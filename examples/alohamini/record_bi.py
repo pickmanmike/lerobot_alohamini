@@ -10,20 +10,12 @@ import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.processor import make_default_processors
-from lerobot.robots.alohamini import AlohaMiniClient, AlohaMiniClientConfig
-from lerobot.teleoperators.bi_so_leader import BiSOLeader, BiSOLeaderConfig
-from lerobot.teleoperators.keyboard import KeyboardTeleop, KeyboardTeleopConfig
+from lerobot.teleoperators.bi_so_leader import BiSOLeaderConfig
 from lerobot.teleoperators.so_leader import SOLeaderConfig
-from lerobot.utils.constants import ACTION, HF_LEROBOT_HOME, OBS_STR
-from lerobot.utils.feature_utils import hw_to_dataset_features
-from lerobot.utils.keyboard_input import init_keyboard_listener
-from lerobot.utils.utils import init_logging, log_say
-from lerobot.utils.visualization_utils import init_visualization, shutdown_visualization
 
-from record_utils import record_loop
+from leader_client_utils import add_leader_port_arguments, resolve_leader_ports
 
 
 @contextmanager
@@ -65,9 +57,7 @@ def parse_bool(value: str | bool) -> bool:
     raise argparse.ArgumentTypeError("Expected true or false.")
 
 
-def main():
-    # Keep the interactive output focused on recording state. Errors are still shown.
-    init_logging(console_level="ERROR")
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Record episodes with bi-arm teleoperation")
     parser.add_argument("--dataset.repo_id", "--dataset", dest="dataset_repo_id", type=str, required=True,
                     help="Dataset repo_id, e.g. liyitenga/record_20250914225057")
@@ -117,6 +107,7 @@ def main():
         choices=["so-arm-5dof", "am-leader-6dof"],
         help="Leader arm profile selector.",
     )
+    add_leader_port_arguments(parser)
     parser.add_argument("--resume", action="store_true", help="Resume recording on existing dataset")
     parser.add_argument(
         "--profile-timing",
@@ -137,6 +128,11 @@ def main():
         help="Display observations and actions in Rerun while recording (default: disabled).",
     )
     parser.add_argument(
+        "--no_rerun",
+        action="store_true",
+        help="Disable Rerun without importing visualization helpers.",
+    )
+    parser.add_argument(
         "--dataset.push_to_hub",
         "--push_to_hub",
         dest="push_to_hub",
@@ -146,8 +142,114 @@ def main():
         default=True,
         help="Whether to upload the dataset to Hugging Face Hub after recording.",
     )
+    return parser
 
-    args = parser.parse_args()
+
+def parse_args(
+    argv: list[str] | None = None,
+    *,
+    platform_name: str | None = None,
+) -> argparse.Namespace:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    return resolve_leader_ports(args, parser, platform_name=platform_name)
+
+
+def make_leader_config(args: argparse.Namespace) -> BiSOLeaderConfig:
+    return BiSOLeaderConfig(
+        left_arm_config=SOLeaderConfig(port=args.left_port, arm_profile=args.arm_profile),
+        right_arm_config=SOLeaderConfig(port=args.right_port, arm_profile=args.arm_profile),
+        id=args.leader_id,
+    )
+
+
+def visualization_enabled(args: argparse.Namespace) -> bool:
+    return args.display_data and not args.no_rerun
+
+
+class RecordingLifecycle:
+    """Track only resources that completed startup so failures clean up safely."""
+
+    def __init__(self) -> None:
+        self.robot: Any | None = None
+        self.leader: Any | None = None
+        self.keyboard: Any | None = None
+        self.listener: Any | None = None
+        self.robot_connected = False
+        self.left_leader_connected = False
+        self.right_leader_connected = False
+        self.keyboard_connected = False
+        self.visualization_started = False
+        self.shutdown_visualization = None
+
+    def cleanup(self) -> None:
+        primary_error = sys.exception()
+        cleanup_errors: list[tuple[str, BaseException]] = []
+
+        def attempt(label: str, callback) -> None:
+            try:
+                callback()
+            except BaseException as exc:
+                cleanup_errors.append((label, exc))
+
+        if self.robot_connected:
+            self.robot_connected = False
+            attempt(
+                "final robot zero command",
+                lambda: self.robot.send_action(
+                    {"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0, "lift_axis.vel": 0}
+                ),
+            )
+        if self.listener is not None:
+            listener, self.listener = self.listener, None
+            attempt("recording keyboard listener stop", listener.stop)
+        if self.keyboard_connected:
+            self.keyboard_connected = False
+            attempt("keyboard disconnect", self.keyboard.disconnect)
+        if self.right_leader_connected:
+            self.right_leader_connected = False
+            attempt("right leader disconnect", self.leader.right_arm.disconnect)
+        if self.left_leader_connected:
+            self.left_leader_connected = False
+            attempt("left leader disconnect", self.leader.left_arm.disconnect)
+        if self.robot is not None and getattr(self.robot, "is_connected", False):
+            attempt("robot disconnect", self.robot.disconnect)
+        if self.visualization_started:
+            self.visualization_started = False
+            attempt("visualization shutdown", lambda: self.shutdown_visualization("rerun"))
+
+        if cleanup_errors:
+            if primary_error is not None:
+                for label, error in cleanup_errors:
+                    primary_error.add_note(f"Cleanup failed during {label}: {error!r}")
+            else:
+                label, error = cleanup_errors[0]
+                for extra_label, extra_error in cleanup_errors[1:]:
+                    error.add_note(f"Additional cleanup failure during {extra_label}: {extra_error!r}")
+                raise error
+
+
+def run_recording(args: argparse.Namespace, lifecycle: RecordingLifecycle) -> None:
+    # Recording dependencies are deliberately loaded only after argument parsing.
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+    from lerobot.processor import make_default_processors
+    from lerobot.robots.alohamini import AlohaMiniClient, AlohaMiniClientConfig
+    from lerobot.teleoperators.bi_so_leader import BiSOLeader
+    from lerobot.teleoperators.keyboard import KeyboardTeleop, KeyboardTeleopConfig
+    from lerobot.utils.constants import ACTION, HF_LEROBOT_HOME, OBS_STR
+    from lerobot.utils.feature_utils import hw_to_dataset_features
+    from lerobot.utils.keyboard_input import init_keyboard_listener
+    from lerobot.utils.utils import init_logging, log_say
+
+    from record_utils import record_loop
+
+    # Keep the interactive output focused on recording state. Errors are still shown.
+    init_logging(console_level="ERROR")
+    display_data = visualization_enabled(args)
+    if display_data:
+        from lerobot.utils.visualization_utils import init_visualization, shutdown_visualization
+
+        lifecycle.shutdown_visualization = shutdown_visualization
 
     # === Robot and teleop config ===
     robot_config = AlohaMiniClientConfig(
@@ -155,22 +257,15 @@ def main():
         id=args.robot_id,
         robot_model=args.robot_model,
     )
-    leader_arm_config = BiSOLeaderConfig(
-        left_arm_config=SOLeaderConfig(
-            port="/dev/am_arm_leader_left",
-            arm_profile=args.arm_profile,
-        ),
-        right_arm_config=SOLeaderConfig(
-            port="/dev/am_arm_leader_right",
-            arm_profile=args.arm_profile,
-        ),
-        id=args.leader_id,
-    )
+    leader_arm_config = make_leader_config(args)
     keyboard_config = KeyboardTeleopConfig()
 
     robot = AlohaMiniClient(robot_config)
     leader_arm = BiSOLeader(leader_arm_config)
     keyboard = KeyboardTeleop(keyboard_config)
+    lifecycle.robot = robot
+    lifecycle.leader = leader_arm
+    lifecycle.keyboard = keyboard
 
     teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
 
@@ -199,14 +294,21 @@ def main():
 
     # === Connect devices ===
     robot.connect()
-    leader_arm.connect()
+    lifecycle.robot_connected = True
+    leader_arm.left_arm.connect()
+    lifecycle.left_leader_connected = True
+    leader_arm.right_arm.connect()
+    lifecycle.right_leader_connected = True
     keyboard.connect()
+    lifecycle.keyboard_connected = keyboard.is_connected
 
     listener, events = init_keyboard_listener()
+    lifecycle.listener = listener
 
     if not robot.is_connected or not leader_arm.is_connected or not keyboard.is_connected:
         raise ValueError("Robot or teleop is not connected!")
-    if args.display_data:
+    if display_data:
+        lifecycle.visualization_started = True
         init_visualization("rerun", session_name="alohamini_record")
     recorded_episodes = 0
 
@@ -296,7 +398,7 @@ def main():
                 teleop_action_processor=teleop_action_processor,
                 robot_action_processor=robot_action_processor,
                 robot_observation_processor=robot_observation_processor,
-                display_data=args.display_data,
+                display_data=display_data,
             )
         finally:
             countdown_stopped.set()
@@ -365,7 +467,7 @@ def main():
                 robot_action_processor=robot_action_processor,
                 robot_observation_processor=robot_observation_processor,
                 timing_callback=print_record_timing if args.profile_timing else None,
-                display_data=args.display_data,
+                display_data=display_data,
             )
         finally:
             recording_elapsed_s = time.monotonic() - recording_started_at
@@ -428,19 +530,22 @@ def main():
         events["exit_early"] = False
 
     # === Clean up ===
-    robot.disconnect()
-    leader_arm.disconnect()
-    keyboard.disconnect()
-    if listener is not None:
-        listener.stop()
+    lifecycle.cleanup()
     print("Saving dataset...", flush=True)
     with native_stderr_as_debug():
         dataset.finalize()
     if args.push_to_hub:
         dataset.push_to_hub()
-    if args.display_data:
-        shutdown_visualization("rerun")
     print(f"Dataset saved at {dataset.root.resolve()}", flush=True)
+
+
+def main() -> None:
+    args = parse_args()
+    lifecycle = RecordingLifecycle()
+    try:
+        run_recording(args, lifecycle)
+    finally:
+        lifecycle.cleanup()
 
 
 if __name__ == "__main__":

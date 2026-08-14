@@ -22,13 +22,21 @@ that both scripts read and write the same calibration files.
 """
 
 import argparse
+import sys
+from collections.abc import Callable
 
 from lerobot.teleoperators.bi_so_leader import BiSOLeader, BiSOLeaderConfig
 from lerobot.teleoperators.so_leader import SOLeaderConfig
 from lerobot.utils.utils import init_logging
 
+from leader_client_utils import add_leader_port_arguments, resolve_leader_ports
 
-def parse_args() -> argparse.Namespace:
+
+def parse_args(
+    argv: list[str] | None = None,
+    *,
+    platform_name: str | None = None,
+) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--teleop.id",
@@ -47,32 +55,69 @@ def parse_args() -> argparse.Namespace:
         choices=["so-arm-5dof", "am-leader-6dof"],
         help="Leader arm profile selector",
     )
-    return parser.parse_args()
+    add_leader_port_arguments(parser)
+    args = parser.parse_args(argv)
+    return resolve_leader_ports(args, parser, platform_name=platform_name)
+
+
+def make_leader_config(args: argparse.Namespace) -> BiSOLeaderConfig:
+    return BiSOLeaderConfig(
+        left_arm_config=SOLeaderConfig(
+            port=args.left_port,
+            arm_profile=args.arm_profile,
+        ),
+        right_arm_config=SOLeaderConfig(
+            port=args.right_port,
+            arm_profile=args.arm_profile,
+        ),
+        id=args.leader_id,
+    )
+
+
+def _record_cleanup_error(
+    errors: list[tuple[str, BaseException]],
+    label: str,
+    cleanup: Callable[[], None],
+) -> None:
+    try:
+        cleanup()
+    except BaseException as exc:
+        errors.append((label, exc))
+
+
+def run_calibration(args: argparse.Namespace) -> None:
+    leader = BiSOLeader(make_leader_config(args))
+    left_connected = False
+    right_connected = False
+    try:
+        leader.left_arm.connect(calibrate=False)
+        left_connected = True
+        leader.right_arm.connect(calibrate=False)
+        right_connected = True
+        leader.calibrate()
+    finally:
+        primary_error = sys.exception()
+        cleanup_errors: list[tuple[str, BaseException]] = []
+        if right_connected:
+            _record_cleanup_error(cleanup_errors, "right leader disconnect", leader.right_arm.disconnect)
+        if left_connected:
+            _record_cleanup_error(cleanup_errors, "left leader disconnect", leader.left_arm.disconnect)
+
+        if cleanup_errors:
+            if primary_error is not None:
+                for label, error in cleanup_errors:
+                    primary_error.add_note(f"Cleanup failed during {label}: {error!r}")
+            else:
+                label, error = cleanup_errors[0]
+                for extra_label, extra_error in cleanup_errors[1:]:
+                    error.add_note(f"Additional cleanup failure during {extra_label}: {extra_error!r}")
+                raise error
 
 
 def main() -> None:
     args = parse_args()
     init_logging()
-
-    leader = BiSOLeader(
-        BiSOLeaderConfig(
-            left_arm_config=SOLeaderConfig(
-                port="/dev/am_arm_leader_left",
-                arm_profile=args.arm_profile,
-            ),
-            right_arm_config=SOLeaderConfig(
-                port="/dev/am_arm_leader_right",
-                arm_profile=args.arm_profile,
-            ),
-            id=args.leader_id,
-        )
-    )
-
-    leader.connect(calibrate=False)
-    try:
-        leader.calibrate()
-    finally:
-        leader.disconnect()
+    run_calibration(args)
 
 
 if __name__ == "__main__":

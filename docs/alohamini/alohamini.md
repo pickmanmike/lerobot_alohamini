@@ -21,7 +21,7 @@ Dual-arm setup — PC (client) + Raspberry Pi (host) on the same LAN.
 └──────────────────────────────┘                   └──────────────────────────────────┘
 ```
 
-Both machines must be on the same LAN with the full environment installed.
+Both machines must be on the same LAN with the environment required for their host or client role.
 
 ---
 
@@ -44,16 +44,65 @@ class AlohaMiniConfig(RobotConfig):
     right_port: str = "/dev/ttyACM1"   # replace with your right-bus port
 ```
 
-**Leader arms** — the PC scripts use the stable device aliases below:
+**Leader arms** — on Linux, the PC scripts default to the stable device aliases below:
 
 ```python
 left_arm_config  = SOLeaderConfig(port="/dev/am_arm_leader_left", ...)
 right_arm_config = SOLeaderConfig(port="/dev/am_arm_leader_right", ...)
 ```
 
-Set up the corresponding udev aliases as described in [commands.md](commands.md#persistent-arm-ports). If you use different paths, keep them consistent in `calibrate_bi.py`, `teleoperate_bi.py`, and `record_bi.py`.
+Set up the corresponding udev aliases as described in [commands.md](commands.md#persistent-arm-ports). If you use different paths, pass the same `--teleop.left_port` and `--teleop.right_port` values to `calibrate_bi.py`, `teleoperate_bi.py`, and `record_bi.py`.
 
 > Port numbers can change after reconnecting or rebooting. If you purchased a complete AlohaMini, the Pi's follower ports are already fixed via udev rules — no action needed.
+
+### Native Windows leader client (Aloha Mini 1)
+
+Native Windows support is for the PC/client role shown above, not the Raspberry Pi hardware-host role. In PowerShell, create a targeted Python 3.12 environment for leader calibration and network teleoperation:
+
+```powershell
+cd C:\Users\pickm\lerobot_alohamini_client
+uv venv --python 3.12
+uv pip install -e ".[hardware,feetech,pyzmq-dep]"
+```
+
+Do not install `.[all]` for this workflow. The initial client environment does not need kinematics, `placo`, `eiquadprog`, `cmeel-boost`, simulation, training policies, Jupyter, phone control, or visualization. Dataset recording can be enabled later with its targeted dataset dependencies.
+
+Find the two leader ports with one USB controller connected at a time, recording which COM port belongs to the left and right leader:
+
+```powershell
+.\.venv\Scripts\lerobot-find-port.exe
+```
+
+Windows requires both ports explicitly. Calibrate the passive leader pair with the same ID and arm profile that later teleoperation and recording commands will use:
+
+```powershell
+.\.venv\Scripts\python.exe `
+  .\examples\alohamini\calibrate_bi.py `
+  --teleop.left_port COM5 `
+  --teleop.right_port COM6 `
+  --teleop.id so101_leader_bi `
+  --teleop.arm_profile so-arm-5dof
+```
+
+For the first supervised Aloha Mini 1 test, start the Pi host first and use a bounded, keyboard-free, visualization-free run. The start gate sends only zero chassis/lift velocity until Enter is pressed:
+
+```powershell
+.\.venv\Scripts\python.exe `
+  .\examples\alohamini\teleoperate_bi.py `
+  --robot.remote_ip 192.168.1.134 `
+  --robot.robot_model alohamini1 `
+  --teleop.left_port COM5 `
+  --teleop.right_port COM6 `
+  --teleop.id so101_leader_bi `
+  --teleop.arm_profile so-arm-5dof `
+  --fps 10 `
+  --duration_s 60 `
+  --no_rerun `
+  --no_keyboard `
+  --start_paused
+```
+
+Leader motors require their 7.4 V low-voltage supply and must never receive the 12 V follower supply. Supervise the first test with the follower arms supported and the follower motor-power disconnect immediately accessible.
 
 ## 3. Camera Configuration
 

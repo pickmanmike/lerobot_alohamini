@@ -10,7 +10,6 @@ from lerobot.processor import RobotAction, RobotObservation, RobotProcessorPipel
 from lerobot.utils.constants import ACTION, OBS_STR
 from lerobot.utils.feature_utils import build_dataset_frame
 from lerobot.utils.robot_utils import precise_sleep
-from lerobot.utils.visualization_utils import log_visualization_data
 
 
 @safe_stop_image_writer
@@ -38,6 +37,10 @@ def record_loop(
         raise ValueError(f"The dataset fps should be equal to requested fps ({dataset.fps} != {fps}).")
     if control_time_s is None:
         raise ValueError("control_time_s must be provided")
+
+    log_visualization_data = None
+    if display_data:
+        from lerobot.utils.visualization_utils import log_visualization_data
 
     control_interval = 1 / fps
     start_episode_t = time.perf_counter()
