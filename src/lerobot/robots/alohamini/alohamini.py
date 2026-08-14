@@ -14,34 +14,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import inspect
 import logging
-import os
+import sys
 import time
 from functools import cached_property
 from itertools import chain
 from typing import Any
-import sys
 
 import numpy as np
 
 from lerobot.cameras.utils import make_cameras_from_configs
+from lerobot.motors import Motor, MotorCalibration, MotorNormMode
+from lerobot.motors.feetech import FeetechMotorsBus, OperatingMode
 from lerobot.processor import RobotAction, RobotObservation
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
-from lerobot.motors import Motor, MotorCalibration, MotorNormMode
-from lerobot.motors.feetech import (
-    FeetechMotorsBus,
-    OperatingMode,
-)
 
 from ..robot import Robot
 from ..utils import ensure_safe_goal_position
 from .config_alohamini import AlohaMiniConfig
+from .lift_axis import LiftAxis, LiftAxisConfig, LiftHomeResult
 from .model_specs import arm_state_keys_for_robot_model, validate_robot_model
+from .motor_safety import REGISTER_RETRIES, set_torque_enabled, write_register
 
 logger = logging.getLogger(__name__)
-
-from .lift_axis import LiftAxis, LiftAxisConfig
 
 
 # Per-arm hardware profiles. Keep the profile name about the arm itself:
@@ -179,8 +174,16 @@ class AlohaMini(Robot):
         self.cameras = make_cameras_from_configs(config.cameras)
 
 
+        lift_config = LiftAxisConfig(
+            lead_mm_per_rev=specs["lead_mm_per_rev"],
+            motor_model=lm,
+            leave_torque_enabled_after_home=config.robot_model == "alohamini1",
+        )
+        if config.robot_model == "alohamini1":
+            lift_config.home_down_speed = 200
+            lift_config.home_timeout_s = 20.0
         self.lift = LiftAxis(
-            LiftAxisConfig(lead_mm_per_rev=specs["lead_mm_per_rev"], motor_model=lm),
+            lift_config,
             bus_left=self.left_bus,
             bus_right=self.right_bus,
         )
@@ -256,31 +259,50 @@ class AlohaMini(Robot):
         cams_ok = all(cam.is_connected for cam in self.cameras.values())
         return self.left_bus.is_connected and (self.right_bus.is_connected if self.right_bus else True) and cams_ok
 
-
     @check_if_already_connected
-    def connect(self, calibrate: bool = True) -> None:
-        self.left_bus.connect()
-        if self.right_bus:
-            self.right_bus.connect()
-        if not self.is_calibrated and calibrate:
-            logger.info(
-                "Mismatch between calibration values in the motor and the calibration file or no calibration file found"
-            )
-            self.calibrate()
+    def connect(
+        self,
+        calibrate: bool = True,
+        *,
+        activate: bool = True,
+        home_lift: bool = True,
+    ) -> None:
+        """Connect, configure with torque off, then explicitly activate safe goals."""
+        try:
+            self.left_bus.connect()
+            if self.right_bus:
+                self.right_bus.connect()
 
-        for cam in self.cameras.values():
-            cam.connect()
+            # Configuration is deliberately separate from activation. It leaves every
+            # motor torque-disabled while modes, gains, and acceleration are changed.
+            self.configure()
+            if calibrate and not self.is_calibrated:
+                logger.info(
+                    "Mismatch between calibration values in the motor and the calibration file "
+                    "or no calibration file found"
+                )
+                self.calibrate()
+                self.configure()
 
-        self.configure()
-        logger.info(f"{self} connected.")
+            for cam in self.cameras.values():
+                cam.connect()
 
-        if self.is_calibrated:
-            self.lift.home()
-            print("Lift axis homed to 0mm.")
-        else:
-            logger.info("Skipping lift homing because AlohaMini is not calibrated.")
+            if activate:
+                should_home_lift = home_lift and self.is_calibrated
+                if home_lift and not should_home_lift:
+                    logger.info("Skipping lift homing because AlohaMini is not calibrated.")
+                if self.config.robot_model == "alohamini1":
+                    self.activate_motors(home_lift=should_home_lift)
+                elif should_home_lift:
+                    # Keep Aloha Mini 2/2 Pro's legacy arm/base activation behavior.
+                    self.lift.home()
+            elif home_lift:
+                logger.info("Motor activation is disabled; lift homing was not run.")
 
-        
+            logger.info("%s connected.", self)
+        except BaseException:
+            self._safe_shutdown(close_buses=True)
+            raise
 
     @property
     def is_calibrated(self) -> bool:
@@ -340,7 +362,7 @@ class AlohaMini(Robot):
         if not getattr(self, "left_arm_motors", None):
             raise RuntimeError("left_arm_motors is empty; expected names starting with 'left_arm_'")
 
-        self.left_bus.disable_torque(self.left_arm_motors)
+        set_torque_enabled(self.left_bus, self.left_arm_motors, enabled=False)
         for name in self.left_arm_motors:
             self.left_bus.write("Operating_Mode", name, OperatingMode.POSITION.value)
 
@@ -370,7 +392,7 @@ class AlohaMini(Robot):
         r_mins, r_maxs = {}, {}
 
         if getattr(self, "right_bus", None) and getattr(self, "right_arm_motors", None):
-            self.right_bus.disable_torque(self.right_arm_motors)
+            set_torque_enabled(self.right_bus, self.right_arm_motors, enabled=False)
             for name in self.right_arm_motors:
                 self.right_bus.write("Operating_Mode", name, OperatingMode.POSITION.value)
 
@@ -429,38 +451,134 @@ class AlohaMini(Robot):
 
 
 
-    def configure(self):
-        # Set-up arm actuators (position mode)
-        # We assume that at connection time, arm is in a rest position,
-        # and torque can be safely disabled to run calibration.
-        self.left_bus.disable_torque()
-        self.left_bus.configure_motors()
+    def _configure_bus_defaults(self, bus: FeetechMotorsBus) -> None:
+        if self.config.robot_model != "alohamini1":
+            bus.configure_motors()
+            return
+
+        # FeetechMotorsBus.configure_motors() may clear a Phase bit on STS3215.
+        # Aloha Mini 1's established motor Phase must remain untouched, so apply the
+        # same runtime delay/acceleration profile explicitly without reading or writing Phase.
+        for name in bus.motors:
+            write_register(bus, "Return_Delay_Time", name, 0)
+            write_register(bus, "Maximum_Acceleration", name, 254)
+            write_register(bus, "Acceleration", name, 254)
+
+    def configure(self) -> None:
+        """Configure motor modes and gains while leaving all torque disabled."""
+        set_torque_enabled(self.left_bus, self.left_bus.motors, enabled=False)
+        self._configure_bus_defaults(self.left_bus)
         for name in self.left_arm_motors:
-            self.left_bus.write("Operating_Mode", name, OperatingMode.POSITION.value)
-            # Set P_Coefficient to lower value to avoid shakiness (Default is 32)
-            self.left_bus.write("P_Coefficient", name, 16)
-            # Set I_Coefficient and D_Coefficient to default value 0 and 32
-            self.left_bus.write("I_Coefficient", name, 0)
-            self.left_bus.write("D_Coefficient", name, 32)
+            write_register(self.left_bus, "Operating_Mode", name, OperatingMode.POSITION.value)
+            # Preserve the existing Aloha Mini follower-arm PID profile.
+            write_register(self.left_bus, "P_Coefficient", name, 16)
+            write_register(self.left_bus, "I_Coefficient", name, 0)
+            write_register(self.left_bus, "D_Coefficient", name, 32)
 
         for name in self.base_motors:
-            self.left_bus.write("Operating_Mode", name, OperatingMode.VELOCITY.value)
-
-        #self.left_bus.enable_torque()
+            write_register(self.left_bus, "Operating_Mode", name, OperatingMode.VELOCITY.value)
 
         if self.right_bus:
-            self.right_bus.disable_torque()
-            self.right_bus.configure_motors()
+            set_torque_enabled(self.right_bus, self.right_bus.motors, enabled=False)
+            self._configure_bus_defaults(self.right_bus)
             for name in self.right_arm_motors:
-                self.right_bus.write("Operating_Mode", name, OperatingMode.POSITION.value)
-                self.right_bus.write("P_Coefficient", name, 16)
-                self.right_bus.write("I_Coefficient", name, 0)
-                self.right_bus.write("D_Coefficient", name, 32)
-            #self.right_bus.enable_torque()
+                write_register(self.right_bus, "Operating_Mode", name, OperatingMode.POSITION.value)
+                write_register(self.right_bus, "P_Coefficient", name, 16)
+                write_register(self.right_bus, "I_Coefficient", name, 0)
+                write_register(self.right_bus, "D_Coefficient", name, 32)
 
-        #self.lift.configure()
+        self.lift.configure(force=True)
 
+    def _seed_arm_goals(self, bus: FeetechMotorsBus, motors: list[str]) -> None:
+        present_positions = {
+            name: int(
+                bus.read(
+                    "Present_Position",
+                    name,
+                    normalize=False,
+                    num_retry=REGISTER_RETRIES,
+                )
+            )
+            for name in motors
+        }
+        for name, present_raw in present_positions.items():
+            write_register(bus, "Goal_Position", name, present_raw)
 
+    def _seed_activation_goals(self) -> None:
+        self._seed_arm_goals(self.left_bus, self.left_arm_motors)
+        if self.right_bus:
+            self._seed_arm_goals(self.right_bus, self.right_arm_motors)
+
+        for name in (*self.base_motors, self.lift.cfg.name):
+            write_register(self.left_bus, "Goal_Velocity", name, 0)
+
+    def activate_motors(self, *, home_lift: bool = True) -> LiftHomeResult | None:
+        """Seed stationary goals, optionally home the lift, and enable normal motors."""
+        home_result = None
+        try:
+            if home_lift:
+                home_result = self.lift.home()
+
+            # Read arm positions after homing, while the arms are still torque-free, so
+            # their hold goals cannot become stale during the bounded lift movement.
+            self._seed_activation_goals()
+            set_torque_enabled(
+                self.left_bus,
+                (*self.left_arm_motors, *self.base_motors),
+                enabled=True,
+            )
+            if self.right_bus:
+                set_torque_enabled(self.right_bus, self.right_arm_motors, enabled=True)
+        except BaseException as error:
+            cleanup_errors = self._safe_shutdown(close_buses=True)
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                raise
+            detail = f" Cleanup issues: {'; '.join(cleanup_errors)}" if cleanup_errors else ""
+            raise RuntimeError(f"AlohaMini motor activation failed.{detail}") from error
+
+        return home_result
+
+    def _safe_shutdown(self, *, close_buses: bool) -> list[str]:
+        """Best-effort zero, torque-off, camera close, and optional bus close."""
+        errors: list[str] = []
+
+        if self.left_bus.is_connected:
+            for name in (*self.base_motors, self.lift.cfg.name):
+                try:
+                    write_register(self.left_bus, "Goal_Velocity", name, 0)
+                except Exception as error:
+                    errors.append(f"zero {name}: {error}")
+
+        for bus_name, bus in (("left", self.left_bus), ("right", self.right_bus)):
+            if bus is None or not bus.is_connected:
+                continue
+            for name in bus.motors:
+                try:
+                    set_torque_enabled(bus, (name,), enabled=False)
+                except Exception as error:
+                    errors.append(f"disable {bus_name}/{name}: {error}")
+
+        for name, camera in self.cameras.items():
+            if not camera.is_connected:
+                continue
+            try:
+                camera.disconnect()
+            except Exception as error:
+                errors.append(f"close camera {name}: {error}")
+
+        if close_buses:
+            for bus_name, bus in (("right", self.right_bus), ("left", self.left_bus)):
+                if bus is None or not bus.is_connected:
+                    continue
+                try:
+                    bus.disconnect(disable_torque=False)
+                except Exception as error:
+                    errors.append(f"close {bus_name} bus: {error}")
+
+        self.lift.mark_unhomed()
+        for error in errors:
+            logger.error("AlohaMini shutdown issue: %s", error)
+        return errors
 
 
     def setup_motors(self) -> None:
@@ -891,17 +1009,30 @@ class AlohaMini(Robot):
         return limited_goal_pos
 
 
-    def stop_base(self):
-        self.left_bus.sync_write("Goal_Velocity", dict.fromkeys(self.base_motors, 0), num_retry=0)
+    def stop_base(self) -> None:
+        failures = []
+        for name in self.base_motors:
+            try:
+                write_register(self.left_bus, "Goal_Velocity", name, 0)
+            except Exception as error:
+                failures.append(f"{name}: {error}")
+        if failures:
+            raise RuntimeError(f"Failed to stop all base motors: {'; '.join(failures)}")
         logger.info("Base motors stopped")
 
-    def stop_lift(self):
+    def stop_lift(self) -> None:
         self.lift.stop()
         logger.info("Lift motor stopped")
 
-    def stop_motion(self):
-        self.stop_base()
-        self.stop_lift()
+    def stop_motion(self) -> None:
+        failures = []
+        for stop in (self.stop_base, self.stop_lift):
+            try:
+                stop()
+            except Exception as error:
+                failures.append(str(error))
+        if failures:
+            raise RuntimeError(f"Failed to stop all AlohaMini motion: {'; '.join(failures)}")
 
     def read_and_check_currents(self, limit_ma, print_currents):
         """Read left/right bus currents (mA), print them, and enforce overcurrent protection"""
@@ -956,12 +1087,8 @@ class AlohaMini(Robot):
         return {k: round(v * scale, 1) for k, v in {**left_curr_raw, **right_curr_raw}.items()}
 
     @check_if_not_connected
-    def disconnect(self):
-        self.stop_motion()
-        self.left_bus.disconnect(self.config.disable_torque_on_disconnect)
-        if self.right_bus:
-            self.right_bus.disconnect(self.config.disable_torque_on_disconnect)
-        for cam in self.cameras.values():
-            cam.disconnect()
-
-        logger.info(f"{self} disconnected.")
+    def disconnect(self) -> None:
+        errors = self._safe_shutdown(close_buses=True)
+        if errors:
+            raise RuntimeError(f"AlohaMini disconnected with cleanup issues: {'; '.join(errors)}")
+        logger.info("%s disconnected.", self)

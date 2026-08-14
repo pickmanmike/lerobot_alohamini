@@ -25,6 +25,16 @@ def make_parser() -> argparse.ArgumentParser:
         help="Skip follower arm calibration.",
     )
     parser.add_argument(
+        "--no_cameras",
+        action="store_true",
+        help="Construct the calibration robot with an empty camera configuration.",
+    )
+    parser.add_argument(
+        "--skip_lift_home",
+        action="store_true",
+        help="Do not home the lift after motor calibration.",
+    )
+    parser.add_argument(
         "--id",
         type=str,
         default="AlohaMiniRobot",
@@ -33,24 +43,33 @@ def make_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def make_robot_config(args: argparse.Namespace) -> AlohaMiniConfig:
+    config = AlohaMiniConfig(
+        id=args.id,
+        robot_model=args.robot_model,
+        no_follower=args.no_follower,
+    )
+    if args.no_cameras:
+        config.cameras = {}
+    return config
+
+
 def main():
     args = make_parser().parse_args()
 
     logging.info("Configuring AlohaMini for calibration")
-    robot_config = AlohaMiniConfig()
-    robot_config.id = args.id
-    robot_config.robot_model = args.robot_model
-    robot_config.no_follower = args.no_follower
-
-    robot = AlohaMini(robot_config)
+    robot = AlohaMini(make_robot_config(args))
 
     try:
         logging.info("Connecting AlohaMini without auto-calibration")
-        robot.connect(calibrate=False)
+        robot.connect(calibrate=False, activate=False, home_lift=False)
         robot.calibrate()
-        if robot.is_calibrated:
-            robot.lift.home()
-            print("Lift axis homed to 0mm.")
+        if robot.is_calibrated and not args.skip_lift_home:
+            result = robot.lift.home()
+            print(
+                f"Lift axis homed to a process-local 0mm reference "
+                f"({result.stop_reason}, {result.elapsed_s:.2f}s)."
+            )
         print("AlohaMini calibration complete.")
     finally:
         if robot.is_connected:

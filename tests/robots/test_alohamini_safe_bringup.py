@@ -1,0 +1,415 @@
+#!/usr/bin/env python
+
+# Copyright 2026 The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
+from collections import defaultdict
+from types import SimpleNamespace
+
+import pytest
+
+from lerobot.robots.alohamini import alohamini as alohamini_module
+from lerobot.robots.alohamini import alohamini_calibrate as calibrate_module
+from lerobot.robots.alohamini.alohamini import AlohaMini
+from lerobot.robots.alohamini.alohamini_calibrate import (
+    make_parser as make_calibrate_parser,
+    make_robot_config as make_calibrate_robot_config,
+)
+from lerobot.robots.alohamini.alohamini_host import (
+    connect_robot,
+    make_host_config,
+    make_parser as make_host_parser,
+    make_robot_config as make_host_robot_config,
+)
+from lerobot.robots.alohamini.alohamini_lift_home import (
+    make_parser as make_lift_home_parser,
+    make_robot_config as make_lift_home_robot_config,
+)
+from lerobot.robots.alohamini.lift_axis import LiftAxis, LiftAxisConfig
+from lerobot.robots.alohamini.motor_safety import set_torque_enabled
+
+
+class FakeBus:
+    def __init__(self, name: str, motor_names: tuple[str, ...], events: list[tuple]):
+        self.name = name
+        self.motors = dict.fromkeys(motor_names, object())
+        self.events = events
+        self.is_connected = True
+        self.registers = defaultdict(int)
+        self.read_sequences: dict[tuple[str, str], list[object]] = {}
+        self.write_failures: dict[tuple[str, str, int], tuple[BaseException, bool]] = {}
+        self.position_step = 0
+
+    def read(
+        self,
+        register: str,
+        motor: str,
+        *,
+        normalize: bool = True,
+        num_retry: int = 3,
+    ) -> int | float:
+        self.events.append((self.name, "read", register, motor))
+        sequence = self.read_sequences.get((register, motor))
+        if sequence:
+            value = sequence.pop(0)
+            if isinstance(value, BaseException):
+                raise value
+            self.registers[(register, motor)] = value
+            return value
+        if register == "Present_Position" and self.position_step:
+            self.registers[(register, motor)] += self.position_step
+        return self.registers[(register, motor)]
+
+    def write(
+        self,
+        register: str,
+        motor: str,
+        value: int | float,
+        *,
+        normalize: bool = True,
+        num_retry: int = 3,
+    ) -> None:
+        int_value = int(value)
+        self.events.append((self.name, "write", register, motor, int_value))
+        failure = self.write_failures.get((register, motor, int_value))
+        if failure is not None:
+            error, apply_before_error = failure
+            if apply_before_error:
+                self.registers[(register, motor)] = int_value
+            raise error
+        self.registers[(register, motor)] = int_value
+
+    def disconnect(self, disable_torque: bool = True) -> None:
+        self.events.append((self.name, "disconnect", disable_torque))
+        self.is_connected = False
+
+
+class FakeLift:
+    def __init__(self):
+        self.cfg = SimpleNamespace(name="lift_axis")
+        self.is_homed = False
+        self.home_calls = 0
+
+    def home(self):
+        self.home_calls += 1
+        self.is_homed = True
+        return None
+
+    def mark_unhomed(self):
+        self.is_homed = False
+
+
+def make_activation_robot(*, fail_arm_enable: bool = False):
+    events = []
+    left_names = (
+        "arm_left_shoulder_pan",
+        "arm_left_gripper",
+        "base_left_wheel",
+        "base_back_wheel",
+        "base_right_wheel",
+        "lift_axis",
+    )
+    right_names = ("arm_right_shoulder_pan", "arm_right_gripper")
+    left = FakeBus("left", left_names, events)
+    right = FakeBus("right", right_names, events)
+    left.registers[("Present_Position", "arm_left_shoulder_pan")] = 101
+    left.registers[("Present_Position", "arm_left_gripper")] = 202
+    right.registers[("Present_Position", "arm_right_shoulder_pan")] = 303
+    right.registers[("Present_Position", "arm_right_gripper")] = 404
+    if fail_arm_enable:
+        left.write_failures[("Torque_Enable", "arm_left_shoulder_pan", 1)] = (
+            ConnectionError("missing acknowledgement"),
+            False,
+        )
+
+    robot = AlohaMini.__new__(AlohaMini)
+    robot.left_bus = left
+    robot.right_bus = right
+    robot.left_arm_motors = ["arm_left_shoulder_pan", "arm_left_gripper"]
+    robot.right_arm_motors = ["arm_right_shoulder_pan", "arm_right_gripper"]
+    robot.base_motors = ["base_left_wheel", "base_back_wheel", "base_right_wheel"]
+    robot.lift = FakeLift()
+    robot.cameras = {}
+    return robot, left, right, events
+
+
+def event_index(events: list[tuple], expected: tuple) -> int:
+    return next(index for index, event in enumerate(events) if event == expected)
+
+
+def test_arm_goals_are_seeded_from_raw_positions_before_torque_enable():
+    robot, _, _, events = make_activation_robot()
+
+    robot.activate_motors(home_lift=False)
+
+    expected_positions = {
+        ("left", "arm_left_shoulder_pan"): 101,
+        ("left", "arm_left_gripper"): 202,
+        ("right", "arm_right_shoulder_pan"): 303,
+        ("right", "arm_right_gripper"): 404,
+    }
+    for (bus_name, motor), position in expected_positions.items():
+        goal_index = event_index(events, (bus_name, "write", "Goal_Position", motor, position))
+        torque_index = event_index(events, (bus_name, "write", "Torque_Enable", motor, 1))
+        assert goal_index < torque_index
+
+
+def test_wheel_and_lift_zero_goals_precede_normal_torque_activation():
+    robot, _, _, events = make_activation_robot()
+
+    robot.activate_motors(home_lift=False)
+
+    first_enable_index = next(
+        index
+        for index, event in enumerate(events)
+        if event[1:3] == ("write", "Torque_Enable") and event[-1] == 1
+    )
+    for motor in (*robot.base_motors, "lift_axis"):
+        zero_index = event_index(events, ("left", "write", "Goal_Velocity", motor, 0))
+        assert zero_index < first_enable_index
+
+
+def test_missing_lock_acknowledgement_requires_correct_readback():
+    events = []
+    bus = FakeBus("left", ("motor",), events)
+    bus.write_failures[("Lock", "motor", 1)] = (ConnectionError("no status packet"), True)
+
+    set_torque_enabled(bus, ("motor",), enabled=True)
+
+    assert bus.registers[("Lock", "motor")] == 1
+    assert ("left", "read", "Lock", "motor") in events
+
+    bad_bus = FakeBus("left", ("motor",), [])
+    bad_bus.write_failures[("Lock", "motor", 1)] = (ConnectionError("no status packet"), False)
+    with pytest.raises(RuntimeError, match="expected 1, read back 0"):
+        set_torque_enabled(bad_bus, ("motor",), enabled=True)
+
+
+def test_activation_failure_zeros_body_disables_torque_and_closes_buses():
+    robot, left, right, events = make_activation_robot(fail_arm_enable=True)
+
+    with pytest.raises(RuntimeError, match="motor activation failed"):
+        robot.activate_motors(home_lift=False)
+
+    failure_index = event_index(
+        events,
+        ("left", "write", "Torque_Enable", "arm_left_shoulder_pan", 1),
+    )
+    for motor in (*robot.base_motors, "lift_axis"):
+        assert any(
+            index > failure_index and event == ("left", "write", "Goal_Velocity", motor, 0)
+            for index, event in enumerate(events)
+        )
+    for bus_name, bus in (("left", left), ("right", right)):
+        for motor in bus.motors:
+            assert (bus_name, "write", "Torque_Enable", motor, 0) in events
+        assert not bus.is_connected
+    assert not robot.lift.is_homed
+
+
+@pytest.mark.parametrize(
+    ("parser_factory", "config_factory", "extra_args"),
+    [
+        (make_host_parser, make_host_robot_config, []),
+        (make_calibrate_parser, make_calibrate_robot_config, []),
+        (make_lift_home_parser, make_lift_home_robot_config, []),
+    ],
+)
+def test_no_cameras_builds_an_empty_camera_configuration(parser_factory, config_factory, extra_args):
+    args = parser_factory().parse_args(["--no_cameras", *extra_args])
+
+    config = config_factory(args)
+
+    assert config.cameras == {}
+
+
+def test_empty_camera_configuration_constructs_no_camera_objects(monkeypatch, tmp_path):
+    class ConstructionBus:
+        def __init__(self, port, motors, calibration):
+            self.port = port
+            self.motors = motors
+            self.calibration = calibration
+
+    camera_configs = []
+
+    def fake_make_cameras(configs):
+        camera_configs.append(configs)
+        return {}
+
+    monkeypatch.setattr(alohamini_module, "FeetechMotorsBus", ConstructionBus)
+    monkeypatch.setattr(alohamini_module, "make_cameras_from_configs", fake_make_cameras)
+    args = make_host_parser().parse_args(["--robot_model", "alohamini1", "--no_cameras"])
+    config = make_host_robot_config(args)
+    config.calibration_dir = tmp_path
+
+    robot = AlohaMini(config)
+
+    assert camera_configs == [{}]
+    assert robot.cameras == {}
+
+
+def test_skip_lift_home_does_not_request_home():
+    class RecordingRobot:
+        def __init__(self):
+            self.home_calls = 0
+
+        def connect(self, *, home_lift: bool):
+            if home_lift:
+                self.home_calls += 1
+
+    robot = RecordingRobot()
+    connect_robot(robot, skip_lift_home=True)
+
+    assert robot.home_calls == 0
+
+
+def test_calibration_skip_lift_home_does_not_call_home(monkeypatch):
+    created_robots = []
+
+    class CalibrationRobot:
+        def __init__(self, config):
+            self.config = config
+            self.is_calibrated = True
+            self.is_connected = False
+            self.home_calls = 0
+            self.lift = SimpleNamespace(home=self._home)
+            created_robots.append(self)
+
+        def _home(self):
+            self.home_calls += 1
+
+        def connect(self, **kwargs):
+            self.connect_kwargs = kwargs
+
+        def calibrate(self):
+            pass
+
+    monkeypatch.setattr(calibrate_module, "AlohaMini", CalibrationRobot)
+    monkeypatch.setattr(
+        "sys.argv",
+        ["alohamini_calibrate", "--robot_model", "alohamini1", "--no_cameras", "--skip_lift_home"],
+    )
+
+    calibrate_module.main()
+
+    robot = created_robots[0]
+    assert robot.config.cameras == {}
+    assert robot.connect_kwargs == {"calibrate": False, "activate": False, "home_lift": False}
+    assert robot.home_calls == 0
+
+
+def test_host_safety_limits_are_applied_to_configs():
+    args = make_host_parser().parse_args(
+        ["--max_relative_target", "4.5", "--max_loop_freq_hz", "20"]
+    )
+
+    assert make_host_robot_config(args).max_relative_target == 4.5
+    assert make_host_config(args).max_loop_freq_hz == 20
+
+
+def test_alohamini1_bus_defaults_do_not_read_or_write_phase():
+    events = []
+    bus = FakeBus("left", ("motor",), events)
+    robot = AlohaMini.__new__(AlohaMini)
+    robot.config = SimpleNamespace(robot_model="alohamini1")
+
+    robot._configure_bus_defaults(bus)
+
+    assert all("Phase" not in event for event in events)
+
+
+def make_lift_axis(events: list[tuple]) -> tuple[LiftAxis, FakeBus]:
+    bus = FakeBus("left", ("lift_axis",), events)
+    config = LiftAxisConfig(
+        home_down_speed=200,
+        home_timeout_s=1.0,
+        home_stall_samples=2,
+        home_min_motion_ticks=2.0,
+        home_poll_interval_s=0.0,
+    )
+    return LiftAxis(config, bus_left=bus, bus_right=None), bus
+
+
+def test_unhomed_lift_commands_only_request_zero_velocity():
+    events = []
+    lift, _ = make_lift_axis(events)
+
+    lift.apply_action({"lift_axis.height_mm": 100.0})
+    lift.apply_action({"lift_axis.vel": 200.0})
+
+    goal_writes = [event for event in events if event[1:3] == ("write", "Goal_Velocity")]
+    assert goal_writes
+    assert all(event[-1] == 0 for event in goal_writes)
+    assert not lift.is_homed
+
+
+def test_lift_home_uses_positive_raw_downward_velocity_and_finishes_zeroed():
+    events = []
+    lift, bus = make_lift_axis(events)
+    bus.read_sequences[("Present_Current", "lift_axis")] = [100, 100]
+
+    result = lift.home(speed_raw=200, timeout_s=1.0)
+
+    positive_index = event_index(events, ("left", "write", "Goal_Velocity", "lift_axis", 200))
+    torque_index = event_index(events, ("left", "write", "Torque_Enable", "lift_axis", 1))
+    zeros_before_torque = [
+        index
+        for index, event in enumerate(events)
+        if event == ("left", "write", "Goal_Velocity", "lift_axis", 0) and index < torque_index
+    ]
+    assert zeros_before_torque
+    assert positive_index > torque_index
+    assert [event for event in events if event[1:3] == ("write", "Goal_Velocity")][-1][-1] == 0
+    assert bus.registers[("Torque_Enable", "lift_axis")] == 1
+    assert result.stop_reason == "current threshold"
+    assert lift.is_homed
+
+
+def test_lift_home_timeout_finishes_zeroed_and_torque_disabled(monkeypatch):
+    events = []
+    lift, bus = make_lift_axis(events)
+    bus.position_step = 10
+    bus.read_sequences[("Present_Current", "lift_axis")] = [0]
+    monotonic_values = iter((0.0, 0.0, 2.0))
+    monkeypatch.setattr(
+        "lerobot.robots.alohamini.lift_axis.time.monotonic",
+        lambda: next(monotonic_values),
+    )
+
+    with pytest.raises(TimeoutError):
+        lift.home(speed_raw=200, timeout_s=1.0)
+
+    goal_writes = [event for event in events if event[1:3] == ("write", "Goal_Velocity")]
+    assert any(event[-1] == 200 for event in goal_writes)
+    assert goal_writes[-1][-1] == 0
+    assert bus.registers[("Torque_Enable", "lift_axis")] == 0
+    assert not lift.is_homed
+
+
+@pytest.mark.parametrize("failure", [RuntimeError("position read failed"), KeyboardInterrupt()])
+def test_lift_home_exception_and_interrupt_finish_zeroed_and_torque_disabled(failure):
+    events = []
+    lift, bus = make_lift_axis(events)
+    bus.read_sequences[("Present_Position", "lift_axis")] = [0, failure]
+
+    with pytest.raises(type(failure)):
+        lift.home(speed_raw=200, timeout_s=1.0)
+
+    goal_writes = [event for event in events if event[1:3] == ("write", "Goal_Velocity")]
+    assert any(event[-1] == 200 for event in goal_writes)
+    assert goal_writes[-1][-1] == 0
+    assert bus.registers[("Torque_Enable", "lift_axis")] == 0
+    assert not lift.is_homed

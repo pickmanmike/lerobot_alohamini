@@ -17,6 +17,7 @@
 import argparse
 import json
 import logging
+import math
 import time
 
 import cv2
@@ -98,7 +99,21 @@ def parse_bool(value: str | bool) -> bool:
     raise argparse.ArgumentTypeError("Expected true or false.")
 
 
-def main():
+def positive_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError("Expected a positive number.")
+    return parsed
+
+
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("Expected a positive integer.")
+    return parsed
+
+
+def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run AlohaMini host process")
     parser.add_argument(
         "--robot_model",
@@ -122,6 +137,28 @@ def main():
         help="Do not connect follower arms, only operate the base and lift. Use together with --no_leader on the teleoperate side.",
     )
     parser.add_argument(
+        "--no_cameras",
+        action="store_true",
+        help="Construct the host robot with an empty camera configuration.",
+    )
+    parser.add_argument(
+        "--skip_lift_home",
+        action="store_true",
+        help="Do not home the lift; lift motion stays disabled for this process.",
+    )
+    parser.add_argument(
+        "--max_relative_target",
+        type=positive_float,
+        default=None,
+        help="Maximum follower-arm position change allowed per command (default: disabled).",
+    )
+    parser.add_argument(
+        "--max_loop_freq_hz",
+        type=positive_int,
+        default=30,
+        help="Maximum host control-loop frequency in Hz (default: 30).",
+    )
+    parser.add_argument(
         "--profile_timing",
         "--profile-timing",
         type=parse_bool,
@@ -133,24 +170,50 @@ def main():
             "(default: false)."
         ),
     )
-    args = parser.parse_args()
+    return parser
+
+
+def make_robot_config(args: argparse.Namespace) -> AlohaMiniConfig:
+    config = AlohaMiniConfig(
+        id="AlohaMiniRobot",
+        robot_model=args.robot_model,
+        no_follower=args.no_follower,
+        max_relative_target=args.max_relative_target,
+    )
+    if args.no_cameras:
+        config.cameras = {}
+    return config
+
+
+def make_host_config(args: argparse.Namespace) -> AlohaMiniHostConfig:
+    return AlohaMiniHostConfig(max_loop_freq_hz=args.max_loop_freq_hz)
+
+
+def connect_robot(robot: AlohaMini, *, skip_lift_home: bool) -> None:
+    robot.connect(home_lift=not skip_lift_home)
+
+
+def main():
+    args = make_parser().parse_args()
 
     logging.info("Configuring AlohaMini")
-    robot_config = AlohaMiniConfig()
-    robot_config.id = "AlohaMiniRobot"
-    robot_config.robot_model = args.robot_model
-    robot_config.no_follower = args.no_follower
+    robot_config = make_robot_config(args)
     if args.no_follower:
         logging.info("no_follower mode: follower arms will not connect, only base and lift operate.")
     robot = AlohaMini(robot_config)
 
 
-    logging.info("Connecting AlohaMini")
-    robot.connect()
+    try:
+        logging.info("Connecting AlohaMini")
+        connect_robot(robot, skip_lift_home=args.skip_lift_home)
 
-    logging.info("Starting HostAgent")
-    host_config = AlohaMiniHostConfig()
-    host = AlohaMiniHost(host_config)
+        logging.info("Starting HostAgent")
+        host_config = make_host_config(args)
+        host = AlohaMiniHost(host_config)
+    except BaseException:
+        if robot.is_connected:
+            robot.disconnect()
+        raise
 
     last_cmd_time = time.time()
     watchdog_active = False
@@ -298,8 +361,11 @@ def main():
         print("Keyboard interrupt received. Exiting...")
     finally:
         print("Shutting down AlohaMini Host.")
-        robot.disconnect()
-        host.disconnect()
+        try:
+            if robot.is_connected:
+                robot.disconnect()
+        finally:
+            host.disconnect()
 
     logging.info("Finished AlohaMini cleanly")
 if __name__ == "__main__":
