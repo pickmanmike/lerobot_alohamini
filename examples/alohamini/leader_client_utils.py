@@ -21,9 +21,35 @@ from __future__ import annotations
 import argparse
 import platform
 
+from lerobot.teleoperators.bi_so_leader import BiSOLeaderConfig
+from lerobot.teleoperators.so_leader import SOLeaderConfig
+
 
 DEFAULT_LEFT_LEADER_PORT = "/dev/am_arm_leader_left"
 DEFAULT_RIGHT_LEADER_PORT = "/dev/am_arm_leader_right"
+
+
+def make_normalized_bi_leader_config(
+    *,
+    left_port: str,
+    right_port: str,
+    leader_id: str,
+    arm_profile: str,
+) -> BiSOLeaderConfig:
+    """Build Aloha Mini leader arms in the followers' normalized action space."""
+    return BiSOLeaderConfig(
+        left_arm_config=SOLeaderConfig(
+            port=left_port,
+            arm_profile=arm_profile,
+            use_degrees=False,
+        ),
+        right_arm_config=SOLeaderConfig(
+            port=right_port,
+            arm_profile=arm_profile,
+            use_degrees=False,
+        ),
+        id=leader_id,
+    )
 
 
 def add_leader_port_arguments(parser: argparse.ArgumentParser) -> None:

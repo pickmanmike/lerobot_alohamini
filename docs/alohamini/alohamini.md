@@ -84,7 +84,9 @@ Windows requires both ports explicitly. Calibrate the passive leader pair with t
   --teleop.arm_profile so-arm-5dof
 ```
 
-For the first supervised Aloha Mini 1 test, start the Pi host first and use a bounded, keyboard-free, visualization-free run. The start gate sends only zero chassis/lift velocity until Enter is pressed:
+Aloha Mini leader and follower arm actions use normalized positions by default: body joints use `-100..100` and grippers use `0..100`. Existing leader calibration files remain reusable because they store raw homing, range, and drive information rather than the runtime normalization mode. Do not recalibrate solely for this change.
+
+Until a clutch or relative-alignment mode is implemented, manually place and support both follower arms in poses matching the passive leaders before host activation. For first commissioning, start the Pi host and run the mandatory no-arm-motion alignment check before any teleoperation:
 
 ```powershell
 .\.venv\Scripts\python.exe `
@@ -95,6 +97,26 @@ For the first supervised Aloha Mini 1 test, start the Pi host first and use a bo
   --teleop.right_port COM6 `
   --teleop.id so101_leader_bi `
   --teleop.arm_profile so-arm-5dof `
+  --max_start_mismatch 10.0 `
+  --no_rerun `
+  --no_keyboard `
+  --check_alignment_only
+```
+
+The command prints every follower/leader joint difference and sends no arm-position action. It succeeds only when both samples are finite, normalized, complete, fresh, and within the threshold. A base/lift zero command may still be sent as part of safe connection and cleanup.
+
+After the alignment-only check passes, use this bounded, keyboard-free, visualization-free first run. The initial gate sends only zero chassis/lift velocity; after Enter, it obtains and compares fresh follower and leader samples again, then forwards that validated leader sample first:
+
+```powershell
+.\.venv\Scripts\python.exe `
+  .\examples\alohamini\teleoperate_bi.py `
+  --robot.remote_ip 192.168.1.134 `
+  --robot.robot_model alohamini1 `
+  --teleop.left_port COM5 `
+  --teleop.right_port COM6 `
+  --teleop.id so101_leader_bi `
+  --teleop.arm_profile so-arm-5dof `
+  --max_start_mismatch 10.0 `
   --fps 10 `
   --duration_s 60 `
   --no_rerun `

@@ -26,10 +26,13 @@ import sys
 from collections.abc import Callable
 
 from lerobot.teleoperators.bi_so_leader import BiSOLeader, BiSOLeaderConfig
-from lerobot.teleoperators.so_leader import SOLeaderConfig
 from lerobot.utils.utils import init_logging
 
-from leader_client_utils import add_leader_port_arguments, resolve_leader_ports
+from leader_client_utils import (
+    add_leader_port_arguments,
+    make_normalized_bi_leader_config,
+    resolve_leader_ports,
+)
 
 
 def parse_args(
@@ -61,16 +64,11 @@ def parse_args(
 
 
 def make_leader_config(args: argparse.Namespace) -> BiSOLeaderConfig:
-    return BiSOLeaderConfig(
-        left_arm_config=SOLeaderConfig(
-            port=args.left_port,
-            arm_profile=args.arm_profile,
-        ),
-        right_arm_config=SOLeaderConfig(
-            port=args.right_port,
-            arm_profile=args.arm_profile,
-        ),
-        id=args.leader_id,
+    return make_normalized_bi_leader_config(
+        left_port=args.left_port,
+        right_port=args.right_port,
+        leader_id=args.leader_id,
+        arm_profile=args.arm_profile,
     )
 
 

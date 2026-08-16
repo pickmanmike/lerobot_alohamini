@@ -19,18 +19,187 @@
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 import time
 from collections.abc import Callable
-from typing import Any
+from typing import Any, NamedTuple
 
 from lerobot.robots.alohamini import AlohaMiniClient, AlohaMiniClientConfig
 from lerobot.teleoperators.bi_so_leader import BiSOLeader, BiSOLeaderConfig
 from lerobot.teleoperators.keyboard.teleop_keyboard import KeyboardTeleop, KeyboardTeleopConfig
-from lerobot.teleoperators.so_leader import SOLeaderConfig
 from lerobot.utils.robot_utils import precise_sleep
 
-from leader_client_utils import add_leader_port_arguments, resolve_leader_ports
+from leader_client_utils import (
+    add_leader_port_arguments,
+    make_normalized_bi_leader_config,
+    resolve_leader_ports,
+)
+
+
+AM1_ARM_POSITION_KEYS = (
+    "arm_left_shoulder_pan.pos",
+    "arm_left_shoulder_lift.pos",
+    "arm_left_elbow_flex.pos",
+    "arm_left_wrist_flex.pos",
+    "arm_left_wrist_roll.pos",
+    "arm_left_gripper.pos",
+    "arm_right_shoulder_pan.pos",
+    "arm_right_shoulder_lift.pos",
+    "arm_right_elbow_flex.pos",
+    "arm_right_wrist_flex.pos",
+    "arm_right_wrist_roll.pos",
+    "arm_right_gripper.pos",
+)
+ACTION_RANGE_TOLERANCE = 1e-6
+
+
+class SafetyRefusal(ValueError):
+    """An expected refusal to forward an unsafe Aloha Mini 1 arm sample."""
+
+
+class AlignmentRow(NamedTuple):
+    joint: str
+    follower_value: float
+    leader_value: float
+    signed_difference: float
+    absolute_difference: float
+
+
+def _joint_identity(key: str) -> tuple[str, str]:
+    side_and_joint = key.removeprefix("arm_").removesuffix(".pos")
+    side, joint = side_and_joint.split("_", maxsplit=1)
+    return side, joint
+
+
+def extract_am1_arm_positions(
+    values: dict[str, Any],
+    *,
+    source: str,
+    leader_sample: bool,
+) -> dict[str, float]:
+    """Validate and return the exact normalized AM1 arm-position mapping."""
+    if leader_sample:
+        arm_values = {
+            key if key.startswith("arm_") else f"arm_{key}": value
+            for key, value in values.items()
+            if key.endswith(".pos")
+        }
+    else:
+        arm_values = {
+            key: value for key, value in values.items() if key.startswith("arm_") and key.endswith(".pos")
+        }
+
+    expected = set(AM1_ARM_POSITION_KEYS)
+    actual = set(arm_values)
+    missing = sorted(expected - actual)
+    unexpected = sorted(actual - expected)
+    if missing or unexpected:
+        details = []
+        if missing:
+            details.append(f"missing {', '.join(missing)}")
+        if unexpected:
+            details.append(f"unexpected {', '.join(unexpected)}")
+        raise SafetyRefusal(f"{source} AM1 arm-position keys are invalid: {'; '.join(details)}")
+
+    validated: dict[str, float] = {}
+    for key in AM1_ARM_POSITION_KEYS:
+        side, joint = _joint_identity(key)
+        try:
+            value = float(arm_values[key])
+        except (TypeError, ValueError) as exc:
+            raise SafetyRefusal(f"{source} {side} {joint} value {arm_values[key]!r} must be numeric") from exc
+        if not math.isfinite(value):
+            raise SafetyRefusal(f"{source} {side} {joint} value {value} must be finite")
+
+        if leader_sample:
+            lower = 0.0 if joint == "gripper" else -100.0
+            upper = 100.0
+            if value < lower - ACTION_RANGE_TOLERANCE or value > upper + ACTION_RANGE_TOLERANCE:
+                expected_range = "0..100" if joint == "gripper" else "-100..100"
+                raise SafetyRefusal(
+                    f"{source} {side} {joint} value {value} is outside expected {expected_range}"
+                )
+        validated[key] = value
+
+    return validated
+
+
+def get_fresh_follower_observation(robot: Any) -> dict[str, Any]:
+    """Wait until the client proves that a newly decoded observation arrived."""
+    previous_sequence = robot.observation_sequence
+    deadline = time.monotonic() + robot.config.connect_timeout_s
+    observation: dict[str, Any] = {}
+    while robot.observation_sequence == previous_sequence:
+        observation = robot.get_observation()
+        if robot.observation_sequence == previous_sequence and time.monotonic() >= deadline:
+            raise RuntimeError("Timed out waiting for a fresh follower observation for alignment.")
+    return observation
+
+
+def build_alignment_rows(
+    follower_positions: dict[str, float],
+    leader_positions: dict[str, float],
+) -> list[AlignmentRow]:
+    rows = []
+    for joint in AM1_ARM_POSITION_KEYS:
+        follower_value = follower_positions[joint]
+        leader_value = leader_positions[joint]
+        signed_difference = leader_value - follower_value
+        rows.append(
+            AlignmentRow(
+                joint=joint,
+                follower_value=follower_value,
+                leader_value=leader_value,
+                signed_difference=signed_difference,
+                absolute_difference=abs(signed_difference),
+            )
+        )
+    return rows
+
+
+def _print_alignment_table(rows: list[AlignmentRow]) -> None:
+    print("AM1 leader/follower alignment (normalized units):")
+    print(
+        f"  {'joint':<36} {'follower value':>14} {'leader value':>14} "
+        f"{'signed difference':>18} {'absolute difference':>20}"
+    )
+    for row in rows:
+        print(
+            f"  {row.joint:<36} {row.follower_value:>14.3f} {row.leader_value:>14.3f} "
+            f"{row.signed_difference:>18.3f} {row.absolute_difference:>20.3f}"
+        )
+
+
+def run_alignment_gate(
+    robot: Any,
+    leader: Any,
+    max_start_mismatch: float,
+) -> tuple[dict[str, float], dict[str, Any]]:
+    observation = get_fresh_follower_observation(robot)
+    follower_positions = extract_am1_arm_positions(
+        observation,
+        source="follower",
+        leader_sample=False,
+    )
+    leader_positions = extract_am1_arm_positions(
+        leader.get_action(),
+        source="leader",
+        leader_sample=True,
+    )
+    rows = build_alignment_rows(follower_positions, leader_positions)
+    _print_alignment_table(rows)
+
+    mismatched_rows = [row for row in rows if row.absolute_difference > max_start_mismatch]
+    if mismatched_rows:
+        worst = max(mismatched_rows, key=lambda row: row.absolute_difference)
+        raise SafetyRefusal(
+            f"startup alignment mismatch for {worst.joint}: follower={worst.follower_value}, "
+            f"leader={worst.leader_value}, signed_difference={worst.signed_difference}, "
+            f"absolute_difference={worst.absolute_difference} exceeds --max_start_mismatch "
+            f"{max_start_mismatch}"
+        )
+    return leader_positions, observation
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -40,6 +209,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no_keyboard", action="store_true", help="Disable keyboard base and lift control")
     parser.add_argument("--no_rerun", action="store_true", help="Disable Rerun without importing visualization helpers")
     parser.add_argument("--start_paused", action="store_true", help="Wait for Enter before forwarding leader actions")
+    parser.add_argument(
+        "--check_alignment_only",
+        action="store_true",
+        help="Validate AM1 leader/follower alignment, send no arm action, and exit",
+    )
+    parser.add_argument(
+        "--max_start_mismatch",
+        type=float,
+        default=10.0,
+        help="Maximum AM1 leader/follower startup difference in normalized units (default: 10.0)",
+    )
     parser.add_argument(
         "--duration_s",
         type=float,
@@ -99,14 +279,21 @@ def parse_args(
         parser.error("--fps must be greater than zero")
     if args.duration_s < 0:
         parser.error("--duration_s must be zero or greater")
+    if not math.isfinite(args.max_start_mismatch) or args.max_start_mismatch <= 0:
+        parser.error("--max_start_mismatch must be finite and greater than zero")
+    if args.check_alignment_only and (args.no_robot or args.no_leader):
+        parser.error("--check_alignment_only requires both robot and leader connections")
+    if args.check_alignment_only and args.robot_model != "alohamini1":
+        parser.error("--check_alignment_only is supported only for alohamini1")
     return resolve_leader_ports(args, parser, platform_name=platform_name)
 
 
 def make_leader_config(args: argparse.Namespace) -> BiSOLeaderConfig:
-    return BiSOLeaderConfig(
-        left_arm_config=SOLeaderConfig(port=args.left_port, arm_profile=args.arm_profile),
-        right_arm_config=SOLeaderConfig(port=args.right_port, arm_profile=args.arm_profile),
-        id=args.leader_id,
+    return make_normalized_bi_leader_config(
+        left_port=args.left_port,
+        right_port=args.right_port,
+        leader_id=args.leader_id,
+        arm_profile=args.arm_profile,
     )
 
 
@@ -149,6 +336,7 @@ def _print_connection_summary(args: argparse.Namespace) -> None:
     print(f"  FPS: {args.fps}")
     print(f"  Keyboard: {'disabled' if args.no_keyboard else 'enabled'}")
     print(f"  Visualization: {'disabled' if args.no_rerun else 'enabled'}")
+    print("  Action space: body joints -100..100; grippers 0..100")
     print("No leader action has yet been forwarded.")
 
 
@@ -158,7 +346,7 @@ def run_teleoperation(
     input_fn: Callable[[str], str] = input,
     monotonic: Callable[[], float] = time.monotonic,
     sleep_fn: Callable[[float], None] = precise_sleep,
-) -> None:
+) -> int:
     robot = None
     leader = None
     keyboard = None
@@ -169,6 +357,8 @@ def run_teleoperation(
     visualization_started = False
     log_rerun_data = None
     shutdown_rerun = None
+    pending_arm_action: dict[str, float] | None = None
+    pending_observation: dict[str, Any] = {}
 
     try:
         if not args.no_robot:
@@ -194,6 +384,20 @@ def run_teleoperation(
         else:
             print("NO_LEADER: leader construction and connection skipped.")
 
+        if args.robot_model == "alohamini1" and robot_connected and right_leader_connected:
+            try:
+                pending_arm_action, pending_observation = run_alignment_gate(
+                    robot,
+                    leader,
+                    args.max_start_mismatch,
+                )
+            except SafetyRefusal as exc:
+                print(f"SAFETY REFUSAL: {exc}")
+                return 2
+            if args.check_alignment_only:
+                print("Alignment check passed; no arm action was sent.")
+                return 0
+
         if not args.no_keyboard:
             keyboard = KeyboardTeleop(KeyboardTeleopConfig(id="my_laptop_keyboard"))
             keyboard.connect()
@@ -211,6 +415,16 @@ def run_teleoperation(
                 robot.send_action(make_zero_action())
             _print_connection_summary(args)
             input_fn("Press Enter to begin forwarding leader actions... ")
+            if args.robot_model == "alohamini1" and robot_connected and right_leader_connected:
+                try:
+                    pending_arm_action, pending_observation = run_alignment_gate(
+                        robot,
+                        leader,
+                        args.max_start_mismatch,
+                    )
+                except SafetyRefusal as exc:
+                    print(f"SAFETY REFUSAL: {exc}")
+                    return 2
 
         started_at = monotonic()
         while True:
@@ -224,11 +438,31 @@ def run_teleoperation(
                 if quit_key in keyboard_keys:
                     break
 
-            observation = robot.get_observation() if robot_connected else {}
-            arm_action = leader.get_action() if right_leader_connected else {}
-            arm_action = {f"arm_{key}": value for key, value in arm_action.items()}
+            forwarding_pending_sample = pending_arm_action is not None
+            if forwarding_pending_sample:
+                observation = pending_observation
+                arm_action = pending_arm_action
+                pending_arm_action = None
+                pending_observation = {}
+            else:
+                observation = robot.get_observation() if robot_connected else {}
+                raw_arm_action = leader.get_action() if right_leader_connected else {}
+                if args.robot_model == "alohamini1" and right_leader_connected:
+                    try:
+                        arm_action = extract_am1_arm_positions(
+                            raw_arm_action,
+                            source="leader",
+                            leader_sample=True,
+                        )
+                    except SafetyRefusal as exc:
+                        print(f"SAFETY REFUSAL: {exc}")
+                        return 2
+                else:
+                    arm_action = {f"arm_{key}": value for key, value in raw_arm_action.items()}
 
-            if keyboard_connected and robot is not None:
+            if forwarding_pending_sample:
+                body_action = make_zero_action()
+            elif keyboard_connected and robot is not None:
                 body_action = {
                     **robot._from_keyboard_to_base_action(keyboard_keys),
                     **robot._from_keyboard_to_lift_action(keyboard_keys),
@@ -276,10 +510,14 @@ def run_teleoperation(
                     error.add_note(f"Additional cleanup failure during {extra_label}: {extra_error!r}")
                 raise error
 
+    return 0
+
 
 def main() -> None:
     args = parse_args()
-    run_teleoperation(args)
+    status = run_teleoperation(args)
+    if status:
+        raise SystemExit(status)
 
 
 if __name__ == "__main__":
