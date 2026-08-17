@@ -315,6 +315,174 @@ def _print_alignment_table(rows: list[AlignmentRow]) -> None:
         )
 
 
+def _print_startup_sync_plan(plan: StartupSyncPlan, *, label: str) -> None:
+    print(f"{label} AM1 startup synchronization plan:")
+    print(f"  Selected side: {plan.side}")
+    print(f"  Requested minimum duration: {plan.requested_duration_s:.3f}s")
+    print(f"  Largest selected-joint displacement: {plan.max_abs_delta:.3f}")
+    print(f"  Planned intervals: {plan.total_steps}")
+    print(f"  Planned frames: {plan.frame_count}")
+    print(f"  Largest planned per-frame change: {plan.largest_planned_per_frame_change:.3f}")
+    print(f"  Estimated actual duration: {plan.estimated_actual_duration_s:.3f}s")
+
+
+def _print_startup_sync_safety_instructions() -> None:
+    print("Startup synchronization is not collision-aware joint-space interpolation.")
+    print("Use empty grippers and clear the complete follower arm envelope.")
+    print("Place both leaders in moderate poses and hold them still until verification completes.")
+    print("Keep people, objects, the other arm, and the chassis clear of any uncertain path.")
+    print("Keep the follower motor disconnect immediately accessible.")
+
+
+def validate_startup_sync_leader_drift(
+    current_leader: Mapping[str, float],
+    frozen_leader_target: Mapping[str, float],
+    selected_keys: tuple[str, ...],
+) -> None:
+    for key in selected_keys:
+        side, joint = _joint_identity(key)
+        signed_difference = current_leader[key] - frozen_leader_target[key]
+        drift = abs(signed_difference)
+        if drift > STARTUP_SYNC_LEADER_DRIFT:
+            raise SafetyRefusal(
+                f"startup sync leader drift for {side} {joint}: "
+                f"frozen={frozen_leader_target[key]}, current={current_leader[key]}, "
+                f"signed_difference={signed_difference}, drift={drift} exceeds "
+                f"STARTUP_SYNC_LEADER_DRIFT {STARTUP_SYNC_LEADER_DRIFT}"
+            )
+
+
+def verify_startup_sync_result(
+    follower_positions: Mapping[str, float],
+    frozen_leader_target: Mapping[str, float],
+    *,
+    selected_keys: tuple[str, ...],
+    max_start_mismatch: float,
+) -> list[AlignmentRow]:
+    rows = build_alignment_rows(dict(follower_positions), dict(frozen_leader_target))
+    _print_alignment_table(rows)
+    selected = set(selected_keys)
+    mismatches = [
+        row
+        for row in rows
+        if row.joint in selected and row.absolute_difference > max_start_mismatch
+    ]
+    if mismatches:
+        worst = max(mismatches, key=lambda row: row.absolute_difference)
+        raise SafetyRefusal(
+            f"startup sync verification mismatch for {worst.joint}: "
+            f"follower={worst.follower_value}, frozen={worst.leader_value}, "
+            f"signed_difference={worst.signed_difference}, "
+            f"absolute_difference={worst.absolute_difference} exceeds "
+            f"--max_start_mismatch {max_start_mismatch}"
+        )
+    return rows
+
+
+def run_startup_sync(
+    robot: Any,
+    leader: Any,
+    *,
+    side: StartupSyncSide,
+    requested_duration_s: float,
+    fps: int,
+    max_start_mismatch: float,
+    input_fn: Callable[[str], str],
+    monotonic: Callable[[], float],
+    sleep_fn: Callable[[float], None],
+) -> tuple[dict[str, float], dict[str, Any]]:
+    initial_observation = get_fresh_follower_observation(robot)
+    initial_follower = extract_am1_arm_positions(
+        initial_observation,
+        source="follower",
+        leader_sample=False,
+    )
+    initial_leader = extract_am1_arm_positions(
+        leader.get_action(),
+        source="leader",
+        leader_sample=True,
+    )
+    preliminary_plan = build_startup_sync_plan(
+        initial_follower,
+        initial_leader,
+        side=side,
+        requested_duration_s=requested_duration_s,
+        fps=fps,
+    )
+    _print_alignment_table(build_alignment_rows(initial_follower, initial_leader))
+    _print_startup_sync_plan(preliminary_plan, label="Preliminary")
+    _print_startup_sync_safety_instructions()
+    if input_fn("Type exactly SYNC and press Enter to begin follower motion: ") != "SYNC":
+        raise SafetyRefusal("startup synchronization requires the operator to type exactly SYNC")
+
+    start_observation = get_fresh_follower_observation(robot)
+    follower_start = extract_am1_arm_positions(
+        start_observation,
+        source="follower",
+        leader_sample=False,
+    )
+    frozen_target = extract_am1_arm_positions(
+        leader.get_action(),
+        source="leader",
+        leader_sample=True,
+    )
+    plan = build_startup_sync_plan(
+        follower_start,
+        frozen_target,
+        side=side,
+        requested_duration_s=requested_duration_s,
+        fps=fps,
+    )
+    _print_startup_sync_plan(plan, label="Final frozen-target")
+
+    current_leader = extract_am1_arm_positions(
+        leader.get_action(),
+        source="leader",
+        leader_sample=True,
+    )
+    validate_startup_sync_leader_drift(
+        current_leader,
+        plan.frozen_leader_target,
+        plan.selected_keys,
+    )
+    robot.send_action(build_startup_sync_action(plan, 0))
+    frame_zero_at = monotonic()
+
+    for frame_index in range(1, plan.frame_count):
+        deadline = frame_zero_at + frame_index / plan.fps
+        sleep_fn(max(deadline - monotonic(), 0.0))
+        current_leader = extract_am1_arm_positions(
+            leader.get_action(),
+            source="leader",
+            leader_sample=True,
+        )
+        validate_startup_sync_leader_drift(
+            current_leader,
+            plan.frozen_leader_target,
+            plan.selected_keys,
+        )
+        robot.send_action(build_startup_sync_action(plan, frame_index))
+
+    final_observation = get_fresh_follower_observation(robot)
+    final_follower = extract_am1_arm_positions(
+        final_observation,
+        source="follower",
+        leader_sample=False,
+    )
+    validated_frozen_target = extract_am1_arm_positions(
+        dict(plan.frozen_leader_target),
+        source="frozen leader target",
+        leader_sample=True,
+    )
+    verify_startup_sync_result(
+        final_follower,
+        validated_frozen_target,
+        selected_keys=plan.selected_keys,
+        max_start_mismatch=max_start_mismatch,
+    )
+    return dict(plan.frozen_leader_target), final_observation
+
+
 def run_alignment_gate(
     robot: Any,
     leader: Any,

@@ -619,10 +619,40 @@ def test_startup_sync_plan_copies_and_freezes_both_endpoint_mappings():
         plan.frozen_leader_target["arm_left_shoulder_pan.pos"] = 1.0
 
 
+class FakeClock:
+    def __init__(self, events: list[tuple]):
+        self.now = 0.0
+        self.events = events
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        self.events.append(("clock", "monotonic", self.now))
+        return self.now
+
+    def sleep(self, duration_s: float) -> None:
+        assert duration_s >= 0
+        self.sleeps.append(duration_s)
+        self.events.append(("clock", "sleep", duration_s))
+        self.now += duration_s
+
+    def advance(self, duration_s: float) -> None:
+        self.now += duration_s
+        self.events.append(("clock", "advance", duration_s))
+
+
+def arm_send_actions(events: list[tuple]) -> list[dict[str, float | int]]:
+    return [
+        event[2]
+        for event in events
+        if event[:2] == ("robot", "send") and any(key.startswith("arm_") for key in event[2])
+    ]
+
+
 class FakeRobot:
     instances = []
     events: list[tuple]
     observation_poses: list[dict[str, float]]
+    observation_sequence_advances: list[bool]
 
     def __init__(self, config):
         self.config = SimpleNamespace(
@@ -645,8 +675,11 @@ class FakeRobot:
     def get_observation(self):
         pose_index = min(self.observation_index, len(type(self).observation_poses) - 1)
         observation = dict(type(self).observation_poses[pose_index])
+        advances = type(self).observation_sequence_advances
+        should_advance = advances[min(self.observation_index, len(advances) - 1)] if advances else True
         self.observation_index += 1
-        self.observation_sequence += 1
+        if should_advance:
+            self.observation_sequence += 1
         self.events.append(("robot", "get_observation", self.observation_sequence, observation))
         return observation
 
@@ -696,7 +729,7 @@ class FakeLeader:
     events: list[tuple]
     right_connect_error: BaseException | None = None
     left_disconnect_error: BaseException | None = None
-    action_poses: list[dict[str, float]]
+    action_poses: list[dict[str, float] | BaseException]
 
     def __init__(self, config):
         self.config = config
@@ -713,8 +746,12 @@ class FakeLeader:
 
     def get_action(self):
         pose_index = min(self.action_index, len(type(self).action_poses) - 1)
-        action = dict(type(self).action_poses[pose_index])
+        queued = type(self).action_poses[pose_index]
         self.action_index += 1
+        if isinstance(queued, BaseException):
+            self.events.append(("leader", "get_action", queued))
+            raise queued
+        action = dict(queued)
         self.events.append(("leader", "get_action", action))
         return action
 
@@ -730,11 +767,13 @@ def prepare_teleoperation(
     left_disconnect_error=None,
     observation_poses=None,
     action_poses=None,
+    observation_sequence_advances=None,
 ):
     events: list[tuple] = []
     FakeRobot.instances = []
     FakeRobot.events = events
     FakeRobot.observation_poses = list(observation_poses or [FOLLOWER_POSE])
+    FakeRobot.observation_sequence_advances = list(observation_sequence_advances or [True])
     FakeLeader.instances = []
     FakeLeader.events = events
     FakeLeader.right_connect_error = right_connect_error
@@ -753,6 +792,296 @@ def prepare_teleoperation(
         lambda: (_ for _ in ()).throw(AssertionError("Rerun helpers were loaded")),
     )
     return events
+
+
+def make_direct_sync_fakes(
+    monkeypatch,
+    module,
+    *,
+    observation_poses,
+    action_poses,
+    observation_sequence_advances=None,
+):
+    events = prepare_teleoperation(
+        monkeypatch,
+        module,
+        observation_poses=observation_poses,
+        action_poses=action_poses,
+        observation_sequence_advances=observation_sequence_advances,
+    )
+    robot = FakeRobot(SimpleNamespace(remote_ip="127.0.0.1", robot_model="alohamini1"))
+    leader = FakeLeader(SimpleNamespace())
+    return robot, leader, events
+
+
+@pytest.mark.parametrize("response", ["", "sync", " SYNC", "SYNC "])
+def test_sync_requires_exact_confirmation_before_any_arm_send(monkeypatch, response):
+    module = load_example_module("teleoperate_bi")
+    robot, leader, events = make_direct_sync_fakes(
+        monkeypatch,
+        module,
+        observation_poses=[FOLLOWER_POSE],
+        action_poses=[LEADER_POSE],
+    )
+    clock = FakeClock(events)
+
+    def refuse_confirmation(prompt):
+        assert "SYNC" in prompt
+        assert arm_send_actions(events) == []
+        return response
+
+    with pytest.raises(module.SafetyRefusal, match="type exactly SYNC"):
+        module.run_startup_sync(
+            robot,
+            leader,
+            side="both",
+            requested_duration_s=0.2,
+            fps=5,
+            max_start_mismatch=10.0,
+            input_fn=refuse_confirmation,
+            monotonic=clock.monotonic,
+            sleep_fn=clock.sleep,
+        )
+
+    assert arm_send_actions(events) == []
+    assert sum(event[:2] == ("leader", "get_action") for event in events) == 1
+
+
+def test_sync_uses_post_confirmation_start_and_frozen_target_for_bounded_payloads(monkeypatch, capsys):
+    module = load_example_module("teleoperate_bi")
+    initial_follower = {**FOLLOWER_POSE, "arm_left_shoulder_pan.pos": -5.0}
+    stale_after_confirmation = {**FOLLOWER_POSE, "arm_left_shoulder_pan.pos": -4.0}
+    measured_start = {**FOLLOWER_POSE, "arm_left_shoulder_pan.pos": 0.0}
+    initial_leader = {**LEADER_POSE, "left_shoulder_pan.pos": -5.0}
+    frozen_leader = {**LEADER_POSE, "left_shoulder_pan.pos": 1.5}
+    final_follower = {f"arm_{key}": value for key, value in frozen_leader.items()}
+    robot, leader, events = make_direct_sync_fakes(
+        monkeypatch,
+        module,
+        observation_poses=[initial_follower, stale_after_confirmation, measured_start, final_follower],
+        action_poses=[
+            initial_leader,
+            frozen_leader,
+            frozen_leader,
+            {**frozen_leader, "left_shoulder_pan.pos": 2.0},
+            {**frozen_leader, "left_shoulder_pan.pos": 2.5},
+        ],
+        observation_sequence_advances=[True, False, True, True],
+    )
+    clock = FakeClock(events)
+
+    def confirm(prompt):
+        assert arm_send_actions(events) == []
+        events.append(("operator", "confirmation", "SYNC"))
+        return "SYNC"
+
+    frozen_target, final_observation = module.run_startup_sync(
+        robot,
+        leader,
+        side="both",
+        requested_duration_s=0.2,
+        fps=5,
+        max_start_mismatch=10.0,
+        input_fn=confirm,
+        monotonic=clock.monotonic,
+        sleep_fn=clock.sleep,
+    )
+
+    sends = arm_send_actions(events)
+    output = capsys.readouterr().out
+    assert len(sends) == 3
+    assert "Preliminary AM1 startup synchronization plan" in output
+    assert "Final frozen-target AM1 startup synchronization plan" in output
+    assert "Selected side: both" in output
+    assert "Requested minimum duration: 0.200s" in output
+    assert "Planned frames: 3" in output
+    assert "not collision-aware" in output
+    assert "motor disconnect" in output
+    assert sends[0]["arm_left_shoulder_pan.pos"] == 0.0
+    assert sends[-1]["arm_left_shoulder_pan.pos"] == 1.5
+    assert frozen_target["arm_left_shoulder_pan.pos"] == 1.5
+    assert final_observation == final_follower
+    for previous, current in zip(sends, sends[1:]):
+        for key in module.AM1_ARM_POSITION_KEYS:
+            assert abs(current[key] - previous[key]) <= module.STARTUP_SYNC_MAX_STEP
+    for action in sends:
+        assert {key: action[key] for key in module.make_zero_action()} == module.make_zero_action()
+    for index, event in enumerate(events):
+        if event[:2] == ("robot", "send") and any(key.startswith("arm_") for key in event[2]):
+            assert events[index - 1][:2] == ("leader", "get_action")
+    assert clock.sleeps == pytest.approx([0.2, 0.2])
+
+
+@pytest.mark.parametrize(
+    ("bad_pose", "reason"),
+    [
+        ({key: value for key, value in LEADER_POSE.items() if key != "right_wrist_roll.pos"}, "missing"),
+        ({**LEADER_POSE, "right_wrist_yaw.pos": 0.0}, "unexpected"),
+        ({**LEADER_POSE, "right_elbow_flex.pos": "bad"}, "must be numeric"),
+        ({**LEADER_POSE, "right_shoulder_lift.pos": math.inf}, "must be finite"),
+        ({**LEADER_POSE, "right_wrist_flex.pos": 100.1}, "outside expected -100..100"),
+    ],
+)
+def test_sync_invalid_unselected_leader_sample_aborts_before_affected_frame(
+    monkeypatch,
+    bad_pose,
+    reason,
+):
+    module = load_example_module("teleoperate_bi")
+    robot, leader, events = make_direct_sync_fakes(
+        monkeypatch,
+        module,
+        observation_poses=[FOLLOWER_POSE, FOLLOWER_POSE],
+        action_poses=[LEADER_POSE, LEADER_POSE, bad_pose],
+    )
+    clock = FakeClock(events)
+
+    with pytest.raises(module.SafetyRefusal, match=reason):
+        module.run_startup_sync(
+            robot,
+            leader,
+            side="left",
+            requested_duration_s=0.2,
+            fps=5,
+            max_start_mismatch=10.0,
+            input_fn=lambda _: "SYNC",
+            monotonic=clock.monotonic,
+            sleep_fn=clock.sleep,
+        )
+
+    assert arm_send_actions(events) == []
+
+
+def test_sync_selected_leader_drift_aborts_before_affected_frame(monkeypatch):
+    module = load_example_module("teleoperate_bi")
+    drifted = {**LEADER_POSE, "left_shoulder_pan.pos": 2.000001}
+    robot, leader, events = make_direct_sync_fakes(
+        monkeypatch,
+        module,
+        observation_poses=[FOLLOWER_POSE, FOLLOWER_POSE],
+        action_poses=[LEADER_POSE, LEADER_POSE, LEADER_POSE, drifted],
+    )
+    clock = FakeClock(events)
+
+    with pytest.raises(
+        module.SafetyRefusal,
+        match=r"left shoulder_pan.*frozen=0\.0.*current=2\.000001.*drift=2\.000001.*2\.0",
+    ):
+        module.run_startup_sync(
+            robot,
+            leader,
+            side="both",
+            requested_duration_s=0.2,
+            fps=5,
+            max_start_mismatch=10.0,
+            input_fn=lambda _: "SYNC",
+            monotonic=clock.monotonic,
+            sleep_fn=clock.sleep,
+        )
+
+    assert len(arm_send_actions(events)) == 1
+
+
+def test_sync_selected_leader_drift_equal_to_limit_is_allowed(monkeypatch):
+    module = load_example_module("teleoperate_bi")
+    boundary = {**LEADER_POSE, "left_shoulder_pan.pos": 2.0}
+    robot, leader, events = make_direct_sync_fakes(
+        monkeypatch,
+        module,
+        observation_poses=[FOLLOWER_POSE, FOLLOWER_POSE, FOLLOWER_POSE],
+        action_poses=[LEADER_POSE, LEADER_POSE, LEADER_POSE, boundary],
+    )
+    clock = FakeClock(events)
+
+    module.run_startup_sync(
+        robot,
+        leader,
+        side="both",
+        requested_duration_s=0.2,
+        fps=5,
+        max_start_mismatch=10.0,
+        input_fn=lambda _: "SYNC",
+        monotonic=clock.monotonic,
+        sleep_fn=clock.sleep,
+    )
+
+    assert len(arm_send_actions(events)) == 2
+
+
+def test_sync_final_selected_mismatch_refuses_after_printing_full_table(monkeypatch, capsys):
+    module = load_example_module("teleoperate_bi")
+    mismatched = {**FOLLOWER_POSE, "arm_left_shoulder_pan.pos": 10.1}
+    robot, leader, events = make_direct_sync_fakes(
+        monkeypatch,
+        module,
+        observation_poses=[FOLLOWER_POSE, FOLLOWER_POSE, mismatched],
+        action_poses=[LEADER_POSE, LEADER_POSE, LEADER_POSE, LEADER_POSE],
+    )
+    clock = FakeClock(events)
+
+    with pytest.raises(module.SafetyRefusal, match=r"arm_left_shoulder_pan\.pos.*10\.1.*10\.0"):
+        module.run_startup_sync(
+            robot,
+            leader,
+            side="both",
+            requested_duration_s=0.2,
+            fps=5,
+            max_start_mismatch=10.0,
+            input_fn=lambda _: "SYNC",
+            monotonic=clock.monotonic,
+            sleep_fn=clock.sleep,
+        )
+
+    output = capsys.readouterr().out
+    assert "follower value" in output
+    assert "signed difference" in output
+    assert len(arm_send_actions(events)) == 2
+
+
+@pytest.mark.parametrize(
+    ("side", "unselected_follower_key", "unselected_leader_key", "forbidden_prefix"),
+    [
+        ("left", "arm_right_shoulder_pan.pos", "right_shoulder_pan.pos", "arm_right_"),
+        ("right", "arm_left_shoulder_pan.pos", "left_shoulder_pan.pos", "arm_left_"),
+    ],
+)
+def test_sync_one_side_ignores_unselected_drift_and_final_mismatch_but_prints_it(
+    monkeypatch,
+    capsys,
+    side,
+    unselected_follower_key,
+    unselected_leader_key,
+    forbidden_prefix,
+):
+    module = load_example_module("teleoperate_bi")
+    unselected_mismatch = {**FOLLOWER_POSE, unselected_follower_key: 20.1}
+    unselected_drift = {**LEADER_POSE, unselected_leader_key: 3.0}
+    robot, leader, events = make_direct_sync_fakes(
+        monkeypatch,
+        module,
+        observation_poses=[FOLLOWER_POSE, FOLLOWER_POSE, unselected_mismatch],
+        action_poses=[LEADER_POSE, LEADER_POSE, LEADER_POSE, unselected_drift],
+    )
+    clock = FakeClock(events)
+
+    frozen_target, _ = module.run_startup_sync(
+        robot,
+        leader,
+        side=side,
+        requested_duration_s=0.2,
+        fps=5,
+        max_start_mismatch=10.0,
+        input_fn=lambda _: "SYNC",
+        monotonic=clock.monotonic,
+        sleep_fn=clock.sleep,
+    )
+
+    assert frozen_target == FOLLOWER_POSE
+    assert unselected_follower_key in capsys.readouterr().out
+    assert all(
+        not any(key.startswith(forbidden_prefix) for key in action)
+        for action in arm_send_actions(events)
+    )
 
 
 def teleoperation_args(module, *extra_args):
