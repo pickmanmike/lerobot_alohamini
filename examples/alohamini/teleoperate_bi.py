@@ -433,6 +433,7 @@ def run_startup_sync(
         requested_duration_s=requested_duration_s,
         fps=fps,
     )
+    _print_alignment_table(build_alignment_rows(follower_start, frozen_target))
     _print_startup_sync_plan(plan, label="Final frozen-target")
 
     current_leader = extract_am1_arm_positions(
@@ -446,11 +447,12 @@ def run_startup_sync(
         plan.selected_keys,
     )
     robot.send_action(build_startup_sync_action(plan, 0))
-    frame_zero_at = monotonic()
+    previous_send_completed_at = monotonic()
+    frame_period_s = 1.0 / plan.fps
 
     for frame_index in range(1, plan.frame_count):
-        deadline = frame_zero_at + frame_index / plan.fps
-        sleep_fn(max(deadline - monotonic(), 0.0))
+        next_send_not_before = previous_send_completed_at + frame_period_s
+        sleep_fn(max(next_send_not_before - monotonic(), 0.0))
         current_leader = extract_am1_arm_positions(
             leader.get_action(),
             source="leader",
@@ -462,24 +464,34 @@ def run_startup_sync(
             plan.selected_keys,
         )
         robot.send_action(build_startup_sync_action(plan, frame_index))
+        previous_send_completed_at = monotonic()
 
-    final_observation = get_fresh_follower_observation(robot)
-    final_follower = extract_am1_arm_positions(
-        final_observation,
-        source="follower",
-        leader_sample=False,
-    )
     validated_frozen_target = extract_am1_arm_positions(
         dict(plan.frozen_leader_target),
         source="frozen leader target",
         leader_sample=True,
     )
-    verify_startup_sync_result(
-        final_follower,
-        validated_frozen_target,
-        selected_keys=plan.selected_keys,
-        max_start_mismatch=max_start_mismatch,
-    )
+    verification_attempts = int(getattr(robot.config, "observation_request_window", 1)) + 1
+    for verification_index in range(verification_attempts):
+        final_observation = get_fresh_follower_observation(robot)
+        final_follower = extract_am1_arm_positions(
+            final_observation,
+            source="follower",
+            leader_sample=False,
+        )
+        try:
+            verify_startup_sync_result(
+                final_follower,
+                validated_frozen_target,
+                selected_keys=plan.selected_keys,
+                max_start_mismatch=max_start_mismatch,
+            )
+        except SafetyRefusal:
+            if verification_index == verification_attempts - 1:
+                raise
+            continue
+        break
+
     return dict(plan.frozen_leader_target), final_observation
 
 

@@ -660,6 +660,7 @@ class FakeRobot:
             robot_model=config.robot_model,
             teleop_keys={"quit": "q"},
             connect_timeout_s=1.0,
+            observation_request_window=3,
         )
         self.is_connected = False
         self.actions: list[dict[str, float]] = []
@@ -912,6 +913,127 @@ def test_sync_uses_post_confirmation_start_and_frozen_target_for_bounded_payload
     assert clock.sleeps == pytest.approx([0.2, 0.2])
 
 
+def test_sync_does_not_compress_frames_after_processing_overruns_period(monkeypatch):
+    module = load_example_module("teleoperate_bi")
+    frozen_leader = {**LEADER_POSE, "left_shoulder_pan.pos": 1.5}
+    final_follower = {f"arm_{key}": value for key, value in frozen_leader.items()}
+    robot, leader, events = make_direct_sync_fakes(
+        monkeypatch,
+        module,
+        observation_poses=[FOLLOWER_POSE, FOLLOWER_POSE, final_follower],
+        action_poses=[LEADER_POSE, frozen_leader, frozen_leader, frozen_leader, frozen_leader],
+    )
+    clock = FakeClock(events)
+    original_get_action = leader.get_action
+    original_send_action = robot.send_action
+    send_times: list[float] = []
+
+    def get_action_with_one_overrun():
+        action = original_get_action()
+        if leader.action_index == 4:
+            clock.advance(0.3)
+        return action
+
+    def send_action_with_timestamp(action):
+        if any(key.startswith("arm_") for key in action):
+            send_times.append(clock.now)
+        return original_send_action(action)
+
+    monkeypatch.setattr(leader, "get_action", get_action_with_one_overrun)
+    monkeypatch.setattr(robot, "send_action", send_action_with_timestamp)
+
+    module.run_startup_sync(
+        robot,
+        leader,
+        side="left",
+        requested_duration_s=0.2,
+        fps=5,
+        max_start_mismatch=10.0,
+        input_fn=lambda prompt: "SYNC",
+        monotonic=clock.monotonic,
+        sleep_fn=clock.sleep,
+    )
+
+    send_gaps = [current - previous for previous, current in zip(send_times, send_times[1:])]
+    assert min(send_gaps) >= 1.0 / 5 - 1e-9
+    assert 0.0 not in clock.sleeps
+
+
+def test_sync_prints_final_measured_endpoints_before_first_arm_send(monkeypatch, capsys):
+    module = load_example_module("teleoperate_bi")
+    initial_follower = {**FOLLOWER_POSE, "arm_left_shoulder_pan.pos": -5.0}
+    final_start = {**FOLLOWER_POSE, "arm_left_shoulder_pan.pos": 12.25}
+    initial_leader = {**LEADER_POSE, "left_shoulder_pan.pos": -4.0}
+    frozen_leader = {**LEADER_POSE, "left_shoulder_pan.pos": 13.5}
+    final_follower = {f"arm_{key}": value for key, value in frozen_leader.items()}
+    robot, leader, events = make_direct_sync_fakes(
+        monkeypatch,
+        module,
+        observation_poses=[initial_follower, final_start, final_follower],
+        action_poses=[initial_leader, frozen_leader, frozen_leader, frozen_leader, frozen_leader],
+    )
+    clock = FakeClock(events)
+    original_send_action = robot.send_action
+    output_before_first_arm_send: list[str] = []
+
+    def send_action_after_recording_output(action):
+        if any(key.startswith("arm_") for key in action) and not output_before_first_arm_send:
+            output_before_first_arm_send.append(capsys.readouterr().out)
+        return original_send_action(action)
+
+    monkeypatch.setattr(robot, "send_action", send_action_after_recording_output)
+
+    module.run_startup_sync(
+        robot,
+        leader,
+        side="left",
+        requested_duration_s=0.2,
+        fps=5,
+        max_start_mismatch=10.0,
+        input_fn=lambda prompt: "SYNC",
+        monotonic=clock.monotonic,
+        sleep_fn=clock.sleep,
+    )
+
+    output = output_before_first_arm_send[0]
+    endpoint_row = (
+        f"  {'arm_left_shoulder_pan.pos':<36} {12.25:>14.3f} {13.5:>14.3f} "
+        f"{1.25:>18.3f} {1.25:>20.3f}"
+    )
+    assert endpoint_row in output
+    assert output.index(endpoint_row) < output.index("Final frozen-target AM1 startup synchronization plan")
+
+
+def test_sync_retries_verification_after_stale_precommand_observation(monkeypatch):
+    module = load_example_module("teleoperate_bi")
+    frozen_leader = {**LEADER_POSE, "left_shoulder_pan.pos": 0.75}
+    stale_observation = dict(FOLLOWER_POSE)
+    settled_observation = {f"arm_{key}": value for key, value in frozen_leader.items()}
+    robot, leader, events = make_direct_sync_fakes(
+        monkeypatch,
+        module,
+        observation_poses=[FOLLOWER_POSE, FOLLOWER_POSE, stale_observation, settled_observation],
+        action_poses=[LEADER_POSE, frozen_leader, frozen_leader, frozen_leader],
+    )
+    clock = FakeClock(events)
+
+    frozen_target, final_observation = module.run_startup_sync(
+        robot,
+        leader,
+        side="left",
+        requested_duration_s=0.2,
+        fps=5,
+        max_start_mismatch=0.1,
+        input_fn=lambda prompt: "SYNC",
+        monotonic=clock.monotonic,
+        sleep_fn=clock.sleep,
+    )
+
+    assert frozen_target["arm_left_shoulder_pan.pos"] == 0.75
+    assert final_observation == settled_observation
+    assert robot.observation_index == 4
+
+
 @pytest.mark.parametrize(
     ("bad_pose", "reason"),
     [
@@ -1036,6 +1158,7 @@ def test_sync_final_selected_mismatch_refuses_after_printing_full_table(monkeypa
     assert "follower value" in output
     assert "signed difference" in output
     assert len(arm_send_actions(events)) == 2
+    assert robot.observation_index == 2 + robot.config.observation_request_window + 1
 
 
 @pytest.mark.parametrize(
@@ -2001,6 +2124,8 @@ def test_windows_startup_sync_commissioning_docs_contain_approved_safety_sequenc
         "not collision-aware",
         "STARTUP_SYNC_MAX_STEP = 0.75",
         "STARTUP_SYNC_LEADER_DRIFT = 2.0",
+        "overrun lengthens the move",
+        "observation request window plus one",
         "type exactly `SYNC`",
         "S1",
         "S2",
