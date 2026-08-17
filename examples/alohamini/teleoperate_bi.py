@@ -215,6 +215,32 @@ def build_parser() -> argparse.ArgumentParser:
         help="Validate AM1 leader/follower alignment, send no arm action, and exit",
     )
     parser.add_argument(
+        "--startup_mode",
+        choices=("strict", "sync"),
+        default="strict",
+        help="AM1 startup behavior: strict alignment refusal or operator-authorized synchronization (default: strict)",
+    )
+    parser.add_argument(
+        "--startup_sync_duration_s",
+        type=float,
+        default=12.0,
+        help="Requested minimum synchronization duration in seconds (default: 12.0)",
+    )
+    parser.add_argument(
+        "--startup_sync_side",
+        choices=("left", "right", "both"),
+        default="both",
+        help="Follower side synchronized by sync mode (default: both)",
+    )
+    parser.add_argument(
+        "--startup_sync_only",
+        action="store_true",
+        help=(
+            "Synchronize, verify, and exit; --start_paused has no effect and "
+            "--duration_s is unused in this mode"
+        ),
+    )
+    parser.add_argument(
         "--max_start_mismatch",
         type=float,
         default=10.0,
@@ -281,6 +307,19 @@ def parse_args(
         parser.error("--duration_s must be zero or greater")
     if not math.isfinite(args.max_start_mismatch) or args.max_start_mismatch <= 0:
         parser.error("--max_start_mismatch must be finite and greater than zero")
+    if not math.isfinite(args.startup_sync_duration_s) or args.startup_sync_duration_s <= 0:
+        parser.error("--startup_sync_duration_s must be finite and greater than zero")
+    if args.startup_sync_only and args.startup_mode != "sync":
+        parser.error("--startup_sync_only requires --startup_mode sync")
+    if args.startup_sync_side in {"left", "right"} and not args.startup_sync_only:
+        parser.error("--startup_sync_side left or right requires --startup_sync_only")
+    if args.startup_mode == "sync":
+        if args.robot_model != "alohamini1":
+            parser.error("--startup_mode sync is supported only for alohamini1")
+        if args.no_robot or args.no_leader:
+            parser.error("--startup_mode sync requires both robot and leader connections")
+        if args.check_alignment_only:
+            parser.error("--check_alignment_only is incompatible with --startup_mode sync")
     if args.check_alignment_only and (args.no_robot or args.no_leader):
         parser.error("--check_alignment_only requires both robot and leader connections")
     if args.check_alignment_only and args.robot_model != "alohamini1":

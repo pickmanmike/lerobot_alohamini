@@ -153,6 +153,111 @@ def test_teleoperation_alignment_threshold_defaults_to_ten():
     assert args.check_alignment_only is False
 
 
+def test_startup_sync_cli_defaults_preserve_strict_mode():
+    module = load_example_module("teleoperate_bi")
+
+    args = module.parse_args([], platform_name="Linux")
+
+    assert args.startup_mode == "strict"
+    assert args.startup_sync_duration_s == 12.0
+    assert args.startup_sync_side == "both"
+    assert args.startup_sync_only is False
+    assert args.max_start_mismatch == 10.0
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "-inf"])
+def test_startup_sync_duration_rejects_nonpositive_or_nonfinite(capsys, value):
+    module = load_example_module("teleoperate_bi")
+
+    with pytest.raises(SystemExit) as caught:
+        module.parse_args([f"--startup_sync_duration_s={value}"], platform_name="Linux")
+
+    assert caught.value.code == 2
+    assert "--startup_sync_duration_s must be finite and greater than zero" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("argv", "reason"),
+    [
+        (["--startup_mode", "sync", "--robot_model", "alohamini2"], "sync is supported only for alohamini1"),
+        (["--startup_mode", "sync", "--robot_model", "alohamini2pro"], "sync is supported only for alohamini1"),
+        (["--startup_mode", "sync", "--no_robot"], "sync requires both robot and leader connections"),
+        (["--startup_mode", "sync", "--no_leader"], "sync requires both robot and leader connections"),
+        (["--startup_sync_only"], "--startup_sync_only requires --startup_mode sync"),
+        (["--startup_sync_side", "left"], "left or right requires --startup_sync_only"),
+        (["--startup_sync_side", "right"], "left or right requires --startup_sync_only"),
+        (
+            ["--startup_mode", "sync", "--startup_sync_side", "left"],
+            "left or right requires --startup_sync_only",
+        ),
+        (
+            ["--startup_mode", "sync", "--startup_sync_side", "right"],
+            "left or right requires --startup_sync_only",
+        ),
+        (
+            ["--startup_mode", "sync", "--check_alignment_only"],
+            "--check_alignment_only is incompatible with --startup_mode sync",
+        ),
+    ],
+)
+def test_startup_sync_rejects_incompatible_arguments(capsys, argv, reason):
+    module = load_example_module("teleoperate_bi")
+
+    with pytest.raises(SystemExit) as caught:
+        module.parse_args(argv, platform_name="Linux")
+
+    assert caught.value.code == 2
+    assert reason in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_startup_sync_allows_one_side_only_for_sync_only(side):
+    module = load_example_module("teleoperate_bi")
+
+    args = module.parse_args(
+        [
+            "--startup_mode",
+            "sync",
+            "--startup_sync_side",
+            side,
+            "--startup_sync_only",
+            "--start_paused",
+            "--duration_s",
+            "30",
+        ],
+        platform_name="Linux",
+    )
+
+    assert args.startup_sync_side == side
+    assert args.start_paused is True
+    assert args.duration_s == 30.0
+
+
+def test_startup_sync_allows_both_for_normal_teleoperation():
+    module = load_example_module("teleoperate_bi")
+
+    args = module.parse_args(["--startup_mode", "sync"], platform_name="Linux")
+
+    assert args.startup_sync_side == "both"
+    assert args.startup_sync_only is False
+
+
+def test_startup_sync_help_explains_sync_only_ignored_options():
+    module = load_example_module("teleoperate_bi")
+
+    help_text = module.build_parser().format_help()
+    sync_only_action = next(
+        action for action in module.build_parser()._actions if action.dest == "startup_sync_only"
+    )
+
+    assert "--startup_mode {strict,sync}" in help_text
+    assert "--startup_sync_duration_s" in help_text
+    assert "--startup_sync_side {left,right,both}" in help_text
+    assert "--startup_sync_only" in help_text
+    assert "--start_paused has no effect" in sync_only_action.help
+    assert "--duration_s is unused" in sync_only_action.help
+
+
 @pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "-inf"])
 def test_teleoperation_rejects_nonpositive_or_nonfinite_alignment_threshold(capsys, value):
     module = load_example_module("teleoperate_bi")
