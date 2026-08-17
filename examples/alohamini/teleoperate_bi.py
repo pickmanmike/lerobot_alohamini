@@ -22,8 +22,10 @@ import argparse
 import math
 import sys
 import time
-from collections.abc import Callable
-from typing import Any, NamedTuple
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from types import MappingProxyType
+from typing import Any, Literal, NamedTuple
 
 from lerobot.robots.alohamini import AlohaMiniClient, AlohaMiniClientConfig
 from lerobot.teleoperators.bi_so_leader import BiSOLeader, BiSOLeaderConfig
@@ -52,6 +54,25 @@ AM1_ARM_POSITION_KEYS = (
     "arm_right_gripper.pos",
 )
 ACTION_RANGE_TOLERANCE = 1e-6
+STARTUP_SYNC_MAX_STEP = 0.75
+STARTUP_SYNC_LEADER_DRIFT = 2.0
+
+StartupSyncSide = Literal["left", "right", "both"]
+
+
+@dataclass(frozen=True)
+class StartupSyncPlan:
+    side: StartupSyncSide
+    selected_keys: tuple[str, ...]
+    follower_start: Mapping[str, float]
+    frozen_leader_target: Mapping[str, float]
+    requested_duration_s: float
+    fps: int
+    max_abs_delta: float
+    total_steps: int
+    frame_count: int
+    largest_planned_per_frame_change: float
+    estimated_actual_duration_s: float
 
 
 class SafetyRefusal(ValueError):
@@ -123,6 +144,129 @@ def extract_am1_arm_positions(
         validated[key] = value
 
     return validated
+
+
+def selected_arm_position_keys(side: StartupSyncSide) -> tuple[str, ...]:
+    if side not in {"left", "right", "both"}:
+        raise ValueError(f"Unsupported startup sync side: {side!r}")
+    if side == "both":
+        return AM1_ARM_POSITION_KEYS
+    return tuple(key for key in AM1_ARM_POSITION_KEYS if key.startswith(f"arm_{side}_"))
+
+
+def validate_selected_sync_positions(
+    positions: Mapping[str, float],
+    selected_keys: tuple[str, ...],
+    *,
+    source: str,
+) -> None:
+    for key in selected_keys:
+        side, joint = _joint_identity(key)
+        try:
+            value = float(positions[key])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise SafetyRefusal(f"{source} {side} {joint} must be present and numeric") from exc
+        if not math.isfinite(value):
+            raise SafetyRefusal(f"{source} {side} {joint} value {value} must be finite")
+        lower = 0.0 if joint == "gripper" else -100.0
+        upper = 100.0
+        if value < lower - ACTION_RANGE_TOLERANCE or value > upper + ACTION_RANGE_TOLERANCE:
+            expected_range = "0..100" if joint == "gripper" else "-100..100"
+            raise SafetyRefusal(
+                f"{source} {side} {joint} value {value} is outside expected {expected_range}"
+            )
+
+
+def build_startup_sync_plan(
+    follower_start: Mapping[str, float],
+    frozen_leader_target: Mapping[str, float],
+    *,
+    side: StartupSyncSide,
+    requested_duration_s: float,
+    fps: int,
+) -> StartupSyncPlan:
+    if not math.isfinite(requested_duration_s) or requested_duration_s <= 0:
+        raise SafetyRefusal("startup sync duration must be finite and greater than zero")
+    if fps <= 0:
+        raise SafetyRefusal("startup sync fps must be greater than zero")
+
+    selected_keys = selected_arm_position_keys(side)
+    follower_copy = extract_am1_arm_positions(
+        dict(follower_start),
+        source="follower",
+        leader_sample=False,
+    )
+    target_copy = extract_am1_arm_positions(
+        dict(frozen_leader_target),
+        source="frozen leader target",
+        leader_sample=True,
+    )
+    validate_selected_sync_positions(follower_copy, selected_keys, source="follower")
+    max_abs_delta = max(abs(target_copy[key] - follower_copy[key]) for key in selected_keys)
+    duration_steps = math.ceil(requested_duration_s * fps)
+    step_limit_steps = math.ceil(max_abs_delta / STARTUP_SYNC_MAX_STEP)
+    total_steps = max(1, duration_steps, step_limit_steps)
+    frame_count = total_steps + 1
+    largest_change = max_abs_delta / total_steps
+    estimated_duration = total_steps / fps
+    if largest_change > STARTUP_SYNC_MAX_STEP + ACTION_RANGE_TOLERANCE:
+        raise SafetyRefusal(
+            f"startup sync planned per-frame change {largest_change} exceeds "
+            f"STARTUP_SYNC_MAX_STEP {STARTUP_SYNC_MAX_STEP}"
+        )
+
+    return StartupSyncPlan(
+        side=side,
+        selected_keys=selected_keys,
+        follower_start=MappingProxyType(follower_copy),
+        frozen_leader_target=MappingProxyType(target_copy),
+        requested_duration_s=requested_duration_s,
+        fps=fps,
+        max_abs_delta=max_abs_delta,
+        total_steps=total_steps,
+        frame_count=frame_count,
+        largest_planned_per_frame_change=largest_change,
+        estimated_actual_duration_s=estimated_duration,
+    )
+
+
+def build_startup_sync_action(
+    plan: StartupSyncPlan,
+    frame_index: int,
+) -> dict[str, float | int]:
+    if frame_index < 0 or frame_index > plan.total_steps:
+        raise ValueError(f"startup sync frame index {frame_index} is outside 0..{plan.total_steps}")
+
+    if frame_index == 0:
+        arm_action = {key: plan.follower_start[key] for key in plan.selected_keys}
+    elif frame_index == plan.total_steps:
+        arm_action = {key: plan.frozen_leader_target[key] for key in plan.selected_keys}
+    else:
+        alpha = frame_index / plan.total_steps
+        arm_action = {
+            key: plan.follower_start[key]
+            + alpha * (plan.frozen_leader_target[key] - plan.follower_start[key])
+            for key in plan.selected_keys
+        }
+
+    validate_selected_sync_positions(arm_action, plan.selected_keys, source="synchronization target")
+    if frame_index > 0:
+        previous_index = frame_index - 1
+        for key in plan.selected_keys:
+            if previous_index == 0:
+                previous_value = plan.follower_start[key]
+            else:
+                previous_alpha = previous_index / plan.total_steps
+                previous_value = plan.follower_start[key] + previous_alpha * (
+                    plan.frozen_leader_target[key] - plan.follower_start[key]
+                )
+            change = abs(arm_action[key] - previous_value)
+            if change > STARTUP_SYNC_MAX_STEP + ACTION_RANGE_TOLERANCE:
+                raise SafetyRefusal(
+                    f"startup sync frame {frame_index} change for {key} is {change}, "
+                    f"above STARTUP_SYNC_MAX_STEP {STARTUP_SYNC_MAX_STEP}"
+                )
+    return {**arm_action, **make_zero_action()}
 
 
 def get_fresh_follower_observation(robot: Any) -> dict[str, Any]:

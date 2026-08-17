@@ -54,9 +54,11 @@ def load_example_module(script_name: str):
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.path.insert(0, str(ALOHAMINI_EXAMPLES))
+    sys.modules[module_name] = module
     try:
         spec.loader.exec_module(module)
     finally:
+        sys.modules.pop(module_name, None)
         sys.path.remove(str(ALOHAMINI_EXAMPLES))
     return module
 
@@ -501,6 +503,120 @@ def test_alignment_rows_use_leader_minus_follower_difference():
     assert row.leader_value == -12.5
     assert row.signed_difference == 7.5
     assert row.absolute_difference == 7.5
+
+
+def test_startup_sync_plan_extends_duration_for_step_limit():
+    module = load_example_module("teleoperate_bi")
+    target = {**FOLLOWER_POSE, "arm_left_shoulder_pan.pos": 3.0}
+
+    plan = module.build_startup_sync_plan(
+        FOLLOWER_POSE,
+        target,
+        side="both",
+        requested_duration_s=0.2,
+        fps=5,
+    )
+
+    assert plan.max_abs_delta == 3.0
+    assert plan.total_steps == 4
+    assert plan.frame_count == 5
+    assert plan.largest_planned_per_frame_change == 0.75
+    assert plan.estimated_actual_duration_s == 0.8
+
+
+def test_startup_sync_plan_preserves_duration_for_zero_displacement():
+    module = load_example_module("teleoperate_bi")
+
+    plan = module.build_startup_sync_plan(
+        FOLLOWER_POSE,
+        FOLLOWER_POSE,
+        side="both",
+        requested_duration_s=12.0,
+        fps=5,
+    )
+
+    assert plan.total_steps == 60
+    assert plan.frame_count == 61
+    assert plan.largest_planned_per_frame_change == 0.0
+    assert plan.estimated_actual_duration_s == 12.0
+
+
+def test_startup_sync_actions_have_exact_endpoints_bounded_steps_and_zero_body():
+    module = load_example_module("teleoperate_bi")
+    target = {**FOLLOWER_POSE, "arm_left_shoulder_pan.pos": 3.0}
+    plan = module.build_startup_sync_plan(
+        FOLLOWER_POSE,
+        target,
+        side="both",
+        requested_duration_s=0.2,
+        fps=5,
+    )
+
+    frames = [module.build_startup_sync_action(plan, index) for index in range(plan.frame_count)]
+
+    assert frames[0]["arm_left_shoulder_pan.pos"] == FOLLOWER_POSE["arm_left_shoulder_pan.pos"]
+    assert frames[-1]["arm_left_shoulder_pan.pos"] == target["arm_left_shoulder_pan.pos"]
+    for previous, current in zip(frames, frames[1:]):
+        for key in plan.selected_keys:
+            assert abs(current[key] - previous[key]) <= module.STARTUP_SYNC_MAX_STEP
+    for frame in frames:
+        assert {key: frame[key] for key in module.make_zero_action()} == module.make_zero_action()
+
+
+@pytest.mark.parametrize(
+    ("side", "required_prefix", "forbidden_prefix"),
+    [("left", "arm_left_", "arm_right_"), ("right", "arm_right_", "arm_left_")],
+)
+def test_startup_sync_action_omits_unselected_arm_keys(side, required_prefix, forbidden_prefix):
+    module = load_example_module("teleoperate_bi")
+    plan = module.build_startup_sync_plan(
+        FOLLOWER_POSE,
+        FOLLOWER_POSE,
+        side=side,
+        requested_duration_s=0.2,
+        fps=5,
+    )
+
+    action = module.build_startup_sync_action(plan, 0)
+    arm_keys = {key for key in action if key.startswith("arm_")}
+
+    assert len(arm_keys) == 6
+    assert all(key.startswith(required_prefix) for key in arm_keys)
+    assert all(not key.startswith(forbidden_prefix) for key in arm_keys)
+
+
+def test_startup_sync_plan_rejects_out_of_range_selected_follower_start():
+    module = load_example_module("teleoperate_bi")
+    invalid_start = {**FOLLOWER_POSE, "arm_left_gripper.pos": -0.1}
+
+    with pytest.raises(module.SafetyRefusal, match=r"follower left gripper.*0\.\.100"):
+        module.build_startup_sync_plan(
+            invalid_start,
+            FOLLOWER_POSE,
+            side="left",
+            requested_duration_s=0.2,
+            fps=5,
+        )
+
+
+def test_startup_sync_plan_copies_and_freezes_both_endpoint_mappings():
+    module = load_example_module("teleoperate_bi")
+    start = dict(FOLLOWER_POSE)
+    target = dict(FOLLOWER_POSE)
+    plan = module.build_startup_sync_plan(
+        start,
+        target,
+        side="both",
+        requested_duration_s=0.2,
+        fps=5,
+    )
+    start["arm_left_shoulder_pan.pos"] = 99.0
+    target["arm_left_shoulder_pan.pos"] = 98.0
+
+    assert plan.follower_start["arm_left_shoulder_pan.pos"] == 0.0
+    assert plan.frozen_leader_target["arm_left_shoulder_pan.pos"] == 0.0
+    with pytest.raises(TypeError):
+        plan.frozen_leader_target["arm_left_shoulder_pan.pos"] = 1.0
 
 
 class FakeRobot:
