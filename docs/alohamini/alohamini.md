@@ -73,58 +73,167 @@ Find the two leader ports with one USB controller connected at a time, recording
 .\.venv\Scripts\lerobot-find-port.exe
 ```
 
-Windows requires both ports explicitly. Calibrate the passive leader pair with the same ID and arm profile that later teleoperation and recording commands will use:
+Windows requires both ports explicitly. The examples below use `COM7` for the left leader and `COM8` for the right leader; substitute the ports found on your PC. Calibrate the passive leader pair with the same ID and arm profile that later teleoperation and recording commands will use:
 
 ```powershell
 .\.venv\Scripts\python.exe `
   .\examples\alohamini\calibrate_bi.py `
-  --teleop.left_port COM5 `
-  --teleop.right_port COM6 `
+  --teleop.left_port COM7 `
+  --teleop.right_port COM8 `
   --teleop.id so101_leader_bi `
   --teleop.arm_profile so-arm-5dof
 ```
 
 Aloha Mini leader and follower arm actions use normalized positions by default: body joints use `-100..100` and grippers use `0..100`. Existing leader calibration files remain reusable because they store raw homing, range, and drive information rather than the runtime normalization mode. Do not recalibrate solely for this change.
 
-Until a clutch or relative-alignment mode is implemented, manually place and support both follower arms in poses matching the passive leaders before host activation. For first commissioning, start the Pi host and run the mandatory no-arm-motion alignment check before any teleoperation:
+### Aloha Mini 1 startup synchronization safety
+
+`strict` remains the default startup mode and never automatically positions followers. `sync` is an Aloha Mini 1-only linear interpolation in normalized joint space: it makes an explicit, slow move from newly measured follower positions to one frozen, validated leader pose. It is not collision-aware and does not check self-collision, the workspace, payloads, cables, or nearby people.
+
+Begin every stage with empty grippers, a clear motion envelope, the passive leaders held in moderate poses, the tested follower supported, and the follower motor-power disconnect immediately accessible. Stop at the first unexpected direction, speed, sound, current, contact, software error, or communication failure. Synchronization does not automatically reverse or return an arm after a refusal, and the Pi may continue holding the last arm target.
+
+Leader motors require their 7.4 V low-voltage supply and must never receive the 12 V follower supply. Physical commissioning is not part of software validation and requires separate authorization; use the stages below only as separately authorized, bounded physical checks. S1 and S2 also require the separately configured Pi host commissioning limit `max_relative_target=1.0`; this client change adds no Pi command.
+
+Before a synchronization move, the client prints the measured start and frozen target and asks the operator to type exactly `SYNC`. Enter alone, lowercase text, or added whitespace does not authorize motion. After confirmation, the client takes fresh follower and leader samples. Every synchronization frame holds base and lift velocity at zero and changes each selected normalized arm position by at most `STARTUP_SYNC_MAX_STEP = 0.75`. This client frame cap is independent of Pi `max_relative_target`; if it needs more frames than the requested duration, the move takes longer. Every leader sample is validated, and exceeding `STARTUP_SYNC_LEADER_DRIFT = 2.0` aborts selected-side motion. The final fresh follower sample must satisfy `--max_start_mismatch` before synchronization succeeds.
+
+Run S1 through S6 in order. Stop after each stage and review the observed movement and cleanup before authorizing the next stage.
+
+#### S1 — left-only synchronization and exit
 
 ```powershell
 .\.venv\Scripts\python.exe `
   .\examples\alohamini\teleoperate_bi.py `
   --robot.remote_ip 192.168.1.134 `
   --robot.robot_model alohamini1 `
-  --teleop.left_port COM5 `
-  --teleop.right_port COM6 `
+  --teleop.left_port COM7 `
+  --teleop.right_port COM8 `
   --teleop.id so101_leader_bi `
   --teleop.arm_profile so-arm-5dof `
+  --startup_mode sync `
+  --startup_sync_side left `
+  --startup_sync_duration_s 12.0 `
+  --startup_sync_only `
   --max_start_mismatch 10.0 `
-  --no_rerun `
+  --fps 5 `
   --no_keyboard `
-  --check_alignment_only
+  --no_rerun
 ```
 
-The command prints every follower/leader joint difference and sends no arm-position action. It succeeds only when both samples are finite, normalized, complete, fresh, and within the threshold. A base/lift zero command may still be sent as part of safe connection and cleanup.
+S1 sends only left-arm position keys plus zero base/lift commands, verifies the result, and exits without entering ordinary teleoperation.
 
-After the alignment-only check passes, use this bounded, keyboard-free, visualization-free first run. The initial gate sends only zero chassis/lift velocity; after Enter, it obtains and compares fresh follower and leader samples again, then forwards that validated leader sample first:
+#### S2 — right-only synchronization and exit
 
 ```powershell
 .\.venv\Scripts\python.exe `
   .\examples\alohamini\teleoperate_bi.py `
   --robot.remote_ip 192.168.1.134 `
   --robot.robot_model alohamini1 `
-  --teleop.left_port COM5 `
-  --teleop.right_port COM6 `
+  --teleop.left_port COM7 `
+  --teleop.right_port COM8 `
   --teleop.id so101_leader_bi `
   --teleop.arm_profile so-arm-5dof `
+  --startup_mode sync `
+  --startup_sync_side right `
+  --startup_sync_duration_s 12.0 `
+  --startup_sync_only `
   --max_start_mismatch 10.0 `
-  --fps 10 `
+  --fps 5 `
+  --no_keyboard `
+  --no_rerun
+```
+
+S2 applies the same bounded procedure to the right follower only.
+
+#### S3 — strict no-motion alignment diagnostic
+
+Manually place and support both followers in poses matching the passive leaders, then run the existing strict diagnostic:
+
+```powershell
+.\.venv\Scripts\python.exe `
+  .\examples\alohamini\teleoperate_bi.py `
+  --robot.remote_ip 192.168.1.134 `
+  --robot.robot_model alohamini1 `
+  --teleop.left_port COM7 `
+  --teleop.right_port COM8 `
+  --teleop.id so101_leader_bi `
+  --teleop.arm_profile so-arm-5dof `
+  --startup_mode strict `
+  --check_alignment_only `
+  --max_start_mismatch 10.0 `
+  --no_keyboard `
+  --no_rerun
+```
+
+S3 prints every follower/leader joint difference and sends no arm-position action. It succeeds only when both samples are finite, normalized, complete, fresh, and within the threshold. A base/lift zero command may still be sent during connection and cleanup.
+
+#### S4 — both-side synchronization and exit
+
+```powershell
+.\.venv\Scripts\python.exe `
+  .\examples\alohamini\teleoperate_bi.py `
+  --robot.remote_ip 192.168.1.134 `
+  --robot.robot_model alohamini1 `
+  --teleop.left_port COM7 `
+  --teleop.right_port COM8 `
+  --teleop.id so101_leader_bi `
+  --teleop.arm_profile so-arm-5dof `
+  --startup_mode sync `
+  --startup_sync_side both `
+  --startup_sync_duration_s 15.0 `
+  --startup_sync_only `
+  --max_start_mismatch 10.0 `
+  --fps 5 `
+  --no_keyboard `
+  --no_rerun
+```
+
+#### S5 — strict bounded gripper-only operator procedure
+
+This is an operator procedure, not a gripper-only payload mode. The client still validates and forwards all twelve arm-position keys; during this check the operator moves only the two grippers.
+
+```powershell
+.\.venv\Scripts\python.exe `
+  .\examples\alohamini\teleoperate_bi.py `
+  --robot.remote_ip 192.168.1.134 `
+  --robot.robot_model alohamini1 `
+  --teleop.left_port COM7 `
+  --teleop.right_port COM8 `
+  --teleop.id so101_leader_bi `
+  --teleop.arm_profile so-arm-5dof `
+  --startup_mode strict `
+  --max_start_mismatch 10.0 `
+  --fps 5 `
+  --duration_s 30 `
+  --start_paused `
+  --no_keyboard `
+  --no_rerun
+```
+
+After Enter, the client obtains fresh follower and leader samples, revalidates and compares them, and uses the final validated leader sample as the first forwarded arm action with explicit zero base/lift commands.
+
+#### S6 — both-side synchronization followed by paused teleoperation
+
+```powershell
+.\.venv\Scripts\python.exe `
+  .\examples\alohamini\teleoperate_bi.py `
+  --robot.remote_ip 192.168.1.134 `
+  --robot.robot_model alohamini1 `
+  --teleop.left_port COM7 `
+  --teleop.right_port COM8 `
+  --teleop.id so101_leader_bi `
+  --teleop.arm_profile so-arm-5dof `
+  --startup_mode sync `
+  --startup_sync_side both `
+  --startup_sync_duration_s 15.0 `
+  --max_start_mismatch 10.0 `
+  --fps 5 `
   --duration_s 60 `
-  --no_rerun `
+  --start_paused `
   --no_keyboard `
-  --start_paused
+  --no_rerun
 ```
 
-Leader motors require their 7.4 V low-voltage supply and must never receive the 12 V follower supply. Supervise the first test with the follower arms supported and the follower motor-power disconnect immediately accessible.
+Synchronization verifies the frozen target before the pause. After Enter, the client again requires a fresh follower observation proven by sequence advancement and a fresh normalized leader sample. It revalidates and re-compares both sides, then forwards that final validated leader sample first with zero base/lift commands. The ordinary `--duration_s` clock starts only after synchronization, optional resource setup, and this pause gate.
 
 ## 3. Camera Configuration
 

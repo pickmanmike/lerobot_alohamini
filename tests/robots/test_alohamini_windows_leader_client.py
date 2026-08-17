@@ -1993,3 +1993,31 @@ def test_no_robot_and_no_leader_do_not_construct_or_cleanup_skipped_devices(monk
         monotonic=lambda: next(clock_values),
         sleep_fn=lambda _: None,
     )
+
+
+def test_windows_startup_sync_commissioning_docs_contain_approved_safety_sequence():
+    text = (REPO_ROOT / "docs" / "alohamini" / "alohamini.md").read_text(encoding="utf-8")
+    required = (
+        "not collision-aware",
+        "STARTUP_SYNC_MAX_STEP = 0.75",
+        "STARTUP_SYNC_LEADER_DRIFT = 2.0",
+        "type exactly `SYNC`",
+        "S1",
+        "S2",
+        "S3",
+        "S4",
+        "S5",
+        "S6",
+        "192.168.1.134",
+        "COM7",
+        "COM8",
+        "so101_leader_bi",
+        "so-arm-5dof",
+        "--startup_sync_only",
+        "--start_paused",
+        "--no_keyboard",
+        "--no_rerun",
+    )
+
+    for marker in required:
+        assert marker in text
