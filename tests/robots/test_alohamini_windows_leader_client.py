@@ -1099,6 +1099,452 @@ def teleoperation_args(module, *extra_args):
     )
 
 
+def sync_args(module, *extra_args):
+    return teleoperation_args(
+        module,
+        "--startup_mode",
+        "sync",
+        "--startup_sync_duration_s",
+        "0.2",
+        "--fps",
+        "5",
+        *extra_args,
+    )
+
+
+@pytest.mark.parametrize("robot_model", ["alohamini1", "alohamini2", "alohamini2pro"])
+def test_strict_mode_never_calls_startup_sync(monkeypatch, robot_model):
+    module = load_example_module("teleoperate_bi")
+    events = prepare_teleoperation(monkeypatch, module)
+    monkeypatch.setattr(
+        module,
+        "run_startup_sync",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("strict entered sync")),
+    )
+    args = teleoperation_args(
+        module,
+        "--startup_mode",
+        "strict",
+        "--robot_model",
+        robot_model,
+        "--duration_s",
+        "0.2",
+        "--fps",
+        "5",
+    )
+    clock = FakeClock(events)
+
+    assert module.run_teleoperation(args, monotonic=clock.monotonic, sleep_fn=clock.sleep) == 0
+    assert arm_send_actions(events)
+
+
+def test_startup_sync_only_skips_optional_resources_and_control_loop(monkeypatch):
+    module = load_example_module("teleoperate_bi")
+    events = prepare_teleoperation(
+        monkeypatch,
+        module,
+        observation_poses=[FOLLOWER_POSE, FOLLOWER_POSE, FOLLOWER_POSE],
+        action_poses=[LEADER_POSE, LEADER_POSE, LEADER_POSE, LEADER_POSE],
+    )
+    args = module.parse_args(
+        [
+            "--teleop.left_port",
+            "COM5",
+            "--teleop.right_port",
+            "COM6",
+            "--startup_mode",
+            "sync",
+            "--startup_sync_duration_s",
+            "0.2",
+            "--startup_sync_only",
+            "--duration_s",
+            "30",
+            "--start_paused",
+            "--fps",
+            "5",
+        ],
+        platform_name="Windows",
+    )
+    clock = FakeClock(events)
+
+    status = module.run_teleoperation(
+        args,
+        input_fn=lambda _: "SYNC",
+        monotonic=clock.monotonic,
+        sleep_fn=clock.sleep,
+    )
+
+    assert status == 0
+    assert len(arm_send_actions(events)) == 2
+    assert sum(event[:2] == ("leader", "get_action") for event in events) == 4
+    assert ("left", "disconnect") in events
+    assert ("right", "disconnect") in events
+    assert ("robot", "disconnect") in events
+
+
+def test_sync_handoff_reuses_frozen_target_without_extra_leader_read(monkeypatch):
+    module = load_example_module("teleoperate_bi")
+    frozen = {**LEADER_POSE, "left_shoulder_pan.pos": 0.5}
+    final_follower = {f"arm_{key}": value for key, value in frozen.items()}
+    events = prepare_teleoperation(
+        monkeypatch,
+        module,
+        observation_poses=[FOLLOWER_POSE, FOLLOWER_POSE, final_follower],
+        action_poses=[LEADER_POSE, frozen, frozen, frozen, {**frozen, "left_shoulder_pan.pos": 1.0}],
+    )
+    args = sync_args(module, "--duration_s", "0.2")
+    clock = FakeClock(events)
+
+    status = module.run_teleoperation(
+        args,
+        input_fn=lambda _: "SYNC",
+        monotonic=clock.monotonic,
+        sleep_fn=clock.sleep,
+    )
+
+    plan = module.build_startup_sync_plan(
+        FOLLOWER_POSE,
+        final_follower,
+        side="both",
+        requested_duration_s=0.2,
+        fps=5,
+    )
+    arm_events = [
+        (index, event)
+        for index, event in enumerate(events)
+        if event[:2] == ("robot", "send") and any(key.startswith("arm_") for key in event[2])
+    ]
+    final_sync_index, _ = arm_events[plan.frame_count - 1]
+    first_ordinary_index, first_ordinary_event = arm_events[plan.frame_count]
+
+    assert status == 0
+    assert first_ordinary_event[2] == {**final_follower, **module.make_zero_action()}
+    assert all(
+        event[:2] != ("leader", "get_action")
+        for event in events[final_sync_index + 1 : first_ordinary_index]
+    )
+
+
+def test_sync_handoff_first_action_forces_zero_body_with_keyboard(monkeypatch):
+    module = load_example_module("teleoperate_bi")
+    events = prepare_teleoperation(
+        monkeypatch,
+        module,
+        observation_poses=[FOLLOWER_POSE, FOLLOWER_POSE, FOLLOWER_POSE],
+        action_poses=[LEADER_POSE, LEADER_POSE, LEADER_POSE, LEADER_POSE],
+    )
+
+    class ActiveKeyboard:
+        is_connected = False
+
+        def __init__(self, config):
+            self.config = config
+
+        def connect(self):
+            self.is_connected = True
+            events.append(("keyboard", "connect"))
+
+        def get_action(self):
+            return {"forward", "lift_up"}
+
+        def disconnect(self):
+            self.is_connected = False
+            events.append(("keyboard", "disconnect"))
+
+    monkeypatch.setattr(module, "KeyboardTeleop", ActiveKeyboard)
+    monkeypatch.setattr(
+        FakeRobot,
+        "_from_keyboard_to_lift_action",
+        lambda self, keys: {"lift_axis.vel": 1},
+    )
+    args = module.parse_args(
+        [
+            "--teleop.left_port",
+            "COM5",
+            "--teleop.right_port",
+            "COM6",
+            "--no_rerun",
+            "--startup_mode",
+            "sync",
+            "--startup_sync_duration_s",
+            "0.2",
+            "--fps",
+            "5",
+            "--duration_s",
+            "0.2",
+        ],
+        platform_name="Windows",
+    )
+    clock = FakeClock(events)
+
+    module.run_teleoperation(
+        args,
+        input_fn=lambda _: "SYNC",
+        monotonic=clock.monotonic,
+        sleep_fn=clock.sleep,
+    )
+
+    first_ordinary = arm_send_actions(events)[2]
+    assert {key: first_ordinary[key] for key in module.make_zero_action()} == module.make_zero_action()
+
+
+def test_post_sync_start_paused_rechecks_and_forwards_final_validated_sample(monkeypatch, capsys):
+    module = load_example_module("teleoperate_bi")
+    post_pause_leader = {**LEADER_POSE, "left_wrist_roll.pos": 6.0}
+    post_pause_follower = {f"arm_{key}": value for key, value in post_pause_leader.items()}
+    events = prepare_teleoperation(
+        monkeypatch,
+        module,
+        observation_poses=[FOLLOWER_POSE, FOLLOWER_POSE, FOLLOWER_POSE, post_pause_follower],
+        action_poses=[
+            LEADER_POSE,
+            LEADER_POSE,
+            LEADER_POSE,
+            LEADER_POSE,
+            post_pause_leader,
+            {**post_pause_leader, "left_wrist_roll.pos": 7.0},
+        ],
+    )
+    args = sync_args(module, "--start_paused", "--duration_s", "0.2")
+    clock = FakeClock(events)
+    responses = iter(("SYNC", ""))
+
+    status = module.run_teleoperation(
+        args,
+        input_fn=lambda _: next(responses),
+        monotonic=clock.monotonic,
+        sleep_fn=clock.sleep,
+    )
+
+    first_ordinary = arm_send_actions(events)[2]
+    assert status == 0
+    assert "Action space: body joints -100..100; grippers 0..100" in capsys.readouterr().out
+    assert first_ordinary == {**post_pause_follower, **module.make_zero_action()}
+    first_ordinary_index = next(
+        index
+        for index, event in enumerate(events)
+        if event[:2] == ("robot", "send") and event[2] == first_ordinary
+    )
+    assert sum(event[:2] == ("leader", "get_action") for event in events[:first_ordinary_index]) == 5
+
+
+def test_post_sync_start_paused_refuses_moved_sample_before_ordinary_send(monkeypatch, capsys):
+    module = load_example_module("teleoperate_bi")
+    moved = {**LEADER_POSE, "right_wrist_flex.pos": 20.1}
+    events = prepare_teleoperation(
+        monkeypatch,
+        module,
+        observation_poses=[FOLLOWER_POSE, FOLLOWER_POSE, FOLLOWER_POSE, FOLLOWER_POSE],
+        action_poses=[LEADER_POSE, LEADER_POSE, LEADER_POSE, LEADER_POSE, moved],
+    )
+    args = sync_args(module, "--start_paused", "--duration_s", "0.2")
+    clock = FakeClock(events)
+    responses = iter(("SYNC", ""))
+
+    status = module.run_teleoperation(
+        args,
+        input_fn=lambda _: next(responses),
+        monotonic=clock.monotonic,
+        sleep_fn=clock.sleep,
+    )
+
+    assert status == 2
+    assert "arm_right_wrist_flex.pos" in capsys.readouterr().out
+    assert len(arm_send_actions(events)) == 2
+
+
+def test_sync_duration_clock_starts_after_sync_and_post_sync_pause(monkeypatch):
+    module = load_example_module("teleoperate_bi")
+    events = prepare_teleoperation(
+        monkeypatch,
+        module,
+        observation_poses=[FOLLOWER_POSE, FOLLOWER_POSE, FOLLOWER_POSE, FOLLOWER_POSE],
+        action_poses=[LEADER_POSE, LEADER_POSE, LEADER_POSE, LEADER_POSE, LEADER_POSE],
+    )
+    args = sync_args(module, "--start_paused", "--duration_s", "0.2")
+    clock = FakeClock(events)
+    responses = iter(("SYNC", ""))
+
+    def confirm_then_pause(prompt):
+        response = next(responses)
+        if response == "":
+            clock.advance(100.0)
+        return response
+
+    status = module.run_teleoperation(
+        args,
+        input_fn=confirm_then_pause,
+        monotonic=clock.monotonic,
+        sleep_fn=clock.sleep,
+    )
+
+    assert status == 0
+    assert len(arm_send_actions(events)) >= 3
+
+
+def test_sync_drift_refusal_returns_two_without_reverse_and_cleans_up(monkeypatch, capsys):
+    module = load_example_module("teleoperate_bi")
+    drifted = {**LEADER_POSE, "left_shoulder_pan.pos": 2.000001}
+    events = prepare_teleoperation(
+        monkeypatch,
+        module,
+        observation_poses=[FOLLOWER_POSE, FOLLOWER_POSE],
+        action_poses=[LEADER_POSE, LEADER_POSE, LEADER_POSE, drifted],
+    )
+    args = sync_args(module, "--duration_s", "0.2")
+    clock = FakeClock(events)
+
+    status = module.run_teleoperation(
+        args,
+        input_fn=lambda _: "SYNC",
+        monotonic=clock.monotonic,
+        sleep_fn=clock.sleep,
+    )
+
+    captured = capsys.readouterr()
+    assert status == 2
+    assert "SAFETY REFUSAL" in captured.out
+    assert "left shoulder_pan" in captured.out
+    assert "frozen=0.0" in captured.out
+    assert "current=2.000001" in captured.out
+    assert "drift=2.000001" in captured.out
+    assert "Traceback" not in captured.err
+    assert len(arm_send_actions(events)) == 1
+    last_arm_index = max(
+        index
+        for index, event in enumerate(events)
+        if event[:2] == ("robot", "send") and any(key.startswith("arm_") for key in event[2])
+    )
+    assert all(
+        not any(key.startswith("arm_") for key in event[2])
+        for event in events[last_arm_index + 1 :]
+        if event[:2] == ("robot", "send")
+    )
+    assert ("left", "disconnect") in events
+    assert ("right", "disconnect") in events
+    assert ("robot", "disconnect") in events
+
+
+def test_sync_final_mismatch_returns_two_without_ordinary_send_and_cleans_up(monkeypatch, capsys):
+    module = load_example_module("teleoperate_bi")
+    mismatched = {**FOLLOWER_POSE, "arm_left_shoulder_pan.pos": 10.1}
+    events = prepare_teleoperation(
+        monkeypatch,
+        module,
+        observation_poses=[FOLLOWER_POSE, FOLLOWER_POSE, mismatched],
+        action_poses=[LEADER_POSE, LEADER_POSE, LEADER_POSE, LEADER_POSE],
+    )
+    args = sync_args(module, "--duration_s", "0.2")
+    clock = FakeClock(events)
+
+    status = module.run_teleoperation(
+        args,
+        input_fn=lambda _: "SYNC",
+        monotonic=clock.monotonic,
+        sleep_fn=clock.sleep,
+    )
+
+    assert status == 2
+    assert "arm_left_shoulder_pan.pos" in capsys.readouterr().out
+    assert len(arm_send_actions(events)) == 2
+    assert ("left", "disconnect") in events
+    assert ("right", "disconnect") in events
+    assert ("robot", "disconnect") in events
+
+
+@pytest.mark.parametrize("failure", [RuntimeError("sync read failed"), KeyboardInterrupt()])
+def test_sync_failure_or_interrupt_preserves_primary_and_cleans_up(monkeypatch, failure):
+    module = load_example_module("teleoperate_bi")
+    events = prepare_teleoperation(
+        monkeypatch,
+        module,
+        left_disconnect_error=RuntimeError("cleanup failed"),
+        observation_poses=[FOLLOWER_POSE, FOLLOWER_POSE],
+        action_poses=[LEADER_POSE, LEADER_POSE, failure],
+    )
+    args = sync_args(module)
+    clock = FakeClock(events)
+
+    with pytest.raises(type(failure)) as caught:
+        module.run_teleoperation(
+            args,
+            input_fn=lambda _: "SYNC",
+            monotonic=clock.monotonic,
+            sleep_fn=clock.sleep,
+        )
+
+    assert caught.value is failure
+    assert any(
+        event[:2] == ("robot", "send") and event[2] == module.make_zero_action()
+        for event in events
+    )
+    assert ("right", "disconnect") in events
+    assert ("left", "disconnect") in events
+    assert ("robot", "disconnect") in events
+
+
+def test_sync_visualization_failure_after_verification_preserves_primary_and_cleans_up(monkeypatch):
+    module = load_example_module("teleoperate_bi")
+    events = prepare_teleoperation(
+        monkeypatch,
+        module,
+        observation_poses=[FOLLOWER_POSE, FOLLOWER_POSE, FOLLOWER_POSE],
+        action_poses=[LEADER_POSE, LEADER_POSE, LEADER_POSE, LEADER_POSE],
+    )
+    primary_error = RuntimeError("visualization failed after sync")
+
+    def fail_visualization_start(**kwargs):
+        events.append(("rerun", "init"))
+        raise primary_error
+
+    monkeypatch.setattr(
+        module,
+        "load_rerun_functions",
+        lambda: (
+            fail_visualization_start,
+            lambda *args: None,
+            lambda: events.append(("rerun", "shutdown")),
+        ),
+    )
+    args = module.parse_args(
+        [
+            "--teleop.left_port",
+            "COM5",
+            "--teleop.right_port",
+            "COM6",
+            "--no_keyboard",
+            "--startup_mode",
+            "sync",
+            "--startup_sync_duration_s",
+            "0.2",
+            "--fps",
+            "5",
+        ],
+        platform_name="Windows",
+    )
+    clock = FakeClock(events)
+
+    with pytest.raises(RuntimeError) as caught:
+        module.run_teleoperation(
+            args,
+            input_fn=lambda _: "SYNC",
+            monotonic=clock.monotonic,
+            sleep_fn=clock.sleep,
+        )
+
+    assert caught.value is primary_error
+    assert len(arm_send_actions(events)) == 2
+    assert max(
+        index
+        for index, event in enumerate(events)
+        if event[:2] == ("robot", "send") and any(key.startswith("arm_") for key in event[2])
+    ) < events.index(("rerun", "init"))
+    assert ("right", "disconnect") in events
+    assert ("left", "disconnect") in events
+    assert ("robot", "disconnect") in events
+    assert ("rerun", "shutdown") in events
+
+
 def test_large_initial_mismatch_refuses_before_arm_send_and_cleans_up(monkeypatch, capsys):
     module = load_example_module("teleoperate_bi")
     events = prepare_teleoperation(

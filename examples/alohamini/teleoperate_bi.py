@@ -737,17 +737,33 @@ def run_teleoperation(
 
         if args.robot_model == "alohamini1" and robot_connected and right_leader_connected:
             try:
-                pending_arm_action, pending_observation = run_alignment_gate(
-                    robot,
-                    leader,
-                    args.max_start_mismatch,
-                )
+                if args.startup_mode == "strict":
+                    pending_arm_action, pending_observation = run_alignment_gate(
+                        robot,
+                        leader,
+                        args.max_start_mismatch,
+                    )
+                    if args.check_alignment_only:
+                        print("Alignment check passed; no arm action was sent.")
+                        return 0
+                else:
+                    pending_arm_action, pending_observation = run_startup_sync(
+                        robot,
+                        leader,
+                        side=args.startup_sync_side,
+                        requested_duration_s=args.startup_sync_duration_s,
+                        fps=args.fps,
+                        max_start_mismatch=args.max_start_mismatch,
+                        input_fn=input_fn,
+                        monotonic=monotonic,
+                        sleep_fn=sleep_fn,
+                    )
+                    print("Synchronization complete")
+                    if args.startup_sync_only:
+                        return 0
             except SafetyRefusal as exc:
                 print(f"SAFETY REFUSAL: {exc}")
                 return 2
-            if args.check_alignment_only:
-                print("Alignment check passed; no arm action was sent.")
-                return 0
 
         if not args.no_keyboard:
             keyboard = KeyboardTeleop(KeyboardTeleopConfig(id="my_laptop_keyboard"))
