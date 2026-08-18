@@ -92,11 +92,52 @@ Aloha Mini leader and follower arm actions use normalized positions by default: 
 
 Begin every stage with empty grippers, a clear motion envelope, the passive leaders held in moderate poses, the tested follower supported, and the follower motor-power disconnect immediately accessible. Stop at the first unexpected direction, speed, sound, current, contact, software error, or communication failure. Synchronization does not automatically reverse or return an arm after a refusal, and the Pi may continue holding the last arm target.
 
-Leader motors require their 7.4 V low-voltage supply and must never receive the 12 V follower supply. Physical commissioning is not part of software validation and requires separate authorization; use the stages below only as separately authorized, bounded physical checks. S1 and S2 also require the separately configured Pi host commissioning limit `max_relative_target=1.0`; this client change adds no Pi command.
+Leader motors require their 7.4 V low-voltage supply and must never receive the 12 V follower supply. Physical commissioning is not part of software validation and requires separate authorization; use the stages below only as separately authorized, bounded physical checks. Keep the Pi host's `max_relative_target` as an independently selected secondary limit; this Windows client does not configure it.
 
 Before a synchronization move, the client prints the measured start and frozen target and asks the operator to type exactly `SYNC`. Enter alone, lowercase text, or added whitespace does not authorize motion. After confirmation, the client takes fresh follower and leader samples and prints those final endpoints before sending frame zero. Every synchronization frame holds base and lift velocity at zero and changes each selected normalized arm position by at most `STARTUP_SYNC_MAX_STEP = 0.75`. This client frame cap is independent of Pi `max_relative_target`; if it needs more frames than the requested duration, the move takes longer. Actual arm-bearing synchronization sends remain at least `1 / --fps` seconds apart, so an overrun lengthens the move instead of triggering catch-up sends. Every leader sample is validated, and exceeding `STARTUP_SYNC_LEADER_DRIFT = 2.0` aborts selected-side motion.
 
-Command and observation traffic use separate sockets, so the first sequence-fresh response after the final command can still have been generated before that command was processed. The client therefore checks up to the configured observation request window plus one sequence-fresh samples. Synchronization succeeds only when a checked follower sample satisfies `--max_start_mismatch`; otherwise it refuses without widening the threshold.
+Command and observation traffic use separate sockets, so the first sequence-fresh response after the final command can still have been generated before that command was processed. The client therefore checks up to the configured observation request window plus one sequence-fresh samples. Synchronization succeeds only when a checked follower sample satisfies `--max_start_mismatch`; otherwise it refuses without widening the threshold. The threshold is final convergence verification only: it does not limit how far apart valid calibrated poses may be when a synchronization plan is first proposed. Use `5.0` for the remaining AM1 commissioning checks; the parser's `10.0` default remains for compatibility and is not the recommended commissioning value.
+
+The client makes the operator phase explicit, in this order:
+
+1. `HOLD LEADERS STILL — STARTUP SYNCHRONIZATION IN PROGRESS`
+2. `SYNCHRONIZATION COMPLETE`
+3. `PRESS ENTER TO ENABLE LIVE TELEOPERATION`
+4. `TELEOPERATION ACTIVE — LEADER MOVEMENT IS NOW ALLOWED`
+
+The final message appears only after the post-pause fresh-sample alignment gate passes and immediately before the first ordinary arm action is sent.
+
+#### Bounded AM1 single-joint diagnostic
+
+If synchronization cannot distinguish limited positional headroom from a joint-specific powered fault, stop ordinary commissioning and use the network-only AM1 diagnostic below in a separately authorized powered session. It constructs no leader, keyboard, camera, or visualization device. It takes a fresh follower pose, holds all nonselected joints at the last pre-move measured pose, sends frame zero at that pose, keeps base and lift commands explicitly zero, and exits after one bounded ramp. No arm-bearing command is sent unless the operator types exact uppercase `MOVE`.
+
+```powershell
+.\.venv\Scripts\python.exe `
+  .\examples\alohamini\diagnose_am1_joint.py `
+  --robot.remote_ip 192.168.1.134 `
+  --robot.id my_alohamini `
+  --side left `
+  --joint elbow_flex `
+  --delta -10.0 `
+  --fps 5 `
+  --duration_s 5.0 `
+  --max_final_error 1.0
+```
+
+The client can report what it sent and what it subsequently observed, but the current action socket supplies no host-acceptance acknowledgement. `PASS` therefore means the sequence-fresh observed position reached the requested tolerance; it does not prove a persistent host setting. In the observed left-elbow case, the Pi's `max_relative_target=5.0` produced an exact clamp from approximately `99.909` to `94.909` while the joint stayed at approximately `99.909`. A separately authorized repeat with only `max_relative_target=10.0` changed is the next hypothesis test. It is not a proven production value, and the client step cap, leader-drift limit, and recommended `5.0` final convergence tolerance must not be widened.
+
+After a run, fetch the newest Pi log from Windows with:
+
+```powershell
+.\tools\fetch_am1_pi_log.ps1
+```
+
+The helper defaults to `pickmanmike@192.168.1.134`, prints the exact remote and local paths, and saves into `$HOME\AlohaMini1Logs`. To retrieve a known log instead of discovering the newest one:
+
+```powershell
+.\tools\fetch_am1_pi_log.ps1 `
+  -RemotePath /home/pickmanmike/am1-left-elbow-diagnostic-YYYY-MM-DD-HHMMSS.log
+```
 
 Run S1 through S6 in order. Stop after each stage and review the observed movement and cleanup before authorizing the next stage.
 
@@ -115,7 +156,7 @@ Run S1 through S6 in order. Stop after each stage and review the observed moveme
   --startup_sync_side left `
   --startup_sync_duration_s 12.0 `
   --startup_sync_only `
-  --max_start_mismatch 10.0 `
+  --max_start_mismatch 5.0 `
   --fps 5 `
   --no_keyboard `
   --no_rerun
@@ -138,7 +179,7 @@ S1 sends only left-arm position keys plus zero base/lift commands, verifies the 
   --startup_sync_side right `
   --startup_sync_duration_s 12.0 `
   --startup_sync_only `
-  --max_start_mismatch 10.0 `
+  --max_start_mismatch 5.0 `
   --fps 5 `
   --no_keyboard `
   --no_rerun
@@ -161,7 +202,7 @@ Manually place and support both followers in poses matching the passive leaders,
   --teleop.arm_profile so-arm-5dof `
   --startup_mode strict `
   --check_alignment_only `
-  --max_start_mismatch 10.0 `
+  --max_start_mismatch 5.0 `
   --no_keyboard `
   --no_rerun
 ```
@@ -183,7 +224,7 @@ S3 prints every follower/leader joint difference and sends no arm-position actio
   --startup_sync_side both `
   --startup_sync_duration_s 15.0 `
   --startup_sync_only `
-  --max_start_mismatch 10.0 `
+  --max_start_mismatch 5.0 `
   --fps 5 `
   --no_keyboard `
   --no_rerun
@@ -203,7 +244,7 @@ This is an operator procedure, not a gripper-only payload mode. The client still
   --teleop.id so101_leader_bi `
   --teleop.arm_profile so-arm-5dof `
   --startup_mode strict `
-  --max_start_mismatch 10.0 `
+  --max_start_mismatch 5.0 `
   --fps 5 `
   --duration_s 30 `
   --start_paused `
@@ -227,7 +268,7 @@ After Enter, the client obtains fresh follower and leader samples, revalidates a
   --startup_mode sync `
   --startup_sync_side both `
   --startup_sync_duration_s 15.0 `
-  --max_start_mismatch 10.0 `
+  --max_start_mismatch 5.0 `
   --fps 5 `
   --duration_s 60 `
   --start_paused `

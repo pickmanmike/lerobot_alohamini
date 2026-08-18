@@ -391,6 +391,7 @@ def run_startup_sync(
     monotonic: Callable[[], float],
     sleep_fn: Callable[[float], None],
 ) -> tuple[dict[str, float], dict[str, Any]]:
+    print("HOLD LEADERS STILL — STARTUP SYNCHRONIZATION IN PROGRESS")
     initial_observation = get_fresh_follower_observation(robot)
     initial_follower = extract_am1_arm_positions(
         initial_observation,
@@ -568,7 +569,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--max_start_mismatch",
         type=float,
         default=10.0,
-        help="Maximum AM1 leader/follower startup difference in normalized units (default: 10.0)",
+        help=(
+            "AM1 final convergence verification tolerance in normalized units; does not limit "
+            "the initial mismatch that sync may plan (default: 10.0)"
+        ),
     )
     parser.add_argument(
         "--duration_s",
@@ -722,6 +726,7 @@ def run_teleoperation(
     shutdown_rerun = None
     pending_arm_action: dict[str, float] | None = None
     pending_observation: dict[str, Any] = {}
+    teleoperation_active_announced = False
 
     try:
         if not args.no_robot:
@@ -770,7 +775,7 @@ def run_teleoperation(
                         monotonic=monotonic,
                         sleep_fn=sleep_fn,
                     )
-                    print("Synchronization complete")
+                    print("SYNCHRONIZATION COMPLETE")
                     if args.startup_sync_only:
                         return 0
             except SafetyRefusal as exc:
@@ -793,7 +798,11 @@ def run_teleoperation(
             if robot_connected:
                 robot.send_action(make_zero_action())
             _print_connection_summary(args)
-            input_fn("Press Enter to begin forwarding leader actions... ")
+            if args.robot_model == "alohamini1":
+                print("PRESS ENTER TO ENABLE LIVE TELEOPERATION")
+                input_fn("")
+            else:
+                input_fn("Press Enter to begin forwarding leader actions... ")
             if args.robot_model == "alohamini1" and robot_connected and right_leader_connected:
                 try:
                     pending_arm_action, pending_observation = run_alignment_gate(
@@ -853,6 +862,14 @@ def run_teleoperation(
             if log_rerun_data is not None:
                 log_rerun_data(observation, action)
             if robot_connected:
+                if (
+                    args.robot_model == "alohamini1"
+                    and right_leader_connected
+                    and not teleoperation_active_announced
+                    and any(key.startswith("arm_") for key in arm_action)
+                ):
+                    print("TELEOPERATION ACTIVE — LEADER MOVEMENT IS NOW ALLOWED")
+                    teleoperation_active_announced = True
                 robot.send_action(action)
 
             sleep_fn(max(1.0 / args.fps - (time.perf_counter() - loop_started_at), 0.0))

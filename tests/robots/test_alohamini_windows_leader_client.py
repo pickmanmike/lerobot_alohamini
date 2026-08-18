@@ -155,6 +155,16 @@ def test_teleoperation_alignment_threshold_defaults_to_ten():
     assert args.check_alignment_only is False
 
 
+def test_max_start_mismatch_help_distinguishes_sync_planning_from_final_verification():
+    module = load_example_module("teleoperate_bi")
+
+    help_text = module.build_parser().format_help()
+    normalized_help = " ".join(help_text.split())
+
+    assert "final convergence verification" in normalized_help
+    assert "does not limit the initial mismatch that sync may plan" in normalized_help
+
+
 def test_startup_sync_cli_defaults_preserve_strict_mode():
     module = load_example_module("teleoperate_bi")
 
@@ -1451,6 +1461,51 @@ def test_post_sync_start_paused_rechecks_and_forwards_final_validated_sample(mon
     assert sum(event[:2] == ("leader", "get_action") for event in events[:first_ordinary_index]) == 5
 
 
+def test_am1_phase_messages_guard_start_paused_first_ordinary_send(monkeypatch):
+    module = load_example_module("teleoperate_bi")
+    events = prepare_teleoperation(
+        monkeypatch,
+        module,
+        observation_poses=[FOLLOWER_POSE, FOLLOWER_POSE, FOLLOWER_POSE, FOLLOWER_POSE],
+        action_poses=[LEADER_POSE, LEADER_POSE, LEADER_POSE, LEADER_POSE, LEADER_POSE],
+    )
+    real_print = print
+
+    def record_console_event(*values, **kwargs):
+        events.append(("console", " ".join(str(value) for value in values)))
+        real_print(*values, **kwargs)
+
+    monkeypatch.setattr("builtins.print", record_console_event)
+    args = sync_args(module, "--start_paused", "--duration_s", "0.2")
+    clock = FakeClock(events)
+    responses = iter(("SYNC", ""))
+
+    status = module.run_teleoperation(
+        args,
+        input_fn=lambda _: next(responses),
+        monotonic=clock.monotonic,
+        sleep_fn=clock.sleep,
+    )
+
+    expected_phases = (
+        "HOLD LEADERS STILL — STARTUP SYNCHRONIZATION IN PROGRESS",
+        "SYNCHRONIZATION COMPLETE",
+        "PRESS ENTER TO ENABLE LIVE TELEOPERATION",
+        "TELEOPERATION ACTIVE — LEADER MOVEMENT IS NOW ALLOWED",
+    )
+    phase_events = [event[1] for event in events if event[0] == "console" and event[1] in expected_phases]
+    assert status == 0
+    assert phase_events == list(expected_phases)
+
+    active_index = events.index(("console", expected_phases[-1]))
+    first_ordinary_index = [
+        index
+        for index, event in enumerate(events)
+        if event[:2] == ("robot", "send") and any(key.startswith("arm_") for key in event[2])
+    ][2]
+    assert active_index + 1 == first_ordinary_index
+
+
 def test_post_sync_start_paused_refuses_moved_sample_before_ordinary_send(monkeypatch, capsys):
     module = load_example_module("teleoperate_bi")
     moved = {**LEADER_POSE, "right_wrist_flex.pos": 20.1}
@@ -1471,8 +1526,10 @@ def test_post_sync_start_paused_refuses_moved_sample_before_ordinary_send(monkey
         sleep_fn=clock.sleep,
     )
 
+    captured = capsys.readouterr()
     assert status == 2
-    assert "arm_right_wrist_flex.pos" in capsys.readouterr().out
+    assert "arm_right_wrist_flex.pos" in captured.out
+    assert "TELEOPERATION ACTIVE — LEADER MOVEMENT IS NOW ALLOWED" not in captured.out
     assert len(arm_send_actions(events)) == 2
 
 
