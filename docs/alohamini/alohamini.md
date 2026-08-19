@@ -109,7 +109,7 @@ The final message appears only after the post-pause fresh-sample alignment gate 
 
 #### Bounded AM1 single-joint diagnostic
 
-If synchronization cannot distinguish limited positional headroom from a joint-specific powered fault, stop ordinary commissioning and use the network-only AM1 diagnostic below in a separately authorized powered session. It constructs no leader, keyboard, camera, or visualization device. It takes a fresh follower pose, holds all nonselected joints at the last pre-move measured pose, sends frame zero at that pose, keeps base and lift commands explicitly zero, and exits after one bounded ramp. No arm-bearing command is sent unless the operator types exact uppercase `MOVE`.
+If synchronization cannot distinguish limited positional headroom from a joint-specific powered fault, stop ordinary commissioning and use the network-only AM1 diagnostic below in a separately authorized powered session. It constructs no leader, keyboard, camera, or visualization device. It takes a fresh follower pose, holds all nonselected joints at the last pre-move measured pose, sends frame zero at that pose, keeps base and lift commands explicitly zero, and runs one bounded ramp followed by a bounded final-target settle. During the settle it repeats the same complete final action, obtains sequence-fresh follower observations, and requires two consecutive in-tolerance samples before an early `PASS`. No arm-bearing command is sent unless the operator types exact uppercase `MOVE`.
 
 ```powershell
 .\.venv\Scripts\python.exe `
@@ -121,10 +121,11 @@ If synchronization cannot distinguish limited positional headroom from a joint-s
   --delta -10.0 `
   --fps 5 `
   --duration_s 5.0 `
+  --settle_s 5.0 `
   --max_final_error 1.0
 ```
 
-The client can report what it sent and what it subsequently observed, but the current action socket supplies no host-acceptance acknowledgement. `PASS` therefore means the sequence-fresh observed position reached the requested tolerance; it does not prove a persistent host setting. In the observed left-elbow case, the Pi's `max_relative_target=5.0` produced an exact clamp from approximately `99.909` to `94.909` while the joint stayed at approximately `99.909`. A separately authorized repeat with only `max_relative_target=10.0` changed is the next hypothesis test. It is not a proven production value, and the client step cap, leader-drift limit, and recommended `5.0` final convergence tolerance must not be widened.
+The client can report what it sent and what it subsequently observed, but the current action socket supplies no host-acceptance acknowledgement. With a positive settle duration, `PASS` therefore means that two post-window, sequence-fresh observed positions were stable within the requested tolerance; it does not prove a persistent host setting. Passing `--settle_s 0` deliberately restores the legacy post-ramp verification and disables that two-sample stability requirement. In the observed left-elbow case, `max_relative_target=10.0` is partially physically proven: it initiated slow movement in the correct direction for the exact `-10.0` target, but full convergence is not proven. Raising the host limit above `10.0` cannot change that exact target when the host present position matches the measured start, so the next bounded test changes only the diagnostic settle time. Do not widen the host limit, client step cap, leader-drift limit, or final convergence tolerance for that test.
 
 After a run, fetch the newest Pi log from Windows with:
 
@@ -132,11 +133,11 @@ After a run, fetch the newest Pi log from Windows with:
 .\tools\fetch_am1_pi_log.ps1
 ```
 
-The helper defaults to `pickmanmike@192.168.1.134`, prints the exact remote and local paths, and saves into `$HOME\AlohaMini1Logs`. To retrieve a known log instead of discovering the newest one:
+The helper defaults to `pickmanmike@192.168.1.134`, prints the exact remote and local paths, and saves into `$HOME\AlohaMini1Logs`. To retrieve a known log instead of discovering the newest one, paste the exact path printed as `HOST_LOG` by the Pi startup command. Do not pass a timestamp template or the Windows log filename:
 
 ```powershell
-.\tools\fetch_am1_pi_log.ps1 `
-  -RemotePath /home/pickmanmike/am1-left-elbow-diagnostic-YYYY-MM-DD-HHMMSS.log
+$piHostLog = Read-Host 'Paste the exact Pi HOST_LOG path'
+.\tools\fetch_am1_pi_log.ps1 -RemotePath $piHostLog
 ```
 
 Run S1 through S6 in order. Stop after each stage and review the observed movement and cleanup before authorizing the next stage.

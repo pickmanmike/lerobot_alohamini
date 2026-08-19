@@ -12,6 +12,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_PATH = REPO_ROOT / "examples" / "alohamini" / "diagnose_am1_joint.py"
+DOC_PATH = REPO_ROOT / "docs" / "alohamini" / "alohamini.md"
 FOLLOWER_POSE = {
     "arm_left_shoulder_pan.pos": 0.0,
     "arm_left_shoulder_lift.pos": 10.0,
@@ -55,7 +56,18 @@ def test_joint_diagnostic_defaults_are_bounded_for_the_left_elbow():
     assert args.delta == -10.0
     assert args.fps == 5
     assert args.duration_s == 5.0
+    assert args.settle_s == 5.0
     assert args.max_final_error == 1.0
+
+
+def test_joint_diagnostic_help_documents_bounded_final_target_settle():
+    module = load_diagnostic_module()
+
+    help_text = module.build_parser().format_help()
+
+    assert "--settle_s" in help_text
+    assert "final target" in help_text
+    assert "default: 5.0" in help_text
 
 
 @pytest.mark.parametrize(
@@ -68,6 +80,10 @@ def test_joint_diagnostic_defaults_are_bounded_for_the_left_elbow():
         (["--fps", "11"], "--fps must be between 1 and 10"),
         (["--duration_s", "0.1"], "--duration_s must be finite and between 0.2 and 10.0"),
         (["--duration_s", "inf"], "--duration_s must be finite and between 0.2 and 10.0"),
+        (["--settle_s", "-0.1"], "--settle_s must be finite and between 0.0 and 10.0"),
+        (["--settle_s", "10.1"], "--settle_s must be finite and between 0.0 and 10.0"),
+        (["--settle_s", "nan"], "--settle_s must be finite and between 0.0 and 10.0"),
+        (["--settle_s", "inf"], "--settle_s must be finite and between 0.0 and 10.0"),
         (
             ["--max_final_error", "0"],
             "--max_final_error must be finite, greater than zero, and no larger than 5.0",
@@ -201,27 +217,59 @@ class FakeClock:
         self.sleeps.append(duration)
         self.now += duration
 
+    def advance(self, duration):
+        self.now += duration
+
 
 class FakeRobot:
-    def __init__(self, observation_poses):
+    def __init__(
+        self,
+        observation_poses,
+        *,
+        observation_sequence_advances=None,
+        clock=None,
+        send_delay_s=0.0,
+    ):
         self.config = SimpleNamespace(connect_timeout_s=1.0, observation_request_window=1)
         self.observation_sequence = 0
         self.observation_poses = [dict(pose) for pose in observation_poses]
+        self.observation_sequence_advances = list(observation_sequence_advances or [True])
         self.observation_index = 0
         self.events = []
+        self.clock = clock
+        self.send_delay_s = send_delay_s
+        self.send_times = []
 
     def get_observation(self):
         pose_index = min(self.observation_index, len(self.observation_poses) - 1)
         pose = dict(self.observation_poses[pose_index])
+        advance_index = min(
+            self.observation_index,
+            len(self.observation_sequence_advances) - 1,
+        )
+        should_advance = self.observation_sequence_advances[advance_index]
         self.observation_index += 1
-        self.observation_sequence += 1
+        if should_advance:
+            self.observation_sequence += 1
         self.events.append(("get_observation", self.observation_sequence, pose))
         return pose
 
     def send_action(self, action):
         action = dict(action)
+        if self.clock is not None:
+            self.send_times.append(self.clock.monotonic())
         self.events.append(("send_action", action))
+        if self.clock is not None and self.send_delay_s:
+            self.clock.advance(self.send_delay_s)
         return action
+
+
+def arm_actions(robot):
+    return [
+        event[1]
+        for event in robot.events
+        if event[0] == "send_action" and any(key.startswith("arm_") for key in event[1])
+    ]
 
 
 class FakeLifecycleRobot(FakeRobot):
@@ -310,6 +358,309 @@ def test_joint_diagnostic_uses_fresh_final_pose_and_reports_observed_outcome(cap
     assert "Host-accepted target: unavailable (the current action channel has no acknowledgement)" in output
     assert "Observed position: arm_left_elbow_flex.pos=99.000" in output
     assert "Outcome: PASS" in output
+
+
+def test_joint_diagnostic_holds_final_target_until_two_stable_fresh_samples(capsys):
+    module = load_diagnostic_module()
+    start = {**FOLLOWER_POSE, "arm_left_elbow_flex.pos": 100.0}
+    ramp_mid = {**start, "arm_left_elbow_flex.pos": 99.7}
+    ramp_end = {**start, "arm_left_elbow_flex.pos": 99.4}
+    one_sample_false_pass = {**start, "arm_left_elbow_flex.pos": 99.05}
+    outside_tolerance = {**start, "arm_left_elbow_flex.pos": 99.2}
+    stable_one = {**start, "arm_left_elbow_flex.pos": 99.04}
+    stable_two = {**start, "arm_left_elbow_flex.pos": 99.03}
+    clock = FakeClock()
+    robot = FakeRobot(
+        [
+            start,
+            start,
+            start,
+            ramp_mid,
+            ramp_end,
+            one_sample_false_pass,
+            outside_tolerance,
+            stable_one,
+            stable_two,
+        ],
+        clock=clock,
+    )
+
+    result = module.run_joint_diagnostic(
+        robot,
+        side="left",
+        joint="elbow_flex",
+        delta=-1.0,
+        duration_s=0.2,
+        settle_s=1.0,
+        fps=5,
+        max_final_error=0.1,
+        input_fn=lambda _: "MOVE",
+        monotonic=clock.monotonic,
+        sleep_fn=clock.sleep,
+    )
+
+    sends = arm_actions(robot)
+    final_action = {**start, "arm_left_elbow_flex.pos": 99.0, **ZERO_BODY}
+    output = capsys.readouterr().out
+    assert len(sends) == 7  # Three ramp frames plus four settle frames.
+    assert sends[-4:] == [final_action] * 4
+    assert all(set(action) == set(FOLLOWER_POSE) | set(ZERO_BODY) for action in sends[-4:])
+    assert result.outcome == "PASS"
+    assert result.ramp_end_value == pytest.approx(99.4)
+    assert result.settle_end_value == pytest.approx(99.03)
+    assert result.total_observed_movement == pytest.approx(-0.97)
+    assert result.first_measurable_movement_frame == 2
+    assert result.first_measurable_movement_elapsed_s == pytest.approx(0.2)
+    assert "First measurable movement: frame 2 at 0.200s" in output
+    assert "Ramp-end position: arm_left_elbow_flex.pos=99.400" in output
+    assert "Settle progress:" in output
+    assert "Settle-end position: arm_left_elbow_flex.pos=99.030" in output
+    assert "Total observed movement: -0.970" in output
+
+
+def test_joint_diagnostic_does_not_count_queued_samples_toward_stability():
+    module = load_diagnostic_module()
+    start = {**FOLLOWER_POSE, "arm_left_elbow_flex.pos": 100.0}
+    ramp_end = {**start, "arm_left_elbow_flex.pos": 99.4}
+    in_tolerance = {**start, "arm_left_elbow_flex.pos": 99.05}
+    clock = FakeClock()
+    robot = FakeRobot(
+        [start, start, start, ramp_end, ramp_end, *([in_tolerance] * 5)],
+        clock=clock,
+    )
+    robot.config.observation_request_window = 3
+
+    result = module.run_joint_diagnostic(
+        robot,
+        side="left",
+        joint="elbow_flex",
+        delta=-1.0,
+        duration_s=0.2,
+        settle_s=1.2,
+        fps=5,
+        max_final_error=0.1,
+        input_fn=lambda _: "MOVE",
+        monotonic=clock.monotonic,
+        sleep_fn=clock.sleep,
+    )
+
+    sends = arm_actions(robot)
+    assert len(sends) == 8  # Three ramp frames plus five settle frames.
+    assert sends[-5:] == [sends[-1]] * 5
+    assert result.outcome == "PASS"
+
+
+def test_joint_diagnostic_requires_sequence_fresh_observations_during_settle():
+    module = load_diagnostic_module()
+    start = {**FOLLOWER_POSE, "arm_left_elbow_flex.pos": 100.0}
+    ramp_end = {**start, "arm_left_elbow_flex.pos": 99.4}
+    clock = FakeClock()
+
+    class StaleDuringSettleRobot(FakeRobot):
+        def get_observation(self):
+            if self.observation_index >= 5:
+                clock.advance(0.6)
+            return super().get_observation()
+
+    robot = StaleDuringSettleRobot(
+        [start, start, start, start, ramp_end],
+        observation_sequence_advances=[True, True, True, True, True, False],
+        clock=clock,
+    )
+
+    with pytest.raises(module.SafetyRefusal, match="sequence-fresh"):
+        module.run_joint_diagnostic(
+            robot,
+            side="left",
+            joint="elbow_flex",
+            delta=-1.0,
+            duration_s=0.2,
+            settle_s=1.0,
+            fps=5,
+            max_final_error=0.1,
+            input_fn=lambda _: "MOVE",
+            monotonic=clock.monotonic,
+            sleep_fn=clock.sleep,
+        )
+
+    sends = arm_actions(robot)
+    assert len(sends) == 4
+    assert sends[-1] == {**start, "arm_left_elbow_flex.pos": 99.0, **ZERO_BODY}
+
+
+def test_joint_diagnostic_settle_timeout_repeats_final_action_for_the_bounded_budget():
+    module = load_diagnostic_module()
+    start = {**FOLLOWER_POSE, "arm_left_elbow_flex.pos": 100.0}
+    moved = {**start, "arm_left_elbow_flex.pos": 99.6}
+    clock = FakeClock()
+    robot = FakeRobot(
+        [start, start, start, moved, moved, moved, moved, moved],
+        clock=clock,
+    )
+
+    result = module.run_joint_diagnostic(
+        robot,
+        side="left",
+        joint="elbow_flex",
+        delta=-1.0,
+        duration_s=0.2,
+        settle_s=0.6,
+        fps=5,
+        max_final_error=0.1,
+        input_fn=lambda _: "MOVE",
+        monotonic=clock.monotonic,
+        sleep_fn=clock.sleep,
+    )
+
+    sends = arm_actions(robot)
+    assert len(sends) == 6  # Three ramp frames plus ceil(0.6 * 5) settle frames.
+    assert sends[-3:] == [sends[-1]] * 3
+    assert clock.sleeps == pytest.approx([0.2] * 5)
+    assert result.outcome == "INCOMPLETE"
+    assert result.ramp_end_value == pytest.approx(99.6)
+    assert result.settle_end_value == pytest.approx(99.6)
+    assert result.final_error == pytest.approx(-0.6)
+
+
+def test_joint_diagnostic_settle_overrun_does_not_compress_or_pass_the_deadline():
+    module = load_diagnostic_module()
+    start = {**FOLLOWER_POSE, "arm_left_elbow_flex.pos": 100.0}
+    moved = {**start, "arm_left_elbow_flex.pos": 99.6}
+    clock = FakeClock()
+    robot = FakeRobot(
+        [start, start, start, moved, moved, moved],
+        clock=clock,
+        send_delay_s=0.35,
+    )
+
+    result = module.run_joint_diagnostic(
+        robot,
+        side="left",
+        joint="elbow_flex",
+        delta=-1.0,
+        duration_s=0.2,
+        settle_s=0.6,
+        fps=5,
+        max_final_error=0.1,
+        input_fn=lambda _: "MOVE",
+        monotonic=clock.monotonic,
+        sleep_fn=clock.sleep,
+    )
+
+    sends = arm_actions(robot)
+    assert len(sends) == 4  # The next no-catch-up send would begin after the settle deadline.
+    assert sends[-1] == {**start, "arm_left_elbow_flex.pos": 99.0, **ZERO_BODY}
+    assert all(
+        later - earlier >= 0.55 - 1e-9
+        for earlier, later in zip(robot.send_times, robot.send_times[1:])
+    )
+    assert clock.sleeps == pytest.approx([0.2] * 3)
+    assert result.outcome == "INCOMPLETE"
+    assert result.settle_elapsed_s == pytest.approx(0.55)
+
+
+def test_joint_diagnostic_does_not_pass_on_an_observation_arriving_after_the_deadline():
+    module = load_diagnostic_module()
+    start = {**FOLLOWER_POSE, "arm_left_elbow_flex.pos": 100.0}
+    ramp_end = {**start, "arm_left_elbow_flex.pos": 99.4}
+    outside_tolerance = {**start, "arm_left_elbow_flex.pos": 99.2}
+    in_tolerance = {**start, "arm_left_elbow_flex.pos": 99.05}
+    clock = FakeClock()
+
+    class LateThirdSettleObservationRobot(FakeRobot):
+        def get_observation(self):
+            if self.observation_index == 7:
+                clock.advance(0.3)
+            return super().get_observation()
+
+    robot = LateThirdSettleObservationRobot(
+        [
+            start,
+            start,
+            start,
+            ramp_end,
+            ramp_end,
+            outside_tolerance,
+            in_tolerance,
+            in_tolerance,
+        ],
+        clock=clock,
+    )
+
+    result = module.run_joint_diagnostic(
+        robot,
+        side="left",
+        joint="elbow_flex",
+        delta=-1.0,
+        duration_s=0.2,
+        settle_s=0.7,
+        fps=5,
+        max_final_error=0.1,
+        input_fn=lambda _: "MOVE",
+        monotonic=clock.monotonic,
+        sleep_fn=clock.sleep,
+    )
+
+    assert len(arm_actions(robot)) == 6  # Three ramp frames plus three settle frames.
+    assert result.settle_elapsed_s == pytest.approx(0.9)
+    assert result.outcome == "INCOMPLETE"
+
+
+def test_joint_diagnostic_does_not_pass_on_one_final_in_tolerance_sample():
+    module = load_diagnostic_module()
+    start = {**FOLLOWER_POSE, "arm_left_elbow_flex.pos": 100.0}
+    ramp_end = {**start, "arm_left_elbow_flex.pos": 99.4}
+    outside_tolerance = {**start, "arm_left_elbow_flex.pos": 99.2}
+    one_final_sample = {**start, "arm_left_elbow_flex.pos": 99.05}
+    robot = FakeRobot(
+        [start, start, start, ramp_end, ramp_end, outside_tolerance, one_final_sample]
+    )
+    clock = FakeClock()
+
+    result = module.run_joint_diagnostic(
+        robot,
+        side="left",
+        joint="elbow_flex",
+        delta=-1.0,
+        duration_s=0.2,
+        settle_s=0.4,
+        fps=5,
+        max_final_error=0.1,
+        input_fn=lambda _: "MOVE",
+        monotonic=clock.monotonic,
+        sleep_fn=clock.sleep,
+    )
+
+    assert result.settle_end_value == pytest.approx(99.05)
+    assert result.outcome == "INCOMPLETE"
+
+
+def test_zero_settle_preserves_the_previous_post_ramp_verification_behavior():
+    module = load_diagnostic_module()
+    start = {**FOLLOWER_POSE, "arm_left_elbow_flex.pos": 100.0}
+    ramp_end = {**start, "arm_left_elbow_flex.pos": 99.4}
+    reached = {**start, "arm_left_elbow_flex.pos": 99.0}
+    robot = FakeRobot([start, start, start, ramp_end, ramp_end, reached, reached])
+    clock = FakeClock()
+
+    result = module.run_joint_diagnostic(
+        robot,
+        side="left",
+        joint="elbow_flex",
+        delta=-1.0,
+        duration_s=0.2,
+        settle_s=0.0,
+        fps=5,
+        max_final_error=0.1,
+        input_fn=lambda _: "MOVE",
+        monotonic=clock.monotonic,
+        sleep_fn=clock.sleep,
+    )
+
+    assert len(arm_actions(robot)) == 3
+    assert result.outcome == "PASS"
+    assert result.ramp_end_value == pytest.approx(99.4)
+    assert result.settle_end_value == pytest.approx(99.0)
 
 
 def test_joint_diagnostic_refuses_a_stale_observation_sequence_before_any_arm_action():
@@ -417,6 +768,55 @@ def test_diagnostic_lifecycle_preserves_primary_failure_when_disconnect_cleanup_
     assert any("cleanup disconnect" in note for note in exc_info.value.__notes__)
     assert robot.events[-1] == ("disconnect",)
     assert ("send_action", ZERO_BODY) in robot.events
+
+
+def test_diagnostic_lifecycle_preserves_a_settle_send_failure_and_still_cleans_up():
+    module = load_diagnostic_module()
+    args = module.parse_args(
+        ["--delta", "-1", "--duration_s", "0.2", "--settle_s", "1.0"]
+    )
+    start = {**FOLLOWER_POSE, "arm_left_elbow_flex.pos": 100.0}
+
+    class SettleFailureRobot(FakeLifecycleRobot):
+        def __init__(self):
+            super().__init__([start], fail_disconnect=True)
+            self.arm_send_count = 0
+
+        def send_action(self, action):
+            action = dict(action)
+            self.events.append(("send_action", action))
+            if any(key.startswith("arm_") for key in action):
+                self.arm_send_count += 1
+                if self.arm_send_count == 4:
+                    raise RuntimeError("primary settle send failed")
+            return action
+
+    robot = SettleFailureRobot()
+    clock = FakeClock()
+
+    with pytest.raises(RuntimeError, match="primary settle send failed") as exc_info:
+        module.run_diagnostic(
+            args,
+            robot_factory=lambda _: robot,
+            input_fn=lambda _: "MOVE",
+            monotonic=clock.monotonic,
+            sleep_fn=clock.sleep,
+        )
+
+    assert any("cleanup disconnect" in note for note in exc_info.value.__notes__)
+    assert robot.events[-1] == ("disconnect",)
+    assert ("send_action", ZERO_BODY) in robot.events
+
+
+def test_joint_diagnostic_docs_show_settle_and_no_literal_timestamp_placeholder():
+    text = DOC_PATH.read_text(encoding="utf-8")
+
+    assert "--settle_s 5.0" in text
+    assert "bounded final-target settle" in text
+    assert "two consecutive" in text
+    assert "max_relative_target=10.0" in text
+    assert "partially physically proven" in text
+    assert "YYYY-MM-DD-HHMMSS" not in text
 
 
 def test_diagnostic_client_factory_is_am1_only_and_disables_camera_schema(monkeypatch):

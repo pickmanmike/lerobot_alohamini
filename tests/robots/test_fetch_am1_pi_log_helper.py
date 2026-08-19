@@ -100,3 +100,20 @@ def test_fetch_helper_rejects_unsafe_host_and_remote_path_before_network(tmp_pat
     assert "RemoteHost must be a plain user@host value." in unsafe_host.stderr
     assert unsafe_path.returncode != 0
     assert "RemotePath must name /home/pickmanmike/am1-*.log." in unsafe_path.stderr
+
+
+def test_fetch_helper_rejects_timestamp_placeholder_before_network(tmp_path):
+    result = run_helper(
+        "-DryRun",
+        "-RemotePath",
+        "/home/pickmanmike/am1-left-elbow-diagnostic-host-YYYY-MM-DD-HHMMSS.log",
+        "-LocalDirectory",
+        str(tmp_path / "logs"),
+    )
+
+    assert result.returncode != 0
+    normalized_error = " ".join(result.stderr.split())
+    assert "RemotePath contains a timestamp placeholder" in normalized_error
+    assert "exact Pi HOST_LOG path" in normalized_error
+    assert "omit -RemotePath" in normalized_error
+    assert "newest AM1 log" in normalized_error

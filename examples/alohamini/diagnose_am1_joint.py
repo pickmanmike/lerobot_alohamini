@@ -65,6 +65,12 @@ class DiagnosticResult:
     target_value: float
     observed_value: float
     final_error: float
+    ramp_end_value: float
+    settle_end_value: float
+    total_observed_movement: float
+    settle_elapsed_s: float
+    first_measurable_movement_frame: int | None
+    first_measurable_movement_elapsed_s: float | None
 
 
 def _validated_follower_positions(follower_positions: Mapping[str, float]) -> dict[str, float]:
@@ -157,6 +163,7 @@ def run_joint_diagnostic(
     joint: str,
     delta: float,
     duration_s: float,
+    settle_s: float = 5.0,
     fps: int,
     max_final_error: float,
     input_fn=input,
@@ -164,6 +171,9 @@ def run_joint_diagnostic(
     sleep_fn,
 ) -> DiagnosticResult:
     """Run one confirmed, measured-pose-relative AM1 joint movement."""
+    if not math.isfinite(settle_s) or not 0.0 <= settle_s <= 10.0:
+        raise SafetyRefusal("settle duration must be finite and between 0.0 and 10.0 seconds")
+
     preliminary_observation = _get_fresh_observation(robot, monotonic=monotonic)
     preliminary_plan = build_joint_plan(
         preliminary_observation,
@@ -179,6 +189,7 @@ def run_joint_diagnostic(
         f"Requested movement: {delta:+.3f} normalized units over approximately "
         f"{duration_s:.3f} seconds at {fps} fps"
     )
+    print(f"Final-target settle: up to {settle_s:.3f} seconds at {fps} fps")
     print("All other arm joints will be held at the final pre-move measured pose.")
     print("Base and lift commands will remain explicitly zero throughout.")
     print("Keep the physical disconnect reachable and stop for unexpected motion or resistance.")
@@ -199,7 +210,11 @@ def run_joint_diagnostic(
     print("Host-accepted target: unavailable (the current action channel has no acknowledgement)")
 
     latest_observation = final_start_observation
+    latest_positions = _validated_follower_positions(latest_observation)
     previous_send_complete: float | None = None
+    ramp_started_at: float | None = None
+    first_movement_frame: int | None = None
+    first_movement_elapsed_s: float | None = None
     period_s = 1.0 / fps
     for frame_index in range(plan.frame_count):
         if previous_send_complete is not None:
@@ -209,6 +224,8 @@ def run_joint_diagnostic(
         action = build_joint_action(plan, frame_index)
         client_result = robot.send_action(action)
         previous_send_complete = monotonic()
+        if ramp_started_at is None:
+            ramp_started_at = previous_send_complete
         latest_observation = _get_fresh_observation(robot, monotonic=monotonic)
         latest_positions = _validated_follower_positions(latest_observation)
         requested_value = float(action[plan.selected_key])
@@ -224,16 +241,111 @@ def run_joint_diagnostic(
             f"requested={requested_value:.3f}, client_return={returned_text}, "
             f"observed={observed_value:.3f}"
         )
+        if (
+            first_movement_frame is None
+            and abs(observed_value - plan.start_value) > MIN_MEASURABLE_CHANGE
+        ):
+            first_movement_frame = frame_index + 1
+            first_movement_elapsed_s = max(monotonic() - ramp_started_at, 0.0)
 
-    # Observe beyond the request window so the result cannot be an older queued pose.
-    for _ in range(robot.config.observation_request_window + 1):
-        latest_observation = _get_fresh_observation(robot, monotonic=monotonic)
-        _validated_follower_positions(latest_observation)
+    ramp_end_value = latest_positions[plan.selected_key]
+    print(f"Ramp-end position: {plan.selected_key}={ramp_end_value:.3f}")
 
-    observed_value = _validated_follower_positions(latest_observation)[plan.selected_key]
+    settle_end_value = ramp_end_value
+    settle_elapsed_s = 0.0
+    settle_succeeded = False
+    request_window = max(1, int(getattr(robot.config, "observation_request_window", 1)))
+    if settle_s > 0.0:
+        settle_frame_count = math.ceil(settle_s * fps)
+        minimum_fresh_samples = request_window + 1
+        consecutive_in_tolerance = 0
+        final_action = build_joint_action(plan, plan.total_steps)
+        settle_started_at = monotonic()
+        settle_deadline = settle_started_at + settle_s
+        settle_observations_received = 0
+        print(
+            f"Holding final target for at most {settle_frame_count} settle frames; "
+            f"early PASS requires at least {minimum_fresh_samples + 1} fresh settle samples "
+            "and two consecutive post-window in-tolerance observations."
+        )
+        for settle_frame_index in range(1, settle_frame_count + 1):
+            now = monotonic()
+            if now > settle_deadline + 1e-12:
+                break
+            if previous_send_complete is not None:
+                next_send_not_before = previous_send_complete + period_s
+                if next_send_not_before > settle_deadline + 1e-12:
+                    break
+                remaining_s = next_send_not_before - now
+                if remaining_s > 0:
+                    sleep_fn(remaining_s)
+            if monotonic() > settle_deadline + 1e-12:
+                break
+            robot.send_action(final_action)
+            previous_send_complete = monotonic()
+            latest_observation = _get_fresh_observation(robot, monotonic=monotonic)
+            settle_observations_received += 1
+            latest_positions = _validated_follower_positions(latest_observation)
+            settle_end_value = latest_positions[plan.selected_key]
+            remaining_error = plan.target_value - settle_end_value
+            settle_elapsed_s = max(monotonic() - settle_started_at, 0.0)
+            print(
+                f"Settle progress: frame {settle_frame_index}/{settle_frame_count}, "
+                f"elapsed={settle_elapsed_s:.3f}s, requested={plan.target_value:.3f}, "
+                f"observed={settle_end_value:.3f}, remaining_error={remaining_error:+.3f}"
+            )
+            if (
+                first_movement_frame is None
+                and abs(settle_end_value - plan.start_value) > MIN_MEASURABLE_CHANGE
+            ):
+                first_movement_frame = plan.frame_count + settle_frame_index
+                first_movement_elapsed_s = max(monotonic() - ramp_started_at, 0.0)
+
+            if monotonic() > settle_deadline + 1e-12:
+                consecutive_in_tolerance = 0
+                print(
+                    f"Settle observation completed after the {settle_s:.3f}s limit; "
+                    "it is not eligible for PASS."
+                )
+                break
+            if settle_frame_index < minimum_fresh_samples:
+                consecutive_in_tolerance = 0
+            elif abs(remaining_error) <= max_final_error:
+                consecutive_in_tolerance += 1
+            else:
+                consecutive_in_tolerance = 0
+            if (
+                settle_frame_index >= minimum_fresh_samples
+                and consecutive_in_tolerance >= 2
+            ):
+                settle_succeeded = True
+                print(
+                    "Final target is stable on two consecutive sequence-fresh "
+                    f"observations after {settle_elapsed_s:.3f}s."
+                )
+                break
+        if not settle_succeeded:
+            print(
+                f"Settle ended without stable convergence after {settle_elapsed_s:.3f}s and "
+                f"{settle_observations_received} sequence-fresh observations."
+            )
+    else:
+        # Preserve the previous no-settle verification behavior when explicitly requested.
+        for verification_index in range(request_window + 1):
+            latest_observation = _get_fresh_observation(robot, monotonic=monotonic)
+            latest_positions = _validated_follower_positions(latest_observation)
+            settle_end_value = latest_positions[plan.selected_key]
+            if (
+                first_movement_frame is None
+                and abs(settle_end_value - plan.start_value) > MIN_MEASURABLE_CHANGE
+            ):
+                first_movement_frame = plan.frame_count + verification_index + 1
+                first_movement_elapsed_s = max(monotonic() - ramp_started_at, 0.0)
+
+    observed_value = settle_end_value
     final_error = plan.target_value - observed_value
     observed_delta = observed_value - plan.start_value
-    if abs(final_error) <= max_final_error:
+    if abs(final_error) <= max_final_error and (settle_s == 0.0 or settle_succeeded):
         outcome = "PASS"
     elif abs(observed_delta) <= MIN_MEASURABLE_CHANGE:
         outcome = "NO_MEASURABLE_MOVEMENT"
@@ -241,6 +353,18 @@ def run_joint_diagnostic(
         outcome = "WRONG_DIRECTION"
     else:
         outcome = "INCOMPLETE"
+    if first_movement_frame is None:
+        print("First measurable movement: not observed")
+    else:
+        print(
+            f"First measurable movement: frame {first_movement_frame} "
+            f"at {first_movement_elapsed_s:.3f}s"
+        )
+    print(f"Settle-end position: {plan.selected_key}={settle_end_value:.3f}")
+    print(
+        f"Total observed movement: {observed_delta:+.3f} "
+        f"(magnitude={abs(observed_delta):.3f})"
+    )
     print(f"Observed position: {plan.selected_key}={observed_value:.3f}")
     print(f"Final error: {final_error:+.3f}")
     print(f"Outcome: {outcome}")
@@ -250,6 +374,12 @@ def run_joint_diagnostic(
         target_value=plan.target_value,
         observed_value=observed_value,
         final_error=final_error,
+        ramp_end_value=ramp_end_value,
+        settle_end_value=settle_end_value,
+        total_observed_movement=observed_delta,
+        settle_elapsed_s=settle_elapsed_s,
+        first_measurable_movement_frame=first_movement_frame,
+        first_measurable_movement_elapsed_s=first_movement_elapsed_s,
     )
 
 
@@ -262,6 +392,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--delta", type=float, default=-10.0)
     parser.add_argument("--fps", type=int, default=5)
     parser.add_argument("--duration_s", type=float, default=5.0)
+    parser.add_argument(
+        "--settle_s",
+        type=float,
+        default=5.0,
+        help=(
+            "Maximum time to repeat the final target while checking fresh follower "
+            "observations (default: 5.0; use 0 to preserve no-settle verification)"
+        ),
+    )
     parser.add_argument("--max_final_error", type=float, default=1.0)
     return parser
 
@@ -275,6 +414,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--fps must be between 1 and 10")
     if not math.isfinite(args.duration_s) or not 0.2 <= args.duration_s <= 10.0:
         parser.error("--duration_s must be finite and between 0.2 and 10.0")
+    if not math.isfinite(args.settle_s) or not 0.0 <= args.settle_s <= 10.0:
+        parser.error("--settle_s must be finite and between 0.0 and 10.0")
     if not math.isfinite(args.max_final_error) or not 0 < args.max_final_error <= 5.0:
         parser.error("--max_final_error must be finite, greater than zero, and no larger than 5.0")
     return args
@@ -318,6 +459,7 @@ def run_diagnostic(
             joint=args.joint,
             delta=args.delta,
             duration_s=args.duration_s,
+            settle_s=args.settle_s,
             fps=args.fps,
             max_final_error=args.max_final_error,
             input_fn=input_fn,

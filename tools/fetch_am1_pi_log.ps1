@@ -21,6 +21,9 @@ function Assert-ValidRemoteHost {
 function Assert-ValidRemotePath {
     param([Parameter(Mandatory)][string]$Value)
 
+    if ($Value -match '(?i)(YYYY|HHMMSS|MM[-_]DD|<[^>]+>)') {
+        throw 'RemotePath contains a timestamp placeholder. Paste the exact Pi HOST_LOG path, or omit -RemotePath to fetch the newest AM1 log.'
+    }
     if ($Value -notmatch '^/home/pickmanmike/am1-[A-Za-z0-9._-]+\.log$') {
         throw 'RemotePath must name /home/pickmanmike/am1-*.log.'
     }
