@@ -125,7 +125,88 @@ If synchronization cannot distinguish limited positional headroom from a joint-s
   --max_final_error 1.0
 ```
 
-The client can report what it sent and what it subsequently observed, but the current action socket supplies no host-acceptance acknowledgement. With a positive settle duration, `PASS` therefore means that two post-window, sequence-fresh observed positions were stable within the requested tolerance; it does not prove a persistent host setting or `Goal_Position` storage. Passing `--settle_s 0` deliberately restores the legacy post-ramp verification and disables that two-sample stability requirement. The supplied Packet 2F evidence used an effective command-line `max_relative_target=10.0`: from start `27.026`, the requested target was `17.026`, but the observed plateau/end was `22.046` (total movement `-4.980`, remaining error `-5.020`). Correct-direction movement under that command-line limit is only partially physically proven; full convergence, clamp behavior, host acceptance, write acknowledgement, and `Goal_Position` storage/readback remain unproven. The next commissioning boundary is a separately authorized, default-off Pi trace; it must be physically run before making any further acceptance claim. Keep the client step cap, leader-drift limit, and recommended `5.0` final convergence tolerance unchanged.
+The client can report what it sent and what it subsequently observed, but the current action socket supplies no host-acceptance acknowledgement. With a positive settle duration, `PASS` therefore means that two post-window, sequence-fresh observed positions were stable within the requested tolerance; it does not prove a persistent host setting or `Goal_Position` storage. Passing `--settle_s 0` deliberately restores the legacy post-ramp verification and disables that two-sample stability requirement. The supplied Packet 2F evidence used an effective command-line `max_relative_target=10.0`: from start `27.026`, the requested target was `17.026`, but the observed plateau/end was `22.046` (total movement `-4.980`, remaining error `-5.020`). Correct-direction movement under that command-line limit is only partially physically proven; full convergence, clamp behavior, host acceptance, write acknowledgement, and `Goal_Position` storage/readback remain unproven. The exact next boundary is the separately authorized, default-off Pi trace below; it must be physically run before making any further acceptance claim. Keep the client step cap, leader-drift limit, and recommended `5.0` final convergence tolerance unchanged.
+
+#### Next trace-only physical discriminator — operator contract
+
+This is one bounded diagnostic, not ordinary commissioning. It requires a separately authorized powered session. Do not run it as an S-stage, do not combine it with teleoperation or leader synchronization, and do not treat its output as host acceptance, acknowledgement, or proof that a `Goal_Position` value was stored.
+
+**Preflight — Windows worktree.** Run this before powering the trace. The Windows branch must be `fix/am1-elbow-commissioning`, the status must be clean, and the reviewed software baseline must be present. `3064fb5447387bba4f84e64b6985df548400c473` is the exact reviewed pre-documentation baseline and contains executable diagnostic commit `b4f0f053cb7853acba645bcde2b329e9aa9087c0` as an ancestor:
+
+```powershell
+$ErrorActionPreference = 'Stop'
+if ((git branch --show-current) -ne 'fix/am1-elbow-commissioning') { throw 'wrong Windows branch' }
+if (git status --porcelain) { throw 'Windows worktree is not clean' }
+git merge-base --is-ancestor 3064fb5447387bba4f84e64b6985df548400c473 HEAD
+if ($LASTEXITCODE -ne 0) { throw 'reviewed Windows software baseline is not an ancestor' }
+git merge-base --is-ancestor b4f0f053cb7853acba645bcde2b329e9aa9087c0 HEAD
+if ($LASTEXITCODE -ne 0) { throw 'executable diagnostic commit is not an ancestor' }
+```
+
+**Preflight — Pi trace worktree.** On the Pi, require branch `fix/am1-relative-target-propagation`, clean status, and exact trace-code HEAD `6ab34e711c1a458da77aa7f80e59239b5b1d9d7f`:
+
+```bash
+set -eu
+test "$(git branch --show-current)" = fix/am1-relative-target-propagation
+test -z "$(git status --porcelain)"
+test "$(git rev-parse HEAD)" = 6ab34e711c1a458da77aa7f80e59239b5b1d9d7f
+```
+
+**Pi command.** With the follower powered and ready, run exactly one host trace. The command prints the exact `HOST_LOG` path and tees all host output, including the JSON lines, to that file:
+
+```bash
+HOST_LOG="/home/pickmanmike/am1-left-elbow-trace-$(date +%Y%m%d-%H%M%S).log"
+printf 'HOST_LOG=%s\n' "$HOST_LOG"
+python -m lerobot.robots.alohamini.alohamini_host \
+  --robot_model alohamini1 \
+  --no_cameras \
+  --skip_lift_home \
+  --max_relative_target 10.0 \
+  --max_loop_freq_hz 30 \
+  --trace_am1_left_elbow 2>&1 | tee "$HOST_LOG"
+```
+
+Leave the host waiting for commands before starting the Windows client. The trace flag is default-off and AM1-only; `--no_cameras` constructs no cameras and `--skip_lift_home` keeps lift homing out of this discriminator.
+
+**Paired Windows command and authorization gate.** Run this exact command once the Pi host is ready. At its prompt, type exactly uppercase `MOVE` and press Enter. No other input authorizes an arm-bearing action; Enter alone, lowercase `move`, or added whitespace is refused.
+
+```powershell
+.\.venv\Scripts\python.exe `
+  .\examples\alohamini\diagnose_am1_joint.py `
+  --robot.remote_ip 192.168.1.134 `
+  --robot.id my_alohamini `
+  --side left `
+  --joint elbow_flex `
+  --delta -10.0 `
+  --fps 5 `
+  --duration_s 5.0 `
+  --settle_s 5.0 `
+  --max_final_error 1.0
+```
+
+**JSON event and field contract.** The Pi emits newline-delimited JSON only when the trace flag is enabled. Every event has an epoch `timestamp_ns` (nanoseconds), `motor: "arm_left_elbow_flex"`, and an event name. Startup emits:
+
+```json
+{"event":"am1_left_elbow_trace_startup","timestamp_ns":0,"effective_max_relative_target":10.0,"motor":"arm_left_elbow_flex"}
+```
+
+Each traced action boundary emits the following field names (numeric values are examples of types, not expected measurements):
+
+```json
+{"event":"am1_left_elbow_action_boundary","timestamp_ns":0,"motor":"arm_left_elbow_flex","requested_normalized_target":0.0,"relative_limiter_present_normalized":0.0,"relative_limiter_target_normalized":0.0,"final_left_bus_target_normalized":0.0,"goal_position_sync_write":{"attempted":true,"sdk_transmit":"completed","servo_acknowledgement":"sync-write supplies no servo acknowledgement"},"readbacks":{"Goal_Position":{"normalized":0.0},"Present_Position":{"raw":0},"Present_Current":{"raw":0,"ma":0.0},"Torque_Enable":{"raw":0},"Lock":{"raw":0},"Operating_Mode":{"raw":0}}}
+```
+
+Interpret the action fields as follows:
+
+- `requested_normalized_target` is the requested left-elbow target from the Windows action before the Pi relative limiter.
+- `relative_limiter_present_normalized` is the present value sampled for the limiter; `relative_limiter_target_normalized` is the target after `max_relative_target` is applied.
+- `final_left_bus_target_normalized` is the target remaining after the later current-based joint/gripper limiting and immediately before the left `Goal_Position` sync-write. It is not an observed servo position.
+- `goal_position_sync_write.attempted` and `sdk_transmit` (`completed` or `failed`) describe the SDK sync-write attempt. The literal `servo_acknowledgement` value says that this action channel supplies no servo acknowledgement. On failure, the object also carries `error`; later-stage failures may add `action_write_failure`, `right_goal_position_sync_write`, `body_goal_velocity_sync_write`, and a `readbacks` status explaining why reads were not attempted.
+- Successful post-write reads are exactly `Goal_Position.normalized`, `Present_Position.raw`, `Present_Current.raw` plus `Present_Current.ma` (raw value multiplied by 6.5), `Torque_Enable.raw`, `Lock.raw`, and `Operating_Mode.raw`. A `diagnostic_reads` error object may replace these on a read failure. These are best-effort register readbacks, not write acknowledgements or proof of persistent storage, and they have no independent timestamp; use the enclosing event's `timestamp_ns`.
+
+**Safe starting state and stop boundary.** Before the `MOVE` gate, remove leaders and ordinary teleoperation from the session, clear people and obstacles from the arm workspace, support the arm in a known safe pose, keep a physical disconnect/E-stop reachable, and verify that base and lift must remain stationary. During the trace, only the left `elbow_flex` target may change; all other arm joints are held at the final fresh measured pose and base/lift commands are explicitly zero. Stop immediately and remove power or disconnect if any joint moves in the wrong direction, any nonselected joint/base/lift moves, resistance/contact/noise/cable tension appears, current or communication errors occur, the JSON contract is missing or contradictory, or the operator loses a clear view or stop path.
+
+The expected discriminator boundary is the known partial movement: a correct-direction but incomplete result may report `INCOMPLETE` (the supplied evidence ended at `22.046` from `27.026` toward `17.026`). `PASS` is reserved for the client’s two consecutive sequence-fresh observations within `--max_final_error 1.0` after the settle window; even `PASS` proves only this bounded observed outcome. Neither outcome proves clamp behavior, host acceptance, a write acknowledgement, or `Goal_Position` storage/readback. End the host trace after this one run and do not proceed to ordinary commissioning based on it.
 
 After a run, fetch the newest Pi log from Windows with:
 
