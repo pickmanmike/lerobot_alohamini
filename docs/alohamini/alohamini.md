@@ -147,6 +147,8 @@ if ($LASTEXITCODE -ne 0) { throw 'executable diagnostic commit is not an ancesto
 
 ```bash
 set -eu
+set -o pipefail
+cd /home/pickmanmike/lerobot_alohamini
 test "$(git branch --show-current)" = fix/am1-relative-target-propagation
 test -z "$(git status --porcelain)"
 test "$(git rev-parse HEAD)" = 6ab34e711c1a458da77aa7f80e59239b5b1d9d7f
@@ -155,9 +157,12 @@ test "$(git rev-parse HEAD)" = 6ab34e711c1a458da77aa7f80e59239b5b1d9d7f
 **Pi command.** With the follower powered and ready, run exactly one host trace. The command prints the exact `HOST_LOG` path and tees all host output, including the JSON lines, to that file:
 
 ```bash
+set -eu
+set -o pipefail
+cd /home/pickmanmike/lerobot_alohamini
 HOST_LOG="/home/pickmanmike/am1-left-elbow-trace-$(date +%Y%m%d-%H%M%S).log"
 printf 'HOST_LOG=%s\n' "$HOST_LOG"
-python -m lerobot.robots.alohamini.alohamini_host \
+./.venv/bin/python -m lerobot.robots.alohamini.alohamini_host \
   --robot_model alohamini1 \
   --no_cameras \
   --skip_lift_home \
@@ -202,11 +207,13 @@ Interpret the action fields as follows:
 - `relative_limiter_present_normalized` is the present value sampled for the limiter; `relative_limiter_target_normalized` is the target after `max_relative_target` is applied.
 - `final_left_bus_target_normalized` is the target remaining after the later current-based joint/gripper limiting and immediately before the left `Goal_Position` sync-write. It is not an observed servo position.
 - `goal_position_sync_write.attempted` and `sdk_transmit` (`completed` or `failed`) describe the SDK sync-write attempt. The literal `servo_acknowledgement` value says that this action channel supplies no servo acknowledgement. On failure, the object also carries `error`; later-stage failures may add `action_write_failure`, `right_goal_position_sync_write`, `body_goal_velocity_sync_write`, and a `readbacks` status explaining why reads were not attempted.
-- Successful post-write reads are exactly `Goal_Position.normalized`, `Present_Position.raw`, `Present_Current.raw` plus `Present_Current.ma` (raw value multiplied by 6.5), `Torque_Enable.raw`, `Lock.raw`, and `Operating_Mode.raw`. A `diagnostic_reads` error object may replace these on a read failure. These are best-effort register readbacks, not write acknowledgements or proof of persistent storage, and they have no independent timestamp; use the enclosing event's `timestamp_ns`.
+- Successful post-write reads are exactly `Goal_Position.normalized`, `Present_Position.raw`, `Present_Current.raw` plus `Present_Current.ma` (raw value multiplied by 6.5), `Torque_Enable.raw`, `Lock.raw`, and `Operating_Mode.raw`. A successful matching `readbacks.Goal_Position.normalized` proves the immediate post-write register read at that boundary, but it is not a servo acknowledgement and does not prove persistence beyond that read. A `diagnostic_reads` error object may replace these on a read failure; the fields have no independent timestamp, so use the enclosing event's `timestamp_ns`.
 
 **Safe starting state and stop boundary.** Before the `MOVE` gate, remove leaders and ordinary teleoperation from the session, clear people and obstacles from the arm workspace, support the arm in a known safe pose, keep a physical disconnect/E-stop reachable, and verify that base and lift must remain stationary. During the trace, only the left `elbow_flex` target may change; all other arm joints are held at the final fresh measured pose and base/lift commands are explicitly zero. Stop immediately and remove power or disconnect if any joint moves in the wrong direction, any nonselected joint/base/lift moves, resistance/contact/noise/cable tension appears, current or communication errors occur, the JSON contract is missing or contradictory, or the operator loses a clear view or stop path.
 
-The expected discriminator boundary is the known partial movement: a correct-direction but incomplete result may report `INCOMPLETE` (the supplied evidence ended at `22.046` from `27.026` toward `17.026`). `PASS` is reserved for the client’s two consecutive sequence-fresh observations within `--max_final_error 1.0` after the settle window; even `PASS` proves only this bounded observed outcome. Neither outcome proves clamp behavior, host acceptance, a write acknowledgement, or `Goal_Position` storage/readback. End the host trace after this one run and do not proceed to ordinary commissioning based on it.
+The expected discriminator boundary is the known partial movement: a correct-direction but incomplete result may report `INCOMPLETE` (the supplied evidence ended at `22.046` from `27.026` toward `17.026`). `PASS` is reserved for the client’s two consecutive sequence-fresh observations within `--max_final_error 1.0` after the settle window. Client `PASS` or `INCOMPLETE` alone proves none of the host-side write or register-read conditions below. End the host trace after this one run and do not proceed to ordinary commissioning based on it.
+
+**Trace-boundary decision.** Compare the startup and action JSON with the paired Windows output. The expected final repeated request is approximately `17.026` (allow normal quantization); startup must report effective `max_relative_target` approximately `10.0`; `relative_limiter_target_normalized` and `final_left_bus_target_normalized` must both be approximately `17.026`; `goal_position_sync_write.sdk_transmit` must be `completed`; `readbacks.Goal_Position.normalized` must match approximately `17.026`; and `readbacks.Torque_Enable.raw`, `readbacks.Lock.raw`, and `readbacks.Operating_Mode.raw` must be `1`, `1`, and `0`. If those conditions match while the observed `Present_Position` remains approximately `22.046`, the host command path passes this boundary only; the next branch is a separately reviewed read-only L/R ID3 register/calibration comparison. If effective `max_relative_target` is approximately `5`, or the relative-limited target, final bus target, or `Goal_Position` readback is approximately `22`, the propagation/limiter path fails. Any missing, errored, or mismatched field keeps the boundary unresolved. Any failure stops the trace and authorizes no ordinary commissioning.
 
 After a run, fetch the newest Pi log from Windows with:
 
