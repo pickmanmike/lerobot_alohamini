@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -194,6 +195,62 @@ def test_refusal_requires_exact_uppercase_read_before_creating_a_bus(tmp_path: P
     ]
 
 
+def test_refusal_rejects_identical_port_arguments_before_calibration_or_bus_access(
+    tmp_path: Path,
+) -> None:
+    module = _load_module()
+
+    def bus_factory(**kwargs: Any) -> FakeBus:
+        raise AssertionError("duplicate ports must be rejected before bus construction")
+
+    output: list[str] = []
+    status = module.run_diagnostic(
+        left_port="SAME",
+        right_port="SAME",
+        calibration_file=tmp_path / "missing.json",
+        input_fn=lambda prompt: "READ",
+        output_fn=output.append,
+        error_fn=lambda message: None,
+        bus_factory=bus_factory,
+    )
+
+    assert status == 2
+    assert output == [
+        "Safety refusal: left and right ports identify the same path or filesystem object; "
+        "no bus was opened."
+    ]
+
+
+def test_refusal_rejects_distinct_paths_to_the_same_filesystem_object_before_bus_access(
+    tmp_path: Path,
+) -> None:
+    module = _load_module()
+    left_port = tmp_path / "left-port"
+    right_port = tmp_path / "right-port"
+    left_port.touch()
+    os.link(left_port, right_port)
+
+    def bus_factory(**kwargs: Any) -> FakeBus:
+        raise AssertionError("aliases of one device must be rejected before bus construction")
+
+    output: list[str] = []
+    status = module.run_diagnostic(
+        left_port=str(left_port),
+        right_port=str(right_port),
+        calibration_file=tmp_path / "missing.json",
+        input_fn=lambda prompt: "READ",
+        output_fn=output.append,
+        error_fn=lambda message: None,
+        bus_factory=bus_factory,
+    )
+
+    assert status == 2
+    assert output == [
+        "Safety refusal: left and right ports identify the same path or filesystem object; "
+        "no bus was opened."
+    ]
+
+
 def test_success_reads_only_raw_id3_registers_and_reports_calibration_differences(
     tmp_path: Path,
 ) -> None:
@@ -347,6 +404,51 @@ def test_read_failure_closes_both_buses_and_cleanup_does_not_hide_original_error
     ]
 
 
+def test_disconnect_failure_after_success_reports_cleanup_error_without_completed_result(
+    tmp_path: Path,
+) -> None:
+    module = _load_module()
+    calibration_file = tmp_path / "AlohaMiniRobot.json"
+    _write_calibration(calibration_file)
+    buses: dict[str, FakeBus] = {}
+
+    def bus_factory(**kwargs: Any) -> FakeBus:
+        side = "left" if kwargs["port"] == "LEFT" else "right"
+        bus = FakeBus(
+            side=side,
+            values=_values(0),
+            disconnect_error=RuntimeError("right close failed") if side == "right" else None,
+        )
+        buses[side] = bus
+        return bus
+
+    output: list[str] = []
+    errors: list[str] = []
+    status = module.run_diagnostic(
+        left_port="LEFT",
+        right_port="RIGHT",
+        calibration_file=calibration_file,
+        input_fn=lambda prompt: "READ",
+        output_fn=output.append,
+        error_fn=errors.append,
+        bus_factory=bus_factory,
+    )
+
+    assert status == 1
+    assert output == []
+    assert buses["left"].disconnect_calls == [False]
+    assert buses["right"].disconnect_calls == [False]
+    error = json.loads(errors[0])
+    assert error["status"] == "error"
+    assert error["error"] == {
+        "message": "Register comparison completed, but bus cleanup failed.",
+        "type": "CleanupError",
+    }
+    assert error["cleanup_errors"] == [
+        {"message": "right close failed", "side": "right", "type": "RuntimeError"}
+    ]
+
+
 def test_missing_calibration_is_reported_without_constructing_a_bus(tmp_path: Path) -> None:
     module = _load_module()
     factory_calls: list[dict[str, Any]] = []
@@ -370,16 +472,16 @@ def test_missing_calibration_is_reported_without_constructing_a_bus(tmp_path: Pa
     assert "missing.json" in error["error"]["message"]
 
 
-def test_default_calibration_path_reuses_alohamini_robot_identity() -> None:
+def test_default_calibration_path_uses_repository_calibration_constant(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    from lerobot.utils import constants
+
+    calibration_root = tmp_path / "configured-calibration-root"
+    monkeypatch.setattr(constants, "HF_LEROBOT_CALIBRATION", calibration_root)
     module = _load_module()
 
     assert module.DEFAULT_CALIBRATION_FILE == (
-        Path.home()
-        / ".cache"
-        / "huggingface"
-        / "lerobot"
-        / "calibration"
-        / "robots"
-        / "alohamini"
-        / "AlohaMiniRobot.json"
+        constants.HF_LEROBOT_CALIBRATION / constants.ROBOTS / "alohamini" / "AlohaMiniRobot.json"
     )

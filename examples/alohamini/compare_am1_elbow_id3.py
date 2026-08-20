@@ -18,22 +18,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
+from lerobot.utils.constants import HF_LEROBOT_CALIBRATION, ROBOTS
 
-DEFAULT_CALIBRATION_FILE = (
-    Path.home()
-    / ".cache"
-    / "huggingface"
-    / "lerobot"
-    / "calibration"
-    / "robots"
-    / "alohamini"
-    / "AlohaMiniRobot.json"
-)
+
+DEFAULT_CALIBRATION_FILE = HF_LEROBOT_CALIBRATION / ROBOTS / "alohamini" / "AlohaMiniRobot.json"
 
 MOTOR_NAME = "elbow_flex"
 CALIBRATION_KEYS = {
@@ -98,6 +92,10 @@ REFUSAL_MESSAGE = (
     "Safety refusal: enter exact uppercase READ to permit read-only elbow register access; "
     "no bus was opened."
 )
+DUPLICATE_PORT_REFUSAL_MESSAGE = (
+    "Safety refusal: left and right ports identify the same path or filesystem object; "
+    "no bus was opened."
+)
 
 
 def _default_bus_factory(*, port: str, motors: dict[str, Any]) -> Any:
@@ -147,6 +145,15 @@ def _exception_record(error: BaseException) -> dict[str, str]:
     return {"message": str(error), "type": type(error).__name__}
 
 
+def _ports_identify_same_object(left_port: str, right_port: str) -> bool:
+    if left_port == right_port:
+        return True
+    try:
+        return os.path.samefile(left_port, right_port)
+    except OSError:
+        return False
+
+
 def run_diagnostic(
     *,
     left_port: str,
@@ -167,6 +174,9 @@ def run_diagnostic(
         confirmation = ""
     if confirmation != "READ":
         output_fn(REFUSAL_MESSAGE)
+        return 2
+    if _ports_identify_same_object(left_port, right_port):
+        output_fn(DUPLICATE_PORT_REFUSAL_MESSAGE)
         return 2
 
     buses: dict[str, Any] = {}
