@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -31,6 +32,20 @@ def run_helper(*args: str) -> subprocess.CompletedProcess[str]:
         text=True,
         timeout=10,
     )
+
+
+def normalize_powershell_stderr(text: str) -> str:
+    """Make native PowerShell stderr stable for phrase assertions in tests."""
+    text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
+    text = re.sub(r"[\x00-\x1f\x7f]", " ", text)
+    return " ".join(text.split())
+
+
+def test_timestamp_placeholder_error_with_ansi_formatting_is_matched_after_normalization():
+    stderr = "RemotePath contains a timestamp \x1b[31mplaceholder\x1b[0m."
+
+    assert "RemotePath contains a timestamp placeholder" not in stderr
+    assert "RemotePath contains a timestamp placeholder" in normalize_powershell_stderr(stderr)
 
 
 def test_fetch_helper_dry_run_selects_newest_and_prints_exact_paths_without_writing(tmp_path):
@@ -112,7 +127,7 @@ def test_fetch_helper_rejects_timestamp_placeholder_before_network(tmp_path):
     )
 
     assert result.returncode != 0
-    normalized_error = " ".join(result.stderr.split())
+    normalized_error = normalize_powershell_stderr(result.stderr)
     assert "RemotePath contains a timestamp placeholder" in normalized_error
     assert "exact Pi HOST_LOG path" in normalized_error
     assert "omit -RemotePath" in normalized_error

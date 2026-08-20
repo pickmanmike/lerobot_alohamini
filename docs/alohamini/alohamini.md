@@ -125,7 +125,7 @@ If synchronization cannot distinguish limited positional headroom from a joint-s
   --max_final_error 1.0
 ```
 
-The client can report what it sent and what it subsequently observed, but the current action socket supplies no host-acceptance acknowledgement. With a positive settle duration, `PASS` therefore means that two post-window, sequence-fresh observed positions were stable within the requested tolerance; it does not prove a persistent host setting. Passing `--settle_s 0` deliberately restores the legacy post-ramp verification and disables that two-sample stability requirement. In the observed left-elbow case, `max_relative_target=10.0` is partially physically proven: it initiated slow movement in the correct direction for the exact `-10.0` target, but full convergence is not proven. Raising the host limit above `10.0` cannot change that exact target when the host present position matches the measured start, so the next bounded test changes only the diagnostic settle time. Do not widen the host limit, client step cap, leader-drift limit, or final convergence tolerance for that test.
+The client can report what it sent and what it subsequently observed, but the current action socket supplies no host-acceptance acknowledgement. With a positive settle duration, `PASS` therefore means that two post-window, sequence-fresh observed positions were stable within the requested tolerance; it does not prove a persistent host setting or `Goal_Position` storage. Passing `--settle_s 0` deliberately restores the legacy post-ramp verification and disables that two-sample stability requirement. The observed left-elbow evidence is partially physically proven and shows a five-unit plateau: Pi `max_relative_target=5.0` produced an exact clamp from approximately `99.909` to `94.909` while the joint stayed at approximately `99.909`. That is not host acceptance, acknowledgement, or proof that a goal position was stored. The next commissioning boundary is a separately authorized, default-off Pi trace with the host `max_relative_target` limit left disabled (do not force `max_relative_target=10.0`); it must be physically run before making any further acceptance claim. Keep the client step cap, leader-drift limit, and recommended `5.0` final convergence tolerance unchanged.
 
 After a run, fetch the newest Pi log from Windows with:
 
@@ -138,6 +138,13 @@ The helper defaults to `pickmanmike@192.168.1.134`, prints the exact remote and 
 ```powershell
 $piHostLog = Read-Host 'Paste the exact Pi HOST_LOG path'
 .\tools\fetch_am1_pi_log.ps1 -RemotePath $piHostLog
+```
+
+For an offline command-line check, collect native output as one string before matching it:
+
+```powershell
+$diagnosticHelp = (& .\.venv\Scripts\python.exe .\examples\alohamini\diagnose_am1_joint.py --help 2>&1 | Out-String)
+if ($diagnosticHelp -notmatch '--settle_s') { throw 'diagnostic --help did not contain --settle_s' }
 ```
 
 Run S1 through S6 in order. Stop after each stage and review the observed movement and cleanup before authorizing the next stage.
