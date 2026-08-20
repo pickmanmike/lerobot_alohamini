@@ -129,7 +129,7 @@ The client can report what it sent and what it subsequently observed, but the cu
 
 #### Next trace-only physical discriminator — operator contract
 
-This is one bounded diagnostic, not ordinary commissioning. It requires a separately authorized powered session. Do not run it as an S-stage, do not combine it with teleoperation or leader synchronization, and do not treat its output as host acceptance, acknowledgement, or proof that a `Goal_Position` value was stored.
+This is one bounded diagnostic, not ordinary commissioning. It requires a separately authorized powered session. Do not run it as an S-stage or combine it with teleoperation or leader synchronization. The client `PASS`/`INCOMPLETE` outcome alone is not host acceptance, an acknowledgement, an immediate `Goal_Position` readback, or persistence proof. A matching trace `readbacks.Goal_Position.normalized` is limited to the immediate post-write register read at that boundary; it is not a servo acknowledgement and does not prove persistence beyond that read.
 
 **Preflight — Windows worktree.** Run this before powering the trace. The Windows branch must be `fix/am1-elbow-commissioning`, the status must be clean, and the reviewed software baseline must be present. `3064fb5447387bba4f84e64b6985df548400c473` is the exact reviewed pre-documentation baseline and contains executable diagnostic commit `b4f0f053cb7853acba645bcde2b329e9aa9087c0` as an ancestor:
 
