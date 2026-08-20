@@ -118,12 +118,13 @@ def test_fetch_helper_rejects_unsafe_host_and_remote_path_before_network(tmp_pat
 
 
 def test_fetch_helper_rejects_timestamp_placeholder_before_network(tmp_path):
+    local_directory = tmp_path / "logs"
     result = run_helper(
         "-DryRun",
         "-RemotePath",
         "/home/pickmanmike/am1-left-elbow-diagnostic-host-YYYY-MM-DD-HHMMSS.log",
         "-LocalDirectory",
-        str(tmp_path / "logs"),
+        str(local_directory),
     )
 
     assert result.returncode != 0
@@ -132,3 +133,4 @@ def test_fetch_helper_rejects_timestamp_placeholder_before_network(tmp_path):
     assert "exact Pi HOST_LOG path" in normalized_error
     assert "omit -RemotePath" in normalized_error
     assert "newest AM1 log" in normalized_error
+    assert not local_directory.exists()
