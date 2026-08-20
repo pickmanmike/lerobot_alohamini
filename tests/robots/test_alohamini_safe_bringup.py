@@ -50,6 +50,7 @@ class FakeBus:
         self.name = name
         self.motors = dict.fromkeys(motor_names, object())
         self.events = events
+        self.read_calls: list[tuple[str, str, bool]] = []
         self.is_connected = True
         self.registers = defaultdict(int)
         self.read_sequences: dict[tuple[str, str], list[object]] = {}
@@ -66,6 +67,7 @@ class FakeBus:
         num_retry: int = 3,
     ) -> int | float:
         self.events.append((self.name, "read", register, motor))
+        self.read_calls.append((register, motor, normalize))
         return self._read_value(register, motor)
 
     def _read_value(self, register: str, motor: str) -> int | float:
@@ -202,6 +204,18 @@ def elbow_action(target: float = 20.0) -> dict[str, float]:
         "y.vel": 0.0,
         "theta.vel": 0.0,
     }
+
+
+def attach_right_elbow_bus(robot: AlohaMini, events: list[tuple]) -> FakeBus:
+    right = FakeBus("right", ("arm_right_elbow_flex",), events)
+    right.registers[("Present_Position", "arm_right_elbow_flex")] = 10
+    robot.right_bus = right
+    robot.right_arm_motors = ["arm_right_elbow_flex"]
+    return right
+
+
+def bimanual_elbow_action() -> dict[str, float]:
+    return {**elbow_action(), "arm_right_elbow_flex.pos": 20.0}
 
 
 def trace_records(captured: str) -> list[dict]:
@@ -534,6 +548,14 @@ def test_trace_records_the_actual_am1_left_elbow_action_boundary(capsys):
         "Lock": {"raw": 0},
         "Operating_Mode": {"raw": 0},
     }
+    assert left.read_calls == [
+        ("Goal_Position", "arm_left_elbow_flex", True),
+        ("Present_Position", "arm_left_elbow_flex", False),
+        ("Present_Current", "arm_left_elbow_flex", False),
+        ("Torque_Enable", "arm_left_elbow_flex", False),
+        ("Lock", "arm_left_elbow_flex", False),
+        ("Operating_Mode", "arm_left_elbow_flex", False),
+    ]
     left_write = event_index(
         events,
         ("left", "sync_write", "Goal_Position", {"arm_left_elbow_flex": 14.0}, True),
@@ -573,6 +595,94 @@ def test_trace_reports_sync_write_failure_and_reraises_original_error(capsys):
     assert record["relative_limiter_target_normalized"] == 14.0
     assert record["final_left_bus_target_normalized"] == 10.0
     assert record["diagnostic_reads"] == "not attempted because Goal_Position sync write failed"
+
+
+@pytest.mark.parametrize("trace_failure", ["serialization", "output"])
+def test_trace_failure_cannot_replace_the_original_left_write_error(monkeypatch, trace_failure):
+    robot, left, _ = make_action_robot(trace_am1_left_elbow=True)
+    original_error = ConnectionError("original left sync write failure")
+    left.sync_write_failures["Goal_Position"] = original_error
+
+    def fail_trace(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError(f"{trace_failure} failed")
+
+    if trace_failure == "serialization":
+        monkeypatch.setattr(alohamini_module.json, "dumps", fail_trace)
+    else:
+        monkeypatch.setattr("builtins.print", fail_trace)
+
+    with pytest.raises(ConnectionError) as raised:
+        robot.send_action(elbow_action())
+
+    assert raised.value is original_error
+
+
+def test_trace_diagnostic_conversion_failure_keeps_successful_action_successful(capsys):
+    class UnconvertibleCurrent:
+        def __float__(self):
+            raise ValueError("current conversion failed")
+
+    robot, left, events = make_action_robot(trace_am1_left_elbow=True)
+    left.read_sequences[("Present_Current", "arm_left_elbow_flex")] = [10, UnconvertibleCurrent()]
+
+    sent = robot.send_action(elbow_action())
+
+    record = trace_records(capsys.readouterr().out)[-1]
+    assert sent["arm_left_elbow_flex.pos"] == 14.0
+    assert record["diagnostic_reads"] == {"error": "ValueError: current conversion failed"}
+    assert any(event[1:3] == ("sync_write", "Goal_Position") for event in events)
+    assert any(event[1:3] == ("sync_write", "Goal_Velocity") for event in events)
+
+
+def test_trace_output_failure_after_successful_writes_keeps_action_successful(monkeypatch):
+    robot, left, events = make_action_robot(trace_am1_left_elbow=True)
+
+    def fail_serialization(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("trace serialization failed")
+
+    monkeypatch.setattr(alohamini_module.json, "dumps", fail_serialization)
+
+    sent = robot.send_action(elbow_action())
+
+    assert sent["arm_left_elbow_flex.pos"] == 14.0
+    assert any(event[1:3] == ("sync_write", "Goal_Position") for event in events)
+    assert any(event[1:3] == ("sync_write", "Goal_Velocity") for event in events)
+
+
+@pytest.mark.parametrize(
+    ("failing_bus", "register", "stage"),
+    [
+        ("right", "Goal_Position", "right_goal_position"),
+        ("left", "Goal_Velocity", "base_goal_velocity"),
+    ],
+)
+def test_trace_reports_later_write_failures_without_early_readbacks(
+    capsys, failing_bus, register, stage
+):
+    robot, left, events = make_action_robot(trace_am1_left_elbow=True)
+    right = attach_right_elbow_bus(robot, events)
+    original_error = ConnectionError(f"{stage} failed")
+    (right if failing_bus == "right" else left).sync_write_failures[register] = original_error
+
+    with pytest.raises(ConnectionError) as raised:
+        robot.send_action(bimanual_elbow_action())
+
+    record = trace_records(capsys.readouterr().out)[-1]
+    assert raised.value is original_error
+    assert record["goal_position_sync_write"] == {
+        "attempted": True,
+        "sdk_transmit": "completed",
+        "servo_acknowledgement": "sync-write supplies no servo acknowledgement",
+    }
+    assert record["action_write_failure"] == {
+        "stage": stage,
+        "error": f"ConnectionError: {stage} failed",
+    }
+    assert record["diagnostic_reads"] == "not attempted because body Goal_Velocity sync write failed"
+    assert left.read_calls == []
+    assert all("Phase" not in event for event in events)
 
 
 @pytest.mark.parametrize(

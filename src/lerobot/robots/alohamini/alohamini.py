@@ -888,7 +888,7 @@ class AlohaMini(Robot):
                 self.left_bus.sync_write("Goal_Position", {k.replace(".pos", ""): v for k, v in left_pos.items()})
             except Exception as error:
                 if trace_enabled:
-                    self._emit_am1_left_elbow_trace(
+                    self._record_am1_left_elbow_trace(
                         requested_normalized_target=trace_requested_target,
                         relative_limiter_present_normalized=trace_relative_present,
                         relative_limiter_target_normalized=trace_relative_target,
@@ -904,24 +904,72 @@ class AlohaMini(Robot):
                 raise
         left_write_done_t = time.perf_counter()
         if self.right_bus and right_pos:
-            self.right_bus.sync_write("Goal_Position", {k.replace(".pos", ""): v for k, v in right_pos.items()})
+            try:
+                self.right_bus.sync_write("Goal_Position", {k.replace(".pos", ""): v for k, v in right_pos.items()})
+            except Exception as error:
+                if trace_enabled:
+                    self._record_am1_left_elbow_trace(
+                        requested_normalized_target=trace_requested_target,
+                        relative_limiter_present_normalized=trace_relative_present,
+                        relative_limiter_target_normalized=trace_relative_target,
+                        final_left_bus_target_normalized=trace_final_left_target,
+                        goal_position_sync_write={
+                            "attempted": True,
+                            "sdk_transmit": "completed",
+                            "servo_acknowledgement": "sync-write supplies no servo acknowledgement",
+                        },
+                        action_write_failure={
+                            "stage": "right_goal_position",
+                            "error": f"{type(error).__name__}: {error}",
+                        },
+                        diagnostic_reads="not attempted because body Goal_Velocity sync write failed",
+                    )
+                raise
         right_write_done_t = time.perf_counter()
-        self.left_bus.sync_write("Goal_Velocity", base_wheel_goal_vel)
+        try:
+            self.left_bus.sync_write("Goal_Velocity", base_wheel_goal_vel)
+        except Exception as error:
+            if trace_enabled:
+                self._record_am1_left_elbow_trace(
+                    requested_normalized_target=trace_requested_target,
+                    relative_limiter_present_normalized=trace_relative_present,
+                    relative_limiter_target_normalized=trace_relative_target,
+                    final_left_bus_target_normalized=trace_final_left_target,
+                    goal_position_sync_write={
+                        "attempted": True,
+                        "sdk_transmit": "completed",
+                        "servo_acknowledgement": "sync-write supplies no servo acknowledgement",
+                    },
+                    action_write_failure={
+                        "stage": "base_goal_velocity",
+                        "error": f"{type(error).__name__}: {error}",
+                    },
+                    diagnostic_reads="not attempted because body Goal_Velocity sync write failed",
+                )
+            raise
         base_write_done_t = time.perf_counter()
 
         if trace_enabled:
-            self._emit_am1_left_elbow_trace(
-                requested_normalized_target=trace_requested_target,
-                relative_limiter_present_normalized=trace_relative_present,
-                relative_limiter_target_normalized=trace_relative_target,
-                final_left_bus_target_normalized=trace_final_left_target,
-                goal_position_sync_write={
+            trace_evidence = {
+                "requested_normalized_target": trace_requested_target,
+                "relative_limiter_present_normalized": trace_relative_present,
+                "relative_limiter_target_normalized": trace_relative_target,
+                "final_left_bus_target_normalized": trace_final_left_target,
+                "goal_position_sync_write": {
                     "attempted": True,
                     "sdk_transmit": "completed",
                     "servo_acknowledgement": "sync-write supplies no servo acknowledgement",
                 },
-                readbacks=self._read_am1_left_elbow_trace_registers(),
-            )
+            }
+            try:
+                readbacks = self._read_am1_left_elbow_trace_registers()
+            except Exception as error:
+                self._record_am1_left_elbow_trace(
+                    **trace_evidence,
+                    diagnostic_reads={"error": f"{type(error).__name__}: {error}"},
+                )
+            else:
+                self._record_am1_left_elbow_trace(**trace_evidence, readbacks=readbacks)
 
         self.logs["action_timing_ms"] = {
             "action_prepare": (prepare_done_t - action_start_t) * 1e3,
@@ -952,6 +1000,16 @@ class AlohaMini(Robot):
             ),
             flush=True,
         )
+
+    def _record_am1_left_elbow_trace(self, **evidence) -> None:
+        """Emit an opt-in trace without changing action success or write-error semantics."""
+        try:
+            self._emit_am1_left_elbow_trace(**evidence)
+        except Exception:
+            try:
+                logger.warning("Failed to emit AM1 left elbow trace.", exc_info=True)
+            except Exception:
+                pass
 
     def _read_am1_left_elbow_trace_registers(self) -> dict[str, dict[str, float | str]]:
         motor = "arm_left_elbow_flex"
