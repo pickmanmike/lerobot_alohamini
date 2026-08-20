@@ -153,6 +153,14 @@ def make_parser() -> argparse.ArgumentParser:
         help="Maximum follower-arm position change allowed per command (default: disabled).",
     )
     parser.add_argument(
+        "--trace_am1_left_elbow",
+        action="store_true",
+        help=(
+            "Emit default-off, AM1-only action-boundary diagnostics for arm_left_elbow_flex "
+            "(requires followers)."
+        ),
+    )
+    parser.add_argument(
         "--max_loop_freq_hz",
         type=positive_int,
         default=30,
@@ -179,6 +187,7 @@ def make_robot_config(args: argparse.Namespace) -> AlohaMiniConfig:
         robot_model=args.robot_model,
         no_follower=args.no_follower,
         max_relative_target=args.max_relative_target,
+        trace_am1_left_elbow=args.trace_am1_left_elbow,
     )
     if args.no_cameras:
         config.cameras = {}
@@ -193,11 +202,37 @@ def connect_robot(robot: AlohaMini, *, skip_lift_home: bool) -> None:
     robot.connect(home_lift=not skip_lift_home)
 
 
+def validate_trace_args(args: argparse.Namespace) -> None:
+    if not args.trace_am1_left_elbow:
+        return
+    if args.robot_model != "alohamini1":
+        raise ValueError("--trace_am1_left_elbow is supported only with --robot_model alohamini1.")
+    if args.no_follower:
+        raise ValueError("--trace_am1_left_elbow requires follower arms; omit --no_follower.")
+
+
+def print_trace_startup_summary(args: argparse.Namespace) -> None:
+    print(
+        json.dumps(
+            {
+                "event": "am1_left_elbow_trace_startup",
+                "timestamp_ns": time.time_ns(),
+                "effective_max_relative_target": args.max_relative_target,
+                "motor": "arm_left_elbow_flex",
+            }
+        ),
+        flush=True,
+    )
+
+
 def main():
     args = make_parser().parse_args()
+    validate_trace_args(args)
 
     logging.info("Configuring AlohaMini")
     robot_config = make_robot_config(args)
+    if args.trace_am1_left_elbow:
+        print_trace_startup_summary(args)
     if args.no_follower:
         logging.info("no_follower mode: follower arms will not connect, only base and lift operate.")
     robot = AlohaMini(robot_config)

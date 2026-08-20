@@ -17,12 +17,15 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import json
+import sys
 from types import SimpleNamespace
 
 import pytest
 
 from lerobot.robots.alohamini import alohamini as alohamini_module
 from lerobot.robots.alohamini import alohamini_calibrate as calibrate_module
+from lerobot.robots.alohamini import alohamini_host as host_module
 from lerobot.robots.alohamini.alohamini import AlohaMini
 from lerobot.robots.alohamini.alohamini_calibrate import (
     make_parser as make_calibrate_parser,
@@ -51,6 +54,7 @@ class FakeBus:
         self.registers = defaultdict(int)
         self.read_sequences: dict[tuple[str, str], list[object]] = {}
         self.write_failures: dict[tuple[str, str, int], tuple[BaseException, bool]] = {}
+        self.sync_write_failures: dict[str, BaseException] = {}
         self.position_step = 0
 
     def read(
@@ -62,6 +66,9 @@ class FakeBus:
         num_retry: int = 3,
     ) -> int | float:
         self.events.append((self.name, "read", register, motor))
+        return self._read_value(register, motor)
+
+    def _read_value(self, register: str, motor: str) -> int | float:
         sequence = self.read_sequences.get((register, motor))
         if sequence:
             value = sequence.pop(0)
@@ -96,6 +103,33 @@ class FakeBus:
         self.events.append((self.name, "disconnect", disable_torque))
         self.is_connected = False
 
+    def sync_read(
+        self,
+        register: str,
+        motors: str | list[str] | None = None,
+        *,
+        normalize: bool = True,
+        num_retry: int = 3,
+    ) -> dict[str, int | float]:
+        names = tuple(self.motors) if motors is None else (motors,) if isinstance(motors, str) else tuple(motors)
+        self.events.append((self.name, "sync_read", register, names, normalize))
+        return {name: self._read_value(register, name) for name in names}
+
+    def sync_write(
+        self,
+        register: str,
+        values: dict[str, int | float],
+        *,
+        normalize: bool = True,
+        num_retry: int = 0,
+    ) -> None:
+        self.events.append((self.name, "sync_write", register, dict(values), normalize))
+        failure = self.sync_write_failures.get(register)
+        if failure is not None:
+            raise failure
+        for motor, value in values.items():
+            self.registers[(register, motor)] = value
+
 
 class FakeLift:
     def __init__(self):
@@ -110,6 +144,68 @@ class FakeLift:
 
     def mark_unhomed(self):
         self.is_homed = False
+
+    def apply_action(self, action):
+        del action
+
+
+def make_action_robot(*, trace_am1_left_elbow: bool, robot_model: str = "alohamini1"):
+    events = []
+    left = FakeBus(
+        "left",
+        (
+            "arm_left_elbow_flex",
+            "base_left_wheel",
+            "base_back_wheel",
+            "base_right_wheel",
+        ),
+        events,
+    )
+    left.registers[("Present_Position", "arm_left_elbow_flex")] = 10
+    left.registers[("Present_Current", "arm_left_elbow_flex")] = 10
+    robot = AlohaMini.__new__(AlohaMini)
+    robot.config = SimpleNamespace(
+        robot_model=robot_model,
+        max_relative_target=4.0,
+        trace_am1_left_elbow=trace_am1_left_elbow,
+    )
+    robot.left_bus = left
+    robot.right_bus = None
+    robot.left_arm_motors = ["arm_left_elbow_flex"]
+    robot.right_arm_motors = []
+    robot.base_motors = ["base_left_wheel", "base_back_wheel", "base_right_wheel"]
+    robot.lift = FakeLift()
+    robot.cameras = {}
+    robot.logs = {}
+    robot._gripper_current_limit_ma = 500.0
+    robot._gripper_hold_close_step = 3.0
+    robot._gripper_release_margin = 1.0
+    robot._gripper_open_direction = {}
+    robot._gripper_hold_goal = {}
+    robot._gripper_hold_direction = {}
+    robot._joint_current_limit_ma = 1800.0
+    robot._joint_release_margin = 1.0
+    robot._joint_hold_goal = {}
+    robot._joint_hold_direction = {}
+    robot._body_to_wheel_raw = lambda x, y, theta: {
+        "base_left_wheel": 0,
+        "base_back_wheel": 0,
+        "base_right_wheel": 0,
+    }
+    return robot, left, events
+
+
+def elbow_action(target: float = 20.0) -> dict[str, float]:
+    return {
+        "arm_left_elbow_flex.pos": target,
+        "x.vel": 0.0,
+        "y.vel": 0.0,
+        "theta.vel": 0.0,
+    }
+
+
+def trace_records(captured: str) -> list[dict]:
+    return [json.loads(line) for line in captured.splitlines() if line.startswith("{")]
 
 
 def make_activation_robot(*, fail_arm_enable: bool = False):
@@ -318,6 +414,184 @@ def test_host_safety_limits_are_applied_to_configs():
 
     assert make_host_robot_config(args).max_relative_target == 4.5
     assert make_host_config(args).max_loop_freq_hz == 20
+
+
+def test_trace_flag_is_host_only_and_defaults_off():
+    parser = make_host_parser()
+
+    assert "--trace_am1_left_elbow" in parser.format_help()
+    args = parser.parse_args(["--robot_model", "alohamini1", "--no_cameras"])
+
+    assert args.trace_am1_left_elbow is False
+    assert make_host_robot_config(args).trace_am1_left_elbow is False
+    trace_args = parser.parse_args(
+        ["--robot_model", "alohamini1", "--no_cameras", "--trace_am1_left_elbow"]
+    )
+    assert make_host_robot_config(trace_args).trace_am1_left_elbow is True
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        SimpleNamespace(trace_am1_left_elbow=True, robot_model="alohamini2", no_follower=False),
+        SimpleNamespace(trace_am1_left_elbow=True, robot_model="alohamini1", no_follower=True),
+    ],
+)
+def test_trace_flag_rejects_invalid_host_modes_before_connection(args):
+    validate = getattr(host_module, "validate_trace_args", lambda value: None)
+
+    with pytest.raises(ValueError, match="trace_am1_left_elbow"):
+        validate(args)
+
+
+def test_trace_startup_summary_reports_effective_limiter_and_motor(capsys):
+    emit = getattr(host_module, "print_trace_startup_summary", lambda args: None)
+
+    emit(SimpleNamespace(max_relative_target=4.0))
+
+    record = trace_records(capsys.readouterr().out)[-1]
+    assert record == {
+        "event": "am1_left_elbow_trace_startup",
+        "timestamp_ns": record["timestamp_ns"],
+        "effective_max_relative_target": 4.0,
+        "motor": "arm_left_elbow_flex",
+    }
+    assert record["timestamp_ns"] > 0
+
+
+def test_trace_host_rejects_invalid_mode_before_constructing_robot(monkeypatch):
+    def must_not_construct(config):
+        del config
+        pytest.fail("trace validation should run before robot construction")
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["alohamini_host", "--robot_model", "alohamini2", "--trace_am1_left_elbow"],
+    )
+    monkeypatch.setattr(host_module, "AlohaMini", must_not_construct)
+
+    with pytest.raises(ValueError, match="trace_am1_left_elbow"):
+        host_module.main()
+
+
+def test_trace_host_prints_startup_summary_before_constructing_robot(monkeypatch, capsys):
+    class StopBeforeConnection(Exception):
+        pass
+
+    def stop_before_connection(config):
+        del config
+        raise StopBeforeConnection
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "alohamini_host",
+            "--robot_model",
+            "alohamini1",
+            "--no_cameras",
+            "--max_relative_target",
+            "4",
+            "--trace_am1_left_elbow",
+        ],
+    )
+    monkeypatch.setattr(host_module, "AlohaMini", stop_before_connection)
+
+    with pytest.raises(StopBeforeConnection):
+        host_module.main()
+
+    record = trace_records(capsys.readouterr().out)[-1]
+    assert record["event"] == "am1_left_elbow_trace_startup"
+    assert record["effective_max_relative_target"] == 4.0
+    assert record["motor"] == "arm_left_elbow_flex"
+
+
+def test_trace_records_the_actual_am1_left_elbow_action_boundary(capsys):
+    robot, left, events = make_action_robot(trace_am1_left_elbow=True)
+
+    sent = robot.send_action(elbow_action())
+
+    record = trace_records(capsys.readouterr().out)[-1]
+    assert sent["arm_left_elbow_flex.pos"] == 14.0
+    assert record["event"] == "am1_left_elbow_action_boundary"
+    assert record["timestamp_ns"] > 0
+    assert record["motor"] == "arm_left_elbow_flex"
+    assert record["requested_normalized_target"] == 20.0
+    assert record["relative_limiter_present_normalized"] == 10.0
+    assert record["relative_limiter_target_normalized"] == 14.0
+    assert record["final_left_bus_target_normalized"] == 14.0
+    assert record["goal_position_sync_write"] == {
+        "attempted": True,
+        "sdk_transmit": "completed",
+        "servo_acknowledgement": "sync-write supplies no servo acknowledgement",
+    }
+    assert record["readbacks"] == {
+        "Goal_Position": {"normalized": 14.0},
+        "Present_Position": {"raw": 10},
+        "Present_Current": {"raw": 10, "ma": 65.0},
+        "Torque_Enable": {"raw": 0},
+        "Lock": {"raw": 0},
+        "Operating_Mode": {"raw": 0},
+    }
+    left_write = event_index(
+        events,
+        ("left", "sync_write", "Goal_Position", {"arm_left_elbow_flex": 14.0}, True),
+    )
+    body_zero = event_index(
+        events,
+        (
+            "left",
+            "sync_write",
+            "Goal_Velocity",
+            {"base_left_wheel": 0, "base_back_wheel": 0, "base_right_wheel": 0},
+            True,
+        ),
+    )
+    first_diagnostic_read = next(index for index, event in enumerate(events) if event[1] == "read")
+    assert left_write < body_zero < first_diagnostic_read
+    assert all("Phase" not in event for event in events)
+
+
+def test_trace_reports_sync_write_failure_and_reraises_original_error(capsys):
+    robot, left, _ = make_action_robot(trace_am1_left_elbow=True)
+    failure = ConnectionError("original sync write failure")
+    left.registers[("Present_Current", "arm_left_elbow_flex")] = 300
+    left.sync_write_failures["Goal_Position"] = failure
+
+    with pytest.raises(ConnectionError, match="original sync write failure") as raised:
+        robot.send_action(elbow_action())
+
+    record = trace_records(capsys.readouterr().out)[-1]
+    assert raised.value is failure
+    assert record["goal_position_sync_write"] == {
+        "attempted": True,
+        "sdk_transmit": "failed",
+        "error": "ConnectionError: original sync write failure",
+        "servo_acknowledgement": "sync-write supplies no servo acknowledgement",
+    }
+    assert record["relative_limiter_target_normalized"] == 14.0
+    assert record["final_left_bus_target_normalized"] == 10.0
+    assert record["diagnostic_reads"] == "not attempted because Goal_Position sync write failed"
+
+
+@pytest.mark.parametrize(
+    ("robot_model", "trace_enabled"),
+    [("alohamini1", False), ("alohamini2", False), ("alohamini2", True), ("alohamini2pro", False), ("alohamini2pro", True)],
+)
+def test_trace_is_default_off_and_non_am1_models_never_emit_or_read_diagnostics(
+    capsys, robot_model, trace_enabled
+):
+    robot, _, events = make_action_robot(
+        trace_am1_left_elbow=trace_enabled,
+        robot_model=robot_model,
+    )
+
+    robot.send_action(elbow_action())
+
+    assert trace_records(capsys.readouterr().out) == []
+    assert not [event for event in events if event[1] == "read"]
+    assert all("Phase" not in event for event in events)
 
 
 def test_alohamini1_bus_defaults_do_not_read_or_write_phase():

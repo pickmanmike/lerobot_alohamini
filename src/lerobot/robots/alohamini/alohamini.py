@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import logging
 import sys
 import time
@@ -822,6 +823,14 @@ class AlohaMini(Robot):
 
 
         base_goal_vel = {k: v for k, v in action.items() if k.endswith(".vel")}
+        trace_key = "arm_left_elbow_flex.pos"
+        trace_enabled = (
+            self.config.robot_model == "alohamini1"
+            and getattr(self.config, "trace_am1_left_elbow", False)
+            and trace_key in left_pos
+        )
+        trace_requested_target = float(left_pos[trace_key]) if trace_enabled else None
+        trace_relative_present = None
 
         base_wheel_goal_vel = self._body_to_wheel_raw(
             base_goal_vel["x.vel"], base_goal_vel["y.vel"], base_goal_vel["theta.vel"]
@@ -841,6 +850,8 @@ class AlohaMini(Robot):
 
         if left_pos and self.config.max_relative_target is not None:
             present_left = self.left_bus.sync_read("Present_Position", self.left_arm_motors)  # left_arm_*
+            if trace_enabled:
+                trace_relative_present = float(present_left["arm_left_elbow_flex"])
             gp_left = {k: (v, present_left[k.replace(".pos", "")]) for k, v in left_pos.items()}
             left_pos = ensure_safe_goal_position(gp_left, self.config.max_relative_target)
 
@@ -849,6 +860,7 @@ class AlohaMini(Robot):
             gp_right = {k: (v, present_right[k.replace(".pos", "")]) for k, v in right_pos.items()}
             right_pos = ensure_safe_goal_position(gp_right, self.config.max_relative_target)
         relative_limit_done_t = time.perf_counter()
+        trace_relative_target = float(left_pos[trace_key]) if trace_enabled else None
 
         left_pos = self._limit_gripper_goal_by_current(self.left_bus, left_pos)
         left_gripper_limit_done_t = time.perf_counter()
@@ -860,6 +872,7 @@ class AlohaMini(Robot):
         if self.right_bus and right_pos:
             right_pos = self._limit_joint_goal_by_current(self.right_bus, right_pos)
         right_joint_limit_done_t = time.perf_counter()
+        trace_final_left_target = float(left_pos[trace_key]) if trace_enabled else None
 
         # Send goal position to the actuators
         # arm_goal_pos_raw = {k.replace(".pos", ""): v for k, v in arm_goal_pos.items()}
@@ -871,13 +884,44 @@ class AlohaMini(Robot):
         #print(f"[{filename}:{lineno}]Sending left_pos:{left_pos}, right_pos:{right_pos}, base_wheel_goal_vel:{base_wheel_goal_vel}")  # debug
     
         if left_pos:
-            self.left_bus.sync_write("Goal_Position", {k.replace(".pos", ""): v for k, v in left_pos.items()})
+            try:
+                self.left_bus.sync_write("Goal_Position", {k.replace(".pos", ""): v for k, v in left_pos.items()})
+            except Exception as error:
+                if trace_enabled:
+                    self._emit_am1_left_elbow_trace(
+                        requested_normalized_target=trace_requested_target,
+                        relative_limiter_present_normalized=trace_relative_present,
+                        relative_limiter_target_normalized=trace_relative_target,
+                        final_left_bus_target_normalized=trace_final_left_target,
+                        goal_position_sync_write={
+                            "attempted": True,
+                            "sdk_transmit": "failed",
+                            "error": f"{type(error).__name__}: {error}",
+                            "servo_acknowledgement": "sync-write supplies no servo acknowledgement",
+                        },
+                        diagnostic_reads="not attempted because Goal_Position sync write failed",
+                    )
+                raise
         left_write_done_t = time.perf_counter()
         if self.right_bus and right_pos:
             self.right_bus.sync_write("Goal_Position", {k.replace(".pos", ""): v for k, v in right_pos.items()})
         right_write_done_t = time.perf_counter()
         self.left_bus.sync_write("Goal_Velocity", base_wheel_goal_vel)
         base_write_done_t = time.perf_counter()
+
+        if trace_enabled:
+            self._emit_am1_left_elbow_trace(
+                requested_normalized_target=trace_requested_target,
+                relative_limiter_present_normalized=trace_relative_present,
+                relative_limiter_target_normalized=trace_relative_target,
+                final_left_bus_target_normalized=trace_final_left_target,
+                goal_position_sync_write={
+                    "attempted": True,
+                    "sdk_transmit": "completed",
+                    "servo_acknowledgement": "sync-write supplies no servo acknowledgement",
+                },
+                readbacks=self._read_am1_left_elbow_trace_registers(),
+            )
 
         self.logs["action_timing_ms"] = {
             "action_prepare": (prepare_done_t - action_start_t) * 1e3,
@@ -895,6 +939,46 @@ class AlohaMini(Robot):
 
         lift_sent = {k: v for k, v in action.items() if k.startswith("lift_axis.")}
         return {**left_pos, **right_pos, **base_goal_vel, **lift_sent}
+
+    def _emit_am1_left_elbow_trace(self, **evidence) -> None:
+        print(
+            json.dumps(
+                {
+                    "event": "am1_left_elbow_action_boundary",
+                    "timestamp_ns": time.time_ns(),
+                    "motor": "arm_left_elbow_flex",
+                    **evidence,
+                }
+            ),
+            flush=True,
+        )
+
+    def _read_am1_left_elbow_trace_registers(self) -> dict[str, dict[str, float | str]]:
+        motor = "arm_left_elbow_flex"
+
+        def read(register: str, *, normalize: bool) -> float | str:
+            try:
+                return self.left_bus.read(register, motor, normalize=normalize)
+            except Exception as error:
+                return f"{type(error).__name__}: {error}"
+
+        goal = read("Goal_Position", normalize=True)
+        position = read("Present_Position", normalize=False)
+        current = read("Present_Current", normalize=False)
+        torque = read("Torque_Enable", normalize=False)
+        lock = read("Lock", normalize=False)
+        operating_mode = read("Operating_Mode", normalize=False)
+        return {
+            "Goal_Position": {"normalized": goal},
+            "Present_Position": {"raw": position},
+            "Present_Current": {
+                "raw": current,
+                "ma": float(current) * 6.5 if not isinstance(current, str) else current,
+            },
+            "Torque_Enable": {"raw": torque},
+            "Lock": {"raw": lock},
+            "Operating_Mode": {"raw": operating_mode},
+        }
 
     def _limit_gripper_goal_by_current(self, bus, goal_pos: dict[str, float]) -> dict[str, float]:
         """Stop pushing a gripper harder once its measured current exceeds the force limit."""

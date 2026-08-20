@@ -58,6 +58,9 @@ class AlohaMiniConfig(RobotConfig):
     # the number of motors in your follower arms.
     max_relative_target: float | None = None
 
+    # Default-off, AM1-only host diagnostic for the left elbow action boundary.
+    trace_am1_left_elbow: bool = False
+
     cameras: dict[str, CameraConfig] = field(default_factory=alohamini_cameras_config)
 
     # Set to `True` for backward compatibility with previous policies/dataset
