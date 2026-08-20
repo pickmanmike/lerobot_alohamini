@@ -57,10 +57,13 @@ EXPECTED_REGISTERS = (
     "Protective_Torque",
     "Protection_Time",
     "Overload_Torque",
+    "Velocity_closed_loop_P_proportional_coefficient",
     "Over_Current_Protection_Time",
+    "Velocity_closed_loop_I_integral_coefficient",
     "Torque_Enable",
     "Acceleration",
     "Goal_Position",
+    "Goal_Time",
     "Goal_Velocity",
     "Torque_Limit",
     "Lock",
@@ -72,6 +75,15 @@ EXPECTED_REGISTERS = (
     "Status",
     "Moving",
     "Present_Current",
+    "Goal_Position_2",
+    "Moving_Velocity",
+    "Moving_Velocity_Threshold",
+    "DTs",
+    "Velocity_Unit_factor",
+    "Hts",
+    "Maximum_Velocity_Limit",
+    "Maximum_Acceleration",
+    "Acceleration_Multiplier ",
 )
 
 
@@ -163,6 +175,20 @@ class FakeBus:
 
 def _values(offset: int) -> dict[str, int]:
     return {register: offset + index for index, register in enumerate(EXPECTED_REGISTERS)}
+
+
+def test_comparator_registers_match_authoritative_non_phase_table_order() -> None:
+    from lerobot.motors.feetech.tables import STS_SMS_SERIES_CONTROL_TABLE
+
+    module = _load_module()
+    expected_registers = tuple(
+        register for register in STS_SMS_SERIES_CONTROL_TABLE if register != "Phase"
+    )
+
+    assert tuple(module.REGISTERS) == expected_registers
+    assert len(expected_registers) == 55
+    assert "Phase" not in module.REGISTERS
+    assert "Acceleration_Multiplier " in module.REGISTERS
 
 
 def test_refusal_requires_exact_uppercase_read_before_creating_a_bus(tmp_path: Path) -> None:
