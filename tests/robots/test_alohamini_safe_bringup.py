@@ -652,14 +652,33 @@ def test_trace_output_failure_after_successful_writes_keeps_action_successful(mo
 
 
 @pytest.mark.parametrize(
-    ("failing_bus", "register", "stage"),
+    ("failing_bus", "register", "stage", "right_write", "body_write"),
     [
-        ("right", "Goal_Position", "right_goal_position"),
-        ("left", "Goal_Velocity", "base_goal_velocity"),
+        (
+            "right",
+            "Goal_Position",
+            "right_goal_position",
+            {"attempted": True, "sdk_transmit": "failed", "error": "ConnectionError: right_goal_position failed"},
+            {
+                "attempted": False,
+                "status": "not attempted because right Goal_Position sync write failed",
+            },
+        ),
+        (
+            "left",
+            "Goal_Velocity",
+            "base_goal_velocity",
+            {"attempted": True, "sdk_transmit": "completed"},
+            {
+                "attempted": True,
+                "sdk_transmit": "failed",
+                "error": "ConnectionError: base_goal_velocity failed",
+            },
+        ),
     ],
 )
 def test_trace_reports_later_write_failures_without_early_readbacks(
-    capsys, failing_bus, register, stage
+    capsys, failing_bus, register, stage, right_write, body_write
 ):
     robot, left, events = make_action_robot(trace_am1_left_elbow=True)
     right = attach_right_elbow_bus(robot, events)
@@ -676,13 +695,68 @@ def test_trace_reports_later_write_failures_without_early_readbacks(
         "sdk_transmit": "completed",
         "servo_acknowledgement": "sync-write supplies no servo acknowledgement",
     }
-    assert record["action_write_failure"] == {
-        "stage": stage,
-        "error": f"ConnectionError: {stage} failed",
+    assert record["action_write_failure"] == {"stage": stage}
+    assert record["right_goal_position_sync_write"] == right_write
+    assert record["body_goal_velocity_sync_write"] == body_write
+    assert record["readbacks"] == {
+        "status": "not attempted before successful body Goal_Velocity sync write"
     }
-    assert record["diagnostic_reads"] == "not attempted because body Goal_Velocity sync write failed"
+    assert record.get("diagnostic_reads") != "not attempted because body Goal_Velocity sync write failed"
     assert left.read_calls == []
     assert all("Phase" not in event for event in events)
+
+
+class UnprintableTraceError(ConnectionError):
+    def __str__(self):
+        raise RuntimeError("exception string conversion must not run outside trace protection")
+
+
+@pytest.mark.parametrize(
+    ("failure_stage", "failing_bus", "register"),
+    [
+        ("left_goal_position", "left", "Goal_Position"),
+        ("right_goal_position", "right", "Goal_Position"),
+        ("base_goal_velocity", "left", "Goal_Velocity"),
+    ],
+)
+def test_unprintable_write_error_preserves_original_identity(
+    capsys, failure_stage, failing_bus, register
+):
+    robot, left, events = make_action_robot(trace_am1_left_elbow=True)
+    right = attach_right_elbow_bus(robot, events) if failure_stage != "left_goal_position" else None
+    original_error = UnprintableTraceError()
+    (right if failing_bus == "right" else left).sync_write_failures[register] = original_error
+
+    with pytest.raises(UnprintableTraceError) as raised:
+        robot.send_action(bimanual_elbow_action() if right else elbow_action())
+
+    record = trace_records(capsys.readouterr().out)[-1]
+    assert raised.value is original_error
+    assert "UnprintableTraceError: <unavailable>" in json.dumps(record)
+    if failure_stage == "left_goal_position":
+        assert record["goal_position_sync_write"]["sdk_transmit"] == "failed"
+    else:
+        assert record["action_write_failure"]["stage"] == failure_stage
+
+
+def test_unprintable_diagnostic_error_after_successful_writes_keeps_action_successful(
+    monkeypatch, capsys
+):
+    robot, left, events = make_action_robot(trace_am1_left_elbow=True)
+    original_error = UnprintableTraceError()
+
+    def fail_diagnostics():
+        raise original_error
+
+    monkeypatch.setattr(robot, "_read_am1_left_elbow_trace_registers", fail_diagnostics)
+
+    sent = robot.send_action(elbow_action())
+
+    record = trace_records(capsys.readouterr().out)[-1]
+    assert sent["arm_left_elbow_flex.pos"] == 14.0
+    assert record["diagnostic_reads"] == {"error": "UnprintableTraceError: <unavailable>"}
+    assert any(event[1:3] == ("sync_write", "Goal_Position") for event in events)
+    assert any(event[1:3] == ("sync_write", "Goal_Velocity") for event in events)
 
 
 @pytest.mark.parametrize(

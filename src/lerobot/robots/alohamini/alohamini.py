@@ -896,7 +896,7 @@ class AlohaMini(Robot):
                         goal_position_sync_write={
                             "attempted": True,
                             "sdk_transmit": "failed",
-                            "error": f"{type(error).__name__}: {error}",
+                            "error": self._describe_am1_left_elbow_trace_error(error),
                             "servo_acknowledgement": "sync-write supplies no servo acknowledgement",
                         },
                         diagnostic_reads="not attempted because Goal_Position sync write failed",
@@ -920,9 +920,19 @@ class AlohaMini(Robot):
                         },
                         action_write_failure={
                             "stage": "right_goal_position",
-                            "error": f"{type(error).__name__}: {error}",
                         },
-                        diagnostic_reads="not attempted because body Goal_Velocity sync write failed",
+                        right_goal_position_sync_write={
+                            "attempted": True,
+                            "sdk_transmit": "failed",
+                            "error": self._describe_am1_left_elbow_trace_error(error),
+                        },
+                        body_goal_velocity_sync_write={
+                            "attempted": False,
+                            "status": "not attempted because right Goal_Position sync write failed",
+                        },
+                        readbacks={
+                            "status": "not attempted before successful body Goal_Velocity sync write"
+                        },
                     )
                 raise
         right_write_done_t = time.perf_counter()
@@ -942,9 +952,19 @@ class AlohaMini(Robot):
                     },
                     action_write_failure={
                         "stage": "base_goal_velocity",
-                        "error": f"{type(error).__name__}: {error}",
                     },
-                    diagnostic_reads="not attempted because body Goal_Velocity sync write failed",
+                    right_goal_position_sync_write={
+                        "attempted": bool(self.right_bus and right_pos),
+                        "sdk_transmit": "completed" if self.right_bus and right_pos else "not attempted",
+                    },
+                    body_goal_velocity_sync_write={
+                        "attempted": True,
+                        "sdk_transmit": "failed",
+                        "error": self._describe_am1_left_elbow_trace_error(error),
+                    },
+                    readbacks={
+                        "status": "not attempted before successful body Goal_Velocity sync write"
+                    },
                 )
             raise
         base_write_done_t = time.perf_counter()
@@ -966,7 +986,7 @@ class AlohaMini(Robot):
             except Exception as error:
                 self._record_am1_left_elbow_trace(
                     **trace_evidence,
-                    diagnostic_reads={"error": f"{type(error).__name__}: {error}"},
+                    diagnostic_reads={"error": self._describe_am1_left_elbow_trace_error(error)},
                 )
             else:
                 self._record_am1_left_elbow_trace(**trace_evidence, readbacks=readbacks)
@@ -1011,6 +1031,14 @@ class AlohaMini(Robot):
             except Exception:
                 pass
 
+    @staticmethod
+    def _describe_am1_left_elbow_trace_error(error: Exception) -> str:
+        try:
+            message = str(error)
+        except Exception:
+            message = "<unavailable>"
+        return f"{type(error).__name__}: {message}"
+
     def _read_am1_left_elbow_trace_registers(self) -> dict[str, dict[str, float | str]]:
         motor = "arm_left_elbow_flex"
 
@@ -1018,7 +1046,7 @@ class AlohaMini(Robot):
             try:
                 return self.left_bus.read(register, motor, normalize=normalize)
             except Exception as error:
-                return f"{type(error).__name__}: {error}"
+                return self._describe_am1_left_elbow_trace_error(error)
 
         goal = read("Goal_Position", normalize=True)
         position = read("Present_Position", normalize=False)
