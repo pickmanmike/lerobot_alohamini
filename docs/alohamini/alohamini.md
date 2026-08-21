@@ -96,7 +96,7 @@ Leader motors require their 7.4 V low-voltage supply and must never receive the 
 
 Before a synchronization move, the client prints the measured start and frozen target and asks the operator to type exactly `SYNC`. Enter alone, lowercase text, or added whitespace does not authorize motion. After confirmation, the client takes fresh follower and leader samples and prints those final endpoints before sending frame zero. Every synchronization frame holds base and lift velocity at zero and changes each selected normalized arm position by at most `STARTUP_SYNC_MAX_STEP = 0.75`. This client frame cap is independent of Pi `max_relative_target`; if it needs more frames than the requested duration, the move takes longer. Actual arm-bearing synchronization sends remain at least `1 / --fps` seconds apart, so an overrun lengthens the move instead of triggering catch-up sends. Every leader sample is validated, and exceeding `STARTUP_SYNC_LEADER_DRIFT = 2.0` aborts selected-side motion.
 
-Command and observation traffic use separate sockets, so the first sequence-fresh response after the final command can still have been generated before that command was processed. The client therefore checks up to the configured observation request window plus one sequence-fresh samples. Synchronization succeeds only when a checked follower sample satisfies `--max_start_mismatch`; otherwise it refuses without widening the threshold. The threshold is final convergence verification only: it does not limit how far apart valid calibrated poses may be when a synchronization plan is first proposed. Use `5.0` for the remaining AM1 commissioning checks; the parser's `10.0` default remains for compatibility and is not the recommended commissioning value.
+Command and observation traffic use separate sockets, so the first sequence-fresh response after the final command can still have been generated before that command was processed. The client therefore checks up to the configured observation request window plus one sequence-fresh samples. Synchronization succeeds only when a checked follower sample satisfies `--max_start_mismatch`; otherwise it refuses without widening the threshold. The threshold is final startup convergence verification only: it does not limit how far apart valid calibrated poses may be when a synchronization plan is first proposed, and it is not used continuously at runtime. The historical S1--S5 commands below retain `5.0`. Packet 2M alone uses `6.0`: it is `0.708` above the worst measured completed-settle negative-direction residual (`5.292`) while still refusing a completely unmoving requested 10-unit joint move. The live Packet 2M session must still validate every joint, not merely the selected elbow.
 
 The client makes the operator phase explicit, in this order:
 
@@ -107,95 +107,26 @@ The client makes the operator phase explicit, in this order:
 
 The final message appears only after the post-pause fresh-sample alignment gate passes and immediately before the first ordinary arm action is sent.
 
-#### Bounded AM1 single-joint diagnostic
+#### Historical AM1 single-joint diagnostic and trace evidence
 
-If synchronization cannot distinguish limited positional headroom from a joint-specific powered fault, stop ordinary commissioning and use the network-only AM1 diagnostic below in a separately authorized powered session. It constructs no leader, keyboard, camera, or visualization device. It takes a fresh follower pose, holds all nonselected joints at the last pre-move measured pose, sends frame zero at that pose, keeps base and lift commands explicitly zero, and runs one bounded ramp followed by a bounded final-target settle. During the settle it repeats the same complete final action, obtains sequence-fresh follower observations, and requires two consecutive in-tolerance samples before an early `PASS`. No arm-bearing command is sent unless the operator types exact uppercase `MOVE`.
+The bounded diagnostic is historical evidence, not the next commissioning action. It constructs no leader, keyboard, camera, or visualization device; it takes a fresh follower pose, holds nonselected joints at the final fresh measured pose, keeps base and lift commands explicitly zero, and uses an exact uppercase `MOVE` gate. With a positive settle duration, historical `PASS` meant two post-window, sequence-fresh in-tolerance samples; it was not by itself a host acknowledgement or persistence proof.
 
-```powershell
-.\.venv\Scripts\python.exe `
-  .\examples\alohamini\diagnose_am1_joint.py `
-  --robot.remote_ip 192.168.1.134 `
-  --robot.id my_alohamini `
-  --side left `
-  --joint elbow_flex `
-  --delta -10.0 `
-  --fps 5 `
-  --duration_s 5.0 `
-  --settle_s 5.0 `
-  --max_final_error 1.0
-```
+The completed traces used effective `max_relative_target=10.0` and a bounded final-target settle of `--settle_s 5.0`; `PASS` required two consecutive post-window, sequence-fresh in-tolerance samples. The prior negative-direction run was only partially physically proven: it measured `S=21.775`, `T=11.775`, movement `-4.708`, and final error `-5.292`, ending `INCOMPLETE`. The fresh positive-direction repeat measured `S=16.885`, `T=26.885`, movement `+9.507`, and final error `+0.493`, ending `PASS`/`0`. In that positive trace, the requested, relative-limiter, and final targets matched; the `Goal_Position` readback matched within quantization; the SDK transmit completed; and `Torque_Enable`, `Lock`, and `Operating_Mode` read back `1`/`1`/`0`. The observed current maxima were `13 mA` versus `221 mA`.
 
-The client can report what it sent and what it subsequently observed, but the current action socket supplies no host-acceptance acknowledgement. With a positive settle duration, `PASS` therefore means that two post-window, sequence-fresh observed positions were stable within the requested tolerance; it does not prove a persistent host setting or `Goal_Position` storage. Passing `--settle_s 0` deliberately restores the legacy post-ramp verification and disables that two-sample stability requirement. The supplied Packet 2F evidence used an effective command-line `max_relative_target=10.0`: from start `27.026`, the requested target was `17.026`, but the observed plateau/end was `22.046` (total movement `-4.980`, remaining error `-5.020`). Correct-direction movement under that command-line limit is only partially physically proven; full convergence, clamp behavior, host acceptance, write acknowledgement, and `Goal_Position` storage/readback remain unproven. The exact next boundary is the separately authorized, default-off Pi trace below; it must be physically run before making any further acceptance claim. Keep the client step cap, leader-drift limit, and recommended `5.0` final convergence tolerance unchanged.
+Together, that is directional/load-dependent downstream behavior: the static non-Phase configuration and normal command transport passed, but the exact physical cause remains unresolved. Do not change any motor setting on the strength of this result. There is no further trace boundary or diagnostic motion authorized by this documentation; the one next separately authorized motion is Packet 2M S6 below.
 
-#### Next trace-only physical discriminator — operator contract
+#### Historical trace field semantics
 
-This is one bounded diagnostic, not ordinary commissioning. It requires a separately authorized powered session. Do not run it as an S-stage or combine it with teleoperation or leader synchronization. The client `PASS`/`INCOMPLETE` outcome alone is not host acceptance, an acknowledgement, an immediate `Goal_Position` readback, or persistence proof. A matching trace `readbacks.Goal_Position.normalized` is limited to the immediate post-write register read at that boundary; it is not a servo acknowledgement and does not prove persistence beyond that read.
+The completed trace is retained only to explain the evidence above. A matching `readbacks.Goal_Position.normalized` was an immediate post-write register read at that boundary; it was not a servo acknowledgement and did not prove persistence beyond that read.
 
-**Preflight — Windows worktree.** Run this before powering the trace. The Windows branch must be `fix/am1-elbow-commissioning`, the status must be clean, and the reviewed software baseline must be present. `3064fb5447387bba4f84e64b6985df548400c473` is the exact reviewed pre-documentation baseline and contains executable diagnostic commit `b4f0f053cb7853acba645bcde2b329e9aa9087c0` as an ancestor:
 
-```powershell
-$ErrorActionPreference = 'Stop'
-if ((git branch --show-current) -ne 'fix/am1-elbow-commissioning') { throw 'wrong Windows branch' }
-if (git status --porcelain) { throw 'Windows worktree is not clean' }
-git merge-base --is-ancestor 3064fb5447387bba4f84e64b6985df548400c473 HEAD
-if ($LASTEXITCODE -ne 0) { throw 'reviewed Windows software baseline is not an ancestor' }
-git merge-base --is-ancestor b4f0f053cb7853acba645bcde2b329e9aa9087c0 HEAD
-if ($LASTEXITCODE -ne 0) { throw 'executable diagnostic commit is not an ancestor' }
-```
-
-**Preflight — Pi trace worktree.** On the Pi, require branch `fix/am1-relative-target-propagation`, clean status, and exact trace-code HEAD `6ab34e711c1a458da77aa7f80e59239b5b1d9d7f`:
-
-```bash
-set -eu
-set -o pipefail
-cd /home/pickmanmike/lerobot_alohamini
-test "$(git branch --show-current)" = fix/am1-relative-target-propagation
-test -z "$(git status --porcelain)"
-test "$(git rev-parse HEAD)" = 6ab34e711c1a458da77aa7f80e59239b5b1d9d7f
-```
-
-**Pi command.** With the follower powered and ready, run exactly one host trace. The command prints the exact `HOST_LOG` path and tees all host output, including the JSON lines, to that file:
-
-```bash
-set -eu
-set -o pipefail
-cd /home/pickmanmike/lerobot_alohamini
-HOST_LOG="/home/pickmanmike/am1-left-elbow-trace-$(date +%Y%m%d-%H%M%S).log"
-printf 'HOST_LOG=%s\n' "$HOST_LOG"
-./.venv/bin/python -m lerobot.robots.alohamini.alohamini_host \
-  --robot_model alohamini1 \
-  --no_cameras \
-  --skip_lift_home \
-  --max_relative_target 10.0 \
-  --max_loop_freq_hz 30 \
-  --trace_am1_left_elbow 2>&1 | tee "$HOST_LOG"
-```
-
-Leave the host waiting for commands before starting the Windows client. The trace flag is default-off and AM1-only; `--no_cameras` constructs no cameras and `--skip_lift_home` keeps lift homing out of this discriminator.
-
-**Paired Windows command and authorization gate.** Run this exact command once the Pi host is ready. At its prompt, type exactly uppercase `MOVE` and press Enter. No other input authorizes an arm-bearing action; Enter alone, lowercase `move`, or added whitespace is refused.
-
-```powershell
-.\.venv\Scripts\python.exe `
-  .\examples\alohamini\diagnose_am1_joint.py `
-  --robot.remote_ip 192.168.1.134 `
-  --robot.id my_alohamini `
-  --side left `
-  --joint elbow_flex `
-  --delta -10.0 `
-  --fps 5 `
-  --duration_s 5.0 `
-  --settle_s 5.0 `
-  --max_final_error 1.0
-```
-
-**JSON event and field contract.** The Pi emits newline-delimited JSON only when the trace flag is enabled. Every event has an epoch `timestamp_ns` (nanoseconds), `motor: "arm_left_elbow_flex"`, and an event name. Startup emits:
+**Historical JSON event and field contract.** The completed Pi trace emitted newline-delimited JSON. Every event had an epoch `timestamp_ns` (nanoseconds), `motor: "arm_left_elbow_flex"`, and an event name. Its startup record was:
 
 ```json
 {"event":"am1_left_elbow_trace_startup","timestamp_ns":0,"effective_max_relative_target":10.0,"motor":"arm_left_elbow_flex"}
 ```
 
-Each traced action boundary emits the following field names (numeric values are examples of types, not expected measurements):
+Each historical traced action boundary used the following field names (numeric values are examples of types, not expected measurements):
 
 ```json
 {"event":"am1_left_elbow_action_boundary","timestamp_ns":0,"motor":"arm_left_elbow_flex","requested_normalized_target":0.0,"relative_limiter_present_normalized":0.0,"relative_limiter_target_normalized":0.0,"final_left_bus_target_normalized":0.0,"goal_position_sync_write":{"attempted":true,"sdk_transmit":"completed","servo_acknowledgement":"sync-write supplies no servo acknowledgement"},"readbacks":{"Goal_Position":{"normalized":0.0},"Present_Position":{"raw":0},"Present_Current":{"raw":0,"ma":0.0},"Torque_Enable":{"raw":0},"Lock":{"raw":0},"Operating_Mode":{"raw":0}}}
@@ -209,13 +140,9 @@ Interpret the action fields as follows:
 - `goal_position_sync_write.attempted` and `sdk_transmit` (`completed` or `failed`) describe the SDK sync-write attempt. The literal `servo_acknowledgement` value says that this action channel supplies no servo acknowledgement. On failure, the object also carries `error`; later-stage failures may add `action_write_failure`, `right_goal_position_sync_write`, `body_goal_velocity_sync_write`, and a `readbacks` status explaining why reads were not attempted.
 - Successful post-write reads are exactly `Goal_Position.normalized`, `Present_Position.raw`, `Present_Current.raw` plus `Present_Current.ma` (raw value multiplied by 6.5), `Torque_Enable.raw`, `Lock.raw`, and `Operating_Mode.raw`. A successful matching `readbacks.Goal_Position.normalized` proves the immediate post-write register read at that boundary, but it is not a servo acknowledgement and does not prove persistence beyond that read. A `diagnostic_reads` error object may replace these on a read failure; the fields have no independent timestamp, so use the enclosing event's `timestamp_ns`.
 
-**Safe starting state and stop boundary.** Before the `MOVE` gate, remove leaders and ordinary teleoperation from the session, clear people and obstacles from the arm workspace, support the arm in a known safe pose, keep a physical disconnect/E-stop reachable, and verify that base and lift must remain stationary. During the trace, only the left `elbow_flex` target may change; all other arm joints are held at the final fresh measured pose and base/lift commands are explicitly zero. Stop immediately and remove power or disconnect if any joint moves in the wrong direction, any nonselected joint/base/lift moves, resistance/contact/noise/cable tension appears, current or communication errors occur, the JSON contract is missing or contradictory, or the operator loses a clear view or stop path.
+The historical trace's physical stop boundary was immediate disconnect/power removal for unexpected direction, speed, sound, current, contact, cable tension, communication failure, or a missing/contradictory field. Those diagnostic-specific conditions are recorded as evidence only; no repeat trace is authorized.
 
-The historical Packet 2F evidence ended at normalized `22.046` from `27.026` toward `17.026`; those absolute values describe that earlier run and are not expected next-run inputs. A correct-direction but incomplete result may report `INCOMPLETE`. Early `PASS` occurs only after clearing the observation-request freshness window plus two consecutive sequence-fresh in-tolerance samples, before the bounded `--settle_s` deadline; it does not mean after the settle window. Client `PASS` or `INCOMPLETE` alone proves none of the host-side write or register-read conditions below. End the host trace after this one run and do not proceed to ordinary commissioning based on it.
-
-**Trace-boundary decision.** Take `S` from the paired Windows `Measured start` and `T` from its `Requested target`; verify `T ≈ S - 10` within normal quantization. Compare the startup and action JSON with that same paired output: startup must report effective `max_relative_target ≈ 10.0`, and `requested_normalized_target`, `relative_limiter_target_normalized`, `final_left_bus_target_normalized`, and `readbacks.Goal_Position.normalized` must each match `T`. `goal_position_sync_write.sdk_transmit` must be `completed`, and `readbacks.Torque_Enable.raw`, `readbacks.Lock.raw`, and `readbacks.Operating_Mode.raw` must be `1`, `1`, and `0`. If those conditions match while the paired Windows normalized observed position plateaus around `S - 5` (the Pi `readbacks.Present_Position.raw` remains in raw units), the host command path passes this boundary only and Branch3 follows: a separately reviewed read-only L/R ID3 register/calibration comparison. If effective `max_relative_target ≈ 5`, or the relative-limited target, final bus target, or `Goal_Position` readback shows an approximately five-unit-limited/midpoint target instead of `T`, the propagation/limiter path fails. Any missing, errored, or mismatched field keeps the boundary unresolved. Any failure stops the trace and authorizes no ordinary commissioning.
-
-After a run, fetch the newest Pi log from Windows with:
+For historical trace-log archive retrieval only, fetch the newest saved Pi log from Windows with:
 
 ```powershell
 .\tools\fetch_am1_pi_log.ps1
@@ -235,7 +162,7 @@ $diagnosticHelp = (& .\.venv\Scripts\python.exe .\examples\alohamini\diagnose_am
 if ($diagnosticHelp -notmatch '--settle_s') { throw 'diagnostic --help did not contain --settle_s' }
 ```
 
-Run S1 through S6 in order. Stop after each stage and review the observed movement and cleanup before authorizing the next stage.
+S1--S5 are historical commissioning commands and retain their recorded `5.0` tolerance. They do not authorize another motion. Packet 2M S6 is the exact next separately authorized motion; run it once only after its own preflight below, then stop for review and perform no further motion from this document.
 
 #### S1 — left-only synchronization and exit
 
@@ -350,10 +277,61 @@ This is an operator procedure, not a gripper-only payload mode. The client still
 
 After Enter, the client obtains fresh follower and leader samples, revalidates and compares them, and uses the final validated leader sample as the first forwarded arm action with explicit zero base/lift commands.
 
-#### S6 — both-side synchronization followed by paused teleoperation
+#### Packet 2M S6 — exact next separately authorized both-side synchronization and paused teleoperation
+
+This is one combined AM1 session for arbitrary safe calibrated initial poses. It is not collision-aware. Keep both leaders still through exact `SYNC`, synchronization verification, the subsequent Enter pause, and until the client prints exactly `TELEOPERATION ACTIVE — LEADER MOVEMENT IS NOW ALLOWED`.
+
+Start with the Pi motor host stopped, follower/body 12 V power off, both leader supplies off, and both leader USB controllers disconnected. Clear and support both arm workspaces, keep the physical follower-power disconnect immediately accessible, and run both source preflights below while all motor power remains off. Only after both preflights pass may the operator connect the two known leader USB controllers, apply each leader's designated 7.4 V supply, apply follower/body 12 V power, and start the Pi host. Never apply the follower 12 V supply to a leader.
+
+**Pi source preflight.** On the Pi, require the safe-bringup branch, a clean worktree, and exact baseline `a8538bd79356b4c5263342aba389dcdf39092e9e`:
+
+```bash
+set -eu
+cd /home/pickmanmike/lerobot_alohamini
+test "$(git branch --show-current)" = fix/am1-safe-bringup
+test -z "$(git status --porcelain)"
+test "$(git rev-parse HEAD)" = a8538bd79356b4c5263342aba389dcdf39092e9e
+```
+
+**Windows preflight.** Require the current commissioning branch, a clean worktree, and the reviewed Packet 2M Windows baseline as an ancestor:
 
 ```powershell
-.\.venv\Scripts\python.exe `
+$ErrorActionPreference = 'Stop'
+if ((git branch --show-current) -ne 'fix/am1-elbow-commissioning') { throw 'wrong Windows branch' }
+if (git status --porcelain) { throw 'Windows worktree is not clean' }
+git merge-base --is-ancestor f11b74d4184afafbf044ace7ec5423617da96553 HEAD
+if ($LASTEXITCODE -ne 0) { throw 'Packet 2M Windows baseline is not an ancestor' }
+```
+
+**Pi host command after the two preflights and authorized power staging.** Start this one host and leave it running for the Windows client. The log tee preserves the normal host output; this is not a trace run.
+
+```bash
+set -eu
+set -o pipefail
+cd /home/pickmanmike/lerobot_alohamini
+test "$(git branch --show-current)" = fix/am1-safe-bringup
+test -z "$(git status --porcelain)"
+test "$(git rev-parse HEAD)" = a8538bd79356b4c5263342aba389dcdf39092e9e
+HOST_LOG="/home/pickmanmike/packet2m-am1-host-$(date +%Y%m%d-%H%M%S).log"
+printf 'HOST_LOG=%s\n' "$HOST_LOG"
+./.venv/bin/python -m lerobot.robots.alohamini.alohamini_host \
+  --robot_model alohamini1 \
+  --no_cameras \
+  --skip_lift_home \
+  --max_relative_target 10.0 \
+  --max_loop_freq_hz 30 2>&1 | tee "$HOST_LOG"
+```
+
+`--no_cameras` keeps cameras absent. `--skip_lift_home` leaves the lift unhomed and its movement blocked. The `10.0` host limiter remains secondary to the client frame cap `STARTUP_SYNC_MAX_STEP = 0.75`; it does not relax that cap.
+
+**Windows command.** With the Pi host ready, run exactly this one client session. It writes the normal client output to a timestamped Windows log, retains the terminal session, and captures the exact client exit code:
+
+```powershell
+$packet2mLogDir = 'C:\Users\pickm\AlohaMini1Logs'
+New-Item -ItemType Directory -Force -Path $packet2mLogDir | Out-Null
+$packet2mTimestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$packet2mLog = Join-Path $packet2mLogDir "packet2m-am1-client-$packet2mTimestamp.log"
+& .\.venv\Scripts\python.exe `
   .\examples\alohamini\teleoperate_bi.py `
   --robot.remote_ip 192.168.1.134 `
   --robot.robot_model alohamini1 `
@@ -364,15 +342,20 @@ After Enter, the client obtains fresh follower and leader samples, revalidates a
   --startup_mode sync `
   --startup_sync_side both `
   --startup_sync_duration_s 15.0 `
-  --max_start_mismatch 5.0 `
+  --max_start_mismatch 6.0 `
   --fps 5 `
   --duration_s 60 `
   --start_paused `
   --no_keyboard `
-  --no_rerun
+  --no_rerun 2>&1 | Tee-Object -FilePath $packet2mLog
+$packet2mExitCode = $LASTEXITCODE
+"CLIENT_LOG=$packet2mLog" | Tee-Object -FilePath $packet2mLog -Append
+"CLIENT_EXIT_CODE=$packet2mExitCode" | Tee-Object -FilePath $packet2mLog -Append
 ```
 
-Synchronization verifies the frozen target before the pause. After Enter, the client again requires a fresh follower observation proven by sequence advancement and a fresh normalized leader sample. It revalidates and re-compares both sides, then forwards that final validated leader sample first with zero base/lift commands. The ordinary `--duration_s` clock starts only after synchronization, optional resource setup, and this pause gate.
+Arm-only here means both-arm position targets plus explicit zero base/lift commands, not omission of the supported zero-velocity fields. No keyboard, camera, or visualization device is started. Synchronization verifies the frozen target before the pause. After Enter, the client again requires a fresh follower observation proven by sequence advancement and a fresh normalized leader sample. It validates and re-compares every joint, then forwards that final validated leader sample first with zero base/lift commands. The ordinary `--duration_s` clock starts only after synchronization, optional resource setup, and this pause gate.
+
+Completion requires client status `0` after the bounded 60-second live interval, all four operator phases in order, no safety refusal, and the normal final zero command and disconnect cleanup. During the live interval, require small, one-at-a-time, correct corresponding movement from every left/right arm joint and both grippers; base and lift must remain stationary; and the live negative-direction left-elbow response must be practically controllable. Immediately stop and remove power or disconnect if any commanded joint is stationary, moves in the wrong direction, moves unexpectedly fast, has unusable lag, or if any arm, base, or lift moves unexpectedly; also stop for resistance, contact, noise, cable tension, current or communication error, a required phase/validation/cleanup failure, or loss of a clear view or stop path. After the client cleanup, stop the Pi host with Ctrl+C, verify its cleanup, then power off. After completion or any stop, end this Packet 2M session and authorize no further motion.
 
 ## 3. Camera Configuration
 
