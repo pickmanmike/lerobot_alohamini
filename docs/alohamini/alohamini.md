@@ -523,7 +523,7 @@ The manifest records the exact original and backup paths, hashes, byte counts, a
 
 The only approved later correction, after separate physical authorization, is coordinated **full recalibration** with logical/physical left on `COM8`, logical/physical right on `COM7`, ID `so101_leader_bi`, and profile `so-arm-5dof`. Do not do a port-only swap, JSON-content swap, or runtime swap layer. Begin with the Pi motor host stopped, follower/body 12 V power off, both leader supplies off, and both leader USB controllers disconnected. The exact next Windows procedure is the calibration block and two no-robot map blocks below. The exact next Pi command is **none**.
 
-**Future corrected-port full recalibration — fail fast.** In one PowerShell session, first execute only the strict-verifier **function-definition** block above (not its historical prompt-based invocation), then execute the calibration block and both map blocks below in order. Do this only after a separate physical authorization. The common guard refuses before connection unless that verifier function is loaded, pins the behavior baseline `cae57b59db1d9156be568aa4b216fc90701aa741`, robustly checks every Git command's exit status and stderr, requires every tracked path except this documentation file to be identical to that baseline, rejects Python/Hugging Face path overrides, pins exact source imports under this checkout, and validates the immutable manifest and backups. `--force_fresh_calibration` eliminates the existing-calibration prompt path; do not accept, type `c` at, or otherwise use such a prompt.
+**Future corrected-port full recalibration — fail fast.** In one PowerShell session, first execute only the strict-verifier **function-definition** block above (not its historical prompt-based invocation), then execute the calibration block and both map blocks below in order. Do this only after a separate physical authorization. The common guard refuses before connection unless the loaded verifier body's normalized SHA-256 matches the reviewed strict implementation, pins the behavior baseline `cae57b59db1d9156be568aa4b216fc90701aa741`, robustly checks every Git command's exit status and stderr, requires every tracked path except this documentation file to be identical to that baseline, rejects Python/Hugging Face path overrides, pins exact source imports under this checkout, and validates the immutable manifest and backups. `--force_fresh_calibration` eliminates the existing-calibration prompt path; do not accept, type `c` at, or otherwise use such a prompt.
 
 ```powershell
 $ErrorActionPreference = 'Stop'
@@ -534,6 +534,7 @@ function Get-Packet2nR5Definition {
     [pscustomobject]@{
         Packet = '2N-R5'
         BehaviorSha = 'cae57b59db1d9156be568aa4b216fc90701aa741'
+        VerifierDefinitionSha256 = '55EA2C4459D0CF0CEEF8D50D88122BA28F2C1B25E036332E54ACA5C46468BFF6'
         Branch = 'fix/am1-elbow-commissioning'
         CalibrationRoot = $packet2nCalibrationRoot
         BackupDirectory = $packet2nBackupDirectory
@@ -607,7 +608,7 @@ function Assert-Packet2nR5ExactPropertySet {
         [Parameter(Mandatory)] [string] $Label
     )
     $packet2nActual = @($Object.PSObject.Properties.Name)
-    if ($packet2nActual.Count -ne $Expected.Count -or @(Compare-Object -ReferenceObject $Expected -DifferenceObject $packet2nActual).Count -ne 0) {
+    if ($packet2nActual.Count -ne $Expected.Count -or @(Compare-Object -ReferenceObject $Expected -DifferenceObject $packet2nActual -CaseSensitive).Count -ne 0) {
         throw "$Label property set mismatch"
     }
 }
@@ -632,7 +633,9 @@ function Assert-Packet2nR5CalibrationSchema {
         }
         if ([int64]$packet2nJoint.id -ne $packet2nIndex + 1) { throw "$Path $packet2nJointName has wrong motor ID" }
         if ([int64]$packet2nJoint.drive_mode -ne 0) { throw "$Path $packet2nJointName has wrong drive mode" }
-        if ([int64]$packet2nJoint.range_min -ge [int64]$packet2nJoint.range_max) { throw "$Path $packet2nJointName has invalid range" }
+        if ([int64]$packet2nJoint.range_min -lt 0 -or [int64]$packet2nJoint.range_min -ge [int64]$packet2nJoint.range_max -or [int64]$packet2nJoint.range_max -gt 4095) {
+            throw "$Path $packet2nJointName has invalid raw range outside 0..4095"
+        }
     }
     if ([int64]$packet2nCalibration.wrist_roll.range_min -ne 0 -or [int64]$packet2nCalibration.wrist_roll.range_max -ne 4095) {
         throw "$Path wrist_roll must retain the full-turn 0..4095 range"
@@ -674,6 +677,13 @@ function Assert-Packet2nR5CommonGuard {
     $packet2nDefinition = Get-Packet2nR5Definition
     $packet2nVerifierCommand = @(Get-Command -Name Get-Packet2nLeaderMapSummary -CommandType Function -ErrorAction SilentlyContinue)
     if ($packet2nVerifierCommand.Count -ne 1) { throw 'strict Packet 2N leader-map verifier function is not loaded' }
+    $packet2nVerifierDefinition = $packet2nVerifierCommand[0].Definition.Replace("`r`n", "`n").Replace("`r", "`n").Trim()
+    $packet2nVerifierDefinitionHash = [Convert]::ToHexString(
+        [Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($packet2nVerifierDefinition))
+    )
+    if ($packet2nVerifierDefinitionHash -ne $packet2nDefinition.VerifierDefinitionSha256) {
+        throw 'strict Packet 2N leader-map verifier definition does not match the reviewed implementation'
+    }
     $packet2nBranchOutput = @(& git branch --show-current 2>&1)
     $packet2nBranchExit = $LASTEXITCODE
     if ($packet2nBranchExit -ne 0 -or $packet2nBranchOutput.Count -ne 1 -or $packet2nBranchOutput[0].Trim() -ne $packet2nDefinition.Branch) {
