@@ -533,6 +533,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no_leader", action="store_true", help="Do not construct or connect the leader arms")
     parser.add_argument("--no_keyboard", action="store_true", help="Disable keyboard base and lift control")
     parser.add_argument("--no_rerun", action="store_true", help="Disable Rerun without importing visualization helpers")
+    parser.add_argument(
+        "--require_calibration_match",
+        action="store_true",
+        help="For AM1 no-robot mapping only, refuse leaders without loaded calibration",
+    )
     parser.add_argument("--start_paused", action="store_true", help="Wait for Enter before forwarding leader actions")
     parser.add_argument(
         "--check_alignment_only",
@@ -652,6 +657,15 @@ def parse_args(
         parser.error("--check_alignment_only requires both robot and leader connections")
     if args.check_alignment_only and args.robot_model != "alohamini1":
         parser.error("--check_alignment_only is supported only for alohamini1")
+    if args.require_calibration_match:
+        if args.robot_model != "alohamini1":
+            parser.error("--require_calibration_match requires --robot.robot_model alohamini1")
+        if args.arm_profile != "so-arm-5dof":
+            parser.error("--require_calibration_match requires --teleop.arm_profile so-arm-5dof")
+        if not args.no_robot:
+            parser.error("--require_calibration_match requires --no_robot")
+        if args.no_leader:
+            parser.error("--require_calibration_match requires leader connections")
     return resolve_leader_ports(args, parser, platform_name=platform_name)
 
 
@@ -745,10 +759,28 @@ def run_teleoperation(
 
         if not args.no_leader:
             leader = BiSOLeader(make_leader_config(args))
-            leader.left_arm.connect()
-            left_leader_connected = True
-            leader.right_arm.connect()
-            right_leader_connected = True
+            if args.require_calibration_match:
+                leader.left_arm.connect(calibrate=False)
+                left_leader_connected = True
+                try:
+                    if not leader.left_arm.is_calibrated:
+                        raise SafetyRefusal("left leader calibration is not loaded.")
+                except SafetyRefusal as exc:
+                    print(f"SAFETY REFUSAL: {exc}")
+                    return 2
+                leader.right_arm.connect(calibrate=False)
+                right_leader_connected = True
+                try:
+                    if not leader.right_arm.is_calibrated:
+                        raise SafetyRefusal("right leader calibration is not loaded.")
+                except SafetyRefusal as exc:
+                    print(f"SAFETY REFUSAL: {exc}")
+                    return 2
+            else:
+                leader.left_arm.connect()
+                left_leader_connected = True
+                leader.right_arm.connect()
+                right_leader_connected = True
         else:
             print("NO_LEADER: leader construction and connection skipped.")
 

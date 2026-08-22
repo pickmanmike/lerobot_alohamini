@@ -58,8 +58,15 @@ def parse_args(
         choices=["so-arm-5dof", "am-leader-6dof"],
         help="Leader arm profile selector",
     )
+    parser.add_argument(
+        "--force_fresh_calibration",
+        action="store_true",
+        help="Clear cached SO-101 leader calibration before the two-arm calibration run",
+    )
     add_leader_port_arguments(parser)
     args = parser.parse_args(argv)
+    if args.force_fresh_calibration and args.arm_profile != "so-arm-5dof":
+        parser.error("--force_fresh_calibration requires --teleop.arm_profile so-arm-5dof")
     return resolve_leader_ports(args, parser, platform_name=platform_name)
 
 
@@ -85,6 +92,10 @@ def _record_cleanup_error(
 
 def run_calibration(args: argparse.Namespace) -> None:
     leader = BiSOLeader(make_leader_config(args))
+    if args.force_fresh_calibration:
+        for arm in (leader.left_arm, leader.right_arm):
+            arm.calibration.clear()
+            arm.bus.calibration.clear()
     left_connected = False
     right_connected = False
     try:

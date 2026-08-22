@@ -400,6 +400,173 @@ def test_calibration_cleanup_does_not_hide_primary_failure(monkeypatch):
     assert any("left leader disconnect" in note for note in caught.value.__notes__)
 
 
+@pytest.mark.parametrize("aliased_calibrations", [False, True])
+def test_force_fresh_calibration_clears_each_child_and_bus_calibration_in_place(
+    monkeypatch, aliased_calibrations
+):
+    module = load_example_module("calibrate_bi")
+    events = []
+
+    class CalibrationArm:
+        def __init__(self, name):
+            self.name = name
+            self.calibration = {"stale_arm": name}
+            self.bus = SimpleNamespace(calibration=self.calibration if aliased_calibrations else {"stale_bus": name})
+
+        def connect(self, calibrate=True):
+            assert self.calibration == {}
+            assert self.bus.calibration == {}
+            events.append((self.name, "connect", calibrate))
+
+        def disconnect(self):
+            events.append((self.name, "disconnect"))
+
+    class CalibrationLeader:
+        def __init__(self, config):
+            self.left_arm = CalibrationArm("left")
+            self.right_arm = CalibrationArm("right")
+
+        def calibrate(self):
+            assert self.left_arm.calibration == self.left_arm.bus.calibration == {}
+            assert self.right_arm.calibration == self.right_arm.bus.calibration == {}
+            events.append(("leader", "calibrate"))
+
+    monkeypatch.setattr(module, "BiSOLeader", CalibrationLeader)
+    args = module.parse_args(
+        [
+            "--teleop.left_port",
+            "COM5",
+            "--teleop.right_port",
+            "COM6",
+            "--force_fresh_calibration",
+        ],
+        platform_name="Windows",
+    )
+
+    module.run_calibration(args)
+
+    assert events == [
+        ("left", "connect", False),
+        ("right", "connect", False),
+        ("leader", "calibrate"),
+        ("right", "disconnect"),
+        ("left", "disconnect"),
+    ]
+
+
+def test_force_fresh_calibration_default_path_is_unchanged_and_sixdof_is_rejected(capsys):
+    module = load_example_module("calibrate_bi")
+
+    default_args = module.parse_args(
+        ["--teleop.left_port", "COM5", "--teleop.right_port", "COM6"], platform_name="Windows"
+    )
+    assert default_args.force_fresh_calibration is False
+
+    with pytest.raises(SystemExit):
+        module.parse_args(
+            [
+                "--teleop.left_port",
+                "COM5",
+                "--teleop.right_port",
+                "COM6",
+                "--teleop.arm_profile",
+                "am-leader-6dof",
+                "--force_fresh_calibration",
+            ],
+            platform_name="Windows",
+        )
+
+    assert "--force_fresh_calibration requires --teleop.arm_profile so-arm-5dof" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("arguments", "reason"),
+    [
+        (["--robot.robot_model", "alohamini2"], "--require_calibration_match requires --robot.robot_model alohamini1"),
+        (["--teleop.arm_profile", "am-leader-6dof"], "--require_calibration_match requires --teleop.arm_profile so-arm-5dof"),
+        ([], "--require_calibration_match requires --no_robot"),
+        (["--no_robot", "--no_leader"], "--require_calibration_match requires leader connections"),
+    ],
+)
+def test_require_calibration_match_rejects_unsupported_modes(capsys, arguments, reason):
+    module = load_example_module("teleoperate_bi")
+
+    with pytest.raises(SystemExit):
+        module.parse_args(
+            [
+                "--require_calibration_match",
+                "--teleop.left_port",
+                "COM5",
+                "--teleop.right_port",
+                "COM6",
+                *arguments,
+            ],
+            platform_name="Windows",
+        )
+
+    assert reason in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(("mismatch_side", "expected_events"), [
+    ("left", [("left", "connect", False), ("left", "disconnect")]),
+    (
+        "right",
+        [
+            ("left", "connect", False),
+            ("right", "connect", False),
+            ("right", "disconnect"),
+            ("left", "disconnect"),
+        ],
+    ),
+])
+def test_require_calibration_match_refuses_before_actions_and_cleans_connected_arms(
+    monkeypatch, capsys, mismatch_side, expected_events
+):
+    module = load_example_module("teleoperate_bi")
+    events = []
+
+    class Arm:
+        def __init__(self, side):
+            self.side = side
+            self.is_calibrated = side != mismatch_side
+
+        def connect(self, calibrate=True):
+            events.append((self.side, "connect", calibrate))
+
+        def disconnect(self):
+            events.append((self.side, "disconnect"))
+
+    class Leader:
+        def __init__(self, config):
+            self.left_arm = Arm("left")
+            self.right_arm = Arm("right")
+
+        def get_action(self):
+            raise AssertionError("mismatched leader must not produce actions")
+
+    monkeypatch.setattr(module, "BiSOLeader", Leader)
+    monkeypatch.setattr(module, "AlohaMiniClient", lambda config: (_ for _ in ()).throw(AssertionError("robot constructed")))
+    monkeypatch.setattr(module, "KeyboardTeleop", lambda config: (_ for _ in ()).throw(AssertionError("keyboard constructed")))
+    monkeypatch.setattr(module, "load_rerun_functions", lambda: (_ for _ in ()).throw(AssertionError("rerun loaded")))
+    args = module.parse_args(
+        [
+            "--require_calibration_match",
+            "--no_robot",
+            "--no_keyboard",
+            "--no_rerun",
+            "--teleop.left_port",
+            "COM5",
+            "--teleop.right_port",
+            "COM6",
+        ],
+        platform_name="Windows",
+    )
+
+    assert module.run_teleoperation(args) == 2
+    assert events == expected_events
+    assert f"SAFETY REFUSAL: {mismatch_side} leader calibration is not loaded." in capsys.readouterr().out
+
+
 def test_am1_validation_rejects_out_of_range_joint_with_exact_identity():
     module = load_example_module("teleoperate_bi")
     values = {**LEADER_POSE, "right_shoulder_lift.pos": -105.8}
@@ -718,6 +885,7 @@ class FakeArm:
         self.connect_error = connect_error
         self.disconnect_error: BaseException | None = None
         self.is_connected = False
+        self.is_calibrated = True
 
     def connect(self, calibrate: bool = True):
         self.events.append((self.name, "connect", calibrate))
@@ -803,6 +971,18 @@ def prepare_teleoperation(
         lambda: (_ for _ in ()).throw(AssertionError("Rerun helpers were loaded")),
     )
     return events
+
+
+def test_require_calibration_match_allows_two_calibrated_leaders_in_no_robot_mode(monkeypatch):
+    module = load_example_module("teleoperate_bi")
+    events = prepare_teleoperation(monkeypatch, module)
+    clock = FakeClock(events)
+    args = teleoperation_args(module, "--require_calibration_match", "--no_robot", "--duration_s", "0.2", "--fps", "5")
+
+    assert module.run_teleoperation(args, monotonic=clock.monotonic, sleep_fn=clock.sleep) == 0
+    assert ("left", "connect", False) in events
+    assert ("right", "connect", False) in events
+    assert any(event[:2] == ("leader", "get_action") for event in events)
 
 
 def make_direct_sync_fakes(
