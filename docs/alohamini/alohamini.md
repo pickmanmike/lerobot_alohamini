@@ -500,13 +500,13 @@ The manifest records each original and backup path, SHA-256, byte count, and sou
 
 The only approved later correction is a coordinated **full recalibration**, after a separate physical authorization: logical/physical left must be `COM8`, logical/physical right must be `COM7`, the ID must be `so101_leader_bi`, and the profile must be `so-arm-5dof`. Do not do a port-only swap, JSON-content swap, or runtime swap layer. Begin with the Pi motor host stopped, follower/body 12 V power off, both leader supplies off, and both leader USB controllers disconnected. Do not run this task's future commands until physical authorization is granted.
 
-**Future corrected-port full recalibration — fail fast.** The guard below is part of every future connection attempt. It rejects all Hugging Face calibration/home overrides, resolves and pins the evidence default calibration root, and validates the manifest's exact original/backup paths, bytes, and hashes. Before calibration, it requires both current sources and both backups to retain the verified pre-calibration hashes. After calibration, it continues to require the manifest and backups unchanged but requires the current sources to match freshly captured same-session post-calibration evidence instead of the old hashes. It also requires the reviewed `f7e8254c80fffe8c215920d6928718b1f482f7a6` baseline as an ancestor and requires every calibration/leader-client source path listed in the guard to be byte-identical to that baseline; this non-self-referential source review remains valid on later reviewed documentation commits. After physical authorization and only with the operator's clear stop path, run exactly this command. At **both** existing-file prompts, verify the shown child identity matches the expected logical child and type exactly `c` (lowercase, then Enter) to force its full recalibration. Stop immediately—without accepting the existing file—on any unexpected prompt, child ID, port, profile, connection/calibration error, or safety concern. Do not continue to no-robot verification after any mismatch.
+**Future corrected-port full recalibration — fail fast.** This supersedes the earlier `c`/reuse procedure: pass `--force_fresh_calibration`; do not accept, type `c` at, or otherwise use an existing-calibration prompt. The pre-connection guard rejects `PYTHONPATH`, `PYTHONHOME`, and all Hugging Face calibration/home overrides; it pins the reviewed code commit `2a55f717ecf4b5ef83805e6ccb89c97a4690da6b` as an ancestor, requires every tracked path except this documentation file to match that commit, and validates the immutable manifest/backups plus the exact default calibration root. Before calibration both sources must retain their backup-era identities. After a zero-exit forced run, capture and persist same-session post-calibration evidence; no-robot runs fail closed unless both current JSONs exactly match that evidence.
 
 ```powershell
 $ErrorActionPreference = 'Stop'
 $script:packet2nR5PostCalibrationEvidence = $null
 function Assert-Packet2nR5CommonGuard {
-    $packet2nBaseline = 'f7e8254c80fffe8c215920d6928718b1f482f7a6'
+    $packet2nBaseline = '2a55f717ecf4b5ef83805e6ccb89c97a4690da6b'
     $packet2nCalibrationRoot = 'C:\Users\pickm\.cache\huggingface\lerobot\calibration'
     $packet2nBackupDirectory = 'C:\Users\pickm\AlohaMini1Backups\packet2n-r5-20260822-121722-7941f445-9587-4345-8e2f-edd54ca750f6'
     $packet2nManifestPath = Join-Path $packet2nBackupDirectory 'manifest.json'
@@ -514,24 +514,19 @@ function Assert-Packet2nR5CommonGuard {
         [pscustomobject]@{ Name = 'so101_leader_bi_left.json'; Bytes = 960; Sha256 = '6F5D6126E84398D0621A26E74E4DF6678EBA7C14C62D343020610B4D5D8B3D8C' },
         [pscustomobject]@{ Name = 'so101_leader_bi_right.json'; Bytes = 961; Sha256 = '65A301F20FC7DC96BD7FB5982E3670BF1A01F535953D7A253AB8D33A03646F11' }
     )
-    if ((git branch --show-current) -ne 'fix/am1-elbow-commissioning') { throw 'wrong Windows branch' }
-    if (git status --porcelain) { throw 'Windows worktree is not clean' }
+    if ((git branch --show-current) -ne 'fix/am1-elbow-commissioning' -or $LASTEXITCODE -ne 0) { throw 'wrong Windows branch' }
+    $packet2nGitStatus = @(git status --porcelain 2>&1)
+    if ($LASTEXITCODE -ne 0 -or $packet2nGitStatus.Count -ne 0) { throw 'Windows worktree is not clean or Git status failed' }
     git merge-base --is-ancestor $packet2nBaseline HEAD
     if ($LASTEXITCODE -ne 0) { throw "Packet 2N-R5 baseline is not an ancestor: $packet2nBaseline" }
-    $packet2nRelevantSources = @(
-        'examples/alohamini/calibrate_bi.py',
-        'examples/alohamini/teleoperate_bi.py',
-        'examples/alohamini/leader_client_utils.py',
-        'src/lerobot/teleoperators/bi_so_leader/bi_so_leader.py',
-        'src/lerobot/teleoperators/bi_so_leader/config_bi_so_leader.py',
-        'src/lerobot/teleoperators/so_leader/so_leader.py',
-        'src/lerobot/teleoperators/so_leader/config_so_leader.py'
-    )
-    git diff --quiet $packet2nBaseline -- $packet2nRelevantSources
-    if ($LASTEXITCODE -ne 0) { throw 'reviewed Packet 2N-R5 source paths differ from the baseline' }
-    if ($env:HF_LEROBOT_CALIBRATION -or $env:HF_LEROBOT_HOME -or $env:HF_HOME) { throw 'HF calibration/home environment overrides must be unset' }
+    $packet2nOtherTrackedChanges = @(git diff --name-only $packet2nBaseline -- . ':(exclude)docs/alohamini/alohamini.md')
+    if ($LASTEXITCODE -ne 0 -or $packet2nOtherTrackedChanges.Count -ne 0) { throw 'reviewed Packet 2N-R5 tracked paths differ from the code baseline' }
+    if ($env:PYTHONPATH -or $env:PYTHONHOME -or $env:HF_LEROBOT_CALIBRATION -or $env:HF_LEROBOT_HOME -or $env:HF_HOME) { throw 'Python/HF environment overrides must be unset' }
     $packet2nResolvedRoot = (& .\.venv\Scripts\python.exe -c "from lerobot.utils.constants import HF_LEROBOT_CALIBRATION; print(HF_LEROBOT_CALIBRATION)" | Out-String).Trim()
     if ($packet2nResolvedRoot -ne $packet2nCalibrationRoot) { throw "unexpected calibration root: $packet2nResolvedRoot" }
+    $packet2nCheckout = (Resolve-Path -LiteralPath '.').Path
+    $packet2nImportedPaths = @(& .\.venv\Scripts\python.exe -c "import sys; sys.path.insert(0, 'examples/alohamini'); import calibrate_bi, teleoperate_bi, leader_client_utils, lerobot.teleoperators.bi_so_leader.bi_so_leader, lerobot.teleoperators.so_leader.so_leader; print('`n'.join(m.__file__ for m in (calibrate_bi, teleoperate_bi, leader_client_utils, lerobot.teleoperators.bi_so_leader.bi_so_leader, lerobot.teleoperators.so_leader.so_leader)))")
+    if ($LASTEXITCODE -ne 0 -or @($packet2nImportedPaths | Where-Object { -not $_.StartsWith($packet2nCheckout, [System.StringComparison]::OrdinalIgnoreCase) }).Count -ne 0) { throw 'required imported module path escaped the reviewed checkout' }
     if (-not (Test-Path -LiteralPath $packet2nManifestPath -PathType Leaf)) { throw "missing Packet 2N-R5 manifest: $packet2nManifestPath" }
     $packet2nManifest = Get-Content -Raw -LiteralPath $packet2nManifestPath | ConvertFrom-Json
     if ($packet2nManifest.Packet -ne '2N-R5' -or $packet2nManifest.BackupDirectory -ne $packet2nBackupDirectory -or -not $packet2nManifest.CopyOnly -or -not $packet2nManifest.HardwareDisconnected) { throw 'Packet 2N-R5 manifest identity or safety fields differ' }
@@ -571,15 +566,22 @@ function Save-Packet2nR5PostCalibrationEvidence {
             if (-not (Test-Path -LiteralPath $packet2nSource -PathType Leaf)) { throw "missing post-calibration source: $packet2nSource" }
             $packet2nSourceItem = Get-Item -LiteralPath $packet2nSource
             $packet2nManifestEntry = @($packet2nManifest.Files | Where-Object { $_.OriginalPath -eq $packet2nSource })
-            if ($packet2nManifestEntry.Count -ne 1 -or $packet2nSourceItem.LastWriteTimeUtc -le [datetime]$packet2nManifestEntry[0].SourceLastWriteTimeUtc) { throw "post-calibration rewrite was not proven: $packet2nSource" }
+            if ($packet2nManifestEntry.Count -ne 1 -or $packet2nSourceItem.LastWriteTimeUtc -le [datetime]$packet2nManifestEntry[0].SourceLastWriteTimeUtc -or $packet2nSourceItem.LastWriteTimeUtc -le $packet2nR5SessionStartedUtc) { throw "post-calibration rewrite was not proven: $packet2nSource" }
             [pscustomobject]@{ Name = $packet2nName; Path = $packet2nSource; Bytes = [int64]$packet2nSourceItem.Length; Sha256 = (Get-FileHash -LiteralPath $packet2nSource -Algorithm SHA256).Hash; LastWriteTimeUtc = $packet2nSourceItem.LastWriteTimeUtc.ToString('o') }
         }
     )
     if ($script:packet2nR5PostCalibrationEvidence.Count -ne 2) { throw 'post-calibration evidence did not capture both sources' }
+    $packet2nOldHashes = @('6F5D6126E84398D0621A26E74E4DF6678EBA7C14C62D343020610B4D5D8B3D8C', '65A301F20FC7DC96BD7FB5982E3670BF1A01F535953D7A253AB8D33A03646F11')
+    if (@($script:packet2nR5PostCalibrationEvidence | Where-Object { $_.Sha256 -in $packet2nOldHashes }).Count -ne 0 -or $script:packet2nR5PostCalibrationEvidence[0].Sha256 -eq $script:packet2nR5PostCalibrationEvidence[1].Sha256) { throw 'post-calibration hashes do not prove two fresh logical calibrations' }
+    if (-not $packet2nR5SessionId -or -not $packet2nR5SessionStartedUtc) { throw 'missing calibration session identity' }
+    $script:packet2nR5EvidencePath = Join-Path 'C:\Users\pickm\AlohaMini1Logs' "packet2n-r5-evidence-$packet2nR5SessionId.json"
+    [pscustomobject]@{ SessionId = $packet2nR5SessionId; SessionStartedUtc = $packet2nR5SessionStartedUtc.ToString('o'); Files = $script:packet2nR5PostCalibrationEvidence } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $script:packet2nR5EvidencePath -Encoding utf8 -NoNewline
+    $script:packet2nR5EvidenceSha256 = (Get-FileHash -LiteralPath $script:packet2nR5EvidencePath -Algorithm SHA256).Hash
 }
 function Assert-Packet2nR5PostCalibrationGuard {
     Assert-Packet2nR5CommonGuard
     if ($null -eq $script:packet2nR5PostCalibrationEvidence -or $script:packet2nR5PostCalibrationEvidence.Count -ne 2) { throw 'missing same-session post-calibration evidence' }
+    if (-not $script:packet2nR5EvidencePath -or -not $script:packet2nR5EvidenceSha256 -or -not (Test-Path -LiteralPath $script:packet2nR5EvidencePath -PathType Leaf) -or (Get-FileHash -LiteralPath $script:packet2nR5EvidencePath -Algorithm SHA256).Hash -ne $script:packet2nR5EvidenceSha256) { throw 'persisted post-calibration evidence is missing or changed' }
     $packet2nCalibrationRoot = 'C:\Users\pickm\.cache\huggingface\lerobot\calibration'
     $packet2nManifestPath = 'C:\Users\pickm\AlohaMini1Backups\packet2n-r5-20260822-121722-7941f445-9587-4345-8e2f-edd54ca750f6\manifest.json'
     $packet2nManifest = Get-Content -Raw -LiteralPath $packet2nManifestPath | ConvertFrom-Json
@@ -595,12 +597,16 @@ function Assert-Packet2nR5PostCalibrationGuard {
     }
 }
 Assert-Packet2nR5PreCalibrationGuard
+$packet2nR5SessionId = [guid]::NewGuid().ToString()
+$packet2nR5SessionStartedUtc = [datetime]::UtcNow
+$packet2nR5CalibrationLog = Join-Path 'C:\Users\pickm\AlohaMini1Logs' "packet2n-r5-calibration-$packet2nR5SessionId.log"
 & .\.venv\Scripts\python.exe `
   .\examples\alohamini\calibrate_bi.py `
   --teleop.left_port COM8 `
   --teleop.right_port COM7 `
   --teleop.id so101_leader_bi `
-  --teleop.arm_profile so-arm-5dof
+  --teleop.arm_profile so-arm-5dof `
+  --force_fresh_calibration 2>&1 | Tee-Object -FilePath $packet2nR5CalibrationLog
 if ($LASTEXITCODE -ne 0) { throw "corrected-port full recalibration failed with $LASTEXITCODE" }
 Save-Packet2nR5PostCalibrationEvidence
 ```
@@ -625,6 +631,7 @@ $packet2nCorrectedPhysicalLeftLog = Join-Path $packet2nCorrectedMapDir "packet2n
   --teleop.right_port COM7 `
   --teleop.id so101_leader_bi `
   --teleop.arm_profile so-arm-5dof `
+  --require_calibration_match `
   --duration_s 12 `
   --fps 5 `
   --start_paused `
@@ -653,6 +660,7 @@ $packet2nCorrectedPhysicalRightLog = Join-Path $packet2nCorrectedMapDir "packet2
   --teleop.right_port COM7 `
   --teleop.id so101_leader_bi `
   --teleop.arm_profile so-arm-5dof `
+  --require_calibration_match `
   --duration_s 12 `
   --fps 5 `
   --start_paused `
