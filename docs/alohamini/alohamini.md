@@ -368,23 +368,37 @@ $packet2nPhysicalRightExitCode = $LASTEXITCODE
 if ($packet2nPhysicalRightExitCode -ne 0) { throw "physical-right map failed with $packet2nPhysicalRightExitCode" }
 ```
 
-The strict verifier is retained unchanged for the historical logs and the future Packet 2N-R5 corrected-port logs. It requires the marker, no-robot notice, absence of any `ZMQ` text, normal cleanup, exit `0`, all twelve arm keys, a moved gripper span of at least 20 normalized units, and less than `2.0` variation across the entire opposite logical family:
+The strict verifier preserves the historical two-path use while adding a fail-closed Packet 2N-R5 evidence mode. Both modes require the marker, exactly 60 no-robot action records, the no-robot notice, absence of runtime `ZMQ` or calibration text, normal cleanup, exit `0`, the exact twelve arm keys, a moved gripper span of at least 20 normalized units, and less than `2.0` variation across the entire opposite logical family. The broad quoted-key scan deliberately rejects missing, duplicated, or unexpected `arm_*.pos` keys such as `arm_center_*.pos`; legitimate non-arm zero base/lift keys are not classified as unexpected arm data. Packet 2N-R5 mode additionally revalidates the persisted calibration evidence, transcript, and current calibration hashes and requires every bound log-metadata line exactly once:
 
 ```powershell
 $ErrorActionPreference = 'Stop'
 function Get-Packet2nLeaderMapSummary {
     param(
         [Parameter(Mandatory)] [string] $Path,
-        [Parameter(Mandatory)] [ValidateSet('PHYSICAL_LEFT_ONLY', 'PHYSICAL_RIGHT_ONLY')] [string] $ExpectedMarker
+        [Parameter(Mandatory)] [ValidateSet('PHYSICAL_LEFT_ONLY', 'PHYSICAL_RIGHT_ONLY')] [string] $ExpectedMarker,
+        [switch] $RequirePacket2nR5Evidence,
+        [string] $Packet2nR5EvidencePath,
+        [string] $Packet2nR5EvidenceSha256
     )
 
     $lines = @(Get-Content -LiteralPath $Path)
     if ($lines.Count -lt 3 -or $lines[0].Trim() -ne "MAP_RUN=$ExpectedMarker") { throw "invalid marker in $Path" }
     if ($lines[-1].Trim() -ne 'CLIENT_EXIT_CODE=0') { throw "missing successful exit in $Path" }
-    if (-not ($lines | Where-Object { $_ -eq 'NO_ROBOT: robot client construction and connection skipped.' })) { throw "missing NO_ROBOT proof in $Path" }
+    if (@($lines | Where-Object { $_ -eq 'NO_ROBOT: robot client construction and connection skipped.' }).Count -ne 1) { throw "missing or duplicate NO_ROBOT proof in $Path" }
     if (-not ($lines | Where-Object { $_ -like 'Shutdown complete:*' })) { throw "missing cleanup proof in $Path" }
     if ($lines -match 'ZMQ') { throw "unexpected ZMQ text in $Path" }
-    if ($lines -match '(?i)calibrat') { throw "calibration text requires refusal and review: $Path" }
+
+    $approvedMetadataLines = @()
+    if ($RequirePacket2nR5Evidence) {
+        if (-not $Packet2nR5EvidencePath -or -not $Packet2nR5EvidenceSha256) { throw 'Packet 2N-R5 verification requires evidence path and SHA-256' }
+        $packet2nR5Context = Assert-Packet2nR5PersistedEvidence -EvidencePath $Packet2nR5EvidencePath -EvidenceSha256 $Packet2nR5EvidenceSha256
+        $approvedMetadataLines = Get-Packet2nR5MapMetadataLines -Context $packet2nR5Context
+        Assert-Packet2nR5MapMetadata -Lines $lines -ExpectedLines $approvedMetadataLines -Path $Path
+    } elseif ($Packet2nR5EvidencePath -or $Packet2nR5EvidenceSha256) {
+        throw 'Packet 2N-R5 evidence parameters require -RequirePacket2nR5Evidence'
+    }
+    $runtimeLines = @($lines | Where-Object { $_ -notin $approvedMetadataLines })
+    if ($runtimeLines -match '(?i)calibrat') { throw "runtime calibration text requires refusal and review: $Path" }
 
     $expectedKeys = @(
         'arm_left_shoulder_pan.pos',
@@ -403,24 +417,27 @@ function Get-Packet2nLeaderMapSummary {
     $series = @{}
     $completeRecordCount = 0
     $number = '-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?'
-    $pattern = "'(?<key>arm_(?:left|right)_[^']+\.pos)':\s*(?<value>$number)"
+    $quotedArmKeyPattern = "'(?<key>arm_[^']*\.pos)'\s*:"
     foreach ($line in $lines) {
         if (-not $line.StartsWith('[NO_ROBOT] action ->')) { continue }
-        $matches = @([regex]::Matches($line, $pattern))
-        $recordKeys = @($matches | ForEach-Object { $_.Groups['key'].Value })
+        $quotedArmMatches = @([regex]::Matches($line, $quotedArmKeyPattern))
+        $recordKeys = @($quotedArmMatches | ForEach-Object { $_.Groups['key'].Value })
         $missingRecordKeys = @($expectedKeys | Where-Object { $_ -notin $recordKeys })
         $unexpectedRecordKeys = @($recordKeys | Where-Object { $_ -notin $expectedKeys })
-        if ($matches.Count -ne 12 -or $missingRecordKeys.Count -ne 0 -or $unexpectedRecordKeys.Count -ne 0) {
-            throw "incomplete or unexpected arm action record in $Path"
+        $duplicateRecordKeys = @($recordKeys | Group-Object | Where-Object { $_.Count -ne 1 })
+        if ($quotedArmMatches.Count -ne 12 -or $missingRecordKeys.Count -ne 0 -or $unexpectedRecordKeys.Count -ne 0 -or $duplicateRecordKeys.Count -ne 0) {
+            throw "missing, duplicate, or unexpected quoted arm action key in $Path"
         }
         $completeRecordCount++
-        foreach ($match in $matches) {
-            $key = $match.Groups['key'].Value
+        foreach ($key in $expectedKeys) {
+            $escapedKey = [regex]::Escape($key)
+            $valueMatches = @([regex]::Matches($line, "'$escapedKey'\s*:\s*(?<value>$number)(?=\s*[,}])"))
+            if ($valueMatches.Count -ne 1) { throw "missing, duplicate, or nonnumeric value for $key in $Path" }
             if (-not $series.ContainsKey($key)) { $series[$key] = @() }
-            $series[$key] += [double] $match.Groups['value'].Value
+            $series[$key] += [double]::Parse($valueMatches[0].Groups['value'].Value, [Globalization.CultureInfo]::InvariantCulture)
         }
     }
-    if ($completeRecordCount -lt 1) { throw "no complete arm action records in $Path" }
+    if ($completeRecordCount -ne 60) { throw "expected exactly 60 complete arm action records in $Path; found $completeRecordCount" }
     $missingKeys = @($expectedKeys | Where-Object { -not $series.ContainsKey($_) })
     $unexpectedKeys = @($series.Keys | Where-Object { $_ -notin $expectedKeys })
     if ($missingKeys.Count -ne 0 -or $unexpectedKeys.Count -ne 0) {
@@ -454,6 +471,11 @@ function Get-Packet2nLeaderMapSummary {
         SampleCount = $completeRecordCount
     }
 }
+```
+
+For the historical Packet 2N-R3 logs only, define the function above and then run this prompt-based invocation. Do not use this historical invocation for Packet 2N-R5:
+
+```powershell
 
 $packet2nPhysicalLeftLog = Read-Host 'Paste the exact PHYSICAL_LEFT_ONLY log path'
 $packet2nPhysicalRightLog = Read-Host 'Paste the exact PHYSICAL_RIGHT_ONLY log path'
@@ -484,276 +506,599 @@ Stop either run immediately and remove leader power for unexpected powered leade
 
 #### Packet 2N-R5 — approved later corrected-port recalibration and no-robot verification (not executed here)
 
-This Packet 2N-R5 task made no COM, leader, follower, Pi, ZMQ, network, or calibration connection. It made a verified **copy-only** offline backup while hardware remained disconnected:
+This Packet 2N-R5 documentation task made no COM, leader, follower, Pi, ZMQ, network, or calibration connection. It made a verified **copy-only** offline backup while hardware remained disconnected:
 
 ```text
 Backup directory: C:\Users\pickm\AlohaMini1Backups\packet2n-r5-20260822-121722-7941f445-9587-4345-8e2f-edd54ca750f6
 Manifest: C:\Users\pickm\AlohaMini1Backups\packet2n-r5-20260822-121722-7941f445-9587-4345-8e2f-edd54ca750f6\manifest.json
+Manifest SHA-256: B90DF72155C60996B4E2704E4A44ED1895BBAEA0C0A332DC24674EC3FA399B8A
 ```
 
-| Original file | Bytes | SHA-256 |
-| --- | ---: | --- |
-| `so101_leader_bi_left.json` | 960 | `6F5D6126E84398D0621A26E74E4DF6678EBA7C14C62D343020610B4D5D8B3D8C` |
-| `so101_leader_bi_right.json` | 961 | `65A301F20FC7DC96BD7FB5982E3670BF1A01F535953D7A253AB8D33A03646F11` |
+| Original file | Bytes | SHA-256 | Source `LastWriteTimeUtc` |
+| --- | ---: | --- | --- |
+| `so101_leader_bi_left.json` | 960 | `6F5D6126E84398D0621A26E74E4DF6678EBA7C14C62D343020610B4D5D8B3D8C` | `2026-08-15T05:18:25.9699568Z` |
+| `so101_leader_bi_right.json` | 961 | `65A301F20FC7DC96BD7FB5982E3670BF1A01F535953D7A253AB8D33A03646F11` | `2026-08-15T05:19:53.2654429Z` |
 
-The manifest records each original and backup path, SHA-256, byte count, and source UTC last-write time. Both backup hashes matched their source hashes, and both original paths and hashes were rechecked unchanged after copying. This backup does not authorize restoring, moving, deleting, renaming, or editing either original; any rollback must be separately reviewed and use this manifest as evidence.
+The manifest records the exact original and backup paths, hashes, byte counts, and source timestamps. Both backup hashes matched their source hashes, and both original paths and hashes were rechecked unchanged after copying. This backup does not authorize restoring, moving, deleting, renaming, editing, or swapping either original; any rollback requires a separate reviewed decision.
 
-The only approved later correction is a coordinated **full recalibration**, after a separate physical authorization: logical/physical left must be `COM8`, logical/physical right must be `COM7`, the ID must be `so101_leader_bi`, and the profile must be `so-arm-5dof`. Do not do a port-only swap, JSON-content swap, or runtime swap layer. Begin with the Pi motor host stopped, follower/body 12 V power off, both leader supplies off, and both leader USB controllers disconnected. Do not run this task's future commands until physical authorization is granted.
+The only approved later correction, after separate physical authorization, is coordinated **full recalibration** with logical/physical left on `COM8`, logical/physical right on `COM7`, ID `so101_leader_bi`, and profile `so-arm-5dof`. Do not do a port-only swap, JSON-content swap, or runtime swap layer. Begin with the Pi motor host stopped, follower/body 12 V power off, both leader supplies off, and both leader USB controllers disconnected. The exact next Windows procedure is the calibration block and two no-robot map blocks below. The exact next Pi command is **none**.
 
-**Future corrected-port full recalibration — fail fast.** This supersedes the earlier `c`/reuse procedure: pass `--force_fresh_calibration`; do not accept, type `c` at, or otherwise use an existing-calibration prompt. The pre-connection guard rejects `PYTHONPATH`, `PYTHONHOME`, and all Hugging Face calibration/home overrides; it pins the reviewed code commit `cae57b59db1d9156be568aa4b216fc90701aa741` as an ancestor, requires every tracked path except this documentation file to match that commit, and validates the immutable manifest/backups plus the exact default calibration root. Before calibration both sources must retain their backup-era identities. After a zero-exit forced run, capture and persist same-session post-calibration evidence; no-robot runs fail closed unless both current JSONs exactly match that evidence and are different from both pre-calibration hashes.
+**Future corrected-port full recalibration — fail fast.** In one PowerShell session, first execute only the strict-verifier **function-definition** block above (not its historical prompt-based invocation), then execute the calibration block and both map blocks below in order. Do this only after a separate physical authorization. The common guard refuses before connection unless that verifier function is loaded, pins the behavior baseline `cae57b59db1d9156be568aa4b216fc90701aa741`, robustly checks every Git command's exit status and stderr, requires every tracked path except this documentation file to be identical to that baseline, rejects Python/Hugging Face path overrides, pins exact source imports under this checkout, and validates the immutable manifest and backups. `--force_fresh_calibration` eliminates the existing-calibration prompt path; do not accept, type `c` at, or otherwise use such a prompt.
 
 ```powershell
 $ErrorActionPreference = 'Stop'
-$script:packet2nR5PostCalibrationEvidence = $null
-function Assert-Packet2nR5CommonGuard {
-    $packet2nBaseline = 'cae57b59db1d9156be568aa4b216fc90701aa741'
+
+function Get-Packet2nR5Definition {
     $packet2nCalibrationRoot = 'C:\Users\pickm\.cache\huggingface\lerobot\calibration'
     $packet2nBackupDirectory = 'C:\Users\pickm\AlohaMini1Backups\packet2n-r5-20260822-121722-7941f445-9587-4345-8e2f-edd54ca750f6'
-    $packet2nManifestPath = Join-Path $packet2nBackupDirectory 'manifest.json'
-    $packet2nFiles = @(
-        [pscustomobject]@{ Name = 'so101_leader_bi_left.json'; Bytes = 960; Sha256 = '6F5D6126E84398D0621A26E74E4DF6678EBA7C14C62D343020610B4D5D8B3D8C' },
-        [pscustomobject]@{ Name = 'so101_leader_bi_right.json'; Bytes = 961; Sha256 = '65A301F20FC7DC96BD7FB5982E3670BF1A01F535953D7A253AB8D33A03646F11' }
-    )
-    if ((git branch --show-current) -ne 'fix/am1-elbow-commissioning' -or $LASTEXITCODE -ne 0) { throw 'wrong Windows branch' }
-    $packet2nGitStatus = @(git status --porcelain 2>&1)
-    if ($LASTEXITCODE -ne 0 -or $packet2nGitStatus.Count -ne 0) { throw 'Windows worktree is not clean or Git status failed' }
-    git merge-base --is-ancestor $packet2nBaseline HEAD
-    if ($LASTEXITCODE -ne 0) { throw "Packet 2N-R5 baseline is not an ancestor: $packet2nBaseline" }
-    $packet2nOtherTrackedChanges = @(git diff --name-only $packet2nBaseline -- . ':(exclude)docs/alohamini/alohamini.md')
-    if ($LASTEXITCODE -ne 0 -or $packet2nOtherTrackedChanges.Count -ne 0) { throw 'reviewed Packet 2N-R5 tracked paths differ from the code baseline' }
-    if ($env:PYTHONPATH -or $env:PYTHONHOME -or $env:HF_LEROBOT_CALIBRATION -or $env:HF_LEROBOT_HOME -or $env:HF_HOME) { throw 'Python/HF environment overrides must be unset' }
-    $packet2nResolvedRoot = (& .\.venv\Scripts\python.exe -c "from lerobot.utils.constants import HF_LEROBOT_CALIBRATION; print(HF_LEROBOT_CALIBRATION)" | Out-String).Trim()
-    if ($packet2nResolvedRoot -ne $packet2nCalibrationRoot) { throw "unexpected calibration root: $packet2nResolvedRoot" }
-    $packet2nCheckout = (Resolve-Path -LiteralPath '.').Path
-    $packet2nImportedPaths = @(& .\.venv\Scripts\python.exe -c "import sys; sys.path.insert(0, 'examples/alohamini'); import calibrate_bi, teleoperate_bi, leader_client_utils, lerobot.teleoperators.bi_so_leader.bi_so_leader, lerobot.teleoperators.so_leader.so_leader; print(*(m.__file__ for m in (calibrate_bi, teleoperate_bi, leader_client_utils, lerobot.teleoperators.bi_so_leader.bi_so_leader, lerobot.teleoperators.so_leader.so_leader)), sep='\n')")
-    if ($LASTEXITCODE -ne 0 -or @($packet2nImportedPaths | Where-Object { -not $_.StartsWith($packet2nCheckout, [System.StringComparison]::OrdinalIgnoreCase) }).Count -ne 0) { throw 'required imported module path escaped the reviewed checkout' }
-    if (-not (Test-Path -LiteralPath $packet2nManifestPath -PathType Leaf)) { throw "missing Packet 2N-R5 manifest: $packet2nManifestPath" }
-    $packet2nManifest = Get-Content -Raw -LiteralPath $packet2nManifestPath | ConvertFrom-Json
-    if ($packet2nManifest.Packet -ne '2N-R5' -or $packet2nManifest.BackupDirectory -ne $packet2nBackupDirectory -or -not $packet2nManifest.CopyOnly -or -not $packet2nManifest.HardwareDisconnected) { throw 'Packet 2N-R5 manifest identity or safety fields differ' }
-    foreach ($packet2nFile in $packet2nFiles) {
-        $packet2nSource = Join-Path $packet2nCalibrationRoot "teleoperators\so_leader\$($packet2nFile.Name)"
-        $packet2nBackup = Join-Path $packet2nBackupDirectory $packet2nFile.Name
-        $packet2nManifestEntry = @($packet2nManifest.Files | Where-Object { $_.OriginalPath -eq $packet2nSource })
-        if ($packet2nManifestEntry.Count -ne 1 -or $packet2nManifestEntry[0].BackupPath -ne $packet2nBackup -or $packet2nManifestEntry[0].Sha256 -ne $packet2nFile.Sha256 -or [int64]$packet2nManifestEntry[0].Bytes -ne $packet2nFile.Bytes) { throw "manifest entry mismatch: $($packet2nFile.Name)" }
-        if (-not (Test-Path -LiteralPath $packet2nBackup -PathType Leaf)) { throw "missing calibration backup: $packet2nBackup" }
-        $packet2nBackupItem = Get-Item -LiteralPath $packet2nBackup
-        if ($packet2nBackupItem.Length -ne $packet2nFile.Bytes -or (Get-FileHash -LiteralPath $packet2nBackup -Algorithm SHA256).Hash -ne $packet2nFile.Sha256) { throw "calibration backup hash/size mismatch: $packet2nBackup" }
+    [pscustomobject]@{
+        Packet = '2N-R5'
+        BehaviorSha = 'cae57b59db1d9156be568aa4b216fc90701aa741'
+        Branch = 'fix/am1-elbow-commissioning'
+        CalibrationRoot = $packet2nCalibrationRoot
+        BackupDirectory = $packet2nBackupDirectory
+        ManifestPath = Join-Path $packet2nBackupDirectory 'manifest.json'
+        ManifestSha256 = 'B90DF72155C60996B4E2704E4A44ED1895BBAEA0C0A332DC24674EC3FA399B8A'
+        LogsDirectory = 'C:\Users\pickm\AlohaMini1Logs'
+        Files = @(
+            [pscustomobject]@{
+                Name = 'so101_leader_bi_left.json'
+                Side = 'left'
+                SourcePath = Join-Path $packet2nCalibrationRoot 'teleoperators\so_leader\so101_leader_bi_left.json'
+                BackupPath = Join-Path $packet2nBackupDirectory 'so101_leader_bi_left.json'
+                Bytes = [int64]960
+                Sha256 = '6F5D6126E84398D0621A26E74E4DF6678EBA7C14C62D343020610B4D5D8B3D8C'
+                SourceLastWriteTimeUtc = '2026-08-15T05:18:25.9699568Z'
+            },
+            [pscustomobject]@{
+                Name = 'so101_leader_bi_right.json'
+                Side = 'right'
+                SourcePath = Join-Path $packet2nCalibrationRoot 'teleoperators\so_leader\so101_leader_bi_right.json'
+                BackupPath = Join-Path $packet2nBackupDirectory 'so101_leader_bi_right.json'
+                Bytes = [int64]961
+                Sha256 = '65A301F20FC7DC96BD7FB5982E3670BF1A01F535953D7A253AB8D33A03646F11'
+                SourceLastWriteTimeUtc = '2026-08-15T05:19:53.2654429Z'
+            }
+        )
+        CalibrationArguments = @(
+            '.\examples\alohamini\calibrate_bi.py',
+            '--teleop.left_port', 'COM8',
+            '--teleop.right_port', 'COM7',
+            '--teleop.id', 'so101_leader_bi',
+            '--teleop.arm_profile', 'so-arm-5dof',
+            '--force_fresh_calibration'
+        )
+        MapArguments = @(
+            '.\examples\alohamini\teleoperate_bi.py',
+            '--no_robot',
+            '--robot.robot_model', 'alohamini1',
+            '--teleop.left_port', 'COM8',
+            '--teleop.right_port', 'COM7',
+            '--teleop.id', 'so101_leader_bi',
+            '--teleop.arm_profile', 'so-arm-5dof',
+            '--require_calibration_match',
+            '--duration_s', '12',
+            '--fps', '5',
+            '--start_paused',
+            '--no_keyboard',
+            '--no_rerun'
+        )
     }
 }
+
+function Assert-Packet2nR5ExactStringArray {
+    param(
+        [Parameter(Mandatory)] [object[]] $Actual,
+        [Parameter(Mandatory)] [object[]] $Expected,
+        [Parameter(Mandatory)] [string] $Label
+    )
+    if ($Actual.Count -ne $Expected.Count) { throw "$Label argument count mismatch" }
+    for ($packet2nIndex = 0; $packet2nIndex -lt $Expected.Count; $packet2nIndex++) {
+        if ([string]$Actual[$packet2nIndex] -cne [string]$Expected[$packet2nIndex]) {
+            throw "$Label argument mismatch at index $packet2nIndex"
+        }
+    }
+}
+
+function Assert-Packet2nR5ExactPropertySet {
+    param(
+        [Parameter(Mandatory)] [object] $Object,
+        [Parameter(Mandatory)] [string[]] $Expected,
+        [Parameter(Mandatory)] [string] $Label
+    )
+    $packet2nActual = @($Object.PSObject.Properties.Name)
+    if ($packet2nActual.Count -ne $Expected.Count -or @(Compare-Object -ReferenceObject $Expected -DifferenceObject $packet2nActual).Count -ne 0) {
+        throw "$Label property set mismatch"
+    }
+}
+
+function Assert-Packet2nR5CalibrationSchema {
+    param([Parameter(Mandatory)] [string] $Path)
+
+    $packet2nCalibration = Get-Content -Raw -LiteralPath $Path | ConvertFrom-Json
+    $packet2nJoints = @('shoulder_pan', 'shoulder_lift', 'elbow_flex', 'wrist_flex', 'wrist_roll', 'gripper')
+    $packet2nFields = @('id', 'drive_mode', 'homing_offset', 'range_min', 'range_max')
+    $packet2nIntegerTypes = @([byte], [sbyte], [int16], [uint16], [int32], [uint32], [int64], [uint64])
+    Assert-Packet2nR5ExactPropertySet -Object $packet2nCalibration -Expected $packet2nJoints -Label "$Path top level"
+    for ($packet2nIndex = 0; $packet2nIndex -lt $packet2nJoints.Count; $packet2nIndex++) {
+        $packet2nJointName = $packet2nJoints[$packet2nIndex]
+        $packet2nJoint = $packet2nCalibration.$packet2nJointName
+        Assert-Packet2nR5ExactPropertySet -Object $packet2nJoint -Expected $packet2nFields -Label "$Path $packet2nJointName"
+        foreach ($packet2nField in $packet2nFields) {
+            $packet2nValue = $packet2nJoint.$packet2nField
+            if ($null -eq $packet2nValue -or $packet2nIntegerTypes -notcontains $packet2nValue.GetType()) {
+                throw "$Path $packet2nJointName.$packet2nField must be an integer"
+            }
+        }
+        if ([int64]$packet2nJoint.id -ne $packet2nIndex + 1) { throw "$Path $packet2nJointName has wrong motor ID" }
+        if ([int64]$packet2nJoint.drive_mode -ne 0) { throw "$Path $packet2nJointName has wrong drive mode" }
+        if ([int64]$packet2nJoint.range_min -ge [int64]$packet2nJoint.range_max) { throw "$Path $packet2nJointName has invalid range" }
+    }
+    if ([int64]$packet2nCalibration.wrist_roll.range_min -ne 0 -or [int64]$packet2nCalibration.wrist_roll.range_max -ne 4095) {
+        throw "$Path wrist_roll must retain the full-turn 0..4095 range"
+    }
+}
+
+function Assert-Packet2nR5PostIdentityFreshness {
+    param(
+        [Parameter(Mandatory)] [object[]] $PreCalibrationFiles,
+        [Parameter(Mandatory)] [object[]] $PostCalibrationFiles,
+        [Parameter(Mandatory)] [datetime] $SessionStartedUtc
+    )
+
+    $packet2nDefinition = Get-Packet2nR5Definition
+    if ($PreCalibrationFiles.Count -ne 2 -or $PostCalibrationFiles.Count -ne 2) { throw 'calibration evidence must contain exactly two pre and two post identities' }
+    foreach ($packet2nFile in $packet2nDefinition.Files) {
+        $packet2nPre = @($PreCalibrationFiles | Where-Object { $_.Name -eq $packet2nFile.Name })
+        $packet2nPost = @($PostCalibrationFiles | Where-Object { $_.Name -eq $packet2nFile.Name })
+        if ($packet2nPre.Count -ne 1 -or $packet2nPost.Count -ne 1) { throw "missing or duplicate identity: $($packet2nFile.Name)" }
+        if ($packet2nPre[0].Path -ne $packet2nFile.SourcePath -or [int64]$packet2nPre[0].Bytes -ne $packet2nFile.Bytes -or $packet2nPre[0].Sha256 -ne $packet2nFile.Sha256 -or $packet2nPre[0].LastWriteTimeUtc -ne $packet2nFile.SourceLastWriteTimeUtc) {
+            throw "pre-calibration identity mismatch: $($packet2nFile.Name)"
+        }
+        if ($packet2nPost[0].Path -ne $packet2nFile.SourcePath -or [int64]$packet2nPost[0].Bytes -le 0) { throw "invalid post-calibration identity: $($packet2nFile.Name)" }
+        $packet2nPostTime = [datetime]$packet2nPost[0].LastWriteTimeUtc
+        if ($packet2nPostTime -le [datetime]$packet2nPre[0].LastWriteTimeUtc -or $packet2nPostTime -le $SessionStartedUtc) {
+            throw "post-calibration timestamp is stale: $($packet2nFile.Name)"
+        }
+    }
+    $packet2nOldHashes = @($packet2nDefinition.Files | ForEach-Object { $_.Sha256 })
+    if (@($PostCalibrationFiles | Where-Object { $_.Sha256 -in $packet2nOldHashes }).Count -ne 0) {
+        throw 'each post-calibration hash must differ from both old hashes'
+    }
+    if ($PostCalibrationFiles[0].Sha256 -eq $PostCalibrationFiles[1].Sha256) {
+        throw 'left and right post-calibration hashes must differ from each other'
+    }
+}
+
+function Assert-Packet2nR5CommonGuard {
+    $packet2nDefinition = Get-Packet2nR5Definition
+    $packet2nVerifierCommand = @(Get-Command -Name Get-Packet2nLeaderMapSummary -CommandType Function -ErrorAction SilentlyContinue)
+    if ($packet2nVerifierCommand.Count -ne 1) { throw 'strict Packet 2N leader-map verifier function is not loaded' }
+    $packet2nBranchOutput = @(& git branch --show-current 2>&1)
+    $packet2nBranchExit = $LASTEXITCODE
+    if ($packet2nBranchExit -ne 0 -or $packet2nBranchOutput.Count -ne 1 -or $packet2nBranchOutput[0].Trim() -ne $packet2nDefinition.Branch) {
+        throw "wrong Windows branch or Git branch query failed: exit=$packet2nBranchExit output=$($packet2nBranchOutput -join ' | ')"
+    }
+    $packet2nStatusOutput = @(& git status --porcelain=v1 --untracked-files=all -- . ':(exclude)docs/alohamini/alohamini.md' 2>&1)
+    $packet2nStatusExit = $LASTEXITCODE
+    if ($packet2nStatusExit -ne 0 -or $packet2nStatusOutput.Count -ne 0) {
+        throw "tracked paths other than this document are dirty or Git status failed: exit=$packet2nStatusExit output=$($packet2nStatusOutput -join ' | ')"
+    }
+    $packet2nMergeOutput = @(& git merge-base --is-ancestor $packet2nDefinition.BehaviorSha HEAD 2>&1)
+    $packet2nMergeExit = $LASTEXITCODE
+    if ($packet2nMergeExit -ne 0) {
+        throw "behavior baseline is not an ancestor or Git merge-base failed: exit=$packet2nMergeExit output=$($packet2nMergeOutput -join ' | ')"
+    }
+    $packet2nDiffOutput = @(& git diff --quiet $packet2nDefinition.BehaviorSha -- . ':(exclude)docs/alohamini/alohamini.md' 2>&1)
+    $packet2nDiffExit = $LASTEXITCODE
+    if ($packet2nDiffExit -eq 1) { throw 'a tracked path other than this document differs from the behavior baseline' }
+    if ($packet2nDiffExit -ne 0) { throw "Git baseline diff failed: exit=$packet2nDiffExit output=$($packet2nDiffOutput -join ' | ')" }
+
+    $packet2nOverrideNames = @(
+        'PYTHONPATH', 'PYTHONHOME', 'PYTHONSTARTUP', 'PYTHONUSERBASE',
+        'HF_LEROBOT_CALIBRATION', 'HF_LEROBOT_HOME', 'HF_HOME',
+        'HF_HUB_CACHE', 'HUGGINGFACE_HUB_CACHE'
+    )
+    foreach ($packet2nOverrideName in $packet2nOverrideNames) {
+        if (-not [string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable($packet2nOverrideName, 'Process'))) {
+            throw "Python/Hugging Face override must be unset: $packet2nOverrideName"
+        }
+    }
+
+    $packet2nPython = (Resolve-Path -LiteralPath '.\.venv\Scripts\python.exe').Path
+    $packet2nRootOutput = @(& $packet2nPython -c "from lerobot.utils.constants import HF_LEROBOT_CALIBRATION; print(HF_LEROBOT_CALIBRATION)" 2>&1)
+    $packet2nRootExit = $LASTEXITCODE
+    if ($packet2nRootExit -ne 0 -or $packet2nRootOutput.Count -ne 1 -or $packet2nRootOutput[0].Trim() -ne $packet2nDefinition.CalibrationRoot) {
+        throw "unexpected calibration root or Python failure: exit=$packet2nRootExit output=$($packet2nRootOutput -join ' | ')"
+    }
+
+    $packet2nCheckout = (Resolve-Path -LiteralPath '.').Path
+    $packet2nImportCommand = "import importlib, sys; sys.path.insert(0, 'examples/alohamini'); names=('calibrate_bi','teleoperate_bi','leader_client_utils','lerobot.teleoperators.bi_so_leader.bi_so_leader','lerobot.teleoperators.so_leader.so_leader'); modules=tuple(importlib.import_module(n) for n in names); print(*(m.__file__ for m in modules), sep='\n')"
+    $packet2nImportOutput = @(& $packet2nPython -c $packet2nImportCommand 2>&1)
+    $packet2nImportExit = $LASTEXITCODE
+    if ($packet2nImportExit -ne 0) { throw "reviewed import check failed: exit=$packet2nImportExit output=$($packet2nImportOutput -join ' | ')" }
+    $packet2nExpectedImports = @(
+        (Join-Path $packet2nCheckout 'examples\alohamini\calibrate_bi.py'),
+        (Join-Path $packet2nCheckout 'examples\alohamini\teleoperate_bi.py'),
+        (Join-Path $packet2nCheckout 'examples\alohamini\leader_client_utils.py'),
+        (Join-Path $packet2nCheckout 'src\lerobot\teleoperators\bi_so_leader\bi_so_leader.py'),
+        (Join-Path $packet2nCheckout 'src\lerobot\teleoperators\so_leader\so_leader.py')
+    )
+    if ($packet2nImportOutput.Count -ne $packet2nExpectedImports.Count) { throw 'reviewed import count mismatch' }
+    $packet2nCheckoutPrefix = $packet2nCheckout.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+    for ($packet2nIndex = 0; $packet2nIndex -lt $packet2nExpectedImports.Count; $packet2nIndex++) {
+        $packet2nImportPath = ([string]$packet2nImportOutput[$packet2nIndex]).Trim()
+        $packet2nActualImport = (Resolve-Path -LiteralPath $packet2nImportPath).Path
+        $packet2nExpectedImport = (Resolve-Path -LiteralPath $packet2nExpectedImports[$packet2nIndex]).Path
+        if (-not $packet2nActualImport.StartsWith($packet2nCheckoutPrefix, [StringComparison]::OrdinalIgnoreCase) -or -not $packet2nActualImport.Equals($packet2nExpectedImport, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "reviewed import path mismatch: $packet2nActualImport"
+        }
+    }
+
+    if (-not (Test-Path -LiteralPath $packet2nDefinition.ManifestPath -PathType Leaf)) { throw "missing manifest: $($packet2nDefinition.ManifestPath)" }
+    if ((Get-FileHash -LiteralPath $packet2nDefinition.ManifestPath -Algorithm SHA256).Hash -ne $packet2nDefinition.ManifestSha256) { throw 'manifest SHA-256 mismatch' }
+    $packet2nManifest = Get-Content -Raw -LiteralPath $packet2nDefinition.ManifestPath | ConvertFrom-Json -DateKind String
+    if ($packet2nManifest.Packet -ne $packet2nDefinition.Packet -or $packet2nManifest.BackupDirectory -ne $packet2nDefinition.BackupDirectory -or -not $packet2nManifest.CopyOnly -or -not $packet2nManifest.HardwareDisconnected -or $packet2nManifest.Files.Count -ne 2) {
+        throw 'manifest identity or safety fields differ'
+    }
+    foreach ($packet2nFile in $packet2nDefinition.Files) {
+        $packet2nManifestEntry = @($packet2nManifest.Files | Where-Object { $_.OriginalPath -eq $packet2nFile.SourcePath })
+        if ($packet2nManifestEntry.Count -ne 1 -or $packet2nManifestEntry[0].BackupPath -ne $packet2nFile.BackupPath -or $packet2nManifestEntry[0].Sha256 -ne $packet2nFile.Sha256 -or [int64]$packet2nManifestEntry[0].Bytes -ne $packet2nFile.Bytes -or $packet2nManifestEntry[0].SourceLastWriteTimeUtc -ne $packet2nFile.SourceLastWriteTimeUtc) {
+            throw "exact manifest entry mismatch: $($packet2nFile.Name)"
+        }
+        if (-not (Test-Path -LiteralPath $packet2nFile.BackupPath -PathType Leaf)) { throw "missing backup: $($packet2nFile.BackupPath)" }
+        $packet2nBackupItem = Get-Item -LiteralPath $packet2nFile.BackupPath
+        if ($packet2nBackupItem.Length -ne $packet2nFile.Bytes -or (Get-FileHash -LiteralPath $packet2nFile.BackupPath -Algorithm SHA256).Hash -ne $packet2nFile.Sha256) {
+            throw "backup hash/size mismatch: $($packet2nFile.BackupPath)"
+        }
+    }
+}
+
 function Assert-Packet2nR5PreCalibrationGuard {
     Assert-Packet2nR5CommonGuard
-    $packet2nCalibrationRoot = 'C:\Users\pickm\.cache\huggingface\lerobot\calibration'
-    $packet2nFiles = @(
-        [pscustomobject]@{ Name = 'so101_leader_bi_left.json'; Bytes = 960; Sha256 = '6F5D6126E84398D0621A26E74E4DF6678EBA7C14C62D343020610B4D5D8B3D8C' },
-        [pscustomobject]@{ Name = 'so101_leader_bi_right.json'; Bytes = 961; Sha256 = '65A301F20FC7DC96BD7FB5982E3670BF1A01F535953D7A253AB8D33A03646F11' }
-    )
-    foreach ($packet2nFile in $packet2nFiles) {
-        $packet2nSource = Join-Path $packet2nCalibrationRoot "teleoperators\so_leader\$($packet2nFile.Name)"
-        if (-not (Test-Path -LiteralPath $packet2nSource -PathType Leaf)) { throw "missing pre-calibration source: $packet2nSource" }
-        $packet2nSourceItem = Get-Item -LiteralPath $packet2nSource
-        if ($packet2nSourceItem.Length -ne $packet2nFile.Bytes -or (Get-FileHash -LiteralPath $packet2nSource -Algorithm SHA256).Hash -ne $packet2nFile.Sha256) { throw "pre-calibration source hash/size mismatch: $packet2nSource" }
-    }
-}
-function Save-Packet2nR5PostCalibrationEvidence {
-    Assert-Packet2nR5CommonGuard
-    $packet2nCalibrationRoot = 'C:\Users\pickm\.cache\huggingface\lerobot\calibration'
-    $packet2nManifestPath = 'C:\Users\pickm\AlohaMini1Backups\packet2n-r5-20260822-121722-7941f445-9587-4345-8e2f-edd54ca750f6\manifest.json'
-    $packet2nManifest = Get-Content -Raw -LiteralPath $packet2nManifestPath | ConvertFrom-Json
-    $packet2nNames = @('so101_leader_bi_left.json', 'so101_leader_bi_right.json')
-    $script:packet2nR5PostCalibrationEvidence = @(
-        foreach ($packet2nName in $packet2nNames) {
-            $packet2nSource = Join-Path $packet2nCalibrationRoot "teleoperators\so_leader\$packet2nName"
-            if (-not (Test-Path -LiteralPath $packet2nSource -PathType Leaf)) { throw "missing post-calibration source: $packet2nSource" }
-            $packet2nSourceItem = Get-Item -LiteralPath $packet2nSource
-            $packet2nManifestEntry = @($packet2nManifest.Files | Where-Object { $_.OriginalPath -eq $packet2nSource })
-            if ($packet2nManifestEntry.Count -ne 1 -or $packet2nSourceItem.LastWriteTimeUtc -le [datetime]$packet2nManifestEntry[0].SourceLastWriteTimeUtc -or $packet2nSourceItem.LastWriteTimeUtc -le $packet2nR5SessionStartedUtc) { throw "post-calibration rewrite was not proven: $packet2nSource" }
-            [pscustomobject]@{ Name = $packet2nName; Path = $packet2nSource; Bytes = [int64]$packet2nSourceItem.Length; Sha256 = (Get-FileHash -LiteralPath $packet2nSource -Algorithm SHA256).Hash; LastWriteTimeUtc = $packet2nSourceItem.LastWriteTimeUtc.ToString('o') }
+    $packet2nDefinition = Get-Packet2nR5Definition
+    if (-not $script:packet2nR5SessionId -or $null -eq $script:packet2nR5SessionStartedUtc) { throw 'missing calibration session identity' }
+    $script:packet2nR5PreCalibrationEvidence = @(
+        foreach ($packet2nFile in $packet2nDefinition.Files) {
+            if (-not (Test-Path -LiteralPath $packet2nFile.SourcePath -PathType Leaf)) { throw "missing pre-calibration source: $($packet2nFile.SourcePath)" }
+            Assert-Packet2nR5CalibrationSchema -Path $packet2nFile.SourcePath
+            $packet2nSourceItem = Get-Item -LiteralPath $packet2nFile.SourcePath
+            $packet2nSourceHash = (Get-FileHash -LiteralPath $packet2nFile.SourcePath -Algorithm SHA256).Hash
+            if ($packet2nSourceItem.Length -ne $packet2nFile.Bytes -or $packet2nSourceHash -ne $packet2nFile.Sha256 -or $packet2nSourceItem.LastWriteTimeUtc.ToString('o') -ne $packet2nFile.SourceLastWriteTimeUtc) {
+                throw "pre-calibration hash/size/mtime mismatch: $($packet2nFile.SourcePath)"
+            }
+            [pscustomobject]@{
+                Name = $packet2nFile.Name
+                Path = $packet2nFile.SourcePath
+                Bytes = [int64]$packet2nSourceItem.Length
+                Sha256 = $packet2nSourceHash
+                LastWriteTimeUtc = $packet2nSourceItem.LastWriteTimeUtc.ToString('o')
+            }
         }
     )
-    if ($script:packet2nR5PostCalibrationEvidence.Count -ne 2) { throw 'post-calibration evidence did not capture both sources' }
-    $packet2nOldHashes = @('6F5D6126E84398D0621A26E74E4DF6678EBA7C14C62D343020610B4D5D8B3D8C', '65A301F20FC7DC96BD7FB5982E3670BF1A01F535953D7A253AB8D33A03646F11')
-    if (@($script:packet2nR5PostCalibrationEvidence | Where-Object { $_.Sha256 -in $packet2nOldHashes }).Count -ne 0 -or $script:packet2nR5PostCalibrationEvidence[0].Sha256 -eq $script:packet2nR5PostCalibrationEvidence[1].Sha256) { throw 'post-calibration hashes do not prove two fresh logical calibrations' }
-    if (-not $packet2nR5SessionId -or -not $packet2nR5SessionStartedUtc) { throw 'missing calibration session identity' }
-    $script:packet2nR5EvidencePath = Join-Path 'C:\Users\pickm\AlohaMini1Logs' "packet2n-r5-evidence-$packet2nR5SessionId.json"
-    [pscustomobject]@{ SessionId = $packet2nR5SessionId; SessionStartedUtc = $packet2nR5SessionStartedUtc.ToString('o'); Files = $script:packet2nR5PostCalibrationEvidence } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $script:packet2nR5EvidencePath -Encoding utf8 -NoNewline
-    $script:packet2nR5EvidenceSha256 = (Get-FileHash -LiteralPath $script:packet2nR5EvidencePath -Algorithm SHA256).Hash
 }
-function Assert-Packet2nR5PostCalibrationGuard {
-    Assert-Packet2nR5CommonGuard
-    if ($null -eq $script:packet2nR5PostCalibrationEvidence -or $script:packet2nR5PostCalibrationEvidence.Count -ne 2) { throw 'missing same-session post-calibration evidence' }
-    if (-not $script:packet2nR5EvidencePath -or -not $script:packet2nR5EvidenceSha256 -or -not (Test-Path -LiteralPath $script:packet2nR5EvidencePath -PathType Leaf) -or (Get-FileHash -LiteralPath $script:packet2nR5EvidencePath -Algorithm SHA256).Hash -ne $script:packet2nR5EvidenceSha256) { throw 'persisted post-calibration evidence is missing or changed' }
-    $packet2nCalibrationRoot = 'C:\Users\pickm\.cache\huggingface\lerobot\calibration'
-    $packet2nManifestPath = 'C:\Users\pickm\AlohaMini1Backups\packet2n-r5-20260822-121722-7941f445-9587-4345-8e2f-edd54ca750f6\manifest.json'
-    $packet2nManifest = Get-Content -Raw -LiteralPath $packet2nManifestPath | ConvertFrom-Json
-    $packet2nNames = @('so101_leader_bi_left.json', 'so101_leader_bi_right.json')
-    foreach ($packet2nName in $packet2nNames) {
-        $packet2nSource = Join-Path $packet2nCalibrationRoot "teleoperators\so_leader\$packet2nName"
-        $packet2nEvidence = @($script:packet2nR5PostCalibrationEvidence | Where-Object { $_.Name -eq $packet2nName })
-        $packet2nManifestEntry = @($packet2nManifest.Files | Where-Object { $_.OriginalPath -eq $packet2nSource })
-        if ($packet2nEvidence.Count -ne 1 -or $packet2nManifestEntry.Count -ne 1 -or $packet2nEvidence[0].Path -ne $packet2nSource -or -not (Test-Path -LiteralPath $packet2nSource -PathType Leaf)) { throw "invalid post-calibration evidence: $packet2nName" }
-        $packet2nSourceItem = Get-Item -LiteralPath $packet2nSource
-        $packet2nSourceHash = (Get-FileHash -LiteralPath $packet2nSource -Algorithm SHA256).Hash
-        if ($packet2nSourceItem.LastWriteTimeUtc -le [datetime]$packet2nManifestEntry[0].SourceLastWriteTimeUtc -or $packet2nSourceItem.Length -ne [int64]$packet2nEvidence[0].Bytes -or $packet2nSourceHash -ne $packet2nEvidence[0].Sha256 -or $packet2nSourceItem.LastWriteTimeUtc.ToString('o') -ne $packet2nEvidence[0].LastWriteTimeUtc) { throw "post-calibration source changed after capture: $packet2nSource" }
+
+function Get-Packet2nR5CalibrationTranscriptHeader {
+    param(
+        [Parameter(Mandatory)] [string] $SessionId,
+        [Parameter(Mandatory)] [string] $SessionStartedUtc,
+        [Parameter(Mandatory)] [string] $BehaviorSha,
+        [Parameter(Mandatory)] [string] $Executable,
+        [Parameter(Mandatory)] [object[]] $Arguments
+    )
+    $packet2nArgumentsJson = ConvertTo-Json -InputObject @($Arguments) -Compress
+    @(
+        "PACKET2N_R5_SESSION_ID=$SessionId",
+        "PACKET2N_R5_SESSION_STARTED_UTC=$SessionStartedUtc",
+        "PACKET2N_R5_BEHAVIOR_SHA=$BehaviorSha",
+        "PACKET2N_R5_CALIBRATION_EXECUTABLE=$Executable",
+        "PACKET2N_R5_CALIBRATION_ARGS_JSON=$packet2nArgumentsJson",
+        'PACKET2N_R5_CALIBRATION_ID=so101_leader_bi',
+        'PACKET2N_R5_CALIBRATION_PROFILE=so-arm-5dof',
+        'PACKET2N_R5_CALIBRATION_LEFT_PORT=COM8',
+        'PACKET2N_R5_CALIBRATION_RIGHT_PORT=COM7'
+    )
+}
+
+function Assert-Packet2nR5PersistedEvidence {
+    param(
+        [Parameter(Mandatory)] [string] $EvidencePath,
+        [Parameter(Mandatory)] [string] $EvidenceSha256
+    )
+
+    $packet2nDefinition = Get-Packet2nR5Definition
+    if (-not (Test-Path -LiteralPath $EvidencePath -PathType Leaf) -or (Get-FileHash -LiteralPath $EvidencePath -Algorithm SHA256).Hash -ne $EvidenceSha256) {
+        throw 'persisted evidence is missing or its SHA-256 changed'
+    }
+    $packet2nEvidence = Get-Content -Raw -LiteralPath $EvidencePath | ConvertFrom-Json -DateKind String
+    $packet2nEvidenceFields = @(
+        'Packet', 'SessionId', 'SessionStartedUtc', 'BehaviorSha', 'CalibrationExecutable',
+        'CalibrationArguments', 'CalibrationTranscriptPath', 'CalibrationTranscriptSha256',
+        'PreCalibrationFiles', 'PostCalibrationFiles'
+    )
+    Assert-Packet2nR5ExactPropertySet -Object $packet2nEvidence -Expected $packet2nEvidenceFields -Label 'persisted evidence'
+    $packet2nParsedGuid = [guid]::Empty
+    if ($packet2nEvidence.Packet -ne $packet2nDefinition.Packet -or -not [guid]::TryParse($packet2nEvidence.SessionId, [ref]$packet2nParsedGuid) -or $packet2nEvidence.BehaviorSha -ne $packet2nDefinition.BehaviorSha) {
+        throw 'persisted evidence packet/session/behavior identity mismatch'
+    }
+    $packet2nSessionStartedUtc = [datetime]$packet2nEvidence.SessionStartedUtc
+    $packet2nExpectedEvidencePath = Join-Path $packet2nDefinition.LogsDirectory "packet2n-r5-evidence-$($packet2nEvidence.SessionId).json"
+    if ($EvidencePath -ne $packet2nExpectedEvidencePath) { throw 'persisted evidence path is not bound to its session' }
+    $packet2nExpectedExecutable = (Resolve-Path -LiteralPath '.\.venv\Scripts\python.exe').Path
+    if ($packet2nEvidence.CalibrationExecutable -ne $packet2nExpectedExecutable) { throw 'persisted calibration executable mismatch' }
+    Assert-Packet2nR5ExactStringArray -Actual @($packet2nEvidence.CalibrationArguments) -Expected $packet2nDefinition.CalibrationArguments -Label 'persisted calibration'
+
+    $packet2nExpectedTranscriptPath = Join-Path $packet2nDefinition.LogsDirectory "packet2n-r5-calibration-$($packet2nEvidence.SessionId).log"
+    if ($packet2nEvidence.CalibrationTranscriptPath -ne $packet2nExpectedTranscriptPath -or -not (Test-Path -LiteralPath $packet2nExpectedTranscriptPath -PathType Leaf)) {
+        throw 'calibration transcript path is missing or not session-bound'
+    }
+    $packet2nTranscriptHash = (Get-FileHash -LiteralPath $packet2nExpectedTranscriptPath -Algorithm SHA256).Hash
+    if ($packet2nTranscriptHash -ne $packet2nEvidence.CalibrationTranscriptSha256) { throw 'calibration transcript SHA-256 mismatch' }
+    $packet2nTranscriptLines = @(Get-Content -LiteralPath $packet2nExpectedTranscriptPath)
+    $packet2nExpectedHeader = Get-Packet2nR5CalibrationTranscriptHeader -SessionId $packet2nEvidence.SessionId -SessionStartedUtc $packet2nEvidence.SessionStartedUtc -BehaviorSha $packet2nEvidence.BehaviorSha -Executable $packet2nEvidence.CalibrationExecutable -Arguments @($packet2nEvidence.CalibrationArguments)
+    if ($packet2nTranscriptLines.Count -le $packet2nExpectedHeader.Count) { throw 'calibration transcript is incomplete' }
+    for ($packet2nIndex = 0; $packet2nIndex -lt $packet2nExpectedHeader.Count; $packet2nIndex++) {
+        if ($packet2nTranscriptLines[$packet2nIndex] -cne $packet2nExpectedHeader[$packet2nIndex]) { throw "calibration transcript header mismatch at line $($packet2nIndex + 1)" }
+    }
+    if (@($packet2nTranscriptLines | Where-Object { $_ -eq 'CALIBRATION_EXIT_CODE=0' }).Count -ne 1 -or $packet2nTranscriptLines[-1] -ne 'CALIBRATION_EXIT_CODE=0') {
+        throw 'calibration transcript does not end in exactly one zero exit record'
+    }
+
+    foreach ($packet2nFile in $packet2nDefinition.Files) {
+        $packet2nPre = @($packet2nEvidence.PreCalibrationFiles | Where-Object { $_.Name -eq $packet2nFile.Name })
+        $packet2nPost = @($packet2nEvidence.PostCalibrationFiles | Where-Object { $_.Name -eq $packet2nFile.Name })
+        if ($packet2nPre.Count -ne 1 -or $packet2nPost.Count -ne 1) { throw "persisted source identity missing or duplicated: $($packet2nFile.Name)" }
+        if (-not (Test-Path -LiteralPath $packet2nFile.SourcePath -PathType Leaf)) { throw "current calibration source is missing: $($packet2nFile.SourcePath)" }
+        Assert-Packet2nR5CalibrationSchema -Path $packet2nFile.SourcePath
+        $packet2nCurrentItem = Get-Item -LiteralPath $packet2nFile.SourcePath
+        $packet2nCurrentHash = (Get-FileHash -LiteralPath $packet2nFile.SourcePath -Algorithm SHA256).Hash
+        if ($packet2nPost[0].Path -ne $packet2nFile.SourcePath -or [int64]$packet2nPost[0].Bytes -ne $packet2nCurrentItem.Length -or $packet2nPost[0].Sha256 -ne $packet2nCurrentHash -or $packet2nPost[0].LastWriteTimeUtc -ne $packet2nCurrentItem.LastWriteTimeUtc.ToString('o')) {
+            throw "current calibration source differs from persisted post identity: $($packet2nFile.Name)"
+        }
+    }
+    Assert-Packet2nR5PostIdentityFreshness -PreCalibrationFiles @($packet2nEvidence.PreCalibrationFiles) -PostCalibrationFiles @($packet2nEvidence.PostCalibrationFiles) -SessionStartedUtc $packet2nSessionStartedUtc
+
+    $packet2nLeftIdentity = @($packet2nEvidence.PostCalibrationFiles | Where-Object { $_.Name -eq 'so101_leader_bi_left.json' })[0]
+    $packet2nRightIdentity = @($packet2nEvidence.PostCalibrationFiles | Where-Object { $_.Name -eq 'so101_leader_bi_right.json' })[0]
+    [pscustomobject]@{
+        SessionId = $packet2nEvidence.SessionId
+        BehaviorSha = $packet2nEvidence.BehaviorSha
+        EvidencePath = $EvidencePath
+        EvidenceSha256 = $EvidenceSha256
+        TranscriptPath = $packet2nExpectedTranscriptPath
+        TranscriptSha256 = $packet2nTranscriptHash
+        LeftIdentityJson = ($packet2nLeftIdentity | Select-Object Name, Path, Bytes, Sha256, LastWriteTimeUtc | ConvertTo-Json -Compress)
+        RightIdentityJson = ($packet2nRightIdentity | Select-Object Name, Path, Bytes, Sha256, LastWriteTimeUtc | ConvertTo-Json -Compress)
     }
 }
+
+function Save-Packet2nR5PostCalibrationEvidence {
+    Assert-Packet2nR5CommonGuard
+    $packet2nDefinition = Get-Packet2nR5Definition
+    if ($script:packet2nR5PreCalibrationEvidence.Count -ne 2 -or -not $script:packet2nR5CalibrationTranscriptPath) { throw 'missing same-session pre-calibration or transcript state' }
+
+    $packet2nPostCalibrationFiles = @(
+        foreach ($packet2nFile in $packet2nDefinition.Files) {
+            if (-not (Test-Path -LiteralPath $packet2nFile.SourcePath -PathType Leaf)) { throw "missing post-calibration source: $($packet2nFile.SourcePath)" }
+            Assert-Packet2nR5CalibrationSchema -Path $packet2nFile.SourcePath
+            $packet2nSourceItem = Get-Item -LiteralPath $packet2nFile.SourcePath
+            [pscustomobject]@{
+                Name = $packet2nFile.Name
+                Path = $packet2nFile.SourcePath
+                Bytes = [int64]$packet2nSourceItem.Length
+                Sha256 = (Get-FileHash -LiteralPath $packet2nFile.SourcePath -Algorithm SHA256).Hash
+                LastWriteTimeUtc = $packet2nSourceItem.LastWriteTimeUtc.ToString('o')
+            }
+        }
+    )
+    Assert-Packet2nR5PostIdentityFreshness -PreCalibrationFiles @($script:packet2nR5PreCalibrationEvidence) -PostCalibrationFiles $packet2nPostCalibrationFiles -SessionStartedUtc $script:packet2nR5SessionStartedUtc
+
+    $packet2nTranscriptLines = @(Get-Content -LiteralPath $script:packet2nR5CalibrationTranscriptPath)
+    if ($packet2nTranscriptLines[-1] -ne 'CALIBRATION_EXIT_CODE=0') { throw 'calibration transcript lacks the zero-exit terminator' }
+    $packet2nTranscriptHash = (Get-FileHash -LiteralPath $script:packet2nR5CalibrationTranscriptPath -Algorithm SHA256).Hash
+    $script:packet2nR5EvidencePath = Join-Path $packet2nDefinition.LogsDirectory "packet2n-r5-evidence-$($script:packet2nR5SessionId).json"
+    if (Test-Path -LiteralPath $script:packet2nR5EvidencePath) { throw "refusing to overwrite evidence: $($script:packet2nR5EvidencePath)" }
+    [pscustomobject]@{
+        Packet = $packet2nDefinition.Packet
+        SessionId = $script:packet2nR5SessionId
+        SessionStartedUtc = $script:packet2nR5SessionStartedUtc.ToString('o')
+        BehaviorSha = $packet2nDefinition.BehaviorSha
+        CalibrationExecutable = $script:packet2nR5CalibrationExecutable
+        CalibrationArguments = @($script:packet2nR5CalibrationArguments)
+        CalibrationTranscriptPath = $script:packet2nR5CalibrationTranscriptPath
+        CalibrationTranscriptSha256 = $packet2nTranscriptHash
+        PreCalibrationFiles = @($script:packet2nR5PreCalibrationEvidence)
+        PostCalibrationFiles = @($packet2nPostCalibrationFiles)
+    } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $script:packet2nR5EvidencePath -Encoding utf8 -NoNewline
+    $script:packet2nR5EvidenceSha256 = (Get-FileHash -LiteralPath $script:packet2nR5EvidencePath -Algorithm SHA256).Hash
+    $null = Assert-Packet2nR5PersistedEvidence -EvidencePath $script:packet2nR5EvidencePath -EvidenceSha256 $script:packet2nR5EvidenceSha256
+}
+
+function Get-Packet2nR5MapMetadataLines {
+    param([Parameter(Mandatory)] [object] $Context)
+    @(
+        "PACKET2N_R5_SESSION_ID=$($Context.SessionId)",
+        "PACKET2N_R5_BEHAVIOR_SHA=$($Context.BehaviorSha)",
+        'PACKET2N_R5_GUARD_SUCCESS=1',
+        "PACKET2N_R5_EVIDENCE_PATH=$($Context.EvidencePath)",
+        "PACKET2N_R5_EVIDENCE_SHA256=$($Context.EvidenceSha256)",
+        "PACKET2N_R5_TRANSCRIPT_PATH=$($Context.TranscriptPath)",
+        "PACKET2N_R5_TRANSCRIPT_SHA256=$($Context.TranscriptSha256)",
+        "PACKET2N_R5_POST_SOURCE_LEFT_JSON=$($Context.LeftIdentityJson)",
+        "PACKET2N_R5_POST_SOURCE_RIGHT_JSON=$($Context.RightIdentityJson)"
+    )
+}
+
+function Assert-Packet2nR5MapMetadata {
+    param(
+        [Parameter(Mandatory)] [string[]] $Lines,
+        [Parameter(Mandatory)] [string[]] $ExpectedLines,
+        [Parameter(Mandatory)] [string] $Path
+    )
+    $packet2nActualMetadata = @($Lines | Where-Object { $_.StartsWith('PACKET2N_R5_', [StringComparison]::Ordinal) })
+    if ($packet2nActualMetadata.Count -ne $ExpectedLines.Count) { throw "Packet 2N-R5 metadata count mismatch in $Path" }
+    foreach ($packet2nExpectedLine in $ExpectedLines) {
+        if (@($packet2nActualMetadata | Where-Object { $_ -ceq $packet2nExpectedLine }).Count -ne 1) {
+            throw "missing, duplicate, or mismatched Packet 2N-R5 metadata in $Path"
+        }
+    }
+    if (@($packet2nActualMetadata | Where-Object { $_ -cnotin $ExpectedLines }).Count -ne 0) {
+        throw "unexpected Packet 2N-R5 metadata in $Path"
+    }
+}
+
+function Assert-Packet2nR5PostCalibrationGuard {
+    Assert-Packet2nR5CommonGuard
+    if (-not $script:packet2nR5EvidencePath -or -not $script:packet2nR5EvidenceSha256 -or -not $script:packet2nR5SessionId) {
+        throw 'missing same-session persisted evidence binding'
+    }
+    $packet2nContext = Assert-Packet2nR5PersistedEvidence -EvidencePath $script:packet2nR5EvidencePath -EvidenceSha256 $script:packet2nR5EvidenceSha256
+    if ($packet2nContext.SessionId -ne $script:packet2nR5SessionId) { throw 'persisted evidence belongs to a different session' }
+    $packet2nContext
+}
+
+# PACKET2N_R5_CALIBRATION_INVOCATION_START — hardware authorization required beyond this line.
+$packet2nDefinition = Get-Packet2nR5Definition
+New-Item -ItemType Directory -Force -Path $packet2nDefinition.LogsDirectory | Out-Null
+$script:packet2nR5SessionId = [guid]::NewGuid().ToString()
+$script:packet2nR5SessionStartedUtc = [datetime]::UtcNow
+$script:packet2nR5CalibrationExecutable = (Resolve-Path -LiteralPath '.\.venv\Scripts\python.exe').Path
+$script:packet2nR5CalibrationArguments = @(
+    '.\examples\alohamini\calibrate_bi.py',
+    '--teleop.left_port', 'COM8',
+    '--teleop.right_port', 'COM7',
+    '--teleop.id', 'so101_leader_bi',
+    '--teleop.arm_profile', 'so-arm-5dof',
+    '--force_fresh_calibration'
+)
+Assert-Packet2nR5ExactStringArray -Actual $script:packet2nR5CalibrationArguments -Expected $packet2nDefinition.CalibrationArguments -Label 'calibration'
 Assert-Packet2nR5PreCalibrationGuard
-$packet2nR5SessionId = [guid]::NewGuid().ToString()
-$packet2nR5SessionStartedUtc = [datetime]::UtcNow
-$packet2nR5CalibrationLog = Join-Path 'C:\Users\pickm\AlohaMini1Logs' "packet2n-r5-calibration-$packet2nR5SessionId.log"
-& .\.venv\Scripts\python.exe `
-  .\examples\alohamini\calibrate_bi.py `
-  --teleop.left_port COM8 `
-  --teleop.right_port COM7 `
-  --teleop.id so101_leader_bi `
-  --teleop.arm_profile so-arm-5dof `
-  --force_fresh_calibration 2>&1 | Tee-Object -FilePath $packet2nR5CalibrationLog
-if ($LASTEXITCODE -ne 0) { throw "corrected-port full recalibration failed with $LASTEXITCODE" }
+
+$script:packet2nR5CalibrationTranscriptPath = Join-Path $packet2nDefinition.LogsDirectory "packet2n-r5-calibration-$($script:packet2nR5SessionId).log"
+if (Test-Path -LiteralPath $script:packet2nR5CalibrationTranscriptPath) { throw "refusing to overwrite transcript: $($script:packet2nR5CalibrationTranscriptPath)" }
+$packet2nTranscriptHeader = Get-Packet2nR5CalibrationTranscriptHeader -SessionId $script:packet2nR5SessionId -SessionStartedUtc $script:packet2nR5SessionStartedUtc.ToString('o') -BehaviorSha $packet2nDefinition.BehaviorSha -Executable $script:packet2nR5CalibrationExecutable -Arguments $script:packet2nR5CalibrationArguments
+$packet2nTranscriptHeader | Set-Content -LiteralPath $script:packet2nR5CalibrationTranscriptPath -Encoding utf8
+
+$packet2nR5CalibrationInvocationArguments = @($script:packet2nR5CalibrationArguments)
+& $script:packet2nR5CalibrationExecutable @packet2nR5CalibrationInvocationArguments 2>&1 | Tee-Object -FilePath $script:packet2nR5CalibrationTranscriptPath -Append
+$packet2nR5CalibrationExitCode = $LASTEXITCODE
+"CALIBRATION_EXIT_CODE=$packet2nR5CalibrationExitCode" | Tee-Object -FilePath $script:packet2nR5CalibrationTranscriptPath -Append
+if ($packet2nR5CalibrationExitCode -ne 0) { throw "corrected-port full recalibration failed with $packet2nR5CalibrationExitCode" }
 Save-Packet2nR5PostCalibrationEvidence
 ```
 
-After a zero-exit full recalibration, the workflow requires both current source `LastWriteTimeUtc` values to be strictly newer than their manifest `SourceLastWriteTimeUtc` values, proving the two logical JSONs were rewritten rather than silently reused. It then captures exactly the pinned-root, two-file post-calibration paths, byte counts, SHA-256 values, and UTC last-write times into the session-local `$script:packet2nR5PostCalibrationEvidence`. The calibration and both marked no-robot blocks are one guarded workflow: run them in the same PowerShell session and in the printed order. Each no-robot block reruns common branch/source-baseline/root/manifest/backup checks and then requires that session evidence and exact current agreement with its post-calibration hash, size, and UTC last-write time. A fresh session, missing capture, unchanged pre-calibration timestamp, stale evidence, or later calibration-source mutation fails before creating a robot/leader connection; the post-calibration sources are intentionally not compared to their pre-calibration hashes. The runs construct no robot client, send no ZMQ request, and must never be used to start follower motion, Pi communication, or startup synchronization. Move only the named physical leader after its Enter prompt; keep the other leader still. Stop immediately for any calibration prompt, unexpected powered motion, resistance, sound, heat, cable strain, communication failure, loss of the clear stop path, follower power/movement, or evidence that a robot/ZMQ connection was constructed.
+This workflow captures the exact two pre-calibration source hashes, byte counts, and timestamps and requires each pre timestamp to equal the pinned manifest. After a zero-exit forced run, both current JSONs must pass the exact six-joint/five-field schema, have IDs `1..6`, `drive_mode=0`, integer values, valid ranges, and `wrist_roll=0..4095`. Each post timestamp must be newer than both the session start and its exact pre timestamp; each post hash must differ from **both** old hashes and from the other post hash. The transcript starts with the session, behavior SHA, exact executable/argument array, ID/profile, and corrected ports; it ends in exactly one `CALIBRATION_EXIT_CODE=0` and is hashed. The persisted evidence JSON binds the same session/start, behavior SHA, exact arguments, transcript path/hash, and both pre/post identities, and is itself hashed.
 
-**Future corrected-port physical-left-only no-robot run (`COM8`).**
+Before each no-robot connection, the guard revalidates the branch/baseline/imports/manifest/backups, persisted evidence hash and schema, transcript hash/header/exit, and both current calibration identities. A stale, unchanged, equal, swapped, malformed, missing, or later-mutated source fails before connection.
 
-```powershell
-$ErrorActionPreference = 'Stop'
-Assert-Packet2nR5PostCalibrationGuard
-$packet2nCorrectedMapDir = 'C:\Users\pickm\AlohaMini1Logs'
-New-Item -ItemType Directory -Force -Path $packet2nCorrectedMapDir | Out-Null
-$packet2nCorrectedTimestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-$packet2nCorrectedPhysicalLeftLog = Join-Path $packet2nCorrectedMapDir "packet2n-corrected-port-physical-left-only-$packet2nCorrectedTimestamp.log"
-'MAP_RUN=PHYSICAL_LEFT_ONLY' | Tee-Object -FilePath $packet2nCorrectedPhysicalLeftLog
-& .\.venv\Scripts\python.exe `
-  .\examples\alohamini\teleoperate_bi.py `
-  --no_robot `
-  --robot.robot_model alohamini1 `
-  --teleop.left_port COM8 `
-  --teleop.right_port COM7 `
-  --teleop.id so101_leader_bi `
-  --teleop.arm_profile so-arm-5dof `
-  --require_calibration_match `
-  --duration_s 12 `
-  --fps 5 `
-  --start_paused `
-  --no_keyboard `
-  --no_rerun 2>&1 | Tee-Object -FilePath $packet2nCorrectedPhysicalLeftLog -Append
-$packet2nCorrectedPhysicalLeftExitCode = $LASTEXITCODE
-"CLIENT_EXIT_CODE=$packet2nCorrectedPhysicalLeftExitCode" | Tee-Object -FilePath $packet2nCorrectedPhysicalLeftLog -Append
-if ($packet2nCorrectedPhysicalLeftExitCode -ne 0) { throw "corrected physical-left map failed with $packet2nCorrectedPhysicalLeftExitCode" }
-```
-
-**Future corrected-port physical-right-only no-robot run (`COM7`).**
+**Future corrected-port physical-left-only no-robot run (`COM8`).** After the client prints its Enter prompt, slowly open and close only the **physical left gripper** through at least 20 normalized units. Hold its other five joints and the entire physical right leader still.
 
 ```powershell
 $ErrorActionPreference = 'Stop'
-Assert-Packet2nR5PostCalibrationGuard
-$packet2nCorrectedMapDir = 'C:\Users\pickm\AlohaMini1Logs'
-New-Item -ItemType Directory -Force -Path $packet2nCorrectedMapDir | Out-Null
-$packet2nCorrectedTimestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-$packet2nCorrectedPhysicalRightLog = Join-Path $packet2nCorrectedMapDir "packet2n-corrected-port-physical-right-only-$packet2nCorrectedTimestamp.log"
-'MAP_RUN=PHYSICAL_RIGHT_ONLY' | Tee-Object -FilePath $packet2nCorrectedPhysicalRightLog
-& .\.venv\Scripts\python.exe `
-  .\examples\alohamini\teleoperate_bi.py `
-  --no_robot `
-  --robot.robot_model alohamini1 `
-  --teleop.left_port COM8 `
-  --teleop.right_port COM7 `
-  --teleop.id so101_leader_bi `
-  --teleop.arm_profile so-arm-5dof `
-  --require_calibration_match `
-  --duration_s 12 `
-  --fps 5 `
-  --start_paused `
-  --no_keyboard `
-  --no_rerun 2>&1 | Tee-Object -FilePath $packet2nCorrectedPhysicalRightLog -Append
-$packet2nCorrectedPhysicalRightExitCode = $LASTEXITCODE
-"CLIENT_EXIT_CODE=$packet2nCorrectedPhysicalRightExitCode" | Tee-Object -FilePath $packet2nCorrectedPhysicalRightLog -Append
-if ($packet2nCorrectedPhysicalRightExitCode -ne 0) { throw "corrected physical-right map failed with $packet2nCorrectedPhysicalRightExitCode" }
+$packet2nR5LeftContext = Assert-Packet2nR5PostCalibrationGuard
+$packet2nR5LeftArguments = @(
+    '.\examples\alohamini\teleoperate_bi.py',
+    '--no_robot',
+    '--robot.robot_model', 'alohamini1',
+    '--teleop.left_port', 'COM8',
+    '--teleop.right_port', 'COM7',
+    '--teleop.id', 'so101_leader_bi',
+    '--teleop.arm_profile', 'so-arm-5dof',
+    '--require_calibration_match',
+    '--duration_s', '12',
+    '--fps', '5',
+    '--start_paused',
+    '--no_keyboard',
+    '--no_rerun'
+)
+Assert-Packet2nR5ExactStringArray -Actual $packet2nR5LeftArguments -Expected (Get-Packet2nR5Definition).MapArguments -Label 'physical-left map'
+$packet2nR5PhysicalLeftLog = Join-Path (Get-Packet2nR5Definition).LogsDirectory "packet2n-r5-physical-left-only-$($script:packet2nR5SessionId).log"
+if (Test-Path -LiteralPath $packet2nR5PhysicalLeftLog) { throw "refusing to overwrite map log: $packet2nR5PhysicalLeftLog" }
+'MAP_RUN=PHYSICAL_LEFT_ONLY' | Set-Content -LiteralPath $packet2nR5PhysicalLeftLog -Encoding utf8
+Get-Packet2nR5MapMetadataLines -Context $packet2nR5LeftContext | Add-Content -LiteralPath $packet2nR5PhysicalLeftLog -Encoding utf8
+& $script:packet2nR5CalibrationExecutable @packet2nR5LeftArguments 2>&1 | Tee-Object -FilePath $packet2nR5PhysicalLeftLog -Append
+$packet2nR5PhysicalLeftExitCode = $LASTEXITCODE
+"CLIENT_EXIT_CODE=$packet2nR5PhysicalLeftExitCode" | Tee-Object -FilePath $packet2nR5PhysicalLeftLog -Append
+if ($packet2nR5PhysicalLeftExitCode -ne 0) { throw "physical-left map failed with $packet2nR5PhysicalLeftExitCode" }
 ```
 
-After both clients disconnect, switch off both 7.4 V leader supplies and disconnect both leader buses. Reuse the existing strict verifier above without weakening it: paste the exact corrected physical-left log and corrected physical-right log paths. The result must be exactly `MAPPING_RESULT=CORRECT`; `REVERSED`, `AMBIGUOUS`, any missing marker, nonzero exit, ZMQ/calibration text, incomplete sample, or unexpected logical family is an immediate stop and review. Passing means only that both corrected-port full recalibrations completed and the strict no-robot verifier returned `MAPPING_RESULT=CORRECT`; it does not authorize follower power, Pi contact, ZMQ, startup synchronization, motor-setting changes, or teleoperation.
-
-Rollback and stop conditions are deliberately conservative: retain the verified copies and manifest; do not restore or modify calibration originals in the field. On a calibration/port/identity mismatch or failed verifier, remove leader power, disconnect both buses, leave follower/body power off, preserve logs, and obtain a separately reviewed recovery decision. Packet 2M S6 remains explicitly blocked until corrected-port recalibration and the two no-robot runs produce `MAPPING_RESULT=CORRECT` and the evidence is reviewed.
-
-#### Packet 2M S6 — blocked future both-side synchronization and paused teleoperation
-
-This is a future combined AM1 session for arbitrary safe calibrated initial poses. It remains blocked until Packet 2N-R5 corrected-port full recalibration and both no-robot verification runs produce `MAPPING_RESULT=CORRECT` and the evidence is reviewed. Do not run the commands in this section yet. When eventually authorized, keep both leaders still through exact `SYNC`, synchronization verification, the subsequent Enter pause, and until the client prints exactly `TELEOPERATION ACTIVE — LEADER MOVEMENT IS NOW ALLOWED`.
-
-Start with the Pi motor host stopped, follower/body 12 V power off, both leader supplies off, and both leader USB controllers disconnected. Clear and support both arm workspaces, keep the physical follower-power disconnect immediately accessible, and run both source preflights below while all motor power remains off. Only after both preflights pass may the operator connect the two known leader USB controllers, apply each leader's designated 7.4 V supply, apply follower/body 12 V power, and start the Pi host. Never apply the follower 12 V supply to a leader.
-
-**Pi source preflight.** On the Pi, require the safe-bringup branch, a clean worktree, and exact baseline `a8538bd79356b4c5263342aba389dcdf39092e9e`:
-
-```bash
-set -eu
-cd /home/pickmanmike/lerobot_alohamini
-test "$(git branch --show-current)" = fix/am1-safe-bringup
-test -z "$(git status --porcelain)"
-test "$(git rev-parse HEAD)" = a8538bd79356b4c5263342aba389dcdf39092e9e
-```
-
-**Windows preflight.** Require the current commissioning branch, a clean worktree, and the reviewed Packet 2M Windows baseline as an ancestor:
+**Future corrected-port physical-right-only no-robot run (`COM7`).** After the client prints its Enter prompt, slowly open and close only the **physical right gripper** through at least 20 normalized units. Hold its other five joints and the entire physical left leader still.
 
 ```powershell
 $ErrorActionPreference = 'Stop'
-if ((git branch --show-current) -ne 'fix/am1-elbow-commissioning') { throw 'wrong Windows branch' }
-if (git status --porcelain) { throw 'Windows worktree is not clean' }
-git merge-base --is-ancestor f11b74d4184afafbf044ace7ec5423617da96553 HEAD
-if ($LASTEXITCODE -ne 0) { throw 'Packet 2M Windows baseline is not an ancestor' }
+$packet2nR5RightContext = Assert-Packet2nR5PostCalibrationGuard
+$packet2nR5RightArguments = @(
+    '.\examples\alohamini\teleoperate_bi.py',
+    '--no_robot',
+    '--robot.robot_model', 'alohamini1',
+    '--teleop.left_port', 'COM8',
+    '--teleop.right_port', 'COM7',
+    '--teleop.id', 'so101_leader_bi',
+    '--teleop.arm_profile', 'so-arm-5dof',
+    '--require_calibration_match',
+    '--duration_s', '12',
+    '--fps', '5',
+    '--start_paused',
+    '--no_keyboard',
+    '--no_rerun'
+)
+Assert-Packet2nR5ExactStringArray -Actual $packet2nR5RightArguments -Expected (Get-Packet2nR5Definition).MapArguments -Label 'physical-right map'
+$packet2nR5PhysicalRightLog = Join-Path (Get-Packet2nR5Definition).LogsDirectory "packet2n-r5-physical-right-only-$($script:packet2nR5SessionId).log"
+if (Test-Path -LiteralPath $packet2nR5PhysicalRightLog) { throw "refusing to overwrite map log: $packet2nR5PhysicalRightLog" }
+'MAP_RUN=PHYSICAL_RIGHT_ONLY' | Set-Content -LiteralPath $packet2nR5PhysicalRightLog -Encoding utf8
+Get-Packet2nR5MapMetadataLines -Context $packet2nR5RightContext | Add-Content -LiteralPath $packet2nR5PhysicalRightLog -Encoding utf8
+& $script:packet2nR5CalibrationExecutable @packet2nR5RightArguments 2>&1 | Tee-Object -FilePath $packet2nR5PhysicalRightLog -Append
+$packet2nR5PhysicalRightExitCode = $LASTEXITCODE
+"CLIENT_EXIT_CODE=$packet2nR5PhysicalRightExitCode" | Tee-Object -FilePath $packet2nR5PhysicalRightLog -Append
+if ($packet2nR5PhysicalRightExitCode -ne 0) { throw "physical-right map failed with $packet2nR5PhysicalRightExitCode" }
 ```
 
-**Pi host command after the two preflights and authorized power staging.** Start this one host and leave it running for the Windows client. The log tee preserves the normal host output; this is not a trace run.
-
-```bash
-set -eu
-set -o pipefail
-cd /home/pickmanmike/lerobot_alohamini
-test "$(git branch --show-current)" = fix/am1-safe-bringup
-test -z "$(git status --porcelain)"
-test "$(git rev-parse HEAD)" = a8538bd79356b4c5263342aba389dcdf39092e9e
-HOST_LOG="/home/pickmanmike/packet2m-am1-host-$(date +%Y%m%d-%H%M%S).log"
-printf 'HOST_LOG=%s\n' "$HOST_LOG"
-./.venv/bin/python -m lerobot.robots.alohamini.alohamini_host \
-  --robot_model alohamini1 \
-  --no_cameras \
-  --skip_lift_home \
-  --max_relative_target 10.0 \
-  --max_loop_freq_hz 30 2>&1 | tee "$HOST_LOG"
-```
-
-`--no_cameras` keeps cameras absent. `--skip_lift_home` leaves the lift unhomed and its movement blocked. The `10.0` host limiter remains secondary to the client frame cap `STARTUP_SYNC_MAX_STEP = 0.75`; it does not relax that cap.
-
-**Windows command.** With the Pi host ready, run exactly this one client session. It writes the normal client output to a timestamped Windows log, retains the terminal session, and captures the exact client exit code:
+After both clients disconnect, switch off both 7.4 V leader supplies and disconnect both leader buses. Then run this exact evidence-aware invocation in the same PowerShell session; do not use the historical prompt-only invocation for Packet 2N-R5:
 
 ```powershell
-$packet2mLogDir = 'C:\Users\pickm\AlohaMini1Logs'
-New-Item -ItemType Directory -Force -Path $packet2mLogDir | Out-Null
-$packet2mTimestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-$packet2mLog = Join-Path $packet2mLogDir "packet2m-am1-client-$packet2mTimestamp.log"
-& .\.venv\Scripts\python.exe `
-  .\examples\alohamini\teleoperate_bi.py `
-  --robot.remote_ip 192.168.1.134 `
-  --robot.robot_model alohamini1 `
-  --teleop.left_port COM7 `
-  --teleop.right_port COM8 `
-  --teleop.id so101_leader_bi `
-  --teleop.arm_profile so-arm-5dof `
-  --startup_mode sync `
-  --startup_sync_side both `
-  --startup_sync_duration_s 15.0 `
-  --max_start_mismatch 6.0 `
-  --fps 5 `
-  --duration_s 60 `
-  --start_paused `
-  --no_keyboard `
-  --no_rerun 2>&1 | Tee-Object -FilePath $packet2mLog
-$packet2mExitCode = $LASTEXITCODE
-"CLIENT_LOG=$packet2mLog" | Tee-Object -FilePath $packet2mLog -Append
-"CLIENT_EXIT_CODE=$packet2mExitCode" | Tee-Object -FilePath $packet2mLog -Append
+$ErrorActionPreference = 'Stop'
+$null = Assert-Packet2nR5PostCalibrationGuard
+$packet2nR5LeftSummary = Get-Packet2nLeaderMapSummary -Path $packet2nR5PhysicalLeftLog -ExpectedMarker PHYSICAL_LEFT_ONLY -RequirePacket2nR5Evidence -Packet2nR5EvidencePath $script:packet2nR5EvidencePath -Packet2nR5EvidenceSha256 $script:packet2nR5EvidenceSha256
+$packet2nR5RightSummary = Get-Packet2nLeaderMapSummary -Path $packet2nR5PhysicalRightLog -ExpectedMarker PHYSICAL_RIGHT_ONLY -RequirePacket2nR5Evidence -Packet2nR5EvidencePath $script:packet2nR5EvidencePath -Packet2nR5EvidenceSha256 $script:packet2nR5EvidenceSha256
+$packet2nR5LeftSummary, $packet2nR5RightSummary | Format-Table -AutoSize
+$packet2nR5MappingResult = if ($packet2nR5LeftSummary.LogicalSide -eq 'left' -and $packet2nR5RightSummary.LogicalSide -eq 'right') {
+    'MAPPING_RESULT=CORRECT'
+} elseif ($packet2nR5LeftSummary.LogicalSide -eq 'right' -and $packet2nR5RightSummary.LogicalSide -eq 'left') {
+    'MAPPING_RESULT=REVERSED'
+} else {
+    'MAPPING_RESULT=AMBIGUOUS'
+}
+$packet2nR5MappingResult
+if ($packet2nR5MappingResult -ne 'MAPPING_RESULT=CORRECT') { throw "Packet 2N-R5 mapping verification failed: $packet2nR5MappingResult" }
 ```
 
-Arm-only here means both-arm position targets plus explicit zero base/lift commands, not omission of the supported zero-velocity fields. No keyboard, camera, or visualization device is started. Synchronization verifies the frozen target before the pause. After Enter, the client again requires a fresh follower observation proven by sequence advancement and a fresh normalized leader sample. It validates and re-compares every joint, then forwards that final validated leader sample first with zero base/lift commands. The ordinary `--duration_s` clock starts only after synchronization, optional resource setup, and this pause gate.
+The evidence-aware verifier requires exactly 60 complete action records, the exact twelve normalized arm keys in every record, and every R5 metadata value exactly once and identical across both logs. It rehashes the evidence, transcript, and current calibration sources. `MAPPING_RESULT=CORRECT` is the only pass. `REVERSED`, `AMBIGUOUS`, 59 or 61 samples, missing/duplicate/unexpected arm data, stale or swapped identities, metadata mismatch, runtime calibration/ZMQ text, nonzero exit, or unclear physical movement is an immediate stop.
 
-Completion requires client status `0` after the bounded 60-second live interval, all four operator phases in order, no safety refusal, and the normal final zero command and disconnect cleanup. During the live interval, require small, one-at-a-time, correct corresponding movement from every left/right arm joint and both grippers; base and lift must remain stationary; and the live negative-direction left-elbow response must be practically controllable. Immediately stop and remove power or disconnect if any commanded joint is stationary, moves in the wrong direction, moves unexpectedly fast, has unusable lag, or if any arm, base, or lift moves unexpectedly; also stop for resistance, contact, noise, cable tension, current or communication error, a required phase/validation/cleanup failure, or loss of a clear view or stop path. After the client cleanup, stop the Pi host with Ctrl+C, verify its cleanup, then power off. After completion or any stop, end this Packet 2M session and authorize no further motion.
+Stop either future physical block immediately and remove leader power for unexpected powered leader motion, resistance, sound, heat, cable strain, communication failure, loss of the clear stop path, any follower power or movement, or any evidence that a robot/ZMQ connection was constructed. Preserve the manifest, transcript, evidence JSON, and both map logs. Passing this packet authorizes only later review of that evidence; it does not authorize Pi contact, follower power, ZMQ, startup synchronization, motor-setting changes, or teleoperation.
+
+#### Packet 2M S6 — hard-blocked future both-side synchronization and paused teleoperation
+
+S6 is **not runnable today**. Packet 2N-R5 has not been physically executed, so no reviewed approval artifact, R5 evidence-file hash, physical-left map-log hash, physical-right map-log hash, or corrected current calibration identities exist. The exact next Pi command is **none**: do not contact the Pi, start its host, stage power, open ZMQ, or run any S6 client.
+
+The only executable placeholder in this section refuses unconditionally before any Git, file, serial, network, or power action:
+
+```powershell
+$ErrorActionPreference = 'Stop'
+throw 'S6 BLOCKED: reviewed Packet 2N-R5 approval artifact and bound evidence/map hashes do not exist'
+```
+
+A later, separately reviewed replacement for that placeholder must robustly capture stderr and the exit code for every Git query, require branch `fix/am1-elbow-commissioning`, require a clean status including unexpected untracked files, require behavior baseline `cae57b59db1d9156be568aa4b216fc90701aa741`, and prove every tracked path except this document remains identical to that baseline. It must then require a review-authored approval artifact whose exact schema binds:
+
+- the Packet 2N-R5 evidence JSON path and SHA-256;
+- both corrected map-log paths and SHA-256 values;
+- the calibration transcript path and SHA-256;
+- the current logical-left and logical-right calibration paths, byte counts, SHA-256 values, and UTC mtimes;
+- the same R5 session ID and behavior SHA across the artifact, evidence, transcript, and both logs;
+- exactly `MAPPING_RESULT=CORRECT` from the strict evidence-aware verifier.
+
+That future preflight must rehash every referenced file, revalidate the two current calibration schemas/identities, and refuse stale, equal, swapped, missing, duplicated, or mismatched evidence. Because the required hashes do not yet exist, no placeholder value may be inferred and no current preflight may pass.
+
+For review context only, any later authorized Windows S6 design must use corrected logical/physical ports **left `COM8` and right `COM7`**, ID `so101_leader_bi`, profile `so-arm-5dof`, AM1 startup synchronization on both sides, client step cap `0.75`, host relative limit `10.0`, final mismatch `6.0`, explicit zero base/lift, start-paused fresh observations, no keyboard/cameras, and the exact post-sync Enter gate. These are blocked design parameters, not a command. No Pi host or Windows teleoperation command is authorized or retained as executable text here.
 
 ## 3. Camera Configuration
 
