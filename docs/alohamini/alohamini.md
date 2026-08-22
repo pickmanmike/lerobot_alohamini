@@ -500,13 +500,13 @@ The manifest records each original and backup path, SHA-256, byte count, and sou
 
 The only approved later correction is a coordinated **full recalibration**, after a separate physical authorization: logical/physical left must be `COM8`, logical/physical right must be `COM7`, the ID must be `so101_leader_bi`, and the profile must be `so-arm-5dof`. Do not do a port-only swap, JSON-content swap, or runtime swap layer. Begin with the Pi motor host stopped, follower/body 12 V power off, both leader supplies off, and both leader USB controllers disconnected. Do not run this task's future commands until physical authorization is granted.
 
-**Future corrected-port full recalibration — fail fast.** This supersedes the earlier `c`/reuse procedure: pass `--force_fresh_calibration`; do not accept, type `c` at, or otherwise use an existing-calibration prompt. The pre-connection guard rejects `PYTHONPATH`, `PYTHONHOME`, and all Hugging Face calibration/home overrides; it pins the reviewed code commit `2a55f717ecf4b5ef83805e6ccb89c97a4690da6b` as an ancestor, requires every tracked path except this documentation file to match that commit, and validates the immutable manifest/backups plus the exact default calibration root. Before calibration both sources must retain their backup-era identities. After a zero-exit forced run, capture and persist same-session post-calibration evidence; no-robot runs fail closed unless both current JSONs exactly match that evidence.
+**Future corrected-port full recalibration — fail fast.** This supersedes the earlier `c`/reuse procedure: pass `--force_fresh_calibration`; do not accept, type `c` at, or otherwise use an existing-calibration prompt. The pre-connection guard rejects `PYTHONPATH`, `PYTHONHOME`, and all Hugging Face calibration/home overrides; it pins the reviewed code commit `cae57b59db1d9156be568aa4b216fc90701aa741` as an ancestor, requires every tracked path except this documentation file to match that commit, and validates the immutable manifest/backups plus the exact default calibration root. Before calibration both sources must retain their backup-era identities. After a zero-exit forced run, capture and persist same-session post-calibration evidence; no-robot runs fail closed unless both current JSONs exactly match that evidence and are different from both pre-calibration hashes.
 
 ```powershell
 $ErrorActionPreference = 'Stop'
 $script:packet2nR5PostCalibrationEvidence = $null
 function Assert-Packet2nR5CommonGuard {
-    $packet2nBaseline = '2a55f717ecf4b5ef83805e6ccb89c97a4690da6b'
+    $packet2nBaseline = 'cae57b59db1d9156be568aa4b216fc90701aa741'
     $packet2nCalibrationRoot = 'C:\Users\pickm\.cache\huggingface\lerobot\calibration'
     $packet2nBackupDirectory = 'C:\Users\pickm\AlohaMini1Backups\packet2n-r5-20260822-121722-7941f445-9587-4345-8e2f-edd54ca750f6'
     $packet2nManifestPath = Join-Path $packet2nBackupDirectory 'manifest.json'
@@ -525,7 +525,7 @@ function Assert-Packet2nR5CommonGuard {
     $packet2nResolvedRoot = (& .\.venv\Scripts\python.exe -c "from lerobot.utils.constants import HF_LEROBOT_CALIBRATION; print(HF_LEROBOT_CALIBRATION)" | Out-String).Trim()
     if ($packet2nResolvedRoot -ne $packet2nCalibrationRoot) { throw "unexpected calibration root: $packet2nResolvedRoot" }
     $packet2nCheckout = (Resolve-Path -LiteralPath '.').Path
-    $packet2nImportedPaths = @(& .\.venv\Scripts\python.exe -c "import sys; sys.path.insert(0, 'examples/alohamini'); import calibrate_bi, teleoperate_bi, leader_client_utils, lerobot.teleoperators.bi_so_leader.bi_so_leader, lerobot.teleoperators.so_leader.so_leader; print('`n'.join(m.__file__ for m in (calibrate_bi, teleoperate_bi, leader_client_utils, lerobot.teleoperators.bi_so_leader.bi_so_leader, lerobot.teleoperators.so_leader.so_leader)))")
+    $packet2nImportedPaths = @(& .\.venv\Scripts\python.exe -c "import sys; sys.path.insert(0, 'examples/alohamini'); import calibrate_bi, teleoperate_bi, leader_client_utils, lerobot.teleoperators.bi_so_leader.bi_so_leader, lerobot.teleoperators.so_leader.so_leader; print(*(m.__file__ for m in (calibrate_bi, teleoperate_bi, leader_client_utils, lerobot.teleoperators.bi_so_leader.bi_so_leader, lerobot.teleoperators.so_leader.so_leader)), sep='\n')")
     if ($LASTEXITCODE -ne 0 -or @($packet2nImportedPaths | Where-Object { -not $_.StartsWith($packet2nCheckout, [System.StringComparison]::OrdinalIgnoreCase) }).Count -ne 0) { throw 'required imported module path escaped the reviewed checkout' }
     if (-not (Test-Path -LiteralPath $packet2nManifestPath -PathType Leaf)) { throw "missing Packet 2N-R5 manifest: $packet2nManifestPath" }
     $packet2nManifest = Get-Content -Raw -LiteralPath $packet2nManifestPath | ConvertFrom-Json
