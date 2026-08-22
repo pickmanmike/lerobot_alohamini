@@ -96,7 +96,7 @@ Leader motors require their 7.4 V low-voltage supply and must never receive the 
 
 Before a synchronization move, the client prints the measured start and frozen target and asks the operator to type exactly `SYNC`. Enter alone, lowercase text, or added whitespace does not authorize motion. After confirmation, the client takes fresh follower and leader samples and prints those final endpoints before sending frame zero. Every synchronization frame holds base and lift velocity at zero and changes each selected normalized arm position by at most `STARTUP_SYNC_MAX_STEP = 0.75`. This client frame cap is independent of Pi `max_relative_target`; if it needs more frames than the requested duration, the move takes longer. Actual arm-bearing synchronization sends remain at least `1 / --fps` seconds apart, so an overrun lengthens the move instead of triggering catch-up sends. Every leader sample is validated, and exceeding `STARTUP_SYNC_LEADER_DRIFT = 2.0` aborts selected-side motion.
 
-Command and observation traffic use separate sockets, so the first sequence-fresh response after the final command can still have been generated before that command was processed. The client therefore checks up to the configured observation request window plus one sequence-fresh samples. Synchronization succeeds only when a checked follower sample satisfies `--max_start_mismatch`; otherwise it refuses without widening the threshold. The threshold is final startup convergence verification only: it does not limit how far apart valid calibrated poses may be when a synchronization plan is first proposed, and it is not used continuously at runtime. The historical S1--S5 commands below retain `5.0`. Packet 2M alone uses `6.0`: it is `0.708` above the worst measured completed-settle negative-direction residual (`5.292`) while still refusing a completely unmoving requested 10-unit joint move. The live Packet 2M session must still validate every joint, not merely the selected elbow.
+Command and observation traffic use separate sockets, so the first sequence-fresh response after the final command can still have been generated before that command was processed. The client therefore checks up to the configured observation request window plus one sequence-fresh samples. Synchronization succeeds only when a checked follower sample satisfies `--max_start_mismatch`; otherwise it refuses without widening the threshold. The threshold is final startup convergence verification only: it does not limit how far apart valid calibrated poses may be when a synchronization plan is first proposed, and it is not used continuously at runtime. The historical S1--S5 commands below retain `5.0`. The blocked Packet 2M S6 command uses `6.0`: it is `0.708` above the worst measured completed-settle negative-direction residual (`5.292`) while still refusing a completely unmoving requested 10-unit joint move. That moving session is not authorized until the Packet 2N-R3 physical leader identity gate below is resolved.
 
 The client makes the operator phase explicit, in this order:
 
@@ -113,7 +113,7 @@ The bounded diagnostic is historical evidence, not the next commissioning action
 
 The completed traces used effective `max_relative_target=10.0` and a bounded final-target settle of `--settle_s 5.0`; `PASS` required two consecutive post-window, sequence-fresh in-tolerance samples. The prior negative-direction run was only partially physically proven: it measured `S=21.775`, `T=11.775`, movement `-4.708`, and final error `-5.292`, ending `INCOMPLETE`. The fresh positive-direction repeat measured `S=16.885`, `T=26.885`, movement `+9.507`, and final error `+0.493`, ending `PASS`/`0`. In that positive trace, the requested, relative-limiter, and final targets matched; the `Goal_Position` readback matched within quantization; the SDK transmit completed; and `Torque_Enable`, `Lock`, and `Operating_Mode` read back `1`/`1`/`0`. The observed current maxima were `13 mA` versus `221 mA`.
 
-Together, that is directional/load-dependent downstream behavior: the static non-Phase configuration and normal command transport passed, but the exact physical cause remains unresolved. Do not change any motor setting on the strength of this result. There is no further trace boundary or diagnostic motion authorized by this documentation; the one next separately authorized motion is Packet 2M S6 below.
+Together, that is directional/load-dependent downstream elbow behavior: the static non-Phase configuration and normal command transport passed, but the exact physical cause remains unresolved. Do not change any motor setting on the strength of this result. Packet 2N later exposed a separate physical leader-identity ambiguity before live teleoperation began; resolve that no-robot boundary before any further follower motion.
 
 #### Historical trace field semantics
 
@@ -162,7 +162,7 @@ $diagnosticHelp = (& .\.venv\Scripts\python.exe .\examples\alohamini\diagnose_am
 if ($diagnosticHelp -notmatch '--settle_s') { throw 'diagnostic --help did not contain --settle_s' }
 ```
 
-S1--S5 are historical commissioning commands and retain their recorded `5.0` tolerance. They do not authorize another motion. Packet 2M S6 is the exact next separately authorized motion; run it once only after its own preflight below, then stop for review and perform no further motion from this document.
+S1--S5 are historical commissioning commands and retain their recorded `5.0` tolerance. They do not authorize another motion. The Packet 2N-R3 no-robot identity gate below is the only next check described by this document. Packet 2M S6 remains blocked until those two separately labeled leader logs prove the physical-to-logical mapping and a later review selects the appropriate branch.
 
 #### S1 — left-only synchronization and exit
 
@@ -277,9 +277,208 @@ This is an operator procedure, not a gripper-only payload mode. The client still
 
 After Enter, the client obtains fresh follower and leader samples, revalidates and compares them, and uses the final validated leader sample as the first forwarded arm action with explicit zero base/lift commands.
 
-#### Packet 2M S6 — exact next separately authorized both-side synchronization and paused teleoperation
+#### Packet 2N-R3 — physical leader identity gate with no robot
 
-This is one combined AM1 session for arbitrary safe calibrated initial poses. It is not collision-aware. Keep both leaders still through exact `SYNC`, synchronization verification, the subsequent Enter pause, and until the client prints exactly `TELEOPERATION ACTIVE — LEADER MOVEMENT IS NOW ALLOWED`.
+Packet 2N never entered live teleoperation and correctly returned status `2`. Its logical left shoulder-lift started at `20.899`, targeted `-96.598`, and was observed at `-23.397` during final verification, leaving a `73.201` residual; all other logical joints were within `2.855`. The client planned a 157-interval, 158-frame schedule lasting at least `31.4` seconds at 5 Hz and reached the verification code that follows completion of that send loop. The available side-map log later contains a period where only `arm_right_*` changes followed by a period where `arm_left_*` also changes, but it does not label which physical leader was moved in either period. The named Packet 2N host log was not present in the Windows evidence directory, so its timestamps cannot be independently correlated here. The visual impression that the followers corresponded crosswise is a warning, not enough evidence for a port or calibration change.
+
+The software mapping itself is deterministic: `--teleop.left_port` owns logical `left_*` and therefore `arm_left_*`; `--teleop.right_port` owns logical `right_*` and therefore `arm_right_*`. With `--teleop.id so101_leader_bi`, the child calibration identities are `so101_leader_bi_left` and `so101_leader_bi_right`. With `HF_LEROBOT_CALIBRATION`, `HF_LEROBOT_HOME`, and `HF_HOME` unset during the Packet 2N-R3 audit, their resolved default files were:
+
+```text
+C:\Users\pickm\.cache\huggingface\lerobot\calibration\teleoperators\so_leader\so101_leader_bi_left.json
+C:\Users\pickm\.cache\huggingface\lerobot\calibration\teleoperators\so_leader\so101_leader_bi_right.json
+```
+
+Those files contain different per-device homing offsets and ranges. Calibration ownership follows the logical child ID, not the COM port. A port-only swap is therefore unsafe: it would attach the other physical controller to the wrong child calibration. Do not rename, overwrite, swap, or recalibrate either file until the physical mapping is proven and a separate correction is reviewed.
+
+The next check uses the existing client only as a normalized leader reader. It constructs no robot client, sends no ZMQ request, starts no keyboard or visualization, and cannot command a follower. Connecting an SO leader still performs the existing leader-bus connection and configuration writes; it does not make this a read-only COM session. It requires separate leader-only physical authorization, and the operator must abort rather than accept or start calibration if any calibration prompt appears. No Pi command is part of this gate: keep the Pi motor host stopped and follower/body 12 V power off. Begin with both leader supplies off and both leader USB controllers disconnected. Run the repository preflight while that state is preserved:
+
+```powershell
+$ErrorActionPreference = 'Stop'
+if ((git branch --show-current) -ne 'fix/am1-elbow-commissioning') { throw 'wrong Windows branch' }
+if (git status --porcelain) { throw 'Windows worktree is not clean' }
+git merge-base --is-ancestor f06dc227682f37f263e09a2d92a77dbbadbc9c2e HEAD
+if ($LASTEXITCODE -ne 0) { throw 'Packet 2N-R3 Windows baseline is not an ancestor' }
+$env:PYTHONDONTWRITEBYTECODE = '1'
+$packet2nCalibrationRoot = (& .\.venv\Scripts\python.exe -c "from lerobot.utils.constants import HF_LEROBOT_CALIBRATION; print(HF_LEROBOT_CALIBRATION)" | Out-String).Trim()
+$packet2nLeftCalibration = Join-Path $packet2nCalibrationRoot 'teleoperators\so_leader\so101_leader_bi_left.json'
+$packet2nRightCalibration = Join-Path $packet2nCalibrationRoot 'teleoperators\so_leader\so101_leader_bi_right.json'
+if (-not (Test-Path -LiteralPath $packet2nLeftCalibration -PathType Leaf)) { throw "missing left calibration: $packet2nLeftCalibration" }
+if (-not (Test-Path -LiteralPath $packet2nRightCalibration -PathType Leaf)) { throw "missing right calibration: $packet2nRightCalibration" }
+"LEFT_CALIBRATION=$packet2nLeftCalibration"
+"RIGHT_CALIBRATION=$packet2nRightCalibration"
+```
+
+Only after a separate leader-only physical authorization may the operator connect the known COM7 and COM8 controllers and apply each leader's designated 7.4 V supply. Never apply follower 12 V power to either leader. Hold both leaders in safe moderate poses.
+
+**Physical-left-only run.** Keep the physical right leader completely still. After the client prints `PRESS ENTER TO ENABLE LIVE TELEOPERATION`, press Enter, then slowly sweep only the physical left gripper through a clearly visible range and make one small physical left elbow movement. The filename and first log line explicitly bind this run to the physical left leader:
+
+```powershell
+$ErrorActionPreference = 'Stop'
+$packet2nMapDir = 'C:\Users\pickm\AlohaMini1Logs'
+New-Item -ItemType Directory -Force -Path $packet2nMapDir | Out-Null
+$packet2nMapTimestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$packet2nPhysicalLeftLog = Join-Path $packet2nMapDir "packet2n-physical-left-only-$packet2nMapTimestamp.log"
+'MAP_RUN=PHYSICAL_LEFT_ONLY' | Tee-Object -FilePath $packet2nPhysicalLeftLog
+& .\.venv\Scripts\python.exe `
+  .\examples\alohamini\teleoperate_bi.py `
+  --no_robot `
+  --robot.robot_model alohamini1 `
+  --teleop.left_port COM7 `
+  --teleop.right_port COM8 `
+  --teleop.id so101_leader_bi `
+  --teleop.arm_profile so-arm-5dof `
+  --duration_s 12 `
+  --fps 5 `
+  --start_paused `
+  --no_keyboard `
+  --no_rerun 2>&1 | Tee-Object -FilePath $packet2nPhysicalLeftLog -Append
+$packet2nPhysicalLeftExitCode = $LASTEXITCODE
+"CLIENT_EXIT_CODE=$packet2nPhysicalLeftExitCode" | Tee-Object -FilePath $packet2nPhysicalLeftLog -Append
+if ($packet2nPhysicalLeftExitCode -ne 0) { throw "physical-left map failed with $packet2nPhysicalLeftExitCode" }
+```
+
+Allow the first client to disconnect both leader buses. Return both leaders to safe moderate poses without exchanging their USB connections or supplies.
+
+**Physical-right-only run.** Keep the physical left leader completely still. After the Enter prompt, slowly sweep only the physical right gripper and make one small physical right elbow movement:
+
+```powershell
+$ErrorActionPreference = 'Stop'
+$packet2nMapDir = 'C:\Users\pickm\AlohaMini1Logs'
+New-Item -ItemType Directory -Force -Path $packet2nMapDir | Out-Null
+$packet2nMapTimestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$packet2nPhysicalRightLog = Join-Path $packet2nMapDir "packet2n-physical-right-only-$packet2nMapTimestamp.log"
+'MAP_RUN=PHYSICAL_RIGHT_ONLY' | Tee-Object -FilePath $packet2nPhysicalRightLog
+& .\.venv\Scripts\python.exe `
+  .\examples\alohamini\teleoperate_bi.py `
+  --no_robot `
+  --robot.robot_model alohamini1 `
+  --teleop.left_port COM7 `
+  --teleop.right_port COM8 `
+  --teleop.id so101_leader_bi `
+  --teleop.arm_profile so-arm-5dof `
+  --duration_s 12 `
+  --fps 5 `
+  --start_paused `
+  --no_keyboard `
+  --no_rerun 2>&1 | Tee-Object -FilePath $packet2nPhysicalRightLog -Append
+$packet2nPhysicalRightExitCode = $LASTEXITCODE
+"CLIENT_EXIT_CODE=$packet2nPhysicalRightExitCode" | Tee-Object -FilePath $packet2nPhysicalRightLog -Append
+if ($packet2nPhysicalRightExitCode -ne 0) { throw "physical-right map failed with $packet2nPhysicalRightExitCode" }
+```
+
+Analyze only the saved logs after both leader buses have disconnected. This verifier requires the marker, no-robot notice, absence of any `ZMQ` text, normal cleanup, exit `0`, all twelve arm keys, a moved gripper span of at least 20 normalized units, and less than `2.0` variation across the entire opposite logical family:
+
+```powershell
+$ErrorActionPreference = 'Stop'
+function Get-Packet2nLeaderMapSummary {
+    param(
+        [Parameter(Mandatory)] [string] $Path,
+        [Parameter(Mandatory)] [ValidateSet('PHYSICAL_LEFT_ONLY', 'PHYSICAL_RIGHT_ONLY')] [string] $ExpectedMarker
+    )
+
+    $lines = @(Get-Content -LiteralPath $Path)
+    if ($lines.Count -lt 3 -or $lines[0].Trim() -ne "MAP_RUN=$ExpectedMarker") { throw "invalid marker in $Path" }
+    if ($lines[-1].Trim() -ne 'CLIENT_EXIT_CODE=0') { throw "missing successful exit in $Path" }
+    if (-not ($lines | Where-Object { $_ -eq 'NO_ROBOT: robot client construction and connection skipped.' })) { throw "missing NO_ROBOT proof in $Path" }
+    if (-not ($lines | Where-Object { $_ -like 'Shutdown complete:*' })) { throw "missing cleanup proof in $Path" }
+    if ($lines -match 'ZMQ') { throw "unexpected ZMQ text in $Path" }
+    if ($lines -match '(?i)calibrat') { throw "calibration text requires refusal and review: $Path" }
+
+    $expectedKeys = @(
+        'arm_left_shoulder_pan.pos',
+        'arm_left_shoulder_lift.pos',
+        'arm_left_elbow_flex.pos',
+        'arm_left_wrist_flex.pos',
+        'arm_left_wrist_roll.pos',
+        'arm_left_gripper.pos',
+        'arm_right_shoulder_pan.pos',
+        'arm_right_shoulder_lift.pos',
+        'arm_right_elbow_flex.pos',
+        'arm_right_wrist_flex.pos',
+        'arm_right_wrist_roll.pos',
+        'arm_right_gripper.pos'
+    )
+    $series = @{}
+    $completeRecordCount = 0
+    $number = '-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?'
+    $pattern = "'(?<key>arm_(?:left|right)_[^']+\.pos)':\s*(?<value>$number)"
+    foreach ($line in $lines) {
+        if (-not $line.StartsWith('[NO_ROBOT] action ->')) { continue }
+        $matches = @([regex]::Matches($line, $pattern))
+        $recordKeys = @($matches | ForEach-Object { $_.Groups['key'].Value })
+        $missingRecordKeys = @($expectedKeys | Where-Object { $_ -notin $recordKeys })
+        $unexpectedRecordKeys = @($recordKeys | Where-Object { $_ -notin $expectedKeys })
+        if ($matches.Count -ne 12 -or $missingRecordKeys.Count -ne 0 -or $unexpectedRecordKeys.Count -ne 0) {
+            throw "incomplete or unexpected arm action record in $Path"
+        }
+        $completeRecordCount++
+        foreach ($match in $matches) {
+            $key = $match.Groups['key'].Value
+            if (-not $series.ContainsKey($key)) { $series[$key] = @() }
+            $series[$key] += [double] $match.Groups['value'].Value
+        }
+    }
+    if ($completeRecordCount -lt 1) { throw "no complete arm action records in $Path" }
+    $missingKeys = @($expectedKeys | Where-Object { -not $series.ContainsKey($_) })
+    $unexpectedKeys = @($series.Keys | Where-Object { $_ -notin $expectedKeys })
+    if ($missingKeys.Count -ne 0 -or $unexpectedKeys.Count -ne 0) {
+        throw "arm action key set mismatch in $Path"
+    }
+
+    $ranges = @{}
+    foreach ($key in $series.Keys) {
+        $measure = $series[$key] | Measure-Object -Minimum -Maximum
+        $ranges[$key] = [double] $measure.Maximum - [double] $measure.Minimum
+    }
+    $leftFamilyMax = [double] (($ranges.GetEnumerator() | Where-Object { $_.Key -like 'arm_left_*' } | Measure-Object -Property Value -Maximum).Maximum)
+    $rightFamilyMax = [double] (($ranges.GetEnumerator() | Where-Object { $_.Key -like 'arm_right_*' } | Measure-Object -Property Value -Maximum).Maximum)
+    $leftGripper = [double] $ranges['arm_left_gripper.pos']
+    $rightGripper = [double] $ranges['arm_right_gripper.pos']
+    $logicalSide = if ($leftGripper -ge 20.0 -and $rightFamilyMax -lt 2.0) {
+        'left'
+    } elseif ($rightGripper -ge 20.0 -and $leftFamilyMax -lt 2.0) {
+        'right'
+    } else {
+        'ambiguous'
+    }
+
+    [pscustomobject]@{
+        PhysicalRun = $ExpectedMarker
+        LogicalSide = $logicalSide
+        LeftGripperRange = $leftGripper
+        RightGripperRange = $rightGripper
+        LeftFamilyMaxRange = $leftFamilyMax
+        RightFamilyMaxRange = $rightFamilyMax
+        SampleCount = $completeRecordCount
+    }
+}
+
+$packet2nPhysicalLeftLog = Read-Host 'Paste the exact PHYSICAL_LEFT_ONLY log path'
+$packet2nPhysicalRightLog = Read-Host 'Paste the exact PHYSICAL_RIGHT_ONLY log path'
+$packet2nLeftSummary = Get-Packet2nLeaderMapSummary -Path $packet2nPhysicalLeftLog -ExpectedMarker PHYSICAL_LEFT_ONLY
+$packet2nRightSummary = Get-Packet2nLeaderMapSummary -Path $packet2nPhysicalRightLog -ExpectedMarker PHYSICAL_RIGHT_ONLY
+$packet2nLeftSummary, $packet2nRightSummary | Format-Table -AutoSize
+
+if ($packet2nLeftSummary.LogicalSide -eq 'left' -and $packet2nRightSummary.LogicalSide -eq 'right') {
+    'MAPPING_RESULT=CORRECT'
+} elseif ($packet2nLeftSummary.LogicalSide -eq 'right' -and $packet2nRightSummary.LogicalSide -eq 'left') {
+    'MAPPING_RESULT=REVERSED'
+} else {
+    'MAPPING_RESULT=AMBIGUOUS'
+}
+```
+
+Classify the paired result only as follows:
+
+- Physical left changes only `arm_left_*`, and physical right changes only `arm_right_*`: physical mapping is correct. Outcome B may then design and implement the bounded startup final-target convergence phase; this document does not implement or authorize it.
+- Physical left changes only `arm_right_*`, and physical right changes only `arm_left_*`: physical mapping is reversed. Outcome A must correct the port and calibration ownership together after a separate reviewed backup/correction packet; do not try a port-only swap.
+- Either run changes both families, neither family, misses the 20-unit/`2.0` separation above, or has an absent marker, calibration prompt, nonzero exit, connection error, or unclear movement: mapping remains unresolved under Outcome C.
+
+Stop either run immediately and remove leader power for unexpected powered leader motion, resistance, sound, heat, cable strain, communication failure, loss of the clear stop path, any follower power or movement, or any evidence that a robot/ZMQ connection was constructed. After the second run, disconnect both leader buses, switch off both 7.4 V supplies, and stop for review. Do not start Packet 2M S6.
+
+#### Packet 2M S6 — blocked future both-side synchronization and paused teleoperation
+
+This is a future combined AM1 session for arbitrary safe calibrated initial poses. It remains blocked until Packet 2N-R3 proves the physical leader mapping and a later reviewed packet either preserves the mapping or corrects port and calibration ownership together. Do not run the commands in this section yet. When eventually authorized, keep both leaders still through exact `SYNC`, synchronization verification, the subsequent Enter pause, and until the client prints exactly `TELEOPERATION ACTIVE — LEADER MOVEMENT IS NOW ALLOWED`.
 
 Start with the Pi motor host stopped, follower/body 12 V power off, both leader supplies off, and both leader USB controllers disconnected. Clear and support both arm workspaces, keep the physical follower-power disconnect immediately accessible, and run both source preflights below while all motor power remains off. Only after both preflights pass may the operator connect the two known leader USB controllers, apply each leader's designated 7.4 V supply, apply follower/body 12 V power, and start the Pi host. Never apply the follower 12 V supply to a leader.
 
