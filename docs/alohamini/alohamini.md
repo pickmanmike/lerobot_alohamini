@@ -461,12 +461,16 @@ $packet2nLeftSummary = Get-Packet2nLeaderMapSummary -Path $packet2nPhysicalLeftL
 $packet2nRightSummary = Get-Packet2nLeaderMapSummary -Path $packet2nPhysicalRightLog -ExpectedMarker PHYSICAL_RIGHT_ONLY
 $packet2nLeftSummary, $packet2nRightSummary | Format-Table -AutoSize
 
-if ($packet2nLeftSummary.LogicalSide -eq 'left' -and $packet2nRightSummary.LogicalSide -eq 'right') {
+$packet2nMappingResult = if ($packet2nLeftSummary.LogicalSide -eq 'left' -and $packet2nRightSummary.LogicalSide -eq 'right') {
     'MAPPING_RESULT=CORRECT'
 } elseif ($packet2nLeftSummary.LogicalSide -eq 'right' -and $packet2nRightSummary.LogicalSide -eq 'left') {
     'MAPPING_RESULT=REVERSED'
 } else {
     'MAPPING_RESULT=AMBIGUOUS'
+}
+$packet2nMappingResult
+if ($packet2nMappingResult -ne 'MAPPING_RESULT=CORRECT') {
+    throw "Packet 2N mapping verification failed: $packet2nMappingResult"
 }
 ```
 
@@ -496,14 +500,53 @@ The manifest records each original and backup path, SHA-256, byte count, and sou
 
 The only approved later correction is a coordinated **full recalibration**, after a separate physical authorization: logical/physical left must be `COM8`, logical/physical right must be `COM7`, the ID must be `so101_leader_bi`, and the profile must be `so-arm-5dof`. Do not do a port-only swap, JSON-content swap, or runtime swap layer. Begin with the Pi motor host stopped, follower/body 12 V power off, both leader supplies off, and both leader USB controllers disconnected. Do not run this task's future commands until physical authorization is granted.
 
-**Future corrected-port full recalibration — fail fast.** After physical authorization and only with the operator's clear stop path, run exactly this command. At **both** existing-file prompts, verify the shown child identity matches the expected logical child and type exactly `c` (lowercase, then Enter) to force its full recalibration. Stop immediately—without accepting the existing file—on any unexpected prompt, child ID, port, profile, connection/calibration error, or safety concern. Do not continue to no-robot verification after any mismatch.
+**Future corrected-port full recalibration — fail fast.** The guard below is part of every future connection attempt. It rejects all Hugging Face calibration/home overrides, resolves and pins the evidence default calibration root, validates the manifest's exact original/backup paths, bytes, and hashes, and validates both files at both locations before connection. It also requires the reviewed `f7e8254c80fffe8c215920d6928718b1f482f7a6` baseline as an ancestor and requires every calibration/leader-client source path listed in the guard to be byte-identical to that baseline; this non-self-referential source review remains valid on later reviewed documentation commits. After physical authorization and only with the operator's clear stop path, run exactly this command. At **both** existing-file prompts, verify the shown child identity matches the expected logical child and type exactly `c` (lowercase, then Enter) to force its full recalibration. Stop immediately—without accepting the existing file—on any unexpected prompt, child ID, port, profile, connection/calibration error, or safety concern. Do not continue to no-robot verification after any mismatch.
 
 ```powershell
 $ErrorActionPreference = 'Stop'
-if ((git branch --show-current) -ne 'fix/am1-elbow-commissioning') { throw 'wrong Windows branch' }
-if (git status --porcelain) { throw 'Windows worktree is not clean' }
-$packet2nR5Manifest = 'C:\Users\pickm\AlohaMini1Backups\packet2n-r5-20260822-121722-7941f445-9587-4345-8e2f-edd54ca750f6\manifest.json'
-if (-not (Test-Path -LiteralPath $packet2nR5Manifest -PathType Leaf)) { throw "missing Packet 2N-R5 backup manifest: $packet2nR5Manifest" }
+function Assert-Packet2nR5Guard {
+    $packet2nBaseline = 'f7e8254c80fffe8c215920d6928718b1f482f7a6'
+    $packet2nCalibrationRoot = 'C:\Users\pickm\.cache\huggingface\lerobot\calibration'
+    $packet2nBackupDirectory = 'C:\Users\pickm\AlohaMini1Backups\packet2n-r5-20260822-121722-7941f445-9587-4345-8e2f-edd54ca750f6'
+    $packet2nManifestPath = Join-Path $packet2nBackupDirectory 'manifest.json'
+    $packet2nFiles = @(
+        [pscustomobject]@{ Name = 'so101_leader_bi_left.json'; Bytes = 960; Sha256 = '6F5D6126E84398D0621A26E74E4DF6678EBA7C14C62D343020610B4D5D8B3D8C' },
+        [pscustomobject]@{ Name = 'so101_leader_bi_right.json'; Bytes = 961; Sha256 = '65A301F20FC7DC96BD7FB5982E3670BF1A01F535953D7A253AB8D33A03646F11' }
+    )
+    if ((git branch --show-current) -ne 'fix/am1-elbow-commissioning') { throw 'wrong Windows branch' }
+    if (git status --porcelain) { throw 'Windows worktree is not clean' }
+    git merge-base --is-ancestor $packet2nBaseline HEAD
+    if ($LASTEXITCODE -ne 0) { throw "Packet 2N-R5 baseline is not an ancestor: $packet2nBaseline" }
+    $packet2nRelevantSources = @(
+        'examples/alohamini/calibrate_bi.py',
+        'examples/alohamini/teleoperate_bi.py',
+        'examples/alohamini/leader_client_utils.py',
+        'src/lerobot/teleoperators/bi_so_leader/bi_so_leader.py',
+        'src/lerobot/teleoperators/bi_so_leader/config_bi_so_leader.py',
+        'src/lerobot/teleoperators/so_leader/so_leader.py',
+        'src/lerobot/teleoperators/so_leader/config_so_leader.py'
+    )
+    git diff --quiet $packet2nBaseline -- $packet2nRelevantSources
+    if ($LASTEXITCODE -ne 0) { throw 'reviewed Packet 2N-R5 source paths differ from the baseline' }
+    if ($env:HF_LEROBOT_CALIBRATION -or $env:HF_LEROBOT_HOME -or $env:HF_HOME) { throw 'HF calibration/home environment overrides must be unset' }
+    $packet2nResolvedRoot = (& .\.venv\Scripts\python.exe -c "from lerobot.utils.constants import HF_LEROBOT_CALIBRATION; print(HF_LEROBOT_CALIBRATION)" | Out-String).Trim()
+    if ($packet2nResolvedRoot -ne $packet2nCalibrationRoot) { throw "unexpected calibration root: $packet2nResolvedRoot" }
+    if (-not (Test-Path -LiteralPath $packet2nManifestPath -PathType Leaf)) { throw "missing Packet 2N-R5 manifest: $packet2nManifestPath" }
+    $packet2nManifest = Get-Content -Raw -LiteralPath $packet2nManifestPath | ConvertFrom-Json
+    if ($packet2nManifest.Packet -ne '2N-R5' -or $packet2nManifest.BackupDirectory -ne $packet2nBackupDirectory -or -not $packet2nManifest.CopyOnly -or -not $packet2nManifest.HardwareDisconnected) { throw 'Packet 2N-R5 manifest identity or safety fields differ' }
+    foreach ($packet2nFile in $packet2nFiles) {
+        $packet2nSource = Join-Path $packet2nCalibrationRoot "teleoperators\so_leader\$($packet2nFile.Name)"
+        $packet2nBackup = Join-Path $packet2nBackupDirectory $packet2nFile.Name
+        $packet2nManifestEntry = @($packet2nManifest.Files | Where-Object { $_.OriginalPath -eq $packet2nSource })
+        if ($packet2nManifestEntry.Count -ne 1 -or $packet2nManifestEntry[0].BackupPath -ne $packet2nBackup -or $packet2nManifestEntry[0].Sha256 -ne $packet2nFile.Sha256 -or [int64]$packet2nManifestEntry[0].Bytes -ne $packet2nFile.Bytes) { throw "manifest entry mismatch: $($packet2nFile.Name)" }
+        foreach ($packet2nPath in @($packet2nSource, $packet2nBackup)) {
+            if (-not (Test-Path -LiteralPath $packet2nPath -PathType Leaf)) { throw "missing calibration evidence: $packet2nPath" }
+            $packet2nItem = Get-Item -LiteralPath $packet2nPath
+            if ($packet2nItem.Length -ne $packet2nFile.Bytes -or (Get-FileHash -LiteralPath $packet2nPath -Algorithm SHA256).Hash -ne $packet2nFile.Sha256) { throw "calibration evidence hash/size mismatch: $packet2nPath" }
+        }
+    }
+}
+Assert-Packet2nR5Guard
 & .\.venv\Scripts\python.exe `
   .\examples\alohamini\calibrate_bi.py `
   --teleop.left_port COM8 `
@@ -513,12 +556,13 @@ if (-not (Test-Path -LiteralPath $packet2nR5Manifest -PathType Leaf)) { throw "m
 if ($LASTEXITCODE -ne 0) { throw "corrected-port full recalibration failed with $LASTEXITCODE" }
 ```
 
-After both full recalibrations return successfully, keep the same corrected USB mapping and follower/body power off. The two following marked runs are future verification commands only. They construct no robot client, send no ZMQ request, and must never be used to start follower motion, Pi communication, or startup synchronization. Move only the named physical leader after its Enter prompt; keep the other leader still. Stop immediately for any calibration prompt, unexpected powered motion, resistance, sound, heat, cable strain, communication failure, loss of the clear stop path, follower power/movement, or evidence that a robot/ZMQ connection was constructed.
+After both full recalibrations return successfully, keep the same corrected USB mapping and follower/body power off. The calibration and both marked no-robot blocks are one guarded workflow: run them in the same PowerShell session and in the printed order. `Assert-Packet2nR5Guard` is deliberately called again before each no-robot connection; a fresh or altered session fails before creating a robot/leader connection. The runs construct no robot client, send no ZMQ request, and must never be used to start follower motion, Pi communication, or startup synchronization. Move only the named physical leader after its Enter prompt; keep the other leader still. Stop immediately for any calibration prompt, unexpected powered motion, resistance, sound, heat, cable strain, communication failure, loss of the clear stop path, follower power/movement, or evidence that a robot/ZMQ connection was constructed.
 
 **Future corrected-port physical-left-only no-robot run (`COM8`).**
 
 ```powershell
 $ErrorActionPreference = 'Stop'
+Assert-Packet2nR5Guard
 $packet2nCorrectedMapDir = 'C:\Users\pickm\AlohaMini1Logs'
 New-Item -ItemType Directory -Force -Path $packet2nCorrectedMapDir | Out-Null
 $packet2nCorrectedTimestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
@@ -546,6 +590,7 @@ if ($packet2nCorrectedPhysicalLeftExitCode -ne 0) { throw "corrected physical-le
 
 ```powershell
 $ErrorActionPreference = 'Stop'
+Assert-Packet2nR5Guard
 $packet2nCorrectedMapDir = 'C:\Users\pickm\AlohaMini1Logs'
 New-Item -ItemType Directory -Force -Path $packet2nCorrectedMapDir | Out-Null
 $packet2nCorrectedTimestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
