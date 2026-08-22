@@ -500,11 +500,12 @@ The manifest records each original and backup path, SHA-256, byte count, and sou
 
 The only approved later correction is a coordinated **full recalibration**, after a separate physical authorization: logical/physical left must be `COM8`, logical/physical right must be `COM7`, the ID must be `so101_leader_bi`, and the profile must be `so-arm-5dof`. Do not do a port-only swap, JSON-content swap, or runtime swap layer. Begin with the Pi motor host stopped, follower/body 12 V power off, both leader supplies off, and both leader USB controllers disconnected. Do not run this task's future commands until physical authorization is granted.
 
-**Future corrected-port full recalibration — fail fast.** The guard below is part of every future connection attempt. It rejects all Hugging Face calibration/home overrides, resolves and pins the evidence default calibration root, validates the manifest's exact original/backup paths, bytes, and hashes, and validates both files at both locations before connection. It also requires the reviewed `f7e8254c80fffe8c215920d6928718b1f482f7a6` baseline as an ancestor and requires every calibration/leader-client source path listed in the guard to be byte-identical to that baseline; this non-self-referential source review remains valid on later reviewed documentation commits. After physical authorization and only with the operator's clear stop path, run exactly this command. At **both** existing-file prompts, verify the shown child identity matches the expected logical child and type exactly `c` (lowercase, then Enter) to force its full recalibration. Stop immediately—without accepting the existing file—on any unexpected prompt, child ID, port, profile, connection/calibration error, or safety concern. Do not continue to no-robot verification after any mismatch.
+**Future corrected-port full recalibration — fail fast.** The guard below is part of every future connection attempt. It rejects all Hugging Face calibration/home overrides, resolves and pins the evidence default calibration root, and validates the manifest's exact original/backup paths, bytes, and hashes. Before calibration, it requires both current sources and both backups to retain the verified pre-calibration hashes. After calibration, it continues to require the manifest and backups unchanged but requires the current sources to match freshly captured same-session post-calibration evidence instead of the old hashes. It also requires the reviewed `f7e8254c80fffe8c215920d6928718b1f482f7a6` baseline as an ancestor and requires every calibration/leader-client source path listed in the guard to be byte-identical to that baseline; this non-self-referential source review remains valid on later reviewed documentation commits. After physical authorization and only with the operator's clear stop path, run exactly this command. At **both** existing-file prompts, verify the shown child identity matches the expected logical child and type exactly `c` (lowercase, then Enter) to force its full recalibration. Stop immediately—without accepting the existing file—on any unexpected prompt, child ID, port, profile, connection/calibration error, or safety concern. Do not continue to no-robot verification after any mismatch.
 
 ```powershell
 $ErrorActionPreference = 'Stop'
-function Assert-Packet2nR5Guard {
+$script:packet2nR5PostCalibrationEvidence = $null
+function Assert-Packet2nR5CommonGuard {
     $packet2nBaseline = 'f7e8254c80fffe8c215920d6928718b1f482f7a6'
     $packet2nCalibrationRoot = 'C:\Users\pickm\.cache\huggingface\lerobot\calibration'
     $packet2nBackupDirectory = 'C:\Users\pickm\AlohaMini1Backups\packet2n-r5-20260822-121722-7941f445-9587-4345-8e2f-edd54ca750f6'
@@ -539,14 +540,61 @@ function Assert-Packet2nR5Guard {
         $packet2nBackup = Join-Path $packet2nBackupDirectory $packet2nFile.Name
         $packet2nManifestEntry = @($packet2nManifest.Files | Where-Object { $_.OriginalPath -eq $packet2nSource })
         if ($packet2nManifestEntry.Count -ne 1 -or $packet2nManifestEntry[0].BackupPath -ne $packet2nBackup -or $packet2nManifestEntry[0].Sha256 -ne $packet2nFile.Sha256 -or [int64]$packet2nManifestEntry[0].Bytes -ne $packet2nFile.Bytes) { throw "manifest entry mismatch: $($packet2nFile.Name)" }
-        foreach ($packet2nPath in @($packet2nSource, $packet2nBackup)) {
-            if (-not (Test-Path -LiteralPath $packet2nPath -PathType Leaf)) { throw "missing calibration evidence: $packet2nPath" }
-            $packet2nItem = Get-Item -LiteralPath $packet2nPath
-            if ($packet2nItem.Length -ne $packet2nFile.Bytes -or (Get-FileHash -LiteralPath $packet2nPath -Algorithm SHA256).Hash -ne $packet2nFile.Sha256) { throw "calibration evidence hash/size mismatch: $packet2nPath" }
-        }
+        if (-not (Test-Path -LiteralPath $packet2nBackup -PathType Leaf)) { throw "missing calibration backup: $packet2nBackup" }
+        $packet2nBackupItem = Get-Item -LiteralPath $packet2nBackup
+        if ($packet2nBackupItem.Length -ne $packet2nFile.Bytes -or (Get-FileHash -LiteralPath $packet2nBackup -Algorithm SHA256).Hash -ne $packet2nFile.Sha256) { throw "calibration backup hash/size mismatch: $packet2nBackup" }
     }
 }
-Assert-Packet2nR5Guard
+function Assert-Packet2nR5PreCalibrationGuard {
+    Assert-Packet2nR5CommonGuard
+    $packet2nCalibrationRoot = 'C:\Users\pickm\.cache\huggingface\lerobot\calibration'
+    $packet2nFiles = @(
+        [pscustomobject]@{ Name = 'so101_leader_bi_left.json'; Bytes = 960; Sha256 = '6F5D6126E84398D0621A26E74E4DF6678EBA7C14C62D343020610B4D5D8B3D8C' },
+        [pscustomobject]@{ Name = 'so101_leader_bi_right.json'; Bytes = 961; Sha256 = '65A301F20FC7DC96BD7FB5982E3670BF1A01F535953D7A253AB8D33A03646F11' }
+    )
+    foreach ($packet2nFile in $packet2nFiles) {
+        $packet2nSource = Join-Path $packet2nCalibrationRoot "teleoperators\so_leader\$($packet2nFile.Name)"
+        if (-not (Test-Path -LiteralPath $packet2nSource -PathType Leaf)) { throw "missing pre-calibration source: $packet2nSource" }
+        $packet2nSourceItem = Get-Item -LiteralPath $packet2nSource
+        if ($packet2nSourceItem.Length -ne $packet2nFile.Bytes -or (Get-FileHash -LiteralPath $packet2nSource -Algorithm SHA256).Hash -ne $packet2nFile.Sha256) { throw "pre-calibration source hash/size mismatch: $packet2nSource" }
+    }
+}
+function Save-Packet2nR5PostCalibrationEvidence {
+    Assert-Packet2nR5CommonGuard
+    $packet2nCalibrationRoot = 'C:\Users\pickm\.cache\huggingface\lerobot\calibration'
+    $packet2nManifestPath = 'C:\Users\pickm\AlohaMini1Backups\packet2n-r5-20260822-121722-7941f445-9587-4345-8e2f-edd54ca750f6\manifest.json'
+    $packet2nManifest = Get-Content -Raw -LiteralPath $packet2nManifestPath | ConvertFrom-Json
+    $packet2nNames = @('so101_leader_bi_left.json', 'so101_leader_bi_right.json')
+    $script:packet2nR5PostCalibrationEvidence = @(
+        foreach ($packet2nName in $packet2nNames) {
+            $packet2nSource = Join-Path $packet2nCalibrationRoot "teleoperators\so_leader\$packet2nName"
+            if (-not (Test-Path -LiteralPath $packet2nSource -PathType Leaf)) { throw "missing post-calibration source: $packet2nSource" }
+            $packet2nSourceItem = Get-Item -LiteralPath $packet2nSource
+            $packet2nManifestEntry = @($packet2nManifest.Files | Where-Object { $_.OriginalPath -eq $packet2nSource })
+            if ($packet2nManifestEntry.Count -ne 1 -or $packet2nSourceItem.LastWriteTimeUtc -le [datetime]$packet2nManifestEntry[0].SourceLastWriteTimeUtc) { throw "post-calibration rewrite was not proven: $packet2nSource" }
+            [pscustomobject]@{ Name = $packet2nName; Path = $packet2nSource; Bytes = [int64]$packet2nSourceItem.Length; Sha256 = (Get-FileHash -LiteralPath $packet2nSource -Algorithm SHA256).Hash; LastWriteTimeUtc = $packet2nSourceItem.LastWriteTimeUtc.ToString('o') }
+        }
+    )
+    if ($script:packet2nR5PostCalibrationEvidence.Count -ne 2) { throw 'post-calibration evidence did not capture both sources' }
+}
+function Assert-Packet2nR5PostCalibrationGuard {
+    Assert-Packet2nR5CommonGuard
+    if ($null -eq $script:packet2nR5PostCalibrationEvidence -or $script:packet2nR5PostCalibrationEvidence.Count -ne 2) { throw 'missing same-session post-calibration evidence' }
+    $packet2nCalibrationRoot = 'C:\Users\pickm\.cache\huggingface\lerobot\calibration'
+    $packet2nManifestPath = 'C:\Users\pickm\AlohaMini1Backups\packet2n-r5-20260822-121722-7941f445-9587-4345-8e2f-edd54ca750f6\manifest.json'
+    $packet2nManifest = Get-Content -Raw -LiteralPath $packet2nManifestPath | ConvertFrom-Json
+    $packet2nNames = @('so101_leader_bi_left.json', 'so101_leader_bi_right.json')
+    foreach ($packet2nName in $packet2nNames) {
+        $packet2nSource = Join-Path $packet2nCalibrationRoot "teleoperators\so_leader\$packet2nName"
+        $packet2nEvidence = @($script:packet2nR5PostCalibrationEvidence | Where-Object { $_.Name -eq $packet2nName })
+        $packet2nManifestEntry = @($packet2nManifest.Files | Where-Object { $_.OriginalPath -eq $packet2nSource })
+        if ($packet2nEvidence.Count -ne 1 -or $packet2nManifestEntry.Count -ne 1 -or $packet2nEvidence[0].Path -ne $packet2nSource -or -not (Test-Path -LiteralPath $packet2nSource -PathType Leaf)) { throw "invalid post-calibration evidence: $packet2nName" }
+        $packet2nSourceItem = Get-Item -LiteralPath $packet2nSource
+        $packet2nSourceHash = (Get-FileHash -LiteralPath $packet2nSource -Algorithm SHA256).Hash
+        if ($packet2nSourceItem.LastWriteTimeUtc -le [datetime]$packet2nManifestEntry[0].SourceLastWriteTimeUtc -or $packet2nSourceItem.Length -ne [int64]$packet2nEvidence[0].Bytes -or $packet2nSourceHash -ne $packet2nEvidence[0].Sha256 -or $packet2nSourceItem.LastWriteTimeUtc.ToString('o') -ne $packet2nEvidence[0].LastWriteTimeUtc) { throw "post-calibration source changed after capture: $packet2nSource" }
+    }
+}
+Assert-Packet2nR5PreCalibrationGuard
 & .\.venv\Scripts\python.exe `
   .\examples\alohamini\calibrate_bi.py `
   --teleop.left_port COM8 `
@@ -554,15 +602,16 @@ Assert-Packet2nR5Guard
   --teleop.id so101_leader_bi `
   --teleop.arm_profile so-arm-5dof
 if ($LASTEXITCODE -ne 0) { throw "corrected-port full recalibration failed with $LASTEXITCODE" }
+Save-Packet2nR5PostCalibrationEvidence
 ```
 
-After both full recalibrations return successfully, keep the same corrected USB mapping and follower/body power off. The calibration and both marked no-robot blocks are one guarded workflow: run them in the same PowerShell session and in the printed order. `Assert-Packet2nR5Guard` is deliberately called again before each no-robot connection; a fresh or altered session fails before creating a robot/leader connection. The runs construct no robot client, send no ZMQ request, and must never be used to start follower motion, Pi communication, or startup synchronization. Move only the named physical leader after its Enter prompt; keep the other leader still. Stop immediately for any calibration prompt, unexpected powered motion, resistance, sound, heat, cable strain, communication failure, loss of the clear stop path, follower power/movement, or evidence that a robot/ZMQ connection was constructed.
+After a zero-exit full recalibration, the workflow requires both current source `LastWriteTimeUtc` values to be strictly newer than their manifest `SourceLastWriteTimeUtc` values, proving the two logical JSONs were rewritten rather than silently reused. It then captures exactly the pinned-root, two-file post-calibration paths, byte counts, SHA-256 values, and UTC last-write times into the session-local `$script:packet2nR5PostCalibrationEvidence`. The calibration and both marked no-robot blocks are one guarded workflow: run them in the same PowerShell session and in the printed order. Each no-robot block reruns common branch/source-baseline/root/manifest/backup checks and then requires that session evidence and exact current agreement with its post-calibration hash, size, and UTC last-write time. A fresh session, missing capture, unchanged pre-calibration timestamp, stale evidence, or later calibration-source mutation fails before creating a robot/leader connection; the post-calibration sources are intentionally not compared to their pre-calibration hashes. The runs construct no robot client, send no ZMQ request, and must never be used to start follower motion, Pi communication, or startup synchronization. Move only the named physical leader after its Enter prompt; keep the other leader still. Stop immediately for any calibration prompt, unexpected powered motion, resistance, sound, heat, cable strain, communication failure, loss of the clear stop path, follower power/movement, or evidence that a robot/ZMQ connection was constructed.
 
 **Future corrected-port physical-left-only no-robot run (`COM8`).**
 
 ```powershell
 $ErrorActionPreference = 'Stop'
-Assert-Packet2nR5Guard
+Assert-Packet2nR5PostCalibrationGuard
 $packet2nCorrectedMapDir = 'C:\Users\pickm\AlohaMini1Logs'
 New-Item -ItemType Directory -Force -Path $packet2nCorrectedMapDir | Out-Null
 $packet2nCorrectedTimestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
@@ -590,7 +639,7 @@ if ($packet2nCorrectedPhysicalLeftExitCode -ne 0) { throw "corrected physical-le
 
 ```powershell
 $ErrorActionPreference = 'Stop'
-Assert-Packet2nR5Guard
+Assert-Packet2nR5PostCalibrationGuard
 $packet2nCorrectedMapDir = 'C:\Users\pickm\AlohaMini1Logs'
 New-Item -ItemType Directory -Force -Path $packet2nCorrectedMapDir | Out-Null
 $packet2nCorrectedTimestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
