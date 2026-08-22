@@ -483,6 +483,7 @@ def test_force_fresh_calibration_default_path_is_unchanged_and_sixdof_is_rejecte
     ("arguments", "reason"),
     [
         (["--robot.robot_model", "alohamini2"], "--require_calibration_match requires --robot.robot_model alohamini1"),
+        (["--robot.robot_model", "alohamini2pro"], "--require_calibration_match requires --robot.robot_model alohamini1"),
         (["--teleop.arm_profile", "am-leader-6dof"], "--require_calibration_match requires --teleop.arm_profile so-arm-5dof"),
         ([], "--require_calibration_match requires --no_robot"),
         (["--no_robot", "--no_leader"], "--require_calibration_match requires leader connections"),
@@ -552,8 +553,6 @@ def test_require_calibration_match_refuses_before_actions_and_cleans_connected_a
         [
             "--require_calibration_match",
             "--no_robot",
-            "--no_keyboard",
-            "--no_rerun",
             "--teleop.left_port",
             "COM5",
             "--teleop.right_port",
@@ -564,7 +563,37 @@ def test_require_calibration_match_refuses_before_actions_and_cleans_connected_a
 
     assert module.run_teleoperation(args) == 2
     assert events == expected_events
-    assert f"SAFETY REFUSAL: {mismatch_side} leader calibration is not loaded." in capsys.readouterr().out
+    assert f"SAFETY REFUSAL: {mismatch_side} leader calibration is missing or does not match the connected arm; refusing without calibration" in capsys.readouterr().out
+
+
+def test_require_calibration_match_connect_read_failure_preserves_primary_and_disconnects(monkeypatch):
+    module = load_example_module("teleoperate_bi")
+    events = []
+    primary = RuntimeError("implicit calibration read failed")
+
+    class Arm:
+        def connect(self, calibrate=True):
+            events.append(("left", "connect", calibrate))
+            raise primary
+
+        def disconnect(self):
+            events.append(("left", "disconnect"))
+            raise RuntimeError("not connected")
+
+    class Leader:
+        def __init__(self, config):
+            self.left_arm = Arm()
+            self.right_arm = SimpleNamespace(connect=lambda **_: (_ for _ in ()).throw(AssertionError("right connected")))
+
+    monkeypatch.setattr(module, "BiSOLeader", Leader)
+    monkeypatch.setattr(module, "AlohaMiniClient", lambda config: (_ for _ in ()).throw(AssertionError("robot constructed")))
+    monkeypatch.setattr(module, "KeyboardTeleop", lambda config: (_ for _ in ()).throw(AssertionError("keyboard constructed")))
+    monkeypatch.setattr(module, "load_rerun_functions", lambda: (_ for _ in ()).throw(AssertionError("rerun loaded")))
+    args = module.parse_args(["--require_calibration_match", "--no_robot", "--teleop.left_port", "COM5", "--teleop.right_port", "COM6"], platform_name="Windows")
+    with pytest.raises(RuntimeError) as caught:
+        module.run_teleoperation(args)
+    assert caught.value is primary
+    assert events == [("left", "connect", False), ("left", "disconnect")]
 
 
 def test_am1_validation_rejects_out_of_range_joint_with_exact_identity():

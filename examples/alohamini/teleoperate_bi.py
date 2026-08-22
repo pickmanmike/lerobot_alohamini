@@ -760,19 +760,19 @@ def run_teleoperation(
         if not args.no_leader:
             leader = BiSOLeader(make_leader_config(args))
             if args.require_calibration_match:
-                leader.left_arm.connect(calibrate=False)
                 left_leader_connected = True
+                leader.left_arm.connect(calibrate=False)
                 try:
                     if not leader.left_arm.is_calibrated:
-                        raise SafetyRefusal("left leader calibration is not loaded.")
+                        raise SafetyRefusal("left leader calibration is missing or does not match the connected arm; refusing without calibration")
                 except SafetyRefusal as exc:
                     print(f"SAFETY REFUSAL: {exc}")
                     return 2
-                leader.right_arm.connect(calibrate=False)
                 right_leader_connected = True
+                leader.right_arm.connect(calibrate=False)
                 try:
                     if not leader.right_arm.is_calibrated:
-                        raise SafetyRefusal("right leader calibration is not loaded.")
+                        raise SafetyRefusal("right leader calibration is missing or does not match the connected arm; refusing without calibration")
                 except SafetyRefusal as exc:
                     print(f"SAFETY REFUSAL: {exc}")
                     return 2
