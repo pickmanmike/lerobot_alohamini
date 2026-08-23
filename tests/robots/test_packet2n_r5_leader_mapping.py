@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import os
 import shutil
 import subprocess
@@ -144,6 +143,46 @@ def make_partial_log(stage: str) -> str:
             "CLIENT_EXIT_CODE=0",
         ]
     ) + "\n"
+
+
+def format_python_dict(pairs: list[tuple[str, object]]) -> str:
+    rendered = []
+    for key, value in pairs:
+        rendered.append(f"{key!r}: {value!r}")
+    return "{" + ", ".join(rendered) + "}"
+
+
+def actual_action_pairs(*, physical_side: str, sample_index: int) -> list[tuple[str, float]]:
+    values = make_map_values(physical_side=physical_side, sample_index=sample_index)
+    return [(key, values[key]) for key in SAMPLE_KEYS]
+
+
+def make_actual_map_log(
+    *,
+    marker: str,
+    state_hash: str,
+    evidence_hash: str,
+    physical_side: str,
+    transcript_path: str = r"C:\logs\packet2n-r5-calibration.log",
+    action_pairs: list[list[tuple[str, object]]] | None = None,
+) -> str:
+    actions = action_pairs or [actual_action_pairs(physical_side=physical_side, sample_index=index) for index in range(60)]
+    lines = [
+        f"MAP_RUN={marker}",
+        "SESSION_ID=test-session",
+        "UTC_START=2026-08-22T00:00:00Z",
+        f"STATE_SHA256={state_hash}",
+        f"EVIDENCE_SHA256={evidence_hash}",
+        f"TRANSCRIPT_PATH={transcript_path}",
+        "NO_ROBOT: robot client construction and connection skipped.",
+    ]
+    for pairs in actions:
+        lines.append(f"[NO_ROBOT] action -> {format_python_dict(pairs)}")
+    lines.append(
+        "Shutdown complete: final zero requested when connected; keyboard, leader buses, robot client, and visualization cleaned up when started."
+    )
+    lines.append("CLIENT_EXIT_CODE=0")
+    return "\n".join(lines) + "\n"
 
 
 def base_plan(tmp_path: Path) -> dict[str, object]:
@@ -293,6 +332,19 @@ def load_state(path: Path) -> dict[str, object]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def run_calibrate(plan: dict[str, object], tmp_path: Path, state_path: Path) -> subprocess.CompletedProcess[str]:
+    return run_runner(
+        "-Stage",
+        "Calibrate",
+        "-StatePath",
+        str(state_path),
+        "-Confirm",
+        "CALIBRATE",
+        plan=plan,
+        tmp_path=tmp_path,
+    )
+
+
 def test_missing_state_refuses_before_command_execution(tmp_path):
     plan = base_plan(tmp_path)
     state_path = tmp_path / "logs" / "missing-state.json"
@@ -351,7 +403,7 @@ def test_native_never_launched_cannot_yield_exit_zero(tmp_path):
     assert "Native command did not launch" in result.stderr
     state = load_state(state_path)
     assert state["stages"]["Calibrate"]["native"]["launched"] is False
-    assert state["stages"]["Calibrate"]["native"]["real_exit_code"] == 0
+    assert state["stages"]["Calibrate"]["native"]["real_exit_code"] is None
     assert not Path(plan["stage_plan"]["Calibrate"]["transcript_path"]).exists()
 
 
@@ -587,3 +639,314 @@ def test_status_on_original_state_is_offline_and_reports_next_calibrate(tmp_path
     assert payload["classification"] == "ORIGINAL_CALIBRATION_INTACT"
     assert payload["next_stage"] == "Calibrate"
     assert not state_path.exists()
+
+
+def test_status_without_state_reports_orphaned_fresh_calibration_and_dry_run_plan(tmp_path):
+    plan = base_plan(tmp_path)
+    write_json(Path(plan["calibration"]["left"]["path"]), make_calibration(400))
+    write_json(Path(plan["calibration"]["right"]["path"]), make_calibration(500))
+    result = run_runner(
+        "-Stage",
+        "Status",
+        "-StatePath",
+        str(tmp_path / "logs" / "missing-state.json"),
+        plan=plan,
+        tmp_path=tmp_path,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "ORPHANED_FRESH_CALIBRATION" in result.stdout
+    assert "dry-run-only recovery plan" in result.stdout
+    assert "preserve orphaned files" in result.stdout
+    assert "restore immutable originals only under later exact reviewed authorization" in result.stdout
+
+
+def test_status_with_malformed_state_reports_invalid_uncertain_and_missing_keys(tmp_path):
+    plan = base_plan(tmp_path)
+    state_path = tmp_path / "logs" / "packet2n-r5-state.json"
+    write_json(state_path, {"schema_version": "1"})
+    result = run_runner(
+        "-Stage",
+        "Status",
+        "-StatePath",
+        str(state_path),
+        plan=plan,
+        tmp_path=tmp_path,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "INVALID_OR_UNCERTAIN_STATE" in result.stdout
+    assert "missing" in result.stdout
+    assert "runner_version" in result.stdout
+
+
+def test_calibration_records_exact_real_command_array_and_executable(tmp_path):
+    plan = base_plan(tmp_path)
+    state_path = tmp_path / "logs" / "packet2n-r5-state.json"
+    result = run_calibrate(plan, tmp_path, state_path)
+
+    assert result.returncode == 0, result.stderr
+    state = load_state(state_path)
+    native = state["stages"]["Calibrate"]["native"]
+    assert native["executable"] == str(REPO_ROOT / ".venv" / "Scripts" / "python.exe")
+    assert native["arguments"] == [
+        str(REPO_ROOT / "examples" / "alohamini" / "calibrate_bi.py"),
+        "--teleop.left_port",
+        LEFT_PORT,
+        "--teleop.right_port",
+        RIGHT_PORT,
+        "--teleop.id",
+        LEADER_ID,
+        "--teleop.arm_profile",
+        ARM_PROFILE,
+        "--force_fresh_calibration",
+    ]
+
+
+def test_script_defines_real_execution_plan_and_no_unconditional_test_mode_disable():
+    source = SCRIPT_PATH.read_text(encoding="utf-8")
+
+    assert "function Get-ExecutionPlan" in source
+    assert "Hardware-capable stages are intentionally disabled outside PACKET2N_R5_TEST_MODE=1" not in source
+
+
+def test_preexisting_map_path_refuses_before_launch_and_keeps_native_unattempted(tmp_path):
+    plan = base_plan(tmp_path)
+    state_path = tmp_path / "logs" / "packet2n-r5-state.json"
+    calibrate = run_calibrate(plan, tmp_path, state_path)
+    assert calibrate.returncode == 0, calibrate.stderr
+    map_path = Path(plan["stage_plan"][LEFT_MAP_STAGE]["map_path"])
+    write_text(map_path, "preexisting\n")
+
+    result = run_runner(
+        "-Stage",
+        LEFT_MAP_STAGE,
+        "-StatePath",
+        str(state_path),
+        "-Confirm",
+        "MAPLEFT",
+        plan=plan,
+        tmp_path=tmp_path,
+    )
+
+    assert result.returncode != 0
+    assert "Refusing to overwrite existing file" in result.stderr
+    state = load_state(state_path)
+    assert state["stages"][LEFT_MAP_STAGE]["native"]["attempted"] is False
+    assert state["stages"][LEFT_MAP_STAGE]["native"]["real_exit_code"] is None
+
+
+def test_transcript_tampering_refuses_before_mapping(tmp_path):
+    plan = base_plan(tmp_path)
+    state_path = tmp_path / "logs" / "packet2n-r5-state.json"
+    calibrate = run_calibrate(plan, tmp_path, state_path)
+    assert calibrate.returncode == 0, calibrate.stderr
+    transcript_path = Path(plan["stage_plan"]["Calibrate"]["transcript_path"])
+    write_text(transcript_path, transcript_path.read_text(encoding="utf-8") + "tampered\n")
+
+    result = run_runner(
+        "-Stage",
+        LEFT_MAP_STAGE,
+        "-StatePath",
+        str(state_path),
+        "-Confirm",
+        "MAPLEFT",
+        plan=plan,
+        tmp_path=tmp_path,
+    )
+
+    assert result.returncode != 0
+    assert "Transcript hash mismatch" in result.stderr
+
+
+def test_state_repo_head_path_and_runner_sha_mismatches_refuse_later_stage(tmp_path):
+    plan = base_plan(tmp_path)
+    state_path = tmp_path / "logs" / "packet2n-r5-state.json"
+    calibrate = run_calibrate(plan, tmp_path, state_path)
+    assert calibrate.returncode == 0, calibrate.stderr
+    state = load_state(state_path)
+    state["repo_head"] = "deadbeef"
+    state["state_path"] = str(tmp_path / "logs" / "wrong-state.json")
+    state["runner_sha"] = "BADSHA"
+    write_json(state_path, state)
+
+    result = run_runner(
+        "-Stage",
+        LEFT_MAP_STAGE,
+        "-StatePath",
+        str(state_path),
+        "-Confirm",
+        "MAPLEFT",
+        plan=plan,
+        tmp_path=tmp_path,
+    )
+
+    assert result.returncode != 0
+    assert "State repository provenance is invalid" in result.stderr
+
+
+def test_verify_accepts_actual_client_log_shape_and_uses_per_key_opposite_family_range(tmp_path):
+    plan = base_plan(tmp_path)
+    state_path = tmp_path / "logs" / "packet2n-r5-state.json"
+    calibrate = run_calibrate(plan, tmp_path, state_path)
+    assert calibrate.returncode == 0, calibrate.stderr
+    state = load_state(state_path)
+    evidence_hash = state["artifacts"]["evidence"]["sha256"]
+    state_hash = sha256_path(state_path)
+
+    left_actions = []
+    for index in range(60):
+        pairs = actual_action_pairs(physical_side="left", sample_index=index)
+        adjusted = []
+        for key, value in pairs:
+            if key == "arm_right_shoulder_pan.pos":
+                adjusted.append((key, -40.0))
+            elif key == "arm_right_shoulder_lift.pos":
+                adjusted.append((key, -20.0))
+            elif key == "arm_right_elbow_flex.pos":
+                adjusted.append((key, 0.0))
+            elif key == "arm_right_wrist_flex.pos":
+                adjusted.append((key, 20.0))
+            elif key == "arm_right_wrist_roll.pos":
+                adjusted.append((key, 40.0))
+            else:
+                adjusted.append((key, value))
+        left_actions.append(adjusted)
+    right_actions = [actual_action_pairs(physical_side="right", sample_index=index) for index in range(60)]
+
+    left_map_path = Path(plan["stage_plan"][LEFT_MAP_STAGE]["map_path"])
+    right_map_path = Path(plan["stage_plan"][RIGHT_MAP_STAGE]["map_path"])
+    write_text(
+        left_map_path,
+        make_actual_map_log(
+            marker="PHYSICAL_LEFT_ONLY",
+            state_hash=state_hash,
+            evidence_hash=evidence_hash,
+            physical_side="left",
+            action_pairs=left_actions,
+        ),
+    )
+    write_text(
+        right_map_path,
+        make_actual_map_log(
+            marker="PHYSICAL_RIGHT_ONLY",
+            state_hash=state_hash,
+            evidence_hash=evidence_hash,
+            physical_side="right",
+            action_pairs=right_actions,
+        ),
+    )
+    state["completed_stages"] = ["Calibrate", LEFT_MAP_STAGE, RIGHT_MAP_STAGE]
+    state["artifacts"]["map_left"] = {"path": str(left_map_path), "sha256": sha256_path(left_map_path)}
+    state["artifacts"]["map_right"] = {"path": str(right_map_path), "sha256": sha256_path(right_map_path)}
+    write_json(state_path, state)
+
+    verify = run_runner(
+        "-Stage",
+        "Verify",
+        "-StatePath",
+        str(state_path),
+        plan=plan,
+        tmp_path=tmp_path,
+    )
+
+    assert verify.returncode == 0, verify.stderr
+    assert verify.stdout.strip() == "MAPPING_RESULT=CORRECT"
+
+
+def test_verify_rejects_actual_client_log_with_duplicate_key(tmp_path):
+    plan = base_plan(tmp_path)
+    state_path = tmp_path / "logs" / "packet2n-r5-state.json"
+    calibrate = run_calibrate(plan, tmp_path, state_path)
+    assert calibrate.returncode == 0, calibrate.stderr
+    state = load_state(state_path)
+    evidence_hash = state["artifacts"]["evidence"]["sha256"]
+    state_hash = sha256_path(state_path)
+    bad_pairs = actual_action_pairs(physical_side="left", sample_index=0)
+    bad_pairs.insert(1, ("arm_left_shoulder_pan.pos", 123.0))
+    left_actions = [bad_pairs] + [actual_action_pairs(physical_side="left", sample_index=index) for index in range(1, 60)]
+    right_actions = [actual_action_pairs(physical_side="right", sample_index=index) for index in range(60)]
+    left_map_path = Path(plan["stage_plan"][LEFT_MAP_STAGE]["map_path"])
+    right_map_path = Path(plan["stage_plan"][RIGHT_MAP_STAGE]["map_path"])
+    write_text(
+        left_map_path,
+        make_actual_map_log(
+            marker="PHYSICAL_LEFT_ONLY",
+            state_hash=state_hash,
+            evidence_hash=evidence_hash,
+            physical_side="left",
+            action_pairs=left_actions,
+        ),
+    )
+    write_text(
+        right_map_path,
+        make_actual_map_log(
+            marker="PHYSICAL_RIGHT_ONLY",
+            state_hash=state_hash,
+            evidence_hash=evidence_hash,
+            physical_side="right",
+            action_pairs=right_actions,
+        ),
+    )
+    state["completed_stages"] = ["Calibrate", LEFT_MAP_STAGE, RIGHT_MAP_STAGE]
+    state["artifacts"]["map_left"] = {"path": str(left_map_path), "sha256": sha256_path(left_map_path)}
+    state["artifacts"]["map_right"] = {"path": str(right_map_path), "sha256": sha256_path(right_map_path)}
+    write_json(state_path, state)
+
+    verify = run_runner(
+        "-Stage",
+        "Verify",
+        "-StatePath",
+        str(state_path),
+        plan=plan,
+        tmp_path=tmp_path,
+    )
+
+    assert verify.returncode != 0
+    assert "duplicate key arm_left_shoulder_pan.pos" in verify.stderr
+
+
+def test_verify_rejects_reversed_or_ambiguous_actual_maps(tmp_path):
+    plan = base_plan(tmp_path)
+    state_path = tmp_path / "logs" / "packet2n-r5-state.json"
+    calibrate = run_calibrate(plan, tmp_path, state_path)
+    assert calibrate.returncode == 0, calibrate.stderr
+    state = load_state(state_path)
+    evidence_hash = state["artifacts"]["evidence"]["sha256"]
+    state_hash = sha256_path(state_path)
+    left_map_path = Path(plan["stage_plan"][LEFT_MAP_STAGE]["map_path"])
+    right_map_path = Path(plan["stage_plan"][RIGHT_MAP_STAGE]["map_path"])
+    write_text(
+        left_map_path,
+        make_actual_map_log(
+            marker="PHYSICAL_LEFT_ONLY",
+            state_hash=state_hash,
+            evidence_hash=evidence_hash,
+            physical_side="right",
+        ),
+    )
+    write_text(
+        right_map_path,
+        make_actual_map_log(
+            marker="PHYSICAL_RIGHT_ONLY",
+            state_hash=state_hash,
+            evidence_hash=evidence_hash,
+            physical_side="right",
+        ),
+    )
+    state["completed_stages"] = ["Calibrate", LEFT_MAP_STAGE, RIGHT_MAP_STAGE]
+    state["artifacts"]["map_left"] = {"path": str(left_map_path), "sha256": sha256_path(left_map_path)}
+    state["artifacts"]["map_right"] = {"path": str(right_map_path), "sha256": sha256_path(right_map_path)}
+    write_json(state_path, state)
+
+    verify = run_runner(
+        "-Stage",
+        "Verify",
+        "-StatePath",
+        str(state_path),
+        plan=plan,
+        tmp_path=tmp_path,
+    )
+
+    assert verify.returncode != 0
+    assert "logical-left classification failed" in verify.stderr
