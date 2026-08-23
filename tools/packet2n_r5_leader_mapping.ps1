@@ -97,21 +97,6 @@ $ReviewedImportModules = @(
     "lerobot.teleoperators.bi_so_leader.bi_so_leader",
     "lerobot.teleoperators.so_leader.so_leader"
 )
-$ReviewedProtectedRuntimePaths = @(
-    "examples\alohamini\calibrate_bi.py",
-    "examples\alohamini\teleoperate_bi.py",
-    "examples\alohamini\leader_client_utils.py",
-    "src\lerobot\teleoperators\bi_so_leader\config_bi_so_leader.py",
-    "src\lerobot\teleoperators\bi_so_leader\bi_so_leader.py",
-    "src\lerobot\teleoperators\so_leader\config_so_leader.py",
-    "src\lerobot\teleoperators\so_leader\so_leader.py",
-    "src\lerobot\teleoperators\teleoperator.py",
-    "src\lerobot\motors\motors_bus.py",
-    "src\lerobot\motors\feetech\feetech.py",
-    "src\lerobot\motors\feetech\tables.py",
-    "src\lerobot\utils\constants.py"
-)
-
 function Invoke-ExternalCommand {
     param(
         [Parameter(Mandatory = $true)]
@@ -219,6 +204,15 @@ function ConvertTo-CanonicalJson {
     return ($Value | ConvertTo-Json -Depth 100)
 }
 
+function ConvertTo-CompactJson {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Value
+    )
+
+    return ($Value | ConvertTo-Json -Depth 100 -Compress)
+}
+
 function Write-JsonAtomic {
     param(
         [Parameter(Mandatory = $true)]
@@ -254,7 +248,7 @@ function Read-JsonFile {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         throw "Missing JSON file: $Path"
     }
-    return (Get-Content -Raw -LiteralPath $Path | ConvertFrom-Json -AsHashtable -Depth 100)
+    return (Get-Content -Raw -LiteralPath $Path | ConvertFrom-Json -AsHashtable -Depth 100 -DateKind String)
 }
 
 function New-Failure {
@@ -280,7 +274,7 @@ function Require-Confirmation {
         "MapRight" { "MAPRIGHT" }
         default { $null }
     }
-    if ($null -ne $expected -and $ConfirmValue -ne $expected) {
+    if ($null -ne $expected -and $ConfirmValue -cne $expected) {
         New-Failure "Stage $StageName requires -Confirm $expected"
     }
 }
@@ -336,10 +330,6 @@ function Get-ImportSourcesMatch {
     return $true
 }
 
-function Get-ProtectedRuntimePaths {
-    return @($ReviewedProtectedRuntimePaths | ForEach-Object { Join-Path $RepositoryRoot $_ })
-}
-
 function Get-ReservedArtifactPaths {
     param(
         [Parameter(Mandatory = $true)]
@@ -380,6 +370,12 @@ function Get-StateSessionBindingDigest {
         leader_id       = $State.leader_id
         arm_profile     = $State.arm_profile
         ports           = $orderedPorts
+        artifact_paths  = [ordered]@{
+            transcript = $State.artifacts.transcript.path
+            evidence   = $State.artifacts.evidence.path
+            map_left   = $State.artifacts.map_left.path
+            map_right  = $State.artifacts.map_right.path
+        }
     }
     return Get-TextSha256Hex -Text (ConvertTo-CanonicalJson -Value $payload)
 }
@@ -421,8 +417,16 @@ function Get-RealPlan {
     if ($baselineResult.exit_code -ne 0 -and $baselineResult.exit_code -ne 1) {
         New-Failure "Git baseline ancestry query failed"
     }
-    $diffArguments = @("diff", "--quiet", $BehaviorBaseline, "--")
-    $diffArguments += @(Get-ProtectedRuntimePaths)
+    $diffArguments = @(
+        "diff",
+        "--quiet",
+        $BehaviorBaseline,
+        "--",
+        ".",
+        ":(exclude)docs/alohamini/alohamini.md",
+        ":(exclude)tests/robots/test_packet2n_r5_leader_mapping.py",
+        ":(exclude)tools/packet2n_r5_leader_mapping.ps1"
+    )
     $diffResult = Invoke-ExternalCommand -FilePath "git" -Arguments $diffArguments
     if ($diffResult.exit_code -ne 0 -and $diffResult.exit_code -ne 1) {
         New-Failure "Git protected-path diff query failed"
@@ -460,7 +464,11 @@ function Get-RealPlan {
         protected_runtime_paths_unchanged = $diffResult.exit_code -eq 0
         protected_runtime_review         = [ordered]@{
             runtime_paths_unchanged = $diffResult.exit_code -eq 0
-            reviewed_paths          = @(Get-ProtectedRuntimePaths)
+            excluded_reviewed_paths = @(
+                "docs/alohamini/alohamini.md",
+                "tests/robots/test_packet2n_r5_leader_mapping.py",
+                "tools/packet2n_r5_leader_mapping.ps1"
+            )
         }
         python_env_clean                 = $pythonEnvClean
         python_resolved                  = $pythonResolved
@@ -543,6 +551,31 @@ function Assert-TestModePath {
     }
 }
 
+function Assert-TestModeMutablePaths {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Plan,
+
+        [Parameter(Mandatory = $true)]
+        [string]$StatePathValue,
+
+        [string]$SessionId
+    )
+
+    if ($env:PACKET2N_R5_TEST_MODE -cne "1") {
+        return
+    }
+    Assert-TestModePath -Plan $Plan -Path $StatePathValue
+    Assert-TestModePath -Plan $Plan -Path ([string]$Plan.calibration.left.path)
+    Assert-TestModePath -Plan $Plan -Path ([string]$Plan.calibration.right.path)
+    if (-not [string]::IsNullOrEmpty($SessionId)) {
+        $reserved = Get-ReservedArtifactPaths -Plan $Plan -SessionId $SessionId
+        foreach ($artifactName in @("transcript", "evidence", "map_left", "map_right")) {
+            Assert-TestModePath -Plan $Plan -Path ([string]$reserved[$artifactName])
+        }
+    }
+}
+
 function Get-FileInfoSnapshot {
     param(
         [Parameter(Mandatory = $true)]
@@ -554,6 +587,62 @@ function Get-FileInfoSnapshot {
         path   = $Path
         sha256 = Get-Sha256Hex -Path $Path
         size   = [int64]$item.Length
+    }
+}
+
+function Test-ExactValue {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Actual,
+
+        [Parameter(Mandatory = $true)]
+        $Expected
+    )
+
+    return (ConvertTo-CompactJson -Value (ConvertTo-SortedCanonicalObject -Value $Actual)) -ceq (ConvertTo-CompactJson -Value (ConvertTo-SortedCanonicalObject -Value $Expected))
+}
+
+function ConvertTo-SortedCanonicalObject {
+    param(
+        $Value
+    )
+
+    if ($null -eq $Value) {
+        return $null
+    }
+    if ($Value -is [System.Collections.IDictionary]) {
+        $result = [ordered]@{}
+        $keys = [string[]]@($Value.Keys | ForEach-Object { [string]$_ })
+        [array]::Sort($keys, [System.StringComparer]::Ordinal)
+        foreach ($key in $keys) {
+            $exactKey = @($Value.Keys | Where-Object { [string]$_ -ceq $key })
+            if ($exactKey.Count -ne 1) {
+                New-Failure "Exact value comparison found an ambiguous key"
+            }
+            $result[$key] = ConvertTo-SortedCanonicalObject -Value $Value[$exactKey[0]]
+        }
+        return $result
+    }
+    if ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [string]) {
+        return @($Value | ForEach-Object { ConvertTo-SortedCanonicalObject -Value $_ })
+    }
+    return $Value
+}
+
+function Assert-ExactValue {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Actual,
+
+        [Parameter(Mandatory = $true)]
+        $Expected,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Message
+    )
+
+    if (-not (Test-ExactValue -Actual $Actual -Expected $Expected)) {
+        New-Failure $Message
     }
 }
 
@@ -778,12 +867,87 @@ function Assert-OriginalCalibrationIdentities {
 
     $current = Get-CurrentIdentities -Plan $Plan
     foreach ($side in @("left", "right")) {
-        if ($current[$side].sha256 -ne $Plan.calibration[$side].backup_sha256) {
+        if ($current[$side].path -cne $Plan.calibration[$side].path) {
+            New-Failure "$side source path mismatch from immutable original"
+        }
+        if ($current[$side].sha256 -cne $Plan.calibration[$side].backup_sha256) {
             New-Failure "$side source hash mismatch from immutable original"
         }
         if ($current[$side].size -ne [int64]$Plan.calibration[$side].backup_size) {
             New-Failure "$side source size mismatch from immutable original"
         }
+        if ($current[$side].mtime_utc -cne $Plan.calibration[$side].source_mtime_utc) {
+            New-Failure "$side source timestamp mismatch from immutable original"
+        }
+        $backupCalibration = Read-JsonFile -Path $Plan.calibration[$side].backup_path
+        Assert-ExactValue -Actual $current[$side].calibration -Expected $backupCalibration -Message "$side source schema values mismatch from immutable original"
+    }
+}
+
+function Test-CurrentIdentitiesAreExactOriginals {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Current,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Plan
+    )
+
+    foreach ($side in @("left", "right")) {
+        if ($Current[$side].path -cne $Plan.calibration[$side].path) {
+            return $false
+        }
+        if ($Current[$side].sha256 -cne $Plan.calibration[$side].backup_sha256) {
+            return $false
+        }
+        if ($Current[$side].size -ne [int64]$Plan.calibration[$side].backup_size) {
+            return $false
+        }
+        if ($Current[$side].mtime_utc -cne $Plan.calibration[$side].source_mtime_utc) {
+            return $false
+        }
+        $backupCalibration = Read-JsonFile -Path $Plan.calibration[$side].backup_path
+        if (-not (Test-ExactValue -Actual $Current[$side].calibration -Expected $backupCalibration)) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Test-CurrentHashesAreOriginals {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Current,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Plan
+    )
+
+    return (
+        $Current.left.sha256 -ceq $Plan.calibration.left.backup_sha256 -and
+        $Current.right.sha256 -ceq $Plan.calibration.right.backup_sha256
+    )
+}
+
+function Assert-PreCalibrationMatchesOriginals {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$State,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Plan
+    )
+
+    foreach ($side in @("left", "right")) {
+        $pre = $State.pre_calibration[$side]
+        if ($pre.path -cne $Plan.calibration[$side].path -or
+            $pre.sha256 -cne $Plan.calibration[$side].backup_sha256 -or
+            $pre.size -ne [int64]$Plan.calibration[$side].backup_size -or
+            $pre.mtime_utc -cne $Plan.calibration[$side].source_mtime_utc) {
+            New-Failure "Evidence semantic validation failed: $side pre-calibration identity mismatch"
+        }
+        $backupCalibration = Read-JsonFile -Path $Plan.calibration[$side].backup_path
+        Assert-ExactValue -Actual $pre.calibration -Expected $backupCalibration -Message "Evidence semantic validation failed: $side pre-calibration schema values mismatch"
     }
 }
 
@@ -832,10 +996,11 @@ function New-InitialState {
         [string]$StatePathValue
     )
 
-    $identities = Get-CurrentIdentities -Plan $Plan
-    $runnerSha = Get-RunnerSha256
     $sessionId = if ($Plan.ContainsKey("session_id")) { $Plan.session_id } else { Get-SessionId }
     $utcStart = if ($Plan.ContainsKey("utc_start")) { $Plan.utc_start } else { [DateTime]::UtcNow.ToString("o") }
+    Assert-TestModeMutablePaths -Plan $Plan -StatePathValue $StatePathValue -SessionId $sessionId
+    $identities = Get-CurrentIdentities -Plan $Plan
+    $runnerSha = Get-RunnerSha256
     $artifactPaths = Get-ReservedArtifactPaths -Plan $Plan -SessionId $sessionId
     $state = [ordered]@{
         schema_version   = $SchemaVersion
@@ -922,14 +1087,12 @@ function New-InitialState {
                 size   = $null
             }
             map_left   = [ordered]@{
-                path                  = $artifactPaths.map_left
-                sha256                = $null
-                expected_state_sha256 = $null
+                path   = $artifactPaths.map_left
+                sha256 = $null
             }
             map_right  = [ordered]@{
-                path                  = $artifactPaths.map_right
-                sha256                = $null
-                expected_state_sha256 = $null
+                path   = $artifactPaths.map_right
+                sha256 = $null
             }
         }
     }
@@ -967,28 +1130,45 @@ function Assert-StateIdentity {
         [hashtable]$State
     )
 
-    if ($State.runner_version -ne $RunnerVersion) {
+    if ($State.runner_version -cne $RunnerVersion) {
         New-Failure "Runner version mismatch in state"
     }
-    if ($State.packet_identity -ne $PacketIdentity) {
+    if ($State.packet_identity -cne $PacketIdentity) {
         New-Failure "Packet identity mismatch in state"
     }
-    if ($State.behavior_sha -ne $BehaviorBaseline) {
+    if ($State.behavior_sha -cne $BehaviorBaseline) {
         New-Failure "Behavior baseline mismatch in state"
     }
-    if ($State.expected_branch -ne $ExpectedBranch) {
+    if ($State.expected_branch -cne $ExpectedBranch) {
         New-Failure "State branch provenance mismatch"
     }
-    if ($State.leader_id -ne $ExpectedLeaderId -or $State.arm_profile -ne $ExpectedProfile) {
+    if ($State.leader_id -cne $ExpectedLeaderId -or $State.arm_profile -cne $ExpectedProfile) {
         New-Failure "Persisted leader identity is invalid"
     }
     foreach ($name in $ExpectedPorts.Keys) {
-        if ($State.ports[$name] -ne $ExpectedPorts[$name]) {
+        if ($State.ports[$name] -cne $ExpectedPorts[$name]) {
             New-Failure "Persisted port assignment is invalid"
         }
     }
     if ($State.schema_version -cne $SchemaVersion) {
         New-Failure "State schema version mismatch"
+    }
+}
+
+function Assert-ReservedArtifactPaths {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$State,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Plan
+    )
+
+    $reserved = Get-ReservedArtifactPaths -Plan $Plan -SessionId ([string]$State.session_id)
+    foreach ($artifactName in @("transcript", "evidence", "map_left", "map_right")) {
+        if ($State.artifacts[$artifactName].path -cne $reserved[$artifactName]) {
+            New-Failure "State reserved artifact path is invalid for $artifactName"
+        }
     }
 }
 
@@ -998,9 +1178,22 @@ function Get-StateValidationIssues {
     )
 
     $issues = [System.Collections.Generic.List[string]]::new()
-    foreach ($name in @("schema_version", "runner_version", "packet_identity", "session_id", "state_path", "repo_head", "runner_sha", "behavior_sha", "expected_branch", "leader_id", "arm_profile", "ports", "stages", "artifacts", "completed_stages", "classification", "session_binding_sha256")) {
-        if (-not $State.ContainsKey($name)) {
+    $expectedStateKeys = @(
+        "schema_version", "runner_version", "packet_identity", "session_id", "utc_start",
+        "behavior_sha", "repo_head", "expected_branch", "runner_sha", "state_path", "ports",
+        "leader_id", "arm_profile", "classification", "completed_stages", "failed_stages",
+        "summaries", "final_result", "next_stage", "session_binding_sha256", "stages",
+        "pre_calibration", "post_calibration", "artifacts"
+    )
+    $actualStateKeys = @($State.Keys)
+    foreach ($name in $expectedStateKeys) {
+        if ($actualStateKeys -cnotcontains $name) {
             $issues.Add("missing $name")
+        }
+    }
+    foreach ($name in $actualStateKeys) {
+        if ($expectedStateKeys -cnotcontains [string]$name) {
+            $issues.Add("unexpected state key $name")
         }
     }
     if ($State.ContainsKey("session_binding_sha256") -and [string]::IsNullOrEmpty([string]$State.session_binding_sha256)) {
@@ -1008,22 +1201,41 @@ function Get-StateValidationIssues {
     }
     if ($State.ContainsKey("completed_stages")) {
         $expectedOrder = @("Calibrate", "MapLeft", "MapRight", "Verify")
-        $lastIndex = -1
-        foreach ($stageName in @($State.completed_stages)) {
-            $stageIndex = [array]::IndexOf($expectedOrder, [string]$stageName)
-            if ($stageIndex -lt 0 -or $stageIndex -le $lastIndex) {
+        $completed = @($State.completed_stages)
+        if ($completed.Count -gt $expectedOrder.Count) {
+            $issues.Add("invalid completed stage ordering")
+        }
+        for ($index = 0; $index -lt $completed.Count -and $index -lt $expectedOrder.Count; $index++) {
+            if ([string]$completed[$index] -cne [string]$expectedOrder[$index]) {
                 $issues.Add("invalid completed stage ordering")
                 break
             }
-            $lastIndex = $stageIndex
         }
     }
     if ($State.ContainsKey("artifacts") -and $null -ne $State.artifacts) {
         foreach ($artifactName in @("transcript", "evidence", "map_left", "map_right")) {
-            if (-not $State.artifacts.ContainsKey($artifactName)) {
+            if (@($State.artifacts.Keys) -cnotcontains $artifactName) {
                 $issues.Add("missing artifact $artifactName")
             }
         }
+    }
+    if ($State.ContainsKey("ports") -and $null -ne $State.ports) {
+        $expectedPortKeys = @("physical_left", "logical_left", "physical_right", "logical_right")
+        $actualPortKeys = @($State.ports.Keys)
+        if ($actualPortKeys.Count -ne $expectedPortKeys.Count) {
+            $issues.Add("invalid port schema")
+        }
+        foreach ($portName in $expectedPortKeys) {
+            if ($actualPortKeys -cnotcontains $portName) {
+                $issues.Add("missing port $portName")
+            }
+        }
+    }
+    if ($State.ContainsKey("classification") -and @("ORIGINAL_CALIBRATION_INTACT", "VALID_FRESH_CALIBRATION") -cnotcontains [string]$State.classification) {
+        $issues.Add("invalid persisted classification")
+    }
+    if ($State.ContainsKey("completed_stages") -and $State.completed_stages -ccontains "Calibrate" -and $null -eq $State.post_calibration) {
+        $issues.Add("missing post-calibration identities")
     }
     return @($issues.ToArray())
 }
@@ -1039,7 +1251,8 @@ function Assert-StateProvenance {
         [hashtable]$Plan
     )
 
-    if ($State.repo_head -ne $Plan.head -or $State.state_path -ne $StatePathValue -or $State.runner_sha -ne (Get-RunnerSha256)) {
+    Assert-ReservedArtifactPaths -State $State -Plan $Plan
+    if ($State.repo_head -cne $Plan.head -or $State.state_path -cne $StatePathValue -or $State.runner_sha -cne (Get-RunnerSha256)) {
         New-Failure "State repository provenance is invalid"
     }
     if ($State.session_binding_sha256 -cne (Get-StateSessionBindingDigest -State $State)) {
@@ -1067,8 +1280,10 @@ function Build-EvidencePayload {
         session_id              = $State.session_id
         utc_start               = $State.utc_start
         behavior_sha            = $BehaviorBaseline
+        evidence_path           = $State.artifacts.evidence.path
         transcript_path         = $TranscriptPath
         transcript_sha256       = Get-Sha256Hex -Path $TranscriptPath
+        transcript_size         = [int64](Get-Item -LiteralPath $TranscriptPath).Length
         calibration_executable  = $Executable
         calibration_arguments   = @($Arguments)
         state_path              = $State.state_path
@@ -1076,6 +1291,90 @@ function Build-EvidencePayload {
         pre_calibration         = $State.pre_calibration
         post_calibration        = $State.post_calibration
         current_identities      = $State.post_calibration
+    }
+}
+
+function Get-CalibrationTranscriptHeaderLines {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$State,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Executable,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$Arguments
+    )
+
+    return @(
+        "PACKET2N_R5_SESSION_ID=$($State.session_id)",
+        "PACKET2N_R5_SESSION_STARTED_UTC=$($State.utc_start)",
+        "PACKET2N_R5_BEHAVIOR_SHA=$($State.behavior_sha)",
+        "PACKET2N_R5_CALIBRATION_EXECUTABLE=$Executable",
+        "PACKET2N_R5_CALIBRATION_ARGS_JSON=$(ConvertTo-CompactJson -Value @($Arguments))"
+    )
+}
+
+function Assert-ExactCommand {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Actual,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Expected,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Message
+    )
+
+    if ($Actual.executable -cne $Expected.executable) {
+        New-Failure $Message
+    }
+    $actualArguments = @($Actual.arguments)
+    $expectedArguments = @($Expected.arguments)
+    if ($actualArguments.Count -ne $expectedArguments.Count) {
+        New-Failure $Message
+    }
+    for ($index = 0; $index -lt $expectedArguments.Count; $index++) {
+        if ([string]$actualArguments[$index] -cne [string]$expectedArguments[$index]) {
+            New-Failure $Message
+        }
+    }
+}
+
+function Assert-TranscriptSemantics {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$State,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Command
+    )
+
+    $transcript = $State.artifacts.transcript
+    if ($null -eq $transcript) {
+        New-Failure "Transcript semantic validation failed: transcript is required"
+    }
+    if ((Get-Sha256Hex -Path $transcript.path) -cne $transcript.sha256) {
+        New-Failure "Transcript hash mismatch"
+    }
+    $actualSize = [int64](Get-Item -LiteralPath $transcript.path).Length
+    if ($actualSize -ne [int64]$transcript.size -or $actualSize -le 0) {
+        New-Failure "Transcript semantic validation failed: size mismatch"
+    }
+    $lines = @(Get-Content -LiteralPath $transcript.path)
+    $expectedHeader = @(Get-CalibrationTranscriptHeaderLines -State $State -Executable $Command.executable -Arguments @($Command.arguments))
+    if ($lines.Count -lt ($expectedHeader.Count + 1)) {
+        New-Failure "Transcript semantic validation failed: transcript is incomplete"
+    }
+    for ($index = 0; $index -lt $expectedHeader.Count; $index++) {
+        if ([string]$lines[$index] -cne [string]$expectedHeader[$index]) {
+            New-Failure "Transcript semantic validation failed: header mismatch"
+        }
+    }
+    $terminators = @($lines | Where-Object { ([string]$_).StartsWith("CALIBRATION_EXIT_CODE=", [System.StringComparison]::Ordinal) })
+    if ($terminators.Count -ne 1 -or [string]$terminators[0] -cne "CALIBRATION_EXIT_CODE=0" -or [string]$lines[-1] -cne "CALIBRATION_EXIT_CODE=0") {
+        New-Failure "Transcript semantic validation failed: success terminator mismatch"
     }
 }
 
@@ -1088,41 +1387,72 @@ function Assert-EvidenceSemantics {
         [hashtable]$Plan
     )
 
+    if ($State.classification -cne "VALID_FRESH_CALIBRATION" -or $State.completed_stages -cnotcontains "Calibrate") {
+        New-Failure "Evidence semantic validation failed: state is not a completed fresh-calibration state"
+    }
     $evidence = $State.artifacts.evidence
     if ($null -eq $evidence) {
         New-Failure "Evidence is required before mapping"
     }
-    if ((Get-Sha256Hex -Path $evidence.path) -ne $evidence.sha256) {
+    if ((Get-Sha256Hex -Path $evidence.path) -cne $evidence.sha256) {
         New-Failure "Evidence hash mismatch"
+    }
+    $evidenceSize = [int64](Get-Item -LiteralPath $evidence.path).Length
+    if ($evidenceSize -ne [int64]$evidence.size -or $evidenceSize -le 0) {
+        New-Failure "Evidence semantic validation failed: size mismatch"
     }
     $evidencePayload = Read-JsonFile -Path $evidence.path
     $transcript = $State.artifacts.transcript
     if ($null -eq $transcript) {
         New-Failure "Transcript is required before mapping"
     }
-    if ((Get-Sha256Hex -Path $transcript.path) -ne $transcript.sha256) {
-        New-Failure "Transcript hash mismatch"
-    }
-    $expectedKeys = @("classification", "session_id", "utc_start", "behavior_sha", "transcript_path", "transcript_sha256", "calibration_executable", "calibration_arguments", "state_path", "state_session_binding", "pre_calibration", "post_calibration", "current_identities")
-    if ((@($evidencePayload.Keys) -join ",") -cne ($expectedKeys -join ",")) {
+    $expectedKeys = @("classification", "session_id", "utc_start", "behavior_sha", "evidence_path", "transcript_path", "transcript_sha256", "transcript_size", "calibration_executable", "calibration_arguments", "state_path", "state_session_binding", "pre_calibration", "post_calibration", "current_identities")
+    $actualKeys = @($evidencePayload.Keys)
+    if ($actualKeys.Count -ne $expectedKeys.Count) {
         New-Failure "Evidence semantic validation failed"
     }
-    if ($evidencePayload.session_id -cne $State.session_id -or $evidencePayload.utc_start -cne $State.utc_start -or $evidencePayload.behavior_sha -cne $BehaviorBaseline) {
+    foreach ($key in $expectedKeys) {
+        if ($actualKeys -cnotcontains $key) {
+            New-Failure "Evidence semantic validation failed"
+        }
+    }
+    foreach ($key in $actualKeys) {
+        if ($expectedKeys -cnotcontains [string]$key) {
+            New-Failure "Evidence semantic validation failed"
+        }
+    }
+    if ($evidencePayload.classification -cne "VALID_FRESH_CALIBRATION" -or
+        $evidencePayload.session_id -cne $State.session_id -or
+        $evidencePayload.utc_start -cne $State.utc_start -or
+        $evidencePayload.behavior_sha -cne $BehaviorBaseline) {
         New-Failure "Evidence semantic validation failed"
     }
-    if ($evidencePayload.transcript_path -cne $transcript.path -or $evidencePayload.transcript_sha256 -cne $transcript.sha256) {
+    $expectedCommand = Build-StageCommand -StageName "Calibrate" -Plan $Plan
+    Assert-ExactCommand -Actual $State.stages.Calibrate.native -Expected $expectedCommand -Message "Evidence semantic validation failed: persisted calibration command mismatch"
+    Assert-TranscriptSemantics -State $State -Command $expectedCommand
+    if ($evidencePayload.evidence_path -cne $evidence.path -or
+        $evidencePayload.transcript_path -cne $transcript.path -or
+        $evidencePayload.transcript_sha256 -cne $transcript.sha256 -or
+        [int64]$evidencePayload.transcript_size -ne [int64]$transcript.size) {
         New-Failure "Evidence semantic validation failed"
     }
     if ($evidencePayload.state_path -cne $State.state_path -or $evidencePayload.state_session_binding -cne $State.session_binding_sha256) {
         New-Failure "Evidence semantic validation failed"
     }
+    $evidenceCommand = [ordered]@{
+        executable = $evidencePayload.calibration_executable
+        arguments  = @($evidencePayload.calibration_arguments)
+    }
+    Assert-ExactCommand -Actual $evidenceCommand -Expected $expectedCommand -Message "Evidence semantic validation failed: calibration command mismatch"
+    Assert-PreCalibrationMatchesOriginals -State $State -Plan $Plan
+    Assert-ExactValue -Actual $evidencePayload.pre_calibration -Expected $State.pre_calibration -Message "Evidence semantic validation failed: pre-calibration identity mismatch"
+    Assert-ExactValue -Actual $evidencePayload.post_calibration -Expected $State.post_calibration -Message "Evidence semantic validation failed: post-calibration identity mismatch"
+    Assert-PostCalibrationFreshness -State $State -Plan $Plan
     $current = Get-CurrentIdentities -Plan $Plan
-    if ($current.left.sha256 -ne $State.post_calibration.left.sha256 -or $current.right.sha256 -ne $State.post_calibration.right.sha256) {
+    if (-not (Test-ExactValue -Actual $current -Expected $State.post_calibration)) {
         New-Failure "Current calibration does not match evidence"
     }
-    if ($evidencePayload.current_identities.left.sha256 -cne $current.left.sha256 -or $evidencePayload.current_identities.right.sha256 -cne $current.right.sha256) {
-        New-Failure "Evidence semantic validation failed"
-    }
+    Assert-ExactValue -Actual $evidencePayload.current_identities -Expected $current -Message "Evidence semantic validation failed: current identity mismatch"
 }
 
 function Assert-EvidenceAndCalibrationStillMatch {
@@ -1165,6 +1495,9 @@ function Invoke-SharedExecutor {
     $State.stages[$StageName].native.arguments = @($command.arguments)
 
     if (-not [bool]$Plan.is_test_mode) {
+        if (-not (Test-Path -LiteralPath $command.executable -PathType Leaf)) {
+            New-Failure "Native executable is missing: $($command.executable)"
+        }
         $State.stages[$StageName].native.attempted = $true
         $State.stages[$StageName].native.launched = $false
         $State.stages[$StageName].native.real_exit_code = $null
@@ -1177,26 +1510,64 @@ function Invoke-SharedExecutor {
             }
             Write-TextAtomic -Path $OutputPath -Text $headerText
         }
+        $nativeTranscriptStarted = $false
+        $capturedExitCode = $null
         try {
             if ($OutputPath) {
-                & $command.executable @($command.arguments) 2>&1 | Tee-Object -FilePath $OutputPath -Append | Out-Null
+                Start-Transcript -Path $OutputPath -Append | Out-Null
+                $nativeTranscriptStarted = $true
             }
-            else {
+            Remove-Variable -Name LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue
+            $State.stages[$StageName].native.launched = $true
+            Save-State -Path $StatePathValue -State $State
+            $nativePrimaryException = $null
+            try {
                 & $command.executable @($command.arguments)
             }
-            $exitCode = if ($null -eq $LASTEXITCODE) { $null } else { [int]$LASTEXITCODE }
-            $State.stages[$StageName].native.launched = $true
-            $State.stages[$StageName].native.real_exit_code = $exitCode
+            catch {
+                $nativePrimaryException = $_.Exception
+            }
+            finally {
+                $lastExitVariable = Get-Variable -Name LASTEXITCODE -ErrorAction SilentlyContinue
+                if ($null -ne $lastExitVariable -and $null -ne $lastExitVariable.Value) {
+                    $capturedExitCode = [int]$lastExitVariable.Value
+                }
+                if ($nativeTranscriptStarted) {
+                    try {
+                        Stop-Transcript | Out-Null
+                        $nativeTranscriptStarted = $false
+                    }
+                    catch {
+                        if ($null -eq $nativePrimaryException) {
+                            $nativePrimaryException = $_.Exception
+                        }
+                    }
+                }
+            }
+            if ($null -ne $nativePrimaryException) {
+                throw $nativePrimaryException
+            }
+            $State.stages[$StageName].native.real_exit_code = $capturedExitCode
             Save-State -Path $StatePathValue -State $State
-            if ($null -eq $exitCode) {
+            if ($null -eq $capturedExitCode) {
                 New-Failure "Native command returned no exit code"
             }
-            if ($exitCode -ne 0) {
-                New-Failure "$StageName native command failed with exit code $exitCode"
+            if ($capturedExitCode -ne 0) {
+                New-Failure "$StageName native command failed with exit code $capturedExitCode"
             }
-            return $exitCode
+            return $capturedExitCode
         }
         catch {
+            if ($nativeTranscriptStarted) {
+                try {
+                    Stop-Transcript | Out-Null
+                }
+                catch {
+                }
+            }
+            if ($null -ne $capturedExitCode) {
+                $State.stages[$StageName].native.real_exit_code = $capturedExitCode
+            }
             Save-State -Path $StatePathValue -State $State
             throw
         }
@@ -1245,8 +1616,9 @@ function New-MapLogText {
 
     $lines = [System.Collections.Generic.List[string]]::new()
     $lines.Add("RUN_MARKER=$StageName")
-    $lines.Add("STATE_SHA256=$($State.state_reference_sha256)")
-    $lines.Add("EVIDENCE_SHA256=$($State.artifacts.evidence.sha256)")
+    foreach ($metadataLine in @(Get-ExpectedMapMetadataLines -State $State)) {
+        $lines.Add($metadataLine)
+    }
     $lines.Add("NO_ROBOT_PROOF=1")
     $lines.Add("CLEANUP_PROOF=1")
     for ($index = 0; $index -lt 60; $index++) {
@@ -1258,6 +1630,28 @@ function New-MapLogText {
         $lines.Add(("SAMPLE {0:D2} {1}" -f $index, ($pairs -join " ")))
     }
     return ($lines -join [Environment]::NewLine) + [Environment]::NewLine
+}
+
+function Get-ExpectedMapMetadataLines {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$State
+    )
+
+    return @(
+        "PACKET2N_R5_SESSION_ID=$($State.session_id)",
+        "PACKET2N_R5_SESSION_STARTED_UTC=$($State.utc_start)",
+        "PACKET2N_R5_BEHAVIOR_SHA=$($State.behavior_sha)",
+        "PACKET2N_R5_STATE_PATH=$($State.state_path)",
+        "PACKET2N_R5_STATE_BINDING_SHA256=$($State.session_binding_sha256)",
+        "PACKET2N_R5_GUARD_SUCCESS=1",
+        "PACKET2N_R5_EVIDENCE_PATH=$($State.artifacts.evidence.path)",
+        "PACKET2N_R5_EVIDENCE_SHA256=$($State.artifacts.evidence.sha256)",
+        "PACKET2N_R5_TRANSCRIPT_PATH=$($State.artifacts.transcript.path)",
+        "PACKET2N_R5_TRANSCRIPT_SHA256=$($State.artifacts.transcript.sha256)",
+        "PACKET2N_R5_POST_SOURCE_LEFT_JSON=$(ConvertTo-CompactJson -Value (ConvertTo-SortedCanonicalObject -Value $State.post_calibration.left))",
+        "PACKET2N_R5_POST_SOURCE_RIGHT_JSON=$(ConvertTo-CompactJson -Value (ConvertTo-SortedCanonicalObject -Value $State.post_calibration.right))"
+    )
 }
 
 function Get-SampleValue {
@@ -1435,7 +1829,9 @@ function Validate-MapLog {
         [Parameter(Mandatory = $true)]
         [hashtable]$State,
 
-        [switch]$AllowMissingSuccessTerminator
+        [switch]$AllowMissingSuccessTerminator,
+
+        [switch]$AllowSyntheticTestGrammar
     )
 
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
@@ -1449,38 +1845,45 @@ function Validate-MapLog {
     if ($lines.Count -lt 7) {
         New-Failure "Map log validation failed for ${StageName}: log is incomplete"
     }
+    $successRecords = @($lines | Where-Object { ([string]$_).StartsWith("CLIENT_EXIT_CODE=", [System.StringComparison]::OrdinalIgnoreCase) })
+    if ($AllowMissingSuccessTerminator) {
+        if ($successRecords.Count -ne 0) {
+            New-Failure "Map log validation failed for ${StageName}: raw log contains a preexisting success terminator record"
+        }
+    }
+    elseif ($successRecords.Count -ne 1 -or [string]$successRecords[0] -cne "CLIENT_EXIT_CODE=0" -or [string]$lines[-1] -cne "CLIENT_EXIT_CODE=0") {
+        New-Failure "Map log validation failed for ${StageName}: success terminator count mismatch"
+    }
+
+    $expectedMetadata = @(Get-ExpectedMapMetadataLines -State $State)
+    $actualMetadata = @($lines | Where-Object { ([string]$_).StartsWith("PACKET2N_R5_", [System.StringComparison]::OrdinalIgnoreCase) })
+    if ($actualMetadata.Count -ne $expectedMetadata.Count) {
+        New-Failure "Map log validation failed for ${StageName}: Packet map metadata count mismatch"
+    }
+    foreach ($line in $actualMetadata) {
+        if ($expectedMetadata -cnotcontains [string]$line) {
+            New-Failure "Map log validation failed for ${StageName}: Packet map metadata is unexpected or mismatched"
+        }
+    }
+    for ($index = 0; $index -lt $expectedMetadata.Count; $index++) {
+        $matching = @($actualMetadata | Where-Object { [string]$_ -ceq [string]$expectedMetadata[$index] })
+        if ($matching.Count -ne 1 -or [string]$lines[$index + 1] -cne [string]$expectedMetadata[$index]) {
+            New-Failure "Map log validation failed for ${StageName}: Packet map metadata is missing, duplicated, mismatched, or out of order"
+        }
+    }
+
     $expectedActualMarker = if ($StageName -eq "MapLeft") { "MAP_RUN=PHYSICAL_LEFT_ONLY" } else { "MAP_RUN=PHYSICAL_RIGHT_ONLY" }
-    if ($lines[0].StartsWith("MAP_RUN=")) {
-        if ($lines[0] -ne $expectedActualMarker) {
+    if (([string]$lines[0]).StartsWith("MAP_RUN=", [System.StringComparison]::Ordinal)) {
+        if ([string]$lines[0] -cne $expectedActualMarker) {
             New-Failure "Map log validation failed for ${StageName}: first marker mismatch"
         }
-        if (-not $AllowMissingSuccessTerminator -and $lines[-1] -ne "CLIENT_EXIT_CODE=0") {
-            New-Failure "Map log validation failed for ${StageName}: success terminator mismatch"
-        }
-        if ((@($lines | Where-Object { $_ -eq $ActualNoRobotProof })).Count -ne 1) {
+        if ((@($lines | Where-Object { [string]$_ -ceq $ActualNoRobotProof })).Count -ne 1) {
             New-Failure "Map log validation failed for ${StageName}: no-robot proof count mismatch"
         }
-        if ((@($lines | Where-Object { $_ -like "$ActualCleanupPrefix*" })).Count -ne 1) {
+        if ((@($lines | Where-Object { ([string]$_).StartsWith($ActualCleanupPrefix, [System.StringComparison]::Ordinal) })).Count -ne 1) {
             New-Failure "Map log validation failed for ${StageName}: cleanup proof count mismatch"
         }
-        $stateLine = @($lines | Where-Object { $_ -like "STATE_SHA256=*" })
-        $evidenceLine = @($lines | Where-Object { $_ -like "EVIDENCE_SHA256=*" })
-        if ($stateLine.Count -ne 1 -or $evidenceLine.Count -ne 1) {
-            New-Failure "Map log validation failed for ${StageName}: state/evidence metadata is incomplete"
-        }
-        $artifactKey = if ($StageName -eq "MapLeft") { "map_left" } else { "map_right" }
-        $artifact = $State.artifacts[$artifactKey]
-        $expectedStateHash = $null
-        if ($null -ne $artifact -and ($artifact.Keys -contains "expected_state_sha256")) {
-            $expectedStateHash = $artifact.expected_state_sha256
-        }
-        if ($expectedStateHash -and $stateLine[0].Substring(13) -ne $expectedStateHash) {
-            New-Failure "Map log validation failed for ${StageName}: state hash mismatch"
-        }
-        if ($evidenceLine[0].Substring(16) -ne $State.artifacts.evidence.sha256) {
-            New-Failure "Map log validation failed for ${StageName}: evidence hash mismatch"
-        }
-        $actionLines = @($lines | Where-Object { $_.StartsWith("[NO_ROBOT] action -> ") })
+        $actionLines = @($lines | Where-Object { ([string]$_).StartsWith("[NO_ROBOT] action -> ", [System.StringComparison]::Ordinal) })
         $collection = [System.Collections.Generic.List[object]]::new()
         foreach ($actionLine in $actionLines) {
             $collection.Add((Parse-PythonActionPairs -Line $actionLine))
@@ -1488,37 +1891,20 @@ function Validate-MapLog {
         Validate-ActionPairs -StageName $StageName -ActionPairsCollection @($collection) -RequireBodyKeys
         return
     }
-    if ($lines[0] -ne "RUN_MARKER=$StageName") {
+    if (-not $AllowSyntheticTestGrammar) {
+        New-Failure "Map log validation failed for ${StageName}: synthetic map grammar is test-only"
+    }
+    if ([string]$lines[0] -cne "RUN_MARKER=$StageName") {
         New-Failure "Map log validation failed for ${StageName}: first marker mismatch"
     }
-    if (-not $AllowMissingSuccessTerminator -and $lines[-1] -ne "CLIENT_EXIT_CODE=0") {
-        New-Failure "Map log validation failed for ${StageName}: success terminator mismatch"
-    }
-    if ((@($lines | Where-Object { $_ -eq "NO_ROBOT_PROOF=1" })).Count -ne 1) {
+    if ((@($lines | Where-Object { [string]$_ -ceq "NO_ROBOT_PROOF=1" })).Count -ne 1) {
         New-Failure "Map log validation failed for ${StageName}: no-robot proof count mismatch"
     }
-    if ((@($lines | Where-Object { $_ -eq "CLEANUP_PROOF=1" })).Count -ne 1) {
+    if ((@($lines | Where-Object { [string]$_ -ceq "CLEANUP_PROOF=1" })).Count -ne 1) {
         New-Failure "Map log validation failed for ${StageName}: cleanup proof count mismatch"
     }
-    $stateLine = @($lines | Where-Object { $_ -like "STATE_SHA256=*" })
-    $evidenceLine = @($lines | Where-Object { $_ -like "EVIDENCE_SHA256=*" })
-    if ($stateLine.Count -ne 1 -or $evidenceLine.Count -ne 1) {
-        New-Failure "Map log validation failed for ${StageName}: state/evidence metadata is incomplete"
-    }
-    $artifactKey = if ($StageName -eq "MapLeft") { "map_left" } else { "map_right" }
-    $artifact = $State.artifacts[$artifactKey]
-    $expectedStateHash = $null
-    if ($null -ne $artifact -and ($artifact.Keys -contains "expected_state_sha256")) {
-        $expectedStateHash = $artifact.expected_state_sha256
-    }
-    if ($expectedStateHash -and $stateLine[0].Substring(13) -ne $expectedStateHash) {
-        New-Failure "Map log validation failed for ${StageName}: state hash mismatch"
-    }
-    if ($evidenceLine[0].Substring(16) -ne $State.artifacts.evidence.sha256) {
-        New-Failure "Map log validation failed for ${StageName}: evidence hash mismatch"
-    }
 
-    $samples = @($lines | Where-Object { $_ -like "SAMPLE *" })
+    $samples = @($lines | Where-Object { ([string]$_).StartsWith("SAMPLE ", [System.StringComparison]::Ordinal) })
     $collection = [System.Collections.Generic.List[object]]::new()
     foreach ($sample in $samples) {
         $tokens = @($sample.Split(" ", [System.StringSplitOptions]::RemoveEmptyEntries))
@@ -1539,6 +1925,47 @@ function Validate-MapLog {
         $collection.Add(@($pairs))
     }
     Validate-ActionPairs -StageName $StageName -ActionPairsCollection @($collection)
+}
+
+function Get-AllowSyntheticMapGrammar {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Plan
+    )
+
+    return (
+        [bool]$Plan.is_test_mode -and
+        $Plan.ContainsKey("allow_synthetic_map_logs") -and
+        [bool]$Plan.allow_synthetic_map_logs
+    )
+}
+
+function Assert-CompletedMapArtifacts {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$State,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Plan
+    )
+
+    $allowSynthetic = Get-AllowSyntheticMapGrammar -Plan $Plan
+    foreach ($entry in @(
+        [ordered]@{ stage = "MapLeft"; artifact = "map_left" },
+        [ordered]@{ stage = "MapRight"; artifact = "map_right" }
+    )) {
+        if ($State.completed_stages -cnotcontains $entry.stage) {
+            continue
+        }
+        $artifact = $State.artifacts[$entry.artifact]
+        if ($null -eq $artifact -or [string]::IsNullOrEmpty([string]$artifact.sha256)) {
+            New-Failure "Map log validation failed for $($entry.stage): stored artifact identity is missing"
+        }
+        if ((Get-Sha256Hex -Path $artifact.path) -cne $artifact.sha256) {
+            New-Failure "Map log validation failed for $($entry.stage): stored hash mismatch"
+        }
+        Validate-MapLog -StageName $entry.stage -Path $artifact.path -State $State -AllowSyntheticTestGrammar:$allowSynthetic
+    }
 }
 
 function Update-StateForFailure {
@@ -1573,15 +2000,26 @@ function Assert-PostCalibrationFreshness {
         [hashtable]$Plan
     )
 
+    if ($null -eq $State.post_calibration) {
+        New-Failure "Post-calibration identities are missing"
+    }
     $sessionStart = [datetime]::Parse($State.utc_start, $null, [System.Globalization.DateTimeStyles]::RoundtripKind)
+    $originalHashes = @(
+        [string]$Plan.calibration.left.backup_sha256,
+        [string]$Plan.calibration.right.backup_sha256
+    )
     foreach ($side in @("left", "right")) {
         $post = $State.post_calibration[$side]
         $pre = $State.pre_calibration[$side]
+        Assert-CalibrationSchema -Calibration $post.calibration -Label "$side post-calibration"
+        if ($post.path -cne $Plan.calibration[$side].path) {
+            New-Failure "$side post-calibration path is invalid"
+        }
         if ($post.size -le 0) {
             New-Failure "$side post-calibration size is invalid"
         }
-        if ($post.sha256 -eq $Plan.calibration[$side].backup_sha256) {
-            New-Failure "$side post-calibration did not become fresh"
+        if ($originalHashes -ccontains [string]$post.sha256) {
+            New-Failure "$side post-calibration hash must differ from both immutable originals"
         }
         $postTime = [datetime]::Parse($post.mtime_utc, $null, [System.Globalization.DateTimeStyles]::RoundtripKind)
         $preTime = [datetime]::Parse($pre.mtime_utc, $null, [System.Globalization.DateTimeStyles]::RoundtripKind)
@@ -1589,20 +2027,8 @@ function Assert-PostCalibrationFreshness {
             New-Failure "$side post-calibration timestamp is not fresh"
         }
     }
-    if ($State.post_calibration.left.sha256 -eq $State.post_calibration.right.sha256) {
+    if ($State.post_calibration.left.sha256 -ceq $State.post_calibration.right.sha256) {
         New-Failure "Post-calibration identities must differ from each other"
-    }
-    foreach ($joint in $ExpectedCalibrationKeys) {
-        $preLeftOffset = [int]$State.pre_calibration.left.calibration[$joint].homing_offset
-        $preRightOffset = [int]$State.pre_calibration.right.calibration[$joint].homing_offset
-        $postLeftOffset = [int]$State.post_calibration.left.calibration[$joint].homing_offset
-        $postRightOffset = [int]$State.post_calibration.right.calibration[$joint].homing_offset
-        if ($preLeftOffset -lt $preRightOffset -and $postLeftOffset -ge $postRightOffset) {
-            New-Failure "Post-calibration side binding is invalid for $joint"
-        }
-        if ($preLeftOffset -gt $preRightOffset -and $postLeftOffset -le $postRightOffset) {
-            New-Failure "Post-calibration side binding is invalid for $joint"
-        }
     }
 }
 
@@ -1638,12 +2064,20 @@ function Invoke-CalibrateStage {
         [string]$StatePathValue
     )
 
+    $sessionId = if ($Plan.ContainsKey("session_id")) { [string]$Plan.session_id } else { $null }
+    Assert-TestModeMutablePaths -Plan $Plan -StatePathValue $StatePathValue -SessionId $sessionId
     Assert-RepoAndEnvGuards -Plan $Plan
     Assert-ImmutableManifestAndBackups -Plan $Plan
     Assert-OriginalCalibrationIdentities -Plan $Plan
-    Assert-TestModePath -Plan $Plan -Path $StatePathValue
     if (Test-Path -LiteralPath $StatePathValue) {
         New-Failure "Calibrate refuses when the state path already exists"
+    }
+    if ([string]::IsNullOrEmpty($sessionId)) {
+        New-Failure "Calibrate requires a reserved session ID"
+    }
+    $reservedArtifacts = Get-ReservedArtifactPaths -Plan $Plan -SessionId $sessionId
+    foreach ($artifactName in @("transcript", "evidence", "map_left", "map_right")) {
+        Assert-PathMissing -Path ([string]$reservedArtifacts[$artifactName])
     }
     $state = New-InitialState -Plan $Plan -StatePathValue $StatePathValue
     Save-State -Path $StatePathValue -State $state
@@ -1659,21 +2093,18 @@ function Invoke-CalibrateStage {
         $state.stages.Calibrate.native.executable = $command.executable
         $state.stages.Calibrate.native.arguments = @($command.arguments)
         Save-State -Path $StatePathValue -State $state
+        $headerLines = @(Get-CalibrationTranscriptHeaderLines -State $state -Executable $command.executable -Arguments @($command.arguments))
         if ([bool]$Plan.is_test_mode) {
             Invoke-SharedExecutor -StageName "Calibrate" -Plan $Plan -State $state -StatePathValue $StatePathValue
-            $rawTranscriptText = ($Plan.stage_plan.Calibrate.transcript_text -replace "(?m)^CALIBRATION_EXIT_CODE=0\r?\n?", "").TrimEnd("`r", "`n")
-            Write-TextAtomic -Path $transcriptPath -Text ($rawTranscriptText + [Environment]::NewLine)
+            $rawTranscriptLines = @(([string]$Plan.stage_plan.Calibrate.transcript_text) -split "`r?`n" | Where-Object {
+                $_ -ne "" -and -not ([string]$_).StartsWith("CALIBRATION_EXIT_CODE=", [System.StringComparison]::Ordinal)
+            })
+            $transcriptLines = @($headerLines + $rawTranscriptLines)
+            Write-TextAtomic -Path $transcriptPath -Text (($transcriptLines -join [Environment]::NewLine) + [Environment]::NewLine)
             Write-JsonAtomic -Path $Plan.calibration.left.path -Value $Plan.stage_plan.Calibrate.post_calibration.left -Overwrite
             Write-JsonAtomic -Path $Plan.calibration.right.path -Value $Plan.stage_plan.Calibrate.post_calibration.right -Overwrite
         }
         else {
-            $headerLines = @(
-                "SESSION_ID=$($state.session_id)",
-                "UTC_START=$($state.utc_start)",
-                "BEHAVIOR_SHA=$BehaviorBaseline",
-                "CALIBRATION_EXECUTABLE=$($command.executable)",
-                "CALIBRATION_ARGUMENTS=$((ConvertTo-CanonicalJson -Value @($command.arguments)))"
-            )
             Invoke-SharedExecutor -StageName "Calibrate" -Plan $Plan -State $state -StatePathValue $StatePathValue -OutputPath $transcriptPath -HeaderLines $headerLines
         }
         $postIdentities = Get-CurrentIdentities -Plan $Plan
@@ -1683,11 +2114,9 @@ function Invoke-CalibrateStage {
         }
         Assert-PostCalibrationFreshness -State $state -Plan $Plan
         Append-TextLine -Path $transcriptPath -Text "CALIBRATION_EXIT_CODE=0"
-        $stateReferenceSha = Get-Sha256Hex -Path $StatePathValue
         $state.classification = "VALID_FRESH_CALIBRATION"
         $state.completed_stages = @("Calibrate")
         $state.next_stage = "MapLeft"
-        $state.state_reference_sha256 = $stateReferenceSha
         $state.artifacts.transcript = Get-FileInfoSnapshot -Path $transcriptPath
         $evidencePayload = Build-EvidencePayload -State $state -Executable $command.executable -Arguments @($command.arguments) -TranscriptPath $transcriptPath
         Write-JsonAtomic -Path $evidencePath -Value $evidencePayload
@@ -1720,17 +2149,19 @@ function Invoke-MapStage {
     if ($issues.Count -gt 0) {
         New-Failure ("INVALID_OR_UNCERTAIN_STATE: " + ($issues -join ", "))
     }
+    Assert-TestModeMutablePaths -Plan $Plan -StatePathValue $StatePathValue -SessionId ([string]$state.session_id)
     Assert-StateIdentity -State $state
     Assert-StateProvenance -State $state -StatePathValue $StatePathValue -Plan $Plan
     Assert-RepoAndEnvGuards -Plan $Plan
     Assert-ImmutableManifestAndBackups -Plan $Plan
-    if ($StageName -eq "MapLeft" -and ($state.completed_stages -notcontains "Calibrate")) {
+    if ($StageName -ceq "MapLeft" -and ($state.completed_stages -cnotcontains "Calibrate")) {
         New-Failure "Calibrate must complete before MapLeft"
     }
-    if ($StageName -eq "MapRight" -and ($state.completed_stages -notcontains "MapLeft")) {
+    if ($StageName -ceq "MapRight" -and ($state.completed_stages -cnotcontains "MapLeft")) {
         New-Failure "MapLeft must complete before MapRight"
     }
     Assert-EvidenceAndCalibrationStillMatch -State $state -Plan $Plan
+    Assert-CompletedMapArtifacts -State $state -Plan $Plan
     try {
         $mapArtifactKey = if ($StageName -eq "MapLeft") { "map_left" } else { "map_right" }
         $mapPath = $state.artifacts[$mapArtifactKey].path
@@ -1743,30 +2174,26 @@ function Invoke-MapStage {
         if ([bool]$Plan.is_test_mode) {
             Invoke-SharedExecutor -StageName $StageName -Plan $Plan -State $state -StatePathValue $StatePathValue
             $mapText = New-MapLogText -StageName $StageName -State $state -PhysicalSide $Plan.stage_plan[$StageName].physical_side
+            if ($Plan.stage_plan[$StageName].ContainsKey("raw_extra_lines")) {
+                $mapText += (@($Plan.stage_plan[$StageName].raw_extra_lines) -join [Environment]::NewLine) + [Environment]::NewLine
+            }
             Write-TextAtomic -Path $mapPath -Text $mapText
         }
         else {
             $marker = if ($StageName -eq "MapLeft") { "PHYSICAL_LEFT_ONLY" } else { "PHYSICAL_RIGHT_ONLY" }
-            $headerLines = @(
-                "MAP_RUN=$marker",
-                "SESSION_ID=$($state.session_id)",
-                "UTC_START=$($state.utc_start)",
-                "STATE_SHA256=$($state.state_reference_sha256)",
-                "EVIDENCE_SHA256=$($state.artifacts.evidence.sha256)",
-                "TRANSCRIPT_PATH=$($state.artifacts.transcript.path)"
-            )
+            $headerLines = @("MAP_RUN=$marker") + @(Get-ExpectedMapMetadataLines -State $state)
             Invoke-SharedExecutor -StageName $StageName -Plan $Plan -State $state -StatePathValue $StatePathValue -OutputPath $mapPath -HeaderLines $headerLines
         }
-        Validate-MapLog -StageName $StageName -Path $mapPath -State $state -AllowMissingSuccessTerminator
+        $allowSynthetic = Get-AllowSyntheticMapGrammar -Plan $Plan
+        Validate-MapLog -StageName $StageName -Path $mapPath -State $state -AllowMissingSuccessTerminator -AllowSyntheticTestGrammar:$allowSynthetic
         Append-TextLine -Path $mapPath -Text "CLIENT_EXIT_CODE=0"
         $state.artifacts[$mapArtifactKey] = [ordered]@{
-            path                  = $mapPath
-            sha256                = Get-Sha256Hex -Path $mapPath
-            expected_state_sha256 = $state.state_reference_sha256
+            path   = $mapPath
+            sha256 = Get-Sha256Hex -Path $mapPath
         }
-        Validate-MapLog -StageName $StageName -Path $mapPath -State $state
+        Validate-MapLog -StageName $StageName -Path $mapPath -State $state -AllowSyntheticTestGrammar:$allowSynthetic
         $state.stages[$StageName].result = "completed"
-        if ($state.completed_stages -notcontains $StageName) {
+        if ($state.completed_stages -cnotcontains $StageName) {
             $state.completed_stages = @($state.completed_stages + $StageName)
         }
         $state.summaries[$StageName] = "$StageName completed"
@@ -1793,24 +2220,18 @@ function Invoke-VerifyStage {
     if ($issues.Count -gt 0) {
         New-Failure ("INVALID_OR_UNCERTAIN_STATE: " + ($issues -join ", "))
     }
+    Assert-TestModeMutablePaths -Plan $Plan -StatePathValue $StatePathValue -SessionId ([string]$state.session_id)
     Assert-StateIdentity -State $state
     Assert-StateProvenance -State $state -StatePathValue $StatePathValue -Plan $Plan
     Assert-RepoAndEnvGuards -Plan $Plan
     Assert-ImmutableManifestAndBackups -Plan $Plan
     Assert-EvidenceAndCalibrationStillMatch -State $state -Plan $Plan
-    if ($null -eq $state.artifacts.map_left -or $null -eq $state.artifacts.map_right) {
+    if ($state.completed_stages -cnotcontains "MapLeft" -or $state.completed_stages -cnotcontains "MapRight") {
         New-Failure "Verify requires both map artifacts"
     }
-    if ((Get-Sha256Hex -Path $state.artifacts.map_left.path) -ne $state.artifacts.map_left.sha256) {
-        New-Failure "Map log validation failed for MapLeft: stored hash mismatch"
-    }
-    if ((Get-Sha256Hex -Path $state.artifacts.map_right.path) -ne $state.artifacts.map_right.sha256) {
-        New-Failure "Map log validation failed for MapRight: stored hash mismatch"
-    }
-    Validate-MapLog -StageName "MapLeft" -Path $state.artifacts.map_left.path -State $state
-    Validate-MapLog -StageName "MapRight" -Path $state.artifacts.map_right.path -State $state
+    Assert-CompletedMapArtifacts -State $state -Plan $Plan
     $state.stages.Verify.result = "completed"
-    if ($state.completed_stages -notcontains "Verify") {
+    if ($state.completed_stages -cnotcontains "Verify") {
         $state.completed_stages = @($state.completed_stages + "Verify")
     }
     $state.final_result = "MAPPING_RESULT=CORRECT"
@@ -1827,15 +2248,23 @@ function Get-StatusPayload {
     )
 
     try {
+        Assert-TestModeMutablePaths -Plan $Plan -StatePathValue $StatePathValue
         Assert-ImmutableManifestAndBackups -Plan $Plan
         $current = Get-CurrentIdentities -Plan $Plan
-        $leftBackup = Get-Sha256Hex -Path $Plan.calibration.left.backup_path
-        $rightBackup = Get-Sha256Hex -Path $Plan.calibration.right.backup_path
+        $exactOriginals = Test-CurrentIdentitiesAreExactOriginals -Current $current -Plan $Plan
+        $originalHashes = Test-CurrentHashesAreOriginals -Current $current -Plan $Plan
         if (-not (Test-Path -LiteralPath $StatePathValue -PathType Leaf)) {
-            if ($current.left.sha256 -eq $leftBackup -and $current.right.sha256 -eq $rightBackup) {
+            if ($exactOriginals) {
                 return [ordered]@{
                     classification = "ORIGINAL_CALIBRATION_INTACT"
                     next_stage     = "Calibrate"
+                }
+            }
+            if ($originalHashes) {
+                return [ordered]@{
+                    classification = "INVALID_OR_UNCERTAIN_STATE"
+                    next_stage     = $null
+                    report         = "original content exists but its exact pinned identity is not intact"
                 }
             }
             return [ordered]@{
@@ -1855,25 +2284,40 @@ function Get-StatusPayload {
         }
         Assert-StateIdentity -State $state
         Assert-StateProvenance -State $state -StatePathValue $StatePathValue -Plan $Plan
+        Assert-TestModeMutablePaths -Plan $Plan -StatePathValue $StatePathValue -SessionId ([string]$state.session_id)
+        if ($state.completed_stages -cnotcontains "Calibrate") {
+            if (-not $exactOriginals -and -not $originalHashes) {
+                return [ordered]@{
+                    classification = "ORPHANED_FRESH_CALIBRATION"
+                    next_stage     = $null
+                    report         = "dry-run-only recovery plan: preserve orphaned files, then restore immutable originals only under later exact reviewed authorization"
+                }
+            }
+            return [ordered]@{
+                classification = "INVALID_OR_UNCERTAIN_STATE"
+                next_stage     = $null
+                report         = "persisted calibration session is incomplete; preserve its state and artifacts for review"
+            }
+        }
+        foreach ($entry in @(
+            [ordered]@{ stage = "MapLeft"; artifact = "map_left" },
+            [ordered]@{ stage = "MapRight"; artifact = "map_right" }
+        )) {
+            if ($state.completed_stages -cnotcontains $entry.stage -and (Test-Path -LiteralPath $state.artifacts[$entry.artifact].path)) {
+                return [ordered]@{
+                    classification = "INVALID_OR_UNCERTAIN_STATE"
+                    next_stage     = $null
+                    report         = "uncompleted reserved map artifact exists for $($entry.stage); preserve it for review"
+                }
+            }
+        }
         Assert-EvidenceSemantics -State $state -Plan $Plan
-        if ($current.left.sha256 -eq $leftBackup -and $current.right.sha256 -eq $rightBackup) {
-            return [ordered]@{
-                classification = "ORIGINAL_CALIBRATION_INTACT"
-                next_stage     = "Calibrate"
-            }
-        }
-        if ($current.left.sha256 -eq $state.post_calibration.left.sha256 -and $current.right.sha256 -eq $state.post_calibration.right.sha256) {
-            $nextStage = if ($state.completed_stages -notcontains "Calibrate") { "Calibrate" } elseif ($state.completed_stages -notcontains "MapLeft") { "MapLeft" } elseif ($state.completed_stages -notcontains "MapRight") { "MapRight" } elseif ($state.completed_stages -notcontains "Verify") { "Verify" } else { $null }
-            return [ordered]@{
-                classification = "VALID_FRESH_CALIBRATION"
-                next_stage     = $nextStage
-                final_result   = $state.final_result
-            }
-        }
+        Assert-CompletedMapArtifacts -State $state -Plan $Plan
+        $nextStage = if ($state.completed_stages -cnotcontains "MapLeft") { "MapLeft" } elseif ($state.completed_stages -cnotcontains "MapRight") { "MapRight" } elseif ($state.completed_stages -cnotcontains "Verify") { "Verify" } else { $null }
         return [ordered]@{
-            classification = "ORPHANED_FRESH_CALIBRATION"
-            next_stage     = $null
-            report         = "dry-run-only recovery plan: preserve orphaned files, then restore immutable originals only under later exact reviewed authorization"
+            classification = "VALID_FRESH_CALIBRATION"
+            next_stage     = $nextStage
+            final_result   = $state.final_result
         }
     }
     catch {
@@ -1885,6 +2329,7 @@ function Get-StatusPayload {
     }
 }
 
+$plan = $null
 try {
     Require-Confirmation -StageName $Stage -ConfirmValue $Confirm
     $plan = Get-ExecutionPlan
@@ -1903,6 +2348,17 @@ try {
     exit 0
 }
 catch {
-    [Console]::Error.WriteLine($_.Exception.Message)
+    $primaryMessage = $_.Exception.Message
+    [Console]::Error.WriteLine($primaryMessage)
+    if ($Stage -cne "Status" -and $null -ne $plan) {
+        try {
+            $recovery = Get-StatusPayload -Plan $plan -StatePathValue $StatePath
+            [Console]::Error.WriteLine("RECOVERY_CLASSIFICATION=$($recovery.classification)")
+            $recoveryNext = if ($null -eq $recovery.next_stage) { "NONE" } else { [string]$recovery.next_stage }
+            [Console]::Error.WriteLine("RECOVERY_NEXT_STAGE=$recoveryNext")
+        }
+        catch {
+        }
+    }
     exit 1
 }
