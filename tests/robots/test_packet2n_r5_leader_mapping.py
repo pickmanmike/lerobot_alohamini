@@ -304,7 +304,12 @@ def base_plan(tmp_path: Path) -> dict[str, object]:
     }
 
 
-def run_runner(*args: str, plan: dict[str, object] | None = None, tmp_path: Path | None = None) -> subprocess.CompletedProcess[str]:
+def run_runner(
+    *args: str,
+    plan: dict[str, object] | None = None,
+    tmp_path: Path | None = None,
+    ps_native_error_preference: bool = False,
+) -> subprocess.CompletedProcess[str]:
     assert SCRIPT_PATH.exists(), "the packet2n_r5 leader mapping runner is missing"
     env = os.environ.copy()
     if plan is not None:
@@ -312,17 +317,41 @@ def run_runner(*args: str, plan: dict[str, object] | None = None, tmp_path: Path
         plan_path = tmp_path / "plan.json"
         write_json(plan_path, plan)
         env["PACKET2N_R5_TEST_MODE"] = "1"
-        command = [
-            "pwsh",
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-File",
-            str(SCRIPT_PATH),
-            *args,
-            "-TestPlanPath",
-            str(plan_path),
-        ]
+        runner_arguments = [str(SCRIPT_PATH), *args, "-TestPlanPath", str(plan_path)]
+        if ps_native_error_preference:
+            wrapper_path = tmp_path / "invoke-runner-with-native-errors.ps1"
+            parameter_names = {"-Stage", "-StatePath", "-Confirm", "-TestPlanPath"}
+            rendered_arguments = [
+                argument
+                if argument in parameter_names
+                else f"'{argument.replace(chr(39), chr(39) * 2)}'"
+                for argument in runner_arguments
+            ]
+            write_text(
+                wrapper_path,
+                "$PSNativeCommandUseErrorActionPreference = $true\n"
+                f"& {' '.join(rendered_arguments)}\n"
+                "$RunnerExitCode = $LASTEXITCODE\n"
+                '[Console]::Error.WriteLine("PS_NATIVE_PREFERENCE_AFTER=$PSNativeCommandUseErrorActionPreference")\n'
+                "exit $RunnerExitCode\n",
+            )
+            command = [
+                "pwsh",
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-File",
+                str(wrapper_path),
+            ]
+        else:
+            command = [
+                "pwsh",
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-File",
+                *runner_arguments,
+            ]
     else:
         command = [
             "pwsh",
@@ -2081,7 +2110,7 @@ def test_test_mode_explicitly_rejects_real_logs_root_before_state_creation(tmp_p
 
 def test_real_native_launch_truth_is_persisted_only_after_direct_invocation_returns():
     source = SCRIPT_PATH.read_text(encoding="utf-8")
-    real_executor_start = source.index("if (-not [bool]$Plan.is_test_mode)")
+    real_executor_start = source.index("$useDirectNative = (-not [bool]$Plan.is_test_mode)")
     real_executor_end = source.index("$preexistingLastExitCode = $null", real_executor_start)
     real_executor = source[real_executor_start:real_executor_end]
 
@@ -2089,3 +2118,69 @@ def test_real_native_launch_truth_is_persisted_only_after_direct_invocation_retu
     invocation_index = real_executor.index("& $command.executable @($command.arguments)")
     launched_index = real_executor.index("native.launched = $true")
     assert attempted_index < invocation_index < launched_index
+
+
+def test_native_exit_seven_is_recorded_when_ps_native_errors_are_terminating(tmp_path):
+    plan = base_plan(tmp_path)
+    plan["stage_plan"]["Calibrate"]["direct_native_exit_probe"] = 7
+    state_path = tmp_path / "logs" / "packet2n-r5-state.json"
+
+    result = run_runner(
+        "-Stage",
+        "Calibrate",
+        "-StatePath",
+        str(state_path),
+        "-Confirm",
+        "CALIBRATE",
+        plan=plan,
+        tmp_path=tmp_path,
+        ps_native_error_preference=True,
+    )
+
+    assert result.returncode != 0
+    assert "Calibrate native command failed with exit code 7" in result.stderr
+    assert "PS_NATIVE_PREFERENCE_AFTER=True" in result.stderr
+    assert "RECOVERY_CLASSIFICATION=INVALID_OR_UNCERTAIN_STATE" in result.stderr
+    assert "RECOVERY_NEXT_STAGE=NONE" in result.stderr
+    state = load_state(state_path)
+    assert state["stages"]["Calibrate"]["result"] == "failed"
+    assert state["stages"]["Calibrate"]["native"]["attempted"] is True
+    assert state["stages"]["Calibrate"]["native"]["launched"] is True
+    assert state["stages"]["Calibrate"]["native"]["real_exit_code"] == 7
+    assert state["completed_stages"] == []
+    transcript_path = Path(state["artifacts"]["transcript"]["path"])
+    assert transcript_path.exists()
+    assert "CALIBRATION_EXIT_CODE=0" not in transcript_path.read_text(encoding="utf-8")
+    assert not Path(state["artifacts"]["evidence"]["path"]).exists()
+
+
+def test_test_mode_rejects_temp_junction_before_target_mutation(tmp_path):
+    junction = tmp_path / "mutable-junction"
+    protected_target = tmp_path.parent / f"{tmp_path.name}-protected-junction-target"
+    protected_target.mkdir()
+    junction_result = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(junction), str(protected_target)],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=10,
+    )
+    if junction_result.returncode != 0:
+        shutil.rmtree(protected_target, ignore_errors=True)
+        pytest.skip(f"temporary junction creation is unavailable: {junction_result.stderr}")
+    try:
+        plan = base_plan(junction)
+        state_path = junction / "logs" / "packet2n-r5-state.json"
+        target_left = protected_target / "calibration" / "teleoperators" / "so_leader" / f"{LEADER_ID}_left.json"
+        original_hash = sha256_path(target_left)
+
+        result = run_calibrate(plan, tmp_path, state_path)
+
+        assert result.returncode != 0
+        assert "reparse point" in result.stderr.lower()
+        assert sha256_path(target_left) == original_hash
+        assert not (protected_target / "logs" / "packet2n-r5-state.json").exists()
+    finally:
+        if junction.exists():
+            os.rmdir(junction)
+        shutil.rmtree(protected_target, ignore_errors=True)

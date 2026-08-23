@@ -551,6 +551,38 @@ function Test-PathIsSameOrDescendant {
     return ($resolvedPath.Equals($resolvedRoot, [System.StringComparison]::OrdinalIgnoreCase) -or $resolvedPath.StartsWith($rootWithSeparator, [System.StringComparison]::OrdinalIgnoreCase))
 }
 
+function Assert-TestModePathHasNoReparsePoint {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Boundary
+    )
+
+    $currentPath = [System.IO.Path]::GetFullPath($Path).TrimEnd('\', '/')
+    $boundaryPath = [System.IO.Path]::GetFullPath($Boundary).TrimEnd('\', '/')
+    if (-not (Test-PathIsSameOrDescendant -Path $currentPath -Root $boundaryPath)) {
+        New-Failure "Test-mode reparse validation path escaped its boundary: $Path"
+    }
+    while ($true) {
+        if (Test-Path -LiteralPath $currentPath) {
+            $item = Get-Item -LiteralPath $currentPath -Force
+            if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                New-Failure "Test-mode sandbox refuses reparse point path component: $currentPath"
+            }
+        }
+        if ($currentPath.Equals($boundaryPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+            break
+        }
+        $parent = [System.IO.Directory]::GetParent($currentPath)
+        if ($null -eq $parent) {
+            New-Failure "Test-mode reparse validation could not reach its boundary: $Path"
+        }
+        $currentPath = $parent.FullName.TrimEnd('\', '/')
+    }
+}
+
 function Assert-TestModePlanRoots {
     param(
         [Parameter(Mandatory = $true)]
@@ -569,6 +601,7 @@ function Assert-TestModePlanRoots {
     if ($testRoot.Equals($osTempRoot, [System.StringComparison]::OrdinalIgnoreCase) -or -not (Test-PathIsSameOrDescendant -Path $testRoot -Root $osTempRoot)) {
         New-Failure "Test-mode sandbox must be a dedicated OS-temporary subtree"
     }
+    Assert-TestModePathHasNoReparsePoint -Path $testRoot -Boundary $osTempRoot
 
     $calibrationRoot = [System.IO.Path]::GetFullPath([string]$Plan.calibration_root).TrimEnd('\', '/')
     $stateRoot = [System.IO.Path]::GetFullPath([string]$Plan.state_root).TrimEnd('\', '/')
@@ -591,6 +624,7 @@ function Assert-TestModePlanRoots {
         if ($entry.path.Equals($testRoot, [System.StringComparison]::OrdinalIgnoreCase) -or -not (Test-PathIsSameOrDescendant -Path $entry.path -Root $testRoot)) {
             New-Failure "Test-mode $($entry.name) escaped the test-mode sandbox"
         }
+        Assert-TestModePathHasNoReparsePoint -Path $entry.path -Boundary $testRoot
     }
     if ((Test-PathIsSameOrDescendant -Path $calibrationRoot -Root $stateRoot) -or (Test-PathIsSameOrDescendant -Path $stateRoot -Root $calibrationRoot)) {
         New-Failure "Test-mode calibration and state roots must be separate subtrees"
@@ -616,6 +650,7 @@ function Assert-TestModePath {
     if (-not ($resolvedPath.Equals($resolvedRoot, [System.StringComparison]::OrdinalIgnoreCase) -or $resolvedPath.StartsWith($rootWithSeparator, [System.StringComparison]::OrdinalIgnoreCase))) {
         New-Failure "Test-mode mutable path escaped validated root: $Path"
     }
+    Assert-TestModePathHasNoReparsePoint -Path $resolvedPath -Boundary $resolvedRoot
 }
 
 function Assert-TestModeMutablePaths {
@@ -747,6 +782,28 @@ function Get-RepositoryPythonPath {
     return (Join-Path $RepositoryRoot ".venv\Scripts\python.exe")
 }
 
+function Test-UseDirectNativeExitProbe {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$StageName,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Plan
+    )
+
+    if (-not [bool]$Plan.is_test_mode -or $StageName -cne "Calibrate") {
+        return $false
+    }
+    $stagePlan = $Plan.stage_plan[$StageName]
+    if ($null -eq $stagePlan -or -not $stagePlan.ContainsKey("direct_native_exit_probe")) {
+        return $false
+    }
+    if (-not (Test-IsJsonInteger -Value $stagePlan.direct_native_exit_probe) -or [int]$stagePlan.direct_native_exit_probe -ne 7) {
+        New-Failure "Test-mode direct native probe permits only the fixed exit code 7"
+    }
+    return $true
+}
+
 function Build-StageCommand {
     param(
         [Parameter(Mandatory = $true)]
@@ -754,6 +811,18 @@ function Build-StageCommand {
 
         [hashtable]$Plan
     )
+
+    if (Test-UseDirectNativeExitProbe -StageName $StageName -Plan $Plan) {
+        $systemDirectory = [Environment]::SystemDirectory
+        if ([string]::IsNullOrEmpty($systemDirectory)) {
+            New-Failure "Test-mode direct native probe could not resolve the Windows system directory"
+        }
+        $commandInterpreter = Join-Path $systemDirectory "cmd.exe"
+        return [ordered]@{
+            executable = [System.IO.Path]::GetFullPath($commandInterpreter)
+            arguments  = @("/d", "/c", "exit", "7")
+        }
+    }
 
     $pythonPath = Get-RepositoryPythonPath -Plan $Plan
     $calibrateScript = Join-Path $RepositoryRoot "examples\alohamini\calibrate_bi.py"
@@ -1676,7 +1745,8 @@ function Invoke-SharedExecutor {
     $State.stages[$StageName].native.executable = $command.executable
     $State.stages[$StageName].native.arguments = @($command.arguments)
 
-    if (-not [bool]$Plan.is_test_mode) {
+    $useDirectNative = (-not [bool]$Plan.is_test_mode) -or (Test-UseDirectNativeExitProbe -StageName $StageName -Plan $Plan)
+    if ($useDirectNative) {
         if (-not (Test-Path -LiteralPath $command.executable -PathType Leaf)) {
             New-Failure "Native executable is missing: $($command.executable)"
         }
@@ -1701,7 +1771,14 @@ function Invoke-SharedExecutor {
             }
             Remove-Variable -Name LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue
             $nativePrimaryException = $null
+            $nativeErrorPreference = Get-Variable -Name PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue
+            $nativeErrorPreferenceExisted = $null -ne $nativeErrorPreference
+            $savedNativeErrorPreference = if ($nativeErrorPreferenceExisted) { $nativeErrorPreference.Value } else { $null }
+            $localNativeErrorPreference = Get-Variable -Name PSNativeCommandUseErrorActionPreference -Scope Local -ErrorAction SilentlyContinue
+            $localNativeErrorPreferenceExisted = $null -ne $localNativeErrorPreference
+            $savedLocalNativeErrorPreference = if ($localNativeErrorPreferenceExisted) { $localNativeErrorPreference.Value } else { $null }
             try {
+                Set-Variable -Name PSNativeCommandUseErrorActionPreference -Scope Local -Value $false
                 & $command.executable @($command.arguments)
                 $State.stages[$StageName].native.launched = $true
                 $lastExitVariable = Get-Variable -Name LASTEXITCODE -ErrorAction SilentlyContinue
@@ -1715,6 +1792,28 @@ function Invoke-SharedExecutor {
                 $nativePrimaryException = $_.Exception
             }
             finally {
+                try {
+                    if ($localNativeErrorPreferenceExisted) {
+                        Set-Variable -Name PSNativeCommandUseErrorActionPreference -Scope Local -Value $savedLocalNativeErrorPreference
+                    }
+                    else {
+                        Remove-Variable -Name PSNativeCommandUseErrorActionPreference -Scope Local -ErrorAction SilentlyContinue
+                    }
+                    $restoredNativeErrorPreference = Get-Variable -Name PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue
+                    if ($nativeErrorPreferenceExisted) {
+                        if ($null -eq $restoredNativeErrorPreference -or $restoredNativeErrorPreference.Value -ne $savedNativeErrorPreference) {
+                            New-Failure "Native error preference restoration failed"
+                        }
+                    }
+                    elseif ($null -ne $restoredNativeErrorPreference) {
+                        New-Failure "Native error preference restoration introduced a variable"
+                    }
+                }
+                catch {
+                    if ($null -eq $nativePrimaryException) {
+                        $nativePrimaryException = $_.Exception
+                    }
+                }
                 if ($nativeTranscriptStarted) {
                     try {
                         Stop-Transcript | Out-Null
@@ -2275,7 +2374,8 @@ function Invoke-CalibrateStage {
         $state.stages.Calibrate.native.arguments = @($command.arguments)
         Save-State -Path $StatePathValue -State $state
         $headerLines = @(Get-CalibrationTranscriptHeaderLines -State $state -Executable $command.executable -Arguments @($command.arguments))
-        if ([bool]$Plan.is_test_mode) {
+        $useDirectNativeProbe = Test-UseDirectNativeExitProbe -StageName "Calibrate" -Plan $Plan
+        if ([bool]$Plan.is_test_mode -and -not $useDirectNativeProbe) {
             Invoke-SharedExecutor -StageName "Calibrate" -Plan $Plan -State $state -StatePathValue $StatePathValue
             $rawTranscriptLines = @(([string]$Plan.stage_plan.Calibrate.transcript_text) -split "`r?`n" | Where-Object {
                 $_ -ne "" -and -not ([string]$_).StartsWith("CALIBRATION_EXIT_CODE=", [System.StringComparison]::Ordinal)
