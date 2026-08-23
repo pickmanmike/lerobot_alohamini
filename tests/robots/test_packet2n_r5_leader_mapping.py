@@ -388,6 +388,66 @@ def rewrite_evidence_and_state(state_path: Path, state: dict[str, object], evide
     write_json(state_path, state)
 
 
+def expected_native_command(stage: str) -> tuple[str, list[str]]:
+    executable = str(REPO_ROOT / ".venv" / "Scripts" / "python.exe")
+    if stage == "Calibrate":
+        arguments = [
+            str(REPO_ROOT / "examples" / "alohamini" / "calibrate_bi.py"),
+            "--teleop.left_port",
+            LEFT_PORT,
+            "--teleop.right_port",
+            RIGHT_PORT,
+            "--teleop.id",
+            LEADER_ID,
+            "--teleop.arm_profile",
+            ARM_PROFILE,
+            "--force_fresh_calibration",
+        ]
+    else:
+        arguments = [
+            str(REPO_ROOT / "examples" / "alohamini" / "teleoperate_bi.py"),
+            "--teleop.left_port",
+            LEFT_PORT,
+            "--teleop.right_port",
+            RIGHT_PORT,
+            "--teleop.id",
+            LEADER_ID,
+            "--teleop.arm_profile",
+            ARM_PROFILE,
+            "--no_robot",
+            "--robot.robot_model",
+            "alohamini1",
+            "--require_calibration_match",
+            "--duration_s",
+            "12",
+            "--fps",
+            "5",
+            "--start_paused",
+            "--no_keyboard",
+            "--no_rerun",
+        ]
+    return executable, arguments
+
+
+def mark_native_stages_completed(state: dict[str, object], *stage_names: str) -> None:
+    completed = list(state["completed_stages"])
+    for stage in stage_names:
+        executable, arguments = expected_native_command(stage)
+        state["stages"][stage] = {
+            "result": "completed",
+            "native": {
+                "attempted": True,
+                "launched": True,
+                "real_exit_code": 0,
+                "executable": executable,
+                "arguments": arguments,
+            },
+        }
+        if stage not in completed:
+            completed.append(stage)
+    state["completed_stages"] = completed
+
+
 def install_actual_map_artifacts(state_path: Path, state: dict[str, object]) -> tuple[Path, Path]:
     left_path = Path(state["artifacts"]["map_left"]["path"])
     right_path = Path(state["artifacts"]["map_right"]["path"])
@@ -399,7 +459,7 @@ def install_actual_map_artifacts(state_path: Path, state: dict[str, object]) -> 
         right_path,
         make_actual_map_log(marker="PHYSICAL_RIGHT_ONLY", state=state, physical_side="right"),
     )
-    state["completed_stages"] = ["Calibrate", LEFT_MAP_STAGE, RIGHT_MAP_STAGE]
+    mark_native_stages_completed(state, LEFT_MAP_STAGE, RIGHT_MAP_STAGE)
     for artifact_name, path in (("map_left", left_path), ("map_right", right_path)):
         state["artifacts"][artifact_name]["sha256"] = sha256_path(path)
     write_json(state_path, state)
@@ -636,7 +696,7 @@ def test_invalid_partial_log_is_never_accepted(tmp_path):
         make_actual_map_log(marker="PHYSICAL_LEFT_ONLY", state=state, physical_side="left"),
     )
     write_text(right_map_path, make_partial_log(RIGHT_MAP_STAGE))
-    state["completed_stages"] = ["Calibrate", LEFT_MAP_STAGE, RIGHT_MAP_STAGE]
+    mark_native_stages_completed(state, LEFT_MAP_STAGE, RIGHT_MAP_STAGE)
     state["artifacts"]["map_left"] = {"path": str(left_map_path), "sha256": sha256_path(left_map_path)}
     state["artifacts"]["map_right"] = {"path": str(right_map_path), "sha256": sha256_path(right_map_path)}
     write_json(state_path, state)
@@ -984,7 +1044,7 @@ def test_verify_accepts_actual_client_log_shape_and_uses_per_key_opposite_family
             action_pairs=right_actions,
         ),
     )
-    state["completed_stages"] = ["Calibrate", LEFT_MAP_STAGE, RIGHT_MAP_STAGE]
+    mark_native_stages_completed(state, LEFT_MAP_STAGE, RIGHT_MAP_STAGE)
     state["artifacts"]["map_left"] = {"path": str(left_map_path), "sha256": sha256_path(left_map_path)}
     state["artifacts"]["map_right"] = {"path": str(right_map_path), "sha256": sha256_path(right_map_path)}
     write_json(state_path, state)
@@ -1032,7 +1092,7 @@ def test_verify_rejects_actual_client_log_with_duplicate_key(tmp_path):
             action_pairs=right_actions,
         ),
     )
-    state["completed_stages"] = ["Calibrate", LEFT_MAP_STAGE, RIGHT_MAP_STAGE]
+    mark_native_stages_completed(state, LEFT_MAP_STAGE, RIGHT_MAP_STAGE)
     state["artifacts"]["map_left"] = {"path": str(left_map_path), "sha256": sha256_path(left_map_path)}
     state["artifacts"]["map_right"] = {"path": str(right_map_path), "sha256": sha256_path(right_map_path)}
     write_json(state_path, state)
@@ -1074,7 +1134,7 @@ def test_verify_rejects_reversed_or_ambiguous_actual_maps(tmp_path):
             physical_side="right",
         ),
     )
-    state["completed_stages"] = ["Calibrate", LEFT_MAP_STAGE, RIGHT_MAP_STAGE]
+    mark_native_stages_completed(state, LEFT_MAP_STAGE, RIGHT_MAP_STAGE)
     state["artifacts"]["map_left"] = {"path": str(left_map_path), "sha256": sha256_path(left_map_path)}
     state["artifacts"]["map_right"] = {"path": str(right_map_path), "sha256": sha256_path(right_map_path)}
     write_json(state_path, state)
@@ -1212,7 +1272,7 @@ def test_verify_rejects_actual_log_with_nonzero_body_key(tmp_path):
             action_pairs=right_actions,
         ),
     )
-    state["completed_stages"] = ["Calibrate", LEFT_MAP_STAGE, RIGHT_MAP_STAGE]
+    mark_native_stages_completed(state, LEFT_MAP_STAGE, RIGHT_MAP_STAGE)
     state["artifacts"]["map_left"] = {"path": str(left_map_path), "sha256": sha256_path(left_map_path)}
     state["artifacts"]["map_right"] = {"path": str(right_map_path), "sha256": sha256_path(right_map_path)}
     write_json(state_path, state)
@@ -1260,7 +1320,7 @@ def test_verify_rejects_actual_log_with_case_variant_body_key(tmp_path):
             action_pairs=right_actions,
         ),
     )
-    state["completed_stages"] = ["Calibrate", LEFT_MAP_STAGE, RIGHT_MAP_STAGE]
+    mark_native_stages_completed(state, LEFT_MAP_STAGE, RIGHT_MAP_STAGE)
     state["artifacts"]["map_left"] = {"path": str(left_map_path), "sha256": sha256_path(left_map_path)}
     state["artifacts"]["map_right"] = {"path": str(right_map_path), "sha256": sha256_path(right_map_path)}
     write_json(state_path, state)
@@ -1693,7 +1753,7 @@ def test_verify_rejects_inexact_packet_metadata(tmp_path, mutation):
     write_text(left_path, left_text)
     right_path = Path(state["artifacts"]["map_right"]["path"])
     write_text(right_path, make_actual_map_log(marker="PHYSICAL_RIGHT_ONLY", state=state, physical_side="right"))
-    state["completed_stages"] = ["Calibrate", LEFT_MAP_STAGE, RIGHT_MAP_STAGE]
+    mark_native_stages_completed(state, LEFT_MAP_STAGE, RIGHT_MAP_STAGE)
     for name, path in (("map_left", left_path), ("map_right", right_path)):
         state["artifacts"][name]["sha256"] = sha256_path(path)
     write_json(state_path, state)
@@ -1726,7 +1786,7 @@ def test_verify_rejects_preexisting_success_terminator_record(tmp_path):
             physical_side="right",
         ),
     )
-    state["completed_stages"] = ["Calibrate", LEFT_MAP_STAGE, RIGHT_MAP_STAGE]
+    mark_native_stages_completed(state, LEFT_MAP_STAGE, RIGHT_MAP_STAGE)
     state["artifacts"]["map_left"] = {"path": str(left_path), "sha256": sha256_path(left_path)}
     state["artifacts"]["map_right"] = {"path": str(right_path), "sha256": sha256_path(right_path)}
     write_json(state_path, state)
@@ -1858,3 +1918,174 @@ def test_test_mode_rejects_calibration_path_outside_validated_root(tmp_path):
     assert result.returncode != 0
     assert "escaped validated root" in result.stderr
     assert sha256_path(escaped_path) == original_hash
+
+
+@pytest.mark.parametrize(
+    ("container", "field", "value"),
+    [
+        ("stage", "result", "pending"),
+        ("native", "attempted", False),
+        ("native", "launched", False),
+        ("native", "real_exit_code", None),
+        ("native", "real_exit_code", 9),
+        ("native", "executable", "C:\\wrong\\python.exe"),
+        ("native", "arguments", ["wrong"]),
+    ],
+)
+def test_status_rejects_completed_calibrate_stage_with_inconsistent_truth(tmp_path, container, field, value):
+    plan = base_plan(tmp_path)
+    state_path = tmp_path / "logs" / "packet2n-r5-state.json"
+    assert run_calibrate(plan, tmp_path, state_path).returncode == 0
+    state = load_state(state_path)
+    target = state["stages"]["Calibrate"] if container == "stage" else state["stages"]["Calibrate"]["native"]
+    target[field] = value
+    write_json(state_path, state)
+
+    result = run_runner("-Stage", "Status", "-StatePath", str(state_path), plan=plan, tmp_path=tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["classification"] == "INVALID_OR_UNCERTAIN_STATE"
+    assert "Calibrate" in payload["report"]
+
+
+def test_later_stage_preflight_rejects_inconsistent_completed_stage_before_native_attempt(tmp_path):
+    plan = base_plan(tmp_path)
+    state_path = tmp_path / "logs" / "packet2n-r5-state.json"
+    assert run_calibrate(plan, tmp_path, state_path).returncode == 0
+    state = load_state(state_path)
+    state["stages"]["Calibrate"]["result"] = "pending"
+    write_json(state_path, state)
+
+    result = run_map_stage(LEFT_MAP_STAGE, plan, tmp_path, state_path)
+
+    assert result.returncode != 0
+    assert "Calibrate" in result.stderr
+    assert load_state(state_path)["stages"][LEFT_MAP_STAGE]["native"]["attempted"] is False
+
+
+@pytest.mark.parametrize("stage", [LEFT_MAP_STAGE, RIGHT_MAP_STAGE])
+def test_status_rejects_completed_map_stage_with_inconsistent_native_truth(tmp_path, stage):
+    plan = base_plan(tmp_path)
+    state_path = tmp_path / "logs" / "packet2n-r5-state.json"
+    assert run_calibrate(plan, tmp_path, state_path).returncode == 0
+    assert run_map_stage(LEFT_MAP_STAGE, plan, tmp_path, state_path).returncode == 0
+    if stage == RIGHT_MAP_STAGE:
+        assert run_map_stage(RIGHT_MAP_STAGE, plan, tmp_path, state_path).returncode == 0
+    state = load_state(state_path)
+    state["stages"][stage]["native"]["attempted"] = False
+    write_json(state_path, state)
+
+    result = run_runner("-Stage", "Status", "-StatePath", str(state_path), plan=plan, tmp_path=tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["classification"] == "INVALID_OR_UNCERTAIN_STATE"
+    assert stage in payload["report"]
+
+
+def test_completed_verify_stage_is_non_native_and_status_rejects_native_tamper(tmp_path):
+    plan = base_plan(tmp_path)
+    state_path = tmp_path / "logs" / "packet2n-r5-state.json"
+    assert run_calibrate(plan, tmp_path, state_path).returncode == 0
+    assert run_map_stage(LEFT_MAP_STAGE, plan, tmp_path, state_path).returncode == 0
+    assert run_map_stage(RIGHT_MAP_STAGE, plan, tmp_path, state_path).returncode == 0
+    verify = run_runner("-Stage", "Verify", "-StatePath", str(state_path), plan=plan, tmp_path=tmp_path)
+    assert verify.returncode == 0, verify.stderr
+    state = load_state(state_path)
+    assert state["stages"]["Verify"] == {
+        "result": "completed",
+        "native": {
+            "attempted": False,
+            "launched": False,
+            "real_exit_code": None,
+            "executable": None,
+            "arguments": [],
+        },
+    }
+    state["stages"]["Verify"]["native"]["attempted"] = True
+    write_json(state_path, state)
+
+    result = run_runner("-Stage", "Status", "-StatePath", str(state_path), plan=plan, tmp_path=tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["classification"] == "INVALID_OR_UNCERTAIN_STATE"
+    assert "Verify" in payload["report"]
+
+
+def test_status_rejects_completed_result_missing_from_completed_stage_list(tmp_path):
+    plan = base_plan(tmp_path)
+    state_path = tmp_path / "logs" / "packet2n-r5-state.json"
+    assert run_calibrate(plan, tmp_path, state_path).returncode == 0
+    state = load_state(state_path)
+    state["stages"][LEFT_MAP_STAGE]["result"] = "completed"
+    write_json(state_path, state)
+
+    result = run_runner("-Stage", "Status", "-StatePath", str(state_path), plan=plan, tmp_path=tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["classification"] == "INVALID_OR_UNCERTAIN_STATE"
+    assert LEFT_MAP_STAGE in payload["report"]
+
+
+def test_test_mode_rejects_repository_mutable_root_before_any_runner_write(tmp_path):
+    repo_sandbox = REPO_ROOT / f".packet2n-r5-test-{sha256_text(str(tmp_path))[:12]}"
+    assert not repo_sandbox.exists()
+    try:
+        plan = base_plan(repo_sandbox)
+        state_path = repo_sandbox / "logs" / "packet2n-r5-state.json"
+        left_path = Path(plan["calibration"]["left"]["path"])
+        original_hash = sha256_path(left_path)
+
+        result = run_calibrate(plan, repo_sandbox, state_path)
+
+        assert result.returncode != 0
+        assert "test-mode sandbox" in result.stderr.lower()
+        assert sha256_path(left_path) == original_hash
+        assert not state_path.exists()
+    finally:
+        shutil.rmtree(repo_sandbox, ignore_errors=True)
+
+
+def test_test_mode_explicitly_rejects_real_calibration_root_without_touching_it(tmp_path):
+    plan = base_plan(tmp_path)
+    original_hashes = {
+        side: sha256_path(Path(plan["calibration"][side]["path"])) for side in ("left", "right")
+    }
+    plan["calibration_root"] = r"C:\Users\pickm\.cache\huggingface\lerobot\calibration"
+    state_path = tmp_path / "logs" / "packet2n-r5-state.json"
+
+    result = run_calibrate(plan, tmp_path, state_path)
+
+    assert result.returncode != 0
+    assert "production calibration root" in result.stderr
+    assert {
+        side: sha256_path(Path(plan["calibration"][side]["path"])) for side in ("left", "right")
+    } == original_hashes
+    assert not state_path.exists()
+
+
+def test_test_mode_explicitly_rejects_real_logs_root_before_state_creation(tmp_path):
+    plan = base_plan(tmp_path)
+    plan["state_root"] = r"C:\Users\pickm\AlohaMini1Logs"
+    state_path = tmp_path / "logs" / "packet2n-r5-state.json"
+
+    result = run_calibrate(plan, tmp_path, state_path)
+
+    assert result.returncode != 0
+    assert "production logs root" in result.stderr
+    assert not state_path.exists()
+
+
+def test_real_native_launch_truth_is_persisted_only_after_direct_invocation_returns():
+    source = SCRIPT_PATH.read_text(encoding="utf-8")
+    real_executor_start = source.index("if (-not [bool]$Plan.is_test_mode)")
+    real_executor_end = source.index("$preexistingLastExitCode = $null", real_executor_start)
+    real_executor = source[real_executor_start:real_executor_end]
+
+    attempted_index = real_executor.index("native.attempted = $true")
+    invocation_index = real_executor.index("& $command.executable @($command.arguments)")
+    launched_index = real_executor.index("native.launched = $true")
+    assert attempted_index < invocation_index < launched_index

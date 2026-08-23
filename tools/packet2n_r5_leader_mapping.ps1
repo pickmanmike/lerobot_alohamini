@@ -296,6 +296,8 @@ function Get-TestModePlan {
     }
     $plan = Read-JsonFile -Path $TestPlanPath
     $plan.is_test_mode = $true
+    $sessionId = if ($plan.ContainsKey("session_id")) { [string]$plan.session_id } else { $null }
+    Assert-TestModeMutablePaths -Plan $plan -StatePathValue $StatePath -SessionId $sessionId
     return $plan
 }
 
@@ -528,7 +530,71 @@ function Get-TestModeRoot {
         [hashtable]$Plan
     )
 
-    return (Split-Path -Parent $Plan.calibration_root)
+    if ([string]::IsNullOrEmpty($TestPlanPath)) {
+        New-Failure "Test-mode sandbox requires -TestPlanPath"
+    }
+    return [System.IO.Path]::GetFullPath((Split-Path -Parent $TestPlanPath))
+}
+
+function Test-PathIsSameOrDescendant {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Root
+    )
+
+    $resolvedPath = [System.IO.Path]::GetFullPath($Path).TrimEnd('\', '/')
+    $resolvedRoot = [System.IO.Path]::GetFullPath($Root).TrimEnd('\', '/')
+    $rootWithSeparator = $resolvedRoot + [System.IO.Path]::DirectorySeparatorChar
+    return ($resolvedPath.Equals($resolvedRoot, [System.StringComparison]::OrdinalIgnoreCase) -or $resolvedPath.StartsWith($rootWithSeparator, [System.StringComparison]::OrdinalIgnoreCase))
+}
+
+function Assert-TestModePlanRoots {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Plan
+    )
+
+    if ($env:PACKET2N_R5_TEST_MODE -cne "1") {
+        return
+    }
+    $testRoot = [System.IO.Path]::GetFullPath((Get-TestModeRoot -Plan $Plan)).TrimEnd('\', '/')
+    $localApplicationData = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
+    if ([string]::IsNullOrEmpty($localApplicationData)) {
+        New-Failure "Test-mode sandbox could not resolve the Windows OS-temporary root"
+    }
+    $osTempRoot = [System.IO.Path]::GetFullPath((Join-Path $localApplicationData "Temp")).TrimEnd('\', '/')
+    if ($testRoot.Equals($osTempRoot, [System.StringComparison]::OrdinalIgnoreCase) -or -not (Test-PathIsSameOrDescendant -Path $testRoot -Root $osTempRoot)) {
+        New-Failure "Test-mode sandbox must be a dedicated OS-temporary subtree"
+    }
+
+    $calibrationRoot = [System.IO.Path]::GetFullPath([string]$Plan.calibration_root).TrimEnd('\', '/')
+    $stateRoot = [System.IO.Path]::GetFullPath([string]$Plan.state_root).TrimEnd('\', '/')
+    if ($calibrationRoot.Equals([System.IO.Path]::GetFullPath($RealCalibrationRoot).TrimEnd('\', '/'), [System.StringComparison]::OrdinalIgnoreCase)) {
+        New-Failure "Test-mode sandbox refuses the production calibration root"
+    }
+    if ($stateRoot.Equals([System.IO.Path]::GetFullPath($RealLogsDirectory).TrimEnd('\', '/'), [System.StringComparison]::OrdinalIgnoreCase)) {
+        New-Failure "Test-mode sandbox refuses the production logs root"
+    }
+
+    foreach ($protectedPath in @($RepositoryRoot, $RealCalibrationRoot, $RealLogsDirectory)) {
+        if ((Test-PathIsSameOrDescendant -Path $testRoot -Root $protectedPath) -or (Test-PathIsSameOrDescendant -Path $protectedPath -Root $testRoot)) {
+            New-Failure "Test-mode sandbox overlaps a protected production or repository path"
+        }
+    }
+    foreach ($entry in @(
+        [ordered]@{ name = "calibration root"; path = $calibrationRoot },
+        [ordered]@{ name = "state root"; path = $stateRoot }
+    )) {
+        if ($entry.path.Equals($testRoot, [System.StringComparison]::OrdinalIgnoreCase) -or -not (Test-PathIsSameOrDescendant -Path $entry.path -Root $testRoot)) {
+            New-Failure "Test-mode $($entry.name) escaped the test-mode sandbox"
+        }
+    }
+    if ((Test-PathIsSameOrDescendant -Path $calibrationRoot -Root $stateRoot) -or (Test-PathIsSameOrDescendant -Path $stateRoot -Root $calibrationRoot)) {
+        New-Failure "Test-mode calibration and state roots must be separate subtrees"
+    }
 }
 
 function Assert-TestModePath {
@@ -543,6 +609,7 @@ function Assert-TestModePath {
     if ($env:PACKET2N_R5_TEST_MODE -ne "1") {
         return
     }
+    Assert-TestModePlanRoots -Plan $Plan
     $resolvedRoot = [System.IO.Path]::GetFullPath((Get-TestModeRoot -Plan $Plan))
     $resolvedPath = [System.IO.Path]::GetFullPath($Path)
     $rootWithSeparator = $resolvedRoot.TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
@@ -565,13 +632,25 @@ function Assert-TestModeMutablePaths {
     if ($env:PACKET2N_R5_TEST_MODE -cne "1") {
         return
     }
+    Assert-TestModePlanRoots -Plan $Plan
     Assert-TestModePath -Plan $Plan -Path $StatePathValue
     Assert-TestModePath -Plan $Plan -Path ([string]$Plan.calibration.left.path)
     Assert-TestModePath -Plan $Plan -Path ([string]$Plan.calibration.right.path)
+    foreach ($side in @("left", "right")) {
+        if (-not (Test-PathIsSameOrDescendant -Path ([string]$Plan.calibration[$side].path) -Root ([string]$Plan.calibration_root))) {
+            New-Failure "Test-mode calibration path escaped the validated calibration root: $($Plan.calibration[$side].path)"
+        }
+    }
+    if (-not (Test-PathIsSameOrDescendant -Path $StatePathValue -Root ([string]$Plan.state_root))) {
+        New-Failure "Test-mode state path escaped the validated state root: $StatePathValue"
+    }
     if (-not [string]::IsNullOrEmpty($SessionId)) {
         $reserved = Get-ReservedArtifactPaths -Plan $Plan -SessionId $SessionId
         foreach ($artifactName in @("transcript", "evidence", "map_left", "map_right")) {
             Assert-TestModePath -Plan $Plan -Path ([string]$reserved[$artifactName])
+            if (-not (Test-PathIsSameOrDescendant -Path ([string]$reserved[$artifactName]) -Root ([string]$Plan.state_root))) {
+                New-Failure "Test-mode artifact path escaped the validated state root: $($reserved[$artifactName])"
+            }
         }
     }
 }
@@ -1174,7 +1253,10 @@ function Assert-ReservedArtifactPaths {
 
 function Get-StateValidationIssues {
     param(
-        [hashtable]$State
+        [hashtable]$State,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Plan
     )
 
     $issues = [System.Collections.Generic.List[string]]::new()
@@ -1209,6 +1291,106 @@ function Get-StateValidationIssues {
             if ([string]$completed[$index] -cne [string]$expectedOrder[$index]) {
                 $issues.Add("invalid completed stage ordering")
                 break
+            }
+        }
+    }
+    $expectedStageNames = @("Calibrate", "MapLeft", "MapRight", "Verify")
+    $completedStageNames = if ($State.ContainsKey("completed_stages")) { @($State.completed_stages) } else { @() }
+    if (-not $State.ContainsKey("stages") -or $State.stages -isnot [System.Collections.IDictionary]) {
+        $issues.Add("invalid stage schema")
+    }
+    else {
+        $actualStageNames = @($State.stages.Keys)
+        if ($actualStageNames.Count -ne $expectedStageNames.Count) {
+            $issues.Add("invalid stage schema")
+        }
+        foreach ($actualStageName in $actualStageNames) {
+            if ($expectedStageNames -cnotcontains [string]$actualStageName) {
+                $issues.Add("unexpected stage $actualStageName")
+            }
+        }
+        foreach ($stageName in $expectedStageNames) {
+            if ($actualStageNames -cnotcontains $stageName) {
+                $issues.Add("missing stage $stageName")
+                continue
+            }
+            $stageRecord = $State.stages[$stageName]
+            if ($stageRecord -isnot [System.Collections.IDictionary]) {
+                $issues.Add("invalid $stageName stage schema")
+                continue
+            }
+            $stageKeys = @($stageRecord.Keys)
+            if ($stageKeys.Count -ne 2 -or $stageKeys -cnotcontains "result" -or $stageKeys -cnotcontains "native") {
+                $issues.Add("invalid $stageName stage schema")
+                continue
+            }
+            $stageResult = [string]$stageRecord.result
+            if (@("pending", "failed", "completed") -cnotcontains $stageResult) {
+                $issues.Add("invalid $stageName stage result")
+            }
+            $isCompleted = $completedStageNames -ccontains $stageName
+            if ($isCompleted -and $stageResult -cne "completed") {
+                $issues.Add("completed stage $stageName does not have result=completed")
+            }
+            if (-not $isCompleted -and $stageResult -ceq "completed") {
+                $issues.Add("stage $stageName has result=completed but is absent from completed_stages")
+            }
+
+            $native = $stageRecord.native
+            if ($native -isnot [System.Collections.IDictionary]) {
+                $issues.Add("invalid $stageName native schema")
+                continue
+            }
+            $expectedNativeKeys = @("attempted", "launched", "real_exit_code", "executable", "arguments")
+            $nativeKeys = @($native.Keys)
+            $nativeSchemaValid = $nativeKeys.Count -eq $expectedNativeKeys.Count
+            if ($nativeKeys.Count -ne $expectedNativeKeys.Count) {
+                $issues.Add("invalid $stageName native schema")
+            }
+            foreach ($nativeKey in $expectedNativeKeys) {
+                if ($nativeKeys -cnotcontains $nativeKey) {
+                    $issues.Add("missing $stageName native field $nativeKey")
+                    $nativeSchemaValid = $false
+                }
+            }
+            if (-not $nativeSchemaValid) {
+                continue
+            }
+            if ($nativeKeys -cnotcontains "attempted" -or $native.attempted -isnot [bool]) {
+                $issues.Add("invalid $stageName native attempted value")
+            }
+            if ($nativeKeys -cnotcontains "launched" -or $native.launched -isnot [bool]) {
+                $issues.Add("invalid $stageName native launched value")
+            }
+            if ($nativeKeys -ccontains "real_exit_code" -and $null -ne $native.real_exit_code -and -not (Test-IsJsonInteger -Value $native.real_exit_code)) {
+                $issues.Add("invalid $stageName native exit code")
+            }
+            if ($nativeKeys -ccontains "executable" -and $null -ne $native.executable -and $native.executable -isnot [string]) {
+                $issues.Add("invalid $stageName native executable")
+            }
+            if ($nativeKeys -cnotcontains "arguments" -or $native.arguments -isnot [System.Array]) {
+                $issues.Add("invalid $stageName native arguments")
+            }
+
+            if ($stageName -ceq "Verify") {
+                if ($native.attempted -ne $false -or $native.launched -ne $false -or $null -ne $native.real_exit_code -or $null -ne $native.executable -or @($native.arguments).Count -ne 0) {
+                    $issues.Add("Verify must remain a non-native stage")
+                }
+                continue
+            }
+            if ($isCompleted) {
+                if ($native.attempted -ne $true -or $native.launched -ne $true -or -not (Test-IsJsonInteger -Value $native.real_exit_code) -or [int64]$native.real_exit_code -ne 0) {
+                    $issues.Add("completed native stage $stageName lacks attempted=true, launched=true, exit=0")
+                }
+                $expectedCommand = Build-StageCommand -StageName $stageName -Plan $Plan
+                try {
+                    if (-not (Test-ExactValue -Actual $native.executable -Expected $expectedCommand.executable) -or -not (Test-ExactValue -Actual @($native.arguments) -Expected @($expectedCommand.arguments))) {
+                        $issues.Add("completed native stage $stageName command does not match the exact reviewed command")
+                    }
+                }
+                catch {
+                    $issues.Add("completed native stage $stageName command is invalid")
+                }
             }
         }
     }
@@ -1518,20 +1700,21 @@ function Invoke-SharedExecutor {
                 $nativeTranscriptStarted = $true
             }
             Remove-Variable -Name LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue
-            $State.stages[$StageName].native.launched = $true
-            Save-State -Path $StatePathValue -State $State
             $nativePrimaryException = $null
             try {
                 & $command.executable @($command.arguments)
+                $State.stages[$StageName].native.launched = $true
+                $lastExitVariable = Get-Variable -Name LASTEXITCODE -ErrorAction SilentlyContinue
+                if ($null -ne $lastExitVariable -and $null -ne $lastExitVariable.Value) {
+                    $capturedExitCode = [int]$lastExitVariable.Value
+                }
+                $State.stages[$StageName].native.real_exit_code = $capturedExitCode
+                Save-State -Path $StatePathValue -State $State
             }
             catch {
                 $nativePrimaryException = $_.Exception
             }
             finally {
-                $lastExitVariable = Get-Variable -Name LASTEXITCODE -ErrorAction SilentlyContinue
-                if ($null -ne $lastExitVariable -and $null -ne $lastExitVariable.Value) {
-                    $capturedExitCode = [int]$lastExitVariable.Value
-                }
                 if ($nativeTranscriptStarted) {
                     try {
                         Stop-Transcript | Out-Null
@@ -1547,8 +1730,6 @@ function Invoke-SharedExecutor {
             if ($null -ne $nativePrimaryException) {
                 throw $nativePrimaryException
             }
-            $State.stages[$StageName].native.real_exit_code = $capturedExitCode
-            Save-State -Path $StatePathValue -State $State
             if ($null -eq $capturedExitCode) {
                 New-Failure "Native command returned no exit code"
             }
@@ -2145,7 +2326,7 @@ function Invoke-MapStage {
     )
 
     $state = Load-State -Path $StatePathValue
-    $issues = @(Get-StateValidationIssues -State $state)
+    $issues = @(Get-StateValidationIssues -State $state -Plan $Plan)
     if ($issues.Count -gt 0) {
         New-Failure ("INVALID_OR_UNCERTAIN_STATE: " + ($issues -join ", "))
     }
@@ -2216,7 +2397,7 @@ function Invoke-VerifyStage {
     )
 
     $state = Load-State -Path $StatePathValue
-    $issues = @(Get-StateValidationIssues -State $state)
+    $issues = @(Get-StateValidationIssues -State $state -Plan $Plan)
     if ($issues.Count -gt 0) {
         New-Failure ("INVALID_OR_UNCERTAIN_STATE: " + ($issues -join ", "))
     }
@@ -2274,7 +2455,7 @@ function Get-StatusPayload {
             }
         }
         $state = Read-JsonFile -Path $StatePathValue
-        $issues = @(Get-StateValidationIssues -State $state)
+        $issues = @(Get-StateValidationIssues -State $state -Plan $Plan)
         if ($issues.Count -gt 0) {
             return [ordered]@{
                 classification = "INVALID_OR_UNCERTAIN_STATE"
