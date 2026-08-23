@@ -368,17 +368,14 @@ $packet2nPhysicalRightExitCode = $LASTEXITCODE
 if ($packet2nPhysicalRightExitCode -ne 0) { throw "physical-right map failed with $packet2nPhysicalRightExitCode" }
 ```
 
-The strict verifier preserves the historical two-path use while adding a fail-closed Packet 2N-R5 evidence mode. Both modes require the marker, exactly 60 no-robot action records, the no-robot notice, absence of runtime `ZMQ` or calibration text, normal cleanup, exit `0`, the exact twelve arm keys, a moved gripper span of at least 20 normalized units, and less than `2.0` variation across the entire opposite logical family. The broad quoted-key scan deliberately rejects missing, duplicated, or unexpected `arm_*.pos` keys such as `arm_center_*.pos`; legitimate non-arm zero base/lift keys are not classified as unexpected arm data. Packet 2N-R5 mode additionally revalidates the persisted calibration evidence, transcript, and current calibration hashes and requires every bound log-metadata line exactly once:
+The strict verifier below is retained only for the historical Packet 2N-R3 paired logs. It requires the marker, exactly 60 no-robot action records, the no-robot notice, absence of runtime `ZMQ` or calibration text, normal cleanup, exit `0`, the exact twelve arm keys, a moved gripper span of at least 20 normalized units, and less than `2.0` variation across the entire opposite logical family. The broad quoted-key scan deliberately rejects missing, duplicated, or unexpected `arm_*.pos` keys such as `arm_center_*.pos`; legitimate non-arm zero base/lift keys are not classified as unexpected arm data:
 
 ```powershell
 $ErrorActionPreference = 'Stop'
 function Get-Packet2nLeaderMapSummary {
     param(
         [Parameter(Mandatory)] [string] $Path,
-        [Parameter(Mandatory)] [ValidateSet('PHYSICAL_LEFT_ONLY', 'PHYSICAL_RIGHT_ONLY')] [string] $ExpectedMarker,
-        [switch] $RequirePacket2nR5Evidence,
-        [string] $Packet2nR5EvidencePath,
-        [string] $Packet2nR5EvidenceSha256
+        [Parameter(Mandatory)] [ValidateSet('PHYSICAL_LEFT_ONLY', 'PHYSICAL_RIGHT_ONLY')] [string] $ExpectedMarker
     )
 
     $lines = @(Get-Content -LiteralPath $Path)
@@ -388,17 +385,7 @@ function Get-Packet2nLeaderMapSummary {
     if (-not ($lines | Where-Object { $_ -like 'Shutdown complete:*' })) { throw "missing cleanup proof in $Path" }
     if ($lines -match 'ZMQ') { throw "unexpected ZMQ text in $Path" }
 
-    $approvedMetadataLines = @()
-    if ($RequirePacket2nR5Evidence) {
-        if (-not $Packet2nR5EvidencePath -or -not $Packet2nR5EvidenceSha256) { throw 'Packet 2N-R5 verification requires evidence path and SHA-256' }
-        $packet2nR5Context = Assert-Packet2nR5PersistedEvidence -EvidencePath $Packet2nR5EvidencePath -EvidenceSha256 $Packet2nR5EvidenceSha256
-        $approvedMetadataLines = Get-Packet2nR5MapMetadataLines -Context $packet2nR5Context
-        Assert-Packet2nR5MapMetadata -Lines $lines -ExpectedLines $approvedMetadataLines -Path $Path
-    } elseif ($Packet2nR5EvidencePath -or $Packet2nR5EvidenceSha256) {
-        throw 'Packet 2N-R5 evidence parameters require -RequirePacket2nR5Evidence'
-    }
-    $runtimeLines = @($lines | Where-Object { $_ -notin $approvedMetadataLines })
-    if ($runtimeLines -match '(?i)calibrat') { throw "runtime calibration text requires refusal and review: $Path" }
+    if ($lines -match '(?i)calibrat') { throw "runtime calibration text requires refusal and review: $Path" }
 
     $expectedKeys = @(
         'arm_left_shoulder_pan.pos',
@@ -473,7 +460,7 @@ function Get-Packet2nLeaderMapSummary {
 }
 ```
 
-For the historical Packet 2N-R3 logs only, define the function above and then run this prompt-based invocation. Do not use this historical invocation for Packet 2N-R5:
+For the historical Packet 2N-R3 logs only, define the function above and then run this prompt-based invocation. It is retained only to reproduce the already completed R3 classification; it is not a future operator path:
 
 ```powershell
 
@@ -576,7 +563,7 @@ pwsh -NoLogo -NoProfile -File .\tools\packet2n_r5_leader_mapping.ps1 -Stage Cali
 
 A pass requires process status zero followed by `Status` reporting `VALID_FRESH_CALIBRATION` and `next_stage` equal to `MapLeft`. The runner must have bound two distinct fresh calibration identities to a valid transcript and evidence JSON. After calibration, switch off both 7.4 V supplies and disconnect both USB controllers. Stop at this power-cycle and review boundary; restage both leaders only for a later authorized map run.
 
-**MapLeft.** With both corrected leaders connected and powered as above, wait for the client Enter prompt. Then slowly open and close only the physical left gripper through at least 20 normalized units. Hold its other five joints and the entire physical right leader still:
+**MapLeft.** With both corrected leaders connected and powered as above, wait for the client Enter prompt, press Enter, and then slowly open and close only the physical left gripper through at least 20 normalized units. Hold its other five joints and the entire physical right leader still:
 
 ```powershell
 pwsh -NoLogo -NoProfile -File .\tools\packet2n_r5_leader_mapping.ps1 -Stage MapLeft -Confirm MAPLEFT
@@ -584,7 +571,7 @@ pwsh -NoLogo -NoProfile -File .\tools\packet2n_r5_leader_mapping.ps1 -Stage MapL
 
 A pass requires process status zero and `Status` reporting `VALID_FRESH_CALIBRATION` with `next_stage` equal to `MapRight`. Power down and disconnect both leaders before review or restaging.
 
-**MapRight.** With both corrected leaders connected and powered as above, wait for the client Enter prompt. Then slowly open and close only the physical right gripper through at least 20 normalized units. Hold its other five joints and the entire physical left leader still:
+**MapRight.** With both corrected leaders connected and powered as above, wait for the client Enter prompt, press Enter, and then slowly open and close only the physical right gripper through at least 20 normalized units. Hold its other five joints and the entire physical left leader still:
 
 ```powershell
 pwsh -NoLogo -NoProfile -File .\tools\packet2n_r5_leader_mapping.ps1 -Stage MapRight -Confirm MAPRIGHT
@@ -600,7 +587,7 @@ pwsh -NoLogo -NoProfile -File .\tools\packet2n_r5_leader_mapping.ps1 -Stage Veri
 
 `Verify` is the only stage that prints `MAPPING_RESULT=CORRECT`. That exact line is the only mapping pass. Final `Status` must report `VALID_FRESH_CALIBRATION`, `final_result` equal to `MAPPING_RESULT=CORRECT`, and `next_stage` equal to `null`.
 
-Each accepted map contains exactly 60 complete samples. Every sample has exactly the twelve expected `arm_*.pos` keys plus `x.vel`, `y.vel`, `theta.vel`, and `lift_axis.vel`, with all four body values exactly zero. The selected physical gripper must span at least 20 normalized units while the entire opposite logical arm family varies by less than `2.0`. Missing, duplicate, unexpected, nonnumeric, nonfinite, or out-of-range arm data; nonzero body data; an invalid sample count; stale or mismatched metadata; runtime calibration or ZMQ text; or an incomplete exit/cleanup record is a refusal.
+Each accepted map contains exactly 60 complete samples. Every sample has exactly the twelve expected `arm_*.pos` keys plus `x.vel`, `y.vel`, `theta.vel`, and `lift_axis.vel`, with all four body values exactly zero. The selected physical gripper must span at least 20 normalized units while the entire opposite logical arm family varies by less than `2.0`. Missing, duplicate, unexpected, nonnumeric, or nonfinite arm data; nonzero body data; an invalid sample count; stale or mismatched metadata; runtime calibration or ZMQ text; or an incomplete exit/cleanup record is a refusal.
 
 Stop immediately and remove leader power for unexpected powered movement, resistance, sound, heat, cable strain, communication or calibration failure, a wrong port or physical identity, accidental movement of the nonselected leader, loss of the clear stop path, any follower power or movement, or any evidence that a robot/ZMQ connection was constructed. Also stop on any nonzero stage exit, unexpected classification, or recovery state. Preserve the state file and every reserved artifact. Do not delete, overwrite, edit, restore, or manually rerun a failed stage without review.
 
