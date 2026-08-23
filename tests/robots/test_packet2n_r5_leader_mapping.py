@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import subprocess
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -37,6 +38,12 @@ SAMPLE_KEYS = (
     "arm_right_wrist_roll.pos",
     "arm_right_gripper.pos",
 )
+BODY_KEYS = (
+    "x.vel",
+    "y.vel",
+    "theta.vel",
+    "lift_axis.vel",
+)
 JOINT_NAMES = (
     "shoulder_pan",
     "shoulder_lift",
@@ -54,6 +61,15 @@ def sha256_text(text: str) -> str:
 
 def sha256_path(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest().upper()
+
+
+def powershell_utc_timestamp(path: Path) -> str:
+    stamp_ns = path.stat().st_mtime_ns
+    seconds, remainder_ns = divmod(stamp_ns, 1_000_000_000)
+    ticks = remainder_ns // 100
+    base = datetime.fromtimestamp(seconds, tz=UTC)
+    fractional = f"{ticks:07d}"
+    return base.strftime("%Y-%m-%dT%H:%M:%S") + f".{fractional}Z"
 
 
 def calibration_record(*, homing_offset: int = 2048, range_min: int = 1000, range_max: int = 3000) -> dict[str, int]:
@@ -154,7 +170,9 @@ def format_python_dict(pairs: list[tuple[str, object]]) -> str:
 
 def actual_action_pairs(*, physical_side: str, sample_index: int) -> list[tuple[str, float]]:
     values = make_map_values(physical_side=physical_side, sample_index=sample_index)
-    return [(key, values[key]) for key in SAMPLE_KEYS]
+    pairs = [(key, values[key]) for key in SAMPLE_KEYS]
+    pairs.extend((key, 0.0) for key in BODY_KEYS)
+    return pairs
 
 
 def make_actual_map_log(
@@ -187,6 +205,7 @@ def make_actual_map_log(
 
 def base_plan(tmp_path: Path) -> dict[str, object]:
     logs_dir = tmp_path / "logs"
+    session_id = "test-session"
     calibration_dir = tmp_path / "calibration" / "teleoperators" / "so_leader"
     left_calibration_path = calibration_dir / f"{LEADER_ID}_left.json"
     right_calibration_path = calibration_dir / f"{LEADER_ID}_right.json"
@@ -214,10 +233,10 @@ def base_plan(tmp_path: Path) -> dict[str, object]:
     write_json(manifest_path, manifest)
     left_fresh = make_calibration(100)
     right_fresh = make_calibration(200)
-    transcript_path = logs_dir / "packet2n-r5-calibration.log"
-    evidence_path = logs_dir / "packet2n-r5-evidence.json"
-    left_map_path = logs_dir / "packet2n-r5-map-left.log"
-    right_map_path = logs_dir / "packet2n-r5-map-right.log"
+    transcript_path = logs_dir / f"packet2n-r5-calibration-{session_id}.log"
+    evidence_path = logs_dir / f"packet2n-r5-evidence-{session_id}.json"
+    left_map_path = logs_dir / f"packet2n-r5-physical-left-only-{session_id}.log"
+    right_map_path = logs_dir / f"packet2n-r5-physical-right-only-{session_id}.log"
     transcript_text = "CALIBRATION START\nCALIBRATION COMPLETE\nCALIBRATION_EXIT_CODE=0\n"
     evidence_payload = {
         "classification": "VALID_FRESH_CALIBRATION",
@@ -228,6 +247,8 @@ def base_plan(tmp_path: Path) -> dict[str, object]:
     return {
         "expected_branch": EXPECTED_BRANCH,
         "behavior_baseline": BEHAVIOR_BASELINE,
+        "session_id": session_id,
+        "utc_start": "2026-08-23T00:00:00.0000000Z",
         "head": "545cf933d794657cb3802e3c6a14ead551617a1d",
         "repo_root": str(REPO_ROOT),
         "worktree_clean": True,
@@ -950,3 +971,366 @@ def test_verify_rejects_reversed_or_ambiguous_actual_maps(tmp_path):
 
     assert verify.returncode != 0
     assert "logical-left classification failed" in verify.stderr
+
+
+def test_protected_runtime_guard_allows_reviewed_runner_test_doc_changes_only(tmp_path):
+    plan = base_plan(tmp_path)
+    plan["protected_runtime_paths_unchanged"] = False
+    plan["protected_runtime_review"] = {
+        "runtime_paths_unchanged": True,
+        "allowed_reviewed_paths": [
+            "tools/packet2n_r5_leader_mapping.ps1",
+            "tests/robots/test_packet2n_r5_leader_mapping.py",
+            "docs/alohamini/alohamini.md",
+        ],
+    }
+    state_path = tmp_path / "logs" / "packet2n-r5-state.json"
+
+    result = run_runner(
+        "-Stage",
+        "Calibrate",
+        "-StatePath",
+        str(state_path),
+        "-Confirm",
+        "CALIBRATE",
+        plan=plan,
+        tmp_path=tmp_path,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_calibrate_reserves_session_bound_artifact_paths_and_map_uses_state_bound_path(tmp_path):
+    plan = base_plan(tmp_path)
+    state_path = tmp_path / "logs" / "packet2n-r5-state.json"
+    calibrate = run_calibrate(plan, tmp_path, state_path)
+
+    assert calibrate.returncode == 0, calibrate.stderr
+    state = load_state(state_path)
+    session_id = state["session_id"]
+    assert state["artifacts"]["map_left"] is not None
+    assert state["artifacts"]["map_right"] is not None
+    assert session_id in state["artifacts"]["transcript"]["path"]
+    assert session_id in state["artifacts"]["evidence"]["path"]
+    assert session_id in state["artifacts"]["map_left"]["path"]
+    assert session_id in state["artifacts"]["map_right"]["path"]
+    reserved_map_path = Path(state["artifacts"]["map_left"]["path"])
+    diverted_map_path = tmp_path / "logs" / "diverted-map-left.log"
+    plan["stage_plan"][LEFT_MAP_STAGE]["map_path"] = str(diverted_map_path)
+
+    map_left = run_runner(
+        "-Stage",
+        LEFT_MAP_STAGE,
+        "-StatePath",
+        str(state_path),
+        "-Confirm",
+        "MAPLEFT",
+        plan=plan,
+        tmp_path=tmp_path,
+    )
+
+    assert map_left.returncode == 0, map_left.stderr
+    assert reserved_map_path.exists()
+    assert not diverted_map_path.exists()
+
+
+def test_map_guard_accepts_newer_post_calibration_mtime(tmp_path):
+    plan = base_plan(tmp_path)
+    left_path = Path(plan["calibration"]["left"]["path"])
+    right_path = Path(plan["calibration"]["right"]["path"])
+    plan["calibration"]["left"]["source_mtime_utc"] = powershell_utc_timestamp(left_path)
+    plan["calibration"]["right"]["source_mtime_utc"] = powershell_utc_timestamp(right_path)
+    state_path = tmp_path / "logs" / "packet2n-r5-state.json"
+    calibrate = run_calibrate(plan, tmp_path, state_path)
+    assert calibrate.returncode == 0, calibrate.stderr
+
+    newer_seconds = max(left_path.stat().st_mtime, right_path.stat().st_mtime) + 5.0
+    os.utime(left_path, (newer_seconds, newer_seconds))
+    os.utime(right_path, (newer_seconds, newer_seconds))
+
+    map_left = run_runner(
+        "-Stage",
+        LEFT_MAP_STAGE,
+        "-StatePath",
+        str(state_path),
+        "-Confirm",
+        "MAPLEFT",
+        plan=plan,
+        tmp_path=tmp_path,
+    )
+
+    assert map_left.returncode == 0, map_left.stderr
+
+
+def test_verify_rejects_actual_log_with_nonzero_body_key(tmp_path):
+    plan = base_plan(tmp_path)
+    state_path = tmp_path / "logs" / "packet2n-r5-state.json"
+    calibrate = run_calibrate(plan, tmp_path, state_path)
+    assert calibrate.returncode == 0, calibrate.stderr
+    state = load_state(state_path)
+    evidence_hash = state["artifacts"]["evidence"]["sha256"]
+    state_hash = sha256_path(state_path)
+    bad_pairs = actual_action_pairs(physical_side="left", sample_index=0)
+    bad_pairs[-1] = ("lift_axis.vel", 1.0)
+    left_actions = [bad_pairs] + [actual_action_pairs(physical_side="left", sample_index=index) for index in range(1, 60)]
+    right_actions = [actual_action_pairs(physical_side="right", sample_index=index) for index in range(60)]
+    left_map_path = Path(plan["stage_plan"][LEFT_MAP_STAGE]["map_path"])
+    right_map_path = Path(plan["stage_plan"][RIGHT_MAP_STAGE]["map_path"])
+    write_text(
+        left_map_path,
+        make_actual_map_log(
+            marker="PHYSICAL_LEFT_ONLY",
+            state_hash=state_hash,
+            evidence_hash=evidence_hash,
+            physical_side="left",
+            action_pairs=left_actions,
+        ),
+    )
+    write_text(
+        right_map_path,
+        make_actual_map_log(
+            marker="PHYSICAL_RIGHT_ONLY",
+            state_hash=state_hash,
+            evidence_hash=evidence_hash,
+            physical_side="right",
+            action_pairs=right_actions,
+        ),
+    )
+    state["completed_stages"] = ["Calibrate", LEFT_MAP_STAGE, RIGHT_MAP_STAGE]
+    state["artifacts"]["map_left"] = {"path": str(left_map_path), "sha256": sha256_path(left_map_path)}
+    state["artifacts"]["map_right"] = {"path": str(right_map_path), "sha256": sha256_path(right_map_path)}
+    write_json(state_path, state)
+
+    verify = run_runner(
+        "-Stage",
+        "Verify",
+        "-StatePath",
+        str(state_path),
+        plan=plan,
+        tmp_path=tmp_path,
+    )
+
+    assert verify.returncode != 0
+    assert "body key lift_axis.vel must be exactly 0" in verify.stderr
+
+
+def test_verify_rejects_actual_log_with_case_variant_body_key(tmp_path):
+    plan = base_plan(tmp_path)
+    state_path = tmp_path / "logs" / "packet2n-r5-state.json"
+    calibrate = run_calibrate(plan, tmp_path, state_path)
+    assert calibrate.returncode == 0, calibrate.stderr
+    state = load_state(state_path)
+    evidence_hash = state["artifacts"]["evidence"]["sha256"]
+    state_hash = sha256_path(state_path)
+    bad_pairs = actual_action_pairs(physical_side="left", sample_index=0)
+    bad_pairs[-1] = ("Lift_Axis.vel", 0.0)
+    left_actions = [bad_pairs] + [actual_action_pairs(physical_side="left", sample_index=index) for index in range(1, 60)]
+    right_actions = [actual_action_pairs(physical_side="right", sample_index=index) for index in range(60)]
+    left_map_path = Path(plan["stage_plan"][LEFT_MAP_STAGE]["map_path"])
+    right_map_path = Path(plan["stage_plan"][RIGHT_MAP_STAGE]["map_path"])
+    write_text(
+        left_map_path,
+        make_actual_map_log(
+            marker="PHYSICAL_LEFT_ONLY",
+            state_hash=state_hash,
+            evidence_hash=evidence_hash,
+            physical_side="left",
+            action_pairs=left_actions,
+        ),
+    )
+    write_text(
+        right_map_path,
+        make_actual_map_log(
+            marker="PHYSICAL_RIGHT_ONLY",
+            state_hash=state_hash,
+            evidence_hash=evidence_hash,
+            physical_side="right",
+            action_pairs=right_actions,
+        ),
+    )
+    state["completed_stages"] = ["Calibrate", LEFT_MAP_STAGE, RIGHT_MAP_STAGE]
+    state["artifacts"]["map_left"] = {"path": str(left_map_path), "sha256": sha256_path(left_map_path)}
+    state["artifacts"]["map_right"] = {"path": str(right_map_path), "sha256": sha256_path(right_map_path)}
+    write_json(state_path, state)
+
+    verify = run_runner(
+        "-Stage",
+        "Verify",
+        "-StatePath",
+        str(state_path),
+        plan=plan,
+        tmp_path=tmp_path,
+    )
+
+    assert verify.returncode != 0
+    assert "unexpected key Lift_Axis.vel" in verify.stderr
+
+
+@pytest.mark.parametrize(
+    ("left_payload", "right_payload"),
+    [
+        (make_calibration(0), make_calibration(10)),
+        (make_calibration(200), make_calibration(100)),
+    ],
+    ids=["originals", "swapped"],
+)
+def test_calibrate_rejects_stale_or_swapped_post_calibration_without_success_terminator(tmp_path, left_payload, right_payload):
+    plan = base_plan(tmp_path)
+    plan["stage_plan"]["Calibrate"]["post_calibration"] = {
+        "left": left_payload,
+        "right": right_payload,
+    }
+    plan["stage_plan"]["Calibrate"]["transcript_text"] = "CALIBRATION START\nCALIBRATION COMPLETE\n"
+    plan["stage_plan"]["Calibrate"]["evidence_text"] = json.dumps({"classification": "VALID_FRESH_CALIBRATION"}) + "\n"
+    state_path = tmp_path / "logs" / "packet2n-r5-state.json"
+
+    result = run_calibrate(plan, tmp_path, state_path)
+
+    assert result.returncode != 0
+    transcript_path = Path(plan["stage_plan"]["Calibrate"]["transcript_path"])
+    if transcript_path.exists():
+        assert "CALIBRATION_EXIT_CODE=0" not in transcript_path.read_text(encoding="utf-8")
+
+
+def test_invalid_raw_map_never_gets_success_terminator(tmp_path):
+    plan = base_plan(tmp_path)
+    plan["stage_plan"][LEFT_MAP_STAGE]["physical_side"] = "right"
+    state_path = tmp_path / "logs" / "packet2n-r5-state.json"
+    calibrate = run_calibrate(plan, tmp_path, state_path)
+    assert calibrate.returncode == 0, calibrate.stderr
+
+    result = run_runner(
+        "-Stage",
+        LEFT_MAP_STAGE,
+        "-StatePath",
+        str(state_path),
+        "-Confirm",
+        "MAPLEFT",
+        plan=plan,
+        tmp_path=tmp_path,
+    )
+
+    assert result.returncode != 0
+    map_path = Path(plan["stage_plan"][LEFT_MAP_STAGE]["map_path"])
+    assert map_path.exists()
+    assert "CLIENT_EXIT_CODE=0" not in map_path.read_text(encoding="utf-8")
+
+
+def test_evidence_semantic_tamper_refuses_even_with_rehashed_artifact(tmp_path):
+    plan = base_plan(tmp_path)
+    state_path = tmp_path / "logs" / "packet2n-r5-state.json"
+    calibrate = run_calibrate(plan, tmp_path, state_path)
+    assert calibrate.returncode == 0, calibrate.stderr
+    state = load_state(state_path)
+    evidence_path = Path(state["artifacts"]["evidence"]["path"])
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    evidence["session_id"] = "other-session"
+    write_json(evidence_path, evidence)
+    state["artifacts"]["evidence"]["sha256"] = sha256_path(evidence_path)
+    write_json(state_path, state)
+
+    result = run_runner(
+        "-Stage",
+        LEFT_MAP_STAGE,
+        "-StatePath",
+        str(state_path),
+        "-Confirm",
+        "MAPLEFT",
+        plan=plan,
+        tmp_path=tmp_path,
+    )
+
+    assert result.returncode != 0
+    assert "Evidence semantic validation failed" in result.stderr
+
+
+def test_status_derives_invalid_from_tampered_state_instead_of_echoing_state_classification(tmp_path):
+    plan = base_plan(tmp_path)
+    state_path = tmp_path / "logs" / "packet2n-r5-state.json"
+    calibrate = run_calibrate(plan, tmp_path, state_path)
+    assert calibrate.returncode == 0, calibrate.stderr
+    state = load_state(state_path)
+    state["classification"] = "VALID_FRESH_CALIBRATION"
+    transcript_path = Path(state["artifacts"]["transcript"]["path"])
+    write_text(transcript_path, transcript_path.read_text(encoding="utf-8") + "tampered\n")
+    write_json(state_path, state)
+
+    result = run_runner(
+        "-Stage",
+        "Status",
+        "-StatePath",
+        str(state_path),
+        plan=plan,
+        tmp_path=tmp_path,
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["classification"] == "INVALID_OR_UNCERTAIN_STATE"
+    assert payload["next_stage"] is None
+
+
+def test_calibration_schema_rejects_string_ids_and_duplicate_joint_ids(tmp_path):
+    plan = base_plan(tmp_path)
+    left_path = Path(plan["calibration"]["left"]["path"])
+    left_calibration = json.loads(left_path.read_text(encoding="utf-8"))
+    left_calibration["shoulder_pan"]["id"] = "1"
+    left_calibration["shoulder_lift"]["id"] = 1
+    write_json(left_path, left_calibration)
+    state_path = tmp_path / "logs" / "packet2n-r5-state.json"
+
+    result = run_runner(
+        "-Stage",
+        "Calibrate",
+        "-StatePath",
+        str(state_path),
+        "-Confirm",
+        "CALIBRATE",
+        plan=plan,
+        tmp_path=tmp_path,
+    )
+
+    assert result.returncode != 0
+    assert "calibration id" in result.stderr.lower()
+
+
+def test_verify_reruns_repo_and_manifest_guards(tmp_path):
+    plan = base_plan(tmp_path)
+    state_path = tmp_path / "logs" / "packet2n-r5-state.json"
+    calibrate = run_calibrate(plan, tmp_path, state_path)
+    assert calibrate.returncode == 0, calibrate.stderr
+    map_left = run_runner(
+        "-Stage",
+        LEFT_MAP_STAGE,
+        "-StatePath",
+        str(state_path),
+        "-Confirm",
+        "MAPLEFT",
+        plan=plan,
+        tmp_path=tmp_path,
+    )
+    assert map_left.returncode == 0, map_left.stderr
+    map_right = run_runner(
+        "-Stage",
+        RIGHT_MAP_STAGE,
+        "-StatePath",
+        str(state_path),
+        "-Confirm",
+        "MAPRIGHT",
+        plan=plan,
+        tmp_path=tmp_path,
+    )
+    assert map_right.returncode == 0, map_right.stderr
+    plan["worktree_clean"] = False
+
+    verify = run_runner(
+        "-Stage",
+        "Verify",
+        "-StatePath",
+        str(state_path),
+        plan=plan,
+        tmp_path=tmp_path,
+    )
+
+    assert verify.returncode != 0
+    assert "tracked/untracked worktree" in verify.stderr
