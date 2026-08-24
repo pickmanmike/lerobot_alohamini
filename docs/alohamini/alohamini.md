@@ -491,16 +491,18 @@ Classify the paired result only as follows:
 
 Stop either run immediately and remove leader power for unexpected powered leader motion, resistance, sound, heat, cable strain, communication failure, loss of the clear stop path, any follower power or movement, or any evidence that a robot/ZMQ connection was constructed. After the second run, disconnect both leader buses, switch off both 7.4 V supplies, and stop for review. Do not start Packet 2M S6.
 
-#### Packet 2N-R5R — authoritative staged corrected-port runner (physical stages not executed)
+#### Packet 2N-R5R — authoritative staged corrected-port runner and rejected-calibration restart
 
 Packet 2N-R5R replaced the fragile pasted PowerShell workflow with the versioned `tools\packet2n_r5_leader_mapping.ps1` runner. The runner is the only Packet 2N-R5R operator path. Do not load the historical Packet 2N-R3 verifier, paste internal functions, or manually construct R5 state, evidence, transcripts, or map logs.
 
-The completed offline audit classified the current state as `ORIGINAL_CALIBRATION_INTACT` with `next_stage` equal to `Calibrate`. No fresh calibration occurred, and there is no valid R5R state file, calibration transcript, evidence JSON, or map run. Under `C:\Users\pickm\.cache\huggingface\lerobot\calibration\teleoperators\so_leader`, the current files still match the old cross-mapped calibration identities exactly:
+Corrected-port calibration session `a9128060-c60c-4582-8cb8-cf45fc1750e6` completed, but the operator rejected its physical range because one non-wrist-roll joint on the left leader was not moved through its complete safe useful range. The current state is `VALID_FRESH_CALIBRATION` with `next_stage` equal to `MapLeft` and completed stages exactly `[Calibrate]`; neither map nor `Verify` ran. The rejected current files are:
 
 | Current calibration file | Bytes | SHA-256 | UTC modification time |
 | --- | ---: | --- | --- |
-| `so101_leader_bi_left.json` | 960 | `6F5D6126E84398D0621A26E74E4DF6678EBA7C14C62D343020610B4D5D8B3D8C` | `2026-08-15T05:18:25.9699568Z` |
-| `so101_leader_bi_right.json` | 961 | `65A301F20FC7DC96BD7FB5982E3670BF1A01F535953D7A253AB8D33A03646F11` | `2026-08-15T05:19:53.2654429Z` |
+| `so101_leader_bi_left.json` | 963 | `3E3896F0C4B49344FA896DFCD430C7EAB8B04B7ED457E8046689C821EA7BFA88` | `2026-08-24T03:52:27.1823938Z` |
+| `so101_leader_bi_right.json` | 962 | `D7D948AD2FFCAA60C6490EAC8631E7ABC6410C7584BCD00EFBDC64839F710119` | `2026-08-24T03:53:39.0485589Z` |
+
+The bound state and evidence validate these identities, session start `2026-08-24T03:51:18.7177104Z`, corrected ports left `COM8` and right `COM7`, source commit `edc14bbbebb173061cf3b04ead08ffa9fcb81051`, runner SHA-256 `0BDBDB2F20AD9D47A2B3DBF84924B833E822FE733EA33FAD505753BAD0BE336E`, and behavior SHA `cae57b59db1d9156be568aa4b216fc90701aa741`. The transcript's bound header, hash, byte count, and final `CALIBRATION_EXIT_CODE=0` terminator validate, but its PowerShell transcript body contains no native calibration output. Do not invent or infer missing native-output evidence.
 
 The immutable copy-only backup remains:
 
@@ -510,7 +512,12 @@ Manifest: C:\Users\pickm\AlohaMini1Backups\packet2n-r5-20260822-121722-7941f445-
 Manifest SHA-256: B90DF72155C60996B4E2704E4A44ED1895BBAEA0C0A332DC24674EC3FA399B8A
 ```
 
-The manifest and both backup files match the paths, hashes, byte counts, and source timestamps above. They are evidence, not authorization to restore, move, rename, edit, delete, or swap a calibration file.
+| Immutable original file | Bytes | SHA-256 | Source UTC modification time |
+| --- | ---: | --- | --- |
+| `so101_leader_bi_left.json` | 960 | `6F5D6126E84398D0621A26E74E4DF6678EBA7C14C62D343020610B4D5D8B3D8C` | `2026-08-15T05:18:25.9699568Z` |
+| `so101_leader_bi_right.json` | 961 | `65A301F20FC7DC96BD7FB5982E3670BF1A01F535953D7A253AB8D33A03646F11` | `2026-08-15T05:19:53.2654429Z` |
+
+The manifest and both backup files match their pinned hashes, byte counts, and source timestamps. They are evidence and are used only by the runner's exact confirmed offline restart; they are not authorization for a manual restore, move, rename, edit, delete, or file-by-file swap.
 
 The following 48-byte log was found and is permanently unusable:
 
@@ -532,7 +539,7 @@ The runner persists its session to:
 C:\Users\pickm\AlohaMini1Logs\packet2n-r5-state.json
 ```
 
-`Status` classifies the current files and any persisted session, while `Calibrate` creates a new bound state only after its offline guards pass. Every continuation stage reloads and revalidates that state, the corrected port ownership, current calibration identities, immutable backup and manifest, evidence, transcript, completed map artifacts, Git provenance, import sources, and confined artifact paths before any later COM construction. Hardware confirmations are exact and case-sensitive. Native execution records whether launch was attempted and completed, captures the actual exit code immediately, and writes a success terminator only after a launched process returns zero. Later stages reparse and rehash prior artifacts instead of trusting state summaries. A failure preserves the primary error and prints the recovery classification and next stage.
+`Status` classifies the current files and any persisted session, while `Calibrate` creates a new bound state only after its offline guards pass. `RestartCalibration` is the offline, exact-confirmation recovery for only a valid fresh pre-map candidate. Every continuation stage reloads and revalidates the state, corrected port ownership, current calibration identities, immutable backup and manifest, evidence, transcript, completed map artifacts, Git provenance, import sources, and confined artifact paths before any later COM construction. Hardware confirmations are exact and case-sensitive. Native execution records whether launch was attempted and completed, captures the actual exit code immediately, and writes a success terminator only after a launched process returns zero. Later stages reparse and rehash prior artifacts instead of trusting state summaries. A failure preserves the primary error and prints the recovery classification and next stage.
 
 `DiagnoseImports` is the entirely offline repository-source preflight used by `Calibrate`. It uses the exact repository virtual environment, prints the interpreter, environment, editable-install metadata, `.pth` source, and expected/actual path for every guarded module, and changes neither calibration files nor runner state:
 
@@ -548,11 +555,33 @@ It must exit zero with `"matches":true` before a later authorized calibration. A
 pwsh -NoLogo -NoProfile -File .\tools\packet2n_r5_leader_mapping.ps1 -Stage Status
 ```
 
-The current required result is `ORIGINAL_CALIBRATION_INTACT` with `next_stage` equal to `Calibrate`. `Status` returning process status zero is not by itself a pass; inspect its JSON classification. `VALID_FRESH_CALIBRATION` resumes from the reported first incomplete stage. `ORPHANED_FRESH_CALIBRATION` or `INVALID_OR_UNCERTAIN_STATE` is a refusal: preserve every file and stop for review. Do not manually restore or repair anything.
+Before the approved restart, the required result is `VALID_FRESH_CALIBRATION` with `next_stage` equal to `MapLeft`. `Status` returning process status zero is not by itself a pass; inspect its JSON classification. The legacy exception is pinned only to session `a9128060-c60c-4582-8cb8-cf45fc1750e6` and its exact state, fresh-pair, evidence, transcript, repository, runner, and behavior identities; a merely self-consistent legacy session is not eligible. Current-runner/current-HEAD sessions remain eligible under the ordinary provenance rule. `RESTART_CALIBRATION_RECOVERABLE` with `next_stage` equal to `RestartCalibration` means the journal authority and the actual archive, active-pair, staged-pair, rollback, retired-pair, and retired-state layout all match a recognized interruption point: rerun only the same exact confirmed restart command. Merely finding a journal is insufficient. A malformed or tampered journal, an unrecognized layout, or a reparse point is `INVALID_OR_UNCERTAIN_STATE`. All ordinary stages remain blocked until the transaction completes. `ORPHANED_FRESH_CALIBRATION` is also a refusal: preserve every file and stop for review. Do not manually restore or repair anything.
+
+##### Offline rejected-calibration restart
+
+Run this only with both leader 7.4 V supplies off, both leader USB controllers disconnected, follower/body 12 V power off, and the Pi motor host stopped. It constructs no COM object, runs no calibration process, contacts no Pi or network service, and constructs no robot, camera, teleoperation, or ZMQ client:
+
+```powershell
+pwsh -NoLogo -NoProfile -File .\tools\packet2n_r5_leader_mapping.ps1 -Stage RestartCalibration -Confirm RECALIBRATE
+```
+
+The runner first revalidates the exact pre-map state, current fresh pair, transcript/evidence, repository provenance, immutable manifest, and both backups. It publishes a non-overwriting archive at:
+
+```text
+C:\Users\pickm\AlohaMini1Backups\packet2n-r5-rejected-a9128060-c60c-4582-8cb8-cf45fc1750e6
+```
+
+The archive records reason `OPERATOR_REJECTED_INCOMPLETE_RANGE` and preserves byte-identical current calibration files, transcript, evidence, state snapshot, immutable manifest identity, hashes, sizes, source/archive timestamps, session/start time, state binding, source/recovery provenance, the withdrawn active directory, the retired state, and a completion receipt. For the one exact approved legacy transcript, the record preserves a specifically validated known limitation that its body contains no native calibration output. A future current-runner transcript is recorded as `NOT_EVALUATED` with `body_contains_native_calibration_output` equal to JSON `null`; absence is never fabricated. Journal, archive-record, and receipt publication use create-new temporary files with write-through and `Flush(true)` before namespace publication through Windows `MoveFileExW` with `MOVEFILE_WRITE_THROUGH`; only regular-file journal replacement also uses `MOVEFILE_REPLACE_EXISTING`. Directory swaps and state retirement use the same write-through namespace API without replacement or cross-volume copy. Windows error codes are preserved in any refusal. The verified receipt publication is durably complete before the journal is retired; an interruption at that seam remains safely resumable.
+
+The runner reconstructs only missing or corrupt expected files in recognized partial archive and original-pair staging directories, then re-verifies every identity before continuing. On retry it first derives the highest completed phase from the validated filesystem layout, durably reconciles a one-transition-lagging journal to that phase, and revalidates the journal and layout before performing the next mutation. This makes consecutive interruptions after different namespace transitions resumable without ever exposing a mixed left/right pair. It stages the complete pinned original pair in a sibling directory, atomically renames the entire active `so_leader` directory aside, and atomically renames the staged original directory active. It never performs sequential in-place left/right replacements. Because AM1, AM2, and AM2 Pro leaders share the `teleoperators\so_leader` directory, that active directory must contain exactly the reviewed AM1 left/right pair; any additional model calibration file causes a pre-mutation refusal with every byte unchanged. Before mutation and again before each move, all path components must remain confined and free of reparse points, and Windows volume identities—not drive-letter strings—must prove the move stays on one actual volume.
+
+The published archive is recursively enumerated against an exact finite layout derived independently from the caller-supplied state path, archived session/state, and pinned plan before `Status` calls it recoverable or restart mutates anything. Every relative filename and source path must be exact; relabeling the archived state source or either preserved state leaf cannot redefine that authority. Archived rejected calibration identities and JSON values must equal `state.post_calibration`; transcript and evidence source-time claims must equal their byte-preserving archived copies; the manifest bytes, hash, parsed content, and backup metadata must equal the pinned manifest/backups; the complete archived state schema, session binding, provenance, and native-stage truth must validate; and archived evidence/transcript headers, semantics, identity bindings, and terminator must agree without reading the retired active calibration paths. Archive record and receipt claims are then derived from those facts rather than accepted because they are internally self-consistent. Unexpected entries, renamed or relabeled artifacts, premature receipt files, wrong path types, or a reparse point at any archive component refuse without mutation. The completed receipt is trusted only when its exact schema, completion time, native-stage truth, source provenance, recovery provenance, archive record, and archived state bindings all verify.
+
+A successful command prints exactly `RESTART_CALIBRATION_COMPLETE`. The following offline `Status` must then report `ORIGINAL_CALIBRATION_INTACT` with `next_stage` equal to `Calibrate` and a verified supplemental rejected-archive record. A later valid fresh session retains that supplemental record without changing its active classification. Do not treat any rejected archive as MapLeft evidence.
 
 ##### Physical-stage prerequisites and commands
 
-The current safe state is both leader 7.4 V supplies off, both leader USB controllers disconnected, follower/body 12 V power off, and the Pi motor host stopped. In that state only `DiagnoseImports` and `Status` are justified. The exact next Pi command is none.
+The current safe state is both leader 7.4 V supplies off, both leader USB controllers disconnected, follower/body 12 V power off, and the Pi motor host stopped. In that state only `DiagnoseImports`, `Status`, and the separately reviewed offline `RestartCalibration` command above are justified. The exact next Pi command is none.
 
 Do not run a hardware stage without separate physical authorization. Immediately before an authorized `Calibrate`, `MapLeft`, or `MapRight` stage:
 
@@ -603,7 +632,7 @@ Passing Packet 2N-R5R authorizes only later review of its evidence. It does not 
 
 #### Packet 2M S6 — hard-blocked future both-side synchronization and paused teleoperation
 
-S6 is not runnable today. Packet 2N-R5R physical calibration and mapping have not occurred, so no reviewed completed state, fresh calibration identities, transcript/evidence hashes, or valid map hashes exist. The exact next Pi command is none. No Windows S6 command is authorized.
+S6 is not runnable today. The first Packet 2N-R5R corrected-port calibration was operator-rejected and neither mapping stage occurred, so there is no reviewed completed mapping state or valid map pair. An offline restart and a later separately authorized corrected-port calibration do not authorize S6; both maps, `Verify`, and evidence review must still complete. The exact next Pi command is none. No Windows S6 command is authorized.
 
 The only executable placeholder in this section refuses unconditionally before any Git, file, serial, network, or power action:
 

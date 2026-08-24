@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet("Status", "DiagnoseImports", "Calibrate", "MapLeft", "MapRight", "Verify")]
+    [ValidateSet("Status", "DiagnoseImports", "RestartCalibration", "Calibrate", "MapLeft", "MapRight", "Verify")]
     [string]$Stage,
 
     [Parameter()]
@@ -21,6 +21,22 @@ $RunnerVersion = "packet2n-r5-runner-v1"
 $SchemaVersion = "1"
 $PacketIdentity = "packet2n-r5r"
 $BehaviorBaseline = "cae57b59db1d9156be568aa4b216fc90701aa741"
+$LegacyRestartRepoHead = "edc14bbbebb173061cf3b04ead08ffa9fcb81051"
+$LegacyRestartRunnerSha256 = "0BDBDB2F20AD9D47A2B3DBF84924B833E822FE733EA33FAD505753BAD0BE336E"
+$LegacyRestartSessionId = "a9128060-c60c-4582-8cb8-cf45fc1750e6"
+$LegacyRestartStateSha256 = "0DB0BE72CF57C570D7064D272779374040075507A560B86AE5B31B61186935BD"
+$LegacyRestartStateSize = [int64]9028
+$LegacyRestartFreshLeftSha256 = "3E3896F0C4B49344FA896DFCD430C7EAB8B04B7ED457E8046689C821EA7BFA88"
+$LegacyRestartFreshLeftSize = [int64]963
+$LegacyRestartFreshLeftMtimeUtc = "2026-08-24T03:52:27.1823938Z"
+$LegacyRestartFreshRightSha256 = "D7D948AD2FFCAA60C6490EAC8631E7ABC6410C7584BCD00EFBDC64839F710119"
+$LegacyRestartFreshRightSize = [int64]962
+$LegacyRestartFreshRightMtimeUtc = "2026-08-24T03:53:39.0485589Z"
+$LegacyRestartEvidenceSha256 = "01484B85820A0674988A88788DD2C8A941092B6BEE8B1BD2A61C0038E071567C"
+$LegacyRestartEvidenceSize = [int64]9749
+$LegacyRestartTranscriptSha256 = "CB4FF5FD33756D47A6864F2B4DD55D5129D9E22D7DAF86E1C31D2FBA93E2ED05"
+$LegacyRestartTranscriptSize = [int64]1422
+$RestartRejectionReason = "OPERATOR_REJECTED_INCOMPLETE_RANGE"
 $ExpectedBranch = "fix/am1-elbow-commissioning"
 $ExpectedPorts = [ordered]@{
     physical_left  = "COM8"
@@ -65,6 +81,7 @@ $RealCalibrationRoot = "C:\Users\pickm\.cache\huggingface\lerobot\calibration"
 $RealBackupDirectory = "C:\Users\pickm\AlohaMini1Backups\packet2n-r5-20260822-121722-7941f445-9587-4345-8e2f-edd54ca750f6"
 $RealManifestSha256 = "B90DF72155C60996B4E2704E4A44ED1895BBAEA0C0A332DC24674EC3FA399B8A"
 $RealLogsDirectory = "C:\Users\pickm\AlohaMini1Logs"
+$RealRejectedArchiveRoot = "C:\Users\pickm\AlohaMini1Backups"
 $RealBackupMetadata = [ordered]@{
     left = [ordered]@{
         path        = (Join-Path $RealBackupDirectory "so101_leader_bi_left.json")
@@ -292,6 +309,7 @@ function Require-Confirmation {
         "Calibrate" { "CALIBRATE" }
         "MapLeft" { "MAPLEFT" }
         "MapRight" { "MAPRIGHT" }
+        "RestartCalibration" { "RECALIBRATE" }
         default { $null }
     }
     if ($null -ne $expected -and $ConfirmValue -cne $expected) {
@@ -893,6 +911,7 @@ function Get-RealPlan {
         calibration_root_matches_expected = $rootMatches
         calibration_root                 = $RealCalibrationRoot
         state_root                       = $RealLogsDirectory
+        rejected_archive_root            = $RealRejectedArchiveRoot
         manifest                         = [ordered]@{
             path   = (Join-Path $RealBackupDirectory "manifest.json")
             sha256 = $RealManifestSha256
@@ -993,9 +1012,15 @@ function Test-PathIsSameOrDescendant {
         [string]$Root
     )
 
-    $resolvedPath = [System.IO.Path]::GetFullPath($Path).TrimEnd('\', '/')
-    $resolvedRoot = [System.IO.Path]::GetFullPath($Root).TrimEnd('\', '/')
-    $rootWithSeparator = $resolvedRoot + [System.IO.Path]::DirectorySeparatorChar
+    $resolvedPath = [System.IO.Path]::GetFullPath($Path)
+    if (-not $resolvedPath.Equals([System.IO.Path]::GetPathRoot($resolvedPath), [System.StringComparison]::OrdinalIgnoreCase)) {
+        $resolvedPath = $resolvedPath.TrimEnd('\', '/')
+    }
+    $resolvedRoot = [System.IO.Path]::GetFullPath($Root)
+    if (-not $resolvedRoot.Equals([System.IO.Path]::GetPathRoot($resolvedRoot), [System.StringComparison]::OrdinalIgnoreCase)) {
+        $resolvedRoot = $resolvedRoot.TrimEnd('\', '/')
+    }
+    $rootWithSeparator = $resolvedRoot.TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
     return ($resolvedPath.Equals($resolvedRoot, [System.StringComparison]::OrdinalIgnoreCase) -or $resolvedPath.StartsWith($rootWithSeparator, [System.StringComparison]::OrdinalIgnoreCase))
 }
 
@@ -1008,8 +1033,14 @@ function Assert-TestModePathHasNoReparsePoint {
         [string]$Boundary
     )
 
-    $currentPath = [System.IO.Path]::GetFullPath($Path).TrimEnd('\', '/')
-    $boundaryPath = [System.IO.Path]::GetFullPath($Boundary).TrimEnd('\', '/')
+    $currentPath = [System.IO.Path]::GetFullPath($Path)
+    if (-not $currentPath.Equals([System.IO.Path]::GetPathRoot($currentPath), [System.StringComparison]::OrdinalIgnoreCase)) {
+        $currentPath = $currentPath.TrimEnd('\', '/')
+    }
+    $boundaryPath = [System.IO.Path]::GetFullPath($Boundary)
+    if (-not $boundaryPath.Equals([System.IO.Path]::GetPathRoot($boundaryPath), [System.StringComparison]::OrdinalIgnoreCase)) {
+        $boundaryPath = $boundaryPath.TrimEnd('\', '/')
+    }
     if (-not (Test-PathIsSameOrDescendant -Path $currentPath -Root $boundaryPath)) {
         New-Failure "Test-mode reparse validation path escaped its boundary: $Path"
     }
@@ -1027,7 +1058,10 @@ function Assert-TestModePathHasNoReparsePoint {
         if ($null -eq $parent) {
             New-Failure "Test-mode reparse validation could not reach its boundary: $Path"
         }
-        $currentPath = $parent.FullName.TrimEnd('\', '/')
+        $currentPath = $parent.FullName
+        if (-not $currentPath.Equals([System.IO.Path]::GetPathRoot($currentPath), [System.StringComparison]::OrdinalIgnoreCase)) {
+            $currentPath = $currentPath.TrimEnd('\', '/')
+        }
     }
 }
 
@@ -1053,29 +1087,43 @@ function Assert-TestModePlanRoots {
 
     $calibrationRoot = [System.IO.Path]::GetFullPath([string]$Plan.calibration_root).TrimEnd('\', '/')
     $stateRoot = [System.IO.Path]::GetFullPath([string]$Plan.state_root).TrimEnd('\', '/')
+    if (-not $Plan.ContainsKey("rejected_archive_root")) {
+        New-Failure "Test-mode rejected archive root is required"
+    }
+    $rejectedArchiveRoot = [System.IO.Path]::GetFullPath([string]$Plan.rejected_archive_root).TrimEnd('\', '/')
     if ($calibrationRoot.Equals([System.IO.Path]::GetFullPath($RealCalibrationRoot).TrimEnd('\', '/'), [System.StringComparison]::OrdinalIgnoreCase)) {
         New-Failure "Test-mode sandbox refuses the production calibration root"
     }
     if ($stateRoot.Equals([System.IO.Path]::GetFullPath($RealLogsDirectory).TrimEnd('\', '/'), [System.StringComparison]::OrdinalIgnoreCase)) {
         New-Failure "Test-mode sandbox refuses the production logs root"
     }
+    if ($rejectedArchiveRoot.Equals([System.IO.Path]::GetFullPath($RealRejectedArchiveRoot).TrimEnd('\', '/'), [System.StringComparison]::OrdinalIgnoreCase)) {
+        New-Failure "Test-mode sandbox refuses the production rejected archive root"
+    }
 
-    foreach ($protectedPath in @($RepositoryRoot, $RealCalibrationRoot, $RealLogsDirectory)) {
+    foreach ($protectedPath in @($RepositoryRoot, $RealCalibrationRoot, $RealLogsDirectory, $RealRejectedArchiveRoot)) {
         if ((Test-PathIsSameOrDescendant -Path $testRoot -Root $protectedPath) -or (Test-PathIsSameOrDescendant -Path $protectedPath -Root $testRoot)) {
             New-Failure "Test-mode sandbox overlaps a protected production or repository path"
         }
     }
     foreach ($entry in @(
         [ordered]@{ name = "calibration root"; path = $calibrationRoot },
-        [ordered]@{ name = "state root"; path = $stateRoot }
+        [ordered]@{ name = "state root"; path = $stateRoot },
+        [ordered]@{ name = "rejected archive root"; path = $rejectedArchiveRoot }
     )) {
         if ($entry.path.Equals($testRoot, [System.StringComparison]::OrdinalIgnoreCase) -or -not (Test-PathIsSameOrDescendant -Path $entry.path -Root $testRoot)) {
             New-Failure "Test-mode $($entry.name) escaped the test-mode sandbox"
         }
         Assert-TestModePathHasNoReparsePoint -Path $entry.path -Boundary $testRoot
     }
-    if ((Test-PathIsSameOrDescendant -Path $calibrationRoot -Root $stateRoot) -or (Test-PathIsSameOrDescendant -Path $stateRoot -Root $calibrationRoot)) {
-        New-Failure "Test-mode calibration and state roots must be separate subtrees"
+    foreach ($pair in @(
+        [ordered]@{ first = $calibrationRoot; second = $stateRoot },
+        [ordered]@{ first = $calibrationRoot; second = $rejectedArchiveRoot },
+        [ordered]@{ first = $stateRoot; second = $rejectedArchiveRoot }
+    )) {
+        if ((Test-PathIsSameOrDescendant -Path $pair.first -Root $pair.second) -or (Test-PathIsSameOrDescendant -Path $pair.second -Root $pair.first)) {
+            New-Failure "Test-mode calibration, state, and rejected archive roots must be separate subtrees"
+        }
     }
 }
 
@@ -1162,6 +1210,53 @@ function Test-ExactValue {
     )
 
     return (ConvertTo-CompactJson -Value (ConvertTo-SortedCanonicalObject -Value $Actual)) -ceq (ConvertTo-CompactJson -Value (ConvertTo-SortedCanonicalObject -Value $Expected))
+}
+
+function Assert-ExactKeySet {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Value,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$ExpectedKeys,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Message
+    )
+
+    if ($Value -isnot [System.Collections.IDictionary]) {
+        New-Failure $Message
+    }
+    $actualKeys = @($Value.Keys)
+    if ($actualKeys.Count -ne $ExpectedKeys.Count) {
+        New-Failure $Message
+    }
+    foreach ($key in $ExpectedKeys) {
+        if ($actualKeys -cnotcontains $key) {
+            New-Failure $Message
+        }
+    }
+}
+
+function Test-IsSha256Hex {
+    param($Value)
+
+    return $Value -is [string] -and [string]$Value -cmatch '^[0-9A-F]{64}$'
+}
+
+function Test-IsUtcTimestamp {
+    param($Value)
+
+    if ($Value -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$Value)) {
+        return $false
+    }
+    try {
+        $parsed = [DateTimeOffset]::Parse([string]$Value, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind)
+        return $parsed.Offset -eq [TimeSpan]::Zero
+    }
+    catch {
+        return $false
+    }
 }
 
 function ConvertTo-SortedCanonicalObject {
@@ -1941,6 +2036,149 @@ function Get-StateValidationIssues {
     return @($issues.ToArray())
 }
 
+function Test-ApprovedLegacyRestartAuthority {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$State,
+
+        [Parameter(Mandatory = $true)]
+        [string]$StatePathValue,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Plan,
+
+        [string]$StateIdentityPath
+    )
+
+    $identityPath = if ([string]::IsNullOrEmpty($StateIdentityPath)) { $StatePathValue } else { $StateIdentityPath }
+
+    if ([bool]$Plan.is_test_mode) {
+        if (-not $Plan.ContainsKey("restart_legacy_fixture")) {
+            return $false
+        }
+        $fixture = $Plan.restart_legacy_fixture
+        Assert-ExactKeySet `
+            -Value $fixture `
+            -ExpectedKeys @(
+                "schema_version", "repo_head", "runner_sha256", "behavior_sha", "session_id",
+                "state", "fresh", "evidence", "transcript", "transcript_body_evaluation"
+            ) `
+            -Message "Test-mode legacy RestartCalibration fixture schema is invalid"
+        Assert-ExactKeySet -Value $fixture.state -ExpectedKeys @("path", "sha256", "size") -Message "Test-mode legacy RestartCalibration state fixture is invalid"
+        Assert-ExactKeySet -Value $fixture.fresh -ExpectedKeys @("left", "right") -Message "Test-mode legacy RestartCalibration fresh fixture is invalid"
+        foreach ($side in @("left", "right")) {
+            Assert-ExactKeySet -Value $fixture.fresh[$side] -ExpectedKeys @("path", "sha256", "size", "mtime_utc", "calibration") -Message "Test-mode legacy RestartCalibration fresh fixture is invalid"
+            Assert-CalibrationSchema -Calibration $fixture.fresh[$side].calibration -Label "test-mode legacy RestartCalibration $side fixture"
+        }
+        foreach ($artifactName in @("evidence", "transcript")) {
+            Assert-ExactKeySet -Value $fixture[$artifactName] -ExpectedKeys @("path", "sha256", "size") -Message "Test-mode legacy RestartCalibration $artifactName fixture is invalid"
+        }
+        if ($fixture.schema_version -cne "1" -or
+            $fixture.repo_head -cne $LegacyRestartRepoHead -or
+            $fixture.runner_sha256 -cne $LegacyRestartRunnerSha256 -or
+            $fixture.behavior_sha -cne $BehaviorBaseline -or
+            $fixture.transcript_body_evaluation -cne "KNOWN_LIMITATION" -or
+            $fixture.session_id -cne $State.session_id -or
+            $fixture.state.path -cne $StatePathValue -or
+            -not (Test-IsSha256Hex -Value $fixture.state.sha256) -or
+            -not (Test-IsJsonInteger -Value $fixture.state.size) -or
+            $fixture.evidence.path -cne $State.artifacts.evidence.path -or
+            $fixture.evidence.sha256 -cne $State.artifacts.evidence.sha256 -or
+            [int64]$fixture.evidence.size -ne [int64]$State.artifacts.evidence.size -or
+            $fixture.transcript.path -cne $State.artifacts.transcript.path -or
+            $fixture.transcript.sha256 -cne $State.artifacts.transcript.sha256 -or
+            [int64]$fixture.transcript.size -ne [int64]$State.artifacts.transcript.size -or
+            -not (Test-ExactValue -Actual $fixture.fresh -Expected $State.post_calibration)) {
+            return $false
+        }
+        $stateItem = Get-Item -LiteralPath $identityPath -Force
+        return (
+            $stateItem -is [System.IO.FileInfo] -and
+            ($stateItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq 0 -and
+            (Get-Sha256Hex -Path $identityPath) -ceq $fixture.state.sha256 -and
+            [int64]$stateItem.Length -eq [int64]$fixture.state.size -and
+            (Get-Sha256Hex -Path $fixture.evidence.path) -ceq $fixture.evidence.sha256 -and
+            [int64](Get-Item -LiteralPath $fixture.evidence.path).Length -eq [int64]$fixture.evidence.size -and
+            (Get-Sha256Hex -Path $fixture.transcript.path) -ceq $fixture.transcript.sha256 -and
+            [int64](Get-Item -LiteralPath $fixture.transcript.path).Length -eq [int64]$fixture.transcript.size
+        )
+    }
+
+    $expectedStatePath = Join-Path $RealLogsDirectory "packet2n-r5-state.json"
+    $expectedEvidencePath = Join-Path $RealLogsDirectory "packet2n-r5-evidence-$LegacyRestartSessionId.json"
+    $expectedTranscriptPath = Join-Path $RealLogsDirectory "packet2n-r5-calibration-$LegacyRestartSessionId.log"
+    $expectedLeftPath = Join-Path $RealCalibrationRoot "teleoperators\so_leader\so101_leader_bi_left.json"
+    $expectedRightPath = Join-Path $RealCalibrationRoot "teleoperators\so_leader\so101_leader_bi_right.json"
+    if ($State.session_id -cne $LegacyRestartSessionId -or
+        $StatePathValue -cne $expectedStatePath -or
+        $State.artifacts.evidence.path -cne $expectedEvidencePath -or
+        $State.artifacts.evidence.sha256 -cne $LegacyRestartEvidenceSha256 -or
+        [int64]$State.artifacts.evidence.size -ne $LegacyRestartEvidenceSize -or
+        $State.artifacts.transcript.path -cne $expectedTranscriptPath -or
+        $State.artifacts.transcript.sha256 -cne $LegacyRestartTranscriptSha256 -or
+        [int64]$State.artifacts.transcript.size -ne $LegacyRestartTranscriptSize -or
+        $State.post_calibration.left.path -cne $expectedLeftPath -or
+        $State.post_calibration.left.sha256 -cne $LegacyRestartFreshLeftSha256 -or
+        [int64]$State.post_calibration.left.size -ne $LegacyRestartFreshLeftSize -or
+        $State.post_calibration.left.mtime_utc -cne $LegacyRestartFreshLeftMtimeUtc -or
+        $State.post_calibration.right.path -cne $expectedRightPath -or
+        $State.post_calibration.right.sha256 -cne $LegacyRestartFreshRightSha256 -or
+        [int64]$State.post_calibration.right.size -ne $LegacyRestartFreshRightSize -or
+        $State.post_calibration.right.mtime_utc -cne $LegacyRestartFreshRightMtimeUtc) {
+        return $false
+    }
+    $stateItem = Get-Item -LiteralPath $identityPath -Force
+    return (
+        $stateItem -is [System.IO.FileInfo] -and
+        ($stateItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq 0 -and
+        (Get-Sha256Hex -Path $identityPath) -ceq $LegacyRestartStateSha256 -and
+        [int64]$stateItem.Length -eq $LegacyRestartStateSize
+    )
+}
+
+function Get-RestartTranscriptValidationPayload {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$State,
+
+        [Parameter(Mandatory = $true)]
+        [string]$StatePathValue,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Plan,
+
+        [Parameter(Mandatory = $true)]
+        [string]$TranscriptSha256,
+
+        [string]$StateIdentityPath
+    )
+
+    $knownLegacyLimitation = (
+        $State.repo_head -ceq $LegacyRestartRepoHead -and
+        $State.runner_sha -ceq $LegacyRestartRunnerSha256 -and
+        $TranscriptSha256 -ceq $State.artifacts.transcript.sha256 -and
+        (Test-ApprovedLegacyRestartAuthority -State $State -StatePathValue $StatePathValue -Plan $Plan -StateIdentityPath $StateIdentityPath)
+    )
+    if ($knownLegacyLimitation) {
+        return [ordered]@{
+            header_valid                            = $true
+            hash_and_size_valid                     = $true
+            final_terminator_valid                  = $true
+            native_calibration_output_evaluation    = "KNOWN_APPROVED_LEGACY_LIMITATION"
+            body_contains_native_calibration_output = $false
+            limitation                              = "The exact approved legacy transcript is known to contain no native calibration output; its bound header, hash, size, and final terminator are validated."
+        }
+    }
+    return [ordered]@{
+        header_valid                            = $true
+        hash_and_size_valid                     = $true
+        final_terminator_valid                  = $true
+        native_calibration_output_evaluation    = "NOT_EVALUATED"
+        body_contains_native_calibration_output = $null
+        limitation                              = "Transcript body content was not evaluated for native calibration output."
+    }
+}
+
 function Assert-StateProvenance {
     param(
         [Parameter(Mandatory = $true)]
@@ -1949,11 +2187,29 @@ function Assert-StateProvenance {
         [Parameter(Mandatory = $true)]
         [string]$StatePathValue,
 
-        [hashtable]$Plan
+        [hashtable]$Plan,
+
+        [switch]$AllowRestartCandidate,
+
+        [string]$StateIdentityPath
     )
 
     Assert-ReservedArtifactPaths -State $State -Plan $Plan
-    if ($State.repo_head -cne $Plan.head -or $State.state_path -cne $StatePathValue -or $State.runner_sha -cne (Get-RunnerSha256)) {
+    $currentProvenance = $State.repo_head -ceq $Plan.head -and $State.runner_sha -ceq (Get-RunnerSha256)
+    $legacyRestartProvenance = (
+        $AllowRestartCandidate -and
+        $State.repo_head -ceq $LegacyRestartRepoHead -and
+        $State.runner_sha -ceq $LegacyRestartRunnerSha256 -and
+        $State.behavior_sha -ceq $BehaviorBaseline -and
+        $State.classification -ceq "VALID_FRESH_CALIBRATION" -and
+        $State.next_stage -ceq "MapLeft" -and
+        @($State.completed_stages).Count -eq 1 -and
+        [string]$State.completed_stages[0] -ceq "Calibrate" -and
+        [string]::IsNullOrEmpty([string]$State.artifacts.map_left.sha256) -and
+        [string]::IsNullOrEmpty([string]$State.artifacts.map_right.sha256) -and
+        (Test-ApprovedLegacyRestartAuthority -State $State -StatePathValue $StatePathValue -Plan $Plan -StateIdentityPath $StateIdentityPath)
+    )
+    if ((-not $currentProvenance -and -not $legacyRestartProvenance) -or $State.state_path -cne $StatePathValue) {
         New-Failure "State repository provenance is invalid"
     }
     if ($State.session_binding_sha256 -cne (Get-StateSessionBindingDigest -State $State)) {
@@ -2049,21 +2305,24 @@ function Assert-TranscriptSemantics {
         [hashtable]$State,
 
         [Parameter(Mandatory = $true)]
-        [hashtable]$Command
+        [hashtable]$Command,
+
+        [string]$TranscriptPath
     )
 
     $transcript = $State.artifacts.transcript
     if ($null -eq $transcript) {
         New-Failure "Transcript semantic validation failed: transcript is required"
     }
-    if ((Get-Sha256Hex -Path $transcript.path) -cne $transcript.sha256) {
+    $actualTranscriptPath = if ([string]::IsNullOrEmpty($TranscriptPath)) { [string]$transcript.path } else { $TranscriptPath }
+    if ((Get-Sha256Hex -Path $actualTranscriptPath) -cne $transcript.sha256) {
         New-Failure "Transcript hash mismatch"
     }
-    $actualSize = [int64](Get-Item -LiteralPath $transcript.path).Length
+    $actualSize = [int64](Get-Item -LiteralPath $actualTranscriptPath).Length
     if ($actualSize -ne [int64]$transcript.size -or $actualSize -le 0) {
         New-Failure "Transcript semantic validation failed: size mismatch"
     }
-    $lines = @(Get-Content -LiteralPath $transcript.path)
+    $lines = @(Get-Content -LiteralPath $actualTranscriptPath)
     $expectedHeader = @(Get-CalibrationTranscriptHeaderLines -State $State -Executable $Command.executable -Arguments @($Command.arguments))
     if ($lines.Count -lt ($expectedHeader.Count + 1)) {
         New-Failure "Transcript semantic validation failed: transcript is incomplete"
@@ -2166,6 +2425,2417 @@ function Assert-EvidenceAndCalibrationStillMatch {
     )
 
     Assert-EvidenceSemantics -State $State -Plan $Plan
+}
+
+function Assert-ArchivedEvidenceSemantics {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$State,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Plan,
+
+        [Parameter(Mandatory = $true)]
+        [string]$EvidencePath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$TranscriptPath
+    )
+
+    if ((Get-Sha256Hex -Path $EvidencePath) -cne $State.artifacts.evidence.sha256 -or
+        [int64](Get-Item -LiteralPath $EvidencePath).Length -ne [int64]$State.artifacts.evidence.size) {
+        New-Failure "Archived evidence identity does not match the archived state"
+    }
+    $payload = Read-JsonFile -Path $EvidencePath
+    Assert-ExactKeySet `
+        -Value $payload `
+        -ExpectedKeys @(
+            "classification", "session_id", "utc_start", "behavior_sha", "evidence_path",
+            "transcript_path", "transcript_sha256", "transcript_size", "calibration_executable",
+            "calibration_arguments", "state_path", "state_session_binding", "pre_calibration",
+            "post_calibration", "current_identities"
+        ) `
+        -Message "Archived evidence schema is invalid"
+    $expectedCommand = Build-StageCommand -StageName "Calibrate" -Plan $Plan
+    Assert-ExactCommand -Actual $State.stages.Calibrate.native -Expected $expectedCommand -Message "Archived state calibration command is invalid"
+    $evidenceCommand = [ordered]@{
+        executable = $payload.calibration_executable
+        arguments  = @($payload.calibration_arguments)
+    }
+    Assert-ExactCommand -Actual $evidenceCommand -Expected $expectedCommand -Message "Archived evidence calibration command is invalid"
+    Assert-TranscriptSemantics -State $State -Command $expectedCommand -TranscriptPath $TranscriptPath
+    if ($payload.classification -cne "VALID_FRESH_CALIBRATION" -or
+        $payload.session_id -cne $State.session_id -or
+        $payload.utc_start -cne $State.utc_start -or
+        $payload.behavior_sha -cne $BehaviorBaseline -or
+        $payload.evidence_path -cne $State.artifacts.evidence.path -or
+        $payload.transcript_path -cne $State.artifacts.transcript.path -or
+        $payload.transcript_sha256 -cne $State.artifacts.transcript.sha256 -or
+        [int64]$payload.transcript_size -ne [int64]$State.artifacts.transcript.size -or
+        $payload.state_path -cne $State.state_path -or
+        $payload.state_session_binding -cne $State.session_binding_sha256 -or
+        -not (Test-ExactValue -Actual $payload.pre_calibration -Expected $State.pre_calibration) -or
+        -not (Test-ExactValue -Actual $payload.post_calibration -Expected $State.post_calibration) -or
+        -not (Test-ExactValue -Actual $payload.current_identities -Expected $State.post_calibration)) {
+        New-Failure "Archived evidence semantics do not match the archived state"
+    }
+}
+
+function Assert-RestartArchivedStateSchema {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$State
+    )
+
+    Assert-ExactKeySet `
+        -Value $State `
+        -ExpectedKeys @(
+            "schema_version", "runner_version", "packet_identity", "session_id", "utc_start",
+            "behavior_sha", "repo_head", "expected_branch", "runner_sha", "state_path", "ports",
+            "leader_id", "arm_profile", "classification", "completed_stages", "failed_stages",
+            "summaries", "final_result", "next_stage", "session_binding_sha256", "stages",
+            "pre_calibration", "post_calibration", "artifacts"
+        ) `
+        -Message "Rejected archive state schema is invalid"
+    Assert-ExactKeySet -Value $State.ports -ExpectedKeys @("physical_left", "logical_left", "physical_right", "logical_right") -Message "Rejected archive state port schema is invalid"
+    Assert-ExactKeySet -Value $State.stages -ExpectedKeys @("Calibrate", "MapLeft", "MapRight", "Verify") -Message "Rejected archive state stage schema is invalid"
+    foreach ($stageName in @("MapLeft", "MapRight", "Verify")) {
+        $pendingStage = $State.stages[$stageName]
+        if ($pendingStage.result -cne "pending" -or
+            $pendingStage.native.attempted -ne $false -or
+            $pendingStage.native.launched -ne $false -or
+            $null -ne $pendingStage.native.real_exit_code -or
+            $null -ne $pendingStage.native.executable -or
+            @($pendingStage.native.arguments).Count -ne 0) {
+            New-Failure "Rejected archive state $stageName native truth is invalid"
+        }
+    }
+    Assert-ExactKeySet -Value $State.summaries -ExpectedKeys @("Calibrate") -Message "Rejected archive state summary schema is invalid"
+    if ($State.summaries.Calibrate -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$State.summaries.Calibrate) -or
+        $null -ne $State.final_result -or
+        -not (Test-IsUtcTimestamp -Value $State.utc_start) -or
+        -not (Test-IsSha256Hex -Value $State.runner_sha) -or
+        -not (Test-IsSha256Hex -Value $State.session_binding_sha256)) {
+        New-Failure "Rejected archive state scalar schema is invalid"
+    }
+    foreach ($calibrationSetName in @("pre_calibration", "post_calibration")) {
+        $calibrationSet = $State[$calibrationSetName]
+        Assert-ExactKeySet -Value $calibrationSet -ExpectedKeys @("left", "right") -Message "Rejected archive state $calibrationSetName schema is invalid"
+        foreach ($side in @("left", "right")) {
+            $identity = $calibrationSet[$side]
+            Assert-ExactKeySet -Value $identity -ExpectedKeys @("path", "sha256", "size", "mtime_utc", "calibration") -Message "Rejected archive state $calibrationSetName $side identity schema is invalid"
+            if (-not (Test-IsSha256Hex -Value $identity.sha256) -or
+                -not (Test-IsJsonInteger -Value $identity.size) -or
+                [int64]$identity.size -le 0 -or
+                -not (Test-IsUtcTimestamp -Value $identity.mtime_utc)) {
+                New-Failure "Rejected archive state $calibrationSetName $side identity is invalid"
+            }
+            Assert-CalibrationSchema -Calibration $identity.calibration -Label "archived state $calibrationSetName $side"
+        }
+    }
+    Assert-ExactKeySet -Value $State.artifacts -ExpectedKeys @("transcript", "evidence", "map_left", "map_right") -Message "Rejected archive state artifact schema is invalid"
+    foreach ($artifactName in @("transcript", "evidence")) {
+        $artifact = $State.artifacts[$artifactName]
+        Assert-ExactKeySet -Value $artifact -ExpectedKeys @("path", "sha256", "size") -Message "Rejected archive state $artifactName schema is invalid"
+        if (-not (Test-IsSha256Hex -Value $artifact.sha256) -or
+            -not (Test-IsJsonInteger -Value $artifact.size) -or
+            [int64]$artifact.size -le 0) {
+            New-Failure "Rejected archive state $artifactName identity is invalid"
+        }
+    }
+    foreach ($artifactName in @("map_left", "map_right")) {
+        $artifact = $State.artifacts[$artifactName]
+        Assert-ExactKeySet -Value $artifact -ExpectedKeys @("path", "sha256") -Message "Rejected archive state $artifactName schema is invalid"
+        if (-not [string]::IsNullOrEmpty([string]$artifact.sha256)) {
+            New-Failure "Rejected archive state contains a map artifact identity"
+        }
+    }
+}
+
+function Get-RestartJournalPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$StatePathValue
+    )
+
+    return "$StatePathValue.restart-calibration.json"
+}
+
+function Get-ActiveCalibrationDirectory {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Plan
+    )
+
+    $leftPath = [System.IO.Path]::GetFullPath([string]$Plan.calibration.left.path)
+    $rightPath = [System.IO.Path]::GetFullPath([string]$Plan.calibration.right.path)
+    $leftDirectory = [System.IO.Path]::GetDirectoryName($leftPath)
+    $rightDirectory = [System.IO.Path]::GetDirectoryName($rightPath)
+    if ([string]::IsNullOrEmpty($leftDirectory) -or -not $leftDirectory.Equals($rightDirectory, [System.StringComparison]::OrdinalIgnoreCase)) {
+        New-Failure "RestartCalibration requires both active calibration files in one directory"
+    }
+    if ([System.IO.Path]::GetFileName($leftPath) -ceq [System.IO.Path]::GetFileName($rightPath)) {
+        New-Failure "RestartCalibration calibration filenames must be distinct"
+    }
+    return $leftDirectory
+}
+
+function Assert-RestartPathHasNoReparsePoint {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Boundary,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Label
+    )
+
+    $currentPath = [System.IO.Path]::GetFullPath($Path)
+    if (-not $currentPath.Equals([System.IO.Path]::GetPathRoot($currentPath), [System.StringComparison]::OrdinalIgnoreCase)) {
+        $currentPath = $currentPath.TrimEnd('\', '/')
+    }
+    $boundaryPath = [System.IO.Path]::GetFullPath($Boundary)
+    if (-not $boundaryPath.Equals([System.IO.Path]::GetPathRoot($boundaryPath), [System.StringComparison]::OrdinalIgnoreCase)) {
+        $boundaryPath = $boundaryPath.TrimEnd('\', '/')
+    }
+    if (-not (Test-PathIsSameOrDescendant -Path $currentPath -Root $boundaryPath)) {
+        New-Failure "RestartCalibration $Label escaped its validated boundary: $currentPath is not under $boundaryPath"
+    }
+    while ($true) {
+        if (Test-Path -LiteralPath $currentPath) {
+            $item = Get-Item -LiteralPath $currentPath -Force
+            if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                New-Failure "RestartCalibration $Label contains a reparse point path component: $currentPath"
+            }
+        }
+        if ($currentPath.Equals($boundaryPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+            break
+        }
+        $parent = [System.IO.Directory]::GetParent($currentPath)
+        if ($null -eq $parent) {
+            New-Failure "RestartCalibration $Label could not reach its validated boundary"
+        }
+        $currentPath = $parent.FullName
+        if (-not $currentPath.Equals([System.IO.Path]::GetPathRoot($currentPath), [System.StringComparison]::OrdinalIgnoreCase)) {
+            $currentPath = $currentPath.TrimEnd('\', '/')
+        }
+    }
+}
+
+function Assert-RestartPathConfined {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Root,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Label
+    )
+
+    $resolvedPath = [System.IO.Path]::GetFullPath($Path)
+    $resolvedRoot = [System.IO.Path]::GetFullPath($Root)
+    if (-not (Test-PathIsSameOrDescendant -Path $resolvedPath -Root $resolvedRoot)) {
+        New-Failure "RestartCalibration $Label escaped its validated root"
+    }
+    $volumeRoot = [System.IO.Path]::GetPathRoot($resolvedRoot)
+    Assert-RestartPathHasNoReparsePoint -Path $resolvedRoot -Boundary $volumeRoot -Label "$Label root"
+    Assert-RestartPathHasNoReparsePoint -Path $resolvedPath -Boundary $resolvedRoot -Label $Label
+}
+
+function Get-RestartNearestExistingPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    $candidate = [System.IO.Path]::GetFullPath($Path)
+    if (-not $candidate.Equals([System.IO.Path]::GetPathRoot($candidate), [System.StringComparison]::OrdinalIgnoreCase)) {
+        $candidate = $candidate.TrimEnd('\', '/')
+    }
+    while (-not (Test-Path -LiteralPath $candidate)) {
+        $parent = [System.IO.Directory]::GetParent($candidate)
+        if ($null -eq $parent) {
+            New-Failure "RestartCalibration could not resolve an existing volume ancestor for $Path"
+        }
+        $candidate = $parent.FullName
+        if (-not $candidate.Equals([System.IO.Path]::GetPathRoot($candidate), [System.StringComparison]::OrdinalIgnoreCase)) {
+            $candidate = $candidate.TrimEnd('\', '/')
+        }
+    }
+    return $candidate
+}
+
+function Initialize-RestartNativePaths {
+    if ($null -eq ("Packet2nR5RestartNativePaths" -as [type])) {
+        Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+
+public static class Packet2nR5RestartNativePaths {
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern bool GetVolumePathNameW(string fileName, StringBuilder volumePathName, uint bufferLength);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern bool GetVolumeNameForVolumeMountPointW(string volumeMountPoint, StringBuilder volumeName, uint bufferLength);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern bool MoveFileExW(string existingFileName, string newFileName, uint flags);
+}
+"@
+    }
+}
+
+function Get-RestartVolumeIdentity {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    Initialize-RestartNativePaths
+    $existingPath = Get-RestartNearestExistingPath -Path $Path
+    $volumePath = [System.Text.StringBuilder]::new(1024)
+    if (-not [Packet2nR5RestartNativePaths]::GetVolumePathNameW($existingPath, $volumePath, [uint32]$volumePath.Capacity)) {
+        New-Failure "RestartCalibration could not resolve the actual volume for $Path"
+    }
+    $volumeName = [System.Text.StringBuilder]::new(1024)
+    if (-not [Packet2nR5RestartNativePaths]::GetVolumeNameForVolumeMountPointW($volumePath.ToString(), $volumeName, [uint32]$volumeName.Capacity)) {
+        New-Failure "RestartCalibration could not resolve the actual volume identity for $Path"
+    }
+    return $volumeName.ToString().TrimEnd('\').ToUpperInvariant()
+}
+
+function Assert-RestartSameVolume {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$First,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Second,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Label
+    )
+
+    $firstVolume = Get-RestartVolumeIdentity -Path $First
+    $secondVolume = Get-RestartVolumeIdentity -Path $Second
+    if ($firstVolume -cne $secondVolume) {
+        New-Failure "RestartCalibration $Label must remain on one actual volume"
+    }
+}
+
+function ConvertTo-RestartExtendedPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    $resolved = [System.IO.Path]::GetFullPath($Path)
+    if ($resolved.StartsWith('\\', [System.StringComparison]::Ordinal)) {
+        return "\\?\UNC\$($resolved.Substring(2))"
+    }
+    return "\\?\$resolved"
+}
+
+function Invoke-RestartDurableNamespaceMove {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Source,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Destination,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Label,
+
+        [switch]$ReplaceExisting
+    )
+
+    if (-not (Test-Path -LiteralPath $Source)) {
+        New-Failure "RestartCalibration $Label source is missing: $Source"
+    }
+    $sourceItem = Get-Item -LiteralPath $Source -Force
+    if (($sourceItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        ($sourceItem -isnot [System.IO.FileInfo] -and $sourceItem -isnot [System.IO.DirectoryInfo])) {
+        New-Failure "RestartCalibration $Label source is not a regular file or directory: $Source"
+    }
+    $destinationExists = Test-Path -LiteralPath $Destination
+    if ($destinationExists) {
+        $destinationItem = Get-Item -LiteralPath $Destination -Force
+        if (($destinationItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            New-Failure "RestartCalibration $Label destination is a reparse point: $Destination"
+        }
+        if (-not $ReplaceExisting) {
+            New-Failure "RestartCalibration $Label destination already exists: $Destination"
+        }
+        if ($sourceItem -isnot [System.IO.FileInfo] -or $destinationItem -isnot [System.IO.FileInfo]) {
+            New-Failure "RestartCalibration $Label replacement requires regular files"
+        }
+    }
+    elseif ($ReplaceExisting -and $sourceItem -isnot [System.IO.FileInfo]) {
+        New-Failure "RestartCalibration $Label replacement requires a regular file source"
+    }
+    Assert-RestartSameVolume -First $Source -Second $Destination -Label $Label
+    Initialize-RestartNativePaths
+    [uint32]$flags = 0x00000008
+    if ($ReplaceExisting) {
+        $flags = $flags -bor 0x00000001
+    }
+    $sourceNative = ConvertTo-RestartExtendedPath -Path $Source
+    $destinationNative = ConvertTo-RestartExtendedPath -Path $Destination
+    if (-not [Packet2nR5RestartNativePaths]::MoveFileExW($sourceNative, $destinationNative, $flags)) {
+        $errorCode = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        $errorMessage = [System.ComponentModel.Win32Exception]::new($errorCode).Message
+        New-Failure "RestartCalibration $Label namespace publication failed with Windows error $errorCode ($errorMessage): $Source -> $Destination"
+    }
+}
+
+function Assert-RestartMoveSafe {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Source,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Destination,
+
+        [Parameter(Mandatory = $true)]
+        [string]$SourceRoot,
+
+        [Parameter(Mandatory = $true)]
+        [string]$DestinationRoot,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Label
+    )
+
+    Assert-RestartPathConfined -Path $Source -Root $SourceRoot -Label "$Label source"
+    Assert-RestartPathConfined -Path $Destination -Root $DestinationRoot -Label "$Label destination"
+    Assert-RestartSameVolume -First $Source -Second $Destination -Label $Label
+}
+
+function Get-RestartTransactionPaths {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Plan,
+
+        [Parameter(Mandatory = $true)]
+        [string]$StatePathValue,
+
+        [Parameter(Mandatory = $true)]
+        [string]$SessionId
+    )
+
+    if (-not $Plan.ContainsKey("rejected_archive_root") -or [string]::IsNullOrWhiteSpace([string]$Plan.rejected_archive_root)) {
+        New-Failure "RestartCalibration rejected archive root is missing"
+    }
+    $activeDirectory = Get-ActiveCalibrationDirectory -Plan $Plan
+    $activeParent = [System.IO.Path]::GetDirectoryName($activeDirectory)
+    $archivePath = Join-Path ([string]$Plan.rejected_archive_root) "packet2n-r5-rejected-$SessionId"
+    $paths = [ordered]@{
+        journal          = Get-RestartJournalPath -StatePathValue $StatePathValue
+        archive          = $archivePath
+        archive_staging  = "$archivePath.staging"
+        active           = $activeDirectory
+        staged_original  = Join-Path $activeParent ".packet2n-r5-original-$SessionId"
+        rollback         = Join-Path $activeParent ".packet2n-r5-rejected-$SessionId"
+    }
+    $calibrationRoot = [System.IO.Path]::GetFullPath([string]$Plan.calibration_root)
+    $stateRoot = [System.IO.Path]::GetFullPath([string]$Plan.state_root)
+    $archiveRoot = [System.IO.Path]::GetFullPath([string]$Plan.rejected_archive_root)
+    Assert-RestartPathConfined -Path $paths.active -Root $calibrationRoot -Label "active calibration path"
+    Assert-RestartPathConfined -Path $paths.staged_original -Root $activeParent -Label "staged-original path"
+    Assert-RestartPathConfined -Path $paths.rollback -Root $activeParent -Label "rollback path"
+    Assert-RestartPathConfined -Path $StatePathValue -Root $stateRoot -Label "source state path"
+    Assert-RestartPathConfined -Path $paths.journal -Root $stateRoot -Label "journal path"
+    Assert-RestartPathConfined -Path $paths.archive -Root $archiveRoot -Label "archive path"
+    Assert-RestartPathConfined -Path $paths.archive_staging -Root $archiveRoot -Label "archive staging path"
+    Assert-RestartSameVolume -First $paths.active -Second $paths.staged_original -Label "active/staged-original directory swap"
+    Assert-RestartSameVolume -First $paths.active -Second $paths.rollback -Label "active/rollback directory swap"
+    Assert-RestartSameVolume -First $paths.active -Second $paths.archive -Label "fresh-pair retirement"
+    Assert-RestartSameVolume -First $StatePathValue -Second $paths.archive -Label "state retirement"
+    foreach ($path in $paths.Values) {
+        Assert-TestModePath -Plan $Plan -Path ([string]$path)
+    }
+    return $paths
+}
+
+function Get-FileTimestampUtc {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    return Format-UtcTimestamp -Value (Get-Item -LiteralPath $Path).LastWriteTimeUtc
+}
+
+function Test-SnapshotMatchesIdentity {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Snapshot,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Identity
+    )
+
+    return (
+        $Snapshot.sha256 -ceq $Identity.sha256 -and
+        [int64]$Snapshot.size -eq [int64]$Identity.size -and
+        $Snapshot.mtime_utc -ceq $Identity.mtime_utc -and
+        (Test-ExactValue -Actual $Snapshot.calibration -Expected $Identity.calibration)
+    )
+}
+
+function Get-PairDirectoryLayout {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Directory,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Plan,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$FreshIdentities
+    )
+
+    if (-not (Test-Path -LiteralPath $Directory)) {
+        return "missing"
+    }
+    if (-not (Test-Path -LiteralPath $Directory -PathType Container)) {
+        return "unrecognized"
+    }
+    $directoryItem = Get-Item -LiteralPath $Directory -Force
+    if (($directoryItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        return "unrecognized"
+    }
+    $entries = @(Get-ChildItem -LiteralPath $Directory -Force)
+    $expectedNames = @(
+        [System.IO.Path]::GetFileName([string]$Plan.calibration.left.path),
+        [System.IO.Path]::GetFileName([string]$Plan.calibration.right.path)
+    )
+    if ($entries.Count -ne 2) {
+        return "unrecognized"
+    }
+    foreach ($entry in $entries) {
+        if ($entry -isnot [System.IO.FileInfo] -or
+            ($entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+            $expectedNames -cnotcontains $entry.Name) {
+            return "unrecognized"
+        }
+    }
+
+    $allFresh = $true
+    $allOriginal = $true
+    foreach ($side in @("left", "right")) {
+        $name = [System.IO.Path]::GetFileName([string]$Plan.calibration[$side].path)
+        try {
+            $snapshot = Get-CalibrationSnapshot -Path (Join-Path $Directory $name) -Label "RestartCalibration $side pair"
+        }
+        catch {
+            return "unrecognized"
+        }
+        if (-not (Test-SnapshotMatchesIdentity -Snapshot $snapshot -Identity $FreshIdentities[$side])) {
+            $allFresh = $false
+        }
+        $backupCalibration = Read-JsonFile -Path $Plan.calibration[$side].backup_path
+        $originalIdentity = [ordered]@{
+            sha256      = $Plan.calibration[$side].backup_sha256
+            size        = [int64]$Plan.calibration[$side].backup_size
+            mtime_utc   = $Plan.calibration[$side].source_mtime_utc
+            calibration = $backupCalibration
+        }
+        if (-not (Test-SnapshotMatchesIdentity -Snapshot $snapshot -Identity $originalIdentity)) {
+            $allOriginal = $false
+        }
+    }
+    if ($allFresh -and -not $allOriginal) {
+        return "fresh"
+    }
+    if ($allOriginal -and -not $allFresh) {
+        return "original"
+    }
+    return "unrecognized"
+}
+
+function Copy-FilePreservingIdentity {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Source,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Destination
+    )
+
+    if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) {
+        New-Failure "RestartCalibration source file is missing: $Source"
+    }
+    Assert-PathMissing -Path $Destination
+    Ensure-ParentDirectory -Path $Destination
+    $sourceItem = Get-Item -LiteralPath $Source -Force
+    if (($sourceItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        New-Failure "RestartCalibration refuses reparse point source: $Source"
+    }
+    [System.IO.File]::Copy($Source, $Destination, $false)
+    [System.IO.File]::SetLastWriteTimeUtc($Destination, $sourceItem.LastWriteTimeUtc)
+    $destinationItem = Get-Item -LiteralPath $Destination -Force
+    if (($destinationItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        (Get-Sha256Hex -Path $Destination) -cne (Get-Sha256Hex -Path $Source) -or
+        [int64]$destinationItem.Length -ne [int64]$sourceItem.Length -or
+        (Format-UtcTimestamp -Value $destinationItem.LastWriteTimeUtc) -cne (Format-UtcTimestamp -Value $sourceItem.LastWriteTimeUtc)) {
+        New-Failure "RestartCalibration copied file identity mismatch: $Destination"
+    }
+}
+
+function Test-FileMatchesSourceIdentity {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Source,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Destination
+    )
+
+    if (-not (Test-Path -LiteralPath $Destination -PathType Leaf)) {
+        return $false
+    }
+    $sourceItem = Get-Item -LiteralPath $Source -Force
+    $destinationItem = Get-Item -LiteralPath $Destination -Force
+    return (
+        ($destinationItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq 0 -and
+        (Get-Sha256Hex -Path $Destination) -ceq (Get-Sha256Hex -Path $Source) -and
+        [int64]$destinationItem.Length -eq [int64]$sourceItem.Length -and
+        (Format-UtcTimestamp -Value $destinationItem.LastWriteTimeUtc) -ceq (Format-UtcTimestamp -Value $sourceItem.LastWriteTimeUtc)
+    )
+}
+
+function Copy-RestartStagedFile {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Source,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Destination,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Plan
+    )
+
+    if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) {
+        New-Failure "RestartCalibration source file is missing: $Source"
+    }
+    $sourceItem = Get-Item -LiteralPath $Source -Force
+    if (($sourceItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        New-Failure "RestartCalibration refuses reparse point source: $Source"
+    }
+    Assert-TestModePath -Plan $Plan -Path $Destination
+    Ensure-ParentDirectory -Path $Destination
+    $tempPath = "$Destination.restart-copy.tmp"
+    Assert-TestModePath -Plan $Plan -Path $tempPath
+    foreach ($candidate in @($Destination, $tempPath)) {
+        if (-not (Test-Path -LiteralPath $candidate)) {
+            continue
+        }
+        $candidateItem = Get-Item -LiteralPath $candidate -Force
+        if ($candidateItem -isnot [System.IO.FileInfo] -or
+            ($candidateItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            New-Failure "RestartCalibration staged path is not a regular file: $candidate"
+        }
+    }
+    if (Test-FileMatchesSourceIdentity -Source $Source -Destination $Destination) {
+        if (Test-Path -LiteralPath $tempPath) {
+            [System.IO.File]::Delete($tempPath)
+        }
+        return
+    }
+    if (Test-Path -LiteralPath $Destination) {
+        [System.IO.File]::Delete($Destination)
+    }
+    if (Test-Path -LiteralPath $tempPath) {
+        [System.IO.File]::Delete($tempPath)
+    }
+    [System.IO.File]::Copy($Source, $tempPath, $false)
+    [System.IO.File]::SetLastWriteTimeUtc($tempPath, $sourceItem.LastWriteTimeUtc)
+    if (-not (Test-FileMatchesSourceIdentity -Source $Source -Destination $tempPath)) {
+        New-Failure "RestartCalibration staged copy identity mismatch: $tempPath"
+    }
+    Invoke-RestartDurableNamespaceMove -Source $tempPath -Destination $Destination -Label "staged-copy publication"
+    if (-not (Test-FileMatchesSourceIdentity -Source $Source -Destination $Destination)) {
+        New-Failure "RestartCalibration published staged copy identity mismatch: $Destination"
+    }
+}
+
+function Get-ArchiveArtifactRecord {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Source,
+
+        [Parameter(Mandatory = $true)]
+        [string]$StagedPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$PublishedPath
+    )
+
+    return [ordered]@{
+        source_path       = $Source
+        archive_path      = $PublishedPath
+        sha256            = Get-Sha256Hex -Path $StagedPath
+        size              = [int64](Get-Item -LiteralPath $StagedPath).Length
+        source_mtime_utc  = Get-FileTimestampUtc -Path $Source
+        archive_mtime_utc = Get-FileTimestampUtc -Path $StagedPath
+    }
+}
+
+function Save-RestartJournal {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Journal,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Plan
+    )
+
+    Write-RestartJsonDurable -Path $Path -Value $Journal -Plan $Plan -Overwrite
+}
+
+function Write-RestartJsonDurable {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        $Value,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Plan,
+
+        [switch]$Overwrite,
+
+        [string]$AfterFlushFailurePoint
+    )
+
+    Assert-TestModePath -Plan $Plan -Path $Path
+    $durablePathRoot = [System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath($Path))
+    Assert-RestartPathHasNoReparsePoint -Path $Path -Boundary $durablePathRoot -Label "durable JSON path"
+    Ensure-ParentDirectory -Path $Path
+    if (Test-Path -LiteralPath $Path) {
+        $pathItem = Get-Item -LiteralPath $Path -Force
+        if ($pathItem -isnot [System.IO.FileInfo] -or
+            ($pathItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            New-Failure "RestartCalibration durable JSON path is not a regular file: $Path"
+        }
+    }
+    if ((-not $Overwrite) -and (Test-Path -LiteralPath $Path)) {
+        New-Failure "Refusing to overwrite existing file: $Path"
+    }
+    $tempPath = "$Path.restart-durable.tmp"
+    Assert-TestModePath -Plan $Plan -Path $tempPath
+    if (Test-Path -LiteralPath $tempPath) {
+        $tempItem = Get-Item -LiteralPath $tempPath -Force
+        if ($tempItem -isnot [System.IO.FileInfo] -or
+            ($tempItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            New-Failure "RestartCalibration durable temp path is not a regular file: $tempPath"
+        }
+        [System.IO.File]::Delete($tempPath)
+    }
+    $text = (ConvertTo-CanonicalJson -Value $Value) + [Environment]::NewLine
+    $bytes = [System.Text.UTF8Encoding]::new($false).GetBytes($text)
+    $stream = [System.IO.FileStream]::new(
+        $tempPath,
+        [System.IO.FileMode]::CreateNew,
+        [System.IO.FileAccess]::Write,
+        [System.IO.FileShare]::None,
+        4096,
+        [System.IO.FileOptions]::WriteThrough
+    )
+    try {
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+    }
+    finally {
+        $stream.Dispose()
+    }
+    if (-not [string]::IsNullOrEmpty($AfterFlushFailurePoint)) {
+        Test-RestartFailurePoint -Plan $Plan -Point $AfterFlushFailurePoint
+    }
+    if (Test-Path -LiteralPath $Path) {
+        if (-not $Overwrite) {
+            New-Failure "Refusing to overwrite existing file: $Path"
+        }
+        Invoke-RestartDurableNamespaceMove -Source $tempPath -Destination $Path -Label "durable JSON replacement" -ReplaceExisting
+    }
+    else {
+        Invoke-RestartDurableNamespaceMove -Source $tempPath -Destination $Path -Label "durable JSON publication"
+    }
+}
+
+function New-RestartJournal {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$State,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Plan,
+
+        [Parameter(Mandatory = $true)]
+        [string]$StatePathValue,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Paths
+    )
+
+    $stateItem = Get-Item -LiteralPath $StatePathValue
+    return [ordered]@{
+        schema_version        = "1"
+        transaction_type      = "packet2n-r5-restart-calibration"
+        status                = "in_progress"
+        phase                 = "initialized"
+        reason                = $RestartRejectionReason
+        session_id            = $State.session_id
+        session_start_utc     = $State.utc_start
+        state_binding_sha256  = $State.session_binding_sha256
+        state_path            = $StatePathValue
+        archive_path          = $Paths.archive
+        archive_staging_path  = $Paths.archive_staging
+        active_directory      = $Paths.active
+        staged_original_path  = $Paths.staged_original
+        rollback_path         = $Paths.rollback
+        source_state          = [ordered]@{
+            sha256    = Get-Sha256Hex -Path $StatePathValue
+            size      = [int64]$stateItem.Length
+            mtime_utc = Format-UtcTimestamp -Value $stateItem.LastWriteTimeUtc
+        }
+        source_fresh          = $State.post_calibration
+        native_stage_truth    = $State.stages
+        source_provenance     = [ordered]@{
+            repo_head     = $State.repo_head
+            runner_sha256 = $State.runner_sha
+            behavior_sha  = $State.behavior_sha
+        }
+        recovery_provenance   = [ordered]@{
+            repo_head     = $Plan.head
+            runner_sha256 = Get-RunnerSha256
+            behavior_sha  = $BehaviorBaseline
+        }
+        archive_record_sha256 = $null
+    }
+}
+
+function Assert-RestartSourceEvidenceBindings {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$State,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Plan
+    )
+
+    $expectedCommand = Build-StageCommand -StageName "Calibrate" -Plan $Plan
+    Assert-TranscriptSemantics -State $State -Command $expectedCommand
+    $evidence = $State.artifacts.evidence
+    if ($null -eq $evidence -or
+        -not (Test-Path -LiteralPath $evidence.path -PathType Leaf) -or
+        (Get-Sha256Hex -Path $evidence.path) -cne $evidence.sha256 -or
+        [int64](Get-Item -LiteralPath $evidence.path).Length -ne [int64]$evidence.size) {
+        New-Failure "RestartCalibration source evidence identity is invalid"
+    }
+    $payload = Read-JsonFile -Path $evidence.path
+    Assert-ExactKeySet `
+        -Value $payload `
+        -ExpectedKeys @(
+            "classification", "session_id", "utc_start", "behavior_sha", "evidence_path",
+            "transcript_path", "transcript_sha256", "transcript_size", "calibration_executable",
+            "calibration_arguments", "state_path", "state_session_binding", "pre_calibration",
+            "post_calibration", "current_identities"
+        ) `
+        -Message "RestartCalibration source evidence schema is invalid"
+    $evidenceCommand = [ordered]@{
+        executable = $payload.calibration_executable
+        arguments  = @($payload.calibration_arguments)
+    }
+    Assert-ExactCommand -Actual $evidenceCommand -Expected $expectedCommand -Message "RestartCalibration source evidence command is invalid"
+    if ($payload.classification -cne "VALID_FRESH_CALIBRATION" -or
+        $payload.session_id -cne $State.session_id -or
+        $payload.utc_start -cne $State.utc_start -or
+        $payload.behavior_sha -cne $BehaviorBaseline -or
+        $payload.evidence_path -cne $evidence.path -or
+        $payload.transcript_path -cne $State.artifacts.transcript.path -or
+        $payload.transcript_sha256 -cne $State.artifacts.transcript.sha256 -or
+        [int64]$payload.transcript_size -ne [int64]$State.artifacts.transcript.size -or
+        $payload.state_path -cne $State.state_path -or
+        $payload.state_session_binding -cne $State.session_binding_sha256 -or
+        -not (Test-ExactValue -Actual $payload.pre_calibration -Expected $State.pre_calibration) -or
+        -not (Test-ExactValue -Actual $payload.post_calibration -Expected $State.post_calibration) -or
+        -not (Test-ExactValue -Actual $payload.current_identities -Expected $State.post_calibration)) {
+        New-Failure "RestartCalibration source evidence binding is invalid"
+    }
+}
+
+function Get-RestartAuthorityState {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Journal,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Plan,
+
+        [Parameter(Mandatory = $true)]
+        [string]$StatePathValue
+    )
+
+    $stateName = [System.IO.Path]::GetFileName($StatePathValue)
+    $candidatePaths = @(
+        $StatePathValue,
+        (Join-Path $Journal.archive_staging_path (Join-Path "state-snapshot" $stateName)),
+        (Join-Path $Journal.archive_path (Join-Path "state-snapshot" $stateName)),
+        (Join-Path $Journal.archive_path (Join-Path "retired-state" $stateName))
+    )
+    foreach ($candidatePath in $candidatePaths) {
+        $candidateRoot = if ((Test-PathIsSameOrDescendant -Path $candidatePath -Root $Plan.state_root)) {
+            [string]$Plan.state_root
+        }
+        else {
+            [string]$Plan.rejected_archive_root
+        }
+        Assert-RestartPathHasNoReparsePoint -Path $candidatePath -Boundary $candidateRoot -Label "preserved source state path"
+    }
+    $existingPaths = @($candidatePaths | Where-Object { Test-Path -LiteralPath $_ })
+    if ($existingPaths.Count -eq 0) {
+        New-Failure "RestartCalibration journal has no preserved source state"
+    }
+    $authorityState = $null
+    $authorityStateIdentityPath = $null
+    foreach ($candidatePath in $existingPaths) {
+        $item = Get-Item -LiteralPath $candidatePath -Force
+        if ($item -isnot [System.IO.FileInfo] -or
+            ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+            (Get-Sha256Hex -Path $candidatePath) -cne $Journal.source_state.sha256 -or
+            [int64]$item.Length -ne [int64]$Journal.source_state.size -or
+            (Format-UtcTimestamp -Value $item.LastWriteTimeUtc) -cne $Journal.source_state.mtime_utc) {
+            New-Failure "RestartCalibration preserved source state identity is invalid"
+        }
+        $candidateState = Read-JsonFile -Path $candidatePath
+        if ($null -eq $authorityState) {
+            $authorityState = $candidateState
+            $authorityStateIdentityPath = $candidatePath
+        }
+        elseif (-not (Test-ExactValue -Actual $candidateState -Expected $authorityState)) {
+            New-Failure "RestartCalibration preserved source state copies disagree"
+        }
+    }
+    $issues = @(Get-StateValidationIssues -State $authorityState -Plan $Plan)
+    if ($issues.Count -gt 0) {
+        New-Failure ("RestartCalibration source state schema is invalid: " + ($issues -join ", "))
+    }
+    Assert-StateIdentity -State $authorityState
+    Assert-StateProvenance `
+        -State $authorityState `
+        -StatePathValue $StatePathValue `
+        -Plan $Plan `
+        -AllowRestartCandidate `
+        -StateIdentityPath $authorityStateIdentityPath
+    if ($authorityState.classification -cne "VALID_FRESH_CALIBRATION" -or
+        $authorityState.next_stage -cne "MapLeft" -or
+        @($authorityState.completed_stages).Count -ne 1 -or
+        [string]$authorityState.completed_stages[0] -cne "Calibrate" -or
+        @($authorityState.failed_stages).Count -ne 0 -or
+        $authorityState.stages.MapLeft.result -cne "pending" -or
+        $authorityState.stages.MapRight.result -cne "pending" -or
+        $authorityState.stages.Verify.result -cne "pending" -or
+        -not [string]::IsNullOrEmpty([string]$authorityState.artifacts.map_left.sha256) -or
+        -not [string]::IsNullOrEmpty([string]$authorityState.artifacts.map_right.sha256) -or
+        (Test-Path -LiteralPath $authorityState.artifacts.map_left.path) -or
+        (Test-Path -LiteralPath $authorityState.artifacts.map_right.path)) {
+        New-Failure "RestartCalibration journal source state is not the exact pre-map candidate"
+    }
+    Assert-RestartSourceEvidenceBindings -State $authorityState -Plan $Plan
+    return $authorityState
+}
+
+function Assert-RestartJournal {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Journal,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Plan,
+
+        [Parameter(Mandatory = $true)]
+        [string]$StatePathValue
+    )
+
+    $required = @(
+        "schema_version", "transaction_type", "status", "phase", "reason", "session_id",
+        "session_start_utc", "state_binding_sha256", "state_path", "archive_path",
+        "archive_staging_path", "active_directory", "staged_original_path", "rollback_path",
+        "source_state", "source_fresh", "native_stage_truth", "source_provenance",
+        "recovery_provenance", "archive_record_sha256"
+    )
+    if (@($Journal.Keys).Count -ne $required.Count) {
+        New-Failure "RestartCalibration journal schema is invalid"
+    }
+    foreach ($key in $required) {
+        if (@($Journal.Keys) -cnotcontains $key) {
+            New-Failure "RestartCalibration journal schema is invalid"
+        }
+    }
+    if ($Journal.schema_version -cne "1" -or
+        $Journal.transaction_type -cne "packet2n-r5-restart-calibration" -or
+        $Journal.status -cne "in_progress" -or
+        $Journal.reason -cne $RestartRejectionReason -or
+        $Journal.state_path -cne $StatePathValue -or
+        [string]::IsNullOrWhiteSpace([string]$Journal.session_id)) {
+        New-Failure "RestartCalibration journal identity is invalid"
+    }
+    if (@(
+        "initialized", "archive_staged", "archive_published", "active_withdrawn",
+        "original_activated", "fresh_pair_retired", "state_retired"
+    ) -cnotcontains [string]$Journal.phase -or
+        -not (Test-IsUtcTimestamp -Value $Journal.session_start_utc) -or
+        -not (Test-IsSha256Hex -Value $Journal.state_binding_sha256)) {
+        New-Failure "RestartCalibration journal phase or source identity is invalid"
+    }
+    Assert-ExactKeySet -Value $Journal.source_state -ExpectedKeys @("sha256", "size", "mtime_utc") -Message "RestartCalibration journal source-state schema is invalid"
+    if (-not (Test-IsSha256Hex -Value $Journal.source_state.sha256) -or
+        -not (Test-IsJsonInteger -Value $Journal.source_state.size) -or
+        [int64]$Journal.source_state.size -le 0 -or
+        -not (Test-IsUtcTimestamp -Value $Journal.source_state.mtime_utc)) {
+        New-Failure "RestartCalibration journal source-state identity is invalid"
+    }
+    Assert-ExactKeySet -Value $Journal.source_fresh -ExpectedKeys @("left", "right") -Message "RestartCalibration journal fresh-pair schema is invalid"
+    foreach ($side in @("left", "right")) {
+        Assert-ExactKeySet `
+            -Value $Journal.source_fresh[$side] `
+            -ExpectedKeys @("path", "sha256", "size", "mtime_utc", "calibration") `
+            -Message "RestartCalibration journal fresh-pair schema is invalid"
+        if (-not (Test-IsSha256Hex -Value $Journal.source_fresh[$side].sha256) -or
+            -not (Test-IsJsonInteger -Value $Journal.source_fresh[$side].size) -or
+            [int64]$Journal.source_fresh[$side].size -le 0 -or
+            -not (Test-IsUtcTimestamp -Value $Journal.source_fresh[$side].mtime_utc)) {
+            New-Failure "RestartCalibration journal fresh-pair identity is invalid"
+        }
+        Assert-CalibrationSchema -Calibration $Journal.source_fresh[$side].calibration -Label "RestartCalibration journal $side fresh calibration"
+    }
+    Assert-ExactKeySet -Value $Journal.native_stage_truth -ExpectedKeys @("Calibrate", "MapLeft", "MapRight", "Verify") -Message "RestartCalibration journal native-stage schema is invalid"
+    Assert-ExactKeySet -Value $Journal.source_provenance -ExpectedKeys @("repo_head", "runner_sha256", "behavior_sha") -Message "RestartCalibration journal source provenance schema is invalid"
+    Assert-ExactKeySet -Value $Journal.recovery_provenance -ExpectedKeys @("repo_head", "runner_sha256", "behavior_sha") -Message "RestartCalibration journal recovery provenance schema is invalid"
+    if ($null -ne $Journal.archive_record_sha256 -and -not (Test-IsSha256Hex -Value $Journal.archive_record_sha256)) {
+        New-Failure "RestartCalibration journal archive-record identity is invalid"
+    }
+    $expectedPaths = Get-RestartTransactionPaths -Plan $Plan -StatePathValue $StatePathValue -SessionId ([string]$Journal.session_id)
+    foreach ($binding in @(
+        [ordered]@{ actual = $Journal.archive_path; expected = $expectedPaths.archive },
+        [ordered]@{ actual = $Journal.archive_staging_path; expected = $expectedPaths.archive_staging },
+        [ordered]@{ actual = $Journal.active_directory; expected = $expectedPaths.active },
+        [ordered]@{ actual = $Journal.staged_original_path; expected = $expectedPaths.staged_original },
+        [ordered]@{ actual = $Journal.rollback_path; expected = $expectedPaths.rollback }
+    )) {
+        if ([string]$binding.actual -cne [string]$binding.expected) {
+            New-Failure "RestartCalibration journal path binding is invalid"
+        }
+    }
+    if ($Journal.recovery_provenance.repo_head -cne $Plan.head -or
+        $Journal.recovery_provenance.runner_sha256 -cne (Get-RunnerSha256) -or
+        $Journal.recovery_provenance.behavior_sha -cne $BehaviorBaseline) {
+        New-Failure "RestartCalibration journal recovery provenance is invalid"
+    }
+    $authorityState = Get-RestartAuthorityState -Journal $Journal -Plan $Plan -StatePathValue $StatePathValue
+    if ($Journal.session_id -cne $authorityState.session_id -or
+        $Journal.session_start_utc -cne $authorityState.utc_start -or
+        $Journal.state_binding_sha256 -cne $authorityState.session_binding_sha256 -or
+        -not (Test-ExactValue -Actual $Journal.source_fresh -Expected $authorityState.post_calibration) -or
+        -not (Test-ExactValue -Actual $Journal.native_stage_truth -Expected $authorityState.stages) -or
+        $Journal.source_provenance.repo_head -cne $authorityState.repo_head -or
+        $Journal.source_provenance.runner_sha256 -cne $authorityState.runner_sha -or
+        $Journal.source_provenance.behavior_sha -cne $authorityState.behavior_sha) {
+        New-Failure "RestartCalibration journal authority does not match the preserved source state"
+    }
+    return $expectedPaths
+}
+
+function Assert-SourceStateIdentity {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$StatePathValue,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Expected
+    )
+
+    if (-not (Test-Path -LiteralPath $StatePathValue -PathType Leaf)) {
+        New-Failure "RestartCalibration source state is missing"
+    }
+    $item = Get-Item -LiteralPath $StatePathValue
+    if ((Get-Sha256Hex -Path $StatePathValue) -cne $Expected.sha256 -or
+        [int64]$item.Length -ne [int64]$Expected.size -or
+        (Format-UtcTimestamp -Value $item.LastWriteTimeUtc) -cne $Expected.mtime_utc) {
+        New-Failure "RestartCalibration source state identity changed"
+    }
+}
+
+function Assert-ExactRestartCandidate {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$State,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Plan,
+
+        [Parameter(Mandatory = $true)]
+        [string]$StatePathValue
+    )
+
+    $issues = @(Get-StateValidationIssues -State $State -Plan $Plan)
+    if ($issues.Count -gt 0) {
+        New-Failure ("INVALID_OR_UNCERTAIN_STATE: " + ($issues -join ", "))
+    }
+    Assert-StateIdentity -State $State
+    Assert-StateProvenance -State $State -StatePathValue $StatePathValue -Plan $Plan -AllowRestartCandidate
+    Assert-RepoAndEnvGuards -Plan $Plan
+    Assert-ImmutableManifestAndBackups -Plan $Plan
+    if ($State.classification -cne "VALID_FRESH_CALIBRATION" -or
+        $State.next_stage -cne "MapLeft" -or
+        @($State.completed_stages).Count -ne 1 -or
+        [string]$State.completed_stages[0] -cne "Calibrate") {
+        New-Failure "RestartCalibration permits only exact completed stages [Calibrate] with next_stage MapLeft"
+    }
+    if (@($State.failed_stages).Count -ne 0 -or
+        $State.stages.MapLeft.result -cne "pending" -or
+        $State.stages.MapRight.result -cne "pending" -or
+        $State.stages.Verify.result -cne "pending") {
+        New-Failure "RestartCalibration refuses a mapped, verified, or failed session"
+    }
+    foreach ($artifact in @("map_left", "map_right")) {
+        if (-not [string]::IsNullOrEmpty([string]$State.artifacts[$artifact].sha256) -or
+            (Test-Path -LiteralPath $State.artifacts[$artifact].path)) {
+            New-Failure "RestartCalibration refuses because mapping has begun"
+        }
+    }
+    Assert-EvidenceAndCalibrationStillMatch -State $State -Plan $Plan
+}
+
+function New-RejectedArchiveStaging {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Journal,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Plan
+    )
+
+    Assert-PathMissing -Path $Journal.archive_path
+    Ensure-ParentDirectory -Path $Journal.archive_path
+    if (-not (Test-Path -LiteralPath $Journal.archive_staging_path)) {
+        [void][System.IO.Directory]::CreateDirectory($Journal.archive_staging_path)
+    }
+    $stagingItem = Get-Item -LiteralPath $Journal.archive_staging_path -Force
+    if ($stagingItem -isnot [System.IO.DirectoryInfo] -or
+        ($stagingItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        New-Failure "RestartCalibration archive staging path is not a regular directory"
+    }
+    $leftName = [System.IO.Path]::GetFileName([string]$Plan.calibration.left.path)
+    $rightName = [System.IO.Path]::GetFileName([string]$Plan.calibration.right.path)
+    $stateName = [System.IO.Path]::GetFileName([string]$Journal.state_path)
+    $sourceState = Read-JsonFile -Path $Journal.state_path
+    $transcriptSource = [string]$sourceState.artifacts.transcript.path
+    $evidenceSource = [string]$sourceState.artifacts.evidence.path
+    $manifestSource = [string]$Plan.manifest.path
+    $copies = [ordered]@{
+        left_calibration = [ordered]@{
+            source = [string]$Plan.calibration.left.path
+            relative = Join-Path "rejected-calibration" $leftName
+        }
+        right_calibration = [ordered]@{
+            source = [string]$Plan.calibration.right.path
+            relative = Join-Path "rejected-calibration" $rightName
+        }
+        transcript = [ordered]@{
+            source = $transcriptSource
+            relative = Join-Path "transcript" ([System.IO.Path]::GetFileName($transcriptSource))
+        }
+        evidence = [ordered]@{
+            source = $evidenceSource
+            relative = Join-Path "evidence" ([System.IO.Path]::GetFileName($evidenceSource))
+        }
+        state = [ordered]@{
+            source = [string]$Journal.state_path
+            relative = Join-Path "state-snapshot" $stateName
+        }
+    }
+    $manifestRelative = Join-Path "immutable-backup" ([System.IO.Path]::GetFileName($manifestSource))
+    $recordPath = Join-Path $Journal.archive_staging_path "archive-record.json"
+    $allowedFiles = @("archive-record.json", "archive-record.json.restart-durable.tmp")
+    $allowedDirectories = @()
+    foreach ($copy in $copies.Values) {
+        $allowedFiles += @($copy.relative, "$($copy.relative).restart-copy.tmp")
+        $allowedDirectories += [System.IO.Path]::GetDirectoryName([string]$copy.relative)
+    }
+    $allowedFiles += @($manifestRelative, "$manifestRelative.restart-copy.tmp")
+    $allowedDirectories += [System.IO.Path]::GetDirectoryName($manifestRelative)
+    foreach ($entry in @(Get-ChildItem -LiteralPath $Journal.archive_staging_path -Recurse -Force)) {
+        $relative = [System.IO.Path]::GetRelativePath($Journal.archive_staging_path, $entry.FullName)
+        if (($entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            New-Failure "RestartCalibration archive staging contains a reparse point: $($entry.FullName)"
+        }
+        if ($entry -is [System.IO.DirectoryInfo]) {
+            if ($allowedDirectories -cnotcontains $relative) {
+                New-Failure "RestartCalibration archive staging contains an unexpected directory: $relative"
+            }
+        }
+        elseif ($entry -isnot [System.IO.FileInfo] -or $allowedFiles -cnotcontains $relative) {
+            New-Failure "RestartCalibration archive staging contains an unexpected file: $relative"
+        }
+    }
+    $artifactRecords = [ordered]@{}
+    $copyIndex = 0
+    foreach ($name in $copies.Keys) {
+        $stagedPath = Join-Path $Journal.archive_staging_path $copies[$name].relative
+        $publishedPath = Join-Path $Journal.archive_path $copies[$name].relative
+        Copy-RestartStagedFile -Source $copies[$name].source -Destination $stagedPath -Plan $Plan
+        $artifactRecords[$name] = Get-ArchiveArtifactRecord -Source $copies[$name].source -StagedPath $stagedPath -PublishedPath $publishedPath
+        $copyIndex++
+        if ($copyIndex -eq 1) {
+            Test-RestartFailurePoint -Plan $Plan -Point "after_first_archive_copy"
+        }
+    }
+    $stagedManifest = Join-Path $Journal.archive_staging_path $manifestRelative
+    Copy-RestartStagedFile -Source $manifestSource -Destination $stagedManifest -Plan $Plan
+    $record = [ordered]@{
+        schema_version       = "1"
+        record_type          = "packet2n-r5-rejected-calibration"
+        reason               = $RestartRejectionReason
+        archive_path         = $Journal.archive_path
+        archive_created_utc  = [DateTime]::UtcNow.ToString("o")
+        session_id           = $Journal.session_id
+        session_start_utc    = $Journal.session_start_utc
+        state_binding_sha256 = $Journal.state_binding_sha256
+        source_provenance    = $Journal.source_provenance
+        recovery_provenance  = $Journal.recovery_provenance
+        immutable_backup     = [ordered]@{
+            manifest = [ordered]@{
+                source_path       = $manifestSource
+                archive_path      = Join-Path $Journal.archive_path $manifestRelative
+                sha256            = Get-Sha256Hex -Path $stagedManifest
+                size              = [int64](Get-Item -LiteralPath $stagedManifest).Length
+                source_mtime_utc  = Get-FileTimestampUtc -Path $manifestSource
+                archive_mtime_utc = Get-FileTimestampUtc -Path $stagedManifest
+            }
+            left = [ordered]@{
+                path             = $Plan.calibration.left.backup_path
+                sha256           = $Plan.calibration.left.backup_sha256
+                size             = [int64]$Plan.calibration.left.backup_size
+                source_mtime_utc = $Plan.calibration.left.source_mtime_utc
+            }
+            right = [ordered]@{
+                path             = $Plan.calibration.right.backup_path
+                sha256           = $Plan.calibration.right.backup_sha256
+                size             = [int64]$Plan.calibration.right.backup_size
+                source_mtime_utc = $Plan.calibration.right.source_mtime_utc
+            }
+        }
+        artifacts            = $artifactRecords
+        transcript_validation = Get-RestartTranscriptValidationPayload `
+            -State $sourceState `
+            -StatePathValue ([string]$Journal.state_path) `
+            -Plan $Plan `
+            -TranscriptSha256 ([string]$artifactRecords.transcript.sha256)
+    }
+    if (-not (Test-Path -LiteralPath $recordPath)) {
+        Write-RestartJsonDurable -Path $recordPath -Value $record -Plan $Plan
+    }
+    elseif (Test-Path -LiteralPath "$recordPath.restart-durable.tmp") {
+        $recordTempItem = Get-Item -LiteralPath "$recordPath.restart-durable.tmp" -Force
+        if ($recordTempItem -isnot [System.IO.FileInfo] -or
+            ($recordTempItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            New-Failure "RestartCalibration archive record durable temp is invalid"
+        }
+        [System.IO.File]::Delete("$recordPath.restart-durable.tmp")
+    }
+    [void](Assert-RejectedArchiveCore -ActualRoot $Journal.archive_staging_path -PublishedRoot $Journal.archive_path -Plan $Plan -ExpectedStatePath ([string]$Journal.state_path))
+    Test-RestartFailurePoint -Plan $Plan -Point "after_archive_record_write"
+    return Get-Sha256Hex -Path $recordPath
+}
+
+function Get-ArchiveActualPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$PublishedPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$PublishedRoot,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ActualRoot
+    )
+
+    if (-not (Test-PathIsSameOrDescendant -Path $PublishedPath -Root $PublishedRoot)) {
+        New-Failure "Rejected archive artifact path escaped its archive"
+    }
+    $relative = [System.IO.Path]::GetRelativePath($PublishedRoot, $PublishedPath)
+    return Join-Path $ActualRoot $relative
+}
+
+function Assert-RejectedArchiveNamespace {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ActualRoot,
+
+        [Parameter(Mandatory = $true)]
+        [string]$PublishedRoot
+    )
+
+    if (-not (Test-Path -LiteralPath $ActualRoot)) {
+        New-Failure "Rejected archive root is missing"
+    }
+    $rootItem = Get-Item -LiteralPath $ActualRoot -Force
+    if (($rootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        New-Failure "Rejected archive root contains a reparse point: $ActualRoot"
+    }
+    if ($rootItem -isnot [System.IO.DirectoryInfo]) {
+        New-Failure "Rejected archive root is not a regular directory: $ActualRoot"
+    }
+    $isPublished = [System.IO.Path]::GetFullPath($ActualRoot).Equals(
+        [System.IO.Path]::GetFullPath($PublishedRoot),
+        [System.StringComparison]::OrdinalIgnoreCase
+    )
+    $requiredDirectories = @(
+        "rejected-calibration", "transcript", "evidence", "state-snapshot", "immutable-backup"
+    )
+    $allowedDirectories = @($requiredDirectories)
+    if ($isPublished) {
+        $allowedDirectories += @("retired-active-calibration", "retired-state")
+    }
+    $allowedRootFiles = @("archive-record.json")
+    if ($isPublished) {
+        $allowedRootFiles += @("restart-receipt.json", "restart-receipt.json.restart-durable.tmp")
+    }
+    $receiptNamespaceCount = 0
+    $fileCountRules = [ordered]@{
+        "rejected-calibration" = [ordered]@{ minimum = 2; maximum = 2; count = 0 }
+        "transcript"           = [ordered]@{ minimum = 1; maximum = 1; count = 0 }
+        "evidence"             = [ordered]@{ minimum = 1; maximum = 1; count = 0 }
+        "state-snapshot"       = [ordered]@{ minimum = 1; maximum = 1; count = 0 }
+        "immutable-backup"     = [ordered]@{ minimum = 1; maximum = 1; count = 0 }
+    }
+    if ($isPublished) {
+        $fileCountRules["retired-active-calibration"] = [ordered]@{ minimum = 0; maximum = 2; count = 0 }
+        $fileCountRules["retired-state"] = [ordered]@{ minimum = 0; maximum = 1; count = 0 }
+    }
+    foreach ($entry in @(Get-ChildItem -LiteralPath $ActualRoot -Recurse -Force)) {
+        $relative = [System.IO.Path]::GetRelativePath($ActualRoot, $entry.FullName)
+        if (($entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            New-Failure "Rejected archive contains a reparse point: $relative"
+        }
+        if ($entry -is [System.IO.DirectoryInfo]) {
+            if ($allowedDirectories -cnotcontains $relative) {
+                New-Failure "Rejected archive contains an unexpected directory: $relative"
+            }
+            continue
+        }
+        if ($entry -isnot [System.IO.FileInfo]) {
+            New-Failure "Rejected archive contains a non-regular entry: $relative"
+        }
+        $parent = [System.IO.Path]::GetDirectoryName($relative)
+        if ([string]::IsNullOrEmpty($parent)) {
+            if ($allowedRootFiles -cnotcontains $relative) {
+                New-Failure "Rejected archive contains an unexpected file: $relative"
+            }
+            if ($relative.StartsWith("restart-receipt.json", [System.StringComparison]::Ordinal)) {
+                $receiptNamespaceCount++
+            }
+            continue
+        }
+        if (-not $fileCountRules.Contains($parent)) {
+            New-Failure "Rejected archive contains an unexpected file: $relative"
+        }
+        $fileCountRules[$parent].count = [int]$fileCountRules[$parent].count + 1
+    }
+    foreach ($directory in $requiredDirectories) {
+        $directoryPath = Join-Path $ActualRoot $directory
+        if (-not (Test-Path -LiteralPath $directoryPath -PathType Container)) {
+            New-Failure "Rejected archive required directory is missing or has the wrong type: $directory"
+        }
+    }
+    foreach ($directory in $fileCountRules.Keys) {
+        $rule = $fileCountRules[$directory]
+        if ([int]$rule.count -lt [int]$rule.minimum -or [int]$rule.count -gt [int]$rule.maximum) {
+            New-Failure "Rejected archive directory has an unexpected file count: $directory"
+        }
+    }
+    if ($receiptNamespaceCount -gt 1) {
+        New-Failure "Rejected archive receipt namespace contains conflicting files"
+    }
+}
+
+function Assert-RejectedArchiveExactNamespace {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ActualRoot,
+
+        [Parameter(Mandatory = $true)]
+        [string]$PublishedRoot,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$ExpectedRelativeFiles
+    )
+
+    $isPublished = [System.IO.Path]::GetFullPath($ActualRoot).Equals(
+        [System.IO.Path]::GetFullPath($PublishedRoot),
+        [System.StringComparison]::OrdinalIgnoreCase
+    )
+    $expectedDirectories = @(
+        "rejected-calibration", "transcript", "evidence", "state-snapshot", "immutable-backup"
+    )
+    $expectedFiles = @(
+        "archive-record.json",
+        [string]$ExpectedRelativeFiles.left_calibration,
+        [string]$ExpectedRelativeFiles.right_calibration,
+        [string]$ExpectedRelativeFiles.transcript,
+        [string]$ExpectedRelativeFiles.evidence,
+        [string]$ExpectedRelativeFiles.state,
+        [string]$ExpectedRelativeFiles.manifest
+    )
+    if ($isPublished) {
+        $retiredPairDirectory = Join-Path $ActualRoot "retired-active-calibration"
+        if (Test-Path -LiteralPath $retiredPairDirectory) {
+            $expectedDirectories += "retired-active-calibration"
+            $expectedFiles += @(
+                (Join-Path "retired-active-calibration" ([System.IO.Path]::GetFileName([string]$ExpectedRelativeFiles.left_calibration))),
+                (Join-Path "retired-active-calibration" ([System.IO.Path]::GetFileName([string]$ExpectedRelativeFiles.right_calibration)))
+            ) | Where-Object { Test-Path -LiteralPath (Join-Path $ActualRoot $_) }
+        }
+        $retiredStateDirectory = Join-Path $ActualRoot "retired-state"
+        if (Test-Path -LiteralPath $retiredStateDirectory) {
+            $expectedDirectories += "retired-state"
+            $retiredStateRelative = Join-Path "retired-state" ([System.IO.Path]::GetFileName([string]$ExpectedRelativeFiles.state))
+            if (Test-Path -LiteralPath (Join-Path $ActualRoot $retiredStateRelative)) {
+                $expectedFiles += $retiredStateRelative
+            }
+        }
+        foreach ($receiptName in @("restart-receipt.json", "restart-receipt.json.restart-durable.tmp")) {
+            if (Test-Path -LiteralPath (Join-Path $ActualRoot $receiptName)) {
+                $expectedFiles += $receiptName
+            }
+        }
+    }
+
+    $actualDirectories = @()
+    $actualFiles = @()
+    foreach ($entry in @(Get-ChildItem -LiteralPath $ActualRoot -Recurse -Force)) {
+        $relative = [System.IO.Path]::GetRelativePath($ActualRoot, $entry.FullName)
+        if (($entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            New-Failure "Rejected archive contains a reparse point: $relative"
+        }
+        if ($entry -is [System.IO.DirectoryInfo]) {
+            $actualDirectories += $relative
+        }
+        elseif ($entry -is [System.IO.FileInfo]) {
+            $actualFiles += $relative
+        }
+        else {
+            New-Failure "Rejected archive contains a non-regular entry: $relative"
+        }
+    }
+    if ($actualDirectories.Count -ne $expectedDirectories.Count -or $actualFiles.Count -ne $expectedFiles.Count) {
+        New-Failure "Rejected archive namespace is not the exact derived layout"
+    }
+    foreach ($relative in $actualDirectories) {
+        if ($expectedDirectories -cnotcontains $relative) {
+            New-Failure "Rejected archive contains an unexpected directory: $relative"
+        }
+    }
+    foreach ($relative in $actualFiles) {
+        if ($expectedFiles -cnotcontains $relative) {
+            New-Failure "Rejected archive contains an unexpected file: $relative"
+        }
+    }
+}
+
+function Assert-RejectedArchiveCore {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ActualRoot,
+
+        [Parameter(Mandatory = $true)]
+        [string]$PublishedRoot,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Plan,
+
+        [string]$ExpectedRecordSha256,
+
+        [string]$ExpectedStatePath
+    )
+
+    Assert-RejectedArchiveNamespace -ActualRoot $ActualRoot -PublishedRoot $PublishedRoot
+    $recordPath = Join-Path $ActualRoot "archive-record.json"
+    if (-not (Test-Path -LiteralPath $recordPath -PathType Leaf)) {
+        New-Failure "Rejected archive record is missing"
+    }
+    if (-not [string]::IsNullOrEmpty($ExpectedRecordSha256) -and (Get-Sha256Hex -Path $recordPath) -cne $ExpectedRecordSha256) {
+        New-Failure "Rejected archive record hash mismatch"
+    }
+    $stateSnapshotEntries = @(Get-ChildItem -LiteralPath (Join-Path $ActualRoot "state-snapshot") -Force)
+    if ($stateSnapshotEntries.Count -ne 1 -or
+        $stateSnapshotEntries[0] -isnot [System.IO.FileInfo] -or
+        ($stateSnapshotEntries[0].Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        New-Failure "Rejected archive state snapshot layout is invalid"
+    }
+    $actualStatePath = $stateSnapshotEntries[0].FullName
+    $archivedState = Read-JsonFile -Path $actualStatePath
+    $logicalStatePath = if ([string]::IsNullOrEmpty($ExpectedStatePath)) { [string]$archivedState.state_path } else { $ExpectedStatePath }
+    if ($archivedState.state_path -cne $logicalStatePath -or
+        -not (Test-PathIsSameOrDescendant -Path $logicalStatePath -Root ([string]$Plan.state_root)) -or
+        $stateSnapshotEntries[0].Name -cne [System.IO.Path]::GetFileName($logicalStatePath)) {
+        New-Failure "Rejected archive state snapshot source path is invalid"
+    }
+    $expectedArchivePath = Join-Path ([string]$Plan.rejected_archive_root) "packet2n-r5-rejected-$($archivedState.session_id)"
+    if ($PublishedRoot -cne $expectedArchivePath) {
+        New-Failure "Rejected archive path is not derived from its archived session"
+    }
+    $reservedArtifacts = Get-ReservedArtifactPaths -Plan $Plan -SessionId ([string]$archivedState.session_id)
+    $expectedRelativeFiles = @{
+        left_calibration  = Join-Path "rejected-calibration" ([System.IO.Path]::GetFileName([string]$Plan.calibration.left.path))
+        right_calibration = Join-Path "rejected-calibration" ([System.IO.Path]::GetFileName([string]$Plan.calibration.right.path))
+        transcript        = Join-Path "transcript" ([System.IO.Path]::GetFileName([string]$reservedArtifacts.transcript))
+        evidence          = Join-Path "evidence" ([System.IO.Path]::GetFileName([string]$reservedArtifacts.evidence))
+        state             = Join-Path "state-snapshot" ([System.IO.Path]::GetFileName($logicalStatePath))
+        manifest          = Join-Path "immutable-backup" ([System.IO.Path]::GetFileName([string]$Plan.manifest.path))
+    }
+    Assert-RejectedArchiveExactNamespace -ActualRoot $ActualRoot -PublishedRoot $PublishedRoot -ExpectedRelativeFiles $expectedRelativeFiles
+
+    $record = Read-JsonFile -Path $recordPath
+    Assert-ExactKeySet `
+        -Value $record `
+        -ExpectedKeys @(
+            "schema_version", "record_type", "reason", "archive_path", "archive_created_utc",
+            "session_id", "session_start_utc", "state_binding_sha256", "source_provenance",
+            "recovery_provenance", "immutable_backup", "artifacts", "transcript_validation"
+        ) `
+        -Message "Rejected archive record schema is invalid"
+    Assert-ExactKeySet -Value $record.source_provenance -ExpectedKeys @("repo_head", "runner_sha256", "behavior_sha") -Message "Rejected archive source provenance schema is invalid"
+    Assert-ExactKeySet -Value $record.recovery_provenance -ExpectedKeys @("repo_head", "runner_sha256", "behavior_sha") -Message "Rejected archive recovery provenance schema is invalid"
+    Assert-ExactKeySet -Value $record.immutable_backup -ExpectedKeys @("manifest", "left", "right") -Message "Rejected archive immutable-backup schema is invalid"
+    Assert-ExactKeySet -Value $record.immutable_backup.manifest -ExpectedKeys @("source_path", "archive_path", "sha256", "size", "source_mtime_utc", "archive_mtime_utc") -Message "Rejected archive manifest schema is invalid"
+    foreach ($side in @("left", "right")) {
+        Assert-ExactKeySet -Value $record.immutable_backup[$side] -ExpectedKeys @("path", "sha256", "size", "source_mtime_utc") -Message "Rejected archive immutable $side schema is invalid"
+    }
+    Assert-ExactKeySet -Value $record.artifacts -ExpectedKeys @("left_calibration", "right_calibration", "transcript", "evidence", "state") -Message "Rejected archive artifacts schema is invalid"
+    Assert-ExactKeySet `
+        -Value $record.transcript_validation `
+        -ExpectedKeys @("header_valid", "hash_and_size_valid", "final_terminator_valid", "native_calibration_output_evaluation", "body_contains_native_calibration_output", "limitation") `
+        -Message "Rejected archive transcript-validation schema is invalid"
+    $expectedTranscriptValidation = Get-RestartTranscriptValidationPayload `
+        -State $archivedState `
+        -StatePathValue $logicalStatePath `
+        -Plan $Plan `
+        -TranscriptSha256 ([string]$archivedState.artifacts.transcript.sha256) `
+        -StateIdentityPath $actualStatePath
+    if ($record.schema_version -cne "1" -or
+        $record.record_type -cne "packet2n-r5-rejected-calibration" -or
+        $record.reason -cne $RestartRejectionReason -or
+        $record.archive_path -cne $PublishedRoot -or
+        -not (Test-IsUtcTimestamp -Value $record.archive_created_utc) -or
+        -not (Test-IsUtcTimestamp -Value $record.session_start_utc) -or
+        [string]::IsNullOrEmpty([string]$record.session_id) -or
+        -not (Test-IsSha256Hex -Value $record.state_binding_sha256) -or
+        -not (Test-IsSha256Hex -Value $record.source_provenance.runner_sha256) -or
+        -not (Test-IsSha256Hex -Value $record.recovery_provenance.runner_sha256) -or
+        [string]::IsNullOrWhiteSpace([string]$record.source_provenance.behavior_sha) -or
+        [string]::IsNullOrWhiteSpace([string]$record.recovery_provenance.behavior_sha) -or
+        -not (Test-ExactValue -Actual $record.transcript_validation -Expected $expectedTranscriptValidation)) {
+        New-Failure "Rejected archive record identity is invalid"
+    }
+    $expectedSourcePaths = @{
+        left_calibration  = [string]$Plan.calibration.left.path
+        right_calibration = [string]$Plan.calibration.right.path
+        transcript        = [string]$reservedArtifacts.transcript
+        evidence          = [string]$reservedArtifacts.evidence
+        state             = $logicalStatePath
+    }
+    foreach ($name in @("left_calibration", "right_calibration", "transcript", "evidence", "state")) {
+        if (@($record.artifacts.Keys) -cnotcontains $name) {
+            New-Failure "Rejected archive artifact record is missing: $name"
+        }
+        $artifact = $record.artifacts[$name]
+        Assert-ExactKeySet -Value $artifact -ExpectedKeys @("source_path", "archive_path", "sha256", "size", "source_mtime_utc", "archive_mtime_utc") -Message "Rejected archive artifact schema is invalid: $name"
+        $expectedArchiveArtifactPath = Join-Path $PublishedRoot ([string]$expectedRelativeFiles[$name])
+        $actualPath = Join-Path $ActualRoot ([string]$expectedRelativeFiles[$name])
+        if ($artifact.source_path -cne $expectedSourcePaths[$name] -or
+            $artifact.archive_path -cne $expectedArchiveArtifactPath -or
+            -not (Test-Path -LiteralPath $actualPath -PathType Leaf) -or
+            -not (Test-IsSha256Hex -Value $artifact.sha256) -or
+            -not (Test-IsUtcTimestamp -Value $artifact.source_mtime_utc) -or
+            -not (Test-IsUtcTimestamp -Value $artifact.archive_mtime_utc) -or
+            (Get-Sha256Hex -Path $actualPath) -cne $artifact.sha256 -or
+            [int64](Get-Item -LiteralPath $actualPath).Length -ne [int64]$artifact.size -or
+            (Get-FileTimestampUtc -Path $actualPath) -cne $artifact.archive_mtime_utc -or
+            (@("transcript", "evidence") -ccontains $name -and
+                $artifact.source_mtime_utc -cne (Get-FileTimestampUtc -Path $actualPath)) -or
+            [string]::IsNullOrEmpty([string]$artifact.source_mtime_utc)) {
+            New-Failure "Rejected archive artifact identity mismatch: $name"
+        }
+    }
+    $manifest = $record.immutable_backup.manifest
+    $actualManifest = Join-Path $ActualRoot ([string]$expectedRelativeFiles.manifest)
+    $sourceManifestItem = Get-Item -LiteralPath $Plan.manifest.path -Force
+    if ($manifest.source_path -cne $Plan.manifest.path -or
+        $manifest.archive_path -cne (Join-Path $PublishedRoot ([string]$expectedRelativeFiles.manifest)) -or
+        -not (Test-Path -LiteralPath $actualManifest -PathType Leaf) -or
+        -not (Test-IsSha256Hex -Value $manifest.sha256) -or
+        -not (Test-IsUtcTimestamp -Value $manifest.source_mtime_utc) -or
+        -not (Test-IsUtcTimestamp -Value $manifest.archive_mtime_utc) -or
+        (Get-Sha256Hex -Path $actualManifest) -cne $manifest.sha256 -or
+        $manifest.sha256 -cne $Plan.manifest.sha256 -or
+        [int64](Get-Item -LiteralPath $actualManifest).Length -ne [int64]$manifest.size -or
+        [int64]$manifest.size -ne [int64]$sourceManifestItem.Length -or
+        $manifest.source_mtime_utc -cne (Format-UtcTimestamp -Value $sourceManifestItem.LastWriteTimeUtc) -or
+        (Get-Sha256Hex -Path $Plan.manifest.path) -cne $Plan.manifest.sha256 -or
+        -not (Test-ExactValue -Actual (Read-JsonFile -Path $actualManifest) -Expected (Read-JsonFile -Path $Plan.manifest.path))) {
+        New-Failure "Rejected archive immutable manifest identity mismatch"
+    }
+    foreach ($side in @("left", "right")) {
+        $immutableSide = $record.immutable_backup[$side]
+        if ($immutableSide.path -cne $Plan.calibration[$side].backup_path -or
+            $immutableSide.sha256 -cne $Plan.calibration[$side].backup_sha256 -or
+            [int64]$immutableSide.size -ne [int64]$Plan.calibration[$side].backup_size -or
+            $immutableSide.source_mtime_utc -cne $Plan.calibration[$side].source_mtime_utc) {
+            New-Failure "Rejected archive immutable $side identity is invalid"
+        }
+    }
+    Assert-RestartArchivedStateSchema -State $archivedState
+    $stateIssues = @(Get-StateValidationIssues -State $archivedState -Plan $Plan)
+    if ($stateIssues.Count -gt 0) {
+        New-Failure ("Rejected archive state schema is invalid: " + ($stateIssues -join ", "))
+    }
+    Assert-StateIdentity -State $archivedState
+    Assert-StateProvenance -State $archivedState -StatePathValue $logicalStatePath -Plan $Plan -AllowRestartCandidate -StateIdentityPath $actualStatePath
+    Assert-PreCalibrationMatchesOriginals -State $archivedState -Plan $Plan
+    Assert-PostCalibrationFreshness -State $archivedState -Plan $Plan
+    if ($archivedState.session_id -cne $record.session_id -or
+        $archivedState.utc_start -cne $record.session_start_utc -or
+        $archivedState.session_binding_sha256 -cne $record.state_binding_sha256 -or
+        $archivedState.repo_head -cne $record.source_provenance.repo_head -or
+        $archivedState.runner_sha -cne $record.source_provenance.runner_sha256 -or
+        $archivedState.behavior_sha -cne $record.source_provenance.behavior_sha -or
+        $archivedState.session_binding_sha256 -cne (Get-StateSessionBindingDigest -State $archivedState) -or
+        $archivedState.classification -cne "VALID_FRESH_CALIBRATION" -or
+        $archivedState.next_stage -cne "MapLeft" -or
+        @($archivedState.completed_stages).Count -ne 1 -or
+        [string]$archivedState.completed_stages[0] -cne "Calibrate" -or
+        @($archivedState.failed_stages).Count -ne 0 -or
+        $archivedState.stages.MapLeft.result -cne "pending" -or
+        $archivedState.stages.MapRight.result -cne "pending" -or
+        $archivedState.stages.Verify.result -cne "pending") {
+        New-Failure "Rejected archive record is not bound to its archived source state"
+    }
+    foreach ($side in @("left", "right")) {
+        $artifactName = "${side}_calibration"
+        $artifact = $record.artifacts[$artifactName]
+        $actualCalibrationPath = Join-Path $ActualRoot ([string]$expectedRelativeFiles[$artifactName])
+        $actualCalibration = Read-JsonFile -Path $actualCalibrationPath
+        Assert-CalibrationSchema -Calibration $actualCalibration -Label "archived rejected $side"
+        if ($artifact.sha256 -cne $archivedState.post_calibration[$side].sha256 -or
+            [int64]$artifact.size -ne [int64]$archivedState.post_calibration[$side].size -or
+            $artifact.source_mtime_utc -cne $archivedState.post_calibration[$side].mtime_utc -or
+            -not (Test-ExactValue -Actual $actualCalibration -Expected $archivedState.post_calibration[$side].calibration)) {
+            New-Failure "Rejected archive calibration identity does not match archived state: $side"
+        }
+    }
+    $actualTranscriptPath = Join-Path $ActualRoot ([string]$expectedRelativeFiles.transcript)
+    $actualEvidencePath = Join-Path $ActualRoot ([string]$expectedRelativeFiles.evidence)
+    if ($record.artifacts.transcript.sha256 -cne $archivedState.artifacts.transcript.sha256 -or
+        [int64]$record.artifacts.transcript.size -ne [int64]$archivedState.artifacts.transcript.size -or
+        $record.artifacts.evidence.sha256 -cne $archivedState.artifacts.evidence.sha256 -or
+        [int64]$record.artifacts.evidence.size -ne [int64]$archivedState.artifacts.evidence.size -or
+        $record.artifacts.state.sha256 -cne (Get-Sha256Hex -Path $actualStatePath) -or
+        [int64]$record.artifacts.state.size -ne [int64](Get-Item -LiteralPath $actualStatePath).Length) {
+        New-Failure "Rejected archive artifact identities do not match archived state"
+    }
+    Assert-ArchivedEvidenceSemantics -State $archivedState -Plan $Plan -EvidencePath $actualEvidencePath -TranscriptPath $actualTranscriptPath
+    return $record
+}
+
+function Assert-RejectedArchiveMatchesJournal {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Record,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Journal
+    )
+
+    if ($Record.session_id -cne $Journal.session_id -or
+        $Record.session_start_utc -cne $Journal.session_start_utc -or
+        $Record.state_binding_sha256 -cne $Journal.state_binding_sha256 -or
+        $Record.archive_path -cne $Journal.archive_path -or
+        -not (Test-ExactValue -Actual $Record.source_provenance -Expected $Journal.source_provenance) -or
+        -not (Test-ExactValue -Actual $Record.recovery_provenance -Expected $Journal.recovery_provenance)) {
+        New-Failure "Rejected archive record does not match RestartCalibration journal authority"
+    }
+}
+
+function New-StagedOriginalPair {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Journal,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Plan
+    )
+
+    if (-not (Test-Path -LiteralPath $Journal.staged_original_path)) {
+        [void][System.IO.Directory]::CreateDirectory($Journal.staged_original_path)
+    }
+    $stagedItem = Get-Item -LiteralPath $Journal.staged_original_path -Force
+    if ($stagedItem -isnot [System.IO.DirectoryInfo] -or
+        ($stagedItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        New-Failure "RestartCalibration staged-original path is not a regular directory"
+    }
+    $allowedNames = @()
+    foreach ($side in @("left", "right")) {
+        $name = [System.IO.Path]::GetFileName([string]$Plan.calibration[$side].path)
+        $allowedNames += @($name, "$name.restart-copy.tmp")
+    }
+    foreach ($entry in @(Get-ChildItem -LiteralPath $Journal.staged_original_path -Force)) {
+        if ($entry -isnot [System.IO.FileInfo] -or
+            ($entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+            $allowedNames -cnotcontains $entry.Name) {
+            New-Failure "RestartCalibration staged-original directory contains an unexpected entry"
+        }
+    }
+    $copyIndex = 0
+    foreach ($side in @("left", "right")) {
+        $name = [System.IO.Path]::GetFileName([string]$Plan.calibration[$side].path)
+        $destination = Join-Path $Journal.staged_original_path $name
+        Copy-RestartStagedFile -Source $Plan.calibration[$side].backup_path -Destination $destination -Plan $Plan
+        $expectedTime = [datetime]::Parse($Plan.calibration[$side].source_mtime_utc, $null, [System.Globalization.DateTimeStyles]::RoundtripKind)
+        [System.IO.File]::SetLastWriteTimeUtc($destination, $expectedTime.ToUniversalTime())
+        $copyIndex++
+        if ($copyIndex -eq 1) {
+            Test-RestartFailurePoint -Plan $Plan -Point "after_first_original_copy"
+        }
+    }
+    if ((Get-PairDirectoryLayout -Directory $Journal.staged_original_path -Plan $Plan -FreshIdentities $Journal.source_fresh) -cne "original") {
+        New-Failure "RestartCalibration staged-original pair verification failed"
+    }
+}
+
+function Get-StagedOriginalLayout {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Directory,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Plan,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$FreshIdentities
+    )
+
+    if (-not (Test-Path -LiteralPath $Directory)) {
+        return "missing"
+    }
+    if (-not (Test-Path -LiteralPath $Directory -PathType Container)) {
+        return "unrecognized"
+    }
+    $directoryItem = Get-Item -LiteralPath $Directory -Force
+    if (($directoryItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        return "unrecognized"
+    }
+    $allowedNames = @()
+    foreach ($side in @("left", "right")) {
+        $name = [System.IO.Path]::GetFileName([string]$Plan.calibration[$side].path)
+        $allowedNames += @($name, "$name.restart-copy.tmp")
+    }
+    foreach ($entry in @(Get-ChildItem -LiteralPath $Directory -Force)) {
+        if ($entry -isnot [System.IO.FileInfo] -or
+            ($entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+            $allowedNames -cnotcontains $entry.Name) {
+            return "unrecognized"
+        }
+    }
+    if ((Get-PairDirectoryLayout -Directory $Directory -Plan $Plan -FreshIdentities $FreshIdentities) -ceq "original") {
+        return "original"
+    }
+    return "partial_original"
+}
+
+function Test-RestartFailurePoint {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Plan,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Point
+    )
+
+    if (-not [bool]$Plan.is_test_mode -or -not $Plan.ContainsKey("restart_failure_point")) {
+        return
+    }
+    $allowed = @(
+        "after_initial_journal_temp_flush",
+        "after_first_archive_copy",
+        "after_archive_record_write",
+        "before_archive_publish",
+        "after_archive_namespace_publish",
+        "after_first_original_copy",
+        "after_active_directory_move",
+        "after_original_directory_move",
+        "after_fresh_pair_namespace_publish",
+        "after_state_namespace_publish",
+        "after_receipt_temp_flush",
+        "after_receipt_publish"
+    )
+    if ($allowed -cnotcontains [string]$Plan.restart_failure_point) {
+        New-Failure "Test-mode RestartCalibration failure point is invalid"
+    }
+    if ([string]$Plan.restart_failure_point -ceq $Point) {
+        New-Failure "TEST FAILURE INJECTION: $Point"
+    }
+}
+
+function Get-RestartReceiptPayload {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Journal
+    )
+
+    return [ordered]@{
+        schema_version        = "1"
+        status                = "completed"
+        reason                = $RestartRejectionReason
+        session_id            = $Journal.session_id
+        completed_utc         = [DateTime]::UtcNow.ToString("o")
+        archive_path          = $Journal.archive_path
+        archive_record_sha256 = $Journal.archive_record_sha256
+        active_classification = "ORIGINAL_CALIBRATION_INTACT"
+        next_stage            = "Calibrate"
+        offline               = $true
+        native_stage_truth    = $Journal.native_stage_truth
+        source_provenance     = $Journal.source_provenance
+        recovery_provenance   = $Journal.recovery_provenance
+    }
+}
+
+function Assert-CompletedRejectedArchive {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ArchivePath,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Plan,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ExpectedStatePath
+    )
+
+    $record = Assert-RejectedArchiveCore `
+        -ActualRoot $ArchivePath `
+        -PublishedRoot $ArchivePath `
+        -Plan $Plan `
+        -ExpectedStatePath $ExpectedStatePath
+    $retiredPairPath = Join-Path $ArchivePath "retired-active-calibration"
+    if (-not (Test-Path -LiteralPath $retiredPairPath -PathType Container)) {
+        New-Failure "Rejected archive retired active calibration directory is missing"
+    }
+    $retiredPairItem = Get-Item -LiteralPath $retiredPairPath -Force
+    $retiredPairEntries = @(Get-ChildItem -LiteralPath $retiredPairPath -Force)
+    if (($retiredPairItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        $retiredPairEntries.Count -ne 2) {
+        New-Failure "Rejected archive retired active calibration directory is invalid"
+    }
+    foreach ($name in @("left_calibration", "right_calibration")) {
+        $artifact = $record.artifacts[$name]
+        $expectedName = [System.IO.Path]::GetFileName([string]$artifact.source_path)
+        $matches = @($retiredPairEntries | Where-Object { $_.Name -ceq $expectedName })
+        if ($matches.Count -ne 1 -or
+            $matches[0] -isnot [System.IO.FileInfo] -or
+            ($matches[0].Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+            (Get-Sha256Hex -Path $matches[0].FullName) -cne $artifact.sha256 -or
+            [int64]$matches[0].Length -ne [int64]$artifact.size -or
+            (Format-UtcTimestamp -Value $matches[0].LastWriteTimeUtc) -cne $artifact.source_mtime_utc) {
+            New-Failure "Rejected archive retired active calibration identity mismatch: $name"
+        }
+    }
+    $retiredStateDirectory = Join-Path $ArchivePath "retired-state"
+    if (-not (Test-Path -LiteralPath $retiredStateDirectory -PathType Container)) {
+        New-Failure "Rejected archive retired state directory is missing"
+    }
+    $retiredStateDirectoryItem = Get-Item -LiteralPath $retiredStateDirectory -Force
+    $retiredStateEntries = @(Get-ChildItem -LiteralPath $retiredStateDirectory -Force)
+    $stateArtifact = $record.artifacts.state
+    $expectedStateName = [System.IO.Path]::GetFileName([string]$stateArtifact.source_path)
+    if (($retiredStateDirectoryItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        $retiredStateEntries.Count -ne 1 -or
+        $retiredStateEntries[0] -isnot [System.IO.FileInfo] -or
+        $retiredStateEntries[0].Name -cne $expectedStateName -or
+        ($retiredStateEntries[0].Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        (Get-Sha256Hex -Path $retiredStateEntries[0].FullName) -cne $stateArtifact.sha256 -or
+        [int64]$retiredStateEntries[0].Length -ne [int64]$stateArtifact.size -or
+        (Format-UtcTimestamp -Value $retiredStateEntries[0].LastWriteTimeUtc) -cne $stateArtifact.source_mtime_utc) {
+        New-Failure "Rejected archive retired state identity mismatch"
+    }
+    $receiptPath = Join-Path $ArchivePath "restart-receipt.json"
+    $receipt = Read-JsonFile -Path $receiptPath
+    Assert-ExactKeySet `
+        -Value $receipt `
+        -ExpectedKeys @(
+            "schema_version", "status", "reason", "session_id", "completed_utc", "archive_path",
+            "archive_record_sha256", "active_classification", "next_stage", "offline",
+            "native_stage_truth", "source_provenance", "recovery_provenance"
+        ) `
+        -Message "Rejected archive receipt schema is invalid"
+    Assert-ExactKeySet -Value $receipt.native_stage_truth -ExpectedKeys @("Calibrate", "MapLeft", "MapRight", "Verify") -Message "Rejected archive receipt native-stage schema is invalid"
+    Assert-ExactKeySet -Value $receipt.source_provenance -ExpectedKeys @("repo_head", "runner_sha256", "behavior_sha") -Message "Rejected archive receipt source provenance schema is invalid"
+    Assert-ExactKeySet -Value $receipt.recovery_provenance -ExpectedKeys @("repo_head", "runner_sha256", "behavior_sha") -Message "Rejected archive receipt recovery provenance schema is invalid"
+    $actualStatePath = Get-ArchiveActualPath -PublishedPath $record.artifacts.state.archive_path -PublishedRoot $ArchivePath -ActualRoot $ArchivePath
+    $archivedState = Read-JsonFile -Path $actualStatePath
+    if ($receipt.schema_version -cne "1" -or
+        $receipt.status -cne "completed" -or
+        $receipt.reason -cne $RestartRejectionReason -or
+        $receipt.session_id -cne $record.session_id -or
+        -not (Test-IsUtcTimestamp -Value $receipt.completed_utc) -or
+        [DateTimeOffset]::Parse([string]$receipt.completed_utc, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind) -lt [DateTimeOffset]::Parse([string]$record.archive_created_utc, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind) -or
+        $receipt.archive_path -cne $ArchivePath -or
+        $receipt.archive_record_sha256 -cne (Get-Sha256Hex -Path (Join-Path $ArchivePath "archive-record.json")) -or
+        $receipt.active_classification -cne "ORIGINAL_CALIBRATION_INTACT" -or
+        $receipt.next_stage -cne "Calibrate" -or
+        $receipt.offline -ne $true -or
+        -not (Test-ExactValue -Actual $receipt.native_stage_truth -Expected $archivedState.stages) -or
+        -not (Test-ExactValue -Actual $receipt.source_provenance -Expected $record.source_provenance) -or
+        -not (Test-ExactValue -Actual $receipt.recovery_provenance -Expected $record.recovery_provenance) -or
+        $receipt.source_provenance.repo_head -cne $archivedState.repo_head -or
+        $receipt.source_provenance.runner_sha256 -cne $archivedState.runner_sha -or
+        $receipt.source_provenance.behavior_sha -cne $archivedState.behavior_sha -or
+        $receipt.recovery_provenance.repo_head -cne $Plan.head -or
+        $receipt.recovery_provenance.runner_sha256 -cne (Get-RunnerSha256) -or
+        $receipt.recovery_provenance.behavior_sha -cne $BehaviorBaseline) {
+        New-Failure "Rejected archive receipt is invalid"
+    }
+    return [ordered]@{
+        archive_path = $ArchivePath
+        reason       = $record.reason
+        session_id   = $record.session_id
+        verified     = $true
+    }
+}
+
+function Get-VerifiedRejectedArchiveRecords {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Plan,
+
+        [Parameter(Mandatory = $true)]
+        [string]$StatePathValue
+    )
+
+    $root = [string]$Plan.rejected_archive_root
+    if (-not (Test-Path -LiteralPath $root)) {
+        return @()
+    }
+    if (-not (Test-Path -LiteralPath $root -PathType Container)) {
+        New-Failure "Rejected archive root is not a directory"
+    }
+    Assert-RestartPathConfined -Path $root -Root $root -Label "rejected archive root"
+    $archiveEntries = @(Get-ChildItem -LiteralPath $root -Force | Where-Object {
+        $_.Name.StartsWith("packet2n-r5-rejected-", [System.StringComparison]::Ordinal)
+    })
+    foreach ($entry in $archiveEntries) {
+        if (($entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            New-Failure "Rejected archive entry is a reparse point: $($entry.FullName)"
+        }
+        if ($entry -isnot [System.IO.DirectoryInfo]) {
+            New-Failure "Rejected archive entry has the wrong path type: $($entry.FullName)"
+        }
+        if ($entry.Name.EndsWith(".staging", [System.StringComparison]::Ordinal)) {
+            New-Failure "Rejected archive staging directory exists without an active journal: $($entry.FullName)"
+        }
+    }
+    $records = @()
+    foreach ($directory in @($archiveEntries | Sort-Object Name)) {
+        $records += Assert-CompletedRejectedArchive `
+            -ArchivePath $directory.FullName `
+            -Plan $Plan `
+            -ExpectedStatePath $StatePathValue
+    }
+    return @($records)
+}
+
+function Get-RejectedArchiveStagingLayout {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Journal,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Plan,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$AuthorityState
+    )
+
+    $root = [string]$Journal.archive_staging_path
+    if (-not (Test-Path -LiteralPath $root)) {
+        return "missing"
+    }
+    if (-not (Test-Path -LiteralPath $root -PathType Container)) {
+        return "unrecognized"
+    }
+    $rootItem = Get-Item -LiteralPath $root -Force
+    if (($rootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        return "unrecognized"
+    }
+    $relativeFiles = @(
+        (Join-Path "rejected-calibration" ([System.IO.Path]::GetFileName([string]$Plan.calibration.left.path)))
+        (Join-Path "rejected-calibration" ([System.IO.Path]::GetFileName([string]$Plan.calibration.right.path)))
+        (Join-Path "transcript" ([System.IO.Path]::GetFileName([string]$AuthorityState.artifacts.transcript.path)))
+        (Join-Path "evidence" ([System.IO.Path]::GetFileName([string]$AuthorityState.artifacts.evidence.path)))
+        (Join-Path "state-snapshot" ([System.IO.Path]::GetFileName([string]$Journal.state_path)))
+        (Join-Path "immutable-backup" ([System.IO.Path]::GetFileName([string]$Plan.manifest.path)))
+    )
+    $allowedFiles = @("archive-record.json", "archive-record.json.restart-durable.tmp")
+    $allowedDirectories = @()
+    foreach ($relativeFile in $relativeFiles) {
+        $allowedFiles += @($relativeFile, "$relativeFile.restart-copy.tmp")
+        $allowedDirectories += [System.IO.Path]::GetDirectoryName($relativeFile)
+    }
+    foreach ($entry in @(Get-ChildItem -LiteralPath $root -Recurse -Force)) {
+        $relative = [System.IO.Path]::GetRelativePath($root, $entry.FullName)
+        if (($entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            return "unrecognized"
+        }
+        if ($entry -is [System.IO.DirectoryInfo]) {
+            if ($allowedDirectories -cnotcontains $relative) {
+                return "unrecognized"
+            }
+        }
+        elseif ($entry -isnot [System.IO.FileInfo] -or $allowedFiles -cnotcontains $relative) {
+            return "unrecognized"
+        }
+    }
+    $recordPath = Join-Path $root "archive-record.json"
+    if (Test-Path -LiteralPath $recordPath -PathType Leaf) {
+        $record = Assert-RejectedArchiveCore -ActualRoot $root -PublishedRoot $Journal.archive_path -Plan $Plan -ExpectedRecordSha256 ([string]$Journal.archive_record_sha256) -ExpectedStatePath ([string]$Journal.state_path)
+        Assert-RejectedArchiveMatchesJournal -Record $record -Journal $Journal
+        return "complete"
+    }
+    return "partial"
+}
+
+function Get-RetiredStateLayout {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Journal
+    )
+
+    $directory = Join-Path $Journal.archive_path "retired-state"
+    if (-not (Test-Path -LiteralPath $directory)) {
+        return "missing"
+    }
+    if (-not (Test-Path -LiteralPath $directory -PathType Container)) {
+        return "unrecognized"
+    }
+    $directoryItem = Get-Item -LiteralPath $directory -Force
+    if (($directoryItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        New-Failure "RestartCalibration retired state path contains a reparse point"
+    }
+    $entries = @(Get-ChildItem -LiteralPath $directory -Force)
+    if ($entries.Count -eq 0) {
+        return "empty"
+    }
+    $expectedName = [System.IO.Path]::GetFileName([string]$Journal.state_path)
+    if ($entries.Count -eq 1 -and
+        ($entries[0].Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        New-Failure "RestartCalibration retired state file contains a reparse point"
+    }
+    if ($entries.Count -ne 1 -or
+        $entries[0] -isnot [System.IO.FileInfo] -or
+        $entries[0].Name -cne $expectedName -or
+        (Get-Sha256Hex -Path $entries[0].FullName) -cne $Journal.source_state.sha256 -or
+        [int64]$entries[0].Length -ne [int64]$Journal.source_state.size -or
+        (Format-UtcTimestamp -Value $entries[0].LastWriteTimeUtc) -cne $Journal.source_state.mtime_utc) {
+        return "unrecognized"
+    }
+    return "retired"
+}
+
+function Assert-RestartRecoveryLayout {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Journal,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Plan,
+
+        [Parameter(Mandatory = $true)]
+        [string]$StatePathValue
+    )
+
+    $authorityState = Get-RestartAuthorityState -Journal $Journal -Plan $Plan -StatePathValue $StatePathValue
+    $archiveExists = $false
+    if (Test-Path -LiteralPath $Journal.archive_path) {
+        $archiveItem = Get-Item -LiteralPath $Journal.archive_path -Force
+        if (($archiveItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            New-Failure "RestartCalibration archive path contains a reparse point"
+        }
+        if ($archiveItem -isnot [System.IO.DirectoryInfo]) {
+            New-Failure "RestartCalibration archive path has the wrong path type"
+        }
+        $archiveExists = $true
+    }
+    $archiveStagingLayout = Get-RejectedArchiveStagingLayout -Journal $Journal -Plan $Plan -AuthorityState $authorityState
+    if ($archiveExists -and $archiveStagingLayout -cne "missing") {
+        New-Failure "unrecognized RestartCalibration archive layout"
+    }
+    $activeLayout = Get-PairDirectoryLayout -Directory $Journal.active_directory -Plan $Plan -FreshIdentities $Journal.source_fresh
+    $stagedLayout = Get-StagedOriginalLayout -Directory $Journal.staged_original_path -Plan $Plan -FreshIdentities $Journal.source_fresh
+    $rollbackLayout = Get-PairDirectoryLayout -Directory $Journal.rollback_path -Plan $Plan -FreshIdentities $Journal.source_fresh
+    $retiredDirectory = Join-Path $Journal.archive_path "retired-active-calibration"
+    $retiredLayout = Get-PairDirectoryLayout -Directory $retiredDirectory -Plan $Plan -FreshIdentities $Journal.source_fresh
+    $retiredStateLayout = Get-RetiredStateLayout -Journal $Journal
+    $stateExists = Test-Path -LiteralPath $StatePathValue -PathType Leaf
+    $receiptPath = Join-Path $Journal.archive_path "restart-receipt.json"
+    $receiptExists = Test-Path -LiteralPath $receiptPath -PathType Leaf
+    $receiptTempExists = Test-Path -LiteralPath "$receiptPath.restart-durable.tmp" -PathType Leaf
+    $recognized = $false
+    $allowedPhases = @()
+    $establishedPhase = $null
+
+    if (-not $archiveExists) {
+        $recognized = (
+            @("missing", "partial", "complete") -ccontains $archiveStagingLayout -and
+            $activeLayout -ceq "fresh" -and
+            $stagedLayout -ceq "missing" -and
+            $rollbackLayout -ceq "missing" -and
+            $retiredLayout -ceq "missing" -and
+            $retiredStateLayout -ceq "missing" -and
+            $stateExists -and
+            -not $receiptExists -and
+            -not $receiptTempExists
+        )
+        if ($recognized) {
+            if ($archiveStagingLayout -ceq "complete") {
+                $allowedPhases = @("initialized", "archive_staged")
+                $establishedPhase = "archive_staged"
+            }
+            else {
+                $allowedPhases = @("initialized")
+                $establishedPhase = "initialized"
+            }
+        }
+    }
+    else {
+        $record = Assert-RejectedArchiveCore -ActualRoot $Journal.archive_path -PublishedRoot $Journal.archive_path -Plan $Plan -ExpectedRecordSha256 ([string]$Journal.archive_record_sha256) -ExpectedStatePath ([string]$Journal.state_path)
+        Assert-RejectedArchiveMatchesJournal -Record $record -Journal $Journal
+        if ($activeLayout -ceq "fresh" -and @("missing", "partial_original", "original") -ccontains $stagedLayout -and $rollbackLayout -ceq "missing" -and $retiredLayout -ceq "missing" -and $stateExists -and $retiredStateLayout -ceq "missing" -and -not $receiptExists -and -not $receiptTempExists) {
+            $recognized = $true
+            $allowedPhases = if ($stagedLayout -ceq "missing") { @("archive_staged", "archive_published") } else { @("archive_published") }
+            $establishedPhase = "archive_published"
+        }
+        elseif ($activeLayout -ceq "missing" -and $stagedLayout -ceq "original" -and $rollbackLayout -ceq "fresh" -and $retiredLayout -ceq "missing" -and $stateExists -and $retiredStateLayout -ceq "missing" -and -not $receiptExists -and -not $receiptTempExists) {
+            $recognized = $true
+            $allowedPhases = @("archive_published", "active_withdrawn")
+            $establishedPhase = "active_withdrawn"
+        }
+        elseif ($activeLayout -ceq "original" -and $stagedLayout -ceq "missing" -and $rollbackLayout -ceq "fresh" -and $retiredLayout -ceq "missing" -and $stateExists -and $retiredStateLayout -ceq "missing" -and -not $receiptExists -and -not $receiptTempExists) {
+            $recognized = $true
+            $allowedPhases = @("active_withdrawn", "original_activated")
+            $establishedPhase = "original_activated"
+        }
+        elseif ($activeLayout -ceq "original" -and $stagedLayout -ceq "missing" -and $rollbackLayout -ceq "missing" -and $retiredLayout -ceq "fresh" -and $stateExists -and @("missing", "empty") -ccontains $retiredStateLayout -and -not $receiptExists -and -not $receiptTempExists) {
+            $recognized = $true
+            $allowedPhases = @("original_activated", "fresh_pair_retired")
+            $establishedPhase = "fresh_pair_retired"
+        }
+        elseif ($activeLayout -ceq "original" -and $stagedLayout -ceq "missing" -and $rollbackLayout -ceq "missing" -and $retiredLayout -ceq "fresh" -and -not $stateExists -and $retiredStateLayout -ceq "retired") {
+            $recognized = $true
+            $allowedPhases = if ($receiptExists -or $receiptTempExists) { @("state_retired") } else { @("fresh_pair_retired", "state_retired") }
+            $establishedPhase = "state_retired"
+        }
+    }
+    if (-not $recognized) {
+        New-Failure "unrecognized RestartCalibration directory layout"
+    }
+    if ($allowedPhases -cnotcontains [string]$Journal.phase) {
+        New-Failure "RestartCalibration journal phase does not match the recognized physical layout"
+    }
+    if ($archiveExists -and $null -eq $Journal.archive_record_sha256) {
+        New-Failure "RestartCalibration published archive is not bound to the journal record hash"
+    }
+    if (-not $archiveExists -and $archiveStagingLayout -cne "complete" -and $null -ne $Journal.archive_record_sha256) {
+        New-Failure "RestartCalibration partial archive staging has an unexpected journal record hash"
+    }
+    $establishedRecordSha256 = if ($archiveExists) {
+        [string]$Journal.archive_record_sha256
+    }
+    elseif ($archiveStagingLayout -ceq "complete") {
+        Get-Sha256Hex -Path (Join-Path $Journal.archive_staging_path "archive-record.json")
+    }
+    else {
+        $null
+    }
+    return [ordered]@{
+        phase                 = $establishedPhase
+        archive_record_sha256 = $establishedRecordSha256
+    }
+}
+
+function Add-RejectedArchivesToStatus {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Payload,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Plan,
+
+        [Parameter(Mandatory = $true)]
+        [string]$StatePathValue
+    )
+
+    $records = @(Get-VerifiedRejectedArchiveRecords -Plan $Plan -StatePathValue $StatePathValue)
+    if ($records.Count -gt 0) {
+        $Payload.rejected_archives = $records
+    }
+    return $Payload
+}
+
+function Get-IncompleteRestartStatus {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Plan,
+
+        [Parameter(Mandatory = $true)]
+        [string]$StatePathValue
+    )
+
+    $journalPath = Get-RestartJournalPath -StatePathValue $StatePathValue
+    if (-not (Test-Path -LiteralPath $journalPath)) {
+        return $null
+    }
+    try {
+        $journal = Read-JsonFile -Path $journalPath
+        [void](Assert-RestartJournal -Journal $journal -Plan $Plan -StatePathValue $StatePathValue)
+        $layoutAuthority = Assert-RestartRecoveryLayout -Journal $journal -Plan $Plan -StatePathValue $StatePathValue
+        return [ordered]@{
+            classification      = "RESTART_CALIBRATION_RECOVERABLE"
+            next_stage          = "RestartCalibration"
+            report              = "incomplete RestartCalibration transaction; rerun the exact confirmed command"
+            restart_transaction = [ordered]@{
+                journal_path = $journalPath
+                session_id   = $journal.session_id
+                phase        = $layoutAuthority.phase
+                reason       = $journal.reason
+                archive_path = $journal.archive_path
+            }
+        }
+    }
+    catch {
+        return [ordered]@{
+            classification = "INVALID_OR_UNCERTAIN_STATE"
+            next_stage     = $null
+            report         = "RestartCalibration journal is invalid: $($_.Exception.Message)"
+        }
+    }
+}
+
+function Assert-NoIncompleteRestartTransaction {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$StatePathValue
+    )
+
+    $journalPath = Get-RestartJournalPath -StatePathValue $StatePathValue
+    if (Test-Path -LiteralPath $journalPath) {
+        New-Failure "Stage $Stage is blocked by an incomplete RestartCalibration transaction"
+    }
+}
+
+function Invoke-RestartCalibrationStage {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Plan,
+
+        [Parameter(Mandatory = $true)]
+        [string]$StatePathValue
+    )
+
+    $journalPath = Get-RestartJournalPath -StatePathValue $StatePathValue
+    if (Test-Path -LiteralPath $journalPath) {
+        $journal = Read-JsonFile -Path $journalPath
+        $paths = Assert-RestartJournal -Journal $journal -Plan $Plan -StatePathValue $StatePathValue
+        $layoutAuthority = Assert-RestartRecoveryLayout -Journal $journal -Plan $Plan -StatePathValue $StatePathValue
+        if ($journal.phase -cne $layoutAuthority.phase -or
+            [string]$journal.archive_record_sha256 -cne [string]$layoutAuthority.archive_record_sha256) {
+            $journal.phase = $layoutAuthority.phase
+            $journal.archive_record_sha256 = $layoutAuthority.archive_record_sha256
+            Save-RestartJournal -Path $journalPath -Journal $journal -Plan $Plan
+            $journal = Read-JsonFile -Path $journalPath
+            $paths = Assert-RestartJournal -Journal $journal -Plan $Plan -StatePathValue $StatePathValue
+            $revalidatedLayout = Assert-RestartRecoveryLayout -Journal $journal -Plan $Plan -StatePathValue $StatePathValue
+            if ($journal.phase -cne $revalidatedLayout.phase -or
+                [string]$journal.archive_record_sha256 -cne [string]$revalidatedLayout.archive_record_sha256) {
+                New-Failure "RestartCalibration journal reconciliation did not durably match the physical layout"
+            }
+        }
+    }
+    else {
+        $state = Load-State -Path $StatePathValue
+        Assert-ExactRestartCandidate -State $state -Plan $Plan -StatePathValue $StatePathValue
+        $paths = Get-RestartTransactionPaths -Plan $Plan -StatePathValue $StatePathValue -SessionId ([string]$state.session_id)
+        foreach ($path in @($paths.archive, $paths.archive_staging, $paths.staged_original, $paths.rollback)) {
+            Assert-PathMissing -Path $path
+        }
+        $layout = Get-PairDirectoryLayout -Directory $paths.active -Plan $Plan -FreshIdentities $state.post_calibration
+        if ($layout -cne "fresh") {
+            New-Failure "RestartCalibration active directory must contain exactly the verified fresh pair"
+        }
+        $journal = New-RestartJournal -State $state -Plan $Plan -StatePathValue $StatePathValue -Paths $paths
+        Write-RestartJsonDurable `
+            -Path $journalPath `
+            -Value $journal `
+            -Plan $Plan `
+            -AfterFlushFailurePoint "after_initial_journal_temp_flush"
+    }
+
+    Assert-RepoAndEnvGuards -Plan $Plan
+    Assert-ImmutableManifestAndBackups -Plan $Plan
+    if ((Test-Path -LiteralPath $journal.archive_path) -and (Test-Path -LiteralPath $journal.archive_staging_path)) {
+        New-Failure "RestartCalibration archive layout is unrecognized"
+    }
+    if (-not (Test-Path -LiteralPath $journal.archive_path)) {
+        Assert-SourceStateIdentity -StatePathValue $StatePathValue -Expected $journal.source_state
+        if ((Get-PairDirectoryLayout -Directory $journal.active_directory -Plan $Plan -FreshIdentities $journal.source_fresh) -cne "fresh") {
+            New-Failure "RestartCalibration cannot stage an archive from a changed active pair"
+        }
+        $journal.archive_record_sha256 = New-RejectedArchiveStaging -Journal $journal -Plan $Plan
+        $journal.phase = "archive_staged"
+        Save-RestartJournal -Path $journalPath -Journal $journal -Plan $Plan
+        $stagedArchiveRecord = Assert-RejectedArchiveCore -ActualRoot $journal.archive_staging_path -PublishedRoot $journal.archive_path -Plan $Plan -ExpectedRecordSha256 $journal.archive_record_sha256 -ExpectedStatePath ([string]$journal.state_path)
+        Assert-RejectedArchiveMatchesJournal -Record $stagedArchiveRecord -Journal $journal
+        Test-RestartFailurePoint -Plan $Plan -Point "before_archive_publish"
+        Assert-RestartMoveSafe `
+            -Source $journal.archive_staging_path `
+            -Destination $journal.archive_path `
+            -SourceRoot ([string]$Plan.rejected_archive_root) `
+            -DestinationRoot ([string]$Plan.rejected_archive_root) `
+            -Label "archive publication"
+        Invoke-RestartDurableNamespaceMove -Source $journal.archive_staging_path -Destination $journal.archive_path -Label "archive publication"
+        Test-RestartFailurePoint -Plan $Plan -Point "after_archive_namespace_publish"
+        $journal.phase = "archive_published"
+        Save-RestartJournal -Path $journalPath -Journal $journal -Plan $Plan
+    }
+    $publishedArchiveRecord = Assert-RejectedArchiveCore -ActualRoot $journal.archive_path -PublishedRoot $journal.archive_path -Plan $Plan -ExpectedRecordSha256 $journal.archive_record_sha256 -ExpectedStatePath ([string]$journal.state_path)
+    Assert-RejectedArchiveMatchesJournal -Record $publishedArchiveRecord -Journal $journal
+
+    $activeLayout = Get-PairDirectoryLayout -Directory $journal.active_directory -Plan $Plan -FreshIdentities $journal.source_fresh
+    $stagedLayout = Get-StagedOriginalLayout -Directory $journal.staged_original_path -Plan $Plan -FreshIdentities $journal.source_fresh
+    $rollbackLayout = Get-PairDirectoryLayout -Directory $journal.rollback_path -Plan $Plan -FreshIdentities $journal.source_fresh
+    $retiredDirectory = Join-Path $journal.archive_path "retired-active-calibration"
+    $retiredLayout = Get-PairDirectoryLayout -Directory $retiredDirectory -Plan $Plan -FreshIdentities $journal.source_fresh
+
+    if ($activeLayout -ceq "fresh" -and @("missing", "partial_original") -ccontains $stagedLayout -and $rollbackLayout -ceq "missing" -and $retiredLayout -ceq "missing") {
+        New-StagedOriginalPair -Journal $journal -Plan $Plan
+        $stagedLayout = "original"
+    }
+    if ($activeLayout -ceq "fresh" -and $stagedLayout -ceq "original" -and $rollbackLayout -ceq "missing" -and $retiredLayout -ceq "missing") {
+        $activeParent = [System.IO.Path]::GetDirectoryName([string]$journal.active_directory)
+        Assert-RestartMoveSafe `
+            -Source $journal.active_directory `
+            -Destination $journal.rollback_path `
+            -SourceRoot $activeParent `
+            -DestinationRoot $activeParent `
+            -Label "active directory withdrawal"
+        Invoke-RestartDurableNamespaceMove -Source $journal.active_directory -Destination $journal.rollback_path -Label "active directory withdrawal"
+        Test-RestartFailurePoint -Plan $Plan -Point "after_active_directory_move"
+        $journal.phase = "active_withdrawn"
+        Save-RestartJournal -Path $journalPath -Journal $journal -Plan $Plan
+        $activeLayout = "missing"
+        $rollbackLayout = "fresh"
+    }
+    if ($activeLayout -ceq "missing" -and $stagedLayout -ceq "original" -and $rollbackLayout -ceq "fresh" -and $retiredLayout -ceq "missing") {
+        $activeParent = [System.IO.Path]::GetDirectoryName([string]$journal.active_directory)
+        Assert-RestartMoveSafe `
+            -Source $journal.staged_original_path `
+            -Destination $journal.active_directory `
+            -SourceRoot $activeParent `
+            -DestinationRoot $activeParent `
+            -Label "original directory activation"
+        Invoke-RestartDurableNamespaceMove -Source $journal.staged_original_path -Destination $journal.active_directory -Label "original directory activation"
+        Test-RestartFailurePoint -Plan $Plan -Point "after_original_directory_move"
+        $journal.phase = "original_activated"
+        Save-RestartJournal -Path $journalPath -Journal $journal -Plan $Plan
+        $activeLayout = "original"
+        $stagedLayout = "missing"
+    }
+    if ($activeLayout -cne "original" -or $stagedLayout -cne "missing") {
+        New-Failure "unrecognized RestartCalibration directory layout"
+    }
+    Assert-OriginalCalibrationIdentities -Plan $Plan
+
+    if ($rollbackLayout -ceq "fresh" -and $retiredLayout -ceq "missing") {
+        $activeParent = [System.IO.Path]::GetDirectoryName([string]$journal.active_directory)
+        Assert-RestartMoveSafe `
+            -Source $journal.rollback_path `
+            -Destination $retiredDirectory `
+            -SourceRoot $activeParent `
+            -DestinationRoot ([string]$Plan.rejected_archive_root) `
+            -Label "fresh-pair retirement"
+        Invoke-RestartDurableNamespaceMove -Source $journal.rollback_path -Destination $retiredDirectory -Label "fresh-pair retirement"
+        Test-RestartFailurePoint -Plan $Plan -Point "after_fresh_pair_namespace_publish"
+        $rollbackLayout = "missing"
+        $retiredLayout = "fresh"
+    }
+    if ($rollbackLayout -cne "missing" -or $retiredLayout -cne "fresh") {
+        New-Failure "unrecognized RestartCalibration retired-pair layout"
+    }
+    $journal.phase = "fresh_pair_retired"
+    Save-RestartJournal -Path $journalPath -Journal $journal -Plan $Plan
+
+    $retiredStateDirectory = Join-Path $journal.archive_path "retired-state"
+    $retiredStatePath = Join-Path $retiredStateDirectory ([System.IO.Path]::GetFileName($StatePathValue))
+    if (Test-Path -LiteralPath $StatePathValue) {
+        Assert-SourceStateIdentity -StatePathValue $StatePathValue -Expected $journal.source_state
+        Assert-PathMissing -Path $retiredStatePath
+        [void][System.IO.Directory]::CreateDirectory($retiredStateDirectory)
+        Assert-RestartMoveSafe `
+            -Source $StatePathValue `
+            -Destination $retiredStatePath `
+            -SourceRoot ([string]$Plan.state_root) `
+            -DestinationRoot ([string]$Plan.rejected_archive_root) `
+            -Label "state retirement"
+        Invoke-RestartDurableNamespaceMove -Source $StatePathValue -Destination $retiredStatePath -Label "state retirement"
+        Test-RestartFailurePoint -Plan $Plan -Point "after_state_namespace_publish"
+    }
+    if (-not (Test-Path -LiteralPath $retiredStatePath -PathType Leaf) -or
+        (Get-Sha256Hex -Path $retiredStatePath) -cne $journal.source_state.sha256 -or
+        [int64](Get-Item -LiteralPath $retiredStatePath).Length -ne [int64]$journal.source_state.size) {
+        New-Failure "RestartCalibration retired state identity mismatch"
+    }
+    $journal.phase = "state_retired"
+    Save-RestartJournal -Path $journalPath -Journal $journal -Plan $Plan
+
+    $receiptPath = Join-Path $journal.archive_path "restart-receipt.json"
+    if (-not (Test-Path -LiteralPath $receiptPath)) {
+        $receipt = Get-RestartReceiptPayload -Journal $journal
+        Write-RestartJsonDurable `
+            -Path $receiptPath `
+            -Value $receipt `
+            -Plan $Plan `
+            -AfterFlushFailurePoint "after_receipt_temp_flush"
+    }
+    [void](Assert-CompletedRejectedArchive `
+        -ArchivePath $journal.archive_path `
+        -Plan $Plan `
+        -ExpectedStatePath ([string]$journal.state_path))
+    Test-RestartFailurePoint -Plan $Plan -Point "after_receipt_publish"
+    [System.IO.File]::Delete($journalPath)
+    [Console]::Out.WriteLine("RESTART_CALIBRATION_COMPLETE")
 }
 
 function Invoke-SharedExecutor {
@@ -2980,16 +5650,21 @@ function Get-StatusPayload {
 
     try {
         Assert-TestModeMutablePaths -Plan $Plan -StatePathValue $StatePathValue
+        $incompleteRestart = Get-IncompleteRestartStatus -Plan $Plan -StatePathValue $StatePathValue
+        if ($null -ne $incompleteRestart) {
+            return $incompleteRestart
+        }
         Assert-ImmutableManifestAndBackups -Plan $Plan
         $current = Get-CurrentIdentities -Plan $Plan
         $exactOriginals = Test-CurrentIdentitiesAreExactOriginals -Current $current -Plan $Plan
         $originalHashes = Test-CurrentHashesAreOriginals -Current $current -Plan $Plan
         if (-not (Test-Path -LiteralPath $StatePathValue -PathType Leaf)) {
             if ($exactOriginals) {
-                return [ordered]@{
+                $payload = [ordered]@{
                     classification = "ORIGINAL_CALIBRATION_INTACT"
                     next_stage     = "Calibrate"
                 }
+                return Add-RejectedArchivesToStatus -Payload $payload -Plan $Plan -StatePathValue $StatePathValue
             }
             if ($originalHashes) {
                 return [ordered]@{
@@ -3014,7 +5689,7 @@ function Get-StatusPayload {
             }
         }
         Assert-StateIdentity -State $state
-        Assert-StateProvenance -State $state -StatePathValue $StatePathValue -Plan $Plan
+        Assert-StateProvenance -State $state -StatePathValue $StatePathValue -Plan $Plan -AllowRestartCandidate
         Assert-TestModeMutablePaths -Plan $Plan -StatePathValue $StatePathValue -SessionId ([string]$state.session_id)
         if ($state.completed_stages -cnotcontains "Calibrate") {
             if (-not $exactOriginals -and -not $originalHashes) {
@@ -3045,11 +5720,12 @@ function Get-StatusPayload {
         Assert-EvidenceSemantics -State $state -Plan $Plan
         Assert-CompletedMapArtifacts -State $state -Plan $Plan
         $nextStage = if ($state.completed_stages -cnotcontains "MapLeft") { "MapLeft" } elseif ($state.completed_stages -cnotcontains "MapRight") { "MapRight" } elseif ($state.completed_stages -cnotcontains "Verify") { "Verify" } else { $null }
-        return [ordered]@{
+        $payload = [ordered]@{
             classification = "VALID_FRESH_CALIBRATION"
             next_stage     = $nextStage
             final_result   = $state.final_result
         }
+        return Add-RejectedArchivesToStatus -Payload $payload -Plan $Plan -StatePathValue $StatePathValue
     }
     catch {
         return [ordered]@{
@@ -3083,8 +5759,12 @@ try {
         [Console]::Out.WriteLine((ConvertTo-CanonicalJson -Value $payload))
         exit 0
     }
+    if (@("Calibrate", "MapLeft", "MapRight", "Verify") -ccontains $Stage) {
+        Assert-NoIncompleteRestartTransaction -StatePathValue $StatePath
+    }
     switch ($Stage) {
         "DiagnoseImports" { Invoke-DiagnoseImportsStage -Plan $plan }
+        "RestartCalibration" { Invoke-RestartCalibrationStage -Plan $plan -StatePathValue $StatePath }
         "Calibrate" { Invoke-CalibrateStage -Plan $plan -StatePathValue $StatePath }
         "MapLeft" { Invoke-MapStage -StageName "MapLeft" -Plan $plan -StatePathValue $StatePath }
         "MapRight" { Invoke-MapStage -StageName "MapRight" -Plan $plan -StatePathValue $StatePath }

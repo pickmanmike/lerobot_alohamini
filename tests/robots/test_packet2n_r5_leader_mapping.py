@@ -17,6 +17,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_PATH = REPO_ROOT / "tools" / "packet2n_r5_leader_mapping.ps1"
 RUNNER_VERSION = "packet2n-r5-runner-v1"
 BEHAVIOR_BASELINE = "cae57b59db1d9156be568aa4b216fc90701aa741"
+LEGACY_REPO_HEAD = "edc14bbbebb173061cf3b04ead08ffa9fcb81051"
+LEGACY_RUNNER_SHA256 = "0BDBDB2F20AD9D47A2B3DBF84924B833E822FE733EA33FAD505753BAD0BE336E"
 EXPECTED_BRANCH = "fix/am1-elbow-commissioning"
 LEFT_PORT = "COM8"
 RIGHT_PORT = "COM7"
@@ -24,6 +26,9 @@ LEADER_ID = "so101_leader_bi"
 ARM_PROFILE = "so-arm-5dof"
 LEFT_MAP_STAGE = "MapLeft"
 RIGHT_MAP_STAGE = "MapRight"
+RESTART_STAGE = "RestartCalibration"
+RESTART_CONFIRMATION = "RECALIBRATE"
+REJECTION_REASON = "OPERATOR_REJECTED_INCOMPLETE_RANGE"
 IMPORT_SOURCE_PATHS = {
     "lerobot": REPO_ROOT / "src" / "lerobot" / "__init__.py",
     "calibrate_bi": REPO_ROOT / "examples" / "alohamini" / "calibrate_bi.py",
@@ -300,6 +305,7 @@ def base_plan(tmp_path: Path) -> dict[str, object]:
         "import_source_probe": make_import_source_probe(),
         "calibration_root": str(tmp_path / "calibration"),
         "state_root": str(logs_dir),
+        "rejected_archive_root": str(tmp_path / "archives"),
         "manifest": {
             "path": str(manifest_path),
             "sha256": sha256_path(manifest_path),
@@ -484,6 +490,155 @@ def rewrite_evidence_and_state(state_path: Path, state: dict[str, object], evide
     state["artifacts"]["evidence"]["sha256"] = sha256_path(evidence_path)
     state["artifacts"]["evidence"]["size"] = evidence_path.stat().st_size
     write_json(state_path, state)
+
+
+def restart_transaction_paths(
+    plan: dict[str, object], state_path: Path, session_id: str
+) -> dict[str, Path]:
+    active_dir = Path(plan["calibration"]["left"]["path"]).parent
+    archive_path = Path(plan["rejected_archive_root"]) / f"packet2n-r5-rejected-{session_id}"
+    return {
+        "journal": Path(f"{state_path}.restart-calibration.json"),
+        "archive": archive_path,
+        "archive_staging": Path(f"{archive_path}.staging"),
+        "staged_original": active_dir.parent / f".packet2n-r5-original-{session_id}",
+        "rollback": active_dir.parent / f".packet2n-r5-rejected-{session_id}",
+    }
+
+
+def run_restart(
+    plan: dict[str, object],
+    tmp_path: Path,
+    state_path: Path,
+    *,
+    confirmation: str = RESTART_CONFIRMATION,
+) -> subprocess.CompletedProcess[str]:
+    return run_runner(
+        "-Stage",
+        RESTART_STAGE,
+        "-StatePath",
+        str(state_path),
+        "-Confirm",
+        confirmation,
+        plan=plan,
+        tmp_path=tmp_path,
+    )
+
+
+def state_session_binding_sha256(state: dict[str, object]) -> str:
+    artifacts = state["artifacts"]
+    payload = {
+        "session_id": state["session_id"],
+        "utc_start": state["utc_start"],
+        "state_path": state["state_path"],
+        "repo_head": state["repo_head"],
+        "runner_sha": state["runner_sha"],
+        "behavior_sha": state["behavior_sha"],
+        "expected_branch": state["expected_branch"],
+        "packet_identity": state["packet_identity"],
+        "leader_id": state["leader_id"],
+        "arm_profile": state["arm_profile"],
+        "ports": {
+            name: state["ports"][name]
+            for name in ("physical_left", "logical_left", "physical_right", "logical_right")
+        },
+        "artifact_paths": {
+            name: artifacts[name]["path"]
+            for name in ("transcript", "evidence", "map_left", "map_right")
+        },
+    }
+    script = (
+        "$Value = [Console]::In.ReadToEnd() | ConvertFrom-Json -AsHashtable -Depth 100 -DateKind String; "
+        "$Text = $Value | ConvertTo-Json -Depth 100; "
+        "$Bytes = [Text.Encoding]::UTF8.GetBytes($Text); "
+        "$Sha = [Security.Cryptography.SHA256]::Create(); "
+        "try { [Console]::Out.Write(([BitConverter]::ToString($Sha.ComputeHash($Bytes))).Replace('-', '')) } "
+        "finally { $Sha.Dispose() }"
+    )
+    result = subprocess.run(
+        ["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+        input=json.dumps(payload, separators=(",", ":")),
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    return result.stdout
+
+
+def convert_fresh_state_to_legacy_provenance(state_path: Path) -> dict[str, object]:
+    state = load_state(state_path)
+    state["repo_head"] = LEGACY_REPO_HEAD
+    state["runner_sha"] = LEGACY_RUNNER_SHA256
+    state["session_binding_sha256"] = state_session_binding_sha256(state)
+    evidence_path = Path(state["artifacts"]["evidence"]["path"])
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    evidence["state_session_binding"] = state["session_binding_sha256"]
+    rewrite_evidence_and_state(state_path, state, evidence)
+    state = load_state(state_path)
+    transcript_path = Path(state["artifacts"]["transcript"]["path"])
+    return {
+        "schema_version": "1",
+        "repo_head": LEGACY_REPO_HEAD,
+        "runner_sha256": LEGACY_RUNNER_SHA256,
+        "behavior_sha": BEHAVIOR_BASELINE,
+        "session_id": state["session_id"],
+        "state": {
+            "path": str(state_path),
+            "sha256": sha256_path(state_path),
+            "size": state_path.stat().st_size,
+        },
+        "fresh": state["post_calibration"],
+        "evidence": {
+            "path": str(evidence_path),
+            "sha256": sha256_path(evidence_path),
+            "size": evidence_path.stat().st_size,
+        },
+        "transcript": {
+            "path": str(transcript_path),
+            "sha256": sha256_path(transcript_path),
+            "size": transcript_path.stat().st_size,
+        },
+        "transcript_body_evaluation": "KNOWN_LIMITATION",
+    }
+
+
+def rewrite_archive_record_and_receipt(archive: Path, record: dict[str, object]) -> None:
+    record_path = archive / "archive-record.json"
+    write_json(record_path, record)
+    receipt_path = archive / "restart-receipt.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["archive_record_sha256"] = sha256_path(record_path)
+    write_json(receipt_path, receipt)
+
+
+def update_archive_artifact_identity(record: dict[str, object], name: str, path: Path) -> None:
+    artifact = record["artifacts"][name]
+    artifact["sha256"] = sha256_path(path)
+    artifact["size"] = path.stat().st_size
+    artifact["archive_mtime_utc"] = powershell_utc_timestamp(path)
+
+
+def assert_complete_pair(directory: Path, expected: dict[str, bytes]) -> None:
+    assert directory.is_dir()
+    assert sorted(path.name for path in directory.iterdir()) == sorted(expected)
+    for name, content in expected.items():
+        path = directory / name
+        assert path.is_file()
+        assert path.read_bytes() == content
+
+
+def create_directory_junction_or_skip(link: Path, target: Path) -> None:
+    result = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(target)],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=10,
+    )
+    if result.returncode != 0:
+        pytest.skip(f"temporary junction creation is unavailable: {result.stderr}")
 
 
 def expected_native_command(stage: str) -> tuple[str, list[str]]:
@@ -2570,3 +2725,1229 @@ def test_test_mode_rejects_temp_junction_before_target_mutation(tmp_path):
         if junction.exists():
             os.rmdir(junction)
         shutil.rmtree(protected_target, ignore_errors=True)
+
+
+def prepare_fresh_restart_candidate(
+    tmp_path: Path,
+) -> tuple[dict[str, object], Path, dict[str, object], dict[str, bytes], dict[str, bytes]]:
+    plan = base_plan(tmp_path)
+    state_path = tmp_path / "logs" / "packet2n-r5-state.json"
+    result = run_calibrate(plan, tmp_path, state_path)
+    assert result.returncode == 0, result.stderr
+    state = load_state(state_path)
+    active = {
+        Path(plan["calibration"][side]["path"]).name: Path(plan["calibration"][side]["path"]).read_bytes()
+        for side in ("left", "right")
+    }
+    originals = {
+        Path(plan["calibration"][side]["path"]).name: Path(plan["calibration"][side]["backup_path"]).read_bytes()
+        for side in ("left", "right")
+    }
+    return plan, state_path, state, active, originals
+
+
+def test_restart_calibration_requires_exact_case_sensitive_confirmation(tmp_path):
+    plan, state_path, state, active, _ = prepare_fresh_restart_candidate(tmp_path)
+    paths = restart_transaction_paths(plan, state_path, state["session_id"])
+
+    for confirmation in ("", "recalibrate", "RECALIBRATE "):
+        args = ["-Stage", RESTART_STAGE, "-StatePath", str(state_path)]
+        if confirmation:
+            args.extend(["-Confirm", confirmation])
+        result = run_runner(*args, plan=plan, tmp_path=tmp_path)
+        assert result.returncode != 0
+        assert "requires -Confirm RECALIBRATE" in result.stderr
+        assert_complete_pair(Path(plan["calibration"]["left"]["path"]).parent, active)
+        assert state_path.exists()
+        assert not paths["journal"].exists()
+        assert not paths["archive"].exists()
+
+
+def test_valid_fresh_pre_map_session_archives_and_restores_original_pair_offline(tmp_path):
+    plan, state_path, state, fresh, originals = prepare_fresh_restart_candidate(tmp_path)
+    state_bytes = state_path.read_bytes()
+    transcript_path = Path(state["artifacts"]["transcript"]["path"])
+    evidence_path = Path(state["artifacts"]["evidence"]["path"])
+    transcript_bytes = transcript_path.read_bytes()
+    evidence_bytes = evidence_path.read_bytes()
+    manifest_path = Path(plan["manifest"]["path"])
+    manifest_bytes = manifest_path.read_bytes()
+    native_truth = json.loads(json.dumps(state["stages"]))
+    paths = restart_transaction_paths(plan, state_path, state["session_id"])
+
+    result = run_restart(plan, tmp_path, state_path)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "RESTART_CALIBRATION_COMPLETE"
+    active_dir = Path(plan["calibration"]["left"]["path"]).parent
+    assert_complete_pair(active_dir, originals)
+    for side in ("left", "right"):
+        active_path = Path(plan["calibration"][side]["path"])
+        backup_path = Path(plan["calibration"][side]["backup_path"])
+        assert sha256_path(active_path) == sha256_path(backup_path)
+        assert active_path.stat().st_size == backup_path.stat().st_size
+        assert powershell_utc_timestamp(active_path) == plan["calibration"][side]["source_mtime_utc"]
+
+    archive = paths["archive"]
+    assert archive.is_dir()
+    assert (archive / "rejected-calibration" / Path(plan["calibration"]["left"]["path"]).name).read_bytes() == fresh[
+        Path(plan["calibration"]["left"]["path"]).name
+    ]
+    assert (archive / "rejected-calibration" / Path(plan["calibration"]["right"]["path"]).name).read_bytes() == fresh[
+        Path(plan["calibration"]["right"]["path"]).name
+    ]
+    assert (archive / "transcript" / transcript_path.name).read_bytes() == transcript_bytes
+    assert (archive / "evidence" / evidence_path.name).read_bytes() == evidence_bytes
+    assert (archive / "state-snapshot" / state_path.name).read_bytes() == state_bytes
+    assert (archive / "immutable-backup" / manifest_path.name).read_bytes() == manifest_bytes
+    assert_complete_pair(archive / "retired-active-calibration", fresh)
+    assert (archive / "retired-state" / state_path.name).read_bytes() == state_bytes
+
+    record_path = archive / "archive-record.json"
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    assert record["schema_version"] == "1"
+    assert record["record_type"] == "packet2n-r5-rejected-calibration"
+    assert record["reason"] == REJECTION_REASON
+    assert record["session_id"] == state["session_id"]
+    assert record["session_start_utc"] == state["utc_start"]
+    assert record["archive_path"] == str(archive)
+    assert record["state_binding_sha256"] == state["session_binding_sha256"]
+    assert record["source_provenance"] == {
+        "repo_head": state["repo_head"],
+        "runner_sha256": state["runner_sha"],
+        "behavior_sha": BEHAVIOR_BASELINE,
+    }
+    assert record["recovery_provenance"] == {
+        "repo_head": plan["head"],
+        "runner_sha256": sha256_path(SCRIPT_PATH),
+        "behavior_sha": BEHAVIOR_BASELINE,
+    }
+    assert record["immutable_backup"]["manifest"]["sha256"] == sha256_path(manifest_path)
+    assert record["immutable_backup"]["left"]["sha256"] == sha256_path(
+        Path(plan["calibration"]["left"]["backup_path"])
+    )
+    assert record["immutable_backup"]["right"]["sha256"] == sha256_path(
+        Path(plan["calibration"]["right"]["backup_path"])
+    )
+    assert record["transcript_validation"] == {
+        "header_valid": True,
+        "hash_and_size_valid": True,
+        "final_terminator_valid": True,
+        "native_calibration_output_evaluation": "NOT_EVALUATED",
+        "body_contains_native_calibration_output": None,
+        "limitation": "Transcript body content was not evaluated for native calibration output.",
+    }
+    for artifact_name in ("left_calibration", "right_calibration", "transcript", "evidence", "state"):
+        artifact = record["artifacts"][artifact_name]
+        archive_artifact_path = Path(artifact["archive_path"])
+        assert archive_artifact_path.exists()
+        assert sha256_path(archive_artifact_path) == artifact["sha256"]
+        assert archive_artifact_path.stat().st_size == artifact["size"]
+        assert artifact["source_mtime_utc"]
+        assert artifact["archive_mtime_utc"]
+
+    receipt = json.loads((archive / "restart-receipt.json").read_text(encoding="utf-8"))
+    assert receipt["status"] == "completed"
+    assert receipt["reason"] == REJECTION_REASON
+    assert receipt["session_id"] == state["session_id"]
+    assert receipt["archive_record_sha256"] == sha256_path(record_path)
+    assert receipt["active_classification"] == "ORIGINAL_CALIBRATION_INTACT"
+    assert receipt["next_stage"] == "Calibrate"
+    assert receipt["offline"] is True
+    assert receipt["native_stage_truth"] == native_truth
+
+    assert not state_path.exists()
+    assert not paths["journal"].exists()
+    assert not paths["archive_staging"].exists()
+    assert not paths["staged_original"].exists()
+    assert not paths["rollback"].exists()
+    assert transcript_path.read_bytes() == transcript_bytes
+    assert evidence_path.read_bytes() == evidence_bytes
+    assert not Path(state["artifacts"]["map_left"]["path"]).exists()
+    assert not Path(state["artifacts"]["map_right"]["path"]).exists()
+
+    status = run_runner("-Stage", "Status", "-StatePath", str(state_path), plan=plan, tmp_path=tmp_path)
+    assert status.returncode == 0, status.stderr
+    status_payload = json.loads(status.stdout)
+    assert status_payload["classification"] == "ORIGINAL_CALIBRATION_INTACT"
+    assert status_payload["next_stage"] == "Calibrate"
+    assert status_payload["rejected_archives"] == [
+        {
+            "archive_path": str(archive),
+            "reason": REJECTION_REASON,
+            "session_id": state["session_id"],
+            "verified": True,
+        }
+    ]
+
+
+@pytest.mark.parametrize("mapped_state", ["mapped", "verified"])
+def test_restart_calibration_refuses_after_mapping_has_begun(tmp_path, mapped_state):
+    plan, state_path, state, fresh, _ = prepare_fresh_restart_candidate(tmp_path)
+    assert run_map_stage(LEFT_MAP_STAGE, plan, tmp_path, state_path).returncode == 0
+    if mapped_state == "verified":
+        assert run_map_stage(RIGHT_MAP_STAGE, plan, tmp_path, state_path).returncode == 0
+        assert (
+            run_runner("-Stage", "Verify", "-StatePath", str(state_path), plan=plan, tmp_path=tmp_path).returncode
+            == 0
+        )
+    state = load_state(state_path)
+    paths = restart_transaction_paths(plan, state_path, state["session_id"])
+
+    result = run_restart(plan, tmp_path, state_path)
+
+    assert result.returncode != 0
+    assert "only exact completed stages [Calibrate]" in result.stderr
+    assert_complete_pair(Path(plan["calibration"]["left"]["path"]).parent, fresh)
+    assert state_path.exists()
+    assert not paths["journal"].exists()
+    assert not paths["archive"].exists()
+
+
+@pytest.mark.parametrize(
+    "refusal",
+    [
+        "changed_current",
+        "missing_evidence",
+        "malformed_evidence",
+        "bad_backup",
+        "preexisting_archive",
+        "unexpected_active_entry",
+    ],
+)
+def test_restart_calibration_refuses_unsafe_or_non_overwriting_inputs(tmp_path, refusal):
+    plan, state_path, state, fresh, _ = prepare_fresh_restart_candidate(tmp_path)
+    paths = restart_transaction_paths(plan, state_path, state["session_id"])
+    if refusal == "changed_current":
+        write_json(Path(plan["calibration"]["left"]["path"]), make_calibration(999))
+    elif refusal == "missing_evidence":
+        Path(state["artifacts"]["evidence"]["path"]).unlink()
+    elif refusal == "malformed_evidence":
+        write_text(Path(state["artifacts"]["evidence"]["path"]), "{not-json\n")
+    elif refusal == "bad_backup":
+        write_json(Path(plan["calibration"]["right"]["backup_path"]), make_calibration(777))
+    elif refusal == "preexisting_archive":
+        write_text(paths["archive"] / "owner.txt", "preexisting\n")
+    else:
+        write_text(Path(plan["calibration"]["left"]["path"]).parent / "unexpected.json", "{}\n")
+    state_before = state_path.read_bytes()
+
+    result = run_restart(plan, tmp_path, state_path)
+
+    assert result.returncode != 0
+    assert state_path.read_bytes() == state_before
+    assert not paths["journal"].exists()
+    assert not paths["archive_staging"].exists()
+    if refusal == "preexisting_archive":
+        assert (paths["archive"] / "owner.txt").read_text(encoding="utf-8") == "preexisting\n"
+    elif refusal not in {"changed_current", "unexpected_active_entry"}:
+        assert_complete_pair(Path(plan["calibration"]["left"]["path"]).parent, fresh)
+
+
+def test_failure_before_archive_publication_preserves_fresh_state_and_resumes(tmp_path):
+    plan, state_path, state, fresh, originals = prepare_fresh_restart_candidate(tmp_path)
+    plan["restart_failure_point"] = "before_archive_publish"
+    paths = restart_transaction_paths(plan, state_path, state["session_id"])
+
+    failed = run_restart(plan, tmp_path, state_path)
+
+    assert failed.returncode != 0
+    assert "TEST FAILURE INJECTION: before_archive_publish" in failed.stderr
+    assert_complete_pair(Path(plan["calibration"]["left"]["path"]).parent, fresh)
+    assert state_path.exists()
+    assert paths["journal"].is_file()
+    assert paths["archive_staging"].is_dir()
+    assert not paths["archive"].exists()
+
+    status = run_runner("-Stage", "Status", "-StatePath", str(state_path), plan=plan, tmp_path=tmp_path)
+    payload = json.loads(status.stdout)
+    assert payload["classification"] == "RESTART_CALIBRATION_RECOVERABLE"
+    assert payload["next_stage"] == RESTART_STAGE
+    assert payload["restart_transaction"]["session_id"] == state["session_id"]
+
+    blocked = run_map_stage(LEFT_MAP_STAGE, plan, tmp_path, state_path)
+    assert blocked.returncode != 0
+    assert "incomplete RestartCalibration transaction" in blocked.stderr
+    del plan["restart_failure_point"]
+    resumed = run_restart(plan, tmp_path, state_path)
+    assert resumed.returncode == 0, resumed.stderr
+    assert_complete_pair(Path(plan["calibration"]["left"]["path"]).parent, originals)
+
+
+@pytest.mark.parametrize(
+    ("failure_point", "active_layout"),
+    [
+        ("after_active_directory_move", "missing"),
+        ("after_original_directory_move", "original"),
+    ],
+)
+def test_directory_pair_swap_recovers_across_each_atomic_move(tmp_path, failure_point, active_layout):
+    plan, state_path, state, fresh, originals = prepare_fresh_restart_candidate(tmp_path)
+    plan["restart_failure_point"] = failure_point
+    paths = restart_transaction_paths(plan, state_path, state["session_id"])
+    active_dir = Path(plan["calibration"]["left"]["path"]).parent
+
+    failed = run_restart(plan, tmp_path, state_path)
+
+    assert failed.returncode != 0
+    assert f"TEST FAILURE INJECTION: {failure_point}" in failed.stderr
+    assert paths["archive"].is_dir()
+    assert state_path.exists()
+    assert paths["journal"].is_file()
+    assert_complete_pair(paths["rollback"], fresh)
+    if active_layout == "missing":
+        assert not active_dir.exists()
+        assert_complete_pair(paths["staged_original"], originals)
+    else:
+        assert_complete_pair(active_dir, originals)
+        assert not paths["staged_original"].exists()
+
+    status = run_runner("-Stage", "Status", "-StatePath", str(state_path), plan=plan, tmp_path=tmp_path)
+    payload = json.loads(status.stdout)
+    assert payload["classification"] == "RESTART_CALIBRATION_RECOVERABLE"
+    assert payload["next_stage"] == RESTART_STAGE
+
+    del plan["restart_failure_point"]
+    resumed = run_restart(plan, tmp_path, state_path)
+    assert resumed.returncode == 0, resumed.stderr
+    assert_complete_pair(active_dir, originals)
+    assert_complete_pair(paths["archive"] / "retired-active-calibration", fresh)
+    assert not state_path.exists()
+    assert not paths["journal"].exists()
+
+
+def test_restart_rerun_refuses_unrecognized_directory_layout_without_mutation(tmp_path):
+    plan, state_path, state, fresh, _ = prepare_fresh_restart_candidate(tmp_path)
+    plan["restart_failure_point"] = "after_active_directory_move"
+    paths = restart_transaction_paths(plan, state_path, state["session_id"])
+    active_dir = Path(plan["calibration"]["left"]["path"]).parent
+    assert run_restart(plan, tmp_path, state_path).returncode != 0
+    active_dir.mkdir()
+    lone_path = active_dir / Path(plan["calibration"]["left"]["path"]).name
+    lone_path.write_bytes(fresh[lone_path.name])
+    rollback_before = {
+        path.name: path.read_bytes() for path in paths["rollback"].iterdir()
+    }
+    del plan["restart_failure_point"]
+
+    status = run_runner("-Stage", "Status", "-StatePath", str(state_path), plan=plan, tmp_path=tmp_path)
+    assert status.returncode == 0, status.stderr
+    status_payload = json.loads(status.stdout)
+    assert status_payload["classification"] == "INVALID_OR_UNCERTAIN_STATE"
+    assert "layout" in status_payload["report"].lower()
+
+    result = run_restart(plan, tmp_path, state_path)
+
+    assert result.returncode != 0
+    assert "unrecognized RestartCalibration directory layout" in result.stderr
+    assert sorted(path.name for path in active_dir.iterdir()) == [lone_path.name]
+    assert lone_path.read_bytes() == fresh[lone_path.name]
+    assert {path.name: path.read_bytes() for path in paths["rollback"].iterdir()} == rollback_before
+    assert state_path.exists()
+    assert paths["journal"].exists()
+
+
+def test_generic_legacy_premap_session_is_not_restart_authority(tmp_path):
+    plan, state_path, state, fresh, _ = prepare_fresh_restart_candidate(tmp_path)
+    convert_fresh_state_to_legacy_provenance(state_path)
+    paths = restart_transaction_paths(plan, state_path, state["session_id"])
+
+    status = run_runner("-Stage", "Status", "-StatePath", str(state_path), plan=plan, tmp_path=tmp_path)
+    assert status.returncode == 0, status.stderr
+    assert json.loads(status.stdout)["classification"] == "INVALID_OR_UNCERTAIN_STATE"
+
+    restarted = run_restart(plan, tmp_path, state_path)
+
+    assert restarted.returncode != 0
+    assert "State repository provenance is invalid" in restarted.stderr
+    assert_complete_pair(Path(plan["calibration"]["left"]["path"]).parent, fresh)
+    assert state_path.is_file()
+    assert not paths["journal"].exists()
+    assert not paths["archive"].exists()
+
+
+def test_validated_test_plan_can_authorize_one_exact_sandbox_legacy_fixture(tmp_path):
+    plan, state_path, _, _, originals = prepare_fresh_restart_candidate(tmp_path)
+    plan["restart_legacy_fixture"] = convert_fresh_state_to_legacy_provenance(state_path)
+
+    status = run_runner("-Stage", "Status", "-StatePath", str(state_path), plan=plan, tmp_path=tmp_path)
+    assert status.returncode == 0, status.stderr
+    assert json.loads(status.stdout)["classification"] == "VALID_FRESH_CALIBRATION"
+    mapped = run_map_stage(LEFT_MAP_STAGE, plan, tmp_path, state_path)
+    assert mapped.returncode != 0
+    assert "State repository provenance is invalid" in mapped.stderr
+    assert not Path(load_state(state_path)["artifacts"]["map_left"]["path"]).exists()
+
+    restarted = run_restart(plan, tmp_path, state_path)
+    assert restarted.returncode == 0, restarted.stderr
+    assert_complete_pair(Path(plan["calibration"]["left"]["path"]).parent, originals)
+    archive = restart_transaction_paths(plan, state_path, "test-session")["archive"]
+    record = json.loads((archive / "archive-record.json").read_text(encoding="utf-8"))
+    assert record["transcript_validation"] == {
+        "header_valid": True,
+        "hash_and_size_valid": True,
+        "final_terminator_valid": True,
+        "native_calibration_output_evaluation": "KNOWN_APPROVED_LEGACY_LIMITATION",
+        "body_contains_native_calibration_output": False,
+        "limitation": "The exact approved legacy transcript is known to contain no native calibration output; its bound header, hash, size, and final terminator are validated.",
+    }
+
+
+@pytest.mark.parametrize(
+    "failure_point",
+    [
+        "after_state_namespace_publish",
+        "after_receipt_temp_flush",
+        "after_receipt_publish",
+    ],
+)
+def test_exact_legacy_restart_recovers_after_live_state_retirement(tmp_path, failure_point):
+    plan, state_path, state, fresh, originals = prepare_fresh_restart_candidate(tmp_path)
+    plan["restart_legacy_fixture"] = convert_fresh_state_to_legacy_provenance(state_path)
+    state = load_state(state_path)
+    paths = restart_transaction_paths(plan, state_path, state["session_id"])
+    active_dir = Path(plan["calibration"]["left"]["path"]).parent
+    plan["restart_failure_point"] = failure_point
+
+    interrupted = run_restart(plan, tmp_path, state_path)
+
+    assert interrupted.returncode != 0
+    assert f"TEST FAILURE INJECTION: {failure_point}" in interrupted.stderr
+    assert not state_path.exists()
+    assert (paths["archive"] / "state-snapshot" / state_path.name).is_file()
+    assert (paths["archive"] / "retired-state" / state_path.name).is_file()
+    assert_complete_pair(active_dir, originals)
+    assert_complete_pair(paths["archive"] / "retired-active-calibration", fresh)
+
+    interrupted_status = run_runner(
+        "-Stage", "Status", "-StatePath", str(state_path), plan=plan, tmp_path=tmp_path
+    )
+
+    assert interrupted_status.returncode == 0, interrupted_status.stderr
+    interrupted_payload = json.loads(interrupted_status.stdout)
+    assert interrupted_payload["classification"] == "RESTART_CALIBRATION_RECOVERABLE", interrupted_payload
+
+    del plan["restart_failure_point"]
+    resumed = run_restart(plan, tmp_path, state_path)
+
+    assert resumed.returncode == 0, resumed.stderr
+    assert resumed.stdout.strip() == "RESTART_CALIBRATION_COMPLETE"
+    assert_complete_pair(active_dir, originals)
+    assert_complete_pair(paths["archive"] / "retired-active-calibration", fresh)
+    assert not paths["journal"].exists()
+    final_status = run_runner("-Stage", "Status", "-StatePath", str(state_path), plan=plan, tmp_path=tmp_path)
+    assert final_status.returncode == 0, final_status.stderr
+    final_payload = json.loads(final_status.stdout)
+    assert final_payload["classification"] == "ORIGINAL_CALIBRATION_INTACT"
+    assert final_payload["next_stage"] == "Calibrate"
+    assert final_payload["rejected_archives"] == [
+        {
+            "archive_path": str(paths["archive"]),
+            "reason": REJECTION_REASON,
+            "session_id": state["session_id"],
+            "verified": True,
+        }
+    ]
+
+
+def test_later_calibrate_keeps_verified_rejected_archive_visible_and_am2_files_unchanged(tmp_path):
+    plan, state_path, state, _, _ = prepare_fresh_restart_candidate(tmp_path)
+    am2_dir = tmp_path / "calibration" / "teleoperators" / "am_leader"
+    am2_files = {
+        "am_leader_bi_left.json": b"AM2 LEFT\n",
+        "am_leader_bi_right.json": b"AM2 RIGHT\n",
+        "am2pro_leader_bi_left.json": b"AM2 PRO LEFT\n",
+        "am2pro_leader_bi_right.json": b"AM2 PRO RIGHT\n",
+    }
+    for name, content in am2_files.items():
+        write_text(am2_dir / name, content.decode())
+    am2_before = {name: sha256_path(am2_dir / name) for name in am2_files}
+    archive = restart_transaction_paths(plan, state_path, state["session_id"])["archive"]
+    assert run_restart(plan, tmp_path, state_path).returncode == 0
+    assert {name: sha256_path(am2_dir / name) for name in am2_files} == am2_before
+
+    plan["session_id"] = "second-session"
+    plan["utc_start"] = "2026-08-24T12:00:00.0000000Z"
+    calibrated = run_calibrate(plan, tmp_path, state_path)
+    assert calibrated.returncode == 0, calibrated.stderr
+    status = run_runner("-Stage", "Status", "-StatePath", str(state_path), plan=plan, tmp_path=tmp_path)
+    assert status.returncode == 0, status.stderr
+    payload = json.loads(status.stdout)
+    assert payload["classification"] == "VALID_FRESH_CALIBRATION"
+    assert payload["next_stage"] == LEFT_MAP_STAGE
+    assert payload["rejected_archives"] == [
+        {
+            "archive_path": str(archive),
+            "reason": REJECTION_REASON,
+            "session_id": state["session_id"],
+            "verified": True,
+        }
+    ]
+    assert {name: sha256_path(am2_dir / name) for name in am2_files} == am2_before
+
+
+def test_restart_refuses_same_so_leader_directory_with_am2_and_am2_pro_files_byte_identically(tmp_path):
+    plan, state_path, state, fresh, _ = prepare_fresh_restart_candidate(tmp_path)
+    active_dir = Path(plan["calibration"]["left"]["path"]).parent
+    extra_files = {
+        "am_leader_bi_left.json": b"AM2 LEFT\n",
+        "am_leader_bi_right.json": b"AM2 RIGHT\n",
+        "am2pro_leader_bi_left.json": b"AM2 PRO LEFT\n",
+        "am2pro_leader_bi_right.json": b"AM2 PRO RIGHT\n",
+    }
+    for name, content in extra_files.items():
+        (active_dir / name).write_bytes(content)
+    before = {path.name: path.read_bytes() for path in active_dir.iterdir()}
+    paths = restart_transaction_paths(plan, state_path, state["session_id"])
+    state_before = state_path.read_bytes()
+
+    restarted = run_restart(plan, tmp_path, state_path)
+
+    assert restarted.returncode != 0
+    assert "exactly the verified fresh pair" in restarted.stderr
+    assert {path.name: path.read_bytes() for path in active_dir.iterdir()} == before
+    for name, content in fresh.items():
+        assert before[name] == content
+    assert state_path.read_bytes() == state_before
+    assert not paths["journal"].exists()
+    assert not paths["archive"].exists()
+    assert not paths["archive_staging"].exists()
+    assert not paths["staged_original"].exists()
+    assert not paths["rollback"].exists()
+
+
+@pytest.mark.parametrize("removed", ["retired_pair", "retired_state"])
+def test_status_refuses_rejected_archive_missing_retired_artifact(tmp_path, removed):
+    plan, state_path, state, _, _ = prepare_fresh_restart_candidate(tmp_path)
+    archive = restart_transaction_paths(plan, state_path, state["session_id"])["archive"]
+    assert run_restart(plan, tmp_path, state_path).returncode == 0
+    if removed == "retired_pair":
+        (archive / "retired-active-calibration" / "so101_leader_bi_left.json").unlink()
+    else:
+        (archive / "retired-state" / state_path.name).unlink()
+
+    status = run_runner("-Stage", "Status", "-StatePath", str(state_path), plan=plan, tmp_path=tmp_path)
+
+    assert status.returncode == 0, status.stderr
+    payload = json.loads(status.stdout)
+    assert payload["classification"] == "INVALID_OR_UNCERTAIN_STATE"
+    assert "rejected archive" in payload["report"].lower()
+
+
+def test_status_refuses_orphaned_rejected_archive_staging_directory(tmp_path):
+    plan = base_plan(tmp_path)
+    state_path = tmp_path / "logs" / "missing-state.json"
+    orphaned_staging = Path(plan["rejected_archive_root"]) / "packet2n-r5-rejected-orphan.staging"
+    write_text(orphaned_staging / "partial.txt", "partial\n")
+
+    status = run_runner("-Stage", "Status", "-StatePath", str(state_path), plan=plan, tmp_path=tmp_path)
+
+    assert status.returncode == 0, status.stderr
+    payload = json.loads(status.stdout)
+    assert payload["classification"] == "INVALID_OR_UNCERTAIN_STATE"
+    assert "staging" in payload["report"].lower()
+
+
+@pytest.mark.parametrize(
+    "failure_point",
+    [
+        "after_first_archive_copy",
+        "after_archive_record_write",
+        "after_first_original_copy",
+    ],
+)
+def test_restart_resumes_each_partial_staging_seam_without_touching_active_fresh_pair(tmp_path, failure_point):
+    plan, state_path, state, fresh, originals = prepare_fresh_restart_candidate(tmp_path)
+    plan["restart_failure_point"] = failure_point
+    paths = restart_transaction_paths(plan, state_path, state["session_id"])
+    active_dir = Path(plan["calibration"]["left"]["path"]).parent
+
+    failed = run_restart(plan, tmp_path, state_path)
+
+    assert failed.returncode != 0
+    assert f"TEST FAILURE INJECTION: {failure_point}" in failed.stderr
+    assert_complete_pair(active_dir, fresh)
+    assert state_path.is_file()
+    assert paths["journal"].is_file()
+    journal = json.loads(paths["journal"].read_text(encoding="utf-8"))
+    if failure_point == "after_first_archive_copy":
+        staged_files = [path for path in paths["archive_staging"].rglob("*") if path.is_file()]
+        assert len(staged_files) == 1
+        assert not paths["archive"].exists()
+        assert journal["archive_record_sha256"] is None
+    elif failure_point == "after_archive_record_write":
+        assert (paths["archive_staging"] / "archive-record.json").is_file()
+        assert not paths["archive"].exists()
+        assert journal["archive_record_sha256"] is None
+    else:
+        staged_original_files = [path for path in paths["staged_original"].iterdir() if path.is_file()]
+        assert len(staged_original_files) == 1
+        assert paths["archive"].is_dir()
+
+    status = run_runner("-Stage", "Status", "-StatePath", str(state_path), plan=plan, tmp_path=tmp_path)
+    assert status.returncode == 0, status.stderr
+    assert json.loads(status.stdout)["classification"] == "RESTART_CALIBRATION_RECOVERABLE"
+
+    del plan["restart_failure_point"]
+    resumed = run_restart(plan, tmp_path, state_path)
+
+    assert resumed.returncode == 0, resumed.stderr
+    assert resumed.stdout.strip() == "RESTART_CALIBRATION_COMPLETE"
+    assert_complete_pair(active_dir, originals)
+    assert_complete_pair(paths["archive"] / "retired-active-calibration", fresh)
+    assert not paths["journal"].exists()
+
+
+def test_restart_reconstructs_interrupted_archive_copy_from_unchanged_source(tmp_path):
+    plan, state_path, state, fresh, originals = prepare_fresh_restart_candidate(tmp_path)
+    plan["restart_failure_point"] = "after_first_archive_copy"
+    paths = restart_transaction_paths(plan, state_path, state["session_id"])
+    active_dir = Path(plan["calibration"]["left"]["path"]).parent
+    failed = run_restart(plan, tmp_path, state_path)
+    assert failed.returncode != 0
+    staged_files = [path for path in paths["archive_staging"].rglob("*") if path.is_file()]
+    assert len(staged_files) == 1
+    staged_files[0].write_bytes(b"interrupted partial copy")
+
+    status = run_runner("-Stage", "Status", "-StatePath", str(state_path), plan=plan, tmp_path=tmp_path)
+    assert status.returncode == 0, status.stderr
+    assert json.loads(status.stdout)["classification"] == "RESTART_CALIBRATION_RECOVERABLE"
+    assert_complete_pair(active_dir, fresh)
+    assert state_path.is_file()
+
+    del plan["restart_failure_point"]
+    resumed = run_restart(plan, tmp_path, state_path)
+
+    assert resumed.returncode == 0, resumed.stderr
+    assert_complete_pair(active_dir, originals)
+    assert_complete_pair(paths["archive"] / "retired-active-calibration", fresh)
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "phase",
+        "source_state",
+        "source_fresh",
+        "state_binding",
+        "native_stage_truth",
+        "source_provenance",
+        "session_start",
+        "nested_schema",
+    ],
+)
+def test_status_refuses_tampered_restart_journal_authority(tmp_path, tamper):
+    plan, state_path, state, fresh, _ = prepare_fresh_restart_candidate(tmp_path)
+    plan["restart_failure_point"] = "before_archive_publish"
+    paths = restart_transaction_paths(plan, state_path, state["session_id"])
+    assert run_restart(plan, tmp_path, state_path).returncode != 0
+    journal = json.loads(paths["journal"].read_text(encoding="utf-8"))
+    if tamper == "phase":
+        journal["phase"] = "operator_guessed"
+    elif tamper == "source_state":
+        journal["source_state"]["sha256"] = "0" * 64
+    elif tamper == "source_fresh":
+        journal["source_fresh"]["left"]["sha256"] = "0" * 64
+    elif tamper == "state_binding":
+        journal["state_binding_sha256"] = "0" * 64
+    elif tamper == "native_stage_truth":
+        journal["native_stage_truth"]["Calibrate"]["native"]["attempted"] = False
+    elif tamper == "source_provenance":
+        journal["source_provenance"]["repo_head"] = "f" * 40
+    elif tamper == "session_start":
+        journal["session_start_utc"] = "2026-01-01T00:00:00.0000000Z"
+    else:
+        journal["source_state"]["unexpected"] = True
+    write_json(paths["journal"], journal)
+    del plan["restart_failure_point"]
+
+    status = run_runner("-Stage", "Status", "-StatePath", str(state_path), plan=plan, tmp_path=tmp_path)
+
+    assert status.returncode == 0, status.stderr
+    payload = json.loads(status.stdout)
+    assert payload["classification"] == "INVALID_OR_UNCERTAIN_STATE"
+    assert "journal" in payload["report"].lower()
+    assert_complete_pair(Path(plan["calibration"]["left"]["path"]).parent, fresh)
+    assert state_path.is_file()
+
+
+def test_status_refuses_valid_phase_that_disagrees_with_physical_layout(tmp_path):
+    plan, state_path, state, _, originals = prepare_fresh_restart_candidate(tmp_path)
+    plan["restart_failure_point"] = "after_active_directory_move"
+    paths = restart_transaction_paths(plan, state_path, state["session_id"])
+    assert run_restart(plan, tmp_path, state_path).returncode != 0
+    assert_complete_pair(paths["staged_original"], originals)
+    state_before = state_path.read_bytes()
+    journal = json.loads(paths["journal"].read_text(encoding="utf-8"))
+    assert journal["phase"] == "archive_published"
+    journal["phase"] = "initialized"
+    write_json(paths["journal"], journal)
+    del plan["restart_failure_point"]
+
+    status = run_runner("-Stage", "Status", "-StatePath", str(state_path), plan=plan, tmp_path=tmp_path)
+
+    assert status.returncode == 0, status.stderr
+    payload = json.loads(status.stdout)
+    assert payload["classification"] == "INVALID_OR_UNCERTAIN_STATE"
+    assert "phase" in payload["report"].lower()
+    assert state_path.read_bytes() == state_before
+
+
+def test_restart_refuses_retired_state_junction_before_state_mutation(tmp_path):
+    plan, state_path, state, _, originals = prepare_fresh_restart_candidate(tmp_path)
+    plan["restart_failure_point"] = "after_original_directory_move"
+    paths = restart_transaction_paths(plan, state_path, state["session_id"])
+    assert run_restart(plan, tmp_path, state_path).returncode != 0
+    active_dir = Path(plan["calibration"]["left"]["path"]).parent
+    assert_complete_pair(active_dir, originals)
+    state_before = state_path.read_bytes()
+    junction = paths["archive"] / "retired-state"
+    junction_target = tmp_path / "retired-state-junction-target"
+    junction_target.mkdir()
+    junction_result = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(junction), str(junction_target)],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=10,
+    )
+    if junction_result.returncode != 0:
+        pytest.skip(f"temporary junction creation is unavailable: {junction_result.stderr}")
+    del plan["restart_failure_point"]
+
+    try:
+        resumed = run_restart(plan, tmp_path, state_path)
+
+        assert resumed.returncode != 0
+        assert "reparse point" in resumed.stderr.lower()
+        assert state_path.read_bytes() == state_before
+        assert list(junction_target.iterdir()) == []
+        assert_complete_pair(active_dir, originals)
+        assert paths["journal"].is_file()
+    finally:
+        if junction.exists():
+            os.rmdir(junction)
+        shutil.rmtree(junction_target, ignore_errors=True)
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    ["native_stage_truth", "source_provenance", "recovery_provenance", "completed_utc", "exact_schema"],
+)
+def test_status_refuses_tampered_completed_receipt_bindings(tmp_path, tamper):
+    plan, state_path, state, _, _ = prepare_fresh_restart_candidate(tmp_path)
+    archive = restart_transaction_paths(plan, state_path, state["session_id"])["archive"]
+    assert run_restart(plan, tmp_path, state_path).returncode == 0
+    receipt_path = archive / "restart-receipt.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    if tamper == "native_stage_truth":
+        receipt["native_stage_truth"]["Calibrate"]["native"]["attempted"] = False
+    elif tamper == "source_provenance":
+        receipt["source_provenance"]["repo_head"] = "f" * 40
+    elif tamper == "recovery_provenance":
+        receipt["recovery_provenance"]["runner_sha256"] = "0" * 64
+    elif tamper == "completed_utc":
+        receipt["completed_utc"] = "not-a-timestamp"
+    else:
+        receipt["unexpected"] = True
+    write_json(receipt_path, receipt)
+
+    status = run_runner("-Stage", "Status", "-StatePath", str(state_path), plan=plan, tmp_path=tmp_path)
+
+    assert status.returncode == 0, status.stderr
+    payload = json.loads(status.stdout)
+    assert payload["classification"] == "INVALID_OR_UNCERTAIN_STATE"
+    assert "receipt" in payload["report"].lower()
+
+
+@pytest.mark.parametrize(
+    "failure_point",
+    ["after_initial_journal_temp_flush", "after_receipt_temp_flush", "after_receipt_publish"],
+)
+def test_restart_durable_write_and_receipt_ordering_seams_resume(tmp_path, failure_point):
+    plan, state_path, state, fresh, originals = prepare_fresh_restart_candidate(tmp_path)
+    plan["restart_failure_point"] = failure_point
+    paths = restart_transaction_paths(plan, state_path, state["session_id"])
+    receipt_path = paths["archive"] / "restart-receipt.json"
+    journal_temp = Path(f"{paths['journal']}.restart-durable.tmp")
+    receipt_temp = Path(f"{receipt_path}.restart-durable.tmp")
+
+    failed = run_restart(plan, tmp_path, state_path)
+
+    assert failed.returncode != 0
+    assert f"TEST FAILURE INJECTION: {failure_point}" in failed.stderr
+    if failure_point == "after_initial_journal_temp_flush":
+        assert journal_temp.is_file()
+        assert not paths["journal"].exists()
+        assert state_path.is_file()
+        assert_complete_pair(Path(plan["calibration"]["left"]["path"]).parent, fresh)
+    elif failure_point == "after_receipt_temp_flush":
+        assert receipt_temp.is_file()
+        assert not receipt_path.exists()
+        assert paths["journal"].is_file()
+        assert not state_path.exists()
+        assert_complete_pair(Path(plan["calibration"]["left"]["path"]).parent, originals)
+    else:
+        assert receipt_path.is_file()
+        assert paths["journal"].is_file()
+        assert not state_path.exists()
+        assert_complete_pair(Path(plan["calibration"]["left"]["path"]).parent, originals)
+
+    del plan["restart_failure_point"]
+    resumed = run_restart(plan, tmp_path, state_path)
+
+    assert resumed.returncode == 0, resumed.stderr
+    assert resumed.stdout.strip() == "RESTART_CALIBRATION_COMPLETE"
+    assert receipt_path.is_file()
+    assert not paths["journal"].exists()
+    assert not journal_temp.exists()
+    assert not receipt_temp.exists()
+
+
+@pytest.mark.parametrize("unexpected_kind", ["file", "directory", "premature_receipt_temp"])
+def test_status_and_restart_refuse_unexpected_published_archive_entry_without_mutation(
+    tmp_path, unexpected_kind
+):
+    plan, state_path, state, fresh, _ = prepare_fresh_restart_candidate(tmp_path)
+    plan["restart_failure_point"] = "after_first_original_copy"
+    paths = restart_transaction_paths(plan, state_path, state["session_id"])
+    active_dir = Path(plan["calibration"]["left"]["path"]).parent
+    assert run_restart(plan, tmp_path, state_path).returncode != 0
+    state_before = state_path.read_bytes()
+    if unexpected_kind == "file":
+        write_text(paths["archive"] / "unexpected.bin", "unexpected\n")
+    elif unexpected_kind == "directory":
+        write_text(paths["archive"] / "unexpected" / "nested.bin", "unexpected\n")
+    else:
+        write_text(paths["archive"] / "restart-receipt.json.restart-durable.tmp", "premature\n")
+    del plan["restart_failure_point"]
+
+    status = run_runner("-Stage", "Status", "-StatePath", str(state_path), plan=plan, tmp_path=tmp_path)
+    resumed = run_restart(plan, tmp_path, state_path)
+
+    assert status.returncode == 0, status.stderr
+    assert json.loads(status.stdout)["classification"] == "INVALID_OR_UNCERTAIN_STATE"
+    assert resumed.returncode != 0
+    expected_error = "layout" if unexpected_kind == "premature_receipt_temp" else "unexpected"
+    assert expected_error in resumed.stderr.lower()
+    assert_complete_pair(active_dir, fresh)
+    assert state_path.read_bytes() == state_before
+    assert paths["journal"].is_file()
+
+
+def test_status_refuses_wrong_archive_path_type_while_staging_is_partial(tmp_path):
+    plan, state_path, state, fresh, _ = prepare_fresh_restart_candidate(tmp_path)
+    plan["restart_failure_point"] = "after_first_archive_copy"
+    paths = restart_transaction_paths(plan, state_path, state["session_id"])
+    active_dir = Path(plan["calibration"]["left"]["path"]).parent
+    assert run_restart(plan, tmp_path, state_path).returncode != 0
+    state_before = state_path.read_bytes()
+    write_text(paths["archive"], "wrong path type\n")
+    del plan["restart_failure_point"]
+
+    status = run_runner("-Stage", "Status", "-StatePath", str(state_path), plan=plan, tmp_path=tmp_path)
+    resumed = run_restart(plan, tmp_path, state_path)
+
+    assert status.returncode == 0, status.stderr
+    assert json.loads(status.stdout)["classification"] == "INVALID_OR_UNCERTAIN_STATE"
+    assert resumed.returncode != 0
+    assert "archive" in resumed.stderr.lower()
+    assert_complete_pair(active_dir, fresh)
+    assert state_path.read_bytes() == state_before
+    assert paths["journal"].is_file()
+
+
+def test_status_and_restart_refuse_junction_backed_archive_artifacts_without_mutation(tmp_path):
+    plan, state_path, state, fresh, _ = prepare_fresh_restart_candidate(tmp_path)
+    plan["restart_failure_point"] = "after_first_original_copy"
+    paths = restart_transaction_paths(plan, state_path, state["session_id"])
+    active_dir = Path(plan["calibration"]["left"]["path"]).parent
+    assert run_restart(plan, tmp_path, state_path).returncode != 0
+    state_before = state_path.read_bytes()
+    artifact_directory = paths["archive"] / "rejected-calibration"
+    junction_target = tmp_path / "archive-artifact-junction-target"
+    shutil.copytree(artifact_directory, junction_target)
+    shutil.rmtree(artifact_directory)
+    create_directory_junction_or_skip(artifact_directory, junction_target)
+    del plan["restart_failure_point"]
+
+    try:
+        status = run_runner("-Stage", "Status", "-StatePath", str(state_path), plan=plan, tmp_path=tmp_path)
+        resumed = run_restart(plan, tmp_path, state_path)
+
+        assert status.returncode == 0, status.stderr
+        assert json.loads(status.stdout)["classification"] == "INVALID_OR_UNCERTAIN_STATE"
+        assert resumed.returncode != 0
+        assert "reparse point" in resumed.stderr.lower()
+        assert_complete_pair(active_dir, fresh)
+        assert state_path.read_bytes() == state_before
+        assert paths["journal"].is_file()
+    finally:
+        if artifact_directory.exists():
+            os.rmdir(artifact_directory)
+        shutil.rmtree(junction_target, ignore_errors=True)
+
+
+def test_status_and_restart_identify_reparse_archive_record_before_mutation(tmp_path):
+    plan, state_path, state, fresh, _ = prepare_fresh_restart_candidate(tmp_path)
+    plan["restart_failure_point"] = "after_first_original_copy"
+    paths = restart_transaction_paths(plan, state_path, state["session_id"])
+    active_dir = Path(plan["calibration"]["left"]["path"]).parent
+    assert run_restart(plan, tmp_path, state_path).returncode != 0
+    state_before = state_path.read_bytes()
+    record_path = paths["archive"] / "archive-record.json"
+    record_path.unlink()
+    junction_target = tmp_path / "archive-record-junction-target"
+    junction_target.mkdir()
+    create_directory_junction_or_skip(record_path, junction_target)
+    del plan["restart_failure_point"]
+
+    try:
+        status = run_runner("-Stage", "Status", "-StatePath", str(state_path), plan=plan, tmp_path=tmp_path)
+        resumed = run_restart(plan, tmp_path, state_path)
+
+        assert status.returncode == 0, status.stderr
+        assert json.loads(status.stdout)["classification"] == "INVALID_OR_UNCERTAIN_STATE"
+        assert resumed.returncode != 0
+        assert "reparse point" in resumed.stderr.lower()
+        assert_complete_pair(active_dir, fresh)
+        assert state_path.read_bytes() == state_before
+        assert paths["journal"].is_file()
+    finally:
+        if record_path.exists():
+            os.rmdir(record_path)
+        shutil.rmtree(junction_target, ignore_errors=True)
+
+
+def test_reparse_receipt_cannot_retire_live_journal(tmp_path):
+    plan, state_path, state, _, originals = prepare_fresh_restart_candidate(tmp_path)
+    plan["restart_failure_point"] = "after_receipt_publish"
+    paths = restart_transaction_paths(plan, state_path, state["session_id"])
+    active_dir = Path(plan["calibration"]["left"]["path"]).parent
+    assert run_restart(plan, tmp_path, state_path).returncode != 0
+    receipt_path = paths["archive"] / "restart-receipt.json"
+    receipt_path.unlink()
+    junction_target = tmp_path / "receipt-junction-target"
+    junction_target.mkdir()
+    create_directory_junction_or_skip(receipt_path, junction_target)
+    del plan["restart_failure_point"]
+
+    try:
+        status = run_runner("-Stage", "Status", "-StatePath", str(state_path), plan=plan, tmp_path=tmp_path)
+        resumed = run_restart(plan, tmp_path, state_path)
+
+        assert status.returncode == 0, status.stderr
+        assert json.loads(status.stdout)["classification"] == "INVALID_OR_UNCERTAIN_STATE"
+        assert resumed.returncode != 0
+        assert "reparse point" in resumed.stderr.lower()
+        assert paths["journal"].is_file()
+        assert_complete_pair(active_dir, originals)
+        assert not state_path.exists()
+        assert list(junction_target.iterdir()) == []
+    finally:
+        if receipt_path.exists():
+            os.rmdir(receipt_path)
+        shutil.rmtree(junction_target, ignore_errors=True)
+
+
+def test_restart_write_through_archive_namespace_publication_seam_resumes(tmp_path):
+    plan, state_path, state, fresh, originals = prepare_fresh_restart_candidate(tmp_path)
+    plan["restart_failure_point"] = "after_archive_namespace_publish"
+    paths = restart_transaction_paths(plan, state_path, state["session_id"])
+    active_dir = Path(plan["calibration"]["left"]["path"]).parent
+
+    failed = run_restart(plan, tmp_path, state_path)
+
+    assert failed.returncode != 0
+    assert "TEST FAILURE INJECTION: after_archive_namespace_publish" in failed.stderr
+    assert paths["archive"].is_dir()
+    assert not paths["archive_staging"].exists()
+    assert json.loads(paths["journal"].read_text(encoding="utf-8"))["phase"] == "archive_staged"
+    assert_complete_pair(active_dir, fresh)
+    assert state_path.is_file()
+
+    del plan["restart_failure_point"]
+    status = run_runner("-Stage", "Status", "-StatePath", str(state_path), plan=plan, tmp_path=tmp_path)
+    resumed = run_restart(plan, tmp_path, state_path)
+
+    assert status.returncode == 0, status.stderr
+    assert json.loads(status.stdout)["classification"] == "RESTART_CALIBRATION_RECOVERABLE"
+    assert resumed.returncode == 0, resumed.stderr
+    assert_complete_pair(active_dir, originals)
+    assert not paths["journal"].exists()
+
+
+@pytest.mark.parametrize(
+    ("first_failure", "second_failure", "normalized_phase", "second_layout"),
+    [
+        (
+            "after_archive_namespace_publish",
+            "after_first_original_copy",
+            "archive_published",
+            "partial_original",
+        ),
+        (
+            "after_active_directory_move",
+            "after_original_directory_move",
+            "active_withdrawn",
+            "original_activated",
+        ),
+        (
+            "after_original_directory_move",
+            "after_fresh_pair_namespace_publish",
+            "original_activated",
+            "fresh_pair_retired",
+        ),
+        (
+            "after_fresh_pair_namespace_publish",
+            "after_state_namespace_publish",
+            "fresh_pair_retired",
+            "state_retired",
+        ),
+        (
+            "after_state_namespace_publish",
+            "after_receipt_temp_flush",
+            "state_retired",
+            "receipt_temp",
+        ),
+    ],
+)
+def test_restart_reconciles_journal_before_chained_namespace_interruption(
+    tmp_path, first_failure, second_failure, normalized_phase, second_layout
+):
+    plan, state_path, state, fresh, originals = prepare_fresh_restart_candidate(tmp_path)
+    paths = restart_transaction_paths(plan, state_path, state["session_id"])
+    active_dir = Path(plan["calibration"]["left"]["path"]).parent
+    plan["restart_failure_point"] = first_failure
+
+    first = run_restart(plan, tmp_path, state_path)
+
+    assert first.returncode != 0
+    assert f"TEST FAILURE INJECTION: {first_failure}" in first.stderr
+    first_status = run_runner("-Stage", "Status", "-StatePath", str(state_path), plan=plan, tmp_path=tmp_path)
+    assert first_status.returncode == 0, first_status.stderr
+    assert json.loads(first_status.stdout)["classification"] == "RESTART_CALIBRATION_RECOVERABLE"
+
+    plan["restart_failure_point"] = second_failure
+    second = run_restart(plan, tmp_path, state_path)
+
+    assert second.returncode != 0
+    assert f"TEST FAILURE INJECTION: {second_failure}" in second.stderr
+    journal = json.loads(paths["journal"].read_text(encoding="utf-8"))
+    assert journal["phase"] == normalized_phase
+    second_status = run_runner("-Stage", "Status", "-StatePath", str(state_path), plan=plan, tmp_path=tmp_path)
+    assert second_status.returncode == 0, second_status.stderr
+    assert json.loads(second_status.stdout)["classification"] == "RESTART_CALIBRATION_RECOVERABLE"
+
+    if second_layout == "partial_original":
+        assert_complete_pair(active_dir, fresh)
+        assert len([path for path in paths["staged_original"].iterdir() if path.is_file()]) == 1
+        assert not paths["rollback"].exists()
+    elif second_layout == "original_activated":
+        assert_complete_pair(active_dir, originals)
+        assert_complete_pair(paths["rollback"], fresh)
+        assert not paths["staged_original"].exists()
+    elif second_layout == "fresh_pair_retired":
+        assert_complete_pair(active_dir, originals)
+        assert_complete_pair(paths["archive"] / "retired-active-calibration", fresh)
+        assert not paths["rollback"].exists()
+        assert not paths["staged_original"].exists()
+    else:
+        assert_complete_pair(active_dir, originals)
+        assert_complete_pair(paths["archive"] / "retired-active-calibration", fresh)
+        assert not state_path.exists()
+        assert (paths["archive"] / "retired-state" / state_path.name).is_file()
+        receipt_path = paths["archive"] / "restart-receipt.json"
+        if second_layout == "state_retired":
+            assert not receipt_path.exists()
+            assert not Path(f"{receipt_path}.restart-durable.tmp").exists()
+        else:
+            assert not receipt_path.exists()
+            assert Path(f"{receipt_path}.restart-durable.tmp").is_file()
+
+    del plan["restart_failure_point"]
+    third = run_restart(plan, tmp_path, state_path)
+
+    assert third.returncode == 0, third.stderr
+    assert third.stdout.strip() == "RESTART_CALIBRATION_COMPLETE"
+    assert_complete_pair(active_dir, originals)
+    assert_complete_pair(paths["archive"] / "retired-active-calibration", fresh)
+    assert not paths["journal"].exists()
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "renamed_calibration",
+        "relabeled_source",
+        "relabeled_state_source",
+        "source_mtime_claims",
+        "calibration_identity",
+        "full_state",
+        "nested_state_schema",
+        "pending_native_truth",
+        "evidence_semantics",
+        "transcript_semantics",
+        "manifest_bytes",
+    ],
+)
+def test_status_rejects_self_consistent_archive_claims_not_derived_from_plan_and_state(tmp_path, tamper):
+    plan, state_path, state, _, _ = prepare_fresh_restart_candidate(tmp_path)
+    archive = restart_transaction_paths(plan, state_path, state["session_id"])["archive"]
+    assert run_restart(plan, tmp_path, state_path).returncode == 0
+    record_path = archive / "archive-record.json"
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    tampered_native_truth = None
+
+    def sync_archived_state(archived_state: dict[str, object]) -> None:
+        snapshot_path = Path(record["artifacts"]["state"]["archive_path"])
+        retired_path = archive / "retired-state" / Path(archived_state["state_path"]).name
+        write_json(snapshot_path, archived_state)
+        write_json(retired_path, archived_state)
+        update_archive_artifact_identity(record, "state", snapshot_path)
+        record["artifacts"]["state"]["source_mtime_utc"] = powershell_utc_timestamp(retired_path)
+
+    if tamper == "renamed_calibration":
+        old_path = Path(record["artifacts"]["left_calibration"]["archive_path"])
+        renamed_path = old_path.with_name("renamed-left-calibration.json")
+        old_path.rename(renamed_path)
+        record["artifacts"]["left_calibration"]["archive_path"] = str(renamed_path)
+        update_archive_artifact_identity(record, "left_calibration", renamed_path)
+    elif tamper == "relabeled_source":
+        source_name = Path(record["artifacts"]["left_calibration"]["source_path"]).name
+        record["artifacts"]["left_calibration"]["source_path"] = str(tmp_path / "other-owner" / source_name)
+    elif tamper == "relabeled_state_source":
+        old_snapshot_path = Path(record["artifacts"]["state"]["archive_path"])
+        old_retired_path = archive / "retired-state" / state_path.name
+        relabeled_state_path = state_path.with_name("relabeled-state.json")
+        relabeled_snapshot_path = old_snapshot_path.with_name(relabeled_state_path.name)
+        relabeled_retired_path = old_retired_path.with_name(relabeled_state_path.name)
+        archived_state = json.loads(old_snapshot_path.read_text(encoding="utf-8"))
+        old_snapshot_path.rename(relabeled_snapshot_path)
+        old_retired_path.rename(relabeled_retired_path)
+        archived_state["state_path"] = str(relabeled_state_path)
+        archived_state["session_binding_sha256"] = state_session_binding_sha256(archived_state)
+        evidence_path = Path(record["artifacts"]["evidence"]["archive_path"])
+        evidence_mtime_ns = evidence_path.stat().st_mtime_ns
+        evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+        evidence["state_path"] = str(relabeled_state_path)
+        evidence["state_session_binding"] = archived_state["session_binding_sha256"]
+        write_json(evidence_path, evidence)
+        os.utime(evidence_path, ns=(evidence_mtime_ns, evidence_mtime_ns))
+        archived_state["artifacts"]["evidence"]["sha256"] = sha256_path(evidence_path)
+        archived_state["artifacts"]["evidence"]["size"] = evidence_path.stat().st_size
+        write_json(relabeled_snapshot_path, archived_state)
+        write_json(relabeled_retired_path, archived_state)
+        record["state_binding_sha256"] = archived_state["session_binding_sha256"]
+        record["artifacts"]["state"]["source_path"] = str(relabeled_state_path)
+        record["artifacts"]["state"]["archive_path"] = str(relabeled_snapshot_path)
+        update_archive_artifact_identity(record, "state", relabeled_snapshot_path)
+        record["artifacts"]["state"]["source_mtime_utc"] = powershell_utc_timestamp(relabeled_retired_path)
+        update_archive_artifact_identity(record, "evidence", evidence_path)
+        record["artifacts"]["evidence"]["source_mtime_utc"] = powershell_utc_timestamp(evidence_path)
+    elif tamper == "source_mtime_claims":
+        preserved_source_mtimes = {
+            name: powershell_utc_timestamp(Path(record["artifacts"][name]["archive_path"]))
+            for name in ("transcript", "evidence")
+        }
+        assert {
+            name: record["artifacts"][name]["source_mtime_utc"]
+            for name in ("transcript", "evidence")
+        } == preserved_source_mtimes
+        record["artifacts"]["transcript"]["source_mtime_utc"] = "2001-01-01T00:00:00.0000000Z"
+        record["artifacts"]["evidence"]["source_mtime_utc"] = "2002-01-01T00:00:00.0000000Z"
+    elif tamper == "calibration_identity":
+        archived_path = Path(record["artifacts"]["left_calibration"]["archive_path"])
+        retired_path = archive / "retired-active-calibration" / archived_path.name
+        write_json(archived_path, make_calibration(901))
+        shutil.copy2(archived_path, retired_path)
+        update_archive_artifact_identity(record, "left_calibration", archived_path)
+        record["artifacts"]["left_calibration"]["source_mtime_utc"] = powershell_utc_timestamp(retired_path)
+    elif tamper == "full_state":
+        snapshot_path = Path(record["artifacts"]["state"]["archive_path"])
+        archived_state = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        archived_state["unbound_archive_claim"] = "tampered"
+        sync_archived_state(archived_state)
+    elif tamper == "nested_state_schema":
+        snapshot_path = Path(record["artifacts"]["state"]["archive_path"])
+        archived_state = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        archived_state["artifacts"]["transcript"]["unbound_archive_claim"] = "tampered"
+        sync_archived_state(archived_state)
+    elif tamper == "pending_native_truth":
+        snapshot_path = Path(record["artifacts"]["state"]["archive_path"])
+        archived_state = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        archived_state["stages"][LEFT_MAP_STAGE]["native"] = {
+            "attempted": True,
+            "launched": True,
+            "real_exit_code": 0,
+            "executable": "invented.exe",
+            "arguments": ["--invented"],
+        }
+        tampered_native_truth = archived_state["stages"]
+        sync_archived_state(archived_state)
+    elif tamper == "evidence_semantics":
+        evidence_path = Path(record["artifacts"]["evidence"]["archive_path"])
+        evidence_mtime_ns = evidence_path.stat().st_mtime_ns
+        evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+        evidence["unbound_archive_claim"] = "tampered"
+        write_json(evidence_path, evidence)
+        os.utime(evidence_path, ns=(evidence_mtime_ns, evidence_mtime_ns))
+        update_archive_artifact_identity(record, "evidence", evidence_path)
+    elif tamper == "transcript_semantics":
+        transcript_path = Path(record["artifacts"]["transcript"]["archive_path"])
+        transcript_mtime_ns = transcript_path.stat().st_mtime_ns
+        transcript_lines = transcript_path.read_text(encoding="utf-8").splitlines()
+        transcript_lines[0] = "TAMPERED_TRANSCRIPT_HEADER=1"
+        write_text(transcript_path, "\n".join(transcript_lines) + "\n")
+        os.utime(transcript_path, ns=(transcript_mtime_ns, transcript_mtime_ns))
+        evidence_path = Path(record["artifacts"]["evidence"]["archive_path"])
+        evidence_mtime_ns = evidence_path.stat().st_mtime_ns
+        evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+        evidence["transcript_sha256"] = sha256_path(transcript_path)
+        evidence["transcript_size"] = transcript_path.stat().st_size
+        write_json(evidence_path, evidence)
+        os.utime(evidence_path, ns=(evidence_mtime_ns, evidence_mtime_ns))
+        snapshot_path = Path(record["artifacts"]["state"]["archive_path"])
+        archived_state = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        archived_state["artifacts"]["transcript"]["sha256"] = sha256_path(transcript_path)
+        archived_state["artifacts"]["transcript"]["size"] = transcript_path.stat().st_size
+        archived_state["artifacts"]["evidence"]["sha256"] = sha256_path(evidence_path)
+        archived_state["artifacts"]["evidence"]["size"] = evidence_path.stat().st_size
+        sync_archived_state(archived_state)
+        update_archive_artifact_identity(record, "transcript", transcript_path)
+        update_archive_artifact_identity(record, "evidence", evidence_path)
+    else:
+        manifest = record["immutable_backup"]["manifest"]
+        manifest_path = Path(manifest["archive_path"])
+        manifest_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest_payload["unbound_archive_claim"] = "tampered"
+        write_json(manifest_path, manifest_payload)
+        manifest["sha256"] = sha256_path(manifest_path)
+        manifest["size"] = manifest_path.stat().st_size
+        manifest["archive_mtime_utc"] = powershell_utc_timestamp(manifest_path)
+
+    rewrite_archive_record_and_receipt(archive, record)
+    if tampered_native_truth is not None:
+        receipt_path = archive / "restart-receipt.json"
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt["native_stage_truth"] = tampered_native_truth
+        write_json(receipt_path, receipt)
+    active_dir = Path(plan["calibration"]["left"]["path"]).parent
+    active_before_status = {path.name: path.read_bytes() for path in active_dir.iterdir()}
+    archive_before_status = {
+        str(path.relative_to(archive)): path.read_bytes() for path in archive.rglob("*") if path.is_file()
+    }
+
+    status = run_runner("-Stage", "Status", "-StatePath", str(state_path), plan=plan, tmp_path=tmp_path)
+
+    assert status.returncode == 0, status.stderr
+    payload = json.loads(status.stdout)
+    assert payload["classification"] == "INVALID_OR_UNCERTAIN_STATE"
+    if tamper == "transcript_semantics":
+        assert "transcript semantic validation failed" in payload["report"].lower()
+    else:
+        assert "rejected archive" in payload["report"].lower()
+    assert {path.name: path.read_bytes() for path in active_dir.iterdir()} == active_before_status
+    assert {str(path.relative_to(archive)): path.read_bytes() for path in archive.rglob("*") if path.is_file()} == archive_before_status
+    assert not state_path.exists()
+    assert not Path(f"{state_path}.restart-calibration.json").exists()
