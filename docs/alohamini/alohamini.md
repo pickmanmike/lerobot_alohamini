@@ -534,7 +534,15 @@ C:\Users\pickm\AlohaMini1Logs\packet2n-r5-state.json
 
 `Status` classifies the current files and any persisted session, while `Calibrate` creates a new bound state only after its offline guards pass. Every continuation stage reloads and revalidates that state, the corrected port ownership, current calibration identities, immutable backup and manifest, evidence, transcript, completed map artifacts, Git provenance, import sources, and confined artifact paths before any later COM construction. Hardware confirmations are exact and case-sensitive. Native execution records whether launch was attempted and completed, captures the actual exit code immediately, and writes a success terminator only after a launched process returns zero. Later stages reparse and rehash prior artifacts instead of trusting state summaries. A failure preserves the primary error and prints the recovery classification and next stage.
 
-`Status` is entirely offline and hardware-free:
+`DiagnoseImports` is the entirely offline repository-source preflight used by `Calibrate`. It uses the exact repository virtual environment, prints the interpreter, environment, editable-install metadata, `.pth` source, and expected/actual path for every guarded module, and changes neither calibration files nor runner state:
+
+```powershell
+pwsh -NoLogo -NoProfile -File .\tools\packet2n_r5_leader_mapping.ps1 -Stage DiagnoseImports
+```
+
+It must exit zero with `"matches":true` before a later authorized calibration. A refusal identifies the mismatched module and its expected and actual canonical paths; do not bypass it or repair calibration files in response.
+
+`Status` is also entirely offline and hardware-free:
 
 ```powershell
 pwsh -NoLogo -NoProfile -File .\tools\packet2n_r5_leader_mapping.ps1 -Stage Status
@@ -544,7 +552,7 @@ The current required result is `ORIGINAL_CALIBRATION_INTACT` with `next_stage` e
 
 ##### Physical-stage prerequisites and commands
 
-The current safe state is both leader 7.4 V supplies off, both leader USB controllers disconnected, follower/body 12 V power off, and the Pi motor host stopped. In that state only `Status` is justified. The exact next Pi command is none.
+The current safe state is both leader 7.4 V supplies off, both leader USB controllers disconnected, follower/body 12 V power off, and the Pi motor host stopped. In that state only `DiagnoseImports` and `Status` are justified. The exact next Pi command is none.
 
 Do not run a hardware stage without separate physical authorization. Immediately before an authorized `Calibrate`, `MapLeft`, or `MapRight` stage:
 

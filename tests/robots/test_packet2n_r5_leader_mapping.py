@@ -24,6 +24,18 @@ LEADER_ID = "so101_leader_bi"
 ARM_PROFILE = "so-arm-5dof"
 LEFT_MAP_STAGE = "MapLeft"
 RIGHT_MAP_STAGE = "MapRight"
+IMPORT_SOURCE_PATHS = {
+    "lerobot": REPO_ROOT / "src" / "lerobot" / "__init__.py",
+    "calibrate_bi": REPO_ROOT / "examples" / "alohamini" / "calibrate_bi.py",
+    "teleoperate_bi": REPO_ROOT / "examples" / "alohamini" / "teleoperate_bi.py",
+    "leader_client_utils": REPO_ROOT / "examples" / "alohamini" / "leader_client_utils.py",
+    "lerobot.teleoperators.bi_so_leader.bi_so_leader": (
+        REPO_ROOT / "src" / "lerobot" / "teleoperators" / "bi_so_leader" / "bi_so_leader.py"
+    ),
+    "lerobot.teleoperators.so_leader.so_leader": (
+        REPO_ROOT / "src" / "lerobot" / "teleoperators" / "so_leader" / "so_leader.py"
+    ),
+}
 SAMPLE_KEYS = (
     "arm_left_shoulder_pan.pos",
     "arm_left_shoulder_lift.pos",
@@ -195,6 +207,41 @@ def make_actual_map_log(
     return "\n".join(lines) + "\n"
 
 
+def make_import_source_probe() -> dict[str, object]:
+    python_path = REPO_ROOT / ".venv" / "Scripts" / "python.exe"
+    site_packages = REPO_ROOT / ".venv" / "Lib" / "site-packages"
+    return {
+        "exit_code": 0,
+        "stderr": [],
+        "repository_root": str(REPO_ROOT),
+        "cwd": str(REPO_ROOT),
+        "python_executable": str(python_path),
+        "sys_executable": str(python_path),
+        "sys_prefix": str(REPO_ROOT / ".venv"),
+        "sys_base_prefix": r"C:\Python312",
+        "pythonpath": None,
+        "sys_path": [
+            str(REPO_ROOT / "examples" / "alohamini"),
+            str(site_packages),
+            str(REPO_ROOT / "src"),
+        ],
+        "direct_url": {
+            "path": str(site_packages / "lerobot-0.6.1.dist-info" / "direct_url.json"),
+            "content": {"url": REPO_ROOT.as_uri(), "dir_info": {"editable": True}},
+        },
+        "pth_files": [
+            {
+                "path": str(site_packages / "__editable__.lerobot-0.6.1.pth"),
+                "content": f"{REPO_ROOT / 'src'}\n",
+                "error": None,
+            }
+        ],
+        "modules": [
+            {"name": name, "path": str(path), "error": None} for name, path in IMPORT_SOURCE_PATHS.items()
+        ],
+    }
+
+
 def base_plan(tmp_path: Path) -> dict[str, object]:
     logs_dir = tmp_path / "logs"
     session_id = "test-session"
@@ -249,6 +296,8 @@ def base_plan(tmp_path: Path) -> dict[str, object]:
         "python_env_clean": True,
         "python_resolved": True,
         "import_sources_match": True,
+        "python_path": str(REPO_ROOT / ".venv" / "Scripts" / "python.exe"),
+        "import_source_probe": make_import_source_probe(),
         "calibration_root": str(tmp_path / "calibration"),
         "state_root": str(logs_dir),
         "manifest": {
@@ -309,9 +358,12 @@ def run_runner(
     plan: dict[str, object] | None = None,
     tmp_path: Path | None = None,
     ps_native_error_preference: bool = False,
+    extra_env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     assert SCRIPT_PATH.exists(), "the packet2n_r5 leader mapping runner is missing"
     env = os.environ.copy()
+    if extra_env:
+        env.update(extra_env)
     if plan is not None:
         assert tmp_path is not None
         plan_path = tmp_path / "plan.json"
@@ -388,6 +440,23 @@ def run_calibrate(plan: dict[str, object], tmp_path: Path, state_path: Path) -> 
         plan=plan,
         tmp_path=tmp_path,
     )
+
+
+def run_diagnose_imports(
+    plan: dict[str, object], tmp_path: Path, state_path: Path
+) -> subprocess.CompletedProcess[str]:
+    return run_runner(
+        "-Stage",
+        "DiagnoseImports",
+        "-StatePath",
+        str(state_path),
+        plan=plan,
+        tmp_path=tmp_path,
+    )
+
+
+def import_probe_module(plan: dict[str, object], module_name: str) -> dict[str, object]:
+    return next(record for record in plan["import_source_probe"]["modules"] if record["name"] == module_name)
 
 
 def run_map_stage(
@@ -493,6 +562,323 @@ def install_actual_map_artifacts(state_path: Path, state: dict[str, object]) -> 
         state["artifacts"][artifact_name]["sha256"] = sha256_path(path)
     write_json(state_path, state)
     return left_path, right_path
+
+
+def test_diagnose_imports_accepts_the_current_repository_without_state_mutation(tmp_path):
+    state_path = tmp_path / "logs" / "packet2n-r5-state.json"
+
+    result = run_runner("-Stage", "DiagnoseImports", "-StatePath", str(state_path))
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["matches"] is True
+    assert [record["module"] for record in payload["modules"]] == list(IMPORT_SOURCE_PATHS)
+    assert all(record["matches"] for record in payload["modules"])
+    assert not state_path.exists()
+
+
+def test_diagnose_imports_is_offline_and_preserves_calibration_and_runner_state(tmp_path):
+    plan = base_plan(tmp_path)
+    state_path = tmp_path / "logs" / "packet2n-r5-state.json"
+    calibration_paths = [Path(plan["calibration"][side]["path"]) for side in ("left", "right")]
+    before_hashes = [sha256_path(path) for path in calibration_paths]
+
+    result = run_diagnose_imports(plan, tmp_path, state_path)
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["matches"] is True
+    assert [sha256_path(path) for path in calibration_paths] == before_hashes
+    assert not state_path.exists()
+    assert not Path(plan["stage_plan"]["Calibrate"]["transcript_path"]).exists()
+    assert not Path(plan["stage_plan"]["Calibrate"]["evidence_path"]).exists()
+
+
+def test_diagnose_imports_stage_name_is_case_insensitive_without_recovery_side_effects(tmp_path):
+    plan = base_plan(tmp_path)
+    state_path = tmp_path / "logs" / "packet2n-r5-state.json"
+
+    result = run_runner(
+        "-Stage", "diagnoseimports", "-StatePath", str(state_path), plan=plan, tmp_path=tmp_path
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["matches"] is True
+    assert "RECOVERY_CLASSIFICATION=" not in result.stderr
+    assert not state_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("case", "changed_modules"),
+    [
+        ("stale external checkout", tuple(IMPORT_SOURCE_PATHS)),
+        ("mixed checkout", ("teleoperate_bi",)),
+        ("global or user-site lerobot", ("lerobot",)),
+    ],
+)
+def test_diagnose_imports_refuses_external_and_mixed_module_sources(tmp_path, case, changed_modules):
+    plan = base_plan(tmp_path)
+    external_root = tmp_path / "external-site"
+    for module_name in changed_modules:
+        external_path = external_root / Path(*module_name.split(".")).with_suffix(".py")
+        write_text(external_path, "# external\n")
+        import_probe_module(plan, module_name)["path"] = str(external_path)
+    state_path = tmp_path / "logs" / "packet2n-r5-state.json"
+
+    result = run_diagnose_imports(plan, tmp_path, state_path)
+
+    assert result.returncode != 0, case
+    payload = json.loads(result.stdout)
+    assert payload["matches"] is False
+    for module_name in changed_modules:
+        record = next(record for record in payload["modules"] if record["module"] == module_name)
+        assert record["matches"] is False
+        assert record["expected_canonical"] == str(IMPORT_SOURCE_PATHS[module_name])
+        assert record["actual_canonical"] == str(Path(import_probe_module(plan, module_name)["path"]))
+        assert module_name in result.stderr
+        assert record["expected_canonical"] in result.stderr
+        assert record["actual_canonical"] in result.stderr
+    assert not state_path.exists()
+
+
+def test_diagnose_imports_refuses_inherited_pythonpath_even_when_modules_resolve_locally(tmp_path):
+    state_path = tmp_path / "logs" / "packet2n-r5-state.json"
+
+    result = run_runner(
+        "-Stage",
+        "DiagnoseImports",
+        "-StatePath",
+        str(state_path),
+        extra_env={"PYTHONPATH": str(tmp_path / "contaminating-pythonpath")},
+    )
+
+    assert result.returncode != 0
+    payload = json.loads(result.stdout)
+    assert payload["matches"] is False
+    assert "PYTHONPATH" in result.stderr
+    assert "RECOVERY_CLASSIFICATION=" not in result.stderr
+    assert "RECOVERY_NEXT_STAGE=" not in result.stderr
+    assert not state_path.exists()
+
+
+def test_diagnose_imports_does_not_launch_python_when_guarded_environment_is_set(tmp_path):
+    sentinel_path = tmp_path / "python-child-launched.txt"
+    contaminating_path = tmp_path / "contaminating-pythonpath"
+    write_text(
+        contaminating_path / "sitecustomize.py",
+        "from pathlib import Path\n"
+        f"Path({str(sentinel_path)!r}).write_text('launched', encoding='utf-8')\n",
+    )
+    state_path = tmp_path / "logs" / "packet2n-r5-state.json"
+
+    result = run_runner(
+        "-Stage",
+        "DiagnoseImports",
+        "-StatePath",
+        str(state_path),
+        extra_env={"PYTHONPATH": str(contaminating_path)},
+    )
+
+    assert result.returncode != 0
+    payload = json.loads(result.stdout)
+    assert payload["matches"] is False
+    assert "probe skipped because guarded override variables are set" in payload["failures"]
+    assert "PYTHONPATH" in result.stderr
+    assert not sentinel_path.exists()
+    assert not state_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("direct_url_change", "expected_reason"),
+    [
+        ({"url": "file:///C:/stale/external/lerobot", "dir_info": {"editable": True}}, "editable URL"),
+        ({"url": REPO_ROOT.as_uri(), "dir_info": {"editable": False}}, "editable installation"),
+    ],
+)
+def test_diagnose_imports_rejects_stale_or_noneditable_distribution_metadata(
+    tmp_path, direct_url_change, expected_reason
+):
+    plan = base_plan(tmp_path)
+    plan["import_source_probe"]["direct_url"]["content"] = direct_url_change
+    state_path = tmp_path / "logs" / "packet2n-r5-state.json"
+
+    result = run_diagnose_imports(plan, tmp_path, state_path)
+
+    assert result.returncode != 0
+    payload = json.loads(result.stdout)
+    assert payload["matches"] is False
+    assert payload["direct_url"]["matches"] is False
+    assert expected_reason in payload["direct_url"]["reason"]
+    assert expected_reason in result.stderr
+    assert "RECOVERY_CLASSIFICATION=" not in result.stderr
+    assert not state_path.exists()
+
+
+def test_diagnose_imports_accepts_legitimate_windows_path_case_differences(tmp_path):
+    plan = base_plan(tmp_path)
+    for record in plan["import_source_probe"]["modules"]:
+        record["path"] = record["path"].swapcase()
+    plan["import_source_probe"]["sys_executable"] = plan["import_source_probe"]["sys_executable"].swapcase()
+    state_path = tmp_path / "logs" / "packet2n-r5-state.json"
+
+    result = run_diagnose_imports(plan, tmp_path, state_path)
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["matches"] is True
+
+
+def test_diagnose_imports_rejects_sibling_path_that_only_shares_a_text_prefix(tmp_path):
+    plan = base_plan(tmp_path)
+    sibling_path = Path(f"{REPO_ROOT}-external") / "src" / "lerobot" / "__init__.py"
+    import_probe_module(plan, "lerobot")["path"] = str(sibling_path)
+    state_path = tmp_path / "logs" / "packet2n-r5-state.json"
+
+    result = run_diagnose_imports(plan, tmp_path, state_path)
+
+    assert result.returncode != 0
+    payload = json.loads(result.stdout)
+    record = next(record for record in payload["modules"] if record["module"] == "lerobot")
+    assert record["matches"] is False
+    assert record["reason"] == "source is outside the intended repository"
+
+
+@pytest.mark.parametrize(
+    ("actual_path", "expected_reason"),
+    [
+        ("\0invalid", "source path is malformed"),
+        (str(REPO_ROOT / "src" / "lerobot" / "missing.py"), "source file does not exist"),
+    ],
+)
+def test_diagnose_imports_clearly_refuses_malformed_or_missing_module_paths(tmp_path, actual_path, expected_reason):
+    plan = base_plan(tmp_path)
+    import_probe_module(plan, "lerobot")["path"] = actual_path
+    state_path = tmp_path / "logs" / "packet2n-r5-state.json"
+
+    result = run_diagnose_imports(plan, tmp_path, state_path)
+
+    assert result.returncode != 0
+    payload = json.loads(result.stdout)
+    record = next(record for record in payload["modules"] if record["module"] == "lerobot")
+    assert record["matches"] is False
+    assert record["reason"] == expected_reason
+    assert "lerobot" in result.stderr
+    assert expected_reason in result.stderr
+
+
+def test_calibrate_provenance_refusal_is_detailed_and_precedes_state_or_native_action(tmp_path):
+    plan = base_plan(tmp_path)
+    external_path = tmp_path / "external" / "teleoperate_bi.py"
+    write_text(external_path, "# external\n")
+    import_probe_module(plan, "teleoperate_bi")["path"] = str(external_path)
+    state_path = tmp_path / "logs" / "packet2n-r5-state.json"
+
+    result = run_calibrate(plan, tmp_path, state_path)
+
+    assert result.returncode != 0
+    assert "teleoperate_bi" in result.stderr
+    assert str(IMPORT_SOURCE_PATHS["teleoperate_bi"]) in result.stderr
+    assert str(external_path) in result.stderr
+    assert not state_path.exists()
+    assert not Path(plan["stage_plan"]["Calibrate"]["transcript_path"]).exists()
+
+
+def test_diagnose_imports_does_not_change_status_classification(tmp_path):
+    plan = base_plan(tmp_path)
+    state_path = tmp_path / "logs" / "packet2n-r5-state.json"
+
+    diagnose = run_diagnose_imports(plan, tmp_path, state_path)
+    status = run_runner("-Stage", "Status", "-StatePath", str(state_path), plan=plan, tmp_path=tmp_path)
+
+    assert diagnose.returncode == 0, diagnose.stderr
+    assert status.returncode == 0, status.stderr
+    payload = json.loads(status.stdout)
+    assert payload["classification"] == "ORIGINAL_CALIBRATION_INTACT"
+    assert payload["next_stage"] == "Calibrate"
+    assert not state_path.exists()
+
+
+def test_diagnose_imports_probe_failure_still_returns_actionable_json_without_state(tmp_path):
+    plan = base_plan(tmp_path)
+    plan["import_source_probe"] = {
+        "exit_code": 1,
+        "stderr": [],
+        "probe_error": "Python import probe exited with status 1",
+    }
+    state_path = tmp_path / "logs" / "packet2n-r5-state.json"
+
+    result = run_diagnose_imports(plan, tmp_path, state_path)
+
+    assert result.returncode != 0
+    payload = json.loads(result.stdout)
+    assert payload["matches"] is False
+    assert "Python import probe exited with status 1" in payload["failures"]
+    assert payload["direct_url"]["path"] is None
+    assert payload["direct_url"]["content"] is None
+    assert "Python import probe exited with status 1" in result.stderr
+    assert "RECOVERY_CLASSIFICATION=" not in result.stderr
+    assert not state_path.exists()
+
+
+def test_diagnose_imports_refuses_executable_code_in_editable_pth(tmp_path):
+    plan = base_plan(tmp_path)
+    plan["import_source_probe"]["pth_files"][0]["content"] += "import unexpected_startup_code\n"
+    state_path = tmp_path / "logs" / "packet2n-r5-state.json"
+
+    result = run_diagnose_imports(plan, tmp_path, state_path)
+
+    assert result.returncode != 0
+    payload = json.loads(result.stdout)
+    assert payload["matches"] is False
+    assert payload["pth_files"][0]["matches"] is False
+    assert payload["pth_files"][0]["reason"] == "editable .pth contains executable code"
+    assert not state_path.exists()
+
+
+def test_diagnose_imports_malformed_module_records_fail_closed_with_json(tmp_path):
+    plan = base_plan(tmp_path)
+    plan["import_source_probe"]["modules"] = "malformed"
+    state_path = tmp_path / "logs" / "packet2n-r5-state.json"
+
+    result = run_diagnose_imports(plan, tmp_path, state_path)
+
+    assert result.returncode != 0
+    payload = json.loads(result.stdout)
+    assert payload["matches"] is False
+    assert "module records are malformed" in payload["failures"]
+    assert not state_path.exists()
+
+
+def test_diagnose_imports_requires_boolean_true_editable_metadata(tmp_path):
+    plan = base_plan(tmp_path)
+    plan["import_source_probe"]["direct_url"]["content"]["dir_info"]["editable"] = "false"
+    state_path = tmp_path / "logs" / "packet2n-r5-state.json"
+
+    result = run_diagnose_imports(plan, tmp_path, state_path)
+
+    assert result.returncode != 0
+    payload = json.loads(result.stdout)
+    assert payload["matches"] is False
+    assert "does not identify an editable installation" in payload["direct_url"]["reason"]
+    assert not state_path.exists()
+
+
+@pytest.mark.parametrize("malformed_field", ["direct_url", "pth_files", "module_record"])
+def test_diagnose_imports_malformed_metadata_shapes_fail_closed_with_json(tmp_path, malformed_field):
+    plan = base_plan(tmp_path)
+    if malformed_field == "direct_url":
+        plan["import_source_probe"]["direct_url"] = "malformed"
+    elif malformed_field == "pth_files":
+        plan["import_source_probe"]["pth_files"] = "malformed"
+    else:
+        del plan["import_source_probe"]["modules"][0]["error"]
+    state_path = tmp_path / "logs" / "packet2n-r5-state.json"
+
+    result = run_diagnose_imports(plan, tmp_path, state_path)
+
+    assert result.returncode != 0
+    payload = json.loads(result.stdout)
+    assert payload["matches"] is False
+    assert any("malformed" in failure for failure in payload["failures"])
+    assert not state_path.exists()
 
 
 def test_missing_state_refuses_before_command_execution(tmp_path):

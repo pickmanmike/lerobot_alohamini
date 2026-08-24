@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet("Status", "Calibrate", "MapLeft", "MapRight", "Verify")]
+    [ValidateSet("Status", "DiagnoseImports", "Calibrate", "MapLeft", "MapRight", "Verify")]
     [string]$Stage,
 
     [Parameter()]
@@ -90,12 +90,13 @@ $OverrideEnvironmentNames = @(
     "HF_HUB_CACHE",
     "HUGGINGFACE_HUB_CACHE"
 )
-$ReviewedImportModules = @(
-    "calibrate_bi",
-    "teleoperate_bi",
-    "leader_client_utils",
-    "lerobot.teleoperators.bi_so_leader.bi_so_leader",
-    "lerobot.teleoperators.so_leader.so_leader"
+$ReviewedImportSources = @(
+    [ordered]@{ module = "lerobot"; relative_path = "src\lerobot\__init__.py" },
+    [ordered]@{ module = "calibrate_bi"; relative_path = "examples\alohamini\calibrate_bi.py" },
+    [ordered]@{ module = "teleoperate_bi"; relative_path = "examples\alohamini\teleoperate_bi.py" },
+    [ordered]@{ module = "leader_client_utils"; relative_path = "examples\alohamini\leader_client_utils.py" },
+    [ordered]@{ module = "lerobot.teleoperators.bi_so_leader.bi_so_leader"; relative_path = "src\lerobot\teleoperators\bi_so_leader\bi_so_leader.py" },
+    [ordered]@{ module = "lerobot.teleoperators.so_leader.so_leader"; relative_path = "src\lerobot\teleoperators\so_leader\so_leader.py" }
 )
 function Invoke-ExternalCommand {
     param(
@@ -109,19 +110,38 @@ function Invoke-ExternalCommand {
         [string]$WorkingDirectory = $RepositoryRoot
     )
 
-    $stdoutPath = [System.IO.Path]::GetTempFileName()
-    $stderrPath = [System.IO.Path]::GetTempFileName()
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $FilePath
+    $startInfo.WorkingDirectory = $WorkingDirectory
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    foreach ($argument in $Arguments) {
+        [void]$startInfo.ArgumentList.Add([string]$argument)
+    }
+
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
     try {
-        $process = Start-Process -FilePath $FilePath -ArgumentList $Arguments -WorkingDirectory $WorkingDirectory -NoNewWindow -PassThru -Wait -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+        if (-not $process.Start()) {
+            throw "Failed to start external command: $FilePath"
+        }
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $process.WaitForExit()
+        $stdoutText = $stdoutTask.GetAwaiter().GetResult()
+        $stderrText = $stderrTask.GetAwaiter().GetResult()
+        $stdoutLines = if ([string]::IsNullOrEmpty($stdoutText)) { @() } else { @($stdoutText.TrimEnd([char[]]"`r`n") -split "`r?`n") }
+        $stderrLines = if ([string]::IsNullOrEmpty($stderrText)) { @() } else { @($stderrText.TrimEnd([char[]]"`r`n") -split "`r?`n") }
         return [ordered]@{
             exit_code = [int]$process.ExitCode
-            stdout    = @((Get-Content -LiteralPath $stdoutPath -ErrorAction SilentlyContinue))
-            stderr    = @((Get-Content -LiteralPath $stderrPath -ErrorAction SilentlyContinue))
+            stdout    = @($stdoutLines)
+            stderr    = @($stderrLines)
         }
     }
     finally {
-        Remove-Item -LiteralPath $stdoutPath -ErrorAction SilentlyContinue
-        Remove-Item -LiteralPath $stderrPath -ErrorAction SilentlyContinue
+        $process.Dispose()
     }
 }
 
@@ -301,35 +321,413 @@ function Get-TestModePlan {
     return $plan
 }
 
-function Get-ImportSourcesMatch {
+function Get-CanonicalPathEvidence {
+    param(
+        $PathValue
+    )
+
+    if ($null -eq $PathValue -or [string]::IsNullOrWhiteSpace([string]$PathValue)) {
+        return [ordered]@{ input = $PathValue; canonical = $null; valid = $false; exists = $false; reason = "source path is missing" }
+    }
+    $pathText = [string]$PathValue
+    try {
+        $fullPath = [System.IO.Path]::GetFullPath($pathText)
+        if (-not [System.IO.Path]::IsPathFullyQualified($pathText)) {
+            return [ordered]@{ input = $pathText; canonical = $null; valid = $false; exists = $false; reason = "source path is not absolute" }
+        }
+    }
+    catch {
+        return [ordered]@{ input = $pathText; canonical = $null; valid = $false; exists = $false; reason = "source path is malformed" }
+    }
+    $exists = Test-Path -LiteralPath $fullPath -PathType Leaf
+    $canonical = if ($exists) { (Resolve-Path -LiteralPath $fullPath).Path } else { $fullPath }
+    return [ordered]@{ input = $pathText; canonical = $canonical; valid = $true; exists = $exists; reason = $null }
+}
+
+function Test-CanonicalPathWithin {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Candidate,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Root
+    )
+
+    $relative = [System.IO.Path]::GetRelativePath($Root, $Candidate)
+    if ([System.IO.Path]::IsPathRooted($relative)) {
+        return $false
+    }
+    $segments = @($relative -split '[\\/]')
+    return ($segments.Count -eq 0 -or $segments[0] -cne "..")
+}
+
+function Invoke-ImportSourceProbe {
     param(
         [Parameter(Mandatory = $true)]
         [string]$PythonPath
     )
 
-    $importCommand = "import importlib, sys; sys.path.insert(0, 'examples/alohamini'); names=('calibrate_bi','teleoperate_bi','leader_client_utils','lerobot.teleoperators.bi_so_leader.bi_so_leader','lerobot.teleoperators.so_leader.so_leader'); modules=tuple(importlib.import_module(n) for n in names); print(*(m.__file__ for m in modules), sep='\n')"
+    $namesJson = ConvertTo-Json -Compress -InputObject @($ReviewedImportSources | ForEach-Object { $_.module })
+    $importCommand = @"
+import importlib
+import importlib.metadata
+import json
+import os
+import pathlib
+import sys
+
+sys.path.insert(0, str(pathlib.Path("examples/alohamini").resolve()))
+names = json.loads(r'''$namesJson''')
+modules = []
+for name in names:
+    try:
+        module = importlib.import_module(name)
+        modules.append({"name": name, "path": getattr(module, "__file__", None), "error": None})
+    except BaseException as exc:
+        modules.append({"name": name, "path": None, "error": f"{type(exc).__name__}: {exc}"})
+
+direct_url = {"path": None, "content": None, "error": None}
+pth_files = []
+try:
+    distribution = importlib.metadata.distribution("lerobot")
+    metadata_path = pathlib.Path(distribution._path)
+    direct_url_path = metadata_path / "direct_url.json"
+    direct_url["path"] = str(direct_url_path)
+    direct_url["content"] = json.loads(direct_url_path.read_text(encoding="utf-8"))
+except BaseException as exc:
+    direct_url["error"] = f"{type(exc).__name__}: {exc}"
+
+for entry in sys.path:
+    if not entry:
+        continue
+    site_path = pathlib.Path(entry)
+    if site_path.name.lower() not in {"site-packages", "dist-packages"} or not site_path.is_dir():
+        continue
+    for pth_path in sorted(site_path.glob("*.pth")):
+        try:
+            content = pth_path.read_text(encoding="utf-8")
+        except BaseException as exc:
+            content = None
+            error = f"{type(exc).__name__}: {exc}"
+        else:
+            error = None
+        if "lerobot" in pth_path.name.lower() or (content is not None and "lerobot" in content.lower()):
+            pth_files.append({"path": str(pth_path), "content": content, "error": error})
+
+payload = {
+    "repository_root": str(pathlib.Path.cwd()),
+    "cwd": os.getcwd(),
+    "python_executable": sys.executable,
+    "sys_executable": sys.executable,
+    "sys_prefix": sys.prefix,
+    "sys_base_prefix": sys.base_prefix,
+    "pythonpath": os.environ.get("PYTHONPATH"),
+    "sys_path": sys.path,
+    "direct_url": direct_url,
+    "pth_files": pth_files,
+    "modules": modules,
+}
+print(json.dumps(payload, separators=(",", ":")))
+"@
     $result = Invoke-ExternalCommand -FilePath $PythonPath -Arguments @("-c", $importCommand) -WorkingDirectory $RepositoryRoot
-    if ($result.exit_code -ne 0 -or $result.stderr.Count -gt 0) {
-        return $false
+    $probe = [ordered]@{
+        exit_code = $result.exit_code
+        stderr    = @($result.stderr)
     }
-    $expected = @(
-        (Join-Path $RepositoryRoot "examples\alohamini\calibrate_bi.py"),
-        (Join-Path $RepositoryRoot "examples\alohamini\teleoperate_bi.py"),
-        (Join-Path $RepositoryRoot "examples\alohamini\leader_client_utils.py"),
-        (Join-Path $RepositoryRoot "src\lerobot\teleoperators\bi_so_leader\bi_so_leader.py"),
-        (Join-Path $RepositoryRoot "src\lerobot\teleoperators\so_leader\so_leader.py")
+    if ($result.exit_code -ne 0) {
+        $probe.probe_error = "Python import probe exited with status $($result.exit_code)"
+        return $probe
+    }
+    if ($result.stdout.Count -ne 1) {
+        $probe.probe_error = "Python import probe returned $($result.stdout.Count) output lines instead of one JSON document"
+        return $probe
+    }
+    try {
+        $payload = [string]$result.stdout[0] | ConvertFrom-Json -AsHashtable -Depth 100 -DateKind String
+    }
+    catch {
+        $probe.probe_error = "Python import probe returned malformed JSON"
+        return $probe
+    }
+    foreach ($key in $payload.Keys) {
+        $probe[$key] = $payload[$key]
+    }
+    return $probe
+}
+
+function Get-ImportSourceDiagnostic {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$PythonPath,
+
+        [Parameter(Mandatory = $true)]
+        [bool]$PythonResolved,
+
+        [Parameter(Mandatory = $true)]
+        [bool]$PythonEnvClean,
+
+        [string[]]$OverrideEnvironmentNames = @(),
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Probe
     )
-    if ($result.stdout.Count -ne $expected.Count) {
-        return $false
+
+    $failures = [System.Collections.Generic.List[string]]::new()
+    $expectedPython = Get-CanonicalPathEvidence -PathValue (Join-Path $RepositoryRoot ".venv\Scripts\python.exe")
+    $expectedPrefix = [System.IO.Path]::GetFullPath((Join-Path $RepositoryRoot ".venv"))
+    $repositoryCanonical = [System.IO.Path]::GetFullPath($RepositoryRoot)
+    $expectedSrc = [System.IO.Path]::GetFullPath((Join-Path $RepositoryRoot "src"))
+
+    if (-not $PythonEnvClean) {
+        $names = if ($OverrideEnvironmentNames.Count -gt 0) { $OverrideEnvironmentNames -join ", " } else { "one or more guarded Python/HF variables" }
+        $failures.Add("override environment variables are set: $names")
     }
-    for ($index = 0; $index -lt $expected.Count; $index++) {
-        $actualPath = (Resolve-Path -LiteralPath ([string]$result.stdout[$index]).Trim()).Path
-        $expectedPath = (Resolve-Path -LiteralPath $expected[$index]).Path
-        if (-not $actualPath.Equals($expectedPath, [System.StringComparison]::OrdinalIgnoreCase)) {
-            return $false
+    if (-not $PythonResolved) {
+        $failures.Add("repository Python could not be resolved")
+    }
+    $runnerPython = Get-CanonicalPathEvidence -PathValue $PythonPath
+    if (-not $runnerPython.valid -or -not $runnerPython.exists -or -not $runnerPython.canonical.Equals($expectedPython.canonical, [System.StringComparison]::OrdinalIgnoreCase)) {
+        $failures.Add("runner Python is not the exact repository virtual-environment executable")
+    }
+    if ($Probe.ContainsKey("probe_error")) {
+        $failures.Add([string]$Probe.probe_error)
+    }
+    if ($Probe.ContainsKey("stderr") -and @($Probe.stderr).Count -gt 0) {
+        $failures.Add("Python import probe wrote to stderr")
+    }
+
+    foreach ($field in @(
+        [ordered]@{ name = "current working directory"; key = "cwd"; expected = $repositoryCanonical },
+        [ordered]@{ name = "sys.executable"; key = "sys_executable"; expected = $expectedPython.canonical },
+        [ordered]@{ name = "sys.prefix"; key = "sys_prefix"; expected = $expectedPrefix }
+    )) {
+        $actualValue = if ($Probe.ContainsKey($field.key)) { $Probe[$field.key] } else { $null }
+        $actualEvidence = Get-CanonicalPathEvidence -PathValue $actualValue
+        if (-not $actualEvidence.valid -or -not $actualEvidence.canonical.Equals($field.expected, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $failures.Add("$($field.name) is not the intended repository value")
         }
     }
-    return $true
+
+    $moduleDiagnostics = @()
+    $probeModules = @()
+    if (-not $Probe.ContainsKey("modules") -or $Probe.modules -is [string] -or $Probe.modules -isnot [System.Collections.IList]) {
+        $failures.Add("module records are malformed")
+    }
+    else {
+        $malformedModuleRecord = $false
+        foreach ($record in @($Probe.modules)) {
+            if ($record -isnot [System.Collections.IDictionary] -or -not $record.Contains("name") -or -not $record.Contains("path") -or -not $record.Contains("error")) {
+                $malformedModuleRecord = $true
+                continue
+            }
+            $probeModules += $record
+        }
+        if ($malformedModuleRecord) {
+            $failures.Add("module records are malformed")
+        }
+    }
+    $expectedModuleNames = @($ReviewedImportSources | ForEach-Object { $_.module })
+    $unexpectedModuleNames = @($probeModules | Where-Object { $expectedModuleNames -cnotcontains $_.name } | ForEach-Object { $_.name })
+    if ($unexpectedModuleNames.Count -gt 0) {
+        $failures.Add("Python import probe returned unexpected module records: $($unexpectedModuleNames -join ', ')")
+    }
+    foreach ($source in $ReviewedImportSources) {
+        $expectedEvidence = Get-CanonicalPathEvidence -PathValue (Join-Path $RepositoryRoot $source.relative_path)
+        $actualRecord = @($probeModules | Where-Object { $_.name -ceq $source.module })
+        $actualPath = if ($actualRecord.Count -eq 1) { $actualRecord[0].path } else { $null }
+        $actualEvidence = Get-CanonicalPathEvidence -PathValue $actualPath
+        $reason = $null
+        $belongs = $false
+        $matches = $false
+        if ($actualRecord.Count -gt 1) {
+            $reason = "module probe returned duplicate source records"
+        }
+        elseif (-not $actualEvidence.valid) {
+            $reason = if ($actualEvidence.reason -eq "source path is missing" -and $actualRecord.Count -eq 1 -and -not [string]::IsNullOrEmpty([string]$actualRecord[0].error)) { "module import failed: $($actualRecord[0].error)" } else { $actualEvidence.reason }
+        }
+        else {
+            $belongs = Test-CanonicalPathWithin -Candidate $actualEvidence.canonical -Root $repositoryCanonical
+            if (-not $belongs) {
+                $reason = "source is outside the intended repository"
+            }
+            elseif (-not $actualEvidence.exists) {
+                $reason = "source file does not exist"
+            }
+            elseif (-not $actualEvidence.canonical.Equals($expectedEvidence.canonical, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $reason = "source does not equal the reviewed repository file"
+            }
+            else {
+                $matches = $true
+            }
+        }
+        if (-not $matches) {
+            $failures.Add("module $($source.module) expected '$($expectedEvidence.canonical)' but resolved '$($actualEvidence.canonical)': $reason")
+        }
+        $moduleDiagnostics += [ordered]@{
+            module             = $source.module
+            expected           = (Join-Path $RepositoryRoot $source.relative_path)
+            actual             = $actualPath
+            expected_canonical = $expectedEvidence.canonical
+            actual_canonical   = $actualEvidence.canonical
+            belongs_to_repository = $belongs
+            matches            = $matches
+            reason             = $reason
+        }
+    }
+
+    $directUrl = @{}
+    if ($Probe.ContainsKey("direct_url") -and $Probe.direct_url -is [System.Collections.IDictionary]) {
+        $directUrl = $Probe.direct_url
+    }
+    else {
+        $failures.Add("direct_url metadata is malformed")
+    }
+    $directUrlPath = if ($directUrl.ContainsKey("path")) { $directUrl.path } else { $null }
+    $directUrlContent = if ($directUrl.ContainsKey("content")) { $directUrl.content } else { $null }
+    $directUrlMatches = $false
+    $directUrlReason = $null
+    try {
+        if ($directUrlContent -isnot [System.Collections.IDictionary] -or
+            -not $directUrlContent.Contains("dir_info") -or
+            $directUrlContent.dir_info -isnot [System.Collections.IDictionary] -or
+            -not $directUrlContent.dir_info.Contains("editable") -or
+            -not $directUrlContent.Contains("url")) {
+            throw "direct_url.json content is unavailable"
+        }
+        if ($directUrlContent.dir_info.editable -isnot [bool] -or $directUrlContent.dir_info.editable -ne $true) {
+            throw "direct_url.json does not identify an editable installation"
+        }
+        $editableUri = [uri][string]$directUrlContent.url
+        if (-not $editableUri.IsFile) {
+            throw "direct_url.json URL is not a local file URL"
+        }
+        $editableEvidence = Get-CanonicalPathEvidence -PathValue $editableUri.LocalPath
+        if (-not $editableEvidence.valid -or -not $editableEvidence.canonical.Equals($repositoryCanonical, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "direct_url.json editable URL does not equal the intended repository"
+        }
+        $directUrlPathEvidence = Get-CanonicalPathEvidence -PathValue $directUrlPath
+        $venvCanonical = [System.IO.Path]::GetFullPath((Join-Path $RepositoryRoot ".venv"))
+        if (-not $directUrlPathEvidence.valid -or -not $directUrlPathEvidence.exists -or -not (Test-CanonicalPathWithin -Candidate $directUrlPathEvidence.canonical -Root $venvCanonical)) {
+            throw "direct_url.json metadata is outside the repository virtual environment"
+        }
+        $directUrlMatches = $true
+    }
+    catch {
+        $directUrlReason = $_.Exception.Message
+        $failures.Add($directUrlReason)
+    }
+
+    $pthDiagnostics = @()
+    $validEditablePthCount = 0
+    $probePthFiles = @()
+    if (-not $Probe.ContainsKey("pth_files") -or $Probe.pth_files -is [string] -or $Probe.pth_files -isnot [System.Collections.IList]) {
+        $failures.Add("editable .pth records are malformed")
+    }
+    else {
+        $malformedPthRecord = $false
+        foreach ($record in @($Probe.pth_files)) {
+            if ($record -isnot [System.Collections.IDictionary] -or -not $record.Contains("path") -or -not $record.Contains("content") -or -not $record.Contains("error")) {
+                $malformedPthRecord = $true
+                continue
+            }
+            $probePthFiles += $record
+        }
+        if ($malformedPthRecord) {
+            $failures.Add("editable .pth records are malformed")
+        }
+    }
+    foreach ($pth in $probePthFiles) {
+        $pthMatches = $false
+        $pthReason = $null
+        $pathLines = @()
+        $pthPathEvidence = Get-CanonicalPathEvidence -PathValue $pth.path
+        $venvCanonical = [System.IO.Path]::GetFullPath((Join-Path $RepositoryRoot ".venv"))
+        if (-not $pthPathEvidence.valid -or -not $pthPathEvidence.exists -or -not (Test-CanonicalPathWithin -Candidate $pthPathEvidence.canonical -Root $venvCanonical)) {
+            $pthReason = "editable .pth metadata is outside the repository virtual environment"
+        }
+        elseif ($null -eq $pth.content) {
+            $pthReason = "editable .pth content is unavailable"
+        }
+        else {
+            $contentLines = @(([string]$pth.content -split "`r?`n") | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and -not $_.TrimStart().StartsWith("#") })
+            if (@($contentLines | Where-Object { $_.TrimStart().StartsWith("import ") }).Count -gt 0) {
+                $pthReason = "editable .pth contains executable code"
+            }
+            elseif ($contentLines.Count -ne 1) {
+                $pthReason = "editable .pth must contain exactly one source path"
+            }
+            else {
+                $line = $contentLines[0].Trim()
+                $candidate = if ([System.IO.Path]::IsPathFullyQualified($line)) { $line } else { Join-Path (Split-Path -Parent ([string]$pth.path)) $line }
+                $pthSourceEvidence = Get-CanonicalPathEvidence -PathValue $candidate
+                if (-not $pthSourceEvidence.valid -or -not $pthSourceEvidence.canonical.Equals($expectedSrc, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    $pthReason = "editable .pth source does not equal the intended repository src directory"
+                }
+                else {
+                    $pthMatches = $true
+                    $validEditablePthCount++
+                }
+            }
+        }
+        if (-not $pthMatches) {
+            $failures.Add($pthReason)
+        }
+        $pthDiagnostics += [ordered]@{ path = $pth.path; content = $pth.content; matches = $pthMatches; reason = $pthReason }
+    }
+    if ($pthDiagnostics.Count -eq 0 -or $validEditablePthCount -eq 0) {
+        $failures.Add("no valid repository editable .pth source was found")
+    }
+
+    return [ordered]@{
+        matches                    = $failures.Count -eq 0
+        repository_root            = $RepositoryRoot
+        current_working_directory  = if ($Probe.ContainsKey("cwd")) { $Probe.cwd } else { $null }
+        expected_python_executable = $expectedPython.canonical
+        python_executable          = $PythonPath
+        sys_executable             = if ($Probe.ContainsKey("sys_executable")) { $Probe.sys_executable } else { $null }
+        sys_prefix                 = if ($Probe.ContainsKey("sys_prefix")) { $Probe.sys_prefix } else { $null }
+        sys_base_prefix            = if ($Probe.ContainsKey("sys_base_prefix")) { $Probe.sys_base_prefix } else { $null }
+        pythonpath                 = if ($Probe.ContainsKey("pythonpath")) { $Probe.pythonpath } else { $null }
+        sys_path                   = if ($Probe.ContainsKey("sys_path")) { @($Probe.sys_path) } else { @() }
+        direct_url                 = [ordered]@{ path = $directUrlPath; content = $directUrlContent; matches = $directUrlMatches; reason = $directUrlReason }
+        pth_files                  = $pthDiagnostics
+        modules                    = $moduleDiagnostics
+        failures                   = @($failures)
+    }
+}
+
+function Get-PlanImportSourceDiagnostic {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Plan
+    )
+
+    if (-not $Plan.ContainsKey("import_source_probe")) {
+        return [ordered]@{
+            matches = [bool]$Plan.import_sources_match
+            modules = @()
+            failures = if ([bool]$Plan.import_sources_match) { @() } else { @("legacy test plan reports mismatched import sources") }
+        }
+    }
+    $overrideNames = if ($Plan.ContainsKey("override_environment_names")) { @($Plan.override_environment_names) } else { @() }
+    return Get-ImportSourceDiagnostic `
+        -PythonPath (Get-RepositoryPythonPath -Plan $Plan) `
+        -PythonResolved ([bool]$Plan.python_resolved) `
+        -PythonEnvClean ([bool]$Plan.python_env_clean) `
+        -OverrideEnvironmentNames $overrideNames `
+        -Probe $Plan.import_source_probe
+}
+
+function Get-ImportSourceFailureMessage {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Diagnostic
+    )
+
+    if (@($Diagnostic.failures).Count -gt 0) {
+        return (@($Diagnostic.failures) -join "; ")
+    }
+    return "import source diagnostic did not establish a matching repository"
 }
 
 function Get-ReservedArtifactPaths {
@@ -434,14 +832,14 @@ function Get-RealPlan {
         New-Failure "Git protected-path diff query failed"
     }
     $pythonResolved = Test-Path -LiteralPath $pythonPath -PathType Leaf
-    $pythonEnvClean = $true
+    $setOverrideEnvironmentNames = @()
     foreach ($name in $OverrideEnvironmentNames) {
         if (-not [string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable($name, "Process"))) {
-            $pythonEnvClean = $false
-            break
+            $setOverrideEnvironmentNames += $name
         }
     }
-    $rootResult = if ($pythonResolved) {
+    $pythonEnvClean = $setOverrideEnvironmentNames.Count -eq 0
+    $rootResult = if ($pythonResolved -and $pythonEnvClean) {
         Invoke-ExternalCommand -FilePath $pythonPath -Arguments @("-c", "from lerobot.utils.constants import HF_LEROBOT_CALIBRATION; print(HF_LEROBOT_CALIBRATION)") -WorkingDirectory $RepositoryRoot
     }
     else {
@@ -451,7 +849,21 @@ function Get-RealPlan {
     if ($null -ne $rootResult -and $rootResult.exit_code -eq 0 -and $rootResult.stderr.Count -eq 0 -and $rootResult.stdout.Count -eq 1) {
         $rootMatches = ([string]$rootResult.stdout[0]).Trim() -eq $RealCalibrationRoot
     }
-    $importSourcesMatch = $pythonResolved -and $pythonEnvClean -and (Get-ImportSourcesMatch -PythonPath $pythonPath)
+    $importSourceProbe = if (-not $pythonEnvClean) {
+        [ordered]@{ exit_code = $null; stderr = @(); probe_error = "probe skipped because guarded override variables are set" }
+    }
+    elseif ($pythonResolved) {
+        Invoke-ImportSourceProbe -PythonPath $pythonPath
+    }
+    else {
+        [ordered]@{ exit_code = $null; stderr = @(); probe_error = "Repository Python is missing" }
+    }
+    $importSourceDiagnostic = Get-ImportSourceDiagnostic `
+        -PythonPath $pythonPath `
+        -PythonResolved $pythonResolved `
+        -PythonEnvClean $pythonEnvClean `
+        -OverrideEnvironmentNames $setOverrideEnvironmentNames `
+        -Probe $importSourceProbe
     return [ordered]@{
         is_test_mode                     = $false
         session_id                       = $sessionId
@@ -473,9 +885,11 @@ function Get-RealPlan {
             )
         }
         python_env_clean                 = $pythonEnvClean
+        override_environment_names       = $setOverrideEnvironmentNames
         python_resolved                  = $pythonResolved
         python_path                      = $pythonPath
-        import_sources_match             = $importSourcesMatch
+        import_source_probe              = $importSourceProbe
+        import_sources_match             = [bool]$importSourceDiagnostic.matches
         calibration_root_matches_expected = $rootMatches
         calibration_root                 = $RealCalibrationRoot
         state_root                       = $RealLogsDirectory
@@ -522,6 +936,40 @@ function Get-ExecutionPlan {
         return $testPlan
     }
     return Get-RealPlan
+}
+
+function Get-ImportDiagnosisPlan {
+    $testPlan = Get-TestModePlan
+    if ($null -ne $testPlan) {
+        return $testPlan
+    }
+
+    $pythonPath = Get-RepositoryPythonPath
+    $pythonResolved = Test-Path -LiteralPath $pythonPath -PathType Leaf
+    $setOverrideEnvironmentNames = @()
+    foreach ($name in $OverrideEnvironmentNames) {
+        if (-not [string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable($name, "Process"))) {
+            $setOverrideEnvironmentNames += $name
+        }
+    }
+    $probe = if ($setOverrideEnvironmentNames.Count -gt 0) {
+        [ordered]@{ exit_code = $null; stderr = @(); probe_error = "probe skipped because guarded override variables are set" }
+    }
+    elseif ($pythonResolved) {
+        Invoke-ImportSourceProbe -PythonPath $pythonPath
+    }
+    else {
+        [ordered]@{ exit_code = $null; stderr = @(); probe_error = "Repository Python is missing" }
+    }
+    return [ordered]@{
+        is_test_mode               = $false
+        python_path                = $pythonPath
+        python_resolved            = $pythonResolved
+        python_env_clean           = $setOverrideEnvironmentNames.Count -eq 0
+        override_environment_names = $setOverrideEnvironmentNames
+        import_source_probe        = $probe
+        import_sources_match       = $false
+    }
 }
 
 function Get-TestModeRoot {
@@ -1127,8 +1575,10 @@ function Assert-RepoAndEnvGuards {
     if (-not [bool]$Plan.python_resolved) {
         New-Failure "Guard refusal: repository Python could not be resolved"
     }
-    if (-not [bool]$Plan.import_sources_match) {
-        New-Failure "Guard refusal: repository import sources do not match"
+    $importDiagnostic = Get-PlanImportSourceDiagnostic -Plan $Plan
+    if (-not [bool]$importDiagnostic.matches) {
+        $details = Get-ImportSourceFailureMessage -Diagnostic $importDiagnostic
+        New-Failure "Guard refusal: repository import sources do not match. $details"
     }
     if ($Plan.ContainsKey("calibration_root_matches_expected") -and -not [bool]$Plan.calibration_root_matches_expected) {
         New-Failure "Guard refusal: calibration root does not match the reviewed repository constant"
@@ -2610,16 +3060,31 @@ function Get-StatusPayload {
     }
 }
 
+function Invoke-DiagnoseImportsStage {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Plan
+    )
+
+    $diagnostic = Get-PlanImportSourceDiagnostic -Plan $Plan
+    [Console]::Out.WriteLine((ConvertTo-CanonicalJson -Value $diagnostic))
+    if (-not [bool]$diagnostic.matches) {
+        $details = Get-ImportSourceFailureMessage -Diagnostic $diagnostic
+        New-Failure "Import source refusal: $details"
+    }
+}
+
 $plan = $null
 try {
     Require-Confirmation -StageName $Stage -ConfirmValue $Confirm
-    $plan = Get-ExecutionPlan
+    $plan = if ($Stage -eq "DiagnoseImports") { Get-ImportDiagnosisPlan } else { Get-ExecutionPlan }
     if ($Stage -eq "Status") {
         $payload = Get-StatusPayload -Plan $plan -StatePathValue $StatePath
         [Console]::Out.WriteLine((ConvertTo-CanonicalJson -Value $payload))
         exit 0
     }
     switch ($Stage) {
+        "DiagnoseImports" { Invoke-DiagnoseImportsStage -Plan $plan }
         "Calibrate" { Invoke-CalibrateStage -Plan $plan -StatePathValue $StatePath }
         "MapLeft" { Invoke-MapStage -StageName "MapLeft" -Plan $plan -StatePathValue $StatePath }
         "MapRight" { Invoke-MapStage -StageName "MapRight" -Plan $plan -StatePathValue $StatePath }
@@ -2631,7 +3096,7 @@ try {
 catch {
     $primaryMessage = $_.Exception.Message
     [Console]::Error.WriteLine($primaryMessage)
-    if ($Stage -cne "Status" -and $null -ne $plan) {
+    if ($Stage -ne "Status" -and $Stage -ne "DiagnoseImports" -and $null -ne $plan) {
         try {
             $recovery = Get-StatusPayload -Plan $plan -StatePathValue $StatePath
             [Console]::Error.WriteLine("RECOVERY_CLASSIFICATION=$($recovery.classification)")
