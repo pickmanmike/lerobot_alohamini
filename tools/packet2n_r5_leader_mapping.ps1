@@ -6360,8 +6360,15 @@ function Assert-InterruptedArchiveCore {
     $retiredPairPresent = (Test-Path -LiteralPath (Join-Path $Root $retiredLeftRelative) -PathType Leaf) -or
         (Test-Path -LiteralPath (Join-Path $Root $retiredRightRelative) -PathType Leaf)
     $retiredStatePresent = Test-Path -LiteralPath (Join-Path $Root $retiredStateRelative) -PathType Leaf
+    $retiredStateDirectoryItem = if (Test-Path -LiteralPath $retiredStateDirectory -PathType Container) {
+        Get-Item -LiteralPath $retiredStateDirectory -Force
+    } else { $null }
+    if ($null -ne $retiredStateDirectoryItem -and
+        ($retiredStateDirectoryItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        New-Failure "Interrupted-calibration retired-state directory is a reparse point"
+    }
     $emptyRetiredStateDirectory = (Test-Path -LiteralPath $Journal.state_path -PathType Leaf) -and
-        (Test-Path -LiteralPath $retiredStateDirectory -PathType Container) -and
+        $null -ne $retiredStateDirectoryItem -and
         @(Get-ChildItem -LiteralPath $retiredStateDirectory -Force).Count -eq 0
     $receiptPresent = Test-Path -LiteralPath (Join-Path $Root "recovery-receipt.json") -PathType Leaf
     $receiptTempRelative = "recovery-receipt.json.restart-durable.tmp"

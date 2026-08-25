@@ -4314,6 +4314,62 @@ def test_interrupted_recovery_refuses_invalid_retired_state_directory_without_li
     assert paths["journal"].is_file()
 
 
+def test_status_rejects_empty_reparse_retired_state_directory_without_mutation(tmp_path):
+    plan, state_path, state, _, _ = prepare_interrupted_calibration_candidate(tmp_path)
+    paths = interrupted_transaction_paths(plan, state_path, state["session_id"])
+    active_dir = Path(plan["calibration"]["left"]["path"]).parent
+    plan["restart_failure_point"] = "after_fresh_pair_namespace_publish"
+    assert run_interrupted_recovery(plan, tmp_path, state_path).returncode != 0
+    del plan["restart_failure_point"]
+    retired_state_dir = paths["archive"] / "retired-state"
+    junction_target = tmp_path / "status-retired-state-junction-target"
+    junction_target.mkdir()
+    create_directory_junction_or_skip(retired_state_dir, junction_target)
+    state_before = state_path.read_bytes()
+    journal_before = paths["journal"].read_bytes()
+    active_before = {path.name: path.read_bytes() for path in active_dir.iterdir()}
+    try:
+        status = run_runner("-Stage", "Status", "-StatePath", str(state_path), plan=plan, tmp_path=tmp_path)
+
+        assert status.returncode == 0, status.stderr
+        payload = json.loads(status.stdout)
+        assert payload["classification"] == "INVALID_OR_UNCERTAIN_STATE"
+        assert "reparse point" in payload["report"].lower()
+        assert state_path.read_bytes() == state_before
+        assert paths["journal"].read_bytes() == journal_before
+        assert {path.name: path.read_bytes() for path in active_dir.iterdir()} == active_before
+        assert list(junction_target.iterdir()) == []
+    finally:
+        if retired_state_dir.exists():
+            os.rmdir(retired_state_dir)
+        shutil.rmtree(junction_target, ignore_errors=True)
+
+
+def test_status_rejects_empty_retired_state_directory_when_pinned_live_state_is_missing(tmp_path):
+    plan, state_path, state, _, _ = prepare_interrupted_calibration_candidate(tmp_path)
+    paths = interrupted_transaction_paths(plan, state_path, state["session_id"])
+    active_dir = Path(plan["calibration"]["left"]["path"]).parent
+    plan["restart_failure_point"] = "after_fresh_pair_namespace_publish"
+    assert run_interrupted_recovery(plan, tmp_path, state_path).returncode != 0
+    del plan["restart_failure_point"]
+    retired_state_dir = paths["archive"] / "retired-state"
+    retired_state_dir.mkdir()
+    state_path.unlink()
+    journal_before = paths["journal"].read_bytes()
+    active_before = {path.name: path.read_bytes() for path in active_dir.iterdir()}
+
+    status = run_runner("-Stage", "Status", "-StatePath", str(state_path), plan=plan, tmp_path=tmp_path)
+
+    assert status.returncode == 0, status.stderr
+    payload = json.loads(status.stdout)
+    assert payload["classification"] == "INVALID_OR_UNCERTAIN_STATE"
+    assert "directory layout is invalid" in payload["report"].lower()
+    assert not state_path.exists()
+    assert paths["journal"].read_bytes() == journal_before
+    assert {path.name: path.read_bytes() for path in active_dir.iterdir()} == active_before
+    assert list(retired_state_dir.iterdir()) == []
+
+
 def test_interrupted_recovery_refuses_reparse_retired_state_directory_without_live_state_mutation(tmp_path):
     plan, state_path, state, _, _ = prepare_interrupted_calibration_candidate(tmp_path)
     paths = interrupted_transaction_paths(plan, state_path, state["session_id"])
