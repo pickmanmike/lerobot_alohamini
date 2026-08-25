@@ -5728,9 +5728,8 @@ function Get-InterruptedRecoveryPaths {
     return $paths
 }
 
-function Get-InterruptedRecoveryAuthority {
+function Get-InterruptedPinnedAuthority {
     param(
-        [Parameter(Mandatory = $true)][hashtable]$State,
         [Parameter(Mandatory = $true)][hashtable]$Plan,
         [Parameter(Mandatory = $true)][string]$StatePathValue
     )
@@ -5752,10 +5751,7 @@ function Get-InterruptedRecoveryAuthority {
         }
         Assert-ExactKeySet -Value $fixture.transcript -ExpectedKeys @("path", "sha256", "size") -Message "Test-mode interrupted transcript fixture is invalid"
         if ($fixture.schema_version -cne "1" -or
-            $fixture.repo_head -cne $State.repo_head -or
-            $fixture.runner_sha256 -cne $State.runner_sha -or
             $fixture.behavior_sha -cne $BehaviorBaseline -or
-            $fixture.session_id -cne $State.session_id -or
             $fixture.state.path -cne $StatePathValue -or
             $fixture.source_evidence_present -ne $false -or
             $fixture.traceback_text_present -ne $false) {
@@ -5767,8 +5763,6 @@ function Get-InterruptedRecoveryAuthority {
     if ($StatePathValue -cne (Join-Path $RealLogsDirectory "packet2n-r5-state.json")) {
         New-Failure "Interrupted-calibration recovery state path is not the pinned production path"
     }
-    $left = Get-CalibrationSnapshot -Path $Plan.calibration.left.path -Label "interrupted active left"
-    $right = Get-CalibrationSnapshot -Path $Plan.calibration.right.path -Label "interrupted active right"
     return [ordered]@{
         schema_version          = "1"
         repo_head               = $InterruptedRepoHead
@@ -5779,11 +5773,11 @@ function Get-InterruptedRecoveryAuthority {
         active                  = [ordered]@{
             left = [ordered]@{
                 path = $Plan.calibration.left.path; sha256 = $InterruptedActiveLeftSha256; size = $InterruptedActiveLeftSize
-                mtime_utc = $InterruptedActiveLeftMtimeUtc; calibration = $left.calibration
+                mtime_utc = $InterruptedActiveLeftMtimeUtc
             }
             right = [ordered]@{
                 path = $Plan.calibration.right.path; sha256 = $RealBackupMetadata.right.sha256; size = $RealBackupMetadata.right.size
-                mtime_utc = $RealBackupMetadata.right.source_mtime; calibration = $right.calibration
+                mtime_utc = $RealBackupMetadata.right.source_mtime
             }
         }
         transcript              = [ordered]@{
@@ -5794,6 +5788,28 @@ function Get-InterruptedRecoveryAuthority {
         source_evidence_present = $false
         traceback_text_present  = $false
     }
+}
+
+function Get-InterruptedRecoveryAuthority {
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$State,
+        [Parameter(Mandatory = $true)][hashtable]$Plan,
+        [Parameter(Mandatory = $true)][string]$StatePathValue
+    )
+
+    $authority = Get-InterruptedPinnedAuthority -Plan $Plan -StatePathValue $StatePathValue
+    if ($authority.repo_head -cne $State.repo_head -or
+        $authority.runner_sha256 -cne $State.runner_sha -or
+        $authority.session_id -cne $State.session_id) {
+        New-Failure "Interrupted-calibration source state does not match pinned authority"
+    }
+    if (-not [bool]$Plan.is_test_mode) {
+        foreach ($side in @("left", "right")) {
+            $snapshot = Get-CalibrationSnapshot -Path $Plan.calibration[$side].path -Label "interrupted active $side"
+            $authority.active[$side]["calibration"] = $snapshot.calibration
+        }
+    }
+    return $authority
 }
 
 function Assert-InterruptedCalibrationCandidate {
@@ -6003,10 +6019,12 @@ function Assert-InterruptedRecoveryJournal {
         "source_evidence_present", "traceback_text_present", "native_stage_truth", "ports", "command",
         "source_provenance", "recovery_provenance", "archive_record_sha256"
     ) -Message "Interrupted-calibration recovery journal schema is invalid"
+    $authority = Get-InterruptedPinnedAuthority -Plan $Plan -StatePathValue $StatePathValue
     if ($Journal.schema_version -cne "1" -or
         $Journal.transaction_type -cne "packet2n-r5-interrupted-calibration" -or
         $Journal.status -cne "in_progress" -or
         $Journal.reason -cne $InterruptedRecoveryReason -or
+        $Journal.session_id -cne $authority.session_id -or
         $Journal.source_evidence_present -ne $false -or $Journal.traceback_text_present -ne $false) {
         New-Failure "Interrupted-calibration recovery journal identity is invalid"
     }
@@ -6017,6 +6035,22 @@ function Assert-InterruptedRecoveryJournal {
     Assert-ExactKeySet -Value $Journal.source_active -ExpectedKeys @("left", "right") -Message "Interrupted-calibration journal active pair is invalid"
     Assert-ExactKeySet -Value $Journal.source_transcript -ExpectedKeys @("path", "sha256", "size") -Message "Interrupted-calibration journal transcript is invalid"
     Assert-ExactKeySet -Value $Journal.command -ExpectedKeys @("executable", "arguments") -Message "Interrupted-calibration journal command is invalid"
+    foreach ($side in @("left", "right")) {
+        Assert-ExactKeySet -Value $Journal.source_active[$side] -ExpectedKeys @("path", "sha256", "size", "mtime_utc", "calibration") -Message "Interrupted-calibration journal $side active identity is invalid"
+        $expectedActive = $authority.active[$side]
+        if ($Journal.source_active[$side].path -cne $expectedActive.path -or
+            $Journal.source_active[$side].sha256 -cne $expectedActive.sha256 -or
+            [int64]$Journal.source_active[$side].size -ne [int64]$expectedActive.size -or
+            $Journal.source_active[$side].mtime_utc -cne $expectedActive.mtime_utc) {
+            New-Failure "Interrupted-calibration journal active identity does not match pinned authority"
+        }
+        Assert-CalibrationSchema -Calibration $Journal.source_active[$side].calibration -Label "interrupted journal $side calibration"
+    }
+    if ($Journal.source_state.sha256 -cne $authority.state.sha256 -or
+        [int64]$Journal.source_state.size -ne [int64]$authority.state.size -or
+        -not (Test-ExactValue -Actual $Journal.source_transcript -Expected $authority.transcript)) {
+        New-Failure "Interrupted-calibration journal source artifacts do not match pinned authority"
+    }
     $paths = Get-InterruptedRecoveryPaths -Plan $Plan -StatePathValue $StatePathValue -SessionId ([string]$Journal.session_id)
     foreach ($binding in @(
         @($Journal.state_path, $StatePathValue), @($Journal.archive_path, $paths.archive),
@@ -6024,6 +6058,42 @@ function Assert-InterruptedRecoveryJournal {
         @($Journal.staged_original_path, $paths.staged_original), @($Journal.rollback_path, $paths.rollback)
     )) {
         if ([string]$binding[0] -cne [string]$binding[1]) { New-Failure "Interrupted-calibration journal path binding is invalid" }
+    }
+    $stateName = [System.IO.Path]::GetFileName($StatePathValue)
+    $pinnedStatePath = if (Test-Path -LiteralPath $StatePathValue -PathType Leaf) {
+        $StatePathValue
+    }
+    elseif (Test-Path -LiteralPath (Join-Path $paths.archive (Join-Path "state-snapshot" $stateName)) -PathType Leaf) {
+        Join-Path $paths.archive (Join-Path "state-snapshot" $stateName)
+    }
+    elseif (Test-Path -LiteralPath (Join-Path $paths.archive_staging (Join-Path "state-snapshot" $stateName)) -PathType Leaf) {
+        Join-Path $paths.archive_staging (Join-Path "state-snapshot" $stateName)
+    }
+    else {
+        New-Failure "Interrupted-calibration pinned source state is unavailable"
+    }
+    if ((Get-Sha256Hex -Path $pinnedStatePath) -cne $authority.state.sha256 -or
+        [int64](Get-Item -LiteralPath $pinnedStatePath).Length -ne [int64]$authority.state.size -or
+        (Get-FileTimestampUtc -Path $pinnedStatePath) -cne $Journal.source_state.mtime_utc) {
+        New-Failure "Interrupted-calibration journal source state does not match pinned authority"
+    }
+    $pinnedState = Read-JsonFile -Path $pinnedStatePath
+    $expectedCommand = [ordered]@{
+        executable = $pinnedState.stages.Calibrate.native.executable
+        arguments = @($pinnedState.stages.Calibrate.native.arguments)
+    }
+    $expectedProvenance = [ordered]@{
+        repo_head = $pinnedState.repo_head
+        runner_sha256 = $pinnedState.runner_sha
+        behavior_sha = $pinnedState.behavior_sha
+    }
+    if ($Journal.session_start_utc -cne $pinnedState.utc_start -or
+        $Journal.state_binding_sha256 -cne $pinnedState.session_binding_sha256 -or
+        -not (Test-ExactValue -Actual $Journal.native_stage_truth -Expected $pinnedState.stages) -or
+        -not (Test-ExactValue -Actual $Journal.ports -Expected $pinnedState.ports) -or
+        -not (Test-ExactValue -Actual $Journal.command -Expected $expectedCommand) -or
+        -not (Test-ExactValue -Actual $Journal.source_provenance -Expected $expectedProvenance)) {
+        New-Failure "Interrupted-calibration journal does not match pinned authority"
     }
     if ($Journal.recovery_provenance.repo_head -cne $Plan.head -or
         $Journal.recovery_provenance.runner_sha256 -cne (Get-RunnerSha256) -or
@@ -6220,10 +6290,13 @@ function Assert-InterruptedArchiveCore {
         (Test-Path -LiteralPath (Join-Path $Root $retiredRightRelative) -PathType Leaf)
     $retiredStatePresent = Test-Path -LiteralPath (Join-Path $Root $retiredStateRelative) -PathType Leaf
     $receiptPresent = Test-Path -LiteralPath (Join-Path $Root "recovery-receipt.json") -PathType Leaf
+    $receiptTempRelative = "recovery-receipt.json.restart-durable.tmp"
+    $receiptTempPresent = Test-Path -LiteralPath (Join-Path $Root $receiptTempRelative) -PathType Leaf
     if ($retiredPairPresent) { $expectedFiles += @($retiredLeftRelative, $retiredRightRelative) }
     if ($retiredStatePresent) { $expectedFiles += $retiredStateRelative }
     if ($receiptPresent) { $expectedFiles += "recovery-receipt.json" }
-    if ($Completed -and (-not $retiredPairPresent -or -not $retiredStatePresent -or -not $receiptPresent)) {
+    if ($receiptTempPresent) { $expectedFiles += $receiptTempRelative }
+    if ($Completed -and (-not $retiredPairPresent -or -not $retiredStatePresent -or -not $receiptPresent -or $receiptTempPresent)) {
         New-Failure "Completed interrupted-calibration archive is incomplete"
     }
     $expectedDirectories = @("interrupted-active-calibration", "failed-transcript", "state-snapshot", "immutable-backup")
@@ -6315,6 +6388,24 @@ function Assert-CompletedInterruptedArchive {
     )
 
     $record = Assert-InterruptedArchiveCore -Root $Journal.archive_path -Journal $Journal -Plan $Plan -Completed
+    $archivedPairPath = Join-Path $Journal.archive_path "interrupted-active-calibration"
+    $retiredPairPath = Join-Path $Journal.archive_path "retired-active-calibration"
+    if ((Get-InterruptedPairLayout -Directory $archivedPairPath -Plan $Plan -SourceActive $Journal.source_active) -cne "interrupted" -or
+        (Get-InterruptedPairLayout -Directory $retiredPairPath -Plan $Plan -SourceActive $Journal.source_active) -cne "interrupted") {
+        New-Failure "Completed interrupted-calibration active identities do not match pinned authority"
+    }
+    $stateName = [System.IO.Path]::GetFileName([string]$Journal.state_path)
+    foreach ($stateArtifact in @(
+        (Join-Path $Journal.archive_path (Join-Path "state-snapshot" $stateName)),
+        (Join-Path $Journal.archive_path (Join-Path "retired-state" $stateName))
+    )) {
+        if (-not (Test-Path -LiteralPath $stateArtifact -PathType Leaf) -or
+            (Get-Sha256Hex -Path $stateArtifact) -cne $Journal.source_state.sha256 -or
+            [int64](Get-Item -LiteralPath $stateArtifact).Length -ne [int64]$Journal.source_state.size -or
+            (Get-FileTimestampUtc -Path $stateArtifact) -cne $Journal.source_state.mtime_utc) {
+            New-Failure "Completed interrupted-calibration state identity does not match pinned authority"
+        }
+    }
     $receiptPath = Join-Path $Journal.archive_path "recovery-receipt.json"
     $receipt = Read-JsonFile -Path $receiptPath
     if ($receipt.schema_version -cne "1" -or $receipt.receipt_type -cne "packet2n-r5-interrupted-calibration-recovery" -or
@@ -6348,29 +6439,35 @@ function Assert-InterruptedRecoveryLayout {
     $retiredStatePath = Join-Path $Journal.archive_path (Join-Path "retired-state" ([System.IO.Path]::GetFileName([string]$Journal.state_path)))
     $retiredStateExists = Test-Path -LiteralPath $retiredStatePath -PathType Leaf
     $receiptExists = Test-Path -LiteralPath (Join-Path $Journal.archive_path "recovery-receipt.json") -PathType Leaf
+    $receiptTempExists = Test-Path -LiteralPath (Join-Path $Journal.archive_path "recovery-receipt.json.restart-durable.tmp") -PathType Leaf
+    if ($receiptExists -and $receiptTempExists) { New-Failure "Interrupted-calibration receipt layout is ambiguous" }
 
     if (-not $archiveExists) {
         if ($active -cne "interrupted" -or $staged -cne "missing" -or $rollback -cne "missing" -or
-            $retired -cne "missing" -or -not $stateExists -or $retiredStateExists -or $receiptExists) {
+            $retired -cne "missing" -or -not $stateExists -or $retiredStateExists -or $receiptExists -or $receiptTempExists) {
             New-Failure "unrecognized interrupted-calibration recovery layout"
         }
         return "initialized"
     }
     [void](Assert-InterruptedArchiveCore -Root $Journal.archive_path -Journal $Journal -Plan $Plan)
     if ($active -ceq "interrupted" -and @("missing", "partial_original", "original") -ccontains $staged -and
-        $rollback -ceq "missing" -and $retired -ceq "missing" -and $stateExists -and -not $retiredStateExists -and -not $receiptExists) {
+        $rollback -ceq "missing" -and $retired -ceq "missing" -and $stateExists -and -not $retiredStateExists -and
+        -not $receiptExists -and -not $receiptTempExists) {
         return "archive_published"
     }
     if ($active -ceq "missing" -and $staged -ceq "original" -and $rollback -ceq "interrupted" -and
-        $retired -ceq "missing" -and $stateExists -and -not $retiredStateExists -and -not $receiptExists) {
+        $retired -ceq "missing" -and $stateExists -and -not $retiredStateExists -and -not $receiptExists -and
+        -not $receiptTempExists) {
         return "active_withdrawn"
     }
     if ($active -ceq "original" -and $staged -ceq "missing" -and $rollback -ceq "interrupted" -and
-        $retired -ceq "missing" -and $stateExists -and -not $retiredStateExists -and -not $receiptExists) {
+        $retired -ceq "missing" -and $stateExists -and -not $retiredStateExists -and -not $receiptExists -and
+        -not $receiptTempExists) {
         return "original_activated"
     }
     if ($active -ceq "original" -and $staged -ceq "missing" -and $rollback -ceq "missing" -and
-        $retired -ceq "interrupted" -and $stateExists -and -not $retiredStateExists -and -not $receiptExists) {
+        $retired -ceq "interrupted" -and $stateExists -and -not $retiredStateExists -and -not $receiptExists -and
+        -not $receiptTempExists) {
         return "rejected_active_retired"
     }
     if ($active -ceq "original" -and $staged -ceq "missing" -and $rollback -ceq "missing" -and
@@ -6461,6 +6558,7 @@ function Add-InterruptedArchivesToStatus {
                         calibration = (Read-JsonFile -Path $record.artifacts.right_calibration.archive_path)
                     }
                 }
+                [void](Assert-InterruptedRecoveryJournal -Journal $journal -Plan $Plan -StatePathValue $StatePathValue)
                 [void](Assert-CompletedInterruptedArchive -Journal $journal -Plan $Plan)
                 $records.Add([ordered]@{
                     archive_path = $archive.FullName; reason = $record.reason; session_id = $record.session_id

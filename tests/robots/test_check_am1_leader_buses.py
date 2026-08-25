@@ -208,6 +208,44 @@ def test_keyboard_interrupt_is_primary_and_cleanup_never_writes() -> None:
     assert buses["COM7"].disconnect_calls == [False]
 
 
+def test_disconnect_failure_exits_nonzero_without_emitting_pass(capsys) -> None:
+    clock = FakeClock()
+    buses: dict[str, ReadOnlyFakeBus] = {}
+
+    class DisconnectFailBus(ReadOnlyFakeBus):
+        def disconnect(self, *, disable_torque: bool = True) -> None:
+            self.disconnect_calls.append(disable_torque)
+            raise RuntimeError("disconnect failed")
+
+    def factory(*, port: str, motors: dict[str, object], calibration=None) -> ReadOnlyFakeBus:
+        bus_type = DisconnectFailBus if port == "COM7" else ReadOnlyFakeBus
+        bus = bus_type(port, [raw_sample()])
+        buses[port] = bus
+        return bus
+
+    lines: list[str] = []
+
+    exit_code = main(
+        [],
+        run=lambda: run_check(
+            bus_factory=factory,
+            monotonic=clock.monotonic,
+            sleep=clock.sleep,
+            port_present=lambda port: True,
+            duration_s=0.01,
+            sample_hz=10.0,
+            out=lines.append,
+        ),
+    )
+
+    assert exit_code == 1
+    assert "LEADER_BUS_CHECK=PASS" not in lines
+    assert "LEADER_BUS_CHECK=PASS" not in capsys.readouterr().out
+    assert any("LEADER_BUS_CHECK_CLEANUP_FAILURE=" in line for line in lines)
+    assert buses["COM8"].disconnect_calls == [False]
+    assert buses["COM7"].disconnect_calls == [False]
+
+
 def test_help_exits_without_constructing_a_bus(capsys) -> None:
     def forbidden_run() -> None:
         raise AssertionError("help must not run the check")

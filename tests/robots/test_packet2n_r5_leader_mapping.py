@@ -4235,6 +4235,112 @@ def test_interrupted_recovery_resumes_every_namespace_seam(tmp_path, failure_poi
     assert not paths["journal"].exists()
 
 
+def test_interrupted_recovery_resumes_after_receipt_temp_flush(tmp_path):
+    plan, state_path, state, mixed, originals = prepare_interrupted_calibration_candidate(tmp_path)
+    paths = interrupted_transaction_paths(plan, state_path, state["session_id"])
+    receipt = paths["archive"] / "recovery-receipt.json"
+    receipt_temp = Path(f"{receipt}.restart-durable.tmp")
+    plan["restart_failure_point"] = "after_receipt_temp_flush"
+
+    interrupted = run_interrupted_recovery(plan, tmp_path, state_path)
+
+    assert interrupted.returncode != 0
+    assert "TEST FAILURE INJECTION: after_receipt_temp_flush" in interrupted.stderr
+    assert paths["journal"].is_file()
+    assert receipt_temp.is_file()
+    assert not receipt.exists()
+    assert not state_path.exists()
+    assert_complete_pair(Path(plan["calibration"]["left"]["path"]).parent, originals)
+    assert_complete_pair(paths["archive"] / "retired-active-calibration", mixed)
+    del plan["restart_failure_point"]
+
+    resumed = run_interrupted_recovery(plan, tmp_path, state_path)
+
+    assert resumed.returncode == 0, resumed.stderr
+    assert resumed.stdout.strip() == "INTERRUPTED_CALIBRATION_RECOVERY_COMPLETE"
+    assert receipt.is_file()
+    assert not receipt_temp.exists()
+    assert not paths["journal"].exists()
+
+
+@pytest.mark.parametrize("relabelled", ["transcript", "active_left"])
+def test_interrupted_recovery_resume_rejects_relabelled_pinned_journal_authority(tmp_path, relabelled):
+    plan, state_path, state, mixed, _ = prepare_interrupted_calibration_candidate(tmp_path)
+    paths = interrupted_transaction_paths(plan, state_path, state["session_id"])
+    plan["restart_failure_point"] = "after_archive_namespace_publish"
+    assert run_interrupted_recovery(plan, tmp_path, state_path).returncode != 0
+    del plan["restart_failure_point"]
+    journal = json.loads(paths["journal"].read_text(encoding="utf-8"))
+    if relabelled == "transcript":
+        journal["source_transcript"]["path"] = str(tmp_path / "relabeled-transcript.log")
+    else:
+        journal["source_active"]["left"]["path"] = str(tmp_path / "relabeled-left.json")
+    write_json(paths["journal"], journal)
+    archive_before = {
+        str(path.relative_to(paths["archive"])): path.read_bytes()
+        for path in paths["archive"].rglob("*")
+        if path.is_file()
+    }
+
+    resumed = run_interrupted_recovery(plan, tmp_path, state_path)
+
+    assert resumed.returncode != 0
+    assert "pinned authority" in resumed.stderr.lower()
+    assert_complete_pair(Path(plan["calibration"]["left"]["path"]).parent, mixed)
+    assert state_path.is_file()
+    assert paths["journal"].is_file()
+    assert {
+        str(path.relative_to(paths["archive"])): path.read_bytes()
+        for path in paths["archive"].rglob("*")
+        if path.is_file()
+    } == archive_before
+
+
+@pytest.mark.parametrize("tamper", ["record_authority", "retired_active", "retired_state"])
+def test_status_rejects_self_consistent_interrupted_archive_tamper_against_pinned_authority(tmp_path, tamper):
+    plan, state_path, state, _, _ = prepare_interrupted_calibration_candidate(tmp_path)
+    paths = interrupted_transaction_paths(plan, state_path, state["session_id"])
+    assert run_interrupted_recovery(plan, tmp_path, state_path).returncode == 0
+    archive = paths["archive"]
+    record_path = archive / "archive-record.json"
+    receipt_path = archive / "recovery-receipt.json"
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    if tamper == "record_authority":
+        record["source_provenance"]["repo_head"] = "f" * 40
+        receipt["source_provenance"] = record["source_provenance"]
+    elif tamper == "retired_active":
+        archived = Path(record["artifacts"]["left_calibration"]["archive_path"])
+        retired = archive / "retired-active-calibration" / archived.name
+        write_json(archived, make_calibration(777))
+        shutil.copy2(archived, retired)
+        update_archive_artifact_identity(record, "left_calibration", archived)
+        record["artifacts"]["left_calibration"]["source_mtime_utc"] = powershell_utc_timestamp(retired)
+    else:
+        snapshot = Path(record["artifacts"]["state"]["archive_path"])
+        retired = archive / "retired-state" / state_path.name
+        archived_state = json.loads(snapshot.read_text(encoding="utf-8"))
+        archived_state["self_consistent_tamper"] = True
+        write_json(snapshot, archived_state)
+        shutil.copy2(snapshot, retired)
+        update_archive_artifact_identity(record, "state", snapshot)
+        record["artifacts"]["state"]["source_mtime_utc"] = powershell_utc_timestamp(retired)
+    write_json(record_path, record)
+    receipt["archive_record_sha256"] = sha256_path(record_path)
+    write_json(receipt_path, receipt)
+    archive_before = {
+        str(path.relative_to(archive)): path.read_bytes() for path in archive.rglob("*") if path.is_file()
+    }
+
+    status = run_runner("-Stage", "Status", "-StatePath", str(state_path), plan=plan, tmp_path=tmp_path)
+
+    assert status.returncode == 0, status.stderr
+    payload = json.loads(status.stdout)
+    assert payload["classification"] == "INVALID_OR_UNCERTAIN_STATE"
+    assert "pinned authority" in payload["report"].lower()
+    assert {str(path.relative_to(archive)): path.read_bytes() for path in archive.rglob("*") if path.is_file()} == archive_before
+
+
 def test_interrupted_recovery_refuses_unexpected_staging_directory_without_mutation(tmp_path):
     plan, state_path, state, mixed, _ = prepare_interrupted_calibration_candidate(tmp_path)
     paths = interrupted_transaction_paths(plan, state_path, state["session_id"])

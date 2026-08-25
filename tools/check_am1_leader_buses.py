@@ -107,6 +107,7 @@ def run_check(
     connected: list[tuple[str, Bus]] = []
     samples: dict[str, list[dict[str, int]]] = {"left": [], "right": []}
     primary: BaseException | None = None
+    result: CheckResult | None = None
 
     out(f"LEFT_PORT={LEFT_PORT}")
     out(f"RIGHT_PORT={RIGHT_PORT}")
@@ -166,8 +167,6 @@ def run_check(
         out(f"LAST_RIGHT={_json(result.last['right'])}")
         out(f"MIN_MAX_LEFT={_json(result.min_max['left'])}")
         out(f"MIN_MAX_RIGHT={_json(result.min_max['right'])}")
-        out("LEADER_BUS_CHECK=PASS")
-        return result
     except BaseException as exc:
         primary = exc
         out(f"LEADER_BUS_CHECK_FAILURE={type(exc).__name__}: {exc}")
@@ -183,6 +182,10 @@ def run_check(
             out(f"LEADER_BUS_CHECK_CLEANUP_FAILURE={'; '.join(cleanup_failures)}")
             if primary is None:
                 raise RuntimeError(f"leader bus cleanup failed: {'; '.join(cleanup_failures)}")
+    if result is None:
+        raise RuntimeError("leader bus check completed without a result")
+    out("LEADER_BUS_CHECK=PASS")
+    return result
 
 
 def main(
