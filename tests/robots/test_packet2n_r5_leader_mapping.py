@@ -4341,6 +4341,41 @@ def test_status_rejects_self_consistent_interrupted_archive_tamper_against_pinne
     assert {str(path.relative_to(archive)): path.read_bytes() for path in archive.rglob("*") if path.is_file()} == archive_before
 
 
+def test_status_rejects_self_consistent_archived_immutable_authority_rewrite(tmp_path):
+    plan, state_path, state, _, _ = prepare_interrupted_calibration_candidate(tmp_path)
+    paths = interrupted_transaction_paths(plan, state_path, state["session_id"])
+    assert run_interrupted_recovery(plan, tmp_path, state_path).returncode == 0
+    archive = paths["archive"]
+    record_path = archive / "archive-record.json"
+    receipt_path = archive / "recovery-receipt.json"
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    manifest_path = Path(record["artifacts"]["manifest"]["archive_path"])
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["self_consistent_immutable_rewrite"] = True
+    write_json(manifest_path, manifest)
+    update_archive_artifact_identity(record, "manifest", manifest_path)
+    for side, seed in (("left", 801), ("right", 802)):
+        name = f"original_{side}"
+        original_path = Path(record["artifacts"][name]["archive_path"])
+        write_json(original_path, make_calibration(seed))
+        update_archive_artifact_identity(record, name, original_path)
+    write_json(record_path, record)
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["archive_record_sha256"] = sha256_path(record_path)
+    write_json(receipt_path, receipt)
+    archive_before = {
+        str(path.relative_to(archive)): path.read_bytes() for path in archive.rglob("*") if path.is_file()
+    }
+
+    status = run_runner("-Stage", "Status", "-StatePath", str(state_path), plan=plan, tmp_path=tmp_path)
+
+    assert status.returncode == 0, status.stderr
+    payload = json.loads(status.stdout)
+    assert payload["classification"] == "INVALID_OR_UNCERTAIN_STATE"
+    assert "pinned immutable authority" in payload["report"].lower()
+    assert {str(path.relative_to(archive)): path.read_bytes() for path in archive.rglob("*") if path.is_file()} == archive_before
+
+
 def test_interrupted_recovery_refuses_unexpected_staging_directory_without_mutation(tmp_path):
     plan, state_path, state, mixed, _ = prepare_interrupted_calibration_candidate(tmp_path)
     paths = interrupted_transaction_paths(plan, state_path, state["session_id"])

@@ -6264,6 +6264,33 @@ function Assert-InterruptedArchiveCore {
             New-Failure "Interrupted-calibration archived $name identity is invalid"
         }
     }
+    $immutableExpectations = [ordered]@{
+        manifest = [ordered]@{
+            source_path = $Plan.manifest.path
+            archive_path = Join-Path $Journal.archive_path (Join-Path "immutable-backup" ([System.IO.Path]::GetFileName([string]$Plan.manifest.path)))
+            sha256 = $Plan.manifest.sha256
+            size = [int64](Get-Item -LiteralPath $Plan.manifest.path).Length
+            source_mtime_utc = Get-FileTimestampUtc -Path $Plan.manifest.path
+            archive_mtime_utc = Get-FileTimestampUtc -Path $Plan.manifest.path
+        }
+    }
+    foreach ($side in @("left", "right")) {
+        $backupPath = [string]$Plan.calibration[$side].backup_path
+        $backupMtime = Get-FileTimestampUtc -Path $backupPath
+        $immutableExpectations["original_$side"] = [ordered]@{
+            source_path = $backupPath
+            archive_path = Join-Path $Journal.archive_path (Join-Path "immutable-backup" ([System.IO.Path]::GetFileName($backupPath)))
+            sha256 = $Plan.calibration[$side].backup_sha256
+            size = [int64]$Plan.calibration[$side].backup_size
+            source_mtime_utc = $backupMtime
+            archive_mtime_utc = $backupMtime
+        }
+    }
+    foreach ($name in $immutableExpectations.Keys) {
+        if (-not (Test-ExactValue -Actual $record.artifacts[$name] -Expected $immutableExpectations[$name])) {
+            New-Failure "Interrupted-calibration archived $name does not match pinned immutable authority"
+        }
+    }
     $derivedPath = if ($Root -ceq $Journal.archive_staging_path) { Join-Path $Root "interrupted-evidence.json" } else { Join-Path $Journal.archive_path "interrupted-evidence.json" }
     $derived = Read-JsonFile -Path $derivedPath
     $expectedDerived = Get-InterruptedDerivedEvidence -Journal $Journal
