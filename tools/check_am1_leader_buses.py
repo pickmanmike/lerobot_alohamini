@@ -137,10 +137,13 @@ def run_check(
                     raise RuntimeError(f"{side} leader {port} read failed: {exc}") from exc
                 samples[side].append(_validate_sample(side, port, raw))
 
+            now = monotonic()
+            if now >= deadline:
+                break
             next_sample += interval
             if next_sample > deadline:
                 break
-            remaining = next_sample - monotonic()
+            remaining = next_sample - now
             if remaining > 0:
                 sleep(remaining)
 

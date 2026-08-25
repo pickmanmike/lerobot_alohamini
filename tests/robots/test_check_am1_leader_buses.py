@@ -107,6 +107,36 @@ def test_clean_check_reads_both_raw_six_motor_buses_without_writes() -> None:
     assert text.rstrip().endswith("LEADER_BUS_CHECK=PASS")
 
 
+def test_slow_reads_do_not_start_new_sample_after_monotonic_deadline() -> None:
+    clock = FakeClock()
+    buses: dict[str, ReadOnlyFakeBus] = {}
+
+    class SlowReadBus(ReadOnlyFakeBus):
+        def sync_read(self, register: str, motors=None, *, normalize: bool = True, num_retry: int = 3):
+            clock.now += 1.0
+            return super().sync_read(register, motors, normalize=normalize, num_retry=num_retry)
+
+    def factory(*, port: str, motors: dict[str, object], calibration=None) -> ReadOnlyFakeBus:
+        bus = SlowReadBus(port, [raw_sample(), raw_sample(), raw_sample()])
+        buses[port] = bus
+        return bus
+
+    result = run_check(
+        bus_factory=factory,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+        port_present=lambda port: True,
+        duration_s=0.2,
+        sample_hz=10.0,
+        out=lambda _: None,
+    )
+
+    assert result.sample_count == 1
+    assert clock.now == 2.0
+    assert all(len(bus.read_calls) == 1 for bus in buses.values())
+    assert all(bus.disconnect_calls == [False] for bus in buses.values())
+
+
 @pytest.mark.parametrize(
     ("side", "bad_sample", "message"),
     [

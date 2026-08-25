@@ -618,6 +618,7 @@ def prepare_interrupted_calibration_candidate(
             "path": str(transcript_path),
             "sha256": sha256_path(transcript_path),
             "size": transcript_path.stat().st_size,
+            "mtime_utc": powershell_utc_timestamp(transcript_path),
         },
         "source_evidence_present": False,
         "traceback_text_present": False,
@@ -4235,6 +4236,112 @@ def test_interrupted_recovery_resumes_every_namespace_seam(tmp_path, failure_poi
     assert not paths["journal"].exists()
 
 
+def test_interrupted_recovery_resumes_exact_empty_retired_state_directory_with_pinned_live_state(tmp_path):
+    plan, state_path, state, mixed, originals = prepare_interrupted_calibration_candidate(tmp_path)
+    paths = interrupted_transaction_paths(plan, state_path, state["session_id"])
+    active_dir = Path(plan["calibration"]["left"]["path"]).parent
+    retired_state_dir = paths["archive"] / "retired-state"
+    state_before = state_path.read_bytes()
+    plan["restart_failure_point"] = "after_fresh_pair_namespace_publish"
+    assert run_interrupted_recovery(plan, tmp_path, state_path).returncode != 0
+    del plan["restart_failure_point"]
+    retired_state_dir.mkdir()
+
+    resumed = run_interrupted_recovery(plan, tmp_path, state_path)
+
+    assert resumed.returncode == 0, resumed.stderr
+    assert resumed.stdout.strip() == "INTERRUPTED_CALIBRATION_RECOVERY_COMPLETE"
+    assert_complete_pair(active_dir, originals)
+    assert_complete_pair(paths["archive"] / "retired-active-calibration", mixed)
+    assert (retired_state_dir / state_path.name).read_bytes() == state_before
+    assert not state_path.exists()
+    assert not paths["journal"].exists()
+
+
+def test_interrupted_recovery_resumes_after_retired_state_directory_creation(tmp_path):
+    plan, state_path, state, mixed, originals = prepare_interrupted_calibration_candidate(tmp_path)
+    paths = interrupted_transaction_paths(plan, state_path, state["session_id"])
+    active_dir = Path(plan["calibration"]["left"]["path"]).parent
+    retired_state_dir = paths["archive"] / "retired-state"
+    state_before = state_path.read_bytes()
+    plan["restart_failure_point"] = "after_retired_state_directory_create"
+
+    interrupted = run_interrupted_recovery(plan, tmp_path, state_path)
+
+    assert interrupted.returncode != 0
+    assert "TEST FAILURE INJECTION: after_retired_state_directory_create" in interrupted.stderr
+    assert retired_state_dir.is_dir()
+    assert list(retired_state_dir.iterdir()) == []
+    assert state_path.read_bytes() == state_before
+    assert_complete_pair(active_dir, originals)
+    assert_complete_pair(paths["archive"] / "retired-active-calibration", mixed)
+    assert paths["journal"].is_file()
+    del plan["restart_failure_point"]
+
+    resumed = run_interrupted_recovery(plan, tmp_path, state_path)
+
+    assert resumed.returncode == 0, resumed.stderr
+    assert resumed.stdout.strip() == "INTERRUPTED_CALIBRATION_RECOVERY_COMPLETE"
+    assert (retired_state_dir / state_path.name).read_bytes() == state_before
+    assert not state_path.exists()
+    assert not paths["journal"].exists()
+
+
+@pytest.mark.parametrize("invalid_layout", ["nonempty", "ambiguous"])
+def test_interrupted_recovery_refuses_invalid_retired_state_directory_without_live_state_mutation(
+    tmp_path, invalid_layout
+):
+    plan, state_path, state, _, _ = prepare_interrupted_calibration_candidate(tmp_path)
+    paths = interrupted_transaction_paths(plan, state_path, state["session_id"])
+    active_dir = Path(plan["calibration"]["left"]["path"]).parent
+    plan["restart_failure_point"] = "after_fresh_pair_namespace_publish"
+    assert run_interrupted_recovery(plan, tmp_path, state_path).returncode != 0
+    del plan["restart_failure_point"]
+    retired_state_dir = paths["archive"] / "retired-state"
+    retired_state_dir.mkdir()
+    if invalid_layout == "nonempty":
+        write_text(retired_state_dir / "unexpected.txt", "unexpected\n")
+    else:
+        shutil.copy2(state_path, retired_state_dir / state_path.name)
+    state_before = state_path.read_bytes()
+    active_before = {path.name: path.read_bytes() for path in active_dir.iterdir()}
+
+    resumed = run_interrupted_recovery(plan, tmp_path, state_path)
+
+    assert resumed.returncode != 0
+    assert state_path.read_bytes() == state_before
+    assert {path.name: path.read_bytes() for path in active_dir.iterdir()} == active_before
+    assert paths["journal"].is_file()
+
+
+def test_interrupted_recovery_refuses_reparse_retired_state_directory_without_live_state_mutation(tmp_path):
+    plan, state_path, state, _, _ = prepare_interrupted_calibration_candidate(tmp_path)
+    paths = interrupted_transaction_paths(plan, state_path, state["session_id"])
+    active_dir = Path(plan["calibration"]["left"]["path"]).parent
+    plan["restart_failure_point"] = "after_fresh_pair_namespace_publish"
+    assert run_interrupted_recovery(plan, tmp_path, state_path).returncode != 0
+    del plan["restart_failure_point"]
+    retired_state_dir = paths["archive"] / "retired-state"
+    junction_target = tmp_path / "retired-state-junction-target"
+    junction_target.mkdir()
+    create_directory_junction_or_skip(retired_state_dir, junction_target)
+    state_before = state_path.read_bytes()
+    active_before = {path.name: path.read_bytes() for path in active_dir.iterdir()}
+    try:
+        resumed = run_interrupted_recovery(plan, tmp_path, state_path)
+
+        assert resumed.returncode != 0
+        assert "reparse point" in resumed.stderr.lower()
+        assert state_path.read_bytes() == state_before
+        assert {path.name: path.read_bytes() for path in active_dir.iterdir()} == active_before
+        assert paths["journal"].is_file()
+        assert list(junction_target.iterdir()) == []
+    finally:
+        if retired_state_dir.exists():
+            os.rmdir(retired_state_dir)
+        shutil.rmtree(junction_target, ignore_errors=True)
+
+
 def test_interrupted_recovery_resumes_after_receipt_temp_flush(tmp_path):
     plan, state_path, state, mixed, originals = prepare_interrupted_calibration_candidate(tmp_path)
     paths = interrupted_transaction_paths(plan, state_path, state["session_id"])
@@ -4294,6 +4401,46 @@ def test_interrupted_recovery_resume_rejects_relabelled_pinned_journal_authority
         for path in paths["archive"].rglob("*")
         if path.is_file()
     } == archive_before
+
+
+@pytest.mark.parametrize("artifact_name", ["left_calibration", "right_calibration", "state", "transcript"])
+def test_live_interrupted_recovery_rejects_self_consistent_archived_source_tamper_before_mutation(
+    tmp_path, artifact_name
+):
+    plan, state_path, state, mixed, _ = prepare_interrupted_calibration_candidate(tmp_path)
+    paths = interrupted_transaction_paths(plan, state_path, state["session_id"])
+    active_dir = Path(plan["calibration"]["left"]["path"]).parent
+    plan["restart_failure_point"] = "after_archive_namespace_publish"
+    assert run_interrupted_recovery(plan, tmp_path, state_path).returncode != 0
+    del plan["restart_failure_point"]
+    record_path = paths["archive"] / "archive-record.json"
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    archived_path = Path(record["artifacts"][artifact_name]["archive_path"])
+    if artifact_name == "transcript":
+        write_text(archived_path, "self-consistently rewritten failed transcript\n")
+    elif artifact_name == "state":
+        archived_state = json.loads(archived_path.read_text(encoding="utf-8"))
+        archived_state["self_consistent_live_tamper"] = True
+        write_json(archived_path, archived_state)
+    else:
+        write_json(archived_path, make_calibration(901 if artifact_name == "left_calibration" else 902))
+    update_archive_artifact_identity(record, artifact_name, archived_path)
+    record["artifacts"][artifact_name]["source_mtime_utc"] = powershell_utc_timestamp(archived_path)
+    write_json(record_path, record)
+    journal = json.loads(paths["journal"].read_text(encoding="utf-8"))
+    journal["archive_record_sha256"] = sha256_path(record_path)
+    write_json(paths["journal"], journal)
+    state_before = state_path.read_bytes()
+    active_before = {path.name: path.read_bytes() for path in active_dir.iterdir()}
+
+    resumed = run_interrupted_recovery(plan, tmp_path, state_path)
+
+    assert resumed.returncode != 0
+    assert "pinned authority" in resumed.stderr.lower()
+    assert state_path.read_bytes() == state_before
+    assert {path.name: path.read_bytes() for path in active_dir.iterdir()} == active_before == mixed
+    assert paths["journal"].is_file()
+    assert not (paths["archive"] / "retired-active-calibration").exists()
 
 
 @pytest.mark.parametrize("tamper", ["record_authority", "retired_active", "retired_state"])

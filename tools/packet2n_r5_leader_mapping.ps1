@@ -46,6 +46,7 @@ $InterruptedStateSha256 = "0371650B298B46B8B724A8425E7D4628AF88F6125F967FEF1ED84
 $InterruptedStateSize = [int64]6110
 $InterruptedTranscriptSha256 = "6BA8699C55BED9074EFBBD18637CEB8FCD337CD70C84629C0C6036BE32768447"
 $InterruptedTranscriptSize = [int64]1397
+$InterruptedTranscriptMtimeUtc = "2026-08-25T00:40:37.3179751Z"
 $InterruptedActiveLeftSha256 = "2B3C2245CAFCA67BBDA25FF0A868A158E6DDCF2162C2A5D5782220EF9DACF50D"
 $InterruptedActiveLeftSize = [int64]961
 $InterruptedActiveLeftMtimeUtc = "2026-08-25T00:39:56.5269224Z"
@@ -4230,6 +4231,7 @@ function Test-RestartFailurePoint {
         "after_active_directory_move",
         "after_original_directory_move",
         "after_fresh_pair_namespace_publish",
+        "after_retired_state_directory_create",
         "after_state_namespace_publish",
         "after_receipt_temp_flush",
         "after_receipt_publish"
@@ -5749,7 +5751,7 @@ function Get-InterruptedPinnedAuthority {
             Assert-ExactKeySet -Value $fixture.active[$side] -ExpectedKeys @("path", "sha256", "size", "mtime_utc", "calibration") -Message "Test-mode interrupted $side fixture is invalid"
             Assert-CalibrationSchema -Calibration $fixture.active[$side].calibration -Label "test-mode interrupted $side fixture"
         }
-        Assert-ExactKeySet -Value $fixture.transcript -ExpectedKeys @("path", "sha256", "size") -Message "Test-mode interrupted transcript fixture is invalid"
+        Assert-ExactKeySet -Value $fixture.transcript -ExpectedKeys @("path", "sha256", "size", "mtime_utc") -Message "Test-mode interrupted transcript fixture is invalid"
         if ($fixture.schema_version -cne "1" -or
             $fixture.behavior_sha -cne $BehaviorBaseline -or
             $fixture.state.path -cne $StatePathValue -or
@@ -5784,6 +5786,7 @@ function Get-InterruptedPinnedAuthority {
             path = Join-Path $RealLogsDirectory "packet2n-r5-calibration-$InterruptedSessionId.log"
             sha256 = $InterruptedTranscriptSha256
             size = $InterruptedTranscriptSize
+            mtime_utc = $InterruptedTranscriptMtimeUtc
         }
         source_evidence_present = $false
         traceback_text_present  = $false
@@ -5895,6 +5898,7 @@ function Assert-InterruptedCalibrationCandidate {
     if ($transcriptPath -cne $authority.transcript.path -or -not (Test-Path -LiteralPath $transcriptPath -PathType Leaf) -or
         (Get-Sha256Hex -Path $transcriptPath) -cne $authority.transcript.sha256 -or
         [int64](Get-Item -LiteralPath $transcriptPath).Length -ne [int64]$authority.transcript.size -or
+        (Get-FileTimestampUtc -Path $transcriptPath) -cne $authority.transcript.mtime_utc -or
         $null -ne $State.artifacts.transcript.sha256 -or $null -ne $State.artifacts.transcript.size) {
         New-Failure "Interrupted-calibration failed transcript identity is invalid"
     }
@@ -6033,7 +6037,7 @@ function Assert-InterruptedRecoveryJournal {
     }
     Assert-ExactKeySet -Value $Journal.source_state -ExpectedKeys @("sha256", "size", "mtime_utc") -Message "Interrupted-calibration journal source state is invalid"
     Assert-ExactKeySet -Value $Journal.source_active -ExpectedKeys @("left", "right") -Message "Interrupted-calibration journal active pair is invalid"
-    Assert-ExactKeySet -Value $Journal.source_transcript -ExpectedKeys @("path", "sha256", "size") -Message "Interrupted-calibration journal transcript is invalid"
+    Assert-ExactKeySet -Value $Journal.source_transcript -ExpectedKeys @("path", "sha256", "size", "mtime_utc") -Message "Interrupted-calibration journal transcript is invalid"
     Assert-ExactKeySet -Value $Journal.command -ExpectedKeys @("executable", "arguments") -Message "Interrupted-calibration journal command is invalid"
     foreach ($side in @("left", "right")) {
         Assert-ExactKeySet -Value $Journal.source_active[$side] -ExpectedKeys @("path", "sha256", "size", "mtime_utc", "calibration") -Message "Interrupted-calibration journal $side active identity is invalid"
@@ -6264,6 +6268,45 @@ function Assert-InterruptedArchiveCore {
             New-Failure "Interrupted-calibration archived $name identity is invalid"
         }
     }
+    $sourceExpectations = [ordered]@{
+        left_calibration = [ordered]@{
+            source_path = $Journal.source_active.left.path
+            archive_path = Join-Path $Journal.archive_path (Join-Path "interrupted-active-calibration" ([System.IO.Path]::GetFileName([string]$Journal.source_active.left.path)))
+            sha256 = $Journal.source_active.left.sha256
+            size = [int64]$Journal.source_active.left.size
+            source_mtime_utc = $Journal.source_active.left.mtime_utc
+            archive_mtime_utc = $Journal.source_active.left.mtime_utc
+        }
+        right_calibration = [ordered]@{
+            source_path = $Journal.source_active.right.path
+            archive_path = Join-Path $Journal.archive_path (Join-Path "interrupted-active-calibration" ([System.IO.Path]::GetFileName([string]$Journal.source_active.right.path)))
+            sha256 = $Journal.source_active.right.sha256
+            size = [int64]$Journal.source_active.right.size
+            source_mtime_utc = $Journal.source_active.right.mtime_utc
+            archive_mtime_utc = $Journal.source_active.right.mtime_utc
+        }
+        state = [ordered]@{
+            source_path = $Journal.state_path
+            archive_path = Join-Path $Journal.archive_path (Join-Path "state-snapshot" ([System.IO.Path]::GetFileName([string]$Journal.state_path)))
+            sha256 = $Journal.source_state.sha256
+            size = [int64]$Journal.source_state.size
+            source_mtime_utc = $Journal.source_state.mtime_utc
+            archive_mtime_utc = $Journal.source_state.mtime_utc
+        }
+        transcript = [ordered]@{
+            source_path = $Journal.source_transcript.path
+            archive_path = Join-Path $Journal.archive_path (Join-Path "failed-transcript" ([System.IO.Path]::GetFileName([string]$Journal.source_transcript.path)))
+            sha256 = $Journal.source_transcript.sha256
+            size = [int64]$Journal.source_transcript.size
+            source_mtime_utc = $Journal.source_transcript.mtime_utc
+            archive_mtime_utc = $Journal.source_transcript.mtime_utc
+        }
+    }
+    foreach ($name in $sourceExpectations.Keys) {
+        if (-not (Test-ExactValue -Actual $record.artifacts[$name] -Expected $sourceExpectations[$name])) {
+            New-Failure "Interrupted-calibration archived $name does not match pinned authority"
+        }
+    }
     $immutableExpectations = [ordered]@{
         manifest = [ordered]@{
             source_path = $Plan.manifest.path
@@ -6313,9 +6356,13 @@ function Assert-InterruptedArchiveCore {
     $retiredLeftRelative = Join-Path "retired-active-calibration" $leftName
     $retiredRightRelative = Join-Path "retired-active-calibration" $rightName
     $retiredStateRelative = Join-Path "retired-state" $stateName
+    $retiredStateDirectory = Join-Path $Root "retired-state"
     $retiredPairPresent = (Test-Path -LiteralPath (Join-Path $Root $retiredLeftRelative) -PathType Leaf) -or
         (Test-Path -LiteralPath (Join-Path $Root $retiredRightRelative) -PathType Leaf)
     $retiredStatePresent = Test-Path -LiteralPath (Join-Path $Root $retiredStateRelative) -PathType Leaf
+    $emptyRetiredStateDirectory = (Test-Path -LiteralPath $Journal.state_path -PathType Leaf) -and
+        (Test-Path -LiteralPath $retiredStateDirectory -PathType Container) -and
+        @(Get-ChildItem -LiteralPath $retiredStateDirectory -Force).Count -eq 0
     $receiptPresent = Test-Path -LiteralPath (Join-Path $Root "recovery-receipt.json") -PathType Leaf
     $receiptTempRelative = "recovery-receipt.json.restart-durable.tmp"
     $receiptTempPresent = Test-Path -LiteralPath (Join-Path $Root $receiptTempRelative) -PathType Leaf
@@ -6328,7 +6375,7 @@ function Assert-InterruptedArchiveCore {
     }
     $expectedDirectories = @("interrupted-active-calibration", "failed-transcript", "state-snapshot", "immutable-backup")
     if ($retiredPairPresent) { $expectedDirectories += "retired-active-calibration" }
-    if ($retiredStatePresent) { $expectedDirectories += "retired-state" }
+    if ($retiredStatePresent -or $emptyRetiredStateDirectory) { $expectedDirectories += "retired-state" }
     $actualDirectories = @(
         Get-ChildItem -LiteralPath $Root -Recurse -Force | Where-Object { $_ -is [System.IO.DirectoryInfo] } |
             ForEach-Object { [System.IO.Path]::GetRelativePath($Root, $_.FullName) }
@@ -6432,6 +6479,13 @@ function Assert-CompletedInterruptedArchive {
             (Get-FileTimestampUtc -Path $stateArtifact) -cne $Journal.source_state.mtime_utc) {
             New-Failure "Completed interrupted-calibration state identity does not match pinned authority"
         }
+    }
+    $transcriptPath = Join-Path $Journal.archive_path (Join-Path "failed-transcript" ([System.IO.Path]::GetFileName([string]$Journal.source_transcript.path)))
+    if (-not (Test-Path -LiteralPath $transcriptPath -PathType Leaf) -or
+        (Get-Sha256Hex -Path $transcriptPath) -cne $Journal.source_transcript.sha256 -or
+        [int64](Get-Item -LiteralPath $transcriptPath).Length -ne [int64]$Journal.source_transcript.size -or
+        (Get-FileTimestampUtc -Path $transcriptPath) -cne $Journal.source_transcript.mtime_utc) {
+        New-Failure "Completed interrupted-calibration transcript identity does not match pinned authority"
     }
     $receiptPath = Join-Path $Journal.archive_path "recovery-receipt.json"
     $receipt = Read-JsonFile -Path $receiptPath
@@ -6568,7 +6622,10 @@ function Add-InterruptedArchivesToStatus {
                     rollback_path = $paths.rollback
                     source_state = [ordered]@{ sha256 = Get-Sha256Hex -Path $retiredStatePath; size = [int64](Get-Item -LiteralPath $retiredStatePath).Length; mtime_utc = Get-FileTimestampUtc -Path $retiredStatePath }
                     source_active = [ordered]@{ left = $retiredState.pre_calibration.left; right = $retiredState.pre_calibration.right }
-                    source_transcript = [ordered]@{ path = $record.artifacts.transcript.source_path; sha256 = $record.artifacts.transcript.sha256; size = $record.artifacts.transcript.size }
+                    source_transcript = [ordered]@{
+                        path = $record.artifacts.transcript.source_path; sha256 = $record.artifacts.transcript.sha256
+                        size = $record.artifacts.transcript.size; mtime_utc = $record.artifacts.transcript.source_mtime_utc
+                    }
                     source_evidence_present = $false; traceback_text_present = $false; native_stage_truth = $record.native_stage_truth
                     ports = $record.ports; command = $record.command; source_provenance = $record.source_provenance
                     recovery_provenance = $record.recovery_provenance; archive_record_sha256 = Get-Sha256Hex -Path $recordPath
@@ -6702,6 +6759,7 @@ function Invoke-RecoverInterruptedCalibrationStage {
         Assert-SourceStateIdentity -StatePathValue $StatePathValue -Expected $journal.source_state
         Assert-PathMissing -Path $retiredStatePath
         [void][System.IO.Directory]::CreateDirectory($retiredStateDirectory)
+        Test-RestartFailurePoint -Plan $Plan -Point "after_retired_state_directory_create"
         Assert-RestartMoveSafe -Source $StatePathValue -Destination $retiredStatePath -SourceRoot ([string]$Plan.state_root) -DestinationRoot ([string]$Plan.rejected_archive_root) -Label "interrupted state retirement"
         Invoke-RestartDurableNamespaceMove -Source $StatePathValue -Destination $retiredStatePath -Label "interrupted state retirement"
         Test-RestartFailurePoint -Plan $Plan -Point "after_state_namespace_publish"
