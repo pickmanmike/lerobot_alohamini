@@ -29,6 +29,9 @@ RIGHT_MAP_STAGE = "MapRight"
 RESTART_STAGE = "RestartCalibration"
 RESTART_CONFIRMATION = "RECALIBRATE"
 REJECTION_REASON = "OPERATOR_REJECTED_INCOMPLETE_RANGE"
+INTERRUPTED_STAGE = "RecoverInterruptedCalibration"
+INTERRUPTED_CONFIRMATION = "RECOVER"
+INTERRUPTED_REASON = "INTERRUPTED_CALIBRATION_RIGHT_BUS_DISCONNECT"
 IMPORT_SOURCE_PATHS = {
     "lerobot": REPO_ROOT / "src" / "lerobot" / "__init__.py",
     "calibrate_bi": REPO_ROOT / "examples" / "alohamini" / "calibrate_bi.py",
@@ -523,6 +526,103 @@ def run_restart(
         plan=plan,
         tmp_path=tmp_path,
     )
+
+
+def interrupted_transaction_paths(
+    plan: dict[str, object], state_path: Path, session_id: str
+) -> dict[str, Path]:
+    active_dir = Path(plan["calibration"]["left"]["path"]).parent
+    archive = Path(plan["rejected_archive_root"]) / f"packet2n-r5-interrupted-{session_id}"
+    return {
+        "journal": Path(f"{state_path}.recover-interrupted-calibration.json"),
+        "archive": archive,
+        "archive_staging": Path(f"{archive}.staging"),
+        "staged_original": active_dir.parent / f".packet2n-r5-interrupted-original-{session_id}",
+        "rollback": active_dir.parent / f".packet2n-r5-interrupted-rejected-{session_id}",
+    }
+
+
+def run_interrupted_recovery(
+    plan: dict[str, object],
+    tmp_path: Path,
+    state_path: Path,
+    *,
+    confirmation: str = INTERRUPTED_CONFIRMATION,
+) -> subprocess.CompletedProcess[str]:
+    return run_runner(
+        "-Stage",
+        INTERRUPTED_STAGE,
+        "-StatePath",
+        str(state_path),
+        "-Confirm",
+        confirmation,
+        plan=plan,
+        tmp_path=tmp_path,
+    )
+
+
+def prepare_interrupted_calibration_candidate(
+    tmp_path: Path,
+) -> tuple[dict[str, object], Path, dict[str, object], dict[str, bytes], dict[str, bytes]]:
+    plan = base_plan(tmp_path)
+    state_path = tmp_path / "logs" / "packet2n-r5-state.json"
+    plan["stage_plan"]["Calibrate"]["exit_code"] = 1
+    failed = run_calibrate(plan, tmp_path, state_path)
+    assert failed.returncode != 0
+    state = load_state(state_path)
+    transcript_path = Path(state["artifacts"]["transcript"]["path"])
+    header = "\n".join(
+        [
+            f"PACKET2N_R5_SESSION_ID={state['session_id']}",
+            f"PACKET2N_R5_SESSION_STARTED_UTC={state['utc_start']}",
+            f"PACKET2N_R5_BEHAVIOR_SHA={state['behavior_sha']}",
+            f"PACKET2N_R5_CALIBRATION_EXECUTABLE={state['stages']['Calibrate']['native']['executable']}",
+            "PACKET2N_R5_CALIBRATION_ARGS_JSON="
+            + json.dumps(state["stages"]["Calibrate"]["native"]["arguments"], separators=(",", ":")),
+            "FAILED WITHOUT NATIVE TRACEBACK",
+            "",
+        ]
+    )
+    write_text(transcript_path, header)
+    left_path = Path(plan["calibration"]["left"]["path"])
+    write_json(left_path, plan["stage_plan"]["Calibrate"]["post_calibration"]["left"])
+    fresh_time = datetime(2026, 8, 25, 0, 39, 56, tzinfo=UTC).timestamp()
+    os.utime(left_path, (fresh_time, fresh_time))
+    state_bytes = state_path.read_bytes()
+    active = {
+        Path(plan["calibration"][side]["path"]).name: Path(plan["calibration"][side]["path"]).read_bytes()
+        for side in ("left", "right")
+    }
+    originals = {
+        Path(plan["calibration"][side]["path"]).name: Path(plan["calibration"][side]["backup_path"]).read_bytes()
+        for side in ("left", "right")
+    }
+    plan["interrupted_legacy_fixture"] = {
+        "schema_version": "1",
+        "repo_head": state["repo_head"],
+        "runner_sha256": state["runner_sha"],
+        "behavior_sha": state["behavior_sha"],
+        "session_id": state["session_id"],
+        "state": {"path": str(state_path), "sha256": sha256_path(state_path), "size": len(state_bytes)},
+        "active": {
+            side: {
+                "path": str(Path(plan["calibration"][side]["path"])),
+                "sha256": sha256_path(Path(plan["calibration"][side]["path"])),
+                "size": Path(plan["calibration"][side]["path"]).stat().st_size,
+                "mtime_utc": powershell_utc_timestamp(Path(plan["calibration"][side]["path"])),
+                "calibration": json.loads(Path(plan["calibration"][side]["path"]).read_text(encoding="utf-8")),
+            }
+            for side in ("left", "right")
+        },
+        "transcript": {
+            "path": str(transcript_path),
+            "sha256": sha256_path(transcript_path),
+            "size": transcript_path.stat().st_size,
+        },
+        "source_evidence_present": False,
+        "traceback_text_present": False,
+    }
+    return plan, state_path, state, active, originals
 
 
 def state_session_binding_sha256(state: dict[str, object]) -> str:
@@ -2474,6 +2574,21 @@ def test_hardware_stage_failure_prints_recovery_classification_and_next_stage(tm
     assert "RECOVERY_NEXT_STAGE=Calibrate" in result.stderr
 
 
+def test_calibrate_failure_preserves_primary_error_and_prints_exact_supported_recovery(tmp_path):
+    plan = base_plan(tmp_path)
+    plan["stage_plan"]["Calibrate"]["exit_code"] = 1
+    state_path = tmp_path / "logs" / "packet2n-r5-state.json"
+
+    result = run_calibrate(plan, tmp_path, state_path)
+
+    assert result.returncode != 0
+    assert result.stderr.splitlines()[0] == "Calibrate native command failed with exit code 1"
+    assert (
+        r"pwsh -NoLogo -NoProfile -File .\tools\packet2n_r5_leader_mapping.ps1 "
+        r"-Stage RecoverInterruptedCalibration -Confirm RECOVER"
+    ) in result.stderr
+
+
 def test_test_mode_rejects_calibration_path_outside_validated_root(tmp_path):
     plan = base_plan(tmp_path)
     escaped_path = tmp_path.parent / f"{tmp_path.name}-escaped-left.json"
@@ -3951,3 +4066,231 @@ def test_status_rejects_self_consistent_archive_claims_not_derived_from_plan_and
     assert {str(path.relative_to(archive)): path.read_bytes() for path in archive.rglob("*") if path.is_file()} == archive_before_status
     assert not state_path.exists()
     assert not Path(f"{state_path}.restart-calibration.json").exists()
+
+
+def test_interrupted_recovery_requires_exact_confirmation_without_mutation(tmp_path):
+    plan, state_path, _, active, _ = prepare_interrupted_calibration_candidate(tmp_path)
+    paths = interrupted_transaction_paths(plan, state_path, "test-session")
+    state_before = state_path.read_bytes()
+
+    for confirmation in ("", "recover", "RECOVER "):
+        result = run_interrupted_recovery(plan, tmp_path, state_path, confirmation=confirmation)
+        assert result.returncode != 0
+        assert "requires -Confirm RECOVER" in result.stderr
+        assert_complete_pair(Path(plan["calibration"]["left"]["path"]).parent, active)
+        assert state_path.read_bytes() == state_before
+        assert not paths["journal"].exists()
+        assert not paths["archive"].exists()
+
+
+def test_exact_interrupted_candidate_archives_mixed_pair_and_restores_original_directory_offline(tmp_path):
+    plan, state_path, state, mixed, originals = prepare_interrupted_calibration_candidate(tmp_path)
+    transcript_path = Path(state["artifacts"]["transcript"]["path"])
+    transcript_bytes = transcript_path.read_bytes()
+    state_bytes = state_path.read_bytes()
+    manifest_path = Path(plan["manifest"]["path"])
+    manifest_bytes = manifest_path.read_bytes()
+    paths = interrupted_transaction_paths(plan, state_path, state["session_id"])
+    active_dir = Path(plan["calibration"]["left"]["path"]).parent
+    am2_dir = tmp_path / "calibration" / "teleoperators" / "am_leader"
+    am2 = {"am_leader_bi_left.json": b"AM2 LEFT\n", "am2pro_leader_bi_right.json": b"AM2 PRO RIGHT\n"}
+    for name, content in am2.items():
+        (am2_dir / name).parent.mkdir(parents=True, exist_ok=True)
+        (am2_dir / name).write_bytes(content)
+
+    result = run_interrupted_recovery(plan, tmp_path, state_path)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "INTERRUPTED_CALIBRATION_RECOVERY_COMPLETE"
+    assert_complete_pair(active_dir, originals)
+    archive = paths["archive"]
+    for side in ("left", "right"):
+        name = Path(plan["calibration"][side]["path"]).name
+        assert (archive / "interrupted-active-calibration" / name).read_bytes() == mixed[name]
+    assert (archive / "failed-transcript" / transcript_path.name).read_bytes() == transcript_bytes
+    assert (archive / "state-snapshot" / state_path.name).read_bytes() == state_bytes
+    assert (archive / "retired-state" / state_path.name).read_bytes() == state_bytes
+    assert (archive / "immutable-backup" / manifest_path.name).read_bytes() == manifest_bytes
+    assert_complete_pair(archive / "retired-active-calibration", mixed)
+    evidence = json.loads((archive / "interrupted-evidence.json").read_text(encoding="utf-8"))
+    assert evidence["source_evidence_present"] is False
+    assert evidence["traceback_text_present"] is False
+    assert evidence["native_exit_code"] == 1
+    assert evidence["mapping_eligible"] is False
+    assert evidence["rejected"] is True
+    record = json.loads((archive / "archive-record.json").read_text(encoding="utf-8"))
+    assert record["record_type"] == "packet2n-r5-interrupted-calibration"
+    assert record["reason"] == INTERRUPTED_REASON
+    assert record["session_id"] == state["session_id"]
+    assert record["ports"] == state["ports"]
+    assert record["native_stage_truth"] == state["stages"]
+    assert record["source_provenance"]["repo_head"] == state["repo_head"]
+    assert record["recovery_provenance"]["runner_sha256"] == sha256_path(SCRIPT_PATH)
+    assert json.loads((archive / "recovery-receipt.json").read_text(encoding="utf-8"))["verified"] is True
+    assert not state_path.exists()
+    assert not paths["journal"].exists()
+    assert {name: (am2_dir / name).read_bytes() for name in am2} == am2
+    assert all(stage["native"]["attempted"] is (name == "Calibrate") for name, stage in state["stages"].items())
+
+    status = run_runner("-Stage", "Status", "-StatePath", str(state_path), plan=plan, tmp_path=tmp_path)
+    assert status.returncode == 0, status.stderr
+    payload = json.loads(status.stdout)
+    assert payload["classification"] == "ORIGINAL_CALIBRATION_INTACT"
+    assert payload["next_stage"] == "Calibrate"
+    assert payload["interrupted_archives"] == [
+        {
+            "archive_path": str(archive),
+            "reason": INTERRUPTED_REASON,
+            "session_id": state["session_id"],
+            "verified": True,
+            "mapping_eligible": False,
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "refusal",
+    [
+        "map_artifact",
+        "changed_active",
+        "bad_immutable",
+        "missing_state",
+        "missing_transcript",
+        "source_evidence_present",
+        "wrong_provenance",
+        "wrong_imports",
+    ],
+)
+def test_interrupted_recovery_refuses_inexact_authority_without_mutation(tmp_path, refusal):
+    plan, state_path, state, active, _ = prepare_interrupted_calibration_candidate(tmp_path)
+    paths = interrupted_transaction_paths(plan, state_path, state["session_id"])
+    if refusal == "map_artifact":
+        write_text(Path(state["artifacts"]["map_left"]["path"]), "map must not exist\n")
+    elif refusal == "changed_active":
+        write_json(Path(plan["calibration"]["left"]["path"]), make_calibration(999))
+    elif refusal == "bad_immutable":
+        write_json(Path(plan["calibration"]["right"]["backup_path"]), make_calibration(999))
+    elif refusal == "missing_state":
+        state_path.unlink()
+    elif refusal == "missing_transcript":
+        Path(state["artifacts"]["transcript"]["path"]).unlink()
+    elif refusal == "source_evidence_present":
+        write_json(Path(state["artifacts"]["evidence"]["path"]), {"unexpected": True})
+    elif refusal == "wrong_provenance":
+        plan["interrupted_legacy_fixture"]["repo_head"] = "0" * 40
+    else:
+        import_probe_module(plan, "lerobot")["path"] = str(tmp_path / "external" / "lerobot" / "__init__.py")
+    state_before = state_path.read_bytes() if state_path.exists() else None
+    active_dir = Path(plan["calibration"]["left"]["path"]).parent
+    active_before = {path.name: path.read_bytes() for path in active_dir.iterdir()}
+
+    result = run_interrupted_recovery(plan, tmp_path, state_path)
+
+    assert result.returncode != 0
+    assert (state_path.read_bytes() if state_path.exists() else None) == state_before
+    assert {path.name: path.read_bytes() for path in active_dir.iterdir()} == active_before
+    assert not paths["journal"].exists()
+    assert not paths["archive"].exists()
+    assert not paths["archive_staging"].exists()
+    if refusal not in {"changed_active", "bad_immutable"}:
+        assert active_before == active
+
+
+@pytest.mark.parametrize(
+    "failure_point",
+    [
+        "after_archive_namespace_publish",
+        "after_active_directory_move",
+        "after_original_directory_move",
+        "after_fresh_pair_namespace_publish",
+        "after_state_namespace_publish",
+        "after_receipt_publish",
+    ],
+)
+def test_interrupted_recovery_resumes_every_namespace_seam(tmp_path, failure_point):
+    plan, state_path, state, mixed, originals = prepare_interrupted_calibration_candidate(tmp_path)
+    paths = interrupted_transaction_paths(plan, state_path, state["session_id"])
+    active_dir = Path(plan["calibration"]["left"]["path"]).parent
+    plan["restart_failure_point"] = failure_point
+
+    interrupted = run_interrupted_recovery(plan, tmp_path, state_path)
+
+    assert interrupted.returncode != 0
+    assert f"TEST FAILURE INJECTION: {failure_point}" in interrupted.stderr
+    assert paths["journal"].is_file()
+    status = run_runner("-Stage", "Status", "-StatePath", str(state_path), plan=plan, tmp_path=tmp_path)
+    assert status.returncode == 0, status.stderr
+    assert json.loads(status.stdout)["classification"] == "INTERRUPTED_CALIBRATION_RECOVERABLE"
+    blocked = run_runner("-Stage", "Verify", "-StatePath", str(state_path), plan=plan, tmp_path=tmp_path)
+    assert blocked.returncode != 0
+    assert "interrupted-calibration recovery transaction" in blocked.stderr
+
+    del plan["restart_failure_point"]
+    resumed = run_interrupted_recovery(plan, tmp_path, state_path)
+
+    assert resumed.returncode == 0, resumed.stderr
+    assert resumed.stdout.strip() == "INTERRUPTED_CALIBRATION_RECOVERY_COMPLETE"
+    assert_complete_pair(active_dir, originals)
+    assert_complete_pair(paths["archive"] / "retired-active-calibration", mixed)
+    assert not paths["journal"].exists()
+
+
+def test_interrupted_recovery_refuses_unexpected_staging_directory_without_mutation(tmp_path):
+    plan, state_path, state, mixed, _ = prepare_interrupted_calibration_candidate(tmp_path)
+    paths = interrupted_transaction_paths(plan, state_path, state["session_id"])
+    active_dir = Path(plan["calibration"]["left"]["path"]).parent
+    plan["restart_failure_point"] = "after_first_archive_copy"
+    assert run_interrupted_recovery(plan, tmp_path, state_path).returncode != 0
+    (paths["archive_staging"] / "unexpected-empty-directory").mkdir()
+    state_before = state_path.read_bytes()
+    del plan["restart_failure_point"]
+
+    resumed = run_interrupted_recovery(plan, tmp_path, state_path)
+
+    assert resumed.returncode != 0
+    assert "unexpected directory" in resumed.stderr.lower()
+    assert state_path.read_bytes() == state_before
+    assert_complete_pair(active_dir, mixed)
+    assert paths["journal"].is_file()
+    assert not paths["archive"].exists()
+
+
+def test_restart_calibration_is_blocked_by_live_interrupted_recovery_journal(tmp_path):
+    plan, state_path, state, mixed, _ = prepare_interrupted_calibration_candidate(tmp_path)
+    paths = interrupted_transaction_paths(plan, state_path, state["session_id"])
+    plan["restart_failure_point"] = "after_archive_namespace_publish"
+    assert run_interrupted_recovery(plan, tmp_path, state_path).returncode != 0
+    del plan["restart_failure_point"]
+
+    restarted = run_restart(plan, tmp_path, state_path)
+
+    assert restarted.returncode != 0
+    assert "interrupted-calibration recovery transaction" in restarted.stderr
+    assert_complete_pair(Path(plan["calibration"]["left"]["path"]).parent, mixed)
+    assert paths["journal"].is_file()
+
+
+def test_check_leader_buses_runner_requires_exact_guards_and_uses_reviewed_command(tmp_path):
+    plan = base_plan(tmp_path)
+    state_path = tmp_path / "logs" / "packet2n-r5-state.json"
+    plan["stage_plan"]["CheckLeaderBuses"] = {"launched": True, "exit_code": 0}
+
+    lowercase = run_runner(
+        "-Stage", "CheckLeaderBuses", "-StatePath", str(state_path), "-Confirm", "check", plan=plan, tmp_path=tmp_path
+    )
+    assert lowercase.returncode != 0
+    assert "requires -Confirm CHECK" in lowercase.stderr
+    import_probe_module(plan, "lerobot")["path"] = str(tmp_path / "external" / "lerobot" / "__init__.py")
+    refused = run_runner(
+        "-Stage", "CheckLeaderBuses", "-StatePath", str(state_path), "-Confirm", "CHECK", plan=plan, tmp_path=tmp_path
+    )
+    assert refused.returncode != 0
+    assert "import sources" in refused.stderr.lower()
+    plan["import_source_probe"] = make_import_source_probe()
+
+    checked = run_runner(
+        "-Stage", "CheckLeaderBuses", "-StatePath", str(state_path), "-Confirm", "CHECK", plan=plan, tmp_path=tmp_path
+    )
+
+    assert checked.returncode == 0, checked.stderr
+    assert checked.stdout.strip() == "LEADER_BUS_CHECK_STAGE=PASS"

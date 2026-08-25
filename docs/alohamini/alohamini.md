@@ -491,7 +491,59 @@ Classify the paired result only as follows:
 
 Stop either run immediately and remove leader power for unexpected powered leader motion, resistance, sound, heat, cable strain, communication failure, loss of the clear stop path, any follower power or movement, or any evidence that a robot/ZMQ connection was constructed. After the second run, disconnect both leader buses, switch off both 7.4 V supplies, and stop for review. Do not start Packet 2M S6.
 
-#### Packet 2N-R5R — authoritative staged corrected-port runner and rejected-calibration restart
+#### Packet 2N-R5C-R2 — interrupted-calibration recovery and leader-bus stability gate
+
+This section is the current AM1 Packet 2N authority and supersedes the historical R5R notes below. The corrected-port Calibrate session `897f00dc-2608-4790-a74b-1482220eb5ed` did not complete: it is classified `ORPHANED_FRESH_CALIBRATION`, has no next stage, and records Calibrate attempted/launched with real exit code `1`. No map or Verify stage ran, neither reserved map artifact exists, source evidence JSON is absent, and the failed transcript contains no native traceback/output. Do not invent missing evidence.
+
+The exact interrupted artifacts are:
+
+| Artifact | Bytes | SHA-256 | UTC modification time |
+|---|---:|---|---|
+| Runner state | 6110 | `0371650B298B46B8B724A8425E7D4628AF88F6125F967FEF1ED84091E6E9D7C5` | preserved by the recovery archive |
+| Failed transcript | 1397 | `6BA8699C55BED9074EFBBD18637CEB8FCD337CD70C84629C0C6036BE32768447` | preserved by the recovery archive |
+| Active left `so101_leader_bi_left.json` | 961 | `2B3C2245CAFCA67BBDA25FF0A868A158E6DDCF2162C2A5D5782220EF9DACF50D` | `2026-08-25T00:39:56.5269224Z` |
+| Active right `so101_leader_bi_right.json` | 961 | `65A301F20FC7DC96BD7FB5982E3670BF1A01F535953D7A253AB8D33A03646F11` | `2026-08-15T05:19:53.2654429Z` |
+
+The immutable manifest hash is `B90DF72155C60996B4E2704E4A44ED1895BBAEA0C0A332DC24674EC3FA399B8A`. The original left is 960 bytes, mtime `2026-08-15T05:18:25.9699568Z`, hash `6F5D6126E84398D0621A26E74E4DF6678EBA7C14C62D343020610B4D5D8B3D8C`; the original right identity is the active-right identity above. The failed state binds commit `a9891f84f244be54a1c4ffdeba4c475e0c1d851f`, runner hash `CFFFFB7D421BA8E524D156981A24D45462DFA7F6CD45EE4D95CD9FDD68AC7B42`, behavior SHA `cae57b59db1d9156be568aa4b216fc90701aa741`, corrected left `COM8`, corrected right `COM7`, ID `so101_leader_bi`, and profile `so-arm-5dof`.
+
+With both leader 7.4 V supplies off, both leader USB controllers disconnected, follower/body 12 V power off, and the Pi motor host stopped, run the one offline recovery command:
+
+```powershell
+pwsh -NoLogo -NoProfile -File .\tools\packet2n_r5_leader_mapping.ps1 -Stage RecoverInterruptedCalibration -Confirm RECOVER
+```
+
+It is eligible only for the exact validated failed session above. It constructs no COM, robot, teleoperation, camera, ZMQ, Pi, or network object. It archives the mixed pair, failed transcript, state snapshot and retired state, recovery-derived evidence that truthfully marks source evidence and traceback text absent, and immutable manifest/backups. It restores the two originals through whole-directory withdrawal and activation, never sequential file replacement. The non-overwriting archive is:
+
+```text
+C:\Users\pickm\AlohaMini1Backups\packet2n-r5-interrupted-897f00dc-2608-4790-a74b-1482220eb5ed
+```
+
+A pass prints `INTERRUPTED_CALIBRATION_RECOVERY_COMPLETE`; the next offline `Status` must report `ORIGINAL_CALIBRATION_INTACT` with next stage `Calibrate` and one verified supplemental interrupted archive marked rejected and ineligible for mapping. Stop on any refusal, unexpected classification, missing receipt, hash/size/time mismatch, incomplete recovery journal, or unrecognized layout. Do not delete, edit, overwrite, copy back, or manually reconstruct any state or archive file.
+
+The raw leader-bus stability check is a separate powered action and is **not authorized by this document**. Run it only after the recovery passes, `Status` is exactly `ORIGINAL_CALIBRATION_INTACT` / `Calibrate`, the Pi and all follower/body hardware remain off, and a later operator packet explicitly authorizes the check:
+
+```powershell
+pwsh -NoLogo -NoProfile -File .\tools\packet2n_r5_leader_mapping.ps1 -Stage CheckLeaderBuses -Confirm CHECK
+```
+
+Exact physical starting state for that later check: clear the leader workspace; keep both 7.4 V disconnects immediately accessible; connect physical/logical left only to `COM8` and physical/logical right only to `COM7`; keep follower/body 12 V off; keep the Pi motor host stopped; power each leader only from its designated 7.4 V supply. The check uses raw, uncalibrated Feetech reads only: IDs `1..6` on both buses, `Present_Position`, no retries, approximately 10 Hz, at most 30 seconds, and cleanup with torque unchanged.
+
+If separately authorized, move the physical right leader first through moderate, comfortable ranges while observing continued clean reads, then return it to rest and move the physical left leader through moderate ranges. Do not force endpoints. PASS requires both buses and every ID `1..6` present in every sample for the full interval, raw integral non-boolean values in register range, a nonzero sample count, complete first/last vectors and per-ID min/max output, clean disconnects, and final `LEADER_BUS_CHECK=PASS` followed by `LEADER_BUS_CHECK_STAGE=PASS`.
+
+Stop immediately and remove leader power on the first missing packet, incomplete/malformed sample, disappearing port, exception, unexpected powered motion, resistance, sound, heat, cable strain, wrong physical identity, loss of the clear stop path, cleanup failure, or any evidence of a write, torque/mode/configuration/calibration operation, robot, Pi, network, camera, or ZMQ construction. A failure authorizes no retry.
+
+Only after recovery, a separately authorized clean bus check, full evidence review, both leader power supplies off again, and both USB controllers disconnected may a later packet authorize fresh calibration:
+
+```powershell
+pwsh -NoLogo -NoProfile -File .\tools\packet2n_r5_leader_mapping.ps1 -Stage Calibrate -Confirm CALIBRATE
+```
+
+This documentation, the recovery result, and a bus-check PASS do not authorize Calibrate, MapLeft, MapRight, Verify, teleoperation, recording, S6, any Pi command, or any AM2/AM2 Pro action. The exact next Pi command is none.
+
+<details>
+<summary>Historical Packet 2N-R5R rejected-successful-calibration notes (superseded)</summary>
+
+#### Packet 2N-R5R — historical rejected-calibration restart
 
 Packet 2N-R5R replaced the fragile pasted PowerShell workflow with the versioned `tools\packet2n_r5_leader_mapping.ps1` runner. The runner is the only Packet 2N-R5R operator path. Do not load the historical Packet 2N-R3 verifier, paste internal functions, or manually construct R5 state, evidence, transcripts, or map logs.
 
@@ -629,6 +681,8 @@ Each accepted map contains exactly 60 complete samples. Every sample has exactly
 Stop immediately and remove leader power for unexpected powered movement, resistance, sound, heat, cable strain, communication or calibration failure, a wrong port or physical identity, accidental movement of the nonselected leader, loss of the clear stop path, any follower power or movement, or any evidence that a robot/ZMQ connection was constructed. Also stop on any nonzero stage exit, unexpected classification, or recovery state. Preserve the state file and every reserved artifact. Do not delete, overwrite, edit, restore, or manually rerun a failed stage without review.
 
 Passing Packet 2N-R5R authorizes only later review of its evidence. It does not authorize follower power, Pi contact, startup synchronization, motor-setting changes, or teleoperation.
+
+</details>
 
 #### Packet 2M S6 — hard-blocked future both-side synchronization and paused teleoperation
 
