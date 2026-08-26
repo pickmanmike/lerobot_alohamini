@@ -24,6 +24,7 @@ that both scripts read and write the same calibration files.
 import argparse
 import sys
 from collections.abc import Callable
+from pathlib import Path
 
 from lerobot.teleoperators.bi_so_leader import BiSOLeader, BiSOLeaderConfig
 from lerobot.utils.utils import init_logging
@@ -59,6 +60,13 @@ def parse_args(
         help="Leader arm profile selector",
     )
     parser.add_argument(
+        "--teleop.calibration_dir",
+        dest="calibration_dir",
+        type=Path,
+        default=None,
+        help="Explicit calibration leaf directory for this bimanual run",
+    )
+    parser.add_argument(
         "--force_fresh_calibration",
         action="store_true",
         help="Clear cached SO-101 leader calibration before the two-arm calibration run",
@@ -71,12 +79,14 @@ def parse_args(
 
 
 def make_leader_config(args: argparse.Namespace) -> BiSOLeaderConfig:
-    return make_normalized_bi_leader_config(
+    config = make_normalized_bi_leader_config(
         left_port=args.left_port,
         right_port=args.right_port,
         leader_id=args.leader_id,
         arm_profile=args.arm_profile,
     )
+    config.calibration_dir = args.calibration_dir
+    return config
 
 
 def _record_cleanup_error(

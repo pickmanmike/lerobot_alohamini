@@ -131,6 +131,29 @@ def test_alohamini_leader_children_use_normalized_positions(script_name):
     assert config.right_arm_config.use_degrees is False
 
 
+def test_calibrate_bi_calibration_dir_defaults_to_existing_resolution():
+    module = load_example_module("calibrate_bi")
+
+    args = module.parse_args([], platform_name="Linux")
+    config = module.make_leader_config(args)
+
+    assert args.calibration_dir is None
+    assert config.calibration_dir is None
+
+
+def test_calibrate_bi_calibration_dir_passes_explicit_leaf_to_bimanual_config(tmp_path):
+    module = load_example_module("calibrate_bi")
+    leaf = tmp_path / "staged-calibration" / "teleoperators" / "so_leader"
+
+    args = module.parse_args(
+        ["--teleop.calibration_dir", str(leaf)],
+        platform_name="Linux",
+    )
+    config = module.make_leader_config(args)
+
+    assert config.calibration_dir == leaf
+
+
 @pytest.mark.parametrize("script_name", ["calibrate_bi", "teleoperate_bi", "record_bi"])
 def test_windows_requires_both_explicit_leader_ports(capsys, script_name):
     module = load_example_module(script_name)
