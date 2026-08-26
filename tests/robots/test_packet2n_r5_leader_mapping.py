@@ -4615,6 +4615,9 @@ def test_restart_calibration_is_blocked_by_live_interrupted_recovery_journal(tmp
 
 
 def test_check_leader_buses_runner_requires_exact_guards_and_uses_reviewed_command(tmp_path):
+    source = SCRIPT_PATH.read_text(encoding="utf-8")
+    assert '@($busCheckScript, "CHECK")' in source
+
     plan = base_plan(tmp_path)
     state_path = tmp_path / "logs" / "packet2n-r5-state.json"
     plan["stage_plan"]["CheckLeaderBuses"] = {"launched": True, "exit_code": 0}

@@ -199,6 +199,11 @@ def main(
     parser = argparse.ArgumentParser(
         description="Run the read-only AM1 COM8/COM7 raw leader-bus stability check."
     )
+    parser.add_argument(
+        "confirmation",
+        choices=("CHECK",),
+        help="Exact uppercase authorization required before opening either leader bus",
+    )
     parser.parse_args(argv)
     try:
         run()

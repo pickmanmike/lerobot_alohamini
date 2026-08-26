@@ -1436,7 +1436,7 @@ function Build-StageCommand {
             )
         }
         "CheckLeaderBuses" {
-            @($busCheckScript)
+            @($busCheckScript, "CHECK")
         }
         default { @() }
     }

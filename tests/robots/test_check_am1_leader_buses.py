@@ -256,7 +256,7 @@ def test_disconnect_failure_exits_nonzero_without_emitting_pass(capsys) -> None:
     lines: list[str] = []
 
     exit_code = main(
-        [],
+        ["CHECK"],
         run=lambda: run_check(
             bus_factory=factory,
             monotonic=clock.monotonic,
@@ -285,3 +285,41 @@ def test_help_exits_without_constructing_a_bus(capsys) -> None:
 
     assert raised.value.code == 0
     assert "read-only" in capsys.readouterr().out.lower()
+
+
+def test_missing_confirmation_refuses_before_constructing_a_bus() -> None:
+    called = False
+
+    def forbidden_run() -> None:
+        nonlocal called
+        called = True
+        raise AssertionError("refusal must precede bus construction")
+
+    with pytest.raises(SystemExit) as raised:
+        main([], run=forbidden_run)
+
+    assert raised.value.code == 2
+    assert called is False
+
+
+def test_exact_check_confirmation_runs_once() -> None:
+    calls = 0
+
+    def clean_run() -> object:
+        nonlocal calls
+        calls += 1
+        return object()
+
+    assert main(["CHECK"], run=clean_run) == 0
+    assert calls == 1
+
+
+@pytest.mark.parametrize("confirmation", ["check", " CHECK", "CHECK "])
+def test_confirmation_is_exact_and_case_sensitive(confirmation: str) -> None:
+    def forbidden_run() -> None:
+        raise AssertionError("invalid confirmation must not run the check")
+
+    with pytest.raises(SystemExit) as raised:
+        main([confirmation], run=forbidden_run)
+
+    assert raised.value.code == 2
