@@ -71,11 +71,11 @@ function Get-Am1FileIdentity {
     }
 
     $item = Get-Item -LiteralPath $fullPath -Force
-    if ($item.PSIsContainer) {
-        throw "Calibration path is not a regular file: $fullPath"
-    }
     if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
         throw "Calibration path is a reparse point: $fullPath"
+    }
+    if ($item.PSIsContainer) {
+        throw "Calibration path is not a regular file: $fullPath"
     }
     if (-not [System.IO.File]::Exists($fullPath)) {
         throw "Calibration path is not a regular file: $fullPath"
@@ -92,6 +92,25 @@ function Get-Am1FileIdentity {
         sha256       = (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash.ToUpperInvariant()
         schema_valid = $false
         schema_error = $null
+    }
+}
+
+function New-Am1InvalidFileIdentity {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Reason
+    )
+
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    $exists = [System.IO.File]::Exists($fullPath) -or [System.IO.Directory]::Exists($fullPath)
+    return [pscustomobject][ordered]@{
+        path         = $fullPath
+        exists       = [bool]$exists
+        size         = $null
+        mtime_utc    = $null
+        sha256       = $null
+        schema_valid = $false
+        schema_error = $Reason
     }
 }
 
@@ -182,13 +201,31 @@ function Get-Am1CalibrationPairStatus {
     $directory = [System.IO.Path]::GetFullPath($DirectoryPath)
     $leftPath = Join-Path $directory "${LeaderIdValue}_left.json"
     $rightPath = Join-Path $directory "${LeaderIdValue}_right.json"
-    $leftFacts = Get-Am1FileIdentity -Path $leftPath
-    $rightFacts = Get-Am1FileIdentity -Path $rightPath
     $errors = [System.Collections.Generic.List[string]]::new()
     $leftRecord = $null
     $rightRecord = $null
+    $leftIdentityError = $null
+    $rightIdentityError = $null
 
-    if (-not $leftFacts.exists) {
+    try {
+        $leftFacts = Get-Am1FileIdentity -Path $leftPath
+    }
+    catch {
+        $leftIdentityError = $_.Exception.Message
+        $leftFacts = New-Am1InvalidFileIdentity -Path $leftPath -Reason $leftIdentityError
+    }
+    try {
+        $rightFacts = Get-Am1FileIdentity -Path $rightPath
+    }
+    catch {
+        $rightIdentityError = $_.Exception.Message
+        $rightFacts = New-Am1InvalidFileIdentity -Path $rightPath -Reason $rightIdentityError
+    }
+
+    if ($null -ne $leftIdentityError) {
+        $errors.Add($leftIdentityError)
+    }
+    elseif (-not $leftFacts.exists) {
         $errors.Add($leftFacts.schema_error)
     }
     else {
@@ -201,7 +238,10 @@ function Get-Am1CalibrationPairStatus {
             $errors.Add($_.Exception.Message)
         }
     }
-    if (-not $rightFacts.exists) {
+    if ($null -ne $rightIdentityError) {
+        $errors.Add($rightIdentityError)
+    }
+    elseif (-not $rightFacts.exists) {
         $errors.Add($rightFacts.schema_error)
     }
     else {
@@ -625,6 +665,12 @@ function Remove-Am1Directory {
     [System.IO.Directory]::Delete($Path, $true)
 }
 
+function Test-Am1PathExists {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    return Test-Path -LiteralPath $Path
+}
+
 function Invoke-Am1DirectoryPromotion {
     param(
         [Parameter(Mandatory = $true)][string]$ActiveDirectory,
@@ -637,6 +683,7 @@ function Invoke-Am1DirectoryPromotion {
         [Parameter(Mandatory = $true)]$BackupFacts,
         [Parameter()][scriptblock]$MoveDirectoryInvoker,
         [Parameter()][scriptblock]$RemoveDirectoryInvoker,
+        [Parameter()][scriptblock]$RollbackPathExistsInvoker,
         [Parameter()][scriptblock]$AfterSecondMoveHook
     )
 
@@ -645,6 +692,9 @@ function Invoke-Am1DirectoryPromotion {
     }
     if ($null -eq $RemoveDirectoryInvoker) {
         $RemoveDirectoryInvoker = ${function:Remove-Am1Directory}
+    }
+    if ($null -eq $RollbackPathExistsInvoker) {
+        $RollbackPathExistsInvoker = ${function:Test-Am1PathExists}
     }
     Assert-Am1DirectSiblingPaths -ActiveDirectory $ActiveDirectory -CandidatePath $CandidatePath `
         -WithdrawalPath $WithdrawalPath -RunId $RunId -RequireCandidateExists
@@ -683,11 +733,18 @@ function Invoke-Am1DirectoryPromotion {
     catch {
         $primary = $_.Exception
         $rollbackFailures = [System.Collections.Generic.List[string]]::new()
-        if (
-            (Test-Path -LiteralPath $ActiveDirectory) -and
-            -not (Test-Path -LiteralPath $CandidatePath) -and
-            (Test-Path -LiteralPath $WithdrawalPath)
-        ) {
+        $firstState = $null
+        try {
+            $firstState = [pscustomobject]@{
+                active     = [bool](& $RollbackPathExistsInvoker $ActiveDirectory)
+                candidate  = [bool](& $RollbackPathExistsInvoker $CandidatePath)
+                withdrawal = [bool](& $RollbackPathExistsInvoker $WithdrawalPath)
+            }
+        }
+        catch {
+            $rollbackFailures.Add("Rollback state inspection failed: $($_.Exception.Message)")
+        }
+        if ($null -ne $firstState -and $firstState.active -and -not $firstState.candidate -and $firstState.withdrawal) {
             try {
                 & $MoveDirectoryInvoker $ActiveDirectory $CandidatePath "return-promoted-active" | Out-Null
             }
@@ -695,7 +752,17 @@ function Invoke-Am1DirectoryPromotion {
                 $rollbackFailures.Add("Return promoted active failed: $($_.Exception.Message)")
             }
         }
-        if (-not (Test-Path -LiteralPath $ActiveDirectory) -and (Test-Path -LiteralPath $WithdrawalPath)) {
+        $secondState = $null
+        try {
+            $secondState = [pscustomobject]@{
+                active     = [bool](& $RollbackPathExistsInvoker $ActiveDirectory)
+                withdrawal = [bool](& $RollbackPathExistsInvoker $WithdrawalPath)
+            }
+        }
+        catch {
+            $rollbackFailures.Add("Rollback state inspection failed: $($_.Exception.Message)")
+        }
+        if ($null -ne $secondState -and -not $secondState.active -and $secondState.withdrawal) {
             try {
                 & $MoveDirectoryInvoker $WithdrawalPath $ActiveDirectory "restore-withdrawal" | Out-Null
             }
@@ -947,6 +1014,7 @@ function Invoke-Am1CalibrationAttempt {
         [Parameter()][scriptblock]$StopTranscriptInvoker,
         [Parameter()][scriptblock]$MoveDirectoryInvoker,
         [Parameter()][scriptblock]$RemoveDirectoryInvoker,
+        [Parameter()][scriptblock]$RollbackPathExistsInvoker,
         [Parameter()][scriptblock]$BeforePromotionHook,
         [Parameter()][scriptblock]$AfterSecondMoveHook
     )
@@ -1066,6 +1134,7 @@ function Invoke-Am1CalibrationAttempt {
             -ExpectedOldSnapshot $activeSnapshot -ExpectedNewSnapshot $candidate.expected_snapshot `
             -ExpectedStagedPair $candidate.staged_pair -BackupFacts $backup `
             -MoveDirectoryInvoker $MoveDirectoryInvoker -RemoveDirectoryInvoker $RemoveDirectoryInvoker `
+            -RollbackPathExistsInvoker $RollbackPathExistsInvoker `
             -AfterSecondMoveHook $AfterSecondMoveHook
         return New-Am1CalibrationSuccessOutcome -Facts $facts -ActivePair $finalPair
     }

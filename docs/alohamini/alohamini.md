@@ -113,6 +113,8 @@ Promotion has a narrow fail-closed interruption case because Windows cannot exch
 .\.venv\Scripts\python.exe .\examples\alohamini\teleoperate_bi.py --no_robot --robot.robot_model alohamini1 --teleop.left_port COM8 --teleop.right_port COM7 --teleop.id so101_leader_bi --teleop.arm_profile so-arm-5dof --require_calibration_match --duration_s 30 --fps 5 --no_keyboard --no_rerun
 ```
 
+This command connects and configures both leader buses. `--no_robot` excludes the follower and Pi only; it is not a raw read-only leader check.
+
 Hold both leaders still until sampling begins. Move only the physical left gripper and verify that the physical left gripper must change only `arm_left_gripper.pos`; return it to a moderate pose, then move only the physical right gripper and verify that the physical right gripper must change only `arm_right_gripper.pos`. Stop immediately on a wrong-side or both-side response, any error, unexpected sound, heat, current, cable strain, disconnect, follower movement or power, or any robot/ZMQ construction. Power off and disconnect both leaders after the check and preserve the complete output for review.
 
 <details>
@@ -808,15 +810,17 @@ python examples/alohamini/calibrate_bi.py \
   --teleop.arm_profile am-leader-6dof
 ```
 
-Use the same `--teleop.id` and `--teleop.arm_profile` for later teleoperation and recording commands so they load the calibration files created here. If a calibration file already exists, press Enter to reuse it or enter `c` to recalibrate.
+For Aloha Mini 1 on native Windows, do not accept an automatic calibration prompt from a generic client: stop the client and complete the simple staged workflow above first. Never enter client-driven calibration while the Pi host, follower/body power, robot connection, or network client is active. The same rule applies to `record_bi.py`.
 
-Running this standalone step is recommended but optional. If it is skipped and no valid calibration is found, `teleoperate_bi.py` keeps the existing behavior: it prompts the user and enters the calibration flow automatically.
+For other supported setups, use the same `--teleop.id` and `--teleop.arm_profile` for later teleoperation and recording commands so they load the calibration files created here. If a calibration file already exists, press Enter to reuse it or enter `c` to recalibrate. Outside the native-Windows AM1 path, skipping the standalone step retains the existing `teleoperate_bi.py` behavior: it prompts and can enter calibration automatically when no valid file is found.
 
 > Power-cycle both leader and follower arms after calibration for changes to take effect.
 
 ---
 
 ## 5. Teleoperation
+
+Native-Windows AM1 teleoperation requires a valid wrapper-managed pair and reviewed no-robot side-check evidence first. If an AM1 client presents a calibration prompt, exit rather than continuing; do not calibrate after starting the Pi host or constructing the robot/network connection.
 
 Start the Pi host first, then the PC client. A valid leader calibration is loaded automatically; if it is missing, the client prompts for calibration before teleoperation starts:
 
@@ -843,6 +847,8 @@ python examples/alohamini/teleoperate_bi.py \
 ---
 
 ## 6. Dataset Recording
+
+For native-Windows AM1, the same wrapper-managed calibration prerequisite and stop-on-prompt rule applies to `record_bi.py`.
 
 > Make sure the Pi host is already running (§5) before recording.  
 > `--teleop.arm_profile` here refers to your **leader arm** hardware, not the follower robot.  

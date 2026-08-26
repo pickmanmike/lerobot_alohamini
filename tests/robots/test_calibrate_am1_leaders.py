@@ -209,6 +209,7 @@ def run_attempt_harness(
     include_promotion_seams: bool = False,
     move_body: str = "[System.IO.Directory]::Move($Source, $Destination)",
     remove_body: str = "[System.IO.Directory]::Delete($Path, $true)",
+    rollback_path_exists_body: str = "Test-Path -LiteralPath $Path",
     before_promotion_body: str = "",
     after_second_move_body: str = "",
 ) -> tuple[subprocess.CompletedProcess[str], dict[str, object] | None]:
@@ -231,6 +232,12 @@ $removeDirectory = {{
     $removeCalls.Add($Path) | Out-Null
     {remove_body}
 }}
+$rollbackPathExistsCalls = 0
+$rollbackPathExists = {{
+    param($Path)
+    $script:rollbackPathExistsCalls += 1
+    {rollback_path_exists_body}
+}}
 $beforePromotion = {{ param($Context) {before_promotion_body} }}
 $afterSecondMove = {{ param($Context) {after_second_move_body} }}
 """
@@ -238,6 +245,7 @@ $afterSecondMove = {{ param($Context) {after_second_move_body} }}
     if include_promotion_seams:
         promotion_arguments = """ `
     -MoveDirectoryInvoker $moveDirectory -RemoveDirectoryInvoker $removeDirectory `
+    -RollbackPathExistsInvoker $rollbackPathExists `
     -BeforePromotionHook $beforePromotion -AfterSecondMoveHook $afterSecondMove"""
     body = probe_blocks(payload, porcelain="") + f"""
 $events = [System.Collections.Generic.List[string]]::new()
@@ -265,6 +273,7 @@ $report = [ordered]@{{
     events = @($events)
     move_calls = @($moveCalls)
     remove_calls = @($removeCalls)
+    rollback_path_exists_calls = $rollbackPathExistsCalls
 }}
 [Console]::Out.WriteLine('OUTCOME_JSON=' + ($report | ConvertTo-Json -Depth 100 -Compress))
 """
@@ -700,6 +709,49 @@ catch {{ $reason = $_.Exception.Message }}
 
 
 @pytest.mark.parametrize(
+    ("invalid_kind", "reason"),
+    [("directory", "not a regular file"), ("junction", "reparse point")],
+)
+def test_status_classifies_invalid_expected_leaf_instead_of_aborting(
+    invalid_kind: str,
+    reason: str,
+    tmp_path: Path,
+) -> None:
+    active = tmp_path / "active"
+    write_valid_pair(active)
+    left = active / "so101_leader_bi_left.json"
+    left.unlink()
+    setup = ""
+    if invalid_kind == "directory":
+        left.mkdir()
+    else:
+        target = tmp_path / "junction-target"
+        target.mkdir()
+        setup = (
+            f"New-Item -ItemType Junction -Path {ps_literal(left)} "
+            f"-Target {ps_literal(target)} | Out-Null"
+        )
+    body = f"""
+{setup}
+$facts = Get-Am1CalibrationPairStatus -DirectoryPath {ps_literal(active)} `
+    -LeaderIdValue 'so101_leader_bi'
+[Console]::Out.WriteLine(($facts | ConvertTo-Json -Depth 100 -Compress))
+"""
+
+    result = run_harness(tmp_path, body)
+
+    assert result.returncode == 0, result.stderr
+    facts = json.loads(result.stdout)
+    assert facts["classification"] == "INCOMPLETE_OR_INVALID_PAIR"
+    assert reason in facts["failure_reason"].lower()
+    assert facts["left"]["path"] == str(left)
+    assert facts["left"]["exists"] is True
+    assert facts["left"]["schema_valid"] is False
+    assert reason in facts["left"]["schema_error"].lower()
+    assert facts["right"]["schema_valid"] is True
+
+
+@pytest.mark.parametrize(
     ("copy_body", "reason"),
     [
         ("throw 'simulated backup copy failure'", "simulated backup copy failure"),
@@ -1117,6 +1169,39 @@ if ($Operation -ceq 'restore-withdrawal') { throw 'simulated rollback failure' }
     assert "CALIBRATION_RESULT=PASS" not in result.stdout
 
 
+def test_rollback_path_probe_failure_is_secondary_and_primary_promotion_error_survives(
+    tmp_path: Path,
+) -> None:
+    fixture = prepare_attempt_fixture(tmp_path)
+    native_body = native_write_body(left=make_calibration(40), right=make_calibration(50))
+    path_exists_body = """
+if ($script:rollbackPathExistsCalls -eq 1) {
+    throw 'simulated rollback path probe failure'
+}
+Test-Path -LiteralPath $Path
+"""
+
+    result, report = run_attempt_harness(
+        tmp_path,
+        fixture,
+        native_body=native_body,
+        include_promotion_seams=True,
+        rollback_path_exists_body=path_exists_body,
+        after_second_move_body="throw 'simulated final verification failure'",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert report is not None
+    outcome = report["outcome"]
+    assert outcome["success"] is False
+    assert outcome["primary_reason"] == "simulated final verification failure"
+    assert any(
+        "rollback state inspection failed: simulated rollback path probe failure" in failure.lower()
+        for failure in outcome["secondary_failures"]
+    )
+    assert "CALIBRATION_RESULT=PASS" not in result.stdout
+
+
 def test_withdrawal_cleanup_failure_reports_verified_new_active_without_rollback(tmp_path: Path) -> None:
     fixture = prepare_attempt_fixture(tmp_path)
     active = fixture["active"]
@@ -1393,6 +1478,9 @@ def test_documentation_covers_recovery_wrist_roll_and_no_robot_side_check() -> N
     assert "Do not force wrist roll during range recording" in text
     assert "implementation assigns `0..4095`" in text
     assert expected_no_robot in normalized
+    assert "connects and configures both leader buses" in simple_section
+    assert "`--no_robot` excludes the follower and Pi only" in simple_section
+    assert "is not a raw read-only leader check" in simple_section
     assert "physical left gripper must change only `arm_left_gripper.pos`" in text
     assert "physical right gripper must change only `arm_right_gripper.pos`" in text
     assert "Follower/body 12 V power is off" in text
@@ -1456,3 +1544,17 @@ def test_documentation_deprecates_old_runner_as_historical_only() -> None:
         historical_summary = text[details_start:summary_end].lower()
         assert "historical" in historical_summary
         assert "deprecated" in historical_summary or "superseded" in historical_summary
+
+
+def test_documentation_blocks_generic_am1_windows_auto_calibration() -> None:
+    text = DOCUMENTATION_PATH.read_text(encoding="utf-8")
+    generic_workflow = text.split("### Step 2 — Calibrate leader arms (PC side)", maxsplit=1)[1]
+
+    for guard in (
+        "For Aloha Mini 1 on native Windows, do not accept an automatic calibration prompt",
+        "stop the client",
+        "simple staged workflow",
+        "Pi host, follower/body power, robot connection, or network client is active",
+        "The same rule applies to `record_bi.py`",
+    ):
+        assert guard in generic_workflow
