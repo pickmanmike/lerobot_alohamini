@@ -164,6 +164,128 @@ def filesystem_inventory(roots: tuple[Path, ...]) -> set[tuple[str, str, int, in
     return inventory
 
 
+def tree_bytes(root: Path) -> dict[str, bytes]:
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file()
+    }
+
+
+def prepare_attempt_fixture(tmp_path: Path) -> dict[str, Path | dict[str, object]]:
+    repository, python = make_fake_repository(tmp_path)
+    calibration_root = tmp_path / "calibration"
+    active = calibration_root / "teleoperators" / "so_leader"
+    write_valid_pair(active)
+    (active / "unrelated-am2.json").write_bytes(b"preserve-am2")
+    return {
+        "repository": repository,
+        "python": python,
+        "calibration_root": calibration_root,
+        "active": active,
+        "payload": make_provenance_payload(repository, python, calibration_root),
+    }
+
+
+def run_attempt_harness(
+    tmp_path: Path,
+    fixture: dict[str, Path | dict[str, object]],
+    *,
+    native_body: str,
+    copy_body: str = "[System.IO.File]::Copy($Source, $Destination, $false)",
+    start_body: str = (
+        "$events.Add('transcript:start') | Out-Null; "
+        "[System.IO.File]::WriteAllText($Path, 'transcript-started')"
+    ),
+    stop_body: str = "$events.Add('transcript:stop') | Out-Null",
+    include_promotion_seams: bool = False,
+    move_body: str = "[System.IO.Directory]::Move($Source, $Destination)",
+    remove_body: str = "[System.IO.Directory]::Delete($Path, $true)",
+    before_promotion_body: str = "",
+    after_second_move_body: str = "",
+) -> tuple[subprocess.CompletedProcess[str], dict[str, object] | None]:
+    repository = fixture["repository"]
+    python = fixture["python"]
+    payload = fixture["payload"]
+    assert isinstance(repository, Path)
+    assert isinstance(python, Path)
+    assert isinstance(payload, dict)
+    promotion_definitions = f"""
+$moveCalls = [System.Collections.Generic.List[object]]::new()
+$removeCalls = [System.Collections.Generic.List[string]]::new()
+$moveDirectory = {{
+    param($Source, $Destination, $Operation)
+    $moveCalls.Add([pscustomobject]@{{ source = $Source; destination = $Destination; operation = $Operation }}) | Out-Null
+    {move_body}
+}}
+$removeDirectory = {{
+    param($Path)
+    $removeCalls.Add($Path) | Out-Null
+    {remove_body}
+}}
+$beforePromotion = {{ param($Context) {before_promotion_body} }}
+$afterSecondMove = {{ param($Context) {after_second_move_body} }}
+"""
+    promotion_arguments = ""
+    if include_promotion_seams:
+        promotion_arguments = """ `
+    -MoveDirectoryInvoker $moveDirectory -RemoveDirectoryInvoker $removeDirectory `
+    -BeforePromotionHook $beforePromotion -AfterSecondMoveHook $afterSecondMove"""
+    body = probe_blocks(payload, porcelain="") + f"""
+$events = [System.Collections.Generic.List[string]]::new()
+$nativeCalls = 0
+$copy = {{ param($Source, $Destination) {copy_body} }}
+$startTranscript = {{ param($Path) {start_body} }}
+$stopTranscript = {{ {stop_body} }}
+$native = {{
+    param($Command, $StagingLeaf, [ref]$Launched, [ref]$ExitCode)
+    $script:nativeCalls += 1
+    {native_body}
+}}
+{promotion_definitions}
+$outcome = Invoke-Am1CalibrationAttempt -RepositoryRoot {ps_literal(repository)} `
+    -PythonPath {ps_literal(python)} -LeftPortValue 'COM8' -RightPortValue 'COM7' `
+    -LeaderIdValue 'so101_leader_bi' -ArmProfileValue 'so-arm-5dof' `
+    -Confirmation 'CALIBRATE' -RunId 'test-run' `
+    -PythonProbeInvoker $pythonProbe -GitInvoker $gitProbe -CopyFileInvoker $copy `
+    -StartTranscriptInvoker $startTranscript -NativeCommandInvoker $native `
+    -StopTranscriptInvoker $stopTranscript{promotion_arguments}
+Write-Am1CalibrationOutcome -Outcome $outcome
+$report = [ordered]@{{
+    outcome = $outcome
+    native_calls = $nativeCalls
+    events = @($events)
+    move_calls = @($moveCalls)
+    remove_calls = @($removeCalls)
+}}
+[Console]::Out.WriteLine('OUTCOME_JSON=' + ($report | ConvertTo-Json -Depth 100 -Compress))
+"""
+    result = run_harness(tmp_path, body)
+    report = None
+    for line in result.stdout.splitlines():
+        if line.startswith("OUTCOME_JSON="):
+            report = json.loads(line.removeprefix("OUTCOME_JSON="))
+    return result, report
+
+
+def native_write_body(*, left: object | None, right: object | None, exit_code: int = 0) -> str:
+    lines: list[str] = []
+    if left is not None:
+        left_text = left if isinstance(left, str) else json.dumps(left, separators=(",", ":"))
+        lines.append(
+            "[System.IO.File]::WriteAllText((Join-Path $StagingLeaf 'so101_leader_bi_left.json'), "
+            f"{ps_literal(left_text)})"
+        )
+    if right is not None:
+        right_text = right if isinstance(right, str) else json.dumps(right, separators=(",", ":"))
+        lines.append(
+            "[System.IO.File]::WriteAllText((Join-Path $StagingLeaf 'so101_leader_bi_right.json'), "
+            f"{ps_literal(right_text)})"
+        )
+    lines.extend(("$Launched.Value = $true", f"$ExitCode.Value = {exit_code}"))
+    return "\n".join(lines)
+
+
 def test_wrapper_can_be_dot_sourced_without_dispatch(tmp_path: Path) -> None:
     result = run_harness(
         tmp_path,
@@ -567,3 +689,628 @@ catch {{ $reason = $_.Exception.Message }}
     refusal = json.loads(result.stdout)
     assert "left port" in refusal["reason"].lower()
     assert refusal["python_call_count"] == 0
+
+
+@pytest.mark.parametrize(
+    ("copy_body", "reason"),
+    [
+        ("throw 'simulated backup copy failure'", "simulated backup copy failure"),
+        (
+            "[System.IO.File]::Copy($Source, $Destination, $false); "
+            "if ($Source -like '*_right.json') { [System.IO.File]::AppendAllText($Destination, 'corrupt') }",
+            "backup hash",
+        ),
+    ],
+)
+def test_backup_failure_calls_no_native_and_preserves_active_tree(
+    copy_body: str,
+    reason: str,
+    tmp_path: Path,
+) -> None:
+    fixture = prepare_attempt_fixture(tmp_path)
+    active = fixture["active"]
+    assert isinstance(active, Path)
+    before = tree_bytes(active)
+
+    result, report = run_attempt_harness(
+        tmp_path,
+        fixture,
+        native_body="throw 'native must not be called'",
+        copy_body=copy_body,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert report is not None
+    outcome = report["outcome"]
+    assert outcome["success"] is False
+    assert reason in outcome["primary_reason"].lower()
+    assert report["native_calls"] == 0
+    assert tree_bytes(active) == before
+    assert result.stdout.count("CALIBRATION_FAILURE_REASON=") == 1
+    assert "CALIBRATION_RESULT=FAIL" in result.stdout
+    assert "CALIBRATION_RESULT=PASS" not in result.stdout
+
+
+def test_native_launch_failure_stops_transcript_and_preserves_active_tree(tmp_path: Path) -> None:
+    fixture = prepare_attempt_fixture(tmp_path)
+    active = fixture["active"]
+    assert isinstance(active, Path)
+    before = tree_bytes(active)
+
+    result, report = run_attempt_harness(
+        tmp_path,
+        fixture,
+        native_body="throw 'simulated native launch failure'",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert report is not None
+    outcome = report["outcome"]
+    assert outcome["success"] is False
+    assert outcome["launched"] is False
+    assert "simulated native launch failure" in outcome["primary_reason"]
+    assert report["events"] == ["transcript:start", "transcript:stop"]
+    assert tree_bytes(active) == before
+    assert "CALIBRATION_RESULT=PASS" not in result.stdout
+
+
+def test_launched_false_result_cannot_emit_pass(tmp_path: Path) -> None:
+    fixture = prepare_attempt_fixture(tmp_path)
+
+    result, report = run_attempt_harness(
+        tmp_path,
+        fixture,
+        native_body="$Launched.Value = $false; $ExitCode.Value = 0",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert report is not None
+    assert report["outcome"]["success"] is False
+    assert report["outcome"]["launched"] is False
+    assert "did not launch" in report["outcome"]["primary_reason"].lower()
+    assert "CALIBRATION_RESULT=FAIL" in result.stdout
+    assert "CALIBRATION_RESULT=PASS" not in result.stdout
+
+
+def test_native_nonzero_preserves_partial_staging_transcript_backup_and_active(tmp_path: Path) -> None:
+    fixture = prepare_attempt_fixture(tmp_path)
+    active = fixture["active"]
+    assert isinstance(active, Path)
+    before = tree_bytes(active)
+    native_body = native_write_body(left=make_calibration(20), right=None, exit_code=42)
+
+    result, report = run_attempt_harness(tmp_path, fixture, native_body=native_body)
+
+    assert result.returncode == 0, result.stderr
+    assert report is not None
+    outcome = report["outcome"]
+    assert outcome["success"] is False
+    assert outcome["launched"] is True
+    assert outcome["exit_code"] == 42
+    assert "exit code 42" in outcome["primary_reason"].lower()
+    assert Path(outcome["transcript_path"]).is_file()
+    assert Path(outcome["backup_directory"]).is_dir()
+    staging = Path(outcome["staging_leaf"])
+    assert (staging / "so101_leader_bi_left.json").is_file()
+    assert not (staging / "so101_leader_bi_right.json").exists()
+    assert tree_bytes(active) == before
+    assert "CALIBRATION_RESULT=PASS" not in result.stdout
+
+
+def test_native_nonzero_remains_primary_when_transcript_stop_also_fails(tmp_path: Path) -> None:
+    fixture = prepare_attempt_fixture(tmp_path)
+    native_body = native_write_body(left=make_calibration(20), right=None, exit_code=42)
+
+    result, report = run_attempt_harness(
+        tmp_path,
+        fixture,
+        native_body=native_body,
+        stop_body=(
+            "$events.Add('transcript:stop') | Out-Null; "
+            "throw 'simulated transcript stop failure'"
+        ),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert report is not None
+    outcome = report["outcome"]
+    assert outcome["success"] is False
+    assert outcome["primary_reason"] == "Native calibration exited with exit code 42"
+    assert outcome["secondary_failures"] == [
+        "Transcript stop failed: simulated transcript stop failure"
+    ]
+    assert "CALIBRATION_RESULT=PASS" not in result.stdout
+
+
+def test_native_interrupt_stops_transcript_and_never_promotes(tmp_path: Path) -> None:
+    fixture = prepare_attempt_fixture(tmp_path)
+    active = fixture["active"]
+    assert isinstance(active, Path)
+    before = tree_bytes(active)
+    native_body = """
+$events.Add('native:interrupt') | Out-Null
+$Launched.Value = $true
+throw [System.OperationCanceledException]::new('simulated operator interrupt')
+"""
+
+    result, report = run_attempt_harness(tmp_path, fixture, native_body=native_body)
+
+    assert result.returncode == 0, result.stderr
+    assert report is not None
+    outcome = report["outcome"]
+    assert outcome["success"] is False
+    assert outcome["interrupted"] is True
+    assert outcome["exit_code"] == 130
+    assert "simulated operator interrupt" in outcome["primary_reason"]
+    assert report["events"] == ["transcript:start", "native:interrupt", "transcript:stop"]
+    assert Path(outcome["transcript_path"]).is_file()
+    assert tree_bytes(active) == before
+    assert not list(active.parent.glob(".am1-candidate-*"))
+    assert not list(active.parent.glob(".am1-withdrawn-*"))
+    assert "CALIBRATION_RESULT=PASS" not in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("native_body", "reason"),
+    [
+        (native_write_body(left=make_calibration(20), right=None), "missing"),
+        (native_write_body(left="{", right=make_calibration(30)), "malformed"),
+    ],
+)
+def test_staged_missing_or_malformed_side_refuses_without_promotion(
+    native_body: str,
+    reason: str,
+    tmp_path: Path,
+) -> None:
+    fixture = prepare_attempt_fixture(tmp_path)
+    active = fixture["active"]
+    assert isinstance(active, Path)
+    before = tree_bytes(active)
+
+    result, report = run_attempt_harness(tmp_path, fixture, native_body=native_body)
+
+    assert result.returncode == 0, result.stderr
+    assert report is not None
+    outcome = report["outcome"]
+    assert outcome["success"] is False
+    assert reason in outcome["primary_reason"].lower()
+    assert Path(outcome["staging_leaf"]).is_dir()
+    assert tree_bytes(active) == before
+    assert not list(active.parent.glob(".am1-candidate-*"))
+    assert not list(active.parent.glob(".am1-withdrawn-*"))
+    assert result.stdout.count("CALIBRATION_FAILURE_REASON=") == 1
+    assert "CALIBRATION_RESULT=PASS" not in result.stdout
+
+
+def test_candidate_and_withdrawal_must_be_direct_nonexistent_siblings(tmp_path: Path) -> None:
+    active_parent = tmp_path / "teleoperators"
+    active = active_parent / "so_leader"
+    write_valid_pair(active)
+    candidate = tmp_path / "outside" / ".am1-candidate-test-run"
+    withdrawal = active_parent / ".am1-withdrawn-test-run"
+
+    result = run_json_harness(
+        tmp_path,
+        "Assert-Am1DirectSiblingPaths "
+        f"-ActiveDirectory {ps_literal(active)} -CandidatePath {ps_literal(candidate)} "
+        f"-WithdrawalPath {ps_literal(withdrawal)} -RunId 'test-run'; "
+        "[ordered]@{ accepted = $true }",
+    )
+
+    assert result.returncode != 0
+    assert "direct sibling" in result.stderr.lower()
+    assert active.is_dir()
+    assert not candidate.exists()
+    assert not withdrawal.exists()
+
+
+def test_successful_candidate_promotion_preserves_unrelated_files_and_reports_evidence(tmp_path: Path) -> None:
+    fixture = prepare_attempt_fixture(tmp_path)
+    active = fixture["active"]
+    assert isinstance(active, Path)
+    original = tree_bytes(active)
+    staged_left = make_calibration(40)
+    staged_right = make_calibration(50)
+    native_body = native_write_body(left=staged_left, right=staged_right)
+
+    result, report = run_attempt_harness(
+        tmp_path,
+        fixture,
+        native_body=native_body,
+        include_promotion_seams=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert report is not None
+    outcome = report["outcome"]
+    assert outcome["success"] is True, json.dumps(outcome, indent=2)
+    assert outcome["primary_reason"] is None
+    staging = Path(outcome["staging_leaf"])
+    active_left = active / "so101_leader_bi_left.json"
+    active_right = active / "so101_leader_bi_right.json"
+    staged_left_path = staging / active_left.name
+    staged_right_path = staging / active_right.name
+    assert hashlib.sha256(active_left.read_bytes()).digest() == hashlib.sha256(staged_left_path.read_bytes()).digest()
+    assert hashlib.sha256(active_right.read_bytes()).digest() == hashlib.sha256(staged_right_path.read_bytes()).digest()
+    assert (active / "unrelated-am2.json").read_bytes() == original["unrelated-am2.json"]
+    backup = Path(outcome["backup_directory"])
+    assert (backup / active_left.name).read_bytes() == original[active_left.name]
+    assert (backup / active_right.name).read_bytes() == original[active_right.name]
+    assert not Path(outcome["candidate_path"]).exists()
+    assert not Path(outcome["withdrawal_path"]).exists()
+    assert [call["operation"] for call in report["move_calls"]] == ["withdraw-active", "promote-candidate"]
+    assert report["remove_calls"] == [outcome["withdrawal_path"]]
+    assert result.stdout.count("CALIBRATION_RESULT=PASS") == 1
+    assert f"ACTIVE_LEFT_PATH={active_left}" in result.stdout
+    assert f"ACTIVE_RIGHT_PATH={active_right}" in result.stdout
+    assert "ACTIVE_LEFT_SHA256=" in result.stdout
+    assert "ACTIVE_RIGHT_SHA256=" in result.stdout
+    assert "PAIR_BACKUP=" in result.stdout
+    assert "STAGED_EVIDENCE=" in result.stdout
+    assert "NEXT_COMMAND=" in result.stdout
+    assert "CALIBRATION_RESULT=FAIL" not in result.stdout
+
+
+def test_concurrent_active_change_refuses_before_first_rename(tmp_path: Path) -> None:
+    fixture = prepare_attempt_fixture(tmp_path)
+    active = fixture["active"]
+    assert isinstance(active, Path)
+    native_body = native_write_body(left=make_calibration(40), right=make_calibration(50))
+    external_bytes = b"external-concurrent-change"
+    before_hook = (
+        "[System.IO.File]::WriteAllBytes((Join-Path $Context.active 'unrelated-am2.json'), "
+        f"[byte[]]@({','.join(str(value) for value in external_bytes)}))"
+    )
+
+    result, report = run_attempt_harness(
+        tmp_path,
+        fixture,
+        native_body=native_body,
+        include_promotion_seams=True,
+        before_promotion_body=before_hook,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert report is not None
+    outcome = report["outcome"]
+    assert outcome["success"] is False
+    assert "active calibration tree changed" in outcome["primary_reason"].lower()
+    assert report["move_calls"] == []
+    assert report["remove_calls"] == []
+    assert (active / "unrelated-am2.json").read_bytes() == external_bytes
+    assert not list(active.parent.glob(".am1-candidate-*"))
+    assert not list(active.parent.glob(".am1-withdrawn-*"))
+    assert "CALIBRATION_RESULT=PASS" not in result.stdout
+
+
+def test_second_rename_failure_restores_original_active_and_preserves_primary(tmp_path: Path) -> None:
+    fixture = prepare_attempt_fixture(tmp_path)
+    active = fixture["active"]
+    assert isinstance(active, Path)
+    original = tree_bytes(active)
+    native_body = native_write_body(left=make_calibration(40), right=make_calibration(50))
+    move_body = """
+if ($Operation -ceq 'promote-candidate') { throw 'simulated second rename failure' }
+[System.IO.Directory]::Move($Source, $Destination)
+"""
+
+    result, report = run_attempt_harness(
+        tmp_path,
+        fixture,
+        native_body=native_body,
+        include_promotion_seams=True,
+        move_body=move_body,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert report is not None
+    outcome = report["outcome"]
+    assert outcome["success"] is False
+    assert outcome["primary_reason"] == "simulated second rename failure"
+    assert outcome["secondary_failures"] == []
+    assert tree_bytes(active) == original
+    assert Path(outcome["candidate_path"]).is_dir()
+    assert not Path(outcome["withdrawal_path"]).exists()
+    assert [call["operation"] for call in report["move_calls"]] == [
+        "withdraw-active",
+        "promote-candidate",
+        "restore-withdrawal",
+    ]
+    assert report["remove_calls"] == []
+    assert "CALIBRATION_RESULT=PASS" not in result.stdout
+
+
+def test_post_verification_failure_rolls_back_complete_directories_before_cleanup(tmp_path: Path) -> None:
+    fixture = prepare_attempt_fixture(tmp_path)
+    active = fixture["active"]
+    assert isinstance(active, Path)
+    original = tree_bytes(active)
+    native_body = native_write_body(left=make_calibration(40), right=make_calibration(50))
+
+    result, report = run_attempt_harness(
+        tmp_path,
+        fixture,
+        native_body=native_body,
+        include_promotion_seams=True,
+        after_second_move_body="throw 'simulated final verification failure'",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert report is not None
+    outcome = report["outcome"]
+    assert outcome["success"] is False
+    assert outcome["primary_reason"] == "simulated final verification failure"
+    assert tree_bytes(active) == original
+    assert Path(outcome["candidate_path"]).is_dir()
+    assert not Path(outcome["withdrawal_path"]).exists()
+    assert [call["operation"] for call in report["move_calls"]] == [
+        "withdraw-active",
+        "promote-candidate",
+        "return-promoted-active",
+        "restore-withdrawal",
+    ]
+    assert report["remove_calls"] == []
+    assert "CALIBRATION_RESULT=PASS" not in result.stdout
+
+
+def test_rollback_failure_is_secondary_and_primary_promotion_error_survives(tmp_path: Path) -> None:
+    fixture = prepare_attempt_fixture(tmp_path)
+    active = fixture["active"]
+    assert isinstance(active, Path)
+    native_body = native_write_body(left=make_calibration(40), right=make_calibration(50))
+    move_body = """
+if ($Operation -ceq 'promote-candidate') { throw 'simulated primary promotion failure' }
+if ($Operation -ceq 'restore-withdrawal') { throw 'simulated rollback failure' }
+[System.IO.Directory]::Move($Source, $Destination)
+"""
+
+    result, report = run_attempt_harness(
+        tmp_path,
+        fixture,
+        native_body=native_body,
+        include_promotion_seams=True,
+        move_body=move_body,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert report is not None
+    outcome = report["outcome"]
+    assert outcome["success"] is False
+    assert outcome["primary_reason"] == "simulated primary promotion failure"
+    assert any("simulated rollback failure" in failure for failure in outcome["secondary_failures"])
+    assert not active.exists()
+    assert Path(outcome["candidate_path"]).is_dir()
+    assert Path(outcome["withdrawal_path"]).is_dir()
+    assert report["remove_calls"] == []
+    assert "CALIBRATION_RESULT=PASS" not in result.stdout
+
+
+def test_withdrawal_cleanup_failure_reports_verified_new_active_without_rollback(tmp_path: Path) -> None:
+    fixture = prepare_attempt_fixture(tmp_path)
+    active = fixture["active"]
+    assert isinstance(active, Path)
+    original = tree_bytes(active)
+    native_body = native_write_body(left=make_calibration(40), right=make_calibration(50))
+
+    result, report = run_attempt_harness(
+        tmp_path,
+        fixture,
+        native_body=native_body,
+        include_promotion_seams=True,
+        remove_body="throw 'simulated withdrawal cleanup failure'",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert report is not None
+    outcome = report["outcome"]
+    assert outcome["success"] is False
+    assert outcome["primary_reason"] == "simulated withdrawal cleanup failure"
+    assert outcome["active_pair_state"] == "PROMOTED_VERIFIED"
+    assert outcome["withdrawal_cleanup_state"] == "FAILED_OR_PARTIAL"
+    assert outcome["secondary_failures"] == []
+    active_left = active / "so101_leader_bi_left.json"
+    active_right = active / "so101_leader_bi_right.json"
+    assert outcome["left"]["sha256"] == hashlib.sha256(active_left.read_bytes()).hexdigest().upper()
+    assert outcome["right"]["sha256"] == hashlib.sha256(active_right.read_bytes()).hexdigest().upper()
+    assert tree_bytes(active) != original
+    assert Path(outcome["withdrawal_path"]).is_dir()
+    assert tree_bytes(Path(outcome["withdrawal_path"])) == original
+    assert [call["operation"] for call in report["move_calls"]] == [
+        "withdraw-active",
+        "promote-candidate",
+    ]
+    assert report["remove_calls"] == [outcome["withdrawal_path"]]
+    assert "ACTIVE_PAIR_STATE=PROMOTED_VERIFIED" in result.stdout
+    assert f"ACTIVE_LEFT_PATH={active_left}" in result.stdout
+    assert f"ACTIVE_RIGHT_PATH={active_right}" in result.stdout
+    assert "WITHDRAWAL_CLEANUP_STATE=FAILED_OR_PARTIAL" in result.stdout
+    assert f"WITHDRAWAL_PATH={outcome['withdrawal_path']}" in result.stdout
+    assert "CALIBRATION_RESULT=FAIL" in result.stdout
+    assert "CALIBRATION_RESULT=PASS" not in result.stdout
+
+
+def test_production_launcher_does_not_mark_missing_executable_as_launched(tmp_path: Path) -> None:
+    missing_executable = tmp_path / "missing-python.exe"
+    body = f"""
+$command = [pscustomobject]@{{
+    executable = {ps_literal(missing_executable)}
+    arguments = @()
+    working_directory = {ps_literal(tmp_path)}
+}}
+$launched = $false
+$exitCode = $null
+$reason = $null
+try {{
+    Invoke-Am1InteractiveCalibrationCommand -Command $command -StagingLeaf {ps_literal(tmp_path)} `
+        -Launched ([ref]$launched) -ExitCode ([ref]$exitCode)
+}}
+catch {{ $reason = $_.Exception.Message }}
+[Console]::Out.WriteLine(([ordered]@{{
+    launched = $launched
+    exit_code = $exitCode
+    reason = $reason
+}} | ConvertTo-Json -Compress))
+"""
+
+    result = run_harness(tmp_path, body)
+
+    assert result.returncode == 0, result.stderr
+    report = json.loads(result.stdout.splitlines()[-1])
+    assert report["reason"]
+    assert report["launched"] is False
+    assert report["exit_code"] is None
+
+
+@pytest.mark.parametrize(("launched", "exit_code", "reason"), [(False, 0, "launch"), (True, 42, "exit")])
+def test_outcome_writer_refuses_synthetic_success_without_runtime_invariants(
+    launched: bool,
+    exit_code: int,
+    reason: str,
+    tmp_path: Path,
+) -> None:
+    body = f"""
+$outcome = [pscustomobject][ordered]@{{
+    success = $true
+    primary_reason = $null
+    secondary_failures = @()
+    launched = ${str(launched).lower()}
+    exit_code = {exit_code}
+    active_pair_state = 'PROMOTED_VERIFIED'
+    withdrawal_cleanup_state = 'COMPLETE'
+    run_directory = 'run-evidence'
+    backup_directory = 'pair-backup'
+    staging_leaf = 'staged-evidence'
+    transcript_path = 'transcript-path'
+    withdrawal_path = 'withdrawal-path'
+    left = [pscustomobject]@{{ path = 'left-path'; sha256 = 'left-hash' }}
+    right = [pscustomobject]@{{ path = 'right-path'; sha256 = 'right-hash' }}
+}}
+$failure = $null
+try {{ Write-Am1CalibrationOutcome -Outcome $outcome }}
+catch {{ $failure = $_.Exception.Message }}
+[Console]::Out.WriteLine('WRITER_JSON=' + ([ordered]@{{ failure = $failure }} | ConvertTo-Json -Compress))
+"""
+
+    result = run_harness(tmp_path, body)
+
+    assert result.returncode == 0, result.stderr
+    report = json.loads(
+        next(line.removeprefix("WRITER_JSON=") for line in result.stdout.splitlines() if line.startswith("WRITER_JSON="))
+    )
+    assert reason in report["failure"].lower()
+    assert "CALIBRATION_RESULT=PASS" not in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("left_port", "confirmation", "reason"),
+    [
+        ("COM9", "CALIBRATE", "left port"),
+        ("COM8", "calibrate", "confirmation"),
+    ],
+)
+def test_calibrate_main_refuses_identity_or_confirmation_before_attempt(
+    left_port: str,
+    confirmation: str,
+    reason: str,
+    tmp_path: Path,
+) -> None:
+    body = f"""
+$attemptCalls = 0
+$attempt = {{ $script:attemptCalls += 1; throw 'attempt must not be called' }}
+$failure = $null
+try {{
+    $null = Invoke-Am1LeaderCalibrationMain -StatusMode $false -CalibrateMode $true `
+        -Confirmation {ps_literal(confirmation)} -LeftPortValue {ps_literal(left_port)} `
+        -RightPortValue 'COM7' -LeaderIdValue 'so101_leader_bi' `
+        -ArmProfileValue 'so-arm-5dof' -RunIdValue 'test-run' `
+        -CalibrationAttemptInvoker $attempt
+}}
+catch {{ $failure = $_.Exception.Message }}
+[Console]::Out.WriteLine(([ordered]@{{ failure = $failure; attempt_calls = $attemptCalls }} |
+    ConvertTo-Json -Compress))
+"""
+
+    result = run_harness(tmp_path, body)
+
+    assert result.returncode == 0, result.stderr
+    report = json.loads(result.stdout.splitlines()[-1])
+    assert reason in report["failure"].lower()
+    assert report["attempt_calls"] == 0
+
+
+@pytest.mark.parametrize(("success", "expected_code"), [(True, 0), (False, 1)])
+def test_calibrate_main_dispatches_once_and_maps_outcome_to_exit_code(
+    success: bool,
+    expected_code: int,
+    tmp_path: Path,
+) -> None:
+    outcome = f"""[pscustomobject][ordered]@{{
+    success = ${str(success).lower()}
+    primary_reason = {"$null" if success else "'simulated calibration failure'"}
+    secondary_failures = @()
+    launched = ${str(success).lower()}
+    exit_code = {0 if success else "$null"}
+    active_pair_state = {"'PROMOTED_VERIFIED'" if success else "$null"}
+    withdrawal_cleanup_state = {"'COMPLETE'" if success else "$null"}
+    run_directory = 'run-evidence'
+    backup_directory = 'pair-backup'
+    staging_leaf = 'staged-evidence'
+    transcript_path = 'transcript-path'
+    withdrawal_path = 'withdrawal-path'
+    left = {"[pscustomobject]@{ path = 'left-path'; sha256 = 'left-hash' }" if success else "$null"}
+    right = {"[pscustomobject]@{ path = 'right-path'; sha256 = 'right-hash' }" if success else "$null"}
+}}"""
+    body = f"""
+$attemptCalls = 0
+$observed = $null
+$attempt = {{
+    param(
+        $RepositoryRoot, $PythonPath, $LeftPortValue, $RightPortValue,
+        $LeaderIdValue, $ArmProfileValue, $Confirmation, $RunId
+    )
+    $script:attemptCalls += 1
+    $script:observed = [ordered]@{{
+        repository = $RepositoryRoot
+        python = $PythonPath
+        left_port = $LeftPortValue
+        right_port = $RightPortValue
+        leader_id = $LeaderIdValue
+        arm_profile = $ArmProfileValue
+        confirmation = $Confirmation
+        run_id = $RunId
+    }}
+    return ({outcome})
+}}
+$code = Invoke-Am1LeaderCalibrationMain -StatusMode $false -CalibrateMode $true `
+    -Confirmation 'CALIBRATE' -LeftPortValue 'COM8' -RightPortValue 'COM7' `
+    -LeaderIdValue 'so101_leader_bi' -ArmProfileValue 'so-arm-5dof' `
+    -RunIdValue 'test-run' -CalibrationAttemptInvoker $attempt
+[Console]::Out.WriteLine('MAIN_JSON=' + ([ordered]@{{
+    code = $code
+    attempt_calls = $attemptCalls
+    observed = $observed
+}} | ConvertTo-Json -Depth 20 -Compress))
+"""
+
+    result = run_harness(tmp_path, body)
+
+    assert result.returncode == 0, result.stderr
+    report = json.loads(
+        next(line.removeprefix("MAIN_JSON=") for line in result.stdout.splitlines() if line.startswith("MAIN_JSON="))
+    )
+    assert report["code"] == expected_code
+    assert report["attempt_calls"] == 1
+    assert report["observed"]["left_port"] == "COM8"
+    assert report["observed"]["right_port"] == "COM7"
+    assert report["observed"]["leader_id"] == "so101_leader_bi"
+    assert report["observed"]["arm_profile"] == "so-arm-5dof"
+    assert report["observed"]["confirmation"] == "CALIBRATE"
+    assert report["observed"]["run_id"] == "test-run"
+    if success:
+        assert result.stdout.count("CALIBRATION_RESULT=PASS") == 1
+        assert "ACTIVE_LEFT_PATH=left-path" in result.stdout
+        assert "ACTIVE_RIGHT_PATH=right-path" in result.stdout
+        assert "CALIBRATION_RESULT=FAIL" not in result.stdout
+    else:
+        assert result.stdout.count("CALIBRATION_RESULT=FAIL") == 1
+        assert "CALIBRATION_RESULT=PASS" not in result.stdout
