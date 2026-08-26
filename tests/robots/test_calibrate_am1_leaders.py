@@ -13,7 +13,15 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_PATH = REPO_ROOT / "tools" / "calibrate_am1_leaders.ps1"
-pytestmark = pytest.mark.skipif(shutil.which("pwsh") is None, reason="PowerShell 7 is unavailable")
+DOCUMENTATION_PATH = REPO_ROOT / "docs" / "alohamini" / "alohamini.md"
+
+
+@pytest.fixture(autouse=True)
+def require_powershell_for_harness_tests(request: pytest.FixtureRequest) -> None:
+    if request.node.name.startswith("test_documentation_"):
+        return
+    if shutil.which("pwsh") is None:
+        pytest.skip("PowerShell 7 is unavailable")
 
 
 def ps_literal(value: Path | str) -> str:
@@ -1314,3 +1322,113 @@ $code = Invoke-Am1LeaderCalibrationMain -StatusMode $false -CalibrateMode $true 
     else:
         assert result.stdout.count("CALIBRATION_RESULT=FAIL") == 1
         assert "CALIBRATION_RESULT=PASS" not in result.stdout
+
+
+def test_documentation_defines_simple_am1_leader_commands_and_identity() -> None:
+    text = DOCUMENTATION_PATH.read_text(encoding="utf-8")
+    normalized = " ".join(text.split())
+
+    assert "### Simple AM1 leader calibration and recovery" in text
+    assert (
+        r".\.venv\Scripts\python.exe .\tools\check_am1_leader_buses.py CHECK"
+        in normalized
+    )
+    assert (
+        r"pwsh -NoLogo -NoProfile -File .\tools\calibrate_am1_leaders.ps1 -Status"
+        in normalized
+    )
+    assert (
+        r"pwsh -NoLogo -NoProfile -File .\tools\calibrate_am1_leaders.ps1 "
+        r"-Calibrate -Confirm CALIBRATE"
+        in normalized
+    )
+    assert "physical/logical left is `COM8`" in text
+    assert "physical/logical right is `COM7`" in text
+
+
+def test_documentation_covers_recovery_wrist_roll_and_no_robot_side_check() -> None:
+    text = DOCUMENTATION_PATH.read_text(encoding="utf-8")
+    normalized = " ".join(text.split())
+    simple_section = text.split(
+        "### Simple AM1 leader calibration and recovery", maxsplit=1
+    )[1].split("<details>", maxsplit=1)[0]
+    calibration_stage = text.split(
+        "3. For a separately authorized one-shot calibration", maxsplit=1
+    )[1].split("4. After a clean calibration `PASS`", maxsplit=1)[0]
+    expected_no_robot = (
+        r".\.venv\Scripts\python.exe .\examples\alohamini\teleoperate_bi.py --no_robot "
+        r"--robot.robot_model alohamini1 --teleop.left_port COM8 --teleop.right_port COM7 "
+        r"--teleop.id so101_leader_bi --teleop.arm_profile so-arm-5dof "
+        r"--require_calibration_match --duration_s 30 --fps 5 --no_keyboard --no_rerun"
+    )
+
+    assert "Before promotion, any failure leaves the active calibration files unchanged" in text
+    assert "any backup, transcript, or staged evidence already created" in text
+    assert "preserves the backup, transcript, and staged evidence" not in text
+    assert "complete fresh rerun" in text
+    assert "Do not force wrist roll during range recording" in text
+    assert "implementation assigns `0..4095`" in text
+    assert expected_no_robot in normalized
+    assert "physical left gripper must change only `arm_left_gripper.pos`" in text
+    assert "physical right gripper must change only `arm_right_gripper.pos`" in text
+    assert "Follower/body 12 V power is off" in text
+    assert "Pi motor host is stopped" in text
+    assert "Stop immediately" in text
+    for stop_term in (
+        "unexpected motion",
+        "resistance",
+        "sound",
+        "heat",
+        "current",
+        "cable strain",
+        "disconnect",
+        "prompt",
+        "communication error",
+    ):
+        assert stop_term in calibration_stage
+    for stop_term in ("wrong-side", "both-side", "sound", "heat", "current", "disconnect"):
+        assert stop_term in text
+    for recovery_term in (
+        "FAIL_CLOSED_RECOVERY=Rename-Item -LiteralPath",
+        "all leader power off",
+        "no LeRobot process running",
+        "active `so_leader` path is absent",
+        "printed withdrawal path is a complete ordinary directory",
+        "inspect and validate the active directory before any cleanup",
+    ):
+        assert recovery_term in simple_section
+
+
+def test_documentation_deprecates_old_runner_as_historical_only() -> None:
+    text = DOCUMENTATION_PATH.read_text(encoding="utf-8")
+
+    assert "Historical/deprecated tooling: `tools\\packet2n_r5_leader_mapping.ps1`" in text
+    for obsolete_claim in (
+        "sole authoritative future corrected-port procedure",
+        "only described future correction",
+        "current AM1 Packet 2N authority",
+        "The runner is the only Packet 2N-R5R operator path",
+        "##### Authoritative staged interface",
+    ):
+        assert obsolete_claim not in text
+
+    legacy_command = (
+        r"pwsh -NoLogo -NoProfile -File .\tools\packet2n_r5_leader_mapping.ps1"
+    )
+    command_offsets = []
+    search_from = 0
+    while (offset := text.find(legacy_command, search_from)) != -1:
+        command_offsets.append(offset)
+        search_from = offset + len(legacy_command)
+
+    assert command_offsets
+    for offset in command_offsets:
+        preceding = text[:offset]
+        details_start = preceding.rfind("<details>")
+        details_end = preceding.rfind("</details>")
+        assert details_start > details_end
+        summary_end = text.find("</summary>", details_start, offset)
+        assert summary_end != -1
+        historical_summary = text[details_start:summary_end].lower()
+        assert "historical" in historical_summary
+        assert "deprecated" in historical_summary or "superseded" in historical_summary
