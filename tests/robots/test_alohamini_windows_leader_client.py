@@ -17,7 +17,9 @@
 from __future__ import annotations
 
 import argparse
+import builtins
 import importlib.util
+import io
 import math
 import sys
 from pathlib import Path
@@ -387,13 +389,245 @@ def test_calibration_uses_passive_connections_and_disconnects_both_buses(monkeyp
     ]
 
 
-def test_calibration_cleanup_does_not_hide_primary_failure(monkeypatch):
+def test_forced_calibration_progress_brackets_torque_mode_writes_and_middle_pose(capsys):
+    module = load_example_module("calibrate_bi")
+
+    class ProgressBus:
+        def __init__(self, side):
+            self.side = side
+            self.motors = {"shoulder_pan": object(), "elbow_flex": object()}
+
+        def disable_torque(self):
+            print(f"FAKE_BUS={self.side}:DISABLE_TORQUE")
+            for motor in self.motors:
+                self.write("Torque_Enable", motor, 0, num_retry=0)
+                self.write("Lock", motor, 0, num_retry=0)
+
+        def write(self, data_name, motor, value, *, normalize=True, num_retry=3):
+            print(f"FAKE_BUS={self.side}:WRITE:{data_name}:{motor}:{value}:{normalize}:{num_retry}")
+
+    class ProgressArm:
+        def __init__(self, side):
+            self.side = side
+            self.bus = ProgressBus(side)
+
+        def calibrate(self):
+            self.bus.disable_torque()
+            for motor in self.bus.motors:
+                self.bus.write("Operating_Mode", motor, 0)
+            print(f"FAKE_ARM={self.side}:MIDDLE_POSE_INPUT")
+
+    class ProgressLeader:
+        def __init__(self):
+            self.left_arm = ProgressArm("LEFT")
+            self.right_arm = ProgressArm("RIGHT")
+
+        def calibrate(self):
+            self.left_arm.calibrate()
+            self.right_arm.calibrate()
+
+    leader = ProgressLeader()
+
+    module._run_am1_calibration_with_progress(leader)
+
+    assert capsys.readouterr().out.splitlines() == [
+        "AM1_CALIBRATION_PROGRESS=LEFT_STARTING_TORQUE_DISABLE",
+        "FAKE_BUS=LEFT:DISABLE_TORQUE",
+        "FAKE_BUS=LEFT:WRITE:Torque_Enable:shoulder_pan:0:True:0",
+        "FAKE_BUS=LEFT:WRITE:Lock:shoulder_pan:0:True:0",
+        "FAKE_BUS=LEFT:WRITE:Torque_Enable:elbow_flex:0:True:0",
+        "FAKE_BUS=LEFT:WRITE:Lock:elbow_flex:0:True:0",
+        "AM1_CALIBRATION_PROGRESS=LEFT_TORQUE_DISABLE_COMPLETE",
+        "AM1_CALIBRATION_PROGRESS=LEFT_STARTING_OPERATING_MODE_WRITES",
+        "FAKE_BUS=LEFT:WRITE:Operating_Mode:shoulder_pan:0:True:3",
+        "FAKE_BUS=LEFT:WRITE:Operating_Mode:elbow_flex:0:True:3",
+        "AM1_CALIBRATION_PROGRESS=LEFT_OPERATING_MODE_WRITES_COMPLETE",
+        "AM1_CALIBRATION_PROGRESS=LEFT_WAITING_FOR_MIDDLE_POSE_ENTER",
+        "FAKE_ARM=LEFT:MIDDLE_POSE_INPUT",
+        "AM1_CALIBRATION_PROGRESS=RIGHT_STARTING_TORQUE_DISABLE",
+        "FAKE_BUS=RIGHT:DISABLE_TORQUE",
+        "FAKE_BUS=RIGHT:WRITE:Torque_Enable:shoulder_pan:0:True:0",
+        "FAKE_BUS=RIGHT:WRITE:Lock:shoulder_pan:0:True:0",
+        "FAKE_BUS=RIGHT:WRITE:Torque_Enable:elbow_flex:0:True:0",
+        "FAKE_BUS=RIGHT:WRITE:Lock:elbow_flex:0:True:0",
+        "AM1_CALIBRATION_PROGRESS=RIGHT_TORQUE_DISABLE_COMPLETE",
+        "AM1_CALIBRATION_PROGRESS=RIGHT_STARTING_OPERATING_MODE_WRITES",
+        "FAKE_BUS=RIGHT:WRITE:Operating_Mode:shoulder_pan:0:True:3",
+        "FAKE_BUS=RIGHT:WRITE:Operating_Mode:elbow_flex:0:True:3",
+        "AM1_CALIBRATION_PROGRESS=RIGHT_OPERATING_MODE_WRITES_COMPLETE",
+        "AM1_CALIBRATION_PROGRESS=RIGHT_WAITING_FOR_MIDDLE_POSE_ENTER",
+        "FAKE_ARM=RIGHT:MIDDLE_POSE_INPUT",
+    ]
+    for arm in (leader.left_arm, leader.right_arm):
+        assert "disable_torque" not in vars(arm.bus)
+        assert "write" not in vars(arm.bus)
+
+
+def test_calibration_transcript_tees_prompt_and_stderr_without_redirecting_console(
+    monkeypatch,
+    tmp_path,
+):
+    module = load_example_module("calibrate_bi")
+    transcript = tmp_path / "child-output.txt"
+    transcript.write_text("WRAPPER_HEADER\n", encoding="utf-8")
+    console_out = io.StringIO()
+    console_err = io.StringIO()
+    monkeypatch.setenv("AM1_CALIBRATION_TRANSCRIPT_PATH", str(transcript))
+    monkeypatch.setattr(module.sys, "stdout", console_out)
+    monkeypatch.setattr(module.sys, "stderr", console_err)
+
+    with module._am1_calibration_transcript_from_environment():
+        module.sys.stdout.write("LC2_NO_NEWLINE_PROMPT>")
+        module.sys.stdout.flush()
+        module.sys.stderr.write("LC2_STDERR\n")
+        module.sys.stderr.flush()
+
+    assert module.sys.stdout is console_out
+    assert module.sys.stderr is console_err
+    assert console_out.getvalue() == "LC2_NO_NEWLINE_PROMPT>"
+    assert console_err.getvalue() == "LC2_STDERR\n"
+    assert transcript.read_text(encoding="utf-8") == (
+        "WRAPPER_HEADER\n"
+        "AM1_CALIBRATION_CHILD_OUTPUT_BEGIN\n"
+        "LC2_NO_NEWLINE_PROMPT>LC2_STDERR\n"
+        "AM1_CALIBRATION_CHILD_OUTPUT_END\n"
+    )
+
+
+def test_calibration_transcript_tees_builtin_input_prompt(monkeypatch, tmp_path):
+    module = load_example_module("calibrate_bi")
+    transcript = tmp_path / "child-input-prompt.txt"
+    console_out = io.StringIO()
+    received_prompts = []
+
+    def fake_console_input(prompt=""):
+        received_prompts.append(prompt)
+        return "LC2_TOKEN"
+
+    monkeypatch.setenv("AM1_CALIBRATION_TRANSCRIPT_PATH", str(transcript))
+    monkeypatch.setattr(module.sys, "stdout", console_out)
+    monkeypatch.setattr(builtins, "input", fake_console_input)
+
+    with module._am1_calibration_transcript_from_environment():
+        result = builtins.input("LC2_MIDDLE_POSE_PROMPT>")
+
+    assert result == "LC2_TOKEN"
+    assert received_prompts == [""]
+    assert builtins.input is fake_console_input
+    assert console_out.getvalue() == "LC2_MIDDLE_POSE_PROMPT>"
+    assert transcript.read_text(encoding="utf-8") == (
+        "AM1_CALIBRATION_CHILD_OUTPUT_BEGIN\n"
+        "LC2_MIDDLE_POSE_PROMPT>"
+        "AM1_CALIBRATION_CHILD_OUTPUT_END\n"
+    )
+
+
+def test_calibration_transcript_close_failure_preserves_primary_exception(monkeypatch):
     module = load_example_module("calibrate_bi")
     primary_error = RuntimeError("calibration failed")
+    close_error = OSError("transcript close failed")
+    console_out = io.StringIO()
+    console_err = io.StringIO()
+
+    class FailingTranscript(io.StringIO):
+        def close(self):
+            raise close_error
+
+    transcript = FailingTranscript()
+    monkeypatch.setenv("AM1_CALIBRATION_TRANSCRIPT_PATH", "unused-offline-path")
+    monkeypatch.setattr(module.Path, "open", lambda self, *args, **kwargs: transcript)
+    monkeypatch.setattr(module.sys, "stdout", console_out)
+    monkeypatch.setattr(module.sys, "stderr", console_err)
+
+    with pytest.raises(RuntimeError) as caught:
+        with module._am1_calibration_transcript_from_environment():
+            raise primary_error
+
+    assert caught.value is primary_error
+    assert any("transcript close" in note for note in caught.value.__notes__)
+    assert module.sys.stdout is console_out
+    assert module.sys.stderr is console_err
+
+
+def test_calibration_transcript_setup_interrupt_restores_all_globals(monkeypatch):
+    module = load_example_module("calibrate_bi")
+    setup_error = KeyboardInterrupt()
+    console_out = io.StringIO()
+    console_err = io.StringIO()
+    original_input = lambda prompt="": "unused"
+
+    class TrackingTranscript(io.StringIO):
+        def __init__(self):
+            super().__init__()
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+            super().close()
+
+    class InterruptingBuiltins:
+        def __init__(self):
+            self._input = original_input
+            self.set_calls = 0
+
+        @property
+        def input(self):
+            return self._input
+
+        @input.setter
+        def input(self, value):
+            self.set_calls += 1
+            if self.set_calls == 1:
+                raise setup_error
+            self._input = value
+
+    transcript = TrackingTranscript()
+    interrupting_builtins = InterruptingBuiltins()
+    monkeypatch.setenv("AM1_CALIBRATION_TRANSCRIPT_PATH", "unused-offline-path")
+    monkeypatch.setattr(module.Path, "open", lambda self, *args, **kwargs: transcript)
+    monkeypatch.setattr(module.sys, "stdout", console_out)
+    monkeypatch.setattr(module.sys, "stderr", console_err)
+    monkeypatch.setattr(module, "builtins", interrupting_builtins)
+
+    try:
+        with pytest.raises(KeyboardInterrupt) as caught:
+            with module._am1_calibration_transcript_from_environment():
+                pytest.fail("setup interruption should prevent entry")
+        observed_stdout = module.sys.stdout
+        observed_stderr = module.sys.stderr
+    finally:
+        module.sys.stdout = console_out
+        module.sys.stderr = console_err
+
+    assert caught.value is setup_error
+    assert observed_stdout is console_out
+    assert observed_stderr is console_err
+    assert interrupting_builtins.input is original_input
+    assert transcript.close_calls == 1
+
+
+@pytest.mark.parametrize("force_fresh", [False, True])
+def test_calibration_cleanup_does_not_hide_primary_failure(monkeypatch, force_fresh):
+    module = load_example_module("calibrate_bi")
+    primary_error = RuntimeError("calibration failed")
+    constructed_leaders = []
+
+    class CalibrationBus:
+        def __init__(self):
+            self.calibration = {"stale": True}
+            self.motors = {}
+
+        def disable_torque(self):
+            pass
+
+        def write(self, data_name, motor, value, *, normalize=True, num_retry=3):
+            pass
 
     class CalibrationArm:
         def __init__(self, *, disconnect_error=None):
             self.disconnect_error = disconnect_error
+            self.calibration = {"stale": True}
+            self.bus = CalibrationBus()
 
         def connect(self, calibrate=True):
             pass
@@ -406,21 +640,25 @@ def test_calibration_cleanup_does_not_hide_primary_failure(monkeypatch):
         def __init__(self, config):
             self.left_arm = CalibrationArm(disconnect_error=RuntimeError("cleanup failed"))
             self.right_arm = CalibrationArm()
+            constructed_leaders.append(self)
 
         def calibrate(self):
             raise primary_error
 
     monkeypatch.setattr(module, "BiSOLeader", CalibrationLeader)
-    args = module.parse_args(
-        ["--teleop.left_port", "COM5", "--teleop.right_port", "COM6"],
-        platform_name="Windows",
-    )
+    argv = ["--teleop.left_port", "COM5", "--teleop.right_port", "COM6"]
+    if force_fresh:
+        argv.append("--force_fresh_calibration")
+    args = module.parse_args(argv, platform_name="Windows")
 
     with pytest.raises(RuntimeError) as caught:
         module.run_calibration(args)
 
     assert caught.value is primary_error
     assert any("left leader disconnect" in note for note in caught.value.__notes__)
+    for arm in (constructed_leaders[0].left_arm, constructed_leaders[0].right_arm):
+        assert "disable_torque" not in vars(arm.bus)
+        assert "write" not in vars(arm.bus)
 
 
 @pytest.mark.parametrize("aliased_calibrations", [False, True])
@@ -430,11 +668,24 @@ def test_force_fresh_calibration_clears_each_child_and_bus_calibration_in_place(
     module = load_example_module("calibrate_bi")
     events = []
 
+    class CalibrationBus:
+        def __init__(self, calibration):
+            self.calibration = calibration
+            self.motors = {}
+
+        def disable_torque(self):
+            pass
+
+        def write(self, data_name, motor, value, *, normalize=True, num_retry=3):
+            pass
+
     class CalibrationArm:
         def __init__(self, name):
             self.name = name
             self.calibration = {"stale_arm": name}
-            self.bus = SimpleNamespace(calibration=self.calibration if aliased_calibrations else {"stale_bus": name})
+            self.bus = CalibrationBus(
+                self.calibration if aliased_calibrations else {"stale_bus": name}
+            )
 
         def connect(self, calibrate=True):
             assert self.calibration == {}

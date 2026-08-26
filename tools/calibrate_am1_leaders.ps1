@@ -798,31 +798,130 @@ function Invoke-Am1DirectoryPromotion {
 function Start-Am1CalibrationTranscript {
     param([Parameter(Mandatory = $true)][string]$Path)
 
-    Start-Transcript -LiteralPath $Path -Force | Out-Null
+    $encoding = [System.Text.UTF8Encoding]::new($false)
+    [System.IO.File]::WriteAllText(
+        $Path,
+        "AM1_CALIBRATION_TRANSCRIPT_BEGIN$([System.Environment]::NewLine)",
+        $encoding
+    )
 }
 
 function Stop-Am1CalibrationTranscript {
-    Stop-Transcript | Out-Null
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $encoding = [System.Text.UTF8Encoding]::new($false)
+    [System.IO.File]::AppendAllText(
+        $Path,
+        "AM1_CALIBRATION_TRANSCRIPT_END$([System.Environment]::NewLine)",
+        $encoding
+    )
+}
+
+function Write-Am1CalibrationTranscriptLine {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Line
+    )
+
+    $encoding = [System.Text.UTF8Encoding]::new($false)
+    [System.IO.File]::AppendAllText($Path, "$Line$([System.Environment]::NewLine)", $encoding)
 }
 
 function Invoke-Am1InteractiveCalibrationCommand {
+    [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]$Command,
         [Parameter(Mandatory = $true)][string]$StagingLeaf,
         [Parameter(Mandatory = $true)][ref]$Launched,
-        [Parameter(Mandatory = $true)][ref]$ExitCode
+        [Parameter(Mandatory = $true)][ref]$ExitCode,
+        [Parameter()][scriptblock]$ProcessFactory,
+        [Parameter()][scriptblock]$ProcessWaiter
     )
 
     $null = $StagingLeaf
-    Push-Location -LiteralPath $Command.working_directory
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = [string]$Command.executable
+    $startInfo.WorkingDirectory = [string]$Command.working_directory
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardInput = $false
+    $startInfo.RedirectStandardOutput = $false
+    $startInfo.RedirectStandardError = $false
+    $transcriptProperty = $Command.PSObject.Properties["transcript_path"]
+    if ($null -ne $transcriptProperty) {
+        $startInfo.Environment["AM1_CALIBRATION_TRANSCRIPT_PATH"] = [string]$transcriptProperty.Value
+    }
+    foreach ($argument in @($Command.arguments)) {
+        $startInfo.ArgumentList.Add([string]$argument)
+    }
+    if ($null -eq $ProcessFactory) {
+        $ProcessFactory = {
+            param($ChildStartInfo)
+            $child = [System.Diagnostics.Process]::new()
+            $child.StartInfo = $ChildStartInfo
+            return $child
+        }
+    }
+    if ($null -eq $ProcessWaiter) {
+        $ProcessWaiter = {
+            param($ChildProcess)
+            Wait-Process -Id $ChildProcess.Id -ErrorAction Stop
+        }
+    }
+
+    $process = $null
+    $started = $false
+    $primary = $null
+    $cleanupFailures = [System.Collections.Generic.List[string]]::new()
     try {
-        & $Command.executable @($Command.arguments) | Out-Host
-        $capturedExitCode = $LASTEXITCODE
+        $process = & $ProcessFactory $startInfo
+        if ($null -eq $process) {
+            throw "Interactive calibration process factory returned no process"
+        }
+        if (-not $process.Start()) {
+            throw "Interactive calibration process did not start"
+        }
+        $started = $true
         $Launched.Value = $true
-        $ExitCode.Value = $capturedExitCode
+        & $ProcessWaiter $process | Out-Null
+        if (-not $process.HasExited) {
+            throw "Interactive calibration process waiter returned before the child exited"
+        }
+        $ExitCode.Value = [int]$process.ExitCode
+    }
+    catch {
+        $primary = $_
     }
     finally {
-        Pop-Location
+        if ($null -ne $process -and $started) {
+            try {
+                if (-not $process.HasExited) {
+                    $process.Kill($true)
+                    if (-not $process.WaitForExit(5000)) {
+                        throw "Interactive calibration child did not exit after process-tree termination"
+                    }
+                }
+            }
+            catch {
+                $cleanupFailures.Add("Interactive child termination failed: $($_.Exception.Message)")
+            }
+        }
+        if ($null -ne $process) {
+            try {
+                $process.Dispose()
+            }
+            catch {
+                $cleanupFailures.Add("Interactive child disposal failed: $($_.Exception.Message)")
+            }
+        }
+    }
+    if ($null -ne $primary) {
+        if ($cleanupFailures.Count -gt 0) {
+            $primary.Exception.Data["AM1_CHILD_CLEANUP_FAILURES"] = [string[]]@($cleanupFailures)
+        }
+        $PSCmdlet.ThrowTerminatingError($primary)
+    }
+    if ($cleanupFailures.Count -gt 0) {
+        throw [System.InvalidOperationException]::new([string]$cleanupFailures[0])
     }
 }
 
@@ -859,22 +958,39 @@ function Invoke-Am1NativeCalibration {
     try {
         & $StartTranscriptInvoker $TranscriptPath | Out-Null
         $transcriptStarted = $true
-        [Console]::Out.WriteLine("CALIBRATION_COMMAND=$($Command.executable) $($Command.arguments -join ' ')")
+        $commandLine = "CALIBRATION_COMMAND=$($Command.executable) $($Command.arguments -join ' ')"
+        [Console]::Out.WriteLine($commandLine)
+        Write-Am1CalibrationTranscriptLine -Path $TranscriptPath -Line $commandLine
+        $interactiveCommand = $Command.PSObject.Copy()
+        $interactiveCommand | Add-Member -NotePropertyName "transcript_path" `
+            -NotePropertyValue $TranscriptPath -Force
         try {
-            & $CommandInvoker $Command $StagingLeaf ([ref]$launched) ([ref]$exitCode) | Out-Null
+            & $CommandInvoker $interactiveCommand $StagingLeaf ([ref]$launched) ([ref]$exitCode) | Out-Null
         }
         catch {
             $failureReason = $_.Exception.Message
-            if (
-                $_.Exception -is [System.OperationCanceledException] -or
-                $_.Exception -is [System.Management.Automation.PipelineStoppedException]
-            ) {
-                $interrupted = $true
-                $exitCode = 130
+            $currentException = $_.Exception
+            while ($null -ne $currentException) {
+                $failureReason = $currentException.Message
+                if ($currentException.Data.Contains("AM1_CHILD_CLEANUP_FAILURES")) {
+                    foreach ($failure in @($currentException.Data["AM1_CHILD_CLEANUP_FAILURES"])) {
+                        $cleanupFailures.Add([string]$failure)
+                    }
+                }
+                if (
+                    $currentException -is [System.OperationCanceledException] -or
+                    $currentException -is [System.Management.Automation.PipelineStoppedException]
+                ) {
+                    $interrupted = $true
+                    $exitCode = 130
+                }
+                $currentException = $currentException.InnerException
             }
         }
         if ($null -ne $exitCode) {
-            [Console]::Out.WriteLine("CALIBRATION_EXIT_CODE=$exitCode")
+            $exitLine = "CALIBRATION_EXIT_CODE=$exitCode"
+            [Console]::Out.WriteLine($exitLine)
+            Write-Am1CalibrationTranscriptLine -Path $TranscriptPath -Line $exitLine
         }
     }
     catch {
@@ -883,7 +999,7 @@ function Invoke-Am1NativeCalibration {
     finally {
         if ($transcriptStarted) {
             try {
-                & $StopTranscriptInvoker | Out-Null
+                & $StopTranscriptInvoker $TranscriptPath | Out-Null
                 $transcriptStopped = $true
             }
             catch {

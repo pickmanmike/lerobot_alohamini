@@ -6,6 +6,8 @@ import hashlib
 import json
 import shutil
 import subprocess
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -28,7 +30,12 @@ def ps_literal(value: Path | str) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
-def run_harness(tmp_path: Path, body: str) -> subprocess.CompletedProcess[str]:
+def run_harness(
+    tmp_path: Path,
+    body: str,
+    *,
+    timeout_s: float | None = None,
+) -> subprocess.CompletedProcess[str]:
     harness = tmp_path / "harness.ps1"
     harness.write_text(
         f". {ps_literal(SCRIPT_PATH)}\n{body}\n",
@@ -40,6 +47,7 @@ def run_harness(tmp_path: Path, body: str) -> subprocess.CompletedProcess[str]:
         text=True,
         capture_output=True,
         check=False,
+        timeout=timeout_s,
     )
 
 
@@ -48,6 +56,103 @@ def run_json_harness(tmp_path: Path, expression: str) -> subprocess.CompletedPro
         tmp_path,
         f"$result = {expression}\n[Console]::Out.WriteLine(($result | ConvertTo-Json -Depth 100 -Compress))",
     )
+
+
+def run_interactive_harness(
+    tmp_path: Path,
+    body: str,
+    *,
+    prompt_marker: str = "LC2_PROMPT>",
+    token: str = "LC2_TOKEN",
+    prompt_timeout_s: float = 5.0,
+) -> tuple[bool, subprocess.CompletedProcess[str]]:
+    """Run a harmless pwsh harness and withhold stdin until its prompt is visible."""
+
+    harness = tmp_path / "interactive-harness.ps1"
+    harness.write_text(
+        f". {ps_literal(SCRIPT_PATH)}\n{body}\n",
+        encoding="utf-8",
+    )
+    process = subprocess.Popen(
+        ["pwsh", "-NoLogo", "-NoProfile", "-File", str(harness)],
+        cwd=REPO_ROOT,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=0,
+    )
+    assert process.stdin is not None
+    assert process.stdout is not None
+
+    output = bytearray()
+    condition = threading.Condition()
+
+    def drain_stdout() -> None:
+        while chunk := process.stdout.read(1):
+            with condition:
+                output.extend(chunk)
+                condition.notify_all()
+        with condition:
+            condition.notify_all()
+
+    reader = threading.Thread(target=drain_stdout, daemon=True)
+    reader.start()
+    marker = prompt_marker.encode()
+    deadline = time.monotonic() + prompt_timeout_s
+    with condition:
+        while marker not in output and process.poll() is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            condition.wait(timeout=remaining)
+        prompt_visible_before_input = marker in output
+
+    process.stdin.write((token + "\r\n").encode())
+    process.stdin.flush()
+    process.stdin.close()
+    try:
+        returncode = process.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        returncode = process.wait(timeout=5)
+        pytest.fail("offline interactive child did not exit after receiving its token")
+    finally:
+        reader.join(timeout=5)
+        process.stdout.close()
+
+    return prompt_visible_before_input, subprocess.CompletedProcess(
+        process.args,
+        returncode,
+        stdout=output.decode(errors="replace"),
+        stderr="",
+    )
+
+
+def native_interactive_probe_body(tmp_path: Path, *, child_exit_code: int) -> tuple[str, Path]:
+    transcript = tmp_path / f"interactive-{child_exit_code}-transcript.txt"
+    child_code = (
+        "import os,sys; "
+        "path=os.environ.get('AM1_CALIBRATION_TRANSCRIPT_PATH'); "
+        "transcript=open(path,'a',encoding='utf-8',buffering=1) if path else None; "
+        "prompt='LC2_PROMPT>'; sys.stdout.write(prompt); sys.stdout.flush(); "
+        "transcript and (transcript.write(prompt),transcript.flush()); "
+        "token=sys.stdin.readline().rstrip('\\r\\n'); "
+        "after='LC2_ECHO='+token+'\\nLC2_AFTER_INPUT=VISIBLE\\n'; "
+        "sys.stdout.write(after); sys.stdout.flush(); "
+        "transcript and (transcript.write(after),transcript.flush(),transcript.close()); "
+        f"sys.exit({child_exit_code})"
+    )
+    body = f"""
+$command = [pscustomobject]@{{
+    executable = {ps_literal(REPO_ROOT / '.venv' / 'Scripts' / 'python.exe')}
+    arguments = @('-c', {ps_literal(child_code)})
+    working_directory = {ps_literal(REPO_ROOT)}
+}}
+$result = Invoke-Am1NativeCalibration -Command $command -StagingLeaf {ps_literal(tmp_path)} `
+    -TranscriptPath {ps_literal(transcript)}
+[Console]::Out.WriteLine('LC2_RESULT=' + ($result | ConvertTo-Json -Depth 20 -Compress))
+"""
+    return body, transcript
 
 
 def calibration_record(
@@ -1276,6 +1381,350 @@ catch {{ $reason = $_.Exception.Message }}
     assert report["reason"]
     assert report["launched"] is False
     assert report["exit_code"] is None
+
+
+@pytest.mark.parametrize("child_exit_code", [0, 41])
+def test_interactive_launcher_inherits_console_handles_and_captures_child_exit(
+    child_exit_code: int,
+    tmp_path: Path,
+) -> None:
+    body = f"""
+$observedStartInfo = $null
+$startCalls = 0
+$waiterCalls = 0
+$waiterReceivedProcess = $false
+$disposeCalls = 0
+$factory = {{
+    param($StartInfo)
+    $script:observedStartInfo = $StartInfo
+    $fake = [pscustomobject]@{{ ExitCode = {child_exit_code}; HasExited = $true }}
+    $fake | Add-Member -MemberType ScriptMethod -Name Start -Value {{
+        $script:startCalls += 1
+        [Console]::Out.Write('LC2_FACTORY_PROMPT>')
+        return $true
+    }}
+    $fake | Add-Member -MemberType ScriptMethod -Name Dispose -Value {{
+        $script:disposeCalls += 1
+    }}
+    $script:createdProcess = $fake
+    return $fake
+}}
+$waiter = {{
+    param($Process)
+    $script:waiterCalls += 1
+    $script:waiterReceivedProcess = [object]::ReferenceEquals($Process, $script:createdProcess)
+}}
+$command = [pscustomobject]@{{
+    executable = 'C:\\exact-repository-python.exe'
+    arguments = @('-c', 'offline-probe')
+    working_directory = {ps_literal(tmp_path)}
+}}
+$launched = $false
+$exitCode = $null
+Invoke-Am1InteractiveCalibrationCommand -Command $command -StagingLeaf {ps_literal(tmp_path)} `
+    -Launched ([ref]$launched) -ExitCode ([ref]$exitCode) -ProcessFactory $factory `
+    -ProcessWaiter $waiter
+[Console]::Out.WriteLine('')
+[Console]::Out.WriteLine(([ordered]@{{
+    launched = $launched
+    exit_code = $exitCode
+    start_calls = $startCalls
+    waiter_calls = $waiterCalls
+    waiter_received_process = $waiterReceivedProcess
+    dispose_calls = $disposeCalls
+    file_name = $observedStartInfo.FileName
+    working_directory = $observedStartInfo.WorkingDirectory
+    use_shell_execute = $observedStartInfo.UseShellExecute
+    redirect_stdin = $observedStartInfo.RedirectStandardInput
+    redirect_stdout = $observedStartInfo.RedirectStandardOutput
+    redirect_stderr = $observedStartInfo.RedirectStandardError
+    arguments = @($observedStartInfo.ArgumentList)
+}} | ConvertTo-Json -Compress))
+"""
+
+    result = run_harness(tmp_path, body)
+
+    assert result.returncode == 0, result.stderr
+    assert "LC2_FACTORY_PROMPT>" in result.stdout
+    report = json.loads(result.stdout.splitlines()[-1])
+    assert report == {
+        "launched": True,
+        "exit_code": child_exit_code,
+        "start_calls": 1,
+        "waiter_calls": 1,
+        "waiter_received_process": True,
+        "dispose_calls": 1,
+        "file_name": r"C:\exact-repository-python.exe",
+        "working_directory": str(tmp_path),
+        "use_shell_execute": False,
+        "redirect_stdin": False,
+        "redirect_stdout": False,
+        "redirect_stderr": False,
+        "arguments": ["-c", "offline-probe"],
+    }
+
+
+def test_interactive_launcher_interrupt_kills_child_and_native_result_is_nonzero(tmp_path: Path) -> None:
+    transcript = tmp_path / "interrupt-transcript.txt"
+    body = f"""
+$killCalls = 0
+$disposeCalls = 0
+$waiterCalls = 0
+$factory = {{
+    param($StartInfo)
+    $fake = [pscustomobject]@{{ ExitCode = $null; HasExited = $false }}
+    $fake | Add-Member -MemberType ScriptMethod -Name Start -Value {{ return $true }}
+    $fake | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value {{
+        param($Milliseconds)
+        if ($this.HasExited) {{ return $true }}
+        return $false
+    }}
+    $fake | Add-Member -MemberType ScriptMethod -Name Kill -Value {{
+        param($EntireProcessTree)
+        if (-not $EntireProcessTree) {{ throw 'expected process-tree kill' }}
+        $script:killCalls += 1
+        $this.HasExited = $true
+    }}
+    $fake | Add-Member -MemberType ScriptMethod -Name Dispose -Value {{
+        $script:disposeCalls += 1
+    }}
+    return $fake
+}}
+$waiter = {{
+    param($Process)
+    $script:waiterCalls += 1
+    throw [System.OperationCanceledException]::new('simulated cancellation-aware waiter stop')
+}}
+$commandInvoker = {{
+    param($Command, $StagingLeaf, [ref]$Launched, [ref]$ExitCode)
+    Invoke-Am1InteractiveCalibrationCommand -Command $Command -StagingLeaf $StagingLeaf `
+        -Launched $Launched -ExitCode $ExitCode -ProcessFactory $factory -ProcessWaiter $waiter
+}}
+$startTranscript = {{ param($Path) [System.IO.File]::WriteAllText($Path, 'started') }}
+$stopTranscript = {{ }}
+$command = [pscustomobject]@{{
+    executable = 'C:\\exact-repository-python.exe'
+    arguments = @('-c', 'offline-probe')
+    working_directory = {ps_literal(tmp_path)}
+}}
+$result = Invoke-Am1NativeCalibration -Command $command -StagingLeaf {ps_literal(tmp_path)} `
+    -TranscriptPath {ps_literal(transcript)} -StartTranscriptInvoker $startTranscript `
+    -CommandInvoker $commandInvoker -StopTranscriptInvoker $stopTranscript
+[Console]::Out.WriteLine(([ordered]@{{
+    result = $result
+    kill_calls = $killCalls
+    dispose_calls = $disposeCalls
+    waiter_calls = $waiterCalls
+}} | ConvertTo-Json -Depth 20 -Compress))
+"""
+
+    result = run_harness(tmp_path, body)
+
+    assert result.returncode == 0, result.stderr
+    report = json.loads(result.stdout.splitlines()[-1])
+    native = report["result"]
+    assert native["launched"] is True
+    assert native["interrupted"] is True, native
+    assert native["exit_code"] == 130
+    assert report["kill_calls"] == 1
+    assert report["dispose_calls"] == 1
+    assert report["waiter_calls"] == 1
+
+
+def test_real_powershell_pipeline_stop_terminates_the_interactive_child(tmp_path: Path) -> None:
+    child_pid_path = tmp_path / "child.pid"
+    child_code = (
+        "import os,pathlib,time; "
+        f"pathlib.Path({str(child_pid_path)!r}).write_text(str(os.getpid()),encoding='utf-8'); "
+        "time.sleep(300)"
+    )
+    body = f"""
+$runspaceScript = @'
+. {ps_literal(SCRIPT_PATH)}
+$command = [pscustomobject]@{{
+    executable = {ps_literal(REPO_ROOT / '.venv' / 'Scripts' / 'python.exe')}
+    arguments = @('-c', {ps_literal(child_code)})
+    working_directory = {ps_literal(REPO_ROOT)}
+}}
+$launched = $false
+$exitCode = $null
+Invoke-Am1InteractiveCalibrationCommand -Command $command -StagingLeaf 'unused' `
+    -Launched ([ref]$launched) -ExitCode ([ref]$exitCode)
+'@
+$pipeline = [powershell]::Create()
+$null = $pipeline.AddScript($runspaceScript)
+$async = $pipeline.BeginInvoke()
+$deadline = [DateTime]::UtcNow.AddSeconds(8)
+while (-not (Test-Path -LiteralPath {ps_literal(child_pid_path)})) {{
+    if ([DateTime]::UtcNow -ge $deadline) {{
+        $pipeline.Stop()
+        $pipeline.Dispose()
+        throw 'offline cancellation child did not start'
+    }}
+    [System.Threading.Thread]::Sleep(25)
+}}
+$childPid = [int][System.IO.File]::ReadAllText({ps_literal(child_pid_path)})
+$stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+$pipeline.Stop()
+$stopwatch.Stop()
+try {{ $pipeline.EndInvoke($async) | Out-Null }} catch {{ }}
+$childAlive = $true
+$exitDeadline = [DateTime]::UtcNow.AddSeconds(3)
+while ($childAlive -and [DateTime]::UtcNow -lt $exitDeadline) {{
+    try {{ $null = [System.Diagnostics.Process]::GetProcessById($childPid) }}
+    catch {{ $childAlive = $false }}
+    if ($childAlive) {{ [System.Threading.Thread]::Sleep(25) }}
+}}
+$pipeline.Dispose()
+if ($childAlive) {{
+    try {{ [System.Diagnostics.Process]::GetProcessById($childPid).Kill($true) }} catch {{ }}
+}}
+[Console]::Out.WriteLine(([ordered]@{{
+    child_alive = $childAlive
+    stop_elapsed_ms = $stopwatch.ElapsedMilliseconds
+}} | ConvertTo-Json -Compress))
+"""
+
+    try:
+        result = run_harness(tmp_path, body, timeout_s=15)
+    except subprocess.TimeoutExpired:
+        if child_pid_path.is_file():
+            child_pid = child_pid_path.read_text(encoding="utf-8")
+            subprocess.run(
+                ["taskkill", "/PID", child_pid, "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        pytest.fail("PowerShell pipeline cancellation did not finish within 15 seconds")
+
+    assert result.returncode == 0, result.stderr
+    report = json.loads(result.stdout.splitlines()[-1])
+    assert report["child_alive"] is False
+    assert report["stop_elapsed_ms"] < 5000
+
+
+def test_interactive_launcher_rethrows_the_original_launch_exception(tmp_path: Path) -> None:
+    body = f"""
+$expected = [System.OperationCanceledException]::new('exact launch interruption')
+$factory = {{ param($StartInfo) throw $expected }}
+$command = [pscustomobject]@{{
+    executable = 'C:\\exact-repository-python.exe'
+    arguments = @('-c', 'offline-probe')
+    working_directory = {ps_literal(tmp_path)}
+}}
+$launched = $false
+$exitCode = $null
+$observed = $null
+try {{
+    Invoke-Am1InteractiveCalibrationCommand -Command $command -StagingLeaf {ps_literal(tmp_path)} `
+        -Launched ([ref]$launched) -ExitCode ([ref]$exitCode) -ProcessFactory $factory
+}}
+catch {{
+    $observed = $_.Exception
+}}
+[Console]::Out.WriteLine(([ordered]@{{
+    same_reference = [object]::ReferenceEquals($expected, $observed)
+    type = $observed.GetType().FullName
+    message = $observed.Message
+    launched = $launched
+    exit_code = $exitCode
+}} | ConvertTo-Json -Compress))
+"""
+
+    result = run_harness(tmp_path, body)
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout.splitlines()[-1]) == {
+        "same_reference": True,
+        "type": "System.OperationCanceledException",
+        "message": "exact launch interruption",
+        "launched": False,
+        "exit_code": None,
+    }
+
+
+def test_native_child_round_trip_captures_zero_exit_and_transcript(
+    tmp_path: Path,
+) -> None:
+    body, transcript = native_interactive_probe_body(tmp_path, child_exit_code=0)
+
+    prompt_visible, result = run_interactive_harness(tmp_path, body)
+
+    assert prompt_visible, result.stdout
+    assert result.returncode == 0, result.stdout
+    assert "LC2_PROMPT>" in result.stdout
+    assert "LC2_ECHO=LC2_TOKEN" in result.stdout
+    assert "LC2_AFTER_INPUT=VISIBLE" in result.stdout
+    report = json.loads(
+        next(line.removeprefix("LC2_RESULT=") for line in result.stdout.splitlines() if line.startswith("LC2_RESULT="))
+    )
+    assert report["launched"] is True
+    assert report["exit_code"] == 0
+    assert report["interrupted"] is False
+    assert report["failure_reason"] is None
+    assert report["transcript_started"] is True
+    assert report["transcript_stopped"] is True
+    assert report["cleanup_failures"] == []
+    transcript_text = transcript.read_text(encoding="utf-8")
+    assert "LC2_ECHO=LC2_TOKEN" in transcript_text
+    assert "LC2_AFTER_INPUT=VISIBLE" in transcript_text
+
+
+def test_native_child_round_trip_preserves_nonzero_exit_and_transcript(tmp_path: Path) -> None:
+    body, transcript = native_interactive_probe_body(tmp_path, child_exit_code=41)
+
+    prompt_visible, result = run_interactive_harness(tmp_path, body)
+
+    assert prompt_visible, result.stdout
+    assert result.returncode == 0, result.stdout
+    assert "LC2_ECHO=LC2_TOKEN" in result.stdout
+    assert "LC2_AFTER_INPUT=VISIBLE" in result.stdout
+    report = json.loads(
+        next(line.removeprefix("LC2_RESULT=") for line in result.stdout.splitlines() if line.startswith("LC2_RESULT="))
+    )
+    assert report["launched"] is True
+    assert report["exit_code"] == 41
+    assert report["transcript_started"] is True
+    assert report["transcript_stopped"] is True
+    transcript_text = transcript.read_text(encoding="utf-8")
+    assert "LC2_ECHO=LC2_TOKEN" in transcript_text
+    assert "LC2_AFTER_INPUT=VISIBLE" in transcript_text
+
+
+def test_successful_native_exit_with_transcript_stop_failure_never_promotes(tmp_path: Path) -> None:
+    fixture = prepare_attempt_fixture(tmp_path)
+    active = fixture["active"]
+    assert isinstance(active, Path)
+    before = tree_bytes(active)
+    native_body = native_write_body(left=make_calibration(40), right=make_calibration(50))
+
+    result, report = run_attempt_harness(
+        tmp_path,
+        fixture,
+        native_body=native_body,
+        stop_body=(
+            "$events.Add('transcript:stop') | Out-Null; "
+            "throw 'simulated successful-child transcript stop failure'"
+        ),
+        include_promotion_seams=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert report is not None
+    outcome = report["outcome"]
+    assert outcome["success"] is False
+    assert outcome["launched"] is True
+    assert outcome["exit_code"] == 0
+    assert outcome["primary_reason"] == (
+        "Transcript stop failed: simulated successful-child transcript stop failure"
+    )
+    assert tree_bytes(active) == before
+    assert report["move_calls"] == []
+    assert report["remove_calls"] == []
+    assert not list(active.parent.glob(".am1-candidate-*"))
+    assert not list(active.parent.glob(".am1-withdrawn-*"))
+    assert "CALIBRATION_RESULT=PASS" not in result.stdout
 
 
 @pytest.mark.parametrize(("launched", "exit_code", "reason"), [(False, 0, "launch"), (True, 42, "exit")])
