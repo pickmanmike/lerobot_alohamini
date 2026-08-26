@@ -959,6 +959,30 @@ def test_successful_candidate_promotion_preserves_unrelated_files_and_reports_ev
     assert "CALIBRATION_RESULT=FAIL" not in result.stdout
 
 
+def test_fail_closed_recovery_command_quotes_apostrophe_in_withdrawal_path(tmp_path: Path) -> None:
+    apostrophe_root = tmp_path / "operator's-calibration-root"
+    fixture = prepare_attempt_fixture(apostrophe_root)
+    native_body = native_write_body(left=make_calibration(40), right=make_calibration(50))
+
+    result, report = run_attempt_harness(
+        apostrophe_root,
+        fixture,
+        native_body=native_body,
+        include_promotion_seams=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert report is not None
+    withdrawal_path = report["outcome"]["withdrawal_path"]
+    assert isinstance(withdrawal_path, str)
+    quoted_withdrawal = withdrawal_path.replace("'", "''")
+    expected = (
+        "FAIL_CLOSED_RECOVERY=Rename-Item "
+        f"-LiteralPath '{quoted_withdrawal}' -NewName 'so_leader'"
+    )
+    assert expected in result.stdout
+
+
 def test_concurrent_active_change_refuses_before_first_rename(tmp_path: Path) -> None:
     fixture = prepare_attempt_fixture(tmp_path)
     active = fixture["active"]

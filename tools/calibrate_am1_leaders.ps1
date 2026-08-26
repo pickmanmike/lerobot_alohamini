@@ -658,8 +658,9 @@ function Invoke-Am1DirectoryPromotion {
     [Console]::Out.WriteLine("CANDIDATE_DIRECTORY=$CandidatePath")
     [Console]::Out.WriteLine("WITHDRAWAL_DIRECTORY=$WithdrawalPath")
     [Console]::Out.WriteLine("PAIR_BACKUP=$($BackupFacts.backup_directory)")
+    $quotedWithdrawalPath = $WithdrawalPath.Replace("'", "''")
     [Console]::Out.WriteLine(
-        "FAIL_CLOSED_RECOVERY=Rename-Item -LiteralPath '$WithdrawalPath' -NewName 'so_leader'"
+        "FAIL_CLOSED_RECOVERY=Rename-Item -LiteralPath '$quotedWithdrawalPath' -NewName 'so_leader'"
     )
 
     try {
