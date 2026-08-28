@@ -24,7 +24,7 @@ import cv2
 import zmq
 
 from .alohamini import AlohaMini
-from .config_alohamini import AlohaMiniConfig, AlohaMiniHostConfig
+from .config_alohamini import AM1_TRACE_JOINTS, AlohaMiniConfig, AlohaMiniHostConfig
 
 
 class AlohaMiniHost:
@@ -161,6 +161,15 @@ def make_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--trace_am1_joint",
+        choices=tuple(AM1_TRACE_JOINTS),
+        default=None,
+        help=(
+            "Emit a default-off, AM1-only action-boundary trace for the selected reviewed "
+            "follower joint (requires followers)."
+        ),
+    )
+    parser.add_argument(
         "--max_loop_freq_hz",
         type=positive_int,
         default=30,
@@ -188,6 +197,7 @@ def make_robot_config(args: argparse.Namespace) -> AlohaMiniConfig:
         no_follower=args.no_follower,
         max_relative_target=args.max_relative_target,
         trace_am1_left_elbow=args.trace_am1_left_elbow,
+        trace_am1_joint=args.trace_am1_joint,
     )
     if args.no_cameras:
         config.cameras = {}
@@ -203,24 +213,42 @@ def connect_robot(robot: AlohaMini, *, skip_lift_home: bool) -> None:
 
 
 def validate_trace_args(args: argparse.Namespace) -> None:
-    if not args.trace_am1_left_elbow:
+    selected_motor = getattr(args, "trace_am1_joint", None)
+    legacy_left_elbow = getattr(args, "trace_am1_left_elbow", False)
+    if selected_motor and selected_motor not in AM1_TRACE_JOINTS:
+        raise ValueError(f"--trace_am1_joint is not approved for {selected_motor!r}.")
+    if selected_motor and legacy_left_elbow:
+        raise ValueError("--trace_am1_joint cannot be combined with --trace_am1_left_elbow.")
+    if not selected_motor and not legacy_left_elbow:
         return
     if args.robot_model != "alohamini1":
-        raise ValueError("--trace_am1_left_elbow is supported only with --robot_model alohamini1.")
+        option = "--trace_am1_joint" if selected_motor else "--trace_am1_left_elbow"
+        raise ValueError(f"{option} is supported only with --robot_model alohamini1.")
     if args.no_follower:
-        raise ValueError("--trace_am1_left_elbow requires follower arms; omit --no_follower.")
+        option = "--trace_am1_joint" if selected_motor else "--trace_am1_left_elbow"
+        raise ValueError(f"{option} requires follower arms; omit --no_follower.")
 
 
 def print_trace_startup_summary(args: argparse.Namespace) -> None:
+    selected_motor = getattr(args, "trace_am1_joint", None)
+    if selected_motor:
+        identity = AM1_TRACE_JOINTS[selected_motor]
+        record = {
+            "event": "am1_joint_trace_startup",
+            "timestamp_ns": time.time_ns(),
+            "effective_max_relative_target": args.max_relative_target,
+            "motor": selected_motor,
+            **identity,
+        }
+    else:
+        record = {
+            "event": "am1_left_elbow_trace_startup",
+            "timestamp_ns": time.time_ns(),
+            "effective_max_relative_target": args.max_relative_target,
+            "motor": "arm_left_elbow_flex",
+        }
     print(
-        json.dumps(
-            {
-                "event": "am1_left_elbow_trace_startup",
-                "timestamp_ns": time.time_ns(),
-                "effective_max_relative_target": args.max_relative_target,
-                "motor": "arm_left_elbow_flex",
-            }
-        ),
+        json.dumps(record),
         flush=True,
     )
 
@@ -231,7 +259,7 @@ def main():
 
     logging.info("Configuring AlohaMini")
     robot_config = make_robot_config(args)
-    if args.trace_am1_left_elbow:
+    if args.trace_am1_left_elbow or args.trace_am1_joint:
         print_trace_startup_summary(args)
     if args.no_follower:
         logging.info("no_follower mode: follower arms will not connect, only base and lift operate.")

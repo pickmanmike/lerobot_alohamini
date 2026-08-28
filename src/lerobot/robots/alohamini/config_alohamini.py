@@ -20,6 +20,12 @@ from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
 from ..config import RobotConfig
 
 
+AM1_TRACE_JOINTS = {
+    "arm_left_elbow_flex": {"motor_id": 3, "side": "left"},
+    "arm_right_shoulder_lift": {"motor_id": 2, "side": "right"},
+}
+
+
 def alohamini_cameras_config() -> dict[str, CameraConfig]:
     return {
         "forward": OpenCVCameraConfig(
@@ -60,6 +66,9 @@ class AlohaMiniConfig(RobotConfig):
 
     # Default-off, AM1-only host diagnostic for the left elbow action boundary.
     trace_am1_left_elbow: bool = False
+
+    # Default-off, AM1-only selector for a reviewed follower-joint action-boundary trace.
+    trace_am1_joint: str | None = None
 
     cameras: dict[str, CameraConfig] = field(default_factory=alohamini_cameras_config)
 

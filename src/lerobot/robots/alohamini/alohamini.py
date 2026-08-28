@@ -32,7 +32,7 @@ from lerobot.utils.decorators import check_if_already_connected, check_if_not_co
 
 from ..robot import Robot
 from ..utils import ensure_safe_goal_position
-from .config_alohamini import AlohaMiniConfig
+from .config_alohamini import AM1_TRACE_JOINTS, AlohaMiniConfig
 from .lift_axis import LiftAxis, LiftAxisConfig, LiftHomeResult
 from .model_specs import arm_state_keys_for_robot_model, validate_robot_model
 from .motor_safety import REGISTER_RETRIES, set_torque_enabled, write_register
@@ -831,6 +831,32 @@ class AlohaMini(Robot):
         )
         trace_requested_target = float(left_pos[trace_key]) if trace_enabled else None
         trace_relative_present = None
+        selected_trace_motor = getattr(self.config, "trace_am1_joint", None)
+        selected_trace_identity = AM1_TRACE_JOINTS.get(selected_trace_motor)
+        selected_trace_side = (
+            selected_trace_identity["side"] if selected_trace_identity is not None else None
+        )
+        selected_trace_key = f"{selected_trace_motor}.pos" if selected_trace_identity else None
+        if selected_trace_side == "left":
+            selected_trace_pos = left_pos
+            selected_trace_bus = self.left_bus
+        elif selected_trace_side == "right":
+            selected_trace_pos = right_pos
+            selected_trace_bus = self.right_bus
+        else:
+            selected_trace_pos = {}
+            selected_trace_bus = None
+        selected_trace_enabled = (
+            self.config.robot_model == "alohamini1"
+            and not getattr(self.config, "trace_am1_left_elbow", False)
+            and selected_trace_motor is not None
+            and selected_trace_bus is not None
+            and selected_trace_key in selected_trace_pos
+        )
+        selected_trace_requested_target = (
+            selected_trace_pos[selected_trace_key] if selected_trace_enabled else None
+        )
+        selected_trace_relative_present = None
 
         base_wheel_goal_vel = self._body_to_wheel_raw(
             base_goal_vel["x.vel"], base_goal_vel["y.vel"], base_goal_vel["theta.vel"]
@@ -852,15 +878,23 @@ class AlohaMini(Robot):
             present_left = self.left_bus.sync_read("Present_Position", self.left_arm_motors)  # left_arm_*
             if trace_enabled:
                 trace_relative_present = float(present_left["arm_left_elbow_flex"])
+            if selected_trace_enabled and selected_trace_side == "left":
+                selected_trace_relative_present = present_left[selected_trace_motor]
             gp_left = {k: (v, present_left[k.replace(".pos", "")]) for k, v in left_pos.items()}
             left_pos = ensure_safe_goal_position(gp_left, self.config.max_relative_target)
 
         if self.right_bus and right_pos and self.config.max_relative_target is not None:
             present_right = self.right_bus.sync_read("Present_Position", self.right_arm_motors)
+            if selected_trace_enabled and selected_trace_side == "right":
+                selected_trace_relative_present = present_right[selected_trace_motor]
             gp_right = {k: (v, present_right[k.replace(".pos", "")]) for k, v in right_pos.items()}
             right_pos = ensure_safe_goal_position(gp_right, self.config.max_relative_target)
         relative_limit_done_t = time.perf_counter()
         trace_relative_target = float(left_pos[trace_key]) if trace_enabled else None
+        selected_trace_pos = left_pos if selected_trace_side == "left" else right_pos
+        selected_trace_relative_target = (
+            selected_trace_pos[selected_trace_key] if selected_trace_enabled else None
+        )
 
         left_pos = self._limit_gripper_goal_by_current(self.left_bus, left_pos)
         left_gripper_limit_done_t = time.perf_counter()
@@ -873,6 +907,10 @@ class AlohaMini(Robot):
             right_pos = self._limit_joint_goal_by_current(self.right_bus, right_pos)
         right_joint_limit_done_t = time.perf_counter()
         trace_final_left_target = float(left_pos[trace_key]) if trace_enabled else None
+        selected_trace_pos = left_pos if selected_trace_side == "left" else right_pos
+        selected_trace_final_target = (
+            selected_trace_pos[selected_trace_key] if selected_trace_enabled else None
+        )
 
         # Send goal position to the actuators
         # arm_goal_pos_raw = {k.replace(".pos", ""): v for k, v in arm_goal_pos.items()}
@@ -887,6 +925,17 @@ class AlohaMini(Robot):
             try:
                 self.left_bus.sync_write("Goal_Position", {k.replace(".pos", ""): v for k, v in left_pos.items()})
             except Exception as error:
+                if selected_trace_enabled:
+                    self._record_am1_joint_action_write_failure(
+                        side=selected_trace_side,
+                        motor=selected_trace_motor,
+                        failure_stage="left_goal_position",
+                        error=error,
+                        requested_normalized_target=selected_trace_requested_target,
+                        relative_limiter_present_normalized=selected_trace_relative_present,
+                        relative_limiter_target_normalized=selected_trace_relative_target,
+                        final_bus_target_normalized=selected_trace_final_target,
+                    )
                 if trace_enabled:
                     self._record_am1_left_elbow_trace(
                         requested_normalized_target=trace_requested_target,
@@ -907,6 +956,17 @@ class AlohaMini(Robot):
             try:
                 self.right_bus.sync_write("Goal_Position", {k.replace(".pos", ""): v for k, v in right_pos.items()})
             except Exception as error:
+                if selected_trace_enabled:
+                    self._record_am1_joint_action_write_failure(
+                        side=selected_trace_side,
+                        motor=selected_trace_motor,
+                        failure_stage="right_goal_position",
+                        error=error,
+                        requested_normalized_target=selected_trace_requested_target,
+                        relative_limiter_present_normalized=selected_trace_relative_present,
+                        relative_limiter_target_normalized=selected_trace_relative_target,
+                        final_bus_target_normalized=selected_trace_final_target,
+                    )
                 if trace_enabled:
                     self._record_am1_left_elbow_trace(
                         requested_normalized_target=trace_requested_target,
@@ -939,6 +999,17 @@ class AlohaMini(Robot):
         try:
             self.left_bus.sync_write("Goal_Velocity", base_wheel_goal_vel)
         except Exception as error:
+            if selected_trace_enabled:
+                self._record_am1_joint_action_write_failure(
+                    side=selected_trace_side,
+                    motor=selected_trace_motor,
+                    failure_stage="base_goal_velocity",
+                    error=error,
+                    requested_normalized_target=selected_trace_requested_target,
+                    relative_limiter_present_normalized=selected_trace_relative_present,
+                    relative_limiter_target_normalized=selected_trace_relative_target,
+                    final_bus_target_normalized=selected_trace_final_target,
+                )
             if trace_enabled:
                 self._record_am1_left_elbow_trace(
                     requested_normalized_target=trace_requested_target,
@@ -990,6 +1061,38 @@ class AlohaMini(Robot):
                 )
             else:
                 self._record_am1_left_elbow_trace(**trace_evidence, readbacks=readbacks)
+
+        if selected_trace_enabled:
+            selected_trace_evidence = {
+                "requested_normalized_target": selected_trace_requested_target,
+                "relative_limiter_present_normalized": selected_trace_relative_present,
+                "relative_limiter_target_normalized": selected_trace_relative_target,
+                "final_bus_target_normalized": selected_trace_final_target,
+                "goal_position_sync_write": {
+                    "attempted": True,
+                    "sdk_transmit": "completed",
+                    "servo_acknowledgement": "sync-write supplies no servo acknowledgement",
+                },
+            }
+            try:
+                readbacks = self._read_am1_joint_trace_registers(
+                    side=selected_trace_side,
+                    motor=selected_trace_motor,
+                )
+            except Exception as error:
+                self._record_am1_joint_trace(
+                    side=selected_trace_side,
+                    motor=selected_trace_motor,
+                    **selected_trace_evidence,
+                    diagnostic_reads={"error": self._describe_am1_left_elbow_trace_error(error)},
+                )
+            else:
+                self._record_am1_joint_trace(
+                    side=selected_trace_side,
+                    motor=selected_trace_motor,
+                    **selected_trace_evidence,
+                    readbacks=readbacks,
+                )
 
         self.logs["action_timing_ms"] = {
             "action_prepare": (prepare_done_t - action_start_t) * 1e3,
@@ -1045,6 +1148,143 @@ class AlohaMini(Robot):
         def read(register: str, *, normalize: bool) -> float | str:
             try:
                 return self.left_bus.read(register, motor, normalize=normalize)
+            except Exception as error:
+                return self._describe_am1_left_elbow_trace_error(error)
+
+        goal = read("Goal_Position", normalize=True)
+        position = read("Present_Position", normalize=False)
+        current = read("Present_Current", normalize=False)
+        torque = read("Torque_Enable", normalize=False)
+        lock = read("Lock", normalize=False)
+        operating_mode = read("Operating_Mode", normalize=False)
+        return {
+            "Goal_Position": {"normalized": goal},
+            "Present_Position": {"raw": position},
+            "Present_Current": {
+                "raw": current,
+                "ma": float(current) * 6.5 if not isinstance(current, str) else current,
+            },
+            "Torque_Enable": {"raw": torque},
+            "Lock": {"raw": lock},
+            "Operating_Mode": {"raw": operating_mode},
+        }
+
+    def _emit_am1_joint_trace(self, *, side: str, motor: str, **evidence) -> None:
+        bus = self.left_bus if side == "left" else self.right_bus
+        motor_id = getattr(bus.motors[motor], "id", None)
+        print(
+            json.dumps(
+                {
+                    "event": "am1_joint_action_boundary",
+                    "timestamp_ns": time.time_ns(),
+                    "motor": motor,
+                    "motor_id": motor_id,
+                    "side": side,
+                    **evidence,
+                }
+            ),
+            flush=True,
+        )
+
+    def _record_am1_joint_trace(self, *, side: str, motor: str, **evidence) -> None:
+        """Emit an opt-in selected-joint trace without changing action success."""
+        try:
+            self._emit_am1_joint_trace(side=side, motor=motor, **evidence)
+        except Exception:
+            try:
+                logger.warning("Failed to emit AM1 selected-joint trace.", exc_info=True)
+            except Exception:
+                pass
+
+    def _record_am1_joint_action_write_failure(
+        self,
+        *,
+        side: str,
+        motor: str,
+        failure_stage: str,
+        error: Exception,
+        requested_normalized_target: float,
+        relative_limiter_present_normalized: float | None,
+        relative_limiter_target_normalized: float,
+        final_bus_target_normalized: float,
+    ) -> None:
+        """Report selected-joint write progress without replacing the write error."""
+        try:
+            stage_order = {
+                "left_goal_position": 0,
+                "right_goal_position": 1,
+                "base_goal_velocity": 2,
+            }
+            selected_stage = f"{side}_goal_position"
+            failure_index = stage_order[failure_stage]
+            selected_index = stage_order[selected_stage]
+            error_description = self._describe_am1_left_elbow_trace_error(error)
+            failure_description = {
+                "left_goal_position": "left Goal_Position sync write failed",
+                "right_goal_position": "right Goal_Position sync write failed",
+                "base_goal_velocity": "body Goal_Velocity sync write failed",
+            }[failure_stage]
+            if failure_index < selected_index:
+                selected_write = {
+                    "attempted": False,
+                    "sdk_transmit": "not attempted",
+                    "status": f"not attempted because {failure_description}",
+                    "servo_acknowledgement": "sync-write supplies no servo acknowledgement",
+                }
+            elif failure_index == selected_index:
+                selected_write = {
+                    "attempted": True,
+                    "sdk_transmit": "failed",
+                    "error": error_description,
+                    "servo_acknowledgement": "sync-write supplies no servo acknowledgement",
+                }
+            else:
+                selected_write = {
+                    "attempted": True,
+                    "sdk_transmit": "completed",
+                    "servo_acknowledgement": "sync-write supplies no servo acknowledgement",
+                }
+
+            if failure_stage == "base_goal_velocity":
+                body_write = {
+                    "attempted": True,
+                    "sdk_transmit": "failed",
+                    "error": error_description,
+                }
+            else:
+                body_write = {
+                    "attempted": False,
+                    "status": f"not attempted because {failure_description}",
+                }
+
+            self._record_am1_joint_trace(
+                side=side,
+                motor=motor,
+                requested_normalized_target=requested_normalized_target,
+                relative_limiter_present_normalized=relative_limiter_present_normalized,
+                relative_limiter_target_normalized=relative_limiter_target_normalized,
+                final_bus_target_normalized=final_bus_target_normalized,
+                goal_position_sync_write=selected_write,
+                action_write_failure={"stage": failure_stage},
+                body_goal_velocity_sync_write=body_write,
+                readbacks={
+                    "status": "not attempted before successful body Goal_Velocity sync write"
+                },
+            )
+        except Exception:
+            try:
+                logger.warning("Failed to record AM1 selected-joint write failure.", exc_info=True)
+            except Exception:
+                pass
+
+    def _read_am1_joint_trace_registers(
+        self, *, side: str, motor: str
+    ) -> dict[str, dict[str, float | str]]:
+        bus = self.left_bus if side == "left" else self.right_bus
+
+        def read(register: str, *, normalize: bool) -> float | str:
+            try:
+                return bus.read(register, motor, normalize=normalize)
             except Exception as error:
                 return self._describe_am1_left_elbow_trace_error(error)
 

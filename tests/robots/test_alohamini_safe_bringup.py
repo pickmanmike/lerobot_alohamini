@@ -218,6 +218,23 @@ def bimanual_elbow_action() -> dict[str, float]:
     return {**elbow_action(), "arm_right_elbow_flex.pos": 20.0}
 
 
+def attach_right_shoulder_bus(robot: AlohaMini, events: list[tuple]) -> FakeBus:
+    right = FakeBus("right", ("arm_right_shoulder_lift",), events)
+    right.motors["arm_right_shoulder_lift"] = SimpleNamespace(id=2)
+    right.registers[("Present_Position", "arm_right_shoulder_lift")] = 10
+    right.registers[("Present_Current", "arm_right_shoulder_lift")] = 10
+    robot.right_bus = right
+    robot.right_arm_motors = ["arm_right_shoulder_lift"]
+    return right
+
+
+def right_shoulder_action(target: float = 20.0) -> dict[str, float]:
+    return {
+        **elbow_action(target=10.0),
+        "arm_right_shoulder_lift.pos": target,
+    }
+
+
 def trace_records(captured: str) -> list[dict]:
     return [json.loads(line) for line in captured.splitlines() if line.startswith("{")]
 
@@ -444,6 +461,81 @@ def test_trace_flag_is_host_only_and_defaults_off():
     assert make_host_robot_config(trace_args).trace_am1_left_elbow is True
 
 
+def test_selected_trace_flag_defaults_off_and_propagates_right_shoulder():
+    parser = make_host_parser()
+
+    args = parser.parse_args(["--robot_model", "alohamini1", "--no_cameras"])
+    selected_args = parser.parse_args(
+        [
+            "--robot_model",
+            "alohamini1",
+            "--no_cameras",
+            "--trace_am1_joint",
+            "arm_right_shoulder_lift",
+        ]
+    )
+
+    assert args.trace_am1_joint is None
+    assert make_host_robot_config(args).trace_am1_joint is None
+    assert selected_args.trace_am1_joint == "arm_right_shoulder_lift"
+    assert make_host_robot_config(selected_args).trace_am1_joint == "arm_right_shoulder_lift"
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        SimpleNamespace(
+            trace_am1_left_elbow=False,
+            trace_am1_joint="arm_right_shoulder_lift",
+            robot_model="alohamini2",
+            no_follower=False,
+        ),
+        SimpleNamespace(
+            trace_am1_left_elbow=False,
+            trace_am1_joint="arm_right_shoulder_lift",
+            robot_model="alohamini1",
+            no_follower=True,
+        ),
+        SimpleNamespace(
+            trace_am1_left_elbow=True,
+            trace_am1_joint="arm_right_shoulder_lift",
+            robot_model="alohamini1",
+            no_follower=False,
+        ),
+        SimpleNamespace(
+            trace_am1_left_elbow=False,
+            trace_am1_joint="arm_right_elbow_flex",
+            robot_model="alohamini1",
+            no_follower=False,
+        ),
+    ],
+)
+def test_selected_trace_rejects_unsafe_or_ambiguous_host_modes(args):
+    with pytest.raises(ValueError, match="trace_am1_joint"):
+        host_module.validate_trace_args(args)
+
+
+def test_selected_trace_startup_summary_identifies_right_shoulder_id2(capsys):
+    host_module.print_trace_startup_summary(
+        SimpleNamespace(
+            max_relative_target=10.0,
+            trace_am1_left_elbow=False,
+            trace_am1_joint="arm_right_shoulder_lift",
+        )
+    )
+
+    record = trace_records(capsys.readouterr().out)[-1]
+    assert record == {
+        "event": "am1_joint_trace_startup",
+        "timestamp_ns": record["timestamp_ns"],
+        "effective_max_relative_target": 10.0,
+        "motor": "arm_right_shoulder_lift",
+        "motor_id": 2,
+        "side": "right",
+    }
+    assert record["timestamp_ns"] > 0
+
+
 @pytest.mark.parametrize(
     "args",
     [
@@ -572,6 +664,259 @@ def test_trace_records_the_actual_am1_left_elbow_action_boundary(capsys):
     )
     first_diagnostic_read = next(index for index, event in enumerate(events) if event[1] == "read")
     assert left_write < body_zero < first_diagnostic_read
+    assert all("Phase" not in event for event in events)
+
+
+def test_selected_trace_records_the_actual_am1_right_shoulder_action_boundary(capsys):
+    robot, left, events = make_action_robot(trace_am1_left_elbow=False)
+    right = attach_right_shoulder_bus(robot, events)
+    robot.config.trace_am1_joint = "arm_right_shoulder_lift"
+
+    sent = robot.send_action(right_shoulder_action())
+
+    record = trace_records(capsys.readouterr().out)[-1]
+    assert sent["arm_right_shoulder_lift.pos"] == 14.0
+    assert record == {
+        "event": "am1_joint_action_boundary",
+        "timestamp_ns": record["timestamp_ns"],
+        "motor": "arm_right_shoulder_lift",
+        "motor_id": 2,
+        "side": "right",
+        "requested_normalized_target": 20.0,
+        "relative_limiter_present_normalized": 10.0,
+        "relative_limiter_target_normalized": 14.0,
+        "final_bus_target_normalized": 14.0,
+        "goal_position_sync_write": {
+            "attempted": True,
+            "sdk_transmit": "completed",
+            "servo_acknowledgement": "sync-write supplies no servo acknowledgement",
+        },
+        "readbacks": {
+            "Goal_Position": {"normalized": 14.0},
+            "Present_Position": {"raw": 10},
+            "Present_Current": {"raw": 10, "ma": 65.0},
+            "Torque_Enable": {"raw": 0},
+            "Lock": {"raw": 0},
+            "Operating_Mode": {"raw": 0},
+        },
+    }
+    assert record["timestamp_ns"] > 0
+    assert left.read_calls == []
+    assert right.read_calls == [
+        ("Goal_Position", "arm_right_shoulder_lift", True),
+        ("Present_Position", "arm_right_shoulder_lift", False),
+        ("Present_Current", "arm_right_shoulder_lift", False),
+        ("Torque_Enable", "arm_right_shoulder_lift", False),
+        ("Lock", "arm_right_shoulder_lift", False),
+        ("Operating_Mode", "arm_right_shoulder_lift", False),
+    ]
+    right_write = event_index(
+        events,
+        ("right", "sync_write", "Goal_Position", {"arm_right_shoulder_lift": 14.0}, True),
+    )
+    body_zero = event_index(
+        events,
+        (
+            "left",
+            "sync_write",
+            "Goal_Velocity",
+            {"base_left_wheel": 0, "base_back_wheel": 0, "base_right_wheel": 0},
+            True,
+        ),
+    )
+    first_diagnostic_read = next(index for index, event in enumerate(events) if event[1] == "read")
+    assert right_write < body_zero < first_diagnostic_read
+    assert all("Phase" not in event for event in events)
+
+
+def test_selected_trace_numeric_capture_cannot_abort_an_action():
+    class TraceHostileFloat(float):
+        def __float__(self):
+            raise ValueError("trace-only conversion must not run")
+
+    robot, _, events = make_action_robot(trace_am1_left_elbow=False)
+    attach_right_shoulder_bus(robot, events)
+    robot.config.trace_am1_joint = "arm_right_shoulder_lift"
+
+    sent = robot.send_action(right_shoulder_action(target=TraceHostileFloat(20.0)))
+
+    assert sent["arm_right_shoulder_lift.pos"] == 14.0
+    assert any(event[1:3] == ("sync_write", "Goal_Position") for event in events)
+    assert any(event[1:3] == ("sync_write", "Goal_Velocity") for event in events)
+
+
+def test_selected_trace_final_target_is_after_the_current_limiter(capsys):
+    robot, _, events = make_action_robot(trace_am1_left_elbow=False)
+    right = attach_right_shoulder_bus(robot, events)
+    right.registers[("Present_Current", "arm_right_shoulder_lift")] = 300
+    robot.config.trace_am1_joint = "arm_right_shoulder_lift"
+
+    sent = robot.send_action(right_shoulder_action())
+
+    record = trace_records(capsys.readouterr().out)[-1]
+    assert record["relative_limiter_target_normalized"] == 14.0
+    assert record["final_bus_target_normalized"] == 10.0
+    assert record["readbacks"]["Goal_Position"] == {"normalized": 10}
+    assert sent["arm_right_shoulder_lift.pos"] == 10
+
+
+def test_selected_trace_output_failure_keeps_a_successful_action_successful(monkeypatch):
+    robot, _, events = make_action_robot(trace_am1_left_elbow=False)
+    attach_right_shoulder_bus(robot, events)
+    robot.config.trace_am1_joint = "arm_right_shoulder_lift"
+
+    def fail_serialization(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("selected trace serialization failed")
+
+    monkeypatch.setattr(alohamini_module.json, "dumps", fail_serialization)
+
+    sent = robot.send_action(right_shoulder_action())
+
+    assert sent["arm_right_shoulder_lift.pos"] == 14.0
+    assert any(event[1:3] == ("sync_write", "Goal_Position") for event in events)
+    assert any(event[1:3] == ("sync_write", "Goal_Velocity") for event in events)
+
+
+def test_selected_trace_diagnostic_conversion_failure_keeps_action_successful(capsys):
+    class UnconvertibleCurrent:
+        def __float__(self):
+            raise ValueError("selected current conversion failed")
+
+    robot, _, events = make_action_robot(trace_am1_left_elbow=False)
+    right = attach_right_shoulder_bus(robot, events)
+    right.read_sequences[("Present_Current", "arm_right_shoulder_lift")] = [
+        10,
+        UnconvertibleCurrent(),
+    ]
+    robot.config.trace_am1_joint = "arm_right_shoulder_lift"
+
+    sent = robot.send_action(right_shoulder_action())
+
+    record = trace_records(capsys.readouterr().out)[-1]
+    assert sent["arm_right_shoulder_lift.pos"] == 14.0
+    assert record["diagnostic_reads"] == {
+        "error": "ValueError: selected current conversion failed"
+    }
+    assert any(event[1:3] == ("sync_write", "Goal_Position") for event in events)
+    assert any(event[1:3] == ("sync_write", "Goal_Velocity") for event in events)
+
+
+def test_selected_trace_can_reuse_the_reviewed_left_elbow_path(capsys):
+    robot, left, events = make_action_robot(trace_am1_left_elbow=False)
+    left.motors["arm_left_elbow_flex"] = SimpleNamespace(id=3)
+    robot.config.trace_am1_joint = "arm_left_elbow_flex"
+
+    sent = robot.send_action(elbow_action())
+
+    record = trace_records(capsys.readouterr().out)[-1]
+    assert sent["arm_left_elbow_flex.pos"] == 14.0
+    assert record["event"] == "am1_joint_action_boundary"
+    assert record["motor"] == "arm_left_elbow_flex"
+    assert record["motor_id"] == 3
+    assert record["side"] == "left"
+    assert record["readbacks"]["Goal_Position"] == {"normalized": 14.0}
+    assert all("Phase" not in event for event in events)
+
+
+def test_selected_trace_rejects_an_unreviewed_direct_config(capsys):
+    robot, _, events = make_action_robot(trace_am1_left_elbow=False)
+    right = attach_right_elbow_bus(robot, events)
+    robot.config.trace_am1_joint = "arm_right_elbow_flex"
+
+    robot.send_action(bimanual_elbow_action())
+
+    assert trace_records(capsys.readouterr().out) == []
+    assert right.read_calls == []
+
+
+def test_selected_trace_stays_off_for_an_ambiguous_direct_config(capsys):
+    robot, _, events = make_action_robot(trace_am1_left_elbow=True)
+    right = attach_right_shoulder_bus(robot, events)
+    robot.config.trace_am1_joint = "arm_right_shoulder_lift"
+
+    robot.send_action(right_shoulder_action())
+
+    records = trace_records(capsys.readouterr().out)
+    assert [record["event"] for record in records] == ["am1_left_elbow_action_boundary"]
+    assert right.read_calls == []
+
+
+@pytest.mark.parametrize(
+    ("failure_stage", "failing_bus", "register", "selected_write", "body_write"),
+    [
+        (
+            "left_goal_position",
+            "left",
+            "Goal_Position",
+            {
+                "attempted": False,
+                "sdk_transmit": "not attempted",
+                "status": "not attempted because left Goal_Position sync write failed",
+                "servo_acknowledgement": "sync-write supplies no servo acknowledgement",
+            },
+            {
+                "attempted": False,
+                "status": "not attempted because left Goal_Position sync write failed",
+            },
+        ),
+        (
+            "right_goal_position",
+            "right",
+            "Goal_Position",
+            {
+                "attempted": True,
+                "sdk_transmit": "failed",
+                "error": "ConnectionError: right_goal_position failed",
+                "servo_acknowledgement": "sync-write supplies no servo acknowledgement",
+            },
+            {
+                "attempted": False,
+                "status": "not attempted because right Goal_Position sync write failed",
+            },
+        ),
+        (
+            "base_goal_velocity",
+            "left",
+            "Goal_Velocity",
+            {
+                "attempted": True,
+                "sdk_transmit": "completed",
+                "servo_acknowledgement": "sync-write supplies no servo acknowledgement",
+            },
+            {
+                "attempted": True,
+                "sdk_transmit": "failed",
+                "error": "ConnectionError: base_goal_velocity failed",
+            },
+        ),
+    ],
+)
+def test_selected_right_trace_preserves_action_write_failures(
+    capsys, failure_stage, failing_bus, register, selected_write, body_write
+):
+    robot, left, events = make_action_robot(trace_am1_left_elbow=False)
+    right = attach_right_shoulder_bus(robot, events)
+    robot.config.trace_am1_joint = "arm_right_shoulder_lift"
+    original_error = ConnectionError(f"{failure_stage} failed")
+    (right if failing_bus == "right" else left).sync_write_failures[register] = original_error
+
+    with pytest.raises(ConnectionError) as raised:
+        robot.send_action(right_shoulder_action())
+
+    record = trace_records(capsys.readouterr().out)[-1]
+    assert raised.value is original_error
+    assert record["event"] == "am1_joint_action_boundary"
+    assert record["motor"] == "arm_right_shoulder_lift"
+    assert record["side"] == "right"
+    assert record["action_write_failure"] == {"stage": failure_stage}
+    assert record["goal_position_sync_write"] == selected_write
+    assert record["body_goal_velocity_sync_write"] == body_write
+    assert record["readbacks"] == {
+        "status": "not attempted before successful body Goal_Velocity sync write"
+    }
+    assert left.read_calls == []
+    assert right.read_calls == []
     assert all("Phase" not in event for event in events)
 
 
@@ -775,6 +1120,32 @@ def test_trace_is_default_off_and_non_am1_models_never_emit_or_read_diagnostics(
 
     assert trace_records(capsys.readouterr().out) == []
     assert not [event for event in events if event[1] == "read"]
+    assert all("Phase" not in event for event in events)
+
+
+@pytest.mark.parametrize(
+    ("robot_model", "selected_motor"),
+    [
+        ("alohamini1", None),
+        ("alohamini2", "arm_right_shoulder_lift"),
+        ("alohamini2pro", "arm_right_shoulder_lift"),
+    ],
+)
+def test_selected_trace_is_default_off_and_never_applies_to_am2_models(
+    capsys, robot_model, selected_motor
+):
+    robot, left, events = make_action_robot(
+        trace_am1_left_elbow=False,
+        robot_model=robot_model,
+    )
+    right = attach_right_shoulder_bus(robot, events)
+    robot.config.trace_am1_joint = selected_motor
+
+    robot.send_action(right_shoulder_action())
+
+    assert trace_records(capsys.readouterr().out) == []
+    assert left.read_calls == []
+    assert right.read_calls == []
     assert all("Phase" not in event for event in events)
 
 
