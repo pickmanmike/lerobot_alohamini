@@ -187,28 +187,29 @@ def test_fresh_live_sample_is_atomic_complete_and_keeps_follower_and_leader_conv
     assert sample.arm_target["arm_right_wrist_flex.pos"] == FOLLOWER["arm_right_wrist_flex.pos"]
 
 
-@pytest.mark.parametrize(
-    ("robot", "reason"),
-    [
-        (SampleRobot(advances=False), "did not advance"),
-        (
-            SampleRobot(observation={key: value for key, value in FOLLOWER.items() if key != ARM_KEYS[0]}),
-            "keys are invalid",
-        ),
-    ],
-)
-def test_cached_or_partial_observation_is_a_latched_stale_sample_not_a_new_target(robot, reason):
+def test_cached_observation_is_a_transient_timeout_not_a_new_target():
     module = load_teleoperate()
 
-    with pytest.raises(module.StaleFollowerObservation) as caught:
+    with pytest.raises(module.TransientFollowerObservation, match="did not advance"):
         module.read_fresh_am1_live_sample(
-            robot,
+            SampleRobot(advances=False),
             SampleLeader(),
             previous_sequence=41,
             monotonic=lambda: 12.5,
         )
 
-    assert reason in str(caught.value)
+
+def test_partial_observation_is_an_immediate_safety_refusal():
+    module = load_teleoperate()
+    partial = {key: value for key, value in FOLLOWER.items() if key != ARM_KEYS[0]}
+
+    with pytest.raises(module.SafetyRefusal, match="keys are invalid"):
+        module.read_fresh_am1_live_sample(
+            SampleRobot(observation=partial),
+            SampleLeader(),
+            previous_sequence=41,
+            monotonic=lambda: 12.5,
+        )
 
 
 def test_completion_spaced_deadline_never_catches_up_after_late_send():
@@ -450,25 +451,185 @@ def test_actual_live_runner_consumes_fresh_complete_target_after_first_approved_
     )
 
 
-def test_actual_live_runner_latches_cached_observation_and_keeps_sending_frozen_target(capsys):
+def test_actual_live_runner_tolerates_cached_observation_below_freshness_limit(capsys):
     module = load_teleoperate()
     robot = TimedRobot(advance=False)
 
-    with pytest.raises(module.SafetyRefusal, match="did not advance"):
+    module.run_am1_live_sender(
+        robot,
+        SampleLeader(action={**LEADER, "right_wrist_flex.pos": 70.0}),
+        initial_arm_target=FOLLOWER,
+        initial_observation_sequence=robot.observation_sequence,
+        fps=10,
+        duration_s=0.35,
+        live_arm_scope="both",
+        profile_cadence=False,
+    )
+
+    assert len(robot.sends) >= 3
+    assert all(action == {**FOLLOWER, **module.make_zero_action()} for _, _, action in robot.sends)
+    assert "STALE FOLLOWER OBSERVATION" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("transient_timeouts", [1, 3])
+def test_subsecond_observation_timeouts_retry_without_latching_or_reading_leader_early(
+    transient_timeouts,
+    capsys,
+):
+    module = load_teleoperate()
+    events: list[tuple[str, int]] = []
+    changed_leader = {key: value + 10.0 for key, value in LEADER.items()}
+    changed_target = {f"arm_{key}": value for key, value in changed_leader.items()}
+
+    class RecoveringRobot(TimedRobot):
+        def __init__(self):
+            super().__init__()
+            self.observation_calls = 0
+
+        def get_observation(self):
+            self.observation_calls += 1
+            events.append(("observation", self.observation_calls))
+            if self.observation_calls > transient_timeouts:
+                self.observation_sequence += 1
+            return dict(FOLLOWER)
+
+    class CountingLeader:
+        def get_action(self):
+            events.append(("leader", len(events)))
+            return dict(changed_leader)
+
+    robot = RecoveringRobot()
+    module.run_am1_live_sender(
+        robot,
+        CountingLeader(),
+        initial_arm_target=FOLLOWER,
+        initial_observation_sequence=robot.observation_sequence,
+        fps=10,
+        duration_s=0.32,
+        live_arm_scope="both",
+        profile_cadence=True,
+    )
+
+    output = capsys.readouterr().out
+    report = next(
+        json.loads(line)
+        for line in output.splitlines()
+        if '"event": "am1_client_action_cadence"' in line
+    )
+    first_leader_event = next(index for index, event in enumerate(events) if event[0] == "leader")
+    assert [event for event in events[:first_leader_event] if event[0] == "observation"] == [
+        ("observation", index) for index in range(1, transient_timeouts + 2)
+    ]
+    assert report["observation_timeout_count"] == transient_timeouts
+    assert report["stale_latched"] is False
+    assert "STALE FOLLOWER OBSERVATION" not in output
+    arm_targets = [
+        {key: action[key] for key in ARM_KEYS}
+        for _, _, action in robot.sends
+    ]
+    assert arm_targets[0] == FOLLOWER
+    assert changed_target in arm_targets
+    assert set(tuple(target[key] for key in ARM_KEYS) for target in arm_targets) <= {
+        tuple(FOLLOWER[key] for key in ARM_KEYS),
+        tuple(changed_target[key] for key in ARM_KEYS),
+    }
+    assert all(
+        {key: action[key] for key in module.make_zero_action()} == module.make_zero_action()
+        for _, _, action in robot.sends
+    )
+
+
+def test_one_second_without_fresh_observation_latches_once_and_holds_frozen_target(capsys):
+    module = load_teleoperate()
+
+    class TimeoutRobot(TimedRobot):
+        def __init__(self):
+            super().__init__(advance=False)
+            self.observation_calls = 0
+
+        def get_observation(self):
+            self.observation_calls += 1
+            time.sleep(0.26)
+            return dict(FOLLOWER)
+
+    robot = TimeoutRobot()
+    with pytest.raises(module.SafetyRefusal, match="freshness limit"):
         module.run_am1_live_sender(
             robot,
             SampleLeader(action={**LEADER, "right_wrist_flex.pos": 70.0}),
             initial_arm_target=FOLLOWER,
             initial_observation_sequence=robot.observation_sequence,
             fps=10,
-            duration_s=0.35,
+            duration_s=1.25,
+            live_arm_scope="both",
+            profile_cadence=True,
+        )
+
+    output = capsys.readouterr().out
+    report = next(
+        json.loads(line)
+        for line in output.splitlines()
+        if '"event": "am1_client_action_cadence"' in line
+    )
+    assert robot.observation_calls >= 4
+    assert report["observation_timeout_count"] == robot.observation_calls
+    assert report["stale_latched"] is True
+    assert output.count("STALE FOLLOWER OBSERVATION") == 1
+    assert all(action == {**FOLLOWER, **module.make_zero_action()} for _, _, action in robot.sends)
+
+
+def test_partial_follower_observation_refuses_immediately_without_stale_hold(capsys):
+    module = load_teleoperate()
+    partial = {key: value for key, value in FOLLOWER.items() if key != ARM_KEYS[0]}
+    robot = TimedRobot()
+    robot.get_observation = lambda: (
+        setattr(robot, "observation_sequence", robot.observation_sequence + 1) or dict(partial)
+    )
+
+    with pytest.raises(module.SafetyRefusal, match="keys are invalid"):
+        module.run_am1_live_sender(
+            robot,
+            SampleLeader(),
+            initial_arm_target=FOLLOWER,
+            initial_observation_sequence=robot.observation_sequence,
+            fps=10,
+            duration_s=0.6,
             live_arm_scope="both",
             profile_cadence=False,
         )
 
-    assert len(robot.sends) >= 3
-    assert all(action == {**FOLLOWER, **module.make_zero_action()} for _, _, action in robot.sends)
-    assert capsys.readouterr().out.count("STALE FOLLOWER OBSERVATION") == 1
+    assert "STALE FOLLOWER OBSERVATION" not in capsys.readouterr().out
+
+
+def test_unbounded_live_run_exits_after_terminal_observation_staleness():
+    module = load_teleoperate()
+
+    class TimeoutRobot(TimedRobot):
+        def __init__(self):
+            super().__init__(advance=False)
+            self.observation_calls = 0
+
+        def get_observation(self):
+            self.observation_calls += 1
+            time.sleep(0.55)
+            return dict(FOLLOWER)
+
+    robot = TimeoutRobot()
+    started_at = time.monotonic()
+    with pytest.raises(module.SafetyRefusal, match="freshness limit"):
+        module.run_am1_live_sender(
+            robot,
+            SampleLeader(),
+            initial_arm_target=FOLLOWER,
+            initial_observation_sequence=robot.observation_sequence,
+            fps=10,
+            duration_s=0,
+            live_arm_scope="both",
+            profile_cadence=False,
+        )
+
+    assert robot.observation_calls >= 2
+    assert time.monotonic() - started_at < 2.5
 
 
 def test_actual_live_runner_rejects_target_paired_with_overage_follower_sample(capsys):
@@ -1118,6 +1279,8 @@ def test_run_teleoperation_holds_stale_target_through_duration_then_returns_two_
         def get_observation(self):
             if self.observation_sequence == 0:
                 self.observation_sequence = 1
+            else:
+                time.sleep(0.26)
             events.append(("observation", self.observation_sequence))
             return dict(FOLLOWER)
 
@@ -1157,7 +1320,7 @@ def test_run_teleoperation_holds_stale_target_through_duration_then_returns_two_
 
     def recording_join(self):
         result = real_join(self)
-        events.append("sampler_joined")
+        events.append("sender_joined")
         return result
 
     monkeypatch.setattr(module.AM1LiveActionSender, "join", recording_join)
@@ -1169,16 +1332,16 @@ def test_run_teleoperation_holds_stale_target_through_duration_then_returns_two_
         "--fps",
         "10",
         "--duration_s",
-        "0.25",
+        "1.25",
     )
 
     status = module.run_teleoperation(args)
 
     captured = capsys.readouterr()
-    reason = "observation_sequence did not advance (previous=1, current=1)"
     assert status == 2
     assert captured.out.count("STALE FOLLOWER OBSERVATION") == 1
-    assert f"SAFETY REFUSAL: {reason}" in captured.out
+    assert "SAFETY REFUSAL: follower observation age" in captured.out
+    assert "freshness limit" in captured.out
     assert "Traceback" not in captured.err
     arm_actions = [action for action in StaleRobot.instance.actions if set(FOLLOWER) <= set(action)]
     assert len(arm_actions) >= 2
@@ -1188,6 +1351,6 @@ def test_run_teleoperation_holds_stale_target_through_duration_then_returns_two_
         for index, event in enumerate(events)
         if isinstance(event, tuple) and event == ("send", module.make_zero_action())
     )
-    assert events.index("sampler_joined") < final_zero_index
+    assert events.index("sender_joined") < final_zero_index
     assert final_zero_index < events.index("right_disconnect") < events.index("left_disconnect")
     assert events.index("left_disconnect") < events.index("robot_disconnect")

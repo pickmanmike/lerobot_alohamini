@@ -89,6 +89,10 @@ class StaleFollowerObservation(RuntimeError):
     """A live follower sample was cached, partial, or otherwise unusable."""
 
 
+class TransientFollowerObservation(RuntimeError):
+    """A follower request completed without a newer decoded observation."""
+
+
 class AlignmentRow(NamedTuple):
     joint: str
     follower_value: float
@@ -341,20 +345,22 @@ def read_fresh_am1_live_sample(
     observation = robot.get_observation()
     observed_at = monotonic()
     observation_sequence = int(robot.observation_sequence)
-    if observation_sequence <= previous_sequence:
-        raise StaleFollowerObservation(
+    if observation_sequence == previous_sequence:
+        raise TransientFollowerObservation(
             "observation_sequence did not advance "
             f"(previous={previous_sequence}, current={observation_sequence})"
         )
-
-    try:
-        follower_positions = extract_am1_arm_positions(
-            dict(observation),
-            source="live follower observation",
-            leader_sample=False,
+    if observation_sequence < previous_sequence:
+        raise SafetyRefusal(
+            "observation_sequence regressed "
+            f"(previous={previous_sequence}, current={observation_sequence})"
         )
-    except SafetyRefusal as exc:
-        raise StaleFollowerObservation(str(exc)) from exc
+
+    follower_positions = extract_am1_arm_positions(
+        dict(observation),
+        source="live follower observation",
+        leader_sample=False,
+    )
     validate_selected_sync_positions(
         follower_positions,
         AM1_ARM_POSITION_KEYS,
@@ -1127,6 +1133,7 @@ def run_am1_live_sender(
     terminal_stale_reason: str | None = None
     started_at = monotonic()
     latest_observed_at: float | None = started_at if follower_hold_target is not None else None
+    last_fresh_observed_at = started_at
 
     try:
         sender.start()
@@ -1153,8 +1160,20 @@ def run_am1_live_sender(
                     previous_sequence=last_used_observation_sequence,
                     monotonic=monotonic,
                 )
-            except StaleFollowerObservation as exc:
+            except TransientFollowerObservation as exc:
                 observation_timeout_count += 1
+                observation_age_s = max(0.0, monotonic() - last_fresh_observed_at)
+                if observation_age_s >= AM1_LIVE_OBSERVATION_MAX_AGE_S:
+                    terminal_stale_reason = (
+                        f"follower observation age {observation_age_s:.3f}s reached the "
+                        f"{AM1_LIVE_OBSERVATION_MAX_AGE_S:.1f}-second freshness limit; {exc}"
+                    )
+                    print(
+                        "STALE FOLLOWER OBSERVATION — holding the last safe complete arm target for "
+                        f"the remainder of this process: {terminal_stale_reason}"
+                    )
+                continue
+            except StaleFollowerObservation as exc:
                 terminal_stale_reason = str(exc)
                 print(
                     "STALE FOLLOWER OBSERVATION — holding the last safe complete arm target for "
@@ -1170,6 +1189,7 @@ def run_am1_live_sender(
             sender.publish(make_am1_live_action(safe_target))
             observed_positions = dict(sample.follower_positions)
             latest_observed_at = sample.observed_at
+            last_fresh_observed_at = sample.observed_at
             last_used_observation_sequence = sample.observation_sequence
             if sample_callback is not None:
                 sample_callback(sample)
