@@ -145,7 +145,7 @@ Leader motors require their 7.4 V low-voltage supply and must never receive the 
 
 Before a synchronization move, the client prints the measured start and frozen target and asks the operator to type exactly `SYNC`. Enter alone, lowercase text, or added whitespace does not authorize motion. After confirmation, the client takes fresh follower and leader samples and prints those final endpoints before sending frame zero. Every synchronization frame holds base and lift velocity at zero and changes each selected normalized arm position by at most `STARTUP_SYNC_MAX_STEP = 0.75`. This client frame cap is independent of Pi `max_relative_target`; if it needs more frames than the requested duration, the move takes longer. Actual arm-bearing synchronization sends remain at least `1 / --fps` seconds apart, so an overrun lengthens the move instead of triggering catch-up sends. Every leader sample is validated, and exceeding `STARTUP_SYNC_LEADER_DRIFT = 2.0` aborts selected-side motion.
 
-Command and observation traffic use separate sockets, so the first sequence-fresh response after the final command can still have been generated before that command was processed. The client therefore checks up to the configured observation request window plus one sequence-fresh samples. Synchronization succeeds only when a checked follower sample satisfies `--max_start_mismatch`; otherwise it refuses without widening the threshold. The threshold is final startup convergence verification only: it does not limit how far apart valid calibrated poses may be when a synchronization plan is first proposed, and it is not used continuously at runtime. The historical S1--S5 commands below retain `5.0`. The blocked Packet 2M S6 command uses `6.0`: it is `0.708` above the worst measured completed-settle negative-direction residual (`5.292`) while still refusing a completely unmoving requested 10-unit joint move. That moving session is not authorized until the simple corrected-port calibration and no-robot side check above both pass and their complete evidence is reviewed.
+Command and observation traffic use separate sockets, so the first sequence-fresh response after the final command can still have been generated before that command was processed. The client therefore checks up to the configured observation request window plus one sequence-fresh samples. Synchronization succeeds only when a checked follower sample satisfies `--max_start_mismatch`; otherwise it refuses without widening the threshold. The threshold is final startup convergence verification only: it does not limit how far apart valid calibrated poses may be when a synchronization plan is first proposed, and it is not used continuously at runtime. Historical S1--S5 evidence used `5.0`; the physically completed Packet AR1 baseline and the next bounded commands below use the provisional commissioning gate `10.0`. Do not widen it.
 
 The client makes the operator phase explicit, in this order:
 
@@ -162,7 +162,7 @@ The bounded diagnostic is historical evidence, not the next commissioning action
 
 The completed traces used effective `max_relative_target=10.0` and a bounded final-target settle of `--settle_s 5.0`; `PASS` required two consecutive post-window, sequence-fresh in-tolerance samples. The prior negative-direction run was only partially physically proven: it measured `S=21.775`, `T=11.775`, movement `-4.708`, and final error `-5.292`, ending `INCOMPLETE`. The fresh positive-direction repeat measured `S=16.885`, `T=26.885`, movement `+9.507`, and final error `+0.493`, ending `PASS`/`0`. In that positive trace, the requested, relative-limiter, and final targets matched; the `Goal_Position` readback matched within quantization; the SDK transmit completed; and `Torque_Enable`, `Lock`, and `Operating_Mode` read back `1`/`1`/`0`. The observed current maxima were `13 mA` versus `221 mA`.
 
-Together, that is directional/load-dependent downstream elbow behavior: the static non-Phase configuration and normal command transport passed, but the exact physical cause remains unresolved. Do not change any motor setting on the strength of this result. Packet 2N later exposed a separate physical leader-identity ambiguity before live teleoperation began; resolve that no-robot boundary before any further follower motion.
+Together, that is directional/load-dependent downstream elbow behavior: the static non-Phase configuration and normal command transport passed, but the exact physical cause remains unresolved. Do not change any motor setting on the strength of this result. Later Packet 2N work resolved the leader identity as physical/logical left `COM8` and right `COM7`; Packet AR1 below supersedes the old pre-live block.
 
 #### Historical trace field semantics
 
@@ -738,20 +738,217 @@ Passing Packet 2N-R5R authorizes only later review of its evidence. It does not 
 
 </details>
 
-#### Packet 2M S6 — hard-blocked future both-side synchronization and paused teleoperation
+#### Packet AR1 — current local bimanual-arm state
 
-S6 is not runnable today. The simple workflow above has not yet produced a separately authorized raw-bus result, one-shot calibration `PASS`, and reviewed 30-second no-robot left/right gripper check. Documentation and software tests do not authorize those physical stages or S6. The exact next Pi command is none, and no Windows S6 command is authorized.
+Local AM1 bimanual arm teleoperation has been physically demonstrated once. The reviewed Windows run completed startup synchronization, printed `TELEOPERATION ACTIVE — LEADER MOVEMENT IS NOW ALLOWED`, forwarded both leaders to their corresponding followers, cleaned up, and recorded `SESSION_EXIT_CODE=0`.
 
-The only executable placeholder in this section refuses unconditionally before any Git, file, serial, network, or power action:
+Evidence:
+
+- Windows client: `C:\Users\pickm\AlohaMini1Logs\am1-provisional-sync-live20-20260829-213421.log`
+- downloaded Pi host: `C:\Users\pickm\AlohaMini1Logs\am1-provisional-live20-host-20260829-212759.log`
+- right-leader direction sample: `C:\Users\pickm\AlohaMini1Logs\am1-right-wrist-leader-direction-20260830-003457.log`
+
+The proven leader ownership is left `COM8` and right `COM7`. The accepted calibration SHA-256 identities are left `34D06E15F6768A3290B85BBE3507D9B14A8CCED263A40C575E02010560E13FBE` and right `753ECD0CC6EA655355447BE3ACE3C864FD86F9DC7A62E26AB41421E3DBAB4D90`. The successful run used a regulated 12 V / 10 A follower/body supply, the physical right follower shoulder-lift at its natural unforced endpoint, Pi `max_relative_target=20.0`, `--startup_sync_duration_s 120.0`, and `--max_start_mismatch 10.0`. The host limit and startup gate remain provisional commissioning settings.
+
+That run left two defects open. Physical right-leader wrist flex drove the right follower wrist in the opposite physical direction, and some follower joints paused before later resuming. The action path had no explicit wrist sign transform, and both endpoint calibration files recorded `drive_mode=0`. AM1 now treats the known-good right-leader normalized value as canonical and reflects `arm_right_wrist_flex` exactly once in the right follower bus's process-local calibration cache. Goal writes and Present Position observations use the same reflection, so startup synchronization, live teleoperation, recording, and later policy actions share one convention without double inversion. No calibration JSON or servo register is rewritten; Phase, PID, torque, IDs, baud, limits, and every unrelated joint remain unchanged. AM2 and AM2 Pro do not receive the reflection.
+
+The old client performed synchronous observation, leader, absent-camera, visualization, and printing work before action sends. Explicit AM1 arms-only mode (`--no_keyboard --no_cameras`) now uses a monotonic completion-spaced sender while a narrow worker owns observation and leader sampling. The sender always transmits all twelve arm targets plus explicit zero `x.vel`, `y.vel`, `theta.vel`, and `lift_axis.vel`; it never sends catch-up bursts. A nonadvancing observation sequence, invalid/incomplete follower observation, or follower observation that becomes at least one second old while its paired leader read completes latches the last safe complete arm target for the bounded run, warns once, then exits status `2` with the reason. An invalid leader sample instead safety-refuses directly and cleans up. Either outcome requires process restart and normal startup synchronization. `--profile_cadence` emits one client live-start marker and one bounded final summary with wall-clock correlation fields. The host reports wall-clocked command gaps, every gap over the watchdog threshold, watchdog transitions, limiter state, and selected right-wrist values once per second, then forces one final cadence snapshot during cleanup. No minimum-command-step behavior was added.
+
+The reviewed software commits are:
+
+- Windows cadence client: `6a54efe579025ee5d45895a228f11be706a93990`
+- Windows live-interval timestamps: `86135e8c048a0d5b1ba7f7c8f9352931cd0efe6d`
+- Windows profiled-cleanup exception identity: `f92469e9ab821f5547f98e623193b05ff325b7a0`
+- Pi wrist normalization and host evidence: `96b6004cb3f9a5e224f5b753171796fd98284341`
+- Pi complete receive-gap counting: `16f241395e9ce1f9e565061cae77a53f6456679e`
+- Pi event timestamps and final snapshot: `518b14e9325102a9528d7be035a8632e665f79a4`
+
+These results do not establish base, lift, cameras, recording, or remote operation. The commands below are prepared for a later separately authorized physical session; this documentation does not authorize motion. Begin staging with the Pi motor host stopped, follower/body power off, both leader supplies off, and both leader USB controllers disconnected. Apply power and reconnect only in the separately authorized physical procedure, never while performing the Git and calibration-identity preflight.
+
+Before either Windows stage, verify the branch, reviewed production tail, clean worktree, and both known-good leader calibrations. The clock check is read-only SSH to the Pi; it neither starts the motor host nor accesses a serial bus:
 
 ```powershell
 $ErrorActionPreference = 'Stop'
-throw 'S6 BLOCKED: reviewed simple-calibration and no-robot side-check evidence do not exist'
+if ((git branch --show-current).Trim() -ne 'fix/am1-wrist-cadence') { throw 'Wrong Windows branch.' }
+git merge-base --is-ancestor f92469e9ab821f5547f98e623193b05ff325b7a0 HEAD
+if ($LASTEXITCODE -ne 0) { throw 'The reviewed Windows AR1 code commit is not present.' }
+$reviewedTail = @(git diff --name-only f92469e9ab821f5547f98e623193b05ff325b7a0..HEAD)
+if (($reviewedTail.Count -ne 1) -or ($reviewedTail[0] -ne 'docs/alohamini/alohamini.md')) { throw 'Unexpected change after the reviewed Windows code commit.' }
+if (@(git status --porcelain).Count -ne 0) { throw 'Windows worktree is not clean.' }
+
+$calibrationDir = Join-Path $HOME '.cache\huggingface\lerobot\calibration\teleoperators\so_leader'
+$leftCalibration = Join-Path $calibrationDir 'so101_leader_bi_left.json'
+$rightCalibration = Join-Path $calibrationDir 'so101_leader_bi_right.json'
+if ((Get-FileHash -LiteralPath $leftCalibration -Algorithm SHA256).Hash -ne '34D06E15F6768A3290B85BBE3507D9B14A8CCED263A40C575E02010560E13FBE') { throw 'Left leader calibration mismatch.' }
+if ((Get-FileHash -LiteralPath $rightCalibration -Algorithm SHA256).Hash -ne '753ECD0CC6EA655355447BE3ACE3C864FD86F9DC7A62E26AB41421E3DBAB4D90') { throw 'Right leader calibration mismatch.' }
+
+$env:PYTHONDONTWRITEBYTECODE = '1'
+$am1LogDir = Join-Path $HOME 'AlohaMini1Logs'
+New-Item -ItemType Directory -Force -Path $am1LogDir | Out-Null
+
+function Get-Am1ClockCheck {
+    param([Parameter(Mandatory)][string]$Phase)
+    $beforeMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    $piTimeOutput = & ssh.exe -o BatchMode=yes -o ConnectTimeout=5 'pickmanmike@192.168.1.134' 'date +%s%3N'
+    $sshExit = $LASTEXITCODE
+    $afterMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    if ($sshExit -ne 0) { throw 'Pi clock check failed.' }
+    [long]$piMs = 0
+    $piTimeText = @($piTimeOutput)[-1].Trim()
+    if (-not [long]::TryParse($piTimeText, [ref]$piMs)) { throw "Invalid Pi clock value: $piTimeText" }
+    $midpointMs = ($beforeMs + $afterMs) / 2.0
+    $rttMs = $afterMs - $beforeMs
+    $offsetBoundMs = [math]::Abs($piMs - $midpointMs) + $rttMs / 2.0
+    $result = [ordered]@{
+        event = 'am1_clock_check'
+        phase = $Phase
+        windows_midpoint_ms = [math]::Round($midpointMs, 3)
+        pi_ms = $piMs
+        rtt_ms = $rttMs
+        offset_bound_ms = [math]::Round($offsetBoundMs, 3)
+    }
+    if ($offsetBoundMs -gt 250.0) { throw "Windows/Pi clock offset bound is $offsetBoundMs ms; limit is 250 ms." }
+    return ($result | ConvertTo-Json -Compress)
+}
 ```
 
-A later packet must independently review the raw-check output, calibration transcript and exit, backup/staged/active paths and hashes, exact calibration `PASS`, final read-only `Status`, the complete no-robot output, and the human left-only/right-only observations. No missing path, hash, timestamp, exit, side identity, or result may be inferred.
+If either leader presents a calibration prompt, stop; do not recalibrate.
 
-For review context only, any later authorized Windows S6 design must use corrected logical/physical ports left `COM8` and right `COM7`, ID `so101_leader_bi`, profile `so-arm-5dof`, AM1 startup synchronization on both sides, client step cap `0.75`, host relative limit `10.0`, final mismatch `6.0`, explicit zero base/lift, start-paused fresh observations, no keyboard/cameras, and the exact post-sync Enter gate. These are blocked design parameters, not a command.
+For the right-wrist-isolated live stage, prepare the Pi on `fix/am1-right-wrist-normalization` at exactly `518b14e9325102a9528d7be035a8632e665f79a4`, with a clean worktree, then run this host wrapper only after that physical stage is authorized. Its prerequisite both-side startup synchronization may reposition any follower arm joint; isolation begins only after `TELEOPERATION ACTIVE`:
+
+```bash
+set -euo pipefail
+cd /home/pickmanmike/lerobot_alohamini
+test "$(git branch --show-current)" = "fix/am1-right-wrist-normalization"
+test "$(git rev-parse HEAD)" = "518b14e9325102a9528d7be035a8632e665f79a4"
+test -z "$(git status --porcelain)"
+
+HOST_LOG="$HOME/am1-ar1-right-wrist-host-$(date +%Y%m%d-%H%M%S).log"
+printf 'HOST_LOG=%s\n' "$HOST_LOG"
+set +e
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m lerobot.robots.alohamini.alohamini_host \
+  --robot_model alohamini1 \
+  --no_cameras \
+  --skip_lift_home \
+  --max_relative_target 20.0 \
+  --max_loop_freq_hz 30 \
+  --profile_timing true \
+  --profile_cadence \
+  2>&1 | tee "$HOST_LOG"
+host_exit=${PIPESTATUS[0]}
+set -e
+printf 'HOST_EXIT_CODE=%s\n' "$host_exit" | tee -a "$HOST_LOG"
+exit "$host_exit"
+```
+
+With both leaders held still until the active message, run the right-wrist-isolated live client:
+
+```powershell
+$timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$windowsLog = Join-Path $am1LogDir "am1-ar1-right-wrist-windows-$timestamp.log"
+"WINDOWS_LOG=$windowsLog" | Tee-Object -FilePath $windowsLog
+Get-Am1ClockCheck -Phase 'pre_client' | Tee-Object -FilePath $windowsLog -Append
+& .\.venv\Scripts\python.exe .\examples\alohamini\teleoperate_bi.py `
+  --robot.remote_ip 192.168.1.134 `
+  --robot.robot_model alohamini1 `
+  --teleop.left_port COM8 `
+  --teleop.right_port COM7 `
+  --teleop.id so101_leader_bi `
+  --teleop.arm_profile so-arm-5dof `
+  --startup_mode sync `
+  --startup_sync_side both `
+  --startup_sync_duration_s 120.0 `
+  --max_start_mismatch 10.0 `
+  --live_arm_scope right_wrist_flex `
+  --fps 10 `
+  --duration_s 30 `
+  --start_paused `
+  --no_keyboard `
+  --no_cameras `
+  --profile_cadence `
+  --no_rerun `
+  2>&1 | Tee-Object -FilePath $windowsLog -Append
+$clientExit = $LASTEXITCODE
+"SESSION_EXIT_CODE=$clientExit" | Tee-Object -FilePath $windowsLog -Append
+if ($clientExit -ne 0) { throw "Right-wrist session failed with exit code $clientExit." }
+Get-Am1ClockCheck -Phase 'post_client' | Tee-Object -FilePath $windowsLog -Append
+```
+
+At `TELEOPERATION ACTIVE`, record the host's reported normalized right-wrist requested value as the excursion reference. Move only the physical right leader wrist slowly upward while the reported request remains within five normalized units of that reference, return to the reference, move downward within five units, and return. This is an operator-enforced bound, not a software travel limit; stop rather than crossing it. Expected: the right follower wrist moves in the same physical direction both ways; every other arm joint holds and base/lift remain stationary throughout the isolated live phase.
+
+Only after that evidence passes review, start the bimanual Pi host with the same reviewed settings and a distinct log:
+
+```bash
+set -euo pipefail
+cd /home/pickmanmike/lerobot_alohamini
+test "$(git branch --show-current)" = "fix/am1-right-wrist-normalization"
+test "$(git rev-parse HEAD)" = "518b14e9325102a9528d7be035a8632e665f79a4"
+test -z "$(git status --porcelain)"
+
+HOST_LOG="$HOME/am1-ar1-bimanual10-host-$(date +%Y%m%d-%H%M%S).log"
+printf 'HOST_LOG=%s\n' "$HOST_LOG"
+set +e
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m lerobot.robots.alohamini.alohamini_host \
+  --robot_model alohamini1 \
+  --no_cameras \
+  --skip_lift_home \
+  --max_relative_target 20.0 \
+  --max_loop_freq_hz 30 \
+  --profile_timing true \
+  --profile_cadence \
+  2>&1 | tee "$HOST_LOG"
+host_exit=${PIPESTATUS[0]}
+set -e
+printf 'HOST_EXIT_CODE=%s\n' "$host_exit" | tee -a "$HOST_LOG"
+exit "$host_exit"
+```
+
+Then run the bimanual Windows client:
+
+```powershell
+$timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$windowsLog = Join-Path $am1LogDir "am1-ar1-bimanual10-windows-$timestamp.log"
+"WINDOWS_LOG=$windowsLog" | Tee-Object -FilePath $windowsLog
+Get-Am1ClockCheck -Phase 'pre_client' | Tee-Object -FilePath $windowsLog -Append
+& .\.venv\Scripts\python.exe .\examples\alohamini\teleoperate_bi.py `
+  --robot.remote_ip 192.168.1.134 `
+  --robot.robot_model alohamini1 `
+  --teleop.left_port COM8 `
+  --teleop.right_port COM7 `
+  --teleop.id so101_leader_bi `
+  --teleop.arm_profile so-arm-5dof `
+  --startup_mode sync `
+  --startup_sync_side both `
+  --startup_sync_duration_s 120.0 `
+  --max_start_mismatch 10.0 `
+  --live_arm_scope both `
+  --fps 10 `
+  --duration_s 45 `
+  --start_paused `
+  --no_keyboard `
+  --no_cameras `
+  --profile_cadence `
+  --no_rerun `
+  2>&1 | Tee-Object -FilePath $windowsLog -Append
+$clientExit = $LASTEXITCODE
+"SESSION_EXIT_CODE=$clientExit" | Tee-Object -FilePath $windowsLog -Append
+if ($clientExit -ne 0) { throw "Bimanual session failed with exit code $clientExit." }
+Get-Am1ClockCheck -Phase 'post_client' | Tee-Object -FilePath $windowsLog -Append
+```
+
+For either stage, begin with both arm envelopes clear; empty grippers; followers supported where needed; the regulated 12 V / 10 A follower supply; leaders on only their designated 7.4 V supplies; the physical right follower shoulder-lift at its natural unforced endpoint; base clear; lift unhomed and blocked; and every physical disconnect immediately reachable. Hold both leaders still through both operator gates: type exact uppercase `SYNC` to authorize startup synchronization. After `SYNCHRONIZATION COMPLETE`, continue holding for at least three seconds so the Pi log contains two post-sync cadence baselines; only then press Enter, and keep holding until the exact active message appears.
+
+Pass requires correct correspondence, same-direction right wrist flex, no human-observed pause/resume or jump, no live watchdog event, no stale latch, no absent-camera warning, strictly increasing sequences, explicit zero body/lift, clean cleanup, client exit `0`, and both `pre_client` and `post_client` `am1_clock_check.offset_bound_ms <= 250`. Let `B` be the larger of those two offset bounds. Use the client's `am1_client_live_start.wall_time_ns` and `am1_client_action_cadence.live_end_wall_time_ns` as the live interval. Every client action-send interval must be at or below 1000 ms. A host report is certainly before live start only when its `wall_time_ns / 1e6 + B` is less than the client start in milliseconds; select the final post-sync report satisfying that rule as the baseline. The first host command after that baseline may increment `receive_gap_over_watchdog_count` once because its measured receive gap spans the post-sync Enter gate; its `last_receive_gap_over_watchdog_sequence` must equal the baseline `command_sequence + 1`. No later host command may increment that count. A host watchdog timestamp is certainly inside the live interval only from `client_start_ms + B` through `client_end_ms - B`; any watchdog timestamp in either `B`-wide boundary band is ambiguous and refuses the pass. Compare the baseline and forced-final `watchdog_events`: the final count must equal the baseline, or may equal baseline plus one only when `last_watchdog_event_wall_time_ns / 1e6 - B` is strictly greater than client live end and represents the single expected post-exit stop. A larger delta or any other delta/timestamp classification refuses the pass. The forced final host snapshot must be present. Do not reject on `max_receive_gap_ms` alone: preconnection, startup-synchronization authorization, the post-sync Enter gate, and post-exit intervals can legitimately raise this cumulative maximum. Repeated target limiting, or any limiter event correlated with a pause, is a failure requiring log review; do not widen limits to hide it.
+
+Stop immediately for wrong direction or joint, excessive travel or speed, jump/resume behavior, unexpected sound/current/contact/cable strain, any live watchdog or stale transition, communication error, calibration prompt, repeated limiter activity, or loss of the physical power-disconnect path. Stop the host and remove motor power before review.
+
+Fetch the exact Pi log path printed by the wrapper after stopping it cleanly:
+
+```powershell
+$piHostLog = Read-Host 'Paste the exact Pi HOST_LOG path'
+.\tools\fetch_am1_pi_log.ps1 -RemoteHost 'pickmanmike@192.168.1.134' -RemotePath $piHostLog
+if ($LASTEXITCODE -ne 0) { throw 'Pi host-log fetch failed.' }
+```
 
 ## 3. Camera Configuration
 
