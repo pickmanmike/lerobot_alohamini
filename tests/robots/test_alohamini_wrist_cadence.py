@@ -265,6 +265,25 @@ def test_host_command_gap_uses_receive_timestamp_before_action_processing():
     assert state.watchdog_due()
 
 
+def test_host_cadence_counts_every_receive_gap_over_watchdog_and_reports_last_offender():
+    clock = FakeClock(100.0)
+    state = alohamini_host.HostCommandState(
+        watchdog_timeout_ms=1000,
+        diagnostics_enabled=True,
+        clock=clock,
+    )
+
+    for received_at in (100.1, 100.9, 101.901, 102.901, 104.101):
+        clock.now = received_at
+        state.record_command({}, received_at=received_at)
+
+    report_prefix = "[HOST CADENCE] "
+    report = json.loads(state.format_report().removeprefix(report_prefix))
+    assert report["receive_gap_over_watchdog_count"] == 2
+    assert report["last_receive_gap_over_watchdog_sequence"] == 5
+    assert report["last_receive_gap_over_watchdog_ms"] == pytest.approx(1200.0)
+
+
 def test_host_command_state_uses_monotonic_intervals_and_latches_watchdog():
     clock = FakeClock(100.0)
     state = alohamini_host.HostCommandState(
@@ -296,6 +315,9 @@ def test_host_command_state_uses_monotonic_intervals_and_latches_watchdog():
         "command_sequence": 2,
         "last_receive_gap_ms": pytest.approx(250.0),
         "max_receive_gap_ms": pytest.approx(250.0),
+        "receive_gap_over_watchdog_count": 0,
+        "last_receive_gap_over_watchdog_sequence": None,
+        "last_receive_gap_over_watchdog_ms": None,
         "watchdog_events": 0,
         "target_limited": True,
         "right_wrist_requested": 50.0,
@@ -316,6 +338,9 @@ def test_host_command_state_uses_monotonic_intervals_and_latches_watchdog():
         "command_sequence": 2,
         "last_receive_gap_ms": pytest.approx(250.0),
         "max_receive_gap_ms": pytest.approx(250.0),
+        "receive_gap_over_watchdog_count": 0,
+        "last_receive_gap_over_watchdog_sequence": None,
+        "last_receive_gap_over_watchdog_ms": None,
         "watchdog_events": 1,
         "target_limited": True,
         "right_wrist_requested": 50.0,

@@ -72,6 +72,9 @@ class HostCommandState:
         self._command_sequence = 0
         self._last_receive_gap_ms = 0.0
         self._max_receive_gap_ms = 0.0
+        self._receive_gap_over_watchdog_count = 0
+        self._last_receive_gap_over_watchdog_sequence: int | None = None
+        self._last_receive_gap_over_watchdog_ms: float | None = None
         self._watchdog_events = 0
         self._last_action_diagnostics: dict[str, object] = {}
 
@@ -84,11 +87,15 @@ class HostCommandState:
         completed_at = self._clock()
         receive_time = completed_at if received_at is None else received_at
         if self.diagnostics_enabled:
+            self._command_sequence += 1
             if self._previous_receive_s is not None:
                 gap_ms = (receive_time - self._previous_receive_s) * 1e3
                 self._last_receive_gap_ms = gap_ms
                 self._max_receive_gap_ms = max(self._max_receive_gap_ms, gap_ms)
-            self._command_sequence += 1
+                if gap_ms > self.watchdog_timeout_ms:
+                    self._receive_gap_over_watchdog_count += 1
+                    self._last_receive_gap_over_watchdog_sequence = self._command_sequence
+                    self._last_receive_gap_over_watchdog_ms = gap_ms
             self._last_action_diagnostics = dict(action_diagnostics)
         self._previous_receive_s = receive_time
         # Preserve the established watchdog lifecycle: a successfully applied action
@@ -113,6 +120,11 @@ class HostCommandState:
             "command_sequence": self._command_sequence,
             "last_receive_gap_ms": self._last_receive_gap_ms,
             "max_receive_gap_ms": self._max_receive_gap_ms,
+            "receive_gap_over_watchdog_count": self._receive_gap_over_watchdog_count,
+            "last_receive_gap_over_watchdog_sequence": (
+                self._last_receive_gap_over_watchdog_sequence
+            ),
+            "last_receive_gap_over_watchdog_ms": self._last_receive_gap_over_watchdog_ms,
             "watchdog_events": self._watchdog_events,
             "target_limited": _jsonable(self._last_action_diagnostics.get("target_limited")),
             "right_wrist_requested": _jsonable(
