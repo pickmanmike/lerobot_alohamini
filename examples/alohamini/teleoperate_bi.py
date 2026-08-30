@@ -1115,8 +1115,14 @@ def run_am1_live_sender(
             deadline = next_completion_spaced_deadline(send_completed_at, fps=fps)
             sleep_fn(max(deadline - monotonic(), 0.0))
     finally:
-        live_end_wall_time_ns = wall_time_ns() if profile_cadence else None
         primary_error = sys.exception()
+        diagnostic_errors: list[tuple[str, BaseException]] = []
+        live_end_wall_time_ns = None
+        if profile_cadence:
+            try:
+                live_end_wall_time_ns = wall_time_ns()
+            except BaseException as exc:
+                diagnostic_errors.append(("capturing the live-end wall clock", exc))
         join_error: BaseException | None = None
         if sampler_started:
             sampler.stop()
@@ -1124,46 +1130,62 @@ def run_am1_live_sender(
                 sampler.join()
             except BaseException as exc:
                 join_error = exc
-                if primary_error is not None:
-                    primary_error.add_note(f"Cleanup failed while joining AM1 live sampler: {exc!r}")
         final_snapshot = sampler.mailbox.snapshot()
         if profile_cadence:
-            report_now = monotonic()
-            print(
-                json.dumps(
-                    {
-                        "event": "am1_client_action_cadence",
-                        "live_end_wall_time_ns": live_end_wall_time_ns,
-                        "action_sequence": action_sequence,
-                        "action_send_interval_ms": round(last_send_interval_ms, 3),
-                        "longest_action_send_interval_ms": round(longest_send_interval_ms, 3),
-                        "observation_sequence": last_used_observation_sequence,
-                        "observation_age_ms": (
-                            None
-                            if latest_observed_at is None
-                            else round(max(0.0, report_now - latest_observed_at) * 1e3, 3)
-                        ),
-                        "observation_timeout_count": final_snapshot.observation_timeout_count,
-                        "stale_latched": final_snapshot.stale_reason is not None,
-                        "right_wrist_requested": safe_target[RIGHT_WRIST_FLEX_KEY],
-                        "right_wrist_observed": (
-                            None
-                            if observed_positions is None
-                            else observed_positions[RIGHT_WRIST_FLEX_KEY]
-                        ),
-                    },
-                    sort_keys=True,
+            try:
+                report_now = monotonic()
+                print(
+                    json.dumps(
+                        {
+                            "event": "am1_client_action_cadence",
+                            "live_end_wall_time_ns": live_end_wall_time_ns,
+                            "action_sequence": action_sequence,
+                            "action_send_interval_ms": round(last_send_interval_ms, 3),
+                            "longest_action_send_interval_ms": round(longest_send_interval_ms, 3),
+                            "observation_sequence": last_used_observation_sequence,
+                            "observation_age_ms": (
+                                None
+                                if latest_observed_at is None
+                                else round(max(0.0, report_now - latest_observed_at) * 1e3, 3)
+                            ),
+                            "observation_timeout_count": final_snapshot.observation_timeout_count,
+                            "stale_latched": final_snapshot.stale_reason is not None,
+                            "right_wrist_requested": safe_target[RIGHT_WRIST_FLEX_KEY],
+                            "right_wrist_observed": (
+                                None
+                                if observed_positions is None
+                                else observed_positions[RIGHT_WRIST_FLEX_KEY]
+                            ),
+                        },
+                        sort_keys=True,
+                    )
                 )
-            )
-        if primary_error is None:
-            if join_error is not None:
-                raise join_error
-            if final_snapshot.error is not None:
-                raise final_snapshot.error
-            if final_snapshot.stale_reason is not None:
-                raise SafetyRefusal(final_snapshot.stale_reason)
-        elif final_snapshot.error is not None and final_snapshot.error is not primary_error:
-            primary_error.add_note(f"AM1 live sampler also failed: {final_snapshot.error!r}")
+            except BaseException as exc:
+                diagnostic_errors.append(("emitting the final cadence report", exc))
+
+        if primary_error is not None:
+            if join_error is not None and join_error is not primary_error:
+                primary_error.add_note(f"Cleanup failed while joining AM1 live sampler: {join_error!r}")
+            if final_snapshot.error is not None and final_snapshot.error is not primary_error:
+                primary_error.add_note(f"AM1 live sampler also failed: {final_snapshot.error!r}")
+            for label, exc in diagnostic_errors:
+                if exc is not primary_error:
+                    primary_error.add_note(f"Cadence diagnostics failed while {label}: {exc!r}")
+        else:
+            outcome_error = join_error or final_snapshot.error
+            if outcome_error is None and final_snapshot.stale_reason is not None:
+                outcome_error = SafetyRefusal(final_snapshot.stale_reason)
+            if outcome_error is not None:
+                for label, exc in diagnostic_errors:
+                    if exc is not outcome_error:
+                        outcome_error.add_note(f"Cadence diagnostics failed while {label}: {exc!r}")
+                raise outcome_error
+            if diagnostic_errors:
+                _, outcome_error = diagnostic_errors[0]
+                for label, exc in diagnostic_errors[1:]:
+                    if exc is not outcome_error:
+                        outcome_error.add_note(f"Cadence diagnostics also failed while {label}: {exc!r}")
+                raise outcome_error
 
 
 def run_teleoperation(

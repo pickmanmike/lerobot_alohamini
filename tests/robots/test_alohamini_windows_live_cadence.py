@@ -507,6 +507,96 @@ def test_disabled_cadence_profile_emits_no_live_boundary_or_wall_clock_read(caps
     assert "am1_client_live_start" not in capsys.readouterr().out
 
 
+def test_profile_finalization_preserves_send_error_when_live_end_clock_fails_and_joins_sampler(
+    monkeypatch,
+):
+    module = load_teleoperate()
+    events: list[str] = []
+    primary = RuntimeError("command send failed")
+    diagnostic_error = RuntimeError("live-end wall clock failed")
+
+    class SecondSendFailsRobot(TimedRobot):
+        def send_action(self, action):
+            if self.sends:
+                events.append("send_failed")
+                raise primary
+            super().send_action(action)
+
+    real_join = module.AM1LiveSampler.join
+
+    def recording_join(self):
+        result = real_join(self)
+        events.append("sampler_joined")
+        return result
+
+    wall_time_calls = 0
+
+    def failing_live_end_wall_time():
+        nonlocal wall_time_calls
+        wall_time_calls += 1
+        if wall_time_calls == 1:
+            return 1_778_000_000_000_000_001
+        raise diagnostic_error
+
+    monkeypatch.setattr(module.AM1LiveSampler, "join", recording_join)
+
+    with pytest.raises(RuntimeError) as caught:
+        module.run_am1_live_sender(
+            SecondSendFailsRobot(observation_delay_s=0.01),
+            SampleLeader(),
+            initial_arm_target=FOLLOWER,
+            initial_observation_sequence=8,
+            fps=10,
+            duration_s=1.0,
+            live_arm_scope="both",
+            profile_cadence=True,
+            wall_time_ns=failing_live_end_wall_time,
+        )
+
+    assert caught.value is primary
+    assert events == ["send_failed", "sampler_joined"]
+    assert any("live-end wall clock failed" in note for note in getattr(primary, "__notes__", ()))
+
+
+def test_profile_finalization_surfaces_live_end_clock_error_only_after_sampler_join(monkeypatch):
+    module = load_teleoperate()
+    events: list[str] = []
+    diagnostic_error = RuntimeError("live-end wall clock failed")
+    wall_times = iter((1_778_000_000_000_000_001,))
+
+    real_join = module.AM1LiveSampler.join
+
+    def recording_join(self):
+        result = real_join(self)
+        events.append("sampler_joined")
+        return result
+
+    def failing_live_end_wall_time():
+        try:
+            return next(wall_times)
+        except StopIteration:
+            events.append("clock_failed")
+            raise diagnostic_error
+
+    monkeypatch.setattr(module.AM1LiveSampler, "join", recording_join)
+
+    with pytest.raises(RuntimeError) as caught:
+        module.run_am1_live_sender(
+            TimedRobot(observation_delay_s=0.2),
+            SampleLeader(),
+            initial_arm_target=FOLLOWER,
+            initial_observation_sequence=8,
+            fps=10,
+            duration_s=0.05,
+            live_arm_scope="both",
+            profile_cadence=True,
+            wall_time_ns=failing_live_end_wall_time,
+        )
+
+    assert caught.value is diagnostic_error
+    assert events == ["clock_failed", "sampler_joined"]
+
+
 def test_actual_live_runner_waits_from_send_completion_instead_of_catching_up():
     module = load_teleoperate()
 
