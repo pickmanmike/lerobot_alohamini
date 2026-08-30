@@ -284,12 +284,76 @@ def test_host_cadence_counts_every_receive_gap_over_watchdog_and_reports_last_of
     assert report["last_receive_gap_over_watchdog_ms"] == pytest.approx(1200.0)
 
 
-def test_host_command_state_uses_monotonic_intervals_and_latches_watchdog():
+def test_host_cadence_reports_shared_wall_times_for_gap_and_watchdog_events():
     clock = FakeClock(100.0)
+    wall_clock_ns = FakeClock(10_000)
     state = alohamini_host.HostCommandState(
         watchdog_timeout_ms=1000,
         diagnostics_enabled=True,
         clock=clock,
+        wall_clock_ns=wall_clock_ns,
+    )
+
+    clock.now = 100.1
+    first_receive_wall_time_ns = state.capture_wall_time_ns()
+    clock.now = 110.0
+    state.record_command(
+        {},
+        received_at=100.1,
+        received_wall_time_ns=first_receive_wall_time_ns,
+    )
+
+    clock.now = 111.201
+    wall_clock_ns.now = 20_000
+    second_receive_wall_time_ns = state.capture_wall_time_ns()
+    clock.now = 120.0
+    state.record_command(
+        {},
+        received_at=111.201,
+        received_wall_time_ns=second_receive_wall_time_ns,
+    )
+
+    clock.now = 121.001
+    wall_clock_ns.now = 30_000
+    assert state.watchdog_due()
+    wall_clock_ns.now = 35_000
+    assert not state.watchdog_due()
+
+    wall_clock_ns.now = 40_000
+    report = json.loads(state.format_report().removeprefix("[HOST CADENCE] "))
+    assert report["wall_time_ns"] == 40_000
+    assert report["last_receive_gap_over_watchdog_wall_time_ns"] == 20_000
+    assert report["last_watchdog_event_wall_time_ns"] == 30_000
+
+
+def test_default_off_host_cadence_never_reads_the_wall_clock():
+    def unexpected_wall_clock_read() -> int:
+        raise AssertionError("default-off diagnostics must not read the wall clock")
+
+    clock = FakeClock(1.0)
+    state = alohamini_host.HostCommandState(
+        watchdog_timeout_ms=1000,
+        diagnostics_enabled=False,
+        clock=clock,
+        wall_clock_ns=unexpected_wall_clock_read,
+    )
+
+    assert state.capture_wall_time_ns() is None
+    clock.now = 1.1
+    state.record_command({})
+    clock.now = 2.101
+    assert state.watchdog_due()
+    assert state.snapshot() is None
+
+
+def test_host_command_state_uses_monotonic_intervals_and_latches_watchdog():
+    clock = FakeClock(100.0)
+    wall_clock_ns = FakeClock(10_000)
+    state = alohamini_host.HostCommandState(
+        watchdog_timeout_ms=1000,
+        diagnostics_enabled=True,
+        clock=clock,
+        wall_clock_ns=wall_clock_ns,
     )
 
     clock.now = 100.1
@@ -312,13 +376,16 @@ def test_host_command_state_uses_monotonic_intervals_and_latches_watchdog():
     )
 
     assert state.snapshot() == {
+        "wall_time_ns": 10_000,
         "command_sequence": 2,
         "last_receive_gap_ms": pytest.approx(250.0),
         "max_receive_gap_ms": pytest.approx(250.0),
         "receive_gap_over_watchdog_count": 0,
         "last_receive_gap_over_watchdog_sequence": None,
         "last_receive_gap_over_watchdog_ms": None,
+        "last_receive_gap_over_watchdog_wall_time_ns": None,
         "watchdog_events": 0,
+        "last_watchdog_event_wall_time_ns": None,
         "target_limited": True,
         "right_wrist_requested": 50.0,
         "right_wrist_final": 30.0,
@@ -328,20 +395,25 @@ def test_host_command_state_uses_monotonic_intervals_and_latches_watchdog():
     clock.now = 101.35
     assert not state.watchdog_due()
     clock.now = 101.351
+    wall_clock_ns.now = 20_000
     assert state.watchdog_due()
     assert not state.watchdog_due()
+    wall_clock_ns.now = 30_000
     report_prefix = "[HOST CADENCE] "
     report = state.format_report()
     assert report.startswith(report_prefix)
     report_state = json.loads(report.removeprefix(report_prefix))
     assert report_state == {
+        "wall_time_ns": 30_000,
         "command_sequence": 2,
         "last_receive_gap_ms": pytest.approx(250.0),
         "max_receive_gap_ms": pytest.approx(250.0),
         "receive_gap_over_watchdog_count": 0,
         "last_receive_gap_over_watchdog_sequence": None,
         "last_receive_gap_over_watchdog_ms": None,
+        "last_receive_gap_over_watchdog_wall_time_ns": None,
         "watchdog_events": 1,
+        "last_watchdog_event_wall_time_ns": 20_000,
         "target_limited": True,
         "right_wrist_requested": 50.0,
         "right_wrist_final": 30.0,
@@ -368,3 +440,45 @@ def test_host_cadence_instrumentation_is_default_off():
     state.record_command({"target_limited": True})
 
     assert state.snapshot() is None
+
+
+def test_main_emits_a_final_host_cadence_snapshot_before_cleanup(monkeypatch, capsys):
+    args = make_parser().parse_args(
+        ["--profile_cadence", "true", "--no_cameras", "--skip_lift_home"]
+    )
+    cleanup_events = []
+
+    class FakeRobot:
+        def __init__(self, config):
+            self.is_connected = True
+
+        def disconnect(self):
+            cleanup_events.append("robot_disconnect")
+            self.is_connected = False
+
+    class FakeHost:
+        watchdog_timeout_ms = 1000
+        connection_time_s = 0
+
+        def __init__(self, config):
+            pass
+
+        def disconnect(self):
+            cleanup_events.append("host_disconnect")
+
+    monkeypatch.setattr(
+        alohamini_host,
+        "make_parser",
+        lambda: SimpleNamespace(parse_args=lambda: args),
+    )
+    monkeypatch.setattr(alohamini_host, "AlohaMini", FakeRobot)
+    monkeypatch.setattr(alohamini_host, "connect_robot", lambda robot, skip_lift_home: None)
+    monkeypatch.setattr(alohamini_host, "AlohaMiniHost", FakeHost)
+
+    alohamini_host.main()
+
+    cadence_lines = [
+        line for line in capsys.readouterr().out.splitlines() if line.startswith("[HOST CADENCE] ")
+    ]
+    assert len(cadence_lines) == 1
+    assert cleanup_events == ["robot_disconnect", "host_disconnect"]

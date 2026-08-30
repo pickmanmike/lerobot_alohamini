@@ -62,10 +62,12 @@ class HostCommandState:
         watchdog_timeout_ms: int,
         diagnostics_enabled: bool = False,
         clock: Callable[[], float] | None = None,
+        wall_clock_ns: Callable[[], int] | None = None,
     ) -> None:
         self.watchdog_timeout_ms = watchdog_timeout_ms
         self.diagnostics_enabled = diagnostics_enabled
         self._clock = time.monotonic if clock is None else clock
+        self._wall_clock_ns = time.time_ns if wall_clock_ns is None else wall_clock_ns
         self._last_command_s = self._clock()
         self._previous_receive_s: float | None = None
         self._watchdog_active = False
@@ -75,14 +77,23 @@ class HostCommandState:
         self._receive_gap_over_watchdog_count = 0
         self._last_receive_gap_over_watchdog_sequence: int | None = None
         self._last_receive_gap_over_watchdog_ms: float | None = None
+        self._last_receive_gap_over_watchdog_wall_time_ns: int | None = None
         self._watchdog_events = 0
+        self._last_watchdog_event_wall_time_ns: int | None = None
         self._last_action_diagnostics: dict[str, object] = {}
+
+    def capture_wall_time_ns(self) -> int | None:
+        """Capture a shared log timestamp without adding work when diagnostics are off."""
+        if not self.diagnostics_enabled:
+            return None
+        return self._wall_clock_ns()
 
     def record_command(
         self,
         action_diagnostics: dict[str, object],
         *,
         received_at: float | None = None,
+        received_wall_time_ns: int | None = None,
     ) -> None:
         completed_at = self._clock()
         receive_time = completed_at if received_at is None else received_at
@@ -96,6 +107,7 @@ class HostCommandState:
                     self._receive_gap_over_watchdog_count += 1
                     self._last_receive_gap_over_watchdog_sequence = self._command_sequence
                     self._last_receive_gap_over_watchdog_ms = gap_ms
+                    self._last_receive_gap_over_watchdog_wall_time_ns = received_wall_time_ns
             self._last_action_diagnostics = dict(action_diagnostics)
         self._previous_receive_s = receive_time
         # Preserve the established watchdog lifecycle: a successfully applied action
@@ -111,12 +123,14 @@ class HostCommandState:
         self._watchdog_active = True
         if self.diagnostics_enabled:
             self._watchdog_events += 1
+            self._last_watchdog_event_wall_time_ns = self._wall_clock_ns()
         return True
 
     def snapshot(self) -> dict[str, object] | None:
         if not self.diagnostics_enabled:
             return None
         return {
+            "wall_time_ns": self._wall_clock_ns(),
             "command_sequence": self._command_sequence,
             "last_receive_gap_ms": self._last_receive_gap_ms,
             "max_receive_gap_ms": self._max_receive_gap_ms,
@@ -125,7 +139,11 @@ class HostCommandState:
                 self._last_receive_gap_over_watchdog_sequence
             ),
             "last_receive_gap_over_watchdog_ms": self._last_receive_gap_over_watchdog_ms,
+            "last_receive_gap_over_watchdog_wall_time_ns": (
+                self._last_receive_gap_over_watchdog_wall_time_ns
+            ),
             "watchdog_events": self._watchdog_events,
+            "last_watchdog_event_wall_time_ns": self._last_watchdog_event_wall_time_ns,
             "target_limited": _jsonable(self._last_action_diagnostics.get("target_limited")),
             "right_wrist_requested": _jsonable(
                 self._last_action_diagnostics.get("right_wrist_requested")
@@ -141,6 +159,12 @@ class HostCommandState:
         if snapshot is None:
             return None
         return f"[HOST CADENCE] {json.dumps(snapshot, separators=(',', ':'))}"
+
+
+def print_cadence_report(command_state: HostCommandState) -> None:
+    report = command_state.format_report()
+    if report is not None:
+        print(report, flush=True)
 
 
 def _jsonable(value):
@@ -341,6 +365,7 @@ def main():
             try:
                 msg = host.zmq_cmd_socket.recv_string(zmq.NOBLOCK)
                 command_received_t = time.monotonic()
+                command_received_wall_time_ns = command_state.capture_wall_time_ns()
                 data = dict(json.loads(msg))
                 #print(f"Received action: {data}")   # debug 
                 _action_sent = robot.send_action(data)
@@ -348,6 +373,7 @@ def main():
                 command_state.record_command(
                     robot.logs.get("action_diagnostics", {}),
                     received_at=command_received_t,
+                    received_wall_time_ns=command_received_wall_time_ns,
                 )
             except zmq.Again:
                 pass
@@ -462,7 +488,7 @@ def main():
 
             cadence_now = time.monotonic()
             if args.profile_cadence and cadence_now - cadence_report_start_t >= 1.0:
-                print(command_state.format_report(), flush=True)
+                print_cadence_report(command_state)
                 cadence_report_start_t = cadence_now
 
             duration = time.perf_counter() - start
@@ -472,6 +498,11 @@ def main():
         print("Keyboard interrupt received. Exiting...")
     finally:
         print("Shutting down AlohaMini Host.")
+        if args.profile_cadence:
+            try:
+                print_cadence_report(command_state)
+            except Exception:
+                logging.exception("Failed to emit final host cadence report.")
         try:
             if robot.is_connected:
                 robot.disconnect()
