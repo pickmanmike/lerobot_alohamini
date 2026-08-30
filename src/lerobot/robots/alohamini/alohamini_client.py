@@ -356,7 +356,11 @@ class AlohaMiniClient(Robot):
         try:
             if isinstance(obs_data, bytes):
                 obs_data = obs_data.decode("utf-8")
-            return json.loads(obs_data)
+            observation = json.loads(obs_data)
+            if not isinstance(observation, dict):
+                logging.error("Observation JSON root must be an object.")
+                return None
+            return observation
         except (UnicodeDecodeError, json.JSONDecodeError) as e:
             logging.error(f"Error decoding JSON observation: {e}")
             return None

@@ -360,6 +360,39 @@ def test_production_conversion_failure_is_an_immediate_refusal_before_leader_rea
         )
 
 
+def test_production_wrong_root_observation_is_an_immediate_refusal_before_leader_read():
+    module = load_teleoperate()
+    from lerobot.robots.alohamini.alohamini_client import AlohaMiniClient
+
+    client = object.__new__(AlohaMiniClient)
+    client.__dict__["_state_order"] = (
+        *ARM_KEYS,
+        "x.vel",
+        "y.vel",
+        "theta.vel",
+        "lift_axis.height_mm",
+    )
+    client.logs = {}
+    client.last_frames = {}
+    client.last_remote_state = dict(FOLLOWER)
+    client._observation_sequence = 41
+    client._latest_raw_observation_keys = frozenset(FOLLOWER)
+    client._poll_and_get_latest_message = lambda: [b"[]"]
+    client.get_observation = lambda: dict(client._get_data()[1])
+
+    class UnreadLeader:
+        def get_action(self):
+            raise AssertionError("leader must not be read after malformed follower data")
+
+    with pytest.raises(module.SafetyRefusal, match="malformed"):
+        module.read_fresh_am1_live_sample(
+            client,
+            UnreadLeader(),
+            previous_sequence=41,
+            monotonic=lambda: 12.5,
+        )
+
+
 def test_production_sequence_timestamp_is_captured_at_receive_completion_before_parsing(monkeypatch):
     import lerobot.robots.alohamini.alohamini_client as client_module
 
