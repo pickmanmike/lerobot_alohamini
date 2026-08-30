@@ -24,7 +24,7 @@ import math
 import sys
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Literal, NamedTuple
@@ -281,6 +281,21 @@ def _joint_identity(key: str) -> tuple[str, str]:
     return side, joint
 
 
+def validate_am1_arm_position_key_set(keys: Iterable[str], *, source: str) -> None:
+    """Require exactly the AM1 arm-position keys while ignoring non-arm state."""
+    actual = {key for key in keys if key.startswith("arm_") and key.endswith(".pos")}
+    expected = set(AM1_ARM_POSITION_KEYS)
+    missing = sorted(expected - actual)
+    unexpected = sorted(actual - expected)
+    if missing or unexpected:
+        details = []
+        if missing:
+            details.append(f"missing {', '.join(missing)}")
+        if unexpected:
+            details.append(f"unexpected {', '.join(unexpected)}")
+        raise SafetyRefusal(f"{source} AM1 arm-position keys are invalid: {'; '.join(details)}")
+
+
 def extract_am1_arm_positions(
     values: dict[str, Any],
     *,
@@ -299,17 +314,7 @@ def extract_am1_arm_positions(
             key: value for key, value in values.items() if key.startswith("arm_") and key.endswith(".pos")
         }
 
-    expected = set(AM1_ARM_POSITION_KEYS)
-    actual = set(arm_values)
-    missing = sorted(expected - actual)
-    unexpected = sorted(actual - expected)
-    if missing or unexpected:
-        details = []
-        if missing:
-            details.append(f"missing {', '.join(missing)}")
-        if unexpected:
-            details.append(f"unexpected {', '.join(unexpected)}")
-        raise SafetyRefusal(f"{source} AM1 arm-position keys are invalid: {'; '.join(details)}")
+    validate_am1_arm_position_key_set(arm_values, source=source)
 
     validated: dict[str, float] = {}
     for key in AM1_ARM_POSITION_KEYS:
@@ -354,6 +359,13 @@ def read_fresh_am1_live_sample(
         raise SafetyRefusal(
             "observation_sequence regressed "
             f"(previous={previous_sequence}, current={observation_sequence})"
+        )
+
+    raw_observation_keys = getattr(robot, "latest_raw_observation_keys", None)
+    if raw_observation_keys is not None:
+        validate_am1_arm_position_key_set(
+            raw_observation_keys,
+            source="live follower observation payload",
         )
 
     follower_positions = extract_am1_arm_positions(
@@ -677,7 +689,7 @@ def run_startup_sync(
     input_fn: Callable[[str], str],
     monotonic: Callable[[], float],
     sleep_fn: Callable[[float], None],
-) -> tuple[dict[str, float], dict[str, Any]]:
+) -> tuple[dict[str, float], dict[str, Any], float]:
     print("HOLD LEADERS STILL — STARTUP SYNCHRONIZATION IN PROGRESS")
     initial_observation = get_fresh_follower_observation(robot)
     initial_follower = extract_am1_arm_positions(
@@ -762,6 +774,7 @@ def run_startup_sync(
     verification_attempts = int(getattr(robot.config, "observation_request_window", 1)) + 1
     for verification_index in range(verification_attempts):
         final_observation = get_fresh_follower_observation(robot)
+        final_observed_at = monotonic()
         final_follower = extract_am1_arm_positions(
             final_observation,
             source="follower",
@@ -780,15 +793,18 @@ def run_startup_sync(
             continue
         break
 
-    return dict(plan.frozen_leader_target), final_observation
+    return dict(plan.frozen_leader_target), final_observation, final_observed_at
 
 
 def run_alignment_gate(
     robot: Any,
     leader: Any,
     max_start_mismatch: float,
-) -> tuple[dict[str, float], dict[str, Any]]:
+    *,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> tuple[dict[str, float], dict[str, Any], float]:
     observation = get_fresh_follower_observation(robot)
+    observed_at = monotonic()
     follower_positions = extract_am1_arm_positions(
         observation,
         source="follower",
@@ -811,7 +827,7 @@ def run_alignment_gate(
             f"absolute_difference={worst.absolute_difference} exceeds --max_start_mismatch "
             f"{max_start_mismatch}"
         )
-    return leader_positions, observation
+    return leader_positions, observation, observed_at
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1074,6 +1090,7 @@ def run_am1_live_sender(
     *,
     initial_arm_target: Mapping[str, float],
     initial_observation_sequence: int,
+    initial_follower_observed_at: float | None = None,
     fps: int,
     duration_s: float,
     live_arm_scope: LiveArmScope,
@@ -1114,6 +1131,14 @@ def run_am1_live_sender(
     if live_arm_scope == "right_wrist_flex" and follower_hold_target is None:
         raise SafetyRefusal("right_wrist_flex live scope requires a fresh follower hold snapshot")
 
+    started_at = monotonic()
+    if initial_follower_observed_at is None:
+        initial_follower_observed_at = started_at
+    if not math.isfinite(initial_follower_observed_at):
+        raise SafetyRefusal("initial follower observation time must be finite")
+    if initial_follower_observed_at > started_at:
+        raise SafetyRefusal("initial follower observation time cannot be in the future")
+
     hold_target = follower_hold_target if live_arm_scope == "right_wrist_flex" else approved_target
     safe_target = dict(hold_target if live_arm_scope == "right_wrist_flex" else approved_target)
     observed_positions = None if follower_hold_target is None else dict(follower_hold_target)
@@ -1134,9 +1159,8 @@ def run_am1_live_sender(
     last_used_observation_sequence = initial_observation_sequence
     observation_timeout_count = 0
     terminal_stale_reason: str | None = None
-    started_at = monotonic()
-    latest_observed_at: float | None = started_at if follower_hold_target is not None else None
-    last_fresh_observed_at = started_at
+    latest_observed_at: float | None = initial_follower_observed_at
+    last_fresh_observed_at = initial_follower_observed_at
 
     try:
         sender.start()
@@ -1288,7 +1312,9 @@ def run_teleoperation(
     shutdown_rerun = None
     pending_arm_action: dict[str, float] | None = None
     pending_observation: dict[str, Any] = {}
+    pending_observed_at: float | None = None
     teleoperation_active_announced = False
+    alignment_monotonic = monotonic if uses_decoupled_am1_live_loop(args) else time.monotonic
 
     try:
         if not args.no_robot:
@@ -1329,16 +1355,17 @@ def run_teleoperation(
         if args.robot_model == "alohamini1" and robot_connected and right_leader_connected:
             try:
                 if args.startup_mode == "strict":
-                    pending_arm_action, pending_observation = run_alignment_gate(
+                    pending_arm_action, pending_observation, pending_observed_at = run_alignment_gate(
                         robot,
                         leader,
                         args.max_start_mismatch,
+                        monotonic=alignment_monotonic,
                     )
                     if args.check_alignment_only:
                         print("Alignment check passed; no arm action was sent.")
                         return 0
                 else:
-                    pending_arm_action, pending_observation = run_startup_sync(
+                    pending_arm_action, pending_observation, pending_observed_at = run_startup_sync(
                         robot,
                         leader,
                         side=args.startup_sync_side,
@@ -1379,10 +1406,11 @@ def run_teleoperation(
                 input_fn("Press Enter to begin forwarding leader actions... ")
             if args.robot_model == "alohamini1" and robot_connected and right_leader_connected:
                 try:
-                    pending_arm_action, pending_observation = run_alignment_gate(
+                    pending_arm_action, pending_observation, pending_observed_at = run_alignment_gate(
                         robot,
                         leader,
                         args.max_start_mismatch,
+                        monotonic=alignment_monotonic,
                     )
                 except SafetyRefusal as exc:
                     print(f"SAFETY REFUSAL: {exc}")
@@ -1394,6 +1422,8 @@ def run_teleoperation(
             and right_leader_connected
             and pending_arm_action is not None
         ):
+            if pending_observed_at is None:
+                raise SafetyRefusal("approved initial follower observation is missing its receipt time")
             initial_follower_positions = extract_am1_arm_positions(
                 pending_observation,
                 source="approved initial follower observation",
@@ -1425,6 +1455,7 @@ def run_teleoperation(
                     leader,
                     initial_arm_target=pending_arm_action,
                     initial_observation_sequence=robot.observation_sequence,
+                    initial_follower_observed_at=pending_observed_at,
                     initial_follower_positions=initial_follower_positions,
                     fps=args.fps,
                     duration_s=args.duration_s,

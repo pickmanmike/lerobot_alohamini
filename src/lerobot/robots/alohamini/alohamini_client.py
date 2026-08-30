@@ -151,6 +151,7 @@ class AlohaMiniClient(Robot):
         # Incremented only when a new observation message is successfully decoded.
         # Callers can use this to distinguish a fresh remote frame from ``last_frames`` fallback.
         self._observation_sequence = 0
+        self._latest_raw_observation_keys: frozenset[str] = frozenset()
         self._lift_target_mm = None
 
         # Define three speed levels and a current index
@@ -207,6 +208,11 @@ class AlohaMiniClient(Robot):
     def observation_sequence(self) -> int:
         """Number of successfully received remote observations."""
         return self._observation_sequence
+
+    @property
+    def latest_raw_observation_keys(self) -> frozenset[str]:
+        """Keys present in the remote payload that produced ``observation_sequence``."""
+        return self._latest_raw_observation_keys
 
     @property
     def is_calibrated(self) -> bool:
@@ -430,9 +436,11 @@ class AlohaMiniClient(Robot):
     ) -> tuple[dict[str, np.ndarray], RobotObservation]:
         """Extracts frames, and state from the parsed observation."""
 
+        raw_observation_keys = frozenset(observation)
         flat_state = {key: observation.get(key, 0.0) for key in self._state_order}
 
         state_vec = np.array([flat_state[key] for key in self._state_order], dtype=np.float32)
+        self._latest_raw_observation_keys = raw_observation_keys
 
         obs_dict: RobotObservation = {**flat_state, OBS_STATE: state_vec}
         #lineno = frame.f_lineno

@@ -1369,7 +1369,7 @@ def test_sync_uses_post_confirmation_start_and_frozen_target_for_bounded_payload
         events.append(("operator", "confirmation", "SYNC"))
         return "SYNC"
 
-    frozen_target, final_observation = module.run_startup_sync(
+    frozen_target, final_observation, _ = module.run_startup_sync(
         robot,
         leader,
         side="both",
@@ -1510,7 +1510,7 @@ def test_sync_retries_verification_after_stale_precommand_observation(monkeypatc
     )
     clock = FakeClock(events)
 
-    frozen_target, final_observation = module.run_startup_sync(
+    frozen_target, final_observation, _ = module.run_startup_sync(
         robot,
         leader,
         side="left",
@@ -1680,7 +1680,7 @@ def test_sync_one_side_ignores_unselected_drift_and_final_mismatch_but_prints_it
     )
     clock = FakeClock(events)
 
-    frozen_target, _ = module.run_startup_sync(
+    frozen_target, _, _ = module.run_startup_sync(
         robot,
         leader,
         side=side,

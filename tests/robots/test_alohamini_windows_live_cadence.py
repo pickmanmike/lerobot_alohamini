@@ -212,6 +212,84 @@ def test_partial_observation_is_an_immediate_safety_refusal():
         )
 
 
+@pytest.mark.parametrize(
+    ("raw_arm_positions", "reason"),
+    [
+        (
+            {key: value for key, value in FOLLOWER.items() if key != ARM_KEYS[0]},
+            "missing",
+        ),
+        (
+            {**FOLLOWER, "arm_left_unexpected.pos": 12.0},
+            "unexpected",
+        ),
+    ],
+)
+def test_production_normalization_cannot_hide_invalid_raw_arm_key_sets(raw_arm_positions, reason):
+    module = load_teleoperate()
+    from lerobot.robots.alohamini.alohamini_client import AlohaMiniClient
+
+    client = object.__new__(AlohaMiniClient)
+    client.__dict__["_state_order"] = (
+        *ARM_KEYS,
+        "x.vel",
+        "y.vel",
+        "theta.vel",
+        "lift_axis.height_mm",
+    )
+    client._observation_sequence = 42
+    raw_observation = {
+        **raw_arm_positions,
+        "x.vel": 0.0,
+        "y.vel": 0.0,
+        "theta.vel": 0.0,
+        "lift_axis.height_mm": 0.0,
+        "lift_axis.vel": 0.0,
+    }
+    _, normalized_observation = client._remote_state_from_obs(raw_observation, {})
+    client.get_observation = lambda: dict(normalized_observation)
+
+    leader = SampleLeader()
+    leader.read_count = 0
+    original_get_action = leader.get_action
+
+    def counted_get_action():
+        leader.read_count += 1
+        return original_get_action()
+
+    leader.get_action = counted_get_action
+    with pytest.raises(module.SafetyRefusal, match=reason):
+        module.read_fresh_am1_live_sample(
+            client,
+            leader,
+            previous_sequence=41,
+            monotonic=lambda: 12.5,
+        )
+
+    assert leader.read_count == 0
+
+
+def test_regressing_observation_sequence_refuses_before_leader_read():
+    module = load_teleoperate()
+
+    class RegressingRobot(SampleRobot):
+        def get_observation(self):
+            self.observation_sequence = 40
+            return dict(self.observation)
+
+    class UnreadLeader(SampleLeader):
+        def get_action(self):
+            raise AssertionError("leader must not be read after an observation sequence regression")
+
+    with pytest.raises(module.SafetyRefusal, match="observation_sequence regressed"):
+        module.read_fresh_am1_live_sample(
+            RegressingRobot(),
+            UnreadLeader(),
+            previous_sequence=41,
+            monotonic=lambda: 12.5,
+        )
+
+
 def test_completion_spaced_deadline_never_catches_up_after_late_send():
     module = load_teleoperate()
 
@@ -505,6 +583,61 @@ def test_right_wrist_runner_refuses_without_fresh_follower_hold_snapshot():
             live_arm_scope="right_wrist_flex",
             profile_cadence=False,
         )
+
+
+def test_initial_follower_age_uses_the_post_gate_receipt_time():
+    module = load_teleoperate()
+    robot = TimedRobot(advance=False)
+
+    class UnreadLeader(SampleLeader):
+        def get_action(self):
+            raise AssertionError("leader must not be read after the initial follower sample is already stale")
+
+    with pytest.raises(module.SafetyRefusal, match="freshness limit"):
+        module.run_am1_live_sender(
+            robot,
+            UnreadLeader(),
+            initial_arm_target=FOLLOWER,
+            initial_observation_sequence=robot.observation_sequence,
+            initial_follower_observed_at=time.monotonic() - 1.1,
+            fps=10,
+            duration_s=0,
+            live_arm_scope="both",
+            profile_cadence=False,
+        )
+
+
+def test_alignment_gate_timestamps_the_follower_before_reading_the_leader(capsys):
+    module = load_teleoperate()
+    events: list[str] = []
+
+    class GateRobot:
+        def __init__(self):
+            self.config = SimpleNamespace(connect_timeout_s=1.0)
+            self.observation_sequence = 0
+
+        def get_observation(self):
+            events.append("follower")
+            self.observation_sequence += 1
+            return dict(FOLLOWER)
+
+    class GateLeader:
+        def get_action(self):
+            events.append("leader")
+            return dict(LEADER)
+
+    approved, observation, observed_at = module.run_alignment_gate(
+        GateRobot(),
+        GateLeader(),
+        max_start_mismatch=10.0,
+        monotonic=lambda: events.append("timestamp") or 17.25,
+    )
+
+    assert approved == FOLLOWER
+    assert observation == FOLLOWER
+    assert observed_at == 17.25
+    assert events == ["follower", "timestamp", "leader"]
+    capsys.readouterr()
 
 
 def test_actual_live_runner_tolerates_cached_observation_below_freshness_limit(capsys):
@@ -1264,6 +1397,77 @@ def test_run_teleoperation_joins_sampler_before_real_cleanup_and_preserves_worke
     assert LifecycleRobot.instance.created_config.command_send_timeout_ms == 50
 
 
+def test_run_teleoperation_uses_the_post_enter_follower_pose_and_receipt_time(monkeypatch):
+    module = load_teleoperate()
+    pre_enter_follower = {key: value + 20.0 for key, value in FOLLOWER.items()}
+    post_enter_follower = {key: value + 30.0 for key, value in FOLLOWER.items()}
+    gate_results = iter(
+        (
+            (dict(FOLLOWER), pre_enter_follower, 10.0),
+            (dict(FOLLOWER), post_enter_follower, 20.0),
+        )
+    )
+    captured: dict[str, object] = {}
+
+    class FakeRobot:
+        def __init__(self, config):
+            self.config = SimpleNamespace(teleop_keys={"quit": "q"}, connect_timeout_s=1.0)
+            self.observation_sequence = 0
+
+        def connect(self):
+            return None
+
+        def send_action(self, action):
+            return dict(action)
+
+        def disconnect(self):
+            return None
+
+    class FakeArm:
+        def connect(self):
+            return None
+
+        def disconnect(self):
+            return None
+
+    class FakeLeader:
+        def __init__(self, config):
+            self.left_arm = FakeArm()
+            self.right_arm = FakeArm()
+
+    def fake_alignment_gate(robot, leader, max_start_mismatch, *, monotonic):
+        robot.observation_sequence += 1
+        return next(gate_results)
+
+    def fake_live_sender(robot, leader, **kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(module, "AlohaMiniClient", FakeRobot)
+    monkeypatch.setattr(module, "BiSOLeader", FakeLeader)
+    monkeypatch.setattr(module, "run_alignment_gate", fake_alignment_gate)
+    monkeypatch.setattr(module, "run_am1_live_sender", fake_live_sender)
+    args = parse_windows(
+        module,
+        "--no_keyboard",
+        "--no_cameras",
+        "--no_rerun",
+        "--start_paused",
+        "--live_arm_scope",
+        "right_wrist_flex",
+        "--duration_s",
+        "0.1",
+    )
+
+    assert module.run_teleoperation(args, input_fn=lambda prompt: "", monotonic=lambda: 99.0) == 0
+    assert captured["initial_observation_sequence"] == 2
+    assert captured["initial_follower_positions"] == post_enter_follower
+    assert captured["initial_follower_observed_at"] == 20.0
+    assert module.make_am1_live_action(captured["initial_follower_positions"]) == {
+        **post_enter_follower,
+        **module.make_zero_action(),
+    }
+
+
 def test_run_teleoperation_turns_live_worker_safety_refusal_into_status_two(monkeypatch, capsys):
     module = load_teleoperate()
     events: list[tuple | str] = []
@@ -1300,7 +1504,11 @@ def test_run_teleoperation_turns_live_worker_safety_refusal_into_status_two(monk
 
     monkeypatch.setattr(module, "AlohaMiniClient", FakeRobot)
     monkeypatch.setattr(module, "BiSOLeader", FakeLeader)
-    monkeypatch.setattr(module, "run_alignment_gate", lambda *args: (dict(FOLLOWER), dict(FOLLOWER)))
+    monkeypatch.setattr(
+        module,
+        "run_alignment_gate",
+        lambda *args, **kwargs: (dict(FOLLOWER), dict(FOLLOWER), 0.0),
+    )
     monkeypatch.setattr(module, "run_am1_live_sender", lambda *args, **kwargs: (_ for _ in ()).throw(refusal))
     args = parse_windows(module, "--no_keyboard", "--no_cameras", "--no_rerun")
 
