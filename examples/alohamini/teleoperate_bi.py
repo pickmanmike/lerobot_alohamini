@@ -19,8 +19,10 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import sys
+import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -56,8 +58,12 @@ AM1_ARM_POSITION_KEYS = (
 ACTION_RANGE_TOLERANCE = 1e-6
 STARTUP_SYNC_MAX_STEP = 0.75
 STARTUP_SYNC_LEADER_DRIFT = 2.0
+AM1_COMMAND_SEND_TIMEOUT_MS = 50
+AM1_LIVE_OBSERVATION_MAX_AGE_S = 1.0
+RIGHT_WRIST_FLEX_KEY = "arm_right_wrist_flex.pos"
 
 StartupSyncSide = Literal["left", "right", "both"]
+LiveArmScope = Literal["both", "right_wrist_flex"]
 
 
 @dataclass(frozen=True)
@@ -79,12 +85,125 @@ class SafetyRefusal(ValueError):
     """An expected refusal to forward an unsafe Aloha Mini 1 arm sample."""
 
 
+class StaleFollowerObservation(RuntimeError):
+    """A live follower sample was cached, partial, or otherwise unusable."""
+
+
 class AlignmentRow(NamedTuple):
     joint: str
     follower_value: float
     leader_value: float
     signed_difference: float
     absolute_difference: float
+
+
+@dataclass(frozen=True)
+class AM1LiveSample:
+    observation_sequence: int
+    observed_at: float
+    observation: Mapping[str, Any]
+    follower_positions: Mapping[str, float]
+    arm_target: Mapping[str, float]
+
+
+@dataclass(frozen=True)
+class AM1LiveSamplerSnapshot:
+    sample: AM1LiveSample | None
+    stale_reason: str | None
+    observation_timeout_count: int
+    error: BaseException | None
+
+
+class AM1LiveSampleMailbox:
+    """Publish one complete sample or one terminal live-sampling state atomically."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._sample: AM1LiveSample | None = None
+        self._stale_reason: str | None = None
+        self._observation_timeout_count = 0
+        self._error: BaseException | None = None
+
+    def publish(self, sample: AM1LiveSample) -> None:
+        with self._lock:
+            if self._stale_reason is None and self._error is None:
+                self._sample = sample
+
+    def latch_stale(self, reason: str) -> None:
+        with self._lock:
+            if self._stale_reason is None and self._error is None:
+                self._stale_reason = reason
+                self._observation_timeout_count += 1
+
+    def publish_error(self, error: BaseException) -> None:
+        with self._lock:
+            if self._stale_reason is None and self._error is None:
+                self._error = error
+
+    def snapshot(self) -> AM1LiveSamplerSnapshot:
+        with self._lock:
+            return AM1LiveSamplerSnapshot(
+                sample=self._sample,
+                stale_reason=self._stale_reason,
+                observation_timeout_count=self._observation_timeout_count,
+                error=self._error,
+            )
+
+
+class AM1LiveSampler:
+    """Own follower-observation and leader-bus reads outside the sender loop."""
+
+    def __init__(
+        self,
+        robot: Any,
+        leader: Any,
+        *,
+        previous_sequence: int,
+        monotonic: Callable[[], float] = time.monotonic,
+        sample_callback: Callable[[AM1LiveSample], None] | None = None,
+    ) -> None:
+        self.mailbox = AM1LiveSampleMailbox()
+        self._robot = robot
+        self._leader = leader
+        self._previous_sequence = previous_sequence
+        self._monotonic = monotonic
+        self._sample_callback = sample_callback
+        self._stop_requested = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="am1-live-sampler",
+            daemon=False,
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_requested.set()
+
+    def join(self) -> None:
+        self._thread.join()
+
+    def _run(self) -> None:
+        try:
+            while not self._stop_requested.is_set():
+                try:
+                    sample = read_fresh_am1_live_sample(
+                        self._robot,
+                        self._leader,
+                        previous_sequence=self._previous_sequence,
+                        monotonic=self._monotonic,
+                    )
+                except StaleFollowerObservation as exc:
+                    self.mailbox.latch_stale(str(exc))
+                    return
+
+                self.mailbox.publish(sample)
+                self._previous_sequence = sample.observation_sequence
+                if self._sample_callback is not None:
+                    self._sample_callback(sample)
+        except BaseException as exc:
+            self.mailbox.publish_error(exc)
 
 
 def _joint_identity(key: str) -> tuple[str, str]:
@@ -144,6 +263,98 @@ def extract_am1_arm_positions(
         validated[key] = value
 
     return validated
+
+
+def read_fresh_am1_live_sample(
+    robot: Any,
+    leader: Any,
+    *,
+    previous_sequence: int,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> AM1LiveSample:
+    """Read one fresh follower observation followed by one complete leader target."""
+    observation = robot.get_observation()
+    observed_at = monotonic()
+    observation_sequence = int(robot.observation_sequence)
+    if observation_sequence <= previous_sequence:
+        raise StaleFollowerObservation(
+            "observation_sequence did not advance "
+            f"(previous={previous_sequence}, current={observation_sequence})"
+        )
+
+    try:
+        follower_positions = extract_am1_arm_positions(
+            dict(observation),
+            source="live follower observation",
+            leader_sample=False,
+        )
+    except SafetyRefusal as exc:
+        raise StaleFollowerObservation(str(exc)) from exc
+
+    arm_target = extract_am1_arm_positions(
+        leader.get_action(),
+        source="live leader",
+        leader_sample=True,
+    )
+    leader_sampled_at = monotonic()
+    observation_age_s = leader_sampled_at - observed_at
+    if observation_age_s >= AM1_LIVE_OBSERVATION_MAX_AGE_S:
+        raise StaleFollowerObservation(
+            f"follower observation age {observation_age_s:.3f}s reached the "
+            f"{AM1_LIVE_OBSERVATION_MAX_AGE_S:.1f}-second freshness limit after leader sampling"
+        )
+    return AM1LiveSample(
+        observation_sequence=observation_sequence,
+        observed_at=observed_at,
+        observation=MappingProxyType(dict(observation)),
+        follower_positions=MappingProxyType(follower_positions),
+        arm_target=MappingProxyType(arm_target),
+    )
+
+
+def apply_am1_commissioning_scope(
+    latest_arm_target: Mapping[str, float],
+    approved_arm_target: Mapping[str, float],
+    *,
+    scope: LiveArmScope,
+) -> dict[str, float]:
+    """Select a complete AM1 arm target without introducing a sign transform."""
+    latest = extract_am1_arm_positions(
+        dict(latest_arm_target),
+        source="latest live leader target",
+        leader_sample=False,
+    )
+    approved = extract_am1_arm_positions(
+        dict(approved_arm_target),
+        source="approved live hold target",
+        leader_sample=False,
+    )
+    validate_selected_sync_positions(latest, AM1_ARM_POSITION_KEYS, source="latest live leader target")
+    validate_selected_sync_positions(approved, AM1_ARM_POSITION_KEYS, source="approved live hold target")
+
+    if scope == "both":
+        return latest
+    if scope == "right_wrist_flex":
+        scoped = dict(approved)
+        scoped[RIGHT_WRIST_FLEX_KEY] = latest[RIGHT_WRIST_FLEX_KEY]
+        return scoped
+    raise ValueError(f"Unsupported live arm scope: {scope!r}")
+
+
+def make_am1_live_action(arm_target: Mapping[str, float]) -> dict[str, float | int]:
+    validated = extract_am1_arm_positions(
+        dict(arm_target),
+        source="live arm target",
+        leader_sample=False,
+    )
+    validate_selected_sync_positions(validated, AM1_ARM_POSITION_KEYS, source="live arm target")
+    return {**validated, **make_zero_action()}
+
+
+def next_completion_spaced_deadline(send_completed_at: float, *, fps: int) -> float:
+    if fps <= 0:
+        raise ValueError("fps must be greater than zero")
+    return send_completed_at + 1.0 / fps
 
 
 def selected_arm_position_keys(side: StartupSyncSide) -> tuple[str, ...]:
@@ -532,6 +743,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no_robot", action="store_true", help="Do not construct or connect the robot client")
     parser.add_argument("--no_leader", action="store_true", help="Do not construct or connect the leader arms")
     parser.add_argument("--no_keyboard", action="store_true", help="Disable keyboard base and lift control")
+    parser.add_argument(
+        "--no_cameras",
+        action="store_true",
+        help="Construct the client with an empty camera schema and perform no camera fallback work",
+    )
     parser.add_argument("--no_rerun", action="store_true", help="Disable Rerun without importing visualization helpers")
     parser.add_argument(
         "--require_calibration_match",
@@ -586,6 +802,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Stop cleanly after this many seconds; 0 has no time limit",
     )
     parser.add_argument("--fps", type=int, default=30, help="Main loop frequency (frames per second)")
+    parser.add_argument(
+        "--live_arm_scope",
+        choices=("both", "right_wrist_flex"),
+        default="both",
+        help=(
+            "AM1 live forwarding scope; right_wrist_flex holds every other arm joint at the "
+            "final approved startup target (default: both)"
+        ),
+    )
+    parser.add_argument(
+        "--profile_cadence",
+        action="store_true",
+        help="Emit one default-off bounded JSON timing summary after live AM1 forwarding",
+    )
     parser.add_argument(
         "--robot.remote_ip",
         "--remote_ip",
@@ -666,6 +896,21 @@ def parse_args(
             parser.error("--require_calibration_match requires --no_robot")
         if args.no_leader:
             parser.error("--require_calibration_match requires leader connections")
+    if args.live_arm_scope == "right_wrist_flex":
+        if args.robot_model != "alohamini1":
+            parser.error("--live_arm_scope right_wrist_flex is supported only for alohamini1")
+        if not args.start_paused:
+            parser.error("--live_arm_scope right_wrist_flex requires --start_paused")
+        if not args.no_keyboard:
+            parser.error("--live_arm_scope right_wrist_flex requires --no_keyboard")
+        if not args.no_cameras:
+            parser.error("--live_arm_scope right_wrist_flex requires --no_cameras")
+        if args.no_robot or args.no_leader:
+            parser.error("--live_arm_scope right_wrist_flex requires robot and leader connections")
+    if args.profile_cadence and not (
+        args.robot_model == "alohamini1" and args.no_keyboard and args.no_cameras
+    ):
+        parser.error("--profile_cadence requires alohamini1 with --no_keyboard and --no_cameras")
     return resolve_leader_ports(args, parser, platform_name=platform_name)
 
 
@@ -676,6 +921,26 @@ def make_leader_config(args: argparse.Namespace) -> BiSOLeaderConfig:
         leader_id=args.leader_id,
         arm_profile=args.arm_profile,
     )
+
+
+def make_robot_config(args: argparse.Namespace) -> AlohaMiniClientConfig:
+    config_kwargs: dict[str, Any] = {
+        "remote_ip": args.remote_ip,
+        "id": args.robot_id,
+        "robot_model": args.robot_model,
+        "command_send_timeout_ms": (
+            AM1_COMMAND_SEND_TIMEOUT_MS
+            if args.robot_model == "alohamini1" and args.no_keyboard and args.no_cameras
+            else None
+        ),
+    }
+    if args.no_cameras:
+        config_kwargs["cameras"] = {}
+    return AlohaMiniClientConfig(**config_kwargs)
+
+
+def uses_decoupled_am1_live_loop(args: argparse.Namespace) -> bool:
+    return args.robot_model == "alohamini1" and args.no_keyboard and args.no_cameras
 
 
 def make_zero_action() -> dict[str, float | int]:
@@ -715,10 +980,172 @@ def _print_connection_summary(args: argparse.Namespace) -> None:
     print(f"  Right leader port: {args.right_port}")
     print(f"  Leader profile: {args.arm_profile}")
     print(f"  FPS: {args.fps}")
+    print(f"  Cameras: {'disabled' if args.no_cameras else 'enabled'}")
+    if args.robot_model == "alohamini1":
+        print(f"  Live arm scope: {args.live_arm_scope}")
     print(f"  Keyboard: {'disabled' if args.no_keyboard else 'enabled'}")
     print(f"  Visualization: {'disabled' if args.no_rerun else 'enabled'}")
     print("  Action space: body joints -100..100; grippers 0..100")
     print("No leader action has yet been forwarded.")
+
+
+def run_am1_live_sender(
+    robot: Any,
+    leader: Any,
+    *,
+    initial_arm_target: Mapping[str, float],
+    initial_observation_sequence: int,
+    fps: int,
+    duration_s: float,
+    live_arm_scope: LiveArmScope,
+    profile_cadence: bool,
+    initial_follower_positions: Mapping[str, float] | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep_fn: Callable[[float], None] = precise_sleep,
+    should_stop: Callable[[], bool] | None = None,
+    sample_callback: Callable[[AM1LiveSample], None] | None = None,
+) -> None:
+    """Send AM1 arm targets independently of observation and leader sampling latency."""
+    approved_target = extract_am1_arm_positions(
+        dict(initial_arm_target),
+        source="approved initial live target",
+        leader_sample=False,
+    )
+    validate_selected_sync_positions(
+        approved_target,
+        AM1_ARM_POSITION_KEYS,
+        source="approved initial live target",
+    )
+    safe_target = dict(approved_target)
+    observed_positions = (
+        extract_am1_arm_positions(
+            dict(initial_follower_positions),
+            source="approved initial follower observation",
+            leader_sample=False,
+        )
+        if initial_follower_positions is not None
+        else None
+    )
+
+    sampler = AM1LiveSampler(
+        robot,
+        leader,
+        previous_sequence=initial_observation_sequence,
+        monotonic=monotonic,
+        sample_callback=sample_callback,
+    )
+    sampler_started = False
+    stale_announced = False
+    last_used_observation_sequence = initial_observation_sequence
+    latest_observed_at: float | None = None
+    action_sequence = 0
+    last_send_started_at: float | None = None
+    longest_send_interval_ms = 0.0
+    last_send_interval_ms = 0.0
+    started_at = monotonic()
+
+    try:
+        while True:
+            now = monotonic()
+            if duration_s > 0 and now - started_at >= duration_s:
+                break
+            if should_stop is not None and should_stop():
+                break
+
+            snapshot = sampler.mailbox.snapshot()
+            if snapshot.error is not None:
+                raise snapshot.error
+            if snapshot.stale_reason is not None and not stale_announced:
+                print(
+                    "STALE FOLLOWER OBSERVATION — holding the last safe complete arm target for "
+                    f"the remainder of this process: {snapshot.stale_reason}"
+                )
+                stale_announced = True
+            if (
+                snapshot.stale_reason is None
+                and snapshot.sample is not None
+                and snapshot.sample.observation_sequence > last_used_observation_sequence
+            ):
+                safe_target = apply_am1_commissioning_scope(
+                    snapshot.sample.arm_target,
+                    approved_target,
+                    scope=live_arm_scope,
+                )
+                observed_positions = dict(snapshot.sample.follower_positions)
+                latest_observed_at = snapshot.sample.observed_at
+                last_used_observation_sequence = snapshot.sample.observation_sequence
+
+            action = make_am1_live_action(safe_target)
+            send_started_at = monotonic()
+            robot.send_action(action)
+            send_completed_at = monotonic()
+            action_sequence += 1
+
+            send_interval_ms = (
+                0.0
+                if last_send_started_at is None
+                else (send_started_at - last_send_started_at) * 1e3
+            )
+            longest_send_interval_ms = max(longest_send_interval_ms, send_interval_ms)
+            last_send_interval_ms = send_interval_ms
+            last_send_started_at = send_started_at
+
+            if not sampler_started:
+                # Starting only after the first command preserves the final alignment sample as
+                # the first forwarded action, with no unchecked leader read in between.
+                sampler.start()
+                sampler_started = True
+
+            deadline = next_completion_spaced_deadline(send_completed_at, fps=fps)
+            sleep_fn(max(deadline - monotonic(), 0.0))
+    finally:
+        primary_error = sys.exception()
+        join_error: BaseException | None = None
+        if sampler_started:
+            sampler.stop()
+            try:
+                sampler.join()
+            except BaseException as exc:
+                join_error = exc
+                if primary_error is not None:
+                    primary_error.add_note(f"Cleanup failed while joining AM1 live sampler: {exc!r}")
+        final_snapshot = sampler.mailbox.snapshot()
+        if profile_cadence:
+            report_now = monotonic()
+            print(
+                json.dumps(
+                    {
+                        "event": "am1_client_action_cadence",
+                        "action_sequence": action_sequence,
+                        "action_send_interval_ms": round(last_send_interval_ms, 3),
+                        "longest_action_send_interval_ms": round(longest_send_interval_ms, 3),
+                        "observation_sequence": last_used_observation_sequence,
+                        "observation_age_ms": (
+                            None
+                            if latest_observed_at is None
+                            else round(max(0.0, report_now - latest_observed_at) * 1e3, 3)
+                        ),
+                        "observation_timeout_count": final_snapshot.observation_timeout_count,
+                        "stale_latched": final_snapshot.stale_reason is not None,
+                        "right_wrist_requested": safe_target[RIGHT_WRIST_FLEX_KEY],
+                        "right_wrist_observed": (
+                            None
+                            if observed_positions is None
+                            else observed_positions[RIGHT_WRIST_FLEX_KEY]
+                        ),
+                    },
+                    sort_keys=True,
+                )
+            )
+        if primary_error is None:
+            if join_error is not None:
+                raise join_error
+            if final_snapshot.error is not None:
+                raise final_snapshot.error
+            if final_snapshot.stale_reason is not None:
+                raise SafetyRefusal(final_snapshot.stale_reason)
+        elif final_snapshot.error is not None and final_snapshot.error is not primary_error:
+            primary_error.add_note(f"AM1 live sampler also failed: {final_snapshot.error!r}")
 
 
 def run_teleoperation(
@@ -744,13 +1171,7 @@ def run_teleoperation(
 
     try:
         if not args.no_robot:
-            robot = AlohaMiniClient(
-                AlohaMiniClientConfig(
-                    remote_ip=args.remote_ip,
-                    id=args.robot_id,
-                    robot_model=args.robot_model,
-                )
-            )
+            robot = AlohaMiniClient(make_robot_config(args))
             robot.connect()
             robot_connected = True
             robot.send_action(make_zero_action())
@@ -845,6 +1266,62 @@ def run_teleoperation(
                 except SafetyRefusal as exc:
                     print(f"SAFETY REFUSAL: {exc}")
                     return 2
+
+        if (
+            uses_decoupled_am1_live_loop(args)
+            and robot_connected
+            and right_leader_connected
+            and pending_arm_action is not None
+        ):
+            initial_follower_positions = extract_am1_arm_positions(
+                pending_observation,
+                source="approved initial follower observation",
+                leader_sample=False,
+            )
+
+            def stop_requested() -> bool:
+                if not keyboard_connected:
+                    return False
+                keyboard_keys = keyboard.get_action()
+                quit_key = robot.config.teleop_keys.get("quit", "q")
+                return quit_key in keyboard_keys
+
+            sample_callback = None
+            if log_rerun_data is not None:
+                approved_target = dict(pending_arm_action)
+
+                def log_live_sample(sample: AM1LiveSample) -> None:
+                    scoped = apply_am1_commissioning_scope(
+                        sample.arm_target,
+                        approved_target,
+                        scope=args.live_arm_scope,
+                    )
+                    log_rerun_data(dict(sample.observation), make_am1_live_action(scoped))
+
+                sample_callback = log_live_sample
+
+            print("TELEOPERATION ACTIVE — LEADER MOVEMENT IS NOW ALLOWED")
+            teleoperation_active_announced = True
+            try:
+                run_am1_live_sender(
+                    robot,
+                    leader,
+                    initial_arm_target=pending_arm_action,
+                    initial_observation_sequence=robot.observation_sequence,
+                    initial_follower_positions=initial_follower_positions,
+                    fps=args.fps,
+                    duration_s=args.duration_s,
+                    live_arm_scope=args.live_arm_scope,
+                    profile_cadence=args.profile_cadence,
+                    monotonic=monotonic,
+                    sleep_fn=sleep_fn,
+                    should_stop=stop_requested,
+                    sample_callback=sample_callback,
+                )
+            except SafetyRefusal as exc:
+                print(f"SAFETY REFUSAL: {exc}")
+                return 2
+            return 0
 
         started_at = monotonic()
         while True:

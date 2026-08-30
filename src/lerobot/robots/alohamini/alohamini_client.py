@@ -24,7 +24,6 @@ from functools import cached_property
 import os
 from typing import Any
 
-import cv2
 import numpy as np
 
 from lerobot.processor import RobotAction, RobotObservation
@@ -63,6 +62,9 @@ class AlohaMiniClient(Robot):
 
         self.polling_timeout_ms = config.polling_timeout_ms
         self.connect_timeout_s = config.connect_timeout_s
+        self.command_send_timeout_ms = config.command_send_timeout_ms
+        if self.command_send_timeout_ms is not None and self.command_send_timeout_ms <= 0:
+            raise ValueError("command_send_timeout_ms must be greater than zero when set")
         self.observation_request_window = config.observation_request_window
         if self.observation_request_window < 1:
             raise ValueError("observation_request_window must be at least 1")
@@ -149,12 +151,17 @@ class AlohaMiniClient(Robot):
         self.zmq_cmd_socket = self.zmq_context.socket(zmq.PUSH)
         # Socket options that control queueing must be set before connect().
         self.zmq_cmd_socket.setsockopt(zmq.CONFLATE, 1)
+        if self.command_send_timeout_ms is not None:
+            self.zmq_cmd_socket.setsockopt(zmq.SNDTIMEO, self.command_send_timeout_ms)
+            self.zmq_cmd_socket.setsockopt(zmq.LINGER, 0)
         zmq_cmd_locator = f"tcp://{self.remote_ip}:{self.port_zmq_cmd}"
         self.zmq_cmd_socket.connect(zmq_cmd_locator)
 
         # Request-driven observation transport with a small bounded window. This covers
         # network round-trip latency without allowing stale frames to accumulate unboundedly.
         self.zmq_observation_socket = self.zmq_context.socket(zmq.DEALER)
+        if self.command_send_timeout_ms is not None:
+            self.zmq_observation_socket.setsockopt(zmq.LINGER, 0)
         self.zmq_observation_socket.setsockopt(zmq.RCVHWM, self.observation_request_window)
         self.zmq_observation_socket.setsockopt(zmq.SNDHWM, self.observation_request_window)
         zmq_observations_locator = f"tcp://{self.remote_ip}:{self.port_zmq_observations}"
@@ -268,6 +275,8 @@ class AlohaMiniClient(Robot):
 
     def _decode_image_from_b64(self, image_b64: str) -> np.ndarray | None:
         """Decodes a base64 encoded image string to an OpenCV image."""
+        import cv2
+
         if not image_b64:
             return None
         try:
@@ -283,6 +292,8 @@ class AlohaMiniClient(Robot):
 
     def _decode_image_from_jpeg_bytes(self, jpg_data: bytes) -> np.ndarray | None:
         """Decodes JPEG bytes from a ZMQ multipart frame to an OpenCV image."""
+        import cv2
+
         if not jpg_data:
             return None
         frame = cv2.imdecode(np.frombuffer(jpg_data, np.uint8), cv2.IMREAD_COLOR)

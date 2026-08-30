@@ -15,12 +15,13 @@
 from dataclasses import dataclass, field
 
 from lerobot.cameras.configs import CameraConfig, Cv2Rotation
-from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
 
 from ..config import RobotConfig
 
 
 def alohamini_cameras_config() -> dict[str, CameraConfig]:
+    from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
+
     return {
         "forward": OpenCVCameraConfig(
             index_or_path="/dev/am_camera_forward", fps=30, width=640, height=480, rotation=Cv2Rotation.NO_ROTATION
@@ -129,3 +130,6 @@ class AlohaMiniClientConfig(RobotConfig):
     # Must exceed one host cycle at 30 Hz for request/reply observation transport.
     polling_timeout_ms: int = 200
     connect_timeout_s: int = 5
+    # Optional bound for command PUSH sends. ``None`` preserves the historical
+    # blocking behavior for callers and models that have not opted in.
+    command_send_timeout_ms: int | None = None
