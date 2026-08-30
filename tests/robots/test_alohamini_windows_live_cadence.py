@@ -227,26 +227,7 @@ def test_partial_observation_is_an_immediate_safety_refusal():
 )
 def test_production_normalization_cannot_hide_invalid_raw_arm_key_sets(raw_arm_positions, reason):
     module = load_teleoperate()
-    from lerobot.robots.alohamini.alohamini_client import AlohaMiniClient
-
-    client = object.__new__(AlohaMiniClient)
-    client.__dict__["_state_order"] = (
-        *ARM_KEYS,
-        "x.vel",
-        "y.vel",
-        "theta.vel",
-        "lift_axis.height_mm",
-    )
-    client._observation_sequence = 42
-    raw_observation = {
-        **raw_arm_positions,
-        "x.vel": 0.0,
-        "y.vel": 0.0,
-        "theta.vel": 0.0,
-        "lift_axis.height_mm": 0.0,
-        "lift_axis.vel": 0.0,
-    }
-    _, normalized_observation = client._remote_state_from_obs(raw_observation, {})
+    client, normalized_observation = make_production_normalized_client(raw_arm_positions)
     client.get_observation = lambda: dict(normalized_observation)
 
     leader = SampleLeader()
@@ -267,6 +248,162 @@ def test_production_normalization_cannot_hide_invalid_raw_arm_key_sets(raw_arm_p
         )
 
     assert leader.read_count == 0
+
+
+def make_production_normalized_client(raw_arm_positions):
+    from lerobot.robots.alohamini.alohamini_client import AlohaMiniClient
+
+    client = object.__new__(AlohaMiniClient)
+    client.__dict__["_state_order"] = (
+        *ARM_KEYS,
+        "x.vel",
+        "y.vel",
+        "theta.vel",
+        "lift_axis.height_mm",
+    )
+    client._observation_sequence = 42
+    client.config = SimpleNamespace(connect_timeout_s=1.0, observation_request_window=1)
+    raw_observation = {
+        **raw_arm_positions,
+        "x.vel": 0.0,
+        "y.vel": 0.0,
+        "theta.vel": 0.0,
+        "lift_axis.height_mm": 0.0,
+        "lift_axis.vel": 0.0,
+    }
+    _, normalized_observation = client._remote_state_from_obs(raw_observation, {})
+    return client, normalized_observation
+
+
+@pytest.mark.parametrize("entrypoint", ["alignment", "startup_sync"])
+@pytest.mark.parametrize(
+    ("raw_arm_positions", "reason"),
+    [
+        ({key: value for key, value in FOLLOWER.items() if key != ARM_KEYS[0]}, "missing"),
+        ({**FOLLOWER, "arm_right_unexpected.pos": 1.0}, "unexpected"),
+    ],
+)
+def test_startup_and_alignment_refuse_invalid_raw_arm_keys_before_leader_read(
+    entrypoint,
+    raw_arm_positions,
+    reason,
+):
+    module = load_teleoperate()
+    client, normalized_observation = make_production_normalized_client(raw_arm_positions)
+
+    def get_observation():
+        client._observation_sequence += 1
+        return dict(normalized_observation)
+
+    client.get_observation = get_observation
+
+    class UnreadLeader:
+        def get_action(self):
+            raise AssertionError("leader must not be read after an invalid raw follower payload")
+
+    with pytest.raises(module.SafetyRefusal, match=reason):
+        if entrypoint == "alignment":
+            module.run_alignment_gate(
+                client,
+                UnreadLeader(),
+                max_start_mismatch=10.0,
+                monotonic=lambda: 12.5,
+            )
+        else:
+            module.run_startup_sync(
+                client,
+                UnreadLeader(),
+                side="both",
+                requested_duration_s=1.0,
+                fps=10,
+                max_start_mismatch=10.0,
+                input_fn=lambda prompt: (_ for _ in ()).throw(
+                    AssertionError("operator prompt must not be reached after an invalid payload")
+                ),
+                monotonic=lambda: 12.5,
+                sleep_fn=lambda duration: None,
+            )
+
+
+def test_production_conversion_failure_is_an_immediate_refusal_before_leader_read():
+    module = load_teleoperate()
+    from lerobot.robots.alohamini.alohamini_client import AlohaMiniClient
+
+    client = object.__new__(AlohaMiniClient)
+    client.__dict__["_state_order"] = (
+        *ARM_KEYS,
+        "x.vel",
+        "y.vel",
+        "theta.vel",
+        "lift_axis.height_mm",
+    )
+    client.logs = {}
+    client.last_frames = {}
+    client.last_remote_state = dict(FOLLOWER)
+    client._observation_sequence = 41
+    client._latest_raw_observation_keys = frozenset(FOLLOWER)
+    raw_observation = {**FOLLOWER, ARM_KEYS[0]: "not-a-number"}
+    client._poll_and_get_latest_message = lambda: [b"payload"]
+    client._parse_observation_message = lambda message_parts: (raw_observation, {})
+    client.get_observation = lambda: dict(client._get_data()[1])
+
+    class UnreadLeader:
+        def get_action(self):
+            raise AssertionError("leader must not be read after malformed follower data")
+
+    with pytest.raises(module.SafetyRefusal, match="malformed"):
+        module.read_fresh_am1_live_sample(
+            client,
+            UnreadLeader(),
+            previous_sequence=41,
+            monotonic=lambda: 12.5,
+        )
+
+
+def test_production_sequence_timestamp_is_captured_at_receive_completion_before_parsing(monkeypatch):
+    import lerobot.robots.alohamini.alohamini_client as client_module
+
+    client = object.__new__(client_module.AlohaMiniClient)
+    client.__dict__["_state_order"] = (
+        *ARM_KEYS,
+        "x.vel",
+        "y.vel",
+        "theta.vel",
+        "lift_axis.height_mm",
+    )
+    client.logs = {}
+    client.last_frames = {}
+    client.last_remote_state = {}
+    client._observation_sequence = 0
+    client._latest_raw_observation_keys = frozenset()
+    receipt_captured = False
+
+    def capture_receipt_time():
+        nonlocal receipt_captured
+        receipt_captured = True
+        return 17.25
+
+    def parse_after_receipt(message_parts):
+        assert receipt_captured
+        return (
+            {
+                **FOLLOWER,
+                "x.vel": 0.0,
+                "y.vel": 0.0,
+                "theta.vel": 0.0,
+                "lift_axis.height_mm": 0.0,
+            },
+            {},
+        )
+
+    monkeypatch.setattr(client_module.time, "monotonic", capture_receipt_time)
+    client._poll_and_get_latest_message = lambda: [b"payload"]
+    client._parse_observation_message = parse_after_receipt
+
+    client._get_data()
+
+    assert client.observation_sequence == 1
+    assert client.latest_observation_received_at == 17.25
 
 
 def test_regressing_observation_sequence_refuses_before_leader_read():
@@ -605,6 +742,8 @@ def test_initial_follower_age_uses_the_post_gate_receipt_time():
             live_arm_scope="both",
             profile_cadence=False,
         )
+
+    assert robot.sends == []
 
 
 def test_alignment_gate_timestamps_the_follower_before_reading_the_leader(capsys):
@@ -1466,6 +1605,96 @@ def test_run_teleoperation_uses_the_post_enter_follower_pose_and_receipt_time(mo
         **post_enter_follower,
         **module.make_zero_action(),
     }
+
+
+def test_post_enter_production_normalization_refuses_missing_raw_joint_before_live_send(
+    monkeypatch,
+    capsys,
+):
+    module = load_teleoperate()
+    from lerobot.robots.alohamini.alohamini_client import AlohaMiniClient
+
+    valid_raw = {
+        **FOLLOWER,
+        "x.vel": 0.0,
+        "y.vel": 0.0,
+        "theta.vel": 0.0,
+        "lift_axis.height_mm": 0.0,
+    }
+    missing_raw = {key: value for key, value in valid_raw.items() if key != ARM_KEYS[0]}
+
+    class ProductionNormalizedRobot(AlohaMiniClient):
+        instance = None
+
+        def __init__(self, config):
+            super().__init__(config)
+            type(self).instance = self
+            self.raw_observations = iter((valid_raw, missing_raw))
+            self.actions = []
+
+        def connect(self):
+            self._is_connected = True
+
+        def get_observation(self):
+            raw_observation = next(self.raw_observations)
+            _, normalized = self._remote_state_from_obs(raw_observation, {})
+            self._observation_sequence += 1
+            return dict(normalized)
+
+        def send_action(self, action):
+            self.actions.append(dict(action))
+            return dict(action)
+
+        def disconnect(self):
+            self._is_connected = False
+
+    class FakeArm:
+        def connect(self):
+            return None
+
+        def disconnect(self):
+            return None
+
+    class CountingLeader:
+        instance = None
+
+        def __init__(self, config):
+            type(self).instance = self
+            self.left_arm = FakeArm()
+            self.right_arm = FakeArm()
+            self.read_count = 0
+
+        def get_action(self):
+            self.read_count += 1
+            return dict(LEADER)
+
+    monkeypatch.setattr(module, "AlohaMiniClient", ProductionNormalizedRobot)
+    monkeypatch.setattr(module, "BiSOLeader", CountingLeader)
+    monkeypatch.setattr(
+        module,
+        "run_am1_live_sender",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("live sender must not start after a malformed post-Enter follower payload")
+        ),
+    )
+    args = parse_windows(
+        module,
+        "--no_keyboard",
+        "--no_cameras",
+        "--no_rerun",
+        "--start_paused",
+        "--live_arm_scope",
+        "right_wrist_flex",
+    )
+
+    status = module.run_teleoperation(args, input_fn=lambda prompt: "")
+
+    assert status == 2
+    assert CountingLeader.instance.read_count == 1
+    output = capsys.readouterr().out
+    assert "SAFETY REFUSAL:" in output
+    assert "missing arm_left_shoulder_pan.pos" in output
+    assert "TELEOPERATION ACTIVE" not in output
 
 
 def test_run_teleoperation_turns_live_worker_safety_refusal_into_status_two(monkeypatch, capsys):

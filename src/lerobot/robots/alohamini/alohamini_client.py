@@ -152,6 +152,8 @@ class AlohaMiniClient(Robot):
         # Callers can use this to distinguish a fresh remote frame from ``last_frames`` fallback.
         self._observation_sequence = 0
         self._latest_raw_observation_keys: frozenset[str] = frozenset()
+        self._latest_observation_received_at: float | None = None
+        self._latest_observation_error: str | None = None
         self._lift_target_mm = None
 
         # Define three speed levels and a current index
@@ -213,6 +215,16 @@ class AlohaMiniClient(Robot):
     def latest_raw_observation_keys(self) -> frozenset[str]:
         """Keys present in the remote payload that produced ``observation_sequence``."""
         return self._latest_raw_observation_keys
+
+    @property
+    def latest_observation_received_at(self) -> float | None:
+        """Monotonic receive-completion time for ``observation_sequence``."""
+        return self._latest_observation_received_at
+
+    @property
+    def latest_observation_error(self) -> str | None:
+        """Malformed-payload reason from the most recent observation request, if any."""
+        return self._latest_observation_error
 
     @property
     def is_calibrated(self) -> bool:
@@ -461,10 +473,12 @@ class AlohaMiniClient(Robot):
         """
 
         observation_start_t = time.perf_counter()
+        self._latest_observation_error = None
 
         # 1. Get the latest message from the socket
         latest_message_parts = self._poll_and_get_latest_message()
         receive_done_t = time.perf_counter()
+        received_at = time.monotonic() if latest_message_parts is not None else None
 
         # 2. If no message, return cached data
         if latest_message_parts is None:
@@ -478,6 +492,7 @@ class AlohaMiniClient(Robot):
         parsed = self._parse_observation_message(latest_message_parts)
         parse_done_t = time.perf_counter()
         if parsed is None:
+            self._latest_observation_error = "remote observation message could not be parsed"
             self.logs["observation_timing_ms"] = {
                 "obs_wait": (receive_done_t - observation_start_t) * 1e3,
                 **self.logs.get("observation_decode_timing_ms", {}),
@@ -490,11 +505,13 @@ class AlohaMiniClient(Robot):
         try:
             new_frames, new_state = self._remote_state_from_obs(observation, encoded_frames)
         except Exception as e:
+            self._latest_observation_error = f"{type(e).__name__}: {e}"
             logging.error(f"Error processing observation data, serving last observation: {e}")
             return self.last_frames, self.last_remote_state
 
         self.last_frames = {**self.last_frames, **new_frames}
         self.last_remote_state = new_state
+        self._latest_observation_received_at = received_at
         self._observation_sequence += 1
         observation_done_t = time.perf_counter()
         self.logs["observation_timing_ms"] = {

@@ -296,6 +296,36 @@ def validate_am1_arm_position_key_set(keys: Iterable[str], *, source: str) -> No
         raise SafetyRefusal(f"{source} AM1 arm-position keys are invalid: {'; '.join(details)}")
 
 
+def refuse_latest_am1_observation_error(robot: Any, *, source: str) -> None:
+    error = getattr(robot, "latest_observation_error", None)
+    if error is not None:
+        raise SafetyRefusal(f"{source} payload is malformed: {error}")
+
+
+def validate_latest_am1_raw_observation_keys(robot: Any, *, source: str) -> None:
+    raw_observation_keys = getattr(robot, "latest_raw_observation_keys", None)
+    if raw_observation_keys is not None:
+        validate_am1_arm_position_key_set(raw_observation_keys, source=source)
+
+
+def latest_am1_observation_received_at(
+    robot: Any,
+    *,
+    fallback: Callable[[], float],
+    source: str,
+) -> float:
+    received_at = getattr(robot, "latest_observation_received_at", None)
+    if received_at is None:
+        received_at = fallback()
+    try:
+        received_at = float(received_at)
+    except (TypeError, ValueError) as exc:
+        raise SafetyRefusal(f"{source} receive time {received_at!r} must be numeric") from exc
+    if not math.isfinite(received_at):
+        raise SafetyRefusal(f"{source} receive time {received_at} must be finite")
+    return received_at
+
+
 def extract_am1_arm_positions(
     values: dict[str, Any],
     *,
@@ -348,7 +378,7 @@ def read_fresh_am1_live_sample(
 ) -> AM1LiveSample:
     """Read one fresh follower observation followed by one complete leader target."""
     observation = robot.get_observation()
-    observed_at = monotonic()
+    refuse_latest_am1_observation_error(robot, source="live follower observation")
     observation_sequence = int(robot.observation_sequence)
     if observation_sequence == previous_sequence:
         raise TransientFollowerObservation(
@@ -361,12 +391,15 @@ def read_fresh_am1_live_sample(
             f"(previous={previous_sequence}, current={observation_sequence})"
         )
 
-    raw_observation_keys = getattr(robot, "latest_raw_observation_keys", None)
-    if raw_observation_keys is not None:
-        validate_am1_arm_position_key_set(
-            raw_observation_keys,
-            source="live follower observation payload",
-        )
+    validate_latest_am1_raw_observation_keys(
+        robot,
+        source="live follower observation payload",
+    )
+    observed_at = latest_am1_observation_received_at(
+        robot,
+        fallback=monotonic,
+        source="live follower observation",
+    )
 
     follower_positions = extract_am1_arm_positions(
         dict(observation),
@@ -575,8 +608,13 @@ def get_fresh_follower_observation(robot: Any) -> dict[str, Any]:
     observation: dict[str, Any] = {}
     while robot.observation_sequence == previous_sequence:
         observation = robot.get_observation()
+        refuse_latest_am1_observation_error(robot, source="follower observation")
         if robot.observation_sequence == previous_sequence and time.monotonic() >= deadline:
             raise RuntimeError("Timed out waiting for a fresh follower observation for alignment.")
+    validate_latest_am1_raw_observation_keys(
+        robot,
+        source="follower observation payload",
+    )
     return observation
 
 
@@ -774,7 +812,11 @@ def run_startup_sync(
     verification_attempts = int(getattr(robot.config, "observation_request_window", 1)) + 1
     for verification_index in range(verification_attempts):
         final_observation = get_fresh_follower_observation(robot)
-        final_observed_at = monotonic()
+        final_observed_at = latest_am1_observation_received_at(
+            robot,
+            fallback=monotonic,
+            source="startup synchronization follower observation",
+        )
         final_follower = extract_am1_arm_positions(
             final_observation,
             source="follower",
@@ -804,7 +846,11 @@ def run_alignment_gate(
     monotonic: Callable[[], float] = time.monotonic,
 ) -> tuple[dict[str, float], dict[str, Any], float]:
     observation = get_fresh_follower_observation(robot)
-    observed_at = monotonic()
+    observed_at = latest_am1_observation_received_at(
+        robot,
+        fallback=monotonic,
+        source="alignment follower observation",
+    )
     follower_positions = extract_am1_arm_positions(
         observation,
         source="follower",
@@ -1138,6 +1184,12 @@ def run_am1_live_sender(
         raise SafetyRefusal("initial follower observation time must be finite")
     if initial_follower_observed_at > started_at:
         raise SafetyRefusal("initial follower observation time cannot be in the future")
+    initial_observation_age_s = max(0.0, started_at - initial_follower_observed_at)
+    if initial_observation_age_s >= AM1_LIVE_OBSERVATION_MAX_AGE_S:
+        raise SafetyRefusal(
+            f"initial follower observation age {initial_observation_age_s:.3f}s reached the "
+            f"{AM1_LIVE_OBSERVATION_MAX_AGE_S:.1f}-second freshness limit before live sending"
+        )
 
     hold_target = follower_hold_target if live_arm_scope == "right_wrist_flex" else approved_target
     safe_target = dict(hold_target if live_arm_scope == "right_wrist_flex" else approved_target)
