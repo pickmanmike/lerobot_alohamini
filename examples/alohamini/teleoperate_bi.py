@@ -814,7 +814,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--profile_cadence",
         action="store_true",
-        help="Emit one default-off bounded JSON timing summary after live AM1 forwarding",
+        help=(
+            "Emit a default-off JSON live-start marker and one bounded timing summary "
+            "after live AM1 forwarding"
+        ),
     )
     parser.add_argument(
         "--robot.remote_ip",
@@ -1001,6 +1004,7 @@ def run_am1_live_sender(
     profile_cadence: bool,
     initial_follower_positions: Mapping[str, float] | None = None,
     monotonic: Callable[[], float] = time.monotonic,
+    wall_time_ns: Callable[[], int] = time.time_ns,
     sleep_fn: Callable[[float], None] = precise_sleep,
     should_stop: Callable[[], bool] | None = None,
     sample_callback: Callable[[AM1LiveSample], None] | None = None,
@@ -1077,6 +1081,18 @@ def run_am1_live_sender(
 
             action = make_am1_live_action(safe_target)
             send_started_at = monotonic()
+            if profile_cadence and action_sequence == 0:
+                print(
+                    json.dumps(
+                        {
+                            "event": "am1_client_live_start",
+                            "initial_observation_sequence": initial_observation_sequence,
+                            "right_wrist_requested": safe_target[RIGHT_WRIST_FLEX_KEY],
+                            "wall_time_ns": wall_time_ns(),
+                        },
+                        sort_keys=True,
+                    )
+                )
             robot.send_action(action)
             send_completed_at = monotonic()
             action_sequence += 1
@@ -1099,6 +1115,7 @@ def run_am1_live_sender(
             deadline = next_completion_spaced_deadline(send_completed_at, fps=fps)
             sleep_fn(max(deadline - monotonic(), 0.0))
     finally:
+        live_end_wall_time_ns = wall_time_ns() if profile_cadence else None
         primary_error = sys.exception()
         join_error: BaseException | None = None
         if sampler_started:
@@ -1116,6 +1133,7 @@ def run_am1_live_sender(
                 json.dumps(
                     {
                         "event": "am1_client_action_cadence",
+                        "live_end_wall_time_ns": live_end_wall_time_ns,
                         "action_sequence": action_sequence,
                         "action_send_interval_ms": round(last_send_interval_ms, 3),
                         "longest_action_send_interval_ms": round(longest_send_interval_ms, 3),

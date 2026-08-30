@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import subprocess
 import sys
@@ -437,6 +438,73 @@ def test_profile_cadence_output_is_bounded_not_printed_on_every_send(capsys):
     assert len(reports) == 1
     assert f'"action_sequence": {len(robot.sends)}' in reports[0]
     assert '"longest_action_send_interval_ms"' in reports[0]
+
+
+def test_profile_cadence_emits_correlatable_live_boundaries_around_first_send(capsys):
+    module = load_teleoperate()
+    wall_times = iter((1_778_000_000_000_000_001, 1_778_000_000_500_000_002))
+
+    class BoundaryRobot(TimedRobot):
+        output_before_first_send = ""
+
+        def send_action(self, action):
+            if not self.sends:
+                self.output_before_first_send = capsys.readouterr().out
+            super().send_action(action)
+
+    robot = BoundaryRobot(observation_delay_s=0.2)
+
+    module.run_am1_live_sender(
+        robot,
+        SampleLeader(),
+        initial_arm_target=FOLLOWER,
+        initial_observation_sequence=robot.observation_sequence,
+        fps=10,
+        duration_s=0.15,
+        live_arm_scope="both",
+        profile_cadence=True,
+        wall_time_ns=lambda: next(wall_times),
+    )
+
+    start_events = [
+        json.loads(line)
+        for line in robot.output_before_first_send.splitlines()
+        if '"event": "am1_client_live_start"' in line
+    ]
+    end_events = [
+        json.loads(line)
+        for line in capsys.readouterr().out.splitlines()
+        if '"event": "am1_client_action_cadence"' in line
+    ]
+    assert start_events == [
+        {
+            "event": "am1_client_live_start",
+            "initial_observation_sequence": 8,
+            "right_wrist_requested": 9.0,
+            "wall_time_ns": 1_778_000_000_000_000_001,
+        }
+    ]
+    assert len(end_events) == 1
+    assert end_events[0]["live_end_wall_time_ns"] == 1_778_000_000_500_000_002
+
+
+def test_disabled_cadence_profile_emits_no_live_boundary_or_wall_clock_read(capsys):
+    module = load_teleoperate()
+    robot = TimedRobot(observation_delay_s=0.2)
+
+    module.run_am1_live_sender(
+        robot,
+        SampleLeader(),
+        initial_arm_target=FOLLOWER,
+        initial_observation_sequence=robot.observation_sequence,
+        fps=10,
+        duration_s=0.15,
+        live_arm_scope="both",
+        profile_cadence=False,
+        wall_time_ns=lambda: (_ for _ in ()).throw(AssertionError("wall clock read while disabled")),
+    )
+
+    assert "am1_client_live_start" not in capsys.readouterr().out
 
 
 def test_actual_live_runner_waits_from_send_completion_instead_of_catching_up():
