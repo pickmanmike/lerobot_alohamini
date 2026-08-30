@@ -17,6 +17,7 @@
 import logging
 import sys
 import time
+from dataclasses import replace
 from functools import cached_property
 from itertools import chain
 from typing import Any
@@ -157,6 +158,8 @@ class AlohaMini(Robot):
         else:
             self.right_bus = None
 
+        self._apply_runtime_joint_directions()
+
         if config.no_follower:
             self.left_arm_motors = []
             self.right_arm_motors = []
@@ -219,6 +222,25 @@ class AlohaMini(Robot):
         self._joint_release_margin = 1.0
         self._joint_hold_goal: dict[str, float] = {}
         self._joint_hold_direction: dict[str, float] = {}
+
+
+    def _apply_runtime_joint_directions(self) -> None:
+        """Apply AM1 installation direction metadata without persisting calibration changes."""
+        if self.config.robot_model != "alohamini1" or self.right_bus is None:
+            return
+
+        motor = "arm_right_wrist_flex"
+        calibration = self.right_bus.calibration.get(motor)
+        if calibration is None or calibration.drive_mode == 1:
+            return
+
+        # This is deliberately a replacement in the bus-local cache. The calibration
+        # file and Robot.calibration retain the measured offsets and direction exactly
+        # as recorded; no motor register is read or written here.
+        self.right_bus.calibration = {
+            **self.right_bus.calibration,
+            motor: replace(calibration, drive_mode=1),
+        }
 
 
     @property
@@ -335,6 +357,7 @@ class AlohaMini(Robot):
                     calib_right = {k: v for k, v in self.calibration.items() if k in self.right_bus.motors}
                     self.right_bus.write_calibration(calib_right, cache=False)
                     self.right_bus.calibration = calib_right
+                    self._apply_runtime_joint_directions()
 
                 return
 
@@ -443,6 +466,7 @@ class AlohaMini(Robot):
             calib_right = {k: v for k, v in self.calibration.items() if k in self.right_bus.motors}
             self.right_bus.write_calibration(calib_right, cache=False)
             self.right_bus.calibration = calib_right
+            self._apply_runtime_joint_directions()
 
         self._save_calibration()
         print("Calibration saved to", self.calibration_fpath)
@@ -819,6 +843,8 @@ class AlohaMini(Robot):
         # arm_goal_pos = {k: v for k, v in action.items() if k.endswith(".pos")}
         left_pos  = {k: v for k, v in action.items() if k.endswith(".pos") and k.startswith("arm_left_") and k.replace(".pos", "") in self.left_bus.motors}
         right_pos = {k: v for k, v in action.items() if k.endswith(".pos") and k.startswith("arm_right_") and self.right_bus is not None and k.replace(".pos", "") in self.right_bus.motors}
+        requested_arm_pos = {**left_pos, **right_pos}
+        right_wrist_observed = None
 
 
         base_goal_vel = {k: v for k, v in action.items() if k.endswith(".vel")}
@@ -846,6 +872,7 @@ class AlohaMini(Robot):
 
         if self.right_bus and right_pos and self.config.max_relative_target is not None:
             present_right = self.right_bus.sync_read("Present_Position", self.right_arm_motors)
+            right_wrist_observed = present_right.get("arm_right_wrist_flex")
             gp_right = {k: (v, present_right[k.replace(".pos", "")]) for k, v in right_pos.items()}
             right_pos = ensure_safe_goal_position(gp_right, self.config.max_relative_target)
         relative_limit_done_t = time.perf_counter()
@@ -891,6 +918,17 @@ class AlohaMini(Robot):
             "action_right_write": (right_write_done_t - left_write_done_t) * 1e3,
             "action_base_write": (base_write_done_t - right_write_done_t) * 1e3,
             "action_total": (base_write_done_t - action_start_t) * 1e3,
+        }
+
+        final_arm_pos = {**left_pos, **right_pos}
+        self.logs["action_diagnostics"] = {
+            "target_limited": any(
+                float(final_arm_pos[key]) != float(requested)
+                for key, requested in requested_arm_pos.items()
+            ),
+            "right_wrist_requested": requested_arm_pos.get("arm_right_wrist_flex.pos"),
+            "right_wrist_final": final_arm_pos.get("arm_right_wrist_flex.pos"),
+            "right_wrist_observed": right_wrist_observed,
         }
 
         lift_sent = {k: v for k, v in action.items() if k.startswith("lift_axis.")}
