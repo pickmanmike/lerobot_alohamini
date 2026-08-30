@@ -275,6 +275,20 @@ def test_only_explicit_am1_arms_only_no_camera_mode_uses_decoupled_live_path():
     ) is False
 
 
+class DelegatingLiveCommandSender:
+    def __init__(self, robot):
+        self.robot = robot
+
+    def __enter__(self):
+        return self
+
+    def send_action(self, action):
+        self.robot.send_action(action)
+
+    def __exit__(self, exc_type, exc, traceback):
+        return False
+
+
 class TimedRobot:
     def __init__(self, *, observation_delay_s: float = 0.0, advance: bool = True):
         self.observation_delay_s = observation_delay_s
@@ -294,6 +308,78 @@ class TimedRobot:
         started = time.monotonic()
         finished = time.monotonic()
         self.sends.append((started, finished, dict(action)))
+
+    def make_live_command_sender(self):
+        return DelegatingLiveCommandSender(self)
+
+
+def test_live_socket_and_device_io_stay_in_creator_threads_and_final_zero_waits_for_live_close():
+    module = load_teleoperate()
+    main_thread = threading.get_ident()
+    events: list[tuple] = []
+    live_socket_open = False
+
+    class RecordingLiveCommandSender:
+        def __enter__(self):
+            nonlocal live_socket_open
+            live_socket_open = True
+            events.append(("live_create", threading.get_ident()))
+            return self
+
+        def send_action(self, action):
+            events.append(("live_send", threading.get_ident(), dict(action)))
+
+        def __exit__(self, exc_type, exc, traceback):
+            nonlocal live_socket_open
+            events.append(("live_close", threading.get_ident()))
+            live_socket_open = False
+
+    class OwnershipRobot:
+        def __init__(self):
+            self.observation_sequence = 8
+
+        def make_live_command_sender(self):
+            events.append(("live_factory", threading.get_ident()))
+            return RecordingLiveCommandSender()
+
+        def get_observation(self):
+            events.append(("observation", threading.get_ident()))
+            self.observation_sequence += 1
+            time.sleep(0.01)
+            return dict(FOLLOWER)
+
+        def send_action(self, action):
+            assert not live_socket_open
+            events.append(("main_send", threading.get_ident(), dict(action)))
+
+    class OwnershipLeader:
+        def get_action(self):
+            events.append(("leader", threading.get_ident()))
+            return dict(LEADER)
+
+    robot = OwnershipRobot()
+    module.run_am1_live_sender(
+        robot,
+        OwnershipLeader(),
+        initial_arm_target=FOLLOWER,
+        initial_observation_sequence=robot.observation_sequence,
+        fps=10,
+        duration_s=0.24,
+        live_arm_scope="both",
+        profile_cadence=False,
+    )
+    robot.send_action(module.make_zero_action())
+
+    observation_threads = {event[1] for event in events if event[0] == "observation"}
+    leader_threads = {event[1] for event in events if event[0] == "leader"}
+    live_threads = {event[1] for event in events if event[0].startswith("live_")}
+    assert observation_threads == {main_thread}
+    assert leader_threads == {main_thread}
+    assert len(live_threads) == 1
+    assert main_thread not in live_threads
+    assert next(index for index, event in enumerate(events) if event[0] == "live_close") < next(
+        index for index, event in enumerate(events) if event[0] == "main_send"
+    )
 
 
 def test_actual_live_runner_sends_unchanged_safe_target_while_sampler_blocks_past_watchdog():
@@ -507,7 +593,7 @@ def test_disabled_cadence_profile_emits_no_live_boundary_or_wall_clock_read(caps
     assert "am1_client_live_start" not in capsys.readouterr().out
 
 
-def test_profile_finalization_preserves_send_error_when_live_end_clock_fails_and_joins_sampler(
+def test_profile_finalization_preserves_send_error_then_closes_joins_and_allows_final_zero(
     monkeypatch,
 ):
     module = load_teleoperate()
@@ -516,17 +602,37 @@ def test_profile_finalization_preserves_send_error_when_live_end_clock_fails_and
     diagnostic_error = RuntimeError("live-end wall clock failed")
 
     class SecondSendFailsRobot(TimedRobot):
+        class LiveSender:
+            def __init__(self, robot):
+                self.robot = robot
+                self.live_sends = 0
+
+            def __enter__(self):
+                return self
+
+            def send_action(self, action):
+                if self.live_sends:
+                    events.append("send_failed")
+                    raise primary
+                self.live_sends += 1
+                self.robot.sends.append((time.monotonic(), time.monotonic(), dict(action)))
+
+            def __exit__(self, exc_type, exc, traceback):
+                events.append("live_socket_closed")
+                return False
+
+        def make_live_command_sender(self):
+            return self.LiveSender(self)
+
         def send_action(self, action):
-            if self.sends:
-                events.append("send_failed")
-                raise primary
+            events.append("main_final_zero")
             super().send_action(action)
 
-    real_join = module.AM1LiveSampler.join
+    real_join = module.AM1LiveActionSender.join
 
     def recording_join(self):
         result = real_join(self)
-        events.append("sampler_joined")
+        events.append("sender_joined")
         return result
 
     wall_time_calls = 0
@@ -538,23 +644,27 @@ def test_profile_finalization_preserves_send_error_when_live_end_clock_fails_and
             return 1_778_000_000_000_000_001
         raise diagnostic_error
 
-    monkeypatch.setattr(module.AM1LiveSampler, "join", recording_join)
+    monkeypatch.setattr(module.AM1LiveActionSender, "join", recording_join)
 
-    with pytest.raises(RuntimeError) as caught:
-        module.run_am1_live_sender(
-            SecondSendFailsRobot(observation_delay_s=0.01),
-            SampleLeader(),
-            initial_arm_target=FOLLOWER,
-            initial_observation_sequence=8,
-            fps=10,
-            duration_s=1.0,
-            live_arm_scope="both",
-            profile_cadence=True,
-            wall_time_ns=failing_live_end_wall_time,
-        )
+    robot = SecondSendFailsRobot(observation_delay_s=0.01)
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            module.run_am1_live_sender(
+                robot,
+                SampleLeader(),
+                initial_arm_target=FOLLOWER,
+                initial_observation_sequence=8,
+                fps=10,
+                duration_s=1.0,
+                live_arm_scope="both",
+                profile_cadence=True,
+                wall_time_ns=failing_live_end_wall_time,
+            )
+    finally:
+        robot.send_action(module.make_zero_action())
 
     assert caught.value is primary
-    assert events == ["send_failed", "sampler_joined"]
+    assert events == ["send_failed", "live_socket_closed", "sender_joined", "main_final_zero"]
     assert any("live-end wall clock failed" in note for note in getattr(primary, "__notes__", ()))
 
 
@@ -564,7 +674,7 @@ def test_profile_finalization_surfaces_live_end_clock_error_only_after_sampler_j
     diagnostic_error = RuntimeError("live-end wall clock failed")
     wall_times = iter((1_778_000_000_000_000_001,))
 
-    real_join = module.AM1LiveSampler.join
+    real_join = module.AM1LiveActionSender.join
 
     def recording_join(self):
         result = real_join(self)
@@ -578,7 +688,7 @@ def test_profile_finalization_surfaces_live_end_clock_error_only_after_sampler_j
             events.append("clock_failed")
             raise diagnostic_error
 
-    monkeypatch.setattr(module.AM1LiveSampler, "join", recording_join)
+    monkeypatch.setattr(module.AM1LiveActionSender, "join", recording_join)
 
     with pytest.raises(RuntimeError) as caught:
         module.run_am1_live_sender(
@@ -636,14 +746,14 @@ def test_worker_primary_error_identity_and_join_precede_caller_cleanup(monkeypat
             events.append("worker_error")
             raise primary
 
-    real_join = module.AM1LiveSampler.join
+    real_join = module.AM1LiveActionSender.join
 
     def recording_join(self):
         result = real_join(self)
         events.append("worker_joined")
         return result
 
-    monkeypatch.setattr(module.AM1LiveSampler, "join", recording_join)
+    monkeypatch.setattr(module.AM1LiveActionSender, "join", recording_join)
 
     try:
         with pytest.raises(RuntimeError) as caught:
@@ -753,6 +863,84 @@ def test_client_applies_command_send_timeout_only_when_configured(timeout_ms):
         assert (fake_zmq.LINGER, 0) in context.sockets[1].options
 
 
+def test_client_live_command_socket_is_created_configured_used_and_closed_in_one_worker_thread():
+    from lerobot.robots.alohamini.alohamini_client import AlohaMiniClient
+    from lerobot.robots.alohamini.config_alohamini import AlohaMiniClientConfig
+
+    main_thread = threading.get_ident()
+    events: list[tuple] = []
+
+    class FakeSocket:
+        def setsockopt(self, option, value):
+            events.append(("setsockopt", threading.get_ident(), option, value))
+
+        def connect(self, locator):
+            events.append(("connect", threading.get_ident(), locator))
+
+        def send_string(self, payload):
+            events.append(("send", threading.get_ident(), json.loads(payload)))
+
+        def close(self):
+            events.append(("close", threading.get_ident()))
+
+    class FakeContext:
+        def __init__(self):
+            events.append(("context", threading.get_ident()))
+
+        def socket(self, socket_type):
+            events.append(("socket", threading.get_ident(), socket_type))
+            return FakeSocket()
+
+        def term(self):
+            events.append(("term", threading.get_ident()))
+
+    fake_zmq = SimpleNamespace(
+        Context=FakeContext,
+        PUSH=1,
+        CONFLATE=2,
+        SNDTIMEO=3,
+        LINGER=4,
+    )
+    client = AlohaMiniClient(
+        AlohaMiniClientConfig(
+            remote_ip="127.0.0.1",
+            id="test",
+            robot_model="alohamini1",
+            cameras={},
+            command_send_timeout_ms=50,
+        )
+    )
+    client._zmq = fake_zmq
+    client._is_connected = True
+
+    def send_once():
+        with client.make_live_command_sender() as sender:
+            sender.send_action({**FOLLOWER, "x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0, "lift_axis.vel": 0})
+
+    worker = threading.Thread(target=send_once, name="fake-live-sender")
+    worker.start()
+    worker.join()
+
+    worker_threads = {event[1] for event in events}
+    assert len(worker_threads) == 1
+    assert main_thread not in worker_threads
+    event_names = [event[0] for event in events]
+    assert event_names == [
+        "context",
+        "socket",
+        "setsockopt",
+        "setsockopt",
+        "setsockopt",
+        "connect",
+        "send",
+        "close",
+        "term",
+    ]
+    assert events[2][2:] == (fake_zmq.CONFLATE, 1)
+    assert events[3][2:] == (fake_zmq.SNDTIMEO, 50)
+    assert events[4][2:] == (fake_zmq.LINGER, 0)
+
+
 def test_run_teleoperation_joins_sampler_before_real_cleanup_and_preserves_worker_error(
     monkeypatch,
 ):
@@ -783,6 +971,9 @@ def test_run_teleoperation_joins_sampler_before_real_cleanup_and_preserves_worke
         def send_action(self, action):
             events.append(("send", dict(action)))
             return action
+
+        def make_live_command_sender(self):
+            return DelegatingLiveCommandSender(self)
 
         def disconnect(self):
             events.append("robot_disconnect")
@@ -815,14 +1006,14 @@ def test_run_teleoperation_joins_sampler_before_real_cleanup_and_preserves_worke
 
     monkeypatch.setattr(module, "AlohaMiniClient", LifecycleRobot)
     monkeypatch.setattr(module, "BiSOLeader", LifecycleLeader)
-    real_join = module.AM1LiveSampler.join
+    real_join = module.AM1LiveActionSender.join
 
     def recording_join(self):
         result = real_join(self)
         events.append("sampler_joined")
         return result
 
-    monkeypatch.setattr(module.AM1LiveSampler, "join", recording_join)
+    monkeypatch.setattr(module.AM1LiveActionSender, "join", recording_join)
     args = parse_windows(
         module,
         "--no_keyboard",
@@ -935,6 +1126,9 @@ def test_run_teleoperation_holds_stale_target_through_duration_then_returns_two_
             self.actions.append(copied)
             events.append(("send", copied))
 
+        def make_live_command_sender(self):
+            return DelegatingLiveCommandSender(self)
+
         def disconnect(self):
             events.append("robot_disconnect")
 
@@ -959,14 +1153,14 @@ def test_run_teleoperation_holds_stale_target_through_duration_then_returns_two_
 
     monkeypatch.setattr(module, "AlohaMiniClient", StaleRobot)
     monkeypatch.setattr(module, "BiSOLeader", OneSampleLeader)
-    real_join = module.AM1LiveSampler.join
+    real_join = module.AM1LiveActionSender.join
 
     def recording_join(self):
         result = real_join(self)
         events.append("sampler_joined")
         return result
 
-    monkeypatch.setattr(module.AM1LiveSampler, "join", recording_join)
+    monkeypatch.setattr(module.AM1LiveActionSender, "join", recording_join)
     args = parse_windows(
         module,
         "--no_keyboard",

@@ -41,6 +41,76 @@ logging.basicConfig(
     format="[%(filename)s:%(lineno)d] %(message)s"
 )
 
+
+class AlohaMiniLiveCommandSender:
+    """Own one bounded live-command PUSH socket for the calling thread."""
+
+    def __init__(self, zmq_module: Any, remote_ip: str, port: int, send_timeout_ms: int):
+        if send_timeout_ms <= 0:
+            raise ValueError("send_timeout_ms must be greater than zero")
+        self._zmq = zmq_module
+        self._locator = f"tcp://{remote_ip}:{port}"
+        self._send_timeout_ms = send_timeout_ms
+        self._context = None
+        self._socket = None
+
+    def __enter__(self) -> "AlohaMiniLiveCommandSender":
+        zmq = self._zmq
+        self._context = zmq.Context()
+        try:
+            self._socket = self._context.socket(zmq.PUSH)
+            self._socket.setsockopt(zmq.CONFLATE, 1)
+            self._socket.setsockopt(zmq.SNDTIMEO, self._send_timeout_ms)
+            self._socket.setsockopt(zmq.LINGER, 0)
+            self._socket.connect(self._locator)
+        except BaseException as exc:
+            self._close_preserving(exc)
+            raise
+        return self
+
+    def send_action(self, action: RobotAction) -> None:
+        if self._socket is None:
+            raise RuntimeError("live command sender is not connected")
+        self._socket.send_string(json.dumps(action))
+
+    def __exit__(self, exc_type, exc, traceback) -> bool:
+        cleanup_error = self._close_preserving(exc)
+        if exc is None and cleanup_error is not None:
+            raise cleanup_error
+        return False
+
+    def _close_preserving(self, primary_error: BaseException | None) -> BaseException | None:
+        cleanup_errors: list[tuple[str, BaseException]] = []
+        if self._socket is not None:
+            try:
+                self._socket.close()
+            except BaseException as exc:
+                cleanup_errors.append(("closing the live command socket", exc))
+            finally:
+                self._socket = None
+        if self._context is not None:
+            try:
+                self._context.term()
+            except BaseException as exc:
+                cleanup_errors.append(("terminating the live command context", exc))
+            finally:
+                self._context = None
+
+        if primary_error is not None:
+            for label, error in cleanup_errors:
+                if error is not primary_error:
+                    primary_error.add_note(f"Cleanup failed while {label}: {error!r}")
+            return None
+        if not cleanup_errors:
+            return None
+        label, error = cleanup_errors[0]
+        for extra_label, extra_error in cleanup_errors[1:]:
+            if extra_error is not error:
+                error.add_note(f"Additional cleanup failure while {extra_label}: {extra_error!r}")
+        error.add_note(f"Live command cleanup failed while {label}")
+        return error
+
+
 class AlohaMiniClient(Robot):
     config_class = AlohaMiniClientConfig
     name = "alohamini_client"
@@ -525,6 +595,18 @@ class AlohaMiniClient(Robot):
 
     def configure(self):
         pass
+
+    @check_if_not_connected
+    def make_live_command_sender(self) -> AlohaMiniLiveCommandSender:
+        """Create a sender whose context and socket are opened by its owning thread."""
+        if self.command_send_timeout_ms is None:
+            raise ValueError("live command sender requires a bounded command_send_timeout_ms")
+        return AlohaMiniLiveCommandSender(
+            self._zmq,
+            self.remote_ip,
+            self.port_zmq_cmd,
+            self.command_send_timeout_ms,
+        )
 
     @check_if_not_connected
     def send_action(self, action: RobotAction) -> RobotAction:

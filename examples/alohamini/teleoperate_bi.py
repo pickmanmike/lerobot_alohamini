@@ -107,71 +107,69 @@ class AM1LiveSample:
 
 
 @dataclass(frozen=True)
-class AM1LiveSamplerSnapshot:
-    sample: AM1LiveSample | None
-    stale_reason: str | None
-    observation_timeout_count: int
+class AM1LiveActionSenderSnapshot:
+    action_sequence: int
+    action_send_interval_ms: float
+    longest_action_send_interval_ms: float
+    live_end_wall_time_ns: int | None
     error: BaseException | None
 
 
-class AM1LiveSampleMailbox:
-    """Publish one complete sample or one terminal live-sampling state atomically."""
+class AM1LiveActionMailbox:
+    """Publish only the latest complete validated action atomically."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._sample: AM1LiveSample | None = None
-        self._stale_reason: str | None = None
-        self._observation_timeout_count = 0
-        self._error: BaseException | None = None
+        self._action: dict[str, float | int] | None = None
 
-    def publish(self, sample: AM1LiveSample) -> None:
+    def publish(self, action: Mapping[str, float | int]) -> None:
         with self._lock:
-            if self._stale_reason is None and self._error is None:
-                self._sample = sample
+            self._action = dict(action)
 
-    def latch_stale(self, reason: str) -> None:
+    def snapshot(self) -> dict[str, float | int] | None:
         with self._lock:
-            if self._stale_reason is None and self._error is None:
-                self._stale_reason = reason
-                self._observation_timeout_count += 1
-
-    def publish_error(self, error: BaseException) -> None:
-        with self._lock:
-            if self._stale_reason is None and self._error is None:
-                self._error = error
-
-    def snapshot(self) -> AM1LiveSamplerSnapshot:
-        with self._lock:
-            return AM1LiveSamplerSnapshot(
-                sample=self._sample,
-                stale_reason=self._stale_reason,
-                observation_timeout_count=self._observation_timeout_count,
-                error=self._error,
-            )
+            return None if self._action is None else dict(self._action)
 
 
-class AM1LiveSampler:
-    """Own follower-observation and leader-bus reads outside the sender loop."""
+class AM1LiveActionSender:
+    """Own the live PUSH socket and completion-spaced action cadence in one thread."""
 
     def __init__(
         self,
         robot: Any,
-        leader: Any,
         *,
-        previous_sequence: int,
+        initial_action: Mapping[str, float | int],
+        initial_observation_sequence: int,
+        fps: int,
+        duration_s: float,
+        profile_cadence: bool,
         monotonic: Callable[[], float] = time.monotonic,
-        sample_callback: Callable[[AM1LiveSample], None] | None = None,
+        wall_time_ns: Callable[[], int] = time.time_ns,
+        sleep_fn: Callable[[float], None] = precise_sleep,
     ) -> None:
-        self.mailbox = AM1LiveSampleMailbox()
+        if fps <= 0:
+            raise ValueError("fps must be greater than zero")
+        self.mailbox = AM1LiveActionMailbox()
         self._robot = robot
-        self._leader = leader
-        self._previous_sequence = previous_sequence
+        self._initial_action = dict(initial_action)
+        self._initial_observation_sequence = initial_observation_sequence
+        self._fps = fps
+        self._duration_s = duration_s
+        self._profile_cadence = profile_cadence
         self._monotonic = monotonic
-        self._sample_callback = sample_callback
+        self._wall_time_ns = wall_time_ns
+        self._sleep_fn = sleep_fn
         self._stop_requested = threading.Event()
+        self._finished = threading.Event()
+        self._state_lock = threading.Lock()
+        self._action_sequence = 0
+        self._last_send_interval_ms = 0.0
+        self._longest_send_interval_ms = 0.0
+        self._live_end_wall_time_ns: int | None = None
+        self._error: BaseException | None = None
         self._thread = threading.Thread(
             target=self._run,
-            name="am1-live-sampler",
+            name="am1-live-action-sender",
             daemon=False,
         )
 
@@ -184,26 +182,93 @@ class AM1LiveSampler:
     def join(self) -> None:
         self._thread.join()
 
-    def _run(self) -> None:
-        try:
-            while not self._stop_requested.is_set():
-                try:
-                    sample = read_fresh_am1_live_sample(
-                        self._robot,
-                        self._leader,
-                        previous_sequence=self._previous_sequence,
-                        monotonic=self._monotonic,
-                    )
-                except StaleFollowerObservation as exc:
-                    self.mailbox.latch_stale(str(exc))
-                    return
+    def is_alive(self) -> bool:
+        return self._thread.is_alive()
 
-                self.mailbox.publish(sample)
-                self._previous_sequence = sample.observation_sequence
-                if self._sample_callback is not None:
-                    self._sample_callback(sample)
+    def wait(self, timeout: float) -> bool:
+        return self._finished.wait(timeout)
+
+    def publish(self, action: Mapping[str, float | int]) -> None:
+        self.mailbox.publish(action)
+
+    def snapshot(self) -> AM1LiveActionSenderSnapshot:
+        with self._state_lock:
+            return AM1LiveActionSenderSnapshot(
+                action_sequence=self._action_sequence,
+                action_send_interval_ms=self._last_send_interval_ms,
+                longest_action_send_interval_ms=self._longest_send_interval_ms,
+                live_end_wall_time_ns=self._live_end_wall_time_ns,
+                error=self._error,
+            )
+
+    def _run(self) -> None:
+        primary_error: BaseException | None = None
+        action = dict(self._initial_action)
+        last_send_started_at: float | None = None
+        started_at = self._monotonic()
+        try:
+            with self._robot.make_live_command_sender() as command_sender:
+                while True:
+                    with self._state_lock:
+                        action_sequence = self._action_sequence
+                    now = self._monotonic()
+                    if action_sequence > 0 and self._stop_requested.is_set():
+                        break
+                    if action_sequence > 0 and self._duration_s > 0 and now - started_at >= self._duration_s:
+                        break
+
+                    send_started_at = self._monotonic()
+                    if self._profile_cadence and action_sequence == 0:
+                        print(
+                            json.dumps(
+                                {
+                                    "event": "am1_client_live_start",
+                                    "initial_observation_sequence": self._initial_observation_sequence,
+                                    "right_wrist_requested": action[RIGHT_WRIST_FLEX_KEY],
+                                    "wall_time_ns": self._wall_time_ns(),
+                                },
+                                sort_keys=True,
+                            )
+                        )
+                    command_sender.send_action(action)
+                    send_completed_at = self._monotonic()
+                    send_interval_ms = (
+                        0.0
+                        if last_send_started_at is None
+                        else (send_started_at - last_send_started_at) * 1e3
+                    )
+                    with self._state_lock:
+                        self._action_sequence += 1
+                        self._last_send_interval_ms = send_interval_ms
+                        self._longest_send_interval_ms = max(
+                            self._longest_send_interval_ms,
+                            send_interval_ms,
+                        )
+                    last_send_started_at = send_started_at
+
+                    latest_action = self.mailbox.snapshot()
+                    if latest_action is not None:
+                        action = latest_action
+                    deadline = next_completion_spaced_deadline(send_completed_at, fps=self._fps)
+                    self._sleep_fn(max(deadline - self._monotonic(), 0.0))
         except BaseException as exc:
-            self.mailbox.publish_error(exc)
+            primary_error = exc
+        finally:
+            diagnostic_error: BaseException | None = None
+            live_end_wall_time_ns = None
+            if self._profile_cadence:
+                try:
+                    live_end_wall_time_ns = self._wall_time_ns()
+                except BaseException as exc:
+                    diagnostic_error = exc
+            if primary_error is not None and diagnostic_error is not None and diagnostic_error is not primary_error:
+                primary_error.add_note(
+                    f"Cadence diagnostics failed while capturing the live-end wall clock: {diagnostic_error!r}"
+                )
+            with self._state_lock:
+                self._live_end_wall_time_ns = live_end_wall_time_ns
+                self._error = primary_error or diagnostic_error
+            self._finished.set()
 
 
 def _joint_identity(key: str) -> tuple[str, str]:
@@ -290,6 +355,11 @@ def read_fresh_am1_live_sample(
         )
     except SafetyRefusal as exc:
         raise StaleFollowerObservation(str(exc)) from exc
+    validate_selected_sync_positions(
+        follower_positions,
+        AM1_ARM_POSITION_KEYS,
+        source="live follower observation",
+    )
 
     arm_target = extract_am1_arm_positions(
         leader.get_action(),
@@ -1009,7 +1079,7 @@ def run_am1_live_sender(
     should_stop: Callable[[], bool] | None = None,
     sample_callback: Callable[[AM1LiveSample], None] | None = None,
 ) -> None:
-    """Send AM1 arm targets independently of observation and leader sampling latency."""
+    """Read devices on the caller thread while a private worker sends live actions."""
     approved_target = extract_am1_arm_positions(
         dict(initial_arm_target),
         source="approved initial live target",
@@ -1020,8 +1090,7 @@ def run_am1_live_sender(
         AM1_ARM_POSITION_KEYS,
         source="approved initial live target",
     )
-    safe_target = dict(approved_target)
-    observed_positions = (
+    follower_hold_target = (
         extract_am1_arm_positions(
             dict(initial_follower_positions),
             source="approved initial follower observation",
@@ -1030,107 +1099,92 @@ def run_am1_live_sender(
         if initial_follower_positions is not None
         else None
     )
+    if follower_hold_target is not None:
+        validate_selected_sync_positions(
+            follower_hold_target,
+            AM1_ARM_POSITION_KEYS,
+            source="approved initial follower observation",
+        )
+    hold_target = approved_target
+    safe_target = dict(approved_target)
+    observed_positions = None if follower_hold_target is None else dict(follower_hold_target)
+    initial_action = make_am1_live_action(safe_target)
 
-    sampler = AM1LiveSampler(
+    sender = AM1LiveActionSender(
         robot,
-        leader,
-        previous_sequence=initial_observation_sequence,
+        initial_action=initial_action,
+        initial_observation_sequence=initial_observation_sequence,
+        fps=fps,
+        duration_s=duration_s,
+        profile_cadence=profile_cadence,
         monotonic=monotonic,
-        sample_callback=sample_callback,
+        wall_time_ns=wall_time_ns,
+        sleep_fn=sleep_fn,
     )
-    sampler_started = False
-    stale_announced = False
+    sender_started = False
     last_used_observation_sequence = initial_observation_sequence
-    latest_observed_at: float | None = None
-    action_sequence = 0
-    last_send_started_at: float | None = None
-    longest_send_interval_ms = 0.0
-    last_send_interval_ms = 0.0
+    observation_timeout_count = 0
+    terminal_stale_reason: str | None = None
     started_at = monotonic()
+    latest_observed_at: float | None = started_at if follower_hold_target is not None else None
 
     try:
-        while True:
-            now = monotonic()
-            if duration_s > 0 and now - started_at >= duration_s:
+        sender.start()
+        sender_started = True
+        while sender.is_alive():
+            sender_snapshot = sender.snapshot()
+            if sender_snapshot.error is not None:
                 break
             if should_stop is not None and should_stop():
+                sender.stop()
                 break
 
-            snapshot = sampler.mailbox.snapshot()
-            if snapshot.error is not None:
-                raise snapshot.error
-            if snapshot.stale_reason is not None and not stale_announced:
+            if terminal_stale_reason is not None:
+                if duration_s == 0:
+                    sender.stop()
+                else:
+                    sender.wait(0.01)
+                continue
+
+            try:
+                sample = read_fresh_am1_live_sample(
+                    robot,
+                    leader,
+                    previous_sequence=last_used_observation_sequence,
+                    monotonic=monotonic,
+                )
+            except StaleFollowerObservation as exc:
+                observation_timeout_count += 1
+                terminal_stale_reason = str(exc)
                 print(
                     "STALE FOLLOWER OBSERVATION — holding the last safe complete arm target for "
-                    f"the remainder of this process: {snapshot.stale_reason}"
+                    f"the remainder of this process: {terminal_stale_reason}"
                 )
-                stale_announced = True
-            if (
-                snapshot.stale_reason is None
-                and snapshot.sample is not None
-                and snapshot.sample.observation_sequence > last_used_observation_sequence
-            ):
-                safe_target = apply_am1_commissioning_scope(
-                    snapshot.sample.arm_target,
-                    approved_target,
-                    scope=live_arm_scope,
-                )
-                observed_positions = dict(snapshot.sample.follower_positions)
-                latest_observed_at = snapshot.sample.observed_at
-                last_used_observation_sequence = snapshot.sample.observation_sequence
+                continue
 
-            action = make_am1_live_action(safe_target)
-            send_started_at = monotonic()
-            if profile_cadence and action_sequence == 0:
-                print(
-                    json.dumps(
-                        {
-                            "event": "am1_client_live_start",
-                            "initial_observation_sequence": initial_observation_sequence,
-                            "right_wrist_requested": safe_target[RIGHT_WRIST_FLEX_KEY],
-                            "wall_time_ns": wall_time_ns(),
-                        },
-                        sort_keys=True,
-                    )
-                )
-            robot.send_action(action)
-            send_completed_at = monotonic()
-            action_sequence += 1
-
-            send_interval_ms = (
-                0.0
-                if last_send_started_at is None
-                else (send_started_at - last_send_started_at) * 1e3
+            safe_target = apply_am1_commissioning_scope(
+                sample.arm_target,
+                hold_target,
+                scope=live_arm_scope,
             )
-            longest_send_interval_ms = max(longest_send_interval_ms, send_interval_ms)
-            last_send_interval_ms = send_interval_ms
-            last_send_started_at = send_started_at
-
-            if not sampler_started:
-                # Starting only after the first command preserves the final alignment sample as
-                # the first forwarded action, with no unchecked leader read in between.
-                sampler.start()
-                sampler_started = True
-
-            deadline = next_completion_spaced_deadline(send_completed_at, fps=fps)
-            sleep_fn(max(deadline - monotonic(), 0.0))
+            sender.publish(make_am1_live_action(safe_target))
+            observed_positions = dict(sample.follower_positions)
+            latest_observed_at = sample.observed_at
+            last_used_observation_sequence = sample.observation_sequence
+            if sample_callback is not None:
+                sample_callback(sample)
     finally:
         primary_error = sys.exception()
         diagnostic_errors: list[tuple[str, BaseException]] = []
-        live_end_wall_time_ns = None
-        if profile_cadence:
-            try:
-                live_end_wall_time_ns = wall_time_ns()
-            except BaseException as exc:
-                diagnostic_errors.append(("capturing the live-end wall clock", exc))
         join_error: BaseException | None = None
-        if sampler_started:
-            sampler.stop()
+        if sender_started:
+            if primary_error is not None:
+                sender.stop()
             try:
-                sampler.join()
+                sender.join()
             except BaseException as exc:
                 join_error = exc
-        final_snapshot = sampler.mailbox.snapshot()
+        final_snapshot = sender.snapshot()
         if profile_cadence:
             try:
                 report_now = monotonic()
@@ -1138,18 +1192,21 @@ def run_am1_live_sender(
                     json.dumps(
                         {
                             "event": "am1_client_action_cadence",
-                            "live_end_wall_time_ns": live_end_wall_time_ns,
-                            "action_sequence": action_sequence,
-                            "action_send_interval_ms": round(last_send_interval_ms, 3),
-                            "longest_action_send_interval_ms": round(longest_send_interval_ms, 3),
+                            "live_end_wall_time_ns": final_snapshot.live_end_wall_time_ns,
+                            "action_sequence": final_snapshot.action_sequence,
+                            "action_send_interval_ms": round(final_snapshot.action_send_interval_ms, 3),
+                            "longest_action_send_interval_ms": round(
+                                final_snapshot.longest_action_send_interval_ms,
+                                3,
+                            ),
                             "observation_sequence": last_used_observation_sequence,
                             "observation_age_ms": (
                                 None
                                 if latest_observed_at is None
                                 else round(max(0.0, report_now - latest_observed_at) * 1e3, 3)
                             ),
-                            "observation_timeout_count": final_snapshot.observation_timeout_count,
-                            "stale_latched": final_snapshot.stale_reason is not None,
+                            "observation_timeout_count": observation_timeout_count,
+                            "stale_latched": terminal_stale_reason is not None,
                             "right_wrist_requested": safe_target[RIGHT_WRIST_FLEX_KEY],
                             "right_wrist_observed": (
                                 None
@@ -1165,16 +1222,16 @@ def run_am1_live_sender(
 
         if primary_error is not None:
             if join_error is not None and join_error is not primary_error:
-                primary_error.add_note(f"Cleanup failed while joining AM1 live sampler: {join_error!r}")
+                primary_error.add_note(f"Cleanup failed while joining AM1 live action sender: {join_error!r}")
             if final_snapshot.error is not None and final_snapshot.error is not primary_error:
-                primary_error.add_note(f"AM1 live sampler also failed: {final_snapshot.error!r}")
+                primary_error.add_note(f"AM1 live action sender also failed: {final_snapshot.error!r}")
             for label, exc in diagnostic_errors:
                 if exc is not primary_error:
                     primary_error.add_note(f"Cadence diagnostics failed while {label}: {exc!r}")
         else:
             outcome_error = join_error or final_snapshot.error
-            if outcome_error is None and final_snapshot.stale_reason is not None:
-                outcome_error = SafetyRefusal(final_snapshot.stale_reason)
+            if outcome_error is None and terminal_stale_reason is not None:
+                outcome_error = SafetyRefusal(terminal_stale_reason)
             if outcome_error is not None:
                 for label, exc in diagnostic_errors:
                     if exc is not outcome_error:
