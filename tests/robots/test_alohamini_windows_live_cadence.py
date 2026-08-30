@@ -451,6 +451,62 @@ def test_actual_live_runner_consumes_fresh_complete_target_after_first_approved_
     )
 
 
+def test_right_wrist_runner_first_holds_follower_snapshot_then_changes_only_wrist_without_inversion():
+    module = load_teleoperate()
+    follower_hold = {key: value + 5.0 for key, value in FOLLOWER.items()}
+    moved_leader = {**LEADER, "right_wrist_flex.pos": 19.0}
+    expected_scoped = {**follower_hold, "arm_right_wrist_flex.pos": 19.0}
+    callback_actions: list[dict[str, float | int]] = []
+
+    class AdvancingRobot(TimedRobot):
+        def get_observation(self):
+            time.sleep(0.02)
+            self.observation_sequence += 1
+            return dict(follower_hold)
+
+    robot = AdvancingRobot()
+    module.run_am1_live_sender(
+        robot,
+        SampleLeader(action=moved_leader),
+        initial_arm_target=FOLLOWER,
+        initial_observation_sequence=robot.observation_sequence,
+        initial_follower_positions=follower_hold,
+        fps=10,
+        duration_s=0.35,
+        live_arm_scope="right_wrist_flex",
+        profile_cadence=False,
+        sample_callback=lambda sample, action: callback_actions.append(dict(action)),
+    )
+
+    sent_actions = [action for _, _, action in robot.sends]
+    assert sent_actions[0] == {**follower_hold, **module.make_zero_action()}
+    assert {**expected_scoped, **module.make_zero_action()} in sent_actions[1:]
+    assert callback_actions
+    assert all(action == {**expected_scoped, **module.make_zero_action()} for action in callback_actions)
+    assert all(action["arm_right_wrist_flex.pos"] == 19.0 for action in callback_actions)
+    assert all(
+        {key: action[key] for key in ARM_KEYS if key != "arm_right_wrist_flex.pos"}
+        == {key: follower_hold[key] for key in ARM_KEYS if key != "arm_right_wrist_flex.pos"}
+        for action in sent_actions
+    )
+
+
+def test_right_wrist_runner_refuses_without_fresh_follower_hold_snapshot():
+    module = load_teleoperate()
+
+    with pytest.raises(module.SafetyRefusal, match="fresh follower hold snapshot"):
+        module.run_am1_live_sender(
+            TimedRobot(),
+            SampleLeader(),
+            initial_arm_target=FOLLOWER,
+            initial_observation_sequence=8,
+            fps=10,
+            duration_s=0.1,
+            live_arm_scope="right_wrist_flex",
+            profile_cadence=False,
+        )
+
+
 def test_actual_live_runner_tolerates_cached_observation_below_freshness_limit(capsys):
     module = load_teleoperate()
     robot = TimedRobot(advance=False)

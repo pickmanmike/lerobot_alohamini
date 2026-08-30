@@ -884,7 +884,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="both",
         help=(
             "AM1 live forwarding scope; right_wrist_flex holds every other arm joint at the "
-            "final approved startup target (default: both)"
+            "fresh post-gate follower snapshot (default: both)"
         ),
     )
     parser.add_argument(
@@ -1083,7 +1083,7 @@ def run_am1_live_sender(
     wall_time_ns: Callable[[], int] = time.time_ns,
     sleep_fn: Callable[[float], None] = precise_sleep,
     should_stop: Callable[[], bool] | None = None,
-    sample_callback: Callable[[AM1LiveSample], None] | None = None,
+    sample_callback: Callable[[AM1LiveSample, Mapping[str, float | int]], None] | None = None,
 ) -> None:
     """Read devices on the caller thread while a private worker sends live actions."""
     approved_target = extract_am1_arm_positions(
@@ -1111,8 +1111,11 @@ def run_am1_live_sender(
             AM1_ARM_POSITION_KEYS,
             source="approved initial follower observation",
         )
-    hold_target = approved_target
-    safe_target = dict(approved_target)
+    if live_arm_scope == "right_wrist_flex" and follower_hold_target is None:
+        raise SafetyRefusal("right_wrist_flex live scope requires a fresh follower hold snapshot")
+
+    hold_target = follower_hold_target if live_arm_scope == "right_wrist_flex" else approved_target
+    safe_target = dict(hold_target if live_arm_scope == "right_wrist_flex" else approved_target)
     observed_positions = None if follower_hold_target is None else dict(follower_hold_target)
     initial_action = make_am1_live_action(safe_target)
 
@@ -1186,13 +1189,14 @@ def run_am1_live_sender(
                 hold_target,
                 scope=live_arm_scope,
             )
-            sender.publish(make_am1_live_action(safe_target))
+            scoped_action = make_am1_live_action(safe_target)
+            sender.publish(scoped_action)
             observed_positions = dict(sample.follower_positions)
             latest_observed_at = sample.observed_at
             last_fresh_observed_at = sample.observed_at
             last_used_observation_sequence = sample.observation_sequence
             if sample_callback is not None:
-                sample_callback(sample)
+                sample_callback(sample, scoped_action)
     finally:
         primary_error = sys.exception()
         diagnostic_errors: list[tuple[str, BaseException]] = []
@@ -1405,15 +1409,11 @@ def run_teleoperation(
 
             sample_callback = None
             if log_rerun_data is not None:
-                approved_target = dict(pending_arm_action)
-
-                def log_live_sample(sample: AM1LiveSample) -> None:
-                    scoped = apply_am1_commissioning_scope(
-                        sample.arm_target,
-                        approved_target,
-                        scope=args.live_arm_scope,
-                    )
-                    log_rerun_data(dict(sample.observation), make_am1_live_action(scoped))
+                def log_live_sample(
+                    sample: AM1LiveSample,
+                    scoped_action: Mapping[str, float | int],
+                ) -> None:
+                    log_rerun_data(dict(sample.observation), dict(scoped_action))
 
                 sample_callback = log_live_sample
 
