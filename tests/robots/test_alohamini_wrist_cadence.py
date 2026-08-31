@@ -21,7 +21,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from lerobot.motors import MotorCalibration
 from lerobot.robots.alohamini import alohamini_host
 from lerobot.robots.alohamini.alohamini import AlohaMini
 from lerobot.robots.alohamini.alohamini_host import make_parser
@@ -80,21 +79,20 @@ def make_unconnected_robot(tmp_path, robot_model: str) -> AlohaMini:
     )
 
 
-def test_am1_right_wrist_runtime_direction_is_symmetric_and_does_not_rewrite_calibration(tmp_path):
+def test_am1_right_wrist_preserves_the_ordinary_calibration_direction(tmp_path):
     calibration_path = tmp_path / "AlohaMiniRobot.json"
     robot = make_unconnected_robot(tmp_path, "alohamini1")
 
     assert robot.calibration[RIGHT_WRIST].drive_mode == 0
     assert json.loads(calibration_path.read_text(encoding="utf-8"))[RIGHT_WRIST]["drive_mode"] == 0
-    assert robot.right_bus.calibration[RIGHT_WRIST].drive_mode == 1
+    assert robot.right_bus.calibration[RIGHT_WRIST].drive_mode == 0
     for name, entry in robot.right_bus.calibration.items():
-        if name != RIGHT_WRIST:
-            assert entry == robot.calibration[name]
+        assert entry == robot.calibration[name]
     for name, entry in robot.left_bus.calibration.items():
         assert entry == robot.calibration[name]
 
-    assert robot.right_bus._normalize({4: 1000})[4] == pytest.approx(100.0)
-    assert robot.right_bus._unnormalize({4: 100.0})[4] == 1000
+    assert robot.right_bus._normalize({4: 1000})[4] == pytest.approx(-100.0)
+    assert robot.right_bus._unnormalize({4: 100.0})[4] == 3000
     assert robot.right_bus._normalize({1: 1000})[1] == pytest.approx(-100.0)
 
 
@@ -105,33 +103,6 @@ def test_am2_models_do_not_reflect_the_right_wrist_runtime_direction(tmp_path, r
     assert robot.right_bus.calibration[RIGHT_WRIST].drive_mode == 0
     assert robot.right_bus._normalize({4: 1000})[4] == pytest.approx(-100.0)
     assert robot.right_bus._unnormalize({4: 100.0})[4] == 3000
-
-
-def test_am1_right_wrist_runtime_direction_is_reapplied_after_calibration_assignment():
-    robot = AlohaMini.__new__(AlohaMini)
-    robot.config = SimpleNamespace(robot_model="alohamini1")
-    robot.right_bus = SimpleNamespace(
-        calibration={
-            RIGHT_WRIST: MotorCalibration(
-                id=4,
-                drive_mode=0,
-                homing_offset=-1609,
-                range_min=1461,
-                range_max=3167,
-            )
-        }
-    )
-
-    robot._apply_runtime_joint_directions()
-
-    assert robot.right_bus.calibration[RIGHT_WRIST] == MotorCalibration(
-        id=4,
-        drive_mode=1,
-        homing_offset=-1609,
-        range_min=1461,
-        range_max=3167,
-    )
-
 
 class ActionBus:
     def __init__(

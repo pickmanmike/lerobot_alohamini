@@ -17,7 +17,6 @@
 import logging
 import sys
 import time
-from dataclasses import replace
 from functools import cached_property
 from itertools import chain
 from typing import Any
@@ -158,8 +157,6 @@ class AlohaMini(Robot):
         else:
             self.right_bus = None
 
-        self._apply_runtime_joint_directions()
-
         if config.no_follower:
             self.left_arm_motors = []
             self.right_arm_motors = []
@@ -222,26 +219,6 @@ class AlohaMini(Robot):
         self._joint_release_margin = 1.0
         self._joint_hold_goal: dict[str, float] = {}
         self._joint_hold_direction: dict[str, float] = {}
-
-
-    def _apply_runtime_joint_directions(self) -> None:
-        """Apply AM1 installation direction metadata without persisting calibration changes."""
-        if self.config.robot_model != "alohamini1" or self.right_bus is None:
-            return
-
-        motor = "arm_right_wrist_flex"
-        calibration = self.right_bus.calibration.get(motor)
-        if calibration is None or calibration.drive_mode == 1:
-            return
-
-        # This is deliberately a replacement in the bus-local cache. The calibration
-        # file and Robot.calibration retain the measured offsets and direction exactly
-        # as recorded; no motor register is read or written here.
-        self.right_bus.calibration = {
-            **self.right_bus.calibration,
-            motor: replace(calibration, drive_mode=1),
-        }
-
 
     @property
     def _state_ft(self) -> dict[str, type]:
@@ -357,7 +334,6 @@ class AlohaMini(Robot):
                     calib_right = {k: v for k, v in self.calibration.items() if k in self.right_bus.motors}
                     self.right_bus.write_calibration(calib_right, cache=False)
                     self.right_bus.calibration = calib_right
-                    self._apply_runtime_joint_directions()
 
                 return
 
@@ -466,7 +442,6 @@ class AlohaMini(Robot):
             calib_right = {k: v for k, v in self.calibration.items() if k in self.right_bus.motors}
             self.right_bus.write_calibration(calib_right, cache=False)
             self.right_bus.calibration = calib_right
-            self._apply_runtime_joint_directions()
 
         self._save_calibration()
         print("Calibration saved to", self.calibration_fpath)
