@@ -73,7 +73,21 @@ Find the two leader ports with one USB controller connected at a time, recording
 .\.venv\Scripts\lerobot-find-port.exe
 ```
 
-Windows requires both ports explicitly. The physical/logical left is `COM8`, and the physical/logical right is `COM7`. Do not infer identity from port numbering, swap only the port arguments, rename calibration files, or exchange JSON contents.
+Windows requires both ports explicitly. COM numbers are runtime addresses, not physical identities. Keep the physical/logical left controller in `LEFT-LABELED-SOCKET` and the physical/logical right controller in `RIGHT-LABELED-SOCKET` on the dedicated hub. The verified map currently resolves those controllers to `COM8` and `COM7`, respectively, but every command below uses the ports discovered for that session.
+
+The read-only helper reports every present CH343 COM port, FriendlyName, PnP InstanceId, and status without opening a port. It may select roles only when both stored PnP identities each have one unique current match:
+
+```powershell
+$portMapFile = 'C:\Users\pickm\AlohaMini1Logs\am1-leader-hub-map-20260831-140827.json'
+$portReport = (& pwsh -NoLogo -NoProfile -File .\tools\report_am1_leader_ports.ps1 -PortMapFile $portMapFile -AsJson | Out-String) | ConvertFrom-Json
+if (-not $portReport.auto_selection_permitted) { throw 'Stored leader PnP identities did not match uniquely; do not open either port.' }
+$LeftPort = [string]$portReport.role_matches.left.port
+$RightPort = [string]$portReport.role_matches.right.port
+if ($LeftPort -eq $RightPort) { throw 'Leader ports are not distinct.' }
+"LEFT_PORT=$LeftPort RIGHT_PORT=$RightPort"
+```
+
+If either identity is missing, duplicated, ambiguous, or attached to the wrong labeled socket, stop. Do not infer a role from the COM number, swap only port arguments, rename calibration files, or exchange JSON contents.
 
 ### Simple AM1 leader calibration and recovery
 
@@ -84,13 +98,13 @@ None of the powered commands below is authorized merely by appearing in this gui
 1. With both leader supplies off and both leader USB controllers disconnected, inspect the active calibration pair without constructing a bus:
 
 ```powershell
-pwsh -NoLogo -NoProfile -File .\tools\calibrate_am1_leaders.ps1 -Status
+pwsh -NoLogo -NoProfile -File .\tools\calibrate_am1_leaders.ps1 -Status -LeftPort $LeftPort -RightPort $RightPort
 ```
 
-2. For a separately authorized raw bus check, connect physical/logical left only as `COM8` and physical/logical right only as `COM7`, power each from its designated 7.4 V supply, and keep the workspace clear. Move the physical right leader moderately, then the physical left leader, while the checker samples both buses. The exact uppercase positional `CHECK` is required:
+2. For a separately authorized raw bus check, keep each leader in its labeled hub socket, power each from its designated 7.4 V supply, and keep the workspace clear. Move the physical right leader moderately, then the physical left leader, while the checker samples the explicitly selected buses. The exact uppercase positional `CHECK` is required:
 
 ```powershell
-.\.venv\Scripts\python.exe .\tools\check_am1_leader_buses.py CHECK
+.\.venv\Scripts\python.exe .\tools\check_am1_leader_buses.py CHECK --left-port $LeftPort --right-port $RightPort
 ```
 
 Stop immediately and remove leader power on a missing or malformed sample, disappearing port, wrong physical identity, unexpected powered movement, resistance, sound, heat, current, cable strain, disconnect, cleanup failure, or any evidence of a write or follower/Pi/network construction. A failed check authorizes no automatic retry.
@@ -98,7 +112,7 @@ Stop immediately and remove leader power on a missing or malformed sample, disap
 3. For a separately authorized one-shot calibration, require both corrected leader buses and designated supplies to be stable, then run:
 
 ```powershell
-pwsh -NoLogo -NoProfile -File .\tools\calibrate_am1_leaders.ps1 -Calibrate -Confirm CALIBRATE
+pwsh -NoLogo -NoProfile -File .\tools\calibrate_am1_leaders.ps1 -Calibrate -Confirm CALIBRATE -LeftPort $LeftPort -RightPort $RightPort
 ```
 
 Follow the existing prompts and move only the joint currently requested through its complete safe useful range. Do not force wrist roll during range recording; the implementation assigns `0..4095`. Before promotion, any failure leaves the active calibration files unchanged; preserve any backup, transcript, or staged evidence already created. After fixing a connection or range-recording problem, perform a complete fresh rerun; never reuse partial staging output. If failure output instead says `ACTIVE_PAIR_STATE=PROMOTED_VERIFIED` and `WITHDRAWAL_CLEANUP_STATE=FAILED_OR_PARTIAL`, do not rerun or alter files—power off and stop for review because the new pair is already active.
@@ -110,12 +124,27 @@ Promotion has a narrow fail-closed interruption case because Windows cannot exch
 4. After a clean calibration `PASS`, power-cycle and reconnect both leaders, keep follower power off and the Pi host stopped, then run this exact 30-second no-robot check:
 
 ```powershell
-.\.venv\Scripts\python.exe .\examples\alohamini\teleoperate_bi.py --no_robot --robot.robot_model alohamini1 --teleop.left_port COM8 --teleop.right_port COM7 --teleop.id so101_leader_bi --teleop.arm_profile so-arm-5dof --require_calibration_match --duration_s 30 --fps 5 --no_keyboard --no_rerun
+.\.venv\Scripts\python.exe .\examples\alohamini\teleoperate_bi.py --no_robot --robot.robot_model alohamini1 --teleop.left_port $LeftPort --teleop.right_port $RightPort --teleop.id so101_leader_bi --teleop.arm_profile so-arm-5dof --require_calibration_match --duration_s 30 --fps 5 --no_keyboard --no_rerun
 ```
 
 This command connects and configures both leader buses. `--no_robot` excludes the follower and Pi only; it is not a raw read-only leader check.
 
 Hold both leaders still until sampling begins. Move only the physical left gripper and verify that the physical left gripper must change only `arm_left_gripper.pos`; return it to a moderate pose, then move only the physical right gripper and verify that the physical right gripper must change only `arm_right_gripper.pos`. Stop immediately on a wrong-side or both-side response, any error, unexpected sound, heat, current, cable strain, disconnect, follower movement or power, or any robot/ZMQ construction. Power off and disconnect both leaders after the check and preserve the complete output for review.
+
+The retained right-only recovery command below is not the normal pair-calibration path. Use it only under a separately reviewed physical calibration packet after backing up the active pair and recording the left hash. It must leave the left file byte-for-byte unchanged:
+
+```powershell
+$Python = '.\.venv\Scripts\python.exe'
+& $Python @(
+  '-m'
+  'lerobot.scripts.lerobot_calibrate'
+  '--teleop.type=so101_leader'
+  '--teleop.port=' + $RightPort
+  '--teleop.id=so101_leader_bi_right'
+  '--teleop.use_degrees=false'
+  '--teleop.arm_profile=so-arm-5dof'
+)
+```
 
 <details>
 <summary>Historical/deprecated direct AM1 calibration example (superseded; do not repeat)</summary>
@@ -738,7 +767,12 @@ Passing Packet 2N-R5R authorizes only later review of its evidence. It does not 
 
 </details>
 
-#### Packet AR1 — current local bimanual-arm state
+<details>
+<summary>Superseded Packet AR1 software-wrist procedure (historical; do not execute)</summary>
+
+The procedure below records the state before the right leader's upside-down wrist-flex motor was mechanically corrected. Its follower-side reflection, calibration hash, commit pins, isolated-wrist stage, and physical commands are obsolete and must not be used.
+
+#### Packet AR1 — superseded local bimanual-arm state
 
 Local AM1 bimanual arm teleoperation has been physically demonstrated once. The reviewed Windows run completed startup synchronization, printed `TELEOPERATION ACTIVE — LEADER MOVEMENT IS NOW ALLOWED`, forwarded both leaders to their corresponding followers, cleaned up, and recorded `SESSION_EXIT_CODE=0`.
 
@@ -953,6 +987,138 @@ Pass requires correct correspondence, same-direction right wrist flex, no human-
 Stop immediately for wrong direction or joint, excessive travel or speed, jump/resume behavior, unexpected sound/current/contact/cable strain, any live watchdog or stale transition, communication error, calibration prompt, repeated limiter activity, or loss of the physical power-disconnect path. Stop the host and remove motor power before review.
 
 Fetch the exact Pi log path printed by the wrapper after stopping it cleanly:
+
+```powershell
+$piHostLog = Read-Host 'Paste the exact Pi HOST_LOG path'
+.\tools\fetch_am1_pi_log.ps1 -RemoteHost 'pickmanmike@192.168.1.134' -RemotePath $piHostLog
+if ($LASTEXITCODE -ne 0) { throw 'Pi host-log fetch failed.' }
+```
+
+</details>
+
+#### Packet AR1 — current local bimanual-arm state
+
+Local AM1 bimanual arm teleoperation has been physically demonstrated once, using the regulated 12 V / 10 A follower/body supply. The completed baseline entered live mode, controlled both corresponding follower arms, cleaned up, and returned `SESSION_EXIT_CODE=0`; base, lift, cameras, recording, and remote operation are not thereby complete. Its evidence remains:
+
+- Windows: `C:\Users\pickm\AlohaMini1Logs\am1-provisional-sync-live20-20260829-213421.log`
+- Pi host: `C:\Users\pickm\AlohaMini1Logs\am1-provisional-live20-host-20260829-212759.log`
+
+The right-leader wrist-flex motor was subsequently found mounted upside down. It was reinstalled in the correct physical orientation and the right leader alone was recalibrated as `so101_leader_bi_right`; the left calibration remained byte-for-byte unchanged. The leader-only two-arm hub check passed and is recorded at `C:\Users\pickm\AlohaMini1Logs\am1-corrected-right-leader-hub-check-20260831-141234.log`. The accepted calibration SHA-256 identities are now:
+
+- left: `34D06E15F6768A3290B85BBE3507D9B14A8CCED263A40C575E02010560E13FBE`
+- corrected right: `C5F04F97B2B4B371EF4C4292616E7BBCAAE3987805930DE46CAEB3C614D2950C`
+
+No follower wrist reflection remains. The Pi follow-up `ee3a6f5dd813be82780a6a9b1789966357542d2f` removes the process-local right-wrist `drive_mode` override and preserves the ordinary calibrated direction for every AM1 path. It retains the host command-gap, watchdog, limiter, and cadence diagnostics. It changes no calibration JSON, servo register, Phase, PID, torque, ID, baud, limit, or unrelated joint; AM2 and AM2 Pro remain isolated.
+
+The bounded post-correction wrist run reached `TELEOPERATION ACTIVE`, while its private action sender maintained approximately 10 Hz, but the client then repeatedly printed `ZMQ observation request failed: Resource temporarily unavailable`; `observation_sequence` stopped advancing and the one-second stale gate correctly refused with status `2`. This not-yet-passing evidence is `C:\Users\pickm\AlohaMini1Logs\am1-ar1-right-wrist-bounded-windows-20260830-194629.log`.
+
+The failed boundary was observation-request bookkeeping, not action cadence. A timed-out oldest request could be followed by a late response for another still-active token; the old client discarded that valid response, cleared the remaining local tokens, and could then meet a full socket high-water mark with no tracked reply available to drain. Repeated sends returned `EAGAIN`, so the window could not recover to a fresh observation. Windows commit `4f8885b73860b204980c70e92e3daee94b0f35e8` now matches each response token, caches responses for other active requests, discards only unknown/retired tokens, retires only the request that actually times out, drains late replies, and replenishes the exact bounded request window. The cache is cleared on disconnect. The one-second terminal stale refusal and every malformed/partial/nonfinite/wrong-key safety refusal remain unchanged. This repair is fake-tested but not yet physically validated.
+
+Windows commit `68cb66673cfba291cfc9f9ea208950d0a42803b6` removes permanent COM defaults from the calibration wrapper and propagates explicit, distinct runtime ports through validation, native calibration, and its follow-up command. Commit `47437569de08a4e4a8875dac728f3ea97d28436e` does the same for the read-only raw bus checker. `tools\report_am1_leader_ports.ps1` reads Windows PnP state without opening a bus and reports CH343 COM port, FriendlyName, PnP InstanceId, and status. It permits automatic role selection only when the stored left and right PnP identities match uniquely and resolve to distinct ports. The verified map is `C:\Users\pickm\AlohaMini1Logs\am1-leader-hub-map-20260831-140827.json`; keep left in `LEFT-LABELED-SOCKET` and right in `RIGHT-LABELED-SOCKET`.
+
+Only one physical arm session remains in this packet: the prepared 45-second, 10 Hz, both-arm test below. The prior isolated-wrist procedure is superseded. These commands are preparation, not authorization; begin with the Pi host stopped, follower/body power off, both leader supplies off, both leader USB controllers disconnected, a clear arm envelope, and all disconnects immediately reachable.
+
+Windows preflight, performed before leader power is applied, verifies the reviewed code ancestry, documentation-only tail, unique PnP mapping, and exact calibration identities without opening a COM port:
+
+```powershell
+$ErrorActionPreference = 'Stop'
+Set-Location 'C:\Users\pickm\lerobot_alohamini_client'
+if ((git branch --show-current).Trim() -ne 'fix/am1-wrist-cadence') { throw 'Wrong Windows branch.' }
+$reviewedCode = '47437569de08a4e4a8875dac728f3ea97d28436e'
+git merge-base --is-ancestor $reviewedCode HEAD
+if ($LASTEXITCODE -ne 0) { throw 'Reviewed Windows AR1-R2H code is absent.' }
+$tail = @(git diff --name-only "$reviewedCode..HEAD" | Sort-Object)
+$expectedTail = @('docs/alohamini/alohamini.md', 'tests/robots/test_calibrate_am1_leaders.py')
+if (@(Compare-Object -ReferenceObject $expectedTail -DifferenceObject $tail).Count -ne 0) { throw 'Unexpected change after reviewed code.' }
+if (@(git status --porcelain).Count -ne 0) { throw 'Windows worktree is not clean.' }
+
+$portMapFile = 'C:\Users\pickm\AlohaMini1Logs\am1-leader-hub-map-20260831-140827.json'
+$portReport = (& pwsh -NoLogo -NoProfile -File .\tools\report_am1_leader_ports.ps1 -PortMapFile $portMapFile -AsJson | Out-String) | ConvertFrom-Json
+if (-not $portReport.auto_selection_permitted) { throw 'Leader PnP identities are missing or ambiguous.' }
+$LeftPort = [string]$portReport.role_matches.left.port
+$RightPort = [string]$portReport.role_matches.right.port
+if ($LeftPort -eq $RightPort) { throw 'Leader ports are not distinct.' }
+
+$calibrationDir = Join-Path $HOME '.cache\huggingface\lerobot\calibration\teleoperators\so_leader'
+$leftCalibration = Join-Path $calibrationDir 'so101_leader_bi_left.json'
+$rightCalibration = Join-Path $calibrationDir 'so101_leader_bi_right.json'
+$leftHash = (Get-FileHash -LiteralPath $leftCalibration -Algorithm SHA256).Hash
+$rightHash = (Get-FileHash -LiteralPath $rightCalibration -Algorithm SHA256).Hash
+if ($leftHash -ne '34D06E15F6768A3290B85BBE3507D9B14A8CCED263A40C575E02010560E13FBE') { throw 'Left leader calibration mismatch.' }
+if ($rightHash -ne 'C5F04F97B2B4B371EF4C4292616E7BBCAAE3987805930DE46CAEB3C614D2950C') { throw 'Corrected right leader calibration mismatch.' }
+"PORT_MAP_FILE=$portMapFile"
+"LEFT_PORT=$LeftPort RIGHT_PORT=$RightPort"
+"LEFT_SHA256=$leftHash RIGHT_SHA256=$rightHash"
+
+$env:PYTHONDONTWRITEBYTECODE = '1'
+$am1LogDir = Join-Path $HOME 'AlohaMini1Logs'
+New-Item -ItemType Directory -Force -Path $am1LogDir | Out-Null
+```
+
+For the separately authorized test, prepare the Pi on the updated draft PR #1 head and start only the no-camera, unhomed-lift host:
+
+```bash
+set -euo pipefail
+cd /home/pickmanmike/lerobot_alohamini
+test "$(git branch --show-current)" = "fix/am1-right-wrist-normalization"
+test "$(git rev-parse HEAD)" = "ee3a6f5dd813be82780a6a9b1789966357542d2f"
+test -z "$(git status --porcelain)"
+
+HOST_LOG="$HOME/am1-ar1-r2h-bimanual10-host-$(date +%Y%m%d-%H%M%S).log"
+printf 'HOST_LOG=%s\n' "$HOST_LOG"
+set +e
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m lerobot.robots.alohamini.alohamini_host \
+  --robot_model alohamini1 \
+  --no_cameras \
+  --skip_lift_home \
+  --max_relative_target 20.0 \
+  --max_loop_freq_hz 30 \
+  --profile_timing true \
+  --profile_cadence \
+  2>&1 | tee "$HOST_LOG"
+host_exit=${PIPESTATUS[0]}
+set -e
+printf 'HOST_EXIT_CODE=%s\n' "$host_exit" | tee -a "$HOST_LOG"
+exit "$host_exit"
+```
+
+After the host is ready, run the Windows client from the preflight shell. The resolved `$LeftPort` and `$RightPort` are explicit runtime arguments; neither COM number is treated as permanent identity:
+
+```powershell
+$timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$windowsLog = Join-Path $am1LogDir "am1-ar1-r2h-bimanual10-windows-$timestamp.log"
+"WINDOWS_LOG=$windowsLog" | Tee-Object -FilePath $windowsLog
+"LEFT_PORT=$LeftPort RIGHT_PORT=$RightPort" | Tee-Object -FilePath $windowsLog -Append
+& .\.venv\Scripts\python.exe .\examples\alohamini\teleoperate_bi.py `
+  --robot.remote_ip 192.168.1.134 `
+  --robot.robot_model alohamini1 `
+  --teleop.left_port $LeftPort `
+  --teleop.right_port $RightPort `
+  --teleop.id so101_leader_bi `
+  --teleop.arm_profile so-arm-5dof `
+  --startup_mode sync `
+  --startup_sync_side both `
+  --startup_sync_duration_s 120.0 `
+  --max_start_mismatch 10.0 `
+  --live_arm_scope both `
+  --fps 10 `
+  --duration_s 45 `
+  --start_paused `
+  --no_keyboard `
+  --no_cameras `
+  --profile_cadence `
+  --no_rerun `
+  2>&1 | Tee-Object -FilePath $windowsLog -Append
+$clientExit = $LASTEXITCODE
+"SESSION_EXIT_CODE=$clientExit" | Tee-Object -FilePath $windowsLog -Append
+if ($clientExit -ne 0) { throw "Bimanual session failed with exit code $clientExit." }
+```
+
+Use arbitrary safe calibrated initial poses, with the physical right follower shoulder-lift at its natural unforced endpoint. Hold both leaders still while typing exact uppercase `SYNC`, throughout synchronization, for at least three seconds after `SYNCHRONIZATION COMPLETE`, while pressing Enter at the start-paused gate, and until the exact `TELEOPERATION ACTIVE` message appears. Only then move one channel at a time initially, followed by slow bounded bimanual motion. The provisional commissioning values remain Pi `max_relative_target=20.0` and client `--max_start_mismatch 10.0`; do not widen either to hide a failure.
+
+Pass requires all twelve channels to respond on the correct side and in the correct physical direction, including the corrected right wrist; no stale latch or observation-request deadlock; no host watchdog event during live forwarding; no multi-second follower freeze, pause/resume jump, or bus failure; explicit zero base/lift throughout; Windows exit `0`; clean client cleanup; and orderly Pi shutdown. A transient observation timeout is recordable only if a later sequence advances, the action cadence remains continuous, and no stale latch or watchdog occurs.
+
+Stop immediately for a wrong side or direction, unexpected or excessive motion, follower freeze or jump, repeated limiter activity, stale transition, observation deadlock, live watchdog, bus/communication error, calibration prompt, sound, heat, current, contact, cable strain, or loss of the power-disconnect path. Stop the host and remove motor power before reviewing or fetching logs. Retrieve the exact path printed as `HOST_LOG` only after the host is stopped:
 
 ```powershell
 $piHostLog = Read-Host 'Paste the exact Pi HOST_LOG path'

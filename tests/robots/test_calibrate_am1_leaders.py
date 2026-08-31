@@ -1903,20 +1903,24 @@ def test_documentation_defines_simple_am1_leader_commands_and_identity() -> None
 
     assert "### Simple AM1 leader calibration and recovery" in text
     assert (
-        r".\.venv\Scripts\python.exe .\tools\check_am1_leader_buses.py CHECK"
-        in normalized
-    )
-    assert (
-        r"pwsh -NoLogo -NoProfile -File .\tools\calibrate_am1_leaders.ps1 -Status"
+        r".\.venv\Scripts\python.exe .\tools\check_am1_leader_buses.py CHECK "
+        r"--left-port $LeftPort --right-port $RightPort"
         in normalized
     )
     assert (
         r"pwsh -NoLogo -NoProfile -File .\tools\calibrate_am1_leaders.ps1 "
-        r"-Calibrate -Confirm CALIBRATE"
+        r"-Status -LeftPort $LeftPort -RightPort $RightPort"
         in normalized
     )
-    assert "physical/logical left is `COM8`" in text
-    assert "physical/logical right is `COM7`" in text
+    assert (
+        r"pwsh -NoLogo -NoProfile -File .\tools\calibrate_am1_leaders.ps1 "
+        r"-Calibrate -Confirm CALIBRATE -LeftPort $LeftPort -RightPort $RightPort"
+        in normalized
+    )
+    assert r".\tools\report_am1_leader_ports.ps1 -PortMapFile $portMapFile -AsJson" in normalized
+    assert "COM numbers are runtime addresses, not physical identities" in text
+    assert "`LEFT-LABELED-SOCKET`" in text
+    assert "`RIGHT-LABELED-SOCKET`" in text
 
 
 def test_documentation_covers_recovery_wrist_roll_and_no_robot_side_check() -> None:
@@ -1930,7 +1934,7 @@ def test_documentation_covers_recovery_wrist_roll_and_no_robot_side_check() -> N
     )[1].split("4. After a clean calibration `PASS`", maxsplit=1)[0]
     expected_no_robot = (
         r".\.venv\Scripts\python.exe .\examples\alohamini\teleoperate_bi.py --no_robot "
-        r"--robot.robot_model alohamini1 --teleop.left_port COM8 --teleop.right_port COM7 "
+        r"--robot.robot_model alohamini1 --teleop.left_port $LeftPort --teleop.right_port $RightPort "
         r"--teleop.id so101_leader_bi --teleop.arm_profile so-arm-5dof "
         r"--require_calibration_match --duration_s 30 --fps 5 --no_keyboard --no_rerun"
     )
@@ -1973,6 +1977,31 @@ def test_documentation_covers_recovery_wrist_roll_and_no_robot_side_check() -> N
         "inspect and validate the active directory before any cleanup",
     ):
         assert recovery_term in simple_section
+
+
+def test_documentation_reconciles_corrected_right_leader_and_one_final_session() -> None:
+    text = DOCUMENTATION_PATH.read_text(encoding="utf-8")
+    normalized = " ".join(text.split())
+    ar1 = text.split("#### Packet AR1 — current local bimanual-arm state", maxsplit=1)[1].split(
+        "## 3. Camera Configuration", maxsplit=1
+    )[0]
+
+    assert "34D06E15F6768A3290B85BBE3507D9B14A8CCED263A40C575E02010560E13FBE" in ar1
+    assert "C5F04F97B2B4B371EF4C4292616E7BBCAAE3987805930DE46CAEB3C614D2950C" in ar1
+    assert "753ECD0CC6EA655355447BE3ACE3C864FD86F9DC7A62E26AB41421E3DBAB4D90" not in ar1
+    assert "mounted upside down" in ar1
+    assert "No follower wrist reflection remains" in ar1
+    assert "ee3a6f5dd813be82780a6a9b1789966357542d2f" in ar1
+    assert "4f8885b73860b204980c70e92e3daee94b0f35e8" in ar1
+    assert "68cb6667" in ar1
+    assert "not yet physically validated" in ar1
+    assert "am1-leader-hub-map-20260831-140827.json" in ar1
+    assert "am1-ar1-right-wrist-bounded-windows-20260830-194629.log" in ar1
+    assert ar1.count("--duration_s 45") == 1
+    assert "right-wrist-isolated live stage" not in ar1
+    assert "--teleop.left_port $LeftPort" in normalized
+    assert "--teleop.right_port $RightPort" in normalized
+    assert "--teleop.id=so101_leader_bi_right" in normalized
 
 
 def test_documentation_deprecates_old_runner_as_historical_only() -> None:
