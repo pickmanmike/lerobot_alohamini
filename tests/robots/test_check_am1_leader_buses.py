@@ -8,6 +8,9 @@ import pytest
 
 from tools.check_am1_leader_buses import JOINT_NAMES, main, run_check
 
+LEFT_PORT = "COM12"
+RIGHT_PORT = "COM13"
+
 
 class FakeClock:
     def __init__(self) -> None:
@@ -70,24 +73,26 @@ def test_clean_check_reads_both_raw_six_motor_buses_without_writes() -> None:
     clock = FakeClock()
     factory, buses, constructions = make_factory(
         {
-            "COM8": [raw_sample(0), raw_sample(10), raw_sample(20)],
-            "COM7": [raw_sample(100), raw_sample(110), raw_sample(120)],
+            LEFT_PORT: [raw_sample(0), raw_sample(10), raw_sample(20)],
+            RIGHT_PORT: [raw_sample(100), raw_sample(110), raw_sample(120)],
         }
     )
     lines: list[str] = []
 
     result = run_check(
+        left_port=LEFT_PORT,
+        right_port=RIGHT_PORT,
         bus_factory=factory,
         monotonic=clock.monotonic,
         sleep=clock.sleep,
-        port_present=lambda port: port in {"COM8", "COM7"},
+        port_present=lambda port: port in {LEFT_PORT, RIGHT_PORT},
         duration_s=0.21,
         sample_hz=10.0,
         out=lines.append,
     )
 
     assert result.sample_count == 3
-    assert [item["port"] for item in constructions] == ["COM8", "COM7"]
+    assert [item["port"] for item in constructions] == [LEFT_PORT, RIGHT_PORT]
     for construction in constructions:
         assert construction["calibration"] is None
         motors = construction["motors"]
@@ -99,8 +104,8 @@ def test_clean_check_reads_both_raw_six_motor_buses_without_writes() -> None:
         assert bus.disconnect_calls == [False]
         assert bus.read_calls == [("Present_Position", None, False, 0)] * 3
     text = "\n".join(lines)
-    assert "LEFT_PORT=COM8" in text
-    assert "RIGHT_PORT=COM7" in text
+    assert f"LEFT_PORT={LEFT_PORT}" in text
+    assert f"RIGHT_PORT={RIGHT_PORT}" in text
     assert "SAMPLE_COUNT=3" in text
     assert "FIRST_LEFT=" in text and "LAST_RIGHT=" in text
     assert "MIN_MAX_LEFT=" in text and "MIN_MAX_RIGHT=" in text
@@ -122,6 +127,8 @@ def test_slow_reads_do_not_start_new_sample_after_monotonic_deadline() -> None:
         return bus
 
     result = run_check(
+        left_port=LEFT_PORT,
+        right_port=RIGHT_PORT,
         bus_factory=factory,
         monotonic=clock.monotonic,
         sleep=clock.sleep,
@@ -154,6 +161,8 @@ def test_any_drop_or_malformed_sample_fails_immediately_and_disconnects(side, ba
 
     with pytest.raises(Exception, match=message):
         run_check(
+            left_port="COM8",
+            right_port="COM7",
             bus_factory=factory,
             monotonic=clock.monotonic,
             sleep=clock.sleep,
@@ -178,6 +187,8 @@ def test_disappearing_port_fails_before_another_read_and_disconnects_both() -> N
 
     with pytest.raises(RuntimeError, match="disappeared"):
         run_check(
+            left_port="COM8",
+            right_port="COM7",
             bus_factory=factory,
             monotonic=clock.monotonic,
             sleep=clock.sleep,
@@ -204,6 +215,8 @@ def test_single_transient_packet_drop_after_clean_sample_is_not_tolerated() -> N
 
     with pytest.raises(RuntimeError, match="transient packet drop"):
         run_check(
+            left_port="COM8",
+            right_port="COM7",
             bus_factory=factory,
             monotonic=clock.monotonic,
             sleep=clock.sleep,
@@ -225,6 +238,8 @@ def test_keyboard_interrupt_is_primary_and_cleanup_never_writes() -> None:
 
     with pytest.raises(KeyboardInterrupt):
         run_check(
+            left_port="COM8",
+            right_port="COM7",
             bus_factory=factory,
             monotonic=clock.monotonic,
             sleep=clock.sleep,
@@ -256,8 +271,9 @@ def test_disconnect_failure_exits_nonzero_without_emitting_pass(capsys) -> None:
     lines: list[str] = []
 
     exit_code = main(
-        ["CHECK"],
-        run=lambda: run_check(
+        ["CHECK", "--left-port", "COM8", "--right-port", "COM7"],
+        run=lambda **ports: run_check(
+            **ports,
             bus_factory=factory,
             monotonic=clock.monotonic,
             sleep=clock.sleep,
@@ -304,14 +320,48 @@ def test_missing_confirmation_refuses_before_constructing_a_bus() -> None:
 
 def test_exact_check_confirmation_runs_once() -> None:
     calls = 0
+    observed: dict[str, str] = {}
 
-    def clean_run() -> object:
+    def clean_run(*, left_port: str, right_port: str) -> object:
         nonlocal calls
         calls += 1
+        observed.update(left_port=left_port, right_port=right_port)
         return object()
 
-    assert main(["CHECK"], run=clean_run) == 0
+    assert main(["CHECK", "--left-port", LEFT_PORT, "--right-port", RIGHT_PORT], run=clean_run) == 0
     assert calls == 1
+    assert observed == {"left_port": LEFT_PORT, "right_port": RIGHT_PORT}
+
+
+@pytest.mark.parametrize(
+    ("left_port", "right_port", "message"),
+    [
+        ("COM0", "COM7", "left port"),
+        ("COM8", "ttyUSB0", "right port"),
+        ("COM8", "COM8", "distinct"),
+    ],
+)
+def test_invalid_runtime_ports_refuse_before_bus_construction(
+    left_port: str,
+    right_port: str,
+    message: str,
+) -> None:
+    called = False
+
+    def forbidden_factory(**_: object) -> ReadOnlyFakeBus:
+        nonlocal called
+        called = True
+        raise AssertionError("invalid ports must refuse before bus construction")
+
+    with pytest.raises(ValueError, match=message):
+        run_check(
+            left_port=left_port,
+            right_port=right_port,
+            bus_factory=forbidden_factory,
+            duration_s=0.01,
+        )
+
+    assert called is False
 
 
 @pytest.mark.parametrize("confirmation", ["check", " CHECK", "CHECK "])

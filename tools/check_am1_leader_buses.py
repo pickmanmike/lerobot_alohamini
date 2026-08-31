@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -13,8 +14,6 @@ from typing import Any, Protocol
 from lerobot.motors import Motor, MotorNormMode
 from lerobot.motors.feetech import FeetechMotorsBus
 
-LEFT_PORT = "COM8"
-RIGHT_PORT = "COM7"
 JOINT_NAMES = (
     "shoulder_pan",
     "shoulder_lift",
@@ -84,8 +83,20 @@ def _json(value: object) -> str:
     return json.dumps(value, separators=(",", ":"), sort_keys=True)
 
 
+def _validate_port_pair(left_port: str, right_port: str) -> tuple[str, str]:
+    if re.fullmatch(r"COM[1-9][0-9]*", left_port) is None:
+        raise ValueError("left port must be an explicit uppercase COM port such as COM8")
+    if re.fullmatch(r"COM[1-9][0-9]*", right_port) is None:
+        raise ValueError("right port must be an explicit uppercase COM port such as COM7")
+    if left_port == right_port:
+        raise ValueError("left and right ports must be distinct")
+    return left_port, right_port
+
+
 def run_check(
     *,
+    left_port: str,
+    right_port: str,
     bus_factory: Callable[..., Bus] = _default_bus_factory,
     monotonic: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
@@ -94,12 +105,13 @@ def run_check(
     sample_hz: float = 10.0,
     out: Callable[[str], Any] = print,
 ) -> CheckResult:
+    left_port, right_port = _validate_port_pair(left_port, right_port)
     if duration_s <= 0 or duration_s > 30.0:
         raise ValueError("duration_s must be greater than zero and no more than 30 seconds")
     if sample_hz <= 0 or sample_hz > 10.0:
         raise ValueError("sample_hz must be greater than zero and no more than 10 Hz")
 
-    specs = (("left", LEFT_PORT), ("right", RIGHT_PORT))
+    specs = (("left", left_port), ("right", right_port))
     buses = {
         side: bus_factory(port=port, motors=_motors(), calibration=None)
         for side, port in specs
@@ -109,8 +121,8 @@ def run_check(
     primary: BaseException | None = None
     result: CheckResult | None = None
 
-    out(f"LEFT_PORT={LEFT_PORT}")
-    out(f"RIGHT_PORT={RIGHT_PORT}")
+    out(f"LEFT_PORT={left_port}")
+    out(f"RIGHT_PORT={right_port}")
     try:
         for side, port in specs:
             if not port_present(port):
@@ -194,19 +206,22 @@ def run_check(
 def main(
     argv: list[str] | None = None,
     *,
-    run: Callable[[], CheckResult] = run_check,
+    run: Callable[..., CheckResult] = run_check,
 ) -> int:
     parser = argparse.ArgumentParser(
-        description="Run the read-only AM1 COM8/COM7 raw leader-bus stability check."
+        description="Run the read-only AM1 raw leader-bus stability check on explicit runtime ports."
     )
     parser.add_argument(
         "confirmation",
         choices=("CHECK",),
         help="Exact uppercase authorization required before opening either leader bus",
     )
-    parser.parse_args(argv)
+    parser.add_argument("--left-port", required=True, help="Current physical/logical left COM port")
+    parser.add_argument("--right-port", required=True, help="Current physical/logical right COM port")
+    args = parser.parse_args(argv)
     try:
-        run()
+        left_port, right_port = _validate_port_pair(args.left_port, args.right_port)
+        run(left_port=left_port, right_port=right_port)
     except KeyboardInterrupt:
         print("LEADER_BUS_CHECK=INTERRUPTED")
         return 130
