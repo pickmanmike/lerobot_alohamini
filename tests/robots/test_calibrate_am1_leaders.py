@@ -1989,6 +1989,8 @@ def test_documentation_reconciles_corrected_right_leader_and_one_final_session()
     assert "34D06E15F6768A3290B85BBE3507D9B14A8CCED263A40C575E02010560E13FBE" in ar1
     assert "C5F04F97B2B4B371EF4C4292616E7BBCAAE3987805930DE46CAEB3C614D2950C" in ar1
     assert "753ECD0CC6EA655355447BE3ACE3C864FD86F9DC7A62E26AB41421E3DBAB4D90" not in ar1
+    assert "753ECD0CC6EA655355447BE3ACE3C864FD86F9DC7A62E26AB41421E3DBAB4D90" not in text
+    assert "reflects `arm_right_wrist_flex`" not in text
     assert "mounted upside down" in ar1
     assert "No follower wrist reflection remains" in ar1
     assert "ee3a6f5dd813be82780a6a9b1789966357542d2f" in ar1

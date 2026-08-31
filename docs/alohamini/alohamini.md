@@ -782,9 +782,9 @@ Evidence:
 - downloaded Pi host: `C:\Users\pickm\AlohaMini1Logs\am1-provisional-live20-host-20260829-212759.log`
 - right-leader direction sample: `C:\Users\pickm\AlohaMini1Logs\am1-right-wrist-leader-direction-20260830-003457.log`
 
-The proven leader ownership is left `COM8` and right `COM7`. The accepted calibration SHA-256 identities are left `34D06E15F6768A3290B85BBE3507D9B14A8CCED263A40C575E02010560E13FBE` and right `753ECD0CC6EA655355447BE3ACE3C864FD86F9DC7A62E26AB41421E3DBAB4D90`. The successful run used a regulated 12 V / 10 A follower/body supply, the physical right follower shoulder-lift at its natural unforced endpoint, Pi `max_relative_target=20.0`, `--startup_sync_duration_s 120.0`, and `--max_start_mismatch 10.0`. The host limit and startup gate remain provisional commissioning settings.
+The historical run used left `COM8`, right `COM7`, a regulated 12 V / 10 A follower/body supply, the physical right follower shoulder-lift at its natural unforced endpoint, Pi `max_relative_target=20.0`, `--startup_sync_duration_s 120.0`, and `--max_start_mismatch 10.0`. Its former right calibration identity was invalidated by the later mechanical correction; only the identities in the current section below are accepted.
 
-That run left two defects open. Physical right-leader wrist flex drove the right follower wrist in the opposite physical direction, and some follower joints paused before later resuming. The action path had no explicit wrist sign transform, and both endpoint calibration files recorded `drive_mode=0`. AM1 now treats the known-good right-leader normalized value as canonical and reflects `arm_right_wrist_flex` exactly once in the right follower bus's process-local calibration cache. Goal writes and Present Position observations use the same reflection, so startup synchronization, live teleoperation, recording, and later policy actions share one convention without double inversion. No calibration JSON or servo register is rewritten; Phase, PID, torque, IDs, baud, limits, and every unrelated joint remain unchanged. AM2 and AM2 Pro do not receive the reflection.
+That run appeared to show a right-wrist coordinate defect and follower pauses. The later mechanical inspection proved the wrist problem came from the upside-down right-leader motor; the temporary follower-side reflection was an incorrect workaround and has been removed. The observation-request failure and current no-reflection design are described in the current section below.
 
 The old client performed synchronous observation, leader, absent-camera, visualization, and printing work before action sends. Explicit AM1 arms-only mode (`--no_keyboard --no_cameras`) now keeps the existing observation DEALER socket, both leader buses, all follower and leader reads, validation, and the operator lifecycle on the main thread. A dedicated action-sender thread creates its own context and PUSH socket, sets `CONFLATE`, bounded `SNDTIMEO`, and `LINGER` before connecting, sends at a monotonic completion-spaced cadence, and closes that socket and context in the same thread. The original main-thread PUSH socket is used only before live forwarding and after the sender has stopped and joined. The sender always transmits all twelve arm targets plus explicit zero `x.vel`, `y.vel`, `theta.vel`, and `lift_axis.vel`; it never sends catch-up bursts.
 
@@ -824,7 +824,7 @@ $calibrationDir = Join-Path $HOME '.cache\huggingface\lerobot\calibration\teleop
 $leftCalibration = Join-Path $calibrationDir 'so101_leader_bi_left.json'
 $rightCalibration = Join-Path $calibrationDir 'so101_leader_bi_right.json'
 if ((Get-FileHash -LiteralPath $leftCalibration -Algorithm SHA256).Hash -ne '34D06E15F6768A3290B85BBE3507D9B14A8CCED263A40C575E02010560E13FBE') { throw 'Left leader calibration mismatch.' }
-if ((Get-FileHash -LiteralPath $rightCalibration -Algorithm SHA256).Hash -ne '753ECD0CC6EA655355447BE3ACE3C864FD86F9DC7A62E26AB41421E3DBAB4D90') { throw 'Right leader calibration mismatch.' }
+throw 'Superseded AR1 procedure: do not execute; use the current AR1-R2H packet below.'
 
 $env:PYTHONDONTWRITEBYTECODE = '1'
 $am1LogDir = Join-Path $HOME 'AlohaMini1Logs'
