@@ -1022,7 +1022,7 @@ Windows preflight, performed before leader power is applied, verifies the review
 
 ```powershell
 $ErrorActionPreference = 'Stop'
-Set-Location 'C:\Users\pickm\lerobot_alohamini_client'
+Set-Location 'C:\Users\pickm\lerobot_alohamini_client\.worktrees\am1-wrist-cadence'
 if ((git branch --show-current).Trim() -ne 'fix/am1-wrist-cadence') { throw 'Wrong Windows branch.' }
 $reviewedCode = '47437569de08a4e4a8875dac728f3ea97d28436e'
 git merge-base --is-ancestor $reviewedCode HEAD
@@ -1051,6 +1051,7 @@ if ($rightHash -ne 'C5F04F97B2B4B371EF4C4292616E7BBCAAE3987805930DE46CAEB3C614D2
 "LEFT_SHA256=$leftHash RIGHT_SHA256=$rightHash"
 
 $env:PYTHONDONTWRITEBYTECODE = '1'
+$Python = 'C:\Users\pickm\lerobot_alohamini_client\.venv\Scripts\python.exe'
 $am1LogDir = Join-Path $HOME 'AlohaMini1Logs'
 New-Item -ItemType Directory -Force -Path $am1LogDir | Out-Null
 ```
@@ -1089,7 +1090,7 @@ $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $windowsLog = Join-Path $am1LogDir "am1-ar1-r2h-bimanual10-windows-$timestamp.log"
 "WINDOWS_LOG=$windowsLog" | Tee-Object -FilePath $windowsLog
 "LEFT_PORT=$LeftPort RIGHT_PORT=$RightPort" | Tee-Object -FilePath $windowsLog -Append
-& .\.venv\Scripts\python.exe .\examples\alohamini\teleoperate_bi.py `
+& $Python .\examples\alohamini\teleoperate_bi.py `
   --robot.remote_ip 192.168.1.134 `
   --robot.robot_model alohamini1 `
   --teleop.left_port $LeftPort `
