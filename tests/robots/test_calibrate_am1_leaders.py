@@ -371,7 +371,9 @@ $outcome = Invoke-Am1CalibrationAttempt -RepositoryRoot {ps_literal(repository)}
     -PythonProbeInvoker $pythonProbe -GitInvoker $gitProbe -CopyFileInvoker $copy `
     -StartTranscriptInvoker $startTranscript -NativeCommandInvoker $native `
     -StopTranscriptInvoker $stopTranscript{promotion_arguments}
-Write-Am1CalibrationOutcome -Outcome $outcome
+Write-Am1CalibrationOutcome -Outcome $outcome `
+    -LeftPortValue 'COM8' -RightPortValue 'COM7' `
+    -LeaderIdValue 'so101_leader_bi' -ArmProfileValue 'so-arm-5dof'
 $report = [ordered]@{{
     outcome = $outcome
     native_calls = $nativeCalls
@@ -546,8 +548,9 @@ def test_pair_rejects_semantically_identical_left_and_right_payloads(tmp_path: P
 @pytest.mark.parametrize(
     ("left", "right", "leader_id", "profile", "confirmation", "require_confirmation", "reason"),
     [
-        ("COM9", "COM7", "so101_leader_bi", "so-arm-5dof", "CALIBRATE", False, "left port"),
-        ("COM8", "COM6", "so101_leader_bi", "so-arm-5dof", "CALIBRATE", False, "right port"),
+        ("COM0", "COM7", "so101_leader_bi", "so-arm-5dof", "CALIBRATE", False, "left port"),
+        ("COM8", "ttyUSB0", "so101_leader_bi", "so-arm-5dof", "CALIBRATE", False, "right port"),
+        ("COM8", "COM8", "so101_leader_bi", "so-arm-5dof", "CALIBRATE", False, "distinct"),
         ("COM8", "COM7", "wrong", "so-arm-5dof", "CALIBRATE", False, "leader ID"),
         ("COM8", "COM7", "so101_leader_bi", "am-leader-6dof", "CALIBRATE", False, "arm profile"),
         ("COM8", "COM7", "so101_leader_bi", "so-arm-5dof", "calibrate", True, "confirmation"),
@@ -624,7 +627,8 @@ def test_native_command_is_exact_and_uses_explicit_staging_leaf(tmp_path: Path) 
         tmp_path,
         "New-Am1NativeCalibrationCommand "
         f"-RepositoryRoot {ps_literal(repository)} -PythonPath {ps_literal(python)} "
-        f"-StagingLeaf {ps_literal(staging)}",
+        f"-StagingLeaf {ps_literal(staging)} -LeftPortValue 'COM12' -RightPortValue 'COM13' "
+        "-LeaderIdValue 'so101_leader_bi' -ArmProfileValue 'so-arm-5dof'",
     )
 
     assert result.returncode == 0, result.stderr
@@ -634,9 +638,9 @@ def test_native_command_is_exact_and_uses_explicit_staging_leaf(tmp_path: Path) 
         "arguments": [
             str(repository / "examples" / "alohamini" / "calibrate_bi.py"),
             "--teleop.left_port",
-            "COM8",
+            "COM12",
             "--teleop.right_port",
-            "COM7",
+            "COM13",
             "--teleop.id",
             "so101_leader_bi",
             "--teleop.arm_profile",
@@ -765,7 +769,7 @@ def test_status_is_read_only_and_reports_both_active_identities(tmp_path: Path) 
 $nativeCalled = $false
 function Invoke-Am1NativeCalibration {{ $script:nativeCalled = $true; throw 'forbidden native invocation' }}
 $statusFacts = Get-Am1LeaderCalibrationStatus -RepositoryRoot {ps_literal(repository)} `
-    -PythonPath {ps_literal(python)} -LeftPortValue 'COM8' -RightPortValue 'COM7' `
+    -PythonPath {ps_literal(python)} -LeftPortValue 'COM12' -RightPortValue 'COM13' `
     -LeaderIdValue 'so101_leader_bi' -ArmProfileValue 'so-arm-5dof' `
     -PythonProbeInvoker $pythonProbe -GitInvoker $gitProbe
 [Console]::Out.WriteLine(([ordered]@{{ status = $statusFacts; native_called = $nativeCalled; python_calls = @($pythonCalls) }} | ConvertTo-Json -Depth 100 -Compress))
@@ -797,7 +801,7 @@ def test_status_wrong_identity_refuses_before_python_probe(tmp_path: Path) -> No
 $reason = $null
 try {{
     Get-Am1LeaderCalibrationStatus -RepositoryRoot {ps_literal(repository)} `
-        -PythonPath {ps_literal(python)} -LeftPortValue 'COM9' -RightPortValue 'COM7' `
+        -PythonPath {ps_literal(python)} -LeftPortValue 'COM0' -RightPortValue 'COM7' `
         -LeaderIdValue 'so101_leader_bi' -ArmProfileValue 'so-arm-5dof' `
         -PythonProbeInvoker $pythonProbe -GitInvoker $gitProbe | Out-Null
 }}
@@ -1770,7 +1774,7 @@ catch {{ $failure = $_.Exception.Message }}
 @pytest.mark.parametrize(
     ("left_port", "confirmation", "reason"),
     [
-        ("COM9", "CALIBRATE", "left port"),
+        ("COM0", "CALIBRATE", "left port"),
         ("COM8", "calibrate", "confirmation"),
     ],
 )
@@ -1848,7 +1852,7 @@ $attempt = {{
     return ({outcome})
 }}
 $code = Invoke-Am1LeaderCalibrationMain -StatusMode $false -CalibrateMode $true `
-    -Confirmation 'CALIBRATE' -LeftPortValue 'COM8' -RightPortValue 'COM7' `
+    -Confirmation 'CALIBRATE' -LeftPortValue 'COM12' -RightPortValue 'COM13' `
     -LeaderIdValue 'so101_leader_bi' -ArmProfileValue 'so-arm-5dof' `
     -RunIdValue 'test-run' -CalibrationAttemptInvoker $attempt
 [Console]::Out.WriteLine('MAIN_JSON=' + ([ordered]@{{
@@ -1866,8 +1870,8 @@ $code = Invoke-Am1LeaderCalibrationMain -StatusMode $false -CalibrateMode $true 
     )
     assert report["code"] == expected_code
     assert report["attempt_calls"] == 1
-    assert report["observed"]["left_port"] == "COM8"
-    assert report["observed"]["right_port"] == "COM7"
+    assert report["observed"]["left_port"] == "COM12"
+    assert report["observed"]["right_port"] == "COM13"
     assert report["observed"]["leader_id"] == "so101_leader_bi"
     assert report["observed"]["arm_profile"] == "so-arm-5dof"
     assert report["observed"]["confirmation"] == "CALIBRATE"
@@ -1876,10 +1880,21 @@ $code = Invoke-Am1LeaderCalibrationMain -StatusMode $false -CalibrateMode $true 
         assert result.stdout.count("CALIBRATION_RESULT=PASS") == 1
         assert "ACTIVE_LEFT_PATH=left-path" in result.stdout
         assert "ACTIVE_RIGHT_PATH=right-path" in result.stdout
+        assert "--teleop.left_port COM12 --teleop.right_port COM13" in result.stdout
+        assert "--teleop.left_port COM8 --teleop.right_port COM7" not in result.stdout
         assert "CALIBRATION_RESULT=FAIL" not in result.stdout
     else:
         assert result.stdout.count("CALIBRATION_RESULT=FAIL") == 1
         assert "CALIBRATION_RESULT=PASS" not in result.stdout
+
+
+def test_wrapper_has_no_permanent_com_port_defaults() -> None:
+    text = SCRIPT_PATH.read_text(encoding="utf-8")
+
+    assert '[Parameter()][string]$LeftPort = "COM8"' not in text
+    assert '[Parameter()][string]$RightPort = "COM7"' not in text
+    assert "[Parameter()][string]$LeftPort," in text
+    assert "[Parameter()][string]$RightPort," in text
 
 
 def test_documentation_defines_simple_am1_leader_commands_and_identity() -> None:

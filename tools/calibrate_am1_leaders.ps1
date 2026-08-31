@@ -3,8 +3,8 @@ param(
     [Parameter()][switch]$Status,
     [Parameter()][switch]$Calibrate,
     [Parameter()][string]$Confirm,
-    [Parameter()][string]$LeftPort = "COM8",
-    [Parameter()][string]$RightPort = "COM7",
+    [Parameter()][string]$LeftPort,
+    [Parameter()][string]$RightPort,
     [Parameter()][string]$LeaderId = "so101_leader_bi",
     [Parameter()][string]$ArmProfile = "so-arm-5dof"
 )
@@ -288,11 +288,14 @@ function Assert-Am1FixedIdentity {
         [Parameter()][switch]$RequireCalibrationConfirmation
     )
 
-    if ($LeftPortValue -cne "COM8") {
-        throw "AM1 left port must be exactly COM8"
+    if ($LeftPortValue -cnotmatch "\ACOM[1-9][0-9]*\z") {
+        throw "AM1 left port must be an explicit uppercase COM port such as COM8"
     }
-    if ($RightPortValue -cne "COM7") {
-        throw "AM1 right port must be exactly COM7"
+    if ($RightPortValue -cnotmatch "\ACOM[1-9][0-9]*\z") {
+        throw "AM1 right port must be an explicit uppercase COM port such as COM7"
+    }
+    if ([System.StringComparer]::OrdinalIgnoreCase.Equals($LeftPortValue, $RightPortValue)) {
+        throw "AM1 left and right ports must be distinct"
     }
     if ($LeaderIdValue -cne "so101_leader_bi") {
         throw "AM1 leader ID must be exactly so101_leader_bi"
@@ -372,7 +375,11 @@ function New-Am1NativeCalibrationCommand {
     param(
         [Parameter(Mandatory = $true)][string]$RepositoryRoot,
         [Parameter(Mandatory = $true)][string]$PythonPath,
-        [Parameter(Mandatory = $true)][string]$StagingLeaf
+        [Parameter(Mandatory = $true)][string]$StagingLeaf,
+        [Parameter(Mandatory = $true)][string]$LeftPortValue,
+        [Parameter(Mandatory = $true)][string]$RightPortValue,
+        [Parameter(Mandatory = $true)][string]$LeaderIdValue,
+        [Parameter(Mandatory = $true)][string]$ArmProfileValue
     )
 
     $repository = [System.IO.Path]::GetFullPath($RepositoryRoot)
@@ -383,13 +390,13 @@ function New-Am1NativeCalibrationCommand {
         arguments         = @(
             (Join-Path $repository "examples\alohamini\calibrate_bi.py")
             "--teleop.left_port"
-            "COM8"
+            $LeftPortValue
             "--teleop.right_port"
-            "COM7"
+            $RightPortValue
             "--teleop.id"
-            "so101_leader_bi"
+            $LeaderIdValue
             "--teleop.arm_profile"
-            "so-arm-5dof"
+            $ArmProfileValue
             "--teleop.calibration_dir"
             $staging
             "--force_fresh_calibration"
@@ -1183,7 +1190,9 @@ function Invoke-Am1CalibrationAttempt {
         $transcriptPath = Join-Path $runDirectory "calibration-transcript.txt"
         $facts.transcript_path = $transcriptPath
         $command = New-Am1NativeCalibrationCommand -RepositoryRoot $RepositoryRoot `
-            -PythonPath $PythonPath -StagingLeaf $stagingLeaf
+            -PythonPath $PythonPath -StagingLeaf $stagingLeaf `
+            -LeftPortValue $LeftPortValue -RightPortValue $RightPortValue `
+            -LeaderIdValue $LeaderIdValue -ArmProfileValue $ArmProfileValue
         if (-not (Test-Path -LiteralPath $command.arguments[0] -PathType Leaf)) {
             throw "Aloha Mini calibration script is missing: $($command.arguments[0])"
         }
@@ -1320,7 +1329,13 @@ function Assert-Am1SuccessfulCalibrationOutcome {
 }
 
 function Write-Am1CalibrationOutcome {
-    param([Parameter(Mandatory = $true)]$Outcome)
+    param(
+        [Parameter(Mandatory = $true)]$Outcome,
+        [Parameter()][AllowNull()][string]$LeftPortValue,
+        [Parameter()][AllowNull()][string]$RightPortValue,
+        [Parameter()][AllowNull()][string]$LeaderIdValue,
+        [Parameter()][AllowNull()][string]$ArmProfileValue
+    )
 
     if ($null -ne $Outcome.run_directory) {
         [Console]::Out.WriteLine("RUN_DIRECTORY=$($Outcome.run_directory)")
@@ -1358,14 +1373,16 @@ function Write-Am1CalibrationOutcome {
         return
     }
     Assert-Am1SuccessfulCalibrationOutcome -Outcome $Outcome
+    Assert-Am1FixedIdentity -LeftPortValue $LeftPortValue -RightPortValue $RightPortValue `
+        -LeaderIdValue $LeaderIdValue -ArmProfileValue $ArmProfileValue
     [Console]::Out.WriteLine("ACTIVE_LEFT_PATH=$($Outcome.left.path)")
     [Console]::Out.WriteLine("ACTIVE_RIGHT_PATH=$($Outcome.right.path)")
     [Console]::Out.WriteLine("ACTIVE_LEFT_SHA256=$($Outcome.left.sha256)")
     [Console]::Out.WriteLine("ACTIVE_RIGHT_SHA256=$($Outcome.right.sha256)")
     [Console]::Out.WriteLine(
         "NEXT_COMMAND=.\.venv\Scripts\python.exe .\examples\alohamini\teleoperate_bi.py --no_robot " +
-        "--robot.robot_model alohamini1 --teleop.left_port COM8 --teleop.right_port COM7 " +
-        "--teleop.id so101_leader_bi --teleop.arm_profile so-arm-5dof --require_calibration_match " +
+        "--robot.robot_model alohamini1 --teleop.left_port $LeftPortValue --teleop.right_port $RightPortValue " +
+        "--teleop.id $LeaderIdValue --teleop.arm_profile $ArmProfileValue --require_calibration_match " +
         "--duration_s 30 --fps 5 --no_keyboard --no_rerun"
     )
     [Console]::Out.WriteLine("CALIBRATION_RESULT=PASS")
@@ -1684,7 +1701,9 @@ function Invoke-Am1LeaderCalibrationMain {
         -LeftPortValue $LeftPortValue -RightPortValue $RightPortValue `
         -LeaderIdValue $LeaderIdValue -ArmProfileValue $ArmProfileValue `
         -Confirmation $Confirmation -RunId $RunIdValue
-    Write-Am1CalibrationOutcome -Outcome $outcome
+    Write-Am1CalibrationOutcome -Outcome $outcome `
+        -LeftPortValue $LeftPortValue -RightPortValue $RightPortValue `
+        -LeaderIdValue $LeaderIdValue -ArmProfileValue $ArmProfileValue
     if ($outcome.success) {
         return 0
     }
