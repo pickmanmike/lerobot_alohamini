@@ -143,6 +143,7 @@ class AlohaMiniClient(Robot):
         self.zmq_cmd_socket = None
         self.zmq_observation_socket = None
         self._observation_request_tokens: deque[bytes] = deque()
+        self._observation_response_cache: dict[bytes, list[bytes]] = {}
         self._observation_request_id = 0
 
         self.last_frames = {}
@@ -285,8 +286,12 @@ class AlohaMiniClient(Robot):
     def _receive_observation_response(
         self, request_token: bytes, timeout_ms: int
     ) -> list[bytes] | None:
-        """Wait for one token-matched response and discard responses to older requests."""
+        """Wait for one token-matched response while preserving other active replies."""
         zmq = self._zmq
+
+        cached = self._observation_response_cache.pop(request_token, None)
+        if cached is not None:
+            return cached
 
         poller = zmq.Poller()
         poller.register(self.zmq_observation_socket, zmq.POLLIN)
@@ -309,8 +314,13 @@ class AlohaMiniClient(Robot):
                     response = self.zmq_observation_socket.recv_multipart(zmq.NOBLOCK)
                 except zmq.Again:
                     break
-                if response and response[0] == request_token:
+                if not response:
+                    continue
+                response_token = response[0]
+                if response_token == request_token:
                     return response[1:]
+                if response_token in self._observation_request_tokens:
+                    self._observation_response_cache[response_token] = response[1:]
 
     def _request_observation(self, timeout_ms: int) -> list[bytes] | None:
         """Send and synchronously receive one observation request."""
@@ -327,10 +337,27 @@ class AlohaMiniClient(Robot):
                 break
             self._observation_request_tokens.append(request_token)
 
+    def _drain_observation_responses(self) -> None:
+        """Drain ready replies, retaining only those for requests still tracked locally."""
+        zmq = self._zmq
+        while True:
+            try:
+                response = self.zmq_observation_socket.recv_multipart(zmq.NOBLOCK)
+            except zmq.Again:
+                return
+            if not response:
+                continue
+            response_token = response[0]
+            if response_token in self._observation_request_tokens:
+                self._observation_response_cache[response_token] = response[1:]
+
     def _poll_and_get_latest_message(self) -> list[bytes] | None:
         """Consume the oldest response and replenish the bounded request window."""
 
         if not self._observation_request_tokens:
+            # A timed-out request can reply after its local token was retired. Drain such
+            # replies before retrying a send so a full inbound pipe cannot strand recovery.
+            self._drain_observation_responses()
             self._fill_observation_request_window()
 
         message = (
@@ -342,13 +369,10 @@ class AlohaMiniClient(Robot):
         )
         if message is None:
             logging.info("No new data available within timeout.")
-            # A missing response may make the remaining ordered tokens ambiguous.
-            # Drop local bookkeeping; later responses are rejected by token matching.
-            self._observation_request_tokens.clear()
-        else:
-            # Replenish before decoding the current frame so Host work and transport overlap
-            # JPEG decoding, teleoperation, action sending, and dataset I/O.
-            self._fill_observation_request_window()
+        # Retire only the token just consumed or timed out. Replies for other active tokens
+        # are cached by token, and every result replenishes exactly the available window slot.
+        self._drain_observation_responses()
+        self._fill_observation_request_window()
         return message
 
     def _parse_observation_json(self, obs_data: str | bytes) -> RobotObservation | None:
@@ -664,6 +688,7 @@ class AlohaMiniClient(Robot):
         """Cleans ZMQ comms"""
 
         self._observation_request_tokens.clear()
+        self._observation_response_cache.clear()
         self.zmq_observation_socket.close()
         self.zmq_cmd_socket.close()
         self.zmq_context.term()

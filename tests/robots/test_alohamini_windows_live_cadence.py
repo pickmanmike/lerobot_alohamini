@@ -5,10 +5,12 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -55,6 +57,260 @@ def parse_windows(module, *extra: str):
         ["--left_port", "COM8", "--right_port", "COM7", *extra],
         platform_name="Windows",
     )
+
+
+class ObservationAgain(Exception):
+    pass
+
+
+class FakeObservationSocket:
+    def __init__(self, *, send_failures: int = 0):
+        self.send_failures = send_failures
+        self.sent: list[bytes] = []
+        self.responses: deque[list[bytes]] = deque()
+
+    def send(self, request_token, flags):
+        if self.send_failures:
+            self.send_failures -= 1
+            raise ObservationAgain("Resource temporarily unavailable")
+        self.sent.append(request_token)
+
+    def recv_multipart(self, flags):
+        if not self.responses:
+            raise ObservationAgain("Resource temporarily unavailable")
+        return self.responses.popleft()
+
+
+class FakeObservationPoller:
+    def __init__(self, pollin):
+        self.pollin = pollin
+        self.socket = None
+
+    def register(self, socket, event):
+        assert event == self.pollin
+        self.socket = socket
+
+    def poll(self, timeout_ms):
+        assert timeout_ms >= 0
+        if self.socket.responses:
+            return [(self.socket, self.pollin)]
+        return []
+
+
+def make_observation_transport_client(*, send_failures: int = 0):
+    from lerobot.robots.alohamini.alohamini_client import AlohaMiniClient
+    from lerobot.robots.alohamini.config_alohamini import AlohaMiniClientConfig
+
+    pollin = 2
+    socket = FakeObservationSocket(send_failures=send_failures)
+    fake_zmq = SimpleNamespace(
+        NOBLOCK=1,
+        POLLIN=pollin,
+        Again=ObservationAgain,
+        ZMQError=ObservationAgain,
+        Poller=lambda: FakeObservationPoller(pollin),
+    )
+    client = AlohaMiniClient(
+        AlohaMiniClientConfig(
+            remote_ip="127.0.0.1",
+            id="test",
+            robot_model="alohamini1",
+            cameras={},
+            polling_timeout_ms=50,
+            observation_request_window=3,
+        )
+    )
+    client._zmq = fake_zmq
+    client.zmq_observation_socket = socket
+    return client, socket
+
+
+def test_observation_window_recovers_after_timeout_then_late_and_fresh_responses():
+    client, socket = make_observation_transport_client()
+    client._fill_observation_request_window()
+
+    assert client._poll_and_get_latest_message() is None
+    assert tuple(client._observation_request_tokens) == (b"2", b"3", b"4")
+
+    socket.responses.extend(([b"1", b"late"], [b"2", b"fresh"]))
+    assert client._poll_and_get_latest_message() == [b"fresh"]
+    assert tuple(client._observation_request_tokens) == (b"3", b"4", b"5")
+
+
+def test_observation_window_recovers_after_send_eagain():
+    client, socket = make_observation_transport_client(send_failures=1)
+
+    assert client._poll_and_get_latest_message() is None
+    assert tuple(client._observation_request_tokens) == (b"2", b"3", b"4")
+    assert socket.sent == [b"2", b"3", b"4"]
+
+    socket.responses.append([b"2", b"recovered"])
+    assert client._poll_and_get_latest_message() == [b"recovered"]
+
+
+def test_observation_window_stays_bounded_and_full_through_multiple_transient_misses():
+    client, socket = make_observation_transport_client()
+
+    for _ in range(5):
+        assert client._poll_and_get_latest_message() is None
+        assert len(client._observation_request_tokens) == client.observation_request_window
+        assert len(set(client._observation_request_tokens)) == client.observation_request_window
+
+    oldest_active = client._observation_request_tokens[0]
+    socket.responses.append([oldest_active, b"after-misses"])
+    assert client._poll_and_get_latest_message() == [b"after-misses"]
+
+
+def test_observation_response_for_another_active_token_is_cached_not_discarded():
+    client, socket = make_observation_transport_client()
+    client._fill_observation_request_window()
+    socket.responses.extend(
+        (
+            [b"999", b"unknown"],
+            [b"2", b"second"],
+            [b"1", b"first"],
+        )
+    )
+
+    assert client._poll_and_get_latest_message() == [b"first"]
+    assert client._poll_and_get_latest_message() == [b"second"]
+
+
+def test_observation_sequence_advances_after_timeout_and_late_response_recovery():
+    client, socket = make_observation_transport_client()
+    client._is_connected = True
+
+    assert client.get_observation() == {}
+    assert client.observation_sequence == 0
+
+    socket.responses.extend(
+        (
+            [b"1", b'{"arm_left_shoulder_pan.pos": -99.0}'],
+            [b"2", b'{"arm_left_shoulder_pan.pos": 12.0}'],
+        )
+    )
+    observation = client.get_observation()
+
+    assert observation["arm_left_shoulder_pan.pos"] == pytest.approx(12.0)
+    assert client.observation_sequence == 1
+
+
+def test_ch343_port_report_matches_only_unique_stored_pnp_identities(tmp_path):
+    pwsh = shutil.which("pwsh") or shutil.which("powershell")
+    if pwsh is None:
+        pytest.skip("PowerShell is required to exercise the Windows port-report helper")
+
+    script = REPO_ROOT / "tools" / "report_am1_leader_ports.ps1"
+    port_map = tmp_path / "port-map.json"
+    devices = tmp_path / "devices.json"
+    port_map.write_text(
+        json.dumps(
+            {
+                "physical_left": {
+                    "port": "COM8",
+                    "pnp_device_id": r"USB\VID_1A86&PID_55D3\LEFT123",
+                    "hub_socket": "LEFT-LABELED-SOCKET",
+                },
+                "physical_right": {
+                    "port": "COM7",
+                    "pnp_device_id": r"USB\VID_1A86&PID_55D3\RIGHT456",
+                    "hub_socket": "RIGHT-LABELED-SOCKET",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    device_rows = [
+        {
+            "FriendlyName": "USB-Enhanced-SERIAL CH343 (COM8)",
+            "InstanceId": r"USB\VID_1A86&PID_55D3\LEFT123",
+            "Status": "OK",
+        },
+        {
+            "FriendlyName": "USB-Enhanced-SERIAL CH343 (COM7)",
+            "InstanceId": r"USB\VID_1A86&PID_55D3\RIGHT456",
+            "Status": "OK",
+        },
+        {
+            "FriendlyName": "Unrelated serial adapter (COM4)",
+            "InstanceId": r"USB\VID_9999&PID_0001\OTHER",
+            "Status": "OK",
+        },
+    ]
+    devices.write_text(json.dumps(device_rows), encoding="utf-8")
+
+    def run_report():
+        return subprocess.run(
+            [
+                pwsh,
+                "-NoLogo",
+                "-NoProfile",
+                "-File",
+                str(script),
+                "-PortMapFile",
+                str(port_map),
+                "-DeviceSnapshotPath",
+                str(devices),
+                "-AsJson",
+            ],
+            cwd=REPO_ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    matched = run_report()
+    assert matched.returncode == 0, matched.stderr
+    report = json.loads(matched.stdout)
+    assert report["auto_selection_permitted"] is True
+    assert report["role_matches"] == {
+        "left": {
+            "status": "matched",
+            "port": "COM8",
+            "instance_id": r"USB\VID_1A86&PID_55D3\LEFT123",
+        },
+        "right": {
+            "status": "matched",
+            "port": "COM7",
+            "instance_id": r"USB\VID_1A86&PID_55D3\RIGHT456",
+        },
+    }
+    assert report["devices"] == [
+        {
+            "port": "COM7",
+            "friendly_name": "USB-Enhanced-SERIAL CH343 (COM7)",
+            "instance_id": r"USB\VID_1A86&PID_55D3\RIGHT456",
+            "status": "OK",
+            "matched_role": "right",
+        },
+        {
+            "port": "COM8",
+            "friendly_name": "USB-Enhanced-SERIAL CH343 (COM8)",
+            "instance_id": r"USB\VID_1A86&PID_55D3\LEFT123",
+            "status": "OK",
+            "matched_role": "left",
+        },
+    ]
+
+    device_rows.append(
+        {
+            "FriendlyName": "USB-Enhanced-SERIAL CH343 (COM9)",
+            "InstanceId": r"USB\VID_1A86&PID_55D3\LEFT123",
+            "Status": "OK",
+        }
+    )
+    devices.write_text(json.dumps(device_rows), encoding="utf-8")
+
+    ambiguous = run_report()
+    assert ambiguous.returncode == 0, ambiguous.stderr
+    report = json.loads(ambiguous.stdout)
+    assert report["auto_selection_permitted"] is False
+    assert report["role_matches"]["left"] == {
+        "status": "ambiguous",
+        "port": None,
+        "instance_id": r"USB\VID_1A86&PID_55D3\LEFT123",
+    }
+    assert report["role_matches"]["right"]["status"] == "matched"
 
 
 def test_no_cameras_builds_empty_schema_and_only_decoupled_am1_opts_into_bounded_send():
