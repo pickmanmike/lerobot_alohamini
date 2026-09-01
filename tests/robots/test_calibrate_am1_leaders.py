@@ -1999,10 +1999,15 @@ def test_documentation_reconciles_corrected_right_leader_and_one_final_session()
     assert "not yet physically validated" in ar1
     assert "am1-leader-hub-map-20260831-140827.json" in ar1
     assert "am1-ar1-right-wrist-bounded-windows-20260830-194629.log" in ar1
+    assert "am1-ar1-r2h-bimanual10-windows-20260831-211727.log" in ar1
+    assert "am1-ar1-r2h-bimanual10-host-20260831-211511.log" in ar1
+    assert "command_send_timeout_ms" in ar1
     assert ar1.count("--duration_s 45") == 1
     assert "right-wrist-isolated live stage" not in ar1
     assert "Set-Location 'C:\\Users\\pickm\\lerobot_alohamini_client\\.worktrees\\am1-wrist-cadence'" in ar1
     assert "$Python = 'C:\\Users\\pickm\\lerobot_alohamini_client\\.venv\\Scripts\\python.exe'" in ar1
+    assert "$env:PYTHONPATH = (Resolve-Path .\\src).Path" in ar1
+    assert "Wrong Python import root" in ar1
     assert "& $Python .\\examples\\alohamini\\teleoperate_bi.py" in ar1
     assert "--teleop.left_port $LeftPort" in normalized
     assert "--teleop.right_port $RightPort" in normalized

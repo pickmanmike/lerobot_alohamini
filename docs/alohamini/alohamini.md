@@ -1014,6 +1014,8 @@ The bounded post-correction wrist run reached `TELEOPERATION ACTIVE`, while its 
 
 The failed boundary was observation-request bookkeeping, not action cadence. A timed-out oldest request could be followed by a late response for another still-active token; the old client discarded that valid response, cleared the remaining local tokens, and could then meet a full socket high-water mark with no tracked reply available to drain. Repeated sends returned `EAGAIN`, so the window could not recover to a fresh observation. Windows commit `4f8885b73860b204980c70e92e3daee94b0f35e8` now matches each response token, caches responses for other active requests, discards only unknown/retired tokens, retires only the request that actually times out, drains late replies, and replenishes the exact bounded request window. The cache is cleared on disconnect. The one-second terminal stale refusal and every malformed/partial/nonfinite/wrong-key safety refusal remain unchanged. This repair is fake-tested but not yet physically validated.
 
+The first AR1-R2H combined validation attempt is recorded in Windows log `C:\Users\pickm\AlohaMini1Logs\am1-ar1-r2h-bimanual10-windows-20260831-211727.log` and Pi host log `/home/pickmanmike/am1-ar1-r2h-bimanual10-host-20260831-211511.log`. The Pi established a quiet hold at approximately 29.9 Hz, but the Windows client refused before constructing `AlohaMiniClient`: the root checkout's editable installation supplied an older `AlohaMiniClientConfig` without `command_send_timeout_ms` while the entry-point script came from the review worktree. No leader COM port or ZMQ connection was opened and no synchronization or commanded motion occurred. The preflight below now pins `PYTHONPATH` to the review worktree and verifies the exact imported configuration source before powered operation.
+
 Windows commit `68cb66673cfba291cfc9f9ea208950d0a42803b6` removes permanent COM defaults from the calibration wrapper and propagates explicit, distinct runtime ports through validation, native calibration, and its follow-up command. Commit `47437569de08a4e4a8875dac728f3ea97d28436e` does the same for the read-only raw bus checker. `tools\report_am1_leader_ports.ps1` reads Windows PnP state without opening a bus and reports CH343 COM port, FriendlyName, PnP InstanceId, and status. It permits automatic role selection only when the stored left and right PnP identities match uniquely and resolve to distinct ports. The verified map is `C:\Users\pickm\AlohaMini1Logs\am1-leader-hub-map-20260831-140827.json`; keep left in `LEFT-LABELED-SOCKET` and right in `RIGHT-LABELED-SOCKET`.
 
 Only one physical arm session remains in this packet: the prepared 45-second, 10 Hz, both-arm test below. The prior isolated-wrist procedure is superseded. These commands are preparation, not authorization; begin with the Pi host stopped, follower/body power off, both leader supplies off, both leader USB controllers disconnected, a clear arm envelope, and all disconnects immediately reachable.
@@ -1052,6 +1054,10 @@ if ($rightHash -ne 'C5F04F97B2B4B371EF4C4292616E7BBCAAE3987805930DE46CAEB3C614D2
 
 $env:PYTHONDONTWRITEBYTECODE = '1'
 $Python = 'C:\Users\pickm\lerobot_alohamini_client\.venv\Scripts\python.exe'
+$env:PYTHONPATH = (Resolve-Path .\src).Path
+$expectedClientConfig = (Resolve-Path .\src\lerobot\robots\alohamini\config_alohamini.py).Path
+$actualClientConfig = (& $Python -c "from pathlib import Path; import lerobot.robots.alohamini.config_alohamini as config; print(Path(config.__file__).resolve())").Trim()
+if ($actualClientConfig -ne $expectedClientConfig) { throw "Wrong Python import root: $actualClientConfig" }
 $am1LogDir = Join-Path $HOME 'AlohaMini1Logs'
 New-Item -ItemType Directory -Force -Path $am1LogDir | Out-Null
 ```
