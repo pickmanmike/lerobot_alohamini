@@ -1979,7 +1979,7 @@ def test_documentation_covers_recovery_wrist_roll_and_no_robot_side_check() -> N
         assert recovery_term in simple_section
 
 
-def test_documentation_reconciles_corrected_right_leader_and_one_final_session() -> None:
+def test_documentation_records_completed_corrected_right_leader_session() -> None:
     text = DOCUMENTATION_PATH.read_text(encoding="utf-8")
     normalized = " ".join(text.split())
     ar1 = text.split("#### Packet AR1 — current local bimanual-arm state", maxsplit=1)[1].split(
@@ -1996,7 +1996,12 @@ def test_documentation_reconciles_corrected_right_leader_and_one_final_session()
     assert "ee3a6f5dd813be82780a6a9b1789966357542d2f" in ar1
     assert "4f8885b73860b204980c70e92e3daee94b0f35e8" in ar1
     assert "68cb6667" in ar1
-    assert "not yet physically validated" in ar1
+    assert "not yet physically validated" not in ar1
+    assert "am1-ar1-r2h-retry-bimanual10-windows-20260831-235812.log" in ar1
+    assert "am1-ar1-r2h-retry-bimanual10-host-20260831-234021.log" in ar1
+    assert "SESSION_EXIT_CODE=0" in ar1
+    assert "HOST_EXIT_CODE=0" in ar1
+    assert "No further powered arm session remains in this packet" in ar1
     assert "am1-leader-hub-map-20260831-140827.json" in ar1
     assert "am1-ar1-right-wrist-bounded-windows-20260830-194629.log" in ar1
     assert "am1-ar1-r2h-bimanual10-windows-20260831-211727.log" in ar1
