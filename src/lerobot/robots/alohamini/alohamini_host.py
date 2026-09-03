@@ -19,6 +19,7 @@ import json
 import logging
 import math
 import time
+from collections.abc import Callable
 
 import cv2
 import zmq
@@ -50,7 +51,121 @@ class AlohaMiniHost:
         self.zmq_observation_socket.close()
         self.zmq_cmd_socket.close()
         self.zmq_context.term()
- 
+
+
+class HostCommandState:
+    """Monotonic watchdog state with optional bounded command-cadence evidence."""
+
+    def __init__(
+        self,
+        *,
+        watchdog_timeout_ms: int,
+        diagnostics_enabled: bool = False,
+        clock: Callable[[], float] | None = None,
+        wall_clock_ns: Callable[[], int] | None = None,
+    ) -> None:
+        self.watchdog_timeout_ms = watchdog_timeout_ms
+        self.diagnostics_enabled = diagnostics_enabled
+        self._clock = time.monotonic if clock is None else clock
+        self._wall_clock_ns = time.time_ns if wall_clock_ns is None else wall_clock_ns
+        self._last_command_s = self._clock()
+        self._previous_receive_s: float | None = None
+        self._watchdog_active = False
+        self._command_sequence = 0
+        self._last_receive_gap_ms = 0.0
+        self._max_receive_gap_ms = 0.0
+        self._receive_gap_over_watchdog_count = 0
+        self._last_receive_gap_over_watchdog_sequence: int | None = None
+        self._last_receive_gap_over_watchdog_ms: float | None = None
+        self._last_receive_gap_over_watchdog_wall_time_ns: int | None = None
+        self._watchdog_events = 0
+        self._last_watchdog_event_wall_time_ns: int | None = None
+        self._last_action_diagnostics: dict[str, object] = {}
+
+    def capture_wall_time_ns(self) -> int | None:
+        """Capture a shared log timestamp without adding work when diagnostics are off."""
+        if not self.diagnostics_enabled:
+            return None
+        return self._wall_clock_ns()
+
+    def record_command(
+        self,
+        action_diagnostics: dict[str, object],
+        *,
+        received_at: float | None = None,
+        received_wall_time_ns: int | None = None,
+    ) -> None:
+        completed_at = self._clock()
+        receive_time = completed_at if received_at is None else received_at
+        if self.diagnostics_enabled:
+            self._command_sequence += 1
+            if self._previous_receive_s is not None:
+                gap_ms = (receive_time - self._previous_receive_s) * 1e3
+                self._last_receive_gap_ms = gap_ms
+                self._max_receive_gap_ms = max(self._max_receive_gap_ms, gap_ms)
+                if gap_ms > self.watchdog_timeout_ms:
+                    self._receive_gap_over_watchdog_count += 1
+                    self._last_receive_gap_over_watchdog_sequence = self._command_sequence
+                    self._last_receive_gap_over_watchdog_ms = gap_ms
+                    self._last_receive_gap_over_watchdog_wall_time_ns = received_wall_time_ns
+            self._last_action_diagnostics = dict(action_diagnostics)
+        self._previous_receive_s = receive_time
+        # Preserve the established watchdog lifecycle: a successfully applied action
+        # resets its age at completion, while diagnostics measure socket receive gaps.
+        self._last_command_s = completed_at
+        self._watchdog_active = False
+
+    def watchdog_due(self) -> bool:
+        if self._watchdog_active:
+            return False
+        if (self._clock() - self._last_command_s) <= self.watchdog_timeout_ms / 1000:
+            return False
+        self._watchdog_active = True
+        if self.diagnostics_enabled:
+            self._watchdog_events += 1
+            self._last_watchdog_event_wall_time_ns = self._wall_clock_ns()
+        return True
+
+    def snapshot(self) -> dict[str, object] | None:
+        if not self.diagnostics_enabled:
+            return None
+        return {
+            "wall_time_ns": self._wall_clock_ns(),
+            "command_sequence": self._command_sequence,
+            "last_receive_gap_ms": self._last_receive_gap_ms,
+            "max_receive_gap_ms": self._max_receive_gap_ms,
+            "receive_gap_over_watchdog_count": self._receive_gap_over_watchdog_count,
+            "last_receive_gap_over_watchdog_sequence": (
+                self._last_receive_gap_over_watchdog_sequence
+            ),
+            "last_receive_gap_over_watchdog_ms": self._last_receive_gap_over_watchdog_ms,
+            "last_receive_gap_over_watchdog_wall_time_ns": (
+                self._last_receive_gap_over_watchdog_wall_time_ns
+            ),
+            "watchdog_events": self._watchdog_events,
+            "last_watchdog_event_wall_time_ns": self._last_watchdog_event_wall_time_ns,
+            "target_limited": _jsonable(self._last_action_diagnostics.get("target_limited")),
+            "right_wrist_requested": _jsonable(
+                self._last_action_diagnostics.get("right_wrist_requested")
+            ),
+            "right_wrist_final": _jsonable(self._last_action_diagnostics.get("right_wrist_final")),
+            "right_wrist_observed": _jsonable(
+                self._last_action_diagnostics.get("right_wrist_observed")
+            ),
+        }
+
+    def format_report(self) -> str | None:
+        snapshot = self.snapshot()
+        if snapshot is None:
+            return None
+        return f"[HOST CADENCE] {json.dumps(snapshot, separators=(',', ':'))}"
+
+
+def print_cadence_report(command_state: HostCommandState) -> None:
+    report = command_state.format_report()
+    if report is not None:
+        print(report, flush=True)
+
 
 def _jsonable(value):
     """Convert numpy scalars to JSON-native values without touching normal Python values."""
@@ -170,6 +285,18 @@ def make_parser() -> argparse.ArgumentParser:
             "(default: false)."
         ),
     )
+    parser.add_argument(
+        "--profile_cadence",
+        "--profile-cadence",
+        type=parse_bool,
+        nargs="?",
+        const=True,
+        default=False,
+        help=(
+            "Print monotonic command sequence/gap, watchdog, limiter, and right-wrist evidence "
+            "once per second (default: false)."
+        ),
+    )
     return parser
 
 
@@ -215,8 +342,10 @@ def main():
             robot.disconnect()
         raise
 
-    last_cmd_time = time.time()
-    watchdog_active = False
+    command_state = HostCommandState(
+        watchdog_timeout_ms=host.watchdog_timeout_ms,
+        diagnostics_enabled=args.profile_cadence,
+    )
     logging.info("Waiting for commands...")
 
     try:
@@ -228,31 +357,34 @@ def main():
         timing_totals_ms: dict[str, float] = {}
         timing_command_count = 0
         action_timing_totals_ms: dict[str, float] = {}
+        cadence_report_start_t = time.monotonic()
 
         while duration < host.connection_time_s:
             loop_start_t = time.perf_counter()
             command_received = False
             try:
                 msg = host.zmq_cmd_socket.recv_string(zmq.NOBLOCK)
+                command_received_t = time.monotonic()
+                command_received_wall_time_ns = command_state.capture_wall_time_ns()
                 data = dict(json.loads(msg))
                 #print(f"Received action: {data}")   # debug 
                 _action_sent = robot.send_action(data)
                 command_received = True
-                
-                last_cmd_time = time.time()
-                watchdog_active = False
+                command_state.record_command(
+                    robot.logs.get("action_diagnostics", {}),
+                    received_at=command_received_t,
+                    received_wall_time_ns=command_received_wall_time_ns,
+                )
             except zmq.Again:
                 pass
             except Exception as e:
                 logging.exception("Message fetching failed: %s", e)
             command_done_t = time.perf_counter()
 
-            now = time.time()
-            if (now - last_cmd_time > host.watchdog_timeout_ms / 1000) and not watchdog_active:
+            if command_state.watchdog_due():
                 logging.warning(
                     f"Command not received for more than {host.watchdog_timeout_ms} milliseconds. Stopping robot motion."
                 )
-                watchdog_active = True
                 robot.stop_motion()
 
             
@@ -354,6 +486,11 @@ def main():
                 timing_command_count = 0
                 action_timing_totals_ms.clear()
 
+            cadence_now = time.monotonic()
+            if args.profile_cadence and cadence_now - cadence_report_start_t >= 1.0:
+                print_cadence_report(command_state)
+                cadence_report_start_t = cadence_now
+
             duration = time.perf_counter() - start
         print("Cycle time reached.")
 
@@ -361,6 +498,11 @@ def main():
         print("Keyboard interrupt received. Exiting...")
     finally:
         print("Shutting down AlohaMini Host.")
+        if args.profile_cadence:
+            try:
+                print_cadence_report(command_state)
+            except Exception:
+                logging.exception("Failed to emit final host cadence report.")
         try:
             if robot.is_connected:
                 robot.disconnect()

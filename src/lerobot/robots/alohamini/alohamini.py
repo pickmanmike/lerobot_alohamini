@@ -220,7 +220,6 @@ class AlohaMini(Robot):
         self._joint_hold_goal: dict[str, float] = {}
         self._joint_hold_direction: dict[str, float] = {}
 
-
     @property
     def _state_ft(self) -> dict[str, type]:
         return dict.fromkeys(
@@ -819,6 +818,8 @@ class AlohaMini(Robot):
         # arm_goal_pos = {k: v for k, v in action.items() if k.endswith(".pos")}
         left_pos  = {k: v for k, v in action.items() if k.endswith(".pos") and k.startswith("arm_left_") and k.replace(".pos", "") in self.left_bus.motors}
         right_pos = {k: v for k, v in action.items() if k.endswith(".pos") and k.startswith("arm_right_") and self.right_bus is not None and k.replace(".pos", "") in self.right_bus.motors}
+        requested_arm_pos = {**left_pos, **right_pos}
+        right_wrist_observed = None
 
 
         base_goal_vel = {k: v for k, v in action.items() if k.endswith(".vel")}
@@ -846,6 +847,7 @@ class AlohaMini(Robot):
 
         if self.right_bus and right_pos and self.config.max_relative_target is not None:
             present_right = self.right_bus.sync_read("Present_Position", self.right_arm_motors)
+            right_wrist_observed = present_right.get("arm_right_wrist_flex")
             gp_right = {k: (v, present_right[k.replace(".pos", "")]) for k, v in right_pos.items()}
             right_pos = ensure_safe_goal_position(gp_right, self.config.max_relative_target)
         relative_limit_done_t = time.perf_counter()
@@ -891,6 +893,17 @@ class AlohaMini(Robot):
             "action_right_write": (right_write_done_t - left_write_done_t) * 1e3,
             "action_base_write": (base_write_done_t - right_write_done_t) * 1e3,
             "action_total": (base_write_done_t - action_start_t) * 1e3,
+        }
+
+        final_arm_pos = {**left_pos, **right_pos}
+        self.logs["action_diagnostics"] = {
+            "target_limited": any(
+                float(final_arm_pos[key]) != float(requested)
+                for key, requested in requested_arm_pos.items()
+            ),
+            "right_wrist_requested": requested_arm_pos.get("arm_right_wrist_flex.pos"),
+            "right_wrist_final": final_arm_pos.get("arm_right_wrist_flex.pos"),
+            "right_wrist_observed": right_wrist_observed,
         }
 
         lift_sent = {k: v for k, v in action.items() if k.startswith("lift_axis.")}
