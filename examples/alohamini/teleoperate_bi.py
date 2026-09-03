@@ -880,6 +880,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--no_robot", action="store_true", help="Do not construct or connect the robot client")
     parser.add_argument("--no_leader", action="store_true", help="Do not construct or connect the leader arms")
+    parser.add_argument(
+        "--base_only",
+        action="store_true",
+        help="Run the bounded AM1 keyboard base path without leaders, lift motion, cameras, or observations",
+    )
     parser.add_argument("--no_keyboard", action="store_true", help="Disable keyboard base and lift control")
     parser.add_argument(
         "--no_cameras",
@@ -1052,6 +1057,26 @@ def parse_args(
         args.robot_model == "alohamini1" and args.no_keyboard and args.no_cameras
     ):
         parser.error("--profile_cadence requires alohamini1 with --no_keyboard and --no_cameras")
+    if args.base_only:
+        if args.robot_model != "alohamini1":
+            parser.error("--base_only is supported only for alohamini1")
+        if args.no_robot:
+            parser.error("--base_only requires a robot connection")
+        if not args.no_leader:
+            parser.error("--base_only requires --no_leader")
+        if args.no_keyboard:
+            parser.error("--base_only requires keyboard control")
+        if not args.no_cameras:
+            parser.error("--base_only requires --no_cameras")
+        if not args.no_rerun:
+            parser.error("--base_only requires --no_rerun")
+        if not args.start_paused:
+            parser.error("--base_only requires --start_paused")
+        if args.fps != 10:
+            parser.error("--base_only requires --fps 10")
+        if not math.isfinite(args.duration_s) or not 0 < args.duration_s <= 30:
+            parser.error("--base_only requires --duration_s greater than 0 and no more than 30")
+        return args
     return resolve_leader_ports(args, parser, platform_name=platform_name)
 
 
@@ -1071,7 +1096,9 @@ def make_robot_config(args: argparse.Namespace) -> AlohaMiniClientConfig:
         "robot_model": args.robot_model,
         "command_send_timeout_ms": (
             AM1_COMMAND_SEND_TIMEOUT_MS
-            if args.robot_model == "alohamini1" and args.no_keyboard and args.no_cameras
+            if args.robot_model == "alohamini1"
+            and args.no_cameras
+            and (args.no_keyboard or getattr(args, "base_only", False))
             else None
         ),
     }
@@ -1092,6 +1119,55 @@ def make_zero_action() -> dict[str, float | int]:
         "theta.vel": 0.0,
         "lift_axis.vel": 0,
     }
+
+
+def make_base_only_action(robot: Any, pressed_keys: Any) -> dict[str, float | int]:
+    """Build one lowest-speed body-only command while keeping the lift stopped."""
+    teleop_keys = getattr(getattr(robot, "config", None), "teleop_keys", {})
+    direction_keys = {
+        teleop_keys.get("forward", "w"),
+        teleop_keys.get("backward", "s"),
+        teleop_keys.get("left", "z"),
+        teleop_keys.get("right", "x"),
+        teleop_keys.get("rotate_left", "a"),
+        teleop_keys.get("rotate_right", "d"),
+    }
+    base_keys = {key for key in pressed_keys if key in direction_keys}
+    return {
+        **robot._from_keyboard_to_base_action(base_keys),
+        "lift_axis.vel": 0,
+    }
+
+
+def run_base_only_loop(
+    robot: Any,
+    keyboard: Any,
+    *,
+    fps: int,
+    duration_s: float,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep_fn: Callable[[float], None] = precise_sleep,
+) -> None:
+    """Send keyboard base commands at completion-spaced cadence without observation work."""
+    if fps != 10:
+        raise SafetyRefusal("base-only control requires exactly 10 Hz")
+    if not math.isfinite(duration_s) or not 0 < duration_s <= 30:
+        raise SafetyRefusal(
+            "base-only control requires a duration greater than 0 and no more than 30 seconds"
+        )
+
+    started_at = monotonic()
+    frame_period_s = 1.0 / fps
+    while monotonic() - started_at < duration_s:
+        pressed_keys = keyboard.get_action()
+        if robot.config.teleop_keys.get("quit", "q") in pressed_keys:
+            break
+
+        robot.send_action(make_base_only_action(robot, pressed_keys))
+        remaining_s = duration_s - (monotonic() - started_at)
+        if remaining_s <= 0:
+            break
+        sleep_fn(min(frame_period_s, remaining_s))
 
 
 def load_rerun_functions() -> tuple[Callable[..., None], Callable[..., None], Callable[[], None]]:
@@ -1117,9 +1193,12 @@ def _print_connection_summary(args: argparse.Namespace) -> None:
     print("Aloha Mini client ready:")
     print(f"  Pi address: {args.remote_ip}")
     print(f"  Robot model: {args.robot_model}")
-    print(f"  Left leader port: {args.left_port}")
-    print(f"  Right leader port: {args.right_port}")
-    print(f"  Leader profile: {args.arm_profile}")
+    if args.no_leader:
+        print("  Leaders: disabled")
+    else:
+        print(f"  Left leader port: {args.left_port}")
+        print(f"  Right leader port: {args.right_port}")
+        print(f"  Leader profile: {args.arm_profile}")
     print(f"  FPS: {args.fps}")
     print(f"  Cameras: {'disabled' if args.no_cameras else 'enabled'}")
     if args.robot_model == "alohamini1":
@@ -1467,6 +1546,22 @@ def run_teleoperation(
                 except SafetyRefusal as exc:
                     print(f"SAFETY REFUSAL: {exc}")
                     return 2
+
+        if getattr(args, "base_only", False):
+            print("BASE TELEOPERATION ACTIVE — WHEELS MAY NOW MOVE")
+            try:
+                run_base_only_loop(
+                    robot,
+                    keyboard,
+                    fps=args.fps,
+                    duration_s=args.duration_s,
+                    monotonic=monotonic,
+                    sleep_fn=sleep_fn,
+                )
+            except SafetyRefusal as exc:
+                print(f"SAFETY REFUSAL: {exc}")
+                return 2
+            return 0
 
         if (
             uses_decoupled_am1_live_loop(args)
