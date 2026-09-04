@@ -219,6 +219,19 @@ def test_host_helper_help_lists_only_arms_and_base_modes():
     assert "--mode arms|base" in result.stdout
 
 
+def test_host_runtime_pipeline_keeps_tee_alive_during_interrupt():
+    runtime_pipeline_lines = [
+        line.strip()
+        for line in HOST_HELPER.read_text(encoding="utf-8").splitlines()
+        if '"${command[@]}" 2>&1 | tee' in line
+    ]
+
+    assert runtime_pipeline_lines == [
+        'PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$repository_root/src" '
+        '"${command[@]}" 2>&1 | tee -i -a "$log_path"'
+    ]
+
+
 def test_local_config_example_is_valid_and_real_config_is_ignored():
     config = json.loads(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
 

@@ -157,7 +157,7 @@ printf 'HOST_LOG=%s\n' "$log_path" | tee "$log_path" || {
 }
 
 set +e
-PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$repository_root/src" "${command[@]}" 2>&1 | tee -a "$log_path"
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$repository_root/src" "${command[@]}" 2>&1 | tee -i -a "$log_path"
 pipeline_status=("${PIPESTATUS[@]}")
 host_exit=${pipeline_status[0]}
 log_exit=${pipeline_status[1]}
