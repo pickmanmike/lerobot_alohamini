@@ -211,6 +211,7 @@ class AM1LiveActionSender:
         self._monotonic = monotonic
         self._wall_time_ns = wall_time_ns
         self._sleep_fn = sleep_fn
+        self._body_send_gate = threading.Lock()
         self._stop_requested = threading.Event()
         self._finished = threading.Event()
         self._state_lock = threading.Lock()
@@ -230,6 +231,12 @@ class AM1LiveActionSender:
 
     def stop(self) -> None:
         self._stop_requested.set()
+
+    def stop_after_clearing_body(self) -> None:
+        with self._body_send_gate:
+            if self._body_mailbox is not None:
+                self._body_mailbox.clear()
+            self._stop_requested.set()
 
     def join(self) -> None:
         self._thread.join()
@@ -269,24 +276,27 @@ class AM1LiveActionSender:
                     if action_sequence > 0 and self._duration_s > 0 and now - started_at >= self._duration_s:
                         break
 
-                    send_started_at = self._monotonic()
-                    if self._profile_cadence and action_sequence == 0:
-                        print(
-                            json.dumps(
-                                {
-                                    "event": "am1_client_live_start",
-                                    "initial_observation_sequence": self._initial_observation_sequence,
-                                    "right_wrist_requested": action[RIGHT_WRIST_FLEX_KEY],
-                                    "wall_time_ns": self._wall_time_ns(),
-                                },
-                                sort_keys=True,
+                    with self._body_send_gate:
+                        if action_sequence > 0 and self._stop_requested.is_set():
+                            break
+                        send_started_at = self._monotonic()
+                        if self._profile_cadence and action_sequence == 0:
+                            print(
+                                json.dumps(
+                                    {
+                                        "event": "am1_client_live_start",
+                                        "initial_observation_sequence": self._initial_observation_sequence,
+                                        "right_wrist_requested": action[RIGHT_WRIST_FLEX_KEY],
+                                        "wall_time_ns": self._wall_time_ns(),
+                                    },
+                                    sort_keys=True,
+                                )
                             )
-                        )
-                    action_to_send = dict(action)
-                    if action_sequence > 0 and self._body_mailbox is not None:
-                        action_to_send.update(self._body_mailbox.snapshot(now=send_started_at))
-                    command_sender.send_action(action_to_send)
-                    send_completed_at = self._monotonic()
+                        action_to_send = dict(action)
+                        if action_sequence > 0 and self._body_mailbox is not None:
+                            action_to_send.update(self._body_mailbox.snapshot(now=send_started_at))
+                        command_sender.send_action(action_to_send)
+                        send_completed_at = self._monotonic()
                     send_interval_ms = (
                         0.0
                         if last_send_started_at is None
@@ -1533,8 +1543,9 @@ def run_am1_live_sender(
                 body_mailbox.publish(body_action_supplier(), published_at=monotonic())
             if should_stop is not None and should_stop():
                 if body_mailbox is not None:
-                    body_mailbox.clear()
-                sender.stop()
+                    sender.stop_after_clearing_body()
+                else:
+                    sender.stop()
                 break
 
             if terminal_stale_reason is not None:
@@ -1555,25 +1566,31 @@ def run_am1_live_sender(
                 observation_timeout_count += 1
                 observation_age_s = max(0.0, monotonic() - last_fresh_observed_at)
                 if observation_age_s >= AM1_LIVE_OBSERVATION_MAX_AGE_S:
-                    terminal_stale_reason = (
+                    stale_reason = (
                         f"follower observation age {observation_age_s:.3f}s reached the "
                         f"{AM1_LIVE_OBSERVATION_MAX_AGE_S:.1f}-second freshness limit; {exc}"
                     )
+                    if body_mailbox is not None:
+                        sender.stop_after_clearing_body()
+                    terminal_stale_reason = stale_reason
                     print(
                         "STALE FOLLOWER OBSERVATION — holding the last safe complete arm target for "
                         f"the remainder of this process: {terminal_stale_reason}"
                     )
                     if body_mailbox is not None:
-                        body_mailbox.clear()
+                        break
                 continue
             except StaleFollowerObservation as exc:
-                terminal_stale_reason = str(exc)
+                stale_reason = str(exc)
+                if body_mailbox is not None:
+                    sender.stop_after_clearing_body()
+                terminal_stale_reason = stale_reason
                 print(
                     "STALE FOLLOWER OBSERVATION — holding the last safe complete arm target for "
                     f"the remainder of this process: {terminal_stale_reason}"
                 )
                 if body_mailbox is not None:
-                    body_mailbox.clear()
+                    break
                 continue
 
             safe_target = apply_am1_commissioning_scope(

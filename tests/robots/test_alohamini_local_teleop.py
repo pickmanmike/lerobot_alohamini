@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -199,6 +200,99 @@ class DelegatingLiveCommandSender:
         return False
 
 
+def test_local_stale_transition_serializes_against_a_snapshotted_nonzero_body_send(
+    monkeypatch,
+):
+    module = load_teleoperate_module()
+    snapshot_taken = threading.Event()
+    release_snapshot = threading.Event()
+    events: list[tuple | str] = []
+    moving_body = {"x.vel": 0.15, "y.vel": 0.0, "theta.vel": 0.0, "lift_axis.vel": 200}
+
+    class LiveCommandSender:
+        def __enter__(self):
+            return self
+
+        def send_action(self, action):
+            events.append(("live_send", time.monotonic(), dict(action)))
+
+        def __exit__(self, exc_type, exc, traceback):
+            events.append("live_socket_closed")
+            return False
+
+    class Robot:
+        observation_sequence = 8
+
+        def make_live_command_sender(self):
+            return LiveCommandSender()
+
+    real_snapshot = module.AM1LiveBodyMailbox.snapshot
+
+    def paused_nonzero_snapshot(self, *, now):
+        action = real_snapshot(self, now=now)
+        if any(float(value) != 0.0 for value in action.values()):
+            snapshot_taken.set()
+            if not release_snapshot.wait(timeout=1.0):
+                raise AssertionError("timed out while holding the nonzero body snapshot")
+        return action
+
+    real_clear = module.AM1LiveBodyMailbox.clear
+
+    def recording_clear(self):
+        result = real_clear(self)
+        events.append(("body_cleared", time.monotonic()))
+        return result
+
+    def stale_after_sender_snapshot(*args, **kwargs):
+        if not snapshot_taken.wait(timeout=1.0):
+            raise AssertionError("sender never snapshotted the nonzero body command")
+        raise module.StaleFollowerObservation("forced terminal stale observation")
+
+    def release_after_transition_attempt():
+        if snapshot_taken.wait(timeout=1.0):
+            time.sleep(0.1)
+            release_snapshot.set()
+
+    monkeypatch.setattr(module.AM1LiveBodyMailbox, "snapshot", paused_nonzero_snapshot)
+    monkeypatch.setattr(module.AM1LiveBodyMailbox, "clear", recording_clear)
+    monkeypatch.setattr(module, "read_fresh_am1_live_sample", stale_after_sender_snapshot)
+    releaser = threading.Thread(target=release_after_transition_attempt, daemon=True)
+    releaser.start()
+
+    with pytest.raises(module.SafetyRefusal, match="forced terminal stale observation"):
+        module.run_am1_live_sender(
+            Robot(),
+            object(),
+            initial_arm_target=FOLLOWER,
+            initial_observation_sequence=8,
+            fps=10,
+            duration_s=30.0,
+            live_arm_scope="both",
+            profile_cadence=False,
+            body_action_supplier=lambda: moving_body,
+        )
+
+    releaser.join(timeout=1.0)
+    assert not releaser.is_alive()
+    body_clear_index = next(
+        index
+        for index, event in enumerate(events)
+        if isinstance(event, tuple) and event[0] == "body_cleared"
+    )
+    live_actions = [
+        (index, event)
+        for index, event in enumerate(events)
+        if isinstance(event, tuple) and event[0] == "live_send"
+    ]
+    assert any(event[2]["x.vel"] > 0 for _, event in live_actions)
+    assert all(
+        event[2]["x.vel"] == 0.0 and event[2]["lift_axis.vel"] == 0
+        for index, event in live_actions
+        if index > body_clear_index
+    )
+    assert events[-1] == "live_socket_closed"
+
+
 def test_local_sender_first_sends_zero_body_then_expires_body_while_observation_stalls():
     module = load_teleoperate_module()
 
@@ -340,12 +434,13 @@ def test_local_session_uses_the_decoupled_sender_and_holds_body_zero_through_bot
     class Keyboard:
         def __init__(self, config):
             self.is_connected = False
+            self.actions = iter(({"w", "u"}, {"q"}))
 
         def connect(self):
             self.is_connected = True
 
         def get_action(self):
-            return {"w", "u"}
+            return next(self.actions)
 
         def disconnect(self):
             self.is_connected = False
@@ -369,6 +464,8 @@ def test_local_session_uses_the_decoupled_sender_and_holds_body_zero_through_bot
             "theta.vel": 0.0,
             "lift_axis.vel": 200,
         }
+        assert kwargs["body_action_supplier"]() == module.make_zero_action()
+        assert kwargs["should_stop"]() is True
 
     monkeypatch.setattr(module, "AlohaMiniClient", Robot)
     monkeypatch.setattr(module, "BiSOLeader", Leader)
@@ -389,3 +486,155 @@ def test_local_session_uses_the_decoupled_sender_and_holds_body_zero_through_bot
     assert captured["initial_arm_target"] == FOLLOWER
     assert captured["initial_observation_sequence"] == 2
     assert all(action == module.make_zero_action() for action in Robot.instance.actions)
+
+
+def test_local_terminal_stale_refuses_promptly_and_joins_sender_before_outer_cleanup(
+    monkeypatch,
+    capsys,
+):
+    module = load_teleoperate_module()
+    events: list[tuple | str] = []
+
+    class LiveCommandSender:
+        def __enter__(self):
+            events.append("live_socket_open")
+            return self
+
+        def send_action(self, action):
+            events.append(("live_send", time.monotonic(), dict(action)))
+
+        def __exit__(self, exc_type, exc, traceback):
+            events.append("live_socket_closed")
+            return False
+
+    class Robot:
+        instance = None
+
+        def __init__(self, config):
+            type(self).instance = self
+            self.config = config
+            self.observation_sequence = 0
+
+        def connect(self):
+            events.append("robot_connect")
+
+        def send_action(self, action):
+            events.append(("main_send", dict(action)))
+
+        def get_observation(self):
+            time.sleep(0.02)
+            return dict(FOLLOWER)
+
+        def make_live_command_sender(self):
+            return LiveCommandSender()
+
+        def disconnect(self):
+            events.append("robot_disconnect")
+
+        def _from_keyboard_to_base_action(self, keys):
+            return {
+                "x.vel": 0.15 if "w" in keys else 0.0,
+                "y.vel": 0.0,
+                "theta.vel": 0.0,
+            }
+
+    class Arm:
+        def __init__(self, side):
+            self.side = side
+
+        def connect(self):
+            events.append(f"{self.side}_connect")
+
+        def disconnect(self):
+            events.append(f"{self.side}_disconnect")
+
+    class Leader:
+        def __init__(self, config):
+            self.left_arm = Arm("left")
+            self.right_arm = Arm("right")
+
+        def get_action(self):
+            return dict(LEADER)
+
+    class Keyboard:
+        def __init__(self, config):
+            self.is_connected = False
+
+        def connect(self):
+            self.is_connected = True
+            events.append("keyboard_connect")
+
+        def get_action(self):
+            return {"w"}
+
+        def disconnect(self):
+            self.is_connected = False
+            events.append("keyboard_disconnect")
+
+    def startup_sync(robot, leader, **kwargs):
+        robot.observation_sequence = 1
+        return dict(FOLLOWER), dict(FOLLOWER), time.monotonic()
+
+    def alignment_gate(robot, leader, max_start_mismatch, *, monotonic):
+        robot.observation_sequence = 2
+        return dict(FOLLOWER), dict(FOLLOWER), time.monotonic()
+
+    real_clear = module.AM1LiveBodyMailbox.clear
+
+    def recording_clear(self):
+        result = real_clear(self)
+        events.append("body_cleared")
+        return result
+
+    real_join = module.AM1LiveActionSender.join
+
+    def recording_join(self):
+        result = real_join(self)
+        events.append("sender_joined")
+        return result
+
+    monkeypatch.setattr(module, "AlohaMiniClient", Robot)
+    monkeypatch.setattr(module, "BiSOLeader", Leader)
+    monkeypatch.setattr(module, "KeyboardTeleop", Keyboard)
+    monkeypatch.setattr(module, "run_startup_sync", startup_sync)
+    monkeypatch.setattr(module, "run_alignment_gate", alignment_gate)
+    monkeypatch.setattr(module, "AM1_LIVE_OBSERVATION_MAX_AGE_S", 0.18)
+    monkeypatch.setattr(module.AM1LiveBodyMailbox, "clear", recording_clear)
+    monkeypatch.setattr(module.AM1LiveActionSender, "join", recording_join)
+    args = module.parse_args(local_cli_args(), platform_name="Windows")
+    args.duration_s = 1.2
+
+    started_at = time.monotonic()
+    status = module.run_teleoperation(args, input_fn=lambda prompt: "")
+    elapsed_s = time.monotonic() - started_at
+
+    assert status == 2
+    assert elapsed_s < 0.8
+    captured = capsys.readouterr()
+    assert captured.out.count("STALE FOLLOWER OBSERVATION") == 1
+    assert "SAFETY REFUSAL: follower observation age" in captured.out
+    assert "Traceback" not in captured.err
+
+    body_clear_index = events.index("body_cleared")
+    live_actions = [
+        (index, event)
+        for index, event in enumerate(events)
+        if isinstance(event, tuple) and event[0] == "live_send"
+    ]
+    assert any(event[2]["x.vel"] > 0 for index, event in live_actions if index < body_clear_index)
+    assert all(
+        event[2]["x.vel"] == 0.0 and event[2]["lift_axis.vel"] == 0
+        for index, event in live_actions
+        if index > body_clear_index
+    )
+
+    sender_join_index = events.index("sender_joined")
+    live_close_index = events.index("live_socket_closed")
+    final_zero_index = max(
+        index
+        for index, event in enumerate(events)
+        if isinstance(event, tuple) and event == ("main_send", module.make_zero_action())
+    )
+    assert body_clear_index < live_close_index < sender_join_index < final_zero_index
+    assert final_zero_index < events.index("right_disconnect") < events.index("left_disconnect")
+    assert events.index("left_disconnect") < events.index("robot_disconnect")
