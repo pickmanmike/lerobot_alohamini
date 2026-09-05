@@ -323,6 +323,37 @@ def test_lift_only_logical_directions_map_to_am1_raw_directions(monkeypatch):
     ]
 
 
+def test_lift_descent_refuses_at_real_floor_and_is_permitted_above_it(monkeypatch):
+    module = load_teleoperate_module()
+    writes = []
+
+    class Bus:
+        motors = {"lift_axis": object()}
+
+    lift = LiftAxis(LiftAxisConfig(), bus_left=Bus(), bus_right=None)
+    lift.is_homed = True
+    heights = iter((2.05, 5.0, 12.3))
+    monkeypatch.setattr(lift, "get_height_mm", lambda: next(heights))
+    monkeypatch.setattr(
+        lift_axis_module,
+        "write_register",
+        lambda bus, register, motor, value, **kwargs: writes.append((register, motor, value)),
+    )
+    robot = SimpleNamespace(config=SimpleNamespace(teleop_keys={"lift_up": "u", "lift_down": "j"}))
+    down = module.make_lift_only_action(robot, {"j"})
+
+    lift.apply_action(down)
+    lift.apply_action(down)
+    lift.apply_action(down)
+
+    assert lift.cfg.descent_floor_mm == 5.0
+    assert writes == [
+        ("Goal_Velocity", "lift_axis", 0),
+        ("Goal_Velocity", "lift_axis", 0),
+        ("Goal_Velocity", "lift_axis", 200),
+    ]
+
+
 def test_lift_only_loop_sends_release_zero_and_ignores_observations_and_base_keys():
     module = load_teleoperate_module()
     sleeps = []

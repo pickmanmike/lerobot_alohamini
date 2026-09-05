@@ -89,7 +89,7 @@ if ($LeftPort -eq $RightPort) { throw 'Leader ports are not distinct.' }
 
 If either identity is missing, duplicated, ambiguous, or attached to the wrong labeled socket, stop. Do not infer a role from the COM number, swap only port arguments, rename calibration files, or exchange JSON contents.
 
-### Lean AM1 local operation and first lift packet
+### Lean AM1 local operation and physically proven lift
 
 `integrate/am1-local-teleop` at `e789330e1ac04d1f7a39ecf2b44c1f2b19aa9743` is the canonical shared branch for the physically validated local arm and base system. It contains both immutable validation inputs: Windows `30609a4597b8b6fca49bc1018024fd29dfb55127` and Pi `ee3a6f5dd813be82780a6a9b1789966357542d2f`.
 
@@ -107,6 +107,11 @@ Local base teleoperation is also physically proven. The elevated-wheel checks es
 - `C:\Users\pickm\lerobot_alohamini_client\.worktrees\am1-base-teleop\am1-base-host-20260903-210104.log`
 - `C:\Users\pickm\AlohaMini1Logs\am1-base-windows-20260904-215623.log`
 - `/home/pickmanmike/AlohaMini1Logs/am1-base-host-20260904-215432.log`
+
+Local lift teleoperation is physically proven in one bounded lift-only session. Homing reached the actual lower stop and stopped; `U` raised the carriage by roughly 2–3 cm and release stopped it; `J` lowered it by roughly 1 cm and release stopped it; the wheels and follower arms remained stationary; and both processes exited `0`. Host commands advanced from sequence 2 through 196 at roughly 100.2 ms intervals without a live watchdog event. The three host watchdog warnings were outside live motion: before the client, while waiting at the Enter gate after sequence 1, and after the client exited. The one client observation timeout also occurred before lift-only live mode. Evidence is retained at:
+
+- `C:\Users\pickm\AlohaMini1Logs\am1-lift-windows-20260904-234200.log`
+- `C:\Users\pickm\AlohaMini1Logs\am1-lift-host-20260904-234125.log` (downloaded from `/home/pickmanmike/AlohaMini1Logs/am1-lift-host-20260904-234125.log`)
 
 The reviewed lean launchers replace the long ordinary host/client command blocks. They support `arms`/`base`/`lift` on the Pi and `Arms`/`Base`/`Lift` on Windows. Copy the tracked example once, edit its machine-local paths, and leave the resulting file ignored by Git:
 
@@ -130,13 +135,15 @@ The Pi command uses `--no_follower --no_cameras` and deliberately omits `--skip_
 
 The Windows command uses `--lift_only --no_leader --start_paused --no_cameras --no_rerun --fps 10 --duration_s 30`: it constructs no leader or COM device, requests no observations in the action loop, accepts only `U` and `J`, and sends exact zero `x.vel`, `y.vel`, and `theta.vel` on every action. `U` requests bounded physical up, `J` requests bounded physical down, simultaneous or released lift keys request zero, and base/speed keys are ignored. Sends remain completion-spaced, the Pi watchdog remains one second, and `Q`, the 30-second bound, or an exception enters final-zero-before-disconnect cleanup.
 
+The unchanged lift controller refuses downward velocity at or below its real `5.0 mm` process-local floor guard and permits descent above it. Consequently, the original 0.5-second `U` then `J` procedure was invalid: at the nominal configured rate, such a short rise may remain below the guard and make a correct `J` command appear inactive. Do not change the guard or speed to bypass this safety behavior.
+
 The following is preparation for a separately authorized human-operated test, not authorization supplied by this guide.
 
-**Lift sequence:** Keep both leader supplies off and leader USB controllers disconnected. Keep the chassis fixed, follower arms supported and clear, the lift unloaded with its complete travel envelope clear, and the 12 V disconnect immediately accessible. Check out the reviewed lift feature commit on both machines and keep both worktrees clean. Apply body power and run the Pi Lift helper. During its single homing cycle, expect a slow physical downward move to the lower stop followed promptly by zero velocity and a quiet hold; observe current and temperature because the code commands no backoff. Do not start the Windows client unless homing completes normally and the lower stop remains safe. Run the Windows Lift helper and require no movement before Enter. Press Enter, hold `U` for no more than 0.5 second, release for at least 1 second, hold `J` for no more than 0.5 second, release for at least 1 second, then press `Q`. Do not press another movement key. Stop the Pi helper with Ctrl+C and remove body power before reading logs.
+**Lift sequence:** Keep both leader supplies off and leader USB controllers disconnected. Keep the chassis fixed, follower arms supported and clear, the lift unloaded with its complete travel envelope clear, and the 12 V disconnect immediately accessible. Check out the reviewed lift feature commit on both machines and keep both worktrees clean. Apply body power and run the Pi Lift helper. During its single homing cycle, expect a slow physical downward move to the lower stop followed promptly by zero velocity and a quiet hold; observe current and temperature because the code commands no backoff. Do not start the Windows client unless homing completes normally and the lower stop remains safe. Run the Windows Lift helper and require no movement before Enter. Press Enter, hold `U` only until the carriage is visibly about 10–15 mm above the homed bottom, then release and confirm at least 1 second of stopped motion. Hold `J` for about 1 second, release, and again confirm a prompt stop; then press `Q`. Actual visible travel governs, and failure to rise authorizes no prolonged command. Do not press another movement key. Stop the Pi helper with Ctrl+C and remove body power before reading logs.
 
 Pass requires one controlled downward homing cycle, safe current and temperature at the lower stop, `U` physical up, `J` physical down, prompt zero on both releases and `Q`, stationary wheels and follower arms, no right-bus or leader access, no live command-watchdog event, clean final zero/disconnect, and client/host exit codes `0`. Stop immediately for a homing timeout or exception, failure to stop at the lower limit, sustained hard-stop load, abnormal current or heating, wrong direction, no movement, continued motion after release, wheel or arm motion, a live watchdog warning, bus/communication error, sound, vibration, cable strain, obstruction, instability, or loss of the power-disconnect path. A refusal authorizes no automatic retry and no speed, watchdog, calibration, PID, Phase, limit, or motor-register change.
 
-Lift, combined local operation, cameras, recording, and remote operation are not yet physically proven by this section.
+The lift-only result is complete. Combined local operation, cameras, recording, and remote operation are not yet physically proven by this section.
 
 ### Simple AM1 leader calibration and recovery
 
