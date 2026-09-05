@@ -126,6 +126,23 @@ def test_windows_lift_command_has_no_leader_or_base_motion_inputs():
 
 
 @requires_powershell
+def test_windows_local_command_combines_validated_arms_with_bounded_keyboard_body_control():
+    payload = command_payload("Local")
+
+    arguments = payload["arguments"]
+    assert arguments[arguments.index("--teleop.left_port") + 1] == "COM8"
+    assert arguments[arguments.index("--teleop.right_port") + 1] == "COM7"
+    assert arguments[arguments.index("--startup_sync_duration_s") + 1] == "120"
+    assert arguments[arguments.index("--max_start_mismatch") + 1] == "10"
+    assert arguments[arguments.index("--fps") + 1] == "10"
+    assert arguments[arguments.index("--duration_s") + 1] == "30"
+    assert "--local_mode" in arguments
+    assert "--no_keyboard" not in arguments
+    assert "--no_cameras" in arguments
+    assert "--profile_cadence" in arguments
+
+
+@requires_powershell
 def test_windows_arms_command_preserves_physically_validated_settings():
     payload = command_payload("Arms")
 
@@ -213,6 +230,11 @@ $code = Invoke-Am1LoggedCommand -Executable {ps_literal(PYTHON)} `
             ("--skip_lift_home", "--no_cameras", "--max_relative_target", "20"),
             ("--no_follower",),
         ),
+        (
+            "local",
+            ("--no_cameras", "--max_relative_target", "20", "--profile_cadence"),
+            ("--no_follower", "--skip_lift_home"),
+        ),
     ],
 )
 def test_host_helper_prints_mode_specific_command_without_hardware(mode, required, forbidden):
@@ -235,7 +257,7 @@ def test_host_helper_prints_mode_specific_command_without_hardware(mode, require
         assert value not in result.stdout
 
 
-def test_host_helper_help_lists_arms_base_and_lift_modes():
+def test_host_helper_help_lists_arms_base_lift_and_local_modes():
     result = subprocess.run(
         [BASH, str(HOST_HELPER), "--help"],
         cwd=REPO_ROOT,
@@ -246,7 +268,7 @@ def test_host_helper_help_lists_arms_base_and_lift_modes():
     )
 
     assert result.returncode == 0, result.stderr
-    assert "--mode arms|base|lift" in result.stdout
+    assert "--mode arms|base|lift|local" in result.stdout
 
 
 def test_host_runtime_pipeline_keeps_tee_alive_during_interrupt():
