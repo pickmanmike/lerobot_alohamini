@@ -162,6 +162,9 @@ wandb/
 # Dev scripts
 .dev/
 
+# Machine-local Aloha Mini launch settings (copy from the tracked example).
+/config/am1.local.json
+
 # Data folders
 data/
 outputs/

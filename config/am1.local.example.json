@@ -1,0 +1,18 @@
+{
+  "pi_host": "192.168.1.134",
+  "leader_pnp_map_path": "C:\\Users\\YOUR_USERNAME\\AlohaMini1Logs\\am1-leader-hub-map.json",
+  "leader_calibration_sha256": {
+    "left": "34D06E15F6768A3290B85BBE3507D9B14A8CCED263A40C575E02010560E13FBE",
+    "right": "C5F04F97B2B4B371EF4C4292616E7BBCAAE3987805930DE46CAEB3C614D2950C"
+  },
+  "windows_python_path": "C:\\Users\\YOUR_USERNAME\\lerobot_alohamini_client\\.venv\\Scripts\\python.exe",
+  "windows_log_directory": "C:\\Users\\YOUR_USERNAME\\AlohaMini1Logs",
+  "pi_log_directory": "/home/YOUR_USERNAME/AlohaMini1Logs",
+  "arm_settings": {
+    "client_fps": 10,
+    "client_duration_s": 45,
+    "startup_sync_duration_s": 120,
+    "max_start_mismatch": 10,
+    "host_max_relative_target": 20
+  }
+}
