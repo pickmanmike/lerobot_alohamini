@@ -21,12 +21,13 @@ readonly AM1_PI_INPUT="ee3a6f5dd813be82780a6a9b1789966357542d2f"
 
 usage() {
     printf '%s\n' \
-        'Usage: ./tools/run_am1_host.sh --mode arms|base|lift [--print-command]' \
+        'Usage: ./tools/run_am1_host.sh --mode arms|base|lift|local [--print-command]' \
         '' \
         'Modes:' \
         '  arms  Start the physically validated AM1 arms host (no cameras, unhomed lift).' \
         '  base  Start only the AM1 left body bus for a bounded base test (no follower arms).' \
         '  lift  Start only the AM1 left body bus and home the lift once (no follower arms).' \
+        '  local Start both follower arms and the body bus, including one lift homing cycle.' \
         '' \
         '--print-command prints the Python command without checking devices or starting the host.'
 }
@@ -46,7 +47,7 @@ print_command=false
 while (($#)); do
     case "$1" in
         --mode)
-            (($# >= 2)) || { die "--mode requires arms, base, or lift"; exit $?; }
+            (($# >= 2)) || { die "--mode requires arms, base, lift, or local"; exit $?; }
             mode="$2"
             shift 2
             ;;
@@ -66,9 +67,9 @@ while (($#)); do
 done
 
 case "$mode" in
-    arms|base|lift) ;;
+    arms|base|lift|local) ;;
     *)
-        die "--mode must be arms, base, or lift"
+        die "--mode must be arms, base, lift, or local"
         exit $?
         ;;
 esac
@@ -102,9 +103,16 @@ elif [[ "$mode" == "base" ]]; then
         --profile_timing true
         --profile_cadence
     )
-else
+elif [[ "$mode" == "lift" ]]; then
     command+=(
         --no_follower
+        --max_loop_freq_hz 30
+        --profile_timing true
+        --profile_cadence
+    )
+else
+    command+=(
+        --max_relative_target 20.0
         --max_loop_freq_hz 30
         --profile_timing true
         --profile_cadence
@@ -142,7 +150,7 @@ actual_import="$(
     die "required left body/follower bus alias is absent: /dev/am_arm_follower_left"
     exit $?
 }
-if [[ "$mode" == "arms" ]]; then
+if [[ "$mode" == "arms" || "$mode" == "local" ]]; then
     [[ -e /dev/am_arm_follower_right ]] || {
         die "required right follower bus alias is absent: /dev/am_arm_follower_right"
         exit $?

@@ -91,7 +91,7 @@ If either identity is missing, duplicated, ambiguous, or attached to the wrong l
 
 ### Lean AM1 local operation and physically proven lift
 
-`integrate/am1-local-teleop` at `e789330e1ac04d1f7a39ecf2b44c1f2b19aa9743` is the canonical shared branch for the physically validated local arm and base system. It contains both immutable validation inputs: Windows `30609a4597b8b6fca49bc1018024fd29dfb55127` and Pi `ee3a6f5dd813be82780a6a9b1789966357542d2f`.
+`integrate/am1-local-teleop` at `07bda8ad036de2dffdaa3493a4a30428ab0f06b8` is the canonical shared branch for the physically validated local arm, base, and lift-only system. It contains both immutable validation inputs: Windows `30609a4597b8b6fca49bc1018024fd29dfb55127` and Pi `ee3a6f5dd813be82780a6a9b1789966357542d2f`.
 
 Local bimanual arms are physically proven. In the accepted run, all twelve channels moved on the correct side and in the correct direction, startup synchronization's maximum final mismatch was `5.534`, and live control sent 449 actions over 44.990 seconds (`9.980 Hz`) with a longest interval of 110 ms. Two transient observation timeouts recovered, `stale_latched` remained false, no command-watchdog event occurred during live forwarding, base and lift remained stationary, and both processes exited `0`. Evidence is retained at:
 
@@ -113,13 +113,13 @@ Local lift teleoperation is physically proven in one bounded lift-only session. 
 - `C:\Users\pickm\AlohaMini1Logs\am1-lift-windows-20260904-234200.log`
 - `C:\Users\pickm\AlohaMini1Logs\am1-lift-host-20260904-234125.log` (downloaded from `/home/pickmanmike/AlohaMini1Logs/am1-lift-host-20260904-234125.log`)
 
-The reviewed lean launchers replace the long ordinary host/client command blocks. They support `arms`/`base`/`lift` on the Pi and `Arms`/`Base`/`Lift` on Windows. Copy the tracked example once, edit its machine-local paths, and leave the resulting file ignored by Git:
+The reviewed lean launchers replace the long ordinary host/client command blocks. They support `arms`/`base`/`lift`/`local` on the Pi and `Arms`/`Base`/`Lift`/`Local` on Windows. Copy the tracked example once, edit its machine-local paths, and leave the resulting file ignored by Git:
 
 ```powershell
 Copy-Item .\config\am1.local.example.json .\config\am1.local.json
 ```
 
-Each launcher verifies a clean reviewed worktree and the repository import root, prints the exact Python command, creates a timestamped log, and prints the child exit code. Arms mode additionally resolves both leader ports from stored PnP identities and verifies the accepted calibration hashes. Base and Lift modes have no leader-map, calibration, or COM path.
+Each launcher verifies a clean reviewed worktree and the repository import root, prints the exact Python command, creates a timestamped log, and prints the child exit code. Arms and Local modes additionally resolve both leader ports from stored PnP identities and verify the accepted calibration hashes. Base and Lift modes have no leader-map, calibration, or COM path.
 
 The first lift packet uses only:
 
@@ -144,6 +144,34 @@ The following is preparation for a separately authorized human-operated test, no
 Pass requires one controlled downward homing cycle, safe current and temperature at the lower stop, `U` physical up, `J` physical down, prompt zero on both releases and `Q`, stationary wheels and follower arms, no right-bus or leader access, no live command-watchdog event, clean final zero/disconnect, and client/host exit codes `0`. Stop immediately for a homing timeout or exception, failure to stop at the lower limit, sustained hard-stop load, abnormal current or heating, wrong direction, no movement, continued motion after release, wheel or arm motion, a live watchdog warning, bus/communication error, sound, vibration, cable strain, obstruction, instability, or loss of the power-disconnect path. A refusal authorizes no automatic retry and no speed, watchdog, calibration, PID, Phase, limit, or motor-register change.
 
 The lift-only result is complete. Combined local operation, cameras, recording, and remote operation are not yet physically proven by this section.
+
+#### First combined Local packet
+
+Local mode is the narrowly scoped combination of the three proven local components; it does not use the older blocking keyboard loop. The Pi helper opens both follower buses, retains the provisional `20.0` relative arm-target limit, disables cameras, and performs one ordinary lift homing cycle. The Windows helper resolves physical/logical left `COM8` and right `COM7` through the stored PnP identities, verifies the accepted leader calibration hashes, performs the proven both-arm startup synchronization for 120 seconds with the `10.0` final gate, and then runs for at most 30 seconds at 10 Hz with cameras and Rerun disabled.
+
+During synchronization, the Enter pause, and the final post-Enter alignment gate, every base and lift command remains zero. The first live action is the final validated leader sample plus explicit zero `x.vel`, `y.vel`, `theta.vel`, and `lift_axis.vel`. Live arm targets continue through the existing single-owner completion-spaced sender. Keyboard body input uses the proven lowest-speed base mapping and bounded `U/J` lift mapping, but a timestamped mailbox replaces every body command older than 250 ms with exact zero. Thus a stalled keyboard/observation producer cannot make the sender repeat nonzero body velocity indefinitely, while the arm target remains the last safe complete sample. There are no catch-up sends, and the Pi watchdog remains one second.
+
+The following is preparation for one separately authorized first combined session. It is not authorization supplied by this guide.
+
+Pi, from a clean checkout of the reviewed Local feature head:
+
+```bash
+./tools/run_am1_host.sh --mode local
+```
+
+Windows, from the matching clean Local worktree while reusing the existing ignored machine-local configuration:
+
+```powershell
+.\tools\run_am1.ps1 -Mode Local -ConfigPath 'C:\Users\pickm\lerobot_alohamini_client\.worktrees\am1-base-teleop\config\am1.local.json'
+```
+
+Starting state: use the regulated 12 V / 10 A body supply; keep the chassis on a level unobstructed floor with at least 2 m clearance; begin both arms in the physically proven natural safe pose, including right-shoulder endpoint headroom; leave the lift near its lower end with its entire unloaded travel clear; verify the labeled leader identities; and keep every power disconnect immediately accessible. Start the Pi helper first. Require exactly one controlled physical-down lift homing cycle, a prompt stop at the real bottom, a quiet hold, no unintended arm or wheel movement, and safe current and temperature. Start the Windows helper, keep both leaders and all movement keys still throughout synchronization, then keep them still at the post-sync Enter gate. Press Enter only with the full envelope clear. Do not move anything until both `TELEOPERATION ACTIVE` and `LOCAL BODY CONTROLS ACTIVE` are printed.
+
+Use this exact short sequence, one body key at a time: move one safe joint on each leader a small amount and return it while no key is held; hold both leaders still; tap `W` for no more than 0.5 second and release for at least 1 second; press `U` only until the carriage is visibly 10–15 mm above its homed bottom and release for at least 1 second; press `J` for about 1 second and release for at least 1 second; then press `Q`. Do not use speed keys and do not intentionally combine arm and body motion in this first session. Stop the Pi helper with Ctrl+C and remove all motor power before reviewing the timestamped logs.
+
+Pass requires both leaders to control their corresponding follower arms in the correct directions, `W` to move the chassis forward and release promptly to zero, `U` to raise the lift, `J` to lower it above the 5 mm guard, every body release and `Q` to stop promptly, no unexpected joint or axis motion, near-10 Hz live action cadence, no live Pi watchdog event, no stale latch, orderly final zero, and client/host exit codes `0`. Stop immediately for synchronization refusal, unexpected direction or motion, loss of endpoint headroom, continued body motion after release, an expired body command during normal responsive operation, a live watchdog warning, stale latch, bus/communication error, abnormal current/heat/sound/vibration, collision risk, cable strain, instability, obstruction, or loss of a disconnect path. A refusal authorizes no automatic retry and no calibration, speed, floor, watchdog, Phase, PID, limit, or servo-register change.
+
+This packet prepares only one bounded combined local session. Cameras, recording, autonomy, battery work, Cloudflare, and remote operation remain out of scope and unproven.
 
 ### Simple AM1 leader calibration and recovery
 
