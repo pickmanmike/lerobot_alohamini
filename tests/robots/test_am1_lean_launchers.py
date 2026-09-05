@@ -97,7 +97,32 @@ def test_windows_base_command_has_no_leader_or_lift_motion_inputs():
         "30",
     ]
     assert all("COM" not in argument for argument in arguments)
-    assert all("lift" not in argument.lower() for argument in arguments)
+    assert all("lift" not in argument.lower() for argument in arguments[1:])
+
+
+@requires_powershell
+def test_windows_lift_command_has_no_leader_or_base_motion_inputs():
+    payload = command_payload("Lift")
+
+    arguments = payload["arguments"]
+    assert arguments == [
+        str(REPO_ROOT / "examples" / "alohamini" / "teleoperate_bi.py"),
+        "--lift_only",
+        "--no_leader",
+        "--start_paused",
+        "--no_cameras",
+        "--no_rerun",
+        "--robot.robot_model",
+        "alohamini1",
+        "--robot.remote_ip",
+        "192.168.1.134",
+        "--fps",
+        "10",
+        "--duration_s",
+        "30",
+    ]
+    assert all("COM" not in argument for argument in arguments)
+    assert "--base_only" not in arguments
 
 
 @requires_powershell
@@ -179,6 +204,11 @@ $code = Invoke-Am1LoggedCommand -Executable {ps_literal(PYTHON)} `
             ("--max_relative_target", "/dev/am_arm_follower_right"),
         ),
         (
+            "lift",
+            ("--no_follower", "--no_cameras", "--max_loop_freq_hz"),
+            ("--skip_lift_home", "--max_relative_target", "/dev/am_arm_follower_right"),
+        ),
+        (
             "arms",
             ("--skip_lift_home", "--no_cameras", "--max_relative_target", "20"),
             ("--no_follower",),
@@ -205,7 +235,7 @@ def test_host_helper_prints_mode_specific_command_without_hardware(mode, require
         assert value not in result.stdout
 
 
-def test_host_helper_help_lists_only_arms_and_base_modes():
+def test_host_helper_help_lists_arms_base_and_lift_modes():
     result = subprocess.run(
         [BASH, str(HOST_HELPER), "--help"],
         cwd=REPO_ROOT,
@@ -216,7 +246,7 @@ def test_host_helper_help_lists_only_arms_and_base_modes():
     )
 
     assert result.returncode == 0, result.stderr
-    assert "--mode arms|base" in result.stdout
+    assert "--mode arms|base|lift" in result.stdout
 
 
 def test_host_runtime_pipeline_keeps_tee_alive_during_interrupt():
