@@ -60,6 +60,7 @@ STARTUP_SYNC_MAX_STEP = 0.75
 STARTUP_SYNC_LEADER_DRIFT = 2.0
 AM1_COMMAND_SEND_TIMEOUT_MS = 50
 AM1_LIVE_OBSERVATION_MAX_AGE_S = 1.0
+AM1_LIFT_ONLY_VELOCITY = 200
 RIGHT_WRIST_FLEX_KEY = "arm_right_wrist_flex.pos"
 
 StartupSyncSide = Literal["left", "right", "both"]
@@ -885,6 +886,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run the bounded AM1 keyboard base path without leaders, lift motion, cameras, or observations",
     )
+    parser.add_argument(
+        "--lift_only",
+        action="store_true",
+        help="Run the bounded AM1 keyboard lift path without leaders, base motion, cameras, or observations",
+    )
     parser.add_argument("--no_keyboard", action="store_true", help="Disable keyboard base and lift control")
     parser.add_argument(
         "--no_cameras",
@@ -1057,6 +1063,8 @@ def parse_args(
         args.robot_model == "alohamini1" and args.no_keyboard and args.no_cameras
     ):
         parser.error("--profile_cadence requires alohamini1 with --no_keyboard and --no_cameras")
+    if args.base_only and args.lift_only:
+        parser.error("--base_only and --lift_only cannot be combined")
     if args.base_only:
         if args.robot_model != "alohamini1":
             parser.error("--base_only is supported only for alohamini1")
@@ -1076,6 +1084,26 @@ def parse_args(
             parser.error("--base_only requires --fps 10")
         if not math.isfinite(args.duration_s) or not 0 < args.duration_s <= 30:
             parser.error("--base_only requires --duration_s greater than 0 and no more than 30")
+        return args
+    if args.lift_only:
+        if args.robot_model != "alohamini1":
+            parser.error("--lift_only is supported only for alohamini1")
+        if args.no_robot:
+            parser.error("--lift_only requires a robot connection")
+        if not args.no_leader:
+            parser.error("--lift_only requires --no_leader")
+        if args.no_keyboard:
+            parser.error("--lift_only requires keyboard control")
+        if not args.no_cameras:
+            parser.error("--lift_only requires --no_cameras")
+        if not args.no_rerun:
+            parser.error("--lift_only requires --no_rerun")
+        if not args.start_paused:
+            parser.error("--lift_only requires --start_paused")
+        if args.fps != 10:
+            parser.error("--lift_only requires --fps 10")
+        if not math.isfinite(args.duration_s) or not 0 < args.duration_s <= 30:
+            parser.error("--lift_only requires --duration_s greater than 0 and no more than 30")
         return args
     return resolve_leader_ports(args, parser, platform_name=platform_name)
 
@@ -1098,7 +1126,11 @@ def make_robot_config(args: argparse.Namespace) -> AlohaMiniClientConfig:
             AM1_COMMAND_SEND_TIMEOUT_MS
             if args.robot_model == "alohamini1"
             and args.no_cameras
-            and (args.no_keyboard or getattr(args, "base_only", False))
+            and (
+                args.no_keyboard
+                or getattr(args, "base_only", False)
+                or getattr(args, "lift_only", False)
+            )
             else None
         ),
     }
@@ -1139,6 +1171,25 @@ def make_base_only_action(robot: Any, pressed_keys: Any) -> dict[str, float | in
     }
 
 
+def make_lift_only_action(robot: Any, pressed_keys: Any) -> dict[str, float | int]:
+    """Build one bounded logical lift command while keeping every base axis stopped."""
+    teleop_keys = getattr(getattr(robot, "config", None), "teleop_keys", {})
+    lift_up = teleop_keys.get("lift_up", "u") in pressed_keys
+    lift_down = teleop_keys.get("lift_down", "j") in pressed_keys
+    if lift_up == lift_down:
+        lift_velocity = 0
+    elif lift_up:
+        lift_velocity = AM1_LIFT_ONLY_VELOCITY
+    else:
+        lift_velocity = -AM1_LIFT_ONLY_VELOCITY
+    return {
+        "x.vel": 0.0,
+        "y.vel": 0.0,
+        "theta.vel": 0.0,
+        "lift_axis.vel": lift_velocity,
+    }
+
+
 def run_base_only_loop(
     robot: Any,
     keyboard: Any,
@@ -1164,6 +1215,37 @@ def run_base_only_loop(
             break
 
         robot.send_action(make_base_only_action(robot, pressed_keys))
+        remaining_s = duration_s - (monotonic() - started_at)
+        if remaining_s <= 0:
+            break
+        sleep_fn(min(frame_period_s, remaining_s))
+
+
+def run_lift_only_loop(
+    robot: Any,
+    keyboard: Any,
+    *,
+    fps: int,
+    duration_s: float,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep_fn: Callable[[float], None] = precise_sleep,
+) -> None:
+    """Send keyboard lift commands at completion-spaced cadence without observation work."""
+    if fps != 10:
+        raise SafetyRefusal("lift-only control requires exactly 10 Hz")
+    if not math.isfinite(duration_s) or not 0 < duration_s <= 30:
+        raise SafetyRefusal(
+            "lift-only control requires a duration greater than 0 and no more than 30 seconds"
+        )
+
+    started_at = monotonic()
+    frame_period_s = 1.0 / fps
+    while monotonic() - started_at < duration_s:
+        pressed_keys = keyboard.get_action()
+        if robot.config.teleop_keys.get("quit", "q") in pressed_keys:
+            break
+
+        robot.send_action(make_lift_only_action(robot, pressed_keys))
         remaining_s = duration_s - (monotonic() - started_at)
         if remaining_s <= 0:
             break
@@ -1551,6 +1633,22 @@ def run_teleoperation(
             print("BASE TELEOPERATION ACTIVE — WHEELS MAY NOW MOVE")
             try:
                 run_base_only_loop(
+                    robot,
+                    keyboard,
+                    fps=args.fps,
+                    duration_s=args.duration_s,
+                    monotonic=monotonic,
+                    sleep_fn=sleep_fn,
+                )
+            except SafetyRefusal as exc:
+                print(f"SAFETY REFUSAL: {exc}")
+                return 2
+            return 0
+
+        if getattr(args, "lift_only", False):
+            print("LIFT TELEOPERATION ACTIVE — U/J MAY NOW MOVE THE LIFT")
+            try:
+                run_lift_only_loop(
                     robot,
                     keyboard,
                     fps=args.fps,

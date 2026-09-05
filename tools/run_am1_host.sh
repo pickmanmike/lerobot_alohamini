@@ -21,11 +21,12 @@ readonly AM1_PI_INPUT="ee3a6f5dd813be82780a6a9b1789966357542d2f"
 
 usage() {
     printf '%s\n' \
-        'Usage: ./tools/run_am1_host.sh --mode arms|base [--print-command]' \
+        'Usage: ./tools/run_am1_host.sh --mode arms|base|lift [--print-command]' \
         '' \
         'Modes:' \
         '  arms  Start the physically validated AM1 arms host (no cameras, unhomed lift).' \
         '  base  Start only the AM1 left body bus for a bounded base test (no follower arms).' \
+        '  lift  Start only the AM1 left body bus and home the lift once (no follower arms).' \
         '' \
         '--print-command prints the Python command without checking devices or starting the host.'
 }
@@ -45,7 +46,7 @@ print_command=false
 while (($#)); do
     case "$1" in
         --mode)
-            (($# >= 2)) || { die "--mode requires arms or base"; exit $?; }
+            (($# >= 2)) || { die "--mode requires arms, base, or lift"; exit $?; }
             mode="$2"
             shift 2
             ;;
@@ -65,9 +66,9 @@ while (($#)); do
 done
 
 case "$mode" in
-    arms|base) ;;
+    arms|base|lift) ;;
     *)
-        die "--mode must be arms or base"
+        die "--mode must be arms, base, or lift"
         exit $?
         ;;
 esac
@@ -84,11 +85,19 @@ command=(
     -m lerobot.robots.alohamini.alohamini_host
     --robot_model alohamini1
     --no_cameras
-    --skip_lift_home
 )
 if [[ "$mode" == "arms" ]]; then
     command+=(
+        --skip_lift_home
         --max_relative_target 20.0
+        --max_loop_freq_hz 30
+        --profile_timing true
+        --profile_cadence
+    )
+elif [[ "$mode" == "base" ]]; then
+    command+=(
+        --skip_lift_home
+        --no_follower
         --max_loop_freq_hz 30
         --profile_timing true
         --profile_cadence

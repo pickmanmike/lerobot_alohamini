@@ -89,46 +89,54 @@ if ($LeftPort -eq $RightPort) { throw 'Leader ports are not distinct.' }
 
 If either identity is missing, duplicated, ambiguous, or attached to the wrong labeled socket, stop. Do not infer a role from the COM number, swap only port arguments, rename calibration files, or exchange JSON contents.
 
-### Lean AM1 local operation and first base packet
+### Lean AM1 local operation and first lift packet
 
-`integrate/am1-local-teleop` at `354e6c290a995b122a20432893de14ad36097724` is the canonical shared branch for the physically validated local arm system. It contains both immutable validation inputs: Windows `30609a4597b8b6fca49bc1018024fd29dfb55127` and Pi `ee3a6f5dd813be82780a6a9b1789966357542d2f`.
+`integrate/am1-local-teleop` at `e789330e1ac04d1f7a39ecf2b44c1f2b19aa9743` is the canonical shared branch for the physically validated local arm and base system. It contains both immutable validation inputs: Windows `30609a4597b8b6fca49bc1018024fd29dfb55127` and Pi `ee3a6f5dd813be82780a6a9b1789966357542d2f`.
 
 Local bimanual arms are physically proven. In the accepted run, all twelve channels moved on the correct side and in the correct direction, startup synchronization's maximum final mismatch was `5.534`, and live control sent 449 actions over 44.990 seconds (`9.980 Hz`) with a longest interval of 110 ms. Two transient observation timeouts recovered, `stale_latched` remained false, no command-watchdog event occurred during live forwarding, base and lift remained stationary, and both processes exited `0`. Evidence is retained at:
 
 - `C:\Users\pickm\AlohaMini1Logs\am1-ar1-r2h-retry-bimanual10-windows-20260831-235812.log`
 - `C:\Users\pickm\AlohaMini1Logs\am1-ar1-r2h-retry-bimanual10-host-20260831-234021.log`
 
-The regulated 12 V / 10 A supply is proven for this arms-only result. It is not yet proven for complete simultaneous arm, base, and lift operation. Base is the next physical packet; lift, combined local operation, cameras, recording, and remote operation remain pending.
+The regulated 12 V / 10 A supply is proven for this arms-only result. It is not yet proven for complete simultaneous arm, base, and lift operation.
 
-The reviewed lean launchers replace the long ordinary host/client command blocks. They support only `arms`/`base` on the Pi and `Arms`/`Base` on Windows. Copy the tracked example once, edit its machine-local paths, and leave the resulting file ignored by Git:
+Local base teleoperation is also physically proven. The elevated-wheel checks established opposing `W/S`, `Z/X`, and `A/D` wheel patterns; the floor check established the correct six chassis directions; every release stopped promptly; and the arms and lift remained stationary. Both Windows base sessions exited `0`. The final no-motion shutdown-only check pressed no movement key, left wheels, arms, and lift stationary, and recorded both `AM1_CLIENT_EXIT_CODE=0` and `HOST_EXIT_CODE=0`. Evidence is retained at:
+
+- `C:\Users\pickm\AlohaMini1Logs\am1-base-windows-20260903-210147.log`
+- `C:\Users\pickm\AlohaMini1Logs\am1-base-windows-20260903-210429.log`
+- `C:\Users\pickm\lerobot_alohamini_client\.worktrees\am1-base-teleop\am1-base-host-20260903-210104.log`
+- `C:\Users\pickm\AlohaMini1Logs\am1-base-windows-20260904-215623.log`
+- `/home/pickmanmike/AlohaMini1Logs/am1-base-host-20260904-215432.log`
+
+The reviewed lean launchers replace the long ordinary host/client command blocks. They support `arms`/`base`/`lift` on the Pi and `Arms`/`Base`/`Lift` on Windows. Copy the tracked example once, edit its machine-local paths, and leave the resulting file ignored by Git:
 
 ```powershell
 Copy-Item .\config\am1.local.example.json .\config\am1.local.json
 ```
 
-Each launcher verifies a clean reviewed worktree and the repository import root, prints the exact Python command, creates a timestamped log, and prints the child exit code. Arms mode additionally resolves both leader ports from stored PnP identities and verifies the accepted calibration hashes. Base mode has no leader-map, calibration, or COM path. It runs at the existing lowest base setting (`0.15 m/s`, `45 deg/s`) and ignores speed and lift keys.
+Each launcher verifies a clean reviewed worktree and the repository import root, prints the exact Python command, creates a timestamped log, and prints the child exit code. Arms mode additionally resolves both leader ports from stored PnP identities and verifies the accepted calibration hashes. Base and Lift modes have no leader-map, calibration, or COM path.
 
-The first base packet uses only:
+The first lift packet uses only:
 
 ```bash
-./tools/run_am1_host.sh --mode base
+./tools/run_am1_host.sh --mode lift
 ```
 
 ```powershell
-.\tools\run_am1.ps1 -Mode Base
+.\tools\run_am1.ps1 -Mode Lift
 ```
 
-The Pi command uses `--no_follower --skip_lift_home --no_cameras`: it constructs only the left body bus, enables only the three wheel motors, and leaves the lift unhomed and unable to move. The Windows command uses `--base_only --no_leader --start_paused --no_cameras --no_rerun --fps 10 --duration_s 30`: it does not resolve or construct leaders, requests no observations in the action loop, sends only `x.vel`, `y.vel`, `theta.vel`, and explicit zero `lift_axis.vel`, and spaces sends from completion so a delay cannot produce a catch-up burst. The Pi watchdog remains one second. `Q`, the 30-second bound, or an exception enters the existing final-zero-before-disconnect cleanup.
+The Pi command uses `--no_follower --no_cameras` and deliberately omits `--skip_lift_home`: it constructs only the left body bus, constructs no follower arms or right bus, and homes the lift exactly once before ordinary host operation. AM1 positive raw lift velocity is physically down. The existing `dir_sign=-1` maps logical `+200` to raw `-200` for physical up and logical `-200` to raw `+200` for physical down. Homing drives raw `+200` downward, requests zero before capturing a process-local zero, and does not claim that zero survives reconnect or process restart. There is no commanded backoff from the lower stop, so sustained load, abnormal current, or heating there is a physical refusal requiring review.
+
+The Windows command uses `--lift_only --no_leader --start_paused --no_cameras --no_rerun --fps 10 --duration_s 30`: it constructs no leader or COM device, requests no observations in the action loop, accepts only `U` and `J`, and sends exact zero `x.vel`, `y.vel`, and `theta.vel` on every action. `U` requests bounded physical up, `J` requests bounded physical down, simultaneous or released lift keys request zero, and base/speed keys are ignored. Sends remain completion-spaced, the Pi watchdog remains one second, and `Q`, the 30-second bound, or an exception enters final-zero-before-disconnect cleanup.
 
 The following is preparation for a separately authorized human-operated test, not authorization supplied by this guide.
 
-**Wheels-elevated sequence:** Keep both leader supplies off and leader USB controllers disconnected. Secure the chassis on a stable stand with all three wheels clear, follower arms supported and clear, lift unloaded, and the 12 V disconnect immediately accessible. Check out the reviewed feature commit on both machines and keep both worktrees clean. Apply body power, run the Pi base helper, and require a quiet zero-speed hold. Run the Windows Base helper; before Enter, require no wheel or lift movement. Press Enter, then use exactly this order, one key at a time: hold `W` for no more than 0.5 second, release for at least 1 second; repeat with `S`, `Z`, `X`, `A`, and `D`; then press `Q`. Never press `T`, `G`, `U`, or `J`. Stop the Pi helper with Ctrl+C and remove body power before reading logs.
+**Lift sequence:** Keep both leader supplies off and leader USB controllers disconnected. Keep the chassis fixed, follower arms supported and clear, the lift unloaded with its complete travel envelope clear, and the 12 V disconnect immediately accessible. Check out the reviewed lift feature commit on both machines and keep both worktrees clean. Apply body power and run the Pi Lift helper. During its single homing cycle, expect a slow physical downward move to the lower stop followed promptly by zero velocity and a quiet hold; observe current and temperature because the code commands no backoff. Do not start the Windows client unless homing completes normally and the lower stop remains safe. Run the Windows Lift helper and require no movement before Enter. Press Enter, hold `U` for no more than 0.5 second, release for at least 1 second, hold `J` for no more than 0.5 second, release for at least 1 second, then press `Q`. Do not press another movement key. Stop the Pi helper with Ctrl+C and remove body power before reading logs.
 
-Pass requires `W/S`, `Z/X`, and `A/D` to produce opposite wheel patterns, every release to return all wheels promptly to zero, no lift or follower-arm movement or torque, no right-bus access, no live command-watchdog event, clean client final zero/disconnect, and client/host exit codes `0` after orderly shutdown. Stop immediately for unexpected direction or motion, a wheel continuing after release, lift or arm motion, a live watchdog warning, bus/communication error, sound, heat, current, vibration, instability, cable strain, or loss of the power-disconnect path.
+Pass requires one controlled downward homing cycle, safe current and temperature at the lower stop, `U` physical up, `J` physical down, prompt zero on both releases and `Q`, stationary wheels and follower arms, no right-bus or leader access, no live command-watchdog event, clean final zero/disconnect, and client/host exit codes `0`. Stop immediately for a homing timeout or exception, failure to stop at the lower limit, sustained hard-stop load, abnormal current or heating, wrong direction, no movement, continued motion after release, wheel or arm motion, a live watchdog warning, bus/communication error, sound, vibration, cable strain, obstruction, instability, or loss of the power-disconnect path. A refusal authorizes no automatic retry and no speed, watchdog, calibration, PID, Phase, limit, or motor-register change.
 
-**Short floor sequence (only after the elevated sequence passes):** Move the chassis to a level, unobstructed floor with at least 2 m clearance and keep the disconnect in hand. Start the same two helpers and require a quiet pre-Enter hold. After Enter, hold `W` for no more than 0.5 second and release for at least 1 second; do the same with `S`, `Z`, `X`, `A`, and `D`, in that order; press `Q`; stop the host; remove body power. At the lowest setting, each 0.5-second translation is bounded to about 7.5 cm and each rotation to about 22.5 degrees before release and transport delay.
-
-Floor pass additionally requires `W` forward, `S` backward, `Z` left, `X` right, `A` counterclockwise, and `D` clockwise, with a prompt stop on every release and no excessive slip or drift. Any elevated-test refusal also refuses the floor test. A failed elevated or floor stage authorizes no automatic retry and no software threshold, speed, watchdog, motor-setting, calibration, or geometry change.
+Lift, combined local operation, cameras, recording, and remote operation are not yet physically proven by this section.
 
 ### Simple AM1 leader calibration and recovery
 

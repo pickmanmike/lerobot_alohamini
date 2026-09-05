@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('Arms', 'Base')]
+    [ValidateSet('Arms', 'Base', 'Lift')]
     [string]$Mode,
     [string]$ConfigPath = (Join-Path $PSScriptRoot '..\config\am1.local.json'),
     [switch]$PrintCommand
@@ -84,7 +84,7 @@ function New-Am1WindowsCommand {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
-        [ValidateSet('Arms', 'Base')]
+        [ValidateSet('Arms', 'Base', 'Lift')]
         [string]$Mode,
         [Parameter(Mandatory)]
         [psobject]$Config,
@@ -103,6 +103,24 @@ function New-Am1WindowsCommand {
         $arguments = [string[]]@(
             $teleoperationPath
             '--base_only'
+            '--no_leader'
+            '--start_paused'
+            '--no_cameras'
+            '--no_rerun'
+            '--robot.robot_model'
+            'alohamini1'
+            '--robot.remote_ip'
+            [string]$Config.pi_host
+            '--fps'
+            '10'
+            '--duration_s'
+            '30'
+        )
+    }
+    elseif ($Mode -eq 'Lift') {
+        $arguments = [string[]]@(
+            $teleoperationPath
+            '--lift_only'
             '--no_leader'
             '--start_paused'
             '--no_cameras'
@@ -281,7 +299,7 @@ function Invoke-Am1Launch {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
-        [ValidateSet('Arms', 'Base')]
+        [ValidateSet('Arms', 'Base', 'Lift')]
         [string]$Mode,
         [Parameter(Mandatory)]
         [string]$ConfigPath,
@@ -349,7 +367,7 @@ function Invoke-Am1Launch {
 
 if ($MyInvocation.InvocationName -ne '.') {
     if ([string]::IsNullOrWhiteSpace($Mode)) {
-        throw 'Specify -Mode Arms or -Mode Base.'
+        throw 'Specify -Mode Arms, -Mode Base, or -Mode Lift.'
     }
     Invoke-Am1Launch -Mode $Mode -ConfigPath $ConfigPath -PrintCommand:$PrintCommand
 }
