@@ -177,6 +177,17 @@ def _jsonable(value):
     return value
 
 
+def format_lift_diagnostic_report(robot: AlohaMini, observation: dict) -> str:
+    lift_snapshot = robot.read_lift_diagnostics()
+    report = {
+        "wall_time_ns": time.time_ns(),
+        "monotonic_time_ns": time.monotonic_ns(),
+        "height_mm": _jsonable(observation.get("lift_axis.height_mm")),
+        **lift_snapshot,
+    }
+    return f"[LIFT DIAGNOSTICS] {json.dumps(report, separators=(',', ':'))}"
+
+
 def build_observation_multipart(observation: dict, camera_keys) -> list[bytes]:
     """Encode state as JSON and camera images as binary JPEG multipart frames."""
     state_observation = {
@@ -297,6 +308,18 @@ def make_parser() -> argparse.ArgumentParser:
             "once per second (default: false)."
         ),
     )
+    parser.add_argument(
+        "--profile_lift_diagnostics",
+        "--profile-lift-diagnostics",
+        type=parse_bool,
+        nargs="?",
+        const=True,
+        default=False,
+        help=(
+            "Print a read-only AM1 lift current, temperature, voltage, velocity, torque, "
+            "mode, status, and process-height snapshot once per second (default: false)."
+        ),
+    )
     return parser
 
 
@@ -338,9 +361,15 @@ def main():
         logging.info("Starting HostAgent")
         host_config = make_host_config(args)
         host = AlohaMiniHost(host_config)
-    except BaseException:
+    except BaseException as error:
         if robot.is_connected:
-            robot.disconnect()
+            try:
+                robot.disconnect(recover_interrupted_bus_io=True)
+            except BaseException as cleanup_error:
+                error.add_note(
+                    "robot disconnect also failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
         raise
 
     command_state = HostCommandState(
@@ -359,6 +388,7 @@ def main():
         timing_command_count = 0
         action_timing_totals_ms: dict[str, float] = {}
         cadence_report_start_t = time.monotonic()
+        lift_diagnostics_report_start_t = cadence_report_start_t
 
         while duration < host.connection_time_s:
             loop_start_t = time.perf_counter()
@@ -417,8 +447,18 @@ def main():
                     logging.info("Dropping observation response, client is not ready")
             response_send_done_t = time.perf_counter()
 
+            lift_diagnostics_done_t = response_send_done_t
+            lift_diagnostics_now = time.monotonic()
+            if (
+                args.profile_lift_diagnostics
+                and lift_diagnostics_now - lift_diagnostics_report_start_t >= 1.0
+            ):
+                print(format_lift_diagnostic_report(robot, last_observation), flush=True)
+                lift_diagnostics_report_start_t = lift_diagnostics_now
+                lift_diagnostics_done_t = time.perf_counter()
+
             # Ensure a short sleep to avoid overloading the CPU.
-            elapsed = response_send_done_t - loop_start_t
+            elapsed = lift_diagnostics_done_t - loop_start_t
 
             time.sleep(max(1 / host.max_loop_freq_hz - elapsed, 0))
             loop_done_t = time.perf_counter()
@@ -429,7 +469,8 @@ def main():
                 "request_poll": (request_poll_done_t - observation_done_t) * 1e3,
                 "jpeg_encode": (encode_done_t - request_poll_done_t) * 1e3,
                 "response_send": (response_send_done_t - encode_done_t) * 1e3,
-                "sleep": (loop_done_t - response_send_done_t) * 1e3,
+                "lift_diagnostics": (lift_diagnostics_done_t - response_send_done_t) * 1e3,
+                "sleep": (loop_done_t - lift_diagnostics_done_t) * 1e3,
                 "loop": (loop_done_t - loop_start_t) * 1e3,
                 **robot.logs.get("observation_timing_ms", {}),
             }

@@ -122,7 +122,14 @@ def test_pi_lift_homing_failure_prevents_normal_activation(monkeypatch):
     robot.lift = FailingLift()
     robot.cameras = {}
     monkeypatch.setattr(robot, "_seed_activation_goals", lambda: events.append("seed"))
-    monkeypatch.setattr(robot, "_safe_shutdown", lambda *, close_buses: events.append("shutdown") or [])
+    monkeypatch.setattr(
+        robot,
+        "_safe_shutdown",
+        lambda *, close_buses, recover_interrupted_bus_io=False: events.append(
+            ("shutdown", recover_interrupted_bus_io)
+        )
+        or [],
+    )
     monkeypatch.setattr(
         alohamini_module,
         "set_torque_enabled",
@@ -132,7 +139,7 @@ def test_pi_lift_homing_failure_prevents_normal_activation(monkeypatch):
     with pytest.raises(RuntimeError, match="motor activation failed"):
         robot.activate_motors(home_lift=True)
 
-    assert events == ["home", "shutdown"]
+    assert events == ["home", ("shutdown", True)]
 
 
 def test_pi_watchdog_remains_one_second_for_lift_mode():

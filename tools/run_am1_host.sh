@@ -21,7 +21,7 @@ readonly AM1_PI_INPUT="ee3a6f5dd813be82780a6a9b1789966357542d2f"
 
 usage() {
     printf '%s\n' \
-        'Usage: ./tools/run_am1_host.sh --mode arms|base|lift|local [--print-command]' \
+        'Usage: ./tools/run_am1_host.sh --mode arms|base|lift|local [--lift-diagnostics] [--print-command]' \
         '' \
         'Modes:' \
         '  arms  Start the physically validated AM1 arms host (no cameras, unhomed lift).' \
@@ -29,6 +29,7 @@ usage() {
         '  lift  Start only the AM1 left body bus and home the lift once (no follower arms).' \
         '  local Start both follower arms and the body bus, including one lift homing cycle.' \
         '' \
+        '--lift-diagnostics adds a once-per-second read-only lift snapshot in Lift mode.' \
         '--print-command prints the Python command without checking devices or starting the host.'
 }
 
@@ -44,6 +45,7 @@ quote_command() {
 
 mode=""
 print_command=false
+lift_diagnostics=false
 while (($#)); do
     case "$1" in
         --mode)
@@ -53,6 +55,10 @@ while (($#)); do
             ;;
         --print-command)
             print_command=true
+            shift
+            ;;
+        --lift-diagnostics)
+            lift_diagnostics=true
             shift
             ;;
         --help|-h)
@@ -73,6 +79,11 @@ case "$mode" in
         exit $?
         ;;
 esac
+
+if [[ "$lift_diagnostics" == true && "$mode" != "lift" ]]; then
+    die "--lift-diagnostics is only valid with --mode lift"
+    exit $?
+fi
 
 script_path="${BASH_SOURCE[0]//\\//}"
 script_parent="${script_path%/*}"
@@ -110,6 +121,9 @@ elif [[ "$mode" == "lift" ]]; then
         --profile_timing true
         --profile_cadence
     )
+    if [[ "$lift_diagnostics" == true ]]; then
+        command+=(--profile_lift_diagnostics)
+    fi
 else
     command+=(
         --max_relative_target 20.0

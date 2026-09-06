@@ -60,6 +60,7 @@ def main():
     logging.info("Configuring AlohaMini for calibration")
     robot = AlohaMini(make_robot_config(args))
 
+    primary_error: BaseException | None = None
     try:
         logging.info("Connecting AlohaMini without auto-calibration")
         robot.connect(calibrate=False, activate=False, home_lift=False)
@@ -71,9 +72,20 @@ def main():
                 f"({result.stop_reason}, {result.elapsed_s:.2f}s)."
             )
         print("AlohaMini calibration complete.")
+    except BaseException as error:
+        primary_error = error
+        raise
     finally:
         if robot.is_connected:
-            robot.disconnect()
+            try:
+                robot.disconnect(recover_interrupted_bus_io=primary_error is not None)
+            except BaseException as cleanup_error:
+                if primary_error is None:
+                    raise
+                primary_error.add_note(
+                    "robot disconnect also failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
 
 
 if __name__ == "__main__":

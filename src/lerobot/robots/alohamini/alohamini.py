@@ -1127,6 +1127,38 @@ class AlohaMini(Robot):
         return {k: round(v * scale, 1) for k, v in {**left_curr_raw, **right_curr_raw}.items()}
 
     @check_if_not_connected
+    def read_lift_diagnostics(self) -> dict[str, int | float | bool]:
+        """Read a compact AM1 lift snapshot without changing any servo register."""
+        if self.config.robot_model != "alohamini1":
+            raise RuntimeError("Lift diagnostics are supported only for Aloha Mini 1.")
+
+        motor = self.lift.cfg.name
+
+        def read_raw(register: str) -> int:
+            return int(
+                self.left_bus.read(
+                    register,
+                    motor,
+                    normalize=False,
+                    num_retry=REGISTER_RETRIES,
+                )
+            )
+
+        present_current_raw = read_raw("Present_Current")
+        return {
+            "is_homed": self.lift.is_homed,
+            "present_current_raw": present_current_raw,
+            "present_current_ma": round(abs(present_current_raw) * 6.5, 1),
+            "present_temperature_raw": read_raw("Present_Temperature"),
+            "present_voltage_raw": read_raw("Present_Voltage"),
+            "goal_velocity_raw": read_raw("Goal_Velocity"),
+            "present_velocity_raw": read_raw("Present_Velocity"),
+            "torque_enable": read_raw("Torque_Enable"),
+            "operating_mode": read_raw("Operating_Mode"),
+            "status": read_raw("Status"),
+        }
+
+    @check_if_not_connected
     def disconnect(self, *, recover_interrupted_bus_io: bool = False) -> None:
         errors = self._safe_shutdown(
             close_buses=True,

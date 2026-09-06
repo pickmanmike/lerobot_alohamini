@@ -269,6 +269,55 @@ def test_host_helper_help_lists_arms_base_lift_and_local_modes():
 
     assert result.returncode == 0, result.stderr
     assert "--mode arms|base|lift|local" in result.stdout
+    assert "--lift-diagnostics" in result.stdout
+
+
+def test_host_helper_adds_lift_diagnostics_only_when_explicitly_requested():
+    enabled = subprocess.run(
+        [
+            BASH,
+            str(HOST_HELPER),
+            "--mode",
+            "lift",
+            "--lift-diagnostics",
+            "--print-command",
+        ],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    default = subprocess.run(
+        [BASH, str(HOST_HELPER), "--mode", "lift", "--print-command"],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    wrong_mode = subprocess.run(
+        [
+            BASH,
+            str(HOST_HELPER),
+            "--mode",
+            "local",
+            "--lift-diagnostics",
+            "--print-command",
+        ],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert enabled.returncode == 0, enabled.stderr
+    assert "--profile_lift_diagnostics" in enabled.stdout
+    assert default.returncode == 0, default.stderr
+    assert "--profile_lift_diagnostics" not in default.stdout
+    assert wrong_mode.returncode == 2
+    assert "only valid with --mode lift" in wrong_mode.stderr
 
 
 def test_host_runtime_pipeline_keeps_tee_alive_during_interrupt():
