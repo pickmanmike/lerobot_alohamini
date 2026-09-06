@@ -329,7 +329,8 @@ def main():
         logging.info("no_follower mode: follower arms will not connect, only base and lift operate.")
     robot = AlohaMini(robot_config)
 
-
+    primary_error: BaseException | None = None
+    interrupted_motor_io = False
     try:
         logging.info("Connecting AlohaMini")
         connect_robot(robot, skip_lift_home=args.skip_lift_home)
@@ -495,7 +496,11 @@ def main():
         print("Cycle time reached.")
 
     except KeyboardInterrupt:
+        interrupted_motor_io = True
         print("Keyboard interrupt received. Exiting...")
+    except BaseException as error:
+        interrupted_motor_io = True
+        primary_error = error
     finally:
         print("Shutting down AlohaMini Host.")
         if args.profile_cadence:
@@ -503,11 +508,30 @@ def main():
                 print_cadence_report(command_state)
             except Exception:
                 logging.exception("Failed to emit final host cadence report.")
+        cleanup_errors: list[tuple[str, BaseException]] = []
         try:
             if robot.is_connected:
-                robot.disconnect()
-        finally:
+                robot.disconnect(recover_interrupted_bus_io=interrupted_motor_io)
+        except BaseException as error:
+            cleanup_errors.append(("robot disconnect", error))
+        try:
             host.disconnect()
+        except BaseException as error:
+            cleanup_errors.append(("host disconnect", error))
+
+        if primary_error is not None:
+            for operation, error in cleanup_errors:
+                primary_error.add_note(
+                    f"{operation} also failed: {type(error).__name__}: {error}"
+                )
+            raise primary_error
+        if cleanup_errors:
+            _, error = cleanup_errors[0]
+            for later_operation, later_error in cleanup_errors[1:]:
+                error.add_note(
+                    f"{later_operation} also failed: {type(later_error).__name__}: {later_error}"
+                )
+            raise error
 
     logging.info("Finished AlohaMini cleanly")
 if __name__ == "__main__":

@@ -423,8 +423,8 @@ def test_main_emits_a_final_host_cadence_snapshot_before_cleanup(monkeypatch, ca
         def __init__(self, config):
             self.is_connected = True
 
-        def disconnect(self):
-            cleanup_events.append("robot_disconnect")
+        def disconnect(self, *, recover_interrupted_bus_io=False):
+            cleanup_events.append(("robot_disconnect", recover_interrupted_bus_io))
             self.is_connected = False
 
     class FakeHost:
@@ -452,4 +452,96 @@ def test_main_emits_a_final_host_cadence_snapshot_before_cleanup(monkeypatch, ca
         line for line in capsys.readouterr().out.splitlines() if line.startswith("[HOST CADENCE] ")
     ]
     assert len(cadence_lines) == 1
-    assert cleanup_events == ["robot_disconnect", "host_disconnect"]
+    assert cleanup_events == [("robot_disconnect", False), "host_disconnect"]
+
+
+def test_main_marks_keyboard_interrupt_cleanup_as_interrupted(monkeypatch):
+    args = make_parser().parse_args(["--no_cameras", "--skip_lift_home"])
+    cleanup_events = []
+
+    class NoCommandSocket:
+        def recv_string(self, flags):
+            raise alohamini_host.zmq.Again()
+
+    class FakeRobot:
+        def __init__(self, config):
+            self.is_connected = True
+            self.logs = {}
+
+        def get_observation(self):
+            raise KeyboardInterrupt("interrupt inside motor read")
+
+        def disconnect(self, *, recover_interrupted_bus_io=False):
+            cleanup_events.append(("robot_disconnect", recover_interrupted_bus_io))
+            self.is_connected = False
+
+    class FakeHost:
+        watchdog_timeout_ms = 1000
+        connection_time_s = 10
+        max_loop_freq_hz = 30
+
+        def __init__(self, config):
+            self.zmq_cmd_socket = NoCommandSocket()
+
+        def disconnect(self):
+            cleanup_events.append("host_disconnect")
+
+    monkeypatch.setattr(
+        alohamini_host,
+        "make_parser",
+        lambda: SimpleNamespace(parse_args=lambda: args),
+    )
+    monkeypatch.setattr(alohamini_host, "AlohaMini", FakeRobot)
+    monkeypatch.setattr(alohamini_host, "connect_robot", lambda robot, skip_lift_home: None)
+    monkeypatch.setattr(alohamini_host, "AlohaMiniHost", FakeHost)
+
+    alohamini_host.main()
+
+    assert cleanup_events == [("robot_disconnect", True), "host_disconnect"]
+
+
+def test_main_preserves_primary_loop_error_when_cleanup_also_fails(monkeypatch):
+    args = make_parser().parse_args(["--no_cameras", "--skip_lift_home"])
+    cleanup_events = []
+
+    class NoCommandSocket:
+        def recv_string(self, flags):
+            raise alohamini_host.zmq.Again()
+
+    class FakeRobot:
+        def __init__(self, config):
+            self.is_connected = True
+            self.logs = {}
+
+        def get_observation(self):
+            raise RuntimeError("primary observation failure")
+
+        def disconnect(self, *, recover_interrupted_bus_io=False):
+            cleanup_events.append(("robot_disconnect", recover_interrupted_bus_io))
+            raise ConnectionError("cleanup wire failure")
+
+    class FakeHost:
+        watchdog_timeout_ms = 1000
+        connection_time_s = 10
+        max_loop_freq_hz = 30
+
+        def __init__(self, config):
+            self.zmq_cmd_socket = NoCommandSocket()
+
+        def disconnect(self):
+            cleanup_events.append("host_disconnect")
+
+    monkeypatch.setattr(
+        alohamini_host,
+        "make_parser",
+        lambda: SimpleNamespace(parse_args=lambda: args),
+    )
+    monkeypatch.setattr(alohamini_host, "AlohaMini", FakeRobot)
+    monkeypatch.setattr(alohamini_host, "connect_robot", lambda robot, skip_lift_home: None)
+    monkeypatch.setattr(alohamini_host, "AlohaMiniHost", FakeHost)
+
+    with pytest.raises(RuntimeError, match="primary observation failure") as caught:
+        alohamini_host.main()
+
+    assert any("cleanup wire failure" in note for note in caught.value.__notes__)
+    assert cleanup_events == [("robot_disconnect", True), "host_disconnect"]

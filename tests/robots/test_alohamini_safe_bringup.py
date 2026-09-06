@@ -42,6 +42,16 @@ from lerobot.robots.alohamini.lift_axis import LiftAxis, LiftAxisConfig
 from lerobot.robots.alohamini.motor_safety import set_torque_enabled
 
 
+class FakePortHandler:
+    def __init__(self, name: str, events: list[tuple]):
+        self.name = name
+        self.events = events
+        self.is_using = False
+
+    def clearPort(self) -> None:
+        self.events.append((self.name, "clear_port"))
+
+
 class FakeBus:
     def __init__(self, name: str, motor_names: tuple[str, ...], events: list[tuple]):
         self.name = name
@@ -52,6 +62,8 @@ class FakeBus:
         self.read_sequences: dict[tuple[str, str], list[object]] = {}
         self.write_failures: dict[tuple[str, str, int], tuple[BaseException, bool]] = {}
         self.position_step = 0
+        self.port_handler = FakePortHandler(name, events)
+        self.latch_port_busy_on_interrupt = False
 
     def read(
         self,
@@ -62,10 +74,14 @@ class FakeBus:
         num_retry: int = 3,
     ) -> int | float:
         self.events.append((self.name, "read", register, motor))
+        if self.port_handler.is_using:
+            raise ConnectionError("[TxRxResult] Port is in use!")
         sequence = self.read_sequences.get((register, motor))
         if sequence:
             value = sequence.pop(0)
             if isinstance(value, BaseException):
+                if isinstance(value, KeyboardInterrupt) and self.latch_port_busy_on_interrupt:
+                    self.port_handler.is_using = True
                 raise value
             self.registers[(register, motor)] = value
             return value
@@ -84,6 +100,8 @@ class FakeBus:
     ) -> None:
         int_value = int(value)
         self.events.append((self.name, "write", register, motor, int_value))
+        if self.port_handler.is_using:
+            raise ConnectionError("[TxRxResult] Port is in use!")
         failure = self.write_failures.get((register, motor, int_value))
         if failure is not None:
             error, apply_before_error = failure
@@ -136,6 +154,7 @@ def make_activation_robot(*, fail_arm_enable: bool = False):
         )
 
     robot = AlohaMini.__new__(AlohaMini)
+    robot.config = SimpleNamespace(robot_model="alohamini1")
     robot.left_bus = left
     robot.right_bus = right
     robot.left_arm_motors = ["arm_left_shoulder_pan", "arm_left_gripper"]
@@ -218,6 +237,63 @@ def test_activation_failure_zeros_body_disables_torque_and_closes_buses():
             assert (bus_name, "write", "Torque_Enable", motor, 0) in events
         assert not bus.is_connected
     assert not robot.lift.is_homed
+
+
+def test_interrupted_bus_read_is_recovered_before_shutdown_io_and_preserves_interrupt():
+    robot, left, right, events = make_activation_robot()
+    primary = KeyboardInterrupt("operator interrupt during SDK read")
+    left.latch_port_busy_on_interrupt = True
+    left.read_sequences[("Present_Position", "arm_left_shoulder_pan")] = [primary]
+
+    with pytest.raises(KeyboardInterrupt) as caught:
+        try:
+            left.read("Present_Position", "arm_left_shoulder_pan")
+        except BaseException:
+            cleanup_errors = robot._safe_shutdown(
+                close_buses=True,
+                recover_interrupted_bus_io=True,
+            )
+            assert cleanup_errors == []
+            raise
+
+    assert caught.value is primary
+    clear_index = event_index(events, ("left", "clear_port"))
+    first_zero_index = event_index(
+        events,
+        ("left", "write", "Goal_Velocity", "base_left_wheel", 0),
+    )
+    assert clear_index < first_zero_index
+    for bus_name, bus in (("left", left), ("right", right)):
+        for motor in bus.motors:
+            assert (bus_name, "write", "Torque_Enable", motor, 0) in events
+        assert not bus.is_connected
+
+
+def test_ordinary_shutdown_does_not_clear_an_idle_port_and_closes_both_buses():
+    robot, left, right, events = make_activation_robot()
+
+    robot.disconnect()
+
+    assert not any(event[1] == "clear_port" for event in events)
+    assert not left.is_connected
+    assert not right.is_connected
+    assert not robot.lift.is_homed
+
+
+def test_genuine_cleanup_failure_remains_an_error_after_interrupted_bus_recovery():
+    robot, left, right, events = make_activation_robot()
+    left.port_handler.is_using = True
+    left.write_failures[("Goal_Velocity", "base_left_wheel", 0)] = (
+        ConnectionError("wire disconnected"),
+        False,
+    )
+
+    with pytest.raises(RuntimeError, match="wire disconnected"):
+        robot.disconnect(recover_interrupted_bus_io=True)
+
+    assert ("left", "clear_port") in events
+    assert not left.is_connected
+    assert not right.is_connected
 
 
 @pytest.mark.parametrize(

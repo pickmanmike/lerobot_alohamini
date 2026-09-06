@@ -300,7 +300,7 @@ class AlohaMini(Robot):
 
             logger.info("%s connected.", self)
         except BaseException:
-            self._safe_shutdown(close_buses=True)
+            self._safe_shutdown(close_buses=True, recover_interrupted_bus_io=True)
             raise
 
     @property
@@ -529,7 +529,7 @@ class AlohaMini(Robot):
             if self.right_bus:
                 set_torque_enabled(self.right_bus, self.right_arm_motors, enabled=True)
         except BaseException as error:
-            cleanup_errors = self._safe_shutdown(close_buses=True)
+            cleanup_errors = self._safe_shutdown(close_buses=True, recover_interrupted_bus_io=True)
             if isinstance(error, (KeyboardInterrupt, SystemExit)):
                 raise
             detail = f" Cleanup issues: {'; '.join(cleanup_errors)}" if cleanup_errors else ""
@@ -537,9 +537,36 @@ class AlohaMini(Robot):
 
         return home_result
 
-    def _safe_shutdown(self, *, close_buses: bool) -> list[str]:
-        """Best-effort zero, torque-off, camera close, and optional bus close."""
+    def _safe_shutdown(
+        self,
+        *,
+        close_buses: bool,
+        recover_interrupted_bus_io: bool = False,
+    ) -> list[str]:
+        """Best-effort zero, torque-off, camera close, and optional bus close.
+
+        ``recover_interrupted_bus_io`` is only for a caller that has already left
+        normal motor I/O after an exception. The Feetech SDK can otherwise retain
+        its single-transaction busy flag when ``KeyboardInterrupt`` escapes a read.
+        """
         errors: list[str] = []
+
+        if recover_interrupted_bus_io and self.config.robot_model == "alohamini1":
+            for bus_name, bus in (("left", self.left_bus), ("right", self.right_bus)):
+                if bus is None or not bus.is_connected:
+                    continue
+                port_handler = getattr(bus, "port_handler", None)
+                if port_handler is None or not getattr(port_handler, "is_using", False):
+                    continue
+                try:
+                    port_handler.clearPort()
+                    port_handler.is_using = False
+                    logger.warning(
+                        "Recovered abandoned %s Feetech transaction before AM1 shutdown.",
+                        bus_name,
+                    )
+                except Exception as error:
+                    errors.append(f"recover {bus_name} bus transaction: {error}")
 
         if self.left_bus.is_connected:
             for name in (*self.base_motors, self.lift.cfg.name):
@@ -1100,8 +1127,11 @@ class AlohaMini(Robot):
         return {k: round(v * scale, 1) for k, v in {**left_curr_raw, **right_curr_raw}.items()}
 
     @check_if_not_connected
-    def disconnect(self) -> None:
-        errors = self._safe_shutdown(close_buses=True)
+    def disconnect(self, *, recover_interrupted_bus_io: bool = False) -> None:
+        errors = self._safe_shutdown(
+            close_buses=True,
+            recover_interrupted_bus_io=recover_interrupted_bus_io,
+        )
         if errors:
             raise RuntimeError(f"AlohaMini disconnected with cleanup issues: {'; '.join(errors)}")
         logger.info("%s disconnected.", self)
