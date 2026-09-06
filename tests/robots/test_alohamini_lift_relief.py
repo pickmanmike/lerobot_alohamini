@@ -1,0 +1,437 @@
+"""Exercise the opt-in diagnostic with real lift/control/cleanup and fake serial I/O."""
+
+from __future__ import annotations
+
+import builtins
+import json
+import signal
+import sys
+from collections import Counter
+
+import pytest
+
+from lerobot.robots.alohamini import alohamini as robot_module
+from lerobot.robots.alohamini import alohamini_host as host
+from lerobot.robots.alohamini import lift_axis
+from tests.robots.test_alohamini_safe_bringup import FakeBus
+
+
+class Clock:
+    now = 100.0
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+class LiftBus(FakeBus):
+    def __init__(self, clock, **kwargs):
+        super().__init__("left", tuple(kwargs["motors"]), [])
+        self.motors = kwargs["motors"]
+        self.clock = clock
+        self.is_connected = False
+        self.position = 1000.0
+        self.bottom = 1100.0
+        self.last_update = clock.now
+        self.up_factor = 1.0
+        self.rest_current = 8
+        self.raised = False
+        self.hook = lambda register: None
+        self.registers.update({
+            (name, "lift_axis"): value for name, value in {
+                "Model_Number": 777, "Firmware_Major_Version": 3, "Firmware_Minor_Version": 6,
+                "Max_Temperature_Limit": 70, "Min_Voltage_Limit": 40, "Max_Voltage_Limit": 140,
+                "Unloading_Condition": 44, "Present_Temperature": 30, "Present_Voltage": 120,
+                "Operating_Mode": 1, "Angular_Resolution": 1,
+            }.items()
+        })
+
+    def connect(self, *, handshake=True):
+        self.events.append(("left", "connect"))
+        self.is_connected = True
+        if handshake:
+            # The real SDK handshake also reads firmware. This diagnostic's own
+            # explicit model/configuration preflight must be the sole such sweep.
+            self.read("Firmware_Major_Version", "lift_axis", normalize=False)
+
+    def read(self, register, motor, **kwargs):
+        self.hook(register)
+        if motor == "lift_axis":
+            goal = self.registers[("Goal_Velocity", motor)]
+            torque = self.registers[("Torque_Enable", motor)]
+            elapsed = self.clock.now - self.last_update
+            self.position = min(self.bottom, self.position + goal * torque * elapsed * (
+                self.up_factor if goal < 0 else 1.0
+            ))
+            self.last_update = self.clock.now
+            if goal < 0:
+                self.raised = True
+            stopped = not goal or (goal > 0 and self.position >= self.bottom)
+            self.registers[("Present_Position", motor)] = round(self.position)
+            self.registers[("Present_Velocity", motor)] = 0 if stopped else goal
+            self.registers[("Present_Current", motor)] = (
+                self.rest_current if self.raised and stopped else 50 if stopped and torque else 5
+            )
+        return super().read(register, motor, **kwargs)
+
+
+@pytest.fixture
+def rig(monkeypatch, tmp_path):
+    clock = Clock()
+    buses = []
+    robots = []
+    monkeypatch.setattr(lift_axis.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(lift_axis.time, "sleep", clock.sleep)
+
+    def make_bus(**kwargs):
+        bus = LiftBus(clock, **kwargs)
+        buses.append(bus)
+        return bus
+
+    original_robot = robot_module.AlohaMini
+
+    def make_robot(config):
+        config.calibration_dir = tmp_path
+        robot = original_robot(config)
+        robots.append(robot)
+        return robot
+
+    monkeypatch.setattr(robot_module, "FeetechMotorsBus", make_bus)
+    monkeypatch.setattr(host, "AlohaMini", make_robot)
+    monkeypatch.setattr(host, "AlohaMiniHost", lambda *_: pytest.fail("diagnostic opened ZMQ"))
+    monkeypatch.setattr(builtins, "input", lambda _: "RELIEF")
+    monkeypatch.setattr(sys, "argv", [
+        "alohamini_host", "--robot_model", "alohamini1", "--no_follower", "--no_cameras",
+        "--lift_relief",
+    ])
+    return clock, buses, robots
+
+
+def execute():
+    with pytest.raises(SystemExit) as caught:
+        host.main()
+    return caught.value.code
+
+
+def reports(capsys):
+    return [json.loads(line.split("] ", 1)[1]) for line in capsys.readouterr().out.splitlines()
+            if line.startswith("[LIFT RELIEF] ")]
+
+
+def assert_stopped(bus):
+    assert bus.registers[("Goal_Velocity", "lift_axis")] == 0
+    assert bus.registers[("Torque_Enable", "lift_axis")] == 0
+    assert not bus.is_connected
+
+
+def test_relief_homes_once_moves_up_ten_mm_then_observes_45_seconds_and_cleans_up(rig, capsys):
+    clock, buses, robots = rig
+    assert execute() == 0
+    assert len(buses) == 1
+    robot, bus = robots[0], buses[0]
+    assert robot.right_bus is None and not robot.left_arm_motors and not robot.cameras
+    writes = [e for e in bus.events if e[1] == "write"]
+    assert sum(e[2:] == ("Goal_Velocity", "lift_axis", 200) for e in writes) == 1
+    assert sum(e[2:] == ("Goal_Velocity", "lift_axis", -200) for e in writes) == 1
+    assert all(e[-1] == 0 for e in writes if e[3].startswith("base_"))
+    assert {e[2] for e in writes} <= {"Goal_Velocity", "Torque_Enable", "Lock", "Operating_Mode"}
+    assert_stopped(bus)
+    assert robot.lift.cfg.descent_floor_mm == 5.0
+    assert robot.lift._z0_deg < 0  # Original bottom reference survives the relief move.
+    observations = [r for r in reports(capsys) if r.get("phase") == "rest"]
+    assert len(observations) >= 45
+    assert all(10 <= r["height_mm"] <= 12 for r in observations)
+    assert observations[-1]["elapsed_s"] - observations[0]["elapsed_s"] >= 44
+    assert all(r["goal_velocity_raw"] == r["present_velocity_raw"] == 0 for r in observations)
+    assert 145 <= clock.now <= 165
+    reads = Counter(e[2] for e in bus.events if e[1] == "read")
+    for name in ("Firmware_Major_Version", "Firmware_Minor_Version", "Max_Temperature_Limit",
+                 "Unloading_Condition", "Velocity_closed_loop_P_proportional_coefficient",
+                 "Velocity_closed_loop_I_integral_coefficient", "Maximum_Velocity_Limit"):
+        assert reads[name] == 1
+    assert reads["Phase"] == 0
+
+
+@pytest.mark.parametrize("fault,reason", [
+    ("hot_start", "cool"), ("missing", "telemetry"), ("fault_status", "status"),
+    ("wrong_model", "model"), ("nonfinite", "telemetry"), ("powered_start", "torque"),
+])
+def test_preflight_faults_refuse_before_any_torque_enable(rig, monkeypatch, capsys, fault, reason):
+    _, buses, _ = rig
+    original = LiftBus.connect
+
+    def connect(bus, **kwargs):
+        original(bus, **kwargs)
+        register, value = {
+            "hot_start": ("Present_Temperature", 41), "missing": ("Present_Voltage", None),
+            "fault_status": ("Status", 4), "wrong_model": ("Model_Number", 2825),
+            "nonfinite": ("Present_Temperature", float("nan")), "powered_start": ("Torque_Enable", 1),
+        }[fault]
+        bus.registers[(register, "lift_axis")] = value
+
+    monkeypatch.setattr(LiftBus, "connect", connect)
+    assert execute() == 2
+    assert reason in capsys.readouterr().out.lower()
+    assert not any(e[1:3] == ("write", "Torque_Enable") and e[-1] == 1 for e in buses[0].events)
+    assert_stopped(buses[0])
+
+
+def test_operator_gate_is_before_homing_and_requires_fresh_cool_telemetry(rig, monkeypatch, capsys):
+    _, buses, _ = rig
+
+    def confirm(_):
+        assert not any(e[1] == "write" for e in buses[0].events)
+        buses[0].registers[("Present_Temperature", "lift_axis")] = 55
+        return "RELIEF"
+
+    monkeypatch.setattr(builtins, "input", confirm)
+    assert execute() == 2
+    assert "temperature" in capsys.readouterr().out.lower()
+    assert not any(e[1:3] == ("write", "Torque_Enable") and e[-1] == 1 for e in buses[0].events)
+    assert_stopped(buses[0])
+
+
+@pytest.mark.parametrize("fault,reason", [
+    ("no_motion", "progress"), ("wrong_direction", "direction"), ("travel", "travel"),
+    ("hot_homing", "temperature"), ("hot_relief", "temperature"),
+    ("high_idle_current", "current"), ("telemetry_failure", "telemetry"),
+    ("interrupt", "interrupted"),
+])
+def test_motion_and_rest_aborts_converge_on_zero_torque_off_and_close(rig, monkeypatch, capsys, fault, reason):
+    clock, buses, _ = rig
+    original = LiftBus.connect
+
+    def connect(bus, **kwargs):
+        original(bus, **kwargs)
+        if fault in ("no_motion", "wrong_direction", "travel"):
+            bus.up_factor = {"no_motion": 0, "wrong_direction": -1, "travel": 100}[fault]
+        if fault == "high_idle_current":
+            bus.rest_current = 31  # 201.5mA, below the earlier 300mA criterion.
+
+        def hook(register):
+            goal = bus.registers[("Goal_Velocity", "lift_axis")]
+            if fault == "wrong_direction" and goal < 0 and register == "Present_Velocity":
+                bus.read_sequences[(register, "lift_axis")] = [200]
+            if fault == "hot_homing" and goal > 0 or fault == "hot_relief" and goal < 0:
+                bus.registers[("Present_Temperature", "lift_axis")] = 55
+            if bus.raised and register == "Present_Temperature":
+                if fault == "telemetry_failure":
+                    raise OSError("telemetry disconnected")
+                if fault == "interrupt":
+                    bus.port_handler.is_using = True
+                    raise KeyboardInterrupt()
+
+        bus.hook = hook
+
+    monkeypatch.setattr(LiftBus, "connect", connect)
+    assert execute() == (130 if fault == "interrupt" else 2)
+    output = capsys.readouterr().out
+    assert reason in output.lower()
+    if fault == "high_idle_current":
+        samples = [json.loads(line.split("] ", 1)[1]) for line in output.splitlines()
+                   if line.startswith("[LIFT RELIEF] ")]
+        assert sum(s.get("phase") == "rest" and s["present_current_ma"] >= 200 for s in samples) == 3
+    assert clock.now < 112
+    assert_stopped(buses[0])
+    assert sum(e[1:] == ("write", "Goal_Velocity", "lift_axis", -200) for e in buses[0].events) <= 1
+
+
+def test_primary_refusal_survives_a_real_cleanup_write_failure(rig, monkeypatch, capsys):
+    _, buses, _ = rig
+    original = LiftBus.connect
+
+    def connect(bus, **kwargs):
+        original(bus, **kwargs)
+        bus.registers[("Present_Temperature", "lift_axis")] = 55
+        bus.write_failures[("Goal_Velocity", "lift_axis", 0)] = (OSError("zero write failed"), False)
+
+    monkeypatch.setattr(LiftBus, "connect", connect)
+    assert execute() == 2
+    output = capsys.readouterr().out.lower()
+    assert "temperature" in output and "zero write failed" in output
+    assert not buses[0].is_connected
+
+
+def test_temperature_is_still_cool_immediately_before_torque(rig, monkeypatch, capsys):
+    original = LiftBus.write
+
+    def write(bus, register, motor, value, **kwargs):
+        original(bus, register, motor, value, **kwargs)
+        if register == "Operating_Mode":
+            bus.registers[("Present_Temperature", "lift_axis")] = 41
+
+    monkeypatch.setattr(LiftBus, "write", write)
+    assert execute() == 2
+    assert "cool" in capsys.readouterr().out.lower()
+    assert not any(e[1:3] == ("write", "Torque_Enable") and e[-1] == 1 for e in rig[1][0].events)
+
+
+def test_nonfinite_homing_position_aborts_before_relief(rig, monkeypatch, capsys):
+    original = LiftBus.connect
+
+    def connect(bus, **kwargs):
+        original(bus, **kwargs)
+
+        def hook(register):
+            if register == "Present_Position" and bus.registers[("Goal_Velocity", "lift_axis")] > 0:
+                bus.read_sequences[(register, "lift_axis")] = [float("nan")]
+
+        bus.hook = hook
+
+    monkeypatch.setattr(LiftBus, "connect", connect)
+    assert execute() == 2
+    assert "telemetry" in capsys.readouterr().out.lower()
+    assert_stopped(rig[1][0])
+    assert not any(e[1:] == ("write", "Goal_Velocity", "lift_axis", -200) for e in rig[1][0].events)
+
+
+@pytest.mark.parametrize("fault,reason", [
+    ("slow_relief", "8.0s"), ("slow_telemetry", "gap"),
+    ("late_target", "8.0s"),
+    ("late_home", "timed out"),
+    ("settle_descent", "direction"), ("home_timeout", "timed out"),
+    ("stationary_motion", "motion"), ("fault_in_rest", "status"),
+])
+def test_remaining_time_and_stationary_bounds(rig, monkeypatch, capsys, fault, reason):
+    clock, buses, _ = rig
+    original = LiftBus.connect
+
+    def connect(bus, **kwargs):
+        original(bus, **kwargs)
+        if fault == "slow_relief":
+            bus.up_factor = 0.2
+        if fault == "late_target":
+            bus.up_factor = 0.302
+        if fault in ("home_timeout", "late_home"):
+            bus.bottom = 100000
+        stopped_reads = 0
+
+        def hook(register):
+            nonlocal stopped_reads
+            if fault == "late_home" and not bus.raised:
+                if register == "Present_Current" and clock.now >= 119.89:
+                    bus.read_sequences[(register, "lift_axis")] = [50]
+                if register == "Present_Temperature" and clock.now >= 119.94:
+                    clock.sleep(0.1)
+            if register != "Present_Temperature" or not bus.raised:
+                return
+            if fault == "slow_telemetry":
+                clock.sleep(0.6)
+            if bus.registers[("Goal_Velocity", "lift_axis")] != 0:
+                return
+            stopped_reads += 1
+            if fault == "settle_descent" and stopped_reads == 1:
+                bus.position += 100  # Two mm loss after zero, before rest.
+            if fault == "stationary_motion" and stopped_reads == 8:
+                bus.position -= 30
+            if fault == "fault_in_rest" and stopped_reads == 8:
+                bus.registers[("Status", "lift_axis")] = 4
+
+        bus.hook = hook
+
+    monkeypatch.setattr(LiftBus, "connect", connect)
+    assert execute() in (1, 2)
+    assert reason in capsys.readouterr().out.lower()
+    assert_stopped(buses[0])
+    assert clock.now < 122
+
+
+def test_gate_refusal_never_homes_or_enables_torque(rig, monkeypatch, capsys):
+    monkeypatch.setattr(builtins, "input", lambda _: "no")
+    assert execute() == 2
+    assert "authorize" in capsys.readouterr().out
+    assert not any(e[1:3] == ("write", "Torque_Enable") and e[-1] == 1 for e in rig[1][0].events)
+    assert_stopped(rig[1][0])
+
+
+def test_initial_position_baseline_must_be_finite_before_torque(rig, monkeypatch, capsys):
+    original = LiftBus.connect
+
+    def connect(bus, **kwargs):
+        original(bus, **kwargs)
+        bus.read_sequences[("Present_Position", "lift_axis")] = [float("nan")]
+
+    monkeypatch.setattr(LiftBus, "connect", connect)
+    assert execute() == 2
+    assert "telemetry" in capsys.readouterr().out.lower()
+    assert not any(e[1:3] == ("write", "Torque_Enable") and e[-1] == 1 for e in rig[1][0].events)
+    assert_stopped(rig[1][0])
+
+
+def test_unexpected_shutdown_exception_cannot_replace_primary_refusal(rig, monkeypatch, capsys):
+    monkeypatch.setattr(builtins, "input", lambda _: "no")
+    original = robot_module.AlohaMini._safe_shutdown
+
+    def shutdown(robot, **kwargs):
+        original(robot, **kwargs)
+        raise OSError("secondary shutdown failure")
+
+    monkeypatch.setattr(robot_module.AlohaMini, "_safe_shutdown", shutdown)
+    assert execute() == 2
+    output = capsys.readouterr().out
+    assert "authorize" in output and "secondary shutdown failure" in output
+    assert_stopped(rig[1][0])
+
+
+def test_second_sigint_cannot_interrupt_zero_torque_off_or_close(rig, monkeypatch, capsys):
+    original_connect = LiftBus.connect
+    original_write = LiftBus.write
+    previous_handler = signal.getsignal(signal.SIGINT)
+    interrupted = False
+
+    def connect(bus, **kwargs):
+        original_connect(bus, **kwargs)
+
+        def hook(register):
+            if bus.raised and register == "Present_Temperature":
+                raise OSError("primary relief telemetry failure")
+
+        bus.hook = hook
+
+    def write(bus, register, motor, value, **kwargs):
+        nonlocal interrupted
+        if bus.raised and motor.startswith("base_") and not interrupted:
+            interrupted = True
+            signal.raise_signal(signal.SIGINT)
+        original_write(bus, register, motor, value, **kwargs)
+
+    monkeypatch.setattr(LiftBus, "connect", connect)
+    monkeypatch.setattr(LiftBus, "write", write)
+    assert execute() == 2
+    assert "primary relief telemetry failure" in capsys.readouterr().out
+    assert interrupted and signal.getsignal(signal.SIGINT) is previous_handler
+    assert_stopped(rig[1][0])
+
+
+@pytest.mark.parametrize("failed_read", [OSError("secondary homing current read failed"), float("nan")])
+def test_homing_cannot_hide_a_fault_in_its_own_current_read(rig, monkeypatch, capsys, failed_read):
+    original_connect = LiftBus.connect
+
+    def connect(bus, **kwargs):
+        original_connect(bus, **kwargs)
+        current_reads = 0
+
+        def hook(register):
+            nonlocal current_reads
+            if register == "Present_Current" and bus.registers[("Goal_Velocity", "lift_axis")] > 0:
+                current_reads += 1
+                if current_reads % 2 == 0:
+                    bus.read_sequences[(register, "lift_axis")] = [failed_read]
+
+        bus.hook = hook
+
+    monkeypatch.setattr(LiftBus, "connect", connect)
+    assert execute() != 0
+    assert "current" in capsys.readouterr().out.lower()
+    assert not any(e[1:] == ("write", "Goal_Velocity", "lift_axis", -200) for e in rig[1][0].events)
+    assert_stopped(rig[1][0])
+
+
+@pytest.mark.parametrize("model", ["alohamini2", "alohamini2pro"])
+def test_opt_in_cannot_construct_am2_or_am2pro(rig, monkeypatch, model):
+    _, buses, _ = rig
+    monkeypatch.setattr(sys, "argv", ["host", "--robot_model", model, "--lift_relief"])
+    assert execute() == 2
+    assert not buses

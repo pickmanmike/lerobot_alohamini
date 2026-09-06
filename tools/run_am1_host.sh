@@ -21,7 +21,7 @@ readonly AM1_PI_INPUT="ee3a6f5dd813be82780a6a9b1789966357542d2f"
 
 usage() {
     printf '%s\n' \
-        'Usage: ./tools/run_am1_host.sh --mode arms|base|lift|local [--lift-diagnostics] [--print-command]' \
+        'Usage: ./tools/run_am1_host.sh --mode arms|base|lift|local [--lift-diagnostics|--lift-relief] [--print-command]' \
         '' \
         'Modes:' \
         '  arms  Start the physically validated AM1 arms host (no cameras, unhomed lift).' \
@@ -30,6 +30,7 @@ usage() {
         '  local Start both follower arms and the body bus, including one lift homing cycle.' \
         '' \
         '--lift-diagnostics adds a once-per-second read-only lift snapshot in Lift mode.' \
+        '--lift-relief selects the guarded, operator-gated lift-only home/10mm relief/45s check (no ZMQ).' \
         '--print-command prints the Python command without checking devices or starting the host.'
 }
 
@@ -46,6 +47,7 @@ quote_command() {
 mode=""
 print_command=false
 lift_diagnostics=false
+lift_relief=false
 while (($#)); do
     case "$1" in
         --mode)
@@ -59,6 +61,10 @@ while (($#)); do
             ;;
         --lift-diagnostics)
             lift_diagnostics=true
+            shift
+            ;;
+        --lift-relief)
+            lift_relief=true
             shift
             ;;
         --help|-h)
@@ -82,6 +88,10 @@ esac
 
 if [[ "$lift_diagnostics" == true && "$mode" != "lift" ]]; then
     die "--lift-diagnostics is only valid with --mode lift"
+    exit $?
+fi
+if [[ "$lift_relief" == true && ( "$mode" != "lift" || "$lift_diagnostics" == true ) ]]; then
+    die "--lift-relief requires --mode lift and cannot be combined with --lift-diagnostics"
     exit $?
 fi
 
@@ -123,6 +133,9 @@ elif [[ "$mode" == "lift" ]]; then
     )
     if [[ "$lift_diagnostics" == true ]]; then
         command+=(--profile_lift_diagnostics)
+    fi
+    if [[ "$lift_relief" == true ]]; then
+        command+=(--lift_relief)
     fi
 else
     command+=(
@@ -180,6 +193,8 @@ printf 'HOST_LOG=%s\n' "$log_path" | tee "$log_path" || {
     exit $?
 }
 {
+    printf 'HOST_SOURCE_BRANCH=%s\n' "$(git branch --show-current)"
+    printf 'HOST_SOURCE_HEAD=%s\n' "$(git rev-parse HEAD)"
     printf 'HOST_COMMAND='
     quote_command "${command[@]}"
 } | tee -a "$log_path" || {

@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import math
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -204,11 +205,15 @@ class LiftAxis:
         speed_raw: int | None = None,
         timeout_s: float | None = None,
         use_current: bool = True,
+        safety_check: Callable[[str, float], None] | None = None,
     ) -> LiftHomeResult:
         """Move downward to the hard stop and create a process-local zero reference.
 
         A successful home leaves zero velocity commanded and torque enabled for later
         height commands. Every unsuccessful exit attempts zero velocity and torque-off.
+        An optional owning-process diagnostic can refuse before torque or at each poll.
+        Its displacement is relative to homing start, in upward-positive millimeters;
+        the callback must not advance the axis position tracker itself.
         """
         if not self.enabled:
             raise RuntimeError("Cannot home a disabled lift axis.")
@@ -234,6 +239,8 @@ class LiftAxis:
             # the process-local tick accumulator for this homing attempt.
             self.configure(force=True)
             self._write_zero_velocity()
+            if safety_check is not None:
+                safety_check("before_torque", 0.0)
             set_torque_enabled(self._bus, (self.cfg.name,), enabled=True)
             write_register(self._bus, "Goal_Velocity", self.cfg.name, speed)
 
@@ -246,6 +253,8 @@ class LiftAxis:
 
                 time.sleep(min(self.cfg.home_poll_interval_s, timeout - elapsed_s))
                 moved_ticks = abs(self._update_extended_ticks())
+                if safety_check is not None:
+                    safety_check("homing", self._extended_deg() * self._mm_per_deg)
 
                 current_ma: float | None = None
                 if use_current:
@@ -258,9 +267,13 @@ class LiftAxis:
                                 num_retry=REGISTER_RETRIES,
                             )
                         )
+                        if safety_check is not None and not math.isfinite(raw_current):
+                            raise ValueError("Guarded lift homing current telemetry must be finite.")
                         current_ma = abs(raw_current * 6.5)
                         peak_current_ma = max(peak_current_ma, current_ma)
                     except Exception as error:
+                        if safety_check is not None:
+                            raise  # A diagnostic may not hide a fault in this second current read.
                         logger.debug("Lift homing current read failed; using motion stall fallback: %s", error)
 
                 current_stall = current_ma is not None and current_ma >= self.cfg.home_stall_current_ma

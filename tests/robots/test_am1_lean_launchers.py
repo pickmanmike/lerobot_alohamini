@@ -333,6 +333,25 @@ def test_host_runtime_pipeline_keeps_tee_alive_during_interrupt():
     ]
 
 
+def test_guarded_relief_launcher_is_explicit_lift_only_and_logs_source_identity():
+    def preview(*arguments):
+        return subprocess.run(
+            [BASH, str(HOST_HELPER), *arguments, "--print-command"],
+            cwd=REPO_ROOT, text=True, capture_output=True, timeout=30, check=False,
+        )
+
+    enabled = preview("--mode", "lift", "--lift-relief")
+    assert enabled.returncode == 0, enabled.stderr
+    assert "--lift_relief" in enabled.stdout
+    assert "--no_follower" in enabled.stdout and "--no_cameras" in enabled.stdout
+    assert "--skip_lift_home" not in enabled.stdout
+    assert "--lift_relief" not in preview("--mode", "lift").stdout
+    assert preview("--mode", "local", "--lift-relief").returncode == 2
+    assert preview("--mode", "lift", "--lift-relief", "--lift-diagnostics").returncode == 2
+    source = HOST_HELPER.read_text(encoding="utf-8")
+    assert "HOST_SOURCE_HEAD=" in source and "HOST_SOURCE_BRANCH=" in source
+
+
 def test_local_config_example_is_valid_and_real_config_is_ignored():
     config = json.loads(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
 

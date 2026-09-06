@@ -320,6 +320,10 @@ def make_parser() -> argparse.ArgumentParser:
             "mode, status, and process-height snapshot once per second (default: false)."
         ),
     )
+    parser.add_argument(
+        "--lift_relief", "--lift-relief", action="store_true",
+        help="Opt-in guarded AM1 lift-only home/10mm relief/45s rest comparison; no ZMQ host.",
+    )
     return parser
 
 
@@ -344,13 +348,23 @@ def connect_robot(robot: AlohaMini, *, skip_lift_home: bool) -> None:
 
 
 def main():
-    args = make_parser().parse_args()
+    parser = make_parser()
+    args = parser.parse_args()
+    if args.lift_relief and (
+        args.robot_model != "alohamini1" or not args.no_follower or not args.no_cameras or args.skip_lift_home
+    ):
+        parser.error("--lift_relief requires AM1, --no_follower, --no_cameras, and homing enabled.")
 
     logging.info("Configuring AlohaMini")
     robot_config = make_robot_config(args)
     if args.no_follower:
         logging.info("no_follower mode: follower arms will not connect, only base and lift operate.")
     robot = AlohaMini(robot_config)
+
+    if args.lift_relief:
+        from .lift_relief import run_lift_relief
+
+        raise SystemExit(run_lift_relief(robot))
 
     primary_error: BaseException | None = None
     interrupted_motor_io = False

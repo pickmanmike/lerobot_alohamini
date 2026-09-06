@@ -172,6 +172,34 @@ def event_index(events: list[tuple], expected: tuple) -> int:
     return next(index for index, event in enumerate(events) if event == expected)
 
 
+def test_optional_home_safety_check_can_refuse_before_torque_or_during_motion(monkeypatch):
+    from lerobot.robots.alohamini import lift_axis as module
+
+    monkeypatch.setattr(module.time, "sleep", lambda _: None)
+    for refuse_phase in ("before_torque", "homing"):
+        events = []
+        bus = FakeBus("left", ("lift_axis",), events)
+        lift = LiftAxis(LiftAxisConfig(home_down_speed=200), bus, None)
+        primary = RuntimeError("diagnostic temperature ceiling")
+        calls = []
+
+        def guard(phase, displacement_mm):
+            calls.append((phase, displacement_mm))
+            if phase == refuse_phase:
+                raise primary
+
+        with pytest.raises(RuntimeError, match="diagnostic temperature ceiling") as caught:
+            lift.home(safety_check=guard)
+
+        assert caught.value is primary
+        assert calls[0] == ("before_torque", 0.0)
+        assert not lift.is_homed
+        assert bus.registers[("Goal_Velocity", "lift_axis")] == 0
+        assert bus.registers[("Torque_Enable", "lift_axis")] == 0
+        enables = [e for e in events if e[1:] == ("write", "Torque_Enable", "lift_axis", 1)]
+        assert len(enables) == (0 if refuse_phase == "before_torque" else 1)
+
+
 def test_arm_goals_are_seeded_from_raw_positions_before_torque_enable():
     robot, _, _, events = make_activation_robot()
 
