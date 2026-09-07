@@ -13,6 +13,7 @@ import pytest
 from lerobot.robots.alohamini import alohamini as robot_module
 from lerobot.robots.alohamini import alohamini_host as host
 from lerobot.robots.alohamini import lift_axis
+from lerobot.robots.alohamini import lift_relief
 from tests.robots.test_alohamini_safe_bringup import FakeBus
 
 
@@ -388,10 +389,432 @@ def test_motion_and_rest_aborts_converge_on_zero_torque_off_and_close(rig, monke
     if fault == "high_idle_current":
         samples = [json.loads(line.split("] ", 1)[1]) for line in output.splitlines()
                    if line.startswith("[LIFT RELIEF] ")]
-        assert sum(s.get("phase") == "rest" and s["present_current_ma"] >= 200 for s in samples) == 3
+        high = [
+            sample
+            for sample in samples
+            if sample.get("phase") == "rest" and sample["present_current_ma"] >= 200
+        ]
+        # The third physical sample is emitted once normally and once with its
+        # explicit refusal reason; it is still exactly three sampled instants.
+        assert len({sample["elapsed_s"] for sample in high}) == 3
+        assert sum(sample.get("rejected", False) for sample in high) == 1
     assert clock.now < 112
     assert_stopped(buses[0])
     assert sum(e[1:] == ("write", "Goal_Velocity", "lift_axis", -200) for e in buses[0].events) <= 1
+
+
+def test_rejected_temperature_sample_is_emitted_inside_report_throttle(rig, monkeypatch, capsys):
+    clock, buses, _ = rig
+    original = LiftBus.connect
+
+    def connect(bus, **kwargs):
+        original(bus, **kwargs)
+        homing_temperature_reads = 0
+
+        def hook(register):
+            nonlocal homing_temperature_reads
+            if register != "Present_Temperature":
+                return
+            if bus.registers[("Goal_Velocity", "lift_axis")] != 200:
+                return
+            homing_temperature_reads += 1
+            if homing_temperature_reads == 2:
+                bus.registers[("Present_Temperature", "lift_axis")] = 93
+
+        bus.hook = hook
+
+    monkeypatch.setattr(LiftBus, "connect", connect)
+
+    assert execute() == 2
+    records = reports(capsys)
+    rejected = [record for record in records if record.get("rejected")]
+    assert rejected[-1]["phase"] == "homing"
+    assert rejected[-1]["present_temperature_raw"] == 93
+    assert rejected[-1]["temperature_c"] == 93
+    assert "diagnostic ceiling 55 C" in rejected[-1]["rejection_reason"]
+    normal_homing = [
+        record
+        for record in records
+        if record.get("phase") == "homing" and not record.get("rejected")
+    ]
+    assert normal_homing[-1]["present_temperature_raw"] == 30
+    assert rejected[-1]["elapsed_s"] - normal_homing[-1]["elapsed_s"] < 1.0
+    assert not any(record.get("phase") == "home_complete" for record in records)
+    assert_stopped(buses[0])
+    assert clock.now < 103
+
+
+def test_rejected_sample_includes_diagnostic_sdk_request_reply_trace(rig, monkeypatch, capsys):
+    _, buses, _ = rig
+    original = LiftBus.connect
+    homing_temperature_reads = 0
+
+    def connect(bus, **kwargs):
+        original(bus, **kwargs)
+        bus.packet_handler = object()
+
+    def verified_read(bus, register, motor):
+        nonlocal homing_temperature_reads
+        value = bus.read(register, motor, normalize=False, num_retry=0)
+        if register == "Present_Temperature" and bus.registers[("Goal_Velocity", motor)] == 200:
+            homing_temperature_reads += 1
+            if homing_temperature_reads == 2:
+                value = 93
+        return int(value), {
+            "register": register,
+            "address": 63 if register == "Present_Temperature" else 0,
+            "requested_width": 1,
+            "requested_id": 11,
+            "response_bytes": [255, 255, 11, 3, 0, int(value), 0],
+            "response_length": 7,
+            "response_id": 11,
+            "sdk_servo_error": 0,
+            "response_error": 0,
+            "checksum_ok": True,
+            "elapsed_ms": 0.1,
+            "request_correlation": "id_length_checksum_only",
+        }
+
+    monkeypatch.setattr(LiftBus, "connect", connect)
+    monkeypatch.setattr(lift_relief, "read_diagnostic_scalar", verified_read)
+
+    assert execute() == 2
+    rejected = [record for record in reports(capsys) if record.get("rejected")]
+    temperature_trace = [
+        trace for trace in rejected[-1]["read_traces"] if trace["register"] == "Present_Temperature"
+    ]
+    assert rejected[-1]["present_temperature_raw"] == 93
+    assert temperature_trace[-1]["response_bytes"][5] == 93
+    assert temperature_trace[-1]["request_correlation"] == "id_length_checksum_only"
+    assert not any(e[1:3] == ("write", "Goal_Velocity") and e[-1] < 0 for e in buses[0].events)
+    assert_stopped(buses[0])
+
+
+def test_post_sample_goal_refusal_is_emitted_inside_report_throttle(rig, monkeypatch, capsys):
+    _, buses, _ = rig
+    original = LiftBus.connect
+    homing_goal_reads = 0
+
+    def connect(bus, **kwargs):
+        original(bus, **kwargs)
+        bus.packet_handler = object()
+
+    def verified_read(bus, register, motor):
+        nonlocal homing_goal_reads
+        value = bus.read(register, motor, normalize=False, num_retry=0)
+        if register == "Goal_Velocity" and bus.registers[(register, motor)] == 200:
+            homing_goal_reads += 1
+            if homing_goal_reads == 2:
+                value = 0
+        return int(value), {
+            "register": register,
+            "address": 46 if register == "Goal_Velocity" else 0,
+            "requested_width": 2,
+            "requested_id": 11,
+            "response_bytes": [255, 255, 11, 4, 0, int(value) & 0xFF, int(value) >> 8, 0],
+            "response_length": 8,
+            "response_id": 11,
+            "response_error": 0,
+            "sdk_servo_error": 0,
+            "checksum_ok": True,
+            "elapsed_ms": 0.1,
+            "request_correlation": "id_length_checksum_only",
+        }
+
+    monkeypatch.setattr(LiftBus, "connect", connect)
+    monkeypatch.setattr(lift_relief, "read_diagnostic_scalar", verified_read)
+
+    assert execute() == 2
+    records = reports(capsys)
+    rejected = [record for record in records if record.get("rejected")]
+    normal_homing = [
+        record for record in records if record.get("phase") == "homing" and not record.get("rejected")
+    ]
+    assert rejected[-1]["phase"] == "homing"
+    assert rejected[-1]["goal_velocity_raw"] == 0
+    assert "unexpected torque/goal velocity" in rejected[-1]["rejection_reason"]
+    goal_trace = [trace for trace in rejected[-1]["read_traces"] if trace["register"] == "Goal_Velocity"]
+    assert goal_trace[-1]["response_bytes"][5] == 0
+    assert rejected[-1]["elapsed_s"] - normal_homing[-1]["elapsed_s"] < 1.0
+    assert_stopped(buses[0])
+
+
+def test_configuration_transport_refusal_emits_the_rejected_reply_trace(rig, monkeypatch, capsys):
+    _, buses, _ = rig
+    original = LiftBus.connect
+    failed = False
+
+    def connect(bus, **kwargs):
+        original(bus, **kwargs)
+        bus.packet_handler = object()
+
+    def verified_read(bus, register, motor):
+        nonlocal failed
+        if register == "Model_Number" and not failed:
+            failed = True
+            raise lift_relief.DiagnosticReadError(
+                "Response checksum could not be verified.",
+                {
+                    "register": register,
+                    "address": 0,
+                    "requested_width": 2,
+                    "requested_id": 11,
+                    "response_bytes": [255, 255, 11, 4, 0, 9, 3, 0],
+                    "response_length": 8,
+                    "response_id": 11,
+                    "sdk_servo_error": 0,
+                    "response_error": 0,
+                    "checksum_ok": False,
+                    "elapsed_ms": 0.1,
+                    "request_correlation": "id_length_checksum_only",
+                },
+            )
+        value = bus.read(register, motor, normalize=False, num_retry=0)
+        return int(value), {"register": register, "checksum_ok": True}
+
+    monkeypatch.setattr(LiftBus, "connect", connect)
+    monkeypatch.setattr(lift_relief, "read_diagnostic_scalar", verified_read)
+
+    assert execute() == 2
+    rejected = [record for record in reports(capsys) if record.get("rejected")]
+    assert rejected[-1]["phase"] == "configuration"
+    assert "Configuration telemetry failed" in rejected[-1]["rejection_reason"]
+    assert rejected[-1]["read_traces"][-1]["register"] == "Model_Number"
+    assert rejected[-1]["read_traces"][-1]["checksum_ok"] is False
+    assert_stopped(buses[0])
+
+
+def test_guarded_diagnostic_routes_lift_position_and_current_through_verified_reader(
+    rig, monkeypatch, capsys
+):
+    _, buses, _ = rig
+    original = LiftBus.connect
+    verified_reads = Counter()
+
+    def connect(bus, **kwargs):
+        original(bus, **kwargs)
+        bus.packet_handler = object()
+
+    def verified_read(bus, register, motor):
+        verified_reads[register] += 1
+        value = bus.read(register, motor, normalize=False, num_retry=0)
+        return int(value), {
+            "register": register,
+            "address": 0,
+            "requested_width": 1,
+            "requested_id": 11,
+            "response_bytes": [],
+            "response_length": 0,
+            "response_id": 11,
+            "sdk_servo_error": 0,
+            "response_error": 0,
+            "checksum_ok": True,
+            "elapsed_ms": 0.1,
+            "request_correlation": "id_length_checksum_only",
+        }
+
+    monkeypatch.setattr(LiftBus, "connect", connect)
+    monkeypatch.setattr(lift_relief, "read_diagnostic_scalar", verified_read)
+
+    assert execute() == 0
+    capsys.readouterr()
+    bus_reads = Counter(event[2] for event in buses[0].events if event[1] == "read")
+    assert verified_reads["Present_Position"] == bus_reads["Present_Position"] > 0
+    assert verified_reads["Present_Current"] == bus_reads["Present_Current"] > 0
+    assert_stopped(buses[0])
+
+
+def test_homing_position_transport_refusal_emits_the_rejected_reply_trace(rig, monkeypatch, capsys):
+    _, buses, _ = rig
+    original = LiftBus.connect
+
+    def connect(bus, **kwargs):
+        original(bus, **kwargs)
+        bus.packet_handler = object()
+
+    def verified_read(bus, register, motor):
+        if register == "Present_Position" and bus.registers[("Goal_Velocity", motor)] == 200:
+            raise lift_relief.DiagnosticReadError(
+                "Response payload length 1 did not match requested 2.",
+                {
+                    "register": register,
+                    "address": 56,
+                    "requested_width": 2,
+                    "requested_id": 11,
+                    "response_bytes": [255, 255, 11, 3, 0, 93, 147],
+                    "response_length": 7,
+                    "response_id": 11,
+                    "response_payload_length": 1,
+                    "sdk_servo_error": 0,
+                    "response_error": 0,
+                    "checksum_ok": True,
+                    "elapsed_ms": 0.1,
+                    "request_correlation": "id_length_checksum_only",
+                },
+            )
+        value = bus.read(register, motor, normalize=False, num_retry=0)
+        return int(value), {"register": register, "checksum_ok": True}
+
+    monkeypatch.setattr(LiftBus, "connect", connect)
+    monkeypatch.setattr(lift_relief, "read_diagnostic_scalar", verified_read)
+
+    assert execute() == 2
+    records = reports(capsys)
+    rejected = [record for record in records if record.get("rejected")]
+    assert rejected[-1]["phase"] == "homing_read"
+    assert rejected[-1]["read_traces"][-1]["register"] == "Present_Position"
+    assert rejected[-1]["read_traces"][-1]["response_payload_length"] == 1
+    assert not any(record.get("phase") == "home_complete" for record in records)
+    assert_stopped(buses[0])
+
+
+def test_cleanup_transport_trace_is_retained_without_replacing_primary_refusal(rig, monkeypatch, capsys):
+    _, buses, _ = rig
+    original = LiftBus.connect
+    hot_sample_finished = False
+    injected_high = False
+    cleanup_failed = False
+
+    def connect(bus, **kwargs):
+        original(bus, **kwargs)
+        bus.packet_handler = object()
+
+    def verified_read(bus, register, motor):
+        nonlocal cleanup_failed, hot_sample_finished, injected_high
+        if hot_sample_finished and register == "Torque_Enable" and not cleanup_failed:
+            cleanup_failed = True
+            raise lift_relief.DiagnosticReadError(
+                "Response checksum could not be verified.",
+                {
+                    "register": register,
+                    "address": 40,
+                    "requested_width": 1,
+                    "requested_id": 11,
+                    "response_bytes": [255, 255, 11, 3, 0, 0, 1],
+                    "response_length": 7,
+                    "response_id": 11,
+                    "response_error": 0,
+                    "sdk_servo_error": 0,
+                    "checksum_ok": False,
+                    "elapsed_ms": 0.1,
+                    "request_correlation": "id_length_checksum_only",
+                },
+            )
+        value = bus.read(register, motor, normalize=False, num_retry=0)
+        if register == "Present_Temperature" and bus.registers[("Goal_Velocity", motor)] == 200:
+            value = 93
+            injected_high = True
+        if register == "Present_Load" and injected_high:
+            hot_sample_finished = True
+        return int(value), {"register": register, "checksum_ok": True}
+
+    monkeypatch.setattr(LiftBus, "connect", connect)
+    monkeypatch.setattr(lift_relief, "read_diagnostic_scalar", verified_read)
+
+    assert execute() == 2
+    output = capsys.readouterr().out
+    records = [
+        json.loads(line.split("] ", 1)[1])
+        for line in output.splitlines()
+        if line.startswith("[LIFT RELIEF] ")
+    ]
+    cleanup_rejections = [
+        record
+        for record in records
+        if record.get("phase") == "cleanup_readback" and record.get("rejected")
+    ]
+    assert cleanup_rejections[-1]["read_traces"][-1]["register"] == "Torque_Enable"
+    assert cleanup_rejections[-1]["read_traces"][-1]["checksum_ok"] is False
+    assert "LIFT_RELIEF_REFUSED: homing: temperature 93 C" in output
+    assert "Cleanup detail:" in output
+    assert_stopped(buses[0])
+
+
+def test_torque_off_readback_check_never_homes_or_sends_nonzero_goal(rig, monkeypatch, capsys):
+    clock, buses, robots = rig
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "alohamini_host",
+            "--robot_model",
+            "alohamini1",
+            "--no_follower",
+            "--no_cameras",
+            "--lift_readback",
+        ],
+    )
+
+    assert execute() == 0
+    output = capsys.readouterr().out
+    records = [
+        json.loads(line.split("] ", 1)[1])
+        for line in output.splitlines()
+        if line.startswith("[LIFT RELIEF] ")
+    ]
+    readbacks = [record for record in records if record.get("phase") == "readback"]
+    assert len(readbacks) >= 30
+    assert readbacks[-1]["elapsed_s"] - readbacks[0]["elapsed_s"] >= 2.9
+    assert all(record["torque_enable"] == 0 for record in readbacks)
+    assert all(record["goal_velocity_raw"] == 0 for record in readbacks)
+    assert all(abs(record["present_velocity_raw"]) <= 5 for record in readbacks)
+    assert "LIFT_READBACK_PASS" in output
+    assert not robots[0].lift.is_homed
+    assert not any(
+        event[1] == "write" and event[-1] != 0
+        for event in buses[0].events
+    )
+    assert_stopped(buses[0])
+    assert 103 <= clock.now < 104
+
+
+def test_torque_off_readback_preserves_anomalous_sample_and_refuses(rig, monkeypatch, capsys):
+    _, buses, robots = rig
+    original = LiftBus.connect
+
+    def connect(bus, **kwargs):
+        original(bus, **kwargs)
+        temperature_reads = 0
+
+        def hook(register):
+            nonlocal temperature_reads
+            if register != "Present_Temperature":
+                return
+            temperature_reads += 1
+            if temperature_reads == 3:
+                bus.registers[("Present_Temperature", "lift_axis")] = 93
+
+        bus.hook = hook
+
+    monkeypatch.setattr(LiftBus, "connect", connect)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "alohamini_host",
+            "--robot_model",
+            "alohamini1",
+            "--no_follower",
+            "--no_cameras",
+            "--lift_readback",
+        ],
+    )
+
+    assert execute() == 2
+    output = capsys.readouterr().out
+    records = [
+        json.loads(line.split("] ", 1)[1])
+        for line in output.splitlines()
+        if line.startswith("[LIFT RELIEF] ")
+    ]
+    rejected = [record for record in records if record.get("rejected")]
+    assert rejected[-1]["phase"] == "readback"
+    assert rejected[-1]["present_temperature_raw"] == 93
+    assert "diagnostic ceiling 55 C" in rejected[-1]["rejection_reason"]
+    assert "LIFT_READBACK_REFUSED" in output
+    assert not robots[0].lift.is_homed
+    assert not any(event[1] == "write" and event[-1] != 0 for event in buses[0].events)
+    assert_stopped(buses[0])
 
 
 def test_primary_refusal_survives_a_real_cleanup_write_failure(rig, monkeypatch, capsys):
@@ -586,8 +1009,9 @@ def test_homing_cannot_hide_a_fault_in_its_own_current_read(rig, monkeypatch, ca
 
 
 @pytest.mark.parametrize("model", ["alohamini2", "alohamini2pro"])
-def test_opt_in_cannot_construct_am2_or_am2pro(rig, monkeypatch, model):
+@pytest.mark.parametrize("flag", ["--lift_relief", "--lift_readback"])
+def test_opt_in_cannot_construct_am2_or_am2pro(rig, monkeypatch, model, flag):
     _, buses, _ = rig
-    monkeypatch.setattr(sys, "argv", ["host", "--robot_model", model, "--lift_relief"])
+    monkeypatch.setattr(sys, "argv", ["host", "--robot_model", model, flag])
     assert execute() == 2
     assert not buses

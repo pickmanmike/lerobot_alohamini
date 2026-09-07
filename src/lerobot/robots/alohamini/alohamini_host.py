@@ -324,6 +324,10 @@ def make_parser() -> argparse.ArgumentParser:
         "--lift_relief", "--lift-relief", action="store_true",
         help="Opt-in guarded AM1 lift-only home/10mm relief/45s rest comparison; no ZMQ host.",
     )
+    parser.add_argument(
+        "--lift_readback", "--lift-readback", action="store_true",
+        help="Opt-in three-second AM1 lift torque-off telemetry check; no homing, motion, or ZMQ host.",
+    )
     return parser
 
 
@@ -350,10 +354,21 @@ def connect_robot(robot: AlohaMini, *, skip_lift_home: bool) -> None:
 def main():
     parser = make_parser()
     args = parser.parse_args()
+    if args.lift_relief and args.lift_readback:
+        parser.error("--lift_relief and --lift_readback are mutually exclusive.")
     if args.lift_relief and (
         args.robot_model != "alohamini1" or not args.no_follower or not args.no_cameras or args.skip_lift_home
     ):
         parser.error("--lift_relief requires AM1, --no_follower, --no_cameras, and homing enabled.")
+    if args.lift_readback and (
+        args.robot_model != "alohamini1"
+        or not args.no_follower
+        or not args.no_cameras
+        or args.skip_lift_home
+    ):
+        parser.error(
+            "--lift_readback requires AM1, --no_follower, --no_cameras, and the owning lift process."
+        )
 
     logging.info("Configuring AlohaMini")
     robot_config = make_robot_config(args)
@@ -365,6 +380,10 @@ def main():
         from .lift_relief import run_lift_relief
 
         raise SystemExit(run_lift_relief(robot))
+    if args.lift_readback:
+        from .lift_relief import run_lift_readback
+
+        raise SystemExit(run_lift_readback(robot))
 
     primary_error: BaseException | None = None
     interrupted_motor_io = False

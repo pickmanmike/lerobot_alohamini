@@ -21,7 +21,7 @@ readonly AM1_PI_INPUT="ee3a6f5dd813be82780a6a9b1789966357542d2f"
 
 usage() {
     printf '%s\n' \
-        'Usage: ./tools/run_am1_host.sh --mode arms|base|lift|local [--lift-diagnostics|--lift-relief] [--print-command]' \
+        'Usage: ./tools/run_am1_host.sh --mode arms|base|lift|local [--lift-diagnostics|--lift-relief|--lift-readback] [--print-command]' \
         '' \
         'Modes:' \
         '  arms  Start the physically validated AM1 arms host (no cameras, unhomed lift).' \
@@ -31,6 +31,7 @@ usage() {
         '' \
         '--lift-diagnostics adds a once-per-second read-only lift snapshot in Lift mode.' \
         '--lift-relief selects the guarded, operator-gated lift-only home/10mm relief/45s check (no ZMQ).' \
+        '--lift-readback selects a three-second torque-off-only lift telemetry check (no homing, motion, or ZMQ).' \
         '--print-command prints the Python command without checking devices or starting the host.'
 }
 
@@ -48,6 +49,7 @@ mode=""
 print_command=false
 lift_diagnostics=false
 lift_relief=false
+lift_readback=false
 while (($#)); do
     case "$1" in
         --mode)
@@ -65,6 +67,10 @@ while (($#)); do
             ;;
         --lift-relief)
             lift_relief=true
+            shift
+            ;;
+        --lift-readback)
+            lift_readback=true
             shift
             ;;
         --help|-h)
@@ -92,6 +98,10 @@ if [[ "$lift_diagnostics" == true && "$mode" != "lift" ]]; then
 fi
 if [[ "$lift_relief" == true && ( "$mode" != "lift" || "$lift_diagnostics" == true ) ]]; then
     die "--lift-relief requires --mode lift and cannot be combined with --lift-diagnostics"
+    exit $?
+fi
+if [[ "$lift_readback" == true && ( "$mode" != "lift" || "$lift_diagnostics" == true || "$lift_relief" == true ) ]]; then
+    die "--lift-readback requires --mode lift and cannot be combined with another lift diagnostic"
     exit $?
 fi
 
@@ -136,6 +146,9 @@ elif [[ "$mode" == "lift" ]]; then
     fi
     if [[ "$lift_relief" == true ]]; then
         command+=(--lift_relief)
+    fi
+    if [[ "$lift_readback" == true ]]; then
+        command+=(--lift_readback)
     fi
 else
     command+=(
