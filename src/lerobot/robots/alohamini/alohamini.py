@@ -17,6 +17,7 @@
 import logging
 import sys
 import time
+from collections.abc import Callable
 from functools import cached_property
 from itertools import chain
 from typing import Any
@@ -542,6 +543,7 @@ class AlohaMini(Robot):
         *,
         close_buses: bool,
         recover_interrupted_bus_io: bool = False,
+        motor_shutdown_check: Callable[[], None] | None = None,
     ) -> list[str]:
         """Best-effort zero, torque-off, camera close, and optional bus close.
 
@@ -583,6 +585,12 @@ class AlohaMini(Robot):
                     set_torque_enabled(bus, (name,), enabled=False)
                 except Exception as error:
                     errors.append(f"disable {bus_name}/{name}: {error}")
+
+        if motor_shutdown_check is not None:
+            try:
+                motor_shutdown_check()
+            except Exception as error:
+                errors.append(f"verify final motor shutdown state: {error}")
 
         for name, camera in self.cameras.items():
             if not camera.is_connected:

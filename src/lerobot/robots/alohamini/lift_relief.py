@@ -142,16 +142,58 @@ class ReliefCheck:
         if data["torque_enable"] != torque or data["goal_velocity_raw"] != goal:
             raise ReliefRefusal(f"{data['phase']}: unexpected torque/goal velocity readback.")
 
+    @staticmethod
+    def expect_stationary(data: dict) -> None:
+        if data["goal_velocity_raw"] != 0 or abs(data["present_velocity_raw"]) > STILL_VELOCITY_RAW:
+            raise ReliefRefusal(f"{data['phase']}: expected zero goal velocity and a stationary carriage.")
+
+    def final_torque_off_before_motion(self, displacement_mm: float) -> None:
+        # This must be the last setup write. set_torque_enabled(False) is not
+        # suitable here because it writes Lock after Torque_Enable.
+        try:
+            write_register(self.robot.left_bus, "Torque_Enable", self.robot.lift.cfg.name, 0)
+        except Exception as error:
+            raise ReliefRefusal(f"before_torque: final torque-off request failed: {error}") from error
+        data = self.sample("before_torque", displacement_mm=displacement_mm, force=True)
+        self.expect(data, torque=0, goal=0)
+        self.expect_stationary(data)
+        if data["temperature_c"] > COOL_START_C:
+            raise ReliefRefusal("Start must still be cool immediately before lift torque activation.")
+
+    def cleanup_readback(self) -> None:
+        # The ordinary safe shutdown writes Torque_Enable=0 and then Lock=0.
+        # End this diagnostic with Torque_Enable itself, then prove torque and
+        # velocity-target state before the owning bus is closed.
+        write_register(self.robot.left_bus, "Torque_Enable", self.robot.lift.cfg.name, 0)
+        record = {
+            "phase": "cleanup_readback",
+            "elapsed_s": round(time.monotonic() - self.start, 3),
+            "wall_time_ns": time.time_ns(),
+            "torque_enable": self.raw("Torque_Enable"),
+            "goal_velocity_raw": self.raw("Goal_Velocity"),
+            "present_velocity_raw": self.raw("Present_Velocity"),
+        }
+        self.emit(record)
+        if record["torque_enable"] != 0 or record["goal_velocity_raw"] != 0:
+            raise ReliefRefusal("cleanup_readback: final torque/goal velocity readback was not zero.")
+
     def home_guard(self, phase: str, displacement_mm: float) -> None:
         if not math.isfinite(displacement_mm) or not math.isfinite(self.robot.lift._last_tick):
             raise ReliefRefusal("homing: nonfinite position telemetry.")
-        data = self.sample(phase, displacement_mm=displacement_mm)
-        self.expect(data, torque=int(phase == "homing"), goal=200 if phase == "homing" else 0)
-        if phase == "before_torque" and data["temperature_c"] > COOL_START_C:
-            raise ReliefRefusal("Start must still be cool immediately before lift torque activation.")
         if phase == "before_torque":
+            # Observe the state left by configure() and its final zero write,
+            # without attributing any side effect to a particular register.
+            data = self.sample("setup_after_writes", displacement_mm=displacement_mm, force=True)
+            self.expect_stationary(data)
+            if data["temperature_c"] > COOL_START_C:
+                raise ReliefRefusal("Start must still be cool immediately before lift torque activation.")
+            self.final_torque_off_before_motion(displacement_mm)
             self.home_started = time.monotonic()
-        elif time.monotonic() - self.home_started >= self.robot.lift.cfg.home_timeout_s:
+            return
+
+        data = self.sample(phase, displacement_mm=displacement_mm)
+        self.expect(data, torque=1, goal=200)
+        if time.monotonic() - self.home_started >= self.robot.lift.cfg.home_timeout_s:
             raise ReliefRefusal("homing: timed out during guarded telemetry.")
         if displacement_mm > 0.5 or data["present_velocity_raw"] < -STILL_VELOCITY_RAW:
             raise ReliefRefusal("homing: unexpected upward direction.")
@@ -183,6 +225,9 @@ class ReliefCheck:
         for motor in self.robot.base_motors:
             write_register(self.robot.left_bus, "Goal_Velocity", motor, 0)
         set_torque_enabled(self.robot.left_bus, self.robot.base_motors, enabled=False)
+        setup_before = self.sample("setup_before", force=True)
+        self.expect(setup_before, torque=0, goal=0)
+        self.expect_stationary(setup_before)
         result = self.robot.lift.home(safety_check=self.home_guard)
         if time.monotonic() - self.home_started >= self.robot.lift.cfg.home_timeout_s:
             raise ReliefRefusal("homing: timed out before guarded completion.")
@@ -232,13 +277,14 @@ class ReliefCheck:
 def run_lift_relief(robot: AlohaMini) -> int:
     """Run once and always use the existing zero/torque-off/bus-close cleanup."""
     primary: BaseException | None = None
+    check = ReliefCheck(robot)
     try:
         # Connect the owning bus only: ordinary robot.connect/configure would activate
         # before cold telemetry and overwrite the settings this comparison must read.
         # The diagnostic itself reads and validates the actual model/firmware below;
         # avoid a second firmware sweep by the ordinary multi-motor handshake.
         robot.left_bus.connect(handshake=False)
-        ReliefCheck(robot).compare()
+        check.compare()
     except BaseException as error:
         primary = error
     finally:
@@ -249,7 +295,11 @@ def run_lift_relief(robot: AlohaMini) -> int:
         previous_sigint = signal.signal(signal.SIGINT, signal.SIG_IGN)
         try:
             try:
-                errors = robot._safe_shutdown(close_buses=True, recover_interrupted_bus_io=primary is not None)
+                errors = robot._safe_shutdown(
+                    close_buses=True,
+                    recover_interrupted_bus_io=primary is not None,
+                    motor_shutdown_check=check.cleanup_readback,
+                )
             except BaseException as error:
                 errors = [f"shutdown also failed: {type(error).__name__}: {error}"]
         finally:

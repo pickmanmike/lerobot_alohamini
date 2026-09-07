@@ -38,6 +38,10 @@ class LiftBus(FakeBus):
         self.up_factor = 1.0
         self.rest_current = 8
         self.raised = False
+        self.setup_torque_side_effect: str | None = None
+        self.ineffective_torque_off_numbers: set[int] = set()
+        self.torque_off_failures: dict[int, tuple[BaseException, bool]] = {}
+        self.torque_off_writes = 0
         self.hook = lambda register: None
         self.registers.update({
             (name, "lift_axis"): value for name, value in {
@@ -75,6 +79,31 @@ class LiftBus(FakeBus):
                 self.rest_current if self.raised and stopped else 50 if stopped and torque else 5
             )
         return super().read(register, motor, **kwargs)
+
+    def write(self, register, motor, value, **kwargs):
+        int_value = int(value)
+        conditional_failure = None
+        if motor == "lift_axis" and register == "Torque_Enable" and int_value == 0:
+            self.torque_off_writes += 1
+            conditional_failure = self.torque_off_failures.get(self.torque_off_writes)
+            if conditional_failure is not None:
+                self.write_failures[(register, motor, int_value)] = conditional_failure
+        try:
+            super().write(register, motor, int_value, **kwargs)
+        finally:
+            if conditional_failure is not None:
+                del self.write_failures[(register, motor, int_value)]
+        if motor != "lift_axis":
+            return
+        if register == "Torque_Enable" and int_value == 0:
+            if self.torque_off_writes in self.ineffective_torque_off_numbers:
+                self.registers[("Torque_Enable", motor)] = 1
+        # These are deliberately fake side-effect models, not claims about
+        # which setup write changed the real servo's torque state.
+        if register == self.setup_torque_side_effect and (
+            register != "Goal_Velocity" or int_value == 0
+        ):
+            self.registers[("Torque_Enable", motor)] = 1
 
 
 @pytest.fixture
@@ -137,14 +166,20 @@ def test_relief_homes_once_moves_up_ten_mm_then_observes_45_seconds_and_cleans_u
     assert sum(e[2:] == ("Goal_Velocity", "lift_axis", -200) for e in writes) == 1
     assert all(e[-1] == 0 for e in writes if e[3].startswith("base_"))
     assert {e[2] for e in writes} <= {"Goal_Velocity", "Torque_Enable", "Lock", "Operating_Mode"}
+    lift_writes = [event for event in writes if event[3] == "lift_axis"]
+    assert lift_writes[-1][2:] == ("Torque_Enable", "lift_axis", 0)
     assert_stopped(bus)
     assert robot.lift.cfg.descent_floor_mm == 5.0
     assert robot.lift._z0_deg < 0  # Original bottom reference survives the relief move.
-    observations = [r for r in reports(capsys) if r.get("phase") == "rest"]
+    records = reports(capsys)
+    observations = [r for r in records if r.get("phase") == "rest"]
     assert len(observations) >= 45
     assert all(10 <= r["height_mm"] <= 12 for r in observations)
     assert observations[-1]["elapsed_s"] - observations[0]["elapsed_s"] >= 44
     assert all(r["goal_velocity_raw"] == r["present_velocity_raw"] == 0 for r in observations)
+    cleanup = [r for r in records if r.get("phase") == "cleanup_readback"]
+    assert len(cleanup) == 1
+    assert cleanup[0]["torque_enable"] == cleanup[0]["goal_velocity_raw"] == 0
     assert 145 <= clock.now <= 165
     reads = Counter(e[2] for e in bus.events if e[1] == "read")
     for name in ("Firmware_Major_Version", "Firmware_Minor_Version", "Max_Temperature_Limit",
@@ -152,6 +187,127 @@ def test_relief_homes_once_moves_up_ten_mm_then_observes_45_seconds_and_cleans_u
                  "Velocity_closed_loop_I_integral_coefficient", "Maximum_Velocity_Limit"):
         assert reads[name] == 1
     assert reads["Phase"] == 0
+
+
+@pytest.mark.parametrize("setup_register", ["Goal_Velocity", "Operating_Mode"])
+def test_setup_side_effect_models_are_reasserted_off_after_all_setup_writes(
+    rig, monkeypatch, capsys, setup_register
+):
+    _, buses, _ = rig
+    original = LiftBus.connect
+
+    def connect(bus, **kwargs):
+        original(bus, **kwargs)
+        bus.setup_torque_side_effect = setup_register
+
+    monkeypatch.setattr(LiftBus, "connect", connect)
+    assert execute() == 0
+    bus = buses[0]
+    phase = {record["phase"]: record for record in reports(capsys)}
+    assert phase["setup_before"]["torque_enable"] == 0
+    assert phase["setup_after_writes"]["torque_enable"] == 1
+    assert phase["before_torque"]["torque_enable"] == 0
+
+    lift_writes = [
+        event for event in bus.events if event[1] == "write" and event[3] == "lift_axis"
+    ]
+    first_enable = next(
+        i
+        for i, event in enumerate(lift_writes)
+        if event[2:] == ("Torque_Enable", "lift_axis", 1)
+    )
+    assert lift_writes[first_enable - 1][2:] == ("Torque_Enable", "lift_axis", 0)
+    assert not any(event[2] == "Operating_Mode" for event in lift_writes[first_enable - 1:first_enable])
+    assert not any(event[2] == "Goal_Velocity" for event in lift_writes[first_enable - 1:first_enable])
+
+
+def test_ineffective_final_pre_motion_torque_off_refuses_without_nonzero_goal(
+    rig, monkeypatch, capsys
+):
+    _, buses, _ = rig
+    original = LiftBus.connect
+
+    def connect(bus, **kwargs):
+        original(bus, **kwargs)
+        bus.setup_torque_side_effect = "Operating_Mode"
+        bus.ineffective_torque_off_numbers = {2}
+
+    monkeypatch.setattr(LiftBus, "connect", connect)
+    assert execute() == 2
+    output = capsys.readouterr().out
+    phase = {
+        record["phase"]: record
+        for record in (
+            json.loads(line.split("] ", 1)[1])
+            for line in output.splitlines()
+            if line.startswith("[LIFT RELIEF] ")
+        )
+    }
+    assert phase["setup_after_writes"]["torque_enable"] == 1
+    assert phase["before_torque"]["torque_enable"] == 1
+    assert "before_torque" in output and "unexpected torque" in output
+    assert not any(
+        event[1:4] == ("write", "Goal_Velocity", "lift_axis") and event[-1] != 0
+        for event in buses[0].events
+    )
+    assert_stopped(buses[0])
+
+
+def test_failed_final_pre_motion_torque_off_refuses_without_nonzero_goal(rig, monkeypatch, capsys):
+    _, buses, _ = rig
+    original = LiftBus.connect
+
+    def connect(bus, **kwargs):
+        original(bus, **kwargs)
+        bus.setup_torque_side_effect = "Operating_Mode"
+        bus.torque_off_failures = {2: (OSError("modeled torque-off write failure"), False)}
+
+    monkeypatch.setattr(LiftBus, "connect", connect)
+    assert execute() == 2
+    output = capsys.readouterr().out
+    assert "failed to verify torque_enable" in output.lower()
+    assert not any(
+        event[1:4] == ("write", "Goal_Velocity", "lift_axis") and event[-1] != 0
+        for event in buses[0].events
+    )
+    assert_stopped(buses[0])
+
+
+def test_final_pre_motion_sample_still_requires_cool_temperature(rig, monkeypatch, capsys):
+    original = LiftBus.write
+
+    def write(bus, register, motor, value, **kwargs):
+        original(bus, register, motor, value, **kwargs)
+        if motor == "lift_axis" and register == "Torque_Enable" and bus.torque_off_writes == 2:
+            bus.registers[("Present_Temperature", motor)] = 41
+
+    monkeypatch.setattr(LiftBus, "write", write)
+    assert execute() == 2
+    output = capsys.readouterr().out
+    assert "cool" in output.lower() and '"phase":"before_torque"' in output
+    assert not any(
+        event[1:4] == ("write", "Goal_Velocity", "lift_axis") and event[-1] != 0
+        for event in rig[1][0].events
+    )
+    assert_stopped(rig[1][0])
+
+
+def test_cleanup_readback_refuses_if_final_direct_torque_off_is_ineffective(
+    rig, monkeypatch, capsys
+):
+    _, buses, _ = rig
+    original = LiftBus.connect
+
+    def connect(bus, **kwargs):
+        original(bus, **kwargs)
+        bus.ineffective_torque_off_numbers = {4}
+
+    monkeypatch.setattr(LiftBus, "connect", connect)
+    assert execute() == 1
+    output = capsys.readouterr().out
+    assert '"phase":"cleanup_readback"' in output
+    assert "cleanup" in output.lower() and "torque" in output.lower()
+    assert not buses[0].is_connected
 
 
 @pytest.mark.parametrize("fault,reason", [
