@@ -49,6 +49,12 @@ ABORT_C = 55
 CURRENT_ABORT_MA = 200.0
 CURRENT_MA_PER_RAW = 6.5
 STILL_VELOCITY_RAW = 5
+STATIONARY_REPORTED_VELOCITY_LIMIT_RAW = 50
+STATIONARY_POSITION_TOLERANCE_RAW = 1
+STATIONARY_WINDOW_S = 0.15
+STATIONARY_MIN_SAMPLES = 4
+STATIONARY_TIMEOUT_S = 0.6
+STATIONARY_PERSISTENT_SAMPLES = 3
 MOTION_VELOCITY_RAW = 100
 MOTION_S = 0.3
 POLL_S = 0.05
@@ -475,7 +481,6 @@ class MotorFeedbackComparison:
         *,
         expected_torque: int,
         expected_goal: int,
-        require_still: bool,
         cold_start: bool = False,
         start_position: int | None = None,
         timeout_ms: float = REPLY_TIMEOUT_MS,
@@ -526,10 +531,143 @@ class MotorFeedbackComparison:
             self.refuse(record, f"{phase}: goal velocity did not match {expected_goal}.")
         if float(record["present_current_ma"]) >= CURRENT_ABORT_MA:
             self.refuse(record, f"{phase}: current reached the {CURRENT_ABORT_MA:g} mA diagnostic ceiling.")
-        if require_still and abs(int(record["present_velocity_raw"])) > STILL_VELOCITY_RAW:
-            self.refuse(record, f"{phase}: motor was not stationary.")
         self.emit(record)
         return record
+
+    def qualify_stationary(
+        self,
+        phase: str,
+        *,
+        expected_torque: int,
+        expected_goal: int,
+        cold_start: bool = False,
+        start_position: int | None = None,
+        max_position_delta_raw: int | None = None,
+        allow_settling: bool = False,
+        timeout_s: float = STATIONARY_TIMEOUT_S,
+    ) -> dict[str, Any]:
+        """Require one bounded window of fresh, mutually consistent feedback."""
+        qualification_started = self.monotonic()
+        deadline = qualification_started + timeout_s
+        candidate: list[tuple[float, dict[str, Any]]] = []
+        last_record: dict[str, Any] | None = None
+
+        def reject_or_reset(record: dict[str, Any], reason: str) -> None:
+            nonlocal candidate
+            if allow_settling:
+                candidate = []
+                return
+            self.refuse(record, reason)
+
+        while True:
+            if last_record is not None:
+                now = self.monotonic()
+                if now >= deadline:
+                    self.refuse(
+                        last_record,
+                        f"{phase}: no complete stationary window within {timeout_s:g} second.",
+                    )
+                self.sleep(min(POLL_S, deadline - now))
+
+            record = self.sample(
+                phase,
+                expected_torque=expected_torque,
+                expected_goal=expected_goal,
+                cold_start=cold_start,
+                start_position=start_position,
+            )
+            sampled_at = self.monotonic()
+            last_record = record
+
+            if sampled_at > deadline:
+                self.refuse(
+                    record,
+                    f"{phase}: stationary feedback exceeded the {timeout_s:g}-second qualification limit.",
+                )
+            if max_position_delta_raw is not None and abs(
+                int(record["position_delta_raw"])
+            ) > max_position_delta_raw:
+                self.refuse(
+                    record,
+                    f"{phase}: travel exceeded {max_position_delta_raw} raw ticks.",
+                )
+
+            velocity = int(record["present_velocity_raw"])
+            moving = int(record["moving"])
+            if moving not in (0, 1):
+                self.refuse(record, f"{phase}: Moving readback was not 0 or 1.")
+            if abs(velocity) > STATIONARY_REPORTED_VELOCITY_LIMIT_RAW:
+                reject_or_reset(
+                    record,
+                    f"{phase}: reported velocity exceeded the stationary evidence bound "
+                    f"of {STATIONARY_REPORTED_VELOCITY_LIMIT_RAW} raw units.",
+                )
+                continue
+
+            proposed = [*candidate, (sampled_at, record)]
+            origin = int(proposed[0][1]["present_position_raw"])
+            offsets = [
+                _position_delta(origin, int(sample["present_position_raw"]))
+                for _, sample in proposed
+            ]
+            excursion = max(offsets) - min(offsets)
+            drift = offsets[-1]
+            if (
+                excursion > STATIONARY_POSITION_TOLERANCE_RAW
+                or abs(drift) > STATIONARY_POSITION_TOLERANCE_RAW
+            ):
+                reject_or_reset(
+                    record,
+                    f"{phase}: position excursion or drift exceeded the "
+                    f"{STATIONARY_POSITION_TOLERANCE_RAW}-tick stationary tolerance.",
+                )
+                if allow_settling:
+                    candidate = [(sampled_at, record)]
+                continue
+
+            candidate = proposed
+            if len(candidate) >= STATIONARY_PERSISTENT_SAMPLES:
+                recent = [sample for _, sample in candidate[-STATIONARY_PERSISTENT_SAMPLES:]]
+                velocities = [int(sample["present_velocity_raw"]) for sample in recent]
+                moving_without_velocity = all(
+                    int(sample["moving"]) == 1
+                    and abs(int(sample["present_velocity_raw"])) <= STILL_VELOCITY_RAW
+                    for sample in recent
+                )
+                same_positive = all(value > STILL_VELOCITY_RAW for value in velocities)
+                same_negative = all(value < -STILL_VELOCITY_RAW for value in velocities)
+                if moving_without_velocity or same_positive or same_negative:
+                    reject_or_reset(
+                        record,
+                        f"{phase}: velocity or Moving reported persistent motion during "
+                        "the stationary window.",
+                    )
+                    if allow_settling:
+                        candidate = [(sampled_at, record)]
+                    continue
+
+            window_s = candidate[-1][0] - candidate[0][0]
+            if len(candidate) < STATIONARY_MIN_SAMPLES or window_s < STATIONARY_WINDOW_S:
+                continue
+
+            evidence = {
+                "sample_count": len(candidate),
+                "window_s": round(window_s, 3),
+                "position_resolution_raw": 4096,
+                "position_tolerance_raw": STATIONARY_POSITION_TOLERANCE_RAW,
+                "position_origin_raw": origin,
+                "position_offsets_raw": offsets,
+                "position_excursion_raw": excursion,
+                "position_drift_raw": drift,
+                "present_velocity_raw": [
+                    int(sample["present_velocity_raw"]) for _, sample in candidate
+                ],
+                "moving": [int(sample["moving"]) for _, sample in candidate],
+                "expected_torque": expected_torque,
+                "expected_goal_velocity_raw": expected_goal,
+            }
+            self.record(f"{phase}_stationary_qualified", **evidence)
+            return {**candidate[-1][1], "stationary_qualification": evidence}
 
     def write(self, phase: str, address: int, width: int, value: int) -> None:
         try:
@@ -547,8 +685,8 @@ class MotorFeedbackComparison:
 
     def compare(self) -> None:
         self.read_configuration()
-        baseline = self.sample(
-            "baseline", expected_torque=0, expected_goal=0, require_still=True, cold_start=True
+        baseline = self.qualify_stationary(
+            "baseline", expected_torque=0, expected_goal=0, cold_start=True
         )
         authorization = self.input_fn(
             "Type ROTATE to authorize one raw +100 pulse with a nominal 0.3-second "
@@ -556,14 +694,14 @@ class MotorFeedbackComparison:
         )
         if authorization != "ROTATE":
             self.refuse(baseline, "Exact ROTATE authorization was not supplied.")
-        pre_motion = self.sample(
-            "pre_motion", expected_torque=0, expected_goal=0, require_still=True, cold_start=True
+        pre_motion = self.qualify_stationary(
+            "pre_motion", expected_torque=0, expected_goal=0, cold_start=True
         )
         start_position = int(pre_motion["present_position_raw"])
 
         self.write("zero_before_torque", GOAL_VELOCITY_ADDRESS, 2, 0)
         self.write("torque_enable", TORQUE_ENABLE_ADDRESS, 1, 1)
-        self.sample("armed_zero", expected_torque=1, expected_goal=0, require_still=True)
+        self.qualify_stationary("armed_zero", expected_torque=1, expected_goal=0)
 
         motion_started = self.monotonic()
         self.write("motion_command", GOAL_VELOCITY_ADDRESS, 2, MOTION_VELOCITY_RAW)
@@ -582,7 +720,6 @@ class MotorFeedbackComparison:
                     "motion",
                     expected_torque=1,
                     expected_goal=MOTION_VELOCITY_RAW,
-                    require_still=False,
                     start_position=start_position,
                     timeout_ms=40.0,
                 )
@@ -642,25 +779,15 @@ class MotorFeedbackComparison:
                 f"motion: travel did not reach {MIN_TRAVEL_RAW} raw ticks.",
             )
 
-        settle_started = self.monotonic()
-        stable = 0
-        while stable < 3:
-            self.sleep(POLL_S)
-            stopped = self.sample(
-                "stopped",
-                expected_torque=1,
-                expected_goal=0,
-                require_still=False,
-                start_position=start_position,
-            )
-            if abs(int(stopped["present_velocity_raw"])) <= STILL_VELOCITY_RAW:
-                stable += 1
-            else:
-                stable = 0
-            if abs(int(stopped["position_delta_raw"])) > MAX_TRAVEL_RAW:
-                self.refuse(stopped, f"stopped: travel exceeded {MAX_TRAVEL_RAW} raw ticks.")
-            if self.monotonic() - settle_started >= SETTLE_TIMEOUT_S and stable < 3:
-                self.refuse(stopped, f"stopped: velocity did not settle within {SETTLE_TIMEOUT_S:g} second.")
+        self.qualify_stationary(
+            "stopped",
+            expected_torque=1,
+            expected_goal=0,
+            start_position=start_position,
+            max_position_delta_raw=MAX_TRAVEL_RAW,
+            allow_settling=True,
+            timeout_s=SETTLE_TIMEOUT_S,
+        )
 
     def cleanup(self) -> list[str]:
         errors: list[str] = []
@@ -676,7 +803,13 @@ class MotorFeedbackComparison:
             except BaseException as error:
                 errors.append(f"{phase}: {type(error).__name__}: {error}")
         try:
-            self.sample("cleanup_readback", expected_torque=0, expected_goal=0, require_still=True)
+            self.qualify_stationary(
+                "cleanup_readback",
+                expected_torque=0,
+                expected_goal=0,
+                allow_settling=True,
+                timeout_s=SETTLE_TIMEOUT_S,
+            )
         except BaseException as error:
             errors.append(f"cleanup_readback: {type(error).__name__}: {error}")
         try:
