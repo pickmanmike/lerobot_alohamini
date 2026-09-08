@@ -370,6 +370,26 @@ def test_torque_off_readback_launcher_is_explicit_lift_only():
     assert preview("--mode", "lift", "--lift-readback", "--lift-diagnostics").returncode == 2
 
 
+def test_motor_feedback_launcher_uses_the_standalone_vendor_path_only():
+    def preview(*arguments):
+        return subprocess.run(
+            [BASH, str(HOST_HELPER), *arguments, "--print-command"],
+            cwd=REPO_ROOT, text=True, capture_output=True, timeout=30, check=False,
+        )
+
+    enabled = preview("--mode", "lift", "--lift-motor-feedback")
+    assert enabled.returncode == 0, enabled.stderr
+    assert "-m lerobot.robots.alohamini.lift_motor_feedback" in enabled.stdout
+    assert "--port /dev/am_arm_follower_left" in enabled.stdout
+    assert "--motor-id 11" in enabled.stdout
+    assert "--baud-rate 1000000" in enabled.stdout
+    assert "alohamini_host" not in enabled.stdout
+    assert "--no_follower" not in enabled.stdout
+    assert "--lift-motor-feedback" not in preview("--mode", "lift").stdout
+    assert preview("--mode", "local", "--lift-motor-feedback").returncode == 2
+    assert preview("--mode", "lift", "--lift-motor-feedback", "--lift-relief").returncode == 2
+
+
 def test_local_config_example_is_valid_and_real_config_is_ignored():
     config = json.loads(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
 

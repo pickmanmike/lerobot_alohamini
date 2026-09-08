@@ -21,7 +21,7 @@ readonly AM1_PI_INPUT="ee3a6f5dd813be82780a6a9b1789966357542d2f"
 
 usage() {
     printf '%s\n' \
-        'Usage: ./tools/run_am1_host.sh --mode arms|base|lift|local [--lift-diagnostics|--lift-relief|--lift-readback] [--print-command]' \
+        'Usage: ./tools/run_am1_host.sh --mode arms|base|lift|local [--lift-diagnostics|--lift-relief|--lift-readback|--lift-motor-feedback] [--print-command]' \
         '' \
         'Modes:' \
         '  arms  Start the physically validated AM1 arms host (no cameras, unhomed lift).' \
@@ -32,6 +32,7 @@ usage() {
         '--lift-diagnostics adds a once-per-second read-only lift snapshot in Lift mode.' \
         '--lift-relief selects the guarded, operator-gated lift-only home/10mm relief/45s check (no ZMQ).' \
         '--lift-readback selects a three-second torque-off-only lift telemetry check (no homing, motion, or ZMQ).' \
+        '--lift-motor-feedback selects one standalone grouped-feedback pulse (no homing, height control, or ZMQ).' \
         '--print-command prints the Python command without checking devices or starting the host.'
 }
 
@@ -50,6 +51,7 @@ print_command=false
 lift_diagnostics=false
 lift_relief=false
 lift_readback=false
+lift_motor_feedback=false
 while (($#)); do
     case "$1" in
         --mode)
@@ -71,6 +73,10 @@ while (($#)); do
             ;;
         --lift-readback)
             lift_readback=true
+            shift
+            ;;
+        --lift-motor-feedback)
+            lift_motor_feedback=true
             shift
             ;;
         --help|-h)
@@ -104,6 +110,10 @@ if [[ "$lift_readback" == true && ( "$mode" != "lift" || "$lift_diagnostics" == 
     die "--lift-readback requires --mode lift and cannot be combined with another lift diagnostic"
     exit $?
 fi
+if [[ "$lift_motor_feedback" == true && ( "$mode" != "lift" || "$lift_diagnostics" == true || "$lift_relief" == true || "$lift_readback" == true ) ]]; then
+    die "--lift-motor-feedback requires --mode lift and cannot be combined with another lift diagnostic"
+    exit $?
+fi
 
 script_path="${BASH_SOURCE[0]//\\//}"
 script_parent="${script_path%/*}"
@@ -112,13 +122,25 @@ script_dir="$(cd -- "$script_parent" && pwd -P)"
 repository_root="$(cd -- "$script_dir/.." && pwd -P)"
 python_path="$repository_root/.venv/bin/python"
 
-command=(
-    "$python_path"
-    -m lerobot.robots.alohamini.alohamini_host
-    --robot_model alohamini1
-    --no_cameras
-)
-if [[ "$mode" == "arms" ]]; then
+if [[ "$lift_motor_feedback" == true ]]; then
+    command=(
+        "$python_path"
+        -m lerobot.robots.alohamini.lift_motor_feedback
+        --port /dev/am_arm_follower_left
+        --motor-id 11
+        --baud-rate 1000000
+    )
+else
+    command=(
+        "$python_path"
+        -m lerobot.robots.alohamini.alohamini_host
+        --robot_model alohamini1
+        --no_cameras
+    )
+fi
+if [[ "$lift_motor_feedback" == true ]]; then
+    :
+elif [[ "$mode" == "arms" ]]; then
     command+=(
         --skip_lift_home
         --max_relative_target 20.0
