@@ -291,6 +291,69 @@ class FakeTransport:
         return {"address": address, "width": width, "value": value, "checksum_ok": True}
 
 
+class TimeBasedMotionTransport(FakeTransport):
+    """Fake whose position follows elapsed command time, not feedback reads."""
+
+    def __init__(
+        self,
+        *,
+        clock: FakeClock,
+        travel_rate_raw_per_s: float,
+        reported_motion_velocity_raw: int | None = None,
+    ) -> None:
+        super().__init__(clock=clock)
+        self.travel_rate_raw_per_s = travel_rate_raw_per_s
+        self.reported_motion_velocity_raw = reported_motion_velocity_raw
+        self.motion_started_at: float | None = None
+        self.motion_origin = self.position
+
+    def _advance_to_now(self) -> None:
+        if self.goal_velocity == 0 or self.motion_started_at is None:
+            return
+        elapsed = self.clock.now - self.motion_started_at
+        self.position = (self.motion_origin + int(elapsed * self.travel_rate_raw_per_s)) % 4096
+
+    def read_group(
+        self, start: int, length: int, *, timeout_ms: float = feedback.REPLY_TIMEOUT_MS
+    ) -> tuple[bytes, dict]:
+        if (start, length) != (feedback.FEEDBACK_START, feedback.FEEDBACK_LENGTH):
+            return super().read_group(start, length, timeout_ms=timeout_ms)
+
+        self.operation_threads.append(threading.get_ident())
+        self.group_reads.append((start, length))
+        self._advance_to_now()
+        if self.goal_velocity:
+            self.motion_read_count += 1
+        present_velocity = self.reported_motion_velocity_raw
+        if present_velocity is None:
+            present_velocity = self.goal_velocity if self.travel_rate_raw_per_s >= 0 else -self.goal_velocity
+        payload = dynamic_payload(
+            torque=self.torque,
+            goal_velocity=self.goal_velocity,
+            present_position=self.position,
+            present_velocity=present_velocity if self.goal_velocity else 0,
+            temperature=self.temperature,
+            current=1,
+        )
+        trace = {
+            "start_address": start,
+            "requested_width": length,
+            "response_bytes": [0xFF, 0xFF, feedback.MOTOR_ID, length + 2, 0, *payload, 0],
+            "checksum_ok": True,
+            "request_correlation": "single_group_reply_without_address_or_sequence",
+            "reply_timeout_ms": timeout_ms,
+        }
+        return payload, trace
+
+    def write_register(self, address: int, width: int, value: int) -> dict:
+        if address == feedback.GOAL_VELOCITY_ADDRESS:
+            self._advance_to_now()
+            if value != 0:
+                self.motion_origin = self.position
+                self.motion_started_at = self.clock.now
+        return super().write_register(address, width, value)
+
+
 class ScriptedFeedbackTransport(FakeTransport):
     def __init__(self, *, clock: FakeClock, samples: Iterable[dict] = ()) -> None:
         super().__init__(clock=clock)
@@ -763,6 +826,169 @@ def test_comparison_is_operator_gated_bounded_and_never_reads_phase() -> None:
     assert set(transport.operation_threads) == {threading.get_ident()}
 
 
+def test_minimum_travel_uses_a_fresh_endpoint_after_the_scheduled_zero() -> None:
+    clock = FakeClock()
+    transport = TimeBasedMotionTransport(clock=clock, travel_rate_raw_per_s=25.0)
+    records: list[dict] = []
+
+    result = feedback.run_comparison(
+        transport,
+        input_fn=lambda _prompt: "ROTATE",
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+        emit=records.append,
+    )
+
+    early = [record for record in records if record.get("phase") == "motion"]
+    assert early
+    assert all(record["position_delta_raw"] < feedback.MIN_TRAVEL_RAW for record in early)
+    assert result == 0
+    endpoint = next(record for record in records if record.get("phase") == "motion_endpoint")
+    assert endpoint["position_delta_raw"] >= feedback.MIN_TRAVEL_RAW
+    assert endpoint["sample_elapsed_s"] > early[-1]["elapsed_s"]
+    assert endpoint["early_samples"] == [
+        {
+            "sample_elapsed_s": sample["elapsed_s"],
+            "present_position_raw": sample["present_position_raw"],
+            "position_delta_raw": sample["position_delta_raw"],
+        }
+        for sample in early
+    ]
+
+
+def test_fresh_endpoint_displacement_is_signed_and_wrap_aware() -> None:
+    clock = FakeClock()
+    transport = TimeBasedMotionTransport(clock=clock, travel_rate_raw_per_s=25.0)
+    transport.position = 4093
+    records: list[dict] = []
+
+    result = feedback.run_comparison(
+        transport,
+        input_fn=lambda _prompt: "ROTATE",
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+        emit=records.append,
+    )
+
+    assert result == 0
+    endpoint = next(record for record in records if record.get("phase") == "motion_endpoint")
+    assert endpoint["start_position_raw"] == 4093
+    assert endpoint["present_position_raw"] < endpoint["start_position_raw"]
+    assert endpoint["position_delta_raw"] >= feedback.MIN_TRAVEL_RAW
+
+
+def test_fresh_endpoint_still_refuses_genuinely_insufficient_travel() -> None:
+    clock = FakeClock()
+    transport = TimeBasedMotionTransport(clock=clock, travel_rate_raw_per_s=10.0)
+    records: list[dict] = []
+
+    result = feedback.run_comparison(
+        transport,
+        input_fn=lambda _prompt: "ROTATE",
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+        emit=records.append,
+    )
+
+    assert result == 2
+    endpoint = next(record for record in records if record.get("phase") == "motion_endpoint")
+    assert 0 < endpoint["position_delta_raw"] < feedback.MIN_TRAVEL_RAW
+    assert f"did not reach {feedback.MIN_TRAVEL_RAW}" in records[-1]["reason"]
+
+
+def test_fresh_endpoint_refuses_opposite_total_travel_not_seen_in_early_samples() -> None:
+    clock = FakeClock()
+    transport = TimeBasedMotionTransport(
+        clock=clock,
+        travel_rate_raw_per_s=-25.0,
+        reported_motion_velocity_raw=0,
+    )
+    records: list[dict] = []
+
+    result = feedback.run_comparison(
+        transport,
+        input_fn=lambda _prompt: "ROTATE",
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+        emit=records.append,
+    )
+
+    early = [record for record in records if record.get("phase") == "motion"]
+    assert early[-1]["position_delta_raw"] == -2
+    assert result == 2
+    assert "motion endpoint: position changed opposite" in records[-1]["reason"]
+
+
+def test_fresh_endpoint_refuses_total_travel_over_the_existing_maximum() -> None:
+    clock = FakeClock()
+    transport = TimeBasedMotionTransport(clock=clock, travel_rate_raw_per_s=450.0)
+    records: list[dict] = []
+
+    result = feedback.run_comparison(
+        transport,
+        input_fn=lambda _prompt: "ROTATE",
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+        emit=records.append,
+    )
+
+    assert result == 2
+    assert transport.goal_velocity == 0
+    assert f"travel exceeded {feedback.MAX_TRAVEL_RAW}" in records[-1]["reason"]
+
+
+@pytest.mark.parametrize("endpoint_fault", ("missing", "thermal"))
+def test_missing_or_faulted_fresh_endpoint_refuses_after_zero(endpoint_fault: str) -> None:
+    class EndpointFaultTransport(TimeBasedMotionTransport):
+        fault_emitted = False
+
+        def read_group(
+            self, start: int, length: int, *, timeout_ms: float = feedback.REPLY_TIMEOUT_MS
+        ) -> tuple[bytes, dict]:
+            at_endpoint = (
+                (start, length) == (feedback.FEEDBACK_START, feedback.FEEDBACK_LENGTH)
+                and self.motion_started_at is not None
+                and self.goal_velocity == 0
+                and not self.fault_emitted
+            )
+            if not at_endpoint:
+                return super().read_group(start, length, timeout_ms=timeout_ms)
+
+            self.fault_emitted = True
+            if endpoint_fault == "missing":
+                raise feedback.TransportRefusal(
+                    "endpoint feedback missing",
+                    {"operation": "sync_read", "requested_width": length},
+                )
+            original_temperature = self.temperature
+            self.temperature = feedback.ABORT_C
+            try:
+                return super().read_group(start, length, timeout_ms=timeout_ms)
+            finally:
+                self.temperature = original_temperature
+
+    clock = FakeClock()
+    transport = EndpointFaultTransport(clock=clock, travel_rate_raw_per_s=25.0)
+    records: list[dict] = []
+
+    result = feedback.run_comparison(
+        transport,
+        input_fn=lambda _prompt: "ROTATE",
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+        emit=records.append,
+    )
+
+    assert result == 2
+    assert transport.goal_velocity == 0
+    assert transport.torque == 0
+    assert not any(record.get("phase") == "motion_endpoint" for record in records)
+    if endpoint_fault == "missing":
+        assert "endpoint feedback missing" in records[-1]["reason"]
+    else:
+        assert "temperature 55 C" in records[-1]["reason"]
+
+
 def test_a_late_motion_read_zeroes_then_refuses_the_timing_envelope() -> None:
     clock = FakeClock()
     transport = FakeTransport(clock=clock, motion_read_delay_s=0.5)
@@ -824,6 +1050,8 @@ def test_suspicious_temperature_stops_once_and_cleanup_cannot_erase_refusal() ->
     ) == 1
     assert records[-1]["phase"] == "result"
     assert records[-1]["status"] == "refused"
+    assert records[-1]["reason"] == rejected[-1]["rejection_reason"]
+    assert not any(record.get("phase") == "motion_endpoint" for record in records)
 
 
 def test_wrong_authorization_refuses_before_any_nonzero_write() -> None:

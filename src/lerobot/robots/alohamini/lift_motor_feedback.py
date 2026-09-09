@@ -705,7 +705,7 @@ class MotorFeedbackComparison:
 
         motion_started = self.monotonic()
         self.write("motion_command", GOAL_VELOCITY_ADDRESS, 2, MOTION_VELOCITY_RAW)
-        final_motion: dict[str, Any] | None = None
+        early_motion_samples: list[dict[str, Any]] = []
         motion_error: BaseException | None = None
         stop_early = False
         try:
@@ -716,24 +716,28 @@ class MotorFeedbackComparison:
                 if self.monotonic() - motion_started >= MOTION_S - 0.1:
                     break
                 self.sleep(POLL_S)
-                final_motion = self.sample(
+                motion_sample = self.sample(
                     "motion",
                     expected_torque=1,
                     expected_goal=MOTION_VELOCITY_RAW,
                     start_position=start_position,
                     timeout_ms=40.0,
                 )
-                velocity = int(final_motion["present_velocity_raw"])
-                delta = int(final_motion["position_delta_raw"])
+                early_motion_samples.append(motion_sample)
+                velocity = int(motion_sample["present_velocity_raw"])
+                delta = int(motion_sample["position_delta_raw"])
                 if velocity < -STILL_VELOCITY_RAW:
                     self.refuse(
-                        final_motion,
+                        motion_sample,
                         "motion: velocity changed opposite the positive raw command.",
                     )
                 if delta < -2:
-                    self.refuse(final_motion, "motion: position changed opposite the positive raw command.")
+                    self.refuse(
+                        motion_sample,
+                        "motion: position changed opposite the positive raw command.",
+                    )
                 if delta > MAX_TRAVEL_RAW:
-                    self.refuse(final_motion, f"motion: travel exceeded {MAX_TRAVEL_RAW} raw ticks.")
+                    self.refuse(motion_sample, f"motion: travel exceeded {MAX_TRAVEL_RAW} raw ticks.")
                 if delta >= TARGET_TRAVEL_RAW:
                     stop_early = True
                     break
@@ -773,13 +777,8 @@ class MotorFeedbackComparison:
                 motion_error.add_note(str(bound_error))
         if motion_error is not None:
             raise motion_error
-        if final_motion is None or int(final_motion["position_delta_raw"]) < MIN_TRAVEL_RAW:
-            self.refuse(
-                final_motion or pre_motion,
-                f"motion: travel did not reach {MIN_TRAVEL_RAW} raw ticks.",
-            )
 
-        self.qualify_stationary(
+        endpoint = self.qualify_stationary(
             "stopped",
             expected_torque=1,
             expected_goal=0,
@@ -788,6 +787,32 @@ class MotorFeedbackComparison:
             allow_settling=True,
             timeout_s=SETTLE_TIMEOUT_S,
         )
+        endpoint_delta = int(endpoint["position_delta_raw"])
+        self.record(
+            "motion_endpoint",
+            start_position_raw=start_position,
+            early_samples=[
+                {
+                    "sample_elapsed_s": sample["elapsed_s"],
+                    "present_position_raw": int(sample["present_position_raw"]),
+                    "position_delta_raw": int(sample["position_delta_raw"]),
+                }
+                for sample in early_motion_samples
+            ],
+            sample_elapsed_s=endpoint["elapsed_s"],
+            present_position_raw=int(endpoint["present_position_raw"]),
+            position_delta_raw=endpoint_delta,
+        )
+        if endpoint_delta < -2:
+            self.refuse(
+                endpoint,
+                "motion endpoint: position changed opposite the positive raw command.",
+            )
+        if endpoint_delta < MIN_TRAVEL_RAW:
+            self.refuse(
+                endpoint,
+                f"motion: travel did not reach {MIN_TRAVEL_RAW} raw ticks.",
+            )
 
     def cleanup(self) -> list[str]:
         errors: list[str] = []

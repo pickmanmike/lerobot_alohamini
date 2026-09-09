@@ -209,7 +209,7 @@ All four correctly refused on the numeric temperature reading during homing and 
 
 The four rejected temperature payloads came from correctly shaped one-byte replies to the same request, `FF FF 0B 04 02 3F 01 AE` (ID 11, address 63, width 1): `FF FF 0B 03 00 4D A4` (77), `FF FF 0B 03 00 46 AB` (70), `FF FF 0B 03 00 37 BA` (55), and `FF FF 0B 03 00 51 A0` (81). Rechecking all 36 captured request/reply pairs found valid framing, declared and actual lengths, checksums, requested ID/address/width, reply ID and error fields, with no pending input and no oversized-reply slicing. A status reply still carries no register address or sequence number; same-ID/same-width correspondence and the physical accuracy of the servo's temperature feedback therefore remain unproven. No concrete additional scalar-reader defect is demonstrated by these runs.
 
-##### Independent grouped motor-feedback comparison (prepared, not physically validated)
+##### Independent grouped motor-feedback comparison (pulse observed; corrected verdict pending)
 
 The next action is one standalone vendor-SDK comparison outside `AlohaMini`, `LiftAxis`, homing, platform-height conversion and ZMQ. The Pi alias `/dev/am_arm_follower_left` currently resolves to `/dev/ttyACM1`, a WCH USB serial interface (`1a86:55d3`, `cdc_acm`, USB serial `5B3D044115`); prior project evidence identifies this VID/PID family as CH343, while the exact carrier-board model is not encoded in the device metadata. The established bus is 1,000,000 baud and the only addressed servo is STS3215 ID 11.
 
@@ -221,15 +221,173 @@ The first two standalone attempts at `afad620d1489e3ececd90ba8c24da13363290de0` 
 
 Stationary gates now require at least four fresh grouped replies spanning 0.15 seconds. Every reply must retain the expected torque and zero goal state and pass the existing transport, temperature, current, voltage, mode and status checks. Position is unwrapped across the 4096-count boundary; both total excursion and net drift are limited to one raw count, about 0.088 degrees at the configured resolution. This is the smallest tolerance that includes the measured adjacent-count variation. Raw velocity and `Moving` remain in every sample and the qualification summary. A candidate window cannot include a velocity magnitude over 50; three consecutive same-sign reports beyond the original five-unit near-zero threshold, or three consecutive `Moving=1` reports paired with near-zero velocity, are treated as persistent contradictory motion evidence. Thus the change does not globally raise the stillness threshold or trust `Moving` alone. Baseline, post-authorization pre-motion and armed-zero must pass within 0.6 seconds, with torque still off until the whole pre-motion window passes. After a commanded zero, stopped verification and cleanup have at most the existing one-second settle limit to produce the same uninterrupted window; accumulated creeping cannot pass as per-sample jitter. Missing, late, corrupt or faulted feedback refuses immediately rather than being retried until a convenient zero appears. Cleanup always sends zero and torque-off before collecting its bounded evidence, and cannot replace an earlier refusal.
 
-**Next operator action:** retain the securely mounted, platform-removed and unloaded configuration from runs 2–4. With body power off, stop every host, keep leaders disconnected, restrain the chassis, clear the servo output's small rotation envelope, keep hands out of pinch points, and make the 12 V disconnect immediately accessible. Stage the exact reviewed PR #5 head on a clean Pi checkout. Apply body power only when ready, then run:
+The direct single-servo attempt at `5ec0cf5f13cc44505736e2dfe32ea43898c0e0fe`, `/home/pickmanmike/AlohaMini1Logs/am1-lift-host-20260908-225950.log` (SHA-256 `a0994af8d019375e997cffb25384d204a10fffcf632fd1d9c7166b723023c820`), used the original ID 11 alone, with the arm and wheel branches disconnected, a new direct compatible cable, and the platform disengaged. Baseline, post-`ROTATE`, and armed-zero windows passed. Torque-enable and raw `+100` were acknowledged, the pulse lasted 0.301 seconds, and all 28 unique recorded transactions validated. All 19 dynamic samples reported 34 C, 12.0 V, status zero, and 0–13 mA. This is not another bad acknowledgement or temperature event.
+
+The run exposed a verdict-ordering defect rather than no movement. Its pre-motion origin was 3025. Early samples at 4.302 and 4.354 seconds were 3025/3026 (delta 0/1); zero was requested at 4.550 seconds. The old comparator nevertheless applied the five-tick minimum to the stale 4.354-second sample before stopped feedback. Cleanup immediately saw 3050 and then settled at 3051, but cleanup cannot retroactively qualify the pulse; the run correctly remains an exit-2 refusal because it has no normal torque-on endpoint.
+
+The corrected comparator retains both early samples and every immediate fault check, requests zero at the unchanged deadline, and, only when no earlier error or zero failure exists, gathers the normal bounded stopped window while torque remains on and goal velocity is zero. It then records a distinct `motion_endpoint` containing the early and endpoint timestamps/positions and evaluates signed wrap-aware displacement from the pre-motion origin. The minimum remains five ticks, the maximum remains 128 ticks, and motion is never extended to reach the minimum. Missing/faulted endpoint data, reverse travel, overtravel, stop-timing failure, and earlier motion faults still refuse before cleanup; cleanup telemetry is never substituted for the endpoint.
+
+**Default next operator action:** repeat the corrected comparator once on the original lift servo using the same direct single-servo wiring as the 225950 run: original ID 11 securely mounted and unloaded, platform disengaged, arm and wheel branches disconnected, new direct compatible cable, and no second serial owner. With body power off, stop every host, keep leaders disconnected, restrain the chassis, clear the servo output's small rotation envelope, keep hands out of pinch points, and make the 12 V disconnect immediately accessible. Stage the exact reviewed PR #5 head on a clean Pi checkout. Apply body power only when ready, then run:
 
 ```bash
 cd /home/pickmanmike/lerobot_alohamini && ./tools/run_am1_host.sh --mode lift --lift-motor-feedback
 ```
 
-Require `baseline_stationary_qualified` before typing `ROTATE`, and type it only if the source header, adapter alias, ID, configuration, temperature, current, voltage, torque-off state and clear physical envelope are correct. The fresh post-gate window must print `pre_motion_stationary_qualified` before torque activation. Expect one small rotation in the servo's positive raw direction, an automatic zero in about 0.3 seconds, and stopped grouped feedback; there is no endstop search or platform-height claim. Immediately remove motor power for unexpected direction or movement, unusual sound or warmth, missing/faulted data, any temperature/current/status/stationarity refusal, failure to stop, cleanup failure or any exit other than `LIFT_MOTOR_FEEDBACK_PASS` with `HOST_EXIT_CODE=0`. Do not retry a refusal.
+Require `baseline_stationary_qualified` before typing `ROTATE`, and type it only if the source header, adapter alias, ID, configuration, temperature, current, voltage, torque-off state and clear physical envelope are correct. The fresh post-gate window must print `pre_motion_stationary_qualified` before torque activation. Expect one small rotation in the servo's positive raw direction, an automatic zero in about 0.3 seconds, a fresh `stopped_stationary_qualified` window and a distinct `motion_endpoint`; there is no endstop search or platform-height claim. Pass requires endpoint displacement from 5 through 128 raw ticks, `LIFT_MOTOR_FEEDBACK_PASS`, verified torque-off cleanup and `HOST_EXIT_CODE=0`. Immediately remove motor power for unexpected direction or movement, unusual sound or warmth, missing/faulted data, any temperature/current/status/stationarity refusal, failure to stop or cleanup failure. Preserve any refusal and do not retry it unchanged. If this original-servo run passes, do not run the spare merely to obtain a second pass.
 
 A coherent grouped high-temperature jump would make scalar read association a weaker hypothesis and leave servo feedback/sensor, firmware, adapter/electrical behavior and actual heating to distinguish. Stable grouped temperature with coherent position/velocity would instead make the scalar/homing transaction timing or homing-load path more plausible, without proving either. A grouped-read preflight failure identifies vendor sync-read compatibility or the transport boundary before motion and authorizes no fallback motion. External touch temperature cannot validate the embedded sensor. Preserve the automatic `/home/pickmanmike/AlohaMini1Logs/am1-lift-host-YYYYMMDD-HHMMSS.log` for review.
+
+<details>
+<summary>Conditional spare-servo setup and A/B comparison (only after an unexplained corrected-original refusal)</summary>
+
+Do not use a generic `STS3215` marking or the returned model number 777 as proof that a spare accepts the 12 V follower supply. Feetech lists both `ST-3215-C001` (7.4 V) and [`ST-3215-C018`](https://www.feetechrc.com/525603.html) (12 V, 30 kg-cm, nominal 1:345 gearing in the [C018 product specification](https://www.feetechrc.com/Data/feetechrc/upload/file/20240507/6385067068652648096680943.pdf)) under the STS3215 name. Before connecting power, photograph and compare the original and spare labels or supplier records. Continue only when both are explicitly the same `ST-3215-C018` 12 V / 1:345 variant and have the same connector/polarity. A C001, missing/ambiguous label, different gearing, or different voltage ends the A/B plan; never apply the 12 V supply to it.
+
+For spare discovery and setup, body power begins off. Disconnect the original ID 11 and every other servo from the controller; connect only the securely mounted, unloaded spare through the known-good direct cable, with its second bus socket empty. Never connect the original and spare ID 11 at the same time. Stop every other serial owner. After the label/polarity gate passes, apply only the confirmed C018 supply, then use the existing read-only `FeetechMotorsBus.scan_port()` path to discover the spare's actual baud and ID rather than assuming either:
+
+```bash
+(
+  set -euo pipefail
+  cd /home/pickmanmike/lerobot_alohamini
+  export PYTHONPATH="$PWD/src"
+  PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -c \
+    "from lerobot.motors.feetech import FeetechMotorsBus; print(FeetechMotorsBus.scan_port('/dev/am_arm_follower_left'))"
+)
+```
+
+Require exactly one response, model 777, and record the discovered values as `SPARE_ID` and `SPARE_BAUD`. With the spare still the sole connected servo, save this non-Phase before snapshot using those discovered values:
+
+```bash
+export SPARE_ID='<discovered integer>'
+export SPARE_BAUD='<discovered baud>'
+export SPARE_BEFORE="$HOME/AlohaMini1Logs/am1-spare-id11-before-$(date +%Y%m%d-%H%M%S).json"
+(
+set -euo pipefail
+cd /home/pickmanmike/lerobot_alohamini
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/src" ./.venv/bin/python - "$SPARE_ID" "$SPARE_BAUD" <<'PY' | tee "$SPARE_BEFORE"
+import json
+import sys
+from lerobot.motors import Motor, MotorNormMode
+from lerobot.motors.feetech import FeetechMotorsBus
+
+motor_id, baud = map(int, sys.argv[1:])
+bus = FeetechMotorsBus(
+    "/dev/am_arm_follower_left",
+    {"spare": Motor(motor_id, "sts3215", MotorNormMode.DEGREES)},
+)
+bus.connect(handshake=False)
+bus.set_baudrate(baud)
+try:
+    names = (
+        "Firmware_Major_Version", "Firmware_Minor_Version", "Model_Number",
+        "ID", "Baud_Rate", "Angular_Resolution", "Operating_Mode",
+        "Torque_Enable", "Goal_Velocity", "Lock",
+    )
+    values = {name: int(bus.read(name, "spare", normalize=False)) for name in names}
+    if values["Model_Number"] != 777 or values["ID"] != motor_id:
+        raise RuntimeError(f"unexpected spare identity: {values}")
+    print(json.dumps({"host_baud": baud, "registers": values}, sort_keys=True))
+finally:
+    bus.disconnect(disable_torque=False)
+PY
+)
+```
+
+Review that saved snapshot, then type the authorization only for this spare. The existing `setup_motor()` path uses the reviewed starting ID/baud, requests torque off/unlock, and assigns only ID 11 and the established 1,000,000-baud value. Skip this identity step when the recorded values are already `11` and `1000000`; do not run it against an unreviewed scan:
+
+```bash
+(
+  set -euo pipefail
+  cd /home/pickmanmike/lerobot_alohamini
+  read -r -p 'Type PREPARE_SPARE_ID11 to write only this isolated spare: ' confirm
+  test "$confirm" = 'PREPARE_SPARE_ID11'
+  test -n "${SPARE_ID:-}" && test -n "${SPARE_BAUD:-}"
+  if test "$SPARE_ID" != 11 || test "$SPARE_BAUD" != 1000000; then
+    SPARE_ID="$SPARE_ID" SPARE_BAUD="$SPARE_BAUD" PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/src" \
+      ./.venv/bin/python - <<'PY'
+import os
+from lerobot.motors import Motor, MotorNormMode
+from lerobot.motors.feetech import FeetechMotorsBus
+
+bus = FeetechMotorsBus(
+    "/dev/am_arm_follower_left",
+    {"spare": Motor(11, "sts3215", MotorNormMode.DEGREES)},
+)
+try:
+    bus.setup_motor(
+        "spare",
+        initial_baudrate=int(os.environ["SPARE_BAUD"]),
+        initial_id=int(os.environ["SPARE_ID"]),
+    )
+finally:
+    if bus.is_connected:
+        bus.disconnect(disable_torque=False)
+PY
+  fi
+)
+```
+
+At 1,000,000 baud with only the spare ID 11 attached, use ordinary acknowledged register operations to establish velocity mode while preserving every unrelated setting. This touches only `Goal_Velocity`, `Torque_Enable`, `Lock`, and `Operating_Mode`; it does not read or write Phase, calibration, PID/PI, firmware, protection, acceleration, or limit registers:
+
+```bash
+(
+  set -euo pipefail
+  cd /home/pickmanmike/lerobot_alohamini
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/src" ./.venv/bin/python - <<'PY'
+from lerobot.motors import Motor, MotorNormMode
+from lerobot.motors.feetech import FeetechMotorsBus, OperatingMode
+
+bus = FeetechMotorsBus(
+    "/dev/am_arm_follower_left",
+    {"spare": Motor(11, "sts3215", MotorNormMode.DEGREES)},
+)
+bus.connect(handshake=True)
+primary = None
+cleanup_errors = []
+try:
+    for register, value in (
+        ("Goal_Velocity", 0),
+        ("Torque_Enable", 0),
+        ("Lock", 0),
+        ("Operating_Mode", OperatingMode.VELOCITY.value),
+        ("Lock", 1),
+        ("Torque_Enable", 0),
+    ):
+        bus.write(register, "spare", value, normalize=False)
+    expected = {
+        "Model_Number": 777, "ID": 11, "Baud_Rate": 0,
+        "Operating_Mode": 1, "Torque_Enable": 0, "Goal_Velocity": 0, "Lock": 1,
+    }
+    actual = {name: int(bus.read(name, "spare", normalize=False)) for name in expected}
+    if actual != expected:
+        raise RuntimeError(f"spare setup readback mismatch: {actual!r}")
+    print(f"SPARE_SETUP_VERIFIED={actual!r}")
+except BaseException as error:
+    primary = error
+finally:
+    for register in ("Goal_Velocity", "Torque_Enable"):
+        try:
+            bus.write(register, "spare", 0, normalize=False)
+        except Exception as error:
+            cleanup_errors.append(f"final {register}: {error!r}")
+    try:
+        bus.disconnect(disable_torque=False)
+    except Exception as error:
+        cleanup_errors.append(f"disconnect: {error!r}")
+if primary is not None:
+    for detail in cleanup_errors:
+        primary.add_note(detail)
+    raise primary
+if cleanup_errors:
+    raise RuntimeError("; ".join(cleanup_errors))
+PY
+)
+```
+
+Remove power, wait for full power-down, reapply power, rerun the read-only scan, and require exactly `{1000000: [11]}`. Rerun the same non-Phase snapshot block with `SPARE_ID=11`, `SPARE_BAUD=1000000`, and an `am1-spare-id11-after-...json` output name; verify identity, baud register 0, mode 1, torque 0 and goal 0 persisted. Any ambiguous discovery, write/readback/cleanup error, or different result stops the procedure. Do not copy an original-servo register dump into the spare.
+
+Only after that separately reviewed setup may the spare use the same `./tools/run_am1_host.sh --mode lift --lift-motor-feedback` comparison and the same direct-cable physical limits. Power off and disconnect the spare before the original is ever reconnected. Different firmware or untouched acceleration/gain/protection/calibration settings limit the A/B interpretation by design: a different result narrows the candidate boundary but does not prove damage or identify a particular setting; the same fault implicates a shared controller/power/software path without proving it. A spare preflight/configuration refusal is evidence to review, not permission to clone more settings.
+
+</details>
 
 Fixed diagnostic policies (not manufacturer ratings or changed servo settings):
 
