@@ -12,12 +12,15 @@ import json
 import math
 import signal
 import time
+from collections.abc import Callable
 from dataclasses import asdict
 from typing import TYPE_CHECKING, Any
 
 from lerobot.motors.motors_bus import get_address
 
-from .motor_safety import REGISTER_RETRIES, set_torque_enabled, write_register
+from . import lift_motor_feedback as grouped_feedback
+from .lift_axis import LiftAxis
+from .motor_safety import REGISTER_RETRIES, write_register
 
 if TYPE_CHECKING:
     from .alohamini import AlohaMini
@@ -277,7 +280,6 @@ class ReliefCheck:
         self.last_report = float("-inf")
         self.phase = ""
         self.config: dict[str, int] = {}
-        self.home_started = 0.0
         self.read_traces: list[dict[str, Any]] = []
 
     def emit(self, record: dict) -> None:
@@ -312,25 +314,6 @@ class ReliefCheck:
         if not isinstance(value, (int, float)) or not math.isfinite(value) or int(value) != value:
             raise ReliefRefusal(f"Unusable telemetry for {register}.")
         return int(value)
-
-    def guarded_raw(self, phase: str, register: str) -> int:
-        """Preserve transport evidence for diagnostic reads outside sample()."""
-        self.read_traces = []
-        try:
-            return self.raw(register)
-        except ReliefRefusal as error:
-            reason = f"{phase}: lift telemetry failed: {error}"
-            self.emit(
-                {
-                    "phase": phase,
-                    "elapsed_s": round(time.monotonic() - self.start, 3),
-                    "wall_time_ns": time.time_ns(),
-                    "rejected": True,
-                    "rejection_reason": reason,
-                    "read_traces": list(self.read_traces),
-                }
-            )
-            raise ReliefRefusal(reason) from error
 
     def lift_snapshot(self) -> dict[str, int | float | bool]:
         present_current_raw = self.raw("Present_Current")
@@ -470,22 +453,6 @@ class ReliefCheck:
                 f"{data['phase']}: expected zero goal velocity and a stationary carriage.",
             )
 
-    def final_torque_off_before_motion(self, displacement_mm: float) -> None:
-        # This must be the last setup write. set_torque_enabled(False) is not
-        # suitable here because it writes Lock after Torque_Enable.
-        try:
-            write_register(self.robot.left_bus, "Torque_Enable", self.robot.lift.cfg.name, 0)
-        except Exception as error:
-            raise ReliefRefusal(f"before_torque: final torque-off request failed: {error}") from error
-        data = self.sample("before_torque", displacement_mm=displacement_mm, force=True)
-        self.expect(data, torque=0, goal=0)
-        self.expect_stationary(data)
-        if data["temperature_c"] > COOL_START_C:
-            self.refuse_sample(
-                data,
-                "Start must still be cool immediately before lift torque activation.",
-            )
-
     def cleanup_readback(self) -> None:
         # The ordinary safe shutdown writes Torque_Enable=0 and then Lock=0.
         # End this diagnostic with Torque_Enable itself, then prove torque and
@@ -521,126 +488,6 @@ class ReliefCheck:
                 "cleanup_readback: final torque/goal velocity readback was not zero.",
             )
 
-    def home_guard(self, phase: str, displacement_mm: float) -> None:
-        if not math.isfinite(displacement_mm) or not math.isfinite(self.robot.lift._last_tick):
-            raise ReliefRefusal("homing: nonfinite position telemetry.")
-        if phase == "before_torque":
-            # Observe the state left by configure() and its final zero write,
-            # without attributing any side effect to a particular register.
-            data = self.sample("setup_after_writes", displacement_mm=displacement_mm, force=True)
-            self.expect_stationary(data)
-            if data["temperature_c"] > COOL_START_C:
-                self.refuse_sample(
-                    data,
-                    "Start must still be cool immediately before lift torque activation.",
-                )
-            self.final_torque_off_before_motion(displacement_mm)
-            self.home_started = time.monotonic()
-            return
-
-        data = self.sample(phase, displacement_mm=displacement_mm)
-        self.expect(data, torque=1, goal=200)
-        if time.monotonic() - self.home_started >= self.robot.lift.cfg.home_timeout_s:
-            self.refuse_sample(data, "homing: timed out during guarded telemetry.")
-        if displacement_mm > 0.5 or data["present_velocity_raw"] < -STILL_VELOCITY_RAW:
-            self.refuse_sample(data, "homing: unexpected upward direction.")
-        if displacement_mm < -self.robot.lift.cfg.soft_max_mm:
-            self.refuse_sample(data, "homing: maximum travel exceeded.")
-
-    def raised_sample(self, phase: str, goal: int, *, force: bool = False) -> dict:
-        data = self.sample(phase, force=force)
-        self.expect(data, torque=1, goal=goal)
-        if data["height_mm"] < -0.5 or (goal < 0 and data["present_velocity_raw"] > STILL_VELOCITY_RAW):
-            self.refuse_sample(data, f"{phase}: unexpected downward direction.")
-        if data["height_mm"] > MAX_RELIEF_MM:
-            self.refuse_sample(data, f"{phase}: travel exceeded {MAX_RELIEF_MM} mm.")
-        if phase in ("settle", "rest") and data["height_mm"] < RELIEF_MM - 0.5:
-            self.refuse_sample(data, f"{phase}: unexpected downward direction after relief stopped.")
-        return data
-
-    def compare(self) -> None:
-        self.read_configuration()
-        self.preflight()
-        print(
-            "Authorize ONE home, logical +200 upward relief to 10 mm, then 45 s rest and torque-off. "
-            "Clear the carriage path. Be ready to support it safely without entering the mechanism "
-            "and remove motor power on a fault. No restart. Type RELIEF to proceed.", flush=True,
-        )
-        if input("Authorization: ").strip() != "RELIEF":
-            raise ReliefRefusal("Operator did not authorize RELIEF.")
-        self.preflight()  # Fresh after the gate, before any activation.
-        for motor in self.robot.base_motors:
-            write_register(self.robot.left_bus, "Goal_Velocity", motor, 0)
-        set_torque_enabled(self.robot.left_bus, self.robot.base_motors, enabled=False)
-        setup_before = self.sample("setup_before", force=True)
-        self.expect(setup_before, torque=0, goal=0)
-        self.expect_stationary(setup_before)
-        result = self.robot.lift.home(
-            safety_check=self.home_guard,
-            read_raw=lambda register: self.guarded_raw("homing_read", register),
-        )
-        if time.monotonic() - self.home_started >= self.robot.lift.cfg.home_timeout_s:
-            raise ReliefRefusal("homing: timed out before guarded completion.")
-        self.emit(
-            {
-                "phase": "home_complete",
-                "result": asdict(result),
-                "zero_reference": "process-local, unchanged",
-            }
-        )
-        self.raised_sample("post_home", 0, force=True)
-
-        self.robot.lift.apply_action(
-            {"lift_axis.vel": 200},
-            read_raw=lambda register: self.guarded_raw("relief_setup_read", register),
-        )
-        started = time.monotonic()
-        while True:
-            time.sleep(POLL_S)
-            data = self.raised_sample("relief", -200)
-            elapsed = time.monotonic() - started
-            if elapsed >= RELIEF_TIMEOUT_S:
-                self.refuse_sample(data, f"relief: target not reached within {RELIEF_TIMEOUT_S}s.")
-            if data["height_mm"] >= RELIEF_MM:
-                break
-            if elapsed >= 2.0 and data["height_mm"] < 0.5:
-                self.refuse_sample(data, "relief: no useful upward progress within 2 seconds.")
-        self.robot.lift.stop()
-
-        started = time.monotonic()
-        stable = 0
-        last_height = data["height_mm"]
-        while stable < 3:
-            time.sleep(POLL_S)
-            data = self.raised_sample("settle", 0)
-            still = (
-                abs(data["present_velocity_raw"]) <= STILL_VELOCITY_RAW
-                and abs(data["height_mm"] - last_height) <= 0.1
-            )
-            stable = stable + 1 if still else 0
-            last_height = data["height_mm"]
-            if time.monotonic() - started >= 1.0:
-                self.refuse_sample(data, "settle: motion did not stop within 1 second.")
-        rest_height = data["height_mm"]
-        started = time.monotonic()
-        high_current = 0
-        while True:
-            data = self.raised_sample("rest", 0, force=time.monotonic() - started >= REST_S)
-            if (
-                abs(data["height_mm"] - rest_height) > 0.5
-                or abs(data["present_velocity_raw"]) > STILL_VELOCITY_RAW
-            ):
-                self.refuse_sample(data, "rest: unexpected stationary motion.")
-            high_current = high_current + 1 if data["present_current_ma"] >= 200 else 0
-            if high_current >= 3:
-                self.refuse_sample(
-                    data,
-                    "rest: stationary current >=200 mA for three consecutive samples.",
-                )
-            if time.monotonic() - started >= REST_S:
-                break
-            time.sleep(POLL_S)
-
     def readback_only(self) -> None:
         """Collect a short torque-off snapshot series without homing or motion."""
         self.read_configuration()
@@ -660,21 +507,347 @@ class ReliefCheck:
             time.sleep(POLL_S)
 
 
+def make_grouped_transport(robot: AlohaMini) -> grouped_feedback.DirectSdkTransport:
+    """Reuse the already-open ID-11 bus as the comparator's sole SDK owner."""
+    return grouped_feedback.DirectSdkTransport(
+        robot.config.left_port,
+        motor_id=robot.lift.cfg.motor_id,
+        port_handler=robot.left_bus.port_handler,
+        packet_handler=robot.left_bus.packet_handler,
+    )
+
+
+class _ObservedLiftBus:
+    """Track acknowledged lift state while delegating writes to the owning bus."""
+
+    def __init__(self, delegate: Any, motor: str):
+        self.delegate = delegate
+        self.motor = motor
+        self.motors = delegate.motors
+        self.expected_torque = 0
+        self.expected_goal = 0
+
+    def read(self, register: str, motor: str, **kwargs) -> int | float:
+        value = self.delegate.read(register, motor, **kwargs)
+        if motor == self.motor and register == "Torque_Enable":
+            self.expected_torque = int(value)
+        elif motor == self.motor and register == "Goal_Velocity":
+            self.expected_goal = int(value)
+        return value
+
+    def write(self, register: str, motor: str, value: int | float, **kwargs) -> None:
+        self.delegate.write(register, motor, value, **kwargs)
+        if motor == self.motor and register == "Torque_Enable":
+            self.expected_torque = int(value)
+        elif motor == self.motor and register == "Goal_Velocity":
+            self.expected_goal = int(value)
+
+
+class _GroupedLiftReader:
+    """Give LiftAxis one fresh grouped position/current sample per homing poll."""
+
+    def __init__(self, check: InstalledLiftCheck):
+        self.check = check
+        self.phase = "setup_position"
+        self.last_record: dict[str, Any] | None = None
+        self._current_available = False
+
+    def set_phase(self, phase: str) -> None:
+        self.phase = phase
+        self._current_available = False
+
+    def __call__(self, register: str) -> int:
+        if register == "Present_Position":
+            expected_torque = None if self.phase == "setup_position" else self.check.bus.expected_torque
+            self.last_record = self.check.monitor.sample(
+                self.phase,
+                expected_torque=expected_torque,
+                expected_goal=self.check.bus.expected_goal,
+            )
+            self._current_available = True
+            return int(self.last_record["present_position_raw"])
+        if register == "Present_Current" and self._current_available and self.last_record is not None:
+            self._current_available = False
+            return int(self.last_record["present_current_raw"])
+        raise ReliefRefusal(
+            f"{self.phase}: {register} was requested without its fresh grouped position sample."
+        )
+
+
+class InstalledLiftCheck:
+    """ID-11-only installed home/relief/rest comparison using grouped feedback."""
+
+    def __init__(
+        self,
+        robot: AlohaMini,
+        *,
+        input_fn: Callable[[str], str] | None = None,
+    ) -> None:
+        self.robot = robot
+        self.input_fn = input if input_fn is None else input_fn
+        self.transport = make_grouped_transport(robot)
+        self.monitor = grouped_feedback.MotorFeedbackComparison(
+            self.transport,
+            input_fn=self.input_fn,
+            monotonic=time.monotonic,
+            sleep=time.sleep,
+            emit=self.emit,
+            # The installed comparison treats finite home/relief current as a
+            # transient. Its >=200 mA rule applies only to raised rest.
+            immediate_current_abort_ma=None,
+        )
+        self.bus = _ObservedLiftBus(robot.left_bus, robot.lift.cfg.name)
+        self.lift = LiftAxis(robot.lift.cfg, bus_left=self.bus, bus_right=None)
+        self.reader = _GroupedLiftReader(self)
+        self.home_started = 0.0
+
+    def emit(self, record: dict[str, Any]) -> None:
+        evidence = {**record, "wall_time_ns": time.time_ns()}
+        print(
+            "[LIFT RELIEF] "
+            + json.dumps(evidence, allow_nan=False, separators=(",", ":")),
+            flush=True,
+        )
+
+    def refuse(self, record: dict[str, Any], reason: str) -> None:
+        self.monitor.refuse(record, reason)
+
+    def home_guard(self, phase: str, displacement_mm: float) -> None:
+        if not math.isfinite(displacement_mm) or not math.isfinite(self.lift._last_tick):
+            raise ReliefRefusal("homing: nonfinite position telemetry.")
+        if phase == "before_torque":
+            # LiftAxis has completed every setup/mode/zero write. Make torque-off
+            # the final setup request, then prove a fresh stationary window.
+            setup_record = self.reader.last_record
+            if setup_record is None:
+                raise ReliefRefusal("before_torque: grouped setup evidence was unavailable.")
+            self.monitor.record(
+                "setup_after_writes",
+                torque_enable=int(setup_record["torque_enable"]),
+                goal_velocity_raw=int(setup_record["goal_velocity_raw"]),
+                operating_mode=int(setup_record["operating_mode"]),
+                group_trace=setup_record["group_trace"],
+            )
+            try:
+                write_register(self.bus, "Torque_Enable", self.lift.cfg.name, 0)
+            except Exception as error:
+                raise ReliefRefusal(
+                    f"before_torque: final torque-off request failed: {error}"
+                ) from error
+            self.bus.expected_torque = 0
+            self.monitor.qualify_stationary(
+                "before_torque",
+                expected_torque=0,
+                expected_goal=0,
+                cold_start=True,
+            )
+            self.home_started = time.monotonic()
+            self.reader.set_phase("homing")
+            return
+
+        record = self.reader.last_record
+        if record is None:
+            raise ReliefRefusal("homing: grouped position evidence was unavailable.")
+        evidence = {
+            **record,
+            "phase": "homing_position",
+            "sample_elapsed_s": record["elapsed_s"],
+            "homing_displacement_mm": displacement_mm,
+        }
+        self.emit(evidence)
+        if time.monotonic() - self.home_started >= self.lift.cfg.home_timeout_s:
+            self.refuse(evidence, "homing: timed out during guarded telemetry.")
+        if displacement_mm > 0.5 or int(record["present_velocity_raw"]) < -STILL_VELOCITY_RAW:
+            self.refuse(evidence, "homing: unexpected upward direction.")
+        if displacement_mm < -self.lift.cfg.soft_max_mm:
+            self.refuse(evidence, "homing: maximum travel exceeded.")
+
+    def _height_from_record(self, record: dict[str, Any]) -> float:
+        position = int(record["present_position_raw"])
+        return self.lift.get_height_mm(read_raw=lambda _register: position)
+
+    def _moving_height(self, phase: str) -> tuple[dict[str, Any], float]:
+        self.reader.set_phase(phase)
+        height = self.lift.get_height_mm(read_raw=self.reader)
+        record = self.reader.last_record
+        if record is None:
+            raise ReliefRefusal(f"{phase}: grouped position evidence was unavailable.")
+        self.monitor.record(
+            f"{phase}_height",
+            sample_elapsed_s=record["elapsed_s"],
+            present_position_raw=int(record["present_position_raw"]),
+            height_mm=round(height, 4),
+        )
+        return record, height
+
+    def _check_raised(self, phase: str, record: dict[str, Any], height: float) -> None:
+        if height < -0.5 or (
+            self.bus.expected_goal < 0
+            and int(record["present_velocity_raw"]) > STILL_VELOCITY_RAW
+        ):
+            self.refuse(record, f"{phase}: unexpected downward direction.")
+        if height > MAX_RELIEF_MM:
+            self.refuse(record, f"{phase}: travel exceeded {MAX_RELIEF_MM} mm.")
+
+    def compare(self) -> None:
+        if set(self.robot.left_bus.motors) != {self.robot.lift.cfg.name}:
+            raise ReliefRefusal("Installed lift comparison requires an ID-11-only bus.")
+        self.monitor.read_configuration()
+        baseline = self.monitor.qualify_stationary(
+            "baseline", expected_torque=0, expected_goal=0, cold_start=True
+        )
+        authorization = self.input_fn(
+            "Authorize ONE installed home, logical +200 upward relief to 10 mm, then "
+            "45 seconds of raised rest. Type RELIEF to proceed: "
+        )
+        if authorization.strip() != "RELIEF":
+            self.refuse(baseline, "Operator did not authorize RELIEF.")
+        pre_motion = self.monitor.qualify_stationary(
+            "pre_motion", expected_torque=0, expected_goal=0, cold_start=True
+        )
+        self.monitor.record(
+            "setup_before",
+            torque_enable=int(pre_motion["torque_enable"]),
+            goal_velocity_raw=int(pre_motion["goal_velocity_raw"]),
+            operating_mode=int(pre_motion["operating_mode"]),
+            group_trace=pre_motion["group_trace"],
+        )
+        self.bus.expected_torque = int(pre_motion["torque_enable"])
+        self.bus.expected_goal = int(pre_motion["goal_velocity_raw"])
+
+        self.reader.set_phase("setup_position")
+        result = self.lift.home(safety_check=self.home_guard, read_raw=self.reader)
+        if time.monotonic() - self.home_started >= self.lift.cfg.home_timeout_s:
+            raise ReliefRefusal("homing: timed out before guarded completion.")
+        self.monitor.record(
+            "home_complete",
+            result=asdict(result),
+            zero_reference="process-local, unchanged",
+        )
+
+        post_home = self.monitor.qualify_stationary(
+            "post_home",
+            expected_torque=1,
+            expected_goal=0,
+            allow_settling=True,
+            timeout_s=grouped_feedback.SETTLE_TIMEOUT_S,
+        )
+        post_home_height = self._height_from_record(post_home)
+        self.monitor.record("post_home_height", height_mm=round(post_home_height, 4))
+        if abs(post_home_height) > 0.5:
+            self.refuse(post_home, "post_home: process-local zero was not stationary at the stop.")
+
+        self.reader.set_phase("relief_setup")
+        self.lift.apply_action({"lift_axis.vel": 200}, read_raw=self.reader)
+        started = time.monotonic()
+        while True:
+            remaining = RELIEF_TIMEOUT_S - (time.monotonic() - started)
+            if remaining <= 0:
+                raise ReliefRefusal(f"relief: target not reached within {RELIEF_TIMEOUT_S}s.")
+            time.sleep(min(POLL_S, remaining))
+            record, height = self._moving_height("relief")
+            elapsed = time.monotonic() - started
+            self._check_raised("relief", record, height)
+            if elapsed >= RELIEF_TIMEOUT_S:
+                self.refuse(record, f"relief: target not reached within {RELIEF_TIMEOUT_S}s.")
+            if height >= RELIEF_MM:
+                break
+            if elapsed >= 2.0 and height < 0.5:
+                self.refuse(record, "relief: no useful upward progress within 2 seconds.")
+        self.lift.stop()
+
+        stopped = self.monitor.qualify_stationary(
+            "settle",
+            expected_torque=1,
+            expected_goal=0,
+            allow_settling=True,
+            timeout_s=grouped_feedback.SETTLE_TIMEOUT_S,
+        )
+        rest_height = self._height_from_record(stopped)
+        self._check_raised("settle", stopped, rest_height)
+        if rest_height < RELIEF_MM - 0.5:
+            self.refuse(stopped, "settle: unexpected downward direction after relief stopped.")
+        self.monitor.record("settle_height", height_mm=round(rest_height, 4))
+
+        started = time.monotonic()
+        high_current = 0
+
+        def check_rest_current(record: dict[str, Any]) -> None:
+            nonlocal high_current
+            high_current = high_current + 1 if float(record["present_current_ma"]) >= 200 else 0
+            if high_current >= 3:
+                self.refuse(
+                    record,
+                    "rest: stationary current >=200 mA for three consecutive samples.",
+                )
+
+        while True:
+            record = self.monitor.qualify_stationary(
+                "rest",
+                expected_torque=1,
+                expected_goal=0,
+                on_sample=check_rest_current,
+            )
+            height = self._height_from_record(record)
+            self.monitor.record(
+                "rest_height",
+                sample_elapsed_s=record["elapsed_s"],
+                present_position_raw=int(record["present_position_raw"]),
+                height_mm=round(height, 4),
+            )
+            self._check_raised("rest", record, height)
+            if abs(height - rest_height) > 0.5:
+                self.refuse(record, "rest: unexpected stationary motion.")
+            elapsed = time.monotonic() - started
+            if elapsed >= REST_S:
+                break
+
+        rest_end = self.monitor.qualify_stationary(
+            "rest_end",
+            expected_torque=1,
+            expected_goal=0,
+            allow_settling=True,
+            timeout_s=grouped_feedback.SETTLE_TIMEOUT_S,
+        )
+        final_height = self._height_from_record(rest_end)
+        self._check_raised("rest_end", rest_end, final_height)
+        if abs(final_height - rest_height) > 0.5:
+            self.refuse(rest_end, "rest_end: raised position did not remain stable.")
+        self.monitor.record("rest_complete", height_mm=round(final_height, 4), duration_s=REST_S)
+
+    def cleanup_readback(self) -> None:
+        # AlohaMini._safe_shutdown has already requested ID-11 zero, torque-off,
+        # and Lock=0. End with Torque_Enable itself and prove grouped stopped state.
+        self.bus.expected_goal = 0
+        self.bus.expected_torque = 0
+        write_register(self.bus, "Torque_Enable", self.lift.cfg.name, 0)
+        self.monitor.qualify_stationary(
+            "cleanup_readback",
+            expected_torque=0,
+            expected_goal=0,
+            allow_settling=True,
+            timeout_s=grouped_feedback.SETTLE_TIMEOUT_S,
+        )
+        self.lift.mark_unhomed()
+
+
 def _run_lift_diagnostic(
     robot: AlohaMini,
     operation,
     *,
     label: str,
     success_message: str,
+    check_factory=ReliefCheck,
 ) -> int:
     primary: BaseException | None = None
-    check = ReliefCheck(robot)
+    check = None
     try:
         # Connect the owning bus only: ordinary robot.connect/configure would activate
         # before cold telemetry and overwrite the settings this comparison must read.
         # The diagnostic itself reads and validates the actual model/firmware below;
         # avoid a second firmware sweep by the ordinary multi-motor handshake.
         robot.left_bus.connect(handshake=False)
+        check = check_factory(robot)
         operation(check)
     except BaseException as error:
         primary = error
@@ -689,7 +862,7 @@ def _run_lift_diagnostic(
                 errors = robot._safe_shutdown(
                     close_buses=True,
                     recover_interrupted_bus_io=primary is not None,
-                    motor_shutdown_check=check.cleanup_readback,
+                    motor_shutdown_check=(check.cleanup_readback if check is not None else None),
                 )
             except BaseException as error:
                 errors = [f"shutdown also failed: {type(error).__name__}: {error}"]
@@ -712,7 +885,9 @@ def _run_lift_diagnostic(
         print("Support the carriage safely; remove motor power. No automatic restart.", flush=True)
         if isinstance(primary, KeyboardInterrupt):
             return 130
-        return 2 if isinstance(primary, ReliefRefusal) else 1
+        return 2 if isinstance(
+            primary, (ReliefRefusal, grouped_feedback.ComparisonRefusal)
+        ) else 1
     print(f"{label}_PASS: {success_message}", flush=True)
     return 0
 
@@ -721,11 +896,12 @@ def run_lift_relief(robot: AlohaMini) -> int:
     """Run once and always use the existing zero/torque-off/bus-close cleanup."""
     return _run_lift_diagnostic(
         robot,
-        ReliefCheck.compare,
+        InstalledLiftCheck.compare,
         label="LIFT_RELIEF",
         success_message=(
             "bounded raised rest completed; zero/torque-off cleanup completed. Remove motor power."
         ),
+        check_factory=InstalledLiftCheck,
     )
 
 

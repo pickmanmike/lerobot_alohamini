@@ -427,12 +427,14 @@ class MotorFeedbackComparison:
         monotonic: Callable[[], float],
         sleep: Callable[[float], None],
         emit: Callable[[dict[str, Any]], None],
+        immediate_current_abort_ma: float | None = CURRENT_ABORT_MA,
     ) -> None:
         self.transport = transport
         self.input_fn = input_fn
         self.monotonic = monotonic
         self.sleep = sleep
         self.emit = emit
+        self.immediate_current_abort_ma = immediate_current_abort_ma
         self.started = monotonic()
         self.config: dict[str, Any] = {}
         self.opened = False
@@ -451,7 +453,18 @@ class MotorFeedbackComparison:
         groups: dict[int, bytes] = {}
         traces = []
         for start, length in CONFIG_GROUPS:
-            payload, trace = self.transport.read_group(start, length)
+            try:
+                payload, trace = self.transport.read_group(start, length)
+            except TransportRefusal as error:
+                self.refuse(
+                    {
+                        "phase": "configuration",
+                        "elapsed_s": round(self.monotonic() - self.started, 3),
+                        "group_range": {"start": start, "length": length},
+                        "group_trace": error.trace,
+                    },
+                    f"Configuration grouped read failed: {error}",
+                )
             groups[start] = payload
             traces.append(trace)
         self.config = _decode_configuration(groups)
@@ -479,8 +492,8 @@ class MotorFeedbackComparison:
         self,
         phase: str,
         *,
-        expected_torque: int,
-        expected_goal: int,
+        expected_torque: int | None,
+        expected_goal: int | None,
         cold_start: bool = False,
         start_position: int | None = None,
         timeout_ms: float = REPLY_TIMEOUT_MS,
@@ -525,12 +538,19 @@ class MotorFeedbackComparison:
             self.refuse(record, f"{phase}: servo status is nonzero.")
         if int(record["operating_mode"]) != 1:
             self.refuse(record, f"{phase}: operating mode changed from 1.")
-        if int(record["torque_enable"]) != expected_torque:
+        if expected_torque is not None and int(record["torque_enable"]) != expected_torque:
             self.refuse(record, f"{phase}: torque readback did not match {expected_torque}.")
-        if int(record["goal_velocity_raw"]) != expected_goal:
+        if expected_goal is not None and int(record["goal_velocity_raw"]) != expected_goal:
             self.refuse(record, f"{phase}: goal velocity did not match {expected_goal}.")
-        if float(record["present_current_ma"]) >= CURRENT_ABORT_MA:
-            self.refuse(record, f"{phase}: current reached the {CURRENT_ABORT_MA:g} mA diagnostic ceiling.")
+        if (
+            self.immediate_current_abort_ma is not None
+            and float(record["present_current_ma"]) >= self.immediate_current_abort_ma
+        ):
+            self.refuse(
+                record,
+                f"{phase}: current reached the {self.immediate_current_abort_ma:g} mA "
+                "diagnostic ceiling.",
+            )
         self.emit(record)
         return record
 
@@ -545,6 +565,7 @@ class MotorFeedbackComparison:
         max_position_delta_raw: int | None = None,
         allow_settling: bool = False,
         timeout_s: float = STATIONARY_TIMEOUT_S,
+        on_sample: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         """Require one bounded window of fresh, mutually consistent feedback."""
         qualification_started = self.monotonic()
@@ -645,6 +666,9 @@ class MotorFeedbackComparison:
                     if allow_settling:
                         candidate = [(sampled_at, record)]
                     continue
+
+            if on_sample is not None:
+                on_sample(record)
 
             window_s = candidate[-1][0] - candidate[0][0]
             if len(candidate) < STATIONARY_MIN_SAMPLES or window_s < STATIONARY_WINDOW_S:

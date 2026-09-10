@@ -68,7 +68,9 @@ class AlohaMiniConfig(RobotConfig):
     # Use together with --no_leader on the teleoperate side for base-only teleoperation.
     no_follower: bool = False
 
-
+    # Internal opt-in diagnostic scope. Ordinary robot construction keeps the
+    # complete body bus; the installed lift comparison owns ID 11 alone.
+    diagnostic_lift_only: bool = False
 
 
 @dataclass

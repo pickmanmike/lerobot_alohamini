@@ -6,13 +6,13 @@ import builtins
 import json
 import signal
 import sys
-from collections import Counter
 
 import pytest
 
 from lerobot.robots.alohamini import alohamini as robot_module
 from lerobot.robots.alohamini import alohamini_host as host
 from lerobot.robots.alohamini import lift_axis
+from lerobot.robots.alohamini import lift_motor_feedback as feedback
 from lerobot.robots.alohamini import lift_relief
 from tests.robots.test_alohamini_safe_bringup import FakeBus
 
@@ -36,6 +36,7 @@ class LiftBus(FakeBus):
         self.position = 1000.0
         self.bottom = 1100.0
         self.last_update = clock.now
+        self.refresh_count = 0
         self.up_factor = 1.0
         self.rest_current = 8
         self.raised = False
@@ -53,6 +54,25 @@ class LiftBus(FakeBus):
             }.items()
         })
 
+    def refresh_lift_state(self):
+        self.refresh_count += 1
+        goal = self.registers[("Goal_Velocity", "lift_axis")]
+        torque = self.registers[("Torque_Enable", "lift_axis")]
+        elapsed = self.clock.now - self.last_update
+        self.position = min(
+            self.bottom,
+            self.position + goal * torque * elapsed * (self.up_factor if goal < 0 else 1.0),
+        )
+        self.last_update = self.clock.now
+        if goal < 0:
+            self.raised = True
+        stopped = not goal or (goal > 0 and self.position >= self.bottom)
+        self.registers[("Present_Position", "lift_axis")] = round(self.position)
+        self.registers[("Present_Velocity", "lift_axis")] = 0 if stopped else goal
+        self.registers[("Present_Current", "lift_axis")] = (
+            self.rest_current if self.raised and stopped else 50 if stopped and torque else 5
+        )
+
     def connect(self, *, handshake=True):
         self.events.append(("left", "connect"))
         self.is_connected = True
@@ -64,21 +84,7 @@ class LiftBus(FakeBus):
     def read(self, register, motor, **kwargs):
         self.hook(register)
         if motor == "lift_axis":
-            goal = self.registers[("Goal_Velocity", motor)]
-            torque = self.registers[("Torque_Enable", motor)]
-            elapsed = self.clock.now - self.last_update
-            self.position = min(self.bottom, self.position + goal * torque * elapsed * (
-                self.up_factor if goal < 0 else 1.0
-            ))
-            self.last_update = self.clock.now
-            if goal < 0:
-                self.raised = True
-            stopped = not goal or (goal > 0 and self.position >= self.bottom)
-            self.registers[("Present_Position", motor)] = round(self.position)
-            self.registers[("Present_Velocity", motor)] = 0 if stopped else goal
-            self.registers[("Present_Current", motor)] = (
-                self.rest_current if self.raised and stopped else 50 if stopped and torque else 5
-            )
+            self.refresh_lift_state()
         return super().read(register, motor, **kwargs)
 
     def write(self, register, motor, value, **kwargs):
@@ -107,6 +113,155 @@ class LiftBus(FakeBus):
             self.registers[("Torque_Enable", motor)] = 1
 
 
+def _set_word(payload: bytearray, offset: int, value: int) -> None:
+    encoded = abs(value) | (0x8000 if value < 0 else 0)
+    payload[offset] = encoded & 0xFF
+    payload[offset + 1] = (encoded >> 8) & 0xFF
+
+
+class GroupedLiftTransport:
+    motor_id = 11
+
+    def __init__(self, bus: LiftBus):
+        self.bus = bus
+        self.group_reads: list[tuple[int, int]] = []
+
+    def _value(self, register: str):
+        try:
+            self.bus.hook(register)
+        except KeyboardInterrupt:
+            raise
+        except BaseException as error:
+            raise feedback.TransportRefusal(
+                f"modeled grouped {register} failure: {error}",
+                {
+                    "operation": "sync_read",
+                    "register": register,
+                    "requested_id": self.motor_id,
+                    "checksum_ok": None,
+                },
+            ) from error
+        sequence = self.bus.read_sequences.get((register, "lift_axis"))
+        if sequence:
+            value = sequence.pop(0)
+            if isinstance(value, KeyboardInterrupt):
+                raise value
+            if isinstance(value, BaseException):
+                raise feedback.TransportRefusal(
+                    f"modeled grouped {register} failure: {value}",
+                    {
+                        "operation": "sync_read",
+                        "register": register,
+                        "requested_id": self.motor_id,
+                        "checksum_ok": None,
+                    },
+                ) from value
+            if not isinstance(value, int):
+                raise feedback.TransportRefusal(
+                    f"modeled grouped {register} returned non-integer telemetry",
+                    {
+                        "operation": "sync_read",
+                        "register": register,
+                        "requested_id": self.motor_id,
+                        "checksum_ok": True,
+                    },
+                )
+            self.bus.registers[(register, "lift_axis")] = value
+        return self.bus.registers[(register, "lift_axis")]
+
+    def read_group(self, start, length, *, timeout_ms=feedback.REPLY_TIMEOUT_MS):
+        self.group_reads.append((start, length))
+        if (start, length) == (0, 18):
+            payload = bytearray(length)
+            payload[0:2] = bytes(
+                (self._value("Firmware_Major_Version"), self._value("Firmware_Minor_Version"))
+            )
+            _set_word(payload, 3, self._value("Model_Number"))
+            payload[5] = self.motor_id
+            payload[6] = 0
+            payload[13:16] = bytes(
+                (
+                    self._value("Max_Temperature_Limit"),
+                    self._value("Max_Voltage_Limit"),
+                    self._value("Min_Voltage_Limit"),
+                )
+            )
+        elif (start, length) == (19, 21):
+            payload = bytearray(length)
+            payload[0] = 44
+            payload[11] = 1
+            payload[14] = 1
+            payload[18:21] = bytes((10, 200, 200))
+        elif (start, length) == (40, 47):
+            payload = bytearray(length)
+            payload[0] = int(self.bus.registers[("Torque_Enable", "lift_axis")])
+            payload[1] = int(self.bus.registers[("Acceleration", "lift_axis")])
+            _set_word(payload, 6, int(self.bus.registers[("Goal_Velocity", "lift_axis")]))
+            _set_word(payload, 8, 1000)
+            payload[15] = int(self.bus.registers[("Lock", "lift_axis")])
+            payload[44:47] = bytes((65, 254, 1))
+        elif (start, length) == (feedback.FEEDBACK_START, feedback.FEEDBACK_LENGTH):
+            self.bus.refresh_lift_state()
+            payload = bytearray(length)
+            payload[feedback.OPERATING_MODE_ADDRESS - start] = int(
+                self._value("Operating_Mode")
+            )
+            payload[feedback.TORQUE_ENABLE_ADDRESS - start] = int(
+                self._value("Torque_Enable")
+            )
+            _set_word(
+                payload,
+                feedback.GOAL_VELOCITY_ADDRESS - start,
+                int(self._value("Goal_Velocity")),
+            )
+            payload[feedback.LOCK_ADDRESS - start] = int(
+                self._value("Lock")
+            )
+            self.bus.registers[("Present_Position", "lift_axis")] = round(self.bus.position)
+            _set_word(
+                payload,
+                feedback.PRESENT_POSITION_ADDRESS - start,
+                int(self._value("Present_Position")),
+            )
+            _set_word(
+                payload,
+                feedback.PRESENT_VELOCITY_ADDRESS - start,
+                int(self._value("Present_Velocity")),
+            )
+            _set_word(payload, feedback.PRESENT_LOAD_ADDRESS - start, 0)
+            payload[feedback.PRESENT_VOLTAGE_ADDRESS - start] = int(
+                self._value("Present_Voltage")
+            )
+            payload[feedback.PRESENT_TEMPERATURE_ADDRESS - start] = int(
+                self._value("Present_Temperature")
+            )
+            payload[feedback.STATUS_ADDRESS - start] = int(
+                self._value("Status")
+            )
+            payload[feedback.MOVING_ADDRESS - start] = int(
+                abs(self.bus.registers[("Present_Velocity", "lift_axis")]) > 5
+            )
+            _set_word(
+                payload,
+                feedback.PRESENT_CURRENT_ADDRESS - start,
+                int(self._value("Present_Current")),
+            )
+        else:
+            raise AssertionError(f"unexpected grouped read {(start, length)}")
+        return bytes(payload), {
+            "start_address": start,
+            "requested_width": length,
+            "response_payload_bytes": list(payload),
+            "response_payload_length": len(payload),
+            "checksum_ok": True,
+            "request_correlation": "single_group_reply_without_address_or_sequence",
+            "reply_timeout_ms": timeout_ms,
+        }
+
+    def write_register(self, *_args, **_kwargs):
+        raise AssertionError("installed relief writes must remain owned by LiftAxis")
+
+
 @pytest.fixture
 def rig(monkeypatch, tmp_path):
     clock = Clock()
@@ -131,6 +286,18 @@ def rig(monkeypatch, tmp_path):
     monkeypatch.setattr(robot_module, "FeetechMotorsBus", make_bus)
     monkeypatch.setattr(host, "AlohaMini", make_robot)
     monkeypatch.setattr(host, "AlohaMiniHost", lambda *_: pytest.fail("diagnostic opened ZMQ"))
+
+    def make_grouped_transport(robot):
+        transport = GroupedLiftTransport(robot.left_bus)
+        robot.left_bus.grouped_transport = transport
+        return transport
+
+    monkeypatch.setattr(
+        lift_relief,
+        "make_grouped_transport",
+        make_grouped_transport,
+        raising=False,
+    )
     monkeypatch.setattr(builtins, "input", lambda _: "RELIEF")
     monkeypatch.setattr(sys, "argv", [
         "alohamini_host", "--robot_model", "alohamini1", "--no_follower", "--no_cameras",
@@ -156,6 +323,30 @@ def assert_stopped(bus):
     assert not bus.is_connected
 
 
+def test_relief_diagnostic_constructs_only_lift_id_11(rig, capsys):
+    _, buses, _ = rig
+
+    assert execute() == 0
+    capsys.readouterr()
+
+    assert len(buses) == 1
+    assert set(buses[0].motors) == {"lift_axis"}
+    assert buses[0].motors["lift_axis"].id == 11
+
+
+def test_relief_uses_grouped_dynamic_feedback_instead_of_scalar_samples(rig, capsys):
+    _, buses, _ = rig
+
+    assert execute() == 0
+    capsys.readouterr()
+
+    assert hasattr(buses[0], "grouped_transport")
+    assert buses[0].grouped_transport.group_reads.count(
+        (feedback.FEEDBACK_START, feedback.FEEDBACK_LENGTH)
+    ) > 0
+    assert not [event for event in buses[0].events if event[1] == "read"]
+
+
 def test_relief_homes_once_moves_up_ten_mm_then_observes_45_seconds_and_cleans_up(rig, capsys):
     clock, buses, robots = rig
     assert execute() == 0
@@ -171,23 +362,24 @@ def test_relief_homes_once_moves_up_ten_mm_then_observes_45_seconds_and_cleans_u
     assert lift_writes[-1][2:] == ("Torque_Enable", "lift_axis", 0)
     assert_stopped(bus)
     assert robot.lift.cfg.descent_floor_mm == 5.0
-    assert robot.lift._z0_deg < 0  # Original bottom reference survives the relief move.
     records = reports(capsys)
-    observations = [r for r in records if r.get("phase") == "rest"]
+    home_complete = next(r for r in records if r.get("phase") == "home_complete")
+    assert home_complete["result"]["final_position_raw"] == round(bus.bottom)
+    assert home_complete["zero_reference"] == "process-local, unchanged"
+    observations = [r for r in records if r.get("phase") == "rest_height"]
     assert len(observations) >= 45
     assert all(10 <= r["height_mm"] <= 12 for r in observations)
     assert observations[-1]["elapsed_s"] - observations[0]["elapsed_s"] >= 44
-    assert all(r["goal_velocity_raw"] == r["present_velocity_raw"] == 0 for r in observations)
+    rest_feedback = [r for r in records if r.get("phase") == "rest"]
+    assert all(r["goal_velocity_raw"] == r["present_velocity_raw"] == 0 for r in rest_feedback)
     cleanup = [r for r in records if r.get("phase") == "cleanup_readback"]
-    assert len(cleanup) == 1
-    assert cleanup[0]["torque_enable"] == cleanup[0]["goal_velocity_raw"] == 0
-    assert 145 <= clock.now <= 165
-    reads = Counter(e[2] for e in bus.events if e[1] == "read")
-    for name in ("Firmware_Major_Version", "Firmware_Minor_Version", "Max_Temperature_Limit",
-                 "Unloading_Condition", "Velocity_closed_loop_P_proportional_coefficient",
-                 "Velocity_closed_loop_I_integral_coefficient", "Maximum_Velocity_Limit"):
-        assert reads[name] == 1
-    assert reads["Phase"] == 0
+    assert len(cleanup) >= feedback.STATIONARY_MIN_SAMPLES
+    assert all(r["torque_enable"] == r["goal_velocity_raw"] == 0 for r in cleanup)
+    assert 148 <= clock.now <= 150
+    assert bus.grouped_transport.group_reads.count((0, 18)) == 1
+    assert bus.grouped_transport.group_reads.count((19, 21)) == 1
+    assert bus.grouped_transport.group_reads.count((40, 47)) == 1
+    assert not any(event[1:3] == ("read", "Phase") for event in bus.events)
 
 
 @pytest.mark.parametrize("setup_register", ["Goal_Velocity", "Operating_Mode"])
@@ -246,7 +438,7 @@ def test_ineffective_final_pre_motion_torque_off_refuses_without_nonzero_goal(
     }
     assert phase["setup_after_writes"]["torque_enable"] == 1
     assert phase["before_torque"]["torque_enable"] == 1
-    assert "before_torque" in output and "unexpected torque" in output
+    assert "before_torque" in output and "torque readback did not match 0" in output
     assert not any(
         event[1:4] == ("write", "Goal_Velocity", "lift_axis") and event[-1] != 0
         for event in buses[0].events
@@ -285,7 +477,7 @@ def test_final_pre_motion_sample_still_requires_cool_temperature(rig, monkeypatc
     monkeypatch.setattr(LiftBus, "write", write)
     assert execute() == 2
     output = capsys.readouterr().out
-    assert "cool" in output.lower() and '"phase":"before_torque"' in output
+    assert "starting temperature" in output.lower() and '"phase":"before_torque"' in output
     assert not any(
         event[1:4] == ("write", "Goal_Velocity", "lift_axis") and event[-1] != 0
         for event in rig[1][0].events
@@ -312,7 +504,7 @@ def test_cleanup_readback_refuses_if_final_direct_torque_off_is_ineffective(
 
 
 @pytest.mark.parametrize("fault,reason", [
-    ("hot_start", "cool"), ("missing", "telemetry"), ("fault_status", "status"),
+    ("hot_start", "temperature"), ("missing", "telemetry"), ("fault_status", "status"),
     ("wrong_model", "model"), ("nonfinite", "telemetry"), ("powered_start", "torque"),
 ])
 def test_preflight_faults_refuse_before_any_torque_enable(rig, monkeypatch, capsys, fault, reason):
@@ -326,7 +518,12 @@ def test_preflight_faults_refuse_before_any_torque_enable(rig, monkeypatch, caps
             "fault_status": ("Status", 4), "wrong_model": ("Model_Number", 2825),
             "nonfinite": ("Present_Temperature", float("nan")), "powered_start": ("Torque_Enable", 1),
         }[fault]
-        bus.registers[(register, "lift_axis")] = value
+        if fault in ("missing", "nonfinite"):
+            bus.read_sequences[(register, "lift_axis")] = [
+                OSError("telemetry missing") if fault == "missing" else value
+            ]
+        else:
+            bus.registers[(register, "lift_axis")] = value
 
     monkeypatch.setattr(LiftBus, "connect", connect)
     assert execute() == 2
@@ -354,7 +551,7 @@ def test_operator_gate_is_before_homing_and_requires_fresh_cool_telemetry(rig, m
     ("no_motion", "progress"), ("wrong_direction", "direction"), ("travel", "travel"),
     ("hot_homing", "temperature"), ("hot_relief", "temperature"),
     ("high_idle_current", "current"), ("telemetry_failure", "telemetry"),
-    ("interrupt", "interrupted"),
+    ("persistent_rest_velocity", "stationary"), ("interrupt", "interrupted"),
 ])
 def test_motion_and_rest_aborts_converge_on_zero_torque_off_and_close(rig, monkeypatch, capsys, fault, reason):
     clock, buses, _ = rig
@@ -362,23 +559,38 @@ def test_motion_and_rest_aborts_converge_on_zero_torque_off_and_close(rig, monke
 
     def connect(bus, **kwargs):
         original(bus, **kwargs)
+        interrupted = False
+        stopped_feedback = 0
         if fault in ("no_motion", "wrong_direction", "travel"):
             bus.up_factor = {"no_motion": 0, "wrong_direction": -1, "travel": 100}[fault]
         if fault == "high_idle_current":
             bus.rest_current = 31  # 201.5mA, below the earlier 300mA criterion.
 
         def hook(register):
+            nonlocal interrupted, stopped_feedback
             goal = bus.registers[("Goal_Velocity", "lift_axis")]
             if fault == "wrong_direction" and goal < 0 and register == "Present_Velocity":
                 bus.read_sequences[(register, "lift_axis")] = [200]
             if fault == "hot_homing" and goal > 0 or fault == "hot_relief" and goal < 0:
                 bus.registers[("Present_Temperature", "lift_axis")] = 55
             if bus.raised and register == "Present_Temperature":
+                if goal == 0:
+                    stopped_feedback += 1
                 if fault == "telemetry_failure":
                     raise OSError("telemetry disconnected")
                 if fault == "interrupt":
-                    bus.port_handler.is_using = True
-                    raise KeyboardInterrupt()
+                    if not interrupted:
+                        interrupted = True
+                        bus.port_handler.is_using = True
+                        raise KeyboardInterrupt()
+            if (
+                fault == "persistent_rest_velocity"
+                and bus.raised
+                and goal == 0
+                and register == "Present_Velocity"
+                and stopped_feedback >= 8
+            ):
+                bus.read_sequences[(register, "lift_axis")] = [50]
 
         bus.hook = hook
 
@@ -428,288 +640,181 @@ def test_rejected_temperature_sample_is_emitted_inside_report_throttle(rig, monk
     assert execute() == 2
     records = reports(capsys)
     rejected = [record for record in records if record.get("rejected")]
-    assert rejected[-1]["phase"] == "homing"
-    assert rejected[-1]["present_temperature_raw"] == 93
-    assert rejected[-1]["temperature_c"] == 93
-    assert "diagnostic ceiling 55 C" in rejected[-1]["rejection_reason"]
+    homing_rejection = next(record for record in rejected if record["phase"] == "homing")
+    assert homing_rejection["temperature_c"] == 93
+    assert "diagnostic ceiling 55 C" in homing_rejection["rejection_reason"]
     normal_homing = [
         record
         for record in records
         if record.get("phase") == "homing" and not record.get("rejected")
     ]
-    assert normal_homing[-1]["present_temperature_raw"] == 30
-    assert rejected[-1]["elapsed_s"] - normal_homing[-1]["elapsed_s"] < 1.0
+    assert normal_homing[-1]["temperature_c"] == 30
+    assert homing_rejection["elapsed_s"] - normal_homing[-1]["elapsed_s"] < 1.0
     assert not any(record.get("phase") == "home_complete" for record in records)
     assert_stopped(buses[0])
     assert clock.now < 103
 
 
-def test_rejected_sample_includes_diagnostic_sdk_request_reply_trace(rig, monkeypatch, capsys):
+def test_rejected_sample_includes_grouped_request_reply_trace(rig, monkeypatch, capsys):
     _, buses, _ = rig
     original = LiftBus.connect
-    homing_temperature_reads = 0
 
     def connect(bus, **kwargs):
         original(bus, **kwargs)
-        bus.packet_handler = object()
+        homing_temperature_reads = 0
 
-    def verified_read(bus, register, motor):
-        nonlocal homing_temperature_reads
-        value = bus.read(register, motor, normalize=False, num_retry=0)
-        if register == "Present_Temperature" and bus.registers[("Goal_Velocity", motor)] == 200:
-            homing_temperature_reads += 1
-            if homing_temperature_reads == 2:
-                value = 93
-        return int(value), {
-            "register": register,
-            "address": 63 if register == "Present_Temperature" else 0,
-            "requested_width": 1,
-            "requested_id": 11,
-            "response_bytes": [255, 255, 11, 3, 0, int(value), 0],
-            "response_length": 7,
-            "response_id": 11,
-            "sdk_servo_error": 0,
-            "response_error": 0,
-            "checksum_ok": True,
-            "elapsed_ms": 0.1,
-            "request_correlation": "id_length_checksum_only",
-        }
+        def hook(register):
+            nonlocal homing_temperature_reads
+            if register == "Present_Temperature" and bus.registers[("Goal_Velocity", "lift_axis")] == 200:
+                homing_temperature_reads += 1
+                if homing_temperature_reads == 2:
+                    bus.registers[(register, "lift_axis")] = 93
+
+        bus.hook = hook
 
     monkeypatch.setattr(LiftBus, "connect", connect)
-    monkeypatch.setattr(lift_relief, "read_diagnostic_scalar", verified_read)
 
     assert execute() == 2
-    rejected = [record for record in reports(capsys) if record.get("rejected")]
-    temperature_trace = [
-        trace for trace in rejected[-1]["read_traces"] if trace["register"] == "Present_Temperature"
+    rejected = [
+        record
+        for record in reports(capsys)
+        if record.get("rejected") and record.get("phase") == "homing"
     ]
-    assert rejected[-1]["present_temperature_raw"] == 93
-    assert temperature_trace[-1]["response_bytes"][5] == 93
-    assert temperature_trace[-1]["request_correlation"] == "id_length_checksum_only"
+    assert rejected[-1]["temperature_c"] == 93
+    trace = rejected[-1]["group_trace"]
+    assert trace["start_address"] == feedback.FEEDBACK_START
+    assert trace["requested_width"] == feedback.FEEDBACK_LENGTH
+    assert trace["response_payload_bytes"][feedback.PRESENT_TEMPERATURE_ADDRESS - feedback.FEEDBACK_START] == 93
+    assert trace["request_correlation"] == "single_group_reply_without_address_or_sequence"
     assert not any(e[1:3] == ("write", "Goal_Velocity") and e[-1] < 0 for e in buses[0].events)
     assert_stopped(buses[0])
 
 
-def test_post_sample_goal_refusal_is_emitted_inside_report_throttle(rig, monkeypatch, capsys):
+def test_grouped_homing_goal_mismatch_is_preserved_and_refused(rig, monkeypatch, capsys):
     _, buses, _ = rig
     original = LiftBus.connect
-    homing_goal_reads = 0
 
     def connect(bus, **kwargs):
         original(bus, **kwargs)
-        bus.packet_handler = object()
+        homing_goal_reads = 0
 
-    def verified_read(bus, register, motor):
-        nonlocal homing_goal_reads
-        value = bus.read(register, motor, normalize=False, num_retry=0)
-        if register == "Goal_Velocity" and bus.registers[(register, motor)] == 200:
-            homing_goal_reads += 1
-            if homing_goal_reads == 2:
-                value = 0
-        return int(value), {
-            "register": register,
-            "address": 46 if register == "Goal_Velocity" else 0,
-            "requested_width": 2,
-            "requested_id": 11,
-            "response_bytes": [255, 255, 11, 4, 0, int(value) & 0xFF, int(value) >> 8, 0],
-            "response_length": 8,
-            "response_id": 11,
-            "response_error": 0,
-            "sdk_servo_error": 0,
-            "checksum_ok": True,
-            "elapsed_ms": 0.1,
-            "request_correlation": "id_length_checksum_only",
-        }
+        def hook(register):
+            nonlocal homing_goal_reads
+            if register == "Goal_Velocity" and bus.registers[(register, "lift_axis")] == 200:
+                homing_goal_reads += 1
+                if homing_goal_reads == 2:
+                    bus.read_sequences[(register, "lift_axis")] = [0]
+
+        bus.hook = hook
 
     monkeypatch.setattr(LiftBus, "connect", connect)
-    monkeypatch.setattr(lift_relief, "read_diagnostic_scalar", verified_read)
 
     assert execute() == 2
     records = reports(capsys)
-    rejected = [record for record in records if record.get("rejected")]
-    normal_homing = [
-        record for record in records if record.get("phase") == "homing" and not record.get("rejected")
-    ]
-    assert rejected[-1]["phase"] == "homing"
-    assert rejected[-1]["goal_velocity_raw"] == 0
-    assert "unexpected torque/goal velocity" in rejected[-1]["rejection_reason"]
-    goal_trace = [trace for trace in rejected[-1]["read_traces"] if trace["register"] == "Goal_Velocity"]
-    assert goal_trace[-1]["response_bytes"][5] == 0
-    assert rejected[-1]["elapsed_s"] - normal_homing[-1]["elapsed_s"] < 1.0
-    assert_stopped(buses[0])
-
-
-def test_configuration_transport_refusal_emits_the_rejected_reply_trace(rig, monkeypatch, capsys):
-    _, buses, _ = rig
-    original = LiftBus.connect
-    failed = False
-
-    def connect(bus, **kwargs):
-        original(bus, **kwargs)
-        bus.packet_handler = object()
-
-    def verified_read(bus, register, motor):
-        nonlocal failed
-        if register == "Model_Number" and not failed:
-            failed = True
-            raise lift_relief.DiagnosticReadError(
-                "Response checksum could not be verified.",
-                {
-                    "register": register,
-                    "address": 0,
-                    "requested_width": 2,
-                    "requested_id": 11,
-                    "response_bytes": [255, 255, 11, 4, 0, 9, 3, 0],
-                    "response_length": 8,
-                    "response_id": 11,
-                    "sdk_servo_error": 0,
-                    "response_error": 0,
-                    "checksum_ok": False,
-                    "elapsed_ms": 0.1,
-                    "request_correlation": "id_length_checksum_only",
-                },
-            )
-        value = bus.read(register, motor, normalize=False, num_retry=0)
-        return int(value), {"register": register, "checksum_ok": True}
-
-    monkeypatch.setattr(LiftBus, "connect", connect)
-    monkeypatch.setattr(lift_relief, "read_diagnostic_scalar", verified_read)
-
-    assert execute() == 2
-    rejected = [record for record in reports(capsys) if record.get("rejected")]
-    assert rejected[-1]["phase"] == "configuration"
-    assert "Configuration telemetry failed" in rejected[-1]["rejection_reason"]
-    assert rejected[-1]["read_traces"][-1]["register"] == "Model_Number"
-    assert rejected[-1]["read_traces"][-1]["checksum_ok"] is False
-    assert_stopped(buses[0])
-
-
-def test_guarded_diagnostic_routes_lift_position_and_current_through_verified_reader(
-    rig, monkeypatch, capsys
-):
-    _, buses, _ = rig
-    original = LiftBus.connect
-    verified_reads = Counter()
-
-    def connect(bus, **kwargs):
-        original(bus, **kwargs)
-        bus.packet_handler = object()
-
-    def verified_read(bus, register, motor):
-        verified_reads[register] += 1
-        value = bus.read(register, motor, normalize=False, num_retry=0)
-        return int(value), {
-            "register": register,
-            "address": 0,
-            "requested_width": 1,
-            "requested_id": 11,
-            "response_bytes": [],
-            "response_length": 0,
-            "response_id": 11,
-            "sdk_servo_error": 0,
-            "response_error": 0,
-            "checksum_ok": True,
-            "elapsed_ms": 0.1,
-            "request_correlation": "id_length_checksum_only",
-        }
-
-    monkeypatch.setattr(LiftBus, "connect", connect)
-    monkeypatch.setattr(lift_relief, "read_diagnostic_scalar", verified_read)
-
-    assert execute() == 0
-    capsys.readouterr()
-    bus_reads = Counter(event[2] for event in buses[0].events if event[1] == "read")
-    assert verified_reads["Present_Position"] == bus_reads["Present_Position"] > 0
-    assert verified_reads["Present_Current"] == bus_reads["Present_Current"] > 0
-    assert_stopped(buses[0])
-
-
-def test_homing_position_transport_refusal_emits_the_rejected_reply_trace(rig, monkeypatch, capsys):
-    _, buses, _ = rig
-    original = LiftBus.connect
-
-    def connect(bus, **kwargs):
-        original(bus, **kwargs)
-        bus.packet_handler = object()
-
-    def verified_read(bus, register, motor):
-        if register == "Present_Position" and bus.registers[("Goal_Velocity", motor)] == 200:
-            raise lift_relief.DiagnosticReadError(
-                "Response payload length 1 did not match requested 2.",
-                {
-                    "register": register,
-                    "address": 56,
-                    "requested_width": 2,
-                    "requested_id": 11,
-                    "response_bytes": [255, 255, 11, 3, 0, 93, 147],
-                    "response_length": 7,
-                    "response_id": 11,
-                    "response_payload_length": 1,
-                    "sdk_servo_error": 0,
-                    "response_error": 0,
-                    "checksum_ok": True,
-                    "elapsed_ms": 0.1,
-                    "request_correlation": "id_length_checksum_only",
-                },
-            )
-        value = bus.read(register, motor, normalize=False, num_retry=0)
-        return int(value), {"register": register, "checksum_ok": True}
-
-    monkeypatch.setattr(LiftBus, "connect", connect)
-    monkeypatch.setattr(lift_relief, "read_diagnostic_scalar", verified_read)
-
-    assert execute() == 2
-    records = reports(capsys)
-    rejected = [record for record in records if record.get("rejected")]
-    assert rejected[-1]["phase"] == "homing_read"
-    assert rejected[-1]["read_traces"][-1]["register"] == "Present_Position"
-    assert rejected[-1]["read_traces"][-1]["response_payload_length"] == 1
+    rejected = next(
+        record for record in records if record.get("rejected") and record.get("phase") == "homing"
+    )
+    assert rejected["goal_velocity_raw"] == 0
+    assert "goal velocity did not match 200" in rejected["rejection_reason"]
+    assert rejected["group_trace"]["requested_width"] == feedback.FEEDBACK_LENGTH
     assert not any(record.get("phase") == "home_complete" for record in records)
     assert_stopped(buses[0])
 
 
-def test_cleanup_transport_trace_is_retained_without_replacing_primary_refusal(rig, monkeypatch, capsys):
+def test_configuration_transport_refusal_emits_grouped_trace(rig, monkeypatch, capsys):
     _, buses, _ = rig
     original = LiftBus.connect
-    hot_sample_finished = False
-    injected_high = False
-    cleanup_failed = False
 
     def connect(bus, **kwargs):
         original(bus, **kwargs)
-        bus.packet_handler = object()
 
-    def verified_read(bus, register, motor):
-        nonlocal cleanup_failed, hot_sample_finished, injected_high
-        if hot_sample_finished and register == "Torque_Enable" and not cleanup_failed:
-            cleanup_failed = True
-            raise lift_relief.DiagnosticReadError(
-                "Response checksum could not be verified.",
-                {
-                    "register": register,
-                    "address": 40,
-                    "requested_width": 1,
-                    "requested_id": 11,
-                    "response_bytes": [255, 255, 11, 3, 0, 0, 1],
-                    "response_length": 7,
-                    "response_id": 11,
-                    "response_error": 0,
-                    "sdk_servo_error": 0,
-                    "checksum_ok": False,
-                    "elapsed_ms": 0.1,
-                    "request_correlation": "id_length_checksum_only",
-                },
-            )
-        value = bus.read(register, motor, normalize=False, num_retry=0)
-        if register == "Present_Temperature" and bus.registers[("Goal_Velocity", motor)] == 200:
-            value = 93
-            injected_high = True
-        if register == "Present_Load" and injected_high:
-            hot_sample_finished = True
-        return int(value), {"register": register, "checksum_ok": True}
+        def hook(register):
+            if register == "Model_Number":
+                raise OSError("modeled checksum failure")
+
+        bus.hook = hook
 
     monkeypatch.setattr(LiftBus, "connect", connect)
-    monkeypatch.setattr(lift_relief, "read_diagnostic_scalar", verified_read)
+
+    assert execute() == 2
+    rejected = [record for record in reports(capsys) if record.get("rejected")]
+    assert rejected[-1]["phase"] == "configuration"
+    assert "Configuration grouped read failed" in rejected[-1]["rejection_reason"]
+    assert rejected[-1]["group_trace"]["register"] == "Model_Number"
+    assert rejected[-1]["group_trace"]["checksum_ok"] is None
+    assert_stopped(buses[0])
+
+
+def test_each_grouped_feedback_sample_advances_the_fake_encoder_once(rig, capsys):
+    _, buses, _ = rig
+
+    assert execute() == 0
+    capsys.readouterr()
+
+    bus = buses[0]
+    feedback_reads = bus.grouped_transport.group_reads.count(
+        (feedback.FEEDBACK_START, feedback.FEEDBACK_LENGTH)
+    )
+    assert bus.refresh_count == feedback_reads > 0
+    assert not [event for event in bus.events if event[1] == "read"]
+    assert_stopped(bus)
+
+
+def test_homing_group_transport_refusal_emits_trace_and_prevents_relief(rig, monkeypatch, capsys):
+    _, buses, _ = rig
+    original = LiftBus.connect
+
+    def connect(bus, **kwargs):
+        original(bus, **kwargs)
+
+        def hook(register):
+            if register == "Present_Position" and bus.registers[("Goal_Velocity", "lift_axis")] == 200:
+                raise OSError("modeled grouped position payload failure")
+
+        bus.hook = hook
+
+    monkeypatch.setattr(LiftBus, "connect", connect)
+
+    assert execute() == 2
+    records = reports(capsys)
+    rejected = next(
+        record for record in records if record.get("rejected") and record.get("phase") == "homing"
+    )
+    assert rejected["group_trace"]["register"] == "Present_Position"
+    assert rejected["group_trace"]["checksum_ok"] is None
+    assert not any(record.get("phase") == "home_complete" for record in records)
+    assert not any(event[1:3] == ("write", "Goal_Velocity") and event[-1] < 0 for event in buses[0].events)
+    assert_stopped(buses[0])
+
+
+def test_cleanup_group_trace_does_not_replace_primary_refusal(rig, monkeypatch, capsys):
+    _, buses, _ = rig
+    original_read_group = GroupedLiftTransport.read_group
+    primary_triggered = False
+    cleanup_failed = False
+
+    def read_group(transport, start, length, **kwargs):
+        nonlocal primary_triggered, cleanup_failed
+        bus = transport.bus
+        if (start, length) == (feedback.FEEDBACK_START, feedback.FEEDBACK_LENGTH):
+            if primary_triggered and bus.registers[("Goal_Velocity", "lift_axis")] == 0 and not cleanup_failed:
+                cleanup_failed = True
+                raise feedback.TransportRefusal(
+                    "modeled cleanup checksum failure",
+                    {
+                        "operation": "sync_read",
+                        "start_address": start,
+                        "requested_width": length,
+                        "requested_id": 11,
+                        "checksum_ok": False,
+                    },
+                )
+            if bus.registers[("Goal_Velocity", "lift_axis")] == 200 and not primary_triggered:
+                bus.registers[("Present_Temperature", "lift_axis")] = 93
+                primary_triggered = True
+        return original_read_group(transport, start, length, **kwargs)
+
+    monkeypatch.setattr(GroupedLiftTransport, "read_group", read_group)
 
     assert execute() == 2
     output = capsys.readouterr().out
@@ -718,13 +823,12 @@ def test_cleanup_transport_trace_is_retained_without_replacing_primary_refusal(r
         for line in output.splitlines()
         if line.startswith("[LIFT RELIEF] ")
     ]
-    cleanup_rejections = [
+    cleanup_rejection = next(
         record
         for record in records
         if record.get("phase") == "cleanup_readback" and record.get("rejected")
-    ]
-    assert cleanup_rejections[-1]["read_traces"][-1]["register"] == "Torque_Enable"
-    assert cleanup_rejections[-1]["read_traces"][-1]["checksum_ok"] is False
+    )
+    assert cleanup_rejection["group_trace"]["checksum_ok"] is False
     assert "LIFT_RELIEF_REFUSED: homing: temperature 93 C" in output
     assert "Cleanup detail:" in output
     assert_stopped(buses[0])
@@ -843,7 +947,7 @@ def test_temperature_is_still_cool_immediately_before_torque(rig, monkeypatch, c
 
     monkeypatch.setattr(LiftBus, "write", write)
     assert execute() == 2
-    assert "cool" in capsys.readouterr().out.lower()
+    assert "starting temperature" in capsys.readouterr().out.lower()
     assert not any(e[1:3] == ("write", "Torque_Enable") and e[-1] == 1 for e in rig[1][0].events)
 
 
@@ -867,9 +971,8 @@ def test_nonfinite_homing_position_aborts_before_relief(rig, monkeypatch, capsys
 
 
 @pytest.mark.parametrize("fault,reason", [
-    ("slow_relief", "8.0s"), ("slow_telemetry", "gap"),
+    ("slow_relief", "8.0s"),
     ("late_target", "8.0s"),
-    ("late_home", "timed out"),
     ("settle_descent", "direction"), ("home_timeout", "timed out"),
     ("stationary_motion", "motion"), ("fault_in_rest", "status"),
 ])
@@ -883,21 +986,14 @@ def test_remaining_time_and_stationary_bounds(rig, monkeypatch, capsys, fault, r
             bus.up_factor = 0.2
         if fault == "late_target":
             bus.up_factor = 0.302
-        if fault in ("home_timeout", "late_home"):
+        if fault == "home_timeout":
             bus.bottom = 100000
         stopped_reads = 0
 
         def hook(register):
             nonlocal stopped_reads
-            if fault == "late_home" and not bus.raised:
-                if register == "Present_Current" and clock.now >= 119.89:
-                    bus.read_sequences[(register, "lift_axis")] = [50]
-                if register == "Present_Temperature" and clock.now >= 119.94:
-                    clock.sleep(0.1)
             if register != "Present_Temperature" or not bus.raised:
                 return
-            if fault == "slow_telemetry":
-                clock.sleep(0.6)
             if bus.registers[("Goal_Velocity", "lift_axis")] != 0:
                 return
             stopped_reads += 1
@@ -959,19 +1055,28 @@ def test_second_sigint_cannot_interrupt_zero_torque_off_or_close(rig, monkeypatc
     original_write = LiftBus.write
     previous_handler = signal.getsignal(signal.SIGINT)
     interrupted = False
+    primary_failed = False
 
     def connect(bus, **kwargs):
         original_connect(bus, **kwargs)
 
         def hook(register):
+            nonlocal primary_failed
             if bus.raised and register == "Present_Temperature":
+                primary_failed = True
                 raise OSError("primary relief telemetry failure")
 
         bus.hook = hook
 
     def write(bus, register, motor, value, **kwargs):
         nonlocal interrupted
-        if bus.raised and motor.startswith("base_") and not interrupted:
+        if (
+            primary_failed
+            and register == "Goal_Velocity"
+            and motor == "lift_axis"
+            and int(value) == 0
+            and not interrupted
+        ):
             interrupted = True
             signal.raise_signal(signal.SIGINT)
         original_write(bus, register, motor, value, **kwargs)

@@ -337,6 +337,7 @@ def make_robot_config(args: argparse.Namespace) -> AlohaMiniConfig:
         robot_model=args.robot_model,
         no_follower=args.no_follower,
         max_relative_target=args.max_relative_target,
+        diagnostic_lift_only=args.lift_relief,
     )
     if args.no_cameras:
         config.cameras = {}

@@ -113,6 +113,12 @@ class AlohaMini(Robot):
         norm_mode_body = MotorNormMode.DEGREES if config.use_degrees else MotorNormMode.RANGE_M100_100
 
         specs = validate_robot_model(config.robot_model)
+        if config.diagnostic_lift_only and (
+            config.robot_model != "alohamini1" or not config.no_follower
+        ):
+            raise ValueError(
+                "diagnostic_lift_only requires Aloha Mini 1 with follower arms disabled."
+            )
         arm_profile = specs["arm_profile"]
         bm = specs["base_motor"]
         lm = specs["lift_motor"]
@@ -127,10 +133,15 @@ class AlohaMini(Robot):
 
         left_bus_motors = {
             **(left_arm_motors_cfg if not config.no_follower else {}),
-            # base
-            "base_left_wheel": Motor(8, bm, MotorNormMode.RANGE_M100_100),
-            "base_back_wheel": Motor(9, bm, MotorNormMode.RANGE_M100_100),
-            "base_right_wheel": Motor(10, bm, MotorNormMode.RANGE_M100_100),
+            **(
+                {
+                    "base_left_wheel": Motor(8, bm, MotorNormMode.RANGE_M100_100),
+                    "base_back_wheel": Motor(9, bm, MotorNormMode.RANGE_M100_100),
+                    "base_right_wheel": Motor(10, bm, MotorNormMode.RANGE_M100_100),
+                }
+                if not config.diagnostic_lift_only
+                else {}
+            ),
             "lift_axis": Motor(11, lm, MotorNormMode.DEGREES),
         }
         left_bus_calibration = {
