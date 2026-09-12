@@ -390,6 +390,37 @@ def test_motor_feedback_launcher_uses_the_standalone_vendor_path_only():
     assert preview("--mode", "lift", "--lift-motor-feedback", "--lift-relief").returncode == 2
 
 
+@pytest.mark.parametrize("specimen", ("original", "spare"))
+def test_motor_feedback_launcher_selects_the_fixed_startup_anomaly_profile(specimen):
+    def preview(*arguments):
+        return subprocess.run(
+            [BASH, str(HOST_HELPER), *arguments, "--print-command"],
+            cwd=REPO_ROOT, text=True, capture_output=True, timeout=30, check=False,
+        )
+
+    enabled = preview(
+        "--mode",
+        "lift",
+        "--lift-motor-feedback",
+        "--startup-comparison",
+        specimen,
+    )
+    assert enabled.returncode == 0, enabled.stderr
+    assert "-m lerobot.robots.alohamini.lift_motor_feedback" in enabled.stdout
+    assert "--profile startup-anomaly" in enabled.stdout
+    assert f"--specimen {specimen}" in enabled.stdout
+    assert "alohamini_host" not in enabled.stdout
+    assert "--no_follower" not in enabled.stdout
+
+    assert preview("--mode", "lift", "--startup-comparison", specimen).returncode == 2
+    assert preview(
+        "--mode", "lift", "--lift-motor-feedback", "--startup-comparison", "unknown"
+    ).returncode == 2
+    assert "--profile startup-anomaly" not in preview(
+        "--mode", "lift", "--lift-motor-feedback"
+    ).stdout
+
+
 def test_local_config_example_is_valid_and_real_config_is_ignored():
     config = json.loads(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
 

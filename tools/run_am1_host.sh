@@ -21,7 +21,7 @@ readonly AM1_PI_INPUT="ee3a6f5dd813be82780a6a9b1789966357542d2f"
 
 usage() {
     printf '%s\n' \
-        'Usage: ./tools/run_am1_host.sh --mode arms|base|lift|local [--lift-diagnostics|--lift-relief|--lift-readback|--lift-motor-feedback] [--print-command]' \
+        'Usage: ./tools/run_am1_host.sh --mode arms|base|lift|local [--lift-diagnostics|--lift-relief|--lift-readback|--lift-motor-feedback [--startup-comparison original|spare]] [--print-command]' \
         '' \
         'Modes:' \
         '  arms  Start the physically validated AM1 arms host (no cameras, unhomed lift).' \
@@ -33,6 +33,7 @@ usage() {
         '--lift-relief selects the guarded, operator-gated lift-only home/10mm relief/45s check (no ZMQ).' \
         '--lift-readback selects a three-second torque-off-only lift telemetry check (no homing, motion, or ZMQ).' \
         '--lift-motor-feedback selects one standalone grouped-feedback pulse (no homing, height control, or ZMQ).' \
+        '--startup-comparison selects the fixed +200/5.25s original-or-spare comparison profile.' \
         '--print-command prints the Python command without checking devices or starting the host.'
 }
 
@@ -52,6 +53,7 @@ lift_diagnostics=false
 lift_relief=false
 lift_readback=false
 lift_motor_feedback=false
+startup_comparison=""
 while (($#)); do
     case "$1" in
         --mode)
@@ -78,6 +80,11 @@ while (($#)); do
         --lift-motor-feedback)
             lift_motor_feedback=true
             shift
+            ;;
+        --startup-comparison)
+            (($# >= 2)) || { die "--startup-comparison requires original or spare"; exit $?; }
+            startup_comparison="$2"
+            shift 2
             ;;
         --help|-h)
             usage
@@ -114,6 +121,16 @@ if [[ "$lift_motor_feedback" == true && ( "$mode" != "lift" || "$lift_diagnostic
     die "--lift-motor-feedback requires --mode lift and cannot be combined with another lift diagnostic"
     exit $?
 fi
+if [[ -n "$startup_comparison" ]]; then
+    [[ "$lift_motor_feedback" == true ]] || {
+        die "--startup-comparison requires --lift-motor-feedback"
+        exit $?
+    }
+    [[ "$startup_comparison" == "original" || "$startup_comparison" == "spare" ]] || {
+        die "--startup-comparison must be original or spare"
+        exit $?
+    }
+fi
 
 script_path="${BASH_SOURCE[0]//\\//}"
 script_parent="${script_path%/*}"
@@ -130,6 +147,12 @@ if [[ "$lift_motor_feedback" == true ]]; then
         --motor-id 11
         --baud-rate 1000000
     )
+    if [[ -n "$startup_comparison" ]]; then
+        command+=(
+            --profile startup-anomaly
+            --specimen "$startup_comparison"
+        )
+    fi
 else
     command=(
         "$python_path"

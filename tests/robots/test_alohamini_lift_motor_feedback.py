@@ -826,6 +826,126 @@ def test_comparison_is_operator_gated_bounded_and_never_reads_phase() -> None:
     assert set(transport.operation_threads) == {threading.get_ident()}
 
 
+def test_startup_anomaly_profile_runs_one_full_plus_200_comparison_and_saves_identity() -> None:
+    clock = FakeClock()
+    transport = TimeBasedMotionTransport(clock=clock, travel_rate_raw_per_s=200.0)
+    records: list[dict] = []
+
+    try:
+        result = feedback.run_comparison(
+            transport,
+            profile="startup-anomaly",
+            specimen="original",
+            input_fn=lambda _prompt: "COMPARE_200",
+            monotonic=clock.monotonic,
+            sleep=clock.sleep,
+            emit=records.append,
+        )
+    except TypeError as error:
+        pytest.fail(f"startup-anomaly comparison profile is unavailable: {error}")
+
+    assert result == 0
+    motion_writes = [
+        (timestamp, value)
+        for timestamp, address, value in transport.write_times
+        if address == feedback.GOAL_VELOCITY_ADDRESS and value != 0
+    ]
+    assert [value for _, value in motion_writes] == [200]
+    motion_started = motion_writes[0][0]
+    first_zero = next(
+        timestamp
+        for timestamp, address, value in transport.write_times
+        if timestamp >= motion_started and address == feedback.GOAL_VELOCITY_ADDRESS and value == 0
+    )
+    assert first_zero - motion_started == pytest.approx(5.25)
+    assert len([record for record in records if record.get("phase") == "motion"]) >= 90
+
+    endpoint = next(record for record in records if record.get("phase") == "motion_endpoint")
+    assert endpoint["position_delta_raw"] == 1050
+    configuration = next(record for record in records if record.get("phase") == "configuration")
+    assert configuration["comparison_profile"] == "startup-anomaly"
+    assert configuration["specimen"] == "original"
+    assert set(configuration["register_bytes_by_address"]) == {
+        *map(str, range(0, 18)),
+        *map(str, range(19, 87)),
+    }
+    assert "18" not in configuration["register_bytes_by_address"]
+
+
+def test_startup_anomaly_profile_stops_on_a_late_temperature_sample_without_retry() -> None:
+    class LateTemperatureTransport(TimeBasedMotionTransport):
+        def read_group(
+            self, start: int, length: int, *, timeout_ms: float = feedback.REPLY_TIMEOUT_MS
+        ) -> tuple[bytes, dict]:
+            if (
+                (start, length) == (feedback.FEEDBACK_START, feedback.FEEDBACK_LENGTH)
+                and self.goal_velocity != 0
+                and self.motion_started_at is not None
+                and self.clock.now - self.motion_started_at >= 4.9
+            ):
+                self.temperature = 61
+            return super().read_group(start, length, timeout_ms=timeout_ms)
+
+    clock = FakeClock()
+    transport = LateTemperatureTransport(clock=clock, travel_rate_raw_per_s=200.0)
+    records: list[dict] = []
+
+    try:
+        result = feedback.run_comparison(
+            transport,
+            profile="startup-anomaly",
+            specimen="spare",
+            input_fn=lambda _prompt: "COMPARE_200",
+            monotonic=clock.monotonic,
+            sleep=clock.sleep,
+            emit=records.append,
+        )
+    except TypeError as error:
+        pytest.fail(f"startup-anomaly comparison profile is unavailable: {error}")
+
+    assert result == 2
+    rejected = [
+        record
+        for record in records
+        if record.get("rejected") and record.get("phase") == "motion"
+    ]
+    assert len(rejected) == 1
+    assert rejected[0]["temperature_c"] == 61
+    assert "diagnostic ceiling 55 C" in rejected[0]["rejection_reason"]
+    nonzero_writes = [
+        (timestamp, value)
+        for timestamp, address, value in transport.write_times
+        if address == feedback.GOAL_VELOCITY_ADDRESS and value != 0
+    ]
+    assert len(nonzero_writes) == 1
+    motion_started = nonzero_writes[0][0]
+    first_zero = next(
+        timestamp
+        for timestamp, address, value in transport.write_times
+        if timestamp >= motion_started and address == feedback.GOAL_VELOCITY_ADDRESS and value == 0
+    )
+    assert 4.9 <= first_zero - motion_started < 5.05
+    assert transport.goal_velocity == 0
+    assert transport.torque == 0
+    assert records[-1]["reason"] == rejected[0]["rejection_reason"]
+
+
+def test_direct_transport_allows_only_the_selected_nonzero_profile_velocity() -> None:
+    port = ByteStreamPort()
+    try:
+        transport = feedback.DirectSdkTransport(
+            "fake-byte-stream",
+            port_handler=port,
+            packet_handler=scs.PacketHandler(0),
+            motion_velocity_raw=200,
+        )
+    except TypeError as error:
+        pytest.fail(f"profile-specific write boundary is unavailable: {error}")
+
+    with pytest.raises(ValueError, match="not allowed"):
+        transport.write_register(feedback.GOAL_VELOCITY_ADDRESS, 2, 100)
+
+
 def test_minimum_travel_uses_a_fresh_endpoint_after_the_scheduled_zero() -> None:
     clock = FakeClock()
     transport = TimeBasedMotionTransport(clock=clock, travel_rate_raw_per_s=25.0)

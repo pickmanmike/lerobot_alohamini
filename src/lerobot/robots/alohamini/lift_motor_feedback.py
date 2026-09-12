@@ -13,6 +13,7 @@ import json
 import signal
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 from lerobot.utils.import_utils import require_package
@@ -64,6 +65,55 @@ SETTLE_TIMEOUT_S = 1.0
 MIN_TRAVEL_RAW = 5
 TARGET_TRAVEL_RAW = 64
 MAX_TRAVEL_RAW = 128
+
+STARTUP_MOTION_VELOCITY_RAW = 200
+STARTUP_MOTION_S = 5.25
+STARTUP_MIN_TRAVEL_RAW = 256
+STARTUP_MAX_TRAVEL_RAW = 1536
+
+
+@dataclass(frozen=True)
+class ComparisonProfile:
+    name: str
+    authorization: str
+    motion_velocity_raw: int
+    motion_s: float
+    minimum_travel_raw: int
+    maximum_travel_raw: int
+    observed_stop_target_raw: int | None
+    maximum_motion_samples: int | None
+    poll_s: float = POLL_S
+    motion_reply_timeout_ms: float = 40.0
+
+    @property
+    def maximum_command_s(self) -> float:
+        return self.motion_s + self.poll_s + self.motion_reply_timeout_ms / 1000
+
+
+QUICK_PROFILE = ComparisonProfile(
+    name="quick",
+    authorization="ROTATE",
+    motion_velocity_raw=MOTION_VELOCITY_RAW,
+    motion_s=MOTION_S,
+    minimum_travel_raw=MIN_TRAVEL_RAW,
+    maximum_travel_raw=MAX_TRAVEL_RAW,
+    observed_stop_target_raw=TARGET_TRAVEL_RAW,
+    maximum_motion_samples=2,
+)
+STARTUP_ANOMALY_PROFILE = ComparisonProfile(
+    name="startup-anomaly",
+    authorization="COMPARE_200",
+    motion_velocity_raw=STARTUP_MOTION_VELOCITY_RAW,
+    motion_s=STARTUP_MOTION_S,
+    minimum_travel_raw=STARTUP_MIN_TRAVEL_RAW,
+    maximum_travel_raw=STARTUP_MAX_TRAVEL_RAW,
+    observed_stop_target_raw=None,
+    maximum_motion_samples=None,
+)
+COMPARISON_PROFILES = {
+    QUICK_PROFILE.name: QUICK_PROFILE,
+    STARTUP_ANOMALY_PROFILE.name: STARTUP_ANOMALY_PROFILE,
+}
 
 
 class ComparisonRefusal(RuntimeError):
@@ -121,6 +171,7 @@ class DirectSdkTransport:
         *,
         motor_id: int = MOTOR_ID,
         baud_rate: int = BAUD_RATE,
+        motion_velocity_raw: int = MOTION_VELOCITY_RAW,
         sdk_module: Any | None = None,
         port_handler: Any | None = None,
         packet_handler: Any | None = None,
@@ -133,6 +184,9 @@ class DirectSdkTransport:
         self.port_name = port
         self.motor_id = motor_id
         self.baud_rate = baud_rate
+        if motion_velocity_raw not in (MOTION_VELOCITY_RAW, STARTUP_MOTION_VELOCITY_RAW):
+            raise ValueError(f"Unsupported diagnostic motion velocity {motion_velocity_raw}.")
+        self.motion_velocity_raw = motion_velocity_raw
         self.port_handler = port_handler or self.sdk.PortHandler(port)
         self.packet_handler = packet_handler or self.sdk.PacketHandler(PROTOCOL_VERSION)
         self.opened = bool(getattr(self.port_handler, "is_open", False))
@@ -288,9 +342,7 @@ class DirectSdkTransport:
             raise ValueError(f"Diagnostic write address {address} is not allowed.")
         if (address, width) not in ((GOAL_VELOCITY_ADDRESS, 2), (TORQUE_ENABLE_ADDRESS, 1)):
             raise ValueError(f"Unexpected diagnostic write width {width} at address {address}.")
-        allowed_values = (
-            (0, 1) if address == TORQUE_ENABLE_ADDRESS else (0, MOTION_VELOCITY_RAW)
-        )
+        allowed_values = (0, 1) if address == TORQUE_ENABLE_ADDRESS else (0, self.motion_velocity_raw)
         if value not in allowed_values:
             raise ValueError(f"Diagnostic write value {value} is not allowed at address {address}.")
         self._prepare_input(operation="write", address=address, width=width)
@@ -410,6 +462,14 @@ def _decode_configuration(groups: dict[int, bytes]) -> dict[str, int | str]:
     }
 
 
+def _configuration_bytes_by_address(groups: dict[int, bytes]) -> dict[str, int]:
+    return {
+        str(start + offset): int(value)
+        for start, payload in sorted(groups.items())
+        for offset, value in enumerate(payload)
+    }
+
+
 def _position_delta(start: int, current: int) -> int:
     return (current - start + 2048) % 4096 - 2048
 
@@ -428,6 +488,8 @@ class MotorFeedbackComparison:
         sleep: Callable[[float], None],
         emit: Callable[[dict[str, Any]], None],
         immediate_current_abort_ma: float | None = CURRENT_ABORT_MA,
+        profile: ComparisonProfile = QUICK_PROFILE,
+        specimen: str | None = None,
     ) -> None:
         self.transport = transport
         self.input_fn = input_fn
@@ -435,12 +497,22 @@ class MotorFeedbackComparison:
         self.sleep = sleep
         self.emit = emit
         self.immediate_current_abort_ma = immediate_current_abort_ma
+        self.profile = profile
+        self.specimen = specimen
         self.started = monotonic()
         self.config: dict[str, Any] = {}
         self.opened = False
 
     def record(self, phase: str, **values: Any) -> dict[str, Any]:
-        record = {"phase": phase, "elapsed_s": round(self.monotonic() - self.started, 3), **values}
+        identity = {"comparison_profile": self.profile.name}
+        if self.specimen is not None:
+            identity["specimen"] = self.specimen
+        record = {
+            "phase": phase,
+            "elapsed_s": round(self.monotonic() - self.started, 3),
+            **identity,
+            **values,
+        }
         self.emit(record)
         return record
 
@@ -471,6 +543,7 @@ class MotorFeedbackComparison:
         record = self.record(
             "configuration",
             registers_raw=self.config,
+            register_bytes_by_address=_configuration_bytes_by_address(groups),
             group_ranges=[{"start": start, "length": length} for start, length in CONFIG_GROUPS],
             group_traces=traces,
             phase_address_18_read=False,
@@ -708,16 +781,21 @@ class MotorFeedbackComparison:
         self.record(phase, address=address, width=width, value=value, write_trace=trace)
 
     def compare(self) -> None:
+        profile = self.profile
         self.read_configuration()
         baseline = self.qualify_stationary(
             "baseline", expected_torque=0, expected_goal=0, cold_start=True
         )
         authorization = self.input_fn(
-            "Type ROTATE to authorize one raw +100 pulse with a nominal 0.3-second "
+            f"Type {profile.authorization} to authorize one raw +{profile.motion_velocity_raw} "
+            f"pulse with a nominal {profile.motion_s:g}-second "
             "software timing envelope (the power disconnect is the hard stop): "
         )
-        if authorization != "ROTATE":
-            self.refuse(baseline, "Exact ROTATE authorization was not supplied.")
+        if authorization != profile.authorization:
+            self.refuse(
+                baseline,
+                f"Exact {profile.authorization} authorization was not supplied.",
+            )
         pre_motion = self.qualify_stationary(
             "pre_motion", expected_torque=0, expected_goal=0, cold_start=True
         )
@@ -728,24 +806,33 @@ class MotorFeedbackComparison:
         self.qualify_stationary("armed_zero", expected_torque=1, expected_goal=0)
 
         motion_started = self.monotonic()
-        self.write("motion_command", GOAL_VELOCITY_ADDRESS, 2, MOTION_VELOCITY_RAW)
+        self.write("motion_command", GOAL_VELOCITY_ADDRESS, 2, profile.motion_velocity_raw)
         early_motion_samples: list[dict[str, Any]] = []
         motion_error: BaseException | None = None
         stop_early = False
         try:
-            # The main thread remains the only SDK/serial owner. Two early
-            # reads have explicit 40 ms SDK deadlines; any anomaly skips the
-            # remaining wait and reaches the zero request immediately.
-            for _ in range(2):
-                if self.monotonic() - motion_started >= MOTION_S - 0.1:
+            # The main thread remains the only SDK/serial owner. The quick
+            # profile keeps its two early reads; the fixed startup comparison
+            # samples throughout its bounded drive interval. Any anomaly
+            # reaches the zero request immediately.
+            while True:
+                if (
+                    profile.maximum_motion_samples is not None
+                    and len(early_motion_samples) >= profile.maximum_motion_samples
+                ):
                     break
-                self.sleep(POLL_S)
+                elapsed = self.monotonic() - motion_started
+                if elapsed >= profile.motion_s:
+                    break
+                self.sleep(min(profile.poll_s, profile.motion_s - elapsed))
+                if self.monotonic() - motion_started >= profile.motion_s:
+                    break
                 motion_sample = self.sample(
                     "motion",
                     expected_torque=1,
-                    expected_goal=MOTION_VELOCITY_RAW,
+                    expected_goal=profile.motion_velocity_raw,
                     start_position=start_position,
-                    timeout_ms=40.0,
+                    timeout_ms=profile.motion_reply_timeout_ms,
                 )
                 early_motion_samples.append(motion_sample)
                 velocity = int(motion_sample["present_velocity_raw"])
@@ -760,13 +847,19 @@ class MotorFeedbackComparison:
                         motion_sample,
                         "motion: position changed opposite the positive raw command.",
                     )
-                if delta > MAX_TRAVEL_RAW:
-                    self.refuse(motion_sample, f"motion: travel exceeded {MAX_TRAVEL_RAW} raw ticks.")
-                if delta >= TARGET_TRAVEL_RAW:
+                if delta > profile.maximum_travel_raw:
+                    self.refuse(
+                        motion_sample,
+                        f"motion: travel exceeded {profile.maximum_travel_raw} raw ticks.",
+                    )
+                if (
+                    profile.observed_stop_target_raw is not None
+                    and delta >= profile.observed_stop_target_raw
+                ):
                     stop_early = True
                     break
             if not stop_early:
-                remaining = MOTION_S - (self.monotonic() - motion_started)
+                remaining = profile.motion_s - (self.monotonic() - motion_started)
                 if remaining > 0:
                     self.sleep(remaining)
         except BaseException as error:
@@ -785,15 +878,16 @@ class MotorFeedbackComparison:
         self.record(
             "motion_bound",
             command_duration_s=round(command_duration, 3),
-            nominal_limit_s=MOTION_S,
-            bounded_sdk_deadline_s=MAX_COMMAND_S,
-            observed_stop_target_raw=TARGET_TRAVEL_RAW,
-            refusal_travel_raw=MAX_TRAVEL_RAW,
+            nominal_limit_s=profile.motion_s,
+            bounded_sdk_deadline_s=profile.maximum_command_s,
+            observed_stop_target_raw=profile.observed_stop_target_raw,
+            refusal_travel_raw=profile.maximum_travel_raw,
             single_serial_owner=True,
         )
-        if command_duration > MAX_COMMAND_S:
+        if command_duration > profile.maximum_command_s:
             bound_error = ComparisonRefusal(
-                f"motion: zero command exceeded the {MAX_COMMAND_S:g}-second SDK timing envelope."
+                f"motion: zero command exceeded the {profile.maximum_command_s:g}-second SDK "
+                "timing envelope."
             )
             if motion_error is None:
                 motion_error = bound_error
@@ -807,7 +901,7 @@ class MotorFeedbackComparison:
             expected_torque=1,
             expected_goal=0,
             start_position=start_position,
-            max_position_delta_raw=MAX_TRAVEL_RAW,
+            max_position_delta_raw=profile.maximum_travel_raw,
             allow_settling=True,
             timeout_s=SETTLE_TIMEOUT_S,
         )
@@ -832,10 +926,10 @@ class MotorFeedbackComparison:
                 endpoint,
                 "motion endpoint: position changed opposite the positive raw command.",
             )
-        if endpoint_delta < MIN_TRAVEL_RAW:
+        if endpoint_delta < profile.minimum_travel_raw:
             self.refuse(
                 endpoint,
-                f"motion: travel did not reach {MIN_TRAVEL_RAW} raw ticks.",
+                f"motion: travel did not reach {profile.minimum_travel_raw} raw ticks.",
             )
 
     def cleanup(self) -> list[str]:
@@ -876,13 +970,18 @@ def run_comparison(
     monotonic: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
     emit: Callable[[dict[str, Any]], None] = _default_emit,
+    profile: str | ComparisonProfile = QUICK_PROFILE,
+    specimen: str | None = None,
 ) -> int:
+    selected_profile = COMPARISON_PROFILES[profile] if isinstance(profile, str) else profile
     comparison = MotorFeedbackComparison(
         transport,
         input_fn=input_fn,
         monotonic=monotonic,
         sleep=sleep,
         emit=emit,
+        profile=selected_profile,
+        specimen=specimen,
     )
     primary: BaseException | None = None
     try:
@@ -944,6 +1043,8 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", default="/dev/am_arm_follower_left")
     parser.add_argument("--motor-id", type=int, default=MOTOR_ID)
     parser.add_argument("--baud-rate", type=int, default=BAUD_RATE)
+    parser.add_argument("--profile", choices=tuple(COMPARISON_PROFILES), default=QUICK_PROFILE.name)
+    parser.add_argument("--specimen", choices=("original", "spare"))
     return parser
 
 
@@ -956,14 +1057,27 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("this comparison is fixed to the established 1,000,000 baud")
     if args.port != PORT_ALIAS:
         parser.error(f"this comparison is fixed to the left follower/body alias {PORT_ALIAS}")
+    if args.profile == STARTUP_ANOMALY_PROFILE.name and args.specimen is None:
+        parser.error("the startup-anomaly profile requires --specimen original or spare")
+    if args.profile == QUICK_PROFILE.name and args.specimen is not None:
+        parser.error("--specimen is valid only with --profile startup-anomaly")
+    selected_profile = COMPARISON_PROFILES[args.profile]
     print(
         "Standalone AM1 lift-motor comparison: WCH USB serial interface 1a86:55d3, "
         f"{args.port}, STS3215 ID {args.motor_id}, {args.baud_rate} baud.\n"
+        f"Profile {selected_profile.name}: one nominal {selected_profile.motion_s:g}-second raw "
+        f"+{selected_profile.motion_velocity_raw} command; "
+        f"specimen={args.specimen or 'unspecified'}.\n"
         "Keep the platform mechanically unloaded, the servo securely mounted, and power removal accessible.",
         flush=True,
     )
-    transport = DirectSdkTransport(args.port, motor_id=args.motor_id, baud_rate=args.baud_rate)
-    result = run_comparison(transport)
+    transport = DirectSdkTransport(
+        args.port,
+        motor_id=args.motor_id,
+        baud_rate=args.baud_rate,
+        motion_velocity_raw=selected_profile.motion_velocity_raw,
+    )
+    result = run_comparison(transport, profile=selected_profile, specimen=args.specimen)
     if result == 0:
         print("LIFT_MOTOR_FEEDBACK_PASS", flush=True)
     else:
