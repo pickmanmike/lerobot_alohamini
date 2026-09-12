@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('Arms', 'Base', 'Lift')]
+    [ValidateSet('Arms', 'Base', 'Lift', 'Local')]
     [string]$Mode,
     [string]$ConfigPath = (Join-Path $PSScriptRoot '..\config\am1.local.json'),
     [switch]$PrintCommand
@@ -84,7 +84,7 @@ function New-Am1WindowsCommand {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
-        [ValidateSet('Arms', 'Base', 'Lift')]
+        [ValidateSet('Arms', 'Base', 'Lift', 'Local')]
         [string]$Mode,
         [Parameter(Mandatory)]
         [psobject]$Config,
@@ -137,10 +137,10 @@ function New-Am1WindowsCommand {
     }
     else {
         if ($LeftPort -notmatch '^COM\d+$' -or $RightPort -notmatch '^COM\d+$' -or $LeftPort -eq $RightPort) {
-            throw 'Arms mode requires two distinct uppercase runtime COM addresses.'
+            throw 'Arms and Local modes require two distinct uppercase runtime COM addresses.'
         }
         $settings = $Config.arm_settings
-        $arguments = [string[]]@(
+        $arguments = @(
             $teleoperationPath
             '--robot.remote_ip'
             [string]$Config.pi_host
@@ -167,13 +167,21 @@ function New-Am1WindowsCommand {
             '--fps'
             [string]$settings.client_fps
             '--duration_s'
-            [string]$settings.client_duration_s
+            $(if ($Mode -eq 'Local') { '30' } else { [string]$settings.client_duration_s })
             '--start_paused'
-            '--no_keyboard'
+        )
+        if ($Mode -eq 'Local') {
+            $arguments += '--local_mode'
+        }
+        else {
+            $arguments += '--no_keyboard'
+        }
+        $arguments += @(
             '--no_cameras'
             '--profile_cadence'
             '--no_rerun'
         )
+        $arguments = [string[]]$arguments
     }
 
     return [pscustomobject][ordered]@{
@@ -299,7 +307,7 @@ function Invoke-Am1Launch {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
-        [ValidateSet('Arms', 'Base', 'Lift')]
+        [ValidateSet('Arms', 'Base', 'Lift', 'Local')]
         [string]$Mode,
         [Parameter(Mandatory)]
         [string]$ConfigPath,
@@ -316,7 +324,7 @@ function Invoke-Am1Launch {
         Assert-Am1ReviewedWorktree -RepositoryRoot $repositoryRoot
     }
     $ports = [pscustomobject]@{ left = $null; right = $null }
-    if ($Mode -eq 'Arms') {
+    if ($Mode -in @('Arms', 'Local')) {
         $ports = Get-Am1RuntimeLeaderPorts -Config $config -RepositoryRoot $repositoryRoot
         Assert-Am1LeaderCalibrationHashes -Config $config
     }
@@ -367,7 +375,7 @@ function Invoke-Am1Launch {
 
 if ($MyInvocation.InvocationName -ne '.') {
     if ([string]::IsNullOrWhiteSpace($Mode)) {
-        throw 'Specify -Mode Arms, -Mode Base, or -Mode Lift.'
+        throw 'Specify -Mode Arms, -Mode Base, -Mode Lift, or -Mode Local.'
     }
     Invoke-Am1Launch -Mode $Mode -ConfigPath $ConfigPath -PrintCommand:$PrintCommand
 }

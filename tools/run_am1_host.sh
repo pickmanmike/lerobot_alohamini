@@ -21,13 +21,19 @@ readonly AM1_PI_INPUT="ee3a6f5dd813be82780a6a9b1789966357542d2f"
 
 usage() {
     printf '%s\n' \
-        'Usage: ./tools/run_am1_host.sh --mode arms|base|lift [--print-command]' \
+        'Usage: ./tools/run_am1_host.sh --mode arms|base|lift|local [--lift-diagnostics|--lift-relief|--lift-readback|--lift-motor-feedback [--startup-comparison original|spare]] [--print-command]' \
         '' \
         'Modes:' \
         '  arms  Start the physically validated AM1 arms host (no cameras, unhomed lift).' \
         '  base  Start only the AM1 left body bus for a bounded base test (no follower arms).' \
         '  lift  Start only the AM1 left body bus and home the lift once (no follower arms).' \
+        '  local Start both follower arms and the body bus, including one lift homing cycle.' \
         '' \
+        '--lift-diagnostics adds a once-per-second read-only lift snapshot in Lift mode.' \
+        '--lift-relief selects the guarded, operator-gated lift-only home/10mm relief/45s check (no ZMQ).' \
+        '--lift-readback selects a three-second torque-off-only lift telemetry check (no homing, motion, or ZMQ).' \
+        '--lift-motor-feedback selects one standalone grouped-feedback pulse (no homing, height control, or ZMQ).' \
+        '--startup-comparison selects the fixed +200/5.25s original-or-spare comparison profile.' \
         '--print-command prints the Python command without checking devices or starting the host.'
 }
 
@@ -43,16 +49,42 @@ quote_command() {
 
 mode=""
 print_command=false
+lift_diagnostics=false
+lift_relief=false
+lift_readback=false
+lift_motor_feedback=false
+startup_comparison=""
 while (($#)); do
     case "$1" in
         --mode)
-            (($# >= 2)) || { die "--mode requires arms, base, or lift"; exit $?; }
+            (($# >= 2)) || { die "--mode requires arms, base, lift, or local"; exit $?; }
             mode="$2"
             shift 2
             ;;
         --print-command)
             print_command=true
             shift
+            ;;
+        --lift-diagnostics)
+            lift_diagnostics=true
+            shift
+            ;;
+        --lift-relief)
+            lift_relief=true
+            shift
+            ;;
+        --lift-readback)
+            lift_readback=true
+            shift
+            ;;
+        --lift-motor-feedback)
+            lift_motor_feedback=true
+            shift
+            ;;
+        --startup-comparison)
+            (($# >= 2)) || { die "--startup-comparison requires original or spare"; exit $?; }
+            startup_comparison="$2"
+            shift 2
             ;;
         --help|-h)
             usage
@@ -66,12 +98,39 @@ while (($#)); do
 done
 
 case "$mode" in
-    arms|base|lift) ;;
+    arms|base|lift|local) ;;
     *)
-        die "--mode must be arms, base, or lift"
+        die "--mode must be arms, base, lift, or local"
         exit $?
         ;;
 esac
+
+if [[ "$lift_diagnostics" == true && "$mode" != "lift" ]]; then
+    die "--lift-diagnostics is only valid with --mode lift"
+    exit $?
+fi
+if [[ "$lift_relief" == true && ( "$mode" != "lift" || "$lift_diagnostics" == true ) ]]; then
+    die "--lift-relief requires --mode lift and cannot be combined with --lift-diagnostics"
+    exit $?
+fi
+if [[ "$lift_readback" == true && ( "$mode" != "lift" || "$lift_diagnostics" == true || "$lift_relief" == true ) ]]; then
+    die "--lift-readback requires --mode lift and cannot be combined with another lift diagnostic"
+    exit $?
+fi
+if [[ "$lift_motor_feedback" == true && ( "$mode" != "lift" || "$lift_diagnostics" == true || "$lift_relief" == true || "$lift_readback" == true ) ]]; then
+    die "--lift-motor-feedback requires --mode lift and cannot be combined with another lift diagnostic"
+    exit $?
+fi
+if [[ -n "$startup_comparison" ]]; then
+    [[ "$lift_motor_feedback" == true ]] || {
+        die "--startup-comparison requires --lift-motor-feedback"
+        exit $?
+    }
+    [[ "$startup_comparison" == "original" || "$startup_comparison" == "spare" ]] || {
+        die "--startup-comparison must be original or spare"
+        exit $?
+    }
+fi
 
 script_path="${BASH_SOURCE[0]//\\//}"
 script_parent="${script_path%/*}"
@@ -80,13 +139,31 @@ script_dir="$(cd -- "$script_parent" && pwd -P)"
 repository_root="$(cd -- "$script_dir/.." && pwd -P)"
 python_path="$repository_root/.venv/bin/python"
 
-command=(
-    "$python_path"
-    -m lerobot.robots.alohamini.alohamini_host
-    --robot_model alohamini1
-    --no_cameras
-)
-if [[ "$mode" == "arms" ]]; then
+if [[ "$lift_motor_feedback" == true ]]; then
+    command=(
+        "$python_path"
+        -m lerobot.robots.alohamini.lift_motor_feedback
+        --port /dev/am_arm_follower_left
+        --motor-id 11
+        --baud-rate 1000000
+    )
+    if [[ -n "$startup_comparison" ]]; then
+        command+=(
+            --profile startup-anomaly
+            --specimen "$startup_comparison"
+        )
+    fi
+else
+    command=(
+        "$python_path"
+        -m lerobot.robots.alohamini.alohamini_host
+        --robot_model alohamini1
+        --no_cameras
+    )
+fi
+if [[ "$lift_motor_feedback" == true ]]; then
+    :
+elif [[ "$mode" == "arms" ]]; then
     command+=(
         --skip_lift_home
         --max_relative_target 20.0
@@ -102,9 +179,25 @@ elif [[ "$mode" == "base" ]]; then
         --profile_timing true
         --profile_cadence
     )
-else
+elif [[ "$mode" == "lift" ]]; then
     command+=(
         --no_follower
+        --max_loop_freq_hz 30
+        --profile_timing true
+        --profile_cadence
+    )
+    if [[ "$lift_diagnostics" == true ]]; then
+        command+=(--profile_lift_diagnostics)
+    fi
+    if [[ "$lift_relief" == true ]]; then
+        command+=(--lift_relief)
+    fi
+    if [[ "$lift_readback" == true ]]; then
+        command+=(--lift_readback)
+    fi
+else
+    command+=(
+        --max_relative_target 20.0
         --max_loop_freq_hz 30
         --profile_timing true
         --profile_cadence
@@ -142,7 +235,7 @@ actual_import="$(
     die "required left body/follower bus alias is absent: /dev/am_arm_follower_left"
     exit $?
 }
-if [[ "$mode" == "arms" ]]; then
+if [[ "$mode" == "arms" || "$mode" == "local" ]]; then
     [[ -e /dev/am_arm_follower_right ]] || {
         die "required right follower bus alias is absent: /dev/am_arm_follower_right"
         exit $?
@@ -158,6 +251,8 @@ printf 'HOST_LOG=%s\n' "$log_path" | tee "$log_path" || {
     exit $?
 }
 {
+    printf 'HOST_SOURCE_BRANCH=%s\n' "$(git branch --show-current)"
+    printf 'HOST_SOURCE_HEAD=%s\n' "$(git rev-parse HEAD)"
     printf 'HOST_COMMAND='
     quote_command "${command[@]}"
 } | tee -a "$log_path" || {

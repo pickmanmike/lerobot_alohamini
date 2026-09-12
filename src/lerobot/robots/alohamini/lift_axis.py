@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import math
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -28,6 +29,8 @@ from lerobot.motors.feetech import OperatingMode
 from .motor_safety import REGISTER_RETRIES, set_torque_enabled, write_register
 
 logger = logging.getLogger(__name__)
+
+RawRead = Callable[[str], int | float]
 
 
 class BusLike(Protocol):
@@ -140,18 +143,21 @@ class LiftAxis:
             num_retry=REGISTER_RETRIES,
         )
 
-    def _reset_tick_tracking(self) -> None:
-        self._last_tick = float(
-            self._bus.read(
-                "Present_Position",
-                self.cfg.name,
-                normalize=False,
-                num_retry=REGISTER_RETRIES,
-            )
+    def _read_raw(self, register: str, read_raw: RawRead | None = None) -> int | float:
+        if read_raw is not None:
+            return read_raw(register)
+        return self._bus.read(
+            register,
+            self.cfg.name,
+            normalize=False,
+            num_retry=REGISTER_RETRIES,
         )
+
+    def _reset_tick_tracking(self, read_raw: RawRead | None = None) -> None:
+        self._last_tick = float(self._read_raw("Present_Position", read_raw))
         self._extended_ticks = 0.0
 
-    def configure(self, *, force: bool = False) -> None:
+    def configure(self, *, force: bool = False, read_raw: RawRead | None = None) -> None:
         """Configure velocity mode while torque remains disabled."""
         if not self.enabled or (self._configured and not force):
             return
@@ -165,20 +171,13 @@ class LiftAxis:
             self.cfg.name,
             OperatingMode.VELOCITY.value,
         )
-        self._reset_tick_tracking()
+        self._reset_tick_tracking(read_raw)
         self._configured = True
 
-    def _update_extended_ticks(self) -> float:
+    def _update_extended_ticks(self, read_raw: RawRead | None = None) -> float:
         if not self.enabled:
             return 0.0
-        cur = float(
-            self._bus.read(
-                "Present_Position",
-                self.cfg.name,
-                normalize=False,
-                num_retry=REGISTER_RETRIES,
-            )
-        )
+        cur = float(self._read_raw("Present_Position", read_raw))
         delta = cur - self._last_tick
         half = self._ticks_per_rev * 0.5
         if delta > half:
@@ -192,10 +191,10 @@ class LiftAxis:
     def _extended_deg(self) -> float:
         return self.cfg.dir_sign * self._extended_ticks * self._deg_per_tick
 
-    def get_height_mm(self) -> float:
+    def get_height_mm(self, read_raw: RawRead | None = None) -> float:
         if not self.enabled:
             return 0.0
-        self._update_extended_ticks()
+        self._update_extended_ticks(read_raw)
         return (self._extended_deg() - self._z0_deg) * self._mm_per_deg
 
     def home(
@@ -204,11 +203,16 @@ class LiftAxis:
         speed_raw: int | None = None,
         timeout_s: float | None = None,
         use_current: bool = True,
+        safety_check: Callable[[str, float], None] | None = None,
+        read_raw: RawRead | None = None,
     ) -> LiftHomeResult:
         """Move downward to the hard stop and create a process-local zero reference.
 
         A successful home leaves zero velocity commanded and torque enabled for later
         height commands. Every unsuccessful exit attempts zero velocity and torque-off.
+        An optional owning-process diagnostic can refuse before torque or at each poll.
+        Its displacement is relative to homing start, in upward-positive millimeters;
+        the callback must not advance the axis position tracker itself.
         """
         if not self.enabled:
             raise RuntimeError("Cannot home a disabled lift axis.")
@@ -232,8 +236,10 @@ class LiftAxis:
 
             # force=True guarantees torque-off before the velocity-mode write and resets
             # the process-local tick accumulator for this homing attempt.
-            self.configure(force=True)
+            self.configure(force=True, read_raw=read_raw)
             self._write_zero_velocity()
+            if safety_check is not None:
+                safety_check("before_torque", 0.0)
             set_torque_enabled(self._bus, (self.cfg.name,), enabled=True)
             write_register(self._bus, "Goal_Velocity", self.cfg.name, speed)
 
@@ -245,22 +251,21 @@ class LiftAxis:
                     raise TimeoutError(f"Lift homing timed out after {timeout:.2f}s.")
 
                 time.sleep(min(self.cfg.home_poll_interval_s, timeout - elapsed_s))
-                moved_ticks = abs(self._update_extended_ticks())
+                moved_ticks = abs(self._update_extended_ticks(read_raw))
+                if safety_check is not None:
+                    safety_check("homing", self._extended_deg() * self._mm_per_deg)
 
                 current_ma: float | None = None
                 if use_current:
                     try:
-                        raw_current = float(
-                            self._bus.read(
-                                "Present_Current",
-                                self.cfg.name,
-                                normalize=False,
-                                num_retry=REGISTER_RETRIES,
-                            )
-                        )
+                        raw_current = float(self._read_raw("Present_Current", read_raw))
+                        if safety_check is not None and not math.isfinite(raw_current):
+                            raise ValueError("Guarded lift homing current telemetry must be finite.")
                         current_ma = abs(raw_current * 6.5)
                         peak_current_ma = max(peak_current_ma, current_ma)
                     except Exception as error:
+                        if safety_check is not None:
+                            raise  # A diagnostic may not hide a fault in this second current read.
                         logger.debug("Lift homing current read failed; using motion stall fallback: %s", error)
 
                 current_stall = current_ma is not None and current_ma >= self.cfg.home_stall_current_ma
@@ -279,7 +284,7 @@ class LiftAxis:
             # Stop before capturing the final hard-stop position used as this
             # process's zero reference. The unconditional cleanup below writes zero again.
             self._write_zero_velocity()
-            self._update_extended_ticks()
+            self._update_extended_ticks(read_raw)
         except BaseException as error:
             failure = error
 
@@ -338,7 +343,7 @@ class LiftAxis:
         except Exception:
             pass
 
-    def apply_action(self, action: dict[str, float]) -> None:
+    def apply_action(self, action: dict[str, float], read_raw: RawRead | None = None) -> None:
         """Apply an ordinary height or velocity command only after this process homes."""
         if not self.enabled:
             return
@@ -356,7 +361,7 @@ class LiftAxis:
 
         if key_h in action:
             target_mm = float(action[key_h])
-            cur_mm = self.get_height_mm()
+            cur_mm = self.get_height_mm() if read_raw is None else self.get_height_mm(read_raw=read_raw)
             err = target_mm - cur_mm
             if abs(err) <= self.cfg.on_target_mm:
                 v_cmd = 0.0
@@ -382,7 +387,7 @@ class LiftAxis:
 
         if key_v in action:
             velocity = max(-self.cfg.v_max, min(self.cfg.v_max, int(action[key_v])))
-            cur_mm = self.get_height_mm()
+            cur_mm = self.get_height_mm() if read_raw is None else self.get_height_mm(read_raw=read_raw)
             if velocity < 0 and cur_mm <= self.cfg.descent_floor_mm:
                 logger.warning(
                     "Lift descent blocked at %.1fmm (floor guard %.1fmm).",

@@ -23,6 +23,7 @@ import pytest
 
 from lerobot.robots.alohamini import alohamini as alohamini_module
 from lerobot.robots.alohamini import alohamini_calibrate as calibrate_module
+from lerobot.robots.alohamini import alohamini_lift_home as lift_home_module
 from lerobot.robots.alohamini.alohamini import AlohaMini
 from lerobot.robots.alohamini.alohamini_calibrate import (
     make_parser as make_calibrate_parser,
@@ -42,6 +43,16 @@ from lerobot.robots.alohamini.lift_axis import LiftAxis, LiftAxisConfig
 from lerobot.robots.alohamini.motor_safety import set_torque_enabled
 
 
+class FakePortHandler:
+    def __init__(self, name: str, events: list[tuple]):
+        self.name = name
+        self.events = events
+        self.is_using = False
+
+    def clearPort(self) -> None:
+        self.events.append((self.name, "clear_port"))
+
+
 class FakeBus:
     def __init__(self, name: str, motor_names: tuple[str, ...], events: list[tuple]):
         self.name = name
@@ -52,6 +63,9 @@ class FakeBus:
         self.read_sequences: dict[tuple[str, str], list[object]] = {}
         self.write_failures: dict[tuple[str, str, int], tuple[BaseException, bool]] = {}
         self.position_step = 0
+        self.port_handler = FakePortHandler(name, events)
+        self.latch_port_busy_on_interrupt = False
+        self.read_options: list[tuple[str, str, bool, int]] = []
 
     def read(
         self,
@@ -62,10 +76,15 @@ class FakeBus:
         num_retry: int = 3,
     ) -> int | float:
         self.events.append((self.name, "read", register, motor))
+        self.read_options.append((register, motor, normalize, num_retry))
+        if self.port_handler.is_using:
+            raise ConnectionError("[TxRxResult] Port is in use!")
         sequence = self.read_sequences.get((register, motor))
         if sequence:
             value = sequence.pop(0)
             if isinstance(value, BaseException):
+                if isinstance(value, KeyboardInterrupt) and self.latch_port_busy_on_interrupt:
+                    self.port_handler.is_using = True
                 raise value
             self.registers[(register, motor)] = value
             return value
@@ -84,6 +103,8 @@ class FakeBus:
     ) -> None:
         int_value = int(value)
         self.events.append((self.name, "write", register, motor, int_value))
+        if self.port_handler.is_using:
+            raise ConnectionError("[TxRxResult] Port is in use!")
         failure = self.write_failures.get((register, motor, int_value))
         if failure is not None:
             error, apply_before_error = failure
@@ -136,6 +157,7 @@ def make_activation_robot(*, fail_arm_enable: bool = False):
         )
 
     robot = AlohaMini.__new__(AlohaMini)
+    robot.config = SimpleNamespace(robot_model="alohamini1")
     robot.left_bus = left
     robot.right_bus = right
     robot.left_arm_motors = ["arm_left_shoulder_pan", "arm_left_gripper"]
@@ -148,6 +170,34 @@ def make_activation_robot(*, fail_arm_enable: bool = False):
 
 def event_index(events: list[tuple], expected: tuple) -> int:
     return next(index for index, event in enumerate(events) if event == expected)
+
+
+def test_optional_home_safety_check_can_refuse_before_torque_or_during_motion(monkeypatch):
+    from lerobot.robots.alohamini import lift_axis as module
+
+    monkeypatch.setattr(module.time, "sleep", lambda _: None)
+    for refuse_phase in ("before_torque", "homing"):
+        events = []
+        bus = FakeBus("left", ("lift_axis",), events)
+        lift = LiftAxis(LiftAxisConfig(home_down_speed=200), bus, None)
+        primary = RuntimeError("diagnostic temperature ceiling")
+        calls = []
+
+        def guard(phase, displacement_mm):
+            calls.append((phase, displacement_mm))
+            if phase == refuse_phase:
+                raise primary
+
+        with pytest.raises(RuntimeError, match="diagnostic temperature ceiling") as caught:
+            lift.home(safety_check=guard)
+
+        assert caught.value is primary
+        assert calls[0] == ("before_torque", 0.0)
+        assert not lift.is_homed
+        assert bus.registers[("Goal_Velocity", "lift_axis")] == 0
+        assert bus.registers[("Torque_Enable", "lift_axis")] == 0
+        enables = [e for e in events if e[1:] == ("write", "Torque_Enable", "lift_axis", 1)]
+        assert len(enables) == (0 if refuse_phase == "before_torque" else 1)
 
 
 def test_arm_goals_are_seeded_from_raw_positions_before_torque_enable():
@@ -218,6 +268,101 @@ def test_activation_failure_zeros_body_disables_torque_and_closes_buses():
             assert (bus_name, "write", "Torque_Enable", motor, 0) in events
         assert not bus.is_connected
     assert not robot.lift.is_homed
+
+
+def test_interrupted_bus_read_is_recovered_before_shutdown_io_and_preserves_interrupt():
+    robot, left, right, events = make_activation_robot()
+    primary = KeyboardInterrupt("operator interrupt during SDK read")
+    left.latch_port_busy_on_interrupt = True
+    left.read_sequences[("Present_Position", "arm_left_shoulder_pan")] = [primary]
+
+    with pytest.raises(KeyboardInterrupt) as caught:
+        try:
+            left.read("Present_Position", "arm_left_shoulder_pan")
+        except BaseException:
+            cleanup_errors = robot._safe_shutdown(
+                close_buses=True,
+                recover_interrupted_bus_io=True,
+            )
+            assert cleanup_errors == []
+            raise
+
+    assert caught.value is primary
+    clear_index = event_index(events, ("left", "clear_port"))
+    first_zero_index = event_index(
+        events,
+        ("left", "write", "Goal_Velocity", "base_left_wheel", 0),
+    )
+    assert clear_index < first_zero_index
+    for bus_name, bus in (("left", left), ("right", right)):
+        for motor in bus.motors:
+            assert (bus_name, "write", "Torque_Enable", motor, 0) in events
+        assert not bus.is_connected
+
+
+def test_ordinary_shutdown_does_not_clear_an_idle_port_and_closes_both_buses():
+    robot, left, right, events = make_activation_robot()
+
+    robot.disconnect()
+
+    assert not any(event[1] == "clear_port" for event in events)
+    assert not left.is_connected
+    assert not right.is_connected
+    assert not robot.lift.is_homed
+
+
+def test_genuine_cleanup_failure_remains_an_error_after_interrupted_bus_recovery():
+    robot, left, right, events = make_activation_robot()
+    left.port_handler.is_using = True
+    left.write_failures[("Goal_Velocity", "base_left_wheel", 0)] = (
+        ConnectionError("wire disconnected"),
+        False,
+    )
+
+    with pytest.raises(RuntimeError, match="wire disconnected"):
+        robot.disconnect(recover_interrupted_bus_io=True)
+
+    assert ("left", "clear_port") in events
+    assert not left.is_connected
+    assert not right.is_connected
+
+
+def test_am1_lift_diagnostics_read_only_supported_non_phase_registers():
+    robot, left, _, events = make_activation_robot()
+    robot.lift.is_homed = True
+    values = {
+        "Present_Current": 7,
+        "Present_Temperature": 44,
+        "Present_Voltage": 121,
+        "Goal_Velocity": 0,
+        "Present_Velocity": -2,
+        "Torque_Enable": 1,
+        "Operating_Mode": 1,
+        "Status": 0,
+    }
+    for register, value in values.items():
+        left.registers[(register, "lift_axis")] = value
+    events.clear()
+    left.read_options.clear()
+
+    snapshot = robot.read_lift_diagnostics()
+
+    assert snapshot == {
+        "is_homed": True,
+        "present_current_raw": 7,
+        "present_current_ma": 45.5,
+        "present_temperature_raw": 44,
+        "present_voltage_raw": 121,
+        "goal_velocity_raw": 0,
+        "present_velocity_raw": -2,
+        "torque_enable": 1,
+        "operating_mode": 1,
+        "status": 0,
+    }
+    assert [event[2] for event in events if event[1] == "read"] == list(values)
+    assert "Phase" not in {event[2] for event in events}
+    assert not any(event[1] == "write" for event in events)
+    assert all(not normalize for _, _, normalize, _ in left.read_options)
 
 
 @pytest.mark.parametrize(
@@ -309,6 +454,62 @@ def test_calibration_skip_lift_home_does_not_call_home(monkeypatch):
     assert robot.config.cameras == {}
     assert robot.connect_kwargs == {"calibrate": False, "activate": False, "home_lift": False}
     assert robot.home_calls == 0
+
+
+def test_calibration_interrupt_recovers_abandoned_io_and_preserves_primary_error(monkeypatch):
+    class InterruptedCalibrationRobot:
+        def __init__(self, config):
+            self.is_connected = False
+            self.is_calibrated = False
+            self.lift = SimpleNamespace(home=lambda: None)
+
+        def connect(self, **kwargs):
+            self.is_connected = True
+
+        def calibrate(self):
+            raise KeyboardInterrupt("primary calibration interruption")
+
+        def disconnect(self, *, recover_interrupted_bus_io=False):
+            assert recover_interrupted_bus_io
+            raise ConnectionError("calibration cleanup failure")
+
+    monkeypatch.setattr(calibrate_module, "AlohaMini", InterruptedCalibrationRobot)
+    monkeypatch.setattr(
+        "sys.argv",
+        ["alohamini_calibrate", "--robot_model", "alohamini1", "--no_cameras"],
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="primary calibration interruption") as caught:
+        calibrate_module.main()
+
+    assert any("calibration cleanup failure" in note for note in caught.value.__notes__)
+
+
+def test_lift_home_interrupt_requests_abandoned_io_recovery(monkeypatch):
+    cleanup_calls = []
+
+    class InterruptedLift:
+        cfg = SimpleNamespace(home_stall_current_ma=300.0)
+
+        def home(self, **kwargs):
+            raise KeyboardInterrupt("primary lift-home interruption")
+
+    class InterruptedLiftRobot:
+        def __init__(self, config):
+            self.lift = InterruptedLift()
+
+        def connect(self, **kwargs):
+            pass
+
+        def _safe_shutdown(self, *, close_buses, recover_interrupted_bus_io=False):
+            cleanup_calls.append((close_buses, recover_interrupted_bus_io))
+            return []
+
+    args = lift_home_module.make_parser().parse_args(["--no_cameras"])
+    monkeypatch.setattr(lift_home_module, "AlohaMini", InterruptedLiftRobot)
+
+    assert lift_home_module.run(args) == 130
+    assert cleanup_calls == [(True, True)]
 
 
 def test_host_safety_limits_are_applied_to_configs():

@@ -91,7 +91,7 @@ If either identity is missing, duplicated, ambiguous, or attached to the wrong l
 
 ### Lean AM1 local operation and physically proven lift
 
-`integrate/am1-local-teleop` at `e789330e1ac04d1f7a39ecf2b44c1f2b19aa9743` is the canonical shared branch for the physically validated local arm and base system. It contains both immutable validation inputs: Windows `30609a4597b8b6fca49bc1018024fd29dfb55127` and Pi `ee3a6f5dd813be82780a6a9b1789966357542d2f`.
+`integrate/am1-local-teleop` at `07bda8ad036de2dffdaa3493a4a30428ab0f06b8` is the canonical shared branch for the physically validated local arm, base, and lift-only system. It contains both immutable validation inputs: Windows `30609a4597b8b6fca49bc1018024fd29dfb55127` and Pi `ee3a6f5dd813be82780a6a9b1789966357542d2f`.
 
 Local bimanual arms are physically proven. In the accepted run, all twelve channels moved on the correct side and in the correct direction, startup synchronization's maximum final mismatch was `5.534`, and live control sent 449 actions over 44.990 seconds (`9.980 Hz`) with a longest interval of 110 ms. Two transient observation timeouts recovered, `stale_latched` remained false, no command-watchdog event occurred during live forwarding, base and lift remained stationary, and both processes exited `0`. Evidence is retained at:
 
@@ -113,13 +113,13 @@ Local lift teleoperation is physically proven in one bounded lift-only session. 
 - `C:\Users\pickm\AlohaMini1Logs\am1-lift-windows-20260904-234200.log`
 - `C:\Users\pickm\AlohaMini1Logs\am1-lift-host-20260904-234125.log` (downloaded from `/home/pickmanmike/AlohaMini1Logs/am1-lift-host-20260904-234125.log`)
 
-The reviewed lean launchers replace the long ordinary host/client command blocks. They support `arms`/`base`/`lift` on the Pi and `Arms`/`Base`/`Lift` on Windows. Copy the tracked example once, edit its machine-local paths, and leave the resulting file ignored by Git:
+The reviewed lean launchers replace the long ordinary host/client command blocks. They support `arms`/`base`/`lift`/`local` on the Pi and `Arms`/`Base`/`Lift`/`Local` on Windows. Copy the tracked example once, edit its machine-local paths, and leave the resulting file ignored by Git:
 
 ```powershell
 Copy-Item .\config\am1.local.example.json .\config\am1.local.json
 ```
 
-Each launcher verifies a clean reviewed worktree and the repository import root, prints the exact Python command, creates a timestamped log, and prints the child exit code. Arms mode additionally resolves both leader ports from stored PnP identities and verifies the accepted calibration hashes. Base and Lift modes have no leader-map, calibration, or COM path.
+Each launcher verifies a clean reviewed worktree and the repository import root, prints the exact Python command, creates a timestamped log, and prints the child exit code. Arms and Local modes additionally resolve both leader ports from stored PnP identities and verify the accepted calibration hashes. Base and Lift modes have no leader-map, calibration, or COM path.
 
 The first lift packet uses only:
 
@@ -144,6 +144,312 @@ The following is preparation for a separately authorized human-operated test, no
 Pass requires one controlled downward homing cycle, safe current and temperature at the lower stop, `U` physical up, `J` physical down, prompt zero on both releases and `Q`, stationary wheels and follower arms, no right-bus or leader access, no live command-watchdog event, clean final zero/disconnect, and client/host exit codes `0`. Stop immediately for a homing timeout or exception, failure to stop at the lower limit, sustained hard-stop load, abnormal current or heating, wrong direction, no movement, continued motion after release, wheel or arm motion, a live watchdog warning, bus/communication error, sound, vibration, cable strain, obstruction, instability, or loss of the power-disconnect path. A refusal authorizes no automatic retry and no speed, watchdog, calibration, PID, Phase, limit, or motor-register change.
 
 The lift-only result is complete. Combined local operation, cameras, recording, and remote operation are not yet physically proven by this section.
+
+#### Combined Local result and lift-rest/shutdown closure packet
+
+Local mode is the narrowly scoped combination of the three proven local components; it does not use the older blocking keyboard loop. The Pi helper opens both follower buses, retains the provisional `20.0` relative arm-target limit, disables cameras, and performs one ordinary lift homing cycle. The Windows helper resolves physical/logical left `COM8` and right `COM7` through the stored PnP identities, verifies the accepted leader calibration hashes, performs the proven both-arm startup synchronization for 120 seconds with the `10.0` final gate, and then runs for at most 30 seconds at 10 Hz with cameras and Rerun disabled.
+
+During synchronization, the Enter pause, and the final post-Enter alignment gate, every base and lift command remains zero. Live arm targets use the single-owner completion-spaced sender. The timestamped body mailbox replaces commands older than 250 ms with exact zero, there are no catch-up sends, and the Pi watchdog remains one second.
+
+**Combined Local motion demonstrated; interrupted shutdown and lift thermal behavior remain open.** The exercised Windows and Pi checkouts were both `feature/am1-local-mode` at `344cb9e1c2317d94a473b54af026a853cb74d0f8`. In the final attempt both arms followed correctly, `W` moved the base forward and stopped on release, `U` raised the lift and stopped on release, `J` lowered it and stopped on release, and no unexpected pause or movement was observed. The client sent 300 live actions, reported a longest interval of 110 ms and no stale latch, and exited `0`. Host live receive gaps remained at or below approximately 100.22 ms with no live watchdog increase. Evidence is retained at:
+
+- `C:\Users\pickm\AlohaMini1Logs\am1-local-windows-20260905-161714.log` (the client reached live mode only after the first host had already failed)
+- `C:\Users\pickm\AlohaMini1Logs\am1-local-windows-20260905-162141.log`
+- `/home/pickmanmike/AlohaMini1Logs/am1-local-host-20260905-162120.log`
+
+Ctrl+C then interrupted a left-bus Feetech read. The exact register is not recoverable from this log because the ordinary observation path did not trace each read boundary; it is bounded to the left-arm position, base velocity, lift position/velocity, or left-bus current read inside `get_observation()`. The installed `feetech-servo-sdk 1.0.0` sets its port `is_using` flag before a transaction but does not clear it in a `finally` block if `KeyboardInterrupt` escapes the receive path. The abandoned flag made every left-bus cleanup write return `Port is in use!`, so final base/lift zero and left-bus torque-off could not be verified and the host honestly exited `1`. Project-owned cleanup now clears the receive buffer and abandoned flag only after control has unwound from exceptional motor I/O, before the existing best-effort zero and torque-off sequence. Ordinary shutdown does not clear an idle port; real cleanup failures still fail; and the original primary exception is retained with cleanup failures attached. The interrupt-resistant `tee -i` runtime logging remains unchanged.
+
+The four Local host attempts used the same reviewed source head and the same logged flags: `--robot_model alohamini1 --no_cameras --max_relative_target 20.0 --max_loop_freq_hz 30 --profile_timing true --profile_cadence`. None of the logs records supply voltage, connector state, a body-power cycle, or another physical change; the later human account says only that the power-supply issue was resolved better. Their thermal evidence is materially different:
+
+| Host log | Evidence and phase | Outcome |
+|---|---|---|
+| `am1-local-host-20260905-160958.log` | 573 once-per-second left-current arrays across 575.724 seconds. The tenth element is lift ID 11 and was already 292–500 mA before any Windows command; mean 341.0 mA and p95 416 mA. The first command arrived about 7 minutes 16 seconds after current logging began. | A lift `Present_Position` response reported `Overheat` near 16:19:40. The paired Windows client did not print live mode until about three seconds after that host failure, so it could not validate movement. Cleanup also encountered the servo error; host exit `1`. |
+| `am1-local-host-20260905-162007.log` | Startup only; no current sample. | Lift ID 11 was not found; cleanup still received `Overheat`; host exit `1`. |
+| `am1-local-host-20260905-162028.log` | Startup only; no current sample. | Lift ID 11 was not found; cleanup still received `Overheat`; host exit `1`. |
+| `am1-local-host-20260905-162120.log` | 294 once-per-second lift-current samples across 296.405 seconds; 0–149 mA, mean 20.0 mA and p95 26 mA. Synchronization, the Enter pause, and the successful 30-second live phase are distinguishable in the cadence record. | Motion passed; Ctrl+C left the SDK busy flag abandoned and cleanup failed; host exit `1`. |
+
+The current arrays are already converted using 6.5 mA per raw unit; do not convert them again or treat their count as control-loop iterations. AM1 homing uses raw `+200` for physical down with a 20-second timeout, explicitly commands zero afterward, retains torque, and commands no backoff. The 5 mm descent guard prevents a later downward command but does not unload the lower hard stop. Lower-stop preload, holding behavior, prior thermal history, and an unrecorded physical or power change remain hypotheses. The logs do not establish what changed before the low-current run, so no backoff, torque, speed, current limit, temperature limit, Phase, PID, ID, calibration, or servo-register change is justified.
+
+The host therefore has a default-off AM1 lift diagnostic. In explicit Lift mode, `--lift-diagnostics` adds a compact read-only snapshot at most once per second: wall and monotonic time, process-local height, current in raw units and mA, raw temperature and voltage, goal and present raw velocity, torque state, operating mode, homed state, and status. It reads only supported registers and never reads or writes `Phase`.
+
+**LIFT-REST-R1 supersedes the ten-minute lower-stop procedure. Do not repeat that baseline.** The terminal capture `C:\Users\pickm\Downloads\AM1 Terminal Window Contents.txt` contains 599 diagnostic records spanning 600.011 seconds: temperature feedback 39 to 71, current 279.5–403 mA (mean 318.7 mA), zero goal/present velocity, torque enabled, mode 1, height essentially zero, and host command sequence zero. The original log was located rather than inferred:
+
+- `/home/pickmanmike/AlohaMini1Logs/am1-lift-host-20260906-003124.log`
+- Original log SHA-256: `841a744e3de7a05ee2512e68bf291baa516167ff9b41612397c3097b5ca5dba4`.
+- Capture SHA-256: `238709aa0cc55940b254cbd4cb3fd79a6782262c7d4f15b873be497807c1268d`.
+
+The original has 640 records spanning 641.172 seconds, beginning 41.161 seconds before the capture: temperature 38 to 71, current 279.5–474.5 mA (mean 324.1 mA). Its launch header identifies the repository venv, AM1, `--no_follower --no_cameras`, enabled ordinary homing, and `--profile_lift_diagnostics`. It does not contain a literal source SHA or detailed homing-result record. Read-only source/import inspection and the Pi reflog place the clean `feature/am1-local-mode` checkout at `d0fd1f7860a5e36bf3ed0c6e4031024219e0db05` before this launch. Termination was a lift ID 11 `Present_Position` **Overheat** response; subsequent zero and torque-disable verification failed and the host exited `1`. This is not a demonstrated recurrence of the interrupted SDK busy flag. The human reports an enclosed servo, warm surroundings, no added platform payload, and no external obstruction. The earlier low-current run remains unexplained. The demonstrated combined Local-motion pass above is retained.
+
+##### Guarded lift telemetry and relief comparison (prepared, not physically validated)
+
+The guarded diagnostic runs inside the existing owning Pi process and left body bus, without constructing an ordinary ZMQ host, follower arms, right bus, leaders, cameras, or a Windows client. It bypasses ordinary robot configuration so the configuration under investigation is not overwritten. Base motors receive only zero/torque-off commands. There is no normal action loop or automatic restart.
+
+The operator-run preflight reads actual model/firmware, temperature and voltage limits, unloading/protection configuration, velocity-loop coefficients, torque limit, acceleration and velocity/profile fields once. `Phase` is neither read nor written. It requires STS3215 model 777 and angular resolution 1 for the existing geometric conversion. The [vendor ST3215 memory map V3.7](https://files.waveshare.com/upload/2/27/ST3215%20memory%20register%20map-EN.xls) specifies temperature in degrees Celsius, with one-degree resolution, and voltage in 0.1 V units. Telemetry retains raw values and also labels Celsius, volts and the existing 6.5 mA/raw-unit current conversion; `Present_Load` is logged **raw**, not claimed to be a calibrated physical force.
+
+The first two guarded attempts at `ffe92d2798958cdd0687078e43e4623c7981e07f` are pre-motion refusals, not thermal-relief results. In `/home/pickmanmike/AlohaMini1Logs/am1-lift-host-20260906-202329.log` (SHA-256 `c092f994e31ca3736667e65d2354748af9988dae2b33fb88fd83bd04d4e61fd3`) and `am1-lift-host-20260906-222702.log` (SHA-256 `649b1710791508bbed0c4f2d8c0d6a14264301d34d908b81a43b73bf53adfa15`), the post-gate preflight read torque off, then the guard read torque on 24 ms and 25 ms later after setup. Both refused with exit `2`; neither reached homing, relief or rest. The exact setup write responsible is not proven. The follow-up diagnostic therefore reports state before and after the setup group, then makes `Torque_Enable=0` the final setup write and requires a successful readback before intentional homing activation.
+
+The next attempt at `6dca83199c12cf49cf46468008eb5b016214767f`, `/home/pickmanmike/AlohaMini1Logs/am1-lift-host-20260907-122711.log` (SHA-256 `0b942dc611ae5fe6940db89587629aa55c05e7ed2ca8bff1a06051bb41157c1c`), passed that final torque-off guard and began homing. Its last printed homing sample at 5.418 seconds reported 37 C, 6.5 mA, status zero and approximately 4.2 mm downward displacement. At 6.410 seconds the diagnostic refused a reported 93 C value against its 55 C ceiling and exited `2`; cleanup read torque and goal velocity zero but present velocity 200. The operator saw only a brief small movement and no external heat. Because routine output was throttled, the fault-causing 93 C sample itself was absent from the structured records. This is neither a completed relief comparison nor proof of a physical 93 C excursion.
+
+Source inspection of the installed `feetech-servo-sdk 1.0.0` established two telemetry limitations. Its status parser checks packet framing, motor ID, servo error and checksum, but its scalar helper does not require the reply payload width to equal the requested register width. Its `clearPort()` calls pySerial `flush()`, which waits for outgoing data rather than discarding received bytes; `reset_input_buffer()` is the receive-discard operation. Protocol-1 status packets contain no requested address or transaction sequence, so even an ID-, length- and checksum-valid reply cannot prove correspondence beyond those fields. These are proven software limits; the logs do not establish that a delayed or wrong-width packet caused the reported 93.
+
+The diagnostic now uses a diagnostic-only scalar reader for configuration, sample, homing position/current, height and cleanup readback. It rejects pending bytes before a request, sends no automatic read retry, requires the requested ID, exact payload width, zero SDK servo error and valid checksum, and retains the exact bounded outbound request frame, returned reply bytes, separately parsed packet error, and timing in any rejected structured sample. The 93 C sample and refusal reason are emitted even inside the normal one-second print throttle. Ordinary lift operation and AM2/AM2 Pro do not use this reader.
+
+The torque-off readback at `012349764fb2e62ca589e54d607e1673bbed7ec2`, `/home/pickmanmike/AlohaMini1Logs/am1-lift-host-20260907-184959.log` (SHA-256 `71ab0167fe084b8ea984da5b52b50f8933f3196dc8ed649248a617554ce01984`), passed. Across approximately 3.05 seconds it reported 37 C, 0 mA, 11.7 V, torque off, zero goal and present velocity, mode 1 and status zero. Cleanup again read torque, goal and present velocity as zero, `LIFT_READBACK_PASS` printed, and the helper recorded `HOST_EXIT_CODE=0`. No physical anomaly was reported. This short torque-off result establishes a usable cold stationary preflight; it does not resolve the prior gradual heating or validate telemetry during motion.
+
+Four subsequent guarded attempts at the same head reached homing but not `home_complete`, relief or raised rest. Run 1 retained the platform; the operator removed it for runs 2–4. The original files and independently verified SHA-256 values are:
+
+| Original Pi log | Platform | Before motion -> rejected sample | Rejected current | Immediate cleanup torque / goal / velocity | SHA-256 |
+|---|---:|---|---:|---|---|
+| `am1-lift-host-20260907-200940.log` | Installed | 38 -> 77 C in 0.734 s | 0 mA | 0 / 0 / 200 | `a26be51575fba491b75768fcc8fb0cff092ee35c3ba1307d95f4b677abe92452` |
+| `am1-lift-host-20260907-202113.log` | Removed | 38 -> 70 C in 8.724 s | 6.5 mA | 0 / 0 / 150 | `cbff57bde62505da6400ac9a517c197262eaa0520413b99c0195be6a044c1287` |
+| `am1-lift-host-20260907-203338.log` | Removed | 38 -> 55 C in 0.063 s | 6.5 mA | 0 / 0 / 100 | `151f6eeb045515d0d76bb8d18319381085452fdd2dcff2e6d1ad3db5e92d290e` |
+| `am1-lift-host-20260907-203410.log` | Removed | 38 -> 81 C in 0.673 s | 6.5 mA | 0 / 0 / 200 | `0a8d2d13de8c82f6c6ed784a1025bc5cb55329e544f1fbc69156b1a563d8ab3e` |
+
+All four correctly refused on the numeric temperature reading during homing and exited `2`. Run 3's rejected 55 C sample and run 4's first 38 C preflight are 28.438 seconds apart; those readings are preserved as evidence, not interpreted as physical cooling. Status, parsed packet error and SDK servo error were zero throughout. The only recorded configuration difference was `Acceleration=254` in run 1 and `Acceleration=0` in runs 2–4. Its cause and relevance are not established, so it authorizes no write. The three omitted disconnected-cable attempts stopped during setup on a missing ID 8 base-left-wheel write acknowledgement, before homing; they are startup-wiring failures rather than evidence about lift feedback.
+
+The four rejected temperature payloads came from correctly shaped one-byte replies to the same request, `FF FF 0B 04 02 3F 01 AE` (ID 11, address 63, width 1): `FF FF 0B 03 00 4D A4` (77), `FF FF 0B 03 00 46 AB` (70), `FF FF 0B 03 00 37 BA` (55), and `FF FF 0B 03 00 51 A0` (81). Rechecking all 36 captured request/reply pairs found valid framing, declared and actual lengths, checksums, requested ID/address/width, reply ID and error fields, with no pending input and no oversized-reply slicing. A status reply still carries no register address or sequence number; same-ID/same-width correspondence and the physical accuracy of the servo's temperature feedback therefore remain unproven. No concrete additional scalar-reader defect is demonstrated by these runs.
+
+##### Independent grouped motor-feedback comparison and matched startup profile
+
+The standalone vendor-SDK comparison operates outside `AlohaMini`, `LiftAxis`, homing, platform-height conversion and ZMQ. The Pi alias `/dev/am_arm_follower_left` currently resolves to `/dev/ttyACM1`, a WCH USB serial interface (`1a86:55d3`, `cdc_acm`, USB serial `5B3D044115`); prior project evidence identifies this VID/PID family as CH343, while the exact carrier-board model is not encoded in the device metadata. The established bus is 1,000,000 baud and the only addressed servo is STS3215 ID 11.
+
+The utility uses the installed `feetech-servo-sdk 1.0.0` Protocol-0 sync-read operation. Three read-only configuration groups cover addresses 0–17, 19–39 and 40–86, deliberately skipping `Phase` at address 18. Each live sample is one contiguous grouped response for addresses 33–70, so temperature is evaluated alongside mode, torque, acceleration, goal and present velocity, position, load, voltage, status, moving and current from the same returned packet. It rejects pending bytes, a wrong request or response shape/ID/length/checksum/error, missing or late replies, unusable configuration (including a configured temperature limit below the 55 C diagnostic ceiling), more than 40 C at start, 55 C, 200 mA current, voltage outside configured limits, wrong motion direction, and nonzero status. Grouping improves field consistency but does not add an address or sequence to the status packet and does not prove sensor accuracy.
+
+The only permitted writes are lift ID 11 `Goal_Velocity` zero or the nonzero value selected by a fixed profile (`+100` for the original quick profile or `+200` for the matched startup profile), and `Torque_Enable` zero or one. Exact uppercase `ROTATE` gates the single nominal 0.3-second quick pulse. One thread remains the sole SDK/serial owner: it takes at most two early grouped samples with 40 ms SDK deadlines, skips the remaining wait on an anomaly or an observed 64-tick early-stop target, and then requests zero. The 0.45-second value is a diagnostic timing envelope that includes the nominal pulse and SDK allowance; exceeding it is recorded as a refusal, not falsely claimed to be a hard real-time stop. Likewise, 128 raw ticks is a rejected observed value, not a preemptive physical travel interlock: the first returned sample may already exceed it. A stalled OS, USB adapter or servo can defeat every software evidence bound, and the human-accessible power disconnect remains the hard stop. Any refusal retains its grouped packet evidence, commands zero and torque-off, verifies stopped cleanup when communication permits, closes the port, exits nonzero and never restarts automatically.
+
+The first two standalone attempts at `afad620d1489e3ececd90ba8c24da13363290de0` did not command the pulse and are not motor-feedback comparison passes. In `/home/pickmanmike/AlohaMini1Logs/am1-lift-host-20260907-235335.log` (SHA-256 `6d09cd7ca9689339e197d289eb58f8ef4dc4815fe022841f05bc906b5acbd78e`), baseline position/velocity was `491/0`; 6.967 seconds later, after `ROTATE`, pre-motion was `492/+50`, so the old single-sample `abs(velocity)>5` predicate refused before torque enable. Its immediate cleanup was `491/-50` and produced the same false stationary error. In `/home/pickmanmike/AlohaMini1Logs/am1-lift-host-20260907-235420.log` (SHA-256 `eb4f135508c2b3c17a7e72bd368f2823a6f63de565130f3296c63f718396f6dc`), baseline `491/-50` with `Moving=0` caused the same pre-gate refusal; cleanup was `492/0`. All seven feedback-bearing snapshots across the attempts reported 37 C, 11.8 V, zero current, torque off, zero goal and status zero. The positions were only 491 or 492. These are sparse phase snapshots and do not establish continuous stillness, a firmware mechanism or that every +/-50 report is harmless. Because no pulse occurred, they add no temperature evidence during motion.
+
+Stationary gates now require at least four fresh grouped replies spanning 0.15 seconds. Every reply must retain the expected torque and zero goal state and pass the existing transport, temperature, current, voltage, mode and status checks. Position is unwrapped across the 4096-count boundary; both total excursion and net drift are limited to one raw count, about 0.088 degrees at the configured resolution. This is the smallest tolerance that includes the measured adjacent-count variation. Raw velocity and `Moving` remain in every sample and the qualification summary. A candidate window cannot include a velocity magnitude over 50; three consecutive same-sign reports beyond the original five-unit near-zero threshold, or three consecutive `Moving=1` reports paired with near-zero velocity, are treated as persistent contradictory motion evidence. Thus the change does not globally raise the stillness threshold or trust `Moving` alone. Baseline, post-authorization pre-motion and armed-zero must pass within 0.6 seconds, with torque still off until the whole pre-motion window passes. After a commanded zero, stopped verification and cleanup have at most the existing one-second settle limit to produce the same uninterrupted window; accumulated creeping cannot pass as per-sample jitter. Missing, late, corrupt or faulted feedback refuses immediately rather than being retried until a convenient zero appears. Cleanup always sends zero and torque-off before collecting its bounded evidence, and cannot replace an earlier refusal.
+
+The direct single-servo attempt at `5ec0cf5f13cc44505736e2dfe32ea43898c0e0fe`, `/home/pickmanmike/AlohaMini1Logs/am1-lift-host-20260908-225950.log` (SHA-256 `a0994af8d019375e997cffb25384d204a10fffcf632fd1d9c7166b723023c820`), used the original ID 11 alone, with the arm and wheel branches disconnected, a new direct compatible cable, and the platform disengaged. Baseline, post-`ROTATE`, and armed-zero windows passed. Torque-enable and raw `+100` were acknowledged, the pulse lasted 0.301 seconds, and all 28 unique recorded transactions validated. All 19 dynamic samples reported 34 C, 12.0 V, status zero, and 0–13 mA. This is not another bad acknowledgement or temperature event.
+
+The run exposed a verdict-ordering defect rather than no movement. Its pre-motion origin was 3025. Early samples at 4.302 and 4.354 seconds were 3025/3026 (delta 0/1); zero was requested at 4.550 seconds. The old comparator nevertheless applied the five-tick minimum to the stale 4.354-second sample before stopped feedback. Cleanup immediately saw 3050 and then settled at 3051, but cleanup cannot retroactively qualify the pulse; the run correctly remains an exit-2 refusal because it has no normal torque-on endpoint.
+
+The corrected comparator retains both early samples and every immediate fault check, requests zero at the unchanged deadline, and, only when no earlier error or zero failure exists, gathers the normal bounded stopped window while torque remains on and goal velocity is zero. It then records a distinct `motion_endpoint` containing the early and endpoint timestamps/positions and evaluates signed wrap-aware displacement from the pre-motion origin. The minimum remains five ticks, the maximum remains 128 ticks, and motion is never extended to reach the minimum. Missing/faulted endpoint data, reverse travel, overtravel, stop-timing failure, and earlier motion faults still refuse before cleanup; cleanup telemetry is never substituted for the endpoint.
+
+The corrected original-servo comparison then passed at `00c4a7d566cbfb47ea868f37e9ac6f8f2831404b`. In `/home/pickmanmike/AlohaMini1Logs/am1-lift-host-20260909-205414.log`, the original ID 11 was the only connected motor on the same controller and new direct cable, with the platform disengaged. The acknowledged raw `+100` pulse lasted 0.301 seconds. The fresh stopped endpoint moved `+30` counts, from 3081 to 3111; temperature remained 40 C, voltage 11.9–12.0 V, and current 0–6.5 mA. Stopped qualification and torque-off cleanup passed with `cleanup_errors=[]`, followed by `LIFT_MOTOR_FEEDBACK_PASS` and `HOST_EXIT_CODE=0`. The operator saw the small pulse, confirmed that the motor stopped, and reported no unusual movement, sound, or warmth.
+
+This is a bounded electrical, feedback, direction, and unloaded-motion pass for the original servo and direct cable. It closes the comparator's endpoint-verdict defect and removes any reason to repeat the same `+100` unloaded run. It is not a matched reference for the later `+200` homing-stage anomalies, and it does not resolve installed startup-temperature reliability or prove long-duration Local-mode thermal safety.
+
+##### Installed grouped home/relief/rest evidence (one functional pass; startup reliability open)
+
+Five operator runs exercised the ID-11-only installed diagnostic at `8dc90a7417c7bf0e919c0556853b176b7d97e63e`. The original logs and SHA-256 values are:
+
+| Original Pi log | Starting raw position | Result | SHA-256 |
+|---|---:|---|---|
+| `am1-lift-host-20260911-224341.log` | 1412 | Homing refused on 61 C; exit 2 | `a7fe1388d0c05088b4d8320363dff6627784b50552aca998bad507bee935a8d3` |
+| `am1-lift-host-20260911-224411.log` | 2185 | Homing refused on 55 C; exit 2 | `0a175ee57085d586afd33f29049c1f758339e40121f74b84ad83b574451bcbf9` |
+| `am1-lift-host-20260911-224436.log` | 3186 | Homing refused on 56 C; exit 2 | `b5cb5a35008ec34a8e84743366479012ca056ce0121e5580548519a9369bc288` |
+| `am1-lift-host-20260911-224504.log` | 3635 | Homing refused on 59 C; exit 2 | `da4c1cbee11c6086f0c37e580274b49fd355ee5c6e9632b159c3e008c8b48431` |
+| `am1-lift-host-20260911-224530.log` | 3848 | Home, relief, raised rest and cleanup passed; exit 0 | `870fcb429b14846e5e82cb04d750a57dd73be76480a288eef8081f0d4910c777` |
+
+The first four runs each reported 40 C approximately 52 ms before the rejected 61, 55, 56 or 59 C sample, then 40 C again in the first cleanup sample about 8–9 ms later. These were diagnostic numeric-temperature refusals, not firmware `Overheat` responses. Status and response-error fields were zero. Independent validation of all 1,598 unique grouped-read transactions across the five logs found the expected frame shape, payload length, ID, checksum and zero error field, and decoded the same values printed by the diagnostic. Those checks still cannot prove request correspondence or physical sensor accuracy because the protocol reply contains neither the requested address nor a transaction sequence. The four anomalies therefore remain unresolved; no retry-until-home policy is acceptable.
+
+The fifth run is preserved as a separate functional success, not treated as an identical-start repeat. The operator reported actual-bottom contact. Homing completed by current threshold in 3.588 seconds. Immediately after zero at the lower stop, five current samples were 331.5–351 mA (mean 339.3 mA) over 0.208 seconds. The carriage then rose and settled at 10.5 mm. During the 45.03-second raised rest, position was unchanged, current was 26–39 mA (mean 31.77 mA), and temperature was 39–44 C, predominantly 40 C. It ended with `LIFT_RELIEF_PASS`, `HOST_EXIT_CODE=0`, and all five cleanup qualifications without cleanup-error text.
+
+This measured current reduction makes controlled post-home relief from the lower stop an evidence-supported candidate normal policy. It is not yet deployed and is not a cure for the four homing-stage temperature anomalies. Reliable normal startup, repeated raised resting behavior, and long-duration Local-mode thermal operation remain open.
+
+**Default next operator action:** perform one matched `+200` original-versus-spare comparison under the same direct-cable, securely mounted, unloaded conditions. The existing original `+100`/0.301-second pass is not a sufficiently matched A reference. Run one bounded A sample on the original and one bounded B sample on the compatible spare; do not repeat installed homing to obtain a preferred result.
+
+The fixed `startup-anomaly` profile uses the same grouped feedback and one serial owner as the corrected comparator, but requires exact `COMPARE_200`, labels each log `original` or `spare`, commands raw `+200` for a nominal 5.25 seconds, and samples throughout the command. That interval covers the longest observed approximately 4.94-second `+200` homing interval before one of the four refusals, with a small bounded sampling margin. It neither homes nor interprets platform height. It retains the existing cold-start and 55 C temperature checks, 200 mA current ceiling, voltage/status/transport checks, prompt zero and torque-off cleanup, and no-retry behavior. It requires at least 256 positive raw ticks and refuses observed travel above 1,536 ticks; these are evidence bounds, not independent physical interlocks. Each automatic log includes all supported configuration bytes at addresses 0–17 and 19–86, explicitly excluding `Phase`, so the two configurations can be compared offline without copying settings.
+
+<details>
+<summary>Matched original/spare setup and one-time A/B comparison</summary>
+
+Do not use a generic `STS3215` marking or the returned model number 777 as proof that a spare accepts the 12 V follower supply. Feetech lists both `ST-3215-C001` (7.4 V) and [`ST-3215-C018`](https://www.feetechrc.com/525603.html) (12 V, 30 kg-cm, nominal 1:345 gearing in the [C018 product specification](https://www.feetechrc.com/Data/feetechrc/upload/file/20240507/6385067068652648096680943.pdf)) under the STS3215 name. Before connecting power, photograph and compare the original and spare labels or supplier records. Continue only when both are explicitly the same `ST-3215-C018` 12 V / 1:345 variant and have the same connector/polarity. A C001, missing/ambiguous label, different gearing, or different voltage ends the A/B plan; never apply the 12 V supply to it.
+
+First create the matched A reference. With body power off, disengage the platform, securely mount the original lift servo with an unobstructed output, and connect only it through the same controller, USB connection, supply and new direct cable. Leave every other servo disconnected. Keep the power disconnect accessible, apply power only when ready, and run:
+
+```bash
+cd /home/pickmanmike/lerobot_alohamini
+./tools/run_am1_host.sh --mode lift --lift-motor-feedback --startup-comparison original
+```
+
+Require a cool, fault-free baseline, then type exact `COMPARE_200`. Stop by removing power for unexpected direction, travel, sound, warmth, voltage behavior or any software refusal. Require automatic zero, torque-off cleanup, `LIFT_MOTOR_FEEDBACK_PASS`, and `HOST_EXIT_CODE=0`; preserve the printed `HOST_LOG`. Whether it passes or refuses, power off completely and disconnect the original before touching the spare. Do not repeat it for a preferred outcome.
+
+For spare discovery and setup, body power begins off. Disconnect the original ID 11 and every other servo from the controller; connect only the securely mounted, unloaded spare through the known-good direct cable, with its second bus socket empty. Never connect the original and spare ID 11 at the same time. Stop every other serial owner. After the label/polarity gate passes, apply only the confirmed C018 supply, then use the existing read-only `FeetechMotorsBus.scan_port()` path to discover the spare's actual baud and ID rather than assuming either:
+
+```bash
+(
+  set -euo pipefail
+  cd /home/pickmanmike/lerobot_alohamini
+  export PYTHONPATH="$PWD/src"
+  PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -c \
+    "from lerobot.motors.feetech import FeetechMotorsBus; print(FeetechMotorsBus.scan_port('/dev/am_arm_follower_left'))"
+)
+```
+
+Require exactly one response, model 777, and record the discovered values as `SPARE_ID` and `SPARE_BAUD`. With the spare still the sole connected servo, save this non-Phase before snapshot using those discovered values:
+
+```bash
+export SPARE_ID='<discovered integer>'
+export SPARE_BAUD='<discovered baud>'
+export SPARE_BEFORE="$HOME/AlohaMini1Logs/am1-spare-id11-before-$(date +%Y%m%d-%H%M%S).json"
+(
+set -euo pipefail
+cd /home/pickmanmike/lerobot_alohamini
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/src" ./.venv/bin/python - "$SPARE_ID" "$SPARE_BAUD" <<'PY' | tee "$SPARE_BEFORE"
+import json
+import sys
+from lerobot.motors import Motor, MotorNormMode
+from lerobot.motors.feetech import FeetechMotorsBus
+
+motor_id, baud = map(int, sys.argv[1:])
+bus = FeetechMotorsBus(
+    "/dev/am_arm_follower_left",
+    {"spare": Motor(motor_id, "sts3215", MotorNormMode.DEGREES)},
+)
+bus.connect(handshake=False)
+bus.set_baudrate(baud)
+try:
+    names = (
+        "Firmware_Major_Version", "Firmware_Minor_Version", "Model_Number",
+        "ID", "Baud_Rate", "Angular_Resolution", "Operating_Mode",
+        "Torque_Enable", "Goal_Velocity", "Lock",
+    )
+    values = {name: int(bus.read(name, "spare", normalize=False)) for name in names}
+    if values["Model_Number"] != 777 or values["ID"] != motor_id:
+        raise RuntimeError(f"unexpected spare identity: {values}")
+    print(json.dumps({"host_baud": baud, "registers": values}, sort_keys=True))
+finally:
+    bus.disconnect(disable_torque=False)
+PY
+)
+```
+
+Review that saved snapshot, then type the authorization only for this spare. The existing `setup_motor()` path uses the reviewed starting ID/baud, requests torque off/unlock, and assigns only ID 11 and the established 1,000,000-baud value. Skip this identity step when the recorded values are already `11` and `1000000`; do not run it against an unreviewed scan:
+
+```bash
+(
+  set -euo pipefail
+  cd /home/pickmanmike/lerobot_alohamini
+  read -r -p 'Type PREPARE_SPARE_ID11 to write only this isolated spare: ' confirm
+  test "$confirm" = 'PREPARE_SPARE_ID11'
+  test -n "${SPARE_ID:-}" && test -n "${SPARE_BAUD:-}"
+  if test "$SPARE_ID" != 11 || test "$SPARE_BAUD" != 1000000; then
+    SPARE_ID="$SPARE_ID" SPARE_BAUD="$SPARE_BAUD" PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/src" \
+      ./.venv/bin/python - <<'PY'
+import os
+from lerobot.motors import Motor, MotorNormMode
+from lerobot.motors.feetech import FeetechMotorsBus
+
+bus = FeetechMotorsBus(
+    "/dev/am_arm_follower_left",
+    {"spare": Motor(11, "sts3215", MotorNormMode.DEGREES)},
+)
+try:
+    bus.setup_motor(
+        "spare",
+        initial_baudrate=int(os.environ["SPARE_BAUD"]),
+        initial_id=int(os.environ["SPARE_ID"]),
+    )
+finally:
+    if bus.is_connected:
+        bus.disconnect(disable_torque=False)
+PY
+  fi
+)
+```
+
+At 1,000,000 baud with only the spare ID 11 attached, use ordinary acknowledged register operations to establish velocity mode while preserving every unrelated setting. This touches only `Goal_Velocity`, `Torque_Enable`, `Lock`, and `Operating_Mode`; it does not read or write Phase, calibration, PID/PI, firmware, protection, acceleration, or limit registers:
+
+```bash
+(
+  set -euo pipefail
+  cd /home/pickmanmike/lerobot_alohamini
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/src" ./.venv/bin/python - <<'PY'
+from lerobot.motors import Motor, MotorNormMode
+from lerobot.motors.feetech import FeetechMotorsBus, OperatingMode
+
+bus = FeetechMotorsBus(
+    "/dev/am_arm_follower_left",
+    {"spare": Motor(11, "sts3215", MotorNormMode.DEGREES)},
+)
+bus.connect(handshake=True)
+primary = None
+cleanup_errors = []
+try:
+    for register, value in (
+        ("Goal_Velocity", 0),
+        ("Torque_Enable", 0),
+        ("Lock", 0),
+        ("Operating_Mode", OperatingMode.VELOCITY.value),
+        ("Lock", 1),
+        ("Torque_Enable", 0),
+    ):
+        bus.write(register, "spare", value, normalize=False)
+    expected = {
+        "Model_Number": 777, "ID": 11, "Baud_Rate": 0,
+        "Operating_Mode": 1, "Torque_Enable": 0, "Goal_Velocity": 0, "Lock": 1,
+    }
+    actual = {name: int(bus.read(name, "spare", normalize=False)) for name in expected}
+    if actual != expected:
+        raise RuntimeError(f"spare setup readback mismatch: {actual!r}")
+    print(f"SPARE_SETUP_VERIFIED={actual!r}")
+except BaseException as error:
+    primary = error
+finally:
+    for register in ("Goal_Velocity", "Torque_Enable"):
+        try:
+            bus.write(register, "spare", 0, normalize=False)
+        except Exception as error:
+            cleanup_errors.append(f"final {register}: {error!r}")
+    try:
+        bus.disconnect(disable_torque=False)
+    except Exception as error:
+        cleanup_errors.append(f"disconnect: {error!r}")
+if primary is not None:
+    for detail in cleanup_errors:
+        primary.add_note(detail)
+    raise primary
+if cleanup_errors:
+    raise RuntimeError("; ".join(cleanup_errors))
+PY
+)
+```
+
+Remove power, wait for full power-down, reapply power, rerun the read-only scan, and require exactly `{1000000: [11]}`. Rerun the same non-Phase snapshot block with `SPARE_ID=11`, `SPARE_BAUD=1000000`, and an `am1-spare-id11-after-...json` output name; verify identity, baud register 0, mode 1, torque 0 and goal 0 persisted. Any ambiguous discovery, write/readback/cleanup error, or different result stops the procedure. Do not copy an original-servo register dump into the spare.
+
+Only after that bounded setup and power-cycle verification may the securely mounted, unloaded spare use the matched B profile, still as the only servo on the same controller, USB connection, supply and new direct cable:
+
+```bash
+cd /home/pickmanmike/lerobot_alohamini
+./tools/run_am1_host.sh --mode lift --lift-motor-feedback --startup-comparison spare
+```
+
+Require the same cool baseline, type exact `COMPARE_200`, apply the same immediate-stop conditions, and preserve its printed `HOST_LOG` plus the before/after setup snapshots. Power off and disconnect the spare before the original is ever reconnected. Review the two automatic configuration records byte-for-byte, classify differences, and compare the grouped temperature/current/position timelines. Different firmware or untouched acceleration/gain/protection/calibration settings limit the A/B interpretation by design: a non-reproduction is only a non-reproduction under this bounded comparison, not proof that the original fault is fixed; reproduction on both servos raises the likelihood of a shared controller/power/protocol condition without proving it; an original-only anomaly raises a servo-specific hypothesis without proving sensor or hardware failure. A preflight/configuration refusal is evidence to review, not permission to clone more settings, weaken a guard, retry automatically, or run free-shaft homing.
+
+</details>
+
+Fixed diagnostic policies (not manufacturer ratings or changed servo settings):
+
+- The installed comparison constructs a single left bus containing only `lift_axis` ID 11. It does not construct follower arms, a right bus, wheels, leaders or cameras, and it reuses the already-open owning bus for grouped configuration and feedback. It never reads `Phase`. Ordinary AM1, AM2 and AM2 Pro construction is unchanged.
+- Start at or below **40 C**, torque off, zero goal velocity, usable grouped stationary telemetry and status zero. Exact uppercase `RELIEF` authorizes the whole bounded sequence. A fresh grouped pre-motion check follows the gate. Diagnostic-only `setup_before` and `setup_after_writes` records bracket the existing lift setup; after every mode/zero/lock setup write, a direct final torque-off request must qualify torque `0`, goal velocity `0`, mode `1` and stationary telemetry in `before_torque`. No other setup write occurs before intentional activation. The gate never waits at the powered lower stop.
+- Abort at **55 C**, or the existing temperature limit if lower, in **every** phase. Missing, late, malformed, faulted or nonfinite grouped feedback, invalid torque/mode/goal readback, unexpected direction, excessive travel or contradictory stationary evidence also refuses. Reported voltage must remain within the limits actually read from the servo; the operator must also stop for visible supply instability.
+- Call the **existing homing once**, raw `+200` physically down, retaining its 20-second timeout and stall detection. Grouped position/current feedback drives the existing homing state through one diagnostic-owned position accumulator; it is not subjected to a stationary predicate while motion is commanded. The guard checks temperature, status, voltage, commanded state, direction and upward-positive homing displacement at every poll. Homing travel cannot exceed the existing 600 mm envelope, and failed/nonfinite current feedback cannot use the ordinary fallback. Ordinary operation is unchanged.
+- After the existing homing has commanded zero and captured its process-local bottom reference, require a brief grouped stopped window, command the existing logical `+200` upward velocity, and stop at approximately 10 mm. Relief must show useful progress within two seconds, complete within eight seconds, and never exceed 12 mm. The original process-local zero and 5 mm descent guard remain unchanged.
+- Qualify the raised state with grouped position, velocity, `Moving`, current, temperature, voltage, torque, goal, mode and status. During the 45-second raised rest, three consecutive samples at or above 200 mA refuse immediately. A stationary window requires at least four samples over 0.15 seconds with no more than one raw position count of excursion or drift; persistent contradictory motion also refuses. These predicates apply only while a zero goal is expected, not during homing or upward relief.
+- Every exit requests existing zero/torque-off/bus-close cleanup. After the normal helper's final `Lock=0`, this diagnostic makes one last direct torque-off request and records bounded final torque, goal-velocity and present-velocity readback before bus close. A missing, faulted or nonzero torque/goal readback is retained as a cleanup failure and cannot produce a pass. Only this diagnostic shields that bounded cleanup from a second Ctrl+C, restoring the prior signal handler afterward. A primary refusal remains primary if cleanup also fails. Exit `0` means the bounded comparison and verified cleanup completed, `2` is diagnostic refusal, `130` operator interruption, and `1` an unexpected I/O/runtime or cleanup failure. No status authorizes an automatic repeat.
+
+The original process-local homed zero remains at the bottom; relief never re-zeroes it. The real 5 mm descent guard, speeds, ordinary homing, ordinary torque policy, gains, protection limits, calibration, IDs and arm behavior are unchanged. A 45-second result is a comparison, **not** proof of long-term thermal equilibrium or dependable indefinite holding. These software bounds depend on responsive serial I/O and the existing position conversion; they are not an independent physical safety interlock.
+
+**Installed comparison procedure used for the September 11 evidence:** The following is retained for auditability. The fifth run passed it once; do not rerun it merely to wait for another successful home while the startup-temperature anomalies remain unresolved.
+
+Mechanical preparation and electrical connections are separate gates:
+
+1. With body power off, reinstall and securely fasten the normal lift platform. Add no payload. Fix the chassis and secure the inactive arms without blocking carriage travel or offloading its mass. Clear both the downward homing and roughly 10 mm upward relief paths. Arrange safe carriage support for torque-off without putting hands in a pinch point, and keep the body-power disconnect immediately accessible.
+2. Keep the original lift servo as the only motor electrically connected to the same controller, USB adapter and new direct cable that passed the unloaded comparison. Leave the controller's arm branch and servo-to-wheel branch disconnected and the servo's second bus socket empty. Leaders, follower arms, wheels and cameras remain unused. Stop every other process that could own the serial adapter.
+3. Let the servo cool fully. External touch is not a substitute for the diagnostic's internal grouped-temperature preflight. Apply body power only when the operator is ready to observe the bounded run.
+
+Only a separately authorized human run may use, from the Pi terminal:
+
+```bash
+cd /home/pickmanmike/lerobot_alohamini && ./tools/run_am1_host.sh --mode lift --lift-relief
+```
+
+Verify the printed source head, exact ID-11-only bus, configuration, cool grouped baseline, torque-off state and zero goal. Type `RELIEF` only after `baseline_stationary_qualified`; the fresh `pre_motion_stationary_qualified` window is collected automatically after authorization and before torque activation. Observe one slow downward home to the actual bottom, immediate logical `+200` upward relief of approximately 10 mm, an automatic zero, and at most 45 seconds of visibly stationary raised observation. Require no wheel or arm movement and no concerning sound, heating, contact or supply behavior. Any contrary observation: press Ctrl+C once, safely support the carriage and remove motor power; do not wait for repeated cleanup attempts when communication has failed. Automatic faults already enter cleanup, so do not restart them. On normal completion, require `LIFT_RELIEF_PASS`, grouped torque-off/zero/stopped cleanup evidence and `HOST_EXIT_CODE=0`; then safely support as needed and remove motor power. Keep the original automatic `/home/pickmanmike/AlohaMini1Logs/am1-lift-host-YYYYMMDD-HHMMSS.log`. No Windows helper is needed.
+
+The fifth run answered the narrow functional question positively once: the installed lift could home, rise approximately 10 mm, stop, and remain low-current for 45 seconds. It also showed that lower-stop current fell by roughly an order of magnitude after relief. The four earlier runs leave normal-startup temperature feedback unreliable, and the differing raw starts prevent a repeatability claim. The next action is therefore the matched direct-servo A/B packet above, not another installed run, a higher limit, a longer settle, a PID change, or a retry campaign. PR #5 stays draft/unmerged. Cameras, recording, autonomy, battery work, Cloudflare and remote operation remain out of scope and unproven.
 
 ### Simple AM1 leader calibration and recovery
 

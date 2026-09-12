@@ -126,6 +126,23 @@ def test_windows_lift_command_has_no_leader_or_base_motion_inputs():
 
 
 @requires_powershell
+def test_windows_local_command_combines_validated_arms_with_bounded_keyboard_body_control():
+    payload = command_payload("Local")
+
+    arguments = payload["arguments"]
+    assert arguments[arguments.index("--teleop.left_port") + 1] == "COM8"
+    assert arguments[arguments.index("--teleop.right_port") + 1] == "COM7"
+    assert arguments[arguments.index("--startup_sync_duration_s") + 1] == "120"
+    assert arguments[arguments.index("--max_start_mismatch") + 1] == "10"
+    assert arguments[arguments.index("--fps") + 1] == "10"
+    assert arguments[arguments.index("--duration_s") + 1] == "30"
+    assert "--local_mode" in arguments
+    assert "--no_keyboard" not in arguments
+    assert "--no_cameras" in arguments
+    assert "--profile_cadence" in arguments
+
+
+@requires_powershell
 def test_windows_arms_command_preserves_physically_validated_settings():
     payload = command_payload("Arms")
 
@@ -213,6 +230,11 @@ $code = Invoke-Am1LoggedCommand -Executable {ps_literal(PYTHON)} `
             ("--skip_lift_home", "--no_cameras", "--max_relative_target", "20"),
             ("--no_follower",),
         ),
+        (
+            "local",
+            ("--no_cameras", "--max_relative_target", "20", "--profile_cadence"),
+            ("--no_follower", "--skip_lift_home"),
+        ),
     ],
 )
 def test_host_helper_prints_mode_specific_command_without_hardware(mode, required, forbidden):
@@ -235,7 +257,7 @@ def test_host_helper_prints_mode_specific_command_without_hardware(mode, require
         assert value not in result.stdout
 
 
-def test_host_helper_help_lists_arms_base_and_lift_modes():
+def test_host_helper_help_lists_arms_base_lift_and_local_modes():
     result = subprocess.run(
         [BASH, str(HOST_HELPER), "--help"],
         cwd=REPO_ROOT,
@@ -246,7 +268,56 @@ def test_host_helper_help_lists_arms_base_and_lift_modes():
     )
 
     assert result.returncode == 0, result.stderr
-    assert "--mode arms|base|lift" in result.stdout
+    assert "--mode arms|base|lift|local" in result.stdout
+    assert "--lift-diagnostics" in result.stdout
+
+
+def test_host_helper_adds_lift_diagnostics_only_when_explicitly_requested():
+    enabled = subprocess.run(
+        [
+            BASH,
+            str(HOST_HELPER),
+            "--mode",
+            "lift",
+            "--lift-diagnostics",
+            "--print-command",
+        ],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    default = subprocess.run(
+        [BASH, str(HOST_HELPER), "--mode", "lift", "--print-command"],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    wrong_mode = subprocess.run(
+        [
+            BASH,
+            str(HOST_HELPER),
+            "--mode",
+            "local",
+            "--lift-diagnostics",
+            "--print-command",
+        ],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert enabled.returncode == 0, enabled.stderr
+    assert "--profile_lift_diagnostics" in enabled.stdout
+    assert default.returncode == 0, default.stderr
+    assert "--profile_lift_diagnostics" not in default.stdout
+    assert wrong_mode.returncode == 2
+    assert "only valid with --mode lift" in wrong_mode.stderr
 
 
 def test_host_runtime_pipeline_keeps_tee_alive_during_interrupt():
@@ -260,6 +331,94 @@ def test_host_runtime_pipeline_keeps_tee_alive_during_interrupt():
         'PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$repository_root/src" '
         '"${command[@]}" 2>&1 | tee -i -a "$log_path"'
     ]
+
+
+def test_guarded_relief_launcher_is_explicit_lift_only_and_logs_source_identity():
+    def preview(*arguments):
+        return subprocess.run(
+            [BASH, str(HOST_HELPER), *arguments, "--print-command"],
+            cwd=REPO_ROOT, text=True, capture_output=True, timeout=30, check=False,
+        )
+
+    enabled = preview("--mode", "lift", "--lift-relief")
+    assert enabled.returncode == 0, enabled.stderr
+    assert "--lift_relief" in enabled.stdout
+    assert "--no_follower" in enabled.stdout and "--no_cameras" in enabled.stdout
+    assert "--skip_lift_home" not in enabled.stdout
+    assert "--lift_relief" not in preview("--mode", "lift").stdout
+    assert preview("--mode", "local", "--lift-relief").returncode == 2
+    assert preview("--mode", "lift", "--lift-relief", "--lift-diagnostics").returncode == 2
+    source = HOST_HELPER.read_text(encoding="utf-8")
+    assert "HOST_SOURCE_HEAD=" in source and "HOST_SOURCE_BRANCH=" in source
+
+
+def test_torque_off_readback_launcher_is_explicit_lift_only():
+    def preview(*arguments):
+        return subprocess.run(
+            [BASH, str(HOST_HELPER), *arguments, "--print-command"],
+            cwd=REPO_ROOT, text=True, capture_output=True, timeout=30, check=False,
+        )
+
+    enabled = preview("--mode", "lift", "--lift-readback")
+    assert enabled.returncode == 0, enabled.stderr
+    assert "--lift_readback" in enabled.stdout
+    assert "--no_follower" in enabled.stdout and "--no_cameras" in enabled.stdout
+    assert "--skip_lift_home" not in enabled.stdout
+    assert "--lift_readback" not in preview("--mode", "lift").stdout
+    assert preview("--mode", "local", "--lift-readback").returncode == 2
+    assert preview("--mode", "lift", "--lift-readback", "--lift-relief").returncode == 2
+    assert preview("--mode", "lift", "--lift-readback", "--lift-diagnostics").returncode == 2
+
+
+def test_motor_feedback_launcher_uses_the_standalone_vendor_path_only():
+    def preview(*arguments):
+        return subprocess.run(
+            [BASH, str(HOST_HELPER), *arguments, "--print-command"],
+            cwd=REPO_ROOT, text=True, capture_output=True, timeout=30, check=False,
+        )
+
+    enabled = preview("--mode", "lift", "--lift-motor-feedback")
+    assert enabled.returncode == 0, enabled.stderr
+    assert "-m lerobot.robots.alohamini.lift_motor_feedback" in enabled.stdout
+    assert "--port /dev/am_arm_follower_left" in enabled.stdout
+    assert "--motor-id 11" in enabled.stdout
+    assert "--baud-rate 1000000" in enabled.stdout
+    assert "alohamini_host" not in enabled.stdout
+    assert "--no_follower" not in enabled.stdout
+    assert "--lift-motor-feedback" not in preview("--mode", "lift").stdout
+    assert preview("--mode", "local", "--lift-motor-feedback").returncode == 2
+    assert preview("--mode", "lift", "--lift-motor-feedback", "--lift-relief").returncode == 2
+
+
+@pytest.mark.parametrize("specimen", ("original", "spare"))
+def test_motor_feedback_launcher_selects_the_fixed_startup_anomaly_profile(specimen):
+    def preview(*arguments):
+        return subprocess.run(
+            [BASH, str(HOST_HELPER), *arguments, "--print-command"],
+            cwd=REPO_ROOT, text=True, capture_output=True, timeout=30, check=False,
+        )
+
+    enabled = preview(
+        "--mode",
+        "lift",
+        "--lift-motor-feedback",
+        "--startup-comparison",
+        specimen,
+    )
+    assert enabled.returncode == 0, enabled.stderr
+    assert "-m lerobot.robots.alohamini.lift_motor_feedback" in enabled.stdout
+    assert "--profile startup-anomaly" in enabled.stdout
+    assert f"--specimen {specimen}" in enabled.stdout
+    assert "alohamini_host" not in enabled.stdout
+    assert "--no_follower" not in enabled.stdout
+
+    assert preview("--mode", "lift", "--startup-comparison", specimen).returncode == 2
+    assert preview(
+        "--mode", "lift", "--lift-motor-feedback", "--startup-comparison", "unknown"
+    ).returncode == 2
+    assert "--profile startup-anomaly" not in preview(
+        "--mode", "lift", "--lift-motor-feedback"
+    ).stdout
 
 
 def test_local_config_example_is_valid_and_real_config_is_ignored():

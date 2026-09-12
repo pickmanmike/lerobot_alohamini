@@ -177,6 +177,17 @@ def _jsonable(value):
     return value
 
 
+def format_lift_diagnostic_report(robot: AlohaMini, observation: dict) -> str:
+    lift_snapshot = robot.read_lift_diagnostics()
+    report = {
+        "wall_time_ns": time.time_ns(),
+        "monotonic_time_ns": time.monotonic_ns(),
+        "height_mm": _jsonable(observation.get("lift_axis.height_mm")),
+        **lift_snapshot,
+    }
+    return f"[LIFT DIAGNOSTICS] {json.dumps(report, separators=(',', ':'))}"
+
+
 def build_observation_multipart(observation: dict, camera_keys) -> list[bytes]:
     """Encode state as JSON and camera images as binary JPEG multipart frames."""
     state_observation = {
@@ -297,6 +308,26 @@ def make_parser() -> argparse.ArgumentParser:
             "once per second (default: false)."
         ),
     )
+    parser.add_argument(
+        "--profile_lift_diagnostics",
+        "--profile-lift-diagnostics",
+        type=parse_bool,
+        nargs="?",
+        const=True,
+        default=False,
+        help=(
+            "Print a read-only AM1 lift current, temperature, voltage, velocity, torque, "
+            "mode, status, and process-height snapshot once per second (default: false)."
+        ),
+    )
+    parser.add_argument(
+        "--lift_relief", "--lift-relief", action="store_true",
+        help="Opt-in guarded AM1 lift-only home/10mm relief/45s rest comparison; no ZMQ host.",
+    )
+    parser.add_argument(
+        "--lift_readback", "--lift-readback", action="store_true",
+        help="Opt-in three-second AM1 lift torque-off telemetry check; no homing, motion, or ZMQ host.",
+    )
     return parser
 
 
@@ -306,6 +337,7 @@ def make_robot_config(args: argparse.Namespace) -> AlohaMiniConfig:
         robot_model=args.robot_model,
         no_follower=args.no_follower,
         max_relative_target=args.max_relative_target,
+        diagnostic_lift_only=args.lift_relief,
     )
     if args.no_cameras:
         config.cameras = {}
@@ -321,7 +353,23 @@ def connect_robot(robot: AlohaMini, *, skip_lift_home: bool) -> None:
 
 
 def main():
-    args = make_parser().parse_args()
+    parser = make_parser()
+    args = parser.parse_args()
+    if args.lift_relief and args.lift_readback:
+        parser.error("--lift_relief and --lift_readback are mutually exclusive.")
+    if args.lift_relief and (
+        args.robot_model != "alohamini1" or not args.no_follower or not args.no_cameras or args.skip_lift_home
+    ):
+        parser.error("--lift_relief requires AM1, --no_follower, --no_cameras, and homing enabled.")
+    if args.lift_readback and (
+        args.robot_model != "alohamini1"
+        or not args.no_follower
+        or not args.no_cameras
+        or args.skip_lift_home
+    ):
+        parser.error(
+            "--lift_readback requires AM1, --no_follower, --no_cameras, and the owning lift process."
+        )
 
     logging.info("Configuring AlohaMini")
     robot_config = make_robot_config(args)
@@ -329,7 +377,17 @@ def main():
         logging.info("no_follower mode: follower arms will not connect, only base and lift operate.")
     robot = AlohaMini(robot_config)
 
+    if args.lift_relief:
+        from .lift_relief import run_lift_relief
 
+        raise SystemExit(run_lift_relief(robot))
+    if args.lift_readback:
+        from .lift_relief import run_lift_readback
+
+        raise SystemExit(run_lift_readback(robot))
+
+    primary_error: BaseException | None = None
+    interrupted_motor_io = False
     try:
         logging.info("Connecting AlohaMini")
         connect_robot(robot, skip_lift_home=args.skip_lift_home)
@@ -337,9 +395,15 @@ def main():
         logging.info("Starting HostAgent")
         host_config = make_host_config(args)
         host = AlohaMiniHost(host_config)
-    except BaseException:
+    except BaseException as error:
         if robot.is_connected:
-            robot.disconnect()
+            try:
+                robot.disconnect(recover_interrupted_bus_io=True)
+            except BaseException as cleanup_error:
+                error.add_note(
+                    "robot disconnect also failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
         raise
 
     command_state = HostCommandState(
@@ -358,6 +422,7 @@ def main():
         timing_command_count = 0
         action_timing_totals_ms: dict[str, float] = {}
         cadence_report_start_t = time.monotonic()
+        lift_diagnostics_report_start_t = cadence_report_start_t
 
         while duration < host.connection_time_s:
             loop_start_t = time.perf_counter()
@@ -416,8 +481,18 @@ def main():
                     logging.info("Dropping observation response, client is not ready")
             response_send_done_t = time.perf_counter()
 
+            lift_diagnostics_done_t = response_send_done_t
+            lift_diagnostics_now = time.monotonic()
+            if (
+                args.profile_lift_diagnostics
+                and lift_diagnostics_now - lift_diagnostics_report_start_t >= 1.0
+            ):
+                print(format_lift_diagnostic_report(robot, last_observation), flush=True)
+                lift_diagnostics_report_start_t = lift_diagnostics_now
+                lift_diagnostics_done_t = time.perf_counter()
+
             # Ensure a short sleep to avoid overloading the CPU.
-            elapsed = response_send_done_t - loop_start_t
+            elapsed = lift_diagnostics_done_t - loop_start_t
 
             time.sleep(max(1 / host.max_loop_freq_hz - elapsed, 0))
             loop_done_t = time.perf_counter()
@@ -428,7 +503,8 @@ def main():
                 "request_poll": (request_poll_done_t - observation_done_t) * 1e3,
                 "jpeg_encode": (encode_done_t - request_poll_done_t) * 1e3,
                 "response_send": (response_send_done_t - encode_done_t) * 1e3,
-                "sleep": (loop_done_t - response_send_done_t) * 1e3,
+                "lift_diagnostics": (lift_diagnostics_done_t - response_send_done_t) * 1e3,
+                "sleep": (loop_done_t - lift_diagnostics_done_t) * 1e3,
                 "loop": (loop_done_t - loop_start_t) * 1e3,
                 **robot.logs.get("observation_timing_ms", {}),
             }
@@ -495,7 +571,11 @@ def main():
         print("Cycle time reached.")
 
     except KeyboardInterrupt:
+        interrupted_motor_io = True
         print("Keyboard interrupt received. Exiting...")
+    except BaseException as error:
+        interrupted_motor_io = True
+        primary_error = error
     finally:
         print("Shutting down AlohaMini Host.")
         if args.profile_cadence:
@@ -503,11 +583,30 @@ def main():
                 print_cadence_report(command_state)
             except Exception:
                 logging.exception("Failed to emit final host cadence report.")
+        cleanup_errors: list[tuple[str, BaseException]] = []
         try:
             if robot.is_connected:
-                robot.disconnect()
-        finally:
+                robot.disconnect(recover_interrupted_bus_io=interrupted_motor_io)
+        except BaseException as error:
+            cleanup_errors.append(("robot disconnect", error))
+        try:
             host.disconnect()
+        except BaseException as error:
+            cleanup_errors.append(("host disconnect", error))
+
+        if primary_error is not None:
+            for operation, error in cleanup_errors:
+                primary_error.add_note(
+                    f"{operation} also failed: {type(error).__name__}: {error}"
+                )
+            raise primary_error
+        if cleanup_errors:
+            _, error = cleanup_errors[0]
+            for later_operation, later_error in cleanup_errors[1:]:
+                error.add_note(
+                    f"{later_operation} also failed: {type(later_error).__name__}: {later_error}"
+                )
+            raise error
 
     logging.info("Finished AlohaMini cleanly")
 if __name__ == "__main__":

@@ -17,6 +17,7 @@
 import logging
 import sys
 import time
+from collections.abc import Callable
 from functools import cached_property
 from itertools import chain
 from typing import Any
@@ -112,6 +113,12 @@ class AlohaMini(Robot):
         norm_mode_body = MotorNormMode.DEGREES if config.use_degrees else MotorNormMode.RANGE_M100_100
 
         specs = validate_robot_model(config.robot_model)
+        if config.diagnostic_lift_only and (
+            config.robot_model != "alohamini1" or not config.no_follower
+        ):
+            raise ValueError(
+                "diagnostic_lift_only requires Aloha Mini 1 with follower arms disabled."
+            )
         arm_profile = specs["arm_profile"]
         bm = specs["base_motor"]
         lm = specs["lift_motor"]
@@ -126,10 +133,15 @@ class AlohaMini(Robot):
 
         left_bus_motors = {
             **(left_arm_motors_cfg if not config.no_follower else {}),
-            # base
-            "base_left_wheel": Motor(8, bm, MotorNormMode.RANGE_M100_100),
-            "base_back_wheel": Motor(9, bm, MotorNormMode.RANGE_M100_100),
-            "base_right_wheel": Motor(10, bm, MotorNormMode.RANGE_M100_100),
+            **(
+                {
+                    "base_left_wheel": Motor(8, bm, MotorNormMode.RANGE_M100_100),
+                    "base_back_wheel": Motor(9, bm, MotorNormMode.RANGE_M100_100),
+                    "base_right_wheel": Motor(10, bm, MotorNormMode.RANGE_M100_100),
+                }
+                if not config.diagnostic_lift_only
+                else {}
+            ),
             "lift_axis": Motor(11, lm, MotorNormMode.DEGREES),
         }
         left_bus_calibration = {
@@ -300,7 +312,7 @@ class AlohaMini(Robot):
 
             logger.info("%s connected.", self)
         except BaseException:
-            self._safe_shutdown(close_buses=True)
+            self._safe_shutdown(close_buses=True, recover_interrupted_bus_io=True)
             raise
 
     @property
@@ -529,7 +541,7 @@ class AlohaMini(Robot):
             if self.right_bus:
                 set_torque_enabled(self.right_bus, self.right_arm_motors, enabled=True)
         except BaseException as error:
-            cleanup_errors = self._safe_shutdown(close_buses=True)
+            cleanup_errors = self._safe_shutdown(close_buses=True, recover_interrupted_bus_io=True)
             if isinstance(error, (KeyboardInterrupt, SystemExit)):
                 raise
             detail = f" Cleanup issues: {'; '.join(cleanup_errors)}" if cleanup_errors else ""
@@ -537,9 +549,37 @@ class AlohaMini(Robot):
 
         return home_result
 
-    def _safe_shutdown(self, *, close_buses: bool) -> list[str]:
-        """Best-effort zero, torque-off, camera close, and optional bus close."""
+    def _safe_shutdown(
+        self,
+        *,
+        close_buses: bool,
+        recover_interrupted_bus_io: bool = False,
+        motor_shutdown_check: Callable[[], None] | None = None,
+    ) -> list[str]:
+        """Best-effort zero, torque-off, camera close, and optional bus close.
+
+        ``recover_interrupted_bus_io`` is only for a caller that has already left
+        normal motor I/O after an exception. The Feetech SDK can otherwise retain
+        its single-transaction busy flag when ``KeyboardInterrupt`` escapes a read.
+        """
         errors: list[str] = []
+
+        if recover_interrupted_bus_io and self.config.robot_model == "alohamini1":
+            for bus_name, bus in (("left", self.left_bus), ("right", self.right_bus)):
+                if bus is None or not bus.is_connected:
+                    continue
+                port_handler = getattr(bus, "port_handler", None)
+                if port_handler is None or not getattr(port_handler, "is_using", False):
+                    continue
+                try:
+                    port_handler.clearPort()
+                    port_handler.is_using = False
+                    logger.warning(
+                        "Recovered abandoned %s Feetech transaction before AM1 shutdown.",
+                        bus_name,
+                    )
+                except Exception as error:
+                    errors.append(f"recover {bus_name} bus transaction: {error}")
 
         if self.left_bus.is_connected:
             for name in (*self.base_motors, self.lift.cfg.name):
@@ -556,6 +596,12 @@ class AlohaMini(Robot):
                     set_torque_enabled(bus, (name,), enabled=False)
                 except Exception as error:
                     errors.append(f"disable {bus_name}/{name}: {error}")
+
+        if motor_shutdown_check is not None:
+            try:
+                motor_shutdown_check()
+            except Exception as error:
+                errors.append(f"verify final motor shutdown state: {error}")
 
         for name, camera in self.cameras.items():
             if not camera.is_connected:
@@ -1100,8 +1146,43 @@ class AlohaMini(Robot):
         return {k: round(v * scale, 1) for k, v in {**left_curr_raw, **right_curr_raw}.items()}
 
     @check_if_not_connected
-    def disconnect(self) -> None:
-        errors = self._safe_shutdown(close_buses=True)
+    def read_lift_diagnostics(self) -> dict[str, int | float | bool]:
+        """Read a compact AM1 lift snapshot without changing any servo register."""
+        if self.config.robot_model != "alohamini1":
+            raise RuntimeError("Lift diagnostics are supported only for Aloha Mini 1.")
+
+        motor = self.lift.cfg.name
+
+        def read_raw(register: str) -> int:
+            return int(
+                self.left_bus.read(
+                    register,
+                    motor,
+                    normalize=False,
+                    num_retry=REGISTER_RETRIES,
+                )
+            )
+
+        present_current_raw = read_raw("Present_Current")
+        return {
+            "is_homed": self.lift.is_homed,
+            "present_current_raw": present_current_raw,
+            "present_current_ma": round(abs(present_current_raw) * 6.5, 1),
+            "present_temperature_raw": read_raw("Present_Temperature"),
+            "present_voltage_raw": read_raw("Present_Voltage"),
+            "goal_velocity_raw": read_raw("Goal_Velocity"),
+            "present_velocity_raw": read_raw("Present_Velocity"),
+            "torque_enable": read_raw("Torque_Enable"),
+            "operating_mode": read_raw("Operating_Mode"),
+            "status": read_raw("Status"),
+        }
+
+    @check_if_not_connected
+    def disconnect(self, *, recover_interrupted_bus_io: bool = False) -> None:
+        errors = self._safe_shutdown(
+            close_buses=True,
+            recover_interrupted_bus_io=recover_interrupted_bus_io,
+        )
         if errors:
             raise RuntimeError(f"AlohaMini disconnected with cleanup issues: {'; '.join(errors)}")
         logger.info("%s disconnected.", self)
