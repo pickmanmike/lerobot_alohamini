@@ -114,6 +114,7 @@ def test_pi_lift_homing_failure_prevents_normal_activation(monkeypatch):
             raise RuntimeError("homing failed")
 
     robot = AlohaMini.__new__(AlohaMini)
+    robot.config = SimpleNamespace(robot_model="alohamini1")
     robot.left_bus = SimpleNamespace(is_connected=False)
     robot.right_bus = None
     robot.left_arm_motors = []
@@ -121,6 +122,14 @@ def test_pi_lift_homing_failure_prevents_normal_activation(monkeypatch):
     robot.base_motors = ["base_left_wheel", "base_back_wheel", "base_right_wheel"]
     robot.lift = FailingLift()
     robot.cameras = {}
+    from lerobot.robots.alohamini import lift_operational
+
+    # The AM1 owner now wraps homing in its confirmed-feedback/relief startup.
+    # Keep this test's narrow activation-failure seam; real mechanics are covered
+    # by test_alohamini_lift_operational with grouped feedback and the real LiftAxis.
+    monkeypatch.setattr(lift_operational, "OperationalLift", lambda owner: SimpleNamespace(
+        lift=owner.lift, start=owner.lift.home,
+    ))
     monkeypatch.setattr(robot, "_seed_activation_goals", lambda: events.append("seed"))
     monkeypatch.setattr(
         robot,

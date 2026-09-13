@@ -490,6 +490,9 @@ class MotorFeedbackComparison:
         immediate_current_abort_ma: float | None = CURRENT_ABORT_MA,
         profile: ComparisonProfile = QUICK_PROFILE,
         specimen: str | None = None,
+        temperature_check: Callable[[dict[str, Any], bool], None] | None = None,
+        min_stationary_samples: int = STATIONARY_MIN_SAMPLES,
+        sample_timeout_ms: float = REPLY_TIMEOUT_MS,
     ) -> None:
         self.transport = transport
         self.input_fn = input_fn
@@ -502,6 +505,11 @@ class MotorFeedbackComparison:
         self.started = monotonic()
         self.config: dict[str, Any] = {}
         self.opened = False
+        # The normal AM1 owner can confirm numeric temperature only. Transport,
+        # status, voltage, mode, torque, goal and current checks below stay immediate.
+        self.temperature_check = temperature_check
+        self.min_stationary_samples = min_stationary_samples
+        self.sample_timeout_ms = sample_timeout_ms
 
     def record(self, phase: str, **values: Any) -> dict[str, Any]:
         identity = {"comparison_profile": self.profile.name}
@@ -569,11 +577,14 @@ class MotorFeedbackComparison:
         expected_goal: int | None,
         cold_start: bool = False,
         start_position: int | None = None,
-        timeout_ms: float = REPLY_TIMEOUT_MS,
+        timeout_ms: float | None = None,
+        emit_sample: bool = True,
     ) -> dict[str, Any]:
+        request_started = self.monotonic()
         try:
             payload, trace = self.transport.read_group(
-                FEEDBACK_START, FEEDBACK_LENGTH, timeout_ms=timeout_ms
+                FEEDBACK_START, FEEDBACK_LENGTH,
+                timeout_ms=self.sample_timeout_ms if timeout_ms is None else timeout_ms,
             )
             values = decode_feedback(payload)
         except TransportRefusal as error:
@@ -586,6 +597,8 @@ class MotorFeedbackComparison:
         record = {
             "phase": phase,
             "elapsed_s": round(self.monotonic() - self.started, 3),
+            "sample_monotonic_s": self.monotonic(),
+            "request_duration_s": self.monotonic() - request_started,
             **values,
             "group_trace": trace,
         }
@@ -594,12 +607,12 @@ class MotorFeedbackComparison:
                 start_position, int(record["present_position_raw"])
             )
         ceiling = min(ABORT_C, int(self.config["max_temperature_limit_c"]))
-        if int(record["temperature_c"]) >= ceiling:
+        if self.temperature_check is None and int(record["temperature_c"]) >= ceiling:
             self.refuse(
                 record,
                 f"{phase}: temperature {record['temperature_c']} C reached diagnostic ceiling {ceiling} C.",
             )
-        if cold_start and int(record["temperature_c"]) > COOL_START_C:
+        if self.temperature_check is None and cold_start and int(record["temperature_c"]) > COOL_START_C:
             self.refuse(record, f"{phase}: starting temperature exceeds {COOL_START_C} C.")
         if not (
             int(self.config["min_voltage_limit_raw"])
@@ -624,7 +637,13 @@ class MotorFeedbackComparison:
                 f"{phase}: current reached the {self.immediate_current_abort_ma:g} mA "
                 "diagnostic ceiling.",
             )
-        self.emit(record)
+        if self.temperature_check is not None:
+            try:
+                self.temperature_check(record, cold_start)
+            except ComparisonRefusal as error:
+                self.refuse(record, str(error))
+        if emit_sample:
+            self.emit(record)
         return record
 
     def qualify_stationary(
@@ -744,7 +763,7 @@ class MotorFeedbackComparison:
                 on_sample(record)
 
             window_s = candidate[-1][0] - candidate[0][0]
-            if len(candidate) < STATIONARY_MIN_SAMPLES or window_s < STATIONARY_WINDOW_S:
+            if len(candidate) < self.min_stationary_samples or window_s < STATIONARY_WINDOW_S:
                 continue
 
             evidence = {

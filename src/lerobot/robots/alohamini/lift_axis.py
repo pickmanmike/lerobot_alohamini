@@ -343,7 +343,9 @@ class LiftAxis:
         except Exception:
             pass
 
-    def apply_action(self, action: dict[str, float], read_raw: RawRead | None = None) -> None:
+    def apply_action(
+        self, action: dict[str, float], read_raw: RawRead | None = None, *, height_mm: float | None = None,
+    ) -> None:
         """Apply an ordinary height or velocity command only after this process homes."""
         if not self.enabled:
             return
@@ -361,7 +363,9 @@ class LiftAxis:
 
         if key_h in action:
             target_mm = float(action[key_h])
-            cur_mm = self.get_height_mm() if read_raw is None else self.get_height_mm(read_raw=read_raw)
+            cur_mm = height_mm if height_mm is not None else (
+                self.get_height_mm() if read_raw is None else self.get_height_mm(read_raw=read_raw)
+            )
             err = target_mm - cur_mm
             if abs(err) <= self.cfg.on_target_mm:
                 v_cmd = 0.0
@@ -387,7 +391,9 @@ class LiftAxis:
 
         if key_v in action:
             velocity = max(-self.cfg.v_max, min(self.cfg.v_max, int(action[key_v])))
-            cur_mm = self.get_height_mm() if read_raw is None else self.get_height_mm(read_raw=read_raw)
+            cur_mm = height_mm if height_mm is not None else (
+                self.get_height_mm() if read_raw is None else self.get_height_mm(read_raw=read_raw)
+            )
             if velocity < 0 and cur_mm <= self.cfg.descent_floor_mm:
                 logger.warning(
                     "Lift descent blocked at %.1fmm (floor guard %.1fmm).",

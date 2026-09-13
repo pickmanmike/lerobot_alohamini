@@ -715,6 +715,11 @@ class InstalledLiftCheck:
         self.bus.expected_torque = int(pre_motion["torque_enable"])
         self.bus.expected_goal = int(pre_motion["goal_velocity_raw"])
 
+        _, rest_height = self.home_and_relieve()
+        self.observe_raised_rest(rest_height)
+
+    def home_and_relieve(self) -> tuple[Any, float]:
+        """The same bounded mechanics for the opt-in comparison and normal AM1 startup."""
         self.reader.set_phase("setup_position")
         result = self.lift.home(safety_check=self.home_guard, read_raw=self.reader)
         if time.monotonic() - self.home_started >= self.lift.cfg.home_timeout_s:
@@ -768,7 +773,9 @@ class InstalledLiftCheck:
         if rest_height < RELIEF_MM - 0.5:
             self.refuse(stopped, "settle: unexpected downward direction after relief stopped.")
         self.monitor.record("settle_height", height_mm=round(rest_height, 4))
+        return result, rest_height
 
+    def observe_raised_rest(self, rest_height: float) -> None:
         started = time.monotonic()
         high_current = 0
 

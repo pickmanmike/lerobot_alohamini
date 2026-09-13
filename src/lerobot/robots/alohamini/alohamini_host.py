@@ -427,6 +427,11 @@ def main():
         while duration < host.connection_time_s:
             loop_start_t = time.perf_counter()
             command_received = False
+            # One grouped lift transaction on the existing owning thread before
+            # any ordinary action. No confirmation wait, worker, or second socket.
+            lift_operation = getattr(robot, "_lift_operation", None)
+            if lift_operation is not None:
+                lift_operation.poll()
             try:
                 msg = host.zmq_cmd_socket.recv_string(zmq.NOBLOCK)
                 command_received_t = time.monotonic()
@@ -443,6 +448,10 @@ def main():
             except zmq.Again:
                 pass
             except Exception as e:
+                if lift_operation is not None:
+                    # Do not let the legacy malformed-command handler swallow a
+                    # latched lift fault (including an unsuccessful motor write).
+                    lift_operation.raise_if_faulted()
                 logging.exception("Message fetching failed: %s", e)
             command_done_t = time.perf_counter()
 

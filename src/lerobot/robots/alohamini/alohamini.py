@@ -528,7 +528,16 @@ class AlohaMini(Robot):
         home_result = None
         try:
             if home_lift:
-                home_result = self.lift.home()
+                if self.config.robot_model == "alohamini1":
+                    from .lift_operational import OperationalLift
+
+                    self._lift_operation = OperationalLift(self)
+                    # The same single lift encoder owner is used from home through
+                    # ordinary control; other motors retain their existing bus.
+                    self.lift = self._lift_operation.lift
+                    home_result = self._lift_operation.start()
+                else:
+                    home_result = self.lift.home()
 
             # Read arm positions after homing, while the arms are still torque-free, so
             # their hold goals cannot become stale during the bounded lift movement.
@@ -597,6 +606,9 @@ class AlohaMini(Robot):
                 except Exception as error:
                     errors.append(f"disable {bus_name}/{name}: {error}")
 
+        operation = getattr(self, "_lift_operation", None)
+        if motor_shutdown_check is None and operation is not None and self.left_bus.is_connected:
+            motor_shutdown_check = operation.cleanup_readback
         if motor_shutdown_check is not None:
             try:
                 motor_shutdown_check()
@@ -812,7 +824,11 @@ class AlohaMini(Robot):
         right_arm_state = {f"{k}.pos": v for k, v in right_pos.items()}
 
         obs_dict = {**left_arm_state, **right_arm_state,**base_vel}
-        self.lift.contribute_observation(obs_dict)
+        operation = getattr(self, "_lift_operation", None)
+        if operation is not None:
+            operation.contribute_observation(obs_dict)
+        else:
+            self.lift.contribute_observation(obs_dict)
         lift_done_t = time.perf_counter()
         #print(f"Observation dict so far: {obs_dict}")  # debug
 
@@ -883,7 +899,11 @@ class AlohaMini(Robot):
         #     arm_safe_goal_pos = ensure_safe_goal_position(goal_present_pos, self.config.max_relative_target)
         #     arm_goal_pos = arm_safe_goal_pos
 
-        self.lift.apply_action(action)
+        operation = getattr(self, "_lift_operation", None)
+        if operation is not None:
+            operation.apply_action(action)
+        else:
+            self.lift.apply_action(action)
         lift_action_done_t = time.perf_counter()
 
         if left_pos and self.config.max_relative_target is not None:
