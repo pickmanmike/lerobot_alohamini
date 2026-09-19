@@ -7,6 +7,7 @@ diagnostic profiles retain their single-reading policy for historical comparison
 from __future__ import annotations
 
 from collections import deque
+from dataclasses import replace
 import json
 import math
 import time
@@ -81,6 +82,10 @@ class OperationalLift(InstalledLiftCheck):
 
     def __init__(self, robot) -> None:
         super().__init__(robot)
+        # At raw +200, 600 mm needs about 146 s, not the diagnostic's 20 s.
+        # Keep the travel/fault guards and stop on bottom detection, not the deadline.
+        # Copy the config so the legacy/opt-in diagnostic limit is unchanged.
+        self.lift.cfg = replace(self.lift.cfg, home_timeout_s=180.0)
         self.temperature = TemperatureWindow()
         self.failure: BaseException | None = None
         self.monitor.temperature_check = self._check_temperature

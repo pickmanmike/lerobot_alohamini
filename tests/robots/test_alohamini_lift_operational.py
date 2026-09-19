@@ -63,6 +63,121 @@ def test_normal_am1_connect_homes_once_and_relieve_before_ordinary_activation(op
     assert not bus.is_connected
 
 
+def wrap_fake_lift_encoder(bus):
+    """Keep synthetic mechanical travel continuous but return real 12-bit positions."""
+    def hook(register):
+        if register == "Present_Position":
+            bus.registers[(register, "lift_axis")] = round(bus.position) % 4096
+    bus.hook = hook
+
+
+@pytest.mark.parametrize("distance_ticks", [100, 6000, 29200])
+def test_normal_home_stops_at_bottom_across_the_existing_travel_range(
+    operating_robot, capsys, distance_ticks,
+):
+    robot, _ = operating_robot
+    bus = robot.left_bus
+    original_config = robot.lift.cfg
+    bus.bottom = bus.position + distance_ticks
+    wrap_fake_lift_encoder(bus)
+
+    robot.connect(calibrate=False)
+
+    records = operational_records(capsys)
+    homes = [r for r in records if r["phase"] == "home_complete"]
+    assert len(homes) == 1
+    # Hand-derived at the unchanged 200 ticks/s: 0.5, 30, and 146 seconds.
+    # Even a near-bottom start must stop promptly, not wait for the new deadline.
+    assert distance_ticks / 200 <= homes[0]["result"]["elapsed_s"] < distance_ticks / 200 + 0.3
+    assert 9.5 <= robot._lift_operation.height_mm <= 12
+    assert robot.lift._z0_deg == pytest.approx(-distance_ticks * 360 / 4096)
+    assert original_config.home_timeout_s == 20  # Do not mutate the legacy/diagnostic config.
+    writes = [e[2:] for e in bus.events if e[1] == "write"]
+    assert writes.count(("Goal_Velocity", "lift_axis", 200)) == 1
+    assert writes.count(("Goal_Velocity", "lift_axis", -200)) == 1
+    robot.disconnect()
+    assert bus.registers[("Goal_Velocity", "lift_axis")] == 0
+    assert bus.registers[("Torque_Enable", "lift_axis")] == 0
+    assert not bus.is_connected
+
+
+@pytest.mark.parametrize("boundary", ["deadline", "travel"])
+def test_normal_home_without_bottom_still_refuses_at_time_or_travel_bound(
+    operating_robot, monkeypatch, capsys, boundary,
+):
+    robot, clock = operating_robot
+    bus = robot.left_bus
+    bus.bottom = 1000000  # Synthetic absent endstop, not a new configured travel limit.
+    wrap_fake_lift_encoder(bus)
+    if boundary == "deadline":
+        refresh = bus.refresh_lift_state
+
+        def slow_progress():
+            if bus.registers[("Goal_Velocity", "lift_axis")] > 0:
+                # Model 60 ticks/s: still >2 ticks/poll, but <600 mm after 180 s.
+                bus.last_update = clock.now - (clock.now - bus.last_update) * 0.3
+            refresh()
+
+        monkeypatch.setattr(bus, "refresh_lift_state", slow_progress)
+
+    with pytest.raises(RuntimeError) as caught:
+        robot.connect(calibrate=False)
+
+    records = operational_records(capsys)
+    rejection = next(r for r in records if r.get("rejected"))
+    if boundary == "deadline":
+        assert "timed out" in str(caught.value.__cause__)
+        assert 180 <= rejection["elapsed_s"] < 181
+    else:
+        assert "maximum travel" in str(caught.value.__cause__)
+        assert 600 < abs(rejection["homing_displacement_mm"]) < 600.5
+        assert 146 < rejection["elapsed_s"] < 148
+    assert caught.value.__cause__ is robot._lift_operation.failure
+    assert not any(r["phase"] in ("home_complete", "relief", "operational_ready") for r in records)
+    assert any(r["phase"] == "shutdown_verified" for r in records)
+    assert not robot.lift.is_homed
+    assert bus.registers[("Goal_Velocity", "lift_axis")] == 0
+    assert bus.registers[("Torque_Enable", "lift_axis")] == 0
+    assert not bus.is_connected
+
+
+@pytest.mark.parametrize("fault,reason", [("temperature", "3/5"), ("status", "status"), ("transport", "grouped feedback")])
+def test_normal_home_faults_after_twenty_seconds_still_stop_before_relief(
+    operating_robot, capsys, fault, reason,
+):
+    robot, clock = operating_robot
+    bus = robot.left_bus
+    bus.bottom = 1000000
+    wrap_fake_lift_encoder(bus)
+    encoder_hook = bus.hook
+    start = clock.now
+
+    def hook(register):
+        encoder_hook(register)
+        if clock.now - start >= 30 and bus.registers[("Goal_Velocity", "lift_axis")] > 0:
+            if fault == "temperature" and register == "Present_Temperature":
+                bus.registers[(register, "lift_axis")] = 60  # Synthetic sustained high.
+            elif fault == "status" and register == "Status":
+                bus.registers[(register, "lift_axis")] = 4
+            elif fault == "transport" and register == "Present_Temperature":
+                raise OSError("synthetic communication loss after 30 seconds")
+        elif register == "Status":
+            bus.registers[(register, "lift_axis")] = 0
+
+    bus.hook = hook
+    with pytest.raises(RuntimeError) as caught:
+        robot.connect(calibrate=False)
+
+    assert reason in str(caught.value.__cause__)
+    assert 30 <= clock.now - start < 31
+    records = operational_records(capsys)
+    assert not any(r["phase"] in ("home_complete", "relief", "operational_ready") for r in records)
+    assert any(r["phase"] == "shutdown_verified" for r in records)
+    assert bus.registers[("Goal_Velocity", "lift_axis")] == 0
+    assert bus.registers[("Torque_Enable", "lift_axis")] == 0
+    assert not bus.is_connected
+
+
 @pytest.mark.parametrize("temperatures,stops", [
     ([37, 37, 93, 37, 37, 37, 37], False),
     ([40, 50, 55, 57, 59], True),  # Synthetic sustained/rising temperature, not trace continuation.
