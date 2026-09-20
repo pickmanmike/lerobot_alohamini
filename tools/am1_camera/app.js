@@ -91,9 +91,10 @@ function startPrimary() {
   }
   (async () => {
     try {
+      const requestAt = performance.now();
       const response = await fetch(`/api/stream.mjpeg?src=${current.role}`, {cache:"no-store", signal:current.controller.signal});
       if (!response.ok || !response.body) throw new Error("Stream unavailable");
-      for await (const frame of AM1MjpegFrames(response.body)) {
+      for await (const frame of AM1MjpegFrames(response.body, undefined, requestAt)) {
         if (stream !== current) break;
         noteProgress(current.role, "received", frame.sequence);
         current.pending = frame; void decodeLatest(); // Latest only while one image is decoding.

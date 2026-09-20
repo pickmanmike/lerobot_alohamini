@@ -1608,9 +1608,10 @@ if ($LASTEXITCODE -ne 0) { throw 'Pi host-log fetch failed.' }
 
 For the **AM1 camera-only LAN viewer**, follow [the focused camera runbook](camera-viewing.md).
 It is independent of the accepted Local motor host and uses private path-based
-camera identities, not edits to the robot configuration below. Five cameras
-are detected; only forward/chest are mapped so far. Five-view acceptance and
-one-camera reconnect remain pending; no simultaneous camera/motion claim.
+camera identities, not edits to the robot configuration below. All five roles
+are mapped; supervised LAN camera-plus-Local use has an owner-accepted qualified
+functional pass. The runbook retains the 1.138 s browser gap, unverified isolated
+hot-plug recovery and other limitations; this is not a strict continuity pass.
 
 The following legacy camera configuration applies to the existing host-camera
 recording path, not to CAMERA-VIEW1. Do not run both capture owners together.

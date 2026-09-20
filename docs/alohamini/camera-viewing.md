@@ -3,8 +3,8 @@
 CAMERA-VIEW1 starts from `integrate/am1-local-teleop` at
 `e7d9253fd309c60d4821e7a1bdb0a2087f5bc9be`. The accepted arms, base, lift,
 Local-motion, idle and shutdown milestones remain closed. Camera-plus-Local
-functional evidence is now recorded below; no motor or camera runtime changes
-were needed for this closeout.
+functional evidence is recorded below. Its original documentation-only closeout
+is distinct from the subsequent offline CAMERA-AGE-1 browser correction below.
 
 ## Current state — owner-accepted functional camera-plus-Local pass
 
@@ -12,8 +12,9 @@ On 2026-09-20 the owner accepted practical closeout for **supervised LAN
 camera-plus-Local use**, explicitly retaining the observed browser interruption
 and remaining camera limitations. This is a qualified functional pass, **not**
 a pass of the strict 500 ms browser-continuity target. PR #6 is prepared for
-ordinary review into `integrate/am1-local-teleop`, not `main`; acceptance does
-not authorize an automatic merge. No unchanged physical repeat is requested.
+ordinary review into `integrate/am1-local-teleop`, not `main`. The subsequent
+CAMERA-AGE-1 packet authorizes an ordinary two-parent merge after the focused
+repair, verification and review pass. No unchanged physical repeat is requested.
 
 The operator reported all five views usable and teleoperation working correctly.
 Complete saved logs were reviewed, not just the filtered viewer:
@@ -47,7 +48,8 @@ Their maxima have no event timestamp and there is no pre-live browser baseline,
 so the 1.138 s gap cannot be assigned specifically to live control or dismissed
 as shutdown. Healthy acquisition places the interruption downstream of capture;
 HTTP/network delivery versus browser processing/scheduling is not distinguished.
-No speculative camera-code fix is supported. Physical scene-to-display latency
+The separately reproduced header-age defect below does not identify this gap's
+cause. Physical scene-to-display latency
 is still unmeasured, not supplied by these gaps or image-age metadata.
 
 ### Accepted practical scope and remaining limitations
@@ -196,7 +198,8 @@ Do not run both viewer modes concurrently. Use normal mode for combined use.
   HTTP request does not refresh a cached image. Gateway frames older than500ms
   are refused; disconnected streams are stale immediately. The browser consumes
   native multipart JPEG, retains only the latest candidate while decoding and
-  advances a separate image clock only after successful browser decode. It hides
+  updates separate displayed-frame state only after successful browser decode,
+  retaining the frame's receive-start timestamp rather than decode time. It hides
   a primary image older than500ms and thumbnails older than1.5s, even while status
   continues advancing. Stalled primary consumption is aborted/reconnected.
   Aging status metadata alone does not destroy a fresh decoded frame. It is
@@ -207,8 +210,13 @@ Do not run both viewer modes concurrently. Use normal mode for combined use.
   Repeated sequences cannot renew image clocks. Reload the page after restarting
   the entire gateway process, whose sequences reset; reconnecting one camera
   within the same gateway retains its sequence and requires no page reload.
-  Footer age is the image's gateway age plus measured receive/decode delay,
-  **not measured physical scene-to-display latency**.
+  Footer age is gateway-reported age plus elapsed client time from the relevant
+  pending read (first frame: before HTTP fetch), including body/decode waits.
+  This conservative estimate may include time waiting for a not-yet-produced
+  frame. It cannot establish exposure time, clock synchronization, or age in
+  unobserved upstream/browser queues. The consumer reads continuously without
+  awaiting image decode; it does not timestamp arbitrary browser-queued chunks
+  while JavaScript is suspended. It is **not physical scene-to-display latency**.
 - Basic authentication is not encryption: trusted LAN only. No public route,
   Cloudflare, firewall changes, boot service, recording or browser motion.
 
@@ -268,7 +276,7 @@ with its single go2rtc acquisition owner; the Local host and Windows client
 already use `--no_cameras`. The host sets its camera configuration to `{}` before
 robot construction. Local retains its independent 10 Hz sender, freshness and
 250 ms body-command expiry, one-second host watchdog and ordinary cleanup.
-No production code or private configuration is changed for this packet.
+Motor production code and private configuration remain unchanged.
 
 Worktrees verified during the evidence review (retain them; no reset or migration):
 
@@ -278,9 +286,11 @@ Worktrees verified during the evidence review (retain them; no reset or migratio
 | Pi motor | `/home/pickmanmike/lerobot_alohamini` | `feature/am1-local-mode`, `7badafdf4347cc1154c43f02fb6f6953d91053a0` |
 | Windows Local | `C:\Users\pickm\lerobot_alohamini_client\.worktrees\am1-local-mode` | `feature/am1-local-mode`, `a0ffbb5820162584efe3118f858f1a8f6b759e08` |
 
-The new camera follow-up is documentation-only; these deployed runtime versions
-need no update. The Windows head adds the accepted motor evidence documentation
-after the exercised Pi head; launcher/runtime content is unchanged between them.
+Those are the exercised/deployed identities at the evidence review, not a claim
+that they already contain CAMERA-AGE-1. That browser correction needs a clean,
+stopped camera checkout updated to the reviewed feature head and a browser reload
+on next normal launch. No motor-checkout update is needed. The Windows motor head
+adds evidence documentation after the exercised Pi head; their runtime is equal.
 
 1. **Physical preparation, motors OFF:** normal motor wiring, spare disconnected,
    mechanically installed lift with no added payload, existing calibrated leaders
@@ -293,7 +303,6 @@ after the exercised Pi head; launcher/runtime content is unchanged between them.
 ```bash
 cd /home/pickmanmike/lerobot_am1_camera_viewing
 export AM1_CAMERA_PYTHON=/home/pickmanmike/lerobot_alohamini/.venv/bin/python
-test "$(git rev-parse HEAD)" = 5a0045bd11ac6ac2c0e5957667f68dd80ca6b193 || exit 2
 bash tools/run_am1_camera.sh --check || exit 2
 bash tools/run_am1_camera.sh
 ```
@@ -515,3 +524,34 @@ help/import and Bash/JS syntax checks. The preparation and owner-acceptance
 follow-ups change only this Markdown runbook and PR text:
 documentation/reference/diff checks only, no fresh
 runtime-test claim, motor suites, dependency installation or hardware execution.
+
+## CAMERA-AGE-1 — focused offline receive-age correction
+
+Review finding `4058369025` exposed a definite frontend defect, separate from
+the accepted physical browser-gap limitation. With synthetic frame time 0 and
+gateway age 0, a header completed at 400 ms was labeled 499 ms/fresh at 899 ms.
+The old parser began its timestamp only after parsing the complete header.
+
+The corrected consumer carries the initial HTTP request start and subsequent
+pending-read timestamps through fragmented headers, body waits and decoding.
+Parts coalesced in a chunk keep that chunk's anchor, even when parsing resumes
+later; the next read gets its own timestamp, not the whole connection's start.
+Empty chunks cannot erase an outstanding wait. Native bytes, bounded buffering,
+reader cancellation/release, sequences, independent status/video clocks and the
+500 ms primary / 1.5 s thumbnail thresholds are unchanged. No motor path,
+gateway protocol, camera backend, authentication, mapping or rotation changed.
+
+Fresh validation for this correction: the five new timing regressions first
+failed for the intended freshness error while all 21 existing Node tests passed;
+after the fix and two additional boundary/control checks, **28 Node tests pass**.
+The existing **32 Python camera tests pass**. A loopback-only synthetic browser
+fixture uses the actual app/parser/freshness/CSS and real JPEG decoding: a delayed
+first response plus fragmented header displays at synthetic age 450 ms, becomes
+stale at 899 ms, accepts fresh subsequent 67 ms delivery, and cancels a repeated
+sequence/stalled stream. Its seven assertions pass. These simulated clocks and
+generated test image are not a new camera trial or a physical latency benchmark.
+
+This correction preserves the qualified owner acceptance, the recorded 1.138 s
+gap and all earlier limitations. It does not prove that gap's cause. The earlier
+two post-exercise documentation commits remain documentation-only; their
+historical runtime checks are not relabeled as tests of this repair.

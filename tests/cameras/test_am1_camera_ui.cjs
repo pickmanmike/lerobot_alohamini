@@ -49,7 +49,8 @@ test("browser multipart consumer handles fragmented headers and exact native pay
   assert.equal(frames[0].age_ms, 12);
 });
 
-function pageFixture(decodeWorks = true, delayedStatus = false, identify = false) {
+function pageFixture(decodeWorks = true, delayedStatus = false, identify = false, options = {}) {
+  const decodes = [];
   class Element {
     constructor() { this.parts = new Map(); this.children = []; this.flags = new Set(); this.dataset = {};
       this.classList = {toggle: (key, enabled) => enabled ? this.flags.add(key) : this.flags.delete(key)}; }
@@ -57,7 +58,10 @@ function pageFixture(decodeWorks = true, delayedStatus = false, identify = false
     append(value) { this.children.push(value); }
     addEventListener(name, fn) { this[name] = fn; }
     removeAttribute(key) { delete this[key]; }
-    decode() { return decodeWorks ? Promise.resolve() : Promise.reject(Error("bad JPEG")); }
+    decode() {
+      if (options.delayedDecode) return new Promise(resolve => decodes.push(resolve));
+      return decodeWorks ? Promise.resolve() : Promise.reject(Error("bad JPEG"));
+    }
   }
   const roots = new Element(), streams = [], timers = [], statusRequests = [];
   let now = 1000, sequence = 1;
@@ -76,26 +80,119 @@ function pageFixture(decodeWorks = true, delayedStatus = false, identify = false
       }
       if (url.startsWith('/api/stream.mjpeg')) {
         const item = {signal:options.signal}; streams.push(item);
-        return {ok:true,body:new ReadableStream({start(controller) {
+        const response = {ok:true,body:new ReadableStream({start(controller) {
           item.controller = controller;
           options.signal.addEventListener('abort', () => { try {controller.error(Error('aborted'));} catch {} });
         }})};
+        if (delayedStreamResponse) return new Promise(resolve => { item.reply = () => resolve(response); });
+        return response;
       }
       return {ok:true, headers:{get: name => name === 'X-Frame-Sequence' ? String(sequence) : '10'},
               blob:async () => new Blob([Buffer.from([255,216,1,2,255,217])],{type:'image/jpeg'})};
     }});
+  const delayedStreamResponse = options.delayedStreamResponse;
   for (const file of ['freshness.js','mjpeg.js','app.js']) {
     const filename = path.resolve(__dirname, '../../tools/am1_camera', file);
     if (fs.existsSync(filename)) vm.runInContext(fs.readFileSync(filename,'utf8'),context);
   }
-  return {context, roots, streams, timers, statusRequests, advance: (time, seq) => {now=time;sequence=seq;}};
+  return {context, roots, streams, timers, statusRequests, decodes, advance: (time, seq) => {now=time;sequence=seq;}};
 }
 const flush = async () => { for(let i=0;i<10;i++) await new Promise(resolve => setImmediate(resolve)); };
-function deliver(page, sequence) {
-  page.streams.at(-1).controller.enqueue(Buffer.concat([
+function multipart(sequence) {
+  return Buffer.concat([
     Buffer.from(`--frame\r\nContent-Type: image/jpeg\r\nContent-Length: 6\r\nX-Frame-Sequence: ${sequence}\r\nX-Frame-Age-Ms: 0\r\n\r\n`),
-    Buffer.from([255,216,1,2,255,217]),Buffer.from('\r\n')]));
+    Buffer.from([255,216,1,2,255,217]),Buffer.from('\r\n')]);
 }
+function deliver(page, sequence) {
+  page.streams.at(-1).controller.enqueue(multipart(sequence));
+}
+
+// Synthetic monotonic times, not measured camera or physical scene latency.
+for (const delayedResponse of [false, true]) {
+  test(`displayed freshness includes 400 ms before the first ${delayedResponse ? 'HTTP response' : 'multipart header'}`, async () => {
+    const page = pageFixture(true, false, false, {delayedStreamResponse:delayedResponse}); await flush();
+    page.advance(1400,1);
+    if (delayedResponse) page.streams[0].reply();
+    deliver(page,1); await flush(); vm.runInContext('render()',page.context);
+    assert.equal(page.roots.querySelector('#primary').flags.has('fresh'),true,'400 ms is inside the unchanged 500 ms limit');
+    page.advance(1899,2); vm.runInContext('render()',page.context);
+    assert.equal(page.roots.querySelector('#primary').flags.has('fresh'),false,'899 ms must not be reported as 499 ms/fresh');
+    assert.equal(page.streams[0].signal.aborted,false,'Freshness must fail even before the decoded-progress stall timer');
+    vm.runInContext('stopPrimary()',page.context);
+  });
+}
+
+test('fragmented header, delayed body and decode cannot renew displayed freshness', async () => {
+  const page = pageFixture(true,false,false,{delayedDecode:true}); await flush();
+  const raw = multipart(1), headerEnd = raw.indexOf('\r\n\r\n') + 4;
+  page.advance(1200,1); page.streams[0].controller.enqueue(raw.subarray(0,20)); await flush();
+  page.advance(1400,1); page.streams[0].controller.enqueue(raw.subarray(20,headerEnd)); await flush();
+  page.advance(1500,1); page.streams[0].controller.enqueue(raw.subarray(headerEnd)); await flush();
+  page.advance(1600,1); page.decodes[0](); await flush();
+  page.advance(1899,2); vm.runInContext('render()',page.context);
+  assert.equal(page.roots.querySelector('#primary').flags.has('fresh'),false,'Header/body/decode completion is not frame birth');
+  assert.equal(vm.runInContext('displayed.get("primary").at',page.context),1000);
+  vm.runInContext('stopPrimary()',page.context);
+});
+
+function timedParser() {
+  let now = 0, controller, cancelled = false;
+  const context = {TextDecoder,Uint8Array};
+  for (const file of ['mjpeg.js','freshness.js']) vm.runInNewContext(fs.readFileSync(path.resolve(__dirname,'../../tools/am1_camera',file),'utf8'),context);
+  const body = new ReadableStream({start(value) {controller=value;}, cancel() {cancelled=true;}});
+  return {body, iterator:context.AM1MjpegFrames(body,()=>now), enqueue:raw=>controller.enqueue(raw),
+    advance:value=>{now=value;}, cancelled:()=>cancelled,
+    state:frame=>context.AM1FrameState({state:'fresh',age_ms:0,sequence:99},now,now,frame).state};
+}
+
+test('multiple buffered parts retain receive provenance across a delayed consumer; later reads get a fresh clock', async () => {
+  const parser = timedParser(), first = parser.iterator.next();
+  parser.advance(400); parser.enqueue(Buffer.concat([multipart(1),multipart(2)]));
+  const a = (await first).value;
+  parser.advance(899); const b = (await parser.iterator.next()).value;
+  assert.equal(parser.state(a),'stale'); assert.equal(parser.state(b),'stale');
+  assert.equal(a.at,0); assert.equal(b.at,0,'Buffered bytes must not be retimestamped on generator resume');
+  parser.advance(1000); const next = parser.iterator.next();
+  parser.advance(1067); parser.enqueue(multipart(3)); const c = (await next).value;
+  assert.equal(parser.state(c),'fresh','Later frames must not inherit the whole connection age');
+  assert.equal(c.at,1000);
+  await parser.iterator.return();
+  assert.equal(parser.cancelled(),true); assert.equal(parser.body.locked,false);
+});
+
+test('a pending body followed by another fragmented header preserves each part clock', async () => {
+  const parser = timedParser(), raw = multipart(1), second = multipart(2), next = parser.iterator.next();
+  parser.advance(100); parser.enqueue(raw.subarray(0,raw.length-3)); await flush();
+  parser.advance(200); parser.enqueue(Buffer.concat([raw.subarray(raw.length-3),second.subarray(0,20)]));
+  const a = (await next).value;
+  parser.advance(400); const pending = parser.iterator.next();
+  parser.advance(500); parser.enqueue(second.subarray(20)); const b = (await pending).value;
+  parser.advance(599);
+  assert.equal(parser.state(a),'stale'); assert.equal(parser.state(b),'fresh');
+  parser.advance(600); assert.equal(parser.state(b),'stale','Second header began waiting at 100, not 400 or 500');
+  assert.equal(b.at,100);
+  await parser.iterator.return();
+});
+
+test('empty chunks retain the outstanding wait and a no-delay control ages normally', async () => {
+  const parser = timedParser(), first = parser.iterator.next();
+  parser.enqueue(multipart(1)); const a = (await first).value;
+  parser.advance(899); assert.equal(parser.state(a),'stale');
+  parser.advance(1000); const pending = parser.iterator.next();
+  parser.advance(1200); parser.enqueue(new Uint8Array()); await flush();
+  parser.advance(1400); parser.enqueue(multipart(2)); const b = (await pending).value;
+  assert.equal(parser.state(b),'fresh');
+  parser.advance(1500); assert.equal(parser.state(b),'stale');
+  assert.equal(b.at,1000);
+  await parser.iterator.return();
+});
+
+test('oversized input still rejects and cancels/releases the reader', async () => {
+  const parser = timedParser(), pending = parser.iterator.next();
+  parser.enqueue(new Uint8Array(2008193));
+  await assert.rejects(pending,/Oversized MJPEG input/);
+  assert.equal(parser.cancelled(),true); assert.equal(parser.body.locked,false);
+});
 
 test("delayed status cannot cancel advancing decoded video or hide a fresh thumbnail", async () => {
   const page = pageFixture(true, true); await flush();
