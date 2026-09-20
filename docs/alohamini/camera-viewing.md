@@ -7,16 +7,19 @@ not change motor code or qualify simultaneous camera/motor load.
 
 ## Confirmed identities and display orientation
 
-The operator identified all five numbered live views on September 20. This
-final mapping **supersedes the earlier preview3 = right wrist identification**:
+After the September 20 reconnect checks, the operator corrected the wrist
+identities: the view previously labeled left wrist is physically right, and
+the view previously labeled right wrist is physically left. This mapping
+**supersedes the wrist labels deployed at80986427**. Display rotations stay
+with the physical cameras; only their semantic role assignments swap:
 
 | Numbered source | Semantic role | Browser image rotation |
 |---|---|---|
 | Camera1 | forward (front) | 180 degrees |
 | Camera2 | chest | 180 degrees |
-| Camera3 | wrist_left (left hand) | 90 degrees clockwise |
+| Camera3 | wrist_right (right hand) | 90 degrees clockwise |
 | Camera4 | backward (rear) | 180 degrees |
-| Camera5 | wrist_right (right hand) | 90 degrees counterclockwise |
+| Camera5 | wrist_left (left hand) | 90 degrees counterclockwise |
 
 Exact USB paths, household images and private maps remain outside Git.
 All share `SN0001`; use measured `ID_PATH` plus capture index 0, not that serial
@@ -24,7 +27,7 @@ or unstable `/dev/videoN` numbering. Metadata index 1 is not a capture device.
 
 Both private maps retain those measured paths; the normal map now contains all
 five semantic roles. Optional `rotations` stores clockwise integer degrees
-0/90/180/270 for configured roles only (omitted means0). Thus right wrist uses270.
+0/90/180/270 for configured roles only (omitted means0). Thus left wrist uses270.
 The browser applies rotation to **images only**, in primary and thumbnail views;
 labels stay upright, quarter turns fit without cropping. Native640×480 JPEGs,
 snapshot API data, capture settings and go2rtc configuration are unchanged.
@@ -65,7 +68,8 @@ bash tools/run_am1_camera.sh --identify
 Windows browser: open `http://192.168.1.134:1984` with the **existing** login.
 Reload after changing viewer mode. Select the desired numbered camera as primary
 to adjust focus/lighting by hand without powering motors; identities are now
-known and do not need another identification round.
+known and do not need another identification round. Numbered paths and their
+rotations do not change when the semantic wrist labels are corrected.
 If a feed is stale/unavailable, focus adjustment cannot fix it: preserve browser
 diagnostics and the printed log. Do not mistake a genuinely dark live feed for
 an unmapped placeholder. Ctrl+C in the launcher stops this identification view;
@@ -139,10 +143,33 @@ back up a prior private map locally rather than silently replacing it.
 paths must resolve to distinct index0 V4L2 character devices, owners and motor
 host must be absent, and the backend binary hash must match the pin.
 For display-only orientation, add the optional `rotations` object to the private
-map after backup, e.g. `"rotations": {"wrist_left": 90, "wrist_right": 270}` when
+map after backup, e.g. `"rotations": {"wrist_left": 270, "wrist_right": 90}` when
 both roles are configured. Values are clockwise degrees, not camera controls.
 
-## One next human viewing session (not a motor test)
+## Immediate next check: front-source recovery, not another full suite
+
+The complete `am1-camera-20260920-144920-dERFuv.log` at80986427 proves the
+front source received **zero frames for the entire run**, not just after
+switching to a thumbnail. A subsequent bounded `v4l2-ctl` reference attempt
+outside the viewer returned `VIDIOC_STREAMON returned -1 (Protocol error)`.
+Its process exit0 is **not a capture pass**. The discovered front index0 path
+resolved to `/dev/video12`, was present and unowned, and reported native
+MJPG640×480@30. No camera settings were changed. The exact USB/device cause
+remains unresolved; do not patch frontend switching or change camera backend
+based on this evidence.
+
+With the viewer stopped and motor/leader supplies OFF, steady the Pi/hub and
+neighboring cables. Disconnect/reconnect **only the front camera's USB cable
+in the same physical port**, not Pi power or a motor controller. Then use the
+normal launch block below and reload the browser. Check Front as primary,
+switch to Rear and confirm Front resumes as a thumbnail.
+About30seconds of useful viewing is enough for this targeted
+check. Copy browser diagnostics **before** Ctrl+C, then retain the printed
+CAMERA_LOG. If Front remains unavailable, stop and preserve evidence rather
+than repeating reconnects. No arm/base/lift test or new wrist-reconnect test
+is requested here. Final isolated reconnect acceptance remains open.
+
+## Normal viewer launch and remaining acceptance (not a motor test)
 
 Keep all follower/body and leader motor supplies **OFF**, host stopped, USB
 camera power on. All five roles have been supplied; verify their labels and
@@ -167,7 +194,8 @@ The foreground helper prints the exact `CAMERA_LOG` under
 Runtime output goes directly to that file, not through the SSH terminal.
 Optional separate read-only log view: `tail -n 3 -F <exact CAMERA_LOG>`.
 
-For two minutes: confirm labels and upright views, click each mapped tile into primary, and
+For the later final acceptance only (not the targeted recovery check above):
+for two minutes confirm labels and upright views, click each mapped tile into primary, and
 record observed fps/freshness. Expand **Browser delivery diagnostics**: status
 request last/max duration, request failures, per-role primary received/displayed
 counts and maximum gaps, decode failures and last stream-cancellation reason.
@@ -190,7 +218,7 @@ Stop with **Ctrl+C in the launcher terminal** (stopping `tail` does not stop
 the viewer). Expect `CAMERA_CLEANUP_ERRORS=[]`, `CAMERA_EXIT_CODE=0` and no owners:
 
 ```bash
-fuser /dev/video0 /dev/video2 /dev/video4 /dev/video6 /dev/video8
+fuser /dev/v4l/by-path/*usb-*-video-index0
 # No PID output is the expected released state (fuser exits 1).
 vcgencmd get_throttled
 ```
@@ -292,6 +320,22 @@ first failed on missing schema/status/image metadata, then passed. A real
 browser using synthetic640×480 orientation cards and the actual stylesheet
 verified0/90/180/270 directions, full-frame fit and unrotated labels. That offline
 check does not substitute for the next normal-mode physical viewing check.
+
+The subsequent operator log `am1-camera-20260920-143700-7gcCfu.log` at80986427
+has199 status records through214.719s; source interruptions match USB events
+during connector handling. Useful viewing was reported;3167 primary frames
+were received/displayed with zero decode failures. Browser counters copied
+after Ctrl+C cannot assign status failures to the live interval. Cleanup[], exit0.
+
+`am1-camera-20260920-144920-dERFuv.log` has88 status records through95.294s.
+Forward remains unavailable with sequence0/bytes0 in every sample. Rear
+recovers from a1.816s source gap. The role then labeled `wrist_left` (physically
+**right**, per the operator correction) recovers from a15.488s frame gap;
+USB events include its actual disconnect14:50:19 and re-enumeration14:50:32.
+The gap therefore is not a15.488s reconnection delay. Chest and physical left
+wrist remain fresh after startup. Rear browser delivery817/817, decode errors0,
+status failures0. Shutdown requested, cleanup[], exit0. This establishes a
+front acquisition failure, not a frontend primary-to-thumbnail diagnosis.
 
 ## Focused software checks
 
