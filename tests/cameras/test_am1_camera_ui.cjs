@@ -49,7 +49,7 @@ test("browser multipart consumer handles fragmented headers and exact native pay
   assert.equal(frames[0].age_ms, 12);
 });
 
-function pageFixture(decodeWorks = true, delayedStatus = false) {
+function pageFixture(decodeWorks = true, delayedStatus = false, identify = false) {
   class Element {
     constructor() { this.parts = new Map(); this.children = []; this.flags = new Set();
       this.classList = {toggle: (key, enabled) => enabled ? this.flags.add(key) : this.flags.delete(key)}; }
@@ -65,7 +65,7 @@ function pageFixture(decodeWorks = true, delayedStatus = false) {
                          chest: {configured:true,state:'fresh',age_ms:10,fps:15,sequence}});
   const context = vm.createContext({TextDecoder, Uint8Array, Blob, AbortController, AbortSignal,
     performance: {now: () => now}, Image: Element,
-    document: {querySelector: key => roots.querySelector(key), createElement: () => new Element()},
+    document: {body:{dataset:{identification:String(identify)}}, querySelector: key => roots.querySelector(key), createElement: () => new Element()},
     URL: {createObjectURL: () => 'blob:test', revokeObjectURL: () => {}},
     setTimeout: () => 1, setInterval: fn => {timers.push(fn); return timers.length;},
     fetch: async (url, options) => {
@@ -215,6 +215,19 @@ test("unmapped tiles do not pretend to be previews or disconnected mapped camera
   await flush();
   assert.match(page.roots.querySelector('#thumbnails').children[1].querySelector('.unavailable').textContent,/unassigned/i);
   assert.match(page.roots.querySelector('#primary').querySelector('.unavailable').textContent,/mapped/i);
+});
+
+test("identification displays numbered live sources without assigning physical roles", async () => {
+  const page = pageFixture(true,true,true); await flush();
+  page.statusRequests[0].reply({preview_4:{configured:true,state:'fresh',age_ms:10,fps:15,sequence:4}});
+  await flush();
+  const tile = page.roots.querySelector('#thumbnails').children[3];
+  assert.equal(tile.querySelector('strong').textContent,'Camera 4');
+  tile.click(); await flush(); deliver(page,4); await flush(); vm.runInContext('render()',page.context);
+  assert.equal(page.roots.querySelector('#primary').flags.has('fresh'),true);
+  assert.equal(page.roots.querySelector('#primary').querySelector('strong').textContent,'Camera 4');
+  assert.match(page.roots.querySelector('#view-heading').textContent,/identification/i);
+  vm.runInContext('stopPrimary()',page.context);
 });
 
 test("bounded browser diagnostics distinguish delivery, display, decode errors and cancellation", async () => {

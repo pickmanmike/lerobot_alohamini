@@ -28,12 +28,13 @@ from urllib.parse import parse_qs, urlsplit
 
 
 ROLES = ("forward", "backward", "chest", "wrist_left", "wrist_right")
+PREVIEW_ROLES = ("preview_1", "preview_2", "preview_3", "preview_4", "preview_5")
 MAX_JPEG = 1_000_000
 FRESH_SECONDS = 0.5
 BINARY_SHA256 = "359fabade8a7a51e81a55fe6df6b0ef81764a5e1d63179577534eaaa71904b50"
 
 
-def validate_config(config):
+def validate_config(config, identify=False):
     if not isinstance(config, dict) or set(config) != {"version", "bind", "port", "cameras"}:
         raise ValueError("Expected version, bind, port and cameras only")
     if type(config["version"]) is not int or config["version"] != 1:
@@ -44,11 +45,12 @@ def validate_config(config):
     if type(config["port"]) is not int or config["port"] != 1984:
         raise ValueError("Camera viewer uses LAN port 1984 only")
     cameras = config["cameras"]
-    if not isinstance(cameras, dict) or not cameras or set(cameras) - set(ROLES):
+    roles = PREVIEW_ROLES if identify else ROLES
+    if not isinstance(cameras, dict) or not cameras or set(cameras) - set(roles):
         raise ValueError("Map at least one approved camera role; never invent missing roles")
     for role, path in cameras.items():
         if not isinstance(path, str) or not (
-            path == f"/dev/am_camera_{role}"
+            (not identify and path == f"/dev/am_camera_{role}")
             or re.fullmatch(r"/dev/v4l/by-path/[A-Za-z0-9_.:-]+-video-index0", path)
         ):
             raise ValueError("Only the role's camera alias or capture-index0 by-path identity is allowed")
@@ -182,6 +184,7 @@ class ViewerServer(ThreadingHTTPServer):
     def __init__(self, address, stores, configured, credentials):
         self.stores = stores
         self.configured = frozenset(configured)
+        self.identification = set(stores) == set(PREVIEW_ROLES)
         self.stop_event = threading.Event()
         self.slots = threading.BoundedSemaphore(24)
         value = f"{credentials['username']}:{credentials['password']}".encode()
@@ -266,7 +269,10 @@ class ViewerHandler(BaseHTTPRequestHandler):
                 self.reply(400)
                 return
             name, mime = assets[target.path]
-            self.reply(200, (Path(__file__).parent / "am1_camera" / name).read_bytes(), mime)
+            body = (Path(__file__).parent / "am1_camera" / name).read_bytes()
+            if name == "index.html" and self.server.identification:
+                body = body.replace(b"<body>", b'<body data-identification="true">', 1)
+            self.reply(200, body, mime)
             return
         if target.path == "/status.json":
             if target.query:
@@ -457,9 +463,9 @@ def preflight(config, binary):
         probe.bind(("127.0.0.1", 1985))  # Refuse a pre-existing backend; never kill it.
 
 
-def run_viewer(config, credentials, binary, state_dir, duration=None):
+def run_viewer(config, credentials, binary, state_dir, duration=None, identify=False):
     preflight(config, binary)
-    stores = {role: FrameStore() for role in ROLES}
+    stores = {role: FrameStore() for role in (PREVIEW_ROLES if identify else ROLES)}
     stop = threading.Event()
     workers, server, child, backend_path = [], None, None, None
     primary_failure = False
@@ -480,6 +486,7 @@ def run_viewer(config, credentials, binary, state_dir, duration=None):
             workers.append(worker)
             worker.start()
         print(f"CAMERA_VIEW_URL=http://{config['bind']}:{config['port']}", flush=True)
+        print("CAMERA_VIEW_MODE=" + ("numbered-identification" if identify else "semantic-roles"), flush=True)
         print("CAMERA_CONFIGURED_ROLES=" + ",".join(config["cameras"]), flush=True)
         print("CAMERA_REQUEST=MJPG 640x480 30fps; delivered rate follows below", flush=True)
         started = last_report = time.monotonic()
@@ -514,7 +521,8 @@ def run_viewer(config, credentials, binary, state_dir, duration=None):
 def main(argv=None):
     home = Path.home()
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, default=home / ".config/am1-camera/cameras.json")
+    parser.add_argument("--config", type=Path, help="Private camera map; separate default in --identify mode")
+    parser.add_argument("--identify", action="store_true", help="Numbered live previews from private identification.json; no role assignment")
     parser.add_argument("--credentials", type=Path, default=home / ".config/am1-camera/viewer.json")
     parser.add_argument("--binary", type=Path, default=home / ".local/lib/am1-camera/go2rtc-v1.9.14")
     parser.add_argument("--state-dir", type=Path, default=home / ".local/state/am1-camera")
@@ -526,6 +534,8 @@ def main(argv=None):
     parser.add_argument("--camera", action="append", default=[], metavar="ROLE=CAPTURE_PATH")
     parser.add_argument("--duration", type=float, help="Optional bounded camera-only check, 1–120 seconds")
     args = parser.parse_args(argv)
+    if args.config is None:
+        args.config = home / ".config/am1-camera" / ("identification.json" if args.identify else "cameras.json")
     if args.duration is not None and not 1 <= args.duration <= 120:
         parser.error("--duration must be finite and within 1–120 seconds")
     if not args.configure and (args.bind or args.camera):
@@ -535,11 +545,11 @@ def main(argv=None):
             pairs = [item.split("=", 1) for item in args.camera]
             if any(len(pair) != 2 for pair in pairs) or len({p[0] for p in pairs}) != len(pairs):
                 raise ValueError("Use each role once as ROLE=CAPTURE_PATH")
-            config = validate_config({"version": 1, "bind": args.bind, "port": 1984, "cameras": dict(pairs)})
+            config = validate_config({"version": 1, "bind": args.bind, "port": 1984, "cameras": dict(pairs)}, args.identify)
             write_private(args.config, config)
             print(f"CAMERA_CONFIG_CREATED={args.config}")
             return 0
-        config = validate_config(load_private(args.config))
+        config = validate_config(load_private(args.config), args.identify)
         if args.check:
             print("CAMERA_CONFIG_OK roles=" + ",".join(config["cameras"]) + "; no device access")
             return 0
@@ -564,7 +574,7 @@ def main(argv=None):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             previous = signal.signal(signal.SIGTERM, lambda signum, frame: (_ for _ in ()).throw(KeyboardInterrupt()))
             try:
-                return run_viewer(config, credentials, args.binary, args.state_dir, args.duration)
+                return run_viewer(config, credentials, args.binary, args.state_dir, args.duration, identify=args.identify)
             finally:
                 signal.signal(signal.SIGTERM, previous)
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:

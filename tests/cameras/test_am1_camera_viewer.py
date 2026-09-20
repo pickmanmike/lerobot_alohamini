@@ -66,6 +66,34 @@ class CameraCoreTests(unittest.TestCase):
             with self.subTest(patch=patch), self.assertRaises(ValueError):
                 self.viewer.validate_config({**self.config, **patch})
 
+    def test_numbered_identification_is_opt_in_and_cannot_assign_semantic_roles(self):
+        config = {**self.config, "cameras": {"preview_4": "/dev/v4l/by-path/usb-4-video-index0"}}
+        with self.assertRaises(ValueError):
+            self.viewer.validate_config(config)
+        # Through CLI: --identify must select a separate private map without touching ordinary roles.
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "identification.json"
+            self.viewer.write_private(path, config)
+            with patch.object(self.viewer, "preflight") as preflight:
+                try:
+                    result = self.viewer.main(["--identify", "--config", str(path), "--check"])
+                except SystemExit:
+                    result = 2
+                self.assertEqual(result, 0)
+                preflight.assert_not_called()
+                self.assertEqual(self.viewer.load_private(path), config)
+
+    def test_numbered_mode_refuses_mixed_roles_and_non_capture_sources(self):
+        for cameras in [{"forward":"/dev/v4l/by-path/usb-1-video-index0"},
+                        {"preview_4":"/dev/ttyACM0"}, {"preview_4":"/dev/video6"},
+                        {"preview_4":"http://example.org/"}, {"preview_4":"exec:command"},
+                        {"preview_4":"/dev/v4l/by-path/usb-4-video-index1"},
+                        {"preview_4":"/dev/am_camera_backward"},
+                        {"preview_6":"/dev/v4l/by-path/usb-6-video-index0"}]:
+            with self.subTest(cameras=cameras), self.assertRaises(ValueError):
+                self.viewer.validate_config({**self.config,"cameras":cameras}, identify=True)
+
     def test_grouped_backend_config_has_only_fixed_native_sources_and_minimal_listeners(self):
         config = self.viewer.backend_config(self.viewer.validate_config(self.config), "backend-secret")
         self.assertEqual(config["api"]["listen"], "127.0.0.1:1985")
@@ -413,6 +441,56 @@ class CameraLifecycleTests(unittest.TestCase):
                                              "--camera", "forward=/dev/am_camera_forward"]), 0)
             self.assertEqual(self.viewer.main(["--config", str(path), "--check"]), 0)
             preflight.assert_not_called()
+
+    def test_identification_uses_existing_owner_cleanup_and_auth_with_numbered_routes_only(self):
+        # Exercise the real run_viewer -> server -> routes, replacing acquisition only.
+        import tempfile
+        config = {"version":1,"bind":"127.0.0.1","port":0,
+                  "cameras":{"preview_4":"/dev/v4l/by-path/usb-4-video-index0"}}
+        real_make_server = self.viewer.make_server
+        observations = []
+        def make_server(*args):
+            server = real_make_server(*args)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            def handle_request():
+                try:
+                    for target, authenticated in [("/",False),("/",True),("/status.json",True),
+                                                  ("/api/frame.jpeg?src=preview_4",True),
+                                                  ("/api/frame.jpeg?src=backward",True),("/api/config",True)]:
+                        conn = http.client.HTTPConnection(*server.server_address, timeout=2)
+                        headers = {"Authorization":"Basic " + base64.b64encode(b"viewer:private-test-password").decode()} if authenticated else {}
+                        conn.request("GET",target,headers=headers)
+                        response = conn.getresponse()
+                        observations.append((target,authenticated,response.status,response.read()))
+                        conn.close()
+                finally:
+                    server.shutdown(); thread.join(2)
+                raise KeyboardInterrupt
+            server.handle_request = handle_request
+            return server
+        def reader(role, auth, store, stop):
+            self.assertEqual(role,"preview_4")
+            store.publish(JPEG)
+            worker = Mock(); worker.is_alive.return_value = False
+            return worker
+        child = Mock(); child.poll.return_value = None
+        with tempfile.TemporaryDirectory() as directory, patch.object(self.viewer,"preflight"), \
+             patch.object(self.viewer,"make_server",side_effect=make_server), \
+             patch.object(self.viewer,"CameraReader",side_effect=reader), \
+             patch.object(self.viewer.subprocess,"Popen",return_value=child):
+            try:
+                result = self.viewer.run_viewer(config,{"username":"viewer","password":"private-test-password"},
+                                                Path("unused"),Path(directory),identify=True)
+            except TypeError:
+                result = 2
+            self.assertEqual(result,0)
+        self.assertEqual([r[2] for r in observations],[401,200,200,200,404,404])
+        self.assertIn(b'data-identification="true"',observations[1][3])
+        self.assertEqual(set(json.loads(observations[2][3])["cameras"]),
+                         {"preview_1","preview_2","preview_3","preview_4","preview_5"})
+        self.assertEqual(observations[3][3],JPEG)
+        child.terminate.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -8,15 +8,16 @@ not change motor code or qualify simultaneous camera/motor load.
 ## Current identity gate
 
 Five capture devices are present. The operator confirmed preview 1 = forward
-and preview 2 = chest. CAMERA-VIEW2 refreshed previews 3–5 directly from their
+and preview 2 = chest, and then confirmed preview3 = right wrist from the
+refreshed image. CAMERA-VIEW2 refreshed previews 3–5 directly from their
 verified capture-index0 paths, independently of the semantic role map. Preview3
-is a blurred nearby surface; previews4/5 are nearly black. Backward and both
+is a blurred nearby surface; previews4/5 are nearly black. Backward and left
 wrist roles are **unassigned**, not inferred. Exact USB paths and the new images
 are private under `AlohaMini1Logs/am1-camera-view2-90rYqE` on Windows/Pi.
 All share `SN0001`; use measured `ID_PATH` plus capture index 0, not that serial
 or unstable `/dev/videoN` numbering. Metadata index 1 is not a capture device.
 
-Partial maps are supported so the two confirmed views are useful now.
+Partial maps are supported so the three confirmed views are useful now.
 Five-camera acceptance remains pending all roles and the human reconnect check.
 Camera-only semantic udev rules are approved but held until mapping is complete;
 the current private map uses persistent `/dev/v4l/by-path/*-video-index0` links.
@@ -27,6 +28,39 @@ uncover/illuminate the actual lenses with motor power off before refreshing the
 same allowlisted captures. The dashboard distinguishes unassigned roles from
 mapped-but-unavailable/stale feeds. A genuinely dark decoded live image remains
 visible as camera data; darkness is not inferred to mean disconnection.
+
+### Live numbered focus/identification (current next step)
+
+The operator needs live images to adjust the lenses physically. Opt-in
+`--identify` reuses this gateway, authentication, acquisition owner and freshness
+logic. It loads **separate** private `~/.config/am1-camera/identification.json`,
+with fixed `preview_1` through `preview_5` keys and verified capture-index0
+by-paths only. It cannot mix semantic roles into that map. The page labels are
+**Camera1–5**, not guessed body roles. No paths, credentials or lens controls
+are exposed in the browser. The ordinary `cameras.json` retains confirmed roles.
+
+With motor/leader supplies off and no other camera owner, Pi Bash:
+
+```bash
+cd /home/pickmanmike/lerobot_am1_camera_viewing
+export AM1_CAMERA_PYTHON=/home/pickmanmike/lerobot_alohamini/.venv/bin/python
+bash tools/run_am1_camera.sh --identify --check
+bash tools/run_am1_camera.sh --identify
+```
+
+Windows browser: open `http://192.168.1.134:1984` with the **existing** login.
+Reload after changing viewer mode. Select Camera4, then Camera5 as primary to
+adjust focus/lighting by hand without powering motors. Return their two physical
+roles in one response. Camera1=forward,2=chest,3=right wrist remain confirmed.
+If a feed is stale/unavailable, focus adjustment cannot fix it: preserve browser
+diagnostics and the printed log. Do not mistake a genuinely dark live feed for
+an unmapped placeholder. Ctrl+C in the launcher stops this identification view;
+do not run it concurrently with the ordinary viewer. Existing runtime logs and
+cleanup checks below apply unchanged.
+
+After identifying4/5, update the private semantic map, then perform the single
+five-label switching/reconnect acceptance below. No semantic udev rule or role
+is guessed to bypass the identification gate.
 
 ## Small isolated data path
 
@@ -238,6 +272,6 @@ Hardware-free tests use fake JPEG parts and loopback HTTP only. They cover
 role/path binding, auth/route/method/query denial, frame freshness, displayed
 thumbnail freshness, disconnect isolation, owned-child cleanup, primary-error
 preservation, local private credentials, config-only execution and the launcher.
-Current focused count: **28 Python tests and 18 Node/browser-logic tests**. Compilation,
+Current focused count: **31 Python tests and 19 Node/browser-logic tests**. Compilation,
 hardware-free help/import, Bash/JS syntax and diff checks pass. No robot suite,
 dependency installation or motor access is part of these checks.

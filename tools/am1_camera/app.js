@@ -1,10 +1,14 @@
 "use strict";
-const roles = ["forward", "backward", "chest", "wrist_left", "wrist_right"];
-const labels = {forward: "Forward", backward: "Backward", chest: "Chest", wrist_left: "Left wrist", wrist_right: "Right wrist"};
+const identifying = document.body.dataset.identification === "true";
+const roles = identifying ? ["preview_1", "preview_2", "preview_3", "preview_4", "preview_5"] :
+                           ["forward", "backward", "chest", "wrist_left", "wrist_right"];
+const labels = identifying ? Object.fromEntries(roles.map((role, i) => [role, `Camera ${i + 1}`])) :
+                            {forward: "Forward", backward: "Backward", chest: "Chest", wrist_left: "Left wrist", wrist_right: "Right wrist"};
+if (identifying) document.querySelector("#view-heading").textContent = "Numbered identification · adjust focus, then confirm roles";
 const primary = document.querySelector("#primary"), thumbs = document.querySelector("#thumbnails");
 const connection = document.querySelector("#connection");
 const diagnostics = document.querySelector("#diagnostics");
-let selected = "forward", latest = null, reportAt = 0, statusReceivedAt = 0, generation = 0, stream = null;
+let selected = roles[0], latest = null, reportAt = 0, statusReceivedAt = 0, generation = 0, stream = null;
 const tiles = new Map(), blobs = new Map(), displayed = new Map(), busy = new Set();
 const sequences = new Map(); // Per display path, retained through stream reconnects.
 const timing = {status_ms:0, status_max_ms:0, status_failures:0, decode_failures:0,
