@@ -91,9 +91,26 @@ If either identity is missing, duplicated, ambiguous, or attached to the wrong l
 
 ### Lean AM1 local operation and physically proven lift
 
-#### Current operator packet — AM1-POSTQ-1 (combined motion passed; idle/shutdown verification pending)
+#### Current status — supervised local hobby use ready (AM1-POSTQ-1 passed)
 
-This direction supersedes the historical spare/adapter/ID experiments and repeatability prerequisites below. Preserve all accepted arm/base/lift-direction and combined Local-motion results. Exact spike causation and spike-free raw temperature are **not** prerequisites for supervised hobby use. No claim of long-duration thermal stability is made; the earlier gradual heating and firmware `Overheat` evidence remain valid. PR #5 stays draft/unmerged until the remaining idle/shutdown behavior below is verified.
+The remaining client-exit/idle/ordinary-shutdown check passed at `7badafdf4347cc1154c43f02fb6f6953d91053a0`. Together with the accepted combined-motion result, this supports supervised local hobby use and ordinary PR #5 closure into `integrate/am1-local-teleop`, never `main`. No motor software change or repeat direction suite is required. The next scoped work is [CAMERA-VIEW1: motor-off local camera viewing](../superpowers/plans/2026-09-19-am1-camera-viewing-packet.md), not another motor test.
+
+This direction supersedes the historical spare/adapter/ID experiments and repeatability prerequisites below. Preserve all accepted arm/base/lift-direction and combined Local-motion results. Exact spike causation and spike-free raw temperature are **not** prerequisites for supervised hobby use. No claim of long-duration thermal stability, unattended safety or camera/remote readiness is made; the earlier gradual heating and firmware `Overheat` evidence remain valid. Keep an operator present, a clear envelope, carriage/arm support before torque-off, and an accessible power disconnect.
+
+**Completed POSTQ evidence (September 19 local / September 20 UTC):** complete Windows `C:\Users\pickm\AlohaMini1Logs\am1-local-windows-20260919-221815.log` and Pi `/home/pickmanmike/AlohaMini1Logs/am1-local-host-20260919-221744.log`. The downloaded Pi copy in `C:\Users\pickm\AlohaMini1Logs` matches SHA-256 `534d44e8e082c2d28ac87984a8b2a38a471f8e54d393df3ea736101d41b518e2`; Windows SHA-256 is `70c42642ef1572996438e6bda6a165cfc43d8328ce0d398e47c82b5986053d82`. All 28,882 Pi lines were reviewed, not just viewer output. Pi headers explicitly identify the branch/head and repository interpreter; Windows identifies the exact Local script/interpreter and arguments, but does not embed a commit SHA. Its immutable identity also relies on the reported exercised checkout and verified local HEAD.
+
+| Boundary | Measured result |
+|---|---|
+| Startup/relief | Five genuine 36 C baseline samples; qualified torque-off preflight. Home completed once in 0.675 s by current threshold (peak 338 mA), followed by stopped qualification and relief to 10.541 mm at `operational_ready`, elapsed 4.752 s. The short post-home zero-goal current interval was 318.5–370.5 mA; it was not an extended bottom hold. |
+| Client exit | Live summary 02:30:46.583–02:30:55.605 UTC on Windows: 90 actions in 9.02 s, maximum 110 ms send interval, observation age 31 ms, zero live timeout/stale latch/body-command expirations. Final-zero/cleanup message and exit 0. Early orderly termination before the 30 s limit is consistent with Q; the exact keypress and process-exit timestamp are not separately logged. One initial observation timeout recovered before synchronization. |
+| Subsequent idle | On the Pi clock alone, final command sequence 1285 was first reported at 02:30:55.707; it remained unchanged through shutdown. The next 1,810 lift samples span 60.4285 s, ending 02:31:56.137, 60.4301 s after that report. Maximum idle sample gap 34.053 ms; height fixed at 10.541 mm, goal 0, torque 1, status 0. No freshness refusal. |
+| Watchdog | Four one-shot zeros: pre-client, initial gate, post-sync/Enter pause, post-client. The last at 02:30:56.377 was expected command silence, not a lift fault; no further event or command arrived. The 34.540 s / 588.321 s cumulative command gaps belong to operator gates, while feedback continued. No live watchdog event. |
+| Temperature/current | All 25,241 ordinary monitoring samples span 843.213 s: 36–42 C, current 13–45.5 mA (mean 31.79), goal 0, height 10.541–10.562 mm. Final idle: 40–42 C, 26–39 mA (mean 31.47). Zero numeric outliers or majority-high windows; no status/transport fault. This does not establish thermal equilibrium or sensor accuracy. |
+| Ordinary shutdown | KeyboardInterrupt entered cleanup; torque and goal read 0. Initial torque-off settling moved raw position 290→318 (about 0.57 mm by the configured conversion), with transient raw velocity 50/100. The final five samples were fixed at 318, measured velocity/moving/current 0, torque/goal 0, over 0.208 s. `shutdown_verified` at 02:31:56.705 and `HOST_EXIT_CODE=0`; no cleanup error or traceback. Support before torque-off remains required. |
+
+All captured grouped reply checks passed; no same-ID checksum result is treated as proof of request correspondence or physical sensor accuracy. Two isolated raw velocity `-50` reports during the final idle had no position change; do not describe every raw sample as velocity-zero. Maximum ordinary monitoring sample gap was 60.002 ms, below the unchanged 0.5 s freshness limit. The idle duration is established from the final-command plateau, not by subtracting unverified Windows/Pi clocks or claiming more than 60 s after the watchdog event itself.
+
+The operator reported expected movement. The separate viewer was opened only after the run; viewer stop/reopen was **not physically exercised**. Blocked/closed-viewer independence remains backed by the prior actual-launcher fake-process tests, not a newly invented physical result. No repeat powered check is required solely for viewer toggling. This bounded pass does not identify the historical 35-second gap's cause or rule out future filesystem, scheduling or underlying serial stalls.
 
 The normal Local session at `fe12a28001b5ec17ebb84466a61169ef8b1d28a4` passed actual-bottom homing (16.02 seconds), 10.42 mm relief, and combined controls. One isolated 92 C numeric reading was retained/tolerated. The initial raised stationary interval lasted 192.26 seconds at unchanged height, 26–45.5 mA (mean 35.39 mA), and 36–39 C. Windows sent 203 live actions with a 110 ms maximum interval, no live observation timeout or stale latch, and exit 0. There was no live-command watchdog event. The operator confirmed arm following, release/Q stopping, normal wiring, and no unusual behavior. This result is preserved; no direction or full-travel commissioning repeat is required.
 
@@ -125,6 +142,9 @@ Status/error bits, corrupt packets, communication failures, invalid/stale feedba
 The ordinary host takes one grouped lift sample before actions in each iteration (30 Hz requested, 40 ms read budget). Five-reading confirmation is incremental, with **no live confirmation sleep**, polling thread, second serial owner, or catch-up burst. Observations and actions use the same paired height, with only one encoder accumulation per sample. Bounded stationary qualification sleeps occur only at startup/relief and shutdown. Other motors, AM2/AM2 Pro, the one-second Pi watchdog, 250 ms Windows body-command expiry, leader mapping/calibration, synchronization and 10 Hz Windows sending remain unchanged. Legacy opt-in comparator profiles remain historical tools with their prior immediate-temperature criteria, not the next operator step.
 
 The installed fifth-run result remains the supporting physical evidence: home completed once, relief settled at 10.5 mm, and current fell from mean 339.3 mA at the lower stop to mean 31.77 mA during 45.03 seconds of raised rest. The four preceding homing-stage numeric refusals remain documented below. Cleanup samples after those refusals are not evidence of what would have happened during continued motion. Synthetic rising/repeated-high tests validate the new stop policy, not physical thermal behavior.
+
+<details>
+<summary>Completed POSTQ operator procedure — retained for reference, not a requested repeat</summary>
 
 **One client-exit / brief-idle / ordinary-shutdown check, not another direction suite:**
 
@@ -161,18 +181,20 @@ Automatic logs are `C:\Users\pickm\AlohaMini1Logs\am1-local-windows-<timestamp>.
 
 Pass for the remaining check: healthy monitoring after Q and with the independent viewer paused/closed; stable raised rest below the existing current boundary; no sustained heating, genuine fault or unexpected behavior; successful stopped/torque-off cleanup and both exit codes 0. Preserve the already accepted combined-motion result rather than repeat it. Known isolated numeric spikes with logged warnings are allowed. Stop immediately for any genuine fault/refusal, unsafe motion/load, heating/sound, failure to stop, power/USB issue or loss of support. Do not widen limits or automatically retry.
 
-After that successful changed-path verification, record the unresolved numeric-feedback limitation and prepare an ordinary merge into `integrate/am1-local-teleop` (not `main`). Exact spike causation is not a remaining merge prerequisite; the current physical check and honest cleanup are. Do not merge before it.
+This procedure has now passed as documented above. Its result supports an ordinary merge into `integrate/am1-local-teleop` (not `main`), with unresolved feedback and historical-cause limitations retained. Do not repeat the powered check merely to fill in unmeasured viewer behavior.
+
+</details>
 
 #### Accepted milestones and historical commissioning evidence
 
-`integrate/am1-local-teleop` at `07bda8ad036de2dffdaa3493a4a30428ab0f06b8` is the canonical shared branch for the physically validated local arm, base, and lift-only system. It contains both immutable validation inputs: Windows `30609a4597b8b6fca49bc1018024fd29dfb55127` and Pi `ee3a6f5dd813be82780a6a9b1789966357542d2f`.
+`integrate/am1-local-teleop` is the canonical shared branch. Its pre-PR-5 base `07bda8ad036de2dffdaa3493a4a30428ab0f06b8` contains the physically validated local arm, base, and lift-only system, including immutable inputs Windows `30609a4597b8b6fca49bc1018024fd29dfb55127` and Pi `ee3a6f5dd813be82780a6a9b1789966357542d2f`. PR #5 adds the accepted combined Local operation and post-client shutdown path; use its ordinary integration merge for subsequent camera-only work.
 
 Local bimanual arms are physically proven. In the accepted run, all twelve channels moved on the correct side and in the correct direction, startup synchronization's maximum final mismatch was `5.534`, and live control sent 449 actions over 44.990 seconds (`9.980 Hz`) with a longest interval of 110 ms. Two transient observation timeouts recovered, `stale_latched` remained false, no command-watchdog event occurred during live forwarding, base and lift remained stationary, and both processes exited `0`. Evidence is retained at:
 
 - `C:\Users\pickm\AlohaMini1Logs\am1-ar1-r2h-retry-bimanual10-windows-20260831-235812.log`
 - `C:\Users\pickm\AlohaMini1Logs\am1-ar1-r2h-retry-bimanual10-host-20260831-234021.log`
 
-The regulated 12 V / 10 A supply is proven for this arms-only result. It is not yet proven for complete simultaneous arm, base, and lift operation.
+The regulated 12 V / 10 A supply supported this arms-only result and the later bounded combined Local session above. These observations do not establish maximum simultaneous motor-load capacity.
 
 Local base teleoperation is also physically proven. The elevated-wheel checks established opposing `W/S`, `Z/X`, and `A/D` wheel patterns; the floor check established the correct six chassis directions; every release stopped promptly; and the arms and lift remained stationary. Both Windows base sessions exited `0`. The final no-motion shutdown-only check pressed no movement key, left wheels, arms, and lift stationary, and recorded both `AM1_CLIENT_EXIT_CODE=0` and `HOST_EXIT_CODE=0`. Evidence is retained at:
 
