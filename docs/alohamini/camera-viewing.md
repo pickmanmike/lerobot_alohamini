@@ -5,6 +5,55 @@ CAMERA-VIEW1 starts from `integrate/am1-local-teleop` at
 Local-motion, idle and shutdown milestones remain closed. This packet does
 not change motor code or qualify simultaneous camera/motor load.
 
+## Current state — restart passed; combined use prepared, not executed
+
+The targeted Forward recovery/restart check is **closed**. Complete saved log
+`am1-camera-20260920-152530-egPuH8.log` records
+`feature/am1-camera-viewing` at `5a0045bd11ac6ac2c0e5957667f68dd80ca6b193`,
+source root `/home/pickmanmike/lerobot_am1_camera_viewing`, and pinned go2rtc
+1.9.14. The original is under `/home/pickmanmike/AlohaMini1Logs`; the complete
+Windows copy is `C:\Users\pickm\AlohaMini1Logs\am1-camera-20260920-152530-egPuH8.log`.
+SHA-256: `fef5be7ee28b0373c581e752b726930a61a25fb9edfbb7896416ad745bafa213`.
+All 60 lines / 48 status records were reviewed, not only a filtered viewer.
+
+| Evidence | Supported result |
+|---|---|
+| No-touch viewer restart | All five sources fresh in all 46 samples from 3.069 s through 51.577 s, a 48.508 s span. No sequence/byte regression. |
+| All-source acquisition | Approximately 15 fps Forward/Backward/Left wrist and 20 fps Chest/Right wrist; cumulative maximum source gaps 53.472–69.454 ms. |
+| Forward browser interval | 608 received / 608 displayed; status/decode failures 0; cancellations 0; maximum receive/display gap 279/280 ms. Actual browser observation duration was not recorded: **no browser-fps calculation** from the count or host duration. |
+| Operator / kernel | Operator reports all five live and looking good, with no USB handling. Saved kernel query for 15:25:25–15:26:35 local time returned no entries. |
+| Shutdown | `CAMERA_STOP_REQUESTED`, `CAMERA_CLEANUP_ERRORS=[]`, `CAMERA_EXIT_CODE=0`. |
+
+Existing evidence is cumulative, not a requirement to repeat every accepted
+item in one log. The operator's five-role/orientation observations and corrected
+wrist mapping below remain accepted. In the preceding
+`am1-camera-20260920-151731-ukdp10.log` at the same source head, Forward recovered
+after its physical replug and then remained fresh through the final 31.118 s;
+the operator confirmed Forward/Rear primary switching and a live Forward
+thumbnail. Browser Forward 261/259 and Rear 102/102, decode/status failures 0,
+last cancellation `role-switch`; latest-only rendering can skip a pending frame.
+A separate Rear USB disconnect caused a 3.213 s gap earlier in that run.
+Recovery and switching passed, but that run did not prove isolated hot-plug
+recovery with all other feeds uninterrupted.
+
+### Proposed practical closeout scope — owner decision still required
+
+Recommend accepting **supervised motor-off LAN viewing with stable connected
+cameras and documented stop/restart recovery**. This explicitly narrows the
+original isolated live hot-plug acceptance criterion; it does **not** claim that
+criterion passed. Keep PR #6 draft/unmerged until the owner/reviewer accepts the
+scope and evidence. PR #5 and all accepted Local motor milestones stay closed.
+The proposed scope adjustment does not block preparation of the combined check.
+
+Still unverified: cold boot/power-cycle reliability; isolated live hot-plug
+recovery; exact cause of the earlier Forward USB/V4L2 failure; physical
+scene-to-display latency; five-view browser fps over measured intervals;
+full five-camera resource/uplink headroom; simultaneous camera/motor load.
+Image-age metadata is not physical latency. These are limitations, not a new
+benchmark or unplug campaign. No unchanged restart, remapping, reseat, camera
+code fix or repeat motor commissioning is requested. The next physical action
+is the single integration session below.
+
 ## Confirmed identities and display orientation
 
 After the September 20 reconnect checks, the operator corrected the wrist
@@ -33,9 +82,9 @@ labels stay upright, quarter turns fit without cropping. Native640×480 JPEGs,
 snapshot API data, capture settings and go2rtc configuration are unchanged.
 This is display orientation, not an image-processing or recording transform.
 
-Five-camera acceptance still needs the single human label/orientation,
-switching and reconnect check below. Additional semantic udev rules are not
-needed for this session: the private map already uses persistent
+Role/orientation and normal view-switch evidence are accepted as described
+above; isolated hot-plug recovery is retained as a limitation under the proposed
+closeout scope. Additional semantic udev rules are not needed: the private map uses persistent
 `/dev/v4l/by-path/*-video-index0` links.
 Do not change motor-controller aliases. Template: `config/am1.cameras.example.json`.
 An unassigned role tile is not an image from one of the unassigned cameras.
@@ -47,14 +96,14 @@ visible as camera data; darkness is not inferred to mean disconnection.
 
 ### Optional numbered focus/identification
 
-The operator needs live images to adjust the lenses physically. Opt-in
+For future focus work only, opt-in
 `--identify` reuses this gateway, authentication, acquisition owner and freshness
 logic. It loads **separate** private `~/.config/am1-camera/identification.json`,
 with fixed `preview_1` through `preview_5` keys and verified capture-index0
 by-paths only. It cannot mix semantic roles into that map. The page labels remain
 **Camera1–5**. No paths, credentials or lens controls are exposed in the browser.
 The ordinary `cameras.json` retains confirmed roles; each private map carries
-the equivalent display rotations. Use normal mode for the next acceptance.
+the equivalent display rotations. No identification run is currently needed.
 
 With motor/leader supplies off and no other camera owner, Pi Bash:
 
@@ -76,8 +125,7 @@ an unmapped placeholder. Ctrl+C in the launcher stops this identification view;
 do not run it concurrently with the ordinary viewer. Existing runtime logs and
 cleanup checks below apply unchanged.
 
-Do not run both viewer modes concurrently. The single normal-mode acceptance
-below replaces further identification captures.
+Do not run both viewer modes concurrently. Use normal mode for combined use.
 
 ## Small isolated data path
 
@@ -146,7 +194,7 @@ For display-only orientation, add the optional `rotations` object to the private
 map after backup, e.g. `"rotations": {"wrist_left": 270, "wrist_right": 90}` when
 both roles are configured. Values are clockwise degrees, not camera controls.
 
-## Immediate next check: front-source recovery, not another full suite
+## Historical Forward failure — recovered, exact cause unresolved
 
 The complete `am1-camera-20260920-144920-dERFuv.log` at80986427 proves the
 front source received **zero frames for the entire run**, not just after
@@ -158,83 +206,145 @@ MJPG640×480@30. No camera settings were changed. The exact USB/device cause
 remains unresolved; do not patch frontend switching or change camera backend
 based on this evidence.
 
-With the viewer stopped and motor/leader supplies OFF, steady the Pi/hub and
-neighboring cables. Disconnect/reconnect **only the front camera's USB cable
-in the same physical port**, not Pi power or a motor controller. Then use the
-normal launch block below and reload the browser. Check Front as primary,
-switch to Rear and confirm Front resumes as a thumbnail.
-About30seconds of useful viewing is enough for this targeted
-check. Copy browser diagnostics **before** Ctrl+C, then retain the printed
-CAMERA_LOG. If Front remains unavailable, stop and preserve evidence rather
-than repeating reconnects. No arm/base/lift test or new wrist-reconnect test
-is requested here. Final isolated reconnect acceptance remains open.
+The later replug recovery and no-touch restart passed as recorded above.
+Do not prescribe another recovery attempt to reconfirm those results. For a
+future loss of a required view during Local use, release movement inputs,
+end the client and cleanly stop the motor host before stopping/restarting the
+viewer. Viewer startup deliberately refuses an already-running motor host.
+If restart does not restore all required views, retain logs and refuse motion;
+do not automatically retry or handle USB connections during powered operation.
 
-## Normal viewer launch and remaining acceptance (not a motor test)
+## One camera-plus-Local integration session — prepared only
 
-Keep all follower/body and leader motor supplies **OFF**, host stopped, USB
-camera power on. All five roles have been supplied; verify their labels and
-orientation in normal mode. Do not unplug a motor USB controller. No reboot or
-motor retest is required.
+This is a short co-load check, not a new arm/base/lift direction suite. Source
+inspection found no integration change needed: the camera gateway starts first
+with its single go2rtc acquisition owner; the Local host and Windows client
+already use `--no_cameras`. The host sets its camera configuration to `{}` before
+robot construction. Local retains its independent 10 Hz sender, freshness and
+250 ms body-command expiry, one-second host watchdog and ordinary cleanup.
+No production code or private configuration is changed for this packet.
 
-Pi SSH terminal, Bash:
+Verified deployed/runtime worktrees (retain them; no reset or migration):
+
+| Machine / purpose | Directory | Branch / head |
+|---|---|---|
+| Pi camera | `/home/pickmanmike/lerobot_am1_camera_viewing` | `feature/am1-camera-viewing`, `5a0045bd11ac6ac2c0e5957667f68dd80ca6b193` |
+| Pi motor | `/home/pickmanmike/lerobot_alohamini` | `feature/am1-local-mode`, `7badafdf4347cc1154c43f02fb6f6953d91053a0` |
+| Windows Local | `C:\Users\pickm\lerobot_alohamini_client\.worktrees\am1-local-mode` | `feature/am1-local-mode`, `a0ffbb5820162584efe3118f858f1a8f6b759e08` |
+
+The new camera follow-up is documentation-only; these deployed runtime versions
+need no update. The Windows head adds the accepted motor evidence documentation
+after the exercised Pi head; launcher/runtime content is unchanged between them.
+
+1. **Physical preparation, motors OFF:** normal motor wiring, spare disconnected,
+   mechanically installed lift with no added payload, existing calibrated leaders
+   and PnP ownership. Preserve the known-good camera USB connections and private
+   login/map. Clear the arm/base/lift envelope; arrange safe carriage/arm support
+   before torque-off and keep the power disconnect accessible. No USB handling,
+   recalibration, endpoint forcing or new power configuration. Motor host stopped.
+2. **Pi SSH terminal A, Bash — camera viewer first.** Reuse the existing Pi venv:
 
 ```bash
 cd /home/pickmanmike/lerobot_am1_camera_viewing
 export AM1_CAMERA_PYTHON=/home/pickmanmike/lerobot_alohamini/.venv/bin/python
-git branch --show-current
-git rev-parse HEAD
-bash tools/run_am1_camera.sh --check
+test "$(git rev-parse HEAD)" = 5a0045bd11ac6ac2c0e5957667f68dd80ca6b193 || exit 2
+bash tools/run_am1_camera.sh --check || exit 2
 bash tools/run_am1_camera.sh
 ```
 
-Credentials already exist: **do not rerun `--init-auth`**. Open
-**http://192.168.1.134:1984** in the Windows browser and use the existing login.
-The foreground helper prints the exact `CAMERA_LOG` under
-`/home/pickmanmike/AlohaMini1Logs/am1-camera-<timestamp>-<suffix>.log`.
-Runtime output goes directly to that file, not through the SSH terminal.
-Optional separate read-only log view: `tail -n 3 -F <exact CAMERA_LOG>`.
-
-For the later final acceptance only (not the targeted recovery check above):
-for two minutes confirm labels and upright views, click each mapped tile into primary, and
-record observed fps/freshness. Expand **Browser delivery diagnostics**: status
-request last/max duration, request failures, per-role primary received/displayed
-counts and maximum gaps, decode failures and last stream-cancellation reason.
-Compare count deltas over a measured interval with the source fps; received
-frames and decoded/displayed frames are separate evidence. Intentional switching
-increments `role-switch`, not a dropout. These bounded counters are page-local,
-not server logs; capture their text with the matching `CAMERA_LOG`.
-Once all five are mapped, unplug/replug **one
-labeled camera**. Others must stay fresh; that view must visibly become stale
-and recover within10s. No repeated unchanged captures when a lens is covered.
-
-Targets remain: primary≥12fps, no normal stall>500ms, thumbnail age<1.5s;
-LAN physical video latency p95<250ms; Pi CPU/memory each<70%, temperature<75°C,
-`get_throttled=0x0`, no USB reset/power warning. Reconnect is a deliberate outage,
-not a normal-stall sample. Record target misses honestly; do not equate requested
-30fps or two-view measurements with five-view acceptance. Physical video latency
-requires a filmed stopwatch; it is not inferred from HTTP age.
-
-Stop with **Ctrl+C in the launcher terminal** (stopping `tail` does not stop
-the viewer). Expect `CAMERA_CLEANUP_ERRORS=[]`, `CAMERA_EXIT_CODE=0` and no owners:
+3. **Windows browser:** reload `http://192.168.1.134:1984`, existing login (no
+   `--init-auth`). Confirm all five required views are available **before motor
+   power or motion**. Keep the browser visible, normally Forward primary, throughout
+   the session. Do not start recording, a second viewer backend or a host camera.
+4. **Pi SSH terminal B, Bash — motor host.** Only after the view check, enable the
+   established follower/body and designated leader supplies. This command can
+   home/move the lift immediately; the operator must be ready. The helper uses
+   `/home/pickmanmike/lerobot_alohamini/.venv/bin/python` and its own source root:
 
 ```bash
-fuser /dev/v4l/by-path/*usb-*-video-index0
-# No PID output is the expected released state (fuser exits 1).
-vcgencmd get_throttled
+cd /home/pickmanmike/lerobot_alohamini
+test "$(git rev-parse HEAD)" = 7badafdf4347cc1154c43f02fb6f6953d91053a0 || exit 2
+./tools/run_am1_host.sh --mode local
 ```
 
-Collect the exact log on Windows PowerShell (no credentials/images/config in Git):
+5. **Pi SSH terminal C, Bash — read-only readiness/log view.** Paste the exact
+   `HOST_LOG` printed by terminal B; this is only a file reader:
+
+```bash
+read -r -p 'Paste the exact HOST_LOG path: ' AM1_LOG
+tail -n +1 -F -- "$AM1_LOG" | grep --line-buffered -E 'operational_ready|HOST CADENCE|temperature_warning|shutdown_verified|HOST_EXIT_CODE|Traceback|Refusal|Error'
+```
+
+   Observe actual-bottom home and approximately 10 mm relief, then wait for
+   `operational_ready` and the first `[HOST CADENCE]`. The full raw log remains
+   saved; filtered output is not substitute evidence. Do not continue on a fault.
+6. **Windows PowerShell 7 — existing Local worktree/helper/config.** Existing
+   Python is `C:\Users\pickm\lerobot_alohamini_client\.venv\Scripts\python.exe`;
+   the helper supplies source `PYTHONPATH`, validates calibration and resolves
+   the existing PnP map. Do not substitute historical COM numbers:
 
 ```powershell
-$cameraLog = Read-Host 'Paste exact Pi CAMERA_LOG path'
-scp "am1-pi:$cameraLog" "$HOME\AlohaMini1Logs\"
-if ($LASTEXITCODE -ne 0) { throw 'Camera log copy failed' }
+Set-Location 'C:\Users\pickm\lerobot_alohamini_client\.worktrees\am1-local-mode'
+if ((git rev-parse HEAD) -ne 'a0ffbb5820162584efe3118f858f1a8f6b759e08') { throw 'Unexpected Local source head' }
+.\tools\run_am1.ps1 -Mode Local -ConfigPath 'C:\Users\pickm\lerobot_alohamini_client\.worktrees\am1-base-teleop\config\am1.local.json'
 ```
 
-Stop/refuse at wrong labels, auth bypass, exposed administration, stale view
-shown fresh, capture contention, resource/USB/power faults or failed cleanup.
-Use the documented µStreamer fallback only if required viewer paths cannot
-coexist with security or reconnect requirements. Do not change motor software.
+   Hold leaders still and release all movement keys through exact uppercase
+   `SYNC`, synchronization (120 s requested, possibly longer), and the post-sync
+   Enter/alignment gate. Wait for `TELEOPERATION ACTIVE` before ordinary motion.
+   While still paused, save a browser-diagnostics/time baseline; note the actual
+   live-start and Q times separately. Do not call page-wide maxima live-only.
+   The existing helper then bounds **live** operation to 30 s at 10 Hz; startup
+   and operator waits are not part of those 30 s. Make small representative
+   bimanual movements, briefly W/release, U/release, then J/release while staying
+   above the unchanged 5 mm descent floor. This samples co-load, not every joint
+   or direction. After each release require prompt visible stopping before the
+   next input; if motion continues, press Q/use the prepared disconnect and do
+   not continue. Keep the browser visible; return focus to the client before
+   using keys. Release inputs before any focus change. Press Q before expiry;
+   otherwise the existing 30 s limit ends live mode. Q does not stop the Pi host.
+7. **Shutdown, in this order:** after Q and Windows exit 0, copy browser
+   diagnostics while the viewer is still running. Safely support carriage/arms,
+   then Ctrl+C in **terminal B**, not the separate tail. Retain `shutdown_verified`
+   and `HOST_EXIT_CODE=0` from the saved host log; remove motor power. Stop the
+   tail with Ctrl+C in C, then stop the camera viewer with Ctrl+C in A. Expect
+   `CAMERA_CLEANUP_ERRORS=[]`, `CAMERA_EXIT_CODE=0`. No extra 60 s idle or motor
+   direction suite is requested. On unsafe behavior use the prepared physical
+   disconnect; do not reach into moving mechanisms or retry automatically.
+
+Automatic logs (retain exact printed paths, outside Git):
+
+- Pi camera: `/home/pickmanmike/AlohaMini1Logs/am1-camera-<timestamp>-<suffix>.log`.
+- Pi motor: `/home/pickmanmike/AlohaMini1Logs/am1-local-host-<timestamp>.log`.
+- Windows: `C:\Users\pickm\AlohaMini1Logs\am1-local-windows-<timestamp>.log`.
+
+After shutdown, optional single PowerShell fetch of the two exact Pi logs:
+
+```powershell
+$cameraLog = Read-Host 'Paste exact CAMERA_LOG path'
+$motorLog = Read-Host 'Paste exact HOST_LOG path'
+scp "am1-pi:$cameraLog" "am1-pi:$motorLog" 'C:\Users\pickm\AlohaMini1Logs\'
+if ($LASTEXITCODE -ne 0) { throw 'Log copy failed; retain original Pi logs' }
+```
+
+**Assess together:** healthy required views before motion and throughout the live
+interval; no normal video stall over 500 ms; no stale required thumbnail over
+1.5 s; approximately 10 Hz live action delivery, fresh observations, no terminal
+stale latch, no live host command-watchdog event; release/Q stopping and clean
+host/viewer cleanup. Record browser counter deltas only with a measured browser
+interval; page maxima can include startup/sync. Use client live markers/cadence
+and host command sequence/gap evidence to separate startup/operator waits and
+expected post-Q watchdog zero from a live fault. Do not assume PC/Pi clock offset.
+Keep approved isolated numeric-temperature warnings distinct from genuine
+faults; no threshold changes. Any genuine motor/transport/power/USB fault, lost
+required view or failed stopping/cleanup ends the check. No automatic resume.
+
+Physical video latency and full resource headroom remain unmeasured, not inferred
+from this short packet. No recording, boot service, remote access, browser motor
+controls, new dependencies, capture format or backend change is authorized here.
+Authentication, administrative-route denial and native-frame freshness protections
+remain required. The original physical-latency/resource targets remain targets,
+not measured passes or new benchmark prerequisites for this proposed scope.
 
 ## Direct verification — two confirmed views only
 
@@ -264,8 +374,8 @@ No camera controls or motor code were changed to obtain the pass.
 
 These measurements are not five-camera, bright-scene stress, browser latency,
 physical reconnect or camera-plus-motion acceptance. Those role labels were
-subsequently supplied (see the final mapping above); the single human
-viewing/reconnect session remains open. No raw image, real device map, secret
+subsequently supplied (see the final mapping and cumulative evidence above).
+No raw image, real device map, secret
 or raw log is public.
 
 Independent review found that producer status alone could hide a stalled primary
@@ -297,10 +407,9 @@ Five regressions initially failed (delayed-status cancellation, repeated primary
 sequence, repeated snapshot sequence, unmapped labeling and missing diagnostics).
 Review then reproduced a longer-delay boundary; an additional RED/GREEN test
 includes successful1s responses **plus** the real250ms post-response delay.
-Fresh positive viewing and the original negative cases pass. Real LAN browser
-measurements and final five-role/reconnect acceptance must be recorded separately
-on PR#6; offline tests and command-line source throughput cannot substitute for
-them. Motor readiness from PR#5 remains closed.
+Fresh positive viewing and the original negative cases pass. Later real LAN
+viewing evidence is recorded above; offline tests and source throughput alone
+do not establish browser or hot-plug acceptance. Motor readiness from PR#5 remains closed.
 
 ## Five-source identification run and rotation verification
 
@@ -319,7 +428,7 @@ requested rotations are operator observations. Browser-only rotation regressions
 first failed on missing schema/status/image metadata, then passed. A real
 browser using synthetic640×480 orientation cards and the actual stylesheet
 verified0/90/180/270 directions, full-frame fit and unrotated labels. That offline
-check does not substitute for the next normal-mode physical viewing check.
+check is separate from the later operator viewing evidence recorded above.
 
 The subsequent operator log `am1-camera-20260920-143700-7gcCfu.log` at80986427
 has199 status records through214.719s; source interruptions match USB events
@@ -352,6 +461,8 @@ Hardware-free tests use fake JPEG parts and loopback HTTP only. They cover
 role/path binding, auth/route/method/query denial, frame freshness, displayed
 thumbnail freshness, disconnect isolation, owned-child cleanup, primary-error
 preservation, local private credentials, config-only execution and the launcher.
-Current focused count: **32 Python tests and 21 Node/browser-logic tests**. Compilation,
-hardware-free help/import, Bash/JS syntax and diff checks pass. No robot suite,
-dependency installation or motor access is part of these checks.
+Existing runtime evidence: **32 Python tests and 21 Node/browser-logic tests**
+passed in the prior camera verification, along with compilation, hardware-free
+help/import and Bash/JS syntax checks. CAMERA-CLOSE / COUSE-PREP changes only this
+Markdown runbook and PR text: documentation/reference/diff checks only, no fresh
+runtime-test claim, motor suites, dependency installation or hardware execution.
