@@ -88,7 +88,9 @@ class FrameStore:
         self.arrivals = deque(maxlen=151)
 
     def publish(self, jpeg):
-        if not 4 <= len(jpeg) <= MAX_JPEG or not jpeg.startswith(b"\xff\xd8") or not jpeg.endswith(b"\xff\xd9"):
+        # These UVC cameras pad native JPEG payloads to an 8-byte boundary.
+        # Accept only EOI plus at most seven zero bytes; preserve the entire payload.
+        if not 4 <= len(jpeg) <= MAX_JPEG or not jpeg.startswith(b"\xff\xd8") or not jpeg[-9:].rstrip(b"\0").endswith(b"\xff\xd9"):
             raise ValueError("Invalid or oversized JPEG frame")
         now = self.clock()
         with self.condition:

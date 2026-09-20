@@ -116,6 +116,18 @@ class CameraCoreTests(unittest.TestCase):
                 store.publish(data)
         self.assertEqual(store.status()["sequence"], 0)
 
+    def test_native_uvc_zero_alignment_padding_is_preserved_without_reencoding(self):
+        # Observed native camera JPEGs end with EOI followed by 0–7 alignment zeros.
+        store = self.viewer.FrameStore()
+        for count in range(8):
+            payload = JPEG + b"\0" * count
+            store.publish(payload)
+            self.assertEqual(store.snapshot()[0], payload)
+        for trailer in [b"garbage", b"\0" * 8, b"\0x\0"]:
+            with self.assertRaises(ValueError):
+                store.publish(JPEG + trailer)
+        self.assertEqual(store.status()["sequence"], 8)
+
     def test_metrics_measure_delivered_frames_and_do_not_retain_unbounded_history(self):
         now = [0.0]
         store = self.viewer.FrameStore(clock=lambda: now[0])
