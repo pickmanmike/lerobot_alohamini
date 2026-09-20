@@ -581,18 +581,23 @@ def main():
 
     except KeyboardInterrupt:
         interrupted_motor_io = True
-        print("Keyboard interrupt received. Exiting...")
+        try:
+            print("Keyboard interrupt received. Exiting...")
+        except BaseException as error:
+            primary_error = error
     except BaseException as error:
         interrupted_motor_io = True
         primary_error = error
     finally:
-        print("Shutting down AlohaMini Host.")
-        if args.profile_cadence:
-            try:
-                print_cadence_report(command_state)
-            except Exception:
-                logging.exception("Failed to emit final host cadence report.")
         cleanup_errors: list[tuple[str, BaseException]] = []
+        # Local mode writes directly to its log file. A failed/full sink must
+        # remain an error, but reporting it must never bypass motor cleanup.
+        try:
+            print("Shutting down AlohaMini Host.")
+            if args.profile_cadence:
+                print_cadence_report(command_state)
+        except BaseException as error:
+            cleanup_errors.append(("shutdown reporting", error))
         try:
             if robot.is_connected:
                 robot.disconnect(recover_interrupted_bus_io=interrupted_motor_io)

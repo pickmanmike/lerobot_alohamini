@@ -260,7 +260,27 @@ printf 'HOST_LOG=%s\n' "$log_path" | tee "$log_path" || {
     exit $?
 }
 
+if [[ "$mode" == "local" ]]; then
+    printf 'Local monitoring logs directly to disk, not through this terminal.\nView in a separate terminal: tail -n 5 -F %q\nUse Ctrl+C HERE for host shutdown; stopping the viewer does not stop the host.\n' "$log_path" || exit 2
+fi
+
 set +e
+if [[ "$mode" == "local" ]]; then
+    # A paused/closed SSH viewer must not block the motor owner or its watchdog.
+    # Keep the host foreground (stdin and Ctrl+C); a separate tail is only a viewer.
+    # No pipe, queue, background owner, or terminal write during control/cleanup.
+    PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$repository_root/src" "${command[@]}" >> "$log_path" 2>&1
+    host_exit=$?
+    printf 'HOST_EXIT_CODE=%s\n' "$host_exit" >> "$log_path"
+    exit_log_exit=$?
+    if ((host_exit != 0)); then
+        exit "$host_exit"
+    fi
+    # A failed log append is not a successful session, even if the host returned 0.
+    ((exit_log_exit == 0)) || exit 2
+    exit 0
+fi
+
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$repository_root/src" "${command[@]}" 2>&1 | tee -i -a "$log_path"
 pipeline_status=("${PIPESTATUS[@]}")
 host_exit=${pipeline_status[0]}

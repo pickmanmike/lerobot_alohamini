@@ -95,6 +95,7 @@ class OperationalLift(InstalledLiftCheck):
         # A gross current fault is never subject to the temperature window.
         self.monitor.immediate_current_abort_ma = 2000.0
         self.last_record: dict[str, Any] | None = None
+        self.last_emit_ms = 0.0
         self.height_mm = 0.0
         self._last_warning = -math.inf
         self._last_goal = 0
@@ -226,7 +227,11 @@ class OperationalLift(InstalledLiftCheck):
                 self._check_idle(record)
             elif now - self._goal_since >= feedback.STATIONARY_WINDOW_S and goal * record["present_velocity_raw"] < -abs(goal) * feedback.STILL_VELOCITY_RAW:
                 self.refuse(record, "live: unexpected lift motion direction.")
-            self.emit(record)
+            emit_started = time.monotonic()
+            try:
+                self.emit(record)
+            finally:
+                self.last_emit_ms = (time.monotonic() - emit_started) * 1000
         except BaseException as error:
             self.failure = error
             raise

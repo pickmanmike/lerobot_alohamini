@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import logging
 import sys
 import time
@@ -826,7 +827,23 @@ class AlohaMini(Robot):
         obs_dict = {**left_arm_state, **right_arm_state,**base_vel}
         operation = getattr(self, "_lift_operation", None)
         if operation is not None:
-            operation.contribute_observation(obs_dict)
+            try:
+                operation.contribute_observation(obs_dict)
+            except BaseException as error:
+                # Fault-only in-memory evidence: do not print or perform another
+                # serial read here. Preserve the original refusal through cleanup.
+                sample = getattr(operation, "last_record", None) or {}
+                sampled_at = sample.get("sample_monotonic_s")
+                error.add_note("AM1 observation freshness context: " + json.dumps({
+                    "lift_sample_age_ms": None if sampled_at is None else round(
+                        (time.monotonic() - sampled_at) * 1000, 3
+                    ),
+                    "lift_emit_ms": round(getattr(operation, "last_emit_ms", 0.0), 3),
+                    "left_arm_ms": round((left_arm_done_t - observation_start_t) * 1000, 3),
+                    "base_ms": round((base_done_t - left_arm_done_t) * 1000, 3),
+                    "right_arm_ms": round((right_arm_done_t - base_done_t) * 1000, 3),
+                }, separators=(",", ":")))
+                raise
         else:
             self.lift.contribute_observation(obs_dict)
         lift_done_t = time.perf_counter()
