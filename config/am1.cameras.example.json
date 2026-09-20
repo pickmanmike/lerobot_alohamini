@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "bind": "192.168.1.134",
+  "port": 1984,
+  "cameras": {
+    "forward": "/dev/am_camera_forward",
+    "backward": "/dev/am_camera_backward",
+    "chest": "/dev/am_camera_chest",
+    "wrist_left": "/dev/am_camera_wrist_left",
+    "wrist_right": "/dev/am_camera_wrist_right"
+  }
+}
