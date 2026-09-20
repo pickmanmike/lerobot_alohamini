@@ -191,14 +191,14 @@ class CameraHTTPTests(unittest.TestCase):
         return result
 
     def test_all_viewer_paths_require_credentials_including_loopback(self):
-        for path in ["/", "/app.js", "/style.css", "/status.json", "/api/frame.jpeg?src=forward"]:
+        for path in ["/", "/app.js", "/freshness.js", "/mjpeg.js", "/style.css", "/status.json", "/api/frame.jpeg?src=forward"]:
             with self.subTest(path=path):
                 status, headers, _ = self.request(path, auth=False)
                 self.assertEqual(status, 401)
                 self.assertIn("Basic", headers["WWW-Authenticate"])
 
     def test_static_status_and_native_snapshot_work_without_exposing_paths_or_credentials(self):
-        for path in ["/", "/app.js", "/style.css"]:
+        for path in ["/", "/app.js", "/freshness.js", "/mjpeg.js", "/style.css"]:
             self.assertEqual(self.request(path)[0], 200)
         status, headers, body = self.request("/status.json")
         self.assertEqual(status, 200)

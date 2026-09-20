@@ -259,6 +259,7 @@ class ViewerHandler(BaseHTTPRequestHandler):
         assets = {"/": ("index.html", "text/html; charset=utf-8"),
                   "/app.js": ("app.js", "text/javascript; charset=utf-8"),
                   "/freshness.js": ("freshness.js", "text/javascript; charset=utf-8"),
+                  "/mjpeg.js": ("mjpeg.js", "text/javascript; charset=utf-8"),
                   "/style.css": ("style.css", "text/css; charset=utf-8")}
         if target.path in assets:
             if target.query:

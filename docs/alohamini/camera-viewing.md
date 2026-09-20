@@ -42,8 +42,12 @@ Do not change motor-controller aliases. Template: `config/am1.cameras.example.js
   Capture requests native MJPG640×480@30; displayed fps is measured delivery.
 - Freshness advances only on a complete new upstream multipart frame. A new
   HTTP request does not refresh a cached image. Gateway frames older than500ms
-  are refused; disconnected streams are stale immediately. The browser hides
-  stale views and snapshots older than1.5s. This is gateway arrival freshness,
+  are refused; disconnected streams are stale immediately. The browser consumes
+  native multipart JPEG, retains only the latest candidate while decoding and
+  advances a separate image clock only after successful browser decode. It hides
+  a primary image older than500ms and thumbnails older than1.5s, even while status
+  continues advancing. Stalled primary consumption is aborted/reconnected.
+  Footer age is the image's gateway age plus measured receive/decode delay,
   **not measured physical scene-to-display latency**.
 - Basic authentication is not encryption: trusted LAN only. No public route,
   Cloudflare, firewall changes, boot service, recording or browser motion.
@@ -133,6 +137,46 @@ shown fresh, capture contention, resource/USB/power faults or failed cleanup.
 Use the documented µStreamer fallback only if required viewer paths cannot
 coexist with security or reconnect requirements. Do not change motor software.
 
+## Direct verification — two confirmed views only
+
+Tested runtime `4da5a8c7d90d2dd5c7e0e2f168ed72f7a9aed5b8`, go2rtc1.9.14.
+Private log `am1-camera-20260920-002144-jWHjTm.log` is in `AlohaMini1Logs` on
+both machines. The helper ran45s; the measurement consumed forward MJPEG plus
+chest snapshots requested at2Hz for30s. It did not physically unplug a camera.
+
+| Check | Measured result |
+|---|---|
+| Capture/delivery | Native640×480 MJPG, 30fps requested; both≈15fps delivered |
+| Primary consumer | 454 frames, 15.000fps, maximum inter-frame gap68.545ms |
+| Auth/required routes | Dashboard, JS/CSS, status, snapshots and MJPEG work; no credentials →401 (including a Windows LAN request) |
+| Denial | Authenticated admin/config/streams/restart/log/debug/WebSocket/discovery paths →404; mutation methods →403; nonconfigured/arbitrary source queries denied |
+| Backend | Loopback1985 only; local authentication required, administration routes404; no8554/8555 listeners |
+| Freshness | Complete multipart-arrival sequence/time; latest-only snapshot cannot extend source freshness; all sampled steady-state views fresh |
+| Two-source JPEG payload | Approximately14.88Mb/s during the30s sample; not interface overhead or five-camera bandwidth |
+| Pi resources | Aggregate CPU≈2.14% averaged over measured interval; available-memory endpoint implies≈16.6% used; maximum sampled SoC47.95°C |
+| USB/power | `throttled=0x0`; no new kernel entries in the bounded check window |
+| Cleanup | `CAMERA_CLEANUP_ERRORS=[]`, `CAMERA_EXIT_CODE=0`; no camera owners; both viewer listeners gone |
+
+The first reader attempt (`am1-camera-20260920-001738-4zeIZi.log`) exposed a
+camera-only parser defect: valid native JPEGs have0–7 zero alignment bytes after
+EOI. A focused failing test reproduced it; the fix accepts only that bounded
+padding, preserves the original bytes, and still rejects missing EOI/garbage.
+No camera controls or motor code were changed to obtain the pass.
+
+These measurements are not five-camera, bright-scene stress, browser latency,
+physical reconnect or camera-plus-motion acceptance. The last three role labels,
+semantic udev rule installation and the single human viewing/reconnect session
+remain open. No raw image, real device map, secret or raw log is public.
+
+Independent review found that producer status alone could hide a stalled primary
+HTTP stream. The follow-up uses a decoded-image clock for both primary and
+thumbnails, aborts stalled primary consumption, and reports the image's age.
+Five initially failing browser regressions now pass, including advancing status
+with frozen delivery, failed thumbnail decode and fragmented multipart input.
+The real browser rendered the two saved private JPEG stills and swapped primary
+views in a loopback-only synthetic fixture. That verifies native padded-JPEG
+decoding/UI wiring, not current physical views or delivery-rate acceptance.
+
 ## Focused software checks
 
 Use the existing environment; no dependency install or motor test suite:
@@ -148,3 +192,6 @@ Hardware-free tests use fake JPEG parts and loopback HTTP only. They cover
 role/path binding, auth/route/method/query denial, frame freshness, displayed
 thumbnail freshness, disconnect isolation, owned-child cleanup, primary-error
 preservation, local private credentials, config-only execution and the launcher.
+Final focused count: **28 Python tests and 8 Node/browser-logic tests**. Compilation,
+hardware-free help/import, Bash/JS syntax and diff checks pass. No robot suite,
+dependency installation or motor access is part of these checks.
