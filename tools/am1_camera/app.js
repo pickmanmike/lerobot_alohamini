@@ -41,6 +41,8 @@ function noteProgress(role, kind, sequence) {
 }
 function paint(tile, role, thumbnail = false) {
   const state = AM1FrameState(latest?.cameras[role], reportAt, performance.now(), displayed.get(thumbnail ? role : "primary"), thumbnail, statusReceivedAt);
+  const rotation = latest?.cameras[role]?.rotation_degrees;
+  tile.querySelector("img").dataset.rotation = String([0, 90, 180, 270].includes(rotation) ? rotation : 0);
   tile.classList.toggle("fresh", state.state === "fresh");
   tile.querySelector("strong").textContent = labels[role];
   tile.querySelector("span").textContent = state.state === "fresh" ? `${state.fps.toFixed(1)} fps source · image ${Math.round(state.age_ms)} ms${state.status_uncertain ? " · status uncertain" : ""}` : state.state;

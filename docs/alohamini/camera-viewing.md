@@ -5,22 +5,35 @@ CAMERA-VIEW1 starts from `integrate/am1-local-teleop` at
 Local-motion, idle and shutdown milestones remain closed. This packet does
 not change motor code or qualify simultaneous camera/motor load.
 
-## Current identity gate
+## Confirmed identities and display orientation
 
-Five capture devices are present. The operator confirmed preview 1 = forward
-and preview 2 = chest, and then confirmed preview3 = right wrist from the
-refreshed image. CAMERA-VIEW2 refreshed previews 3–5 directly from their
-verified capture-index0 paths, independently of the semantic role map. Preview3
-is a blurred nearby surface; previews4/5 are nearly black. Backward and left
-wrist roles are **unassigned**, not inferred. Exact USB paths and the new images
-are private under `AlohaMini1Logs/am1-camera-view2-90rYqE` on Windows/Pi.
+The operator identified all five numbered live views on September 20. This
+final mapping **supersedes the earlier preview3 = right wrist identification**:
+
+| Numbered source | Semantic role | Browser image rotation |
+|---|---|---|
+| Camera1 | forward (front) | 180 degrees |
+| Camera2 | chest | 180 degrees |
+| Camera3 | wrist_left (left hand) | 90 degrees clockwise |
+| Camera4 | backward (rear) | 180 degrees |
+| Camera5 | wrist_right (right hand) | 90 degrees counterclockwise |
+
+Exact USB paths, household images and private maps remain outside Git.
 All share `SN0001`; use measured `ID_PATH` plus capture index 0, not that serial
 or unstable `/dev/videoN` numbering. Metadata index 1 is not a capture device.
 
-Partial maps are supported so the three confirmed views are useful now.
-Five-camera acceptance remains pending all roles and the human reconnect check.
-Camera-only semantic udev rules are approved but held until mapping is complete;
-the current private map uses persistent `/dev/v4l/by-path/*-video-index0` links.
+Both private maps retain those measured paths; the normal map now contains all
+five semantic roles. Optional `rotations` stores clockwise integer degrees
+0/90/180/270 for configured roles only (omitted means0). Thus right wrist uses270.
+The browser applies rotation to **images only**, in primary and thumbnail views;
+labels stay upright, quarter turns fit without cropping. Native640×480 JPEGs,
+snapshot API data, capture settings and go2rtc configuration are unchanged.
+This is display orientation, not an image-processing or recording transform.
+
+Five-camera acceptance still needs the single human label/orientation,
+switching and reconnect check below. Additional semantic udev rules are not
+needed for this session: the private map already uses persistent
+`/dev/v4l/by-path/*-video-index0` links.
 Do not change motor-controller aliases. Template: `config/am1.cameras.example.json`.
 An unassigned role tile is not an image from one of the unassigned cameras.
 Use the numbered private previews to identify those devices. If still too dark,
@@ -29,15 +42,16 @@ same allowlisted captures. The dashboard distinguishes unassigned roles from
 mapped-but-unavailable/stale feeds. A genuinely dark decoded live image remains
 visible as camera data; darkness is not inferred to mean disconnection.
 
-### Live numbered focus/identification (current next step)
+### Optional numbered focus/identification
 
 The operator needs live images to adjust the lenses physically. Opt-in
 `--identify` reuses this gateway, authentication, acquisition owner and freshness
 logic. It loads **separate** private `~/.config/am1-camera/identification.json`,
 with fixed `preview_1` through `preview_5` keys and verified capture-index0
-by-paths only. It cannot mix semantic roles into that map. The page labels are
-**Camera1–5**, not guessed body roles. No paths, credentials or lens controls
-are exposed in the browser. The ordinary `cameras.json` retains confirmed roles.
+by-paths only. It cannot mix semantic roles into that map. The page labels remain
+**Camera1–5**. No paths, credentials or lens controls are exposed in the browser.
+The ordinary `cameras.json` retains confirmed roles; each private map carries
+the equivalent display rotations. Use normal mode for the next acceptance.
 
 With motor/leader supplies off and no other camera owner, Pi Bash:
 
@@ -49,18 +63,17 @@ bash tools/run_am1_camera.sh --identify
 ```
 
 Windows browser: open `http://192.168.1.134:1984` with the **existing** login.
-Reload after changing viewer mode. Select Camera4, then Camera5 as primary to
-adjust focus/lighting by hand without powering motors. Return their two physical
-roles in one response. Camera1=forward,2=chest,3=right wrist remain confirmed.
+Reload after changing viewer mode. Select the desired numbered camera as primary
+to adjust focus/lighting by hand without powering motors; identities are now
+known and do not need another identification round.
 If a feed is stale/unavailable, focus adjustment cannot fix it: preserve browser
 diagnostics and the printed log. Do not mistake a genuinely dark live feed for
 an unmapped placeholder. Ctrl+C in the launcher stops this identification view;
 do not run it concurrently with the ordinary viewer. Existing runtime logs and
 cleanup checks below apply unchanged.
 
-After identifying4/5, update the private semantic map, then perform the single
-five-label switching/reconnect acceptance below. No semantic udev rule or role
-is guessed to bypass the identification gate.
+Do not run both viewer modes concurrently. The single normal-mode acceptance
+below replaces further identification captures.
 
 ## Small isolated data path
 
@@ -125,13 +138,16 @@ back up a prior private map locally rather than silently replacing it.
 `--check` validates the private schema without opening cameras. At startup,
 paths must resolve to distinct index0 V4L2 character devices, owners and motor
 host must be absent, and the backend binary hash must match the pin.
+For display-only orientation, add the optional `rotations` object to the private
+map after backup, e.g. `"rotations": {"wrist_left": 90, "wrist_right": 270}` when
+both roles are configured. Values are clockwise degrees, not camera controls.
 
 ## One next human viewing session (not a motor test)
 
 Keep all follower/body and leader motor supplies **OFF**, host stopped, USB
-camera power on. Uncover/illuminate the three unidentified cameras and supply
-their roles before claiming five-view acceptance. Do not unplug a motor USB
-controller. No reboot or motor retest is required.
+camera power on. All five roles have been supplied; verify their labels and
+orientation in normal mode. Do not unplug a motor USB controller. No reboot or
+motor retest is required.
 
 Pi SSH terminal, Bash:
 
@@ -151,7 +167,7 @@ The foreground helper prints the exact `CAMERA_LOG` under
 Runtime output goes directly to that file, not through the SSH terminal.
 Optional separate read-only log view: `tail -n 3 -F <exact CAMERA_LOG>`.
 
-For two minutes: confirm labels, click each mapped tile into primary, and
+For two minutes: confirm labels and upright views, click each mapped tile into primary, and
 record observed fps/freshness. Expand **Browser delivery diagnostics**: status
 request last/max duration, request failures, per-role primary received/displayed
 counts and maximum gaps, decode failures and last stream-cancellation reason.
@@ -219,9 +235,10 @@ padding, preserves the original bytes, and still rejects missing EOI/garbage.
 No camera controls or motor code were changed to obtain the pass.
 
 These measurements are not five-camera, bright-scene stress, browser latency,
-physical reconnect or camera-plus-motion acceptance. The last three role labels,
-semantic udev rule installation and the single human viewing/reconnect session
-remain open. No raw image, real device map, secret or raw log is public.
+physical reconnect or camera-plus-motion acceptance. Those role labels were
+subsequently supplied (see the final mapping above); the single human
+viewing/reconnect session remains open. No raw image, real device map, secret
+or raw log is public.
 
 Independent review found that producer status alone could hide a stalled primary
 HTTP stream. The follow-up uses a decoded-image clock for both primary and
@@ -257,6 +274,25 @@ measurements and final five-role/reconnect acceptance must be recorded separatel
 on PR#6; offline tests and command-line source throughput cannot substitute for
 them. Motor readiness from PR#5 remains closed.
 
+## Five-source identification run and rotation verification
+
+Complete private log `am1-camera-20260920-133204-BLAPj2.log` exercised
+`8c277dd6a9e424a0924d3025b90f5cc32a32d7b0`, numbered mode, pinned go2rtc1.9.14.
+It contains250 source-status records through269.563s. All five were fresh by
+3.259s and stayed fresh in the remaining248 samples, with strictly advancing
+sequences. Final rolling fps for1–5:14.966,19.941,19.943,14.979,14.967; maximum
+source gaps:69.366,68.547,69.466,70.128,69.967ms. Sources2/3 changed between
+roughly15 and20fps during this run without a freshness loss. Requested30fps
+is not a delivered-rate claim. Stop requested, cleanup[], exit0.
+
+This log supports five-source acquisition and cleanup, not browser decoding,
+display orientation, physical latency or reconnect. Physical identities and
+requested rotations are operator observations. Browser-only rotation regressions
+first failed on missing schema/status/image metadata, then passed. A real
+browser using synthetic640×480 orientation cards and the actual stylesheet
+verified0/90/180/270 directions, full-frame fit and unrotated labels. That offline
+check does not substitute for the next normal-mode physical viewing check.
+
 ## Focused software checks
 
 Use the existing environment; no dependency install or motor test suite:
@@ -272,6 +308,6 @@ Hardware-free tests use fake JPEG parts and loopback HTTP only. They cover
 role/path binding, auth/route/method/query denial, frame freshness, displayed
 thumbnail freshness, disconnect isolation, owned-child cleanup, primary-error
 preservation, local private credentials, config-only execution and the launcher.
-Current focused count: **31 Python tests and 19 Node/browser-logic tests**. Compilation,
+Current focused count: **32 Python tests and 21 Node/browser-logic tests**. Compilation,
 hardware-free help/import, Bash/JS syntax and diff checks pass. No robot suite,
 dependency installation or motor access is part of these checks.

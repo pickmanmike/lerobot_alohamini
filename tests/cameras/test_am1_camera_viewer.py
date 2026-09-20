@@ -107,6 +107,18 @@ class CameraCoreTests(unittest.TestCase):
         self.assertEqual(config["rtsp"]["listen"], "")
         self.assertEqual(config["webrtc"]["listen"], "")
 
+    def test_view_rotations_are_optional_validated_and_do_not_change_native_capture(self):
+        original = self.viewer.backend_config(self.config, "test-backend-password")
+        for angle in (0, 90, 180, 270):
+            with self.subTest(angle=angle):
+                rotated = self.viewer.validate_config({**self.config,"rotations":{"forward":angle}})
+                self.assertEqual(rotated["rotations"], {"forward":angle})
+                self.assertEqual(self.viewer.backend_config(rotated,"test-backend-password"),original)
+        for rotations in ({"missing":90},{"forward":45},{"forward":True},
+                          {"forward":"90"},{"forward":90.0},{"forward":-90},None,[]):
+            with self.subTest(rotations=rotations), self.assertRaises(ValueError):
+                self.viewer.validate_config({**self.config,"rotations":rotations})
+
     def test_freshness_comes_from_new_frames_not_snapshot_requests(self):
         now = [10.0]
         store = self.viewer.FrameStore(clock=lambda: now[0])
@@ -233,6 +245,7 @@ class CameraHTTPTests(unittest.TestCase):
         report = json.loads(body)
         self.assertEqual(report["cameras"]["forward"]["state"], "fresh")
         self.assertEqual(report["cameras"]["backward"]["state"], "unavailable")
+        self.assertEqual(report["cameras"]["forward"].get("rotation_degrees"), 0)
         self.assertNotIn(b"password", body)
         self.assertNotIn(b"/dev/", body)
         status, headers, body = self.request("/api/frame.jpeg?src=forward&cache=500ms")
@@ -446,7 +459,8 @@ class CameraLifecycleTests(unittest.TestCase):
         # Exercise the real run_viewer -> server -> routes, replacing acquisition only.
         import tempfile
         config = {"version":1,"bind":"127.0.0.1","port":0,
-                  "cameras":{"preview_4":"/dev/v4l/by-path/usb-4-video-index0"}}
+                  "cameras":{"preview_4":"/dev/v4l/by-path/usb-4-video-index0"},
+                  "rotations":{"preview_4":90}}
         real_make_server = self.viewer.make_server
         observations = []
         def make_server(*args):
@@ -489,6 +503,7 @@ class CameraLifecycleTests(unittest.TestCase):
         self.assertIn(b'data-identification="true"',observations[1][3])
         self.assertEqual(set(json.loads(observations[2][3])["cameras"]),
                          {"preview_1","preview_2","preview_3","preview_4","preview_5"})
+        self.assertEqual(json.loads(observations[2][3])["cameras"]["preview_4"].get("rotation_degrees"),90)
         self.assertEqual(observations[3][3],JPEG)
         child.terminate.assert_called_once()
 

@@ -35,8 +35,9 @@ BINARY_SHA256 = "359fabade8a7a51e81a55fe6df6b0ef81764a5e1d63179577534eaaa71904b5
 
 
 def validate_config(config, identify=False):
-    if not isinstance(config, dict) or set(config) != {"version", "bind", "port", "cameras"}:
-        raise ValueError("Expected version, bind, port and cameras only")
+    required = {"version", "bind", "port", "cameras"}
+    if not isinstance(config, dict) or not required <= set(config) or set(config) - required - {"rotations"}:
+        raise ValueError("Expected version, bind, port, cameras and optional rotations only")
     if type(config["version"]) is not int or config["version"] != 1:
         raise ValueError("Unsupported camera config version")
     address = ipaddress.IPv4Address(config["bind"])
@@ -56,7 +57,15 @@ def validate_config(config, identify=False):
             raise ValueError("Only the role's camera alias or capture-index0 by-path identity is allowed")
     if len(set(cameras.values())) != len(cameras):
         raise ValueError("Camera paths must be unique")
-    return {**config, "cameras": dict(cameras)}
+    rotations = config.get("rotations", {})
+    if not isinstance(rotations, dict) or set(rotations) - set(cameras):
+        raise ValueError("Rotations must name configured cameras only")
+    if any(type(angle) is not int or angle not in (0, 90, 180, 270) for angle in rotations.values()):
+        raise ValueError("Rotations must be clockwise integer degrees: 0, 90, 180 or 270")
+    result = {**config, "cameras": dict(cameras)}
+    if "rotations" in config:
+        result["rotations"] = dict(rotations)
+    return result
 
 
 def backend_config(config, password):
@@ -181,9 +190,10 @@ class ViewerServer(ThreadingHTTPServer):
     block_on_close = False
     request_queue_size = 16
 
-    def __init__(self, address, stores, configured, credentials):
+    def __init__(self, address, stores, configured, credentials, rotations=None):
         self.stores = stores
         self.configured = frozenset(configured)
+        self.rotations = dict(rotations or {})
         self.identification = set(stores) == set(PREVIEW_ROLES)
         self.stop_event = threading.Event()
         self.slots = threading.BoundedSemaphore(24)
@@ -280,7 +290,8 @@ class ViewerHandler(BaseHTTPRequestHandler):
                 return
             report = {"format": "MJPG", "width": 640, "height": 480, "requested_fps": 30,
                       "freshness": "complete upstream frame arrival; not HTTP/cache time",
-                      "cameras": {role: {**store.status(), "configured": role in self.server.configured}
+                      "cameras": {role: {**store.status(), "configured": role in self.server.configured,
+                                         "rotation_degrees": self.server.rotations.get(role, 0)}
                                   for role, store in self.server.stores.items()}}
             self.reply(200, json.dumps(report).encode(), "application/json")
             return
@@ -334,8 +345,8 @@ class ViewerHandler(BaseHTTPRequestHandler):
     do_POST = do_PUT = do_PATCH = do_DELETE = do_OPTIONS = do_HEAD = do_TRACE = do_CONNECT = refuse
 
 
-def make_server(address, stores, configured, credentials):
-    return ViewerServer(address, stores, configured, credentials)
+def make_server(address, stores, configured, credentials, rotations=None):
+    return ViewerServer(address, stores, configured, credentials, rotations)
 
 
 def read_connection(connection, role, authorization, store, stop):
@@ -470,7 +481,8 @@ def run_viewer(config, credentials, binary, state_dir, duration=None, identify=F
     workers, server, child, backend_path = [], None, None, None
     primary_failure = False
     try:
-        server = make_server((config["bind"], config["port"]), stores, config["cameras"], credentials)
+        server = make_server((config["bind"], config["port"]), stores, config["cameras"], credentials,
+                             config.get("rotations", {}))
         server.timeout = 0.2
         password = secrets.token_urlsafe(32)
         fd, name = tempfile.mkstemp(prefix="backend-", suffix=".json", dir=state_dir)

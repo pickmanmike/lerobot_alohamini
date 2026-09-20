@@ -51,7 +51,7 @@ test("browser multipart consumer handles fragmented headers and exact native pay
 
 function pageFixture(decodeWorks = true, delayedStatus = false, identify = false) {
   class Element {
-    constructor() { this.parts = new Map(); this.children = []; this.flags = new Set();
+    constructor() { this.parts = new Map(); this.children = []; this.flags = new Set(); this.dataset = {};
       this.classList = {toggle: (key, enabled) => enabled ? this.flags.add(key) : this.flags.delete(key)}; }
     querySelector(key) { if (!this.parts.has(key)) this.parts.set(key, new Element()); return this.parts.get(key); }
     append(value) { this.children.push(value); }
@@ -227,6 +227,40 @@ test("identification displays numbered live sources without assigning physical r
   assert.equal(page.roots.querySelector('#primary').flags.has('fresh'),true);
   assert.equal(page.roots.querySelector('#primary').querySelector('strong').textContent,'Camera 4');
   assert.match(page.roots.querySelector('#view-heading').textContent,/identification/i);
+  vm.runInContext('stopPrimary()',page.context);
+});
+
+test("role rotations follow both thumbnails and primary selection without rotating labels", async () => {
+  const page = pageFixture(true,true); await flush();
+  page.statusRequests[0].reply({forward:{configured:true,state:'fresh',age_ms:10,fps:15,sequence:4,rotation_degrees:180},
+                              wrist_left:{configured:true,state:'fresh',age_ms:10,fps:15,sequence:4,rotation_degrees:90},
+                              wrist_right:{configured:true,state:'fresh',age_ms:10,fps:15,sequence:4,rotation_degrees:270}});
+  await flush();
+  const primary = page.roots.querySelector('#primary');
+  const tiles = page.roots.querySelector('#thumbnails').children;
+  assert.equal(primary.querySelector('img').dataset.rotation,'180');
+  assert.equal(tiles[3].querySelector('img').dataset.rotation,'90');
+  assert.equal(tiles[4].querySelector('img').dataset.rotation,'270');
+  tiles[3].click(); await flush();
+  assert.equal(primary.querySelector('img').dataset.rotation,'90');
+  assert.equal(primary.querySelector('strong').textContent,'Left wrist');
+  tiles[4].click(); await flush();
+  assert.equal(primary.querySelector('img').dataset.rotation,'270');
+  assert.equal(primary.dataset.rotation,undefined,'Labels/whole tile must not rotate');
+  vm.runInContext('stopPrimary()',page.context);
+});
+
+test("numbered preview rotation is display-only and absent rotation defaults to upright", async () => {
+  const page = pageFixture(true,true,true); await flush();
+  page.statusRequests[0].reply({preview_1:{configured:true,state:'fresh',age_ms:10,fps:15,sequence:4},
+                              preview_3:{configured:true,state:'fresh',age_ms:10,fps:15,sequence:4,rotation_degrees:90}});
+  await flush();
+  assert.equal(page.roots.querySelector('#primary').querySelector('img').dataset.rotation,'0');
+  const tile = page.roots.querySelector('#thumbnails').children[2];
+  assert.equal(tile.querySelector('img').dataset.rotation,'90');
+  tile.click(); await flush(); deliver(page,4); await flush(); vm.runInContext('render()',page.context);
+  assert.equal(page.roots.querySelector('#primary').flags.has('fresh'),true);
+  assert.equal(page.roots.querySelector('#primary').querySelector('img').dataset.rotation,'90');
   vm.runInContext('stopPrimary()',page.context);
 });
 
