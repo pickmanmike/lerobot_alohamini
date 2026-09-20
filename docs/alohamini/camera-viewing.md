@@ -8,9 +8,11 @@ not change motor code or qualify simultaneous camera/motor load.
 ## Current identity gate
 
 Five capture devices are present. The operator confirmed preview 1 = forward
-and preview 2 = chest. Previews 3–5 remain too dark to identify; backward and
-both wrist roles are **unassigned**, not inferred. Exact USB paths and images
-are private under `AlohaMini1Logs/am1-camera-discovery-NK2rRDBZ` on Windows/Pi.
+and preview 2 = chest. CAMERA-VIEW2 refreshed previews 3–5 directly from their
+verified capture-index0 paths, independently of the semantic role map. Preview3
+is a blurred nearby surface; previews4/5 are nearly black. Backward and both
+wrist roles are **unassigned**, not inferred. Exact USB paths and the new images
+are private under `AlohaMini1Logs/am1-camera-view2-90rYqE` on Windows/Pi.
 All share `SN0001`; use measured `ID_PATH` plus capture index 0, not that serial
 or unstable `/dev/videoN` numbering. Metadata index 1 is not a capture device.
 
@@ -19,6 +21,12 @@ Five-camera acceptance remains pending all roles and the human reconnect check.
 Camera-only semantic udev rules are approved but held until mapping is complete;
 the current private map uses persistent `/dev/v4l/by-path/*-video-index0` links.
 Do not change motor-controller aliases. Template: `config/am1.cameras.example.json`.
+An unassigned role tile is not an image from one of the unassigned cameras.
+Use the numbered private previews to identify those devices. If still too dark,
+uncover/illuminate the actual lenses with motor power off before refreshing the
+same allowlisted captures. The dashboard distinguishes unassigned roles from
+mapped-but-unavailable/stale feeds. A genuinely dark decoded live image remains
+visible as camera data; darkness is not inferred to mean disconnection.
 
 ## Small isolated data path
 
@@ -47,6 +55,14 @@ Do not change motor-controller aliases. Template: `config/am1.cameras.example.js
   advances a separate image clock only after successful browser decode. It hides
   a primary image older than500ms and thumbnails older than1.5s, even while status
   continues advancing. Stalled primary consumption is aborted/reconnected.
+  Aging status metadata alone does not destroy a fresh decoded frame. It is
+  marked uncertain separately. Status availability uses reply time, independently
+  of conservative request-start source age; failed requests hide the views, with
+  a2s receipt-time ceiling if the polling loop stops (250ms poll delay plus1500ms
+  request timeout and margin). These are **not** relaxed frame-age limits.
+  Repeated sequences cannot renew image clocks. Reload the page after restarting
+  the entire gateway process, whose sequences reset; reconnecting one camera
+  within the same gateway retains its sequence and requires no page reload.
   Footer age is the image's gateway age plus measured receive/decode delay,
   **not measured physical scene-to-display latency**.
 - Basic authentication is not encryption: trusted LAN only. No public route,
@@ -91,20 +107,25 @@ export AM1_CAMERA_PYTHON=/home/pickmanmike/lerobot_alohamini/.venv/bin/python
 git branch --show-current
 git rev-parse HEAD
 bash tools/run_am1_camera.sh --check
-# First use only: enter username/password HERE, hidden locally, never in chat.
-bash tools/run_am1_camera.sh --init-auth
 bash tools/run_am1_camera.sh
 ```
 
-If credentials already exist, omit `--init-auth`; it refuses to overwrite them.
-Open **http://192.168.1.134:1984** in the Windows browser and authenticate.
+Credentials already exist: **do not rerun `--init-auth`**. Open
+**http://192.168.1.134:1984** in the Windows browser and use the existing login.
 The foreground helper prints the exact `CAMERA_LOG` under
 `/home/pickmanmike/AlohaMini1Logs/am1-camera-<timestamp>-<suffix>.log`.
 Runtime output goes directly to that file, not through the SSH terminal.
 Optional separate read-only log view: `tail -n 3 -F <exact CAMERA_LOG>`.
 
 For two minutes: confirm labels, click each mapped tile into primary, and
-record observed fps/freshness. Once all five are mapped, unplug/replug **one
+record observed fps/freshness. Expand **Browser delivery diagnostics**: status
+request last/max duration, request failures, per-role primary received/displayed
+counts and maximum gaps, decode failures and last stream-cancellation reason.
+Compare count deltas over a measured interval with the source fps; received
+frames and decoded/displayed frames are separate evidence. Intentional switching
+increments `role-switch`, not a dropout. These bounded counters are page-local,
+not server logs; capture their text with the matching `CAMERA_LOG`.
+Once all five are mapped, unplug/replug **one
 labeled camera**. Others must stay fresh; that view must visibly become stale
 and recover within10s. No repeated unchanged captures when a lens is covered.
 
@@ -177,6 +198,31 @@ The real browser rendered the two saved private JPEG stills and swapped primary
 views in a loopback-only synthetic fixture. That verifies native padded-JPEG
 decoding/UI wiring, not current physical views or delivery-rate acceptance.
 
+## CAMERA-VIEW2 correction and evidence limits
+
+The complete operator log `am1-camera-20260920-113702-iMMW5j.log` exercised
+`7d7b9cb2b22913613ab679f7d1aa23d3507dc8ea`. It has175 source-status records
+through188.435s. After startup, forward173/173 and chest174/174 samples were
+fresh, about14.97fps; maximum source gaps68.851/68.844ms. Cleanup[], exit0.
+This establishes healthy acquisition, not browser delivery or usable viewing.
+
+The unchanged frontend reproduced a synthetic dropout: a status request begun
+at1000ms returned at1200ms, and a decoded image at1480ms was removed at1500ms
+because the *separate* source-status estimate aged past500ms. The repair keeps
+advancing decoded delivery independent of that clock, exposes uncertainty and
+retains explicit source/status-loss and frozen-image detection. No USB, Wi-Fi,
+camera or go2rtc defect is inferred from this reproduction. Requested30fps is
+unchanged; the measured≈15fps already exceeds the initial12fps target.
+
+Five regressions initially failed (delayed-status cancellation, repeated primary
+sequence, repeated snapshot sequence, unmapped labeling and missing diagnostics).
+Review then reproduced a longer-delay boundary; an additional RED/GREEN test
+includes successful1s responses **plus** the real250ms post-response delay.
+Fresh positive viewing and the original negative cases pass. Real LAN browser
+measurements and final five-role/reconnect acceptance must be recorded separately
+on PR#6; offline tests and command-line source throughput cannot substitute for
+them. Motor readiness from PR#5 remains closed.
+
 ## Focused software checks
 
 Use the existing environment; no dependency install or motor test suite:
@@ -192,6 +238,6 @@ Hardware-free tests use fake JPEG parts and loopback HTTP only. They cover
 role/path binding, auth/route/method/query denial, frame freshness, displayed
 thumbnail freshness, disconnect isolation, owned-child cleanup, primary-error
 preservation, local private credentials, config-only execution and the launcher.
-Final focused count: **28 Python tests and 8 Node/browser-logic tests**. Compilation,
+Current focused count: **28 Python tests and 18 Node/browser-logic tests**. Compilation,
 hardware-free help/import, Bash/JS syntax and diff checks pass. No robot suite,
 dependency installation or motor access is part of these checks.
