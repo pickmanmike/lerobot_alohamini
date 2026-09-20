@@ -61,6 +61,7 @@ STARTUP_SYNC_LEADER_DRIFT = 2.0
 AM1_COMMAND_SEND_TIMEOUT_MS = 50
 AM1_LIVE_OBSERVATION_MAX_AGE_S = 1.0
 AM1_LIFT_ONLY_VELOCITY = 200
+AM1_LOCAL_BODY_MAX_AGE_S = 0.25
 RIGHT_WRIST_FLEX_KEY = "arm_right_wrist_flex.pos"
 
 StartupSyncSide = Literal["left", "right", "both"]
@@ -136,6 +137,50 @@ class AM1LiveActionMailbox:
             return None if self._action is None else dict(self._action)
 
 
+class AM1LiveBodyMailbox:
+    """Keep a complete body command only while its input sample is fresh."""
+
+    def __init__(self, *, max_age_s: float = AM1_LOCAL_BODY_MAX_AGE_S) -> None:
+        if not math.isfinite(max_age_s) or max_age_s <= 0:
+            raise ValueError("body command max age must be finite and greater than zero")
+        self._lock = threading.Lock()
+        self._max_age_s = max_age_s
+        self._action: dict[str, float | int] | None = None
+        self._published_at: float | None = None
+        self._expiration_count = 0
+
+    def publish(self, action: Mapping[str, float | int], *, published_at: float) -> None:
+        validated = validate_am1_local_body_action(action)
+        if not math.isfinite(published_at):
+            raise SafetyRefusal("local body input timestamp must be finite")
+        with self._lock:
+            self._action = validated
+            self._published_at = published_at
+
+    def snapshot(self, *, now: float) -> dict[str, float | int]:
+        with self._lock:
+            if self._action is None or self._published_at is None:
+                return make_zero_action()
+            age_s = now - self._published_at
+            if not math.isfinite(age_s) or age_s < 0 or age_s >= self._max_age_s:
+                if any(float(value) != 0.0 for value in self._action.values()):
+                    self._expiration_count += 1
+                self._action = None
+                self._published_at = None
+                return make_zero_action()
+            return dict(self._action)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._action = None
+            self._published_at = None
+
+    @property
+    def expiration_count(self) -> int:
+        with self._lock:
+            return self._expiration_count
+
+
 class AM1LiveActionSender:
     """Own the live PUSH socket and completion-spaced action cadence in one thread."""
 
@@ -148,6 +193,7 @@ class AM1LiveActionSender:
         fps: int,
         duration_s: float,
         profile_cadence: bool,
+        body_mailbox: AM1LiveBodyMailbox | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         wall_time_ns: Callable[[], int] = time.time_ns,
         sleep_fn: Callable[[float], None] = precise_sleep,
@@ -161,9 +207,11 @@ class AM1LiveActionSender:
         self._fps = fps
         self._duration_s = duration_s
         self._profile_cadence = profile_cadence
+        self._body_mailbox = body_mailbox
         self._monotonic = monotonic
         self._wall_time_ns = wall_time_ns
         self._sleep_fn = sleep_fn
+        self._body_send_gate = threading.Lock()
         self._stop_requested = threading.Event()
         self._finished = threading.Event()
         self._state_lock = threading.Lock()
@@ -183,6 +231,12 @@ class AM1LiveActionSender:
 
     def stop(self) -> None:
         self._stop_requested.set()
+
+    def stop_after_clearing_body(self) -> None:
+        with self._body_send_gate:
+            if self._body_mailbox is not None:
+                self._body_mailbox.clear()
+            self._stop_requested.set()
 
     def join(self) -> None:
         self._thread.join()
@@ -222,21 +276,27 @@ class AM1LiveActionSender:
                     if action_sequence > 0 and self._duration_s > 0 and now - started_at >= self._duration_s:
                         break
 
-                    send_started_at = self._monotonic()
-                    if self._profile_cadence and action_sequence == 0:
-                        print(
-                            json.dumps(
-                                {
-                                    "event": "am1_client_live_start",
-                                    "initial_observation_sequence": self._initial_observation_sequence,
-                                    "right_wrist_requested": action[RIGHT_WRIST_FLEX_KEY],
-                                    "wall_time_ns": self._wall_time_ns(),
-                                },
-                                sort_keys=True,
+                    with self._body_send_gate:
+                        if action_sequence > 0 and self._stop_requested.is_set():
+                            break
+                        send_started_at = self._monotonic()
+                        if self._profile_cadence and action_sequence == 0:
+                            print(
+                                json.dumps(
+                                    {
+                                        "event": "am1_client_live_start",
+                                        "initial_observation_sequence": self._initial_observation_sequence,
+                                        "right_wrist_requested": action[RIGHT_WRIST_FLEX_KEY],
+                                        "wall_time_ns": self._wall_time_ns(),
+                                    },
+                                    sort_keys=True,
+                                )
                             )
-                        )
-                    command_sender.send_action(action)
-                    send_completed_at = self._monotonic()
+                        action_to_send = dict(action)
+                        if action_sequence > 0 and self._body_mailbox is not None:
+                            action_to_send.update(self._body_mailbox.snapshot(now=send_started_at))
+                        command_sender.send_action(action_to_send)
+                        send_completed_at = self._monotonic()
                     send_interval_ms = (
                         0.0
                         if last_send_started_at is None
@@ -891,6 +951,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run the bounded AM1 keyboard lift path without leaders, base motion, cameras, or observations",
     )
+    parser.add_argument(
+        "--local_mode",
+        action="store_true",
+        help="Run bounded AM1 bimanual arms with freshness-limited keyboard base and lift control",
+    )
     parser.add_argument("--no_keyboard", action="store_true", help="Disable keyboard base and lift control")
     parser.add_argument(
         "--no_cameras",
@@ -1024,6 +1089,41 @@ def parse_args(
         parser.error("--max_start_mismatch must be finite and greater than zero")
     if not math.isfinite(args.startup_sync_duration_s) or args.startup_sync_duration_s <= 0:
         parser.error("--startup_sync_duration_s must be finite and greater than zero")
+    if args.local_mode:
+        if args.robot_model != "alohamini1":
+            parser.error("--local_mode is supported only for alohamini1")
+        if args.no_robot:
+            parser.error("--local_mode requires a robot connection")
+        if args.no_leader:
+            parser.error("--local_mode requires both leader connections")
+        if args.no_keyboard:
+            parser.error("--local_mode requires keyboard control")
+        if not args.no_cameras:
+            parser.error("--local_mode requires --no_cameras")
+        if not args.no_rerun:
+            parser.error("--local_mode requires --no_rerun")
+        if not args.start_paused:
+            parser.error("--local_mode requires --start_paused")
+        if args.startup_mode != "sync":
+            parser.error("--local_mode requires --startup_mode sync")
+        if args.startup_sync_side != "both":
+            parser.error("--local_mode requires --startup_sync_side both")
+        if args.startup_sync_duration_s != 120.0:
+            parser.error("--local_mode requires --startup_sync_duration_s 120")
+        if args.max_start_mismatch != 10.0:
+            parser.error("--local_mode requires --max_start_mismatch 10")
+        if args.live_arm_scope != "both":
+            parser.error("--local_mode requires --live_arm_scope both")
+        if args.fps != 10:
+            parser.error("--local_mode requires --fps 10")
+        if not math.isfinite(args.duration_s) or not 0 < args.duration_s <= 30:
+            parser.error("--local_mode requires --duration_s greater than 0 and no more than 30")
+        if not args.profile_cadence:
+            parser.error("--local_mode requires --profile_cadence")
+        if args.startup_sync_only or args.check_alignment_only:
+            parser.error(
+                "--local_mode cannot be combined with --startup_sync_only or --check_alignment_only"
+            )
     if args.startup_sync_only and args.startup_mode != "sync":
         parser.error("--startup_sync_only requires --startup_mode sync")
     if args.startup_sync_side in {"left", "right"} and not args.startup_sync_only:
@@ -1060,11 +1160,17 @@ def parse_args(
         if args.no_robot or args.no_leader:
             parser.error("--live_arm_scope right_wrist_flex requires robot and leader connections")
     if args.profile_cadence and not (
-        args.robot_model == "alohamini1" and args.no_keyboard and args.no_cameras
+        args.robot_model == "alohamini1"
+        and args.no_cameras
+        and (args.no_keyboard or args.local_mode)
     ):
-        parser.error("--profile_cadence requires alohamini1 with --no_keyboard and --no_cameras")
+        parser.error(
+            "--profile_cadence requires alohamini1 with --no_cameras and either --no_keyboard or --local_mode"
+        )
     if args.base_only and args.lift_only:
         parser.error("--base_only and --lift_only cannot be combined")
+    if args.local_mode and (args.base_only or args.lift_only):
+        parser.error("--local_mode cannot be combined with --base_only or --lift_only")
     if args.base_only:
         if args.robot_model != "alohamini1":
             parser.error("--base_only is supported only for alohamini1")
@@ -1130,6 +1236,7 @@ def make_robot_config(args: argparse.Namespace) -> AlohaMiniClientConfig:
                 args.no_keyboard
                 or getattr(args, "base_only", False)
                 or getattr(args, "lift_only", False)
+                or getattr(args, "local_mode", False)
             )
             else None
         ),
@@ -1140,7 +1247,11 @@ def make_robot_config(args: argparse.Namespace) -> AlohaMiniClientConfig:
 
 
 def uses_decoupled_am1_live_loop(args: argparse.Namespace) -> bool:
-    return args.robot_model == "alohamini1" and args.no_keyboard and args.no_cameras
+    return (
+        args.robot_model == "alohamini1"
+        and args.no_cameras
+        and (args.no_keyboard or getattr(args, "local_mode", False))
+    )
 
 
 def make_zero_action() -> dict[str, float | int]:
@@ -1151,6 +1262,31 @@ def make_zero_action() -> dict[str, float | int]:
         "theta.vel": 0.0,
         "lift_axis.vel": 0,
     }
+
+
+def validate_am1_local_body_action(
+    action: Mapping[str, float | int],
+) -> dict[str, float | int]:
+    expected_limits = {
+        "x.vel": 0.15,
+        "y.vel": 0.15,
+        "theta.vel": 45.0,
+        "lift_axis.vel": float(AM1_LIFT_ONLY_VELOCITY),
+    }
+    if set(action) != set(expected_limits):
+        raise SafetyRefusal("local body action must contain exactly x, y, theta, and lift velocity")
+    validated: dict[str, float | int] = {}
+    for key, limit in expected_limits.items():
+        value = action[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise SafetyRefusal(f"local body action {key} must be numeric")
+        numeric = float(value)
+        if not math.isfinite(numeric):
+            raise SafetyRefusal(f"local body action {key} must be finite")
+        if abs(numeric) > limit + ACTION_RANGE_TOLERANCE:
+            raise SafetyRefusal(f"local body action {key} exceeds the bounded limit {limit:g}")
+        validated[key] = value
+    return validated
 
 
 def make_base_only_action(robot: Any, pressed_keys: Any) -> dict[str, float | int]:
@@ -1188,6 +1324,20 @@ def make_lift_only_action(robot: Any, pressed_keys: Any) -> dict[str, float | in
         "theta.vel": 0.0,
         "lift_axis.vel": lift_velocity,
     }
+
+
+def make_local_body_action(robot: Any, pressed_keys: Any) -> dict[str, float | int]:
+    """Combine the proven lowest-speed base and bounded lift velocity mappings."""
+    base_action = make_base_only_action(robot, pressed_keys)
+    lift_action = make_lift_only_action(robot, pressed_keys)
+    return validate_am1_local_body_action(
+        {
+            "x.vel": base_action["x.vel"],
+            "y.vel": base_action["y.vel"],
+            "theta.vel": base_action["theta.vel"],
+            "lift_axis.vel": lift_action["lift_axis.vel"],
+        }
+    )
 
 
 def run_base_only_loop(
@@ -1307,6 +1457,7 @@ def run_am1_live_sender(
     wall_time_ns: Callable[[], int] = time.time_ns,
     sleep_fn: Callable[[float], None] = precise_sleep,
     should_stop: Callable[[], bool] | None = None,
+    body_action_supplier: Callable[[], Mapping[str, float | int]] | None = None,
     sample_callback: Callable[[AM1LiveSample, Mapping[str, float | int]], None] | None = None,
 ) -> None:
     """Read devices on the caller thread while a private worker sends live actions."""
@@ -1356,6 +1507,7 @@ def run_am1_live_sender(
     safe_target = dict(hold_target if live_arm_scope == "right_wrist_flex" else approved_target)
     observed_positions = None if follower_hold_target is None else dict(follower_hold_target)
     initial_action = make_am1_live_action(safe_target)
+    body_mailbox = AM1LiveBodyMailbox() if body_action_supplier is not None else None
 
     sender = AM1LiveActionSender(
         robot,
@@ -1364,6 +1516,7 @@ def run_am1_live_sender(
         fps=fps,
         duration_s=duration_s,
         profile_cadence=profile_cadence,
+        body_mailbox=body_mailbox,
         monotonic=monotonic,
         wall_time_ns=wall_time_ns,
         sleep_fn=sleep_fn,
@@ -1382,8 +1535,17 @@ def run_am1_live_sender(
             sender_snapshot = sender.snapshot()
             if sender_snapshot.error is not None:
                 break
+            if (
+                terminal_stale_reason is None
+                and body_action_supplier is not None
+                and body_mailbox is not None
+            ):
+                body_mailbox.publish(body_action_supplier(), published_at=monotonic())
             if should_stop is not None and should_stop():
-                sender.stop()
+                if body_mailbox is not None:
+                    sender.stop_after_clearing_body()
+                else:
+                    sender.stop()
                 break
 
             if terminal_stale_reason is not None:
@@ -1404,21 +1566,31 @@ def run_am1_live_sender(
                 observation_timeout_count += 1
                 observation_age_s = max(0.0, monotonic() - last_fresh_observed_at)
                 if observation_age_s >= AM1_LIVE_OBSERVATION_MAX_AGE_S:
-                    terminal_stale_reason = (
+                    stale_reason = (
                         f"follower observation age {observation_age_s:.3f}s reached the "
                         f"{AM1_LIVE_OBSERVATION_MAX_AGE_S:.1f}-second freshness limit; {exc}"
                     )
+                    if body_mailbox is not None:
+                        sender.stop_after_clearing_body()
+                    terminal_stale_reason = stale_reason
                     print(
                         "STALE FOLLOWER OBSERVATION — holding the last safe complete arm target for "
                         f"the remainder of this process: {terminal_stale_reason}"
                     )
+                    if body_mailbox is not None:
+                        break
                 continue
             except StaleFollowerObservation as exc:
-                terminal_stale_reason = str(exc)
+                stale_reason = str(exc)
+                if body_mailbox is not None:
+                    sender.stop_after_clearing_body()
+                terminal_stale_reason = stale_reason
                 print(
                     "STALE FOLLOWER OBSERVATION — holding the last safe complete arm target for "
                     f"the remainder of this process: {terminal_stale_reason}"
                 )
+                if body_mailbox is not None:
+                    break
                 continue
 
             safe_target = apply_am1_commissioning_scope(
@@ -1468,6 +1640,9 @@ def run_am1_live_sender(
                             ),
                             "observation_timeout_count": observation_timeout_count,
                             "stale_latched": terminal_stale_reason is not None,
+                            "body_command_expiration_count": (
+                                None if body_mailbox is None else body_mailbox.expiration_count
+                            ),
                             "right_wrist_requested": safe_target[RIGHT_WRIST_FLEX_KEY],
                             "right_wrist_observed": (
                                 None
@@ -1674,8 +1849,20 @@ def run_teleoperation(
                 source="approved initial follower observation",
                 leader_sample=False,
             )
+            local_quit_requested = False
+
+            def local_body_action_supplier() -> dict[str, float | int]:
+                nonlocal local_quit_requested
+                keyboard_keys = keyboard.get_action()
+                quit_key = robot.config.teleop_keys.get("quit", "q")
+                if quit_key in keyboard_keys:
+                    local_quit_requested = True
+                    return make_zero_action()
+                return make_local_body_action(robot, keyboard_keys)
 
             def stop_requested() -> bool:
+                if getattr(args, "local_mode", False):
+                    return local_quit_requested
                 if not keyboard_connected:
                     return False
                 keyboard_keys = keyboard.get_action()
@@ -1693,6 +1880,8 @@ def run_teleoperation(
                 sample_callback = log_live_sample
 
             print("TELEOPERATION ACTIVE — LEADER MOVEMENT IS NOW ALLOWED")
+            if getattr(args, "local_mode", False):
+                print("LOCAL BODY CONTROLS ACTIVE — W/S/Z/X/A/D AND U/J MAY NOW MOVE THE ROBOT")
             teleoperation_active_announced = True
             try:
                 run_am1_live_sender(
@@ -1709,6 +1898,9 @@ def run_teleoperation(
                     monotonic=monotonic,
                     sleep_fn=sleep_fn,
                     should_stop=stop_requested,
+                    body_action_supplier=(
+                        local_body_action_supplier if getattr(args, "local_mode", False) else None
+                    ),
                     sample_callback=sample_callback,
                 )
             except SafetyRefusal as exc:

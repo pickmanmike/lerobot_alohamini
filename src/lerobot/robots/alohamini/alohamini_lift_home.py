@@ -89,6 +89,7 @@ def run(args: argparse.Namespace) -> int:
     print("Zero reference: process-local; normal host startup must home again")
 
     result_code = 1
+    recover_interrupted_bus_io = False
     try:
         # No auto-calibration and no normal arm/base activation. LiftAxis.home()
         # independently performs zero-before-torque and bounded lift-only activation.
@@ -100,13 +101,18 @@ def run(args: argparse.Namespace) -> int:
         )
         result_code = 0
     except KeyboardInterrupt:
+        recover_interrupted_bus_io = True
         print("[STOP] Lift commissioning interrupted; safe cleanup requested.", file=sys.stderr)
         result_code = 130
     except Exception as error:
+        recover_interrupted_bus_io = True
         print(f"[FAIL] Lift home result: {type(error).__name__}: {error}", file=sys.stderr)
         result_code = 1
     finally:
-        cleanup_errors = robot._safe_shutdown(close_buses=True)
+        cleanup_errors = robot._safe_shutdown(
+            close_buses=True,
+            recover_interrupted_bus_io=recover_interrupted_bus_io,
+        )
         if cleanup_errors:
             print(
                 f"[FAIL] Cleanup completed with issues: {'; '.join(cleanup_errors)}",

@@ -400,6 +400,7 @@ def test_host_command_state_uses_monotonic_intervals_and_latches_watchdog():
 def test_host_cadence_instrumentation_is_default_off():
     args = make_parser().parse_args([])
     assert not args.profile_cadence
+    assert not args.profile_lift_diagnostics
 
     clock = FakeClock(1.0)
     state = alohamini_host.HostCommandState(
@@ -413,6 +414,35 @@ def test_host_cadence_instrumentation_is_default_off():
     assert state.snapshot() is None
 
 
+def test_host_parser_enables_default_off_lift_diagnostics_with_either_option_spelling():
+    assert make_parser().parse_args(["--profile_lift_diagnostics"]).profile_lift_diagnostics
+    assert make_parser().parse_args(["--profile-lift-diagnostics"]).profile_lift_diagnostics
+
+
+def test_lift_diagnostic_report_adds_height_and_exact_timestamps(monkeypatch):
+    class FakeRobot:
+        def read_lift_diagnostics(self):
+            return {"present_current_raw": 7, "present_current_ma": 45.5}
+
+    monkeypatch.setattr(alohamini_host.time, "monotonic_ns", lambda: 123_000)
+    monkeypatch.setattr(alohamini_host.time, "time_ns", lambda: 456_000)
+
+    report = alohamini_host.format_lift_diagnostic_report(
+        FakeRobot(),
+        {"lift_axis.height_mm": 12.5},
+    )
+
+    prefix = "[LIFT DIAGNOSTICS] "
+    assert report.startswith(prefix)
+    assert json.loads(report.removeprefix(prefix)) == {
+        "wall_time_ns": 456_000,
+        "monotonic_time_ns": 123_000,
+        "height_mm": 12.5,
+        "present_current_raw": 7,
+        "present_current_ma": 45.5,
+    }
+
+
 def test_main_emits_a_final_host_cadence_snapshot_before_cleanup(monkeypatch, capsys):
     args = make_parser().parse_args(
         ["--profile_cadence", "true", "--no_cameras", "--skip_lift_home"]
@@ -423,8 +453,8 @@ def test_main_emits_a_final_host_cadence_snapshot_before_cleanup(monkeypatch, ca
         def __init__(self, config):
             self.is_connected = True
 
-        def disconnect(self):
-            cleanup_events.append("robot_disconnect")
+        def disconnect(self, *, recover_interrupted_bus_io=False):
+            cleanup_events.append(("robot_disconnect", recover_interrupted_bus_io))
             self.is_connected = False
 
     class FakeHost:
@@ -452,4 +482,126 @@ def test_main_emits_a_final_host_cadence_snapshot_before_cleanup(monkeypatch, ca
         line for line in capsys.readouterr().out.splitlines() if line.startswith("[HOST CADENCE] ")
     ]
     assert len(cadence_lines) == 1
-    assert cleanup_events == ["robot_disconnect", "host_disconnect"]
+    assert cleanup_events == [("robot_disconnect", False), "host_disconnect"]
+
+
+def test_main_marks_keyboard_interrupt_cleanup_as_interrupted(monkeypatch):
+    args = make_parser().parse_args(["--no_cameras", "--skip_lift_home"])
+    cleanup_events = []
+
+    class NoCommandSocket:
+        def recv_string(self, flags):
+            raise alohamini_host.zmq.Again()
+
+    class FakeRobot:
+        def __init__(self, config):
+            self.is_connected = True
+            self.logs = {}
+
+        def get_observation(self):
+            raise KeyboardInterrupt("interrupt inside motor read")
+
+        def disconnect(self, *, recover_interrupted_bus_io=False):
+            cleanup_events.append(("robot_disconnect", recover_interrupted_bus_io))
+            self.is_connected = False
+
+    class FakeHost:
+        watchdog_timeout_ms = 1000
+        connection_time_s = 10
+        max_loop_freq_hz = 30
+
+        def __init__(self, config):
+            self.zmq_cmd_socket = NoCommandSocket()
+
+        def disconnect(self):
+            cleanup_events.append("host_disconnect")
+
+    monkeypatch.setattr(
+        alohamini_host,
+        "make_parser",
+        lambda: SimpleNamespace(parse_args=lambda: args),
+    )
+    monkeypatch.setattr(alohamini_host, "AlohaMini", FakeRobot)
+    monkeypatch.setattr(alohamini_host, "connect_robot", lambda robot, skip_lift_home: None)
+    monkeypatch.setattr(alohamini_host, "AlohaMiniHost", FakeHost)
+
+    alohamini_host.main()
+
+    assert cleanup_events == [("robot_disconnect", True), "host_disconnect"]
+
+
+def test_main_preserves_primary_loop_error_when_cleanup_also_fails(monkeypatch):
+    args = make_parser().parse_args(["--no_cameras", "--skip_lift_home"])
+    cleanup_events = []
+
+    class NoCommandSocket:
+        def recv_string(self, flags):
+            raise alohamini_host.zmq.Again()
+
+    class FakeRobot:
+        def __init__(self, config):
+            self.is_connected = True
+            self.logs = {}
+
+        def get_observation(self):
+            raise RuntimeError("primary observation failure")
+
+        def disconnect(self, *, recover_interrupted_bus_io=False):
+            cleanup_events.append(("robot_disconnect", recover_interrupted_bus_io))
+            raise ConnectionError("cleanup wire failure")
+
+    class FakeHost:
+        watchdog_timeout_ms = 1000
+        connection_time_s = 10
+        max_loop_freq_hz = 30
+
+        def __init__(self, config):
+            self.zmq_cmd_socket = NoCommandSocket()
+
+        def disconnect(self):
+            cleanup_events.append("host_disconnect")
+
+    monkeypatch.setattr(
+        alohamini_host,
+        "make_parser",
+        lambda: SimpleNamespace(parse_args=lambda: args),
+    )
+    monkeypatch.setattr(alohamini_host, "AlohaMini", FakeRobot)
+    monkeypatch.setattr(alohamini_host, "connect_robot", lambda robot, skip_lift_home: None)
+    monkeypatch.setattr(alohamini_host, "AlohaMiniHost", FakeHost)
+
+    with pytest.raises(RuntimeError, match="primary observation failure") as caught:
+        alohamini_host.main()
+
+    assert any("cleanup wire failure" in note for note in caught.value.__notes__)
+    assert cleanup_events == [("robot_disconnect", True), "host_disconnect"]
+
+
+def test_main_preserves_host_startup_error_when_robot_cleanup_also_fails(monkeypatch):
+    args = make_parser().parse_args(["--no_cameras", "--skip_lift_home"])
+
+    class FakeRobot:
+        def __init__(self, config):
+            self.is_connected = True
+
+        def disconnect(self, *, recover_interrupted_bus_io=False):
+            assert recover_interrupted_bus_io
+            raise ConnectionError("startup cleanup failure")
+
+    class FailingHost:
+        def __init__(self, config):
+            raise RuntimeError("primary host startup failure")
+
+    monkeypatch.setattr(
+        alohamini_host,
+        "make_parser",
+        lambda: SimpleNamespace(parse_args=lambda: args),
+    )
+    monkeypatch.setattr(alohamini_host, "AlohaMini", FakeRobot)
+    monkeypatch.setattr(alohamini_host, "connect_robot", lambda robot, skip_lift_home: None)
+    monkeypatch.setattr(alohamini_host, "AlohaMiniHost", FailingHost)
+
+    with pytest.raises(RuntimeError, match="primary host startup failure") as caught:
+        alohamini_host.main()
+
+    assert any("startup cleanup failure" in note for note in caught.value.__notes__)
