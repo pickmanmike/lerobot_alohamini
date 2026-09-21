@@ -3,6 +3,10 @@ param(
     [ValidateSet('Arms', 'Base', 'Lift', 'Local')]
     [string]$Mode,
     [string]$ConfigPath = (Join-Path $PSScriptRoot '..\config\am1.local.json'),
+    [string]$DurationSeconds,
+    [string]$LogPath,
+    [string]$StopRequestPath,
+    [switch]$Preflight,
     [switch]$PrintCommand
 )
 
@@ -29,7 +33,10 @@ $script:Am1LeftCalibrationSha256 = '34D06E15F6768A3290B85BBE3507D9B14A8CCED263A4
 $script:Am1RightCalibrationSha256 = 'C5F04F97B2B4B371EF4C4292616E7BBCAAE3987805930DE46CAEB3C614D2950C'
 
 function Assert-Am1ValidatedEnvelope {
-    param([Parameter(Mandatory)][psobject]$Config)
+    param(
+        [Parameter(Mandatory)][psobject]$Config,
+        [Parameter(Mandatory)][ValidateSet('Arms', 'Base', 'Lift', 'Local')][string]$Mode
+    )
 
     $settings = $Config.arm_settings
     $settingsMatch =
@@ -38,12 +45,26 @@ function Assert-Am1ValidatedEnvelope {
         [double]$settings.startup_sync_duration_s -eq 120 -and
         [double]$settings.max_start_mismatch -eq 10 -and
         [double]$settings.host_max_relative_target -eq 20
+    $localSettingsMatch = $Mode -ne 'Local' -or [double]$settings.local_startup_sync_duration_s -eq 30
     $hashesMatch =
         [string]$Config.leader_calibration_sha256.left -ceq $script:Am1LeftCalibrationSha256 -and
         [string]$Config.leader_calibration_sha256.right -ceq $script:Am1RightCalibrationSha256
-    if (-not $settingsMatch -or -not $hashesMatch) {
+    if (-not $settingsMatch -or -not $localSettingsMatch -or -not $hashesMatch) {
         throw 'Local config must retain the validated AM1 arm settings and calibration identities.'
     }
+}
+
+function ConvertTo-Am1LocalDurationSeconds {
+    param([AllowNull()][object]$Value)
+
+    if ($null -eq $Value -or [string]::IsNullOrWhiteSpace([string]$Value)) {
+        return 30
+    }
+    $text = [string]$Value
+    if ($text -cnotmatch '^(?:[1-9]|[1-9][0-9]{1,2}|1[0-7][0-9]{2}|1800)$') {
+        throw 'Local duration must be a whole number from 1 through 1800 seconds.'
+    }
+    return [int]::Parse($text, [System.Globalization.CultureInfo]::InvariantCulture)
 }
 
 function Resolve-Am1ConfiguredPath {
@@ -91,10 +112,12 @@ function New-Am1WindowsCommand {
         [Parameter(Mandatory)]
         [string]$RepositoryRoot,
         [string]$LeftPort,
-        [string]$RightPort
+        [string]$RightPort,
+        [Nullable[int]]$LocalDurationSeconds,
+        [string]$StopRequestPath
     )
 
-    Assert-Am1ValidatedEnvelope -Config $Config
+    Assert-Am1ValidatedEnvelope -Config $Config -Mode $Mode
     $pythonPath = Resolve-Am1ConfiguredPath -Value ([string]$Config.windows_python_path) `
         -RepositoryRoot $RepositoryRoot
     $teleoperationPath = Join-Path $RepositoryRoot 'examples\alohamini\teleoperate_bi.py'
@@ -140,6 +163,18 @@ function New-Am1WindowsCommand {
             throw 'Arms and Local modes require two distinct uppercase runtime COM addresses.'
         }
         $settings = $Config.arm_settings
+        $syncDuration = if ($Mode -eq 'Local') {
+            [string]$settings.local_startup_sync_duration_s
+        }
+        else {
+            [string]$settings.startup_sync_duration_s
+        }
+        $liveDuration = if ($Mode -eq 'Local') {
+            if ($null -eq $LocalDurationSeconds) { '30' } else { [string]$LocalDurationSeconds }
+        }
+        else {
+            [string]$settings.client_duration_s
+        }
         $arguments = @(
             $teleoperationPath
             '--robot.remote_ip'
@@ -159,7 +194,7 @@ function New-Am1WindowsCommand {
             '--startup_sync_side'
             'both'
             '--startup_sync_duration_s'
-            [string]$settings.startup_sync_duration_s
+            $syncDuration
             '--max_start_mismatch'
             [string]$settings.max_start_mismatch
             '--live_arm_scope'
@@ -167,13 +202,22 @@ function New-Am1WindowsCommand {
             '--fps'
             [string]$settings.client_fps
             '--duration_s'
-            $(if ($Mode -eq 'Local') { '30' } else { [string]$settings.client_duration_s })
+            $liveDuration
             '--start_paused'
         )
         if ($Mode -eq 'Local') {
             $arguments += '--local_mode'
+            if (-not [string]::IsNullOrWhiteSpace($StopRequestPath)) {
+                if (-not [System.IO.Path]::IsPathRooted($StopRequestPath)) {
+                    throw '-StopRequestPath must be an absolute path.'
+                }
+                $arguments += @('--external_stop_file', [System.IO.Path]::GetFullPath($StopRequestPath))
+            }
         }
         else {
+            if (-not [string]::IsNullOrWhiteSpace($StopRequestPath)) {
+                throw '-StopRequestPath is available only for Local mode.'
+            }
             $arguments += '--no_keyboard'
         }
         $arguments += @(
@@ -199,15 +243,35 @@ function Invoke-Am1LoggedCommand {
         [Parameter(Mandatory)]
         [string[]]$Arguments,
         [Parameter(Mandatory)]
-        [string]$LogPath
+        [string]$LogPath,
+        [Nullable[int]]$DisplayDurationSeconds
     )
 
     $parent = Split-Path -Parent $LogPath
     if ($parent) {
         $null = New-Item -ItemType Directory -Path $parent -Force
     }
+    # Keep durable logging independent of console rendering. The helper's
+    # disposable viewer may block without back-pressuring the client or its
+    # cleanup path.
+    $logger = Join-Path $PSScriptRoot 'am1_logged_process.py'
+    if (-not (Test-Path -LiteralPath $logger -PathType Leaf)) {
+        throw "AM1 direct logger is missing: $logger"
+    }
+    $loggerArguments = [string[]]@($logger, '--log', $LogPath, '--', $Executable) + $Arguments
+    if ($null -ne $DisplayDurationSeconds) {
+        $loggerArguments = [string[]]@(
+            $logger
+            '--log'
+            $LogPath
+            '--duration-seconds'
+            [string]$DisplayDurationSeconds
+            '--'
+            $Executable
+        ) + $Arguments
+    }
     $PSNativeCommandUseErrorActionPreference = $false
-    & $Executable @Arguments 2>&1 | Tee-Object -FilePath $LogPath -Append | Out-Host
+    & $Executable @loggerArguments
     return [int]$LASTEXITCODE
 }
 
@@ -311,6 +375,10 @@ function Invoke-Am1Launch {
         [string]$Mode,
         [Parameter(Mandatory)]
         [string]$ConfigPath,
+        [AllowNull()][object]$DurationSeconds,
+        [string]$LogPath,
+        [string]$StopRequestPath,
+        [switch]$Preflight,
         [switch]$PrintCommand
     )
 
@@ -319,6 +387,16 @@ function Invoke-Am1Launch {
         throw "Local AM1 config is missing. Copy config\am1.local.example.json to config\am1.local.json and edit the local paths."
     }
     $config = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
+    if ($Preflight -and $PrintCommand) {
+        throw '-Preflight and -PrintCommand cannot be combined.'
+    }
+    $localDuration = $null
+    if ($Mode -eq 'Local') {
+        $localDuration = ConvertTo-Am1LocalDurationSeconds -Value $DurationSeconds
+    }
+    elseif ($null -ne $DurationSeconds -and -not [string]::IsNullOrWhiteSpace([string]$DurationSeconds)) {
+        throw '-DurationSeconds is available only for Local mode.'
+    }
 
     if (-not $PrintCommand) {
         Assert-Am1ReviewedWorktree -RepositoryRoot $repositoryRoot
@@ -329,7 +407,8 @@ function Invoke-Am1Launch {
         Assert-Am1LeaderCalibrationHashes -Config $config
     }
     $command = New-Am1WindowsCommand -Mode $Mode -Config $config -RepositoryRoot $repositoryRoot `
-        -LeftPort $ports.left -RightPort $ports.right
+        -LeftPort $ports.left -RightPort $ports.right -LocalDurationSeconds $localDuration `
+        -StopRequestPath $StopRequestPath
     $commandText = ConvertTo-Am1CommandText -Executable $command.executable -Arguments $command.arguments
 
     if ($PrintCommand) {
@@ -339,23 +418,43 @@ function Invoke-Am1Launch {
 
     Assert-Am1ImportRoot -Executable $command.executable -RepositoryRoot $repositoryRoot
 
+    if ($Preflight) {
+        Write-Output "AM1_$($Mode.ToUpperInvariant())_PREFLIGHT_READY"
+        Write-Output "WINDOWS_COMMAND=$commandText"
+        return
+    }
+
     $logDirectory = [string]$config.windows_log_directory
     $null = New-Item -ItemType Directory -Path $logDirectory -Force
-    $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-    $logPath = Join-Path $logDirectory "am1-$($Mode.ToLowerInvariant())-windows-$timestamp.log"
-    Write-Output "WINDOWS_LOG=$logPath"
-    Write-Output "WINDOWS_COMMAND=$commandText"
-    "WINDOWS_COMMAND=$commandText" | Set-Content -LiteralPath $logPath -Encoding utf8
+    if ([string]::IsNullOrWhiteSpace($LogPath)) {
+        $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+        $resolvedLogPath = Join-Path $logDirectory "am1-$($Mode.ToLowerInvariant())-windows-$timestamp.log"
+    }
+    else {
+        if (-not [System.IO.Path]::IsPathRooted($LogPath)) {
+            throw '-LogPath must be an absolute path.'
+        }
+        $resolvedLogPath = [System.IO.Path]::GetFullPath($LogPath)
+    }
+    $isUnifiedSession = -not [string]::IsNullOrWhiteSpace($StopRequestPath)
+    if (-not $isUnifiedSession) {
+        Write-Output "WINDOWS_LOG=$resolvedLogPath"
+        Write-Output "WINDOWS_COMMAND=$commandText"
+    }
+    "WINDOWS_COMMAND=$commandText" | Set-Content -LiteralPath $resolvedLogPath -Encoding utf8
 
     $previousPythonPath = $env:PYTHONPATH
     $previousNoBytecode = $env:PYTHONDONTWRITEBYTECODE
+    $previousPythonUnbuffered = $env:PYTHONUNBUFFERED
     try {
         $env:PYTHONPATH = (Resolve-Path -LiteralPath (Join-Path $repositoryRoot 'src')).Path
         $env:PYTHONDONTWRITEBYTECODE = '1'
+        $env:PYTHONUNBUFFERED = '1'
         Push-Location $command.working_directory
         try {
             $clientExit = Invoke-Am1LoggedCommand -Executable $command.executable `
-                -Arguments $command.arguments -LogPath $logPath
+                -Arguments $command.arguments -LogPath $resolvedLogPath `
+                -DisplayDurationSeconds $localDuration
         }
         finally {
             Pop-Location
@@ -364,12 +463,18 @@ function Invoke-Am1Launch {
     finally {
         $env:PYTHONPATH = $previousPythonPath
         $env:PYTHONDONTWRITEBYTECODE = $previousNoBytecode
+        $env:PYTHONUNBUFFERED = $previousPythonUnbuffered
     }
 
-    "AM1_CLIENT_EXIT_CODE=$clientExit" | Tee-Object -FilePath $logPath -Append | Out-Host
+    if ($isUnifiedSession) {
+        "AM1_CLIENT_EXIT_CODE=$clientExit" | Add-Content -LiteralPath $resolvedLogPath -Encoding utf8
+    }
+    else {
+        "AM1_CLIENT_EXIT_CODE=$clientExit" | Tee-Object -FilePath $resolvedLogPath -Append | Out-Host
+    }
     $global:LASTEXITCODE = $clientExit
-    if ($clientExit -ne 0) {
-        throw "AM1 $Mode client failed with exit code $clientExit. Review $logPath; this shell remains available."
+    if ($clientExit -ne 0 -and $clientExit -ne 130) {
+        throw "AM1 $Mode client failed with exit code $clientExit. Review $resolvedLogPath; this shell remains available."
     }
 }
 
@@ -377,5 +482,7 @@ if ($MyInvocation.InvocationName -ne '.') {
     if ([string]::IsNullOrWhiteSpace($Mode)) {
         throw 'Specify -Mode Arms, -Mode Base, -Mode Lift, or -Mode Local.'
     }
-    Invoke-Am1Launch -Mode $Mode -ConfigPath $ConfigPath -PrintCommand:$PrintCommand
+    Invoke-Am1Launch -Mode $Mode -ConfigPath $ConfigPath -DurationSeconds $DurationSeconds `
+        -LogPath $LogPath -StopRequestPath $StopRequestPath -Preflight:$Preflight `
+        -PrintCommand:$PrintCommand
 }

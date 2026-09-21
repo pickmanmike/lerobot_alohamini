@@ -26,6 +26,7 @@ import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal, NamedTuple
 
@@ -85,6 +86,40 @@ class StartupSyncPlan:
 
 class SafetyRefusal(ValueError):
     """An expected refusal to forward an unsafe Aloha Mini 1 arm sample."""
+
+
+class ExternalStopRequested(RuntimeError):
+    """The owning Windows session requested cooperative Local cleanup."""
+
+
+def wait_for_input_or_stop(
+    input_fn: Callable[[str], str],
+    prompt: str,
+    stop_requested: Callable[[], bool],
+) -> str:
+    if stop_requested():
+        raise ExternalStopRequested("external Local stop requested")
+    responses: list[tuple[str, Any]] = []
+    response_ready = threading.Event()
+
+    def read_input() -> None:
+        try:
+            responses.append(("value", input_fn(prompt)))
+        except BaseException as exc:
+            responses.append(("error", exc))
+        finally:
+            response_ready.set()
+
+    threading.Thread(target=read_input, name="am1-local-input", daemon=True).start()
+    while not response_ready.wait(0.05):
+        if stop_requested():
+            raise ExternalStopRequested("external Local stop requested")
+    if stop_requested():
+        raise ExternalStopRequested("external Local stop requested")
+    kind, value = responses[0]
+    if kind == "error":
+        raise value
+    return str(value)
 
 
 class StaleFollowerObservation(RuntimeError):
@@ -194,6 +229,7 @@ class AM1LiveActionSender:
         duration_s: float,
         profile_cadence: bool,
         body_mailbox: AM1LiveBodyMailbox | None = None,
+        before_first_send_stop_requested: Callable[[], bool] | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         wall_time_ns: Callable[[], int] = time.time_ns,
         sleep_fn: Callable[[float], None] = precise_sleep,
@@ -208,6 +244,7 @@ class AM1LiveActionSender:
         self._duration_s = duration_s
         self._profile_cadence = profile_cadence
         self._body_mailbox = body_mailbox
+        self._before_first_send_stop_requested = before_first_send_stop_requested
         self._monotonic = monotonic
         self._wall_time_ns = wall_time_ns
         self._sleep_fn = sleep_fn
@@ -271,6 +308,12 @@ class AM1LiveActionSender:
                     with self._state_lock:
                         action_sequence = self._action_sequence
                     now = self._monotonic()
+                    if (
+                        action_sequence == 0
+                        and self._before_first_send_stop_requested is not None
+                        and self._before_first_send_stop_requested()
+                    ):
+                        break
                     if action_sequence > 0 and self._stop_requested.is_set():
                         break
                     if action_sequence > 0 and self._duration_s > 0 and now - started_at >= self._duration_s:
@@ -290,7 +333,8 @@ class AM1LiveActionSender:
                                         "wall_time_ns": self._wall_time_ns(),
                                     },
                                     sort_keys=True,
-                                )
+                                ),
+                                flush=True,
                             )
                         action_to_send = dict(action)
                         if action_sequence > 0 and self._body_mailbox is not None:
@@ -835,6 +879,7 @@ def run_startup_sync(
     _print_alignment_table(build_alignment_rows(follower_start, frozen_target))
     _print_startup_sync_plan(plan, label="Final frozen-target")
 
+    motion_started_at = monotonic()
     current_leader = extract_am1_arm_positions(
         leader.get_action(),
         source="leader",
@@ -864,6 +909,19 @@ def run_startup_sync(
         )
         robot.send_action(build_startup_sync_action(plan, frame_index))
         previous_send_completed_at = monotonic()
+
+    print(
+        json.dumps(
+            {
+                "actual_duration_s": round(previous_send_completed_at - motion_started_at, 6),
+                "event": "am1_startup_sync_timing",
+                "frame_count": plan.frame_count,
+                "planned_duration_s": round(plan.estimated_actual_duration_s, 6),
+                "requested_duration_s": round(plan.requested_duration_s, 6),
+            },
+            sort_keys=True,
+        )
+    )
 
     validated_frozen_target = extract_am1_arm_positions(
         dict(plan.frozen_leader_target),
@@ -1034,6 +1092,11 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--external_stop_file",
+        type=Path,
+        help="Session-owned cooperative stop request (Local mode only)",
+    )
+    parser.add_argument(
         "--robot.remote_ip",
         "--remote_ip",
         dest="remote_ip",
@@ -1081,6 +1144,11 @@ def parse_args(
 ) -> argparse.Namespace:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.external_stop_file is not None:
+        if not args.local_mode:
+            parser.error("--external_stop_file is available only with --local_mode")
+        if not args.external_stop_file.is_absolute():
+            parser.error("--external_stop_file must be an absolute path")
     if args.fps <= 0:
         parser.error("--fps must be greater than zero")
     if args.duration_s < 0:
@@ -1108,16 +1176,20 @@ def parse_args(
             parser.error("--local_mode requires --startup_mode sync")
         if args.startup_sync_side != "both":
             parser.error("--local_mode requires --startup_sync_side both")
-        if args.startup_sync_duration_s != 120.0:
-            parser.error("--local_mode requires --startup_sync_duration_s 120")
+        if args.startup_sync_duration_s != 30.0:
+            parser.error("--local_mode requires --startup_sync_duration_s 30")
         if args.max_start_mismatch != 10.0:
             parser.error("--local_mode requires --max_start_mismatch 10")
         if args.live_arm_scope != "both":
             parser.error("--local_mode requires --live_arm_scope both")
         if args.fps != 10:
             parser.error("--local_mode requires --fps 10")
-        if not math.isfinite(args.duration_s) or not 0 < args.duration_s <= 30:
-            parser.error("--local_mode requires --duration_s greater than 0 and no more than 30")
+        if (
+            not math.isfinite(args.duration_s)
+            or not 1 <= args.duration_s <= 1800
+            or not args.duration_s.is_integer()
+        ):
+            parser.error("--local_mode requires a whole --duration_s from 1 through 1800")
         if not args.profile_cadence:
             parser.error("--local_mode requires --profile_cadence")
         if args.startup_sync_only or args.check_alignment_only:
@@ -1517,6 +1589,7 @@ def run_am1_live_sender(
         duration_s=duration_s,
         profile_cadence=profile_cadence,
         body_mailbox=body_mailbox,
+        before_first_send_stop_requested=should_stop,
         monotonic=monotonic,
         wall_time_ns=wall_time_ns,
         sleep_fn=sleep_fn,
@@ -1703,12 +1776,32 @@ def run_teleoperation(
     pending_observed_at: float | None = None
     teleoperation_active_announced = False
     alignment_monotonic = monotonic if uses_decoupled_am1_live_loop(args) else time.monotonic
+    external_stop_path = getattr(args, "external_stop_file", None)
+
+    def external_stop_requested() -> bool:
+        return external_stop_path is not None and external_stop_path.exists()
+
+    def raise_if_external_stop_requested() -> None:
+        if external_stop_requested():
+            raise ExternalStopRequested("external Local stop requested")
+
+    def stop_aware_input(prompt: str) -> str:
+        if external_stop_path is None:
+            return input_fn(prompt)
+        return wait_for_input_or_stop(input_fn, prompt, external_stop_requested)
+
+    def stop_aware_sleep(duration: float) -> None:
+        raise_if_external_stop_requested()
+        sleep_fn(duration)
+        raise_if_external_stop_requested()
 
     try:
+        raise_if_external_stop_requested()
         if not args.no_robot:
             robot = AlohaMiniClient(make_robot_config(args))
             robot.connect()
             robot_connected = True
+            raise_if_external_stop_requested()
             robot.send_action(make_zero_action())
         else:
             print("NO_ROBOT: robot client construction and connection skipped.")
@@ -1718,6 +1811,7 @@ def run_teleoperation(
             if args.require_calibration_match:
                 left_leader_connected = True
                 leader.left_arm.connect(calibrate=False)
+                raise_if_external_stop_requested()
                 try:
                     if not leader.left_arm.is_calibrated:
                         raise SafetyRefusal("left leader calibration is missing or does not match the connected arm; refusing without calibration")
@@ -1726,6 +1820,7 @@ def run_teleoperation(
                     return 2
                 right_leader_connected = True
                 leader.right_arm.connect(calibrate=False)
+                raise_if_external_stop_requested()
                 try:
                     if not leader.right_arm.is_calibrated:
                         raise SafetyRefusal("right leader calibration is missing or does not match the connected arm; refusing without calibration")
@@ -1735,8 +1830,10 @@ def run_teleoperation(
             else:
                 leader.left_arm.connect()
                 left_leader_connected = True
+                raise_if_external_stop_requested()
                 leader.right_arm.connect()
                 right_leader_connected = True
+                raise_if_external_stop_requested()
         else:
             print("NO_LEADER: leader construction and connection skipped.")
 
@@ -1760,9 +1857,9 @@ def run_teleoperation(
                         requested_duration_s=args.startup_sync_duration_s,
                         fps=args.fps,
                         max_start_mismatch=args.max_start_mismatch,
-                        input_fn=input_fn,
+                        input_fn=stop_aware_input,
                         monotonic=monotonic,
-                        sleep_fn=sleep_fn,
+                        sleep_fn=stop_aware_sleep,
                     )
                     print("SYNCHRONIZATION COMPLETE")
                     if args.startup_sync_only:
@@ -1775,6 +1872,7 @@ def run_teleoperation(
             keyboard = KeyboardTeleop(KeyboardTeleopConfig(id="my_laptop_keyboard"))
             keyboard.connect()
             keyboard_connected = keyboard.is_connected
+            raise_if_external_stop_requested()
             if not keyboard_connected:
                 raise RuntimeError("Keyboard control was enabled, but the keyboard listener did not connect.")
 
@@ -1789,9 +1887,9 @@ def run_teleoperation(
             _print_connection_summary(args)
             if args.robot_model == "alohamini1":
                 print("PRESS ENTER TO ENABLE LIVE TELEOPERATION")
-                input_fn("")
+                stop_aware_input("")
             else:
-                input_fn("Press Enter to begin forwarding leader actions... ")
+                stop_aware_input("Press Enter to begin forwarding leader actions... ")
             if args.robot_model == "alohamini1" and robot_connected and right_leader_connected:
                 try:
                     pending_arm_action, pending_observation, pending_observed_at = run_alignment_gate(
@@ -1803,6 +1901,8 @@ def run_teleoperation(
                 except SafetyRefusal as exc:
                     print(f"SAFETY REFUSAL: {exc}")
                     return 2
+
+        raise_if_external_stop_requested()
 
         if getattr(args, "base_only", False):
             print("BASE TELEOPERATION ACTIVE — WHEELS MAY NOW MOVE")
@@ -1853,6 +1953,9 @@ def run_teleoperation(
 
             def local_body_action_supplier() -> dict[str, float | int]:
                 nonlocal local_quit_requested
+                if external_stop_requested():
+                    local_quit_requested = True
+                    return make_zero_action()
                 keyboard_keys = keyboard.get_action()
                 quit_key = robot.config.teleop_keys.get("quit", "q")
                 if quit_key in keyboard_keys:
@@ -1861,6 +1964,8 @@ def run_teleoperation(
                 return make_local_body_action(robot, keyboard_keys)
 
             def stop_requested() -> bool:
+                if external_stop_requested():
+                    return True
                 if getattr(args, "local_mode", False):
                     return local_quit_requested
                 if not keyboard_connected:
@@ -1879,11 +1984,13 @@ def run_teleoperation(
 
                 sample_callback = log_live_sample
 
+            raise_if_external_stop_requested()
             print("TELEOPERATION ACTIVE — LEADER MOVEMENT IS NOW ALLOWED")
             if getattr(args, "local_mode", False):
                 print("LOCAL BODY CONTROLS ACTIVE — W/S/Z/X/A/D AND U/J MAY NOW MOVE THE ROBOT")
             teleoperation_active_announced = True
             try:
+                raise_if_external_stop_requested()
                 run_am1_live_sender(
                     robot,
                     leader,
@@ -1896,13 +2003,14 @@ def run_teleoperation(
                     live_arm_scope=args.live_arm_scope,
                     profile_cadence=args.profile_cadence,
                     monotonic=monotonic,
-                    sleep_fn=sleep_fn,
+                    sleep_fn=stop_aware_sleep,
                     should_stop=stop_requested,
                     body_action_supplier=(
                         local_body_action_supplier if getattr(args, "local_mode", False) else None
                     ),
                     sample_callback=sample_callback,
                 )
+                raise_if_external_stop_requested()
             except SafetyRefusal as exc:
                 print(f"SAFETY REFUSAL: {exc}")
                 return 2
@@ -1966,9 +2074,12 @@ def run_teleoperation(
                     teleoperation_active_announced = True
                 robot.send_action(action)
 
-            sleep_fn(max(1.0 / args.fps - (time.perf_counter() - loop_started_at), 0.0))
+            stop_aware_sleep(max(1.0 / args.fps - (time.perf_counter() - loop_started_at), 0.0))
             if args.no_robot:
                 print(f"[NO_ROBOT] action -> {action}")
+    except ExternalStopRequested:
+        print("AM1 Local session stop requested; beginning ordinary client cleanup.")
+        return 130
     finally:
         primary_error = sys.exception()
         cleanup_errors: list[tuple[str, BaseException]] = []

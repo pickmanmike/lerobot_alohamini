@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import builtins
 import importlib.util
+import json
 import io
 import math
 import sys
@@ -1450,6 +1451,64 @@ def test_sync_does_not_compress_frames_after_processing_overruns_period(monkeypa
     send_gaps = [current - previous for previous, current in zip(send_times, send_times[1:])]
     assert min(send_gaps) >= 1.0 / 5 - 1e-9
     assert 0.0 not in clock.sleeps
+
+
+def test_sync_reports_requested_planned_and_actual_motion_timing(monkeypatch, capsys):
+    module = load_example_module("teleoperate_bi")
+    robot, leader, events = make_direct_sync_fakes(
+        monkeypatch,
+        module,
+        observation_poses=[FOLLOWER_POSE, FOLLOWER_POSE, FOLLOWER_POSE],
+        action_poses=[LEADER_POSE, LEADER_POSE, LEADER_POSE, LEADER_POSE],
+    )
+    clock = FakeClock(events)
+
+    module.run_startup_sync(
+        robot,
+        leader,
+        side="both",
+        requested_duration_s=0.2,
+        fps=5,
+        max_start_mismatch=10.0,
+        input_fn=lambda _: "SYNC",
+        monotonic=clock.monotonic,
+        sleep_fn=clock.sleep,
+    )
+
+    timing = next(
+        json.loads(line)
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith('{"actual_duration_s"')
+    )
+    assert timing == {
+        "actual_duration_s": pytest.approx(0.2),
+        "event": "am1_startup_sync_timing",
+        "frame_count": 2,
+        "planned_duration_s": pytest.approx(0.2),
+        "requested_duration_s": pytest.approx(0.2),
+    }
+
+
+@pytest.mark.parametrize("target", [0.5, 100.0])
+def test_thirty_second_sync_plan_preserves_step_limit_for_small_and_full_range(target):
+    module = load_example_module("teleoperate_bi")
+    follower = dict(FOLLOWER_POSE)
+    leader = dict(LEADER_POSE)
+    follower["arm_left_shoulder_pan.pos"] = -100.0 if target == 100.0 else 0.0
+    leader["left_shoulder_pan.pos"] = target
+
+    plan = module.build_startup_sync_plan(
+        follower,
+        leader,
+        side="both",
+        requested_duration_s=30.0,
+        fps=10,
+    )
+
+    assert plan.total_steps == 300
+    assert plan.frame_count == 301
+    assert plan.estimated_actual_duration_s == pytest.approx(30.0)
+    assert plan.largest_planned_per_frame_change <= module.STARTUP_SYNC_MAX_STEP
 
 
 def test_sync_prints_final_measured_endpoints_before_first_arm_send(monkeypatch, capsys):
