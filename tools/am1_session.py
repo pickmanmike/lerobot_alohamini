@@ -881,7 +881,64 @@ def _write_active(config: SessionConfig, payload: dict[str, Any]) -> None:
     os.replace(temporary, path)
 
 
+def _windows_pid_running(pid: int) -> bool:
+    import ctypes
+    from ctypes import wintypes
+
+    synchronize = 0x00100000
+    wait_object_0 = 0x00000000
+    wait_timeout = 0x00000102
+    wait_failed = 0xFFFFFFFF
+    error_access_denied = 5
+    error_invalid_parameter = 87
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    handle = kernel32.OpenProcess(synchronize, False, pid)
+    if not handle:
+        error = ctypes.get_last_error()
+        if error == error_invalid_parameter:
+            return False
+        if error == error_access_denied:
+            raise SessionError(f"Windows process {pid} liveness query failed: access denied.")
+        raise SessionError(f"Windows process {pid} liveness could not be verified (error {error}).")
+
+    wait_result = kernel32.WaitForSingleObject(handle, 0)
+    wait_error = ctypes.get_last_error() if wait_result == wait_failed else 0
+    if not kernel32.CloseHandle(handle):
+        close_error = ctypes.get_last_error()
+        if wait_result == wait_failed:
+            raise SessionError(
+                f"Windows process {pid} liveness could not be verified "
+                f"(wait error {wait_error}; handle-close error {close_error})."
+            )
+        raise SessionError(
+            f"Windows process {pid} liveness was read but its query handle could not be closed "
+            f"(error {close_error})."
+        )
+
+    if wait_result == wait_timeout:
+        return True
+    if wait_result == wait_object_0:
+        return False
+    if wait_result == wait_failed:
+        raise SessionError(f"Windows process {pid} liveness could not be verified (wait error {wait_error}).")
+    raise SessionError(
+        f"Windows process {pid} liveness returned an unexpected wait result 0x{wait_result:08x}."
+    )
+
+
 def _pid_running(pid: int) -> bool:
+    if pid <= 0:
+        raise SessionError(f"Invalid AM1 session controller PID: {pid}.")
+    if os.name == "nt":
+        return _windows_pid_running(pid)
     try:
         os.kill(pid, 0)
     except OSError:

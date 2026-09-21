@@ -42,13 +42,39 @@ class SessionControlStop(SessionRefusal):
 
 
 def _read_text(path: Path, limit: int = 2_000_000) -> str:
+    if limit <= 0:
+        return ""
+
+    def complete_lines(data: bytes) -> bytes:
+        if data.endswith(b"\n"):
+            return data
+        last_newline = data.rfind(b"\n")
+        return data[: last_newline + 1] if last_newline >= 0 else b""
+
     try:
         with path.open("rb") as stream:
-            data = stream.read(limit + 1)
+            size = os.fstat(stream.fileno()).st_size
+            if size <= limit:
+                data = complete_lines(stream.read(limit))
+            else:
+                head_limit = min(64_000, max(1, limit // 4))
+                tail_limit = limit - head_limit
+                head = complete_lines(stream.read(head_limit))
+
+                tail_start = size - tail_limit
+                probe_start = max(0, tail_start - 1)
+                stream.seek(probe_start)
+                tail = stream.read(tail_limit + (tail_start > 0))
+                if tail_start > 0:
+                    if tail.startswith(b"\n"):
+                        tail = tail[1:]
+                    else:
+                        first_newline = tail.find(b"\n")
+                        tail = tail[first_newline + 1 :] if first_newline >= 0 else b""
+                tail = complete_lines(tail)
+                data = head + tail
     except OSError:
         return ""
-    if len(data) > limit:
-        data = data[-limit:]
     return data.decode("utf-8", errors="replace")
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import importlib.util
 import io
 import json
@@ -31,6 +32,35 @@ def load_tool(name: str):
     finally:
         sys.modules.pop(spec.name, None)
     return module
+
+
+def stop_disposable_process(process: subprocess.Popen) -> None:
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
+
+
+class FakeCtypesFunction:
+    def __init__(self, result):
+        self.result = result
+        self.calls = []
+
+    def __call__(self, *args):
+        self.calls.append(args)
+        return self.result
+
+
+def fake_windows_kernel32(*, open_result=1234, wait_result=0x00000102, close_result=1):
+    kernel32 = type("Kernel32", (), {})()
+    kernel32.OpenProcess = FakeCtypesFunction(open_result)
+    kernel32.WaitForSingleObject = FakeCtypesFunction(wait_result)
+    kernel32.CloseHandle = FakeCtypesFunction(close_result)
+    return kernel32
 
 
 @pytest.mark.parametrize("value", ["1", "60", "120", "1800", 1, 1800])
@@ -626,6 +656,66 @@ def test_remote_readiness_requires_all_fresh_cameras_and_operational_host_marker
     assert module.host_is_operational('{"phase":"home_complete"}') is False
 
 
+def test_remote_bounded_reader_finds_late_host_readiness_and_waits_for_complete_line(tmp_path):
+    module = load_tool("am1_session_remote")
+    log_path = tmp_path / "host.log"
+    limit = 2_000_000
+    marker_offset = 2_070_000
+    prefix = b'{"phase":"starting"}\n'
+    filler = (b"x" * (marker_offset - len(prefix) - 1)) + b"\n"
+    log_path.write_bytes(prefix + filler)
+    assert log_path.stat().st_size == marker_offset
+
+    initial = module._read_text(log_path, limit)
+
+    assert len(initial) <= limit
+    assert module.host_is_operational(initial) is False
+
+    with log_path.open("a", encoding="utf-8") as stream:
+        stream.write('{"phase":"operational_ready","height_mm":10.0}')
+    incomplete = module._read_text(log_path, limit)
+
+    assert len(incomplete) <= limit
+    assert module.host_is_operational(incomplete) is False
+
+    with log_path.open("a", encoding="utf-8") as stream:
+        stream.write("\n")
+    complete = module._read_text(log_path, limit)
+
+    assert len(complete) <= limit
+    assert module.host_is_operational(complete) is True
+
+
+def test_remote_bounded_reader_preserves_camera_metadata_and_latest_status(tmp_path):
+    module = load_tool("am1_session_remote")
+    log_path = tmp_path / "camera.log"
+    roles = ["forward", "backward", "chest", "wrist_left", "wrist_right"]
+    stale_status = {
+        "cameras": {role: {"state": "stale"} for role in roles},
+        "sequence": 1,
+    }
+    fresh_status = {
+        "cameras": {role: {"state": "fresh"} for role in roles},
+        "sequence": 999,
+    }
+    lines = [
+        "CAMERA_VIEW_URL=http://192.0.2.1:1984",
+        "CAMERA_CONFIGURED_ROLES=" + ",".join(roles),
+        "CAMERA_STATUS " + json.dumps(stale_status, separators=(",", ":")),
+        *("filler-record" for _ in range(200)),
+        "CAMERA_STATUS " + json.dumps(fresh_status, separators=(",", ":")),
+    ]
+    log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    text = module._read_text(log_path, 1_024)
+
+    assert len(text) <= 1_024
+    assert module.parse_camera_readiness(text) == {
+        "browser_url": "http://192.0.2.1:1984",
+        "roles": roles,
+    }
+
+
 @pytest.mark.parametrize("child_name", ["camera", "host"])
 def test_remote_records_exact_child_log_before_later_readiness_failure(tmp_path, child_name):
     module = load_tool("am1_session_remote")
@@ -1218,6 +1308,141 @@ def test_collect_only_refuses_manifest_destination_outside_exact_session_directo
         module.collect_only(config, session_id)
 
     assert not outside.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows process semantics")
+def test_windows_pid_query_leaves_disposable_child_alive():
+    module = load_tool("am1_session")
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        assert module._pid_running(process.pid) is True
+        with pytest.raises(subprocess.TimeoutExpired):
+            process.wait(timeout=0.25)
+    finally:
+        stop_disposable_process(process)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows process semantics")
+@pytest.mark.parametrize(
+    ("wait_result", "expected"),
+    [
+        (0x00000102, True),
+        (0x00000000, False),
+    ],
+)
+def test_windows_pid_query_uses_and_closes_query_handle(monkeypatch, wait_result, expected):
+    module = load_tool("am1_session")
+    kernel32 = fake_windows_kernel32(wait_result=wait_result)
+    monkeypatch.setattr(ctypes, "WinDLL", lambda *args, **kwargs: kernel32)
+    monkeypatch.setattr(
+        module.os,
+        "kill",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("os.kill must not query Windows PIDs")),
+    )
+
+    assert module._pid_running(424242) is expected
+    assert kernel32.OpenProcess.calls == [(0x00100000, False, 424242)]
+    assert kernel32.WaitForSingleObject.calls == [(1234, 0)]
+    assert kernel32.CloseHandle.calls == [(1234,)]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows process semantics")
+def test_windows_pid_query_treats_invalid_parameter_as_absent(monkeypatch):
+    module = load_tool("am1_session")
+    kernel32 = fake_windows_kernel32(open_result=0, wait_result=0xFFFFFFFF)
+    monkeypatch.setattr(ctypes, "WinDLL", lambda *args, **kwargs: kernel32)
+    monkeypatch.setattr(ctypes, "get_last_error", lambda: 87)
+    monkeypatch.setattr(
+        module.os,
+        "kill",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("os.kill must not query Windows PIDs")),
+    )
+
+    assert module._pid_running(424242) is False
+    assert kernel32.CloseHandle.calls == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows process semantics")
+@pytest.mark.parametrize(
+    ("last_error", "message"),
+    [
+        (5, "access denied"),
+        (12345, "could not be verified"),
+    ],
+)
+def test_windows_pid_query_refuses_access_denied_or_unknown(monkeypatch, last_error, message):
+    module = load_tool("am1_session")
+    kernel32 = fake_windows_kernel32(open_result=0, wait_result=0xFFFFFFFF)
+    monkeypatch.setattr(ctypes, "WinDLL", lambda *args, **kwargs: kernel32)
+    monkeypatch.setattr(ctypes, "get_last_error", lambda: last_error)
+    monkeypatch.setattr(
+        module.os,
+        "kill",
+        lambda *args, **kwargs: (_ for _ in ()).throw(PermissionError("query denied")),
+    )
+
+    with pytest.raises(module.SessionError, match=message):
+        module._pid_running(424242)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows process semantics")
+def test_request_stop_keeps_fake_controller_alive_to_acknowledge_cleanup(monkeypatch, tmp_path):
+    module = load_tool("am1_session")
+    state = tmp_path / "state"
+    state.mkdir()
+    active_path = state / "active.json"
+    stop_request = state / "stop-20260921T120000-1234abcd"
+    controller_script = "\n".join(
+        [
+            "import json, os, sys, time",
+            "from pathlib import Path",
+            "stop_request = Path(sys.argv[1])",
+            "active_path = Path(sys.argv[2])",
+            "deadline = time.monotonic() + 10",
+            "while time.monotonic() < deadline:",
+            "    if stop_request.exists():",
+            "        payload = json.loads(active_path.read_text(encoding='utf-8'))",
+            "        payload.update(status='complete', final_exit_code=130)",
+            "        temporary = active_path.with_name('.active.ack.tmp')",
+            "        temporary.write_text(json.dumps(payload), encoding='utf-8')",
+            "        os.replace(temporary, active_path)",
+            "        time.sleep(30)",
+            "        raise SystemExit(0)",
+            "    time.sleep(0.01)",
+            "raise SystemExit(3)",
+        ]
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", controller_script, str(stop_request), str(active_path)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    active_path.write_text(
+        json.dumps(
+            {
+                "session_id": "20260921T120000-1234abcd",
+                "controller_pid": process.pid,
+                "stop_request": str(stop_request),
+                "status": "active",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(module, "STOP_CONFIRMATION_TIMEOUT_S", 2.0)
+    config = type("Config", (), {"local_state_directory": state})()
+
+    try:
+        assert module.request_stop(config) == 130
+        assert stop_request.read_text(encoding="utf-8") == "20260921T120000-1234abcd\n"
+        assert process.poll() is None
+    finally:
+        stop_disposable_process(process)
 
 
 def test_stop_returns_recorded_result_during_post_cleanup_collection_without_second_ssh(monkeypatch, tmp_path):
