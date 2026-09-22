@@ -73,9 +73,30 @@ function Invoke-Am1SessionEntrypoint {
         $arguments += @('collect', '--session-id', $SessionId)
     }
 
-    $PSNativeCommandUseErrorActionPreference = $false
-    & $python @arguments 2>&1 | Out-Host
-    $exitCode = [int]$LASTEXITCODE
+    # Bypass PowerShell's line-oriented native-output adapter and preserve the
+    # interactive child's real standard handles, including when an outer shell
+    # is collecting launcher output. This keeps prompts visible before input.
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $python
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardInput = $false
+    $startInfo.RedirectStandardOutput = $false
+    $startInfo.RedirectStandardError = $false
+    foreach ($argument in $arguments) {
+        $null = $startInfo.ArgumentList.Add([string]$argument)
+    }
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    try {
+        if (-not $process.Start()) {
+            throw 'Configured Windows Python did not start.'
+        }
+        $process.WaitForExit()
+        $exitCode = [int]$process.ExitCode
+    }
+    finally {
+        $process.Dispose()
+    }
     $global:LASTEXITCODE = $exitCode
     return $exitCode
 }

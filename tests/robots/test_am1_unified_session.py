@@ -45,6 +45,20 @@ def stop_disposable_process(process: subprocess.Popen) -> None:
         process.wait(timeout=5)
 
 
+def wait_for_process_output(
+    output: bytearray,
+    expected: bytes,
+    *,
+    timeout_s: float = 3.0,
+) -> None:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if expected in bytes(output):
+            return
+        time.sleep(0.01)
+    pytest.fail(f"timed out waiting for {expected!r}; output={bytes(output)!r}")
+
+
 class FakeCtypesFunction:
     def __init__(self, result):
         self.result = result
@@ -162,7 +176,7 @@ def test_coordinator_orders_startup_cleanup_and_exact_log_collection(tmp_path):
         client=Client(),
         open_browser=lambda url: events.append(("browser", url)),
         collect_remote_log=collect,
-        input_fn=lambda prompt: events.append(("prompt", prompt)) or "READY",
+        input_fn=lambda prompt: events.append(("prompt", prompt)) or "",
     ).run(
         duration_seconds=1800,
         session_id="20260920T120000-1234abcd",
@@ -204,7 +218,7 @@ def test_coordinator_reports_hardware_cleanup_before_slow_log_collection(tmp_pat
     outcome = module.SessionCoordinator(
         remote=Remote(), client=Client(), open_browser=lambda url: None,
         collect_remote_log=lambda remote, local: events.append("collect") or (True, None),
-        input_fn=lambda prompt: "READY",
+        input_fn=lambda prompt: "",
         on_cleanup=lambda outcome: events.append(("hardware_cleanup", outcome.cleanup_verified)),
     ).run(
         duration_seconds=60, session_id="20260920T120000-1234abcd",
@@ -254,7 +268,115 @@ def test_readiness_refusal_never_starts_motor_or_client_and_cleans_camera(tmp_pa
     assert outcome.final_exit_code == 2
 
 
-def test_stop_during_ready_prompt_cancels_prompt_and_cleans_camera_promptly(tmp_path):
+def test_enter_only_readiness_is_announced_before_host_start(tmp_path, capsys):
+    module = load_tool("am1_session")
+    events = []
+
+    class Remote:
+        def preflight(self):
+            events.append("preflight")
+            return {}
+
+        def start_camera(self):
+            events.append("camera")
+            return {"camera_log": "/logs/camera.log", "browser_url": "http://camera"}
+
+        def start_host(self):
+            events.append("host")
+            return {"host_log": "/logs/host.log"}
+
+        def stop(self):
+            events.append("stop")
+            return {"cleanup_verified": True}
+
+    class Client:
+        def run(self, **kwargs):
+            events.append("client")
+            return 0
+
+        def cleanup_status(self):
+            return {"cleanup_verified": True}
+
+    def press_enter(prompt):
+        events.append(("input", prompt, capsys.readouterr().out))
+        return ""
+
+    outcome = module.SessionCoordinator(
+        remote=Remote(), client=Client(), open_browser=lambda url: events.append("browser"),
+        collect_remote_log=lambda remote, local: (True, None), input_fn=press_enter,
+    ).run(
+        duration_seconds=90, session_id="20260921T120000-1234abcd",
+        session_directory=tmp_path, client_log_path=tmp_path / "client.log",
+        stop_requested=lambda: False,
+    )
+
+    input_event = next(event for event in events if isinstance(event, tuple))
+    assert input_event[1] == ""
+    assert "CONFIRMATION 1/3" in input_event[2]
+    assert events.index(input_event) < events.index("host")
+    assert outcome.final_exit_code == 0
+
+
+def test_enter_only_readiness_rejects_text_without_starting_host(tmp_path):
+    module = load_tool("am1_session")
+    events = []
+
+    class Remote:
+        def preflight(self): return {}
+        def start_camera(self): return {"camera_log": "/logs/camera.log", "browser_url": "http://camera"}
+        def start_host(self): raise AssertionError("host must not start after a non-empty response")
+        def stop(self): events.append("stop"); return {"cleanup_verified": True}
+
+    class Client:
+        def run(self, **kwargs): raise AssertionError("client must not start")
+        def cleanup_status(self): return {"cleanup_verified": True, "not_started": True}
+
+    outcome = module.SessionCoordinator(
+        remote=Remote(), client=Client(), open_browser=lambda url: None,
+        collect_remote_log=lambda remote, local: (True, None), input_fn=lambda prompt: "READY",
+    ).run(
+        duration_seconds=90, session_id="20260921T120000-1234abcd",
+        session_directory=tmp_path, client_log_path=tmp_path / "client.log",
+        stop_requested=lambda: False,
+    )
+
+    assert outcome.final_exit_code == 2
+    assert "Enter only" in outcome.failure
+    assert events == ["stop"]
+
+
+def test_enter_only_readiness_rejects_console_eof_without_starting_host(tmp_path):
+    module = load_tool("am1_session")
+    events = []
+
+    class Remote:
+        def preflight(self): return {}
+        def start_camera(self): return {"camera_log": "/logs/camera.log", "browser_url": "http://camera"}
+        def start_host(self): raise AssertionError("host must not start after console EOF")
+        def stop(self): events.append("stop"); return {"cleanup_verified": True}
+
+    class Client:
+        def run(self, **kwargs): raise AssertionError("client must not start")
+        def cleanup_status(self): return {"cleanup_verified": True, "not_started": True}
+
+    def closed_console(prompt):
+        raise EOFError("console input closed")
+
+    outcome = module.SessionCoordinator(
+        remote=Remote(), client=Client(), open_browser=lambda url: None,
+        collect_remote_log=lambda remote, local: (True, None), input_fn=closed_console,
+    ).run(
+        duration_seconds=90, session_id="20260921T120000-1234abcd",
+        session_directory=tmp_path, client_log_path=tmp_path / "client.log",
+        stop_requested=lambda: False,
+    )
+
+    assert outcome.final_exit_code == 2
+    assert outcome.failure == "EOFError: console input closed"
+    assert events == ["stop"]
+
+
+def test_stop_during_enter_confirmation_cancels_prompt_and_cleans_camera_promptly(tmp_path):
     module = load_tool("am1_session")
     stop = threading.Event()
     prompt_entered = threading.Event()
@@ -275,7 +397,7 @@ def test_stop_during_ready_prompt_cancels_prompt_and_cleans_camera_promptly(tmp_
     def blocking_input(prompt):
         prompt_entered.set()
         release_prompt.wait(5)
-        return "READY"
+        return ""
 
     coordinator = module.SessionCoordinator(
         remote=Remote(), client=Client(), open_browser=lambda url: None,
@@ -299,7 +421,7 @@ def test_stop_during_ready_prompt_cancels_prompt_and_cleans_camera_promptly(tmp_
     if runner.is_alive():
         release_prompt.set()
         runner.join(2)
-        pytest.fail("stop request did not interrupt the READY wait")
+        pytest.fail("stop request did not interrupt the Enter-confirmation wait")
 
     assert result[0].operational_exit_code == 130
     assert stopped == ["stop"]
@@ -327,7 +449,7 @@ def test_stop_during_remote_readiness_wait_is_forwarded_and_cleaned(tmp_path):
 
     coordinator = module.SessionCoordinator(
         remote=Remote(), client=Client(), open_browser=lambda url: None,
-        collect_remote_log=lambda remote, local: (True, None), input_fn=lambda prompt: "READY",
+        collect_remote_log=lambda remote, local: (True, None), input_fn=lambda prompt: "",
     )
     runner = threading.Thread(
         target=lambda: result.append(
@@ -364,7 +486,7 @@ def test_partial_camera_start_failure_still_requests_remote_cleanup(tmp_path):
 
     outcome = module.SessionCoordinator(
         remote=Remote(), client=Client(), open_browser=lambda url: None,
-        collect_remote_log=lambda remote, local: (True, None), input_fn=lambda prompt: "READY",
+        collect_remote_log=lambda remote, local: (True, None), input_fn=lambda prompt: "",
     ).run(
         duration_seconds=60, session_id="20260920T120000-1234abcd",
         session_directory=tmp_path, client_log_path=tmp_path / "client.log",
@@ -389,7 +511,7 @@ def test_remote_preflight_failure_after_process_ownership_still_requests_cleanup
 
     outcome = module.SessionCoordinator(
         remote=Remote(), client=Client(), open_browser=lambda url: None,
-        collect_remote_log=lambda remote, local: (True, None), input_fn=lambda prompt: "READY",
+        collect_remote_log=lambda remote, local: (True, None), input_fn=lambda prompt: "",
     ).run(
         duration_seconds=60, session_id="20260920T120000-1234abcd",
         session_directory=tmp_path, client_log_path=tmp_path / "client.log",
@@ -419,7 +541,7 @@ def test_explicit_stop_and_ctrl_c_both_cleanup_without_relabeling_success(tmp_pa
 
     outcome = module.SessionCoordinator(
         remote=Remote(), client=Client(), open_browser=lambda url: None,
-        collect_remote_log=lambda remote, local: (True, None), input_fn=lambda prompt: "READY",
+        collect_remote_log=lambda remote, local: (True, None), input_fn=lambda prompt: "",
     ).run(
         duration_seconds=60, session_id="20260920T120000-1234abcd",
         session_directory=tmp_path, client_log_path=tmp_path / "client.log",
@@ -445,7 +567,7 @@ def test_primary_client_failure_survives_cleanup_and_copy_failures(tmp_path):
 
     outcome = module.SessionCoordinator(
         remote=Remote(), client=Client(), open_browser=lambda url: None,
-        collect_remote_log=lambda remote, local: (False, "copy failed"), input_fn=lambda prompt: "READY",
+        collect_remote_log=lambda remote, local: (False, "copy failed"), input_fn=lambda prompt: "",
     ).run(
         duration_seconds=60, session_id="20260920T120000-1234abcd",
         session_directory=tmp_path, client_log_path=tmp_path / "client.log",
@@ -477,7 +599,7 @@ def test_primary_client_failure_survives_collection_callback_exception(tmp_path)
 
     outcome = module.SessionCoordinator(
         remote=Remote(), client=Client(), open_browser=lambda url: None,
-        collect_remote_log=collect, input_fn=lambda prompt: "READY",
+        collect_remote_log=collect, input_fn=lambda prompt: "",
     ).run(
         duration_seconds=60, session_id="20260920T120000-1234abcd",
         session_directory=tmp_path, client_log_path=tmp_path / "client.log",
@@ -509,7 +631,7 @@ def test_persisted_runtime_fault_is_not_relabelled_success_after_verified_cleanu
 
     outcome = module.SessionCoordinator(
         remote=Remote(), client=Client(), open_browser=lambda url: None,
-        collect_remote_log=lambda remote, local: (True, None), input_fn=lambda prompt: "READY",
+        collect_remote_log=lambda remote, local: (True, None), input_fn=lambda prompt: "",
     ).run(
         duration_seconds=60, session_id="20260920T120000-1234abcd",
         session_directory=tmp_path, client_log_path=tmp_path / "client.log",
@@ -1260,7 +1382,7 @@ def test_coordinator_marks_unverified_client_cleanup_even_when_remote_cleanup_pa
 
     outcome = module.SessionCoordinator(
         remote=Remote(), client=Client(), open_browser=lambda url: None,
-        collect_remote_log=lambda remote, local: (True, None), input_fn=lambda prompt: "READY",
+        collect_remote_log=lambda remote, local: (True, None), input_fn=lambda prompt: "",
     ).run(
         duration_seconds=60, session_id="20260920T120000-1234abcd",
         session_directory=tmp_path, client_log_path=tmp_path / "client.log",
@@ -1479,6 +1601,71 @@ def test_powershell_entrypoint_declares_start_stop_and_collection_without_numeri
     assert "[switch]$CollectOnly" in text
     assert "ConvertTo-Am1SessionDuration" in text
     assert "[int]$DurationSeconds" not in text
+    assert "2>&1 | Out-Host" not in text
+
+
+def test_unified_local_command_enables_enter_only_client_confirmations():
+    text = (REPO_ROOT / "tools" / "run_am1.ps1").read_text(encoding="utf-8")
+    local_command = text.split("if ($Mode -eq 'Local')", 2)[2].split(
+        "$arguments += @(\n            '--no_cameras'", 1
+    )[0]
+
+    assert "--unified_session_enter_confirmations" in local_command
+
+
+def test_camera_page_uses_neutral_read_only_viewer_wording():
+    page = (REPO_ROOT / "tools" / "am1_camera" / "index.html").read_text(encoding="utf-8")
+
+    assert "Keep motor power off" not in page
+    assert "read-only" in page.lower()
+
+
+def test_controller_prints_identity_and_persists_pre_client_failure(monkeypatch, tmp_path, capsys):
+    module = load_tool("am1_session")
+    session_id = "20260921T120000-1234abcd"
+    logs = tmp_path / "logs"
+    state = tmp_path / "state"
+    logs.mkdir()
+    state.mkdir()
+    config = type(
+        "Config",
+        (),
+        {
+            "windows_log_directory": logs,
+            "local_state_directory": state,
+        },
+    )()
+
+    class Remote:
+        def __init__(self, config, actual_session_id, session_directory):
+            assert actual_session_id == session_id
+
+        def set_stop_requested(self, callback): pass
+        def fault(self): return None
+        def preflight(self): raise module.SessionError("fake pre-client startup failure")
+        def stop(self): return {"cleanup_verified": True, "nothing_started": True}
+
+    class Client:
+        def __init__(self, *args): pass
+        def run(self, **kwargs): raise AssertionError("client must not start")
+        def cleanup_status(self): return {"cleanup_verified": True, "not_started": True}
+
+    monkeypatch.setattr(module, "_new_session_id", lambda: session_id)
+    monkeypatch.setattr(module, "SSHRemote", Remote)
+    monkeypatch.setattr(module, "WindowsClient", Client)
+    monkeypatch.setattr(module.os, "startfile", lambda path: None)
+
+    exit_code = module._run_start_locked(REPO_ROOT, config, 90)
+
+    output = capsys.readouterr().out
+    result_directory = logs / f"am1-session-{session_id}"
+    summary = json.loads((result_directory / "session-summary.json").read_text(encoding="utf-8"))
+    assert output.index(f"AM1_SESSION_ID={session_id}") < output.index("fake pre-client startup failure")
+    assert f"AM1_SESSION_RESULT={result_directory}" in output
+    assert "AM1_SESSION_FAILURE=SessionError: fake pre-client startup failure" in output
+    assert "AM1_SESSION_EXIT_CODE=2" in output
+    assert summary["failure"] == "SessionError: fake pre-client startup failure"
+    assert exit_code == 2
 
 
 @pytest.mark.parametrize("value", ["0", "1801", "1.5", "NaN", "1e3"])
@@ -1529,6 +1716,137 @@ def test_powershell_entrypoint_displays_child_output_and_returns_exact_child_exi
 
     assert result.returncode == 7
     assert "SESSION_CHILD_OUTPUT" in result.stdout
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows console and PowerShell semantics")
+def test_real_powershell_entrypoint_exposes_each_prompt_before_input_and_hands_off_to_client(tmp_path):
+    powershell = shutil.which("pwsh")
+    if powershell is None:
+        pytest.skip("PowerShell 7 is required")
+    shutil.copy2(REPO_ROOT / "tools" / "run_am1_session.ps1", tmp_path / "run_am1_session.ps1")
+    (tmp_path / "am1_session.py").write_text(
+        "\n".join(
+            [
+                "import sys",
+                "print('AM1_SESSION_ID=fake-session', flush=True)",
+                "print('AM1_SESSION_RESULT=C:/fake/results', flush=True)",
+                "for index in range(1, 4):",
+                "    try:",
+                "        print(f'CONFIRMATION {index}/3>', flush=True)",
+                "        response = input()",
+                "    except EOFError:",
+                "        print('FAKE_REFUSAL=console EOF', flush=True)",
+                "        raise SystemExit(2)",
+                "    if response != '':",
+                "        print('FAKE_REFUSAL=Enter only', flush=True)",
+                "        raise SystemExit(2)",
+                "    print(f'FAKE_STAGE_{index}_CONFIRMED', flush=True)",
+                "try:",
+                "    print('FAKE_CLIENT_INPUT>', flush=True)",
+                "    client_input = input()",
+                "except EOFError:",
+                "    print('FAKE_REFUSAL=client EOF', flush=True)",
+                "    raise SystemExit(2)",
+                "print(f'FAKE_CLIENT_INPUT={client_input}', flush=True)",
+                "raise SystemExit(0 if client_input == 'Q' else 2)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    config = tmp_path / "session.json"
+    config.write_text(json.dumps({"windows_python": sys.executable}), encoding="utf-8")
+    process = subprocess.Popen(
+        [
+            powershell, "-NoLogo", "-NoProfile", "-File", str(tmp_path / "run_am1_session.ps1"),
+            "-DurationSeconds", "90", "-ConfigPath", str(config),
+        ],
+        cwd=tmp_path,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=0,
+    )
+    output = bytearray()
+
+    def read_output():
+        assert process.stdout is not None
+        while chunk := process.stdout.read(1):
+            output.extend(chunk)
+
+    reader = threading.Thread(target=read_output, daemon=True)
+    reader.start()
+    try:
+        assert process.stdin is not None
+        for index in range(1, 4):
+            wait_for_process_output(output, f"CONFIRMATION {index}/3>".encode())
+            process.stdin.write(b"\r\n")
+            process.stdin.flush()
+            wait_for_process_output(output, f"FAKE_STAGE_{index}_CONFIRMED".encode())
+        wait_for_process_output(output, b"FAKE_CLIENT_INPUT>")
+        process.stdin.write(b"Q\r\n")
+        process.stdin.flush()
+        assert process.wait(timeout=10) == 0
+        reader.join(timeout=2)
+    finally:
+        stop_disposable_process(process)
+
+    rendered = bytes(output)
+    assert b"AM1_SESSION_ID=fake-session" in rendered
+    assert b"AM1_SESSION_RESULT=C:/fake/results" in rendered
+    assert b"FAKE_CLIENT_INPUT=Q" in rendered
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows console and PowerShell semantics")
+def test_real_powershell_entrypoint_treats_console_eof_as_refusal(tmp_path):
+    powershell = shutil.which("pwsh")
+    if powershell is None:
+        pytest.skip("PowerShell 7 is required")
+    shutil.copy2(REPO_ROOT / "tools" / "run_am1_session.ps1", tmp_path / "run_am1_session.ps1")
+    (tmp_path / "am1_session.py").write_text(
+        "import sys\n"
+        "print('AM1_SESSION_RESULT=C:/fake/results', flush=True)\n"
+        "try:\n"
+        "    print('CONFIRMATION 1/3>', flush=True)\n"
+        "    input()\n"
+        "except EOFError:\n"
+        "    print('FAKE_REFUSAL=console EOF', flush=True)\n"
+        "    raise SystemExit(2)\n"
+        "raise SystemExit(0)\n",
+        encoding="utf-8",
+    )
+    config = tmp_path / "session.json"
+    config.write_text(json.dumps({"windows_python": sys.executable}), encoding="utf-8")
+    process = subprocess.Popen(
+        [
+            powershell, "-NoLogo", "-NoProfile", "-File", str(tmp_path / "run_am1_session.ps1"),
+            "-DurationSeconds", "90", "-ConfigPath", str(config),
+        ],
+        cwd=tmp_path,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=0,
+    )
+    output = bytearray()
+
+    def read_output():
+        assert process.stdout is not None
+        while chunk := process.stdout.read(1):
+            output.extend(chunk)
+
+    reader = threading.Thread(target=read_output, daemon=True)
+    reader.start()
+    try:
+        wait_for_process_output(output, b"CONFIRMATION 1/3>")
+        assert process.stdin is not None
+        process.stdin.close()
+        assert process.wait(timeout=10) == 2
+        reader.join(timeout=2)
+    finally:
+        stop_disposable_process(process)
+
+    assert b"FAKE_REFUSAL=console EOF" in bytes(output)
 
 
 def test_local_runtime_uses_direct_logger_instead_of_tee_pipeline():

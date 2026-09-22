@@ -122,6 +122,20 @@ def wait_for_input_or_stop(
     return str(value)
 
 
+def require_enter_confirmation(
+    input_fn: Callable[[str], str],
+    message: str,
+) -> None:
+    """Print one complete prompt line, then accept only a deliberate bare Enter."""
+    print(message, flush=True)
+    try:
+        response = input_fn("")
+    except (EOFError, OSError, TimeoutError) as exc:
+        raise SafetyRefusal("Enter-only confirmation refused because console input closed or failed") from exc
+    if response != "":
+        raise SafetyRefusal("Enter-only confirmation requires Enter only; non-empty input was refused")
+
+
 class StaleFollowerObservation(RuntimeError):
     """A live follower sample was cached, partial, or otherwise unusable."""
 
@@ -832,6 +846,7 @@ def run_startup_sync(
     input_fn: Callable[[str], str],
     monotonic: Callable[[], float],
     sleep_fn: Callable[[float], None],
+    enter_confirmation: bool = False,
 ) -> tuple[dict[str, float], dict[str, Any], float]:
     print("HOLD LEADERS STILL — STARTUP SYNCHRONIZATION IN PROGRESS")
     initial_observation = get_fresh_follower_observation(robot)
@@ -855,7 +870,13 @@ def run_startup_sync(
     _print_alignment_table(build_alignment_rows(initial_follower, initial_leader))
     _print_startup_sync_plan(preliminary_plan, label="Preliminary")
     _print_startup_sync_safety_instructions()
-    if input_fn("Type exactly SYNC and press Enter to begin follower motion: ") != "SYNC":
+    if enter_confirmation:
+        require_enter_confirmation(
+            input_fn,
+            "CONFIRMATION 2/3 — Hold both leaders still and press Enter only to begin the nominal "
+            "30-second arm synchronization.",
+        )
+    elif input_fn("Type exactly SYNC and press Enter to begin follower motion: ") != "SYNC":
         raise SafetyRefusal("startup synchronization requires the operator to type exactly SYNC")
 
     start_observation = get_fresh_follower_observation(robot)
@@ -1097,6 +1118,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Session-owned cooperative stop request (Local mode only)",
     )
     parser.add_argument(
+        "--unified_session_enter_confirmations",
+        action="store_true",
+        help="Use the supervised Local session's three deliberate Enter-only startup confirmations",
+    )
+    parser.add_argument(
         "--robot.remote_ip",
         "--remote_ip",
         dest="remote_ip",
@@ -1149,6 +1175,11 @@ def parse_args(
             parser.error("--external_stop_file is available only with --local_mode")
         if not args.external_stop_file.is_absolute():
             parser.error("--external_stop_file must be an absolute path")
+    if args.unified_session_enter_confirmations:
+        if not args.local_mode or args.external_stop_file is None:
+            parser.error(
+                "--unified_session_enter_confirmations requires --local_mode and --external_stop_file"
+            )
     if args.fps <= 0:
         parser.error("--fps must be greater than zero")
     if args.duration_s < 0:
@@ -1860,6 +1891,7 @@ def run_teleoperation(
                         input_fn=stop_aware_input,
                         monotonic=monotonic,
                         sleep_fn=stop_aware_sleep,
+                        enter_confirmation=getattr(args, "unified_session_enter_confirmations", False),
                     )
                     print("SYNCHRONIZATION COMPLETE")
                     if args.startup_sync_only:
@@ -1886,8 +1918,19 @@ def run_teleoperation(
                 robot.send_action(make_zero_action())
             _print_connection_summary(args)
             if args.robot_model == "alohamini1":
-                print("PRESS ENTER TO ENABLE LIVE TELEOPERATION")
-                stop_aware_input("")
+                if getattr(args, "unified_session_enter_confirmations", False):
+                    try:
+                        require_enter_confirmation(
+                            stop_aware_input,
+                            "CONFIRMATION 3/3 — Keep both leaders still and press Enter only to recheck "
+                            "alignment and enable live teleoperation.",
+                        )
+                    except SafetyRefusal as exc:
+                        print(f"SAFETY REFUSAL: {exc}")
+                        return 2
+                else:
+                    print("PRESS ENTER TO ENABLE LIVE TELEOPERATION")
+                    stop_aware_input("")
             else:
                 stop_aware_input("Press Enter to begin forwarding leader actions... ")
             if args.robot_model == "alohamini1" and robot_connected and right_leader_connected:

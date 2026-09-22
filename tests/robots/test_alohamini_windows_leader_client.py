@@ -1342,6 +1342,97 @@ def test_sync_requires_exact_confirmation_before_any_arm_send(monkeypatch, respo
     assert sum(event[:2] == ("leader", "get_action") for event in events) == 1
 
 
+def test_unified_session_enter_confirmation_is_visible_and_starts_sync(monkeypatch, capsys):
+    module = load_example_module("teleoperate_bi")
+    robot, leader, events = make_direct_sync_fakes(
+        monkeypatch,
+        module,
+        observation_poses=[FOLLOWER_POSE, FOLLOWER_POSE, FOLLOWER_POSE],
+        action_poses=[LEADER_POSE, LEADER_POSE, LEADER_POSE, LEADER_POSE],
+    )
+    clock = FakeClock(events)
+
+    def press_enter(prompt):
+        output = capsys.readouterr().out
+        assert prompt == ""
+        assert "CONFIRMATION 2/3" in output
+        assert arm_send_actions(events) == []
+        return ""
+
+    module.run_startup_sync(
+        robot,
+        leader,
+        side="both",
+        requested_duration_s=0.2,
+        fps=5,
+        max_start_mismatch=10.0,
+        input_fn=press_enter,
+        monotonic=clock.monotonic,
+        sleep_fn=clock.sleep,
+        enter_confirmation=True,
+    )
+
+    assert arm_send_actions(events)
+
+
+@pytest.mark.parametrize("response", ["SYNC", "READY", " "])
+def test_unified_session_sync_refuses_nonempty_confirmation_before_arm_send(monkeypatch, response):
+    module = load_example_module("teleoperate_bi")
+    robot, leader, events = make_direct_sync_fakes(
+        monkeypatch,
+        module,
+        observation_poses=[FOLLOWER_POSE],
+        action_poses=[LEADER_POSE],
+    )
+    clock = FakeClock(events)
+
+    with pytest.raises(module.SafetyRefusal, match="Enter only"):
+        module.run_startup_sync(
+            robot,
+            leader,
+            side="both",
+            requested_duration_s=0.2,
+            fps=5,
+            max_start_mismatch=10.0,
+            input_fn=lambda prompt: response,
+            monotonic=clock.monotonic,
+            sleep_fn=clock.sleep,
+            enter_confirmation=True,
+        )
+
+    assert arm_send_actions(events) == []
+
+
+def test_unified_session_sync_refuses_console_eof_before_arm_send(monkeypatch):
+    module = load_example_module("teleoperate_bi")
+    robot, leader, events = make_direct_sync_fakes(
+        monkeypatch,
+        module,
+        observation_poses=[FOLLOWER_POSE],
+        action_poses=[LEADER_POSE],
+    )
+    clock = FakeClock(events)
+
+    def closed_console(prompt):
+        raise EOFError("console closed")
+
+    with pytest.raises(module.SafetyRefusal, match="console input closed"):
+        module.run_startup_sync(
+            robot,
+            leader,
+            side="both",
+            requested_duration_s=0.2,
+            fps=5,
+            max_start_mismatch=10.0,
+            input_fn=closed_console,
+            monotonic=clock.monotonic,
+            sleep_fn=clock.sleep,
+            enter_confirmation=True,
+        )
+
+    assert arm_send_actions(events) == []
+
+
 def test_sync_uses_post_confirmation_start_and_frozen_target_for_bounded_payloads(monkeypatch, capsys):
     module = load_example_module("teleoperate_bi")
     initial_follower = {**FOLLOWER_POSE, "arm_left_shoulder_pan.pos": -5.0}
@@ -2019,8 +2110,9 @@ def test_am1_phase_messages_guard_start_paused_first_ordinary_send(monkeypatch):
 
     monkeypatch.setattr("builtins.print", record_console_event)
     args = sync_args(module, "--start_paused", "--duration_s", "0.2")
+    args.unified_session_enter_confirmations = True
     clock = FakeClock(events)
-    responses = iter(("SYNC", ""))
+    responses = iter(("", ""))
 
     status = module.run_teleoperation(
         args,
@@ -2031,8 +2123,9 @@ def test_am1_phase_messages_guard_start_paused_first_ordinary_send(monkeypatch):
 
     expected_phases = (
         "HOLD LEADERS STILL — STARTUP SYNCHRONIZATION IN PROGRESS",
+        "CONFIRMATION 2/3 — Hold both leaders still and press Enter only to begin the nominal 30-second arm synchronization.",
         "SYNCHRONIZATION COMPLETE",
-        "PRESS ENTER TO ENABLE LIVE TELEOPERATION",
+        "CONFIRMATION 3/3 — Keep both leaders still and press Enter only to recheck alignment and enable live teleoperation.",
         "TELEOPERATION ACTIVE — LEADER MOVEMENT IS NOW ALLOWED",
     )
     phase_events = [event[1] for event in events if event[0] == "console" and event[1] in expected_phases]

@@ -273,6 +273,7 @@ class SessionCoordinator:
                 self.remote.set_stop_requested(stop_requested)
             remote_started = True
             preflight = self.remote.preflight()
+            print("AM1 session phase: Pi source and ownership preflight passed.", flush=True)
             outcome.sources = {
                 key: str(value)
                 for key, value in preflight.items()
@@ -282,23 +283,32 @@ class SessionCoordinator:
             if camera.get("camera_log"):
                 remote_logs.append(camera["camera_log"])
             self.open_browser(camera["browser_url"])
+            print("AM1 session phase: all five camera sources are ready; the read-only viewer is open.", flush=True)
+            print(
+                "CONFIRMATION 1/3 — Verify all five required views are usable, the workspace is clear, "
+                "carriage support and motor-power removal are accessible, and established robot/leader "
+                "power is ready. Press Enter only to start the motor host.",
+                flush=True,
+            )
             approval = self._input_with_stop(
-                (
-                    "Confirm all five required views are usable, the workspace is clear, carriage support and "
-                    "motor-power removal are accessible, and robot/leader power is ready. Type exactly READY: "
-                ),
+                "",
                 stop_requested,
             )
-            if approval != "READY":
-                outcome.failure = "physical/view readiness was not approved with exact READY"
+            if approval != "":
+                outcome.failure = "physical/view readiness requires Enter only; non-empty input was refused"
                 outcome.operational_exit_code = 2
             elif stop_requested():
                 outcome.failure = "session stop requested before motor activation"
                 outcome.operational_exit_code = 130
             else:
+                print("AM1 session phase: operator readiness confirmed; starting the motor host.", flush=True)
                 host = self.remote.start_host()
                 if host.get("host_log"):
                     remote_logs.insert(0, host["host_log"])
+                print(
+                    "AM1 session phase: motor host is operational; handing the console to the Windows Local client.",
+                    flush=True,
+                )
                 outcome.operational_exit_code = int(
                     self.client.run(
                         duration_seconds=duration_seconds,
@@ -973,6 +983,9 @@ def _run_start_locked(repository: Path, config: SessionConfig, duration_seconds:
             "status": "active",
         },
     )
+    print(f"AM1_SESSION_ID={session_id}", flush=True)
+    print(f"AM1_SESSION_RESULT={session_directory}", flush=True)
+    print("AM1 session phase: starting bounded source and ownership preflight.", flush=True)
     remote = SSHRemote(config, session_id, session_directory)
     client = WindowsClient(repository, config, remote.fault, stop_request)
     def record_hardware_cleanup(outcome: SessionOutcome) -> None:
@@ -1013,9 +1026,9 @@ def _run_start_locked(repository: Path, config: SessionConfig, duration_seconds:
         },
     )
     stop_request.unlink(missing_ok=True)
-    print(f"AM1_SESSION_ID={session_id}")
-    print(f"AM1_SESSION_RESULT={session_directory}")
-    print(f"AM1_SESSION_EXIT_CODE={outcome.final_exit_code}")
+    if outcome.failure:
+        print(f"AM1_SESSION_FAILURE={outcome.failure}", flush=True)
+    print(f"AM1_SESSION_EXIT_CODE={outcome.final_exit_code}", flush=True)
     if outcome.missing_logs:
         print("Log collection is incomplete; rerun with -CollectOnly -SessionId " + session_id)
     if os.name == "nt":

@@ -212,6 +212,7 @@ function New-Am1WindowsCommand {
                     throw '-StopRequestPath must be an absolute path.'
                 }
                 $arguments += @('--external_stop_file', [System.IO.Path]::GetFullPath($StopRequestPath))
+                $arguments += '--unified_session_enter_confirmations'
             }
         }
         else {

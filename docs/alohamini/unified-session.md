@@ -10,15 +10,17 @@ continuity target. Loss of a required view still means release controls, press
 
 ## Compact design
 
-- Windows is the session controller and remains the interactive owner of `SYNC`,
-  final Enter approval, keyboard controls, and `Q`.
+- Windows is the session controller and remains the interactive owner of all
+  three Enter-only startup confirmations, keyboard controls, and `Q`. Direct
+  non-session launchers retain their existing confirmations.
 - One foreground SSH connection starts one session-scoped Pi supervisor. The
   supervisor starts only the existing camera and Local launchers, each in its own
   recorded process group. It has no listener, requires a bounded controller
   heartbeat, and treats controller loss or EOF as a stop.
 - Camera startup must report its exact log, URL, five configured roles, and one
-  all-fresh status sample before the browser opens. Exact `READY` approval is
-  required before the motor host starts.
+  all-fresh status sample before the browser opens. A deliberate bare Enter at
+  the complete `CONFIRMATION 1/3` prompt is required before the motor host
+  starts; text, EOF, cancelled input, and console failure are refusals.
 - The motor host must report its exact log and structured `operational_ready`
   state after homing and lower-stop relief before the Windows client starts.
 - The client retains a completion-spaced 10 Hz sender, body-command expiry,
@@ -71,10 +73,21 @@ suite or 30-minute endurance run:
 
 The command performs software/source/ownership preflight with no hardware
 access, starts the camera owner, opens the existing authenticated browser URL,
-and then asks for exact `READY`. Before typing it, verify all five required views
-and the physical envelope. The Pi host then homes and relieves the lift and must
-reach `operational_ready`. The client preserves the existing exact `SYNC` and
-post-sync Enter gates. Hold leaders still until `TELEOPERATION ACTIVE`.
+and prints the session ID and result-folder path immediately. It then uses three
+complete, visible prompts, each accepting only a bare Enter:
+
+1. After all five camera views are fresh, verify the views, physical envelope,
+   support, and power-removal access; press Enter to start the motor host.
+2. After the host homes and relieves the lift and the client displays the
+   alignment plan, hold both leaders still; press Enter to begin the nominal
+   30-second synchronization.
+3. After synchronization, continue holding the leaders still; press Enter to
+   perform the final alignment check and enable live control.
+
+Do not pre-feed blank lines. Hold both leaders still until `TELEOPERATION
+ACTIVE`. Text, EOF, cancellation, or input failure at any confirmation refuses
+the transition. A startup failure prints its reason, session result folder, and
+actual exit code in the foreground terminal.
 
 During live use, release motion keys before changing support. `Q` is the normal
 single quit action. Duration expiry follows the same shutdown path. Either now
