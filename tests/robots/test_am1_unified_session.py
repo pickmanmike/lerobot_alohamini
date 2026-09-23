@@ -427,6 +427,65 @@ def test_stop_during_enter_confirmation_cancels_prompt_and_cleans_camera_promptl
     assert stopped == ["stop"]
 
 
+def test_remote_fault_during_first_enter_refuses_before_host_start(tmp_path):
+    module = load_tool("am1_session")
+    remote_fault = threading.Event()
+    prompt_entered = threading.Event()
+    release_prompt = threading.Event()
+    host_started: list[bool] = []
+    stopped: list[str] = []
+    result = []
+
+    class Remote:
+        def preflight(self): return {}
+        def start_camera(self): return {"camera_log": "/logs/camera.log", "browser_url": "http://camera"}
+        def start_host(self): host_started.append(True); return {"host_log": "/logs/host.log"}
+        def fault(self):
+            if remote_fault.is_set():
+                return {"event": "fault", "reason": "SSH controller exited with status 255"}
+            return None
+        def stop(self): stopped.append("stop"); return {"cleanup_verified": False}
+
+    class Client:
+        def run(self, **kwargs): raise AssertionError("client must not start after a remote fault")
+        def cleanup_status(self): return {"cleanup_verified": True, "not_started": True}
+
+    def blocking_input(prompt):
+        prompt_entered.set()
+        release_prompt.wait(5)
+        return ""
+
+    coordinator = module.SessionCoordinator(
+        remote=Remote(), client=Client(), open_browser=lambda url: None,
+        collect_remote_log=lambda remote, local: (True, None), input_fn=blocking_input,
+    )
+    runner = threading.Thread(
+        target=lambda: result.append(
+            coordinator.run(
+                duration_seconds=90,
+                session_id="20260922T120000-1234abcd",
+                session_directory=tmp_path,
+                client_log_path=tmp_path / "client.log",
+                stop_requested=lambda: False,
+            )
+        )
+    )
+    runner.start()
+    assert prompt_entered.wait(1)
+    remote_fault.set()
+    runner.join(1)
+    if runner.is_alive():
+        release_prompt.set()
+        runner.join(2)
+        pytest.fail("remote failure did not interrupt the first Enter confirmation")
+
+    release_prompt.set()
+    assert host_started == []
+    assert stopped == ["stop"]
+    assert result[0].operational_exit_code == 2
+    assert "SSH controller exited with status 255" in result[0].failure
+
+
 def test_stop_during_remote_readiness_wait_is_forwarded_and_cleaned(tmp_path):
     module = load_tool("am1_session")
     stop = threading.Event()
@@ -683,7 +742,182 @@ def test_remote_stop_recovers_verified_cleanup_from_persisted_state_after_contro
         "persisted_status": "complete",
         "terminal_status": "complete",
         "stop_reason": "controller_eof",
+        "persisted_state_available": True,
+        "persisted_state_terminal": True,
     }
+
+
+def test_persisted_state_retains_nonterminal_status_reason_and_exact_logs(monkeypatch, tmp_path):
+    module = load_tool("am1_session")
+    config = type(
+        "Config",
+        (),
+        {
+            "ssh_target": "am1-pi",
+            "remote_python": "/python",
+            "remote_helper": "/helper.py",
+            "remote_state_directory": "/state",
+        },
+    )()
+    remote = module.SSHRemote(config, "20260922T120000-1234abcd", tmp_path)
+    state = {
+        "session_id": remote.session_id,
+        "status": "host_starting",
+        "host_log": "/logs/exact-host.log",
+        "camera_log": "/logs/exact-camera.log",
+        "cleanup": None,
+    }
+    monkeypatch.setattr(
+        module.subprocess,
+        "run",
+        lambda *args, **kwargs: type(
+            "Completed", (), {"returncode": 2, "stdout": json.dumps(state), "stderr": ""}
+        )(),
+    )
+
+    recovered = remote._persisted_terminal_state()
+
+    assert recovered["persisted_state_available"] is True
+    assert recovered["persisted_state_terminal"] is False
+    assert recovered["persisted_status"] == "host_starting"
+    assert recovered["host_log"] == "/logs/exact-host.log"
+    assert recovered["camera_log"] == "/logs/exact-camera.log"
+    assert recovered["cleanup_verified"] is False
+    assert "nonterminal" in recovered["cleanup_error"]
+
+
+def test_persisted_state_retries_once_then_recovers_exact_terminal_state(monkeypatch, tmp_path):
+    module = load_tool("am1_session")
+    config = type(
+        "Config",
+        (),
+        {
+            "ssh_target": "am1-pi",
+            "remote_python": "/python",
+            "remote_helper": "/helper.py",
+            "remote_state_directory": "/state",
+        },
+    )()
+    remote = module.SSHRemote(config, "20260922T120000-1234abcd", tmp_path)
+    state = {
+        "session_id": remote.session_id,
+        "status": "fault",
+        "host_log": "/logs/exact-host.log",
+        "camera_log": "/logs/exact-camera.log",
+        "stop_reason": "controller_lease_expired",
+        "cleanup": {"cleanup_verified": True, "host_exit": 0, "camera_exit": 0},
+    }
+    calls = []
+
+    def run(*args, **kwargs):
+        calls.append((args, kwargs))
+        if len(calls) == 1:
+            return type("Completed", (), {"returncode": 255, "stdout": "", "stderr": "link down"})()
+        return type("Completed", (), {"returncode": 2, "stdout": json.dumps(state), "stderr": ""})()
+
+    monkeypatch.setattr(module.subprocess, "run", run)
+    monkeypatch.setattr(module.time, "sleep", lambda duration: None)
+
+    recovered = remote._persisted_terminal_state()
+
+    assert len(calls) == 2
+    assert recovered["persisted_state_available"] is True
+    assert recovered["persisted_state_terminal"] is True
+    assert recovered["persisted_status"] == "fault"
+    assert recovered["stop_reason"] == "controller_lease_expired"
+    assert recovered["persisted_state_errors"] == ["attempt 1: SSH state query exited 255: link down"]
+
+
+def test_persisted_state_retries_nonterminal_state_until_terminal(monkeypatch, tmp_path):
+    module = load_tool("am1_session")
+    config = type(
+        "Config",
+        (),
+        {
+            "ssh_target": "am1-pi",
+            "remote_python": "/python",
+            "remote_helper": "/helper.py",
+            "remote_state_directory": "/state",
+        },
+    )()
+    remote = module.SSHRemote(config, "20260922T120000-1234abcd", tmp_path)
+    nonterminal = {
+        "session_id": remote.session_id,
+        "status": "stopping",
+        "host_log": "/logs/exact-host.log",
+        "camera_log": "/logs/exact-camera.log",
+        "cleanup": None,
+    }
+    terminal = {
+        **nonterminal,
+        "status": "complete",
+        "stop_reason": "controller_eof",
+        "cleanup": {"cleanup_verified": True, "host_exit": 0, "camera_exit": 0},
+    }
+    responses = iter([nonterminal, terminal])
+    calls = []
+
+    def run(*args, **kwargs):
+        calls.append((args, kwargs))
+        return type(
+            "Completed",
+            (),
+            {"returncode": 0, "stdout": json.dumps(next(responses)), "stderr": ""},
+        )()
+
+    monkeypatch.setattr(module.subprocess, "run", run)
+    monkeypatch.setattr(module.time, "sleep", lambda duration: None)
+
+    recovered = remote._persisted_terminal_state()
+
+    assert len(calls) == 2
+    assert recovered["persisted_state_terminal"] is True
+    assert recovered["persisted_status"] == "complete"
+    assert recovered["cleanup_verified"] is True
+
+
+def test_persisted_state_reports_every_failed_lookup_reason(monkeypatch, tmp_path):
+    module = load_tool("am1_session")
+    config = type(
+        "Config",
+        (),
+        {
+            "ssh_target": "am1-pi",
+            "remote_python": "/python",
+            "remote_helper": "/helper.py",
+            "remote_state_directory": "/state",
+        },
+    )()
+    remote = module.SSHRemote(config, "20260922T120000-1234abcd", tmp_path)
+    responses = iter(
+        [
+            type("Completed", (), {"returncode": 255, "stdout": "", "stderr": "link unavailable"})(),
+            type("Completed", (), {"returncode": 2, "stdout": "{", "stderr": "state lookup refused"})(),
+            type(
+                "Completed",
+                (),
+                {
+                    "returncode": 0,
+                    "stdout": json.dumps({"session_id": "20260922T120000-deadbeef", "status": "complete"}),
+                    "stderr": "",
+                },
+            )(),
+        ]
+    )
+    monkeypatch.setattr(module.subprocess, "run", lambda *args, **kwargs: next(responses))
+    monkeypatch.setattr(module.time, "sleep", lambda duration: None)
+
+    recovered = remote._persisted_terminal_state()
+
+    assert recovered["persisted_state_available"] is False
+    assert recovered["persisted_state_terminal"] is False
+    assert recovered["persisted_state_errors"] == [
+        "attempt 1: SSH state query exited 255: link unavailable",
+        "attempt 2: persisted state was not valid JSON: Expecting property name enclosed in double quotes: "
+        "line 1 column 2 (char 1); stderr: state lookup refused",
+        "attempt 3: persisted session identity did not match",
+    ]
+    assert recovered["persisted_state_error"] == recovered["persisted_state_errors"][-1]
 
 
 def test_control_ssh_uses_bounded_keepalive_and_noninteractive_authentication(tmp_path):
@@ -715,6 +949,163 @@ def test_control_ssh_uses_bounded_keepalive_and_noninteractive_authentication(tm
     assert "ServerAliveCountMax=3" in command
 
 
+def test_remote_fault_preserves_first_reason_and_records_later_heartbeat_error(tmp_path):
+    module = load_tool("am1_session")
+    remote = module.SSHRemote(type("Config", (), {})(), "20260922T120000-1234abcd", tmp_path)
+    first = {"event": "runtime_fault", "reason": "controller heartbeat lease expired"}
+    later = {"event": "fault", "reason": "controller heartbeat failed: control link unavailable"}
+
+    remote._record_fault(first)
+    remote._record_fault(later)
+
+    assert remote.fault() == first
+    assert remote.diagnostics()["later_errors"] == [later]
+
+
+def test_remote_wait_reports_ssh_exit_status_and_stderr(tmp_path):
+    module = load_tool("am1_session")
+    remote = module.SSHRemote(type("Config", (), {})(), "20260922T120000-1234abcd", tmp_path)
+    stderr_path = tmp_path / "ssh-control.log"
+    stderr_path.write_text("Timeout, server 192.0.2.1 not responding.\n", encoding="utf-8")
+
+    class Process:
+        returncode = 255
+        def poll(self): return 255
+
+    remote.process = Process()
+    remote.stderr_path = stderr_path
+
+    with pytest.raises(module.SessionError, match="SSH controller exited with status 255"):
+        remote._wait("host_ready", 0.2)
+
+    fault = remote.fault()
+    assert fault["ssh_exit_status"] == 255
+    assert fault["ssh_stderr"] == "Timeout, server 192.0.2.1 not responding."
+
+
+def test_remote_stop_records_ssh_exit_after_earlier_heartbeat_fault(monkeypatch, tmp_path):
+    module = load_tool("am1_session")
+    remote = module.SSHRemote(type("Config", (), {})(), "20260922T120000-1234abcd", tmp_path)
+    remote.stderr_path.write_text("Timeout, server 192.0.2.1 not responding.\n", encoding="utf-8")
+    heartbeat = {"event": "fault", "reason": "controller heartbeat failed: control link unavailable"}
+    remote._record_fault(heartbeat)
+
+    class Process:
+        returncode = 255
+        def poll(self): return 255
+
+    remote.process = Process()
+    monkeypatch.setattr(
+        remote,
+        "_persisted_terminal_state",
+        lambda: {
+            "cleanup_verified": True,
+            "persisted_status": "fault",
+            "terminal_status": "fault",
+            "persisted_state_available": True,
+            "persisted_state_terminal": True,
+        },
+    )
+
+    cleanup = remote.stop()
+
+    assert cleanup["primary_fault"] == heartbeat
+    assert cleanup["later_errors"] == [
+        {
+            "event": "fault",
+            "reason": "SSH controller exited with status 255 before cleanup verification",
+            "ssh_exit_status": 255,
+            "ssh_stderr": "Timeout, server 192.0.2.1 not responding.",
+        }
+    ]
+
+
+def test_remote_stop_retains_diagnostics_after_cleanup_event_and_nonzero_ssh_exit(monkeypatch, tmp_path):
+    module = load_tool("am1_session")
+    remote = module.SSHRemote(type("Config", (), {})(), "20260922T120000-1234abcd", tmp_path)
+    remote.stderr_path.write_text("connection reset after cleanup\n", encoding="utf-8")
+    first = {"event": "runtime_fault", "reason": "first remote fault"}
+    remote._record_fault(first)
+
+    class Stream:
+        def close(self): pass
+
+    class Process:
+        def __init__(self):
+            self.stdin = Stream()
+            self.returncode = None
+        def poll(self): return self.returncode
+        def wait(self, timeout): self.returncode = 255; return 255
+
+    remote.process = Process()
+    monkeypatch.setattr(remote, "_send", lambda command: None)
+    monkeypatch.setattr(
+        remote,
+        "_wait",
+        lambda *args, **kwargs: {
+            "event": "cleanup_complete",
+            "session_id": remote.session_id,
+            "cleanup_verified": True,
+        },
+    )
+
+    cleanup = remote.stop()
+
+    assert cleanup["cleanup_verified"] is True
+    assert cleanup["primary_fault"] == first
+    assert cleanup["later_errors"] == [
+        {
+            "event": "fault",
+            "reason": "SSH controller exited with status 255 after cleanup_complete",
+            "ssh_exit_status": 255,
+            "ssh_stderr": "connection reset after cleanup",
+        }
+    ]
+
+
+def test_remote_stop_does_not_verify_cleanup_while_ssh_controller_remains_active(monkeypatch, tmp_path):
+    module = load_tool("am1_session")
+    remote = module.SSHRemote(type("Config", (), {})(), "20260922T120000-1234abcd", tmp_path)
+
+    class Stream:
+        def __init__(self): self.closed = False
+        def close(self): self.closed = True
+
+    class Process:
+        returncode = None
+        def __init__(self): self.stdin = Stream()
+        def poll(self): return None
+        def wait(self, timeout): raise module.subprocess.TimeoutExpired("ssh", timeout)
+
+    process = Process()
+    remote.process = process
+    monkeypatch.setattr(remote, "_send", lambda command: None)
+    monkeypatch.setattr(
+        remote,
+        "_wait",
+        lambda *args, **kwargs: (_ for _ in ()).throw(module.SessionError("cleanup event timeout")),
+    )
+    monkeypatch.setattr(
+        remote,
+        "_persisted_terminal_state",
+        lambda: {
+            "cleanup_verified": True,
+            "persisted_status": "complete",
+            "terminal_status": "complete",
+            "persisted_state_available": True,
+            "persisted_state_terminal": True,
+        },
+    )
+
+    cleanup = remote.stop()
+
+    assert process.stdin.closed is True
+    assert cleanup["persisted_cleanup_verified"] is True
+    assert cleanup["cleanup_verified"] is False
+    assert "remained active" in cleanup["cleanup_error"]
+    assert "cleanup event timeout" in cleanup["control_cleanup_error"]
+
+
 def test_remote_stop_closes_control_stdin_and_uses_persisted_cleanup_when_stop_send_fails(monkeypatch, tmp_path):
     module = load_tool("am1_session")
     config = type("Config", (), {})()
@@ -737,7 +1128,13 @@ def test_remote_stop_closes_control_stdin_and_uses_persisted_cleanup_when_stop_s
     monkeypatch.setattr(
         remote,
         "_persisted_terminal_state",
-        lambda: {"cleanup_verified": True, "terminal_status": "fault", "persisted_status": "fault"},
+        lambda: {
+            "cleanup_verified": True,
+            "terminal_status": "fault",
+            "persisted_status": "fault",
+            "persisted_state_available": True,
+            "persisted_state_terminal": True,
+        },
     )
 
     result = remote.stop()
@@ -776,6 +1173,17 @@ def test_remote_readiness_requires_all_fresh_cameras_and_operational_host_marker
     assert module.parse_camera_readiness(camera.replace(",wrist_right", "")) is None
     assert module.host_is_operational('{"phase":"operational_ready","height_mm":10.1}') is True
     assert module.host_is_operational('{"phase":"home_complete"}') is False
+
+
+def test_remote_host_readiness_accepts_actual_lift_operational_log_format():
+    module = load_tool("am1_session_remote")
+    actual_record = (
+        '[LIFT OPERATIONAL] {"phase":"operational_ready","elapsed_s":6.733,'
+        '"height_mm":10.376953125,"policy":"am1-confirmed-temperature-relief-v1"}\n'
+    )
+
+    assert module.host_is_operational(actual_record) is True
+    assert module.host_is_operational(actual_record.replace("operational_ready", "home_complete")) is False
 
 
 def test_remote_bounded_reader_finds_late_host_readiness_and_waits_for_complete_line(tmp_path):
@@ -1406,7 +1814,7 @@ def test_collect_only_refuses_manifest_destination_outside_exact_session_directo
                 "session_id": session_id,
                 "missing": [
                     {
-                        "remote_path": "/logs/host.log",
+                        "remote_path": "/logs/am1-host.log",
                         "destination": str(outside),
                         "error": "old failure",
                     }
@@ -1415,7 +1823,9 @@ def test_collect_only_refuses_manifest_destination_outside_exact_session_directo
         ),
         encoding="utf-8",
     )
-    (directory / "session-summary.json").write_text("{}", encoding="utf-8")
+    (directory / "session-summary.json").write_text(
+        json.dumps({"session_id": session_id}), encoding="utf-8"
+    )
     config = type(
         "Config",
         (),
@@ -1426,10 +1836,173 @@ def test_collect_only_refuses_manifest_destination_outside_exact_session_directo
         },
     )()
 
-    with pytest.raises(module.SessionError, match="outside the exact session directory"):
+    with pytest.raises(module.SessionError, match="exact log filename"):
         module.collect_only(config, session_id)
 
     assert not outside.exists()
+
+
+def test_collect_only_refuses_manifest_overwrite_of_original_summary(tmp_path):
+    module = load_tool("am1_session")
+    session_id = "20260920T120000-1234abcd"
+    directory = tmp_path / f"am1-session-{session_id}"
+    directory.mkdir()
+    summary_path = directory / "session-summary.json"
+    original_summary = json.dumps({"session_id": session_id}) + "\n"
+    summary_path.write_text(original_summary, encoding="utf-8")
+    (directory / "missing-logs.json").write_text(
+        json.dumps(
+            {
+                "session_id": session_id,
+                "missing": [
+                    {
+                        "remote_path": "/logs/am1-exact-host.log",
+                        "destination": str(summary_path),
+                        "error": "old failure",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = type("Config", (), {"windows_log_directory": tmp_path, "remote_log_directory": "/logs"})()
+
+    with pytest.raises(module.SessionError, match="exact log filename"):
+        module.collect_only(config, session_id)
+
+    assert summary_path.read_text(encoding="utf-8") == original_summary
+
+
+@pytest.mark.parametrize(
+    ("artifact", "identity"),
+    [
+        ("session-summary.json", None),
+        ("session-summary.json", "20260920T120000-deadbeef"),
+        ("missing-logs.json", None),
+        ("missing-logs.json", "20260920T120000-deadbeef"),
+    ],
+)
+def test_collect_only_requires_exact_session_identity(tmp_path, artifact, identity):
+    module = load_tool("am1_session")
+    session_id = "20260920T120000-1234abcd"
+    directory = tmp_path / f"am1-session-{session_id}"
+    directory.mkdir()
+    (directory / "session-summary.json").write_text(
+        json.dumps({"session_id": session_id}), encoding="utf-8"
+    )
+    payload = {"missing": []} if artifact == "missing-logs.json" else {}
+    if identity is not None:
+        payload["session_id"] = identity
+    (directory / artifact).write_text(json.dumps(payload), encoding="utf-8")
+    config = type("Config", (), {"windows_log_directory": tmp_path})()
+
+    with pytest.raises(module.SessionError, match="identity does not match"):
+        module.collect_only(config, session_id)
+
+
+def test_collect_only_discovers_exact_session_logs_without_rewriting_original_summary(monkeypatch, tmp_path):
+    module = load_tool("am1_session")
+    session_id = "20260922T120000-1234abcd"
+    directory = tmp_path / f"am1-session-{session_id}"
+    directory.mkdir()
+    summary_path = directory / "session-summary.json"
+    original_summary = json.dumps(
+        {
+            "session_id": session_id,
+            "operational_exit_code": 2,
+            "final_exit_code": 2,
+            "failure": "SessionError: SSH controller exited with status 255",
+            "remote_logs": ["/logs/am1-exact-camera.log"],
+            "missing_logs": [],
+        },
+        indent=2,
+    ) + "\n"
+    summary_path.write_text(original_summary, encoding="utf-8")
+    config = type(
+        "Config",
+        (),
+        {
+            "windows_log_directory": tmp_path,
+            "remote_log_directory": "/logs",
+            "ssh_target": "am1-pi",
+            "remote_python": "/python",
+            "remote_helper": "/helper.py",
+            "remote_state_directory": "/state",
+        },
+    )()
+    recovered_state = {
+        "cleanup_verified": True,
+        "host_exit": 0,
+        "camera_exit": 0,
+        "host_log": "/logs/am1-exact-host.log",
+        "camera_log": "/logs/am1-exact-camera.log",
+        "persisted_status": "fault",
+        "terminal_status": "fault",
+        "stop_reason": "controller_lease_expired",
+        "persisted_state_available": True,
+        "persisted_state_terminal": True,
+    }
+    monkeypatch.setattr(module.SSHRemote, "_persisted_terminal_state", lambda self: recovered_state)
+
+    copied = []
+    def collect(config, remote_path, destination):
+        copied.append((remote_path, destination.name))
+        destination.write_text(remote_path + "\n", encoding="utf-8")
+        return True, None
+    monkeypatch.setattr(module, "_collect_with_scp", collect)
+
+    assert module.collect_only(config, session_id) == 0
+
+    assert summary_path.read_text(encoding="utf-8") == original_summary
+    assert copied == [
+        ("/logs/am1-exact-host.log", "am1-exact-host.log"),
+        ("/logs/am1-exact-camera.log", "am1-exact-camera.log"),
+    ]
+    recovery = json.loads((directory / "evidence-recovery.json").read_text(encoding="utf-8"))
+    assert recovery["session_id"] == session_id
+    assert recovery["original_final_exit_code"] == 2
+    assert recovery["persisted_state"]["stop_reason"] == "controller_lease_expired"
+    assert recovery["recovered_logs"] == ["/logs/am1-exact-host.log", "/logs/am1-exact-camera.log"]
+
+
+def test_collect_only_keeps_nonterminal_recovery_incomplete(monkeypatch, tmp_path, capsys):
+    module = load_tool("am1_session")
+    session_id = "20260922T120000-1234abcd"
+    directory = tmp_path / f"am1-session-{session_id}"
+    directory.mkdir()
+    summary_path = directory / "session-summary.json"
+    original_summary = json.dumps({"session_id": session_id, "final_exit_code": 2}) + "\n"
+    summary_path.write_text(original_summary, encoding="utf-8")
+    config = type(
+        "Config",
+        (),
+        {
+            "windows_log_directory": tmp_path,
+            "remote_log_directory": "/logs",
+            "ssh_target": "am1-pi",
+            "remote_python": "/python",
+            "remote_helper": "/helper.py",
+            "remote_state_directory": "/state",
+        },
+    )()
+    monkeypatch.setattr(
+        module.SSHRemote,
+        "_persisted_terminal_state",
+        lambda self: {
+            "cleanup_verified": False,
+            "persisted_status": "host_starting",
+            "persisted_state_available": True,
+            "persisted_state_terminal": False,
+            "cleanup_error": "Persisted remote state is nonterminal: 'host_starting'",
+        },
+    )
+
+    assert module.collect_only(config, session_id) == 4
+    assert summary_path.read_text(encoding="utf-8") == original_summary
+    recovery = json.loads((directory / "evidence-recovery.json").read_text(encoding="utf-8"))
+    assert recovery["persisted_state"]["persisted_status"] == "host_starting"
+    assert recovery["original_summary_unchanged"] is True
+    assert "Persisted remote state is nonterminal: 'host_starting'" in capsys.readouterr().err
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires native Windows process semantics")

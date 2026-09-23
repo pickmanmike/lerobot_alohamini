@@ -27,6 +27,11 @@ SESSION_ID_PATTERN = re.compile(r"^[0-9]{8}T[0-9]{6}-[0-9a-f]{8}$")
 REMOTE_PATH_PATTERN = re.compile(r"^/[A-Za-z0-9._/-]+$")
 REMOTE_LOG_NAME_PATTERN = re.compile(r"^am1-[A-Za-z0-9][A-Za-z0-9._-]*\.log$")
 STOP_CONFIRMATION_TIMEOUT_S = 120.0
+PERSISTED_STATE_ATTEMPTS = 3
+PERSISTED_STATE_CONNECT_TIMEOUT_S = 4
+PERSISTED_STATE_COMMAND_TIMEOUT_S = 8
+PERSISTED_STATE_RETRY_DELAY_S = 0.25
+SSH_STDERR_LIMIT = 4_000
 
 
 class SessionError(RuntimeError):
@@ -226,7 +231,12 @@ class SessionCoordinator:
         self.input_fn = input_fn
         self.on_cleanup = on_cleanup
 
-    def _input_with_stop(self, prompt: str, stop_requested: Callable[[], bool]) -> str:
+    def _input_with_stop(
+        self,
+        prompt: str,
+        stop_requested: Callable[[], bool],
+        remote_fault: Callable[[], Any] | None = None,
+    ) -> str:
         if stop_requested():
             raise SessionStopped("session stop requested while waiting for operator readiness")
         responses: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=1)
@@ -241,12 +251,16 @@ class SessionCoordinator:
         while True:
             if stop_requested():
                 raise SessionStopped("session stop requested while waiting for operator readiness")
+            if remote_fault is not None and (fault := remote_fault()) is not None:
+                raise SessionError(f"Pi session fault while waiting for operator readiness: {fault}")
             try:
                 kind, value = responses.get(timeout=0.05)
             except queue.Empty:
                 continue
             if kind == "error":
                 raise value
+            if remote_fault is not None and (fault := remote_fault()) is not None:
+                raise SessionError(f"Pi session fault while waiting for operator readiness: {fault}")
             return str(value)
 
     def run(
@@ -293,6 +307,7 @@ class SessionCoordinator:
             approval = self._input_with_stop(
                 "",
                 stop_requested,
+                getattr(self.remote, "fault", None),
             )
             if approval != "":
                 outcome.failure = "physical/view readiness requires Enter only; non-empty input was refused"
@@ -439,10 +454,13 @@ class SSHRemote:
         self.stderr_stream = None
         self.reader: threading.Thread | None = None
         self._fault: dict[str, Any] | None = None
+        self._later_errors: list[dict[str, Any]] = []
+        self._fault_lock = threading.Lock()
         self._stop_requested: Callable[[], bool] = lambda: False
         self._send_lock = threading.Lock()
         self._heartbeat_stop = threading.Event()
         self._heartbeat: threading.Thread | None = None
+        self.stderr_path = self.session_directory / "ssh-control.log"
 
     def set_stop_requested(self, stop_requested: Callable[[], bool]) -> None:
         self._stop_requested = stop_requested
@@ -480,7 +498,55 @@ class SSHRemote:
                 continue
             self.events.put(event)
             if event.get("event") in {"runtime_fault", "refused", "fault"}:
-                self._fault = event
+                self._record_fault(event)
+
+    def _record_fault(self, event: dict[str, Any]) -> None:
+        recorded = dict(event)
+        with self._fault_lock:
+            if self._fault is None:
+                self._fault = recorded
+            elif recorded != self._fault and recorded not in self._later_errors:
+                self._later_errors.append(recorded)
+
+    def _ssh_stderr(self) -> str:
+        if self.stderr_stream is not None:
+            try:
+                self.stderr_stream.flush()
+            except OSError:
+                pass
+        try:
+            text = self.stderr_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+        return text[-SSH_STDERR_LIMIT:].strip()
+
+    def _record_ssh_exit(self, context: str, *, relation: str = "before") -> dict[str, Any]:
+        exit_status = self.process.returncode if self.process is not None else None
+        event: dict[str, Any] = {
+            "event": "fault",
+            "reason": f"SSH controller exited with status {exit_status} {relation} {context}",
+            "ssh_exit_status": exit_status,
+        }
+        if stderr := self._ssh_stderr():
+            event["ssh_stderr"] = stderr
+        self._record_fault(event)
+        return event
+
+    def diagnostics(self) -> dict[str, Any]:
+        with self._fault_lock:
+            return {
+                "primary_fault": dict(self._fault) if self._fault is not None else None,
+                "later_errors": [dict(error) for error in self._later_errors],
+            }
+
+    def _diagnostic_fields(self) -> dict[str, Any]:
+        diagnostics = self.diagnostics()
+        fields: dict[str, Any] = {}
+        if diagnostics["primary_fault"] is not None:
+            fields["primary_fault"] = diagnostics["primary_fault"]
+        if diagnostics["later_errors"]:
+            fields["later_errors"] = diagnostics["later_errors"]
+        return fields
 
     def _wait(
         self,
@@ -494,21 +560,21 @@ class SSHRemote:
         while time.monotonic() < deadline:
             if self._stop_requested() and not ignore_stop_request:
                 raise SessionStopped(f"session stop requested while waiting for Pi event {expected}")
+            if self.process and self.process.poll() is not None and self.events.empty():
+                self._record_ssh_exit(expected)
+                raise SessionError(f"Pi session fault: {self.fault()}")
             if self._fault is not None and not allow_prior_fault:
                 raise SessionError(f"Pi session fault: {self._fault}")
-            if self.process and self.process.poll() is not None and self.events.empty():
-                raise SessionError(
-                    f"Pi session controller exited with status {self.process.returncode} before {expected}."
-                )
             try:
                 event = self.events.get(timeout=min(0.1, max(deadline - time.monotonic(), 0.01)))
             except queue.Empty:
                 continue
             if event.get("event") == expected:
                 return event
-            if event.get("event") in {"runtime_fault", "refused", "fault"} and not allow_prior_fault:
-                self._fault = event
-                raise SessionError(f"Pi session fault: {event}")
+            if event.get("event") in {"runtime_fault", "refused", "fault"}:
+                self._record_fault(event)
+                if not allow_prior_fault:
+                    raise SessionError(f"Pi session fault: {self.fault()}")
         raise SessionError(f"Timed out waiting for Pi session event {expected}.")
 
     def _send(self, command: str) -> None:
@@ -523,14 +589,14 @@ class SSHRemote:
             try:
                 self._send("HEARTBEAT")
             except BaseException as exc:
-                self._fault = {
+                self._record_fault({
                     "event": "fault",
                     "reason": f"controller heartbeat failed: {type(exc).__name__}: {exc}",
-                }
+                })
                 return
 
     def preflight(self) -> dict[str, Any]:
-        self.stderr_stream = (self.session_directory / "ssh-control.log").open("w", encoding="utf-8")
+        self.stderr_stream = self.stderr_path.open("w", encoding="utf-8")
         self.process = subprocess.Popen(
             self._command(),
             stdin=subprocess.PIPE,
@@ -565,44 +631,103 @@ class SSHRemote:
         return self._wait("host_ready", 270.0)
 
     def fault(self) -> dict[str, Any] | None:
-        return self._fault
+        with self._fault_lock:
+            return dict(self._fault) if self._fault is not None else None
 
-    def _persisted_terminal_state(self) -> dict[str, Any] | None:
-        completed = subprocess.run(
-            [
-                "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ConnectionAttempts=1",
-                self.config.ssh_target, self.config.remote_python, self.config.remote_helper, "state",
-                "--state-directory", self.config.remote_state_directory, "--session-id", self.session_id,
-            ],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=20,
-            check=False,
-        )
-        if completed.returncode not in {0, 2}:
-            return None
-        try:
-            state = json.loads(completed.stdout)
-        except json.JSONDecodeError:
-            return None
-        if state.get("status") not in {"complete", "fault", "cleanup_unknown", "refused"}:
-            return None
-        cleanup = state.get("cleanup") if isinstance(state.get("cleanup"), dict) else {}
+    def _persisted_terminal_state(self) -> dict[str, Any]:
+        errors: list[str] = []
+        nonterminal_observations: list[dict[str, Any]] = []
+        latest_nonterminal: dict[str, Any] | None = None
+        terminal_states = {"complete", "fault", "cleanup_unknown", "refused"}
+        command = [
+            "ssh", "-o", "BatchMode=yes",
+            "-o", f"ConnectTimeout={PERSISTED_STATE_CONNECT_TIMEOUT_S}",
+            "-o", "ConnectionAttempts=1",
+            "-o", "ServerAliveInterval=2",
+            "-o", "ServerAliveCountMax=3",
+            self.config.ssh_target, self.config.remote_python, self.config.remote_helper, "state",
+            "--state-directory", self.config.remote_state_directory, "--session-id", self.session_id,
+        ]
+        for attempt in range(1, PERSISTED_STATE_ATTEMPTS + 1):
+            try:
+                completed = subprocess.run(
+                    command,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=PERSISTED_STATE_COMMAND_TIMEOUT_S,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                errors.append(f"attempt {attempt}: SSH state query failed: {type(exc).__name__}: {exc}")
+            else:
+                stderr = completed.stderr.strip()[-SSH_STDERR_LIMIT:]
+
+                def with_stderr(message: str) -> str:
+                    return f"{message}; stderr: {stderr}" if stderr else message
+
+                if completed.returncode not in {0, 2}:
+                    message = f"attempt {attempt}: SSH state query exited {completed.returncode}"
+                    errors.append(f"{message}: {stderr}" if stderr else message)
+                else:
+                    try:
+                        state = json.loads(completed.stdout)
+                    except json.JSONDecodeError as exc:
+                        errors.append(
+                            with_stderr(f"attempt {attempt}: persisted state was not valid JSON: {exc}")
+                        )
+                    else:
+                        if not isinstance(state, dict):
+                            errors.append(
+                                with_stderr(f"attempt {attempt}: persisted state was not an object")
+                            )
+                        elif state.get("session_id") != self.session_id:
+                            errors.append(
+                                with_stderr(f"attempt {attempt}: persisted session identity did not match")
+                            )
+                        else:
+                            status = state.get("status")
+                            terminal = status in terminal_states
+                            cleanup = state.get("cleanup") if isinstance(state.get("cleanup"), dict) else {}
+                            recovered: dict[str, Any] = {
+                                **cleanup,
+                                "cleanup_verified": terminal and bool(cleanup.get("cleanup_verified")),
+                                "host_log": state.get("host_log"),
+                                "camera_log": state.get("camera_log"),
+                                "persisted_status": status,
+                                "terminal_status": status if terminal else None,
+                                "stop_reason": state.get("stop_reason"),
+                                "persisted_state_available": True,
+                                "persisted_state_terminal": terminal,
+                            }
+                            if errors:
+                                recovered["persisted_state_errors"] = list(errors)
+                            if terminal:
+                                if nonterminal_observations:
+                                    recovered["persisted_state_observations"] = list(nonterminal_observations)
+                                return recovered
+                            recovered["cleanup_error"] = f"Persisted remote state is nonterminal: {status!r}"
+                            latest_nonterminal = recovered
+                            nonterminal_observations.append({"attempt": attempt, "status": status})
+            if attempt < PERSISTED_STATE_ATTEMPTS:
+                time.sleep(PERSISTED_STATE_RETRY_DELAY_S)
+        if latest_nonterminal is not None:
+            if errors:
+                latest_nonterminal["persisted_state_errors"] = list(errors)
+            latest_nonterminal["persisted_state_observations"] = list(nonterminal_observations)
+            return latest_nonterminal
         return {
-            **cleanup,
-            "cleanup_verified": bool(cleanup.get("cleanup_verified")),
-            "host_log": state.get("host_log"),
-            "camera_log": state.get("camera_log"),
-            "persisted_status": state.get("status"),
-            "terminal_status": state.get("status"),
-            "stop_reason": state.get("stop_reason"),
+            "cleanup_verified": False,
+            "persisted_state_available": False,
+            "persisted_state_terminal": False,
+            "persisted_state_error": errors[-1] if errors else "persisted state query failed",
+            "persisted_state_errors": errors,
         }
 
     def stop(self) -> dict[str, Any]:
         self._heartbeat_stop.set()
         if not self.process:
-            return {"cleanup_verified": True, "nothing_started": True}
+            return {"cleanup_verified": True, "nothing_started": True, **self._diagnostic_fields()}
         if self.process.poll() is None:
             control_stop_error: str | None = None
             try:
@@ -621,14 +746,23 @@ class SSHRemote:
                         "cleanup_verified": False,
                         "cleanup_error": "Pi control link failed and remote supervisor did not exit after EOF",
                         "control_stop_error": control_stop_error,
+                        **self._diagnostic_fields(),
                     }
+                if self.process.returncode not in {0, None}:
+                    self._record_ssh_exit("cleanup verification")
                 persisted = self._persisted_terminal_state()
-                if persisted is not None:
-                    return {**persisted, "control_stop_error": control_stop_error}
+                if persisted.get("persisted_state_available"):
+                    return {
+                        **persisted,
+                        "control_stop_error": control_stop_error,
+                        **self._diagnostic_fields(),
+                    }
                 return {
+                    **persisted,
                     "cleanup_verified": False,
                     "cleanup_error": "Pi control link failed and persisted remote cleanup was unavailable",
                     "control_stop_error": control_stop_error,
+                    **self._diagnostic_fields(),
                 }
             try:
                 event = self._wait(
@@ -638,27 +772,74 @@ class SSHRemote:
                     ignore_stop_request=True,
                 )
             except BaseException as exc:
-                return {"cleanup_verified": False, "cleanup_error": f"{type(exc).__name__}: {exc}"}
-            finally:
                 if self.process.stdin:
                     self.process.stdin.close()
+                controller_active = False
+                try:
+                    self.process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    controller_active = True
+                    self._record_fault(
+                        {
+                            "event": "fault",
+                            "reason": "SSH controller remained active after cleanup event wait failed",
+                        }
+                    )
+                else:
+                    if self.process.returncode not in {0, None}:
+                        self._record_ssh_exit("cleanup event wait failure", relation="after")
+                    if self.stderr_stream:
+                        self.stderr_stream.close()
+                persisted = self._persisted_terminal_state()
+                result = {
+                    **persisted,
+                    "control_cleanup_error": f"{type(exc).__name__}: {exc}",
+                    **self._diagnostic_fields(),
+                }
+                if controller_active:
+                    return {
+                        **result,
+                        "persisted_cleanup_verified": bool(persisted.get("cleanup_verified")),
+                        "cleanup_verified": False,
+                        "cleanup_error": "SSH controller remained active after cleanup event wait failed",
+                    }
+                if persisted.get("persisted_state_available"):
+                    return result
+                return {
+                    **result,
+                    "cleanup_verified": False,
+                    "cleanup_error": f"{type(exc).__name__}: {exc}",
+                }
+            if self.process.stdin:
+                self.process.stdin.close()
             try:
                 self.process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 return {
                     "cleanup_verified": False,
                     "cleanup_error": "SSH controller remained active after remote cleanup",
+                    **self._diagnostic_fields(),
                 }
+            if self.process.returncode not in {0, None}:
+                self._record_ssh_exit("cleanup_complete", relation="after")
             if self.stderr_stream:
                 self.stderr_stream.close()
-            return {key: value for key, value in event.items() if key not in {"event", "session_id"}}
-        if persisted := self._persisted_terminal_state():
-            return persisted
+            return {
+                **{key: value for key, value in event.items() if key not in {"event", "session_id"}},
+                **self._diagnostic_fields(),
+            }
+        if self.process.returncode not in {0, None}:
+            self._record_ssh_exit("cleanup verification")
+        persisted = self._persisted_terminal_state()
+        if persisted.get("persisted_state_available"):
+            return {**persisted, **self._diagnostic_fields()}
         return {
+            **persisted,
             "cleanup_verified": False,
             "cleanup_error": (
                 f"SSH controller already exited {self.process.returncode}; persisted remote state unavailable"
             ),
+            **self._diagnostic_fields(),
         }
 
 
@@ -1088,40 +1269,112 @@ def collect_only(config: SessionConfig, session_id: str) -> int:
     manifest_path = directory / "missing-logs.json"
     summary_path = directory / "session-summary.json"
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        raise SessionError(
-            f"No valid missing-log manifest and session summary exist for {session_id}: {exc}"
-        ) from exc
-    remaining = []
-    for entry in manifest.get("missing", []):
-        destination = Path(entry["destination"])
+        raise SessionError(f"No valid session summary exists for {session_id}: {exc}") from exc
+    if not isinstance(summary, dict) or summary.get("session_id") != session_id:
+        raise SessionError("Session summary identity does not match the collection request.")
+
+    if manifest_path.exists():
         try:
-            if destination.resolve().parent != directory.resolve():
-                raise SessionError("Missing-log manifest destination is outside the exact session directory.")
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise SessionError(f"No valid missing-log manifest exists for {session_id}: {exc}") from exc
+    else:
+        manifest = {"session_id": session_id, "missing": []}
+    if not isinstance(manifest, dict) or manifest.get("session_id") != session_id:
+        raise SessionError("Missing-log manifest identity does not match the collection request.")
+
+    requested: dict[str, Path] = {}
+    missing = manifest.get("missing", [])
+    if not isinstance(missing, list):
+        raise SessionError("Missing-log manifest entries are not a list.")
+    for entry in missing:
+        if not isinstance(entry, dict) or not isinstance(entry.get("remote_path"), str):
+            raise SessionError("Missing-log manifest entry is invalid.")
+        remote_path = entry["remote_path"]
+        candidate = PurePosixPath(remote_path)
+        expected_remote_directory = PurePosixPath(config.remote_log_directory)
+        if (
+            candidate.parent != expected_remote_directory
+            or not REMOTE_LOG_NAME_PATTERN.fullmatch(candidate.name)
+        ):
+            raise SessionError("Missing-log manifest remote path is outside the exact-log directory.")
+        if not isinstance(entry.get("destination"), str):
+            raise SessionError("Missing-log manifest destination is invalid.")
+        destination = Path(entry["destination"])
+        expected_destination = directory / candidate.name
+        try:
+            if destination.resolve() != expected_destination.resolve():
+                raise SessionError("Missing-log manifest destination does not use the exact log filename.")
         except OSError as exc:
             raise SessionError(f"Unable to validate missing-log destination: {exc}") from exc
-        ok, error = _collect_with_scp(config, entry["remote_path"], destination)
+        requested[remote_path] = destination
+
+    persisted = SSHRemote(config, session_id, directory)._persisted_terminal_state()
+    if persisted.get("persisted_state_available"):
+        for key in ("host_log", "camera_log"):
+            remote_path = persisted.get(key)
+            if isinstance(remote_path, str) and remote_path:
+                requested.setdefault(remote_path, directory / PurePosixPath(remote_path).name)
+    summary_logs = summary.get("remote_logs", [])
+    if not isinstance(summary_logs, list):
+        raise SessionError("Session summary remote logs are not a list.")
+    for remote_path in summary_logs:
+        if isinstance(remote_path, str) and remote_path:
+            requested.setdefault(remote_path, directory / PurePosixPath(remote_path).name)
+
+    remaining = []
+    recovered_logs: list[str] = []
+    for remote_path, destination in requested.items():
+        try:
+            if destination.resolve().parent != directory.resolve():
+                raise SessionError("Recovered log destination is outside the exact session directory.")
+        except OSError as exc:
+            raise SessionError(f"Unable to validate recovered log destination: {exc}") from exc
+        ok, error = _collect_with_scp(config, remote_path, destination)
         if not ok:
-            remaining.append({**entry, "error": error or "unknown"})
+            remaining.append(
+                {
+                    "remote_path": remote_path,
+                    "destination": str(destination),
+                    "error": error or "unknown",
+                }
+            )
+        else:
+            recovered_logs.append(remote_path)
+
+    recovery = {
+        "session_id": session_id,
+        "recovered_at": datetime.now().astimezone().isoformat(),
+        "original_final_exit_code": summary.get("final_exit_code"),
+        "original_failure": summary.get("failure"),
+        "persisted_state": persisted,
+        "recovered_logs": recovered_logs,
+        "missing_logs": [entry["remote_path"] for entry in remaining],
+        "original_summary_unchanged": True,
+    }
+    recovery_path = directory / "evidence-recovery.json"
+    temporary_recovery = recovery_path.with_name(f".{recovery_path.name}.{os.getpid()}.tmp")
+    temporary_recovery.write_text(json.dumps(recovery, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temporary_recovery, recovery_path)
+
     if remaining:
         manifest_path.write_text(
             json.dumps({"session_id": session_id, "missing": remaining}, indent=2) + "\n", encoding="utf-8"
         )
         return 4
-    summary["missing_logs"] = []
-    summary["collection_retry"] = {
-        "completed_at": datetime.now().astimezone().isoformat(),
-        "status": "complete",
-    }
-    if summary.get("operational_exit_code") == 0 and summary.get("cleanup_verified"):
-        summary["final_exit_code"] = 0
-    temporary_summary = summary_path.with_name(f".{summary_path.name}.{os.getpid()}.tmp")
-    temporary_summary.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    os.replace(temporary_summary, summary_path)
-    manifest_path.unlink()
-    print(f"AM1 log collection complete: {directory}")
+    if not persisted.get("persisted_state_available") or not persisted.get("persisted_state_terminal"):
+        reason = (
+            persisted.get("cleanup_error")
+            or persisted.get("persisted_state_error")
+            or "exact persisted session state is not terminal"
+        )
+        print(f"AM1 same-session evidence recovery incomplete: {reason}", file=sys.stderr)
+        return 4
+    manifest_path.unlink(missing_ok=True)
+    print(f"AM1 same-session evidence recovery complete: {directory}")
+    print("The original operational result and session summary were not changed.")
     return 0
 
 

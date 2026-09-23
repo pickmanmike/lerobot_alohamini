@@ -20,7 +20,8 @@ continuity target. Loss of a required view still means release controls, press
 - Camera startup must report its exact log, URL, five configured roles, and one
   all-fresh status sample before the browser opens. A deliberate bare Enter at
   the complete `CONFIRMATION 1/3` prompt is required before the motor host
-  starts; text, EOF, cancelled input, and console failure are refusals.
+  starts; text, EOF, cancelled input, console failure, and a remote-control-link
+  fault while the prompt is open are refusals.
 - The motor host must report its exact log and structured `operational_ready`
   state after homing and lower-stop relief before the Windows client starts.
 - The client retains a completion-spaced 10 Hz sender, body-command expiry,
@@ -122,11 +123,19 @@ heads, process exits, cleanup verification, and copy result. Remote originals
 remain in place.
 
 If a copy fails, `missing-logs.json` records only the exact missing remote paths.
+An empty or absent manifest is not proof that every artifact was discovered.
 Retry collection without camera or motor startup:
 
 ```powershell
 .\tools\run_am1_session.ps1 -CollectOnly -SessionId <session-id>
 ```
+
+The retry makes a bounded query for that exact session's persisted Pi state,
+distinguishes unavailable, nonterminal, and terminal state, and discovers the
+exact host and camera paths recorded there. It copies only validated paths from
+the configured log directory and writes the supplemental result to
+`evidence-recovery.json`. It never changes the original `session-summary.json`
+or turns a failed operational run into a successful one.
 
 If cleanup is unverified or SSH state is unknown, do not restart. Release all
 controls, use the accessible motor-power removal, support the carriage/arms, and

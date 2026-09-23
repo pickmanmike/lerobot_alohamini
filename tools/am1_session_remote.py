@@ -110,6 +110,8 @@ def parse_camera_readiness(text: str) -> dict[str, Any] | None:
 
 def host_is_operational(text: str) -> bool:
     for line in text.splitlines():
+        if line.startswith("[LIFT OPERATIONAL] "):
+            line = line.removeprefix("[LIFT OPERATIONAL] ")
         try:
             payload = json.loads(line)
         except json.JSONDecodeError:
