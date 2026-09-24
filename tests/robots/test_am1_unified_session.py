@@ -1678,6 +1678,65 @@ def test_powershell_logged_command_returns_with_blocked_outer_display(tmp_path):
     assert log.stat().st_size == payload_size
 
 
+@pytest.mark.parametrize("child_exit", [0, 2, 130])
+def test_powershell_logged_command_returns_only_exit_code_when_client_prints(tmp_path, child_exit):
+    powershell = shutil.which("pwsh")
+    if powershell is None:
+        pytest.skip("PowerShell 7 is required")
+    log = tmp_path / "runtime.log"
+    command = (
+        f". '{REPO_ROOT / 'tools' / 'run_am1.ps1'}'; "
+        "$arguments = @('-c', \"import sys, time; print('FAKE_CLIENT_OUTPUT', flush=True); "
+        f"time.sleep(0.5); sys.exit({child_exit})\"); "
+        f"$values = @(Invoke-Am1LoggedCommand -Executable '{sys.executable}' "
+        f"-Arguments $arguments -LogPath '{log}'); "
+        "Write-Output ('RETURN_COUNT=' + $values.Count); "
+        "Write-Output ('RETURN_VALUE=' + ($values -join '|'))"
+    )
+    result = subprocess.run(
+        [powershell, "-NoLogo", "-NoProfile", "-Command", command],
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "RETURN_COUNT=1" in result.stdout
+    assert f"RETURN_VALUE={child_exit}" in result.stdout
+    assert "FAKE_CLIENT_OUTPUT" in result.stdout
+    assert "FAKE_CLIENT_OUTPUT" in log.read_text(encoding="utf-8")
+
+
+def test_powershell_logged_command_preserves_interactive_stdin(tmp_path):
+    powershell = shutil.which("pwsh")
+    if powershell is None:
+        pytest.skip("PowerShell 7 is required")
+    log = tmp_path / "runtime.log"
+    command = (
+        f". '{REPO_ROOT / 'tools' / 'run_am1.ps1'}'; "
+        "$arguments = @('-c', \"import time; print('FAKE_PROMPT', flush=True); "
+        "print('FAKE_INPUT=' + input(), flush=True); time.sleep(0.5)\"); "
+        f"$code = Invoke-Am1LoggedCommand -Executable '{sys.executable}' "
+        f"-Arguments $arguments -LogPath '{log}'; "
+        "Write-Output ('RETURN_VALUE=' + $code)"
+    )
+    result = subprocess.run(
+        [powershell, "-NoLogo", "-NoProfile", "-Command", command],
+        input="ENTER\n",
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "FAKE_PROMPT" in result.stdout
+    assert "FAKE_INPUT=ENTER" in result.stdout
+    assert "RETURN_VALUE=0" in result.stdout
+    assert "FAKE_INPUT=ENTER" in log.read_text(encoding="utf-8")
+
+
 @pytest.mark.parametrize("stop_kind", ["explicit", "ctrl-c"])
 def test_windows_client_labels_user_stop_130_even_when_child_cleanup_exits_zero(monkeypatch, tmp_path, stop_kind):
     module = load_tool("am1_session")

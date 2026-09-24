@@ -271,9 +271,26 @@ function Invoke-Am1LoggedCommand {
             $Executable
         ) + $Arguments
     }
-    $PSNativeCommandUseErrorActionPreference = $false
-    & $Executable @loggerArguments
-    return [int]$LASTEXITCODE
+    # Inherit the console handles directly. Capturing the native command in
+    # PowerShell would also capture the logger's disposable display output as
+    # part of this function's return value instead of only the exit code.
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $Executable
+    $startInfo.UseShellExecute = $false
+    foreach ($argument in $loggerArguments) {
+        [void]$startInfo.ArgumentList.Add($argument)
+    }
+    $process = [System.Diagnostics.Process]::Start($startInfo)
+    if ($null -eq $process) {
+        throw "Unable to start AM1 direct logger: $Executable"
+    }
+    try {
+        $process.WaitForExit()
+        return [int]$process.ExitCode
+    }
+    finally {
+        $process.Dispose()
+    }
 }
 
 function Assert-Am1ReviewedWorktree {
