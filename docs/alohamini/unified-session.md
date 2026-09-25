@@ -24,10 +24,12 @@ continuity target. Loss of a required view still means release controls, press
   fault while the prompt is open are refusals.
 - The motor host must report its exact log and structured `operational_ready`
   state after homing and lower-stop relief before the Windows client starts.
-- The client retains a completion-spaced 10 Hz sender, body-command expiry,
-  follower freshness refusal, one-second Pi watchdog, zero base/lift during
-  synchronization, and no catch-up bursts. Local synchronization is nominally
-  30 seconds; Arms mode retains its previously validated 120-second setting.
+- The client retains a completion-spaced 10 Hz sender, 250 ms body-command
+  expiry, a one-second motion-freshness boundary, the one-second Pi watchdog,
+  zero base/lift during synchronization, and no catch-up bursts. Unified Local
+  pauses on a recoverable observation gap as described below; direct Arms and
+  Local modes retain their existing behavior. Local synchronization is
+  nominally 30 seconds; Arms mode retains its validated 120-second setting.
 - Live duration is an explicit whole number from 1 through 1800 seconds. The
   live clock starts at `am1_client_live_start`, after synchronization and final
   approval. Direct `run_am1.ps1 -Mode Local` still defaults to 30 live seconds.
@@ -95,6 +97,31 @@ single quit action. Duration expiry follows the same shutdown path. Either now
 releases torque through host cleanup, so the arms and carriage must already have
 a safe supported resting position.
 
+If follower feedback reaches one second old, or a bounded command send is
+temporarily unavailable, unified Local prints `PAUSED`,
+clears body inputs, and sends only zero body commands while the Pi's existing
+motor-owning thread seeds follower arm goals from measured positions. Arm torque
+is not released for a recoverable pause. The client retires old observation
+requests and requires a Pi-acknowledged hold plus three advancing Pi observation
+IDs over at least 0.2 seconds, each with a request-to-reply age below one
+second, before resuming. A gap of at most about three seconds measured from the
+last fresh observation may resume automatically only with released body keys, still leaders,
+and aligned follower/leader positions. A longer gap or moved leader prints
+`RESUME-NEEDS-ENTER`; release body keys, check the robot and views, then press
+Enter once. The first resumed arm action uses fresh follower positions and
+subsequent alignment steps are capped at 0.75 normalized units per send. Do not
+move leaders until `RECOVERED`. `Q`, the separate `-Stop` command, and the
+session duration continue to operate while paused; expiry without recovery is
+a refusal. Manual Enter does not waive the existing 10-unit leader/follower
+alignment gate: a larger mismatch refuses the session. The final client
+body-zero command is accepted by the AM1 host only
+as a stop-and-measured-arm-hold latch; it cannot rearm the session. Its socket
+send alone is not delivery proof, so the ordinary Pi host shutdown and cleanup
+result still matter. Unusable feedback for 30 seconds, a lost host, or a genuine motor or
+telemetry fault ends the run; there is no automatic restart. A recovered gap is
+recorded as a warning in `session-summary.json`, not as a successful physical
+acceptance claim.
+
 From another PowerShell only when the foreground controller is unavailable or
 an early stop is needed:
 
@@ -119,8 +146,8 @@ Each run creates:
 The folder contains the exact Windows client log, exact copied host/camera logs,
 `ssh-control.log`, and `session-summary.json`. The summary distinguishes the
 requested and measured live interval, synchronization timing, reviewed source
-heads, process exits, cleanup verification, and copy result. Remote originals
-remain in place.
+heads, recovered-gap warnings, process exits, cleanup verification, and copy
+result. Remote originals remain in place.
 
 If a copy fails, `missing-logs.json` records only the exact missing remote paths.
 An empty or absent manifest is not proof that every artifact was discovered.

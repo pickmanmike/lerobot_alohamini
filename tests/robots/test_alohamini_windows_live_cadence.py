@@ -195,6 +195,49 @@ def test_observation_sequence_advances_after_timeout_and_late_response_recovery(
     assert client.observation_sequence == 1
 
 
+def test_local_pause_retires_pre_pause_tokens_and_rejects_late_old_replies():
+    client, socket = make_observation_transport_client()
+    client._fill_observation_request_window()
+    assert tuple(client._observation_request_tokens) == (b"1", b"2", b"3")
+    socket.responses.append([b"2", b'cached-before-pause'])
+
+    client.retire_observation_requests()
+    post_pause = tuple(client._observation_request_tokens)
+    assert post_pause == (b"4", b"5", b"6")
+    assert client._observation_response_cache == {}
+    socket.responses.extend(([b"3", b"late-pre-pause"], [b"4", b"fresh-post-pause"]))
+    assert client._poll_and_get_latest_message() == [b"fresh-post-pause"]
+
+
+def test_local_feedback_is_taken_from_the_new_decoded_observation_only():
+    client, socket = make_observation_transport_client()
+    client._is_connected = True
+    client._fill_observation_request_window()
+    socket.responses.append([
+        b"1",
+        b'{"arm_left_shoulder_pan.pos":12.0,"_am1_local_feedback":{"version":1,"state":"paused","epoch":1}}',
+    ])
+
+    client.get_observation()
+    assert client.latest_am1_local_feedback == {"version": 1, "state": "paused", "epoch": 1}
+    socket.responses.append([b"2", b'{"arm_left_shoulder_pan.pos":13.0}'])
+    client.get_observation()
+    assert client.latest_am1_local_feedback is None
+
+
+def test_local_feedback_exposes_request_to_reply_age_not_just_receipt_age():
+    client, socket = make_observation_transport_client()
+    client._is_connected = True
+    client._fill_observation_request_window()
+    client._observation_request_sent_at[b"1"] -= 1.5
+    socket.responses.append([b"1", b'{"arm_left_shoulder_pan.pos":12.0}'])
+
+    client.get_observation()
+
+    assert client.latest_observation_roundtrip_age_s >= 1.5
+    assert b"1" not in client._observation_request_sent_at
+
+
 def test_ch343_port_report_matches_only_unique_stored_pnp_identities(tmp_path):
     pwsh = shutil.which("pwsh") or shutil.which("powershell")
     if pwsh is None:

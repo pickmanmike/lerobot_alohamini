@@ -24,6 +24,7 @@ import math
 import sys
 import threading
 import time
+import zmq
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -63,6 +64,10 @@ AM1_COMMAND_SEND_TIMEOUT_MS = 50
 AM1_LIVE_OBSERVATION_MAX_AGE_S = 1.0
 AM1_LIFT_ONLY_VELOCITY = 200
 AM1_LOCAL_BODY_MAX_AGE_S = 0.25
+AM1_LOCAL_RECOVERY_BUDGET_S = 30.0
+AM1_LOCAL_AUTOMATIC_PAUSE_S = 3.0
+AM1_LOCAL_RECOVERY_SAMPLE_SPAN_S = 0.2
+AM1_LOCAL_RECOVERY_LEADER_DRIFT = 0.75
 RIGHT_WRIST_FLEX_KEY = "arm_right_wrist_flex.pos"
 
 StartupSyncSide = Literal["left", "right", "both"]
@@ -185,6 +190,10 @@ class AM1LiveActionMailbox:
         with self._lock:
             return None if self._action is None else dict(self._action)
 
+    def clear(self) -> None:
+        with self._lock:
+            self._action = None
+
 
 class AM1LiveBodyMailbox:
     """Keep a complete body command only while its input sample is fresh."""
@@ -197,12 +206,15 @@ class AM1LiveBodyMailbox:
         self._action: dict[str, float | int] | None = None
         self._published_at: float | None = None
         self._expiration_count = 0
+        self._suspended = False
 
     def publish(self, action: Mapping[str, float | int], *, published_at: float) -> None:
         validated = validate_am1_local_body_action(action)
         if not math.isfinite(published_at):
             raise SafetyRefusal("local body input timestamp must be finite")
         with self._lock:
+            if self._suspended:
+                return
             self._action = validated
             self._published_at = published_at
 
@@ -224,6 +236,18 @@ class AM1LiveBodyMailbox:
             self._action = None
             self._published_at = None
 
+    def suspend(self) -> None:
+        with self._lock:
+            self._suspended = True
+            self._action = None
+            self._published_at = None
+
+    def resume(self) -> None:
+        with self._lock:
+            self._action = None
+            self._published_at = None
+            self._suspended = False
+
     @property
     def expiration_count(self) -> int:
         with self._lock:
@@ -243,6 +267,8 @@ class AM1LiveActionSender:
         duration_s: float,
         profile_cadence: bool,
         body_mailbox: AM1LiveBodyMailbox | None = None,
+        recovery_enabled: bool = False,
+        initial_follower_observed_at: float | None = None,
         before_first_send_stop_requested: Callable[[], bool] | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         wall_time_ns: Callable[[], int] = time.time_ns,
@@ -258,6 +284,14 @@ class AM1LiveActionSender:
         self._duration_s = duration_s
         self._profile_cadence = profile_cadence
         self._body_mailbox = body_mailbox
+        self._recovery_enabled = recovery_enabled
+        self._last_fresh_at = initial_follower_observed_at
+        self._recovery_state = "active"
+        self._recovery_epoch = 0
+        self._pause_started_at: float | None = None
+        self._pause_reason: str | None = None
+        self._resume_action: dict[str, float | int] | None = None
+        self._ramp_after_resume = False
         self._before_first_send_stop_requested = before_first_send_stop_requested
         self._monotonic = monotonic
         self._wall_time_ns = wall_time_ns
@@ -301,6 +335,63 @@ class AM1LiveActionSender:
     def publish(self, action: Mapping[str, float | int]) -> None:
         self.mailbox.publish(action)
 
+    def recovery_snapshot(self) -> tuple[str, int, float | None, str | None]:
+        with self._state_lock:
+            return self._recovery_state, self._recovery_epoch, self._pause_started_at, self._pause_reason
+
+    def note_fresh_observation(self, observed_at: float) -> None:
+        with self._state_lock:
+            if self._recovery_state == "active":
+                self._last_fresh_at = observed_at
+
+    def _pause_under_gate(self, *, now: float, reason: str) -> bool:
+        with self._state_lock:
+            if self._recovery_state == "paused":
+                return False
+            self._recovery_epoch += 1
+            if self._recovery_epoch % 2 != 1:
+                raise RuntimeError("AM1 Local pause epoch is not odd")
+            self._recovery_state = "paused"
+            self._pause_started_at = now
+            self._pause_reason = reason
+            self._resume_action = None
+        self.mailbox.clear()
+        if self._body_mailbox is not None:
+            self._body_mailbox.suspend()
+        return True
+
+    def request_pause(self, reason: str) -> bool:
+        if not self._recovery_enabled:
+            return False
+        with self._body_send_gate:
+            return self._pause_under_gate(now=self._monotonic(), reason=reason)
+
+    def resume_from(self, follower_positions: Mapping[str, float], *, observed_at: float) -> int:
+        if not self._recovery_enabled:
+            raise RuntimeError("AM1 Local recovery was not enabled")
+        action = make_am1_live_action(follower_positions)
+        with self._body_send_gate:
+            with self._state_lock:
+                if self._recovery_state != "paused":
+                    raise RuntimeError("AM1 Local resume requires a paused sender")
+                self._recovery_epoch += 1
+                epoch = self._recovery_epoch
+                self._recovery_state = "resuming"
+                self._resume_action = action
+                self._last_fresh_at = observed_at
+                self._ramp_after_resume = True
+            self.mailbox.clear()
+        return epoch
+
+    def acknowledge_resume(self, *, observed_at: float) -> None:
+        with self._state_lock:
+            if self._recovery_state != "resuming":
+                raise RuntimeError("AM1 Local active acknowledgement arrived outside resume")
+            self._recovery_state = "active"
+            self._last_fresh_at = observed_at
+        if self._body_mailbox is not None:
+            self._body_mailbox.resume()
+
     def snapshot(self) -> AM1LiveActionSenderSnapshot:
         with self._state_lock:
             return AM1LiveActionSenderSnapshot(
@@ -315,6 +406,7 @@ class AM1LiveActionSender:
         primary_error: BaseException | None = None
         action = dict(self._initial_action)
         last_send_started_at: float | None = None
+        live_start_emitted = False
         started_at = self._monotonic()
         try:
             with self._robot.make_live_command_sender() as command_sender:
@@ -328,16 +420,38 @@ class AM1LiveActionSender:
                         and self._before_first_send_stop_requested()
                     ):
                         break
-                    if action_sequence > 0 and self._stop_requested.is_set():
+                    if (action_sequence > 0 or self._recovery_enabled) and self._stop_requested.is_set():
                         break
-                    if action_sequence > 0 and self._duration_s > 0 and now - started_at >= self._duration_s:
+                    if (
+                        (action_sequence > 0 or self._recovery_enabled)
+                        and self._duration_s > 0 and now - started_at >= self._duration_s
+                    ):
                         break
 
+                    send_failed = False
                     with self._body_send_gate:
-                        if action_sequence > 0 and self._stop_requested.is_set():
+                        if (action_sequence > 0 or self._recovery_enabled) and self._stop_requested.is_set():
                             break
                         send_started_at = self._monotonic()
-                        if self._profile_cadence and action_sequence == 0:
+                        if self._recovery_enabled:
+                            with self._state_lock:
+                                recovery_state = self._recovery_state
+                                last_fresh_at = self._last_fresh_at
+                            if (
+                                recovery_state != "paused"
+                                and last_fresh_at is not None
+                                and send_started_at - last_fresh_at >= AM1_LIVE_OBSERVATION_MAX_AGE_S
+                            ):
+                                self._pause_under_gate(
+                                    now=send_started_at,
+                                    reason=f"follower observation age {send_started_at - last_fresh_at:.3f}s",
+                                )
+                            with self._state_lock:
+                                recovery_state = self._recovery_state
+                                recovery_epoch = self._recovery_epoch
+                                resume_action = self._resume_action
+                                ramp_after_resume = self._ramp_after_resume
+                        if self._profile_cadence and not live_start_emitted:
                             print(
                                 json.dumps(
                                     {
@@ -350,11 +464,52 @@ class AM1LiveActionSender:
                                 ),
                                 flush=True,
                             )
-                        action_to_send = dict(action)
-                        if action_sequence > 0 and self._body_mailbox is not None:
-                            action_to_send.update(self._body_mailbox.snapshot(now=send_started_at))
-                        command_sender.send_action(action_to_send)
+                            live_start_emitted = True
+                        if self._recovery_enabled and recovery_state == "paused":
+                            action_to_send = {**make_zero_action(), "_am1_local_control": {
+                                "version": 1, "mode": "pause", "epoch": recovery_epoch,
+                            }}
+                        else:
+                            if self._recovery_enabled and resume_action is not None:
+                                action = dict(resume_action)
+                                with self._state_lock:
+                                    self._resume_action = None
+                            elif self._recovery_enabled and ramp_after_resume and recovery_state == "active":
+                                desired = self.mailbox.snapshot()
+                                if desired is not None:
+                                    action = make_am1_live_action({
+                                        key: float(action[key]) + max(
+                                            -STARTUP_SYNC_MAX_STEP,
+                                            min(STARTUP_SYNC_MAX_STEP, float(desired[key]) - float(action[key])),
+                                        )
+                                        for key in AM1_ARM_POSITION_KEYS
+                                    })
+                            action_to_send = dict(action)
+                            if (
+                                action_sequence > 0
+                                and self._body_mailbox is not None
+                                and (not self._recovery_enabled or recovery_state == "active")
+                            ):
+                                action_to_send.update(self._body_mailbox.snapshot(now=send_started_at))
+                            if self._recovery_enabled:
+                                action_to_send["_am1_local_control"] = {
+                                    "version": 1, "mode": "active", "epoch": recovery_epoch,
+                                }
+                        try:
+                            command_sender.send_action(action_to_send)
+                        except zmq.Again:
+                            if not self._recovery_enabled:
+                                raise
+                            self._pause_under_gate(
+                                now=self._monotonic(),
+                                reason="live command socket temporarily unavailable",
+                            )
+                            send_failed = True
                         send_completed_at = self._monotonic()
+                    if send_failed:
+                        self._sleep_fn(max(next_completion_spaced_deadline(send_completed_at, fps=self._fps)
+                                           - self._monotonic(), 0.0))
+                        continue
                     send_interval_ms = (
                         0.0
                         if last_send_started_at is None
@@ -369,9 +524,10 @@ class AM1LiveActionSender:
                         )
                     last_send_started_at = send_started_at
 
-                    latest_action = self.mailbox.snapshot()
-                    if latest_action is not None:
-                        action = latest_action
+                    if not self._recovery_enabled or not self._ramp_after_resume:
+                        latest_action = self.mailbox.snapshot()
+                        if latest_action is not None:
+                            action = latest_action
                     deadline = next_completion_spaced_deadline(send_completed_at, fps=self._fps)
                     self._sleep_fn(max(deadline - self._monotonic(), 0.0))
         except BaseException as exc:
@@ -493,6 +649,7 @@ def read_fresh_am1_live_sample(
     leader: Any,
     *,
     previous_sequence: int,
+    require_current_request: bool = False,
     monotonic: Callable[[], float] = time.monotonic,
 ) -> AM1LiveSample:
     """Read one fresh follower observation followed by one complete leader target."""
@@ -531,6 +688,15 @@ def read_fresh_am1_live_sample(
         source="live follower observation",
     )
 
+    if require_current_request:
+        roundtrip_age = getattr(robot, "latest_observation_roundtrip_age_s", None)
+        if type(roundtrip_age) not in (int, float) or not math.isfinite(roundtrip_age) or roundtrip_age < 0:
+            raise SafetyRefusal("AM1 Local observation request/reply age is unavailable or invalid")
+        if roundtrip_age >= AM1_LIVE_OBSERVATION_MAX_AGE_S:
+            raise TransientFollowerObservation(
+                f"AM1 Local observation request/reply age {roundtrip_age:.3f}s exceeds freshness limit"
+            )
+
     arm_target = extract_am1_arm_positions(
         leader.get_action(),
         source="live leader",
@@ -538,6 +704,11 @@ def read_fresh_am1_live_sample(
     )
     leader_sampled_at = monotonic()
     observation_age_s = leader_sampled_at - observed_at
+    if require_current_request and roundtrip_age + max(0.0, observation_age_s) >= AM1_LIVE_OBSERVATION_MAX_AGE_S:
+        raise StaleFollowerObservation(
+            "AM1 Local observation request/reply plus local age "
+            f"{roundtrip_age + max(0.0, observation_age_s):.3f}s reached the freshness limit"
+        )
     if observation_age_s >= AM1_LIVE_OBSERVATION_MAX_AGE_S:
         raise StaleFollowerObservation(
             f"follower observation age {observation_age_s:.3f}s reached the "
@@ -1544,6 +1715,372 @@ def _print_connection_summary(args: argparse.Namespace) -> None:
     print("No leader action has yet been forwarded.")
 
 
+def _am1_local_feedback(robot: Any) -> dict[str, Any]:
+    feedback = getattr(robot, "latest_am1_local_feedback", None)
+    if (
+        not isinstance(feedback, dict)
+        or type(feedback.get("version")) is not int
+        or feedback["version"] != 1
+        or feedback.get("state") not in {"ready", "active", "paused"}
+        or type(feedback.get("epoch")) is not int
+        or type(feedback.get("observation_id")) is not int
+        or feedback["observation_id"] < 0
+    ):
+        raise SafetyRefusal("AM1 Local host pause/observation feedback is unavailable or malformed")
+    return feedback
+
+
+def _max_am1_arm_difference(first: Mapping[str, float], second: Mapping[str, float]) -> float:
+    return max(abs(float(first[key]) - float(second[key])) for key in AM1_ARM_POSITION_KEYS)
+
+
+def _run_am1_recovering_local_sender(
+    robot: Any,
+    leader: Any,
+    *,
+    initial_arm_target: Mapping[str, float],
+    initial_follower_positions: Mapping[str, float],
+    initial_observation_sequence: int,
+    initial_follower_observed_at: float,
+    fps: int,
+    duration_s: float,
+    profile_cadence: bool,
+    max_start_mismatch: float,
+    monotonic: Callable[[], float],
+    wall_time_ns: Callable[[], int],
+    sleep_fn: Callable[[float], None],
+    should_stop: Callable[[], bool] | None,
+    body_action_supplier: Callable[[], Mapping[str, float | int]],
+    input_fn: Callable[[str], str],
+    sample_callback: Callable[[AM1LiveSample, Mapping[str, float | int]], None] | None,
+) -> None:
+    """Unified Local only: a host-acknowledged hold while feedback recovers."""
+    initial_feedback = _am1_local_feedback(robot)
+    if initial_feedback["state"] != "ready" or initial_feedback["epoch"] != -1:
+        raise SafetyRefusal("AM1 Local host was not ready for a new recovery epoch")
+    initial_roundtrip_age = getattr(robot, "latest_observation_roundtrip_age_s", None)
+    if (
+        type(initial_roundtrip_age) not in (int, float)
+        or not math.isfinite(initial_roundtrip_age)
+        or initial_roundtrip_age < 0
+        or initial_roundtrip_age >= AM1_LIVE_OBSERVATION_MAX_AGE_S
+    ):
+        raise SafetyRefusal("AM1 Local initial observation request/reply age is unavailable or stale")
+    if (
+        initial_roundtrip_age + max(0.0, monotonic() - initial_follower_observed_at)
+        >= AM1_LIVE_OBSERVATION_MAX_AGE_S
+    ):
+        raise SafetyRefusal("AM1 Local initial follower observation is stale at live start")
+    body_mailbox = AM1LiveBodyMailbox()
+    sender = AM1LiveActionSender(
+        robot,
+        initial_action=make_am1_live_action(initial_arm_target),
+        initial_observation_sequence=initial_observation_sequence,
+        fps=fps,
+        duration_s=duration_s,
+        profile_cadence=profile_cadence,
+        body_mailbox=body_mailbox,
+        recovery_enabled=True,
+        initial_follower_observed_at=initial_follower_observed_at,
+        before_first_send_stop_requested=should_stop,
+        monotonic=monotonic,
+        wall_time_ns=wall_time_ns,
+        sleep_fn=sleep_fn,
+    )
+    sender_started = False
+    started_at = monotonic()
+    last_sequence = initial_observation_sequence
+    last_host_observation_id = initial_feedback["observation_id"]
+    last_observed_at = initial_follower_observed_at
+    safe_target = dict(initial_arm_target)
+    last_leader_target = dict(initial_arm_target)
+    initial_active_ack = False
+    pause_epoch_seen: int | None = None
+    pause_gap_started_at: float | None = None
+    pause_leader_reference: dict[str, float] | None = None
+    pause_acknowledged = False
+    qualified_first_at: float | None = None
+    qualified_count = 0
+    qualified_at: float | None = None
+    unusable_since: float | None = None
+    body_released = False
+    manual_required = False
+    manual_responses: list[tuple[str, Any, float]] = []
+    manual_ready = threading.Event()
+    manual_requested = False
+    manual_enter_at: float | None = None
+    resume_mode_pending: str | None = None
+    recovery_count = 0
+    observation_timeout_count = 0
+    refusal: str | None = None
+    operator_stop_requested = False
+
+    def request_manual_enter() -> None:
+        nonlocal manual_requested
+        if manual_requested:
+            return
+        manual_requested = True
+        print("RESUME-NEEDS-ENTER — release body keys, hold leaders still, then press Enter only.", flush=True)
+
+        def read_enter() -> None:
+            try:
+                manual_responses.append(("value", input_fn(""), monotonic()))
+            except BaseException as exc:
+                manual_responses.append(("error", exc, monotonic()))
+            finally:
+                manual_ready.set()
+
+        threading.Thread(target=read_enter, name="am1-local-recovery-enter", daemon=True).start()
+
+    def note_unusable_feedback() -> None:
+        nonlocal qualified_first_at, qualified_count, qualified_at, unusable_since
+        state, _, _, _ = sender.recovery_snapshot()
+        if (
+            state == "paused"
+            and qualified_at is not None
+            and monotonic() - last_observed_at >= AM1_LIVE_OBSERVATION_MAX_AGE_S
+        ):
+            qualified_first_at = None
+            qualified_count = 0
+            qualified_at = None
+            unusable_since = monotonic()
+
+    try:
+        sender.start()
+        sender_started = True
+        while sender.is_alive():
+            now = monotonic()
+            if sender.snapshot().error is not None:
+                break
+            body_action = validate_am1_local_body_action(body_action_supplier())
+            state, epoch, pause_started_at, pause_reason = sender.recovery_snapshot()
+            if state == "active" and initial_active_ack:
+                body_mailbox.publish(body_action, published_at=now)
+            elif all(float(value) == 0.0 for value in body_action.values()):
+                body_released = True
+            else:
+                manual_required = True
+            if should_stop is not None and should_stop():
+                operator_stop_requested = True
+                sender.stop_after_clearing_body()
+                break
+
+            if state == "paused" and pause_epoch_seen != epoch:
+                pause_epoch_seen = epoch
+                pause_gap_started_at = last_observed_at
+                pause_leader_reference = dict(last_leader_target)
+                pause_acknowledged = False
+                qualified_first_at = None
+                qualified_count = 0
+                qualified_at = None
+                unusable_since = pause_started_at
+                body_released = False
+                manual_required = False
+                manual_responses.clear()
+                manual_ready.clear()
+                manual_requested = False
+                manual_enter_at = None
+                resume_mode_pending = None
+                robot.retire_observation_requests()
+                print(
+                    f"PAUSED — epoch={epoch} cause={pause_reason}; waiting for measured-arm hold and fresh feedback",
+                    flush=True,
+                )
+                print(json.dumps({"event": "am1_local_paused", "epoch": epoch,
+                                  "cause": pause_reason, "wall_time_ns": wall_time_ns()}), flush=True)
+            if (
+                state == "paused"
+                and pause_started_at is not None
+                and qualified_at is None
+                and unusable_since is not None
+                and now - unusable_since >= AM1_LOCAL_RECOVERY_BUDGET_S
+            ):
+                refusal = f"AM1 Local feedback did not qualify within {AM1_LOCAL_RECOVERY_BUDGET_S:.0f}s"
+                break
+
+            try:
+                sample = read_fresh_am1_live_sample(
+                    robot, leader, previous_sequence=last_sequence, monotonic=monotonic,
+                    require_current_request=True,
+                )
+            except TransientFollowerObservation:
+                observation_timeout_count += 1
+                note_unusable_feedback()
+                continue
+            except StaleFollowerObservation:
+                observation_timeout_count += 1
+                sender.request_pause("stale follower observation after leader sampling")
+                note_unusable_feedback()
+                continue
+
+            feedback = _am1_local_feedback(robot)
+            host_observation_id = feedback["observation_id"]
+            if host_observation_id <= last_host_observation_id:
+                raise SafetyRefusal("AM1 Local host observation ID did not advance")
+            last_host_observation_id = host_observation_id
+            last_sequence = sample.observation_sequence
+            state, epoch, pause_started_at, _ = sender.recovery_snapshot()
+            if state == "paused" and pause_epoch_seen != epoch:
+                # This reply may have been requested before the sender entered PAUSED.
+                # Do not advance the pre-pause freshness origin; the next iteration
+                # retires its token window before qualification.
+                continue
+            last_observed_at = sample.observed_at
+            last_leader_target = dict(sample.arm_target)
+
+            if state == "active":
+                if feedback["state"] == "paused" and feedback["epoch"] == epoch:
+                    sender.request_pause("host watchdog reported measured-arm hold")
+                    continue
+                if feedback["state"] == "ready" and not initial_active_ack:
+                    if monotonic() - started_at >= AM1_LOCAL_AUTOMATIC_PAUSE_S:
+                        raise SafetyRefusal("AM1 Local host did not acknowledge initial action")
+                    continue
+                if feedback["state"] != "active" or feedback["epoch"] != epoch:
+                    raise SafetyRefusal("AM1 Local host state/epoch changed unexpectedly")
+                initial_active_ack = True
+                sender.note_fresh_observation(sample.observed_at)
+                safe_target = dict(sample.arm_target)
+                scoped_action = make_am1_live_action(safe_target)
+                sender.publish(scoped_action)
+                if sample_callback is not None:
+                    sample_callback(sample, scoped_action)
+                continue
+
+            if state == "resuming":
+                if feedback["state"] == "active" and feedback["epoch"] == epoch:
+                    sender.acknowledge_resume(observed_at=sample.observed_at)
+                    recovery_count += 1
+                    initial_active_ack = True
+                    body_released = True
+                    print(
+                        f"RECOVERED — epoch={epoch} mode={resume_mode_pending} "
+                        f"pause_duration_s={monotonic() - (pause_started_at or started_at):.3f}",
+                        flush=True,
+                    )
+                    print(json.dumps({"event": "am1_local_recovered", "epoch": epoch,
+                                      "resume_mode": resume_mode_pending,
+                                      "pause_duration_s": round(monotonic() - (pause_started_at or started_at), 3),
+                                      "wall_time_ns": wall_time_ns()}), flush=True)
+                elif feedback["state"] == "paused" and feedback["epoch"] == epoch - 1:
+                    continue
+                else:
+                    raise SafetyRefusal("AM1 Local host did not acknowledge bounded resume")
+                continue
+
+            if state != "paused" or pause_started_at is None or pause_leader_reference is None:
+                raise SafetyRefusal("AM1 Local recovery state is inconsistent")
+            if feedback["state"] == "paused" and feedback["epoch"] == epoch:
+                pause_acknowledged = True
+            elif (
+                not pause_acknowledged and feedback["state"] == "ready"
+                and feedback["epoch"] == -1 and not initial_active_ack
+            ):
+                # The first marked active send can fail before reaching the host;
+                # pause epoch 1 is allowed to become its first accepted command.
+                continue
+            elif not pause_acknowledged and feedback["state"] == "paused" and feedback["epoch"] == epoch - 1:
+                # The host watchdog may have measured-held the preceding active
+                # epoch while the new odd pause command was still in transit.
+                continue
+            elif (
+                not pause_acknowledged and feedback["state"] == "paused"
+                and feedback["epoch"] == epoch - 2 and epoch >= 3
+            ):
+                # A resuming active send can be backpressured before delivery.
+                # The preceding odd-epoch hold remains valid until this pause lands.
+                continue
+            elif not pause_acknowledged and feedback["state"] == "active" and feedback["epoch"] == epoch - 1:
+                continue
+            else:
+                raise SafetyRefusal("AM1 Local measured-arm hold was not acknowledged by the same host")
+            if not pause_acknowledged:
+                continue
+            if qualified_first_at is None:
+                qualified_first_at = sample.observed_at
+            qualified_count += 1
+            if _max_am1_arm_difference(sample.arm_target, pause_leader_reference) > AM1_LOCAL_RECOVERY_LEADER_DRIFT:
+                manual_required = True
+            if qualified_count < 3 or sample.observed_at - qualified_first_at < AM1_LOCAL_RECOVERY_SAMPLE_SPAN_S:
+                continue
+            if qualified_at is None:
+                qualified_at = sample.observed_at
+                unusable_since = None
+            if _max_am1_arm_difference(sample.arm_target, sample.follower_positions) > max_start_mismatch:
+                manual_required = True
+            if (
+                pause_gap_started_at is None
+                or monotonic() - pause_gap_started_at > AM1_LOCAL_AUTOMATIC_PAUSE_S
+                or not body_released
+            ):
+                manual_required = True
+            if manual_required:
+                request_manual_enter()
+                if not manual_ready.is_set():
+                    continue
+                kind, value, entered_at = manual_responses[0]
+                if kind == "error":
+                    raise SafetyRefusal(f"AM1 Local recovery Enter failed: {value}")
+                if value != "":
+                    raise SafetyRefusal("AM1 Local recovery requires Enter only")
+                if not all(float(value) == 0.0 for value in body_action.values()):
+                    raise SafetyRefusal("AM1 Local recovery body controls must be released before Enter")
+                if manual_enter_at is None:
+                    manual_enter_at = entered_at
+                if sample.observed_at <= manual_enter_at:
+                    continue
+                if _max_am1_arm_difference(sample.arm_target, sample.follower_positions) > max_start_mismatch:
+                    raise SafetyRefusal("AM1 Local recovery leader/follower mismatch exceeds startup gate")
+            resume_mode_pending = "manual" if manual_required else "automatic"
+            sender.resume_from(sample.follower_positions, observed_at=sample.observed_at)
+        if refusal is None and not operator_stop_requested:
+            final_state, _, _, _ = sender.recovery_snapshot()
+            if final_state != "active" or not initial_active_ack:
+                refusal = f"session duration expired while paused or recovering (state={final_state})"
+    finally:
+        primary_error = sys.exception()
+        join_error: BaseException | None = None
+        diagnostic_error: BaseException | None = None
+        if sender_started:
+            if primary_error is not None or refusal is not None:
+                sender.stop_after_clearing_body()
+            try:
+                sender.join()
+            except BaseException as exc:
+                join_error = exc
+        snapshot = sender.snapshot()
+        if profile_cadence:
+            try:
+                print(json.dumps({"event": "am1_client_action_cadence",
+                                  "live_end_wall_time_ns": snapshot.live_end_wall_time_ns,
+                                  "action_sequence": snapshot.action_sequence,
+                                  "action_send_interval_ms": round(snapshot.action_send_interval_ms, 3),
+                                  "longest_action_send_interval_ms": round(snapshot.longest_action_send_interval_ms, 3),
+                                  "observation_sequence": last_sequence,
+                                  "observation_timeout_count": observation_timeout_count,
+                                  "recovery_count": recovery_count,
+                                  "observation_age_ms": round(max(0.0, monotonic() - last_observed_at) * 1e3, 3),
+                                  "stale_latched": refusal is not None,
+                                  "body_command_expiration_count": body_mailbox.expiration_count,
+                                  "right_wrist_requested": safe_target[RIGHT_WRIST_FLEX_KEY]},
+                                 sort_keys=True), flush=True)
+            except BaseException as exc:
+                diagnostic_error = exc
+        if primary_error is not None:
+            for label, error in (("sender join", join_error), ("sender", snapshot.error),
+                                 ("cadence diagnostics", diagnostic_error)):
+                if error is not None and error is not primary_error:
+                    primary_error.add_note(f"AM1 Local recovery {label} also failed: {error!r}")
+        else:
+            outcome_error = join_error or snapshot.error or (SafetyRefusal(refusal) if refusal else None)
+            if outcome_error is not None:
+                if diagnostic_error is not None and diagnostic_error is not outcome_error:
+                    outcome_error.add_note(f"AM1 Local recovery cadence diagnostics also failed: {diagnostic_error!r}")
+                raise outcome_error
+            if diagnostic_error is not None:
+                raise diagnostic_error
+
+
 def run_am1_live_sender(
     robot: Any,
     leader: Any,
@@ -1562,6 +2099,9 @@ def run_am1_live_sender(
     should_stop: Callable[[], bool] | None = None,
     body_action_supplier: Callable[[], Mapping[str, float | int]] | None = None,
     sample_callback: Callable[[AM1LiveSample, Mapping[str, float | int]], None] | None = None,
+    recovery_enabled: bool = False,
+    max_start_mismatch: float = 10.0,
+    input_fn: Callable[[str], str] = input,
 ) -> None:
     """Read devices on the caller thread while a private worker sends live actions."""
     approved_target = extract_am1_arm_positions(
@@ -1605,6 +2145,23 @@ def run_am1_live_sender(
             f"initial follower observation age {initial_observation_age_s:.3f}s reached the "
             f"{AM1_LIVE_OBSERVATION_MAX_AGE_S:.1f}-second freshness limit before live sending"
         )
+
+    if recovery_enabled:
+        if body_action_supplier is None or live_arm_scope != "both" or follower_hold_target is None:
+            raise SafetyRefusal("AM1 Local recovery requires both follower arms and Local body input")
+        _run_am1_recovering_local_sender(
+            robot, leader,
+            initial_arm_target=approved_target,
+            initial_follower_positions=follower_hold_target,
+            initial_observation_sequence=initial_observation_sequence,
+            initial_follower_observed_at=initial_follower_observed_at,
+            fps=fps, duration_s=duration_s, profile_cadence=profile_cadence,
+            max_start_mismatch=max_start_mismatch, monotonic=monotonic,
+            wall_time_ns=wall_time_ns, sleep_fn=sleep_fn, should_stop=should_stop,
+            body_action_supplier=body_action_supplier, input_fn=input_fn,
+            sample_callback=sample_callback,
+        )
+        return
 
     hold_target = follower_hold_target if live_arm_scope == "right_wrist_flex" else approved_target
     safe_target = dict(hold_target if live_arm_scope == "right_wrist_flex" else approved_target)
@@ -2052,6 +2609,9 @@ def run_teleoperation(
                         local_body_action_supplier if getattr(args, "local_mode", False) else None
                     ),
                     sample_callback=sample_callback,
+                    recovery_enabled=bool(getattr(args, "unified_session_enter_confirmations", False)),
+                    max_start_mismatch=args.max_start_mismatch,
+                    input_fn=input_fn,
                 )
                 raise_if_external_stop_requested()
             except SafetyRefusal as exc:

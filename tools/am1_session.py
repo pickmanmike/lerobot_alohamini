@@ -203,6 +203,7 @@ class SessionOutcome:
     remote_logs: list[str] = field(default_factory=list)
     missing_logs: list[str] = field(default_factory=list)
     cleanup: dict[str, Any] = field(default_factory=dict)
+    warnings: list[dict[str, Any]] = field(default_factory=list)
     failure: str | None = None
     sources: dict[str, str] = field(default_factory=dict)
     sync_timing: dict[str, Any] | None = None
@@ -282,6 +283,7 @@ class SessionCoordinator:
         )
         remote_logs: list[str] = []
         remote_started = False
+        remote_fault_observed_after_client_result: dict[str, Any] | None = None
         try:
             if hasattr(self.remote, "set_stop_requested"):
                 self.remote.set_stop_requested(stop_requested)
@@ -331,9 +333,26 @@ class SessionCoordinator:
                         stop_requested=stop_requested,
                     )
                 )
-                if hasattr(self.remote, "fault") and self.remote.fault() is not None:
-                    outcome.failure = "Pi session fault: " + json.dumps(self.remote.fault(), sort_keys=True)
-                    outcome.operational_exit_code = 2
+                if outcome.operational_exit_code != 0:
+                    refusal = None
+                    try:
+                        for line in reversed(client_log_path.read_text(encoding="utf-8", errors="replace").splitlines()):
+                            if line.startswith("SAFETY REFUSAL: "):
+                                refusal = line.partition(": ")[2]
+                                break
+                    except OSError:
+                        pass
+                    outcome.failure = (
+                        f"Windows Local client safety refusal: {refusal}"
+                        if refusal is not None
+                        else f"Windows Local client exited with status {outcome.operational_exit_code}"
+                    )
+                if hasattr(self.remote, "fault") and (remote_fault := self.remote.fault()) is not None:
+                    if outcome.failure is None:
+                        outcome.failure = "Pi session fault: " + json.dumps(remote_fault, sort_keys=True)
+                        outcome.operational_exit_code = 2
+                    else:
+                        remote_fault_observed_after_client_result = dict(remote_fault)
         except (KeyboardInterrupt, SessionStopped):
             outcome.failure = "operator interrupt"
             outcome.operational_exit_code = 130
@@ -355,6 +374,8 @@ class SessionCoordinator:
                 else {"cleanup_verified": True, "not_reported": True}
             )
             cleanup["client"] = client_cleanup
+            if remote_fault_observed_after_client_result is not None:
+                cleanup["remote_fault_observed_after_client_result"] = remote_fault_observed_after_client_result
             outcome.cleanup = cleanup
             outcome.cleanup_verified = bool(cleanup.get("cleanup_verified")) and bool(
                 client_cleanup.get("cleanup_verified")
@@ -388,6 +409,7 @@ class SessionCoordinator:
                 try:
                     start_ns = None
                     end_ns = None
+                    paused_causes: dict[int, str] = {}
                     for line in client_log_path.read_text(encoding="utf-8", errors="replace").splitlines():
                         if not line.startswith("{"):
                             continue
@@ -397,6 +419,19 @@ class SessionCoordinator:
                             continue
                         if payload.get("event") == "am1_startup_sync_timing":
                             outcome.sync_timing = payload
+                        elif payload.get("event") == "am1_local_paused":
+                            if type(payload.get("epoch")) is int and isinstance(payload.get("cause"), str):
+                                paused_causes[payload["epoch"]] = payload["cause"]
+                        elif payload.get("event") == "am1_local_recovered":
+                            epoch = payload.get("epoch")
+                            if type(epoch) is int and epoch - 1 in paused_causes:
+                                outcome.warnings.append({
+                                    "kind": "recovered_observation_gap",
+                                    "epoch": epoch,
+                                    "cause": paused_causes[epoch - 1],
+                                    "pause_duration_s": payload.get("pause_duration_s"),
+                                    "resume_mode": payload.get("resume_mode"),
+                                })
                         elif payload.get("event") == "am1_client_live_start":
                             start_ns = payload.get("wall_time_ns")
                         elif payload.get("event") == "am1_client_action_cadence":

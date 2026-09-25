@@ -641,6 +641,74 @@ def test_primary_client_failure_survives_cleanup_and_copy_failures(tmp_path):
     assert [entry["remote_path"] for entry in manifest["missing"]] == outcome.missing_logs
 
 
+def test_client_safety_refusal_stays_primary_when_lease_fault_appears_after_client_exit(tmp_path):
+    module = load_tool("am1_session")
+    late_fault = {"event": "runtime_fault", "reason": "controller heartbeat lease expired"}
+    state = {"client_exited": False}
+
+    class Remote:
+        def preflight(self): return {}
+        def start_camera(self): return {"browser_url": "http://camera"}
+        def start_host(self): return {}
+        def fault(self): return late_fault if state["client_exited"] else None
+        def stop(self): return {"cleanup_verified": True, "primary_fault": late_fault}
+
+    class Client:
+        def run(self, *, log_path, **kwargs):
+            log_path.write_text("SAFETY REFUSAL: follower observation age 1.016s\nAM1_CLIENT_EXIT_CODE=2\n")
+            state["client_exited"] = True
+            return 2
+
+    outcome = module.SessionCoordinator(
+        remote=Remote(), client=Client(), open_browser=lambda url: None,
+        collect_remote_log=lambda remote, local: (True, None), input_fn=lambda prompt: "",
+    ).run(
+        duration_seconds=60, session_id="20260924T210455-3eb748ba",
+        session_directory=tmp_path, client_log_path=tmp_path / "client.log",
+        stop_requested=lambda: False,
+    )
+
+    assert outcome.operational_exit_code == outcome.final_exit_code == 2
+    assert outcome.failure == "Windows Local client safety refusal: follower observation age 1.016s"
+    assert outcome.cleanup["remote_fault_observed_after_client_result"] == late_fault
+
+
+def test_successful_short_recovery_is_a_summary_warning_not_a_failed_session(tmp_path):
+    module = load_tool("am1_session")
+
+    class Remote:
+        def preflight(self): return {}
+        def start_camera(self): return {"browser_url": "http://camera"}
+        def start_host(self): return {}
+        def stop(self): return {"cleanup_verified": True}
+
+    class Client:
+        def run(self, *, log_path, **kwargs):
+            log_path.write_text(
+                '{"event":"am1_local_paused","epoch":1,"cause":"observation age 1.016s","wall_time_ns":10}\n'
+                '{"event":"am1_local_recovered","epoch":2,"pause_duration_s":1.4,"resume_mode":"automatic","wall_time_ns":11}\n'
+                "AM1_CLIENT_EXIT_CODE=0\n"
+            )
+            return 0
+
+    outcome = module.SessionCoordinator(
+        remote=Remote(), client=Client(), open_browser=lambda url: None,
+        collect_remote_log=lambda remote, local: (True, None), input_fn=lambda prompt: "",
+    ).run(
+        duration_seconds=60, session_id="20260925T120000-1234abcd",
+        session_directory=tmp_path, client_log_path=tmp_path / "client.log",
+        stop_requested=lambda: False,
+    )
+
+    assert outcome.final_exit_code == 0
+    assert outcome.failure is None
+    assert outcome.warnings == [{
+        "kind": "recovered_observation_gap", "epoch": 2,
+        "cause": "observation age 1.016s", "pause_duration_s": 1.4,
+        "resume_mode": "automatic",
+    }]
+
+
 def test_primary_client_failure_survives_collection_callback_exception(tmp_path):
     module = load_tool("am1_session")
 

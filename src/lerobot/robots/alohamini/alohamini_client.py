@@ -144,6 +144,8 @@ class AlohaMiniClient(Robot):
         self.zmq_observation_socket = None
         self._observation_request_tokens: deque[bytes] = deque()
         self._observation_response_cache: dict[bytes, list[bytes]] = {}
+        self._observation_request_sent_at: dict[bytes, float] = {}
+        self._last_response_request_sent_at: float | None = None
         self._observation_request_id = 0
 
         self.last_frames = {}
@@ -154,7 +156,9 @@ class AlohaMiniClient(Robot):
         self._observation_sequence = 0
         self._latest_raw_observation_keys: frozenset[str] = frozenset()
         self._latest_observation_received_at: float | None = None
+        self._latest_observation_roundtrip_age_s: float | None = None
         self._latest_observation_error: str | None = None
+        self._latest_am1_local_feedback: Any = None
         self._lift_target_mm = None
 
         # Define three speed levels and a current index
@@ -223,9 +227,19 @@ class AlohaMiniClient(Robot):
         return self._latest_observation_received_at
 
     @property
+    def latest_observation_roundtrip_age_s(self) -> float | None:
+        """Elapsed time from the matching request send to decoded reply receipt."""
+        return self._latest_observation_roundtrip_age_s
+
+    @property
     def latest_observation_error(self) -> str | None:
         """Malformed-payload reason from the most recent observation request, if any."""
         return self._latest_observation_error
+
+    @property
+    def latest_am1_local_feedback(self) -> Any:
+        """Unmodified AM1 Local host acknowledgement from the latest decoded frame."""
+        return self._latest_am1_local_feedback
 
     @property
     def is_calibrated(self) -> bool:
@@ -277,10 +291,12 @@ class AlohaMiniClient(Robot):
         request_token = str(self._observation_request_id).encode("ascii")
 
         try:
+            sent_at = time.monotonic()
             self.zmq_observation_socket.send(request_token, flags=zmq.NOBLOCK)
         except zmq.ZMQError as e:
             logging.error(f"ZMQ observation request failed: {e}")
             return None
+        self._observation_request_sent_at[request_token] = sent_at
         return request_token
 
     def _receive_observation_response(
@@ -327,7 +343,10 @@ class AlohaMiniClient(Robot):
         request_token = self._send_observation_request()
         if request_token is None:
             return None
-        return self._receive_observation_response(request_token, timeout_ms)
+        try:
+            return self._receive_observation_response(request_token, timeout_ms)
+        finally:
+            self._observation_request_sent_at.pop(request_token, None)
 
     def _fill_observation_request_window(self) -> None:
         """Keep a bounded number of requests in flight to cover transport latency."""
@@ -336,6 +355,15 @@ class AlohaMiniClient(Robot):
             if request_token is None:
                 break
             self._observation_request_tokens.append(request_token)
+
+    def retire_observation_requests(self) -> None:
+        """Exclude every pre-pause request/reply before qualifying recovery."""
+        self._observation_request_tokens.clear()
+        self._observation_response_cache.clear()
+        self._observation_request_sent_at.clear()
+        self._last_response_request_sent_at = None
+        self._drain_observation_responses()
+        self._fill_observation_request_window()
 
     def _drain_observation_responses(self) -> None:
         """Drain ready replies, retaining only those for requests still tracked locally."""
@@ -360,13 +388,19 @@ class AlohaMiniClient(Robot):
             self._drain_observation_responses()
             self._fill_observation_request_window()
 
+        request_token = self._observation_request_tokens.popleft() if self._observation_request_tokens else None
         message = (
-            self._receive_observation_response(
-                self._observation_request_tokens.popleft(), self.polling_timeout_ms
-            )
-            if self._observation_request_tokens
+            self._receive_observation_response(request_token, self.polling_timeout_ms)
+            if request_token is not None
             else None
         )
+        self._last_response_request_sent_at = (
+            self._observation_request_sent_at.pop(request_token, None)
+            if request_token is not None and message is not None
+            else None
+        )
+        if request_token is not None and message is None:
+            self._observation_request_sent_at.pop(request_token, None)
         if message is None:
             logging.info("No new data available within timeout.")
         # Retire only the token just consumed or timed out. Replies for other active tokens
@@ -539,7 +573,14 @@ class AlohaMiniClient(Robot):
 
         self.last_frames = {**self.last_frames, **new_frames}
         self.last_remote_state = new_state
+        self._latest_am1_local_feedback = observation.get("_am1_local_feedback")
         self._latest_observation_received_at = received_at
+        request_sent_at = getattr(self, "_last_response_request_sent_at", None)
+        self._latest_observation_roundtrip_age_s = (
+            received_at - request_sent_at
+            if received_at is not None and request_sent_at is not None
+            else None
+        )
         self._observation_sequence += 1
         observation_done_t = time.perf_counter()
         self.logs["observation_timing_ms"] = {
