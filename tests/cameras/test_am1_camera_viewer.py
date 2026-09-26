@@ -103,6 +103,38 @@ class CameraCoreTests(unittest.TestCase):
         self.assertIn("CAMERA_REFUSAL TimeoutExpired: stage=private-camera-map", output.getvalue())
         self.assertNotIn("private-command", output.getvalue())
 
+    def test_backend_port_probe_reuses_timewait_without_admitting_live_owner(self):
+        class Probe:
+            def __init__(self, live_owner):
+                self.live_owner = live_owner
+                self.reuse_enabled = False
+
+            def __enter__(self): return self
+            def __exit__(self, *_): return False
+
+            def setsockopt(self, level, option, value):
+                assert (level, option, value) == (self_socket.SOL_SOCKET, self_socket.SO_REUSEADDR, 1)
+                self.reuse_enabled = True
+
+            def bind(self, address):
+                assert self.reuse_enabled, "TIME_WAIT-safe reuse must precede bind"
+                assert address == ("127.0.0.1", 1985)
+                if self.live_owner:
+                    raise OSError(98, "live backend")
+
+        self_socket = self.viewer.socket
+        binary = Mock()
+        binary.read_bytes.return_value = b"approved-binary"
+        digest = Mock()
+        digest.hexdigest.return_value = self.viewer.BINARY_SHA256
+        with patch.object(self.viewer.sys, "platform", "linux"), \
+             patch.object(self.viewer.hashlib, "sha256", return_value=digest), \
+             patch.object(self.viewer.subprocess, "run", return_value=Mock(returncode=1)), \
+             patch.object(self_socket, "socket", side_effect=[Probe(False), Probe(True)]):
+            self.viewer.preflight({"cameras": {}}, binary)
+            with self.assertRaisesRegex(RuntimeError, "backend port unavailable"):
+                self.viewer.preflight({"cameras": {}}, binary)
+
     def test_partial_mapping_retains_missing_roles_without_guessing(self):
         result = self.viewer.validate_config(self.config)
         self.assertEqual(result["cameras"], {"forward": "/dev/am_camera_forward"})

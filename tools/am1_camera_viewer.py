@@ -490,6 +490,9 @@ def preflight(config, binary):
         raise ValueError("Camera already owned (or device-owner check failed); stop the other owner first")
     with socket.socket() as probe:
         try:
+            # Prior backend connections may remain in TIME_WAIT after clean exit.
+            # This still refuses a live listener on Linux without SO_REUSEPORT.
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             probe.bind(("127.0.0.1", 1985))  # Refuse a pre-existing backend; never kill it.
         except OSError as exc:
             raise RuntimeError(f"camera backend port unavailable (errno={exc.errno})") from exc
