@@ -209,6 +209,594 @@ def test_local_pause_retires_pre_pause_tokens_and_rejects_late_old_replies():
     assert client._poll_and_get_latest_message() == [b"fresh-post-pause"]
 
 
+def test_final_alignment_retires_old_request_window_after_long_enter(monkeypatch):
+    module = load_teleoperate()
+    from lerobot.robots.alohamini import alohamini_client
+
+    clock = SimpleNamespace(now=100.0)
+    monkeypatch.setattr(alohamini_client.time, "monotonic", lambda: clock.now)
+    client, socket = make_observation_transport_client()
+    client._is_connected = True
+    client._fill_observation_request_window()
+    old_tokens = tuple(socket.sent)
+    clock.now += 5.0  # Operator's final Enter pause exceeds the live freshness limit.
+    socket.responses.append([old_tokens[0], json.dumps(FOLLOWER).encode()])
+    original_send = socket.send
+
+    def reply_to_new_request(token, flags):
+        original_send(token, flags)
+        socket.responses.append([token, json.dumps(FOLLOWER).encode()])
+
+    socket.send = reply_to_new_request
+    leader = SimpleNamespace(get_action=lambda: dict(LEADER))
+
+    approved, observation, observed_at = module.run_alignment_gate(
+        client, leader, 10.0, monotonic=lambda: clock.now,
+        require_current_request=True,
+    )
+
+    assert approved == FOLLOWER
+    assert {key: observation[key] for key in ARM_KEYS} == FOLLOWER
+    assert observed_at == clock.now
+    assert client.latest_observation_roundtrip_age_s < 1.0
+    assert client.observation_sequence == 1
+    assert not any(token in client._observation_request_tokens for token in old_tokens)
+
+
+def test_final_alignment_retries_when_leader_read_ages_current_reply(monkeypatch):
+    module = load_teleoperate()
+    from lerobot.robots.alohamini import alohamini_client
+
+    clock = SimpleNamespace(now=100.0)
+    monkeypatch.setattr(alohamini_client.time, "monotonic", lambda: clock.now)
+    client, socket = make_observation_transport_client()
+    client._is_connected = True
+    original_send = socket.send
+
+    def host_reply(token, flags):
+        original_send(token, flags)
+        socket.responses.append([token, json.dumps(FOLLOWER).encode()])
+
+    socket.send = host_reply
+    leader_reads = []
+
+    def read_leader():
+        leader_reads.append(clock.now)
+        if len(leader_reads) == 1:
+            clock.now += 1.1
+        return dict(LEADER)
+
+    approved, _, observed_at = module.run_alignment_gate(
+        client, SimpleNamespace(get_action=read_leader), 10.0,
+        monotonic=lambda: clock.now, require_current_request=True,
+    )
+    assert approved == FOLLOWER
+    assert len(leader_reads) == 2
+    assert client.observation_sequence == 2
+    assert observed_at == clock.now
+
+
+def test_thirty_second_sync_retires_old_request_window_before_verification(monkeypatch):
+    module = load_teleoperate()
+    from lerobot.robots.alohamini import alohamini_client
+
+    clock = SimpleNamespace(now=100.0)
+    monkeypatch.setattr(alohamini_client.time, "monotonic", lambda: clock.now)
+    client, socket = make_observation_transport_client()
+    client._is_connected = True
+    actions = []
+    client.send_action = lambda action: actions.append(dict(action))
+    original_send = socket.send
+
+    def fake_host_reply(token, flags):
+        original_send(token, flags)
+        payload = {**FOLLOWER, "_am1_local_feedback": {
+            "version": 1, "state": "ready", "epoch": -1, "observation_id": int(token),
+        }}
+        socket.responses.append([token, json.dumps(payload).encode()])
+
+    socket.send = fake_host_reply
+    client._fill_observation_request_window()
+    leader = SimpleNamespace(get_action=lambda: dict(LEADER))
+
+    target, observation, observed_at = module.run_startup_sync(
+        client, leader, side="both", requested_duration_s=30.0, fps=10,
+        max_start_mismatch=10.0, input_fn=lambda _: "",
+        monotonic=lambda: clock.now,
+        sleep_fn=lambda seconds: setattr(clock, "now", clock.now + seconds),
+        enter_confirmation=True,
+    )
+
+    assert len(actions) >= 300
+    assert target == FOLLOWER
+    assert {key: observation[key] for key in ARM_KEYS} == FOLLOWER
+    assert observed_at == clock.now
+    assert clock.now == pytest.approx(130.0)
+    assert client.latest_observation_roundtrip_age_s < 1.0
+
+
+def test_unified_final_enter_uses_post_pause_request_window_for_first_live_target(monkeypatch, capsys):
+    module = load_teleoperate()
+    from lerobot.robots.alohamini import alohamini_client
+    from lerobot.robots.alohamini.alohamini_client import AlohaMiniClient
+
+    clock = SimpleNamespace(now=100.0)
+    monkeypatch.setattr(alohamini_client.time, "monotonic", lambda: clock.now)
+    captured = {}
+
+    class TransportRobot(AlohaMiniClient):
+        instance = None
+
+        def __init__(self, config):
+            super().__init__(config)
+            type(self).instance = self
+            self.socket = FakeObservationSocket()
+            self._zmq = SimpleNamespace(
+                NOBLOCK=1, POLLIN=2, Again=ObservationAgain, ZMQError=ObservationAgain,
+                Poller=lambda: FakeObservationPoller(2),
+            )
+            original_send = self.socket.send
+
+            def host_reply(token, flags):
+                original_send(token, flags)
+                payload = {**FOLLOWER, "_am1_local_feedback": {
+                    "version": 1, "state": "ready", "epoch": -1,
+                    "observation_id": int(token),
+                }}
+                self.socket.responses.append([token, json.dumps(payload).encode()])
+
+            self.socket.send = host_reply
+            self.zmq_observation_socket = self.socket
+            self.actions = []
+
+        def connect(self, *, cancel_check=None):
+            self._is_connected = True
+            self._fill_observation_request_window()
+
+        def send_action(self, action):
+            self.actions.append(dict(action))
+            return dict(action)
+
+        def disconnect(self): self._is_connected = False
+
+    class Arm:
+        def connect(self): pass
+        def disconnect(self): pass
+
+    class Leader:
+        def __init__(self, config):
+            self.left_arm = Arm()
+            self.right_arm = Arm()
+
+        def get_action(self): return dict(LEADER)
+
+    class Keyboard:
+        is_connected = True
+        def __init__(self, config): pass
+        def connect(self): pass
+        def disconnect(self): pass
+        def get_action(self): return {}
+
+    monkeypatch.setattr(module, "AlohaMiniClient", TransportRobot)
+    monkeypatch.setattr(module, "BiSOLeader", Leader)
+    monkeypatch.setattr(module, "KeyboardTeleop", Keyboard)
+    def admit_and_capture(*_args, **kwargs):
+        captured.update(kwargs)
+        kwargs["announce_active"]()
+
+    monkeypatch.setattr(module, "run_am1_live_sender", admit_and_capture)
+    args = parse_windows(
+        module, "--local_mode", "--startup_mode", "sync", "--start_paused",
+        "--startup_sync_duration_s", "30", "--startup_sync_side", "both",
+        "--no_cameras", "--no_rerun", "--fps", "10", "--duration_s", "1",
+        "--profile_cadence", "--unified_session_enter_confirmations",
+        "--external_stop_file", str(REPO_ROOT / ".pytest-tmp-startup" / "not-stopped"),
+    )
+    prompts = []
+
+    def enter(prompt):
+        prompts.append(prompt)
+        if len(prompts) == 2:
+            clock.now += 5.0
+        return ""
+
+    status = module.run_teleoperation(
+        args, input_fn=enter, monotonic=lambda: clock.now,
+        sleep_fn=lambda seconds: setattr(clock, "now", clock.now + seconds),
+    )
+
+    assert status == 0
+    assert len(prompts) == 2
+    assert clock.now == pytest.approx(135.0)
+    assert captured["initial_arm_target"] == FOLLOWER
+    assert captured["initial_follower_observed_at"] == clock.now
+    assert TransportRobot.instance.latest_observation_roundtrip_age_s < 1.0
+    assert "TELEOPERATION ACTIVE" in capsys.readouterr().out
+    assert all(action.get("x.vel", 0.0) == 0 for action in TransportRobot.instance.actions)
+
+
+def test_current_startup_sample_with_missing_request_age_refuses_before_leader_read():
+    module = load_teleoperate()
+
+    class Robot:
+        observation_sequence = 0
+        config = SimpleNamespace(connect_timeout_s=1.0)
+        latest_observation_roundtrip_age_s = None
+        latest_raw_observation_keys = frozenset(FOLLOWER)
+        latest_observation_error = None
+
+        def retire_observation_requests(self): pass
+        def get_observation(self):
+            self.observation_sequence += 1
+            return dict(FOLLOWER)
+
+    leader = SimpleNamespace(get_action=lambda: (_ for _ in ()).throw(
+        AssertionError("leader must not be read after invalid timing")
+    ))
+    with pytest.raises(module.SafetyRefusal, match="request/reply age is unavailable"):
+        module.run_alignment_gate(Robot(), leader, 10.0, require_current_request=True)
+
+
+def test_current_startup_sample_with_missing_receive_time_refuses_before_leader_read():
+    module = load_teleoperate()
+
+    class Robot:
+        observation_sequence = 0
+        config = SimpleNamespace(connect_timeout_s=1.0)
+        latest_observation_roundtrip_age_s = 0.01
+        latest_raw_observation_keys = frozenset(FOLLOWER)
+        latest_observation_error = None
+
+        def retire_observation_requests(self): pass
+        def get_observation(self):
+            self.observation_sequence += 1
+            return dict(FOLLOWER)
+
+    leader = SimpleNamespace(get_action=lambda: (_ for _ in ()).throw(
+        AssertionError("leader must not be read after missing receive time")
+    ))
+    with pytest.raises(module.SafetyRefusal, match="receive time is unavailable"):
+        module.run_alignment_gate(Robot(), leader, 10.0, require_current_request=True)
+
+
+def test_current_startup_missing_feedback_has_bounded_refusal_and_checks_cancel():
+    module = load_teleoperate()
+    clock = SimpleNamespace(now=0.0)
+
+    class Robot:
+        observation_sequence = 0
+        config = SimpleNamespace(connect_timeout_s=0.25)
+        latest_observation_error = None
+        retired = False
+
+        def retire_observation_requests(self): self.retired = True
+        def get_observation(self):
+            clock.now += 0.1
+            return {}
+
+    robot = Robot()
+    with pytest.raises(module.SafetyRefusal, match="timed out waiting for a current follower"):
+        module.get_fresh_follower_observation(
+            robot, require_current_request=True, monotonic=lambda: clock.now,
+        )
+    assert robot.retired
+    assert clock.now <= 0.4
+
+    cancelled = module.ExternalStopRequested("operator stop")
+    with pytest.raises(module.ExternalStopRequested) as caught:
+        module.get_fresh_follower_observation(
+            Robot(), require_current_request=True, monotonic=lambda: clock.now,
+            cancel_check=lambda: (_ for _ in ()).throw(cancelled),
+        )
+    assert caught.value is cancelled
+
+
+def test_unified_changed_final_pose_offers_one_enter_realignment_then_admits(monkeypatch, capsys):
+    module = load_teleoperate()
+    clock = SimpleNamespace(now=100.0)
+    actions = []
+    sync_calls = []
+    gate_calls = []
+    prompts = []
+    captured = {}
+
+    class Robot:
+        observation_sequence = 0
+        latest_observation_roundtrip_age_s = 0.01
+        latest_am1_local_feedback = {
+            "version": 1, "state": "ready", "epoch": -1, "observation_id": 1,
+        }
+
+        def __init__(self, config):
+            self.config = SimpleNamespace(teleop_keys={"quit": "q"}, connect_timeout_s=1.0)
+
+        def connect(self, *, cancel_check=None): pass
+        def send_action(self, action): actions.append(dict(action))
+        def disconnect(self): pass
+
+    class Arm:
+        def connect(self): pass
+        def disconnect(self): pass
+
+    class Leader:
+        def __init__(self, config):
+            self.left_arm = Arm()
+            self.right_arm = Arm()
+
+    class Keyboard:
+        is_connected = True
+        def __init__(self, config): pass
+        def connect(self): pass
+        def disconnect(self): pass
+        def get_action(self): return {}
+
+    def fake_sync(robot, leader, **kwargs):
+        sync_calls.append(kwargs)
+        if len(sync_calls) == 2:
+            assert kwargs["confirmation_prompt"].startswith("REALIGNMENT")
+            assert kwargs["input_fn"]("") == ""
+        robot.observation_sequence += 1
+        return dict(FOLLOWER), dict(FOLLOWER), clock.now
+
+    def fake_gate(robot, leader, *args, **kwargs):
+        gate_calls.append(kwargs)
+        if len(gate_calls) == 1:
+            raise module.StartupAlignmentMismatch(
+                "startup alignment mismatch for arm_right_elbow_flex.pos: absolute_difference=61.441"
+            )
+        robot.observation_sequence += 1
+        observed_at = clock.now
+        if len(gate_calls) == 2:
+            clock.now += 1.1  # Valid final gate ages during admission setup.
+        return dict(FOLLOWER), dict(FOLLOWER), observed_at
+
+    monkeypatch.setattr(module, "AlohaMiniClient", Robot)
+    monkeypatch.setattr(module, "BiSOLeader", Leader)
+    monkeypatch.setattr(module, "KeyboardTeleop", Keyboard)
+    monkeypatch.setattr(module, "run_startup_sync", fake_sync)
+    monkeypatch.setattr(module, "run_alignment_gate", fake_gate)
+    def admit_and_capture(*_args, **kwargs):
+        captured.update(kwargs)
+        kwargs["announce_active"]()
+
+    monkeypatch.setattr(module, "run_am1_live_sender", admit_and_capture)
+    args = parse_windows(
+        module, "--local_mode", "--startup_mode", "sync", "--start_paused",
+        "--startup_sync_duration_s", "30", "--startup_sync_side", "both",
+        "--no_cameras", "--no_rerun", "--fps", "10", "--duration_s", "1",
+        "--profile_cadence", "--unified_session_enter_confirmations",
+        "--external_stop_file", str(REPO_ROOT / ".pytest-tmp-startup" / "not-stopped"),
+    )
+
+    def enter(prompt):
+        prompts.append(prompt)
+        return ""
+
+    assert module.run_teleoperation(args, input_fn=enter, monotonic=lambda: clock.now) == 0
+    assert len(sync_calls) == 2
+    assert len(gate_calls) == 3
+    assert len(prompts) == 2
+    assert sync_calls[1]["requested_duration_s"] == 30.0
+    assert sync_calls[1]["max_start_mismatch"] == 10.0
+    assert captured["initial_arm_target"] == FOLLOWER
+    assert captured["initial_follower_observed_at"] == clock.now
+    assert all(action == module.make_zero_action() for action in actions)
+    output = capsys.readouterr().out
+    assert "ALIGNMENT CHANGED" in output
+    assert output.index("REALIGNMENT COMPLETE") < output.index("TELEOPERATION ACTIVE")
+
+    monkeypatch.setattr(module, "run_am1_live_sender", lambda *a, **kw: (_ for _ in ()).throw(
+        module.SafetyRefusal("admission lost before sender start")
+    ))
+    assert module.run_teleoperation(args, input_fn=enter, monotonic=lambda: clock.now) == 2
+    failed_output = capsys.readouterr().out
+    assert "admission lost before sender start" in failed_output
+    assert "TELEOPERATION ACTIVE" not in failed_output
+
+
+def test_unified_realign_enter_runs_bounded_arm_frames_before_live(monkeypatch):
+    module = load_teleoperate()
+    clock = SimpleNamespace(now=100.0)
+    events = []
+    captured = {}
+    original_sync = module.run_startup_sync
+
+    class Robot:
+        instance = None
+        def __init__(self, config):
+            Robot.instance = self
+            self.config = SimpleNamespace(teleop_keys={"quit": "q"}, connect_timeout_s=2.0)
+            self.positions = dict(FOLLOWER)
+            self.observation_sequence = 0
+            self.latest_observation_roundtrip_age_s = 0.01
+            self.latest_observation_received_at = clock.now
+            self.latest_raw_observation_keys = frozenset(FOLLOWER)
+            self.latest_observation_error = None
+            self.latest_am1_local_feedback = {
+                "version": 1, "state": "ready", "epoch": -1, "observation_id": 0,
+            }
+
+        def connect(self, *, cancel_check=None): pass
+        def disconnect(self): pass
+        def retire_observation_requests(self): pass
+        def get_observation(self):
+            self.observation_sequence += 1
+            self.latest_observation_received_at = clock.now
+            self.latest_am1_local_feedback["observation_id"] += 1
+            return dict(self.positions)
+        def send_action(self, action):
+            events.append(("send", dict(action)))
+            for key in ARM_KEYS:
+                if key in action:
+                    self.positions[key] = float(action[key])
+            return dict(action)
+
+    class Arm:
+        def connect(self): pass
+        def disconnect(self): pass
+
+    class Leader:
+        instance = None
+        def __init__(self, config):
+            Leader.instance = self
+            self.left_arm, self.right_arm = Arm(), Arm()
+            self.target = dict(LEADER)
+        def get_action(self): return dict(self.target)
+
+    class Keyboard:
+        is_connected = True
+        def __init__(self, config): pass
+        def connect(self): pass
+        def disconnect(self): pass
+        def get_action(self): return {}
+
+    sync_calls = []
+    def first_then_real_sync(robot, leader, **kwargs):
+        sync_calls.append(kwargs)
+        if len(sync_calls) == 1:
+            return dict(FOLLOWER), dict(FOLLOWER), clock.now
+        return original_sync(robot, leader, **kwargs)
+
+    def live_capture(*_args, **kwargs):
+        captured.update(kwargs)
+        kwargs["announce_active"]()
+
+    monkeypatch.setattr(module, "AlohaMiniClient", Robot)
+    monkeypatch.setattr(module, "BiSOLeader", Leader)
+    monkeypatch.setattr(module, "KeyboardTeleop", Keyboard)
+    monkeypatch.setattr(module, "run_startup_sync", first_then_real_sync)
+    monkeypatch.setattr(module, "run_am1_live_sender", live_capture)
+    args = parse_windows(
+        module, "--local_mode", "--startup_mode", "sync", "--start_paused",
+        "--startup_sync_duration_s", "30", "--startup_sync_side", "both",
+        "--no_cameras", "--no_rerun", "--fps", "10", "--duration_s", "1",
+        "--profile_cadence", "--unified_session_enter_confirmations",
+        "--external_stop_file", str(REPO_ROOT / ".pytest-tmp-startup" / "not-stopped"),
+    )
+    prompts = []
+    def enter(prompt):
+        prompts.append(prompt)
+        events.append(("enter", len(prompts)))
+        if len(prompts) == 1:
+            Leader.instance.target["right_elbow_flex.pos"] += 20.0
+        return ""
+
+    assert module.run_teleoperation(
+        args, input_fn=enter, monotonic=lambda: clock.now,
+        sleep_fn=lambda seconds: setattr(clock, "now", clock.now + seconds),
+    ) == 0
+    assert len(sync_calls) == 2 and len(prompts) == 2
+    first_arm_index = next(i for i, (kind, value) in enumerate(events) if kind == "send" and ARM_KEYS[0] in value)
+    assert ("enter", 2) in events[:first_arm_index]
+    arm_actions = [value for kind, value in events if kind == "send" and ARM_KEYS[0] in value]
+    assert len(arm_actions) >= 300
+    assert all(action["x.vel"] == action["y.vel"] == action["theta.vel"] == action["lift_axis.vel"] == 0 for action in arm_actions)
+    elbow = "arm_right_elbow_flex.pos"
+    assert arm_actions[-1][elbow] == pytest.approx(FOLLOWER[elbow] + 20.0)
+    assert max(abs(second[elbow] - first[elbow]) for first, second in zip(arm_actions, arm_actions[1:])) <= 0.75
+    assert captured["initial_arm_target"][elbow] == pytest.approx(FOLLOWER[elbow] + 20.0)
+
+
+def test_unified_sync_does_not_keep_advancing_arms_after_feedback_stalls():
+    module = load_teleoperate()
+    clock = SimpleNamespace(now=100.0)
+    target = dict(LEADER)
+    target["right_elbow_flex.pos"] += 20.0
+    actions = []
+
+    class Robot:
+        def __init__(self):
+            self.config = SimpleNamespace(connect_timeout_s=1.5)
+            self.observation_sequence = 0
+            self.latest_observation_roundtrip_age_s = 0.01
+            self.latest_observation_received_at = clock.now
+            self.latest_raw_observation_keys = frozenset(FOLLOWER)
+            self.latest_observation_error = None
+            self.latest_am1_local_feedback = {
+                "version": 1, "state": "ready", "epoch": -1, "observation_id": 0,
+            }
+
+        def retire_observation_requests(self): pass
+        def get_observation(self):
+            clock.now += 0.01
+            if clock.now < 100.25:
+                self.observation_sequence += 1
+                self.latest_observation_received_at = clock.now
+                self.latest_am1_local_feedback["observation_id"] += 1
+            return dict(FOLLOWER)
+        def send_action(self, action): actions.append((clock.now, dict(action)))
+
+    robot = Robot()
+    with pytest.raises(module.SafetyRefusal):
+        module.run_startup_sync(
+            robot, SimpleNamespace(get_action=lambda: dict(target)),
+            side="both", requested_duration_s=30.0, fps=10,
+            max_start_mismatch=10.0, input_fn=lambda prompt: "",
+            monotonic=lambda: clock.now,
+            sleep_fn=lambda seconds: setattr(clock, "now", clock.now + seconds),
+            enter_confirmation=True,
+        )
+    stalled_targets = {
+        round(action["arm_right_elbow_flex.pos"], 6)
+        for sent_at, action in actions if sent_at >= 101.3
+    }
+    assert len(stalled_targets) == 1
+    assert clock.now < 104.0
+    assert all(action["x.vel"] == action["y.vel"] == action["theta.vel"] == action["lift_axis.vel"] == 0 for _, action in actions)
+
+
+def test_unified_sync_short_feedback_gap_holds_then_resumes_without_burst(capsys):
+    module = load_teleoperate()
+    clock = SimpleNamespace(now=100.0)
+    target = dict(LEADER)
+    target["right_elbow_flex.pos"] += 20.0
+    actions = []
+
+    class Robot:
+        def __init__(self):
+            self.config = SimpleNamespace(connect_timeout_s=1.5, observation_request_window=1)
+            self.positions = dict(FOLLOWER)
+            self.observation_sequence = 0
+            self.latest_observation_roundtrip_age_s = 0.01
+            self.latest_observation_received_at = clock.now
+            self.latest_raw_observation_keys = frozenset(FOLLOWER)
+            self.latest_observation_error = None
+            self.latest_am1_local_feedback = {
+                "version": 1, "state": "ready", "epoch": -1, "observation_id": 0,
+            }
+
+        def retire_observation_requests(self): pass
+        def get_observation(self):
+            clock.now += 0.01
+            if clock.now < 100.25 or clock.now >= 101.7:
+                self.observation_sequence += 1
+                self.latest_observation_received_at = clock.now
+                self.latest_am1_local_feedback["observation_id"] += 1
+            return dict(self.positions)
+        def send_action(self, action):
+            actions.append((clock.now, dict(action)))
+            self.positions.update({key: float(action[key]) for key in ARM_KEYS if key in action})
+
+    robot = Robot()
+    approved, _, _ = module.run_startup_sync(
+        robot, SimpleNamespace(get_action=lambda: dict(target)),
+        side="both", requested_duration_s=30.0, fps=10,
+        max_start_mismatch=10.0, input_fn=lambda prompt: "",
+        monotonic=lambda: clock.now,
+        sleep_fn=lambda seconds: setattr(clock, "now", clock.now + seconds),
+        enter_confirmation=True,
+    )
+    assert approved["arm_right_elbow_flex.pos"] == pytest.approx(FOLLOWER["arm_right_elbow_flex.pos"] + 20.0)
+    output = capsys.readouterr().out
+    assert output.count("STARTUP FEEDBACK PAUSED") == 1
+    assert output.count("STARTUP FEEDBACK RESUMED") == 1
+    held = [round(action["arm_right_elbow_flex.pos"], 6) for sent_at, action in actions if 101.3 <= sent_at < 101.7]
+    assert len(held) >= 2 and len(set(held)) == 1
+    assert min(later - earlier for (earlier, _), (later, _) in zip(actions, actions[1:])) >= 0.09
+    assert max(abs(second[1]["arm_right_elbow_flex.pos"] - first[1]["arm_right_elbow_flex.pos"])
+               for first, second in zip(actions, actions[1:])) <= 0.75
+
+
 def test_local_feedback_is_taken_from_the_new_decoded_observation_only():
     client, socket = make_observation_transport_client()
     client._is_connected = True
@@ -1684,6 +2272,131 @@ def test_client_applies_command_send_timeout_only_when_configured(timeout_ms):
         assert (fake_zmq.LINGER, 0) in context.sockets[1].options
 
 
+def test_connect_retries_temporary_observation_send_failure_and_closes_on_timeout():
+    from lerobot.robots.alohamini.alohamini_client import AlohaMiniClient
+    from lerobot.robots.alohamini.config_alohamini import AlohaMiniClientConfig
+
+    class Socket(FakeObservationSocket):
+        def __init__(self, send_failures=0):
+            super().__init__(send_failures=send_failures)
+            self.closed = False
+
+        def setsockopt(self, *_): pass
+        def connect(self, *_): pass
+        def close(self): self.closed = True
+
+    class Context:
+        def __init__(self, failures):
+            self.sockets = []
+            self.failures = failures
+            self.terminated = False
+
+        def socket(self, _):
+            socket = Socket(self.failures if self.sockets else 0)
+            self.sockets.append(socket)
+            return socket
+
+        def term(self): self.terminated = True
+
+    def make_client(failures, timeout):
+        context = Context(failures)
+        client = AlohaMiniClient(AlohaMiniClientConfig(
+            remote_ip="127.0.0.1", id="test", robot_model="alohamini1",
+            cameras={}, connect_timeout_s=timeout,
+        ))
+        client._zmq = SimpleNamespace(
+            Context=lambda: context, PUSH=1, DEALER=2, CONFLATE=3, SNDTIMEO=4,
+            RCVHWM=5, SNDHWM=6, LINGER=7, NOBLOCK=8, POLLIN=9,
+            Again=ObservationAgain, ZMQError=ObservationAgain,
+            Poller=lambda: FakeObservationPoller(9),
+        )
+        return client, context
+
+    client, context = make_client(2, 0.5)
+    original_send = context.socket  # The observation socket is created by connect().
+
+    def socket_with_reply(kind):
+        socket = original_send(kind)
+        if kind == 2:
+            original_method = socket.send
+
+            def send(token, flags):
+                original_method(token, flags)
+                socket.responses.append([token, b'{}'])
+
+            socket.send = send
+        return socket
+
+    context.socket = socket_with_reply
+    client.connect()
+    assert client.is_connected
+    assert len(context.sockets[1].sent) >= 1
+    assert client._observation_request_id >= 3
+    client.disconnect()
+    assert all(socket.closed for socket in context.sockets)
+    assert context.terminated
+
+    failed, failed_context = make_client(10_000, 0.05)
+    with pytest.raises(Exception, match="Timeout waiting for AlohaMini Host"):
+        failed.connect()
+    assert not failed.is_connected
+    assert all(socket.closed for socket in failed_context.sockets)
+    assert failed_context.terminated
+
+    cancelled, cancelled_context = make_client(0, 0.5)
+    reason = RuntimeError("operator stop")
+    with pytest.raises(RuntimeError) as caught:
+        cancelled.connect(cancel_check=lambda: (_ for _ in ()).throw(reason))
+    assert caught.value is reason
+    assert all(socket.closed for socket in cancelled_context.sockets)
+    assert cancelled_context.terminated
+
+    fatal, fatal_context = make_client(0, 0.5)
+    class FatalZMQ(Exception): pass
+    fatal._zmq.ZMQError = FatalZMQ
+    original_factory = fatal_context.socket
+
+    def fatal_socket(kind):
+        socket = original_factory(kind)
+        if kind == 2:
+            socket.send = lambda *_args, **_kwargs: (_ for _ in ()).throw(FatalZMQ("context lost"))
+        return socket
+
+    fatal_context.socket = fatal_socket
+    with pytest.raises(FatalZMQ, match="context lost"):
+        fatal.connect()
+    assert all(socket.closed for socket in fatal_context.sockets)
+    assert fatal_context.terminated
+
+
+@pytest.mark.parametrize("robot_model", ["alohamini2", "alohamini2pro"])
+def test_other_models_keep_their_single_observation_handshake(robot_model):
+    from lerobot.robots.alohamini.alohamini_client import AlohaMiniClient
+    from lerobot.robots.alohamini.config_alohamini import AlohaMiniClientConfig
+
+    class Socket:
+        def setsockopt(self, *_): pass
+        def connect(self, *_): pass
+
+    class Context:
+        def socket(self, _): return Socket()
+
+    client = AlohaMiniClient(AlohaMiniClientConfig(
+        remote_ip="127.0.0.1", id="test", robot_model=robot_model, cameras={},
+    ))
+    client._zmq = SimpleNamespace(
+        Context=Context, PUSH=1, DEALER=2, CONFLATE=3, RCVHWM=4, SNDHWM=5,
+    )
+    calls = []
+    client._request_observation = lambda timeout: calls.append(timeout) or [b"ready"]
+    client._fill_observation_request_window = lambda: None
+
+    client.connect()
+
+    assert calls == [client.connect_timeout_s * 1000]
+    assert client.is_connected
+
+
 def test_client_live_command_socket_is_created_configured_used_and_closed_in_one_worker_thread():
     from lerobot.robots.alohamini.alohamini_client import AlohaMiniClient
     from lerobot.robots.alohamini.config_alohamini import AlohaMiniClientConfig
@@ -1906,7 +2619,7 @@ def test_run_teleoperation_uses_the_post_enter_follower_pose_and_receipt_time(mo
             self.left_arm = FakeArm()
             self.right_arm = FakeArm()
 
-    def fake_alignment_gate(robot, leader, max_start_mismatch, *, monotonic):
+    def fake_alignment_gate(robot, leader, max_start_mismatch, *, monotonic, **kwargs):
         robot.observation_sequence += 1
         return next(gate_results)
 

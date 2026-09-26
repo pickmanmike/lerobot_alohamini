@@ -22,7 +22,7 @@ import time
 from collections import deque
 from functools import cached_property
 import os
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -246,40 +246,73 @@ class AlohaMiniClient(Robot):
         pass
 
     @check_if_already_connected
-    def connect(self) -> None:
+    def connect(self, *, cancel_check: Callable[[], None] | None = None) -> None:
         """Establishes ZMQ sockets with the remote mobile robot"""
 
         zmq = self._zmq
-        self.zmq_context = zmq.Context()
-        self.zmq_cmd_socket = self.zmq_context.socket(zmq.PUSH)
-        # Socket options that control queueing must be set before connect().
-        self.zmq_cmd_socket.setsockopt(zmq.CONFLATE, 1)
-        if self.command_send_timeout_ms is not None:
-            self.zmq_cmd_socket.setsockopt(zmq.SNDTIMEO, self.command_send_timeout_ms)
-            self.zmq_cmd_socket.setsockopt(zmq.LINGER, 0)
-        zmq_cmd_locator = f"tcp://{self.remote_ip}:{self.port_zmq_cmd}"
-        self.zmq_cmd_socket.connect(zmq_cmd_locator)
+        try:
+            self.zmq_context = zmq.Context()
+            self.zmq_cmd_socket = self.zmq_context.socket(zmq.PUSH)
+            # Socket options that control queueing must be set before connect().
+            self.zmq_cmd_socket.setsockopt(zmq.CONFLATE, 1)
+            if self.command_send_timeout_ms is not None:
+                self.zmq_cmd_socket.setsockopt(zmq.SNDTIMEO, self.command_send_timeout_ms)
+                self.zmq_cmd_socket.setsockopt(zmq.LINGER, 0)
+            zmq_cmd_locator = f"tcp://{self.remote_ip}:{self.port_zmq_cmd}"
+            self.zmq_cmd_socket.connect(zmq_cmd_locator)
 
-        # Request-driven observation transport with a small bounded window. This covers
-        # network round-trip latency without allowing stale frames to accumulate unboundedly.
-        self.zmq_observation_socket = self.zmq_context.socket(zmq.DEALER)
-        if self.command_send_timeout_ms is not None:
-            self.zmq_observation_socket.setsockopt(zmq.LINGER, 0)
-        self.zmq_observation_socket.setsockopt(zmq.RCVHWM, self.observation_request_window)
-        self.zmq_observation_socket.setsockopt(zmq.SNDHWM, self.observation_request_window)
-        zmq_observations_locator = f"tcp://{self.remote_ip}:{self.port_zmq_observations}"
-        self.zmq_observation_socket.connect(zmq_observations_locator)
+            # Request-driven observation transport with a small bounded window.
+            self.zmq_observation_socket = self.zmq_context.socket(zmq.DEALER)
+            if self.command_send_timeout_ms is not None:
+                self.zmq_observation_socket.setsockopt(zmq.LINGER, 0)
+            self.zmq_observation_socket.setsockopt(zmq.RCVHWM, self.observation_request_window)
+            self.zmq_observation_socket.setsockopt(zmq.SNDHWM, self.observation_request_window)
+            zmq_observations_locator = f"tcp://{self.remote_ip}:{self.port_zmq_observations}"
+            self.zmq_observation_socket.connect(zmq_observations_locator)
 
-        handshake_message = self._request_observation(self.connect_timeout_s * 1000)
-        if handshake_message is None:
-            raise DeviceNotConnectedError("Timeout waiting for AlohaMini Host to connect expired.")
+            if self.config.robot_model == "alohamini1":
+                # A newly connected DEALER can briefly refuse NOBLOCK sends. Retry only
+                # within the original total connection budget; do not recreate the host.
+                deadline = time.monotonic() + self.connect_timeout_s
+                handshake_message = None
+                self._connect_handshake_strict = True
+                try:
+                    while handshake_message is None:
+                        if cancel_check is not None:
+                            cancel_check()
+                        remaining_s = deadline - time.monotonic()
+                        if remaining_s <= 0:
+                            break
+                        handshake_message = self._request_observation(min(100, max(1, int(remaining_s * 1000))))
+                        if handshake_message is None:
+                            time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
+                finally:
+                    self._connect_handshake_strict = False
+            else:
+                handshake_message = self._request_observation(self.connect_timeout_s * 1000)
+            if handshake_message is None:
+                raise DeviceNotConnectedError("Timeout waiting for AlohaMini Host to connect expired.")
 
-        # The handshake proves that the Host is available, but it may become stale while
-        # the remaining teleoperation devices connect. Discard it and fill a bounded request
-        # window for frames that get_observation() will consume.
-        self._fill_observation_request_window()
-
-        self._is_connected = True
+            # The handshake proves availability, not freshness after leader connection.
+            self._fill_observation_request_window()
+            self._is_connected = True
+        except BaseException as primary:
+            # connect() has not marked the client connected, so outer cleanup cannot
+            # call the decorated disconnect(). Close the partially created sockets here.
+            self._observation_request_tokens.clear()
+            self._observation_response_cache.clear()
+            self._observation_request_sent_at.clear()
+            for label, resource, method in (
+                ("observation socket", self.zmq_observation_socket, "close"),
+                ("command socket", self.zmq_cmd_socket, "close"),
+                ("context", self.zmq_context, "term"),
+            ):
+                if resource is not None:
+                    try:
+                        getattr(resource, method)()
+                    except BaseException as cleanup_error:
+                        primary.add_note(f"AlohaMiniClient connect cleanup {label} also failed: {cleanup_error!r}")
+            raise
 
     def calibrate(self) -> None:
         pass
@@ -294,6 +327,8 @@ class AlohaMiniClient(Robot):
             sent_at = time.monotonic()
             self.zmq_observation_socket.send(request_token, flags=zmq.NOBLOCK)
         except zmq.ZMQError as e:
+            if getattr(self, "_connect_handshake_strict", False) and not isinstance(e, zmq.Again):
+                raise
             logging.error(f"ZMQ observation request failed: {e}")
             return None
         self._observation_request_sent_at[request_token] = sent_at
@@ -320,6 +355,8 @@ class AlohaMiniClient(Robot):
             try:
                 socks = dict(poller.poll(remaining_ms))
             except zmq.ZMQError as e:
+                if getattr(self, "_connect_handshake_strict", False) and not isinstance(e, zmq.Again):
+                    raise
                 logging.error(f"ZMQ observation poll failed: {e}")
                 return None
             if self.zmq_observation_socket not in socks:

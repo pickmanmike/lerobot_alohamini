@@ -108,6 +108,42 @@ def parse_camera_readiness(text: str) -> dict[str, Any] | None:
     return {"browser_url": url, "roles": roles}
 
 
+def camera_readiness_failure(text: str) -> str | None:
+    """Summarize sanitized refusal, latest role diagnostic and nonfresh state."""
+    lines = text.splitlines()
+    refusal = next((line[:256] for line in reversed(lines) if line.startswith("CAMERA_REFUSAL ")), None)
+    role_diagnostic = next(
+        (line for line in reversed(lines) if re.fullmatch(
+            r"CAMERA_ROLE_UNAVAILABLE role=(forward|backward|chest|wrist_left|wrist_right) "
+            r"cause=(?:[A-Za-z]{1,48} errno=(?:None|[0-9]+)|ValueError backend HTTP status [0-9]+|[A-Za-z]+)",
+            line,
+        )),
+        None,
+    )
+    if refusal:
+        return refusal + (f"; last {role_diagnostic}" if role_diagnostic else "")
+    latest_status: dict[str, Any] | None = None
+    for line in lines:
+        if line.startswith("CAMERA_STATUS "):
+            try:
+                candidate = json.loads(line.removeprefix("CAMERA_STATUS "))
+            except json.JSONDecodeError:
+                continue
+            if isinstance(candidate, dict):
+                latest_status = candidate
+    cameras = latest_status.get("cameras") if latest_status is not None else None
+    if not isinstance(cameras, dict):
+        return role_diagnostic
+    not_fresh = []
+    for role in sorted(REQUIRED_CAMERA_ROLES):
+        state = cameras.get(role, {}).get("state") if isinstance(cameras.get(role), dict) else None
+        if state != "fresh":
+            safe_state = state if isinstance(state, str) and state in {"stale", "unavailable", "missing"} else "unknown"
+            not_fresh.append(f"{role}={safe_state}")
+    state_summary = "camera roles not fresh: " + ", ".join(not_fresh) if not_fresh else None
+    return state_summary + (f"; last {role_diagnostic}" if role_diagnostic else "") if state_summary else role_diagnostic
+
+
 def host_is_operational(text: str) -> bool:
     for line in text.splitlines():
         if line.startswith("[LIFT OPERATIONAL] "):
@@ -412,12 +448,17 @@ class RemoteSupervisor:
         child.log_path = log_path
         self.state.update(status="camera_starting", camera_log=log_path)
         self.save()
-        readiness = self._wait_for(
-            child,
-            lambda: parse_camera_readiness(_read_text(Path(log_path))),
-            self.args.camera_ready_timeout,
-            "all five camera sources",
-        )
+        try:
+            readiness = self._wait_for(
+                child,
+                lambda: parse_camera_readiness(_read_text(Path(log_path))),
+                self.args.camera_ready_timeout,
+                "camera viewer",
+            )
+        except SessionRefusal as exc:
+            detail = camera_readiness_failure(_read_text(Path(log_path)))
+            suffix = f"; {detail}" if detail else ""
+            raise SessionRefusal(f"{exc}{suffix}; CAMERA_LOG={log_path}") from exc
         self.state.update(status="camera_ready", camera_log=log_path, browser_url=readiness["browser_url"])
         self.save()
         self.emit("camera_ready", camera_log=log_path, **readiness)

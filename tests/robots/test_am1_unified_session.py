@@ -1243,6 +1243,35 @@ def test_remote_readiness_requires_all_fresh_cameras_and_operational_host_marker
     assert module.host_is_operational('{"phase":"home_complete"}') is False
 
 
+def test_remote_camera_failure_identifies_actual_role_or_sanitized_refusal():
+    module = load_tool("am1_session_remote")
+    roles = "forward,backward,chest,wrist_left,wrist_right"
+    status = {"cameras": {
+        role: {"state": "unavailable" if role == "forward" else "fresh"}
+        for role in roles.split(",")
+    }}
+    text = f"CAMERA_CONFIGURED_ROLES={roles}\nCAMERA_STATUS {json.dumps(status)}\n"
+    assert module.camera_readiness_failure(text) == "camera roles not fresh: forward=unavailable"
+    assert module.camera_readiness_failure(
+        "CAMERA_REFUSAL PermissionError: stage=camera-owner-lock errno=11\n"
+    ) == "CAMERA_REFUSAL PermissionError: stage=camera-owner-lock errno=11"
+    diagnosis = module.camera_readiness_failure(
+        "CAMERA_ROLE_UNAVAILABLE role=forward cause=OSError errno=111\n"
+        "CAMERA_ROLE_UNAVAILABLE role=forward cause=OSError errno=5\n"
+        "CAMERA_REFUSAL RuntimeError: Camera backend exited unexpectedly\n"
+    )
+    assert "role=forward cause=OSError errno=5" in diagnosis
+    assert "Camera backend exited unexpectedly" in diagnosis
+    assert "role=forward cause=ConnectionRefusedError errno=111" in module.camera_readiness_failure(
+        "CAMERA_ROLE_UNAVAILABLE role=forward cause=ConnectionRefusedError errno=111\n"
+        "CAMERA_REFUSAL RuntimeError: Camera backend exited unexpectedly\n"
+    )
+    assert "role=forward cause=RemoteDisconnected errno=None" in module.camera_readiness_failure(
+        "CAMERA_ROLE_UNAVAILABLE role=forward cause=RemoteDisconnected errno=None\n"
+        "CAMERA_REFUSAL RuntimeError: Camera backend exited unexpectedly\n"
+    )
+
+
 def test_remote_host_readiness_accepts_actual_lift_operational_log_format():
     module = load_tool("am1_session_remote")
     actual_record = (
@@ -1351,10 +1380,12 @@ def test_remote_records_exact_child_log_before_later_readiness_failure(tmp_path,
     supervisor._wait_for = wait_for
     supervisor.save = lambda: None
 
-    with pytest.raises(module.SessionRefusal, match="not ready"):
+    with pytest.raises(module.SessionRefusal, match="not ready") as caught:
         (supervisor.start_camera if child_name == "camera" else supervisor.start_host)()
 
     assert supervisor.state[f"{child_name}_log"] == f"/logs/exact-{child_name}.log"
+    if child_name == "camera":
+        assert "CAMERA_LOG=/logs/exact-camera.log" in str(caught.value)
 
 
 def test_remote_cleanup_signals_only_owned_process_groups_and_never_killall():

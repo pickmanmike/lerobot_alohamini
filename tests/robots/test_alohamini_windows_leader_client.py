@@ -23,6 +23,7 @@ import json
 import io
 import math
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1134,6 +1135,7 @@ class FakeRobot:
     events: list[tuple]
     observation_poses: list[dict[str, float]]
     observation_sequence_advances: list[bool]
+    observation_clock = None
 
     def __init__(self, config):
         self.config = SimpleNamespace(
@@ -1147,10 +1149,14 @@ class FakeRobot:
         self.actions: list[dict[str, float]] = []
         self.events = type(self).events
         self.observation_sequence = 0
+        self.latest_observation_roundtrip_age_s = 0.0
+        self.latest_am1_local_feedback = {
+            "version": 1, "state": "ready", "epoch": -1, "observation_id": 1,
+        }
         self.observation_index = 0
         type(self).instances.append(self)
 
-    def connect(self):
+    def connect(self, *, cancel_check=None):
         self.events.append(("robot", "connect"))
         self.is_connected = True
 
@@ -1162,8 +1168,14 @@ class FakeRobot:
         self.observation_index += 1
         if should_advance:
             self.observation_sequence += 1
+        self.latest_observation_received_at = (
+            type(self).observation_clock() if type(self).observation_clock is not None else time.monotonic()
+        )
         self.events.append(("robot", "get_observation", self.observation_sequence, observation))
         return observation
+
+    def retire_observation_requests(self):
+        pass
 
     def send_action(self, action):
         action_copy = dict(action)
@@ -1257,6 +1269,7 @@ def prepare_teleoperation(
     FakeRobot.events = events
     FakeRobot.observation_poses = list(observation_poses or [FOLLOWER_POSE])
     FakeRobot.observation_sequence_advances = list(observation_sequence_advances or [True])
+    FakeRobot.observation_clock = None
     FakeLeader.instances = []
     FakeLeader.events = events
     FakeLeader.right_connect_error = right_connect_error
@@ -1351,6 +1364,7 @@ def test_unified_session_enter_confirmation_is_visible_and_starts_sync(monkeypat
         action_poses=[LEADER_POSE, LEADER_POSE, LEADER_POSE, LEADER_POSE],
     )
     clock = FakeClock(events)
+    FakeRobot.observation_clock = clock.monotonic
 
     def press_enter(prompt):
         output = capsys.readouterr().out
@@ -1385,6 +1399,7 @@ def test_unified_session_sync_refuses_nonempty_confirmation_before_arm_send(monk
         action_poses=[LEADER_POSE],
     )
     clock = FakeClock(events)
+    FakeRobot.observation_clock = clock.monotonic
 
     with pytest.raises(module.SafetyRefusal, match="Enter only"):
         module.run_startup_sync(
@@ -1412,6 +1427,7 @@ def test_unified_session_sync_refuses_console_eof_before_arm_send(monkeypatch):
         action_poses=[LEADER_POSE],
     )
     clock = FakeClock(events)
+    FakeRobot.observation_clock = clock.monotonic
 
     def closed_console(prompt):
         raise EOFError("console closed")
@@ -2109,10 +2125,17 @@ def test_am1_phase_messages_guard_start_paused_first_ordinary_send(monkeypatch):
         real_print(*values, **kwargs)
 
     monkeypatch.setattr("builtins.print", record_console_event)
-    args = sync_args(module, "--start_paused", "--duration_s", "0.2")
+    args = sync_args(module, "--start_paused", "--duration_s", "0.2", "--no_cameras")
     args.unified_session_enter_confirmations = True
     clock = FakeClock(events)
+    FakeRobot.observation_clock = clock.monotonic
     responses = iter(("", ""))
+
+    def fake_live_sender(robot, leader, **kwargs):
+        kwargs["announce_active"]()
+        robot.send_action({**FOLLOWER_POSE, **module.make_zero_action()})
+
+    monkeypatch.setattr(module, "run_am1_live_sender", fake_live_sender)
 
     status = module.run_teleoperation(
         args,
@@ -2138,7 +2161,9 @@ def test_am1_phase_messages_guard_start_paused_first_ordinary_send(monkeypatch):
         for index, event in enumerate(events)
         if event[:2] == ("robot", "send") and any(key.startswith("arm_") for key in event[2])
     ][2]
-    assert active_index + 1 == first_ordinary_index
+    assert active_index < first_ordinary_index
+    assert events[active_index + 1][0] == "console"
+    assert active_index + 2 == first_ordinary_index
 
 
 def test_post_sync_start_paused_refuses_moved_sample_before_ordinary_send(monkeypatch, capsys):

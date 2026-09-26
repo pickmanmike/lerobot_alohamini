@@ -87,10 +87,32 @@ complete, visible prompts, each accepting only a bare Enter:
 3. After synchronization, continue holding the leaders still; press Enter to
    perform the final alignment check and enable live control.
 
+The client discards observations requested before each long human pause and
+before post-sync verification. It allows up to the existing connection budget
+for a new request/reply with a valid receive time and total age below one
+second. During unified synchronization, an arm target advances only while
+host feedback remains qualified. A short observation gap holds the last arm
+target and zero body commands; expiration of the existing connection budget
+refuses the attempt without catching up the skipped steps.
+`TELEOPERATION ACTIVE` is withheld until the host acknowledges the first live
+action.
+If the current final leader pose differs by more than 10 normalized units,
+`ALIGNMENT CHANGED` leaves the session paused. Check the printed current-pose
+plan and arm envelope, then one additional bare Enter authorizes one bounded
+realignment using the same 0.75-unit step and leader-drift guards. A second
+mismatch is a refusal, not an automatic repeat. No body key is active in this
+phase. The nominal 30-second sync and any realignment are outside the selected
+live-duration allowance.
+
 Do not pre-feed blank lines. Hold both leaders still until `TELEOPERATION
 ACTIVE`. Text, EOF, cancellation, or input failure at any confirmation refuses
 the transition. A startup failure prints its reason, session result folder, and
 actual exit code in the foreground terminal.
+
+Camera startup failures report the exact camera log and, when available, the
+failed role or sanitized gateway/owner stage and errno. A viewer process exit
+is not evidence that all five cameras failed. Unknown camera startup errors are
+not automatically retried; confirm owned cleanup and inspect that exact log.
 
 During live use, release motion keys before changing support. `Q` is the normal
 single quit action. Duration expiry follows the same shutdown path. Either now

@@ -154,15 +154,201 @@ def test_one_bounded_command_backpressure_pauses_then_requires_host_ack_to_resum
         def get_action(self): return dict(LEADER)
 
     robot = Robot()
+    active_announcements = []
     module.run_am1_live_sender(
         robot, Leader(), initial_arm_target=FOLLOWER, initial_observation_sequence=0,
         initial_follower_observed_at=robot.latest_observation_received_at,
         initial_follower_positions=FOLLOWER, fps=10, duration_s=1.1,
         live_arm_scope="both", profile_cadence=False,
         body_action_supplier=module.make_zero_action, recovery_enabled=True,
+        announce_active=lambda: active_announcements.append(control.state),
     )
     assert control.state == "active" and control.epoch == 2
+    assert active_announcements == ["active"]
     assert "PAUSED" in capsys.readouterr().out
+
+
+def test_first_active_ack_after_pause_rechecks_leader_before_announcing():
+    module = load_teleoperate()
+    host = FakeLocalRobot()
+    control = alohamini_host.AM1LocalControl()
+    announced = []
+
+    class Sender:
+        calls = 0
+
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def send_action(self, action):
+            self.calls += 1
+            if self.calls == 1:
+                raise alohamini_host.zmq.Again()
+            control.apply(host, dict(action))
+
+    class Robot(FreshReplyRobot):
+        def __init__(self):
+            self.observation_sequence = 0
+            self.latest_observation_received_at = time.monotonic()
+            self.latest_observation_error = None
+            self.latest_raw_observation_keys = frozenset(FOLLOWER)
+            self.latest_am1_local_feedback = {
+                "version": 1, "state": "ready", "epoch": -1, "observation_id": 0,
+            }
+
+        def make_live_command_sender(self): return Sender()
+        def retire_observation_requests(self): pass
+        def get_observation(self):
+            time.sleep(0.025)
+            self.observation_sequence += 1
+            self.latest_observation_received_at = time.monotonic()
+            feedback = {}
+            control.annotate(feedback)
+            self.latest_am1_local_feedback = feedback[FEEDBACK]
+            return dict(FOLLOWER)
+
+    class Leader:
+        def get_action(self):
+            if control.state == "active" and control.epoch == 2:
+                return {**LEADER, "left_elbow_flex.pos": LEADER["left_elbow_flex.pos"] + 6}
+            return dict(LEADER)
+
+    with pytest.raises(module.SafetyRefusal, match="leader moved before live admission"):
+        module.run_am1_live_sender(
+            Robot(), Leader(), initial_arm_target=FOLLOWER, initial_observation_sequence=0,
+            initial_follower_observed_at=time.monotonic(), initial_follower_positions=FOLLOWER,
+            fps=10, duration_s=2, live_arm_scope="both", profile_cadence=False,
+            body_action_supplier=module.make_zero_action, recovery_enabled=True,
+            announce_active=lambda: announced.append(True),
+        )
+    assert announced == []
+    assert all(event[1]["arm_left_elbow_flex.pos"] == FOLLOWER["arm_left_elbow_flex.pos"]
+               for event in host.events if event[0] == "action")
+
+
+def test_host_ack_arriving_after_initial_admission_deadline_cannot_announce_active(monkeypatch):
+    module = load_teleoperate()
+    monkeypatch.setattr(module, "AM1_LIVE_OBSERVATION_MAX_AGE_S", 10.0)
+    factor = 10.0
+    real_started = time.monotonic()
+    clock = lambda: (time.monotonic() - real_started) * factor
+    announced = []
+
+    class Sender:
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def send_action(self, action): pass
+
+    class Robot(FreshReplyRobot):
+        def __init__(self):
+            self.observation_sequence = 0
+            self.latest_observation_received_at = clock()
+            self.latest_observation_error = None
+            self.latest_raw_observation_keys = frozenset(FOLLOWER)
+            self.latest_am1_local_feedback = {
+                "version": 1, "state": "ready", "epoch": -1, "observation_id": 0,
+            }
+
+        def make_live_command_sender(self): return Sender()
+        def retire_observation_requests(self): pass
+        def get_observation(self):
+            time.sleep(0.32)
+            self.observation_sequence += 1
+            self.latest_observation_received_at = clock()
+            self.latest_am1_local_feedback = {
+                "version": 1, "state": "active", "epoch": 0,
+                "observation_id": self.observation_sequence,
+            }
+            return dict(FOLLOWER)
+
+    with pytest.raises(module.SafetyRefusal, match="initial active acknowledgement.*within 3s"):
+        module.run_am1_live_sender(
+            Robot(), SimpleNamespace(get_action=lambda: dict(LEADER)),
+            initial_arm_target=FOLLOWER, initial_observation_sequence=0,
+            initial_follower_observed_at=clock(), initial_follower_positions=FOLLOWER,
+            fps=10, duration_s=1.0, live_arm_scope="both", profile_cadence=False,
+            body_action_supplier=module.make_zero_action, recovery_enabled=True,
+            monotonic=clock, sleep_fn=lambda seconds: time.sleep(seconds / factor),
+            announce_active=lambda: announced.append(True),
+        )
+    assert announced == []
+
+
+def test_sender_cannot_mark_admission_after_deciding_startup_timeout(monkeypatch):
+    module = load_teleoperate()
+    monkeypatch.setattr(module, "AM1_LOCAL_AUTOMATIC_PAUSE_S", 0.05)
+
+    class Sender:
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def send_action(self, action): raise alohamini_host.zmq.Again()
+
+    class Robot:
+        def make_live_command_sender(self): return Sender()
+
+    sender = module.AM1LiveActionSender(
+        Robot(), initial_action=module.make_am1_live_action(FOLLOWER),
+        initial_observation_sequence=0, fps=10, duration_s=1,
+        profile_cadence=False, recovery_enabled=True,
+    )
+    sender.start()
+    sender.join()
+    with pytest.raises(module.SafetyRefusal, match="initial active acknowledgement"):
+        sender.mark_live_admitted()
+
+
+@pytest.mark.parametrize("fail_first_send", [False, True])
+def test_failed_atomic_admission_never_prints_active_banner(monkeypatch, fail_first_send):
+    module = load_teleoperate()
+    host = FakeLocalRobot()
+    control = alohamini_host.AM1LocalControl()
+    announced = []
+    monkeypatch.setattr(
+        module.AM1LiveActionSender, "mark_live_admitted",
+        lambda sender: (_ for _ in ()).throw(module.SafetyRefusal("admission already expired")),
+    )
+
+    class Sender:
+        calls = 0
+
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def send_action(self, action):
+            self.calls += 1
+            if fail_first_send and self.calls == 1:
+                raise alohamini_host.zmq.Again()
+            control.apply(host, dict(action))
+
+    class Robot(FreshReplyRobot):
+        def __init__(self):
+            self.observation_sequence = 0
+            self.latest_observation_received_at = time.monotonic()
+            self.latest_observation_error = None
+            self.latest_raw_observation_keys = frozenset(FOLLOWER)
+            self.latest_am1_local_feedback = {
+                "version": 1, "state": "ready", "epoch": -1, "observation_id": 0,
+            }
+
+        def make_live_command_sender(self): return Sender()
+        def retire_observation_requests(self): pass
+        def get_observation(self):
+            time.sleep(0.02)
+            self.observation_sequence += 1
+            self.latest_observation_received_at = time.monotonic()
+            feedback = {}
+            control.annotate(feedback)
+            self.latest_am1_local_feedback = feedback[FEEDBACK]
+            return dict(FOLLOWER)
+
+    with pytest.raises(module.SafetyRefusal, match="admission already expired"):
+        module.run_am1_live_sender(
+            Robot(), SimpleNamespace(get_action=lambda: dict(LEADER)),
+            initial_arm_target=FOLLOWER, initial_observation_sequence=0,
+            initial_follower_observed_at=time.monotonic(), initial_follower_positions=FOLLOWER,
+            fps=10, duration_s=2, live_arm_scope="both", profile_cadence=False,
+            body_action_supplier=module.make_zero_action, recovery_enabled=True,
+            announce_active=lambda: announced.append(True),
+        )
+    assert announced == []
 
 
 def test_resume_send_backpressure_keeps_prior_host_hold_until_new_pause_ack(capsys):
@@ -254,7 +440,8 @@ def test_recovery_duration_expires_even_if_no_command_send_ever_succeeds(capsys)
         def get_action(self): return dict(LEADER)
 
     robot = Robot()
-    with pytest.raises(module.SafetyRefusal, match="session duration expired while paused"):
+    active_announcements = []
+    with pytest.raises(module.SafetyRefusal, match="initial active acknowledgement did not arrive"):
         module.run_am1_live_sender(
             robot, Leader(), initial_arm_target=FOLLOWER, initial_observation_sequence=0,
             initial_follower_observed_at=robot.latest_observation_received_at,
@@ -262,9 +449,140 @@ def test_recovery_duration_expires_even_if_no_command_send_ever_succeeds(capsys)
             live_arm_scope="both", profile_cadence=True,
             body_action_supplier=module.make_zero_action, recovery_enabled=True,
             monotonic=clock, sleep_fn=lambda seconds: time.sleep(seconds / factor),
+            announce_active=lambda: active_announcements.append(True),
         )
-    assert clock() < 3.0
+    assert clock() < 4.0
     assert capsys.readouterr().out.count('"event": "am1_client_live_start"') == 1
+    assert active_announcements == []
+
+
+def test_unified_live_duration_begins_only_after_host_active_ack():
+    module = load_teleoperate()
+    factor = 10.0
+    real_started = time.monotonic()
+    clock = lambda: (time.monotonic() - real_started) * factor
+    host = FakeLocalRobot()
+    control = alohamini_host.AM1LocalControl()
+    sent_at = []
+    announced_at = []
+
+    class Sender:
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def send_action(self, action):
+            sent_at.append(clock())
+            control.apply(host, dict(action))
+
+    class Robot(FreshReplyRobot):
+        def __init__(self):
+            self.observation_sequence = 0
+            self.latest_observation_received_at = clock()
+            self.latest_observation_error = None
+            self.latest_raw_observation_keys = frozenset(FOLLOWER)
+            self.latest_am1_local_feedback = {
+                "version": 1, "state": "ready", "epoch": -1, "observation_id": 0,
+            }
+
+        def make_live_command_sender(self): return Sender()
+        def retire_observation_requests(self): pass
+        def get_observation(self):
+            time.sleep(0.002)
+            self.observation_sequence += 1
+            self.latest_observation_received_at = clock()
+            feedback = {}
+            control.annotate(feedback)
+            if clock() < 0.8:
+                feedback[FEEDBACK]["state"] = "ready"
+                feedback[FEEDBACK]["epoch"] = -1
+            self.latest_am1_local_feedback = feedback[FEEDBACK]
+            return dict(FOLLOWER)
+
+    module.run_am1_live_sender(
+        Robot(), SimpleNamespace(get_action=lambda: dict(LEADER)),
+        initial_arm_target=FOLLOWER, initial_observation_sequence=0,
+        initial_follower_observed_at=clock(), initial_follower_positions=FOLLOWER,
+        fps=10, duration_s=1.0, live_arm_scope="both", profile_cadence=False,
+        body_action_supplier=module.make_zero_action, recovery_enabled=True,
+        monotonic=clock, sleep_fn=lambda seconds: time.sleep(seconds / factor),
+        announce_active=lambda: announced_at.append(clock()),
+    )
+    assert len(announced_at) == 1
+    assert sent_at[-1] - announced_at[0] >= 0.85
+
+
+@pytest.mark.parametrize("leader_delta", [1.5, 6.0])
+def test_delayed_initial_ack_never_forwards_unapproved_leader_jump(leader_delta):
+    module = load_teleoperate()
+    factor = 10.0
+    real_started = time.monotonic()
+    clock = lambda: (time.monotonic() - real_started) * factor
+    host = FakeLocalRobot()
+    control = alohamini_host.AM1LocalControl()
+    sent = []
+    announced_at = []
+    timeline = []
+
+    class Sender:
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def send_action(self, action):
+            sent.append((clock(), dict(action)))
+            timeline.append(("send", action["arm_left_elbow_flex.pos"]))
+            control.apply(host, dict(action))
+
+    class Robot(FreshReplyRobot):
+        def __init__(self):
+            self.observation_sequence = 0
+            self.latest_observation_received_at = clock()
+            self.latest_observation_error = None
+            self.latest_raw_observation_keys = frozenset(FOLLOWER)
+            self.latest_am1_local_feedback = {
+                "version": 1, "state": "ready", "epoch": -1, "observation_id": 0,
+            }
+
+        def make_live_command_sender(self): return Sender()
+        def retire_observation_requests(self): pass
+        def get_observation(self):
+            time.sleep(0.002)
+            self.observation_sequence += 1
+            self.latest_observation_received_at = clock()
+            feedback = {}
+            control.annotate(feedback)
+            if clock() < 0.6:
+                feedback[FEEDBACK]["state"] = "ready"
+                feedback[FEEDBACK]["epoch"] = -1
+            self.latest_am1_local_feedback = feedback[FEEDBACK]
+            return dict(FOLLOWER)
+
+    leader_action = {**LEADER, "left_elbow_flex.pos": LEADER["left_elbow_flex.pos"] + leader_delta}
+    kwargs = dict(
+        initial_arm_target=FOLLOWER, initial_observation_sequence=0,
+        initial_follower_observed_at=clock(), initial_follower_positions=FOLLOWER,
+        fps=10, duration_s=1.6, live_arm_scope="both", profile_cadence=False,
+        body_action_supplier=module.make_zero_action, recovery_enabled=True,
+        monotonic=clock, sleep_fn=lambda seconds: time.sleep(seconds / factor),
+        announce_active=lambda: (announced_at.append(clock()), timeline.append(("active", None))),
+    )
+    if leader_delta > module.STARTUP_SYNC_LEADER_DRIFT:
+        with pytest.raises(module.SafetyRefusal, match="leader moved before live admission"):
+            module.run_am1_live_sender(
+                Robot(), SimpleNamespace(get_action=lambda: dict(leader_action)), **kwargs,
+            )
+        assert announced_at == []
+        assert all(action["arm_left_elbow_flex.pos"] == FOLLOWER["arm_left_elbow_flex.pos"]
+                   for _, action in sent)
+    else:
+        module.run_am1_live_sender(
+            Robot(), SimpleNamespace(get_action=lambda: dict(leader_action)), **kwargs,
+        )
+        assert len(announced_at) == 1
+        assert all(value == FOLLOWER["arm_left_elbow_flex.pos"] for event, value in
+                   timeline[:timeline.index(("active", None))] if event == "send")
+        values = [FOLLOWER["arm_left_elbow_flex.pos"]] + [
+            action["arm_left_elbow_flex.pos"] for _, action in sent
+        ]
+        assert all(abs(after - before) <= module.STARTUP_SYNC_MAX_STEP + 1e-9
+                   for before, after in zip(values, values[1:]))
 
 
 def local_action(mode: str, epoch: int, *, x_vel: float = 0.0):
@@ -356,11 +674,15 @@ def test_outer_unified_local_cleanup_final_zero_reaches_host_without_fault(monke
     events = []
 
     class Client:
+        latest_observation_roundtrip_age_s = 0.0
+        latest_am1_local_feedback = {
+            "version": 1, "state": "ready", "epoch": -1, "observation_id": 1,
+        }
         def __init__(self, config):
             self.config = SimpleNamespace(teleop_keys={"quit": "q"})
             self.observation_sequence = 0
 
-        def connect(self): events.append("robot_connect")
+        def connect(self, *, cancel_check=None): events.append("robot_connect")
         def send_action(self, action):
             control.apply(host, dict(action))
             return dict(action)
@@ -837,6 +1159,7 @@ def test_sender_pauses_during_blocked_reader_and_never_republishes_held_body_inp
         recovery_enabled=True,
     )
     sender.start()
+    sender.mark_live_admitted()  # This sender-only fixture begins after host admission.
     time.sleep(1.15)  # The owning observation reader is deliberately unable to run here.
     body.publish({"x.vel": 0.15, "y.vel": 0, "theta.vel": 0, "lift_axis.vel": 0}, published_at=time.monotonic())
     sender.join()
@@ -1146,6 +1469,77 @@ def test_recovery_cleanup_preserves_primary_motor_fault_if_sender_join_also_fail
             body_action_supplier=module.make_zero_action, recovery_enabled=True,
         )
     assert "secondary sender join failure" in " ".join(caught.value.__notes__)
+
+
+def test_initial_admission_age_expiry_refreshes_alignment_before_sender(monkeypatch):
+    module = load_teleoperate()
+    aligned = []
+    sent = []
+
+    class Sender:
+        def __enter__(self): return self
+        def send_action(self, action): sent.append(dict(action))
+        def __exit__(self, *args): return False
+
+    class Robot(FreshReplyRobot):
+        def __init__(self):
+            self.config = SimpleNamespace(connect_timeout_s=2.0)
+            self.observation_sequence = 1
+            self.latest_am1_local_feedback = {
+                "version": 1, "state": "ready", "epoch": -1, "observation_id": 1,
+            }
+
+        def make_live_command_sender(self): return Sender()
+
+    robot = Robot()
+
+    def fresh_gate(*args, **kwargs):
+        aligned.append(kwargs)
+        robot.observation_sequence += 1
+        return dict(FOLLOWER), dict(FOLLOWER), 100.0
+
+    monkeypatch.setattr(module, "run_alignment_gate", fresh_gate)
+    with pytest.raises(module.SafetyRefusal):
+        module.run_am1_live_sender(
+            robot, SimpleNamespace(get_action=lambda: dict(LEADER)),
+            initial_arm_target=FOLLOWER, initial_observation_sequence=1,
+            initial_follower_observed_at=98.9, initial_follower_positions=FOLLOWER,
+            fps=10, duration_s=2, live_arm_scope="both", profile_cadence=False,
+            body_action_supplier=module.make_zero_action, recovery_enabled=True,
+            monotonic=lambda: 100.0, should_stop=lambda: True,
+        )
+    assert len(aligned) == 1
+    assert aligned[0]["require_current_request"] is True
+    assert sent == []
+
+
+def test_unified_active_banner_waits_for_sender_start(monkeypatch):
+    module = load_teleoperate()
+    announced = []
+    failure = RuntimeError("sender socket could not open")
+    monkeypatch.setattr(
+        module.AM1LiveActionSender, "start",
+        lambda sender: (_ for _ in ()).throw(failure),
+    )
+
+    class Robot(FreshReplyRobot):
+        observation_sequence = 1
+        latest_am1_local_feedback = {
+            "version": 1, "state": "ready", "epoch": -1, "observation_id": 1,
+        }
+
+    with pytest.raises(RuntimeError) as caught:
+        module.run_am1_live_sender(
+            Robot(), SimpleNamespace(get_action=lambda: dict(LEADER)),
+            initial_arm_target=FOLLOWER, initial_observation_sequence=1,
+            initial_follower_observed_at=time.monotonic(),
+            initial_follower_positions=FOLLOWER,
+            fps=10, duration_s=2, live_arm_scope="both", profile_cadence=False,
+            body_action_supplier=module.make_zero_action, recovery_enabled=True,
+            announce_active=lambda: announced.append(True),
+        )
+    assert caught.value is failure
+    assert announced == []
 
 
 def test_qualified_pause_loses_feedback_again_and_does_not_wait_forever_for_enter(capsys):
