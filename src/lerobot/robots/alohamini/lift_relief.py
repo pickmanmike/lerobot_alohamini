@@ -742,7 +742,9 @@ class InstalledLiftCheck:
         self.reader.set_phase("relief_setup")
         self.lift.apply_action({"lift_axis.vel": 200}, read_raw=self.reader)
         started = time.monotonic()
-        previous_height = post_home_height
+        # apply_action already advanced the sole encoder accumulator with its
+        # grouped setup sample; compare the first motion sample against that.
+        previous_height = (self.lift._extended_deg() - self.lift._z0_deg) * self.lift._mm_per_deg
         velocity_disagreements = 0
         while True:
             remaining = RELIEF_TIMEOUT_S - (time.monotonic() - started)
@@ -752,9 +754,11 @@ class InstalledLiftCheck:
             record, height = self._moving_height("relief")
             elapsed = time.monotonic() - started
             self._check_raised("relief", record, height)
+            if height < previous_height:
+                self.refuse(record, "relief: unexpected downward direction.")
             if int(record["present_velocity_raw"]) > STILL_VELOCITY_RAW:
-                if height < previous_height:
-                    self.refuse(record, "relief: unexpected downward direction.")
+                if height == previous_height:
+                    self.refuse(record, "relief: direction unconfirmed; reported downward velocity without fresh upward position progress.")
                 velocity_disagreements += 1
                 self.emit({
                     **record,
