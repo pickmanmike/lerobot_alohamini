@@ -103,6 +103,9 @@ class OperationalLift(InstalledLiftCheck):
         self._stationary: deque[dict[str, Any]] = deque()
         self._high_idle_current = 0
         self._last_idle_height: float | None = None
+        self._idle_qualified_at: float | None = None
+        self._idle_uncertain = False
+        self._idle_uncertain_band: tuple[int, int, int] | None = None
 
     def emit(self, record: dict[str, Any]) -> None:
         record = {key: value for key, value in record.items() if key != "comparison_profile"}
@@ -144,7 +147,7 @@ class OperationalLift(InstalledLiftCheck):
                 "baseline", expected_torque=0, expected_goal=0, cold_start=True,
             )
             self.temperature.assert_fresh(time.monotonic())
-            result, _ = self.home_and_relieve()
+            result, _ = self.home_and_relieve(allow_one_count_variation=True)
             self._goal_since = time.monotonic()
             self.poll()
             self.monitor.record(
@@ -161,6 +164,19 @@ class OperationalLift(InstalledLiftCheck):
     def _check_idle(self, record: dict[str, Any]) -> None:
         """Incremental existing stationary evidence, without sleeping in the live loop."""
         now = record["sample_monotonic_s"]
+        qualified = self._idle_qualified_at is not None
+        if qualified:
+            self._check_idle_load(record)
+        if self._idle_uncertain:
+            # Neither a bad sample nor a partial candidate renews this deadline.
+            if now - self._idle_qualified_at >= feedback.SETTLE_TIMEOUT_S:
+                self.refuse(record, "live: lift failed stopped qualification within 1 s.")
+            origin, low, high = self._idle_uncertain_band
+            offset = feedback._position_delta(origin, int(record["present_position_raw"]))
+            low, high = min(low, offset), max(high, offset)
+            if high - low > feedback.STATIONARY_POSITION_TOLERANCE_RAW:
+                self.refuse(record, "live: lift displaced during stopped-feedback uncertainty.")
+            self._idle_uncertain_band = (origin, low, high)
         self._stationary.append(record)
         while len(self._stationary) > 1 and now - self._stationary[0]["sample_monotonic_s"] > 0.5:
             self._stationary.popleft()
@@ -168,20 +184,29 @@ class OperationalLift(InstalledLiftCheck):
         offsets = [feedback._position_delta(origin, int(r["present_position_raw"])) for r in self._stationary]
         recent = list(self._stationary)[-feedback.STATIONARY_PERSISTENT_SAMPLES:]
         velocities = [int(r["present_velocity_raw"]) for r in recent]
-        persistent = len(recent) >= feedback.STATIONARY_PERSISTENT_SAMPLES and (
+        persistent_velocity = len(recent) >= feedback.STATIONARY_PERSISTENT_SAMPLES and (
             all(v > feedback.STILL_VELOCITY_RAW for v in velocities)
             or all(v < -feedback.STILL_VELOCITY_RAW for v in velocities)
-            or all(r["moving"] == 1 and abs(r["present_velocity_raw"]) <= feedback.STILL_VELOCITY_RAW for r in recent)
         )
-        moving = (
+        persistent_moving = len(recent) >= feedback.STATIONARY_PERSISTENT_SAMPLES and all(
+            r["moving"] == 1 and abs(r["present_velocity_raw"]) <= feedback.STILL_VELOCITY_RAW for r in recent
+        )
+        motion_evidence = (
             abs(record["present_velocity_raw"]) > feedback.STATIONARY_REPORTED_VELOCITY_LIMIT_RAW
             or max(offsets) - min(offsets) > feedback.STATIONARY_POSITION_TOLERANCE_RAW
-            or persistent
+            or persistent_moving
         )
-        if moving:
+        if qualified and motion_evidence:
+            self.refuse(record, "live: unexpected stationary lift motion.")
+        if motion_evidence or persistent_velocity:
+            if qualified and not self._idle_uncertain:
+                # Only velocity-only ambiguity gets this bounded grace. Anchor the
+                # entire episode so resetting candidates cannot hide position drift.
+                self._idle_uncertain = True
+                self._idle_uncertain_band = (origin, min(offsets), max(offsets))
+                self.emit({**record, "phase": "idle_velocity_uncertain", "lift_goal_held_zero": True})
             self._stationary.clear()
-            self._high_idle_current = 0
-            if now - self._goal_since >= feedback.SETTLE_TIMEOUT_S:
+            if not qualified and now - self._goal_since >= feedback.SETTLE_TIMEOUT_S:
                 self.refuse(record, "live: lift failed stopped qualification within 1 s.")
             return
         complete = (
@@ -189,9 +214,19 @@ class OperationalLift(InstalledLiftCheck):
             and now - self._stationary[0]["sample_monotonic_s"] >= feedback.STATIONARY_WINDOW_S
         )
         if not complete:
-            if now - self._goal_since >= feedback.SETTLE_TIMEOUT_S:
+            if not qualified and now - self._goal_since >= feedback.SETTLE_TIMEOUT_S:
                 self.refuse(record, "live: no usable stopped window within 1 s.")
             return
+        if not qualified:
+            self._check_idle_load(record)
+        self._idle_qualified_at = now
+        if self._idle_uncertain:
+            self.emit({**record, "phase": "idle_requalified", "lift_goal_held_zero": True})
+            self._idle_uncertain = False
+            self._idle_uncertain_band = None
+
+    def _check_idle_load(self, record: dict[str, Any]) -> None:
+        # Current and displacement remain active even during velocity uncertainty.
         if self._last_idle_height is None:
             self._last_idle_height = self.height_mm
         if abs(self.height_mm - self._last_idle_height) > 0.5:
@@ -219,6 +254,9 @@ class OperationalLift(InstalledLiftCheck):
                 self._stationary.clear()
                 self._last_idle_height = None
                 self._high_idle_current = 0
+                self._idle_qualified_at = None
+                self._idle_uncertain = False
+                self._idle_uncertain_band = None
             if not math.isfinite(self.height_mm) or not -0.5 <= self.height_mm <= self.lift.cfg.soft_max_mm + 0.5:
                 self.refuse(record, "live: lift height exceeded travel bounds.")
             if record["moving"] not in (0, 1):
@@ -249,6 +287,11 @@ class OperationalLift(InstalledLiftCheck):
     def apply_action(self, action: dict[str, float]) -> None:
         self._require_latest()
         try:
+            if self._idle_uncertain and (
+                f"{self.lift.cfg.name}.height_mm" in action
+                or action.get(f"{self.lift.cfg.name}.vel", 0) != 0
+            ):
+                self.refuse(self.last_record, "live: new lift motion refused while stopped feedback is uncertain.")
             self.lift.apply_action(action, height_mm=self.height_mm)
         except BaseException as error:
             self.failure = error

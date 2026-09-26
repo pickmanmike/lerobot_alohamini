@@ -126,6 +126,24 @@ SSH health. The September 26 retained SSH journal shows successful quick
 reconnections after the Pi's 12:21 boot, but the earlier failure interval was
 not retained; no source penalty or server-side setting change is established.
 
+The owner-approved AM1 operational lift guard permits at most one encoder count
+(about 0.0205 mm) below the best upward position reached during relief. It logs
+that raw variation; the reference does not follow successive downward samples.
+More downward travel, uncorroborated positive raw velocity, or repeated
+velocity/position direction disagreements still refuse startup. The original
+homed zero, 10 mm relief target, 12 mm maximum and 8-second relief bound remain.
+The standalone comparison keeps its stricter direction rule.
+
+After a complete fresh stopped window, velocity-only uncertainty may requalify
+for at most one second from the last valid window, with position confined to
+one fixed one-count band and lift goal zero. Only a complete new stopped window
+clears that uncertainty. A requested nonzero lift velocity or height action
+during uncertainty refuses the session rather than queuing motion. Displacement,
+gross velocity, current, temperature, status and transport faults remain stops;
+partial windows and bad samples cannot renew the deadline. Transition records
+retain the raw evidence. This is a bounded operating policy, not proof that the
+historical velocity readings were false or that the hardware cause is resolved.
+
 During live use, release motion keys before changing support. `Q` is the normal
 single quit action. Duration expiry follows the same shutdown path. Either now
 releases torque through host cleanup, so the arms and carriage must already have

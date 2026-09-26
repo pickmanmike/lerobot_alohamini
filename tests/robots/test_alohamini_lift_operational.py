@@ -177,7 +177,7 @@ def test_wrong_sign_velocity_without_upward_encoder_step_refuses_immediately(ope
 def test_first_relief_step_compares_with_fresh_setup_position(operating_robot, capsys):
     robot, _ = operating_robot
     bus = robot.left_bus
-    bus.up_factor = -0.05
+    bus.up_factor = -0.2  # More than the approved one-count variation on the first sample.
     shifted_setup_position = False
 
     def hook(register):
@@ -201,6 +201,83 @@ def test_first_relief_step_compares_with_fresh_setup_position(operating_robot, c
     assert motion[0]["present_position_raw"] > setup[-1]["present_position_raw"]
     assert motion[0]["present_position_raw"] < 1100
     assert not any(record["phase"] == "operational_ready" for record in records)
+    assert bus.registers[("Goal_Velocity", "lift_axis")] == 0
+    assert bus.registers[("Torque_Enable", "lift_axis")] == 0
+    assert not bus.is_connected
+
+
+@pytest.mark.parametrize("reported_velocity", [0, -50])
+def test_one_count_relief_variation_is_logged_and_finishes_with_original_zero(
+    operating_robot, capsys, reported_velocity,
+):
+    robot, _ = operating_robot
+    bus = robot.left_bus
+    setup = None
+    samples = 0
+
+    def hook(register):
+        nonlocal setup, samples
+        operation = getattr(robot, "_lift_operation", None)
+        if operation is None:
+            return
+        if register == "Present_Position" and operation.reader.phase == "relief_setup":
+            setup = round(bus.position)
+        if operation.reader.phase == "relief" and bus.registers[("Goal_Velocity", "lift_axis")] == -200:
+            if register == "Present_Position":
+                samples += 1
+                if samples == 1:
+                    # Synthetic one-count backstep, modeled on the saved refusal.
+                    bus.position = setup + 1
+                    bus.registers[(register, "lift_axis")] = setup + 1
+            elif register == "Present_Velocity" and samples == 1:
+                bus.read_sequences[(register, "lift_axis")] = [reported_velocity]
+
+    bus.hook = hook
+    robot.connect(calibrate=False)
+    records = operational_records(capsys)
+    motion = [r for r in records if r["phase"] == "relief"]
+    assert motion[0]["present_position_raw"] == setup + 1
+    assert motion[0]["present_velocity_raw"] == reported_velocity
+    assert any(r["phase"] == "relief_position_variation" for r in records)
+    assert 9.5 <= robot._lift_operation.height_mm <= 12
+    assert robot.lift._z0_deg == pytest.approx(-8.7890625)  # 100 ticks, unchanged home zero.
+    robot.disconnect()
+    assert bus.registers[("Goal_Velocity", "lift_axis")] == 0
+    assert bus.registers[("Torque_Enable", "lift_axis")] == 0
+    assert not bus.is_connected
+
+
+def test_relief_one_count_allowance_cannot_accumulate_downward_drift(operating_robot, capsys):
+    robot, _ = operating_robot
+    bus = robot.left_bus
+    setup = None
+    samples = 0
+
+    def hook(register):
+        nonlocal setup, samples
+        operation = getattr(robot, "_lift_operation", None)
+        if operation is None:
+            return
+        if register == "Present_Position" and operation.reader.phase == "relief_setup":
+            setup = round(bus.position)
+        if operation.reader.phase == "relief" and bus.registers[("Goal_Velocity", "lift_axis")] == -200:
+            if register == "Present_Position":
+                samples += 1
+                # Each step is only one count, but the second exceeds the fixed best-position band.
+                bus.position = setup + samples
+                bus.registers[(register, "lift_axis")] = setup + samples
+            elif register == "Present_Velocity":
+                bus.read_sequences[(register, "lift_axis")] = [0]
+
+    bus.hook = hook
+    with pytest.raises(RuntimeError, match="AlohaMini motor activation failed") as failure:
+        robot.connect(calibrate=False)
+    assert "unexpected downward direction" in str(failure.value.__cause__)
+    records = operational_records(capsys)
+    rejected = next(r for r in records if r.get("rejected") and r["phase"] == "relief")
+    assert samples == 2
+    assert rejected["present_position_raw"] == setup + 2
+    assert not any(r["phase"] == "operational_ready" for r in records)
     assert bus.registers[("Goal_Velocity", "lift_axis")] == 0
     assert bus.registers[("Torque_Enable", "lift_axis")] == 0
     assert not bus.is_connected
@@ -447,6 +524,119 @@ def test_synthetic_sustained_high_during_home_stops_and_closes_before_relief(
     assert any(r.get("rejected") and r["temperature_c"] == 60 for r in records)
     assert not any(r["phase"] == "relief" for r in records)
     assert any(r["phase"] == "shutdown_verified" for r in records)
+
+
+def poll_idle_feedback(robot, clock, *, velocity=0, position=None):
+    """A fresh grouped fake-bus transaction; the real monitor and clock still run."""
+    if position is not None:
+        robot.left_bus.position = position
+    robot.left_bus.read_sequences[("Present_Velocity", "lift_axis")] = [velocity]
+    clock.sleep(1 / 30)
+    robot._lift_operation.poll()
+
+
+@pytest.fixture
+def qualified_idle(operating_robot):
+    robot, clock = operating_robot
+    robot.connect(calibrate=False)
+    for _ in range(45):  # A genuine stopped history, more than one second after zero.
+        poll_idle_feedback(robot, clock)
+    try:
+        yield robot, clock
+    finally:
+        if robot.left_bus.is_connected:
+            robot._safe_shutdown(close_buses=True)
+
+
+@pytest.mark.parametrize("velocity", [-50, 50])
+def test_stopped_velocity_uncertainty_requalifies_without_motion_or_extra_reads(
+    qualified_idle, capsys, velocity,
+):
+    robot, clock = qualified_idle
+    op = robot._lift_operation
+    origin = op.last_record["present_position_raw"]
+    read_count = len(op.transport.group_reads)
+    for position in (origin, origin + 1, origin + 1):
+        poll_idle_feedback(robot, clock, velocity=velocity, position=position)
+        op.apply_action({"lift_axis.vel": 0})
+    # Synthetic normal continuation, not a claim about readings after the real shutdown.
+    for _ in range(7):
+        poll_idle_feedback(robot, clock, position=origin)
+    assert len(op.transport.group_reads) == read_count + 10
+    assert op.failure is None
+    assert op.bus.expected_goal == 0
+    records = operational_records(capsys)
+    assert sum(r["phase"] == "idle_velocity_uncertain" for r in records) == 1
+    assert sum(r["phase"] == "idle_requalified" for r in records) == 1
+    assert sum(r["phase"] == "live" and r.get("present_velocity_raw") == velocity for r in records) == 3
+    robot.disconnect()
+
+
+@pytest.mark.parametrize("velocity", [-50, 50])
+def test_persistent_idle_uncertainty_cannot_restart_its_deadline(qualified_idle, velocity):
+    robot, clock = qualified_idle
+    op = robot._lift_operation
+    for _ in range(2):
+        poll_idle_feedback(robot, clock, velocity=velocity)
+    last_valid_window = clock.now
+    with pytest.raises(RuntimeError, match="within 1 s") as caught:
+        for index in range(40):
+            # A lone normal velocity cannot manufacture a complete stopped window.
+            poll_idle_feedback(robot, clock, velocity=0 if index % 4 == 3 else velocity)
+            op.apply_action({"lift_axis.vel": 0})
+    assert 1.0 <= clock.now - last_valid_window <= 1.036
+    assert op.failure is caught.value
+    assert op.bus.expected_goal == 0
+    with pytest.raises(RuntimeError) as repeated:
+        poll_idle_feedback(robot, clock)  # No automatic recovery after the deadline.
+    assert repeated.value is caught.value
+    assert robot._safe_shutdown(close_buses=True) == []
+
+
+@pytest.mark.parametrize("action", [{"lift_axis.vel": 200}, {"lift_axis.vel": -200}, {"lift_axis.height_mm": 20}])
+def test_idle_uncertainty_refuses_new_lift_motion_before_any_write(qualified_idle, action):
+    robot, clock = qualified_idle
+    op = robot._lift_operation
+    for _ in range(3):
+        poll_idle_feedback(robot, clock, velocity=-50)
+    before = len(robot.left_bus.events)
+    with pytest.raises(RuntimeError, match="uncertain") as caught:
+        op.apply_action(action)
+    assert op.failure is caught.value
+    assert len(robot.left_bus.events) == before
+    assert op.bus.expected_goal == 0
+    assert robot._safe_shutdown(close_buses=True) == []
+
+
+@pytest.mark.parametrize("fault", ["drift", "velocity", "current", "temperature", "status", "transport", "stale"])
+def test_idle_uncertainty_never_defers_real_faults(qualified_idle, fault):
+    robot, clock = qualified_idle
+    op = robot._lift_operation
+    for _ in range(3):
+        poll_idle_feedback(robot, clock, velocity=-50)
+    origin = op.last_record["present_position_raw"]
+    started = clock.now
+    if fault == "current":
+        robot.left_bus.rest_current = 31  # Synthetic 201.5 mA.
+    elif fault == "temperature":
+        robot.left_bus.registers[("Present_Temperature", "lift_axis")] = 60  # Synthetic sustained heat.
+    elif fault == "status":
+        robot.left_bus.registers[("Status", "lift_axis")] = 4
+    elif fault == "transport":
+        robot.left_bus.read_sequences[("Present_Position", "lift_axis")] = [RuntimeError("bad packet")]
+    elif fault == "stale":
+        clock.sleep(0.501)
+    with pytest.raises(RuntimeError) as caught:
+        for index in range(3):
+            poll_idle_feedback(
+                robot, clock, velocity=-51 if fault == "velocity" else -50,
+                position=origin + index + 1 if fault == "drift" else None,
+            )
+    assert clock.now - started < 0.6  # Never waits out the velocity-uncertainty second.
+    assert op.failure is caught.value
+    assert op.bus.expected_goal == 0
+    robot.left_bus.registers[("Status", "lift_axis")] = 0
+    assert robot._safe_shutdown(close_buses=True) == []
 
 
 @pytest.mark.parametrize("fault", ["idle_current", "stationary_motion", "stale", "late_reply"])

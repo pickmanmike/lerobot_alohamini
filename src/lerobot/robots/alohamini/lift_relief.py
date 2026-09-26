@@ -715,7 +715,7 @@ class InstalledLiftCheck:
         _, rest_height = self.home_and_relieve()
         self.observe_raised_rest(rest_height)
 
-    def home_and_relieve(self) -> tuple[Any, float]:
+    def home_and_relieve(self, *, allow_one_count_variation: bool = False) -> tuple[Any, float]:
         """The same bounded mechanics for the opt-in comparison and normal AM1 startup."""
         self.reader.set_phase("setup_position")
         result = self.lift.home(safety_check=self.home_guard, read_raw=self.reader)
@@ -745,6 +745,11 @@ class InstalledLiftCheck:
         # apply_action already advanced the sole encoder accumulator with its
         # grouped setup sample; compare the first motion sample against that.
         previous_height = (self.lift._extended_deg() - self.lift._z0_deg) * self.lift._mm_per_deg
+        # Use the existing unwrapped accumulator, not another read or rounded mm.
+        # The normal AM1 policy may allow one count below the best upward position;
+        # comparing only adjacent samples would permit accumulated downward drift.
+        best_upward_ticks = self.lift.cfg.dir_sign * self.lift._extended_ticks
+        variation_ticks = 1 if allow_one_count_variation else 0
         velocity_disagreements = 0
         while True:
             remaining = RELIEF_TIMEOUT_S - (time.monotonic() - started)
@@ -754,10 +759,19 @@ class InstalledLiftCheck:
             record, height = self._moving_height("relief")
             elapsed = time.monotonic() - started
             self._check_raised("relief", record, height)
-            if height < previous_height:
+            upward_ticks = self.lift.cfg.dir_sign * self.lift._extended_ticks
+            if upward_ticks < best_upward_ticks - variation_ticks:
                 self.refuse(record, "relief: unexpected downward direction.")
+            if upward_ticks < best_upward_ticks:
+                self.emit({
+                    **record,
+                    "phase": "relief_position_variation",
+                    "backstep_ticks": best_upward_ticks - upward_ticks,
+                    "height_mm": round(height, 4),
+                })
+            best_upward_ticks = max(best_upward_ticks, upward_ticks)
             if int(record["present_velocity_raw"]) > STILL_VELOCITY_RAW:
-                if height == previous_height:
+                if height <= previous_height:
                     self.refuse(record, "relief: direction unconfirmed; reported downward velocity without fresh upward position progress.")
                 velocity_disagreements += 1
                 self.emit({
