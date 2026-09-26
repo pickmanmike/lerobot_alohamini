@@ -27,6 +27,7 @@ from typing import Any, Callable, TextIO
 SESSION_ID_PATTERN = re.compile(r"^[0-9]{8}T[0-9]{6}-[0-9a-f]{8}$")
 TERMINAL_STATES = {"complete", "fault", "cleanup_unknown", "refused"}
 REQUIRED_CAMERA_ROLES = {"forward", "backward", "chest", "wrist_left", "wrist_right"}
+HOST_LAUNCHER_READY_TIMEOUT_S = 30.0  # Cold import-root verification precedes HOST_LOG.
 
 
 class SessionRefusal(RuntimeError):
@@ -476,7 +477,7 @@ class RemoteSupervisor:
         log_path = self._wait_for(
             child,
             lambda: self._marker(child.control_path, "HOST_LOG"),
-            10.0,
+            HOST_LAUNCHER_READY_TIMEOUT_S,
             "motor-host launcher",
         )
         child.log_path = log_path
