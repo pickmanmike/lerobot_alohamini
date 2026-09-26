@@ -297,6 +297,10 @@ class AlohaMiniClient(Robot):
             self._fill_observation_request_window()
             self._is_connected = True
         except BaseException as primary:
+            if self.config.robot_model != "alohamini1":
+                # Preserve the other models' existing failed-handshake lifecycle;
+                # only AM1 uses the bounded retry and partial-connect cleanup.
+                raise
             # connect() has not marked the client connected, so outer cleanup cannot
             # call the decorated disconnect(). Close the partially created sockets here.
             self._observation_request_tokens.clear()

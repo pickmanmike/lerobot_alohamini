@@ -2397,6 +2397,48 @@ def test_other_models_keep_their_single_observation_handshake(robot_model):
     assert client.is_connected
 
 
+@pytest.mark.parametrize("robot_model", ["alohamini2", "alohamini2pro"])
+def test_other_models_keep_their_original_failed_handshake_lifecycle(robot_model):
+    from lerobot.robots.alohamini.alohamini_client import AlohaMiniClient
+    from lerobot.robots.alohamini.config_alohamini import AlohaMiniClientConfig
+
+    class Socket:
+        def __init__(self): self.closed = False
+        def setsockopt(self, *_): pass
+        def connect(self, *_): pass
+        def close(self): self.closed = True
+
+    class Context:
+        def __init__(self):
+            self.sockets = []
+            self.terminated = False
+
+        def socket(self, _):
+            socket = Socket()
+            self.sockets.append(socket)
+            return socket
+
+        def term(self): self.terminated = True
+
+    context = Context()
+    client = AlohaMiniClient(AlohaMiniClientConfig(
+        remote_ip="127.0.0.1", id="test", robot_model=robot_model, cameras={},
+    ))
+    client._zmq = SimpleNamespace(
+        Context=lambda: context, PUSH=1, DEALER=2, CONFLATE=3, RCVHWM=4, SNDHWM=5,
+    )
+    calls = []
+    client._request_observation = lambda timeout: calls.append(timeout) or None
+
+    with pytest.raises(Exception, match="Timeout waiting for AlohaMini Host"):
+        client.connect()
+
+    assert calls == [client.connect_timeout_s * 1000]
+    assert not client.is_connected
+    assert not context.terminated
+    assert all(not socket.closed for socket in context.sockets)
+
+
 def test_client_live_command_socket_is_created_configured_used_and_closed_in_one_worker_thread():
     from lerobot.robots.alohamini.alohamini_client import AlohaMiniClient
     from lerobot.robots.alohamini.config_alohamini import AlohaMiniClientConfig
