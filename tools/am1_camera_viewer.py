@@ -32,6 +32,15 @@ PREVIEW_ROLES = ("preview_1", "preview_2", "preview_3", "preview_4", "preview_5"
 MAX_JPEG = 1_000_000
 FRESH_SECONDS = 0.5
 BINARY_SHA256 = "359fabade8a7a51e81a55fe6df6b0ef81764a5e1d63179577534eaaa71904b50"
+_LOG_LOCK = threading.Lock()
+
+
+def log_record(message, *, file=None):
+    """Keep a complete line intact across reader, HTTP and main-thread output."""
+    # print writes the text and newline separately. The session supervisor
+    # parses these records, so flush=True alone does not protect their framing.
+    with _LOG_LOCK:
+        print(message, file=file, flush=True)
 
 
 def validate_config(config, identify=False):
@@ -220,7 +229,7 @@ class ViewerServer(ThreadingHTTPServer):
 
     def handle_error(self, request, client_address):
         # Never echo request targets/auth into a traceback or public log.
-        print('CAMERA_HTTP_ERROR', flush=True)
+        log_record('CAMERA_HTTP_ERROR')
 
 
 class ViewerHandler(BaseHTTPRequestHandler):
@@ -388,7 +397,7 @@ class CameraReader(threading.Thread):
                 # Backend startup can first produce ECONNREFUSED. Preserve a
                 # later distinct role failure, while bounding repeated output.
                 if reason not in reported_failures and len(reported_failures) < 3:
-                    print(f"CAMERA_ROLE_UNAVAILABLE role={self.role} cause={reason}", flush=True)
+                    log_record(f"CAMERA_ROLE_UNAVAILABLE role={self.role} cause={reason}")
                     reported_failures.add(reason)
             self.stop.wait(0.5)
 
@@ -527,10 +536,10 @@ def run_viewer(config, credentials, binary, state_dir, duration=None, identify=F
             worker = CameraReader(role, authorization, stores[role], stop)
             workers.append(worker)
             worker.start()
-        print(f"CAMERA_VIEW_URL=http://{config['bind']}:{config['port']}", flush=True)
-        print("CAMERA_VIEW_MODE=" + ("numbered-identification" if identify else "semantic-roles"), flush=True)
-        print("CAMERA_CONFIGURED_ROLES=" + ",".join(config["cameras"]), flush=True)
-        print("CAMERA_REQUEST=MJPG 640x480 30fps; delivered rate follows below", flush=True)
+        log_record(f"CAMERA_VIEW_URL=http://{config['bind']}:{config['port']}")
+        log_record("CAMERA_VIEW_MODE=" + ("numbered-identification" if identify else "semantic-roles"))
+        log_record("CAMERA_CONFIGURED_ROLES=" + ",".join(config["cameras"]))
+        log_record("CAMERA_REQUEST=MJPG 640x480 30fps; delivered rate follows below")
         started = last_report = time.monotonic()
         while duration is None or time.monotonic() - started < duration:
             if child.poll() is not None:
@@ -538,12 +547,12 @@ def run_viewer(config, credentials, binary, state_dir, duration=None, identify=F
             server.handle_request()
             now = time.monotonic()
             if now - last_report >= 1:
-                print("CAMERA_STATUS " + json.dumps({"elapsed_s": round(now - started, 3),
+                log_record("CAMERA_STATUS " + json.dumps({"elapsed_s": round(now - started, 3),
                       "cameras": {role: stores[role].status() for role in config["cameras"]}},
-                      separators=(",", ":")), flush=True)
+                      separators=(",", ":")))
                 last_report = now
     except KeyboardInterrupt:
-        print("CAMERA_STOP_REQUESTED", flush=True)
+        log_record("CAMERA_STOP_REQUESTED")
     except BaseException:
         primary_failure = True
         raise
@@ -554,7 +563,7 @@ def run_viewer(config, credentials, binary, state_dir, duration=None, identify=F
                 backend_path.unlink()
             except OSError as exc:
                 errors.append(f"private-runtime-cleanup:{type(exc).__name__}")
-        print("CAMERA_CLEANUP_ERRORS=" + json.dumps(errors), flush=True)
+        log_record("CAMERA_CLEANUP_ERRORS=" + json.dumps(errors))
         if errors and not primary_failure:
             raise RuntimeError("Camera cleanup failed; inspect the private log")
     return 0
@@ -590,11 +599,11 @@ def main(argv=None):
                 raise ValueError("Use each role once as ROLE=CAPTURE_PATH")
             config = validate_config({"version": 1, "bind": args.bind, "port": 1984, "cameras": dict(pairs)}, args.identify)
             write_private(args.config, config)
-            print(f"CAMERA_CONFIG_CREATED={args.config}")
+            log_record(f"CAMERA_CONFIG_CREATED={args.config}")
             return 0
         config = validate_config(load_private(args.config), args.identify)
         if args.check:
-            print("CAMERA_CONFIG_OK roles=" + ",".join(config["cameras"]) + "; no device access")
+            log_record("CAMERA_CONFIG_OK roles=" + ",".join(config["cameras"]) + "; no device access")
             return 0
         if args.init_auth:
             if not sys.stdin.isatty():
@@ -604,7 +613,7 @@ def main(argv=None):
             if password != getpass.getpass("Confirm password (hidden): "):
                 raise ValueError("Passwords did not match")
             write_private(args.credentials, validate_credentials({"username": username, "password": password}))
-            print("CAMERA_PRIVATE_AUTH_CREATED; password was not logged")
+            log_record("CAMERA_PRIVATE_AUTH_CREATED; password was not logged")
             return 0
         stage = "private-camera-credentials"
         credentials = validate_credentials(load_private(args.credentials))
@@ -632,7 +641,7 @@ def main(argv=None):
             detail = f"stage={stage} errno={exc.errno}"
         else:
             detail = f"stage={stage}"
-        print(f"CAMERA_REFUSAL {type(exc).__name__}: {detail}", file=sys.stderr)
+        log_record(f"CAMERA_REFUSAL {type(exc).__name__}: {detail}", file=sys.stderr)
         return 2
 
 

@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 
@@ -38,6 +39,73 @@ class CameraCoreTests(unittest.TestCase):
             "port": 1984,
             "cameras": {"forward": "/dev/am_camera_forward"},
         }
+
+    def test_runtime_records_remain_separate_during_concurrent_reader_failure(self):
+        # A reader error between print's text and newline must not corrupt a
+        # readiness header or JSON status. Acquisition/processes stay fake.
+        import tempfile
+
+        for marker in ("CAMERA_VIEW_URL=", "CAMERA_CONFIGURED_ROLES=", "CAMERA_STATUS "):
+            with self.subTest(marker=marker):
+                marker_started = threading.Event()
+                error_written = threading.Event()
+
+                class InterleavingOutput(io.StringIO):
+                    def write(self, text):
+                        result = super().write(text)
+                        if text.startswith(marker):
+                            marker_started.set()
+                            # The unfixed reader can finish its log write here.
+                            # A serialized writer waits until this record ends.
+                            error_written.wait(0.2)
+                        elif text.startswith("CAMERA_ROLE_UNAVAILABLE"):
+                            error_written.set()
+                        return result
+
+                output = InterleavingOutput()
+                now = [0.0]
+                child, server = Mock(), Mock()
+                child.poll.return_value = None
+                server.handle_request.side_effect = lambda: now.__setitem__(0, 1.1)
+                reader_class = self.viewer.CameraReader
+                workers = []
+
+                def failed_connection(*args, **kwargs):
+                    if not marker_started.wait(1):
+                        raise RuntimeError("Test did not reach the readiness record")
+                    raise ConnectionRefusedError(111, "private backend detail")
+
+                def make_reader(role, auth, store, stop):
+                    worker = reader_class(role, auth, store, stop, connection_factory=failed_connection)
+                    workers.append(worker)
+                    return worker
+
+                with tempfile.TemporaryDirectory() as directory, \
+                     patch.object(self.viewer, "preflight"), \
+                     patch.object(self.viewer, "make_server", return_value=server), \
+                     patch.object(self.viewer.subprocess, "Popen", return_value=child), \
+                     patch.object(self.viewer, "CameraReader", side_effect=make_reader), \
+                     patch.object(self.viewer, "time", SimpleNamespace(monotonic=lambda: now[0])), \
+                     patch("sys.stdout", output):
+                    result = self.viewer.run_viewer(
+                        self.config, {"username": "viewer", "password": "private-test-password"},
+                        Path("unused-binary"), Path(directory), duration=1,
+                    )
+
+                self.assertEqual(result, 0)
+                self.assertTrue(error_written.is_set(), "Concurrent reader path was not exercised")
+                self.assertTrue(all(not worker.is_alive() for worker in workers))
+                lines = output.getvalue().splitlines()
+                self.assertIn("CAMERA_VIEW_URL=http://192.168.1.134:1984", lines)
+                self.assertIn("CAMERA_CONFIGURED_ROLES=forward", lines)
+                self.assertIn(
+                    "CAMERA_ROLE_UNAVAILABLE role=forward cause=ConnectionRefusedError errno=111", lines,
+                )
+                status_lines = [line.removeprefix("CAMERA_STATUS ") for line in lines
+                                if line.startswith("CAMERA_STATUS ")]
+                self.assertEqual(len(status_lines), 1)
+                self.assertEqual(json.loads(status_lines[0])["cameras"]["forward"]["state"], "unavailable")
+                self.assertNotIn("private backend detail", output.getvalue())
 
     def test_private_map_oserror_reports_safe_stage_and_errno(self):
         output = io.StringIO()
