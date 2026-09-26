@@ -17,6 +17,12 @@ continuity target. Loss of a required view still means release controls, press
   supervisor starts only the existing camera and Local launchers, each in its own
   recorded process group. It has no listener, requires a bounded controller
   heartbeat, and treats controller loss or EOF as a stop.
+- Initial SSH establishment permits at most three sequential attempts within
+  about 40 seconds, with 3- and 6-second cancellable waits, only when the local
+  SSH client trace identifies a temporary failure before authentication and
+  command dispatch. Authentication, host-key, configuration, ambiguous link
+  loss, or any possible supervisor dispatch is not retried. The latter follows
+  exact-session state and cleanup recovery before another session may start.
 - Camera startup must report its exact log, URL, five configured roles, and one
   all-fresh status sample before the browser opens. A deliberate bare Enter at
   the complete `CONFIRMATION 1/3` prompt is required before the motor host
@@ -113,6 +119,12 @@ Camera startup failures report the exact camera log and, when available, the
 failed role or sanitized gateway/owner stage and errno. A viewer process exit
 is not evidence that all five cameras failed. Unknown camera startup errors are
 not automatically retried; confirm owned cleanup and inspect that exact log.
+Initial SSH attempt traces remain in the private session result folder as
+`ssh-client-attempt-<n>.log`; do not upload them with public source changes.
+Raspberry Pi Connect working through its separate path does not prove direct
+SSH health. The September 26 retained SSH journal shows successful quick
+reconnections after the Pi's 12:21 boot, but the earlier failure interval was
+not retained; no source penalty or server-side setting change is established.
 
 During live use, release motion keys before changing support. `Q` is the normal
 single quit action. Duration expiry follows the same shutdown path. Either now

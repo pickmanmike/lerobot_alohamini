@@ -32,6 +32,50 @@ PERSISTED_STATE_CONNECT_TIMEOUT_S = 4
 PERSISTED_STATE_COMMAND_TIMEOUT_S = 8
 PERSISTED_STATE_RETRY_DELAY_S = 0.25
 SSH_STDERR_LIMIT = 4_000
+SSH_INITIAL_ATTEMPTS = 3
+SSH_INITIAL_BACKOFF_S = (3.0, 6.0)
+SSH_INITIAL_BUDGET_S = 40.0
+_TEMPORARY_PRE_AUTH_ERROR = re.compile(
+    r"(?m)^ssh: connect to host [^\r\n]+ port \d+: "
+    r"(?:Connection timed out|Connection refused|No route to host|Network is unreachable)$"
+    r"|^Connection timed out during banner exchange$"
+    r"|^kex_exchange_identification: "
+    r"(?:read: Connection reset by peer|Connection closed by remote host)$"
+)
+_NO_RETRY_SSH_MARKERS = re.compile(
+    r"(?m)^Host key verification failed\.?$"
+    r"|^Permission denied \([^)]+\)\.?$"
+    r"|^WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!$"
+    r"|^command-line: line \d+: Bad configuration option:"
+    r"|Authenticated to "
+    r"|Sending command:"
+)
+
+
+def _temporary_pre_auth_ssh_failure(trace: str, exit_status: int | None, remote_event_seen: bool) -> bool:
+    """Only client-side, pre-auth establishment failures permit a supervisor relaunch."""
+    if exit_status != 255 or remote_event_seen or "debug1: Connecting to " not in trace:
+        return False
+    if _NO_RETRY_SSH_MARKERS.search(trace):
+        return False
+    return any(match.end() == len(trace.rstrip()) for match in _TEMPORARY_PRE_AUTH_ERROR.finditer(trace.rstrip()))
+
+
+def _definite_initial_ssh_no_dispatch(
+    trace: str, stderr: str, exit_status: int | None, remote_event_seen: bool,
+) -> bool:
+    if exit_status != 255 or remote_event_seen or "Authenticated to " in trace or "Sending command:" in trace:
+        return False
+    if _TEMPORARY_PRE_AUTH_ERROR.search(trace):
+        return False
+    if re.search(
+        r"(?m)^Host key verification failed\.?\s*$"
+        r"|^Permission denied \([^)]+\)\.?\s*$"
+        r"|^WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!\s*$",
+        trace,
+    ):
+        return True
+    return not trace and bool(re.search(r"(?m)^command-line: line \d+: Bad configuration option:", stderr))
 
 
 class SessionError(RuntimeError):
@@ -496,18 +540,26 @@ class SSHRemote:
         self._heartbeat_stop = threading.Event()
         self._heartbeat: threading.Thread | None = None
         self.stderr_path = self.session_directory / "ssh-control.log"
+        self._client_trace_path: Path | None = None
+        self._remote_event_seen = False
+        self._initial_no_dispatch = False
+        self._initial_attempts: list[dict[str, Any]] = []
 
     def set_stop_requested(self, stop_requested: Callable[[], bool]) -> None:
         self._stop_requested = stop_requested
 
-    def _command(self) -> list[str]:
-        return [
+    def _command(self, client_trace: Path | None = None) -> list[str]:
+        command = [
             "ssh",
             "-o", "BatchMode=yes",
             "-o", "ConnectTimeout=10",
             "-o", "ConnectionAttempts=1",
             "-o", "ServerAliveInterval=2",
             "-o", "ServerAliveCountMax=3",
+        ]
+        if client_trace is not None:
+            command.extend(["-v", "-E", str(client_trace)])
+        command.extend([
             self.config.ssh_target,
             self.config.remote_python,
             self.config.remote_helper,
@@ -522,7 +574,8 @@ class SSHRemote:
             "--motor-head", self.config.remote_motor_head,
             "--log-directory", self.config.remote_log_directory,
             "--state-directory", self.config.remote_state_directory,
-        ]
+        ])
+        return command
 
     def _read_events(self) -> None:
         assert self.process and self.process.stdout
@@ -531,6 +584,7 @@ class SSHRemote:
                 event = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            self._remote_event_seen = True
             self.events.put(event)
             if event.get("event") in {"runtime_fault", "refused", "fault"}:
                 self._record_fault(event)
@@ -552,7 +606,25 @@ class SSHRemote:
         try:
             text = self.stderr_path.read_text(encoding="utf-8", errors="replace")
         except OSError:
-            return ""
+            text = ""
+        if self._client_trace_path is not None:
+            try:
+                trace_lines = self._client_trace_path.read_text(
+                    encoding="utf-8", errors="replace"
+                ).splitlines()
+            except OSError:
+                trace_lines = []
+            for line in reversed(trace_lines):
+                if re.fullmatch(
+                    r"Host key verification failed\.?|Permission denied \([^)]+\)\.?"
+                    r"|ssh: connect to host [^\r\n]+ port \d+: [^\r\n]+"
+                    r"|Connection timed out during banner exchange"
+                    r"|kex_exchange_identification: [^\r\n]+"
+                    r"|Timeout, server [^\r\n]+ not responding\.",
+                    line.strip(),
+                ):
+                    text += "\nSSH client: " + line.strip()
+                    break
         return text[-SSH_STDERR_LIMIT:].strip()
 
     def _record_ssh_exit(self, context: str, *, relation: str = "before") -> dict[str, Any]:
@@ -564,6 +636,8 @@ class SSHRemote:
         }
         if stderr := self._ssh_stderr():
             event["ssh_stderr"] = stderr
+        if self._client_trace_path is not None and self._client_trace_path.exists():
+            event["ssh_client_trace"] = str(self._client_trace_path)
         self._record_fault(event)
         return event
 
@@ -581,6 +655,8 @@ class SSHRemote:
             fields["primary_fault"] = diagnostics["primary_fault"]
         if diagnostics["later_errors"]:
             fields["later_errors"] = diagnostics["later_errors"]
+        if self._initial_attempts:
+            fields["ssh_initial_attempts"] = list(self._initial_attempts)
         return fields
 
     def _wait(
@@ -630,27 +706,101 @@ class SSHRemote:
                 })
                 return
 
+    def _pause_before_initial_retry(self, delay_s: float, deadline: float) -> None:
+        until = min(time.monotonic() + delay_s, deadline)
+        while True:
+            if self._stop_requested():
+                raise SessionStopped("session stop requested during initial SSH reconnect wait")
+            remaining = until - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(0.1, remaining))
+        if time.monotonic() >= deadline:
+            raise SessionError("Initial SSH connection budget expired before reconnect.")
+
     def preflight(self) -> dict[str, Any]:
-        self.stderr_stream = self.stderr_path.open("w", encoding="utf-8")
-        self.process = subprocess.Popen(
-            self._command(),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=self.stderr_stream,
-            text=True,
-            bufsize=1,
-        )
-        if self.process.stdin is not None:
+        deadline = time.monotonic() + SSH_INITIAL_BUDGET_S
+        for attempt in range(1, SSH_INITIAL_ATTEMPTS + 1):
+            if self._stop_requested():
+                raise SessionStopped("session stop requested before Pi SSH preflight")
+            if time.monotonic() >= deadline:
+                raise SessionError("Initial SSH connection budget expired before preflight.")
+            trace_path = self.session_directory / f"ssh-client-attempt-{attempt}.log"
+            self._client_trace_path = trace_path
+            self._remote_event_seen = False
+            self.stderr_stream = self.stderr_path.open("w" if attempt == 1 else "a", encoding="utf-8")
+            self.stderr_stream.write(f"\nAM1_INITIAL_SSH_ATTEMPT={attempt}\n")
+            self.stderr_stream.flush()
             try:
-                os.set_blocking(self.process.stdin.fileno(), False)
-            except (AttributeError, OSError):
-                pass
-        self.reader = threading.Thread(target=self._read_events, name="am1-session-events", daemon=True)
-        self.reader.start()
-        event = self._wait("preflight_ready", 30.0)
-        self._heartbeat = threading.Thread(target=self._heartbeat_loop, name="am1-session-heartbeat", daemon=True)
-        self._heartbeat.start()
-        return event
+                self.process = subprocess.Popen(
+                    self._command(trace_path),
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=self.stderr_stream,
+                    text=True,
+                    bufsize=1,
+                )
+            except BaseException:
+                self.stderr_stream.close()
+                self.stderr_stream = None
+                raise
+            if self.process.stdin is not None:
+                try:
+                    os.set_blocking(self.process.stdin.fileno(), False)
+                except (AttributeError, OSError):
+                    pass
+            self.reader = threading.Thread(target=self._read_events, name="am1-session-events", daemon=True)
+            self.reader.start()
+            try:
+                event = self._wait("preflight_ready", min(30.0, max(0.01, deadline - time.monotonic())))
+            except SessionError:
+                if self.process.poll() == 255 and self.reader is not None:
+                    self.reader.join(timeout=1.0)
+                try:
+                    trace = trace_path.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    trace = ""
+                retryable = (
+                    self.reader is not None and not self.reader.is_alive()
+                    and _temporary_pre_auth_ssh_failure(
+                        trace, self.process.returncode, self._remote_event_seen
+                    )
+                )
+                if not retryable:
+                    self._initial_no_dispatch = (
+                        self.reader is not None and not self.reader.is_alive()
+                        and _definite_initial_ssh_no_dispatch(
+                            trace, self._ssh_stderr(), self.process.returncode, self._remote_event_seen
+                        )
+                    )
+                    raise
+                failure = self.fault() or self._record_ssh_exit("preflight_ready")
+                self._initial_attempts.append({
+                    "attempt": attempt,
+                    "stage": "temporary_pre_auth_establishment_failure",
+                    "ssh_exit_status": 255,
+                    "fault": failure,
+                })
+                if self.process.stdin is not None:
+                    self.process.stdin.close()
+                if self.process.stdout is not None:
+                    self.process.stdout.close()
+                self.stderr_stream.close()
+                self.stderr_stream = None
+                self.process = None
+                self.reader = None
+                if attempt == SSH_INITIAL_ATTEMPTS:
+                    raise
+                self._pause_before_initial_retry(SSH_INITIAL_BACKOFF_S[attempt - 1], deadline)
+                with self._fault_lock:
+                    self._fault = None
+                    self._later_errors.clear()
+                self.events = queue.Queue()
+                continue
+            self._heartbeat = threading.Thread(target=self._heartbeat_loop, name="am1-session-heartbeat", daemon=True)
+            self._heartbeat.start()
+            return event
+        raise AssertionError("initial SSH attempt loop exhausted without outcome")
 
     def start_camera(self) -> dict[str, Any]:
         self._send("START_CAMERA")
@@ -761,6 +911,15 @@ class SSHRemote:
 
     def stop(self) -> dict[str, Any]:
         self._heartbeat_stop.set()
+        if self._initial_no_dispatch:
+            if self.process is not None:
+                for stream in (self.process.stdin, self.process.stdout):
+                    if stream is not None:
+                        stream.close()
+            if self.stderr_stream is not None:
+                self.stderr_stream.close()
+                self.stderr_stream = None
+            return {"cleanup_verified": True, "nothing_started": True, **self._diagnostic_fields()}
         if not self.process:
             return {"cleanup_verified": True, "nothing_started": True, **self._diagnostic_fields()}
         if self.process.poll() is None:
