@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "windows_python": "C:\\Users\\YOUR_USERNAME\\lerobot_alohamini_client\\.venv\\Scripts\\python.exe",
+  "local_config": "C:\\Users\\YOUR_USERNAME\\lerobot_alohamini_client\\.worktrees\\am1-base-teleop\\config\\am1.local.json",
+  "local_state_directory": "C:\\Users\\YOUR_USERNAME\\AppData\\Local\\AM1\\session-state",
+  "windows_log_directory": "C:\\Users\\YOUR_USERNAME\\AlohaMini1Logs",
+  "ssh_target": "am1-pi",
+  "browser_url": "http://192.168.1.134:1984",
+  "remote_python": "/home/YOUR_USERNAME/lerobot_alohamini/.venv/bin/python",
+  "remote_helper": "/home/YOUR_USERNAME/lerobot_am1_unified_session/tools/am1_session_remote.py",
+  "remote_session_repository": "/home/YOUR_USERNAME/lerobot_am1_unified_session",
+  "remote_session_head": "0000000000000000000000000000000000000000",
+  "remote_camera_repository": "/home/YOUR_USERNAME/lerobot_am1_camera_viewing",
+  "remote_camera_head": "f339493e55f89a4a5bc429bc32b2e9aaa4e2ea52",
+  "remote_camera_python": "/home/YOUR_USERNAME/lerobot_alohamini/.venv/bin/python",
+  "remote_motor_repository": "/home/YOUR_USERNAME/lerobot_alohamini",
+  "remote_motor_head": "7badafdf4347cc1154c43f02fb6f6953d91053a0",
+  "remote_log_directory": "/home/YOUR_USERNAME/AlohaMini1Logs",
+  "remote_state_directory": "/home/YOUR_USERNAME/.local/state/am1-session"
+}

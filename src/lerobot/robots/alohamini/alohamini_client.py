@@ -22,7 +22,7 @@ import time
 from collections import deque
 from functools import cached_property
 import os
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -144,6 +144,8 @@ class AlohaMiniClient(Robot):
         self.zmq_observation_socket = None
         self._observation_request_tokens: deque[bytes] = deque()
         self._observation_response_cache: dict[bytes, list[bytes]] = {}
+        self._observation_request_sent_at: dict[bytes, float] = {}
+        self._last_response_request_sent_at: float | None = None
         self._observation_request_id = 0
 
         self.last_frames = {}
@@ -154,7 +156,9 @@ class AlohaMiniClient(Robot):
         self._observation_sequence = 0
         self._latest_raw_observation_keys: frozenset[str] = frozenset()
         self._latest_observation_received_at: float | None = None
+        self._latest_observation_roundtrip_age_s: float | None = None
         self._latest_observation_error: str | None = None
+        self._latest_am1_local_feedback: Any = None
         self._lift_target_mm = None
 
         # Define three speed levels and a current index
@@ -223,49 +227,96 @@ class AlohaMiniClient(Robot):
         return self._latest_observation_received_at
 
     @property
+    def latest_observation_roundtrip_age_s(self) -> float | None:
+        """Elapsed time from the matching request send to decoded reply receipt."""
+        return self._latest_observation_roundtrip_age_s
+
+    @property
     def latest_observation_error(self) -> str | None:
         """Malformed-payload reason from the most recent observation request, if any."""
         return self._latest_observation_error
+
+    @property
+    def latest_am1_local_feedback(self) -> Any:
+        """Unmodified AM1 Local host acknowledgement from the latest decoded frame."""
+        return self._latest_am1_local_feedback
 
     @property
     def is_calibrated(self) -> bool:
         pass
 
     @check_if_already_connected
-    def connect(self) -> None:
+    def connect(self, *, cancel_check: Callable[[], None] | None = None) -> None:
         """Establishes ZMQ sockets with the remote mobile robot"""
 
         zmq = self._zmq
-        self.zmq_context = zmq.Context()
-        self.zmq_cmd_socket = self.zmq_context.socket(zmq.PUSH)
-        # Socket options that control queueing must be set before connect().
-        self.zmq_cmd_socket.setsockopt(zmq.CONFLATE, 1)
-        if self.command_send_timeout_ms is not None:
-            self.zmq_cmd_socket.setsockopt(zmq.SNDTIMEO, self.command_send_timeout_ms)
-            self.zmq_cmd_socket.setsockopt(zmq.LINGER, 0)
-        zmq_cmd_locator = f"tcp://{self.remote_ip}:{self.port_zmq_cmd}"
-        self.zmq_cmd_socket.connect(zmq_cmd_locator)
+        try:
+            self.zmq_context = zmq.Context()
+            self.zmq_cmd_socket = self.zmq_context.socket(zmq.PUSH)
+            # Socket options that control queueing must be set before connect().
+            self.zmq_cmd_socket.setsockopt(zmq.CONFLATE, 1)
+            if self.command_send_timeout_ms is not None:
+                self.zmq_cmd_socket.setsockopt(zmq.SNDTIMEO, self.command_send_timeout_ms)
+                self.zmq_cmd_socket.setsockopt(zmq.LINGER, 0)
+            zmq_cmd_locator = f"tcp://{self.remote_ip}:{self.port_zmq_cmd}"
+            self.zmq_cmd_socket.connect(zmq_cmd_locator)
 
-        # Request-driven observation transport with a small bounded window. This covers
-        # network round-trip latency without allowing stale frames to accumulate unboundedly.
-        self.zmq_observation_socket = self.zmq_context.socket(zmq.DEALER)
-        if self.command_send_timeout_ms is not None:
-            self.zmq_observation_socket.setsockopt(zmq.LINGER, 0)
-        self.zmq_observation_socket.setsockopt(zmq.RCVHWM, self.observation_request_window)
-        self.zmq_observation_socket.setsockopt(zmq.SNDHWM, self.observation_request_window)
-        zmq_observations_locator = f"tcp://{self.remote_ip}:{self.port_zmq_observations}"
-        self.zmq_observation_socket.connect(zmq_observations_locator)
+            # Request-driven observation transport with a small bounded window.
+            self.zmq_observation_socket = self.zmq_context.socket(zmq.DEALER)
+            if self.command_send_timeout_ms is not None:
+                self.zmq_observation_socket.setsockopt(zmq.LINGER, 0)
+            self.zmq_observation_socket.setsockopt(zmq.RCVHWM, self.observation_request_window)
+            self.zmq_observation_socket.setsockopt(zmq.SNDHWM, self.observation_request_window)
+            zmq_observations_locator = f"tcp://{self.remote_ip}:{self.port_zmq_observations}"
+            self.zmq_observation_socket.connect(zmq_observations_locator)
 
-        handshake_message = self._request_observation(self.connect_timeout_s * 1000)
-        if handshake_message is None:
-            raise DeviceNotConnectedError("Timeout waiting for AlohaMini Host to connect expired.")
+            if self.config.robot_model == "alohamini1":
+                # A newly connected DEALER can briefly refuse NOBLOCK sends. Retry only
+                # within the original total connection budget; do not recreate the host.
+                deadline = time.monotonic() + self.connect_timeout_s
+                handshake_message = None
+                self._connect_handshake_strict = True
+                try:
+                    while handshake_message is None:
+                        if cancel_check is not None:
+                            cancel_check()
+                        remaining_s = deadline - time.monotonic()
+                        if remaining_s <= 0:
+                            break
+                        handshake_message = self._request_observation(min(100, max(1, int(remaining_s * 1000))))
+                        if handshake_message is None:
+                            time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
+                finally:
+                    self._connect_handshake_strict = False
+            else:
+                handshake_message = self._request_observation(self.connect_timeout_s * 1000)
+            if handshake_message is None:
+                raise DeviceNotConnectedError("Timeout waiting for AlohaMini Host to connect expired.")
 
-        # The handshake proves that the Host is available, but it may become stale while
-        # the remaining teleoperation devices connect. Discard it and fill a bounded request
-        # window for frames that get_observation() will consume.
-        self._fill_observation_request_window()
-
-        self._is_connected = True
+            # The handshake proves availability, not freshness after leader connection.
+            self._fill_observation_request_window()
+            self._is_connected = True
+        except BaseException as primary:
+            if self.config.robot_model != "alohamini1":
+                # Preserve the other models' existing failed-handshake lifecycle;
+                # only AM1 uses the bounded retry and partial-connect cleanup.
+                raise
+            # connect() has not marked the client connected, so outer cleanup cannot
+            # call the decorated disconnect(). Close the partially created sockets here.
+            self._observation_request_tokens.clear()
+            self._observation_response_cache.clear()
+            self._observation_request_sent_at.clear()
+            for label, resource, method in (
+                ("observation socket", self.zmq_observation_socket, "close"),
+                ("command socket", self.zmq_cmd_socket, "close"),
+                ("context", self.zmq_context, "term"),
+            ):
+                if resource is not None:
+                    try:
+                        getattr(resource, method)()
+                    except BaseException as cleanup_error:
+                        primary.add_note(f"AlohaMiniClient connect cleanup {label} also failed: {cleanup_error!r}")
+            raise
 
     def calibrate(self) -> None:
         pass
@@ -277,10 +328,14 @@ class AlohaMiniClient(Robot):
         request_token = str(self._observation_request_id).encode("ascii")
 
         try:
+            sent_at = time.monotonic()
             self.zmq_observation_socket.send(request_token, flags=zmq.NOBLOCK)
         except zmq.ZMQError as e:
+            if getattr(self, "_connect_handshake_strict", False) and not isinstance(e, zmq.Again):
+                raise
             logging.error(f"ZMQ observation request failed: {e}")
             return None
+        self._observation_request_sent_at[request_token] = sent_at
         return request_token
 
     def _receive_observation_response(
@@ -304,6 +359,8 @@ class AlohaMiniClient(Robot):
             try:
                 socks = dict(poller.poll(remaining_ms))
             except zmq.ZMQError as e:
+                if getattr(self, "_connect_handshake_strict", False) and not isinstance(e, zmq.Again):
+                    raise
                 logging.error(f"ZMQ observation poll failed: {e}")
                 return None
             if self.zmq_observation_socket not in socks:
@@ -327,7 +384,10 @@ class AlohaMiniClient(Robot):
         request_token = self._send_observation_request()
         if request_token is None:
             return None
-        return self._receive_observation_response(request_token, timeout_ms)
+        try:
+            return self._receive_observation_response(request_token, timeout_ms)
+        finally:
+            self._observation_request_sent_at.pop(request_token, None)
 
     def _fill_observation_request_window(self) -> None:
         """Keep a bounded number of requests in flight to cover transport latency."""
@@ -336,6 +396,15 @@ class AlohaMiniClient(Robot):
             if request_token is None:
                 break
             self._observation_request_tokens.append(request_token)
+
+    def retire_observation_requests(self) -> None:
+        """Exclude every pre-pause request/reply before qualifying recovery."""
+        self._observation_request_tokens.clear()
+        self._observation_response_cache.clear()
+        self._observation_request_sent_at.clear()
+        self._last_response_request_sent_at = None
+        self._drain_observation_responses()
+        self._fill_observation_request_window()
 
     def _drain_observation_responses(self) -> None:
         """Drain ready replies, retaining only those for requests still tracked locally."""
@@ -360,13 +429,19 @@ class AlohaMiniClient(Robot):
             self._drain_observation_responses()
             self._fill_observation_request_window()
 
+        request_token = self._observation_request_tokens.popleft() if self._observation_request_tokens else None
         message = (
-            self._receive_observation_response(
-                self._observation_request_tokens.popleft(), self.polling_timeout_ms
-            )
-            if self._observation_request_tokens
+            self._receive_observation_response(request_token, self.polling_timeout_ms)
+            if request_token is not None
             else None
         )
+        self._last_response_request_sent_at = (
+            self._observation_request_sent_at.pop(request_token, None)
+            if request_token is not None and message is not None
+            else None
+        )
+        if request_token is not None and message is None:
+            self._observation_request_sent_at.pop(request_token, None)
         if message is None:
             logging.info("No new data available within timeout.")
         # Retire only the token just consumed or timed out. Replies for other active tokens
@@ -539,7 +614,14 @@ class AlohaMiniClient(Robot):
 
         self.last_frames = {**self.last_frames, **new_frames}
         self.last_remote_state = new_state
+        self._latest_am1_local_feedback = observation.get("_am1_local_feedback")
         self._latest_observation_received_at = received_at
+        request_sent_at = getattr(self, "_last_response_request_sent_at", None)
+        self._latest_observation_roundtrip_age_s = (
+            received_at - request_sent_at
+            if received_at is not None and request_sent_at is not None
+            else None
+        )
         self._observation_sequence += 1
         observation_done_t = time.perf_counter()
         self.logs["observation_timing_ms"] = {

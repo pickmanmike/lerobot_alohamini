@@ -6,6 +6,7 @@ import importlib.util
 import io
 import http.client
 import json
+import subprocess
 from pathlib import Path
 import sys
 import threading
@@ -37,6 +38,70 @@ class CameraCoreTests(unittest.TestCase):
             "port": 1984,
             "cameras": {"forward": "/dev/am_camera_forward"},
         }
+
+    def test_private_map_oserror_reports_safe_stage_and_errno(self):
+        output = io.StringIO()
+        with patch.object(self.viewer, "load_private", side_effect=OSError(13, "secret-path-must-not-print")), \
+             patch("sys.stderr", output):
+            status = self.viewer.main(["--check"])
+        self.assertEqual(status, 2)
+        self.assertIn("stage=private-camera-map", output.getvalue())
+        self.assertIn("errno=13", output.getvalue())
+        self.assertNotIn("secret-path", output.getvalue())
+
+    def test_reader_reports_first_role_specific_backend_failure_without_spam(self):
+        output = io.StringIO()
+        stop = threading.Event()
+
+        def no_connection(*args, **kwargs):
+            raise OSError(111, "secret-backend-detail")
+
+        class OneWait:
+            def is_set(self): return stop.is_set()
+            def wait(self, _): stop.set()
+
+        reader = self.viewer.CameraReader(
+            "forward", "private-auth", self.viewer.FrameStore(), OneWait(),
+            connection_factory=no_connection,
+        )
+        with patch("sys.stdout", output):
+            reader.run()
+        self.assertIn("CAMERA_ROLE_UNAVAILABLE role=forward", output.getvalue())
+        self.assertIn("errno=111", output.getvalue())
+        self.assertNotIn("secret-backend-detail", output.getvalue())
+
+    def test_reader_reports_later_distinct_role_failure_after_startup_refusal(self):
+        output = io.StringIO()
+        attempts = iter([OSError(111, "backend starting"), OSError(5, "private device path")])
+
+        class TwoWait:
+            count = 0
+            def is_set(self): return self.count >= 2
+            def wait(self, _): self.count += 1
+
+        def failed_connection(*args, **kwargs):
+            raise next(attempts)
+
+        reader = self.viewer.CameraReader(
+            "forward", "private-auth", self.viewer.FrameStore(), TwoWait(),
+            connection_factory=failed_connection,
+        )
+        with patch("sys.stdout", output):
+            reader.run()
+        lines = [line for line in output.getvalue().splitlines() if line.startswith("CAMERA_ROLE_UNAVAILABLE")]
+        self.assertEqual(len(lines), 2)
+        self.assertIn("errno=111", lines[0])
+        self.assertIn("errno=5", lines[1])
+        self.assertNotIn("private device path", output.getvalue())
+
+    def test_subprocess_timeout_returns_sanitized_refusal(self):
+        output = io.StringIO()
+        with patch.object(self.viewer, "load_private", side_effect=subprocess.TimeoutExpired("private-command", 3)), \
+             patch("sys.stderr", output):
+            status = self.viewer.main(["--check"])
+        self.assertEqual(status, 2)
+        self.assertIn("CAMERA_REFUSAL TimeoutExpired: stage=private-camera-map", output.getvalue())
+        self.assertNotIn("private-command", output.getvalue())
 
     def test_partial_mapping_retains_missing_roles_without_guessing(self):
         result = self.viewer.validate_config(self.config)

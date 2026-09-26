@@ -74,7 +74,7 @@ def local_cli_args(*extra: str) -> list[str]:
         "--startup_mode",
         "sync",
         "--startup_sync_duration_s",
-        "120",
+        "30",
         "--max_start_mismatch",
         "10",
         "--start_paused",
@@ -121,10 +121,11 @@ def test_local_cli_selects_the_decoupled_am1_path_with_bounded_send_timeout():
         (local_cli_args("--no_leader"), "--local_mode requires both leader connections"),
         (local_cli_args("--no_keyboard"), "--local_mode requires keyboard control"),
         (local_cli_args("--startup_mode", "strict"), "--local_mode requires --startup_mode sync"),
-        (local_cli_args("--startup_sync_duration_s", "119"), "--local_mode requires --startup_sync_duration_s 120"),
+        (local_cli_args("--startup_sync_duration_s", "29"), "--local_mode requires --startup_sync_duration_s 30"),
         (local_cli_args("--max_start_mismatch", "9"), "--local_mode requires --max_start_mismatch 10"),
         (local_cli_args("--fps", "5"), "--local_mode requires --fps 10"),
-        (local_cli_args("--duration_s", "31"), "--local_mode requires --duration_s greater than 0 and no more than 30"),
+        (local_cli_args("--duration_s", "1801"), "--local_mode requires a whole --duration_s from 1 through 1800"),
+        (local_cli_args("--duration_s", "1.5"), "--local_mode requires a whole --duration_s from 1 through 1800"),
         (local_cli_args("--live_arm_scope", "right_wrist_flex"), "--local_mode requires --live_arm_scope both"),
         (
             local_cli_args("--startup_sync_only"),
@@ -145,6 +146,188 @@ def test_local_cli_requires_the_physically_proven_bounded_shape(capsys, argument
 
     assert caught.value.code == 2
     assert reason in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("duration", ["1", "60", "120", "1800"])
+def test_local_cli_accepts_explicit_whole_second_live_duration(duration):
+    module = load_teleoperate_module()
+
+    args = module.parse_args(local_cli_args("--duration_s", duration), platform_name="Windows")
+
+    assert args.duration_s == float(duration)
+
+
+def test_local_cli_accepts_only_an_absolute_local_session_stop_file(tmp_path, capsys):
+    module = load_teleoperate_module()
+    stop_path = tmp_path / "stop-request"
+
+    args = module.parse_args(
+        local_cli_args("--external_stop_file", str(stop_path)),
+        platform_name="Windows",
+    )
+    assert args.external_stop_file == stop_path
+
+    with pytest.raises(SystemExit):
+        module.parse_args(
+            local_cli_args("--external_stop_file", "relative-stop"),
+            platform_name="Windows",
+        )
+    assert "absolute" in capsys.readouterr().err
+
+
+def test_stop_latched_as_input_returns_still_refuses_the_prompt_response():
+    module = load_teleoperate_module()
+    stop = threading.Event()
+
+    def input_and_stop(prompt):
+        stop.set()
+        return ""
+
+    with pytest.raises(module.ExternalStopRequested):
+        module.wait_for_input_or_stop(input_and_stop, "prompt", stop.is_set)
+
+
+def test_external_stop_at_enter_gate_returns_130_and_zeros_before_disconnect(monkeypatch, tmp_path):
+    module = load_teleoperate_module()
+    events = []
+    stop_path = tmp_path / "session-stop"
+
+    class Robot:
+        def __init__(self, config):
+            self.config = config
+            self.observation_sequence = 2
+        def connect(self): events.append("robot_connect")
+        def send_action(self, action): events.append(("robot_send", dict(action)))
+        def disconnect(self): events.append("robot_disconnect")
+
+    class Arm:
+        def __init__(self, side): self.side = side
+        def connect(self): events.append(f"{self.side}_connect")
+        def disconnect(self): events.append(f"{self.side}_disconnect")
+
+    class Leader:
+        def __init__(self, config):
+            self.left_arm = Arm("left")
+            self.right_arm = Arm("right")
+
+    class Keyboard:
+        def __init__(self, config): self.is_connected = False
+        def connect(self): self.is_connected = True; events.append("keyboard_connect")
+        def disconnect(self): self.is_connected = False; events.append("keyboard_disconnect")
+
+    monkeypatch.setattr(module, "AlohaMiniClient", Robot)
+    monkeypatch.setattr(module, "BiSOLeader", Leader)
+    monkeypatch.setattr(module, "KeyboardTeleop", Keyboard)
+    monkeypatch.setattr(
+        module,
+        "run_startup_sync",
+        lambda *args, **kwargs: (dict(FOLLOWER), dict(FOLLOWER), time.monotonic()),
+    )
+    monkeypatch.setattr(
+        module,
+        "run_alignment_gate",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("alignment must not run after stop")),
+    )
+    args = module.parse_args(
+        local_cli_args("--external_stop_file", str(stop_path)),
+        platform_name="Windows",
+    )
+
+    def latch_stop(prompt):
+        stop_path.write_text("stop\n", encoding="utf-8")
+        return ""
+
+    status = module.run_teleoperation(args, input_fn=latch_stop)
+
+    assert status == 130
+    assert all(not any(key.startswith("arm_") for key in event[1]) for event in events if event[0] == "robot_send")
+    final_zero_index = max(
+        index for index, event in enumerate(events)
+        if isinstance(event, tuple) and event == ("robot_send", module.make_zero_action())
+    )
+    assert final_zero_index < events.index("right_disconnect") < events.index("left_disconnect")
+    assert events.index("left_disconnect") < events.index("robot_disconnect")
+
+
+def test_external_stop_before_first_live_send_emits_no_action():
+    module = load_teleoperate_module()
+
+    class Sender:
+        def __init__(self): self.actions = []
+        def __enter__(self): return self
+        def send_action(self, action): self.actions.append(dict(action))
+        def __exit__(self, exc_type, exc, traceback): return False
+
+    class Robot:
+        def __init__(self): self.sender = Sender()
+        def make_live_command_sender(self): return self.sender
+
+    robot = Robot()
+    sender = module.AM1LiveActionSender(
+        robot,
+        initial_action={**FOLLOWER, **module.make_zero_action()},
+        initial_observation_sequence=2,
+        fps=10,
+        duration_s=60,
+        profile_cadence=True,
+        before_first_send_stop_requested=lambda: True,
+    )
+
+    sender.start()
+    sender.join()
+
+    assert robot.sender.actions == []
+    assert sender.snapshot().action_sequence == 0
+
+
+def test_1800_second_local_expiry_uses_fake_time_and_keeps_zero_body_commands():
+    module = load_teleoperate_module()
+
+    class FakeClock:
+        def __init__(self):
+            self.now = 0.0
+            self.lock = threading.Lock()
+
+        def monotonic(self):
+            with self.lock:
+                return self.now
+
+        def sleep(self, duration):
+            with self.lock:
+                self.now += duration
+
+    class Sender:
+        def __init__(self): self.actions = []
+        def __enter__(self): return self
+        def send_action(self, action): self.actions.append(dict(action))
+        def __exit__(self, exc_type, exc, traceback): return False
+
+    class Robot:
+        def __init__(self): self.sender = Sender()
+        def make_live_command_sender(self): return self.sender
+
+    clock = FakeClock()
+    robot = Robot()
+    sender = module.AM1LiveActionSender(
+        robot,
+        initial_action={**FOLLOWER, **module.make_zero_action()},
+        initial_observation_sequence=1,
+        fps=10,
+        duration_s=1800,
+        profile_cadence=False,
+        monotonic=clock.monotonic,
+        sleep_fn=clock.sleep,
+    )
+
+    sender.start()
+    sender.join()
+
+    assert 17_999 <= len(robot.sender.actions) <= 18_001
+    assert 1800 <= clock.now < 1800.2
+    assert all(
+        {key: action[key] for key in module.make_zero_action()} == module.make_zero_action()
+        for action in robot.sender.actions
+    )
 
 
 @pytest.mark.parametrize("robot_model", ["alohamini2", "alohamini2pro"])

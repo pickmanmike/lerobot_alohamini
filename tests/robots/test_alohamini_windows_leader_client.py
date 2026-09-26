@@ -19,9 +19,11 @@ from __future__ import annotations
 import argparse
 import builtins
 import importlib.util
+import json
 import io
 import math
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1133,6 +1135,7 @@ class FakeRobot:
     events: list[tuple]
     observation_poses: list[dict[str, float]]
     observation_sequence_advances: list[bool]
+    observation_clock = None
 
     def __init__(self, config):
         self.config = SimpleNamespace(
@@ -1146,10 +1149,14 @@ class FakeRobot:
         self.actions: list[dict[str, float]] = []
         self.events = type(self).events
         self.observation_sequence = 0
+        self.latest_observation_roundtrip_age_s = 0.0
+        self.latest_am1_local_feedback = {
+            "version": 1, "state": "ready", "epoch": -1, "observation_id": 1,
+        }
         self.observation_index = 0
         type(self).instances.append(self)
 
-    def connect(self):
+    def connect(self, *, cancel_check=None):
         self.events.append(("robot", "connect"))
         self.is_connected = True
 
@@ -1161,8 +1168,14 @@ class FakeRobot:
         self.observation_index += 1
         if should_advance:
             self.observation_sequence += 1
+        self.latest_observation_received_at = (
+            type(self).observation_clock() if type(self).observation_clock is not None else time.monotonic()
+        )
         self.events.append(("robot", "get_observation", self.observation_sequence, observation))
         return observation
+
+    def retire_observation_requests(self):
+        pass
 
     def send_action(self, action):
         action_copy = dict(action)
@@ -1256,6 +1269,7 @@ def prepare_teleoperation(
     FakeRobot.events = events
     FakeRobot.observation_poses = list(observation_poses or [FOLLOWER_POSE])
     FakeRobot.observation_sequence_advances = list(observation_sequence_advances or [True])
+    FakeRobot.observation_clock = None
     FakeLeader.instances = []
     FakeLeader.events = events
     FakeLeader.right_connect_error = right_connect_error
@@ -1339,6 +1353,100 @@ def test_sync_requires_exact_confirmation_before_any_arm_send(monkeypatch, respo
 
     assert arm_send_actions(events) == []
     assert sum(event[:2] == ("leader", "get_action") for event in events) == 1
+
+
+def test_unified_session_enter_confirmation_is_visible_and_starts_sync(monkeypatch, capsys):
+    module = load_example_module("teleoperate_bi")
+    robot, leader, events = make_direct_sync_fakes(
+        monkeypatch,
+        module,
+        observation_poses=[FOLLOWER_POSE, FOLLOWER_POSE, FOLLOWER_POSE],
+        action_poses=[LEADER_POSE, LEADER_POSE, LEADER_POSE, LEADER_POSE],
+    )
+    clock = FakeClock(events)
+    FakeRobot.observation_clock = clock.monotonic
+
+    def press_enter(prompt):
+        output = capsys.readouterr().out
+        assert prompt == ""
+        assert "CONFIRMATION 2/3" in output
+        assert arm_send_actions(events) == []
+        return ""
+
+    module.run_startup_sync(
+        robot,
+        leader,
+        side="both",
+        requested_duration_s=0.2,
+        fps=5,
+        max_start_mismatch=10.0,
+        input_fn=press_enter,
+        monotonic=clock.monotonic,
+        sleep_fn=clock.sleep,
+        enter_confirmation=True,
+    )
+
+    assert arm_send_actions(events)
+
+
+@pytest.mark.parametrize("response", ["SYNC", "READY", " "])
+def test_unified_session_sync_refuses_nonempty_confirmation_before_arm_send(monkeypatch, response):
+    module = load_example_module("teleoperate_bi")
+    robot, leader, events = make_direct_sync_fakes(
+        monkeypatch,
+        module,
+        observation_poses=[FOLLOWER_POSE],
+        action_poses=[LEADER_POSE],
+    )
+    clock = FakeClock(events)
+    FakeRobot.observation_clock = clock.monotonic
+
+    with pytest.raises(module.SafetyRefusal, match="Enter only"):
+        module.run_startup_sync(
+            robot,
+            leader,
+            side="both",
+            requested_duration_s=0.2,
+            fps=5,
+            max_start_mismatch=10.0,
+            input_fn=lambda prompt: response,
+            monotonic=clock.monotonic,
+            sleep_fn=clock.sleep,
+            enter_confirmation=True,
+        )
+
+    assert arm_send_actions(events) == []
+
+
+def test_unified_session_sync_refuses_console_eof_before_arm_send(monkeypatch):
+    module = load_example_module("teleoperate_bi")
+    robot, leader, events = make_direct_sync_fakes(
+        monkeypatch,
+        module,
+        observation_poses=[FOLLOWER_POSE],
+        action_poses=[LEADER_POSE],
+    )
+    clock = FakeClock(events)
+    FakeRobot.observation_clock = clock.monotonic
+
+    def closed_console(prompt):
+        raise EOFError("console closed")
+
+    with pytest.raises(module.SafetyRefusal, match="console input closed"):
+        module.run_startup_sync(
+            robot,
+            leader,
+            side="both",
+            requested_duration_s=0.2,
+            fps=5,
+            max_start_mismatch=10.0,
+            input_fn=closed_console,
+            monotonic=clock.monotonic,
+            sleep_fn=clock.sleep,
+            enter_confirmation=True,
+        )
+
+    assert arm_send_actions(events) == []
 
 
 def test_sync_uses_post_confirmation_start_and_frozen_target_for_bounded_payloads(monkeypatch, capsys):
@@ -1450,6 +1558,64 @@ def test_sync_does_not_compress_frames_after_processing_overruns_period(monkeypa
     send_gaps = [current - previous for previous, current in zip(send_times, send_times[1:])]
     assert min(send_gaps) >= 1.0 / 5 - 1e-9
     assert 0.0 not in clock.sleeps
+
+
+def test_sync_reports_requested_planned_and_actual_motion_timing(monkeypatch, capsys):
+    module = load_example_module("teleoperate_bi")
+    robot, leader, events = make_direct_sync_fakes(
+        monkeypatch,
+        module,
+        observation_poses=[FOLLOWER_POSE, FOLLOWER_POSE, FOLLOWER_POSE],
+        action_poses=[LEADER_POSE, LEADER_POSE, LEADER_POSE, LEADER_POSE],
+    )
+    clock = FakeClock(events)
+
+    module.run_startup_sync(
+        robot,
+        leader,
+        side="both",
+        requested_duration_s=0.2,
+        fps=5,
+        max_start_mismatch=10.0,
+        input_fn=lambda _: "SYNC",
+        monotonic=clock.monotonic,
+        sleep_fn=clock.sleep,
+    )
+
+    timing = next(
+        json.loads(line)
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith('{"actual_duration_s"')
+    )
+    assert timing == {
+        "actual_duration_s": pytest.approx(0.2),
+        "event": "am1_startup_sync_timing",
+        "frame_count": 2,
+        "planned_duration_s": pytest.approx(0.2),
+        "requested_duration_s": pytest.approx(0.2),
+    }
+
+
+@pytest.mark.parametrize("target", [0.5, 100.0])
+def test_thirty_second_sync_plan_preserves_step_limit_for_small_and_full_range(target):
+    module = load_example_module("teleoperate_bi")
+    follower = dict(FOLLOWER_POSE)
+    leader = dict(LEADER_POSE)
+    follower["arm_left_shoulder_pan.pos"] = -100.0 if target == 100.0 else 0.0
+    leader["left_shoulder_pan.pos"] = target
+
+    plan = module.build_startup_sync_plan(
+        follower,
+        leader,
+        side="both",
+        requested_duration_s=30.0,
+        fps=10,
+    )
+
+    assert plan.total_steps == 300
+    assert plan.frame_count == 301
+    assert plan.estimated_actual_duration_s == pytest.approx(30.0)
+    assert plan.largest_planned_per_frame_change <= module.STARTUP_SYNC_MAX_STEP
 
 
 def test_sync_prints_final_measured_endpoints_before_first_arm_send(monkeypatch, capsys):
@@ -1959,9 +2125,17 @@ def test_am1_phase_messages_guard_start_paused_first_ordinary_send(monkeypatch):
         real_print(*values, **kwargs)
 
     monkeypatch.setattr("builtins.print", record_console_event)
-    args = sync_args(module, "--start_paused", "--duration_s", "0.2")
+    args = sync_args(module, "--start_paused", "--duration_s", "0.2", "--no_cameras")
+    args.unified_session_enter_confirmations = True
     clock = FakeClock(events)
-    responses = iter(("SYNC", ""))
+    FakeRobot.observation_clock = clock.monotonic
+    responses = iter(("", ""))
+
+    def fake_live_sender(robot, leader, **kwargs):
+        kwargs["announce_active"]()
+        robot.send_action({**FOLLOWER_POSE, **module.make_zero_action()})
+
+    monkeypatch.setattr(module, "run_am1_live_sender", fake_live_sender)
 
     status = module.run_teleoperation(
         args,
@@ -1972,8 +2146,9 @@ def test_am1_phase_messages_guard_start_paused_first_ordinary_send(monkeypatch):
 
     expected_phases = (
         "HOLD LEADERS STILL — STARTUP SYNCHRONIZATION IN PROGRESS",
+        "CONFIRMATION 2/3 — Hold both leaders still and press Enter only to begin the nominal 30-second arm synchronization.",
         "SYNCHRONIZATION COMPLETE",
-        "PRESS ENTER TO ENABLE LIVE TELEOPERATION",
+        "CONFIRMATION 3/3 — Keep both leaders still and press Enter only to recheck alignment and enable live teleoperation.",
         "TELEOPERATION ACTIVE — LEADER MOVEMENT IS NOW ALLOWED",
     )
     phase_events = [event[1] for event in events if event[0] == "console" and event[1] in expected_phases]
@@ -1986,7 +2161,9 @@ def test_am1_phase_messages_guard_start_paused_first_ordinary_send(monkeypatch):
         for index, event in enumerate(events)
         if event[:2] == ("robot", "send") and any(key.startswith("arm_") for key in event[2])
     ][2]
-    assert active_index + 1 == first_ordinary_index
+    assert active_index < first_ordinary_index
+    assert events[active_index + 1][0] == "console"
+    assert active_index + 2 == first_ordinary_index
 
 
 def test_post_sync_start_paused_refuses_moved_sample_before_ordinary_send(monkeypatch, capsys):

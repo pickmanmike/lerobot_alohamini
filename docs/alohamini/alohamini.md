@@ -1,5 +1,9 @@
 # AlohaMini — Full Workflow
 
+For the reviewed Aloha Mini 1 one-command supervised LAN camera-plus-Local
+workflow, bounded duration, automatic exact-log collection, and shutdown
+procedure, see [AM1 supervised unified Local session](unified-session.md).
+
 > **Prerequisites:** complete [install.md](install.md) first.  
 > **Hardware profiles:** see [profiles.md](profiles.md).
 

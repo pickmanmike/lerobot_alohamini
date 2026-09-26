@@ -63,6 +63,149 @@ def test_normal_am1_connect_homes_once_and_relieve_before_ordinary_activation(op
     assert not bus.is_connected
 
 
+def test_one_wrong_sign_relief_velocity_with_upward_encoder_does_not_abort(operating_robot, capsys):
+    robot, _ = operating_robot
+    bus = robot.left_bus
+    relief_samples = 0
+
+    def hook(register):
+        nonlocal relief_samples
+        if register == "Present_Velocity" and bus.registers[("Goal_Velocity", "lift_axis")] == -200:
+            relief_samples += 1
+            if relief_samples == 2:
+                bus.read_sequences[(register, "lift_axis")] = [50]
+
+    bus.hook = hook
+    robot.connect(calibrate=False)
+    records = operational_records(capsys)
+    motion = [record for record in records if record["phase"] == "relief"]
+    assert len(motion) >= 3
+    assert motion[1]["present_velocity_raw"] == 50
+    assert motion[1]["present_position_raw"] < motion[0]["present_position_raw"]
+    assert any(record["phase"] == "relief_direction_disagreement" for record in records)
+    assert any(record["phase"] == "operational_ready" for record in records)
+    assert not any(record.get("rejected") for record in records)
+    robot.disconnect()
+    assert bus.registers[("Goal_Velocity", "lift_axis")] == 0
+    assert bus.registers[("Torque_Enable", "lift_axis")] == 0
+    assert not bus.is_connected
+
+
+def test_repeated_wrong_sign_relief_velocity_refuses_after_two_fresh_samples(operating_robot, capsys):
+    robot, _ = operating_robot
+    bus = robot.left_bus
+    relief_samples = 0
+
+    def hook(register):
+        nonlocal relief_samples
+        if register == "Present_Velocity" and bus.registers[("Goal_Velocity", "lift_axis")] == -200:
+            relief_samples += 1
+            if relief_samples in (2, 3):
+                bus.read_sequences[(register, "lift_axis")] = [50]
+
+    bus.hook = hook
+    with pytest.raises(RuntimeError, match="AlohaMini motor activation failed") as failure:
+        robot.connect(calibrate=False)
+    assert "repeated velocity/position direction disagreement" in str(failure.value.__cause__)
+    records = operational_records(capsys)
+    wrong_sign = [
+        record for record in records
+        if record["phase"] == "relief" and record["present_velocity_raw"] == 50
+        and not record.get("rejected")
+    ]
+    assert len(wrong_sign) == 2
+    assert wrong_sign[1]["present_position_raw"] < wrong_sign[0]["present_position_raw"]
+    assert any(record.get("rejected") and record["phase"] == "relief" for record in records)
+    assert not any(record["phase"] == "operational_ready" for record in records)
+    assert bus.registers[("Goal_Velocity", "lift_axis")] == 0
+    assert bus.registers[("Torque_Enable", "lift_axis")] == 0
+    assert not bus.is_connected
+
+
+@pytest.mark.parametrize("reported_velocity", [0, -50])
+def test_downward_encoder_step_refuses_despite_nonpositive_velocity(operating_robot, capsys, reported_velocity):
+    robot, _ = operating_robot
+    bus = robot.left_bus
+    bus.up_factor = -1
+
+    def hook(register):
+        operation = getattr(robot, "_lift_operation", None)
+        if (register == "Present_Position" and operation is not None
+                and operation.reader.phase == "relief_setup"):
+            bus.bottom = 1200
+        if register == "Present_Velocity" and bus.registers[("Goal_Velocity", "lift_axis")] == -200:
+            bus.read_sequences[(register, "lift_axis")] = [reported_velocity]
+
+    bus.hook = hook
+    with pytest.raises(RuntimeError, match="AlohaMini motor activation failed") as failure:
+        robot.connect(calibrate=False)
+    assert "relief: unexpected downward direction" in str(failure.value.__cause__)
+    records = operational_records(capsys)
+    motion = [record for record in records if record["phase"] == "relief" and not record.get("rejected")]
+    assert len(motion) == 1
+    assert motion[0]["present_velocity_raw"] == reported_velocity
+    assert motion[0]["present_position_raw"] > 1100
+    assert not any(record["phase"] == "operational_ready" for record in records)
+    assert bus.registers[("Goal_Velocity", "lift_axis")] == 0
+    assert bus.registers[("Torque_Enable", "lift_axis")] == 0
+    assert not bus.is_connected
+
+
+def test_wrong_sign_velocity_without_upward_encoder_step_refuses_immediately(operating_robot, capsys):
+    robot, _ = operating_robot
+    bus = robot.left_bus
+    bus.up_factor = 0
+
+    def hook(register):
+        if register == "Present_Velocity" and bus.registers[("Goal_Velocity", "lift_axis")] == -200:
+            bus.read_sequences[(register, "lift_axis")] = [50]
+
+    bus.hook = hook
+    with pytest.raises(RuntimeError, match="AlohaMini motor activation failed") as failure:
+        robot.connect(calibrate=False)
+    assert "without fresh upward position progress" in str(failure.value.__cause__)
+    records = operational_records(capsys)
+    motion = [record for record in records if record["phase"] == "relief" and not record.get("rejected")]
+    assert len(motion) == 1
+    assert motion[0]["present_velocity_raw"] == 50
+    assert not any(record["phase"] == "operational_ready" for record in records)
+    assert bus.registers[("Goal_Velocity", "lift_axis")] == 0
+    assert bus.registers[("Torque_Enable", "lift_axis")] == 0
+    assert not bus.is_connected
+
+
+def test_first_relief_step_compares_with_fresh_setup_position(operating_robot, capsys):
+    robot, _ = operating_robot
+    bus = robot.left_bus
+    bus.up_factor = -0.05
+    shifted_setup_position = False
+
+    def hook(register):
+        nonlocal shifted_setup_position
+        operation = getattr(robot, "_lift_operation", None)
+        if (register == "Present_Position" and operation is not None
+                and operation.reader.phase == "relief_setup" and not shifted_setup_position):
+            bus.position -= 20
+            bus.registers[(register, "lift_axis")] = round(bus.position)
+            shifted_setup_position = True
+
+    bus.hook = hook
+    with pytest.raises(RuntimeError, match="AlohaMini motor activation failed") as failure:
+        robot.connect(calibrate=False)
+    assert "relief: unexpected downward direction" in str(failure.value.__cause__)
+    records = operational_records(capsys)
+    setup = [record for record in records if record["phase"] == "relief_setup"]
+    motion = [record for record in records if record["phase"] == "relief" and not record.get("rejected")]
+    assert setup[-1]["present_position_raw"] == 1080
+    assert len(motion) == 1
+    assert motion[0]["present_position_raw"] > setup[-1]["present_position_raw"]
+    assert motion[0]["present_position_raw"] < 1100
+    assert not any(record["phase"] == "operational_ready" for record in records)
+    assert bus.registers[("Goal_Velocity", "lift_axis")] == 0
+    assert bus.registers[("Torque_Enable", "lift_axis")] == 0
+    assert not bus.is_connected
+
+
 def wrap_fake_lift_encoder(bus):
     """Keep synthetic mechanical travel continuous but return real 12-bit positions."""
     def hook(register):

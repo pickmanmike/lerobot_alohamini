@@ -1130,6 +1130,19 @@ class AlohaMini(Robot):
         if failures:
             raise RuntimeError(f"Failed to stop all AlohaMini motion: {'; '.join(failures)}")
 
+    def hold_follower_arms(self) -> None:
+        """AM1 Local pause: replace old goals with measured raw arm positions."""
+        if self.config.robot_model != "alohamini1" or self.config.no_follower:
+            raise RuntimeError("AM1 Local arm hold requires connected AM1 follower arms")
+        failures = []
+        for bus, motors in ((self.left_bus, self.left_arm_motors), (self.right_bus, self.right_arm_motors)):
+            try:
+                self._seed_arm_goals(bus, motors)
+            except Exception as error:
+                failures.append(f"{motors[0].split('_')[1]} arm: {error}")
+        if failures:
+            raise RuntimeError(f"Failed to hold AM1 follower arms: {'; '.join(failures)}")
+
     def read_and_check_currents(self, limit_ma, print_currents):
         """Read left/right bus currents (mA), print them, and enforce overcurrent protection"""
         scale = 6.5  # sts3215 current unit conversion factor
