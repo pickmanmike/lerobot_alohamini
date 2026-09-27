@@ -275,6 +275,7 @@ class AlohaMiniClient(Robot):
                 # within the original total connection budget; do not recreate the host.
                 deadline = time.monotonic() + self.connect_timeout_s
                 handshake_message = None
+                handshake_token = None
                 self._connect_handshake_strict = True
                 try:
                     while handshake_message is None:
@@ -283,10 +284,18 @@ class AlohaMiniClient(Robot):
                         remaining_s = deadline - time.monotonic()
                         if remaining_s <= 0:
                             break
-                        handshake_message = self._request_observation(min(100, max(1, int(remaining_s * 1000))))
+                        if handshake_token is None:
+                            handshake_token = self._send_observation_request()
+                        if handshake_token is not None:
+                            # Keep this request alive across cancellable polls. Retiring
+                            # it every 100 ms would discard valid delayed replies.
+                            handshake_message = self._receive_observation_response(
+                                handshake_token, min(100, max(1, int(remaining_s * 1000)))
+                            )
                         if handshake_message is None:
                             time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
                 finally:
+                    self._observation_request_sent_at.pop(handshake_token, None)
                     self._connect_handshake_strict = False
             else:
                 handshake_message = self._request_observation(self.connect_timeout_s * 1000)
@@ -313,7 +322,13 @@ class AlohaMiniClient(Robot):
             ):
                 if resource is not None:
                     try:
-                        getattr(resource, method)()
+                        if method == "close":
+                            # A failed handshake can leave a queued DEALER request even
+                            # with the default send settings. Do not let it hold term()
+                            # forever. These are this connect call's own sockets only.
+                            resource.close(linger=0)
+                        else:
+                            resource.term()
                     except BaseException as cleanup_error:
                         primary.add_note(f"AlohaMiniClient connect cleanup {label} also failed: {cleanup_error!r}")
             raise

@@ -2401,7 +2401,8 @@ def test_client_applies_command_send_timeout_only_when_configured(timeout_ms):
         )
     )
     client._zmq = fake_zmq
-    client._request_observation = lambda timeout: [b"handshake"]
+    client._send_observation_request = lambda: b"handshake-token"
+    client._receive_observation_response = lambda token, timeout: [b"handshake"]
     client._fill_observation_request_window = lambda: None
 
     client.connect()
@@ -2426,10 +2427,13 @@ def test_connect_retries_temporary_observation_send_failure_and_closes_on_timeou
         def __init__(self, send_failures=0):
             super().__init__(send_failures=send_failures)
             self.closed = False
+            self.close_linger = None
 
         def setsockopt(self, *_): pass
         def connect(self, *_): pass
-        def close(self): self.closed = True
+        def close(self, linger=None):
+            self.close_linger = linger
+            self.closed = True
 
     class Context:
         def __init__(self, failures):
@@ -2487,6 +2491,7 @@ def test_connect_retries_temporary_observation_send_failure_and_closes_on_timeou
         failed.connect()
     assert not failed.is_connected
     assert all(socket.closed for socket in failed_context.sockets)
+    assert all(socket.close_linger == 0 for socket in failed_context.sockets)
     assert failed_context.terminated
 
     cancelled, cancelled_context = make_client(0, 0.5)

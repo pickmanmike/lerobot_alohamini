@@ -633,7 +633,9 @@ def test_local_session_uses_the_decoupled_sender_and_holds_body_zero_through_bot
         events.append("sync")
         return dict(FOLLOWER), dict(FOLLOWER), 1.0
 
-    def alignment_gate(robot, leader, max_start_mismatch, *, monotonic):
+    def alignment_gate(robot, leader, max_start_mismatch, *, monotonic, require_current_request, cancel_check):
+        assert require_current_request is False
+        assert cancel_check is None
         robot.observation_sequence = 2
         events.append("post_enter_gate")
         return dict(FOLLOWER), dict(FOLLOWER), 2.0
@@ -758,7 +760,9 @@ def test_local_terminal_stale_refuses_promptly_and_joins_sender_before_outer_cle
         robot.observation_sequence = 1
         return dict(FOLLOWER), dict(FOLLOWER), time.monotonic()
 
-    def alignment_gate(robot, leader, max_start_mismatch, *, monotonic):
+    def alignment_gate(robot, leader, max_start_mismatch, *, monotonic, require_current_request, cancel_check):
+        assert require_current_request is False
+        assert cancel_check is None
         robot.observation_sequence = 2
         return dict(FOLLOWER), dict(FOLLOWER), time.monotonic()
 
