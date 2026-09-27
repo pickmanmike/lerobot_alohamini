@@ -988,6 +988,13 @@ class AlohaMini(Robot):
             "right_wrist_final": final_arm_pos.get("arm_right_wrist_flex.pos"),
             "right_wrist_observed": right_wrist_observed,
         }
+        shoulder = "arm_right_shoulder_lift.pos"
+        if getattr(self.config, "robot_model", None) == "alohamini1" and shoulder in requested_arm_pos:
+            self.logs["action_diagnostics"]["right_shoulder"] = {
+                "requested": requested_arm_pos[shoulder], "final": final_arm_pos[shoulder],
+                # Broadcast sync-write completion is not a servo acknowledgement.
+                "sync_write_returned": True, "write_acknowledged": False,
+            }
 
         lift_sent = {k: v for k, v in action.items() if k.startswith("lift_axis.")}
         return {**left_pos, **right_pos, **base_goal_vel, **lift_sent}
@@ -1129,6 +1136,19 @@ class AlohaMini(Robot):
                 failures.append(str(error))
         if failures:
             raise RuntimeError(f"Failed to stop all AlohaMini motion: {'; '.join(failures)}")
+
+    def hold_follower_arms(self) -> None:
+        """AM1 Local pause: replace old goals with measured raw arm positions."""
+        if self.config.robot_model != "alohamini1" or self.config.no_follower:
+            raise RuntimeError("AM1 Local arm hold requires connected AM1 follower arms")
+        failures = []
+        for bus, motors in ((self.left_bus, self.left_arm_motors), (self.right_bus, self.right_arm_motors)):
+            try:
+                self._seed_arm_goals(bus, motors)
+            except Exception as error:
+                failures.append(f"{motors[0].split('_')[1]} arm: {error}")
+        if failures:
+            raise RuntimeError(f"Failed to hold AM1 follower arms: {'; '.join(failures)}")
 
     def read_and_check_currents(self, limit_ma, print_currents):
         """Read left/right bus currents (mA), print them, and enforce overcurrent protection"""

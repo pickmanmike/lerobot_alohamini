@@ -354,7 +354,7 @@ def read_connection(connection, role, authorization, store, stop):
         connection.request("GET", f"/api/stream.mjpeg?src={role}", headers={"Authorization": authorization})
         response = connection.getresponse()
         if response.status != 200:
-            raise ValueError("Camera backend unavailable")
+            raise ValueError(f"backend HTTP status {response.status}")
         for jpeg in iter_mjpeg(response, response.getheader("Content-Type", "")):
             if stop.is_set():
                 break
@@ -373,12 +373,23 @@ class CameraReader(threading.Thread):
         self.connection_factory = connection_factory
 
     def run(self):
+        reported_failures = set()
         while not self.stop.is_set():
             try:
                 connection = self.connection_factory("127.0.0.1", 1985, timeout=1)
                 read_connection(connection, self.role, self.authorization, self.store, self.stop)
-            except (OSError, ValueError, EOFError, http.client.HTTPException):
+            except (OSError, ValueError, EOFError, http.client.HTTPException) as exc:
                 self.store.disconnected()
+                reason = type(exc).__name__
+                if isinstance(exc, OSError):
+                    reason += f" errno={exc.errno}"
+                elif isinstance(exc, ValueError) and str(exc).startswith("backend HTTP status "):
+                    reason += f" {exc}"
+                # Backend startup can first produce ECONNREFUSED. Preserve a
+                # later distinct role failure, while bounding repeated output.
+                if reason not in reported_failures and len(reported_failures) < 3:
+                    print(f"CAMERA_ROLE_UNAVAILABLE role={self.role} cause={reason}", flush=True)
+                    reported_failures.add(reason)
             self.stop.wait(0.5)
 
 
@@ -457,11 +468,18 @@ def preflight(config, binary):
     if result.returncode != 1:
         raise ValueError("Motor host must be stopped (or host process check failed)")
     resolved = []
-    for path in config["cameras"].values():
-        device = Path(path).resolve(strict=True)
-        if not re.fullmatch(r"/dev/video[0-9]+", str(device)) or not stat.S_ISCHR(device.stat().st_mode):
+    for role, path in config["cameras"].items():
+        try:
+            device = Path(path).resolve(strict=True)
+            if not re.fullmatch(r"/dev/video[0-9]+", str(device)):
+                raise ValueError("Camera identity did not resolve to a V4L2 character device")
+            device_mode = device.stat().st_mode
+            capture_index = (Path("/sys/class/video4linux") / device.name / "index").read_text().strip()
+        except OSError as exc:
+            raise RuntimeError(f"camera role {role} identity unavailable (errno={exc.errno})") from exc
+        if not stat.S_ISCHR(device_mode):
             raise ValueError("Camera identity did not resolve to a V4L2 character device")
-        if (Path("/sys/class/video4linux") / device.name / "index").read_text().strip() != "0":
+        if capture_index != "0":
             raise ValueError("Camera identity is not a capture-index0 device")
         resolved.append(str(device))
     if len(set(resolved)) != len(resolved):
@@ -471,7 +489,10 @@ def preflight(config, binary):
     if result.returncode != 1:
         raise ValueError("Camera already owned (or device-owner check failed); stop the other owner first")
     with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 1985))  # Refuse a pre-existing backend; never kill it.
+        try:
+            probe.bind(("127.0.0.1", 1985))  # Refuse a pre-existing backend; never kill it.
+        except OSError as exc:
+            raise RuntimeError(f"camera backend port unavailable (errno={exc.errno})") from exc
 
 
 def run_viewer(config, credentials, binary, state_dir, duration=None, identify=False):
@@ -481,8 +502,11 @@ def run_viewer(config, credentials, binary, state_dir, duration=None, identify=F
     workers, server, child, backend_path = [], None, None, None
     primary_failure = False
     try:
-        server = make_server((config["bind"], config["port"]), stores, config["cameras"], credentials,
-                             config.get("rotations", {}))
+        try:
+            server = make_server((config["bind"], config["port"]), stores, config["cameras"], credentials,
+                                 config.get("rotations", {}))
+        except OSError as exc:
+            raise RuntimeError(f"camera viewer gateway unavailable (errno={exc.errno})") from exc
         server.timeout = 0.2
         password = secrets.token_urlsafe(32)
         fd, name = tempfile.mkstemp(prefix="backend-", suffix=".json", dir=state_dir)
@@ -490,8 +514,11 @@ def run_viewer(config, credentials, binary, state_dir, duration=None, identify=F
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             json.dump(backend_config(config, password), stream)
         # Isolate child from terminal Ctrl+C. No credentials on argv or in logs.
-        child = subprocess.Popen([str(binary), "-config", str(backend_path)], stdin=subprocess.DEVNULL,
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        try:
+            child = subprocess.Popen([str(binary), "-config", str(backend_path)], stdin=subprocess.DEVNULL,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError as exc:
+            raise RuntimeError(f"camera backend launch failed (errno={exc.errno})") from exc
         authorization = "Basic " + base64.b64encode(f"camera_backend:{password}".encode()).decode()
         for role in config["cameras"]:
             worker = CameraReader(role, authorization, stores[role], stop)
@@ -553,6 +580,7 @@ def main(argv=None):
     if not args.configure and (args.bind or args.camera):
         parser.error("--bind and --camera are only for --configure")
     try:
+        stage = "private-camera-map"
         if args.configure:
             pairs = [item.split("=", 1) for item in args.camera]
             if any(len(pair) != 2 for pair in pairs) or len({p[0] for p in pairs}) != len(pairs):
@@ -575,25 +603,33 @@ def main(argv=None):
             write_private(args.credentials, validate_credentials({"username": username, "password": password}))
             print("CAMERA_PRIVATE_AUTH_CREATED; password was not logged")
             return 0
+        stage = "private-camera-credentials"
         credentials = validate_credentials(load_private(args.credentials))
+        stage = "private-camera-state"
         args.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         info = args.state_dir.stat()
         if os.name != "posix" or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
             raise ValueError("Run on Pi with an owner-only mode-0700 camera state directory")
         import fcntl  # Pi-only; hardware-free help/check/import works on Windows.
+        stage = "camera-owner-lock"
         fd = os.open(args.state_dir / "viewer.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, "w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             previous = signal.signal(signal.SIGTERM, lambda signum, frame: (_ for _ in ()).throw(KeyboardInterrupt()))
             try:
+                stage = "camera-preflight-or-runtime"
                 return run_viewer(config, credentials, args.binary, args.state_dir, args.duration, identify=args.identify)
             finally:
                 signal.signal(signal.SIGTERM, previous)
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
         # Never print user values, response bodies, URLs or credentials from an exception.
-        print(f"CAMERA_REFUSAL {type(exc).__name__}: {exc}" if isinstance(exc, (ValueError, RuntimeError))
-              else f"CAMERA_REFUSAL {type(exc).__name__}: check private paths, permissions and owner/port availability",
-              file=sys.stderr)
+        if isinstance(exc, (ValueError, RuntimeError)):
+            detail = str(exc)
+        elif isinstance(exc, OSError):
+            detail = f"stage={stage} errno={exc.errno}"
+        else:
+            detail = f"stage={stage}"
+        print(f"CAMERA_REFUSAL {type(exc).__name__}: {detail}", file=sys.stderr)
         return 2
 
 

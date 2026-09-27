@@ -20,11 +20,17 @@ from .motor_safety import write_register
 
 class TemperatureWindow:
     SIZE = 5
+    SLOT_S = 0.1
     MAX_AGE_S = 0.5
     CEILING_C = 55
 
     def __init__(self) -> None:
+        # Each entry is the actual peak reading/time in one occupied 100 ms
+        # slot. Faster polling cannot create extra votes or erase a slot's high.
         self.samples: deque[tuple[float, int]] = deque(maxlen=self.SIZE)
+        self._origin_ns: int | None = None
+        self._last_slot: int | None = None
+        self._last_sample_at: float | None = None
         self.failure: feedback.ComparisonRefusal | None = None
         self.outliers = 0
 
@@ -41,13 +47,13 @@ class TemperatureWindow:
         if self.failure is not None:
             raise self.failure
         if not math.isfinite(now) or not self.ready:
-            self.refuse("temperature: five genuine fresh baseline samples are required.")
-        # Before the next read only, the oldest of the prior five is about to be
-        # replaced. Validate the new five in update(), before any command uses it.
-        # Otherwise a genuine 10 Hz stream could falsely expire its sixth tick.
-        oldest_required = self.samples[-1 if refreshing else 0][0]
-        if now < self.samples[-1][0] or now - oldest_required > self.MAX_AGE_S:
-            self.refuse("temperature: five-reading feedback window is stale (>0.5 s).")
+            self.refuse("temperature: five genuine fresh baseline time slots are required.")
+        # A fresh read may replace the oldest slot. Before reading, check the
+        # last RAW timestamp; update() then checks all retained peak timestamps
+        # before any action can use them. No stale history becomes a normal low.
+        oldest_required = self._last_sample_at if refreshing else self.samples[0][0]
+        if now < self._last_sample_at or now - oldest_required > self.MAX_AGE_S:
+            self.refuse("temperature: five-slot feedback window is stale (>0.5 s).")
 
     def update(self, value: int, now: float, *, cold_start: bool = False) -> dict[str, Any]:
         if self.failure is not None:
@@ -58,20 +64,34 @@ class TemperatureWindow:
             or not math.isfinite(now)
         ):
             self.refuse("temperature: invalid numeric feedback or timestamp.")
-        if self.samples and (now <= self.samples[-1][0] or now - self.samples[-1][0] > self.MAX_AGE_S):
+        if self._last_sample_at is not None and (
+            now <= self._last_sample_at or now - self._last_sample_at > self.MAX_AGE_S
+        ):
             self.refuse("temperature: repeated, backward or stale feedback timestamp.")
-        self.samples.append((now, int(value)))
+        # Integer nanoseconds avoid floating-point 0.1-boundary drift. The first
+        # real reading anchors slots for the whole process, never each phase.
+        sample_ns = round(now * 1_000_000_000)
+        if self._origin_ns is None:
+            self._origin_ns = sample_ns
+        slot = (sample_ns - self._origin_ns) // round(self.SLOT_S * 1_000_000_000)
+        if slot != self._last_slot:
+            self.samples.append((now, int(value)))
+            self._last_slot = slot
+        elif value > self.samples[-1][1]:
+            self.samples[-1] = (now, int(value))
+        self._last_sample_at = now
         if now - self.samples[0][0] > self.MAX_AGE_S:
-            self.refuse("temperature: five-reading feedback window is stale (>0.5 s).")
+            self.refuse("temperature: five-slot feedback window is stale (>0.5 s).")
+        if value >= self.CEILING_C:
+            self.outliers += 1  # Includes the actual refusal-causing raw reading.
         high = sum(temperature >= self.CEILING_C for _, temperature in self.samples)
         if self.ready and high >= 3:
-            self.refuse("temperature: majority (3/5) at or above 55 C; stop latched.")
+            self.refuse("temperature: majority (3/5 time slots) at or above 55 C; stop latched.")
         if self.ready and cold_start and sum(t > feedback.COOL_START_C for _, t in self.samples) >= 3:
             self.refuse("temperature: confirmed starting temperature exceeds 40 C.")
-        if value >= self.CEILING_C:
-            self.outliers += 1
         return {
             "count": len(self.samples), "high_count": high, "ready": self.ready,
+            "slot_s": self.SLOT_S, "aggregation": "maximum_per_occupied_slot",
             "span_s": round(now - self.samples[0][0], 6),
             "values_c": [t for _, t in self.samples], "numeric_outlier_count": self.outliers,
         }
@@ -103,11 +123,14 @@ class OperationalLift(InstalledLiftCheck):
         self._stationary: deque[dict[str, Any]] = deque()
         self._high_idle_current = 0
         self._last_idle_height: float | None = None
+        self._idle_qualified_at: float | None = None
+        self._idle_uncertain = False
+        self._idle_uncertain_band: tuple[int, int, int] | None = None
 
     def emit(self, record: dict[str, Any]) -> None:
         record = {key: value for key, value in record.items() if key != "comparison_profile"}
         print("[LIFT OPERATIONAL] " + json.dumps(
-            {**record, "policy": "am1-confirmed-temperature-relief-v1", "wall_time_ns": time.time_ns()},
+            {**record, "policy": "am1-confirmed-temperature-slots-relief-v2", "wall_time_ns": time.time_ns()},
             allow_nan=False, separators=(",", ":"),
         ), flush=True)
 
@@ -121,11 +144,13 @@ class OperationalLift(InstalledLiftCheck):
             )
         except feedback.ComparisonRefusal:
             record["temperature_history"] = list(self.temperature.samples)
+            record["temperature_slot_s"] = self.temperature.SLOT_S
+            record["numeric_outlier_count"] = self.temperature.outliers
             raise
         if record["temperature_c"] >= 55 and now - self._last_warning >= 1.0:
             self.monitor.record(
                 "temperature_warning", event="temperature_outlier",
-                message="Numeric high reading retained; fewer than 3/5 high. Monitoring continues.",
+                message="Numeric high reading retained in its 100 ms slot; confirmation not reached.",
                 numeric_outlier_count=self.temperature.outliers,
             )
             self._last_warning = now
@@ -140,17 +165,27 @@ class OperationalLift(InstalledLiftCheck):
             # All ordinary setup writes have finished. Final off follows zero/Lock/mode.
             write_register(self.bus, "Goal_Velocity", self.lift.cfg.name, 0)
             write_register(self.bus, "Torque_Enable", self.lift.cfg.name, 0)
-            self.monitor.qualify_stationary(
-                "baseline", expected_torque=0, expected_goal=0, cold_start=True,
+            # Extend only the existing torque-off baseline to span four 100 ms
+            # intervals at the unchanged 50 ms poll. Every slot must contain a
+            # genuine fresh reply. No sleeps/extra reads enter ordinary poll().
+            stationary_samples = self.monitor.min_stationary_samples
+            self.monitor.min_stationary_samples = 1 + math.ceil(
+                (self.temperature.SIZE - 1) * self.temperature.SLOT_S / feedback.POLL_S
             )
+            try:
+                self.monitor.qualify_stationary(
+                    "baseline", expected_torque=0, expected_goal=0, cold_start=True,
+                )
+            finally:
+                self.monitor.min_stationary_samples = stationary_samples
             self.temperature.assert_fresh(time.monotonic())
-            result, _ = self.home_and_relieve()
+            result, _ = self.home_and_relieve(allow_one_count_variation=True)
             self._goal_since = time.monotonic()
             self.poll()
             self.monitor.record(
                 "operational_ready", height_mm=self.height_mm,
                 zero_reference="process-local, original home zero retained",
-                temperature_policy="3/5 >=55 C, all five within 0.5 s",
+                temperature_policy="3/5 100 ms slot maxima >=55 C, all five readings within 0.5 s",
                 support="Keep carriage support and motor-power removal accessible before shutdown.",
             )
             return result
@@ -161,6 +196,19 @@ class OperationalLift(InstalledLiftCheck):
     def _check_idle(self, record: dict[str, Any]) -> None:
         """Incremental existing stationary evidence, without sleeping in the live loop."""
         now = record["sample_monotonic_s"]
+        qualified = self._idle_qualified_at is not None
+        if qualified:
+            self._check_idle_load(record)
+        if self._idle_uncertain:
+            # Neither a bad sample nor a partial candidate renews this deadline.
+            if now - self._idle_qualified_at >= feedback.SETTLE_TIMEOUT_S:
+                self.refuse(record, "live: lift failed stopped qualification within 1 s.")
+            origin, low, high = self._idle_uncertain_band
+            offset = feedback._position_delta(origin, int(record["present_position_raw"]))
+            low, high = min(low, offset), max(high, offset)
+            if high - low > feedback.STATIONARY_POSITION_TOLERANCE_RAW:
+                self.refuse(record, "live: lift displaced during stopped-feedback uncertainty.")
+            self._idle_uncertain_band = (origin, low, high)
         self._stationary.append(record)
         while len(self._stationary) > 1 and now - self._stationary[0]["sample_monotonic_s"] > 0.5:
             self._stationary.popleft()
@@ -168,20 +216,29 @@ class OperationalLift(InstalledLiftCheck):
         offsets = [feedback._position_delta(origin, int(r["present_position_raw"])) for r in self._stationary]
         recent = list(self._stationary)[-feedback.STATIONARY_PERSISTENT_SAMPLES:]
         velocities = [int(r["present_velocity_raw"]) for r in recent]
-        persistent = len(recent) >= feedback.STATIONARY_PERSISTENT_SAMPLES and (
+        persistent_velocity = len(recent) >= feedback.STATIONARY_PERSISTENT_SAMPLES and (
             all(v > feedback.STILL_VELOCITY_RAW for v in velocities)
             or all(v < -feedback.STILL_VELOCITY_RAW for v in velocities)
-            or all(r["moving"] == 1 and abs(r["present_velocity_raw"]) <= feedback.STILL_VELOCITY_RAW for r in recent)
         )
-        moving = (
+        persistent_moving = len(recent) >= feedback.STATIONARY_PERSISTENT_SAMPLES and all(
+            r["moving"] == 1 and abs(r["present_velocity_raw"]) <= feedback.STILL_VELOCITY_RAW for r in recent
+        )
+        motion_evidence = (
             abs(record["present_velocity_raw"]) > feedback.STATIONARY_REPORTED_VELOCITY_LIMIT_RAW
             or max(offsets) - min(offsets) > feedback.STATIONARY_POSITION_TOLERANCE_RAW
-            or persistent
+            or persistent_moving
         )
-        if moving:
+        if qualified and motion_evidence:
+            self.refuse(record, "live: unexpected stationary lift motion.")
+        if motion_evidence or persistent_velocity:
+            if qualified and not self._idle_uncertain:
+                # Only velocity-only ambiguity gets this bounded grace. Anchor the
+                # entire episode so resetting candidates cannot hide position drift.
+                self._idle_uncertain = True
+                self._idle_uncertain_band = (origin, min(offsets), max(offsets))
+                self.emit({**record, "phase": "idle_velocity_uncertain", "lift_goal_held_zero": True})
             self._stationary.clear()
-            self._high_idle_current = 0
-            if now - self._goal_since >= feedback.SETTLE_TIMEOUT_S:
+            if not qualified and now - self._goal_since >= feedback.SETTLE_TIMEOUT_S:
                 self.refuse(record, "live: lift failed stopped qualification within 1 s.")
             return
         complete = (
@@ -189,9 +246,19 @@ class OperationalLift(InstalledLiftCheck):
             and now - self._stationary[0]["sample_monotonic_s"] >= feedback.STATIONARY_WINDOW_S
         )
         if not complete:
-            if now - self._goal_since >= feedback.SETTLE_TIMEOUT_S:
+            if not qualified and now - self._goal_since >= feedback.SETTLE_TIMEOUT_S:
                 self.refuse(record, "live: no usable stopped window within 1 s.")
             return
+        if not qualified:
+            self._check_idle_load(record)
+        self._idle_qualified_at = now
+        if self._idle_uncertain:
+            self.emit({**record, "phase": "idle_requalified", "lift_goal_held_zero": True})
+            self._idle_uncertain = False
+            self._idle_uncertain_band = None
+
+    def _check_idle_load(self, record: dict[str, Any]) -> None:
+        # Current and displacement remain active even during velocity uncertainty.
         if self._last_idle_height is None:
             self._last_idle_height = self.height_mm
         if abs(self.height_mm - self._last_idle_height) > 0.5:
@@ -219,6 +286,9 @@ class OperationalLift(InstalledLiftCheck):
                 self._stationary.clear()
                 self._last_idle_height = None
                 self._high_idle_current = 0
+                self._idle_qualified_at = None
+                self._idle_uncertain = False
+                self._idle_uncertain_band = None
             if not math.isfinite(self.height_mm) or not -0.5 <= self.height_mm <= self.lift.cfg.soft_max_mm + 0.5:
                 self.refuse(record, "live: lift height exceeded travel bounds.")
             if record["moving"] not in (0, 1):
@@ -249,6 +319,11 @@ class OperationalLift(InstalledLiftCheck):
     def apply_action(self, action: dict[str, float]) -> None:
         self._require_latest()
         try:
+            if self._idle_uncertain and (
+                f"{self.lift.cfg.name}.height_mm" in action
+                or action.get(f"{self.lift.cfg.name}.vel", 0) != 0
+            ):
+                self.refuse(self.last_record, "live: new lift motion refused while stopped feedback is uncertain.")
             self.lift.apply_action(action, height_mm=self.height_mm)
         except BaseException as error:
             self.failure = error

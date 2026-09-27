@@ -216,6 +216,84 @@ class FakeClock:
         return self.now
 
 
+def test_am1_shoulder_trace_pairs_transmitted_goal_with_owner_readback(capsys):
+    robot = make_action_robot()
+    robot.config.robot_model = "alohamini1"
+    shoulder = "arm_right_shoulder_lift"
+    robot.right_bus = ActionBus({shoulder: 55.4061045})
+    robot.right_arm_motors = [shoulder]
+    robot.send_action({f"{shoulder}.pos": 41.879637, "x.vel": 0, "y.vel": 0,
+                       "theta.vel": 0, "lift_axis.vel": 0})
+    reads = []
+
+    def read(register, motor, *, num_retry):
+        reads.append((register, motor, num_retry))
+        return 41.88
+
+    robot.right_bus.read = read
+    command = alohamini_host.HostCommandState(watchdog_timeout_ms=1000, diagnostics_enabled=True)
+    command.record_command(robot.logs["action_diagnostics"], received_wall_time_ns=123)
+    alohamini_host.print_startup_shoulder_report(robot, command, {f"{shoulder}.pos": 55.4061045})
+    record = json.loads(capsys.readouterr().out.split("] ", 1)[1])
+    assert reads == [("Goal_Position", shoulder, 0)]
+    assert record["requested"] == record["final"] == 41.879637
+    assert record["goal_position_readback"] == 41.88
+    assert record["observed_position"] == 55.4061045
+    assert record["sync_write_returned"] is True and record["write_acknowledged"] is False
+    assert record["command_sequence"] == 1 and record["command_received_wall_time_ns"] == 123
+
+
+@pytest.mark.parametrize("model", ["alohamini2", "alohamini2pro"])
+def test_shoulder_trace_performs_no_read_for_other_models(model, capsys):
+    robot = SimpleNamespace(config=SimpleNamespace(robot_model=model))
+    state = alohamini_host.HostCommandState(watchdog_timeout_ms=1000, diagnostics_enabled=True)
+    alohamini_host.print_startup_shoulder_report(robot, state, {})
+    assert capsys.readouterr().out == ""
+
+
+def test_shoulder_trace_fault_preserves_exception_and_never_claims_readback(capsys):
+    failure = RuntimeError("servo status fault")
+    def read(*args, **kwargs):
+        raise failure
+    robot = SimpleNamespace(
+        config=SimpleNamespace(robot_model="alohamini1"),
+        right_bus=SimpleNamespace(read=read),
+    )
+    state = alohamini_host.HostCommandState(watchdog_timeout_ms=1000, diagnostics_enabled=True)
+    state.record_command({"right_shoulder": {"requested": 42.0, "final": 42.0,
+                          "sync_write_returned": True, "write_acknowledged": False}})
+    with pytest.raises(RuntimeError) as caught:
+        alohamini_host.print_startup_shoulder_report(robot, state, {})
+    assert caught.value is failure
+    record = json.loads(capsys.readouterr().out.split("] ", 1)[1])
+    assert "servo status fault" in record["readback_error"]
+    assert record["goal_position_readback"] is None
+
+
+def test_shoulder_trace_reporting_failure_cannot_replace_primary_read_failure(monkeypatch):
+    failure = RuntimeError("original read failure")
+    def read(*args, **kwargs):
+        raise failure
+    def fail_print(*args, **kwargs):
+        raise OSError("log sink failed")
+    robot = SimpleNamespace(config=SimpleNamespace(robot_model="alohamini1"),
+                            right_bus=SimpleNamespace(read=read))
+    state = alohamini_host.HostCommandState(watchdog_timeout_ms=1000, diagnostics_enabled=True)
+    state.record_command({"right_shoulder": {"requested": 42.0, "final": 42.0}})
+    monkeypatch.setattr("builtins.print", fail_print)
+    with pytest.raises(RuntimeError) as caught:
+        alohamini_host.print_startup_shoulder_report(robot, state, {})
+    assert caught.value is failure
+    assert any("log sink failed" in note for note in failure.__notes__)
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_shoulder_trace_without_enabled_command_evidence_does_no_bus_io(enabled):
+    robot = SimpleNamespace(config=SimpleNamespace(robot_model="alohamini1"))
+    state = alohamini_host.HostCommandState(watchdog_timeout_ms=1000, diagnostics_enabled=enabled)
+    alohamini_host.print_startup_shoulder_report(robot, state, {})
+
+
 def test_host_command_gap_uses_receive_timestamp_before_action_processing():
     clock = FakeClock(10.0)
     state = alohamini_host.HostCommandState(
@@ -483,6 +561,60 @@ def test_main_emits_a_final_host_cadence_snapshot_before_cleanup(monkeypatch, ca
     ]
     assert len(cadence_lines) == 1
     assert cleanup_events == [("robot_disconnect", False), "host_disconnect"]
+
+
+@pytest.mark.parametrize("opt_in,state,profile,expected_reads", [
+    (False, "ready", True, 0), (True, "ready", True, 1),
+    (True, "active", True, 0), (True, "paused", True, 0), (True, "ready", False, 0),
+])
+def test_main_shoulder_readback_requires_unified_startup_opt_in(monkeypatch, opt_in, state, profile, expected_reads):
+    args = make_parser().parse_args(["--robot_model", "alohamini1", "--no_cameras", "--skip_lift_home"])
+    args.profile_cadence, args.profile_timing = profile, False
+    if opt_in:
+        monkeypatch.setenv("AM1_SYNC_SHOULDER_READBACK", "1")
+    else:
+        monkeypatch.delenv("AM1_SYNC_SHOULDER_READBACK", raising=False)
+    clock = SimpleNamespace(now=0.0)
+    reads = []
+    command = {"arm_right_shoulder_lift.pos": 42.0}
+    if state != "ready":
+        command[alohamini_host.AM1_LOCAL_CONTROL_KEY] = {
+            "version": 1, "mode": "active" if state == "active" else "pause",
+            "epoch": 0 if state == "active" else 1,
+        }
+
+    class Socket:
+        def recv_string(self, flags): return json.dumps(command)
+        def recv_multipart(self, flags): raise alohamini_host.zmq.Again()
+
+    class Robot:
+        def __init__(self, config):
+            self.config, self.is_connected, self.cameras = config, True, {}
+            self.logs = {"action_diagnostics": {"right_shoulder": {"requested": 42.0, "final": 42.0}}}
+            self.right_bus = SimpleNamespace(read=lambda *args, **kwargs: reads.append(args) or 42.0)
+        def send_action(self, action): pass
+        def stop_motion(self): pass
+        def hold_follower_arms(self): pass
+        def get_observation(self):
+            clock.now = 1.1
+            return {"arm_right_shoulder_lift.pos": 55.0}
+        def disconnect(self, **kwargs): self.is_connected = False
+
+    class Host:
+        watchdog_timeout_ms, connection_time_s, max_loop_freq_hz = 1000, 0.5, 30
+        def __init__(self, config): self.zmq_cmd_socket = self.zmq_observation_socket = Socket()
+        def disconnect(self): pass
+
+    monkeypatch.setattr(alohamini_host, "time", SimpleNamespace(
+        monotonic=lambda: clock.now, perf_counter=lambda: clock.now,
+        time_ns=lambda: int(clock.now * 1e9), sleep=lambda _: None,
+    ))
+    monkeypatch.setattr(alohamini_host, "make_parser", lambda: SimpleNamespace(parse_args=lambda: args))
+    monkeypatch.setattr(alohamini_host, "AlohaMini", Robot)
+    monkeypatch.setattr(alohamini_host, "AlohaMiniHost", Host)
+    monkeypatch.setattr(alohamini_host, "connect_robot", lambda *args, **kwargs: None)
+    alohamini_host.main()
+    assert len(reads) == expected_reads
 
 
 def test_main_marks_keyboard_interrupt_cleanup_as_interrupted(monkeypatch):

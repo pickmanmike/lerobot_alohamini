@@ -18,6 +18,7 @@ import argparse
 import json
 import logging
 import math
+import os
 import time
 from collections.abc import Callable
 
@@ -26,6 +27,96 @@ import zmq
 
 from .alohamini import AlohaMini
 from .config_alohamini import AlohaMiniConfig, AlohaMiniHostConfig
+
+AM1_LOCAL_CONTROL_KEY = "_am1_local_control"
+AM1_LOCAL_FEEDBACK_KEY = "_am1_local_feedback"
+
+
+class AM1LocalControl:
+    """AM1-only host-side pause latch on the existing motor-owner thread."""
+
+    def __init__(self) -> None:
+        self.state = "ready"
+        self.epoch = -1
+        self.observation_id = 0
+
+    def annotate(self, observation: dict) -> None:
+        self.observation_id += 1
+        observation[AM1_LOCAL_FEEDBACK_KEY] = {
+            "version": 1, "state": self.state, "epoch": self.epoch,
+            "observation_id": self.observation_id,
+        }
+
+    def watchdog_stop(self, robot: AlohaMini) -> None:
+        robot.stop_motion()
+        if self.state == "active":
+            robot.hold_follower_arms()
+            self.state = "paused"
+            logging.warning("AM1 Local watchdog held follower arms at measured positions; epoch=%s", self.epoch)
+
+    def apply(self, robot: AlohaMini, command: dict) -> bool:
+        marker = command.get(AM1_LOCAL_CONTROL_KEY)
+        if marker is None:
+            if self.state != "ready":
+                zero_keys = {"x.vel", "y.vel", "theta.vel", "lift_axis.vel"}
+                if set(command) != zero_keys or any(
+                    type(value) not in (int, float) or float(value) != 0.0
+                    for value in command.values()
+                ):
+                    raise RuntimeError("AM1 Local control marker missing after session activation")
+                # The outer client cleanup uses its existing body-zero command after
+                # the live sender has closed. This is the only unmarked command that
+                # can be accepted: stop and hold, then reject any queued old action.
+                robot.stop_motion()
+                if self.state == "active":
+                    robot.hold_follower_arms()
+                self.state = "stopped"
+                return True
+            robot.send_action(command)
+            return True
+        if (
+            not isinstance(marker, dict)
+            or set(marker) != {"version", "mode", "epoch"}
+            or marker.get("version") != 1
+            or type(marker.get("epoch")) is not int
+            or marker["epoch"] < 0
+            or marker.get("mode") not in {"active", "pause"}
+        ):
+            raise RuntimeError("Invalid AM1 Local control marker")
+        if self.state == "stopped":
+            return False
+        mode, epoch = marker["mode"], marker["epoch"]
+        if epoch < self.epoch:
+            return False
+        if mode == "pause":
+            if epoch == self.epoch and self.state == "paused":
+                return True
+            expected = (
+                1 if self.state == "ready"
+                else self.epoch + (2 if self.state == "paused" and self.epoch % 2 == 1 else 1)
+            )
+            if epoch != expected or epoch % 2 != 1:
+                raise RuntimeError("AM1 Local pause epoch is out of order")
+            robot.stop_motion()
+            robot.hold_follower_arms()
+            self.state, self.epoch = "paused", epoch
+            logging.warning("AM1 Local PAUSED: measured-position hold acknowledged; epoch=%s", epoch)
+            return True
+        if epoch == self.epoch and self.state == "paused":
+            return False
+        starting = self.state == "ready" and epoch == 0
+        resuming = self.state == "paused" and epoch == self.epoch + 1 and epoch % 2 == 0
+        continuing = self.state == "active" and epoch == self.epoch
+        if not (starting or resuming or continuing):
+            raise RuntimeError("AM1 Local active epoch requires the acknowledged pause sequence")
+        action = {key: value for key, value in command.items() if key != AM1_LOCAL_CONTROL_KEY}
+        if resuming and any(float(action.get(key, 0)) != 0 for key in ("x.vel", "y.vel", "theta.vel", "lift_axis.vel")):
+            raise RuntimeError("AM1 Local first resumed action must have zero body velocity")
+        robot.send_action(action)
+        self.state, self.epoch = "active", epoch
+        if resuming:
+            logging.info("AM1 Local RECOVERED: first bounded action applied; epoch=%s", epoch)
+        return True
 
 
 class AlohaMiniHost:
@@ -81,6 +172,7 @@ class HostCommandState:
         self._watchdog_events = 0
         self._last_watchdog_event_wall_time_ns: int | None = None
         self._last_action_diagnostics: dict[str, object] = {}
+        self._last_receive_wall_time_ns: int | None = None
 
     def capture_wall_time_ns(self) -> int | None:
         """Capture a shared log timestamp without adding work when diagnostics are off."""
@@ -109,6 +201,7 @@ class HostCommandState:
                     self._last_receive_gap_over_watchdog_ms = gap_ms
                     self._last_receive_gap_over_watchdog_wall_time_ns = received_wall_time_ns
             self._last_action_diagnostics = dict(action_diagnostics)
+            self._last_receive_wall_time_ns = received_wall_time_ns
         self._previous_receive_s = receive_time
         # Preserve the established watchdog lifecycle: a successfully applied action
         # resets its age at completion, while diagnostics measure socket receive gaps.
@@ -129,7 +222,7 @@ class HostCommandState:
     def snapshot(self) -> dict[str, object] | None:
         if not self.diagnostics_enabled:
             return None
-        return {
+        report = {
             "wall_time_ns": self._wall_clock_ns(),
             "command_sequence": self._command_sequence,
             "last_receive_gap_ms": self._last_receive_gap_ms,
@@ -153,6 +246,12 @@ class HostCommandState:
                 self._last_action_diagnostics.get("right_wrist_observed")
             ),
         }
+        if "right_shoulder" in self._last_action_diagnostics:
+            report["right_shoulder"] = {
+                **_jsonable(self._last_action_diagnostics["right_shoulder"]),
+                "command_received_wall_time_ns": self._last_receive_wall_time_ns,
+            }
+        return report
 
     def format_report(self) -> str | None:
         snapshot = self.snapshot()
@@ -165,6 +264,39 @@ def print_cadence_report(command_state: HostCommandState) -> None:
     report = command_state.format_report()
     if report is not None:
         print(report, flush=True)
+
+
+def print_startup_shoulder_report(
+    robot: AlohaMini, command_state: HostCommandState, observation: dict,
+) -> None:
+    """One optional readback on the existing owner, never a second bus or writer."""
+    if robot.config.robot_model != "alohamini1":
+        return
+    snapshot = command_state.snapshot()
+    if snapshot is None or "right_shoulder" not in snapshot:
+        return
+    record = {
+        **snapshot["right_shoulder"], "command_sequence": snapshot["command_sequence"],
+        "wall_time_ns": time.time_ns(), "read_started_at": time.monotonic(),
+        "observed_position": observation.get("arm_right_shoulder_lift.pos"),
+        "goal_position_readback": None,
+    }
+    def emit() -> None:
+        record["read_completed_at"] = time.monotonic()
+        print(f"[AM1 SYNC SHOULDER] {json.dumps(_jsonable(record), separators=(',', ':'))}", flush=True)
+
+    try:
+        record["goal_position_readback"] = robot.right_bus.read(
+            "Goal_Position", "arm_right_shoulder_lift", num_retry=0,
+        )
+    except BaseException as error:
+        record["readback_error"] = f"{type(error).__name__}: {error}"
+        try:
+            emit()
+        except BaseException as report_error:
+            error.add_note(f"shoulder readback reporting also failed: {report_error}")
+        raise  # Preserve a genuine communication/servo failure and its identity.
+    emit()
 
 
 def _jsonable(value):
@@ -410,6 +542,14 @@ def main():
         watchdog_timeout_ms=host.watchdog_timeout_ms,
         diagnostics_enabled=args.profile_cadence,
     )
+    local_control = (
+        AM1LocalControl()
+        if args.robot_model == "alohamini1" and not args.no_follower
+        else None
+    )
+    # Only the unified supervisor opts in. Direct Arms/Local commands remain
+    # unmarked and can stay "ready" during live use; state alone is insufficient.
+    sync_shoulder_readback = os.environ.get("AM1_SYNC_SHOULDER_READBACK") == "1"
     logging.info("Waiting for commands...")
 
     try:
@@ -427,6 +567,7 @@ def main():
         while duration < host.connection_time_s:
             loop_start_t = time.perf_counter()
             command_received = False
+            data = None
             # One grouped lift transaction on the existing owning thread before
             # any ordinary action. No confirmation wait, worker, or second socket.
             lift_operation = getattr(robot, "_lift_operation", None)
@@ -438,13 +579,17 @@ def main():
                 command_received_wall_time_ns = command_state.capture_wall_time_ns()
                 data = dict(json.loads(msg))
                 #print(f"Received action: {data}")   # debug 
-                _action_sent = robot.send_action(data)
-                command_received = True
-                command_state.record_command(
-                    robot.logs.get("action_diagnostics", {}),
-                    received_at=command_received_t,
-                    received_wall_time_ns=command_received_wall_time_ns,
-                )
+                if local_control is not None:
+                    command_received = local_control.apply(robot, data)
+                else:
+                    robot.send_action(data)
+                    command_received = True
+                if command_received:
+                    command_state.record_command(
+                        robot.logs.get("action_diagnostics", {}),
+                        received_at=command_received_t,
+                        received_wall_time_ns=command_received_wall_time_ns,
+                    )
             except zmq.Again:
                 pass
             except Exception as e:
@@ -452,6 +597,11 @@ def main():
                     # Do not let the legacy malformed-command handler swallow a
                     # latched lift fault (including an unsuccessful motor write).
                     lift_operation.raise_if_faulted()
+                if local_control is not None and (
+                    local_control.state != "ready"
+                    or (isinstance(data, dict) and AM1_LOCAL_CONTROL_KEY in data)
+                ):
+                    raise
                 logging.exception("Message fetching failed: %s", e)
             command_done_t = time.perf_counter()
 
@@ -459,10 +609,15 @@ def main():
                 logging.warning(
                     f"Command not received for more than {host.watchdog_timeout_ms} milliseconds. Stopping robot motion."
                 )
-                robot.stop_motion()
+                if local_control is not None:
+                    local_control.watchdog_stop(robot)
+                else:
+                    robot.stop_motion()
 
             
             last_observation = robot.get_observation()
+            if local_control is not None:
+                local_control.annotate(last_observation)
             observation_done_t = time.perf_counter()
 
             # Consume at most one request credit per Host loop. Draining all pending
@@ -574,6 +729,8 @@ def main():
             cadence_now = time.monotonic()
             if args.profile_cadence and cadence_now - cadence_report_start_t >= 1.0:
                 print_cadence_report(command_state)
+                if sync_shoulder_readback and local_control is not None and local_control.state == "ready":
+                    print_startup_shoulder_report(robot, command_state, last_observation)
                 cadence_report_start_t = cadence_now
 
             duration = time.perf_counter() - start

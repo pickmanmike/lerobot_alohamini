@@ -1,5 +1,10 @@
 # AM1 supervised LAN camera viewing and Local co-use
 
+For the optional single-command camera-plus-Local lifecycle added after this
+milestone, see [AM1 supervised unified Local session](unified-session.md). The
+underlying camera security model, accepted evidence, and known browser-gap
+limitation documented here remain unchanged.
+
 CAMERA-VIEW1 starts from `integrate/am1-local-teleop` at
 `e7d9253fd309c60d4821e7a1bdb0a2087f5bc9be`. The accepted arms, base, lift,
 Local-motion, idle and shutdown milestones remain closed. Camera-plus-Local
@@ -106,16 +111,17 @@ recovery with all other feeds uninterrupted.
 After the September 20 reconnect checks, the operator corrected the wrist
 identities: the view previously labeled left wrist is physically right, and
 the view previously labeled right wrist is physically left. This mapping
-**supersedes the wrist labels deployed at80986427**. Display rotations stay
-with the physical cameras; only their semantic role assignments swap:
+**supersedes the wrist labels deployed at80986427**. The later supervised-session
+display update retains those identities and applies the requested additional
+180-degree browser rotation to each wrist image:
 
 | Numbered source | Semantic role | Browser image rotation |
 |---|---|---|
 | Camera1 | forward (front) | 180 degrees |
 | Camera2 | chest | 180 degrees |
-| Camera3 | wrist_right (right hand) | 90 degrees clockwise |
+| Camera3 | wrist_right (right hand) | 270 degrees clockwise |
 | Camera4 | backward (rear) | 180 degrees |
-| Camera5 | wrist_left (left hand) | 90 degrees counterclockwise |
+| Camera5 | wrist_left (left hand) | 90 degrees clockwise |
 
 Exact USB paths, household images and private maps remain outside Git.
 All share `SN0001`; use measured `ID_PATH` plus capture index 0, not that serial
@@ -123,7 +129,8 @@ or unstable `/dev/videoN` numbering. Metadata index 1 is not a capture device.
 
 Both private maps retain those measured paths; the normal map now contains all
 five semantic roles. Optional `rotations` stores clockwise integer degrees
-0/90/180/270 for configured roles only (omitted means0). Thus left wrist uses270.
+0/90/180/270 for configured roles only (omitted means0). The reviewed current
+targets are `wrist_left=90` and `wrist_right=270`.
 The browser applies rotation to **images only**, in primary and thumbnail views;
 labels stay upright, quarter turns fit without cropping. Native640×480 JPEGs,
 snapshot API data, capture settings and go2rtc configuration are unchanged.
@@ -244,7 +251,7 @@ back up a prior private map locally rather than silently replacing it.
 paths must resolve to distinct index0 V4L2 character devices, owners and motor
 host must be absent, and the backend binary hash must match the pin.
 For display-only orientation, add the optional `rotations` object to the private
-map after backup, e.g. `"rotations": {"wrist_left": 270, "wrist_right": 90}` when
+map after backup, e.g. `"rotations": {"wrist_left": 90, "wrist_right": 270}` when
 both roles are configured. Values are clockwise degrees, not camera controls.
 
 ## Historical Forward failure — recovered, exact cause unresolved

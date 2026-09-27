@@ -164,6 +164,7 @@ wandb/
 
 # Machine-local Aloha Mini launch settings (copy from the tracked example).
 /config/am1.local.json
+/config/am1.session.json
 
 # Data folders
 data/

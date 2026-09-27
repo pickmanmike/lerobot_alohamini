@@ -62,12 +62,15 @@ def run_powershell(body: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def command_payload(mode: str) -> dict:
+def command_payload(mode: str, *, local_duration_seconds: int | None = None) -> dict:
+    duration_argument = (
+        "" if local_duration_seconds is None else f" -LocalDurationSeconds {local_duration_seconds}"
+    )
     body = f"""
 . {ps_literal(WINDOWS_HELPER)}
 $config = Get-Content -LiteralPath {ps_literal(EXAMPLE_CONFIG)} -Raw | ConvertFrom-Json
 $command = New-Am1WindowsCommand -Mode {mode} -Config $config `
-    -RepositoryRoot {ps_literal(REPO_ROOT)} -LeftPort 'COM8' -RightPort 'COM7'
+    -RepositoryRoot {ps_literal(REPO_ROOT)} -LeftPort 'COM8' -RightPort 'COM7'{duration_argument}
 $command | ConvertTo-Json -Depth 6 -Compress
 """
     result = run_powershell(body)
@@ -132,7 +135,7 @@ def test_windows_local_command_combines_validated_arms_with_bounded_keyboard_bod
     arguments = payload["arguments"]
     assert arguments[arguments.index("--teleop.left_port") + 1] == "COM8"
     assert arguments[arguments.index("--teleop.right_port") + 1] == "COM7"
-    assert arguments[arguments.index("--startup_sync_duration_s") + 1] == "120"
+    assert arguments[arguments.index("--startup_sync_duration_s") + 1] == "30"
     assert arguments[arguments.index("--max_start_mismatch") + 1] == "10"
     assert arguments[arguments.index("--fps") + 1] == "10"
     assert arguments[arguments.index("--duration_s") + 1] == "30"
@@ -140,6 +143,34 @@ def test_windows_local_command_combines_validated_arms_with_bounded_keyboard_bod
     assert "--no_keyboard" not in arguments
     assert "--no_cameras" in arguments
     assert "--profile_cadence" in arguments
+
+
+@pytest.mark.parametrize("duration", [1, 60, 120, 1800])
+@requires_powershell
+def test_windows_local_command_propagates_explicit_whole_second_duration(duration):
+    payload = command_payload("Local", local_duration_seconds=duration)
+
+    arguments = payload["arguments"]
+    assert arguments[arguments.index("--duration_s") + 1] == str(duration)
+    assert arguments[arguments.index("--startup_sync_duration_s") + 1] == "30"
+
+
+@requires_powershell
+def test_windows_local_command_passes_session_unique_cooperative_stop_file():
+    stop_path = REPO_ROOT / "ignored-session-stop-request"
+    body = f"""
+. {ps_literal(WINDOWS_HELPER)}
+$config = Get-Content -LiteralPath {ps_literal(EXAMPLE_CONFIG)} -Raw | ConvertFrom-Json
+$command = New-Am1WindowsCommand -Mode Local -Config $config `
+    -RepositoryRoot {ps_literal(REPO_ROOT)} -LeftPort 'COM8' -RightPort 'COM7' `
+    -LocalDurationSeconds 60 -StopRequestPath {ps_literal(stop_path)}
+$command | ConvertTo-Json -Depth 6 -Compress
+"""
+    result = run_powershell(body)
+
+    assert result.returncode == 0, result.stderr
+    arguments = json.loads(result.stdout.strip().splitlines()[-1])["arguments"]
+    assert arguments[arguments.index("--external_stop_file") + 1] == str(stop_path)
 
 
 @requires_powershell
@@ -192,6 +223,32 @@ catch {{
 
     assert result.returncode == 0, result.stderr
     assert "must retain the validated AM1" in result.stdout
+
+
+@requires_powershell
+def test_windows_local_rejects_changed_local_sync_but_arms_does_not_depend_on_the_new_key():
+    body = f"""
+. {ps_literal(WINDOWS_HELPER)}
+$config = Get-Content -LiteralPath {ps_literal(EXAMPLE_CONFIG)} -Raw | ConvertFrom-Json
+$config.arm_settings.local_startup_sync_duration_s = 31
+try {{
+    $null = New-Am1WindowsCommand -Mode Local -Config $config `
+        -RepositoryRoot {ps_literal(REPO_ROOT)} -LeftPort 'COM8' -RightPort 'COM7'
+    [Console]::Error.WriteLine('UNSAFE_LOCAL_CONFIG_ACCEPTED')
+    exit 9
+}}
+catch {{
+    [Console]::Out.WriteLine($_.Exception.Message)
+}}
+$config.arm_settings.psobject.Properties.Remove('local_startup_sync_duration_s')
+$null = New-Am1WindowsCommand -Mode Arms -Config $config `
+    -RepositoryRoot {ps_literal(REPO_ROOT)} -LeftPort 'COM8' -RightPort 'COM7'
+"""
+    result = run_powershell(body)
+
+    assert result.returncode == 0, result.stderr
+    assert "must retain the validated AM1" in result.stdout
+    assert "UNSAFE_LOCAL_CONFIG_ACCEPTED" not in result.stderr
 
 
 @requires_powershell
@@ -432,6 +489,7 @@ def test_local_config_example_is_valid_and_real_config_is_ignored():
         "client_fps": 10,
         "client_duration_s": 45,
         "startup_sync_duration_s": 120,
+        "local_startup_sync_duration_s": 30,
         "max_start_mismatch": 10,
         "host_max_relative_target": 20,
     }

@@ -681,10 +681,7 @@ class InstalledLiftCheck:
         return record, height
 
     def _check_raised(self, phase: str, record: dict[str, Any], height: float) -> None:
-        if height < -0.5 or (
-            self.bus.expected_goal < 0
-            and int(record["present_velocity_raw"]) > STILL_VELOCITY_RAW
-        ):
+        if height < -0.5:
             self.refuse(record, f"{phase}: unexpected downward direction.")
         if height > MAX_RELIEF_MM:
             self.refuse(record, f"{phase}: travel exceeded {MAX_RELIEF_MM} mm.")
@@ -718,7 +715,7 @@ class InstalledLiftCheck:
         _, rest_height = self.home_and_relieve()
         self.observe_raised_rest(rest_height)
 
-    def home_and_relieve(self) -> tuple[Any, float]:
+    def home_and_relieve(self, *, allow_one_count_variation: bool = False) -> tuple[Any, float]:
         """The same bounded mechanics for the opt-in comparison and normal AM1 startup."""
         self.reader.set_phase("setup_position")
         result = self.lift.home(safety_check=self.home_guard, read_raw=self.reader)
@@ -745,6 +742,15 @@ class InstalledLiftCheck:
         self.reader.set_phase("relief_setup")
         self.lift.apply_action({"lift_axis.vel": 200}, read_raw=self.reader)
         started = time.monotonic()
+        # apply_action already advanced the sole encoder accumulator with its
+        # grouped setup sample; compare the first motion sample against that.
+        previous_height = (self.lift._extended_deg() - self.lift._z0_deg) * self.lift._mm_per_deg
+        # Use the existing unwrapped accumulator, not another read or rounded mm.
+        # The normal AM1 policy may allow one count below the best upward position;
+        # comparing only adjacent samples would permit accumulated downward drift.
+        best_upward_ticks = self.lift.cfg.dir_sign * self.lift._extended_ticks
+        variation_ticks = 1 if allow_one_count_variation else 0
+        velocity_disagreements = 0
         while True:
             remaining = RELIEF_TIMEOUT_S - (time.monotonic() - started)
             if remaining <= 0:
@@ -753,6 +759,32 @@ class InstalledLiftCheck:
             record, height = self._moving_height("relief")
             elapsed = time.monotonic() - started
             self._check_raised("relief", record, height)
+            upward_ticks = self.lift.cfg.dir_sign * self.lift._extended_ticks
+            if upward_ticks < best_upward_ticks - variation_ticks:
+                self.refuse(record, "relief: unexpected downward direction.")
+            if upward_ticks < best_upward_ticks:
+                self.emit({
+                    **record,
+                    "phase": "relief_position_variation",
+                    "backstep_ticks": best_upward_ticks - upward_ticks,
+                    "height_mm": round(height, 4),
+                })
+            best_upward_ticks = max(best_upward_ticks, upward_ticks)
+            if int(record["present_velocity_raw"]) > STILL_VELOCITY_RAW:
+                if height <= previous_height:
+                    self.refuse(record, "relief: direction unconfirmed; reported downward velocity without fresh upward position progress.")
+                velocity_disagreements += 1
+                self.emit({
+                    **record,
+                    "phase": "relief_direction_disagreement",
+                    "previous_height_mm": round(previous_height, 4),
+                    "height_mm": round(height, 4),
+                })
+                if velocity_disagreements >= 2:
+                    self.refuse(record, "relief: repeated velocity/position direction disagreement.")
+            else:
+                velocity_disagreements = 0
+            previous_height = height
             if elapsed >= RELIEF_TIMEOUT_S:
                 self.refuse(record, f"relief: target not reached within {RELIEF_TIMEOUT_S}s.")
             if height >= RELIEF_MM:
