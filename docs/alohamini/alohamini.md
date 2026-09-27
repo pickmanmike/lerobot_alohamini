@@ -95,7 +95,30 @@ If either identity is missing, duplicated, ambiguous, or attached to the wrong l
 
 ### Lean AM1 local operation and physically proven lift
 
-#### Current status — supervised local hobby use ready (AM1-POSTQ-1 passed)
+#### Current status — qualified unified workflow integrated (PR #7)
+
+PR #7 was merged into `integrate/am1-local-teleop`, not `main`, by ordinary
+two-parent merge `865bfd1f4de9a276cebe9650a4fd2e951f492169`. Its parents are
+`e1fff50fb190782657aaaadff15acafd67133dc2` and reviewed head
+`f7d00306ab889556c79a4939f32b993f247bba61`; its tree equals that reviewed head.
+
+The accepted supervised session `20260927T122640-69179ca1` exercised the
+`a6a263266888ebc2cd658d0ff5be670632ded3d0` workflow for approximately 63.7 live
+seconds from a closely aligned right-shoulder start, with Q/release stopping,
+clean component exits and collected evidence. The later `f7d00306` connection
+correction was tested offline and deployed; this merge is not a new physical
+test or a claim that it fixes the separate shoulder/camera limitations.
+
+Windows client/session and Pi session helper remain at `f7d00306`; Pi motor
+remains at `a6a26326`; the separately deployed camera remains at
+`047c4fcf7cbf34684a9b8c348193585938975815`, which is **not** in this merge's
+ancestry. Full source identities, operating limits, retained follow-ups and the
+ordinary-use procedure are in the [unified-session runbook](unified-session.md).
+No checkout, private reference, calibration, map, credential or environment is
+changed merely to match the integration SHA. The next use is ordinary attended
+operation, not another required commissioning session.
+
+#### Historical milestone — AM1-POSTQ-1 passed
 
 The remaining client-exit/idle/ordinary-shutdown check passed at `7badafdf4347cc1154c43f02fb6f6953d91053a0`. Together with the accepted combined-motion result, this supports supervised local hobby use and ordinary PR #5 closure into `integrate/am1-local-teleop`, never `main`. No motor software change or repeat direction suite is required. The next scoped work is [CAMERA-VIEW1: motor-off local camera viewing](../superpowers/plans/2026-09-19-am1-camera-viewing-packet.md), not another motor test.
 

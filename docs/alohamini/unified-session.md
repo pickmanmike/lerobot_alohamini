@@ -8,6 +8,43 @@ had a maximum browser display gap of `1.138 s`, above the unchanged `500 ms`
 continuity target. Loss of a required view still means release controls, press
 `Q`, and restart only after all owned processes have stopped.
 
+## Current integration and deployment — September 27, 2026
+
+PR #7 is merged into `integrate/am1-local-teleop`, not `main`, at
+`865bfd1f4de9a276cebe9650a4fd2e951f492169`. Its ordered parents are
+`e1fff50fb190782657aaaadff15acafd67133dc2` and
+`f7d00306ab889556c79a4939f32b993f247bba61`. The merge tree is identical to the
+reviewed head; the subsequent closeout edits are documentation only.
+
+| Evidence or deployed component | Exact source |
+|---|---|
+| Physically exercised client/session workflow and motor | `a6a263266888ebc2cd658d0ff5be670632ded3d0` |
+| Currently deployed Windows client/session and Pi session helper | `f7d00306ab889556c79a4939f32b993f247bba61` |
+| Currently deployed Pi motor, intentionally unchanged | `a6a263266888ebc2cd658d0ff5be670632ded3d0` |
+| Separately deployed Pi camera, intentionally unchanged | `047c4fcf7cbf34684a9b8c348193585938975815` |
+
+The camera commit is **not an ancestor** of the integration merge. The private
+configuration still selects that separate component; merging this PR does not
+claim to incorporate every deployed camera change. Keep the working checkouts,
+environments, ignored Local/session configuration, camera maps and credentials.
+Do not move them to the integration SHA merely for uniformity.
+
+Session `20260927T122640-69179ca1` remains an accepted **qualified** workflow
+pass: approximately 63.7 seconds live from the closely aligned shoulder start,
+owner-confirmed Q/release stopping, clean component exits and collected logs.
+The later `f7d00306` correction retains the AM1 availability request across
+cancellable polls and bounds failed-connect cleanup. It does not change motion
+admission or prove a cause for separate tracking or camera failures.
+
+Verification retained from that correction: **686 passed / 1 skipped** in the
+affected integration run, **28 browser checks**, and **10 final connection
+tests**, plus the simulated missing-optional-dependency collection check.
+The skipped case is the POSIX process-group test on Windows. Independent
+review cleared the scoped findings. These are earlier test executions, not
+tests rerun for this documentation closeout. Fresh integration checks verified
+the exact heads, merge parents/tree, source references and documentation diff;
+no new powered acceptance or long-duration claim is made.
+
 ## Compact design
 
 - Windows is the session controller and remains the interactive owner of all
@@ -72,10 +109,10 @@ An unexpected map or rotation is a refusal, not a guessed migration.
 
 ## Everyday supervised use
 
-Use PowerShell 7 in the reviewed Windows unified-session worktree. Prepare
-unobstructed arm and carriage support; power remains a human action. A first
-post-change observation should use 60–90 live seconds, not a commissioning
-suite or 30-minute endurance run:
+Use PowerShell 7 in the preserved Windows unified-session worktree, with its
+existing ignored session configuration and configured Python environment.
+Prepare unobstructed arm and carriage support; power remains a human action.
+This is ordinary supervised operation, not another required acceptance test:
 
 ```powershell
 .\tools\run_am1_session.ps1 -DurationSeconds 90
@@ -89,8 +126,12 @@ complete, visible prompts, each accepting only a bare Enter:
 1. After all five camera views are fresh, verify the views, physical envelope,
    support, and power-removal access; press Enter to start the motor host.
 2. After the host homes and relieves the lift and the client displays the
-   alignment plan, hold both leaders still; press Enter to begin the nominal
-   30-second synchronization.
+   alignment plan, verify the right leader shoulder is close to the **current
+   measured follower** value. Do not use a historical absolute pose as the
+   target or force the follower. If the displayed frozen plan needs a leader
+   adjustment, cancel rather than moving the leader during approval; prepare
+   a fresh plan on a later ordinary start. With the approved plan, hold both
+   leaders still and press Enter for nominal 30-second synchronization.
 3. After synchronization, continue holding the leaders still; press Enter to
    perform the final alignment check and enable live control.
 
@@ -120,8 +161,8 @@ requested target, final limited target, completed broadcast write, and immediate
 register readback. A completed broadcast write is not a servo acknowledgement;
 register readback is not proof of physical convergence. This optional readback
 does not run in live control; genuine read/servo errors still terminate through
-normal cleanup. The bounded completion change requires a supervised run before
-claiming physical success.
+normal cleanup. Completion was exercised in the accepted `a6a26326` workflow
+from a closely aligned shoulder start; arbitrary-pose convergence is not proven.
 
 `TELEOPERATION ACTIVE` is withheld until the host acknowledges the first live
 action.
@@ -231,6 +272,30 @@ synchronization, the final pre-send gate, and live control all observe it. The
 controller stops its exact client first. If the controller is gone, the command
 asks the recorded Pi supervisor to clean only its verified session children. It
 never kills unrelated Python, camera, or motor processes.
+
+## Retained limitations and follow-up
+
+- The large-offset right-shoulder tracking shortfall remains unresolved even
+  after sampled goal-register delivery. The successful closer start does not
+  isolate loading or repair that behavior. Match the leader to the current
+  measured follower before startup approval; keep the existing gate and bounds.
+- Intermittent Forward-camera acquisition can fail before any motor startup.
+  Replug recovery does not establish a loose connector or a network cause.
+  Preserve that refusal and its cleanup instead of automatically retrying.
+- The owner reports browser deterioration during movement, with no established
+  cause. This is distinct from acquisition failure. Source freshness is not
+  uninterrupted browser viewing or physical scene-to-display latency; retain
+  the historical **1.138-second** maximum display gap and required-view stop.
+- Short supervised success does not establish long-duration thermal stability,
+  arbitrary-pose tracking, unattended operation or remote-use readiness. Raw
+  lift-feedback limitations and genuine historical faults remain recorded.
+
+The next recommended improvement is a separate, bounded camera-observability
+follow-up: retain private backend diagnostics and distinguish acquisition from
+browser delivery using existing evidence first. Do not add a duplicate reader,
+global USB reset, automatic powered restart or mandatory repeat campaign.
+The detailed shoulder/camera review remains private; this is its sanitized
+follow-up summary, not a reopened integration blocker.
 
 ## Evidence and recovery
 

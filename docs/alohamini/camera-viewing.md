@@ -256,6 +256,17 @@ both roles are configured. Values are clockwise degrees, not camera controls.
 
 ## Historical Forward failure — recovered, exact cause unresolved
 
+**September 27 follow-up:** the unified workflow is now qualified and integrated
+through PR #7; see the [current source table and retained follow-ups](unified-session.md#retained-limitations-and-follow-up).
+The deployed camera remains the separate `047c4fcf7cbf34684a9b8c348193585938975815`
+component, not an ancestor of that merge. Later intermittent Forward acquisition
+refusals and reported browser deterioration during movement remain distinct,
+unresolved limitations. Neither the client connection correction nor fresh
+source counters proves a repair or a physical scene-to-display latency result.
+Retain the accepted 1.138-second display gap; no repeat campaign is required
+merely to close integration. A later bounded private diagnostic improvement is
+recommended, not implemented by this documentation update.
+
 The complete `am1-camera-20260920-144920-dERFuv.log` at80986427 proves the
 front source received **zero frames for the entire run**, not just after
 switching to a thumbnail. A subsequent bounded `v4l2-ctl` reference attempt
