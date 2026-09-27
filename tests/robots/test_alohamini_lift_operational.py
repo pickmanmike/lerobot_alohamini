@@ -411,14 +411,14 @@ def test_five_fresh_real_temperatures_confirm_majority_only(temperatures, stops)
     failure = None
     for index, temperature in enumerate(temperatures):
         try:
-            window.update(temperature, index * 0.05)
+            window.update(temperature, index * 0.1)
         except ComparisonRefusal as error:
             failure = error
             break
     assert (failure is not None) is stops
     if stops:
         with pytest.raises(ComparisonRefusal):
-            window.update(37, 0.3)  # A later normal value cannot re-arm a fault.
+            window.update(37, 0.8)  # A later normal value cannot re-arm a fault.
     else:
         assert window.outliers == 1
 
@@ -429,12 +429,138 @@ def test_temperature_baseline_is_real_five_samples_and_never_resets_at_phase_cha
 
     window = TemperatureWindow()
     for index, temperature in enumerate([39, 39, 39, 60]):
-        window.update(temperature, index * 0.05, cold_start=True)
+        window.update(temperature, index * 0.1, cold_start=True)
         assert not window.ready
-    window.update(60, 0.2, cold_start=True)
+    window.update(60, 0.4, cold_start=True)
     assert window.ready  # Real cool majority; two numeric outliers remain evidence.
     with pytest.raises(ComparisonRefusal, match="55"):
-        window.update(60, 0.25)  # Third high spans before_torque -> homing, no reset.
+        window.update(60, 0.5)  # Third high spans before_torque -> homing, no reset.
+
+
+def test_fast_read_burst_cannot_manufacture_a_five_slot_cold_baseline():
+    from lerobot.robots.alohamini.lift_operational import TemperatureWindow
+    from lerobot.robots.alohamini.lift_motor_feedback import ComparisonRefusal
+
+    window = TemperatureWindow()
+    for index in range(5):
+        window.update(37, index * 0.001, cold_start=True)
+    assert not window.ready
+    with pytest.raises(ComparisonRefusal, match="baseline"):
+        window.assert_fresh(0.004)
+
+
+def test_multiple_high_readings_in_one_slot_count_once_and_lows_do_not_erase_peak():
+    from lerobot.robots.alohamini.lift_operational import TemperatureWindow
+
+    window = TemperatureWindow()
+    for index in range(5):
+        window.update(37, index * 0.1, cold_start=True)
+    for at_s, temperature in [(0.51, 58), (0.52, 81), (0.53, 73), (0.54, 37)]:
+        result = window.update(temperature, at_s)
+    assert result["high_count"] == 1
+    assert result["values_c"] == [37, 37, 37, 37, 81]
+    assert window.outliers == 3
+    assert window.ready
+
+
+def test_high_in_three_slots_cannot_be_diluted_by_fast_low_readings():
+    from lerobot.robots.alohamini.lift_operational import TemperatureWindow
+    from lerobot.robots.alohamini.lift_motor_feedback import ComparisonRefusal
+
+    window = TemperatureWindow()
+    for index in range(5):
+        window.update(37, index * 0.1)
+    for at_s, temperature in [
+        (0.51, 60), (0.52, 37), (0.53, 37), (0.54, 37),
+        (0.61, 60), (0.62, 37), (0.63, 37), (0.64, 37),
+    ]:
+        window.update(temperature, at_s)
+    with pytest.raises(ComparisonRefusal, match="3/5") as caught:
+        window.update(60, 0.71)
+    with pytest.raises(ComparisonRefusal) as repeated:
+        window.update(37, 0.72)
+    assert repeated.value is caught.value
+    assert window.outliers == 3  # Include the raw reading which actually caused the stop.
+
+
+def test_lower_reading_in_same_slot_cannot_refresh_retained_peak_age():
+    from lerobot.robots.alohamini.lift_operational import TemperatureWindow
+    from lerobot.robots.alohamini.lift_motor_feedback import ComparisonRefusal
+
+    window = TemperatureWindow()
+    window.update(60, 0.0)
+    window.update(37, 0.09)
+    for index in range(1, 5):
+        window.update(37, index * 0.1)
+    # The last raw reading is fresh, but the genuine retained high is too old
+    # for an action. Treating it as a new reading at 0.09 would incorrectly pass.
+    with pytest.raises(ComparisonRefusal, match="stale"):
+        window.assert_fresh(0.500001)
+
+
+def test_raw_timestamp_must_advance_even_when_last_slot_peak_does_not():
+    from lerobot.robots.alohamini.lift_operational import TemperatureWindow
+    from lerobot.robots.alohamini.lift_motor_feedback import ComparisonRefusal
+
+    window = TemperatureWindow()
+    for index in range(5):
+        window.update(37, index * 0.1)
+    window.update(60, 0.41)
+    window.update(37, 0.49)
+    with pytest.raises(ComparisonRefusal, match="backward"):
+        window.update(37, 0.45)  # Newer than the peak, older than the last RAW reply.
+
+
+@pytest.mark.parametrize("hz", [10, 20, 30, 100])
+def test_synthetic_sustained_heat_stops_in_third_high_time_slot_at_each_rate(hz):
+    from lerobot.robots.alohamini.lift_operational import TemperatureWindow
+    from lerobot.robots.alohamini.lift_motor_feedback import ComparisonRefusal
+
+    window = TemperatureWindow()
+    # Synthetic continuation, NOT inferred from post-shutdown normal feedback.
+    with pytest.raises(ComparisonRefusal, match="3/5"):
+        for index in range(hz + 1):
+            at_s = index / hz
+            window.update(60 if at_s >= 0.61 else 37, at_s)
+    assert 0.8 <= at_s <= 0.9
+
+
+def test_recorded_pre_stop_temperature_cluster_occupies_two_slots_without_invented_continuation():
+    from lerobot.robots.alohamini.lift_operational import TemperatureWindow
+
+    # September 26 measured samples up to the old refusal ONLY; no cleanup lows
+    # are used to predict what would have happened under continued motion.
+    samples = [
+        (0.007, 33), (0.059, 33), (0.111, 33), (0.163, 33), (0.215, 33),
+        (0.221, 33), (0.224, 33), (0.276, 33), (0.328, 33), (0.380, 33),
+        (0.432, 33), (0.487, 33), (0.539, 33), (0.591, 33), (0.643, 33),
+        (0.695, 33), (0.747, 33), (0.799, 33), (0.851, 33), (0.903, 37),
+        (0.955, 33), (1.007, 33), (1.059, 33), (1.111, 33), (1.163, 33),
+        (1.215, 33), (1.267, 33), (1.319, 58), (1.371, 33), (1.423, 73),
+        (1.475, 81),
+    ]
+    window = TemperatureWindow()
+    for at_s, temperature in samples:
+        result = window.update(temperature, at_s)
+    assert result["high_count"] == 2
+    assert result["values_c"] == [33, 33, 33, 58, 81]
+    assert result["span_s"] <= 0.5
+    assert window.outliers == 3
+
+
+def test_normal_activation_requires_real_temperature_slots_before_any_nonzero_goal(
+    operating_robot, capsys,
+):
+    robot, _ = operating_robot
+    robot.connect(calibrate=False)
+    records = operational_records(capsys)
+    baseline = [r for r in records if r["phase"] == "baseline"]
+    assert baseline[-1]["sample_monotonic_s"] - baseline[0]["sample_monotonic_s"] >= 0.4
+    assert baseline[-1]["temperature_window"]["ready"]
+    assert all(r["torque_enable"] == 0 and r["goal_velocity_raw"] == 0 for r in baseline)
+    first_motion = next(r for r in records if r.get("goal_velocity_raw"))
+    assert first_motion["sample_monotonic_s"] > baseline[-1]["sample_monotonic_s"]
+    robot.disconnect()
 
 
 @pytest.mark.parametrize("fault", ["gap", "old_window", "nan", "duplicate", "missing"])
@@ -444,18 +570,18 @@ def test_bad_or_stale_data_cannot_become_normal_temperature(fault):
 
     window = TemperatureWindow()
     for index in range(5):
-        window.update(37, index * 0.05)
+        window.update(37, index * 0.1)
     with pytest.raises(ComparisonRefusal):
         if fault == "gap":
-            window.update(37, 0.701)
+            window.update(37, 0.901)
         elif fault == "old_window":
-            window.update(37, 0.56)  # Last five span 0.51 s, even though last sample gap <0.5.
+            window.update(37, 0.61)  # Last five span 0.51 s, even though last sample gap <0.5.
         elif fault == "nan":
-            window.update(float("nan"), 0.25)
+            window.update(float("nan"), 0.45)
         elif fault == "duplicate":
-            window.update(37, 0.2)
+            window.update(37, 0.4)
         else:
-            window.assert_fresh(0.701)
+            window.assert_fresh(0.901)
 
 
 def test_warm_cold_start_refuses_before_any_torque_enable(operating_robot):
@@ -627,7 +753,7 @@ def test_idle_uncertainty_never_defers_real_faults(qualified_idle, fault):
     elif fault == "stale":
         clock.sleep(0.501)
     with pytest.raises(RuntimeError) as caught:
-        for index in range(3):
+        for index in range(10 if fault == "temperature" else 3):
             poll_idle_feedback(
                 robot, clock, velocity=-51 if fault == "velocity" else -50,
                 position=origin + index + 1 if fault == "drift" else None,

@@ -144,6 +144,28 @@ partial windows and bad samples cannot renew the deadline. Transition records
 retain the raw evidence. This is a bounded operating policy, not proof that the
 historical velocity readings were false or that the hardware cause is resolved.
 
+Normal AM1 lift temperature confirmation uses five **occupied 100 ms time
+slots**, anchored to the first genuine feedback sample and retained across
+startup, homing, relief, live use and healthy shutdown. Each slot keeps its
+highest actual reading and that reading's timestamp. Faster polling cannot
+create additional votes, and a later low within a slot cannot erase its high.
+Three of the five slot maxima at or above **55 C** latch a stop. All five
+retained readings must remain within **0.5 s**; missing, invalid, backward or
+stale feedback never becomes a normal temperature. A genuine fresh, cool
+baseline spanning five slots is required before activation. Only the existing
+torque-off baseline is lengthened; no confirmation sleep, second reader or
+thread is added to the ordinary control loop.
+
+Raw high readings remain in the logs with bounded warnings, including the
+reading which causes refusal. Status/error, checksum/transport, current,
+voltage and motion faults are not filtered. This owner-approved timing-policy
+refinement is not a sensor repair or proof of safe physical temperature. The
+September 26 pre-stop cluster `[33,58,33,73,81]` occupied two high time slots;
+offline replay stops at the original refusal and does not use post-shutdown
+lows to predict continued motion. A new powered attempt may still refuse if
+high readings persist into a third slot. Neither a clean replay nor a short
+startup pass closes the retained gradual-heating evidence.
+
 During live use, release motion keys before changing support. `Q` is the normal
 single quit action. Duration expiry follows the same shutdown path. Either now
 releases torque through host cleanup, so the arms and carriage must already have
