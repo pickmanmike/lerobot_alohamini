@@ -469,6 +469,7 @@ class RemoteSupervisor:
             raise SessionRefusal("Motor-host start is out of order.")
         env = dict(os.environ)
         env["AM1_LOG_DIRECTORY"] = self.args.log_directory
+        env["AM1_SYNC_SHOULDER_READBACK"] = "1"
         child = self._spawn(
             "host",
             ["bash", str(Path(self.args.motor_repository) / "tools" / "run_am1_host.sh"), "--mode", "local"],

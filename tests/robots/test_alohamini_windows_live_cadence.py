@@ -797,6 +797,152 @@ def test_unified_sync_short_feedback_gap_holds_then_resumes_without_burst(capsys
                for first, second in zip(actions, actions[1:])) <= 0.75
 
 
+def endpoint_completion_rig(*, behavior="lag", observation_delay=0.01):
+    """A fake transport/plant; run_startup_sync itself stays real."""
+    module = load_teleoperate()
+    clock = SimpleNamespace(now=100.0)
+    joint = "arm_right_shoulder_lift.pos"
+    target = {**LEADER, "right_shoulder_lift.pos": 41.879637}
+    actions = []
+    failure = RuntimeError("explicit follower transport fault")
+
+    class Robot:
+        config = SimpleNamespace(connect_timeout_s=1.5, observation_request_window=3)
+        observation_sequence = 0
+        latest_observation_roundtrip_age_s = 0.01
+        latest_observation_error = None
+        latest_raw_observation_keys = frozenset(FOLLOWER)
+        latest_am1_local_feedback = {
+            "version": 1, "state": "ready", "epoch": -1, "observation_id": 0,
+        }
+
+        def __init__(self):
+            self.positions = {**FOLLOWER, joint: 98.965}
+            self.endpoint_at = None
+            self.delivered_endpoint_at = None
+            self.retired = 0
+            self.latest_observation_received_at = clock.now
+
+        def retire_observation_requests(self):
+            self.retired += 1
+
+        def get_observation(self):
+            clock.now += observation_delay
+            if self.endpoint_at is not None and self.retired >= 3:
+                if behavior == "fault":
+                    raise failure
+                if behavior == "cached":
+                    return {**self.positions, joint: 41.879637}  # Looks aligned, but no fresh sequence.
+                if behavior == "stale_reply":
+                    self.latest_observation_roundtrip_age_s = 2.0
+                if behavior == "invalid_stale":
+                    self.latest_observation_roundtrip_age_s = 2.0
+                    self.latest_raw_observation_keys = frozenset(FOLLOWER) - {joint}
+                if behavior in {"lag", "lost_final"} and self.delivered_endpoint_at is not None:
+                    elapsed = clock.now - self.delivered_endpoint_at
+                    self.positions[joint] = 41.879637 + max(0.0, 13.526467 - 4 * max(0.0, elapsed - 0.4))
+                if behavior == "worsening":
+                    self.positions[joint] += 0.01
+            self.observation_sequence += 1
+            self.latest_observation_received_at = clock.now
+            self.latest_am1_local_feedback["observation_id"] += 1
+            return dict(self.positions)
+
+        def send_action(self, action):
+            actions.append((clock.now, dict(action)))
+            endpoint = abs(action[joint] - 41.879637) < 1e-8
+            if endpoint and self.endpoint_at is None:
+                self.endpoint_at = clock.now
+                if behavior == "lost_final":
+                    return dict(action)  # PUSH send succeeded; delivery is not acknowledgement.
+            if endpoint and self.delivered_endpoint_at is None:
+                self.delivered_endpoint_at = clock.now
+            if self.endpoint_at is None or self.retired < 3:
+                self.positions.update({key: value for key, value in action.items() if key in ARM_KEYS})
+                self.positions[joint] = min(98.965, action[joint] + 13.526467)
+            return dict(action)
+
+    robot = Robot()
+
+    def leader_sample():
+        if behavior == "drift" and robot.endpoint_at is not None and robot.retired >= 3:
+            return {**target, "right_shoulder_lift.pos": 44.0}
+        return dict(target)
+
+    def cancel_check():
+        if behavior == "cancel" and robot.endpoint_at is not None and robot.retired >= 3:
+            raise failure
+
+    def run():
+        return module.run_startup_sync(
+            robot, SimpleNamespace(get_action=leader_sample), side="both",
+            requested_duration_s=30.0, fps=10, max_start_mismatch=10.0,
+            input_fn=lambda prompt: "", monotonic=lambda: clock.now,
+            sleep_fn=lambda seconds: setattr(clock, "now", clock.now + seconds),
+            enter_confirmation=True, cancel_check=cancel_check,
+        )
+
+    return module, clock, robot, actions, failure, run
+
+
+@pytest.mark.parametrize("behavior", ["lag", "lost_final"])
+def test_endpoint_completion_maintains_frozen_target_until_fresh_alignment(behavior):
+    _, clock, robot, actions, _, run = endpoint_completion_rig(behavior=behavior)
+    approved, observed, _ = run()
+    joint = "arm_right_shoulder_lift.pos"
+    assert approved[joint] == 41.879637
+    assert abs(observed[joint] - approved[joint]) <= 10.0
+    assert 0.4 < clock.now - robot.endpoint_at < 5.0
+    completion = [(at, action) for at, action in actions if at > robot.endpoint_at]
+    assert completion and all(action[joint] == pytest.approx(41.879637) for _, action in completion)
+    assert all(action[k] == 0 for _, action in actions for k in ("x.vel", "y.vel", "theta.vel", "lift_axis.vel"))
+    assert min(b[0] - a[0] for a, b in zip(actions, actions[1:])) >= 0.1 - 1e-9
+    assert max(abs(b[1][joint] - a[1][joint]) for a, b in zip(actions, actions[1:])) <= 0.75
+
+
+@pytest.mark.parametrize("behavior", ["stationary", "worsening", "cached", "stale_reply"])
+def test_endpoint_completion_has_one_fixed_deadline_and_never_qualifies_stale_data(behavior):
+    module, clock, robot, actions, _, run = endpoint_completion_rig(behavior=behavior)
+    with pytest.raises(module.SafetyRefusal, match="completion.*5"):
+        run()
+    assert 4.9 <= clock.now - robot.endpoint_at <= 5.02
+    assert actions[-1][0] < robot.endpoint_at + 5.0
+    assert all(action[k] == 0 for _, action in actions for k in ("x.vel", "y.vel", "theta.vel", "lift_axis.vel"))
+    assert all(action["arm_right_shoulder_lift.pos"] == pytest.approx(41.879637)
+               for at, action in actions if at > robot.endpoint_at)
+
+
+@pytest.mark.parametrize("behavior", ["fault", "cancel", "drift"])
+def test_endpoint_completion_stops_before_another_action_on_fault_cancel_or_drift(behavior):
+    module, _, robot, actions, failure, run = endpoint_completion_rig(behavior=behavior)
+    if behavior == "drift":
+        with pytest.raises(module.SafetyRefusal, match="leader drift"):
+            run()
+    else:
+        with pytest.raises(RuntimeError) as caught:
+            run()
+        assert caught.value is failure
+    assert actions[-1][0] == robot.endpoint_at
+
+
+def test_endpoint_completion_late_observation_cannot_extend_deadline_or_send_catchup():
+    module, clock, robot, actions, _, run = endpoint_completion_rig(
+        behavior="stationary", observation_delay=0.23,
+    )
+    with pytest.raises(module.SafetyRefusal, match="completion.*5"):
+        run()
+    assert clock.now - robot.endpoint_at < 5.24  # One already-in-progress bounded read, no extra send.
+    assert actions[-1][0] < robot.endpoint_at + 5.0
+    assert min(b[0] - a[0] for a, b in zip(actions, actions[1:])) >= 0.1 - 1e-9
+
+
+def test_endpoint_completion_does_not_hide_invalid_new_payload_behind_staleness():
+    module, _, robot, actions, _, run = endpoint_completion_rig(behavior="invalid_stale")
+    with pytest.raises(module.SafetyRefusal, match="missing"):
+        run()
+    assert actions[-1][0] == robot.endpoint_at
+
+
 def test_local_feedback_is_taken_from_the_new_decoded_observation_only():
     client, socket = make_observation_transport_client()
     client._is_connected = True

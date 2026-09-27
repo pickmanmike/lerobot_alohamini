@@ -18,6 +18,7 @@ import argparse
 import json
 import logging
 import math
+import os
 import time
 from collections.abc import Callable
 
@@ -171,6 +172,7 @@ class HostCommandState:
         self._watchdog_events = 0
         self._last_watchdog_event_wall_time_ns: int | None = None
         self._last_action_diagnostics: dict[str, object] = {}
+        self._last_receive_wall_time_ns: int | None = None
 
     def capture_wall_time_ns(self) -> int | None:
         """Capture a shared log timestamp without adding work when diagnostics are off."""
@@ -199,6 +201,7 @@ class HostCommandState:
                     self._last_receive_gap_over_watchdog_ms = gap_ms
                     self._last_receive_gap_over_watchdog_wall_time_ns = received_wall_time_ns
             self._last_action_diagnostics = dict(action_diagnostics)
+            self._last_receive_wall_time_ns = received_wall_time_ns
         self._previous_receive_s = receive_time
         # Preserve the established watchdog lifecycle: a successfully applied action
         # resets its age at completion, while diagnostics measure socket receive gaps.
@@ -219,7 +222,7 @@ class HostCommandState:
     def snapshot(self) -> dict[str, object] | None:
         if not self.diagnostics_enabled:
             return None
-        return {
+        report = {
             "wall_time_ns": self._wall_clock_ns(),
             "command_sequence": self._command_sequence,
             "last_receive_gap_ms": self._last_receive_gap_ms,
@@ -243,6 +246,12 @@ class HostCommandState:
                 self._last_action_diagnostics.get("right_wrist_observed")
             ),
         }
+        if "right_shoulder" in self._last_action_diagnostics:
+            report["right_shoulder"] = {
+                **_jsonable(self._last_action_diagnostics["right_shoulder"]),
+                "command_received_wall_time_ns": self._last_receive_wall_time_ns,
+            }
+        return report
 
     def format_report(self) -> str | None:
         snapshot = self.snapshot()
@@ -255,6 +264,39 @@ def print_cadence_report(command_state: HostCommandState) -> None:
     report = command_state.format_report()
     if report is not None:
         print(report, flush=True)
+
+
+def print_startup_shoulder_report(
+    robot: AlohaMini, command_state: HostCommandState, observation: dict,
+) -> None:
+    """One optional readback on the existing owner, never a second bus or writer."""
+    if robot.config.robot_model != "alohamini1":
+        return
+    snapshot = command_state.snapshot()
+    if snapshot is None or "right_shoulder" not in snapshot:
+        return
+    record = {
+        **snapshot["right_shoulder"], "command_sequence": snapshot["command_sequence"],
+        "wall_time_ns": time.time_ns(), "read_started_at": time.monotonic(),
+        "observed_position": observation.get("arm_right_shoulder_lift.pos"),
+        "goal_position_readback": None,
+    }
+    def emit() -> None:
+        record["read_completed_at"] = time.monotonic()
+        print(f"[AM1 SYNC SHOULDER] {json.dumps(_jsonable(record), separators=(',', ':'))}", flush=True)
+
+    try:
+        record["goal_position_readback"] = robot.right_bus.read(
+            "Goal_Position", "arm_right_shoulder_lift", num_retry=0,
+        )
+    except BaseException as error:
+        record["readback_error"] = f"{type(error).__name__}: {error}"
+        try:
+            emit()
+        except BaseException as report_error:
+            error.add_note(f"shoulder readback reporting also failed: {report_error}")
+        raise  # Preserve a genuine communication/servo failure and its identity.
+    emit()
 
 
 def _jsonable(value):
@@ -505,6 +547,9 @@ def main():
         if args.robot_model == "alohamini1" and not args.no_follower
         else None
     )
+    # Only the unified supervisor opts in. Direct Arms/Local commands remain
+    # unmarked and can stay "ready" during live use; state alone is insufficient.
+    sync_shoulder_readback = os.environ.get("AM1_SYNC_SHOULDER_READBACK") == "1"
     logging.info("Waiting for commands...")
 
     try:
@@ -684,6 +729,8 @@ def main():
             cadence_now = time.monotonic()
             if args.profile_cadence and cadence_now - cadence_report_start_t >= 1.0:
                 print_cadence_report(command_state)
+                if sync_shoulder_readback and local_control is not None and local_control.state == "ready":
+                    print_startup_shoulder_report(robot, command_state, last_observation)
                 cadence_report_start_t = cadence_now
 
             duration = time.perf_counter() - start

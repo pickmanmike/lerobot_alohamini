@@ -1367,7 +1367,11 @@ def test_remote_records_exact_child_log_before_later_readiness_failure(tmp_path,
     if child_name == "host":
         supervisor.children["camera"] = object()
     child = module.OwnedChild(child_name, object(), 100, tmp_path / "control")
-    supervisor._spawn = lambda *args, **kwargs: child
+    spawned = []
+    def spawn(name, command, env):
+        spawned.append((name, command, env))
+        return child
+    supervisor._spawn = spawn
     calls = 0
 
     def wait_for(*args, **kwargs):
@@ -1384,6 +1388,8 @@ def test_remote_records_exact_child_log_before_later_readiness_failure(tmp_path,
         (supervisor.start_camera if child_name == "camera" else supervisor.start_host)()
 
     assert supervisor.state[f"{child_name}_log"] == f"/logs/exact-{child_name}.log"
+    if child_name == "host":
+        assert spawned[0][2]["AM1_SYNC_SHOULDER_READBACK"] == "1"
     if child_name == "camera":
         assert "CAMERA_LOG=/logs/exact-camera.log" in str(caught.value)
 

@@ -2292,6 +2292,51 @@ def test_sync_final_mismatch_returns_two_without_ordinary_send_and_cleans_up(mon
     assert ("robot", "disconnect") in events
 
 
+@pytest.mark.parametrize("outcome", ["deadline", "read_fault", "cancel"])
+def test_unified_completion_failure_reaches_outer_zero_and_disconnect(monkeypatch, capsys, outcome):
+    module = load_example_module("teleoperate_bi")
+    events = prepare_teleoperation(
+        monkeypatch, module,
+        left_disconnect_error=RuntimeError("secondary cleanup failure") if outcome != "deadline" else None,
+    )
+    args = sync_args(module, "--startup_sync_only")
+    args.unified_session_enter_confirmations = True
+    clock = FakeClock(events)
+    FakeRobot.observation_clock = clock.monotonic
+    original_read = FakeRobot.get_observation
+    primary = KeyboardInterrupt() if outcome == "cancel" else RuntimeError("endpoint read failed")
+
+    def endpoint_read(self):
+        observation = original_read(self)
+        if len(arm_send_actions(events)) >= 2:
+            if outcome != "deadline":
+                raise primary
+            observation["arm_right_shoulder_lift.pos"] += 13.53
+        return observation
+
+    monkeypatch.setattr(FakeRobot, "get_observation", endpoint_read)
+    run = lambda: module.run_teleoperation(
+        args, input_fn=lambda _: "", monotonic=clock.monotonic, sleep_fn=clock.sleep,
+    )
+    if outcome == "deadline":
+        assert run() == 2
+        assert clock.now == pytest.approx(5.2)
+    else:
+        with pytest.raises(type(primary)) as caught:
+            run()
+        assert caught.value is primary
+    output = capsys.readouterr().out
+    assert "TELEOPERATION ACTIVE" not in output
+    if outcome == "deadline":
+        assert "startup sync completion exceeded 5.0s" in output
+    sends = [(i, event[2]) for i, event in enumerate(events) if event[:2] == ("robot", "send")]
+    assert sends[-1][1] == module.make_zero_action()
+    assert all(all(action[key] == 0 for key in module.make_zero_action()) for _, action in sends)
+    assert sends[-1][0] < events.index(("right", "disconnect"))
+    assert events.index(("right", "disconnect")) < events.index(("left", "disconnect"))
+    assert events.index(("left", "disconnect")) < events.index(("robot", "disconnect"))
+
+
 @pytest.mark.parametrize("failure", [RuntimeError("sync read failed"), KeyboardInterrupt()])
 def test_sync_failure_or_interrupt_preserves_primary_and_cleans_up(monkeypatch, failure):
     module = load_example_module("teleoperate_bi")

@@ -988,6 +988,13 @@ class AlohaMini(Robot):
             "right_wrist_final": final_arm_pos.get("arm_right_wrist_flex.pos"),
             "right_wrist_observed": right_wrist_observed,
         }
+        shoulder = "arm_right_shoulder_lift.pos"
+        if getattr(self.config, "robot_model", None) == "alohamini1" and shoulder in requested_arm_pos:
+            self.logs["action_diagnostics"]["right_shoulder"] = {
+                "requested": requested_arm_pos[shoulder], "final": final_arm_pos[shoulder],
+                # Broadcast sync-write completion is not a servo acknowledgement.
+                "sync_write_returned": True, "write_acknowledged": False,
+            }
 
         lift_sent = {k: v for k, v in action.items() if k.startswith("lift_axis.")}
         return {**left_pos, **right_pos, **base_goal_vel, **lift_sent}

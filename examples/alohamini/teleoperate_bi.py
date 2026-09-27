@@ -60,6 +60,7 @@ AM1_ARM_POSITION_KEYS = (
 ACTION_RANGE_TOLERANCE = 1e-6
 STARTUP_SYNC_MAX_STEP = 0.75
 STARTUP_SYNC_LEADER_DRIFT = 2.0
+STARTUP_SYNC_COMPLETION_S = 5.0
 AM1_COMMAND_SEND_TIMEOUT_MS = 50
 AM1_LIVE_OBSERVATION_MAX_AGE_S = 1.0
 AM1_LIFT_ONLY_VELOCITY = 200
@@ -1089,6 +1090,110 @@ def verify_startup_sync_result(
     return rows
 
 
+def _complete_unified_startup_sync(
+    robot: Any,
+    leader: Any,
+    plan: StartupSyncPlan,
+    last_action: dict[str, float | int],
+    last_send_completed_at: float,
+    *,
+    max_start_mismatch: float,
+    monotonic: Callable[[], float],
+    sleep_fn: Callable[[float], None],
+    cancel_check: Callable[[], None] | None,
+) -> tuple[dict[str, Any], float]:
+    """Maintain the approved endpoint for one fixed, measured-completion budget."""
+    started_at = last_send_completed_at
+    deadline = started_at + STARTUP_SYNC_COMPLETION_S
+    previous_sequence = robot.observation_sequence
+    # Only replies to requests issued after the ramp can qualify completion.
+    # Retire once, not on every poll: leave the existing bounded pipeline intact.
+    robot.retire_observation_requests()
+    action = dict(last_action)
+    last_mismatch = "no fresh endpoint observation"
+    print(json.dumps({
+        "event": "am1_startup_sync_completion", "state": "start",
+        "wall_time_ns": time.time_ns(), "last_send_completed_at": last_send_completed_at,
+        "deadline": deadline, "right_shoulder_target": action.get("arm_right_shoulder_lift.pos"),
+        "meaning": "client send completed; not a servo goal acknowledgement",
+    }, sort_keys=True), flush=True)
+
+    def check_control() -> None:
+        if cancel_check is not None:
+            cancel_check()
+        current_leader = extract_am1_arm_positions(
+            leader.get_action(), source="leader", leader_sample=True,
+        )
+        validate_startup_sync_leader_drift(current_leader, plan.frozen_leader_target, plan.selected_keys)
+
+    def check_deadline() -> None:
+        if monotonic() >= deadline:
+            raise SafetyRefusal(
+                f"startup sync completion exceeded {STARTUP_SYNC_COMPLETION_S:.1f}s: {last_mismatch}"
+            )
+
+    while True:
+        check_control()
+        check_deadline()
+        observation = robot.get_observation()
+        refuse_latest_am1_observation_error(robot, source="startup completion follower feedback")
+        check_control()
+        check_deadline()  # A late read cannot authorize success or another command.
+        sequence = robot.observation_sequence
+        if sequence < previous_sequence:
+            raise SafetyRefusal("follower observation_sequence regressed during startup completion")
+        fresh = sequence > previous_sequence
+        previous_sequence = sequence
+        follower = None
+        if fresh:
+            # A malformed new payload is a fault even if its delivery was slow.
+            validate_latest_am1_raw_observation_keys(robot, source="startup completion follower feedback")
+            follower = extract_am1_arm_positions(observation, source="follower", leader_sample=False)
+        observed_at = latest_am1_observation_received_at(
+            robot, fallback=monotonic, source="startup completion follower feedback",
+        )
+        if getattr(robot, "latest_observation_received_at", None) is None:
+            raise SafetyRefusal("startup completion observation receive time is unavailable")
+        try:
+            validate_am1_local_initial_admission(robot, observed_at=observed_at, monotonic=monotonic)
+        except InitialObservationStale:
+            fresh = False  # Hold only the last target; this never renews the deadline.
+        if fresh:
+            rows = build_alignment_rows(follower, dict(plan.frozen_leader_target))
+            worst = max((row for row in rows if row.joint in plan.selected_keys),
+                        key=lambda row: row.absolute_difference)
+            aligned = worst.absolute_difference <= max_start_mismatch
+            last_mismatch = (
+                f"{worst.joint}: follower={worst.follower_value}, frozen={worst.leader_value}, "
+                f"absolute_difference={worst.absolute_difference}, limit={max_start_mismatch}"
+            )
+            print(json.dumps({
+                "event": "am1_startup_sync_completion", "wall_time_ns": time.time_ns(),
+                "elapsed_s": round(monotonic() - started_at, 6),
+                "observation_sequence": sequence, "observed_at": observed_at,
+                "state": "aligned" if aligned else "pending",
+                "worst_joint": worst.joint, "worst_error": worst.absolute_difference,
+                "right_shoulder_target": plan.frozen_leader_target["arm_right_shoulder_lift.pos"],
+                "right_shoulder_observed": follower["arm_right_shoulder_lift.pos"],
+                "last_send_completed_at": last_send_completed_at,
+            }, sort_keys=True), flush=True)
+            if aligned:
+                _print_alignment_table(rows)
+                return observation, observed_at
+        sleep_fn(min(max(0.0, last_send_completed_at + 1.0 / plan.fps - monotonic()),
+                     max(0.0, deadline - monotonic())))
+        check_control()
+        check_deadline()
+        if fresh:
+            # Normally the final ramp frame already equals the endpoint. If a
+            # bounded progression remains, finish it without an endpoint jump.
+            for key in plan.selected_keys:
+                delta = plan.frozen_leader_target[key] - action[key]
+                action[key] += max(-STARTUP_SYNC_MAX_STEP, min(STARTUP_SYNC_MAX_STEP, delta))
+        robot.send_action({**action, **make_zero_action()})
+        last_send_completed_at = monotonic()
+
+
 def run_startup_sync(
     robot: Any,
     leader: Any,
@@ -1242,6 +1347,13 @@ def run_startup_sync(
         source="frozen leader target",
         leader_sample=True,
     )
+    if enter_confirmation:
+        final_observation, final_observed_at = _complete_unified_startup_sync(
+            robot, leader, plan, hold_action, previous_send_completed_at,
+            max_start_mismatch=max_start_mismatch, monotonic=monotonic,
+            sleep_fn=sleep_fn, cancel_check=cancel_check,
+        )
+        return validated_frozen_target, final_observation, final_observed_at
     verification_attempts = int(getattr(robot.config, "observation_request_window", 1)) + 1
     for verification_index in range(verification_attempts):
         final_observation = get_fresh_follower_observation(

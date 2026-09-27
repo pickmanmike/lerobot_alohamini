@@ -35,7 +35,8 @@ continuity target. Loss of a required view still means release controls, press
   zero base/lift during synchronization, and no catch-up bursts. Unified Local
   pauses on a recoverable observation gap as described below; direct Arms and
   Local modes retain their existing behavior. Local synchronization is
-  nominally 30 seconds; Arms mode retains its validated 120-second setting.
+  nominally 30 seconds, followed by at most five seconds of bounded endpoint
+  completion; Arms mode retains its validated 120-second setting.
 - Live duration is an explicit whole number from 1 through 1800 seconds. The
   live clock starts at `am1_client_live_start`, after synchronization and final
   approval. Direct `run_am1.ps1 -Mode Local` still defaults to 30 live seconds.
@@ -100,6 +101,28 @@ second. During unified synchronization, an arm target advances only while
 host feedback remains qualified. A short observation gap holds the last arm
 target and zero body commands; expiration of the existing connection budget
 refuses the attempt without catching up the skipped steps.
+After the unified ramp, one fixed five-second completion deadline allows a
+lagging follower to reach the unchanged 10-unit alignment gate. The client
+continues the frozen, approved target with zero body/lift, completion-spaced
+commands, and the same 0.75-unit step and 2-unit leader-drift limits. Any
+remaining commanded progression is bounded, never an endpoint jump. Only fresh
+post-ramp feedback can qualify; completion stops immediately when it qualifies.
+Stale feedback cannot advance the target or renew the deadline. A stationary or
+worsening joint still refuses at that deadline; there is no automatic retry.
+
+Completion records include command-send timing and measured right-shoulder
+position/error. The unified supervisor opts in through
+`AM1_SYNC_SHOULDER_READBACK=1`; ordinary direct hosts do not acquire this read.
+With the existing cadence diagnostics enabled, the Pi's single motor owner
+also reads the right shoulder's normalized `Goal_Position` at most
+once per second while its Local state is `ready`. These records distinguish
+requested target, final limited target, completed broadcast write, and immediate
+register readback. A completed broadcast write is not a servo acknowledgement;
+register readback is not proof of physical convergence. This optional readback
+does not run in live control; genuine read/servo errors still terminate through
+normal cleanup. The bounded completion change requires a supervised run before
+claiming physical success.
+
 `TELEOPERATION ACTIVE` is withheld until the host acknowledges the first live
 action.
 If the current final leader pose differs by more than 10 normalized units,
