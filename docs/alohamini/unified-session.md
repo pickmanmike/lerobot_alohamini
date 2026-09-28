@@ -123,9 +123,10 @@ review. PR #8 remains draft and unmerged.
 ### Opt-in scripted leader input (stacked follow-up to PR #8)
 
 The focused `codex/am1-scripted-leader` branch starts from reviewed PR #8 head
-`80ea84c7d474771d870dd9add5f096e12fab2af4`. It changes Windows input and launcher
-selection, not the Pi motor or camera implementation. It requires that reliability
-base; it is not a substitute for its fixes or a change to either deployed component.
+`80ea84c7d474771d870dd9add5f096e12fab2af4`. The initial scripted feature changes
+Windows input and launcher selection, not the Pi motor or camera implementation.
+It requires that reliability base. The later, separately approved motor-only
+initial-relief timing adjustment is recorded below; it does not rewrite the generator.
 
 ```powershell
 .\tools\run_am1_session.ps1 -LeaderSource Scripted -MotionProfile ArmSmoke -DurationSeconds 180
@@ -208,8 +209,22 @@ failure. Complete logs were collected and all session-owned processes stopped.
 No second attempt was launched. A later encoder change during cleanup does not
 retroactively qualify relief. The cause of the initial lack of progress remains
 unresolved; no motor bound or policy was changed merely to get past this refusal.
-Detailed evidence stays private. Resolve that specific startup boundary before
-another ArmSmoke attempt; do not repeat unchanged or reopen passed arm/base tests.
+Detailed evidence stays private. Do not repeat unchanged or reopen passed arm/base tests.
+
+The subsequently owner-approved policy is implemented in source commit `5e8d5c16`:
+ordinary AM1 startup now allows **1.0 s**, once, for genuine net upward encoder progress. This is a
+deliberate timing-policy adjustment, not a demonstrated servo response specification
+or a claim that the failed run would have succeeded. It neither credits cleanup
+motion nor reclassifies that run. The first valid progress ends qualification;
+the deadline cannot reset or reopen. All other relief and fault guards remain.
+There is no automatic further increase if the next attempt fails.
+
+Fresh focused verification: **167 passed** across the operational and standalone
+relief files. Meaningful RED first reproduced the old 250 ms refusal. Synthetic
+onsets at 306, 612 and 918 ms now qualify; no onset by 1.0 s and late feedback still
+stop. Extended-window direction/fault/cancellation cases retain zero/torque-off
+cleanup and original error identity. Compilation and diff checks passed. These
+are simulated policy results, not retrospective proof of the observed lift motion.
 
 ## Compact design
 
@@ -359,7 +374,7 @@ not retained; no source penalty or server-side setting change is established.
 The owner-approved AM1 operational lift guard permits at most one encoder count
 (about 0.0205 mm) below the best upward position reached during relief. It logs
 that raw variation; the reference does not follow successive downward samples.
-Normal AM1 startup now has a fixed **250 ms initial direction-qualification
+Normal AM1 startup now has a fixed **1.0 s initial direction-qualification
 window**, anchored once after the upward command completes. Fresh net upward
 encoder progress must qualify before it expires; returning from a one-count
 backstep to the initial position is not sufficient. During this initial window
