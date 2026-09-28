@@ -1390,7 +1390,7 @@ def test_host_preserves_pending_sample_after_safe_cleanup(operating_robot, monke
             assert "pending lift sample" in " ".join(caught.value.__notes__)
     assert len(records) == 1
     assert records[0]["sample_monotonic_s"] < clock.now
-    assert robot._lift_operation._pending_sample is None
+    assert not robot._lift_operation._pending_samples
 
 
 @pytest.mark.parametrize("temperatures,fails", [([37, 80, 37, 37, 37], False), ([60] * 5, True)])
