@@ -111,12 +111,86 @@ motor-only deployment `699d6eaf` contains the identical four Python/test files;
 only the backed-up private motor pin changed. Its Pi compile/import/help and
 helper print-only checks passed. No powered attempt was run for this correction.
 
-Next ordinary use uses `-DurationSeconds 300` as a ceiling, the same three actual
+Physical-leader ordinary use uses `-DurationSeconds 300` as a ceiling, the same three actual
 Enter prompts and nominal 30-second synchronization. The owner can finish a
 lightweight task plus brief normal base/lift use and press Q earlier. Preserve
 all accepted milestones and shoulder/camera limitations; do not add another
 diagnostic campaign. A new genuine fault stops that attempt for exact-evidence
 review. PR #8 remains draft and unmerged.
+
+### Opt-in scripted leader input (stacked follow-up to PR #8)
+
+The focused `codex/am1-scripted-leader` branch starts from reviewed PR #8 head
+`80ea84c7d474771d870dd9add5f096e12fab2af4`. It changes Windows input and launcher
+selection, not the Pi motor or camera implementation. It requires that reliability
+base; it is not a substitute for its fixes or a change to either deployed component.
+
+```powershell
+.\tools\run_am1_session.ps1 -LeaderSource Scripted -MotionProfile ArmSmoke -DurationSeconds 180
+```
+
+This is **SCRIPTED LEADER INPUT — REAL FOLLOWER MOTION**, not a simulation.
+Physical leaders are disconnected and unused: this explicit mode neither resolves
+their PnP/COM ports nor reads their calibration files. The default remains physical
+leaders with all their checks, without automatic fallback. Follower configuration,
+calibration, genuine host readiness, current observations, cameras, ordinary lift
+home/relief and monitoring, watchdogs, controller lease, and cleanup remain real.
+
+Prepare the normal clear arm envelope, empty grippers, carriage support and
+accessible stop/disconnect. Normalized bounds alone do not prove collision clearance.
+The owner handles power and physical support. Under attended authorization Codex
+may answer each actual Enter prompt individually; never queue blank lines. The
+three gates remain camera/readiness approval, nominal 30-second synchronization,
+and fresh post-sync alignment/live admission. Scripted startup freezes a genuinely
+fresh follower pose as its input origin. It may involve no arm movement and does
+**not** validate arbitrary-pose or large-offset physical-leader synchronization.
+
+`ArmSmoke` runs one finite cycle: 2 seconds stationary; all 12 arm/gripper channels
+in schema order, one at a time, with a 3-unit excursion over 3 seconds, a 0.5-second
+endpoint hold, a 3-second return and a 0.5-second origin hold; then 2 seconds
+stationary. Near a normalized upper endpoint the excursion points inward. Planned
+origins, targets and directions are logged before motion. Its nominal active
+trajectory is 88 seconds; 180 seconds is the live wall-clock ceiling, not a reason
+to keep moving after completion. Slower polls or recoveries may extend the profile.
+
+Only actual acknowledged live feedback advances the trajectory clock. Repeated
+`get_action` calls, startup, paused/recovering states and unusable feedback do not.
+Each update advances at most one nominal frame; there is no queued catch-up motion,
+no target rebasing to a failed follower, no new serial owner or sender. Existing
+measured-hold acknowledgements and bounded resume remain required. W/S/Z/X/A/D,
+U/J and speed keys cannot command body motion in this profile; every live action
+contains explicit zero base/lift velocities. Q and explicit Stop remain available.
+
+Per-segment structured records distinguish requested coordinates, received normalized
+feedback displacement/error, phase and observation sequence. They are tracking
+evidence, not a claim that every tiny movement was visually observed or that source
+camera fps measures browser quality. Existing camera timing remains available.
+`am1_scripted_input_summary` records `script_complete` separately from manual Q,
+explicit Stop, Ctrl+C, duration expiry and faults. The session only accepts successful
+script completion with verified coordinated cleanup; raw logs remain private.
+
+Ordinary cancellation and collection use the same launcher:
+
+```powershell
+.\tools\run_am1_session.ps1 -Stop
+.\tools\run_am1_session.ps1 -CollectOnly -SessionId <exact-printed-session-id>
+```
+
+No automatic batch runner was added. Begin with one useful attended cycle. A second
+session (maximum two for startup/shutdown comparison) is permitted only after the
+first reports normal script completion, verified clean component exits and collected
+evidence. Manual stop, fault, non-completion or uncertain cleanup ends that sequence.
+Inspect the exact evidence and do supported software work before another powered
+attempt; never repeat homing until a pass. Preserve the existing shoulder/camera and
+long-duration limitations and all previously accepted physical-leader milestones.
+
+Offline verification for this addition: **561 passed, 1 skipped** across the eight
+affected scripted-input, launcher/session, startup, Local and sender test files.
+The skip is the existing POSIX-only process-group case on Windows. Compilation,
+PowerShell parsing, help/import/lazy-camera checks and diff checks passed. Independent
+review reproduced and verified corrections to atomic completion and combined-age
+freshness races. Its real sender/host-protocol exercise still used fake hardware;
+none of these results is physical tracking or clearance evidence.
 
 ## Compact design
 

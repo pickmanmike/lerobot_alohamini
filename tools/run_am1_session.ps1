@@ -3,6 +3,11 @@ param(
     [Parameter(Mandatory, ParameterSetName = 'Start')]
     [AllowEmptyString()]
     [string]$DurationSeconds,
+    [Parameter(ParameterSetName = 'Start')]
+    [ValidateSet('Physical', 'Scripted')]
+    [string]$LeaderSource = 'Physical',
+    [Parameter(ParameterSetName = 'Start')]
+    [string]$MotionProfile,
     [Parameter(Mandatory, ParameterSetName = 'Stop')]
     [switch]$Stop,
     [Parameter(Mandatory, ParameterSetName = 'Collect')]
@@ -37,6 +42,11 @@ function Invoke-Am1SessionEntrypoint {
         [Parameter(Mandatory, ParameterSetName = 'Start')]
         [AllowEmptyString()]
         [string]$DurationSeconds,
+        [Parameter(ParameterSetName = 'Start')]
+        [ValidateSet('Physical', 'Scripted')]
+        [string]$LeaderSource = 'Physical',
+        [Parameter(ParameterSetName = 'Start')]
+        [string]$MotionProfile,
         [Parameter(Mandatory, ParameterSetName = 'Stop')]
         [switch]$Stop,
         [Parameter(Mandatory, ParameterSetName = 'Collect')]
@@ -52,6 +62,12 @@ function Invoke-Am1SessionEntrypoint {
     $validatedDuration = $null
     if ($PSCmdlet.ParameterSetName -eq 'Start') {
         $validatedDuration = ConvertTo-Am1SessionDuration -Value $DurationSeconds
+        if ($LeaderSource -eq 'Scripted' -and $MotionProfile -cne 'ArmSmoke') {
+            throw 'Scripted leader input requires -MotionProfile ArmSmoke.'
+        }
+        if ($LeaderSource -eq 'Physical' -and -not [string]::IsNullOrEmpty($MotionProfile)) {
+            throw '-MotionProfile is available only for Scripted leader input.'
+        }
     }
     if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
         throw "Private AM1 session config is missing: $ConfigPath"
@@ -65,6 +81,9 @@ function Invoke-Am1SessionEntrypoint {
     $arguments = @($script, '--config', [System.IO.Path]::GetFullPath($ConfigPath))
     if ($PSCmdlet.ParameterSetName -eq 'Start') {
         $arguments += @('start', '--duration-seconds', [string]$validatedDuration)
+        if ($LeaderSource -eq 'Scripted') {
+            $arguments += @('--leader-source', 'scripted', '--motion-profile', $MotionProfile)
+        }
     }
     elseif ($PSCmdlet.ParameterSetName -eq 'Stop') {
         $arguments += 'stop'
@@ -103,7 +122,8 @@ function Invoke-Am1SessionEntrypoint {
 
 if ($MyInvocation.InvocationName -ne '.') {
     if ($PSCmdlet.ParameterSetName -eq 'Start') {
-        $exitCode = Invoke-Am1SessionEntrypoint -DurationSeconds $DurationSeconds -ConfigPath $ConfigPath
+        $exitCode = Invoke-Am1SessionEntrypoint -DurationSeconds $DurationSeconds -ConfigPath $ConfigPath `
+            -LeaderSource $LeaderSource -MotionProfile $MotionProfile
     }
     elseif ($PSCmdlet.ParameterSetName -eq 'Stop') {
         $exitCode = Invoke-Am1SessionEntrypoint -Stop -ConfigPath $ConfigPath

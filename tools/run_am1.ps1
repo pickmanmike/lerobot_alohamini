@@ -4,6 +4,9 @@ param(
     [string]$Mode,
     [string]$ConfigPath = (Join-Path $PSScriptRoot '..\config\am1.local.json'),
     [string]$DurationSeconds,
+    [ValidateSet('Physical', 'Scripted')]
+    [string]$LeaderSource = 'Physical',
+    [string]$MotionProfile,
     [string]$LogPath,
     [string]$StopRequestPath,
     [switch]$Preflight,
@@ -32,10 +35,31 @@ $script:Am1PiInput = 'ee3a6f5dd813be82780a6a9b1789966357542d2f'
 $script:Am1LeftCalibrationSha256 = '34D06E15F6768A3290B85BBE3507D9B14A8CCED263A40C575E02010560E13FBE'
 $script:Am1RightCalibrationSha256 = 'C5F04F97B2B4B371EF4C4292616E7BBCAAE3987805930DE46CAEB3C614D2950C'
 
+function Assert-Am1LeaderSource {
+    param(
+        [Parameter(Mandatory)][string]$Mode,
+        [ValidateSet('Physical', 'Scripted')][string]$LeaderSource = 'Physical',
+        [string]$MotionProfile
+    )
+
+    if ($LeaderSource -eq 'Scripted') {
+        if ($Mode -ne 'Local') {
+            throw 'Scripted leader input is available only for Local unified sessions.'
+        }
+        if ($MotionProfile -cne 'ArmSmoke') {
+            throw 'Scripted leader input requires -MotionProfile ArmSmoke.'
+        }
+    }
+    elseif (-not [string]::IsNullOrEmpty($MotionProfile)) {
+        throw '-MotionProfile is available only for Scripted leader input.'
+    }
+}
+
 function Assert-Am1ValidatedEnvelope {
     param(
         [Parameter(Mandatory)][psobject]$Config,
-        [Parameter(Mandatory)][ValidateSet('Arms', 'Base', 'Lift', 'Local')][string]$Mode
+        [Parameter(Mandatory)][ValidateSet('Arms', 'Base', 'Lift', 'Local')][string]$Mode,
+        [ValidateSet('Physical', 'Scripted')][string]$LeaderSource = 'Physical'
     )
 
     $settings = $Config.arm_settings
@@ -46,9 +70,12 @@ function Assert-Am1ValidatedEnvelope {
         [double]$settings.max_start_mismatch -eq 10 -and
         [double]$settings.host_max_relative_target -eq 20
     $localSettingsMatch = $Mode -ne 'Local' -or [double]$settings.local_startup_sync_duration_s -eq 30
-    $hashesMatch =
-        [string]$Config.leader_calibration_sha256.left -ceq $script:Am1LeftCalibrationSha256 -and
-        [string]$Config.leader_calibration_sha256.right -ceq $script:Am1RightCalibrationSha256
+    $hashesMatch = $true
+    if ($LeaderSource -eq 'Physical') {
+        $hashesMatch =
+            [string]$Config.leader_calibration_sha256.left -ceq $script:Am1LeftCalibrationSha256 -and
+            [string]$Config.leader_calibration_sha256.right -ceq $script:Am1RightCalibrationSha256
+    }
     if (-not $settingsMatch -or -not $localSettingsMatch -or -not $hashesMatch) {
         throw 'Local config must retain the validated AM1 arm settings and calibration identities.'
     }
@@ -114,10 +141,13 @@ function New-Am1WindowsCommand {
         [string]$LeftPort,
         [string]$RightPort,
         [Nullable[int]]$LocalDurationSeconds,
-        [string]$StopRequestPath
+        [string]$StopRequestPath,
+        [ValidateSet('Physical', 'Scripted')][string]$LeaderSource = 'Physical',
+        [string]$MotionProfile
     )
 
-    Assert-Am1ValidatedEnvelope -Config $Config -Mode $Mode
+    Assert-Am1LeaderSource -Mode $Mode -LeaderSource $LeaderSource -MotionProfile $MotionProfile
+    Assert-Am1ValidatedEnvelope -Config $Config -Mode $Mode -LeaderSource $LeaderSource
     $pythonPath = Resolve-Am1ConfiguredPath -Value ([string]$Config.windows_python_path) `
         -RepositoryRoot $RepositoryRoot
     $teleoperationPath = Join-Path $RepositoryRoot 'examples\alohamini\teleoperate_bi.py'
@@ -159,7 +189,9 @@ function New-Am1WindowsCommand {
         )
     }
     else {
-        if ($LeftPort -notmatch '^COM\d+$' -or $RightPort -notmatch '^COM\d+$' -or $LeftPort -eq $RightPort) {
+        if ($LeaderSource -eq 'Physical' -and (
+            $LeftPort -notmatch '^COM\d+$' -or $RightPort -notmatch '^COM\d+$' -or $LeftPort -eq $RightPort
+        )) {
             throw 'Arms and Local modes require two distinct uppercase runtime COM addresses.'
         }
         $settings = $Config.arm_settings
@@ -181,14 +213,23 @@ function New-Am1WindowsCommand {
             [string]$Config.pi_host
             '--robot.robot_model'
             'alohamini1'
-            '--teleop.left_port'
-            $LeftPort
-            '--teleop.right_port'
-            $RightPort
-            '--teleop.id'
-            'so101_leader_bi'
-            '--teleop.arm_profile'
-            'so-arm-5dof'
+        )
+        if ($LeaderSource -eq 'Scripted') {
+            $arguments += @('--leader_source', 'scripted', '--motion_profile', $MotionProfile)
+        }
+        else {
+            $arguments += @(
+                '--teleop.left_port'
+                $LeftPort
+                '--teleop.right_port'
+                $RightPort
+                '--teleop.id'
+                'so101_leader_bi'
+                '--teleop.arm_profile'
+                'so-arm-5dof'
+            )
+        }
+        $arguments += @(
             '--startup_mode'
             'sync'
             '--startup_sync_side'
@@ -396,10 +437,17 @@ function Invoke-Am1Launch {
         [AllowNull()][object]$DurationSeconds,
         [string]$LogPath,
         [string]$StopRequestPath,
+        [ValidateSet('Physical', 'Scripted')][string]$LeaderSource = 'Physical',
+        [string]$MotionProfile,
         [switch]$Preflight,
         [switch]$PrintCommand
     )
 
+    Assert-Am1LeaderSource -Mode $Mode -LeaderSource $LeaderSource -MotionProfile $MotionProfile
+    if ($LeaderSource -eq 'Scripted' -and -not $Preflight -and -not $PrintCommand -and
+        [string]::IsNullOrWhiteSpace($StopRequestPath)) {
+        throw 'Scripted leader input must be started through the unified session launcher.'
+    }
     $repositoryRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
     if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
         throw "Local AM1 config is missing. Copy config\am1.local.example.json to config\am1.local.json and edit the local paths."
@@ -420,13 +468,13 @@ function Invoke-Am1Launch {
         Assert-Am1ReviewedWorktree -RepositoryRoot $repositoryRoot
     }
     $ports = [pscustomobject]@{ left = $null; right = $null }
-    if ($Mode -in @('Arms', 'Local')) {
+    if ($LeaderSource -eq 'Physical' -and $Mode -in @('Arms', 'Local')) {
         $ports = Get-Am1RuntimeLeaderPorts -Config $config -RepositoryRoot $repositoryRoot
         Assert-Am1LeaderCalibrationHashes -Config $config
     }
     $command = New-Am1WindowsCommand -Mode $Mode -Config $config -RepositoryRoot $repositoryRoot `
         -LeftPort $ports.left -RightPort $ports.right -LocalDurationSeconds $localDuration `
-        -StopRequestPath $StopRequestPath
+        -StopRequestPath $StopRequestPath -LeaderSource $LeaderSource -MotionProfile $MotionProfile
     $commandText = ConvertTo-Am1CommandText -Executable $command.executable -Arguments $command.arguments
 
     if ($PrintCommand) {
@@ -502,5 +550,5 @@ if ($MyInvocation.InvocationName -ne '.') {
     }
     Invoke-Am1Launch -Mode $Mode -ConfigPath $ConfigPath -DurationSeconds $DurationSeconds `
         -LogPath $LogPath -StopRequestPath $StopRequestPath -Preflight:$Preflight `
-        -PrintCommand:$PrintCommand
+        -PrintCommand:$PrintCommand -LeaderSource $LeaderSource -MotionProfile $MotionProfile
 }

@@ -41,6 +41,7 @@ from leader_client_utils import (
     make_normalized_bi_leader_config,
     resolve_leader_ports,
 )
+from scripted_leader import ScriptedLeaderInput
 
 
 AM1_ARM_POSITION_KEYS = (
@@ -173,6 +174,7 @@ class AM1LiveSample:
     observation: Mapping[str, Any]
     follower_positions: Mapping[str, float]
     arm_target: Mapping[str, float]
+    request_roundtrip_age_s: float | None = None
 
 
 @dataclass(frozen=True)
@@ -346,6 +348,39 @@ class AM1LiveActionSender:
 
     def publish(self, action: Mapping[str, float | int]) -> None:
         self.mailbox.publish(action)
+
+    def advance_scripted_input(
+        self, provider: ScriptedLeaderInput, sample: AM1LiveSample, *, epoch: int, clock_active: bool,
+    ) -> str | None:
+        """Commit a pure trajectory tick/completion against the same active epoch.
+
+        No logging, device access or waiting under these locks. A concurrent pause,
+        fault, stop or duration expiry wins over scripted progress/completion.
+        """
+        with self._body_send_gate:
+            with self._state_lock:
+                now = self._monotonic()
+                request_age = sample.request_roundtrip_age_s
+                if (
+                    not self._recovery_enabled or self._recovery_state != "active"
+                    or self._recovery_epoch != epoch or self._live_started_at is None
+                    or self._stop_requested.is_set() or self._finished.is_set() or self._error is not None
+                    or not self.is_alive()
+                    or (self._duration_s > 0 and now - self._live_started_at >= self._duration_s)
+                    or type(request_age) not in (int, float) or not math.isfinite(request_age) or request_age < 0
+                    or now < sample.observed_at
+                    or request_age + (now - sample.observed_at) >= AM1_LIVE_OBSERVATION_MAX_AGE_S
+                ):
+                    return None
+                if not clock_active:
+                    provider.admit(now)
+                provider.advance(now, sample.follower_positions, sample.observation_sequence, defer_events=True)
+                if provider.complete:
+                    if self._body_mailbox is not None:
+                        self._body_mailbox.clear()
+                    self._stop_requested.set()
+                    return "script_complete"
+                return "advanced"
 
     def mark_live_admitted(self) -> None:
         if not self._recovery_enabled:
@@ -769,6 +804,7 @@ def read_fresh_am1_live_sample(
         observation=MappingProxyType(dict(observation)),
         follower_positions=MappingProxyType(follower_positions),
         arm_target=MappingProxyType(arm_target),
+        request_roundtrip_age_s=roundtrip_age if require_current_request else None,
     )
 
 
@@ -1442,6 +1478,8 @@ def run_alignment_gate(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--leader_source", choices=("physical", "scripted"), default="physical")
+    parser.add_argument("--motion_profile", choices=("ArmSmoke",), help="Explicit scripted AM1 input profile")
     parser.add_argument("--no_robot", action="store_true", help="Do not construct or connect the robot client")
     parser.add_argument("--no_leader", action="store_true", help="Do not construct or connect the leader arms")
     parser.add_argument(
@@ -1594,6 +1632,13 @@ def parse_args(
 ) -> argparse.Namespace:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.leader_source == "scripted":
+        if not args.local_mode or not args.unified_session_enter_confirmations:
+            parser.error("scripted input requires the unified AM1 Local workflow")
+        if args.motion_profile != "ArmSmoke" or args.no_leader or args.require_calibration_match:
+            parser.error("scripted input requires ArmSmoke, not disabled or physical-calibration leader mode")
+    elif args.motion_profile is not None:
+        parser.error("--motion_profile requires --leader_source scripted")
     if args.external_stop_file is not None:
         if not args.local_mode:
             parser.error("--external_stop_file is available only with --local_mode")
@@ -1737,6 +1782,8 @@ def parse_args(
             parser.error("--lift_only requires --fps 10")
         if not math.isfinite(args.duration_s) or not 0 < args.duration_s <= 30:
             parser.error("--lift_only requires --duration_s greater than 0 and no more than 30")
+        return args
+    if args.leader_source == "scripted":
         return args
     return resolve_leader_ports(args, parser, platform_name=platform_name)
 
@@ -1952,7 +1999,9 @@ def _print_connection_summary(args: argparse.Namespace) -> None:
     print("Aloha Mini client ready:")
     print(f"  Pi address: {args.remote_ip}")
     print(f"  Robot model: {args.robot_model}")
-    if args.no_leader:
+    if getattr(args, "leader_source", "physical") == "scripted":
+        print("  SCRIPTED LEADER INPUT — REAL FOLLOWER MOTION; ArmSmoke; physical leaders unused")
+    elif args.no_leader:
         print("  Leaders: disabled")
     else:
         print(f"  Left leader port: {args.left_port}")
@@ -2029,7 +2078,8 @@ def _run_am1_recovering_local_sender(
     input_fn: Callable[[str], str],
     sample_callback: Callable[[AM1LiveSample, Mapping[str, float | int]], None] | None,
     announce_active: Callable[[], None] | None,
-) -> None:
+    scripted_input: ScriptedLeaderInput | None = None,
+) -> str | None:
     """Unified Local only: a host-acknowledged hold while feedback recovers."""
     try:
         validate_am1_local_initial_admission(
@@ -2096,6 +2146,14 @@ def _run_am1_recovering_local_sender(
     observation_timeout_count = 0
     refusal: str | None = None
     operator_stop_requested = False
+    script_complete = False
+    scripted_clock_active = False
+
+    def freeze_script() -> None:
+        nonlocal scripted_clock_active
+        if scripted_input is not None:
+            scripted_input.freeze()
+            scripted_clock_active = False
 
     def request_manual_enter() -> None:
         nonlocal manual_requested
@@ -2165,6 +2223,8 @@ def _run_am1_recovering_local_sender(
                 break
             body_action = validate_am1_local_body_action(body_action_supplier())
             state, epoch, pause_started_at, pause_reason = sender.recovery_snapshot()
+            if state != "active" or not initial_active_ack:
+                freeze_script()
             if state == "active" and initial_active_ack:
                 body_mailbox.publish(body_action, published_at=now)
             elif all(float(value) == 0.0 for value in body_action.values()):
@@ -2217,10 +2277,12 @@ def _run_am1_recovering_local_sender(
                     require_current_request=True,
                 )
             except TransientFollowerObservation:
+                freeze_script()
                 observation_timeout_count += 1
                 note_unusable_feedback()
                 continue
             except StaleFollowerObservation:
+                freeze_script()
                 observation_timeout_count += 1
                 sender.request_pause("stale follower observation after leader sampling")
                 note_unusable_feedback()
@@ -2237,6 +2299,7 @@ def _run_am1_recovering_local_sender(
                 # This reply may have been requested before the sender entered PAUSED.
                 # Do not advance the pre-pause freshness origin; the next iteration
                 # retires its token window before qualification.
+                freeze_script()
                 continue
             last_observed_at = sample.observed_at
             last_leader_target = dict(sample.arm_target)
@@ -2244,6 +2307,7 @@ def _run_am1_recovering_local_sender(
             if state == "active":
                 if feedback["state"] == "paused" and feedback["epoch"] == epoch:
                     sender.request_pause("host watchdog reported measured-arm hold")
+                    freeze_script()
                     continue
                 if feedback["state"] == "ready" and not initial_active_ack:
                     if monotonic() - started_at >= AM1_LOCAL_AUTOMATIC_PAUSE_S:
@@ -2260,6 +2324,9 @@ def _run_am1_recovering_local_sender(
                     if announce_active is not None:
                         announce_active()
                     initial_active_ack = True
+                    if scripted_input is not None:
+                        scripted_input.admit(monotonic())
+                        scripted_clock_active = True
                     # This reply may contain a leader read predating the banner. Keep
                     # sending the approved aligned target until the next fresh sample.
                     continue
@@ -2268,6 +2335,19 @@ def _run_am1_recovering_local_sender(
                 sender.publish(scoped_action)
                 if sample_callback is not None:
                     sample_callback(sample, scoped_action)
+                if scripted_input is not None:
+                    # Advance only following current acknowledged active feedback.
+                    # The sample just published was read from this same provider.
+                    progress = sender.advance_scripted_input(
+                        scripted_input, sample, epoch=epoch, clock_active=scripted_clock_active,
+                    )
+                    scripted_clock_active = progress is not None
+                    if progress is None:
+                        freeze_script()
+                    scripted_input.flush_events()
+                    if progress == "script_complete":
+                        script_complete = True
+                        break
                 continue
 
             if state == "resuming":
@@ -2281,6 +2361,9 @@ def _run_am1_recovering_local_sender(
                         if announce_active is not None:
                             announce_active()
                     initial_active_ack = True
+                    if scripted_input is not None:
+                        scripted_input.admit(monotonic())
+                        scripted_clock_active = True
                     body_released = True
                     print(
                         f"RECOVERED — epoch={epoch} mode={resume_mode_pending} "
@@ -2369,7 +2452,7 @@ def _run_am1_recovering_local_sender(
                               "host_observation_id": last_host_observation_id, "observed_at": sample.observed_at,
                               "wall_time_ns": wall_time_ns()}, sort_keys=True), flush=True)
             sender.resume_from(sample.follower_positions, observed_at=sample.observed_at)
-        if refusal is None and not operator_stop_requested:
+        if refusal is None and not operator_stop_requested and not script_complete:
             final_state, _, _, _ = sender.recovery_snapshot()
             if not initial_active_ack:
                 refusal = f"AM1 Local initial active acknowledgement did not arrive within {AM1_LOCAL_AUTOMATIC_PAUSE_S:.0f}s"
@@ -2377,6 +2460,7 @@ def _run_am1_recovering_local_sender(
                 refusal = f"session duration expired while paused or recovering (state={final_state})"
     finally:
         primary_error = sys.exception()
+        freeze_script()
         join_error: BaseException | None = None
         diagnostic_error: BaseException | None = None
         if sender_started:
@@ -2422,6 +2506,9 @@ def _run_am1_recovering_local_sender(
                 raise outcome_error
             if diagnostic_error is not None:
                 raise diagnostic_error
+    if scripted_input is not None:
+        return "script_complete" if script_complete else ("operator_stop" if operator_stop_requested else "duration_expired")
+    return None
 
 
 def run_am1_live_sender(
@@ -2446,7 +2533,8 @@ def run_am1_live_sender(
     max_start_mismatch: float = 10.0,
     input_fn: Callable[[str], str] = input,
     announce_active: Callable[[], None] | None = None,
-) -> None:
+    scripted_input: ScriptedLeaderInput | None = None,
+) -> str | None:
     """Read devices on the caller thread while a private worker sends live actions."""
     approved_target = extract_am1_arm_positions(
         dict(initial_arm_target),
@@ -2493,7 +2581,7 @@ def run_am1_live_sender(
     if recovery_enabled:
         if body_action_supplier is None or live_arm_scope != "both" or follower_hold_target is None:
             raise SafetyRefusal("AM1 Local recovery requires both follower arms and Local body input")
-        _run_am1_recovering_local_sender(
+        return _run_am1_recovering_local_sender(
             robot, leader,
             initial_arm_target=approved_target,
             initial_follower_positions=follower_hold_target,
@@ -2503,9 +2591,10 @@ def run_am1_live_sender(
             max_start_mismatch=max_start_mismatch, monotonic=monotonic,
             wall_time_ns=wall_time_ns, sleep_fn=sleep_fn, should_stop=should_stop,
             body_action_supplier=body_action_supplier, input_fn=input_fn,
-            sample_callback=sample_callback, announce_active=announce_active,
+            sample_callback=sample_callback, announce_active=announce_active, scripted_input=scripted_input,
         )
-        return
+    if scripted_input is not None:
+        raise SafetyRefusal("scripted input requires the acknowledged Local recovery path")
 
     hold_target = follower_hold_target if live_arm_scope == "right_wrist_flex" else approved_target
     safe_target = dict(hold_target if live_arm_scope == "right_wrist_flex" else approved_target)
@@ -2709,6 +2798,10 @@ def run_teleoperation(
     teleoperation_active_announced = False
     alignment_monotonic = monotonic if uses_decoupled_am1_live_loop(args) else time.monotonic
     external_stop_path = getattr(args, "external_stop_file", None)
+    scripted_mode = getattr(args, "leader_source", "physical") == "scripted"
+    scripted_input: ScriptedLeaderInput | None = None
+    scripted_stop_reason = "fault"
+    arm_input_ready = False
 
     def external_stop_requested() -> bool:
         return external_stop_path is not None and external_stop_path.exists()
@@ -2741,7 +2834,30 @@ def run_teleoperation(
         else:
             print("NO_ROBOT: robot client construction and connection skipped.")
 
-        if not args.no_leader:
+        if scripted_mode:
+            print("SCRIPTED LEADER INPUT — REAL FOLLOWER MOTION", flush=True)
+            try:
+                seed_observation = get_fresh_follower_observation(
+                    robot, require_current_request=True, monotonic=monotonic,
+                    cancel_check=raise_if_external_stop_requested,
+                )
+                validate_am1_local_initial_admission(
+                    robot, observed_at=robot.latest_observation_received_at, monotonic=monotonic,
+                )
+                seed = extract_am1_arm_positions(seed_observation, source="scripted follower seed", leader_sample=False)
+                validate_selected_sync_positions(seed, AM1_ARM_POSITION_KEYS, source="scripted follower seed")
+                scripted_input = ScriptedLeaderInput(seed, joint_keys=AM1_ARM_POSITION_KEYS, fps=args.fps)
+                leader = scripted_input
+                arm_input_ready = True
+                print(json.dumps({"event": "am1_scripted_seed", "input_source": "scripted",
+                                  "motion_profile": args.motion_profile, "observation_sequence": robot.observation_sequence,
+                                  "observed_at": robot.latest_observation_received_at, "origin": seed,
+                                  "meaning": "frozen fresh follower seed; not large-offset leader synchronization"},
+                                 sort_keys=True), flush=True)
+            except SafetyRefusal as exc:
+                print(f"SAFETY REFUSAL: {exc}")
+                return 2
+        elif not args.no_leader:
             leader = BiSOLeader(make_leader_config(args))
             if args.require_calibration_match:
                 left_leader_connected = True
@@ -2769,10 +2885,11 @@ def run_teleoperation(
                 leader.right_arm.connect()
                 right_leader_connected = True
                 raise_if_external_stop_requested()
+            arm_input_ready = right_leader_connected
         else:
             print("NO_LEADER: leader construction and connection skipped.")
 
-        if args.robot_model == "alohamini1" and robot_connected and right_leader_connected:
+        if args.robot_model == "alohamini1" and robot_connected and arm_input_ready:
             try:
                 if args.startup_mode == "strict":
                     pending_arm_action, pending_observation, pending_observed_at = run_alignment_gate(
@@ -2796,6 +2913,12 @@ def run_teleoperation(
                         monotonic=monotonic,
                         sleep_fn=stop_aware_sleep,
                         enter_confirmation=getattr(args, "unified_session_enter_confirmations", False),
+                        confirmation_prompt=(
+                            "CONFIRMATION 2/3 — Scripted targets are frozen at fresh follower positions. "
+                            "Check the clear arm envelope and empty grippers; press Enter only for nominal "
+                            "30-second startup synchronization."
+                            if scripted_mode else None
+                        ),
                         cancel_check=(
                             raise_if_external_stop_requested
                             if getattr(args, "unified_session_enter_confirmations", False) else None
@@ -2830,8 +2953,11 @@ def run_teleoperation(
                     try:
                         require_enter_confirmation(
                             stop_aware_input,
-                            "CONFIRMATION 3/3 — Keep both leaders still and press Enter only to recheck "
-                            "alignment and enable live teleoperation.",
+                            ("CONFIRMATION 3/3 — REAL FOLLOWER MOTION: press Enter only to recheck "
+                             "alignment and start ArmSmoke; body keys are disabled, Q/Stop remains available."
+                             if scripted_mode else
+                             "CONFIRMATION 3/3 — Keep both leaders still and press Enter only to recheck "
+                             "alignment and enable live teleoperation."),
                         )
                     except SafetyRefusal as exc:
                         print(f"SAFETY REFUSAL: {exc}")
@@ -2841,7 +2967,7 @@ def run_teleoperation(
                     stop_aware_input("")
             else:
                 stop_aware_input("Press Enter to begin forwarding leader actions... ")
-            if args.robot_model == "alohamini1" and robot_connected and right_leader_connected:
+            if args.robot_model == "alohamini1" and robot_connected and arm_input_ready:
                 try:
                     unified = bool(getattr(args, "unified_session_enter_confirmations", False))
                     try:
@@ -2917,7 +3043,7 @@ def run_teleoperation(
         if (
             uses_decoupled_am1_live_loop(args)
             and robot_connected
-            and right_leader_connected
+            and arm_input_ready
             and pending_arm_action is not None
         ):
             if pending_observed_at is None:
@@ -2933,6 +3059,8 @@ def run_teleoperation(
                 quit_key = robot.config.teleop_keys.get("quit", "q")
                 if quit_key in keyboard_keys:
                     local_quit_requested = True
+                    return make_zero_action()
+                if scripted_mode:
                     return make_zero_action()
                 return make_local_body_action(robot, keyboard_keys)
 
@@ -2992,12 +3120,16 @@ def run_teleoperation(
                 teleoperation_active_announced = True
 
             def announce_unified_active() -> None:
+                if scripted_mode:
+                    print("TELEOPERATION ACTIVE — SCRIPTED LEADER INPUT — REAL FOLLOWER MOTION", flush=True)
+                    print("ArmSmoke active: body/lift keys disabled; Q/Stop cancels.", flush=True)
+                    return
                 print("TELEOPERATION ACTIVE — LEADER MOVEMENT IS NOW ALLOWED")
                 print("LOCAL BODY CONTROLS ACTIVE — W/S/Z/X/A/D AND U/J MAY NOW MOVE THE ROBOT")
 
             try:
                 raise_if_external_stop_requested()
-                run_am1_live_sender(
+                live_result = run_am1_live_sender(
                     robot,
                     leader,
                     initial_arm_target=pending_arm_action,
@@ -3019,7 +3151,10 @@ def run_teleoperation(
                     max_start_mismatch=args.max_start_mismatch,
                     input_fn=input_fn,
                     announce_active=announce_unified_active if unified_live else None,
+                    **({"scripted_input": scripted_input} if scripted_mode else {}),
                 )
+                if scripted_mode:
+                    scripted_stop_reason = "manual_q" if live_result == "operator_stop" else live_result
                 raise_if_external_stop_requested()
             except SafetyRefusal as exc:
                 print(f"SAFETY REFUSAL: {exc}")
@@ -3088,6 +3223,7 @@ def run_teleoperation(
             if args.no_robot:
                 print(f"[NO_ROBOT] action -> {action}")
     except ExternalStopRequested:
+        scripted_stop_reason = "explicit_stop"
         print("AM1 Local session stop requested; beginning ordinary client cleanup.")
         return 130
     finally:
@@ -3106,6 +3242,18 @@ def run_teleoperation(
             _attempt_cleanup(cleanup_errors, "robot disconnect", robot.disconnect)
         if visualization_started and shutdown_rerun is not None:
             _attempt_cleanup(cleanup_errors, "visualization shutdown", shutdown_rerun)
+
+        if scripted_mode:
+            if cleanup_errors or (primary_error is not None and not isinstance(primary_error, KeyboardInterrupt)):
+                scripted_stop_reason = "fault"
+            elif isinstance(primary_error, KeyboardInterrupt):
+                scripted_stop_reason = "keyboard_interrupt"
+            if scripted_input is not None:
+                _attempt_cleanup(cleanup_errors, "scripted input summary", lambda: scripted_input.finish(scripted_stop_reason))
+            else:
+                print(json.dumps({"event": "am1_scripted_input_summary", "input_source": "scripted",
+                                  "motion_profile": args.motion_profile, "stop_reason": scripted_stop_reason,
+                                  "profile_complete": False}, sort_keys=True), flush=True)
 
         print(
             "Shutdown complete: final zero requested when connected; "
