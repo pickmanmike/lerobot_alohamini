@@ -255,6 +255,57 @@ def test_one_count_relief_variation_is_logged_and_finishes_with_original_zero(
     assert not bus.is_connected
 
 
+@pytest.mark.parametrize("progress_sample,expected_elapsed", [(3, 0.306), (6, 0.612), (9, 0.918)])
+def test_initial_relief_allows_delayed_net_upward_progress_before_one_second(
+    operating_robot, capsys, progress_sample, expected_elapsed,
+):
+    robot, _ = operating_robot
+    bus = robot.left_bus
+    bus.up_factor = 0
+    setup = None
+    samples = 0
+
+    def hook(register):
+        nonlocal setup, samples
+        operation = getattr(robot, "_lift_operation", None)
+        if operation is None:
+            return
+        if register == "Present_Position" and operation.reader.phase == "relief_setup":
+            setup = round(bus.position)
+        if operation.reader.phase != "relief" or bus.registers[("Goal_Velocity", "lift_axis")] != -200:
+            return
+        if register == "Present_Position":
+            samples += 1
+            if samples == progress_sample:
+                # Synthetic delayed onset, not a reconstruction of the stopped run.
+                bus.position = setup - 1
+                bus.registers[(register, "lift_axis")] = setup - 1
+                bus.up_factor = 1
+        elif register == "Present_Velocity" and samples < progress_sample:
+            bus.read_sequences[(register, "lift_axis")] = [0]
+
+    bus.hook = hook
+    robot.connect(calibrate=False)
+    records = operational_records(capsys)
+    pending = [r for r in records if r["phase"] == "relief_direction_pending"]
+    qualified = [r for r in records if r["phase"] == "relief_direction_qualified"]
+    assert len(pending) == progress_sample - 1
+    assert all(r["present_position_raw"] == setup for r in pending)
+    assert len(qualified) == 1
+    assert qualified[0]["qualification_elapsed_s"] == pytest.approx(expected_elapsed)
+    assert qualified[0]["present_position_raw"] == setup - 1
+    assert qualified[0]["upward_ticks"] > qualified[0]["initial_upward_ticks"]
+    assert 9.5 <= robot._lift_operation.height_mm <= 12
+    assert robot.lift._z0_deg == pytest.approx(-8.7890625)
+    assert any(r["phase"] == "operational_ready" for r in records)
+    writes = [e[2:] for e in bus.events if e[1] == "write"]
+    assert writes.count(("Goal_Velocity", "lift_axis", -200)) == 1
+    assert bus.registers[("Goal_Velocity", "lift_axis")] == 0
+    robot.disconnect()
+    assert bus.registers[("Torque_Enable", "lift_axis")] == 0
+    assert not bus.is_connected
+
+
 @pytest.mark.parametrize("offsets", [(0, 0), (1, 0), (1, 1)])
 def test_initial_relief_direction_deadline_is_fixed_and_stops_without_upward_progress(
     operating_robot, monkeypatch, capsys, offsets,
@@ -292,20 +343,20 @@ def test_initial_relief_direction_deadline_is_fixed_and_stops_without_upward_pro
     bus.hook = hook
     with pytest.raises(RuntimeError) as failure:
         robot.connect(calibrate=False)
-    assert "initial upward direction not confirmed within 0.25 s" in str(failure.value.__cause__)
+    assert "initial upward direction not confirmed within 1.0 s" in str(failure.value.__cause__)
     assert failure.value.__cause__ is robot._lift_operation.failure
     start = next(t for t, register, motor, value in writes
                  if (register, motor, value) == ("Goal_Velocity", "lift_axis", -200))
     stop = next(t for t, register, motor, value in writes
                 if t >= start and (register, motor, value) == ("Goal_Velocity", "lift_axis", 0))
-    assert stop - start == pytest.approx(0.25)
-    assert samples == 2
+    assert stop - start == pytest.approx(1.0)
+    assert samples == 9
     assert sum((register, motor, value) == ("Goal_Velocity", "lift_axis", -200)
                for _, register, motor, value in writes) == 1
     records = operational_records(capsys)
     rejected = next(r for r in records if r.get("rejected") and r["phase"] == "relief")
-    assert rejected["qualification_elapsed_s"] == pytest.approx(0.25)
-    assert rejected["sample_monotonic_s"] < start + 0.25  # Last actual reply is NOT relabeled fresh.
+    assert rejected["qualification_elapsed_s"] == pytest.approx(1.0)
+    assert rejected["sample_monotonic_s"] < start + 1.0  # Last actual reply is NOT relabeled fresh.
     assert not any(r["phase"] in ("relief_direction_qualified", "operational_ready") for r in records)
     assert any(r["phase"] == "shutdown_verified" for r in records)
     assert bus.registers[("Goal_Velocity", "lift_axis")] == 0
@@ -313,24 +364,28 @@ def test_initial_relief_direction_deadline_is_fixed_and_stops_without_upward_pro
     assert not bus.is_connected
 
 
+@pytest.mark.parametrize("first_wrong_sample", [1, 6])
 def test_initial_relief_repeated_small_wrong_sign_velocity_still_stops_on_second_sample(
-    operating_robot, capsys,
+    operating_robot, capsys, first_wrong_sample,
 ):
     robot, _ = operating_robot
     bus = robot.left_bus
     bus.up_factor = 0
+    samples = 0
 
     def hook(register):
+        nonlocal samples
         if register == "Present_Velocity" and bus.registers[("Goal_Velocity", "lift_axis")] == -200:
-            bus.read_sequences[(register, "lift_axis")] = [50]
+            samples += 1
+            bus.read_sequences[(register, "lift_axis")] = [50 if samples >= first_wrong_sample else 0]
 
     bus.hook = hook
     with pytest.raises(RuntimeError) as failure:
         robot.connect(calibrate=False)
     assert "repeated velocity/position direction disagreement" in str(failure.value.__cause__)
     records = operational_records(capsys)
-    samples = [r for r in records if r["phase"] == "relief" and not r.get("rejected")]
-    assert len(samples) == 2
+    motion_records = [r for r in records if r["phase"] == "relief" and not r.get("rejected")]
+    assert len(motion_records) == first_wrong_sample + 1
     assert not any(r["phase"] in ("relief_direction_qualified", "operational_ready") for r in records)
     assert bus.registers[("Goal_Velocity", "lift_axis")] == 0
     assert bus.registers[("Torque_Enable", "lift_axis")] == 0
@@ -380,6 +435,7 @@ def test_initial_relief_cannot_qualify_late_upward_feedback(
 
     robot, clock = operating_robot
     bus = robot.left_bus
+    bus.up_factor = 0
     original_moving_height = OperationalLift._moving_height
     samples = 0
     first_position = None
@@ -393,19 +449,20 @@ def test_initial_relief_cannot_qualify_late_upward_feedback(
         samples += 1
         if samples == 1:
             first_position = bus.position
-            bus.up_factor = 0  # First sample stays at the command's initial position.
-        else:
-            clock.sleep(0.06)  # Scheduling delay before the transaction, not a larger reply budget.
+        if samples == 9:
+            # Arrive just after 1 s, but retain the unchanged temperature
+            # freshness window so this isolates the direction deadline.
+            clock.sleep(0.085)
+            bus.up_factor = 1
         result = original_moving_height(operation, phase)
-        bus.up_factor = 1
         return result
 
     original_sleep = clock.sleep
 
     def delayed_sleep(seconds):
         original_sleep(seconds)
-        if samples == 1 and seconds > 0.05 and bus.registers[("Goal_Velocity", "lift_axis")] == -200:
-            original_sleep(0.06)
+        if samples == 8 and seconds > 0.05 and bus.registers[("Goal_Velocity", "lift_axis")] == -200:
+            original_sleep(0.085)
 
     bus.hook = hook
     monkeypatch.setattr(OperationalLift, "_moving_height", moving_height)
@@ -413,11 +470,11 @@ def test_initial_relief_cannot_qualify_late_upward_feedback(
         monkeypatch.setattr(lift_relief.time, "sleep", delayed_sleep)
     with pytest.raises(RuntimeError) as failure:
         robot.connect(calibrate=False)
-    assert "initial upward direction not confirmed within 0.25 s" in str(failure.value.__cause__)
+    assert "initial upward direction not confirmed within 1.0 s" in str(failure.value.__cause__)
     records = operational_records(capsys)
     rejected = next(r for r in records if r.get("rejected") and r["phase"] == "relief")
-    assert 0.25 <= rejected["qualification_elapsed_s"] < 0.27
-    assert samples == (1 if delayed_boundary == "sleep" else 2)
+    assert 1.0 <= rejected["qualification_elapsed_s"] < 1.01
+    assert samples == (8 if delayed_boundary == "sleep" else 9)
     if delayed_boundary == "feedback":
         assert rejected["present_position_raw"] < first_position  # Fresh but too late.
     assert not any(r["phase"] in ("relief_direction_qualified", "operational_ready") for r in records)
@@ -431,8 +488,9 @@ def test_initial_relief_cannot_qualify_late_upward_feedback(
     ("current", "2000 mA"), ("voltage", "voltage"), ("interrupt", "cancelled"),
     ("temperature", "majority (3/5 time slots)"),
 ])
+@pytest.mark.parametrize("fault_sample", [2, 6])
 def test_initial_relief_pending_does_not_filter_faults_or_cancellation(
-    operating_robot, capsys, fault, reason,
+    operating_robot, capsys, fault, reason, fault_sample,
 ):
     robot, _ = operating_robot
     bus = robot.left_bus
@@ -444,9 +502,12 @@ def test_initial_relief_pending_does_not_filter_faults_or_cancellation(
         nonlocal samples
         operation = getattr(robot, "_lift_operation", None)
         if fault == "temperature" and register == "Present_Temperature":
-            # Synthetic sustained high at setup and the two genuine relief
-            # reads: three occupied slots, not three votes in one time slot.
-            heating = operation is not None and operation.reader.phase in ("relief_setup", "relief")
+            # Synthetic sustained high in three occupied slots. Test both
+            # the old interval and the newly allowed part of qualification.
+            heating = operation is not None and (
+                (fault_sample == 2 and operation.reader.phase == "relief_setup")
+                or (operation.reader.phase == "relief" and samples >= fault_sample - 2)
+            )
             bus.read_sequences[(register, "lift_axis")] = [60 if heating else 30]
         if bus.registers[("Goal_Velocity", "lift_axis")] != -200:
             if register == "Status":
@@ -458,7 +519,7 @@ def test_initial_relief_pending_does_not_filter_faults_or_cancellation(
             samples += 1
         elif register == "Present_Velocity":
             bus.read_sequences[(register, "lift_axis")] = [50 if samples == 1 else 0]
-        if samples != 2:
+        if samples != fault_sample:
             return
         if fault == "status" and register == "Status":
             bus.read_sequences[(register, "lift_axis")] = [4]
@@ -487,13 +548,16 @@ def test_initial_relief_pending_does_not_filter_faults_or_cancellation(
         assert rejected["temperature_c"] == 60
         assert "majority (3/5 time slots)" in rejected["rejection_reason"]
     assert not any(r["phase"] in ("relief_direction_qualified", "operational_ready") for r in records)
-    assert samples == 2
+    assert samples == fault_sample
     assert bus.registers[("Goal_Velocity", "lift_axis")] == 0
     assert bus.registers[("Torque_Enable", "lift_axis")] == 0
     assert not bus.is_connected
 
 
-def test_relief_one_count_allowance_cannot_accumulate_downward_drift(operating_robot, capsys):
+@pytest.mark.parametrize("first_backstep_sample", [1, 6])
+def test_relief_one_count_allowance_cannot_accumulate_downward_drift(
+    operating_robot, capsys, first_backstep_sample,
+):
     robot, _ = operating_robot
     bus = robot.left_bus
     setup = None
@@ -510,8 +574,8 @@ def test_relief_one_count_allowance_cannot_accumulate_downward_drift(operating_r
             if register == "Present_Position":
                 samples += 1
                 # Each step is only one count, but the second exceeds the fixed best-position band.
-                bus.position = setup + samples
-                bus.registers[(register, "lift_axis")] = setup + samples
+                bus.position = setup + max(0, samples - first_backstep_sample + 1)
+                bus.registers[(register, "lift_axis")] = round(bus.position)
             elif register == "Present_Velocity":
                 bus.read_sequences[(register, "lift_axis")] = [0]
 
@@ -521,7 +585,7 @@ def test_relief_one_count_allowance_cannot_accumulate_downward_drift(operating_r
     assert "unexpected downward direction" in str(failure.value.__cause__)
     records = operational_records(capsys)
     rejected = next(r for r in records if r.get("rejected") and r["phase"] == "relief")
-    assert samples == 2
+    assert samples == first_backstep_sample + 1
     assert rejected["present_position_raw"] == setup + 2
     assert not any(r["phase"] == "operational_ready" for r in records)
     assert bus.registers[("Goal_Velocity", "lift_axis")] == 0
