@@ -841,12 +841,12 @@ def test_real_host_polls_before_actions_and_cleans_up_latched_fault_without_swal
         original_connect(calibrate=False, **kwargs)
         operation = robot._lift_operation
         poll = operation.poll
-        def checked_poll():
+        def checked_poll(**kwargs):
             events.append("poll")
             if not fail_action and events.count("poll") == 4:
                 operation.failure = primary
                 raise primary
-            poll()
+            poll(**kwargs)
         operation.poll = checked_poll
         apply = operation.apply_action
         def checked_apply(action):
@@ -918,6 +918,169 @@ def test_normal_live_rate_has_no_confirmation_wait_or_false_stale_window(operati
         assert clock.now - before == pytest.approx(0.002)
     assert op.failure is None
     robot.disconnect()
+
+
+@pytest.mark.parametrize("log_delay,log_error", [(0.026, False), (0.060, False), (0.501, False), (0, True)])
+def test_real_host_consumes_fresh_lift_sample_before_slow_routine_logging(
+    operating_robot, monkeypatch, log_delay, log_error,
+):
+    """Synthetic saved-log delays must not age feedback before its consumers."""
+    from types import SimpleNamespace
+    from lerobot.robots.alohamini import alohamini_host as host
+
+    robot, clock = operating_robot
+    events = []
+    records = []
+    primary = OSError("synthetic log sink failure")
+    monkeypatch.setattr(host, "AlohaMini", lambda config: robot)
+    monkeypatch.setattr(host.time, "perf_counter", clock.monotonic)
+    monkeypatch.setattr("sys.argv", ["host", "--robot_model", "alohamini1", "--no_cameras"])
+    original_connect = robot.connect
+
+    def connect(**kwargs):
+        original_connect(calibrate=False, **kwargs)
+        op = robot._lift_operation
+        emit = op.emit
+
+        def delayed_emit(record):
+            if record["phase"] == "live":
+                events.append("lift_log")
+                records.append(dict(record))
+                clock.sleep(log_delay)
+                if log_error:
+                    raise primary
+            emit(record)
+
+        op.emit = delayed_emit
+
+    monkeypatch.setattr(robot, "connect", connect)
+    original_action = robot.send_action
+    original_observation = robot.get_observation
+
+    def action(values):
+        events.append("action")
+        return original_action(values)
+
+    def observation():
+        events.append("observation")
+        clock.sleep(0.006)  # Synthetic finite arm/body-read work, not network delay.
+        return original_observation()
+
+    monkeypatch.setattr(robot, "send_action", action)
+    monkeypatch.setattr(robot, "get_observation", observation)
+
+    class Requests:
+        def recv_multipart(self, **kwargs):
+            return [b"client", b"request"]
+
+        def send_multipart(self, parts, **kwargs):
+            assert parts[:2] == [b"client", b"request"]
+            events.append("reply")
+
+    command = json.dumps({"x.vel": 0, "y.vel": 0, "theta.vel": 0, "lift_axis.vel": 0})
+    monkeypatch.setattr(host, "AlohaMiniHost", lambda config: SimpleNamespace(
+        connection_time_s=1, max_loop_freq_hz=30, watchdog_timeout_ms=1000,
+        zmq_cmd_socket=SimpleNamespace(recv_string=lambda flags: command),
+        zmq_observation_socket=Requests(), disconnect=lambda: None,
+    ))
+    if log_error or log_delay > 0.5:
+        with pytest.raises((OSError, RuntimeError)) as caught:
+            host.main()
+        assert caught.value is robot._lift_operation.failure
+        if log_error:
+            assert caught.value is primary
+        else:
+            assert "stale" in str(caught.value)
+        assert len(records) == 1  # Next tick refuses before another action/read.
+    else:
+        host.main()
+        assert len(records) >= 10
+        assert robot._lift_operation.failure is None
+    assert events == ["action", "observation", "reply", "lift_log"] * len(records)
+    assert all(r["temperature_window"]["ready"] for r in records)
+    assert all(r["temperature_window"]["span_s"] <= 0.5 for r in records)
+    assert all(b["sample_monotonic_s"] > a["sample_monotonic_s"] for a, b in zip(records, records[1:]))
+    assert all(
+        b["sample_monotonic_s"] - a["sample_monotonic_s"] == pytest.approx(log_delay + 0.008)
+        for a, b in zip(records, records[1:])
+    )  # Logging time counts toward the loop budget; no extra fixed sleep or catch-up.
+    assert robot.left_bus.registers[("Goal_Velocity", "lift_axis")] == 0
+    assert robot.left_bus.registers[("Torque_Enable", "lift_axis")] == 0
+    assert not robot.left_bus.is_connected
+
+
+@pytest.mark.parametrize("failure_stage", ["observation", "reply", "interrupt"])
+@pytest.mark.parametrize("log_error", [False, True])
+def test_host_preserves_pending_sample_after_safe_cleanup(operating_robot, monkeypatch, failure_stage, log_error):
+    from types import SimpleNamespace
+    from lerobot.robots.alohamini import alohamini_host as host
+
+    robot, clock = operating_robot
+    events = []
+    records = []
+    primary = RuntimeError("synthetic consumer fault")
+    sink_error = OSError("synthetic final sample log failure")
+    original_connect = robot.connect
+
+    def connect(**kwargs):
+        original_connect(calibrate=False, **kwargs)
+        operation = robot._lift_operation
+        emit = operation.emit
+
+        def checked_emit(record):
+            if record["phase"] == "live":
+                assert events == ["socket_closed"]
+                assert not robot.left_bus.is_connected
+                assert robot.left_bus.registers[("Goal_Velocity", "lift_axis")] == 0
+                assert robot.left_bus.registers[("Torque_Enable", "lift_axis")] == 0
+                records.append(dict(record))
+                if log_error:
+                    raise sink_error
+            emit(record)
+
+        operation.emit = checked_emit
+
+    def fail():
+        if failure_stage == "interrupt":
+            raise KeyboardInterrupt
+        robot._lift_operation.failure = primary
+        raise primary
+
+    original_observation = robot.get_observation
+
+    def observation():
+        return original_observation() if failure_stage == "reply" else fail()
+
+    def no_command(flags):
+        raise host.zmq.Again()
+
+    monkeypatch.setattr(robot, "connect", connect)
+    monkeypatch.setattr(robot, "get_observation", observation)
+    monkeypatch.setattr(host, "AlohaMini", lambda config: robot)
+    monkeypatch.setattr(host.time, "perf_counter", clock.monotonic)
+    monkeypatch.setattr("sys.argv", ["host", "--robot_model", "alohamini1", "--no_cameras"])
+    monkeypatch.setattr(host, "AlohaMiniHost", lambda config: SimpleNamespace(
+        connection_time_s=1, max_loop_freq_hz=30, watchdog_timeout_ms=1000,
+        zmq_cmd_socket=SimpleNamespace(recv_string=no_command),
+        zmq_observation_socket=SimpleNamespace(
+            recv_multipart=lambda **kwargs: [b"client", b"request"],
+            send_multipart=lambda *args, **kwargs: fail(),
+        ),
+        disconnect=lambda: events.append("socket_closed"),
+    ))
+    if failure_stage == "interrupt" and not log_error:
+        host.main()  # Retain the host's ordinary clean Ctrl+C behavior.
+    else:
+        with pytest.raises((RuntimeError, OSError)) as caught:
+            host.main()
+        assert caught.value is (sink_error if failure_stage == "interrupt" else primary)
+        if failure_stage != "interrupt":
+            assert robot._lift_operation.failure is primary
+        if log_error and failure_stage != "interrupt":
+            assert "pending lift sample" in " ".join(caught.value.__notes__)
+    assert len(records) == 1
+    assert records[0]["sample_monotonic_s"] < clock.now
+    assert robot._lift_operation._pending_sample is None
 
 
 @pytest.mark.parametrize("temperatures,fails", [([37, 80, 37, 37, 37], False), ([60] * 5, True)])
