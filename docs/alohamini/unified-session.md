@@ -8,7 +8,7 @@ had a maximum browser display gap of `1.138 s`, above the unchanged `500 ms`
 continuity target. Loss of a required view still means release controls, press
 `Q`, and restart only after all owned processes have stopped.
 
-## Current integration and deployment — September 27, 2026
+## Integrated baseline and reliability follow-up — September 27, 2026
 
 PR #7 is merged into `integrate/am1-local-teleop`, not `main`, at
 `865bfd1f4de9a276cebe9650a4fd2e951f492169`. Its ordered parents are
@@ -19,7 +19,7 @@ reviewed head; the subsequent closeout edits are documentation only.
 | Evidence or deployed component | Exact source |
 |---|---|
 | Physically exercised client/session workflow and motor | `a6a263266888ebc2cd658d0ff5be670632ded3d0` |
-| Currently deployed Windows client/session and Pi session helper | `f7d00306ab889556c79a4939f32b993f247bba61` |
+| Windows client/session and Pi session helper used by the reviewed reliability attempts | `f7d00306ab889556c79a4939f32b993f247bba61` |
 | Currently deployed Pi motor, intentionally unchanged | `a6a263266888ebc2cd658d0ff5be670632ded3d0` |
 | Separately deployed Pi camera, intentionally unchanged | `047c4fcf7cbf34684a9b8c348193585938975815` |
 
@@ -44,6 +44,29 @@ review cleared the scoped findings. These are earlier test executions, not
 tests rerun for this documentation closeout. Fresh integration checks verified
 the exact heads, merge parents/tree, source references and documentation diff;
 no new powered acceptance or long-duration claim is made.
+
+The subsequent `codex/am1-session-reliability` follow-up is separate from closed
+PR #7 and targets `integrate/am1-local-teleop`, not `main`. It corrects fault/exit
+reporting and one pre-authentication timeout classification, and adds bounded
+control-link and resume-input evidence. Its implementation commits are
+`a63544d9`, `c36b97e3`, `7f780513` and `178044d0`. Only the Windows client/session
+and Pi helper require these updates; the motor and separate camera remain at
+the exact sources above. Check the private session pin against the deployed
+helper rather than treating this historical source table as a deployment command.
+
+Fresh follow-up verification: 285 passed, 1 skipped across the affected session,
+SSH reconnect, Local recovery, live-cadence and client-connection test files.
+Compilation, helper/client help, fresh imports, lazy visualization/OpenCV checks,
+PowerShell parsing and diff checks passed. These are offline checks, not new
+physical acceptance; the earlier 686/1 and browser results above remain historical.
+
+The seven reviewed follow-up attempts show distinct pre-authentication failures,
+authenticated control-link loss/lease expiry, a bounded startup-feedback refusal,
+and a live pause followed by controller-driven stopping. The two child exits of
+130 were **not operator cancellation**, according to the owner and control-link
+evidence. A later successful large-offset synchronization is recorded below;
+the qualified earlier workflow pass is retained. No change here is evidence that
+the intermittent transport failure has been cured.
 
 ## Compact design
 
@@ -275,10 +298,12 @@ never kills unrelated Python, camera, or motor processes.
 
 ## Retained limitations and follow-up
 
-- The large-offset right-shoulder tracking shortfall remains unresolved even
-  after sampled goal-register delivery. The successful closer start does not
-  isolate loading or repair that behavior. Match the leader to the current
-  measured follower before startup approval; keep the existing gate and bounds.
+- A later run synchronized the right shoulder from about +99.069 toward -5.936,
+  reaching -1.604 and passing the unchanged gate. Large-offset tracking therefore
+  succeeded in that pose. It does not erase the earlier 13.402-unit plateau at a
+  different target after sampled goal-register delivery or establish arbitrary-pose
+  convergence. Continue matching the leader to the current measured follower for
+  ordinary startup; keep the existing gate and bounds.
 - Intermittent Forward-camera acquisition can fail before any motor startup.
   Replug recovery does not establish a loose connector or a network cause.
   Preserve that refusal and its cleanup instead of automatically retrying.
@@ -290,12 +315,22 @@ never kills unrelated Python, camera, or motor processes.
   arbitrary-pose tracking, unattended operation or remote-use readiness. Raw
   lift-feedback limitations and genuine historical faults remain recorded.
 
-The next recommended improvement is a separate, bounded camera-observability
-follow-up: retain private backend diagnostics and distinguish acquisition from
-browser delivery using existing evidence first. Do not add a duplicate reader,
-global USB reset, automatic powered restart or mandatory repeat campaign.
-The detailed shoulder/camera review remains private; this is its sanitized
-follow-up summary, not a reopened integration blocker.
+Session reliability takes priority over a camera-only follow-up. The saved host
+sensor loops continued near 30 Hz during Windows observation gaps; this does not
+prove that a reply was delivered or distinguish a network failure from every
+possible queuing condition. No demonstrated defect justifies larger queues,
+longer motion-freshness/watchdog/lease limits, or automatic supervisor relaunch.
+An offline disposable control peer verifies that waiting for the first Enter
+does not itself stop heartbeats. Actual local ZMQ peers cover short-gap recovery
+and fresh-feedback-qualified manual resume; these are not physical tests.
+
+At the next ordinary supervised use, retain the existing automatic evidence and
+the added diagnostics below. If it stops, inspect that exact failure rather than
+repeat unchanged. Camera acquisition, browser delivery and display correlation
+remain separate follow-ups; no new acquisition refusal appeared in the seven
+reviewed attempts, and four reached all-five readiness. Do not add a duplicate
+reader, global USB reset or a required repeat commissioning campaign. Detailed
+session evidence remains private; this is only a sanitized current-state summary.
 
 ## Evidence and recovery
 
@@ -310,6 +345,30 @@ The folder contains the exact Windows client log, exact copied host/camera logs,
 requested and measured live interval, synchronization timing, reviewed source
 heads, recovered-gap warnings, process exits, cleanup verification, and copy
 result. Remote originals remain in place.
+
+The reliability follow-up adds:
+
+- `client-stop.json` and `cleanup.client.stop_context`: the first **observed**
+  controller stop trigger (explicit Stop, Ctrl+C or remote fault), timestamp and
+  fault detail. A remote-driven child 0/130 becomes session status 2, while the
+  raw child/wrapper codes stay recorded. A pre-existing client safety refusal
+  stays primary. This is not proof of ordering between simultaneous signals.
+- `cleanup.control_link`: attempted/completed/failed writes and separate
+  heartbeat counts/timestamps that survive the later STOP write. Successful pipe
+  writing is not proof of remote receipt. Pi transition/state records include
+  receive counts, last heartbeat time and contact age at cleanup. These are
+  bounded counters, not a per-heartbeat file log or a new acknowledgement protocol.
+- `am1_local_resume_input_received`, then (only when its gates pass)
+  `am1_local_resume_qualified`, then host-acknowledged `am1_local_recovered`.
+  The final cadence record includes recovery state/epoch and input disposition;
+  `manual_input_qualified` means permitted to request resume, not host acknowledgement.
+  Enter receipt alone cannot authorize motion. Final `stale_latched=false` alone
+  is not a freshness claim: inspect observation age and recovery state.
+
+No per-run private-config copy existed in the seven older uploaded folders.
+Their summaries record Pi source pins; Windows command headers identify the
+script/environment, with commit identity supported by the enforced matching
+local preflight. Do not describe missing snapshots as present.
 
 If a copy fails, `missing-logs.json` records only the exact missing remote paths.
 An empty or absent manifest is not proof that every artifact was discovered.

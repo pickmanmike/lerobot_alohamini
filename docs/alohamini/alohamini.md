@@ -109,11 +109,17 @@ clean component exits and collected evidence. The later `f7d00306` connection
 correction was tested offline and deployed; this merge is not a new physical
 test or a claim that it fixes the separate shoulder/camera limitations.
 
-Windows client/session and Pi session helper remain at `f7d00306`; Pi motor
-remains at `a6a26326`; the separately deployed camera remains at
+The subsequent seven reliability attempts used Windows client/session and Pi
+helper `f7d00306`, Pi motor `a6a26326`, and the separate camera
 `047c4fcf7cbf34684a9b8c348193585938975815`, which is **not** in this merge's
 ancestry. Full source identities, operating limits, retained follow-ups and the
 ordinary-use procedure are in the [unified-session runbook](unified-session.md).
+The separate `codex/am1-session-reliability` follow-up corrects remote-fault
+exit classification, recognizes a pre-auth SSH handshake-timeout form, and
+records heartbeat and resume-input evidence. It does not claim to fix the
+intermittent transport loss, change motor settings, or reopen merged PR #7.
+A large-offset right-shoulder synchronization passed in a later pose; the
+earlier target-specific tracking shortfall remains documented.
 No checkout, private reference, calibration, map, credential or environment is
 changed merely to match the integration SHA. The next use is ordinary attended
 operation, not another required commissioning session.
