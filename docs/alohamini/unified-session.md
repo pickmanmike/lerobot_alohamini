@@ -23,6 +23,7 @@ reviewed head; the subsequent closeout edits are documentation only.
 | Motor used by those attempts, before the logging-order correction | `a6a263266888ebc2cd658d0ff5be670632ded3d0` |
 | Motor-only logging-order correction used by the later first-relief refusal | `4e16b18b732247072157d3dc64dad6117761ea13` |
 | Motor-only initial-relief qualification; later scripted attempt refused before readiness | `699d6eaf19de1dc80dfcd6621406ba7850fae446` |
+| Motor-only one-second initial qualification; subsequent ArmSmoke started but did not complete | `b0bce720572e83b7046d1234a997a3064ce118b9` |
 | Windows client/session and Pi helper deployed for the first scripted attempt | `60fcd9bcc4deecae76520b9c35e7120d889414ad` |
 | Separately deployed Pi camera, intentionally unchanged | `047c4fcf7cbf34684a9b8c348193585938975815` |
 
@@ -225,6 +226,45 @@ onsets at 306, 612 and 918 ms now qualify; no onset by 1.0 s and late feedback s
 stop. Extended-window direction/fault/cancellation cases retain zero/torque-off
 cleanup and original error identity. Compilation and diff checks passed. These
 are simulated policy results, not retrospective proof of the observed lift motion.
+
+The reviewed two-file motor change was cherry-picked with source provenance onto
+the preserved motor lineage as `b0bce720572e83b7046d1234a997a3064ce118b9`. Its
+source/test blobs match the reviewed correction. Only the backed-up private motor
+pin changed; client/session and Pi helper remain at `60fcd9bc`, camera at
+`047c4fcf`. Hardware-free deployed import-root, compilation and help checks passed.
+
+### Subsequent attended ArmSmoke: startup passed, live profile incomplete
+
+One subsequent attended attempt used those exact components and the existing
+launcher, answering each actual Enter prompt individually. Initial upward progress
+qualified after the former 250 ms allowance but within the approved one second.
+Home, full bounded relief, readiness and nominal synchronization completed. The
+real scripted arm profile then started; it did **not** reach normal completion.
+
+A recoverable observation-age pause preceded a terminal host refusal in
+`get_observation` / `OperationalLift.contribute_observation`: the oldest retained
+temperature-slot reading crossed the unchanged 0.5-second freshness boundary
+between sampling and consumption. This was not a confirmed temperature rise or
+another initial-relief failure. Saved-sample replay through the actual window
+class reproduces that boundary; it does not establish the cause of the earlier
+observation gap or authorize relaxing freshness. No further timing allowance,
+camera/network change, or motor tuning was made.
+
+Feedback showed movement for several exercised arm channels, incomplete return
+tracking for some, and no measured displacement for one small elbow excursion.
+The last two channels were not reached. Generated targets and profile admission
+are not proof of complete physical tracking. Detailed joint/timing evidence remains
+private; the earlier qualified physical-leader milestones are unchanged.
+
+The supervisor stopped the client after the host fault, not operator Q. Actual
+exits were host 1, client 130, camera 0 and unified session 2. The lift separately
+verified zero goal, torque off and a stopped window after settling. Preserve the
+supervisor's conservative `cleanup_unknown` classification rather than relabeling
+the run as success. Exact logs were collected; subsequent read-only inspection
+found no session-owned runtime and clean deployed checkouts. No further powered
+attempt followed. The next scoped work is the demonstrated read-to-consumer
+freshness timing boundary, keeping the existing 0.5-second policy and single bus
+owner; do not repeat this run unchanged. PRs #8 and #9 remain draft and unmerged.
 
 ## Compact design
 
