@@ -22,7 +22,8 @@ reviewed head; the subsequent closeout edits are documentation only.
 | Windows client/session and Pi session helper for the latest ordinary-use attempts | `16c557c05497c94d0bb2e2938c51d4ba56b0a549` |
 | Motor used by those attempts, before the logging-order correction | `a6a263266888ebc2cd658d0ff5be670632ded3d0` |
 | Motor-only logging-order correction used by the later first-relief refusal | `4e16b18b732247072157d3dc64dad6117761ea13` |
-| Motor-only initial-relief qualification staged; not physically exercised | `699d6eaf19de1dc80dfcd6621406ba7850fae446` |
+| Motor-only initial-relief qualification; later scripted attempt refused before readiness | `699d6eaf19de1dc80dfcd6621406ba7850fae446` |
+| Windows client/session and Pi helper deployed for the first scripted attempt | `60fcd9bcc4deecae76520b9c35e7120d889414ad` |
 | Separately deployed Pi camera, intentionally unchanged | `047c4fcf7cbf34684a9b8c348193585938975815` |
 
 The camera commit is **not an ancestor** of the integration merge. The private
@@ -109,7 +110,8 @@ Independent review found no blocker; its confirmed-temperature case is now a
 permanent regression. Compile, help/import-root and diff checks passed. The
 motor-only deployment `699d6eaf` contains the identical four Python/test files;
 only the backed-up private motor pin changed. Its Pi compile/import/help and
-helper print-only checks passed. No powered attempt was run for this correction.
+helper print-only checks passed. No powered attempt was run at that correction's
+closeout; the later scripted attempt below exercised it and refused before readiness.
 
 Physical-leader ordinary use uses `-DurationSeconds 300` as a ceiling, the same three actual
 Enter prompts and nominal 30-second synchronization. The owner can finish a
@@ -191,6 +193,23 @@ PowerShell parsing, help/import/lazy-camera checks and diff checks passed. Indep
 review reproduced and verified corrections to atomic completion and combined-age
 freshness races. Its real sender/host-protocol exercise still used fake hardware;
 none of these results is physical tracking or clearance evidence.
+
+The first attended scripted attempt reached all-five camera readiness, and the
+unchanged motor reported homing complete. It then refused because initial upward
+relief progress did not qualify within the existing 250 ms window. No Windows
+client started: there was no synchronization, live admission, generated ArmSmoke
+motion, or physical tracking result. This was a lift-startup refusal, not a
+temperature-confirmation fault or a demonstrated scripted-input defect.
+
+The motor subsequently recorded zero goal, torque off and a qualified stopped
+window. Preserve the operational failure: host exit 1, camera exit 0, session exit
+2; the supervisor conservatively retained `cleanup_unknown` because of the host
+failure. Complete logs were collected and all session-owned processes stopped.
+No second attempt was launched. A later encoder change during cleanup does not
+retroactively qualify relief. The cause of the initial lack of progress remains
+unresolved; no motor bound or policy was changed merely to get past this refusal.
+Detailed evidence stays private. Resolve that specific startup boundary before
+another ArmSmoke attempt; do not repeat unchanged or reopen passed arm/base tests.
 
 ## Compact design
 
@@ -363,9 +382,11 @@ That attempt completed homing but refused before operational readiness,
 synchronization or live control. Cleanup verified zero goal, torque off and a
 stopped window; the genuine operational refusal remains a failed session.
 It did not reach the ordinary loop and therefore neither validates nor
-disproves the preceding logging-order correction. The new initial qualification
-has not yet been physically exercised. Focused fake-clock/grouped-feedback
-validation of the operational and standalone relief files passed **156 tests**;
+disproves the preceding logging-order correction. The initial qualification was
+later exercised by the scripted attempt recorded above, which refused before
+readiness; that is not a successful relief or arm-profile result. Focused
+fake-clock/grouped-feedback validation of the operational and standalone relief
+files passed **156 tests**;
 historical motor/camera acceptance remains separate.
 
 After a complete fresh stopped window, velocity-only uncertainty may requalify
