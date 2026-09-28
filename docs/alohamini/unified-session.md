@@ -21,7 +21,7 @@ reviewed head; the subsequent closeout edits are documentation only.
 | Physically exercised client/session workflow and motor | `a6a263266888ebc2cd658d0ff5be670632ded3d0` |
 | Windows client/session and Pi session helper for the latest ordinary-use attempts | `16c557c05497c94d0bb2e2938c51d4ba56b0a549` |
 | Motor used by those attempts, before the logging-order correction | `a6a263266888ebc2cd658d0ff5be670632ded3d0` |
-| Motor-only logging-order correction deployed for the next supervised use | `4e16b18b732247072157d3dc64dad6117761ea13` |
+| Motor-only logging-order correction used by the later first-relief refusal | `4e16b18b732247072157d3dc64dad6117761ea13` |
 | Separately deployed Pi camera, intentionally unchanged | `047c4fcf7cbf34684a9b8c348193585938975815` |
 
 The camera commit is **not an ancestor** of the integration merge. The private
@@ -255,10 +255,33 @@ not retained; no source penalty or server-side setting change is established.
 The owner-approved AM1 operational lift guard permits at most one encoder count
 (about 0.0205 mm) below the best upward position reached during relief. It logs
 that raw variation; the reference does not follow successive downward samples.
-More downward travel, uncorroborated positive raw velocity, or repeated
-velocity/position direction disagreements still refuse startup. The original
-homed zero, 10 mm relief target, 12 mm maximum and 8-second relief bound remain.
-The standalone comparison keeps its stricter direction rule.
+Normal AM1 startup now has a fixed **250 ms initial direction-qualification
+window**, anchored once after the upward command completes. Fresh net upward
+encoder progress must qualify before it expires; returning from a one-count
+backstep to the initial position is not sufficient. During this initial window
+only, an uncorroborated positive raw velocity no greater than the existing
+50-raw stationary-feedback bound may await the next sample. The one-count
+travel boundary remains active, and two consecutive wrong-sign velocity
+samples still refuse. A larger uncorroborated positive velocity, late/missing
+qualification or any genuine telemetry fault stops through existing cleanup.
+Once upward progress qualifies, the initial window never reopens. Full pending,
+qualified and rejected feedback is retained without inventing sample freshness.
+The original homed zero, 10 mm relief target, 12 mm maximum, 8-second relief
+bound and two-second useful-progress check remain. The standalone comparison
+keeps its stricter immediate direction rule; AM2/AM2 Pro are unchanged.
+
+This owner-approved qualification is a bounded operating-policy change, not
+proof that the earlier first-sample velocity/position disagreement was false.
+Its offline cases model an initial one-count backstep and later upward progress;
+they do not claim that the stopped physical attempt would have recovered.
+That attempt completed homing but refused before operational readiness,
+synchronization or live control. Cleanup verified zero goal, torque off and a
+stopped window; the genuine operational refusal remains a failed session.
+It did not reach the ordinary loop and therefore neither validates nor
+disproves the preceding logging-order correction. The new initial qualification
+has not yet been physically exercised. Focused fake-clock/grouped-feedback
+validation of the operational and standalone relief files passed **156 tests**;
+historical motor/camera acceptance remains separate.
 
 After a complete fresh stopped window, velocity-only uncertainty may requalify
 for at most one second from the last valid window, with position confined to
