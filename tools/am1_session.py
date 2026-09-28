@@ -39,6 +39,7 @@ _TEMPORARY_PRE_AUTH_ERROR = re.compile(
     r"(?m)^ssh: connect to host [^\r\n]+ port \d+: "
     r"(?:Connection timed out|Connection refused|No route to host|Network is unreachable)$"
     r"|^Connection timed out during banner exchange$"
+    r"|^Connection to [^\r\n]+ port \d+ timed out$"
     r"|^kex_exchange_identification: "
     r"(?:read: Connection reset by peer|Connection closed by remote host)$"
 )
@@ -628,6 +629,7 @@ class SSHRemote:
                     r"Host key verification failed\.?|Permission denied \([^)]+\)\.?"
                     r"|ssh: connect to host [^\r\n]+ port \d+: [^\r\n]+"
                     r"|Connection timed out during banner exchange"
+                    r"|Connection to [^\r\n]+ port \d+ timed out"
                     r"|kex_exchange_identification: [^\r\n]+"
                     r"|Timeout, server [^\r\n]+ not responding\.",
                     line.strip(),
