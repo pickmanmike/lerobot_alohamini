@@ -19,8 +19,9 @@ reviewed head; the subsequent closeout edits are documentation only.
 | Evidence or deployed component | Exact source |
 |---|---|
 | Physically exercised client/session workflow and motor | `a6a263266888ebc2cd658d0ff5be670632ded3d0` |
-| Windows client/session and Pi session helper used by the reviewed reliability attempts | `f7d00306ab889556c79a4939f32b993f247bba61` |
-| Currently deployed Pi motor, intentionally unchanged | `a6a263266888ebc2cd658d0ff5be670632ded3d0` |
+| Windows client/session and Pi session helper for the latest ordinary-use attempts | `16c557c05497c94d0bb2e2938c51d4ba56b0a549` |
+| Motor used by those attempts, before the logging-order correction | `a6a263266888ebc2cd658d0ff5be670632ded3d0` |
+| Motor-only logging-order correction deployed for the next supervised use | `4e16b18b732247072157d3dc64dad6117761ea13` |
 | Separately deployed Pi camera, intentionally unchanged | `047c4fcf7cbf34684a9b8c348193585938975815` |
 
 The camera commit is **not an ancestor** of the integration merge. The private
@@ -49,10 +50,10 @@ The subsequent `codex/am1-session-reliability` follow-up is separate from closed
 PR #7 and targets `integrate/am1-local-teleop`, not `main`. It corrects fault/exit
 reporting and one pre-authentication timeout classification, and adds bounded
 control-link and resume-input evidence. Its implementation commits are
-`a63544d9`, `c36b97e3`, `7f780513` and `178044d0`. Only the Windows client/session
-and Pi helper require these updates; the motor and separate camera remain at
-the exact sources above. Check the private session pin against the deployed
-helper rather than treating this historical source table as a deployment command.
+`a63544d9`, `c36b97e3`, `7f780513` and `178044d0`. Those changes updated only the
+Windows client/session and Pi helper. The later motor-only correction below is
+separate; the camera remains unchanged. Check all private session pins against
+their deployed components rather than deploying every component at one SHA.
 
 Fresh follow-up verification: 285 passed, 1 skipped across the affected session,
 SSH reconnect, Local recovery, live-cadence and client-connection test files.
@@ -67,6 +68,44 @@ and a live pause followed by controller-driven stopping. The two child exits of
 evidence. A later successful large-offset synchronization is recorded below;
 the qualified earlier workflow pass is retained. No change here is evidence that
 the intermittent transport failure has been cured.
+
+### Return to useful operation: consume feedback before routine logging
+
+The owner reports temporary connectivity recovery after router restarts;
+network diagnosis/remediation is an external project, not a prerequisite audit
+here or proof of any historical cause. Use ordinary bounded launcher preflight.
+
+The two subsequent attempts both completed home, approximately 10 mm relief,
+and synchronization. One briefly entered live control; the other remained at
+the final Enter gate. Their first demonstrated host failure was the five-slot
+temperature-history freshness check, not confirmed heat or control-link loss.
+Routine synchronous telemetry emission occurred between the fresh grouped read
+and its action/observation consumers and exhausted the retained history's margin.
+Both hosts subsequently verified stopped/zero/torque-off cleanup but retained
+exit 1; a conservative supervisor cleanup-unknown label did not erase that
+operational failure. Complete evidence stays private.
+
+Correction `a2555838` moves only routine live-sample emission after action,
+observation and reply processing. Original timestamps and raw records remain;
+fault/transition evidence remains immediate. A pending sample on a consumer fault
+is emitted after motor/socket cleanup, without replacing the primary error.
+Logging still counts toward the loop budget and the next unchanged freshness
+check. There is no extra reader, thread, confirmation wait, relaxed guard or
+automatic restart. The motor-only deployment above is the exact four-file
+cherry-pick onto its prior source; helper/client and camera pins remain distinct.
+
+New focused verification: **128 passed, 1 skipped** (POSIX-only process-group
+case on Windows), including actual fake-host consumer/log ordering, genuine
+staleness, log failure, Ctrl+C and preserved final raw evidence. Compilation,
+host help/import-root, diff checks and independent code review passed. These
+are offline results, not a claim that the correction is physically exercised.
+
+Next ordinary use uses `-DurationSeconds 300` as a ceiling, the same three actual
+Enter prompts and nominal 30-second synchronization. The owner can finish a
+lightweight task plus brief normal base/lift use and press Q earlier. Preserve
+all accepted milestones and shoulder/camera limitations; do not add another
+diagnostic campaign. A new genuine fault stops that attempt for exact-evidence
+review. PR #8 remains draft and unmerged.
 
 ## Compact design
 
