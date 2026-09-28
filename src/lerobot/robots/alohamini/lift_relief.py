@@ -31,7 +31,8 @@ ABORT_C = 55
 RELIEF_MM = 10.0
 MAX_RELIEF_MM = 12.0
 RELIEF_TIMEOUT_S = 8.0
-INITIAL_DIRECTION_TIMEOUT_S = 0.25
+# Owner-approved ordinary-AM1 policy; standalone comparison does not enable it.
+INITIAL_DIRECTION_TIMEOUT_S = 1.0
 REST_S = 45.0
 READBACK_S = 3.0
 POLL_S = 0.1
