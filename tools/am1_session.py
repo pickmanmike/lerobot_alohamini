@@ -391,6 +391,15 @@ class SessionCoordinator:
                         if refusal is not None
                         else f"Windows Local client exited with status {outcome.operational_exit_code}"
                     )
+                    client_status = self.client.cleanup_status() if hasattr(self.client, "cleanup_status") else {}
+                    stop_context = client_status.get("stop_context", {})
+                    if (
+                        refusal is None and outcome.operational_exit_code == 2
+                        and stop_context.get("origin") == "remote_fault"
+                    ):
+                        outcome.failure = "Pi session fault requested client stop: " + json.dumps(
+                            stop_context.get("fault"), sort_keys=True
+                        )
                 if hasattr(self.remote, "fault") and (remote_fault := self.remote.fault()) is not None:
                     if outcome.failure is None:
                         outcome.failure = "Pi session fault: " + json.dumps(remote_fault, sort_keys=True)
@@ -1050,9 +1059,27 @@ class WindowsClient:
         self.remote_fault = remote_fault
         self.stop_request_path = stop_request_path
         self._cleanup_status: dict[str, Any] = {"cleanup_verified": True, "not_started": True}
+        self._stop_context: dict[str, Any] | None = None
 
     def cleanup_status(self) -> dict[str, Any]:
-        return dict(self._cleanup_status)
+        result = dict(self._cleanup_status)
+        if self._stop_context is not None:
+            result["stop_context"] = dict(self._stop_context)
+        return result
+
+    def _stop_with_context(self, origin: str, log_path: Path, fault: Any = None) -> None:
+        # Capture the first trigger, not a later cleanup error or a generic child 130.
+        if self._stop_context is None:
+            self._stop_context = {"origin": origin, "wall_time_ns": time.time_ns()}
+            if fault is not None:
+                self._stop_context["fault"] = dict(fault) if isinstance(fault, dict) else str(fault)
+        self._request_stop()  # Do not delay the cooperative stop for evidence IO.
+        try:
+            (log_path.parent / "client-stop.json").write_text(
+                json.dumps(self._stop_context, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )
+        except OSError as exc:
+            self._stop_context["evidence_write_error"] = f"{type(exc).__name__}: {exc}"
 
     def _force_reap_owned_client(self, process: subprocess.Popen[Any]) -> bool:
         if process.poll() is not None:
@@ -1102,19 +1129,19 @@ class WindowsClient:
         try:
             while process.poll() is None:
                 if not stop_sent and stop_requested():
-                    self._request_stop()
+                    self._stop_with_context("explicit_stop", log_path)
                     stop_sent = True
                     user_stop_requested = True
                     stop_sent_at = time.monotonic()
-                elif not stop_sent and self.remote_fault() is not None:
-                    self._request_stop()
+                elif not stop_sent and (fault := self.remote_fault()) is not None:
+                    self._stop_with_context("remote_fault", log_path, fault)
                     stop_sent = True
                     stop_sent_at = time.monotonic()
                 if stop_sent_at is not None and time.monotonic() - stop_sent_at >= 30.0:
                     raise SessionError("Windows client did not honor its cooperative stop request within 30 seconds.")
                 time.sleep(0.1)
         except KeyboardInterrupt:
-            self._request_stop()
+            self._stop_with_context("keyboard_interrupt", log_path)
             stop_sent = True
             user_stop_requested = True
             stop_sent_at = time.monotonic()
@@ -1164,6 +1191,11 @@ class WindowsClient:
             "cooperative_stop_requested": stop_sent,
         }
         effective_exit = client_exit if client_exit is not None else wrapper_exit
+        if (
+            self._stop_context is not None and self._stop_context["origin"] == "remote_fault"
+            and effective_exit in {0, 130}
+        ):
+            return 2
         return 130 if user_stop_requested and effective_exit == 0 else effective_exit
 
 

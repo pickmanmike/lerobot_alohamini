@@ -1873,6 +1873,69 @@ def test_windows_client_labels_user_stop_130_even_when_child_cleanup_exits_zero(
     assert exit_code == 130
 
 
+@pytest.mark.parametrize("marker", [0, 130, 2])
+def test_remote_fault_stop_keeps_fault_origin_and_never_reports_operator_cancel(monkeypatch, tmp_path, marker):
+    module = load_tool("am1_session")
+    log = tmp_path / "client.log"
+    stop = tmp_path / "stop"
+    fault = {"event": "fault", "reason": "SSH transport unavailable"}
+
+    class Process:
+        pid = 1234
+        returncode = None
+
+        def poll(self):
+            if stop.exists():
+                log.write_text(f"AM1_CLIENT_EXIT_CODE={marker}\n", encoding="utf-8")
+                self.returncode = 0
+            return self.returncode
+
+        def wait(self, timeout):
+            return self.poll()
+
+    monkeypatch.setattr(module.subprocess, "Popen", lambda *args, **kwargs: Process())
+    monkeypatch.setattr(module.shutil, "which", lambda name: "pwsh")
+    monkeypatch.setattr(module.time, "sleep", lambda duration: None)
+    config = type("Config", (), {"local_config": tmp_path / "local.json"})()
+    client = module.WindowsClient(tmp_path, config, lambda: dict(fault), stop)
+
+    assert client.run(duration_seconds=90, log_path=log, stop_requested=lambda: False) == 2
+    cleanup = client.cleanup_status()
+    assert cleanup["client_exit"] == marker  # Preserve the real child result separately.
+    assert cleanup["stop_context"]["origin"] == "remote_fault"
+    assert cleanup["stop_context"]["fault"] == fault
+    assert cleanup["stop_context"]["wall_time_ns"] > 0
+    assert json.loads((tmp_path / "client-stop.json").read_text()) == cleanup["stop_context"]
+    assert stop.read_text() == "stop\n"
+
+
+def test_coordinator_preserves_fault_that_requested_stop_not_generic_child_130(tmp_path):
+    module = load_tool("am1_session")
+    fault = {"event": "runtime_fault", "reason": "controller heartbeat lease expired"}
+
+    class Remote:
+        def preflight(self): return {}
+        def start_camera(self): return {"browser_url": "http://camera"}
+        def start_host(self): return {}
+        def stop(self): return {"cleanup_verified": True}
+
+    class Client:
+        def run(self, **kwargs): return 2
+        def cleanup_status(self):
+            return {"cleanup_verified": True, "client_exit": 130,
+                    "stop_context": {"origin": "remote_fault", "fault": fault, "wall_time_ns": 123}}
+
+    outcome = module.SessionCoordinator(
+        remote=Remote(), client=Client(), open_browser=lambda url: None,
+        collect_remote_log=lambda remote, local: (True, None), input_fn=lambda prompt: "",
+    ).run(duration_seconds=90, session_id="20260920T120000-1234abcd",
+          session_directory=tmp_path, client_log_path=tmp_path / "client.log", stop_requested=lambda: False)
+
+    assert outcome.final_exit_code == 2
+    assert "controller heartbeat lease expired" in outcome.failure
+    assert "exited with status" not in outcome.failure
+
+
 def test_windows_client_force_reaps_exact_owned_process_when_cooperative_stop_is_ignored(monkeypatch, tmp_path):
     module = load_tool("am1_session")
     log = tmp_path / "client.log"
@@ -1931,7 +1994,11 @@ def test_windows_client_second_ctrl_c_force_reaps_only_owned_process(monkeypatch
 
     assert client.run(duration_seconds=60, log_path=log, stop_requested=lambda: False) == 130
     assert reaped == [7654]
-    assert client.cleanup_status() == {
+    status = client.cleanup_status()
+    context = status.pop("stop_context")
+    assert context["origin"] == "keyboard_interrupt"
+    assert context["wall_time_ns"] > 0
+    assert status == {
         "cleanup_verified": False,
         "state": "forced_after_repeated_interrupt",
         "client_wrapper_pid": 7654,
