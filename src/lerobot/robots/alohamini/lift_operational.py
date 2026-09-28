@@ -98,7 +98,7 @@ class TemperatureWindow:
 
 
 class OperationalLift(InstalledLiftCheck):
-    """Synchronous AM1 lift monitor; polled once per normal host iteration."""
+    """Synchronous AM1 lift monitor with bounded same-owner consumer refresh."""
 
     def __init__(self, robot) -> None:
         super().__init__(robot)
@@ -115,7 +115,9 @@ class OperationalLift(InstalledLiftCheck):
         # A gross current fault is never subject to the temperature window.
         self.monitor.immediate_current_abort_ma = 2000.0
         self.last_record: dict[str, Any] | None = None
-        self._pending_sample: dict[str, Any] | None = None
+        # One initial poll and at most one refresh at each of the two consumers.
+        # Do not overwrite the earlier raw evidence when a consumer refreshes.
+        self._pending_samples: list[dict[str, Any]] = []
         self.last_emit_ms = 0.0
         self.height_mm = 0.0
         self._last_warning = -math.inf
@@ -273,6 +275,8 @@ class OperationalLift(InstalledLiftCheck):
     def poll(self, *, defer_sample_log: bool = False) -> None:
         self.raise_if_faulted()
         try:
+            if len(self._pending_samples) >= 3:
+                raise feedback.ComparisonRefusal("live: pending feedback exceeds one host iteration.")
             # Check before reading: a gap must not be washed away by five new lows.
             self.temperature.assert_fresh(time.monotonic(), refreshing=True)
             record = self.monitor.sample(
@@ -300,7 +304,7 @@ class OperationalLift(InstalledLiftCheck):
                 self._check_idle(record)
             elif now - self._goal_since >= feedback.STATIONARY_WINDOW_S and goal * record["present_velocity_raw"] < -abs(goal) * feedback.STILL_VELOCITY_RAW:
                 self.refuse(record, "live: unexpected lift motion direction.")
-            self._pending_sample = record
+            self._pending_samples.append(record)
             if not defer_sample_log:
                 self.emit_pending_sample()
         except BaseException as error:
@@ -308,18 +312,20 @@ class OperationalLift(InstalledLiftCheck):
             raise
 
     def emit_pending_sample(self) -> None:
-        """Write the already-validated raw sample after its host-loop consumers.
+        """Write the bounded raw batch after its host-loop consumers.
 
-        This is one pending record, not another reader or asynchronous queue.
-        Its original sample timestamp is retained; logging never refreshes it.
+        This is at most three records, not another reader or asynchronous queue.
+        Original sample timestamps are retained; logging never refreshes them.
         Fault/transition records remain immediate through the existing monitor.
         """
-        record, self._pending_sample = self._pending_sample, None
-        if record is None:
+        if not self._pending_samples:
             return
         emit_started = time.monotonic()
         try:
-            self.emit(record)
+            while self._pending_samples:
+                # A failed sink may already have written this record. Preserve
+                # the original no-retry behavior; later records remain pending.
+                self.emit(self._pending_samples.pop(0))
         except BaseException as error:
             if self.failure is None:
                 self.failure = error
@@ -330,9 +336,17 @@ class OperationalLift(InstalledLiftCheck):
     def _require_latest(self) -> None:
         self.raise_if_faulted()
         try:
-            self.temperature.assert_fresh(time.monotonic())
             if self.last_record is None:
                 raise feedback.ComparisonRefusal("live: no paired lift feedback available.")
+            now = time.monotonic()
+            # Work since the loop's first read may consume the retained peaks'
+            # margin. Only still-fresh RAW feedback permits one genuine read;
+            # never catch/clear a latched window refusal or retry until qualified.
+            self.temperature.assert_fresh(now, refreshing=True)
+            if now - self.temperature.samples[0][0] > self.temperature.MAX_AGE_S:
+                self.poll(defer_sample_log=True)
+            # The full five-slot policy still decides, including read duration.
+            self.temperature.assert_fresh(time.monotonic())
         except BaseException as error:
             self.failure = error
             raise
