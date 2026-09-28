@@ -737,7 +737,8 @@ def test_outer_unified_local_cleanup_final_zero_reaches_host_without_fault(monke
     assert events[-4:] == ["keyboard_disconnect", "arm_disconnect", "arm_disconnect", "robot_disconnect"]
 
 
-def test_real_local_zmq_transport_pauses_recovers_and_latches_final_zero(capsys):
+@pytest.mark.parametrize("gap_end,manual", [(1.45, False), (3.45, True)])
+def test_real_local_zmq_transport_pauses_recovers_and_latches_final_zero(capsys, gap_end, manual):
     """Loopback-only ROUTER/PULL peers exercise the actual token and socket paths."""
     module = load_teleoperate()
     from lerobot.robots.alohamini.alohamini_client import AlohaMiniClient
@@ -773,7 +774,7 @@ def test_real_local_zmq_transport_pauses_recovers_and_latches_final_zero(capsys)
                     control.annotate(observation)
                     started = gap_start[0]
                     gap_age = time.monotonic() - started if started is not None else -1.0
-                    if not 0.2 < gap_age < 1.45:
+                    if not 0.2 < gap_age < gap_end:
                         observation_socket.send_multipart(
                             [identity, token, json.dumps(observation).encode("utf-8")], zmq.NOBLOCK,
                         )
@@ -796,6 +797,7 @@ def test_real_local_zmq_transport_pauses_recovers_and_latches_final_zero(capsys)
     class Leader:
         def get_action(self): return dict(LEADER)
 
+    prompts = []
     try:
         client.connect()
         initial = client.get_observation()
@@ -808,11 +810,17 @@ def test_real_local_zmq_transport_pauses_recovers_and_latches_final_zero(capsys)
             initial_follower_positions=module.extract_am1_arm_positions(
                 initial, source="loopback follower", leader_sample=False,
             ),
-            fps=10, duration_s=2.6, live_arm_scope="both", profile_cadence=False,
+            fps=10, duration_s=gap_end + 1.3, live_arm_scope="both", profile_cadence=False,
             body_action_supplier=module.make_zero_action, recovery_enabled=True,
+            input_fn=lambda prompt: prompts.append(prompt) or "",
         )
         assert control.state == "active" and control.epoch == 2
-        assert "RECOVERED" in capsys.readouterr().out
+        output = capsys.readouterr().out
+        assert "RECOVERED" in output
+        assert len(prompts) == int(manual)
+        assert ('"event": "am1_local_resume_input_received"' in output) == manual
+        assert all(event[1].get(key, 0) == 0 for event in host.events if event[0] == "action"
+                   for key in module.make_zero_action())
         client.send_action(module.make_zero_action())
         deadline = time.monotonic() + 0.6
         while control.state != "stopped" and time.monotonic() < deadline:
@@ -1374,6 +1382,7 @@ def test_paused_local_loop_honors_q_stop_and_finite_expiry(end_kind):
     real_started = time.monotonic()
     clock = lambda: (time.monotonic() - real_started) * factor
     quit_requested = False
+    live_started = []
 
     class Sender:
         def __enter__(self): return self
@@ -1392,7 +1401,7 @@ def test_paused_local_loop_honors_q_stop_and_finite_expiry(end_kind):
         def retire_observation_requests(self): pass
         def get_observation(self):
             time.sleep(0.002)
-            if clock() < 0.2:
+            if not live_started or clock() - live_started[0] < 0.2:
                 self.observation_sequence += 1
                 self.latest_observation_received_at = clock()
                 feedback = {}
@@ -1405,7 +1414,7 @@ def test_paused_local_loop_honors_q_stop_and_finite_expiry(end_kind):
 
     def body_input():
         nonlocal quit_requested
-        if end_kind == "q" and clock() >= 1.5:
+        if end_kind == "q" and live_started and clock() - live_started[0] >= 1.5:
             quit_requested = True
         return module.make_zero_action()
 
@@ -1419,7 +1428,10 @@ def test_paused_local_loop_honors_q_stop_and_finite_expiry(end_kind):
             live_arm_scope="both", profile_cadence=False,
             body_action_supplier=body_input, recovery_enabled=True,
             monotonic=clock, sleep_fn=lambda seconds: time.sleep(seconds / factor),
-            should_stop=lambda: quit_requested or (end_kind == "external_stop" and clock() >= 1.5),
+            should_stop=lambda: quit_requested or (
+                end_kind == "external_stop" and live_started and clock() - live_started[0] >= 1.5
+            ),
+            announce_active=lambda: live_started.append(clock()),
         )
 
     if end_kind == "duration":
@@ -1603,3 +1615,92 @@ def test_qualified_pause_loses_feedback_again_and_does_not_wait_forever_for_ente
     finally:
         release_enter.set()
     assert "RESUME-NEEDS-ENTER" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("feedback_returns", [False, True])
+@pytest.mark.parametrize("receipt_clock_fails", [False, True])
+def test_enter_receipt_is_logged_during_second_gap_but_cannot_itself_resume(capsys, feedback_returns, receipt_clock_fails):
+    module = load_teleoperate()
+    host = FakeLocalRobot()
+    control = alohamini_host.AM1LocalControl()
+    factor = 10.0
+    real_started = time.monotonic()
+    clock = lambda: (time.monotonic() - real_started) * factor
+    entered_at = []
+    delivered = []
+    closed = []
+
+    class Sender:
+        def __enter__(self): return self
+        def __exit__(self, *args): closed.append(True)
+        def send_action(self, action):
+            delivered.append((clock(), dict(action)))
+            control.apply(host, dict(action))
+
+    class Robot(FreshReplyRobot):
+        def __init__(self):
+            self.observation_sequence = 0
+            self.latest_observation_received_at = clock()
+            self.latest_observation_error = None
+            self.latest_raw_observation_keys = frozenset(FOLLOWER)
+            self.latest_am1_local_feedback = {"version": 1, "state": "ready", "epoch": -1, "observation_id": 0}
+
+        def make_live_command_sender(self): return Sender()
+        def retire_observation_requests(self): pass
+        def get_observation(self):
+            time.sleep(0.002)
+            if 0.6 < clock() < 3.8 or (entered_at and clock() - entered_at[0] < 1.3):
+                return dict(FOLLOWER)
+            self.observation_sequence += 1
+            self.latest_observation_received_at = clock()
+            feedback = {}
+            control.annotate(feedback)
+            self.latest_am1_local_feedback = feedback[FEEDBACK]
+            return dict(FOLLOWER)
+
+    def enter(_):
+        entered_at.append(clock())
+        return ""
+
+    def stop():
+        return bool(not feedback_returns and entered_at and clock() - entered_at[0] > 1.1)
+
+    def wall_clock():
+        if receipt_clock_fails and threading.current_thread().name == "am1-local-recovery-enter":
+            raise RuntimeError("synthetic diagnostic clock failure")
+        return time.time_ns()
+
+    robot = Robot()
+    module.run_am1_live_sender(
+        robot, SimpleNamespace(get_action=lambda: dict(LEADER)),
+        initial_arm_target=FOLLOWER, initial_observation_sequence=0,
+        initial_follower_observed_at=robot.latest_observation_received_at, initial_follower_positions=FOLLOWER,
+        fps=10, duration_s=7, live_arm_scope="both", profile_cadence=True,
+        body_action_supplier=module.make_zero_action, recovery_enabled=True,
+        monotonic=clock, sleep_fn=lambda seconds: time.sleep(seconds / factor),
+        input_fn=enter, should_stop=stop,
+        wall_time_ns=wall_clock,
+    )
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.startswith("{")]
+    receipts = [event for event in events if event.get("event") == "am1_local_resume_input_received"]
+    assert len(receipts) == 1 and receipts[0]["input_result"] == "enter"
+    assert receipts[0]["epoch"] == 1
+    assert (receipts[0]["wall_time_ns"] is None) == receipt_clock_fails
+    assert closed == [True]
+    gap_commands = [action for at, action in delivered if entered_at[0] + 0.15 < at < entered_at[0] + 1.1]
+    assert gap_commands and all(action[CONTROL]["mode"] == "pause" for action in gap_commands)
+    assert all(action[key] == 0 for _, action in delivered for key in module.make_zero_action())
+    final = next(event for event in events if event.get("event") == "am1_client_action_cadence")
+    assert final["manual_input_result"] == "enter"
+    qualified = [event for event in events if event.get("event") == "am1_local_resume_qualified"]
+    if feedback_returns:
+        assert len(qualified) == 1 and final["recovery_state"] == "active"
+        assert final["recovery_count"] == 1
+        assert qualified[0]["observed_at"] > entered_at[0] + 1.3
+        assert events.index(receipts[0]) < events.index(qualified[0])
+        first_resume = next(action for _, action in delivered if action[CONTROL]["epoch"] == 2)
+        assert {key: first_resume[key] for key in ARM_KEYS} == FOLLOWER
+    else:
+        assert qualified == [] and final["recovery_state"] == "paused"
+        assert final["recovery_count"] == 0 and final["observation_age_ms"] >= 1000
+        assert all(action[CONTROL]["epoch"] <= 1 for _, action in delivered)
