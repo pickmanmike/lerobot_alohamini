@@ -22,6 +22,7 @@ reviewed head; the subsequent closeout edits are documentation only.
 | Windows client/session and Pi session helper for the latest ordinary-use attempts | `16c557c05497c94d0bb2e2938c51d4ba56b0a549` |
 | Motor used by those attempts, before the logging-order correction | `a6a263266888ebc2cd658d0ff5be670632ded3d0` |
 | Motor-only logging-order correction used by the later first-relief refusal | `4e16b18b732247072157d3dc64dad6117761ea13` |
+| Motor-only initial-relief qualification staged; not physically exercised | `699d6eaf19de1dc80dfcd6621406ba7850fae446` |
 | Separately deployed Pi camera, intentionally unchanged | `047c4fcf7cbf34684a9b8c348193585938975815` |
 
 The camera commit is **not an ancestor** of the integration merge. The private
@@ -91,14 +92,24 @@ fault/transition evidence remains immediate. A pending sample on a consumer faul
 is emitted after motor/socket cleanup, without replacing the primary error.
 Logging still counts toward the loop budget and the next unchanged freshness
 check. There is no extra reader, thread, confirmation wait, relaxed guard or
-automatic restart. The motor-only deployment above is the exact four-file
-cherry-pick onto its prior source; helper/client and camera pins remain distinct.
+automatic restart. Motor commit `4e16b18b` is the exact four-file cherry-pick
+onto its prior source; helper/client and camera pins remain distinct.
 
-New focused verification: **128 passed, 1 skipped** (POSIX-only process-group
+Earlier focused verification: **128 passed, 1 skipped** (POSIX-only process-group
 case on Windows), including actual fake-host consumer/log ordering, genuine
 staleness, log failure, Ctrl+C and preserved final raw evidence. Compilation,
 host help/import-root, diff checks and independent code review passed. These
 are offline results, not a claim that the correction is physically exercised.
+
+The later first-relief refusal prompted the separately approved fixed initial
+qualification described below. Source correction `18ad0161` passed **156**
+affected operational/standalone relief tests after meaningful RED, including
+fixed deadlines, late progress, repeated disagreement, faults and cleanup.
+Independent review found no blocker; its confirmed-temperature case is now a
+permanent regression. Compile, help/import-root and diff checks passed. The
+motor-only deployment `699d6eaf` contains the identical four Python/test files;
+only the backed-up private motor pin changed. Its Pi compile/import/help and
+helper print-only checks passed. No powered attempt was run for this correction.
 
 Next ordinary use uses `-DurationSeconds 300` as a ceiling, the same three actual
 Enter prompts and nominal 30-second synchronization. The owner can finish a
