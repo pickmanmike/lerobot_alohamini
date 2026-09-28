@@ -24,7 +24,8 @@ reviewed head; the subsequent closeout edits are documentation only.
 | Motor-only logging-order correction used by the later first-relief refusal | `4e16b18b732247072157d3dc64dad6117761ea13` |
 | Motor-only initial-relief qualification; later scripted attempt refused before readiness | `699d6eaf19de1dc80dfcd6621406ba7850fae446` |
 | Motor-only one-second initial qualification; subsequent ArmSmoke started but did not complete | `b0bce720572e83b7046d1234a997a3064ce118b9` |
-| Windows client/session and Pi helper deployed for the first scripted attempt | `60fcd9bcc4deecae76520b9c35e7120d889414ad` |
+| Current motor-only consumer-refresh correction; attended run ended cleanly but profile remained incomplete | `1514c50a4ba9b7762fc577a08fddf02498733386` |
+| Windows client/session and Pi helper, unchanged across the scripted attempts | `60fcd9bcc4deecae76520b9c35e7120d889414ad` |
 | Separately deployed Pi camera, intentionally unchanged | `047c4fcf7cbf34684a9b8c348193585938975815` |
 
 The camera commit is **not an ancestor** of the integration merge. The private
@@ -261,10 +262,55 @@ exits were host 1, client 130, camera 0 and unified session 2. The lift separate
 verified zero goal, torque off and a stopped window after settling. Preserve the
 supervisor's conservative `cleanup_unknown` classification rather than relabeling
 the run as success. Exact logs were collected; subsequent read-only inspection
-found no session-owned runtime and clean deployed checkouts. No further powered
-attempt followed. The next scoped work is the demonstrated read-to-consumer
-freshness timing boundary, keeping the existing 0.5-second policy and single bus
-owner; do not repeat this run unchanged. PRs #8 and #9 remain draft and unmerged.
+found no session-owned runtime and clean deployed checkouts. At that closeout no
+further powered attempt had followed. The subsequently approved correction and
+one attended follow-up are recorded separately below; the original failed exits
+and tracking limitations remain unchanged. PRs #8 and #9 remain draft and unmerged.
+
+### Bounded consumer refresh: clean lifecycle, incomplete ArmSmoke
+
+Source `02f93ff7f1e63603fab9502980ac9f8d657b255b` corrects the demonstrated
+read-to-consumer scheduling boundary. If raw feedback is still fresh but the
+retained history has aged out, each action/observation consumer may request at
+most one genuine grouped read through the existing owner. The unchanged full
+five-slot, 0.5-second check must then pass. A raw outage, nonqualifying refresh,
+motor/transport fault or cancellation still stops; no refusal is cleared.
+The bounded pending batch preserves all original sample timestamps and evidence.
+No temperature vote, motion limit, initial-relief policy or client behavior changed.
+
+Fresh focused verification: **190 passed** across the operational-lift,
+consumer-refresh and Local-recovery test files. Five actual fake-host cases first
+failed at the intended consumption boundary. New tests cover active/hold/resume,
+both consumers, retained high votes, missing/delayed data, bounded read counts,
+zero/cleanup and cancellation. Compilation, import-root/help checks, complete
+diff/artifact review and independent code review passed. Earlier broad results
+were not rerun or relabeled as fresh verification.
+
+The motor-only cherry-pick is `1514c50a4ba9b7762fc577a08fddf02498733386`;
+its three changed blobs match the reviewed source. Only the backed-up private
+motor pin changed. Client/session/helper remain `60fcd9bc`; camera remains
+`047c4fcf`. These intentionally separate deployments and environments are retained.
+
+One attended run passed camera readiness, home, bounded relief, synchronization
+and live admission without the previous lift freshness fault. Lift monitoring
+continued through the session without a rejected sample or confirmed heating.
+However, repeated observation-age recoveries and slow qualified observation
+progress left ArmSmoke **incomplete at the unchanged duration limit**. Clean
+exit is not profile completion or a complete joint-tracking pass. Some exercised
+channels still had incomplete returns; unvisited channels remain untested.
+
+The client kept its bounded action cadence while the scripted trajectory froze
+on unusable feedback and advanced without catch-up. The request/response or
+consumer delay is unresolved; this result does not establish a Wi-Fi cause.
+One recovery required the existing Enter gate, so its whole paused interval
+must not be attributed to transport. Client, host, camera and session exited 0;
+zero goal, torque off and a stopped cleanup window were verified, all exact logs
+were collected, and no owned runtime remained. No second attempt followed.
+
+Next: isolate qualified-observation delivery/consumption with a hardware-free
+timing reproduction before another powered profile. Do not widen freshness,
+extend the session, tune joints or repeat unchanged to obtain completion. PRs
+#8/#9 stay draft/unmerged. Detailed joint/timing evidence and raw logs stay private.
 
 ## Compact design
 
