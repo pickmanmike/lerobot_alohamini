@@ -31,6 +31,7 @@ ABORT_C = 55
 RELIEF_MM = 10.0
 MAX_RELIEF_MM = 12.0
 RELIEF_TIMEOUT_S = 8.0
+INITIAL_DIRECTION_TIMEOUT_S = 0.25
 REST_S = 45.0
 READBACK_S = 3.0
 POLL_S = 0.1
@@ -715,7 +716,9 @@ class InstalledLiftCheck:
         _, rest_height = self.home_and_relieve()
         self.observe_raised_rest(rest_height)
 
-    def home_and_relieve(self, *, allow_one_count_variation: bool = False) -> tuple[Any, float]:
+    def home_and_relieve(
+        self, *, allow_one_count_variation: bool = False, qualify_initial_direction: bool = False,
+    ) -> tuple[Any, float]:
         """The same bounded mechanics for the opt-in comparison and normal AM1 startup."""
         self.reader.set_phase("setup_position")
         result = self.lift.home(safety_check=self.home_guard, read_raw=self.reader)
@@ -749,15 +752,34 @@ class InstalledLiftCheck:
         # The normal AM1 policy may allow one count below the best upward position;
         # comparing only adjacent samples would permit accumulated downward drift.
         best_upward_ticks = self.lift.cfg.dir_sign * self.lift._extended_ticks
+        initial_upward_ticks = best_upward_ticks
         variation_ticks = 1 if allow_one_count_variation else 0
         velocity_disagreements = 0
+        direction_pending = qualify_initial_direction
+        record = self.reader.last_record
+
+        def direction_remaining(sample: dict[str, Any]) -> float:
+            if not direction_pending:
+                return RELIEF_TIMEOUT_S
+            elapsed = time.monotonic() - started
+            if elapsed >= INITIAL_DIRECTION_TIMEOUT_S:
+                # Preserve the last real reply's timestamp, even if scheduling
+                # exhausted the deadline before another read could start.
+                self.refuse(
+                    {**sample, "phase": "relief", "qualification_elapsed_s": elapsed},
+                    f"relief: initial upward direction not confirmed within {INITIAL_DIRECTION_TIMEOUT_S} s.",
+                )
+            return INITIAL_DIRECTION_TIMEOUT_S - elapsed
+
         while True:
             remaining = RELIEF_TIMEOUT_S - (time.monotonic() - started)
             if remaining <= 0:
                 raise ReliefRefusal(f"relief: target not reached within {RELIEF_TIMEOUT_S}s.")
-            time.sleep(min(POLL_S, remaining))
+            time.sleep(min(POLL_S, remaining, direction_remaining(record)))
+            direction_remaining(record)
             record, height = self._moving_height("relief")
             elapsed = time.monotonic() - started
+            direction_remaining(record)
             self._check_raised("relief", record, height)
             upward_ticks = self.lift.cfg.dir_sign * self.lift._extended_ticks
             if upward_ticks < best_upward_ticks - variation_ticks:
@@ -770,9 +792,18 @@ class InstalledLiftCheck:
                     "height_mm": round(height, 4),
                 })
             best_upward_ticks = max(best_upward_ticks, upward_ticks)
-            if int(record["present_velocity_raw"]) > STILL_VELOCITY_RAW:
+            reported_velocity = int(record["present_velocity_raw"])
+            if reported_velocity > STILL_VELOCITY_RAW:
                 if height <= previous_height:
-                    self.refuse(record, "relief: direction unconfirmed; reported downward velocity without fresh upward position progress.")
+                    # Normal AM1 startup alone may qualify an initial small
+                    # ambiguity. This never relaxes the encoder travel guard,
+                    # and repeated wrong-sign replies still refuse below.
+                    small_initial_ambiguity = (
+                        direction_pending
+                        and reported_velocity <= grouped_feedback.STATIONARY_REPORTED_VELOCITY_LIMIT_RAW
+                    )
+                    if not small_initial_ambiguity:
+                        self.refuse(record, "relief: direction unconfirmed; reported downward velocity without fresh upward position progress.")
                 velocity_disagreements += 1
                 self.emit({
                     **record,
@@ -784,6 +815,17 @@ class InstalledLiftCheck:
                     self.refuse(record, "relief: repeated velocity/position direction disagreement.")
             else:
                 velocity_disagreements = 0
+            if direction_pending:
+                direction_remaining(record)
+                direction_pending = not (upward_ticks > initial_upward_ticks and height > previous_height)
+                self.emit({
+                    **record,
+                    "phase": "relief_direction_pending" if direction_pending else "relief_direction_qualified",
+                    "qualification_elapsed_s": time.monotonic() - started,
+                    "initial_upward_ticks": initial_upward_ticks,
+                    "upward_ticks": upward_ticks,
+                    "height_mm": round(height, 4),
+                })
             previous_height = height
             if elapsed >= RELIEF_TIMEOUT_S:
                 self.refuse(record, f"relief: target not reached within {RELIEF_TIMEOUT_S}s.")

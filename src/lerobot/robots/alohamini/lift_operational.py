@@ -180,7 +180,9 @@ class OperationalLift(InstalledLiftCheck):
             finally:
                 self.monitor.min_stationary_samples = stationary_samples
             self.temperature.assert_fresh(time.monotonic())
-            result, _ = self.home_and_relieve(allow_one_count_variation=True)
+            result, _ = self.home_and_relieve(
+                allow_one_count_variation=True, qualify_initial_direction=True,
+            )
             self._goal_since = time.monotonic()
             self.poll()
             self.monitor.record(
