@@ -554,6 +554,12 @@ class SSHRemote:
         self._remote_event_seen = False
         self._initial_no_dispatch = False
         self._initial_attempts: list[dict[str, Any]] = []
+        self._evidence_lock = threading.Lock()
+        self._control_evidence: dict[str, Any] = {
+            "send_attempt_count": 0, "send_completed_count": 0, "send_failure_count": 0,
+            "heartbeat_attempt_count": 0, "heartbeat_completed_count": 0, "heartbeat_failure_count": 0,
+            "event_received_count": 0, "max_send_duration_ms": 0.0,
+        }
 
     def set_stop_requested(self, stop_requested: Callable[[], bool]) -> None:
         self._stop_requested = stop_requested
@@ -594,6 +600,11 @@ class SSHRemote:
                 event = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            with self._evidence_lock:
+                self._control_evidence["event_received_count"] += 1
+                self._control_evidence.update(
+                    last_event=event.get("event"), last_event_wall_time_ns=time.time_ns(),
+                )
             self._remote_event_seen = True
             self.events.put(event)
             if event.get("event") in {"runtime_fault", "refused", "fault"}:
@@ -661,7 +672,8 @@ class SSHRemote:
 
     def _diagnostic_fields(self) -> dict[str, Any]:
         diagnostics = self.diagnostics()
-        fields: dict[str, Any] = {}
+        with self._evidence_lock:
+            fields: dict[str, Any] = {"control_link": dict(self._control_evidence)}
         if diagnostics["primary_fault"] is not None:
             fields["primary_fault"] = diagnostics["primary_fault"]
         if diagnostics["later_errors"]:
@@ -701,10 +713,41 @@ class SSHRemote:
 
     def _send(self, command: str) -> None:
         with self._send_lock:
-            if not self.process or not self.process.stdin or self.process.poll() is not None:
-                raise SessionError("Pi session control link is not available.")
-            self.process.stdin.write(command + "\n")
-            self.process.stdin.flush()
+            started_at = time.monotonic()
+            is_heartbeat = command == "HEARTBEAT"
+            with self._evidence_lock:
+                self._control_evidence["send_attempt_count"] += 1
+                self._control_evidence.update(
+                    last_send_command=command, last_send_started_wall_time_ns=time.time_ns(),
+                )
+                if is_heartbeat:
+                    self._control_evidence["heartbeat_attempt_count"] += 1
+                    self._control_evidence["last_heartbeat_started_wall_time_ns"] = time.time_ns()
+            try:
+                if not self.process or not self.process.stdin or self.process.poll() is not None:
+                    raise SessionError("Pi session control link is not available.")
+                self.process.stdin.write(command + "\n")
+                self.process.stdin.flush()
+            except BaseException:
+                with self._evidence_lock:
+                    self._control_evidence["send_failure_count"] += 1
+                    if is_heartbeat:
+                        self._control_evidence["heartbeat_failure_count"] += 1
+                raise
+            else:
+                with self._evidence_lock:
+                    self._control_evidence["send_completed_count"] += 1
+                    self._control_evidence["last_send_completed_wall_time_ns"] = time.time_ns()
+                    if is_heartbeat:
+                        self._control_evidence["heartbeat_completed_count"] += 1
+                        self._control_evidence["last_heartbeat_completed_wall_time_ns"] = time.time_ns()
+            finally:
+                with self._evidence_lock:
+                    self._control_evidence["max_send_duration_ms"] = max(
+                        self._control_evidence["max_send_duration_ms"],
+                        round((time.monotonic() - started_at) * 1000, 3),
+                    )
+            # A completed pipe write is not proof that the Pi received the command.
 
     def _heartbeat_loop(self) -> None:
         while not self._heartbeat_stop.wait(1.0):
@@ -896,6 +939,9 @@ class SSHRemote:
                                 "persisted_state_available": True,
                                 "persisted_state_terminal": terminal,
                             }
+                            for key in ("controller_contact", "controller_stop_context"):
+                                if key in state:
+                                    recovered[key] = state[key]
                             if errors:
                                 recovered["persisted_state_errors"] = list(errors)
                             if terminal:
