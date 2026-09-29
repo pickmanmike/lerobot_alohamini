@@ -8,7 +8,68 @@ had a maximum browser display gap of `1.138 s`, above the unchanged `500 ms`
 continuity target. Loss of a required view still means release controls, press
 `Q`, and restart only after all owned processes have stopped.
 
-## Current scripted follow-up — September 28, 2026
+## Current integration and tracking status — September 28, 2026
+
+PRs #8 and #9 are closed and merged into `integrate/am1-local-teleop`, not
+`main`, in the authorized order. Both are ordinary two-parent merges:
+
+| PR | Merge | Ordered parents |
+|---|---|---|
+| #8 | `6df1af1285b0d698125e1a7d969f2872a0c2771d` | `bf1ba5451e1190a609e228c007aad2c0dc2a5c48`, `80ea84c7d474771d870dd9add5f096e12fab2af4` |
+| #9 | `91f9ec48883026cfb4ac90a110ee0568b7182bec` | `6df1af1285b0d698125e1a7d969f2872a0c2771d`, `4bbf1a313776316bf6afb7d4dbe320d4e025e193` |
+
+The final merged tree is `a7d51f2dc099da55cd1e922949ad3c029a749870`, exactly
+the reviewed PR #9 tree. PR #9 was retargeted only after #8 merged, and its
+remaining diff and candidate were rechecked. Current-state edits after the merge
+are documentation only. No dependency branch, working checkout or environment
+was deleted. The intermediate #8 relief timing policy is not the final stack:
+the final stack retains the one-second initial qualification and bounded
+same-owner consumer refresh.
+
+Fresh verification of this candidate: **199 passed, 2 skipped** across
+`test_am1_unified_session.py`, `test_am1_scripted_launchers.py`,
+`test_am1_ssh_reconnect.py` and `test_alohamini_postq.py`; all 16 changed Python
+files compiled, both changed PowerShell launchers parsed, and diff plus
+changed-path/secret-marker checks passed. Independent PR #8 and incremental
+PR #9 review found no material blocker. The earlier 243-test execution below is
+retained as earlier evidence, not relabeled as a new run. No powered check was
+performed for integration.
+
+Session `20260928T205156-707fef5f` retains three separate verdicts: lifecycle
+passed with verified cleanup and clean component exits; ArmSmoke completed
+88/88 trajectory seconds in about 92.395 seconds live without recovery or a
+live watchdog event; complete per-joint tracking remains unproven. Eight ordinary
+empty polls preserved progression. The authorized batch ended after its first
+successful profile; unused attempt slots do not require a repeat. This does not
+explain every historical delay or establish long-term network reliability.
+
+Deployment remains intentionally unchanged:
+
+| Component | Deployed source | Relationship to merged code |
+|---|---|---|
+| Windows client/session and Pi helper | `e1efd2e41e30701218f946a4714a74c123152b7c` | Client examples and session/helper tools match |
+| Pi motor | `1514c50a4ba9b7762fc577a08fddf02498733386` | Motor host, robot, lift and motor-support code match; the differing outbound `alohamini_client.py` is not used by the Pi motor owner |
+| Pi camera | `047c4fcf7cbf34684a9b8c348193585938975815` | Separate camera lineage and runtime differences remain; this merge does not incorporate every deployed camera change |
+
+The four deployed checkouts and ignored exact-SHA session references were
+verified consistent without changing them. Preserve private configuration,
+calibration, camera mappings, rotations and credentials.
+
+Tracking is a separate follow-up, initially the right elbow and left shoulder
+pan. Existing segment observations are phase-boundary samples: the printed
+`trajectory_s` has crossed into the next phase, while `requested` is the previous
+generated action that was just published to the sender mailbox. The origin-hold
+residual is measured displacement from the frozen origin at the end of that
+short hold, not a measurement of servo goal-register return or a guarantee of
+settling. The final summary provides a later stationary-feedback checkpoint.
+There is no selected-joint goal-register readback in this run; the right-shoulder
+readback cannot substitute for it. Preserve the observed incomplete excursion
+and return without diagnosing reversal, a failed servo or shared deadband.
+Prepare only opt-in, same-owner target/goal/position/current capture before the
+next bounded evidence run. Do not change gains, current limits, calibration,
+profile amplitude/dwell or tracking tolerance.
+
+### Completed scripted follow-up — historical implementation evidence
 
 The approved empty-poll bookkeeping repair is source
 `a26690a626fba5fb7624deb714caf35e58e81b08`. An ordinary empty observation poll
@@ -53,8 +114,8 @@ return error. Generated targets are not servo goal-register acknowledgement or
 visual confirmation. Detailed joint/timing evidence and raw logs remain private.
 No gains, minimum-step workaround or profile tuning was introduced. Earlier
 incomplete/faulted runs, accepted ordinary motion, shoulder/camera limitations and
-long-duration restrictions remain. Next is focused integration review; PRs #8/#9
-remain draft and unmerged, not a request for another powered session.
+long-duration restrictions remain. The integration disposition above supersedes
+the draft/unmerged status at the time of this historical evidence.
 
 The script-only cadence summary adds empty-poll/preserved-poll counts, advance
 counts and cumulative feedback-call time; manual resume records prompt and input

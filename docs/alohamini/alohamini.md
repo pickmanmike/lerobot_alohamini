@@ -95,7 +95,26 @@ If either identity is missing, duplicated, ambiguous, or attached to the wrong l
 
 ### Lean AM1 local operation and physically proven lift
 
-#### Current status — qualified unified workflow integrated (PR #7)
+#### Current status — reliability and scripted workflow integrated (PRs #8/#9)
+
+The reviewed reliability and scripted-input stack is merged into
+`integrate/am1-local-teleop`, not `main`: PR #8 at
+`6df1af1285b0d698125e1a7d969f2872a0c2771d`, followed by retargeted PR #9 at
+`91f9ec48883026cfb4ac90a110ee0568b7182bec`. The final tree equals reviewed
+PR #9 head `4bbf1a313776316bf6afb7d4dbe320d4e025e193`.
+
+The completed scripted run separately passed lifecycle/cleanup and the finite
+ArmSmoke profile; per-joint tracking remains incomplete. No repeat powered
+acceptance was required for integration. The unchanged deployed client/helper,
+motor and camera stay separately pinned; the camera is not made equivalent by
+this merge. Exact identities, fresh versus historical test evidence, operating
+reference, and the narrow tracking follow-up are in the
+[unified-session runbook](unified-session.md#current-integration-and-tracking-status--september-28-2026).
+Keep all accepted physical milestones and the shoulder, camera, raw-feedback,
+long-duration and unattended-use limitations. No gains, motion envelope,
+watchdog, calibration or network setting changed during this closeout.
+
+#### Historical integration — qualified unified workflow (PR #7)
 
 PR #7 was merged into `integrate/am1-local-teleop`, not `main`, by ordinary
 two-parent merge `865bfd1f4de9a276cebe9650a4fd2e951f492169`. Its parents are
