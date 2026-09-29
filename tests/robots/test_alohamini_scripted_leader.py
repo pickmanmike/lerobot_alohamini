@@ -4,10 +4,127 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
+
+@pytest.mark.parametrize("reply_period,poll_ms,min_progress,max_progress", [
+    (0.1, 150, 4.8, 6.3),  # Control: fresh replies, usually no empty poll.
+    (0.1, 25, 4.8, 6.3),   # Same replies with intervening harmless empty polls.
+    (0.2, 25, 2.3, 3.2),   # Keep the existing one-frame-per-valid-call cap.
+])
+def test_actual_local_request_window_keeps_progress_between_empty_polls(
+    capsys, reply_period, poll_ms, min_progress, max_progress,
+):
+    """Real Local producer, sender, client token window and loopback-only peers."""
+    from lerobot.robots.alohamini import alohamini_host
+    from lerobot.robots.alohamini.alohamini_client import AlohaMiniClient
+    from lerobot.robots.alohamini.config_alohamini import AlohaMiniClientConfig
+
+    m = module()
+    initial = pose(m)
+    positions = dict(initial)
+    actions, records, errors = [], [], []
+    control = alohamini_host.AM1LocalControl()
+
+    class Host:
+        def send_action(self, action):
+            actions.append(dict(action))
+            positions.update({key: action[key] for key in initial if key in action})
+        def stop_motion(self): pass
+        def hold_follower_arms(self): pass
+
+    zmq = alohamini_host.zmq
+    context = zmq.Context()
+    commands = context.socket(zmq.PULL)
+    observations = context.socket(zmq.ROUTER)
+    command_port = commands.bind_to_random_port("tcp://127.0.0.1")
+    observation_port = observations.bind_to_random_port("tcp://127.0.0.1")
+    stop = threading.Event()
+    periodic = threading.Event()
+
+    def serve():
+        pending = []
+        next_reply = time.monotonic()
+        try:
+            while not stop.is_set():
+                try:
+                    control.apply(Host(), json.loads(commands.recv_string(zmq.NOBLOCK)))
+                except zmq.Again:
+                    pass
+                try:
+                    pending.append(observations.recv_multipart(zmq.NOBLOCK))
+                except zmq.Again:
+                    pass
+                if not periodic.is_set() or time.monotonic() >= next_reply:
+                    for identity, token in pending:
+                        observation = dict(positions)
+                        control.annotate(observation)
+                        observations.send_multipart([identity, token, json.dumps(observation).encode()], zmq.NOBLOCK)
+                    pending.clear()
+                    next_reply = time.monotonic() + reply_period
+                time.sleep(0.001)
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            commands.close(0)
+            observations.close(0)
+
+    peer = threading.Thread(target=serve, name="script-clock-loopback-peer")
+    peer.start()
+    robot = AlohaMiniClient(AlohaMiniClientConfig(
+        remote_ip="127.0.0.1", port_zmq_cmd=command_port,
+        port_zmq_observations=observation_port, robot_model="alohamini1",
+        id="fake-script-clock", cameras={}, observation_request_window=3,
+        polling_timeout_ms=poll_ms, command_send_timeout_ms=50,
+    ))
+    provider = m.ScriptedLeaderInput(initial, joint_keys=m.AM1_ARM_POSITION_KEYS, fps=10, emit=records.append)
+    try:
+        robot.connect()
+        robot.get_observation()
+        result = m.run_am1_live_sender(
+            robot, provider, initial_arm_target=initial,
+            initial_observation_sequence=robot.observation_sequence,
+            initial_follower_observed_at=robot.latest_observation_received_at,
+            initial_follower_positions=initial, fps=10, duration_s=6.2,
+            live_arm_scope="both", profile_cadence=True,
+            body_action_supplier=m.make_zero_action, recovery_enabled=True,
+            scripted_input=provider, announce_active=periodic.set,
+        )
+        assert result == "duration_expired" and not provider.complete
+        assert min_progress <= provider.elapsed_s <= max_progress
+        assert max(a[m.AM1_ARM_POSITION_KEYS[0]] for a in actions) > 12.2
+        assert all(a[key] == 0 for a in actions for key in m.make_zero_action())
+        for before, after in zip(actions, actions[1:]):
+            assert max(abs(after[k] - before[k]) for k in initial) <= .751
+        output = capsys.readouterr().out
+        assert '"event": "am1_local_paused"' not in output
+        cadence = next(json.loads(line) for line in output.splitlines()
+                       if '"event": "am1_client_action_cadence"' in line)
+        if poll_ms == 25:
+            assert cadence["observation_timeout_count"] > 20
+            assert cadence["script_clock"]["preserved_empty_polls"] > 20
+        assert cadence["script_clock"]["trajectory_s"] == pytest.approx(provider.elapsed_s, abs=1e-6)
+        assert cadence["script_clock"]["stale_replies"] == 0
+        assert cadence["action_sequence"] >= 50 and cadence["body_command_expiration_count"] == 0
+        assert not any(t.name == "am1-live-action-sender" and t.is_alive() for t in threading.enumerate())
+        robot.send_action(m.make_zero_action())
+        deadline = time.monotonic() + .5
+        while control.state != "stopped" and time.monotonic() < deadline:
+            time.sleep(.002)
+        assert control.state == "stopped"
+        assert errors == []
+    finally:
+        if robot.is_connected:
+            robot.disconnect()
+        stop.set()
+        peer.join(timeout=2)
+        context.term()
+        assert not peer.is_alive()
 
 
 def module():
@@ -276,9 +393,105 @@ class LocalHarness:
 
     def clock(self): return self.now
     def sleep(self, duration): self.now += duration
-    def run(self, m, tmp_path, *, duration=180):
+    def run(self, m, tmp_path, *, duration=180, input_fn=None):
         args = m.parse_args(arguments(tmp_path / "stop") + ["--duration_s", str(duration)], platform_name="Windows")
-        return m.run_teleoperation(args, input_fn=lambda prompt: "", monotonic=self.clock, sleep_fn=self.sleep)
+        return m.run_teleoperation(args, input_fn=input_fn or (lambda prompt: ""),
+                                  monotonic=self.clock, sleep_fn=self.sleep)
+
+
+@pytest.mark.parametrize("kind", ["empty", "old_reply", "combined_age"])
+def test_fake_time_local_empty_polls_are_distinct_from_unqualified_replies(monkeypatch, tmp_path, capsys, kind):
+    m = module()
+    harness = LocalHarness(monkeypatch, m, quit_after=6.2)
+    read = m.AlohaMiniClient.get_observation
+    polls = []
+
+    def interleaved(robot):
+        worker = harness.worker
+        if worker is not None and worker.live_started is not None:
+            polls.append(harness.now)
+            if len(polls) % 2:
+                harness.now += .05
+                if kind != "empty":
+                    robot.observation_sequence += 1
+                    robot.latest_am1_local_feedback["observation_id"] = robot.observation_sequence
+                    robot.latest_observation_received_at = harness.now - (.5 if kind == "combined_age" else 0)
+                    robot.latest_observation_roundtrip_age_s = .6 if kind == "combined_age" else 1.01
+                return dict(harness.positions)
+        robot.latest_observation_roundtrip_age_s = 0.0
+        return read(robot)
+
+    monkeypatch.setattr(m.AlohaMiniClient, "get_observation", interleaved)
+    assert harness.run(m, tmp_path) == 0
+    actions = [e[1] for e in harness.events if e[0] == "worker_action"]
+    assert all(a[key] == 0 for a in actions for key in m.make_zero_action())
+    if kind == "empty":
+        assert 6.0 <= harness.provider.elapsed_s <= 6.3
+        assert max(a[m.AM1_ARM_POSITION_KEYS[0]] for a in actions) > 14.5
+    elif kind == "old_reply":
+        assert harness.provider.elapsed_s == 0  # Each real stale reply resets admission time.
+        assert all(a[m.AM1_ARM_POSITION_KEYS[0]] == 12 for a in actions)
+    else:
+        assert any(e[0] == "host_hold" for e in harness.events)
+        assert harness.provider.elapsed_s < 1
+    assert harness.events.index(("private_socket_close_and_join",)) < harness.events.index(("disconnect",))
+
+
+@pytest.mark.parametrize("enter_delay", [0.0, 20.0])
+def test_fake_time_script_clock_discards_recovery_and_enter_waits(monkeypatch, tmp_path, capsys, enter_delay):
+    """Long waits are virtual; real Local recovery still qualifies same-host epochs."""
+    m = module()
+    harness = LocalHarness(monkeypatch, m)
+    read = m.AlohaMiniClient.get_observation
+    get_key = m.KeyboardTeleop.get_action
+    gaps, paused_progress, resumed_ticks, entered = [], [], [], []
+
+    def interrupted(robot):
+        worker = harness.worker
+        if worker is not None and worker.live_started is not None:
+            if worker.state == "active" and len(gaps) < 2 and harness.provider.elapsed_s >= 2 + 2 * len(gaps):
+                gaps.append(harness.provider.elapsed_s)
+                worker.request_pause("synthetic recorded feedback outage")
+                harness.now += 1.1 if len(gaps) == 1 else 3.1
+            if worker.state in {"paused", "resuming"}:
+                paused_progress.append((len(gaps), harness.provider.elapsed_s))
+        return read(robot)
+
+    def keys(keyboard):
+        if harness.provider is not None and harness.provider.elapsed_s >= 6:
+            return {"q"}
+        return get_key(keyboard)
+
+    def enter(_prompt):
+        if harness.worker is not None:
+            entered.append(harness.now)
+            harness.now += enter_delay
+        return ""
+
+    factory = m.ScriptedLeaderInput
+    def monitored_provider(*args, **kwargs):
+        provider = factory(*args, **kwargs)
+        advance = provider.advance
+        def measured_advance(*a, **kw):
+            before = provider.elapsed_s
+            advance(*a, **kw)
+            resumed_ticks.append(provider.elapsed_s - before)
+        provider.advance = measured_advance
+        return provider
+
+    monkeypatch.setattr(m, "ScriptedLeaderInput", monitored_provider)
+    monkeypatch.setattr(m.AlohaMiniClient, "get_observation", interrupted)
+    monkeypatch.setattr(m.KeyboardTeleop, "get_action", keys)
+    assert harness.run(m, tmp_path, duration=80, input_fn=enter) == 0
+    assert len(gaps) == 2 and len(entered) == 1
+    for index in (1, 2):
+        assert {progress for group, progress in paused_progress if group == index} == {gaps[index-1]}
+    assert max(resumed_ticks) <= .100001 and 6 <= harness.provider.elapsed_s <= 6.1
+    assert harness.events.count(("resume_ack",)) == 2
+    output = capsys.readouterr().out
+    assert output.count('"event": "am1_local_resume_input_requested"') == 1
+    assert output.count('"event": "am1_local_resume_input_received"') == 1
+    assert '"stop_reason": "manual_q"' in output and '"profile_complete": false' in output
 
 
 @pytest.mark.parametrize("pause", [False, True])

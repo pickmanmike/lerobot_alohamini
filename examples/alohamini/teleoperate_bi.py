@@ -159,6 +159,10 @@ class TransientFollowerObservation(RuntimeError):
     """A follower request completed without a newer decoded observation."""
 
 
+class NoNewFollowerObservation(TransientFollowerObservation):
+    """An empty poll, not a newly received but over-age response."""
+
+
 class AlignmentRow(NamedTuple):
     joint: str
     follower_value: float
@@ -741,7 +745,7 @@ def read_fresh_am1_live_sample(
     refuse_latest_am1_observation_error(robot, source="live follower observation")
     observation_sequence = int(robot.observation_sequence)
     if observation_sequence == previous_sequence:
-        raise TransientFollowerObservation(
+        raise NoNewFollowerObservation(
             "observation_sequence did not advance "
             f"(previous={previous_sequence}, current={observation_sequence})"
         )
@@ -2123,6 +2127,7 @@ def _run_am1_recovering_local_sender(
     last_sequence = initial_observation_sequence
     last_host_observation_id = initial_feedback["observation_id"]
     last_observed_at = initial_follower_observed_at
+    last_request_age_s = robot.latest_observation_roundtrip_age_s
     safe_target = dict(initial_arm_target)
     last_leader_target = dict(initial_arm_target)
     initial_active_ack = False
@@ -2148,10 +2153,14 @@ def _run_am1_recovering_local_sender(
     operator_stop_requested = False
     script_complete = False
     scripted_clock_active = False
+    script_clock = dict(empty_polls=0, preserved_empty_polls=0, stale_replies=0,
+                        freezes=0, advance_calls=0, zero_time_advances=0, feedback_read_s=0.0)
 
     def freeze_script() -> None:
         nonlocal scripted_clock_active
         if scripted_input is not None:
+            if scripted_clock_active:
+                script_clock["freezes"] += 1
             scripted_input.freeze()
             scripted_clock_active = False
 
@@ -2161,6 +2170,8 @@ def _run_am1_recovering_local_sender(
             return
         manual_requested = True
         print("RESUME-NEEDS-ENTER — release body keys, hold leaders still, then press Enter only.", flush=True)
+        print(json.dumps({"event": "am1_local_resume_input_requested", "epoch": pause_epoch_seen,
+                          "wall_time_ns": wall_time_ns()}, sort_keys=True), flush=True)
 
         def read_enter() -> None:
             try:
@@ -2271,13 +2282,29 @@ def _run_am1_recovering_local_sender(
                 refusal = f"AM1 Local feedback did not qualify within {AM1_LOCAL_RECOVERY_BUDGET_S:.0f}s"
                 break
 
+            feedback_read_started = monotonic()
             try:
                 sample = read_fresh_am1_live_sample(
                     robot, leader, previous_sequence=last_sequence, monotonic=monotonic,
                     require_current_request=True,
                 )
-            except TransientFollowerObservation:
-                freeze_script()
+            except TransientFollowerObservation as exc:
+                empty_poll = isinstance(exc, NoNewFollowerObservation)
+                state_now, _, _, _ = sender.recovery_snapshot()
+                elapsed_since_feedback = monotonic() - last_observed_at
+                preserve_clock = (
+                    empty_poll and initial_active_ack and state_now == "active"
+                    and 0 <= elapsed_since_feedback
+                    and last_request_age_s + elapsed_since_feedback < AM1_LIVE_OBSERVATION_MAX_AGE_S
+                )
+                script_clock["empty_polls" if empty_poll else "stale_replies"] += 1
+                if preserve_clock:
+                    # No leader read, publish or trajectory advance on this poll. Retain
+                    # bookkeeping only; the next fresh tick still takes the sender's
+                    # active-epoch/freshness locks and its one-frame progress cap.
+                    script_clock["preserved_empty_polls"] += 1
+                else:
+                    freeze_script()
                 observation_timeout_count += 1
                 note_unusable_feedback()
                 continue
@@ -2287,6 +2314,8 @@ def _run_am1_recovering_local_sender(
                 sender.request_pause("stale follower observation after leader sampling")
                 note_unusable_feedback()
                 continue
+            finally:
+                script_clock["feedback_read_s"] += max(0.0, monotonic() - feedback_read_started)
 
             feedback = _am1_local_feedback(robot)
             host_observation_id = feedback["observation_id"]
@@ -2302,6 +2331,7 @@ def _run_am1_recovering_local_sender(
                 freeze_script()
                 continue
             last_observed_at = sample.observed_at
+            last_request_age_s = sample.request_roundtrip_age_s
             last_leader_target = dict(sample.arm_target)
 
             if state == "active":
@@ -2338,10 +2368,14 @@ def _run_am1_recovering_local_sender(
                 if scripted_input is not None:
                     # Advance only following current acknowledged active feedback.
                     # The sample just published was read from this same provider.
+                    before_progress = scripted_input.elapsed_s
                     progress = sender.advance_scripted_input(
                         scripted_input, sample, epoch=epoch, clock_active=scripted_clock_active,
                     )
                     scripted_clock_active = progress is not None
+                    if progress is not None:
+                        script_clock["advance_calls"] += 1
+                        script_clock["zero_time_advances"] += int(scripted_input.elapsed_s == before_progress)
                     if progress is None:
                         freeze_script()
                     scripted_input.flush_events()
@@ -2489,6 +2523,10 @@ def _run_am1_recovering_local_sender(
                                   "observation_age_ms": round(max(0.0, monotonic() - last_observed_at) * 1e3, 3),
                                   "stale_latched": refusal is not None,
                                   "body_command_expiration_count": body_mailbox.expiration_count,
+                                  **({"script_clock": {**script_clock,
+                                       "feedback_read_s": round(script_clock["feedback_read_s"], 6),
+                                       "trajectory_s": round(scripted_input.elapsed_s, 6)}}
+                                     if scripted_input is not None else {}),
                                   "right_wrist_requested": safe_target[RIGHT_WRIST_FLEX_KEY]},
                                  sort_keys=True), flush=True)
             except BaseException as exc:
