@@ -82,10 +82,13 @@ the capture window. A substantial recovery-prompt wait was execution/input
 waiting, not established network latency. These results do not certify tracking
 or every write. Detailed evidence remains private; PRs #8/#9 stay closed.
 
-That capture used separate helper/client `ba43bbe4` and motor `59bb6072` slices;
-camera `047c4fcf` was unchanged. The deferred follow-up below requires reviewed
-component-only deployment and consistent backed-up private pins, not wholesale
-replacement of working motor/camera lineages.
+That first capture used separate helper/client `ba43bbe4` and motor `59bb6072`
+slices. The deferred follow-up is now implemented at reviewed source `a997f768`
+and deployed as helper/client `cc0234b3d9772f6a040131384f9d508653c2931b` and motor
+`745255b62ae3f871ea9d70aab56e21e1b926971e`. Camera
+`047c4fcf7cbf34684a9b8c348193585938975815` remains intentionally unchanged.
+Only necessary private pins changed, with backup; working lineages/environments
+were preserved. Later documentation commits do not require runtime redeployment.
 
 It captures only right elbow and left shoulder pan through the existing motor
 owner, after an accepted active command and its ordinary observation/reply.
@@ -116,8 +119,8 @@ gap rather than inventing a value. A long recovery can exhaust capture time
 before profile completion. The unchanged 88-second profile, 180-second session
 ceiling, short holds, zero body/lift, Enter gates and normal cleanup remain.
 
-After that separate deployment, the single bounded next evidence run uses the
-ordinary launcher with this additional option:
+The completed attended evidence run used the ordinary launcher below. This is
+the exact executed command, not a request to repeat a successful profile:
 
 ```powershell
 .\tools\run_am1_session.ps1 -LeaderSource Scripted -MotionProfile ArmSmoke -DurationSeconds 180 -ArmTrackingReadback -ArmTrackingStart RightElbowRequest
@@ -151,6 +154,31 @@ two RED cases reproduced it. The correction reacquires time after reporting whil
 retaining the original deadline. The final narrow tracking/launcher rerun passed
 **37 tests**, including the new slow-sink and supported-register checks. No further
 material review finding remained; this does not claim new physical evidence.
+
+The subsequent single attended deferred run completed 88/88 trajectory seconds
+in about 96.263 seconds live, with one automatically qualified recovery. Client
+longest send interval was 110 ms. The host had no new live watchdog event;
+pre-live confirmation gaps remain separate. All component/session exits were
+zero, cleanup verified and exact logs collected. The host completion label
+`cancelled` reflects ordinary supervisor SIGINT after `script_complete`, not a
+manual cancellation or failed profile.
+
+The trigger waited for the accepted elbow request; 103 two-joint snapshots
+covered the elbow outbound, endpoint, return and late stationary hold. All 206 sampled
+goals matched the unchanged calibration conversion, with received/limited/final
+targets agreeing. Actual selected-joint settings readbacks matched. Measured
+response nevertheless remained short: the elbow did not report positive motion
+during the captured excursion, and a shoulder return residual persisted. This
+closes the missing evidence window, **not** complete joint tracking or exact
+physical causation. Sequential samples still do not acknowledge every write or
+establish uninterrupted goal persistence. Detailed count/current timelines and
+raw/private evidence remain outside GitHub.
+
+No second run, speculative motor-setting change or command-path workaround was
+made. A single-joint reversible response comparison is proposed separately for
+approval; no automatic gain escalation or simultaneous shoulder tuning. Keep
+PR #10 draft/unmerged pending focused review. Earlier accepted lifecycle/profile
+milestones and remaining camera, shoulder and long-duration limitations remain.
 
 ### Completed scripted follow-up — historical implementation evidence
 
