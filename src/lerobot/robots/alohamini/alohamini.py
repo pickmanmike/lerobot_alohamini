@@ -853,8 +853,16 @@ class AlohaMini(Robot):
         logger.debug(f"{self} read state: {dt_ms:.1f}ms")
 
         # currents protection
-        self.read_and_check_currents(limit_ma=2000, print_currents=True)
+        currents = self.read_and_check_currents(limit_ma=2000, print_currents=True)
         currents_done_t = time.perf_counter()
+        if getattr(self, "_arm_tracking_readback_enabled", False) and self.config.robot_model == "alohamini1":
+            from .arm_tracking import TRACKING_MOTORS
+
+            self.logs["arm_tracking_observation"] = {
+                "completed_at": time.monotonic(),
+                "joints": {motor: {"observed_position": obs_dict[f"{motor}.pos"], "current_ma": currents[motor]}
+                           for motor in TRACKING_MOTORS},
+            }
 
         # Capture images from cameras
         camera_timings_ms = {}
@@ -934,6 +942,11 @@ class AlohaMini(Robot):
             gp_right = {k: (v, present_right[k.replace(".pos", "")]) for k, v in right_pos.items()}
             right_pos = ensure_safe_goal_position(gp_right, self.config.max_relative_target)
         relative_limit_done_t = time.perf_counter()
+        tracking = getattr(self, "_arm_tracking_readback_enabled", False) and self.config.robot_model == "alohamini1"
+        if tracking:
+            from .arm_tracking import TRACKING_MOTORS
+
+            relative_targets = {**left_pos, **right_pos}
 
         left_pos = self._limit_gripper_goal_by_current(self.left_bus, left_pos)
         left_gripper_limit_done_t = time.perf_counter()
@@ -979,6 +992,14 @@ class AlohaMini(Robot):
         }
 
         final_arm_pos = {**left_pos, **right_pos}
+        if tracking:
+            self.logs["arm_tracking_action"] = {
+                motor: {"requested": requested_arm_pos[f"{motor}.pos"],
+                        "relative_limited": relative_targets[f"{motor}.pos"],
+                        "final": final_arm_pos[f"{motor}.pos"]}
+                for motor in TRACKING_MOTORS if f"{motor}.pos" in requested_arm_pos
+            }
+            self.logs["arm_tracking_action_applied_at"] = time.monotonic()
         self.logs["action_diagnostics"] = {
             "target_limited": any(
                 float(final_arm_pos[key]) != float(requested)

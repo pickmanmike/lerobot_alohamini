@@ -657,10 +657,14 @@ class SessionCoordinator:
 
 
 class SSHRemote:
-    def __init__(self, config: SessionConfig, session_id: str, session_directory: Path) -> None:
+    def __init__(
+        self, config: SessionConfig, session_id: str, session_directory: Path, *,
+        arm_tracking_readback: bool = False,
+    ) -> None:
         self.config = config
         self.session_id = session_id
         self.session_directory = session_directory
+        self.arm_tracking_readback = arm_tracking_readback
         self.process: subprocess.Popen[str] | None = None
         self.events: queue.Queue[dict[str, Any]] = queue.Queue()
         self.stderr_stream = None
@@ -714,6 +718,8 @@ class SSHRemote:
             "--log-directory", self.config.remote_log_directory,
             "--state-directory", self.config.remote_state_directory,
         ])
+        if self.arm_tracking_readback:
+            command.append("--arm-tracking-readback")
         return command
 
     def _read_events(self) -> None:
@@ -1545,8 +1551,11 @@ def _pid_running(pid: int) -> bool:
 def _run_start_locked(
     repository: Path, config: SessionConfig, duration_seconds: int, *,
     leader_source: str = "physical", motion_profile: str | None = None,
+    arm_tracking_readback: bool = False,
 ) -> int:
     validate_leader_selection(leader_source, motion_profile)
+    if arm_tracking_readback and leader_source != "scripted":
+        raise ValueError("Arm tracking readback is available only for scripted leader input.")
     active_path = _active_path(config)
     if active_path.exists():
         try:
@@ -1579,6 +1588,7 @@ def _run_start_locked(
     print(f"AM1_SESSION_RESULT={session_directory}", flush=True)
     print("AM1 session phase: starting bounded source and ownership preflight.", flush=True)
     remote = SSHRemote(config, session_id, session_directory)
+    remote.arm_tracking_readback = arm_tracking_readback
     selection = {"leader_source": leader_source, "motion_profile": motion_profile} if leader_source == "scripted" else {}
     client = WindowsClient(repository, config, remote.fault, stop_request, **selection)
     def record_hardware_cleanup(outcome: SessionOutcome) -> None:
@@ -1646,13 +1656,17 @@ def _run_start_locked(
 def run_start(
     repository: Path, config: SessionConfig, duration_seconds: int, *,
     leader_source: str = "physical", motion_profile: str | None = None,
+    arm_tracking_readback: bool = False,
 ) -> int:
+    if arm_tracking_readback and leader_source != "scripted":
+        raise ValueError("Arm tracking readback is available only for scripted leader input.")
     validate_local_preflight(
         repository, config, duration_seconds, leader_source=leader_source, motion_profile=motion_profile,
     )
     with LocalSessionLock(config.local_state_directory / "active.lock"):
         return _run_start_locked(
             repository, config, duration_seconds, leader_source=leader_source, motion_profile=motion_profile,
+            **({"arm_tracking_readback": True} if arm_tracking_readback else {}),
         )
 
 
@@ -1816,6 +1830,8 @@ def build_parser() -> argparse.ArgumentParser:
     start_parser.add_argument("--duration-seconds", required=True)
     start_parser.add_argument("--leader-source", choices=("physical", "scripted"), default="physical")
     start_parser.add_argument("--motion-profile")
+    start_parser.add_argument("--arm-tracking-readback", action="store_true",
+                              help="Opt-in same-owner right-elbow/left-pan readback for one ArmSmoke run.")
     subparsers.add_parser("stop")
     collect_parser = subparsers.add_parser("collect")
     collect_parser.add_argument("--session-id", required=True)
@@ -1828,12 +1844,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "start":
             duration_seconds = parse_duration_seconds(args.duration_seconds)
             validate_leader_selection(args.leader_source, args.motion_profile)
+            if args.arm_tracking_readback and args.leader_source != "scripted":
+                raise ValueError("Arm tracking readback is available only for scripted leader input.")
         config = SessionConfig.load(args.config)
         repository = Path(__file__).resolve().parents[1]
         if args.command == "start":
             return run_start(
                 repository, config, duration_seconds,
                 leader_source=args.leader_source, motion_profile=args.motion_profile,
+                **({"arm_tracking_readback": True} if args.arm_tracking_readback else {}),
             )
         if args.command == "stop":
             return request_stop(config)

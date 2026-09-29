@@ -69,6 +69,54 @@ Prepare only opt-in, same-owner target/goal/position/current capture before the
 next bounded evidence run. Do not change gains, current limits, calibration,
 profile amplitude/dwell or tracking tolerance.
 
+### Prepared tracking capture — separate, not deployed
+
+The `codex/am1-tracking-capture` follow-up adds `-ArmTrackingReadback` to the
+existing unified launcher, only with `-LeaderSource Scripted -MotionProfile
+ArmSmoke`. It is **not** part of the integrated runtime above and has not been
+physically exercised or deployed. A later reviewed deployment must update only
+the necessary client/helper and motor pins before using this new option.
+
+It captures only right elbow and left shoulder pan through the existing motor
+owner, after an accepted active command and its ordinary observation/reply.
+Records distinguish received target, relative-limited target, final target,
+calibrated goal-register readback, ordinary position/current, host command and
+observation IDs, epoch and timestamps. Only two `Goal_Position` reads are added;
+there is no writer, second serial owner or new polling thread. A readback error
+retains the genuine fault and reaches existing host cleanup.
+
+The opt-in capture is capped at four snapshots per second, 480 snapshots and
+120 wall seconds from the first active capture, with no catch-up or reset on
+recovery. These are periodic, sequential snapshots, **not phase-triggered or
+atomic measurements**, servo write acknowledgements, durable-goal guarantees or
+proof of receipt by the client. Match endpoint and return using the actual
+captured targets and existing script events; if a phase is missed, report that
+gap rather than inventing a value. A long recovery can exhaust capture time
+before profile completion. The unchanged 88-second profile, 180-second session
+ceiling, short holds, zero body/lift, Enter gates and normal cleanup remain.
+
+After that separate deployment, the single bounded next evidence run uses the
+ordinary launcher with this additional option:
+
+```powershell
+.\tools\run_am1_session.ps1 -LeaderSource Scripted -MotionProfile ArmSmoke -DurationSeconds 180 -ArmTrackingReadback
+```
+
+Codex handles software execution and exact-log collection during attended use;
+the owner handles physical readiness/support and the accessible stop. Physical
+leaders remain disconnected and unused. There is no additional comparator,
+minimum-step workaround, larger excursion, longer global dwell or repeated-pass
+campaign. A genuine fault stops the attempt; assess the exact capture before
+another movement. The aim is to distinguish missing/limited goal delivery from
+incomplete response to a confirmed sampled goal, not to certify all tracking.
+
+Offline RED demonstrated missing target-boundary evidence, absent opted-in
+readback/error propagation, and missing launcher selection. Fixture-only
+setup mistakes were corrected before implementing. The focused final regression
+passed **255 tests, with 2 POSIX-only skips on Windows**, including actual fake
+action/observation/host paths, read-error cleanup, bounded sampling, disabled
+behavior, AM2 isolation and launcher propagation. No powered result is claimed.
+
 ### Completed scripted follow-up — historical implementation evidence
 
 The approved empty-poll bookkeeping repair is source
