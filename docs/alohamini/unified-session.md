@@ -8,6 +8,60 @@ had a maximum browser display gap of `1.138 s`, above the unchanged `500 ms`
 continuity target. Loss of a required view still means release controls, press
 `Q`, and restart only after all owned processes have stopped.
 
+## Current scripted follow-up — September 28, 2026
+
+The approved empty-poll bookkeeping repair is source
+`a26690a626fba5fb7624deb714caf35e58e81b08`. An ordinary empty observation poll
+does not reset the script clock while the previously qualified active state is
+still fresh. It does not sample the leader, publish a target or advance the
+trajectory. The next genuinely fresh sample must still pass the existing locked
+active-epoch/freshness checks, fixed origin and one-frame progress cap. Real stale
+replies, pauses, faults and cancellation retain their existing freeze/stop paths.
+No motor, camera, profile amplitude/dwell, freshness or network limit changed.
+
+New actual Local-loop/client-request-window/sender loopback cases first reproduced
+zero trajectory progress with intervening empty polls (two intended failures;
+the no-empty control passed). The corrected cases cover fast and slower valid
+replies, emitted bounded commands, body zero, duration expiry and cleanup.
+Fake-time cases separately cover stale feedback, repeated recovery and immediate
+versus delayed Enter. Final affected verification: **243 passed** across scripted
+leader, Local recovery and Windows leader-client tests. Compile, help, fresh lazy
+imports, source-root and diff/artifact checks passed. Independent review found no
+material blocker. These offline results do not simulate physical joint tracking.
+
+Windows client/session and Pi helper are deployed at the matching two-file
+cherry-pick `e1efd2e41e30701218f946a4714a74c123152b7c`. Motor
+`1514c50a4ba9b7762fc577a08fddf02498733386` and camera
+`047c4fcf7cbf34684a9b8c348193585938975815` remain intentionally unchanged.
+The ignored session pin was backed up and updated; environments and private
+configuration were preserved.
+
+Under the subsequent owner-authorized maximum-three-attempt packet, the **first**
+attended run completed the unchanged finite ArmSmoke profile inside its original
+180-second duration, with `script_complete`, no live recovery, clean component
+exits, verified zero/torque-off/stopped cleanup and complete log collection.
+The batch stopped there; no replicate or longer-duration run was used. Ordinary
+empty polls were observed and retained without resetting progression. This one
+run does not prove every prior delay was caused by that reset: the earlier run
+also had real recoveries and an Enter wait, and its missing counters cannot be
+reconstructed retrospectively.
+
+Keep three verdicts separate: lifecycle passed once; the full profile completed;
+**complete per-joint tracking did not pass**. The previously weak elbow excursion
+was revisited without a useful positive response, and some channels retained
+return error. Generated targets are not servo goal-register acknowledgement or
+visual confirmation. Detailed joint/timing evidence and raw logs remain private.
+No gains, minimum-step workaround or profile tuning was introduced. Earlier
+incomplete/faulted runs, accepted ordinary motion, shoulder/camera limitations and
+long-duration restrictions remain. Next is focused integration review; PRs #8/#9
+remain draft and unmerged, not a request for another powered session.
+
+The script-only cadence summary adds empty-poll/preserved-poll counts, advance
+counts and cumulative feedback-call time; manual resume records prompt and input
+events separately. `stale_replies` counts returned over-age replies, not every
+combined-age failure; `freezes` counts active-clock freeze calls, not every failed
+locked commit. Use recovery/fault events too, not these counters as a fault census.
+
 ## Integrated baseline and reliability follow-up — September 27, 2026
 
 PR #7 is merged into `integrate/am1-local-teleop`, not `main`, at
@@ -25,7 +79,8 @@ reviewed head; the subsequent closeout edits are documentation only.
 | Motor-only initial-relief qualification; later scripted attempt refused before readiness | `699d6eaf19de1dc80dfcd6621406ba7850fae446` |
 | Motor-only one-second initial qualification; subsequent ArmSmoke started but did not complete | `b0bce720572e83b7046d1234a997a3064ce118b9` |
 | Current motor-only consumer-refresh correction; attended run ended cleanly but profile remained incomplete | `1514c50a4ba9b7762fc577a08fddf02498733386` |
-| Windows client/session and Pi helper, unchanged across the scripted attempts | `60fcd9bcc4deecae76520b9c35e7120d889414ad` |
+| Windows client/session and Pi helper for the earlier incomplete scripted attempts | `60fcd9bcc4deecae76520b9c35e7120d889414ad` |
+| Current client/session and Pi helper; empty-poll correction exercised through profile completion | `e1efd2e41e30701218f946a4714a74c123152b7c` |
 | Separately deployed Pi camera, intentionally unchanged | `047c4fcf7cbf34684a9b8c348193585938975815` |
 
 The camera commit is **not an ancestor** of the integration merge. The private
@@ -181,13 +236,15 @@ Ordinary cancellation and collection use the same launcher:
 .\tools\run_am1_session.ps1 -CollectOnly -SessionId <exact-printed-session-id>
 ```
 
-No automatic batch runner was added. Begin with one useful attended cycle. A second
-session (maximum two for startup/shutdown comparison) is permitted only after the
-first reports normal script completion, verified clean component exits and collected
-evidence. Manual stop, fault, non-completion or uncertain cleanup ends that sequence.
-Inspect the exact evidence and do supported software work before another powered
-attempt; never repeat homing until a pass. Preserve the existing shoulder/camera and
-long-duration limitations and all previously accepted physical-leader milestones.
+No automatic batch runner was added. The original two-attempt authorization was
+superseded by the owner's bounded iterative packet: at most three attended attempts,
+each answering a stated question after review of the preceding outcome; one
+unchanged replicate or a justified duration-only variation up to 600 seconds was
+permitted. A fault stops its attempt, manual Stop ends the batch, and uncertain
+cleanup or supervision prevents another launch. That batch closed after its first
+complete profile, as recorded above. Do not turn it into standing indefinite retry
+authority. Preserve shoulder/camera and long-duration limitations and all earlier
+accepted physical-leader milestones.
 
 Offline verification for this addition: **561 passed, 1 skipped** across the eight
 affected scripted-input, launcher/session, startup, Local and sender test files.
@@ -307,10 +364,10 @@ must not be attributed to transport. Client, host, camera and session exited 0;
 zero goal, torque off and a stopped cleanup window were verified, all exact logs
 were collected, and no owned runtime remained. No second attempt followed.
 
-Next: isolate qualified-observation delivery/consumption with a hardware-free
-timing reproduction before another powered profile. Do not widen freshness,
-extend the session, tune joints or repeat unchanged to obtain completion. PRs
-#8/#9 stay draft/unmerged. Detailed joint/timing evidence and raw logs stay private.
+At that closeout, the next step was a hardware-free qualified-observation timing
+reproduction, not an unchanged physical retry. The subsequently approved correction
+and bounded batch are recorded at the top; they do not erase this incomplete run.
+PRs #8/#9 stay draft/unmerged. Detailed joint/timing evidence and raw logs stay private.
 
 ## Compact design
 
