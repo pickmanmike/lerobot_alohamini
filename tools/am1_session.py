@@ -150,6 +150,49 @@ def parse_duration_seconds(value: object) -> int:
     return int(text)
 
 
+def validate_leader_selection(leader_source: str, motion_profile: str | None) -> None:
+    if leader_source not in {"physical", "scripted"}:
+        raise ValueError("Leader source must be physical or scripted.")
+    if leader_source == "scripted" and motion_profile != "ArmSmoke":
+        raise ValueError("Scripted leader input requires --motion-profile ArmSmoke.")
+    if leader_source == "physical" and motion_profile is not None:
+        raise ValueError("--motion-profile is available only for scripted leader input.")
+
+
+def _leader_launch_arguments(leader_source: str, motion_profile: str | None) -> list[str]:
+    validate_leader_selection(leader_source, motion_profile)
+    if leader_source == "scripted":
+        return ["-LeaderSource", "Scripted", "-MotionProfile", "ArmSmoke"]
+    return []
+
+
+def _read_scripted_summary(path: Path) -> dict[str, Any] | None:
+    summaries = []
+    try:
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if not line.startswith("{"):
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict) and payload.get("event") == "am1_scripted_input_summary":
+                summaries.append(payload)
+    except OSError:
+        return None
+    if len(summaries) != 1:
+        return None
+    summary = summaries[0]
+    if (
+        summary.get("input_source") != "scripted" or summary.get("motion_profile") != "ArmSmoke"
+        or summary.get("stop_reason") not in {
+            "script_complete", "manual_q", "explicit_stop", "duration_expired", "fault", "keyboard_interrupt",
+        }
+    ):
+        return None
+    return summary
+
+
 @dataclass(frozen=True)
 class SessionConfig:
     windows_python: Path
@@ -245,6 +288,10 @@ class SessionOutcome:
     operational_exit_code: int
     final_exit_code: int
     cleanup_verified: bool
+    input_source: str = "physical"
+    motion_profile: str | None = None
+    stop_reason: str | None = None
+    scripted_input_summary: dict[str, Any] | None = None
     remote_logs: list[str] = field(default_factory=list)
     missing_logs: list[str] = field(default_factory=list)
     cleanup: dict[str, Any] = field(default_factory=dict)
@@ -269,13 +316,70 @@ class SessionCoordinator:
         collect_remote_log: Callable[[str, Path], tuple[bool, str | None]],
         input_fn: Callable[[str], str] = input,
         on_cleanup: Callable[[SessionOutcome], None] | None = None,
+        leader_source: str = "physical",
+        motion_profile: str | None = None,
+        windows_source_head: str | None = None,
     ) -> None:
+        validate_leader_selection(leader_source, motion_profile)
         self.remote = remote
         self.client = client
         self.open_browser = open_browser
         self.collect_remote_log = collect_remote_log
         self.input_fn = input_fn
         self.on_cleanup = on_cleanup
+        self.leader_source = leader_source
+        self.motion_profile = motion_profile
+        self.windows_source_head = windows_source_head
+
+    def _record_scripted_result(self, outcome: SessionOutcome, client_log_path: Path) -> None:
+        if self.leader_source != "scripted":
+            return
+        summary = _read_scripted_summary(client_log_path)
+        outcome.scripted_input_summary = summary
+        reason = summary["stop_reason"] if summary is not None else (outcome.stop_reason or "unknown")
+        cleanup = outcome.cleanup
+        client = cleanup.get("client", {})
+        stop_origin = client.get("stop_context", {}).get("origin")
+        if stop_origin in {"explicit_stop", "keyboard_interrupt"}:
+            reason = stop_origin
+        child_exits = [cleanup.get("host_exit"), cleanup.get("camera_exit"), client.get("wrapper_exit")]
+        expected_cancellation = (
+            reason in {"explicit_stop", "keyboard_interrupt"}
+            and outcome.operational_exit_code == 130
+            and client.get("wrapper_exit") in {0, 130}
+            and client.get("client_exit") in {0, 130}
+        )
+        fault_exits = child_exits[:2] if expected_cancellation else child_exits
+        if (
+            outcome.operational_exit_code not in {0, 130}
+            or stop_origin == "remote_fault"
+            or cleanup.get("primary_fault") is not None
+            or cleanup.get("terminal_status", cleanup.get("persisted_status")) in {"fault", "refused"}
+            or any(type(code) is int and code != 0 for code in fault_exits)
+            or reason == "fault"
+        ):
+            reason = "fault"
+            if outcome.operational_exit_code in {0, 130}:
+                outcome.operational_exit_code = 2
+            if outcome.failure is None:
+                outcome.failure = "Scripted session did not complete cleanly; see client and remote cleanup evidence."
+        elif reason == "script_complete":
+            if summary is None or summary.get("profile_complete") is not True:
+                reason = "unknown"
+                if outcome.operational_exit_code == 0:
+                    outcome.operational_exit_code = 2
+                outcome.failure = outcome.failure or "Scripted profile completion was not explicitly verified."
+            elif outcome.operational_exit_code != 0:
+                reason = "unknown"
+            elif not outcome.cleanup_verified or any(
+                type(code) is not int or code != 0 for code in [*child_exits, client.get("client_exit")]
+            ):
+                reason = "cleanup_unknown"
+                outcome.cleanup_verified = False
+        elif summary is None and outcome.operational_exit_code == 0:
+            outcome.operational_exit_code = 2
+            outcome.failure = "Scripted input completion summary is missing, ambiguous, or invalid."
+        outcome.stop_reason = reason
 
     def _input_with_stop(
         self,
@@ -324,6 +428,8 @@ class SessionCoordinator:
             operational_exit_code=2,
             final_exit_code=2,
             cleanup_verified=False,
+            input_source=self.leader_source,
+            motion_profile=self.motion_profile,
             started_at=datetime.now().astimezone().isoformat(),
         )
         remote_logs: list[str] = []
@@ -340,17 +446,29 @@ class SessionCoordinator:
                 for key, value in preflight.items()
                 if key.endswith("_source_head")
             }
+            if self.windows_source_head is not None:
+                outcome.sources["windows_source_head"] = self.windows_source_head
             camera = self.remote.start_camera()
             if camera.get("camera_log"):
                 remote_logs.append(camera["camera_log"])
             self.open_browser(camera["browser_url"])
             print("AM1 session phase: all five camera sources are ready; the read-only viewer is open.", flush=True)
-            print(
-                "CONFIRMATION 1/3 — Verify all five required views are usable, the workspace is clear, "
-                "carriage support and motor-power removal are accessible, and established robot/leader "
-                "power is ready. Press Enter only to start the motor host.",
-                flush=True,
-            )
+            if self.leader_source == "scripted":
+                print(
+                    "SCRIPTED LEADER INPUT — REAL FOLLOWER MOTION\n"
+                    "CONFIRMATION 1/3 — Verify all five required views are usable, the approved motion area "
+                    "is clear, carriage support and motor-power removal are accessible, and follower power "
+                    "is ready. Physical leader controllers remain disconnected; leaders are not used. "
+                    "Press Enter only to start the motor host.",
+                    flush=True,
+                )
+            else:
+                print(
+                    "CONFIRMATION 1/3 — Verify all five required views are usable, the workspace is clear, "
+                    "carriage support and motor-power removal are accessible, and established robot/leader "
+                    "power is ready. Press Enter only to start the motor host.",
+                    flush=True,
+                )
             approval = self._input_with_stop(
                 "",
                 stop_requested,
@@ -362,6 +480,7 @@ class SessionCoordinator:
             elif stop_requested():
                 outcome.failure = "session stop requested before motor activation"
                 outcome.operational_exit_code = 130
+                outcome.stop_reason = "explicit_stop"
             else:
                 print("AM1 session phase: operator readiness confirmed; starting the motor host.", flush=True)
                 host = self.remote.start_host()
@@ -407,9 +526,10 @@ class SessionCoordinator:
                         outcome.operational_exit_code = 2
                     else:
                         remote_fault_observed_after_client_result = dict(remote_fault)
-        except (KeyboardInterrupt, SessionStopped):
+        except (KeyboardInterrupt, SessionStopped) as exc:
             outcome.failure = "operator interrupt"
             outcome.operational_exit_code = 130
+            outcome.stop_reason = "keyboard_interrupt" if isinstance(exc, KeyboardInterrupt) else "explicit_stop"
         except BaseException as exc:
             outcome.failure = f"{type(exc).__name__}: {exc}"
             outcome.operational_exit_code = 2
@@ -445,6 +565,7 @@ class SessionCoordinator:
                     else:
                         remote_logs.append(cleanup[key])
             outcome.remote_logs = list(remote_logs)
+            self._record_scripted_result(outcome, client_log_path)
 
             if outcome.operational_exit_code != 0:
                 outcome.final_exit_code = outcome.operational_exit_code
@@ -458,6 +579,8 @@ class SessionCoordinator:
                 except BaseException as exc:
                     outcome.cleanup["local_cleanup_callback_error"] = f"{type(exc).__name__}: {exc}"
                     outcome.cleanup_verified = False
+                    if outcome.stop_reason == "script_complete":
+                        outcome.stop_reason = "cleanup_unknown"
 
             if client_log_path.exists():
                 try:
@@ -1101,7 +1224,11 @@ class WindowsClient:
         config: SessionConfig,
         remote_fault: Callable[[], Any],
         stop_request_path: Path,
+        *,
+        leader_source: str = "physical",
+        motion_profile: str | None = None,
     ) -> None:
+        self._leader_arguments = _leader_launch_arguments(leader_source, motion_profile)
         self.repository = repository
         self.config = config
         self.remote_fault = remote_fault
@@ -1163,7 +1290,7 @@ class WindowsClient:
             "-Mode", "Local", "-ConfigPath", str(self.config.local_config),
             "-DurationSeconds", str(duration_seconds), "-LogPath", str(log_path),
             "-StopRequestPath", str(self.stop_request_path),
-        ]
+        ] + self._leader_arguments
         creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
         process = subprocess.Popen(command, cwd=self.repository, creationflags=creationflags)
         self._cleanup_status = {
@@ -1257,7 +1384,11 @@ def _git_head(repository: Path) -> str:
     return completed.stdout.strip()
 
 
-def validate_local_preflight(repository: Path, config: SessionConfig, duration_seconds: int) -> None:
+def validate_local_preflight(
+    repository: Path, config: SessionConfig, duration_seconds: int, *,
+    leader_source: str = "physical", motion_profile: str | None = None,
+) -> None:
+    leader_arguments = _leader_launch_arguments(leader_source, motion_profile)
     required = [config.windows_python, config.local_config, repository / "tools" / "run_am1.ps1"]
     missing = [str(path) for path in required if not path.is_file()]
     if missing:
@@ -1278,7 +1409,7 @@ def validate_local_preflight(repository: Path, config: SessionConfig, duration_s
             powershell, "-NoLogo", "-NoProfile", "-File", str(repository / "tools" / "run_am1.ps1"),
             "-Mode", "Local", "-ConfigPath", str(config.local_config),
             "-DurationSeconds", str(duration_seconds), "-Preflight",
-        ],
+        ] + leader_arguments,
         cwd=repository,
         text=True,
         stdout=subprocess.PIPE,
@@ -1411,7 +1542,11 @@ def _pid_running(pid: int) -> bool:
     return True
 
 
-def _run_start_locked(repository: Path, config: SessionConfig, duration_seconds: int) -> int:
+def _run_start_locked(
+    repository: Path, config: SessionConfig, duration_seconds: int, *,
+    leader_source: str = "physical", motion_profile: str | None = None,
+) -> int:
+    validate_leader_selection(leader_source, motion_profile)
     active_path = _active_path(config)
     if active_path.exists():
         try:
@@ -1436,13 +1571,16 @@ def _run_start_locked(repository: Path, config: SessionConfig, duration_seconds:
             "session_directory": str(session_directory),
             "stop_request": str(stop_request),
             "status": "active",
+            "input_source": leader_source,
+            "motion_profile": motion_profile,
         },
     )
     print(f"AM1_SESSION_ID={session_id}", flush=True)
     print(f"AM1_SESSION_RESULT={session_directory}", flush=True)
     print("AM1 session phase: starting bounded source and ownership preflight.", flush=True)
     remote = SSHRemote(config, session_id, session_directory)
-    client = WindowsClient(repository, config, remote.fault, stop_request)
+    selection = {"leader_source": leader_source, "motion_profile": motion_profile} if leader_source == "scripted" else {}
+    client = WindowsClient(repository, config, remote.fault, stop_request, **selection)
     def record_hardware_cleanup(outcome: SessionOutcome) -> None:
         _write_active(
             config,
@@ -1454,6 +1592,9 @@ def _run_start_locked(repository: Path, config: SessionConfig, duration_seconds:
                 "operational_exit_code": outcome.operational_exit_code,
                 "final_exit_code": outcome.final_exit_code,
                 "cleanup_verified": outcome.cleanup_verified,
+                "input_source": outcome.input_source,
+                "motion_profile": outcome.motion_profile,
+                "stop_reason": outcome.stop_reason,
             },
         )
 
@@ -1463,6 +1604,9 @@ def _run_start_locked(repository: Path, config: SessionConfig, duration_seconds:
         open_browser=_open_browser,
         collect_remote_log=lambda remote_path, destination: _collect_with_scp(config, remote_path, destination),
         on_cleanup=record_hardware_cleanup,
+        leader_source=leader_source,
+        motion_profile=motion_profile,
+        windows_source_head=getattr(config, "remote_session_head", None),
     ).run(
         duration_seconds=duration_seconds,
         session_id=session_id,
@@ -1478,11 +1622,16 @@ def _run_start_locked(repository: Path, config: SessionConfig, duration_seconds:
             "session_directory": str(session_directory),
             "status": "complete" if outcome.final_exit_code == 0 else "failed",
             "final_exit_code": outcome.final_exit_code,
+            "input_source": outcome.input_source,
+            "motion_profile": outcome.motion_profile,
+            "stop_reason": outcome.stop_reason,
         },
     )
     stop_request.unlink(missing_ok=True)
     if outcome.failure:
         print(f"AM1_SESSION_FAILURE={outcome.failure}", flush=True)
+    if outcome.stop_reason is not None:
+        print(f"AM1_SESSION_STOP_REASON={outcome.stop_reason}", flush=True)
     print(f"AM1_SESSION_EXIT_CODE={outcome.final_exit_code}", flush=True)
     if outcome.missing_logs:
         print("Log collection is incomplete; rerun with -CollectOnly -SessionId " + session_id)
@@ -1494,10 +1643,17 @@ def _run_start_locked(repository: Path, config: SessionConfig, duration_seconds:
     return outcome.final_exit_code
 
 
-def run_start(repository: Path, config: SessionConfig, duration_seconds: int) -> int:
-    validate_local_preflight(repository, config, duration_seconds)
+def run_start(
+    repository: Path, config: SessionConfig, duration_seconds: int, *,
+    leader_source: str = "physical", motion_profile: str | None = None,
+) -> int:
+    validate_local_preflight(
+        repository, config, duration_seconds, leader_source=leader_source, motion_profile=motion_profile,
+    )
     with LocalSessionLock(config.local_state_directory / "active.lock"):
-        return _run_start_locked(repository, config, duration_seconds)
+        return _run_start_locked(
+            repository, config, duration_seconds, leader_source=leader_source, motion_profile=motion_profile,
+        )
 
 
 def request_stop(config: SessionConfig) -> int:
@@ -1658,6 +1814,8 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     start_parser = subparsers.add_parser("start")
     start_parser.add_argument("--duration-seconds", required=True)
+    start_parser.add_argument("--leader-source", choices=("physical", "scripted"), default="physical")
+    start_parser.add_argument("--motion-profile")
     subparsers.add_parser("stop")
     collect_parser = subparsers.add_parser("collect")
     collect_parser.add_argument("--session-id", required=True)
@@ -1667,10 +1825,16 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        if args.command == "start":
+            duration_seconds = parse_duration_seconds(args.duration_seconds)
+            validate_leader_selection(args.leader_source, args.motion_profile)
         config = SessionConfig.load(args.config)
         repository = Path(__file__).resolve().parents[1]
         if args.command == "start":
-            return run_start(repository, config, parse_duration_seconds(args.duration_seconds))
+            return run_start(
+                repository, config, duration_seconds,
+                leader_source=args.leader_source, motion_profile=args.motion_profile,
+            )
         if args.command == "stop":
             return request_stop(config)
         return collect_only(config, args.session_id)

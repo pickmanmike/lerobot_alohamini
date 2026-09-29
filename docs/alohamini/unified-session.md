@@ -8,6 +8,60 @@ had a maximum browser display gap of `1.138 s`, above the unchanged `500 ms`
 continuity target. Loss of a required view still means release controls, press
 `Q`, and restart only after all owned processes have stopped.
 
+## Current scripted follow-up — September 28, 2026
+
+The approved empty-poll bookkeeping repair is source
+`a26690a626fba5fb7624deb714caf35e58e81b08`. An ordinary empty observation poll
+does not reset the script clock while the previously qualified active state is
+still fresh. It does not sample the leader, publish a target or advance the
+trajectory. The next genuinely fresh sample must still pass the existing locked
+active-epoch/freshness checks, fixed origin and one-frame progress cap. Real stale
+replies, pauses, faults and cancellation retain their existing freeze/stop paths.
+No motor, camera, profile amplitude/dwell, freshness or network limit changed.
+
+New actual Local-loop/client-request-window/sender loopback cases first reproduced
+zero trajectory progress with intervening empty polls (two intended failures;
+the no-empty control passed). The corrected cases cover fast and slower valid
+replies, emitted bounded commands, body zero, duration expiry and cleanup.
+Fake-time cases separately cover stale feedback, repeated recovery and immediate
+versus delayed Enter. Final affected verification: **243 passed** across scripted
+leader, Local recovery and Windows leader-client tests. Compile, help, fresh lazy
+imports, source-root and diff/artifact checks passed. Independent review found no
+material blocker. These offline results do not simulate physical joint tracking.
+
+Windows client/session and Pi helper are deployed at the matching two-file
+cherry-pick `e1efd2e41e30701218f946a4714a74c123152b7c`. Motor
+`1514c50a4ba9b7762fc577a08fddf02498733386` and camera
+`047c4fcf7cbf34684a9b8c348193585938975815` remain intentionally unchanged.
+The ignored session pin was backed up and updated; environments and private
+configuration were preserved.
+
+Under the subsequent owner-authorized maximum-three-attempt packet, the **first**
+attended run completed the unchanged finite ArmSmoke profile inside its original
+180-second duration, with `script_complete`, no live recovery, clean component
+exits, verified zero/torque-off/stopped cleanup and complete log collection.
+The batch stopped there; no replicate or longer-duration run was used. Ordinary
+empty polls were observed and retained without resetting progression. This one
+run does not prove every prior delay was caused by that reset: the earlier run
+also had real recoveries and an Enter wait, and its missing counters cannot be
+reconstructed retrospectively.
+
+Keep three verdicts separate: lifecycle passed once; the full profile completed;
+**complete per-joint tracking did not pass**. The previously weak elbow excursion
+was revisited without a useful positive response, and some channels retained
+return error. Generated targets are not servo goal-register acknowledgement or
+visual confirmation. Detailed joint/timing evidence and raw logs remain private.
+No gains, minimum-step workaround or profile tuning was introduced. Earlier
+incomplete/faulted runs, accepted ordinary motion, shoulder/camera limitations and
+long-duration restrictions remain. Next is focused integration review; PRs #8/#9
+remain draft and unmerged, not a request for another powered session.
+
+The script-only cadence summary adds empty-poll/preserved-poll counts, advance
+counts and cumulative feedback-call time; manual resume records prompt and input
+events separately. `stale_replies` counts returned over-age replies, not every
+combined-age failure; `freezes` counts active-clock freeze calls, not every failed
+locked commit. Use recovery/fault events too, not these counters as a fault census.
+
 ## Integrated baseline and reliability follow-up — September 27, 2026
 
 PR #7 is merged into `integrate/am1-local-teleop`, not `main`, at
@@ -22,7 +76,11 @@ reviewed head; the subsequent closeout edits are documentation only.
 | Windows client/session and Pi session helper for the latest ordinary-use attempts | `16c557c05497c94d0bb2e2938c51d4ba56b0a549` |
 | Motor used by those attempts, before the logging-order correction | `a6a263266888ebc2cd658d0ff5be670632ded3d0` |
 | Motor-only logging-order correction used by the later first-relief refusal | `4e16b18b732247072157d3dc64dad6117761ea13` |
-| Motor-only initial-relief qualification staged; not physically exercised | `699d6eaf19de1dc80dfcd6621406ba7850fae446` |
+| Motor-only initial-relief qualification; later scripted attempt refused before readiness | `699d6eaf19de1dc80dfcd6621406ba7850fae446` |
+| Motor-only one-second initial qualification; subsequent ArmSmoke started but did not complete | `b0bce720572e83b7046d1234a997a3064ce118b9` |
+| Current motor-only consumer-refresh correction; attended run ended cleanly but profile remained incomplete | `1514c50a4ba9b7762fc577a08fddf02498733386` |
+| Windows client/session and Pi helper for the earlier incomplete scripted attempts | `60fcd9bcc4deecae76520b9c35e7120d889414ad` |
+| Current client/session and Pi helper; empty-poll correction exercised through profile completion | `e1efd2e41e30701218f946a4714a74c123152b7c` |
 | Separately deployed Pi camera, intentionally unchanged | `047c4fcf7cbf34684a9b8c348193585938975815` |
 
 The camera commit is **not an ancestor** of the integration merge. The private
@@ -109,14 +167,207 @@ Independent review found no blocker; its confirmed-temperature case is now a
 permanent regression. Compile, help/import-root and diff checks passed. The
 motor-only deployment `699d6eaf` contains the identical four Python/test files;
 only the backed-up private motor pin changed. Its Pi compile/import/help and
-helper print-only checks passed. No powered attempt was run for this correction.
+helper print-only checks passed. No powered attempt was run at that correction's
+closeout; the later scripted attempt below exercised it and refused before readiness.
 
-Next ordinary use uses `-DurationSeconds 300` as a ceiling, the same three actual
+Physical-leader ordinary use uses `-DurationSeconds 300` as a ceiling, the same three actual
 Enter prompts and nominal 30-second synchronization. The owner can finish a
 lightweight task plus brief normal base/lift use and press Q earlier. Preserve
 all accepted milestones and shoulder/camera limitations; do not add another
 diagnostic campaign. A new genuine fault stops that attempt for exact-evidence
 review. PR #8 remains draft and unmerged.
+
+### Opt-in scripted leader input (stacked follow-up to PR #8)
+
+The focused `codex/am1-scripted-leader` branch starts from reviewed PR #8 head
+`80ea84c7d474771d870dd9add5f096e12fab2af4`. The initial scripted feature changes
+Windows input and launcher selection, not the Pi motor or camera implementation.
+It requires that reliability base. The later, separately approved motor-only
+initial-relief timing adjustment is recorded below; it does not rewrite the generator.
+
+```powershell
+.\tools\run_am1_session.ps1 -LeaderSource Scripted -MotionProfile ArmSmoke -DurationSeconds 180
+```
+
+This is **SCRIPTED LEADER INPUT — REAL FOLLOWER MOTION**, not a simulation.
+Physical leaders are disconnected and unused: this explicit mode neither resolves
+their PnP/COM ports nor reads their calibration files. The default remains physical
+leaders with all their checks, without automatic fallback. Follower configuration,
+calibration, genuine host readiness, current observations, cameras, ordinary lift
+home/relief and monitoring, watchdogs, controller lease, and cleanup remain real.
+
+Prepare the normal clear arm envelope, empty grippers, carriage support and
+accessible stop/disconnect. Normalized bounds alone do not prove collision clearance.
+The owner handles power and physical support. Under attended authorization Codex
+may answer each actual Enter prompt individually; never queue blank lines. The
+three gates remain camera/readiness approval, nominal 30-second synchronization,
+and fresh post-sync alignment/live admission. Scripted startup freezes a genuinely
+fresh follower pose as its input origin. It may involve no arm movement and does
+**not** validate arbitrary-pose or large-offset physical-leader synchronization.
+
+`ArmSmoke` runs one finite cycle: 2 seconds stationary; all 12 arm/gripper channels
+in schema order, one at a time, with a 3-unit excursion over 3 seconds, a 0.5-second
+endpoint hold, a 3-second return and a 0.5-second origin hold; then 2 seconds
+stationary. Near a normalized upper endpoint the excursion points inward. Planned
+origins, targets and directions are logged before motion. Its nominal active
+trajectory is 88 seconds; 180 seconds is the live wall-clock ceiling, not a reason
+to keep moving after completion. Slower polls or recoveries may extend the profile.
+
+Only actual acknowledged live feedback advances the trajectory clock. Repeated
+`get_action` calls, startup, paused/recovering states and unusable feedback do not.
+Each update advances at most one nominal frame; there is no queued catch-up motion,
+no target rebasing to a failed follower, no new serial owner or sender. Existing
+measured-hold acknowledgements and bounded resume remain required. W/S/Z/X/A/D,
+U/J and speed keys cannot command body motion in this profile; every live action
+contains explicit zero base/lift velocities. Q and explicit Stop remain available.
+
+Per-segment structured records distinguish requested coordinates, received normalized
+feedback displacement/error, phase and observation sequence. They are tracking
+evidence, not a claim that every tiny movement was visually observed or that source
+camera fps measures browser quality. Existing camera timing remains available.
+`am1_scripted_input_summary` records `script_complete` separately from manual Q,
+explicit Stop, Ctrl+C, duration expiry and faults. The session only accepts successful
+script completion with verified coordinated cleanup; raw logs remain private.
+
+Ordinary cancellation and collection use the same launcher:
+
+```powershell
+.\tools\run_am1_session.ps1 -Stop
+.\tools\run_am1_session.ps1 -CollectOnly -SessionId <exact-printed-session-id>
+```
+
+No automatic batch runner was added. The original two-attempt authorization was
+superseded by the owner's bounded iterative packet: at most three attended attempts,
+each answering a stated question after review of the preceding outcome; one
+unchanged replicate or a justified duration-only variation up to 600 seconds was
+permitted. A fault stops its attempt, manual Stop ends the batch, and uncertain
+cleanup or supervision prevents another launch. That batch closed after its first
+complete profile, as recorded above. Do not turn it into standing indefinite retry
+authority. Preserve shoulder/camera and long-duration limitations and all earlier
+accepted physical-leader milestones.
+
+Offline verification for this addition: **561 passed, 1 skipped** across the eight
+affected scripted-input, launcher/session, startup, Local and sender test files.
+The skip is the existing POSIX-only process-group case on Windows. Compilation,
+PowerShell parsing, help/import/lazy-camera checks and diff checks passed. Independent
+review reproduced and verified corrections to atomic completion and combined-age
+freshness races. Its real sender/host-protocol exercise still used fake hardware;
+none of these results is physical tracking or clearance evidence.
+
+The first attended scripted attempt reached all-five camera readiness, and the
+unchanged motor reported homing complete. It then refused because initial upward
+relief progress did not qualify within the existing 250 ms window. No Windows
+client started: there was no synchronization, live admission, generated ArmSmoke
+motion, or physical tracking result. This was a lift-startup refusal, not a
+temperature-confirmation fault or a demonstrated scripted-input defect.
+
+The motor subsequently recorded zero goal, torque off and a qualified stopped
+window. Preserve the operational failure: host exit 1, camera exit 0, session exit
+2; the supervisor conservatively retained `cleanup_unknown` because of the host
+failure. Complete logs were collected and all session-owned processes stopped.
+No second attempt was launched. A later encoder change during cleanup does not
+retroactively qualify relief. The cause of the initial lack of progress remains
+unresolved; no motor bound or policy was changed merely to get past this refusal.
+Detailed evidence stays private. Do not repeat unchanged or reopen passed arm/base tests.
+
+The subsequently owner-approved policy is implemented in source commit `5e8d5c16`:
+ordinary AM1 startup now allows **1.0 s**, once, for genuine net upward encoder progress. This is a
+deliberate timing-policy adjustment, not a demonstrated servo response specification
+or a claim that the failed run would have succeeded. It neither credits cleanup
+motion nor reclassifies that run. The first valid progress ends qualification;
+the deadline cannot reset or reopen. All other relief and fault guards remain.
+There is no automatic further increase if the next attempt fails.
+
+Fresh focused verification: **167 passed** across the operational and standalone
+relief files. Meaningful RED first reproduced the old 250 ms refusal. Synthetic
+onsets at 306, 612 and 918 ms now qualify; no onset by 1.0 s and late feedback still
+stop. Extended-window direction/fault/cancellation cases retain zero/torque-off
+cleanup and original error identity. Compilation and diff checks passed. These
+are simulated policy results, not retrospective proof of the observed lift motion.
+
+The reviewed two-file motor change was cherry-picked with source provenance onto
+the preserved motor lineage as `b0bce720572e83b7046d1234a997a3064ce118b9`. Its
+source/test blobs match the reviewed correction. Only the backed-up private motor
+pin changed; client/session and Pi helper remain at `60fcd9bc`, camera at
+`047c4fcf`. Hardware-free deployed import-root, compilation and help checks passed.
+
+### Subsequent attended ArmSmoke: startup passed, live profile incomplete
+
+One subsequent attended attempt used those exact components and the existing
+launcher, answering each actual Enter prompt individually. Initial upward progress
+qualified after the former 250 ms allowance but within the approved one second.
+Home, full bounded relief, readiness and nominal synchronization completed. The
+real scripted arm profile then started; it did **not** reach normal completion.
+
+A recoverable observation-age pause preceded a terminal host refusal in
+`get_observation` / `OperationalLift.contribute_observation`: the oldest retained
+temperature-slot reading crossed the unchanged 0.5-second freshness boundary
+between sampling and consumption. This was not a confirmed temperature rise or
+another initial-relief failure. Saved-sample replay through the actual window
+class reproduces that boundary; it does not establish the cause of the earlier
+observation gap or authorize relaxing freshness. No further timing allowance,
+camera/network change, or motor tuning was made.
+
+Feedback showed movement for several exercised arm channels, incomplete return
+tracking for some, and no measured displacement for one small elbow excursion.
+The last two channels were not reached. Generated targets and profile admission
+are not proof of complete physical tracking. Detailed joint/timing evidence remains
+private; the earlier qualified physical-leader milestones are unchanged.
+
+The supervisor stopped the client after the host fault, not operator Q. Actual
+exits were host 1, client 130, camera 0 and unified session 2. The lift separately
+verified zero goal, torque off and a stopped window after settling. Preserve the
+supervisor's conservative `cleanup_unknown` classification rather than relabeling
+the run as success. Exact logs were collected; subsequent read-only inspection
+found no session-owned runtime and clean deployed checkouts. At that closeout no
+further powered attempt had followed. The subsequently approved correction and
+one attended follow-up are recorded separately below; the original failed exits
+and tracking limitations remain unchanged. PRs #8 and #9 remain draft and unmerged.
+
+### Bounded consumer refresh: clean lifecycle, incomplete ArmSmoke
+
+Source `02f93ff7f1e63603fab9502980ac9f8d657b255b` corrects the demonstrated
+read-to-consumer scheduling boundary. If raw feedback is still fresh but the
+retained history has aged out, each action/observation consumer may request at
+most one genuine grouped read through the existing owner. The unchanged full
+five-slot, 0.5-second check must then pass. A raw outage, nonqualifying refresh,
+motor/transport fault or cancellation still stops; no refusal is cleared.
+The bounded pending batch preserves all original sample timestamps and evidence.
+No temperature vote, motion limit, initial-relief policy or client behavior changed.
+
+Fresh focused verification: **190 passed** across the operational-lift,
+consumer-refresh and Local-recovery test files. Five actual fake-host cases first
+failed at the intended consumption boundary. New tests cover active/hold/resume,
+both consumers, retained high votes, missing/delayed data, bounded read counts,
+zero/cleanup and cancellation. Compilation, import-root/help checks, complete
+diff/artifact review and independent code review passed. Earlier broad results
+were not rerun or relabeled as fresh verification.
+
+The motor-only cherry-pick is `1514c50a4ba9b7762fc577a08fddf02498733386`;
+its three changed blobs match the reviewed source. Only the backed-up private
+motor pin changed. Client/session/helper remain `60fcd9bc`; camera remains
+`047c4fcf`. These intentionally separate deployments and environments are retained.
+
+One attended run passed camera readiness, home, bounded relief, synchronization
+and live admission without the previous lift freshness fault. Lift monitoring
+continued through the session without a rejected sample or confirmed heating.
+However, repeated observation-age recoveries and slow qualified observation
+progress left ArmSmoke **incomplete at the unchanged duration limit**. Clean
+exit is not profile completion or a complete joint-tracking pass. Some exercised
+channels still had incomplete returns; unvisited channels remain untested.
+
+The client kept its bounded action cadence while the scripted trajectory froze
+on unusable feedback and advanced without catch-up. The request/response or
+consumer delay is unresolved; this result does not establish a Wi-Fi cause.
+One recovery required the existing Enter gate, so its whole paused interval
+must not be attributed to transport. Client, host, camera and session exited 0;
+zero goal, torque off and a stopped cleanup window were verified, all exact logs
+were collected, and no owned runtime remained. No second attempt followed.
+
+At that closeout, the next step was a hardware-free qualified-observation timing
+reproduction, not an unchanged physical retry. The subsequently approved correction
+and bounded batch are recorded at the top; they do not erase this incomplete run.
+PRs #8/#9 stay draft/unmerged. Detailed joint/timing evidence and raw logs stay private.
 
 ## Compact design
 
@@ -266,7 +517,7 @@ not retained; no source penalty or server-side setting change is established.
 The owner-approved AM1 operational lift guard permits at most one encoder count
 (about 0.0205 mm) below the best upward position reached during relief. It logs
 that raw variation; the reference does not follow successive downward samples.
-Normal AM1 startup now has a fixed **250 ms initial direction-qualification
+Normal AM1 startup now has a fixed **1.0 s initial direction-qualification
 window**, anchored once after the upward command completes. Fresh net upward
 encoder progress must qualify before it expires; returning from a one-count
 backstep to the initial position is not sufficient. During this initial window
@@ -289,9 +540,11 @@ That attempt completed homing but refused before operational readiness,
 synchronization or live control. Cleanup verified zero goal, torque off and a
 stopped window; the genuine operational refusal remains a failed session.
 It did not reach the ordinary loop and therefore neither validates nor
-disproves the preceding logging-order correction. The new initial qualification
-has not yet been physically exercised. Focused fake-clock/grouped-feedback
-validation of the operational and standalone relief files passed **156 tests**;
+disproves the preceding logging-order correction. The initial qualification was
+later exercised by the scripted attempt recorded above, which refused before
+readiness; that is not a successful relief or arm-profile result. Focused
+fake-clock/grouped-feedback validation of the operational and standalone relief
+files passed **156 tests**;
 historical motor/camera acceptance remains separate.
 
 After a complete fresh stopped window, velocity-only uncertainty may requalify
