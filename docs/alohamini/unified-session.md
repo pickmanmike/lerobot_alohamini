@@ -76,10 +76,16 @@ verified restoration to P16, but demonstrated no improvement in positive elbow
 excursion. A smaller endpoint error reflected a different target, not movement;
 pose/timing differences limit current comparisons. Keep P16 and omit
 `-RightElbowP20Trial`. Owner inspection found no obvious external interference.
-The next visual P16 comparison remains pending; successful lifecycle/profile
-completion is not complete tracking qualification.
+The subsequent attended P16 run with the idle allowance completed the unchanged
+88/88 profile, with no recovery or live watchdog event and verified clean exits.
+Elbow sampled goals matched calibrated commanded targets, but measured excursion
+remained short and return incomplete. Its starting pose differed from the prior
+comparison. The owner saw subtle movement but could not confidently align it to
+the announced elbow phase; no unexpected behavior was reported. This is not a
+complete tracking or visual-versus-encoder pass. A clearly timed close-up view,
+not more gain or tolerance changes, is the remaining discriminator.
 
-The subsequent pre-profile refusal was the operational idle position-span check,
+The earlier pre-profile refusal was the operational idle position-span check,
 not failed homing, overheating or new elbow evidence. Home/relief completed;
 subsequent zero/off/stopped cleanup qualified. That historical refusal remains a
 failed attempt. The approved correction applies **only to ordinary AM1 post-home
