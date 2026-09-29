@@ -26,6 +26,7 @@ import cv2
 import zmq
 
 from .alohamini import AlohaMini
+from .arm_tracking import AM1ArmTrackingCapture
 from .config_alohamini import AlohaMiniConfig, AlohaMiniHostConfig
 
 AM1_LOCAL_CONTROL_KEY = "_am1_local_control"
@@ -487,6 +488,9 @@ def connect_robot(robot: AlohaMini, *, skip_lift_home: bool) -> None:
 def main():
     parser = make_parser()
     args = parser.parse_args()
+    arm_tracking_enabled = os.environ.get("AM1_ARM_TRACKING_READBACK") == "1"
+    if arm_tracking_enabled and (args.robot_model != "alohamini1" or args.no_follower):
+        parser.error("AM1_ARM_TRACKING_READBACK requires AM1 with follower arms.")
     if args.lift_relief and args.lift_readback:
         parser.error("--lift_relief and --lift_readback are mutually exclusive.")
     if args.lift_relief and (
@@ -508,6 +512,7 @@ def main():
     if args.no_follower:
         logging.info("no_follower mode: follower arms will not connect, only base and lift operate.")
     robot = AlohaMini(robot_config)
+    robot._arm_tracking_readback_enabled = arm_tracking_enabled
 
     if args.lift_relief:
         from .lift_relief import run_lift_relief
@@ -540,7 +545,7 @@ def main():
 
     command_state = HostCommandState(
         watchdog_timeout_ms=host.watchdog_timeout_ms,
-        diagnostics_enabled=args.profile_cadence,
+        diagnostics_enabled=args.profile_cadence or arm_tracking_enabled,
     )
     local_control = (
         AM1LocalControl()
@@ -550,6 +555,7 @@ def main():
     # Only the unified supervisor opts in. Direct Arms/Local commands remain
     # unmarked and can stay "ready" during live use; state alone is insufficient.
     sync_shoulder_readback = os.environ.get("AM1_SYNC_SHOULDER_READBACK") == "1"
+    arm_tracking = AM1ArmTrackingCapture() if arm_tracking_enabled else None
     logging.info("Waiting for commands...")
 
     try:
@@ -644,6 +650,15 @@ def main():
                 except zmq.Again:
                     logging.info("Dropping observation response, client is not ready")
             response_send_done_t = time.perf_counter()
+
+            # Default-off tracking evidence follows normal consumers/reply delivery.
+            # A read failure reaches ordinary zero/disconnect cleanup, not the
+            # malformed-command handler. No reads during startup, pause or idle.
+            if arm_tracking is not None and command_received and local_control.state == "active":
+                arm_tracking.after_command(
+                    robot, command_sequence=command_state.snapshot()["command_sequence"],
+                    observation_id=local_control.observation_id, epoch=local_control.epoch,
+                )
 
             # Routine raw logging must not consume the five-slot freshness
             # margin between this tick's grouped read and action/observation use.
