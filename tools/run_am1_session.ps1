@@ -8,6 +8,8 @@ param(
     [string]$LeaderSource = 'Physical',
     [Parameter(ParameterSetName = 'Start')]
     [string]$MotionProfile,
+    [Parameter(ParameterSetName = 'Start')]
+    [switch]$ArmTrackingReadback,
     [Parameter(Mandatory, ParameterSetName = 'Stop')]
     [switch]$Stop,
     [Parameter(Mandatory, ParameterSetName = 'Collect')]
@@ -47,6 +49,8 @@ function Invoke-Am1SessionEntrypoint {
         [string]$LeaderSource = 'Physical',
         [Parameter(ParameterSetName = 'Start')]
         [string]$MotionProfile,
+        [Parameter(ParameterSetName = 'Start')]
+        [switch]$ArmTrackingReadback,
         [Parameter(Mandatory, ParameterSetName = 'Stop')]
         [switch]$Stop,
         [Parameter(Mandatory, ParameterSetName = 'Collect')]
@@ -62,6 +66,9 @@ function Invoke-Am1SessionEntrypoint {
     $validatedDuration = $null
     if ($PSCmdlet.ParameterSetName -eq 'Start') {
         $validatedDuration = ConvertTo-Am1SessionDuration -Value $DurationSeconds
+        if ($ArmTrackingReadback -and $LeaderSource -ne 'Scripted') {
+            throw '-ArmTrackingReadback is available only for Scripted leader input.'
+        }
         if ($LeaderSource -eq 'Scripted' -and $MotionProfile -cne 'ArmSmoke') {
             throw 'Scripted leader input requires -MotionProfile ArmSmoke.'
         }
@@ -84,6 +91,7 @@ function Invoke-Am1SessionEntrypoint {
         if ($LeaderSource -eq 'Scripted') {
             $arguments += @('--leader-source', 'scripted', '--motion-profile', $MotionProfile)
         }
+        if ($ArmTrackingReadback) { $arguments += '--arm-tracking-readback' }
     }
     elseif ($PSCmdlet.ParameterSetName -eq 'Stop') {
         $arguments += 'stop'
@@ -123,7 +131,7 @@ function Invoke-Am1SessionEntrypoint {
 if ($MyInvocation.InvocationName -ne '.') {
     if ($PSCmdlet.ParameterSetName -eq 'Start') {
         $exitCode = Invoke-Am1SessionEntrypoint -DurationSeconds $DurationSeconds -ConfigPath $ConfigPath `
-            -LeaderSource $LeaderSource -MotionProfile $MotionProfile
+            -LeaderSource $LeaderSource -MotionProfile $MotionProfile -ArmTrackingReadback:$ArmTrackingReadback
     }
     elseif ($PSCmdlet.ParameterSetName -eq 'Stop') {
         $exitCode = Invoke-Am1SessionEntrypoint -Stop -ConfigPath $ConfigPath
