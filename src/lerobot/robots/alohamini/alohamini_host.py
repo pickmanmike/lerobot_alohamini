@@ -489,6 +489,9 @@ def main():
     parser = make_parser()
     args = parser.parse_args()
     arm_tracking_enabled = os.environ.get("AM1_ARM_TRACKING_READBACK") == "1"
+    arm_tracking_start = os.environ.get("AM1_ARM_TRACKING_START", "immediate") if arm_tracking_enabled else "immediate"
+    if arm_tracking_start not in ("immediate", "right-elbow-request"):
+        parser.error("AM1_ARM_TRACKING_START must be immediate or right-elbow-request.")
     if arm_tracking_enabled and (args.robot_model != "alohamini1" or args.no_follower):
         parser.error("AM1_ARM_TRACKING_READBACK requires AM1 with follower arms.")
     if args.lift_relief and args.lift_readback:
@@ -513,6 +516,7 @@ def main():
         logging.info("no_follower mode: follower arms will not connect, only base and lift operate.")
     robot = AlohaMini(robot_config)
     robot._arm_tracking_readback_enabled = arm_tracking_enabled
+    robot._arm_tracking_config_snapshot_enabled = arm_tracking_enabled and arm_tracking_start == "right-elbow-request"
 
     if args.lift_relief:
         from .lift_relief import run_lift_relief
@@ -555,7 +559,8 @@ def main():
     # Only the unified supervisor opts in. Direct Arms/Local commands remain
     # unmarked and can stay "ready" during live use; state alone is insufficient.
     sync_shoulder_readback = os.environ.get("AM1_SYNC_SHOULDER_READBACK") == "1"
-    arm_tracking = AM1ArmTrackingCapture() if arm_tracking_enabled else None
+    arm_tracking = AM1ArmTrackingCapture(start=arm_tracking_start) if arm_tracking_enabled else None
+    tracking_stop_reason = "session_end"
     logging.info("Waiting for commands...")
 
     try:
@@ -758,12 +763,14 @@ def main():
         print("Cycle time reached.")
 
     except KeyboardInterrupt:
+        tracking_stop_reason = "cancelled"
         interrupted_motor_io = True
         try:
             print("Keyboard interrupt received. Exiting...")
         except BaseException as error:
             primary_error = error
     except BaseException as error:
+        tracking_stop_reason = "error"
         interrupted_motor_io = True
         primary_error = error
     finally:
@@ -795,6 +802,12 @@ def main():
                 lift_operation.emit_pending_sample()
             except BaseException as error:
                 cleanup_errors.append(("pending lift sample", error))
+
+        if arm_tracking is not None:
+            try:
+                arm_tracking.finish(tracking_stop_reason)
+            except BaseException as error:
+                cleanup_errors.append(("arm tracking completion", error))
 
         if primary_error is not None:
             for operation, error in cleanup_errors:

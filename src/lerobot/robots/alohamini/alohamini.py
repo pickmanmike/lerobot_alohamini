@@ -300,6 +300,12 @@ class AlohaMini(Robot):
                 cam.connect()
 
             if activate:
+                if self.config.robot_model == "alohamini1" and getattr(
+                    self, "_arm_tracking_config_snapshot_enabled", False
+                ):
+                    from .arm_tracking import read_tracking_configuration
+
+                    read_tracking_configuration(self)
                 should_home_lift = home_lift and self.is_calibrated
                 if home_lift and not should_home_lift:
                     logger.info("Skipping lift homing because AlohaMini is not calibrated.")

@@ -69,13 +69,23 @@ Prepare only opt-in, same-owner target/goal/position/current capture before the
 next bounded evidence run. Do not change gains, current limits, calibration,
 profile amplitude/dwell or tracking tolerance.
 
-### Prepared tracking capture — separate, not deployed
+### Tracking capture — separate follow-up, September 29, 2026
 
 The `codex/am1-tracking-capture` follow-up adds `-ArmTrackingReadback` to the
 existing unified launcher, only with `-LeaderSource Scripted -MotionProfile
-ArmSmoke`. It is **not** part of the integrated runtime above and has not been
-physically exercised or deployed. A later reviewed deployment must update only
-the necessary client/helper and motor pins before using this new option.
+ArmSmoke`. It is **not** part of the integrated runtime above. Its first attended
+capture completed the unchanged 88/88 profile with verified cleanup, five
+recoveries and two live watchdog holds. All 478 sampled goals matched the
+calibrated final-target conversion. Shoulder endpoint/return goals were sampled,
+but measured tracking remained short; elbow endpoint/return goals were outside
+the capture window. A substantial recovery-prompt wait was execution/input
+waiting, not established network latency. These results do not certify tracking
+or every write. Detailed evidence remains private; PRs #8/#9 stay closed.
+
+That capture used separate helper/client `ba43bbe4` and motor `59bb6072` slices;
+camera `047c4fcf` was unchanged. The deferred follow-up below requires reviewed
+component-only deployment and consistent backed-up private pins, not wholesale
+replacement of working motor/camera lineages.
 
 It captures only right elbow and left shoulder pan through the existing motor
 owner, after an accepted active command and its ordinary observation/reply.
@@ -87,8 +97,19 @@ retains the genuine fault and reaches existing host cleanup.
 
 The opt-in capture is capped at four snapshots per second, 480 snapshots and
 120 wall seconds from the first active capture, with no catch-up or reset on
-recovery. These are periodic, sequential snapshots, **not phase-triggered or
-atomic measurements**, servo write acknowledgements, durable-goal guarantees or
+recovery. `-ArmTrackingStart Immediate` remains the default for opted-in capture.
+The explicit `RightElbowRequest` selection freezes the first accepted ACTIVE
+right-elbow requested target, then starts once when an accepted ACTIVE request
+differs. Numeric int/float equivalents and signed zero compare equal; even a
+representable normalized change triggers without raw-count rounding. Neither
+observed motion nor a changed limited/final target is required. Baseline, trigger,
+no-trigger completion and cancellation are recorded. Recovery never replaces the
+baseline or resets the deadline. This selection also records one read-only
+two-joint configuration snapshot after normal configuration and before activation,
+using the existing buses; it does not write settings or touch Phase.
+
+After triggering, these remain periodic, sequential snapshots, **not endpoint-
+triggered or atomic measurements**, servo write acknowledgements, durable-goal guarantees or
 proof of receipt by the client. Match endpoint and return using the actual
 captured targets and existing script events; if a phase is missed, report that
 gap rather than inventing a value. A long recovery can exhaust capture time
@@ -99,7 +120,7 @@ After that separate deployment, the single bounded next evidence run uses the
 ordinary launcher with this additional option:
 
 ```powershell
-.\tools\run_am1_session.ps1 -LeaderSource Scripted -MotionProfile ArmSmoke -DurationSeconds 180 -ArmTrackingReadback
+.\tools\run_am1_session.ps1 -LeaderSource Scripted -MotionProfile ArmSmoke -DurationSeconds 180 -ArmTrackingReadback -ArmTrackingStart RightElbowRequest
 ```
 
 Codex handles software execution and exact-log collection during attended use;
@@ -110,12 +131,26 @@ campaign. A genuine fault stops the attempt; assess the exact capture before
 another movement. The aim is to distinguish missing/limited goal delivery from
 incomplete response to a confirmed sampled goal, not to certify all tracking.
 
-Offline RED demonstrated missing target-boundary evidence, absent opted-in
+The original capture's offline RED demonstrated missing target-boundary evidence, absent opted-in
 readback/error propagation, and missing launcher selection. Fixture-only
 setup mistakes were corrected before implementing. The focused final regression
 passed **255 tests, with 2 POSIX-only skips on Windows**, including actual fake
 action/observation/host paths, read-error cleanup, bounded sampling, disabled
-behavior, AM2 isolation and launcher propagation. No powered result is claimed.
+behavior, AM2 isolation and launcher propagation. This is historical verification,
+not a newly rerun count or a physical tracking pass.
+
+The deferred-start/settings follow-up observed meaningful RED on the real fake
+host trigger path and absent setup readback, then **235 passed, 1 POSIX-only skip**
+across tracking, tracking-launcher, scripted-launcher, unified-session and wrist-
+cadence checks. They cover requested-versus-limited/observed triggering, frozen
+baseline across epochs, the 480-read cap, cancellation/errors and cleanup,
+end-to-end selection, pre-activation read-only configuration and model isolation.
+Compile, parser, help/import and diff/artifact checks are software evidence only.
+Independent review identified delayed trigger logging using an old read timestamp;
+two RED cases reproduced it. The correction reacquires time after reporting while
+retaining the original deadline. The final narrow tracking/launcher rerun passed
+**37 tests**, including the new slow-sink and supported-register checks. No further
+material review finding remained; this does not claim new physical evidence.
 
 ### Completed scripted follow-up — historical implementation evidence
 
