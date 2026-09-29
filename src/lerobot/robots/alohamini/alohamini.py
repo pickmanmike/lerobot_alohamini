@@ -285,10 +285,20 @@ class AlohaMini(Robot):
             if self.right_bus:
                 self.right_bus.connect()
 
+            if self.config.robot_model == "alohamini1" and getattr(self, "_right_elbow_p20_trial_enabled", False):
+                from .arm_gain_trial import RightElbowP20Trial
+
+                self._right_elbow_gain_trial = RightElbowP20Trial(self)
+                self._right_elbow_gain_trial.preflight()
+                if not self.is_calibrated:
+                    raise RuntimeError("P20 trial requires existing matching calibration; no calibration is allowed.")
+
             # Configuration is deliberately separate from activation. It leaves every
             # motor torque-disabled while modes, gains, and acceleration are changed.
             self.configure()
             if calibrate and not self.is_calibrated:
+                if getattr(self, "_right_elbow_gain_trial", None) is not None:
+                    raise RuntimeError("P20 trial calibration changed after configuration; refusing without calibration.")
                 logger.info(
                     "Mismatch between calibration values in the motor and the calibration file "
                     "or no calibration file found"
@@ -306,6 +316,9 @@ class AlohaMini(Robot):
                     from .arm_tracking import read_tracking_configuration
 
                     read_tracking_configuration(self)
+                trial = getattr(self, "_right_elbow_gain_trial", None)
+                if trial is not None:
+                    trial.apply()
                 should_home_lift = home_lift and self.is_calibrated
                 if home_lift and not should_home_lift:
                     logger.info("Skipping lift homing because AlohaMini is not calibrated.")
@@ -318,8 +331,17 @@ class AlohaMini(Robot):
                 logger.info("Motor activation is disabled; lift homing was not run.")
 
             logger.info("%s connected.", self)
-        except BaseException:
-            self._safe_shutdown(close_buses=True, recover_interrupted_bus_io=True)
+        except BaseException as error:
+            try:
+                cleanup_errors = self._safe_shutdown(close_buses=True, recover_interrupted_bus_io=True)
+            except BaseException as cleanup_error:
+                if getattr(self, "_right_elbow_gain_trial", None) is None:
+                    raise
+                error.add_note(f"trial cleanup also failed: {type(cleanup_error).__name__}: {cleanup_error}")
+                raise error
+            if getattr(self, "_right_elbow_gain_trial", None) is not None:
+                for detail in cleanup_errors:
+                    error.add_note(f"trial cleanup also failed: {detail}")
             raise
 
     @property
@@ -557,7 +579,13 @@ class AlohaMini(Robot):
             if self.right_bus:
                 set_torque_enabled(self.right_bus, self.right_arm_motors, enabled=True)
         except BaseException as error:
-            cleanup_errors = self._safe_shutdown(close_buses=True, recover_interrupted_bus_io=True)
+            try:
+                cleanup_errors = self._safe_shutdown(close_buses=True, recover_interrupted_bus_io=True)
+            except BaseException as cleanup_error:
+                if getattr(self, "_right_elbow_gain_trial", None) is None:
+                    raise
+                error.add_note(f"trial cleanup also failed: {type(cleanup_error).__name__}: {cleanup_error}")
+                raise error
             if isinstance(error, (KeyboardInterrupt, SystemExit)):
                 raise
             detail = f" Cleanup issues: {'; '.join(cleanup_errors)}" if cleanup_errors else ""
@@ -579,6 +607,15 @@ class AlohaMini(Robot):
         its single-transaction busy flag when ``KeyboardInterrupt`` escapes a read.
         """
         errors: list[str] = []
+        trial = getattr(self, "_right_elbow_gain_trial", None)
+        interruptions: list[BaseException] = []
+
+        def record_error(operation: str, error: BaseException) -> None:
+            if not isinstance(error, Exception):
+                if trial is None:
+                    raise error  # Ordinary shutdown behavior is unchanged.
+                interruptions.append(error)
+            errors.append(f"{operation}: {type(error).__name__}: {error}")
 
         if recover_interrupted_bus_io and self.config.robot_model == "alohamini1":
             for bus_name, bus in (("left", self.left_bus), ("right", self.right_bus)):
@@ -594,15 +631,15 @@ class AlohaMini(Robot):
                         "Recovered abandoned %s Feetech transaction before AM1 shutdown.",
                         bus_name,
                     )
-                except Exception as error:
-                    errors.append(f"recover {bus_name} bus transaction: {error}")
+                except BaseException as error:
+                    record_error(f"recover {bus_name} bus transaction", error)
 
         if self.left_bus.is_connected:
             for name in (*self.base_motors, self.lift.cfg.name):
                 try:
                     write_register(self.left_bus, "Goal_Velocity", name, 0)
-                except Exception as error:
-                    errors.append(f"zero {name}: {error}")
+                except BaseException as error:
+                    record_error(f"zero {name}", error)
 
         for bus_name, bus in (("left", self.left_bus), ("right", self.right_bus)):
             if bus is None or not bus.is_connected:
@@ -610,8 +647,8 @@ class AlohaMini(Robot):
             for name in bus.motors:
                 try:
                     set_torque_enabled(bus, (name,), enabled=False)
-                except Exception as error:
-                    errors.append(f"disable {bus_name}/{name}: {error}")
+                except BaseException as error:
+                    record_error(f"disable {bus_name}/{name}", error)
 
         operation = getattr(self, "_lift_operation", None)
         if motor_shutdown_check is None and operation is not None and self.left_bus.is_connected:
@@ -619,16 +656,23 @@ class AlohaMini(Robot):
         if motor_shutdown_check is not None:
             try:
                 motor_shutdown_check()
-            except Exception as error:
-                errors.append(f"verify final motor shutdown state: {error}")
+            except BaseException as error:
+                record_error("verify final motor shutdown state", error)
+
+        if trial is not None:
+            try:
+                trial.restore(recover_interrupted_bus_io=bool(interruptions))
+            except BaseException as error:
+                # Restoration failure must not bypass remaining close operations.
+                record_error("restore right elbow P16", error)
 
         for name, camera in self.cameras.items():
             if not camera.is_connected:
                 continue
             try:
                 camera.disconnect()
-            except Exception as error:
-                errors.append(f"close camera {name}: {error}")
+            except BaseException as error:
+                record_error(f"close camera {name}", error)
 
         if close_buses:
             for bus_name, bus in (("right", self.right_bus), ("left", self.left_bus)):
@@ -636,12 +680,16 @@ class AlohaMini(Robot):
                     continue
                 try:
                     bus.disconnect(disable_torque=False)
-                except Exception as error:
-                    errors.append(f"close {bus_name} bus: {error}")
+                except BaseException as error:
+                    record_error(f"close {bus_name} bus", error)
 
         self.lift.mark_unhomed()
         for error in errors:
             logger.error("AlohaMini shutdown issue: %s", error)
+        if interruptions:
+            for detail in errors:
+                interruptions[0].add_note(detail)
+            raise interruptions[0]
         return errors
 
 

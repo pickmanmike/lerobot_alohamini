@@ -490,6 +490,12 @@ def main():
     args = parser.parse_args()
     arm_tracking_enabled = os.environ.get("AM1_ARM_TRACKING_READBACK") == "1"
     arm_tracking_start = os.environ.get("AM1_ARM_TRACKING_START", "immediate") if arm_tracking_enabled else "immediate"
+    right_elbow_p20_trial = os.environ.get("AM1_RIGHT_ELBOW_P20_TRIAL") == "1"
+    if right_elbow_p20_trial and (
+        not arm_tracking_enabled or arm_tracking_start != "right-elbow-request"
+        or args.robot_model != "alohamini1" or args.no_follower or not args.no_cameras
+    ):
+        parser.error("P20 trial requires AM1 follower arms, no cameras, and deferred elbow tracking opt-in.")
     if arm_tracking_start not in ("immediate", "right-elbow-request"):
         parser.error("AM1_ARM_TRACKING_START must be immediate or right-elbow-request.")
     if arm_tracking_enabled and (args.robot_model != "alohamini1" or args.no_follower):
@@ -516,6 +522,7 @@ def main():
         logging.info("no_follower mode: follower arms will not connect, only base and lift operate.")
     robot = AlohaMini(robot_config)
     robot._arm_tracking_readback_enabled = arm_tracking_enabled
+    robot._right_elbow_p20_trial_enabled = right_elbow_p20_trial
     robot._arm_tracking_config_snapshot_enabled = arm_tracking_enabled and arm_tracking_start == "right-elbow-request"
 
     if args.lift_relief:
