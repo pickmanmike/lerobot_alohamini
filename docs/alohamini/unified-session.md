@@ -71,6 +71,29 @@ profile amplitude/dwell or tracking tolerance.
 
 ### Tracking capture — separate follow-up, September 29, 2026
 
+Latest bounded follow-up: the P20 comparison completed the unchanged profile and
+verified restoration to P16, but demonstrated no improvement in positive elbow
+excursion. A smaller endpoint error reflected a different target, not movement;
+pose/timing differences limit current comparisons. Keep P16 and omit
+`-RightElbowP20Trial`. Owner inspection found no obvious external interference.
+The next visual P16 comparison remains pending; successful lifecycle/profile
+completion is not complete tracking qualification.
+
+The subsequent pre-profile refusal was the operational idle position-span check,
+not failed homing, overheating or new elbow evidence. Home/relief completed;
+subsequent zero/off/stopped cleanup qualified. That historical refusal remains a
+failed attempt. The approved correction applies **only to ordinary AM1 post-home
+idle monitoring**: at most **0.10 mm** local position span, floored to whole counts
+using the configured lift conversion. At 84 mm/revolution, 4096 counts and ratio
+1, four counts (0.08203125 mm) are allowed, five (0.1025390625 mm) are not. This is
+an operating allowance, not a manufacturer accuracy or safety specification.
+The velocity-uncertainty span uses the same allowance. The independent **0.5 mm
+fixed idle-reference displacement guard** does not re-anchor on rolling windows,
+zero commands or recovery; actual commanded motion retains the existing new-idle
+episode lifecycle. Raw readings, velocity/Moving rules, fault latches and all
+other guards are unchanged. Pre-motion, homing, relief and cleanup retain their
+strict existing criteria; the standalone diagnostic constant is unchanged.
+
 The `codex/am1-tracking-capture` follow-up adds `-ArmTrackingReadback` to the
 existing unified launcher, only with `-LeaderSource Scripted -MotionProfile
 ArmSmoke`. It is **not** part of the integrated runtime above. Its first attended
@@ -833,6 +856,10 @@ session evidence remains private; this is only a sanitized current-state summary
 ## Evidence and recovery
 
 ### Explicit right-elbow gain comparison (not ordinary use)
+
+**Closed comparison; retained as historical procedure, not the next command.**
+P20 did not demonstrate benefit and P16 restoration was verified. Do not repeat
+this comparison or infer authorization for further gain changes.
 
 The owner approved one reversible AM1 right-elbow-only P16→20 comparison after
 sampled servo goals matched delivered targets but measured elbow response remained
