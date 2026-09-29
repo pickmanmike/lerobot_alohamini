@@ -832,6 +832,37 @@ session evidence remains private; this is only a sanitized current-state summary
 
 ## Evidence and recovery
 
+### Explicit right-elbow gain comparison (not ordinary use)
+
+The owner approved one reversible AM1 right-elbow-only P16→20 comparison after
+sampled servo goals matched delivered targets but measured elbow response remained
+short. This is a hypothesis test, not a diagnosed cure or a permanent tuning policy.
+
+```powershell
+.\tools\run_am1_session.ps1 -LeaderSource Scripted -MotionProfile ArmSmoke -DurationSeconds 180 -ArmTrackingReadback -ArmTrackingStart RightElbowRequest -RightElbowP20Trial
+```
+
+Physical leaders remain disconnected. Keep the same three-unit profile, dwell,
+comparable starting posture/load, zero live body commands and all existing limits.
+Only the existing owner writes P20, while torque is verified off, after verifying
+original P16 before ordinary configuration can overwrite it. I0/D32 and all other
+settings remain unchanged. The command refuses other modes, duration or capture
+selection; ordinary starts never inherit the option from an ambient environment.
+
+`[AM1 ELBOW GAIN]` records original, applied-pre-activation and restored values.
+Normal/error cleanup first requests zero and torque-off, then verifies off/unlocked,
+restores P16 and reads it back before closing the existing bus. A failed/uncertain
+P20 write still requires restoration; a failed restoration is not a successful
+exit and must be resolved before reuse. EEPROM does not automatically revert at
+process exit or power loss; abrupt termination can prevent restoration. No
+automatic retry, rearm or further gain increase is permitted.
+
+Compare actual elbow movement against encoder excursion, sampled goal/position
+endpoint and return error, current, overshoot, chatter and stationary holding.
+Stop for unexpected movement, contact, oscillation or a genuine fault. Do not
+tune the shoulder simultaneously. A null result does not authorize a higher P.
+The prior command/lifecycle pass remains distinct from complete tracking.
+
 Each run creates:
 
 ```text

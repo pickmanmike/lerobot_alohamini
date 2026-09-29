@@ -130,3 +130,75 @@ def test_cli_deferred_selection_reaches_lifecycle(monkeypatch):
                         "--leader-source", "scripted", "--motion-profile", "ArmSmoke",
                         "--arm-tracking-readback", "--arm-tracking-start", "right-elbow-request"]) == 0
     assert calls[0]["arm_tracking_start"] == "right-elbow-request"
+
+
+@requires_powershell
+def test_explicit_elbow_trial_flag_reaches_python_entrypoint(tmp_path):
+    shutil.copy2(REPO_ROOT / "tools/run_am1_session.ps1", tmp_path / "run_am1_session.ps1")
+    (tmp_path / "am1_session.py").write_text("import json,sys; print(json.dumps(sys.argv[1:]))\n")
+    config = tmp_path / "session.json"
+    config.write_text(json.dumps({"windows_python": sys.executable}))
+    result = subprocess.run([
+        POWERSHELL, "-NoLogo", "-NoProfile", "-File", str(tmp_path / "run_am1_session.ps1"),
+        "-DurationSeconds", "180", "-ConfigPath", str(config), "-LeaderSource", "Scripted",
+        "-MotionProfile", "ArmSmoke", "-ArmTrackingReadback", "-ArmTrackingStart", "RightElbowRequest",
+        "-RightElbowP20Trial",
+    ], text=True, capture_output=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert "--right-elbow-p20-trial" in json.loads(result.stdout)
+
+
+def test_trial_cli_requires_matching_capture_before_config_or_lifecycle(monkeypatch):
+    module = load_tool("am1_session")
+    monkeypatch.setattr(module.SessionConfig, "load", lambda _: pytest.fail("config opened before refusal"))
+    assert module.main(["--config", "missing.json", "start", "--duration-seconds", "180",
+                        "--leader-source", "scripted", "--motion-profile", "ArmSmoke",
+                        "--right-elbow-p20-trial"]) == 2
+
+
+def test_trial_cli_reaches_lifecycle(monkeypatch):
+    module = load_tool("am1_session")
+    monkeypatch.setattr(module.SessionConfig, "load", lambda _: object())
+    calls = []
+    monkeypatch.setattr(module, "run_start", lambda *args, **kwargs: calls.append(kwargs) or 0)
+    assert module.main(["--config", "missing.json", "start", "--duration-seconds", "180",
+                        "--leader-source", "scripted", "--motion-profile", "ArmSmoke",
+                        "--arm-tracking-readback", "--arm-tracking-start", "right-elbow-request",
+                        "--right-elbow-p20-trial"]) == 0
+    assert calls[0]["right_elbow_p20_trial"] is True
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_trial_remote_spawn_does_not_inherit_ambient_opt_in(monkeypatch, tmp_path, enabled):
+    module = load_tool("am1_session")
+    config = module.SessionConfig.load(REPO_ROOT / "config/am1.session.example.json")
+    remote = module.SSHRemote(config, "20260928T000000-1234abcd", tmp_path,
+                              arm_tracking_readback=True, arm_tracking_start="right-elbow-request",
+                              right_elbow_p20_trial=enabled)
+    command = remote._command()
+    assert ("--right-elbow-p20-trial" in command) is enabled
+    pi = load_tool("am1_session_remote")
+    args = pi.build_parser().parse_args(command[command.index("supervise"):])
+    args.state_directory = str(tmp_path / "state")
+    supervisor = pi.RemoteSupervisor(args, pi.BestEffortReporter(lambda payload: None))
+    supervisor.children["camera"] = object()
+    launched = []
+    def spawn(name, argv, env):
+        launched.append(env)
+        return SimpleNamespace(control_path=tmp_path / "control", log_path=None)
+    monkeypatch.setattr(supervisor, "_spawn", spawn)
+    monkeypatch.setattr(supervisor, "_wait_for", lambda *a, **kw: str(tmp_path / "host.log"))
+    monkeypatch.setattr(supervisor, "save", lambda: None)
+    monkeypatch.setenv("AM1_RIGHT_ELBOW_P20_TRIAL", "1")
+    supervisor.start_host()
+    assert launched[0]["AM1_RIGHT_ELBOW_P20_TRIAL"] == ("1" if enabled else "0")
+
+
+def test_trial_help_works_with_windows_legacy_output_encoding():
+    import os
+    result = subprocess.run([
+        sys.executable, str(REPO_ROOT / "tools/am1_session.py"),
+        "--config", "unused.json", "start", "--help",
+    ], capture_output=True, env={**os.environ, "PYTHONIOENCODING": "cp1252"}, timeout=30)
+    assert result.returncode == 0, result.stderr.decode("cp1252", errors="replace")
+    assert b"--right-elbow-p20-trial" in result.stdout

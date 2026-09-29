@@ -661,12 +661,14 @@ class SSHRemote:
         self, config: SessionConfig, session_id: str, session_directory: Path, *,
         arm_tracking_readback: bool = False,
         arm_tracking_start: str = "immediate",
+        right_elbow_p20_trial: bool = False,
     ) -> None:
         self.config = config
         self.session_id = session_id
         self.session_directory = session_directory
         self.arm_tracking_readback = arm_tracking_readback
         self.arm_tracking_start = arm_tracking_start
+        self.right_elbow_p20_trial = right_elbow_p20_trial
         self.process: subprocess.Popen[str] | None = None
         self.events: queue.Queue[dict[str, Any]] = queue.Queue()
         self.stderr_stream = None
@@ -724,6 +726,8 @@ class SSHRemote:
             command.append("--arm-tracking-readback")
             if self.arm_tracking_start != "immediate":
                 command.extend(["--arm-tracking-start", self.arm_tracking_start])
+        if self.right_elbow_p20_trial:
+            command.append("--right-elbow-p20-trial")
         return command
 
     def _read_events(self) -> None:
@@ -1552,12 +1556,23 @@ def _pid_running(pid: int) -> bool:
     return True
 
 
+def validate_right_elbow_trial(enabled, leader_source, motion_profile, readback, start, duration_seconds):
+    if enabled and (
+        leader_source != "scripted" or motion_profile != "ArmSmoke"
+        or not readback or start != "right-elbow-request" or duration_seconds != 180
+    ):
+        raise ValueError("P20 trial requires Scripted ArmSmoke180 and deferred right-elbow tracking readback.")
+
+
 def _run_start_locked(
     repository: Path, config: SessionConfig, duration_seconds: int, *,
     leader_source: str = "physical", motion_profile: str | None = None,
     arm_tracking_readback: bool = False,
     arm_tracking_start: str = "immediate",
+    right_elbow_p20_trial: bool = False,
 ) -> int:
+    validate_right_elbow_trial(right_elbow_p20_trial, leader_source, motion_profile,
+                               arm_tracking_readback, arm_tracking_start, duration_seconds)
     validate_leader_selection(leader_source, motion_profile)
     if arm_tracking_readback and leader_source != "scripted":
         raise ValueError("Arm tracking readback is available only for scripted leader input.")
@@ -1595,6 +1610,7 @@ def _run_start_locked(
     remote = SSHRemote(config, session_id, session_directory)
     remote.arm_tracking_readback = arm_tracking_readback
     remote.arm_tracking_start = arm_tracking_start
+    remote.right_elbow_p20_trial = right_elbow_p20_trial
     selection = {"leader_source": leader_source, "motion_profile": motion_profile} if leader_source == "scripted" else {}
     client = WindowsClient(repository, config, remote.fault, stop_request, **selection)
     def record_hardware_cleanup(outcome: SessionOutcome) -> None:
@@ -1664,7 +1680,10 @@ def run_start(
     leader_source: str = "physical", motion_profile: str | None = None,
     arm_tracking_readback: bool = False,
     arm_tracking_start: str = "immediate",
+    right_elbow_p20_trial: bool = False,
 ) -> int:
+    validate_right_elbow_trial(right_elbow_p20_trial, leader_source, motion_profile,
+                               arm_tracking_readback, arm_tracking_start, duration_seconds)
     if arm_tracking_start not in ("immediate", "right-elbow-request") or (
         arm_tracking_start != "immediate" and not arm_tracking_readback
     ):
@@ -1679,6 +1698,7 @@ def run_start(
             repository, config, duration_seconds, leader_source=leader_source, motion_profile=motion_profile,
             **({"arm_tracking_readback": True} if arm_tracking_readback else {}),
             **({"arm_tracking_start": arm_tracking_start} if arm_tracking_start != "immediate" else {}),
+            **({"right_elbow_p20_trial": True} if right_elbow_p20_trial else {}),
         )
 
 
@@ -1844,6 +1864,8 @@ def build_parser() -> argparse.ArgumentParser:
     start_parser.add_argument("--motion-profile")
     start_parser.add_argument("--arm-tracking-readback", action="store_true",
                               help="Opt-in same-owner right-elbow/left-pan readback for one ArmSmoke run.")
+    start_parser.add_argument("--right-elbow-p20-trial", action="store_true",
+                              help="Explicit approved right-elbow P16 to P20 trial, restored to16 on cleanup; ArmSmoke180 only.")
     start_parser.add_argument("--arm-tracking-start", choices=("immediate", "right-elbow-request"), default="immediate",
                               help="Start the bounded capture immediately or on the first changed right-elbow request.")
     subparsers.add_parser("stop")
@@ -1857,6 +1879,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "start":
             duration_seconds = parse_duration_seconds(args.duration_seconds)
+            validate_right_elbow_trial(args.right_elbow_p20_trial, args.leader_source, args.motion_profile,
+                                       args.arm_tracking_readback, args.arm_tracking_start, duration_seconds)
             validate_leader_selection(args.leader_source, args.motion_profile)
             if args.arm_tracking_start != "immediate" and not args.arm_tracking_readback:
                 raise ValueError("Deferred arm tracking requires explicit readback opt-in.")
@@ -1870,6 +1894,7 @@ def main(argv: list[str] | None = None) -> int:
                 leader_source=args.leader_source, motion_profile=args.motion_profile,
                 **({"arm_tracking_readback": True} if args.arm_tracking_readback else {}),
                 **({"arm_tracking_start": args.arm_tracking_start} if args.arm_tracking_start != "immediate" else {}),
+                **({"right_elbow_p20_trial": True} if args.right_elbow_p20_trial else {}),
             )
         if args.command == "stop":
             return request_stop(config)

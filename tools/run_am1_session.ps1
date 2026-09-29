@@ -13,6 +13,8 @@ param(
     [Parameter(ParameterSetName = 'Start')]
     [ValidateSet('Immediate', 'RightElbowRequest')]
     [string]$ArmTrackingStart = 'Immediate',
+    [Parameter(ParameterSetName = 'Start')]
+    [switch]$RightElbowP20Trial,
     [Parameter(Mandatory, ParameterSetName = 'Stop')]
     [switch]$Stop,
     [Parameter(Mandatory, ParameterSetName = 'Collect')]
@@ -57,6 +59,8 @@ function Invoke-Am1SessionEntrypoint {
         [Parameter(ParameterSetName = 'Start')]
         [ValidateSet('Immediate', 'RightElbowRequest')]
         [string]$ArmTrackingStart = 'Immediate',
+        [Parameter(ParameterSetName = 'Start')]
+        [switch]$RightElbowP20Trial,
         [Parameter(Mandatory, ParameterSetName = 'Stop')]
         [switch]$Stop,
         [Parameter(Mandatory, ParameterSetName = 'Collect')]
@@ -72,6 +76,10 @@ function Invoke-Am1SessionEntrypoint {
     $validatedDuration = $null
     if ($PSCmdlet.ParameterSetName -eq 'Start') {
         $validatedDuration = ConvertTo-Am1SessionDuration -Value $DurationSeconds
+        if ($RightElbowP20Trial -and ($LeaderSource -ne 'Scripted' -or $MotionProfile -cne 'ArmSmoke' -or
+            -not $ArmTrackingReadback -or $ArmTrackingStart -ne 'RightElbowRequest' -or $validatedDuration -ne 180)) {
+            throw '-RightElbowP20Trial requires Scripted ArmSmoke180 with deferred right-elbow tracking.'
+        }
         if ($ArmTrackingStart -ne 'Immediate' -and -not $ArmTrackingReadback) {
             throw '-ArmTrackingStart RightElbowRequest requires -ArmTrackingReadback.'
         }
@@ -101,6 +109,7 @@ function Invoke-Am1SessionEntrypoint {
             $arguments += @('--leader-source', 'scripted', '--motion-profile', $MotionProfile)
         }
         if ($ArmTrackingReadback) { $arguments += '--arm-tracking-readback' }
+        if ($RightElbowP20Trial) { $arguments += '--right-elbow-p20-trial' }
         if ($ArmTrackingStart -eq 'RightElbowRequest') {
             $arguments += @('--arm-tracking-start', 'right-elbow-request')
         }
@@ -144,7 +153,7 @@ if ($MyInvocation.InvocationName -ne '.') {
     if ($PSCmdlet.ParameterSetName -eq 'Start') {
         $exitCode = Invoke-Am1SessionEntrypoint -DurationSeconds $DurationSeconds -ConfigPath $ConfigPath `
             -LeaderSource $LeaderSource -MotionProfile $MotionProfile -ArmTrackingReadback:$ArmTrackingReadback `
-            -ArmTrackingStart $ArmTrackingStart
+            -ArmTrackingStart $ArmTrackingStart -RightElbowP20Trial:$RightElbowP20Trial
     }
     elseif ($PSCmdlet.ParameterSetName -eq 'Stop') {
         $exitCode = Invoke-Am1SessionEntrypoint -Stop -ConfigPath $ConfigPath
