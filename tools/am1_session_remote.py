@@ -500,6 +500,10 @@ class RemoteSupervisor:
         env["AM1_LOG_DIRECTORY"] = self.args.log_directory
         env["AM1_SYNC_SHOULDER_READBACK"] = "1"
         env["AM1_ARM_TRACKING_READBACK"] = "1" if getattr(self.args, "arm_tracking_readback", False) else "0"
+        env["AM1_ARM_TRACKING_START"] = (
+            getattr(self.args, "arm_tracking_start", "immediate")
+            if getattr(self.args, "arm_tracking_readback", False) else "immediate"
+        )
         child = self._spawn(
             "host",
             ["bash", str(Path(self.args.motor_repository) / "tools" / "run_am1_host.sh"), "--mode", "local"],
@@ -746,6 +750,7 @@ def build_parser() -> argparse.ArgumentParser:
     supervise_parser.add_argument("--cleanup-timeout", type=float, default=15.0)
     supervise_parser.add_argument("--controller-lease-timeout", type=float, default=6.0)
     supervise_parser.add_argument("--arm-tracking-readback", action="store_true")
+    supervise_parser.add_argument("--arm-tracking-start", choices=("immediate", "right-elbow-request"), default="immediate")
 
     stop_parser = subparsers.add_parser("stop")
     stop_parser.add_argument("--state-directory", required=True)

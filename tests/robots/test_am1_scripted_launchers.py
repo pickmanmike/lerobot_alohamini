@@ -453,8 +453,9 @@ def test_script_complete_requires_explicit_boolean_profile_completion(tmp_path, 
     assert outcome.scripted_input_summary == summary
 
 
+@pytest.mark.parametrize("tracking_start", [None, "right-elbow-request"])
 def test_real_session_start_preserves_scripted_selection_and_stop_reason_through_final_state(
-    monkeypatch, tmp_path, capsys,
+    monkeypatch, tmp_path, capsys, tracking_start,
 ):
     module = load_session()
     state = tmp_path / "state"
@@ -473,7 +474,10 @@ def test_real_session_start_preserves_scripted_selection_and_stop_reason_through
 
     class Remote:
         def __init__(self, *args): pass
-        def preflight(self): return {"session_source_head": head}
+        def preflight(self):
+            assert self.arm_tracking_readback is (tracking_start is not None)
+            assert self.arm_tracking_start == (tracking_start or "immediate")
+            return {"session_source_head": head}
         def start_camera(self): return {"browser_url": "http://camera"}
         def start_host(self): return {}
         def fault(self): return None
@@ -515,7 +519,8 @@ def test_real_session_start_preserves_scripted_selection_and_stop_reason_through
     monkeypatch.setattr(module.subprocess, "run", run)
     monkeypatch.setattr(module.subprocess, "Popen", popen)
 
-    assert module.run_start(REPO_ROOT, config, 180, leader_source="scripted", motion_profile="ArmSmoke") == 0
+    options = {"arm_tracking_readback": True, "arm_tracking_start": tracking_start} if tracking_start else {}
+    assert module.run_start(REPO_ROOT, config, 180, leader_source="scripted", motion_profile="ArmSmoke", **options) == 0
 
     assert len(confirmations) == 1
     assert commands[2][-4:] == ["-LeaderSource", "Scripted", "-MotionProfile", "ArmSmoke"]

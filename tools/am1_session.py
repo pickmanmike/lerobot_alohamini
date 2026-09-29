@@ -660,11 +660,13 @@ class SSHRemote:
     def __init__(
         self, config: SessionConfig, session_id: str, session_directory: Path, *,
         arm_tracking_readback: bool = False,
+        arm_tracking_start: str = "immediate",
     ) -> None:
         self.config = config
         self.session_id = session_id
         self.session_directory = session_directory
         self.arm_tracking_readback = arm_tracking_readback
+        self.arm_tracking_start = arm_tracking_start
         self.process: subprocess.Popen[str] | None = None
         self.events: queue.Queue[dict[str, Any]] = queue.Queue()
         self.stderr_stream = None
@@ -720,6 +722,8 @@ class SSHRemote:
         ])
         if self.arm_tracking_readback:
             command.append("--arm-tracking-readback")
+            if self.arm_tracking_start != "immediate":
+                command.extend(["--arm-tracking-start", self.arm_tracking_start])
         return command
 
     def _read_events(self) -> None:
@@ -1552,6 +1556,7 @@ def _run_start_locked(
     repository: Path, config: SessionConfig, duration_seconds: int, *,
     leader_source: str = "physical", motion_profile: str | None = None,
     arm_tracking_readback: bool = False,
+    arm_tracking_start: str = "immediate",
 ) -> int:
     validate_leader_selection(leader_source, motion_profile)
     if arm_tracking_readback and leader_source != "scripted":
@@ -1589,6 +1594,7 @@ def _run_start_locked(
     print("AM1 session phase: starting bounded source and ownership preflight.", flush=True)
     remote = SSHRemote(config, session_id, session_directory)
     remote.arm_tracking_readback = arm_tracking_readback
+    remote.arm_tracking_start = arm_tracking_start
     selection = {"leader_source": leader_source, "motion_profile": motion_profile} if leader_source == "scripted" else {}
     client = WindowsClient(repository, config, remote.fault, stop_request, **selection)
     def record_hardware_cleanup(outcome: SessionOutcome) -> None:
@@ -1657,7 +1663,12 @@ def run_start(
     repository: Path, config: SessionConfig, duration_seconds: int, *,
     leader_source: str = "physical", motion_profile: str | None = None,
     arm_tracking_readback: bool = False,
+    arm_tracking_start: str = "immediate",
 ) -> int:
+    if arm_tracking_start not in ("immediate", "right-elbow-request") or (
+        arm_tracking_start != "immediate" and not arm_tracking_readback
+    ):
+        raise ValueError("Deferred arm tracking requires explicit readback opt-in.")
     if arm_tracking_readback and leader_source != "scripted":
         raise ValueError("Arm tracking readback is available only for scripted leader input.")
     validate_local_preflight(
@@ -1667,6 +1678,7 @@ def run_start(
         return _run_start_locked(
             repository, config, duration_seconds, leader_source=leader_source, motion_profile=motion_profile,
             **({"arm_tracking_readback": True} if arm_tracking_readback else {}),
+            **({"arm_tracking_start": arm_tracking_start} if arm_tracking_start != "immediate" else {}),
         )
 
 
@@ -1832,6 +1844,8 @@ def build_parser() -> argparse.ArgumentParser:
     start_parser.add_argument("--motion-profile")
     start_parser.add_argument("--arm-tracking-readback", action="store_true",
                               help="Opt-in same-owner right-elbow/left-pan readback for one ArmSmoke run.")
+    start_parser.add_argument("--arm-tracking-start", choices=("immediate", "right-elbow-request"), default="immediate",
+                              help="Start the bounded capture immediately or on the first changed right-elbow request.")
     subparsers.add_parser("stop")
     collect_parser = subparsers.add_parser("collect")
     collect_parser.add_argument("--session-id", required=True)
@@ -1844,6 +1858,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "start":
             duration_seconds = parse_duration_seconds(args.duration_seconds)
             validate_leader_selection(args.leader_source, args.motion_profile)
+            if args.arm_tracking_start != "immediate" and not args.arm_tracking_readback:
+                raise ValueError("Deferred arm tracking requires explicit readback opt-in.")
             if args.arm_tracking_readback and args.leader_source != "scripted":
                 raise ValueError("Arm tracking readback is available only for scripted leader input.")
         config = SessionConfig.load(args.config)
@@ -1853,6 +1869,7 @@ def main(argv: list[str] | None = None) -> int:
                 repository, config, duration_seconds,
                 leader_source=args.leader_source, motion_profile=args.motion_profile,
                 **({"arm_tracking_readback": True} if args.arm_tracking_readback else {}),
+                **({"arm_tracking_start": args.arm_tracking_start} if args.arm_tracking_start != "immediate" else {}),
             )
         if args.command == "stop":
             return request_stop(config)
