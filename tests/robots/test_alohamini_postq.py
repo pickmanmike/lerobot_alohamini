@@ -212,8 +212,8 @@ def test_actual_host_after_client_exit_keeps_polling_or_truthfully_stops(
         poll = operation.poll
         sync_read = robot.left_bus.sync_read
 
-        def checked_poll():
-            poll()
+        def checked_poll(**kwargs):
+            poll(**kwargs)
             polls.append(clock.now)
 
         def modeled_io(register, motors):
@@ -254,7 +254,7 @@ def test_actual_host_after_client_exit_keeps_polling_or_truthfully_stops(
             assert caught.value is primary
         else:
             assert caught.value is robot._lift_operation.failure
-            assert "five-reading feedback window is stale" in str(caught.value)
+            assert "five-slot feedback window is stale" in str(caught.value)
             frames = [f.name for f in traceback.extract_tb(caught.value.__traceback__)]
             assert "get_observation" in frames and "_require_latest" in frames
             notes = " ".join(getattr(caught.value, "__notes__", []))

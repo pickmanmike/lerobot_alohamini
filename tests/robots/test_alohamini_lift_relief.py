@@ -347,6 +347,31 @@ def test_relief_uses_grouped_dynamic_feedback_instead_of_scalar_samples(rig, cap
     assert not [event for event in buses[0].events if event[1] == "read"]
 
 
+def test_standalone_relief_keeps_immediate_wrong_sign_refusal(rig, monkeypatch, capsys):
+    _, buses, _ = rig
+
+    def authorize(_):
+        bus = buses[0]
+        bus.up_factor = 0
+
+        def hook(register):
+            if register == "Present_Velocity" and bus.registers[("Goal_Velocity", "lift_axis")] == -200:
+                bus.read_sequences[(register, "lift_axis")] = [50]
+
+        bus.hook = hook
+        return "RELIEF"
+
+    monkeypatch.setattr(builtins, "input", authorize)
+    assert execute() == 2
+    records = reports(capsys)
+    samples = [r for r in records if r["phase"] == "relief" and not r.get("rejected")]
+    assert len(samples) == 1
+    assert any(r.get("rejected") and "without fresh upward position progress" in r["rejection_reason"]
+               for r in records)
+    assert not any(r["phase"] in ("relief_direction_pending", "relief_direction_qualified") for r in records)
+    assert_stopped(buses[0])
+
+
 def test_relief_homes_once_moves_up_ten_mm_then_observes_45_seconds_and_cleans_up(rig, capsys):
     clock, buses, robots = rig
     assert execute() == 0

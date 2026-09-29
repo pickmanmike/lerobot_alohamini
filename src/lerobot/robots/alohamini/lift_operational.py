@@ -115,6 +115,7 @@ class OperationalLift(InstalledLiftCheck):
         # A gross current fault is never subject to the temperature window.
         self.monitor.immediate_current_abort_ma = 2000.0
         self.last_record: dict[str, Any] | None = None
+        self._pending_sample: dict[str, Any] | None = None
         self.last_emit_ms = 0.0
         self.height_mm = 0.0
         self._last_warning = -math.inf
@@ -179,7 +180,9 @@ class OperationalLift(InstalledLiftCheck):
             finally:
                 self.monitor.min_stationary_samples = stationary_samples
             self.temperature.assert_fresh(time.monotonic())
-            result, _ = self.home_and_relieve(allow_one_count_variation=True)
+            result, _ = self.home_and_relieve(
+                allow_one_count_variation=True, qualify_initial_direction=True,
+            )
             self._goal_since = time.monotonic()
             self.poll()
             self.monitor.record(
@@ -267,7 +270,7 @@ class OperationalLift(InstalledLiftCheck):
         if self._high_idle_current >= 3:
             self.refuse(record, "live: stationary current >=200 mA for three consecutive samples.")
 
-    def poll(self) -> None:
+    def poll(self, *, defer_sample_log: bool = False) -> None:
         self.raise_if_faulted()
         try:
             # Check before reading: a gap must not be washed away by five new lows.
@@ -297,14 +300,32 @@ class OperationalLift(InstalledLiftCheck):
                 self._check_idle(record)
             elif now - self._goal_since >= feedback.STATIONARY_WINDOW_S and goal * record["present_velocity_raw"] < -abs(goal) * feedback.STILL_VELOCITY_RAW:
                 self.refuse(record, "live: unexpected lift motion direction.")
-            emit_started = time.monotonic()
-            try:
-                self.emit(record)
-            finally:
-                self.last_emit_ms = (time.monotonic() - emit_started) * 1000
+            self._pending_sample = record
+            if not defer_sample_log:
+                self.emit_pending_sample()
         except BaseException as error:
             self.failure = error
             raise
+
+    def emit_pending_sample(self) -> None:
+        """Write the already-validated raw sample after its host-loop consumers.
+
+        This is one pending record, not another reader or asynchronous queue.
+        Its original sample timestamp is retained; logging never refreshes it.
+        Fault/transition records remain immediate through the existing monitor.
+        """
+        record, self._pending_sample = self._pending_sample, None
+        if record is None:
+            return
+        emit_started = time.monotonic()
+        try:
+            self.emit(record)
+        except BaseException as error:
+            if self.failure is None:
+                self.failure = error
+            raise
+        finally:
+            self.last_emit_ms = (time.monotonic() - emit_started) * 1000
 
     def _require_latest(self) -> None:
         self.raise_if_faulted()

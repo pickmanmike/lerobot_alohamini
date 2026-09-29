@@ -55,7 +55,8 @@ class FakeProcess:
         return self.returncode
 
 
-def test_initial_preauth_timeout_retries_same_session_without_starting_host(monkeypatch, tmp_path):
+@pytest.mark.parametrize("handshake_timeout", [False, True])
+def test_initial_preauth_timeout_retries_same_session_without_starting_host(monkeypatch, tmp_path, handshake_timeout):
     module = load_session_tool()
     session_id = "20260926T120000-1234abcd"
     remote = module.SSHRemote(fake_config(), session_id, tmp_path)
@@ -72,7 +73,9 @@ def test_initial_preauth_timeout_retries_same_session_without_starting_host(monk
             if "-E" in command:
                 Path(command[command.index("-E") + 1]).write_text(
                     "debug1: Connecting to 192.168.1.134 [192.168.1.134] port 22.\n"
-                    "ssh: connect to host 192.168.1.134 port 22: Connection timed out\n",
+                    + ("debug1: Connection established.\ndebug1: SSH2_MSG_KEXINIT sent\n"
+                       "Connection to 192.168.1.134 port 22 timed out\n" if handshake_timeout else
+                       "ssh: connect to host 192.168.1.134 port 22: Connection timed out\n"),
                     encoding="utf-8",
                 )
         return FakeProcess(
@@ -117,6 +120,15 @@ def test_initial_preauth_timeout_retries_same_session_without_starting_host(monk
             "debug1: Sending command: /python /helper.py supervise\n",
             "ssh: connect to host 192.168.1.134 port 22: Connection timed out\n",
             "SSH controller exited",
+            True,
+        ),
+        (
+            "debug1: Connecting to 192.168.1.134 [192.168.1.134] port 22.\n"
+            "Authenticated to 192.168.1.134 using publickey.\n"
+            "debug1: Sending command: /python /helper.py supervise\n"
+            "Connection to 192.168.1.134 port 22 timed out\n",
+            "",
+            "Connection to 192.168.1.134 port 22 timed out",
             True,
         ),
         (
@@ -185,26 +197,31 @@ def test_auth_or_possible_remote_dispatch_never_relaunches_supervisor(
         assert cleanup["cleanup_verified"] is True
 
 
-def test_three_preauth_failures_stop_without_remote_command_or_fourth_attempt(monkeypatch, tmp_path):
+@pytest.mark.parametrize("failure", [
+    "ssh: connect to host 192.168.1.134 port 22: Connection refused",
+    "Connection to 192.168.1.134 port 22 timed out",
+])
+def test_three_preauth_failures_stop_without_remote_command_or_fourth_attempt(monkeypatch, tmp_path, failure):
     module = load_session_tool()
     remote = module.SSHRemote(fake_config(), "20260926T120000-1234abcd", tmp_path)
     launches = []
 
     def launch(command, **kwargs):
         launches.append(list(command))
-        kwargs["stderr"].write("ssh: connect to host 192.168.1.134 port 22: Connection refused\n")
+        kwargs["stderr"].write(failure + "\n")
         kwargs["stderr"].flush()
         Path(command[command.index("-E") + 1]).write_text(
             "debug1: Connecting to 192.168.1.134 [192.168.1.134] port 22.\n"
-            "ssh: connect to host 192.168.1.134 port 22: Connection refused\n",
+            + failure + "\n",
             encoding="utf-8",
         )
         return FakeProcess(exit_code=255)
 
     monkeypatch.setattr(module.subprocess, "Popen", launch)
     monkeypatch.setattr(module, "SSH_INITIAL_BACKOFF_S", (0.0, 0.0))
+    monkeypatch.setattr(remote, "_persisted_terminal_state", lambda: {"cleanup_verified": False})
 
-    with pytest.raises(module.SessionError, match="Connection refused"):
+    with pytest.raises(module.SessionError, match=failure):
         remote.preflight()
     cleanup = remote.stop()
 

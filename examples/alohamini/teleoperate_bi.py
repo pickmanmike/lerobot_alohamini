@@ -2086,10 +2086,11 @@ def _run_am1_recovering_local_sender(
     unusable_since: float | None = None
     body_released = False
     manual_required = False
-    manual_responses: list[tuple[str, Any, float]] = []
+    manual_responses: list[tuple[str, Any, float, int | None]] = []
     manual_ready = threading.Event()
     manual_requested = False
     manual_enter_at: float | None = None
+    manual_input_result: str | None = None
     resume_mode_pending: str | None = None
     recovery_count = 0
     observation_timeout_count = 0
@@ -2105,13 +2106,30 @@ def _run_am1_recovering_local_sender(
 
         def read_enter() -> None:
             try:
-                manual_responses.append(("value", input_fn(""), monotonic()))
+                response = ("value", input_fn(""), monotonic())
             except BaseException as exc:
-                manual_responses.append(("error", exc, monotonic()))
-            finally:
-                manual_ready.set()
+                response = ("error", exc, monotonic())
+            try:
+                received_wall_time_ns = wall_time_ns()
+            except BaseException:
+                # Evidence-clock failure must not discard input or replace its error.
+                received_wall_time_ns = None
+            manual_responses.append((*response, received_wall_time_ns))
+            manual_ready.set()
 
         threading.Thread(target=read_enter, name="am1-local-recovery-enter", daemon=True).start()
+
+    def report_manual_input() -> None:
+        nonlocal manual_input_result
+        if manual_input_result is not None or not manual_ready.is_set():
+            return
+        kind, value, _, received_wall_time_ns = manual_responses[0]
+        manual_input_result = "error" if kind == "error" else ("enter" if value == "" else "nonempty")
+        # Receipt is evidence, not permission to resume; fresh post-input feedback
+        # and all existing qualification gates below are still required.
+        print(json.dumps({"event": "am1_local_resume_input_received", "epoch": pause_epoch_seen,
+                          "input_result": manual_input_result, "wall_time_ns": received_wall_time_ns},
+                         sort_keys=True), flush=True)
 
     def note_unusable_feedback() -> None:
         nonlocal qualified_first_at, qualified_count, qualified_at, unusable_since
@@ -2173,6 +2191,7 @@ def _run_am1_recovering_local_sender(
                 manual_ready.clear()
                 manual_requested = False
                 manual_enter_at = None
+                manual_input_result = None
                 resume_mode_pending = None
                 robot.retire_observation_requests()
                 print(
@@ -2181,6 +2200,7 @@ def _run_am1_recovering_local_sender(
                 )
                 print(json.dumps({"event": "am1_local_paused", "epoch": epoch,
                                   "cause": pause_reason, "wall_time_ns": wall_time_ns()}), flush=True)
+            report_manual_input()  # Also runs when the next observation poll yields no usable data.
             if (
                 state == "paused"
                 and pause_started_at is not None
@@ -2329,7 +2349,8 @@ def _run_am1_recovering_local_sender(
                 request_manual_enter()
                 if not manual_ready.is_set():
                     continue
-                kind, value, entered_at = manual_responses[0]
+                report_manual_input()
+                kind, value, entered_at, _ = manual_responses[0]
                 if kind == "error":
                     raise SafetyRefusal(f"AM1 Local recovery Enter failed: {value}")
                 if value != "":
@@ -2343,6 +2364,10 @@ def _run_am1_recovering_local_sender(
                 if _max_am1_arm_difference(sample.arm_target, sample.follower_positions) > max_start_mismatch:
                     raise SafetyRefusal("AM1 Local recovery leader/follower mismatch exceeds startup gate")
             resume_mode_pending = "manual" if manual_required else "automatic"
+            print(json.dumps({"event": "am1_local_resume_qualified", "epoch": epoch,
+                              "resume_mode": resume_mode_pending, "observation_sequence": last_sequence,
+                              "host_observation_id": last_host_observation_id, "observed_at": sample.observed_at,
+                              "wall_time_ns": wall_time_ns()}, sort_keys=True), flush=True)
             sender.resume_from(sample.follower_positions, observed_at=sample.observed_at)
         if refusal is None and not operator_stop_requested:
             final_state, _, _, _ = sender.recovery_snapshot()
@@ -2364,6 +2389,8 @@ def _run_am1_recovering_local_sender(
         snapshot = sender.snapshot()
         if profile_cadence:
             try:
+                report_manual_input()
+                final_recovery_state, final_epoch, _, _ = sender.recovery_snapshot()
                 print(json.dumps({"event": "am1_client_action_cadence",
                                   "live_end_wall_time_ns": snapshot.live_end_wall_time_ns,
                                   "action_sequence": snapshot.action_sequence,
@@ -2372,6 +2399,9 @@ def _run_am1_recovering_local_sender(
                                   "observation_sequence": last_sequence,
                                   "observation_timeout_count": observation_timeout_count,
                                   "recovery_count": recovery_count,
+                                  "recovery_state": final_recovery_state, "recovery_epoch": final_epoch,
+                                  "manual_input_result": manual_input_result,
+                                  "manual_input_qualified": resume_mode_pending == "manual",
                                   "observation_age_ms": round(max(0.0, monotonic() - last_observed_at) * 1e3, 3),
                                   "stale_latched": refusal is not None,
                                   "body_command_expiration_count": body_mailbox.expiration_count,

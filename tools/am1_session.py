@@ -39,6 +39,7 @@ _TEMPORARY_PRE_AUTH_ERROR = re.compile(
     r"(?m)^ssh: connect to host [^\r\n]+ port \d+: "
     r"(?:Connection timed out|Connection refused|No route to host|Network is unreachable)$"
     r"|^Connection timed out during banner exchange$"
+    r"|^Connection to [^\r\n]+ port \d+ timed out$"
     r"|^kex_exchange_identification: "
     r"(?:read: Connection reset by peer|Connection closed by remote host)$"
 )
@@ -391,6 +392,15 @@ class SessionCoordinator:
                         if refusal is not None
                         else f"Windows Local client exited with status {outcome.operational_exit_code}"
                     )
+                    client_status = self.client.cleanup_status() if hasattr(self.client, "cleanup_status") else {}
+                    stop_context = client_status.get("stop_context", {})
+                    if (
+                        refusal is None and outcome.operational_exit_code == 2
+                        and stop_context.get("origin") == "remote_fault"
+                    ):
+                        outcome.failure = "Pi session fault requested client stop: " + json.dumps(
+                            stop_context.get("fault"), sort_keys=True
+                        )
                 if hasattr(self.remote, "fault") and (remote_fault := self.remote.fault()) is not None:
                     if outcome.failure is None:
                         outcome.failure = "Pi session fault: " + json.dumps(remote_fault, sort_keys=True)
@@ -544,6 +554,12 @@ class SSHRemote:
         self._remote_event_seen = False
         self._initial_no_dispatch = False
         self._initial_attempts: list[dict[str, Any]] = []
+        self._evidence_lock = threading.Lock()
+        self._control_evidence: dict[str, Any] = {
+            "send_attempt_count": 0, "send_completed_count": 0, "send_failure_count": 0,
+            "heartbeat_attempt_count": 0, "heartbeat_completed_count": 0, "heartbeat_failure_count": 0,
+            "event_received_count": 0, "max_send_duration_ms": 0.0,
+        }
 
     def set_stop_requested(self, stop_requested: Callable[[], bool]) -> None:
         self._stop_requested = stop_requested
@@ -584,6 +600,11 @@ class SSHRemote:
                 event = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            with self._evidence_lock:
+                self._control_evidence["event_received_count"] += 1
+                self._control_evidence.update(
+                    last_event=event.get("event"), last_event_wall_time_ns=time.time_ns(),
+                )
             self._remote_event_seen = True
             self.events.put(event)
             if event.get("event") in {"runtime_fault", "refused", "fault"}:
@@ -619,6 +640,7 @@ class SSHRemote:
                     r"Host key verification failed\.?|Permission denied \([^)]+\)\.?"
                     r"|ssh: connect to host [^\r\n]+ port \d+: [^\r\n]+"
                     r"|Connection timed out during banner exchange"
+                    r"|Connection to [^\r\n]+ port \d+ timed out"
                     r"|kex_exchange_identification: [^\r\n]+"
                     r"|Timeout, server [^\r\n]+ not responding\.",
                     line.strip(),
@@ -650,7 +672,8 @@ class SSHRemote:
 
     def _diagnostic_fields(self) -> dict[str, Any]:
         diagnostics = self.diagnostics()
-        fields: dict[str, Any] = {}
+        with self._evidence_lock:
+            fields: dict[str, Any] = {"control_link": dict(self._control_evidence)}
         if diagnostics["primary_fault"] is not None:
             fields["primary_fault"] = diagnostics["primary_fault"]
         if diagnostics["later_errors"]:
@@ -690,10 +713,41 @@ class SSHRemote:
 
     def _send(self, command: str) -> None:
         with self._send_lock:
-            if not self.process or not self.process.stdin or self.process.poll() is not None:
-                raise SessionError("Pi session control link is not available.")
-            self.process.stdin.write(command + "\n")
-            self.process.stdin.flush()
+            started_at = time.monotonic()
+            is_heartbeat = command == "HEARTBEAT"
+            with self._evidence_lock:
+                self._control_evidence["send_attempt_count"] += 1
+                self._control_evidence.update(
+                    last_send_command=command, last_send_started_wall_time_ns=time.time_ns(),
+                )
+                if is_heartbeat:
+                    self._control_evidence["heartbeat_attempt_count"] += 1
+                    self._control_evidence["last_heartbeat_started_wall_time_ns"] = time.time_ns()
+            try:
+                if not self.process or not self.process.stdin or self.process.poll() is not None:
+                    raise SessionError("Pi session control link is not available.")
+                self.process.stdin.write(command + "\n")
+                self.process.stdin.flush()
+            except BaseException:
+                with self._evidence_lock:
+                    self._control_evidence["send_failure_count"] += 1
+                    if is_heartbeat:
+                        self._control_evidence["heartbeat_failure_count"] += 1
+                raise
+            else:
+                with self._evidence_lock:
+                    self._control_evidence["send_completed_count"] += 1
+                    self._control_evidence["last_send_completed_wall_time_ns"] = time.time_ns()
+                    if is_heartbeat:
+                        self._control_evidence["heartbeat_completed_count"] += 1
+                        self._control_evidence["last_heartbeat_completed_wall_time_ns"] = time.time_ns()
+            finally:
+                with self._evidence_lock:
+                    self._control_evidence["max_send_duration_ms"] = max(
+                        self._control_evidence["max_send_duration_ms"],
+                        round((time.monotonic() - started_at) * 1000, 3),
+                    )
+            # A completed pipe write is not proof that the Pi received the command.
 
     def _heartbeat_loop(self) -> None:
         while not self._heartbeat_stop.wait(1.0):
@@ -885,6 +939,9 @@ class SSHRemote:
                                 "persisted_state_available": True,
                                 "persisted_state_terminal": terminal,
                             }
+                            for key in ("controller_contact", "controller_stop_context"):
+                                if key in state:
+                                    recovered[key] = state[key]
                             if errors:
                                 recovered["persisted_state_errors"] = list(errors)
                             if terminal:
@@ -1050,9 +1107,27 @@ class WindowsClient:
         self.remote_fault = remote_fault
         self.stop_request_path = stop_request_path
         self._cleanup_status: dict[str, Any] = {"cleanup_verified": True, "not_started": True}
+        self._stop_context: dict[str, Any] | None = None
 
     def cleanup_status(self) -> dict[str, Any]:
-        return dict(self._cleanup_status)
+        result = dict(self._cleanup_status)
+        if self._stop_context is not None:
+            result["stop_context"] = dict(self._stop_context)
+        return result
+
+    def _stop_with_context(self, origin: str, log_path: Path, fault: Any = None) -> None:
+        # Capture the first trigger, not a later cleanup error or a generic child 130.
+        if self._stop_context is None:
+            self._stop_context = {"origin": origin, "wall_time_ns": time.time_ns()}
+            if fault is not None:
+                self._stop_context["fault"] = dict(fault) if isinstance(fault, dict) else str(fault)
+        self._request_stop()  # Do not delay the cooperative stop for evidence IO.
+        try:
+            (log_path.parent / "client-stop.json").write_text(
+                json.dumps(self._stop_context, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )
+        except OSError as exc:
+            self._stop_context["evidence_write_error"] = f"{type(exc).__name__}: {exc}"
 
     def _force_reap_owned_client(self, process: subprocess.Popen[Any]) -> bool:
         if process.poll() is not None:
@@ -1102,19 +1177,19 @@ class WindowsClient:
         try:
             while process.poll() is None:
                 if not stop_sent and stop_requested():
-                    self._request_stop()
+                    self._stop_with_context("explicit_stop", log_path)
                     stop_sent = True
                     user_stop_requested = True
                     stop_sent_at = time.monotonic()
-                elif not stop_sent and self.remote_fault() is not None:
-                    self._request_stop()
+                elif not stop_sent and (fault := self.remote_fault()) is not None:
+                    self._stop_with_context("remote_fault", log_path, fault)
                     stop_sent = True
                     stop_sent_at = time.monotonic()
                 if stop_sent_at is not None and time.monotonic() - stop_sent_at >= 30.0:
                     raise SessionError("Windows client did not honor its cooperative stop request within 30 seconds.")
                 time.sleep(0.1)
         except KeyboardInterrupt:
-            self._request_stop()
+            self._stop_with_context("keyboard_interrupt", log_path)
             stop_sent = True
             user_stop_requested = True
             stop_sent_at = time.monotonic()
@@ -1164,6 +1239,11 @@ class WindowsClient:
             "cooperative_stop_requested": stop_sent,
         }
         effective_exit = client_exit if client_exit is not None else wrapper_exit
+        if (
+            self._stop_context is not None and self._stop_context["origin"] == "remote_fault"
+            and effective_exit in {0, 130}
+        ):
+            return 2
         return 130 if user_stop_requested and effective_exit == 0 else effective_exit
 
 

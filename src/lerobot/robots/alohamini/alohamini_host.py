@@ -572,7 +572,7 @@ def main():
             # any ordinary action. No confirmation wait, worker, or second socket.
             lift_operation = getattr(robot, "_lift_operation", None)
             if lift_operation is not None:
-                lift_operation.poll()
+                lift_operation.poll(defer_sample_log=True)
             try:
                 msg = host.zmq_cmd_socket.recv_string(zmq.NOBLOCK)
                 command_received_t = time.monotonic()
@@ -645,7 +645,13 @@ def main():
                     logging.info("Dropping observation response, client is not ready")
             response_send_done_t = time.perf_counter()
 
-            lift_diagnostics_done_t = response_send_done_t
+            # Routine raw logging must not consume the five-slot freshness
+            # margin between this tick's grouped read and action/observation use.
+            # A slow sink still counts toward the next poll's unchanged deadline.
+            if lift_operation is not None:
+                lift_operation.emit_pending_sample()
+
+            lift_diagnostics_done_t = time.perf_counter()
             lift_diagnostics_now = time.monotonic()
             if (
                 args.profile_lift_diagnostics
@@ -764,6 +770,16 @@ def main():
             host.disconnect()
         except BaseException as error:
             cleanup_errors.append(("host disconnect", error))
+
+        # A consumer failure or Ctrl+C can bypass the normal end-of-tick emit.
+        # Preserve that genuine sample, but only after motor/socket cleanup:
+        # a failed or slow log sink must not delay the zero/off requests.
+        lift_operation = getattr(robot, "_lift_operation", None)
+        if lift_operation is not None:
+            try:
+                lift_operation.emit_pending_sample()
+            except BaseException as error:
+                cleanup_errors.append(("pending lift sample", error))
 
         if primary_error is not None:
             for operation, error in cleanup_errors:

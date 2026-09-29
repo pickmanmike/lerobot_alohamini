@@ -312,6 +312,12 @@ class RemoteSupervisor:
         self.controller_stop_requested = threading.Event()
         self.stop_requested = threading.Event()
         self.last_controller_contact = time.monotonic()
+        self._contact_lock = threading.Lock()
+        self._contact_evidence: dict[str, Any] = {
+            "received_count": 0, "heartbeat_count": 0, "last_command": None,
+            "last_receive_wall_time_ns": None, "max_receive_gap_s": 0.0,
+            "last_heartbeat_wall_time_ns": None,
+        }
         self.state: dict[str, Any] = {
             "session_id": args.session_id,
             "supervisor_pid": os.getpid(),
@@ -324,8 +330,27 @@ class RemoteSupervisor:
             "cleanup": None,
         }
 
-    def note_controller_contact(self) -> None:
-        self.last_controller_contact = time.monotonic()
+    def note_controller_contact(self, command: str = "HEARTBEAT") -> None:
+        with self._contact_lock:
+            now = time.monotonic()
+            if self._contact_evidence["received_count"]:
+                self._contact_evidence["max_receive_gap_s"] = max(
+                    self._contact_evidence["max_receive_gap_s"], now - self.last_controller_contact,
+                )
+            self.last_controller_contact = now
+            self._contact_evidence["received_count"] += 1
+            self._contact_evidence["heartbeat_count"] += int(command == "HEARTBEAT")
+            self._contact_evidence.update(last_command=command, last_receive_wall_time_ns=time.time_ns())
+            if command == "HEARTBEAT":
+                self._contact_evidence["last_heartbeat_wall_time_ns"] = time.time_ns()
+
+    def controller_contact_evidence(self) -> dict[str, Any]:
+        with self._contact_lock:
+            return {
+                **self._contact_evidence,
+                "last_receive_age_s": max(0.0, time.monotonic() - self.last_controller_contact),
+                "lease_timeout_s": getattr(self.args, "controller_lease_timeout", 6.0),
+            }
 
     def controller_lease_expired(self) -> bool:
         return bool(self.children) and (
@@ -333,6 +358,7 @@ class RemoteSupervisor:
         )
 
     def save(self) -> None:
+        self.state["controller_contact"] = self.controller_contact_evidence()
         _atomic_json(self.state_path, self.state)
         _atomic_json(
             self.active_path,
@@ -340,7 +366,10 @@ class RemoteSupervisor:
         )
 
     def emit(self, event: str, **fields: Any) -> None:
-        self.reporter.emit({"event": event, "session_id": self.args.session_id, **fields})
+        self.reporter.emit({
+            "event": event, "session_id": self.args.session_id, "wall_time_ns": time.time_ns(),
+            "controller_contact": self.controller_contact_evidence(), **fields,
+        })
 
     def preflight(self) -> None:
         if not SESSION_ID_PATTERN.fullmatch(self.args.session_id):
@@ -501,6 +530,7 @@ class RemoteSupervisor:
         return None
 
     def cleanup(self, *, reason: str) -> dict[str, Any]:
+        self.state.setdefault("controller_stop_context", self.controller_contact_evidence())
         self.state["status"] = "stopping"
         self.state["stop_reason"] = reason
         state_errors: list[str] = []
@@ -545,8 +575,8 @@ class RemoteSupervisor:
 def _read_commands(supervisor: RemoteSupervisor, commands: queue.Queue[str]) -> None:
     try:
         for line in sys.stdin:
-            supervisor.note_controller_contact()
             command = line.strip()
+            supervisor.note_controller_contact(command)
             if command == "STOP":
                 supervisor.controller_stop_requested.set()
             commands.put(command)

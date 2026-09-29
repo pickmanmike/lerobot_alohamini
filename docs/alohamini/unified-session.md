@@ -8,7 +8,7 @@ had a maximum browser display gap of `1.138 s`, above the unchanged `500 ms`
 continuity target. Loss of a required view still means release controls, press
 `Q`, and restart only after all owned processes have stopped.
 
-## Current integration and deployment — September 27, 2026
+## Integrated baseline and reliability follow-up — September 27, 2026
 
 PR #7 is merged into `integrate/am1-local-teleop`, not `main`, at
 `865bfd1f4de9a276cebe9650a4fd2e951f492169`. Its ordered parents are
@@ -19,8 +19,10 @@ reviewed head; the subsequent closeout edits are documentation only.
 | Evidence or deployed component | Exact source |
 |---|---|
 | Physically exercised client/session workflow and motor | `a6a263266888ebc2cd658d0ff5be670632ded3d0` |
-| Currently deployed Windows client/session and Pi session helper | `f7d00306ab889556c79a4939f32b993f247bba61` |
-| Currently deployed Pi motor, intentionally unchanged | `a6a263266888ebc2cd658d0ff5be670632ded3d0` |
+| Windows client/session and Pi session helper for the latest ordinary-use attempts | `16c557c05497c94d0bb2e2938c51d4ba56b0a549` |
+| Motor used by those attempts, before the logging-order correction | `a6a263266888ebc2cd658d0ff5be670632ded3d0` |
+| Motor-only logging-order correction used by the later first-relief refusal | `4e16b18b732247072157d3dc64dad6117761ea13` |
+| Motor-only initial-relief qualification staged; not physically exercised | `699d6eaf19de1dc80dfcd6621406ba7850fae446` |
 | Separately deployed Pi camera, intentionally unchanged | `047c4fcf7cbf34684a9b8c348193585938975815` |
 
 The camera commit is **not an ancestor** of the integration merge. The private
@@ -44,6 +46,77 @@ review cleared the scoped findings. These are earlier test executions, not
 tests rerun for this documentation closeout. Fresh integration checks verified
 the exact heads, merge parents/tree, source references and documentation diff;
 no new powered acceptance or long-duration claim is made.
+
+The subsequent `codex/am1-session-reliability` follow-up is separate from closed
+PR #7 and targets `integrate/am1-local-teleop`, not `main`. It corrects fault/exit
+reporting and one pre-authentication timeout classification, and adds bounded
+control-link and resume-input evidence. Its implementation commits are
+`a63544d9`, `c36b97e3`, `7f780513` and `178044d0`. Those changes updated only the
+Windows client/session and Pi helper. The later motor-only correction below is
+separate; the camera remains unchanged. Check all private session pins against
+their deployed components rather than deploying every component at one SHA.
+
+Fresh follow-up verification: 285 passed, 1 skipped across the affected session,
+SSH reconnect, Local recovery, live-cadence and client-connection test files.
+Compilation, helper/client help, fresh imports, lazy visualization/OpenCV checks,
+PowerShell parsing and diff checks passed. These are offline checks, not new
+physical acceptance; the earlier 686/1 and browser results above remain historical.
+
+The seven reviewed follow-up attempts show distinct pre-authentication failures,
+authenticated control-link loss/lease expiry, a bounded startup-feedback refusal,
+and a live pause followed by controller-driven stopping. The two child exits of
+130 were **not operator cancellation**, according to the owner and control-link
+evidence. A later successful large-offset synchronization is recorded below;
+the qualified earlier workflow pass is retained. No change here is evidence that
+the intermittent transport failure has been cured.
+
+### Return to useful operation: consume feedback before routine logging
+
+The owner reports temporary connectivity recovery after router restarts;
+network diagnosis/remediation is an external project, not a prerequisite audit
+here or proof of any historical cause. Use ordinary bounded launcher preflight.
+
+The two subsequent attempts both completed home, approximately 10 mm relief,
+and synchronization. One briefly entered live control; the other remained at
+the final Enter gate. Their first demonstrated host failure was the five-slot
+temperature-history freshness check, not confirmed heat or control-link loss.
+Routine synchronous telemetry emission occurred between the fresh grouped read
+and its action/observation consumers and exhausted the retained history's margin.
+Both hosts subsequently verified stopped/zero/torque-off cleanup but retained
+exit 1; a conservative supervisor cleanup-unknown label did not erase that
+operational failure. Complete evidence stays private.
+
+Correction `a2555838` moves only routine live-sample emission after action,
+observation and reply processing. Original timestamps and raw records remain;
+fault/transition evidence remains immediate. A pending sample on a consumer fault
+is emitted after motor/socket cleanup, without replacing the primary error.
+Logging still counts toward the loop budget and the next unchanged freshness
+check. There is no extra reader, thread, confirmation wait, relaxed guard or
+automatic restart. Motor commit `4e16b18b` is the exact four-file cherry-pick
+onto its prior source; helper/client and camera pins remain distinct.
+
+Earlier focused verification: **128 passed, 1 skipped** (POSIX-only process-group
+case on Windows), including actual fake-host consumer/log ordering, genuine
+staleness, log failure, Ctrl+C and preserved final raw evidence. Compilation,
+host help/import-root, diff checks and independent code review passed. These
+are offline results, not a claim that the correction is physically exercised.
+
+The later first-relief refusal prompted the separately approved fixed initial
+qualification described below. Source correction `18ad0161` passed **156**
+affected operational/standalone relief tests after meaningful RED, including
+fixed deadlines, late progress, repeated disagreement, faults and cleanup.
+Independent review found no blocker; its confirmed-temperature case is now a
+permanent regression. Compile, help/import-root and diff checks passed. The
+motor-only deployment `699d6eaf` contains the identical four Python/test files;
+only the backed-up private motor pin changed. Its Pi compile/import/help and
+helper print-only checks passed. No powered attempt was run for this correction.
+
+Next ordinary use uses `-DurationSeconds 300` as a ceiling, the same three actual
+Enter prompts and nominal 30-second synchronization. The owner can finish a
+lightweight task plus brief normal base/lift use and press Q earlier. Preserve
+all accepted milestones and shoulder/camera limitations; do not add another
+diagnostic campaign. A new genuine fault stops that attempt for exact-evidence
+review. PR #8 remains draft and unmerged.
 
 ## Compact design
 
@@ -193,10 +266,33 @@ not retained; no source penalty or server-side setting change is established.
 The owner-approved AM1 operational lift guard permits at most one encoder count
 (about 0.0205 mm) below the best upward position reached during relief. It logs
 that raw variation; the reference does not follow successive downward samples.
-More downward travel, uncorroborated positive raw velocity, or repeated
-velocity/position direction disagreements still refuse startup. The original
-homed zero, 10 mm relief target, 12 mm maximum and 8-second relief bound remain.
-The standalone comparison keeps its stricter direction rule.
+Normal AM1 startup now has a fixed **250 ms initial direction-qualification
+window**, anchored once after the upward command completes. Fresh net upward
+encoder progress must qualify before it expires; returning from a one-count
+backstep to the initial position is not sufficient. During this initial window
+only, an uncorroborated positive raw velocity no greater than the existing
+50-raw stationary-feedback bound may await the next sample. The one-count
+travel boundary remains active, and two consecutive wrong-sign velocity
+samples still refuse. A larger uncorroborated positive velocity, late/missing
+qualification or any genuine telemetry fault stops through existing cleanup.
+Once upward progress qualifies, the initial window never reopens. Full pending,
+qualified and rejected feedback is retained without inventing sample freshness.
+The original homed zero, 10 mm relief target, 12 mm maximum, 8-second relief
+bound and two-second useful-progress check remain. The standalone comparison
+keeps its stricter immediate direction rule; AM2/AM2 Pro are unchanged.
+
+This owner-approved qualification is a bounded operating-policy change, not
+proof that the earlier first-sample velocity/position disagreement was false.
+Its offline cases model an initial one-count backstep and later upward progress;
+they do not claim that the stopped physical attempt would have recovered.
+That attempt completed homing but refused before operational readiness,
+synchronization or live control. Cleanup verified zero goal, torque off and a
+stopped window; the genuine operational refusal remains a failed session.
+It did not reach the ordinary loop and therefore neither validates nor
+disproves the preceding logging-order correction. The new initial qualification
+has not yet been physically exercised. Focused fake-clock/grouped-feedback
+validation of the operational and standalone relief files passed **156 tests**;
+historical motor/camera acceptance remains separate.
 
 After a complete fresh stopped window, velocity-only uncertainty may requalify
 for at most one second from the last valid window, with position confined to
@@ -275,10 +371,12 @@ never kills unrelated Python, camera, or motor processes.
 
 ## Retained limitations and follow-up
 
-- The large-offset right-shoulder tracking shortfall remains unresolved even
-  after sampled goal-register delivery. The successful closer start does not
-  isolate loading or repair that behavior. Match the leader to the current
-  measured follower before startup approval; keep the existing gate and bounds.
+- A later run synchronized the right shoulder from about +99.069 toward -5.936,
+  reaching -1.604 and passing the unchanged gate. Large-offset tracking therefore
+  succeeded in that pose. It does not erase the earlier 13.402-unit plateau at a
+  different target after sampled goal-register delivery or establish arbitrary-pose
+  convergence. Continue matching the leader to the current measured follower for
+  ordinary startup; keep the existing gate and bounds.
 - Intermittent Forward-camera acquisition can fail before any motor startup.
   Replug recovery does not establish a loose connector or a network cause.
   Preserve that refusal and its cleanup instead of automatically retrying.
@@ -290,12 +388,22 @@ never kills unrelated Python, camera, or motor processes.
   arbitrary-pose tracking, unattended operation or remote-use readiness. Raw
   lift-feedback limitations and genuine historical faults remain recorded.
 
-The next recommended improvement is a separate, bounded camera-observability
-follow-up: retain private backend diagnostics and distinguish acquisition from
-browser delivery using existing evidence first. Do not add a duplicate reader,
-global USB reset, automatic powered restart or mandatory repeat campaign.
-The detailed shoulder/camera review remains private; this is its sanitized
-follow-up summary, not a reopened integration blocker.
+Session reliability takes priority over a camera-only follow-up. The saved host
+sensor loops continued near 30 Hz during Windows observation gaps; this does not
+prove that a reply was delivered or distinguish a network failure from every
+possible queuing condition. No demonstrated defect justifies larger queues,
+longer motion-freshness/watchdog/lease limits, or automatic supervisor relaunch.
+An offline disposable control peer verifies that waiting for the first Enter
+does not itself stop heartbeats. Actual local ZMQ peers cover short-gap recovery
+and fresh-feedback-qualified manual resume; these are not physical tests.
+
+At the next ordinary supervised use, retain the existing automatic evidence and
+the added diagnostics below. If it stops, inspect that exact failure rather than
+repeat unchanged. Camera acquisition, browser delivery and display correlation
+remain separate follow-ups; no new acquisition refusal appeared in the seven
+reviewed attempts, and four reached all-five readiness. Do not add a duplicate
+reader, global USB reset or a required repeat commissioning campaign. Detailed
+session evidence remains private; this is only a sanitized current-state summary.
 
 ## Evidence and recovery
 
@@ -310,6 +418,30 @@ The folder contains the exact Windows client log, exact copied host/camera logs,
 requested and measured live interval, synchronization timing, reviewed source
 heads, recovered-gap warnings, process exits, cleanup verification, and copy
 result. Remote originals remain in place.
+
+The reliability follow-up adds:
+
+- `client-stop.json` and `cleanup.client.stop_context`: the first **observed**
+  controller stop trigger (explicit Stop, Ctrl+C or remote fault), timestamp and
+  fault detail. A remote-driven child 0/130 becomes session status 2, while the
+  raw child/wrapper codes stay recorded. A pre-existing client safety refusal
+  stays primary. This is not proof of ordering between simultaneous signals.
+- `cleanup.control_link`: attempted/completed/failed writes and separate
+  heartbeat counts/timestamps that survive the later STOP write. Successful pipe
+  writing is not proof of remote receipt. Pi transition/state records include
+  receive counts, last heartbeat time and contact age at cleanup. These are
+  bounded counters, not a per-heartbeat file log or a new acknowledgement protocol.
+- `am1_local_resume_input_received`, then (only when its gates pass)
+  `am1_local_resume_qualified`, then host-acknowledged `am1_local_recovered`.
+  The final cadence record includes recovery state/epoch and input disposition;
+  `manual_input_qualified` means permitted to request resume, not host acknowledgement.
+  Enter receipt alone cannot authorize motion. Final `stale_latched=false` alone
+  is not a freshness claim: inspect observation age and recovery state.
+
+No per-run private-config copy existed in the seven older uploaded folders.
+Their summaries record Pi source pins; Windows command headers identify the
+script/environment, with commit identity supported by the enforced matching
+local preflight. Do not describe missing snapshots as present.
 
 If a copy fails, `missing-logs.json` records only the exact missing remote paths.
 An empty or absent manifest is not proof that every artifact was discovered.

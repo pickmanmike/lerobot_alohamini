@@ -801,7 +801,11 @@ def test_remote_stop_recovers_verified_cleanup_from_persisted_state_after_contro
         )(),
     )
 
-    assert remote.stop() == {
+    cleanup = remote.stop()
+    evidence = cleanup.pop("control_link")
+    assert evidence["send_completed_count"] == 0
+    assert evidence["event_received_count"] == 0
+    assert cleanup == {
         "cleanup_verified": True,
         "host_exit": 0,
         "camera_exit": 0,
@@ -1591,6 +1595,125 @@ def test_remote_command_reader_refreshes_contact_for_heartbeat(monkeypatch, tmp_
     assert commands.get_nowait() == "__EOF__"
 
 
+def test_controller_contact_evidence_distinguishes_receive_from_later_cleanup(monkeypatch, tmp_path):
+    module = load_tool("am1_session_remote")
+    monkeypatch.setattr(module.os, "killpg", lambda *args: pytest.fail("no child to signal"), raising=False)
+    args = type("Args", (), {
+        "session_id": "20260920T120000-1234abcd", "state_directory": str(tmp_path),
+        "camera_head": "camera", "motor_head": "motor", "session_head": "helper",
+        "controller_lease_timeout": 6.0, "cleanup_timeout": 1.0,
+    })()
+    clock = [10.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    supervisor = module.RemoteSupervisor(args, module.BestEffortReporter(lambda payload: None))
+    monkeypatch.setattr(module.sys, "stdin", io.StringIO("START_CAMERA\nHEARTBEAT\nHEARTBEAT\n"))
+    module._read_commands(supervisor, module.queue.Queue())
+    clock[0] = 16.1
+    supervisor.cleanup(reason="controller_lease_expired")
+    state = json.loads(supervisor.state_path.read_text())
+    evidence = state["controller_stop_context"]
+    assert evidence["received_count"] == 3 and evidence["heartbeat_count"] == 2
+    assert evidence["last_command"] == "HEARTBEAT"
+    assert evidence["last_receive_wall_time_ns"] > 0
+    assert evidence["last_heartbeat_wall_time_ns"] > 0
+    assert evidence["last_receive_age_s"] == pytest.approx(6.1)
+    assert evidence["lease_timeout_s"] == 6.0
+    assert state["stop_reason"] == "controller_lease_expired"
+
+
+def test_control_send_failure_records_attempt_not_success_and_preserves_exception(tmp_path):
+    module = load_tool("am1_session")
+    remote = module.SSHRemote(None, "20260920T120000-1234abcd", tmp_path)
+    original = BrokenPipeError("synthetic failed control write")
+
+    class Stream:
+        def write(self, text): raise original
+        def flush(self): raise AssertionError("failed write cannot flush")
+
+    remote.process = type("Process", (), {"stdin": Stream(), "poll": lambda self: None})()
+    with pytest.raises(BrokenPipeError) as caught:
+        remote._send("HEARTBEAT")
+    assert caught.value is original
+    evidence = remote._diagnostic_fields()["control_link"]
+    assert evidence["send_attempt_count"] == 1
+    assert evidence["send_completed_count"] == 0
+    assert evidence["send_failure_count"] == 1
+    assert evidence["heartbeat_attempt_count"] == 1
+    assert evidence["heartbeat_completed_count"] == 0
+    assert evidence["heartbeat_failure_count"] == 1
+    assert evidence["last_send_command"] == "HEARTBEAT"
+    assert evidence["last_send_started_wall_time_ns"] > 0
+
+
+def test_real_control_pipe_keeps_heartbeats_during_enter_wait_and_reports_remote_receive(tmp_path):
+    """Actual stdin/stdout/heartbeat/input threads, with a harmless local Python peer."""
+    module = load_tool("am1_session")
+    peer = "\n".join([
+        "import sys, queue, threading, json",
+        "from types import SimpleNamespace",
+        "sys.path.insert(0, sys.argv[1])",
+        "from am1_session_remote import RemoteSupervisor, BestEffortReporter, _read_commands",
+        "args = SimpleNamespace(session_id='20260920T120000-1234abcd', state_directory=sys.argv[2],",
+        "    camera_head='fake', motor_head='fake', session_head='fake', controller_lease_timeout=6)",
+        "reporter = BestEffortReporter(lambda payload: print(json.dumps(payload), flush=True))",
+        "supervisor = RemoteSupervisor(args, reporter)",
+        "commands = queue.Queue()",
+        "threading.Thread(target=_read_commands, args=(supervisor, commands), daemon=True).start()",
+        "supervisor.emit('preflight_ready')",
+        "beats = 0",
+        "while True:",
+        "    command = commands.get(timeout=8)",
+        "    if command == 'HEARTBEAT':",
+        "        beats += 1",
+        "        if beats == 2: supervisor.emit('runtime_fault', reason='synthetic peer fault')",
+        "    elif command == 'STOP':",
+        "        supervisor.emit('cleanup_complete', cleanup_verified=True)",
+        "        break",
+    ])
+    remote = module.SSHRemote(None, "20260920T120000-1234abcd", tmp_path)
+    remote.process = subprocess.Popen(
+        [sys.executable, "-u", "-c", peer, str(REPO_ROOT / "tools"), str(tmp_path)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
+    )
+    remote.reader = threading.Thread(target=remote._read_events, daemon=True)
+    remote.reader.start()
+    input_release = threading.Event()
+    coordinator = module.SessionCoordinator(
+        remote=remote, client=None, open_browser=lambda url: None,
+        collect_remote_log=lambda *args: (True, None),
+        input_fn=lambda prompt: input_release.wait(8) or "",
+    )
+    try:
+        remote._wait("preflight_ready", 3.0)
+        remote._heartbeat = threading.Thread(target=remote._heartbeat_loop, daemon=True)
+        remote._heartbeat.start()
+        with pytest.raises(module.SessionError, match="synthetic peer fault"):
+            coordinator._input_with_stop("Enter only", lambda: False, remote.fault)
+        fault = remote.fault()
+        assert fault["controller_contact"]["heartbeat_count"] >= 2
+        assert fault["controller_contact"]["last_receive_age_s"] < 1.0
+        assert fault["controller_contact"]["last_heartbeat_wall_time_ns"] > 0
+        result = remote.stop()
+        assert result["cleanup_verified"] is True
+        evidence = result["control_link"]
+        assert evidence["send_completed_count"] >= 3  # Two heartbeats, then STOP.
+        assert evidence["heartbeat_completed_count"] >= 2
+        assert evidence["last_send_command"] == "STOP"
+        assert evidence["last_heartbeat_completed_wall_time_ns"] < evidence["last_send_completed_wall_time_ns"]
+        assert evidence["event_received_count"] == 3
+        assert evidence["last_event"] == "cleanup_complete"
+    finally:
+        input_release.set()
+        remote._heartbeat_stop.set()
+        stop_disposable_process(remote.process)
+        remote.reader.join(timeout=2)
+        if remote._heartbeat is not None:
+            remote._heartbeat.join(timeout=2)
+        for stream in (remote.process.stdin, remote.process.stdout, remote.process.stderr):
+            if stream is not None:
+                stream.close()
+
+
 def test_remote_readiness_wait_refuses_when_controller_lease_expires(tmp_path):
     module = load_tool("am1_session_remote")
     args = type(
@@ -1873,6 +1996,69 @@ def test_windows_client_labels_user_stop_130_even_when_child_cleanup_exits_zero(
     assert exit_code == 130
 
 
+@pytest.mark.parametrize("marker", [0, 130, 2])
+def test_remote_fault_stop_keeps_fault_origin_and_never_reports_operator_cancel(monkeypatch, tmp_path, marker):
+    module = load_tool("am1_session")
+    log = tmp_path / "client.log"
+    stop = tmp_path / "stop"
+    fault = {"event": "fault", "reason": "SSH transport unavailable"}
+
+    class Process:
+        pid = 1234
+        returncode = None
+
+        def poll(self):
+            if stop.exists():
+                log.write_text(f"AM1_CLIENT_EXIT_CODE={marker}\n", encoding="utf-8")
+                self.returncode = 0
+            return self.returncode
+
+        def wait(self, timeout):
+            return self.poll()
+
+    monkeypatch.setattr(module.subprocess, "Popen", lambda *args, **kwargs: Process())
+    monkeypatch.setattr(module.shutil, "which", lambda name: "pwsh")
+    monkeypatch.setattr(module.time, "sleep", lambda duration: None)
+    config = type("Config", (), {"local_config": tmp_path / "local.json"})()
+    client = module.WindowsClient(tmp_path, config, lambda: dict(fault), stop)
+
+    assert client.run(duration_seconds=90, log_path=log, stop_requested=lambda: False) == 2
+    cleanup = client.cleanup_status()
+    assert cleanup["client_exit"] == marker  # Preserve the real child result separately.
+    assert cleanup["stop_context"]["origin"] == "remote_fault"
+    assert cleanup["stop_context"]["fault"] == fault
+    assert cleanup["stop_context"]["wall_time_ns"] > 0
+    assert json.loads((tmp_path / "client-stop.json").read_text()) == cleanup["stop_context"]
+    assert stop.read_text() == "stop\n"
+
+
+def test_coordinator_preserves_fault_that_requested_stop_not_generic_child_130(tmp_path):
+    module = load_tool("am1_session")
+    fault = {"event": "runtime_fault", "reason": "controller heartbeat lease expired"}
+
+    class Remote:
+        def preflight(self): return {}
+        def start_camera(self): return {"browser_url": "http://camera"}
+        def start_host(self): return {}
+        def stop(self): return {"cleanup_verified": True}
+
+    class Client:
+        def run(self, **kwargs): return 2
+        def cleanup_status(self):
+            return {"cleanup_verified": True, "client_exit": 130,
+                    "stop_context": {"origin": "remote_fault", "fault": fault, "wall_time_ns": 123}}
+
+    outcome = module.SessionCoordinator(
+        remote=Remote(), client=Client(), open_browser=lambda url: None,
+        collect_remote_log=lambda remote, local: (True, None), input_fn=lambda prompt: "",
+    ).run(duration_seconds=90, session_id="20260920T120000-1234abcd",
+          session_directory=tmp_path, client_log_path=tmp_path / "client.log", stop_requested=lambda: False)
+
+    assert outcome.final_exit_code == 2
+    assert "controller heartbeat lease expired" in outcome.failure
+    assert "exited with status" not in outcome.failure
+
+
 def test_windows_client_force_reaps_exact_owned_process_when_cooperative_stop_is_ignored(monkeypatch, tmp_path):
     module = load_tool("am1_session")
     log = tmp_path / "client.log"
@@ -1931,7 +2117,11 @@ def test_windows_client_second_ctrl_c_force_reaps_only_owned_process(monkeypatch
 
     assert client.run(duration_seconds=60, log_path=log, stop_requested=lambda: False) == 130
     assert reaped == [7654]
-    assert client.cleanup_status() == {
+    status = client.cleanup_status()
+    context = status.pop("stop_context")
+    assert context["origin"] == "keyboard_interrupt"
+    assert context["wall_time_ns"] > 0
+    assert status == {
         "cleanup_verified": False,
         "state": "forced_after_repeated_interrupt",
         "client_wrapper_pid": 7654,
