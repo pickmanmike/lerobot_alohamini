@@ -100,6 +100,10 @@ class TemperatureWindow:
 class OperationalLift(InstalledLiftCheck):
     """Synchronous AM1 lift monitor with bounded same-owner consumer refresh."""
 
+    # Operating allowance only, not a manufacturer accuracy/safety specification.
+    # Strict startup, relief and cleanup retain the shared diagnostic criterion.
+    IDLE_POSITION_SPAN_MM = 0.10
+
     def __init__(self, robot) -> None:
         super().__init__(robot)
         # At raw +200, 600 mm needs about 146 s, not the diagnostic's 20 s.
@@ -124,6 +128,9 @@ class OperationalLift(InstalledLiftCheck):
         self._last_goal = 0
         self._goal_since = time.monotonic()
         self._stationary: deque[dict[str, Any]] = deque()
+        self._idle_position_span_raw = math.floor(
+            self.IDLE_POSITION_SPAN_MM / abs(self.lift._deg_per_tick * self.lift._mm_per_deg)
+        )
         self._high_idle_current = 0
         self._last_idle_height: float | None = None
         self._idle_qualified_at: float | None = None
@@ -211,7 +218,7 @@ class OperationalLift(InstalledLiftCheck):
             origin, low, high = self._idle_uncertain_band
             offset = feedback._position_delta(origin, int(record["present_position_raw"]))
             low, high = min(low, offset), max(high, offset)
-            if high - low > feedback.STATIONARY_POSITION_TOLERANCE_RAW:
+            if high - low > self._idle_position_span_raw:
                 self.refuse(record, "live: lift displaced during stopped-feedback uncertainty.")
             self._idle_uncertain_band = (origin, low, high)
         self._stationary.append(record)
@@ -230,7 +237,7 @@ class OperationalLift(InstalledLiftCheck):
         )
         motion_evidence = (
             abs(record["present_velocity_raw"]) > feedback.STATIONARY_REPORTED_VELOCITY_LIMIT_RAW
-            or max(offsets) - min(offsets) > feedback.STATIONARY_POSITION_TOLERANCE_RAW
+            or max(offsets) - min(offsets) > self._idle_position_span_raw
             or persistent_moving
         )
         if qualified and motion_evidence:

@@ -30,7 +30,16 @@ def operating_robot(monkeypatch, tmp_path):
     class Transport(GroupedLiftTransport):
         def read_group(self, *args, **kwargs):
             clock.sleep(0.002)  # Synthetic finite transaction time, not instant duplicate samples.
-            return super().read_group(*args, **kwargs)
+            payload, trace = super().read_group(*args, **kwargs)
+            from lerobot.robots.alohamini import lift_motor_feedback as feedback
+
+            moving = self.bus.read_sequences.get(("Moving", "lift_axis"))
+            if moving and args[:2] == (feedback.FEEDBACK_START, feedback.FEEDBACK_LENGTH):
+                payload = bytearray(payload)
+                payload[feedback.MOVING_ADDRESS - feedback.FEEDBACK_START] = moving.pop(0)
+                payload = bytes(payload)
+                trace = {**trace, "response_payload_bytes": list(payload)}
+            return payload, trace
 
     monkeypatch.setattr(robot_module, "FeetechMotorsBus", bus_factory)
     monkeypatch.setattr(lift_relief, "make_grouped_transport", lambda robot: Transport(robot.left_bus))
@@ -962,11 +971,13 @@ def test_synthetic_sustained_high_during_home_stops_and_closes_before_relief(
     assert any(r["phase"] == "shutdown_verified" for r in records)
 
 
-def poll_idle_feedback(robot, clock, *, velocity=0, position=None):
+def poll_idle_feedback(robot, clock, *, velocity=0, position=None, moving=None):
     """A fresh grouped fake-bus transaction; the real monitor and clock still run."""
     if position is not None:
         robot.left_bus.position = position
     robot.left_bus.read_sequences[("Present_Velocity", "lift_axis")] = [velocity]
+    if moving is not None:
+        robot.left_bus.read_sequences[("Moving", "lift_axis")] = [moving]
     clock.sleep(1 / 30)
     robot._lift_operation.poll()
 
@@ -982,6 +993,159 @@ def qualified_idle(operating_robot):
     finally:
         if robot.left_bus.is_connected:
             robot._safe_shutdown(close_buses=True)
+
+
+@pytest.mark.parametrize("offsets", [
+    [0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1],  # Retained refusal's relative positions.
+    [0, 4, 0, 4], [0, -4, 0, -4],
+])
+def test_operational_idle_span_accepts_bounded_variation_without_new_motion_or_filtering(
+    qualified_idle, capsys, offsets,
+):
+    robot, clock = qualified_idle
+    op = robot._lift_operation
+    origin = op.last_record["present_position_raw"]
+    anchor = op._last_idle_height
+    zero = robot.lift._z0_deg
+    before = len(robot.left_bus.events)
+    reads = len(op.transport.group_reads)
+    for offset in offsets:
+        poll_idle_feedback(robot, clock, position=origin + offset)
+        robot.send_action({"x.vel": 0, "y.vel": 0, "theta.vel": 0, "lift_axis.vel": 0})
+    assert op.failure is None
+    assert op._last_idle_height == anchor
+    assert robot.lift._z0_deg == zero
+    assert len(op.transport.group_reads) == reads + len(offsets)
+    assert [r["present_position_raw"] for r in operational_records(capsys) if r["phase"] == "live"][-len(offsets):] == [origin + d for d in offsets]
+    writes = [e for e in robot.left_bus.events[before:] if e[1:3] == ("write", "Goal_Velocity")]
+    assert writes and all(e[-1] == 0 for e in writes)
+    assert op.bus.expected_goal == 0
+
+
+@pytest.mark.parametrize("offset", [-5, 5])
+def test_operational_idle_span_next_count_refuses_before_further_action(qualified_idle, offset):
+    robot, clock = qualified_idle
+    op = robot._lift_operation
+    origin = op.last_record["present_position_raw"]
+    with pytest.raises(RuntimeError, match="unexpected stationary lift motion") as caught:
+        poll_idle_feedback(robot, clock, position=origin + offset)
+    before = len(robot.left_bus.events)
+    with pytest.raises(RuntimeError) as again:
+        robot.send_action({"x.vel": 1, "y.vel": 0, "theta.vel": 0, "lift_axis.vel": 200})
+    assert again.value is caught.value is op.failure
+    assert len(robot.left_bus.events) == before
+    assert robot._safe_shutdown(close_buses=True) == []
+    assert robot.left_bus.registers[("Goal_Velocity", "lift_axis")] == 0
+    assert robot.left_bus.registers[("Torque_Enable", "lift_axis")] == 0
+
+
+def test_operational_idle_span_uses_configured_conversion_without_rounding_up(operating_robot):
+    from dataclasses import replace
+
+    robot, clock = operating_robot
+    robot.lift.cfg = replace(robot.lift.cfg, output_gear_ratio=2)
+    robot.connect(calibrate=False)
+    op = robot._lift_operation
+    for _ in range(8):
+        poll_idle_feedback(robot, clock)
+    origin = op.last_record["present_position_raw"]
+    # 168/4096 mm/count: two counts fit 0.10mm, three do not.
+    poll_idle_feedback(robot, clock, position=origin + 2)
+    op.apply_action({"lift_axis.vel": 0})
+    with pytest.raises(RuntimeError, match="unexpected stationary lift motion"):
+        poll_idle_feedback(robot, clock, position=origin + 3)
+    assert robot._safe_shutdown(close_buses=True) == []
+
+
+def test_operational_idle_span_handles_encoder_wrap_in_new_commanded_idle_episode(qualified_idle):
+    robot, clock = qualified_idle
+    op = robot._lift_operation
+    zero = robot.lift._z0_deg
+    robot.left_bus.bottom = 5000  # Permit fake physical positions up to the encoder wrap.
+    op.apply_action({"lift_axis.vel": 200})
+    poll_idle_feedback(robot, clock, velocity=-200)
+    op.apply_action({"lift_axis.vel": 0})
+    for _ in range(8):
+        poll_idle_feedback(robot, clock, position=4094)
+    anchor = op._last_idle_height
+    for position in [4095, 0, 1, 2, 4094]:  # Four-count span across 4095/0.
+        poll_idle_feedback(robot, clock, position=position)
+        op.apply_action({"lift_axis.vel": 0})
+    assert op.failure is None
+    assert op._last_idle_height == anchor
+    assert robot.lift._z0_deg == zero
+    with pytest.raises(RuntimeError, match="unexpected stationary lift motion"):
+        poll_idle_feedback(robot, clock, position=3)  # Five-count span.
+
+
+def test_operational_idle_span_slow_drift_keeps_anchor_across_zero_and_recovery(
+    qualified_idle, monkeypatch,
+):
+    from lerobot.robots.alohamini.alohamini_host import AM1LocalControl, AM1_LOCAL_CONTROL_KEY
+
+    robot, clock = qualified_idle
+    op = robot._lift_operation
+    origin, anchor = op.last_record["present_position_raw"], op._last_idle_height
+    control = AM1LocalControl()
+    zero = {"x.vel": 0, "y.vel": 0, "theta.vel": 0, "lift_axis.vel": 0}
+    # This fixture has no arms. Their measured hold does not alter lift state;
+    # the real host recovery state machine, stop_motion and lift writes still run.
+    monkeypatch.setattr(robot, "hold_follower_arms", lambda: None)
+    epoch = 0
+    control.apply(robot, {**zero, AM1_LOCAL_CONTROL_KEY: {"version": 1, "mode": "active", "epoch": epoch}})
+    with pytest.raises(RuntimeError, match="unexpected stationary lift displacement") as caught:
+        for offset in range(1, 27):
+            for _ in range(7):  # <=3 counts/window, but whole-idle drift cannot re-anchor.
+                poll_idle_feedback(robot, clock, position=origin - offset)
+                control.apply(robot, {**zero, AM1_LOCAL_CONTROL_KEY: {"version": 1, "mode": "active", "epoch": epoch}})
+                assert op._last_idle_height == anchor
+            if offset % 4 == 0:
+                control.apply(robot, {AM1_LOCAL_CONTROL_KEY: {"version": 1, "mode": "pause", "epoch": epoch + 1}})
+                epoch += 2
+                control.apply(robot, {**zero, AM1_LOCAL_CONTROL_KEY: {"version": 1, "mode": "active", "epoch": epoch}})
+                assert op._last_idle_height == anchor
+    assert offset == 25  # 24*84/4096 <0.5mm; 25*84/4096 >0.5mm.
+    assert op.failure is caught.value
+    assert op.bus.expected_goal == 0
+    assert robot._safe_shutdown(close_buses=True) == []
+
+
+def test_operational_idle_span_velocity_uncertainty_retains_allowance_and_anchor(qualified_idle):
+    robot, clock = qualified_idle
+    op = robot._lift_operation
+    origin, anchor = op.last_record["present_position_raw"], op._last_idle_height
+    for offset in (0, 1, 2):
+        poll_idle_feedback(robot, clock, position=origin + offset, velocity=50)
+    assert op._idle_uncertain
+    for offset in (3, 4, 4, 3, 2, 1, 0):
+        poll_idle_feedback(robot, clock, position=origin + offset)
+        op.apply_action({"lift_axis.vel": 0})
+    assert op.failure is None and not op._idle_uncertain
+    assert op._last_idle_height == anchor
+
+
+def test_operational_idle_span_uncertainty_rejects_five_count_episode(qualified_idle):
+    robot, clock = qualified_idle
+    op = robot._lift_operation
+    origin = op.last_record["present_position_raw"]
+    for offset in (0, 1, 2):
+        poll_idle_feedback(robot, clock, position=origin + offset, velocity=50)
+    poll_idle_feedback(robot, clock, position=origin + 4)
+    with pytest.raises(RuntimeError, match="displaced during stopped-feedback uncertainty"):
+        poll_idle_feedback(robot, clock, position=origin + 5)
+    assert op.bus.expected_goal == 0
+
+
+@pytest.mark.parametrize("phase", ["baseline", "cleanup_readback"])
+def test_operational_idle_allowance_does_not_relax_strict_monitor(qualified_idle, phase):
+    robot, _ = qualified_idle
+    op = robot._lift_operation
+    origin = op.last_record["present_position_raw"]
+    robot.left_bus.read_sequences[("Present_Position", "lift_axis")] = [origin, origin + 2] * 20
+    with pytest.raises(RuntimeError):
+        op.monitor.qualify_stationary(phase, expected_torque=1, expected_goal=0)
+    assert op.bus.expected_goal == 0
+    robot.left_bus.read_sequences[("Present_Position", "lift_axis")] = []
 
 
 @pytest.mark.parametrize("velocity", [-50, 50])
@@ -1044,7 +1208,7 @@ def test_idle_uncertainty_refuses_new_lift_motion_before_any_write(qualified_idl
     assert robot._safe_shutdown(close_buses=True) == []
 
 
-@pytest.mark.parametrize("fault", ["drift", "velocity", "current", "temperature", "status", "transport", "stale"])
+@pytest.mark.parametrize("fault", ["drift", "velocity", "moving", "current", "voltage", "temperature", "status", "transport", "stale"])
 def test_idle_uncertainty_never_defers_real_faults(qualified_idle, fault):
     robot, clock = qualified_idle
     op = robot._lift_operation
@@ -1054,6 +1218,8 @@ def test_idle_uncertainty_never_defers_real_faults(qualified_idle, fault):
     started = clock.now
     if fault == "current":
         robot.left_bus.rest_current = 31  # Synthetic 201.5 mA.
+    elif fault == "voltage":
+        robot.left_bus.registers[("Present_Voltage", "lift_axis")] = 10
     elif fault == "temperature":
         robot.left_bus.registers[("Present_Temperature", "lift_axis")] = 60  # Synthetic sustained heat.
     elif fault == "status":
@@ -1065,13 +1231,16 @@ def test_idle_uncertainty_never_defers_real_faults(qualified_idle, fault):
     with pytest.raises(RuntimeError) as caught:
         for index in range(10 if fault == "temperature" else 3):
             poll_idle_feedback(
-                robot, clock, velocity=-51 if fault == "velocity" else -50,
-                position=origin + index + 1 if fault == "drift" else None,
+                robot, clock,
+                velocity=0 if fault == "moving" else (-51 if fault == "velocity" else -50),
+                moving=1 if fault == "moving" else None,
+                position=origin + index + 5 if fault == "drift" else None,  # Exceeds 0.10mm allowance.
             )
     assert clock.now - started < 0.6  # Never waits out the velocity-uncertainty second.
     assert op.failure is caught.value
     assert op.bus.expected_goal == 0
     robot.left_bus.registers[("Status", "lift_axis")] = 0
+    robot.left_bus.registers[("Present_Voltage", "lift_axis")] = 120
     assert robot._safe_shutdown(close_buses=True) == []
 
 
