@@ -95,7 +95,27 @@ If either identity is missing, duplicated, ambiguous, or attached to the wrong l
 
 ### Lean AM1 local operation and physically proven lift
 
-#### Current status — reliability and scripted workflow integrated (PRs #8/#9)
+#### Current status — supervised teleoperation phase complete
+
+Local teleoperation is reasonably functional for supervised LAN hobby use.
+The latest attended P16 run completed home/relief, 88/88 ArmSmoke, normal cleanup
+and all component/session exits 0. A clean production extraction carries only
+the exercised ordinary lift idle-span correction: 0.10 mm floored through the
+actual conversion, retaining the independent fixed 0.5 mm drift check and all
+strict startup/relief/cleanup and fault checks. P20 is retired without benefit;
+its launcher/code and specialized tracking capture are omitted from production.
+Scripted input remains available as a regression tool, not a replacement for
+ordinary physical-leader use.
+
+Right-elbow small-command tracking remains imperfect but nonblocking. Reopen it
+only if practical manual operation reveals a material usability issue. No new
+recording or general acceptance campaign is required before the separate
+automatic charging-dock phase. Shoulder/arbitrary-pose, camera/display-gap,
+raw-feedback and long-duration/unattended-use limitations remain; home-network
+remediation is external. Exact versions and the one-command/Q/Stop/log reference
+are in the [current unified-session runbook](unified-session.md#current-state--teleoperation-closeout-september-29-2026).
+
+#### Historical integration — reliability and scripted workflow (PRs #8/#9)
 
 The reviewed reliability and scripted-input stack is merged into
 `integrate/am1-local-teleop`, not `main`: PR #8 at
@@ -109,7 +129,7 @@ acceptance was required for integration. The unchanged deployed client/helper,
 motor and camera stay separately pinned; the camera is not made equivalent by
 this merge. Exact identities, fresh versus historical test evidence, operating
 reference, and the narrow tracking follow-up are in the
-[unified-session runbook](unified-session.md#current-integration-and-tracking-status--september-28-2026).
+[unified-session runbook](unified-session.md#historical-integration-and-tracking-status--september-28-2026).
 Keep all accepted physical milestones and the shoulder, camera, raw-feedback,
 long-duration and unattended-use limitations. No gains, motion envelope,
 watchdog, calibration or network setting changed during this closeout.

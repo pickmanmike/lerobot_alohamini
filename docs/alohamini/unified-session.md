@@ -8,7 +8,48 @@ had a maximum browser display gap of `1.138 s`, above the unchanged `500 ms`
 continuity target. Loss of a required view still means release controls, press
 `Q`, and restart only after all owned processes have stopped.
 
-## Current integration and tracking status — September 28, 2026
+## Current state — teleoperation closeout, September 29, 2026
+
+Local teleoperation is reasonably functional for **supervised LAN hobby use**.
+The latest attended P16 run completed home/approximately 10 mm relief, the full
+88/88 ArmSmoke trajectory, normal cleanup and all component/session exits 0.
+This is retained physical evidence, not a new powered acceptance run for this
+source extraction. No further teleoperation commissioning is a prerequisite to
+the separate automatic charging-dock phase; that phase is not implemented here.
+
+Production correction `f99f7e906a0c6fec862e4af3657ed71a492e21fb` extracts only
+the exercised ordinary AM1 idle-span change from diagnostic source `8adf84c9`:
+0.10 mm floored through the actual lift conversion (four counts currently), in
+both local idle-span paths. The independent fixed 0.5 mm whole-idle drift guard
+is retained. Strict startup, homing, relief and cleanup criteria, raw evidence,
+temperature/current/status/transport checks and other models are unchanged.
+This is an operating allowance, not a manufacturer accuracy specification.
+
+The clean production branch starts from integration
+`08fff2fbfaad8841e5a38f9c6da73730cd531164`; its lift monitor and focused test
+file exactly match exercised motor `115badc35a09d1e02b81b532cdfe92f2133892ca`.
+Fresh extraction verification: **218 passed** in the operational-lift,
+lift-relief and motor-feedback test files. Earlier RED/GREEN and physical results
+remain historical. Merge/deployment identities will be recorded after integration.
+
+P20 demonstrated no tracking benefit and is retired. The clean baseline contains
+neither its launcher option nor `arm_gain_trial`, and omits the specialized
+selected-joint capture. PR #10's branch and private evidence remain historical;
+scripted input already integrated through PR #9 remains the regression tool.
+Right-elbow small-signal tracking is incomplete: sampled goal delivery accompanied
+some measured movement and incomplete return. This is a known **nonblocking**
+limitation, not a demand for another recording or commissioning run. Reopen only
+if practical manual use exposes a material usability problem. Keep P16 and the
+existing profile, calibration, gains and limits.
+
+Match the physical leader to the **current** follower pose before ordinary
+startup. Historical shoulder/arbitrary-pose, camera acquisition/browser delivery
+(including the 1.138 s display gap), long-duration and unattended-use limitations
+remain. Network infrastructure remediation is external. See the short
+[everyday reference](#everyday-supervised-use); historical records below are not
+new pending commissioning requirements.
+
+## Historical integration and tracking status — September 28, 2026
 
 PRs #8 and #9 are closed and merged into `integrate/am1-local-teleop`, not
 `main`, in the authorized order. Both are ordinary two-parent merges:
@@ -65,9 +106,9 @@ settling. The final summary provides a later stationary-feedback checkpoint.
 There is no selected-joint goal-register readback in this run; the right-shoulder
 readback cannot substitute for it. Preserve the observed incomplete excursion
 and return without diagnosing reversal, a failed servo or shared deadband.
-Prepare only opt-in, same-owner target/goal/position/current capture before the
-next bounded evidence run. Do not change gains, current limits, calibration,
-profile amplitude/dwell or tracking tolerance.
+That closeout led to the separately retained diagnostic capture. Its tracking
+limitations are now nonblocking as recorded above. Do not change gains, current
+limits, calibration, profile amplitude/dwell or tracking tolerance.
 
 ### Completed scripted follow-up — historical implementation evidence
 
@@ -500,8 +541,23 @@ Prepare unobstructed arm and carriage support; power remains a human action.
 This is ordinary supervised operation, not another required acceptance test:
 
 ```powershell
+Set-Location 'C:\Users\pickm\.codex\worktrees\am1-unified-session\lerobot_alohamini_client'
 .\tools\run_am1_session.ps1 -DurationSeconds 90
 ```
+
+Physical leaders are the default; reuse the existing PnP role map and calibration.
+The configured shared Python environment is selected by the helper; no activation
+or reinstall is required. `-DurationSeconds` accepts 1..1800. For a future
+explicitly attended regression with physical leaders disconnected, use
+`-LeaderSource Scripted -MotionProfile ArmSmoke -DurationSeconds 180` instead.
+Do not add historical P20 or selected-joint capture switches to ordinary use.
+
+Release keys and press **Q** to end normally. The controller then stops the host
+and camera and collects their exact logs. Have safe arm/carriage support ready
+before torque-off. If the foreground controller is unavailable, run
+`.\tools\run_am1_session.ps1 -Stop` in this same directory. Logs are under
+`C:\Users\pickm\AlohaMini1Logs\am1-session-<session-id>\`; collection-only retry is
+`.\tools\run_am1_session.ps1 -CollectOnly -SessionId '<printed-session-id>'`.
 
 The command performs software/source/ownership preflight with no hardware
 access, starts the camera owner, opens the existing authenticated browser URL,
@@ -610,7 +666,11 @@ historical motor/camera acceptance remains separate.
 
 After a complete fresh stopped window, velocity-only uncertainty may requalify
 for at most one second from the last valid window, with position confined to
-one fixed one-count band and lift goal zero. Only a complete new stopped window
+one fixed operational 0.10 mm band (floored through the configured conversion)
+and lift goal zero. Ordinary rolling idle windows use the same allowance; the
+independent fixed 0.5 mm whole-idle displacement reference is not reset by zero
+commands or recovery. Strict startup/relief/cleanup do not use this allowance.
+Only a complete new stopped window
 clears that uncertainty. A requested nonzero lift velocity or height action
 during uncertainty refuses the session rather than queuing motion. Displacement,
 gross velocity, current, temperature, status and transport faults remain stops;
@@ -685,6 +745,9 @@ never kills unrelated Python, camera, or motor processes.
 
 ## Retained limitations and follow-up
 
+- Right-elbow small-signal excursion/return remains incomplete despite sampled
+  goal delivery. P20 did not help; P16 remains. This is nonblocking for closing
+  supervised teleoperation, with no required close-up or repeated profile.
 - A later run synchronized the right shoulder from about +99.069 toward -5.936,
   reaching -1.604 and passing the unchanged gate. Large-offset tracking therefore
   succeeded in that pose. It does not erase the earlier 13.402-unit plateau at a
