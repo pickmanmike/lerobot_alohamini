@@ -107,6 +107,14 @@ its launcher/code and specialized tracking capture are omitted from production.
 Scripted input remains available as a regression tool, not a replacement for
 ordinary physical-leader use.
 
+Clean production PR #11 is merged into `integrate/am1-local-teleop` at
+`43d1622a9395cdc1d1f9acce1090ed3f029f4f7c`, now deployed to the stopped Pi motor
+checkout. PR #10 is closed unmerged as retained diagnostic history. Helper/client
+`0c4f2e7c` and the separate camera `047c4fcf` remain unchanged, with matching
+private pins. Fresh extraction checks: 218 passed, compilation/diff/scope checks
+and focused independent review clear; hardware-free deployment checks passed.
+No powered run or new physical acceptance is claimed here.
+
 Right-elbow small-command tracking remains imperfect but nonblocking. Reopen it
 only if practical manual operation reveals a material usability issue. No new
 recording or general acceptance campaign is required before the separate

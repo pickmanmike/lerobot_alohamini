@@ -30,11 +30,38 @@ The clean production branch starts from integration
 file exactly match exercised motor `115badc35a09d1e02b81b532cdfe92f2133892ca`.
 Fresh extraction verification: **218 passed** in the operational-lift,
 lift-relief and motor-feedback test files. Earlier RED/GREEN and physical results
-remain historical. Merge/deployment identities will be recorded after integration.
+remain historical. Compilation, diff/scope/added-secret-marker checks and focused
+independent read-only review passed. No powered test was run for this extraction.
+
+Production PR **#11 is merged** into `integrate/am1-local-teleop`, not `main`,
+at `43d1622a9395cdc1d1f9acce1090ed3f029f4f7c`. Ordered parents are
+`08fff2fbfaad8841e5a38f9c6da73730cd531164` and
+`4ed2097360b26672b09b93e890017c2161dd9a52`; the merge tree equals the reviewed
+and tested production head. This post-merge identity record is documentation
+only; it does not require another motor deployment or powered check.
+
+| Component | Exact deployed source |
+|---|---|
+| Pi motor, now clean integration source | `43d1622a9395cdc1d1f9acce1090ed3f029f4f7c` |
+| Windows client/session and Pi helper, unchanged | `0c4f2e7ccce3ddcce6d75e7113ed819d07f1d192` |
+| Separate Pi camera, unchanged | `047c4fcf7cbf34684a9b8c348193585938975815` |
+
+The clean, stopped Pi motor checkout was switched non-destructively to the
+integration branch; its diagnostic branch at `115badc3` remains. Compile,
+import-root/policy, host help, Bash syntax and Local `--print-command` checks
+passed without opening hardware. Only the ignored motor-head pin changed, with
+a private backup outside Git; all three pins match their components. Windows
+session help/configuration validation passed. Existing environments, private
+Local configuration, maps, rotations, credentials and raw evidence were retained.
+The preserved helper build still has historical opt-in diagnostic switches;
+they are retired/unsupported with this clean motor and are not ordinary-use
+commands. This deployment does not incorporate the separately pinned camera
+lineage into the integration history.
 
 P20 demonstrated no tracking benefit and is retired. The clean baseline contains
 neither its launcher option nor `arm_gain_trial`, and omits the specialized
-selected-joint capture. PR #10's branch and private evidence remain historical;
+selected-joint capture. PR **#10 is closed unmerged**; its branch and private
+evidence remain historical. PRs #8/#9 remain closed;
 scripted input already integrated through PR #9 remains the regression tool.
 Right-elbow small-signal tracking is incomplete: sampled goal delivery accompanied
 some measured movement and incomplete return. This is a known **nonblocking**
