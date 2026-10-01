@@ -8,6 +8,47 @@ had a maximum browser display gap of `1.138 s`, above the unchanged `500 ms`
 continuity target. Loss of a required view still means release controls, press
 `Q`, and restart only after all owned processes have stopped.
 
+## Windows Control console candidate (not yet physically accepted)
+
+From the reviewed Windows checkout in PowerShell 7, with the existing private
+`config/am1.session.json` and configured Python environment:
+
+```powershell
+.\tools\run_am1_console.ps1
+```
+
+This opens only `http://127.0.0.1:8765/`. Opening or refreshing the browser does
+not start cameras or motors. The private session config must contain an absolute
+`console_camera_auth_file` pointing to a user-only JSON file with `username` and
+`password` for the already-deployed Pi camera viewer; neither file belongs in
+Git. If the port is occupied, the launcher refuses instead of starting a second
+controller. The CLI fallback remains `tools/run_am1_session.ps1` with its
+existing exact-SHA configuration, Stop and CollectOnly modes.
+
+Start on the Control page prepares one ordinary physical-leader Local session.
+The existing Pi owner performs actual camera readiness, one home and approximately
+10 mm relief, nominal 30-second startup alignment, and 10 Hz live forwarding.
+The browser never reads leaders or owns a motor socket. During live use, hold
+W/S/Z/X/A/D for base and U/J for lift; release zeros body input. Leaving Control,
+losing focus or a stale browser lease clears body input and requests measured-arm
+pause. Resume and any exceptional realignment require explicit on-page approval
+and fresh host/follower/leader qualification. Q on Control or Stop from any page
+requests the existing exact-session cleanup. Do not treat a returned Stop request
+as verified shutdown: wait for the final session result. The exact result folder
+is under the private configured `windows_log_directory`, named
+`am1-session-<session-id>`; CollectOnly can retry missing log collection without
+starting hardware.
+
+If a required camera view is unavailable or only a retained image remains,
+release body keys, Pause, then Stop if the view does not promptly recover. Confirm
+the owned session has stopped before reopening the view or starting another
+session; a last frame is not a live driving view. Small right-elbow tracking,
+arbitrary-pose shoulder alignment, intermittent camera acquisition/browser gaps,
+and long-duration or unattended use retain the limitations below. This console
+source has passed offline fake/browser checks, but has not yet had its single
+attended integrated check; the deployed helper and separate camera source must
+be verified and staged before that check.
+
 ## Current state — teleoperation closeout, September 29, 2026
 
 Local teleoperation is reasonably functional for **supervised LAN hobby use**.

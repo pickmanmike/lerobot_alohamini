@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import base64
 import hmac
 import http.client
@@ -10,6 +11,7 @@ import json
 import secrets
 import threading
 import time
+import webbrowser
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -525,3 +527,73 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         self._json(200, result)
 
     do_PUT = do_PATCH = do_DELETE = do_OPTIONS = do_TRACE = do_CONNECT = do_HEAD = lambda self: self._reply(403)
+
+
+def run_console(config_path: Path, *, no_browser: bool = False, session_module=None) -> int:
+    """Open only a loopback viewer/controller; session Start remains explicit."""
+    if session_module is None:
+        from tools import am1_session as session_module
+
+    try:
+        config = session_module.SessionConfig.load(config_path)
+        auth_file = config.console_camera_auth_file
+        if auth_file is None:
+            raise ValueError("private console_camera_auth_file is not configured")
+        repository = Path(__file__).resolve().parents[1]
+        adapter = ConsoleSessionAdapter(config, repository, session_module)
+        server = ConsoleServer(config, auth_file, adapter, ("127.0.0.1", 8765))
+    except (session_module.SessionError, OSError, ValueError) as exc:
+        print(f"AM1 console refused before session start: {exc}")
+        return 2
+    primary_error: BaseException | None = None
+    close_error: BaseException | None = None
+    try:
+        address = f"http://127.0.0.1:{server.server_address[1]}/"
+        print(f"AM1 console: {address} (opening it never starts a robot)", flush=True)
+        if not no_browser:
+            webbrowser.open(address)
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("AM1 console stopping; checking its exact session owner.", flush=True)
+    except BaseException as exc:
+        primary_error = exc
+    finally:
+        try:
+            server.server_close()
+        except BaseException as exc:
+            close_error = exc
+    state = adapter.state()
+    if state["session_id"] is not None and not adapter.wait(0):
+        try:
+            stop = adapter.operation({"kind": "Stop", "session_id": state["session_id"]})
+            stopped = bool(stop.get("accepted")) and adapter.wait(30)
+        except BaseException as exc:
+            stopped = False
+            if primary_error is None:
+                primary_error = exc
+        if not stopped:
+            print("AM1 console exited with session cleanup unverified; use the existing exact-session Stop/Collect fallback.")
+            return 3
+    if primary_error is not None:
+        print(f"AM1 console failed: {type(primary_error).__name__}: {primary_error}")
+    if close_error is not None:
+        print(f"AM1 console listener cleanup also failed: {type(close_error).__name__}: {close_error}")
+    if close_error is not None:
+        return 3
+    if primary_error is not None:
+        return 2
+    if state.get("final_exit_code") not in (None, 0):
+        return int(state["final_exit_code"])
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Loopback AM1 camera and supervised Local control console")
+    parser.add_argument("--config", type=Path, required=True, help="existing private AM1 session configuration")
+    parser.add_argument("--no-browser", action="store_true", help="serve without opening a browser tab")
+    args = parser.parse_args(argv)
+    return run_console(args.config, no_browser=args.no_browser)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

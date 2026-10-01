@@ -523,3 +523,91 @@ $command.arguments | ConvertTo-Json -Compress
     assert arguments[arguments.index("--console_auth_file") + 1] == str(auth)
     assert arguments[arguments.index("--console_session_id") + 1] == "20261001T000000-1234abcd"
     assert "not-a-real-secret" not in result.stdout
+
+
+def test_console_launcher_is_read_only_until_start(monkeypatch, tmp_path):
+    auth = tmp_path / "camera-auth.json"
+    auth.write_text(json.dumps({"username": "test", "password": "fake-only"}), encoding="utf-8")
+    events = []
+    config = SimpleNamespace(console_camera_auth_file=auth, local_state_directory=tmp_path,
+                             browser_url="http://127.0.0.1:1984")
+
+    class FakeServer:
+        server_address = ("127.0.0.1", 8765)
+
+        def __init__(self, config, auth_file, adapter, address):
+            assert auth_file == auth and address == ("127.0.0.1", 8765)
+            events.append("bound")
+
+        def serve_forever(self): events.append("serving")
+        def server_close(self): events.append("closed")
+
+    monkeypatch.setattr(session.SessionConfig, "load", lambda _: config)
+    monkeypatch.setattr(console, "ConsoleServer", FakeServer)
+    monkeypatch.setattr(console, "ConsoleSessionAdapter", lambda *_: SimpleNamespace(
+        state=lambda: {"session_id": None}, wait=lambda _: True))
+    monkeypatch.setattr(console.webbrowser, "open", lambda url: events.append(("browser", url)))
+    monkeypatch.setattr(session, "run_start", lambda *_a, **_kw: pytest.fail("page open must not start a session"))
+    assert console.run_console(tmp_path / "config.json", session_module=session) == 0
+    assert events == ["bound", ("browser", "http://127.0.0.1:8765/"), "serving", "closed"]
+
+
+def test_console_port_collision_refuses_without_browser_or_session(monkeypatch, tmp_path):
+    auth = tmp_path / "auth"
+    auth.write_text("{}", encoding="utf-8")
+    config = SimpleNamespace(console_camera_auth_file=auth)
+    monkeypatch.setattr(session.SessionConfig, "load", lambda _: config)
+    monkeypatch.setattr(console, "ConsoleSessionAdapter", lambda *_: object())
+    monkeypatch.setattr(console, "ConsoleServer", lambda *_a, **_kw: (_ for _ in ()).throw(OSError("in use")))
+    monkeypatch.setattr(console.webbrowser, "open", lambda _: pytest.fail("collision must not open browser"))
+    assert console.run_console(tmp_path / "config.json", session_module=session) == 2
+
+
+def test_console_server_fault_requests_exact_stop_before_exit(monkeypatch, tmp_path):
+    identity = "20261001T000000-1234abcd"
+    events = []
+    config = SimpleNamespace(console_camera_auth_file=tmp_path / "auth")
+
+    class FakeServer:
+        server_address = ("127.0.0.1", 8765)
+        def __init__(self, *_): pass
+        def serve_forever(self): raise RuntimeError("server fault")
+        def server_close(self): events.append("closed")
+
+    class FakeAdapter:
+        def __init__(self, *_): self.stopped = False
+        def state(self): return {"session_id": identity}
+        def wait(self, _): return self.stopped
+        def operation(self, payload):
+            events.append(payload)
+            self.stopped = True
+            return {"accepted": True}
+
+    monkeypatch.setattr(session.SessionConfig, "load", lambda _: config)
+    monkeypatch.setattr(console, "ConsoleServer", FakeServer)
+    monkeypatch.setattr(console, "ConsoleSessionAdapter", FakeAdapter)
+    assert console.run_console(tmp_path / "config.json", no_browser=True, session_module=session) == 2
+    assert events == ["closed", {"kind": "Stop", "session_id": identity}]
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="PowerShell 7 unavailable")
+def test_powershell_console_command_uses_configured_python_without_start(tmp_path):
+    helper = ROOT / "tools" / "run_am1_console.ps1"
+    auth = tmp_path / "private-auth.json"
+    auth.write_text("{}", encoding="utf-8")
+    config = tmp_path / "session.json"
+    config.write_text(json.dumps({"windows_python": sys.executable,
+                                  "console_camera_auth_file": str(auth)}), encoding="utf-8")
+    script = f"""
+. '{str(helper).replace("'", "''")}'
+$command = New-Am1ConsoleCommand -ConfigPath '{str(config).replace("'", "''")}' -NoBrowser
+$command | ConvertTo-Json -Compress
+"""
+    result = subprocess.run([shutil.which("pwsh"), "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                            cwd=ROOT, capture_output=True, text=True, timeout=20, check=False)
+    assert result.returncode == 0, result.stderr
+    command = json.loads(result.stdout.splitlines()[-1])
+    assert command["executable"] == sys.executable
+    assert command["arguments"][:2] == ["-m", "tools.am1_console"]
+    assert "--no-browser" in command["arguments"]
+    assert not any("session start" in str(arg) for arg in command["arguments"])
