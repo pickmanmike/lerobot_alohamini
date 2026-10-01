@@ -5,6 +5,8 @@ from __future__ import annotations
 import importlib.util
 import json
 import re
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -382,3 +384,142 @@ def test_unknown_cleanup_not_stopped(monkeypatch, tmp_path):
     monkeypatch.setattr(session, "request_stop", lambda *args, **kwargs: stop_calls.append((args, kwargs)) or 0)
     assert adapter.operation({"kind": "Stop", "session_id": session_id})["accepted"] is False
     assert stop_calls == []
+
+
+def test_console_body_has_one_token_epoch_and_sequence(monkeypatch, tmp_path):
+    from examples.alohamini.am1_console_bridge import AM1ConsoleInputState
+
+    session_id = "20261001T000000-1234abcd"
+    finish = threading.Event()
+    created = []
+
+    class FakeBridge:
+        pipe_name = r"\\.\pipe\fake-am1"
+        auth_file = tmp_path / "auth"
+
+        def __init__(self, identity, directory, token):
+            assert identity == session_id and directory == tmp_path
+            self.state = AM1ConsoleInputState(identity, token)
+            self.closed = False
+            created.append(self)
+
+        def browser_keys(self, *, token, epoch, seq, keys, active):
+            return self.state.browser_keys(token=token, epoch=epoch, seq=seq, keys=keys, active=active, now=1.0)
+
+        def snapshot(self):
+            return {"input_epoch": self.state.epoch, "input_lease": self.state.lease(now=1.0)["valid"],
+                    "pending_gate": self.state.pending_gate}
+
+        def close(self):
+            self.closed = True
+
+    def fake_start(_repo, _config, _duration, **kwargs):
+        kwargs["console_prepare"](session_id)
+        kwargs["on_session_created"](session_id)
+        finish.wait(2)
+        return 0
+
+    monkeypatch.setattr(session, "run_start", fake_start)
+    adapter = console.ConsoleSessionAdapter(SimpleNamespace(local_state_directory=tmp_path), ROOT, session,
+                                            bridge_factory=FakeBridge)
+    try:
+        result = adapter.operation({"kind": "Start", "duration_seconds": 10})
+        token = result["control_token"]
+        assert len(created) == 1
+        assert adapter.operation({"kind": "Start", "duration_seconds": 10}).get("control_token") is None
+        assert not adapter.body_input({"session_id": session_id, "control_token": "wrong", "epoch": 1,
+                                       "seq": 1, "keys": ["w"], "active": True})["accepted"]
+        assert adapter.body_input({"session_id": session_id, "control_token": token, "epoch": 1,
+                                   "seq": 1, "keys": ["w"], "active": True})["accepted"]
+        assert not adapter.body_input({"session_id": session_id, "control_token": token, "epoch": 1,
+                                       "seq": 1, "keys": ["u"], "active": True})["accepted"]
+        assert adapter.state()["input_lease"] is True
+    finally:
+        finish.set()
+        adapter.wait(3)
+    assert created[0].closed
+
+
+def test_bridge_cleanup_failure_retains_primary_session_error(monkeypatch, tmp_path):
+    session_id = "20261001T000000-1234abcd"
+
+    class BrokenBridge:
+        pipe_name = r"\\.\pipe\fake-am1"
+        auth_file = tmp_path / "auth"
+
+        def __init__(self, *_): pass
+        def close(self): raise OSError("pipe close failed")
+        def snapshot(self): return {"input_epoch": 1, "input_lease": False}
+
+    def fake_start(_repo, _config, _duration, **kwargs):
+        kwargs["console_prepare"](session_id)
+        kwargs["on_session_created"](session_id)
+        raise RuntimeError("original startup failure")
+
+    monkeypatch.setattr(session, "run_start", fake_start)
+    adapter = console.ConsoleSessionAdapter(SimpleNamespace(local_state_directory=tmp_path), ROOT, session,
+                                            bridge_factory=BrokenBridge)
+    adapter.operation({"kind": "Start", "duration_seconds": 10})
+    assert adapter.wait(3)
+    state = adapter.state()
+    assert "original startup failure" in state["error"]
+    assert "pipe close failed" in state["error"]
+    assert state["phase"] == "cleanup_unknown"
+
+
+def test_native_client_launch_receives_pipe_paths_not_auth_secret(monkeypatch, tmp_path):
+    commands = []
+
+    class Process:
+        pid = 123
+
+        def poll(self):
+            return 0
+
+        def wait(self, timeout=None):
+            return 0
+
+    def popen(command, **kwargs):
+        commands.append(command)
+        return Process()
+
+    monkeypatch.setattr(session.subprocess, "Popen", popen)
+    monkeypatch.setattr(session.shutil, "which", lambda _: "pwsh")
+    config = SimpleNamespace(local_config=tmp_path / "am1.local.json")
+    log_path = tmp_path / "client.log"
+    log_path.write_text("AM1_CLIENT_EXIT_CODE=0\n", encoding="utf-8")
+    client = session.WindowsClient(ROOT, config, lambda: None, tmp_path / "stop",
+                                   console_pipe=r"\\.\pipe\private", console_auth_file=tmp_path / "auth",
+                                   console_session_id="20261001T000000-1234abcd")
+    assert client.run(duration_seconds=10, log_path=log_path, stop_requested=lambda: False) == 0
+    command = commands[0]
+    assert command[command.index("-ConsolePipe") + 1] == r"\\.\pipe\private"
+    assert command[command.index("-ConsoleAuthFile") + 1] == str(tmp_path / "auth")
+    assert command[command.index("-ConsoleSessionId") + 1] == "20261001T000000-1234abcd"
+    assert "private-test-value" not in " ".join(command)
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="PowerShell 7 unavailable")
+def test_local_powershell_command_passes_console_pipe_only_when_requested(tmp_path):
+    auth = tmp_path / "private.auth"
+    auth.write_text("not-a-real-secret", encoding="utf-8")
+    helper = ROOT / "tools" / "run_am1.ps1"
+    example = ROOT / "config" / "am1.local.example.json"
+    script = f"""
+. '{str(helper).replace("'", "''")}'
+$config = Get-Content -LiteralPath '{str(example).replace("'", "''")}' -Raw | ConvertFrom-Json
+$command = New-Am1WindowsCommand -Mode Local -Config $config -RepositoryRoot '{str(ROOT).replace("'", "''")}' `
+ -LeftPort 'COM8' -RightPort 'COM7' -LocalDurationSeconds 10 `
+ -StopRequestPath '{str(tmp_path / "stop").replace("'", "''")}' `
+ -ConsolePipe '\\\\.\\pipe\\am1-test' -ConsoleAuthFile '{str(auth).replace("'", "''")}' `
+ -ConsoleSessionId '20261001T000000-1234abcd'
+$command.arguments | ConvertTo-Json -Compress
+"""
+    result = subprocess.run([shutil.which("pwsh"), "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                            cwd=ROOT, capture_output=True, text=True, timeout=20, check=False)
+    assert result.returncode == 0, result.stderr
+    arguments = json.loads(result.stdout.splitlines()[-1])
+    assert arguments[arguments.index("--console_pipe") + 1] == r"\\.\pipe\am1-test"
+    assert arguments[arguments.index("--console_auth_file") + 1] == str(auth)
+    assert arguments[arguments.index("--console_session_id") + 1] == "20261001T000000-1234abcd"
+    assert "not-a-real-secret" not in result.stdout

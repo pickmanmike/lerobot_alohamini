@@ -19,10 +19,15 @@ from urllib.parse import parse_qs, urlsplit
 class ConsoleSessionAdapter:
     """One console-facing adapter around the existing local session owner."""
 
-    def __init__(self, config, repository: Path, session_module):
+    def __init__(self, config, repository: Path, session_module, *, bridge_factory=None):
+        if bridge_factory is None:
+            from examples.alohamini.am1_console_bridge import AM1ConsoleBridgeServer
+
+            bridge_factory = AM1ConsoleBridgeServer
         self.config = config
         self.repository = repository
         self.session_module = session_module
+        self.bridge_factory = bridge_factory
         self._lock = threading.Lock()
         self._created = threading.Event()
         self._worker: threading.Thread | None = None
@@ -32,6 +37,8 @@ class ConsoleSessionAdapter:
         self._error: str | None = None
         self._events = deque(maxlen=128)
         self._event_sink = None
+        self._bridge = None
+        self._control_token: str | None = None
 
     def set_event_sink(self, sink):
         self._event_sink = sink
@@ -54,6 +61,12 @@ class ConsoleSessionAdapter:
         self._created.set()
         self._emit({"event": "session_created", "session_id": session_id})
 
+    def _prepare_console(self, session_id: str):
+        bridge = self.bridge_factory(session_id, self.config.local_state_directory, self._control_token)
+        with self._lock:
+            self._bridge = bridge
+        return bridge.pipe_name, bridge.auth_file
+
     def _gate(self, stage, evidence, cancel):
         # Prepared Start is the operator's approval for ordinary qualified
         # progression; actual camera/host events still must precede each gate.
@@ -65,6 +78,7 @@ class ConsoleSessionAdapter:
                 self.repository, self.config, duration,
                 leader_source=leader_source, motion_profile=motion_profile,
                 gate=self._gate, emit=self._emit, on_session_created=self._on_created,
+                console_prepare=self._prepare_console,
             )
             with self._lock:
                 self._final_exit_code = result
@@ -75,13 +89,27 @@ class ConsoleSessionAdapter:
                 self._phase = "failed"
             self._emit({"event": "session_error", "reason": self._error})
         finally:
+            bridge = self._bridge
+            if bridge is not None:
+                try:
+                    bridge.close()
+                except BaseException as exc:
+                    with self._lock:
+                        cleanup_note = f"pipe cleanup also failed: {type(exc).__name__}: {exc}"
+                        self._error = f"{self._error}; {cleanup_note}" if self._error else cleanup_note
+                        self._phase = "cleanup_unknown"
+                self._bridge = None
             self._created.set()
 
     def state(self):
         with self._lock:
-            return {"session_id": self._session_id, "phase": self._phase,
+            state = {"session_id": self._session_id, "phase": self._phase,
                     "final_exit_code": self._final_exit_code, "error": self._error,
                     "events": list(self._events)}
+            bridge = self._bridge
+        if bridge is not None:
+            state.update(bridge.snapshot())
+        return state
 
     def wait(self, timeout: float) -> bool:
         worker = self._worker
@@ -107,6 +135,7 @@ class ConsoleSessionAdapter:
                 self._session_id = None
                 self._final_exit_code = None
                 self._error = None
+                self._control_token = secrets.token_hex(32)
                 self._phase = "starting"
                 self._worker = threading.Thread(target=self._run, args=(duration, leader_source, motion_profile),
                                                 name="am1-console-session", daemon=False)
@@ -115,7 +144,9 @@ class ConsoleSessionAdapter:
                 return {"accepted": False, "phase": "starting", "reason": "session identity not yet established"}
             state = self.state()
             return {"accepted": state["session_id"] is not None, "session_id": state["session_id"],
-                    "phase": state["phase"], "error": state["error"]}
+                    "phase": state["phase"], "error": state["error"],
+                    "control_token": self._control_token if state["session_id"] is not None else None,
+                    "input_epoch": state.get("input_epoch")}
         if kind == "Stop":
             expected = payload.get("session_id")
             with self._lock:
@@ -131,18 +162,54 @@ class ConsoleSessionAdapter:
                 return {"accepted": False, "reason": str(exc)}
             self._emit({"event": "stop_requested", "session_id": expected})
             return {"accepted": True, "session_id": expected, "phase": "stopping"}
-        return {"accepted": False, "reason": "operation not yet connected"}
+        if kind in {"Pause", "Resume", "Approve", "ClaimInput"}:
+            expected = payload.get("session_id")
+            with self._lock:
+                current, bridge, token, worker = self._session_id, self._bridge, self._control_token, self._worker
+            if expected != current or bridge is None or worker is None or not worker.is_alive():
+                return {"accepted": False, "reason": "active session identity is unavailable"}
+            if kind == "ClaimInput":
+                if bridge.snapshot().get("input_lease"):
+                    return {"accepted": False, "reason": "the current input owner is still live"}
+                new_token = secrets.token_hex(32)
+                epoch = bridge.claim(new_token)
+                with self._lock:
+                    self._control_token = new_token
+                self._emit({"event": "input_claimed", "session_id": expected, "input_epoch": epoch})
+                return {"accepted": True, "session_id": expected, "control_token": new_token,
+                        "input_epoch": epoch, "phase": "paused"}
+            if payload.get("control_token") != token:
+                return {"accepted": False, "reason": "input owner token mismatch"}
+            if kind == "Pause":
+                bridge.request_pause("operator")
+                self._emit({"event": "pause_requested", "session_id": expected})
+                return {"accepted": True, "phase": "pausing"}
+            stage = "resume" if kind == "Resume" else "realign"
+            host_epoch = payload.get("host_epoch")
+            if host_epoch is not None and type(host_epoch) is not int:
+                return {"accepted": False, "reason": "host epoch is invalid"}
+            accepted = bridge.approve(stage, host_epoch=host_epoch, token=token)
+            return {"accepted": accepted, "phase": "resume_pending" if accepted else "approval_refused"}
+        return {"accepted": False, "reason": "operation is unavailable"}
 
     def body_input(self, payload):
-        return {"accepted": False, "reason": "body input not yet connected"}
+        with self._lock:
+            bridge, session_id, token, worker = self._bridge, self._session_id, self._control_token, self._worker
+        if bridge is None or worker is None or not worker.is_alive() or payload.get("session_id") != session_id:
+            return {"accepted": False, "reason": "no matching active session"}
+        if payload.get("control_token") != token:
+            return {"accepted": False, "reason": "input owner token mismatch"}
+        accepted = bridge.browser_keys(token=token, epoch=payload.get("epoch"), seq=payload.get("seq"),
+                                       keys=payload.get("keys"), active=payload.get("active"))
+        return {"accepted": accepted, "input_epoch": bridge.snapshot()["input_epoch"]}
 
 
 MAX_POST_BYTES = 4096
 CAMERA_ROLES = frozenset({"forward", "backward", "chest", "wrist_left", "wrist_right"})
 CAMERA_ASSETS = frozenset({"app.js", "freshness.js", "mjpeg.js", "style.css"})
 CONSOLE_ASSETS = frozenset({"app.js", "style.css"})
-ALLOWED_OPERATIONS = frozenset({"Start", "Pause", "Resume", "Stop", "Approve"})
-ALLOWED_BODY_KEYS = frozenset("WSZXADUJT G".replace(" ", ""))
+ALLOWED_OPERATIONS = frozenset({"Start", "Pause", "Resume", "Stop", "Approve", "ClaimInput"})
+ALLOWED_BODY_KEYS = frozenset("wszxadujtg")
 COOKIE_NAME = "am1_console"
 
 

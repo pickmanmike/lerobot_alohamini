@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import sys
 import threading
 import time
@@ -42,6 +43,7 @@ from leader_client_utils import (
     resolve_leader_ports,
 )
 from scripted_leader import ScriptedLeaderInput
+from am1_console_bridge import AM1ConsoleBridgeClient
 
 
 AM1_ARM_POSITION_KEYS = (
@@ -1248,6 +1250,8 @@ def run_startup_sync(
     enter_confirmation: bool = False,
     confirmation_prompt: str | None = None,
     cancel_check: Callable[[], None] | None = None,
+    confirmation_gate: Callable[[str], bool] | None = None,
+    gate_stage: str = "sync_start",
 ) -> tuple[dict[str, float], dict[str, Any], float]:
     print("HOLD LEADERS STILL — STARTUP SYNCHRONIZATION IN PROGRESS")
     initial_observation = get_fresh_follower_observation(
@@ -1275,13 +1279,17 @@ def run_startup_sync(
     _print_startup_sync_plan(preliminary_plan, label="Preliminary")
     _print_startup_sync_safety_instructions()
     if enter_confirmation:
-        require_enter_confirmation(
-            input_fn,
-            confirmation_prompt or (
-                "CONFIRMATION 2/3 — Hold both leaders still and press Enter only to begin the nominal "
-                "30-second arm synchronization."
-            ),
-        )
+        if confirmation_gate is not None:
+            if not confirmation_gate(gate_stage):
+                raise SafetyRefusal(f"console {gate_stage} approval was not received")
+        else:
+            require_enter_confirmation(
+                input_fn,
+                confirmation_prompt or (
+                    "CONFIRMATION 2/3 — Hold both leaders still and press Enter only to begin the nominal "
+                    "30-second arm synchronization."
+                ),
+            )
     elif input_fn("Type exactly SYNC and press Enter to begin follower motion: ") != "SYNC":
         raise SafetyRefusal("startup synchronization requires the operator to type exactly SYNC")
 
@@ -1588,6 +1596,9 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Use the supervised Local session's three deliberate Enter-only startup confirmations",
     )
+    parser.add_argument("--console_pipe", help="Private Windows input pipe for the optional AM1 console")
+    parser.add_argument("--console_auth_file", type=Path, help="Private local pipe authentication file")
+    parser.add_argument("--console_session_id", help="Exact owning AM1 console session identity")
     parser.add_argument(
         "--robot.remote_ip",
         "--remote_ip",
@@ -1653,6 +1664,16 @@ def parse_args(
             parser.error(
                 "--unified_session_enter_confirmations requires --local_mode and --external_stop_file"
             )
+    console_values = (args.console_pipe, args.console_auth_file, args.console_session_id)
+    if any(value is not None for value in console_values):
+        if not all(value is not None for value in console_values):
+            parser.error("console input requires pipe, auth file and exact session identity together")
+        if not args.local_mode or not args.unified_session_enter_confirmations:
+            parser.error("console input requires the unified AM1 Local workflow")
+        if not args.console_pipe.startswith(r"\\.\pipe\am1-") or not args.console_auth_file.is_absolute():
+            parser.error("console input requires a private AM1 pipe and absolute auth-file path")
+        if not re.fullmatch(r"[0-9]{8}T[0-9]{6}-[0-9a-f]{8}", args.console_session_id):
+            parser.error("console session identity is invalid")
     if args.fps <= 0:
         parser.error("--fps must be greater than zero")
     if args.duration_s < 0:
@@ -2083,6 +2104,9 @@ def _run_am1_recovering_local_sender(
     sample_callback: Callable[[AM1LiveSample, Mapping[str, float | int]], None] | None,
     announce_active: Callable[[], None] | None,
     scripted_input: ScriptedLeaderInput | None = None,
+    control_pause_requested: Callable[[], bool] | None = None,
+    manual_gate: Callable[[int | None], bool] | None = None,
+    on_host_active: Callable[[], None] | None = None,
 ) -> str | None:
     """Unified Local only: a host-acknowledged hold while feedback recovers."""
     try:
@@ -2141,6 +2165,7 @@ def _run_am1_recovering_local_sender(
     unusable_since: float | None = None
     body_released = False
     manual_required = False
+    console_manual_required = False
     manual_responses: list[tuple[str, Any, float, int | None]] = []
     manual_ready = threading.Event()
     manual_requested = False
@@ -2169,13 +2194,23 @@ def _run_am1_recovering_local_sender(
         if manual_requested:
             return
         manual_requested = True
-        print("RESUME-NEEDS-ENTER — release body keys, hold leaders still, then press Enter only.", flush=True)
+        print(
+            "RESUME-NEEDS-APPROVAL — release body keys, hold leaders still, then approve in the console."
+            if manual_gate is not None else
+            "RESUME-NEEDS-ENTER — release body keys, hold leaders still, then press Enter only.",
+            flush=True,
+        )
         print(json.dumps({"event": "am1_local_resume_input_requested", "epoch": pause_epoch_seen,
                           "wall_time_ns": wall_time_ns()}, sort_keys=True), flush=True)
 
         def read_enter() -> None:
             try:
-                response = ("value", input_fn(""), monotonic())
+                if manual_gate is not None:
+                    if not manual_gate(pause_epoch_seen):
+                        raise SafetyRefusal("console Resume approval was not received")
+                    response = ("value", "", monotonic())
+                else:
+                    response = ("value", input_fn(""), monotonic())
             except BaseException as exc:
                 response = ("error", exc, monotonic())
             try:
@@ -2234,6 +2269,10 @@ def _run_am1_recovering_local_sender(
                 break
             body_action = validate_am1_local_body_action(body_action_supplier())
             state, epoch, pause_started_at, pause_reason = sender.recovery_snapshot()
+            if control_pause_requested is not None and control_pause_requested() and state == "active":
+                console_manual_required = True
+                sender.request_pause("console input lease lost or operator paused")
+                state, epoch, pause_started_at, pause_reason = sender.recovery_snapshot()
             if state != "active" or not initial_active_ack:
                 freeze_script()
             if state == "active" and initial_active_ack:
@@ -2257,7 +2296,7 @@ def _run_am1_recovering_local_sender(
                 qualified_at = None
                 unusable_since = pause_started_at
                 body_released = False
-                manual_required = False
+                manual_required = console_manual_required
                 manual_responses.clear()
                 manual_ready.clear()
                 manual_requested = False
@@ -2351,9 +2390,12 @@ def _run_am1_recovering_local_sender(
                     if _max_am1_arm_difference(sample.arm_target, initial_arm_target) > 0:
                         sender.enable_initial_catchup()
                     sender.mark_live_admitted()
+                    if on_host_active is not None:
+                        on_host_active()
                     if announce_active is not None:
                         announce_active()
                     initial_active_ack = True
+                    console_manual_required = False
                     if scripted_input is not None:
                         scripted_input.admit(monotonic())
                         scripted_clock_active = True
@@ -2389,6 +2431,8 @@ def _run_am1_recovering_local_sender(
                     if not initial_active_ack:
                         qualify_initial_active_ack(sample)
                     sender.acknowledge_resume(observed_at=sample.observed_at)
+                    if on_host_active is not None:
+                        on_host_active()
                     recovery_count += 1
                     if not initial_active_ack:
                         sender.mark_live_admitted()
@@ -2469,7 +2513,8 @@ def _run_am1_recovering_local_sender(
                 report_manual_input()
                 kind, value, entered_at, _ = manual_responses[0]
                 if kind == "error":
-                    raise SafetyRefusal(f"AM1 Local recovery Enter failed: {value}")
+                    approval_name = "console approval" if manual_gate is not None else "Enter"
+                    raise SafetyRefusal(f"AM1 Local recovery {approval_name} failed: {value}")
                 if value != "":
                     raise SafetyRefusal("AM1 Local recovery requires Enter only")
                 if not all(float(value) == 0.0 for value in body_action.values()):
@@ -2572,6 +2617,9 @@ def run_am1_live_sender(
     input_fn: Callable[[str], str] = input,
     announce_active: Callable[[], None] | None = None,
     scripted_input: ScriptedLeaderInput | None = None,
+    control_pause_requested: Callable[[], bool] | None = None,
+    manual_gate: Callable[[int | None], bool] | None = None,
+    on_host_active: Callable[[], None] | None = None,
 ) -> str | None:
     """Read devices on the caller thread while a private worker sends live actions."""
     approved_target = extract_am1_arm_positions(
@@ -2630,6 +2678,8 @@ def run_am1_live_sender(
             wall_time_ns=wall_time_ns, sleep_fn=sleep_fn, should_stop=should_stop,
             body_action_supplier=body_action_supplier, input_fn=input_fn,
             sample_callback=sample_callback, announce_active=announce_active, scripted_input=scripted_input,
+            control_pause_requested=control_pause_requested, manual_gate=manual_gate,
+            on_host_active=on_host_active,
         )
     if scripted_input is not None:
         raise SafetyRefusal("scripted input requires the acknowledged Local recovery path")
@@ -2840,6 +2890,7 @@ def run_teleoperation(
     scripted_input: ScriptedLeaderInput | None = None
     scripted_stop_reason = "fault"
     arm_input_ready = False
+    console_input: AM1ConsoleBridgeClient | None = None
 
     def external_stop_requested() -> bool:
         return external_stop_path is not None and external_stop_path.exists()
@@ -2849,6 +2900,8 @@ def run_teleoperation(
             raise ExternalStopRequested("external Local stop requested")
 
     def stop_aware_input(prompt: str) -> str:
+        if console_input is not None:
+            raise SafetyRefusal("console mode cannot read a terminal approval")
         if external_stop_path is None:
             return input_fn(prompt)
         return wait_for_input_or_stop(input_fn, prompt, external_stop_requested)
@@ -2860,6 +2913,13 @@ def run_teleoperation(
 
     try:
         raise_if_external_stop_requested()
+        if getattr(args, "console_pipe", None) is not None:
+            console_input = AM1ConsoleBridgeClient(
+                args.console_pipe, args.console_auth_file, args.console_session_id,
+            )
+            console_input.connect()
+            if not console_input.is_connected:
+                raise SafetyRefusal("authenticated AM1 console input bridge is unavailable")
         if not args.no_robot:
             robot = AlohaMiniClient(make_robot_config(args))
             if getattr(args, "unified_session_enter_confirmations", False):
@@ -2961,6 +3021,8 @@ def run_teleoperation(
                             raise_if_external_stop_requested
                             if getattr(args, "unified_session_enter_confirmations", False) else None
                         ),
+                        **({"confirmation_gate": lambda stage: console_input.wait_gate(
+                            stage, cancel=external_stop_requested)} if console_input is not None else {}),
                     )
                     print("SYNCHRONIZATION COMPLETE")
                     if args.startup_sync_only:
@@ -2970,8 +3032,11 @@ def run_teleoperation(
                 return 2
 
         if not args.no_keyboard:
-            keyboard = KeyboardTeleop(KeyboardTeleopConfig(id="my_laptop_keyboard"))
-            keyboard.connect()
+            if console_input is not None:
+                keyboard = console_input
+            else:
+                keyboard = KeyboardTeleop(KeyboardTeleopConfig(id="my_laptop_keyboard"))
+                keyboard.connect()
             keyboard_connected = keyboard.is_connected
             raise_if_external_stop_requested()
             if not keyboard_connected:
@@ -2987,7 +3052,11 @@ def run_teleoperation(
                 robot.send_action(make_zero_action())
             _print_connection_summary(args)
             if args.robot_model == "alohamini1":
-                if getattr(args, "unified_session_enter_confirmations", False):
+                if console_input is not None:
+                    if not console_input.wait_gate("live_start", cancel=external_stop_requested):
+                        print("SAFETY REFUSAL: console live-start approval was not received")
+                        return 2
+                elif getattr(args, "unified_session_enter_confirmations", False):
                     try:
                         require_enter_confirmation(
                             stop_aware_input,
@@ -3032,6 +3101,9 @@ def run_teleoperation(
                                 "and press Enter once to run one bounded synchronization."
                             ),
                             cancel_check=raise_if_external_stop_requested,
+                            **({"confirmation_gate": lambda stage: console_input.wait_gate(
+                                stage, cancel=external_stop_requested), "gate_stage": "realign"}
+                               if console_input is not None else {}),
                         )
                         print("REALIGNMENT COMPLETE — rechecking current follower and leader positions.", flush=True)
                         pending_arm_action, pending_observation, pending_observed_at = run_alignment_gate(
@@ -3190,6 +3262,11 @@ def run_teleoperation(
                     input_fn=input_fn,
                     announce_active=announce_unified_active if unified_live else None,
                     **({"scripted_input": scripted_input} if scripted_mode else {}),
+                    **({"control_pause_requested": console_input.pause_requested,
+                        "manual_gate": lambda epoch: console_input.wait_gate(
+                            "resume", host_epoch=epoch, cancel=external_stop_requested),
+                        "on_host_active": console_input.note_live_admitted}
+                       if console_input is not None else {}),
                 )
                 if scripted_mode:
                     scripted_stop_reason = "manual_q" if live_result == "operator_stop" else live_result
@@ -3272,6 +3349,8 @@ def run_teleoperation(
             _attempt_cleanup(cleanup_errors, "final robot zero command", lambda: robot.send_action(make_zero_action()))
         if keyboard_connected:
             _attempt_cleanup(cleanup_errors, "keyboard disconnect", keyboard.disconnect)
+        elif console_input is not None:
+            _attempt_cleanup(cleanup_errors, "console input disconnect", console_input.disconnect)
         if right_leader_connected:
             _attempt_cleanup(cleanup_errors, "right leader disconnect", leader.right_arm.disconnect)
         if left_leader_connected:

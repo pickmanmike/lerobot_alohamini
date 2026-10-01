@@ -1257,8 +1257,18 @@ class WindowsClient:
         *,
         leader_source: str = "physical",
         motion_profile: str | None = None,
+        console_pipe: str | None = None,
+        console_auth_file: Path | None = None,
+        console_session_id: str | None = None,
     ) -> None:
         self._leader_arguments = _leader_launch_arguments(leader_source, motion_profile)
+        if any(value is not None for value in (console_pipe, console_auth_file, console_session_id)) and not all(
+            value is not None for value in (console_pipe, console_auth_file, console_session_id)
+        ):
+            raise SessionError("Console client pipe, auth file and exact session ID must be supplied together.")
+        self.console_pipe = console_pipe
+        self.console_auth_file = console_auth_file
+        self.console_session_id = console_session_id
         self.repository = repository
         self.config = config
         self.remote_fault = remote_fault
@@ -1321,6 +1331,10 @@ class WindowsClient:
             "-DurationSeconds", str(duration_seconds), "-LogPath", str(log_path),
             "-StopRequestPath", str(self.stop_request_path),
         ] + self._leader_arguments
+        if self.console_pipe is not None:
+            command += ["-ConsolePipe", self.console_pipe,
+                        "-ConsoleAuthFile", str(self.console_auth_file),
+                        "-ConsoleSessionId", self.console_session_id]
         creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
         process = subprocess.Popen(command, cwd=self.repository, creationflags=creationflags)
         self._cleanup_status = {
@@ -1578,6 +1592,7 @@ def _run_start_locked(
     gate: Callable[[str, dict[str, Any], Callable[[], bool]], bool] | None = None,
     emit: Callable[[dict[str, Any]], None] | None = None,
     on_session_created: Callable[[str], None] | None = None,
+    console_prepare: Callable[[str], tuple[str, Path]] | None = None,
 ) -> int:
     validate_leader_selection(leader_source, motion_profile)
     active_path = _active_path(config)
@@ -1594,6 +1609,7 @@ def _run_start_locked(
         raise AssertionError("generated invalid session identity")
     session_directory = config.windows_log_directory / f"am1-session-{session_id}"
     session_directory.mkdir(mode=0o700)
+    console_pipe, console_auth_file = console_prepare(session_id) if console_prepare is not None else (None, None)
     stop_request = config.local_state_directory / f"stop-{session_id}"
     client_log = session_directory / f"am1-local-windows-{session_id}.log"
     _write_active(
@@ -1615,7 +1631,13 @@ def _run_start_locked(
     print("AM1 session phase: starting bounded source and ownership preflight.", flush=True)
     remote = SSHRemote(config, session_id, session_directory)
     selection = {"leader_source": leader_source, "motion_profile": motion_profile} if leader_source == "scripted" else {}
-    client = WindowsClient(repository, config, remote.fault, stop_request, **selection)
+    console_selection = (
+        {"console_pipe": console_pipe, "console_auth_file": console_auth_file,
+         "console_session_id": session_id}
+        if console_pipe is not None else {}
+    )
+    client = WindowsClient(repository, config, remote.fault, stop_request,
+                           **selection, **console_selection)
     def record_hardware_cleanup(outcome: SessionOutcome) -> None:
         _write_active(
             config,
@@ -1686,6 +1708,7 @@ def run_start(
     gate: Callable[[str, dict[str, Any], Callable[[], bool]], bool] | None = None,
     emit: Callable[[dict[str, Any]], None] | None = None,
     on_session_created: Callable[[str], None] | None = None,
+    console_prepare: Callable[[str], tuple[str, Path]] | None = None,
 ) -> int:
     validate_local_preflight(
         repository, config, duration_seconds, leader_source=leader_source, motion_profile=motion_profile,
@@ -1694,6 +1717,7 @@ def run_start(
         return _run_start_locked(
             repository, config, duration_seconds, leader_source=leader_source, motion_profile=motion_profile,
             gate=gate, emit=emit, on_session_created=on_session_created,
+            console_prepare=console_prepare,
         )
 
 

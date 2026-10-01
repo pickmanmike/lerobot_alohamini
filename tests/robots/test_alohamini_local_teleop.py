@@ -95,6 +95,23 @@ def local_cli_without(flag: str) -> list[str]:
     return arguments
 
 
+def test_console_pipe_is_opt_in_local_only_and_preserves_native_leaders(tmp_path, capsys):
+    module = load_teleoperate_module()
+    pipe = r"\\.\pipe\am1-test"
+    extra = ["--external_stop_file", str(tmp_path / "stop"), "--unified_session_enter_confirmations",
+             "--console_pipe", pipe, "--console_auth_file", str(tmp_path / "auth"),
+             "--console_session_id", "20261001T000000-1234abcd"]
+    args = module.parse_args(local_cli_args(*extra), platform_name="Windows")
+    assert args.console_pipe == pipe and args.no_keyboard is False and args.no_leader is False
+    for invalid in (
+        local_cli_args("--console_pipe", pipe),
+        local_cli_args(*extra, "--robot.robot_model", "alohamini2"),
+    ):
+        with pytest.raises(SystemExit):
+            module.parse_args(invalid, platform_name="Windows")
+        capsys.readouterr()
+
+
 def test_local_cli_selects_the_decoupled_am1_path_with_bounded_send_timeout():
     module = load_teleoperate_module()
 
@@ -671,6 +688,98 @@ def test_local_session_uses_the_decoupled_sender_and_holds_body_zero_through_bot
     assert captured["initial_arm_target"] == FOLLOWER
     assert captured["initial_observation_sequence"] == 2
     assert all(action == module.make_zero_action() for action in Robot.instance.actions)
+
+
+def test_console_local_uses_native_leaders_without_constructing_keyboard(monkeypatch, tmp_path):
+    module = load_teleoperate_module()
+    events = []
+
+    class Robot:
+        def __init__(self, config):
+            self.config = config
+            self.observation_sequence = 0
+            self.latest_observation_received_at = 1.0
+
+        def connect(self, **_):
+            events.append("robot_connect")
+
+        def send_action(self, action):
+            assert all(float(action[key]) == 0 for key in module.make_zero_action())
+
+        def _from_keyboard_to_base_action(self, _keys):
+            return {"x.vel": 0, "y.vel": 0, "theta.vel": 0}
+
+        def disconnect(self):
+            events.append("robot_disconnect")
+
+    class Arm:
+        is_calibrated = True
+
+        def connect(self, **_):
+            pass
+
+        def disconnect(self):
+            pass
+
+    class Leader:
+        def __init__(self, config):
+            self.left_arm, self.right_arm = Arm(), Arm()
+
+    class Bridge:
+        def __init__(self, pipe, auth, identity):
+            events.append("bridge_created")
+            self.is_connected = False
+
+        def connect(self):
+            self.is_connected = True
+
+        def get_action(self):
+            return set()
+
+        def wait_gate(self, stage, **_):
+            events.append(stage)
+            return True
+
+        def pause_requested(self):
+            return False
+
+        def note_live_admitted(self):
+            events.append("host_active")
+
+        def disconnect(self):
+            self.is_connected = False
+
+    def sync(robot, leader, **kwargs):
+        events.append("sync")
+        assert kwargs["confirmation_gate"] is not None
+        robot.observation_sequence = 1
+        return dict(FOLLOWER), dict(FOLLOWER), 1.0
+
+    def alignment(robot, leader, max_start_mismatch, **kwargs):
+        robot.observation_sequence = 2
+        return dict(FOLLOWER), dict(FOLLOWER), 2.0
+
+    def live(robot, leader, **kwargs):
+        events.append("live")
+        assert kwargs["control_pause_requested"] is not None
+        assert kwargs["body_action_supplier"]() == module.make_zero_action()
+
+    monkeypatch.setattr(module, "AlohaMiniClient", Robot)
+    monkeypatch.setattr(module, "BiSOLeader", Leader)
+    monkeypatch.setattr(module, "KeyboardTeleop", lambda *_: pytest.fail("native keyboard listener must not be constructed"))
+    monkeypatch.setattr(module, "AM1ConsoleBridgeClient", Bridge, raising=False)
+    monkeypatch.setattr(module, "run_startup_sync", sync)
+    monkeypatch.setattr(module, "run_alignment_gate", alignment)
+    monkeypatch.setattr(module, "run_am1_live_sender", live)
+    monkeypatch.setattr(module, "validate_am1_local_initial_admission", lambda *_args, **_kwargs: None)
+    args = module.parse_args(local_cli_args("--external_stop_file", str(tmp_path / "stop"),
+                                            "--unified_session_enter_confirmations",
+                                            "--console_pipe", r"\\.\pipe\am1-test",
+                                            "--console_auth_file", str(tmp_path / "auth"),
+                                            "--console_session_id", "20261001T000000-1234abcd"),
+                             platform_name="Windows")
+    assert module.run_teleoperation(args, input_fn=lambda _: pytest.fail("no terminal Enter"), monotonic=lambda: 2.0) == 0
+    assert "live_start" in events and "live" in events and "robot_disconnect" in events
 
 
 def test_local_terminal_stale_refuses_promptly_and_joins_sender_before_outer_cleanup(

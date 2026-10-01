@@ -9,11 +9,30 @@
 <p id="connection">Camera status pending</p></header>
 <nav aria-label="Console pages"><a href="#control">Control</a><a href="#servos">Servos</a><a href="#system">System</a><a href="#logs">Logs</a><a href="#terminal">Terminal</a></nav>
 <aside id="session-state" aria-live="polite">No session is active.</aside>
-<main id="am1-camera-root" data-camera-base="/camera/">
+<div class="global-stop"><button type="button" data-operation="Stop">Stop session</button><span>Stop is available from every page. Q also stops while Control has focus.</span></div>
+<main data-console-page="control"><section class="control-panel" aria-label="Local session controls">
+<div class="control-actions"><label>Live duration (seconds) <input id="duration-seconds" type="number" min="1" max="1800" value="90"></label>
+<button type="button" data-operation="Start">Start Local session</button>
+<button type="button" data-operation="Pause">Pause / release body</button>
+<button type="button" data-operation="Resume">Approve Resume</button>
+<button type="button" data-operation="Approve">Approve realignment</button>
+<button type="button" data-operation="ClaimInput">Claim inactive input</button></div>
+<p id="gate-state" aria-live="polite">No manual approval pending.</p><p id="control-notice" aria-live="polite">Opening this page does not start the robot. Start is the first motion authorization.</p>
+<div class="body-pad" aria-label="Hold-to-move base and lift controls">
+<button type="button" data-body-key="w">W · forward</button><button type="button" data-body-key="s">S · back</button>
+<button type="button" data-body-key="z">Z · left</button><button type="button" data-body-key="x">X · right</button>
+<button type="button" data-body-key="a">A · rotate left</button><button type="button" data-body-key="d">D · rotate right</button>
+<button type="button" data-body-key="u">U · lift up</button><button type="button" data-body-key="j">J · lift down</button>
+</div><p>Buttons move only while held after live admission. Releasing, leaving Control, hiding this tab or losing input stops body commands and requires explicit Resume.</p></section>
+<div id="am1-camera-root" data-camera-base="/camera/">
 <section id="primary" class="view primary" data-role="forward" aria-label="Focused camera"><div class="camera-heading"><strong>Front</strong><span class="camera-status">Waiting</span></div>
 <div class="image-wrap"><img alt="Focused camera view"><div class="unavailable">Waiting for a decoded frame</div></div>
 <details class="camera-details"><summary>Details</summary><dl><dt>Image age</dt><dd data-field="image-age">Not sampled</dd><dt>Source</dt><dd data-field="source">Unavailable</dd><dt>Sequence</dt><dd data-field="sequence">Not sampled</dd><dt>Rotation</dt><dd data-field="rotation">Not sampled</dd></dl></details></section>
-<section id="thumbnails" aria-label="Camera positions"></section></main>
+<section id="thumbnails" aria-label="Camera positions"></section></div>
 <details><summary>Browser delivery diagnostics</summary><pre id="diagnostics">Waiting for status…</pre></details>
-<p class="note">Camera age is measured from gateway JPEG receipt, not physical scene-to-display latency. Last frame / waiting is not a live driving view.</p>
+<p class="note">Camera age is measured from gateway JPEG receipt, not physical scene-to-display latency. Last frame / waiting is not a live driving view.</p></main>
+<main data-console-page="servos" hidden><p>Servo snapshots will appear here when sourced measurements are available. No second motor reader is started.</p></main>
+<main data-console-page="system" hidden><p>System observations are not sampled yet.</p></main>
+<main data-console-page="logs" hidden><p>Exact session logs will appear here after collection.</p></main>
+<main data-console-page="terminal" hidden><p>Read-only event view. This console has no command execution route.</p></main>
 </body></html>

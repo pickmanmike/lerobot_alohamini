@@ -1,3 +1,13 @@
 nav { display:flex; flex-wrap:wrap; gap:1rem; margin:1rem 0; }
 nav a { color:inherit; padding:.35rem .55rem; border:1px solid #777; border-radius:.3rem; }
 #session-state { padding:.7rem; border:1px solid #777; border-radius:.3rem; margin-bottom:1rem; }
+[hidden] { display:none !important; }
+.global-stop { position:sticky; top:0; z-index:20; display:flex; gap:.7rem; align-items:center; padding:.5rem; background:#171b24; border:1px solid #b44; }
+.global-stop button { background:#9f2525; color:white; font-weight:bold; }
+.control-panel { padding:.8rem; margin-bottom:1rem; border:1px solid #777; border-radius:.4rem; }
+.control-actions, .body-pad { display:flex; flex-wrap:wrap; align-items:center; gap:.5rem; margin:.6rem 0; }
+.control-actions button, .body-pad button, .global-stop button { min-height:2.6rem; border-radius:.3rem; padding:.4rem .7rem; cursor:pointer; }
+.body-pad button { min-width:7rem; touch-action:none; user-select:none; }
+.body-pad button:active { background:#6785b0; }
+#duration-seconds { max-width:5.5rem; }
+#gate-state, #control-notice { padding:.4rem; border-left:3px solid #6785b0; }
