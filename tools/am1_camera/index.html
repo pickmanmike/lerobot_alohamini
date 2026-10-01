@@ -4,8 +4,18 @@
 <title>AM1 · Local cameras</title><link rel="stylesheet" href="/style.css"><script defer src="/freshness.js"></script><script defer src="/mjpeg.js"></script><script defer src="/app.js"></script></head>
 <body><header><span class="eyebrow">ALOHA MINI 1 / CAMERA-ONLY</span><h1 id="view-heading">Local view</h1>
 <p>Read-only camera viewer; it provides no motor controls or motor-state indication.</p><p id="connection">Connecting to frame status…</p></header>
-<main><section id="primary" class="view primary"><img alt="Primary camera view"><div class="unavailable">Waiting for a fresh frame</div><footer><strong></strong><span></span></footer></section>
-<section id="thumbnails" aria-label="Choose primary camera"></section></main>
+<main id="am1-camera-root" data-camera-base="/">
+<section id="primary" class="view primary" data-role="forward" aria-label="Focused camera">
+  <div class="camera-heading"><strong>Front</strong><span class="camera-status">Waiting</span></div>
+  <div class="image-wrap"><img alt="Focused camera view"><div class="unavailable">Waiting for a decoded frame</div></div>
+  <details class="camera-details"><summary>Details</summary><dl>
+    <dt>Image age</dt><dd data-field="image-age">Not sampled</dd>
+    <dt>Source</dt><dd data-field="source">Unavailable</dd>
+    <dt>Sequence</dt><dd data-field="sequence">Not sampled</dd>
+    <dt>Rotation</dt><dd data-field="rotation">Not sampled</dd>
+  </dl></details>
+</section>
+<section id="thumbnails" aria-label="Camera positions"></section></main>
 <details><summary>Browser delivery diagnostics</summary><pre id="diagnostics">Waiting for status…</pre></details>
-<p class="note">Native MJPG 640 × 480 · 30 fps requested, delivered rates shown per view. Frame age is not physical scene latency. Delayed status is marked separately from fresh decoded images. Old thumbnails and disconnected feeds are hidden. A dark live image is still camera data; unassigned tiles are not identification previews.</p>
+<p class="note">Native MJPG 640 × 480 · 30 fps requested. Image age starts when the gateway receives a JPEG; it is not physical scene-to-display latency. A held image is labeled Last frame / waiting and must not be used as a live driving view. A dark live image is still camera data; unassigned tiles are not identification previews.</p>
 </body></html>

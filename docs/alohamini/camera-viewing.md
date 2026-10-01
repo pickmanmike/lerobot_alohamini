@@ -5,6 +5,26 @@ milestone, see [AM1 supervised unified Local session](unified-session.md). The
 underlying camera security model, accepted evidence, and known browser-gap
 limitation documented here remain unchanged.
 
+## Camera workspace prepared for the control console
+
+The camera-only frontend now places Front, Rear, Chest, Left wrist and Right
+wrist in fixed anatomical slots below a large focus view. Front is focused
+initially; selecting another slot changes only the focus view. Each source
+has a collapsed Details panel below its image, so metrics do not cover the
+picture. The same JavaScript accepts a fixed `data-camera-base` of `/` for
+the Pi viewer or `/camera/` for the later Windows loopback console.
+
+The last decoded JPEG remains attached to its own semantic role during a
+disconnect or reconnect and is labeled **Last frame / waiting** with an
+advancing gateway-receipt age. A never-decoded source shows a placeholder.
+Fresh source status cannot renew an old image, and a source sequence reset
+cannot promote an old in-flight decode into the new generation. This is a
+presentation change, not a claim that held imagery is safe for driving or
+that physical scene-to-display latency has been measured. The existing
+required-view stop/recovery procedure and historical browser-gap limitation
+still apply. This source change remains separate from the Pi gateway and
+motor implementations until the camera-only deployment check is complete.
+
 CAMERA-VIEW1 starts from `integrate/am1-local-teleop` at
 `e7d9253fd309c60d4821e7a1bdb0a2087f5bc9be`. The accepted arms, base, lift,
 Local-motion, idle and shutdown milestones remain closed. Camera-plus-Local
