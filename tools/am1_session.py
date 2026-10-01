@@ -212,6 +212,7 @@ class SessionConfig:
     remote_log_directory: str
     remote_state_directory: str
     windows_log_directory: Path
+    console_camera_auth_file: Path | None = None
 
     @classmethod
     def load(cls, path: Path) -> "SessionConfig":
@@ -260,6 +261,9 @@ class SessionConfig:
         browser = urlsplit(values["browser_url"])
         if browser.scheme not in {"http", "https"} or not browser.hostname or browser.username or browser.password:
             raise SessionError("Browser URL must be HTTP(S) with no embedded credentials.")
+        auth_file = data.get("console_camera_auth_file")
+        if auth_file is not None and (not isinstance(auth_file, str) or not Path(auth_file).is_absolute()):
+            raise SessionError("Private AM1 console camera auth file must be an absolute path.")
         return cls(
             windows_python=Path(values["windows_python"]),
             local_config=Path(values["local_config"]),
@@ -278,6 +282,7 @@ class SessionConfig:
             remote_log_directory=values["remote_log_directory"],
             remote_state_directory=values["remote_state_directory"],
             windows_log_directory=Path(values["windows_log_directory"]),
+            console_camera_auth_file=Path(auth_file) if auth_file is not None else None,
         )
 
 

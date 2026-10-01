@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="am1-csrf" content="AM1_CSRF_TOKEN"><title>AM1 · Control console</title>
+<link rel="stylesheet" href="/camera/assets/style.css"><link rel="stylesheet" href="/assets/style.css">
+<script defer src="/camera/assets/freshness.js"></script><script defer src="/camera/assets/mjpeg.js"></script>
+<script defer src="/camera/assets/app.js"></script><script defer src="/assets/app.js"></script></head>
+<body><header><span class="eyebrow">ALOHA MINI 1 / WINDOWS LOCAL</span><h1 id="view-heading">Control</h1>
+<p>Console availability is not motor readiness. Opening this page never starts a session.</p>
+<p id="connection">Camera status pending</p></header>
+<nav aria-label="Console pages"><a href="#control">Control</a><a href="#servos">Servos</a><a href="#system">System</a><a href="#logs">Logs</a><a href="#terminal">Terminal</a></nav>
+<aside id="session-state" aria-live="polite">No session is active.</aside>
+<main id="am1-camera-root" data-camera-base="/camera/">
+<section id="primary" class="view primary" data-role="forward" aria-label="Focused camera"><div class="camera-heading"><strong>Front</strong><span class="camera-status">Waiting</span></div>
+<div class="image-wrap"><img alt="Focused camera view"><div class="unavailable">Waiting for a decoded frame</div></div>
+<details class="camera-details"><summary>Details</summary><dl><dt>Image age</dt><dd data-field="image-age">Not sampled</dd><dt>Source</dt><dd data-field="source">Unavailable</dd><dt>Sequence</dt><dd data-field="sequence">Not sampled</dd><dt>Rotation</dt><dd data-field="rotation">Not sampled</dd></dl></details></section>
+<section id="thumbnails" aria-label="Camera positions"></section></main>
+<details><summary>Browser delivery diagnostics</summary><pre id="diagnostics">Waiting for status…</pre></details>
+<p class="note">Camera age is measured from gateway JPEG receipt, not physical scene-to-display latency. Last frame / waiting is not a live driving view.</p>
+</body></html>
