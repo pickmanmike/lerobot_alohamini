@@ -22,6 +22,11 @@ assert SPEC and SPEC.loader
 console = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = console
 SPEC.loader.exec_module(console)
+SESSION_SPEC = importlib.util.spec_from_file_location("am1_session_console_test", ROOT / "tools" / "am1_session.py")
+assert SESSION_SPEC and SESSION_SPEC.loader
+session = importlib.util.module_from_spec(SESSION_SPEC)
+sys.modules[SESSION_SPEC.name] = session
+SESSION_SPEC.loader.exec_module(session)
 
 
 class FakeAdapter:
@@ -214,3 +219,166 @@ def test_small_mjpeg_part_is_forwarded_without_waiting_for_large_buffer(tmp_path
         camera.server_close()
         thread.join(timeout=3)
         camera_thread.join(timeout=3)
+
+
+def test_duplicate_start_is_same_session(monkeypatch, tmp_path):
+    created = threading.Event()
+    finish = threading.Event()
+    starts = []
+    session_id = "20261001T000000-1234abcd"
+
+    def fake_start(_repository, _config, _duration, **kwargs):
+        starts.append(kwargs)
+        kwargs["on_session_created"](session_id)
+        created.set()
+        finish.wait(2)
+        return 0
+
+    monkeypatch.setattr(session, "run_start", fake_start)
+    adapter = console.ConsoleSessionAdapter(SimpleNamespace(local_state_directory=tmp_path), ROOT, session)
+    try:
+        first = adapter.operation({"kind": "Start", "duration_seconds": 10, "leader_source": "physical"})
+        assert created.is_set()
+        second = adapter.operation({"kind": "Start", "duration_seconds": 10, "leader_source": "physical"})
+        assert first["session_id"] == second["session_id"] == session_id
+        assert len(starts) == 1
+        assert adapter.state()["session_id"] == session_id
+    finally:
+        finish.set()
+        adapter.wait(3)
+
+
+def test_completed_console_can_start_next_session(monkeypatch, tmp_path):
+    identifiers = iter(("20261001T000000-1234abcd", "20261001T000100-1234abcd"))
+    calls = []
+
+    def fake_start(_repository, _config, _duration, **kwargs):
+        identity = next(identifiers)
+        calls.append(identity)
+        kwargs["on_session_created"](identity)
+        return 0
+
+    monkeypatch.setattr(session, "run_start", fake_start)
+    adapter = console.ConsoleSessionAdapter(SimpleNamespace(local_state_directory=tmp_path), ROOT, session)
+    first = adapter.operation({"kind": "Start", "duration_seconds": 10})
+    assert adapter.wait(3)
+    second = adapter.operation({"kind": "Start", "duration_seconds": 10})
+    assert adapter.wait(3)
+    assert first["session_id"] != second["session_id"]
+    assert len(calls) == 2
+
+
+def test_stop_targets_exact_active_owner_and_returns_before_cleanup(tmp_path, monkeypatch):
+    session_id = "20261001T000000-1234abcd"
+    state = tmp_path / "active.json"
+    stop_path = tmp_path / f"stop-{session_id}"
+    state.write_text(json.dumps({"session_id": session_id, "controller_pid": 42, "status": "active",
+                                 "stop_request": str(stop_path)}), encoding="utf-8")
+    monkeypatch.setattr(session, "_pid_running", lambda _: True)
+    config = SimpleNamespace(local_state_directory=tmp_path)
+    with pytest.raises(session.SessionError, match="identity"):
+        session.request_stop(config, expected_session_id="wrong", wait=False)
+    assert not stop_path.exists()
+    start = time.monotonic()
+    assert session.request_stop(config, expected_session_id=session_id, wait=False) == 0
+    assert time.monotonic() - start < 0.5
+    assert stop_path.read_text(encoding="utf-8").strip() == session_id
+
+
+def test_real_ready_events_advance_without_stdin(tmp_path):
+    class Remote:
+        def __init__(self):
+            self.calls = []
+
+        def preflight(self):
+            self.calls.append("preflight")
+            return {"motor_source_head": "a" * 40}
+
+        def start_camera(self):
+            self.calls.append("camera")
+            return {"event": "camera_ready", "camera_log": "/tmp/am1-camera.log", "browser_url": "http://example.invalid"}
+
+        def start_host(self):
+            self.calls.append("host")
+            return {"event": "host_ready", "host_log": "/tmp/am1-host.log"}
+
+        def stop(self):
+            self.calls.append("stop")
+            return {"cleanup_verified": True, "host_exit": 0, "camera_exit": 0}
+
+        def fault(self):
+            return None
+
+    class Client:
+        def run(self, **_):
+            return 0
+
+        def cleanup_status(self):
+            return {"cleanup_verified": True}
+
+    remote = Remote()
+    gates, events = [], []
+    coordinator = session.SessionCoordinator(
+        remote=remote, client=Client(), open_browser=lambda _: None,
+        collect_remote_log=lambda *_: (True, None),
+        input_fn=lambda _: pytest.fail("console must not consume terminal Enter"),
+        gate=lambda stage, evidence, cancel: gates.append((stage, evidence)) or True,
+        emit=events.append,
+    )
+    outcome = coordinator.run(duration_seconds=10, session_id="test", session_directory=tmp_path,
+                              client_log_path=tmp_path / "client.log", stop_requested=lambda: False)
+    assert outcome.final_exit_code == 0
+    assert remote.calls == ["preflight", "camera", "host", "stop"]
+    assert [stage for stage, _ in gates] == ["camera_ready", "host_ready"]
+    assert [event["event"] for event in events if event.get("event") in {"camera_ready", "host_ready"}] == ["camera_ready", "host_ready"]
+
+
+def test_stop_at_camera_gate_preserves_fault(tmp_path):
+    class Remote:
+        def preflight(self):
+            return {}
+
+        def start_camera(self):
+            return {"event": "camera_ready", "browser_url": "http://example.invalid"}
+
+        def start_host(self):
+            pytest.fail("host must not start after gate refusal")
+
+        def stop(self):
+            return {"cleanup_verified": True}
+
+        def fault(self):
+            return None
+
+    coordinator = session.SessionCoordinator(
+        remote=Remote(), client=object(), open_browser=lambda _: None,
+        collect_remote_log=lambda *_: (True, None),
+        input_fn=lambda _: pytest.fail("terminal input forbidden"),
+        gate=lambda *_: False,
+    )
+    outcome = coordinator.run(duration_seconds=10, session_id="test", session_directory=tmp_path,
+                              client_log_path=tmp_path / "client.log", stop_requested=lambda: False)
+    assert outcome.final_exit_code == 130
+    assert outcome.stop_reason == "explicit_stop"
+
+
+def test_unknown_cleanup_not_stopped(monkeypatch, tmp_path):
+    session_id = "20261001T000000-1234abcd"
+
+    def fake_start(_repository, _config, _duration, **kwargs):
+        kwargs["on_session_created"](session_id)
+        kwargs["emit"]({"event": "cleanup", "cleanup_verified": False})
+        return 3
+
+    monkeypatch.setattr(session, "run_start", fake_start)
+    adapter = console.ConsoleSessionAdapter(SimpleNamespace(local_state_directory=tmp_path), ROOT, session)
+    adapter.operation({"kind": "Start", "duration_seconds": 10, "leader_source": "physical"})
+    adapter.wait(3)
+    state = adapter.state()
+    assert state["phase"] == "cleanup_unknown"
+    assert state["final_exit_code"] == 3
+    assert state["phase"] != "stopped"
+    stop_calls = []
+    monkeypatch.setattr(session, "request_stop", lambda *args, **kwargs: stop_calls.append((args, kwargs)) or 0)
+    assert adapter.operation({"kind": "Stop", "session_id": session_id})["accepted"] is False
+    assert stop_calls == []

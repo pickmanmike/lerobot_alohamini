@@ -16,6 +16,127 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 
+class ConsoleSessionAdapter:
+    """One console-facing adapter around the existing local session owner."""
+
+    def __init__(self, config, repository: Path, session_module):
+        self.config = config
+        self.repository = repository
+        self.session_module = session_module
+        self._lock = threading.Lock()
+        self._created = threading.Event()
+        self._worker: threading.Thread | None = None
+        self._session_id: str | None = None
+        self._phase = "idle"
+        self._final_exit_code: int | None = None
+        self._error: str | None = None
+        self._events = deque(maxlen=128)
+        self._event_sink = None
+
+    def set_event_sink(self, sink):
+        self._event_sink = sink
+
+    def _emit(self, event):
+        event = dict(event)
+        with self._lock:
+            self._events.append(event)
+            if event.get("event") in {"preflight_passed", "camera_ready", "host_ready"}:
+                self._phase = event["event"]
+            elif event.get("event") == "cleanup" and not event.get("cleanup_verified"):
+                self._phase = "cleanup_unknown"
+        if self._event_sink is not None:
+            self._event_sink(event)
+
+    def _on_created(self, session_id: str):
+        with self._lock:
+            self._session_id = session_id
+            self._phase = "preflight"
+        self._created.set()
+        self._emit({"event": "session_created", "session_id": session_id})
+
+    def _gate(self, stage, evidence, cancel):
+        # Prepared Start is the operator's approval for ordinary qualified
+        # progression; actual camera/host events still must precede each gate.
+        return not cancel()
+
+    def _run(self, duration, leader_source, motion_profile):
+        try:
+            result = self.session_module.run_start(
+                self.repository, self.config, duration,
+                leader_source=leader_source, motion_profile=motion_profile,
+                gate=self._gate, emit=self._emit, on_session_created=self._on_created,
+            )
+            with self._lock:
+                self._final_exit_code = result
+                self._phase = "complete" if result == 0 else "cleanup_unknown" if result == 3 else "failed"
+        except BaseException as exc:
+            with self._lock:
+                self._error = f"{type(exc).__name__}: {exc}"
+                self._phase = "failed"
+            self._emit({"event": "session_error", "reason": self._error})
+        finally:
+            self._created.set()
+
+    def state(self):
+        with self._lock:
+            return {"session_id": self._session_id, "phase": self._phase,
+                    "final_exit_code": self._final_exit_code, "error": self._error,
+                    "events": list(self._events)}
+
+    def wait(self, timeout: float) -> bool:
+        worker = self._worker
+        if worker is not None:
+            worker.join(timeout)
+        return worker is None or not worker.is_alive()
+
+    def operation(self, payload):
+        kind = payload.get("kind")
+        if kind == "Start":
+            with self._lock:
+                if self._worker is not None and self._worker.is_alive():
+                    # A second tab attaches to the current or completed result.
+                    return {"accepted": True, "session_id": self._session_id, "phase": self._phase}
+                if self._worker is not None and self._final_exit_code != 0:
+                    return {"accepted": False, "session_id": self._session_id,
+                            "phase": self._phase, "reason": "prior cleanup or failure is unresolved"}
+                duration = self.session_module.parse_duration_seconds(payload.get("duration_seconds"))
+                leader_source = payload.get("leader_source", "physical")
+                motion_profile = payload.get("motion_profile")
+                self.session_module.validate_leader_selection(leader_source, motion_profile)
+                self._created.clear()
+                self._session_id = None
+                self._final_exit_code = None
+                self._error = None
+                self._phase = "starting"
+                self._worker = threading.Thread(target=self._run, args=(duration, leader_source, motion_profile),
+                                                name="am1-console-session", daemon=False)
+                self._worker.start()
+            if not self._created.wait(60):
+                return {"accepted": False, "phase": "starting", "reason": "session identity not yet established"}
+            state = self.state()
+            return {"accepted": state["session_id"] is not None, "session_id": state["session_id"],
+                    "phase": state["phase"], "error": state["error"]}
+        if kind == "Stop":
+            expected = payload.get("session_id")
+            with self._lock:
+                current = self._session_id
+                running = self._worker is not None and self._worker.is_alive()
+            if not isinstance(expected, str) or not hmac.compare_digest(expected, current or ""):
+                return {"accepted": False, "reason": "session identity mismatch"}
+            if not running:
+                return {"accepted": False, "reason": "session is already terminal; cleanup state is unchanged"}
+            try:
+                self.session_module.request_stop(self.config, expected_session_id=expected, wait=False)
+            except self.session_module.SessionError as exc:
+                return {"accepted": False, "reason": str(exc)}
+            self._emit({"event": "stop_requested", "session_id": expected})
+            return {"accepted": True, "session_id": expected, "phase": "stopping"}
+        return {"accepted": False, "reason": "operation not yet connected"}
+
+    def body_input(self, payload):
+        return {"accepted": False, "reason": "body input not yet connected"}
+
+
 MAX_POST_BYTES = 4096
 CAMERA_ROLES = frozenset({"forward", "backward", "chest", "wrist_left", "wrist_right"})
 CAMERA_ASSETS = frozenset({"app.js", "freshness.js", "mjpeg.js", "style.css"})
@@ -81,6 +202,8 @@ class ConsoleServer(ThreadingHTTPServer):
         self.events = deque(maxlen=128)
         self.event_sequence = 0
         self.event_condition = threading.Condition()
+        if hasattr(session_adapter, "set_event_sink"):
+            session_adapter.set_event_sink(self.emit)
         super().__init__(address, ConsoleHandler)
 
     def emit(self, event: dict) -> None:

@@ -324,6 +324,8 @@ class SessionCoordinator:
         leader_source: str = "physical",
         motion_profile: str | None = None,
         windows_source_head: str | None = None,
+        gate: Callable[[str, dict[str, Any], Callable[[], bool]], bool] | None = None,
+        emit: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         validate_leader_selection(leader_source, motion_profile)
         self.remote = remote
@@ -335,6 +337,12 @@ class SessionCoordinator:
         self.leader_source = leader_source
         self.motion_profile = motion_profile
         self.windows_source_head = windows_source_head
+        self.gate = gate
+        self.emit = emit
+
+    def _emit(self, event: dict[str, Any]) -> None:
+        if self.emit is not None:
+            self.emit(event)
 
     def _record_scripted_result(self, outcome: SessionOutcome, client_log_path: Path) -> None:
         if self.leader_source != "scripted":
@@ -453,10 +461,12 @@ class SessionCoordinator:
             }
             if self.windows_source_head is not None:
                 outcome.sources["windows_source_head"] = self.windows_source_head
+            self._emit({"event": "preflight_passed", "sources": dict(outcome.sources)})
             camera = self.remote.start_camera()
             if camera.get("camera_log"):
                 remote_logs.append(camera["camera_log"])
             self.open_browser(camera["browser_url"])
+            self._emit({"event": "camera_ready", "evidence": dict(camera)})
             print("AM1 session phase: all five camera sources are ready; the read-only viewer is open.", flush=True)
             if self.leader_source == "scripted":
                 print(
@@ -474,11 +484,16 @@ class SessionCoordinator:
                     "power is ready. Press Enter only to start the motor host.",
                     flush=True,
                 )
-            approval = self._input_with_stop(
-                "",
-                stop_requested,
-                getattr(self.remote, "fault", None),
-            )
+            if self.gate is None:
+                approval = self._input_with_stop(
+                    "",
+                    stop_requested,
+                    getattr(self.remote, "fault", None),
+                )
+            else:
+                approval = "" if self.gate("camera_ready", dict(camera), stop_requested) else None
+                if approval is None:
+                    raise SessionStopped("console session stopped at camera readiness gate")
             if approval != "":
                 outcome.failure = "physical/view readiness requires Enter only; non-empty input was refused"
                 outcome.operational_exit_code = 2
@@ -491,6 +506,9 @@ class SessionCoordinator:
                 host = self.remote.start_host()
                 if host.get("host_log"):
                     remote_logs.insert(0, host["host_log"])
+                self._emit({"event": "host_ready", "evidence": dict(host)})
+                if self.gate is not None and not self.gate("host_ready", dict(host), stop_requested):
+                    raise SessionStopped("console session stopped at host readiness gate")
                 print(
                     "AM1 session phase: motor host is operational; handing the console to the Windows Local client.",
                     flush=True,
@@ -502,6 +520,7 @@ class SessionCoordinator:
                         stop_requested=stop_requested,
                     )
                 )
+                self._emit({"event": "client_exited", "exit_code": outcome.operational_exit_code})
                 if outcome.operational_exit_code != 0:
                     refusal = None
                     try:
@@ -559,6 +578,8 @@ class SessionCoordinator:
             outcome.cleanup_verified = bool(cleanup.get("cleanup_verified")) and bool(
                 client_cleanup.get("cleanup_verified")
             )
+            self._emit({"event": "cleanup", "cleanup_verified": outcome.cleanup_verified,
+                        "operational_exit_code": outcome.operational_exit_code})
             terminal_status = cleanup.get("terminal_status") or cleanup.get("persisted_status")
             if terminal_status in {"fault", "refused"} and outcome.operational_exit_code == 0:
                 outcome.failure = f"Pi session ended in terminal state {terminal_status}"
@@ -658,6 +679,10 @@ class SessionCoordinator:
             (session_directory / "session-summary.json").write_text(
                 json.dumps(asdict(outcome), indent=2, sort_keys=True) + "\n", encoding="utf-8"
             )
+            self._emit({"event": "session_complete", "session_id": session_id,
+                        "final_exit_code": outcome.final_exit_code,
+                        "cleanup_verified": outcome.cleanup_verified,
+                        "result_directory": str(session_directory)})
         return outcome
 
 
@@ -1550,6 +1575,9 @@ def _pid_running(pid: int) -> bool:
 def _run_start_locked(
     repository: Path, config: SessionConfig, duration_seconds: int, *,
     leader_source: str = "physical", motion_profile: str | None = None,
+    gate: Callable[[str, dict[str, Any], Callable[[], bool]], bool] | None = None,
+    emit: Callable[[dict[str, Any]], None] | None = None,
+    on_session_created: Callable[[str], None] | None = None,
 ) -> int:
     validate_leader_selection(leader_source, motion_profile)
     active_path = _active_path(config)
@@ -1580,6 +1608,8 @@ def _run_start_locked(
             "motion_profile": motion_profile,
         },
     )
+    if on_session_created is not None:
+        on_session_created(session_id)
     print(f"AM1_SESSION_ID={session_id}", flush=True)
     print(f"AM1_SESSION_RESULT={session_directory}", flush=True)
     print("AM1 session phase: starting bounded source and ownership preflight.", flush=True)
@@ -1606,12 +1636,14 @@ def _run_start_locked(
     outcome = SessionCoordinator(
         remote=remote,
         client=client,
-        open_browser=_open_browser,
+        open_browser=_open_browser if gate is None else lambda _: None,
         collect_remote_log=lambda remote_path, destination: _collect_with_scp(config, remote_path, destination),
         on_cleanup=record_hardware_cleanup,
         leader_source=leader_source,
         motion_profile=motion_profile,
         windows_source_head=getattr(config, "remote_session_head", None),
+        gate=gate,
+        emit=emit,
     ).run(
         duration_seconds=duration_seconds,
         session_id=session_id,
@@ -1651,6 +1683,9 @@ def _run_start_locked(
 def run_start(
     repository: Path, config: SessionConfig, duration_seconds: int, *,
     leader_source: str = "physical", motion_profile: str | None = None,
+    gate: Callable[[str, dict[str, Any], Callable[[], bool]], bool] | None = None,
+    emit: Callable[[dict[str, Any]], None] | None = None,
+    on_session_created: Callable[[str], None] | None = None,
 ) -> int:
     validate_local_preflight(
         repository, config, duration_seconds, leader_source=leader_source, motion_profile=motion_profile,
@@ -1658,10 +1693,11 @@ def run_start(
     with LocalSessionLock(config.local_state_directory / "active.lock"):
         return _run_start_locked(
             repository, config, duration_seconds, leader_source=leader_source, motion_profile=motion_profile,
+            gate=gate, emit=emit, on_session_created=on_session_created,
         )
 
 
-def request_stop(config: SessionConfig) -> int:
+def request_stop(config: SessionConfig, *, expected_session_id: str | None = None, wait: bool = True) -> int:
     path = _active_path(config)
     try:
         active = json.loads(path.read_text(encoding="utf-8"))
@@ -1669,12 +1705,16 @@ def request_stop(config: SessionConfig) -> int:
         pid = int(active["controller_pid"])
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
         raise SessionError(f"No valid active local AM1 session was found: {exc}") from exc
+    if expected_session_id is not None and session_id != expected_session_id:
+        raise SessionError("Stop session identity no longer matches the active owner.")
     if active.get("status") != "active":
         return int(active.get("final_exit_code", active.get("operational_exit_code", 2)))
     if active.get("status") == "active" and _pid_running(pid):
         stop_request = Path(active["stop_request"])
         stop_request.write_text(session_id + "\n", encoding="utf-8")
         print(f"Stop requested for owned AM1 session {session_id}; waiting for client-first cleanup.")
+        if not wait:
+            return 0
         # Covers the client's cooperative 30 s window, exact-tree reap,
         # remote 45 s cleanup, SSH exit verification, and scheduling margin.
         deadline = time.monotonic() + STOP_CONFIRMATION_TIMEOUT_S
@@ -1685,6 +1725,8 @@ def request_stop(config: SessionConfig) -> int:
             time.sleep(0.2)
         raise SessionError("The active controller did not confirm bounded cleanup; use the physical stop instruction.")
 
+    if not wait:
+        raise SessionError("Controller liveness is unverified; console Stop cannot report confirmed cleanup.")
     completed = subprocess.run(
         [
                 "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ConnectionAttempts=1",
