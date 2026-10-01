@@ -1123,6 +1123,7 @@ def test_actual_local_loop_pauses_at_one_second_and_auto_resumes_after_current_f
 
     robot = Robot()
     prompts = []
+    feedback_events = []
     module.run_am1_live_sender(
         robot,
         Leader(),
@@ -1137,6 +1138,7 @@ def test_actual_local_loop_pauses_at_one_second_and_auto_resumes_after_current_f
         body_action_supplier=module.make_zero_action,
         recovery_enabled=True,
         input_fn=lambda prompt: prompts.append(prompt) or "",
+        feedback_callback=lambda sample, feedback: feedback_events.append((feedback["state"], feedback["epoch"])),
     )
 
     assert robot.retire_count == 1
@@ -1148,6 +1150,8 @@ def test_actual_local_loop_pauses_at_one_second_and_auto_resumes_after_current_f
     assert len(prompts) == int(manual)
     assert ("RESUME-NEEDS-ENTER" in output) == manual
     assert f'"resume_mode": "{"manual" if manual else "automatic"}"' in output
+    assert ("paused", 1) in feedback_events
+    assert ("active", 2) in feedback_events
 
 
 def test_actual_local_loop_recovers_twice_without_permanent_latch(capsys):

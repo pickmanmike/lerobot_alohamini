@@ -297,6 +297,48 @@ def test_external_stop_before_first_live_send_emits_no_action():
     assert sender.snapshot().action_sequence == 0
 
 
+def test_console_action_callback_sees_sent_body_action_without_affecting_cadence():
+    module = load_teleoperate_module()
+
+    class Clock:
+        now = 0.0
+        def monotonic(self): return self.now
+        def sleep(self, duration): self.now += duration
+
+    class Sender:
+        def __init__(self): self.actions = []
+        def __enter__(self): return self
+        def send_action(self, action): self.actions.append(dict(action))
+        def __exit__(self, *_): return False
+
+    class Robot:
+        def __init__(self): self.sender = Sender()
+        def make_live_command_sender(self): return self.sender
+
+    clock = Clock()
+    robot = Robot()
+    seen = []
+    def report(action, sequence, interval_ms, wall_ns):
+        seen.append((dict(action), sequence, interval_ms, wall_ns))
+        raise RuntimeError("display-only subscriber failed")
+
+    worker = module.AM1LiveActionSender(
+        robot, initial_action={**FOLLOWER, **module.make_zero_action()},
+        initial_observation_sequence=1, fps=10, duration_s=0.21,
+        profile_cadence=False, monotonic=clock.monotonic, sleep_fn=clock.sleep,
+        wall_time_ns=lambda: 7, action_sent_callback=report,
+    )
+    worker.start()
+    worker.join()
+
+    assert worker.snapshot().error is None
+    assert len(seen) == len(robot.sender.actions) == 3
+    assert [record[1] for record in seen] == [1, 2, 3]
+    assert all(record[0] == action for record, action in zip(seen, robot.sender.actions))
+    assert [round(record[2]) for record in seen] == [0, 100, 100]
+    assert all(record[0]["x.vel"] == 0.0 for record in seen)
+
+
 def test_1800_second_local_expiry_uses_fake_time_and_keeps_zero_body_commands():
     module = load_teleoperate_module()
 

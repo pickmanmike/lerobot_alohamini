@@ -119,6 +119,52 @@ def test_proxy_refuses_unlisted_target_and_never_exposes_credentials(running_con
     assert request(server, "GET", "/camera/assets/app.js", cookie=cookie)[0] == 200
 
 
+def test_camera_health_uses_request_start_and_reports_failed_fetch(running_console, monkeypatch):
+    server, adapter = running_console
+    cookie, _, _ = session_tokens(server)
+    recorded = []
+    adapter.camera_status = lambda status, *, acquired_at_ns: recorded.append(("ok", acquired_at_ns)) or True
+    adapter.camera_status_failed = lambda *, acquired_at_ns: recorded.append(("failed", acquired_at_ns))
+    clock = [1_000_000_000]
+    monkeypatch.setattr(console.time, "time_ns", lambda: clock[0])
+
+    class Response:
+        status = 200
+
+        def getheader(self, name, default=None):
+            return "14" if name == "Content-Length" else default
+
+        def read(self, size):
+            return b'{"cameras":{}}'
+
+    class CameraConnection:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def request(self, *args, **kwargs):
+            pass
+
+        def getresponse(self):
+            clock[0] = 1_800_000_000
+            return Response()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(console.http.client, "HTTPConnection", CameraConnection)
+    assert request(server, "GET", "/camera/status.json", cookie=cookie)[0] == 200
+    assert recorded == [("ok", 1_000_000_000)]
+
+    class FailedConnection(CameraConnection):
+        def getresponse(self):
+            raise OSError("camera unavailable")
+
+    clock[0] = 2_000_000_000
+    monkeypatch.setattr(console.http.client, "HTTPConnection", FailedConnection)
+    assert request(server, "GET", "/camera/status.json", cookie=cookie)[0] == 503
+    assert recorded[-1] == ("failed", 2_000_000_000)
+
+
 def test_foreign_origin_and_oversized_post_refused(running_console):
     server, adapter = running_console
     cookie, csrf, _ = session_tokens(server)

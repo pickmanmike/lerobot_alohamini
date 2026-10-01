@@ -687,12 +687,14 @@ class SessionCoordinator:
 
 
 class SSHRemote:
-    def __init__(self, config: SessionConfig, session_id: str, session_directory: Path) -> None:
+    def __init__(self, config: SessionConfig, session_id: str, session_directory: Path,
+                 telemetry_sink: Callable[[dict[str, Any]], None] | None = None) -> None:
         self.config = config
         self.session_id = session_id
         self.session_directory = session_directory
         self.process: subprocess.Popen[str] | None = None
         self.events: queue.Queue[dict[str, Any]] = queue.Queue()
+        self.telemetry_sink = telemetry_sink
         self.stderr_stream = None
         self.reader: threading.Thread | None = None
         self._fault: dict[str, Any] | None = None
@@ -716,6 +718,9 @@ class SSHRemote:
 
     def set_stop_requested(self, stop_requested: Callable[[], bool]) -> None:
         self._stop_requested = stop_requested
+
+    def set_telemetry_sink(self, sink: Callable[[dict[str, Any]], None]) -> None:
+        self.telemetry_sink = sink
 
     def _command(self, client_trace: Path | None = None) -> list[str]:
         command = [
@@ -759,6 +764,13 @@ class SSHRemote:
                     last_event=event.get("event"), last_event_wall_time_ns=time.time_ns(),
                 )
             self._remote_event_seen = True
+            if event.get("event") == "system_sample":
+                if self.telemetry_sink is not None:
+                    try:
+                        self.telemetry_sink({**event, "windows_received_at_ns": time.time_ns()})
+                    except Exception:
+                        pass  # Display telemetry cannot stop lifecycle event reception.
+                continue
             self.events.put(event)
             if event.get("event") in {"runtime_fault", "refused", "fault"}:
                 self._record_fault(event)
@@ -1630,6 +1642,8 @@ def _run_start_locked(
     print(f"AM1_SESSION_RESULT={session_directory}", flush=True)
     print("AM1 session phase: starting bounded source and ownership preflight.", flush=True)
     remote = SSHRemote(config, session_id, session_directory)
+    if emit is not None and hasattr(remote, "set_telemetry_sink"):
+        remote.set_telemetry_sink(emit)
     selection = {"leader_source": leader_source, "motion_profile": motion_profile} if leader_source == "scripted" else {}
     console_selection = (
         {"console_pipe": console_pipe, "console_auth_file": console_auth_file,

@@ -17,7 +17,7 @@ import threading
 import time
 from multiprocessing.connection import Client, Listener
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 BODY_KEYS = frozenset({"w", "s", "z", "x", "a", "d", "u", "j", "t", "g"})
@@ -25,6 +25,68 @@ INPUT_MAX_AGE_S = 0.25
 MAX_PIPE_BYTES = 4096
 PREPARED_GATES = frozenset({"sync_start", "live_start"})
 MANUAL_GATES = frozenset({"realign", "resume"})
+CONSOLE_BODY_OBSERVATION_KEYS = frozenset({"x.vel", "y.vel", "theta.vel", "lift_axis.vel", "lift_axis.height_mm"})
+CONSOLE_ARM_KEYS = frozenset(f"arm_{side}_{joint}.pos" for side in ("left", "right")
+                             for joint in ("shoulder_pan", "shoulder_lift", "elbow_flex",
+                                           "wrist_flex", "wrist_roll", "gripper"))
+
+
+def _console_numbers(values: Any, allowed: frozenset[str]) -> dict[str, float]:
+    result: dict[str, float] = {}
+    for key in allowed:
+        value = values.get(key) if hasattr(values, "get") else None
+        if value is None or isinstance(value, (bool, str, bytes, dict, list, tuple, complex)):
+            continue
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(number):
+            result[key] = number
+    return result
+
+
+def make_console_live_sample_event(sample: Any, action: dict[str, Any], *, raw_keys: frozenset[str],
+                                   host_feedback: Any, wall_ns: int, monotonic_now: float,
+                                   leader_source: str = "physical") -> dict[str, Any]:
+    """Label the already-read sample; never infer missing body telemetry as zero."""
+    age_ns = int(max(0.0, monotonic_now - sample.observed_at) * 1e9)
+    feedback = host_feedback if isinstance(host_feedback, dict) else {}
+    leader_values = _console_numbers(sample.arm_target, CONSOLE_ARM_KEYS)
+    return {"event": "live_sample", "acquired_at_ns": max(0, wall_ns - age_ns),
+            "observation_sequence": sample.observation_sequence,
+            "host_observation_id": feedback.get("observation_id"),
+            "host_state": feedback.get("state"), "host_epoch": feedback.get("epoch"),
+            "follower_positions": _console_numbers(sample.follower_positions, CONSOLE_ARM_KEYS),
+            "leader_positions": leader_values if leader_source == "physical" else {},
+            "scripted_target": leader_values if leader_source == "scripted" else {},
+            "requested_targets": _console_numbers(action, CONSOLE_ARM_KEYS),
+            "body_observation": _console_numbers(sample.observation,
+                                                  CONSOLE_BODY_OBSERVATION_KEYS & raw_keys)}
+
+
+def make_console_host_feedback_event(sample: Any, feedback: dict[str, Any], *,
+                                     wall_ns: int, monotonic_now: float) -> dict[str, Any]:
+    age_ns = int(max(0.0, monotonic_now - sample.observed_at) * 1e9)
+    return {"event": "host_feedback", "acquired_at_ns": max(0, wall_ns - age_ns),
+            "observation_sequence": sample.observation_sequence,
+            "host_observation_id": feedback.get("observation_id"),
+            "host_state": feedback.get("state"), "host_epoch": feedback.get("epoch")}
+
+
+def make_console_action_sent_event(action: Any, *, sequence: int, interval_ms: float,
+                                   wall_ns: int) -> dict[str, Any]:
+    return {"event": "action_sent", "acquired_at_ns": wall_ns, "action_sequence": sequence,
+            "action_send_interval_ms": interval_ms,
+            "requested_targets": _console_numbers(action, CONSOLE_ARM_KEYS | CONSOLE_BODY_OBSERVATION_KEYS)}
+
+
+def publish_console_telemetry_best_effort(client: Any, build_event: Callable[[], dict[str, Any]]) -> None:
+    """Display-only data must never turn a valid robot action into a failure."""
+    try:
+        client.publish_telemetry(build_event())
+    except Exception:
+        pass
 
 
 def _encode(message: dict[str, Any]) -> bytes:
@@ -152,6 +214,7 @@ class AM1ConsoleBridgeClient:
         self._worker: threading.Thread | None = None
         self._stop = threading.Event()
         self._outbound: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=8)
+        self._telemetry_pending: dict[str, dict[str, Any]] = {}
         self._gate_events: dict[tuple[str, int | None], threading.Event] = {}
         self._epoch = 0
         self._last_seq = 0
@@ -203,7 +266,16 @@ class AM1ConsoleBridgeClient:
                 try:
                     message = self._outbound.get_nowait()
                 except queue.Empty:
-                    pass
+                    with self._lock:
+                        message = self._telemetry_pending.pop(next(iter(self._telemetry_pending))) if self._telemetry_pending else None
+                    if message is not None:
+                        try:
+                            packet = _encode({"session_id": self.session_id, "epoch": self._epoch,
+                                              "seq": 0, "kind": "telemetry", "payload": message})
+                        except (TypeError, ValueError):
+                            pass  # A display-only sample is not allowed to fault native input.
+                        else:
+                            self._conn.send_bytes(packet)
                 else:
                     self._conn.send_bytes(_encode(message))
                 if self._conn.poll(0.05):
@@ -261,6 +333,13 @@ class AM1ConsoleBridgeClient:
                 event.set()
                 return True
         return False
+
+    def publish_telemetry(self, event: dict[str, Any]) -> None:
+        """Replace a pending display sample without delaying action or approval traffic."""
+        if event.get("event") not in {"live_sample", "action_sent", "host_feedback"}:
+            return
+        with self._lock:
+            self._telemetry_pending[event["event"]] = event
 
     def body_keys(self, *, now: float | None = None) -> set[str]:
         at = self.clock() if now is None else now
@@ -379,6 +458,7 @@ class AM1ConsoleBridgeServer:
             self.auth_file.unlink(missing_ok=True)
             raise
         self.connection = None
+        self._telemetry_sink = None
         self._send_seq = 0
         self._thread = threading.Thread(target=self._io, name="am1-console-pipe-owner", daemon=True)
         self._thread.start()
@@ -415,6 +495,15 @@ class AM1ConsoleBridgeServer:
                             if message.get("epoch") != self.state.epoch:
                                 continue
                             self.state.request_gate(stage, host_epoch=host_epoch)
+                    elif message.get("kind") == "telemetry" and message.get("epoch") == self.state.epoch:
+                        payload = message.get("payload")
+                        if isinstance(payload, dict) and payload.get("event") in {"live_sample", "action_sent", "host_feedback"}:
+                            sink = self._telemetry_sink
+                            if sink is not None:
+                                try:
+                                    sink(payload)
+                                except Exception:
+                                    pass  # A display subscriber must not tear down the input bridge.
                 with self.lock:
                     pending = self.state.pending_gate
                     if pending is not None and self.state.gate_ack(pending[0], host_epoch=pending[1], now=self.clock()):
@@ -441,6 +530,9 @@ class AM1ConsoleBridgeServer:
         with self.lock:
             return self.state.browser_keys(token=token, epoch=epoch, seq=seq, keys=keys,
                                            active=active, now=self.clock())
+
+    def set_telemetry_sink(self, sink: Any) -> None:
+        self._telemetry_sink = sink
 
     def request_pause(self, cause: str) -> None:
         with self.lock:

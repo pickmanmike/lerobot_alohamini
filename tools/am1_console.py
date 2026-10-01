@@ -17,6 +17,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+from tools.am1_console_model import ConsoleSnapshot
+
 
 class ConsoleSessionAdapter:
     """One console-facing adapter around the existing local session owner."""
@@ -38,6 +40,7 @@ class ConsoleSessionAdapter:
         self._final_exit_code: int | None = None
         self._error: str | None = None
         self._events = deque(maxlen=128)
+        self._telemetry = ConsoleSnapshot()
         self._event_sink = None
         self._bridge = None
         self._control_token: str | None = None
@@ -45,9 +48,27 @@ class ConsoleSessionAdapter:
     def set_event_sink(self, sink):
         self._event_sink = sink
 
+    def camera_status(self, status: dict, *, acquired_at_ns: int) -> bool:
+        cameras = status.get("cameras") if isinstance(status, dict) else None
+        if not isinstance(cameras, dict):
+            self.camera_status_failed(acquired_at_ns=acquired_at_ns)
+            return False
+        with self._lock:
+            self._telemetry.update({"event": "camera_status", "acquired_at_ns": acquired_at_ns,
+                                    "roles": cameras})
+        return True
+
+    def camera_status_failed(self, *, acquired_at_ns: int) -> None:
+        with self._lock:
+            self._telemetry.update({"event": "camera_status_failed", "acquired_at_ns": acquired_at_ns})
+
     def _emit(self, event):
         event = dict(event)
+        telemetry_only = event.get("event") in {"live_sample", "action_sent", "host_feedback", "system_sample"}
         with self._lock:
+            self._telemetry.update(event)
+            if telemetry_only:
+                return
             self._events.append(event)
             if event.get("event") in {"preflight_passed", "camera_ready", "host_ready"}:
                 self._phase = event["event"]
@@ -65,6 +86,8 @@ class ConsoleSessionAdapter:
 
     def _prepare_console(self, session_id: str):
         bridge = self.bridge_factory(session_id, self.config.local_state_directory, self._control_token)
+        if hasattr(bridge, "set_telemetry_sink"):
+            bridge.set_telemetry_sink(self._emit)
         with self._lock:
             self._bridge = bridge
         return bridge.pipe_name, bridge.auth_file
@@ -107,7 +130,7 @@ class ConsoleSessionAdapter:
         with self._lock:
             state = {"session_id": self._session_id, "phase": self._phase,
                     "final_exit_code": self._final_exit_code, "error": self._error,
-                    "events": list(self._events)}
+                    "events": list(self._events), "telemetry": self._telemetry.snapshot(now_ns=time.time_ns())}
             bridge = self._bridge
         if bridge is not None:
             state.update(bridge.snapshot())
@@ -425,7 +448,15 @@ class ConsoleHandler(BaseHTTPRequestHandler):
 
     def _proxy_camera(self, camera_path: str):
         streaming = camera_path.startswith("/api/stream.mjpeg")
+        is_status = camera_path == "/status.json"
+        request_started_ns = time.time_ns()
+
+        def status_failed() -> None:
+            if is_status and hasattr(self.server.session_adapter, "camera_status_failed"):
+                self.server.session_adapter.camera_status_failed(acquired_at_ns=request_started_ns)
+
         if not self.server.camera_slots.acquire(blocking=False):
+            status_failed()
             self._reply(503)
             return
         if streaming and not self.server.stream_slots.acquire(blocking=False):
@@ -438,6 +469,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             connection.request("GET", camera_path, headers={"Authorization": self.server.camera_authorization})
             response = connection.getresponse()
             if response.status != 200:
+                status_failed()
                 self._reply(503)
                 return
             if streaming:
@@ -457,13 +489,26 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             else:
                 length = response.getheader("Content-Length")
                 if length is None or not length.isdecimal() or int(length) > 1_000_000:
+                    status_failed()
                     self._reply(502)
                     return
                 body = response.read(int(length))
                 if len(body) != int(length):
+                    status_failed()
                     self._reply(502)
                     return
                 mime = "application/json" if camera_path == "/status.json" else "image/jpeg"
+                if is_status and hasattr(self.server.session_adapter, "camera_status"):
+                    try:
+                        if not self.server.session_adapter.camera_status(
+                            json.loads(body), acquired_at_ns=request_started_ns
+                        ):
+                            self._reply(502)
+                            return
+                    except (ValueError, TypeError):
+                        status_failed()
+                        self._reply(502)
+                        return
                 extra = {}
                 if mime == "image/jpeg":
                     for name in ("X-Frame-Sequence", "X-Frame-Age-Ms"):
@@ -473,6 +518,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 self._headers(200, mime, len(body), extra=extra)
                 self.wfile.write(body)
         except (OSError, ValueError, http.client.HTTPException, BrokenPipeError, ConnectionResetError):
+            status_failed()
             try:
                 self._reply(503)
             except (OSError, ValueError):

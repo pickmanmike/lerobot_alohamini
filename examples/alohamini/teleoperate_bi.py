@@ -43,7 +43,10 @@ from leader_client_utils import (
     resolve_leader_ports,
 )
 from scripted_leader import ScriptedLeaderInput
-from am1_console_bridge import AM1ConsoleBridgeClient
+from am1_console_bridge import (
+    AM1ConsoleBridgeClient, make_console_action_sent_event, make_console_host_feedback_event,
+    make_console_live_sample_event, publish_console_telemetry_best_effort,
+)
 
 
 AM1_ARM_POSITION_KEYS = (
@@ -290,6 +293,7 @@ class AM1LiveActionSender:
         monotonic: Callable[[], float] = time.monotonic,
         wall_time_ns: Callable[[], int] = time.time_ns,
         sleep_fn: Callable[[float], None] = precise_sleep,
+        action_sent_callback: Callable[[Mapping[str, float | int], int, float, int], None] | None = None,
     ) -> None:
         if fps <= 0:
             raise ValueError("fps must be greater than zero")
@@ -313,6 +317,7 @@ class AM1LiveActionSender:
         self._monotonic = monotonic
         self._wall_time_ns = wall_time_ns
         self._sleep_fn = sleep_fn
+        self._action_sent_callback = action_sent_callback
         self._body_send_gate = threading.Lock()
         self._stop_requested = threading.Event()
         self._finished = threading.Event()
@@ -612,6 +617,13 @@ class AM1LiveActionSender:
                             self._longest_send_interval_ms,
                             send_interval_ms,
                         )
+                        sent_sequence = self._action_sequence
+                    if self._action_sent_callback is not None:
+                        try:
+                            self._action_sent_callback(action_to_send, sent_sequence,
+                                                       send_interval_ms, self._wall_time_ns())
+                        except Exception:
+                            pass  # Display telemetry cannot interrupt the action sender.
                     last_send_started_at = send_started_at
 
                     if not self._recovery_enabled or not self._ramp_after_resume:
@@ -2107,6 +2119,8 @@ def _run_am1_recovering_local_sender(
     control_pause_requested: Callable[[], bool] | None = None,
     manual_gate: Callable[[int | None], bool] | None = None,
     on_host_active: Callable[[], None] | None = None,
+    action_sent_callback: Callable[[Mapping[str, float | int], int, float, int], None] | None = None,
+    feedback_callback: Callable[[AM1LiveSample, Mapping[str, Any]], None] | None = None,
 ) -> str | None:
     """Unified Local only: a host-acknowledged hold while feedback recovers."""
     try:
@@ -2145,6 +2159,7 @@ def _run_am1_recovering_local_sender(
         monotonic=monotonic,
         wall_time_ns=wall_time_ns,
         sleep_fn=sleep_fn,
+        action_sent_callback=action_sent_callback,
     )
     sender_started = False
     started_at = monotonic()
@@ -2357,6 +2372,8 @@ def _run_am1_recovering_local_sender(
                 script_clock["feedback_read_s"] += max(0.0, monotonic() - feedback_read_started)
 
             feedback = _am1_local_feedback(robot)
+            if feedback_callback is not None:
+                feedback_callback(sample, feedback)
             host_observation_id = feedback["observation_id"]
             if host_observation_id <= last_host_observation_id:
                 raise SafetyRefusal("AM1 Local host observation ID did not advance")
@@ -2620,6 +2637,8 @@ def run_am1_live_sender(
     control_pause_requested: Callable[[], bool] | None = None,
     manual_gate: Callable[[int | None], bool] | None = None,
     on_host_active: Callable[[], None] | None = None,
+    action_sent_callback: Callable[[Mapping[str, float | int], int, float, int], None] | None = None,
+    feedback_callback: Callable[[AM1LiveSample, Mapping[str, Any]], None] | None = None,
 ) -> str | None:
     """Read devices on the caller thread while a private worker sends live actions."""
     approved_target = extract_am1_arm_positions(
@@ -2678,6 +2697,8 @@ def run_am1_live_sender(
             wall_time_ns=wall_time_ns, sleep_fn=sleep_fn, should_stop=should_stop,
             body_action_supplier=body_action_supplier, input_fn=input_fn,
             sample_callback=sample_callback, announce_active=announce_active, scripted_input=scripted_input,
+            action_sent_callback=action_sent_callback,
+            feedback_callback=feedback_callback,
             control_pause_requested=control_pause_requested, manual_gate=manual_gate,
             on_host_active=on_host_active,
         )
@@ -2702,6 +2723,7 @@ def run_am1_live_sender(
         monotonic=monotonic,
         wall_time_ns=wall_time_ns,
         sleep_fn=sleep_fn,
+        action_sent_callback=action_sent_callback,
     )
     sender_started = False
     last_used_observation_sequence = initial_observation_sequence
@@ -3186,14 +3208,37 @@ def run_teleoperation(
                 return quit_key in keyboard_keys
 
             sample_callback = None
-            if log_rerun_data is not None:
+            if log_rerun_data is not None or console_input is not None:
                 def log_live_sample(
                     sample: AM1LiveSample,
                     scoped_action: Mapping[str, float | int],
                 ) -> None:
-                    log_rerun_data(dict(sample.observation), dict(scoped_action))
+                    if log_rerun_data is not None:
+                        log_rerun_data(dict(sample.observation), dict(scoped_action))
+                    if console_input is not None:
+                        publish_console_telemetry_best_effort(
+                            console_input, lambda: make_console_live_sample_event(
+                                sample, dict(scoped_action),
+                                raw_keys=robot.latest_raw_observation_keys,
+                                host_feedback=robot.latest_am1_local_feedback,
+                                wall_ns=time.time_ns(), monotonic_now=monotonic(),
+                                leader_source="scripted" if scripted_mode else "physical",
+                            ))
 
                 sample_callback = log_live_sample
+
+            def publish_console_feedback(sample: AM1LiveSample, feedback: Mapping[str, Any]) -> None:
+                if console_input is None:
+                    return
+                publish_console_telemetry_best_effort(
+                    console_input, lambda: make_console_host_feedback_event(
+                        sample, dict(feedback), wall_ns=time.time_ns(), monotonic_now=monotonic()))
+
+            def publish_console_action(action: Mapping[str, float | int], sequence: int,
+                                       interval_ms: float, wall_ns: int) -> None:
+                if console_input is not None:
+                    console_input.publish_telemetry(make_console_action_sent_event(
+                        action, sequence=sequence, interval_ms=interval_ms, wall_ns=wall_ns))
 
             raise_if_external_stop_requested()
             if getattr(args, "unified_session_enter_confirmations", False):
@@ -3257,6 +3302,8 @@ def run_teleoperation(
                         local_body_action_supplier if getattr(args, "local_mode", False) else None
                     ),
                     sample_callback=sample_callback,
+                    action_sent_callback=publish_console_action if console_input is not None else None,
+                    feedback_callback=publish_console_feedback if console_input is not None else None,
                     recovery_enabled=bool(getattr(args, "unified_session_enter_confirmations", False)),
                     max_start_mismatch=args.max_start_mismatch,
                     input_fn=input_fn,
