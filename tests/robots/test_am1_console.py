@@ -108,6 +108,26 @@ def test_open_is_read_only(running_console):
     assert adapter.operations == []
 
 
+def test_actual_entrypoint_wires_real_server_constructor_without_starting_session(monkeypatch, tmp_path):
+    auth = tmp_path / "viewer.json"
+    auth.write_text(json.dumps({"username": "fixture", "password": "fixture-only"}), encoding="utf-8")
+    config = SimpleNamespace(console_camera_auth_file=auth, browser_url="http://127.0.0.1:1984")
+    monkeypatch.setattr(session.SessionConfig, "load", lambda _: config)
+    real_server = console.ConsoleServer
+
+    class ShortConsole(real_server):
+        def __init__(self, address, config, camera_auth_file, session_adapter):
+            assert address == ("127.0.0.1", 8765)
+            super().__init__(("127.0.0.1", 0), config, camera_auth_file, session_adapter)
+            assert self.session_adapter.state()["session_id"] is None
+
+        def serve_forever(self):
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(console, "ConsoleServer", ShortConsole)
+    assert console.run_console(tmp_path / "config.json", no_browser=True, session_module=session) == 0
+
+
 def test_proxy_refuses_unlisted_target_and_never_exposes_credentials(running_console):
     server, _ = running_console
     cookie, _, page = session_tokens(server)
@@ -720,7 +740,7 @@ def test_console_launcher_is_read_only_until_start(monkeypatch, tmp_path):
     class FakeServer:
         server_address = ("127.0.0.1", 8765)
 
-        def __init__(self, config, auth_file, adapter, address):
+        def __init__(self, address, config, auth_file, adapter):
             assert auth_file == auth and address == ("127.0.0.1", 8765)
             events.append("bound")
 

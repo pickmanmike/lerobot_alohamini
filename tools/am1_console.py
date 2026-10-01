@@ -836,7 +836,7 @@ def run_console(config_path: Path, *, no_browser: bool = False, session_module=N
             raise ValueError("private console_camera_auth_file is not configured")
         repository = Path(__file__).resolve().parents[1]
         adapter = ConsoleSessionAdapter(config, repository, session_module)
-        server = ConsoleServer(config, auth_file, adapter, ("127.0.0.1", 8765))
+        server = ConsoleServer(("127.0.0.1", 8765), config, auth_file, adapter)
     except (session_module.SessionError, OSError, ValueError) as exc:
         print(f"AM1 console refused before session start: {exc}")
         return 2
