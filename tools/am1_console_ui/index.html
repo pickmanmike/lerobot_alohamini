@@ -31,8 +31,20 @@
 <section id="thumbnails" aria-label="Camera positions"></section></div>
 <details><summary>Browser delivery diagnostics</summary><pre id="diagnostics">Waiting for status…</pre></details>
 <p class="note">Camera age is measured from gateway JPEG receipt, not physical scene-to-display latency. Last frame / waiting is not a live driving view.</p></main>
-<main data-console-page="servos" hidden><p>Servo snapshots will appear here when sourced measurements are available. No second motor reader is started.</p></main>
-<main data-console-page="system" hidden><p>System observations are not sampled yet.</p></main>
-<main data-console-page="logs" hidden><p>Exact session logs will appear here after collection.</p></main>
-<main data-console-page="terminal" hidden><p>Read-only event view. This console has no command execution route.</p></main>
+<main data-console-page="servos" hidden><p>Latest sourced snapshots only. Opening this page never reads a motor. Missing motor current, temperature or status stays Not sampled.</p>
+<div id="servo-schematic" class="servo-schematic" aria-label="Follower arms, lift and three base wheels"></div>
+<details><summary>All sourced servo fields and identities</summary>
+<div class="table-scroll"><table><thead><tr><th scope="col">Identity</th><th scope="col">Position</th><th scope="col">Sent target</th><th scope="col">Current</th><th scope="col">Temperature</th><th scope="col">Status</th></tr></thead><tbody id="servo-rows"></tbody></table></div></details></main>
+<main data-console-page="system" hidden><p id="system-notice">System samples are read-only Pi OS snapshots. Their displayed age is a lower bound from Windows receipt; SSH transit time is unknown.</p>
+<div class="table-scroll"><table><tbody id="system-rows"></tbody></table></div></main>
+<main data-console-page="logs" hidden><p>Only files in this session's exact result folder are available. A missing or oversized file is refused; use the existing collection-only command for missing remote logs.</p>
+<div class="log-actions"><label>Component/source <select id="log-kind"><option value="client">Windows client</option><option value="host">Pi motor host</option><option value="camera">Pi camera</option><option value="ssh">SSH control</option><option value="summary">Session summary</option></select></label>
+<button type="button" id="log-load">Load</button><button type="button" id="log-export">Export exact file</button><label>Severity <select id="log-severity"><option value="all">All</option><option value="error">Error/fault</option><option value="warning">Warning</option><option value="info">Other</option></select></label>
+<label>Filter lines <input id="log-filter" type="search" autocomplete="off"></label><label><input id="log-follow" type="checkbox">Follow</label><label><input id="log-pause" type="checkbox">Pause</label></div>
+<p id="log-session">No exact session log selected.</p>
+<pre id="log-lines" class="readout">No log loaded.</pre></main>
+<main data-console-page="terminal" hidden><p>Read-only original output for one exact session and component. There is no command input or execution route.</p>
+<label>Original output <select id="terminal-kind"><option value="client">Windows client</option><option value="host">Pi motor host</option><option value="camera">Pi camera</option><option value="ssh">SSH control</option></select></label>
+<button type="button" id="terminal-load">View</button><pre id="terminal-output" class="readout">No output selected.</pre>
+<details><summary>Bounded lifecycle and fault events</summary><pre id="terminal-events" class="readout">No events yet.</pre></details></main>
 </body></html>

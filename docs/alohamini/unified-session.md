@@ -49,6 +49,30 @@ source has passed offline fake/browser checks, but has not yet had its single
 attended integrated check; the deployed helper and separate camera source must
 be verified and staged before that check.
 
+The Servos page distinguishes the physical leader and Pi follower identities.
+It displays normalized position and the action actually sent; per-servo current,
+temperature and status remain **Not sampled** until a correctly identified
+same-owner source exists. The System page shows cached Pi OS snapshots, body
+observations, host state/epoch, action cadence and camera-source health. A Pi
+acquisition timestamp is retained, while the displayed sample age is only a
+lower bound from Windows receipt because SSH transit and clock skew are not
+measured. Configured source pins are labeled expected until the session's
+preflight reports exact source heads. Stale or failed camera status never makes
+a retained frame live.
+
+Logs loads only one exact file from the current private session result folder:
+Windows client, collected Pi host, collected Pi camera, SSH control, or summary.
+The console refuses missing, ambiguous and over-2 MB files. Its local filter
+shows at most 400 matching original lines; Export downloads the selected
+unchanged file; timestamps appear where present in the original log. The Logs
+page has a bounded recent-line view, component/source and severity filters,
+search, and optional follow/pause. For a missing Pi log, use the existing
+`-CollectOnly -SessionId` fallback. Terminal shows the original client, host,
+camera or SSH output as separate read-only views, plus bounded lifecycle/fault
+events; it has no command input or execution route. Changing any page releases
+browser body keys; the global Stop remains available. None of these pages starts a second motor
+reader or changes the original cleanup result.
+
 ## Current state — teleoperation closeout, September 29, 2026
 
 Local teleoperation is reasonably functional for **supervised LAN hobby use**.

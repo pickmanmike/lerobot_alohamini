@@ -68,6 +68,64 @@ class AM1BrowserInput {
 }
 globalThis.AM1BrowserInput = AM1BrowserInput;
 
+class AM1ConsoleViews {
+  static field(entry) {
+    if (!entry || entry.value === null || entry.value === undefined)
+      return entry?.state || "Not sampled";
+    const lowerBound = String(entry.age_basis || "").includes("lower bound");
+    const age = typeof entry.age_ms === "number" ? ` · age ${lowerBound ? "≥" : ""}${Math.round(entry.age_ms)} ms` : "";
+    return `${entry.value} ${entry.unit || ""} · ${entry.state || "Snapshot"} · ${entry.source || "source unknown"}${age}`;
+  }
+  static servoRows(servos) {
+    return Object.entries(servos || {}).sort(([a], [b]) => a.localeCompare(b)).map(([identity, parts]) => ({
+      identity, position:this.field(parts.position), target:this.field(parts.target),
+      current:this.field(parts.current), temperature:this.field(parts.temperature),
+      status:this.field(parts.status)
+    }));
+  }
+  static schematicGroups(servos, body) {
+    const joints = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"];
+    const side = name => joints.map(joint => ({label:joint.replaceAll("_", " "),
+      value:this.field(servos?.[`follower.${name}_bus.arm_${name}_${joint}.pos`]?.position)}));
+    const leaders = Object.entries(servos || {}).filter(([identity]) => identity.startsWith("leader."))
+      .sort(([a], [b]) => a.localeCompare(b)).map(([identity, values]) => ({
+        label:identity.replace("leader.", ""), value:this.field(values.position)}));
+    return {left:side("left"), right:side("right"), leaders,
+      lift:{label:"lift axis", value:this.field(body?.["lift_axis.height_mm"])},
+      wheels:[8, 9, 10].map(id => ({label:`base wheel ID ${id}`, value:"Not sampled"}))};
+  }
+  static filteredLog(text, query, limit = 400, severity = "all") {
+    const needle = String(query || "").toLowerCase();
+    const matchesSeverity = line => severity === "all" || (severity === "error" ?
+      /\b(error|fault|refused|traceback|failed)\b/i.test(line) : severity === "warning" ?
+      /\b(warning|warn)\b/i.test(line) : !/\b(error|fault|refused|traceback|failed|warning|warn)\b/i.test(line));
+    return String(text || "").split(/\r?\n/).filter(line => line && line.toLowerCase().includes(needle) && matchesSeverity(line))
+      .slice(-Math.max(1, Math.min(limit, 400))).join("\n");
+  }
+  static acceptLogResponse(requestedSessionId, currentSessionId) {
+    return Boolean(requestedSessionId) && requestedSessionId === currentSessionId;
+  }
+  static logUrl(kind, sessionId, download = false) {
+    return `/api/log?kind=${encodeURIComponent(kind)}&session_id=${encodeURIComponent(sessionId)}`
+      + (download ? "&download=1" : "");
+  }
+  static hostStatus(observation, phase) {
+    if (!observation || observation.host_state == null) return "Not sampled";
+    const value = `${observation.host_state} / ${observation.host_epoch ?? "unknown"}`;
+    const stale = observation.age_ms == null || observation.age_ms > 1000 ||
+      ["complete", "failed", "cleanup_unknown", "stopping"].includes(phase);
+    return stale ? `Last observed ${value} (Snapshot; ${Math.round(observation.age_ms ?? 0)} ms ago)` : value;
+  }
+  static eventLines(events) {
+    return (events || []).slice(-80).map(event => {
+      const stamp = Number.isInteger(event.wall_time_ns) && event.wall_time_ns > 0 ?
+        new Date(event.wall_time_ns / 1e6).toISOString() : "time unavailable";
+      return `${stamp} · ${event.event || "event"}${event.reason ? ` · ${event.reason}` : ""}`;
+    }).join("\n");
+  }
+}
+globalThis.AM1ConsoleViews = AM1ConsoleViews;
+
 if (typeof document !== "undefined") {
   const csrf = document.querySelector('meta[name="am1-csrf"]').content;
   const stateText = document.querySelector("#session-state");
@@ -83,6 +141,87 @@ if (typeof document !== "undefined") {
   });
   let state = null;
   let busy = false;
+  let stateRequestInFlight = false;
+  let loadedLog = "";
+  let loadedLogSessionId = null;
+  let logRequestId = 0;
+  let logRequestInFlight = false;
+  let terminalRequestId = 0;
+
+  function row(container, label, value) {
+    const line = document.createElement("tr");
+    const name = document.createElement("th");
+    const data = document.createElement("td");
+    name.scope = "row";
+    name.textContent = label;
+    data.textContent = value;
+    line.append(name, data);
+    container.append(line);
+  }
+  function renderSnapshot(snapshot) {
+    const telemetry = snapshot?.telemetry || {};
+    const schematic = document.querySelector("#servo-schematic");
+    schematic.replaceChildren();
+    const groups = AM1ConsoleViews.schematicGroups(telemetry.servos, telemetry.body);
+    for (const [title, cards] of [["Left follower arm", groups.left], ["Right follower arm", groups.right],
+                                  ["Lift and base", [groups.lift, ...groups.wheels]],
+                                  ...(groups.leaders.length ? [["Connected physical leaders", groups.leaders]] : [])]) {
+      const section = document.createElement("section");
+      section.className = "schematic-group";
+      const heading = document.createElement("h3");
+      heading.textContent = title;
+      section.append(heading);
+      const rail = document.createElement("div");
+      rail.className = "schematic-rail";
+      for (const card of cards) {
+        const item = document.createElement("div");
+        item.className = "schematic-card";
+        const name = document.createElement("strong");
+        name.textContent = card.label;
+        const value = document.createElement("span");
+        value.textContent = card.value;
+        item.append(name, value);
+        rail.append(item);
+      }
+      section.append(rail);
+      schematic.append(section);
+    }
+    const servoBody = document.querySelector("#servo-rows");
+    servoBody.replaceChildren();
+    for (const details of AM1ConsoleViews.servoRows(telemetry.servos)) {
+      const tr = document.createElement("tr");
+      for (const key of ["identity", "position", "target", "current", "temperature", "status"]) {
+        const cell = document.createElement(key === "identity" ? "th" : "td");
+        if (key === "identity") cell.scope = "row";
+        cell.textContent = details[key];
+        tr.append(cell);
+      }
+      servoBody.append(tr);
+    }
+    const systemBody = document.querySelector("#system-rows");
+    systemBody.replaceChildren();
+    row(systemBody, "Session", snapshot.session_id || "No session");
+    row(systemBody, "Phase / result", `${snapshot.phase || "idle"} / ${snapshot.final_exit_code ?? "pending"}`);
+    row(systemBody, "Cleanup verified", snapshot.cleanup_verified == null ? "Not yet known" : snapshot.cleanup_verified ? "Yes" : "NO — inspect summary and stop before restart");
+    row(systemBody, "Host state / epoch", AM1ConsoleViews.hostStatus(telemetry.observation, snapshot.phase));
+    row(systemBody, "Observation age", telemetry.observation?.age_ms == null ? "Not sampled" : `${Math.round(telemetry.observation.age_ms)} ms`);
+    row(systemBody, "Sent action sequence", telemetry.action?.sequence ?? "Not sampled");
+    row(systemBody, "Action interval", telemetry.action?.send_interval_ms == null ? "Not sampled" : `${Math.round(telemetry.action.send_interval_ms)} ms`);
+    for (const [key, value] of Object.entries(snapshot.configured_source_pins || {}))
+      row(systemBody, `Configured expected ${key}`, value || "Not sampled");
+    if (snapshot.verified_source_heads) {
+      for (const [key, value] of Object.entries(snapshot.verified_source_heads))
+        row(systemBody, `Preflight reported ${key}`, value);
+    } else row(systemBody, "Preflight source report", "Not yet available");
+    for (const [key, entry] of Object.entries(telemetry.body || {}))
+      row(systemBody, `Body ${key}`, AM1ConsoleViews.field(entry));
+    for (const [key, entry] of Object.entries(telemetry.system || {}))
+      row(systemBody, `Pi ${key}`, AM1ConsoleViews.field(entry));
+    for (const [role, camera] of Object.entries(telemetry.cameras || {}))
+      row(systemBody, `Camera ${role}`, `${camera.state || "Unavailable"} · age ${camera.age_ms == null ? "unknown" : `${Math.round(camera.age_ms)} ms`} · seq ${camera.sequence ?? "unknown"}`);
+    document.querySelector("#terminal-events").textContent = AM1ConsoleViews.eventLines(
+      [...(snapshot.events || []), ...(telemetry.events || [])].sort((a, b) => (a.wall_time_ns || 0) - (b.wall_time_ns || 0)));
+  }
 
   async function post(url, payload) {
     const response = await fetch(url, {method:"POST", credentials:"same-origin", cache:"no-store",
@@ -101,10 +240,22 @@ if (typeof document !== "undefined") {
     });
   }
   async function readState() {
+    if (stateRequestInFlight) return;
+    stateRequestInFlight = true;
     try {
       const response = await fetch("/api/state", {cache:"no-store", credentials:"same-origin"});
       if (!response.ok) throw new Error("session state unavailable");
+      const priorSessionId = state?.session_id;
       state = await response.json();
+      if (priorSessionId !== state.session_id) {
+        loadedLog = "";
+        loadedLogSessionId = null;
+        logRequestId++;
+        terminalRequestId++;
+        document.querySelector("#log-lines").textContent = "Session changed. Load its exact log.";
+        document.querySelector("#log-session").textContent = "No exact session log selected.";
+        document.querySelector("#terminal-output").textContent = "Session changed. Select an original output.";
+      }
       stateText.textContent = state.session_id ? `Session ${state.session_id}: ${state.phase}` : "No session is active.";
       const saved = sessionStorage.getItem("am1-control-owner");
       if (saved && !input.sessionId && state.session_id) {
@@ -116,11 +267,90 @@ if (typeof document !== "undefined") {
       document.querySelector("#gate-state").textContent = gate ?
         `Approval needed: ${gate[0]} (host epoch ${gate[1] ?? "before live"}). Hold leaders still and release body keys.` :
         "No manual approval pending.";
+      try { renderSnapshot(state); } catch {
+        document.querySelector("#system-notice").textContent = "Diagnostic display unavailable; Control and Stop remain available.";
+      }
     } catch {
       stateText.textContent = "Session state unavailable; no motor readiness implied.";
       input.release();
+    } finally { stateRequestInFlight = false; }
+  }
+
+  async function loadLog() {
+    if (logRequestInFlight) return;
+    const kind = document.querySelector("#log-kind").value;
+    const output = document.querySelector("#log-lines");
+    const requestedSessionId = state?.session_id;
+    const requestId = ++logRequestId;
+    if (!requestedSessionId) { output.textContent = "No session result is selected."; return; }
+    logRequestInFlight = true;
+    loadedLog = "";
+    output.textContent = "Loading exact session log…";
+    try {
+      const response = await fetch(AM1ConsoleViews.logUrl(kind, requestedSessionId),
+        {cache:"no-store", credentials:"same-origin"});
+      if (!response.ok) throw new Error(`log unavailable (${response.status})`);
+      const text = await response.text();
+      if (!AM1ConsoleViews.acceptLogResponse(requestedSessionId, state?.session_id) || requestId !== logRequestId) return;
+      loadedLog = text;
+      loadedLogSessionId = requestedSessionId;
+      renderLoadedLog();
+    } catch (error) {
+      if (requestId === logRequestId) output.textContent = error.message;
+    } finally { logRequestInFlight = false; }
+  }
+  function renderLoadedLog() {
+    if (!AM1ConsoleViews.acceptLogResponse(loadedLogSessionId, state?.session_id)) return;
+    document.querySelector("#log-lines").textContent = AM1ConsoleViews.filteredLog(
+      loadedLog, document.querySelector("#log-filter").value, 400,
+      document.querySelector("#log-severity").value) || "No matching lines.";
+    document.querySelector("#log-session").textContent = `Exact session ${loadedLogSessionId} · ${document.querySelector("#log-kind").value}`;
+  }
+  document.querySelector("#log-load").addEventListener("click", loadLog);
+  document.querySelector("#log-kind").addEventListener("change", () => {
+    logRequestId++;
+    loadedLog = "";
+    loadedLogSessionId = null;
+    document.querySelector("#log-lines").textContent = "Select Load for the chosen exact session log.";
+    document.querySelector("#log-session").textContent = "No exact session log selected.";
+  });
+  document.querySelector("#log-filter").addEventListener("input", renderLoadedLog);
+  document.querySelector("#log-severity").addEventListener("change", renderLoadedLog);
+  document.querySelector("#log-export").addEventListener("click", () => {
+    const sessionId = state?.session_id;
+    if (!sessionId) return;
+    const kind = document.querySelector("#log-kind").value;
+    const link = document.createElement("a");
+    link.href = AM1ConsoleViews.logUrl(kind, sessionId, true);
+    link.click();
+  });
+  setInterval(() => {
+    if (input.route === "logs" && document.querySelector("#log-follow").checked &&
+        !document.querySelector("#log-pause").checked) loadLog();
+  }, 2000);
+  async function loadTerminal() {
+    const kind = document.querySelector("#terminal-kind").value;
+    const output = document.querySelector("#terminal-output");
+    const requestedSessionId = state?.session_id;
+    const requestId = ++terminalRequestId;
+    if (!requestedSessionId) { output.textContent = "No session result is selected."; return; }
+    output.textContent = "Loading original output…";
+    try {
+      const response = await fetch(AM1ConsoleViews.logUrl(kind, requestedSessionId),
+        {cache:"no-store", credentials:"same-origin"});
+      if (!response.ok) throw new Error(`original output unavailable (${response.status})`);
+      const text = await response.text();
+      if (!AM1ConsoleViews.acceptLogResponse(requestedSessionId, state?.session_id) || requestId !== terminalRequestId) return;
+      output.textContent = text;
+    } catch (error) {
+      if (requestId === terminalRequestId) output.textContent = error.message;
     }
   }
+  document.querySelector("#terminal-load").addEventListener("click", loadTerminal);
+  document.querySelector("#terminal-kind").addEventListener("change", () => {
+    terminalRequestId++;
+    document.querySelector("#terminal-output").textContent = "Select View for this original output.";
+  });
   async function operation(kind) {
     if (busy) return;
     busy = true;

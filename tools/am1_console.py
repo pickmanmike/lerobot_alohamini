@@ -8,6 +8,7 @@ import base64
 import hmac
 import http.client
 import json
+import re
 import secrets
 import threading
 import time
@@ -15,9 +16,19 @@ import webbrowser
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from pathlib import PurePosixPath
 from urllib.parse import parse_qs, urlsplit
 
 from tools.am1_console_model import ConsoleSnapshot
+
+
+MAX_CONSOLE_LOG_BYTES = 2_000_000
+LOG_KINDS = frozenset({"client", "host", "camera", "ssh", "summary"})
+REMOTE_LOG_NAME = re.compile(r"am1-(?:local-host|camera)-[A-Za-z0-9-]{1,100}\.log\Z")
+
+
+class SessionMismatchError(Exception):
+    """A log request refers to a session no longer owned by this console."""
 
 
 class ConsoleSessionAdapter:
@@ -38,6 +49,9 @@ class ConsoleSessionAdapter:
         self._session_id: str | None = None
         self._phase = "idle"
         self._final_exit_code: int | None = None
+        self._cleanup_verified: bool | None = None
+        self._verified_source_heads: dict[str, str] | None = None
+        self._verified_source_at_ns: int | None = None
         self._error: str | None = None
         self._events = deque(maxlen=128)
         self._telemetry = ConsoleSnapshot()
@@ -70,10 +84,21 @@ class ConsoleSessionAdapter:
             if telemetry_only:
                 return
             self._events.append(event)
-            if event.get("event") in {"preflight_passed", "camera_ready", "host_ready"}:
+            if event.get("event") in {"preflight_passed", "camera_ready", "host_ready"} and self._phase != "stopping":
                 self._phase = event["event"]
+            elif event.get("event") == "stop_requested":
+                self._phase = "stopping"
+            if event.get("event") == "preflight_passed" and isinstance(event.get("sources"), dict):
+                self._verified_source_heads = {
+                    key: value for key, value in event["sources"].items()
+                    if isinstance(key, str) and key.endswith("_source_head")
+                    and isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40}", value)
+                }
+                self._verified_source_at_ns = time.time_ns()
             elif event.get("event") == "cleanup" and not event.get("cleanup_verified"):
                 self._phase = "cleanup_unknown"
+            if event.get("event") in {"cleanup", "session_complete"} and type(event.get("cleanup_verified")) is bool:
+                self._cleanup_verified = event["cleanup_verified"]
         if self._event_sink is not None:
             self._event_sink(event)
 
@@ -129,12 +154,69 @@ class ConsoleSessionAdapter:
     def state(self):
         with self._lock:
             state = {"session_id": self._session_id, "phase": self._phase,
-                    "final_exit_code": self._final_exit_code, "error": self._error,
+                    "final_exit_code": self._final_exit_code, "cleanup_verified": self._cleanup_verified,
+                    "error": self._error,
                     "events": list(self._events), "telemetry": self._telemetry.snapshot(now_ns=time.time_ns())}
+            state["configured_source_pins"] = {name: getattr(self.config, name, None) for name in (
+                "remote_session_head", "remote_motor_head", "remote_camera_head")}
+            state["verified_source_heads"] = None if self._verified_source_heads is None else dict(self._verified_source_heads)
+            state["verified_source_at_ns"] = self._verified_source_at_ns
             bridge = self._bridge
         if bridge is not None:
             state.update(bridge.snapshot())
         return state
+
+    def read_log(self, kind: str, expected_session_id: str) -> tuple[str, bytes]:
+        """Read only one named file from this console's exact owned result folder."""
+        if kind not in LOG_KINDS:
+            raise ValueError("unknown AM1 session log kind")
+        if not self.session_module.SESSION_ID_PATTERN.fullmatch(expected_session_id):
+            raise ValueError("invalid AM1 session identity")
+        with self._lock:
+            session_id = self._session_id
+        if session_id != expected_session_id:
+            raise SessionMismatchError("AM1 session changed before log read")
+        if not isinstance(session_id, str) or not self.session_module.SESSION_ID_PATTERN.fullmatch(session_id):
+            raise FileNotFoundError("no current AM1 session result")
+        root = self.config.windows_log_directory.resolve()
+        directory = root / f"am1-session-{session_id}"
+        if directory.is_symlink() or not directory.is_dir() or directory.resolve().parent != root:
+            raise FileNotFoundError("AM1 session result is unavailable")
+        if kind == "client":
+            name = f"am1-local-windows-{session_id}.log"
+        elif kind == "ssh":
+            name = "ssh-control.log"
+        elif kind == "summary":
+            name = "session-summary.json"
+        else:
+            summary_path = directory / "session-summary.json"
+            summary = self._read_owned_file(summary_path, directory, limit=64_000)
+            manifest = json.loads(summary)
+            if not isinstance(manifest, dict) or manifest.get("session_id") != session_id:
+                raise FileNotFoundError("AM1 session log manifest does not match")
+            paths = manifest.get("remote_logs")
+            if not isinstance(paths, list):
+                raise FileNotFoundError("AM1 session log manifest is unavailable")
+            prefix = "am1-local-host-" if kind == "host" else "am1-camera-"
+            matches = [PurePosixPath(path).name for path in paths if isinstance(path, str)
+                       and PurePosixPath(path).name.startswith(prefix)
+                       and REMOTE_LOG_NAME.fullmatch(PurePosixPath(path).name)]
+            if len(matches) != 1:
+                raise FileNotFoundError("exact AM1 session log is unavailable or ambiguous")
+            name = matches[0]
+        return name, self._read_owned_file(directory / name, directory, limit=MAX_CONSOLE_LOG_BYTES)
+
+    @staticmethod
+    def _read_owned_file(path: Path, directory: Path, *, limit: int) -> bytes:
+        if path.is_symlink() or path.resolve().parent != directory.resolve():
+            raise FileNotFoundError("AM1 session log is outside the result folder")
+        if path.stat().st_size > limit:
+            raise OverflowError("AM1 session log exceeds the console read limit")
+        with path.open("rb") as stream:
+            data = stream.read(limit + 1)
+        if len(data) > limit:
+            raise OverflowError("AM1 session log exceeds the console read limit")
+        return data
 
     def wait(self, timeout: float) -> bool:
         worker = self._worker
@@ -159,7 +241,14 @@ class ConsoleSessionAdapter:
                 self._created.clear()
                 self._session_id = None
                 self._final_exit_code = None
+                self._cleanup_verified = None
+                self._verified_source_heads = None
+                self._verified_source_at_ns = None
                 self._error = None
+                # Session-owned observations/actions cannot be attributed to
+                # the next Start. Camera status is reacquired independently.
+                self._telemetry = ConsoleSnapshot()
+                self._events.clear()
                 self._control_token = secrets.token_hex(32)
                 self._phase = "starting"
                 self._worker = threading.Thread(target=self._run, args=(duration, leader_source, motion_profile),
@@ -291,6 +380,7 @@ class ConsoleServer(ThreadingHTTPServer):
         self.camera_slots = threading.BoundedSemaphore(8)
         self.stream_slots = threading.BoundedSemaphore(5)
         self.event_slots = threading.BoundedSemaphore(4)
+        self.log_slots = threading.BoundedSemaphore(2)
         self.events = deque(maxlen=128)
         self.event_sequence = 0
         self.event_condition = threading.Condition()
@@ -366,12 +456,27 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         tokens = [part.partition("=")[2] for part in parts if part.partition("=")[0] == COOKIE_NAME]
         return len(tokens) == 1 and hmac.compare_digest(tokens[0], self.server.cookie_token)
 
+    def _drain_small_post_body(self):
+        # A Windows TCP peer can reset the refused response if its request
+        # body is left unread. Bound both size and time for untrusted input.
+        length = self.headers.get("Content-Length", "")
+        if length.isdecimal() and int(length) <= MAX_POST_BYTES * 2:
+            try:
+                self.connection.settimeout(0.5)
+                self.rfile.read(int(length))
+            except OSError:
+                pass
+
     def _base_check(self):
         if not self._valid_host() or self.headers.get("Upgrade") or self.headers.get("Transfer-Encoding"):
+            if self.command == "POST":
+                self._drain_small_post_body()
             self._reply(403)
             return False
         target = urlsplit(self.path)
         if target.scheme or target.netloc or target.fragment or ".." in target.path.split("/"):
+            if self.command == "POST":
+                self._drain_small_post_body()
             self._reply(403)
             return False
         return True
@@ -405,6 +510,9 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         if target.path == "/api/state" and not target.query:
             self._json(200, self.server.session_adapter.state())
             return
+        if target.path == "/api/log":
+            self._serve_log(target)
+            return
         if target.path == "/api/events" and not target.query:
             self._events()
             return
@@ -416,6 +524,48 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             self._proxy_camera(camera_path)
             return
         self._reply(404)
+
+    def _serve_log(self, target):
+        if not self.server.log_slots.acquire(blocking=False):
+            self._reply(503)
+            return
+        try:
+            try:
+                query = parse_qs(target.query, strict_parsing=True, keep_blank_values=True)
+            except ValueError:
+                self._reply(400)
+                return
+            if set(query) - {"kind", "session_id", "download"} or len(query.get("kind", [])) != 1 or (
+                len(query.get("session_id", [])) != 1
+            ) or (
+                "download" in query and query["download"] != ["1"]
+            ):
+                self._reply(400)
+                return
+            try:
+                name, body = self.server.session_adapter.read_log(query["kind"][0], query["session_id"][0])
+            except ValueError:
+                self._reply(400)
+                return
+            except SessionMismatchError:
+                self._reply(409)
+                return
+            except (FileNotFoundError, OSError):
+                self._reply(404)
+                return
+            except OverflowError:
+                self._reply(413)
+                return
+            extra = {"Content-Disposition": f'attachment; filename="{name}"'} if query.get("download") == ["1"] else None
+            mime = "application/json" if query["kind"] == ["summary"] else "text/plain; charset=utf-8"
+            self.connection.settimeout(2)
+            try:
+                self._headers(200, mime, len(body), extra=extra)
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+                pass
+        finally:
+            self.server.log_slots.release()
 
     def _events(self):
         if not self.server.event_slots.acquire(blocking=False):
@@ -535,6 +685,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             return
         target = urlsplit(self.path)
         if target.query or target.path not in {"/api/operation", "/api/body"}:
+            self._drain_small_post_body()
             self._reply(404)
             return
         if (
@@ -542,14 +693,12 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             or self.headers.get_all("X-AM1-CSRF", []) != [self.server.csrf_token]
             or self.headers.get("Content-Type") != "application/json"
         ):
+            self._drain_small_post_body()
             self._reply(403)
             return
         length = self.headers.get("Content-Length", "")
         if not length.isdecimal() or int(length) > MAX_POST_BYTES:
-            # Consume only a small already-sent body before refusing, so the
-            # Windows TCP stack does not reset this ordinary 413 response.
-            if length.isdecimal() and int(length) <= MAX_POST_BYTES * 2:
-                self.rfile.read(int(length))
+            self._drain_small_post_body()
             self._reply(413)
             return
         try:

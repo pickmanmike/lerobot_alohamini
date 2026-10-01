@@ -165,6 +165,111 @@ def test_camera_health_uses_request_start_and_reports_failed_fetch(running_conso
     assert recorded[-1] == ("failed", 2_000_000_000)
 
 
+def test_exact_owned_session_logs_are_bounded_and_exportable(running_console, tmp_path):
+    server, _ = running_console
+    cookie, _, _ = session_tokens(server)
+    session_id = "20261001T120000-12345678"
+    result = tmp_path / f"am1-session-{session_id}"
+    result.mkdir()
+    (result / f"am1-local-windows-{session_id}.log").write_text("client line\n", encoding="utf-8")
+    (result / "am1-local-host-20261001-120001.log").write_text("host line\n", encoding="utf-8")
+    (result / "am1-camera-20261001-120001.log").write_text("camera line\n", encoding="utf-8")
+    (result / "ssh-control.log").write_text("ssh line\n", encoding="utf-8")
+    (result / "session-summary.json").write_text(json.dumps({"session_id": session_id,
+        "remote_logs": ["/home/operator/am1-local-host-20261001-120001.log",
+                        "/home/operator/am1-camera-20261001-120001.log"]}), encoding="utf-8")
+    adapter = console.ConsoleSessionAdapter(
+        SimpleNamespace(windows_log_directory=tmp_path), ROOT, session, bridge_factory=lambda *args: None)
+    adapter._on_created(session_id)
+    server.session_adapter = adapter
+    for kind, expected in (("client", b"client line"), ("host", b"host line"),
+                           ("camera", b"camera line"), ("ssh", b"ssh line"),
+                           ("summary", b'"remote_logs"')):
+        status, _, body = request(server, "GET", f"/api/log?kind={kind}&session_id={session_id}", cookie=cookie)
+        assert status == 200 and expected in body
+        status, headers, exported = request(server, "GET", f"/api/log?kind={kind}&session_id={session_id}&download=1", cookie=cookie)
+        assert status == 200 and exported == body
+        assert headers["Content-Disposition"].startswith("attachment;")
+    assert request(server, "GET", f"/api/log?kind=../../private&session_id={session_id}", cookie=cookie)[0] in (400, 404)
+    assert request(server, "GET", "/api/log?kind=client", cookie=cookie)[0] == 400
+    (result / f"am1-local-windows-{session_id}.log").write_bytes(b"x" * 2_000_001)
+    assert request(server, "GET", f"/api/log?kind=client&session_id={session_id}", cookie=cookie)[0] == 413
+
+
+def test_log_request_is_bound_to_expected_session_during_transition(running_console, tmp_path):
+    server, _ = running_console
+    cookie, _, _ = session_tokens(server)
+    first = "20261001T120000-12345678"
+    second = "20261001T120100-87654321"
+    for identity, line in ((first, "first"), (second, "second")):
+        result = tmp_path / f"am1-session-{identity}"
+        result.mkdir()
+        (result / f"am1-local-windows-{identity}.log").write_text(line, encoding="utf-8")
+    adapter = console.ConsoleSessionAdapter(
+        SimpleNamespace(windows_log_directory=tmp_path), ROOT, session, bridge_factory=lambda *args: None)
+    server.session_adapter = adapter
+    adapter._on_created(first)
+    assert request(server, "GET", f"/api/log?kind=client&session_id={first}", cookie=cookie)[2] == b"first"
+    adapter._on_created(second)
+    assert request(server, "GET", f"/api/log?kind=client&session_id={first}", cookie=cookie)[0] == 409
+    assert request(server, "GET", f"/api/log?kind=client&session_id={second}", cookie=cookie)[2] == b"second"
+
+
+def test_terminal_has_no_command_route(running_console):
+    server, adapter = running_console
+    cookie, csrf, _ = session_tokens(server)
+    assert request(server, "GET", "/api/terminal", cookie=cookie)[0] == 404
+    url = f"http://127.0.0.1:{server.server_address[1]}"
+    assert request(server, "POST", "/api/command", body={"command": "anything"},
+                   cookie=cookie, csrf=csrf, origin=url)[0] == 404
+    assert adapter.operations == []
+
+
+def test_log_capacity_cannot_starve_stop(running_console):
+    server, adapter = running_console
+    cookie, csrf, _ = session_tokens(server)
+    assert server.log_slots.acquire(blocking=False)
+    assert server.log_slots.acquire(blocking=False)
+    try:
+        assert request(server, "GET", "/api/log?kind=client", cookie=cookie)[0] == 503
+        url = f"http://127.0.0.1:{server.server_address[1]}"
+        status, _, _ = request(server, "POST", "/api/operation", body={"kind": "Stop", "session_id": "owned"},
+                               cookie=cookie, csrf=csrf, origin=url)
+        assert status == 200 and adapter.operations[-1]["kind"] == "Stop"
+    finally:
+        server.log_slots.release()
+        server.log_slots.release()
+
+
+def test_operational_failure_does_not_hide_unverified_cleanup(tmp_path):
+    adapter = console.ConsoleSessionAdapter(SimpleNamespace(), tmp_path, session, bridge_factory=lambda *args: None)
+    adapter._emit({"event": "cleanup", "cleanup_verified": False, "operational_exit_code": 2})
+    adapter._final_exit_code = 2
+    adapter._phase = "failed"
+    state = adapter.state()
+    assert state["final_exit_code"] == 2
+    assert state["cleanup_verified"] is False
+
+
+def test_configured_source_pins_are_not_claimed_as_preflight_verified(tmp_path):
+    config = SimpleNamespace(remote_session_head="a" * 40, remote_motor_head="b" * 40,
+                             remote_camera_head="c" * 40)
+    adapter = console.ConsoleSessionAdapter(config, tmp_path, session, bridge_factory=lambda *args: None)
+    idle = adapter.state()
+    assert idle["configured_source_pins"]["remote_motor_head"] == "b" * 40
+    assert idle["verified_source_heads"] is None
+    adapter._emit({"event": "preflight_passed", "sources": {"motor_source_head": "b" * 40}})
+    assert adapter.state()["verified_source_heads"] == {"motor_source_head": "b" * 40}
+
+
+def test_stop_requested_remains_stopping_until_cleanup(tmp_path):
+    adapter = console.ConsoleSessionAdapter(SimpleNamespace(), tmp_path, session, bridge_factory=lambda *args: None)
+    adapter._emit({"event": "host_ready"})
+    adapter._emit({"event": "stop_requested"})
+    adapter._emit({"event": "camera_ready"})  # A late readiness event must not undo Stop.
+    assert adapter.state()["phase"] == "stopping"
+
+
 def test_foreign_origin_and_oversized_post_refused(running_console):
     server, adapter = running_console
     cookie, csrf, _ = session_tokens(server)
@@ -310,10 +415,19 @@ def test_completed_console_can_start_next_session(monkeypatch, tmp_path):
     adapter = console.ConsoleSessionAdapter(SimpleNamespace(local_state_directory=tmp_path), ROOT, session)
     first = adapter.operation({"kind": "Start", "duration_seconds": 10})
     assert adapter.wait(3)
+    adapter._emit({"event": "host_feedback", "acquired_at_ns": time.time_ns(),
+                   "host_state": "active", "host_epoch": 7, "observation_sequence": 99})
+    adapter._emit({"event": "action_sent", "acquired_at_ns": time.time_ns(),
+                   "action_sequence": 88, "requested_targets": {"arm_left_elbow_flex.pos": 3.0}})
+    assert adapter.state()["telemetry"]["observation"]["host_state"] == "active"
     second = adapter.operation({"kind": "Start", "duration_seconds": 10})
     assert adapter.wait(3)
     assert first["session_id"] != second["session_id"]
     assert len(calls) == 2
+    snapshot = adapter.state()["telemetry"]
+    assert snapshot["observation"]["host_state"] is None
+    assert snapshot["action"]["sequence"] is None
+    assert all(event["event"] == "session_created" for event in adapter.state()["events"])
 
 
 def test_stop_targets_exact_active_owner_and_returns_before_cleanup(tmp_path, monkeypatch):
