@@ -764,7 +764,7 @@ class SSHRemote:
                     last_event=event.get("event"), last_event_wall_time_ns=time.time_ns(),
                 )
             self._remote_event_seen = True
-            if event.get("event") == "system_sample":
+            if event.get("event") in {"system_sample", "process_output"}:
                 if self.telemetry_sink is not None:
                     try:
                         self.telemetry_sink({**event, "windows_received_at_ns": time.time_ns()})

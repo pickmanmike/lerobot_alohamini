@@ -4,12 +4,14 @@
 
 The helper owns only children it starts, has no listener, and treats loss of its
 controlling SSH stdin as a cleanup request. Runtime children continue to log
-directly to their existing files; stdout carries only small transition records.
+directly to their existing files; stdout carries small transitions and bounded
+best-effort original-output excerpts. Display delivery cannot delay cleanup.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import queue
@@ -378,6 +380,8 @@ class RemoteSupervisor:
         self.state_path = self.session_root / "state.json"
         self.active_path = Path(args.state_directory) / "active.json"
         self.children: dict[str, OwnedChild] = {}
+        self._output_offsets: dict[str, int] = {}
+        self._next_output_at = 0.0
         self.lock_stream: TextIO | None = None
         self.controller_closed = threading.Event()
         self.controller_stop_requested = threading.Event()
@@ -441,6 +445,41 @@ class RemoteSupervisor:
             "event": event, "session_id": self.args.session_id, "wall_time_ns": time.time_ns(),
             "controller_contact": self.controller_contact_evidence(), **fields,
         })
+
+    def forward_output(self, *, now: float | None = None) -> None:
+        """Bounded best-effort reads of this owner's existing logs, no tailer.
+
+        Byte offsets expose dropped output. Base64 keeps each pipe write below
+        PIPE_BUF even for control characters; the complete original stays on disk.
+        """
+        now = time.monotonic() if now is None else now
+        if now < self._next_output_at:
+            return
+        self._next_output_at = now + 0.25
+        for name, child in self.children.items():
+            if name not in {"host", "camera"} or not child.log_path:
+                continue
+            path = Path(child.log_path)
+            try:
+                if path.is_symlink() or path.resolve().parent != Path(self.args.log_directory).resolve():
+                    continue
+                offset = self._output_offsets.get(name, 0)
+                with path.open("rb") as stream:
+                    size = os.fstat(stream.fileno()).st_size
+                    # Do not build a display backlog that can monopolize SSH.
+                    offset = max(offset if offset <= size else 0, size - 1536)
+                    stream.seek(offset)
+                    data = stream.read(1536)
+            except OSError:
+                continue
+            if data:
+                self._output_offsets[name] = offset + len(data)
+                payload = {"event": "process_output", "session_id": self.args.session_id,
+                           "source": name, "path": str(path), "offset": offset,
+                           "acquired_at_ns": time.time_ns(),
+                           "data_base64": base64.b64encode(data).decode("ascii")}
+                if len(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()) < 4095:
+                    self.reporter.emit(payload)
 
     def preflight(self) -> None:
         if not SESSION_ID_PATTERN.fullmatch(self.args.session_id):
@@ -513,6 +552,7 @@ class RemoteSupervisor:
                     "controller_lease_expired",
                     f"{label} cancelled after controller heartbeat lease expired",
                 )
+            self.forward_output()
             exit_code = child.process.poll()
             if exit_code is not None:
                 raise SessionRefusal(f"{label} exited before readiness with status {exit_code}")
@@ -702,6 +742,7 @@ def supervise(args: argparse.Namespace) -> int:
                 supervisor.cleanup(reason=f"{name}_exit_{exit_code}")
                 cleanup_done = True
                 return exit_code or 2
+            supervisor.forward_output()
             try:
                 command = commands.get(timeout=0.1)
             except queue.Empty:

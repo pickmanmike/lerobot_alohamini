@@ -241,6 +241,31 @@ def test_log_capacity_cannot_starve_stop(running_console):
         server.log_slots.release()
 
 
+def test_live_output_route_is_session_bound_and_cannot_starve_stop(running_console, tmp_path):
+    server, _ = running_console
+    cookie, csrf, _ = session_tokens(server)
+    identity = "20261001T120000-deadbeef"
+    adapter = console.ConsoleSessionAdapter(
+        SimpleNamespace(windows_log_directory=tmp_path), ROOT, session, bridge_factory=lambda *args: None)
+    adapter._on_created(identity)
+    server.session_adapter = adapter
+    status, _, body = request(server, "GET", f"/api/output?kind=host&session_id={identity}", cookie=cookie)
+    assert status == 200 and json.loads(body)["state"] == "Unavailable"
+    assert request(server, "GET", "/api/output?kind=host&session_id=20261001T120001-deadbeef", cookie=cookie)[0] == 409
+    assert request(server, "GET", f"/api/output?kind=../../secret&session_id={identity}", cookie=cookie)[0] == 400
+    assert request(server, "GET", f"/api/output?kind=host&session_id={identity}")[0] == 403
+    server.session_adapter = FakeAdapter()
+    assert server.log_slots.acquire(blocking=False) and server.log_slots.acquire(blocking=False)
+    try:
+        assert request(server, "GET", f"/api/output?kind=host&session_id={identity}", cookie=cookie)[0] == 503
+        status, _, body = request(server, "POST", "/api/operation", cookie=cookie, csrf=csrf,
+                                  origin=f"http://127.0.0.1:{server.server_address[1]}", body={"kind":"Stop"})
+        assert status == 200 and json.loads(body)["accepted"]
+    finally:
+        server.log_slots.release()
+        server.log_slots.release()
+
+
 def test_operational_failure_does_not_hide_unverified_cleanup(tmp_path):
     adapter = console.ConsoleSessionAdapter(SimpleNamespace(), tmp_path, session, bridge_factory=lambda *args: None)
     adapter._emit({"event": "cleanup", "cleanup_verified": False, "operational_exit_code": 2})

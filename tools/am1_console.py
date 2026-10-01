@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import binascii
 import hmac
 import http.client
 import json
@@ -23,6 +24,7 @@ from tools.am1_console_model import ConsoleSnapshot
 
 
 MAX_CONSOLE_LOG_BYTES = 2_000_000
+MAX_OUTPUT_BYTES = 128_000
 LOG_KINDS = frozenset({"client", "host", "camera", "ssh", "summary"})
 REMOTE_LOG_NAME = re.compile(r"am1-(?:local-host|camera)-[A-Za-z0-9-]{1,100}\.log\Z")
 
@@ -54,6 +56,7 @@ class ConsoleSessionAdapter:
         self._verified_source_at_ns: int | None = None
         self._error: str | None = None
         self._events = deque(maxlen=128)
+        self._outputs: dict[str, dict] = {}
         self._telemetry = ConsoleSnapshot()
         self._event_sink = None
         self._bridge = None
@@ -78,6 +81,10 @@ class ConsoleSessionAdapter:
 
     def _emit(self, event):
         event = dict(event)
+        if event.get("event") == "process_output":
+            # Output is not lifecycle/SSE traffic and cannot fill its queues.
+            self._receive_output(event)
+            return
         telemetry_only = event.get("event") in {"live_sample", "action_sent", "host_feedback", "system_sample"}
         with self._lock:
             self._telemetry.update(event)
@@ -101,6 +108,75 @@ class ConsoleSessionAdapter:
                 self._cleanup_verified = event["cleanup_verified"]
         if self._event_sink is not None:
             self._event_sink(event)
+
+    def _receive_output(self, event):
+        source, offset, encoded = event.get("source"), event.get("offset"), event.get("data_base64")
+        path, acquired = event.get("path"), event.get("acquired_at_ns")
+        if (source not in {"host", "camera"} or type(offset) is not int or offset < 0
+                or not isinstance(encoded, str) or len(encoded) > 2048
+                or not isinstance(path, str) or len(path) > 1024
+                or type(acquired) is not int):
+            return
+        try:
+            data = base64.b64decode(encoded, validate=True)
+        except (ValueError, binascii.Error):
+            return
+        if not data or len(data) > 1536:
+            return
+        with self._lock:
+            if event.get("session_id") != self._session_id:
+                return
+            current = self._outputs.get(source)
+            gap = current is None and offset != 0 or current is not None and (
+                offset != current["end_offset"] or path != current["path"])
+            prior = current["data"] if current is not None and not gap else b""
+            combined = prior + data
+            self._outputs[source] = {
+                "data": combined[-MAX_OUTPUT_BYTES:], "path": path,
+                "end_offset": offset + len(data), "acquired_at_ns": acquired,
+                "received_at_ns": event["windows_received_at_ns"]
+                    if type(event.get("windows_received_at_ns")) is int else time.time_ns(),
+                "truncated": bool(gap or len(combined) > MAX_OUTPUT_BYTES or
+                                  current is not None and current["truncated"]),
+            }
+
+    def read_output(self, kind: str, expected_session_id: str) -> dict:
+        """A bounded live/retained display; exact file export remains separate."""
+        if kind not in LOG_KINDS - {"summary"} or not self.session_module.SESSION_ID_PATTERN.fullmatch(expected_session_id):
+            raise ValueError("invalid AM1 output selection")
+        with self._lock:
+            if expected_session_id != self._session_id:
+                raise SessionMismatchError("AM1 session changed before output read")
+            current = dict(self._outputs[kind]) if kind in self._outputs else None
+            running = self._worker is not None and self._worker.is_alive()
+        result = {"session_id": expected_session_id, "source": kind, "text": "", "state": "Unavailable",
+                  "reason": "Original output has not arrived; saved files remain available after collection.",
+                  "truncated": False, "path": None, "acquired_at_ns": None}
+        if current is not None:
+            age_ms = max(0, (time.time_ns() - current["received_at_ns"]) / 1_000_000)
+            result.update(text=current["data"].decode("utf-8", errors="replace"), path=current["path"],
+                          acquired_at_ns=current["acquired_at_ns"], received_age_ms=age_ms,
+                          truncated=current["truncated"], reason=None,
+                          state="Live forwarded" if running and age_ms < 2000 else "Retained output")
+        elif kind in {"client", "ssh"}:
+            root = self.config.windows_log_directory.resolve()
+            directory = root / f"am1-session-{expected_session_id}"
+            name = f"am1-local-windows-{expected_session_id}.log" if kind == "client" else "ssh-control.log"
+            path = directory / name
+            try:
+                if directory.is_symlink() or path.is_symlink() or path.resolve().parent != directory.resolve():
+                    return result
+                with path.open("rb") as stream:
+                    stream.seek(0, 2)
+                    size = stream.tell()
+                    stream.seek(max(0, size - MAX_OUTPUT_BYTES))
+                    data = stream.read(MAX_OUTPUT_BYTES)
+                result.update(text=data.decode("utf-8", errors="replace"), path=str(path), reason=None,
+                              state="Current file snapshot" if running else "Retained output",
+                              acquired_at_ns=time.time_ns(), truncated=size > MAX_OUTPUT_BYTES)
+            except OSError:
+                pass
+        return result
 
     def _on_created(self, session_id: str):
         with self._lock:
@@ -249,6 +325,7 @@ class ConsoleSessionAdapter:
                 # the next Start. Camera status is reacquired independently.
                 self._telemetry = ConsoleSnapshot()
                 self._events.clear()
+                self._outputs.clear()
                 self._control_token = secrets.token_hex(32)
                 self._phase = "starting"
                 self._worker = threading.Thread(target=self._run, args=(duration, leader_source, motion_profile),
@@ -513,6 +590,9 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         if target.path == "/api/log":
             self._serve_log(target)
             return
+        if target.path == "/api/output":
+            self._serve_output(target)
+            return
         if target.path == "/api/events" and not target.query:
             self._events()
             return
@@ -524,6 +604,26 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             self._proxy_camera(camera_path)
             return
         self._reply(404)
+
+    def _serve_output(self, target):
+        if not self.server.log_slots.acquire(blocking=False):
+            self._reply(503)
+            return
+        try:
+            query = parse_qs(target.query, strict_parsing=True, keep_blank_values=True, max_num_fields=2)
+            if set(query) != {"kind", "session_id"} or any(len(values) != 1 for values in query.values()):
+                raise ValueError("invalid output request")
+            payload = self.server.session_adapter.read_output(query["kind"][0], query["session_id"][0])
+            self.connection.settimeout(2)
+            self._json(200, payload)
+        except ValueError:
+            self._reply(400)
+        except SessionMismatchError:
+            self._reply(409)
+        except OSError:
+            pass
+        finally:
+            self.server.log_slots.release()
 
     def _serve_log(self, target):
         if not self.server.log_slots.acquire(blocking=False):

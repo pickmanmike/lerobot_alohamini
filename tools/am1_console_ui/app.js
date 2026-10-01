@@ -109,6 +109,16 @@ class AM1ConsoleViews {
     return `/api/log?kind=${encodeURIComponent(kind)}&session_id=${encodeURIComponent(sessionId)}`
       + (download ? "&download=1" : "");
   }
+  static outputUrl(kind, sessionId) {
+    return `/api/output?kind=${encodeURIComponent(kind)}&session_id=${encodeURIComponent(sessionId)}`;
+  }
+  static outputLabel(output) {
+    const at = output.acquired_at_ns ? new Date(output.acquired_at_ns / 1000000).toISOString() : "not received";
+    return `Session ${output.session_id} · ${output.source} · ${output.state} · acquired ${at}`
+      + (output.received_age_ms != null ? ` · receipt age ≥${Math.round(output.received_age_ms)} ms` : "")
+      + (output.truncated ? " · excerpt truncated / forwarding gap" : "")
+      + (output.path ? ` · ${output.path}` : "");
+  }
   static hostStatus(observation, phase) {
     if (!observation || observation.host_state == null) return "Not sampled";
     const value = `${observation.host_state} / ${observation.host_epoch ?? "unknown"}`;
@@ -144,9 +154,11 @@ if (typeof document !== "undefined") {
   let stateRequestInFlight = false;
   let loadedLog = "";
   let loadedLogSessionId = null;
+  let loadedLogDescription = "";
   let logRequestId = 0;
   let logRequestInFlight = false;
   let terminalRequestId = 0;
+  let terminalRequestInFlight = false;
 
   function row(container, label, value) {
     const line = document.createElement("tr");
@@ -276,6 +288,22 @@ if (typeof document !== "undefined") {
     } finally { stateRequestInFlight = false; }
   }
 
+  async function fetchOriginal(kind, requestedSessionId) {
+    if (kind !== "summary") {
+      const response = await fetch(AM1ConsoleViews.outputUrl(kind, requestedSessionId),
+        {cache:"no-store", credentials:"same-origin"});
+      if (!response.ok) throw new Error(`original output unavailable (${response.status})`);
+      const output = await response.json();
+      if (output.session_id !== requestedSessionId) throw new Error("output session changed");
+      if (output.state !== "Unavailable") return {text:output.text, label:AM1ConsoleViews.outputLabel(output)};
+      if (!["complete", "failed", "cleanup_unknown"].includes(state?.phase))
+        return {text:output.reason, label:AM1ConsoleViews.outputLabel(output)};
+    }
+    const response = await fetch(AM1ConsoleViews.logUrl(kind, requestedSessionId),
+      {cache:"no-store", credentials:"same-origin"});
+    if (!response.ok) throw new Error(`saved log unavailable (${response.status})`);
+    return {text:await response.text(), label:`Exact saved session ${requestedSessionId} · ${kind}`};
+  }
   async function loadLog() {
     if (logRequestInFlight) return;
     const kind = document.querySelector("#log-kind").value;
@@ -287,12 +315,10 @@ if (typeof document !== "undefined") {
     loadedLog = "";
     output.textContent = "Loading exact session log…";
     try {
-      const response = await fetch(AM1ConsoleViews.logUrl(kind, requestedSessionId),
-        {cache:"no-store", credentials:"same-origin"});
-      if (!response.ok) throw new Error(`log unavailable (${response.status})`);
-      const text = await response.text();
+      const original = await fetchOriginal(kind, requestedSessionId);
       if (!AM1ConsoleViews.acceptLogResponse(requestedSessionId, state?.session_id) || requestId !== logRequestId) return;
-      loadedLog = text;
+      loadedLog = original.text;
+      loadedLogDescription = original.label;
       loadedLogSessionId = requestedSessionId;
       renderLoadedLog();
     } catch (error) {
@@ -304,7 +330,7 @@ if (typeof document !== "undefined") {
     document.querySelector("#log-lines").textContent = AM1ConsoleViews.filteredLog(
       loadedLog, document.querySelector("#log-filter").value, 400,
       document.querySelector("#log-severity").value) || "No matching lines.";
-    document.querySelector("#log-session").textContent = `Exact session ${loadedLogSessionId} · ${document.querySelector("#log-kind").value}`;
+    document.querySelector("#log-session").textContent = loadedLogDescription;
   }
   document.querySelector("#log-load").addEventListener("click", loadLog);
   document.querySelector("#log-kind").addEventListener("change", () => {
@@ -329,23 +355,22 @@ if (typeof document !== "undefined") {
         !document.querySelector("#log-pause").checked) loadLog();
   }, 2000);
   async function loadTerminal() {
+    if (terminalRequestInFlight) return;
     const kind = document.querySelector("#terminal-kind").value;
     const output = document.querySelector("#terminal-output");
     const requestedSessionId = state?.session_id;
     const requestId = ++terminalRequestId;
     if (!requestedSessionId) { output.textContent = "No session result is selected."; return; }
-    output.textContent = "Loading original output…";
+    terminalRequestInFlight = true;
     try {
-      const response = await fetch(AM1ConsoleViews.logUrl(kind, requestedSessionId),
-        {cache:"no-store", credentials:"same-origin"});
-      if (!response.ok) throw new Error(`original output unavailable (${response.status})`);
-      const text = await response.text();
+      const original = await fetchOriginal(kind, requestedSessionId);
       if (!AM1ConsoleViews.acceptLogResponse(requestedSessionId, state?.session_id) || requestId !== terminalRequestId) return;
-      output.textContent = text;
+      output.textContent = `${original.label}\n\n${original.text}`;
     } catch (error) {
       if (requestId === terminalRequestId) output.textContent = error.message;
-    }
+    } finally { terminalRequestInFlight = false; }
   }
+  setInterval(() => { if (input.route === "terminal") loadTerminal(); }, 2000);
   document.querySelector("#terminal-load").addEventListener("click", loadTerminal);
   document.querySelector("#terminal-kind").addEventListener("change", () => {
     terminalRequestId++;

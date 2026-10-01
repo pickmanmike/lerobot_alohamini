@@ -60,16 +60,25 @@ measured. Configured source pins are labeled expected until the session's
 preflight reports exact source heads. Stale or failed camera status never makes
 a retained frame live.
 
-Logs loads only one exact file from the current private session result folder:
-Windows client, collected Pi host, collected Pi camera, SSH control, or summary.
-The console refuses missing, ambiguous and over-2 MB files. Its local filter
-shows at most 400 matching original lines; Export downloads the selected
-unchanged file; timestamps appear where present in the original log. The Logs
-page has a bounded recent-line view, component/source and severity filters,
-search, and optional follow/pause. For a missing Pi log, use the existing
-`-CollectOnly -SessionId` fallback. Terminal shows the original client, host,
-camera or SSH output as separate read-only views, plus bounded lifecycle/fault
-events; it has no command input or execution route. Changing any page releases
+Logs and Terminal display bounded original-output excerpts during the session.
+The existing Pi supervisor forwards up to 1536 bytes per component every 250 ms
+from its exact owned host/camera logs over its existing control connection;
+there is no second SSH tailer or motor reader. Forwarding is best effort and
+does not wait/retry on a blocked display. Byte-offset gaps, truncated excerpts,
+session/source/path, acquisition time and retained output are explicitly labeled.
+The console retains at most 128 KB per component. Windows client and SSH output
+use bounded snapshots of the exact current result files. Output acquisition
+time is a file-read time, not the original line's creation time; original line
+timestamps remain unchanged where present. A quiet/aged excerpt is retained,
+not proof that its process is currently live.
+
+The local filter shows at most 400 matching lines, with source/severity filters,
+search and follow/pause. Export still downloads only an exact collected file
+from this session's result folder, refusing missing, ambiguous and over-2 MB
+files. For a missing Pi log, use `-CollectOnly -SessionId`. The summary is
+available after cleanup. Terminal follows the chosen original output as a
+read-only view, plus bounded lifecycle/fault events; it has no command input
+or execution route. Changing any page releases
 browser body keys; the global Stop remains available. None of these pages starts a second motor
 reader or changes the original cleanup result.
 

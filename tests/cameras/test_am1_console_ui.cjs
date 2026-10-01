@@ -19,6 +19,16 @@ function loadViews() {
   return context.AM1ConsoleViews;
 }
 
+test("live output uses a separate session-bound route and reports truncation", () => {
+  const Views = loadViews();
+  assert.equal(Views.outputUrl("host", "session-1"), "/api/output?kind=host&session_id=session-1");
+  const label = Views.outputLabel({session_id:"session-1", source:"host", path:"/logs/exact.log",
+    state:"Retained output", acquired_at_ns:1000000000, truncated:true});
+  assert.match(label, /session-1.*host.*Retained output/);
+  assert.match(label, /truncated|gap/);
+  assert.match(label, /1970-01-01T00:00:01/);
+});
+
 test("control keys ignore typing and route changes release the body", () => {
   const Input = loadInput(), sent = [];
   const input = new Input(payload => sent.push(payload));
