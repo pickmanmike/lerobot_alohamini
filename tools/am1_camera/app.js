@@ -3,30 +3,42 @@ const identifying = document.body.dataset.identification === "true";
 const roles = identifying ? ["preview_1", "preview_2", "preview_3", "preview_4", "preview_5"] :
                            ["forward", "backward", "chest", "wrist_left", "wrist_right"];
 const labels = identifying ? Object.fromEntries(roles.map((role, i) => [role, `Camera ${i + 1}`])) :
-                            {forward: "Forward", backward: "Backward", chest: "Chest", wrist_left: "Left wrist", wrist_right: "Right wrist"};
+                            {forward: "Front", backward: "Rear", chest: "Chest", wrist_left: "Left wrist", wrist_right: "Right wrist"};
 if (identifying) document.querySelector("#view-heading").textContent = "Numbered identification · adjust focus, then confirm roles";
+const cameraRoot = document.querySelector("#am1-camera-root");
+const cameraBase = cameraRoot?.dataset.cameraBase === "/camera/" ? "/camera/" : "/";
+function cameraURL(path) { return cameraBase + path; }
 const primary = document.querySelector("#primary"), thumbs = document.querySelector("#thumbnails");
 const connection = document.querySelector("#connection");
 const diagnostics = document.querySelector("#diagnostics");
 let selected = roles[0], latest = null, reportAt = 0, statusReceivedAt = 0, stream = null;
 let statusRequest = 0, acceptedStatusRequest = 0;
-const tiles = new Map(), busy = new Set(), decodingRoles = new Set();
+const tiles = new Map(), slots = new Map(), details = new Map(), busy = new Set(), decodingRoles = new Set();
 const retained = new AM1RetainedFrames();
 const roleGenerations = new Map(roles.map(role => [role, 1]));
-const sourceSequences = new Map(), sourceStates = new Map();
+const sourceSequences = new Map(), sourceStates = new Map(), roleRotations = new Map();
 for (const role of roles) retained.setGeneration(role, 1);
 const timing = {status_ms:0, status_max_ms:0, status_failures:0, decode_failures:0,
                 cancellations:0, last_cancel:"none"};
 const progress = new Map(roles.map(role => [role, {received:0, displayed:0, sequence:0,
   received_at:null, displayed_at:null, receive_max_gap_ms:0, display_max_gap_ms:0}]));
 for (const role of roles) {
+  const slot = document.createElement("article");
+  slot.className = `camera-slot slot-${role}`;
+  slot.dataset.role = role;
   const button = document.createElement("button");
   button.className = "view";
-  button.innerHTML = '<img alt=""><div class="unavailable">Unavailable</div><footer><strong></strong><span></span></footer>';
+  button.type = "button";
+  button.dataset.role = role;
+  button.innerHTML = '<div class="camera-heading"><strong></strong><span class="camera-status"></span></div><div class="image-wrap"><img alt=""><div class="unavailable">Unavailable</div></div>';
   button.querySelector("img").alt = labels[role];
   button.querySelector("strong").textContent = labels[role];
   button.addEventListener("click", () => { if (role !== selected) { stopPrimary("role-switch"); selected = role; render(); } });
-  thumbs.append(button); tiles.set(role, button);
+  const detail = document.createElement("details");
+  detail.className = "camera-details";
+  detail.innerHTML = '<summary>Details</summary><dl><dt>Image age</dt><dd data-field="image-age">Not sampled</dd><dt>Source</dt><dd data-field="source">Unavailable</dd><dt>Sequence</dt><dd data-field="sequence">Not sampled</dd><dt>Rotation</dt><dd data-field="rotation">Not sampled</dd></dl>';
+  slot.append(button); slot.append(detail); thumbs.append(slot);
+  tiles.set(role, button); slots.set(role, slot); details.set(role, detail);
 }
 function sourceFor(role) { return AM1SourceState(latest?.cameras[role], reportAt, performance.now()); }
 // Poll liveness uses reply time; source age retains conservative request time.
@@ -54,21 +66,34 @@ function retainedImage(tile, role) {
   if (!held && image.src) image.removeAttribute("src");
   return held;
 }
+function paintDetails(detail, held, source, rotation) {
+  detail.querySelector('[data-field="image-age"]').textContent = held ? `${Math.round(held.age_ms)} ms (gateway receipt)` : "Not sampled";
+  detail.querySelector('[data-field="source"]').textContent = source ?
+    `${source.state ?? "Unknown"} · ${Number.isFinite(source.fps) ? source.fps.toFixed(1) : "?"} fps` : "Unavailable";
+  detail.querySelector('[data-field="sequence"]').textContent = held ? `Decoded ${held.sequence}` :
+    Number.isSafeInteger(source?.sequence) ? `Source ${source.sequence}` : "Not sampled";
+  detail.querySelector('[data-field="rotation"]').textContent = `${rotation}° display-only`;
+}
 function paint(tile, role, thumbnail = false) {
   const held = retainedImage(tile, role);
-  const state = AM1FrameState(latest?.cameras[role], reportAt, performance.now(),
+  const source = latest?.cameras[role];
+  const state = AM1FrameState(source, reportAt, performance.now(),
     held ? {at:held.at, age_ms:held.age_at_receipt_ms} : null, thumbnail, statusReceivedAt);
-  const rotation = latest?.cameras[role]?.rotation_degrees;
-  tile.querySelector("img").dataset.rotation = String([0, 90, 180, 270].includes(rotation) ? rotation : 0);
+  const rotation = [0, 90, 180, 270].includes(source?.rotation_degrees) ?
+    source.rotation_degrees : (roleRotations.get(role) ?? 0);
+  tile.querySelector("img").dataset.rotation = String(rotation);
   tile.classList.toggle("fresh", state.state === "fresh");
   tile.classList.toggle("held", !!held && state.state !== "fresh");
   tile.querySelector("strong").textContent = labels[role];
   tile.querySelector("span").textContent = state.state === "fresh" ?
-    `${state.fps.toFixed(1)} fps source · image ${Math.round(state.age_ms)} ms${state.status_uncertain ? " · status uncertain" : ""}` :
+    `Live · image ${Math.round(state.age_ms)} ms${state.status_uncertain ? " · status uncertain" : ""}` :
     held ? `Last frame / waiting · image ${Math.round(held.age_ms)} ms` : state.state;
+  if (!held && state.state !== "fresh") tile.querySelector("span").textContent =
+    source?.configured === false ? "Unassigned" : source?.state === "stale" ? "Disconnected" : "Waiting";
   tile.querySelector(".unavailable").textContent = held ? "" : !statusAvailable() ? "Status unavailable" :
     latest.cameras[role]?.configured === false || !latest.cameras[role] ? "Unassigned · use numbered identification previews" :
     state.state === "stale" ? "Mapped · stale / waiting for a decoded frame" : "Mapped · not connected / waiting for source";
+  paintDetails(thumbnail ? details.get(role) : primary.querySelector("details"), held, source, rotation);
 }
 async function showFrame(role, blob, frame, valid) {
   if (decodingRoles.has(role)) return false;
@@ -112,7 +137,7 @@ function startPrimary() {
   (async () => {
     try {
       const requestAt = performance.now();
-      const response = await fetch(`/api/stream.mjpeg?src=${current.role}`, {cache:"no-store", signal:current.controller.signal});
+      const response = await fetch(cameraURL(`api/stream.mjpeg?src=${current.role}`), {cache:"no-store", signal:current.controller.signal});
       if (!response.ok || !response.body) throw new Error("Stream unavailable");
       for await (const frame of AM1MjpegFrames(response.body, undefined, requestAt)) {
         if (stream !== current) break;
@@ -124,12 +149,18 @@ function startPrimary() {
   })();
 }
 function render() {
+  primary.dataset.role = selected;
   const allowed = usable(selected);
   if (!allowed) stopPrimary(statusAvailable() ? "source-unavailable" : "status-unavailable");
   else if (stream && performance.now() - stream.progressed > 500) stopPrimary("display-stall");
   if (allowed && !stream) startPrimary();
   paint(primary, selected);
-  for (const [role, tile] of tiles) { tile.hidden = role === selected; paint(tile, role, true); }
+  for (const [role, tile] of tiles) {
+    tile.ariaPressed = role === selected ? "true" : "false";
+    tile.setAttribute("aria-pressed", tile.ariaPressed);
+    slots.get(role).dataset.focused = role === selected ? "true" : "false";
+    paint(tile, role, true);
+  }
   connection.textContent = !statusAvailable() ? "Status unavailable — do not rely on these views" :
     sourceFor(selected).state !== "fresh" && usable(selected) ? "LAN viewer · status delayed/uncertain · decoded-frame clock remains active" :
     "LAN viewer · source status and decoded-frame progress tracked separately";
@@ -141,13 +172,14 @@ async function statusLoop() {
   const start = performance.now();
   const request = ++statusRequest;
   try {
-    const response = await fetch("/status.json", {cache:"no-store", signal:AbortSignal.timeout(1500)});
+    const response = await fetch(cameraURL("status.json"), {cache:"no-store", signal:AbortSignal.timeout(1500)});
     if (!response.ok) throw new Error("Status unavailable");
     const next = await response.json();
     if (request > acceptedStatusRequest) {
       acceptedStatusRequest = request;
       for (const role of roles) {
         const source = next.cameras?.[role], previous = sourceSequences.get(role);
+        if ([0, 90, 180, 270].includes(source?.rotation_degrees)) roleRotations.set(role, source.rotation_degrees);
         const state = source?.state === "fresh" && source.configured !== false ? "fresh" : "not-fresh";
         if (state === "fresh" && ((Number.isSafeInteger(previous) && source.sequence < previous) ||
             sourceStates.get(role) === "not-fresh")) bumpGeneration(role);
@@ -168,7 +200,7 @@ async function snapshots() {
     (async () => {
       try {
         const at = performance.now();
-        const response = await fetch(`/api/frame.jpeg?src=${role}&cache=500ms`, {cache:"no-store", signal:AbortSignal.timeout(1000)});
+        const response = await fetch(cameraURL(`api/frame.jpeg?src=${role}&cache=500ms`), {cache:"no-store", signal:AbortSignal.timeout(1000)});
         if (!response.ok) return;
         const blob = await response.blob();
         const age_ms = Number(response.headers.get("X-Frame-Age-Ms") ?? NaN);
