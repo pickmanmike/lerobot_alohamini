@@ -8,9 +8,13 @@ if (identifying) document.querySelector("#view-heading").textContent = "Numbered
 const primary = document.querySelector("#primary"), thumbs = document.querySelector("#thumbnails");
 const connection = document.querySelector("#connection");
 const diagnostics = document.querySelector("#diagnostics");
-let selected = roles[0], latest = null, reportAt = 0, statusReceivedAt = 0, generation = 0, stream = null;
-const tiles = new Map(), blobs = new Map(), displayed = new Map(), busy = new Set();
-const sequences = new Map(); // Per display path, retained through stream reconnects.
+let selected = roles[0], latest = null, reportAt = 0, statusReceivedAt = 0, stream = null;
+let statusRequest = 0, acceptedStatusRequest = 0;
+const tiles = new Map(), busy = new Set(), decodingRoles = new Set();
+const retained = new AM1RetainedFrames();
+const roleGenerations = new Map(roles.map(role => [role, 1]));
+const sourceSequences = new Map(), sourceStates = new Map();
+for (const role of roles) retained.setGeneration(role, 1);
 const timing = {status_ms:0, status_max_ms:0, status_failures:0, decode_failures:0,
                 cancellations:0, last_cancel:"none"};
 const progress = new Map(roles.map(role => [role, {received:0, displayed:0, sequence:0,
@@ -21,7 +25,7 @@ for (const role of roles) {
   button.innerHTML = '<img alt=""><div class="unavailable">Unavailable</div><footer><strong></strong><span></span></footer>';
   button.querySelector("img").alt = labels[role];
   button.querySelector("strong").textContent = labels[role];
-  button.addEventListener("click", () => { stopPrimary("role-switch"); selected = role; generation++; render(); });
+  button.addEventListener("click", () => { if (role !== selected) { stopPrimary("role-switch"); selected = role; render(); } });
   thumbs.append(button); tiles.set(role, button);
 }
 function sourceFor(role) { return AM1SourceState(latest?.cameras[role], reportAt, performance.now()); }
@@ -39,40 +43,55 @@ function noteProgress(role, kind, sequence) {
   if (previous !== null) item[gap] = Math.max(item[gap], now - previous);
   item[`${kind}_at`] = now; item[kind]++; item.sequence = sequence;
 }
+function bumpGeneration(role) {
+  const next = roleGenerations.get(role) + 1;
+  roleGenerations.set(role, next); retained.setGeneration(role, next);
+  if (stream?.role === role) stopPrimary("source-generation-changed");
+}
+function retainedImage(tile, role) {
+  const image = tile.querySelector("img"), held = retained.get(role, performance.now());
+  if (held && image.src !== held.url) image.src = held.url;
+  if (!held && image.src) image.removeAttribute("src");
+  return held;
+}
 function paint(tile, role, thumbnail = false) {
-  const state = AM1FrameState(latest?.cameras[role], reportAt, performance.now(), displayed.get(thumbnail ? role : "primary"), thumbnail, statusReceivedAt);
+  const held = retainedImage(tile, role);
+  const state = AM1FrameState(latest?.cameras[role], reportAt, performance.now(),
+    held ? {at:held.at, age_ms:held.age_at_receipt_ms} : null, thumbnail, statusReceivedAt);
   const rotation = latest?.cameras[role]?.rotation_degrees;
   tile.querySelector("img").dataset.rotation = String([0, 90, 180, 270].includes(rotation) ? rotation : 0);
   tile.classList.toggle("fresh", state.state === "fresh");
+  tile.classList.toggle("held", !!held && state.state !== "fresh");
   tile.querySelector("strong").textContent = labels[role];
-  tile.querySelector("span").textContent = state.state === "fresh" ? `${state.fps.toFixed(1)} fps source · image ${Math.round(state.age_ms)} ms${state.status_uncertain ? " · status uncertain" : ""}` : state.state;
-  tile.querySelector(".unavailable").textContent = !statusAvailable() ? "Status unavailable" :
+  tile.querySelector("span").textContent = state.state === "fresh" ?
+    `${state.fps.toFixed(1)} fps source · image ${Math.round(state.age_ms)} ms${state.status_uncertain ? " · status uncertain" : ""}` :
+    held ? `Last frame / waiting · image ${Math.round(held.age_ms)} ms` : state.state;
+  tile.querySelector(".unavailable").textContent = held ? "" : !statusAvailable() ? "Status unavailable" :
     latest.cameras[role]?.configured === false || !latest.cameras[role] ? "Unassigned · use numbered identification previews" :
     state.state === "stale" ? "Mapped · stale / waiting for a decoded frame" : "Mapped · not connected / waiting for source";
 }
-async function showFrame(tile, key, blob, frame, valid, sequenceKey = key) {
-  if (frame.sequence <= (sequences.get(sequenceKey) ?? 0)) return false;
+async function showFrame(role, blob, frame, valid) {
+  if (decodingRoles.has(role)) return false;
+  decodingRoles.add(role);
   const url = URL.createObjectURL(blob), candidate = new Image();
   candidate.src = url;
   try {
     await candidate.decode();
-    if (!valid() || frame.sequence <= (sequences.get(sequenceKey) ?? 0)) { URL.revokeObjectURL(url); return false; }
-    tile.querySelector("img").src = url;
-    const old = blobs.get(key); blobs.set(key,url);
-    displayed.set(key, {at:frame.at, age_ms:frame.age_ms, sequence:frame.sequence});
-    sequences.set(sequenceKey, frame.sequence);
-    if (old) URL.revokeObjectURL(old);
+    if (!valid()) { URL.revokeObjectURL(url); return false; }
+    if (!retained.accept(role, frame.generation, frame.sequence, url, frame.age_ms, frame.at)) return false;
+    if (role === selected) retainedImage(primary, role);
+    else retainedImage(tiles.get(role), role);
     return true;
   } catch { timing.decode_failures++; URL.revokeObjectURL(url); return false; }
+  finally { decodingRoles.delete(role); }
 }
 function stopPrimary(reason = "stopped") {
   if (stream) { timing.cancellations++; timing.last_cancel = reason; stream.controller.abort(); }
-  stream = null; displayed.delete("primary");
-  primary.querySelector("img").removeAttribute("src");
-  const old = blobs.get("primary"); if (old) URL.revokeObjectURL(old); blobs.delete("primary");
+  stream = null;
 }
 function startPrimary() {
-  const current = {role:selected, controller:new AbortController(), progressed:performance.now(), pending:null, decoding:false};
+  const current = {role:selected, generation:roleGenerations.get(selected),
+    controller:new AbortController(), progressed:performance.now(), pending:null, decoding:false};
   stream = current;
   // Gaps measure continuous viewing, not time spent selecting another role.
   progress.get(selected).received_at = null; progress.get(selected).displayed_at = null;
@@ -82,8 +101,9 @@ function startPrimary() {
     try {
       while (current.pending && stream === current) {
         const frame = current.pending; current.pending = null;
-        if (await showFrame(primary, "primary", new Blob([frame.jpeg], {type:"image/jpeg"}), frame,
-                            () => stream === current && usable(current.role), `primary:${current.role}`)) {
+        if (await showFrame(current.role, new Blob([frame.jpeg], {type:"image/jpeg"}),
+                            {...frame, generation:current.generation},
+                            () => stream === current && current.generation === roleGenerations.get(current.role) && usable(current.role))) {
           current.progressed = performance.now(); noteProgress(current.role, "displayed", frame.sequence);
         }
       }
@@ -119,11 +139,24 @@ function render() {
 }
 async function statusLoop() {
   const start = performance.now();
+  const request = ++statusRequest;
   try {
     const response = await fetch("/status.json", {cache:"no-store", signal:AbortSignal.timeout(1500)});
     if (!response.ok) throw new Error("Status unavailable");
-    latest = await response.json(); reportAt = start; statusReceivedAt = performance.now();
-  } catch { timing.status_failures++; latest = null; }
+    const next = await response.json();
+    if (request > acceptedStatusRequest) {
+      acceptedStatusRequest = request;
+      for (const role of roles) {
+        const source = next.cameras?.[role], previous = sourceSequences.get(role);
+        const state = source?.state === "fresh" && source.configured !== false ? "fresh" : "not-fresh";
+        if (state === "fresh" && ((Number.isSafeInteger(previous) && source.sequence < previous) ||
+            sourceStates.get(role) === "not-fresh")) bumpGeneration(role);
+        if (Number.isSafeInteger(source?.sequence)) sourceSequences.set(role, source.sequence);
+        sourceStates.set(role, state);
+      }
+      latest = next; reportAt = start; statusReceivedAt = performance.now();
+    }
+  } catch { if (request > acceptedStatusRequest) { timing.status_failures++; latest = null; } }
   timing.status_ms = performance.now() - start;
   timing.status_max_ms = Math.max(timing.status_max_ms, timing.status_ms);
   render(); setTimeout(statusLoop, 250);
@@ -131,7 +164,7 @@ async function statusLoop() {
 async function snapshots() {
   for (const role of roles) {
     if (role === selected || busy.has(role) || !usable(role)) continue;
-    busy.add(role); const current = generation;
+    busy.add(role); const current = roleGenerations.get(role);
     (async () => {
       try {
         const at = performance.now();
@@ -141,8 +174,8 @@ async function snapshots() {
         const age_ms = Number(response.headers.get("X-Frame-Age-Ms") ?? NaN);
         const sequence = Number(response.headers.get("X-Frame-Sequence") ?? NaN);
         if (!Number.isFinite(age_ms) || age_ms < 0 || !Number.isSafeInteger(sequence) || sequence < 1 || blob.size > 1000000) return;
-        await showFrame(tiles.get(role), role, blob, {at,age_ms,sequence},
-                        () => current === generation && role !== selected && usable(role));
+        await showFrame(role, blob, {at,age_ms,sequence,generation:current},
+                        () => current === roleGenerations.get(role) && role !== selected && usable(role));
       } catch { /* An unsuccessful fetch or decode cannot renew the previous image clock. */ }
       finally { busy.delete(role); }
     })();
