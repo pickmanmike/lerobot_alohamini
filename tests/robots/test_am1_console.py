@@ -705,6 +705,32 @@ def test_native_client_launch_receives_pipe_paths_not_auth_secret(monkeypatch, t
 
 
 @pytest.mark.skipif(shutil.which("pwsh") is None, reason="PowerShell 7 unavailable")
+@pytest.mark.parametrize("partial_console", [False, True])
+def test_local_powershell_command_handles_empty_or_partial_console_options(tmp_path, partial_console):
+    helper = ROOT / "tools" / "run_am1.ps1"
+    example = ROOT / "config" / "am1.local.example.json"
+    extra = " -ConsolePipe '\\\\.\\pipe\\am1-test'" if partial_console else ""
+    script = f"""
+. '{str(helper).replace("'", "''")}'
+$config = Get-Content -LiteralPath '{str(example).replace("'", "''")}' -Raw | ConvertFrom-Json
+$command = New-Am1WindowsCommand -Mode Local -Config $config -RepositoryRoot '{str(ROOT).replace("'", "''")}' `
+ -LeftPort 'COM8' -RightPort 'COM7' -LocalDurationSeconds 90{extra}
+$command.arguments | ConvertTo-Json -Compress
+"""
+    result = subprocess.run([shutil.which("pwsh"), "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                            cwd=ROOT, capture_output=True, text=True, timeout=20, check=False)
+    if partial_console:
+        assert result.returncode != 0
+        assert "Console input requires Local mode" in result.stderr
+    else:
+        assert result.returncode == 0, result.stderr
+        arguments = json.loads(result.stdout.splitlines()[-1])
+        assert "--local_mode" in arguments
+        assert arguments[arguments.index("--duration_s") + 1] == "90"
+        assert not any(arg.startswith("--console_") for arg in arguments)
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="PowerShell 7 unavailable")
 def test_local_powershell_command_passes_console_pipe_only_when_requested(tmp_path):
     auth = tmp_path / "private.auth"
     auth.write_text("not-a-real-secret", encoding="utf-8")

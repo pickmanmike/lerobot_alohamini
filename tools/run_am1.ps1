@@ -153,7 +153,7 @@ function New-Am1WindowsCommand {
     )
 
     Assert-Am1LeaderSource -Mode $Mode -LeaderSource $LeaderSource -MotionProfile $MotionProfile
-    $consoleValues = @($ConsolePipe, $ConsoleAuthFile, $ConsoleSessionId) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    $consoleValues = @(@($ConsolePipe, $ConsoleAuthFile, $ConsoleSessionId) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
     if ($consoleValues.Count -gt 0) {
         if ($consoleValues.Count -ne 3 -or $Mode -ne 'Local' -or [string]::IsNullOrWhiteSpace($StopRequestPath)) {
             throw 'Console input requires Local mode, a session stop path, pipe, auth file and exact session ID.'
