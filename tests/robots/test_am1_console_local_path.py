@@ -178,7 +178,7 @@ class FakeCamera(BaseHTTPRequestHandler):
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Actual AF_PIPE is Windows-only")
 @pytest.mark.parametrize("case", ["healthy", "navigation", "blur", "hidden", "body-delay",
-                                      "body-reject", "body-denied", "state-reject", "state-delay", "pending-stop", "camera-delay"])
+                                      "body-reject", "body-denied", "state-reject", "state-delay", "pending-stop", "camera-delay", "approval-order"])
 def test_browser_loopback_native_path(tmp_path, case):
     node = shutil.which("node")
     if not node or subprocess.run([node, "-e", "require('playwright')"], capture_output=True).returncode:

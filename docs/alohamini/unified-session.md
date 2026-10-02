@@ -106,6 +106,28 @@ not repaired by assertion. Keep the unchanged 250 ms input expiry, current-gate
 approval and host qualification; use Stop promptly if the current gate is absent
 or cannot be completed. No further powered attempt was made in this repair batch.
 
+The next attended Control-only attempt did show validated live admission after
+automatic alignment. The owner did not perform manual movements before another
+accepted-input expiry. The current Resume gate was visible, but its required
+empty-lease request was refused; no Resume reached the native client before its
+deadline. Page Stop was then accepted during cleanup. Client refusal 2 and
+verified host/camera exits 0 are retained, not a manual-control pass.
+
+A controlled offline request-order test reproduced a separate approval race:
+periodic body requests could overtake the explicit empty approval packet, making
+its sequence stale. The frontend now reserves input-request scheduling for that
+pending packet and ignores new held input during it. Release/Stop bypasses and
+invalidates the pending approval. Owner/epoch and release-generation checks also
+cover the later operation acknowledgement: a delayed reply cannot undo focus or
+navigation release, or revoke a replacement owner's input. Held input is not
+replayed after approval. These async races were reproduced and corrected offline
+through the actual frontend and existing browser/HTTP/native-pipe harness.
+No expiry is extended, no current gate is bypassed, and no automatic rearm is
+added. This reproduction does not establish the powered attempt's exact HTTP
+ordering or explain the initiating input gap. Manual leader/body response,
+release stopping and successful explicit Pause/Resume still require the focused
+attended Control check; the console remains a draft candidate.
+
 The Servos page distinguishes the physical leader and Pi follower identities.
 It displays normalized position and the action actually sent; per-servo current,
 temperature and status remain **Not sampled** until a correctly identified

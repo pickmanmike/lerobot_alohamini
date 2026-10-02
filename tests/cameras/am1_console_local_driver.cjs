@@ -10,7 +10,16 @@ const [url, scenario] = process.argv.slice(2);
   const bodyTiming = [];
   const browserPauses = [];
   const operations = [];
+  const operationRequests = [];
+  const bodyReplies = [];
   page.on("response", async response => {
+    if (response.url().endsWith("/api/body")) {
+      try {
+        const request = response.request().postDataJSON();
+        const result = await response.json();
+        bodyReplies.push({seq:request.seq, active:request.active, accepted:result.accepted});
+      } catch {}
+    }
     if (response.url().endsWith("/api/operation")) {
       try {
         const request = response.request().postDataJSON();
@@ -26,7 +35,13 @@ const [url, scenario] = process.argv.slice(2);
       if (event.event === "am1_browser_input_release") browserPauses.push(event);
     } catch {}
   });
-  page.on("request", request => { if (request.url().endsWith("/api/body")) bodyTiming.push({sent:Date.now(), request}); });
+  page.on("request", request => {
+    if (request.url().endsWith("/api/body")) bodyTiming.push({sent:Date.now(), request});
+    if (request.url().endsWith("/api/operation")) {
+      const payload = request.postDataJSON();
+      operationRequests.push({kind:payload.kind, stage:payload.gate_stage, epoch:payload.host_epoch});
+    }
+  });
   page.on("requestfinished", request => {
     const record = bodyTiming.find(v => v.request === request);
     if (record) { record.duration_ms = Date.now() - record.sent; record.timing = request.timing(); }
@@ -89,6 +104,11 @@ const [url, scenario] = process.argv.slice(2);
     // waiting for a live label while the fake host is already paused.
     await until(state => state.phase === "live" || state.pending_gate?.[0] === "resume");
     await page.waitForTimeout(900);
+    // Wait for the browser's actual current state before deciding whether the
+    // single initial recovery is needed. A native-only check can precede the
+    // next UI render, then incorrectly wait for live after a genuine expiry.
+    await page.waitForFunction(() => document.querySelector("#session-state").textContent.endsWith(": live") ||
+      document.querySelector("#gate-state").textContent.includes("Approval needed: resume"));
     if (native(await read()).paused) {
       // A loaded desktop can genuinely miss the unchanged 250 ms deadline.
       // Do not call that a premature pause, hide it, or manufacture a heartbeat.
@@ -171,12 +191,37 @@ const [url, scenario] = process.argv.slice(2);
       await page.waitForTimeout(1200);
       assert.equal(native(await read()).paused, false, "pending diagnostic state IO cannot stop body delivery");
       await page.unrouteAll({behavior:"ignoreErrors"});
+    } else if (scenario === "approval-order") {
+      await page.keyboard.down("w");
+      await until(state => native(state)?.keys.includes("w"));
+      await page.getByRole("button", {name:"Pause / release body", exact:true}).click();
+      await until(state => state.pending_gate?.[0] === "resume");
+      // Delay only the explicitly requested empty approval packet. The real
+      // server rejects older sequences if a periodic request overtakes it.
+      // This models local request scheduling, not a proven powered-run cause.
+      let delayed = false;
+      await page.route("**/api/body", async route => {
+        if (!delayed && route.request().postDataJSON().active) {
+          delayed = true;
+          await page.keyboard.down("u"); // Real event during the pending empty lease.
+          await new Promise(resolve => setTimeout(resolve, 200));
+        }
+        await route.continue();
+      });
+      await resume();
+      assert.equal(delayed, true, "the explicit empty packet must exercise delayed delivery");
+      await page.unrouteAll({behavior:"ignoreErrors"});
+      const delivered = bodyReplies.filter(reply => reply.active && reply.accepted).length;
+      await until(() => bodyReplies.filter(reply => reply.active && reply.accepted).length >= delivered + 2);
+      assert.deepEqual(native(await read()).keys, [], "approval cannot replay held body input");
+      await page.keyboard.up("w");
+      await page.keyboard.up("u");
     } else if (scenario === "pending-stop") {
       await page.getByRole("button", {name:"Pause / release body", exact:true}).click();
       const current = await until(state => state.pending_gate?.[0] === "resume");
       await page.waitForFunction(epoch => document.querySelector("#gate-state").textContent
         .includes(`Approval needed: resume (host epoch ${epoch})`), current.pending_gate[1]);
-      const resumesBeforeStop = operations.filter(item => item.kind === "Resume").length;
+      const resumesBeforeStop = operationRequests.filter(item => item.kind === "Resume").length;
       let release;
       const held = new Promise(resolve => { release = resolve; });
       await page.route("**/api/body", async route => { await held; await route.continue(); });
@@ -185,7 +230,7 @@ const [url, scenario] = process.argv.slice(2);
       await page.getByRole("button", {name:"Stop session", exact:true}).click();
       try { await until(state => state.phase === "complete"); } finally { release(); }
       await page.waitForTimeout(200);
-      assert.equal(operations.filter(item => item.kind === "Resume").length, resumesBeforeStop,
+      assert.equal(operationRequests.filter(item => item.kind === "Resume").length, resumesBeforeStop,
                    "Stop invalidates this delayed approval before dispatch");
     }
     if (scenario !== "pending-stop") await page.getByRole("button", {name:"Stop session", exact:true}).click();
@@ -194,7 +239,7 @@ const [url, scenario] = process.argv.slice(2);
     assert.equal(done.cleanup_verified, true);
     console.log(`PASS ${scenario}: actual frontend, HTTP owner, native pipe and cleanup`);
   } catch (error) {
-    console.error(JSON.stringify({scenario, bodySendIntervals:bodyTiming.slice(-20).map((v,i,a) => i ? v.sent-a[i-1].sent : 0),
+    console.error(JSON.stringify({scenario, bodyReplies:bodyReplies.slice(-10), bodySendIntervals:bodyTiming.slice(-20).map((v,i,a) => i ? v.sent-a[i-1].sent : 0),
                                  bodyDurations:bodyTiming.slice(-10).map(v => ({duration_ms:v.duration_ms, timing:v.timing})),
                                  bodyCallIntervals:await page.evaluate(() => testBodyCalls.slice(-20).map((v,i,a) => i ? v-a[i-1] : 0)),
                                  longTasks:await Promise.all(page.frames().map(frame => frame.evaluate(() => testLongTasks)))}));

@@ -141,6 +141,51 @@ test("approval cannot switch gates or owner while its empty lease is pending", a
   assert.equal(result.payload.control_token, "owner-token");
 });
 
+test("periodic body requests cannot overtake the explicit empty approval packet", async () => {
+  const Input = loadInput(), sent = [];
+  let hold = false, finish;
+  const input = new Input(payload => {
+    sent.push(payload);
+    return hold ? new Promise(resolve => { finish = resolve; }) : Promise.resolve({accepted:true});
+  });
+  input.attach("session-1", "owner-token", 1);
+  input.setLive(true);
+  input.keyDown("w", {tagName:"BODY"});
+  hold = true;
+  const before = sent.length;
+  const approval = input.prepareApprovalRequest("Resume", ["resume", 3]);
+  const complete = finish;
+  input.tick(); // The existing 100 ms scheduler may run while HTTP is pending.
+  input.keyDown("u", {tagName:"BODY"});
+  input.pointerDown("j");
+  input.tick();
+  assert.equal(sent.length, before + 1, "a later sequence must not supersede the approval request");
+  assert.equal(sent.at(-1).active, true);
+  assert.deepEqual(Array.from(sent.at(-1).keys), []);
+  complete({accepted:true});
+  assert.equal((await approval).accepted, true);
+  hold = false;
+  input.tick();
+  assert.deepEqual(Array.from(sent.at(-1).keys), [], "pending keys cannot replay after admission");
+});
+
+test("release bypasses a pending approval and invalidates its late response", async () => {
+  const Input = loadInput(), sent = [];
+  let hold = false, finish;
+  const input = new Input(payload => {
+    sent.push(payload);
+    return hold && payload.active ? new Promise(resolve => { finish = resolve; }) : Promise.resolve({accepted:true});
+  });
+  input.attach("session-1", "owner-token", 1);
+  hold = true;
+  const approval = input.prepareApprovalRequest("Resume", ["resume", 3]);
+  input.blur();
+  assert.equal(sent.at(-1).active, false, "release cannot wait for the approval response");
+  finish({accepted:true});
+  assert.equal((await approval).accepted, false, "a released input cannot authorize Resume later");
+  assert.equal(input.live, false);
+});
+
 test("servo details show identity, provenance and unavailable values", () => {
   const Views = loadViews();
   const rows = Views.servoRows({
@@ -281,3 +326,92 @@ test("Stop cancels a pending approval and releases busy ownership for later Star
   pendingStart({ok:true,json:async()=>({accepted:true})});
   await starting;
 });
+
+function loadApp(fetchHook) {
+  const nodes = new Map(), sent = [], windowListeners = new Map(), documentListeners = new Map();
+  const element = () => ({textContent:"", value:"120", content:"test-only", dataset:{},
+    append(){}, replaceChildren(){}, addEventListener(){}, click(){}});
+  const document = {hidden:false, querySelector:key => {
+    if (!nodes.has(key)) nodes.set(key, element());
+    return nodes.get(key);
+  }, querySelectorAll:()=>[], createElement:element,
+  addEventListener:(type, listener) => documentListeners.set(type, listener)};
+  let state = {session_id:"old-session", phase:"host_ready", input_epoch:1,
+    pending_gate:["resume",1], events:[], telemetry:{}};
+  const context = vm.createContext({document, console:{info(){}}, location:{hash:""},
+    sessionStorage:{getItem:()=>null,setItem(){}},
+    window:{addEventListener:(type, listener) => windowListeners.set(type, listener)}, setInterval:()=>0,
+    fetch:(url, options={}) => {
+      const payload = options.body ? JSON.parse(options.body) : null;
+      sent.push({url, payload});
+      const held = fetchHook?.(url, payload);
+      if (held) return held;
+      const result = url === "/api/state" ? state : {accepted:true};
+      return Promise.resolve({ok:true,json:async()=>result});
+    }});
+  const source = fs.readFileSync(path.resolve(__dirname, "../../tools/am1_console_ui/app.js"), "utf8")
+    .replace("  route();", "  globalThis.testInput=input; globalThis.testOperation=operation; globalThis.testReadState=readState; route();");
+  vm.runInContext(source, context);
+  return {context, sent, windowListeners, documentListeners, setState:value => { state = value; }};
+}
+
+for (const outcome of ["denial", "failure"]) {
+  test(`a canceled old body ${outcome} cannot release a replacement owner`, async () => {
+    let pendingBody, hold = false;
+    const app = loadApp((url, payload) => {
+      if (url === "/api/body" && hold && payload.active && payload.session_id === "old-session")
+        return new Promise((resolve, reject) => { pendingBody = {resolve, reject}; });
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    const input = app.context.testInput;
+    input.attach("old-session", "old-token", 1);
+    hold = true;
+    const approval = app.context.testOperation("Resume"); // Old epoch 1, sequence 2.
+    await new Promise(resolve => setImmediate(resolve));
+    await app.context.testOperation("Stop");
+    app.setState({session_id:"new-session", phase:"live", input_epoch:1, events:[], telemetry:{}});
+    input.attach("new-session", "new-token", 1);
+    await app.context.testReadState();
+    input.setLive(true);
+    input.keyDown("w", {tagName:"BODY"});
+    input.tick(); // Replacement owner also has epoch 1, sequence 2.
+    if (outcome === "denial") pendingBody.resolve({ok:true,json:async()=>({accepted:false})});
+    else pendingBody.reject(new Error("old request failed"));
+    await approval;
+    assert.equal(input.live, true, "the old response must not revoke the new owner's lease");
+    assert.deepEqual(Array.from(input.keys()), ["w"]);
+    assert.equal(app.sent.at(-1).payload.session_id, "new-session");
+    assert.equal(app.sent.at(-1).payload.active, true);
+  });
+}
+
+for (const release of ["blur", "hidden", "route"]) {
+  test(`a late Resume operation response cannot rearm after ${release}`, async () => {
+    let pendingResume;
+    const app = loadApp((url, payload) => {
+      if (url === "/api/operation" && payload.kind === "Resume")
+        return new Promise(resolve => { pendingResume = resolve; });
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    const input = app.context.testInput;
+    input.attach("old-session", "old-token", 1);
+    const approval = app.context.testOperation("Resume");
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(typeof pendingResume, "function", "the real operation POST must be pending");
+    if (release === "blur") app.windowListeners.get("blur")();
+    else if (release === "hidden") {
+      app.context.document.hidden = true;
+      app.documentListeners.get("visibilitychange")();
+    } else {
+      input.setRoute("logs");
+      input.setRoute("control"); // Returning to Control must not revive the old approval.
+    }
+    assert.equal(input.live, false);
+    pendingResume({ok:true,json:async()=>({accepted:true})});
+    await approval;
+    assert.equal(input.live, false, "released input must require a new explicit current-gate approval");
+    input.tick();
+    assert.equal(app.sent.at(-1).payload.active, false);
+    assert.deepEqual(Array.from(input.keys()), []);
+  });
+}

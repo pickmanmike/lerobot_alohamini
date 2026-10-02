@@ -14,6 +14,8 @@ class AM1BrowserInput {
     this.held = new Set();
     this.releaseReason = null;
     this.firstRelease = null;
+    this.pendingApproval = null;
+    this.releaseGeneration = 0;
   }
   attach(sessionId, token, epoch) {
     this.release();
@@ -31,7 +33,7 @@ class AM1BrowserInput {
     return ["INPUT", "TEXTAREA", "SELECT"].includes(tag) || target?.isContentEditable === true;
   }
   keyDown(key, target) {
-    if (this.route === "control" && this.live && !this._typing(target) && this._validKey(key)) {
+    if (!this.pendingApproval && this.route === "control" && this.live && !this._typing(target) && this._validKey(key)) {
       this.held.add(key);
       return true;
     }
@@ -39,10 +41,14 @@ class AM1BrowserInput {
   }
   keyUp(key) { this.held.delete(key); }
   pointerDown(key) {
-    if (this.route === "control" && this.live && this._validKey(key)) this.held.add(key);
+    if (!this.pendingApproval && this.route === "control" && this.live && this._validKey(key)) this.held.add(key);
   }
   pointerUp(key) { this.held.delete(key); }
   tick() {
+    if (this.pendingApproval) return; // Do not supersede the explicit empty lease in flight.
+    return this.sendCurrent();
+  }
+  sendCurrent() {
     if (!this.sessionId || !this.token) return;
     const active = this.live && this.route === "control";
     return this.send({session_id:this.sessionId, control_token:this.token, epoch:this.epoch,
@@ -51,6 +57,8 @@ class AM1BrowserInput {
                                                               first_release:this.firstRelease})});
   }
   release(send = true, reason = "released browser input") {
+    this.releaseGeneration++;
+    this.pendingApproval = null; // Release/Stop must bypass a pending HTTP approval.
     if (this.live && this.sessionId) {
       const record = {reason, local_wall_time_ms:Date.now(), input_sequence:this.seq,
                       input_epoch:this.epoch, route:this.route};
@@ -75,7 +83,7 @@ class AM1BrowserInput {
   prepareApproval() {
     this.held.clear();
     this.setLive(true);
-    return this.tick();
+    return this.sendCurrent();
   }
   approvalPayload(kind, gate) {
     return {kind, session_id:this.sessionId, control_token:this.token,
@@ -83,8 +91,17 @@ class AM1BrowserInput {
   }
   async prepareApprovalRequest(kind, gate) {
     const payload = this.approvalPayload(kind, gate); // Bind the displayed gate before IO.
-    const lease = await this.prepareApproval();
-    return {accepted:lease?.accepted === true, payload};
+    if (this.pendingApproval) return {accepted:false, payload};
+    const pending = this.pendingApproval = {};
+    try {
+      const lease = await this.prepareApproval();
+      return {accepted:this.pendingApproval === pending && lease?.accepted === true, payload};
+    } finally {
+      if (this.pendingApproval === pending) {
+        this.pendingApproval = null;
+        this.held.clear(); // No key/button acquired during the gate may replay.
+      }
+    }
   }
 }
 globalThis.AM1BrowserInput = AM1BrowserInput;
@@ -162,14 +179,18 @@ if (typeof document !== "undefined") {
   const stateText = document.querySelector("#session-state");
   const notice = document.querySelector("#control-notice");
   const input = new AM1BrowserInput(payload => {
+    const generation = input.releaseGeneration;
+    const current = () => payload.active && payload.session_id === input.sessionId &&
+      payload.control_token === input.token && payload.epoch === input.epoch &&
+      payload.seq === input.seq && generation === input.releaseGeneration;
     return post("/api/body", payload).then(result => {
-      if (!result.accepted && payload.active && payload.epoch === input.epoch && payload.seq === input.seq) {
+      if (!result.accepted && current()) {
         input.release(true, "body-request-rejected");
         message("Input paused: body request rejected. Release controls; explicit Resume is required.");
       }
       return result;
     }).catch(() => {
-      if (payload.active && payload.epoch === input.epoch && payload.seq === input.seq) {
+      if (current()) {
         input.release(true, "body-request-failed");
         message("Input paused: body request failed. Release controls; explicit Resume is required.");
       }
@@ -425,11 +446,18 @@ if (typeof document !== "undefined") {
       busy = false; // The invalidated operation must not own the next session.
       input.release(); // Do not wait for another operation before clearing held input.
     } else busy = true;
+    const approving = kind === "Resume" || kind === "Approve";
+    const owner = {sessionId:input.sessionId, token:input.token, epoch:input.epoch,
+                   releaseGeneration:input.releaseGeneration};
+    const approvalCurrent = () => input.live && input.route === "control" &&
+      owner.sessionId === input.sessionId && owner.token === input.token && owner.epoch === input.epoch &&
+      owner.releaseGeneration === input.releaseGeneration;
     try {
       let approval = null;
-      if (kind === "Resume" || kind === "Approve") {
+      if (approving) {
         approval = await input.prepareApprovalRequest(kind, state?.pending_gate);
         if (generation !== operationGeneration) return; // Stop cancels a pending approval.
+        if (!approvalCurrent()) return; // A release/replacement also cancels the local approval.
         if (!approval.accepted) throw new Error("fresh empty control lease was not accepted");
       }
       const payload = approval ? approval.payload :
@@ -440,6 +468,9 @@ if (typeof document !== "undefined") {
       }
       const result = await post("/api/operation", payload);
       if (!stopping && generation !== operationGeneration) return;
+      // Empty-lease delivery and operation acknowledgement are separate awaits.
+      // A late acknowledgement must never undo blur, navigation or ownership loss.
+      if (approving && !approvalCurrent()) return;
       if (!result.accepted) { message(result.reason || "Operation refused; no motion approval granted."); return; }
       if (["Start", "ClaimInput"].includes(kind) && result.control_token) {
         input.attach(result.session_id, result.control_token, result.input_epoch);
@@ -453,6 +484,7 @@ if (typeof document !== "undefined") {
       await readState();
     } catch (error) {
       if (!stopping && generation !== operationGeneration) return;
+      if (approving && !approvalCurrent()) return;
       input.release();
       message(`Control connection failed: ${error.message}. Body input released.`);
     } finally {
