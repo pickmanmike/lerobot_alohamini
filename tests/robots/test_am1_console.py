@@ -645,6 +645,67 @@ def test_console_body_has_one_token_epoch_and_sequence(monkeypatch, tmp_path):
     assert created[0].closed
 
 
+@pytest.mark.parametrize("stage", ["sync_start", "live_start"])
+def test_console_resume_approves_exact_pending_startup_gate(monkeypatch, tmp_path, stage):
+    from examples.alohamini.am1_console_bridge import AM1ConsoleInputState
+
+    session_id = "20261001T000000-1234abcd"
+    finish = threading.Event()
+    created = []
+
+    class FakeBridge:
+        pipe_name = r"\\.\pipe\fake-am1"
+        auth_file = tmp_path / "auth"
+
+        def __init__(self, identity, directory, token):
+            self.state = AM1ConsoleInputState(identity, token)
+            self.state.request_pause("startup input released")
+            self.state.request_gate(stage, host_epoch=None)
+            created.append(self)
+
+        def browser_keys(self, **payload):
+            return self.state.browser_keys(**payload, now=1.0)
+
+        def approve(self, selected, **payload):
+            return self.state.approve(selected, **payload, now=1.1)
+
+        def snapshot(self):
+            return {"input_epoch": self.state.epoch, "input_lease": self.state.lease(now=1.1)["valid"],
+                    "pending_gate": self.state.pending_gate}
+
+        def close(self): pass
+
+    def fake_start(_repo, _config, _duration, **kwargs):
+        kwargs["console_prepare"](session_id)
+        kwargs["on_session_created"](session_id)
+        finish.wait(10)
+        return 0
+
+    monkeypatch.setattr(session, "run_start", fake_start)
+    adapter = console.ConsoleSessionAdapter(SimpleNamespace(local_state_directory=tmp_path), ROOT, session,
+                                            bridge_factory=FakeBridge)
+    try:
+        start = adapter.operation({"kind": "Start", "duration_seconds": 10})
+        token = start["control_token"]
+        adapter.body_input({"session_id": session_id, "control_token": token, "epoch": 1,
+                            "seq": 1, "keys": [], "active": True})
+        assert not adapter.operation({"kind": "Resume", "session_id": session_id, "control_token": token,
+                                      "gate_stage": [stage], "host_epoch": None})["accepted"]
+        assert adapter.operation({"kind": "Resume", "session_id": session_id, "control_token": token,
+                                  "gate_stage": stage, "host_epoch": None})["accepted"]
+        assert created[0].state.gate_ack(stage, host_epoch=None, now=1.11)
+        created[0].state.request_pause("operator")
+        created[0].state.request_gate("resume", host_epoch=3)
+        assert not adapter.operation({"kind": "Resume", "session_id": session_id, "control_token": token,
+                                      "gate_stage": stage, "host_epoch": 3})["accepted"]
+        assert adapter.operation({"kind": "Resume", "session_id": session_id, "control_token": token,
+                                  "gate_stage": "resume", "host_epoch": 3})["accepted"]
+        assert created[0].state.gate_ack("resume", host_epoch=3, now=1.12)
+    finally:
+        finish.set()
+        adapter.wait(3)
+
+
 def test_bridge_cleanup_failure_retains_primary_session_error(monkeypatch, tmp_path):
     session_id = "20261001T000000-1234abcd"
 

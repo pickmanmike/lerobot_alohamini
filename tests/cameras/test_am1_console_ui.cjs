@@ -100,6 +100,33 @@ test("explicit Resume first establishes a fresh empty lease", () => {
   assert.equal(sent.at(-1).keys.length, 0);
 });
 
+test("startup approval carries the displayed gate, owner and host epoch", () => {
+  const Input = loadInput();
+  const input = new Input(() => {});
+  input.attach("session-1", "owner-token", 1);
+  const payload = input.approvalPayload("Resume", ["sync_start", null]);
+  assert.equal(JSON.stringify(payload), JSON.stringify({kind:"Resume", session_id:"session-1",
+    control_token:"owner-token", gate_stage:"sync_start", host_epoch:null}));
+  assert.equal(input.approvalPayload("Resume", ["resume", 3]).host_epoch, 3);
+  assert.equal(input.approvalPayload("Resume", ["resume", 3]).gate_stage, "resume");
+});
+
+test("approval cannot switch gates or owner while its empty lease is pending", async () => {
+  const Input = loadInput();
+  let finish;
+  const input = new Input(() => new Promise(resolve => { finish = resolve; }));
+  input.attach("session-1", "owner-token", 1);
+  const gate = ["sync_start", null];
+  const pending = input.prepareApprovalRequest("Resume", gate);
+  gate[0] = "live_start";
+  input.token = "new-owner";
+  finish({accepted:true});
+  const result = await pending;
+  assert.equal(result.accepted, true);
+  assert.equal(result.payload.gate_stage, "sync_start");
+  assert.equal(result.payload.control_token, "owner-token");
+});
+
 test("servo details show identity, provenance and unavailable values", () => {
   const Views = loadViews();
   const rows = Views.servoRows({

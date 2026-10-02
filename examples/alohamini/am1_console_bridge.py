@@ -134,6 +134,8 @@ class AM1ConsoleInputState:
             or not math.isfinite(now)
         ):
             return False
+        if self.ever_active and not self._fresh(now):
+            self.request_pause("expired browser input")
         self.last_browser_seq = seq
         self.last_browser_at = now
         self.browser_active = active
@@ -141,13 +143,13 @@ class AM1ConsoleInputState:
         if active:
             self.ever_active = True
         elif self.ever_active:
-            self.forced_pause = True
+            self.request_pause("released browser input")
         return True
 
     def lease(self, *, now: float) -> dict[str, Any]:
         fresh = self._fresh(now)
         if not fresh and self.ever_active:
-            self.forced_pause = True
+            self.request_pause("expired browser input")
         valid = fresh and not self.forced_pause
         return {"valid": valid, "keys": list(self.keys) if valid else [], "epoch": self.epoch,
                 "pause_required": self.forced_pause}
@@ -170,6 +172,8 @@ class AM1ConsoleInputState:
         del cause
         self.keys = []
         self.forced_pause = True
+        if self.approved_gate is not None and self.approved_gate[0] in PREPARED_GATES:
+            self.approved_gate = None
 
     def request_gate(self, stage: str, *, host_epoch: int | None) -> None:
         if stage not in PREPARED_GATES | MANUAL_GATES:
@@ -181,8 +185,9 @@ class AM1ConsoleInputState:
 
     def approve(self, stage: str, *, host_epoch: int | None, token: str, now: float) -> bool:
         if (
-            stage not in MANUAL_GATES or self.pending_gate != (stage, host_epoch)
+            stage not in PREPARED_GATES | MANUAL_GATES or self.pending_gate != (stage, host_epoch)
             or not secrets.compare_digest(token, self.control_token) or not self._fresh(now)
+            or (stage in PREPARED_GATES and self.keys)
         ):
             return False
         self.approved_gate = (stage, host_epoch)
@@ -192,14 +197,13 @@ class AM1ConsoleInputState:
         if self.pending_gate != (stage, host_epoch) or not self._fresh(now):
             return False
         if stage in PREPARED_GATES:
-            if self.forced_pause:
+            if self.forced_pause and (self.approved_gate != (stage, host_epoch) or self.keys):
                 return False
         elif self.approved_gate != (stage, host_epoch):
             return False
         self.pending_gate = None
         self.approved_gate = None
-        if stage in {"resume", "realign"}:
-            self.forced_pause = False
+        self.forced_pause = False
         return True
 
 

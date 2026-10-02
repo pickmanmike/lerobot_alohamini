@@ -39,15 +39,29 @@ is under the private configured `windows_log_directory`, named
 `am1-session-<session-id>`; CollectOnly can retry missing log collection without
 starting hardware.
 
+If a startup input lease was released, the pending `sync_start` or `live_start`
+gate shows **Continue startup**. Hold the leaders still, release all body input,
+and click it to approve only that displayed gate with a fresh empty lease.
+Fresh heartbeats alone do not clear the latch; stale/wrong-stage approval is
+refused. Live Pause/Resume still requires the existing host/follower/leader
+qualification, and startup approval never enables body motion before live
+admission. Match leaders to the current measured follower pose before Start;
+this UI correction does not remove the documented large-offset shoulder limit.
+
 If a required camera view is unavailable or only a retained image remains,
 release body keys, Pause, then Stop if the view does not promptly recover. Confirm
 the owned session has stopped before reopening the view or starting another
 session; a last frame is not a live driving view. Small right-elbow tracking,
 arbitrary-pose shoulder alignment, intermittent camera acquisition/browser gaps,
 and long-duration or unattended use retain the limitations below. This console
-source has passed offline fake/browser checks, but has not yet had its single
-attended integrated check; the deployed helper and separate camera source must
-be verified and staged before that check.
+source has passed offline fake/browser checks. The camera-only layout/start/stop
+check passed with five fresh sources, but the attended Control check is not yet
+accepted. One attempt stopped on an unpowered left leader chain; after the owner
+restored its supply, the next stopped before the arm ramp on a startup approval
+timeout. Both collected results verified cleanup. These are not live-control
+passes; the focused startup-gate recovery correction still needs its targeted
+operational check. The initiating lease-release event was not captured, so its
+runtime trigger remains unproven.
 
 The Servos page distinguishes the physical leader and Pi follower identities.
 It displays normalized position and the action actually sent; per-servo current,

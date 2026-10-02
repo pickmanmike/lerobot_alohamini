@@ -101,6 +101,49 @@ def test_prepared_gate_needs_real_browser_lease():
     assert state.gate_ack("sync_start", host_epoch=None, now=1.01)
 
 
+@pytest.mark.parametrize("stage", ["sync_start", "live_start"])
+def test_released_startup_gate_requires_explicit_fresh_empty_approval(stage):
+    state = bridge.AM1ConsoleInputState("20261001T000000-1234abcd", "private-token")
+    state.browser_keys(token="private-token", epoch=1, seq=1, keys=["w"], active=True, now=1.0)
+    state.browser_keys(token="private-token", epoch=1, seq=2, keys=[], active=False, now=1.1)
+    state.request_gate(stage, host_epoch=None)
+    state.browser_keys(token="private-token", epoch=1, seq=3, keys=[], active=True, now=1.2)
+    assert not state.gate_ack(stage, host_epoch=None, now=1.21)  # No automatic rearm.
+    assert not state.approve(stage, host_epoch=None, token="wrong", now=1.21)
+    assert not state.approve(stage, host_epoch=3, token="private-token", now=1.21)
+    assert not state.approve(stage, host_epoch=None, token="private-token", now=1.5)
+    state.browser_keys(token="private-token", epoch=1, seq=4, keys=["u"], active=True, now=1.6)
+    assert not state.approve(stage, host_epoch=None, token="private-token", now=1.61)
+    state.browser_keys(token="private-token", epoch=1, seq=5, keys=[], active=True, now=1.7)
+    assert state.approve(stage, host_epoch=None, token="private-token", now=1.71)
+    state.browser_keys(token="private-token", epoch=1, seq=6, keys=["u"], active=True, now=1.72)
+    assert not state.gate_ack(stage, host_epoch=None, now=1.73)
+    state.browser_keys(token="private-token", epoch=1, seq=7, keys=[], active=True, now=1.74)
+    assert state.gate_ack(stage, host_epoch=None, now=1.75)
+    assert not state.gate_ack(stage, host_epoch=None, now=1.76)
+    assert state.lease(now=1.76)["keys"] == []
+    assert state.lease(now=1.76)["valid"]
+
+
+@pytest.mark.parametrize("loss", ["release", "expiry", "pause", "gap_without_poll"])
+def test_startup_approval_does_not_survive_subsequent_input_loss(loss):
+    state = bridge.AM1ConsoleInputState("20261001T000000-1234abcd", "private-token")
+    state.request_pause("startup input released")
+    state.request_gate("sync_start", host_epoch=None)
+    state.browser_keys(token="private-token", epoch=1, seq=1, keys=[], active=True, now=1.0)
+    assert state.approve("sync_start", host_epoch=None, token="private-token", now=1.01)
+    if loss == "release":
+        state.browser_keys(token="private-token", epoch=1, seq=2, keys=[], active=False, now=1.1)
+    elif loss == "expiry":
+        assert not state.lease(now=1.3)["valid"]
+    elif loss == "pause":
+        state.request_pause("operator")
+    state.browser_keys(token="private-token", epoch=1, seq=3, keys=[], active=True, now=1.4)
+    assert not state.gate_ack("sync_start", host_epoch=None, now=1.41)
+    assert state.approve("sync_start", host_epoch=None, token="private-token", now=1.42)
+    assert state.gate_ack("sync_start", host_epoch=None, now=1.43)
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="AF_PIPE is Windows-only")
 def test_real_authenticated_pipe_carries_prepared_gate_and_bounded_body(tmp_path):
     session_id = "20261001T000000-1234abcd"

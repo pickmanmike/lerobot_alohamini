@@ -65,6 +65,15 @@ class AM1BrowserInput {
     this.setLive(true);
     return this.tick();
   }
+  approvalPayload(kind, gate) {
+    return {kind, session_id:this.sessionId, control_token:this.token,
+            gate_stage:gate?.[0] ?? null, host_epoch:gate?.[1] ?? null};
+  }
+  async prepareApprovalRequest(kind, gate) {
+    const payload = this.approvalPayload(kind, gate); // Bind the displayed gate before IO.
+    const lease = await this.prepareApproval();
+    return {accepted:lease?.accepted === true, payload};
+  }
 }
 globalThis.AM1BrowserInput = AM1BrowserInput;
 
@@ -279,6 +288,8 @@ if (typeof document !== "undefined") {
       document.querySelector("#gate-state").textContent = gate ?
         `Approval needed: ${gate[0]} (host epoch ${gate[1] ?? "before live"}). Hold leaders still and release body keys.` :
         "No manual approval pending.";
+      document.querySelector('[data-operation="Resume"]').textContent =
+        ["sync_start", "live_start"].includes(gate?.[0]) ? "Continue startup" : "Approve Resume";
       try { renderSnapshot(state); } catch {
         document.querySelector("#system-notice").textContent = "Diagnostic display unavailable; Control and Stop remain available.";
       }
@@ -380,12 +391,13 @@ if (typeof document !== "undefined") {
     if (busy) return;
     busy = true;
     try {
+      let approval = null;
       if (kind === "Resume" || kind === "Approve") {
-        const lease = await input.prepareApproval();
-        if (!lease?.accepted) throw new Error("fresh empty control lease was not accepted");
+        approval = await input.prepareApprovalRequest(kind, state?.pending_gate);
+        if (!approval.accepted) throw new Error("fresh empty control lease was not accepted");
       }
-      const payload = {kind, session_id:state?.session_id, control_token:input.token,
-                       host_epoch:state?.pending_gate?.[1] ?? null};
+      const payload = approval ? approval.payload :
+        {kind, session_id:state?.session_id, control_token:input.token};
       if (kind === "Start") {
         payload.duration_seconds = Number(document.querySelector("#duration-seconds").value);
         payload.leader_source = "physical";

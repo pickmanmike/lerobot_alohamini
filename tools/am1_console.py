@@ -376,10 +376,19 @@ class ConsoleSessionAdapter:
                 self._emit({"event": "pause_requested", "session_id": expected})
                 return {"accepted": True, "phase": "pausing"}
             stage = "resume" if kind == "Resume" else "realign"
+            requested_stage = payload.get("gate_stage", stage)
+            if not isinstance(requested_stage, str):
+                return {"accepted": False, "reason": "approval gate is invalid"}
+            if kind == "Resume" and requested_stage in {"sync_start", "live_start"}:
+                stage = requested_stage
+            elif requested_stage != stage:
+                return {"accepted": False, "reason": "approval does not match the displayed gate"}
             host_epoch = payload.get("host_epoch")
             if host_epoch is not None and type(host_epoch) is not int:
                 return {"accepted": False, "reason": "host epoch is invalid"}
             accepted = bridge.approve(stage, host_epoch=host_epoch, token=token)
+            self._emit({"event": "gate_approval", "session_id": expected, "stage": stage,
+                        "host_epoch": host_epoch, "accepted": accepted})
             return {"accepted": accepted, "phase": "resume_pending" if accepted else "approval_refused"}
         return {"accepted": False, "reason": "operation is unavailable"}
 
