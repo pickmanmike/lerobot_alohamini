@@ -17,7 +17,10 @@ from types import SimpleNamespace
 import pytest
 from PIL import Image
 
-from examples.alohamini.am1_console_bridge import AM1ConsoleBridgeClient, AM1ConsoleBridgeServer
+from examples.alohamini.am1_console_bridge import (
+    AM1ConsoleBridgeClient, AM1ConsoleBridgeServer, CONSOLE_ARM_KEYS, CONSOLE_BODY_OBSERVATION_KEYS,
+    make_console_action_sent_event, make_console_host_feedback_event, make_console_live_sample_event,
+)
 from tools.am1_console import ConsoleServer, ConsoleSessionAdapter
 
 
@@ -50,6 +53,29 @@ class FakeSessionIO:
         callbacks["on_session_created"](identity)
         native = self.native = AM1ConsoleBridgeClient(pipe, auth, identity)
         emit = callbacks["emit"]
+        telemetry_stop = threading.Event()
+        telemetry_thread = None
+        host_feedback = [{"state": "ready", "epoch": 0}]
+        def telemetry():
+            sequence = 0
+            positions = {key: 12.3456789012345 for key in CONSOLE_ARM_KEYS}
+            while not telemetry_stop.wait(.1):
+                sequence += 1
+                # Complete native packet shapes remain flowing while the main
+                # fake robot/session waits for explicit current-gate Resume.
+                sample = SimpleNamespace(arm_target=positions, follower_positions=positions,
+                    observed_at=time.monotonic(), observation_sequence=sequence,
+                    observation={key: 0.0 for key in CONSOLE_BODY_OBSERVATION_KEYS})
+                feedback = {"version": 1, **host_feedback[0], "observation_id": sequence}
+                for event in (
+                    make_console_live_sample_event(sample, positions, raw_keys=CONSOLE_BODY_OBSERVATION_KEYS,
+                        host_feedback=feedback, wall_ns=time.time_ns(), monotonic_now=time.monotonic()),
+                    make_console_host_feedback_event(sample, feedback, wall_ns=time.time_ns(),
+                                                    monotonic_now=time.monotonic()),
+                    make_console_action_sent_event(positions, sequence=sequence, interval_ms=100,
+                                                  wall_ns=time.time_ns()),
+                ):
+                    native.publish_telemetry(event)
         try:
             native.connect()
             for event in ("camera_ready", "host_ready"):
@@ -57,7 +83,10 @@ class FakeSessionIO:
             for gate in ("sync_start", "live_start"):
                 if not native.wait_gate(gate, cancel=self.stopped.is_set, timeout_s=8):
                     return 2
-            native.note_live_admitted()  # Fake current host active acknowledgement.
+            host_feedback[0] = {"state": "active", "epoch": 0}  # Fake actual host acknowledgement.
+            native.note_live_admitted(host_epoch=0)
+            telemetry_thread = threading.Thread(target=telemetry, daemon=True)
+            telemetry_thread.start()
             self.on_live()
             epoch, previous, last_output = 0, None, 0.0
             deadline = time.monotonic() + 25
@@ -71,18 +100,19 @@ class FakeSessionIO:
                     previous = sample
                 if paused:
                     epoch += 1
+                    host_feedback[0] = {"state": "paused", "epoch": epoch}
                     if not native.wait_gate("resume", host_epoch=epoch,
                                             cancel=self.stopped.is_set, timeout_s=8):
                         return 0 if self.stopped.is_set() else 2
-                    native.note_live_admitted()
+                    epoch += 1
+                    host_feedback[0] = {"state": "active", "epoch": epoch}  # Not the UI approval itself.
+                    native.note_live_admitted(host_epoch=epoch)
                 now = time.monotonic()
                 if now - last_output >= .1:
                     emit({"event": "process_output", "session_id": identity, "source": "host",
                           "path": "/logs/am1-local-host-20261002-000000.log", "offset": 0,
                           "data_base64": base64.b64encode(b"FAKE HOST ordinary output\n").decode(),
                           "acquired_at_ns": time.time_ns()})
-                    native.publish_telemetry({"event": "host_feedback", "host_state": "active",
-                                              "host_epoch": epoch, "body": {"x.vel": 0, "lift_axis.vel": 0}})
                     last_output = now
                 time.sleep(.02)
             return 0
@@ -90,6 +120,9 @@ class FakeSessionIO:
             self.error = exc
             raise
         finally:
+            telemetry_stop.set()
+            if telemetry_thread is not None:
+                telemetry_thread.join(1)
             native.disconnect()
             emit({"event": "cleanup", "cleanup_verified": True})
 

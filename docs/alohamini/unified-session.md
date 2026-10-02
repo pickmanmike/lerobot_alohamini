@@ -82,6 +82,30 @@ approval. Under desktop load, a real browser input gap can exceed the unchanged
 not an invented heartbeat or a claim of uninterrupted cadence. These are offline
 results, not a replacement for the pending attended Control check.
 
+The subsequent Control-only attempt also passed automatic synchronization and
+native live admission, but the page continued to display `host_ready`. A later
+input-lease expiry requested explicit Resume in the native client; Control did
+not expose the pending gate before its deadline. The owner only watched startup
+and reported prompt stopping without unusual behavior. Client refusal 2 and
+verified host/camera cleanup 0 are retained; manual leader/body input, successful
+Pause/Resume and page Stop remain unaccepted. Healthy SSH in that attempt does
+not explain the local lease expiry or the missing gate.
+
+The focused correction derives Control's `live` phase from the native client's
+validated same-host/epoch admission plus matching accepted host feedback, not
+raw active feedback, action transmission or UI approval. Ready/paused feedback
+revokes the prior live display. An aged active sample is
+displayed as `feedback_stale`, and cannot overwrite stopping/terminal state.
+The native pipe retains one bounded gate-request record and one sent-ack record;
+native gate logs separately show request and acknowledged/cancelled/disconnected/
+timeout result. A sent acknowledgement is not itself host admission. Control
+also labels native connection/rejected-request state. Complete synthetic native
+telemetry exercised the real browser/HTTP/pipe/model path and explicit Resume;
+it did not reproduce the physical attempt's absent gate. Its cause remains open,
+not repaired by assertion. Keep the unchanged 250 ms input expiry, current-gate
+approval and host qualification; use Stop promptly if the current gate is absent
+or cannot be completed. No further powered attempt was made in this repair batch.
+
 The Servos page distinguishes the physical leader and Pi follower identities.
 It displays normalized position and the action actually sent; per-servo current,
 temperature and status remain **Not sampled** until a correctly identified

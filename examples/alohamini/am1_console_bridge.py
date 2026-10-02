@@ -34,6 +34,17 @@ CONSOLE_BODY_OBSERVATION_KEYS = frozenset({"x.vel", "y.vel", "theta.vel", "lift_
 CONSOLE_ARM_KEYS = frozenset(f"arm_{side}_{joint}.pos" for side in ("left", "right")
                              for joint in ("shoulder_pan", "shoulder_lift", "elbow_flex",
                                            "wrist_flex", "wrist_roll", "gripper"))
+_RECORD_LOCK = threading.Lock()
+
+
+def _print_record(record: dict[str, Any]) -> None:
+    # Gate/pause evidence is not permission and must not replace cancellation
+    # or the primary fault if an output viewer has closed. Keep JSON lines whole.
+    try:
+        with _RECORD_LOCK:
+            print(json.dumps(record, sort_keys=True), flush=True)
+    except (OSError, ValueError):
+        pass
 
 
 def _browser_release(record: Any, epoch: int, seq: int) -> dict[str, Any] | None:
@@ -317,7 +328,7 @@ class AM1ConsoleBridgeClient:
                         message = self._telemetry_pending.pop(next(iter(self._telemetry_pending))) if self._telemetry_pending else None
                     if message is not None:
                         if message.get("event") == "am1_console_input_pause" and message.get("source") == "native":
-                            print(json.dumps(message, sort_keys=True), flush=True)
+                            _print_record(message)
                         try:
                             packet = _encode({"session_id": self.session_id, "epoch": self._epoch,
                                               "seq": 0, "kind": "telemetry", "payload": message})
@@ -412,13 +423,13 @@ class AM1ConsoleBridgeClient:
                 return False
         if pause_log is not None:
             # A bounded transition record outside the input-state lock, not a per-frame display.
-            print(json.dumps(pause_log, sort_keys=True), flush=True)
+            _print_record(pause_log)
             self.publish_telemetry(pause_log)
         return True
 
     def publish_telemetry(self, event: dict[str, Any]) -> None:
         """Replace a pending display sample without delaying action or approval traffic."""
-        if event.get("event") not in {"live_sample", "action_sent", "host_feedback", "am1_console_input_pause"}:
+        if event.get("event") not in {"live_sample", "action_sent", "host_feedback", "live_admitted", "am1_console_input_pause"}:
             return
         with self._lock:
             self._telemetry_pending[event["event"]] = event
@@ -446,12 +457,16 @@ class AM1ConsoleBridgeClient:
                 return set()
             return set() if self._pause_latched or not self._body_enabled or self._needs_release else set(self._keys)
 
-    def note_live_admitted(self) -> None:
+    def note_live_admitted(self, *, host_epoch: int | None = None) -> None:
         """Called only after current host active acknowledgement, not UI approval."""
         with self._lock:
             self._body_enabled = not self._pause_latched
             self._needs_release = True
             self._keys.clear()
+            if type(host_epoch) is int and host_epoch >= 0:
+                self._telemetry_pending["live_admitted"] = {
+                    "event": "live_admitted", "host_epoch": host_epoch, "acquired_at_ns": time.time_ns(),
+                }
 
     def get_action(self) -> set[str]:
         return self.body_keys()
@@ -475,21 +490,30 @@ class AM1ConsoleBridgeClient:
                 raise ValueError("console gate already pending")
             self._gate_events[key] = event
             epoch = self._epoch
+        result = "error"
         try:
             self._outbound.put_nowait({"session_id": self.session_id, "epoch": epoch, "seq": 0,
                                        "kind": "gate_request", "payload": {"stage": stage, "host_epoch": host_epoch}})
+            _print_record({"event": "am1_console_gate_request", "stage": stage, "host_epoch": host_epoch,
+                           "input_epoch": epoch, "wall_time_ns": time.time_ns()})
             deadline = self.clock() + timeout_s
             while self.clock() < deadline:
                 if cancel is not None and cancel():
+                    result = "cancelled"
                     return False
                 if event.wait(0.05):
+                    result = "acknowledged"
                     return True
                 if not self.is_connected:
+                    result = "disconnected"
                     return False
+            result = "timeout"
             return False
         finally:
             with self._lock:
                 self._gate_events.pop(key, None)
+            _print_record({"event": "am1_console_gate_result", "stage": stage, "host_epoch": host_epoch,
+                           "input_epoch": epoch, "result": result, "wall_time_ns": time.time_ns()})
 
     def disconnect(self) -> None:
         self._stop.set()
@@ -551,6 +575,9 @@ class AM1ConsoleBridgeServer:
             self.auth_file.unlink(missing_ok=True)
             raise
         self.connection = None
+        self._native_connected = False
+        self._gate_request_evidence = None
+        self._gate_ack_evidence = None
         self._telemetry_sink = None
         self._send_seq = 0
         self._thread = threading.Thread(target=self._io, name="am1-console-pipe-owner", daemon=True)
@@ -576,6 +603,8 @@ class AM1ConsoleBridgeServer:
             if hello.get("kind") != "hello" or hello.get("session_id") != self.session_id:
                 return
             self._send("welcome", {})
+            with self.lock:
+                self._native_connected = True
             while not self.stop_event.is_set():
                 if conn.poll(0.05):
                     message = _decode(conn.recv_bytes(MAX_PIPE_BYTES))
@@ -585,12 +614,22 @@ class AM1ConsoleBridgeServer:
                         payload = message.get("payload", {})
                         stage, host_epoch = payload.get("stage"), payload.get("host_epoch")
                         with self.lock:
+                            self._gate_request_evidence = {
+                                "stage": stage if isinstance(stage, str) and stage in PREPARED_GATES | MANUAL_GATES else "invalid",
+                                "host_epoch": host_epoch if type(host_epoch) is int else None,
+                                "input_epoch": message.get("epoch") if type(message.get("epoch")) is int else None,
+                                "expected_input_epoch": self.state.epoch,
+                                "accepted": False,
+                                "rejection": "input epoch mismatch" if message.get("epoch") != self.state.epoch else "invalid gate",
+                                "wall_time_ns": time.time_ns(),
+                            }
                             if message.get("epoch") != self.state.epoch:
                                 continue
                             self.state.request_gate(stage, host_epoch=host_epoch)
+                            self._gate_request_evidence.update(accepted=True, rejection=None)
                     elif message.get("kind") == "telemetry" and message.get("epoch") == self.state.epoch:
                         payload = message.get("payload")
-                        if isinstance(payload, dict) and payload.get("event") in {"live_sample", "action_sent", "host_feedback", "am1_console_input_pause"}:
+                        if isinstance(payload, dict) and payload.get("event") in {"live_sample", "action_sent", "host_feedback", "live_admitted", "am1_console_input_pause"}:
                             sink = self._telemetry_sink
                             if sink is not None:
                                 try:
@@ -606,11 +645,14 @@ class AM1ConsoleBridgeServer:
                     lease = self.state.lease(now=self.clock())
                 if ack is not None:
                     self._send("gate_ack", ack)
+                    with self.lock:
+                        self._gate_ack_evidence = {**ack, "wall_time_ns": time.time_ns()}
                 self._send("lease", lease)
         except (EOFError, OSError, ValueError):
             pass
         finally:
             with self.lock:
+                self._native_connected = False
                 self.state.request_pause("pipe disconnected")
             if self.connection is not None:
                 try:
@@ -647,7 +689,10 @@ class AM1ConsoleBridgeServer:
             return {"input_epoch": self.state.epoch, "input_lease": lease["valid"],
                     "pending_gate": self.state.pending_gate, "pause_required": lease["pause_required"],
                     "first_input_pause": self.state.first_pause, "input_pause": self.state.pause_evidence,
-                    "browser_first_pause": self.state.browser_first_pause}
+                    "browser_first_pause": self.state.browser_first_pause,
+                    "native_connected": self._native_connected,
+                    "gate_request_evidence": None if self._gate_request_evidence is None else dict(self._gate_request_evidence),
+                    "gate_ack_evidence": None if self._gate_ack_evidence is None else dict(self._gate_ack_evidence)}
 
     def close(self) -> None:
         self.stop_event.set()

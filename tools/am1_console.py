@@ -61,6 +61,8 @@ class ConsoleSessionAdapter:
         self._event_sink = None
         self._bridge = None
         self._control_token: str | None = None
+        self._admitted_host_epoch: int | None = None
+        self._admitted_at_ns: int | None = None
 
     def set_event_sink(self, sink):
         self._event_sink = sink
@@ -85,9 +87,38 @@ class ConsoleSessionAdapter:
             # Output is not lifecycle/SSE traffic and cannot fill its queues.
             self._receive_output(event)
             return
-        telemetry_only = event.get("event") in {"live_sample", "action_sent", "host_feedback", "system_sample"}
+        telemetry_only = event.get("event") in {"live_sample", "action_sent", "host_feedback", "system_sample", "live_admitted"}
         with self._lock:
             self._telemetry.update(event)
+            if event.get("event") in {"host_feedback", "live_sample", "live_admitted"} and self._phase not in {
+                "stopping", "client_exited", "complete", "failed", "cleanup_unknown",
+            }:
+                observation = self._telemetry.observation
+                acquired = event.get("acquired_at_ns")
+                if (event.get("event") == "live_admitted" and type(acquired) is int
+                        and type(event.get("host_epoch")) is int and event["host_epoch"] >= 0
+                        and (self._admitted_at_ns is None or acquired >= self._admitted_at_ns)):
+                    # Only the native consumer's validated same-host active ack
+                    # calls note_live_admitted; raw feedback/UI approval does not.
+                    self._admitted_host_epoch = event["host_epoch"]
+                    self._admitted_at_ns = acquired
+                # Never use an older observation rejected by the cache.
+                if (type(event.get("acquired_at_ns")) is int
+                        and (event.get("event") == "live_admitted"
+                             or event["acquired_at_ns"] == observation["acquired_at_ns"])):
+                    if observation.get("host_state") == "active":
+                        self._phase = "live" if observation.get("host_epoch") == self._admitted_host_epoch else "awaiting_live_ack"
+                    elif observation.get("host_state") in {"paused", "ready"}:
+                        self._phase = "paused" if observation["host_state"] == "paused" else "host_ready"
+                        if (self._admitted_at_ns is not None and observation["acquired_at_ns"] is not None
+                                and observation["acquired_at_ns"] >= self._admitted_at_ns
+                                and (observation["host_state"] == "ready"
+                                     or type(observation.get("host_epoch")) is not int
+                                     or self._admitted_host_epoch is None
+                                     or observation["host_epoch"] >= self._admitted_host_epoch)):
+                            # A later timestamp on sequential telemetry does
+                            # not make a superseded paused host epoch current.
+                            self._admitted_host_epoch = None
             if telemetry_only:
                 return
             self._events.append(event)
@@ -95,6 +126,8 @@ class ConsoleSessionAdapter:
                 self._phase = event["event"]
             elif event.get("event") == "stop_requested":
                 self._phase = "stopping"
+            elif event.get("event") == "client_exited":
+                self._phase = "client_exited"
             if event.get("event") == "preflight_passed" and isinstance(event.get("sources"), dict):
                 self._verified_source_heads = {
                     key: value for key, value in event["sources"].items()
@@ -233,6 +266,10 @@ class ConsoleSessionAdapter:
                     "final_exit_code": self._final_exit_code, "cleanup_verified": self._cleanup_verified,
                     "error": self._error,
                     "events": list(self._events), "telemetry": self._telemetry.snapshot(now_ns=time.time_ns())}
+            if state["phase"] == "live":
+                age = state["telemetry"]["observation"]["age_ms"]
+                if age is None or age > 1000:
+                    state["phase"] = "feedback_stale"
             state["configured_source_pins"] = {name: getattr(self.config, name, None) for name in (
                 "remote_session_head", "remote_motor_head", "remote_camera_head")}
             state["verified_source_heads"] = None if self._verified_source_heads is None else dict(self._verified_source_heads)
@@ -324,6 +361,8 @@ class ConsoleSessionAdapter:
                 # Session-owned observations/actions cannot be attributed to
                 # the next Start. Camera status is reacquired independently.
                 self._telemetry = ConsoleSnapshot()
+                self._admitted_host_epoch = None
+                self._admitted_at_ns = None
                 self._events.clear()
                 self._outputs.clear()
                 self._control_token = secrets.token_hex(32)

@@ -61,10 +61,18 @@ const [url, scenario] = process.argv.slice(2);
   const native = state => state.events.filter(e => e.event === "test_native_state").at(-1);
   const resume = async () => {
     const current = await until(state => state.pending_gate?.[0] === "resume");
+    assert.equal(current.native_connected, true);
+    assert.equal(current.gate_request_evidence.stage, "resume");
+    assert.equal(current.gate_request_evidence.host_epoch, current.pending_gate[1]);
+    assert.equal(current.gate_request_evidence.accepted, true);
     await page.waitForFunction(epoch => document.querySelector("#gate-state").textContent
       .includes(`Approval needed: resume (host epoch ${epoch})`), current.pending_gate[1]);
+    await page.waitForFunction(() => document.querySelector("#gate-state").textContent
+      .includes("Native input: connected"), null, {timeout:1500});
     await page.getByRole("button", {name:"Approve Resume", exact:true}).click();
     await until(state => native(state)?.paused === false);
+    await until(state => state.phase === "live");
+    await page.waitForFunction(() => document.querySelector("#session-state").textContent.endsWith(": live"));
   };
   try {
     await page.goto(url);
@@ -75,7 +83,11 @@ const [url, scenario] = process.argv.slice(2);
         [...document.querySelectorAll("#thumbnails img")].every(img => img.src.startsWith("blob:"));
     });
     await page.getByRole("button", {name:"Start Local session", exact:true}).click();
-    await until(state => native(state)?.paused === false);
+    await until(state => native(state)?.paused === false || state.pending_gate?.[0] === "resume");
+    // Full native telemetry can expose a real expiry before the browser has
+    // rendered a brief live admission. Handle that CURRENT gate rather than
+    // waiting for a live label while the fake host is already paused.
+    await until(state => state.phase === "live" || state.pending_gate?.[0] === "resume");
     await page.waitForTimeout(900);
     if (native(await read()).paused) {
       // A loaded desktop can genuinely miss the unchanged 250 ms deadline.
@@ -91,6 +103,8 @@ const [url, scenario] = process.argv.slice(2);
       await resume();
     }
     assert.equal(native(await read()).paused, false, "qualified focused input must be live");
+    await until(state => state.phase === "live");
+    await page.waitForFunction(() => document.querySelector("#session-state").textContent.endsWith(": live"));
     if (["healthy", "camera-delay"].includes(scenario)) {
       await page.keyboard.down("w");
       await until(state => native(state)?.keys.includes("w"));

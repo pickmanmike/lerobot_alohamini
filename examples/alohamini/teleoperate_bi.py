@@ -3312,7 +3312,8 @@ def run_teleoperation(
                     **({"control_pause_requested": console_input.pause_requested,
                         "manual_gate": lambda epoch: console_input.wait_gate(
                             "resume", host_epoch=epoch, cancel=external_stop_requested),
-                        "on_host_active": console_input.note_live_admitted}
+                        "on_host_active": lambda: console_input.note_live_admitted(
+                            host_epoch=robot.latest_am1_local_feedback["epoch"])}
                        if console_input is not None else {}),
                 )
                 if scripted_mode:

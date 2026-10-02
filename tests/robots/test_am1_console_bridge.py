@@ -296,3 +296,113 @@ def test_oversized_display_metadata_cannot_break_bounded_pipe():
     assert state.browser_first_pause is None
     assert len(bridge._encode(state.lease(now=1.1))) < bridge.MAX_PIPE_BYTES
     assert not state.browser_keys(token="private-token", epoch=1, seq=huge, keys=[], active=True, now=1.2)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Actual AF_PIPE is Windows-only")
+def test_full_native_telemetry_does_not_hide_current_resume_gate(tmp_path, capsys):
+    """Use the actual native event shapes/pipe, not a tiny fake host payload."""
+    from types import SimpleNamespace
+    server = bridge.AM1ConsoleBridgeServer("20261002T000000-1234abcd", tmp_path, "private-token")
+    client = bridge.AM1ConsoleBridgeClient(server.pipe_name, server.auth_file, server.session_id)
+    stop = threading.Event()
+    received = []
+    server.set_telemetry_sink(received.append)
+    sequence = [0]
+    def browser():
+        while not stop.wait(.05):
+            sequence[0] += 1
+            server.browser_keys(token="private-token", epoch=1, seq=sequence[0], keys=[], active=True)
+    producer = threading.Thread(target=browser, daemon=True)
+    positions = {key: 12.3456789012345 for key in bridge.CONSOLE_ARM_KEYS}
+    sample = SimpleNamespace(arm_target=positions, follower_positions=positions,
+                             observed_at=time.monotonic(), observation_sequence=17,
+                             observation={key: 0.0 for key in bridge.CONSOLE_BODY_OBSERVATION_KEYS})
+    try:
+        producer.start()
+        client.connect()
+        assert client.wait_gate("sync_start", timeout_s=2)
+        assert client.wait_gate("live_start", timeout_s=2)
+        client.note_live_admitted()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            sample.observed_at = time.monotonic()
+            feedback = {"state": "active", "epoch": 0, "observation_id": 17}
+            for event in (
+                bridge.make_console_live_sample_event(sample, positions, raw_keys=bridge.CONSOLE_BODY_OBSERVATION_KEYS,
+                    host_feedback=feedback, wall_ns=time.time_ns(), monotonic_now=time.monotonic()),
+                bridge.make_console_host_feedback_event(sample, feedback, wall_ns=time.time_ns(),
+                                                       monotonic_now=time.monotonic()),
+                bridge.make_console_action_sent_event(positions, sequence=17, interval_ms=100, wall_ns=time.time_ns()),
+            ):
+                client.publish_telemetry(event)
+            time.sleep(.1)
+        server.request_pause("operator")
+        completed = []
+        waiter = threading.Thread(target=lambda: completed.append(client.wait_gate("resume", host_epoch=1,
+                                  cancel=stop.is_set, timeout_s=2)), daemon=True)
+        waiter.start()
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline and server.snapshot()["pending_gate"] != ("resume", 1):
+            time.sleep(.01)
+        assert server.snapshot()["pending_gate"] == ("resume", 1)
+        request = server.snapshot()["gate_request_evidence"]
+        assert request["stage"] == "resume" and request["host_epoch"] == 1
+        assert request["accepted"] is True and request["input_epoch"] == 1
+        assert server.snapshot()["native_connected"] is True
+        assert not completed, "a displayed request is not automatic approval"
+        assert server.approve("resume", host_epoch=1, token="private-token")
+        waiter.join(2)
+        assert completed == [True]
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline and (server.snapshot()["gate_ack_evidence"] or {}).get("stage") != "resume":
+            time.sleep(.01)
+        ack = server.snapshot()["gate_ack_evidence"]
+        assert ack["stage"] == "resume" and ack["host_epoch"] == 1
+        records = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.startswith("{")]
+        assert any(event.get("event") == "am1_console_gate_request" and event.get("stage") == "resume"
+                   and event.get("host_epoch") == 1 for event in records)
+        assert any(event.get("event") == "am1_console_gate_result" and event.get("stage") == "resume"
+                   and event.get("result") == "acknowledged" for event in records)
+        assert {event["event"] for event in received} >= {"live_sample", "host_feedback", "action_sent"}
+    finally:
+        stop.set()
+        producer.join(1)
+        client.disconnect()
+        server.close()
+
+
+def test_gate_evidence_failure_does_not_replace_cancellation(monkeypatch, tmp_path):
+    client = bridge.AM1ConsoleBridgeClient("unused", tmp_path / "unused", "session")
+    def broken_output(*args, **kwargs):
+        raise BrokenPipeError("display output closed")
+    monkeypatch.setattr(bridge, "print", broken_output, raising=False)
+    assert not client.wait_gate("resume", host_epoch=1, cancel=lambda: True, timeout_s=1)
+    assert not client._gate_events
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Actual AF_PIPE is Windows-only")
+@pytest.mark.parametrize("epoch,stage,host_epoch,reason", [
+    (0, "resume", 1, "input epoch mismatch"),
+    (1, "unknown-stage", 1, "invalid gate"),
+    (1, "resume", 1.5, "invalid gate"),
+])
+def test_rejected_native_gate_is_not_reported_as_accepted(tmp_path, epoch, stage, host_epoch, reason):
+    server = bridge.AM1ConsoleBridgeServer("20261002T000000-1234abcd", tmp_path, "private-token")
+    client = bridge.AM1ConsoleBridgeClient(server.pipe_name, server.auth_file, server.session_id)
+    try:
+        client.connect()
+        # Inject on the existing worker's own outbound queue, not a second pipe writer.
+        client._outbound.put_nowait({"session_id": server.session_id, "epoch": epoch, "seq": 0,
+            "kind": "gate_request", "payload": {"stage": stage, "host_epoch": host_epoch}})
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline and server.snapshot()["gate_request_evidence"] is None:
+            time.sleep(.01)
+        state = server.snapshot()
+        assert state["gate_request_evidence"]["accepted"] is False
+        assert state["gate_request_evidence"]["rejection"] == reason
+        assert state["pending_gate"] is None
+        assert state["gate_ack_evidence"] is None
+        assert "private-token" not in json.dumps(state)
+    finally:
+        client.disconnect()
+        server.close()

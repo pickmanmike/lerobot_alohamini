@@ -40,6 +40,61 @@ def test_servo_identity_and_units():
     assert view["observation"]["age_ms"] == 200.0
 
 
+def test_control_phase_follows_current_host_ack_not_action_or_approval(tmp_path, monkeypatch):
+    clock = [2_000_000_000]
+    monkeypatch.setattr("tools.am1_console.time.time_ns", lambda: clock[0])
+    adapter = ConsoleSessionAdapter(SimpleNamespace(), tmp_path, SimpleNamespace())
+    adapter._on_created("20261002T000000-1234abcd")
+    adapter._emit({"event": "host_ready"})
+    adapter._emit({"event": "action_sent", "acquired_at_ns": 1_000_000_000,
+                   "action_sequence": 1, "requested_targets": {"x.vel": 0}})
+    assert adapter.state()["phase"] == "host_ready"  # Sending is not admission.
+    adapter._emit({"event": "host_feedback", "acquired_at_ns": 2_000_000_000,
+                   "host_state": "active", "host_epoch": 0, "host_observation_id": 10})
+    assert adapter.state()["phase"] == "awaiting_live_ack"  # Not yet validated by native consumer.
+    adapter._emit({"event": "live_admitted", "acquired_at_ns": 2_000_000_000, "host_epoch": 0})
+    assert adapter.state()["phase"] == "live"
+    adapter._emit({"event": "host_feedback", "acquired_at_ns": 3_000_000_000,
+                   "host_state": "paused", "host_epoch": 1, "host_observation_id": 11})
+    assert adapter.state()["phase"] == "paused"
+    adapter._emit({"event": "host_feedback", "acquired_at_ns": 2_500_000_000,
+                   "host_state": "active", "host_epoch": 0, "host_observation_id": 10})
+    assert adapter.state()["phase"] == "paused"  # Delayed display cannot claim recovery.
+    adapter._emit({"event": "host_feedback", "acquired_at_ns": 4_000_000_000,
+                   "host_state": "active", "host_epoch": 2, "host_observation_id": 12})
+    assert adapter.state()["phase"] == "awaiting_live_ack"
+    adapter._emit({"event": "live_admitted", "acquired_at_ns": 4_000_000_000, "host_epoch": 2})
+    assert adapter.state()["phase"] == "live"
+    clock[0] = 5_001_000_000
+    assert adapter.state()["phase"] == "feedback_stale"  # Cached active is not current admission.
+    adapter._emit({"event": "host_feedback", "acquired_at_ns": 5_000_000_000,
+                   "host_state": "ready", "host_epoch": -1, "host_observation_id": 13})
+    assert adapter.state()["phase"] == "host_ready"  # Restart cannot reuse admission.
+    adapter._emit({"event": "stop_requested"})
+    adapter._emit({"event": "live_admitted", "acquired_at_ns": 5_000_000_000, "host_epoch": 2})
+    adapter._emit({"event": "host_feedback", "acquired_at_ns": 5_000_000_000,
+                   "host_state": "active", "host_epoch": 1, "host_observation_id": 13})
+    assert adapter.state()["phase"] == "stopping"
+
+
+def test_delayed_lower_epoch_pause_does_not_erase_new_native_admission(tmp_path, monkeypatch):
+    monkeypatch.setattr("tools.am1_console.time.time_ns", lambda: 4_000_000_003)
+    adapter = ConsoleSessionAdapter(SimpleNamespace(), tmp_path, SimpleNamespace())
+    adapter._on_created("20261002T000000-1234abcd")
+    adapter._emit({"event": "live_admitted", "acquired_at_ns": 4_000_000_000, "host_epoch": 2})
+    # A sequential telemetry producer can publish an older host epoch after
+    # admission; wall-clock ordering alone cannot make that paused epoch current.
+    adapter._emit({"event": "host_feedback", "acquired_at_ns": 4_000_000_001,
+                   "host_state": "paused", "host_epoch": 1})
+    assert adapter.state()["phase"] != "live", "paused cached data is not live"
+    adapter._emit({"event": "host_feedback", "acquired_at_ns": 4_000_000_002,
+                   "host_state": "active", "host_epoch": 2})
+    assert adapter.state()["phase"] == "live"
+    adapter._emit({"event": "host_feedback", "acquired_at_ns": 4_000_000_003,
+                   "host_state": "paused", "host_epoch": 3})
+    assert adapter.state()["phase"] == "paused"
+
+
 def test_missing_field_is_not_sampled():
     cache = ConsoleSnapshot()
     cache.update({"event": "live_sample", "acquired_at_ns": 10,

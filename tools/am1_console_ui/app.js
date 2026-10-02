@@ -312,6 +312,10 @@ if (typeof document !== "undefined") {
         ` Input pause: ${state.input_pause.reason} (first retained: ${state.first_input_pause?.reason || "not received"}).`;
       if (state.browser_first_pause) document.querySelector("#gate-state").textContent +=
         ` First browser release: ${state.browser_first_pause.reason} (browser timestamp; not server ordering).`;
+      if (typeof state.native_connected === "boolean") document.querySelector("#gate-state").textContent +=
+        ` Native input: ${state.native_connected ? "connected" : "disconnected"}.`;
+      if (state.gate_request_evidence?.accepted === false) document.querySelector("#gate-state").textContent +=
+        ` Last native gate request rejected: ${state.gate_request_evidence.rejection}. Use Stop if the gate cannot be completed.`;
       document.querySelector('[data-operation="Resume"]').textContent =
         ["sync_start", "live_start"].includes(gate?.[0]) ? "Continue startup" : "Approve Resume";
       try { renderSnapshot(state); } catch {
