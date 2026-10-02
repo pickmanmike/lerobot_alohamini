@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 import threading
 import time
@@ -67,6 +68,75 @@ def test_stale_epoch_and_sequence_never_replay_body():
     assert not state.browser_keys(token="private-token", epoch=1, seq=3, keys=["w"], active=True, now=1.3)
     assert state.lease(now=1.3)["keys"] == []
     assert state.epoch == 2
+
+
+def test_first_pause_retains_reason_and_pre_release_input_without_secrets():
+    state = bridge.AM1ConsoleInputState("20261001T000000-1234abcd", "private-token")
+    state.browser_keys(token="private-token", epoch=1, seq=7, keys=["w"], active=True, now=10.0)
+    state.request_pause("window-blur", now=10.05)
+    first = dict(state.first_pause)
+    assert first["reason"] == "window-blur"
+    assert first["input_sequence"] == 7
+    assert first["input_age_ms"] == pytest.approx(50)
+    assert first["browser_active"] is True
+    assert first["local_monotonic_s"] == 10.05
+    assert "private-token" not in json.dumps(first)
+    state.lease(now=10.4)
+    state.request_pause("pipe disconnected", now=10.5)
+    assert state.first_pause == first
+    assert state.lease(now=10.5)["pause_evidence"] == first
+    assert state.lease(now=10.5)["keys"] == []
+
+
+def test_recovery_keeps_first_pause_and_records_next_independent_latch():
+    state = bridge.AM1ConsoleInputState("20261001T000000-1234abcd", "private-token")
+    state.browser_keys(token="private-token", epoch=1, seq=1, keys=[], active=True, now=1.0)
+    state.request_pause("window-blur", now=1.01)
+    first = dict(state.first_pause)
+    state.request_gate("resume", host_epoch=2)
+    state.browser_keys(token="private-token", epoch=1, seq=2, keys=[], active=True, now=1.02)
+    assert state.approve("resume", host_epoch=2, token="private-token", now=1.03)
+    assert state.gate_ack("resume", host_epoch=2, now=1.04)
+    state.lease(now=1.4)
+    assert state.first_pause == first
+    assert state.lease(now=1.4)["pause_evidence"]["reason"] == "expired browser input"
+    assert state.lease(now=1.4)["pause_evidence"]["pause_sequence"] == 2
+
+
+def test_released_packet_preserves_allowed_browser_cause_and_native_log(capsys):
+    state = bridge.AM1ConsoleInputState("20261001T000000-1234abcd", "private-token")
+    state.browser_keys(token="private-token", epoch=1, seq=4, keys=[], active=True, now=1.0)
+    assert state.browser_keys(token="private-token", epoch=1, seq=5, keys=[], active=False,
+                              release_reason="window-blur", now=1.05)
+    native = bridge.AM1ConsoleBridgeClient("unused", Path("unused"), state.session_id)
+    native.accept_message({"session_id": state.session_id, "epoch": 1, "seq": 1,
+                           "kind": "lease", "payload": state.lease(now=1.06)}, received_at=1.06)
+    record = json.loads(capsys.readouterr().out)
+    assert record["event"] == "am1_console_input_pause"
+    assert record["reason"] == "window-blur"
+    assert record["input_sequence"] == 5
+    assert record["native_body_enabled"] is False
+    assert "private-token" not in json.dumps(record)
+    native.accept_message({"session_id": state.session_id, "epoch": 1, "seq": 2,
+                           "kind": "lease", "payload": state.lease(now=1.4)}, received_at=1.4)
+    assert capsys.readouterr().out == ""
+
+
+def test_pause_evidence_never_echoes_extra_peer_fields(capsys):
+    native = bridge.AM1ConsoleBridgeClient("unused", Path("unused"), "session")
+    native.accept_message({"session_id": "session", "epoch": 1, "seq": 1, "kind": "lease",
+                           "payload": {"valid": False, "keys": [], "pause_evidence": {
+                               "pause_sequence": 1, "reason": "window-blur", "password": "not-for-evidence"}}},
+                          received_at=1.0)
+    assert "not-for-evidence" not in capsys.readouterr().out
+
+
+def test_invalid_browser_reason_is_bounded_not_a_transport_error():
+    state = bridge.AM1ConsoleInputState("session", "token")
+    state.browser_keys(token="token", epoch=1, seq=1, keys=[], active=True, now=1.0)
+    assert state.browser_keys(token="token", epoch=1, seq=2, keys=[], active=False,
+                              release_reason=["untrusted"], now=1.1)
+    assert state.first_pause["reason"] == "released browser input"
 
 
 def test_typed_resume_requires_current_pending_request_and_explicit_approval():
@@ -182,3 +252,47 @@ def test_unused_pipe_closes_without_orphan_accept_thread(tmp_path):
     server.close()
     assert not server._thread.is_alive()
     assert not server.auth_file.exists()
+
+
+def test_native_lease_expiry_retains_cause_without_printing_on_action_consumer(capsys):
+    client = bridge.AM1ConsoleBridgeClient("unused", Path("unused"), "session")
+    client._gate_events[("live_start", None)] = threading.Event()
+    client.accept_message({"session_id": "session", "epoch": 1, "seq": 1, "kind": "gate_ack",
+                           "payload": {"stage": "live_start", "host_epoch": None}}, received_at=.99)
+    client.accept_message({"session_id": "session", "epoch": 1, "seq": 2, "kind": "lease",
+                           "payload": {"valid": True, "keys": []}}, received_at=1)
+    client.note_live_admitted()
+    assert client.pause_requested(now=1.251)
+    event = client._telemetry_pending["am1_console_input_pause"]
+    assert event["reason"] == "native input expired"
+    assert event["input_age_ms"] == pytest.approx(251)
+    assert event["input_sequence"] == 2
+    assert capsys.readouterr().out == ""
+    assert client.pause_requested(now=2)
+    assert client._telemetry_pending["am1_console_input_pause"] == event
+
+
+def test_delayed_release_keeps_browser_first_cause_separate_from_server_expiry():
+    state = bridge.AM1ConsoleInputState("session", "private-token")
+    state.browser_keys(token="private-token", epoch=1, seq=1, keys=[], active=True, now=1)
+    state.lease(now=1.3)
+    first = {"reason": "window-blur", "local_wall_time_ms": 1000, "input_sequence": 1,
+             "input_epoch": 1, "route": "control"}
+    state.browser_keys(token="private-token", epoch=1, seq=3, keys=[], active=False, now=1.4,
+                       release_reason="document-hidden", first_release=first)
+    assert state.first_pause["reason"] == "expired browser input"
+    assert state.browser_first_pause == first
+    assert state.lease(now=1.4)["browser_first_pause"] == first
+
+
+def test_oversized_display_metadata_cannot_break_bounded_pipe():
+    state = bridge.AM1ConsoleInputState("session", "private-token")
+    state.browser_keys(token="private-token", epoch=1, seq=1, keys=[], active=True, now=1)
+    huge = int("9" * 3700)
+    first = {"reason": "window-blur", "local_wall_time_ms": huge, "input_sequence": 1,
+             "input_epoch": 1, "route": "control"}
+    assert state.browser_keys(token="private-token", epoch=1, seq=2, keys=[], active=False, now=1.1,
+                              first_release=first)
+    assert state.browser_first_pause is None
+    assert len(bridge._encode(state.lease(now=1.1))) < bridge.MAX_PIPE_BYTES
+    assert not state.browser_keys(token="private-token", epoch=1, seq=huge, keys=[], active=True, now=1.2)

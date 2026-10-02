@@ -71,6 +71,20 @@ test("blur and visibility loss clear held pointer and key input without auto-res
   assert.deepEqual(Array.from(input.keys()), []);
 });
 
+test("input release names the first initiating event separately from later symptoms", () => {
+  const Input = loadInput(), sent = [];
+  const input = new Input(payload => sent.push(payload));
+  input.attach("session-1", "secret", 1);
+  input.setLive(true);
+  input.blur();
+  assert.equal(sent.at(-1).release_reason, "window-blur");
+  assert.equal(input.firstRelease.reason, "window-blur");
+  input.hidden();
+  assert.equal(input.firstRelease.reason, "window-blur");
+  assert.equal(sent.at(-1).release_reason, "document-hidden");
+  assert.equal(JSON.stringify(input.firstRelease).includes("secret"), false);
+});
+
 test("new epoch never replays old held keys", () => {
   const Input = loadInput(), sent = [];
   const input = new Input(payload => sent.push(payload));
@@ -221,4 +235,49 @@ test("servo schematic separates two follower arms, lift and unsampled wheels", (
   assert.match(groups.lift.value, /10.*mm/);
   const html = fs.readFileSync(path.resolve(__dirname, "../../tools/am1_console_ui/index.html"), "utf8");
   assert.match(html, /id="servo-schematic"/);
+});
+
+test("Stop cancels a pending approval and releases busy ownership for later Start", async () => {
+  const nodes = new Map(), sent = [];
+  const element = () => ({textContent:"", value:"120", content:"test-only", dataset:{},
+    append(){}, replaceChildren(){}, addEventListener(){}, click(){}});
+  const document = {querySelector:key => {
+    if (!nodes.has(key)) nodes.set(key, element());
+    return nodes.get(key);
+  }, querySelectorAll:()=>[], createElement:element, addEventListener(){}};
+  let pendingBody, pendingStart, hold = false, phase = "host_ready";
+  const context = vm.createContext({document, console, location:{hash:""},
+    sessionStorage:{getItem:()=>null,setItem(){}}, window:{addEventListener(){}}, setInterval:()=>0,
+    fetch:(url, options={}) => {
+      const payload = options.body ? JSON.parse(options.body) : null;
+      sent.push({url, payload});
+      if (url === "/api/body" && hold && payload.active)
+        return new Promise(resolve => { pendingBody = resolve; });
+      if (url === "/api/operation" && payload.kind === "Start")
+        return new Promise(resolve => { pendingStart = resolve; });
+      if (payload?.kind === "Stop") phase = "complete";
+      const result = url === "/api/state" ? {session_id:"session", phase, input_epoch:1,
+        pending_gate:["resume",1], events:[], telemetry:{}} : {accepted:true};
+      return Promise.resolve({ok:true,json:async()=>result});
+    }});
+  const source = fs.readFileSync(path.resolve(__dirname, "../../tools/am1_console_ui/app.js"), "utf8")
+    .replace("  route();", "  globalThis.testInput=input; globalThis.testOperation=operation; globalThis.testReadState=readState; route();");
+  vm.runInContext(source, context);
+  await new Promise(resolve => setImmediate(resolve));
+  context.testInput.attach("session", "test-only", 1);
+  await context.testReadState();
+  hold = true;
+  const approval = context.testOperation("Resume");
+  await new Promise(resolve => setImmediate(resolve));
+  await context.testOperation("Stop");
+  const starting = context.testOperation("Start");
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(sent.filter(item => item.url === "/api/operation").map(item => item.payload.kind), ["Stop", "Start"]);
+  pendingBody({ok:true,json:async()=>({accepted:true})});
+  await approval;
+  await context.testOperation("Start"); // Old finally must not clear newer Start's busy flag.
+  assert.equal(sent.filter(item => item.payload?.kind === "Start").length, 1);
+  assert.equal(sent.filter(item => item.payload?.kind === "Resume").length, 0);
+  pendingStart({ok:true,json:async()=>({accepted:true})});
+  await starting;
 });

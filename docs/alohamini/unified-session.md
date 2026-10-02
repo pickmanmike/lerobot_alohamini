@@ -45,8 +45,17 @@ and click it to approve only that displayed gate with a fresh empty lease.
 Fresh heartbeats alone do not clear the latch; stale/wrong-stage approval is
 refused. Live Pause/Resume still requires the existing host/follower/leader
 qualification, and startup approval never enables body motion before live
-admission. Match leaders to the current measured follower pose before Start;
-this UI correction does not remove the documented large-offset shoulder limit.
+admission. The followers automatically synchronize to the frozen leader target;
+manual pose matching is not a prerequisite. Hold leaders still during the ramp
+and keep the full follower path clear. The existing gate/bounds and documented
+arbitrary-pose shoulder limitation remain: a failed alignment refuses live use.
+
+Stay on the focused Control page during live operation. Blur, hidden document,
+page navigation and failed input/state requests intentionally release input;
+returning focus does not rearm. Release controls, read the displayed pause cause,
+and explicitly approve the current Resume gate. The first local input-pause cause
+is retained separately from later expiry or SSH/controller-loss symptoms. Stop
+does not wait for a pending approval request and cancels that pending approval.
 
 If a required camera view is unavailable or only a retained image remains,
 release body keys, Pause, then Stop if the view does not promptly recover. Confirm
@@ -56,12 +65,22 @@ arbitrary-pose shoulder alignment, intermittent camera acquisition/browser gaps,
 and long-duration or unattended use retain the limitations below. This console
 source has passed offline fake/browser checks. The camera-only layout/start/stop
 check passed with five fresh sources, but the attended Control check is not yet
-accepted. One attempt stopped on an unpowered left leader chain; after the owner
-restored its supply, the next stopped before the arm ramp on a startup approval
-timeout. Both collected results verified cleanup. These are not live-control
-passes; the focused startup-gate recovery correction still needs its targeted
-operational check. The initiating lease-release event was not captured, so its
-runtime trigger remains unproven.
+accepted. Earlier attempts refused on a disconnected leader supply or a startup
+approval timeout. The later automatic sync completed 301 frames in 30.968 seconds
+at the unchanged tolerance, worst error 5.766. Native live admission was followed
+by a local input-lease pause, then a separate SSH/controller-loss failure and
+status 2. Recovered evidence verifies host/camera exits 0 and cleanup. This is a
+sync pass, not a manual live-control pass. Its initiating local event was not
+captured; the new bounded evidence cannot retroactively establish that cause.
+
+The focused live-close follow-up passed 95 affected Python checks and 17 Node
+UI checks. Eleven Python cases exercise the actual frontend, loopback service
+and Windows named pipe with synthetic camera/robot feedback, including request
+loss, focus/navigation release, explicit recovery and Stop during an outstanding
+approval. Under desktop load, a real browser input gap can exceed the unchanged
+250 ms limit: those cases retain the safe pause and require explicit recovery,
+not an invented heartbeat or a claim of uninterrupted cadence. These are offline
+results, not a replacement for the pending attended Control check.
 
 The Servos page distinguishes the physical leader and Pi follower identities.
 It displays normalized position and the action actually sent; per-servo current,
@@ -157,8 +176,8 @@ limitation, not a demand for another recording or commissioning run. Reopen only
 if practical manual use exposes a material usability problem. Keep P16 and the
 existing profile, calibration, gains and limits.
 
-Match the physical leader to the **current** follower pose before ordinary
-startup. Historical shoulder/arbitrary-pose, camera acquisition/browser delivery
+Ordinary startup automatically aligns followers to held-still physical leaders;
+manual matching is optional, not required. Historical shoulder/arbitrary-pose, camera acquisition/browser delivery
 (including the 1.138 s display gap), long-duration and unattended-use limitations
 remain. Network infrastructure remediation is external. See the short
 [everyday reference](#everyday-supervised-use); historical records below are not
@@ -682,9 +701,9 @@ complete, visible prompts, each accepting only a bare Enter:
 1. After all five camera views are fresh, verify the views, physical envelope,
    support, and power-removal access; press Enter to start the motor host.
 2. After the host homes and relieves the lift and the client displays the
-   alignment plan, verify the right leader shoulder is close to the **current
-   measured follower** value. Do not use a historical absolute pose as the
-   target or force the follower. If the displayed frozen plan needs a leader
+   alignment plan, verify the full automatic follower-to-leader path is clear.
+   Do not use a historical absolute pose as the target or force the follower.
+   Manual pose matching is not required. If the displayed frozen plan needs a leader
    adjustment, cancel rather than moving the leader during approval; prepare
    a fresh plan on a later ordinary start. With the approved plan, hold both
    leaders still and press Enter for nominal 30-second synchronization.
@@ -867,8 +886,8 @@ never kills unrelated Python, camera, or motor processes.
   reaching -1.604 and passing the unchanged gate. Large-offset tracking therefore
   succeeded in that pose. It does not erase the earlier 13.402-unit plateau at a
   different target after sampled goal-register delivery or establish arbitrary-pose
-  convergence. Continue matching the leader to the current measured follower for
-  ordinary startup; keep the existing gate and bounds.
+  convergence. Automatic synchronization remains ordinary startup, with no
+  mandatory manual matching; keep the existing gate and bounds.
 - Intermittent Forward-camera acquisition can fail before any motor startup.
   Replug recovery does not establish a loose connector or a network cause.
   Preserve that refusal and its cleanup instead of automatically retrying.

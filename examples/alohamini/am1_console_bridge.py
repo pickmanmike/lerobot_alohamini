@@ -23,12 +23,31 @@ from typing import Any, Callable
 BODY_KEYS = frozenset({"w", "s", "z", "x", "a", "d", "u", "j", "t", "g"})
 INPUT_MAX_AGE_S = 0.25
 MAX_PIPE_BYTES = 4096
+MAX_INPUT_INTEGER = 2**53 - 1  # Browser-safe integer; also bounds echoed diagnostic metadata.
 PREPARED_GATES = frozenset({"sync_start", "live_start"})
 MANUAL_GATES = frozenset({"realign", "resume"})
+PAUSE_CAUSES = frozenset({"window-blur", "document-hidden", "route-change", "pagehide",
+                         "body-request-rejected", "body-request-failed", "state-request-failed",
+                         "operator", "pipe disconnected", "expired browser input",
+                         "released browser input", "native input expired", "native pipe disconnected"})
 CONSOLE_BODY_OBSERVATION_KEYS = frozenset({"x.vel", "y.vel", "theta.vel", "lift_axis.vel", "lift_axis.height_mm"})
 CONSOLE_ARM_KEYS = frozenset(f"arm_{side}_{joint}.pos" for side in ("left", "right")
                              for joint in ("shoulder_pan", "shoulder_lift", "elbow_flex",
                                            "wrist_flex", "wrist_roll", "gripper"))
+
+
+def _browser_release(record: Any, epoch: int, seq: int) -> dict[str, Any] | None:
+    """Accept only a fixed, credential-free browser event with explicit provenance."""
+    if not isinstance(record, dict):
+        return None
+    reason, route = record.get("reason"), record.get("route")
+    if (not isinstance(reason, str) or reason not in PAUSE_CAUSES
+            or not isinstance(route, str) or route not in {"control", "servos", "system", "logs", "terminal"}
+            or type(record.get("input_epoch")) is not int or record["input_epoch"] != epoch
+            or type(record.get("input_sequence")) is not int or not 0 <= record["input_sequence"] <= min(seq, MAX_INPUT_INTEGER)
+            or type(record.get("local_wall_time_ms")) is not int or not 0 <= record["local_wall_time_ms"] <= MAX_INPUT_INTEGER):
+        return None
+    return {key: record[key] for key in ("reason", "route", "input_epoch", "input_sequence", "local_wall_time_ms")}
 
 
 def _console_numbers(values: Any, allowed: frozenset[str]) -> dict[str, float]:
@@ -120,22 +139,29 @@ class AM1ConsoleInputState:
         self.forced_pause = False
         self.pending_gate: tuple[str, int | None] | None = None
         self.approved_gate: tuple[str, int | None] | None = None
+        self.first_pause: dict[str, Any] | None = None
+        self.pause_evidence: dict[str, Any] | None = None
+        self.pause_sequence = 0
+        self.browser_first_pause: dict[str, Any] | None = None
 
     def _fresh(self, now: float) -> bool:
         return (self.browser_active and self.last_browser_at is not None
                 and 0 <= now - self.last_browser_at < INPUT_MAX_AGE_S)
 
-    def browser_keys(self, *, token: str, epoch: int, seq: int, keys: list[str], active: bool, now: float) -> bool:
+    def browser_keys(self, *, token: str, epoch: int, seq: int, keys: list[str], active: bool, now: float,
+                     release_reason: str | None = None, first_release: Any = None) -> bool:
         if (
             not secrets.compare_digest(token, self.control_token) or type(epoch) is not int or epoch != self.epoch
-            or type(seq) is not int or seq <= self.last_browser_seq or type(active) is not bool
+            or type(seq) is not int or not self.last_browser_seq < seq <= MAX_INPUT_INTEGER or type(active) is not bool
             or not isinstance(keys, list) or len(keys) > len(BODY_KEYS)
             or any(not isinstance(key, str) or key not in BODY_KEYS for key in keys)
             or not math.isfinite(now)
         ):
             return False
+        if not active and self.browser_first_pause is None:
+            self.browser_first_pause = _browser_release(first_release, epoch, seq)
         if self.ever_active and not self._fresh(now):
-            self.request_pause("expired browser input")
+            self.request_pause("expired browser input", now=now)
         self.last_browser_seq = seq
         self.last_browser_at = now
         self.browser_active = active
@@ -143,16 +169,18 @@ class AM1ConsoleInputState:
         if active:
             self.ever_active = True
         elif self.ever_active:
-            self.request_pause("released browser input")
+            self.request_pause(release_reason if isinstance(release_reason, str) and release_reason in PAUSE_CAUSES
+                               else "released browser input", now=now)
         return True
 
     def lease(self, *, now: float) -> dict[str, Any]:
         fresh = self._fresh(now)
         if not fresh and self.ever_active:
-            self.request_pause("expired browser input")
+            self.request_pause("expired browser input", now=now)
         valid = fresh and not self.forced_pause
         return {"valid": valid, "keys": list(self.keys) if valid else [], "epoch": self.epoch,
-                "pause_required": self.forced_pause}
+                "pause_required": self.forced_pause, "pause_evidence": self.pause_evidence,
+                "browser_first_pause": self.browser_first_pause}
 
     def claim(self, token: str, *, now: float) -> int:
         if not token or not math.isfinite(now):
@@ -166,10 +194,24 @@ class AM1ConsoleInputState:
         self.forced_pause = True
         self.pending_gate = None
         self.approved_gate = None
+        self.browser_first_pause = None
         return self.epoch
 
-    def request_pause(self, cause: str) -> None:
-        del cause
+    def request_pause(self, cause: str, *, now: float | None = None) -> None:
+        at = time.monotonic() if now is None else now
+        if not self.forced_pause or self.pause_evidence is None:
+            self.pause_sequence += 1
+            self.pause_evidence = {
+                "reason": cause if cause in PAUSE_CAUSES else "input pause (reason unavailable)",
+                "pause_sequence": self.pause_sequence,
+                "local_monotonic_s": at, "wall_time_ns": time.time_ns(),
+                "input_epoch": self.epoch, "input_sequence": self.last_browser_seq,
+                "input_age_ms": None if self.last_browser_at is None else max(0, (at - self.last_browser_at) * 1000),
+                "age_basis": "last accepted browser packet receipt",
+                "browser_active": self.browser_active, "pending_gate": self.pending_gate,
+            }
+            if self.first_pause is None:
+                self.first_pause = dict(self.pause_evidence)
         self.keys = []
         self.forced_pause = True
         if self.approved_gate is not None and self.approved_gate[0] in PREPARED_GATES:
@@ -230,6 +272,7 @@ class AM1ConsoleBridgeClient:
         self._needs_release = True
         self._connected = False
         self._error: str | None = None
+        self._reported_pause: tuple[int, int, int | None] | None = None
 
     @property
     def is_connected(self) -> bool:
@@ -273,6 +316,8 @@ class AM1ConsoleBridgeClient:
                     with self._lock:
                         message = self._telemetry_pending.pop(next(iter(self._telemetry_pending))) if self._telemetry_pending else None
                     if message is not None:
+                        if message.get("event") == "am1_console_input_pause" and message.get("source") == "native":
+                            print(json.dumps(message, sort_keys=True), flush=True)
                         try:
                             packet = _encode({"session_id": self.session_id, "epoch": self._epoch,
                                               "seq": 0, "kind": "telemetry", "payload": message})
@@ -301,6 +346,7 @@ class AM1ConsoleBridgeClient:
         epoch, seq, kind, payload = message.get("epoch"), message.get("seq"), message.get("kind"), message.get("payload")
         if type(epoch) is not int or type(seq) is not int or not isinstance(payload, dict):
             return False
+        pause_log = None
         with self._lock:
             if epoch < self._epoch or (epoch == self._epoch and seq <= self._last_seq):
                 return False
@@ -322,10 +368,36 @@ class AM1ConsoleBridgeClient:
                     self._pause_latched = True
                     self._body_enabled = False
                     self._needs_release = True
+                    evidence = payload.get("pause_evidence")
+                    browser_first = _browser_release(payload.get("browser_first_pause"), epoch, 2**63 - 1)
+                    if (isinstance(evidence, dict) and type(evidence.get("pause_sequence")) is int
+                            and isinstance(evidence.get("reason"), str)
+                            and evidence["reason"] in PAUSE_CAUSES | {"input pause (reason unavailable)"}
+                            and self._reported_pause != (epoch, evidence["pause_sequence"],
+                                                        browser_first["input_sequence"] if browser_first else None)):
+                        self._reported_pause = (epoch, evidence["pause_sequence"],
+                                                browser_first["input_sequence"] if browser_first else None)
+                        safe = {"reason": evidence["reason"], "age_basis": "last accepted browser packet receipt"}
+                        for key in ("pause_sequence", "local_monotonic_s", "wall_time_ns", "input_epoch",
+                                    "input_sequence", "input_age_ms"):
+                            value = evidence.get(key)
+                            if type(value) in (int, float) and abs(value) <= 2**63 - 1 and math.isfinite(value):
+                                safe[key] = value
+                        if type(evidence.get("browser_active")) is bool:
+                            safe["browser_active"] = evidence["browser_active"]
+                        gate = evidence.get("pending_gate")
+                        if (isinstance(gate, (tuple, list)) and len(gate) == 2 and isinstance(gate[0], str)
+                                and gate[0] in PREPARED_GATES | MANUAL_GATES
+                                and (gate[1] is None or type(gate[1]) is int and 0 <= gate[1] <= MAX_INPUT_INTEGER)):
+                            safe["pending_gate"] = gate
+                        pause_log = {"event": "am1_console_input_pause", **safe,
+                                     "browser_first_pause": browser_first,
+                                     "native_received_monotonic_s": received_at,
+                                     "native_body_enabled": self._body_enabled,
+                                     "native_pause_latched": self._pause_latched}
                 elif self._body_enabled and not keys:
                     self._needs_release = False
-                return True
-            if kind == "gate_ack":
+            elif kind == "gate_ack":
                 stage, host_epoch = payload.get("stage"), payload.get("host_epoch")
                 event = self._gate_events.get((stage, host_epoch))
                 if event is None:
@@ -336,11 +408,17 @@ class AM1ConsoleBridgeClient:
                     self._needs_release = True
                 event.set()
                 return True
-        return False
+            else:
+                return False
+        if pause_log is not None:
+            # A bounded transition record outside the input-state lock, not a per-frame display.
+            print(json.dumps(pause_log, sort_keys=True), flush=True)
+            self.publish_telemetry(pause_log)
+        return True
 
     def publish_telemetry(self, event: dict[str, Any]) -> None:
         """Replace a pending display sample without delaying action or approval traffic."""
-        if event.get("event") not in {"live_sample", "action_sent", "host_feedback"}:
+        if event.get("event") not in {"live_sample", "action_sent", "host_feedback", "am1_console_input_pause"}:
             return
         with self._lock:
             self._telemetry_pending[event["event"]] = event
@@ -350,6 +428,17 @@ class AM1ConsoleBridgeClient:
         with self._lock:
             if (not self._lease_valid or self._received_at is None
                     or not 0 <= at - self._received_at < INPUT_MAX_AGE_S):
+                if not self._pause_latched:
+                    # Queue one bounded transition. Never print or perform IO
+                    # from the action consumer, and never manufacture freshness.
+                    self._telemetry_pending["am1_console_input_pause"] = {
+                        "event": "am1_console_input_pause", "source": "native",
+                        "reason": "native input expired", "wall_time_ns": time.time_ns(),
+                        "local_monotonic_s": at, "input_epoch": self._epoch,
+                        "input_sequence": self._last_seq,
+                        "input_age_ms": None if self._received_at is None else (at - self._received_at) * 1000,
+                        "age_basis": "native lease receipt", "native_body_enabled": self._body_enabled,
+                    }
                 self._keys.clear()
                 self._pause_latched = True
                 self._body_enabled = False
@@ -501,7 +590,7 @@ class AM1ConsoleBridgeServer:
                             self.state.request_gate(stage, host_epoch=host_epoch)
                     elif message.get("kind") == "telemetry" and message.get("epoch") == self.state.epoch:
                         payload = message.get("payload")
-                        if isinstance(payload, dict) and payload.get("event") in {"live_sample", "action_sent", "host_feedback"}:
+                        if isinstance(payload, dict) and payload.get("event") in {"live_sample", "action_sent", "host_feedback", "am1_console_input_pause"}:
                             sink = self._telemetry_sink
                             if sink is not None:
                                 try:
@@ -530,10 +619,12 @@ class AM1ConsoleBridgeServer:
                     pass
                 self.connection = None
 
-    def browser_keys(self, *, token: str, epoch: int, seq: int, keys: list[str], active: bool) -> bool:
+    def browser_keys(self, *, token: str, epoch: int, seq: int, keys: list[str], active: bool,
+                     release_reason: str | None = None, first_release: Any = None) -> bool:
         with self.lock:
             return self.state.browser_keys(token=token, epoch=epoch, seq=seq, keys=keys,
-                                           active=active, now=self.clock())
+                                           active=active, now=self.clock(), release_reason=release_reason,
+                                           first_release=first_release)
 
     def set_telemetry_sink(self, sink: Any) -> None:
         self._telemetry_sink = sink
@@ -554,7 +645,9 @@ class AM1ConsoleBridgeServer:
         with self.lock:
             lease = self.state.lease(now=self.clock())
             return {"input_epoch": self.state.epoch, "input_lease": lease["valid"],
-                    "pending_gate": self.state.pending_gate, "pause_required": lease["pause_required"]}
+                    "pending_gate": self.state.pending_gate, "pause_required": lease["pause_required"],
+                    "first_input_pause": self.state.first_pause, "input_pause": self.state.pause_evidence,
+                    "browser_first_pause": self.state.browser_first_pause}
 
     def close(self) -> None:
         self.stop_event.set()

@@ -12,9 +12,12 @@ class AM1BrowserInput {
     this.route = "control";
     this.live = false;
     this.held = new Set();
+    this.releaseReason = null;
+    this.firstRelease = null;
   }
   attach(sessionId, token, epoch) {
     this.release();
+    if (sessionId !== this.sessionId || epoch !== this.epoch) this.firstRelease = null;
     this.sessionId = sessionId;
     this.token = token;
     this.epoch = epoch;
@@ -43,17 +46,26 @@ class AM1BrowserInput {
     if (!this.sessionId || !this.token) return;
     const active = this.live && this.route === "control";
     return this.send({session_id:this.sessionId, control_token:this.token, epoch:this.epoch,
-                      seq:++this.seq, keys:active ? this.keys() : [], active});
+                      seq:++this.seq, keys:active ? this.keys() : [], active,
+                      ...(active || !this.releaseReason ? {} : {release_reason:this.releaseReason,
+                                                              first_release:this.firstRelease})});
   }
-  release(send = true) {
+  release(send = true, reason = "released browser input") {
+    if (this.live && this.sessionId) {
+      const record = {reason, local_wall_time_ms:Date.now(), input_sequence:this.seq,
+                      input_epoch:this.epoch, route:this.route};
+      if (!this.firstRelease) this.firstRelease = record;
+      globalThis.console?.info(JSON.stringify({event:"am1_browser_input_release", ...record}));
+    }
+    this.releaseReason = reason;
     this.held.clear();
     this.live = false;
     if (send) this.tick();
   }
-  blur() { this.release(); }
-  hidden() { this.release(); }
+  blur() { this.release(true, "window-blur"); }
+  hidden() { this.release(true, "document-hidden"); }
   setRoute(route) {
-    if (route !== this.route) this.release();
+    if (route !== this.route) this.release(true, "route-change");
     this.route = route;
   }
   setLive(value) {
@@ -151,15 +163,23 @@ if (typeof document !== "undefined") {
   const notice = document.querySelector("#control-notice");
   const input = new AM1BrowserInput(payload => {
     return post("/api/body", payload).then(result => {
-      if (!result.accepted && payload.epoch === input.epoch && payload.seq === input.seq) input.release(false);
+      if (!result.accepted && payload.active && payload.epoch === input.epoch && payload.seq === input.seq) {
+        input.release(true, "body-request-rejected");
+        message("Input paused: body request rejected. Release controls; explicit Resume is required.");
+      }
       return result;
     }).catch(() => {
-      if (payload.epoch === input.epoch && payload.seq === input.seq) input.release(false);
+      if (payload.active && payload.epoch === input.epoch && payload.seq === input.seq) {
+        input.release(true, "body-request-failed");
+        message("Input paused: body request failed. Release controls; explicit Resume is required.");
+      }
       return {accepted:false};
     });
   });
   let state = null;
   let busy = false;
+  let operationGeneration = 0;
+  let stopInFlight = false;
   let stateRequestInFlight = false;
   let loadedLog = "";
   let loadedLogSessionId = null;
@@ -288,6 +308,10 @@ if (typeof document !== "undefined") {
       document.querySelector("#gate-state").textContent = gate ?
         `Approval needed: ${gate[0]} (host epoch ${gate[1] ?? "before live"}). Hold leaders still and release body keys.` :
         "No manual approval pending.";
+      if (state.input_pause) document.querySelector("#gate-state").textContent +=
+        ` Input pause: ${state.input_pause.reason} (first retained: ${state.first_input_pause?.reason || "not received"}).`;
+      if (state.browser_first_pause) document.querySelector("#gate-state").textContent +=
+        ` First browser release: ${state.browser_first_pause.reason} (browser timestamp; not server ordering).`;
       document.querySelector('[data-operation="Resume"]').textContent =
         ["sync_start", "live_start"].includes(gate?.[0]) ? "Continue startup" : "Approve Resume";
       try { renderSnapshot(state); } catch {
@@ -295,7 +319,8 @@ if (typeof document !== "undefined") {
       }
     } catch {
       stateText.textContent = "Session state unavailable; no motor readiness implied.";
-      input.release();
+      if (input.live) input.release(true, "state-request-failed");
+      message("Input paused: session state request failed. Release controls; explicit Resume is required.");
     } finally { stateRequestInFlight = false; }
   }
 
@@ -388,12 +413,19 @@ if (typeof document !== "undefined") {
     document.querySelector("#terminal-output").textContent = "Select View for this original output.";
   });
   async function operation(kind) {
-    if (busy) return;
-    busy = true;
+    const stopping = kind === "Stop";
+    if (stopping ? stopInFlight : busy || stopInFlight) return;
+    const generation = stopping ? ++operationGeneration : operationGeneration;
+    if (stopping) {
+      stopInFlight = true;
+      busy = false; // The invalidated operation must not own the next session.
+      input.release(); // Do not wait for another operation before clearing held input.
+    } else busy = true;
     try {
       let approval = null;
       if (kind === "Resume" || kind === "Approve") {
         approval = await input.prepareApprovalRequest(kind, state?.pending_gate);
+        if (generation !== operationGeneration) return; // Stop cancels a pending approval.
         if (!approval.accepted) throw new Error("fresh empty control lease was not accepted");
       }
       const payload = approval ? approval.payload :
@@ -403,6 +435,7 @@ if (typeof document !== "undefined") {
         payload.leader_source = "physical";
       }
       const result = await post("/api/operation", payload);
+      if (!stopping && generation !== operationGeneration) return;
       if (!result.accepted) { message(result.reason || "Operation refused; no motion approval granted."); return; }
       if (["Start", "ClaimInput"].includes(kind) && result.control_token) {
         input.attach(result.session_id, result.control_token, result.input_epoch);
@@ -415,9 +448,13 @@ if (typeof document !== "undefined") {
       message(`${kind} accepted. Actual readiness and cleanup follow the session state.`);
       await readState();
     } catch (error) {
+      if (!stopping && generation !== operationGeneration) return;
       input.release();
       message(`Control connection failed: ${error.message}. Body input released.`);
-    } finally { busy = false; }
+    } finally {
+      if (stopping) stopInFlight = false;
+      else if (generation === operationGeneration) busy = false;
+    }
   }
   document.querySelectorAll("[data-operation]").forEach(button =>
     button.addEventListener("click", () => operation(button.dataset.operation)));
@@ -436,7 +473,7 @@ if (typeof document !== "undefined") {
   document.addEventListener("keyup", event => input.keyUp(event.key.toLowerCase()));
   document.addEventListener("visibilitychange", () => { if (document.hidden) input.hidden(); });
   window.addEventListener("blur", () => input.blur());
-  window.addEventListener("pagehide", () => input.release());
+  window.addEventListener("pagehide", () => input.release(true, "pagehide"));
   window.addEventListener("hashchange", route);
   route();
   readState();

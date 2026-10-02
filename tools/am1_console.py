@@ -400,7 +400,8 @@ class ConsoleSessionAdapter:
         if payload.get("control_token") != token:
             return {"accepted": False, "reason": "input owner token mismatch"}
         accepted = bridge.browser_keys(token=token, epoch=payload.get("epoch"), seq=payload.get("seq"),
-                                       keys=payload.get("keys"), active=payload.get("active"))
+                                       keys=payload.get("keys"), active=payload.get("active"),
+                                       **{key:payload[key] for key in ("release_reason", "first_release") if key in payload})
         return {"accepted": accepted, "input_epoch": bridge.snapshot()["input_epoch"]}
 
 
