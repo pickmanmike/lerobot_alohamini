@@ -9,8 +9,12 @@ import binascii
 import hmac
 import http.client
 import json
+import os
 import re
 import secrets
+import shutil
+import subprocess
+import sys
 import threading
 import time
 import webbrowser
@@ -895,7 +899,35 @@ class ConsoleHandler(BaseHTTPRequestHandler):
     do_PUT = do_PATCH = do_DELETE = do_OPTIONS = do_TRACE = do_CONNECT = do_HEAD = lambda self: self._reply(403)
 
 
-def run_console(config_path: Path, *, no_browser: bool = False, session_module=None) -> int:
+def open_console_browser(address: str, state_directory: Path, *, direct: bool = False) -> None:
+    """Opt-in local-only Edge process; never alter system/default-profile proxy settings."""
+    if not direct:
+        webbrowser.open(address)
+        return
+    target = urlsplit(address)
+    if (sys.platform != "win32" or target.scheme != "http" or target.hostname != "127.0.0.1"
+            or target.username is not None or target.password is not None):
+        raise ValueError("Direct console browser requires a Windows loopback HTTP address")
+    candidates = [Path(root) / "Microsoft/Edge/Application/msedge.exe"
+                  for name in ("ProgramFiles(x86)", "ProgramFiles", "LOCALAPPDATA")
+                  if (root := os.environ.get(name))]
+    edge = next((path for path in candidates if path.is_file()), None)
+    if edge is None and (installed := shutil.which("msedge")):
+        edge = Path(installed)
+    if edge is None:
+        raise FileNotFoundError("Microsoft Edge is unavailable for the direct console browser; no profile fallback")
+    # A distinct profile gives these process flags effect even if ordinary Edge
+    # is already open. Retain it privately; never change/delete the user's profile.
+    profile = state_directory.resolve() / "edge-console-direct"
+    profile.mkdir(parents=True, exist_ok=True)
+    subprocess.Popen([str(edge), "--no-proxy-server", f"--user-data-dir={profile}",
+                      "--no-first-run", "--no-default-browser-check", f"--app={address}"],
+                     shell=False, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL)
+
+
+def run_console(config_path: Path, *, no_browser: bool = False, direct_browser: bool = False,
+                session_module=None) -> int:
     """Open only a loopback viewer/controller; session Start remains explicit."""
     if session_module is None:
         from tools import am1_session as session_module
@@ -917,7 +949,11 @@ def run_console(config_path: Path, *, no_browser: bool = False, session_module=N
         address = f"http://127.0.0.1:{server.server_address[1]}/"
         print(f"AM1 console: {address} (opening it never starts a robot)", flush=True)
         if not no_browser:
-            webbrowser.open(address)
+            if direct_browser:
+                open_console_browser(address, config.local_state_directory, direct=True)
+                print("AM1 console browser: dedicated Edge profile, process-local direct routing", flush=True)
+            else:
+                webbrowser.open(address)
         server.serve_forever()
     except KeyboardInterrupt:
         print("AM1 console stopping; checking its exact session owner.", flush=True)
@@ -956,9 +992,12 @@ def run_console(config_path: Path, *, no_browser: bool = False, session_module=N
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Loopback AM1 camera and supervised Local control console")
     parser.add_argument("--config", type=Path, required=True, help="existing private AM1 session configuration")
-    parser.add_argument("--no-browser", action="store_true", help="serve without opening a browser tab")
+    browsers = parser.add_mutually_exclusive_group()
+    browsers.add_argument("--no-browser", action="store_true", help="serve without opening a browser tab")
+    browsers.add_argument("--direct-browser", action="store_true",
+                          help="open dedicated Windows Edge console with process-local direct routing")
     args = parser.parse_args(argv)
-    return run_console(args.config, no_browser=args.no_browser)
+    return run_console(args.config, no_browser=args.no_browser, direct_browser=args.direct_browser)
 
 
 if __name__ == "__main__":

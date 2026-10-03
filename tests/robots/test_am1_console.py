@@ -1095,7 +1095,8 @@ $command.arguments | ConvertTo-Json -Compress
     assert "not-a-real-secret" not in result.stdout
 
 
-def test_console_launcher_is_read_only_until_start(monkeypatch, tmp_path):
+@pytest.mark.parametrize("direct_browser", [False, True])
+def test_console_launcher_is_read_only_until_start(monkeypatch, tmp_path, direct_browser):
     auth = tmp_path / "camera-auth.json"
     auth.write_text(json.dumps({"username": "test", "password": "fake-only"}), encoding="utf-8")
     events = []
@@ -1117,8 +1118,12 @@ def test_console_launcher_is_read_only_until_start(monkeypatch, tmp_path):
     monkeypatch.setattr(console, "ConsoleSessionAdapter", lambda *_: SimpleNamespace(
         state=lambda: {"session_id": None}, wait=lambda _: True))
     monkeypatch.setattr(console.webbrowser, "open", lambda url: events.append(("browser", url)))
+    def direct_open(url, state_directory, *, direct):
+        assert state_directory == tmp_path and direct is True
+        events.append(("browser", url))
+    monkeypatch.setattr(console, "open_console_browser", direct_open)
     monkeypatch.setattr(session, "run_start", lambda *_a, **_kw: pytest.fail("page open must not start a session"))
-    assert console.run_console(tmp_path / "config.json", session_module=session) == 0
+    assert console.run_console(tmp_path / "config.json", session_module=session, direct_browser=direct_browser) == 0
     assert events == ["bound", ("browser", "http://127.0.0.1:8765/"), "serving", "closed"]
 
 
@@ -1181,3 +1186,61 @@ $command | ConvertTo-Json -Compress
     assert command["arguments"][:2] == ["-m", "tools.am1_console"]
     assert "--no-browser" in command["arguments"]
     assert not any("session start" in str(arg) for arg in command["arguments"])
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="PowerShell 7 unavailable")
+def test_powershell_console_direct_browser_reaches_python_without_start(tmp_path):
+    """An opt-in launch must not silently fall back to system proxy discovery."""
+    helper = ROOT / "tools" / "run_am1_console.ps1"
+    auth = tmp_path / "auth.json"
+    auth.write_text("{}", encoding="utf-8")
+    config = tmp_path / "session.json"
+    config.write_text(json.dumps({"windows_python": sys.executable,
+                                  "console_camera_auth_file": str(auth)}), encoding="utf-8")
+    script = f"""
+. '{str(helper).replace("'", "''")}'
+$command = New-Am1ConsoleCommand -ConfigPath '{str(config).replace("'", "''")}' -DirectBrowser
+$command | ConvertTo-Json -Compress
+"""
+    result = subprocess.run([shutil.which("pwsh"), "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                            cwd=ROOT, capture_output=True, text=True, timeout=20, check=False)
+    assert result.returncode == 0, result.stderr
+    command = json.loads(result.stdout.splitlines()[-1])
+    assert "--direct-browser" in command["arguments"], "the console must receive the direct-browser request"
+    assert "--no-browser" not in command["arguments"]
+    assert command["arguments"][:2] == ["-m", "tools.am1_console"]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Direct Edge console is Windows-only")
+def test_direct_console_browser_is_loopback_and_process_local(tmp_path, monkeypatch):
+    """Catch a flag dropped into an existing ordinary/profile browser process."""
+    edge = tmp_path / "programs" / "Microsoft/Edge/Application/msedge.exe"
+    edge.parent.mkdir(parents=True)
+    edge.write_bytes(b"test-only executable boundary")
+    monkeypatch.setenv("ProgramFiles(x86)", str(tmp_path / "programs"))
+    commands = []
+    monkeypatch.setattr(subprocess, "Popen", lambda args, **kwargs: commands.append((args, kwargs)))
+    monkeypatch.setattr(console.webbrowser, "open", lambda _: pytest.fail("must not reuse the default profile"))
+    console.open_console_browser("http://127.0.0.1:8765/", tmp_path / "private-state", direct=True)
+    args, options = commands[0]
+    assert args[0] == str(edge)
+    assert "--no-proxy-server" in args
+    assert f"--user-data-dir={tmp_path / 'private-state' / 'edge-console-direct'}" in args
+    assert "--app=http://127.0.0.1:8765/" in args
+    assert options["shell"] is False
+    assert (tmp_path / "private-state/edge-console-direct").is_dir()
+    assert not any("disable-web-security" in arg or "ignore-certificate" in arg for arg in args)
+    with pytest.raises(ValueError, match="loopback"):
+        console.open_console_browser("http://example.invalid/", tmp_path, direct=True)
+    assert len(commands) == 1, "invalid target must not launch anything"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Direct Edge console is Windows-only")
+def test_direct_console_browser_missing_edge_refuses_without_fallback(tmp_path, monkeypatch):
+    for name in ("ProgramFiles(x86)", "ProgramFiles", "LOCALAPPDATA"):
+        monkeypatch.setenv(name, str(tmp_path / "missing"))
+    monkeypatch.setattr(shutil, "which", lambda _: None)
+    monkeypatch.setattr(console.webbrowser, "open", lambda _: pytest.fail("no unsafe silent fallback"))
+    monkeypatch.setattr(subprocess, "Popen", lambda *_a, **_kw: pytest.fail("Edge is missing"))
+    with pytest.raises(FileNotFoundError, match="Edge"):
+        console.open_console_browser("http://127.0.0.1:8765/", tmp_path, direct=True)

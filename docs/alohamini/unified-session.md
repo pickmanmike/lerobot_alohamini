@@ -253,6 +253,76 @@ and lift hold/release, deliberate Pause/current Resume, then page Stop with actu
 cleanup. Stay on Control and handle its current Resume/Stop gate before analysis.
 Do not repeat an unchanged powered session just to seek a pass.
 
+### Process/startup/output comparison and loopback routing (October 3, 2026)
+
+These are motor-free checks, not physical Control acceptance. The earlier
+65.584-second nominal pass and shorter ordinary Edge Profile 1 observation remain
+separate historical results. The old external harness sent Stop after its deadline;
+it did not demonstrate a timely production Stop failure.
+
+The same visible Edge driver, five synthetic 640x480 / 15 fps camera views,
+frontend/HTTP/native pipe and unchanged policy were exercised incrementally:
+
+| Added condition | Actual result |
+| --- | --- |
+| A: separately owned PS7/Python native consumer | Passed in 73.03 s total; no unexpected expiry, verified native cleanup. |
+| B: actual `run_startup_sync`, nominal 30 s ramp | Passed in 147.08 s total; two 301-frame ramps, zero body, no unexpected expiry. |
+| C: measured-size/rate synthetic supervisor output through the actual forwarder/reader | Failed on accepted-browser expiry; retained as a failed nominal result, not rescued. |
+| C plus browser-process direct routing | Passed in 150.78 s total, 65.256 s first live; both ramps, input/release, deliberate Pause/current Resume, Stop and cleanup passed. |
+
+Output was approximately 42 KB/s host and 638 B/s camera with bounded bursts,
+advancing file offsets and the ordinary 1536-byte forwarding cap. Skipped output
+bytes remain explicit; synthetic replay does not claim to reproduce SSH transport
+or motor IO. Test-only native children retain actual launch provenance (including
+Windows executable/venv redirectors), original failures and bounded owned cleanup.
+
+At the first useful C divergence, browser callbacks continued while localhost
+requests arrived late; native leases/consumption and output also continued.
+A second failed C check completed its first live interval and deliberate Stop,
+then expired during the second startup; that failed restart is retained separately.
+Focused browser network evidence in a subsequent failed C check located a
+**1.845 s `PROXY_RESOLUTION_SERVICE_WAITING_FOR_INIT_PAC`** wait on `/api/body`
+before resolving to `DIRECT`. Socket-pool queuing followed that wait. This proves
+the dispatch layer of that synthetic failure, not that output caused proxy
+initialization or that all historical powered gaps shared this cause. The matched
+direct-routing check recorded no PAC events, no expiry, at most 125 ms continuous
+HTTP-arrival spacing, and 115.1 ms retained browser-submission spacing.
+
+After the owned-process cleanup review, final affected console/process/replay
+verification passed **59 checks** (16 browser/foreground cases deselected).
+The separate final visible direct-routing C regression passed in **149.70 s**:
+65.135 s first live, two paced 301-frame startups, no unexpected expiry or rescue,
+172 ms maximum continuous HTTP-arrival spacing, and verified owned cleanup.
+Earlier harness RED failures (missing child/startup coverage, repeated zero
+offsets, launch failure, blocked replay reader and wrapper/early-child cleanup)
+were corrected with focused tests. A wrong immediate-parent assumption exposed
+Windows executable/venv redirectors and was replaced with actual launch provenance;
+it was a fixture error, not a robot defect. Compilation, console help, fresh lazy
+imports, Node/PowerShell syntax and diff checks passed. The earlier 151 Python / 29
+browser results were not rerun or relabeled as new evidence.
+
+An opt-in launcher mitigation is available:
+
+```powershell
+.\tools\run_am1_console.ps1 -DirectBrowser
+```
+
+This uses installed Microsoft Edge in a separate private `edge-console-direct`
+profile under the configured local state directory, with process-local
+`--no-proxy-server`. It does not change Windows proxy settings, ordinary Edge
+Profile 1, authentication, any deadline, or the motor/camera sources. Missing Edge
+refuses rather than silently falling back. The ordinary launch and `-NoBrowser`
+remain available; do not open a second controlling tab. Browser launch itself
+starts no robot. The distinct profile is necessary so an already-running ordinary
+Edge process cannot silently ignore the requested process flags.
+
+The remaining justified real-use observation is whether the selected direct
+console window can complete the still-missing brief leader/page-button/release,
+Pause/current Resume and Stop interactions. No powered check was run for this
+packet. A later accepted result must retain any first expiry and actual cleanup;
+this offline pass alone does not complete manual Control acceptance. Private raw
+timing/NetLog output stays outside Git (NetLog can include request credentials).
+
 The Servos page distinguishes the physical leader and Pi follower identities.
 It displays normalized position and the action actually sent; per-servo current,
 temperature and status remain **Not sampled** until a correctly identified

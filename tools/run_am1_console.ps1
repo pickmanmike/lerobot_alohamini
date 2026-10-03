@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
     [string]$ConfigPath = (Join-Path $PSScriptRoot '..\config\am1.session.json'),
-    [switch]$NoBrowser
+    [switch]$NoBrowser,
+    [switch]$DirectBrowser
 )
 
 # Opens only the Windows loopback console. A browser Start is still required
@@ -10,7 +11,9 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 function New-Am1ConsoleCommand {
-    param([Parameter(Mandatory)][string]$ConfigPath, [switch]$NoBrowser)
+    param([Parameter(Mandatory)][string]$ConfigPath, [switch]$NoBrowser, [switch]$DirectBrowser)
+
+    if ($NoBrowser -and $DirectBrowser) { throw 'NoBrowser and DirectBrowser are mutually exclusive.' }
 
     $exactConfig = [System.IO.Path]::GetFullPath($ConfigPath)
     if (-not (Test-Path -LiteralPath $exactConfig -PathType Leaf)) {
@@ -28,13 +31,14 @@ function New-Am1ConsoleCommand {
     }
     $arguments = @('-m', 'tools.am1_console', '--config', $exactConfig)
     if ($NoBrowser) { $arguments += '--no-browser' }
+    if ($DirectBrowser) { $arguments += '--direct-browser' }
     return [pscustomobject]@{ executable = $python; arguments = $arguments;
                              directory = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..')) }
 }
 
 function Invoke-Am1Console {
-    param([Parameter(Mandatory)][string]$ConfigPath, [switch]$NoBrowser)
-    $command = New-Am1ConsoleCommand -ConfigPath $ConfigPath -NoBrowser:$NoBrowser
+    param([Parameter(Mandatory)][string]$ConfigPath, [switch]$NoBrowser, [switch]$DirectBrowser)
+    $command = New-Am1ConsoleCommand -ConfigPath $ConfigPath -NoBrowser:$NoBrowser -DirectBrowser:$DirectBrowser
     $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
     $startInfo.FileName = $command.executable
     $startInfo.WorkingDirectory = $command.directory
@@ -58,5 +62,5 @@ function Invoke-Am1Console {
 }
 
 if ($MyInvocation.InvocationName -ne '.') {
-    exit (Invoke-Am1Console -ConfigPath $ConfigPath -NoBrowser:$NoBrowser)
+    exit (Invoke-Am1Console -ConfigPath $ConfigPath -NoBrowser:$NoBrowser -DirectBrowser:$DirectBrowser)
 }
