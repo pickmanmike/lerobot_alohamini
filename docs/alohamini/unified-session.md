@@ -128,6 +128,30 @@ ordering or explain the initiating input gap. Manual leader/body response,
 release stopping and successful explicit Pause/Resume still require the focused
 attended Control check; the console remains a draft candidate.
 
+The recovered owner-operated session used client/session helper
+`2e3d3e694db220efa389279a3ee9244cf8e23bbe`, unchanged motor
+`43d1622a9395cdc1d1f9acce1090ed3f029f4f7c` and camera
+`9b1f0670e7068f7d39eb50270a118e3807418355`. Home, relief and automatic
+alignment completed. Three input-lease pauses were explicitly recovered, followed
+by approximately 54 seconds without another pause. Sending stayed near 10 Hz,
+with no new live host watchdog event. The owner reported mostly keyboard use.
+The explicit cancellation retained client exit 130; host/camera exits were 0
+and cleanup was verified. This is not another missed-Resume refusal. Both-leader
+response, page-button hold/release, deliberate page Pause/Resume and live
+supporting-page acceptance remain unconfirmed; retained snapshots do not fill
+those gaps. Earlier failed attempts and the initiating input-expiry uncertainty
+remain part of the record.
+
+The normal Stop follow-up retains raw cancellation codes and classifies only a
+verified, nonfault explicit cancellation as **Stopped by operator**. **Stopping**
+remains visible until remote/client cleanup and the private input-pipe owner have
+finished. Faults, forced/uncertain cleanup and pipe-close errors still block Start.
+A verified Stop permits a new deliberate Start through normal preflight; it never
+automatically restarts or rearms. A verified cancellation before remote dispatch
+is also distinguished from failure. These behaviors and cleanup-order/stale-event
+races are covered offline through the actual coordinator, adapter and local lock.
+No motor, camera, input-expiry or recovery limit changes accompany this repair.
+
 The Servos page distinguishes the physical leader and Pi follower identities.
 It displays normalized position and the action actually sent; per-servo current,
 temperature and status remain **Not sampled** until a correctly identified

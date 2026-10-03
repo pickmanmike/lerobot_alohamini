@@ -161,7 +161,7 @@ class AM1ConsoleViews {
     if (!observation || observation.host_state == null) return "Not sampled";
     const value = `${observation.host_state} / ${observation.host_epoch ?? "unknown"}`;
     const stale = observation.age_ms == null || observation.age_ms > 1000 ||
-      ["complete", "failed", "cleanup_unknown", "stopping"].includes(phase);
+      ["complete", "operator_stopped", "failed", "cleanup_unknown", "stopping"].includes(phase);
     return stale ? `Last observed ${value} (Snapshot; ${Math.round(observation.age_ms ?? 0)} ms ago)` : value;
   }
   static eventLines(events) {
@@ -318,7 +318,8 @@ if (typeof document !== "undefined") {
         document.querySelector("#log-session").textContent = "No exact session log selected.";
         document.querySelector("#terminal-output").textContent = "Session changed. Select an original output.";
       }
-      stateText.textContent = state.session_id ? `Session ${state.session_id}: ${state.phase}` : "No session is active.";
+      const phaseLabel = state.phase === "operator_stopped" ? "Stopped by operator" : state.phase;
+      stateText.textContent = state.session_id ? `Session ${state.session_id}: ${phaseLabel}` : "No session is active.";
       const saved = sessionStorage.getItem("am1-control-owner");
       if (saved && !input.sessionId && state.session_id) {
         const owner = JSON.parse(saved);
@@ -357,7 +358,7 @@ if (typeof document !== "undefined") {
       const output = await response.json();
       if (output.session_id !== requestedSessionId) throw new Error("output session changed");
       if (output.state !== "Unavailable") return {text:output.text, label:AM1ConsoleViews.outputLabel(output)};
-      if (!["complete", "failed", "cleanup_unknown"].includes(state?.phase))
+      if (!["complete", "operator_stopped", "failed", "cleanup_unknown"].includes(state?.phase))
         return {text:output.reason, label:AM1ConsoleViews.outputLabel(output)};
     }
     const response = await fetch(AM1ConsoleViews.logUrl(kind, requestedSessionId),

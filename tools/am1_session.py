@@ -293,6 +293,7 @@ class SessionOutcome:
     operational_exit_code: int
     final_exit_code: int
     cleanup_verified: bool
+    operator_stopped: bool = False
     input_source: str = "physical"
     motion_profile: str | None = None
     stop_reason: str | None = None
@@ -498,7 +499,6 @@ class SessionCoordinator:
                 outcome.failure = "physical/view readiness requires Enter only; non-empty input was refused"
                 outcome.operational_exit_code = 2
             elif stop_requested():
-                outcome.failure = "session stop requested before motor activation"
                 outcome.operational_exit_code = 130
                 outcome.stop_reason = "explicit_stop"
             else:
@@ -530,13 +530,19 @@ class SessionCoordinator:
                                 break
                     except OSError:
                         pass
-                    outcome.failure = (
-                        f"Windows Local client safety refusal: {refusal}"
-                        if refusal is not None
-                        else f"Windows Local client exited with status {outcome.operational_exit_code}"
-                    )
                     client_status = self.client.cleanup_status() if hasattr(self.client, "cleanup_status") else {}
                     stop_context = client_status.get("stop_context", {})
+                    if (refusal is None and outcome.operational_exit_code == 130
+                            and stop_context.get("origin") == "explicit_stop"):
+                        # This is only a candidate cancellation. Final cleanup,
+                        # fault and ownership evidence must still qualify it.
+                        outcome.stop_reason = "explicit_stop"
+                    else:
+                        outcome.failure = (
+                            f"Windows Local client safety refusal: {refusal}"
+                            if refusal is not None
+                            else f"Windows Local client exited with status {outcome.operational_exit_code}"
+                        )
                     if (
                         refusal is None and outcome.operational_exit_code == 2
                         and stop_context.get("origin") == "remote_fault"
@@ -551,7 +557,7 @@ class SessionCoordinator:
                     else:
                         remote_fault_observed_after_client_result = dict(remote_fault)
         except (KeyboardInterrupt, SessionStopped) as exc:
-            outcome.failure = "operator interrupt"
+            outcome.failure = "operator interrupt" if isinstance(exc, KeyboardInterrupt) else None
             outcome.operational_exit_code = 130
             outcome.stop_reason = "keyboard_interrupt" if isinstance(exc, KeyboardInterrupt) else "explicit_stop"
         except BaseException as exc:
@@ -581,8 +587,8 @@ class SessionCoordinator:
             self._emit({"event": "cleanup", "cleanup_verified": outcome.cleanup_verified,
                         "operational_exit_code": outcome.operational_exit_code})
             terminal_status = cleanup.get("terminal_status") or cleanup.get("persisted_status")
-            if terminal_status in {"fault", "refused"} and outcome.operational_exit_code == 0:
-                outcome.failure = f"Pi session ended in terminal state {terminal_status}"
+            if (terminal_status in {"fault", "refused"} or cleanup.get("primary_fault") is not None) and outcome.operational_exit_code in {0, 130}:
+                outcome.failure = outcome.failure or f"Pi session ended in terminal state {terminal_status}"
                 outcome.operational_exit_code = 2
             for key in ("host_log", "camera_log"):
                 if cleanup.get(key) and cleanup[key] not in remote_logs:
@@ -675,6 +681,26 @@ class SessionCoordinator:
                 outcome.final_exit_code = 4
             else:
                 outcome.final_exit_code = 0
+            client_cleanup = outcome.cleanup.get("client", {})
+            outcome.operator_stopped = (
+                outcome.final_exit_code == 130 and outcome.stop_reason == "explicit_stop"
+                and outcome.failure is None and outcome.cleanup_verified is True
+                and (outcome.cleanup.get("terminal_status") == "complete" or (
+                    outcome.cleanup.get("nothing_started") is True
+                    and outcome.cleanup.get("terminal_status") is None
+                ))
+                and not outcome.cleanup.get("cleanup_errors")
+                and outcome.cleanup.get("primary_fault") is None
+                and outcome.cleanup.get("remote_fault_observed_after_client_result") is None
+                and all(outcome.cleanup.get(key) in (None, 0) for key in ("host_exit", "camera_exit"))
+                and client_cleanup.get("cleanup_verified") is True
+                and (client_cleanup.get("not_started") is True or (
+                    client_cleanup.get("state") == "exited"
+                    and client_cleanup.get("stop_context", {}).get("origin") == "explicit_stop"
+                    and client_cleanup.get("client_exit") in (0, 130)
+                    and client_cleanup.get("wrapper_exit") in (0, 130)
+                ))
+            )
             outcome.finished_at = datetime.now().astimezone().isoformat()
             (session_directory / "session-summary.json").write_text(
                 json.dumps(asdict(outcome), indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -682,6 +708,7 @@ class SessionCoordinator:
             self._emit({"event": "session_complete", "session_id": session_id,
                         "final_exit_code": outcome.final_exit_code,
                         "cleanup_verified": outcome.cleanup_verified,
+                        "operator_stopped": outcome.operator_stopped,
                         "result_directory": str(session_directory)})
         return outcome
 
@@ -1693,7 +1720,7 @@ def _run_start_locked(
             "session_id": session_id,
             "controller_pid": os.getpid(),
             "session_directory": str(session_directory),
-            "status": "complete" if outcome.final_exit_code == 0 else "failed",
+            "status": "operator_stopped" if outcome.operator_stopped else "complete" if outcome.final_exit_code == 0 else "failed",
             "final_exit_code": outcome.final_exit_code,
             "input_source": outcome.input_source,
             "motion_profile": outcome.motion_profile,

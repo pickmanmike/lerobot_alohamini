@@ -352,8 +352,20 @@ function loadApp(fetchHook) {
   const source = fs.readFileSync(path.resolve(__dirname, "../../tools/am1_console_ui/app.js"), "utf8")
     .replace("  route();", "  globalThis.testInput=input; globalThis.testOperation=operation; globalThis.testReadState=readState; route();");
   vm.runInContext(source, context);
-  return {context, sent, windowListeners, documentListeners, setState:value => { state = value; }};
+  return {context, sent, nodes, windowListeners, documentListeners, setState:value => { state = value; }};
 }
+
+test("verified operator cancellation is labeled stopped with only historical host feedback", async () => {
+  const app = loadApp();
+  await new Promise(resolve => setImmediate(resolve));
+  app.setState({session_id:"old-session", phase:"operator_stopped", final_exit_code:130,
+    cleanup_verified:true, events:[], telemetry:{}});
+  await app.context.testReadState();
+  assert.match(app.nodes.get("#session-state").textContent, /Stopped by operator/);
+  const Views = loadViews();
+  assert.match(Views.hostStatus({host_state:"active", host_epoch:2, age_ms:50}, "operator_stopped"),
+    /Last observed.*Snapshot/);
+});
 
 for (const outcome of ["denial", "failure"]) {
   test(`a canceled old body ${outcome} cannot release a replacement owner`, async () => {

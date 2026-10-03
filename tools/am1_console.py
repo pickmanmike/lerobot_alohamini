@@ -52,6 +52,7 @@ class ConsoleSessionAdapter:
         self._phase = "idle"
         self._final_exit_code: int | None = None
         self._cleanup_verified: bool | None = None
+        self._operator_stopped = False
         self._verified_source_heads: dict[str, str] | None = None
         self._verified_source_at_ns: int | None = None
         self._error: str | None = None
@@ -89,9 +90,11 @@ class ConsoleSessionAdapter:
             return
         telemetry_only = event.get("event") in {"live_sample", "action_sent", "host_feedback", "system_sample", "live_admitted"}
         with self._lock:
+            if event.get("session_id") is not None and event["session_id"] != self._session_id:
+                return
             self._telemetry.update(event)
             if event.get("event") in {"host_feedback", "live_sample", "live_admitted"} and self._phase not in {
-                "stopping", "client_exited", "complete", "failed", "cleanup_unknown",
+                "stopping", "client_exited", "complete", "operator_stopped", "failed", "cleanup_unknown",
             }:
                 observation = self._telemetry.observation
                 acquired = event.get("acquired_at_ns")
@@ -126,7 +129,7 @@ class ConsoleSessionAdapter:
                 self._phase = event["event"]
             elif event.get("event") == "stop_requested":
                 self._phase = "stopping"
-            elif event.get("event") == "client_exited":
+            elif event.get("event") == "client_exited" and self._phase != "stopping":
                 self._phase = "client_exited"
             if event.get("event") == "preflight_passed" and isinstance(event.get("sources"), dict):
                 self._verified_source_heads = {
@@ -135,10 +138,15 @@ class ConsoleSessionAdapter:
                     and isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40}", value)
                 }
                 self._verified_source_at_ns = time.time_ns()
-            elif event.get("event") == "cleanup" and not event.get("cleanup_verified"):
+            elif (event.get("event") == "cleanup" and not event.get("cleanup_verified")
+                  and self._phase != "stopping"):
                 self._phase = "cleanup_unknown"
             if event.get("event") in {"cleanup", "session_complete"} and type(event.get("cleanup_verified")) is bool:
                 self._cleanup_verified = event["cleanup_verified"]
+            if event.get("event") == "session_complete":
+                self._operator_stopped = (event.get("operator_stopped") is True
+                                          and event.get("final_exit_code") == 130
+                                          and event.get("cleanup_verified") is True)
         if self._event_sink is not None:
             self._event_sink(event)
 
@@ -241,7 +249,6 @@ class ConsoleSessionAdapter:
             )
             with self._lock:
                 self._final_exit_code = result
-                self._phase = "complete" if result == 0 else "cleanup_unknown" if result == 3 else "failed"
         except BaseException as exc:
             with self._lock:
                 self._error = f"{type(exc).__name__}: {exc}"
@@ -257,7 +264,17 @@ class ConsoleSessionAdapter:
                         cleanup_note = f"pipe cleanup also failed: {type(exc).__name__}: {exc}"
                         self._error = f"{self._error}; {cleanup_note}" if self._error else cleanup_note
                         self._phase = "cleanup_unknown"
+                        self._cleanup_verified = False
                 self._bridge = None
+            with self._lock:
+                if self._cleanup_verified is False:
+                    self._phase = "cleanup_unknown"
+                elif self._error is not None:
+                    self._phase = "failed"
+                elif self._final_exit_code == 130 and self._operator_stopped and self._cleanup_verified is True:
+                    self._phase = "operator_stopped"
+                else:
+                    self._phase = "complete" if self._final_exit_code == 0 else "cleanup_unknown" if self._final_exit_code == 3 else "failed"
             self._created.set()
 
     def state(self):
@@ -344,7 +361,9 @@ class ConsoleSessionAdapter:
                 if self._worker is not None and self._worker.is_alive():
                     # A second tab attaches to the current or completed result.
                     return {"accepted": True, "session_id": self._session_id, "phase": self._phase}
-                if self._worker is not None and self._final_exit_code != 0:
+                if self._worker is not None and not (
+                    self._phase in {"complete", "operator_stopped"} and self._bridge is None
+                ):
                     return {"accepted": False, "session_id": self._session_id,
                             "phase": self._phase, "reason": "prior cleanup or failure is unresolved"}
                 duration = self.session_module.parse_duration_seconds(payload.get("duration_seconds"))
@@ -355,6 +374,7 @@ class ConsoleSessionAdapter:
                 self._session_id = None
                 self._final_exit_code = None
                 self._cleanup_verified = None
+                self._operator_stopped = False
                 self._verified_source_heads = None
                 self._verified_source_at_ns = None
                 self._error = None
