@@ -8,6 +8,354 @@ had a maximum browser display gap of `1.138 s`, above the unchanged `500 ms`
 continuity target. Loss of a required view still means release controls, press
 `Q`, and restart only after all owned processes have stopped.
 
+## Windows Control console candidate (not yet physically accepted)
+
+From the reviewed Windows checkout in PowerShell 7, with the existing private
+`config/am1.session.json` and configured Python environment:
+
+```powershell
+.\tools\run_am1_console.ps1
+```
+
+This opens only `http://127.0.0.1:8765/`. Opening or refreshing the browser does
+not start cameras or motors. The private session config must contain an absolute
+`console_camera_auth_file` pointing to a user-only JSON file with `username` and
+`password` for the already-deployed Pi camera viewer; neither file belongs in
+Git. If the port is occupied, the launcher refuses instead of starting a second
+controller. The CLI fallback remains `tools/run_am1_session.ps1` with its
+existing exact-SHA configuration, Stop and CollectOnly modes.
+
+Start on the Control page prepares one ordinary physical-leader Local session.
+The existing Pi owner performs actual camera readiness, one home and approximately
+10 mm relief, nominal 30-second startup alignment, and 10 Hz live forwarding.
+The browser never reads leaders or owns a motor socket. During live use, hold
+W/S/Z/X/A/D for base and U/J for lift; release zeros body input. Body commands
+expire after 250 ms of accepted-browser silence, independently of the approved
+1.5-second browser-presence allowance. A short gap clears held movement: release
+the controls, then deliberately press again; it does not by itself pause the arms.
+Leaving Control, losing focus, failed input/state requests or lost presence still
+clear body input and request measured-arm pause. Resume and exceptional realignment require explicit on-page approval
+and fresh host/follower/leader qualification. Q on Control or Stop from any page
+requests the existing exact-session cleanup. Do not treat a returned Stop request
+as verified shutdown: wait for the final session result. The exact result folder
+is under the private configured `windows_log_directory`, named
+`am1-session-<session-id>`; CollectOnly can retry missing log collection without
+starting hardware.
+
+If a startup input lease was released, the pending `sync_start` or `live_start`
+gate shows **Continue startup**. Hold the leaders still, release all body input,
+and click it to approve only that displayed gate with a fresh empty lease.
+Fresh heartbeats alone do not clear the latch; stale/wrong-stage approval is
+refused. Live Pause/Resume still requires the existing host/follower/leader
+qualification, and startup approval never enables body motion before live
+admission. The followers automatically synchronize to the frozen leader target;
+manual pose matching is not a prerequisite. Hold leaders still during the ramp
+and keep the full follower path clear. The existing gate/bounds and documented
+arbitrary-pose shoulder limitation remain: a failed alignment refuses live use.
+
+Stay on the focused Control page during live operation. Blur, hidden document,
+page navigation and failed input/state requests intentionally release input;
+returning focus does not rearm. Release controls, read the displayed pause cause,
+and explicitly approve the current Resume gate. The first local input-pause cause
+is retained separately from later expiry or SSH/controller-loss symptoms. Stop
+does not wait for a pending approval request and cancels that pending approval.
+
+If a required camera view is unavailable or only a retained image remains,
+release body keys, Pause, then Stop if the view does not promptly recover. Confirm
+the owned session has stopped before reopening the view or starting another
+session; a last frame is not a live driving view. Small right-elbow tracking,
+arbitrary-pose shoulder alignment, intermittent camera acquisition/browser gaps,
+and long-duration or unattended use retain the limitations below. This console
+source has passed offline fake/browser checks. The camera-only layout/start/stop
+check passed with five fresh sources, but the attended Control check is not yet
+accepted. Earlier attempts refused on a disconnected leader supply or a startup
+approval timeout. The later automatic sync completed 301 frames in 30.968 seconds
+at the unchanged tolerance, worst error 5.766. Native live admission was followed
+by a local input-lease pause, then a separate SSH/controller-loss failure and
+status 2. Recovered evidence verifies host/camera exits 0 and cleanup. This is a
+sync pass, not a manual live-control pass. Its initiating local event was not
+captured; the new bounded evidence cannot retroactively establish that cause.
+
+The focused live-close follow-up passed 95 affected Python checks and 17 Node
+UI checks. Eleven Python cases exercise the actual frontend, loopback service
+and Windows named pipe with synthetic camera/robot feedback, including request
+loss, focus/navigation release, explicit recovery and Stop during an outstanding
+approval. Under desktop load, a real browser input gap can exceed the unchanged
+250 ms limit: those cases retain the safe pause and require explicit recovery,
+not an invented heartbeat or a claim of uninterrupted cadence. These are offline
+results, not a replacement for the pending attended Control check.
+
+The subsequent Control-only attempt also passed automatic synchronization and
+native live admission, but the page continued to display `host_ready`. A later
+input-lease expiry requested explicit Resume in the native client; Control did
+not expose the pending gate before its deadline. The owner only watched startup
+and reported prompt stopping without unusual behavior. Client refusal 2 and
+verified host/camera cleanup 0 are retained; manual leader/body input, successful
+Pause/Resume and page Stop remain unaccepted. Healthy SSH in that attempt does
+not explain the local lease expiry or the missing gate.
+
+The focused correction derives Control's `live` phase from the native client's
+validated same-host/epoch admission plus matching accepted host feedback, not
+raw active feedback, action transmission or UI approval. Ready/paused feedback
+revokes the prior live display. An aged active sample is
+displayed as `feedback_stale`, and cannot overwrite stopping/terminal state.
+The native pipe retains one bounded gate-request record and one sent-ack record;
+native gate logs separately show request and acknowledged/cancelled/disconnected/
+timeout result. A sent acknowledgement is not itself host admission. Control
+also labels native connection/rejected-request state. Complete synthetic native
+telemetry exercised the real browser/HTTP/pipe/model path and explicit Resume;
+it did not reproduce the physical attempt's absent gate. Its cause remains open,
+not repaired by assertion. Keep the unchanged 250 ms input expiry, current-gate
+approval and host qualification; use Stop promptly if the current gate is absent
+or cannot be completed. No further powered attempt was made in this repair batch.
+
+The next attended Control-only attempt did show validated live admission after
+automatic alignment. The owner did not perform manual movements before another
+accepted-input expiry. The current Resume gate was visible, but its required
+empty-lease request was refused; no Resume reached the native client before its
+deadline. Page Stop was then accepted during cleanup. Client refusal 2 and
+verified host/camera exits 0 are retained, not a manual-control pass.
+
+A controlled offline request-order test reproduced a separate approval race:
+periodic body requests could overtake the explicit empty approval packet, making
+its sequence stale. The frontend now reserves input-request scheduling for that
+pending packet and ignores new held input during it. Release/Stop bypasses and
+invalidates the pending approval. Owner/epoch and release-generation checks also
+cover the later operation acknowledgement: a delayed reply cannot undo focus or
+navigation release, or revoke a replacement owner's input. Held input is not
+replayed after approval. These async races were reproduced and corrected offline
+through the actual frontend and existing browser/HTTP/native-pipe harness.
+No expiry is extended, no current gate is bypassed, and no automatic rearm is
+added. This reproduction does not establish the powered attempt's exact HTTP
+ordering or explain the initiating input gap. Manual leader/body response,
+release stopping and successful explicit Pause/Resume still require the focused
+attended Control check; the console remains a draft candidate.
+
+The recovered owner-operated session used client/session helper
+`2e3d3e694db220efa389279a3ee9244cf8e23bbe`, unchanged motor
+`43d1622a9395cdc1d1f9acce1090ed3f029f4f7c` and camera
+`9b1f0670e7068f7d39eb50270a118e3807418355`. Home, relief and automatic
+alignment completed. Three input-lease pauses were explicitly recovered, followed
+by approximately 54 seconds without another pause. Sending stayed near 10 Hz,
+with no new live host watchdog event. The owner reported mostly keyboard use.
+The explicit cancellation retained client exit 130; host/camera exits were 0
+and cleanup was verified. This is not another missed-Resume refusal. Both-leader
+response, page-button hold/release, deliberate page Pause/Resume and live
+supporting-page acceptance remain unconfirmed; retained snapshots do not fill
+those gaps. Earlier failed attempts and the initiating input-expiry uncertainty
+remain part of the record.
+
+The normal Stop follow-up retains raw cancellation codes and classifies only a
+verified, nonfault explicit cancellation as **Stopped by operator**. **Stopping**
+remains visible until remote/client cleanup and the private input-pipe owner have
+finished. Faults, forced/uncertain cleanup and pipe-close errors still block Start.
+A verified Stop permits a new deliberate Start through normal preflight; it never
+automatically restarts or rearms. A verified cancellation before remote dispatch
+is also distinguished from failure. These behaviors and cleanup-order/stale-event
+races are covered offline through the actual coordinator, adapter and local lock.
+No motor, camera, input-expiry or recovery limit changes accompany this repair.
+
+The next attended attempt at `eec5d160` again passed automatic startup but
+expired input before the owner could use the remaining controls. One current-gate
+recovery succeeded; a subsequent Resume deadline expired before Stop arrived.
+Client refusal 2, wrapper 1 and verified host/camera cleanup 0 remain intact.
+Repeated input expiry is a usability blocker, not a missing-observation pass.
+Do not conduct another unchanged powered check to seek a successful result.
+
+The hardware-free desktop timing investigation reproduced that failure class in
+the visible in-app browser using the actual frontend/HTTP/Windows-pipe path,
+fake robot feedback and synthetic images. One 822 ms browser long task prevented
+input callbacks: sequence 314 to 315 had a 920.4 ms fetch-submission gap and a
+937 ms HTTP-arrival gap. The service correctly latched expiry/hold at 265 ms
+accepted-input age. The prior
+request completed normally and no approval was pending. Browser and Python
+monotonic intervals were measured separately. The blocking task's initiator,
+its relationship to historical powered attempts, and any HTTP-pool effect are
+not established. This first capture used 61,756-byte synthetic headroom frames;
+a later 69-second in-app monitoring/Pause/Resume/Stop comparison at that same
+load had no unexpected expiry. It did not cover every nominal interaction.
+
+A separate visible Edge nominal exercise with 36,953-byte 640x480 synthetic
+frames at 15 fps and filled telemetry completed 65.7 seconds, W/U/J movement and
+release through the fake native consumer, deliberate Pause/Resume, Stop with
+verified cleanup and a fresh deliberate Start without rescue approvals. Full
+camera/diagnostic UI remained enabled. Continuous HTTP-arrival gaps stayed at or below
+125 ms and timed diagnostic rendering peaked at 9.6 ms; those measurements do
+not attribute the intermittent earlier stall to hidden rendering. This is a
+nominal offline pass, not a production correction or physical acceptance.
+The existing fault-handling suite remains separate from this no-rescue check.
+
+Final verification after the test-only evidence labels/assertions were completed
+ran the entire affected local-path file: 14 passed, 1 opt-in in-app capture
+skipped in 140.44 seconds. Its 65.65-second visible Edge nominal exercise had
+no unexpected expiry, at most 125 ms continuous HTTP-arrival spacing and 9 ms
+maximum measured diagnostic-render work. The 25 existing Node UI checks,
+Python compilation, timing-helper syntax and diff checks also passed. The
+earlier in-app refusal and failed capture result are retained; they are not
+reclassified as a successful run or a production RED/GREEN correction.
+
+The capped probe and foreground exercise live only under `tests/`; they are
+opt-in (`AM1_TIMING_FOREGROUND=1` for the existing desktop Playwright runner,
+`AM1_TIMING_EXTERNAL_BROWSER=1` for an attended in-app capture). They never use
+real camera content or hardware configuration and require no installation.
+Capture a first unexpected expiry honestly; do not rescue it into a nominal
+pass. Raw timing artifacts stay ignored and outside published evidence. No
+runtime limit, browser-presence policy or deployed source pin changed in that
+test-only investigation. The separately approved policy follow-up is below;
+the earlier timing evidence and failed attempts remain historical evidence.
+
+### Approved input-presence follow-up (offline verified, physical check pending)
+
+The owner subsequently approved separating session presence from body movement:
+actual accepted browser receipt permits presence for at most 1.5 seconds, while
+body movement, native-pipe delivery and gate permission retain 250 ms deadlines.
+This explicitly changes the undelivered browser-loss-to-arm-hold allowance from
+250 ms to 1.5 seconds. Delivered blur/hidden/navigation/Pause and request failures
+still request full pause immediately; full pause remains latched until explicit
+current-gate approval and qualified host admission. No server-generated heartbeat
+or pipe forwarding renews the original browser receipt.
+
+Short callback/request gaps clear keyboard and pointer movement and show a bounded
+nonterminal notice. A held key, autorepeat or pointer cannot replay after expiry;
+release and a new press are required. Gates keep their actual fresh receipt and
+owner/host epoch. A captured old lease/ack cannot be relabeled with a replacement
+owner; ownership change cancels the old gate waiter. Fresh receipt metadata is
+installed before acknowledgement, and malformed metadata fails closed without
+hiding the first pause or turning a refused session into operator-stop success.
+Normal prepared startup still auto-advances with fresh input and retains its
+post-host-admission body-release requirement; no new startup choreography is added.
+
+Red-green checks reproduced the old short-gap full pause, held-input replay,
+expired gate metadata and owner-transfer permission, plus a Resume handoff that
+could immediately re-latch. They assert real outgoing input, body zero and explicit
+recovery through the frontend/HTTP/Windows pipe, not only a passing return value.
+The full-page foreground nominal exercise remains separate from deliberate
+input-loss tests and cannot use rescue approvals to conceal unexpected starvation.
+All robot IO and imagery in these checks are synthetic. This follow-up affects
+only helper/client input behavior; deployed motor `43d1622a` and camera `9b1f0670`
+remain unchanged. It does not establish the 822 ms task's initiator, hidden-rendering
+or connection-pool causation, nor physical manual-control acceptance.
+
+Final affected verification: 151 Python checks passed (two opt-in foreground modes
+deselected), and 29 Node UI checks passed. The separate visible Edge nominal
+exercise completed 65.78 seconds without unexpected expiry or rescue approval:
+synthetic W/U/J and release, deliberate Pause/current Resume, Stop/cleanup and a
+fresh Start; full camera/telemetry UI stayed enabled. HTTP-arrival spacing peaked
+at 125 ms, browser submission spacing at 115.1 ms, and measured snapshot work at
+7.7 ms. The alternate in-app capture mode was skipped, not retested. An earlier
+combined run had four overlong Windows test-log-path failures; the short fresh
+temporary-path rerun passed without changing production code. Compilation,
+module help, fresh lazy imports, JavaScript/PowerShell syntax, diff checks and
+independent read-only review also passed. Prior historical tests are not relabeled.
+
+After staging, the remaining attended Control check is both leaders, page wheel
+and lift hold/release, deliberate Pause/current Resume, then page Stop with actual
+cleanup. Stay on Control and handle its current Resume/Stop gate before analysis.
+Do not repeat an unchanged powered session just to seek a pass.
+
+### Process/startup/output comparison and loopback routing (October 3, 2026)
+
+These are motor-free checks, not physical Control acceptance. The earlier
+65.584-second nominal pass and shorter ordinary Edge Profile 1 observation remain
+separate historical results. The old external harness sent Stop after its deadline;
+it did not demonstrate a timely production Stop failure.
+
+The same visible Edge driver, five synthetic 640x480 / 15 fps camera views,
+frontend/HTTP/native pipe and unchanged policy were exercised incrementally:
+
+| Added condition | Actual result |
+| --- | --- |
+| A: separately owned PS7/Python native consumer | Passed in 73.03 s total; no unexpected expiry, verified native cleanup. |
+| B: actual `run_startup_sync`, nominal 30 s ramp | Passed in 147.08 s total; two 301-frame ramps, zero body, no unexpected expiry. |
+| C: measured-size/rate synthetic supervisor output through the actual forwarder/reader | Failed on accepted-browser expiry; retained as a failed nominal result, not rescued. |
+| C plus browser-process direct routing | Passed in 150.78 s total, 65.256 s first live; both ramps, input/release, deliberate Pause/current Resume, Stop and cleanup passed. |
+
+Output was approximately 42 KB/s host and 638 B/s camera with bounded bursts,
+advancing file offsets and the ordinary 1536-byte forwarding cap. Skipped output
+bytes remain explicit; synthetic replay does not claim to reproduce SSH transport
+or motor IO. Test-only native children retain actual launch provenance (including
+Windows executable/venv redirectors), original failures and bounded owned cleanup.
+
+At the first useful C divergence, browser callbacks continued while localhost
+requests arrived late; native leases/consumption and output also continued.
+A second failed C check completed its first live interval and deliberate Stop,
+then expired during the second startup; that failed restart is retained separately.
+Focused browser network evidence in a subsequent failed C check located a
+**1.845 s `PROXY_RESOLUTION_SERVICE_WAITING_FOR_INIT_PAC`** wait on `/api/body`
+before resolving to `DIRECT`. Socket-pool queuing followed that wait. This proves
+the dispatch layer of that synthetic failure, not that output caused proxy
+initialization or that all historical powered gaps shared this cause. The matched
+direct-routing check recorded no PAC events, no expiry, at most 125 ms continuous
+HTTP-arrival spacing, and 115.1 ms retained browser-submission spacing.
+
+After the owned-process cleanup review, final affected console/process/replay
+verification passed **59 checks** (16 browser/foreground cases deselected).
+The separate final visible direct-routing C regression passed in **149.70 s**:
+65.135 s first live, two paced 301-frame startups, no unexpected expiry or rescue,
+172 ms maximum continuous HTTP-arrival spacing, and verified owned cleanup.
+Earlier harness RED failures (missing child/startup coverage, repeated zero
+offsets, launch failure, blocked replay reader and wrapper/early-child cleanup)
+were corrected with focused tests. A wrong immediate-parent assumption exposed
+Windows executable/venv redirectors and was replaced with actual launch provenance;
+it was a fixture error, not a robot defect. Compilation, console help, fresh lazy
+imports, Node/PowerShell syntax and diff checks passed. The earlier 151 Python / 29
+browser results were not rerun or relabeled as new evidence.
+
+An opt-in launcher mitigation is available:
+
+```powershell
+.\tools\run_am1_console.ps1 -DirectBrowser
+```
+
+This uses installed Microsoft Edge in a separate private `edge-console-direct`
+profile under the configured local state directory, with process-local
+`--no-proxy-server`. It does not change Windows proxy settings, ordinary Edge
+Profile 1, authentication, any deadline, or the motor/camera sources. Missing Edge
+refuses rather than silently falling back. The ordinary launch and `-NoBrowser`
+remain available; do not open a second controlling tab. Browser launch itself
+starts no robot. The distinct profile is necessary so an already-running ordinary
+Edge process cannot silently ignore the requested process flags.
+
+The remaining justified real-use observation is whether the selected direct
+console window can complete the still-missing brief leader/page-button/release,
+Pause/current Resume and Stop interactions. No powered check was run for this
+packet. A later accepted result must retain any first expiry and actual cleanup;
+this offline pass alone does not complete manual Control acceptance. Private raw
+timing/NetLog output stays outside Git (NetLog can include request credentials).
+
+The Servos page distinguishes the physical leader and Pi follower identities.
+It displays normalized position and the action actually sent; per-servo current,
+temperature and status remain **Not sampled** until a correctly identified
+same-owner source exists. The System page shows cached Pi OS snapshots, body
+observations, host state/epoch, action cadence and camera-source health. A Pi
+acquisition timestamp is retained, while the displayed sample age is only a
+lower bound from Windows receipt because SSH transit and clock skew are not
+measured. Configured source pins are labeled expected until the session's
+preflight reports exact source heads. Stale or failed camera status never makes
+a retained frame live.
+
+Logs and Terminal display bounded original-output excerpts during the session.
+The existing Pi supervisor forwards up to 1536 bytes per component every 250 ms
+from its exact owned host/camera logs over its existing control connection;
+there is no second SSH tailer or motor reader. Forwarding is best effort and
+does not wait/retry on a blocked display. Byte-offset gaps, truncated excerpts,
+session/source/path, acquisition time and retained output are explicitly labeled.
+The console retains at most 128 KB per component. Windows client and SSH output
+use bounded snapshots of the exact current result files. Output acquisition
+time is a file-read time, not the original line's creation time; original line
+timestamps remain unchanged where present. A quiet/aged excerpt is retained,
+not proof that its process is currently live.
+
+The local filter shows at most 400 matching lines, with source/severity filters,
+search and follow/pause. Export still downloads only an exact collected file
+from this session's result folder, refusing missing, ambiguous and over-2 MB
+files. For a missing Pi log, use `-CollectOnly -SessionId`. The summary is
+available after cleanup. Terminal follows the chosen original output as a
+read-only view, plus bounded lifecycle/fault events; it has no command input
+or execution route. Changing any page releases
+browser body keys; the global Stop remains available. None of these pages starts a second motor
+reader or changes the original cleanup result.
+
 ## Current state — teleoperation closeout, September 29, 2026
 
 Local teleoperation is reasonably functional for **supervised LAN hobby use**.
@@ -69,8 +417,8 @@ limitation, not a demand for another recording or commissioning run. Reopen only
 if practical manual use exposes a material usability problem. Keep P16 and the
 existing profile, calibration, gains and limits.
 
-Match the physical leader to the **current** follower pose before ordinary
-startup. Historical shoulder/arbitrary-pose, camera acquisition/browser delivery
+Ordinary startup automatically aligns followers to held-still physical leaders;
+manual matching is optional, not required. Historical shoulder/arbitrary-pose, camera acquisition/browser delivery
 (including the 1.138 s display gap), long-duration and unattended-use limitations
 remain. Network infrastructure remediation is external. See the short
 [everyday reference](#everyday-supervised-use); historical records below are not
@@ -594,9 +942,9 @@ complete, visible prompts, each accepting only a bare Enter:
 1. After all five camera views are fresh, verify the views, physical envelope,
    support, and power-removal access; press Enter to start the motor host.
 2. After the host homes and relieves the lift and the client displays the
-   alignment plan, verify the right leader shoulder is close to the **current
-   measured follower** value. Do not use a historical absolute pose as the
-   target or force the follower. If the displayed frozen plan needs a leader
+   alignment plan, verify the full automatic follower-to-leader path is clear.
+   Do not use a historical absolute pose as the target or force the follower.
+   Manual pose matching is not required. If the displayed frozen plan needs a leader
    adjustment, cancel rather than moving the leader during approval; prepare
    a fresh plan on a later ordinary start. With the approved plan, hold both
    leaders still and press Enter for nominal 30-second synchronization.
@@ -779,8 +1127,8 @@ never kills unrelated Python, camera, or motor processes.
   reaching -1.604 and passing the unchanged gate. Large-offset tracking therefore
   succeeded in that pose. It does not erase the earlier 13.402-unit plateau at a
   different target after sampled goal-register delivery or establish arbitrary-pose
-  convergence. Continue matching the leader to the current measured follower for
-  ordinary startup; keep the existing gate and bounds.
+  convergence. Automatic synchronization remains ordinary startup, with no
+  mandatory manual matching; keep the existing gate and bounds.
 - Intermittent Forward-camera acquisition can fail before any motor startup.
   Replug recovery does not establish a loose connector or a network cause.
   Preserve that refusal and its cleanup instead of automatically retrying.

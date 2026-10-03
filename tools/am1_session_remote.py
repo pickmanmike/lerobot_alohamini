@@ -4,16 +4,19 @@
 
 The helper owns only children it starts, has no listener, and treats loss of its
 controlling SSH stdin as a cleanup request. Runtime children continue to log
-directly to their existing files; stdout carries only small transition records.
+directly to their existing files; stdout carries small transitions and bounded
+best-effort original-output excerpts. Display delivery cannot delay cleanup.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import queue
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -171,6 +174,76 @@ class BestEffortReporter:
             pass
 
 
+def _pi_throttling() -> str | None:
+    if shutil.which("vcgencmd") is None:
+        return None
+    try:
+        result = subprocess.run(["vcgencmd", "get_throttled"], capture_output=True, text=True,
+                                timeout=0.2, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def sample_pi_system(*, proc_root: Path = Path("/proc"), sys_root: Path = Path("/sys"),
+                     storage_root: Path = Path("/"), previous_cpu: tuple[int, int] | None = None,
+                     throttling: Callable[[], str | None] = _pi_throttling) -> tuple[dict[str, Any], tuple[int, int] | None]:
+    """Read bounded OS sources only; omitted values stay unavailable in the UI."""
+    metrics: dict[str, Any] = {}
+    cpu = previous_cpu
+    try:
+        numbers = [int(value) for value in (proc_root / "stat").read_text(encoding="ascii").splitlines()[0].split()[1:8]]
+        idle = numbers[3] + numbers[4]
+        current = (sum(numbers) - idle, sum(numbers))
+        if cpu is not None and current[1] > cpu[1]:
+            metrics["cpu_percent"] = round(100 * (current[0] - cpu[0]) / (current[1] - cpu[1]), 2)
+        cpu = current
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        entries = {}
+        for line in (proc_root / "meminfo").read_text(encoding="ascii").splitlines():
+            key, _, value = line.partition(":")
+            if key in {"MemTotal", "MemAvailable"}:
+                entries[key] = int(value.strip().split()[0])
+        if entries.get("MemTotal", 0) > 0 and "MemAvailable" in entries:
+            metrics["memory_percent"] = round(100 * (1 - entries["MemAvailable"] / entries["MemTotal"]), 2)
+    except (OSError, ValueError, IndexError):
+        pass
+    for name, path, divisor in (
+        ("cpu_temp_c", sys_root / "class" / "thermal" / "thermal_zone0" / "temp", 1000),
+        ("uptime_s", proc_root / "uptime", 1),
+    ):
+        try:
+            value = float(path.read_text(encoding="ascii").split()[0]) / divisor
+            if value >= 0:
+                metrics[name] = value
+        except (OSError, ValueError, IndexError):
+            pass
+    try:
+        metrics["storage_free_bytes"] = shutil.disk_usage(storage_root).free
+    except OSError:
+        pass
+    try:
+        report = throttling()
+        match = re.fullmatch(r"throttled=(0x[0-9a-fA-F]{1,8})", report or "")
+        if match:
+            metrics["throttled_raw"] = match.group(1)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return metrics, cpu
+
+
+def _system_sample_worker(session_id: str, reporter: BestEffortReporter, stop: threading.Event) -> None:
+    previous_cpu = None
+    while not stop.is_set():
+        acquired_at_ns = time.time_ns()
+        metrics, previous_cpu = sample_pi_system(previous_cpu=previous_cpu)
+        reporter.emit({"event": "system_sample", "session_id": session_id,
+                       "acquired_at_ns": acquired_at_ns, "metrics": metrics})
+        stop.wait(1.0)
+
+
 def _nonblocking_stdout_writer(payload: dict[str, Any]) -> None:
     encoded = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
     try:
@@ -307,6 +380,8 @@ class RemoteSupervisor:
         self.state_path = self.session_root / "state.json"
         self.active_path = Path(args.state_directory) / "active.json"
         self.children: dict[str, OwnedChild] = {}
+        self._output_offsets: dict[str, int] = {}
+        self._next_output_at = 0.0
         self.lock_stream: TextIO | None = None
         self.controller_closed = threading.Event()
         self.controller_stop_requested = threading.Event()
@@ -370,6 +445,41 @@ class RemoteSupervisor:
             "event": event, "session_id": self.args.session_id, "wall_time_ns": time.time_ns(),
             "controller_contact": self.controller_contact_evidence(), **fields,
         })
+
+    def forward_output(self, *, now: float | None = None) -> None:
+        """Bounded best-effort reads of this owner's existing logs, no tailer.
+
+        Byte offsets expose dropped output. Base64 keeps each pipe write below
+        PIPE_BUF even for control characters; the complete original stays on disk.
+        """
+        now = time.monotonic() if now is None else now
+        if now < self._next_output_at:
+            return
+        self._next_output_at = now + 0.25
+        for name, child in self.children.items():
+            if name not in {"host", "camera"} or not child.log_path:
+                continue
+            path = Path(child.log_path)
+            try:
+                if path.is_symlink() or path.resolve().parent != Path(self.args.log_directory).resolve():
+                    continue
+                offset = self._output_offsets.get(name, 0)
+                with path.open("rb") as stream:
+                    size = os.fstat(stream.fileno()).st_size
+                    # Do not build a display backlog that can monopolize SSH.
+                    offset = max(offset if offset <= size else 0, size - 1536)
+                    stream.seek(offset)
+                    data = stream.read(1536)
+            except OSError:
+                continue
+            if data:
+                self._output_offsets[name] = offset + len(data)
+                payload = {"event": "process_output", "session_id": self.args.session_id,
+                           "source": name, "path": str(path), "offset": offset,
+                           "acquired_at_ns": time.time_ns(),
+                           "data_base64": base64.b64encode(data).decode("ascii")}
+                if len(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()) < 4095:
+                    self.reporter.emit(payload)
 
     def preflight(self) -> None:
         if not SESSION_ID_PATTERN.fullmatch(self.args.session_id):
@@ -442,6 +552,7 @@ class RemoteSupervisor:
                     "controller_lease_expired",
                     f"{label} cancelled after controller heartbeat lease expired",
                 )
+            self.forward_output()
             exit_code = child.process.poll()
             if exit_code is not None:
                 raise SessionRefusal(f"{label} exited before readiness with status {exit_code}")
@@ -597,8 +708,14 @@ def supervise(args: argparse.Namespace) -> int:
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
     cleanup_done = False
+    system_stop = threading.Event()
+    system_thread = None
     try:
         supervisor.preflight()
+        system_thread = threading.Thread(target=_system_sample_worker,
+                                         args=(args.session_id, reporter, system_stop),
+                                         name="am1-system-readonly", daemon=True)
+        system_thread.start()
         reader = threading.Thread(target=_read_commands, args=(supervisor, commands), daemon=True)
         reader.start()
         while True:
@@ -625,6 +742,7 @@ def supervise(args: argparse.Namespace) -> int:
                 supervisor.cleanup(reason=f"{name}_exit_{exit_code}")
                 cleanup_done = True
                 return exit_code or 2
+            supervisor.forward_output()
             try:
                 command = commands.get(timeout=0.1)
             except queue.Empty:
@@ -676,6 +794,9 @@ def supervise(args: argparse.Namespace) -> int:
             supervisor.cleanup(reason="supervisor_fault")
         raise
     finally:
+        system_stop.set()
+        if system_thread is not None:
+            system_thread.join(timeout=0.3)
         if supervisor.lock_stream is not None:
             supervisor.lock_stream.close()
 

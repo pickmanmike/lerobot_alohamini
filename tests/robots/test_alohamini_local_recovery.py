@@ -1016,6 +1016,63 @@ def test_actual_local_loop_normal_delivery_and_one_missed_reply_keep_active(sing
     assert "PAUSED" not in capsys.readouterr().out
 
 
+def test_console_lease_loss_holds_arms_zeros_body_and_requires_explicit_resume(capsys):
+    module = load_teleoperate()
+    host = FakeLocalRobot()
+    control = alohamini_host.AM1LocalControl()
+
+    class Sender:
+        def __enter__(self): return self
+        def send_action(self, action): control.apply(host, dict(action))
+        def __exit__(self, *args): return False
+
+    class Robot(FreshReplyRobot):
+        def __init__(self):
+            self.started = time.monotonic()
+            self.observation_sequence = 0
+            self.latest_observation_received_at = self.started
+            self.latest_observation_error = None
+            self.latest_raw_observation_keys = frozenset(FOLLOWER)
+            self.latest_am1_local_feedback = {"version": 1, "state": "ready", "epoch": -1, "observation_id": 0}
+
+        def make_live_command_sender(self): return Sender()
+        def retire_observation_requests(self): pass
+        def get_observation(self):
+            time.sleep(0.02)
+            self.observation_sequence += 1
+            self.latest_observation_received_at = time.monotonic()
+            feedback = {}
+            control.annotate(feedback)
+            self.latest_am1_local_feedback = feedback[FEEDBACK]
+            return dict(FOLLOWER)
+
+    class Leader:
+        def get_action(self): return dict(LEADER)
+
+    robot = Robot()
+    gates = []
+
+    def body():
+        x = 0.15 if time.monotonic() - robot.started < 0.25 else 0.0
+        return {"x.vel": x, "y.vel": 0, "theta.vel": 0, "lift_axis.vel": 0}
+
+    with pytest.raises(module.SafetyRefusal, match="Resume approval was not received"):
+        module.run_am1_live_sender(
+            robot, Leader(), initial_arm_target=FOLLOWER, initial_observation_sequence=0,
+            initial_follower_observed_at=robot.started, initial_follower_positions=FOLLOWER,
+            fps=10, duration_s=2, live_arm_scope="both", profile_cadence=False,
+            body_action_supplier=body, recovery_enabled=True,
+            control_pause_requested=lambda: time.monotonic() - robot.started >= 0.25,
+            manual_gate=lambda epoch: gates.append(epoch) or False,
+        )
+    assert gates == [1]
+    assert ("zero_body",) in host.events
+    hold = host.events.index(("hold_present_arms",))
+    assert not any(event[0] == "action" for event in host.events[hold + 1:])
+    assert control.state == "paused" and control.epoch == 1
+    assert "RESUME-NEEDS-APPROVAL" in capsys.readouterr().out
+
+
 @pytest.mark.parametrize(("gap_end", "manual"), [(1.35, False), (2.15, False), (3.45, True), (4.35, True)])
 def test_actual_local_loop_pauses_at_one_second_and_auto_resumes_after_current_feedback(capsys, gap_end, manual):
     module = load_teleoperate()
@@ -1066,6 +1123,7 @@ def test_actual_local_loop_pauses_at_one_second_and_auto_resumes_after_current_f
 
     robot = Robot()
     prompts = []
+    feedback_events = []
     module.run_am1_live_sender(
         robot,
         Leader(),
@@ -1080,6 +1138,7 @@ def test_actual_local_loop_pauses_at_one_second_and_auto_resumes_after_current_f
         body_action_supplier=module.make_zero_action,
         recovery_enabled=True,
         input_fn=lambda prompt: prompts.append(prompt) or "",
+        feedback_callback=lambda sample, feedback: feedback_events.append((feedback["state"], feedback["epoch"])),
     )
 
     assert robot.retire_count == 1
@@ -1091,6 +1150,8 @@ def test_actual_local_loop_pauses_at_one_second_and_auto_resumes_after_current_f
     assert len(prompts) == int(manual)
     assert ("RESUME-NEEDS-ENTER" in output) == manual
     assert f'"resume_mode": "{"manual" if manual else "automatic"}"' in output
+    assert ("paused", 1) in feedback_events
+    assert ("active", 2) in feedback_events
 
 
 def test_actual_local_loop_recovers_twice_without_permanent_latch(capsys):
