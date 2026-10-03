@@ -152,6 +152,55 @@ is also distinguished from failure. These behaviors and cleanup-order/stale-even
 races are covered offline through the actual coordinator, adapter and local lock.
 No motor, camera, input-expiry or recovery limit changes accompany this repair.
 
+The next attended attempt at `eec5d160` again passed automatic startup but
+expired input before the owner could use the remaining controls. One current-gate
+recovery succeeded; a subsequent Resume deadline expired before Stop arrived.
+Client refusal 2, wrapper 1 and verified host/camera cleanup 0 remain intact.
+Repeated input expiry is a usability blocker, not a missing-observation pass.
+Do not conduct another unchanged powered check to seek a successful result.
+
+The hardware-free desktop timing investigation reproduced that failure class in
+the visible in-app browser using the actual frontend/HTTP/Windows-pipe path,
+fake robot feedback and synthetic images. One 822 ms browser long task prevented
+input callbacks: sequence 314 to 315 had a 920.4 ms fetch-submission gap and a
+937 ms HTTP-arrival gap. The service correctly latched expiry/hold at 265 ms
+accepted-input age. The prior
+request completed normally and no approval was pending. Browser and Python
+monotonic intervals were measured separately. The blocking task's initiator,
+its relationship to historical powered attempts, and any HTTP-pool effect are
+not established. This first capture used 61,756-byte synthetic headroom frames;
+a later 69-second in-app monitoring/Pause/Resume/Stop comparison at that same
+load had no unexpected expiry. It did not cover every nominal interaction.
+
+A separate visible Edge nominal exercise with 36,953-byte 640x480 synthetic
+frames at 15 fps and filled telemetry completed 65.7 seconds, W/U/J movement and
+release through the fake native consumer, deliberate Pause/Resume, Stop with
+verified cleanup and a fresh deliberate Start without rescue approvals. Full
+camera/diagnostic UI remained enabled. Continuous HTTP-arrival gaps stayed at or below
+125 ms and timed diagnostic rendering peaked at 9.6 ms; those measurements do
+not attribute the intermittent earlier stall to hidden rendering. This is a
+nominal offline pass, not a production correction or physical acceptance.
+The existing fault-handling suite remains separate from this no-rescue check.
+
+Final verification after the test-only evidence labels/assertions were completed
+ran the entire affected local-path file: 14 passed, 1 opt-in in-app capture
+skipped in 140.44 seconds. Its 65.65-second visible Edge nominal exercise had
+no unexpected expiry, at most 125 ms continuous HTTP-arrival spacing and 9 ms
+maximum measured diagnostic-render work. The 25 existing Node UI checks,
+Python compilation, timing-helper syntax and diff checks also passed. The
+earlier in-app refusal and failed capture result are retained; they are not
+reclassified as a successful run or a production RED/GREEN correction.
+
+The capped probe and foreground exercise live only under `tests/`; they are
+opt-in (`AM1_TIMING_FOREGROUND=1` for the existing desktop Playwright runner,
+`AM1_TIMING_EXTERNAL_BROWSER=1` for an attended in-app capture). They never use
+real camera content or hardware configuration and require no installation.
+Capture a first unexpected expiry honestly; do not rescue it into a nominal
+pass. Raw timing artifacts stay ignored and outside published evidence. No
+runtime limit, browser-presence policy or deployed source pin changed as a
+result of this investigation. Any separation of session presence from the
+unchanged 250 ms movement expiry requires explicit review/approval first.
+
 The Servos page distinguishes the physical leader and Pi follower identities.
 It displays normalized position and the action actually sent; per-servo current,
 temperature and status remain **Not sampled** until a correctly identified
