@@ -110,12 +110,12 @@ const [url, scenario] = process.argv.slice(2);
     await page.waitForFunction(() => document.querySelector("#session-state").textContent.endsWith(": live") ||
       document.querySelector("#gate-state").textContent.includes("Approval needed: resume"));
     if (native(await read()).paused) {
-      // A loaded desktop can genuinely miss the unchanged 250 ms deadline.
+      // A loaded desktop can genuinely miss the approved 1.5 s presence deadline.
       // Do not call that a premature pause, hide it, or manufacture a heartbeat.
       const gaps = await page.evaluate(() => testBodyCalls.slice(1).map((at,i) => at-testBodyCalls[i]));
       const observed = await read();
       assert.equal(observed.input_pause?.reason, "expired browser input");
-      assert.ok(observed.input_pause.input_age_ms >= 250,
+      assert.ok(observed.input_pause.input_age_ms >= 1500,
                 "this pause must prove expiry from its last accepted browser packet");
       assert.deepEqual(native(observed).keys, []);
       console.log(`EXPECTED safe pause: recorded accepted-input age ${Math.round(observed.input_pause.input_age_ms)} ms; ` +
@@ -156,13 +156,35 @@ const [url, scenario] = process.argv.slice(2);
       assert.equal(native(await read()).paused, true, "refocus cannot auto-rearm");
       await resume();
       assert.deepEqual(native(await read()).keys, []);
-    } else if (["body-delay", "body-reject", "body-denied", "state-reject"].includes(scenario)) {
+    } else if (scenario === "short-browser-stall") {
+      await page.keyboard.down("w");
+      await until(state => native(state)?.keys.includes("w"));
+      const stall = await page.evaluate(() => {
+        const start = performance.now(), wall = Date.now();
+        while (performance.now() - start < 940) {} // Synthetic known scheduling gap, not its historical initiator.
+        return {start_wall_ms:wall, end_wall_ms:Date.now()};
+      });
+      const cleared = await until(state => native(state)?.keys.length === 0);
+      const inside = cleared.events.filter(event => event.event === "test_native_state" &&
+        event.wall_time_ns / 1e6 >= stall.start_wall_ms && event.wall_time_ns / 1e6 < stall.end_wall_ms);
+      assert.ok(inside.some(event => !event.paused && event.keys.length === 0 &&
+        event.wall_time_ns / 1e6 - stall.start_wall_ms < 450), "native consumer clears body during the blocked browser");
+      assert.ok(inside.every(event => !event.paused), "940 ms browser gap is not a full presence pause");
+      await page.waitForTimeout(500);
+      assert.equal(native(await read()).paused, false);
+      assert.deepEqual(native(await read()).keys, [], "held W cannot replay when callbacks return");
+      await page.keyboard.up("w");
+      await page.keyboard.down("w");
+      await until(state => native(state)?.keys.includes("w"));
+      await page.keyboard.up("w");
+      await until(state => native(state)?.keys.length === 0);
+    } else if (["body-delay", "body-presence-loss", "body-reject", "body-denied", "state-reject"].includes(scenario)) {
       await page.keyboard.down("w");
       await until(state => native(state)?.keys.includes("w"));
       const target = scenario === "state-reject" ? "**/api/state" : "**/api/body";
       await page.route(target, async route => {
-        if (scenario === "body-delay") {
-          await new Promise(resolve => setTimeout(resolve, 450));
+        if (["body-delay", "body-presence-loss"].includes(scenario)) {
+          await new Promise(resolve => setTimeout(resolve, scenario === "body-delay" ? 450 : 1800));
           try { await route.continue(); } catch (error) {
             if (!/already handled|has been closed/.test(error.message)) throw error;
           }
@@ -170,19 +192,30 @@ const [url, scenario] = process.argv.slice(2);
         else if (scenario === "body-denied") await route.fulfill({status:200, contentType:"application/json", body:'{"accepted":false}'});
         else await route.fulfill({status:503, body:"synthetic refusal"});
       });
-      await until(state => native(state)?.paused === true);
-      if (scenario !== "body-delay") {
+      await until(state => scenario === "body-delay" ? native(state)?.keys.length === 0 : native(state)?.paused === true);
+      if (!["body-delay", "body-presence-loss"].includes(scenario)) {
         const expected = scenario === "state-reject" ? "state-request-failed" : scenario === "body-denied" ? "body-request-rejected" : "body-request-failed";
         assert.ok(browserPauses.some(event => event.reason === expected), "browser must retain its request-loss cause");
       }
       // Stop intercepting new heartbeats before awaiting recovery. Waiting for
       // every route while those heartbeats continue can deadlock the test.
       await page.unrouteAll({behavior:"ignoreErrors"});
+      if (scenario === "body-delay") {
+        await page.waitForTimeout(500);
+        assert.equal(native(await read()).paused, false, "450 ms delivery gap clears body, not session presence");
+        assert.deepEqual(native(await read()).keys, [], "a delayed held request cannot replay movement");
+      }
       await page.keyboard.up("w");
       await page.waitForTimeout(500);
       assert.equal(native(await read()).keys.length, 0);
-      await resume();
+      if (scenario !== "body-delay") await resume();
       assert.deepEqual(native(await read()).keys, []);
+      if (scenario === "body-delay") {
+        await page.keyboard.down("w");
+        await until(state => native(state)?.keys.includes("w"));
+        await page.keyboard.up("w");
+        await until(state => native(state)?.keys.length === 0);
+      }
     } else if (scenario === "state-delay") {
       await page.route("**/api/state", async route => {
         await new Promise(resolve => setTimeout(resolve, 450));

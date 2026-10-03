@@ -1,10 +1,11 @@
 "use strict";
 
-// Browser input is a short lease, never a motor owner. The native Windows
+// Browser presence is separate from the 250 ms body command, never a motor owner. The native Windows
 // client alone reads physical leaders and forwards actions to the Pi.
 class AM1BrowserInput {
-  constructor(send) {
+  constructor(send, now = () => performance.now()) {
     this.send = send;
+    this.now = now;
     this.sessionId = null;
     this.token = null;
     this.epoch = 0;
@@ -12,6 +13,8 @@ class AM1BrowserInput {
     this.route = "control";
     this.live = false;
     this.held = new Set();
+    this.blocked = new Set();
+    this.lastSubmittedAt = null;
     this.releaseReason = null;
     this.firstRelease = null;
     this.pendingApproval = null;
@@ -32,18 +35,25 @@ class AM1BrowserInput {
     const tag = (target?.tagName || "").toUpperCase();
     return ["INPUT", "TEXTAREA", "SELECT"].includes(tag) || target?.isContentEditable === true;
   }
-  keyDown(key, target) {
-    if (!this.pendingApproval && this.route === "control" && this.live && !this._typing(target) && this._validKey(key)) {
+  keyDown(key, target, repeat = false) {
+    if (!repeat && !this.blocked.has(key) && !this.pendingApproval && this.route === "control" && this.live && !this._typing(target) && this._validKey(key)) {
       this.held.add(key);
       return true;
     }
     return false;
   }
-  keyUp(key) { this.held.delete(key); }
+  keyUp(key) { this.held.delete(key); this.blocked.delete(key); }
   pointerDown(key) {
-    if (!this.pendingApproval && this.route === "control" && this.live && this._validKey(key)) this.held.add(key);
+    if (!this.blocked.has(key) && !this.pendingApproval && this.route === "control" && this.live && this._validKey(key)) this.held.add(key);
   }
-  pointerUp(key) { this.held.delete(key); }
+  pointerUp(key) { this.held.delete(key); this.blocked.delete(key); }
+  expireBody() {
+    const changed = this.held.size > 0;
+    for (const key of this.held) this.blocked.add(key);
+    this.held.clear();
+    if (changed) this.onBodyExpired?.();
+    return changed;
+  }
   tick() {
     if (this.pendingApproval) return; // Do not supersede the explicit empty lease in flight.
     return this.sendCurrent();
@@ -51,6 +61,9 @@ class AM1BrowserInput {
   sendCurrent() {
     if (!this.sessionId || !this.token) return;
     const active = this.live && this.route === "control";
+    const now = this.now();
+    if (active && this.lastSubmittedAt !== null && now - this.lastSubmittedAt >= 250) this.expireBody();
+    this.lastSubmittedAt = now; // Local submission only; never renews server/native freshness.
     return this.send({session_id:this.sessionId, control_token:this.token, epoch:this.epoch,
                       seq:++this.seq, keys:active ? this.keys() : [], active,
                       ...(active || !this.releaseReason ? {} : {release_reason:this.releaseReason,
@@ -67,6 +80,7 @@ class AM1BrowserInput {
     }
     this.releaseReason = reason;
     this.held.clear();
+    this.lastSubmittedAt = null;
     this.live = false;
     if (send) this.tick();
   }
@@ -187,7 +201,7 @@ if (typeof document !== "undefined") {
       if (!result.accepted && current()) {
         input.release(true, "body-request-rejected");
         message("Input paused: body request rejected. Release controls; explicit Resume is required.");
-      }
+      } else if (result.body_release_required && current()) input.expireBody();
       return result;
     }).catch(() => {
       if (current()) {
@@ -197,6 +211,7 @@ if (typeof document !== "undefined") {
       return {accepted:false};
     });
   });
+  input.onBodyExpired = () => message("Body command expired: release controls, then press again. Arm presence is still monitored.");
   let state = null;
   let busy = false;
   let operationGeneration = 0;
@@ -505,7 +520,7 @@ if (typeof document !== "undefined") {
     if (event.key.toLowerCase() === "q" && input.route === "control" && !input._typing(event.target)) {
       event.preventDefault(); operation("Stop"); return;
     }
-    if (input.keyDown(event.key.toLowerCase(), event.target)) event.preventDefault();
+    if (input.keyDown(event.key.toLowerCase(), event.target, event.repeat)) event.preventDefault();
   });
   document.addEventListener("keyup", event => input.keyUp(event.key.toLowerCase()));
   document.addEventListener("visibilitychange", () => { if (document.hidden) input.hidden(); });

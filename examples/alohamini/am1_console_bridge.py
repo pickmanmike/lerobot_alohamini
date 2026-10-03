@@ -22,6 +22,7 @@ from typing import Any, Callable
 
 BODY_KEYS = frozenset({"w", "s", "z", "x", "a", "d", "u", "j", "t", "g"})
 INPUT_MAX_AGE_S = 0.25
+BROWSER_PRESENCE_MAX_AGE_S = 1.5
 MAX_PIPE_BYTES = 4096
 MAX_INPUT_INTEGER = 2**53 - 1  # Browser-safe integer; also bounds echoed diagnostic metadata.
 PREPARED_GATES = frozenset({"sync_start", "live_start"})
@@ -154,10 +155,23 @@ class AM1ConsoleInputState:
         self.pause_evidence: dict[str, Any] | None = None
         self.pause_sequence = 0
         self.browser_first_pause: dict[str, Any] | None = None
+        self.body_release_required = False
 
     def _fresh(self, now: float) -> bool:
         return (self.browser_active and self.last_browser_at is not None
                 and 0 <= now - self.last_browser_at < INPUT_MAX_AGE_S)
+
+    def _expire_input(self, now: float) -> None:
+        if not self.ever_active:
+            return
+        if not self._fresh(now):
+            self.keys = []
+            self.body_release_required = True
+            # An approval still requires its original fresh empty packet.
+            self.approved_gate = None
+        if (not self.browser_active or self.last_browser_at is None
+                or not 0 <= now - self.last_browser_at < BROWSER_PRESENCE_MAX_AGE_S):
+            self.request_pause("expired browser input", now=now)
 
     def browser_keys(self, *, token: str, epoch: int, seq: int, keys: list[str], active: bool, now: float,
                      release_reason: str | None = None, first_release: Any = None) -> bool:
@@ -171,12 +185,13 @@ class AM1ConsoleInputState:
             return False
         if not active and self.browser_first_pause is None:
             self.browser_first_pause = _browser_release(first_release, epoch, seq)
-        if self.ever_active and not self._fresh(now):
-            self.request_pause("expired browser input", now=now)
+        self._expire_input(now)  # Detect a gap before a new packet can renew receipt.
         self.last_browser_seq = seq
         self.last_browser_at = now
         self.browser_active = active
-        self.keys = sorted(set(keys)) if active else []
+        if active and not keys:
+            self.body_release_required = False
+        self.keys = sorted(set(keys)) if active and not self.body_release_required else []
         if active:
             self.ever_active = True
         elif self.ever_active:
@@ -185,13 +200,14 @@ class AM1ConsoleInputState:
         return True
 
     def lease(self, *, now: float) -> dict[str, Any]:
-        fresh = self._fresh(now)
-        if not fresh and self.ever_active:
-            self.request_pause("expired browser input", now=now)
-        valid = fresh and not self.forced_pause
+        self._expire_input(now)
+        valid = (self.browser_active and self.last_browser_at is not None
+                 and 0 <= now - self.last_browser_at < BROWSER_PRESENCE_MAX_AGE_S and not self.forced_pause)
         return {"valid": valid, "keys": list(self.keys) if valid else [], "epoch": self.epoch,
                 "pause_required": self.forced_pause, "pause_evidence": self.pause_evidence,
-                "browser_first_pause": self.browser_first_pause}
+                "browser_first_pause": self.browser_first_pause,
+                "browser_received_at_s": self.last_browser_at,
+                "body_release_required": self.body_release_required}
 
     def claim(self, token: str, *, now: float) -> int:
         if not token or not math.isfinite(now):
@@ -206,6 +222,7 @@ class AM1ConsoleInputState:
         self.pending_gate = None
         self.approved_gate = None
         self.browser_first_pause = None
+        self.body_release_required = True
         return self.epoch
 
     def request_pause(self, cause: str, *, now: float | None = None) -> None:
@@ -224,6 +241,7 @@ class AM1ConsoleInputState:
             if self.first_pause is None:
                 self.first_pause = dict(self.pause_evidence)
         self.keys = []
+        self.body_release_required = True
         self.forced_pause = True
         if self.approved_gate is not None and self.approved_gate[0] in PREPARED_GATES:
             self.approved_gate = None
@@ -240,6 +258,7 @@ class AM1ConsoleInputState:
         if (
             stage not in PREPARED_GATES | MANUAL_GATES or self.pending_gate != (stage, host_epoch)
             or not secrets.compare_digest(token, self.control_token) or not self._fresh(now)
+            or self.body_release_required
             or (stage in PREPARED_GATES and self.keys)
         ):
             return False
@@ -247,7 +266,7 @@ class AM1ConsoleInputState:
         return True
 
     def gate_ack(self, stage: str, *, host_epoch: int | None, now: float) -> bool:
-        if self.pending_gate != (stage, host_epoch) or not self._fresh(now):
+        if self.pending_gate != (stage, host_epoch) or not self._fresh(now) or self.body_release_required:
             return False
         if stage in PREPARED_GATES:
             if self.forced_pause and (self.approved_gate != (stage, host_epoch) or self.keys):
@@ -272,10 +291,12 @@ class AM1ConsoleBridgeClient:
         self._stop = threading.Event()
         self._outbound: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=8)
         self._telemetry_pending: dict[str, dict[str, Any]] = {}
-        self._gate_events: dict[tuple[str, int | None], threading.Event] = {}
+        self._gate_events: dict[tuple[str, int | None, int], threading.Event] = {}
         self._epoch = 0
         self._last_seq = 0
         self._received_at: float | None = None
+        self._browser_received_at: float | None = None
+        self._body_release_required = True
         self._keys: set[str] = set()
         self._lease_valid = False
         self._pause_latched = True
@@ -368,13 +389,30 @@ class AM1ConsoleBridgeClient:
                 self._pause_latched = True
                 self._body_enabled = False
                 self._needs_release = True
+                self._received_at = None
+                self._browser_received_at = None
+                self._lease_valid = False
+            elif kind == "lease" and self._received_at is not None:
+                # A delayed packet cannot erase either old deadline before the
+                # action consumer polls. Both processes use Windows monotonic time.
+                self._check_freshness_locked(received_at)
             self._last_seq = seq
             if kind == "lease":
                 keys = payload.get("keys")
-                valid = payload.get("valid") is True and isinstance(keys, list) and all(key in BODY_KEYS for key in keys)
+                browser_at = payload.get("browser_received_at_s")
+                release_required = payload.get("body_release_required")
+                valid = (payload.get("valid") is True and isinstance(keys, list) and len(keys) <= len(BODY_KEYS)
+                         and all(isinstance(key, str) and key in BODY_KEYS for key in keys)
+                         and type(browser_at) in (int, float) and 0 <= browser_at <= received_at
+                         and math.isfinite(browser_at)
+                         and 0 <= received_at - browser_at < BROWSER_PRESENCE_MAX_AGE_S
+                         and (self._browser_received_at is None or browser_at >= self._browser_received_at)
+                         and type(release_required) is bool)
                 self._lease_valid = valid
                 self._keys = set(keys) if valid and not self._pause_latched else set()
                 self._received_at = received_at
+                self._browser_received_at = browser_at if valid else None
+                self._body_release_required = release_required if valid else True
                 if not valid:
                     self._pause_latched = True
                     self._body_enabled = False
@@ -406,12 +444,18 @@ class AM1ConsoleBridgeClient:
                                      "native_received_monotonic_s": received_at,
                                      "native_body_enabled": self._body_enabled,
                                      "native_pause_latched": self._pause_latched}
-                elif self._body_enabled and not keys:
+                elif (self._body_enabled and not keys and not release_required
+                      and 0 <= received_at - browser_at < INPUT_MAX_AGE_S):
                     self._needs_release = False
             elif kind == "gate_ack":
                 stage, host_epoch = payload.get("stage"), payload.get("host_epoch")
-                event = self._gate_events.get((stage, host_epoch))
-                if event is None:
+                event = self._gate_events.get((stage, host_epoch, epoch))
+                # Gate permission keeps its original 250 ms freshness contract,
+                # independently of the longer browser-presence allowance.
+                if (event is None or not self._lease_valid or self._body_release_required
+                        or self._received_at is None or self._browser_received_at is None
+                        or not 0 <= received_at - self._received_at < INPUT_MAX_AGE_S
+                        or not 0 <= received_at - self._browser_received_at < INPUT_MAX_AGE_S):
                     return False
                 if stage in PREPARED_GATES | {"resume"}:
                     self._pause_latched = False
@@ -434,27 +478,37 @@ class AM1ConsoleBridgeClient:
         with self._lock:
             self._telemetry_pending[event["event"]] = event
 
+    def _check_freshness_locked(self, at: float) -> None:
+        pipe_fresh = self._received_at is not None and 0 <= at - self._received_at < INPUT_MAX_AGE_S
+        presence_fresh = (self._browser_received_at is not None
+                          and 0 <= at - self._browser_received_at < BROWSER_PRESENCE_MAX_AGE_S)
+        if not self._lease_valid or not pipe_fresh or not presence_fresh:
+            if not self._pause_latched:
+                # Queue one bounded transition; no IO on the action consumer.
+                browser_loss = pipe_fresh and self._lease_valid and not presence_fresh
+                acquired = self._browser_received_at if browser_loss else self._received_at
+                self._telemetry_pending["am1_console_input_pause"] = {
+                    "event": "am1_console_input_pause", "source": "native",
+                    "reason": "expired browser input" if browser_loss else "native input expired",
+                    "wall_time_ns": time.time_ns(), "local_monotonic_s": at,
+                    "input_epoch": self._epoch, "input_sequence": self._last_seq,
+                    "input_age_ms": None if acquired is None else (at - acquired) * 1000,
+                    "age_basis": "accepted browser receipt" if browser_loss else "native lease receipt",
+                    "native_body_enabled": self._body_enabled,
+                }
+            self._keys.clear()
+            self._pause_latched = True
+            self._body_enabled = False
+            self._needs_release = True
+        elif (self._body_release_required or self._browser_received_at is None
+              or not 0 <= at - self._browser_received_at < INPUT_MAX_AGE_S):
+            self._keys.clear()
+            self._needs_release = True
+
     def body_keys(self, *, now: float | None = None) -> set[str]:
         at = self.clock() if now is None else now
         with self._lock:
-            if (not self._lease_valid or self._received_at is None
-                    or not 0 <= at - self._received_at < INPUT_MAX_AGE_S):
-                if not self._pause_latched:
-                    # Queue one bounded transition. Never print or perform IO
-                    # from the action consumer, and never manufacture freshness.
-                    self._telemetry_pending["am1_console_input_pause"] = {
-                        "event": "am1_console_input_pause", "source": "native",
-                        "reason": "native input expired", "wall_time_ns": time.time_ns(),
-                        "local_monotonic_s": at, "input_epoch": self._epoch,
-                        "input_sequence": self._last_seq,
-                        "input_age_ms": None if self._received_at is None else (at - self._received_at) * 1000,
-                        "age_basis": "native lease receipt", "native_body_enabled": self._body_enabled,
-                    }
-                self._keys.clear()
-                self._pause_latched = True
-                self._body_enabled = False
-                self._needs_release = True
-                return set()
+            self._check_freshness_locked(at)
             return set() if self._pause_latched or not self._body_enabled or self._needs_release else set(self._keys)
 
     def note_live_admitted(self, *, host_epoch: int | None = None) -> None:
@@ -484,12 +538,12 @@ class AM1ConsoleBridgeClient:
         if stage not in PREPARED_GATES | MANUAL_GATES:
             raise ValueError("unknown console gate")
         event = threading.Event()
-        key = (stage, host_epoch)
         with self._lock:
+            epoch = self._epoch
+            key = (stage, host_epoch, epoch)
             if key in self._gate_events:
                 raise ValueError("console gate already pending")
             self._gate_events[key] = event
-            epoch = self._epoch
         result = "error"
         try:
             self._outbound.put_nowait({"session_id": self.session_id, "epoch": epoch, "seq": 0,
@@ -501,9 +555,14 @@ class AM1ConsoleBridgeClient:
                 if cancel is not None and cancel():
                     result = "cancelled"
                     return False
-                if event.wait(0.05):
-                    result = "acknowledged"
-                    return True
+                acknowledged = event.wait(0.05)
+                with self._lock:
+                    if self._epoch != epoch:
+                        result = "owner_changed"
+                        return False
+                    if acknowledged:
+                        result = "acknowledged"
+                        return True
                 if not self.is_connected:
                     result = "disconnected"
                     return False
@@ -583,15 +642,18 @@ class AM1ConsoleBridgeServer:
         self._thread = threading.Thread(target=self._io, name="am1-console-pipe-owner", daemon=True)
         self._thread.start()
 
-    def _send(self, kind: str, payload: dict[str, Any]) -> None:
+    def _send(self, kind: str, payload: dict[str, Any], *, input_epoch: int | None = None) -> bool:
         if self.connection is None:
-            return
+            return False
         with self.lock:
+            if input_epoch is not None and input_epoch != self.state.epoch:
+                return False  # Never label a captured old owner's data as its replacement.
             self._send_seq += 1
-            epoch = self.state.epoch
+            epoch = self.state.epoch if input_epoch is None else input_epoch
             sequence = self._send_seq
         self.connection.send_bytes(_encode({"session_id": self.session_id, "epoch": epoch, "seq": sequence,
                                             "kind": kind, "payload": payload}))
+        return True
 
     def _io(self) -> None:
         try:
@@ -643,11 +705,13 @@ class AM1ConsoleBridgeServer:
                     else:
                         ack = None
                     lease = self.state.lease(now=self.clock())
-                if ack is not None:
-                    self._send("gate_ack", ack)
+                    input_epoch = self.state.epoch
+                # Install real receipt metadata before acknowledging permission;
+                # never open a gate against the previous invalid paused lease.
+                self._send("lease", lease, input_epoch=input_epoch)
+                if ack is not None and self._send("gate_ack", ack, input_epoch=input_epoch):
                     with self.lock:
-                        self._gate_ack_evidence = {**ack, "wall_time_ns": time.time_ns()}
-                self._send("lease", lease)
+                        self._gate_ack_evidence = {**ack, "input_epoch": input_epoch, "wall_time_ns": time.time_ns()}
         except (EOFError, OSError, ValueError):
             pass
         finally:
@@ -687,6 +751,7 @@ class AM1ConsoleBridgeServer:
         with self.lock:
             lease = self.state.lease(now=self.clock())
             return {"input_epoch": self.state.epoch, "input_lease": lease["valid"],
+                    "body_release_required": lease["body_release_required"],
                     "pending_gate": self.state.pending_gate, "pause_required": lease["pause_required"],
                     "first_input_pause": self.state.first_pause, "input_pause": self.state.pause_evidence,
                     "browser_first_pause": self.state.browser_first_pause,

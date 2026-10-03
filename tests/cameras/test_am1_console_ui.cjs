@@ -5,7 +5,7 @@ const fs = require("node:fs"), path = require("node:path"), vm = require("node:v
 
 function loadInput() {
   const source = path.resolve(__dirname, "../../tools/am1_console_ui/app.js");
-  const context = vm.createContext({setInterval: () => 1, clearInterval: () => {},
+  const context = vm.createContext({performance:{now:()=>0}, setInterval: () => 1, clearInterval: () => {},
                                     setTimeout: () => 1, clearTimeout: () => {}});
   vm.runInContext(fs.readFileSync(source, "utf8"), context);
   return context.AM1BrowserInput;
@@ -48,6 +48,35 @@ test("control keys ignore typing and route changes release the body", () => {
   input.keyDown("u", {tagName: "BODY"});
   input.tick();
   assert.deepEqual(Array.from(input.keys()), []);
+});
+
+test("a short callback gap clears held body input without a full pause or replay", () => {
+  const Input = loadInput(), sent = [];
+  let now = 0;
+  const input = new Input(payload => sent.push(payload), () => now);
+  input.attach("session-1", "test-only", 1);
+  input.setLive(true);
+  input.keyDown("w", {tagName:"BODY"});
+  input.pointerDown("u");
+  input.tick();
+  now = 249;
+  input.tick();
+  assert.equal(sent.at(-1).keys.join(""), "uw");
+  now = 1189; // Measured class of short foreground scheduling gap, not presence loss.
+  input.tick();
+  assert.deepEqual(Array.from(sent.at(-1).keys), [], "expired held movement must not be renewed");
+  assert.equal(sent.at(-1).active, true, "browser presence is separate from body expiry");
+  assert.equal(input.live, true);
+  input.keyDown("w", {tagName:"BODY"}, true); // OS auto-repeat is not a new press.
+  input.pointerDown("u"); // Still held, not released.
+  input.tick();
+  assert.deepEqual(Array.from(sent.at(-1).keys), []);
+  input.keyUp("w");
+  input.pointerUp("u");
+  input.keyDown("w", {tagName:"BODY"}, false);
+  input.pointerDown("u");
+  input.tick();
+  assert.equal(sent.at(-1).keys.join(""), "uw", "deliberate release and new press may reacquire");
 });
 
 test("blur and visibility loss clear held pointer and key input without auto-resume", () => {
@@ -291,7 +320,7 @@ test("Stop cancels a pending approval and releases busy ownership for later Star
     return nodes.get(key);
   }, querySelectorAll:()=>[], createElement:element, addEventListener(){}};
   let pendingBody, pendingStart, hold = false, phase = "host_ready";
-  const context = vm.createContext({document, console, location:{hash:""},
+  const context = vm.createContext({document, console, performance:{now:()=>0}, location:{hash:""},
     sessionStorage:{getItem:()=>null,setItem(){}}, window:{addEventListener(){}}, setInterval:()=>0,
     fetch:(url, options={}) => {
       const payload = options.body ? JSON.parse(options.body) : null;
@@ -338,7 +367,7 @@ function loadApp(fetchHook) {
   addEventListener:(type, listener) => documentListeners.set(type, listener)};
   let state = {session_id:"old-session", phase:"host_ready", input_epoch:1,
     pending_gate:["resume",1], events:[], telemetry:{}};
-  const context = vm.createContext({document, console:{info(){}}, location:{hash:""},
+  const context = vm.createContext({document, console:{info(){}}, performance:{now:()=>0}, location:{hash:""},
     sessionStorage:{getItem:()=>null,setItem(){}},
     window:{addEventListener:(type, listener) => windowListeners.set(type, listener)}, setInterval:()=>0,
     fetch:(url, options={}) => {
@@ -354,6 +383,63 @@ function loadApp(fetchHook) {
   vm.runInContext(source, context);
   return {context, sent, nodes, windowListeners, documentListeners, setState:value => { state = value; }};
 }
+
+test("server body expiry clears only movement and requires release before reacquisition", async () => {
+  const app = loadApp((url, payload) => url === "/api/body" && payload.keys.length ?
+    Promise.resolve({ok:true,json:async()=>({accepted:true,body_release_required:true})}) : null);
+  await new Promise(resolve => setImmediate(resolve));
+  const input = app.context.testInput;
+  input.attach("old-session", "test-only", 1);
+  input.setLive(true);
+  input.keyDown("w", {tagName:"BODY"});
+  await input.tick();
+  assert.deepEqual(Array.from(input.keys()), []);
+  assert.equal(input.live, true, "accepted presence must not become a full Pause");
+  input.keyDown("w", {tagName:"BODY"}, true);
+  await input.tick();
+  assert.deepEqual(app.sent.at(-1).payload.keys, []);
+  assert.match(app.nodes.get("#control-notice").textContent, /release.*press/i);
+  input.keyUp("w");
+  assert.equal(input.keyDown("w", {tagName:"BODY"}, false), true);
+});
+
+test("local callback body expiry has a bounded nonterminal notice", async () => {
+  const app = loadApp();
+  await new Promise(resolve => setImmediate(resolve));
+  const input = app.context.testInput;
+  let now = 0;
+  input.now = () => now;
+  input.attach("old-session", "test-only", 1);
+  input.setLive(true);
+  input.keyDown("w", {tagName:"BODY"});
+  await input.tick();
+  now = 940;
+  await input.tick();
+  assert.match(app.nodes.get("#control-notice").textContent, /expired.*release.*press/i);
+  assert.equal(input.live, true);
+  assert.deepEqual(app.sent.at(-1).payload.keys, []);
+});
+
+test("a late old body-expiry response cannot clear a replacement owner's movement", async () => {
+  let finish, hold = false;
+  const app = loadApp((url, payload) => url === "/api/body" && hold && payload.active &&
+    payload.session_id === "old-session" ? new Promise(resolve => { finish = resolve; }) : null);
+  await new Promise(resolve => setImmediate(resolve));
+  const input = app.context.testInput;
+  input.attach("old-session", "test-only", 1);
+  input.setLive(true);
+  hold = true;
+  input.keyDown("w", {tagName:"BODY"});
+  const old = input.tick();
+  input.attach("new-session", "new-test-only", 1);
+  input.setLive(true);
+  input.keyDown("u", {tagName:"BODY"});
+  await input.tick();
+  finish({ok:true,json:async()=>({accepted:true,body_release_required:true})});
+  await old;
+  assert.deepEqual(Array.from(input.keys()), ["u"]);
+  assert.equal(input.live, true);
+});
 
 test("verified operator cancellation is labeled stopped with only historical host feedback", async () => {
   const app = loadApp();

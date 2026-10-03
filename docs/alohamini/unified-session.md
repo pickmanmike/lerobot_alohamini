@@ -29,9 +29,12 @@ Start on the Control page prepares one ordinary physical-leader Local session.
 The existing Pi owner performs actual camera readiness, one home and approximately
 10 mm relief, nominal 30-second startup alignment, and 10 Hz live forwarding.
 The browser never reads leaders or owns a motor socket. During live use, hold
-W/S/Z/X/A/D for base and U/J for lift; release zeros body input. Leaving Control,
-losing focus or a stale browser lease clears body input and requests measured-arm
-pause. Resume and any exceptional realignment require explicit on-page approval
+W/S/Z/X/A/D for base and U/J for lift; release zeros body input. Body commands
+expire after 250 ms of accepted-browser silence, independently of the approved
+1.5-second browser-presence allowance. A short gap clears held movement: release
+the controls, then deliberately press again; it does not by itself pause the arms.
+Leaving Control, losing focus, failed input/state requests or lost presence still
+clear body input and request measured-arm pause. Resume and exceptional realignment require explicit on-page approval
 and fresh host/follower/leader qualification. Q on Control or Stop from any page
 requests the existing exact-session cleanup. Do not treat a returned Stop request
 as verified shutdown: wait for the final session result. The exact result folder
@@ -197,9 +200,58 @@ opt-in (`AM1_TIMING_FOREGROUND=1` for the existing desktop Playwright runner,
 real camera content or hardware configuration and require no installation.
 Capture a first unexpected expiry honestly; do not rescue it into a nominal
 pass. Raw timing artifacts stay ignored and outside published evidence. No
-runtime limit, browser-presence policy or deployed source pin changed as a
-result of this investigation. Any separation of session presence from the
-unchanged 250 ms movement expiry requires explicit review/approval first.
+runtime limit, browser-presence policy or deployed source pin changed in that
+test-only investigation. The separately approved policy follow-up is below;
+the earlier timing evidence and failed attempts remain historical evidence.
+
+### Approved input-presence follow-up (offline verified, physical check pending)
+
+The owner subsequently approved separating session presence from body movement:
+actual accepted browser receipt permits presence for at most 1.5 seconds, while
+body movement, native-pipe delivery and gate permission retain 250 ms deadlines.
+This explicitly changes the undelivered browser-loss-to-arm-hold allowance from
+250 ms to 1.5 seconds. Delivered blur/hidden/navigation/Pause and request failures
+still request full pause immediately; full pause remains latched until explicit
+current-gate approval and qualified host admission. No server-generated heartbeat
+or pipe forwarding renews the original browser receipt.
+
+Short callback/request gaps clear keyboard and pointer movement and show a bounded
+nonterminal notice. A held key, autorepeat or pointer cannot replay after expiry;
+release and a new press are required. Gates keep their actual fresh receipt and
+owner/host epoch. A captured old lease/ack cannot be relabeled with a replacement
+owner; ownership change cancels the old gate waiter. Fresh receipt metadata is
+installed before acknowledgement, and malformed metadata fails closed without
+hiding the first pause or turning a refused session into operator-stop success.
+Normal prepared startup still auto-advances with fresh input and retains its
+post-host-admission body-release requirement; no new startup choreography is added.
+
+Red-green checks reproduced the old short-gap full pause, held-input replay,
+expired gate metadata and owner-transfer permission, plus a Resume handoff that
+could immediately re-latch. They assert real outgoing input, body zero and explicit
+recovery through the frontend/HTTP/Windows pipe, not only a passing return value.
+The full-page foreground nominal exercise remains separate from deliberate
+input-loss tests and cannot use rescue approvals to conceal unexpected starvation.
+All robot IO and imagery in these checks are synthetic. This follow-up affects
+only helper/client input behavior; deployed motor `43d1622a` and camera `9b1f0670`
+remain unchanged. It does not establish the 822 ms task's initiator, hidden-rendering
+or connection-pool causation, nor physical manual-control acceptance.
+
+Final affected verification: 151 Python checks passed (two opt-in foreground modes
+deselected), and 29 Node UI checks passed. The separate visible Edge nominal
+exercise completed 65.78 seconds without unexpected expiry or rescue approval:
+synthetic W/U/J and release, deliberate Pause/current Resume, Stop/cleanup and a
+fresh Start; full camera/telemetry UI stayed enabled. HTTP-arrival spacing peaked
+at 125 ms, browser submission spacing at 115.1 ms, and measured snapshot work at
+7.7 ms. The alternate in-app capture mode was skipped, not retested. An earlier
+combined run had four overlong Windows test-log-path failures; the short fresh
+temporary-path rerun passed without changing production code. Compilation,
+module help, fresh lazy imports, JavaScript/PowerShell syntax, diff checks and
+independent read-only review also passed. Prior historical tests are not relabeled.
+
+After staging, the remaining attended Control check is both leaders, page wheel
+and lift hold/release, deliberate Pause/current Resume, then page Stop with actual
+cleanup. Stay on Control and handle its current Resume/Stop gate before analysis.
+Do not repeat an unchanged powered session just to seek a pass.
 
 The Servos page distinguishes the physical leader and Pi follower identities.
 It displays normalized position and the action actually sent; per-servo current,

@@ -461,7 +461,9 @@ class ConsoleSessionAdapter:
         accepted = bridge.browser_keys(token=token, epoch=payload.get("epoch"), seq=payload.get("seq"),
                                        keys=payload.get("keys"), active=payload.get("active"),
                                        **{key:payload[key] for key in ("release_reason", "first_release") if key in payload})
-        return {"accepted": accepted, "input_epoch": bridge.snapshot()["input_epoch"]}
+        snapshot = bridge.snapshot()
+        return {"accepted": accepted, "input_epoch": snapshot["input_epoch"],
+                "body_release_required": snapshot["body_release_required"]}
 
 
 MAX_POST_BYTES = 4096

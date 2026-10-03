@@ -185,6 +185,7 @@ class FakeCamera(BaseHTTPRequestHandler):
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Actual AF_PIPE is Windows-only")
 @pytest.mark.parametrize("case", ["healthy", "navigation", "blur", "hidden", "body-delay",
+                                      "body-presence-loss", "short-browser-stall",
                                       "body-reject", "body-denied", "state-reject", "state-delay", "pending-stop", "camera-delay", "approval-order"])
 def test_browser_loopback_native_path(tmp_path, case):
     node = shutil.which("node")
@@ -403,7 +404,7 @@ def test_foreground_full_page_input_timing(tmp_path, monkeypatch, browser_mode):
         return result
     monkeypatch.setattr(AM1ConsoleBridgeClient, "accept_message", accept)
     real_send = AM1ConsoleBridgeServer._send
-    def send(owner, kind, payload):
+    def send(owner, kind, payload, **kwargs):
         if kind == "lease":
             with owner.lock:
                 seq, pipe_seq = owner.state.last_browser_seq, owner._send_seq + 1
@@ -412,7 +413,7 @@ def test_foreground_full_page_input_timing(tmp_path, monkeypatch, browser_mode):
             trace.add("pipe_send", session_id=owner.session_id, browser_seq_at_send=seq, pipe_seq=pipe_seq,
                       pause_browser_seq=(payload.get("pause_evidence") or {}).get("input_sequence"),
                       valid=payload.get("valid"))
-        return real_send(owner, kind, payload)
+        return real_send(owner, kind, payload, **kwargs)
     monkeypatch.setattr(AM1ConsoleBridgeServer, "_send", send)
     real_emit = adapter._emit
     def emit(event):

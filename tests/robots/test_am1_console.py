@@ -859,6 +859,7 @@ def test_console_body_has_one_token_epoch_and_sequence(monkeypatch, tmp_path):
     session_id = "20261001T000000-1234abcd"
     finish = threading.Event()
     created = []
+    clock = [1.0]
 
     class FakeBridge:
         pipe_name = r"\\.\pipe\fake-am1"
@@ -871,11 +872,12 @@ def test_console_body_has_one_token_epoch_and_sequence(monkeypatch, tmp_path):
             created.append(self)
 
         def browser_keys(self, *, token, epoch, seq, keys, active):
-            return self.state.browser_keys(token=token, epoch=epoch, seq=seq, keys=keys, active=active, now=1.0)
+            return self.state.browser_keys(token=token, epoch=epoch, seq=seq, keys=keys, active=active, now=clock[0])
 
         def snapshot(self):
-            return {"input_epoch": self.state.epoch, "input_lease": self.state.lease(now=1.0)["valid"],
-                    "pending_gate": self.state.pending_gate}
+            return {"input_epoch": self.state.epoch, "input_lease": self.state.lease(now=clock[0])["valid"],
+                    "pending_gate": self.state.pending_gate,
+                    "body_release_required": self.state.body_release_required}
 
         def close(self):
             self.closed = True
@@ -901,6 +903,17 @@ def test_console_body_has_one_token_epoch_and_sequence(monkeypatch, tmp_path):
         assert not adapter.body_input({"session_id": session_id, "control_token": token, "epoch": 1,
                                        "seq": 1, "keys": ["u"], "active": True})["accepted"]
         assert adapter.state()["input_lease"] is True
+        clock[0] = 1.94
+        result = adapter.body_input({"session_id": session_id, "control_token": token, "epoch": 1,
+                                     "seq": 2, "keys": ["w"], "active": True})
+        assert result["accepted"] is True
+        assert result["body_release_required"] is True
+        assert created[0].state.keys == []
+        assert not created[0].state.forced_pause
+        clock[0] = 1.95
+        result = adapter.body_input({"session_id": session_id, "control_token": token, "epoch": 1,
+                                     "seq": 3, "keys": [], "active": True})
+        assert result["body_release_required"] is False
     finally:
         finish.set()
         adapter.wait(3)
@@ -933,7 +946,8 @@ def test_console_resume_approves_exact_pending_startup_gate(monkeypatch, tmp_pat
 
         def snapshot(self):
             return {"input_epoch": self.state.epoch, "input_lease": self.state.lease(now=1.1)["valid"],
-                    "pending_gate": self.state.pending_gate}
+                    "pending_gate": self.state.pending_gate,
+                    "body_release_required": self.state.body_release_required}
 
         def close(self): pass
 
@@ -958,6 +972,8 @@ def test_console_resume_approves_exact_pending_startup_gate(monkeypatch, tmp_pat
         assert created[0].state.gate_ack(stage, host_epoch=None, now=1.11)
         created[0].state.request_pause("operator")
         created[0].state.request_gate("resume", host_epoch=3)
+        adapter.body_input({"session_id": session_id, "control_token": token, "epoch": 1,
+                            "seq": 2, "keys": [], "active": True})
         assert not adapter.operation({"kind": "Resume", "session_id": session_id, "control_token": token,
                                       "gate_stage": stage, "host_epoch": 3})["accepted"]
         assert adapter.operation({"kind": "Resume", "session_id": session_id, "control_token": token,
