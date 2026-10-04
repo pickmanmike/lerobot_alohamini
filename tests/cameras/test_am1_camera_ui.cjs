@@ -8,6 +8,51 @@ function load(name = "AM1FrameState") {
   const context = {}; vm.runInNewContext(fs.readFileSync(source, "utf8"), context);
   return context[name];
 }
+test("test_role_cache_survives_disconnect_and_switch", () => {
+  const revoked = [], Cache = load("AM1RetainedFrames"), cache = new Cache(url => revoked.push(url));
+  cache.setGeneration("forward", 1);
+  assert.equal(cache.accept("forward", 1, 8, "blob:forward", 20, 1000), true);
+  cache.setGeneration("chest", 1);
+  assert.equal(cache.accept("chest", 1, 3, "blob:chest", 10, 1100), true);
+  assert.equal(cache.get("forward", 1200).url, "blob:forward");
+  assert.equal(cache.get("forward", 1700).state, "stale");
+  assert.equal(cache.get("forward", 1700).age_ms, 720);
+  assert.deepEqual(revoked, [], "Switching or disconnection must not release the last image");
+});
+test("test_generation_discards_old_inflight_reply", () => {
+  const revoked = [], Cache = load("AM1RetainedFrames"), cache = new Cache(url => revoked.push(url));
+  cache.setGeneration("wrist_left", 4);
+  assert.equal(cache.accept("wrist_left", 4, 90, "blob:old", 0, 1000), true);
+  cache.setGeneration("wrist_left", 5);
+  assert.equal(cache.accept("wrist_left", 4, 91, "blob:late", 0, 1100), false);
+  assert.equal(cache.accept("wrist_left", 5, 1, "blob:new", 0, 1200), true);
+  assert.equal(cache.get("wrist_left", 1250).url, "blob:new");
+  assert.deepEqual(revoked, ["blob:late", "blob:old"]);
+});
+test("test_status_does_not_renew_frame_age", () => {
+  const Cache = load("AM1RetainedFrames"), cache = new Cache(() => {});
+  cache.setGeneration("forward", 1);
+  cache.accept("forward", 1, 1, "blob:one", 40, 1000);
+  assert.equal(cache.get("forward", 1300).age_ms, 340);
+  // A later status poll has no method by which it can change the frame clock.
+  assert.equal(cache.get("forward", 1600).age_ms, 640);
+  assert.equal(cache.get("forward", 1600).state, "stale");
+});
+test("test_object_urls_stay_bounded", () => {
+  const revoked = [], Cache = load("AM1RetainedFrames"), cache = new Cache(url => revoked.push(url));
+  const roles = ["forward", "backward", "chest", "wrist_left", "wrist_right"];
+  for (const role of roles) {
+    cache.setGeneration(role, 1);
+    for (let seq = 1; seq <= 4; seq++) cache.accept(role, 1, seq, `blob:${role}:${seq}`, 0, seq);
+  }
+  assert.equal(revoked.length, 15, "Each replacement must release its predecessor");
+  assert.equal(roles.filter(role => cache.get(role, 5)?.url).length, 5);
+  cache.setGeneration("unexpected_sixth", 1);
+  assert.equal(cache.accept("unexpected_sixth", 1, 1, "blob:sixth", 0, 5), false);
+  assert.equal(revoked.length, 16, "A sixth retained source must be rejected and released");
+  for (const role of roles) cache.release(role);
+  assert.equal(revoked.length, 21, "No object URL remains after release");
+});
 test("producer freshness never advances merely because a status request succeeded", () => {
   const state = load("AM1SourceState"), frame = {state: "fresh", age_ms: 10, fps: 15, sequence: 2};
   assert.equal(state(frame, 1000, 1200).state, "fresh");
@@ -52,8 +97,9 @@ test("browser multipart consumer handles fragmented headers and exact native pay
 function pageFixture(decodeWorks = true, delayedStatus = false, identify = false, options = {}) {
   const decodes = [];
   class Element {
-    constructor() { this.parts = new Map(); this.children = []; this.flags = new Set(); this.dataset = {};
+    constructor(tagName = "DIV") { this.tagName = tagName.toUpperCase(); this.parts = new Map(); this.children = []; this.flags = new Set(); this.dataset = {}; this.attributes = new Map();
       this.classList = {toggle: (key, enabled) => enabled ? this.flags.add(key) : this.flags.delete(key)}; }
+    setAttribute(name, value) { this.attributes.set(name, String(value)); }
     querySelector(key) { if (!this.parts.has(key)) this.parts.set(key, new Element()); return this.parts.get(key); }
     append(value) { this.children.push(value); }
     addEventListener(name, fn) { this[name] = fn; }
@@ -63,22 +109,25 @@ function pageFixture(decodeWorks = true, delayedStatus = false, identify = false
       return decodeWorks ? Promise.resolve() : Promise.reject(Error("bad JPEG"));
     }
   }
-  const roots = new Element(), streams = [], timers = [], statusRequests = [];
+  const roots = new Element(), streams = [], timers = [], statusRequests = [], requests = [], urls = {created:[],revoked:[]};
+  roots.querySelector("#am1-camera-root").dataset.cameraBase = options.cameraBase ?? "/";
   let now = 1000, sequence = 1;
   const cameras = () => ({forward: {configured:true,state:'fresh',age_ms:10,fps:15,sequence},
                          chest: {configured:true,state:'fresh',age_ms:10,fps:15,sequence}});
   const context = vm.createContext({TextDecoder, Uint8Array, Blob, AbortController, AbortSignal,
     performance: {now: () => now}, Image: Element,
-    document: {body:{dataset:{identification:String(identify)}}, querySelector: key => roots.querySelector(key), createElement: () => new Element()},
-    URL: {createObjectURL: () => 'blob:test', revokeObjectURL: () => {}},
+    document: {body:{dataset:{identification:String(identify)}}, querySelector: key => roots.querySelector(key), createElement: tag => new Element(tag)},
+    URL: {createObjectURL: () => {const url = `blob:test-${urls.created.length + 1}`; urls.created.push(url); return url;},
+          revokeObjectURL: url => urls.revoked.push(url)},
     setTimeout: () => 1, setInterval: fn => {timers.push(fn); return timers.length;},
     fetch: async (url, options) => {
-      if (url === '/status.json') {
+      requests.push(url);
+      if (url === `${optionsBase}status.json`) {
         if (delayedStatus) return new Promise((resolve, reject) => statusRequests.push({
           reply: (data = cameras()) => resolve({ok:true,json:async () => ({cameras:data})}), reject}));
         return {ok:true,json:async () => ({cameras:cameras()})};
       }
-      if (url.startsWith('/api/stream.mjpeg')) {
+      if (url.startsWith(`${optionsBase}api/stream.mjpeg`)) {
         const item = {signal:options.signal}; streams.push(item);
         const response = {ok:true,body:new ReadableStream({start(controller) {
           item.controller = controller;
@@ -91,11 +140,13 @@ function pageFixture(decodeWorks = true, delayedStatus = false, identify = false
               blob:async () => new Blob([Buffer.from([255,216,1,2,255,217])],{type:'image/jpeg'})};
     }});
   const delayedStreamResponse = options.delayedStreamResponse;
+  const optionsBase = options.cameraBase ?? "/";
   for (const file of ['freshness.js','mjpeg.js','app.js']) {
     const filename = path.resolve(__dirname, '../../tools/am1_camera', file);
     if (fs.existsSync(filename)) vm.runInContext(fs.readFileSync(filename,'utf8'),context);
   }
-  return {context, roots, streams, timers, statusRequests, decodes, advance: (time, seq) => {now=time;sequence=seq;}};
+  return {context, roots, streams, timers, statusRequests, decodes, urls, requests,
+    advance: (time, seq) => {now=time;sequence=seq;}};
 }
 const flush = async () => { for(let i=0;i<10;i++) await new Promise(resolve => setImmediate(resolve)); };
 function multipart(sequence) {
@@ -106,6 +157,92 @@ function multipart(sequence) {
 function deliver(page, sequence) {
   page.streams.at(-1).controller.enqueue(multipart(sequence));
 }
+function tile(page, index) { return page.roots.querySelector("#thumbnails").children[index].children[0]; }
+test("decoded role image survives disconnect and promotion without crossing labels", async () => {
+  const page = pageFixture(); await flush(); deliver(page, 1); await flush();
+  const primary = page.roots.querySelector("#primary"), tiles = [0,1,2,3,4].map(index => tile(page,index));
+  const forwardUrl = primary.querySelector("img").src;
+  assert.ok(forwardUrl?.startsWith("blob:"));
+  page.advance(1050, 2); tiles[2].click(); await flush(); deliver(page, 2); await flush();
+  assert.notEqual(primary.querySelector("img").src, forwardUrl);
+  assert.equal(tiles[0].querySelector("img").src, forwardUrl);
+  page.advance(1700, 3); vm.runInContext('latest.cameras.forward.state = "stale"; render()', page.context);
+  assert.equal(tiles[0].querySelector("img").src, forwardUrl);
+  assert.match(tiles[0].querySelector("span").textContent, /last frame.*waiting/i);
+  tiles[0].click(); await flush();
+  assert.equal(primary.querySelector("img").src, forwardUrl);
+  assert.equal(primary.querySelector("strong").textContent, "Front");
+  vm.runInContext("stopPrimary()", page.context);
+});
+test("status sequence reset rejects a pending old-generation decode", async () => {
+  const page = pageFixture(true, false, false, {delayedDecode:true}); await flush();
+  deliver(page, 80); await flush(); page.decodes.shift()(); await flush();
+  const primary = page.roots.querySelector("#primary"), priorUrl = primary.querySelector("img").src;
+  deliver(page, 90); await flush();
+  page.advance(1050, 91); await vm.runInContext("statusLoop()", page.context); await flush();
+  page.advance(1100, 1); await vm.runInContext("statusLoop()", page.context); await flush();
+  assert.equal(page.streams[0].signal.aborted, true, "Reset must invalidate the old stream");
+  page.decodes.shift()(); await flush();
+  assert.equal(primary.querySelector("img").src, priorUrl, "Old in-flight decode cannot replace held frame");
+  deliver(page, 1); await flush(); page.decodes.shift()(); await flush();
+  assert.notEqual(primary.querySelector("img").src, priorUrl, "New generation may start at sequence one");
+  vm.runInContext("stopPrimary()", page.context);
+});
+test("test_anatomical_slots_and_focus", async () => {
+  const page = pageFixture(); await flush();
+  const slots = page.roots.querySelector("#thumbnails").children;
+  assert.deepEqual(slots.map(slot => slot.dataset.role),
+    ["forward", "backward", "chest", "wrist_left", "wrist_right"]);
+  assert.equal(page.roots.querySelector("#primary").dataset.role, "forward");
+  const original = slots.slice();
+  slots[4].children[0].click(); await flush();
+  assert.equal(page.roots.querySelector("#primary").dataset.role, "wrist_right");
+  assert.deepEqual(slots, original, "Promoting a role cannot reshuffle the anatomy");
+  assert.equal(slots[4].children[0].ariaPressed, "true");
+  assert.equal(slots[0].children[0].ariaPressed, "false");
+  assert.equal(slots[4].children[0].attributes.get("aria-pressed"), "true");
+  assert.equal(slots[0].children[0].attributes.get("aria-pressed"), "false");
+  vm.runInContext("stopPrimary()", page.context);
+});
+test("test_details_does_not_promote", async () => {
+  const page = pageFixture(); await flush();
+  const slot = page.roots.querySelector("#thumbnails").children[3];
+  const button = slot.children[0], details = slot.children[1];
+  assert.equal(details.tagName, "DETAILS");
+  assert.equal(button.children.includes(details), false, "Details must not nest inside a button");
+  details.open = true;
+  if (details.click) details.click(); await flush();
+  assert.equal(page.roots.querySelector("#primary").dataset.role, "forward");
+  assert.equal(slot.dataset.role, "wrist_left");
+  vm.runInContext("stopPrimary()", page.context);
+});
+test("test_camera_base_and_rotations", async () => {
+  const page = pageFixture(true, false, false, {cameraBase:"/camera/"}); await flush();
+  assert.ok(page.requests.includes("/camera/status.json"));
+  assert.ok(page.requests.some(url => url.startsWith("/camera/api/stream.mjpeg?src=forward")));
+  await vm.runInContext("snapshots()", page.context); await flush();
+  assert.ok(page.requests.some(url => url.startsWith("/camera/api/frame.jpeg?src=chest")));
+  vm.runInContext('latest.cameras.wrist_left = {configured:true,state:"fresh",age_ms:0,fps:15,sequence:1,rotation_degrees:90}; render()',page.context);
+  assert.equal(page.roots.querySelector("#thumbnails").children[3].children[0].querySelector("img").dataset.rotation,"90");
+  const html = fs.readFileSync(path.resolve(__dirname, "../../tools/am1_camera/index.html"), "utf8");
+  assert.match(html, /id="am1-camera-root"[^>]*data-camera-base="\/"/);
+  assert.match(html, /id="primary"[\s\S]*?<details[\s\S]*?<\/section>/, "Focus details remain below its frame");
+  const css = fs.readFileSync(path.resolve(__dirname, "../../tools/am1_camera/style.css"), "utf8");
+  assert.match(css, /data-identification="true"[^}]*grid-template-areas:\s*none/, "Numbered previews must not inherit semantic placement");
+  vm.runInContext("stopPrimary()", page.context);
+});
+test("held rotated frame keeps its role orientation when status is lost", async () => {
+  const page = pageFixture(true,true); await flush();
+  page.statusRequests[0].reply({forward:{configured:true,state:"fresh",age_ms:0,fps:15,sequence:1,rotation_degrees:180}});
+  await flush(); deliver(page,1); await flush();
+  const primary = page.roots.querySelector("#primary"), oldUrl = primary.querySelector("img").src;
+  const pending = vm.runInContext("statusLoop()",page.context); await flush();
+  page.statusRequests[1].reject(Error("status timeout")); await pending; await flush();
+  assert.equal(primary.querySelector("img").src, oldUrl);
+  assert.equal(primary.querySelector("img").dataset.rotation, "180");
+  assert.match(primary.querySelector("span").textContent, /last frame.*waiting/i);
+  vm.runInContext("stopPrimary()",page.context);
+});
 
 // Synthetic monotonic times, not measured camera or physical scene latency.
 for (const delayedResponse of [false, true]) {
@@ -131,7 +268,7 @@ test('fragmented header, delayed body and decode cannot renew displayed freshnes
   page.advance(1600,1); page.decodes[0](); await flush();
   page.advance(1899,2); vm.runInContext('render()',page.context);
   assert.equal(page.roots.querySelector('#primary').flags.has('fresh'),false,'Header/body/decode completion is not frame birth');
-  assert.equal(vm.runInContext('displayed.get("primary").at',page.context),1000);
+  assert.equal(vm.runInContext('retained.get("forward", performance.now()).at',page.context),1000);
   vm.runInContext('stopPrimary()',page.context);
 });
 
@@ -207,7 +344,7 @@ test("delayed status cannot cancel advancing decoded video or hide a fresh thumb
   page.advance(1500,8); vm.runInContext('render()',page.context);
   assert.equal(page.streams[0].signal.aborted,false,'Aged metadata is not a stalled stream');
   assert.equal(page.roots.querySelector('#primary').flags.has('fresh'),true);
-  assert.equal(page.roots.querySelector('#thumbnails').children[2].flags.has('fresh'),true);
+  assert.equal(tile(page,2).flags.has('fresh'),true);
   assert.match(page.roots.querySelector('#connection').textContent,/status.*(delayed|uncertain)/i);
   page.advance(1547,9); deliver(page,9); await flush();
   page.advance(1614,10); deliver(page,10); await flush();
@@ -270,7 +407,7 @@ test("repeated cached snapshot cannot renew thumbnail freshness", async () => {
   page.advance(2400,1); await vm.runInContext('statusLoop()',page.context); await flush();
   await vm.runInContext('snapshots()',page.context); await flush();
   page.advance(2600,1); await vm.runInContext('statusLoop()',page.context); await flush();
-  assert.equal(page.roots.querySelector('#thumbnails').children[2].flags.has('fresh'),false);
+  assert.equal(tile(page,2).flags.has('fresh'),false);
   vm.runInContext('stopPrimary()',page.context);
 });
 
@@ -296,7 +433,7 @@ test("an explicit disconnected source is hidden even if its last decoded image i
 
 test("role switching cancels the previous primary and waits for a newly decoded image", async () => {
   const page = pageFixture(); await flush(); deliver(page,1); await flush();
-  page.roots.querySelector('#thumbnails').children[2].click(); await flush();
+  tile(page,2).click(); await flush();
   assert.equal(page.streams[0].signal.aborted,true);
   assert.equal(page.roots.querySelector('#primary').flags.has('fresh'),false);
   page.advance(1100,2); deliver(page,2); await flush(); vm.runInContext('render()',page.context);
@@ -310,7 +447,7 @@ test("unmapped tiles do not pretend to be previews or disconnected mapped camera
   page.statusRequests[0].reply({backward:{configured:false,state:'unavailable',age_ms:null,sequence:0},
                               forward:{configured:true,state:'unavailable',age_ms:null,sequence:0}});
   await flush();
-  assert.match(page.roots.querySelector('#thumbnails').children[1].querySelector('.unavailable').textContent,/unassigned/i);
+  assert.match(tile(page,1).querySelector('.unavailable').textContent,/unassigned/i);
   assert.match(page.roots.querySelector('#primary').querySelector('.unavailable').textContent,/mapped/i);
 });
 
@@ -318,9 +455,9 @@ test("identification displays numbered live sources without assigning physical r
   const page = pageFixture(true,true,true); await flush();
   page.statusRequests[0].reply({preview_4:{configured:true,state:'fresh',age_ms:10,fps:15,sequence:4}});
   await flush();
-  const tile = page.roots.querySelector('#thumbnails').children[3];
-  assert.equal(tile.querySelector('strong').textContent,'Camera 4');
-  tile.click(); await flush(); deliver(page,4); await flush(); vm.runInContext('render()',page.context);
+  const preview = tile(page,3);
+  assert.equal(preview.querySelector('strong').textContent,'Camera 4');
+  preview.click(); await flush(); deliver(page,4); await flush(); vm.runInContext('render()',page.context);
   assert.equal(page.roots.querySelector('#primary').flags.has('fresh'),true);
   assert.equal(page.roots.querySelector('#primary').querySelector('strong').textContent,'Camera 4');
   assert.match(page.roots.querySelector('#view-heading').textContent,/identification/i);
@@ -334,7 +471,7 @@ test("role rotations follow both thumbnails and primary selection without rotati
                               wrist_right:{configured:true,state:'fresh',age_ms:10,fps:15,sequence:4,rotation_degrees:270}});
   await flush();
   const primary = page.roots.querySelector('#primary');
-  const tiles = page.roots.querySelector('#thumbnails').children;
+  const tiles = [0,1,2,3,4].map(index => tile(page,index));
   assert.equal(primary.querySelector('img').dataset.rotation,'180');
   assert.equal(tiles[3].querySelector('img').dataset.rotation,'90');
   assert.equal(tiles[4].querySelector('img').dataset.rotation,'270');
@@ -353,9 +490,9 @@ test("numbered preview rotation is display-only and absent rotation defaults to 
                               preview_3:{configured:true,state:'fresh',age_ms:10,fps:15,sequence:4,rotation_degrees:90}});
   await flush();
   assert.equal(page.roots.querySelector('#primary').querySelector('img').dataset.rotation,'0');
-  const tile = page.roots.querySelector('#thumbnails').children[2];
-  assert.equal(tile.querySelector('img').dataset.rotation,'90');
-  tile.click(); await flush(); deliver(page,4); await flush(); vm.runInContext('render()',page.context);
+  const preview = tile(page,2);
+  assert.equal(preview.querySelector('img').dataset.rotation,'90');
+  preview.click(); await flush(); deliver(page,4); await flush(); vm.runInContext('render()',page.context);
   assert.equal(page.roots.querySelector('#primary').flags.has('fresh'),true);
   assert.equal(page.roots.querySelector('#primary').querySelector('img').dataset.rotation,'90');
   vm.runInContext('stopPrimary()',page.context);
@@ -393,6 +530,6 @@ test("app never renews thumbnail freshness when JPEG decoding fails", async () =
   const page = pageFixture(false); await flush();
   await vm.runInContext('snapshots()',page.context); await flush();
   vm.runInContext('render()',page.context);
-  assert.equal(page.roots.querySelector('#thumbnails').children[2].flags.has('fresh'),false);
+  assert.equal(tile(page,2).flags.has('fresh'),false);
   if (vm.runInContext('typeof stopPrimary',page.context) === 'function') vm.runInContext('stopPrimary()',page.context);
 });

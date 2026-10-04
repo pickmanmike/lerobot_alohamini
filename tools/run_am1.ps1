@@ -9,6 +9,9 @@ param(
     [string]$MotionProfile,
     [string]$LogPath,
     [string]$StopRequestPath,
+    [string]$ConsolePipe,
+    [string]$ConsoleAuthFile,
+    [string]$ConsoleSessionId,
     [switch]$Preflight,
     [switch]$PrintCommand
 )
@@ -142,11 +145,25 @@ function New-Am1WindowsCommand {
         [string]$RightPort,
         [Nullable[int]]$LocalDurationSeconds,
         [string]$StopRequestPath,
+        [string]$ConsolePipe,
+        [string]$ConsoleAuthFile,
+        [string]$ConsoleSessionId,
         [ValidateSet('Physical', 'Scripted')][string]$LeaderSource = 'Physical',
         [string]$MotionProfile
     )
 
     Assert-Am1LeaderSource -Mode $Mode -LeaderSource $LeaderSource -MotionProfile $MotionProfile
+    $consoleValues = @(@($ConsolePipe, $ConsoleAuthFile, $ConsoleSessionId) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($consoleValues.Count -gt 0) {
+        if ($consoleValues.Count -ne 3 -or $Mode -ne 'Local' -or [string]::IsNullOrWhiteSpace($StopRequestPath)) {
+            throw 'Console input requires Local mode, a session stop path, pipe, auth file and exact session ID.'
+        }
+        if (-not $ConsolePipe.StartsWith('\\.\pipe\am1-', [System.StringComparison]::Ordinal) -or
+            -not [System.IO.Path]::IsPathRooted($ConsoleAuthFile) -or
+            $ConsoleSessionId -cnotmatch '^[0-9]{8}T[0-9]{6}-[0-9a-f]{8}$') {
+            throw 'Console pipe, private auth path or session identity is invalid.'
+        }
+    }
     Assert-Am1ValidatedEnvelope -Config $Config -Mode $Mode -LeaderSource $LeaderSource
     $pythonPath = Resolve-Am1ConfiguredPath -Value ([string]$Config.windows_python_path) `
         -RepositoryRoot $RepositoryRoot
@@ -254,6 +271,11 @@ function New-Am1WindowsCommand {
                 }
                 $arguments += @('--external_stop_file', [System.IO.Path]::GetFullPath($StopRequestPath))
                 $arguments += '--unified_session_enter_confirmations'
+                if ($consoleValues.Count -eq 3) {
+                    $arguments += @('--console_pipe', $ConsolePipe,
+                        '--console_auth_file', [System.IO.Path]::GetFullPath($ConsoleAuthFile),
+                        '--console_session_id', $ConsoleSessionId)
+                }
             }
         }
         else {
@@ -437,6 +459,9 @@ function Invoke-Am1Launch {
         [AllowNull()][object]$DurationSeconds,
         [string]$LogPath,
         [string]$StopRequestPath,
+        [string]$ConsolePipe,
+        [string]$ConsoleAuthFile,
+        [string]$ConsoleSessionId,
         [ValidateSet('Physical', 'Scripted')][string]$LeaderSource = 'Physical',
         [string]$MotionProfile,
         [switch]$Preflight,
@@ -474,7 +499,8 @@ function Invoke-Am1Launch {
     }
     $command = New-Am1WindowsCommand -Mode $Mode -Config $config -RepositoryRoot $repositoryRoot `
         -LeftPort $ports.left -RightPort $ports.right -LocalDurationSeconds $localDuration `
-        -StopRequestPath $StopRequestPath -LeaderSource $LeaderSource -MotionProfile $MotionProfile
+        -StopRequestPath $StopRequestPath -LeaderSource $LeaderSource -MotionProfile $MotionProfile `
+        -ConsolePipe $ConsolePipe -ConsoleAuthFile $ConsoleAuthFile -ConsoleSessionId $ConsoleSessionId
     $commandText = ConvertTo-Am1CommandText -Executable $command.executable -Arguments $command.arguments
 
     if ($PrintCommand) {
@@ -550,5 +576,6 @@ if ($MyInvocation.InvocationName -ne '.') {
     }
     Invoke-Am1Launch -Mode $Mode -ConfigPath $ConfigPath -DurationSeconds $DurationSeconds `
         -LogPath $LogPath -StopRequestPath $StopRequestPath -Preflight:$Preflight `
-        -PrintCommand:$PrintCommand -LeaderSource $LeaderSource -MotionProfile $MotionProfile
+        -PrintCommand:$PrintCommand -LeaderSource $LeaderSource -MotionProfile $MotionProfile `
+        -ConsolePipe $ConsolePipe -ConsoleAuthFile $ConsoleAuthFile -ConsoleSessionId $ConsoleSessionId
 }

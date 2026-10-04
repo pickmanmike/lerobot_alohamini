@@ -17,3 +17,38 @@ globalThis.AM1FrameState = function(frame, reportAt, now, displayed = null, thum
           status_uncertain: source.state !== "fresh",
           state: fresh ? "fresh" : source.sequence ? "stale" : "unavailable"};
 };
+// One decoded object URL per semantic role. A connection generation is advanced
+// before accepting a restarted source, so an old in-flight decode cannot win.
+globalThis.AM1RetainedFrames = class {
+  constructor(revoke = url => URL.revokeObjectURL(url)) {
+    this.frames = new Map();
+    this.generations = new Map();
+    this.revoke = revoke;
+  }
+  setGeneration(role, generation) {
+    if (!Number.isSafeInteger(generation) || generation < 0) throw new RangeError("Invalid camera generation");
+    if (generation > (this.generations.get(role) ?? -1)) this.generations.set(role, generation);
+  }
+  accept(role, generation, sequence, objectUrl, ageMsAtReceipt, receivedAt) {
+    const previous = this.frames.get(role);
+    const valid = (previous || this.frames.size < 5) && generation === this.generations.get(role) &&
+      Number.isSafeInteger(sequence) && sequence > 0 &&
+      (!previous || previous.generation !== generation || sequence > previous.sequence) &&
+      Number.isFinite(ageMsAtReceipt) && ageMsAtReceipt >= 0 &&
+      Number.isFinite(receivedAt) && typeof objectUrl === "string" && objectUrl.length > 0;
+    if (!valid) { if (objectUrl) this.revoke(objectUrl); return false; }
+    this.frames.set(role, {url:objectUrl, generation, sequence, age_at_receipt_ms:ageMsAtReceipt, at:receivedAt});
+    if (previous) this.revoke(previous.url);
+    return true;
+  }
+  get(role, now) {
+    const frame = this.frames.get(role);
+    if (!frame) return null;
+    const age_ms = frame.age_at_receipt_ms + Math.max(0, now - frame.at);
+    return {...frame, age_ms, state:age_ms < 500 ? "fresh" : "stale"};
+  }
+  release(role) {
+    const previous = this.frames.get(role);
+    if (previous) { this.revoke(previous.url); this.frames.delete(role); }
+  }
+};
