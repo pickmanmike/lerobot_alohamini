@@ -8,16 +8,84 @@ had a maximum browser display gap of `1.138 s`, above the unchanged `500 ms`
 continuity target. Loss of a required view still means release controls, press
 `Q`, and restart only after all owned processes have stopped.
 
-## Windows Control console candidate (not yet physically accepted)
+## Windows Control console — qualified ordinary-use closeout, October 4, 2026
+
+The owner accepts ordinary supervised Local use. The remaining original Control
+interactions are now accounted for across two distinct owner-operated sessions:
+
+| Evidence | Established result |
+| --- | --- |
+| 50.6-second live session | Owner-operated page Start, right physical leader, all page movement buttons, release-to-stop and page Stop; no recovery or live command-watchdog event. |
+| Separate 62.6-second live window | Left physical leader, deliberate page Pause, current-gate qualified manual Resume and normal Stop. The window includes a 9.813-second operator pause, not uninterrupted motion. |
+| Earlier 90.2-second no-input session | Startup, duration expiry and cleanup passed; this remains separate from physical-input acceptance. |
+
+Both owner-stopped sessions retain raw client/session cancellation **130**, with
+host/camera exits **0**, verified zero/torque-off/stopped cleanup and complete log
+collection. They are correctly classified **Stopped by operator**, not failed
+sessions or all-zero component exits. Sent commands alone are not physical
+observations. The historical failures below remain genuine failures.
+
+### Intentionally distinct working deployments
+
+| Component | Exact accepted source |
+| --- | --- |
+| Windows console/client and Pi session helper | `a77e97b09a2ae1defa9c440baadc9e58a3df3aa9` |
+| Pi motor owner | `c3fc683d645ea1c355e69a72f705a8bbadde6a1a` |
+| Pi camera owner | `9b1f0670e7068f7d39eb50270a118e3807418355` |
+
+Reviewed combined runtime source: `d3358f6a00a1fe6a9735706e75727cccc6c46a15`.
+Its relevant helper/client, motor and camera-UI blobs match the working
+components. The motor timing-evidence patch was separately extracted onto the
+accepted motor lineage; it is not a demonstrated cure for the historical sample
+gap. PR #12 integrates into **`integrate/am1-local-teleop`**, never `main`.
+Documentation/integration commits do not change deployed checkouts or private
+pins. Preserve their environments, mappings, rotations, calibration and Direct
+Browser profile; do not deploy the whole console PR over the motor/camera owners.
+
+### Scope and verification qualifications
+
+Camera presentation retains correct role/generation identity, bounded last-good
+frames and honest advancing age. Servos/System/Logs/Terminal use existing sourced
+data and bounded output. Their captured-data and offline checks plus retained
+post-stop inspection are accepted for this closeout; a fresh live visual tour of
+every supporting page is **not** claimed. Missing servo fields remain **Not
+sampled**; no second reader is justified to populate them.
+
+The browser currently starts physical-leader mode only. A browser Scripted-mode
+selector and visible speed indicator/control from the original presentation
+design remain nonblocking omissions, not delivered features. Scripted ArmSmoke
+remains available through the existing CLI; T/G keyboard speed handling remains.
+After a console Pause, later gaps can conservatively require manual Resume.
+Ordinary button/key release zeros body input without requiring Resume; only a
+full pause needs the displayed qualified approval. The page's broader release
+help wording must not be read as changing this actual policy.
+
+Final review found no Critical/Important runtime issue. Historical verification
+retains its actual provenance: 151 Python/29 Node UI checks at `97582303`, 59
+focused checks at `a77e97b0`, 215 affected checks at `d3358f6a`, and 10 focused
+motor-extraction checks at `c3fc683d`. Documentation-only closeout does not relabel
+those as new test runs or physical tests. Source equivalence, clean ownership,
+private-pin consistency and diff/artifact checks were verified hardware-free.
+
+This is qualified supervised LAN hobby-use readiness, not full presentation-spec
+compliance, unattended/remote readiness, arbitrary-pose convergence or endurance
+acceptance. Keep the historical 1.138-second display gap, imperfect small-command
+elbow tracking, camera acquisition/browser limitations and unresolved historical
+host-gap causation. No new powered commissioning is required solely for closeout.
+All earlier pending/draft instructions below describe their historical stage;
+this current disposition supersedes them without erasing the evidence.
+
+### Everyday console reference
 
 From the reviewed Windows checkout in PowerShell 7, with the existing private
 `config/am1.session.json` and configured Python environment:
 
 ```powershell
-.\tools\run_am1_console.ps1
+.\tools\run_am1_console.ps1 -DirectBrowser
 ```
 
-This opens only `http://127.0.0.1:8765/`. Opening or refreshing the browser does
+This opens the dedicated direct-routing Edge window at `http://127.0.0.1:8765/`.
+Opening or refreshing the browser does
 not start cameras or motors. The private session config must contain an absolute
 `console_camera_auth_file` pointing to a user-only JSON file with `username` and
 `password` for the already-deployed Pi camera viewer; neither file belongs in
@@ -65,8 +133,13 @@ release body keys, Pause, then Stop if the view does not promptly recover. Confi
 the owned session has stopped before reopening the view or starting another
 session; a last frame is not a live driving view. Small right-elbow tracking,
 arbitrary-pose shoulder alignment, intermittent camera acquisition/browser gaps,
-and long-duration or unattended use retain the limitations below. This console
-source has passed offline fake/browser checks. The camera-only layout/start/stop
+and long-duration or unattended use retain the limitations below.
+
+### Historical console development and acceptance evidence
+
+The following records preserve the pending state at each earlier stage, not a
+requirement to repeat completed interactions after the qualified closeout above.
+The console source had passed offline fake/browser checks. The camera-only layout/start/stop
 check passed with five fresh sources, but the attended Control check is not yet
 accepted. Earlier attempts refused on a disconnected leader supply or a startup
 approval timeout. The later automatic sync completed 301 frames in 30.968 seconds
@@ -204,7 +277,7 @@ runtime limit, browser-presence policy or deployed source pin changed in that
 test-only investigation. The separately approved policy follow-up is below;
 the earlier timing evidence and failed attempts remain historical evidence.
 
-### Approved input-presence follow-up (offline verified, physical check pending)
+### Historical input-presence follow-up (offline verification before acceptance)
 
 The owner subsequently approved separating session presence from body movement:
 actual accepted browser receipt permits presence for at most 1.5 seconds, while
@@ -405,7 +478,7 @@ or execution route. Changing any page releases
 browser body keys; the global Stop remains available. None of these pages starts a second motor
 reader or changes the original cleanup result.
 
-## Current state — teleoperation closeout, September 29, 2026
+## Historical teleoperation closeout — September 29, 2026
 
 Local teleoperation is reasonably functional for **supervised LAN hobby use**.
 The latest attended P16 run completed home/approximately 10 mm relief, the full
