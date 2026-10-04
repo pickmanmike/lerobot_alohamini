@@ -1288,6 +1288,48 @@ def test_live_uses_paired_height_once_preserves_original_zero_and_real_floor(ope
     robot.disconnect()
 
 
+def test_host_fault_context_labels_post_cache_refusal_as_cached_not_accepted(operating_robot, monkeypatch):
+    from types import SimpleNamespace
+    from lerobot.robots.alohamini import alohamini_host as host
+    from lerobot.robots.alohamini.lift_motor_feedback import ComparisonRefusal
+
+    robot, clock = operating_robot
+    original_connect = robot.connect
+
+    def connect(**kwargs):
+        original_connect(calibrate=False, **kwargs)
+        # Synthetic out-of-travel height reaches the actual guard AFTER last_record
+        # is cached. That cache must not be mislabeled as operationally accepted.
+        monkeypatch.setattr(
+            robot._lift_operation, "_height_from_record", lambda record: robot.lift.cfg.soft_max_mm + 1,
+        )
+
+    def no_message(*args, **kwargs):
+        raise host.zmq.Again()
+
+    monkeypatch.setattr(robot, "connect", connect)
+    monkeypatch.setattr(host, "AlohaMini", lambda config: robot)
+    monkeypatch.setattr(host.time, "perf_counter", clock.monotonic)
+    monkeypatch.setattr("sys.argv", ["host", "--robot_model", "alohamini1", "--no_cameras"])
+    monkeypatch.setattr(host, "AlohaMiniHost", lambda config: SimpleNamespace(
+        connection_time_s=1, max_loop_freq_hz=30, watchdog_timeout_ms=1000,
+        zmq_cmd_socket=SimpleNamespace(recv_string=no_message),
+        zmq_observation_socket=SimpleNamespace(recv_multipart=no_message), disconnect=lambda: None,
+    ))
+    with pytest.raises(ComparisonRefusal, match="lift height exceeded travel bounds") as caught:
+        host.main()
+    operation = robot._lift_operation
+    assert caught.value is operation.failure
+    assert operation.last_record["height_mm"] > robot.lift.cfg.soft_max_mm
+    note = next(n for n in caught.value.__notes__ if n.startswith("AM1 host loop timing context: "))
+    context = json.loads(note.split(": ", 1)[1])
+    assert context["last_cached_lift_sample_monotonic_s"] == operation.last_record["sample_monotonic_s"]
+    assert "last_accepted_lift_sample_monotonic_s" not in context
+    assert not robot.left_bus.is_connected
+    assert robot.left_bus.registers[("Goal_Velocity", "lift_axis")] == 0
+    assert robot.left_bus.registers[("Torque_Enable", "lift_axis")] == 0
+
+
 @pytest.mark.parametrize("model,home", [("alohamini1", False), ("alohamini2", True), ("alohamini2pro", True)])
 def test_skip_home_and_other_models_never_create_operational_policy(operating_robot, monkeypatch, model, home):
     robot, _ = operating_robot
@@ -1605,4 +1647,210 @@ def test_explicit_faults_never_filtered_and_original_refusal_remains_latched(
     assert operation.failure is caught.value
     assert robot.left_bus.registers[("Goal_Velocity", "lift_axis")] == 0
     assert robot.left_bus.registers[("Torque_Enable", "lift_axis")] == 0
+    assert not robot.left_bus.is_connected
+
+
+@pytest.mark.parametrize("delay_stage", ["sample_log", "robot_observation", "lift_diagnostics", "reports"])
+def test_real_host_retains_fault_loop_timings_after_cleanup(
+    operating_robot, monkeypatch, delay_stage,
+):
+    """Synthetic delays identify the measured stage, not the historical gap's cause."""
+    from types import SimpleNamespace
+    from lerobot.robots.alohamini import alohamini_host as host
+    from lerobot.robots.alohamini.lift_motor_feedback import ComparisonRefusal
+
+    robot, clock = operating_robot
+    delayed = False
+    closed = False
+    original_connect = robot.connect
+    original_observation = robot.get_observation
+    original_report = host.print_cadence_report
+    original_add_note = ComparisonRefusal.add_note
+    original_loop_timing = host.AM1HostLoopTiming
+    timing = None
+
+    def make_timing():
+        nonlocal timing
+        timing = original_loop_timing()
+        return timing
+
+    def delay_once(stage):
+        nonlocal delayed
+        if stage == delay_stage and not delayed:
+            delayed = True
+            clock.sleep(0.296)  # Synthetic, not a measured historical log-write duration.
+
+    def connect(**kwargs):
+        original_connect(calibrate=False, **kwargs)
+        operation = robot._lift_operation
+        emit = operation.emit
+
+        def emit_sample(record):
+            if record["phase"] == "live":
+                delay_once("sample_log")
+            emit(record)
+
+        operation.emit = emit_sample
+
+    def observation():
+        delay_once("robot_observation")
+        return original_observation()
+
+    def report(state):
+        delay_once("reports")
+        return original_report(state)
+
+    def monotonic():
+        if timing is not None and timing.current is not None:
+            if timing.current["active_phase"] == "lift_diagnostics":
+                delay_once("lift_diagnostics")
+        return clock.monotonic()
+
+    def close():
+        nonlocal closed
+        closed = True
+
+    def add_note(error, note):
+        if note.startswith("AM1 host loop timing context: "):
+            assert closed and not robot.left_bus.is_connected
+            assert robot.left_bus.registers[("Goal_Velocity", "lift_axis")] == 0
+            assert robot.left_bus.registers[("Torque_Enable", "lift_axis")] == 0
+        original_add_note(error, note)
+
+    def no_request(**kwargs):
+        raise host.zmq.Again()
+
+    command = json.dumps({"x.vel": 0, "y.vel": 0, "theta.vel": 0, "lift_axis.vel": 0})
+    monkeypatch.setattr(robot, "connect", connect)
+    monkeypatch.setattr(robot, "get_observation", observation)
+    monkeypatch.setattr(host, "print_cadence_report", report)
+    monkeypatch.setattr(host, "AM1HostLoopTiming", make_timing)
+    monkeypatch.setattr(ComparisonRefusal, "add_note", add_note)
+    monkeypatch.setattr(host, "AlohaMini", lambda config: robot)
+    monkeypatch.setattr(host.time, "perf_counter", clock.monotonic)
+    monkeypatch.setattr(host.time, "monotonic", monotonic)
+    monkeypatch.setattr("sys.argv", [
+        "host", "--robot_model", "alohamini1", "--no_cameras", "--profile_cadence",
+    ])
+    monkeypatch.setattr(host, "AlohaMiniHost", lambda config: SimpleNamespace(
+        connection_time_s=2, max_loop_freq_hz=30, watchdog_timeout_ms=1000,
+        zmq_cmd_socket=SimpleNamespace(recv_string=lambda flags: command),
+        zmq_observation_socket=SimpleNamespace(recv_multipart=no_request), disconnect=close,
+    ))
+    with pytest.raises(ComparisonRefusal, match="five-slot feedback window is stale") as caught:
+        host.main()
+    assert caught.value is robot._lift_operation.failure
+    assert closed and not robot.left_bus.is_connected
+    notes = [n for n in getattr(caught.value, "__notes__", [])
+             if n.startswith("AM1 host loop timing context: ")]
+    assert len(notes) == 1  # The current host loses the preceding iteration's timing.
+    context = json.loads(notes[0].split(": ", 1)[1])
+    assert context["clock"] == "perf_counter"
+    loop = context["current_loop"] if delay_stage == "robot_observation" else context["previous_loop"]
+    assert loop["phase_ms"][delay_stage] >= 296
+    if delay_stage == "lift_diagnostics":
+        assert loop["phase_ms"]["sleep"] < 50  # The check's delay is not counted as sleep.
+    assert context["current_loop"]["active_phase"] == (
+        "robot_observation" if delay_stage == "robot_observation" else "lift_poll"
+    )
+    assert len(loop["phase_ms"]) <= 10  # One bounded current/previous record, never growing history.
+    assert "cleanup" not in loop["phase_ms"]
+
+
+@pytest.mark.parametrize("context_encode_fails", [False, True])
+def test_host_fault_timing_cannot_replace_primary_or_cleanup_failure(
+    operating_robot, monkeypatch, context_encode_fails,
+):
+    from types import SimpleNamespace
+    from lerobot.robots.alohamini import alohamini_host as host
+
+    robot, clock = operating_robot
+    primary = OSError("synthetic primary sample log failure")
+    secondary = OSError("synthetic socket cleanup failure")
+    original_connect = robot.connect
+    original_dumps = json.dumps
+    closed = False
+
+    def connect(**kwargs):
+        original_connect(calibrate=False, **kwargs)
+        operation = robot._lift_operation
+        emit = operation.emit
+
+        def failed_emit(record):
+            if record["phase"] == "live":
+                raise primary
+            emit(record)
+
+        operation.emit = failed_emit
+
+    def close():
+        nonlocal closed
+        closed = True
+        raise secondary
+
+    def dumps(value, *args, **kwargs):
+        if context_encode_fails and isinstance(value, dict) and value.get("clock") == "perf_counter":
+            assert closed and not robot.left_bus.is_connected
+            raise ValueError("synthetic fault-context encoding failure")
+        return original_dumps(value, *args, **kwargs)
+
+    def no_message(*args, **kwargs):
+        raise host.zmq.Again()
+
+    monkeypatch.setattr(robot, "connect", connect)
+    monkeypatch.setattr(host, "AlohaMini", lambda config: robot)
+    monkeypatch.setattr(host.time, "perf_counter", clock.monotonic)
+    monkeypatch.setattr(host.json, "dumps", dumps)
+    monkeypatch.setattr("sys.argv", ["host", "--robot_model", "alohamini1", "--no_cameras"])
+    monkeypatch.setattr(host, "AlohaMiniHost", lambda config: SimpleNamespace(
+        connection_time_s=1, max_loop_freq_hz=30, watchdog_timeout_ms=1000,
+        zmq_cmd_socket=SimpleNamespace(recv_string=no_message),
+        zmq_observation_socket=SimpleNamespace(recv_multipart=no_message), disconnect=close,
+    ))
+    with pytest.raises(OSError) as caught:
+        host.main()
+    assert caught.value is primary and robot._lift_operation.failure is primary
+    assert closed and not robot.left_bus.is_connected
+    assert robot.left_bus.registers[("Goal_Velocity", "lift_axis")] == 0
+    assert robot.left_bus.registers[("Torque_Enable", "lift_axis")] == 0
+    notes = getattr(primary, "__notes__", [])
+    assert any("host disconnect also failed: OSError: synthetic socket cleanup failure" in n for n in notes)
+    if context_encode_fails:
+        assert "AM1 host loop timing context unavailable: ValueError" in notes
+    else:
+        note = next(n for n in notes if n.startswith("AM1 host loop timing context: "))
+        assert json.loads(note.split(": ", 1)[1])["current_loop"]["active_phase"] == "sample_log"
+
+
+@pytest.mark.parametrize("model,home", [("alohamini1", False), ("alohamini2", True), ("alohamini2pro", True)])
+def test_host_loop_context_excludes_skip_home_and_other_models(operating_robot, monkeypatch, model, home):
+    from types import SimpleNamespace
+    from lerobot.robots.alohamini import alohamini_host as host
+
+    robot, clock = operating_robot
+    robot.config.robot_model = model
+    legacy_home = []
+    monkeypatch.setattr(robot, "configure", lambda: None)
+    monkeypatch.setattr(robot.lift, "home", lambda: legacy_home.append(True))
+
+    def unexpected_context():
+        raise AssertionError("AM1 operational timing must not run in this model/mode")
+
+    def no_message(*args, **kwargs):
+        raise host.zmq.Again()
+
+    monkeypatch.setattr(host, "AM1HostLoopTiming", unexpected_context)
+    monkeypatch.setattr(host, "AlohaMini", lambda config: robot)
+    monkeypatch.setattr(host.time, "perf_counter", clock.monotonic)
+    argv = ["host", "--robot_model", model, "--no_cameras", "--no_follower"]
+    if not home:
+        argv.append("--skip_lift_home")
+    monkeypatch.setattr("sys.argv", argv)
+    monkeypatch.setattr(host, "AlohaMiniHost", lambda config: SimpleNamespace(
+        connection_time_s=0.1, max_loop_freq_hz=30, watchdog_timeout_ms=1000,
+        zmq_cmd_socket=SimpleNamespace(recv_string=no_message),
+        zmq_observation_socket=SimpleNamespace(recv_multipart=no_message), disconnect=lambda: None,
+    ))
+    host.main()
+    assert legacy_home == ([True] if home else [])
     assert not robot.left_bus.is_connected

@@ -21,6 +21,7 @@ import math
 import os
 import time
 from collections.abc import Callable
+from typing import Any
 
 import cv2
 import zmq
@@ -264,6 +265,56 @@ def print_cadence_report(command_state: HostCommandState) -> None:
     report = command_state.format_report()
     if report is not None:
         print(report, flush=True)
+
+
+class AM1HostLoopTiming:
+    """Two in-memory owner-loop records, reported only after a genuine fault.
+
+    These wall durations include scheduling delays, not just CPU work. They
+    locate a delayed phase without attributing it to a particular device/sink.
+    No motor reads, waits, periodic output, or freshness-policy changes.
+    """
+
+    def __init__(self) -> None:
+        self.previous: dict[str, Any] | None = None
+        self.current: dict[str, Any] | None = None
+        self._phase_started_s = 0.0
+        self._loop_index = 0
+
+    def begin(self, at: float) -> None:
+        self._loop_index += 1
+        self.current = {
+            "loop_index": self._loop_index, "start_s": at,
+            "between_loops_ms": None if self.previous is None else round(
+                (at - self.previous["end_s"]) * 1000, 3,
+            ),
+            "active_phase": "lift_poll", "phase_ms": {}, "completed": False,
+        }
+        self._phase_started_s = at
+
+    def mark(self, phase: str, at: float) -> None:
+        self.current["phase_ms"][self.current["active_phase"]] = round(
+            (at - self._phase_started_s) * 1000, 3,
+        )
+        self.current["active_phase"] = phase
+        self._phase_started_s = at
+
+    def finish(self, at: float) -> None:
+        self.mark("complete", at)
+        self.current.update(
+            end_s=at, elapsed_ms=round((at - self.current["start_s"]) * 1000, 3), completed=True,
+        )
+        self.previous, self.current = self.current, None
+
+    def snapshot(self, at: float) -> dict[str, Any]:
+        current = None
+        if self.current is not None:
+            current = {**self.current, "phase_ms": dict(self.current["phase_ms"])}
+            current["phase_ms"][current["active_phase"]] = round(
+                (at - self._phase_started_s) * 1000, 3,
+            )
+            current["elapsed_ms"] = round((at - current["start_s"]) * 1000, 3)
+        return {"clock": "perf_counter", "previous_loop": self.previous, "current_loop": current}
 
 
 def print_startup_shoulder_report(
@@ -550,6 +601,13 @@ def main():
     # Only the unified supervisor opts in. Direct Arms/Local commands remain
     # unmarked and can stay "ready" during live use; state alone is insufficient.
     sync_shoulder_readback = os.environ.get("AM1_SYNC_SHOULDER_READBACK") == "1"
+    loop_timing = (
+        AM1HostLoopTiming()
+        if args.robot_model == "alohamini1" and getattr(robot, "_lift_operation", None) is not None
+        else None
+    )
+    fault_loop_context = None
+    fault_loop_context_error = None
     logging.info("Waiting for commands...")
 
     try:
@@ -566,6 +624,8 @@ def main():
 
         while duration < host.connection_time_s:
             loop_start_t = time.perf_counter()
+            if loop_timing is not None:
+                loop_timing.begin(loop_start_t)
             command_received = False
             data = None
             # One grouped lift transaction on the existing owning thread before
@@ -573,6 +633,8 @@ def main():
             lift_operation = getattr(robot, "_lift_operation", None)
             if lift_operation is not None:
                 lift_operation.poll(defer_sample_log=True)
+            if loop_timing is not None:
+                loop_timing.mark("command", time.perf_counter())
             try:
                 msg = host.zmq_cmd_socket.recv_string(zmq.NOBLOCK)
                 command_received_t = time.monotonic()
@@ -604,6 +666,8 @@ def main():
                     raise
                 logging.exception("Message fetching failed: %s", e)
             command_done_t = time.perf_counter()
+            if loop_timing is not None:
+                loop_timing.mark("watchdog", command_done_t)
 
             if command_state.watchdog_due():
                 logging.warning(
@@ -614,11 +678,14 @@ def main():
                 else:
                     robot.stop_motion()
 
-            
+            if loop_timing is not None:
+                loop_timing.mark("robot_observation", time.perf_counter())
             last_observation = robot.get_observation()
             if local_control is not None:
                 local_control.annotate(last_observation)
             observation_done_t = time.perf_counter()
+            if loop_timing is not None:
+                loop_timing.mark("observation_response", observation_done_t)
 
             # Consume at most one request credit per Host loop. Draining all pending
             # requests here would collapse the client's sliding window back into
@@ -644,6 +711,8 @@ def main():
                 except zmq.Again:
                     logging.info("Dropping observation response, client is not ready")
             response_send_done_t = time.perf_counter()
+            if loop_timing is not None:
+                loop_timing.mark("sample_log", response_send_done_t)
 
             # Routine raw logging must not consume the five-slot freshness
             # margin between this tick's grouped read and action/observation use.
@@ -652,6 +721,8 @@ def main():
                 lift_operation.emit_pending_sample()
 
             lift_diagnostics_done_t = time.perf_counter()
+            if loop_timing is not None:
+                loop_timing.mark("lift_diagnostics", lift_diagnostics_done_t)
             lift_diagnostics_now = time.monotonic()
             if (
                 args.profile_lift_diagnostics
@@ -660,12 +731,16 @@ def main():
                 print(format_lift_diagnostic_report(robot, last_observation), flush=True)
                 lift_diagnostics_report_start_t = lift_diagnostics_now
                 lift_diagnostics_done_t = time.perf_counter()
+            if loop_timing is not None:
+                loop_timing.mark("sleep", time.perf_counter())
 
             # Ensure a short sleep to avoid overloading the CPU.
             elapsed = lift_diagnostics_done_t - loop_start_t
 
             time.sleep(max(1 / host.max_loop_freq_hz - elapsed, 0))
             loop_done_t = time.perf_counter()
+            if loop_timing is not None:
+                loop_timing.mark("reports", loop_done_t)
 
             loop_timings_ms = {
                 "command": (command_done_t - loop_start_t) * 1e3,
@@ -740,6 +815,8 @@ def main():
                 cadence_report_start_t = cadence_now
 
             duration = time.perf_counter() - start
+            if loop_timing is not None:
+                loop_timing.finish(time.perf_counter())
         print("Cycle time reached.")
 
     except KeyboardInterrupt:
@@ -751,6 +828,17 @@ def main():
     except BaseException as error:
         interrupted_motor_io = True
         primary_error = error
+        if loop_timing is not None:
+            # Capture BEFORE cleanup, attach AFTER it. Cleanup time must not be
+            # misreported as poll/log/observation delay, or diagnostic I/O delay zero/off.
+            try:
+                fault_loop_context = loop_timing.snapshot(time.perf_counter())
+                sample = getattr(getattr(robot, "_lift_operation", None), "last_record", None) or {}
+                # last_record is cached before some operational guards; it may
+                # contain the rejected sample, not the last accepted one.
+                fault_loop_context["last_cached_lift_sample_monotonic_s"] = sample.get("sample_monotonic_s")
+            except BaseException as context_error:
+                fault_loop_context_error = type(context_error).__name__
     finally:
         cleanup_errors: list[tuple[str, BaseException]] = []
         # Local mode writes directly to its log file. A failed/full sink must
@@ -782,6 +870,15 @@ def main():
                 cleanup_errors.append(("pending lift sample", error))
 
         if primary_error is not None:
+            if fault_loop_context is not None:
+                try:
+                    primary_error.add_note("AM1 host loop timing context: " + json.dumps(
+                        fault_loop_context, allow_nan=False, separators=(",", ":"),
+                    ))
+                except BaseException as context_error:
+                    fault_loop_context_error = type(context_error).__name__
+            if fault_loop_context_error is not None:
+                primary_error.add_note("AM1 host loop timing context unavailable: " + fault_loop_context_error)
             for operation, error in cleanup_errors:
                 primary_error.add_note(
                     f"{operation} also failed: {type(error).__name__}: {error}"

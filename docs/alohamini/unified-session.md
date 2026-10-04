@@ -323,6 +323,55 @@ packet. A later accepted result must retain any first expiry and actual cleanup;
 this offline pass alone does not complete manual Control acceptance. Private raw
 timing/NetLog output stays outside Git (NetLog can include request credentials).
 
+### Owning-host sampling boundary (October 3, 2026)
+
+The subsequent attended dedicated-window attempt used helper/client `a77e97b0`,
+motor `43d1622a` and camera `9b1f0670`. Home, approximately 10.397 mm relief,
+automatic 301-frame alignment and live admission passed. The first terminating
+condition was the lift's unchanged five-slot freshness guard: a 304 ms raw sample
+gap left 671 ms of retained history. The rejected reading was 30 C; its grouped
+request completed in approximately 1.1 ms. This is not confirmed overheating or
+a demonstrated browser-presence/network failure. No manual inputs were used, so
+the remaining Control interactions are still unaccepted. The owner reported
+prompt stopping with nothing unusual.
+
+Saved lift cleanup later qualified zero goal, torque off and stopped feedback;
+camera exit 0 and absence of owned runtimes were verified. Original host exit 1,
+client 130, session 2 and the conservative `cleanup_unknown` summary remain.
+Immediate cleanup feedback was not uniformly zero; later stationary qualification
+does not erase the original refusal or prove those earlier readings' cause.
+
+Exact deployed-policy replay reproduced the refusal. A separate fake-host model
+with a synthetic logging delay also reproduced it and zero/off/close cleanup;
+that model does not establish which operation caused the real gap. The preceding
+log timestamp narrows the unmeasured interval, but does not distinguish log-write
+blocking, sleep/scheduling delay or other work. No guard change is justified by
+these records.
+
+The focused follow-up retains only the current and preceding AM1 operational
+host-loop timings in memory. On a genuine fault it snapshots the active phase
+before cleanup, then attaches the context to the original exception after motor
+and socket cleanup. Phases include grouped poll, command, watchdog, observation,
+response, sample emission, diagnostics, sleep and reporting; an inter-loop gap is
+also labeled. Durations use `perf_counter` and include scheduling time, not just
+device/CPU work. Cached lift timestamps use their original monotonic clock and
+are not labeled accepted: some operational guards can reject after caching.
+Routine output, raw evidence and refusal behavior are unchanged. There
+is no extra servo read, sampling thread, retry, limit change or automatic restart.
+Context construction/encoding failure cannot replace the primary fault or its
+cleanup notes. AM2/AM2 Pro and skip-home paths do not use this context.
+
+Offline validation of the follow-up: 215 affected operational/consumer-refresh/
+local-recovery tests passed; changed Python compilation, host help, fresh
+worktree-root import/lazy-visualization checks and diff checks passed. The new
+fake-host timing, exception and provenance regressions were verified RED/GREEN;
+synthetic delays are not a reconstruction of the physical cause.
+
+This is an evidence correction, not a demonstrated cure for the 304 ms gap or
+a new powered pass. Deployed components/pins remain unchanged pending review of
+the prepared motor follow-up. Keep PR #12 draft/unmerged and raw logs private;
+do not conduct an unchanged powered retry to seek a manual-control pass.
+
 The Servos page distinguishes the physical leader and Pi follower identities.
 It displays normalized position and the action actually sent; per-servo current,
 temperature and status remain **Not sampled** until a correctly identified
