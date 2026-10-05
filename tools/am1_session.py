@@ -345,6 +345,12 @@ class SessionCoordinator:
         if self.emit is not None:
             self.emit(event)
 
+    def _display_progress(self, stage: str, *, source: str) -> None:
+        try:
+            self._emit({"event": "startup_progress", "stage": stage, "source": source})
+        except Exception:
+            pass  # Optional presentation must not alter the owning lifecycle.
+
     def _record_scripted_result(self, outcome: SessionOutcome, client_log_path: Path) -> None:
         if self.leader_source != "scripted":
             return
@@ -453,6 +459,7 @@ class SessionCoordinator:
             if hasattr(self.remote, "set_stop_requested"):
                 self.remote.set_stop_requested(stop_requested)
             remote_started = True
+            self._display_progress("connections", source="session preflight")
             preflight = self.remote.preflight()
             print("AM1 session phase: Pi source and ownership preflight passed.", flush=True)
             outcome.sources = {
@@ -463,6 +470,7 @@ class SessionCoordinator:
             if self.windows_source_head is not None:
                 outcome.sources["windows_source_head"] = self.windows_source_head
             self._emit({"event": "preflight_passed", "sources": dict(outcome.sources)})
+            self._display_progress("cameras", source="session camera start")
             camera = self.remote.start_camera()
             if camera.get("camera_log"):
                 remote_logs.append(camera["camera_log"])
@@ -709,6 +717,7 @@ class SessionCoordinator:
                         "final_exit_code": outcome.final_exit_code,
                         "cleanup_verified": outcome.cleanup_verified,
                         "operator_stopped": outcome.operator_stopped,
+                        "failure": outcome.failure,
                         "result_directory": str(session_directory)})
         return outcome
 
@@ -791,7 +800,7 @@ class SSHRemote:
                     last_event=event.get("event"), last_event_wall_time_ns=time.time_ns(),
                 )
             self._remote_event_seen = True
-            if event.get("event") in {"system_sample", "process_output"}:
+            if event.get("event") in {"system_sample", "process_output", "startup_progress"}:
                 if self.telemetry_sink is not None:
                     try:
                         self.telemetry_sink({**event, "windows_received_at_ns": time.time_ns()})

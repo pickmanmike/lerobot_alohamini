@@ -19,6 +19,40 @@ function loadViews() {
   return context.AM1ConsoleViews;
 }
 
+function loadPresentation() {
+  const context = vm.createContext({performance:{now:()=>0}});
+  vm.runInContext(fs.readFileSync(path.resolve(__dirname, "../../tools/am1_console_ui/app.js"), "utf8"), context);
+  return context.AM1ConsolePresentation;
+}
+
+test("startup presentation uses measured frame estimates and waits for real final readiness", () => {
+  const UI = loadPresentation();
+  assert.match(UI.startup({stage:"arm_sync", step:6, total:7, remaining_estimate_s:29.3}), /Step 6 of 7.*estimated.*30/i);
+  assert.match(UI.startup({stage:"arm_sync", step:6, waiting:true, elapsed_s:3}), /waiting/i);
+  assert.match(UI.startup(null), /not yet reported/i);
+});
+
+test("countdown interpolates a native remaining sample, not browser Start or Resume", () => {
+  const UI = loadPresentation();
+  assert.match(UI.countdown({state:"Unavailable"}, 0, 0), /unavailable/i);
+  assert.match(UI.countdown({state:"Current", remaining_s:85, age_s:0}, 1000, 2000), /1:24/);
+  assert.match(UI.countdown({state:"Current", remaining_s:85, age_s:0}, 1000, 4500), /stale/i);
+  assert.match(UI.countdown({state:"Elapsed", remaining_s:0}, 0, 0), /elapsed.*stopping/i);
+  assert.match(UI.countdown({state:"Stopped", remaining_s:40}, 0, 0), /timer stopped.*cleanup/i);
+  assert.doesNotMatch(UI.countdown({state:"Stopped", remaining_s:40}, 0, 0), /session ended/i);
+});
+
+test("natural status keeps accepted requests, cleanup and primary failures distinct", () => {
+  const UI = loadPresentation();
+  assert.match(UI.status({phase:"stopping", cleanup_verified:null}), /stopping.*cleanup/i);
+  assert.doesNotMatch(UI.status({phase:"stopping"}), /stopped by operator/i);
+  assert.match(UI.status({phase:"failed", error:"real refusal", final_exit_code:2}), /real refusal/);
+  assert.match(UI.status({phase:"paused", pending_gate:["resume",3]}), /release.*Resume/i);
+  assert.match(UI.status({phase:"operator_stopped", cleanup_verified:true, final_exit_code:130}), /stopped.*cleanup verified/i);
+  assert.match(UI.status({phase:"cleanup_unknown",error:"original fault"}), /unverified.*do not restart.*original fault/i);
+  assert.match(UI.status({phase:"client_exited",session_id:"session"}), /cleanup.*final result/i);
+});
+
 test("live output uses a separate session-bound route and reports truncation", () => {
   const Views = loadViews();
   assert.equal(Views.outputUrl("host", "session-1"), "/api/output?kind=host&session_id=session-1");
@@ -245,7 +279,7 @@ test("route changes clear held input but preserve session identity", () => {
   }
   const html = fs.readFileSync(path.resolve(__dirname, "../../tools/am1_console_ui/index.html"), "utf8");
   assert.equal((html.match(/data-operation="Stop"/g) || []).length, 1);
-  assert.match(html, /class="global-stop"/);
+  assert.match(html, /class="[^"]*\bglobal-stop\b/);
 });
 
 test("logs filter is bounded and preserves timestamped original lines", () => {
@@ -314,7 +348,7 @@ test("servo schematic separates two follower arms, lift and unsampled wheels", (
 test("Stop cancels a pending approval and releases busy ownership for later Start", async () => {
   const nodes = new Map(), sent = [];
   const element = () => ({textContent:"", value:"120", content:"test-only", dataset:{},
-    append(){}, replaceChildren(){}, addEventListener(){}, click(){}});
+    append(){}, replaceChildren(){}, addEventListener(){}, setAttribute(){}, click(){}});
   const document = {querySelector:key => {
     if (!nodes.has(key)) nodes.set(key, element());
     return nodes.get(key);
@@ -359,7 +393,7 @@ test("Stop cancels a pending approval and releases busy ownership for later Star
 function loadApp(fetchHook) {
   const nodes = new Map(), sent = [], windowListeners = new Map(), documentListeners = new Map();
   const element = () => ({textContent:"", value:"120", content:"test-only", dataset:{},
-    append(){}, replaceChildren(){}, addEventListener(){}, click(){}});
+    append(){}, replaceChildren(){}, addEventListener(){}, setAttribute(){}, click(){}});
   const document = {hidden:false, querySelector:key => {
     if (!nodes.has(key)) nodes.set(key, element());
     return nodes.get(key);
@@ -383,6 +417,18 @@ function loadApp(fetchHook) {
   vm.runInContext(source, context);
   return {context, sent, nodes, windowListeners, documentListeners, setState:value => { state = value; }};
 }
+
+test("global header Start and approvals remain non-actuating off Control", async () => {
+  const app=loadApp();
+  await new Promise(resolve=>setImmediate(resolve));
+  app.context.testInput.setRoute("logs");
+  const before=app.sent.filter(r=>r.url==="/api/operation").length;
+  for(const kind of ["Start","Resume","Approve","ClaimInput"]) await app.context.testOperation(kind);
+  assert.equal(app.sent.filter(r=>r.url==="/api/operation").length,before);
+  assert.match(app.nodes.get("#control-notice").textContent,/return to Control/i);
+  await app.context.testOperation("Stop");
+  assert.equal(app.sent.at(-2)?.payload?.kind || app.sent.find(r=>r.payload?.kind==="Stop")?.payload?.kind,"Stop");
+});
 
 test("server body expiry clears only movement and requires release before reacquisition", async () => {
   const app = loadApp((url, payload) => url === "/api/body" && payload.keys.length ?

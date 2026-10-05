@@ -24,7 +24,7 @@ from pathlib import Path
 from pathlib import PurePosixPath
 from urllib.parse import parse_qs, urlsplit
 
-from tools.am1_console_model import ConsoleSnapshot
+from tools.am1_console_model import ConsoleProgress, ConsoleSnapshot
 
 
 MAX_CONSOLE_LOG_BYTES = 2_000_000
@@ -63,6 +63,7 @@ class ConsoleSessionAdapter:
         self._events = deque(maxlen=128)
         self._outputs: dict[str, dict] = {}
         self._telemetry = ConsoleSnapshot()
+        self._progress = ConsoleProgress()
         self._event_sink = None
         self._bridge = None
         self._control_token: str | None = None
@@ -92,11 +93,12 @@ class ConsoleSessionAdapter:
             # Output is not lifecycle/SSE traffic and cannot fill its queues.
             self._receive_output(event)
             return
-        telemetry_only = event.get("event") in {"live_sample", "action_sent", "host_feedback", "system_sample", "live_admitted"}
+        telemetry_only = event.get("event") in {"live_sample", "action_sent", "host_feedback", "system_sample", "live_admitted", "startup_progress", "live_timing"}
         with self._lock:
             if event.get("session_id") is not None and event["session_id"] != self._session_id:
                 return
             self._telemetry.update(event)
+            self._progress.update(event, received_at=time.monotonic())
             if event.get("event") in {"host_feedback", "live_sample", "live_admitted"} and self._phase not in {
                 "stopping", "client_exited", "complete", "operator_stopped", "failed", "cleanup_unknown",
             }:
@@ -148,6 +150,8 @@ class ConsoleSessionAdapter:
             if event.get("event") in {"cleanup", "session_complete"} and type(event.get("cleanup_verified")) is bool:
                 self._cleanup_verified = event["cleanup_verified"]
             if event.get("event") == "session_complete":
+                if isinstance(event.get("failure"), str) and event["failure"] and self._error is None:
+                    self._error = event["failure"]
                 self._operator_stopped = (event.get("operator_stopped") is True
                                           and event.get("final_exit_code") == 130
                                           and event.get("cleanup_verified") is True)
@@ -286,7 +290,8 @@ class ConsoleSessionAdapter:
             state = {"session_id": self._session_id, "phase": self._phase,
                     "final_exit_code": self._final_exit_code, "cleanup_verified": self._cleanup_verified,
                     "error": self._error,
-                    "events": list(self._events), "telemetry": self._telemetry.snapshot(now_ns=time.time_ns())}
+                    "events": list(self._events), "telemetry": self._telemetry.snapshot(now_ns=time.time_ns()),
+                    "progress": self._progress.snapshot(now=time.monotonic())}
             if state["phase"] == "live":
                 age = state["telemetry"]["observation"]["age_ms"]
                 if age is None or age > 1000:
@@ -385,6 +390,7 @@ class ConsoleSessionAdapter:
                 # Session-owned observations/actions cannot be attributed to
                 # the next Start. Camera status is reacquired independently.
                 self._telemetry = ConsoleSnapshot()
+                self._progress = ConsoleProgress()
                 self._admitted_host_epoch = None
                 self._admitted_at_ns = None
                 self._events.clear()

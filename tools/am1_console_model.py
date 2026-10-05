@@ -34,6 +34,82 @@ def _numeric(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
+class ConsoleProgress:
+    """One latest display record; never grants readiness or controls duration.
+
+    Native and server are Windows processes using the system-wide QPC-backed
+    Python monotonic clock. Pi monotonic times are deliberately not accepted.
+    Browser clients receive a remaining value and interpolate on their own clock.
+    """
+
+    STAGES = ("connections", "cameras", "lift_home", "lift_relief",
+              "leader_preparation", "arm_sync", "final_readiness")
+
+    def __init__(self) -> None:
+        self.startup: dict[str, Any] | None = None
+        self.started_at: float | None = None
+        self.timing: dict[str, float] | None = None
+        self.sync_plan_origin: float | None = None
+        self.stopped = False
+
+    def update(self, event: dict[str, Any], *, received_at: float) -> None:
+        kind = event.get("event")
+        if kind in {"stop_requested", "client_exited", "cleanup", "session_complete", "session_error"}:
+            self.stopped = True
+        if kind == "startup_progress" and not self.stopped:
+            stage = event.get("stage")
+            if stage not in self.STAGES:
+                return
+            step = self.STAGES.index(stage) + 1
+            origin = _numeric(event.get("plan_started_at"))
+            if origin is not None and self.sync_plan_origin is not None and origin < self.sync_plan_origin:
+                return
+            new_plan = stage == "arm_sync" and origin is not None and (
+                self.sync_plan_origin is None or origin > self.sync_plan_origin)
+            if self.startup is not None and step < self.startup["step"] and not new_plan:
+                return  # Sequential transport may deliver an older producer later.
+            if self.startup is None or step != self.startup["step"] or new_plan:
+                self.started_at = received_at
+            if origin is not None:
+                self.sync_plan_origin = origin
+            self.startup = {"stage": stage, "step": step, "total": 7,
+                            "source": str(event.get("source", "owning process event"))[:100]}
+            for key in ("frames_sent", "frame_count", "fps", "remaining_estimate_s"):
+                value = _numeric(event.get(key))
+                if value is not None and value >= 0:
+                    self.startup[key] = value
+            self.startup["waiting"] = event.get("waiting") is True
+        if kind == "live_timing" and not self.stopped:
+            values = {key: _numeric(event.get(key)) for key in
+                      ("live_started_at", "deadline", "sampled_at", "duration_s")}
+            if (event.get("clock") != "windows_monotonic" or any(v is None for v in values.values())
+                    or not 1 <= values["duration_s"] <= 1800
+                    or not 0 <= values["live_started_at"] <= values["sampled_at"] <= received_at
+                    or abs(values["deadline"] - values["live_started_at"] - values["duration_s"]) > 1e-6):
+                return
+            if self.timing is not None and (
+                values["live_started_at"] != self.timing["live_started_at"]
+                or values["deadline"] != self.timing["deadline"]
+                or values["sampled_at"] < self.timing["sampled_at"]
+            ):
+                return  # Resume/reordered messages cannot create a new origin.
+            self.timing = values
+
+    def snapshot(self, *, now: float) -> dict[str, Any]:
+        startup = None if self.startup is None else {
+            **self.startup, "elapsed_s": max(0.0, now - self.started_at),
+        }
+        timing: dict[str, Any] = {"state": "Unavailable", "remaining_s": None}
+        if self.timing is not None:
+            age = max(0.0, now - self.timing["sampled_at"])
+            remaining = max(0.0, self.timing["deadline"] - now)
+            timing = {**self.timing, "remaining_s": remaining, "age_s": age,
+                      "state": "Stopped" if self.stopped else "Stale" if age > 2.0 else
+                               "Elapsed" if remaining == 0 else "Current",
+                      "source": "native live admission and enforced deadline (Windows monotonic)"}
+        return {"startup": startup, "live_timing": timing}
+
+
 class ConsoleSnapshot:
     """Cache one latest measurement per identity, not a growing telemetry history."""
 

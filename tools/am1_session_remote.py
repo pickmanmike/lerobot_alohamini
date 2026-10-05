@@ -382,6 +382,7 @@ class RemoteSupervisor:
         self.children: dict[str, OwnedChild] = {}
         self._output_offsets: dict[str, int] = {}
         self._next_output_at = 0.0
+        self._last_startup_stage: str | None = None
         self.lock_stream: TextIO | None = None
         self.controller_closed = threading.Event()
         self.controller_stop_requested = threading.Event()
@@ -626,13 +627,37 @@ class RemoteSupervisor:
         self.save()
         self._wait_for(
             child,
-            lambda: host_is_operational(_read_text(Path(log_path))),
+            lambda: self._host_readiness_progress(_read_text(Path(log_path))),
             self.args.host_ready_timeout,
             "motor host operational_ready",
         )
         self.state.update(status="host_ready", host_log=log_path)
         self.save()
         self.emit("host_ready", host_log=log_path)
+
+    def _host_readiness_progress(self, text: str) -> bool:
+        """Reuse the readiness reader's records; no motor polling or readiness inference."""
+        phases = {"homing": "lift_home", "homing_position": "lift_home",
+                  "home_complete": "lift_relief", "relief": "lift_relief",
+                  "relief_direction_pending": "lift_relief", "relief_direction_qualified": "lift_relief",
+                  "settle": "lift_relief", "operational_ready": "leader_preparation"}
+        for line in reversed(text.splitlines()):
+            if not line.startswith("[LIFT OPERATIONAL] "):
+                continue
+            try:
+                record = json.loads(line.removeprefix("[LIFT OPERATIONAL] "))
+            except json.JSONDecodeError:
+                continue
+            stage = phases.get(record.get("phase")) if isinstance(record, dict) else None
+            if stage is not None and stage != self._last_startup_stage:
+                self._last_startup_stage = stage
+                try:
+                    self.emit("startup_progress", stage=stage, source="Pi owning host lift record")
+                except Exception:
+                    pass  # Display progress cannot turn readiness into a fault.
+            if stage is not None:
+                break
+        return host_is_operational(text)
 
     def check_children(self) -> tuple[str, int] | None:
         for name, child in self.children.items():

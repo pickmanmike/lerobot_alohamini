@@ -87,7 +87,7 @@ const [url, scenario] = process.argv.slice(2);
     await page.getByRole("button", {name:"Approve Resume", exact:true}).click();
     await until(state => native(state)?.paused === false);
     await until(state => state.phase === "live");
-    await page.waitForFunction(() => document.querySelector("#session-state").textContent.endsWith(": live"));
+    await page.waitForFunction(() => document.querySelector("#session-state").textContent.startsWith("Live —"));
   };
   try {
     await page.goto(url);
@@ -107,7 +107,7 @@ const [url, scenario] = process.argv.slice(2);
     // Wait for the browser's actual current state before deciding whether the
     // single initial recovery is needed. A native-only check can precede the
     // next UI render, then incorrectly wait for live after a genuine expiry.
-    await page.waitForFunction(() => document.querySelector("#session-state").textContent.endsWith(": live") ||
+    await page.waitForFunction(() => document.querySelector("#session-state").textContent.startsWith("Live —") ||
       document.querySelector("#gate-state").textContent.includes("Approval needed: resume"));
     if (native(await read()).paused) {
       // A loaded desktop can genuinely miss the approved 1.5 s presence deadline.
@@ -124,7 +124,7 @@ const [url, scenario] = process.argv.slice(2);
     }
     assert.equal(native(await read()).paused, false, "qualified focused input must be live");
     await until(state => state.phase === "live");
-    await page.waitForFunction(() => document.querySelector("#session-state").textContent.endsWith(": live"));
+    await page.waitForFunction(() => document.querySelector("#session-state").textContent.startsWith("Live —"));
     if (["healthy", "camera-delay"].includes(scenario)) {
       await page.keyboard.down("w");
       await until(state => native(state)?.keys.includes("w"));
