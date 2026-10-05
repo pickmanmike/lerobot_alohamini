@@ -56,7 +56,7 @@ test("compact camera-first Control fits measured half viewport and preserves int
     assert.equal(await visiblePreviews.count(), 4);
     fixture.camerasAvailable=false;
     await page.waitForFunction(()=>document.querySelector('#primary .camera-status').textContent.includes('Last frame'));
-    assert.match(await page.locator('#primary .camera-status').innerText(), /Last frame.*image/i);
+    assert.match(await page.locator('#primary .camera-status').innerText(), /Last frame/i);
     await page.locator('[data-help="touch"]').click();
     assert.equal(fixture.requests.length,before, "Help must not initiate an operation");
     for (const route of ["servos","system","logs","terminal"]) {
@@ -101,4 +101,42 @@ test("actual DOM preserves native timing across pause/refresh and Stop remains u
     await page.waitForFunction(()=>document.querySelector('#session-state').textContent.includes('Stopping'));
     assert.doesNotMatch(await page.locator('#session-state').innerText(),/Stopped by operator/);
   } finally {await browser.close();server.closeAllConnections();await new Promise(r=>server.close(r));}
+});
+
+test("camera captions retain liveness while image age is available only in Details", async () => {
+  const {server, fixture} = createFixture();
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  const browser = await chromium.launch({headless:true, channel:"msedge"});
+  const page = await browser.newPage({viewport:{width:767, height:786}});
+  try {
+    await page.goto(`http://127.0.0.1:${server.address().port}/`);
+    fixture.jpeg = Buffer.from(await page.evaluate(() => {
+      const canvas = document.createElement("canvas");
+      canvas.width = 640; canvas.height = 480;
+      return canvas.toDataURL("image/jpeg").split(",")[1];
+    }), "base64");
+    await page.waitForFunction(() => document.querySelector('#connection').textContent.includes('Cameras 5/5'));
+    const views = page.locator('#primary, #thumbnails .camera-slot:visible');
+    assert.equal(await views.count(), 5);
+    for (const view of await views.all()) {
+      assert.match(await view.locator('.camera-status').innerText(), /^Live/);
+      assert.doesNotMatch(await view.locator('.camera-status').innerText(), /image|\d+\s*ms/i);
+      const age = view.locator('[data-field="image-age"]');
+      assert.equal(await age.isVisible(), false, "age stays under closed Details");
+      await view.locator('.camera-details summary').click();
+      assert.equal(await age.isVisible(), true);
+      assert.match(await age.innerText(), /^\d+ ms \(gateway receipt\)$/);
+      await view.locator('.camera-details summary').click();
+    }
+    fixture.camerasAvailable = false;
+    await page.waitForFunction(() => document.querySelector('#primary .camera-status').textContent.includes('Last frame'));
+    const age = page.locator('#primary [data-field="image-age"]');
+    const before = Number.parseInt(await age.textContent(), 10);
+    await page.waitForTimeout(250);
+    assert.ok(Number.parseInt(await age.textContent(), 10) > before, "retained image age keeps advancing");
+    assert.match(await page.locator('#primary .camera-status').innerText(), /Last frame/);
+    assert.doesNotMatch(await page.locator('#primary .camera-status').innerText(), /image|\d+\s*ms/i);
+    assert.match(await page.locator('#connection').innerText(), /not live/);
+    assert.equal(fixture.requests.length, 0, "camera Details never approves or starts a session");
+  } finally { await browser.close(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
 });

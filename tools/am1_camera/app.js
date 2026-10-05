@@ -93,8 +93,8 @@ function paint(tile, role, thumbnail = false) {
   tile.classList.toggle("held", !!held && state.state !== "fresh");
   tile.querySelector("strong").textContent = labels[role];
   tile.querySelector("span").textContent = state.state === "fresh" ?
-    `Live · image ${Math.round(state.age_ms)} ms${state.status_uncertain ? " · status uncertain" : ""}` :
-    held ? `Last frame / waiting · image ${Math.round(held.age_ms)} ms` : state.state;
+    `Live${state.status_uncertain ? " · status uncertain" : ""}` :
+    held ? "Last frame / waiting" : state.state;
   if (!held && state.state !== "fresh") tile.querySelector("span").textContent =
     source?.configured === false ? "Unassigned" : source?.state === "stale" ? "Disconnected" : "Waiting";
   tile.querySelector(".unavailable").textContent = held ? "" : !statusAvailable() ? "Status unavailable" :
@@ -175,7 +175,7 @@ function render() {
     const fresh = Number(primary.classList.contains("fresh")) +
       [...tiles.entries()].filter(([role,tile]) => role !== selected && tile.classList.contains("fresh")).length;
     connection.textContent = !statusAvailable() ? "Camera status unavailable — retained images are not live." :
-      `Cameras ${fresh}/5 fresh decoded views${fresh < 5 ? " — check required views; retained images are not live." : " · image ages shown below."}`;
+      `Cameras ${fresh}/5 fresh decoded views${fresh < 5 ? " — check required views; retained images are not live." : " · image ages in Details."}`;
   }
   diagnostics.textContent = `Status request ${Math.round(timing.status_ms)} ms (max ${Math.round(timing.status_max_ms)} ms); failures ${timing.status_failures}\n` +
     `Decode failures ${timing.decode_failures}; stream cancellations ${timing.cancellations}; last ${timing.last_cancel}\n` +
