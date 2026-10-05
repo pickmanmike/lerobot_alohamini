@@ -177,8 +177,14 @@ is under the private configured `windows_log_directory`, named
 starting hardware.
 
 If a startup input lease was released, the pending `sync_start` or `live_start`
-gate shows **Continue startup**. Hold the leaders still, release all body input,
-and click it to approve only that displayed gate with a fresh empty lease.
+gate shows **Continue startup**. Its approval instruction and recorded input-pause
+reason remain visible above the toolbar, outside collapsed Session details; they
+replace the measured-completion message while the gate is pending. The button
+also says **Continue startup**, not Resume. Technical gate/epoch evidence stays
+in Session details. This display-only correction changes no gate deadline,
+input lease or automatic-admission policy and requires only the Windows console
+source, not a Pi helper/motor/camera update. Hold the leaders still, release all
+body input, and click it to approve only that displayed gate with a fresh empty lease.
 Fresh heartbeats alone do not clear the latch; stale/wrong-stage approval is
 refused. Live Pause/Resume still requires the existing host/follower/leader
 qualification, and startup approval never enables body motion before live

@@ -189,7 +189,13 @@ class AM1ConsoleViews {
 globalThis.AM1ConsoleViews = AM1ConsoleViews;
 
 class AM1ConsolePresentation {
-  static startup(record) {
+  static startup(record, gate = null, pauseReason = null) {
+    if (["sync_start", "live_start"].includes(gate)) {
+      const causes = {"window-blur":"Control window lost focus.", "document-hidden":"Control page was hidden.",
+        "route-change":"Control page was left.", "pagehide":"Control page was unloaded."};
+      const cause = pauseReason ? (causes[pauseReason] || "Control input was paused; see Session details.") + " " : "";
+      return `${cause}Release body controls, hold leaders still, then select Continue startup to approve this gate, or Stop.`;
+    }
     if (!record || !Number.isInteger(record.step) || record.step < 1 || record.step > 7)
       return "Startup progress not yet reported.";
     const labels = {connections:"Checking connections", cameras:"Preparing cameras", lift_home:"Homing lift",
@@ -224,6 +230,7 @@ class AM1ConsolePresentation {
       "Stopped by operator — cleanup verified." : "Stopped result awaiting cleanup verification.";
     if (state.phase === "complete") return state.cleanup_verified === true ?
       "Session complete — cleanup verified." : "Session ended — cleanup not yet verified.";
+    if (["sync_start", "live_start"].includes(gate)) return "Startup approval needed — use Continue startup or Stop.";
     if (gate) return `${gate === "resume" ? "Paused" : "Startup approval needed"} — release controls, hold leaders still, then ${gate === "realign" ? "approve realignment" : "use Resume"}.`;
     if (state.phase === "paused" || state.pause_required) return "Paused — release controls and wait for the current qualified Resume gate.";
     if (state.phase === "live") return "Live — leaders and held body controls are enabled.";
@@ -394,8 +401,11 @@ if (typeof document !== "undefined") {
       stateText.textContent = AM1ConsolePresentation.status(state);
       const startup = state.progress?.startup;
       const starting = !["live", "paused", "feedback_stale", "stopping", "operator_stopped", "complete", "failed", "cleanup_unknown", "client_exited"].includes(state.phase);
-      document.querySelector("#startup-state").hidden = !state.session_id || !starting;
-      document.querySelector("#startup-state").textContent = AM1ConsolePresentation.startup(startup);
+      const gate = state.pending_gate;
+      const startupGate = starting && !state.error && ["sync_start", "live_start"].includes(gate?.[0]);
+      document.querySelector("#startup-state").hidden = !state.session_id || !starting || Boolean(state.error);
+      document.querySelector("#startup-state").textContent = AM1ConsolePresentation.startup(
+        startup, startupGate ? gate[0] : null, state.input_pause?.reason);
       document.querySelector("#session-details").textContent = JSON.stringify({session_id:state.session_id,
         phase:state.phase, final_exit_code:state.final_exit_code, cleanup_verified:state.cleanup_verified,
         error:state.error, events:state.events,
@@ -409,7 +419,6 @@ if (typeof document !== "undefined") {
         if (owner.session_id === state.session_id && owner.input_epoch === state.input_epoch)
           input.attach(owner.session_id, owner.control_token, owner.input_epoch);
       }
-      const gate = state.pending_gate;
       document.querySelector("#gate-state").textContent = gate ?
         `Approval needed: ${gate[0]} (host epoch ${gate[1] ?? "before live"}). Hold leaders still and release body keys.` :
         "No manual approval pending.";
@@ -422,13 +431,14 @@ if (typeof document !== "undefined") {
       if (state.gate_request_evidence?.accepted === false) document.querySelector("#gate-state").textContent +=
         ` Last native gate request rejected: ${state.gate_request_evidence.rejection}. Use Stop if the gate cannot be completed.`;
       const resume = document.querySelector('[data-operation="Resume"]');
-      resume.textContent = ["sync_start", "live_start"].includes(gate?.[0]) ? "Continue" : "Resume";
-      resume.setAttribute("aria-label", ["sync_start", "live_start"].includes(gate?.[0]) ? "Continue startup" : "Approve Resume");
+      resume.textContent = startupGate ? "Continue startup" : "Resume";
+      resume.setAttribute("aria-label", startupGate ? "Continue startup" : "Approve Resume");
       try { renderSnapshot(state); } catch {
         document.querySelector("#system-notice").textContent = "Diagnostic display unavailable; Control and Stop remain available.";
       }
     } catch {
       stateText.textContent = "Session state unavailable; no motor readiness implied.";
+      document.querySelector("#startup-state").hidden = true;
       if (input.live) input.release(true, "state-request-failed");
       message("Input paused: session state request failed. Release controls; explicit Resume is required.");
     } finally { stateRequestInFlight = false; }

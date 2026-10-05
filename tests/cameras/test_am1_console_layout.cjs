@@ -140,3 +140,62 @@ test("camera captions retain liveness while image age is available only in Detai
     assert.equal(fixture.requests.length, 0, "camera Details never approves or starts a session");
   } finally { await browser.close(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
 });
+
+test("startup approval stays visible and Continue startup approves only the displayed gate", async () => {
+  const {server, fixture} = createFixture();
+  fixture.snapshot = {session_id:"fixture-startup", input_epoch:1, phase:"host_ready", events:[], telemetry:{},
+    pending_gate:["live_start", null], input_pause:{reason:"window-blur"},
+    progress:{startup:{step:7, stage:"final_readiness", waiting:true}}};
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  const browser = await chromium.launch({headless:true, channel:"msedge"});
+  const page = await browser.newPage({viewport:{width:767, height:786}});
+  try {
+    await page.addInitScript(() => sessionStorage.setItem("am1-control-owner", JSON.stringify({
+      session_id:"fixture-startup", control_token:"fixture-owner", input_epoch:1
+    })));
+    await page.goto(`http://127.0.0.1:${server.address().port}/`);
+    await page.waitForFunction(() => document.querySelector('#gate-state').textContent.includes('live_start'));
+    const approval = page.locator('#startup-state');
+    assert.equal(await page.locator('.session-details').getAttribute('open'), null);
+    assert.equal(await approval.isVisible(), true);
+    assert.match(await approval.innerText(), /window lost focus/i);
+    assert.match(await approval.innerText(), /Continue startup/);
+    assert.doesNotMatch(await approval.innerText(), /waiting for measured completion/i);
+    assert.match(await page.locator('#session-state').innerText(), /Continue startup/);
+    const button = page.locator('[data-operation="Resume"]');
+    assert.equal(await button.innerText(), "Continue startup");
+    const stop = await page.locator('[data-operation="Stop"]').boundingBox();
+    assert.ok(stop && stop.y >= 0 && stop.y + stop.height <= 786);
+    await page.waitForTimeout(5200); // Unlike the transient operation notice, the gate remains visible.
+    assert.equal(await approval.isVisible(), true);
+    assert.equal(fixture.requests.filter(request => request.path === "/api/operation").length, 0,
+      "displaying the gate or restoring owner state must not approve it");
+
+    for (const stage of ["live_start", "sync_start"]) {
+      fixture.snapshot.pending_gate = [stage, null];
+      await page.waitForFunction(stage => document.querySelector('#gate-state').textContent.includes(stage), stage);
+      const before = fixture.requests.length;
+      await Promise.all([
+        page.waitForResponse(response => response.url().endsWith('/api/operation') &&
+          response.request().postDataJSON().gate_stage === stage),
+        button.click()
+      ]);
+      await page.waitForFunction(() => document.querySelector('#control-notice').textContent.includes('Resume accepted'));
+      const sent = fixture.requests.slice(before);
+      const operation = sent.find(request => request.path === "/api/operation");
+      assert.deepEqual(operation, {path:"/api/operation", kind:"Resume", session_id:"fixture-startup",
+        control_token:"fixture-owner", gate_stage:stage, host_epoch:null});
+      const emptyLease = sent.find(request => request.path === "/api/body" && request.active);
+      assert.ok(emptyLease && sent.indexOf(emptyLease) < sent.indexOf(operation));
+      assert.deepEqual(emptyLease.keys, []);
+      assert.doesNotMatch(await page.locator('#session-state').innerText(), /^Live/,
+        "approval acknowledgement is not native live admission");
+    }
+    fixture.snapshot = {...fixture.snapshot, phase:"awaiting_live_ack", pending_gate:null};
+    await page.waitForFunction(() => document.querySelector('#session-state').textContent.includes('native live admission'));
+    assert.doesNotMatch(await approval.innerText(), /Continue startup/);
+    fixture.snapshot = {...fixture.snapshot, phase:"failed", pending_gate:["live_start", null], error:"original refusal"};
+    await page.waitForFunction(() => document.querySelector('#session-state').textContent.includes('original refusal'));
+    assert.equal(await approval.isVisible(), false, "a retained gate must not hide a fault or invite continuation");
+  } finally { await browser.close(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
+});
