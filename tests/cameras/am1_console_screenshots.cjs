@@ -2,9 +2,13 @@
 // Synthetic frames only. Output stays outside Git; no household evidence.
 const {chromium}=require("playwright"), fs=require("node:fs"), path=require("node:path");
 const {createFixture}=require("./am1_console_layout_fixture.cjs");
-const [output, label="after", source]=process.argv.slice(2);
+const args=process.argv.slice(2), startupApproval=args.includes("--startup-approval");
+const [output, label="after", source]=args.filter(arg=>arg!=="--startup-approval");
 (async()=>{
   const {server,fixture}=createFixture(source);
+  if (startupApproval) fixture.snapshot={session_id:"synthetic-approval", phase:"host_ready", telemetry:{},
+    pending_gate:["live_start",null], input_pause:{reason:"window-blur"},
+    progress:{startup:{step:7,stage:"final_readiness",waiting:true}}};
   await new Promise(r=>server.listen(0,"127.0.0.1",r));
   const browser=await chromium.launch({headless:true,channel:"msedge"});
   try {

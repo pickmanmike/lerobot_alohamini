@@ -145,6 +145,7 @@ test("startup approval stays visible and Continue startup approves only the disp
   const {server, fixture} = createFixture();
   fixture.snapshot = {session_id:"fixture-startup", input_epoch:1, phase:"host_ready", events:[], telemetry:{},
     pending_gate:["live_start", null], input_pause:{reason:"window-blur"},
+    first_input_pause:{reason:"document-hidden"},
     progress:{startup:{step:7, stage:"final_readiness", waiting:true}}};
   await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
   const browser = await chromium.launch({headless:true, channel:"msedge"});
@@ -159,13 +160,30 @@ test("startup approval stays visible and Continue startup approves only the disp
     assert.equal(await page.locator('.session-details').getAttribute('open'), null);
     assert.equal(await approval.isVisible(), true);
     assert.match(await approval.innerText(), /window lost focus/i);
+    assert.doesNotMatch(await approval.innerText(), /page was hidden/i, "current cause must not use first-pause history");
     assert.match(await approval.innerText(), /Continue startup/);
     assert.doesNotMatch(await approval.innerText(), /waiting for measured completion/i);
-    assert.match(await page.locator('#session-state').innerText(), /Continue startup/);
+    assert.match(await page.locator('#session-state').innerText(), /Waiting for your confirmation.*Continue startup/);
     const button = page.locator('[data-operation="Resume"]');
     assert.equal(await button.innerText(), "Continue startup");
+    assert.equal(await button.getAttribute('aria-label'), "Continue startup");
+    await button.focus();
+    assert.match(await page.locator('#control-tooltip').innerText(), /Continue startup/);
+    await page.keyboard.press('Escape');
     const stop = await page.locator('[data-operation="Stop"]').boundingBox();
     assert.ok(stop && stop.y >= 0 && stop.y + stop.height <= 786);
+    for (const [width, height] of [[767,786], [1536,794]]) {
+      await page.setViewportSize({width, height});
+      const layout = await page.evaluate(() => ({width:innerWidth, height:innerHeight,
+        scrollWidth:document.documentElement.scrollWidth,
+        bottom:Math.max(...[...document.querySelectorAll('[data-body-key], .control-actions button, #primary, #thumbnails')]
+          .filter(element => element.getBoundingClientRect().width)
+          .map(element => element.getBoundingClientRect().bottom)),
+        minimumButtonHeight:Math.min(...[...document.querySelectorAll('[data-body-key]')]
+          .map(element => element.getBoundingClientRect().height))}));
+      assert.ok(layout.bottom <= height && layout.scrollWidth <= width, JSON.stringify(layout));
+      assert.ok(layout.minimumButtonHeight >= 42);
+    }
     await page.waitForTimeout(5200); // Unlike the transient operation notice, the gate remains visible.
     assert.equal(await approval.isVisible(), true);
     assert.equal(fixture.requests.filter(request => request.path === "/api/operation").length, 0,
@@ -194,8 +212,36 @@ test("startup approval stays visible and Continue startup approves only the disp
     fixture.snapshot = {...fixture.snapshot, phase:"awaiting_live_ack", pending_gate:null};
     await page.waitForFunction(() => document.querySelector('#session-state').textContent.includes('native live admission'));
     assert.doesNotMatch(await approval.innerText(), /Continue startup/);
+    fixture.snapshot = {...fixture.snapshot, phase:"live"};
+    await page.waitForFunction(() => document.querySelector('#session-state').textContent.startsWith('Live —'));
+    assert.equal(await approval.isVisible(), false);
+    assert.equal(await button.getAttribute('aria-label'), "Resume");
+    fixture.snapshot = {...fixture.snapshot, phase:"paused", pending_gate:["resume",3]};
+    await page.waitForFunction(() => document.querySelector('#session-state').textContent.startsWith('Paused'));
+    await button.focus();
+    assert.match(await page.locator('#control-tooltip').innerText(), /Resume/);
+    assert.doesNotMatch(await page.locator('#control-tooltip').innerText(), /Continue startup/);
+    await page.keyboard.press('Escape');
+    fixture.snapshot = {...fixture.snapshot, pending_gate:["realign",3]};
+    await page.waitForFunction(() => document.querySelector('#gate-state').textContent.includes('Approval needed: realign'));
+    await page.locator('#duration-seconds').focus(); // Escape kept focus on Resume; refocus to reopen its help.
+    await button.focus();
+    assert.equal(await page.locator('#control-tooltip').isVisible(), true);
+    assert.match(await page.locator('#control-tooltip').innerText(), /More.*Approve realignment/);
+    await page.keyboard.press('Escape');
     fixture.snapshot = {...fixture.snapshot, phase:"failed", pending_gate:["live_start", null], error:"original refusal"};
     await page.waitForFunction(() => document.querySelector('#session-state').textContent.includes('original refusal'));
     assert.equal(await approval.isVisible(), false, "a retained gate must not hide a fault or invite continuation");
+    fixture.snapshot = {session_id:"fixture-next", phase:"host_ready", events:[], telemetry:{},
+      first_input_pause:{reason:"window-blur"}, progress:{startup:{step:6,stage:"arm_sync",remaining_estimate_s:20}}};
+    await page.waitForFunction(() => document.querySelector('#startup-state').textContent.includes('Step 6 of 7'));
+    assert.doesNotMatch(await approval.innerText(), /focus|confirmation|Continue startup/i,
+      "a new session without a pending gate reports its actual phase, not an old pause");
+    fixture.snapshot.pending_gate = ["sync_start",null];
+    await page.waitForFunction(() => document.querySelector('#startup-state').textContent.includes('reason not reported'));
+    assert.doesNotMatch(await approval.innerText(), /window lost focus/i);
+    fixture.snapshot.input_pause = {reason:"unclassified input condition"};
+    await page.waitForFunction(() => document.querySelector('#startup-state').textContent.includes('reason unknown'));
+    assert.doesNotMatch(await approval.innerText(), /window lost focus/i);
   } finally { await browser.close(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
 });

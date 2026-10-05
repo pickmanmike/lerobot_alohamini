@@ -68,6 +68,13 @@ Exact staged console/helper identity is `git rev-parse HEAD` in their checkouts
 and the backed-up private `remote_session_head` pin; do not publish private config.
 No new servo reader, polling thread, dependency or timing service is introduced.
 
+The image-age and startup-message follow-ups are **Windows-only**. The Pi helper
+stays at `8e6a0cf616cb2000df1d0e996ab27a19d2fb2fba`; the separate motor/camera pins
+above remain unchanged. Their earlier software and physical evidence is retained,
+not relabeled as a newly exercised startup. An observed focus release followed by
+successful alignment and an unapproved live-start timeout is a genuine refusal,
+not a motor/alignment failure. The originating focus event remains unknown.
+
 Everyday entrypoint and Q/page Stop remain unchanged. Stop before switching
 sources. Rollback uses the retained accepted console/helper branch at
 `a77e97b09a2ae1defa9c440baadc9e58a3df3aa9` plus the matching private-pin backup;
@@ -179,8 +186,14 @@ starting hardware.
 If a startup input lease was released, the pending `sync_start` or `live_start`
 gate shows **Continue startup**. Its approval instruction and recorded input-pause
 reason remain visible above the toolbar, outside collapsed Session details; they
-replace the measured-completion message while the gate is pending. The button
-also says **Continue startup**, not Resume. Technical gate/epoch evidence stays
+replace the measured-completion message with **Waiting for your confirmation**
+while the gate is pending. Instruction, button, accessible name and help all use
+**Continue startup** for startup, **Resume** for live recovery, and the existing
+**Approve realignment** action for its separate gate. A current unknown/unreported
+reason stays unknown/unreported; first-pause history is not a substitute. Before
+a gate exists, the actual startup phase/estimate remains visible and does not
+claim that all motion stopped. Faults, stopping and terminal results take precedence;
+completed gates and new sessions clear old instructions. Technical gate/epoch evidence stays
 in Session details. This display-only correction changes no gate deadline,
 input lease or automatic-admission policy and requires only the Windows console
 source, not a Pi helper/motor/camera update. Hold the leaders still, release all

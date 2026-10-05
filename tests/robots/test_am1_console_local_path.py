@@ -39,6 +39,7 @@ class FakeSessionIO:
         self.native = None
         self.error = None
         self.on_live = lambda: None
+        self.before_gate = lambda stage, emit: None
         self.live_duration_s = live_duration_s
         self.run_count = 0
         self.variant = variant
@@ -106,6 +107,7 @@ class FakeSessionIO:
             else:
                 gates = ("sync_start", "live_start")
             for gate in gates:
+                self.before_gate(gate, emit)
                 if not native.wait_gate(gate, cancel=self.stopped.is_set, timeout_s=8):
                     return 2
             host_feedback[0] = {"state": "active", "epoch": 0}  # Fake actual host acknowledgement.
@@ -700,12 +702,19 @@ def test_owned_native_process_keeps_real_pipe_and_stops(tmp_path, startup_second
 @pytest.mark.skipif(sys.platform != "win32", reason="Actual AF_PIPE is Windows-only")
 @pytest.mark.parametrize("case", ["healthy", "navigation", "blur", "hidden", "body-delay",
                                       "body-presence-loss", "short-browser-stall",
-                                      "body-reject", "body-denied", "state-reject", "state-delay", "pending-stop", "camera-delay", "approval-order"])
+                                      "body-reject", "body-denied", "state-reject", "state-delay", "pending-stop", "camera-delay", "approval-order", "startup-approval"])
 def test_browser_loopback_native_path(tmp_path, case):
     node = shutil.which("node")
     if not node or subprocess.run([node, "-e", "require('playwright')"], capture_output=True).returncode:
         pytest.skip("Existing Playwright runtime required; never install it in this test")
     session = FakeSessionIO()
+    startup_release = threading.Event()
+    if case == "startup-approval":
+        def before_gate(stage, emit):
+            if stage == "live_start":
+                emit({"event": "test_before_live_gate"})
+                assert startup_release.wait(5), "frontend must deliver a real startup blur before requesting the gate"
+        session.before_gate = before_gate
     camera = ThreadingHTTPServer(("127.0.0.1", 0), FakeCamera)
     camera.daemon_threads = True
     if case == "camera-delay":
@@ -724,7 +733,10 @@ def test_browser_loopback_native_path(tmp_path, case):
     real_body_input = adapter.body_input
     def observed_body_input(payload):
         received.append((payload.get("seq"), time.monotonic(), payload.get("active")))
-        return real_body_input(payload)
+        result = real_body_input(payload)
+        if not payload.get("active") and payload.get("release_reason") == "window-blur":
+            startup_release.set()  # Only after the real HTTP owner received the release.
+        return result
     adapter.body_input = observed_body_input
     server = ConsoleServer(("127.0.0.1", 0), config, auth, adapter)
     threads = [threading.Thread(target=s.serve_forever, daemon=True) for s in (camera, server)]

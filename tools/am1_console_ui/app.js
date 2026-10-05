@@ -193,7 +193,8 @@ class AM1ConsolePresentation {
     if (["sync_start", "live_start"].includes(gate)) {
       const causes = {"window-blur":"Control window lost focus.", "document-hidden":"Control page was hidden.",
         "route-change":"Control page was left.", "pagehide":"Control page was unloaded."};
-      const cause = pauseReason ? (causes[pauseReason] || "Control input was paused; see Session details.") + " " : "";
+      const cause = (pauseReason ? (causes[pauseReason] || "Current pause reason unknown; see Details.") :
+        "Current pause reason not reported.") + " ";
       return `${cause}Release body controls, hold leaders still, then select Continue startup to approve this gate, or Stop.`;
     }
     if (!record || !Number.isInteger(record.step) || record.step < 1 || record.step > 7)
@@ -230,7 +231,7 @@ class AM1ConsolePresentation {
       "Stopped by operator — cleanup verified." : "Stopped result awaiting cleanup verification.";
     if (state.phase === "complete") return state.cleanup_verified === true ?
       "Session complete — cleanup verified." : "Session ended — cleanup not yet verified.";
-    if (["sync_start", "live_start"].includes(gate)) return "Startup approval needed — use Continue startup or Stop.";
+    if (["sync_start", "live_start"].includes(gate)) return "Waiting for your confirmation — Continue startup or Stop.";
     if (gate) return `${gate === "resume" ? "Paused" : "Startup approval needed"} — release controls, hold leaders still, then ${gate === "realign" ? "approve realignment" : "use Resume"}.`;
     if (state.phase === "paused" || state.pause_required) return "Paused — release controls and wait for the current qualified Resume gate.";
     if (state.phase === "live") return "Live — leaders and held body controls are enabled.";
@@ -432,7 +433,12 @@ if (typeof document !== "undefined") {
         ` Last native gate request rejected: ${state.gate_request_evidence.rejection}. Use Stop if the gate cannot be completed.`;
       const resume = document.querySelector('[data-operation="Resume"]');
       resume.textContent = startupGate ? "Continue startup" : "Resume";
-      resume.setAttribute("aria-label", startupGate ? "Continue startup" : "Approve Resume");
+      resume.setAttribute("aria-label", resume.textContent);
+      resume.dataset.tip = startupGate ?
+        "Continue startup: release movement controls and hold leaders still. Approve only this startup gate; wait for native live admission." :
+        gate?.[0] === "realign" ? "Use More → Approve realignment for this gate. Resume is for live recovery." :
+        "Resume: release movement controls and hold leaders still. Approve only the current qualified live gate; wait for native resumption.";
+      if (tooltipOwner === resume) showTooltip(resume);
       try { renderSnapshot(state); } catch {
         document.querySelector("#system-notice").textContent = "Diagnostic display unavailable; Control and Stop remain available.";
       }

@@ -129,7 +129,7 @@ assert([8000, 45000].includes(startupWaitMs), "test startup deadline must stay b
     const paused = await until(state => state.pending_gate?.[0] === "resume");
     await page.waitForFunction(epoch => document.querySelector("#gate-state").textContent.includes(
       `Approval needed: resume (host epoch ${epoch})`), paused.pending_gate[1]);
-    await page.getByRole("button", {name:"Approve Resume", exact:true}).click();
+    await page.getByRole("button", {name:"Resume", exact:true}).click();
     await until(state => state.phase === "live" && native(state)?.paused === false);
     await page.keyboard.down("w");
     await until(state => native(state)?.keys.includes("w"));
