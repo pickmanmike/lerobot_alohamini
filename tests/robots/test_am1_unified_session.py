@@ -659,9 +659,11 @@ def test_client_safety_refusal_stays_primary_when_lease_fault_appears_after_clie
             state["client_exited"] = True
             return 2
 
+    emitted=[]
     outcome = module.SessionCoordinator(
         remote=Remote(), client=Client(), open_browser=lambda url: None,
         collect_remote_log=lambda remote, local: (True, None), input_fn=lambda prompt: "",
+        emit=emitted.append,
     ).run(
         duration_seconds=60, session_id="20260924T210455-3eb748ba",
         session_directory=tmp_path, client_log_path=tmp_path / "client.log",
@@ -671,6 +673,7 @@ def test_client_safety_refusal_stays_primary_when_lease_fault_appears_after_clie
     assert outcome.operational_exit_code == outcome.final_exit_code == 2
     assert outcome.failure == "Windows Local client safety refusal: follower observation age 1.016s"
     assert outcome.cleanup["remote_fault_observed_after_client_result"] == late_fault
+    assert emitted[-1]["failure"] == outcome.failure
 
 
 def test_successful_short_recovery_is_a_summary_warning_not_a_failed_session(tmp_path):

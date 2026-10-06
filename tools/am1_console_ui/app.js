@@ -188,6 +188,60 @@ class AM1ConsoleViews {
 }
 globalThis.AM1ConsoleViews = AM1ConsoleViews;
 
+class AM1ConsolePresentation {
+  static startup(record, gate = null, pauseReason = null) {
+    if (["sync_start", "live_start"].includes(gate)) {
+      const causes = {"window-blur":"Control window lost focus.", "document-hidden":"Control page was hidden.",
+        "route-change":"Control page was left.", "pagehide":"Control page was unloaded."};
+      const cause = (pauseReason ? (causes[pauseReason] || "Current pause reason unknown; see Details.") :
+        "Current pause reason not reported.") + " ";
+      return `${cause}Release body controls, hold leaders still, then select Continue startup to approve this gate, or Stop.`;
+    }
+    if (!record || !Number.isInteger(record.step) || record.step < 1 || record.step > 7)
+      return "Startup progress not yet reported.";
+    const labels = {connections:"Checking connections", cameras:"Preparing cameras", lift_home:"Homing lift",
+      lift_relief:"Raising lift clear of the stop", leader_preparation:"Preparing leaders",
+      arm_sync:"Synchronizing arms", final_readiness:"Checking final readiness"};
+    const suffix = record.waiting ? "waiting for measured completion" :
+      Number.isFinite(record.remaining_estimate_s) ? `estimated ${Math.ceil(record.remaining_estimate_s)} s remaining` :
+      `elapsed ${Math.floor(record.elapsed_s || 0)} s; waiting for actual progress`;
+    return `Step ${record.step} of 7 · ${labels[record.stage] || "Progress unavailable"} · ${suffix}`;
+  }
+  static countdown(timing, receivedAt, now, roundTripMs = 0) {
+    if (!timing || timing.state === "Unavailable" || !Number.isFinite(timing.remaining_s))
+      return "Live timer unavailable";
+    if (timing.state === "Stopped") return "Live timer stopped — see cleanup status";
+    const elapsed = Math.max(0, now - receivedAt) / 1000;
+    if (timing.state === "Stale" || (timing.age_s || 0) + elapsed + roundTripMs / 1000 > 2)
+      return "Live timer stale — waiting for native timing";
+    const remaining = Math.max(0, Math.ceil(timing.remaining_s - elapsed));
+    return remaining === 0 ? "Time elapsed — stopping pending actual result" :
+      `~${Math.floor(remaining / 60)}:${String(remaining % 60).padStart(2,"0")} remaining`;
+  }
+  static status(state) {
+    if (!state) return "Session status unavailable. Release controls; use Stop if needed.";
+    const gate = state.pending_gate?.[0];
+    if (state.phase === "stopping") return "Stopping — waiting for verified cleanup.";
+    if (state.phase === "client_exited") return "Finishing — waiting for cleanup and the final result.";
+    if (state.phase === "cleanup_unknown") return "Cleanup is unverified — do not restart." +
+      (state.error ? ` Primary fault: ${state.error}` : "");
+    if (state.error) return `Session refused: ${state.error}`;
+    if (state.phase === "failed") return "Session failed — inspect Session details; do not restart.";
+    if (state.phase === "operator_stopped") return state.cleanup_verified === true ?
+      "Stopped by operator — cleanup verified." : "Stopped result awaiting cleanup verification.";
+    if (state.phase === "complete") return state.cleanup_verified === true ?
+      "Session complete — cleanup verified." : "Session ended — cleanup not yet verified.";
+    if (["sync_start", "live_start"].includes(gate)) return "Waiting for your confirmation — Continue startup or Stop.";
+    if (gate) return `${gate === "resume" ? "Paused" : "Startup approval needed"} — release controls, hold leaders still, then ${gate === "realign" ? "approve realignment" : "use Resume"}.`;
+    if (state.phase === "paused" || state.pause_required) return "Paused — release controls and wait for the current qualified Resume gate.";
+    if (state.phase === "live") return "Live — leaders and held body controls are enabled.";
+    if (state.phase === "awaiting_live_ack") return "Waiting for native live admission — hold leaders still.";
+    if (state.phase === "feedback_stale") return "Follower feedback is stale — waiting for safe recovery.";
+    return state.session_id ? "Starting — hold leaders still; watch actual progress below." : "Ready to start a Local session.";
+  }
+}
+globalThis.AM1ConsolePresentation = AM1ConsolePresentation;
+
 if (typeof document !== "undefined") {
   const csrf = document.querySelector('meta[name="am1-csrf"]').content;
   const stateText = document.querySelector("#session-state");
@@ -224,6 +278,7 @@ if (typeof document !== "undefined") {
   let logRequestInFlight = false;
   let terminalRequestId = 0;
   let terminalRequestInFlight = false;
+  let timingReceivedAt = 0, stateRoundTripMs = 0, noticeUntil = 0;
 
   function row(container, label, value) {
     const line = document.createElement("tr");
@@ -306,7 +361,11 @@ if (typeof document !== "undefined") {
     if (!response.ok) throw new Error(`request refused (${response.status})`);
     return response.json();
   }
-  function message(value) { notice.textContent = value; }
+  function message(value) {
+    notice.textContent = value;
+    notice.hidden = !value;
+    noticeUntil = performance.now() + 5000;
+  }
   function route() {
     const selected = ["control", "servos", "system", "logs", "terminal"].includes(location.hash.slice(1)) ?
       location.hash.slice(1) : "control";
@@ -315,15 +374,22 @@ if (typeof document !== "undefined") {
     document.querySelectorAll("[data-console-page]").forEach(page => {
       page.hidden = page.dataset.consolePage !== selected;
     });
+    document.querySelectorAll('[data-operation="Start"], [data-operation="Resume"], [data-operation="Approve"], [data-operation="ClaimInput"]').forEach(button => {
+      button.disabled = selected !== "control";
+      button.title = selected === "control" ? "" : "Return to Control to start or approve motion.";
+    });
   }
   async function readState() {
     if (stateRequestInFlight) return;
     stateRequestInFlight = true;
+    const requestedAt = performance.now();
     try {
       const response = await fetch("/api/state", {cache:"no-store", credentials:"same-origin"});
       if (!response.ok) throw new Error("session state unavailable");
       const priorSessionId = state?.session_id;
       state = await response.json();
+      timingReceivedAt = performance.now();
+      stateRoundTripMs = timingReceivedAt - requestedAt;
       if (priorSessionId !== state.session_id) {
         loadedLog = "";
         loadedLogSessionId = null;
@@ -333,15 +399,27 @@ if (typeof document !== "undefined") {
         document.querySelector("#log-session").textContent = "No exact session log selected.";
         document.querySelector("#terminal-output").textContent = "Session changed. Select an original output.";
       }
-      const phaseLabel = state.phase === "operator_stopped" ? "Stopped by operator" : state.phase;
-      stateText.textContent = state.session_id ? `Session ${state.session_id}: ${phaseLabel}` : "No session is active.";
+      stateText.textContent = AM1ConsolePresentation.status(state);
+      const startup = state.progress?.startup;
+      const starting = !["live", "paused", "feedback_stale", "stopping", "operator_stopped", "complete", "failed", "cleanup_unknown", "client_exited"].includes(state.phase);
+      const gate = state.pending_gate;
+      const startupGate = starting && !state.error && ["sync_start", "live_start"].includes(gate?.[0]);
+      document.querySelector("#startup-state").hidden = !state.session_id || !starting || Boolean(state.error);
+      document.querySelector("#startup-state").textContent = AM1ConsolePresentation.startup(
+        startup, startupGate ? gate[0] : null, state.input_pause?.reason);
+      document.querySelector("#session-details").textContent = JSON.stringify({session_id:state.session_id,
+        phase:state.phase, final_exit_code:state.final_exit_code, cleanup_verified:state.cleanup_verified,
+        error:state.error, events:state.events,
+        progress:state.progress, host:state.telemetry?.observation, input_epoch:state.input_epoch,
+        input_pause:state.input_pause, first_input_pause:state.first_input_pause,
+        browser_first_pause:state.browser_first_pause, gate_ack_evidence:state.gate_ack_evidence,
+        gate_request_evidence:state.gate_request_evidence, native_connected:state.native_connected}, null, 2);
       const saved = sessionStorage.getItem("am1-control-owner");
       if (saved && !input.sessionId && state.session_id) {
         const owner = JSON.parse(saved);
         if (owner.session_id === state.session_id && owner.input_epoch === state.input_epoch)
           input.attach(owner.session_id, owner.control_token, owner.input_epoch);
       }
-      const gate = state.pending_gate;
       document.querySelector("#gate-state").textContent = gate ?
         `Approval needed: ${gate[0]} (host epoch ${gate[1] ?? "before live"}). Hold leaders still and release body keys.` :
         "No manual approval pending.";
@@ -353,13 +431,20 @@ if (typeof document !== "undefined") {
         ` Native input: ${state.native_connected ? "connected" : "disconnected"}.`;
       if (state.gate_request_evidence?.accepted === false) document.querySelector("#gate-state").textContent +=
         ` Last native gate request rejected: ${state.gate_request_evidence.rejection}. Use Stop if the gate cannot be completed.`;
-      document.querySelector('[data-operation="Resume"]').textContent =
-        ["sync_start", "live_start"].includes(gate?.[0]) ? "Continue startup" : "Approve Resume";
+      const resume = document.querySelector('[data-operation="Resume"]');
+      resume.textContent = startupGate ? "Continue startup" : "Resume";
+      resume.setAttribute("aria-label", resume.textContent);
+      resume.dataset.tip = startupGate ?
+        "Continue startup: release movement controls and hold leaders still. Approve only this startup gate; wait for native live admission." :
+        gate?.[0] === "realign" ? "Use More → Approve realignment for this gate. Resume is for live recovery." :
+        "Resume: release movement controls and hold leaders still. Approve only the current qualified live gate; wait for native resumption.";
+      if (tooltipOwner === resume) showTooltip(resume);
       try { renderSnapshot(state); } catch {
         document.querySelector("#system-notice").textContent = "Diagnostic display unavailable; Control and Stop remain available.";
       }
     } catch {
       stateText.textContent = "Session state unavailable; no motor readiness implied.";
+      document.querySelector("#startup-state").hidden = true;
       if (input.live) input.release(true, "state-request-failed");
       message("Input paused: session state request failed. Release controls; explicit Resume is required.");
     } finally { stateRequestInFlight = false; }
@@ -454,6 +539,10 @@ if (typeof document !== "undefined") {
     document.querySelector("#terminal-output").textContent = "Select View for this original output.";
   });
   async function operation(kind) {
+    if (["Start","Resume","Approve","ClaimInput"].includes(kind) && input.route !== "control") {
+      message("Return to Control to start or approve motion. Stop remains available here.");
+      return;
+    }
     const stopping = kind === "Stop";
     if (stopping ? stopInFlight : busy || stopInFlight) return;
     const generation = stopping ? ++operationGeneration : operationGeneration;
@@ -480,6 +569,10 @@ if (typeof document !== "undefined") {
         {kind, session_id:state?.session_id, control_token:input.token};
       if (kind === "Start") {
         payload.duration_seconds = Number(document.querySelector("#duration-seconds").value);
+        if (!Number.isInteger(payload.duration_seconds) || payload.duration_seconds < 1 || payload.duration_seconds > 1800) {
+          message("Choose a whole-number duration from 1 to 1800 seconds. Start was not sent.");
+          return;
+        }
         payload.leader_source = "physical";
       }
       const result = await post("/api/operation", payload);
@@ -516,6 +609,46 @@ if (typeof document !== "undefined") {
     for (const type of ["pointerup", "pointercancel", "pointerleave", "lostpointercapture"])
       button.addEventListener(type, () => input.pointerUp(key));
   });
+  // Bind once, independently of status ticks and hold/release listeners.
+  const tooltip = document.querySelector("#control-tooltip");
+  let tooltipOwner = null;
+  function hideTooltip() { tooltip.hidden = true; tooltipOwner = null; }
+  function showTooltip(button) {
+    tooltipOwner = button;
+    tooltip.textContent = button.dataset.tip;
+    tooltip.hidden = false;
+    const anchor = button.getBoundingClientRect(), stop = document.querySelector('[data-operation="Stop"]').getBoundingClientRect();
+    // Keep explanations below the Stop toolbar, even when a lower control is focused.
+    const box = tooltip.getBoundingClientRect();
+    tooltip.style.left = `${Math.max(8,Math.min(anchor.left,innerWidth-box.width-8))}px`;
+    tooltip.style.top = `${Math.max(stop.bottom+8,Math.min(anchor.bottom+8,innerHeight-box.height-8))}px`;
+  }
+  document.querySelectorAll("[data-tip]").forEach(button => {
+    button.setAttribute("aria-describedby", "control-tooltip");
+    button.addEventListener("pointerenter", () => showTooltip(button));
+    button.addEventListener("focus", () => showTooltip(button));
+    button.addEventListener("pointerleave", () => { if (tooltipOwner === button) hideTooltip(); });
+    button.addEventListener("blur", () => { if (tooltipOwner === button) hideTooltip(); });
+  });
+  const helpButton = document.querySelector('[data-help="touch"]');
+  helpButton.addEventListener("click", () => {
+    const help = document.querySelector("#control-help");
+    help.hidden = !help.hidden;
+    helpButton.setAttribute("aria-expanded", String(!help.hidden));
+    hideTooltip();
+  });
+  document.addEventListener("keydown", event => {
+    if (event.key === "Escape") {
+      hideTooltip();
+      document.querySelector("#control-help").hidden = true;
+      helpButton.setAttribute("aria-expanded", "false");
+    }
+  });
+  setInterval(() => {
+    document.querySelector("#live-countdown").textContent = AM1ConsolePresentation.countdown(
+      state?.progress?.live_timing, timingReceivedAt, performance.now(), stateRoundTripMs);
+    if (noticeUntil && performance.now() > noticeUntil) notice.hidden = true;
+  }, 250);
   document.addEventListener("keydown", event => {
     if (event.key.toLowerCase() === "q" && input.route === "control" && !input._typing(event.target)) {
       event.preventDefault(); operation("Stop"); return;

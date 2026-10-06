@@ -1122,6 +1122,52 @@ class FakeClock:
         self.events.append(("clock", "advance", duration_s))
 
 
+def test_console_sync_progress_reports_actual_frames_without_changing_actions(monkeypatch):
+    module = load_example_module("teleoperate_bi")
+    target = {**LEADER_POSE, "left_shoulder_pan.pos": 1.5}
+    final = {f"arm_{key}": value for key, value in target.items()}
+    robot, leader, events = make_direct_sync_fakes(
+        monkeypatch, module, observation_poses=[FOLLOWER_POSE, FOLLOWER_POSE, final],
+        action_poses=[target] * 7,
+    )
+    clock = FakeClock(events)
+    progress = []
+    module.run_startup_sync(robot, leader, side="both", requested_duration_s=1.0, fps=5,
+        max_start_mismatch=10, input_fn=lambda _: "SYNC", monotonic=clock.monotonic,
+        sleep_fn=clock.sleep, progress_callback=progress.append)
+    plan = [p for p in progress if p["stage"] == "arm_sync" and not p.get("waiting")]
+    assert plan[0]["frames_sent"] == 0
+    assert plan[-1]["frames_sent"] == plan[-1]["frame_count"] == len(arm_send_actions(events))
+    assert plan[0]["remaining_estimate_s"] == 1.0
+    assert all(p["remaining_estimate_s"] == max(0,p["frame_count"]-max(1,p["frames_sent"]))/p["fps"]
+               for p in plan)
+    assert progress[-1]["stage"] == "final_readiness"
+    assert all(all(action[key] == 0 for key in module.make_zero_action()) for action in arm_send_actions(events))
+
+
+def test_live_timing_origin_is_exact_native_admission_and_is_not_restarted_during_pause():
+    module = load_example_module("teleoperate_bi")
+    at = [100.0]
+    sender = module.AM1LiveActionSender.__new__(module.AM1LiveActionSender)
+    import threading
+    sender._state_lock = threading.Lock()
+    sender._recovery_enabled = True
+    sender._initial_admission_expired = False
+    sender._finished = threading.Event()
+    sender._stop_requested = threading.Event()
+    sender._live_started_at = None
+    sender._duration_s = 90.0
+    sender._monotonic = lambda: at[0]
+    assert sender.live_timing_snapshot() is None
+    sender.mark_live_admitted()
+    at[0] = 105.0
+    assert sender.live_timing_snapshot() == {"event":"live_timing", "clock":"windows_monotonic",
+        "live_started_at":100.0, "deadline":190.0, "duration_s":90.0, "sampled_at":105.0}
+    sender._recovery_state = "paused"
+    at[0] = 115.0
+    assert sender.live_timing_snapshot()["deadline"] == 190.0
+
+
 def arm_send_actions(events: list[tuple]) -> list[dict[str, float | int]]:
     return [
         event[2]

@@ -403,6 +403,16 @@ class AM1LiveActionSender:
                 raise RuntimeError("AM1 Local live admission already recorded")
             self._live_started_at = self._monotonic()
 
+    def live_timing_snapshot(self) -> dict[str, Any] | None:
+        """Read the actual enforced live origin; display only, including pauses."""
+        with self._state_lock:
+            if self._live_started_at is None:
+                return None
+            return {"event": "live_timing", "clock": "windows_monotonic",
+                    "live_started_at": self._live_started_at,
+                    "deadline": self._live_started_at + self._duration_s,
+                    "duration_s": self._duration_s, "sampled_at": self._monotonic()}
+
     def enable_initial_catchup(self) -> None:
         with self._state_lock:
             self._ramp_after_resume = True
@@ -1248,6 +1258,14 @@ def _complete_unified_startup_sync(
         last_send_completed_at = monotonic()
 
 
+def _publish_display_event(callback: Callable[[dict[str, Any]], None] | None, event: dict[str, Any]) -> None:
+    if callback is not None:
+        try:
+            callback(event)
+        except Exception:
+            pass  # Read-only presentation cannot replace a motion outcome.
+
+
 def run_startup_sync(
     robot: Any,
     leader: Any,
@@ -1264,6 +1282,7 @@ def run_startup_sync(
     cancel_check: Callable[[], None] | None = None,
     confirmation_gate: Callable[[str], bool] | None = None,
     gate_stage: str = "sync_start",
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[dict[str, float], dict[str, Any], float]:
     print("HOLD LEADERS STILL — STARTUP SYNCHRONIZATION IN PROGRESS")
     initial_observation = get_fresh_follower_observation(
@@ -1356,6 +1375,18 @@ def run_startup_sync(
     hold_action = build_startup_sync_action(plan, 0)
     feedback_paused_at: float | None = None
     previous_send_completed_at: float | None = None
+    def report_progress(*, waiting: bool = False, stage: str = "arm_sync") -> None:
+        _publish_display_event(progress_callback, {
+            "event": "startup_progress", "stage": stage, "source": "native frozen-target sync plan",
+            "frames_sent": frame_index, "frame_count": plan.frame_count, "fps": plan.fps,
+            "waiting": waiting,
+            "plan_started_at": motion_started_at,  # Repeated: latest-only forwarding may skip frame zero.
+            **({"remaining_estimate_s": max(0, plan.frame_count - max(1, frame_index)) / plan.fps}
+               if not waiting and stage == "arm_sync" else {}),
+        })
+
+    report_progress()
+    next_progress_at = motion_started_at + 0.25
     while frame_index < plan.frame_count:
         if previous_send_completed_at is not None:
             next_send_not_before = previous_send_completed_at + frame_period_s
@@ -1380,6 +1411,9 @@ def run_startup_sync(
                 raise SafetyRefusal("AM1 Local startup feedback did not recover within the connection budget")
             robot.send_action(hold_action)
             previous_send_completed_at = monotonic()
+            if previous_send_completed_at >= next_progress_at:
+                report_progress(waiting=True)
+                next_progress_at = previous_send_completed_at + 0.25
             continue
         if feedback_paused_at is not None:
             print("STARTUP FEEDBACK RESUMED — continuing bounded arm synchronization", flush=True)
@@ -1388,6 +1422,9 @@ def run_startup_sync(
         robot.send_action(hold_action)
         previous_send_completed_at = monotonic()
         frame_index += 1
+        if previous_send_completed_at >= next_progress_at or frame_index == plan.frame_count:
+            report_progress()
+            next_progress_at = previous_send_completed_at + 0.25
 
     print(
         json.dumps(
@@ -1408,11 +1445,13 @@ def run_startup_sync(
         leader_sample=True,
     )
     if enter_confirmation:
+        report_progress(waiting=True)
         final_observation, final_observed_at = _complete_unified_startup_sync(
             robot, leader, plan, hold_action, previous_send_completed_at,
             max_start_mismatch=max_start_mismatch, monotonic=monotonic,
             sleep_fn=sleep_fn, cancel_check=cancel_check,
         )
+        report_progress(stage="final_readiness", waiting=True)
         return validated_frozen_target, final_observation, final_observed_at
     verification_attempts = int(getattr(robot.config, "observation_request_window", 1)) + 1
     for verification_index in range(verification_attempts):
@@ -1443,6 +1482,7 @@ def run_startup_sync(
             continue
         break
 
+    report_progress(stage="final_readiness", waiting=True)
     return dict(plan.frozen_leader_target), final_observation, final_observed_at
 
 
@@ -2121,6 +2161,7 @@ def _run_am1_recovering_local_sender(
     on_host_active: Callable[[], None] | None = None,
     action_sent_callback: Callable[[Mapping[str, float | int], int, float, int], None] | None = None,
     feedback_callback: Callable[[AM1LiveSample, Mapping[str, Any]], None] | None = None,
+    timing_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> str | None:
     """Unified Local only: a host-acknowledged hold while feedback recovers."""
     try:
@@ -2275,11 +2316,19 @@ def _run_am1_recovering_local_sender(
         if _max_am1_arm_difference(sample.arm_target, sample.follower_positions) > max_start_mismatch:
             raise SafetyRefusal("AM1 Local leader/follower mismatch before live admission exceeds startup gate")
 
+    next_timing_at = 0.0
+    def report_timing() -> None:
+        if timing_callback is not None and (timing := sender.live_timing_snapshot()) is not None:
+            _publish_display_event(timing_callback, timing)
+
     try:
         sender.start()
         sender_started = True
         while sender.is_alive():
             now = monotonic()
+            if timing_callback is not None and now >= next_timing_at:
+                report_timing()
+                next_timing_at = now + 0.25
             if sender.snapshot().error is not None:
                 break
             body_action = validate_am1_local_body_action(body_action_supplier())
@@ -2407,6 +2456,7 @@ def _run_am1_recovering_local_sender(
                     if _max_am1_arm_difference(sample.arm_target, initial_arm_target) > 0:
                         sender.enable_initial_catchup()
                     sender.mark_live_admitted()
+                    report_timing()
                     if on_host_active is not None:
                         on_host_active()
                     if announce_active is not None:
@@ -2453,6 +2503,7 @@ def _run_am1_recovering_local_sender(
                     recovery_count += 1
                     if not initial_active_ack:
                         sender.mark_live_admitted()
+                        report_timing()
                         if announce_active is not None:
                             announce_active()
                     initial_active_ack = True
@@ -2639,6 +2690,7 @@ def run_am1_live_sender(
     on_host_active: Callable[[], None] | None = None,
     action_sent_callback: Callable[[Mapping[str, float | int], int, float, int], None] | None = None,
     feedback_callback: Callable[[AM1LiveSample, Mapping[str, Any]], None] | None = None,
+    timing_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> str | None:
     """Read devices on the caller thread while a private worker sends live actions."""
     approved_target = extract_am1_arm_positions(
@@ -2699,6 +2751,7 @@ def run_am1_live_sender(
             sample_callback=sample_callback, announce_active=announce_active, scripted_input=scripted_input,
             action_sent_callback=action_sent_callback,
             feedback_callback=feedback_callback,
+            timing_callback=timing_callback,
             control_pause_requested=control_pause_requested, manual_gate=manual_gate,
             on_host_active=on_host_active,
         )
@@ -3044,7 +3097,9 @@ def run_teleoperation(
                             if getattr(args, "unified_session_enter_confirmations", False) else None
                         ),
                         **({"confirmation_gate": lambda stage: console_input.wait_gate(
-                            stage, cancel=external_stop_requested)} if console_input is not None else {}),
+                            stage, cancel=external_stop_requested),
+                            "progress_callback": console_input.publish_telemetry}
+                           if console_input is not None else {}),
                     )
                     print("SYNCHRONIZATION COMPLETE")
                     if args.startup_sync_only:
@@ -3124,7 +3179,8 @@ def run_teleoperation(
                             ),
                             cancel_check=raise_if_external_stop_requested,
                             **({"confirmation_gate": lambda stage: console_input.wait_gate(
-                                stage, cancel=external_stop_requested), "gate_stage": "realign"}
+                                stage, cancel=external_stop_requested), "gate_stage": "realign",
+                                "progress_callback": console_input.publish_telemetry}
                                if console_input is not None else {}),
                         )
                         print("REALIGNMENT COMPLETE — rechecking current follower and leader positions.", flush=True)
@@ -3313,7 +3369,8 @@ def run_teleoperation(
                         "manual_gate": lambda epoch: console_input.wait_gate(
                             "resume", host_epoch=epoch, cancel=external_stop_requested),
                         "on_host_active": lambda: console_input.note_live_admitted(
-                            host_epoch=robot.latest_am1_local_feedback["epoch"])}
+                            host_epoch=robot.latest_am1_local_feedback["epoch"]),
+                        "timing_callback": console_input.publish_telemetry}
                        if console_input is not None else {}),
                 )
                 if scripted_mode:

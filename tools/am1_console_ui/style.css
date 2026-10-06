@@ -23,3 +23,68 @@ th[scope="row"] { white-space:nowrap; }
 .schematic-group h3 { margin:.1rem 0 .6rem; }
 .schematic-rail { display:flex; flex-wrap:wrap; gap:.4rem; }
 .schematic-card { display:flex; flex-direction:column; gap:.2rem; min-width:7rem; flex:1; padding:.5rem; border:1px solid #667; border-radius:.3rem; font-size:.78rem; }
+
+/* Console-only layout. The standalone camera viewer keeps its original CSS. */
+body[data-console="compact"] { max-width:1600px; padding:10px; box-sizing:border-box; }
+body[data-console="compact"] .console-top { position:sticky; top:0; z-index:30; background:#10171a; padding-bottom:6px; margin:0; }
+body[data-console="compact"] .page-heading { display:inline-flex; gap:.65rem; align-items:baseline; }
+body[data-console="compact"] h1 { font-size:1.1rem; margin:0; }
+body[data-console="compact"] nav { display:inline-flex; gap:.3rem; margin:0 0 6px 1rem; }
+body[data-console="compact"] nav a { font-size:.9rem; padding:.3rem .45rem; text-decoration:none; }
+body[data-console="compact"] .status-line { display:flex; gap:.6rem; align-items:baseline; justify-content:space-between; }
+body[data-console="compact"] #session-state { border:0; margin:0; padding:2px 0; font-weight:600; }
+body[data-console="compact"] #live-countdown { white-space:nowrap; font-variant-numeric:tabular-nums; color:#b2ddd2; font-size:.9rem; }
+body[data-console="compact"] #connection, body[data-console="compact"] #startup-state { margin:3px 0; }
+body[data-console="compact"] .control-actions { position:relative; display:flex; flex-wrap:wrap; gap:6px; align-items:center; margin:6px 0; padding:0; border:0; background:transparent; }
+body[data-console="compact"] button { font:inherit; color:inherit; background:#22353b; border:1px solid #536b71; border-radius:6px; cursor:pointer; }
+body[data-console="compact"] button:hover, body[data-console="compact"] button:focus-visible { outline:2px solid #85dfb8; outline-offset:1px; }
+body[data-console="compact"] .control-actions button { min-height:44px; padding:6px 12px; font-weight:600; }
+body[data-console="compact"] .control-actions button[data-operation="Stop"] { background:#ad3030; border-color:#e57171; color:white; margin-left:auto; }
+body[data-console="compact"] #duration-seconds { width:4rem; padding:6px 3px; font:inherit; border:1px solid #667; border-radius:4px; }
+body[data-console="compact"] .more-actions { margin:0; font-size:.9rem; }
+body[data-console="compact"] .more-actions summary { padding:10px 5px; cursor:pointer; }
+body[data-console="compact"] .more-actions[open] { flex-basis:100%; }
+body[data-console="compact"] .more-actions div { display:flex; gap:8px; flex-wrap:wrap; }
+body[data-console="compact"] .session-details { margin:4px 0 0; font-size:.85rem; }
+body[data-console="compact"] .session-details summary { cursor:pointer; }
+body[data-console="compact"] #control-notice { margin:4px 0; padding:4px 8px; }
+body[data-console="compact"] #control-help { padding:4px 10px; border:1px solid #526c70; border-radius:6px; }
+body[data-console="compact"] #control-help p { margin:6px 0; }
+body[data-console="compact"] main { gap:8px; }
+body[data-console="compact"] #am1-camera-root { display:grid; grid-template-columns:minmax(0,1.45fr) minmax(0,1fr); gap:8px; align-items:start; }
+body[data-console="compact"] #primary .image-wrap { height:clamp(200px,36vh,430px); }
+body[data-console="compact"] #thumbnails { display:grid; grid-template-areas:none; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; }
+body[data-console="compact"] .camera-slot { grid-area:auto; }
+body[data-console="compact"] .camera-slot[data-focused="true"] { display:none; }
+body[data-console="compact"] #thumbnails .image-wrap { height:clamp(80px,13vh,170px); aspect-ratio:auto; }
+body[data-console="compact"] .camera-heading { padding:5px 8px; min-height:30px; gap:4px; }
+body[data-console="compact"] #thumbnails .camera-heading { flex-direction:column; align-items:start; }
+body[data-console="compact"] .camera-status { font-size:.8rem; overflow-wrap:anywhere; }
+body[data-console="compact"] .camera-details { padding:3px 8px; font-size:.8rem; }
+body[data-console="compact"] .camera-details dl { grid-template-columns:1fr; }
+body[data-console="compact"] .camera-details dd { text-align:left; }
+body[data-console="compact"] .body-pad { display:grid; grid-template-columns:1.55fr 1fr 1fr; gap:14px; margin:0; padding:7px 10px; border:1px solid #344748; border-radius:8px; }
+body[data-console="compact"] .movement-group { min-width:0; }
+body[data-console="compact"] .movement-group h2 { font-size:1rem; margin:0 0 6px; color:#b6ccc5; }
+body[data-console="compact"] .direction-cross { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); grid-template-rows:repeat(3,44px); gap:4px; }
+body[data-console="compact"] .direction-cross [data-body-key="w"] { grid-column:2; grid-row:1; }
+body[data-console="compact"] .direction-cross [data-body-key="z"] { grid-column:1; grid-row:2; }
+body[data-console="compact"] .direction-cross [data-body-key="x"] { grid-column:3; grid-row:2; }
+body[data-console="compact"] .direction-cross [data-body-key="s"] { grid-column:2; grid-row:3; }
+body[data-console="compact"] .rotation-pair { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:6px; }
+body[data-console="compact"] .rotation-pair button { min-height:70px; }
+body[data-console="compact"] .lift-pair { display:grid; gap:6px; }
+body[data-console="compact"] .lift-pair button { min-height:62px; }
+body[data-console="compact"] .body-pad button { min-width:0; padding:2px 4px; display:flex; flex-direction:column; justify-content:center; align-items:center; line-height:1.15; font-size:1rem; }
+body[data-console="compact"] .body-pad kbd { font:inherit; font-size:.8rem; color:#a8bcb3; margin-top:2px; }
+body[data-console="compact"] .body-pad button:active { background:#416877; }
+body[data-console="compact"] main > details { margin:0; }
+body[data-console="compact"] #control-tooltip { position:fixed; z-index:50; max-width:300px; padding:9px 12px; font-size:.9rem; color:#f4faf7; background:#263c43; border:1px solid #8ca9aa; border-radius:7px; box-shadow:0 3px 14px #0008; pointer-events:none; }
+@media (max-width:650px) {
+  body[data-console="compact"] nav { display:flex; margin:6px 0; }
+  body[data-console="compact"] .status-line { align-items:start; flex-direction:column; gap:1px; }
+  body[data-console="compact"] .control-actions { padding:6px 0; background:#10171a; }
+  body[data-console="compact"] #am1-camera-root { grid-template-columns:1fr; }
+  body[data-console="compact"] .body-pad { grid-template-columns:1fr 1fr; }
+  body[data-console="compact"] .movement-group:first-child { grid-column:1 / -1; }
+}

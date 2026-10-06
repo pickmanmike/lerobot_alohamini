@@ -8,6 +8,79 @@ had a maximum browser display gap of `1.138 s`, above the unchanged `500 ms`
 continuity target. Loss of a required view still means release controls, press
 `Q`, and restart only after all owned processes have stopped.
 
+## Compact Control presentation — focused follow-up, October 4, 2026
+
+`codex/am1-control-ui-polish` follows integration `3645646701d721b3f1b60075c7f5e0d834997deb`;
+PR #12 remains closed. This changes presentation and bounded read-only progress,
+not the accepted operating policy. The dedicated DirectBrowser viewport was
+measured at **767 x 786 CSS pixels** snapped to half the owner's display, and
+**1536 x 794** maximized, both at device-pixel ratio 1.25 and visual scale 1.
+Synthetic-image before/after captures stay outside Git; no household images or
+private logs are published. The collapsed Control view fits all five views,
+status, duration/session toolbar and readable movement buttons at that half size.
+Smaller/accessibility-zoom windows may scroll; Stop remains accessible.
+
+One enlarged view plus four previews preserves roles, promotion, rotations,
+bounded retained images, generation/sequence and actual advancing receipt age.
+The top camera summary counts the visible primary against its existing 500 ms
+limit and previews against their existing 1500 ms limit. A last-good frame is
+not live. These are not physical scene-to-display latency measurements.
+
+Hold/release keys and actions are unchanged: W/S/Z/X move, A/D rotate, U/J lift.
+Hover or focus shows help; Escape dismisses it without moving focus or sending
+a command. Touch Help is non-actuating. More holds exceptional ownership and
+realignment actions. Start/approvals require Control; Stop is global and stays
+available during pending operations. Ordinary release zeros body input; only a
+full pause requires the current qualified Resume. The 1.5 s accepted-presence
+and 250 ms body/native-pipe/gate deadlines are unchanged.
+
+Startup is **Step N of 7**, never an elapsed-time readiness animation:
+
+| Display | Actual source |
+| --- | --- |
+| Connections; cameras | Existing Windows session preflight/start transitions |
+| Lift home; lift relief | The Pi helper's existing readiness-log reader, using the owning host's `[LIFT OPERATIONAL]` phase records |
+| Leader preparation | Actual lift `operational_ready`, before the existing native client preparation |
+| Arm synchronization | Frozen native sync plan and completed frame count; rate-limited, latest-only pipe telemetry |
+| Final readiness/live | Successful measured alignment followed by the existing native live-admission acknowledgement |
+
+Sync remaining time is explicitly **estimated** from the remaining planned send
+intervals and FPS. Feedback holds/final measured completion show waiting instead
+of inventing an ETA. A later operator-approved realignment reports its new plan.
+Phase elapsed time is since the console received that phase, not exact actuator
+start time; a short phase may be missed by the existing bounded log reader.
+
+The live countdown uses the sender's actual native live-admission origin and
+enforced deadline, not an earlier marker or browser Start. Windows native/server
+Python processes share the system-wide monotonic clock; Pi/browser monotonic
+origins are not subtracted. The HTTP response carries computed remaining time;
+browser interpolation is display-only with a conservative request-latency age
+margin. Timing older than 2 s is **stale**, missing timing is **unavailable**.
+Refresh attaches to current state. Pause consumes duration and Resume never
+resets it. Zero means time elapsed, awaiting the real terminal result; a stopped
+timer is not verified cleanup. Fault reason/raw codes remain in Session details.
+
+Only Windows console/client and the Pi session helper need this follow-up.
+Preserve the separate motor `c3fc683d645ea1c355e69a72f705a8bbadde6a1a` and camera
+`9b1f0670e7068f7d39eb50270a118e3807418355` owners. The accepted source identities
+and physical results below remain historical evidence, not a new powered test.
+Exact staged console/helper identity is `git rev-parse HEAD` in their checkouts
+and the backed-up private `remote_session_head` pin; do not publish private config.
+No new servo reader, polling thread, dependency or timing service is introduced.
+
+The image-age and startup-message follow-ups are **Windows-only**. The Pi helper
+stays at `8e6a0cf616cb2000df1d0e996ab27a19d2fb2fba`; the separate motor/camera pins
+above remain unchanged. Their earlier software and physical evidence is retained,
+not relabeled as a newly exercised startup. An observed focus release followed by
+successful alignment and an unapproved live-start timeout is a genuine refusal,
+not a motor/alignment failure. The originating focus event remains unknown.
+
+Everyday entrypoint and Q/page Stop remain unchanged. Stop before switching
+sources. Rollback uses the retained accepted console/helper branch at
+`a77e97b09a2ae1defa9c440baadc9e58a3df3aa9` plus the matching private-pin backup;
+switch clean stopped checkouts normally, without reset or changing motor/camera
+pins. This follow-up is a separate draft PR; no merge is implied.
+
 ## Windows Control console — qualified ordinary-use closeout, October 4, 2026
 
 The owner accepts ordinary supervised Local use. The remaining original Control
@@ -111,8 +184,20 @@ is under the private configured `windows_log_directory`, named
 starting hardware.
 
 If a startup input lease was released, the pending `sync_start` or `live_start`
-gate shows **Continue startup**. Hold the leaders still, release all body input,
-and click it to approve only that displayed gate with a fresh empty lease.
+gate shows **Continue startup**. Its approval instruction and recorded input-pause
+reason remain visible above the toolbar, outside collapsed Session details; they
+replace the measured-completion message with **Waiting for your confirmation**
+while the gate is pending. Instruction, button, accessible name and help all use
+**Continue startup** for startup, **Resume** for live recovery, and the existing
+**Approve realignment** action for its separate gate. A current unknown/unreported
+reason stays unknown/unreported; first-pause history is not a substitute. Before
+a gate exists, the actual startup phase/estimate remains visible and does not
+claim that all motion stopped. Faults, stopping and terminal results take precedence;
+completed gates and new sessions clear old instructions. Technical gate/epoch evidence stays
+in Session details. This display-only correction changes no gate deadline,
+input lease or automatic-admission policy and requires only the Windows console
+source, not a Pi helper/motor/camera update. Hold the leaders still, release all
+body input, and click it to approve only that displayed gate with a fresh empty lease.
 Fresh heartbeats alone do not clear the latch; stale/wrong-stage approval is
 refused. Live Pause/Resume still requires the existing host/follower/leader
 qualification, and startup approval never enables body motion before live

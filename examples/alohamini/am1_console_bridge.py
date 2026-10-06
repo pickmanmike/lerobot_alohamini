@@ -473,7 +473,7 @@ class AM1ConsoleBridgeClient:
 
     def publish_telemetry(self, event: dict[str, Any]) -> None:
         """Replace a pending display sample without delaying action or approval traffic."""
-        if event.get("event") not in {"live_sample", "action_sent", "host_feedback", "live_admitted", "am1_console_input_pause"}:
+        if event.get("event") not in {"live_sample", "action_sent", "host_feedback", "live_admitted", "am1_console_input_pause", "startup_progress", "live_timing"}:
             return
         with self._lock:
             self._telemetry_pending[event["event"]] = event
@@ -691,7 +691,7 @@ class AM1ConsoleBridgeServer:
                             self._gate_request_evidence.update(accepted=True, rejection=None)
                     elif message.get("kind") == "telemetry" and message.get("epoch") == self.state.epoch:
                         payload = message.get("payload")
-                        if isinstance(payload, dict) and payload.get("event") in {"live_sample", "action_sent", "host_feedback", "live_admitted", "am1_console_input_pause"}:
+                        if isinstance(payload, dict) and payload.get("event") in {"live_sample", "action_sent", "host_feedback", "live_admitted", "am1_console_input_pause", "startup_progress", "live_timing"}:
                             sink = self._telemetry_sink
                             if sink is not None:
                                 try:

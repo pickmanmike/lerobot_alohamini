@@ -37,6 +37,11 @@ for (const role of roles) {
   const detail = document.createElement("details");
   detail.className = "camera-details";
   detail.innerHTML = '<summary>Details</summary><dl><dt>Image age</dt><dd data-field="image-age">Not sampled</dd><dt>Source</dt><dd data-field="source">Unavailable</dd><dt>Sequence</dt><dd data-field="sequence">Not sampled</dd><dt>Rotation</dt><dd data-field="rotation">Not sampled</dd></dl>';
+  if (document.body.dataset.console === "compact") {
+    const term=document.createElement("dt"), value=document.createElement("dd");
+    term.textContent="Frame generation"; value.dataset.field="generation";
+    detail.querySelector("dl").append(term,value);
+  }
   slot.append(button); slot.append(detail); thumbs.append(slot);
   tiles.set(role, button); slots.set(role, slot); details.set(role, detail);
 }
@@ -73,6 +78,8 @@ function paintDetails(detail, held, source, rotation) {
   detail.querySelector('[data-field="sequence"]').textContent = held ? `Decoded ${held.sequence}` :
     Number.isSafeInteger(source?.sequence) ? `Source ${source.sequence}` : "Not sampled";
   detail.querySelector('[data-field="rotation"]').textContent = `${rotation}° display-only`;
+  const generation = detail.querySelector('[data-field="generation"]');
+  if (generation) generation.textContent = held ? String(held.generation) : "Not sampled";
 }
 function paint(tile, role, thumbnail = false) {
   const held = retainedImage(tile, role);
@@ -86,8 +93,8 @@ function paint(tile, role, thumbnail = false) {
   tile.classList.toggle("held", !!held && state.state !== "fresh");
   tile.querySelector("strong").textContent = labels[role];
   tile.querySelector("span").textContent = state.state === "fresh" ?
-    `Live · image ${Math.round(state.age_ms)} ms${state.status_uncertain ? " · status uncertain" : ""}` :
-    held ? `Last frame / waiting · image ${Math.round(held.age_ms)} ms` : state.state;
+    `Live${state.status_uncertain ? " · status uncertain" : ""}` :
+    held ? "Last frame / waiting" : state.state;
   if (!held && state.state !== "fresh") tile.querySelector("span").textContent =
     source?.configured === false ? "Unassigned" : source?.state === "stale" ? "Disconnected" : "Waiting";
   tile.querySelector(".unavailable").textContent = held ? "" : !statusAvailable() ? "Status unavailable" :
@@ -164,6 +171,12 @@ function render() {
   connection.textContent = !statusAvailable() ? "Status unavailable — do not rely on these views" :
     sourceFor(selected).state !== "fresh" && usable(selected) ? "LAN viewer · status delayed/uncertain · decoded-frame clock remains active" :
     "LAN viewer · source status and decoded-frame progress tracked separately";
+  if (document.body.dataset.console === "compact") {
+    const fresh = Number(primary.classList.contains("fresh")) +
+      [...tiles.entries()].filter(([role,tile]) => role !== selected && tile.classList.contains("fresh")).length;
+    connection.textContent = !statusAvailable() ? "Camera status unavailable — retained images are not live." :
+      `Cameras ${fresh}/5 fresh decoded views${fresh < 5 ? " — check required views; retained images are not live." : " · image ages in Details."}`;
+  }
   diagnostics.textContent = `Status request ${Math.round(timing.status_ms)} ms (max ${Math.round(timing.status_max_ms)} ms); failures ${timing.status_failures}\n` +
     `Decode failures ${timing.decode_failures}; stream cancellations ${timing.cancellations}; last ${timing.last_cancel}\n` +
     roles.map(role => { const p = progress.get(role); return `${labels[role]} primary: received ${p.received}, displayed ${p.displayed}, seq ${p.sequence}; max receive/display gap ${Math.round(p.receive_max_gap_ms)}/${Math.round(p.display_max_gap_ms)} ms`; }).join("\n");

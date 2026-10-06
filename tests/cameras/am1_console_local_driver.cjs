@@ -84,10 +84,10 @@ const [url, scenario] = process.argv.slice(2);
       .includes(`Approval needed: resume (host epoch ${epoch})`), current.pending_gate[1]);
     await page.waitForFunction(() => document.querySelector("#gate-state").textContent
       .includes("Native input: connected"), null, {timeout:1500});
-    await page.getByRole("button", {name:"Approve Resume", exact:true}).click();
+    await page.getByRole("button", {name:"Resume", exact:true}).click();
     await until(state => native(state)?.paused === false);
     await until(state => state.phase === "live");
-    await page.waitForFunction(() => document.querySelector("#session-state").textContent.endsWith(": live"));
+    await page.waitForFunction(() => document.querySelector("#session-state").textContent.startsWith("Live —"));
   };
   try {
     await page.goto(url);
@@ -98,6 +98,21 @@ const [url, scenario] = process.argv.slice(2);
         [...document.querySelectorAll("#thumbnails img")].every(img => img.src.startsWith("blob:"));
     });
     await page.getByRole("button", {name:"Start Local session", exact:true}).click();
+    if (scenario === "startup-approval") {
+      await until(state => state.events.some(event => event.event === "test_before_live_gate"));
+      await page.evaluate(() => window.dispatchEvent(new Event("blur")));
+      const pending = await until(state => state.pending_gate?.[0] === "live_start");
+      assert.equal(pending.input_pause.reason, "window-blur");
+      await page.waitForFunction(() => document.querySelector('#startup-state').textContent.includes('Control window lost focus'));
+      assert.equal(await page.locator('.session-details').getAttribute('open'), null);
+      assert.match(await page.locator('#session-state').innerText(), /Waiting for your confirmation/);
+      assert.notEqual(pending.phase, "live");
+      assert.equal(operationRequests.filter(request => request.kind === "Resume").length, 0);
+      await page.getByRole("button", {name:"Continue startup", exact:true}).click();
+      await until(state => state.phase === "live"); // Actual native pipe admission, not the POST result.
+      assert.deepEqual(operationRequests.filter(request => request.kind === "Resume"),
+        [{kind:"Resume", stage:"live_start", epoch:null}]);
+    }
     await until(state => native(state)?.paused === false || state.pending_gate?.[0] === "resume");
     // Full native telemetry can expose a real expiry before the browser has
     // rendered a brief live admission. Handle that CURRENT gate rather than
@@ -107,7 +122,7 @@ const [url, scenario] = process.argv.slice(2);
     // Wait for the browser's actual current state before deciding whether the
     // single initial recovery is needed. A native-only check can precede the
     // next UI render, then incorrectly wait for live after a genuine expiry.
-    await page.waitForFunction(() => document.querySelector("#session-state").textContent.endsWith(": live") ||
+    await page.waitForFunction(() => document.querySelector("#session-state").textContent.startsWith("Live —") ||
       document.querySelector("#gate-state").textContent.includes("Approval needed: resume"));
     if (native(await read()).paused) {
       // A loaded desktop can genuinely miss the approved 1.5 s presence deadline.
@@ -124,7 +139,7 @@ const [url, scenario] = process.argv.slice(2);
     }
     assert.equal(native(await read()).paused, false, "qualified focused input must be live");
     await until(state => state.phase === "live");
-    await page.waitForFunction(() => document.querySelector("#session-state").textContent.endsWith(": live"));
+    await page.waitForFunction(() => document.querySelector("#session-state").textContent.startsWith("Live —"));
     if (["healthy", "camera-delay"].includes(scenario)) {
       await page.keyboard.down("w");
       await until(state => native(state)?.keys.includes("w"));
@@ -258,7 +273,7 @@ const [url, scenario] = process.argv.slice(2);
       let release;
       const held = new Promise(resolve => { release = resolve; });
       await page.route("**/api/body", async route => { await held; await route.continue(); });
-      await page.getByRole("button", {name:"Approve Resume", exact:true}).click();
+      await page.getByRole("button", {name:"Resume", exact:true}).click();
       await page.waitForTimeout(150);
       await page.getByRole("button", {name:"Stop session", exact:true}).click();
       try { await until(state => state.phase === "complete"); } finally { release(); }

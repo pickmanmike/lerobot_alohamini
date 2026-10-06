@@ -187,9 +187,10 @@ def test_pi_system_events_do_not_accumulate_in_lifecycle_queue(tmp_path):
     remote = SSHRemote(config, "session", tmp_path, telemetry_sink=seen.append)
     remote.process = SimpleNamespace(stdout=StringIO(
         '{"event":"system_sample","acquired_at_ns":100,"metrics":{"cpu_percent":2}}\n'
+        '{"event":"startup_progress","stage":"lift_home"}\n'
         '{"event":"camera_ready","session_id":"session"}\n'))
     remote._read_events()
-    assert [item["event"] for item in seen] == ["system_sample"]
+    assert [item["event"] for item in seen] == ["system_sample", "startup_progress"]
     assert remote.events.qsize() == 1
     assert remote.events.get_nowait()["event"] == "camera_ready"
 

@@ -572,7 +572,14 @@ def test_full_native_telemetry_does_not_hide_current_resume_gate(tmp_path, capsy
     client = bridge.AM1ConsoleBridgeClient(server.pipe_name, server.auth_file, server.session_id)
     stop = threading.Event()
     received = []
-    server.set_telemetry_sink(received.append)
+    from tools.am1_console import ConsoleSessionAdapter
+    adapter=ConsoleSessionAdapter(SimpleNamespace(),tmp_path,SimpleNamespace())
+    adapter._on_created(server.session_id)
+    def receive(event):
+        received.append(event)
+        adapter._emit(event)
+    server.set_telemetry_sink(receive)
+    timing_origin=time.monotonic()
     sequence = [0]
     def browser():
         while not stop.wait(.05):
@@ -599,6 +606,9 @@ def test_full_native_telemetry_does_not_hide_current_resume_gate(tmp_path, capsy
                 bridge.make_console_host_feedback_event(sample, feedback, wall_ns=time.time_ns(),
                                                        monotonic_now=time.monotonic()),
                 bridge.make_console_action_sent_event(positions, sequence=17, interval_ms=100, wall_ns=time.time_ns()),
+                {"event":"startup_progress", "stage":"arm_sync", "frames_sent":17, "frame_count":301},
+                {"event":"live_timing", "clock":"windows_monotonic", "live_started_at":timing_origin,
+                 "deadline":timing_origin+90, "sampled_at":time.monotonic(), "duration_s":90},
             ):
                 client.publish_telemetry(event)
             time.sleep(.1)
@@ -629,7 +639,12 @@ def test_full_native_telemetry_does_not_hide_current_resume_gate(tmp_path, capsy
                    and event.get("host_epoch") == 1 for event in records)
         assert any(event.get("event") == "am1_console_gate_result" and event.get("stage") == "resume"
                    and event.get("result") == "acknowledged" for event in records)
-        assert {event["event"] for event in received} >= {"live_sample", "host_feedback", "action_sent"}
+        assert {event["event"] for event in received} >= {
+            "live_sample", "host_feedback", "action_sent", "startup_progress", "live_timing"}
+        view=adapter.state()["progress"]
+        assert view["startup"]["frames_sent"] == 17
+        assert view["live_timing"]["deadline"] == timing_origin+90
+        assert view["live_timing"]["remaining_s"] < 90
     finally:
         stop.set()
         producer.join(1)
