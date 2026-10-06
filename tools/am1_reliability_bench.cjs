@@ -23,6 +23,7 @@ assert(!(headless && target.port === "8765"), "Powered console bench requires th
   const records = [], pulses = [];
   let ownedSession = null, startRefusal = null, startCount = 0, droppedRecords = 0, cancelled = false;
   let final = null, failure = null;
+  let viewsRequired = false;
   const startedAt = Date.now();
   const deadline = startedAt + (scenario === "ArmSmoke" ? 300000 : 180000);
   const keep = record => {
@@ -78,11 +79,15 @@ assert(!(headless && target.port === "8765"), "Powered console bench requires th
     if (ownedSession) assert.equal(state.session_id, ownedSession, "Session ownership changed");
     const verified = state.verified_source_heads;
     if (verified && verifySource) assert.equal(verified.windows_source_head, expectedWindowsHead);
+    const cameras = verifySource ? await page.locator("#connection").innerText({timeout:1000}) : null;
     keep({event:"state", session_id:state.session_id, phase:state.phase,
           pending_gate:state.pending_gate, input_epoch:state.input_epoch,
           input_pause_reason:state.input_pause?.reason,
           observation_age_ms:state.telemetry?.observation?.age_ms,
-          cleanup_verified:state.cleanup_verified, final_exit_code:state.final_exit_code});
+          cleanup_verified:state.cleanup_verified, final_exit_code:state.final_exit_code,
+          camera_summary:cameras});
+    if (verifySource && viewsRequired && ["live", "paused", "feedback_stale"].includes(state.phase))
+      assert(cameras.startsWith("Cameras 5/5 fresh decoded views"), "Required camera view lost: " + cameras);
     return state;
   };
   const terminal = state => ["complete", "failed", "cleanup_unknown", "operator_stopped"].includes(state.phase);
@@ -103,6 +108,8 @@ assert(!(headless && target.port === "8765"), "Powered console bench requires th
   };
   try {
     await page.goto(address, {timeout:15000});
+    await page.bringToFront();
+    assert(await page.evaluate(() => !document.hidden && document.hasFocus()), "Control must actually be focused before Start");
     const initial = await read();
     assert(initial.restart_allowed, "A prior owner or unknown cleanup blocks Start");
     assert.equal(initial.configured_source_pins.windows_session_head, expectedWindowsHead);
@@ -115,6 +122,9 @@ assert(!(headless && target.port === "8765"), "Powered console bench requires th
     await page.waitForFunction(() => document.querySelector("#primary img")?.src.startsWith("blob:") &&
       [...document.querySelectorAll("#thumbnails img")].every(img => img.src.startsWith("blob:")),
       null, {timeout:5000});
+    await page.waitForFunction(() => document.querySelector("#connection").textContent.startsWith(
+      "Cameras 5/5 fresh decoded views"), null, {timeout:5000});
+    viewsRequired = true;
     if (scenario === "BodyPressRelease") {
       for (const key of ["w", "a", "u", "j"]) {
         const current = await read();

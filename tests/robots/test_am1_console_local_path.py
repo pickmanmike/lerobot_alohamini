@@ -711,7 +711,7 @@ def test_owned_native_process_keeps_real_pipe_and_stops(tmp_path, startup_second
 @pytest.mark.skipif(sys.platform != "win32", reason="Actual AF_PIPE is Windows-only")
 @pytest.mark.parametrize("case", ["healthy", "navigation", "blur", "hidden", "body-delay",
                                       "body-presence-loss", "short-browser-stall",
-                                      "body-reject", "body-denied", "state-reject", "state-delay", "pending-stop", "camera-delay", "approval-order", "startup-approval", "bench-body", "bench-arm", "bench-pause", "bench-foreign", "bench-monitor-failure"])
+                                      "body-reject", "body-denied", "state-reject", "state-delay", "pending-stop", "camera-delay", "approval-order", "startup-approval", "bench-body", "bench-arm", "bench-pause", "bench-foreign", "bench-monitor-failure", "bench-camera-loss"])
 def test_browser_loopback_native_path(tmp_path, case):
     node = shutil.which("node")
     if not node or subprocess.run([node, "-e", "require('playwright')"], capture_output=True).returncode:
@@ -730,6 +730,8 @@ def test_browser_loopback_native_path(tmp_path, case):
     camera.daemon_threads = True
     if case == "camera-delay":
         session.on_live = lambda: setattr(camera, "snapshot_delay_s", .65)
+    if case == "bench-camera-loss":
+        session.on_live = lambda: threading.Timer(1, lambda: setattr(camera, "snapshot_delay_s", 3)).start()
     config = SimpleNamespace(browser_url=f"http://127.0.0.1:{camera.server_port}",
                              local_state_directory=tmp_path, windows_log_directory=tmp_path,
                              windows_session_head="1" * 40)
@@ -800,16 +802,19 @@ def test_browser_loopback_native_path(tmp_path, case):
             assert evidence["cleanup_verified"] is True
             operations = [record["kind"] for record in evidence["records"] if record["event"] == "operation_result"]
             assert not {"Resume", "Approve", "ClaimInput"}.intersection(operations)
-            if case in {"bench-pause", "bench-monitor-failure"}:
+            if case in {"bench-pause", "bench-monitor-failure", "bench-camera-loss"}:
                 assert result.returncode == 1
                 assert evidence["failure"]
-                assert evidence["pulses"] == []
+                if case != "bench-camera-loss":
+                    assert evidence["pulses"] == []
+                else:
+                    assert "Required camera view lost" in evidence["failure"]
                 assert "Stop" in operations
             else:
                 assert evidence["failure"] is None
                 assert session.start_requests == ([(180, "scripted", "ArmSmoke")] if case == "bench-arm" else [(12, "physical", None)])
                 assert [pulse["key"] for pulse in evidence["pulses"]] == ([] if case == "bench-arm" else ["w", "a", "u", "j"])
-        if case not in {"bench-pause", "bench-monitor-failure"}:
+        if case not in {"bench-pause", "bench-monitor-failure", "bench-camera-loss"}:
             assert result.returncode == 0, result.stdout + result.stderr + f"\nServer body arrivals: {intervals[-20:]}"
         assert session.error is None
         assert FakeCamera.requests > before
