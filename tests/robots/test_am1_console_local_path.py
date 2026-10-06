@@ -23,7 +23,7 @@ from examples.alohamini.am1_console_bridge import (
     AM1ConsoleBridgeClient, AM1ConsoleBridgeServer, CONSOLE_ARM_KEYS, CONSOLE_BODY_OBSERVATION_KEYS,
     make_console_action_sent_event, make_console_host_feedback_event, make_console_live_sample_event,
 )
-from tools.am1_console import ConsoleServer, ConsoleSessionAdapter
+from tools.am1_console import ConsoleHandler, ConsoleServer, ConsoleSessionAdapter
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -42,6 +42,7 @@ class FakeSessionIO:
         self.before_gate = lambda stage, emit: None
         self.live_duration_s = live_duration_s
         self.run_count = 0
+        self.start_requests = []
         self.variant = variant
         self.startup_duration_s = 30 if variant in {"startup", "output"} else 0
         self.child = None
@@ -52,12 +53,14 @@ class FakeSessionIO:
         self.emit_output = True
         self.output_records = []
         self.native_marker_delay_s = 0  # Explicit failure model; unchanged nominal workload.
+        self.finalization_delay_s = 0
+        self.native_closed_at = None
 
     def parse_duration_seconds(self, value):
         return int(value)
 
     def validate_leader_selection(self, source, profile):
-        assert source == "physical" and profile is None
+        assert (source, profile) in {("physical", None), ("scripted", "ArmSmoke")}
 
     def request_stop(self, config, *, expected_session_id, wait):
         self.stopped.set()
@@ -67,6 +70,7 @@ class FakeSessionIO:
             return self._run_child(repository, config, **callbacks)
         self.stopped.clear()
         self.run_count += 1
+        self.start_requests.append((duration, callbacks.get("leader_source", "physical"), callbacks.get("motion_profile")))
         identity = f"20261002T000000-{self.run_count:08x}"
         pipe, auth = callbacks["console_prepare"](identity)
         callbacks["on_session_created"](identity)
@@ -97,6 +101,7 @@ class FakeSessionIO:
                     native.publish_telemetry(event)
         try:
             native.connect()
+            emit({"event": "preflight_passed", "sources": {"windows_source_head": "1" * 40}})
             for event in ("camera_ready", "host_ready"):
                 emit({"event": event, "session_id": identity})
             if self.startup_duration_s:
@@ -154,7 +159,12 @@ class FakeSessionIO:
             if telemetry_thread is not None:
                 telemetry_thread.join(1)
             native.disconnect()
+            self.native_closed_at = time.monotonic()
+            if self.finalization_delay_s:
+                time.sleep(self.finalization_delay_s)
             emit({"event": "cleanup", "cleanup_verified": True})
+            emit({"event": "session_complete", "session_id": identity,
+                  "cleanup_verified": not native.is_connected and not native._worker.is_alive()})
 
     def _startup(self, native, emit):
         # Import only function code; all device boundaries below are synthetic
@@ -324,6 +334,10 @@ class FakeSessionIO:
             callbacks["emit"]({"event": "cleanup", "cleanup_verified": bool(
                 native_closed.is_set() and self.reader is not None and not self.reader.is_alive()
                 and self.error is None)})
+            callbacks["emit"]({"event": "session_complete", "session_id": identity,
+                "cleanup_verified": bool(native_closed.is_set() and self.reader is not None
+                    and not self.reader.is_alive() and self.child is not None
+                    and self.child.poll() is not None and self.error is None)})
 
 
 class SyntheticOutputReplay:
@@ -699,15 +713,36 @@ def test_owned_native_process_keeps_real_pipe_and_stops(tmp_path, startup_second
     assert adapter.state()["cleanup_verified"] is True
 
 
+@pytest.mark.parametrize("duration", ["0", "1800", "NaN"])
+def test_bench_refuses_unqualified_native_duration_before_browser(tmp_path, duration):
+    node = shutil.which("node")
+    if not node or subprocess.run([node, "-e", "require('playwright')"], capture_output=True).returncode:
+        pytest.skip("Node/Playwright unavailable")
+    evidence = tmp_path / "bench.json"
+    result = subprocess.run([node, str(ROOT / "tools/am1_reliability_bench.cjs"),
+        "http://127.0.0.1:1/", "ArmSmoke", "AM1-RELIABILITY-01-arm-01", str(evidence), "1" * 40, duration],
+        capture_output=True, text=True, timeout=10)
+    assert result.returncode == 1 and "Native duration must be an established finite scenario" in result.stderr
+    assert not evidence.exists()
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="Actual AF_PIPE is Windows-only")
 @pytest.mark.parametrize("case", ["healthy", "navigation", "blur", "hidden", "body-delay",
                                       "body-presence-loss", "short-browser-stall",
-                                      "body-reject", "body-denied", "state-reject", "state-delay", "pending-stop", "camera-delay", "approval-order", "startup-approval"])
+                                      "body-reject", "body-denied", "state-reject", "state-delay", "pending-stop", "camera-delay", "approval-order", "startup-approval", "bench-body", "bench-arm", "bench-arm-short", "bench-pause", "bench-foreign", "bench-monitor-failure", "bench-camera-loss", "bench-finalize", "bench-finalize-stall", "bench-finalize-late-result"])
 def test_browser_loopback_native_path(tmp_path, case):
     node = shutil.which("node")
     if not node or subprocess.run([node, "-e", "require('playwright')"], capture_output=True).returncode:
         pytest.skip("Existing Playwright runtime required; never install it in this test")
     session = FakeSessionIO()
+    if case.startswith("bench-"):
+        session.live_duration_s = 12
+    if case == "bench-finalize":
+        session.finalization_delay_s = 1.2
+    if case == "bench-finalize-stall":
+        session.finalization_delay_s = 12
+    if case == "bench-finalize-late-result":
+        session.finalization_delay_s = 9.5
     startup_release = threading.Event()
     if case == "startup-approval":
         def before_gate(stage, emit):
@@ -719,8 +754,11 @@ def test_browser_loopback_native_path(tmp_path, case):
     camera.daemon_threads = True
     if case == "camera-delay":
         session.on_live = lambda: setattr(camera, "snapshot_delay_s", .65)
+    if case == "bench-camera-loss":
+        session.on_live = lambda: threading.Timer(1, lambda: setattr(camera, "snapshot_delay_s", 3)).start()
     config = SimpleNamespace(browser_url=f"http://127.0.0.1:{camera.server_port}",
-                             local_state_directory=tmp_path, windows_log_directory=tmp_path)
+                             local_state_directory=tmp_path, windows_log_directory=tmp_path,
+                             windows_session_head="1" * 40)
     auth = tmp_path / "fake-camera.json"
     auth.write_text(json.dumps({"username": "test-only", "password": "test-only"}))
     bridges = []
@@ -729,6 +767,15 @@ def test_browser_loopback_native_path(tmp_path, case):
         bridges.append(owner)
         return owner
     adapter = ConsoleSessionAdapter(config, ROOT, session, bridge_factory=bridge_factory)
+    if case == "bench-pause":
+        session.on_live = lambda: adapter._bridge.request_pause("operator")
+    if case == "bench-foreign":
+        real_operation = adapter.operation
+        def competing_start(payload):
+            if payload.get("kind") == "Start":
+                real_operation({"kind": "Start", "duration_seconds": 12})
+            return real_operation(payload)
+        adapter.operation = competing_start
     received = []
     real_body_input = adapter.body_input
     def observed_body_input(payload):
@@ -739,17 +786,79 @@ def test_browser_loopback_native_path(tmp_path, case):
         return result
     adapter.body_input = observed_body_input
     server = ConsoleServer(("127.0.0.1", 0), config, auth, adapter)
+    if case == "bench-monitor-failure":
+        failures = [0]
+        session.on_live = lambda: failures.__setitem__(0, 2)
+        class FailedBenchReads(ConsoleHandler):
+            def do_GET(self):  # noqa: N802 — BaseHTTPRequestHandler requires this method name.
+                if self.path == "/api/state" and self.headers.get("X-AM1-Bench-Monitor") and failures[0]:
+                    failures[0] -= 1
+                    self.send_error(503, "Fake monitor read failure")
+                    return
+                super().do_GET()
+        server.RequestHandlerClass = FailedBenchReads
+    if case == "bench-finalize-late-result":
+        delayed = [False]
+        class LateTerminalRead(ConsoleHandler):
+            def do_GET(self):  # noqa: N802 — BaseHTTPRequestHandler requires this method name.
+                if (self.path == "/api/state" and self.headers.get("X-AM1-Bench-Monitor")
+                        and session.native_closed_at is not None and not delayed[0]
+                        and time.monotonic() - session.native_closed_at >= 9):
+                    delayed[0] = True
+                    time.sleep(1.5)
+                super().do_GET()
+        server.RequestHandlerClass = LateTerminalRead
     threads = [threading.Thread(target=s.serve_forever, daemon=True) for s in (camera, server)]
     before = FakeCamera.requests
     for thread in threads:
         thread.start()
     try:
-        result = subprocess.run([node, str(ROOT / "tests/cameras/am1_console_local_driver.cjs"),
-                                 f"http://127.0.0.1:{server.server_port}", case],
+        arm_bench = case in {"bench-arm", "bench-arm-short"}
+        driver = ([node, str(ROOT / "tools/am1_reliability_bench.cjs"),
+                   f"http://127.0.0.1:{server.server_port}",
+                   "ArmSmoke" if arm_bench else "BodyPressRelease",
+                   "AM1-RELIABILITY-01-arm-01" if arm_bench else "AM1-RELIABILITY-01-body-01",
+                   str(tmp_path / "bench.json"), "1" * 40]
+                  if case.startswith("bench-") else
+                  [node, str(ROOT / "tests/cameras/am1_console_local_driver.cjs"),
+                   f"http://127.0.0.1:{server.server_port}", case])
+        if case == "bench-arm-short":
+            driver.append("30")
+        result = subprocess.run(driver,
                                 capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=35)
         intervals = [(seq, round((at - previous[1])*1000), active)
                      for previous, (seq, at, active) in zip(received, received[1:])]
-        assert result.returncode == 0, result.stdout + result.stderr + f"\nServer body arrivals: {intervals[-20:]}"
+        if case.startswith("bench-"):
+            evidence = json.loads((tmp_path / "bench.json").read_text())
+            assert evidence["start_count"] == session.run_count == 1
+            if case == "bench-foreign":
+                assert result.returncode == 1
+                assert evidence["session_id"] is None
+                assert evidence["failure"] == "Start attached to another owner"
+                assert not session.stopped.is_set(), "An attached foreign session must not receive Stop"
+                return
+            assert evidence["cleanup_verified"] is True
+            operations = [record["kind"] for record in evidence["records"] if record["event"] == "operation_result"]
+            assert not {"Resume", "Approve", "ClaimInput"}.intersection(operations)
+            if case in {"bench-pause", "bench-monitor-failure", "bench-camera-loss", "bench-finalize-stall", "bench-finalize-late-result"}:
+                assert result.returncode == 1
+                assert evidence["failure"]
+                if case in {"bench-pause", "bench-monitor-failure"}:
+                    assert evidence["pulses"] == []
+                elif case == "bench-camera-loss":
+                    assert "Required camera view lost" in evidence["failure"]
+                else:
+                    assert "finalization deadline" in evidence["failure"]
+                if case != "bench-finalize-late-result":
+                    assert "Stop" in operations
+            else:
+                assert evidence["failure"] is None
+                assert "Stop" not in operations
+                arm_duration = 30 if case == "bench-arm-short" else 180
+                assert session.start_requests == ([(arm_duration, "scripted", "ArmSmoke")] if arm_bench else [(12, "physical", None)])
+                assert [pulse["key"] for pulse in evidence["pulses"]] == ([] if arm_bench else ["w", "a", "u", "j"])
+        if case not in {"bench-pause", "bench-monitor-failure", "bench-camera-loss", "bench-finalize-stall", "bench-finalize-late-result"}:
+            assert result.returncode == 0, result.stdout + result.stderr + f"\nServer body arrivals: {intervals[-20:]}"
         assert session.error is None
         assert FakeCamera.requests > before
         assert adapter.wait(3), "session cleanup worker must terminate before verdict"

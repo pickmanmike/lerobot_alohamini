@@ -176,6 +176,47 @@ def test_observation_response_for_another_active_token_is_cached_not_discarded()
     assert client._poll_and_get_latest_message() == [b"second"]
 
 
+@pytest.mark.parametrize("request_age_s", [0.4, 1.05])
+def test_am1_missing_oldest_reply_does_not_conceal_available_tracked_feedback(monkeypatch, request_age_s):
+    from lerobot.robots.alohamini import alohamini_client
+
+    clock = SimpleNamespace(now=100.0)
+    monkeypatch.setattr(alohamini_client.time, "monotonic", lambda: clock.now)
+    client, socket = make_observation_transport_client()
+    client._is_connected = True
+    client._fill_observation_request_window()
+    clock.now += request_age_s
+    socket.responses.append([b"2", b'{"arm_left_shoulder_pan.pos":12.0}'])
+
+    observation = client.get_observation()
+
+    assert observation["arm_left_shoulder_pan.pos"] == 12.0
+    assert client.observation_sequence == 1
+    # An available reply may still be stale. Keep its original send time for
+    # the existing Local freshness guard, rather than rejuvenating its age.
+    assert client.latest_observation_roundtrip_age_s == pytest.approx(request_age_s)
+    assert len(client._observation_request_tokens) == 3
+    socket.responses.extend(([b"1", b'{"arm_left_shoulder_pan.pos":-99.0}'],
+                             [b"3", b'{"arm_left_shoulder_pan.pos":13.0}']))
+    assert client.get_observation()["arm_left_shoulder_pan.pos"] == 13.0
+    assert client.observation_sequence == 2
+
+
+def test_am1_reply_arriving_for_later_credit_ends_current_poll():
+    client, socket = make_observation_transport_client()
+    client._fill_observation_request_window()
+
+    class LaterCreditPoller(FakeObservationPoller):
+        def poll(self, timeout_ms):
+            socket.responses.append([b"2", b"advancing-feedback"])
+            return super().poll(timeout_ms)
+
+    client._zmq.Poller = lambda: LaterCreditPoller(client._zmq.POLLIN)
+
+    assert client._poll_and_get_latest_message() == [b"advancing-feedback"]
+    assert len(client._observation_request_tokens) == 3
+
+
 def test_observation_sequence_advances_after_timeout_and_late_response_recovery():
     client, socket = make_observation_transport_client()
     client._is_connected = True

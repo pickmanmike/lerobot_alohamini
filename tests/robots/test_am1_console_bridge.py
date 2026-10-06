@@ -24,6 +24,74 @@ def lease_payload(keys, browser_at):
     return {"valid": True, "keys": keys, "browser_received_at_s": browser_at, "body_release_required": False}
 
 
+@pytest.mark.parametrize("finish_before_close", [True, False], ids=["ordinary-read", "fallback-close"])
+def test_disconnect_allows_inflight_read_to_finish_before_closing_its_handle(finish_before_close):
+    client = bridge.AM1ConsoleBridgeClient("pipe", Path("auth"), "session")
+    reading, release_read, closed = threading.Event(), threading.Event(), threading.Event()
+    failures = []
+
+    class Connection:
+        reader_active_at_close = None
+
+        def poll(self, timeout):
+            reading.set()
+            assert release_read.wait(1)
+            return finish_before_close
+
+        def recv_bytes(self, maximum):
+            # Model an already-started, finite Windows overlapped read. Closing
+            # its handle first produced the actual observed ReadFile TypeError.
+            if closed.is_set():
+                raise TypeError("ReadFile() argument 1 must be int, not None")
+            return bridge._encode({"session_id": "session", "epoch": 1, "seq": 1,
+                "kind": "lease", "payload": lease_payload([], time.monotonic())})
+
+        def close(self):
+            self.reader_active_at_close = client._worker.is_alive()
+            closed.set()
+            release_read.set()
+
+    connection = client._conn = Connection()
+    client._connected = True
+    client._keys = {"w"}
+    client._body_enabled = True
+    client._pause_latched = False
+    client._needs_release = False
+    def consume():
+        try:
+            client._io()
+        except BaseException as error:
+            failures.append(error)
+    worker = threading.Thread(target=consume)
+    class WorkerJoin:
+        safety_at_join = []
+        budgets = []
+
+        def join(self, timeout):
+            self.safety_at_join.append(not client.is_connected and client._keys == set()
+                and client._pause_latched and not client._body_enabled and client._needs_release)
+            self.budgets.append(timeout)
+            if finish_before_close:
+                release_read.set()
+            worker.join(timeout)
+
+        def is_alive(self):
+            return worker.is_alive()
+    client._worker = WorkerJoin()
+    worker.start()
+    assert reading.wait(1)
+    client.disconnect()
+
+    assert connection.reader_active_at_close is not finish_before_close
+    assert failures == []
+    assert client._worker.safety_at_join[0], "input must be disabled before the first grace join"
+    assert all(client._worker.safety_at_join)
+    assert client._worker.budgets == [0.5, 0.5], "fallback retains the existing total one-second join budget"
+    assert closed.is_set() and not client._worker.is_alive()
+    assert not client.is_connected and client._keys == set() and client._pause_latched
+    assert client._last_seq == 0 and client._received_at is None, "a read returned after Stop cannot renew input"
+
+
 def prepare_native_gate(client, at):
     client._gate_events[("live_start", None, 1)] = threading.Event()
     assert client.accept_message({"session_id": client.session_id, "epoch": 1, "seq": 0, "kind": "lease",

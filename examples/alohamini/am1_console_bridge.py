@@ -360,7 +360,10 @@ class AM1ConsoleBridgeClient:
                 else:
                     self._conn.send_bytes(_encode(message))
                 if self._conn.poll(0.05):
-                    self.accept_message(_decode(self._conn.recv_bytes(MAX_PIPE_BYTES)), received_at=self.clock())
+                    packet = self._conn.recv_bytes(MAX_PIPE_BYTES)
+                    if self._stop.is_set():
+                        break
+                    self.accept_message(_decode(packet), received_at=self.clock())
         except (EOFError, OSError, ValueError) as exc:
             with self._lock:
                 self._error = f"{type(exc).__name__}: {exc}"
@@ -576,13 +579,24 @@ class AM1ConsoleBridgeClient:
 
     def disconnect(self) -> None:
         self._stop.set()
+        with self._lock:
+            self._connected = False
+            self._keys.clear()
+            self._pause_latched = True
+            self._body_enabled = False
+            self._needs_release = True
+        # An ordinary in-flight Windows ReadFile must finish with its handle
+        # open. Keep the existing total one-second join budget and still close
+        # the pipe to release a genuinely blocked worker after the short grace.
+        if self._worker is not None:
+            self._worker.join(timeout=0.5)
         if self._conn is not None:
             try:
                 self._conn.close()
             except OSError:
                 pass
         if self._worker is not None:
-            self._worker.join(timeout=1)
+            self._worker.join(timeout=0.5)
         with self._lock:
             self._connected = False
             self._keys.clear()

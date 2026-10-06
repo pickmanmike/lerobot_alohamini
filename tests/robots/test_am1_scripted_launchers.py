@@ -518,8 +518,10 @@ def test_real_session_start_preserves_scripted_selection_and_stop_reason_through
     assert module.run_start(REPO_ROOT, config, 180, leader_source="scripted", motion_profile="ArmSmoke") == 0
 
     assert len(confirmations) == 1
-    assert commands[2][-4:] == ["-LeaderSource", "Scripted", "-MotionProfile", "ArmSmoke"]
-    assert commands[3][-4:] == ["-LeaderSource", "Scripted", "-MotionProfile", "ArmSmoke"]
+    launch_commands = [command for command in commands if "-LeaderSource" in command]
+    assert len(launch_commands) == 2
+    assert all(command[-4:] == ["-LeaderSource", "Scripted", "-MotionProfile", "ArmSmoke"]
+               for command in launch_commands)
     active = json.loads((state / "active.json").read_text())
     assert active["input_source"] == "scripted"
     assert active["motion_profile"] == "ArmSmoke"

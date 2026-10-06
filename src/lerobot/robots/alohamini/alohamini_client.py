@@ -421,22 +421,77 @@ class AlohaMiniClient(Robot):
         self._drain_observation_responses()
         self._fill_observation_request_window()
 
-    def _drain_observation_responses(self) -> None:
+    def _drain_observation_responses(self, *, limit: int | None = None) -> None:
         """Drain ready replies, retaining only those for requests still tracked locally."""
         zmq = self._zmq
-        while True:
+        received = 0
+        while limit is None or received < limit:
             try:
                 response = self.zmq_observation_socket.recv_multipart(zmq.NOBLOCK)
             except zmq.Again:
                 return
+            received += 1
             if not response:
                 continue
             response_token = response[0]
             if response_token in self._observation_request_tokens:
                 self._observation_response_cache[response_token] = response[1:]
 
+    def _poll_am1_available_message(self) -> list[bytes] | None:
+        """Do not withhold advancing AM1 feedback behind a missing older reply."""
+        zmq = self._zmq
+        self._last_response_request_sent_at = None
+        if not self._observation_request_tokens:
+            self._drain_observation_responses(limit=self.observation_request_window)
+            self._fill_observation_request_window()
+
+        poller = zmq.Poller()
+        poller.register(self.zmq_observation_socket, zmq.POLLIN)
+        deadline = time.monotonic() + self.polling_timeout_ms / 1000
+        while self._observation_request_tokens:
+            # Bound each drain as well as the unchanged overall poll deadline.
+            self._drain_observation_responses(limit=self.observation_request_window)
+            available = next((token for token in self._observation_request_tokens
+                              if token in self._observation_response_cache), None)
+            if available is not None:
+                message = self._observation_response_cache.pop(available)
+                # Missing earlier requests can no longer provide advancing data.
+                # Exclude their late replies; retain later credits and their replies.
+                while self._observation_request_tokens:
+                    token = self._observation_request_tokens.popleft()
+                    sent_at = self._observation_request_sent_at.pop(token, None)
+                    if token == available:
+                        self._last_response_request_sent_at = sent_at
+                        break
+                    self._observation_response_cache.pop(token, None)
+                self._fill_observation_request_window()
+                return message
+
+            remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
+            if not remaining_ms:
+                break
+            try:
+                ready = dict(poller.poll(remaining_ms))
+            except zmq.ZMQError as error:
+                logging.error("ZMQ observation poll failed: %s", error)
+                break
+            if self.zmq_observation_socket not in ready:
+                break
+
+        # Preserve the existing bounded empty-poll retry: retire one missing
+        # credit, never extend a safety deadline or grow the request window.
+        if self._observation_request_tokens:
+            token = self._observation_request_tokens.popleft()
+            self._observation_request_sent_at.pop(token, None)
+            self._observation_response_cache.pop(token, None)
+        self._fill_observation_request_window()
+        logging.info("No new data available within timeout.")
+        return None
+
     def _poll_and_get_latest_message(self) -> list[bytes] | None:
         """Consume the oldest response and replenish the bounded request window."""
+        if self.config.robot_model == "alohamini1":
+            return self._poll_am1_available_message()
 
         if not self._observation_request_tokens:
             # A timed-out request can reply after its local token was retired. Drain such

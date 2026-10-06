@@ -1,5 +1,245 @@
 # AM1 supervised unified Local session
 
+## AM1-RELIABILITY-01 — October 6, 2026
+
+For this packet the owner authorizes finite automated bench operation with the
+base raised, and confirms that the arms can safely swing down when torque is
+released. This replaces the historical per-session attendance procedure **for
+this packet only**. Retain the normal lift home/relief arrangement, real feedback,
+source/ownership checks, motion limits and qualified cleanup. A motor-owner
+process freeze is tested offline only: its in-thread watchdog cannot run while
+that process is frozen; it has no independent hardware-stop guarantee.
+
+### Demonstrated transport correction
+
+Saved session `20261006T011321-9247fa03` completed 90.11815 seconds live with
+three follower-feedback interruptions and 131 empty/unusable native polls.
+Recovery took 21.265 seconds with manual approval, then 0.547 and 2.343 seconds
+automatically. The first feedback pause preceded browser-input expiry by about
+3.85 seconds. Replay found 3,984 host live lift samples, no sampled interval above
+100 ms, maximum sampled lift temperature 36 C and current 175.5 mA. These records
+do not establish the historical network/client scheduling cause or a Wi-Fi fault.
+
+The failing offline case establishes a narrower client defect: waiting for the
+oldest missing request conceals another already available tracked reply. AM1 now
+consumes the first available reply in request order, retires missing predecessors
+and refills the existing three-credit window. The selected reply retains its
+original send time. A 1.05-second-old reply remains stale to native qualification;
+late retired replies cannot authorize recovery. Other models retain their prior
+transport path. There is no new reader, larger queue or relaxed safety deadline.
+
+### Finite runner and current qualifications
+
+`tools/am1_reliability_bench.cjs` uses the real visible Edge Control frontend,
+loopback HTTP and native Windows pipe. Its one Start selects the existing
+Scripted/ArmSmoke backend option or normal physical-leader body mode. It requires
+a new-owner Start response, the exact Windows source pin and actual browser
+focus. Prepared startup keeps its existing qualification; manual recovery is
+never approved. Required views must be fresh decoded views, not retained blobs.
+Loss of a required view or a live latched pause requests ordinary session-bound
+Stop. During final monitoring after live admission, an exact native
+pipe-disconnected state permits a ten-second monotonic terminal-acceptance budget
+from its first observed closed state. Bounded HTTP/DOM reads can defer Stop beyond
+that point; this is not a ten-second physical-stop guarantee. This window permits
+no further pulses or recovery approval; raw exit zero and explicit cleanup proof
+are still required. A late terminal response cannot erase an elapsed deadline.
+Monitoring failure cannot suppress Stop. Each attempt has a native live
+limit, an outer finite deadline, bounded evidence and a 60-second cleanup-proof
+budget; there is no automatic restart. Cleanup failure stays failed/unverified.
+
+Physical-mode non-actuating preflight refused because Windows reports no present
+USB leader Ports. Consequently physical-leader movement and powered wheel/lift
+press-release scenarios are withheld; Scripted does not establish those results.
+Scripted preflight passed with the actual deployed import root. No identified
+spare Creality Nebula device was exposed on this Windows host; P1 observer capture
+is unavailable here, and the other printer cameras were not touched. Existing
+onboard decoded views are available to the runner; no visual motion claim follows
+from their availability.
+
+The driver invocation uses existing Node/Playwright and installed Edge. Start the
+ordinary loopback console while no session is active; keep its private config and
+camera-auth file outside Git. If necessary, set `NODE_PATH` to the existing
+Playwright installation. For the current packet's finite arm scenario:
+
+```powershell
+node tools/am1_reliability_bench.cjs http://127.0.0.1:8765/ ArmSmoke AM1-RELIABILITY-01-arm-02 <private-absolute-evidence-path> 81c10a8497fda8eea36bac3ea6861f9e6ff5ed05 30
+```
+
+The optional final argument permits only the short 30-second native arm limit or
+the full 180-second ceiling (default); body remains 12 seconds. The short scenario
+is a portion of ArmSmoke ending through its existing duration-expiry cleanup,
+not a full-profile completion. Its outer budget is 150 seconds; full-arm is 300.
+Do not launch another attempt after an unresolved failure. The same-session
+normal CLI Stop/Collect fallback remains available. The 180-second ArmSmoke
+ceiling allows the unchanged finite 88-second trajectory to complete; an idle
+duration extension or additional home is not dynamic endurance evidence.
+
+### Shutdown corrections and preserved first attempt
+
+Attempt `AM1-RELIABILITY-01-arm-01`, session `20261006T145141-642324c5`, used
+Windows `c4c4314c3870b32b45c0f39992d6316889dba3e5`. Native ArmSmoke completed
+its unchanged 88-second trajectory in 88.330017 seconds live: 878 arm action
+sends, 2,935 observations, zero feedback timeouts, zero recoveries and a maximum
+action interval of 110 ms. The runner mistook normal pipe EOF for an input fault
+about 197 ms after profile completion and requested Stop before the supervisor
+finished. Its original session result remains **operator-stopped / 130**, with
+verified cleanup; it is not a successful whole-session attempt.
+
+Fake IO reproduced both this finalization delay and a Windows input-thread
+close/read race. The runner now uses the bounded terminal wait described above.
+Native disconnect invalidates input immediately, allows an ordinary in-flight
+read to finish before closing its handle, and retains the existing total
+one-second join budget with fallback closure. A packet returned after Stop is
+discarded. No broad exception catch or feedback deadline change was added.
+
+The first attempt's existing host log contains 3,884 operational-live lift
+samples, maximum sample interval 60.007 ms, maximum sampled lift temperature
+34 C/current 39 mA and status zero throughout. These are lift samples over the
+host's operational window, not temperatures for all arm motors or the native
+live duration. Fresh arm feedback recorded endpoint movement on 11 of 12 joints,
+with endpoint errors up to 3 normalized units. The left shoulder lift remained
+at 100 for its target of 97; the final left elbow stayed about 1.992 units from
+its seed. Completion therefore establishes bounded profile progression and
+feedback availability, not precise tracking or visual motion acceptance.
+
+### Powered attempt ledger
+
+Each attempt used its own real visible browser and new owned session. Cleanup
+was verified before another Start; the corrected attempts used Windows
+`81c10a8497fda8eea36bac3ea6861f9e6ff5ed05`. All logs and derived evidence remain
+under the private packet directory outside Git.
+
+| Attempt / session | Native live / trajectory (seconds) | Live feedback timeouts / recoveries | Whole-session result |
+| --- | ---: | ---: | --- |
+| arm-01 / `20261006T145141-642324c5` | 88.330 / 88.000 | 0 / 0 | Runner aborted; Stop/130; cleanup verified |
+| arm-02 / `20261006T152432-0af03490` | 30.100 / 29.944 | 0 / 0 | Short portion complete; exit 0; cleanup verified |
+| arm-03 / `20261006T152715-4cdf7037` | 30.083 / 29.919 | 0 / 0 | Short portion complete; exit 0; cleanup verified |
+| arm-04 / `20261006T153008-5bad7ec3` | 90.025 / 88.000 | 4 / 0 | Full profile complete; exit 0; cleanup verified |
+
+The two matched short workloads each produced 299 native arm sends and 1,202
+observations, zero empty/stale live polls, and a maximum native send interval of
+110 ms. Both ended through `duration_expired`, with `profile_complete=false`.
+This establishes repeatable short lifecycle completion rather than completion
+of all twelve joint segments. Lift samples peaked at 34/35 C and 45.5/39 mA,
+respectively; maximum host sample gaps were 88.007/63.022 ms, with status zero.
+All client/wrapper/host/camera exits were zero; no collection warnings or missing
+logs were reported.
+
+The longer arm-04 attempt completed all twelve segments and the 88-second
+trajectory. Its four empty native polls were preserved by the existing bounded
+short-gap policy, with zero stale replies, zero feedback pauses and zero
+recoveries. The 90.025134-second live period produced 895 sends and 2,915
+observations, with maximum action interval 110 ms and no body-expiry event.
+The runner's maximum sampled observation age was 684.348 ms; it is a sampled
+display/native telemetry value, not a continuous maximum or a duration for each
+empty poll. Individual poll times were not logged. Its 700-record evidence ring
+reported 57 rotated early records; the complete collected native/host logs remain
+private. Normal native EOF was followed by bounded supervisor finalization rather
+than another motion command or Stop that relabeled a clean finish.
+Existing host lift evidence contains 3,933 operational-live samples: maximum
+sample interval 60.025 ms, maximum sampled temperature 36 C/current 45.5 mA,
+status zero and no native-live watchdog event. The host's cumulative command-gap
+counter reported no gap over its watchdog threshold; its whole-operational-window
+maximum was 402.040 ms, including startup, rather than a native-live gap claim.
+All client/wrapper/host/camera exits were zero, with verified cleanup and complete
+log collection. Final read-only audit found no Pi runtime owner and all three
+component checkouts clean at the unchanged pins.
+
+This is a matched 88-second ArmSmoke runner comparison: arm-01 incorrectly
+canceled a native success; arm-04 preserved the supervisor's successful result.
+The frozen seeds differ, and the transport correction was already present in
+arm-01. The older 90-second physical-input session is a different workload, so
+its three pauses/131 empty polls are context, not a matched transport before/after
+benchmark. The three offline request-order cases are the controlled comparison:
+all failed before the client correction and passed afterward (91 cadence tests).
+No new powered run required qualified pause/recovery; those paths remain covered
+offline and in the historical recovered evidence.
+
+Arm-04 again measured endpoint displacement on 11 of 12 joints, maximum endpoint
+error 3 normalized units and final requested/measured error 2.263 units. The left
+shoulder lift still did not follow its small inward target. This packet supports
+review/integration of the transport and shutdown fixes after PR #14, while
+physical-leader/body motion, precise tracking, P1 visual corroboration and dynamic
+operation beyond the tested 88-second profile remain unqualified. The normal
+loopback console is left idle; no robot/camera owner remains active.
+
+### Deployment and rollback
+
+Only the clean, stopped Windows console/client checkout was switched to
+`81c10a8497fda8eea36bac3ea6861f9e6ff5ed05`, with the independent private
+`windows_session_head` updated. Pi helper remains
+`8e6a0cf616cb2000df1d0e996ab27a19d2fb2fba`, motor
+`c3fc683d645ea1c355e69a72f705a8bbadde6a1a`, camera
+`9b1f0670e7068f7d39eb50270a118e3807418355`; all were clean and unowned before
+dispatch. Environments, calibration, mapping and DirectBrowser profile were
+preserved. The original private config is backed up outside Git. With all owned
+runtimes stopped, normally switch Windows back to
+`915a32d4d9ac42433c1aee95f4f0c74f348c5dda` and restore that private-pin backup;
+do not reset the checkout or change the three Pi component pins.
+
+For a rollback after all owned runtimes have stopped, use the same deployment
+checkout and restore only the separate Windows pin (or the original private
+config backup, after checking for intervening private edits):
+
+```powershell
+git switch --detach 915a32d4d9ac42433c1aee95f4f0c74f348c5dda
+$am1RollbackConfig = Get-Content -LiteralPath config/am1.session.json -Raw | ConvertFrom-Json
+$am1RollbackConfig.windows_session_head = '915a32d4d9ac42433c1aee95f4f0c74f348c5dda'
+$am1RollbackConfig | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath config/am1.session.json -Encoding utf8
+```
+
+Normal preflight must pass again before Start. The older DirectBrowser entrypoint
+and private local hardware configuration remain available.
+
+### Focused verification
+
+With the existing Windows environment, candidate `src` and repository on
+`PYTHONPATH`, installed Edge selected by `AM1_TEST_BROWSER_CHANNEL=msedge`, and
+the existing Playwright installation on `NODE_PATH`, the affected-suite command
+passed **955 tests, four skips** in 378.47 seconds:
+
+```powershell
+uv run --no-sync python -m pytest -p no:cacheprovider `
+  tests/robots/test_alohamini_windows_live_cadence.py `
+  tests/robots/test_alohamini_local_recovery.py `
+  tests/robots/test_alohamini_local_teleop.py `
+  tests/robots/test_alohamini_scripted_leader.py `
+  tests/robots/test_alohamini_lift_consumer_refresh.py `
+  tests/robots/test_alohamini_lift_operational.py `
+  tests/robots/test_alohamini_postq.py `
+  tests/robots/test_am1_unified_session.py `
+  tests/robots/test_am1_console.py `
+  tests/robots/test_am1_console_bridge.py `
+  tests/robots/test_am1_console_progress.py `
+  tests/robots/test_am1_console_telemetry.py `
+  tests/robots/test_am1_console_output.py `
+  tests/robots/test_am1_console_local_path.py `
+  tests/robots/test_am1_scripted_launchers.py `
+  tests/robots/test_am1_lean_launchers.py `
+  tests/robots/test_alohamini_windows_leader_client.py -q --tb=short
+```
+
+The finite 30-second option was added afterward. Its real-frontend dispatch case
+failed before correction; the subsequent command passed **15 tests** in 128.92
+seconds, including both arm limits, physical-mode fake press/release, real pipe
+shutdown, required-view loss, manual pause, foreign-owner refusal, failed monitor
+reads, delayed finalization, stalled finalization and late terminal response:
+
+```powershell
+uv run --no-sync python -m pytest -p no:cacheprovider tests/robots/test_am1_console_bridge.py tests/robots/test_am1_console_local_path.py -k 'bench or inflight_read' -q --tb=short
+node --test tests/cameras/test_am1_console_ui.cjs
+node --check tools/am1_reliability_bench.cjs
+git diff --check
+```
+
+Frontend tests: **34 passed**. JavaScript syntax and diff checks passed. Ruff
+0.14.1 (the project's pre-commit pin) found 50 diagnostics in both the exact PR
+#14 base and these seven changed Python files, with **zero added findings**.
+This is a baseline comparison, not a clean full pre-commit result. The broader
+ML/GPU suite was not run. Original failed reproductions and failed powered
+attempts remain recorded; no raw logs, private config or household images are
+included in Git. Remaining sections retain their historical evidence.
+
 This entrypoint coordinates the already accepted LAN camera viewer, Aloha Mini 1
 Local motor host, and native Windows client. It does not replace their safety
 logic, add a service, switch power, expose a network listener, or support off-LAN
