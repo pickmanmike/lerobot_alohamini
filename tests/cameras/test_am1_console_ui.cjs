@@ -53,6 +53,22 @@ test("natural status keeps accepted requests, cleanup and primary failures disti
   assert.match(UI.status({phase:"client_exited",session_id:"session"}), /cleanup.*final result/i);
 });
 
+test("restart guidance distinguishes preflight refusal, verified cleanup and unknown ownership", () => {
+  const UI = loadPresentation();
+  const preflight = UI.status({phase:"failed", error:"source mismatch", final_exit_code:2,
+                              restart_allowed:true, preflight_refused:true, cleanup_verified:null});
+  assert.match(preflight, /source mismatch/i);
+  assert.match(preflight, /no hardware.*start/i);
+  assert.match(preflight, /select Start.*retry/i);
+  assert.doesNotMatch(preflight, /cleanup verified|do not restart/i);
+  const cleaned = UI.status({phase:"failed", error:"approval timeout", final_exit_code:2,
+                            restart_allowed:true, preflight_refused:false, cleanup_verified:true});
+  assert.match(cleaned, /approval timeout.*cleanup verified.*select Start.*retry/i);
+  assert.doesNotMatch(cleaned, /complete|success|stopped by operator/i);
+  assert.doesNotMatch(UI.status({phase:"cleanup_unknown", error:"pipe close failed",
+                                 cleanup_verified:false, restart_allowed:false}), /select Start/i);
+});
+
 test("live output uses a separate session-bound route and reports truncation", () => {
   const Views = loadViews();
   assert.equal(Views.outputUrl("host", "session-1"), "/api/output?kind=host&session_id=session-1");

@@ -112,6 +112,65 @@ def test_private_config_refuses_remote_shell_paths_and_embedded_browser_credenti
         module.SessionConfig.load(config_path)
 
 
+@pytest.mark.parametrize("separate_windows_pin", [False, True])
+def test_local_preflight_checks_windows_pin_without_requiring_pi_helper_identity(
+    monkeypatch, tmp_path, separate_windows_pin,
+):
+    module = load_tool("am1_session")
+    data = json.loads((REPO_ROOT / "config/am1.session.example.json").read_text())
+    data.pop("windows_session_head", None)
+    data["remote_session_head"] = "a" * 40
+    actual_head = "b" * 40 if separate_windows_pin else "a" * 40
+    if separate_windows_pin:
+        data["windows_session_head"] = actual_head
+    data.update(windows_python=sys.executable, local_config=str(tmp_path / "local.json"),
+                windows_log_directory=str(tmp_path / "logs"), local_state_directory=str(tmp_path / "state"))
+    (tmp_path / "local.json").write_text("{}")
+    config_path = tmp_path / "session.json"
+    config_path.write_text(json.dumps(data))
+    config = module.SessionConfig.load(config_path)
+    monkeypatch.setattr(module, "_git_head", lambda _: actual_head)
+    monkeypatch.setattr(module.shutil, "which", lambda _: "pwsh")
+
+    def local_checks(command, **_):
+        if command[:1] == ["git"] and command[-2:] == ["status", "--porcelain"]:
+            return subprocess.CompletedProcess(command, 0, "", "")
+        assert "-Preflight" in command and "-File" in command
+        return subprocess.CompletedProcess(command, 0, "AM1_LOCAL_PREFLIGHT_READY", "")
+
+    monkeypatch.setattr(module.subprocess, "run", local_checks)
+    module.validate_local_preflight(REPO_ROOT, config, 90)
+    assert config.remote_session_head == "a" * 40
+    monkeypatch.setattr(module, "_git_head", lambda _: "c" * 40)
+    with pytest.raises(module.SessionError, match="Windows session source"):
+        module.validate_local_preflight(REPO_ROOT, config, 90)
+
+
+@pytest.mark.parametrize("invalid_pin", [None, "", "a" * 39, "G" * 40])
+def test_explicit_windows_pin_must_be_exact_sha(tmp_path, invalid_pin):
+    module = load_tool("am1_session")
+    data = json.loads((REPO_ROOT / "config/am1.session.example.json").read_text())
+    data["windows_session_head"] = invalid_pin
+    config_path = tmp_path / "session.json"
+    config_path.write_text(json.dumps(data))
+    with pytest.raises(module.SessionError, match="windows_session_head.*exact commit SHA"):
+        module.SessionConfig.load(config_path)
+
+
+def test_preflight_refusal_preserves_cause_before_any_owner_is_created(monkeypatch, tmp_path):
+    module = load_tool("am1_session")
+    original = module.SessionError("synthetic local source mismatch")
+
+    def refuse(*_, **__):
+        raise original
+
+    monkeypatch.setattr(module, "validate_local_preflight", refuse)
+    monkeypatch.setattr(module, "_run_start_locked", lambda *_, **__: pytest.fail("owner started"))
+    with pytest.raises(module.SessionError, match="synthetic local source mismatch") as failure:
+        module.run_start(REPO_ROOT, object(), 90)
+    assert failure.value.__cause__ is original
+
+
 def test_log_collection_refuses_untrusted_remote_path_before_scp(monkeypatch, tmp_path):
     module = load_tool("am1_session")
     monkeypatch.setattr(

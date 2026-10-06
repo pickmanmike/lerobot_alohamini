@@ -1,6 +1,7 @@
 {
   "version": 1,
   "windows_python": "C:\\Users\\YOUR_USERNAME\\lerobot_alohamini_client\\.venv\\Scripts\\python.exe",
+  "windows_session_head": "0000000000000000000000000000000000000000",
   "local_config": "C:\\Users\\YOUR_USERNAME\\lerobot_alohamini_client\\.worktrees\\am1-base-teleop\\config\\am1.local.json",
   "local_state_directory": "C:\\Users\\YOUR_USERNAME\\AppData\\Local\\AM1\\session-state",
   "windows_log_directory": "C:\\Users\\YOUR_USERNAME\\AlohaMini1Logs",

@@ -454,6 +454,8 @@ def test_completed_console_can_start_next_session(monkeypatch, tmp_path):
         identity = next(identifiers)
         calls.append(identity)
         kwargs["on_session_created"](identity)
+        kwargs["emit"]({"event": "session_complete", "session_id": identity,
+                        "final_exit_code": 0, "cleanup_verified": True})
         return 0
 
     monkeypatch.setattr(session, "run_start", fake_start)
@@ -472,7 +474,7 @@ def test_completed_console_can_start_next_session(monkeypatch, tmp_path):
     snapshot = adapter.state()["telemetry"]
     assert snapshot["observation"]["host_state"] is None
     assert snapshot["action"]["sequence"] is None
-    assert all(event["event"] == "session_created" for event in adapter.state()["events"])
+    assert [event["event"] for event in adapter.state()["events"]] == ["session_created", "session_complete"]
 
 
 @pytest.fixture
@@ -619,6 +621,150 @@ def test_verified_operator_stop_allows_only_a_new_deliberate_start(operator_stop
     assert adapter.wait(5)
 
 
+def test_preflight_only_refusal_allows_deliberate_retry_not_automatic_restart(operator_stop_console, monkeypatch):
+    adapter, control, _ = operator_stop_console
+    calls = []
+
+    def preflight(*args, **kwargs):
+        calls.append(args)
+        if len(calls) == 1:
+            raise session.SessionError("synthetic local source mismatch")
+
+    monkeypatch.setattr(session, "validate_local_preflight", preflight)
+    first = adapter.operation({"kind": "Start", "duration_seconds": 10})
+    assert adapter.wait(5)
+    assert first["accepted"] is False and first["session_id"] is None
+    assert "synthetic local source mismatch" in adapter.state()["error"]
+    assert adapter.state()["preflight_refused"] is True
+    assert adapter.state()["final_exit_code"] == 2
+    assert adapter.state()["cleanup_verified"] is None  # Not a fabricated cleanup result.
+    assert adapter.state()["restart_allowed"] is True
+    assert not control.client_running.is_set() and not control.cleanup_started.is_set()
+    assert len(calls) == 1
+    second = adapter.operation({"kind": "Start", "duration_seconds": 10})
+    try:
+        assert second["accepted"] is True
+        assert control.client_running.wait(2) and len(calls) == 2
+        assert adapter.state()["error"] is None
+    finally:
+        if second.get("session_id"):
+            adapter.operation({"kind": "Stop", "session_id": second["session_id"]})
+        assert adapter.wait(5)
+
+
+def test_verified_failed_session_can_restart_without_relabeling_failure(operator_stop_console):
+    adapter, control, config = operator_stop_console
+    control.client_exit = 2
+    control.refusal = "synthetic live approval not received"
+    first = adapter.operation({"kind": "Start", "duration_seconds": 10})
+    assert control.client_running.wait(2)
+    assert adapter.operation({"kind": "Stop", "session_id": first["session_id"]})["accepted"]
+    assert adapter.wait(5)
+    final = adapter.state()
+    assert final["phase"] == "failed" and final["cleanup_verified"] is True
+    assert final["final_exit_code"] == 2
+    summary_path = config.windows_log_directory / f"am1-session-{first['session_id']}" / "session-summary.json"
+    saved = summary_path.read_bytes()
+    assert len(control.preflights) == 1
+    control.client_running.clear()
+    second = adapter.operation({"kind": "Start", "duration_seconds": 10})
+    try:
+        assert second["accepted"] and second["session_id"] != first["session_id"]
+        assert control.client_running.wait(2) and len(control.preflights) == 2
+        assert summary_path.read_bytes() == saved
+    finally:
+        if second.get("session_id"):
+            adapter.operation({"kind": "Stop", "session_id": second["session_id"]})
+        assert adapter.wait(5)
+
+
+def test_session_summary_records_actual_windows_head_not_pi_pin(operator_stop_console, monkeypatch):
+    adapter, control, config = operator_stop_console
+    monkeypatch.setattr(session, "_git_head", lambda _: "b" * 40)
+    first = adapter.operation({"kind": "Start", "duration_seconds": 10})
+    assert control.client_running.wait(2)
+    assert adapter.operation({"kind": "Stop", "session_id": first["session_id"]})["accepted"]
+    assert adapter.wait(5)
+    summary = json.loads((config.windows_log_directory / f"am1-session-{first['session_id']}" /
+                          "session-summary.json").read_text())
+    assert summary["sources"]["windows_source_head"] == "b" * 40
+    assert summary["sources"]["session_source_head"] == "a" * 40
+
+
+def test_remote_preflight_refusal_retains_known_windows_source(operator_stop_console, monkeypatch):
+    adapter, _, config = operator_stop_console
+    monkeypatch.setattr(session, "_git_head", lambda _: "b" * 40)
+
+    def refuse(_):
+        raise session.SessionError("synthetic remote source refusal")
+
+    monkeypatch.setattr(session.SSHRemote, "preflight", refuse)
+    result = adapter.operation({"kind": "Start", "duration_seconds": 10})
+    assert adapter.wait(5)
+    summary = json.loads((config.windows_log_directory / f"am1-session-{result['session_id']}" /
+                          "session-summary.json").read_text())
+    assert summary["sources"] == {"windows_source_head": "b" * 40}
+    assert "synthetic remote source refusal" in summary["failure"]
+
+
+def test_cleanup_finalization_and_summary_failure_cannot_reuse_early_proof(operator_stop_console, monkeypatch):
+    adapter, control, _ = operator_stop_console
+    first = adapter.operation({"kind": "Start", "duration_seconds": 10})
+    assert control.client_running.wait(2)
+    original_write = Path.write_text
+    failed_writes = []
+
+    def fail_active_write(*_):
+        failed_writes.append("active")
+        raise OSError("synthetic persistent finalization write failure")
+
+    def fail_terminal_writes(path, *args, **kwargs):
+        if path.name == "session-summary.json":
+            failed_writes.append("summary")
+            raise OSError("synthetic persistent finalization write failure")
+        return original_write(path, *args, **kwargs)
+
+    monkeypatch.setattr(session, "_write_active", fail_active_write)
+    monkeypatch.setattr(Path, "write_text", fail_terminal_writes)
+    assert adapter.operation({"kind": "Stop", "session_id": first["session_id"]})["accepted"]
+    assert adapter.wait(5)
+    assert failed_writes == ["active", "summary"]
+    state = adapter.state()
+    assert any(event.get("event") == "cleanup" and event.get("cleanup_verified") is True
+               for event in state["events"])
+    assert "synthetic persistent finalization write failure" in state["error"]
+    assert state["cleanup_verified"] is not True
+    assert state["restart_allowed"] is False
+    assert not adapter.operation({"kind": "Start", "duration_seconds": 10})["accepted"]
+    assert len(control.preflights) == 1
+
+
+def test_success_return_without_terminal_cleanup_proof_cannot_restart(monkeypatch, tmp_path):
+    def incomplete(_repository, _config, _duration, **kwargs):
+        kwargs["on_session_created"]("20261001T000000-1234abcd")
+        kwargs["emit"]({"event": "cleanup", "cleanup_verified": True})
+        return 0
+
+    monkeypatch.setattr(session, "run_start", incomplete)
+    adapter = console.ConsoleSessionAdapter(SimpleNamespace(local_state_directory=tmp_path), ROOT, session)
+    adapter.operation({"kind": "Start", "duration_seconds": 10})
+    assert adapter.wait(3)
+    assert adapter.state()["restart_allowed"] is False
+    assert not adapter.operation({"kind": "Start", "duration_seconds": 10})["accepted"]
+
+
+def test_unknown_exception_before_identity_is_not_proof_nothing_started(monkeypatch, tmp_path):
+    def uncertain(*_, **__):
+        raise RuntimeError("unknown dispatch boundary")
+
+    monkeypatch.setattr(session, "run_start", uncertain)
+    adapter = console.ConsoleSessionAdapter(SimpleNamespace(), ROOT, session)
+    adapter.operation({"kind": "Start", "duration_seconds": 10})
+    assert adapter.wait(3)
+    assert adapter.state()["cleanup_verified"] is None
+    assert not adapter.operation({"kind": "Start", "duration_seconds": 10})["accepted"]
+
+
 @pytest.mark.parametrize("change", [
     {"remote_fault": {"reason": "synthetic genuine motor fault"}},
     {"primary_fault": {"reason": "synthetic recorded motor fault"}},
@@ -638,7 +784,12 @@ def test_cancel_exit_cannot_hide_fault_or_uncertain_ownership(operator_stop_cons
     assert adapter.operation({"kind": "Stop", "session_id": first["session_id"]})["accepted"]
     assert adapter.wait(5)
     assert adapter.state()["phase"] in {"failed", "cleanup_unknown"}
-    assert not adapter.operation({"kind": "Start", "duration_seconds": 10})["accepted"]
+    if adapter.state()["cleanup_verified"] is not True:
+        assert not adapter.operation({"kind": "Start", "duration_seconds": 10})["accepted"]
+    else:
+        # A failed run stays failed, but a later deliberate Start may re-run
+        # normal preflight after all owners have closed with verified cleanup.
+        assert adapter.state()["restart_allowed"] is True
     assert len(control.preflights) == 1
 
 
@@ -653,10 +804,12 @@ def test_operator_stop_stays_stopping_until_hardware_and_pipe_owners_finish(oper
     assert adapter.operation({"kind": "Stop", "session_id": first["session_id"]})["accepted"]
     assert control.cleanup_started.wait(2)
     assert adapter.state()["phase"] == "stopping"
+    assert adapter.state()["restart_allowed"] is False
     assert adapter.operation({"kind": "Start", "duration_seconds": 10})["session_id"] == first["session_id"]
     control.cleanup_release.set()
     assert control.pipe_close_started.wait(2)
     assert adapter.state()["phase"] == "stopping"
+    assert adapter.state()["restart_allowed"] is False
     assert len(control.preflights) == 1
     control.pipe_close_release.set()
     assert adapter.wait(5)
@@ -714,7 +867,9 @@ def test_stop_preserves_client_refusal_before_later_remote_fault(operator_stop_c
     assert summary["failure"] == "Windows Local client safety refusal: synthetic primary follower fault"
     assert summary["operator_stopped"] is False
     assert summary["cleanup"]["client"]["client_exit"] == 130
-    assert not adapter.operation({"kind": "Start", "duration_seconds": 10})["accepted"]
+    assert adapter.state()["phase"] == "failed"
+    assert adapter.state()["restart_allowed"] is True
+    assert len(control.preflights) == 1  # Failed status never automatically restarts.
 
 
 def test_stop_before_remote_dispatch_is_verified_without_automatic_restart(operator_stop_console):

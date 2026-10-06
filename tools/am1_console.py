@@ -56,6 +56,8 @@ class ConsoleSessionAdapter:
         self._phase = "idle"
         self._final_exit_code: int | None = None
         self._cleanup_verified: bool | None = None
+        self._preflight_refused = False
+        self._terminal_cleanup_verified = False
         self._operator_stopped = False
         self._verified_source_heads: dict[str, str] | None = None
         self._verified_source_at_ns: int | None = None
@@ -150,6 +152,10 @@ class ConsoleSessionAdapter:
             if event.get("event") in {"cleanup", "session_complete"} and type(event.get("cleanup_verified")) is bool:
                 self._cleanup_verified = event["cleanup_verified"]
             if event.get("event") == "session_complete":
+                self._terminal_cleanup_verified = (
+                    self._session_id is not None and event.get("session_id") == self._session_id
+                    and event.get("cleanup_verified") is True
+                )
                 if isinstance(event.get("failure"), str) and event["failure"] and self._error is None:
                     self._error = event["failure"]
                 self._operator_stopped = (event.get("operator_stopped") is True
@@ -261,6 +267,9 @@ class ConsoleSessionAdapter:
             with self._lock:
                 self._error = f"{type(exc).__name__}: {exc}"
                 self._phase = "failed"
+                if isinstance(exc, getattr(self.session_module, "LocalPreflightError", ())):
+                    self._preflight_refused = True
+                    self._final_exit_code = 2
             self._emit({"event": "session_error", "reason": self._error})
         finally:
             bridge = self._bridge
@@ -275,7 +284,13 @@ class ConsoleSessionAdapter:
                         self._cleanup_verified = False
                 self._bridge = None
             with self._lock:
-                if self._cleanup_verified is False:
+                # The preliminary cleanup event precedes local finalization.
+                # It cannot prove cleanup if finalization never reports back.
+                if self._cleanup_verified is True and not self._terminal_cleanup_verified:
+                    self._cleanup_verified = None
+                if self._cleanup_verified is False or (
+                    self._session_id is not None and self._cleanup_verified is None
+                ):
                     self._phase = "cleanup_unknown"
                 elif self._error is not None:
                     self._phase = "failed"
@@ -285,10 +300,21 @@ class ConsoleSessionAdapter:
                     self._phase = "complete" if self._final_exit_code == 0 else "cleanup_unknown" if self._final_exit_code == 3 else "failed"
             self._created.set()
 
+    def _restart_allowed_locked(self) -> bool:
+        if self._bridge is not None or (self._worker is not None and self._worker.is_alive()):
+            return False
+        if self._worker is None:
+            return self._phase == "idle"
+        return self._phase in {"complete", "operator_stopped", "failed"} and (
+            (self._cleanup_verified is True and self._terminal_cleanup_verified)
+            or (self._preflight_refused and self._cleanup_verified is None)
+        )
+
     def state(self):
         with self._lock:
             state = {"session_id": self._session_id, "phase": self._phase,
                     "final_exit_code": self._final_exit_code, "cleanup_verified": self._cleanup_verified,
+                    "restart_allowed": self._restart_allowed_locked(), "preflight_refused": self._preflight_refused,
                     "error": self._error,
                     "events": list(self._events), "telemetry": self._telemetry.snapshot(now_ns=time.time_ns()),
                     "progress": self._progress.snapshot(now=time.monotonic())}
@@ -298,6 +324,9 @@ class ConsoleSessionAdapter:
                     state["phase"] = "feedback_stale"
             state["configured_source_pins"] = {name: getattr(self.config, name, None) for name in (
                 "remote_session_head", "remote_motor_head", "remote_camera_head")}
+            state["configured_source_pins"]["windows_session_head"] = (
+                getattr(self.config, "windows_session_head", None) or getattr(self.config, "remote_session_head", None)
+            )
             state["verified_source_heads"] = None if self._verified_source_heads is None else dict(self._verified_source_heads)
             state["verified_source_at_ns"] = self._verified_source_at_ns
             bridge = self._bridge
@@ -370,11 +399,9 @@ class ConsoleSessionAdapter:
                 if self._worker is not None and self._worker.is_alive():
                     # A second tab attaches to the current or completed result.
                     return {"accepted": True, "session_id": self._session_id, "phase": self._phase}
-                if self._worker is not None and not (
-                    self._phase in {"complete", "operator_stopped"} and self._bridge is None
-                ):
+                if not self._restart_allowed_locked():
                     return {"accepted": False, "session_id": self._session_id,
-                            "phase": self._phase, "reason": "prior cleanup or failure is unresolved"}
+                            "phase": self._phase, "reason": "prior session cleanup is not verified; inspect the previous result"}
                 duration = self.session_module.parse_duration_seconds(payload.get("duration_seconds"))
                 leader_source = payload.get("leader_source", "physical")
                 motion_profile = payload.get("motion_profile")
@@ -383,6 +410,8 @@ class ConsoleSessionAdapter:
                 self._session_id = None
                 self._final_exit_code = None
                 self._cleanup_verified = None
+                self._preflight_refused = False
+                self._terminal_cleanup_verified = False
                 self._operator_stopped = False
                 self._verified_source_heads = None
                 self._verified_source_at_ns = None

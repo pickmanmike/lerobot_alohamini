@@ -225,6 +225,10 @@ class AM1ConsolePresentation {
     if (state.phase === "client_exited") return "Finishing — waiting for cleanup and the final result.";
     if (state.phase === "cleanup_unknown") return "Cleanup is unverified — do not restart." +
       (state.error ? ` Primary fault: ${state.error}` : "");
+    if (state.phase === "failed" && state.restart_allowed === true) {
+      const proof = state.preflight_refused ? "No hardware was started." : "Cleanup verified.";
+      return `Previous attempt failed${state.error ? `: ${state.error}.` : "."} ${proof} Correct the cause, then select Start to retry.`;
+    }
     if (state.error) return `Session refused: ${state.error}`;
     if (state.phase === "failed") return "Session failed — inspect Session details; do not restart.";
     if (state.phase === "operator_stopped") return state.cleanup_verified === true ?

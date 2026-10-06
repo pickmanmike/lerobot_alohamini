@@ -10,6 +10,27 @@ continuity target. Loss of a required view still means release controls, press
 
 ## Compact Control presentation — focused follow-up, October 4, 2026
 
+### Separate Windows pin and deliberate retry after verified shutdown
+
+The private session config can set `windows_session_head` to the exact reviewed
+Windows commit independently of `remote_session_head` (the Pi helper commit).
+If omitted, legacy configs still require Windows to match `remote_session_head`.
+Both remain exact SHA checks; do not disable preflight or deploy unrelated code
+over the motor/camera owners to make the versions identical. Back up private
+configuration before changing a source pin. Summaries report the actual Windows
+Git head, not the Pi helper's configured head.
+
+A failed attempt stays failed, with its original reason/exit and saved session
+records intact. A later **deliberate Start** is allowed only after the worker and
+console pipe have closed, and either cleanup was explicitly verified or local
+preflight explicitly refused before session resources/remote dispatch. A missing
+session ID by itself is not evidence that nothing started. Unverified/failed
+cleanup continues to block restart; it cannot be cleared by pressing Stop again.
+The page distinguishes “No hardware was started” from “Cleanup verified” and
+tells the operator to correct the cause before selecting Start. There is no
+automatic retry, success relabeling or change to current Resume/gate policy.
+Every new Start repeats normal exact-source, single-owner and hardware preflight.
+
 `codex/am1-control-ui-polish` follows integration `3645646701d721b3f1b60075c7f5e0d834997deb`;
 PR #12 remains closed. This changes presentation and bounded read-only progress,
 not the accepted operating policy. The dedicated DirectBrowser viewport was
