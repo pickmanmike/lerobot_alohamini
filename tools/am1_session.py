@@ -83,6 +83,10 @@ class SessionError(RuntimeError):
     pass
 
 
+class LocalPreflightError(SessionError):
+    """Local validation refused before session resources or remote dispatch."""
+
+
 class SessionStopped(RuntimeError):
     pass
 
@@ -213,6 +217,7 @@ class SessionConfig:
     remote_state_directory: str
     windows_log_directory: Path
     console_camera_auth_file: Path | None = None
+    windows_session_head: str | None = None
 
     @classmethod
     def load(cls, path: Path) -> "SessionConfig":
@@ -239,6 +244,9 @@ class SessionConfig:
         for key in ("remote_session_head", "remote_camera_head", "remote_motor_head"):
             if not re.fullmatch(r"[0-9a-f]{40}", values[key]):
                 raise SessionError(f"Private AM1 session config field {key} must be an exact commit SHA.")
+        windows_head = data.get("windows_session_head", values["remote_session_head"])
+        if not isinstance(windows_head, str) or not re.fullmatch(r"[0-9a-f]{40}", windows_head):
+            raise SessionError("Private AM1 session config field windows_session_head must be an exact commit SHA.")
         for key in (
             "remote_python",
             "remote_helper",
@@ -283,6 +291,7 @@ class SessionConfig:
             remote_state_directory=values["remote_state_directory"],
             windows_log_directory=Path(values["windows_log_directory"]),
             console_camera_auth_file=Path(auth_file) if auth_file is not None else None,
+            windows_session_head=windows_head,
         )
 
 
@@ -452,6 +461,8 @@ class SessionCoordinator:
             motion_profile=self.motion_profile,
             started_at=datetime.now().astimezone().isoformat(),
         )
+        if self.windows_source_head is not None:
+            outcome.sources["windows_source_head"] = self.windows_source_head
         remote_logs: list[str] = []
         remote_started = False
         remote_fault_observed_after_client_result: dict[str, Any] | None = None
@@ -462,13 +473,11 @@ class SessionCoordinator:
             self._display_progress("connections", source="session preflight")
             preflight = self.remote.preflight()
             print("AM1 session phase: Pi source and ownership preflight passed.", flush=True)
-            outcome.sources = {
+            outcome.sources.update({
                 key: str(value)
                 for key, value in preflight.items()
-                if key.endswith("_source_head")
-            }
-            if self.windows_source_head is not None:
-                outcome.sources["windows_source_head"] = self.windows_source_head
+                if key.endswith("_source_head") and key != "windows_source_head"
+            })
             self._emit({"event": "preflight_passed", "sources": dict(outcome.sources)})
             self._display_progress("cameras", source="session camera start")
             camera = self.remote.start_camera()
@@ -1485,7 +1494,8 @@ def validate_local_preflight(
     missing = [str(path) for path in required if not path.is_file()]
     if missing:
         raise SessionError("Required local session path is missing: " + ", ".join(missing))
-    if _git_head(repository) != config.remote_session_head:
+    expected_windows_head = getattr(config, "windows_session_head", None) or config.remote_session_head
+    if _git_head(repository) != expected_windows_head:
         raise SessionError("Windows session source does not match the reviewed session commit.")
     status = subprocess.run(
         ["git", "-C", str(repository), "status", "--porcelain"],
@@ -1643,6 +1653,7 @@ def _run_start_locked(
     console_prepare: Callable[[str], tuple[str, Path]] | None = None,
 ) -> int:
     validate_leader_selection(leader_source, motion_profile)
+    windows_source_head = _git_head(repository)
     active_path = _active_path(config)
     if active_path.exists():
         try:
@@ -1713,7 +1724,7 @@ def _run_start_locked(
         on_cleanup=record_hardware_cleanup,
         leader_source=leader_source,
         motion_profile=motion_profile,
-        windows_source_head=getattr(config, "remote_session_head", None),
+        windows_source_head=windows_source_head,
         gate=gate,
         emit=emit,
     ).run(
@@ -1760,9 +1771,14 @@ def run_start(
     on_session_created: Callable[[str], None] | None = None,
     console_prepare: Callable[[str], tuple[str, Path]] | None = None,
 ) -> int:
-    validate_local_preflight(
-        repository, config, duration_seconds, leader_source=leader_source, motion_profile=motion_profile,
-    )
+    try:
+        validate_local_preflight(
+            repository, config, duration_seconds, leader_source=leader_source, motion_profile=motion_profile,
+        )
+    except Exception as exc:
+        # This boundary is before lock/pipe/client/supervisor creation. A missing
+        # session ID alone is NOT proof that an arbitrary later failure is safe.
+        raise LocalPreflightError(str(exc)) from exc
     with LocalSessionLock(config.local_state_directory / "active.lock"):
         return _run_start_locked(
             repository, config, duration_seconds, leader_source=leader_source, motion_profile=motion_profile,
