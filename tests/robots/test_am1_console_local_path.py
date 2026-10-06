@@ -59,8 +59,9 @@ class FakeSessionIO:
     def parse_duration_seconds(self, value):
         return int(value)
 
-    def validate_leader_selection(self, source, profile):
-        assert (source, profile) in {("physical", None), ("scripted", "ArmSmoke")}
+    def validate_leader_selection(self, source, profile, duration=None):
+        from tools.am1_session import validate_leader_selection
+        validate_leader_selection(source, profile, duration)
 
     def request_stop(self, config, *, expected_session_id, wait):
         self.stopped.set()
@@ -713,14 +714,21 @@ def test_owned_native_process_keeps_real_pipe_and_stops(tmp_path, startup_second
     assert adapter.state()["cleanup_verified"] is True
 
 
-@pytest.mark.parametrize("duration", ["0", "1800", "NaN"])
-def test_bench_refuses_unqualified_native_duration_before_browser(tmp_path, duration):
+@pytest.mark.parametrize('scenario,identity,duration', [
+    ('ArmSmoke', 'AM1-RELIABILITY-01-arm-01', '0'),
+    ('ArmSmoke', 'AM1-RELIABILITY-01-arm-01', '1800'),
+    ('ArmSmoke', 'AM1-RELIABILITY-01-arm-01', 'NaN'),
+    ('ArmSmokeRepeat', 'AM1-RELIABILITY-02-arm-01', '180'),
+    ('ArmSmokeRepeat', 'AM1-RELIABILITY-02-arm-01', '421'),
+    ('PhysicalLeader', 'AM1-RELIABILITY-02-physical-01', '420'),
+])
+def test_bench_refuses_unqualified_native_duration_before_browser(tmp_path, scenario, identity, duration):
     node = shutil.which("node")
     if not node or subprocess.run([node, "-e", "require('playwright')"], capture_output=True).returncode:
         pytest.skip("Node/Playwright unavailable")
     evidence = tmp_path / "bench.json"
     result = subprocess.run([node, str(ROOT / "tools/am1_reliability_bench.cjs"),
-        "http://127.0.0.1:1/", "ArmSmoke", "AM1-RELIABILITY-01-arm-01", str(evidence), "1" * 40, duration],
+        "http://127.0.0.1:1/", scenario, identity, str(evidence), "1" * 40, duration],
         capture_output=True, text=True, timeout=10)
     assert result.returncode == 1 and "Native duration must be an established finite scenario" in result.stderr
     assert not evidence.exists()
@@ -729,7 +737,7 @@ def test_bench_refuses_unqualified_native_duration_before_browser(tmp_path, dura
 @pytest.mark.skipif(sys.platform != "win32", reason="Actual AF_PIPE is Windows-only")
 @pytest.mark.parametrize("case", ["healthy", "navigation", "blur", "hidden", "body-delay",
                                       "body-presence-loss", "short-browser-stall",
-                                      "body-reject", "body-denied", "state-reject", "state-delay", "pending-stop", "camera-delay", "approval-order", "startup-approval", "bench-body", "bench-arm", "bench-arm-short", "bench-pause", "bench-foreign", "bench-monitor-failure", "bench-camera-loss", "bench-finalize", "bench-finalize-stall", "bench-finalize-late-result"])
+                                      "body-reject", "body-denied", "state-reject", "state-delay", "pending-stop", "camera-delay", "approval-order", "startup-approval", "bench-body", "bench-arm", "bench-arm-short", "bench-repeat", "bench-physical", "bench-pause", "bench-foreign", "bench-monitor-failure", "bench-camera-loss", "bench-finalize", "bench-finalize-stall", "bench-finalize-late-result"])
 def test_browser_loopback_native_path(tmp_path, case):
     node = shutil.which("node")
     if not node or subprocess.run([node, "-e", "require('playwright')"], capture_output=True).returncode:
@@ -813,11 +821,16 @@ def test_browser_loopback_native_path(tmp_path, case):
     for thread in threads:
         thread.start()
     try:
-        arm_bench = case in {"bench-arm", "bench-arm-short"}
+        arm_bench = case in {"bench-arm", "bench-arm-short", "bench-repeat"}
+        bench_scenario = ('ArmSmokeRepeat' if case == 'bench-repeat' else
+                          'PhysicalLeader' if case == 'bench-physical' else
+                          'ArmSmoke' if arm_bench else 'BodyPressRelease')
+        bench_identity = ('AM1-RELIABILITY-02-physical-01' if case == 'bench-physical' else
+                          'AM1-RELIABILITY-02-arm-01' if case == 'bench-repeat' else
+                          'AM1-RELIABILITY-01-arm-01' if arm_bench else 'AM1-RELIABILITY-01-body-01')
         driver = ([node, str(ROOT / "tools/am1_reliability_bench.cjs"),
                    f"http://127.0.0.1:{server.server_port}",
-                   "ArmSmoke" if arm_bench else "BodyPressRelease",
-                   "AM1-RELIABILITY-01-arm-01" if arm_bench else "AM1-RELIABILITY-01-body-01",
+                   bench_scenario, bench_identity,
                    str(tmp_path / "bench.json"), "1" * 40]
                   if case.startswith("bench-") else
                   [node, str(ROOT / "tests/cameras/am1_console_local_driver.cjs"),
@@ -826,6 +839,8 @@ def test_browser_loopback_native_path(tmp_path, case):
             driver.append("30")
         result = subprocess.run(driver,
                                 capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=35)
+        if case in {'bench-repeat', 'bench-physical'}:
+            assert result.returncode == 0, result.stdout + result.stderr
         intervals = [(seq, round((at - previous[1])*1000), active)
                      for previous, (seq, at, active) in zip(received, received[1:])]
         if case.startswith("bench-"):
@@ -855,7 +870,12 @@ def test_browser_loopback_native_path(tmp_path, case):
                 assert evidence["failure"] is None
                 assert "Stop" not in operations
                 arm_duration = 30 if case == "bench-arm-short" else 180
-                assert session.start_requests == ([(arm_duration, "scripted", "ArmSmoke")] if arm_bench else [(12, "physical", None)])
+                if case == 'bench-repeat':
+                    assert session.start_requests == [(420, 'scripted', 'ArmSmokeRepeat')]
+                elif case == 'bench-physical':
+                    assert session.start_requests == [(180, 'physical', None)]
+                else:
+                    assert session.start_requests == ([(arm_duration, "scripted", "ArmSmoke")] if arm_bench else [(12, "physical", None)])
                 assert [pulse["key"] for pulse in evidence["pulses"]] == ([] if arm_bench else ["w", "a", "u", "j"])
         if case not in {"bench-pause", "bench-monitor-failure", "bench-camera-loss", "bench-finalize-stall", "bench-finalize-late-result"}:
             assert result.returncode == 0, result.stdout + result.stderr + f"\nServer body arrivals: {intervals[-20:]}"

@@ -9,12 +9,16 @@ const [requestedAddress, scenario, identity, evidencePath, expectedWindowsHead, 
 const target = new URL(requestedAddress);
 const address = target.href;
 assert(target.protocol === "http:" && target.hostname === "127.0.0.1" && target.pathname === "/");
-assert(["ArmSmoke", "BodyPressRelease"].includes(scenario));
-assert(/^AM1-RELIABILITY-01-(arm|body)-\d{2}$/.test(identity));
-assert.equal(identity.includes("-arm-"), scenario === "ArmSmoke");
-const nativeLiveSeconds = Number(requestedLiveSeconds ?? (scenario === "ArmSmoke" ? 180 : 12));
-assert(scenario === "ArmSmoke" ? [30, 180].includes(nativeLiveSeconds) : nativeLiveSeconds === 12,
-       "Native duration must be an established finite scenario: ArmSmoke 30 or 180; body 12");
+assert(["ArmSmoke", "ArmSmokeRepeat", "BodyPressRelease", "PhysicalLeader"].includes(scenario));
+const scripted = scenario === "ArmSmoke" || scenario === "ArmSmokeRepeat";
+const kind = scripted ? "arm" : scenario === "PhysicalLeader" ? "physical" : "body";
+assert(/^AM1-RELIABILITY-(01|02)-(arm|body|physical)-\d{2}$/.test(identity));
+assert(identity.includes(`-${kind}-`), "Evidence identity must match the input scenario");
+if (["ArmSmokeRepeat", "PhysicalLeader"].includes(scenario)) assert(identity.startsWith("AM1-RELIABILITY-02-"));
+const durations = {ArmSmoke:[30, 180], ArmSmokeRepeat:[420], BodyPressRelease:[12], PhysicalLeader:[180]};
+const nativeLiveSeconds = Number(requestedLiveSeconds ?? durations[scenario].at(-1));
+assert(durations[scenario].includes(nativeLiveSeconds),
+       "Native duration must be an established finite scenario: ArmSmoke 30 or 180; repeat 420; body 12; physical 180");
 assert(/^[a-f0-9]{40}$/.test(expectedWindowsHead));
 assert(path.isAbsolute(evidencePath), "Use a private absolute evidence path outside public Git");
 const headless = process.env.AM1_BENCH_HEADLESS === "1";
@@ -28,7 +32,7 @@ assert(!(headless && target.port === "8765"), "Powered console bench requires th
   let final = null, failure = null;
   let viewsRequired = false;
   const startedAt = Date.now();
-  const deadline = performance.now() + (scenario === "ArmSmoke" ? nativeLiveSeconds * 1000 + 120000 : 180000);
+  const deadline = performance.now() + (scenario === "BodyPressRelease" ? 180000 : nativeLiveSeconds * 1000 + 120000);
   const keep = record => {
     records.push({received_wall_time_ms:Date.now(), ...record});
     if (records.length > 700) { records.shift(); droppedRecords++; }
@@ -44,9 +48,12 @@ assert(!(headless && target.port === "8765"), "Powered console bench requires th
     if (payload.kind === "Start") {
       assert.equal(++startCount, 1, "Only one attempt is authorized per invocation");
       payload.duration_seconds = nativeLiveSeconds;
-      if (scenario === "ArmSmoke") {
+      if (scripted) {
         payload.leader_source = "scripted";
-        payload.motion_profile = "ArmSmoke";
+        payload.motion_profile = scenario;
+      } else if (scenario === "PhysicalLeader") {
+        payload.leader_source = "physical";
+        delete payload.motion_profile;
       }
       await route.continue({postData:JSON.stringify(payload)});
     } else {
@@ -141,7 +148,7 @@ assert(!(headless && target.port === "8765"), "Powered console bench requires th
     await page.waitForFunction(() => document.querySelector("#connection").textContent.startsWith(
       "Cameras 5/5 fresh decoded views"), null, {timeout:5000});
     viewsRequired = true;
-    if (scenario === "BodyPressRelease") {
+    if (scenario === "BodyPressRelease" || scenario === "PhysicalLeader") {
       for (const key of ["w", "a", "u", "j"]) {
         const current = await read();
         assert.equal(current.phase, "live");

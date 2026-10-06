@@ -1,5 +1,165 @@
 # AM1 supervised unified Local session
 
+## AM1-RELIABILITY-02 — integration and bounded follow-ups
+
+PR #14 was merged ordinarily into `integrate/am1-local-teleop` as
+`7da4cb2ab249f4a83e87edd97fb19e9f2bebc62b`, with parents `8b5f8963` and
+`915a32d4`. PR #15 was then retargeted, its actual ten-file incremental diff
+reviewed, and merged as `9aa6d3b042a92e538213b0c684fd52d000b9cc7c`, with
+parents `7da4cb2a` and `39647399`. Each merge tree equals its reviewed PR
+head. Both PRs are closed as merged; remote integration matches. Main remains
+`ab4462b713aeb24d0473f1ec6c8812290ab19510`; no protection bypass was used.
+The latest posted PR #15 review and final focused code review found no blocker.
+GitHub returned no commit status contexts or PR workflow runs for either head.
+Prior test results below retain their actual source versions; integration did
+not trigger another broad suite or powered trial.
+
+### Opt-in finite repetition
+
+Ordinary `ArmSmoke` and its 30/180-second runner options are unchanged.
+`ArmSmokeRepeat` composes exactly four existing 88-second trajectories in one
+native Local session. It keeps the original fresh frozen seed, inward 3-unit
+targets, three-second ramps, existing holds, 10 Hz cadence, freshness and
+recovery rules. No cycle homes, synchronizes, reconnects devices or starts a
+new session. The 352 trajectory seconds include the original holds; boundary
+qualification time is excluded from trajectory progress.
+
+At every return, including the fourth, three distinct advancing observations
+must span at least 0.2 seconds and stay within 3 normalized units of the
+original seed. Only the existing active-epoch sender can admit a tick, with
+the unchanged combined request/local age limit. A pause discards the partial
+return window and elapsed wall time. A return outside tolerance refuses through
+ordinary cleanup; there is no reseeding, corrective jump or automatic retry.
+Completion has one profile-specific terminal summary, four completed cycles
+and four qualified returns. The native ceiling is exactly 420 seconds, checked
+by the console/session/native paths and PowerShell launchers. Partial runs
+remain partial. Body/lift commands remain disabled for scripted profiles.
+
+The separate `PhysicalLeader` runner scenario requests one ordinary 180-second
+physical-leader session. The owner moves both leaders briefly after normal
+startup; the runner uses the existing owned frontend for W/A/U/J press/release
+actions of 200 ms. Its observations and pulses are evidence of accepted input,
+not a claim of measured base/lift motion. Existing gate, ownership, camera,
+controller-loss, session-bound Stop and cleanup requirements remain in force.
+Neither new scenario approves recovery or restarts motion automatically.
+
+Offline verification of the affected core paths: **304 passed, 1 skipped**.
+Affected bench cases: **18 passed**. Nine affected tests were rerun successfully
+after test-only lint repairs. RED was observed for the missing provider/native
+dispatch, launch/summary path and browser scenarios before their implementations.
+Fake native entrypoint tests complete all four cycles with one connection and
+one live admission; real sender tests reject stale/lost admission at a boundary.
+Real frontend/HTTP/Windows pipe tests dispatch both new scenarios and verify
+owned cleanup. These fake tests are not powered endurance evidence. Python AST,
+JavaScript syntax and diff checks pass; Ruff 0.14.1 adds no findings against the
+exact integrated base (63 inherited findings in the seven checked files).
+
+### Working and deployed paths
+
+The follow-up branch is `codex/am1-reliability-02`, from integrated `9aa6d3b0`,
+in `C:\Users\pickm\.codex\worktrees\am1-reliability-01\lerobot_alohamini_client`.
+The shell is PowerShell 7. Tests reuse
+`C:\Users\pickm\lerobot_alohamini_client\.venv`, with `uv run --no-sync` and
+the candidate's `src` and root on `PYTHONPATH`; no dependency installation is
+required. The affected deployment is Windows console/client/launcher only.
+The Pi helper, motor and camera require no source change for profile selection.
+
+The post-merge audit found clean deployed Windows source `81c10a84`, helper
+`8e6a0cf6`, motor `c3fc683d` and camera `9b1f0670`, with no Pi runtime owner.
+Windows `81c10a84` to integrated `9aa6d3b0` differs only in two documentation
+files, so the merges did not justify a cosmetic deployment. Any staging of
+this follow-up must instead use its reviewed runtime commit and update only
+the separate private Windows pin. Back up the private config outside Git,
+preserve its permissions, and stage only with the session and all owners
+stopped. Rollback for this follow-up is the stopped Windows source and private
+Windows pin `81c10a8497fda8eea36bac3ea6861f9e6ff5ed05`; Pi pins stay separate.
+
+Configured deployment directory:
+`C:\Users\pickm\lerobot_alohamini_client\.worktrees\am1-console-implementation`.
+Its launch remains:
+
+```powershell
+$env:UV_PROJECT_ENVIRONMENT = 'C:\Users\pickm\lerobot_alohamini_client\.venv'
+$env:PYTHONPATH = "$PWD\src;$PWD"
+uv run --no-sync python -m tools.am1_console --config config\am1.session.json --no-browser
+```
+
+With that reviewed source staged, existing connections verified, motor supplies
+restored in their established assignments, an accessible disconnect and the
+owner supervising, use one visible ordinary Control browser invocation:
+
+```powershell
+$head = (Get-Content config\am1.session.json -Raw | ConvertFrom-Json).windows_session_head
+$env:AM1_BENCH_HEADLESS = '0'
+# Use the existing NODE_PATH for installed Playwright, as in packet 01.
+node tools\am1_reliability_bench.cjs http://127.0.0.1:8765/ PhysicalLeader `
+    AM1-RELIABILITY-02-physical-01 C:\Users\pickm\AlohaMini1Logs\am1-reliability-02\physical-01.json $head
+# A separate later supervised invocation, after reviewing the physical session:
+node tools\am1_reliability_bench.cjs http://127.0.0.1:8765/ ArmSmokeRepeat `
+    AM1-RELIABILITY-02-arm-01 C:\Users\pickm\AlohaMini1Logs\am1-reliability-02\arm-01.json $head
+```
+
+### Connection and observation evidence
+
+Duffy is `Duffy_Laptop`. Its present PnP/serial inventory has no ports, neither
+configured controller, and no dedicated leader hub. Preserve the recorded map:
+left `USB\VID_1A86&PID_55D3\5B3D045224` in `LEFT-LABELED-SOCKET` (historical
+COM8); right `USB\VID_1A86&PID_55D3\5B3D048497` in `RIGHT-LABELED-SOCKET`
+(historical COM7). Restore the existing dedicated hub's upstream USB connection
+and those controllers to their labeled sockets, with the AM1 session stopped
+and motor/leader power off. Keep leaders on their designated 7.4 V supplies
+and the established regulated 12 V / 10 A follower/body supply. USB absence
+does not establish a failed supply. No ID reassignment, calibration, installer
+or supply change is indicated by this inventory.
+
+P1's existing `codex-home` SSH route succeeds and returns `WIN-6E43SCJGTL7`.
+Independent present USB/Camera/Image/Media and video-interface enumerations
+show only the existing THETA V (`VID_05CA/PID_2712/MI_01`), not the spare
+observer. At `2026-10-06T23:09:33.5262847Z`, the read-only video-interface
+query returned that device, unsupported static camera profiles and no
+advertised recording-profile modes; no capture was initialized. That is not
+proof that THETA has no recording modes. The spare's supported modes remain
+unqueryable until it is exposed. Existing OBS, THETA, printer cameras and
+unrelated services were untouched. The failing layer is peripheral exposure
+on P1, not SSH authentication or network access.
+
+Connect the existing spare observer USB to P1 without rearranging printer
+cameras. Then enumerate its new exact identity and supported modes, capture
+one bounded private 5–10-second low-resolution clip with actual acquisition
+times and selected images, retrieve those images over the existing SSH/SFTP
+route, and inspect a newly acquired image using the Codex image tool. Retained
+images with rewritten timestamps cannot meet this check. No spare clip/image
+was captured or visually inspected in this packet yet; no private images or
+credentials belong in Git.
+
+### Physical evidence and stop boundary
+
+The saved arm-04 left shoulder-lift request was 100→97 while normalized
+feedback remained 100 (zero observed displacement, −3 tracking error).
+Position normalization clips raw feedback at the calibration bounds, while
+unnormalization maps the requested value into the calibrated range. Thus
+normalized 100 alone cannot distinguish physical nonmovement from saturation
+outside the calibrated interval. Raw position/current evidence for this joint
+and the ordinary physical movement/visual check remain pending. No servo
+failure, gain, amplitude or calibration change follows from this result.
+
+Read-only software/installation checks found the established two follower USB
+aliases and no AM1/estop/motor-disable systemd unit. The installed path's stop,
+watchdog and torque-off cleanup depend on the owning motor process; no
+independent disable route is configured or qualified by these checks. The
+physical disconnect hardware has not been visually verified. Recommend a
+reachable, appropriately rated local cutoff of the AM1 motor supplies that
+works independently of Windows, network and Pi execution. New wiring and
+dock hardware are outside this packet. Until qualified, longer powered work
+requires supervision and an accessible existing disconnect; process-freeze,
+bus-fault and overload tests remain withheld.
+
+The arm swing-down confirmation is retained; it does not prove process-freeze
+protection. Packet-01 evidence below keeps its original taxonomy, units and
+limits. This packet has no new powered session, physical-leader/body result,
+external visual corroboration or longer endurance pass. Those checks remain
+pending after the physical connections and supervised setup are restored.
+
 ## AM1-RELIABILITY-01 — October 6, 2026
 
 For this packet the owner authorizes finite automated bench operation with the

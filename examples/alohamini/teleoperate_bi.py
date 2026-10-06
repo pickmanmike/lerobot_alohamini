@@ -43,6 +43,7 @@ from leader_client_utils import (
     resolve_leader_ports,
 )
 from scripted_leader import ScriptedLeaderInput
+from scripted_leader_repeat import ArmSmokeRepeatInput
 from am1_console_bridge import (
     AM1ConsoleBridgeClient, make_console_action_sent_event, make_console_host_feedback_event,
     make_console_live_sample_event, publish_console_telemetry_best_effort,
@@ -1543,7 +1544,7 @@ def run_alignment_gate(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--leader_source", choices=("physical", "scripted"), default="physical")
-    parser.add_argument("--motion_profile", choices=("ArmSmoke",), help="Explicit scripted AM1 input profile")
+    parser.add_argument("--motion_profile", choices=("ArmSmoke", "ArmSmokeRepeat"), help="Explicit scripted AM1 input profile")
     parser.add_argument("--no_robot", action="store_true", help="Do not construct or connect the robot client")
     parser.add_argument("--no_leader", action="store_true", help="Do not construct or connect the leader arms")
     parser.add_argument(
@@ -1702,8 +1703,10 @@ def parse_args(
     if args.leader_source == "scripted":
         if not args.local_mode or not args.unified_session_enter_confirmations:
             parser.error("scripted input requires the unified AM1 Local workflow")
-        if args.motion_profile != "ArmSmoke" or args.no_leader or args.require_calibration_match:
+        if args.motion_profile not in {"ArmSmoke", "ArmSmokeRepeat"} or args.no_leader or args.require_calibration_match:
             parser.error("scripted input requires ArmSmoke, not disabled or physical-calibration leader mode")
+        if args.motion_profile == "ArmSmokeRepeat" and args.duration_s != 420:
+            parser.error("ArmSmokeRepeat requires the finite --duration_s 420 ceiling")
     elif args.motion_profile is not None:
         parser.error("--motion_profile requires --leader_source scripted")
     if args.external_stop_file is not None:
@@ -2077,7 +2080,7 @@ def _print_connection_summary(args: argparse.Namespace) -> None:
     print(f"  Pi address: {args.remote_ip}")
     print(f"  Robot model: {args.robot_model}")
     if getattr(args, "leader_source", "physical") == "scripted":
-        print("  SCRIPTED LEADER INPUT — REAL FOLLOWER MOTION; ArmSmoke; physical leaders unused")
+        print(f"  SCRIPTED LEADER INPUT — REAL FOLLOWER MOTION; {args.motion_profile}; physical leaders unused")
     elif args.no_leader:
         print("  Leaders: disabled")
     else:
@@ -2155,7 +2158,7 @@ def _run_am1_recovering_local_sender(
     input_fn: Callable[[str], str],
     sample_callback: Callable[[AM1LiveSample, Mapping[str, float | int]], None] | None,
     announce_active: Callable[[], None] | None,
-    scripted_input: ScriptedLeaderInput | None = None,
+    scripted_input: ScriptedLeaderInput | ArmSmokeRepeatInput | None = None,
     control_pause_requested: Callable[[], bool] | None = None,
     manual_gate: Callable[[int | None], bool] | None = None,
     on_host_active: Callable[[], None] | None = None,
@@ -2684,7 +2687,7 @@ def run_am1_live_sender(
     max_start_mismatch: float = 10.0,
     input_fn: Callable[[str], str] = input,
     announce_active: Callable[[], None] | None = None,
-    scripted_input: ScriptedLeaderInput | None = None,
+    scripted_input: ScriptedLeaderInput | ArmSmokeRepeatInput | None = None,
     control_pause_requested: Callable[[], bool] | None = None,
     manual_gate: Callable[[int | None], bool] | None = None,
     on_host_active: Callable[[], None] | None = None,
@@ -2962,7 +2965,7 @@ def run_teleoperation(
     alignment_monotonic = monotonic if uses_decoupled_am1_live_loop(args) else time.monotonic
     external_stop_path = getattr(args, "external_stop_file", None)
     scripted_mode = getattr(args, "leader_source", "physical") == "scripted"
-    scripted_input: ScriptedLeaderInput | None = None
+    scripted_input: ScriptedLeaderInput | ArmSmokeRepeatInput | None = None
     scripted_stop_reason = "fault"
     arm_input_ready = False
     console_input: AM1ConsoleBridgeClient | None = None
@@ -3019,7 +3022,8 @@ def run_teleoperation(
                 )
                 seed = extract_am1_arm_positions(seed_observation, source="scripted follower seed", leader_sample=False)
                 validate_selected_sync_positions(seed, AM1_ARM_POSITION_KEYS, source="scripted follower seed")
-                scripted_input = ScriptedLeaderInput(seed, joint_keys=AM1_ARM_POSITION_KEYS, fps=args.fps)
+                provider = ArmSmokeRepeatInput if args.motion_profile == "ArmSmokeRepeat" else ScriptedLeaderInput
+                scripted_input = provider(seed, joint_keys=AM1_ARM_POSITION_KEYS, fps=args.fps)
                 leader = scripted_input
                 arm_input_ready = True
                 print(json.dumps({"event": "am1_scripted_seed", "input_source": "scripted",
@@ -3333,7 +3337,7 @@ def run_teleoperation(
             def announce_unified_active() -> None:
                 if scripted_mode:
                     print("TELEOPERATION ACTIVE — SCRIPTED LEADER INPUT — REAL FOLLOWER MOTION", flush=True)
-                    print("ArmSmoke active: body/lift keys disabled; Q/Stop cancels.", flush=True)
+                    print(f"{args.motion_profile} active: body/lift keys disabled; Q/Stop cancels.", flush=True)
                     return
                 print("TELEOPERATION ACTIVE — LEADER MOVEMENT IS NOW ALLOWED")
                 print("LOCAL BODY CONTROLS ACTIVE — W/S/Z/X/A/D AND U/J MAY NOW MOVE THE ROBOT")

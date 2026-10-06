@@ -405,7 +405,7 @@ class ConsoleSessionAdapter:
                 duration = self.session_module.parse_duration_seconds(payload.get("duration_seconds"))
                 leader_source = payload.get("leader_source", "physical")
                 motion_profile = payload.get("motion_profile")
-                self.session_module.validate_leader_selection(leader_source, motion_profile)
+                self.session_module.validate_leader_selection(leader_source, motion_profile, duration)
                 self._created.clear()
                 self._session_id = None
                 self._final_exit_code = None
