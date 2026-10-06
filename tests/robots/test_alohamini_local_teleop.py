@@ -785,6 +785,9 @@ def test_console_local_uses_native_leaders_without_constructing_keyboard(monkeyp
         def pause_requested(self):
             return False
 
+        def publish_telemetry(self, event):
+            pass
+
         def note_live_admitted(self):
             events.append("host_active")
 

@@ -23,7 +23,7 @@ from examples.alohamini.am1_console_bridge import (
     AM1ConsoleBridgeClient, AM1ConsoleBridgeServer, CONSOLE_ARM_KEYS, CONSOLE_BODY_OBSERVATION_KEYS,
     make_console_action_sent_event, make_console_host_feedback_event, make_console_live_sample_event,
 )
-from tools.am1_console import ConsoleServer, ConsoleSessionAdapter
+from tools.am1_console import ConsoleHandler, ConsoleServer, ConsoleSessionAdapter
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -42,6 +42,7 @@ class FakeSessionIO:
         self.before_gate = lambda stage, emit: None
         self.live_duration_s = live_duration_s
         self.run_count = 0
+        self.start_requests = []
         self.variant = variant
         self.startup_duration_s = 30 if variant in {"startup", "output"} else 0
         self.child = None
@@ -57,7 +58,7 @@ class FakeSessionIO:
         return int(value)
 
     def validate_leader_selection(self, source, profile):
-        assert source == "physical" and profile is None
+        assert (source, profile) in {("physical", None), ("scripted", "ArmSmoke")}
 
     def request_stop(self, config, *, expected_session_id, wait):
         self.stopped.set()
@@ -67,6 +68,7 @@ class FakeSessionIO:
             return self._run_child(repository, config, **callbacks)
         self.stopped.clear()
         self.run_count += 1
+        self.start_requests.append((duration, callbacks.get("leader_source", "physical"), callbacks.get("motion_profile")))
         identity = f"20261002T000000-{self.run_count:08x}"
         pipe, auth = callbacks["console_prepare"](identity)
         callbacks["on_session_created"](identity)
@@ -97,6 +99,7 @@ class FakeSessionIO:
                     native.publish_telemetry(event)
         try:
             native.connect()
+            emit({"event": "preflight_passed", "sources": {"windows_source_head": "1" * 40}})
             for event in ("camera_ready", "host_ready"):
                 emit({"event": event, "session_id": identity})
             if self.startup_duration_s:
@@ -155,6 +158,8 @@ class FakeSessionIO:
                 telemetry_thread.join(1)
             native.disconnect()
             emit({"event": "cleanup", "cleanup_verified": True})
+            emit({"event": "session_complete", "session_id": identity,
+                  "cleanup_verified": not native.is_connected and not native._worker.is_alive()})
 
     def _startup(self, native, emit):
         # Import only function code; all device boundaries below are synthetic
@@ -324,6 +329,10 @@ class FakeSessionIO:
             callbacks["emit"]({"event": "cleanup", "cleanup_verified": bool(
                 native_closed.is_set() and self.reader is not None and not self.reader.is_alive()
                 and self.error is None)})
+            callbacks["emit"]({"event": "session_complete", "session_id": identity,
+                "cleanup_verified": bool(native_closed.is_set() and self.reader is not None
+                    and not self.reader.is_alive() and self.child is not None
+                    and self.child.poll() is not None and self.error is None)})
 
 
 class SyntheticOutputReplay:
@@ -702,12 +711,14 @@ def test_owned_native_process_keeps_real_pipe_and_stops(tmp_path, startup_second
 @pytest.mark.skipif(sys.platform != "win32", reason="Actual AF_PIPE is Windows-only")
 @pytest.mark.parametrize("case", ["healthy", "navigation", "blur", "hidden", "body-delay",
                                       "body-presence-loss", "short-browser-stall",
-                                      "body-reject", "body-denied", "state-reject", "state-delay", "pending-stop", "camera-delay", "approval-order", "startup-approval"])
+                                      "body-reject", "body-denied", "state-reject", "state-delay", "pending-stop", "camera-delay", "approval-order", "startup-approval", "bench-body", "bench-arm", "bench-pause", "bench-foreign", "bench-monitor-failure"])
 def test_browser_loopback_native_path(tmp_path, case):
     node = shutil.which("node")
     if not node or subprocess.run([node, "-e", "require('playwright')"], capture_output=True).returncode:
         pytest.skip("Existing Playwright runtime required; never install it in this test")
     session = FakeSessionIO()
+    if case.startswith("bench-"):
+        session.live_duration_s = 12
     startup_release = threading.Event()
     if case == "startup-approval":
         def before_gate(stage, emit):
@@ -720,7 +731,8 @@ def test_browser_loopback_native_path(tmp_path, case):
     if case == "camera-delay":
         session.on_live = lambda: setattr(camera, "snapshot_delay_s", .65)
     config = SimpleNamespace(browser_url=f"http://127.0.0.1:{camera.server_port}",
-                             local_state_directory=tmp_path, windows_log_directory=tmp_path)
+                             local_state_directory=tmp_path, windows_log_directory=tmp_path,
+                             windows_session_head="1" * 40)
     auth = tmp_path / "fake-camera.json"
     auth.write_text(json.dumps({"username": "test-only", "password": "test-only"}))
     bridges = []
@@ -729,6 +741,15 @@ def test_browser_loopback_native_path(tmp_path, case):
         bridges.append(owner)
         return owner
     adapter = ConsoleSessionAdapter(config, ROOT, session, bridge_factory=bridge_factory)
+    if case == "bench-pause":
+        session.on_live = lambda: adapter._bridge.request_pause("operator")
+    if case == "bench-foreign":
+        real_operation = adapter.operation
+        def competing_start(payload):
+            if payload.get("kind") == "Start":
+                real_operation({"kind": "Start", "duration_seconds": 12})
+            return real_operation(payload)
+        adapter.operation = competing_start
     received = []
     real_body_input = adapter.body_input
     def observed_body_input(payload):
@@ -739,17 +760,57 @@ def test_browser_loopback_native_path(tmp_path, case):
         return result
     adapter.body_input = observed_body_input
     server = ConsoleServer(("127.0.0.1", 0), config, auth, adapter)
+    if case == "bench-monitor-failure":
+        failures = [0]
+        session.on_live = lambda: failures.__setitem__(0, 2)
+        class FailedBenchReads(ConsoleHandler):
+            def do_GET(self):  # noqa: N802 — BaseHTTPRequestHandler requires this method name.
+                if self.path == "/api/state" and self.headers.get("X-AM1-Bench-Monitor") and failures[0]:
+                    failures[0] -= 1
+                    self.send_error(503, "Fake monitor read failure")
+                    return
+                super().do_GET()
+        server.RequestHandlerClass = FailedBenchReads
     threads = [threading.Thread(target=s.serve_forever, daemon=True) for s in (camera, server)]
     before = FakeCamera.requests
     for thread in threads:
         thread.start()
     try:
-        result = subprocess.run([node, str(ROOT / "tests/cameras/am1_console_local_driver.cjs"),
-                                 f"http://127.0.0.1:{server.server_port}", case],
+        driver = ([node, str(ROOT / "tools/am1_reliability_bench.cjs"),
+                   f"http://127.0.0.1:{server.server_port}",
+                   "ArmSmoke" if case == "bench-arm" else "BodyPressRelease",
+                   "AM1-RELIABILITY-01-arm-01" if case == "bench-arm" else "AM1-RELIABILITY-01-body-01",
+                   str(tmp_path / "bench.json"), "1" * 40]
+                  if case.startswith("bench-") else
+                  [node, str(ROOT / "tests/cameras/am1_console_local_driver.cjs"),
+                   f"http://127.0.0.1:{server.server_port}", case])
+        result = subprocess.run(driver,
                                 capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=35)
         intervals = [(seq, round((at - previous[1])*1000), active)
                      for previous, (seq, at, active) in zip(received, received[1:])]
-        assert result.returncode == 0, result.stdout + result.stderr + f"\nServer body arrivals: {intervals[-20:]}"
+        if case.startswith("bench-"):
+            evidence = json.loads((tmp_path / "bench.json").read_text())
+            assert evidence["start_count"] == session.run_count == 1
+            if case == "bench-foreign":
+                assert result.returncode == 1
+                assert evidence["session_id"] is None
+                assert evidence["failure"] == "Start attached to another owner"
+                assert not session.stopped.is_set(), "An attached foreign session must not receive Stop"
+                return
+            assert evidence["cleanup_verified"] is True
+            operations = [record["kind"] for record in evidence["records"] if record["event"] == "operation_result"]
+            assert not {"Resume", "Approve", "ClaimInput"}.intersection(operations)
+            if case in {"bench-pause", "bench-monitor-failure"}:
+                assert result.returncode == 1
+                assert evidence["failure"]
+                assert evidence["pulses"] == []
+                assert "Stop" in operations
+            else:
+                assert evidence["failure"] is None
+                assert session.start_requests == ([(180, "scripted", "ArmSmoke")] if case == "bench-arm" else [(12, "physical", None)])
+                assert [pulse["key"] for pulse in evidence["pulses"]] == ([] if case == "bench-arm" else ["w", "a", "u", "j"])
+        if case not in {"bench-pause", "bench-monitor-failure"}:
+            assert result.returncode == 0, result.stdout + result.stderr + f"\nServer body arrivals: {intervals[-20:]}"
         assert session.error is None
         assert FakeCamera.requests > before
         assert adapter.wait(3), "session cleanup worker must terminate before verdict"
