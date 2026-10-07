@@ -32,6 +32,8 @@ assert(!(headless && target.port === "8765"), "Powered console bench requires th
   let uncaughtPageErrorCount = 0;
   let ownedSession = null, startRefusal = null, startCount = 0, droppedRecords = 0, cancelled = false;
   let final = null, failure = null;
+  let readinessFailureSnapshot = null;
+  let readinessFailureWallTime = null;
   let viewsRequired = false;
   const startedAt = Date.now();
   const deadline = performance.now() + (scenario === "BodyPressRelease" ? 180000 : nativeLiveSeconds * 1000 + 120000);
@@ -101,6 +103,16 @@ assert(!(headless && target.port === "8765"), "Powered console bench requires th
     uncaughtPageErrorCount++;
     keep({event:"uncaught_page_error", name:error.name, message:error.message.slice(0, 240)});
   });
+  const readCameraEvidence = () => page.locator("#am1-camera-root").evaluate(root => ({
+      summary:root.ownerDocument.querySelector("#connection").textContent,
+      diagnostics:root.ownerDocument.querySelector("#diagnostics").textContent.slice(0, 1500),
+      roles:[...root.querySelectorAll(".camera-slot")].slice(0, 5).map(slot => ({
+        role:slot.dataset.role, fresh:slot.querySelector(".view").classList.contains("fresh"),
+        image_age:slot.querySelector('[data-field="image-age"]').textContent.slice(0, 80),
+        source:slot.querySelector('[data-field="source"]').textContent.slice(0, 80),
+        sequence:slot.querySelector('[data-field="sequence"]').textContent.slice(0, 80),
+      })),
+    }), null, {timeout:1000});
   const read = async (verifySource = true) => {
     const state = await (await page.request.get(`${address}api/state`, {
       timeout:2000, maxRetries:0, headers:{"X-AM1-Bench-Monitor":identity},
@@ -108,13 +120,14 @@ assert(!(headless && target.port === "8765"), "Powered console bench requires th
     if (ownedSession) assert.equal(state.session_id, ownedSession, "Session ownership changed");
     const verified = state.verified_source_heads;
     if (verified && verifySource) assert.equal(verified.windows_source_head, expectedWindowsHead);
-    const cameras = verifySource ? await page.locator("#connection").innerText({timeout:1000}) : null;
+    const cameraEvidence = verifySource ? await readCameraEvidence() : null;
+    const cameras = cameraEvidence?.summary ?? null;
     keep({event:"state", session_id:state.session_id, phase:state.phase,
           pending_gate:state.pending_gate, input_epoch:state.input_epoch,
           input_pause_reason:state.input_pause?.reason,
           observation_age_ms:state.telemetry?.observation?.age_ms,
           cleanup_verified:state.cleanup_verified, final_exit_code:state.final_exit_code,
-          camera_summary:cameras});
+          camera_summary:cameras, camera_evidence:cameraEvidence});
     if (verifySource && viewsRequired && state.native_connected && ["live", "paused", "feedback_stale"].includes(state.phase))
       assert(cameras.startsWith("Cameras 5/5 fresh decoded views"), "Required camera view lost: " + cameras);
     return state;
@@ -161,11 +174,26 @@ assert(!(headless && target.port === "8765"), "Powered console bench requires th
     assert(await page.evaluate(() => !document.hidden && document.hasFocus()), "Control must actually be focused");
     // Existing bounded camera views corroborate availability; native protections
     // and deadlines remain responsible for termination, never image interpretation.
-    await page.waitForFunction(() => document.querySelector("#primary img")?.src.startsWith("blob:") &&
-      [...document.querySelectorAll("#thumbnails img")].every(img => img.src.startsWith("blob:")),
-      null, {timeout:5000});
-    await page.waitForFunction(() => document.querySelector("#connection").textContent.startsWith(
-      "Cameras 5/5 fresh decoded views"), null, {timeout:5000});
+    try {
+      await page.waitForFunction(() => document.querySelector("#primary img")?.src.startsWith("blob:") &&
+        [...document.querySelectorAll("#thumbnails img")].every(img => img.src.startsWith("blob:")),
+        null, {timeout:5000});
+      await page.waitForFunction(() => document.querySelector("#connection").textContent.startsWith(
+        "Cameras 5/5 fresh decoded views"), null, {timeout:5000});
+    } catch (error) {
+      readinessFailureWallTime = Date.now();
+      // Best effort in parallel; never wait for diagnostics before owned Stop.
+      readinessFailureSnapshot = readCameraEvidence().then(cameraEvidence => {
+        keep({event:"camera_readiness_failure", failure_wall_time_ms:readinessFailureWallTime,
+              camera_evidence:cameraEvidence});
+        return true;
+      }).catch(snapshotError => {
+        keep({event:"camera_readiness_snapshot_unavailable", failure_wall_time_ms:readinessFailureWallTime,
+              reason:snapshotError.message.slice(0, 240)});
+        return true;
+      });
+      throw error;
+    }
     viewsRequired = true;
     if (scenario === "BodyPressRelease" || scenario === "PhysicalLeader") {
       for (const key of ["w", "a", "u", "j"]) {
@@ -213,6 +241,14 @@ assert(!(headless && target.port === "8765"), "Powered console bench requires th
       } else final = current;
       if (ownedSession && final?.cleanup_verified !== true) failure ||= "Cleanup remains unverified";
     } catch (error) { failure ||= `Stop/cleanup verification: ${error.message}`; }
+    if (readinessFailureSnapshot) {
+      // Stop and cleanup have already been handled. Bound evidence finalization
+      // independently even if browser automation cannot complete the snapshot.
+      const captured = await Promise.race([readinessFailureSnapshot,
+        new Promise(resolve => setTimeout(() => resolve(false), 1000))]);
+      if (!captured) keep({event:"camera_readiness_snapshot_unavailable",
+                           failure_wall_time_ms:readinessFailureWallTime, reason:"diagnostic deadline"});
+    }
     try { fs.writeFileSync(evidencePath, JSON.stringify({identity, scenario, native_live_limit_seconds:nativeLiveSeconds, session_id:ownedSession,
       started_wall_time_ms:startedAt, finished_wall_time_ms:Date.now(), start_count:startCount,
       expected_windows_head:expectedWindowsHead, failure, final_phase:final?.phase,

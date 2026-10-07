@@ -737,7 +737,7 @@ def test_bench_refuses_unqualified_native_duration_before_browser(tmp_path, scen
 @pytest.mark.skipif(sys.platform != "win32", reason="Actual AF_PIPE is Windows-only")
 @pytest.mark.parametrize("case", ["healthy", "navigation", "blur", "hidden", "body-delay",
                                       "body-presence-loss", "short-browser-stall",
-                                      "body-reject", "body-denied", "state-reject", "state-delay", "pending-stop", "camera-delay", "approval-order", "startup-approval", "bench-body", "bench-arm", "bench-arm-short", "bench-repeat", "bench-physical", "bench-pause", "bench-foreign", "bench-monitor-failure", "bench-frontend-state-reject", "bench-frontend-state-reset", "bench-camera-loss", "bench-finalize", "bench-finalize-stall", "bench-finalize-late-result"])
+                                      "body-reject", "body-denied", "state-reject", "state-delay", "pending-stop", "camera-delay", "approval-order", "startup-approval", "bench-body", "bench-arm", "bench-arm-short", "bench-repeat", "bench-physical", "bench-pause", "bench-foreign", "bench-monitor-failure", "bench-frontend-state-reject", "bench-frontend-state-reset", "bench-camera-loss", "bench-camera-readiness-timeout", "bench-finalize", "bench-finalize-stall", "bench-finalize-late-result"])
 def test_browser_loopback_native_path(tmp_path, case):
     node = shutil.which("node")
     if not node or subprocess.run([node, "-e", "require('playwright')"], capture_output=True).returncode:
@@ -760,6 +760,9 @@ def test_browser_loopback_native_path(tmp_path, case):
         session.before_gate = before_gate
     camera = ThreadingHTTPServer(("127.0.0.1", 0), FakeCamera)
     camera.daemon_threads = True
+    if case == "bench-camera-readiness-timeout":
+        camera.frame_count = 0
+        camera.snapshot_delay_s = 3
     if case == "camera-delay":
         session.on_live = lambda: setattr(camera, "snapshot_delay_s", .65)
     if case == "bench-camera-loss":
@@ -870,13 +873,27 @@ def test_browser_loopback_native_path(tmp_path, case):
             assert evidence["cleanup_verified"] is True
             operations = [record["kind"] for record in evidence["records"] if record["event"] == "operation_result"]
             assert not {"Resume", "Approve", "ClaimInput"}.intersection(operations)
-            if case in {"bench-pause", "bench-monitor-failure", "bench-frontend-state-reject", "bench-frontend-state-reset", "bench-camera-loss", "bench-finalize-stall", "bench-finalize-late-result"}:
+            if case in {"bench-pause", "bench-monitor-failure", "bench-frontend-state-reject", "bench-frontend-state-reset", "bench-camera-loss", "bench-camera-readiness-timeout", "bench-finalize-stall", "bench-finalize-late-result"}:
                 assert result.returncode == 1
                 assert evidence["failure"]
                 if case in {"bench-pause", "bench-monitor-failure"}:
                     assert evidence["pulses"] == []
                 elif case == "bench-camera-loss":
                     assert "Required camera view lost" in evidence["failure"]
+                    camera_states = [record for record in evidence["records"]
+                                     if record["event"] == "state" and record.get("camera_summary")]
+                    assert camera_states[-1]["camera_evidence"]["diagnostics"].startswith("Status request")
+                    assert len(camera_states[-1]["camera_evidence"]["roles"]) == 5
+                elif case == "bench-camera-readiness-timeout":
+                    assert "Timeout 5000ms" in evidence["failure"]
+                    snapshot = next(record for record in evidence["records"]
+                                    if record["event"] == "camera_readiness_failure")
+                    live = next(record for record in evidence["records"]
+                                if record["event"] == "state" and record.get("phase") == "live")
+                    assert snapshot["failure_wall_time_ms"] >= live["received_wall_time_ms"] + 4500
+                    assert not snapshot["camera_evidence"]["summary"].startswith("Cameras 5/5")
+                    assert len(snapshot["camera_evidence"]["roles"]) == 5
+                    assert all(not role["fresh"] for role in snapshot["camera_evidence"]["roles"])
                 elif case in {"bench-frontend-state-reject", "bench-frontend-state-reset"}:
                     assert any(record.get("input_pause_reason") == "state-request-failed"
                                for record in evidence["records"])
@@ -906,7 +923,7 @@ def test_browser_loopback_native_path(tmp_path, case):
                 else:
                     assert session.start_requests == ([(arm_duration, "scripted", "ArmSmoke")] if arm_bench else [(12, "physical", None)])
                 assert [pulse["key"] for pulse in evidence["pulses"]] == ([] if arm_bench else ["w", "a", "u", "j"])
-        if case not in {"bench-pause", "bench-monitor-failure", "bench-frontend-state-reject", "bench-frontend-state-reset", "bench-camera-loss", "bench-finalize-stall", "bench-finalize-late-result"}:
+        if case not in {"bench-pause", "bench-monitor-failure", "bench-frontend-state-reject", "bench-frontend-state-reset", "bench-camera-loss", "bench-camera-readiness-timeout", "bench-finalize-stall", "bench-finalize-late-result"}:
             assert result.returncode == 0, result.stdout + result.stderr + f"\nServer body arrivals: {intervals[-20:]}"
         assert session.error is None
         assert FakeCamera.requests > before
