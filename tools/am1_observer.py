@@ -755,39 +755,42 @@ def run_capture(args) -> int:
                             else:
                                 reconnect_count += 1
                                 attempt_pending = True
-                                if active_transport().poll() is not None:
-                                    stream = (output / f"forward-reattach-{reconnect_count}.stderr").open(
-                                        "wb"
-                                    )
-                                    forward_stderr.append(stream)
-                                    forward_process = subprocess.Popen(
-                                        _observer_forward_command(
-                                            args.ssh_host,
-                                            local_port,
-                                            remote_port,
-                                            compression=compression,
-                                            forwarding_only=True,
-                                        ),
-                                        stdin=subprocess.DEVNULL,
-                                        stdout=subprocess.DEVNULL,
-                                        stderr=stream,
-                                    )
-                                    forward_processes.append(forward_process)
-                                    forwarding_waiting = True
-                                    with (output / "protocol-events.ndjson").open(
-                                        "a", encoding="utf-8"
-                                    ) as protocol:
-                                        protocol.write(
-                                            json.dumps(
-                                                {
-                                                    "event": "forward_reattach_started",
-                                                    "attempt": reconnect_count,
-                                                    "generation": args.generation,
-                                                    "received_wall_time_ms": _wall_time_ms(),
-                                                }
-                                            )
-                                            + "\n"
+                                # A live source-owning SSH process can still have a stalled data
+                                # forward. Rebuild only transport to the same capture on a new local
+                                # port; its source owner, remote port and nonce history stay intact.
+                                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                                    probe.bind(("127.0.0.1", 0))
+                                    local_port = probe.getsockname()[1]
+                                stream = (output / f"forward-reattach-{reconnect_count}.stderr").open("wb")
+                                forward_stderr.append(stream)
+                                forward_process = subprocess.Popen(
+                                    _observer_forward_command(
+                                        args.ssh_host,
+                                        local_port,
+                                        remote_port,
+                                        compression=compression,
+                                        forwarding_only=True,
+                                    ),
+                                    stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.DEVNULL,
+                                    stderr=stream,
+                                )
+                                forward_processes.append(forward_process)
+                                forwarding_waiting = True
+                                with (output / "protocol-events.ndjson").open(
+                                    "a", encoding="utf-8"
+                                ) as protocol:
+                                    protocol.write(
+                                        json.dumps(
+                                            {
+                                                "event": "forward_reattach_started",
+                                                "attempt": reconnect_count,
+                                                "generation": args.generation,
+                                                "received_wall_time_ms": _wall_time_ms(),
+                                            }
                                         )
+                                        + "\n"
+                                    )
                         if not stopped.is_set() or attempt_pending:
                             try:
                                 connected = socket.create_connection(("127.0.0.1", local_port), timeout=0.5)

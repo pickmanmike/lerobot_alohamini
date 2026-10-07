@@ -71,10 +71,15 @@ its receiver failed after delayed return delivery and an SSH connection reset.
 Original source acquisition, JPEG, JSON and socket-write timings stayed fast at
 matched delay spikes. An original 20-second qualification window is retained
 separately from current stale status and the failed receiver verdict. The next
-declared transport experiment uses lossless SSH compression; forwarding-only
-reconnection must retain the same capture owner, generation, original nonce
-timestamps, finite deadline and three-reconnect budget. Neither experiment
-qualifies actual motion until current delivery and inspected framing pass.
+lossless-compression experiment failed current qualification and stopped with
+verified camera release; it does not demonstrate improved delivery. It showed
+that a forwarding channel can stall while the source-owning SSH process remains
+alive. Recovery now rebuilds a forwarding-only connection on a new local port
+to the same capture, preserving its remote port, generation, token, original
+nonce timestamps, deadline and three-attempt/five-second budget. Original owner
+and delivery failure verdicts remain separate from later cleanup. All 77 focused
+observer tests pass. The next real capture tests this repair with compression
+off; actual motion still requires current delivery and inspected framing.
 
 Plan: [AM1-03 executable plan](../superpowers/plans/2026-10-06-am1-reliability-03.md).
 Historical packet-02/01 evidence below retains its original verdicts.

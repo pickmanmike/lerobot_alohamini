@@ -1169,6 +1169,8 @@ def reset_transport(tmp_path, monkeypatch, jpeg):
         qualified_run=False,
         failed_forwards=False,
         exhausted_metadata_reads=0,
+        owner_alive_stalled=False,
+        owner_alive_at_reattach=[],
     )
     real_perf_counter = time.perf_counter
     monkeypatch.setattr(module.time, "perf_counter", lambda: real_perf_counter() + state.clock_offset)
@@ -1196,6 +1198,7 @@ def reset_transport(tmp_path, monkeypatch, jpeg):
                 )
             else:
                 state.forwarded_health.append(health(args.output_dir))
+                state.owner_alive_at_reattach.append(state.processes[0].poll() is None)
             if self.is_replacement and state.failed_forwards:
                 self.reset()
             else:
@@ -1223,6 +1226,16 @@ def reset_transport(tmp_path, monkeypatch, jpeg):
                                 "recording_started_utc": "original-start",
                                 "recording_stopped_utc": "original-stop",
                             }
+                            if state.owner_alive_stalled:
+                                owner = state.processes[0]
+                                owner.writer.write(
+                                    (
+                                        json.dumps({"event": "ending", "generation": args.generation}) + "\n"
+                                    ).encode()
+                                )
+                                owner.writer.write((json.dumps(state.final) + "\n").encode())
+                                owner.returncode = 0
+                                owner.writer.close()
                             return
                         count += 1
                         if self.is_replacement and state.replay and count == 1:
@@ -1269,6 +1282,8 @@ def reset_transport(tmp_path, monkeypatch, jpeg):
                             self.writer.close()
                             return
                         if count == 3 and len(state.processes) <= state.resets:
+                            if state.owner_alive_stalled and not self.is_replacement:
+                                return  # Drop only forwarded frames; the capture-owning SSH/metadata remains live.
                             self.reset()
                             return
                         if self.is_replacement and count == 3 and state.resets == 1:
@@ -1356,10 +1371,9 @@ def test_ssh_reset_reattaches_only_forwarding_to_original_live_capture(reset_tra
     assert len(state.commands) == 2
     assert state.stage_count == 1
     assert "-N" not in state.commands[0] and "-N" in state.commands[1]
-    assert (
-        state.commands[0][state.commands[0].index("-L") + 1]
-        == state.commands[1][state.commands[1].index("-L") + 1]
-    )
+    old_port = state.commands[0][state.commands[0].index("-L") + 1].split(":")
+    new_port = state.commands[1][state.commands[1].index("-L") + 1].split(":")
+    assert old_port[1] != new_port[1] and old_port[2:] == new_port[2:]
     assert "EncodedCommand" not in " ".join(state.commands[1])
     assert state.forwarded_health[0]["running"] is False
     assert state.forwarded_health[0]["received_wall_time_ms"] > 0
@@ -1480,3 +1494,26 @@ def test_final_metadata_fetch_accepts_only_original_strict_terminal(tmp_path, mo
     assert "capture-metadata.json" in script and "capture.ps1" not in script
     assert "same-host" in script and r"C:\private\g" in script
     assert not (tmp_path / "latest-health.json").exists()
+
+
+def test_owner_alive_stalled_forward_is_rebuilt_without_restarting_capture(reset_transport):
+    state = reset_transport
+    state.owner_alive_stalled = True
+    assert (
+        state.module.run_capture(state.args) == 1
+    )  # Short transport fixture never claims 20s qualification.
+    assert len(state.commands) == 2 and state.stage_count == 1
+    assert state.owner_alive_at_reattach == [True]
+    original_spec = state.commands[0][state.commands[0].index("-L") + 1].split(":")
+    replacement_spec = state.commands[1][state.commands[1].index("-L") + 1].split(":")
+    assert original_spec[1] != replacement_spec[1]
+    assert original_spec[2:] == replacement_spec[2:]
+    assert "-N" in state.commands[1] and "EncodedCommand" not in " ".join(state.commands[1])
+    result = json.loads((state.args.output_dir / "receiver-result.json").read_text())
+    assert result["same_capture_reconnects"] == 1 and result["failure"] is None
+    assert result["owner_ssh_exit_code"] == 0
+    assert result["ssh_exit_code"] == 1 and result["forwarding_retired"] is True
+    assert result["camera_released"] is True and result["capture_success"] is True
+    assert result["qualification_at_stop"] is False
+    assert len({v["nonce"] for v in state.received if v["event"] == "frame"}) == result["challenges_issued"]
+    assert any(v["event"] == "stop" for v in state.received)
