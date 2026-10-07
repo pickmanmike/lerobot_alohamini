@@ -1517,3 +1517,234 @@ def test_owner_alive_stalled_forward_is_rebuilt_without_restarting_capture(reset
     assert result["qualification_at_stop"] is False
     assert len({v["nonce"] for v in state.received if v["event"] == "frame"}) == result["challenges_issued"]
     assert any(v["event"] == "stop" for v in state.received)
+
+
+def test_opt_in_scp_stage_failure_never_sends_private_stdin_or_starts_camera(tmp_path, monkeypatch):
+    import subprocess
+    from types import SimpleNamespace
+
+    module = load_observer()
+    config = tmp_path / "private.json"
+    config.write_text(
+        json.dumps(
+            {
+                "expected_host": "private-host",
+                "camera_name": "camera",
+                "video_device_id": "device",
+                "remote_output_root": r"C:\private\observer",
+            }
+        )
+    )
+    args = SimpleNamespace(
+        config=config,
+        output_dir=tmp_path / "capture",
+        generation="qualified-test",
+        duration_seconds=20,
+        ssh_host="existing-alias",
+        stage_via_scp=True,
+    )
+    calls = []
+
+    def stage(command, **kwargs):
+        assert "input" not in kwargs, "SCP opt-in must remove long Console.In staging input"
+        calls.append((command, kwargs))
+        if command[0] == "scp":
+            return subprocess.CompletedProcess(command, 255, b"", b"original copy refusal")
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            json.dumps(
+                {"event": "stage_directory", "generation": args.generation, "host": "private-host"}
+            ).encode(),
+            b"",
+        )
+
+    monkeypatch.setattr(module.subprocess, "run", stage)
+    monkeypatch.setattr(
+        module.subprocess,
+        "Popen",
+        lambda *_a, **_k: pytest.fail("Capture started before verified staging ACK"),
+    )
+    with pytest.raises(RuntimeError, match="staging failed"):
+        module.run_capture(args)
+    assert [c[0][0] for c in calls] == ["ssh", "scp"]
+    assert (args.output_dir / "stage.stderr").read_bytes() == b"original copy refusal"
+    assert health(args.output_dir)["running"] is False
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Exercises actual Windows PowerShell staging finalize")
+@pytest.mark.parametrize(
+    "failure",
+    [None, "source-size", "source-hash", "config-hash", "generation", "host", "copy", "ack", "late"],
+)
+def test_scp_stage_real_powershell_validates_before_publish_and_never_executes(
+    tmp_path, monkeypatch, failure
+):
+    import os
+    import shutil
+    import subprocess
+    from types import SimpleNamespace
+
+    module = load_observer()
+    actual_run = subprocess.run
+    actual_popen = subprocess.Popen
+    root = tmp_path / "remote"
+    root.mkdir()
+    output = tmp_path / "local"
+    output.mkdir()
+    args = SimpleNamespace(generation="qualified-test", ssh_host="existing-alias")
+    remote = root / args.generation
+    token = "b" * 64
+    config = {
+        "expected_host": os.environ["COMPUTERNAME"],
+        "remote_output_root": str(root),
+        "generation": args.generation,
+        "output_dir": str(remote),
+        "token": token,
+        "camera_name": "unit-inert",
+        "video_device_id": "unit-inert",
+    }
+    if failure == "generation":
+        config["generation"] = "wrong"
+    if failure == "host":
+        config["expected_host"] = "wrong-host"
+    source = b"INERT UNIT TEST DATA; MUST NEVER EXECUTE"
+    clock = [0.0]
+    calls = []
+    monkeypatch.setattr(module.time, "perf_counter", lambda: clock[0])
+
+    def boundary(command, **kwargs):
+        assert "input" not in kwargs and kwargs["stdin"] == subprocess.DEVNULL
+        calls.append((command, kwargs["timeout"]))
+        assert token not in " ".join(command)
+        if command[0] == "scp":
+            assert command[-1] == args.ssh_host + ":" + str(remote).replace("\\", "/") + "/"
+            if failure == "copy":
+                return subprocess.CompletedProcess(command, 255, b"", b"first copy failure")
+            for path in command[-3:-1]:
+                shutil.copyfile(path, remote / Path(path).name)
+            if failure == "source-size":
+                (remote / "source.stage").write_bytes(source[:-1])
+            if failure == "source-hash":
+                (remote / "source.stage").write_bytes(b"X" + source[1:])
+            if failure == "config-hash":
+                staged = (remote / "config.stage").read_bytes()
+                (remote / "config.stage").write_bytes(b"X" + staged[1:])
+            result = subprocess.CompletedProcess(command, 0, b"", b"")
+        else:
+            script = base64.b64decode(command[-1]).decode("utf-16-le")
+            assert token not in script
+            result = actual_run(
+                module._powershell(script),
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=kwargs["timeout"],
+            )
+            if len(calls) == 3 and failure == "ack":
+                result = subprocess.CompletedProcess(command, 0, b"{", b"")
+        clock[0] += 5
+        if failure == "late" and len(calls) == 3:
+            clock[0] = 31
+        return result
+
+    monkeypatch.setattr(module.subprocess, "run", boundary)
+
+    def local_powershell_only(command, *positional, **kwargs):
+        assert command[0] in {"powershell", "powershell.exe"}, "Staging must never invoke capture-owning SSH"
+        return actual_popen(command, *positional, **kwargs)
+
+    monkeypatch.setattr(module.subprocess, "Popen", local_powershell_only)
+    if failure == "late":
+        with pytest.raises(subprocess.TimeoutExpired):
+            module._scp_observer_stage(args, config, source, str(remote), output)
+        return
+    result = module._scp_observer_stage(args, config, source, str(remote), output)
+    if failure is None:
+        assert result.returncode == 0
+        assert (remote / "capture.ps1").read_bytes() == source
+        final = json.loads((remote / "invocation.json").read_text(encoding="utf-8-sig"))
+        assert final["token"] == token and 1024 <= final["capture_port"] <= 65535
+        proof = json.loads((output / "staging-proof.json").read_text())
+        assert proof["transport"] == "scp" and proof["shared_deadline_seconds"] == 30
+        assert token not in (output / "staging-proof.json").read_text()
+        assert [timeout for _, timeout in calls] == [30, 25, 20]
+    else:
+        assert result.returncode != 0
+        reasons = {
+            "source-size": b"Observer staging size mismatch",
+            "source-hash": b"Observer staging hash mismatch",
+            "config-hash": b"Observer staging hash mismatch",
+            "generation": b"Observer staging identity mismatch",
+            "host": b"Observer host mismatch",
+            "copy": b"first copy failure",
+            "ack": b"observer SCP staging invalid ACK",
+        }
+        assert reasons[failure] in result.stderr
+        assert not (output / "staging-proof.json").exists()
+        if failure != "ack":
+            assert not (remote / "capture.ps1").exists() and not (remote / "invocation.json").exists()
+    assert (output / "source.stage").read_bytes() == source
+    assert b"\r\n" not in (output / "config.stage").read_bytes()
+
+
+@pytest.mark.parametrize("phase,fail_at", [("upload", 2), ("finalize", 3)])
+def test_scp_timeout_retains_phase_before_call_and_original_stderr(tmp_path, monkeypatch, phase, fail_at):
+    import subprocess
+    from types import SimpleNamespace
+
+    module = load_observer()
+    config = tmp_path / "private.json"
+    config.write_text(
+        json.dumps(
+            {
+                "expected_host": "private-host",
+                "camera_name": "unit-inert",
+                "video_device_id": "unit-inert",
+                "remote_output_root": r"C:\private\observer",
+            }
+        )
+    )
+    args = SimpleNamespace(
+        config=config,
+        output_dir=tmp_path / "capture",
+        generation="qualified-test",
+        duration_seconds=20,
+        ssh_host="existing-alias",
+        stage_via_scp=True,
+    )
+    calls = []
+    original_stderr = (phase + " exact original timeout\n").encode() * 4000
+
+    def call(command, **kwargs):
+        calls.append(command)
+        if len(calls) == fail_at:
+            before = json.loads((args.output_dir / "stage-phase.json").read_text())
+            assert before["phase"] == phase and before["status"] == "started"
+            assert 0 < before["remaining_seconds_at_phase_start"] <= 30
+            assert "token" not in before
+            raise subprocess.TimeoutExpired("owned phase", kwargs["timeout"], stderr=original_stderr)
+        if len(calls) == 1:
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                json.dumps(
+                    {"event": "stage_directory", "generation": args.generation, "host": "private-host"}
+                ).encode(),
+                b"",
+            )
+        return subprocess.CompletedProcess(command, 0, b"", b"")
+
+    monkeypatch.setattr(module.subprocess, "run", call)
+    monkeypatch.setattr(
+        module.subprocess,
+        "Popen",
+        lambda *_a, **_k: pytest.fail("Camera started after partial stage timeout"),
+    )
+    assert module.run_capture(args) == 1
+    proof = json.loads((args.output_dir / "stage-phase.json").read_text())
+    assert proof["phase"] == phase and proof["status"] == "timeout"
+    assert proof["elapsed_seconds"] >= 0 and proof["original_shared_timeout_seconds"] == 30
+    assert (args.output_dir / ("stage-" + phase + ".stderr")).read_bytes() == original_stderr[-65536:]
+    assert (args.output_dir / "stage.stderr").read_bytes() == original_stderr[-65536:]
+    assert len(calls) == fail_at and not (args.output_dir / "staging-proof.json").exists()
+    assert health(args.output_dir)["running"] is False

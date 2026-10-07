@@ -498,6 +498,151 @@ def close_delivery_and_wait(process, client, *, timeout: float) -> int:
     return process.wait(timeout=timeout)
 
 
+def _scp_observer_stage(args, config, capture_source, remote_dir, output):
+    """Opt-in finite file transport; camera admission still waits for verified ACK."""
+    from pathlib import PureWindowsPath
+
+    root = PureWindowsPath(config["remote_output_root"])
+    if (
+        not root.is_absolute()
+        or ".." in root.parts
+        or PureWindowsPath(remote_dir) != root / args.generation
+        or not re.fullmatch(r"[A-Za-z]:[\\/][A-Za-z0-9_.\\/-]+", remote_dir)
+    ):
+        raise ValueError(
+            "SCP staging requires the configured private Windows path without shell metacharacters"
+        )
+    config_bytes = json.dumps(config).encode("utf-8")
+    if not 1 <= len(capture_source) <= 256 * 1024 or not 1 <= len(config_bytes) <= 16 * 1024:
+        raise ValueError("observer staging files exceed their bounds")
+    source_hash, config_hash = (hashlib.sha256(value).hexdigest() for value in (capture_source, config_bytes))
+    local_files = [output / "source.stage", output / "config.stage"]
+    for path, value in zip(local_files, (capture_source, config_bytes), strict=True):
+        with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as stream:
+            stream.write(value)
+    stage_started = time.perf_counter()
+    deadline = stage_started + 30
+
+    def call(command, phase):
+        phase_started = time.perf_counter()
+        proof = {
+            "generation": args.generation,
+            "phase": phase,
+            "status": "started",
+            "original_shared_timeout_seconds": 30,
+            "stage_start_monotonic_ms": stage_started * 1000,
+            "phase_start_monotonic_ms": phase_started * 1000,
+            "remaining_seconds_at_phase_start": deadline - phase_started,
+        }
+        if not _atomic_json(output / "stage-phase.json", proof):
+            raise ValueError("observer staging phase evidence publication failed")
+        try:
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired("observer SCP staging", 30)
+            result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, timeout=remaining)
+            (output / f"stage-{phase}.stderr").write_bytes(result.stderr[-65536:])
+            if time.perf_counter() >= deadline:
+                raise subprocess.TimeoutExpired("observer SCP staging", 30, stderr=result.stderr)
+        except subprocess.TimeoutExpired as error:
+            (output / f"stage-{phase}.stderr").write_bytes((error.stderr or b"")[-65536:])
+            proof.update(
+                status="timeout",
+                elapsed_seconds=time.perf_counter() - phase_started,
+                finished_monotonic_ms=time.perf_counter() * 1000,
+            )
+            _atomic_json(output / "stage-phase.json", proof)
+            _atomic_json(output / f"stage-{phase}.json", proof)
+            raise
+        proof.update(
+            status="complete" if result.returncode == 0 else "failed",
+            exit_code=result.returncode,
+            elapsed_seconds=time.perf_counter() - phase_started,
+            finished_monotonic_ms=time.perf_counter() * 1000,
+        )
+        _atomic_json(output / "stage-phase.json", proof)
+        _atomic_json(output / f"stage-{phase}.json", proof)
+        return result
+
+    expected_host, generation = config["expected_host"], args.generation
+    prefix = (
+        "$ProgressPreference='SilentlyContinue';$ErrorActionPreference='Stop';"
+        "[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);"
+        f"if($env:COMPUTERNAME -ne {_ps_quote(expected_host)}){{throw 'Observer host mismatch'}};"
+        f"$d={_ps_quote(remote_dir)};"
+    )
+    mkdir = prefix + (
+        "if(Test-Path -LiteralPath $d){throw 'Observer generation already exists'};"
+        "$null=New-Item -ItemType Directory -Path $d;"
+        f"[Console]::Out.WriteLine((@{{event='stage_directory';host=$env:COMPUTERNAME;generation={_ps_quote(generation)}}}|ConvertTo-Json -Compress))"
+    )
+    result = call(_ssh(args.ssh_host) + _powershell(mkdir), "directory")
+    if result.returncode:
+        return result
+    try:
+        ack = json.loads(result.stdout)
+        if ack != {"event": "stage_directory", "host": expected_host, "generation": generation}:
+            raise ValueError("observer stage directory ACK is invalid")
+        result = call(
+            [
+                "scp",
+                "-B",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10",
+                *(str(path) for path in local_files),
+                args.ssh_host + ":" + remote_dir.replace("\\", "/") + "/",
+            ],
+            "upload",
+        )
+        if result.returncode:
+            return result
+        finalize = prefix + (
+            "$s=Join-Path $d 'source.stage';$cpath=Join-Path $d 'config.stage';"
+            f"if((Get-Item -LiteralPath $s).Length -ne {len(capture_source)} -or (Get-Item -LiteralPath $cpath).Length -ne {len(config_bytes)}){{throw 'Observer staging size mismatch'}};"
+            "$hasher=[Security.Cryptography.SHA256]::Create();try{$sh=[BitConverter]::ToString($hasher.ComputeHash([IO.File]::ReadAllBytes($s))).Replace('-','').ToLowerInvariant();$ch=[BitConverter]::ToString($hasher.ComputeHash([IO.File]::ReadAllBytes($cpath))).Replace('-','').ToLowerInvariant()}finally{$hasher.Dispose()};"
+            f"if($sh -ne '{source_hash}' -or $ch -ne '{config_hash}'){{throw 'Observer staging hash mismatch'}};"
+            "$c=[IO.File]::ReadAllText($cpath,[Text.Encoding]::UTF8)|ConvertFrom-Json;"
+            f"if($c.expected_host -ne {_ps_quote(expected_host)} -or $c.generation -ne {_ps_quote(generation)} -or $c.output_dir -ne $d){{throw 'Observer staging identity mismatch'}};"
+            "$target=Join-Path $d 'capture.ps1';$invocation=Join-Path $d 'invocation.json';"
+            "if((Test-Path -LiteralPath $target) -or (Test-Path -LiteralPath $invocation)){throw 'Observer staging publish collision'};"
+            "$probe=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,0);$probe.Start();$port=$probe.LocalEndpoint.Port;$probe.Stop();"
+            "$c|Add-Member -NotePropertyName capture_port -NotePropertyValue $port;"
+            "$ready=Join-Path $d 'invocation.ready';[IO.File]::WriteAllText($ready,($c|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false));"
+            "Move-Item -LiteralPath $s -Destination $target;Move-Item -LiteralPath $ready -Destination $invocation;"
+            f"[Console]::Out.WriteLine((@{{event='stage_complete';host=$env:COMPUTERNAME;generation={_ps_quote(generation)};capture_port=$port;source_bytes={len(capture_source)};config_bytes={len(config_bytes)};source_sha256='{source_hash}';config_sha256='{config_hash}'}}|ConvertTo-Json -Compress))"
+        )
+        result = call(_ssh(args.ssh_host) + _powershell(finalize), "finalize")
+        if result.returncode:
+            return result
+        if len(result.stdout) > 16384:
+            raise ValueError("observer staging ACK size limit")
+        ack = json.loads(result.stdout)
+        expected = {
+            "event": "stage_complete",
+            "host": expected_host,
+            "generation": generation,
+            "source_bytes": len(capture_source),
+            "config_bytes": len(config_bytes),
+            "source_sha256": source_hash,
+            "config_sha256": config_hash,
+        }
+        if (
+            not isinstance(ack, dict)
+            or any(ack.get(key) != value for key, value in expected.items())
+            or any(type(ack.get(key)) is not int for key in ("capture_port", "source_bytes", "config_bytes"))
+            or not 1024 <= ack["capture_port"] <= 65535
+        ):
+            raise ValueError("observer staging final ACK is invalid")
+        _atomic_json(output / "staging-proof.json", dict(ack, transport="scp", shared_deadline_seconds=30))
+        return result
+    except (ValueError, UnicodeError) as error:
+        return subprocess.CompletedProcess(
+            "observer SCP staging", 1, b"", ("observer SCP staging invalid ACK: " + str(error)).encode()
+        )
+
+
 def run_capture(args) -> int:
     import secrets
     import socket
@@ -540,17 +685,20 @@ def run_capture(args) -> int:
         "[Console]::Out.WriteLine((@{capture_port=$port}|ConvertTo-Json -Compress))"
     )
     try:
-        stage = subprocess.run(
-            _ssh(args.ssh_host) + _powershell(stage_script),
-            input=(
-                base64.b64encode(capture_source).decode()
-                + "\n"
-                + base64.b64encode(json.dumps(config).encode()).decode()
-                + "\n"
-            ).encode(),
-            capture_output=True,
-            timeout=30,
-        )
+        if getattr(args, "stage_via_scp", False) is True:
+            stage = _scp_observer_stage(args, config, capture_source, remote_dir, output)
+        else:
+            stage = subprocess.run(
+                _ssh(args.ssh_host) + _powershell(stage_script),
+                input=(
+                    base64.b64encode(capture_source).decode()
+                    + "\n"
+                    + base64.b64encode(json.dumps(config).encode()).decode()
+                    + "\n"
+                ).encode(),
+                capture_output=True,
+                timeout=30,
+            )
     except subprocess.TimeoutExpired as error:
         (output / "stage.stderr").write_bytes((error.stderr or b"")[-65536:])
         _atomic_json(
@@ -1520,6 +1668,11 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--generation", default=uuid.uuid4().hex)
     parser.add_argument("--duration-seconds", type=int, default=660)
+    parser.add_argument(
+        "--stage-via-scp",
+        action="store_true",
+        help="Stage bounded inert files via SCP and verify their hashes before camera launch",
+    )
     parser.add_argument(
         "--delivery-compression",
         action="store_true",

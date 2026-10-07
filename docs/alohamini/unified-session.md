@@ -90,13 +90,28 @@ false. The verified finalized recording is retained privately; actual motion sti
 current delivery and inspected framing.
 
 The failed preparation reproduced a lift history freshness decision crossing 500 ms between
-two clock reads, while current raw feedback was about 20 ms old at 32 degrees and the
-preceding eight loops stayed near 33.4 ms. The focused correction revalidates raw feedback
+two clock reads, while current raw feedback remained fresh and the preceding eight loops
+stayed within their normal scheduling interval. The focused correction revalidates raw feedback
 and evaluates the history decision at one actual timestamp; any real grouped refresh then
 takes a fresh completion timestamp. Original readings, old peaks and both 500 ms limits
 remain enforced. All 172 affected thermal tests pass, including the crossing and refusal of
 raw feedback that expires before refresh authorization. Independent review found no
 actionable blocker; powered completion remains pending.
+
+Two later observer launches failed during staging before capture, and read-only input probes
+did not establish a repeatable delimiter cause. An explicit file-copy staging option now
+uploads inert files, verifies their exact sizes, hashes and invocation identity, and publishes
+the capture only after a validated acknowledgement. Directory creation, upload and finalization
+share the original thirty-second deadline; phase and first-failure evidence remain private.
+Default stdin staging is unchanged. All 89 observer tests pass, including real local PowerShell
+validation and timeout/corruption refusals. Actual use of the new staging path remains pending.
+
+A separate stopped check with the actual host calibration identity found one arm outside
+its calibrated command range. Native preparation starts after host activation and cannot
+qualify that earlier transition. A pre-activation guard is being added and reviewed; the
+owner has been asked for one precise support placement under the packet exception for a
+demonstrated physical setup blocker. No powered retry or integration is authorized by a
+later cleanup check alone.
 
 Plan: [AM1-03 executable plan](../superpowers/plans/2026-10-06-am1-reliability-03.md).
 Historical packet-02/01 evidence below retains its original verdicts.
