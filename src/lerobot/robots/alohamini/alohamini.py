@@ -996,6 +996,28 @@ class AlohaMini(Robot):
                 "sync_write_returned": True, "write_acknowledged": False,
             }
 
+        left_shoulder = "arm_left_shoulder_lift.pos"
+        if (
+            getattr(self, "_am1_left_shoulder_evidence_enabled", False)
+            and getattr(self.config, "robot_model", None) == "alohamini1"
+            and left_shoulder in requested_arm_pos
+        ):
+            record = {
+                **getattr(self, "_am1_left_shoulder_feedback", {"feedback_available": False}),
+                "requested": requested_arm_pos[left_shoulder],
+                "final": final_arm_pos[left_shoulder],
+                "sync_write_returned": True, "write_acknowledged": False,
+                "expected_goal_raw": None,
+            }
+            try:
+                motor_id = self.left_bus.motors["arm_left_shoulder_lift"].id
+                record["expected_goal_raw"] = self.left_bus._unnormalize(
+                    {motor_id: float(final_arm_pos[left_shoulder])}
+                )[motor_id]
+            except Exception as error:
+                record["expected_goal_error"] = f"{type(error).__name__}: {error}"
+            self.logs["action_diagnostics"]["left_shoulder"] = record
+
         lift_sent = {k: v for k, v in action.items() if k.startswith("lift_axis.")}
         return {**left_pos, **right_pos, **base_goal_vel, **lift_sent}
 
@@ -1056,10 +1078,56 @@ class AlohaMini(Robot):
             return goal_pos
 
         target_motors = [key.replace(".pos", "") for key in target_keys]
+        selected = "arm_left_shoulder_lift"
+        trace_shoulder = (
+            getattr(self, "_am1_left_shoulder_evidence_enabled", False)
+            and getattr(self.config, "robot_model", None) == "alohamini1"
+            and bus is self.left_bus and selected in target_motors
+        )
+        if trace_shoulder:
+            self._am1_left_shoulder_feedback = {"feedback_available": False}
         try:
+            if trace_shoulder:
+                current_started = time.monotonic()
+                current_wall_started = time.time_ns()
             currents_raw = bus.sync_read("Present_Current", target_motors)
-            present_pos = bus.sync_read("Present_Position", target_motors)
+            if trace_shoulder:
+                current_completed = time.monotonic()
+                position_started = time.monotonic()
+                position_wall_started = time.time_ns()
+                # Reuse this existing force-limit read. The normalizer is exactly
+                # the one sync_read(normalize=True) uses; there is no extra read.
+                raw_present = bus.sync_read("Present_Position", target_motors, normalize=False)
+                position_completed = time.monotonic()
+                ids = {bus.motors[name].id: value for name, value in raw_present.items()}
+                normalized = bus._normalize(ids)
+                present_pos = {
+                    name: normalized[bus.motors[name].id] for name in target_motors
+                }
+                self._am1_left_shoulder_feedback = {
+                    "feedback_available": True,
+                    "present_position_raw": raw_present[selected],
+                    "present_position_normalized": present_pos[selected],
+                    "present_current_raw": currents_raw[selected],
+                    "present_current_ma": float(currents_raw[selected]) * 6.5,
+                    "current_read_started_at": current_started,
+                    "current_read_completed_at": current_completed,
+                    "current_read_started_wall_time_ns": current_wall_started,
+                    "position_read_started_at": position_started,
+                    "position_read_completed_at": position_completed,
+                    "position_read_started_wall_time_ns": position_wall_started,
+                }
+            else:
+                present_pos = bus.sync_read("Present_Position", target_motors)
         except Exception as e:
+            if trace_shoulder:
+                self._am1_left_shoulder_feedback = {
+                    "feedback_available": False,
+                    "read_started_at": current_started,
+                    "read_completed_at": time.monotonic(),
+                    "read_started_wall_time_ns": current_wall_started,
+                    "read_error": f"{type(e).__name__}: {e}",
+                }
             logger.warning("Failed to read %s current/position for force limiting: %s", log_tag, e)
             return goal_pos
 

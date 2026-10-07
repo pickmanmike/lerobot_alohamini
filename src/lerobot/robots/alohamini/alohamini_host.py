@@ -253,6 +253,11 @@ class HostCommandState:
                 **_jsonable(self._last_action_diagnostics["right_shoulder"]),
                 "command_received_wall_time_ns": self._last_receive_wall_time_ns,
             }
+        if "left_shoulder" in self._last_action_diagnostics:
+            report["left_shoulder"] = {
+                **_jsonable(self._last_action_diagnostics["left_shoulder"]),
+                "command_received_wall_time_ns": self._last_receive_wall_time_ns,
+            }
         return report
 
     def format_report(self) -> str | None:
@@ -367,6 +372,103 @@ def print_startup_shoulder_report(
             error.add_note(f"shoulder readback reporting also failed: {report_error}")
         raise  # Preserve a genuine communication/servo failure and its identity.
     emit()
+
+
+class AM1LeftShoulderEvidence:
+    """Sparse diagnostic reads by the existing host owner; never motion authority."""
+
+    SETTINGS = (
+        "CW_Dead_Zone", "CCW_Dead_Zone", "Operating_Mode", "Torque_Enable",
+        "Goal_Time", "Goal_Velocity", "Torque_Limit", "Max_Torque_Limit",
+        "P_Coefficient", "I_Coefficient", "D_Coefficient", "Minimum_Startup_Force",
+    )
+
+    def __init__(
+        self, *, enabled: bool, clock: Callable[[], float] = time.monotonic,
+        wall_clock_ns: Callable[[], int] = time.time_ns,
+    ) -> None:
+        self.enabled, self._clock, self._wall_clock_ns = enabled, clock, wall_clock_ns
+        self._last_read_at: float | None = None
+        self._settings: dict | None = None
+        self._goal_read_attempts = 0
+        self._goal_read_unavailable = 0
+
+    def report(self, robot: AlohaMini, command_state: HostCommandState) -> None:
+        if not self.enabled or robot.config.robot_model != "alohamini1":
+            return
+        snapshot = command_state.snapshot()
+        if snapshot is None or "left_shoulder" not in snapshot:
+            return
+        now = self._clock()
+        if self._last_read_at is not None and now - self._last_read_at < 1.0:
+            return
+        self._last_read_at = now
+        record = {
+            **snapshot["left_shoulder"], "command_sequence": snapshot["command_sequence"],
+            "wall_time_ns": self._wall_clock_ns(),
+            "goal_read_started_at": now,
+            "goal_read_started_wall_time_ns": self._wall_clock_ns(),
+            "goal_position_readback_raw": None, "goal_matches_expected_raw": None,
+            "diagnostic_available": False, "feedback_qualified": False,
+        }
+        bus, name = robot.left_bus, "arm_left_shoulder_lift"
+        primary_error: Exception | None = None
+        self._goal_read_attempts += 1
+        try:
+            goal = bus.read("Goal_Position", name, normalize=False, num_retry=0)
+            record["goal_position_readback_raw"] = goal
+            expected = record.get("expected_goal_raw")
+            if type(expected) is int:
+                record["goal_matches_expected_raw"] = int(goal) == expected
+            record["diagnostic_available"] = True
+        except Exception as error:
+            record["goal_read_error"] = f"{type(error).__name__}: {error}"
+            self._goal_read_unavailable += 1
+            if not isinstance(error, ConnectionError):
+                primary_error = error
+        record["goal_read_completed_at"] = self._clock()
+        record["goal_read_attempt_count"] = self._goal_read_attempts
+        record["goal_read_unavailable_count"] = self._goal_read_unavailable
+        if self._settings is None and record["diagnostic_available"]:
+            settings = {"registers_raw": {}, "reads": {}, "unavailable": {}}
+            self._settings = settings
+            table = bus.model_ctrl_table[bus.motors[name].model]
+            settings_started = self._clock()
+            for register in self.SETTINGS:
+                if register not in table:
+                    settings["unavailable"][register] = "not in the actual motor model table"
+                    continue
+                if self._clock() - settings_started >= 0.020:
+                    settings["unavailable"][register] = "20 ms snapshot budget exhausted"
+                    continue
+                acquired = {
+                    "started_at": self._clock(),
+                    "started_wall_time_ns": self._wall_clock_ns(),
+                }
+                try:
+                    settings["registers_raw"][register] = bus.read(
+                        register, name, normalize=False, num_retry=0,
+                    )
+                except Exception as error:
+                    settings["unavailable"][register] = f"{type(error).__name__}: {error}"
+                    if not isinstance(error, ConnectionError):
+                        primary_error = error
+                acquired["completed_at"] = self._clock()
+                settings["reads"][register] = acquired
+                if primary_error is not None:
+                    break
+            settings["complete"] = not settings["unavailable"]
+        record["settings_snapshot"] = self._settings
+        if primary_error is not None:
+            record["diagnostic_available"] = False
+        try:
+            print(f"[AM1 LEFT SHOULDER] {json.dumps(_jsonable(record), separators=(',', ':'))}", flush=True)
+        except BaseException as report_error:
+            if primary_error is None:
+                raise
+            primary_error.add_note(f"shoulder evidence reporting also failed: {report_error}")
+        if primary_error is not None:
+            raise primary_error
 
 
 def _jsonable(value):
@@ -578,6 +680,11 @@ def main():
     if args.no_follower:
         logging.info("no_follower mode: follower arms will not connect, only base and lift operate.")
     robot = AlohaMini(robot_config)
+    left_shoulder_evidence = AM1LeftShoulderEvidence(
+        enabled=(os.environ.get("AM1_LEFT_SHOULDER_EVIDENCE") == "1"
+                 and args.robot_model == "alohamini1" and not args.no_follower),
+    )
+    robot._am1_left_shoulder_evidence_enabled = left_shoulder_evidence.enabled
 
     if args.lift_relief:
         from .lift_relief import run_lift_relief
@@ -831,6 +938,11 @@ def main():
                 print_cadence_report(command_state)
                 if sync_shoulder_readback and local_control is not None and local_control.state == "ready":
                     print_startup_shoulder_report(robot, command_state, last_observation)
+                if left_shoulder_evidence.enabled and loop_timing is not None:
+                    loop_timing.mark("left_shoulder_evidence", time.perf_counter())
+                left_shoulder_evidence.report(robot, command_state)
+                if left_shoulder_evidence.enabled and loop_timing is not None:
+                    loop_timing.mark("report_after_left_shoulder_evidence", time.perf_counter())
                 cadence_report_start_t = cadence_now
 
             duration = time.perf_counter() - start
