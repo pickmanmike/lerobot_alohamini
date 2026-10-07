@@ -34,6 +34,7 @@ from lerobot.utils.decorators import check_if_already_connected, check_if_not_co
 
 from ..robot import Robot
 from ..utils import ensure_safe_goal_position
+from .am1_shoulder_integral import AM1ShoulderIntegralTrial
 from .config_alohamini import AlohaMiniConfig
 from .lift_axis import LiftAxis, LiftAxisConfig, LiftHomeResult
 from .model_specs import arm_state_keys_for_robot_model, validate_robot_model
@@ -480,6 +481,9 @@ class AlohaMini(Robot):
     def configure(self) -> None:
         """Configure motor modes and gains while leaving all torque disabled."""
         set_torque_enabled(self.left_bus, self.left_bus.motors, enabled=False)
+        previous_trial = getattr(self, "_am1_shoulder_integral_trial", None)
+        if previous_trial is not None:
+            previous_trial.restore(self)
         self._configure_bus_defaults(self.left_bus)
         for name in self.left_arm_motors:
             write_register(self.left_bus, "Operating_Mode", name, OperatingMode.POSITION.value)
@@ -501,6 +505,10 @@ class AlohaMini(Robot):
                 write_register(self.right_bus, "D_Coefficient", name, 32)
 
         self.lift.configure(force=True)
+
+        # Retain the trial before its first write, including partially applied failures.
+        self._am1_shoulder_integral_trial = AM1ShoulderIntegralTrial()
+        self._am1_shoulder_integral_trial.configure(self)
 
     def _seed_arm_goals(self, bus: FeetechMotorsBus, motors: list[str]) -> None:
         present_positions = {
@@ -607,6 +615,13 @@ class AlohaMini(Robot):
                     set_torque_enabled(bus, (name,), enabled=False)
                 except Exception as error:
                     errors.append(f"disable {bus_name}/{name}: {error}")
+
+        integral_trial = getattr(self, "_am1_shoulder_integral_trial", None)
+        if integral_trial is not None:
+            try:
+                integral_trial.restore(self)
+            except BaseException as error:
+                errors.append(f"restore AM1 left shoulder integral: {type(error).__name__}: {error}")
 
         operation = getattr(self, "_lift_operation", None)
         if motor_shutdown_check is None and operation is not None and self.left_bus.is_connected:
