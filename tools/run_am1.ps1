@@ -49,8 +49,8 @@ function Assert-Am1LeaderSource {
         if ($Mode -ne 'Local') {
             throw 'Scripted leader input is available only for Local unified sessions.'
         }
-        if ($MotionProfile -cnotin @('ArmSmoke', 'ArmSmokeRepeat')) {
-            throw 'Scripted leader input requires -MotionProfile ArmSmoke or ArmSmokeRepeat.'
+        if ($MotionProfile -cnotin @('ArmSmoke', 'ArmSmokeRepeat', 'ArmHoldBody')) {
+            throw 'Scripted leader input requires -MotionProfile ArmSmoke, ArmSmokeRepeat or ArmHoldBody.'
         }
     }
     elseif (-not [string]::IsNullOrEmpty($MotionProfile)) {
@@ -226,6 +226,9 @@ function New-Am1WindowsCommand {
         }
         if ($MotionProfile -ceq 'ArmSmokeRepeat' -and $liveDuration -cne '420') {
             throw 'ArmSmokeRepeat requires the finite -DurationSeconds 420 ceiling.'
+        }
+        if ($MotionProfile -ceq 'ArmHoldBody' -and $liveDuration -cne '12') {
+            throw 'ArmHoldBody requires the finite -DurationSeconds 12 ceiling.'
         }
         $arguments = @(
             $teleoperationPath
@@ -489,6 +492,9 @@ function Invoke-Am1Launch {
         $localDuration = ConvertTo-Am1LocalDurationSeconds -Value $DurationSeconds
         if ($MotionProfile -ceq 'ArmSmokeRepeat' -and $localDuration -ne 420) {
             throw 'ArmSmokeRepeat requires the finite -DurationSeconds 420 ceiling.'
+        }
+        if ($MotionProfile -ceq 'ArmHoldBody' -and $localDuration -ne 12) {
+            throw 'ArmHoldBody requires the finite -DurationSeconds 12 ceiling.'
         }
     }
     elseif ($null -ne $DurationSeconds -and -not [string]::IsNullOrWhiteSpace([string]$DurationSeconds)) {

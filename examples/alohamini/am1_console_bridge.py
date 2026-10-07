@@ -27,7 +27,7 @@ MAX_PIPE_BYTES = 4096
 MAX_INPUT_INTEGER = 2**53 - 1  # Browser-safe integer; also bounds echoed diagnostic metadata.
 PREPARED_GATES = frozenset({"sync_start", "live_start"})
 MANUAL_GATES = frozenset({"realign", "resume"})
-PAUSE_CAUSES = frozenset({"window-blur", "document-hidden", "route-change", "pagehide",
+PAUSE_CAUSES = frozenset({"bench required coverage", "window-blur", "document-hidden", "route-change", "pagehide",
                          "body-request-rejected", "body-request-failed", "state-request-failed",
                          "operator", "pipe disconnected", "expired browser input",
                          "released browser input", "native input expired", "native pipe disconnected"})
@@ -102,7 +102,9 @@ def make_console_host_feedback_event(sample: Any, feedback: dict[str, Any], *,
     return {"event": "host_feedback", "acquired_at_ns": max(0, wall_ns - age_ns),
             "observation_sequence": sample.observation_sequence,
             "host_observation_id": feedback.get("observation_id"),
-            "host_state": feedback.get("state"), "host_epoch": feedback.get("epoch")}
+            "host_state": feedback.get("state"), "host_epoch": feedback.get("epoch"),
+            "follower_positions": _console_numbers(sample.follower_positions, CONSOLE_ARM_KEYS),
+            "arm_target": _console_numbers(sample.arm_target, CONSOLE_ARM_KEYS)}
 
 
 def make_console_action_sent_event(action: Any, *, sequence: int, interval_ms: float,
@@ -243,8 +245,8 @@ class AM1ConsoleInputState:
         self.keys = []
         self.body_release_required = True
         self.forced_pause = True
-        if self.approved_gate is not None and self.approved_gate[0] in PREPARED_GATES:
-            self.approved_gate = None
+        # Any later pause revokes queued permission, including live Resume.
+        self.approved_gate = None
 
     def request_gate(self, stage: str, *, host_epoch: int | None) -> None:
         if stage not in PREPARED_GATES | MANUAL_GATES:
@@ -564,6 +566,15 @@ class AM1ConsoleBridgeClient:
                         result = "owner_changed"
                         return False
                     if acknowledged:
+                        at = self.clock()
+                        self._check_freshness_locked(at)
+                        if (not self._lease_valid or self._received_at is None
+                                or self._browser_received_at is None
+                                or not 0 <= at - self._received_at < INPUT_MAX_AGE_S
+                                or not 0 <= at - self._browser_received_at < INPUT_MAX_AGE_S
+                                or stage in PREPARED_GATES | {"resume"} and self._pause_latched):
+                            result = "revoked_acknowledgement"
+                            return False
                         result = "acknowledged"
                         return True
                 if not self.is_connected:
@@ -635,7 +646,7 @@ class AM1ConsoleBridgeServer:
         self.session_id = session_id
         self.clock = clock
         self.state = AM1ConsoleInputState(session_id, control_token)
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.stop_event = threading.Event()
         self.pipe_name = rf"\\.\pipe\am1-console-{secrets.token_hex(12)}"
         self.auth_file = state_directory / f".am1-console-{session_id}-{secrets.token_hex(6)}.auth"
@@ -651,6 +662,7 @@ class AM1ConsoleBridgeServer:
         self._native_connected = False
         self._gate_request_evidence = None
         self._gate_ack_evidence = None
+        self._prepared_gate_guard = None
         self._telemetry_sink = None
         self._send_seq = 0
         self._thread = threading.Thread(target=self._io, name="am1-console-pipe-owner", daemon=True)
@@ -714,7 +726,9 @@ class AM1ConsoleBridgeServer:
                                     pass  # A display subscriber must not tear down the input bridge.
                 with self.lock:
                     pending = self.state.pending_gate
-                    if pending is not None and self.state.gate_ack(pending[0], host_epoch=pending[1], now=self.clock()):
+                    covered = (pending is None or pending[0] not in PREPARED_GATES
+                               or self._prepared_gate_guard is None or self._prepared_gate_guard())
+                    if pending is not None and covered and self.state.gate_ack(pending[0], host_epoch=pending[1], now=self.clock()):
                         ack = {"stage": pending[0], "host_epoch": pending[1]}
                     else:
                         ack = None
@@ -723,9 +737,13 @@ class AM1ConsoleBridgeServer:
                 # Install real receipt metadata before acknowledging permission;
                 # never open a gate against the previous invalid paused lease.
                 self._send("lease", lease, input_epoch=input_epoch)
-                if ack is not None and self._send("gate_ack", ack, input_epoch=input_epoch):
+                if ack is not None:
+                    # A Pause/claim after the lease snapshot revokes this unsent ack.
                     with self.lock:
-                        self._gate_ack_evidence = {**ack, "input_epoch": input_epoch, "wall_time_ns": time.time_ns()}
+                        if (self.state.epoch == input_epoch and not self.state.forced_pause
+                                and self._send("gate_ack", ack, input_epoch=input_epoch)):
+                            self._gate_ack_evidence = {**ack, "input_epoch": input_epoch,
+                                                      "wall_time_ns": time.time_ns()}
         except (EOFError, OSError, ValueError):
             pass
         finally:
@@ -745,6 +763,10 @@ class AM1ConsoleBridgeServer:
             return self.state.browser_keys(token=token, epoch=epoch, seq=seq, keys=keys,
                                            active=active, now=self.clock(), release_reason=release_reason,
                                            first_release=first_release)
+
+    def set_prepared_gate_guard(self, guard) -> None:
+        """Opt-in immutable coverage snapshot; callback performs no IO or locks."""
+        self._prepared_gate_guard = guard
 
     def set_telemetry_sink(self, sink: Any) -> None:
         self._telemetry_sink = sink

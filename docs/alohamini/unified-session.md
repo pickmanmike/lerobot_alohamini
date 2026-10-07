@@ -1,5 +1,52 @@
 # AM1 supervised unified Local session
 
+## AM1-RELIABILITY-03 — current virtual reliability workstream
+
+Execute finite virtual/scripted arm input and automated owned body controls,
+with the existing spare P1 observer current throughout useful runs. The owner
+authorizes supported software repairs, bounded ordinary runs and qualified
+same-session recovery without attendance/readiness/manual-leader actions.
+Manual-leader acceptance and independent cutoff development are outside this
+packet; older procedural prerequisites do not apply to this workstream.
+
+Preserve actual motor/thermal/current/status/feedback limits, ownership, private
+configuration/calibration/mappings, exact separate pins and rollback. Do not
+force a powered process freeze, bus fault or overload. Optional camera quality
+issues must be recorded separately from required observation coverage and motion
+authority. Actual required-coverage loss must hold/freeze, then qualify bounded
+recovery; explicit user Pause/Stop and real motor faults are not cleared.
+
+Target one four-cycle ArmSmokeRepeat: 352 trajectory seconds, original seed and
+existing amplitudes/rates/holds, within the unchanged 420-second native ceiling.
+Completion requires characterized useful outward and return motion, current
+observer evidence, focused review/tests and exact deployment/publication proof.
+Do not substitute another diagnostic-only result for this completion loop.
+
+The explicit virtual bench uses numeric role health and a fresh nonce-qualified
+P1 image. Its required coverage has a 500 ms causal age bound, including
+challenge round-trip transit. Transient Windows health-file sharing refusals
+retain only an accepted record until its original expiry and expose uncertainty.
+All five camera views remain a separate quality result; optional view loss has
+bounded role-local reconnects. Required coverage loss freezes the existing
+trajectory and permits at most three qualified same-session recoveries, each
+within ten seconds. The absolute native deadline remains unchanged. A later
+operator Pause, Stop, foreign owner or motor fault revokes automatic recovery.
+
+The supported short ArmHoldBody profile holds all twelve fresh measured arm
+targets and permits normal owned body commands for twelve seconds. Other
+scripted arm profiles continue to send zero body velocity. Body execution must
+declare inspected current scene coverage in addition to P1 arms/lift coverage.
+
+Software validation currently includes nine loaded real HTTP/frontend/native
+pipe cases and 47 camera/pure-policy Node tests. These cover optional degradation,
+required observation hold/recovery, explicit operator refusal, scripted body
+commands, refused Start and existing packet-02 behavior. Powered packet-03
+motion and final observer delivery qualification remain pending; these tests
+do not establish shoulder return or four-cycle completion.
+
+Plan: [AM1-03 executable plan](../superpowers/plans/2026-10-06-am1-reliability-03.md).
+Historical packet-02/01 evidence below retains its original verdicts.
+
 ## AM1-RELIABILITY-02 — integration and bounded follow-ups
 
 PR #14 was merged ordinarily into `integrate/am1-local-teleop` as

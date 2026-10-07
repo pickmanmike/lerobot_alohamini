@@ -159,12 +159,14 @@ def validate_leader_selection(
 ) -> None:
     if leader_source not in {"physical", "scripted"}:
         raise ValueError("Leader source must be physical or scripted.")
-    if leader_source == "scripted" and motion_profile not in {"ArmSmoke", "ArmSmokeRepeat"}:
-        raise ValueError("Scripted leader input requires --motion-profile ArmSmoke or ArmSmokeRepeat.")
+    if leader_source == "scripted" and motion_profile not in {"ArmSmoke", "ArmSmokeRepeat", "ArmHoldBody"}:
+        raise ValueError("Scripted leader input requires --motion-profile ArmSmoke, ArmSmokeRepeat or ArmHoldBody.")
     if leader_source == "physical" and motion_profile is not None:
         raise ValueError("--motion-profile is available only for scripted leader input.")
     if motion_profile == "ArmSmokeRepeat" and duration_seconds is not None and duration_seconds != 420:
         raise ValueError("ArmSmokeRepeat requires the finite 420-second native ceiling.")
+    if motion_profile == "ArmHoldBody" and duration_seconds is not None and duration_seconds != 12:
+        raise ValueError("ArmHoldBody requires the finite 12-second native ceiling.")
 
 
 def _leader_launch_arguments(leader_source: str, motion_profile: str | None) -> list[str]:
@@ -789,8 +791,10 @@ class SSHRemote:
         ]
         if client_trace is not None:
             command.extend(["-v", "-E", str(client_trace)])
+        command.append(self.config.ssh_target)
+        if os.environ.get("AM1_LEFT_SHOULDER_EVIDENCE") == "1":
+            command.extend(["env", "AM1_LEFT_SHOULDER_EVIDENCE=1"])
         command.extend([
-            self.config.ssh_target,
             self.config.remote_python,
             self.config.remote_helper,
             "supervise",

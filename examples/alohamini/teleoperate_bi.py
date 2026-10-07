@@ -42,7 +42,7 @@ from leader_client_utils import (
     make_normalized_bi_leader_config,
     resolve_leader_ports,
 )
-from scripted_leader import ScriptedLeaderInput
+from scripted_leader import ArmHoldBodyInput, ScriptedLeaderInput
 from scripted_leader_repeat import ArmSmokeRepeatInput
 from am1_console_bridge import (
     AM1ConsoleBridgeClient, make_console_action_sent_event, make_console_host_feedback_event,
@@ -1544,7 +1544,7 @@ def run_alignment_gate(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--leader_source", choices=("physical", "scripted"), default="physical")
-    parser.add_argument("--motion_profile", choices=("ArmSmoke", "ArmSmokeRepeat"), help="Explicit scripted AM1 input profile")
+    parser.add_argument("--motion_profile", choices=("ArmSmoke", "ArmSmokeRepeat", "ArmHoldBody"), help="Explicit scripted AM1 input profile")
     parser.add_argument("--no_robot", action="store_true", help="Do not construct or connect the robot client")
     parser.add_argument("--no_leader", action="store_true", help="Do not construct or connect the leader arms")
     parser.add_argument(
@@ -1703,10 +1703,12 @@ def parse_args(
     if args.leader_source == "scripted":
         if not args.local_mode or not args.unified_session_enter_confirmations:
             parser.error("scripted input requires the unified AM1 Local workflow")
-        if args.motion_profile not in {"ArmSmoke", "ArmSmokeRepeat"} or args.no_leader or args.require_calibration_match:
+        if args.motion_profile not in {"ArmSmoke", "ArmSmokeRepeat", "ArmHoldBody"} or args.no_leader or args.require_calibration_match:
             parser.error("scripted input requires ArmSmoke, not disabled or physical-calibration leader mode")
         if args.motion_profile == "ArmSmokeRepeat" and args.duration_s != 420:
             parser.error("ArmSmokeRepeat requires the finite --duration_s 420 ceiling")
+        if args.motion_profile == "ArmHoldBody" and args.duration_s != 12:
+            parser.error("ArmHoldBody requires the finite --duration_s 12 ceiling")
     elif args.motion_profile is not None:
         parser.error("--motion_profile requires --leader_source scripted")
     if args.external_stop_file is not None:
@@ -2336,7 +2338,7 @@ def _run_am1_recovering_local_sender(
                 break
             body_action = validate_am1_local_body_action(body_action_supplier())
             state, epoch, pause_started_at, pause_reason = sender.recovery_snapshot()
-            if control_pause_requested is not None and control_pause_requested() and state == "active":
+            if control_pause_requested is not None and control_pause_requested() and state in {"active", "resuming"}:
                 console_manual_required = True
                 sender.request_pause("console input lease lost or operator paused")
                 state, epoch, pause_started_at, pause_reason = sender.recovery_snapshot()
@@ -2596,6 +2598,16 @@ def _run_am1_recovering_local_sender(
                     continue
                 if _max_am1_arm_difference(sample.arm_target, sample.follower_positions) > max_start_mismatch:
                     raise SafetyRefusal("AM1 Local recovery leader/follower mismatch exceeds startup gate")
+            if control_pause_requested is not None and control_pause_requested():
+                # A later console pause revokes an ack already returned to the
+                # input thread. Keep measured hold and request a current gate.
+                if manual_gate is not None and manual_ready.is_set():
+                    manual_responses.clear()
+                    manual_ready.clear()
+                    manual_requested = False
+                    manual_enter_at = None
+                    manual_input_result = None
+                continue
             resume_mode_pending = "manual" if manual_required else "automatic"
             print(json.dumps({"event": "am1_local_resume_qualified", "epoch": epoch,
                               "resume_mode": resume_mode_pending, "observation_sequence": last_sequence,
@@ -3022,7 +3034,10 @@ def run_teleoperation(
                 )
                 seed = extract_am1_arm_positions(seed_observation, source="scripted follower seed", leader_sample=False)
                 validate_selected_sync_positions(seed, AM1_ARM_POSITION_KEYS, source="scripted follower seed")
-                provider = ArmSmokeRepeatInput if args.motion_profile == "ArmSmokeRepeat" else ScriptedLeaderInput
+                provider = {
+                    "ArmSmoke": ScriptedLeaderInput, "ArmSmokeRepeat": ArmSmokeRepeatInput,
+                    "ArmHoldBody": ArmHoldBodyInput,
+                }[args.motion_profile]
                 scripted_input = provider(seed, joint_keys=AM1_ARM_POSITION_KEYS, fps=args.fps)
                 leader = scripted_input
                 arm_input_ready = True
@@ -3142,7 +3157,10 @@ def run_teleoperation(
                         require_enter_confirmation(
                             stop_aware_input,
                             ("CONFIRMATION 3/3 — REAL FOLLOWER MOTION: press Enter only to recheck "
-                             "alignment and start ArmSmoke; body keys are disabled, Q/Stop remains available."
+                             f"alignment and start {args.motion_profile}; "
+                             + ("measured arms held and normal body controls active; Q/Stop remains available."
+                                if args.motion_profile == "ArmHoldBody"
+                                else "body keys are disabled, Q/Stop remains available.")
                              if scripted_mode else
                              "CONFIRMATION 3/3 — Keep both leaders still and press Enter only to recheck "
                              "alignment and enable live teleoperation."),
@@ -3252,7 +3270,7 @@ def run_teleoperation(
                 if quit_key in keyboard_keys:
                     local_quit_requested = True
                     return make_zero_action()
-                if scripted_mode:
+                if scripted_mode and args.motion_profile != "ArmHoldBody":
                     return make_zero_action()
                 return make_local_body_action(robot, keyboard_keys)
 
@@ -3337,7 +3355,11 @@ def run_teleoperation(
             def announce_unified_active() -> None:
                 if scripted_mode:
                     print("TELEOPERATION ACTIVE — SCRIPTED LEADER INPUT — REAL FOLLOWER MOTION", flush=True)
-                    print(f"{args.motion_profile} active: body/lift keys disabled; Q/Stop cancels.", flush=True)
+                    controls = (
+                        "measured arms held; normal body/lift controls active"
+                        if args.motion_profile == "ArmHoldBody" else "body/lift keys disabled"
+                    )
+                    print(f"{args.motion_profile} active: {controls}; Q/Stop cancels.", flush=True)
                     return
                 print("TELEOPERATION ACTIVE — LEADER MOVEMENT IS NOW ALLOWED")
                 print("LOCAL BODY CONTROLS ACTIVE — W/S/Z/X/A/D AND U/J MAY NOW MOVE THE ROBOT")
