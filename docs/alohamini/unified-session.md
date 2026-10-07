@@ -29,7 +29,8 @@ between challenge receipt and capture, with a conservative one-millisecond
 precision margin and contradiction checks; legacy records retain the full
 round-trip bound. Startup stabilization requires a current continuous twenty
 seconds of fresh delivery. Cumulative startup gaps and the whole-invocation
-uninterrupted verdict remain separate from that current qualification. Transient Windows health-file sharing refusals
+uninterrupted verdict remain separate from that current qualification. Transient Windows
+health-file sharing refusals
 retain only an accepted record until its original expiry and expose uncertainty.
 All five camera views remain a separate quality result; optional view loss has
 bounded role-local reconnects. Required coverage loss freezes the existing
@@ -64,7 +65,11 @@ tests and was staged while the motor owner was stopped. It uses the same
 qualified live owner, finite inward preparation, one fresh program seed and the
 unchanged original trajectory. The selected I1 experiment records its original
 registers before writing and verifies restoration to I0 with torque off.
-Actual powered preparation, return and four-cycle completion remain pending.
+The first powered I1 trial advanced only preparation, then failed on lift temperature
+history before the original program began. Its original cleanup_unknown remains unchanged. A
+later stopped-owner read verified all sixteen motors torque-off, zero body velocity goals
+and restored I0; the actual gain snapshot separately verifies I1-to-I0 restoration. Return
+and four-cycle completion remain pending.
 
 A subsequent P1 capture acquired all 660 seconds and released normally, while
 its receiver failed after delayed return delivery and an SSH connection reset.
@@ -78,8 +83,20 @@ alive. Recovery now rebuilds a forwarding-only connection on a new local port
 to the same capture, preserving its remote port, generation, token, original
 nonce timestamps, deadline and three-attempt/five-second budget. Original owner
 and delivery failure verdicts remain separate from later cleanup. All 77 focused
-observer tests pass. The next real capture tests this repair with compression
-off; actual motion still requires current delivery and inspected framing.
+observer tests pass. The next capture, with compression off, recorded the actual preparation
+and interruption with no socket losses or reconnects, then stopped and released normally.
+Its original freshness gaps remain recorded and its whole-capture uninterrupted verdict is
+false. The verified finalized recording is retained privately; actual motion still requires
+current delivery and inspected framing.
+
+The failed preparation reproduced a lift history freshness decision crossing 500 ms between
+two clock reads, while current raw feedback was about 20 ms old at 32 degrees and the
+preceding eight loops stayed near 33.4 ms. The focused correction revalidates raw feedback
+and evaluates the history decision at one actual timestamp; any real grouped refresh then
+takes a fresh completion timestamp. Original readings, old peaks and both 500 ms limits
+remain enforced. All 172 affected thermal tests pass, including the crossing and refusal of
+raw feedback that expires before refresh authorization. Independent review found no
+actionable blocker; powered completion remains pending.
 
 Plan: [AM1-03 executable plan](../superpowers/plans/2026-10-06-am1-reliability-03.md).
 Historical packet-02/01 evidence below retains its original verdicts.
@@ -392,7 +409,9 @@ camera-auth file outside Git. If necessary, set `NODE_PATH` to the existing
 Playwright installation. For the current packet's finite arm scenario:
 
 ```powershell
-node tools/am1_reliability_bench.cjs http://127.0.0.1:8765/ ArmSmoke AM1-RELIABILITY-01-arm-02 <private-absolute-evidence-path> 81c10a8497fda8eea36bac3ea6861f9e6ff5ed05 30
+node tools/am1_reliability_bench.cjs http://127.0.0.1:8765/ ArmSmoke
+AM1-RELIABILITY-01-arm-02 <private-absolute-evidence-path>
+81c10a8497fda8eea36bac3ea6861f9e6ff5ed05 30
 ```
 
 The optional final argument permits only the short 30-second native arm limit or
@@ -515,7 +534,8 @@ config backup, after checking for intervening private edits):
 git switch --detach 915a32d4d9ac42433c1aee95f4f0c74f348c5dda
 $am1RollbackConfig = Get-Content -LiteralPath config/am1.session.json -Raw | ConvertFrom-Json
 $am1RollbackConfig.windows_session_head = '915a32d4d9ac42433c1aee95f4f0c74f348c5dda'
-$am1RollbackConfig | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath config/am1.session.json -Encoding utf8
+$am1RollbackConfig | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath
+config/am1.session.json -Encoding utf8
 ```
 
 Normal preflight must pass again before Start. The older DirectBrowser entrypoint
@@ -556,7 +576,9 @@ shutdown, required-view loss, manual pause, foreign-owner refusal, failed monito
 reads, delayed finalization, stalled finalization and late terminal response:
 
 ```powershell
-uv run --no-sync python -m pytest -p no:cacheprovider tests/robots/test_am1_console_bridge.py tests/robots/test_am1_console_local_path.py -k 'bench or inflight_read' -q --tb=short
+uv run --no-sync python -m pytest -p no:cacheprovider
+tests/robots/test_am1_console_bridge.py tests/robots/test_am1_console_local_path.py -k
+'bench or inflight_read' -q --tb=short
 node --test tests/cameras/test_am1_console_ui.cjs
 node --check tools/am1_reliability_bench.cjs
 git diff --check
@@ -766,7 +788,8 @@ expire after 250 ms of accepted-browser silence, independently of the approved
 1.5-second browser-presence allowance. A short gap clears held movement: release
 the controls, then deliberately press again; it does not by itself pause the arms.
 Leaving Control, losing focus, failed input/state requests or lost presence still
-clear body input and request measured-arm pause. Resume and exceptional realignment require explicit on-page approval
+clear body input and request measured-arm pause. Resume and exceptional realignment require
+explicit on-page approval
 and fresh host/follower/leader qualification. Q on Control or Stop from any page
 requests the existing exact-session cleanup. Do not treat a returned Stop request
 as verified shutdown: wait for the final session result. The exact result folder
@@ -1216,7 +1239,8 @@ if practical manual use exposes a material usability problem. Keep P16 and the
 existing profile, calibration, gains and limits.
 
 Ordinary startup automatically aligns followers to held-still physical leaders;
-manual matching is optional, not required. Historical shoulder/arbitrary-pose, camera acquisition/browser delivery
+manual matching is optional, not required. Historical shoulder/arbitrary-pose, camera
+acquisition/browser delivery
 (including the 1.138 s display gap), long-duration and unattended-use limitations
 remain. Network infrastructure remediation is external. See the short
 [everyday reference](#everyday-supervised-use); historical records below are not

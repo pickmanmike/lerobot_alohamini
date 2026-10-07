@@ -8,11 +8,15 @@ from types import SimpleNamespace
 
 import pytest
 
-from lerobot.robots.alohamini import alohamini as robot_module
-from lerobot.robots.alohamini import alohamini_host as host
-from lerobot.robots.alohamini import lift_motor_feedback as feedback
+from lerobot.robots.alohamini import (
+    alohamini as robot_module,
+    alohamini_host as host,
+    lift_motor_feedback as feedback,
+)
 from lerobot.robots.alohamini.config_alohamini import AlohaMiniConfig
-from tests.robots.test_alohamini_lift_operational import operating_robot  # noqa: F401
+from tests.robots.test_alohamini_lift_operational import operating_robot as _operating_robot
+
+operating_robot = _operating_robot
 
 
 @pytest.fixture
@@ -293,3 +297,102 @@ def test_refresh_keeps_high_history_faults_and_cancellation_terminal(host_case, 
     assert all(case.robot.left_bus.registers[("Goal_Velocity", name)] == 0
                for name in case.robot.base_motors + ["lift_axis"])
     assert case.robot.left_bus.registers[("Torque_Enable", "lift_axis")] == 0
+
+
+def _five_slot_consumer_boundary(robot, clock, *, retained_highs=False):
+    """Populate actual slot peaks and a later same-slot raw reply."""
+    robot.connect(calibrate=False)
+    op = robot._lift_operation
+    origin = op.temperature._origin_ns / 1e9
+    start = origin + math.ceil((clock.now - origin) / 0.1) * 0.1
+    for index in range(5):
+        clock.sleep(start + index * 0.1 - clock.now - 0.002)
+        robot.left_bus.registers[("Present_Temperature", "lift_axis")] = (
+            60 if retained_highs and index in (2, 3) else 30
+        )
+        op.poll()
+    robot.left_bus.registers[("Present_Temperature", "lift_axis")] = 30
+    clock.sleep(start + 0.478 - clock.now)
+    op.poll()
+    assert op.last_record["sample_monotonic_s"] == pytest.approx(start + 0.48)
+    op.emit_pending_sample()
+    return op
+
+
+def _elapsed_after_first_raw_check(op, clock, monkeypatch):
+    """Delay a real guard's work; do not replace its decisions or sample times."""
+    original = op.temperature.assert_fresh
+    crossed = False
+
+    def check(now, *, refreshing=False):
+        nonlocal crossed
+        original(now, refreshing=refreshing)
+        if refreshing and not crossed:
+            clock.sleep(0.000002)
+            crossed = True
+
+    monkeypatch.setattr(op.temperature, "assert_fresh", check)
+
+
+@pytest.mark.parametrize("consumer", ["action", "observation"])
+@pytest.mark.parametrize("retained_highs", [False, True])
+def test_consumer_refresh_decision_uses_current_history_boundary(
+    operating_robot, monkeypatch, consumer, retained_highs,
+):
+    """A real 2 ms owner reply must resolve a guard-clock boundary crossing."""
+    robot, clock = operating_robot
+    op = _five_slot_consumer_boundary(robot, clock, retained_highs=retained_highs)
+    history = list(op.temperature.samples)
+    latest = op.last_record["sample_monotonic_s"]
+    reads = len(op.transport.group_reads)
+    clock.sleep(history[0][0] + 0.499999 - clock.now)
+    _elapsed_after_first_raw_check(op, clock, monkeypatch)
+    observation = {}
+    try:
+        if consumer == "action":
+            op.apply_action({"lift_axis.vel": 0})
+        else:
+            op.contribute_observation(observation)
+        assert len(op.transport.group_reads) == reads + 1
+        acquired = op.last_record["sample_monotonic_s"]
+        assert acquired > latest
+        assert acquired == pytest.approx(history[0][0] + 0.502001)
+        assert list(op.temperature.samples)[:-1] == history[1:]
+        assert op.temperature.samples[-1] == (acquired, 30)
+        assert op.temperature._last_sample_at == acquired
+        assert op.last_record["request_duration_s"] == pytest.approx(0.002)
+        assert op.temperature.failure is op.failure is None
+        assert sum(value >= 55 for _, value in op.temperature.samples) == (2 if retained_highs else 0)
+        if consumer == "observation":
+            assert observation["lift_axis.height_mm"] == op.height_mm
+        assert robot.left_bus.registers[("Goal_Velocity", "lift_axis")] == 0
+    finally:
+        op.emit_pending_sample()
+        robot.disconnect()
+
+
+@pytest.mark.parametrize("consumer", ["action", "observation"])
+def test_raw_sample_expiring_during_guard_work_refuses_before_another_read(
+    operating_robot, monkeypatch, consumer,
+):
+    robot, clock = operating_robot
+    op = _five_slot_consumer_boundary(robot, clock)
+    history = list(op.temperature.samples)
+    latest = op.last_record["sample_monotonic_s"]
+    reads = len(op.transport.group_reads)
+    clock.sleep(latest + 0.499999 - clock.now)
+    _elapsed_after_first_raw_check(op, clock, monkeypatch)
+    observation = {}
+    try:
+        with pytest.raises(feedback.ComparisonRefusal, match="five-slot feedback window is stale") as caught:
+            if consumer == "action":
+                op.apply_action({"lift_axis.vel": 0})
+            else:
+                op.contribute_observation(observation)
+        assert op.failure is op.temperature.failure is caught.value
+        assert len(op.transport.group_reads) == reads
+        assert list(op.temperature.samples) == history
+        assert op.temperature._last_sample_at == latest
+        assert not observation
+    finally:
+        robot.disconnect()
