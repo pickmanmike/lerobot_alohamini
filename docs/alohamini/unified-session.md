@@ -59,12 +59,22 @@ remain enforced. Encoded targets round inward within the existing relative
 limit, and incompatible protected holds refuse before either arm write.
 Actual shoulder return and the four-cycle workload remain pending.
 
-A scoped preparation experiment is being reviewed before deployment. It uses
-the same qualified live owner, finite inward preparation, one fresh program seed
-and the unchanged original trajectory. Selected integral-gain qualification and
-torque-off rollback are explicit; ordinary manual/body profiles retain their
-existing behavior. Instrumentation and a representable seed alone do not prove
-physical return.
+The scoped preparation and selected integral-gain experiment passed 153 focused
+tests and was staged while the motor owner was stopped. It uses the same
+qualified live owner, finite inward preparation, one fresh program seed and the
+unchanged original trajectory. The selected I1 experiment records its original
+registers before writing and verifies restoration to I0 with torque off.
+Actual powered preparation, return and four-cycle completion remain pending.
+
+A subsequent P1 capture acquired all 660 seconds and released normally, while
+its receiver failed after delayed return delivery and an SSH connection reset.
+Original source acquisition, JPEG, JSON and socket-write timings stayed fast at
+matched delay spikes. An original 20-second qualification window is retained
+separately from current stale status and the failed receiver verdict. The next
+declared transport experiment uses lossless SSH compression; forwarding-only
+reconnection must retain the same capture owner, generation, original nonce
+timestamps, finite deadline and three-reconnect budget. Neither experiment
+qualifies actual motion until current delivery and inspected framing pass.
 
 Plan: [AM1-03 executable plan](../superpowers/plans/2026-10-06-am1-reliability-03.md).
 Historical packet-02/01 evidence below retains its original verdicts.

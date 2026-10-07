@@ -415,6 +415,77 @@ def _ssh(alias: str) -> list[str]:
     ]
 
 
+def _observer_forward_command(alias, local_port, remote_port, *, compression=False, forwarding_only=False):
+    if any(type(port) is not int or not 1024 <= port <= 65535 for port in (local_port, remote_port)):
+        raise ValueError("invalid owned observer forwarding port")
+    options = ["-o", "ExitOnForwardFailure=yes", "-L", f"127.0.0.1:{local_port}:127.0.0.1:{remote_port}"]
+    if compression:
+        options += ["-o", "Compression=yes"]
+    if forwarding_only:
+        options += ["-N"]
+    return _ssh(alias)[:-1] + options + [alias]
+
+
+def _validate_capture_terminal(value, generation):
+    if (
+        not isinstance(value, dict)
+        or value.get("generation") != generation
+        or not isinstance(value.get("event"), str)
+        or value.get("event") not in {"complete", "failed"}
+        or type(value.get("camera_released")) is not bool
+        or type(value.get("success")) is not bool
+    ):
+        raise ValueError("observer final capture identity/status is invalid")
+    if (
+        value["event"] == "complete"
+        and (
+            value["success"] is not True
+            or value["camera_released"] is not True
+            or value.get("cleanup_errors")
+        )
+    ) or (value["event"] == "failed" and value["success"] is True):
+        raise ValueError("observer final capture event/status is contradictory")
+    return value
+
+
+def _fetch_capture_terminal(args, config, remote_dir, output, *, timeout):
+    # Read only the original owner's final artifact. This command cannot start a
+    # capture, change its finite duration, or create any new challenge authority.
+    path = remote_dir + "\\capture-metadata.json"
+    script = (
+        "$ProgressPreference='SilentlyContinue';$ErrorActionPreference='Stop';"
+        "[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);"
+        f"if($env:COMPUTERNAME -ne {_ps_quote(config['expected_host'])}){{throw 'Observer host mismatch'}};"
+        f"$p={_ps_quote(path)};"
+        "if(!(Test-Path -LiteralPath $p)){[Console]::Out.WriteLine('null');exit 0};"
+        f"if((Get-Item -LiteralPath $p).Length -gt {MAX_LINE_BYTES}){{throw 'Observer metadata size limit'}};"
+        "[Console]::Out.WriteLine([IO.File]::ReadAllText($p,[Text.Encoding]::UTF8))"
+    )
+    event = {"event": "final_metadata_read", "generation": args.generation}
+    try:
+        result = subprocess.run(
+            _ssh(args.ssh_host) + _powershell(script), capture_output=True, timeout=timeout
+        )
+        if result.returncode != 0:
+            raise ValueError("observer final metadata SSH read failed")
+        if len(result.stdout) > MAX_LINE_BYTES:
+            raise ValueError("observer final metadata size limit")
+        value = json.loads(result.stdout.decode("utf-8-sig"))
+        if value is None:
+            event["result"] = "not yet published"
+            return None
+        value = _validate_capture_terminal(value, args.generation)
+        event["result"] = "validated original terminal"
+        return value
+    except (OSError, UnicodeError, ValueError, subprocess.TimeoutExpired) as error:
+        event.update(result="unqualified", error_type=type(error).__name__, reason=str(error)[:250])
+        return None
+    finally:
+        event["received_wall_time_ms"] = _wall_time_ms()
+        with (output / "terminal-metadata-reads.ndjson").open("a", encoding="utf-8") as history:
+            history.write(json.dumps(event) + "\n")
+
+
 def close_delivery_and_wait(process, client, *, timeout: float) -> int:
     # SSH keeps forwarded channels alive after its remote command has exited.
     # Release this invocation's channel before waiting for its SSH transport.
@@ -501,19 +572,16 @@ def run_capture(args) -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
         probe.bind(("127.0.0.1", 0))
         local_port = probe.getsockname()[1]
-    command = (
-        _ssh(args.ssh_host)[:-1]
-        + [
-            "-o",
-            "ExitOnForwardFailure=yes",
-            "-L",
-            f"127.0.0.1:{local_port}:127.0.0.1:{remote_port}",
-            args.ssh_host,
-        ]
-        + _powershell(
-            "$ProgressPreference='SilentlyContinue';$ErrorActionPreference='Stop';"
-            f"& {_ps_quote(remote_script)} -ConfigPath {_ps_quote(remote_config)}"
-        )
+    compression = getattr(args, "delivery_compression", False) is True
+    _atomic_json(
+        output / "delivery-transport.json",
+        {"generation": args.generation, "delivery_compression": compression},
+    )
+    command = _observer_forward_command(
+        args.ssh_host, local_port, remote_port, compression=compression
+    ) + _powershell(
+        "$ProgressPreference='SilentlyContinue';$ErrorActionPreference='Stop';"
+        f"& {_ps_quote(remote_script)} -ConfigPath {_ps_quote(remote_config)}"
     )
     stopped = threading.Event()
     previous_handlers = {}
@@ -530,6 +598,15 @@ def run_capture(args) -> int:
     delivery_issues = 0
     max_rtt = max_capture_age = 0.0
     next_connection_attempt = 0.0
+    attempt_pending = False
+    forwarding_waiting = False
+    forward_process = None
+    forward_processes = []
+    forward_stderr = []
+    dead_transports = set()
+    first_transport_failure = None
+    next_metadata_read = 0.0
+    retired_forwarding = set()
 
     def enqueue(kind, line, epoch=0):
         item = (kind, line, time.perf_counter() * 1000, _wall_time_ms(), epoch)
@@ -584,6 +661,45 @@ def run_capture(args) -> int:
             )
         return success
 
+    def active_transport():
+        return forward_process if forward_process is not None else process
+
+    def lose_delivery(reason, now, *, transport_exit=None):
+        nonlocal connected, delivery_issues, loss_started, attempt_pending, forwarding_waiting
+        nonlocal first_transport_failure
+        if connected is None and loss_started is not None and not attempt_pending:
+            return
+        receiver.expire(now * 1000)
+        receiver._unqualify(reason)
+        receiver.challenges.clear()
+        if connected is not None:
+            with suppress(OSError):
+                connected.shutdown(socket.SHUT_RDWR)
+            connected.close()
+            connected = None
+        delivery_issues += 1
+        loss_started = now if loss_started is None else loss_started
+        attempt_pending = forwarding_waiting = False
+        if first_transport_failure is None:
+            first_transport_failure = {
+                "reason": reason,
+                "received_wall_time_ms": _wall_time_ms(),
+                "transport_exit_code": transport_exit,
+            }
+        with (output / "protocol-events.ndjson").open("a", encoding="utf-8") as history:
+            history.write(
+                json.dumps(
+                    {
+                        "event": "delivery_lost",
+                        "reason": reason,
+                        "received_wall_time_ms": _wall_time_ms(),
+                        "connection_epoch": connection_id,
+                        "transport_exit_code": transport_exit,
+                    }
+                )
+                + "\n"
+            )
+
     with (output / "capture.stderr").open("wb") as stderr:
         process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=stderr)
 
@@ -605,37 +721,113 @@ def run_capture(args) -> int:
                     now = time.perf_counter()
                     if (output / "stop.request").exists() or now - started >= args.duration_seconds + 60:
                         stopped.set()
+                    transport = active_transport()
+                    if (
+                        capture_started
+                        and forward_process is not None
+                        and transport.poll() is not None
+                        and id(transport) not in dead_transports
+                    ):
+                        dead_transports.add(id(transport))
+                        if not stopped.is_set():
+                            lose_delivery(
+                                "observer SSH transport exited", now, transport_exit=transport.returncode
+                            )
+                    if loss_started is not None and now - loss_started >= 5 and not stopped.is_set():
+                        failure = "observer same-capture delivery reconnect deadline"
+                        stopped.set()
                     if stopped.is_set() and stop_sent_at is None:
                         receiver.expire(now * 1000)
                         qualification_at_stop = receiver.current_contiguous_delivery_qualified
                         send({"event": "stop"})
                         stop_sent_at = now
                     if (
-                        not stopped.is_set()
-                        and capture_started
+                        capture_started
                         and connected is None
                         and now >= next_connection_attempt
+                        and (not stopped.is_set() or (attempt_pending and active_transport().poll() is None))
                     ):
                         next_connection_attempt = now + 0.25
-                        try:
-                            connected = socket.create_connection(("127.0.0.1", local_port), timeout=0.5)
-                            connected.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                            connected.settimeout(2)
-                            connection_id += 1
-                            threading.Thread(
-                                target=read_channel, args=(connected, connection_id), daemon=True
-                            ).start()
-                            if loss_started is not None:
-                                reconnect_count += 1
-                                loss_started = None
-                            receiver.challenges.clear()
-                            if stopped.is_set():
-                                send({"event": "stop"})
-                        except OSError:
-                            connected = None
-                            if loss_started is not None and now - loss_started > 5:
-                                failure = "observer same-capture delivery reconnect deadline"
+                        if loss_started is not None and not attempt_pending:
+                            if reconnect_count >= 3:
+                                failure = "observer same-capture reconnect attempt limit"
                                 stopped.set()
+                            else:
+                                reconnect_count += 1
+                                attempt_pending = True
+                                if active_transport().poll() is not None:
+                                    stream = (output / f"forward-reattach-{reconnect_count}.stderr").open(
+                                        "wb"
+                                    )
+                                    forward_stderr.append(stream)
+                                    forward_process = subprocess.Popen(
+                                        _observer_forward_command(
+                                            args.ssh_host,
+                                            local_port,
+                                            remote_port,
+                                            compression=compression,
+                                            forwarding_only=True,
+                                        ),
+                                        stdin=subprocess.DEVNULL,
+                                        stdout=subprocess.DEVNULL,
+                                        stderr=stream,
+                                    )
+                                    forward_processes.append(forward_process)
+                                    forwarding_waiting = True
+                                    with (output / "protocol-events.ndjson").open(
+                                        "a", encoding="utf-8"
+                                    ) as protocol:
+                                        protocol.write(
+                                            json.dumps(
+                                                {
+                                                    "event": "forward_reattach_started",
+                                                    "attempt": reconnect_count,
+                                                    "generation": args.generation,
+                                                    "received_wall_time_ms": _wall_time_ms(),
+                                                }
+                                            )
+                                            + "\n"
+                                        )
+                        if not stopped.is_set() or attempt_pending:
+                            try:
+                                connected = socket.create_connection(("127.0.0.1", local_port), timeout=0.5)
+                                connected.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                                connected.settimeout(2)
+                                connection_id += 1
+                                threading.Thread(
+                                    target=read_channel, args=(connected, connection_id), daemon=True
+                                ).start()
+                                receiver.challenges.clear()
+                                forwarding_waiting = False
+                                if stopped.is_set():
+                                    send({"event": "stop"})
+                            except OSError:
+                                connected = None
+                                if not forwarding_waiting:
+                                    attempt_pending = False
+                    if (
+                        (forward_process is not None or id(process) in dead_transports)
+                        and connected is None
+                        and now >= next_metadata_read
+                    ):
+                        deadline = (
+                            stop_sent_at + 45
+                            if stop_sent_at is not None
+                            else (loss_started + 5 if loss_started is not None else now + 1)
+                        )
+                        remaining = deadline - time.perf_counter()
+                        if remaining > 0:
+                            fetched = _fetch_capture_terminal(
+                                args, config, remote_dir, output, timeout=min(1.0, remaining)
+                            )
+                            next_metadata_read = time.perf_counter() + 0.25
+                            if fetched is not None:
+                                terminal = fetched
+                                receiver.terminal(terminal)
+                                _atomic_json(output / "capture-result.json", terminal)
+                                if terminal["event"] == "failed" or terminal["success"] is not True:
+                                    failure = failure or "observer source capture failed"
+                                break
                     if not stopped.is_set() and connected is not None and now >= next_challenge:
                         counter += 1
                         nonce = f"challenge-{counter}"
@@ -660,7 +852,8 @@ def run_capture(args) -> int:
                     try:
                         item = messages.get(timeout=0.025)
                     except queue.Empty:
-                        if process.poll() is not None:
+                        if not capture_started and process.poll() is not None:
+                            failure = "observer SSH closed before capture start"
                             break
                         continue
                     if item is None:
@@ -671,15 +864,14 @@ def run_capture(args) -> int:
                         stopped.set()
                         continue
                     if kind == "transport_lost":
-                        if epoch == connection_id and connected is not None and not stopped.is_set():
-                            receiver._unqualify("observer delivery connection lost")
-                            connected.close()
-                            connected = None
-                            delivery_issues += 1
-                            loss_started = now
-                            if reconnect_count >= 3:
-                                failure = "observer same-capture reconnect attempt limit"
-                                stopped.set()
+                        if epoch == connection_id and connected is not None:
+                            if stopped.is_set():
+                                with suppress(OSError):
+                                    connected.shutdown(socket.SHUT_RDWR)
+                                connected.close()
+                                connected = None
+                            else:
+                                lose_delivery("observer delivery connection lost", now)
                         continue
                     if kind == "transport_error":
                         with (output / "protocol-events.ndjson").open("a", encoding="utf-8") as protocol:
@@ -696,7 +888,15 @@ def run_capture(args) -> int:
                             )
                         continue
                     if kind == "ssh_closed":
-                        break
+                        if not capture_started:
+                            failure = "observer SSH closed before capture start"
+                            break
+                        dead_transports.add(id(process))
+                        if terminal is None and forward_process is None and not stopped.is_set():
+                            lose_delivery(
+                                "observer owner SSH stdout closed", now, transport_exit=process.poll()
+                            )
+                        continue
                     value = json.loads(line)
                     if not isinstance(value, dict):
                         raise ValueError("observer protocol must be an object")
@@ -731,14 +931,31 @@ def run_capture(args) -> int:
                         )
                         history.flush()
                         if accepted:
+                            loss_started = None
+                            attempt_pending = forwarding_waiting = False
                             max_rtt = max(max_rtt, receiver.state["round_trip_ms"])
                             max_capture_age = max(max_capture_age, receiver.state["capture_age_ms"])
                     elif value.get("event") in ("complete", "failed"):
-                        terminal = value
-                        receiver.terminal(value)
+                        terminal = _validate_capture_terminal(value, args.generation)
+                        receiver.terminal(terminal)
                         _atomic_json(output / "capture-result.json", value)
+                        if terminal["event"] == "failed" or terminal["success"] is not True:
+                            failure = failure or "observer source capture failed"
                         break
                     elif value.get("event") == "ending":
+                        ending_now = time.perf_counter()
+                        if stop_sent_at is None:
+                            receiver.expire(ending_now * 1000)
+                            qualification_at_stop = receiver.current_contiguous_delivery_qualified
+                            stop_sent_at = ending_now
+                        _atomic_json(
+                            output / "capture-ending.json",
+                            {
+                                "source": value,
+                                "received_wall_time_ms": received_wall,
+                                "qualification_checked_monotonic_ms": ending_now * 1000,
+                            },
+                        )
                         stopped.set()
                         receiver._unqualify("observer capture ending")
                     elif value.get("event") == "started":
@@ -765,6 +982,17 @@ def run_capture(args) -> int:
                     failure = failure or "observer SSH release unknown; remote finite ceiling retained"
             if connected is not None:
                 connected.close()
+            for transport in forward_processes:
+                if transport.poll() is None:
+                    retired_forwarding.add(id(transport))
+                    transport.terminate()  # This process owns only a local SSH forward, never the capture.
+                    try:
+                        transport.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        transport.kill()
+                        transport.wait(timeout=5)
+            for stream in forward_stderr:
+                stream.close()
             receiver.terminal(terminal or {"event": "failed", "generation": args.generation})
             for signum, handler in previous_handlers.items():
                 signal.signal(signum, handler)
@@ -773,10 +1001,14 @@ def run_capture(args) -> int:
         "accepted_frames": receiver.accepted_frames,
         "rejected_frames": receiver.rejected_frames,
         "challenges_issued": counter,
-        "ssh_exit_code": process.returncode,
+        "ssh_exit_code": active_transport().returncode,
+        "owner_ssh_exit_code": process.returncode,
+        "forwarding_retired": id(active_transport()) in retired_forwarding,
+        "first_transport_failure": first_transport_failure,
+        "delivery_compression": compression,
         "failure": failure,
-        "camera_released": bool(terminal and terminal.get("camera_released")),
-        "capture_success": bool(terminal and terminal.get("success")),
+        "camera_released": terminal is not None and terminal.get("camera_released") is True,
+        "capture_success": terminal is not None and terminal.get("success") is True,
         "continuous_delivery_qualified": receiver.continuous_delivery_qualified and delivery_issues == 0,
         "qualification_at_stop": qualification_at_stop,
         "current_contiguous_delivery_qualified": receiver.current_contiguous_delivery_qualified,
@@ -804,7 +1036,7 @@ def run_capture(args) -> int:
     return (
         0
         if not failure
-        and process.returncode == 0
+        and (active_transport().returncode == 0 or id(active_transport()) in retired_forwarding)
         and summary["camera_released"]
         and summary["capture_success"]
         and summary["qualification_at_stop"]
@@ -1285,6 +1517,11 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--generation", default=uuid.uuid4().hex)
     parser.add_argument("--duration-seconds", type=int, default=660)
+    parser.add_argument(
+        "--delivery-compression",
+        action="store_true",
+        help="Use compression only on this capture's SSH forwarding transports",
+    )
     offline = parser.add_mutually_exclusive_group()
     offline.add_argument("--retrieve-only", action="store_true")
     offline.add_argument("--export-events", action="store_true")
