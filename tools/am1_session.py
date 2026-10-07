@@ -157,6 +157,12 @@ def parse_duration_seconds(value: object) -> int:
 def validate_leader_selection(
     leader_source: str, motion_profile: str | None, duration_seconds: int | None = None,
 ) -> None:
+    preparation = os.environ.get("AM1_SCRIPTED_PREPARE") == "1"
+    integral_test = os.environ.get("AM1_SHOULDER_INTEGRAL_TEST") == "1"
+    if integral_test and (not preparation or os.environ.get("AM1_LEFT_SHOULDER_EVIDENCE") != "1"):
+        raise ValueError("AM1 integral experiment requires explicit preparation and shoulder evidence.")
+    if preparation and (leader_source != "scripted" or motion_profile not in {"ArmSmoke", "ArmSmokeRepeat"}):
+        raise ValueError("AM1 preparation requires scripted ArmSmoke or ArmSmokeRepeat.")
     if leader_source not in {"physical", "scripted"}:
         raise ValueError("Leader source must be physical or scripted.")
     if leader_source == "scripted" and motion_profile not in {"ArmSmoke", "ArmSmokeRepeat", "ArmHoldBody"}:
@@ -792,8 +798,13 @@ class SSHRemote:
         if client_trace is not None:
             command.extend(["-v", "-E", str(client_trace)])
         command.append(self.config.ssh_target)
-        if os.environ.get("AM1_LEFT_SHOULDER_EVIDENCE") == "1":
-            command.extend(["env", "AM1_LEFT_SHOULDER_EVIDENCE=1"])
+        experiment_env = [
+            f"{name}=1" for name in (
+                "AM1_LEFT_SHOULDER_EVIDENCE", "AM1_SCRIPTED_PREPARE", "AM1_SHOULDER_INTEGRAL_TEST",
+            ) if os.environ.get(name) == "1"
+        ]
+        if experiment_env:
+            command.extend(["env", *experiment_env])
         command.extend([
             self.config.remote_python,
             self.config.remote_helper,

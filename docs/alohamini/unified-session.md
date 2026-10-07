@@ -45,9 +45,26 @@ declare inspected current scene coverage in addition to P1 arms/lift coverage.
 Software validation currently includes nine loaded real HTTP/frontend/native
 pipe cases and 49 camera/pure-policy Node tests. These cover optional degradation,
 required observation hold/recovery, explicit operator refusal, scripted body
-commands, refused Start and existing packet-02 behavior. Powered packet-03
-motion and final observer delivery qualification remain pending; these tests
-do not establish shoulder return or four-cycle completion.
+commands, refused Start and existing packet-02 behavior. The first packet-03
+thirty-second powered diagnostic completed with verified cleanup and one
+qualified same-session observation recovery. Continuous P1 recording covered
+the run; selected event images and clips were retained and inspected. The
+observer's current startup window qualified separately from cumulative earlier
+gaps. Its uninterrupted-delivery verdict remains separate from recovered motion.
+
+The diagnostic exposed feedback clipping at the arm command range, which hid
+actual movement and return error. AM1 feedback now retains the calibrated affine
+measurement beyond command endpoints; command range and current/relative limits
+remain enforced. Encoded targets round inward within the existing relative
+limit, and incompatible protected holds refuse before either arm write.
+Actual shoulder return and the four-cycle workload remain pending.
+
+A scoped preparation experiment is being reviewed before deployment. It uses
+the same qualified live owner, finite inward preparation, one fresh program seed
+and the unchanged original trajectory. Selected integral-gain qualification and
+torque-off rollback are explicit; ordinary manual/body profiles retain their
+existing behavior. Instrumentation and a representable seed alone do not prove
+physical return.
 
 Plan: [AM1-03 executable plan](../superpowers/plans/2026-10-06-am1-reliability-03.md).
 Historical packet-02/01 evidence below retains its original verdicts.
