@@ -28,6 +28,8 @@ assert(!(headless && target.port === "8765"), "Powered console bench requires th
   const browser = await chromium.launch({headless, channel:"msedge", args:["--no-proxy-server"]});
   const page = await browser.newPage({viewport:{width:1440, height:1000}});
   const records = [], pulses = [];
+  const frontendStateNetwork = {http_status_counts:{}, request_failure_count:0};
+  let uncaughtPageErrorCount = 0;
   let ownedSession = null, startRefusal = null, startCount = 0, droppedRecords = 0, cancelled = false;
   let final = null, failure = null;
   let viewsRequired = false;
@@ -68,6 +70,14 @@ assert(!(headless && target.port === "8765"), "Powered console bench requires th
     }
   });
   page.on("response", async response => {
+    // Passive page events exclude the runner's APIRequestContext monitor reads.
+    // Keep finite status counters and bounded failures, without headers or bodies.
+    if (new URL(response.url()).pathname === "/api/state") {
+      const status = response.status();
+      frontendStateNetwork.http_status_counts[status] = (frontendStateNetwork.http_status_counts[status] || 0) + 1;
+      if (!response.ok()) keep({event:"frontend_state_http_error", status});
+      return;
+    }
     if (!response.url().endsWith("/api/operation")) return;
     try {
       const request = response.request().postDataJSON(), result = await response.json();
@@ -81,6 +91,15 @@ assert(!(headless && target.port === "8765"), "Powered console bench requires th
       keep({event:"operation_result", kind:request.kind, accepted:result.accepted,
             session_id:result.session_id, reason:result.reason});
     } catch { /* The ordinary frontend handles failed requests and releases input. */ }
+  });
+  page.on("requestfailed", request => {
+    if (new URL(request.url()).pathname !== "/api/state") return;
+    frontendStateNetwork.request_failure_count++;
+    keep({event:"frontend_state_request_failed", reason:request.failure()?.errorText?.slice(0, 240)});
+  });
+  page.on("pageerror", error => {
+    uncaughtPageErrorCount++;
+    keep({event:"uncaught_page_error", name:error.name, message:error.message.slice(0, 240)});
   });
   const read = async (verifySource = true) => {
     const state = await (await page.request.get(`${address}api/state`, {
@@ -198,6 +217,7 @@ assert(!(headless && target.port === "8765"), "Powered console bench requires th
       started_wall_time_ms:startedAt, finished_wall_time_ms:Date.now(), start_count:startCount,
       expected_windows_head:expectedWindowsHead, failure, final_phase:final?.phase,
       final_exit_code:final?.final_exit_code, cleanup_verified:final?.cleanup_verified,
+      frontend_state_network:frontendStateNetwork, uncaught_page_error_count:uncaughtPageErrorCount,
       pulses, dropped_records:droppedRecords, records}, null, 2)); }
     finally {
       process.off("SIGINT", cancel);

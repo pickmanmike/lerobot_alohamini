@@ -737,7 +737,7 @@ def test_bench_refuses_unqualified_native_duration_before_browser(tmp_path, scen
 @pytest.mark.skipif(sys.platform != "win32", reason="Actual AF_PIPE is Windows-only")
 @pytest.mark.parametrize("case", ["healthy", "navigation", "blur", "hidden", "body-delay",
                                       "body-presence-loss", "short-browser-stall",
-                                      "body-reject", "body-denied", "state-reject", "state-delay", "pending-stop", "camera-delay", "approval-order", "startup-approval", "bench-body", "bench-arm", "bench-arm-short", "bench-repeat", "bench-physical", "bench-pause", "bench-foreign", "bench-monitor-failure", "bench-camera-loss", "bench-finalize", "bench-finalize-stall", "bench-finalize-late-result"])
+                                      "body-reject", "body-denied", "state-reject", "state-delay", "pending-stop", "camera-delay", "approval-order", "startup-approval", "bench-body", "bench-arm", "bench-arm-short", "bench-repeat", "bench-physical", "bench-pause", "bench-foreign", "bench-monitor-failure", "bench-frontend-state-reject", "bench-frontend-state-reset", "bench-camera-loss", "bench-finalize", "bench-finalize-stall", "bench-finalize-late-result"])
 def test_browser_loopback_native_path(tmp_path, case):
     node = shutil.which("node")
     if not node or subprocess.run([node, "-e", "require('playwright')"], capture_output=True).returncode:
@@ -805,6 +805,21 @@ def test_browser_loopback_native_path(tmp_path, case):
                     return
                 super().do_GET()
         server.RequestHandlerClass = FailedBenchReads
+    if case in {"bench-frontend-state-reject", "bench-frontend-state-reset"}:
+        failures = [False]
+        session.on_live = lambda: failures.__setitem__(0, True)
+        class FailedFrontendReads(ConsoleHandler):
+            def do_GET(self):  # noqa: N802 — BaseHTTPRequestHandler requires this method name.
+                if self.path == "/api/state" and not self.headers.get("X-AM1-Bench-Monitor") and failures[0]:
+                    if case == "bench-frontend-state-reject":
+                        self.send_error(503, "Fake frontend read failure")
+                    else:
+                        self.close_connection = True
+                        self.connection.shutdown(2)
+                        self.connection.close()
+                    return
+                super().do_GET()
+        server.RequestHandlerClass = FailedFrontendReads
     if case == "bench-finalize-late-result":
         delayed = [False]
         class LateTerminalRead(ConsoleHandler):
@@ -855,13 +870,27 @@ def test_browser_loopback_native_path(tmp_path, case):
             assert evidence["cleanup_verified"] is True
             operations = [record["kind"] for record in evidence["records"] if record["event"] == "operation_result"]
             assert not {"Resume", "Approve", "ClaimInput"}.intersection(operations)
-            if case in {"bench-pause", "bench-monitor-failure", "bench-camera-loss", "bench-finalize-stall", "bench-finalize-late-result"}:
+            if case in {"bench-pause", "bench-monitor-failure", "bench-frontend-state-reject", "bench-frontend-state-reset", "bench-camera-loss", "bench-finalize-stall", "bench-finalize-late-result"}:
                 assert result.returncode == 1
                 assert evidence["failure"]
                 if case in {"bench-pause", "bench-monitor-failure"}:
                     assert evidence["pulses"] == []
                 elif case == "bench-camera-loss":
                     assert "Required camera view lost" in evidence["failure"]
+                elif case in {"bench-frontend-state-reject", "bench-frontend-state-reset"}:
+                    assert any(record.get("input_pause_reason") == "state-request-failed"
+                               for record in evidence["records"])
+                    network = evidence["frontend_state_network"]
+                    assert network["http_status_counts"]["200"] > 0
+                    if case == "bench-frontend-state-reject":
+                        assert network["http_status_counts"]["503"] > 0
+                        assert network["request_failure_count"] == 0
+                        assert any(record["event"] == "frontend_state_http_error" and record["status"] == 503
+                                   for record in evidence["records"])
+                    else:
+                        assert network["request_failure_count"] > 0
+                        assert any(record["event"] == "frontend_state_request_failed" and record["reason"]
+                                   for record in evidence["records"])
                 else:
                     assert "finalization deadline" in evidence["failure"]
                 if case != "bench-finalize-late-result":
@@ -877,7 +906,7 @@ def test_browser_loopback_native_path(tmp_path, case):
                 else:
                     assert session.start_requests == ([(arm_duration, "scripted", "ArmSmoke")] if arm_bench else [(12, "physical", None)])
                 assert [pulse["key"] for pulse in evidence["pulses"]] == ([] if arm_bench else ["w", "a", "u", "j"])
-        if case not in {"bench-pause", "bench-monitor-failure", "bench-camera-loss", "bench-finalize-stall", "bench-finalize-late-result"}:
+        if case not in {"bench-pause", "bench-monitor-failure", "bench-frontend-state-reject", "bench-frontend-state-reset", "bench-camera-loss", "bench-finalize-stall", "bench-finalize-late-result"}:
             assert result.returncode == 0, result.stdout + result.stderr + f"\nServer body arrivals: {intervals[-20:]}"
         assert session.error is None
         assert FakeCamera.requests > before
