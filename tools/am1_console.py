@@ -25,7 +25,7 @@ from pathlib import PurePosixPath
 from urllib.parse import parse_qs, urlsplit
 
 from tools.am1_console_model import ConsoleProgress, ConsoleSnapshot
-from tools.am1_virtual_bench import VirtualBenchPolicy
+from tools.am1_virtual_bench import VirtualBenchPolicy, local_wall_time_ms
 
 
 MAX_CONSOLE_LOG_BYTES = 2_000_000
@@ -267,12 +267,12 @@ class ConsoleSessionAdapter:
         # Prepared Start is the operator's approval for ordinary qualified
         # progression; actual camera/host events still must precede each gate.
         if self._bench_policy is not None and stage in {"camera_ready", "host_ready"}:
-            deadline = time.monotonic() + 10
-            while not cancel() and time.monotonic() < deadline:
+            deadline = time.perf_counter() + 10
+            while not cancel() and time.perf_counter() < deadline:
                 with self._bench_lock:
-                    covered = self._bench_policy.observer(now=time.monotonic(), wall_ms=time.time_ns()/1e6,
-                                                           clock=time.monotonic, wall_clock_ms=lambda:time.time_ns()/1e6)
-                    covered = covered and self._bench_policy.camera_qualified(time.monotonic())
+                    covered = self._bench_policy.observer(now=time.perf_counter(), wall_ms=local_wall_time_ms(),
+                                                           clock=time.perf_counter, wall_clock_ms=local_wall_time_ms)
+                    covered = covered and self._bench_policy.camera_qualified(time.perf_counter())
                 if covered:
                     return True
                 self._bench_stop.wait(.1)
@@ -283,16 +283,16 @@ class ConsoleSessionAdapter:
         with self._bench_lock:
             if self._bench_policy is None:
                 return None
-            evaluated_at = time.monotonic()
-            status = self._bench_policy.evaluate(state, now=evaluated_at, wall_ms=time.time_ns()/1e6,
-                                                 clock=time.monotonic, wall_clock_ms=lambda:time.time_ns()/1e6)
+            evaluated_at = time.perf_counter()
+            status = self._bench_policy.evaluate(state, now=evaluated_at, wall_ms=local_wall_time_ms(),
+                                                 clock=time.perf_counter, wall_clock_ms=local_wall_time_ms)
             self._bench_gate_status = (status["required_coverage_qualified"],
                                        min(evaluated_at + .25, self._bench_policy.coverage_expires_at()))
             return status
 
     def _bench_prepared_gate_qualified(self):
         qualified, expires_at = self._bench_gate_status
-        return qualified and time.monotonic() <= expires_at
+        return qualified and time.perf_counter() <= expires_at
 
     def _bench_monitor(self, session_id):
         try:
@@ -529,7 +529,7 @@ class ConsoleSessionAdapter:
                 return {"accepted":False, "reason":"virtual bench owner is unavailable"}
             if kind == "BenchCoverage":
                 with self._bench_lock:
-                    qualified = self._bench_policy.cameras(payload.get("camera_health"), now=time.monotonic())
+                    qualified = self._bench_policy.cameras(payload.get("camera_health"), now=time.perf_counter())
                 return {"accepted":True, "qualified":qualified}
             bridge.request_pause("bench required coverage")
             return {"accepted":True, "phase":"pausing"}
@@ -598,8 +598,8 @@ class ConsoleSessionAdapter:
                         allowed = (isinstance(evidence, dict) and stage == "resume"
                                    and host_epoch == evidence.get("host_epoch")
                                    and self._bench_policy.approval(evidence, current_state,
-                                       now=time.monotonic(), wall_ms=time.time_ns()/1e6,
-                                       clock=time.monotonic, wall_clock_ms=lambda:time.time_ns()/1e6))
+                                       now=time.perf_counter(), wall_ms=local_wall_time_ms(),
+                                       clock=time.perf_counter, wall_clock_ms=local_wall_time_ms))
                         if not allowed:
                             return {"accepted":False, "reason":"bench recovery qualification refused"}
                     else:

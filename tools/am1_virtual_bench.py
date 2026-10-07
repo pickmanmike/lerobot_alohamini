@@ -6,10 +6,19 @@ The caller owns hold/stop operations and the native runtime still qualifies resu
 
 from __future__ import annotations
 
+import ctypes
 import json
 import math
+import os
 import re
+import time
 from pathlib import Path
+
+if os.name == "nt":
+    _precise_file_time = ctypes.WinDLL("kernel32").GetSystemTimePreciseAsFileTime
+    _precise_file_time.argtypes = [ctypes.POINTER(ctypes.c_uint64)]
+    _precise_file_time.restype = None
+
 
 CAUSES = frozenset({"bench required coverage", "state-request-failed"})
 ROLES = frozenset({"forward", "backward", "chest", "wrist_left", "wrist_right"})
@@ -17,6 +26,39 @@ ROLES = frozenset({"forward", "backward", "chest", "wrist_left", "wrist_right"})
 
 def number(value):
     return type(value) in (int, float) and math.isfinite(value)
+
+
+def local_wall_time_ms():
+    """Original local UTC receipt/sample time with sub-millisecond Windows resolution."""
+    if os.name != "nt":
+        return time.time_ns() // 1_000_000
+    stamp = ctypes.c_uint64()
+    _precise_file_time(ctypes.byref(stamp))
+    return (stamp.value - 116444736000000000) // 10000
+
+
+def observer_capture_age_upper_bound(data):
+    """Subtract only a causally enclosed same-P1 QPC duration from local RTT."""
+    age, rtt = data.get("capture_age_ms"), data.get("round_trip_ms")
+    if not all(number(value) for value in (age, rtt)) or age < 0 or not 0 <= rtt <= 750:
+        return None
+    if "timing_basis" not in data:
+        return max(age, rtt)
+    resolution = data.get("local_clock_resolution_ms")
+    source, challenge = data.get("source_system_relative_ticks"), data.get("challenge_received_qpc_ticks")
+    if (
+        data.get("timing_basis") != "qpc_elapsed_v1"
+        or not number(resolution)
+        or not 0 < resolution <= 0.01
+        or any(type(value) is not int or not 0 < value <= 2**53 - 1 for value in (source, challenge))
+    ):
+        return None
+    elapsed = (source - challenge) / 10000
+    # The fixed margin covers timestamp conversion/UTC millisecond flooring;
+    # it adds to the upper bound and never widens the 500 ms authority limit.
+    if not 0 < elapsed <= rtt or elapsed + age > rtt + 1:
+        return None
+    return max(age, rtt - elapsed + 1)
 
 
 class VirtualBenchPolicy:
@@ -99,6 +141,7 @@ class VirtualBenchPolicy:
             self._last_observer_record = None
             return False
         seq, ticks = data.get("sequence"), data.get("source_system_relative_ticks")
+        age_upper = observer_capture_age_upper_bound(data)
         age, rtt, receipt = (
             data.get(k) for k in ("capture_age_ms", "round_trip_ms", "received_wall_time_ms")
         )
@@ -111,7 +154,8 @@ class VirtualBenchPolicy:
             or ticks < 0
             or not all(number(v) for v in (age, rtt, receipt))
             or not 0 <= wall_ms - receipt <= 1000
-            or not 0 <= max(age, rtt) + wall_ms - receipt <= 500
+            or age_upper is None
+            or not 0 <= age_upper + wall_ms - receipt <= 500
             or not 0 <= rtt <= 750
         ):
             self._last_observer_record = None
@@ -126,7 +170,7 @@ class VirtualBenchPolicy:
         if qualified:
             self._last_observer_record = data
             self.observer_expires_at = min(
-                now + (500 - max(age, rtt) - wall_ms + receipt) / 1000,
+                now + (500 - age_upper - wall_ms + receipt) / 1000,
                 now + (1000 - wall_ms + receipt) / 1000,
                 self.advanced_at + 1,
             )

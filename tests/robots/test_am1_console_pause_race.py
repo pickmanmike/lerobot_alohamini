@@ -62,20 +62,23 @@ def test_active_ack_after_episode_deadline_cannot_erase_recovery_budget(tmp_path
 
 
 def test_delayed_observation_evaluation_cannot_freshen_prepared_gate_snapshot(monkeypatch, tmp_path):
-    clock = SimpleNamespace(now=100.0)
+    clock_state = SimpleNamespace(now=100.0)
     monkeypatch.setattr(
         console,
         "time",
         SimpleNamespace(
-            monotonic=lambda: clock.now,
-            time_ns=lambda: int(clock.now * 1e9),
+            monotonic=lambda: 100.0,  # Coarse clock can remain frozen while QPC advances.
+            perf_counter=lambda: clock_state.now,
+            time_ns=lambda: int(clock_state.now * 1e9),
         ),
     )
 
+    monkeypatch.setattr(console, "local_wall_time_ms", lambda: int(clock_state.now * 1000))
+
     class Policy:
-        def evaluate(self, state, *, now, wall_ms):
+        def evaluate(self, state, *, now, wall_ms, clock, wall_clock_ms):
             assert now == 100.0
-            clock.now += 0.3  # Finite file-read or scheduling delay after the age check.
+            clock_state.now += 0.3  # Finite file-read or scheduling delay after the age check.
             return {"required_coverage_qualified": True}
 
         def coverage_expires_at(self):

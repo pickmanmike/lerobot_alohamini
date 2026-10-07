@@ -23,8 +23,13 @@ observer evidence, focused review/tests and exact deployment/publication proof.
 Do not substitute another diagnostic-only result for this completion loop.
 
 The explicit virtual bench uses numeric role health and a fresh nonce-qualified
-P1 image. Its required coverage has a 500 ms causal age bound, including
-challenge round-trip transit. Transient Windows health-file sharing refusals
+P1 image. Required coverage keeps a 500 ms causal source-age bound. Tagged
+precise local QPC round trips subtract only the original same-P1 elapsed time
+between challenge receipt and capture, with a conservative one-millisecond
+precision margin and contradiction checks; legacy records retain the full
+round-trip bound. Startup stabilization requires a current continuous twenty
+seconds of fresh delivery. Cumulative startup gaps and the whole-invocation
+uninterrupted verdict remain separate from that current qualification. Transient Windows health-file sharing refusals
 retain only an accepted record until its original expiry and expose uncertainty.
 All five camera views remain a separate quality result; optional view loss has
 bounded role-local reconnects. Required coverage loss freezes the existing
@@ -38,7 +43,7 @@ scripted arm profiles continue to send zero body velocity. Body execution must
 declare inspected current scene coverage in addition to P1 arms/lift coverage.
 
 Software validation currently includes nine loaded real HTTP/frontend/native
-pipe cases and 47 camera/pure-policy Node tests. These cover optional degradation,
+pipe cases and 49 camera/pure-policy Node tests. These cover optional degradation,
 required observation hold/recovery, explicit operator refusal, scripted body
 commands, refused Start and existing packet-02 behavior. Powered packet-03
 motion and final observer delivery qualification remain pending; these tests

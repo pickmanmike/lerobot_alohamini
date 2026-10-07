@@ -99,3 +99,26 @@ test("transient Windows read refusal retains only accepted original observer clo
   assert.equal(invalid.observe({...observer(3,10600),running:false},cameras(),10600,600).required_coverage_qualified,false);
   assert.equal(invalid.observe(null,cameras(),10700,700,"EACCES").required_coverage_qualified,false);
 });
+
+
+test("same-P1 QPC duration excludes pre-capture time without renewing original expiry",()=>{
+  const policy=new VirtualObservationPolicy(config());
+  const pair=(seq)=>({...observer(seq),timing_basis:"qpc_elapsed_v1",local_clock_resolution_ms:.0001,source_system_relative_ticks:(seq+1)*1000000,
+    challenge_received_qpc_ticks:seq*1000000,capture_age_ms:300,round_trip_ms:550,source_age_upper_bound_ms:1});
+  assert.equal(policy.observe(pair(1),cameras(),10000,0).required_coverage_qualified,false);
+  const result=policy.observe(pair(2),cameras(),10000,100);
+  assert.equal(result.required_coverage_qualified,true);
+  assert.equal(result.observer.effective_capture_age_ms,451);
+  assert.equal(policy.observe(pair(2),cameras(),10048,148).required_coverage_qualified,true);
+  assert.equal(policy.observe(pair(2),cameras(),10050,150).required_coverage_qualified,false);
+});
+test("unknown clock and contradictory P1 intervals cannot qualify through an age claim",()=>{
+  for(const change of [{timing_basis:"foreign_clock"},{local_clock_resolution_ms:15.625},{local_clock_resolution_ms:null},{challenge_received_qpc_ticks:0},
+                       {challenge_received_qpc_ticks:3000000},{challenge_received_qpc_ticks:3000001},
+                       {capture_age_ms:300,round_trip_ms:350},{round_trip_ms:99},{round_trip_ms:751}]) {
+    const policy=readyPolicy();
+    const sample={...observer(3,11000),timing_basis:"qpc_elapsed_v1",local_clock_resolution_ms:.0001,source_system_relative_ticks:3000000,
+      challenge_received_qpc_ticks:2000000,capture_age_ms:200,round_trip_ms:350,source_age_upper_bound_ms:1,...change};
+    assert.equal(policy.observe(sample,cameras(),11000,1000).required_coverage_qualified,false,JSON.stringify(change));
+  }
+});

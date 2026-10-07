@@ -30,6 +30,17 @@ function cameraRoleQualified(health, role, required=false) {
     Number.isFinite(item.source_age_ms) && item.source_age_ms>=0 && (!required || item.source_age_ms<=500) &&
     Number.isFinite(health.status_received_age_ms) && health.status_received_age_ms>=0 && health.status_received_age_ms<=2000;
 }
+function observerCaptureAgeUpperBound(data) {
+  const age=data?.capture_age_ms, rtt=data?.round_trip_ms;
+  if (!Number.isFinite(age) || age<0 || !Number.isFinite(rtt) || rtt<0 || rtt>750) return null;
+  if (!Object.hasOwn(data,"timing_basis")) return Math.max(age,rtt);
+  const resolution=data.local_clock_resolution_ms, source=data.source_system_relative_ticks, challenge=data.challenge_received_qpc_ticks;
+  if (data.timing_basis!=="qpc_elapsed_v1" || !Number.isFinite(resolution) || resolution<=0 || resolution>.01 ||
+      !Number.isSafeInteger(source) || source<=0 || !Number.isSafeInteger(challenge) || challenge<=0) return null;
+  const elapsed=(source-challenge)/10000;
+  if (elapsed<=0 || elapsed>rtt || elapsed+age>rtt+1) return null;
+  return Math.max(age,rtt-elapsed+1);
+}
 class VirtualObservationPolicy {
   constructor(config) { this.config=validateVirtualConfig(config); this.lastSequence=null; this.lastSourceTicks=null; this.lastAdvance=null;
     this.advanceCount=0; this.observerRegressed=false; this.acceptedObserver=null; this.reconnections=new Map(); }
@@ -41,8 +52,8 @@ class VirtualObservationPolicy {
     let reason=null;
     const finite=value=>Number.isFinite(value) && value>=0;
     const receiptAge=finite(observer?.received_wall_time_ms) ? wallNow-observer.received_wall_time_ms : null;
-    const captureAge=finite(observer?.capture_age_ms) && finite(observer?.round_trip_ms) && finite(receiptAge) ?
-      Math.max(observer.capture_age_ms,observer.round_trip_ms)+receiptAge : null;
+    const sourceAgeUpper=observerCaptureAgeUpperBound(observer);
+    const captureAge=sourceAgeUpper!==null && finite(receiptAge) ? sourceAgeUpper+receiptAge : null;
     if (!observer || observer.generation!==this.config.observer_generation) reason="observer generation";
     else if (!observer.running || !observer.recording || observer.challenge_qualified!==true ||
              typeof observer.nonce!=="string" || observer.nonce.length<1 || observer.nonce.length>128) reason="observer challenge";
@@ -65,7 +76,7 @@ class VirtualObservationPolicy {
     const degraded=CAMERA_ROLES.filter(role=>!cameraRoleQualified(cameras,role));
     const missing=this.config.required_camera_roles.filter(role=>!cameraRoleQualified(cameras,role,true));
     const observerResult={qualified:reason===null,reason,metadata_uncertain:metadataUncertain,generation:observer?.generation??null,sequence:observer?.sequence??null,
-      capture_age_ms:observer?.capture_age_ms??null,effective_capture_age_ms:captureAge,
+      capture_age_ms:observer?.capture_age_ms??null,source_age_upper_bound_ms:sourceAgeUpper,effective_capture_age_ms:captureAge,
       round_trip_ms:observer?.round_trip_ms??null,receipt_age_ms:receiptAge,
       local_sequence_age_ms:this.lastAdvance===null?null:monotonicNow-this.lastAdvance};
     return {required_coverage_qualified:reason===null && missing.length===0,observer:observerResult,

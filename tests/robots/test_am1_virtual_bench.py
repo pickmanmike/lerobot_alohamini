@@ -300,3 +300,52 @@ def test_recovery_rechecks_original_observer_deadline_after_preemption(tmp_path)
     assert p.observer_expires_at == pytest.approx(0.15)
     assert not result["required_coverage_qualified"]
     assert not result["recovery_eligible"]
+
+
+def test_qpc_pair_excludes_only_causal_pre_capture_time_and_keeps_original_expiry(tmp_path):
+    p, path = policy(tmp_path)
+    pair = {
+        "timing_basis": "qpc_elapsed_v1",
+        "local_clock_resolution_ms": 0.0001,
+        "capture_age_ms": 300,
+        "round_trip_ms": 550,
+        "source_age_upper_bound_ms": 1,
+    }
+    health(path, 1, source_system_relative_ticks=2_000_000, challenge_received_qpc_ticks=1_000_000, **pair)
+    assert not p.observer(now=0, wall_ms=10000)
+    health(path, 2, source_system_relative_ticks=3_000_000, challenge_received_qpc_ticks=2_000_000, **pair)
+    assert p.observer(now=0.1, wall_ms=10000)
+    assert p.observer_expires_at == pytest.approx(0.149)
+    assert p.observer(now=0.148, wall_ms=10048)
+    assert not p.observer(now=0.15, wall_ms=10050)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"timing_basis": "foreign_clock"},
+        {"local_clock_resolution_ms": 15.625},
+        {"local_clock_resolution_ms": None},
+        {"challenge_received_qpc_ticks": 0},
+        {"challenge_received_qpc_ticks": 3_000_000},
+        {"challenge_received_qpc_ticks": 3_000_001},
+        {"capture_age_ms": 300, "round_trip_ms": 350},
+        {"round_trip_ms": 99},
+        {"round_trip_ms": 751},
+    ],
+)
+def test_qpc_pair_rejects_unknown_clock_and_impossible_original_intervals(tmp_path, change):
+    p, path = policy(tmp_path)
+    p.observer(now=0, wall_ms=10000)
+    pair = {
+        "timing_basis": "qpc_elapsed_v1",
+        "local_clock_resolution_ms": 0.0001,
+        "source_system_relative_ticks": 3_000_000,
+        "challenge_received_qpc_ticks": 2_000_000,
+        "capture_age_ms": 200,
+        "round_trip_ms": 350,
+        "source_age_upper_bound_ms": 1,
+    }
+    pair.update(change)
+    health(path, 2, **pair)
+    assert not p.observer(now=0.1, wall_ms=10000)
