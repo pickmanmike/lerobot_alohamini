@@ -20,6 +20,7 @@ import logging
 import math
 import os
 import time
+from collections import deque
 from collections.abc import Callable
 from typing import Any
 
@@ -268,16 +269,20 @@ def print_cadence_report(command_state: HostCommandState) -> None:
 
 
 class AM1HostLoopTiming:
-    """Two in-memory owner-loop records, reported only after a genuine fault.
+    """Eight completed owner loops and the current loop, emitted after a fault.
 
     These wall durations include scheduling delays, not just CPU work. They
     locate a delayed phase without attributing it to a particular device/sink.
     No motor reads, waits, periodic output, or freshness-policy changes.
     """
 
+    HISTORY_SIZE = 8
+
     def __init__(self) -> None:
         self.previous: dict[str, Any] | None = None
         self.current: dict[str, Any] | None = None
+        self._completed: deque[dict[str, Any]] = deque(maxlen=self.HISTORY_SIZE)
+        self._omitted_completed_loop_count = 0
         self._phase_started_s = 0.0
         self._loop_index = 0
 
@@ -305,6 +310,9 @@ class AM1HostLoopTiming:
             end_s=at, elapsed_ms=round((at - self.current["start_s"]) * 1000, 3), completed=True,
         )
         self.previous, self.current = self.current, None
+        if len(self._completed) == self.HISTORY_SIZE:
+            self._omitted_completed_loop_count += 1
+        self._completed.append(self.previous)
 
     def snapshot(self, at: float) -> dict[str, Any]:
         current = None
@@ -314,7 +322,18 @@ class AM1HostLoopTiming:
                 (at - self._phase_started_s) * 1000, 3,
             )
             current["elapsed_ms"] = round((at - current["start_s"]) * 1000, 3)
-        return {"clock": "perf_counter", "previous_loop": self.previous, "current_loop": current}
+
+        def copy_completed(record: dict[str, Any]) -> dict[str, Any]:
+            return {**record, "phase_ms": dict(record["phase_ms"])}
+
+        return {
+            "clock": "perf_counter",
+            "previous_loop": None if self.previous is None else copy_completed(self.previous),
+            "current_loop": current,
+            "recent_completed_loops": [copy_completed(record) for record in self._completed],
+            "completed_loop_history_limit": self.HISTORY_SIZE,
+            "omitted_completed_loop_count": self._omitted_completed_loop_count,
+        }
 
 
 def print_startup_shoulder_report(

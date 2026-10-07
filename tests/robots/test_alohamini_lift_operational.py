@@ -1854,3 +1854,49 @@ def test_host_loop_context_excludes_skip_home_and_other_models(operating_robot, 
     host.main()
     assert legacy_home == ([True] if home else [])
     assert not robot.left_bus.is_connected
+
+
+def test_host_fault_timing_retains_slow_loop_after_one_healthy_iteration():
+    from lerobot.robots.alohamini.alohamini_host import AM1HostLoopTiming
+
+    timing = AM1HostLoopTiming()
+    timing.begin(100.0)
+    timing.mark("sample_log", 100.002)
+    timing.mark("sleep", 100.143)
+    timing.finish(100.144)
+    timing.begin(100.144)
+    timing.mark("sample_log", 100.146)
+    timing.finish(100.177)
+    timing.begin(100.177)
+    context = timing.snapshot(100.179)
+
+    assert context["previous_loop"]["loop_index"] == 2
+    assert context["current_loop"]["loop_index"] == 3
+    delayed, healthy = context["recent_completed_loops"]
+    assert delayed["loop_index"] == 1
+    assert delayed["phase_ms"]["sample_log"] == pytest.approx(141)
+    assert delayed["completed"] and healthy["completed"]
+    assert context["current_loop"]["completed"] is False
+    assert context["omitted_completed_loop_count"] == 0
+
+
+def test_host_fault_timing_history_is_bounded_and_snapshot_is_independent():
+    from lerobot.robots.alohamini.alohamini_host import AM1HostLoopTiming
+
+    timing = AM1HostLoopTiming()
+    for index in range(100):
+        timing.begin(float(index))
+        timing.mark("sample_log", index + 0.001)
+        timing.finish(index + 0.033)
+    context = timing.snapshot(100.0)
+
+    assert len(context["recent_completed_loops"]) == context["completed_loop_history_limit"] == 8
+    assert context["omitted_completed_loop_count"] == 92
+    assert [r["loop_index"] for r in context["recent_completed_loops"]] == list(range(93, 101))
+    context["recent_completed_loops"][-1]["phase_ms"]["sample_log"] = -1
+    context["previous_loop"]["phase_ms"]["sample_log"] = -2
+    timing.begin(100.0)
+    timing.finish(100.033)
+    later = timing.snapshot(101.0)
+    assert later["recent_completed_loops"][-2]["phase_ms"]["sample_log"] >= 0
+    assert later["omitted_completed_loop_count"] == 93
