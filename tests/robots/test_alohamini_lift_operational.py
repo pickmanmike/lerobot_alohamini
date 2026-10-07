@@ -27,6 +27,13 @@ def operating_robot(monkeypatch, tmp_path):
             name: MotorCalibration(motor.id, 0, 0, 1000, 2200)
             for name, motor in bus.motors.items()
         }
+        # The fixture claims a calibrated stopped owner; its EEPROM must carry
+        # the same synthetic limits/offset as that cache before activation.
+        for name, calibration in bus.calibration.items():
+            for register, value in (("Min_Position_Limit", calibration.range_min),
+                                    ("Max_Position_Limit", calibration.range_max),
+                                    ("Homing_Offset", calibration.homing_offset)):
+                bus.registers[(register, name)] = value
         normalizer = FeetechMotorsBus("unused-test-port", bus.motors, bus.calibration)
         bus.apply_drive_mode = normalizer.apply_drive_mode
         bus.model_resolution_table = normalizer.model_resolution_table

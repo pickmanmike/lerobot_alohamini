@@ -104,14 +104,19 @@ uploads inert files, verifies their exact sizes, hashes and invocation identity,
 the capture only after a validated acknowledgement. Directory creation, upload and finalization
 share the original thirty-second deadline; phase and first-failure evidence remain private.
 Default stdin staging is unchanged. All 89 observer tests pass, including real local PowerShell
-validation and timeout/corruption refusals. Actual use of the new staging path remains pending.
+validation and timeout/corruption refusals. A finite passive capture subsequently staged through
+this path, qualified a genuine current startup window, then stopped with verified camera release.
+Its original delivery gaps remain recorded separately; this is not combined motion evidence.
 
-A separate stopped check with the actual host calibration identity found one arm outside
-its calibrated command range. Native preparation starts after host activation and cannot
-qualify that earlier transition. A pre-activation guard is being added and reviewed; the
-owner has been asked for one precise support placement under the packet exception for a
-demonstrated physical setup blocker. No powered retry or integration is authorized by a
-later cleanup check alone.
+AM1 activation now verifies all arm mappings, cached calibration and current EEPROM limits,
+torque-off and raw positions before powered lift setup. After homing it takes fresh raw arm
+positions, seeds both buses, verifies all accepted goals, and checks the original raw-vector
+age before each torque enable. Goal readbacks never renew position freshness. Unsupported
+resting poses refuse without substituting an EEPROM boundary or widening preparation.
+All 491 affected activation, lift, gain rollback, native preparation, recovery, body-hold and
+launcher tests pass. Independent review found no actionable blocker; AM2 follows its existing
+activation path. Actual full motion is held until a qualified supported initial pose is available.
+The packet permits the single physical setup action already requested for that dependency.
 
 Plan: [AM1-03 executable plan](../superpowers/plans/2026-10-06-am1-reliability-03.md).
 Historical packet-02/01 evidence below retains its original verdicts.

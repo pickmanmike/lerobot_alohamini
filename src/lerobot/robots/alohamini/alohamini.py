@@ -533,10 +533,132 @@ class AlohaMini(Robot):
         for name in (*self.base_motors, self.lift.cfg.name):
             write_register(self.left_bus, "Goal_Velocity", name, 0)
 
+    AM1_ACTIVATION_MAX_RAW_AGE_S = 1.0
+
+    def _require_am1_activation_fresh(self, phase: str) -> None:
+        expected = len(self.left_arm_motors) + len(self.right_arm_motors)
+        if not expected:
+            return
+        samples = [row for row in self._am1_activation_readbacks
+                   if row["phase"] == phase and row["register"] == "Present_Position"]
+        now = time.monotonic()
+        if len(samples) != expected or any("unavailable" in row for row in samples):
+            raise RuntimeError("AM1 arm activation refused: complete raw position vector is unavailable.")
+        earliest = min(row["read_started_at"] for row in samples)
+        if (not math.isfinite(now) or not math.isfinite(earliest)
+            or now < max(row["read_completed_at"] for row in samples)
+            or now - earliest >= self.AM1_ACTIVATION_MAX_RAW_AGE_S):
+            raise RuntimeError("AM1 arm activation refused: original raw position vector expired (>=1 s).")
+
+    def _am1_activation_calibration(self, bus: FeetechMotorsBus, name: str) -> tuple[int, int, int, int, int]:
+        calibration = getattr(bus, "calibration", {}).get(name)
+        if calibration is None or name not in bus.motors:
+            raise RuntimeError(f"AM1 arm activation refused: missing calibration or motor mapping for '{name}'.")
+        values = (calibration.id, calibration.drive_mode, calibration.homing_offset,
+                  calibration.range_min, calibration.range_max)
+        if any(isinstance(value, bool) or not isinstance(value, (int, np.integer)) for value in values):
+            raise RuntimeError(f"AM1 arm activation refused: malformed calibration for '{name}'.")
+        identity = tuple(int(value) for value in values)
+        if identity[0] != bus.motors[name].id or identity[1] not in (0, 1) or identity[3] >= identity[4]:
+            raise RuntimeError(f"AM1 arm activation refused: invalid calibration or motor mapping for '{name}'.")
+        return identity
+
+    def _read_am1_activation_raw(self, bus: FeetechMotorsBus, register: str, name: str, *, phase: str) -> int:
+        started_at = time.monotonic()
+        record = {"phase": phase, "motor": name, "register": register, "read_started_at": started_at}
+        try:
+            value = bus.read(register, name, normalize=False, num_retry=REGISTER_RETRIES)
+            record["raw"] = value
+            if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+                raise RuntimeError(f"AM1 arm activation refused: malformed raw {register} for '{name}'.")
+            return int(value)
+        except BaseException as error:
+            record["unavailable"] = type(error).__name__
+            raise
+        finally:
+            record["read_completed_at"] = time.monotonic()
+            # Original startup acquisitions are diagnostic evidence only. Native
+            # admission and live feedback continue to require their own new reads.
+            self._am1_activation_readbacks.append(record)
+
+    def _qualify_am1_activation_ranges(
+        self,
+    ) -> list[tuple[FeetechMotorsBus, dict[str, tuple[int, int, int, int, int]]]]:
+        qualified = []
+        for bus, names in ((self.left_bus, self.left_arm_motors), (self.right_bus, self.right_arm_motors)):
+            if bus is None:
+                continue
+            limits = {}
+            for name in names:
+                calibration = self._am1_activation_calibration(bus, name)
+                for register, expected in (("Min_Position_Limit", calibration[3]),
+                                           ("Max_Position_Limit", calibration[4]),
+                                           ("Homing_Offset", calibration[2])):
+                    actual = self._read_am1_activation_raw(bus, register, name, phase="before_home")
+                    if actual != expected:
+                        raise RuntimeError(
+                            f"AM1 arm activation refused: '{name}' {register} differs from cached calibration."
+                        )
+                self._qualify_am1_activation_position(bus, name, calibration, phase="before_home")
+                limits[name] = calibration
+            qualified.append((bus, limits))
+        return qualified
+
+    def _qualify_am1_activation_position(
+        self, bus: FeetechMotorsBus, name: str, calibration: tuple[int, int, int, int, int], *, phase: str,
+    ) -> int:
+        torque = self._read_am1_activation_raw(bus, "Torque_Enable", name, phase=phase)
+        if torque != 0:
+            raise RuntimeError(f"AM1 arm activation refused: '{name}' torque must be disabled before qualification.")
+        present = self._read_am1_activation_raw(bus, "Present_Position", name, phase=phase)
+        if not calibration[3] <= present <= calibration[4]:
+            raise RuntimeError(
+                f"AM1 arm activation refused: '{name}' raw position {present} is outside verified "
+                f"calibration limits {calibration[3]}..{calibration[4]}."
+            )
+        return present
+
+    def _seed_qualified_am1_activation_goals(
+        self, qualified: list[tuple[FeetechMotorsBus, dict[str, tuple[int, int, int, int, int]]]],
+    ) -> None:
+        all_goals = []
+        for bus, limits in qualified:
+            present_positions = {}
+            for name, calibration in limits.items():
+                if self._am1_activation_calibration(bus, name) != calibration:
+                    raise RuntimeError(f"AM1 arm activation refused: '{name}' calibration changed during lift home.")
+                present_positions[name] = self._qualify_am1_activation_position(
+                    bus, name, calibration, phase="after_home",
+                )
+            all_goals.append((bus, present_positions))
+        self._require_am1_activation_fresh("after_home")
+        # Both buses qualify before the first goal write, then every seeded goal
+        # is verified before the first arm/base torque enable. Do not command an
+        # EEPROM boundary as a substitute for an unrepresentable measured hold.
+        for bus, present_positions in all_goals:
+            for name, present in present_positions.items():
+                write_register(bus, "Goal_Position", name, present)
+        for bus, present_positions in all_goals:
+            for name, expected in present_positions.items():
+                actual = self._read_am1_activation_raw(bus, "Goal_Position", name, phase="seed_readback")
+                if actual != expected:
+                    raise RuntimeError(
+                        f"AM1 arm activation refused: '{name}' measured goal readback {actual} differs from {expected}."
+                    )
+        for name in (*self.base_motors, self.lift.cfg.name):
+            write_register(self.left_bus, "Goal_Velocity", name, 0)
+
     def activate_motors(self, *, home_lift: bool = True) -> LiftHomeResult | None:
         """Seed stationary goals, optionally home the lift, and enable normal motors."""
         home_result = None
         try:
+            qualified = None
+            if self.config.robot_model == "alohamini1":
+                self._am1_activation_readbacks = []
+                # Reject an unrepresentable arm rest before even powered lift
+                # home. This owner's home does not change any arm calibration.
+                qualified = self._qualify_am1_activation_ranges()
+                self._require_am1_activation_fresh("before_home")
             if home_lift:
                 if self.config.robot_model == "alohamini1":
                     from .lift_operational import OperationalLift
@@ -551,14 +673,26 @@ class AlohaMini(Robot):
 
             # Read arm positions after homing, while the arms are still torque-free, so
             # their hold goals cannot become stale during the bounded lift movement.
-            self._seed_activation_goals()
-            set_torque_enabled(
-                self.left_bus,
-                (*self.left_arm_motors, *self.base_motors),
-                enabled=True,
-            )
-            if self.right_bus:
-                set_torque_enabled(self.right_bus, self.right_arm_motors, enabled=True)
+            if qualified is None:
+                self._seed_activation_goals()
+            else:
+                self._seed_qualified_am1_activation_goals(qualified)
+            if qualified is None:
+                set_torque_enabled(
+                    self.left_bus,
+                    (*self.left_arm_motors, *self.base_motors),
+                    enabled=True,
+                )
+                if self.right_bus:
+                    set_torque_enabled(self.right_bus, self.right_arm_motors, enabled=True)
+            else:
+                for bus, names in ((self.left_bus, (*self.left_arm_motors, *self.base_motors)),
+                                   (self.right_bus, self.right_arm_motors)):
+                    if bus is None:
+                        continue
+                    for name in names:
+                        self._require_am1_activation_fresh("after_home")
+                        set_torque_enabled(bus, (name,), enabled=True)
         except BaseException as error:
             cleanup_errors = self._safe_shutdown(close_buses=True, recover_interrupted_bus_io=True)
             if isinstance(error, (KeyboardInterrupt, SystemExit)):
