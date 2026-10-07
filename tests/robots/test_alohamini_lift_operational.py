@@ -6,6 +6,8 @@ import json
 
 import pytest
 
+from lerobot.motors import MotorCalibration
+from lerobot.motors.feetech import FeetechMotorsBus
 from lerobot.robots.alohamini import alohamini as robot_module
 from lerobot.robots.alohamini import lift_relief
 from lerobot.robots.alohamini.config_alohamini import AlohaMiniConfig
@@ -21,7 +23,29 @@ def operating_robot(monkeypatch, tmp_path):
     def bus_factory(**kwargs):
         bus = LiftBus(clock, **kwargs)
         bus.is_calibrated = True
-        bus.sync_read = lambda register, motors: {name: bus.read(register, name) for name in motors}
+        bus.calibration = {
+            name: MotorCalibration(motor.id, 0, 0, 1000, 2200)
+            for name, motor in bus.motors.items()
+        }
+        normalizer = FeetechMotorsBus("unused-test-port", bus.motors, bus.calibration)
+        bus.apply_drive_mode = normalizer.apply_drive_mode
+        bus.model_resolution_table = normalizer.model_resolution_table
+        bus._normalize, bus._unnormalize = normalizer._normalize, normalizer._unnormalize
+        original_read = bus.read
+
+        def calibrated_read(register, name, *, normalize=True, **options):
+            value = original_read(register, name, normalize=normalize, **options)
+            if register == "Present_Position" and name.startswith("arm_") and not normalize:
+                # These fixtures declare arm positions in normalized units; model
+                # the same raw register representation as the real bus.
+                motor = bus.motors[name]
+                return bus._unnormalize({motor.id: value})[motor.id]
+            return value
+
+        bus.read = calibrated_read
+        bus.sync_read = lambda register, motors, **options: {
+            name: bus.read(register, name, **options) for name in motors
+        }
         bus.sync_write = lambda register, values, **kwargs: [
             bus.write(register, name, value, **kwargs) for name, value in values.items()
         ]

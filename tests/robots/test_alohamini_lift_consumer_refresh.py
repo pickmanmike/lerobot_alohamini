@@ -181,7 +181,8 @@ def test_host_refreshes_genuine_lift_feedback_after_action_or_hold_work(host_cas
     assert robot.lift._extended_ticks == case.start_ticks
     assert robot.lift._z0_deg == case.start_zero
     for bus, names in ((robot.left_bus, robot.left_arm_motors), (robot.right_bus, robot.right_arm_motors)):
-        assert all(bus.registers[("Goal_Position", name)] == (10 if mode == "pause" else 13) for name in names)
+        expected_raw = bus._unnormalize({bus.motors[name].id: 10 if mode == "pause" else 13 for name in names})
+        assert all(bus.registers[("Goal_Position", name)] == expected_raw[bus.motors[name].id] for name in names)
         assert not bus.is_connected
     assert all(robot.left_bus.registers[("Goal_Velocity", name)] == 0 for name in robot.base_motors + ["lift_axis"])
     assert robot.left_bus.registers[("Torque_Enable", "lift_axis")] == 0
@@ -278,7 +279,9 @@ def test_refresh_keeps_high_history_faults_and_cancellation_terminal(host_case, 
     assert not case.observations
     if consumer == "action":
         assert not case.actions
-        assert all(case.robot.left_bus.registers[("Goal_Position", name)] == 10
+        bus = case.robot.left_bus
+        expected_raw = bus._unnormalize({bus.motors[name].id: 10 for name in case.robot.left_arm_motors})
+        assert all(bus.registers[("Goal_Position", name)] == expected_raw[bus.motors[name].id]
                    for name in case.robot.left_arm_motors)
     if fault == "high":
         assert [t for _, t in case.rejected[0]["temperature_history"]][-3:] == [60, 60, 60]

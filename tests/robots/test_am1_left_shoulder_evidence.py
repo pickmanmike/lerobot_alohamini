@@ -329,3 +329,201 @@ def test_repeated_extra_goal_read_unavailability_remains_visible(capsys):
     assert record["goal_read_unavailable_count"] == 2
     assert record["position_read_completed_at"] == 10.001
     assert record["diagnostic_available"] is False
+
+
+def test_am1_feedback_does_not_hide_raw_position_beyond_calibrated_endpoint(monkeypatch):
+    robot, reads, writes = action_robot(monkeypatch)
+    robot.id = "synthetic-feedback-test"
+    guards = []
+
+    def beyond_endpoint(address, length, ids, **kwargs):
+        reads.append((address, length, tuple(ids), kwargs["num_retry"]))
+        return {id_: 2225 if address == 56 and id_ == 2 else 0 for id_ in ids}, 0
+
+    monkeypatch.setattr(robot.left_bus, "_sync_read", beyond_endpoint)
+    robot.right_arm_motors = []
+    robot.lift = SimpleNamespace(contribute_observation=lambda observation: None, apply_action=lambda _: None)
+    monkeypatch.setattr(robot, "read_and_check_currents", lambda **kwargs: guards.append(kwargs))
+    observation = robot.get_observation()
+    assert observation[f"{SHOULDER}.pos"] == pytest.approx(104.1666666667)
+    assert len(reads) == 2  # reuse existing arm position and base velocity transactions
+    assert guards == [{"limit_ma": 2000, "print_currents": True}]
+    robot.send_action({f"{SHOULDER}.pos": 100.0, "x.vel": 0, "y.vel": 0, "theta.vel": 0, "lift_axis.vel": 0})
+    assert (42, 2, {2: 2200}) in writes  # unchanged absolute command conversion
+    assert len(reads) == 5
+
+
+@pytest.mark.parametrize("raw_position", [2225, 975])
+def test_encoded_command_cannot_bypass_relative_guard_at_calibration_endpoint(monkeypatch, raw_position):
+    robot, reads, writes = action_robot(monkeypatch)
+    robot.config.max_relative_target = 1.0
+
+    def endpoint_read(address, length, ids, **kwargs):
+        reads.append((address, length, tuple(ids), kwargs["num_retry"]))
+        return dict.fromkeys(ids, raw_position if address == 56 else 0), 0
+
+    monkeypatch.setattr(robot.left_bus, "_sync_read", endpoint_read)
+    with pytest.raises(RuntimeError, match="encoded.*relative"):
+        robot.send_action({
+            f"{SHOULDER}.pos": 0.0, "x.vel": 0, "y.vel": 0,
+            "theta.vel": 0, "lift_axis.vel": 0,
+        })
+    assert writes == []
+    assert len(reads) == 3
+
+
+def test_unrepresentable_high_current_hold_is_refused_before_arm_write(monkeypatch):
+    robot, reads, writes = action_robot(monkeypatch)
+
+    def high_current_read(address, length, ids, **kwargs):
+        reads.append((address, length, tuple(ids), kwargs["num_retry"]))
+        return dict.fromkeys(ids, 2225 if address == 56 else 300), 0
+
+    monkeypatch.setattr(robot.left_bus, "_sync_read", high_current_read)
+    with pytest.raises(RuntimeError, match="current.*hold.*represent"):
+        robot.send_action({
+            f"{SHOULDER}.pos": 100.0, "x.vel": 0, "y.vel": 0,
+            "theta.vel": 0, "lift_axis.vel": 0,
+        })
+    assert writes == []
+    assert robot._joint_hold_goal[SHOULDER] == pytest.approx(104.1666666667)
+
+
+def test_in_range_relative_guard_uses_same_wire_conversion(monkeypatch):
+    robot, reads, writes = action_robot(monkeypatch)
+    robot.config.max_relative_target = 1.0
+    sent = robot.send_action({
+        f"{SHOULDER}.pos": 0.0, "x.vel": 0, "y.vel": 0,
+        "theta.vel": 0, "lift_axis.vel": 0,
+    })
+    assert sent[f"{SHOULDER}.pos"] == pytest.approx(22.0)
+    assert (42, 2, {2: 1732}) in writes
+    assert len(reads) == 3
+
+
+@pytest.mark.parametrize(("mode", "drive_mode", "expected"), [
+    (MotorNormMode.RANGE_M100_100, 0, 104.1666666667),
+    (MotorNormMode.RANGE_M100_100, 1, -104.1666666667),
+    (MotorNormMode.RANGE_0_100, 0, 102.0833333333),
+    (MotorNormMode.RANGE_0_100, 1, -2.0833333333),
+    (MotorNormMode.DEGREES, 0, (2225 - 1600) * 360 / 4095),
+])
+def test_am1_raw_feedback_keeps_normalization_units_and_direction(monkeypatch, mode, drive_mode, expected):
+    robot, reads, _ = action_robot(monkeypatch)
+    robot.id = "synthetic-feedback-test"
+    robot.left_bus.motors[SHOULDER].norm_mode = mode
+    robot.left_bus.calibration[SHOULDER].drive_mode = drive_mode
+    robot.left_bus.apply_drive_mode = True
+    robot.right_arm_motors = []
+    robot.lift = SimpleNamespace(contribute_observation=lambda _: None)
+    monkeypatch.setattr(robot, "read_and_check_currents", lambda **_: None)
+    monkeypatch.setattr(robot.left_bus, "_sync_read", lambda address, length, ids, **_: (
+        dict.fromkeys(ids, 2225 if address == 56 else 0), 0,
+    ))
+    assert robot.get_observation()[f"{SHOULDER}.pos"] == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("model", ["alohamini2", "alohamini2pro"])
+def test_other_models_keep_existing_feedback_clamp(monkeypatch, model):
+    robot, _, _ = action_robot(monkeypatch)
+    robot.id = "synthetic-feedback-test"
+    robot.config.robot_model = model
+    robot.right_arm_motors = []
+    robot.lift = SimpleNamespace(contribute_observation=lambda _: None)
+    monkeypatch.setattr(robot, "read_and_check_currents", lambda **_: None)
+    monkeypatch.setattr(robot.left_bus, "_sync_read", lambda address, length, ids, **_: (
+        dict.fromkeys(ids, 2225 if address == 56 else 0), 0,
+    ))
+    assert robot.get_observation()[f"{SHOULDER}.pos"] == 100.0
+
+
+@pytest.mark.parametrize(("raw_position", "cap", "expected_goal_raw"), [
+    (1729, 20.0, 1609),  # arithmetic roundoff around an exactly legal integer goal
+    (1738, 0.7, 1734),  # floor would cross the cap; round the goal inward instead
+])
+def test_relative_guard_selects_representable_safe_integer_without_second_floor(
+    monkeypatch, raw_position, cap, expected_goal_raw,
+):
+    robot, reads, writes = action_robot(monkeypatch)
+    robot.config.max_relative_target = cap
+
+    def raw_read(address, length, ids, **kwargs):
+        reads.append((address, length, tuple(ids), kwargs["num_retry"]))
+        return dict.fromkeys(ids, raw_position if address == 56 else 0), 0
+
+    monkeypatch.setattr(robot.left_bus, "_sync_read", raw_read)
+    sent = robot.send_action({
+        f"{SHOULDER}.pos": -50.0, "x.vel": 0, "y.vel": 0,
+        "theta.vel": 0, "lift_axis.vel": 0,
+    })
+    assert (42, 2, {2: expected_goal_raw}) in writes
+    assert abs(expected_goal_raw - raw_position) * 200 / 1200 <= cap
+    assert sent[f"{SHOULDER}.pos"] == pytest.approx((expected_goal_raw - 1000) * 200 / 1200 - 100)
+    assert len(reads) == 3
+
+
+
+@pytest.mark.parametrize("already_held", [False, True])
+def test_fresh_current_hold_cannot_be_replaced_to_satisfy_older_relative_sample(monkeypatch, already_held):
+    robot, reads, writes = action_robot(monkeypatch)
+    robot.config.max_relative_target = 1.0
+    positions = iter([1738, 1800])
+    if already_held:
+        robot._joint_hold_goal[SHOULDER] = (1800 - 1000) / 1200 * 200 - 100
+        robot._joint_hold_direction[SHOULDER] = 1.0
+
+    def changing_position(address, length, ids, **kwargs):
+        reads.append((address, length, tuple(ids), kwargs["num_retry"]))
+        return dict.fromkeys(ids, next(positions) if address == 56 else 300), 0
+
+    monkeypatch.setattr(robot.left_bus, "_sync_read", changing_position)
+    with pytest.raises(RuntimeError, match="current.*hold.*relative"):
+        robot.send_action({
+            f"{SHOULDER}.pos": 50.0, "x.vel": 0, "y.vel": 0,
+            "theta.vel": 0, "lift_axis.vel": 0,
+        })
+    assert writes == []
+    assert robot._joint_hold_goal[SHOULDER] == pytest.approx(33.3333333333)
+
+
+
+@pytest.mark.parametrize(("mode", "reversed_drive"), [
+    (MotorNormMode.RANGE_M100_100, False), (MotorNormMode.RANGE_M100_100, True),
+    (MotorNormMode.RANGE_0_100, False), (MotorNormMode.RANGE_0_100, True),
+    (MotorNormMode.DEGREES, False),
+])
+@pytest.mark.parametrize(("cap", "dict_cap", "target"), [(0.01, False, 100.0), (0.7, True, -50.0)])
+def test_encoded_relative_guard_units_direction_dict_and_sub_tick_limit(
+    monkeypatch, mode, reversed_drive, cap, dict_cap, target,
+):
+    robot, reads, writes = action_robot(monkeypatch)
+    robot.left_bus.motors[SHOULDER].norm_mode = mode
+    robot.left_bus.calibration[SHOULDER].drive_mode = int(reversed_drive)
+    robot.left_bus.apply_drive_mode = True
+    robot.config.max_relative_target = {f"{SHOULDER}.pos": cap} if dict_cap else cap
+    robot.send_action({
+        f"{SHOULDER}.pos": target, "x.vel": 0, "y.vel": 0,
+        "theta.vel": 0, "lift_axis.vel": 0,
+    })
+    goal_raw = next(values[2] for address, _, values in writes if address == 42)
+    units_per_tick = 360 / 4095 if mode is MotorNormMode.DEGREES else (
+        (200 if mode is MotorNormMode.RANGE_M100_100 else 100) / 1200
+    )
+    assert abs(goal_raw - 1738) * units_per_tick <= cap
+    if mode is not MotorNormMode.DEGREES:
+        assert 1000 <= goal_raw <= 2200
+    assert len(reads) == 3
+
+
+def test_unrepresentable_current_hold_refuses_even_when_relative_cap_is_disabled(monkeypatch):
+    robot, _, writes = action_robot(monkeypatch)
+    robot.config.max_relative_target = None
+    monkeypatch.setattr(robot.left_bus, "_sync_read", lambda address, length, ids, **_: (
+        dict.fromkeys(ids, 2225 if address == 56 else 300), 0,
+    ))
+    with pytest.raises(RuntimeError, match="current.*hold.*represent"):
+        robot.send_action({
+            f"{SHOULDER}.pos": 100.0, "x.vel": 0, "y.vel": 0,
+            "theta.vel": 0, "lift_axis.vel": 0,
+        })
+    assert writes == []

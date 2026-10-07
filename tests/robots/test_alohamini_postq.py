@@ -207,7 +207,15 @@ def test_actual_host_after_client_exit_keeps_polling_or_truthfully_stops(
     def connect(**kwargs):
         original_connect(calibrate=False, **kwargs)
         # Add a fake arm read to exercise the same observation stages as Local.
-        robot.left_arm_motors = ["synthetic_left_arm"]
+        from lerobot.motors import Motor, MotorCalibration, MotorNormMode
+        from lerobot.motors.feetech import FeetechMotorsBus
+
+        robot.left_arm_motors = ["arm_left_synthetic"]
+        bus = robot.left_bus
+        bus.motors["arm_left_synthetic"] = Motor(55, "sts3215", MotorNormMode.RANGE_M100_100)
+        bus.calibration["arm_left_synthetic"] = MotorCalibration(55, 0, 0, 1000, 2200)
+        normalizer = FeetechMotorsBus("unused-test-port", bus.motors, bus.calibration)
+        bus._normalize, bus._unnormalize = normalizer._normalize, normalizer._unnormalize
         operation = robot._lift_operation
         poll = operation.poll
         sync_read = robot.left_bus.sync_read
@@ -216,14 +224,14 @@ def test_actual_host_after_client_exit_keeps_polling_or_truthfully_stops(
             poll(**kwargs)
             polls.append(clock.now)
 
-        def modeled_io(register, motors):
+        def modeled_io(register, motors, **options):
             target = robot.left_arm_motors if fault == "left_arm_delay" else robot.base_motors
             if fault and motors == target and len(commands) >= 2 and not injected:
                 injected.append(fault)
                 if fault == "wheel_error":
                     raise primary
                 clock.sleep(35.2)  # Synthetic blocked read/write/flush/retry duration.
-            return sync_read(register, motors)
+            return sync_read(register, motors, **options)
 
         operation.poll = checked_poll
         robot.left_bus.sync_read = modeled_io

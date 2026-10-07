@@ -16,6 +16,7 @@
 
 import json
 import logging
+import math
 import sys
 import time
 from collections.abc import Callable
@@ -790,6 +791,104 @@ class AlohaMini(Robot):
         except Exception:
             return 0.0
         
+    def _normalize_arm_feedback(self, bus: FeetechMotorsBus, raw: dict[str, int]) -> dict[str, float]:
+        """Keep measured AM1 positions truthful beyond the calibrated command range."""
+        ids = {bus.motors[name].id: value for name, value in raw.items()}
+        normalized = bus._normalize(ids)  # retain calibration validation and degree units
+        for name, value in raw.items():
+            motor = bus.motors[name]
+            calibration = bus.calibration[name]
+            drive_mode = bus.apply_drive_mode and calibration.drive_mode
+            if motor.norm_mode is MotorNormMode.RANGE_M100_100:
+                position = (value - calibration.range_min) / (
+                    calibration.range_max - calibration.range_min
+                ) * 200 - 100
+                normalized[motor.id] = -position if drive_mode else position
+            elif motor.norm_mode is MotorNormMode.RANGE_0_100:
+                position = (value - calibration.range_min) / (
+                    calibration.range_max - calibration.range_min
+                ) * 100
+                normalized[motor.id] = 100 - position if drive_mode else position
+        return {name: normalized[bus.motors[name].id] for name in raw}
+
+    def _read_arm_positions(
+        self, bus: FeetechMotorsBus, motors: list[str], *, raw_positions: dict[str, int] | None = None,
+    ) -> dict[str, float]:
+        if getattr(self.config, "robot_model", None) != "alohamini1":
+            return bus.sync_read("Present_Position", motors)
+        raw = bus.sync_read("Present_Position", motors, normalize=False)
+        if raw_positions is not None:
+            raw_positions.update(raw)
+        return self._normalize_arm_feedback(bus, raw)
+
+    def _encode_am1_arm_goals(
+        self, bus: FeetechMotorsBus, goals: dict[str, float], present_raw: dict[str, int],
+    ) -> tuple[dict[str, float], dict[str, int] | None]:
+        """Encode once, rounding inward so existing protections survive conversion."""
+        if getattr(self.config, "robot_model", None) != "alohamini1" or not goals:
+            return goals, None
+        raw_goals = bus._unnormalize({
+            bus.motors[key.removesuffix(".pos")].id: value for key, value in goals.items()
+        })
+        for key, goal in goals.items():
+            motor = key.removesuffix(".pos")
+            model = bus.motors[motor]
+            calibration = bus.calibration[motor]
+            mode = model.norm_mode
+            bounds = (-100.0, 100.0) if mode is MotorNormMode.RANGE_M100_100 else (
+                (0.0, 100.0) if mode is MotorNormMode.RANGE_0_100 else None
+            )
+            holds = self._gripper_hold_goal if motor.endswith("_gripper") else self._joint_hold_goal
+            protected_hold = motor in holds and goal == holds[motor]
+            if protected_hold and bounds and not bounds[0] <= goal <= bounds[1]:
+                raise RuntimeError(f"AM1 current-limit hold for {motor} cannot be represented within its command range")
+            if protected_hold and not motor.endswith("_gripper"):
+                # A joint hold is an integer Present_Position sample. Recover that
+                # exact encoder tick; a float round trip must not move its hold.
+                value = -goal if bus.apply_drive_mode and calibration.drive_mode else goal
+                if mode is MotorNormMode.RANGE_M100_100:
+                    raw_hold = (value + 100) / 200 * (calibration.range_max - calibration.range_min) + calibration.range_min
+                elif mode is MotorNormMode.RANGE_0_100:
+                    value = 100 - goal if bus.apply_drive_mode and calibration.drive_mode else goal
+                    raw_hold = value / 100 * (calibration.range_max - calibration.range_min) + calibration.range_min
+                else:
+                    raw_hold = goal * (bus.model_resolution_table[model.model] - 1) / 360 + (
+                        calibration.range_min + calibration.range_max
+                    ) / 2
+                raw_goals[model.id] = round(raw_hold)
+            if self.config.max_relative_target is None:
+                continue
+            cap = self.config.max_relative_target
+            if isinstance(cap, dict):
+                cap = cap[key]
+            if mode is MotorNormMode.DEGREES:
+                ticks_per_unit = (bus.model_resolution_table[model.model] - 1) / 360
+            else:
+                ticks_per_unit = (calibration.range_max - calibration.range_min) / (
+                    200 if mode is MotorNormMode.RANGE_M100_100 else 100
+                )
+            measured_raw = present_raw[motor]
+            raw_cap = cap * ticks_per_unit
+            # Integer distances avoid affine subtraction roundoff. No tick margin.
+            distance_cap = math.floor(raw_cap)
+            low, high = measured_raw - distance_cap, measured_raw + distance_cap
+            if bounds:
+                low, high = max(low, calibration.range_min), min(high, calibration.range_max)
+            if low > high:
+                raise RuntimeError(
+                    f"AM1 encoded goal for {motor} cannot meet relative target limit "
+                    f"inside the calibrated command range: present_raw={measured_raw}, limit={cap}"
+                )
+            if protected_hold and not low <= raw_goals[model.id] <= high:
+                raise RuntimeError(f"AM1 current-limit hold for {motor} conflicts with the relative target limit")
+            raw_goals[model.id] = min(high, max(low, raw_goals[model.id]))
+        named_raw = {
+            key.removesuffix(".pos"): raw_goals[bus.motors[key.removesuffix(".pos")].id]
+            for key in goals
+        }
+        wire_positions = self._normalize_arm_feedback(bus, named_raw)
+        return {key: wire_positions[key.removesuffix(".pos")] for key in goals}, named_raw
+
     @check_if_not_connected
     def get_observation(self) -> RobotObservation:
         # Read actuators position for arm and vel for base
@@ -798,7 +897,7 @@ class AlohaMini(Robot):
 
         #print(f"Left arm motors: {self.left_arm_motors}, Right arm motors: {self.right_arm_motors}")  # debug
         left_pos = (
-            self.left_bus.sync_read("Present_Position", self.left_arm_motors)
+            self._read_arm_positions(self.left_bus, self.left_arm_motors)
             if self.left_arm_motors
             else {}
         )
@@ -815,7 +914,7 @@ class AlohaMini(Robot):
         base_done_t = time.perf_counter()
 
         right_pos = (
-            self.right_bus.sync_read("Present_Position", self.right_arm_motors)
+            self._read_arm_positions(self.right_bus, self.right_arm_motors)
             if self.right_bus and self.right_arm_motors
             else {}
         )
@@ -923,13 +1022,18 @@ class AlohaMini(Robot):
             self.lift.apply_action(action)
         lift_action_done_t = time.perf_counter()
 
+        present_left_raw, present_right_raw = {}, {}
         if left_pos and self.config.max_relative_target is not None:
-            present_left = self.left_bus.sync_read("Present_Position", self.left_arm_motors)  # left_arm_*
+            present_left = self._read_arm_positions(
+                self.left_bus, self.left_arm_motors, raw_positions=present_left_raw,
+            )
             gp_left = {k: (v, present_left[k.replace(".pos", "")]) for k, v in left_pos.items()}
             left_pos = ensure_safe_goal_position(gp_left, self.config.max_relative_target)
 
         if self.right_bus and right_pos and self.config.max_relative_target is not None:
-            present_right = self.right_bus.sync_read("Present_Position", self.right_arm_motors)
+            present_right = self._read_arm_positions(
+                self.right_bus, self.right_arm_motors, raw_positions=present_right_raw,
+            )
             right_wrist_observed = present_right.get("arm_right_wrist_flex")
             gp_right = {k: (v, present_right[k.replace(".pos", "")]) for k, v in right_pos.items()}
             right_pos = ensure_safe_goal_position(gp_right, self.config.max_relative_target)
@@ -946,6 +1050,11 @@ class AlohaMini(Robot):
             right_pos = self._limit_joint_goal_by_current(self.right_bus, right_pos)
         right_joint_limit_done_t = time.perf_counter()
 
+        left_pos, left_raw_goals = self._encode_am1_arm_goals(self.left_bus, left_pos, present_left_raw)
+        right_raw_goals = None
+        if self.right_bus and right_pos:
+            right_pos, right_raw_goals = self._encode_am1_arm_goals(self.right_bus, right_pos, present_right_raw)
+
         # Send goal position to the actuators
         # arm_goal_pos_raw = {k.replace(".pos", ""): v for k, v in arm_goal_pos.items()}
         # self.left_bus.sync_write("Goal_Position", arm_goal_pos_raw)
@@ -956,10 +1065,16 @@ class AlohaMini(Robot):
         #print(f"[{filename}:{lineno}]Sending left_pos:{left_pos}, right_pos:{right_pos}, base_wheel_goal_vel:{base_wheel_goal_vel}")  # debug
     
         if left_pos:
-            self.left_bus.sync_write("Goal_Position", {k.replace(".pos", ""): v for k, v in left_pos.items()})
+            if left_raw_goals is not None:
+                self.left_bus.sync_write("Goal_Position", left_raw_goals, normalize=False)
+            else:
+                self.left_bus.sync_write("Goal_Position", {k.replace(".pos", ""): v for k, v in left_pos.items()})
         left_write_done_t = time.perf_counter()
         if self.right_bus and right_pos:
-            self.right_bus.sync_write("Goal_Position", {k.replace(".pos", ""): v for k, v in right_pos.items()})
+            if right_raw_goals is not None:
+                self.right_bus.sync_write("Goal_Position", right_raw_goals, normalize=False)
+            else:
+                self.right_bus.sync_write("Goal_Position", {k.replace(".pos", ""): v for k, v in right_pos.items()})
         right_write_done_t = time.perf_counter()
         self.left_bus.sync_write("Goal_Velocity", base_wheel_goal_vel)
         base_write_done_t = time.perf_counter()
@@ -1010,10 +1125,7 @@ class AlohaMini(Robot):
                 "expected_goal_raw": None,
             }
             try:
-                motor_id = self.left_bus.motors["arm_left_shoulder_lift"].id
-                record["expected_goal_raw"] = self.left_bus._unnormalize(
-                    {motor_id: float(final_arm_pos[left_shoulder])}
-                )[motor_id]
+                record["expected_goal_raw"] = left_raw_goals["arm_left_shoulder_lift"]
             except Exception as error:
                 record["expected_goal_error"] = f"{type(error).__name__}: {error}"
             self.logs["action_diagnostics"]["left_shoulder"] = record
@@ -1095,15 +1207,11 @@ class AlohaMini(Robot):
                 current_completed = time.monotonic()
                 position_started = time.monotonic()
                 position_wall_started = time.time_ns()
-                # Reuse this existing force-limit read. The normalizer is exactly
-                # the one sync_read(normalize=True) uses; there is no extra read.
+                # Reuse the existing force-limit transaction and retain its raw
+                # sample; AM1 feedback must not hide positions past a command limit.
                 raw_present = bus.sync_read("Present_Position", target_motors, normalize=False)
                 position_completed = time.monotonic()
-                ids = {bus.motors[name].id: value for name, value in raw_present.items()}
-                normalized = bus._normalize(ids)
-                present_pos = {
-                    name: normalized[bus.motors[name].id] for name in target_motors
-                }
+                present_pos = self._normalize_arm_feedback(bus, raw_present)
                 self._am1_left_shoulder_feedback = {
                     "feedback_available": True,
                     "present_position_raw": raw_present[selected],
@@ -1118,7 +1226,7 @@ class AlohaMini(Robot):
                     "position_read_started_wall_time_ns": position_wall_started,
                 }
             else:
-                present_pos = bus.sync_read("Present_Position", target_motors)
+                present_pos = self._read_arm_positions(bus, target_motors)
         except Exception as e:
             if trace_shoulder:
                 self._am1_left_shoulder_feedback = {
