@@ -10,13 +10,35 @@
 
 **Spec:** Owner-provided Packet AM1-RELIABILITY-02, attachment `0ed5acba-00af-4d91-9aa4-2c025c0d40da/Pasted text.txt`.
 
+## Latest owner steering and evidence
+
+The owner restored both leaders and the spare observer and directed bounded virtual controls without attendance requests or owner leader/key movements. Both leaders pass the non-actuating preflight at unchanged mappings/calibration. Two fresh six-second spare-camera clips were retrieved with matching hashes, all 56/55 frames decoded and four selected new images inspected. Imagery and access/device metadata stay private.
+
+Keep the packet-02 results distinct from packet-01. Body-01 refused before Live because follower power was off (owner confirmed/restored); original cleanup_unknown is retained. Reviewed exclusive normal zero/off qualification freshly verified 20 registers and closed both ports without changing calibration or that summary. Body-02 then completed 12.086 seconds Live with four frontend pulses, exit 0 and verified cleanup.
+
+Arm-01 stopped at 48.172/88 trajectory seconds on the unchanged lift temperature-history guard: 512.023 ms > 500 ms. No recovery completed; native 130 / host 1 / original session 2 / cleanup_unknown remain. A second reviewed zero/off proof preserved that summary. Acquisition-timestamp replay reproduces the first fault; its specific initiating owner-loop phase is unknown.
+
+Host commit 81034618 retains eight completed loop timings plus current/omission count. RED/green regressions, 14 focused checks and zero-added lint were recorded. Only Pi motor was staged, c3fc683d→6d99b263, with file hashes, stopped owners, private-pin backup and unchanged permissions/calibration. Windows remains 7249eec3, helper 8e6a0cf6 and camera 9b1f0670.
+
+Arm-02 paused on state-request-failed before motor host/native client/Live; owned Stop 130 and cleanup verified. HTTP versus JSON/UI-processing cause is unknown. Passive bench commit bca3a982 adds frontend HTTP/failure/page-error evidence; 503/reset RED then five affected checks passed. Arm-03 stopped at 2.105 trajectory seconds / 6.135 seconds Live on a required-camera timeout, cleanup verified. State HTTP 200 responses had no request failure/page error; Pi acquisition remained fresh.
+
+An exclusive camera-only 60-second run exited 0 with no motor access. A 35-second read-only browser capture retained 24 DOM samples, all five fresh, no status/decode failures/cancellations. Bench 1a8ac290 adds bounded per-role age/sequence/source evidence in the existing timed read. Camera-loss RED then four affected checks passed; the exact readiness-timeout regression passed after RED. Failure snapshots never delay Stop; post-cleanup finalization is bounded. Independent review is clear.
+
+Arm-04 completed the commanded 88 seconds / 88.803 seconds Live, 883 sends, all runtime exits 0 and cleanup verified. Three empty polls were preserved; no feedback recovery/stale latch. Its one freeze is normal terminal finally. Maximum endpoint error was 2.6896 normalized units; left shoulder-lift reached +2.9975 but did not follow its small return. Other joints partly returned.
+
+Independent replay confirms the repeat boundary is an envelope check: its 3-unit tolerance equals the excursion and can admit arm-04's 2.9975-unit residual using three advancing synthetic samples. Original-seed retention prevents cumulative rebasing; this does not qualify precise physical return.
+
+One deliberate ArmSmokeRepeat attempt, arm-05, reached 51.009/352 trajectory seconds / 54.096 seconds Live with 538 sends. Chest/left-wrist decoded views aged past 1500 ms while Pi sources stayed fresh; owned Stop, session/native 130, verified cleanup, zero feedback freezes/recovery/stale latch. No cycle/boundary completed. Lift remained 32–35 C, at most 39 mA, status zero. Left shoulder-lift residual was +3.3306 normalized units; no boundary was reached. Full continuous workload, moving physical-leader input and precise small return remain unqualified.
+
+A corrected exclusive camera-only 120-second diagnostic exited 0, with clean pins and no remaining owner. Its 105-second read-only browser capture recorded 105 samples, all five views fresh, 840 snapshot/366 status/213 state HTTP 200 responses, no failed request or dropped record, and zero decode failures/cancellations. Maximum snapshot duration was 802.615 ms, mainly waiting for response bytes after local connection/request start; status maximum was 447.513 ms. Network versus proxy/Pi waiting remains unresolved, and this is not a matched powered repair. Earlier setup attempts are retained: SSH TCP timeout before launch and an over-limit 180-second request refused before capture by the installed 120-second guard. That guard was preserved.
+
 ## Global Constraints
 
 - Ordinary ArmSmoke remains one 88-second trajectory with unchanged amplitudes/rates.
 - Repeat is explicitly selected, fixed at four cycles (352 trajectory seconds), with a 420-second native ceiling. No idle padding or reinitialization is endurance evidence.
-- Physical-input follow-up uses one ordinary 180-second session, both physical leaders and brief owned body/lift press/release controls; owner supplies leader movements.
+- Physical-input follow-up uses one ordinary 180-second session, both physical leaders and brief owned body/lift press/release controls; actual physical movements remain untested under the latest virtual-control direction.
 - Keep separate component pins, private configurations, calibration, PnP identities, supplies, environments, DirectBrowser and AM2 intact.
-- Longer powered work requires supervision and an accessible disconnect; no process freeze, bus fault, overload, unrestricted recovery or automatic restart.
+- Latest owner steering removes attendance requests for the authorized ordinary virtual checks. Independent cutoff remains unqualified; no process freeze, bus fault, overload, unrestricted recovery or automatic restart.
 - Reuse verified prior results for unchanged integration code. New verification covers changed execution paths, not unrelated broad suites.
 
 ## Review Focus
@@ -51,16 +73,67 @@
 
 - [x] Add explicit repeat (420 s) and ordinary physical-leader (180 s) scenarios to the existing single-Start visible-browser runner; preserve current scenarios and ownership/Stop/recovery restrictions.
 - [x] Observe RED then GREEN for actual HTTP profile/duration dispatch, required views, cleanup and identity bounds. Run changed JS syntax/diff checks.
-- [x] Inspect Duffy/P1 identities and existing capture/stop routes read-only. Spare absent; capture/retrieve/view remain explicitly pending.
-- [x] Prepare stopped/power-off reconnection and one supervised physical session. Leave unavailable physical/visual/endurance evidence pending.
-- [ ] Request focused independent review, resolve important findings, commit/push and attach a draft PR against integration.
+- [x] Inspect Duffy/P1 and existing capture/stop routes read-only; subsequently verify restored leaders and capture/retrieve/inspect the spare camera.
+- [x] Prepare stopped/power-off reconnection and the ordinary physical scenario; latest owner steering uses bounded virtual controls.
+- [x] Request focused independent review, resolve important findings, commit/push and attach draft PR #16 against integration; runtime 7249eec3 staged on Windows with rollback81c10a84.
 
-## Recoverable checkpoint
+### Task 4: Restore connections and qualify the ordinary powered path
 
-Candidate: `codex/am1-reliability-02` from `9aa6d3b0` in `C:\Users\pickm\.codex\worktrees\am1-reliability-01\lerobot_alohamini_client`; shell PowerShell 7. Reuse `C:\Users\pickm\lerobot_alohamini_client\.venv` with `uv run --no-sync`, candidate `src`/root on PYTHONPATH. Deployed launch is `python -m tools.am1_console --config config/am1.session.json --no-browser` from `.worktrees/am1-console-implementation`; Windows-only source is affected by the proposed changes. Pi helper/motor/camera remain separate and unchanged.
+- [x] Verify restored original leader identities and non-actuating preflight; capture/retrieve/decode/inspect two fresh private spare-camera clips.
+- [x] Preserve body-01 first refusal and owner-confirmed power repair; review/fake-test/exclusively execute normal all-zero/off proof without changing original verdict.
+- [x] Complete body-02 ordinary frontend press/release and verified cleanup; keep measured lift results separate from unmeasured wheel displacement/static leader reads.
+- [x] Preserve arm-01 temperature-history first fault and replay actual timestamps without changing policy; document measured outward left shoulder-lift response and unresolved return.
+- [x] Add/review/test bounded completed-loop history; stage only exact Pi motor diagnostic with separate pin/hash/backup/rollback and no owner.
+- [x] Freshly qualify all 20 zero/off registers after arm-01, retaining original cleanup_unknown.
+- [x] Preserve arm-02 pre-motor frontend pause and arm-03 partial-motion camera interruption; no recovery approval or automatic restart.
 
-Read-only console state remains completed prior arm-04, exit 0, cleanup verified, no pending gate. Duffy exposes no ports; configured left `USB\VID_1A86&PID_55D3\5B3D045224` / LEFT-LABELED-SOCKET (historical COM8), right `USB\VID_1A86&PID_55D3\5B3D048497` / RIGHT-LABELED-SOCKET (historical COM7), and the dedicated hub are absent. P1 SSH alias `codex-home` successfully returns `WIN-6E43SCJGTL7`; Camera/Image plus all present USB/Media inventories expose only THETA, not the spare observer. Existing OBS is untouched. Capture, physical input/body follow-up and repeat endurance are pending, not passed.
+### Task 5: Investigate the observation interruptions
 
-Keep packet-01 verdicts unchanged: arm-01 native complete but Stop/130; arm-02/03 successful 30-second portions; arm-04 one 88-second trajectory in 90.025 seconds live, four bounded empty polls, no feedback pause/recovery and verified cleanup. Action interval 110 ms is not latency; motor telemetry is lift-only; endpoint errors are normalized units. Raw logs, image data and configs remain private.
+- [x] Add passive frontend response/failure/pageerror evidence; fake 503/reset RED then five affected checks GREEN.
+- [x] Run the existing finite camera-only launcher under both session locks, normally exit 0, verify no owners and inspect private read-only request/decoded-view evidence.
+- [x] Add bounded per-role camera evidence in the runner's existing timed read; fake required-view-loss RED then four affected checks GREEN, zero added lint.
+- [x] Complete independent review and ordinary arm-04 commanded 88-second trajectory with verified cleanup after fresh source/owner checks; physical return remains incomplete.
+- [x] Run one deliberate four-cycle attempt after ordinary qualification; retain arm-05 as a 51.009-second partial trajectory, camera-loss Stop/130 and verified cleanup.
+- [ ] Qualify the full continuous four-cycle workload; arm-05 did not complete a cycle.
+- [x] Complete corrected camera-only timing capture, preserve pre-capture refusals, and freshly verify stopped clean sources/no owners. This does not qualify a powered camera repair.
+- [ ] Qualify moving physical-leader input if requested separately; current owner steering uses virtual controls.
+- [ ] Resolve left shoulder-lift small return from demonstrated command/normalization/readback evidence; do not alter gains/amplitude/calibration without a cause.
 
-Final available verification: affected core **304 passed, 1 POSIX process-group test skipped on Windows**; bench subset **18 passed, 25 deselected**; nine affected tests reran after test-only lint repairs. AST, JS syntax, diff checks and Ruff 0.14.1 comparison pass (63 inherited findings, zero added; new provider zero). No powered session this packet. Private access ledger: `C:\Users\pickm\AlohaMini1Logs\am1-reliability-02\packet02-access-verification.json`. WinRT video-interface query at 23:09:33.5262847Z independently confirms only THETA/no spare, no capture initialized. Independent static review is clear and supports stopped Windows-only staging. Next steps at this pre-publication checkpoint: commit, stage Windows with rollback81c10a84, push and attach draft PR against integration; record resulting SHA/deployment/publication proof in its PR and private ledger. All physical/visual/endurance checks remain pending.
+## Current checkpoint
+
+Candidate: `codex/am1-reliability-02` from integration `9aa6d3b0`, in
+`C:\Users\pickm\.codex\worktrees\am1-reliability-01\lerobot_alohamini_client`.
+Shell: PowerShell 7; reuse `C:\Users\pickm\lerobot_alohamini_client\.venv`
+with `uv run --no-sync` and candidate root/`src` on `PYTHONPATH`.
+Draft PR #16 targets integration. Windows runtime remains 7249eec3; separate
+bench runner 1a8ac290 and host diagnostic 81034618 are separate candidate commits;
+the redacted documentation records their reviewed results. Pi motor diagnostic 6d99b263 is
+deployed; helper 8e6a0cf6 and camera 9b1f0670 remain separate.
+
+Rollback while stopped/unowned: Windows 81c10a84 plus only its private pin;
+independently Pi motor c3fc683d plus only its private motor pin. Preserve private
+permissions, mappings, calibration and backups. Current motor session is stopped
+with verified cleanup. The camera-only diagnostic finished, released the existing
+session locks and left no runtime owner.
+
+Keep packet-01 verdicts unchanged: arm-01 native complete but Stop/130;
+arm-02/03 successful 30-second portions; arm-04 one 88-second trajectory in
+90.025 seconds Live, four bounded empty polls, no feedback pause/recovery
+and verified cleanup. Action interval 110 ms is not latency; temperature/current
+are lift-only; endpoint errors are normalized units. Raw logs/images/configs
+remain private.
+
+At runtime 7249eec3: affected core 304 passed, 1 POSIX process-group skip on
+Windows; affected bench 18 passed, 25 deselected; nine affected checks reran
+after test-only lint repairs. AST, JavaScript syntax, diff checks and Ruff
+comparison recorded zero added findings (63 inherited in seven checked files).
+New diagnostic checks retain their separate source versions and outcomes above.
+
+Final source verification: seven affected fake-browser cases passed, 39 deselected,
+at bench 1a8ac290; AST/JavaScript syntax/diff checks and exact preservation of older
+packet evidence passed. Independent documentation review is clear.
+Publication target: the existing draft PR #16 on integration. Preserve its draft
+state, publish the redacted candidate, and record the verified remote head in
+the PR/private ledger; no main merge is authorized.
+Do not label a camera-only pass as powered camera repair, a partial repeat as
+continuous endurance, or the return envelope as precise physical return.

@@ -14,69 +14,198 @@ GitHub returned no commit status contexts or PR workflow runs for either head.
 Prior test results below retain their actual source versions; integration did
 not trigger another broad suite or powered trial.
 
+### Restored access and virtual-control results — October 6, 2026
+
+The owner restored both leaders and the spare observer, then directed bounded
+virtual arm/body controls without attendance requests or owner leader/key
+movements. This supersedes the earlier attendance and owner-movement instructions
+for these ordinary checks. Existing guards and excluded fault scenarios remain.
+Moving physical-leader input is untested; the 180-second scenario is prepared.
+
+Both original leader identities are present at their existing COM assignments,
+and the non-actuating 180-second preflight passes with unchanged calibration.
+The intended P1 observer host and existing remote access were verified. Only
+the spare camera was initialized and its supported modes enumerated. Two private
+1280×720/10 fps NV12, six-second H264 clips without audio were normally stopped
+and released, retrieved with matching SHA256 hashes, and completely decoded
+(56 and 55 frames). Three images per clip retain decoder presentation timestamps;
+two new frames from each clip were inspected. Recording request/acknowledgment
+times are separate from within-clip presentation timestamps. The second clip
+overlaps arm-01 and shows both arms and the lift, with blocky early video and
+some changing positions. It does not quantify three-unit tracking or isolate
+a joint. Base supports and the disconnect are outside the view. Unrelated
+cameras/services were untouched; imagery and access/device metadata stay private.
+
+These are packet-02 attempts. Keep the packet-01 verdicts below unchanged.
+
+| Attempt | Actual result |
+| --- | --- |
+| body-01 | Refused before Live: expected motors absent on the left follower/body bus. No native client or pulses. Host 1, camera 0, original session 2 / cleanup_unknown. The owner confirmed follower power was off and restored it. |
+| body-02 | 12.086 seconds Live, frontend W/A/U/J press/release, 120 sends, zero feedback timeout/recovery or body-input expiration; session/client/host/camera exit 0 and verified cleanup. |
+| arm-01 | 51.503 seconds Live, 48.172/88 trajectory seconds, then Pi temperature-history freshness refusal. One freeze, recovery epoch 1, no completed recovery. Native 130 after fault Stop, host 1, original session 2 / cleanup_unknown. |
+| arm-02 | Frontend state-request-failed during camera startup, before motor host/native client/Live/pulses. Owned Stop: operator_stopped/130, verified cleanup, camera 0. HTTP versus JSON/UI-processing cause is unknown. |
+| arm-03 | 6.135 seconds Live, 2.105/88 trajectory seconds, then runner Stop on a five-second required-camera-view timeout. Session/native 130, host/camera 0, verified cleanup; 13 empty polls, zero freezes/recovery. |
+| arm-04 | One complete 88.000-second commanded trajectory in 88.803 seconds Live, 883 sends; all runtime exits 0, verified cleanup. Three preserved empty polls, no feedback recovery/stale latch. Small-return tracking remains incomplete. |
+| arm-05 | One ArmSmokeRepeat attempt: 54.096 seconds Live, 51.009/352 trajectory seconds, 538 sends. Required chest/left-wrist decoded views became stale; owned Stop, session/native 130, host/camera 0, verified cleanup. Ten preserved empty polls, zero freezes/recovery/stale latch; no completed cycle or boundary. |
+
+After body-01 and again after arm-01, a reviewed exclusive one-shot invocation
+of the installed normal zero/off routine freshly verified all 16 torque
+registers and four body/lift velocity goals were zero and closed both ports.
+It held both ownership locks, checked exact motor/source identities, protected
+cancellation cleanup, and preserved calibration and each original summary byte
+for byte. Seven private fake verifier cases pass. These are separate register
+proofs, not retroactive successful cleanup or full motion/thermal qualification.
+Each permitted replacement of a stopped idle console before a deliberate new
+attempt. No recovery approval or automatic restart was used.
+
+Body-02 operational lift samples were 30–33 C, at most 65 mA, status zero,
+11.3–11.9 V, with largest adjacent raw-read gap 61.023 ms. Up/down goal and
+measured velocities were ±200 raw; height ranged 10.356–11.074 mm and ended
+at 10.356 mm. All-phase logs also retain an unexplained isolated startup 68 C
+reading/warning and homing current up to 435.5 mA. Those are separate from
+operational maxima. Wheel displacement is unmeasured. Static leader reads and
+startup synchronization do not qualify moving physical input.
+
+Arm-01 operational lift samples were 31–34 C, at most 32.5 mA, status zero
+and 11.7–11.9 V. The unchanged temperature guard correctly refused five genuine
+slot peaks spanning 512.023 ms against its 500 ms limit. Offline replay of
+actual acquisition timestamps reproduces the first fault. The initiating
+adjacent-read gap was 143.022 ms; the next group read took 1.440 ms. This
+locates delay after the prior sample in owner-loop work/scheduling, but the
+specific phase/cause was not retained. The old snapshot contained a subsequent
+healthy loop and the current refusing loop. Later empty-poll/error output
+follows the dead host and is not a successful recovery. Wi-Fi, logging,
+servo failure and overheating are not established causes.
+
+Seven completed arm-01 endpoints had maximum error 1.596 normalized units.
+Left shoulder-lift responded +2.9975 to its +3-unit command, then stayed there
+through the small return request and origin hold. Arm-04 again showed +2.9975
+outward response without the small return. Its maximum outbound endpoint error
+was 2.6896; final maximum seed displacement was 2.9975. Other joints showed
+mixed partial return. Arm-05 left shoulder-lift reached +3.3306 and retained
+that displacement through return/origin hold. No repeat boundary was reached.
+These are normalized units, not degrees. Outward response is measured; precise
+small-return response is unresolved. Gains, amplitudes and calibration stay unchanged.
+
+Arm-04 operational lift samples were 32–35 C, at most 39 mA, status zero,
+11.7–11.9 V; largest adjacent gap 60.028 ms. One isolated startup temperature
+warning remains in the logs. Its sole script freeze is the normal terminal
+finally call after completion, not a feedback pause. Arm-05 operational lift
+samples were 32–35 C, at most 39 mA, status zero, 11.7–11.9 V, with largest
+adjacent gap 62.022 ms and no temperature warning. Arm-04/05 lift height stayed
+within 10.397–10.418 mm. Temperature/current measurements here are lift-only.
+
+### Diagnostics and observation limits
+
+A reviewed host-only diagnostic retains eight completed loop timings plus the
+current loop, independent snapshot copies and an explicit omitted-loop count.
+It adds no motor reads, control threads, IO, sleeps or periodic output and
+does not change temperature policy. RED/green regressions and 14 focused host
+fault/loop tests pass; lint adds no finding. Staging used stopped owners, exact
+old/new file hashes, a one-file diff, clean detached source and an in-place
+private motor-pin update preserving permissions.
+
+The bench now records passive frontend state HTTP/failure/page-error evidence
+and bounded per-role decoded-image ages, sequences, source labels and decode
+diagnostics. It retains at most 700 records with an explicit dropped count.
+Fake frontend 503/disconnect cases were RED, then five affected checks passed.
+Camera-loss was RED, then four affected checks passed; the exact readiness
+timeout regression also passed after RED. A readiness-failure snapshot starts
+without awaiting it before owned Stop. Evidence finalization waits at most one
+second after cleanup and preserves failure timing if the snapshot is unavailable.
+No served Control behavior, camera threshold, recovery approval or retry changed.
+At final bench source 1a8ac290, all seven affected fake-browser cases passed
+(39 deselected); AST/JavaScript syntax and diff checks also passed.
+
+Arm-03 recorded 196 frontend state HTTP 200 responses, zero failed state
+requests/page errors. Pi source cameras stayed fresh while decoded views were
+intermittently stale. A subsequent exclusive camera-only 60-second run exited 0.
+Its 35-second read-only browser check retained 24 DOM samples, all five views
+fresh, with zero status/decode failures/cancellations and maximum primary display
+gap 495 ms. That demonstrates availability, not repair of the interruption.
+Arm-04 recorded 316 state HTTP 200 responses and 416 retained Live camera samples
+all five fresh; 37 earlier ring records were evicted.
+
+Arm-05 recorded 249 state HTTP 200 responses, zero failed state requests/page
+errors, and no dropped records. At the first camera refusal, chest and left
+wrist image ages were 1653/1652 ms against the 1500 ms thumbnail limit; the
+other views remained fresh. Diagnostics showed three camera-status failures,
+maximum status request 1517 ms, and zero decode failures/stream cancellations.
+Pi acquisition remained fresh at roughly 15–20 fps with maximum source gaps
+under 71 ms. The delay is in delivery of decoded views; its exact layer is
+not yet established. No full cycle or continuous-duration pass follows from
+this interrupted attempt.
+
+A corrected camera-only 120-second diagnostic then exited 0 without motor
+access; a fresh source/owner audit found clean pins and no remaining owner.
+Its 105-second read-only browser capture recorded 105 DOM samples, all five
+views fresh, with no dropped record, failed request, decode failure or stream
+cancellation. It received 213 state, 366 camera-status and 840 snapshot HTTP 200
+responses. Maximum snapshot duration was 802.615 ms, mainly waiting for
+response bytes after a roughly 2 ms local connection/request start; maximum
+status duration was 447.513 ms. This does not isolate network versus proxy/Pi
+waiting and is not a matched powered camera repair. The earlier SSH TCP
+connection timeout and the mistakenly requested 180-second camera diagnostic
+are retained separately: both failed before capture, the latter at the installed
+120-second duration guard. That guard was not changed.
+
 ### Opt-in finite repetition
 
-Ordinary `ArmSmoke` and its 30/180-second runner options are unchanged.
-`ArmSmokeRepeat` composes exactly four existing 88-second trajectories in one
-native Local session. It keeps the original fresh frozen seed, inward 3-unit
-targets, three-second ramps, existing holds, 10 Hz cadence, freshness and
-recovery rules. No cycle homes, synchronizes, reconnects devices or starts a
-new session. The 352 trajectory seconds include the original holds; boundary
-qualification time is excluded from trajectory progress.
+Ordinary `ArmSmoke` and its 30/180-second runner options remain unchanged.
+`ArmSmokeRepeat` composes four existing 88-second trajectories in one native
+Local session. It retains one original fresh frozen seed, inward 3-unit targets,
+three-second ramps, original holds, 10 Hz cadence and existing freshness/recovery
+rules. No cycle homes, synchronizes, reconnects or starts a new session. The
+352 trajectory seconds include the original holds; boundary time is excluded.
 
-At every return, including the fourth, three distinct advancing observations
-must span at least 0.2 seconds and stay within 3 normalized units of the
-original seed. Only the existing active-epoch sender can admit a tick, with
-the unchanged combined request/local age limit. A pause discards the partial
-return window and elapsed wall time. A return outside tolerance refuses through
-ordinary cleanup; there is no reseeding, corrective jump or automatic retry.
-Completion has one profile-specific terminal summary, four completed cycles
-and four qualified returns. The native ceiling is exactly 420 seconds, checked
-by the console/session/native paths and PowerShell launchers. Partial runs
-remain partial. Body/lift commands remain disabled for scripted profiles.
+At every boundary, including the fourth, three distinct sender-admitted fresh
+advancing observations must span at least 0.2 seconds and remain within 3
+normalized units of the original seed. A pause clears the partial qualification
+window and elapsed wall time. Outside-tolerance feedback refuses through normal
+cleanup; no reseeding, corrective jump or automatic retry is permitted.
 
-The separate `PhysicalLeader` runner scenario requests one ordinary 180-second
-physical-leader session. The owner moves both leaders briefly after normal
-startup; the runner uses the existing owned frontend for W/A/U/J press/release
-actions of 200 ms. Its observations and pulses are evidence of accepted input,
-not a claim of measured base/lift motion. Existing gate, ownership, camera,
-controller-loss, session-bound Stop and cleanup requirements remain in force.
-Neither new scenario approves recovery or restarts motion automatically.
+This is an envelope admission check. Its tolerance equals the commanded excursion,
+so it does not prove precise physical return: offline replay of the actual
+arm-04 final pose at 2.9975 units qualifies with three advancing synthetic
+observations. The replay is not powered evidence. Original-seed retention still
+prevents cumulative rebasing across cycles. A successful workload requires one
+profile-specific terminal summary, four cycles and four qualified boundaries.
+The native ceiling is exactly 420 seconds throughout console/session/native
+and PowerShell launch paths. Scripted profiles disable body/lift input.
 
-Offline verification of the affected core paths: **304 passed, 1 skipped**.
-Affected bench cases: **18 passed**. Nine affected tests were rerun successfully
-after test-only lint repairs. RED was observed for the missing provider/native
-dispatch, launch/summary path and browser scenarios before their implementations.
-Fake native entrypoint tests complete all four cycles with one connection and
-one live admission; real sender tests reject stale/lost admission at a boundary.
-Real frontend/HTTP/Windows pipe tests dispatch both new scenarios and verify
-owned cleanup. These fake tests are not powered endurance evidence. Python AST,
-JavaScript syntax and diff checks pass; Ruff 0.14.1 adds no findings against the
-exact integrated base (63 inherited findings in the seven checked files).
+`PhysicalLeader` remains a separately selected ordinary 180-second session
+for actual movements of both physical leaders and 200 ms owned frontend W/A/U/J
+pulses. The latest owner-directed virtual checks did not exercise moving leaders.
 
-### Working and deployed paths
+At runtime source 7249eec3, affected core verification was **304 passed, 1 skipped**
+(POSIX process-group test on Windows); affected bench cases were **18 passed**.
+Nine affected tests reran after test-only lint repairs. Fake native entrypoint
+tests complete four cycles with one connection/admission; real sender tests
+refuse stale/lost admission at boundaries. Real frontend/HTTP/Windows pipe tests
+verify dispatch and owned cleanup. These are not powered endurance evidence.
+AST, JavaScript syntax and diff checks pass. Ruff 0.14.1 comparison adds no
+findings against integration (63 inherited findings in seven checked files).
 
-The follow-up branch is `codex/am1-reliability-02`, from integrated `9aa6d3b0`,
-in `C:\Users\pickm\.codex\worktrees\am1-reliability-01\lerobot_alohamini_client`.
-The shell is PowerShell 7. Tests reuse
-`C:\Users\pickm\lerobot_alohamini_client\.venv`, with `uv run --no-sync` and
-the candidate's `src` and root on `PYTHONPATH`; no dependency installation is
-required. The affected deployment is Windows console/client/launcher only.
-The Pi helper, motor and camera require no source change for profile selection.
+### Working paths, deployment and rollback
 
-The post-merge audit found clean deployed Windows source `81c10a84`, helper
-`8e6a0cf6`, motor `c3fc683d` and camera `9b1f0670`, with no Pi runtime owner.
-Windows `81c10a84` to integrated `9aa6d3b0` differs only in two documentation
-files, so the merges did not justify a cosmetic deployment. Any staging of
-this follow-up must instead use its reviewed runtime commit and update only
-the separate private Windows pin. Back up the private config outside Git,
-preserve its permissions, and stage only with the session and all owners
-stopped. Rollback for this follow-up is the stopped Windows source and private
-Windows pin `81c10a8497fda8eea36bac3ea6861f9e6ff5ed05`; Pi pins stay separate.
+Candidate branch: `codex/am1-reliability-02`, based on `9aa6d3b0`, in
+`C:\Users\pickm\.codex\worktrees\am1-reliability-01\lerobot_alohamini_client`.
+Shell: PowerShell 7. Use the existing
+`C:\Users\pickm\lerobot_alohamini_client\.venv` with `uv run --no-sync` and
+the candidate root/`src` on `PYTHONPATH`; no installation is required.
+
+The post-merge comparison from Windows 81c10a84 to integration 9aa6d3b0 was
+documentation-only and did not justify deployment. Reviewed finite-repeat
+runtime 7249eec309f9ebdf4bbc469c1cc888cb2e2fe673 was subsequently staged on
+Windows. Pi helper remains 8e6a0cf616cb2000df1d0e996ab27a19d2fb2fba and
+camera remains 9b1f0670e7068f7d39eb50270a118e3807418355. Only Pi motor
+changed, to host-history diagnostic 6d99b263d609c4048602a1ac5c48dda679f65c74,
+parent c3fc683d; its file matches candidate host commit 81034618. The separate
+passive bench runner is 1a8ac290, not the served Windows runtime.
 
 Configured deployment directory:
 `C:\Users\pickm\lerobot_alohamini_client\.worktrees\am1-console-implementation`.
-Its launch remains:
+Existing launch:
 
 ```powershell
 $env:UV_PROJECT_ENVIRONMENT = 'C:\Users\pickm\lerobot_alohamini_client\.venv'
@@ -84,81 +213,38 @@ $env:PYTHONPATH = "$PWD\src;$PWD"
 uv run --no-sync python -m tools.am1_console --config config\am1.session.json --no-browser
 ```
 
-With that reviewed source staged, existing connections verified, motor supplies
-restored in their established assignments, an accessible disconnect and the
-owner supervising, use one visible ordinary Control browser invocation:
+Rollback only while stopped/unowned: restore Windows detached
+81c10a8497fda8eea36bac3ea6861f9e6ff5ed05 and only its private Windows pin
+from the preserved backup. Independently restore Pi motor detached
+c3fc683d645ea1c355e69a72f705a8bbadde6a1a and only its private motor pin.
+Preserve private-file permissions, mappings, calibration and separate pins.
 
-```powershell
-$head = (Get-Content config\am1.session.json -Raw | ConvertFrom-Json).windows_session_head
-$env:AM1_BENCH_HEADLESS = '0'
-# Use the existing NODE_PATH for installed Playwright, as in packet 01.
-node tools\am1_reliability_bench.cjs http://127.0.0.1:8765/ PhysicalLeader `
-    AM1-RELIABILITY-02-physical-01 C:\Users\pickm\AlohaMini1Logs\am1-reliability-02\physical-01.json $head
-# A separate later supervised invocation, after reviewing the physical session:
-node tools\am1_reliability_bench.cjs http://127.0.0.1:8765/ ArmSmokeRepeat `
-    AM1-RELIABILITY-02-arm-01 C:\Users\pickm\AlohaMini1Logs\am1-reliability-02\arm-01.json $head
-```
+Use the reviewed candidate bench with the existing installed Node/Playwright,
+`AM1_BENCH_HEADLESS=0`, the actual configured Windows head, and a new private
+evidence path/identity for each deliberate invocation. Page opening never Starts.
+Ordinary launch syntax is `node tools\am1_reliability_bench.cjs <console-url>
+<scenario> <new-identity> <new-private-json> <actual-windows-head>`.
+Prepared scenarios are PhysicalLeader (180 seconds) and ArmSmokeRepeat (420).
 
-### Connection and observation evidence
+### Remaining physical evidence and stop capability
 
-Duffy is `Duffy_Laptop`. Its present PnP/serial inventory has no ports, neither
-configured controller, and no dedicated leader hub. Preserve the recorded map:
-left `USB\VID_1A86&PID_55D3\5B3D045224` in `LEFT-LABELED-SOCKET` (historical
-COM8); right `USB\VID_1A86&PID_55D3\5B3D048497` in `RIGHT-LABELED-SOCKET`
-(historical COM7). Restore the existing dedicated hub's upstream USB connection
-and those controllers to their labeled sockets, with the AM1 session stopped
-and motor/leader power off. Keep leaders on their designated 7.4 V supplies
-and the established regulated 12 V / 10 A follower/body supply. USB absence
-does not establish a failed supply. No ID reassignment, calibration, installer
-or supply change is indicated by this inventory.
+The older packet-01 shoulder-lift sample was clipped at normalized 100 during
+a 100→97 request. Normalized 100 cannot distinguish physical nonmovement from
+raw feedback outside calibration. New outward response establishes movement
+within the interval; small return remains unqualified. Existing command and
+feedback logs do not establish a servo failure or an active arm current limit.
+No competing motor reader/controller or undocumented tuning was introduced.
 
-P1's existing `codex-home` SSH route succeeds and returns `WIN-6E43SCJGTL7`.
-Independent present USB/Camera/Image/Media and video-interface enumerations
-show only the existing THETA V (`VID_05CA/PID_2712/MI_01`), not the spare
-observer. At `2026-10-06T23:09:33.5262847Z`, the read-only video-interface
-query returned that device, unsupported static camera profiles and no
-advertised recording-profile modes; no capture was initialized. That is not
-proof that THETA has no recording modes. The spare's supported modes remain
-unqueryable until it is exposed. Existing OBS, THETA, printer cameras and
-unrelated services were untouched. The failing layer is peripheral exposure
-on P1, not SSH authentication or network access.
-
-Connect the existing spare observer USB to P1 without rearranging printer
-cameras. Then enumerate its new exact identity and supported modes, capture
-one bounded private 5–10-second low-resolution clip with actual acquisition
-times and selected images, retrieve those images over the existing SSH/SFTP
-route, and inspect a newly acquired image using the Codex image tool. Retained
-images with rewritten timestamps cannot meet this check. No spare clip/image
-was captured or visually inspected in this packet yet; no private images or
-credentials belong in Git.
-
-### Physical evidence and stop boundary
-
-The saved arm-04 left shoulder-lift request was 100→97 while normalized
-feedback remained 100 (zero observed displacement, −3 tracking error).
-Position normalization clips raw feedback at the calibration bounds, while
-unnormalization maps the requested value into the calibrated range. Thus
-normalized 100 alone cannot distinguish physical nonmovement from saturation
-outside the calibrated interval. Raw position/current evidence for this joint
-and the ordinary physical movement/visual check remain pending. No servo
-failure, gain, amplitude or calibration change follows from this result.
-
-Read-only software/installation checks found the established two follower USB
-aliases and no AM1/estop/motor-disable systemd unit. The installed path's stop,
-watchdog and torque-off cleanup depend on the owning motor process; no
-independent disable route is configured or qualified by these checks. The
-physical disconnect hardware has not been visually verified. Recommend a
-reachable, appropriately rated local cutoff of the AM1 motor supplies that
-works independently of Windows, network and Pi execution. New wiring and
-dock hardware are outside this packet. Until qualified, longer powered work
-requires supervision and an accessible existing disconnect; process-freeze,
-bus-fault and overload tests remain withheld.
-
-The arm swing-down confirmation is retained; it does not prove process-freeze
-protection. Packet-01 evidence below keeps its original taxonomy, units and
-limits. This packet has no new powered session, physical-leader/body result,
-external visual corroboration or longer endurance pass. Those checks remain
-pending after the physical connections and supervised setup are restored.
+Read-only installation checks found the existing follower USB aliases and no
+configured AM1 independent motor-disable unit. Stop, watchdog and torque-off
+cleanup depend on the owning motor process. The physical disconnect is outside
+the observer view, so independent cutoff capability is not visually verified
+or qualified. Recommend a reachable, appropriately rated local cutoff of AM1
+motor supplies that works independently of Windows, Pi and the network.
+New wiring/dock hardware is outside this packet. Retain the owner's arm
+swing-down confirmation; it does not establish process-freeze protection.
+Process freeze, forced bus fault, overload and unrestricted/automatic recovery
+remain excluded. AM2 is untouched.
 
 ## AM1-RELIABILITY-01 — October 6, 2026
 
