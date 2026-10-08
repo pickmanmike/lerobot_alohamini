@@ -12,6 +12,7 @@ import argparse
 import base64
 import hashlib
 import io
+import ipaddress
 import json
 import math
 import os
@@ -681,9 +682,32 @@ def _ssh(alias: str) -> list[str]:
     ]
 
 
+def _delivery_bind_address(value):
+    if value is None:
+        return None
+    message = "delivery bind address requires a usable numeric IPv4 source"
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9.]{7,15}", value):
+        raise ValueError(message)
+    try:
+        address = ipaddress.IPv4Address(value)
+    except ipaddress.AddressValueError:
+        raise ValueError(message) from None
+    if address.packed[0] == 0 or address.is_loopback or address.packed[0] >= 224 or address.packed[-1] == 255:
+        raise ValueError(message)
+    return str(address)
+
+
 def _observer_forward_command(
-    alias, local_port, remote_port, *, compression=False, forwarding_only=False, ipqos_none=False
+    alias,
+    local_port,
+    remote_port,
+    *,
+    compression=False,
+    forwarding_only=False,
+    ipqos_none=False,
+    bind_address=None,
 ):
+    bind_address = _delivery_bind_address(bind_address)
     if any(type(port) is not int or not 1024 <= port <= 65535 for port in (local_port, remote_port)):
         raise ValueError("invalid owned observer forwarding port")
     options = ["-o", "ExitOnForwardFailure=yes", "-L", f"127.0.0.1:{local_port}:127.0.0.1:{remote_port}"]
@@ -691,6 +715,8 @@ def _observer_forward_command(
         options += ["-o", "Compression=yes"]
     if ipqos_none is True:
         options += ["-o", "IPQoS=none"]
+    if bind_address is not None:
+        options += ["-o", "BindAddress=" + bind_address]
     if forwarding_only:
         options += ["-N"]
     return _ssh(alias)[:-1] + options + [alias]
@@ -917,6 +943,7 @@ def run_capture(args) -> int:
     import secrets
     import socket
 
+    bind_address = _delivery_bind_address(getattr(args, "delivery_bind_address", None))
     config = json.loads(args.config.read_text(encoding="utf-8-sig"))
     required = ("expected_host", "camera_name", "video_device_id", "remote_output_root")
     if any(not isinstance(config.get(key), str) or not config[key] for key in required):
@@ -993,16 +1020,21 @@ def run_capture(args) -> int:
         local_port = probe.getsockname()[1]
     compression = getattr(args, "delivery_compression", False) is True
     ipqos_none = getattr(args, "delivery_ipqos_none", False) is True
-    _atomic_json(
-        output / "delivery-transport.json",
-        {
-            "generation": args.generation,
-            "delivery_compression": compression,
-            "delivery_ipqos_none": ipqos_none,
-        },
-    )
+    transport_evidence = {
+        "generation": args.generation,
+        "delivery_compression": compression,
+        "delivery_ipqos_none": ipqos_none,
+    }
+    if bind_address is not None:
+        transport_evidence["delivery_bind_address"] = bind_address
+    _atomic_json(output / "delivery-transport.json", transport_evidence)
     command = _observer_forward_command(
-        args.ssh_host, local_port, remote_port, compression=compression, ipqos_none=ipqos_none
+        args.ssh_host,
+        local_port,
+        remote_port,
+        compression=compression,
+        ipqos_none=ipqos_none,
+        bind_address=bind_address,
     ) + _powershell(
         "$ProgressPreference='SilentlyContinue';$ErrorActionPreference='Stop';"
         f"& {_ps_quote(remote_script)} -ConfigPath {_ps_quote(remote_config)}"
@@ -1201,6 +1233,7 @@ def run_capture(args) -> int:
                                         compression=compression,
                                         forwarding_only=True,
                                         ipqos_none=ipqos_none,
+                                        bind_address=bind_address,
                                     ),
                                     stdin=subprocess.DEVNULL,
                                     stdout=subprocess.DEVNULL,
@@ -1501,8 +1534,10 @@ def run_capture(args) -> int:
     }
     if diagnostic.enabled:
         summary["delivery_diagnostics"] = diagnostic.snapshot()
+    if bind_address is not None:
+        summary["delivery_bind_address"] = bind_address
     _atomic_json(output / "receiver-result.json", summary)
-    print(json.dumps(summary))
+    print(json.dumps({key: value for key, value in summary.items() if key != "delivery_bind_address"}))
     return (
         0
         if not failure
@@ -2006,6 +2041,11 @@ def main() -> int:
         "--delivery-ipqos-none",
         action="store_true",
         help="Use the OS-default IP QoS only on this capture's SSH forwarding transports",
+    )
+    parser.add_argument(
+        "--delivery-bind-address",
+        type=_delivery_bind_address,
+        help="Bind only this capture's SSH forwarding transports to a numeric IPv4 source address",
     )
     offline = parser.add_mutually_exclusive_group()
     offline.add_argument("--retrieve-only", action="store_true")
