@@ -143,8 +143,25 @@ startup continues its existing synchronization using the corrected follower coor
 Final focused checks: 254 startup, corrected-endpoint/restart, virtual amplitude, early
 preflight, preparation and launcher cases pass. Three unsafe-startup mutations and endpoint
 exclusion are caught. New modules are lint-clean; modified legacy files introduce no new
-lint findings. Independent final review is clear. Actual I0 useful return and the full
-workload remain pending; no powered motion is claimed from these software checks.
+lint findings. Independent source review is clear; software checks remain separate from
+actual motion qualification.
+
+Actual automatic startup now succeeds from normal rest. The short I0 baseline showed too
+little selected-joint motion to prove useful return. The scoped reversible I1 comparison
+showed a gradual small excursion and actual later return near the original seed, with
+normal cleanup and verified restoration to I0. Images independently show reversal without
+new contact or an abrupt startup move. The tighter immediate-return criterion did not pass;
+this result establishes a delayed useful return, not precision tracking at every phase.
+
+The next ArmSmokeRepeat attempt completed two cycles and two original boundary
+qualifications, reaching 220.053 of 352 trajectory seconds after 3.188 seconds of preparation.
+Three required-observation losses recovered in the same session; a fourth freshness loss
+exhausted the unchanged recovery budget and triggered ordinary owned Stop. Cleanup was
+verified. A subsequent benchmark finalization timeout occurred during stopped-session log
+collection; it is secondary to the preserved observation-budget stop. Full completion and
+the planned comparable restart confirmation remain pending. Investigate the demonstrated
+response-delivery delay before another powered repeat; keep original source ages, ownership,
+freshness thresholds, trajectory, seed and recovery budgets unchanged.
 
 Plan: [AM1-03 executable plan](../superpowers/plans/2026-10-06-am1-reliability-03.md).
 Historical packet-02/01 evidence below retains its original verdicts.

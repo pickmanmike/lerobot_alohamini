@@ -54,6 +54,8 @@ class FakeSessionIO:
         self.output_records = []
         self.native_marker_delay_s = 0  # Explicit failure model; unchanged nominal workload.
         self.finalization_delay_s = 0
+        self.cleanup_before_finalization = False
+        self.stop_exit_code = 0
         self.native_closed_at = None
 
     def parse_duration_seconds(self, value):
@@ -137,7 +139,7 @@ class FakeSessionIO:
                     host_feedback[0] = {"state": "paused", "epoch": epoch}
                     if not native.wait_gate("resume", host_epoch=epoch,
                                             cancel=self.stopped.is_set, timeout_s=8):
-                        return 0 if self.stopped.is_set() else 2
+                        return self.stop_exit_code if self.stopped.is_set() else 2
                     epoch += 1
                     host_feedback[0] = {"state": "active", "epoch": epoch}  # Not the UI approval itself.
                     native.note_live_admitted(host_epoch=epoch)
@@ -151,7 +153,7 @@ class FakeSessionIO:
                     output_offset += len(data)
                     last_output = now
                 time.sleep(.02)
-            return 0
+            return self.stop_exit_code if self.stopped.is_set() else 0
         except BaseException as exc:
             self.error = exc
             raise
@@ -161,11 +163,17 @@ class FakeSessionIO:
                 telemetry_thread.join(1)
             native.disconnect()
             self.native_closed_at = time.monotonic()
+            if self.cleanup_before_finalization:
+                emit({"event": "client_exited", "exit_code": self.stop_exit_code if self.stopped.is_set() else 0})
+                emit({"event": "cleanup", "cleanup_verified": True})
             if self.finalization_delay_s:
                 time.sleep(self.finalization_delay_s)
             emit({"event": "cleanup", "cleanup_verified": True})
-            emit({"event": "session_complete", "session_id": identity,
-                  "cleanup_verified": not native.is_connected and not native._worker.is_alive()})
+            completed = {"event": "session_complete", "session_id": identity,
+                         "cleanup_verified": not native.is_connected and not native._worker.is_alive()}
+            if self.stopped.is_set() and self.stop_exit_code == 130:
+                completed.update(final_exit_code=130, operator_stopped=True)
+            emit(completed)
 
     def _startup(self, native, emit):
         # Import only function code; all device boundaries below are synthetic
@@ -741,7 +749,7 @@ def test_bench_refuses_unqualified_native_duration_before_browser(tmp_path, scen
 @pytest.mark.skipif(sys.platform != "win32", reason="Actual AF_PIPE is Windows-only")
 @pytest.mark.parametrize("case", ["healthy", "navigation", "blur", "hidden", "body-delay",
                                       "body-presence-loss", "short-browser-stall",
-                                      "body-reject", "body-denied", "state-reject", "state-delay", "pending-stop", "camera-delay", "approval-order", "startup-approval", "bench-body", "bench-arm", "bench-arm-short", "bench-repeat", "bench-physical", "bench-pause", "bench-foreign", "bench-monitor-failure", "bench-frontend-state-reject", "bench-frontend-state-reset", "bench-camera-loss", "bench-camera-readiness-timeout", "bench-finalize", "bench-finalize-stall", "bench-finalize-late-result", "bench-virtual-optional-camera", "bench-virtual-recovery", "bench-virtual-operator", "bench-virtual-body", "bench-virtual-required-camera", "bench-virtual-start-refusal"])
+                                      "body-reject", "body-denied", "state-reject", "state-delay", "pending-stop", "camera-delay", "approval-order", "startup-approval", "bench-body", "bench-arm", "bench-arm-short", "bench-repeat", "bench-physical", "bench-pause", "bench-foreign", "bench-monitor-failure", "bench-frontend-state-reject", "bench-frontend-state-reset", "bench-camera-loss", "bench-camera-readiness-timeout", "bench-finalize", "bench-finalize-stall", "bench-finalize-late-result", "bench-finalize-verified", "bench-virtual-budget-stop", "bench-virtual-optional-camera", "bench-virtual-recovery", "bench-virtual-operator", "bench-virtual-body", "bench-virtual-required-camera", "bench-virtual-start-refusal"])
 def test_browser_loopback_native_path(tmp_path, case):
     node = shutil.which("node")
     if not node or subprocess.run([node, "-e", "require('playwright')"], capture_output=True).returncode:
@@ -755,6 +763,14 @@ def test_browser_loopback_native_path(tmp_path, case):
         session.finalization_delay_s = 12
     if case == "bench-finalize-late-result":
         session.finalization_delay_s = 9.5
+    if case in {"bench-finalize-verified", "bench-virtual-budget-stop"}:
+        # External log collection follows verified client/host cleanup, and
+        # can outlast the input pipe's unchanged unverified-cleanup deadline.
+        session.cleanup_before_finalization = True
+        session.finalization_delay_s = 11.5
+    if case == "bench-virtual-budget-stop":
+        session.live_duration_s = 30
+        session.stop_exit_code = 130
     startup_release = threading.Event()
     if case == "startup-approval":
         def before_gate(stage, emit):
@@ -807,7 +823,8 @@ def test_browser_loopback_native_path(tmp_path, case):
             return real_operation(payload)
         adapter.operation = competing_start
     observer_stop, observer_lost = threading.Event(), [False]
-    observer_thread, output_replay = None, []
+    observer_thread, output_replay, coverage_thread = None, [], None
+    coverage_errors = []
     virtual_config_path = tmp_path / "virtual-config.json"
     if virtual_case:
         health_path = tmp_path / "latest-health.json"
@@ -839,6 +856,7 @@ def test_browser_loopback_native_path(tmp_path, case):
         observer_thread = threading.Thread(target=observer_updates, daemon=True)
         observer_thread.start()
         def virtual_live():
+            nonlocal coverage_thread
             if case == "bench-virtual-optional-camera":
                 threading.Timer(1, lambda: setattr(camera, "snapshot_role_delays", {"chest": 3, "wrist_left": 3})).start()
                 threading.Timer(4, lambda: setattr(camera, "snapshot_role_delays", {})).start()
@@ -853,6 +871,32 @@ def test_browser_loopback_native_path(tmp_path, case):
                 threading.Timer(2, lambda: observer_lost.__setitem__(0, False)).start()
             elif case == "bench-virtual-operator":
                 adapter._bridge.request_pause("operator")
+            elif case == "bench-virtual-budget-stop":
+                def coverage_episodes():
+                    for episode in range(1, 5):
+                        observer_lost[0] = True
+                        if episode == 4:
+                            return  # Current real policy must Stop instead of a fourth Resume.
+                        episode_deadline = time.monotonic() + 8
+                        while not observer_stop.wait(.02):
+                            policy = adapter._bench_policy
+                            if policy is not None and policy.seen_pause:
+                                break
+                            assert time.monotonic() < episode_deadline, "native coverage hold did not arrive"
+                        observer_lost[0] = False
+                        while not observer_stop.wait(.02):
+                            if adapter._bench_policy.recovery_count == episode:
+                                break
+                            assert time.monotonic() < episode_deadline, "qualified recovery did not complete"
+                        if observer_stop.wait(.4):
+                            return
+                def run_coverage_episodes():
+                    try:
+                        coverage_episodes()
+                    except BaseException as error:
+                        coverage_errors.append(error)
+                coverage_thread = threading.Thread(target=run_coverage_episodes, daemon=True)
+                coverage_thread.start()
         session.on_live = virtual_live
     native_states = []
     real_emit = adapter._emit
@@ -917,13 +961,26 @@ def test_browser_loopback_native_path(tmp_path, case):
                     time.sleep(1.5)
                 super().do_GET()
         server.RequestHandlerClass = LateTerminalRead
+    if case == "bench-virtual-budget-stop":
+        class StopBetweenMonitorReads(ConsoleHandler):
+            def do_GET(self):  # noqa: N802 — delay only the external monitor request.
+                if (self.path == "/api/state" and self.headers.get("X-AM1-Bench-Monitor")
+                        and observer_lost[0] and adapter._bench_policy is not None
+                        and adapter._bench_policy.recovery_count == 3):
+                    # The real adapter's monitor can Stop and the real native
+                    # pipe can close between two benchmark status replies.
+                    closed_deadline = time.monotonic() + 2
+                    while session.native_closed_at is None and time.monotonic() < closed_deadline:
+                        time.sleep(.01)
+                super().do_GET()
+        server.RequestHandlerClass = StopBetweenMonitorReads
     threads = [threading.Thread(target=s.serve_forever, daemon=True) for s in (camera, server)]
     before = camera_handler.requests
     for thread in threads:
         thread.start()
     try:
-        arm_bench = case in {"bench-arm", "bench-arm-short", "bench-repeat", "bench-virtual-optional-camera", "bench-virtual-recovery", "bench-virtual-operator", "bench-virtual-required-camera", "bench-virtual-start-refusal"}
-        bench_scenario = ('ArmSmokeRepeat' if case in {'bench-repeat','bench-virtual-optional-camera','bench-virtual-recovery','bench-virtual-operator','bench-virtual-required-camera','bench-virtual-start-refusal'} else
+        arm_bench = case in {"bench-arm", "bench-arm-short", "bench-repeat", "bench-virtual-budget-stop", "bench-virtual-optional-camera", "bench-virtual-recovery", "bench-virtual-operator", "bench-virtual-required-camera", "bench-virtual-start-refusal"}
+        bench_scenario = ('ArmSmokeRepeat' if case in {'bench-repeat','bench-virtual-budget-stop','bench-virtual-optional-camera','bench-virtual-recovery','bench-virtual-operator','bench-virtual-required-camera','bench-virtual-start-refusal'} else
                           'PhysicalLeader' if case == 'bench-physical' else
                           'ArmSmoke' if arm_bench else 'BodyPressRelease')
         bench_identity = (('AM1-RELIABILITY-03-arm-01' if arm_bench else 'AM1-RELIABILITY-03-body-01') if virtual_case else
@@ -946,6 +1003,7 @@ def test_browser_loopback_native_path(tmp_path, case):
             bench_environment.pop("AM1_BENCH_VIRTUAL_CONFIG", None)
         result = subprocess.run(driver, env=bench_environment,
                                 capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=35)
+        assert not coverage_errors, coverage_errors
         if case in {'bench-repeat', 'bench-physical'}:
             assert result.returncode == 0, result.stdout + result.stderr
         intervals = [(seq, round((at - previous[1])*1000), active)
@@ -972,12 +1030,31 @@ def test_browser_loopback_native_path(tmp_path, case):
             assert not {"Approve", "ClaimInput"}.intersection(operations)
             if not virtual_case or case in {"bench-virtual-optional-camera","bench-virtual-operator"}:
                 assert "Resume" not in operations
-            if case in {"bench-pause", "bench-monitor-failure", "bench-frontend-state-reject", "bench-frontend-state-reset", "bench-camera-loss", "bench-camera-readiness-timeout", "bench-finalize-stall", "bench-finalize-late-result", "bench-virtual-operator"}:
+            if case in {"bench-pause", "bench-monitor-failure", "bench-frontend-state-reject", "bench-frontend-state-reset", "bench-camera-loss", "bench-camera-readiness-timeout", "bench-finalize-stall", "bench-finalize-late-result", "bench-virtual-budget-stop", "bench-virtual-operator"}:
                 assert result.returncode == 1
                 assert evidence["failure"]
                 if case == "bench-virtual-operator":
                     assert evidence["failure"] in {"Pause is not recoverable: operator", "Input pause: operator"}
                     assert evidence["recovery_attempts"] == 0
+                elif case == "bench-virtual-budget-stop":
+                    assert "recovery budget exhausted" in evidence["failure"]
+                    assert "stop cause unavailable" in evidence["failure"]
+                    assert "finalization deadline" not in evidence["failure"]
+                    assert evidence["final_exit_code"] == 130
+                    assert evidence["recovery_attempts"] == operations.count("Resume") == 3
+                    stopped = evidence["virtual_stop"]
+                    assert stopped["session_id"] == evidence["session_id"]
+                    assert stopped["reason"] == "recovery budget exhausted"
+                    assert stopped["reason_basis"] == "same-session stop event"
+                    assert stopped["cause"] is None and stopped["cause_basis"] == "unavailable"
+                    assert stopped["observed_pause_cause"] == "bench required coverage"
+                    assert stopped["observed_pause_cause_basis"] == "last observed policy"
+                    assert stopped["recovery_count"] == 3
+                    recorded_stop = next(record for record in evidence["records"]
+                                         if record["event"] == "virtual_bench_stop")
+                    assert not any(record["event"] == "operation_result" and record["kind"] == "Resume"
+                                   and record["received_wall_time_ms"] >= recorded_stop["received_wall_time_ms"]
+                                   for record in evidence["records"])
                 elif case in {"bench-pause", "bench-monitor-failure"}:
                     assert evidence["pulses"] == []
                 elif case == "bench-camera-loss":
@@ -1017,6 +1094,11 @@ def test_browser_loopback_native_path(tmp_path, case):
             else:
                 assert evidence["failure"] is None
                 assert "Stop" not in operations
+                if case == "bench-finalize-verified":
+                    closed = [record for record in evidence["records"] if record["event"] == "state"
+                              and record.get("input_pause_reason") == "pipe disconnected"]
+                    assert closed and closed[0]["cleanup_verified"] is True
+                    assert evidence["finished_wall_time_ms"] - closed[0]["received_wall_time_ms"] >= 11000
                 arm_duration = 30 if case == "bench-arm-short" else 180
                 if virtual_case:
                     assert session.start_requests == ([(420, 'scripted', 'ArmSmokeRepeat')] if arm_bench else [(12, 'scripted', 'ArmHoldBody')])
@@ -1049,13 +1131,13 @@ def test_browser_loopback_native_path(tmp_path, case):
                 else:
                     assert session.start_requests == ([(arm_duration, "scripted", "ArmSmoke")] if arm_bench else [(12, "physical", None)])
                 assert [pulse["key"] for pulse in evidence["pulses"]] == ([] if arm_bench else ["w", "a", "u", "j"])
-        if case not in {"bench-pause", "bench-monitor-failure", "bench-frontend-state-reject", "bench-frontend-state-reset", "bench-camera-loss", "bench-camera-readiness-timeout", "bench-finalize-stall", "bench-finalize-late-result", "bench-virtual-operator"}:
+        if case not in {"bench-pause", "bench-monitor-failure", "bench-frontend-state-reject", "bench-frontend-state-reset", "bench-camera-loss", "bench-camera-readiness-timeout", "bench-finalize-stall", "bench-finalize-late-result", "bench-virtual-budget-stop", "bench-virtual-operator"}:
             assert result.returncode == 0, result.stdout + result.stderr + f"\nServer body arrivals: {intervals[-20:]}"
         assert session.error is None
         assert camera_handler.requests > before
         assert adapter.wait(3), "session cleanup worker must terminate before verdict"
         final = adapter.state()
-        assert final["phase"] == "complete"
+        assert final["phase"] == ("operator_stopped" if case == "bench-virtual-budget-stop" else "complete")
         assert final["error"] is None
         assert final["cleanup_verified"] is True
         assert not session.native.is_connected
@@ -1065,6 +1147,8 @@ def test_browser_loopback_native_path(tmp_path, case):
         session.stopped.set()
         adapter.wait(3)
         observer_stop.set()
+        if coverage_thread:
+            coverage_thread.join(2)
         if observer_thread:
             observer_thread.join(2)
         for replay in output_replay:

@@ -70,6 +70,7 @@ assert(!(headless && target.port === "8765"), "Powered console bench requires th
     })().finally(()=>{observerEventWrite=null;});
   };
   let final = null, failure = null;
+  let virtualStop = null, lastVirtualPause = null;
   let readinessFailureSnapshot = null;
   let readinessFailureWallTime = null;
   let viewsRequired = false;
@@ -191,6 +192,29 @@ assert(!(headless && target.port === "8765"), "Powered console bench requires th
     if (ownedSession) assert.equal(state.session_id, ownedSession, "Session ownership changed");
     const verified = state.verified_source_heads;
     if (verified && verifySource) assert.equal(verified.windows_source_head, expectedWindowsHead);
+    const pauseCause = state.virtual_bench?.cause;
+    if (virtualConfig && ownedSession && RECOVERABLE_CAUSES.has(pauseCause)) lastVirtualPause = pauseCause;
+    // The native exit can replace the policy's disarm reason between polls.
+    // Its retained exact-session stop event still proves the earlier budget stop.
+    const exhausted = state.events?.find(event => event.event === "bench_recovery_exhausted" && event.session_id === ownedSession);
+    const policyStop = state.virtual_bench?.action === "stop" || state.virtual_bench?.disarm_reason === "recovery budget exhausted";
+    if (virtualConfig && ownedSession && state.virtual_bench?.enabled && !virtualStop &&
+        (exhausted || policyStop)) {
+      const eventCause = typeof exhausted?.cause === "string" ? exhausted.cause : null;
+      const currentCause = policyStop && RECOVERABLE_CAUSES.has(pauseCause);
+      virtualStop = {session_id:ownedSession,
+        reason:exhausted ? "recovery budget exhausted" : state.virtual_bench.disarm_reason,
+        reason_basis:exhausted ? "same-session stop event" : "current policy",
+        cause:eventCause ?? (currentCause ? pauseCause : null),
+        cause_basis:eventCause !== null ? "stop event" : currentCause ? "current policy" : "unavailable",
+        observed_pause_cause:lastVirtualPause,
+        observed_pause_cause_basis:lastVirtualPause === null ? "unavailable" : "last observed policy",
+        recovery_count:state.virtual_bench.recovery_count,
+        observed_input_epoch:state.input_epoch, observed_pause_sequence:state.virtual_bench.pause_sequence};
+      failure ||= `Virtual bench stopped: ${virtualStop.reason}: ${virtualStop.cause ?? "stop cause unavailable"}`;
+      keep({event:"virtual_bench_stop", ...virtualStop});
+    }
+    const nativeClosed = state.native_connected === false && state.input_pause?.reason === "pipe disconnected";
     const cameraEvidence = verifySource ? await readCameraEvidence() : null;
     const cameras = cameraEvidence?.summary ?? null;
     if (virtualPolicy && verifySource) {
@@ -208,7 +232,7 @@ assert(!(headless && target.port === "8765"), "Powered console bench requires th
         keep({event:"camera_quality", all_five_fresh:observation.all_five_fresh,
               degraded_roles:observation.degraded_roles,status_uncertain:observation.status_uncertain});
       }
-      if (ownedSession && Number.isInteger(state.input_epoch) && !terminal(state)) {
+      if (ownedSession && Number.isInteger(state.input_epoch) && !terminal(state) && !nativeClosed && !virtualStop) {
         if (virtualConfig.required_camera_roles.length && performance.now()-lastCoveragePost>=100) {
           lastCoveragePost = performance.now();
           const response = await page.request.post(`${address}api/operation`, {timeout:2000,maxRetries:0,
@@ -219,7 +243,7 @@ assert(!(headless && target.port === "8765"), "Powered console bench requires th
           keep({event:"bench_coverage_result",accepted:result.accepted,reason:result.reason});
         }
       }
-      if (ownedSession && state.native_connected && ["live","paused","feedback_stale"].includes(state.phase)) {
+      if (ownedSession && !virtualStop && state.native_connected && ["live","paused","feedback_stale"].includes(state.phase)) {
         for (const role of virtualPolicy.reconnectRoles(observation,performance.now())) {
           const reply = await page.evaluate(role => globalThis.AM1CameraReconnect(role),role);
           keep({event:"optional_camera_reconnect",role,...reply});
@@ -251,12 +275,21 @@ assert(!(headless && target.port === "8765"), "Powered console bench requires th
   };
   const terminal = state => ["complete", "failed", "cleanup_unknown", "operator_stopped"].includes(state.phase);
   const until = async (predicate, {waitForNativeExit = false} = {}) => {
-    let nativeClosedAt = null;
+    let nativeClosedAt = null, cleanupVerifiedAt = null;
     while (!cancelled && performance.now() < deadline) {
       const state = await read();
       assert(!startRefusal, startRefusal);
-      assert(nativeClosedAt === null || performance.now() - nativeClosedAt < 10000,
-             "Native closed before a terminal result: finalization deadline");
+      assert(!virtualStop, failure);
+      if (nativeClosedAt !== null) {
+        const now = performance.now(), age = now - nativeClosedAt;
+        if (state.cleanup_verified !== true) cleanupVerifiedAt = null;
+        const verifiedInTime = state.cleanup_verified === true && (cleanupVerifiedAt !== null || age < 10000);
+        if (verifiedInTime) cleanupVerifiedAt ??= now;
+        // Preserve the 10 s cleanup bound. Only timely current-session cleanup
+        // permits the existing 60 s stopped-session collection/finalization wait.
+        assert(age < (verifiedInTime ? 60000 : 10000),
+               "Native closed before a terminal result: finalization deadline");
+      }
       if (recoveryStarted !== null) {
         const elapsed = performance.now()-recoveryStarted;
         assert(elapsed < virtualConfig.recovery_episode_seconds*1000,"Virtual recovery episode deadline");
@@ -412,7 +445,7 @@ assert(!(headless && target.port === "8765"), "Powered console bench requires th
     assert.equal(final.final_exit_code, 0, final.error || "Run was not successful");
     assert.equal(final.cleanup_verified, true, "Cleanup is not verified");
   } catch (error) {
-    failure = error.message;
+    failure ||= error.message;
   } finally {
     let current = null;
     try { current = await read(false); }
@@ -447,7 +480,7 @@ assert(!(headless && target.port === "8765"), "Powered console bench requires th
       expected_windows_head:expectedWindowsHead, failure, final_phase:final?.phase,
       final_exit_code:final?.final_exit_code, cleanup_verified:final?.cleanup_verified,
       frontend_state_network:frontendStateNetwork, uncaught_page_error_count:uncaughtPageErrorCount,
-      virtual_bench_policy:virtualConfig,recovery_attempts:recoveryAttempts,
+      virtual_bench_policy:virtualConfig,recovery_attempts:recoveryAttempts,virtual_stop:virtualStop,
       pulses, dropped_records:droppedRecords, records}, null, 2)); }
     finally {
       process.off("SIGINT", cancel);
