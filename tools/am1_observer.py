@@ -681,12 +681,16 @@ def _ssh(alias: str) -> list[str]:
     ]
 
 
-def _observer_forward_command(alias, local_port, remote_port, *, compression=False, forwarding_only=False):
+def _observer_forward_command(
+    alias, local_port, remote_port, *, compression=False, forwarding_only=False, ipqos_none=False
+):
     if any(type(port) is not int or not 1024 <= port <= 65535 for port in (local_port, remote_port)):
         raise ValueError("invalid owned observer forwarding port")
     options = ["-o", "ExitOnForwardFailure=yes", "-L", f"127.0.0.1:{local_port}:127.0.0.1:{remote_port}"]
     if compression:
         options += ["-o", "Compression=yes"]
+    if ipqos_none is True:
+        options += ["-o", "IPQoS=none"]
     if forwarding_only:
         options += ["-N"]
     return _ssh(alias)[:-1] + options + [alias]
@@ -988,12 +992,17 @@ def run_capture(args) -> int:
         probe.bind(("127.0.0.1", 0))
         local_port = probe.getsockname()[1]
     compression = getattr(args, "delivery_compression", False) is True
+    ipqos_none = getattr(args, "delivery_ipqos_none", False) is True
     _atomic_json(
         output / "delivery-transport.json",
-        {"generation": args.generation, "delivery_compression": compression},
+        {
+            "generation": args.generation,
+            "delivery_compression": compression,
+            "delivery_ipqos_none": ipqos_none,
+        },
     )
     command = _observer_forward_command(
-        args.ssh_host, local_port, remote_port, compression=compression
+        args.ssh_host, local_port, remote_port, compression=compression, ipqos_none=ipqos_none
     ) + _powershell(
         "$ProgressPreference='SilentlyContinue';$ErrorActionPreference='Stop';"
         f"& {_ps_quote(remote_script)} -ConfigPath {_ps_quote(remote_config)}"
@@ -1191,6 +1200,7 @@ def run_capture(args) -> int:
                                         remote_port,
                                         compression=compression,
                                         forwarding_only=True,
+                                        ipqos_none=ipqos_none,
                                     ),
                                     stdin=subprocess.DEVNULL,
                                     stdout=subprocess.DEVNULL,
@@ -1463,6 +1473,7 @@ def run_capture(args) -> int:
         "forwarding_retired": id(active_transport()) in retired_forwarding,
         "first_transport_failure": first_transport_failure,
         "delivery_compression": compression,
+        "delivery_ipqos_none": ipqos_none,
         "failure": failure,
         "camera_released": terminal is not None and terminal.get("camera_released") is True,
         "capture_success": terminal is not None and terminal.get("success") is True,
@@ -1990,6 +2001,11 @@ def main() -> int:
         "--delivery-diagnostics",
         action="store_true",
         help="Retain bounded source and receiver timing evidence for this finite capture only",
+    )
+    parser.add_argument(
+        "--delivery-ipqos-none",
+        action="store_true",
+        help="Use the OS-default IP QoS only on this capture's SSH forwarding transports",
     )
     offline = parser.add_mutually_exclusive_group()
     offline.add_argument("--retrieve-only", action="store_true")
