@@ -2,6 +2,13 @@
 
 ## AM1-RELIABILITY-03 — current virtual reliability workstream
 
+For a finite live-payload comparison, `--delivery-jpeg-quality-percent 15` reduces
+only live 640×360 JPEG quality. Omission or explicit `45` preserves the existing
+0.45 value; 10 fps capture and 1280×720 H264 recording remain unchanged. Private
+transport/result records retain the request, and the source terminal reports the
+applied choice. This payload-pressure hypothesis does not qualify delivery or
+relax observation limits; inspect current framing before powered admission.
+
 Execute finite virtual/scripted arm input and automated owned body controls,
 with the existing spare P1 observer current throughout useful runs. The owner
 authorizes supported software repairs, bounded ordinary runs and qualified

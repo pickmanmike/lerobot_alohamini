@@ -682,6 +682,12 @@ def _ssh(alias: str) -> list[str]:
     ]
 
 
+def _delivery_jpeg_quality_percent(value):
+    if type(value) is not int or value not in (15, 45):
+        raise ValueError("observer live JPEG quality percent must be integer 15 or 45")
+    return value
+
+
 def _delivery_bind_address(value):
     if value is None:
         return None
@@ -943,6 +949,7 @@ def run_capture(args) -> int:
     import secrets
     import socket
 
+    jpeg_quality_percent = _delivery_jpeg_quality_percent(getattr(args, "delivery_jpeg_quality_percent", 45))
     bind_address = _delivery_bind_address(getattr(args, "delivery_bind_address", None))
     config = json.loads(args.config.read_text(encoding="utf-8-sig"))
     required = ("expected_host", "camera_name", "video_device_id", "remote_output_root")
@@ -966,6 +973,7 @@ def run_capture(args) -> int:
         output_dir=remote_dir,
         token=token,
         delivery_diagnostics=getattr(args, "delivery_diagnostics", False) is True,
+        delivery_jpeg_quality_percent=jpeg_quality_percent,
     )
     stage_script = (
         "$ProgressPreference='SilentlyContinue';$ErrorActionPreference='Stop';"
@@ -1024,6 +1032,7 @@ def run_capture(args) -> int:
         "generation": args.generation,
         "delivery_compression": compression,
         "delivery_ipqos_none": ipqos_none,
+        "delivery_jpeg_quality_percent": jpeg_quality_percent,
     }
     if bind_address is not None:
         transport_evidence["delivery_bind_address"] = bind_address
@@ -1507,6 +1516,10 @@ def run_capture(args) -> int:
         "first_transport_failure": first_transport_failure,
         "delivery_compression": compression,
         "delivery_ipqos_none": ipqos_none,
+        "delivery_jpeg_quality_percent": jpeg_quality_percent,
+        "source_delivery_jpeg_quality_percent": (
+            terminal.get("delivery_jpeg_quality_percent") if terminal is not None else None
+        ),
         "failure": failure,
         "camera_released": terminal is not None and terminal.get("camera_released") is True,
         "capture_success": terminal is not None and terminal.get("success") is True,
@@ -2046,6 +2059,13 @@ def main() -> int:
         "--delivery-bind-address",
         type=_delivery_bind_address,
         help="Bind only this capture's SSH forwarding transports to a numeric IPv4 source address",
+    )
+    parser.add_argument(
+        "--delivery-jpeg-quality-percent",
+        type=int,
+        choices=(15, 45),
+        default=45,
+        help="Use this live JPEG quality percent for this capture only; recording quality stays unchanged",
     )
     offline = parser.add_mutually_exclusive_group()
     offline.add_argument("--retrieve-only", action="store_true")

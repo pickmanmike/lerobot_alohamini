@@ -7,6 +7,12 @@ if ($env:COMPUTERNAME -ne $config.expected_host) { throw 'Unexpected observer ho
 if ($config.generation -notmatch '^[A-Za-z0-9_-]{1,80}$') { throw 'Invalid observer generation' }
 if ($config.duration_seconds -lt 20 -or $config.duration_seconds -gt 660) { throw 'Invalid finite observer duration' }
 if ($config.max_recording_bytes -gt 146800640 -or $config.max_recording_bytes -lt 1048576) { throw 'Invalid recording cap' }
+$deliveryJpegQualityPercent=45
+if ($null -ne $config.PSObject.Properties['delivery_jpeg_quality_percent']) {
+    $quality=$config.delivery_jpeg_quality_percent
+    if (($quality -isnot [int] -and $quality -isnot [long]) -or $quality -notin @(15,45)) { throw 'Invalid observer live JPEG quality percent' }
+    $deliveryJpegQualityPercent=[int]$quality
+}
 Add-Type -AssemblyName System.Runtime.WindowsRuntime
 $actionAsTask=[System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and -not $_.IsGenericMethod -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncAction' } | Select-Object -First 1
 $operationAsTask=[System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.IsGenericMethod -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq ('IAsyncOperation'+[char]96+'1') } | Select-Object -First 1
@@ -130,9 +136,10 @@ public sealed class AM1ObserverCollector : IDisposable {
             lock(gate) failure="Frame callback failed: "+error.GetType().Name+" "+error.Message;
         }
     }
-    public static Windows.Foundation.IAsyncOperation<BitmapEncoder> CreateJpegEncoder(Windows.Storage.Streams.IRandomAccessStream stream) {
+    public static Windows.Foundation.IAsyncOperation<BitmapEncoder> CreateJpegEncoder(Windows.Storage.Streams.IRandomAccessStream stream,int qualityPercent=45) {
+        if(qualityPercent != 15 && qualityPercent != 45) throw new ArgumentOutOfRangeException("qualityPercent");
         var properties=new BitmapPropertySet();
-        properties.Add("ImageQuality",new BitmapTypedValue((float)0.45,Windows.Foundation.PropertyType.Single));
+        properties.Add("ImageQuality",new BitmapTypedValue(qualityPercent == 15 ? (float)0.15 : (float)0.45,Windows.Foundation.PropertyType.Single));
         return BitmapEncoder.CreateAsync(BitmapEncoder.JpegEncoderId,stream,properties);
     }
     public static void ConfigureDeliveryJpeg(BitmapEncoder encoder) {
@@ -346,7 +353,7 @@ $clipPath=Join-Path $config.output_dir 'continuous.mp4'
 $metadataPath=Join-Path $config.output_dir 'capture-metadata.json'
 $phaseTimings=[Collections.Generic.List[object]]::new()
 $deliveryDiagnostics=@{enabled=($config.delivery_diagnostics -is [bool] -and $config.delivery_diagnostics);records=0;bytes=0;incomplete=$false;dropped=0;previous_sequence=0;previous_start=0;previous_end=0;max_emit_ticks=0}
-$result=[ordered]@{event='failed';generation=$config.generation;success=$false;camera_released=$false;audio_recorded=$false;clip_path=$clipPath;requested_duration_seconds=$config.duration_seconds;acquired_utc=[DateTimeOffset]::UtcNow.ToString('o')}
+$result=[ordered]@{event='failed';generation=$config.generation;success=$false;camera_released=$false;audio_recorded=$false;clip_path=$clipPath;requested_duration_seconds=$config.duration_seconds;delivery_jpeg_quality_percent=$deliveryJpegQualityPercent;acquired_utc=[DateTimeOffset]::UtcNow.ToString('o')}
 try {
     if ($config.token -notmatch '^[a-f0-9]{64}$' -or $config.capture_port -lt 1024 -or $config.capture_port -gt 65535) { throw 'Invalid private observer channel configuration' }
     $channel=[AM1ObserverChannel]::new([int]$config.capture_port,$config.token,$config.generation)
@@ -415,7 +422,7 @@ try {
                 try {
                     $stream=[Windows.Storage.Streams.InMemoryRandomAccessStream,Windows.Storage,ContentType=WindowsRuntime]::new()
                     $encoderType=[Windows.Graphics.Imaging.BitmapEncoder,Windows.Graphics,ContentType=WindowsRuntime]
-                    $encoder=Wait-CaptureOperation ([AM1ObserverCollector]::CreateJpegEncoder($stream)) $encoderType 'JPEG encoder' 3000
+                    $encoder=Wait-CaptureOperation ([AM1ObserverCollector]::CreateJpegEncoder($stream,$deliveryJpegQualityPercent)) $encoderType 'JPEG encoder' 3000
                     $encoderCreated=Get-QpcTicks
                     $encoder.SetSoftwareBitmap($sample.Bitmap)
                     [AM1ObserverCollector]::ConfigureDeliveryJpeg($encoder)
