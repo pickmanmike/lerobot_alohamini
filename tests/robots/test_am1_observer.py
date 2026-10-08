@@ -1882,3 +1882,483 @@ def test_scp_timeout_retains_phase_before_call_and_original_stderr(tmp_path, mon
     assert (args.output_dir / "stage.stderr").read_bytes() == original_stderr[-65536:]
     assert len(calls) == fail_at and not (args.output_dir / "staging-proof.json").exists()
     assert health(args.output_dir)["running"] is False
+
+
+class ScriptedObserverSocket:
+    """No sockets: real buffered SocketIO or raw recv over scripted bytes/errors."""
+
+    def __init__(self, actions, clock):
+        import socket
+        from collections import deque
+
+        self.actions = deque(actions)
+        self.clock = clock
+        self.buffered = io.BufferedReader(socket.SocketIO(self, "rb"))
+
+    def recv(self, limit):
+        if not self.actions:
+            return b""
+        stamp, value = self.actions.popleft()
+        self.clock[0] = stamp
+        if isinstance(value, BaseException):
+            raise value
+        if len(value) > limit:
+            self.actions.appendleft((stamp, value[limit:]))
+        return value[:limit]
+
+    def recv_into(self, buffer):
+        value = self.recv(len(buffer))
+        buffer[: len(value)] = value
+        return len(value)
+
+    def readline(self, limit):
+        return self.buffered.readline(limit)
+
+    def _decref_socketios(self):
+        pass
+
+
+def test_partial_line_idle_preserves_socket_then_only_fresh_pixels_qualify(tmp_path, jpeg):
+    module = load_observer()
+    receiver = module.ObserverReceiver(tmp_path, "qualified-test")
+    receiver.issue_challenge("one", 100.0)
+    old = (json.dumps(frame(jpeg)) + "\n").encode()
+    fresh = (
+        json.dumps(
+            frame(
+                jpeg,
+                nonce="two",
+                sequence=4,
+                source_system_relative_ticks=101_000_000,
+                challenge_received_qpc_ticks=100_990_000,
+            )
+        )
+        + "\n"
+    ).encode()
+    now = [100.0]
+    client = ScriptedObserverSocket(
+        [(100.0, old[:50]), (2100.0, TimeoutError("timed out")), (2200.0, old[50:] + fresh)],
+        now,
+    )
+    accepted, idle, original_receipts = [], [], []
+
+    def enqueue(kind, line, epoch, read_started_monotonic_ms=None, **receipt):
+        assert epoch == 1
+        if kind == "transport_idle":
+            idle.append(json.loads(line))
+            receiver.expire(now[0])
+            receiver.issue_challenge("two", 2100.0)
+        elif kind == "frame":
+            stamp = receipt.get("received_monotonic_ms", now[0])
+            original_receipts.append(stamp)
+            accepted.append(
+                receiver.accept(json.loads(line), received_wall_time_ms=12200, received_monotonic_ms=stamp)
+            )
+
+    error = None
+    try:
+        module._read_observer_lines(client, enqueue, 1, clock_ms=lambda: now[0])
+    except OSError as caught:
+        error = caught
+    finally:
+        client.buffered.close()
+    assert error is None, "A recoverable idle must not abort the owned frame reader"
+    assert len(idle) == 1 and idle[0]["error_type"] == "TimeoutError"
+    assert accepted == [False, True]
+    assert original_receipts == [2200.0, 2200.0]
+    actual = health(tmp_path)
+    assert actual["running"] is True and actual["sequence"] == 4
+    assert actual["round_trip_ms"] == 100.0 and actual["received_wall_time_ms"] == 12200
+    assert actual["source_system_relative_ticks"] == 101_000_000
+
+
+def test_coalesced_lines_keep_original_receipts_when_first_queue_put_stalls():
+    module = load_observer()
+    now = [100.0]
+    client = ScriptedObserverSocket([(150.0, b'{"s":1}\n{"s":2}\n')], now)
+    receipts = []
+
+    def enqueue(kind, line, epoch, read_started_monotonic_ms=None, **receipt):
+        assert kind == "frame" and epoch == 7
+        receipts.append(receipt.get("received_monotonic_ms", now[0]))
+        now[0] += 500.0  # A queue stall cannot become a new wire receipt.
+
+    try:
+        module._read_observer_lines(client, enqueue, 7, clock_ms=lambda: now[0])
+    finally:
+        client.buffered.close()
+    assert receipts == [150.0, 150.0]
+
+
+def test_eof_does_not_promote_unterminated_json_fragment():
+    module = load_observer()
+    now = [100.0]
+    client = ScriptedObserverSocket([(150.0, b'{"event":"frame"}')], now)
+    frames = []
+    try:
+        with module.suppress(OSError):
+            module._read_observer_lines(client, lambda *args, **kwargs: frames.append(args), 1)
+    finally:
+        client.buffered.close()
+    assert frames == []
+
+
+def test_reset_after_partial_line_remains_a_real_transport_error():
+    module = load_observer()
+    now = [100.0]
+    client = ScriptedObserverSocket(
+        [(150.0, b'{"event":'), (160.0, ConnectionResetError(10054, "reset"))], now
+    )
+    frames = []
+    try:
+        with pytest.raises(ConnectionResetError):
+            module._read_observer_lines(client, lambda *args, **kwargs: frames.append(args), 1)
+    finally:
+        client.buffered.close()
+    assert frames == []
+
+
+@pytest.fixture
+def fake_idle_capture(tmp_path, monkeypatch, jpeg):
+    """Real capture/receiver/watchdog; synthetic async IO boundary, no network."""
+    import queue
+    import socket
+    import subprocess
+    from collections import deque
+    from types import SimpleNamespace
+
+    module = load_observer()
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps(
+            {
+                "expected_host": "host",
+                "camera_name": "camera",
+                "video_device_id": "device",
+                "remote_output_root": r"C:\private",
+            }
+        )
+    )
+    args = SimpleNamespace(
+        config=config,
+        output_dir=tmp_path / "capture",
+        generation="qualified-test",
+        duration_seconds=20,
+        ssh_host="existing",
+    )
+    state = SimpleNamespace(
+        module=module,
+        args=args,
+        now=10.0,
+        mode="fresh",
+        values=deque(),
+        commands=[],
+        source=None,
+        first_idle=None,
+        last_idle=None,
+        idle_delivered=False,
+        frame_count=0,
+        first_frame=None,
+        stop_at=None,
+        terminal=None,
+        process=None,
+        deferred_to_deadline=False,
+        late_decision_at=None,
+    )
+    real_empty = queue.Empty
+
+    def item(kind, value, epoch=1, receipt=None):
+        stamp = state.now * 1000 if receipt is None else receipt
+        return module._observer_message(
+            kind,
+            (json.dumps(value) + "\n").encode(),
+            epoch,
+            clock_ms=lambda: stamp,
+            wall_ms=lambda: int(stamp + 100000),
+        )
+
+    class Messages:
+        def __init__(self, maxsize):
+            self.maxsize = maxsize
+
+        def get(self, timeout):
+            if state.values:
+                value = state.values.popleft()
+                if value[0] == "frame" and state.idle_delivered and state.mode == "queue_stale":
+                    state.now += 0.49  # Original20ms age +490ms queue delay exceeds500ms.
+                if value[0] == "frame" and state.idle_delivered and state.mode == "late_fresh":
+                    state.now += 0.10  # Fresh pixels, but processing crossed the original5s deadline.
+                    state.late_decision_at = state.now
+                return value
+            if not state.idle_delivered:
+                state.now = 12.02  # Two seconds after the last complete frame.
+                state.first_idle = state.last_idle = state.now
+                state.idle_delivered = True
+                return item(
+                    "transport_idle",
+                    {"error_type": "TimeoutError", "error": "timed out"},
+                    0 if state.mode == "old_epoch" else 1,
+                )
+            if state.mode in ("fresh", "old_epoch") and health(args.output_dir).get("sequence") == 2:
+                (args.output_dir / "stop.request").write_text("owned normal stop")
+                raise real_empty
+            if state.mode == "late_fresh" and not state.deferred_to_deadline:
+                state.now = state.first_idle + 4.9
+                state.deferred_to_deadline = True
+                raise real_empty
+            state.now += 0.25
+            if state.now - state.first_idle > 5.5 and state.stop_at is None:
+                raise AssertionError("Original first-idle five-second watchdog did not stop")
+            if state.now - state.last_idle >= 2:
+                state.last_idle = state.now
+                return item("transport_idle", {"error_type": "TimeoutError", "error": "timed out"})
+            raise real_empty
+
+    class Client:
+        def setsockopt(self, *args):
+            pass
+
+        def settimeout(self, value):
+            pass
+
+        def sendall(self, encoded):
+            value = json.loads(encoded)
+            assert value["token"] == state.source["token"] and value["generation"] == args.generation
+            if value["event"] == "stop":
+                state.stop_at = state.now
+                state.terminal = {
+                    "event": "complete",
+                    "generation": args.generation,
+                    "success": True,
+                    "camera_released": True,
+                    "stop_reason": "normal_stop",
+                }
+                state.values.extend(
+                    [
+                        item("metadata", {"event": "ending", "generation": args.generation}, 0),
+                        item("metadata", state.terminal, 0),
+                    ]
+                )
+                state.process.returncode = 0
+                return
+            state.frame_count += 1
+            if state.idle_delivered and state.mode == "partial":
+                return  # Raw partial bytes produce no frame callback or authority.
+            if state.idle_delivered and state.mode == "late_fresh" and not state.deferred_to_deadline:
+                return  # Only a new challenge near the original deadline can get a fresh response.
+            issued = state.now
+            state.now += 0.65 if state.idle_delivered and state.mode == "age_stale" else 0.02
+            payload = frame(
+                jpeg,
+                nonce=value["nonce"],
+                sequence=state.frame_count,
+                capture_age_ms=0,
+                challenge_received_qpc_ticks=int(issued * 10_000_000),
+                source_system_relative_ticks=int(issued * 10_000_000) + 10000,
+            )
+            state.first_frame = state.first_frame or dict(payload)
+            if state.idle_delivered and state.mode == "replay":
+                payload = state.first_frame
+            if state.idle_delivered and state.mode == "wrong_identity":
+                payload["generation"] = "foreign"
+            state.values.append(item("frame", payload))
+
+        def shutdown(self, *args):
+            pass
+
+        def close(self):
+            pass
+
+    class Probe:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def bind(self, *args):
+            pass
+
+        def getsockname(self):
+            return "127.0.0.1", 54321
+
+    class Owner:
+        def __init__(self):
+            self.returncode = None
+            self.stdout = io.BytesIO()
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout):
+            # A simulated local SSH close cannot establish remote cleanup.
+            self.returncode = 0
+            return 0
+
+    class ThreadBoundary:
+        def __init__(self, target, **kwargs):
+            self.target = target
+
+        def start(self):
+            pass  # Scripted Messages mirrors the unavailable asynchronous IO boundary.
+
+    def run(command, **kwargs):
+        if "input" in kwargs:
+            state.source = json.loads(base64.b64decode(kwargs["input"].splitlines()[1]))
+            return subprocess.CompletedProcess(command, 0, b'{"capture_port":54321}', b"")
+        return subprocess.CompletedProcess(command, 0, json.dumps(state.terminal).encode(), b"")
+
+    def popen(command, **kwargs):
+        state.commands.append(command)
+        assert "-N" not in command, "Read idle must not launch a new forwarding owner"
+        state.process = Owner()
+        state.values.append(
+            item("metadata", {"event": "started", "generation": args.generation, "recording": True}, 0)
+        )
+        return state.process
+
+    original_publish = module._atomic_json
+
+    def publish(path, value):
+        if (
+            state.mode == "publication_failure"
+            and state.idle_delivered
+            and path.name == "latest-health.json"
+            and value.get("running") is True
+        ):
+            return False
+        return original_publish(path, value)
+
+    monkeypatch.setattr(module, "_atomic_json", publish)
+    monkeypatch.setattr(module.time, "perf_counter", lambda: state.now)
+    monkeypatch.setattr(module.queue, "Queue", Messages)
+    monkeypatch.setattr(module.threading, "Thread", ThreadBoundary)
+    monkeypatch.setattr(socket, "socket", lambda *args, **kwargs: Probe())
+    monkeypatch.setattr(socket, "create_connection", lambda *args, **kwargs: Client())
+    monkeypatch.setattr(module.subprocess, "run", run)
+    monkeypatch.setattr(module.subprocess, "Popen", popen)
+    return state
+
+
+def test_idle_then_fresh_same_owner_delivers_pixels_and_normal_stop(fake_idle_capture):
+    state = fake_idle_capture
+    assert state.module.run_capture(state.args) == 1  # No invented20second contiguous qualification.
+    result = json.loads((state.args.output_dir / "receiver-result.json").read_text())
+    assert result["accepted_frames"] == 2 and result["same_capture_reconnects"] == 0
+    assert result["camera_released"] is True and result["capture_success"] is True
+    assert result["first_transport_failure"] is not None
+    assert result["first_transport_failure"]["classification"] == "idle_timeout"
+    assert len(state.commands) == 1 and state.stop_at is not None
+    events = [
+        json.loads(line)
+        for line in (state.args.output_dir / "protocol-events.ndjson").read_text().splitlines()
+    ]
+    assert any(value["event"] == "transport_idle" for value in events)
+
+
+@pytest.mark.parametrize(
+    "mode", ["partial", "replay", "age_stale", "queue_stale", "wrong_identity", "publication_failure"]
+)
+def test_only_current_fresh_frame_can_clear_original_idle_watchdog(fake_idle_capture, mode):
+    state = fake_idle_capture
+    state.mode = mode
+    error = None
+    try:
+        state.module.run_capture(state.args)
+    except AssertionError as caught:
+        error = caught
+    assert error is None, str(error)
+    result = json.loads((state.args.output_dir / "receiver-result.json").read_text())
+    assert result["failure"] == "observer same-capture delivery reconnect deadline"
+    assert state.first_idle + 5 <= state.stop_at <= state.first_idle + 5.5
+    assert result["first_transport_failure"] is not None
+    assert result["first_transport_failure"]["classification"] == "idle_timeout"
+    assert result["qualification_at_stop"] is False and result["same_capture_reconnects"] == 0
+    assert result["camera_released"] is True and len(state.commands) == 1
+
+
+def test_line_limit_stops_reader_before_following_unbounded_data(monkeypatch):
+    module = load_observer()
+    monkeypatch.setattr(module, "MAX_LINE_BYTES", 8)
+    now = [100.0]
+    client = ScriptedObserverSocket([(150.0, b"1234567\n"), (160.0, b"abcdefghi"), (170.0, b"later\n")], now)
+    frames = []
+    try:
+        module._read_observer_lines(client, lambda kind, line, *args, **kwargs: frames.append(line), 1)
+    finally:
+        client.buffered.close()
+    # Main receives the bounded fatal oversize marker and never a later frame.
+    assert frames == [b"1234567\n", b"abcdefghi"]
+    assert list(client.actions) == [(170.0, b"later\n")]
+
+
+def test_os_transport_timeout_is_not_treated_as_polling_idle():
+    module = load_observer()
+    now = [100.0]
+    client = ScriptedObserverSocket([(150.0, TimeoutError(10060, "transport timed out"))], now)
+    callbacks = []
+    try:
+        with pytest.raises(TimeoutError):
+            module._read_observer_lines(client, lambda *args, **kwargs: callbacks.append(args), 1)
+    finally:
+        client.buffered.close()
+    assert callbacks == []
+
+
+def test_old_connection_idle_cannot_start_new_owner_recovery(fake_idle_capture):
+    state = fake_idle_capture
+    state.mode = "old_epoch"
+    assert state.module.run_capture(state.args) == 1
+    result = json.loads((state.args.output_dir / "receiver-result.json").read_text())
+    assert result["accepted_frames"] == 2 and result["same_capture_reconnects"] == 0
+    assert result["first_transport_failure"] is None and result["delivery_issues"] == 0
+    assert result["camera_released"] is True and len(state.commands) == 1
+
+
+def test_empty_buffer_idle_keeps_earliest_read_start_and_original_complete_receipt():
+    module = load_observer()
+    now = [100.0]
+    client = ScriptedObserverSocket(
+        [
+            (2100.0, TimeoutError("timed out")),
+            (4100.0, TimeoutError("timed out")),
+            (4150.0, b'{"s":1}\n'),
+            (4250.0, b'{"s":2}\n'),
+        ],
+        now,
+    )
+    records = []
+
+    def enqueue(kind, line, epoch, read_started_monotonic_ms=None, **receipt):
+        records.append((kind, read_started_monotonic_ms, receipt["received_monotonic_ms"]))
+
+    try:
+        module._read_observer_lines(client, enqueue, 1, clock_ms=lambda: now[0])
+    finally:
+        client.buffered.close()
+    assert records == [
+        ("transport_idle", None, 2100.0),
+        ("transport_idle", None, 4100.0),
+        ("frame", 100.0, 4150.0),
+        ("frame", 4150.0, 4250.0),
+    ]
+
+
+def test_fresh_processing_after_original_idle_deadline_cannot_erase_watchdog(fake_idle_capture):
+    state = fake_idle_capture
+    state.mode = "late_fresh"
+    error = None
+    try:
+        state.module.run_capture(state.args)
+    except AssertionError as caught:
+        error = caught
+    assert error is None, str(error)
+    result = json.loads((state.args.output_dir / "receiver-result.json").read_text())
+    assert result["failure"] == "observer same-capture delivery reconnect deadline"
+    assert result["accepted_frames"] == 2  # The actual late frame was fresh and decoded.
+    assert state.late_decision_at >= state.first_idle + 5
+    assert state.stop_at == state.late_decision_at
+    assert result["first_transport_failure"]["classification"] == "idle_timeout"
+    assert result["qualification_at_stop"] is False and result["same_capture_reconnects"] == 0
+    assert result["camera_released"] is True and len(state.commands) == 1
+    assert health(state.args.output_dir)["running"] is False

@@ -208,6 +208,20 @@ records are retained. All four gaps had steady source cadence and delayed shared
 no retained Wi-Fi security event overlaps the powered run. The failing transport layer
 remains under investigation. Later useful selected-shoulder return remains distinct from
 the failed tighter immediate-return criterion and from unproven return of every joint.
+
+A further receiver correction preserves partial newline-framed records through an idle
+read without retiring a still-owned connection. Complete coalesced records retain their
+original receipt time; an unfinished EOF record never grants authority. Real EOF/reset
+and operating-system transport errors retain bounded forwarding recovery. The first idle
+anchors the original five-second deadline; stale, replayed, foreign or late-processed
+frames cannot renew it. The post-decode deadline check can unqualify a briefly published
+actually fresh frame; no lifecycle renewal is inferred from that publication. The
+233 affected observer checks passed with background-thread warnings treated as errors.
+This repairs receiver framing/idle classification, not the initial shared IP delay.
+An isolated comparison with additional outbound gateway activity still retained two
+half-second delivery gaps and does not establish a mitigation. No adapter or network
+permission setting was changed. All original failed/partial results remain unchanged.
+
 Full completion, comparable automatic restart from resulting normal rest and the
 conditional body check remain pending; PR #16 remains draft.
 Plan: [AM1-03 executable plan](../superpowers/plans/2026-10-06-am1-reliability-03.md).

@@ -86,13 +86,61 @@ def _observer_message(kind, line, epoch, read_started_monotonic_ms=None, *, cloc
     return kind, line, received, wall, epoch, read_started_monotonic_ms
 
 
-def _read_observer_lines(stream, enqueue, epoch, *, clock_ms=None):
+def _read_observer_lines(client, enqueue, epoch, *, clock_ms=None):
+    """Bounded complete records; an idle read does not establish peer loss."""
+    pending = bytearray()
+    read_started = None
     while True:
-        read_started = clock_ms() if clock_ms is not None else None
-        line = stream.readline(MAX_LINE_BYTES + 1)
-        if not line:
-            return
-        enqueue("frame", line, epoch, read_started_monotonic_ms=read_started)
+        if read_started is None:
+            read_started = clock_ms() if clock_ms is not None else None
+        try:
+            chunk = client.recv(min(65536, MAX_LINE_BYTES + 1 - len(pending)))
+        except TimeoutError as error:
+            if error.errno is not None:  # An OS transport timeout is a terminal socket error.
+                raise
+            received = clock_ms() if clock_ms is not None else time.perf_counter() * 1000
+            enqueue(
+                "transport_idle",
+                json.dumps({"error_type": type(error).__name__, "error": str(error)}).encode(),
+                epoch,
+                received_monotonic_ms=received,
+                received_wall_time_ms=_wall_time_ms(),
+            )
+            continue
+        if not chunk:
+            if pending:
+                raise OSError("observer delivery EOF with incomplete line")
+            return "eof"
+        # Coalesced complete lines share the original recv receipt, even if queueing blocks.
+        received = clock_ms() if clock_ms is not None else time.perf_counter() * 1000
+        wall = _wall_time_ms()
+        pending.extend(chunk)
+        while b"\n" in pending:
+            end = pending.index(10) + 1
+            line = bytes(pending[:end])
+            del pending[:end]
+            enqueue(
+                "frame",
+                line,
+                epoch,
+                read_started_monotonic_ms=read_started,
+                received_monotonic_ms=received,
+                received_wall_time_ms=wall,
+            )
+            read_started = received if clock_ms is not None else None
+            if len(line) > MAX_LINE_BYTES:
+                return "line-limit"
+        if len(pending) > MAX_LINE_BYTES:
+            # The main loop retains its existing fatal protocol-bound handling.
+            enqueue(
+                "frame",
+                bytes(pending),
+                epoch,
+                read_started_monotonic_ms=read_started,
+                received_monotonic_ms=received,
+                received_wall_time_ms=wall,
+            )
+            return "line-limit"
 
 
 class ObserverDeliveryDiagnostics:
@@ -1074,8 +1122,23 @@ def run_capture(args) -> int:
     next_metadata_read = 0.0
     retired_forwarding = set()
 
-    def enqueue(kind, line, epoch=0, read_started_monotonic_ms=None):
-        item = _observer_message(kind, line, epoch, read_started_monotonic_ms)
+    def enqueue(
+        kind,
+        line,
+        epoch=0,
+        read_started_monotonic_ms=None,
+        *,
+        received_monotonic_ms=None,
+        received_wall_time_ms=None,
+    ):
+        item = _observer_message(
+            kind,
+            line,
+            epoch,
+            read_started_monotonic_ms,
+            clock_ms=(lambda: received_monotonic_ms) if received_monotonic_ms is not None else None,
+            wall_ms=(lambda: received_wall_time_ms) if received_wall_time_ms is not None else None,
+        )
         try:
             messages.put(item, timeout=0.1)
         except queue.Full:
@@ -1083,22 +1146,23 @@ def run_capture(args) -> int:
             diagnostic.queue_dropped()
 
     def read_channel(client, epoch):
+        cause = "eof"
         try:
-            with client.makefile("rb") as stream:
-                _read_observer_lines(
-                    stream,
-                    enqueue,
-                    epoch,
-                    clock_ms=(lambda: time.perf_counter() * 1000) if diagnostic.enabled else None,
-                )
+            cause = _read_observer_lines(
+                client,
+                enqueue,
+                epoch,
+                clock_ms=(lambda: time.perf_counter() * 1000) if diagnostic.enabled else None,
+            )
         except OSError as error:
+            cause = type(error).__name__
             enqueue(
                 "transport_error",
-                json.dumps({"error_type": type(error).__name__, "error": str(error)}).encode(),
+                json.dumps({"error_type": cause, "error": str(error)}).encode(),
                 epoch,
             )
         finally:
-            enqueue("transport_lost", b"{}", epoch)
+            enqueue("transport_lost", json.dumps({"cause": cause}).encode(), epoch)
 
     def send(value):
         if connected is None:
@@ -1135,7 +1199,7 @@ def run_capture(args) -> int:
     def active_transport():
         return forward_process if forward_process is not None else process
 
-    def lose_delivery(reason, now, *, transport_exit=None):
+    def lose_delivery(reason, now, *, transport_exit=None, cause=None):
         nonlocal connected, delivery_issues, loss_started, attempt_pending, forwarding_waiting
         nonlocal first_transport_failure
         if connected is None and loss_started is not None and not attempt_pending:
@@ -1156,6 +1220,8 @@ def run_capture(args) -> int:
                 "reason": reason,
                 "received_wall_time_ms": _wall_time_ms(),
                 "transport_exit_code": transport_exit,
+                "classification": "transport_loss",
+                "cause": cause,
             }
         with (output / "protocol-events.ndjson").open("a", encoding="utf-8") as history:
             history.write(
@@ -1166,6 +1232,7 @@ def run_capture(args) -> int:
                         "received_wall_time_ms": _wall_time_ms(),
                         "connection_epoch": connection_id,
                         "transport_exit_code": transport_exit,
+                        "cause": cause,
                     }
                 )
                 + "\n"
@@ -1350,7 +1417,39 @@ def run_capture(args) -> int:
                                 connected.close()
                                 connected = None
                             else:
-                                lose_delivery("observer delivery connection lost", now)
+                                lose_delivery(
+                                    "observer delivery connection lost",
+                                    now,
+                                    cause=json.loads(line).get("cause"),
+                                )
+                        continue
+                    if kind == "transport_idle":
+                        with (output / "protocol-events.ndjson").open("a", encoding="utf-8") as protocol:
+                            protocol.write(
+                                json.dumps(
+                                    dict(
+                                        json.loads(line),
+                                        event=kind,
+                                        received_wall_time_ms=received_wall,
+                                        received_monotonic_ms=received_mono,
+                                        connection_epoch=epoch,
+                                    )
+                                )
+                                + "\n"
+                            )
+                        if epoch == connection_id and connected is not None and not stopped.is_set():
+                            receiver.expire(time.perf_counter() * 1000)
+                            if loss_started is None:
+                                loss_started = received_mono / 1000
+                                delivery_issues += 1
+                            if first_transport_failure is None:
+                                first_transport_failure = {
+                                    "reason": "observer delivery read idle timeout",
+                                    "classification": "idle_timeout",
+                                    "received_wall_time_ms": received_wall,
+                                    "received_monotonic_ms": received_mono,
+                                    "transport_exit_code": None,
+                                }
                         continue
                     if kind == "transport_error":
                         with (output / "protocol-events.ndjson").open("a", encoding="utf-8") as protocol:
@@ -1440,8 +1539,23 @@ def run_capture(args) -> int:
                                 connection_epoch=epoch,
                             )
                         if accepted:
-                            loss_started = None
-                            attempt_pending = forwarding_waiting = False
+                            decision_now = time.perf_counter()
+                            receiver.expire(decision_now * 1000)
+                            if (
+                                loss_started is not None
+                                and decision_now - loss_started >= 5
+                                and not stopped.is_set()
+                            ):
+                                failure = "observer same-capture delivery reconnect deadline"
+                                stopped.set()
+                                receiver._unqualify(failure)
+                            if (
+                                not stopped.is_set()
+                                and receiver.state.get("running") is True
+                                and receiver.state.get("challenge_qualified") is True
+                            ):
+                                loss_started = None
+                                attempt_pending = forwarding_waiting = False
                             max_rtt = max(max_rtt, receiver.state["round_trip_ms"])
                             max_capture_age = max(max_capture_age, receiver.state["capture_age_ms"])
                     elif value.get("event") in ("complete", "failed"):

@@ -294,21 +294,21 @@ def test_delivery_stall_and_publication_stall_have_distinct_original_timings(
     class Stream:
         delivered = False
 
-        def readline(self, limit):
+        def recv(self, limit):
             if self.delivered:
                 return b""
             self.delivered = True
             now[0] += read_delay
             return b'{"event":"frame"}\n'
 
-    def enqueue(kind, line, epoch, read_started_monotonic_ms=None):
+    def enqueue(kind, line, epoch, read_started_monotonic_ms=None, **receipt):
         messages.append(
             module._observer_message(
                 kind,
                 line,
                 epoch,
                 read_started_monotonic_ms,
-                clock_ms=lambda: now[0],
+                clock_ms=lambda: receipt.get("received_monotonic_ms", now[0]),
                 wall_ms=lambda: 1000,
             )
         )
@@ -395,7 +395,7 @@ def test_blocked_actual_health_publication_records_processing_and_next_frame_que
     class Stream:
         index = 0
 
-        def readline(self, _limit):
+        def recv(self, _limit):
             if self.index == len(values):
                 return b""
             now[0] += 50.0 if self.index == 0 else 100.0
@@ -403,14 +403,14 @@ def test_blocked_actual_health_publication_records_processing_and_next_frame_que
             self.index += 1
             return line
 
-    def enqueue(kind, line, epoch, read_started_monotonic_ms=None):
+    def enqueue(kind, line, epoch, read_started_monotonic_ms=None, **receipt):
         messages.append(
             module._observer_message(
                 kind,
                 line,
                 epoch,
                 read_started_monotonic_ms,
-                clock_ms=lambda: now[0],
+                clock_ms=lambda: receipt.get("received_monotonic_ms", now[0]),
                 wall_ms=lambda: int(now[0] + 850),
             )
         )
@@ -695,7 +695,7 @@ def capture_pipeline(tmp_path, monkeypatch):
     class FrameStream(Probe):
         index = 0
 
-        def readline(self, _limit):
+        def recv(self, _limit):
             if self.index == 2 or (self.index == 1 and state.drop_wire):
                 stopped.wait(2)
                 return b""
@@ -721,8 +721,8 @@ def capture_pipeline(tmp_path, monkeypatch):
     class Connection:
         stream = FrameStream()
 
-        def makefile(self, _):
-            return self.stream
+        def recv(self, limit):
+            return self.stream.recv(limit)
 
         def setsockopt(self, *_):
             pass
@@ -785,8 +785,8 @@ def capture_pipeline(tmp_path, monkeypatch):
     original_message = module._observer_message
     original_publish = module._atomic_json
 
-    def message(kind, line, epoch, read_started_monotonic_ms=None):
-        item = original_message(kind, line, epoch, read_started_monotonic_ms)
+    def message(kind, line, epoch, read_started_monotonic_ms=None, **receipt):
+        item = original_message(kind, line, epoch, read_started_monotonic_ms, **receipt)
         if kind == "frame":
             state.received.append(item)
             if json.loads(line)["sequence"] == 2:

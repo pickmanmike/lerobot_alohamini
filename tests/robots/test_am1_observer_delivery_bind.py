@@ -165,7 +165,8 @@ def capture_transports(tmp_path, monkeypatch):
         def __init__(self, number):
             self.number = number
 
-        def readline(self, _limit):
+        def recv(self, limit):
+            assert 0 < limit <= 65536
             if self.number > 1 and not closed.wait(2):
                 state.errors.append("fake reader close deadline")
             return b""
@@ -173,9 +174,10 @@ def capture_transports(tmp_path, monkeypatch):
     class Connection:
         def __init__(self, number):
             self.number = number
+            self.stream = FrameStream(number)
 
-        def makefile(self, _):
-            return FrameStream(self.number)
+        def recv(self, limit):
+            return self.stream.recv(limit)
 
         def setsockopt(self, *_):
             pass
