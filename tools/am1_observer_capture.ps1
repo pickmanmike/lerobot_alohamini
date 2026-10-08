@@ -21,6 +21,42 @@ function Wait-CaptureOperation($operation,[Type]$type,[string]$step,[int]$timeou
 }
 function Get-QpcTicks { return [int64]([Diagnostics.Stopwatch]::GetTimestamp()*10000000.0/[Diagnostics.Stopwatch]::Frequency) }
 function Send-Observer($value) { [Console]::Out.WriteLine(($value | ConvertTo-Json -Depth 8 -Compress)); [Console]::Out.Flush() }
+function Send-ObserverDeliveryTiming {
+    param(
+        [Collections.IDictionary]$State,
+        [Collections.IDictionary]$Record,
+        [Alias('Clock')][scriptblock]$ReadClock={ Get-QpcTicks },
+        [scriptblock]$WriteLine={ [Console]::Out.WriteLine($args[0]); [Console]::Out.Flush() }
+    )
+    if (-not $State.enabled) { return }
+    if ($State.records -ge 8192) { $State.incomplete=$true; $State.dropped++; return }
+    try {
+        # This event follows the original Send; none of its stamps replace frame proof.
+        $value=[ordered]@{}
+        foreach ($key in $Record.Keys) { $value[$key]=$Record[$key] }
+        $value.previous_metadata_sequence=$State.previous_sequence
+        $value.previous_metadata_started_qpc_ticks=$State.previous_start
+        $value.previous_metadata_ended_qpc_ticks=$State.previous_end
+        $emitStarted=& $ReadClock
+        $value.metadata_emit_started_qpc_ticks=$emitStarted
+        $line=$value | ConvertTo-Json -Depth 4 -Compress
+        $lineBytes=[Text.Encoding]::UTF8.GetByteCount($line)+[Text.Encoding]::UTF8.GetByteCount([Environment]::NewLine)
+        if ($lineBytes -gt 1024 -or $State.bytes+$lineBytes -gt 8388608) {
+            $State.incomplete=$true; $State.dropped++; return
+        }
+        & $WriteLine $line
+        $emitEnded=& $ReadClock
+        $State.records++
+        $State.bytes+=$lineBytes
+        $State.previous_sequence=$Record.sequence
+        $State.previous_start=$emitStarted
+        $State.previous_end=$emitEnded
+        $State.max_emit_ticks=[Math]::Max($State.max_emit_ticks,$emitEnded-$emitStarted)
+    } catch {
+        # An incomplete diagnostic cannot stop capture or confer observation authority.
+        $State.incomplete=$true; $State.dropped++
+    }
+}
 $collectorSource=@'
 using System;
 using System.IO;
@@ -309,6 +345,7 @@ $reading=$false
 $clipPath=Join-Path $config.output_dir 'continuous.mp4'
 $metadataPath=Join-Path $config.output_dir 'capture-metadata.json'
 $phaseTimings=[Collections.Generic.List[object]]::new()
+$deliveryDiagnostics=@{enabled=($config.delivery_diagnostics -is [bool] -and $config.delivery_diagnostics);records=0;bytes=0;incomplete=$false;dropped=0;previous_sequence=0;previous_start=0;previous_end=0;max_emit_ticks=0}
 $result=[ordered]@{event='failed';generation=$config.generation;success=$false;camera_released=$false;audio_recorded=$false;clip_path=$clipPath;requested_duration_seconds=$config.duration_seconds;acquired_utc=[DateTimeOffset]::UtcNow.ToString('o')}
 try {
     if ($config.token -notmatch '^[a-f0-9]{64}$' -or $config.capture_port -lt 1024 -or $config.capture_port -gt 65535) { throw 'Invalid private observer channel configuration' }
@@ -399,6 +436,7 @@ try {
                     $serializeStart=Get-QpcTicks
                     $frameMessage=([ordered]@{event='frame';generation=$config.generation;nonce=$nonce;sequence=$sample.Sequence;source_system_relative_ticks=$sample.SourceTicks;challenge_received_qpc_ticks=$challengeTicks;capture_age_ms=$ageMs;recording=$recording;source_wait_ms=$phase.source_wait_ms;callback_source_age_ms=$phase.callback_source_age_ms;encoder_create_ms=$phase.encoder_create_ms;encoder_flush_ms=$phase.encoder_flush_ms;jpeg_read_ms=$phase.jpeg_read_ms;jpeg_base64=[Convert]::ToBase64String($bytes)} | ConvertTo-Json -Depth 6 -Compress)
                     $serialized=Get-QpcTicks
+                    if ($deliveryDiagnostics.enabled) { $sendStarted=Get-QpcTicks }
                     $sent=$channel.Send($frameMessage)
                     $sendEnded=Get-QpcTicks
                     $phase.json_serialize_ms=($serialized-$serializeStart)/10000.0
@@ -406,6 +444,9 @@ try {
                     $phase.sent=$sent
                     $phaseTimings.Add($phase)
                     if($phaseTimings.Count -gt 128) { $phaseTimings.RemoveAt(0) }
+                    if ($deliveryDiagnostics.enabled) {
+                        Send-ObserverDeliveryTiming -State $deliveryDiagnostics -Record ([ordered]@{event='frame_delivery_timing';generation=$config.generation;nonce=$nonce;sequence=$sample.Sequence;source_system_relative_ticks=$sample.SourceTicks;challenge_received_qpc_ticks=$challengeTicks;capture_age_ms=$ageMs;serialize_start_qpc_ticks=$serializeStart;serialized_qpc_ticks=$serialized;send_start_qpc_ticks=$sendStarted;send_ended_qpc_ticks=$sendEnded;jpeg_bytes=$bytes.Length;sent=$sent})
+                    }
                     if ($sent) { $deliveredCount++ }
                     $nonce=$null
                 } finally {
@@ -447,6 +488,9 @@ try {
     if ($cleanupErrors.Count -gt 0) { $result.cleanup_errors=$cleanupErrors; $result.success=$false; $result.event='failed' }
 }
 if (Test-Path -LiteralPath $clipPath) { $result.clip_bytes=(Get-Item -LiteralPath $clipPath).Length; $result.clip_sha256=(Get-FileHash -LiteralPath $clipPath -Algorithm SHA256).Hash }
+if ($deliveryDiagnostics.enabled) {
+    $result.delivery_diagnostics=[ordered]@{enabled=$true;records=$deliveryDiagnostics.records;bytes=$deliveryDiagnostics.bytes;incomplete=$deliveryDiagnostics.incomplete;dropped=$deliveryDiagnostics.dropped;max_emit_ticks=$deliveryDiagnostics.max_emit_ticks}
+}
 $result | ConvertTo-Json -Depth 8 -Compress | Set-Content -LiteralPath $metadataPath -Encoding UTF8
 Send-Observer $result
 if (-not $result.success) { exit 1 }

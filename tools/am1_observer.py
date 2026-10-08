@@ -33,6 +33,9 @@ MAX_LINE_BYTES = 1024 * 1024
 MAX_RECORDING_BYTES = 140 * 1024 * 1024
 CHALLENGE_INTERVAL_SECONDS = 0.125
 MAX_ACTIVE_NONCES = 6
+DELIVERY_DIAGNOSTIC_MAX_LINE_BYTES = 1024
+DELIVERY_DIAGNOSTIC_MAX_RECORDS = 8192
+DELIVERY_DIAGNOSTIC_MAX_BYTES = 16 * 1024 * 1024
 
 
 @cache
@@ -73,6 +76,269 @@ def _atomic_json(path: Path, value: dict) -> bool:
             if time.perf_counter() >= deadline:
                 return False
             time.sleep(0.005)
+
+
+def _observer_message(kind, line, epoch, read_started_monotonic_ms=None, *, clock_ms=None, wall_ms=None):
+    """Stamp original receipt before queueing, without substituting processing time."""
+    received = clock_ms() if clock_ms is not None else time.perf_counter() * 1000
+    wall = wall_ms() if wall_ms is not None else _wall_time_ms()
+    return kind, line, received, wall, epoch, read_started_monotonic_ms
+
+
+def _read_observer_lines(stream, enqueue, epoch, *, clock_ms=None):
+    while True:
+        read_started = clock_ms() if clock_ms is not None else None
+        line = stream.readline(MAX_LINE_BYTES + 1)
+        if not line:
+            return
+        enqueue("frame", line, epoch, read_started_monotonic_ms=read_started)
+
+
+class ObserverDeliveryDiagnostics:
+    """Bounded timing evidence only; this object cannot qualify observation health."""
+
+    _source_fields = {
+        "event",
+        "generation",
+        "nonce",
+        "sequence",
+        "source_system_relative_ticks",
+        "challenge_received_qpc_ticks",
+        "capture_age_ms",
+        "serialize_start_qpc_ticks",
+        "serialized_qpc_ticks",
+        "send_start_qpc_ticks",
+        "send_ended_qpc_ticks",
+        "metadata_emit_started_qpc_ticks",
+        "jpeg_bytes",
+        "sent",
+        "previous_metadata_sequence",
+        "previous_metadata_started_qpc_ticks",
+        "previous_metadata_ended_qpc_ticks",
+    }
+
+    def __init__(self, output_dir: Path, generation: str, *, enabled: bool = False):
+        self.enabled = enabled is True
+        self.generation = generation
+        self.incomplete = False
+        self.rejected_records = self.dropped_records = self.bytes_written = 0
+        self.counts = {"source": 0, "receiver": 0}
+        self.max_append_ms = 0.0
+        self.first_error = None
+        self.drop_lock = threading.Lock()
+        self.stream = None
+        if self.enabled:
+            try:
+                self.stream = (Path(output_dir) / "delivery-timing.ndjson").open("xb")
+            except OSError as error:
+                self._drop(str(error))
+
+    def _drop(self, reason, *, rejected=False):
+        with self.drop_lock:
+            self.incomplete = True
+            if rejected:
+                self.rejected_records += 1
+            else:
+                self.dropped_records += 1
+            if self.first_error is None:
+                self.first_error = reason[:160]
+        return False
+
+    def queue_dropped(self):
+        if self.enabled:
+            self._drop("observer message queue full")
+
+    @staticmethod
+    def _number(value):
+        try:
+            return type(value) in (int, float) and math.isfinite(value) and value >= 0
+        except OverflowError:
+            return False
+
+    def _identity(self, value):
+        if (
+            not isinstance(value, dict)
+            or value.get("generation") != self.generation
+            or not isinstance(value.get("nonce"), str)
+            or not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", value["nonce"])
+            or any(
+                type(value.get(key)) is not int or not 0 < value[key] <= 2**53 - 1
+                for key in ("sequence", "source_system_relative_ticks", "challenge_received_qpc_ticks")
+            )
+            or value["source_system_relative_ticks"] <= value["challenge_received_qpc_ticks"]
+        ):
+            raise ValueError("diagnostic frame identity invalid")
+        return {
+            key: value[key]
+            for key in (
+                "generation",
+                "nonce",
+                "sequence",
+                "source_system_relative_ticks",
+                "challenge_received_qpc_ticks",
+            )
+        }
+
+    def _receipt(self, received_monotonic_ms, received_wall_time_ms, processing_started_ms):
+        if (
+            not all(self._number(value) for value in (received_monotonic_ms, processing_started_ms))
+            or processing_started_ms < received_monotonic_ms
+            or type(received_wall_time_ms) is not int
+            or received_wall_time_ms <= 0
+        ):
+            raise ValueError("diagnostic original local receipt invalid")
+        return {
+            "received_local_perf_counter_ms": received_monotonic_ms,
+            "received_wall_time_ms": received_wall_time_ms,
+            "processing_started_monotonic_ms": processing_started_ms,
+        }
+
+    def _append(self, kind, value):
+        began = time.perf_counter()
+        try:
+            encoded = (
+                json.dumps(dict(value, kind=kind), separators=(",", ":"), allow_nan=False) + "\n"
+            ).encode()
+            if len(encoded) > DELIVERY_DIAGNOSTIC_MAX_LINE_BYTES:
+                return self._drop("diagnostic row byte limit", rejected=True)
+            if (
+                self.counts[kind] >= DELIVERY_DIAGNOSTIC_MAX_RECORDS
+                or self.bytes_written + len(encoded) > DELIVERY_DIAGNOSTIC_MAX_BYTES
+            ):
+                return self._drop("diagnostic finite record/byte limit")
+            if self.stream is None:
+                return self._drop("diagnostic file unavailable")
+            self.stream.write(encoded)
+            self.stream.flush()
+            self.counts[kind] += 1
+            self.bytes_written += len(encoded)
+            return True
+        except (OSError, ValueError, TypeError) as error:
+            return self._drop(str(error), rejected=not isinstance(error, OSError))
+        finally:
+            self.max_append_ms = max(self.max_append_ms, (time.perf_counter() - began) * 1000)
+
+    def source(self, value, *, received_wall_time_ms, received_monotonic_ms, processing_started_ms):
+        if not self.enabled:
+            return False
+        try:
+            self._identity(value)
+            if set(value) != self._source_fields or value.get("event") != "frame_delivery_timing":
+                raise ValueError("diagnostic source schema invalid")
+            keys = (
+                "source_system_relative_ticks",
+                "serialize_start_qpc_ticks",
+                "serialized_qpc_ticks",
+                "send_start_qpc_ticks",
+                "send_ended_qpc_ticks",
+                "metadata_emit_started_qpc_ticks",
+            )
+            ticks = [value[key] for key in keys]
+            if any(type(tick) is not int or not 0 < tick <= 2**53 - 1 for tick in ticks) or ticks != sorted(
+                ticks
+            ):
+                raise ValueError("diagnostic original source phases invalid")
+            previous = [
+                value[key]
+                for key in (
+                    "previous_metadata_sequence",
+                    "previous_metadata_started_qpc_ticks",
+                    "previous_metadata_ended_qpc_ticks",
+                )
+            ]
+            if any(type(tick) is not int or not 0 <= tick <= 2**53 - 1 for tick in previous) or not (
+                previous == [0, 0, 0]
+                or (0 < previous[0] < value["sequence"] and 0 < previous[1] <= previous[2] <= ticks[1])
+            ):
+                raise ValueError("diagnostic prior stdout phases invalid")
+            if (
+                not self._number(value["capture_age_ms"])
+                or type(value["sent"]) is not bool
+                or type(value["jpeg_bytes"]) is not int
+                or not 0 < value["jpeg_bytes"] <= MAX_JPEG_BYTES
+            ):
+                raise ValueError("diagnostic original source values invalid")
+            receipt = self._receipt(received_monotonic_ms, received_wall_time_ms, processing_started_ms)
+            return self._append("source", dict(value, **receipt))
+        except (ValueError, TypeError, KeyError) as error:
+            return self._drop(str(error), rejected=True)
+
+    def receiver(
+        self,
+        value,
+        *,
+        read_started_ms,
+        received_monotonic_ms,
+        received_wall_time_ms,
+        processing_started_ms,
+        processing_completed_ms,
+        accepted,
+        connection_epoch=None,
+    ):
+        if not self.enabled:
+            return False
+        try:
+            identity = self._identity(value)
+            receipt = self._receipt(received_monotonic_ms, received_wall_time_ms, processing_started_ms)
+            if (
+                not all(self._number(value) for value in (read_started_ms, processing_completed_ms))
+                or read_started_ms > received_monotonic_ms
+                or processing_completed_ms < processing_started_ms
+                or type(accepted) is not bool
+                or (
+                    connection_epoch is not None
+                    and (type(connection_epoch) is not int or connection_epoch < 0)
+                )
+            ):
+                raise ValueError("diagnostic original receiver phases invalid")
+            return self._append(
+                "receiver",
+                dict(
+                    identity,
+                    **receipt,
+                    event="frame_receiver_timing",
+                    read_started_monotonic_ms=read_started_ms,
+                    processing_completed_monotonic_ms=processing_completed_ms,
+                    accepted=accepted,
+                    connection_epoch=connection_epoch,
+                    read_wait_ms=received_monotonic_ms - read_started_ms,
+                    queue_delay_ms=processing_started_ms - received_monotonic_ms,
+                    processing_ms=processing_completed_ms - processing_started_ms,
+                ),
+            )
+        except (ValueError, TypeError, KeyError) as error:
+            return self._drop(str(error), rejected=True)
+
+    def finish(self, source_summary):
+        if self.enabled and (
+            not isinstance(source_summary, dict)
+            or source_summary.get("enabled") is not True
+            or type(source_summary.get("records")) is not int
+            or source_summary["records"] != self.counts["source"]
+            or source_summary.get("incomplete") is not False
+        ):
+            self._drop("source diagnostic evidence missing or incomplete")
+
+    def close(self):
+        if self.stream is not None:
+            try:
+                self.stream.close()
+            except OSError as error:
+                self._drop(str(error))
+            self.stream = None
+
+    def snapshot(self):
+        return {
+            "enabled": self.enabled,
+            "incomplete": self.incomplete,
+            "source_records": self.counts["source"],
+            "receiver_records": self.counts["receiver"],
+            "rejected_records": self.rejected_records,
+            "dropped_records": self.dropped_records,
+            "bytes_written": self.bytes_written,
+            "max_append_ms": self.max_append_ms,
+            "first_error": self.first_error,
+        }
 
 
 class ObserverReceiver:
@@ -668,6 +934,7 @@ def run_capture(args) -> int:
         max_recording_bytes=MAX_RECORDING_BYTES,
         output_dir=remote_dir,
         token=token,
+        delivery_diagnostics=getattr(args, "delivery_diagnostics", False) is True,
     )
     stage_script = (
         "$ProgressPreference='SilentlyContinue';$ErrorActionPreference='Stop';"
@@ -735,7 +1002,8 @@ def run_capture(args) -> int:
     previous_handlers = {}
     for signum in (signal.SIGINT, signal.SIGTERM):
         previous_handlers[signum] = signal.signal(signum, lambda *_: stopped.set())
-    messages: queue.Queue[tuple[str, bytes, float, int, int] | None] = queue.Queue(maxsize=16)
+    messages: queue.Queue[tuple[str, bytes, float, int, int, float | None] | None] = queue.Queue(maxsize=16)
+    diagnostic = ObserverDeliveryDiagnostics(output, args.generation, enabled=config["delivery_diagnostics"])
     failure = terminal = None
     started = time.perf_counter()
     connected = None
@@ -756,18 +1024,23 @@ def run_capture(args) -> int:
     next_metadata_read = 0.0
     retired_forwarding = set()
 
-    def enqueue(kind, line, epoch=0):
-        item = (kind, line, time.perf_counter() * 1000, _wall_time_ms(), epoch)
+    def enqueue(kind, line, epoch=0, read_started_monotonic_ms=None):
+        item = _observer_message(kind, line, epoch, read_started_monotonic_ms)
         try:
             messages.put(item, timeout=0.1)
         except queue.Full:
             stopped.set()
+            diagnostic.queue_dropped()
 
     def read_channel(client, epoch):
         try:
             with client.makefile("rb") as stream:
-                while line := stream.readline(MAX_LINE_BYTES + 1):
-                    enqueue("frame", line, epoch)
+                _read_observer_lines(
+                    stream,
+                    enqueue,
+                    epoch,
+                    clock_ms=(lambda: time.perf_counter() * 1000) if diagnostic.enabled else None,
+                )
         except OSError as error:
             enqueue(
                 "transport_error",
@@ -1009,7 +1282,8 @@ def run_capture(args) -> int:
                         continue
                     if item is None:
                         continue
-                    kind, line, received_mono, received_wall, epoch = item
+                    processing_started = time.perf_counter() * 1000 if diagnostic.enabled else None
+                    kind, line, received_mono, received_wall, epoch, read_started = item
                     if len(line) > MAX_LINE_BYTES:
                         failure = "observer protocol line limit"
                         stopped.set()
@@ -1051,6 +1325,14 @@ def run_capture(args) -> int:
                     value = json.loads(line)
                     if not isinstance(value, dict):
                         raise ValueError("observer protocol must be an object")
+                    if kind == "metadata" and value.get("event") == "frame_delivery_timing":
+                        diagnostic.source(
+                            value,
+                            received_wall_time_ms=received_wall,
+                            received_monotonic_ms=received_mono,
+                            processing_started_ms=processing_started,
+                        )
+                        continue
                     if kind == "metadata":
                         with (output / "protocol-events.ndjson").open("a", encoding="utf-8") as protocol:
                             protocol.write(
@@ -1065,6 +1347,17 @@ def run_capture(args) -> int:
                             )
                     if kind == "frame":
                         if epoch != connection_id:
+                            if diagnostic.enabled:
+                                diagnostic.receiver(
+                                    value,
+                                    read_started_ms=read_started,
+                                    received_monotonic_ms=received_mono,
+                                    received_wall_time_ms=received_wall,
+                                    processing_started_ms=processing_started,
+                                    processing_completed_ms=time.perf_counter() * 1000,
+                                    accepted=False,
+                                    connection_epoch=epoch,
+                                )
                             continue
                         accepted = receiver.accept(
                             value, received_wall_time_ms=received_wall, received_monotonic_ms=received_mono
@@ -1081,6 +1374,17 @@ def run_capture(args) -> int:
                             + "\n"
                         )
                         history.flush()
+                        if diagnostic.enabled:
+                            diagnostic.receiver(
+                                value,
+                                read_started_ms=read_started,
+                                received_monotonic_ms=received_mono,
+                                received_wall_time_ms=received_wall,
+                                processing_started_ms=processing_started,
+                                processing_completed_ms=time.perf_counter() * 1000,
+                                accepted=accepted,
+                                connection_epoch=epoch,
+                            )
                         if accepted:
                             loss_started = None
                             attempt_pending = forwarding_waiting = False
@@ -1147,6 +1451,8 @@ def run_capture(args) -> int:
             receiver.terminal(terminal or {"event": "failed", "generation": args.generation})
             for signum, handler in previous_handlers.items():
                 signal.signal(signum, handler)
+            diagnostic.finish(terminal.get("delivery_diagnostics") if terminal is not None else None)
+            diagnostic.close()
     summary = {
         "generation": args.generation,
         "accepted_frames": receiver.accepted_frames,
@@ -1182,6 +1488,8 @@ def run_capture(args) -> int:
             else None
         ),
     }
+    if diagnostic.enabled:
+        summary["delivery_diagnostics"] = diagnostic.snapshot()
     _atomic_json(output / "receiver-result.json", summary)
     print(json.dumps(summary))
     return (
@@ -1677,6 +1985,11 @@ def main() -> int:
         "--delivery-compression",
         action="store_true",
         help="Use compression only on this capture's SSH forwarding transports",
+    )
+    parser.add_argument(
+        "--delivery-diagnostics",
+        action="store_true",
+        help="Retain bounded source and receiver timing evidence for this finite capture only",
     )
     offline = parser.add_mutually_exclusive_group()
     offline.add_argument("--retrieve-only", action="store_true")
