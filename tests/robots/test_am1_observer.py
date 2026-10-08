@@ -1171,6 +1171,11 @@ def reset_transport(tmp_path, monkeypatch, jpeg):
         exhausted_metadata_reads=0,
         owner_alive_stalled=False,
         owner_alive_at_reattach=[],
+        live_owner_backlog=False,
+        owner_stdout_eof_only=False,
+        delay_replacement=False,
+        metadata_before_stop=0,
+        source_diagnostics_sent=0,
     )
     real_perf_counter = time.perf_counter
     monkeypatch.setattr(module.time, "perf_counter", lambda: real_perf_counter() + state.clock_offset)
@@ -1187,8 +1192,9 @@ def reset_transport(tmp_path, monkeypatch, jpeg):
             self.listener = socket.socket()
             self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.listener.bind(("127.0.0.1", int(spec[1])))
-            self.listener.listen()
             self.is_replacement = "-N" in command
+            if not (self.is_replacement and (state.live_owner_backlog or state.delay_replacement)):
+                self.listener.listen()
             if not self.is_replacement:
                 self.writer.write(
                     (
@@ -1201,10 +1207,50 @@ def reset_transport(tmp_path, monkeypatch, jpeg):
                 state.owner_alive_at_reattach.append(state.processes[0].poll() is None)
             if self.is_replacement and state.failed_forwards:
                 self.reset()
+            elif self.is_replacement and (state.live_owner_backlog or state.delay_replacement):
+                # Real delayed loopback readiness, like a forwarding process that
+                # exists before its local listener accepts connections.
+                def open_forward():
+                    time.sleep(0.2)
+                    self.listener.listen()
+                    self.accept()
+
+                def publish_source_backlog():
+                    time.sleep(0.02)
+                    owner = state.processes[0]
+                    for index in range(24):
+                        ticks = 1_100_000 + index * 1_000_000
+                        record = {
+                            "event": "frame_delivery_timing",
+                            "generation": args.generation,
+                            "nonce": "old-source-diagnostic",
+                            "sequence": 1000 + index,
+                            "source_system_relative_ticks": ticks,
+                            "challenge_received_qpc_ticks": ticks - 100_000,
+                            "capture_age_ms": 2500.0,
+                            "serialize_start_qpc_ticks": ticks + 200_000,
+                            "serialized_qpc_ticks": ticks + 210_000,
+                            "send_start_qpc_ticks": ticks + 220_000,
+                            "send_ended_qpc_ticks": ticks + 230_000,
+                            "metadata_emit_started_qpc_ticks": ticks + 240_000,
+                            "jpeg_bytes": 1000,
+                            "sent": True,
+                            "previous_metadata_sequence": 0,
+                            "previous_metadata_started_qpc_ticks": 0,
+                            "previous_metadata_ended_qpc_ticks": 0,
+                        }
+                        owner.writer.write((json.dumps(record) + "\n").encode())
+                        state.source_diagnostics_sent += 1
+                        time.sleep(0.04)
+
+                threading.Thread(target=open_forward, daemon=True).start()
+                if state.live_owner_backlog:
+                    threading.Thread(target=publish_source_backlog, daemon=True).start()
             else:
                 threading.Thread(target=self.accept, daemon=True).start()
 
         def accept(self):
+            count = 0
             try:
                 client, _ = self.listener.accept()
                 self.clients.append(client)
@@ -1226,6 +1272,12 @@ def reset_transport(tmp_path, monkeypatch, jpeg):
                                 "recording_started_utc": "original-start",
                                 "recording_stopped_utc": "original-stop",
                             }
+                            if state.live_owner_backlog:
+                                state.final["delivery_diagnostics"] = {
+                                    "enabled": True,
+                                    "records": state.source_diagnostics_sent,
+                                    "incomplete": False,
+                                }
                             if state.owner_alive_stalled:
                                 owner = state.processes[0]
                                 owner.writer.write(
@@ -1287,9 +1339,30 @@ def reset_transport(tmp_path, monkeypatch, jpeg):
                             self.reset()
                             return
                         if self.is_replacement and count == 3 and state.resets == 1:
+                            if state.live_owner_backlog:
+                                deadline = real_perf_counter() + 2
+                                while state.source_diagnostics_sent < 24 and real_perf_counter() < deadline:
+                                    time.sleep(0.001)
                             (args.output_dir / "stop.request").write_text("normal owned stop")
+                if (
+                    count == 0
+                    and self.is_replacement
+                    and (state.live_owner_backlog or state.delay_replacement)
+                ):
+                    # Windows may complete a connect after the caller's existing
+                    # timeout. Its empty connection is not a capture Stop; the
+                    # same live forward accepts the next authenticated client.
+                    self.accept()
             except (OSError, ValueError) as error:
-                if self.returncode is None and state.final is None:
+                if (
+                    count == 0
+                    and self.is_replacement
+                    and (state.live_owner_backlog or state.delay_replacement)
+                    and self.returncode is None
+                    and state.final is None
+                ):
+                    self.accept()  # An empty timed-out client does not retire a live forward.
+                elif self.returncode is None and state.final is None:
                     state.errors.append(error)
             finally:
                 for client in [] if state.qualified_run and state.final else self.clients:
@@ -1298,7 +1371,8 @@ def reset_transport(tmp_path, monkeypatch, jpeg):
                     client.close()
 
         def reset(self):
-            self.returncode = 255
+            if not (state.owner_stdout_eof_only and not self.is_replacement):
+                self.returncode = 255
             self.stderr.write(b"client_loop: send disconnect: Connection reset\n")
             self.listener.close()
             self.writer.close()
@@ -1311,6 +1385,8 @@ def reset_transport(tmp_path, monkeypatch, jpeg):
             return self.returncode
 
         def wait(self, timeout):
+            if state.owner_stdout_eof_only and not self.is_replacement and state.final is not None:
+                self.returncode = 0  # Closing the last forward releases an SSH whose stdout already ended.
             if self.returncode is None:
                 raise subprocess.TimeoutExpired("forward-only", timeout)
             return self.returncode
@@ -1332,6 +1408,12 @@ def reset_transport(tmp_path, monkeypatch, jpeg):
             state.source = json.loads(base64.b64decode(kwargs["input"].splitlines()[1]))
             return subprocess.CompletedProcess(command, 0, b'{"capture_port":54321}', b"")
         state.metadata_reads += 1
+        if state.processes[0].poll() is None and not any(v["event"] == "stop" for v in state.received):
+            state.metadata_before_stop += 1
+        if state.live_owner_backlog and state.processes[0].poll() is None:
+            # Mock only the unavailable external SSH read. FIFO pipes, socket
+            # IO, queue, diagnostics, validation and health publication are real.
+            time.sleep(0.8)
         if state.final is None and len(state.processes) >= 4 and state.processes[-1].poll() is not None:
             state.exhausted_metadata_reads += 1
             if state.exhausted_metadata_reads >= 3:
@@ -1517,6 +1599,58 @@ def test_owner_alive_stalled_forward_is_rebuilt_without_restarting_capture(reset
     assert result["qualification_at_stop"] is False
     assert len({v["nonce"] for v in state.received if v["event"] == "frame"}) == result["challenges_issued"]
     assert any(v["event"] == "stop" for v in state.received)
+
+
+def test_source_stdout_eof_allows_terminal_lookup_even_if_owner_ssh_is_alive(reset_transport):
+    state = reset_transport
+    state.owner_stdout_eof_only = True
+    state.delay_replacement = True
+    state.replay = True
+    assert state.module.run_capture(state.args) == 1
+    result = json.loads((state.args.output_dir / "receiver-result.json").read_text())
+    assert state.owner_alive_at_reattach == [True]
+    assert state.metadata_reads >= 1 and state.metadata_before_stop >= 1
+    assert result["camera_released"] is True and result["capture_success"] is True
+    assert result["owner_ssh_exit_code"] == 0 and result["failure"] is None
+    assert result["qualification_at_stop"] is False and result["same_capture_reconnects"] == 1
+    assert state.stage_count == 1 and len(state.commands) == 2
+
+
+def test_live_owner_cleanup_fetch_cannot_starve_fifo_during_forward_recovery(reset_transport):
+    state = reset_transport
+    state.owner_alive_stalled = True
+    state.live_owner_backlog = True
+    state.replay = True
+    state.args.delivery_diagnostics = True
+    assert state.module.run_capture(state.args) == 1  # No invented twenty-second qualification.
+    result = json.loads((state.args.output_dir / "receiver-result.json").read_text())
+    assert result["accepted_frames"] >= 5, "cleanup-only SSH blocked genuine forwarding recovery"
+    assert result["failure"] is None and result["same_capture_reconnects"] == 1
+    assert result["delivery_diagnostics"]["source_records"] == 24
+    assert result["delivery_diagnostics"]["incomplete"] is False
+    assert result["delivery_diagnostics"]["dropped_records"] == 0
+    rows = [
+        json.loads(line) for line in (state.args.output_dir / "frame-health.ndjson").read_text().splitlines()
+    ]
+    rejected = [row for row in rows if not row["accepted"]]
+    assert any(row["rejection"]["reason"] == "observer challenge mismatch" for row in rejected)
+    assert all(row["current_contiguous_delivery_qualified"] is False for row in rows)
+    timings = [
+        json.loads(line)
+        for line in (state.args.output_dir / "delivery-timing.ndjson").read_text().splitlines()
+    ]
+    source = [row for row in timings if row["kind"] == "source"]
+    assert [row["sequence"] for row in source] == list(range(1000, 1024))
+    assert all(row["capture_age_ms"] == 2500.0 for row in source)
+    assert all(
+        row["received_local_perf_counter_ms"] <= row["processing_started_monotonic_ms"] for row in source
+    )
+    assert result["camera_released"] is True and result["capture_success"] is True
+    assert result["qualification_at_stop"] is False and result["owner_ssh_exit_code"] == 0
+    assert state.stage_count == 1 and len(state.commands) == 2
+    assert state.owner_alive_at_reattach == [True]
+    nonces = [value["nonce"] for value in state.received if value["event"] == "frame"]
+    assert len(nonces) == len(set(nonces)) and any(value["event"] == "stop" for value in state.received)
 
 
 def test_opt_in_scp_stage_failure_never_sends_private_stdin_or_starts_camera(tmp_path, monkeypatch):

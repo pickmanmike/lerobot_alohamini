@@ -185,8 +185,14 @@ actual attempt refused before Live on two repeated lift velocity/position direct
 disagreements; no trajectory or Resume ran. The original cleanup_unknown verdict remains.
 A separate exclusive read-only inspection subsequently verified all sixteen motors off,
 zero body goals, selected gain I0 and unchanged corrected calibration. A conservative
-post-home quiet-feedback transition is under test within the existing settling budget;
-the servo's physical cause and the hypothesis's effectiveness remain unproven.
+post-home quiet-feedback transition passed 341 focused checks and was staged within the
+existing settling budget. The next observer capture stopped before startup admission on
+a delivery stall, so the lift transition has not yet been exercised on hardware. A
+secondary receiver defect was reproduced: synchronous cleanup lookup blocked the live
+source FIFO during forwarding recovery. The narrow ordered-EOF/Stop lookup correction
+passed 217 focused observer cases and independent regression checks. Original source
+ages, identities and recovery limits remain unchanged; the initial transport stall and
+the lift hypothesis's physical effectiveness remain unproven.
 Plan: [AM1-03 executable plan](../superpowers/plans/2026-10-06-am1-reliability-03.md).
 Historical packet-02/01 evidence below retains its original verdicts.
 

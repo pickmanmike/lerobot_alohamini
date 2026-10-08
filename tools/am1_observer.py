@@ -1282,7 +1282,9 @@ def run_capture(args) -> int:
                                 if not forwarding_waiting:
                                     attempt_pending = False
                     if (
-                        (forward_process is not None or id(process) in dead_transports)
+                        # Cleanup reads can block for a second. While the source
+                        # stdout is live, drain its ordered FIFO during recovery.
+                        (stop_sent_at is not None or id(process) in dead_transports)
                         and connected is None
                         and now >= next_metadata_read
                     ):

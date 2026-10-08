@@ -46,6 +46,12 @@ and was staged. The next attempt stopped before Live on repeated lift velocity/p
 direction disagreement, so it did not exercise Resume or the trajectory. Original
 cleanup_unknown is retained; a separate exclusive read-only check verified all sixteen
 motors off, zero body goals, unchanged corrected calibration and selected gain I0.
-Test a conservative post-home quiet-feedback transition within the existing settling
-budget; this is a specific hypothesis, not a demonstrated physical cause or cure.
+The conservative post-home quiet-feedback transition passed 341 focused cases and was
+staged within the existing settling budget. The next observer capture stopped before
+startup admission, leaving the lift hypothesis unexercised on hardware. Its first fault
+was a delivery stall; later synchronous cleanup lookups blocked the live source FIFO.
+The narrow ordered-EOF/Stop lookup correction passed 217 focused observer cases and
+independent regression checks. It repairs the demonstrated secondary blocking while
+preserving original ages, identities and all recovery limits; it does not establish
+the initial transport stall's cause or a physical lift cure.
 Full 352-second completion, natural-rest confirmation and conditional body check remain open.
