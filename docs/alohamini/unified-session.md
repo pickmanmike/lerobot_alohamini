@@ -222,6 +222,18 @@ An isolated comparison with additional outbound gateway activity still retained 
 half-second delivery gaps and does not establish a mitigation. No adapter or network
 permission setting was changed. All original failed/partial results remain unchanged.
 
+A camera-only attempt with that correction lost delivery before robot Start. The
+receiver sent Stop 5.012 seconds after the original idle indication; repeated idle
+records belonged to cleanup, not a renewed recovery budget. The original failed
+receiver verdict is retained. After connectivity returned, the same generation's
+final artifact independently verified finite capture completion and camera release.
+A local Wi-Fi security stop occurred 14 ms after the last decoded receipt, followed
+by repeated reauthentication and failed connections to both known device hosts.
+This identifies a connection event at this failure boundary, not its driver or
+access-point mechanism or the cause of earlier gaps without matching events.
+A one-property roaming comparison and exact rollback are being prepared;
+no adapter, permission or motor setting has been changed by this investigation.
+
 Full completion, comparable automatic restart from resulting normal rest and the
 conditional body check remain pending; PR #16 remains draft.
 Plan: [AM1-03 executable plan](../superpowers/plans/2026-10-06-am1-reliability-03.md).
