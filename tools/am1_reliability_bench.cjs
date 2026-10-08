@@ -41,7 +41,7 @@ assert(!(headless && target.port === "8765"), "Powered console bench requires th
   let ownedSession = null, ownedToken = null, csrfToken = null, startRefusal = null, startCount = 0, droppedRecords = 0, cancelled = false;
   let observation = null, lastQuality = null, lastCoveragePost = -Infinity;
   const observationPollMs = virtualConfig?.required_camera_roles.length ? 100 : 200;
-  let recoveryStarted = null, lastRecoveryProof = null, recoveryAttempts = 0, recoveryRefusal = null, heldCameraEpoch = null;
+  let recoveryStarted = null, lastRecoveryProof = null, lastRecoveryCause = null, recoveryAttempts = 0, recoveryRefusal = null, heldCameraEpoch = null;
   const approvedPauses = new Set();
   let observerEventCount = 0, pendingObserverEvent = null, observerEventWrite = null;
   const observerEventPath = virtualConfig ? path.join(path.dirname(virtualConfig.observer_health_path),"event-request.json") : null;
@@ -102,12 +102,44 @@ assert(!(headless && target.port === "8765"), "Powered console bench requires th
       await route.continue({postData:JSON.stringify(payload)});
     } else {
       if (payload.kind === "Resume" && virtualConfig) {
-        const current = await read();
-        const proof = qualifyRecovery(current, ownedSession, observation?.required_coverage_qualified,
-                                      virtualConfig.max_recoveries);
-        assert(proof && approvedPauses.has(proof.pause_sequence), "Current virtual recovery no longer qualifies");
+        const requestedProof = lastRecoveryProof && {...lastRecoveryProof};
+        assert(requestedProof && approvedPauses.has(requestedProof.pause_sequence), "Resume has no approved episode");
         assert.equal(payload.session_id, ownedSession);
-        assert.equal(payload.gate_stage, "resume"); assert.equal(payload.host_epoch, proof.host_epoch);
+        assert.equal(payload.control_token, ownedToken);
+        assert.equal(payload.gate_stage, "resume"); assert.equal(payload.host_epoch, requestedProof.host_epoch);
+        // Qualification may expire while the real frontend prepares its empty
+        // lease. Keep this one request held inside the original episode; never
+        // forward stale proof, click again, or reset a recovery/trajectory clock.
+        let proof = null;
+        while (!proof) {
+          assert(!cancelled && performance.now() < deadline, "Bench cancelled or deadline expired during Resume");
+          assert(recoveryStarted !== null && performance.now()-recoveryStarted < virtualConfig.recovery_episode_seconds*1000,
+                 "Virtual recovery episode deadline");
+          const current = await read();
+          const bench = current.virtual_bench;
+          assert(!virtualStop, failure);
+          assert(current.session_id === ownedSession && current.native_connected === true &&
+                 current.input_epoch === requestedProof.input_epoch && bench?.enabled && bench.disarmed === false &&
+                 bench.pause_sequence === requestedProof.pause_sequence && bench.host_epoch === requestedProof.host_epoch &&
+                 bench.input_epoch === requestedProof.input_epoch && bench.cause === lastRecoveryCause &&
+                 current.input_pause?.reason === lastRecoveryCause && RECOVERABLE_CAUSES.has(lastRecoveryCause) &&
+                 current.input_pause?.pause_sequence === requestedProof.pause_sequence &&
+                 current.pending_gate?.[0] === "resume" && current.pending_gate[1] === requestedProof.host_epoch &&
+                 Number.isSafeInteger(bench.recovery_count) && bench.recovery_count < virtualConfig.max_recoveries &&
+                 Number.isFinite(bench.remaining_seconds) && bench.remaining_seconds > 0,
+                 "Virtual recovery ownership, gate or episode changed");
+          assert(!cancelled && performance.now() < deadline &&
+                 performance.now()-recoveryStarted < virtualConfig.recovery_episode_seconds*1000,
+                 "Virtual recovery episode deadline");
+          proof = qualifyRecovery(current, ownedSession, observation?.required_coverage_qualified,
+                                  virtualConfig.max_recoveries);
+          if (!proof) {
+            keep({event:"recovery_request_held",...requestedProof,
+                  elapsed_ms:performance.now()-recoveryStarted});
+            await page.waitForTimeout(observationPollMs);
+          }
+        }
+        assert.deepEqual(proof, requestedProof, "Virtual recovery proof changed while request was held");
         payload.bench_recovery = proof;
         await route.continue({postData:JSON.stringify(payload)});
         return;
@@ -342,7 +374,7 @@ assert(!(headless && target.port === "8765"), "Powered console bench requires th
             currentGateVisible = await visibleGate();
           }
           if (!currentGateVisible) { await page.waitForTimeout(observationPollMs); continue; }
-          approvedPauses.add(proof.pause_sequence); recoveryAttempts++; lastRecoveryProof = proof;
+          approvedPauses.add(proof.pause_sequence); recoveryAttempts++; lastRecoveryProof = proof; lastRecoveryCause = state.input_pause.reason;
           keep({event:"qualified_recovery_request",cause:state.input_pause.reason,...proof,
                 attempt:recoveryAttempts,elapsed_ms:performance.now()-recoveryStarted});
           await page.getByRole("button",{name:"Resume",exact:true}).click({timeout:2000});

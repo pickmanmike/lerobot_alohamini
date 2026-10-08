@@ -38,5 +38,8 @@ showed a delayed small outward/return movement with restoration, while its tight
 immediate-return criterion failed. The first full repeat completed two cycles and two
 boundaries before the fourth required-observation gap exhausted three permitted recoveries.
 Ordinary Stop and cleanup succeeded; a later log-finalization timeout is secondary.
-Repair reporting and diagnose the response-delivery boundary before a supported rerun.
+Bench first-cause/finalization reporting was corrected. A smaller live-JPEG payload
+comparison had no transport loss but stopped after two cycles when current coverage
+expired between Resume preparation and forwarding. Preserve that partial result;
+review and stage the same-episode held-request correction before a supported rerun.
 Full 352-second completion, natural-rest confirmation and conditional body check remain open.

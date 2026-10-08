@@ -9,6 +9,14 @@ transport/result records retain the request, and the source terminal reports the
 applied choice. This payload-pressure hypothesis does not qualify delivery or
 relax observation limits; inspect current framing before powered admission.
 
+The subsequent smaller-payload attempt had no SSH loss and completed two cycles
+before a Resume request lost current coverage between preparation and forwarding.
+Its ordinary Stop and cleanup succeeded; the workload remained incomplete. The
+runner now keeps that one request held within its original recovery episode and
+requires the same owner, pause, gate and fresh proof before forwarding. Expiry,
+operator intervention, ownership changes and backend refusal remain terminal.
+No recovery count, motion timeline or observation limit is reset.
+
 Execute finite virtual/scripted arm input and automated owned body controls,
 with the existing spare P1 observer current throughout useful runs. The owner
 authorizes supported software repairs, bounded ordinary runs and qualified
