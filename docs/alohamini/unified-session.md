@@ -161,7 +161,7 @@ exclusion are caught. New modules are lint-clean; modified legacy files introduc
 lint findings. Independent source review is clear; software checks remain separate from
 actual motion qualification.
 
-Actual automatic startup now succeeds from normal rest. The short I0 baseline showed too
+Earlier corrected-map automatic starts succeeded from normal rest. The short I0 baseline showed too
 little selected-joint motion to prove useful return. The scoped reversible I1 comparison
 showed a gradual small excursion and actual later return near the original seed, with
 normal cleanup and verified restoration to I0. Images independently show reversal without
@@ -178,6 +178,15 @@ the planned comparable restart confirmation remain pending. Investigate the demo
 response-delivery delay before another powered repeat; keep original source ages, ownership,
 freshness thresholds, trajectory, seed and recovery budgets unchanged.
 
+A later smaller-live-JPEG comparison had no transport loss but stopped at 217.039/352
+trajectory seconds when current observation expired between Resume preparation and
+forwarding. The same-episode held-request correction was tested and staged. Its next
+actual attempt refused before Live on two repeated lift velocity/position direction
+disagreements; no trajectory or Resume ran. The original cleanup_unknown verdict remains.
+A separate exclusive read-only inspection subsequently verified all sixteen motors off,
+zero body goals, selected gain I0 and unchanged corrected calibration. A conservative
+post-home quiet-feedback transition is under test within the existing settling budget;
+the servo's physical cause and the hypothesis's effectiveness remain unproven.
 Plan: [AM1-03 executable plan](../superpowers/plans/2026-10-06-am1-reliability-03.md).
 Historical packet-02/01 evidence below retains its original verdicts.
 

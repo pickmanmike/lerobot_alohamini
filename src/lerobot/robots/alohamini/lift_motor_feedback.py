@@ -658,12 +658,18 @@ class MotorFeedbackComparison:
         allow_settling: bool = False,
         timeout_s: float = STATIONARY_TIMEOUT_S,
         on_sample: Callable[[dict[str, Any]], None] | None = None,
+        require_quiet_motion_feedback: bool = False,
     ) -> dict[str, Any]:
         """Require one bounded window of fresh, mutually consistent feedback."""
         qualification_started = self.monotonic()
         deadline = qualification_started + timeout_s
         candidate: list[tuple[float, dict[str, Any]]] = []
         last_record: dict[str, Any] | None = None
+        required_samples = self.min_stationary_samples
+        required_window_s = STATIONARY_WINDOW_S
+        if require_quiet_motion_feedback:
+            required_samples = max(required_samples, 5)
+            required_window_s = max(required_window_s, 4 * POLL_S)
 
         def reject_or_reset(record: dict[str, Any], reason: str) -> None:
             nonlocal candidate
@@ -717,6 +723,14 @@ class MotorFeedbackComparison:
                 )
                 continue
 
+            if require_quiet_motion_feedback and (abs(velocity) > STILL_VELOCITY_RAW or moving != 0):
+                # Normal startup requires the homing motion indication to settle
+                # before commanding relief. Candidate resets retain this one deadline.
+                reject_or_reset(
+                    record, f"{phase}: motion feedback was not quiet during the stationary window."
+                )
+                continue
+
             proposed = [*candidate, (sampled_at, record)]
             origin = int(proposed[0][1]["present_position_raw"])
             offsets = [
@@ -763,7 +777,7 @@ class MotorFeedbackComparison:
                 on_sample(record)
 
             window_s = candidate[-1][0] - candidate[0][0]
-            if len(candidate) < self.min_stationary_samples or window_s < STATIONARY_WINDOW_S:
+            if len(candidate) < required_samples or window_s < required_window_s:
                 continue
 
             evidence = {
@@ -782,6 +796,8 @@ class MotorFeedbackComparison:
                 "expected_torque": expected_torque,
                 "expected_goal_velocity_raw": expected_goal,
             }
+            if require_quiet_motion_feedback:
+                evidence["motion_feedback_quiet"] = True
             self.record(f"{phase}_stationary_qualified", **evidence)
             return {**candidate[-1][1], "stationary_qualification": evidence}
 

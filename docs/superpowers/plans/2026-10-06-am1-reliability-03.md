@@ -40,6 +40,12 @@ boundaries before the fourth required-observation gap exhausted three permitted 
 Ordinary Stop and cleanup succeeded; a later log-finalization timeout is secondary.
 Bench first-cause/finalization reporting was corrected. A smaller live-JPEG payload
 comparison had no transport loss but stopped after two cycles when current coverage
-expired between Resume preparation and forwarding. Preserve that partial result;
-review and stage the same-episode held-request correction before a supported rerun.
+expired between Resume preparation and forwarding, at 217.039/352 trajectory seconds.
+The same-episode held-request correction passed focused real browser/native-pipe tests
+and was staged. The next attempt stopped before Live on repeated lift velocity/position
+direction disagreement, so it did not exercise Resume or the trajectory. Original
+cleanup_unknown is retained; a separate exclusive read-only check verified all sixteen
+motors off, zero body goals, unchanged corrected calibration and selected gain I0.
+Test a conservative post-home quiet-feedback transition within the existing settling
+budget; this is a specific hypothesis, not a demonstrated physical cause or cure.
 Full 352-second completion, natural-rest confirmation and conditional body check remain open.
