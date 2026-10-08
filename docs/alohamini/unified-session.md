@@ -187,12 +187,29 @@ A separate exclusive read-only inspection subsequently verified all sixteen moto
 zero body goals, selected gain I0 and unchanged corrected calibration. A conservative
 post-home quiet-feedback transition passed 341 focused checks and was staged within the
 existing settling budget. The next observer capture stopped before startup admission on
-a delivery stall, so the lift transition has not yet been exercised on hardware. A
+a delivery stall, leaving the lift transition unexercised at that point. A
 secondary receiver defect was reproduced: synchronous cleanup lookup blocked the live
 source FIFO during forwarding recovery. The narrow ordered-EOF/Stop lookup correction
 passed 217 focused observer cases and independent regression checks. Original source
 ages, identities and recovery limits remain unchanged; the initial transport stall and
 the lift hypothesis's physical effectiveness remain unproven.
+
+The latest automatic start from normal rest reached Live through the quiet-feedback
+transition. It rejected a moving post-home sample, then required five quiet samples
+over 0.208 seconds within the original settling deadline. Relief direction subsequently
+qualified under the unchanged guard. This demonstrates startup admission on this attempt;
+it does not establish the earlier lift disagreement's physical cause or longer endurance.
+The run completed three cycles and three measured envelope boundaries: 326.754 of 352
+trajectory seconds after 3.218 seconds of preparation, with 338.913 seconds in Live.
+Three observation losses recovered automatically in the same session; a fourth exhausted
+the original recovery budget and triggered ordinary Stop with cleanup verified. The held
+Resume correction was exercised without owner input. Original recording and timing
+records are retained. All four gaps had steady source cadence and delayed shared receipt;
+no retained Wi-Fi security event overlaps the powered run. The failing transport layer
+remains under investigation. Later useful selected-shoulder return remains distinct from
+the failed tighter immediate-return criterion and from unproven return of every joint.
+Full completion, comparable automatic restart from resulting normal rest and the
+conditional body check remain pending; PR #16 remains draft.
 Plan: [AM1-03 executable plan](../superpowers/plans/2026-10-06-am1-reliability-03.md).
 Historical packet-02/01 evidence below retains its original verdicts.
 

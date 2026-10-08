@@ -48,10 +48,20 @@ cleanup_unknown is retained; a separate exclusive read-only check verified all s
 motors off, zero body goals, unchanged corrected calibration and selected gain I0.
 The conservative post-home quiet-feedback transition passed 341 focused cases and was
 staged within the existing settling budget. The next observer capture stopped before
-startup admission, leaving the lift hypothesis unexercised on hardware. Its first fault
+startup admission, leaving the lift hypothesis unexercised on that attempt. Its first fault
 was a delivery stall; later synchronous cleanup lookups blocked the live source FIFO.
 The narrow ordered-EOF/Stop lookup correction passed 217 focused observer cases and
 independent regression checks. It repairs the demonstrated secondary blocking while
 preserving original ages, identities and all recovery limits; it does not establish
 the initial transport stall's cause or a physical lift cure.
+The next automatic normal-rest start reached Live: one moving post-home sample was
+withheld before five quiet samples qualified over 0.208 seconds within the unchanged
+deadline. Relief direction then qualified under the original guard. The workload reached
+326.754/352 trajectory seconds, three cycles and three envelope boundaries after 3.218
+seconds of preparation and 338.913 seconds in Live. Three observation episodes recovered
+through the staged held-Resume correction without owner input; the fourth exhausted the
+unchanged budget and caused ordinary Stop with cleanup verified. Original source cadence
+continued across all four shared receipt delays; no retained Wi-Fi security event overlaps
+the powered interval. The transport cause remains unresolved. Selected-joint later return
+does not establish the tighter immediate-return criterion or useful return of every joint.
 Full 352-second completion, natural-rest confirmation and conditional body check remain open.
