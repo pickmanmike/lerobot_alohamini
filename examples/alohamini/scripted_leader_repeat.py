@@ -21,6 +21,7 @@ class ArmSmokeRepeatInput:
     def __init__(
         self, initial_positions: Mapping[str, float], *, joint_keys: tuple[str, ...],
         fps: int, emit: Callable[[dict[str, Any]], None] | None = None,
+        joint_amplitudes: Mapping[str, float] | None = None,
     ) -> None:
         self._emit = emit or (lambda record: print(json.dumps(record, sort_keys=True), flush=True))
         self._pending_events: list[dict[str, Any]] = []
@@ -36,7 +37,9 @@ class ArmSmokeRepeatInput:
         self._finished = False
         self._observed: dict[str, float] | None = None
         self._fps = fps
-        self._cycle = ScriptedLeaderInput(initial_positions, joint_keys=joint_keys, fps=fps, emit=self._cycle_event)
+        self._cycle = ScriptedLeaderInput(initial_positions, joint_keys=joint_keys, fps=fps,
+                                          emit=self._cycle_event, joint_amplitudes=joint_amplitudes)
+        self._joint_amplitudes = dict(self._cycle.joint_amplitudes)
         self.origin = dict(self._cycle.origin)
         self.joint_keys = joint_keys
         self.duration_s = 4 * self._cycle.duration_s
@@ -95,9 +98,12 @@ class ArmSmokeRepeatInput:
         if set(observed) != set(self.origin) or not all(math.isfinite(v) for v in observed.values()):
             raise ValueError("scripted feedback is incomplete or invalid")
         if self._waiting_for_return:
-            error = max(abs(observed[k] - self.origin[k]) for k in self.origin)
-            if error > 3.0:
-                raise ValueError(f"ArmSmokeRepeat return exceeds 3 normalized units: {error}")
+            return_errors = {key: abs(observed[key] - self.origin[key]) for key in self.origin}
+            error = max(return_errors.values())
+            for key, joint_error in return_errors.items():
+                limit = self._joint_amplitudes[key]
+                if joint_error > limit:
+                    raise ValueError(f"ArmSmokeRepeat return for {key} exceeds {limit} normalized units: {joint_error}")
             self._return_first = now if self._return_first is None else self._return_first
             self._return_count += 1
             span = now - self._return_first
@@ -105,14 +111,16 @@ class ArmSmokeRepeatInput:
                 self.returns_qualified += 1
                 self._record("am1_scripted_return_qualified", sample_count=self._return_count,
                              span_s=span, maximum_return_error=error, observation_sequence=observation_sequence,
-                             observed=dict(observed), original_seed=dict(self.origin))
+                             observed=dict(observed), original_seed=dict(self.origin),
+                             return_error_limits=dict(self._joint_amplitudes))
                 self._cycle.finish("script_complete")
                 if self._cycle_number == 4:
                     self._complete = True
                 else:
                     self._cycle_number += 1
                     self._cycle = ScriptedLeaderInput(self.origin, joint_keys=self.joint_keys,
-                                                     fps=self._fps, emit=self._cycle_event)
+                                                     fps=self._fps, emit=self._cycle_event,
+                                                     joint_amplitudes=self._joint_amplitudes)
                     self._cycle.admit(now)
                     self._waiting_for_return = False
                     self._return_first = None

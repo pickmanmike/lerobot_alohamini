@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import queue
 import re
@@ -157,6 +158,15 @@ def parse_duration_seconds(value: object) -> int:
 def validate_leader_selection(
     leader_source: str, motion_profile: str | None, duration_seconds: int | None = None,
 ) -> None:
+    amplitude = os.environ.get("AM1_SCRIPTED_LEFT_SHOULDER_AMPLITUDE")
+    if amplitude is not None:
+        if leader_source != "scripted" or motion_profile not in {"ArmSmoke", "ArmSmokeRepeat"}:
+            raise ValueError("AM1_SCRIPTED_LEFT_SHOULDER_AMPLITUDE requires scripted ArmSmoke or ArmSmokeRepeat.")
+        if not re.fullmatch(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?", amplitude):
+            raise ValueError("AM1_SCRIPTED_LEFT_SHOULDER_AMPLITUDE must be a finite number greater than zero through 3.")
+        amplitude_value = float(amplitude)
+        if not math.isfinite(amplitude_value) or not 0 < amplitude_value <= 3.0:
+            raise ValueError("AM1_SCRIPTED_LEFT_SHOULDER_AMPLITUDE must be a finite number greater than zero through 3.")
     preparation = os.environ.get("AM1_SCRIPTED_PREPARE") == "1"
     integral_test = os.environ.get("AM1_SHOULDER_INTEGRAL_TEST") == "1"
     if integral_test and (not preparation or os.environ.get("AM1_LEFT_SHOULDER_EVIDENCE") != "1"):

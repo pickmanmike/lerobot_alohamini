@@ -115,8 +115,36 @@ age before each torque enable. Goal readbacks never renew position freshness. Un
 resting poses refuse without substituting an EEPROM boundary or widening preparation.
 All 491 affected activation, lift, gain rollback, native preparation, recovery, body-hold and
 launcher tests pass. Independent review found no actionable blocker; AM2 follows its existing
-activation path. Actual full motion is held until a qualified supported initial pose is available.
-The packet permits the single physical setup action already requested for that dependency.
+activation path. The owner clarified in AM1-RELIABILITY-03A that the present shoulder
+pose is ordinary normal rest. Resolve its coordinate/calibration/startup-acquisition
+mismatch, then prove positive automatic startup, useful return, the original workload
+and Stop → natural rest → Start. Manual placement inside the old interval is not a
+startup prerequisite. The earlier refusal and support request remain historical evidence.
+
+The normal-rest investigation recovered the original commissioning record. It asked for full
+ROM, but the selected shoulder upper endpoint remained one tick beyond the chosen midpoint;
+the opposite side was never captured. A reviewed affected-joint correction now uses the
+stable, owner-qualified and visually inspected natural-rest operating reference. It changes
+only that endpoint in the private cache and persistent servo setting, with an exact original
+backup, unchanged offset/direction/Phase and verified closed/reopened-bus readback. This is
+not a newly measured hard mechanical maximum or a claim of whole-range clearance.
+
+The optional `AM1_SCRIPTED_LEFT_SHOULDER_AMPLITUDE` reduction preserves the selected joint's
+original physical excursion under the corrected span. It is checked before remote startup,
+permits only finite positive reductions through the original three units, and applies only
+to the unified virtual ArmSmoke/Repeat path. Four cycles reuse the same mapping and seed;
+the selected return envelope is reduced in the same units while other joints keep their
+original envelope. Plan events label the remapped recipe; timing remains 88/352 seconds.
+The flag must be absent for ordinary manual input and ArmHoldBody. Old normalized shoulder
+poses/datasets are not numerically comparable under the corrected map: convert through the
+saved raw affine mapping before reuse. Leader calibration remains unchanged; normal manual
+startup continues its existing synchronization using the corrected follower coordinates.
+
+Final focused checks: 254 startup, corrected-endpoint/restart, virtual amplitude, early
+preflight, preparation and launcher cases pass. Three unsafe-startup mutations and endpoint
+exclusion are caught. New modules are lint-clean; modified legacy files introduce no new
+lint findings. Independent final review is clear. Actual I0 useful return and the full
+workload remain pending; no powered motion is claimed from these software checks.
 
 Plan: [AM1-03 executable plan](../superpowers/plans/2026-10-06-am1-reliability-03.md).
 Historical packet-02/01 evidence below retains its original verdicts.

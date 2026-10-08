@@ -29,6 +29,7 @@ import time
 import zmq
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal, NamedTuple
@@ -1728,6 +1729,28 @@ def _scripted_preparation_enabled(args: argparse.Namespace) -> bool:
     return enabled
 
 
+def _scripted_joint_amplitudes(args: argparse.Namespace) -> dict[str, float] | None:
+    raw = os.environ.get("AM1_SCRIPTED_LEFT_SHOULDER_AMPLITUDE")
+    if raw is None:
+        return None
+    if not (
+        getattr(args, "leader_source", "physical") == "scripted"
+        and getattr(args, "motion_profile", None) in {"ArmSmoke", "ArmSmokeRepeat"}
+        and getattr(args, "robot_model", None) == "alohamini1"
+        and getattr(args, "local_mode", False)
+        and getattr(args, "unified_session_enter_confirmations", False)
+    ):
+        raise SafetyRefusal(
+            "AM1_SCRIPTED_LEFT_SHOULDER_AMPLITUDE requires unified AM1 Local scripted ArmSmoke or ArmSmokeRepeat"
+        )
+    if not re.fullmatch(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?", raw):
+        raise SafetyRefusal("AM1_SCRIPTED_LEFT_SHOULDER_AMPLITUDE must be a finite number greater than zero through 3")
+    amplitude = float(raw)
+    if not math.isfinite(amplitude) or not 0 < amplitude <= 3.0:
+        raise SafetyRefusal("AM1_SCRIPTED_LEFT_SHOULDER_AMPLITUDE must be a finite number greater than zero through 3")
+    return {"arm_left_shoulder_lift.pos": amplitude}
+
+
 def parse_args(
     argv: list[str] | None = None,
     *,
@@ -1737,6 +1760,7 @@ def parse_args(
     args = parser.parse_args(argv)
     try:
         _scripted_preparation_enabled(args)
+        _scripted_joint_amplitudes(args)
     except SafetyRefusal as exc:
         parser.error(str(exc))
     if args.leader_source == "scripted":
@@ -3024,6 +3048,7 @@ def run_teleoperation(
     external_stop_path = getattr(args, "external_stop_file", None)
     scripted_mode = getattr(args, "leader_source", "physical") == "scripted"
     scripted_prepare = _scripted_preparation_enabled(args)
+    scripted_amplitudes = _scripted_joint_amplitudes(args)
     scripted_input: ScriptedLeaderInput | ArmSmokeRepeatInput | PreparedScriptedInput | None = None
     scripted_stop_reason = "fault"
     arm_input_ready = False
@@ -3084,6 +3109,8 @@ def run_teleoperation(
                     "ArmSmoke": ScriptedLeaderInput, "ArmSmokeRepeat": ArmSmokeRepeatInput,
                     "ArmHoldBody": ArmHoldBodyInput,
                 }[args.motion_profile]
+                if scripted_amplitudes is not None:
+                    provider = partial(provider, joint_amplitudes=scripted_amplitudes)
                 if scripted_prepare:
                     try:
                         scripted_input = PreparedScriptedInput(

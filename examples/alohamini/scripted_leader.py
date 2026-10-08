@@ -22,11 +22,28 @@ class ScriptedLeaderInput:
     def __init__(
         self, initial_positions: Mapping[str, float], *, joint_keys: tuple[str, ...],
         fps: int, emit: Callable[[dict[str, Any]], None] | None = None,
+        joint_amplitudes: Mapping[str, float] | None = None,
     ) -> None:
         if set(initial_positions) != set(joint_keys) or len(joint_keys) != 12:
             raise ValueError("scripted seed requires the exact AM1 arm-position key set")
         if fps != 10:
             raise ValueError("ArmSmoke requires the reviewed 10 Hz cadence")
+        if self.hold_only and joint_amplitudes is not None:
+            raise ValueError("hold-only input does not accept joint amplitude overrides")
+        self.joint_amplitudes = dict.fromkeys(joint_keys, 3.0)
+        if joint_amplitudes is not None:
+            if not isinstance(joint_amplitudes, Mapping) or set(joint_amplitudes) - set(joint_keys):
+                raise ValueError("joint amplitude overrides require known AM1 arm-position keys")
+            for key, amplitude in joint_amplitudes.items():
+                if isinstance(amplitude, bool):
+                    raise ValueError("joint amplitude must be finite and greater than zero through 3")
+                try:
+                    amplitude = float(amplitude)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("joint amplitude must be finite and greater than zero through 3") from exc
+                if not math.isfinite(amplitude) or not 0 < amplitude <= 3.0:
+                    raise ValueError("joint amplitude must be finite and greater than zero through 3")
+                self.joint_amplitudes[key] = amplitude
         self.origin = {key: float(initial_positions[key]) for key in joint_keys}
         for key, value in self.origin.items():
             lower = 0.0 if key.endswith("gripper.pos") else -100.0
@@ -46,7 +63,7 @@ class ScriptedLeaderInput:
         self._emit = emit or (lambda record: print(json.dumps(record, sort_keys=True), flush=True))
         self.targets = (
             dict(self.origin) if self.hold_only else {
-                key: value + (3.0 if value <= 97.0 else -3.0)
+                key: value + (self.joint_amplitudes[key] if value <= 97.0 else -self.joint_amplitudes[key])
                 for key, value in self.origin.items()
             }
         )
@@ -57,7 +74,10 @@ class ScriptedLeaderInput:
             for key in joint_keys:
                 self._record("am1_scripted_segment_plan", joint=key, origin=self.origin[key],
                              target=self.targets[key], amplitude=self.targets[key] - self.origin[key],
-                             ramp_s=3.0, endpoint_hold_s=0.5, reduced=False, skipped=False)
+                             ramp_s=3.0, endpoint_hold_s=0.5,
+                             reduced=self.joint_amplitudes[key] < 3.0, skipped=False,
+                             recipe="mapped_physical_excursion" if self.joint_amplitudes[key] < 3.0 else "original",
+                             timing_changed=False)
         self.flush_events()
 
     @property
