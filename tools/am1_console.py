@@ -25,6 +25,7 @@ from pathlib import PurePosixPath
 from urllib.parse import parse_qs, urlsplit
 
 from tools.am1_console_model import ConsoleProgress, ConsoleSnapshot
+from tools.am1_virtual_bench import VirtualBenchPolicy, local_wall_time_ms
 
 
 MAX_CONSOLE_LOG_BYTES = 2_000_000
@@ -71,6 +72,11 @@ class ConsoleSessionAdapter:
         self._control_token: str | None = None
         self._admitted_host_epoch: int | None = None
         self._admitted_at_ns: int | None = None
+        self._bench_policy = None
+        self._bench_lock = threading.RLock()
+        self._bench_stop = threading.Event()
+        self._bench_thread = None
+        self._bench_gate_status = (False, 0.0)
 
     def set_event_sink(self, sink):
         self._event_sink = sink
@@ -99,6 +105,10 @@ class ConsoleSessionAdapter:
         with self._lock:
             if event.get("session_id") is not None and event["session_id"] != self._session_id:
                 return
+            if event.get("event") in {"confirmed_motor_fault", "session_error", "client_exited", "session_complete"}:
+                with self._bench_lock:
+                    if self._bench_policy is not None:
+                        self._bench_policy.disarm("terminal runtime event")
             self._telemetry.update(event)
             self._progress.update(event, received_at=time.monotonic())
             if event.get("event") in {"host_feedback", "live_sample", "live_admitted"} and self._phase not in {
@@ -246,12 +256,67 @@ class ConsoleSessionAdapter:
             bridge.set_telemetry_sink(self._emit)
         with self._lock:
             self._bridge = bridge
+        if self._bench_policy is not None:
+            bridge.set_prepared_gate_guard(self._bench_prepared_gate_qualified)
+            self._bench_thread = threading.Thread(target=self._bench_monitor, args=(session_id,),
+                                                  name="am1-bench-observation", daemon=True)
+            self._bench_thread.start()
         return bridge.pipe_name, bridge.auth_file
 
     def _gate(self, stage, evidence, cancel):
         # Prepared Start is the operator's approval for ordinary qualified
         # progression; actual camera/host events still must precede each gate.
+        if self._bench_policy is not None and stage in {"camera_ready", "host_ready"}:
+            deadline = time.perf_counter() + 10
+            while not cancel() and time.perf_counter() < deadline:
+                with self._bench_lock:
+                    covered = self._bench_policy.observer(now=time.perf_counter(), wall_ms=local_wall_time_ms(),
+                                                           clock=time.perf_counter, wall_clock_ms=local_wall_time_ms)
+                    covered = covered and self._bench_policy.camera_qualified(time.perf_counter())
+                if covered:
+                    return True
+                self._bench_stop.wait(.1)
+            return False
         return not cancel()
+
+    def _bench_snapshot(self, state):
+        with self._bench_lock:
+            if self._bench_policy is None:
+                return None
+            evaluated_at = time.perf_counter()
+            status = self._bench_policy.evaluate(state, now=evaluated_at, wall_ms=local_wall_time_ms(),
+                                                 clock=time.perf_counter, wall_clock_ms=local_wall_time_ms)
+            self._bench_gate_status = (status["required_coverage_qualified"],
+                                       min(evaluated_at + .25, self._bench_policy.coverage_expires_at()))
+            return status
+
+    def _bench_prepared_gate_qualified(self):
+        qualified, expires_at = self._bench_gate_status
+        return qualified and time.perf_counter() <= expires_at
+
+    def _bench_monitor(self, session_id):
+        try:
+            while not self._bench_stop.wait(.1):
+                state = self.state()
+                policy = state.get("virtual_bench") or {}
+                bridge = self._bridge
+                if state["session_id"] != session_id or bridge is None:
+                    continue
+                if policy.get("action") == "hold":
+                    bridge.request_pause("bench required coverage")
+                    self._emit({"event":"bench_observation_hold", "session_id":session_id})
+                elif policy.get("action") == "stop":
+                    self.session_module.request_stop(self.config, expected_session_id=session_id, wait=False)
+                    self._emit({"event":"bench_recovery_exhausted", "session_id":session_id})
+                    return
+        except Exception as exc:
+            # A failed observation monitor must not leave the owned motion unattended.
+            bridge = self._bridge
+            if bridge is not None:
+                bridge.request_pause("bench required coverage")
+            self._emit({"event":"bench_monitor_failed", "session_id":session_id,
+                        "reason":type(exc).__name__})
+            self.session_module.request_stop(self.config, expected_session_id=session_id, wait=False)
 
     def _run(self, duration, leader_source, motion_profile):
         try:
@@ -272,6 +337,9 @@ class ConsoleSessionAdapter:
                     self._final_exit_code = 2
             self._emit({"event": "session_error", "reason": self._error})
         finally:
+            self._bench_stop.set()
+            if self._bench_thread is not None:
+                self._bench_thread.join(2)
             bridge = self._bridge
             if bridge is not None:
                 try:
@@ -332,6 +400,11 @@ class ConsoleSessionAdapter:
             bridge = self._bridge
         if bridge is not None:
             state.update(bridge.snapshot())
+        if self._bench_policy is not None:
+            state["virtual_bench_admitted"] = self._admitted_at_ns is not None
+        policy = self._bench_snapshot(state)
+        if policy is not None:
+            state["virtual_bench"] = policy
         return state
 
     def read_log(self, kind: str, expected_session_id: str) -> tuple[str, bytes]:
@@ -405,7 +478,18 @@ class ConsoleSessionAdapter:
                 duration = self.session_module.parse_duration_seconds(payload.get("duration_seconds"))
                 leader_source = payload.get("leader_source", "physical")
                 motion_profile = payload.get("motion_profile")
-                self.session_module.validate_leader_selection(leader_source, motion_profile)
+                self.session_module.validate_leader_selection(leader_source, motion_profile, duration)
+                bench_config = payload.get("virtual_bench")
+                if bench_config is not None:
+                    if leader_source != "scripted":
+                        raise ValueError("virtual bench requires scripted arm input")
+                    self._bench_policy = VirtualBenchPolicy(bench_config,
+                                                            log_root=self.config.windows_log_directory)
+                else:
+                    self._bench_policy = None
+                self._bench_stop = threading.Event()
+                self._bench_thread = None
+                self._bench_gate_status = (False, 0.0)
                 self._created.clear()
                 self._session_id = None
                 self._final_exit_code = None
@@ -436,6 +520,19 @@ class ConsoleSessionAdapter:
                     "phase": state["phase"], "error": state["error"],
                     "control_token": self._control_token if state["session_id"] is not None else None,
                     "input_epoch": state.get("input_epoch")}
+        if kind in {"BenchHold", "BenchCoverage"}:
+            with self._lock:
+                current, bridge, token, worker = self._session_id, self._bridge, self._control_token, self._worker
+            if (self._bench_policy is None or payload.get("session_id") != current or bridge is None
+                    or worker is None or not worker.is_alive() or payload.get("control_token") != token
+                    or payload.get("epoch") != bridge.snapshot()["input_epoch"]):
+                return {"accepted":False, "reason":"virtual bench owner is unavailable"}
+            if kind == "BenchCoverage":
+                with self._bench_lock:
+                    qualified = self._bench_policy.cameras(payload.get("camera_health"), now=time.perf_counter())
+                return {"accepted":True, "qualified":qualified}
+            bridge.request_pause("bench required coverage")
+            return {"accepted":True, "phase":"pausing"}
         if kind == "Stop":
             expected = payload.get("session_id")
             with self._lock:
@@ -445,6 +542,9 @@ class ConsoleSessionAdapter:
                 return {"accepted": False, "reason": "session identity mismatch"}
             if not running:
                 return {"accepted": False, "reason": "session is already terminal; cleanup state is unchanged"}
+            with self._bench_lock:
+                if self._bench_policy is not None:
+                    self._bench_policy.disarm("explicit stop")
             try:
                 self.session_module.request_stop(self.config, expected_session_id=expected, wait=False)
             except self.session_module.SessionError as exc:
@@ -458,6 +558,9 @@ class ConsoleSessionAdapter:
             if expected != current or bridge is None or worker is None or not worker.is_alive():
                 return {"accepted": False, "reason": "active session identity is unavailable"}
             if kind == "ClaimInput":
+                with self._bench_lock:
+                    if self._bench_policy is not None:
+                        self._bench_policy.disarm("ownership claim")
                 if bridge.snapshot().get("input_lease"):
                     return {"accepted": False, "reason": "the current input owner is still live"}
                 new_token = secrets.token_hex(32)
@@ -470,7 +573,10 @@ class ConsoleSessionAdapter:
             if payload.get("control_token") != token:
                 return {"accepted": False, "reason": "input owner token mismatch"}
             if kind == "Pause":
-                bridge.request_pause("operator")
+                with self._bench_lock:
+                    if self._bench_policy is not None:
+                        self._bench_policy.disarm("operator pause")
+                    bridge.request_pause("operator")
                 self._emit({"event": "pause_requested", "session_id": expected})
                 return {"accepted": True, "phase": "pausing"}
             stage = "resume" if kind == "Resume" else "realign"
@@ -484,7 +590,21 @@ class ConsoleSessionAdapter:
             host_epoch = payload.get("host_epoch")
             if host_epoch is not None and type(host_epoch) is not int:
                 return {"accepted": False, "reason": "host epoch is invalid"}
-            accepted = bridge.approve(stage, host_epoch=host_epoch, token=token)
+            current_state = self.state() if payload.get("bench_recovery") is not None else None
+            with self._bench_lock:
+                if self._bench_policy is not None:
+                    evidence = payload.get("bench_recovery")
+                    if evidence is not None:
+                        allowed = (isinstance(evidence, dict) and stage == "resume"
+                                   and host_epoch == evidence.get("host_epoch")
+                                   and self._bench_policy.approval(evidence, current_state,
+                                       now=time.perf_counter(), wall_ms=local_wall_time_ms(),
+                                       clock=time.perf_counter, wall_clock_ms=local_wall_time_ms))
+                        if not allowed:
+                            return {"accepted":False, "reason":"bench recovery qualification refused"}
+                    else:
+                        self._bench_policy.disarm("operator approval")
+                accepted = bridge.approve(stage, host_epoch=host_epoch, token=token)
             self._emit({"event": "gate_approval", "session_id": expected, "stage": stage,
                         "host_epoch": host_epoch, "accepted": accepted})
             return {"accepted": accepted, "phase": "resume_pending" if accepted else "approval_refused"}
@@ -497,6 +617,13 @@ class ConsoleSessionAdapter:
             return {"accepted": False, "reason": "no matching active session"}
         if payload.get("control_token") != token:
             return {"accepted": False, "reason": "input owner token mismatch"}
+        if payload.get("release_reason") in {
+            "window-blur", "document-hidden", "route-change", "pagehide", "operator",
+            "body-request-rejected", "body-request-failed",
+        } and payload.get("epoch") == bridge.snapshot()["input_epoch"]:
+            with self._bench_lock:
+                if self._bench_policy is not None:
+                    self._bench_policy.disarm("explicit input release")
         accepted = bridge.browser_keys(token=token, epoch=payload.get("epoch"), seq=payload.get("seq"),
                                        keys=payload.get("keys"), active=payload.get("active"),
                                        **{key:payload[key] for key in ("release_reason", "first_release") if key in payload})
@@ -509,7 +636,7 @@ MAX_POST_BYTES = 4096
 CAMERA_ROLES = frozenset({"forward", "backward", "chest", "wrist_left", "wrist_right"})
 CAMERA_ASSETS = frozenset({"app.js", "freshness.js", "mjpeg.js", "style.css"})
 CONSOLE_ASSETS = frozenset({"app.js", "style.css"})
-ALLOWED_OPERATIONS = frozenset({"Start", "Pause", "Resume", "Stop", "Approve", "ClaimInput"})
+ALLOWED_OPERATIONS = frozenset({"Start", "Pause", "Resume", "Stop", "Approve", "ClaimInput", "BenchHold", "BenchCoverage"})
 ALLOWED_BODY_KEYS = frozenset("wszxadujtg")
 COOKIE_NAME = "am1_console"
 

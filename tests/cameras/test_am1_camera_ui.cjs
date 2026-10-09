@@ -119,7 +119,7 @@ function pageFixture(decodeWorks = true, delayedStatus = false, identify = false
     document: {body:{dataset:{identification:String(identify)}}, querySelector: key => roots.querySelector(key), createElement: tag => new Element(tag)},
     URL: {createObjectURL: () => {const url = `blob:test-${urls.created.length + 1}`; urls.created.push(url); return url;},
           revokeObjectURL: url => urls.revoked.push(url)},
-    setTimeout: () => 1, setInterval: fn => {timers.push(fn); return timers.length;},
+    setTimeout: () => 1, clearTimeout: () => {}, setInterval: fn => {timers.push(fn); return timers.length;},
     fetch: async (url, options) => {
       requests.push(url);
       if (url === `${optionsBase}status.json`) {
@@ -238,6 +238,7 @@ test("held rotated frame keeps its role orientation when status is lost", async 
   const primary = page.roots.querySelector("#primary"), oldUrl = primary.querySelector("img").src;
   const pending = vm.runInContext("statusLoop()",page.context); await flush();
   page.statusRequests[1].reject(Error("status timeout")); await pending; await flush();
+  page.advance(3001,2); vm.runInContext("render()",page.context);
   assert.equal(primary.querySelector("img").src, oldUrl);
   assert.equal(primary.querySelector("img").dataset.rotation, "180");
   assert.match(primary.querySelector("span").textContent, /last frame.*waiting/i);
@@ -411,13 +412,22 @@ test("repeated cached snapshot cannot renew thumbnail freshness", async () => {
   vm.runInContext('stopPrimary()',page.context);
 });
 
-test("failed status stops delivery without silently claiming cached video is live", async () => {
+test("transient status failure preserves independent decoded delivery until the original status deadline", async () => {
   const page = pageFixture(true,true); await flush(); page.statusRequests[0].reply(); await flush();
   deliver(page,1); await flush();
-  const pending = vm.runInContext('statusLoop()',page.context); await flush();
+  page.advance(1100,2); const pending = vm.runInContext('statusLoop()',page.context); await flush();
   page.statusRequests[1].reject(Error('timed out')); await pending; await flush();
-  assert.equal(page.streams[0].signal.aborted,true);
+  assert.equal(page.streams[0].signal.aborted,false,'One failed poll cannot cancel an independently advancing view');
+  page.advance(1200,3); deliver(page,3); await flush();
+  await vm.runInContext('snapshots()',page.context); await flush();
+  vm.runInContext('render()',page.context);
+  assert.equal(page.roots.querySelector('#primary').flags.has('fresh'),true);
+  assert.equal(tile(page,2).flags.has('fresh'),true,'An unrelated role must still fetch and decode its own image');
+  assert.match(page.roots.querySelector('#connection').textContent,/status.*uncertain/i);
+  page.advance(3001,4); vm.runInContext('render()',page.context); await flush();
+  assert.equal(page.streams[0].signal.aborted,true,'The original successful reply keeps its unchanged 2 s deadline');
   assert.equal(page.roots.querySelector('#primary').flags.has('fresh'),false);
+  assert.equal(tile(page,2).flags.has('fresh'),false);
   assert.match(page.roots.querySelector('#connection').textContent,/status unavailable/i);
 });
 
@@ -532,4 +542,74 @@ test("app never renews thumbnail freshness when JPEG decoding fails", async () =
   vm.runInContext('render()',page.context);
   assert.equal(tile(page,2).flags.has('fresh'),false);
   if (vm.runInContext('typeof stopPrimary',page.context) === 'function') vm.runInContext('stopPrimary()',page.context);
+});
+
+
+test("structured role health preserves real frame age, role identity and source uncertainty", async () => {
+  const page = pageFixture(true,true); await flush(); page.statusRequests[0].reply(); await flush();
+  deliver(page,1); await flush();
+  page.advance(1100,2); await vm.runInContext('snapshots()',page.context); await flush();
+  const first = vm.runInContext('AM1CameraHealth()',page.context);
+  assert.equal(first.version,1);
+  assert.equal(first.selected_role,'forward');
+  assert.equal(first.roles.length,5);
+  const forward = first.roles.find(role=>role.role==='forward');
+  assert.equal(forward.identity,'forward');
+  assert.equal(forward.selected,true);
+  assert.equal(forward.sequence,1);
+  assert.equal(forward.generation,1);
+  assert.equal(forward.decoded_generation,1);
+  assert.equal(forward.decoded_age_ms,100);
+  assert.equal(forward.fresh,true);
+  page.advance(1200,3); const pending = vm.runInContext('statusLoop()',page.context); await flush();
+  page.statusRequests[1].reject(Error('status failure')); await pending; await flush();
+  page.advance(1400,4);
+  const held = vm.runInContext('AM1CameraHealth()',page.context);
+  assert.equal(held.status_uncertain,true);
+  assert.equal(held.status_received_age_ms,400,'A failed poll cannot re-age retained status');
+  assert.equal(held.roles.find(role=>role.role==='forward').decoded_age_ms,400);
+  assert.equal(held.roles.find(role=>role.role==='chest').decoded_age_ms,310);
+  assert.equal(held.roles.find(role=>role.role==='backward').decoded_age_ms,null);
+  page.advance(3001,5);
+  const expired = vm.runInContext('AM1CameraHealth()',page.context);
+  assert.equal(expired.status_available,false);
+  assert.equal(expired.roles.find(role=>role.role==='chest').fresh,false);
+  assert.equal(expired.roles.find(role=>role.role==='chest').sequence,2);
+  assert.equal(expired.roles.find(role=>role.role==='chest').decoded_age_ms,1911);
+  vm.runInContext('stopPrimary()',page.context);
+});
+
+
+test("bounded per-role reconnection leaves other views running and rejects old generation evidence", async () => {
+  const page = pageFixture(); await flush(); deliver(page,1); await flush();
+  await vm.runInContext('snapshots()',page.context); await flush();
+  const before = vm.runInContext('AM1CameraHealth()',page.context);
+  const chest = before.roles.find(role=>role.role==='chest');
+  assert.equal(chest.fresh,true);
+  const reply = vm.runInContext('AM1CameraReconnect("chest")',page.context);
+  assert.equal(reply.accepted,true);
+  assert.equal(reply.attempt,1);
+  assert.equal(page.streams[0].signal.aborted,false,'Chest reconnect must not interrupt forward coverage');
+  const pending = vm.runInContext('AM1CameraHealth()',page.context).roles.find(role=>role.role==='chest');
+  assert.equal(pending.generation,2);
+  assert.equal(pending.decoded_generation,1);
+  assert.equal(pending.sequence,1);
+  assert.equal(pending.fresh,false,'An old-generation retained image cannot qualify reconnection');
+  await flush();
+  assert.equal(vm.runInContext('AM1CameraHealth()',page.context).roles.find(role=>role.role==='chest').fresh,false,
+    'A transport reconnect cannot re-age a cached copy with the same source sequence');
+  page.advance(1100,2); await vm.runInContext('snapshots()',page.context); await flush();
+  const restored = vm.runInContext('AM1CameraHealth()',page.context).roles.find(role=>role.role==='chest');
+  assert.equal(restored.decoded_generation,2);
+  assert.equal(restored.fresh,true);
+  assert.equal(vm.runInContext('AM1CameraReconnect("chest")',page.context).accepted,false,'Immediate retries are rate limited');
+  assert.equal(vm.runInContext('AM1CameraReconnect("unexpected")',page.context).accepted,false);
+  assert.equal(vm.runInContext('AM1CameraReconnect("backward")',page.context).accepted,false,'Unassigned views cannot qualify');
+  page.advance(2100,2); await vm.runInContext('statusLoop()',page.context); await flush();
+  assert.equal(vm.runInContext('AM1CameraReconnect("chest")',page.context).attempt,2); await flush();
+  page.advance(3200,3); await vm.runInContext('statusLoop()',page.context); await flush();
+  assert.equal(vm.runInContext('AM1CameraReconnect("chest")',page.context).attempt,3); await flush();
+  page.advance(4300,4); await vm.runInContext('statusLoop()',page.context); await flush();
+  assert.equal(vm.runInContext('AM1CameraReconnect("chest")',page.context).accepted,false,'Reconnection attempts stay bounded for this page lifetime');
+  vm.runInContext('stopPrimary()',page.context);
 });

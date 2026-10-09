@@ -42,7 +42,8 @@ def run_powershell(body: str) -> subprocess.CompletedProcess[str]:
 
 
 @requires_powershell
-def test_scripted_local_preflight_never_resolves_physical_leaders(tmp_path):
+@pytest.mark.parametrize('profile,duration', [('ArmSmoke', 180), ('ArmSmokeRepeat', 420)])
+def test_scripted_local_preflight_never_resolves_physical_leaders(tmp_path, profile, duration):
     config = json.loads((REPO_ROOT / "config/am1.local.example.json").read_text())
     del config["leader_pnp_map_path"]
     del config["leader_calibration_sha256"]
@@ -54,16 +55,16 @@ function Get-Am1RuntimeLeaderPorts {{ throw 'PHYSICAL_PORT_ENUMERATION_FORBIDDEN
 function Assert-Am1LeaderCalibrationHashes {{ throw 'LEADER_CALIBRATION_ACCESS_FORBIDDEN' }}
 function Assert-Am1ReviewedWorktree {{ Write-Output 'REVIEWED_SOURCE_CHECKED' }}
 function Assert-Am1ImportRoot {{ Write-Output 'IMPORT_ROOT_CHECKED' }}
-Invoke-Am1Launch -Mode Local -ConfigPath {ps_literal(config_path)} -DurationSeconds 180 `
-    -LeaderSource Scripted -MotionProfile ArmSmoke -Preflight
+Invoke-Am1Launch -Mode Local -ConfigPath {ps_literal(config_path)} -DurationSeconds {duration} `
+    -LeaderSource Scripted -MotionProfile {profile} -Preflight
 """)
 
     assert result.returncode == 0, result.stderr
     assert "REVIEWED_SOURCE_CHECKED" in result.stdout
     assert "IMPORT_ROOT_CHECKED" in result.stdout
     assert "AM1_LOCAL_PREFLIGHT_READY" in result.stdout
-    assert "--leader_source scripted --motion_profile ArmSmoke" in result.stdout
-    assert "--duration_s 180" in result.stdout
+    assert f"--leader_source scripted --motion_profile {profile}" in result.stdout
+    assert f"--duration_s {duration}" in result.stdout
     assert "--local_mode" in result.stdout
     assert "--teleop." not in result.stdout
     assert "--no_leader" not in result.stdout
@@ -105,22 +106,23 @@ Invoke-Am1Launch -Mode Local -LeaderSource Scripted -MotionProfile ArmSmoke `
 
 
 @requires_powershell
-def test_scripted_command_retains_envelope_and_stop_contract():
+@pytest.mark.parametrize('profile,duration', [('ArmSmoke', 180), ('ArmSmokeRepeat', 420)])
+def test_scripted_command_retains_envelope_and_stop_contract(profile, duration):
     stop_path = REPO_ROOT / "test-scripted-stop"
     result = run_powershell(f"""
 . {ps_literal(REPO_ROOT / 'tools/run_am1.ps1')}
 $config = Get-Content -Raw {ps_literal(REPO_ROOT / 'config/am1.local.example.json')} | ConvertFrom-Json
 $command = New-Am1WindowsCommand -Mode Local -Config $config -RepositoryRoot {ps_literal(REPO_ROOT)} `
-    -LeaderSource Scripted -MotionProfile ArmSmoke -LocalDurationSeconds 180 -StopRequestPath {ps_literal(stop_path)}
+    -LeaderSource Scripted -MotionProfile {profile} -LocalDurationSeconds {duration} -StopRequestPath {ps_literal(stop_path)}
 $command | ConvertTo-Json -Depth 6 -Compress
 """)
 
     assert result.returncode == 0, result.stderr
     arguments = json.loads(result.stdout)["arguments"]
     for name, expected in {
-        "--leader_source": "scripted", "--motion_profile": "ArmSmoke",
+        "--leader_source": "scripted", "--motion_profile": profile,
         "--startup_sync_duration_s": "30", "--max_start_mismatch": "10",
-        "--fps": "10", "--duration_s": "180", "--external_stop_file": str(stop_path),
+        "--fps": "10", "--duration_s": str(duration), "--external_stop_file": str(stop_path),
     }.items():
         assert arguments[arguments.index(name) + 1] == expected
     assert "--unified_session_enter_confirmations" in arguments
@@ -167,8 +169,8 @@ Invoke-Am1Launch -Mode Local -ConfigPath {ps_literal(REPO_ROOT / 'config/am1.loc
 
 
 @requires_powershell
-@pytest.mark.parametrize("scripted", [False, True])
-def test_session_powershell_passes_explicit_scripted_selection_to_python(tmp_path, scripted):
+@pytest.mark.parametrize('profile,duration', [(None, 180), ('ArmSmoke', 180), ('ArmSmokeRepeat', 420)])
+def test_session_powershell_passes_explicit_scripted_selection_to_python(tmp_path, profile, duration):
     shutil.copy2(REPO_ROOT / "tools/run_am1_session.ps1", tmp_path / "run_am1_session.ps1")
     (tmp_path / "am1_session.py").write_text(
         "import json, sys\nprint(json.dumps(sys.argv[1:]))\n", encoding="utf-8",
@@ -177,16 +179,16 @@ def test_session_powershell_passes_explicit_scripted_selection_to_python(tmp_pat
     config.write_text(json.dumps({"windows_python": sys.executable}), encoding="utf-8")
     command = [
         POWERSHELL, "-NoLogo", "-NoProfile", "-File", str(tmp_path / "run_am1_session.ps1"),
-        "-DurationSeconds", "180", "-ConfigPath", str(config),
+        "-DurationSeconds", str(duration), "-ConfigPath", str(config),
     ]
-    if scripted:
-        command.extend(["-LeaderSource", "Scripted", "-MotionProfile", "ArmSmoke"])
+    if profile:
+        command.extend(["-LeaderSource", "Scripted", "-MotionProfile", profile])
     result = subprocess.run(command, text=True, capture_output=True, timeout=30, check=False)
 
     assert result.returncode == 0, result.stderr
     arguments = json.loads(result.stdout)
-    assert arguments[:5] == ["--config", str(config), "start", "--duration-seconds", "180"]
-    assert arguments[5:] == (["--leader-source", "scripted", "--motion-profile", "ArmSmoke"] if scripted else [])
+    assert arguments[:5] == ["--config", str(config), "start", "--duration-seconds", str(duration)]
+    assert arguments[5:] == (["--leader-source", "scripted", "--motion-profile", profile] if profile else [])
 
 
 @requires_powershell
@@ -317,7 +319,8 @@ def test_windows_client_propagates_selection_to_real_local_launcher(monkeypatch,
 
 
 def scripted_outcome(module, tmp_path, *, reason="script_complete", client_exit=0, remote_cleanup=None,
-                     client_cleanup=None, remote_fault=None, summary_override=None, on_cleanup=None):
+                     client_cleanup=None, remote_fault=None, summary_override=None, on_cleanup=None,
+                     profile="ArmSmoke"):
     summary = {
         "event": "am1_scripted_input_summary", "input_source": "scripted",
         "motion_profile": "ArmSmoke", "stop_reason": reason,
@@ -355,11 +358,40 @@ def scripted_outcome(module, tmp_path, *, reason="script_complete", client_exit=
     return module.SessionCoordinator(
         remote=remote, client=Client(), open_browser=lambda url: None,
         collect_remote_log=lambda remote, local: (True, None), input_fn=lambda prompt: "",
-        leader_source="scripted", motion_profile="ArmSmoke", on_cleanup=on_cleanup,
+        leader_source="scripted", motion_profile=profile, on_cleanup=on_cleanup,
     ).run(
-        duration_seconds=180, session_id="20260928T120000-1234abcd", session_directory=tmp_path,
+        duration_seconds=420 if profile == 'ArmSmokeRepeat' else 180,
+        session_id="20260928T120000-1234abcd", session_directory=tmp_path,
         client_log_path=tmp_path / "client.log", stop_requested=lambda: False,
     )
+
+
+def test_repeat_supervisor_accepts_only_its_requested_profile_and_four_qualified_returns(tmp_path):
+    m = load_session()
+    summary = {'event': 'am1_scripted_input_summary', 'input_source': 'scripted', 'motion_profile': 'ArmSmokeRepeat',
+               'stop_reason': 'script_complete', 'profile_complete': True, 'trajectory_s': 352,
+               'cycles_completed': 4, 'returns_qualified': 4}
+    outcome = scripted_outcome(m, tmp_path, profile='ArmSmokeRepeat', summary_override=summary)
+    assert outcome.final_exit_code == 0 and outcome.stop_reason == 'script_complete'
+    assert outcome.cleanup_verified is True
+    for index, wrong in enumerate([
+        {**summary, 'motion_profile': 'ArmSmoke'}, {**summary, 'cycles_completed': 3},
+        {**summary, 'returns_qualified': 3}, {**summary, 'trajectory_s': 351.9},
+    ]):
+        directory = tmp_path / str(index)
+        directory.mkdir()
+        outcome = scripted_outcome(m, directory, profile='ArmSmokeRepeat', summary_override=wrong)
+        assert outcome.final_exit_code != 0 and outcome.stop_reason != 'script_complete'
+
+
+def test_repeat_selection_and_native_launch_arguments_are_explicit():
+    m = load_session()
+    assert m._leader_launch_arguments('scripted', 'ArmSmokeRepeat') == [
+        '-LeaderSource', 'Scripted', '-MotionProfile', 'ArmSmokeRepeat',
+    ]
+    for duration in [180, 419, 421, 1800]:
+        with pytest.raises(ValueError, match='420'):
+            m.validate_leader_selection('scripted', 'ArmSmokeRepeat', duration)
 
 
 @pytest.mark.parametrize(

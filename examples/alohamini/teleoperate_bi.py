@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import re
 import sys
 import threading
@@ -28,6 +29,7 @@ import time
 import zmq
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal, NamedTuple
@@ -42,7 +44,9 @@ from leader_client_utils import (
     make_normalized_bi_leader_config,
     resolve_leader_ports,
 )
-from scripted_leader import ScriptedLeaderInput
+from scripted_leader import ArmHoldBodyInput, ScriptedLeaderInput
+from scripted_leader_repeat import ArmSmokeRepeatInput
+from am1_scripted_prepare import PreparedScriptedInput
 from am1_console_bridge import (
     AM1ConsoleBridgeClient, make_console_action_sent_event, make_console_host_feedback_event,
     make_console_live_sample_event, publish_console_telemetry_best_effort,
@@ -76,6 +80,7 @@ AM1_LOCAL_AUTOMATIC_PAUSE_S = 3.0
 AM1_LOCAL_RECOVERY_SAMPLE_SPAN_S = 0.2
 AM1_LOCAL_RECOVERY_LEADER_DRIFT = 0.75
 RIGHT_WRIST_FLEX_KEY = "arm_right_wrist_flex.pos"
+LEFT_SHOULDER_LIFT_KEY = "arm_left_shoulder_lift.pos"
 
 StartupSyncSide = Literal["left", "right", "both"]
 LiveArmScope = Literal["both", "right_wrist_flex"]
@@ -361,7 +366,7 @@ class AM1LiveActionSender:
         self.mailbox.publish(action)
 
     def advance_scripted_input(
-        self, provider: ScriptedLeaderInput, sample: AM1LiveSample, *, epoch: int, clock_active: bool,
+        self, provider: ScriptedLeaderInput | ArmSmokeRepeatInput | PreparedScriptedInput, sample: AM1LiveSample, *, epoch: int, clock_active: bool,
     ) -> str | None:
         """Commit a pure trajectory tick/completion against the same active epoch.
 
@@ -794,10 +799,8 @@ def read_fresh_am1_live_sample(
         source="live follower observation",
         leader_sample=False,
     )
-    validate_selected_sync_positions(
-        follower_positions,
-        AM1_ARM_POSITION_KEYS,
-        source="live follower observation",
+    validate_am1_follower_positions(
+        follower_positions, source="live follower observation", preparing_input=leader,
     )
 
     if require_current_request:
@@ -910,6 +913,27 @@ def validate_selected_sync_positions(
             raise SafetyRefusal(
                 f"{source} {side} {joint} value {value} is outside expected {expected_range}"
             )
+
+
+def validate_am1_follower_positions(
+    positions: Mapping[str, float], *, source: str, preparing_input: Any = None,
+) -> None:
+    if not isinstance(preparing_input, PreparedScriptedInput) or not preparing_input.preparing:
+        validate_selected_sync_positions(positions, AM1_ARM_POSITION_KEYS, source=source)
+        return
+    # Only this finite preparation may observe the selected shoulder outside the
+    # normalized command range. Its actual value is retained; all sent targets
+    # still take normal range validation and the native alignment gate is unchanged.
+    validate_selected_sync_positions(
+        positions, tuple(key for key in AM1_ARM_POSITION_KEYS if key != LEFT_SHOULDER_LIFT_KEY),
+        source=source,
+    )
+    try:
+        selected = float(positions[LEFT_SHOULDER_LIFT_KEY])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise SafetyRefusal(f"{source} selected shoulder-lift must be present and numeric") from exc
+    if not math.isfinite(selected) or not -120.0 <= selected <= 120.0:
+        raise SafetyRefusal(f"{source} selected shoulder-lift is outside the finite preparation envelope")
 
 
 def build_startup_sync_plan(
@@ -1543,7 +1567,7 @@ def run_alignment_gate(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--leader_source", choices=("physical", "scripted"), default="physical")
-    parser.add_argument("--motion_profile", choices=("ArmSmoke",), help="Explicit scripted AM1 input profile")
+    parser.add_argument("--motion_profile", choices=("ArmSmoke", "ArmSmokeRepeat", "ArmHoldBody"), help="Explicit scripted AM1 input profile")
     parser.add_argument("--no_robot", action="store_true", help="Do not construct or connect the robot client")
     parser.add_argument("--no_leader", action="store_true", help="Do not construct or connect the leader arms")
     parser.add_argument(
@@ -1692,6 +1716,41 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _scripted_preparation_enabled(args: argparse.Namespace) -> bool:
+    enabled = os.environ.get("AM1_SCRIPTED_PREPARE") == "1"
+    if enabled and not (
+        getattr(args, "leader_source", "physical") == "scripted"
+        and getattr(args, "motion_profile", None) in {"ArmSmoke", "ArmSmokeRepeat"}
+        and getattr(args, "robot_model", None) == "alohamini1"
+        and getattr(args, "local_mode", False)
+        and getattr(args, "unified_session_enter_confirmations", False)
+    ):
+        raise SafetyRefusal("AM1_SCRIPTED_PREPARE=1 requires unified AM1 Local scripted ArmSmoke or ArmSmokeRepeat")
+    return enabled
+
+
+def _scripted_joint_amplitudes(args: argparse.Namespace) -> dict[str, float] | None:
+    raw = os.environ.get("AM1_SCRIPTED_LEFT_SHOULDER_AMPLITUDE")
+    if raw is None:
+        return None
+    if not (
+        getattr(args, "leader_source", "physical") == "scripted"
+        and getattr(args, "motion_profile", None) in {"ArmSmoke", "ArmSmokeRepeat"}
+        and getattr(args, "robot_model", None) == "alohamini1"
+        and getattr(args, "local_mode", False)
+        and getattr(args, "unified_session_enter_confirmations", False)
+    ):
+        raise SafetyRefusal(
+            "AM1_SCRIPTED_LEFT_SHOULDER_AMPLITUDE requires unified AM1 Local scripted ArmSmoke or ArmSmokeRepeat"
+        )
+    if not re.fullmatch(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?", raw):
+        raise SafetyRefusal("AM1_SCRIPTED_LEFT_SHOULDER_AMPLITUDE must be a finite number greater than zero through 3")
+    amplitude = float(raw)
+    if not math.isfinite(amplitude) or not 0 < amplitude <= 3.0:
+        raise SafetyRefusal("AM1_SCRIPTED_LEFT_SHOULDER_AMPLITUDE must be a finite number greater than zero through 3")
+    return {"arm_left_shoulder_lift.pos": amplitude}
+
+
 def parse_args(
     argv: list[str] | None = None,
     *,
@@ -1699,11 +1758,20 @@ def parse_args(
 ) -> argparse.Namespace:
     parser = build_parser()
     args = parser.parse_args(argv)
+    try:
+        _scripted_preparation_enabled(args)
+        _scripted_joint_amplitudes(args)
+    except SafetyRefusal as exc:
+        parser.error(str(exc))
     if args.leader_source == "scripted":
         if not args.local_mode or not args.unified_session_enter_confirmations:
             parser.error("scripted input requires the unified AM1 Local workflow")
-        if args.motion_profile != "ArmSmoke" or args.no_leader or args.require_calibration_match:
+        if args.motion_profile not in {"ArmSmoke", "ArmSmokeRepeat", "ArmHoldBody"} or args.no_leader or args.require_calibration_match:
             parser.error("scripted input requires ArmSmoke, not disabled or physical-calibration leader mode")
+        if args.motion_profile == "ArmSmokeRepeat" and args.duration_s != 420:
+            parser.error("ArmSmokeRepeat requires the finite --duration_s 420 ceiling")
+        if args.motion_profile == "ArmHoldBody" and args.duration_s != 12:
+            parser.error("ArmHoldBody requires the finite --duration_s 12 ceiling")
     elif args.motion_profile is not None:
         parser.error("--motion_profile requires --leader_source scripted")
     if args.external_stop_file is not None:
@@ -2077,7 +2145,7 @@ def _print_connection_summary(args: argparse.Namespace) -> None:
     print(f"  Pi address: {args.remote_ip}")
     print(f"  Robot model: {args.robot_model}")
     if getattr(args, "leader_source", "physical") == "scripted":
-        print("  SCRIPTED LEADER INPUT — REAL FOLLOWER MOTION; ArmSmoke; physical leaders unused")
+        print(f"  SCRIPTED LEADER INPUT — REAL FOLLOWER MOTION; {args.motion_profile}; physical leaders unused")
     elif args.no_leader:
         print("  Leaders: disabled")
     else:
@@ -2155,7 +2223,7 @@ def _run_am1_recovering_local_sender(
     input_fn: Callable[[str], str],
     sample_callback: Callable[[AM1LiveSample, Mapping[str, float | int]], None] | None,
     announce_active: Callable[[], None] | None,
-    scripted_input: ScriptedLeaderInput | None = None,
+    scripted_input: ScriptedLeaderInput | ArmSmokeRepeatInput | PreparedScriptedInput | None = None,
     control_pause_requested: Callable[[], bool] | None = None,
     manual_gate: Callable[[int | None], bool] | None = None,
     on_host_active: Callable[[], None] | None = None,
@@ -2184,6 +2252,15 @@ def _run_am1_recovering_local_sender(
         validate_am1_local_initial_admission(
             robot, observed_at=initial_follower_observed_at, monotonic=monotonic,
         )
+    if isinstance(scripted_input, PreparedScriptedInput) and scripted_input.preparing:
+        validate_am1_follower_positions(
+            initial_follower_positions, source="prepared initial follower observation", preparing_input=scripted_input,
+        )
+        if (
+            not math.isfinite(max_start_mismatch) or max_start_mismatch <= 0
+            or _max_am1_arm_difference(initial_arm_target, initial_follower_positions) > min(10.0, max_start_mismatch)
+        ):
+            raise SafetyRefusal("AM1 preparation exceeds the unchanged native startup alignment limit")
     initial_feedback = _am1_local_feedback(robot)
     body_mailbox = AM1LiveBodyMailbox()
     sender = AM1LiveActionSender(
@@ -2333,7 +2410,7 @@ def _run_am1_recovering_local_sender(
                 break
             body_action = validate_am1_local_body_action(body_action_supplier())
             state, epoch, pause_started_at, pause_reason = sender.recovery_snapshot()
-            if control_pause_requested is not None and control_pause_requested() and state == "active":
+            if control_pause_requested is not None and control_pause_requested() and state in {"active", "resuming"}:
                 console_manual_required = True
                 sender.request_pause("console input lease lost or operator paused")
                 state, epoch, pause_started_at, pause_reason = sender.recovery_snapshot()
@@ -2593,6 +2670,16 @@ def _run_am1_recovering_local_sender(
                     continue
                 if _max_am1_arm_difference(sample.arm_target, sample.follower_positions) > max_start_mismatch:
                     raise SafetyRefusal("AM1 Local recovery leader/follower mismatch exceeds startup gate")
+            if control_pause_requested is not None and control_pause_requested():
+                # A later console pause revokes an ack already returned to the
+                # input thread. Keep measured hold and request a current gate.
+                if manual_gate is not None and manual_ready.is_set():
+                    manual_responses.clear()
+                    manual_ready.clear()
+                    manual_requested = False
+                    manual_enter_at = None
+                    manual_input_result = None
+                continue
             resume_mode_pending = "manual" if manual_required else "automatic"
             print(json.dumps({"event": "am1_local_resume_qualified", "epoch": epoch,
                               "resume_mode": resume_mode_pending, "observation_sequence": last_sequence,
@@ -2684,7 +2771,7 @@ def run_am1_live_sender(
     max_start_mismatch: float = 10.0,
     input_fn: Callable[[str], str] = input,
     announce_active: Callable[[], None] | None = None,
-    scripted_input: ScriptedLeaderInput | None = None,
+    scripted_input: ScriptedLeaderInput | ArmSmokeRepeatInput | PreparedScriptedInput | None = None,
     control_pause_requested: Callable[[], bool] | None = None,
     manual_gate: Callable[[int | None], bool] | None = None,
     on_host_active: Callable[[], None] | None = None,
@@ -2713,10 +2800,8 @@ def run_am1_live_sender(
         else None
     )
     if follower_hold_target is not None:
-        validate_selected_sync_positions(
-            follower_hold_target,
-            AM1_ARM_POSITION_KEYS,
-            source="approved initial follower observation",
+        validate_am1_follower_positions(
+            follower_hold_target, source="approved initial follower observation", preparing_input=scripted_input,
         )
     if live_arm_scope == "right_wrist_flex" and follower_hold_target is None:
         raise SafetyRefusal("right_wrist_flex live scope requires a fresh follower hold snapshot")
@@ -2962,7 +3047,9 @@ def run_teleoperation(
     alignment_monotonic = monotonic if uses_decoupled_am1_live_loop(args) else time.monotonic
     external_stop_path = getattr(args, "external_stop_file", None)
     scripted_mode = getattr(args, "leader_source", "physical") == "scripted"
-    scripted_input: ScriptedLeaderInput | None = None
+    scripted_prepare = _scripted_preparation_enabled(args)
+    scripted_amplitudes = _scripted_joint_amplitudes(args)
+    scripted_input: ScriptedLeaderInput | ArmSmokeRepeatInput | PreparedScriptedInput | None = None
     scripted_stop_reason = "fault"
     arm_input_ready = False
     console_input: AM1ConsoleBridgeClient | None = None
@@ -3018,15 +3105,35 @@ def run_teleoperation(
                     robot, observed_at=robot.latest_observation_received_at, monotonic=monotonic,
                 )
                 seed = extract_am1_arm_positions(seed_observation, source="scripted follower seed", leader_sample=False)
-                validate_selected_sync_positions(seed, AM1_ARM_POSITION_KEYS, source="scripted follower seed")
-                scripted_input = ScriptedLeaderInput(seed, joint_keys=AM1_ARM_POSITION_KEYS, fps=args.fps)
+                provider = {
+                    "ArmSmoke": ScriptedLeaderInput, "ArmSmokeRepeat": ArmSmokeRepeatInput,
+                    "ArmHoldBody": ArmHoldBodyInput,
+                }[args.motion_profile]
+                if scripted_amplitudes is not None:
+                    provider = partial(provider, joint_amplitudes=scripted_amplitudes)
+                if scripted_prepare:
+                    try:
+                        scripted_input = PreparedScriptedInput(
+                            seed, joint_keys=AM1_ARM_POSITION_KEYS, fps=args.fps,
+                            provider=provider, motion_profile=args.motion_profile,
+                        )
+                    except ValueError as exc:
+                        raise SafetyRefusal(str(exc)) from exc
+                    print(json.dumps({"event": "am1_scripted_preparation_observation", "input_source": "scripted",
+                                      "motion_profile": args.motion_profile, "observation_sequence": robot.observation_sequence,
+                                      "observed_at": robot.latest_observation_received_at, "positions": seed,
+                                      "meaning": "original fresh follower feedback before qualified preparation"},
+                                     sort_keys=True), flush=True)
+                else:
+                    validate_selected_sync_positions(seed, AM1_ARM_POSITION_KEYS, source="scripted follower seed")
+                    scripted_input = provider(seed, joint_keys=AM1_ARM_POSITION_KEYS, fps=args.fps)
+                    print(json.dumps({"event": "am1_scripted_seed", "input_source": "scripted",
+                                      "motion_profile": args.motion_profile, "observation_sequence": robot.observation_sequence,
+                                      "observed_at": robot.latest_observation_received_at, "origin": seed,
+                                      "meaning": "frozen fresh follower seed; not large-offset leader synchronization"},
+                                     sort_keys=True), flush=True)
                 leader = scripted_input
                 arm_input_ready = True
-                print(json.dumps({"event": "am1_scripted_seed", "input_source": "scripted",
-                                  "motion_profile": args.motion_profile, "observation_sequence": robot.observation_sequence,
-                                  "observed_at": robot.latest_observation_received_at, "origin": seed,
-                                  "meaning": "frozen fresh follower seed; not large-offset leader synchronization"},
-                                 sort_keys=True), flush=True)
             except SafetyRefusal as exc:
                 print(f"SAFETY REFUSAL: {exc}")
                 return 2
@@ -3064,7 +3171,13 @@ def run_teleoperation(
 
         if args.robot_model == "alohamini1" and robot_connected and arm_input_ready:
             try:
-                if args.startup_mode == "strict":
+                if scripted_prepare:
+                    pending_arm_action, pending_observation, pending_observed_at = run_alignment_gate(
+                        robot, leader, args.max_start_mismatch,
+                        monotonic=alignment_monotonic, require_current_request=True,
+                        cancel_check=raise_if_external_stop_requested,
+                    )
+                elif args.startup_mode == "strict":
                     pending_arm_action, pending_observation, pending_observed_at = run_alignment_gate(
                         robot,
                         leader,
@@ -3138,7 +3251,10 @@ def run_teleoperation(
                         require_enter_confirmation(
                             stop_aware_input,
                             ("CONFIRMATION 3/3 — REAL FOLLOWER MOTION: press Enter only to recheck "
-                             "alignment and start ArmSmoke; body keys are disabled, Q/Stop remains available."
+                             f"alignment and start {args.motion_profile}; "
+                             + ("measured arms held and normal body controls active; Q/Stop remains available."
+                                if args.motion_profile == "ArmHoldBody"
+                                else "body keys are disabled, Q/Stop remains available.")
                              if scripted_mode else
                              "CONFIRMATION 3/3 — Keep both leaders still and press Enter only to recheck "
                              "alignment and enable live teleoperation."),
@@ -3162,7 +3278,7 @@ def run_teleoperation(
                             cancel_check=raise_if_external_stop_requested if unified else None,
                         )
                     except StartupAlignmentMismatch as mismatch:
-                        if not unified:
+                        if not unified or scripted_prepare:
                             raise
                         print(f"ALIGNMENT CHANGED — {mismatch}; Local session remains paused.", flush=True)
                         # Exactly one new operator-authorized bounded plan from the
@@ -3248,7 +3364,7 @@ def run_teleoperation(
                 if quit_key in keyboard_keys:
                     local_quit_requested = True
                     return make_zero_action()
-                if scripted_mode:
+                if scripted_mode and args.motion_profile != "ArmHoldBody":
                     return make_zero_action()
                 return make_local_body_action(robot, keyboard_keys)
 
@@ -3333,7 +3449,11 @@ def run_teleoperation(
             def announce_unified_active() -> None:
                 if scripted_mode:
                     print("TELEOPERATION ACTIVE — SCRIPTED LEADER INPUT — REAL FOLLOWER MOTION", flush=True)
-                    print("ArmSmoke active: body/lift keys disabled; Q/Stop cancels.", flush=True)
+                    controls = (
+                        "measured arms held; normal body/lift controls active"
+                        if args.motion_profile == "ArmHoldBody" else "body/lift keys disabled"
+                    )
+                    print(f"{args.motion_profile} active: {controls}; Q/Stop cancels.", flush=True)
                     return
                 print("TELEOPERATION ACTIVE — LEADER MOVEMENT IS NOW ALLOWED")
                 print("LOCAL BODY CONTROLS ACTIVE — W/S/Z/X/A/D AND U/J MAY NOW MOVE THE ROBOT")

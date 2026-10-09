@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import queue
 import re
@@ -154,23 +155,44 @@ def parse_duration_seconds(value: object) -> int:
     return int(text)
 
 
-def validate_leader_selection(leader_source: str, motion_profile: str | None) -> None:
+def validate_leader_selection(
+    leader_source: str, motion_profile: str | None, duration_seconds: int | None = None,
+) -> None:
+    amplitude = os.environ.get("AM1_SCRIPTED_LEFT_SHOULDER_AMPLITUDE")
+    if amplitude is not None:
+        if leader_source != "scripted" or motion_profile not in {"ArmSmoke", "ArmSmokeRepeat"}:
+            raise ValueError("AM1_SCRIPTED_LEFT_SHOULDER_AMPLITUDE requires scripted ArmSmoke or ArmSmokeRepeat.")
+        if not re.fullmatch(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?", amplitude):
+            raise ValueError("AM1_SCRIPTED_LEFT_SHOULDER_AMPLITUDE must be a finite number greater than zero through 3.")
+        amplitude_value = float(amplitude)
+        if not math.isfinite(amplitude_value) or not 0 < amplitude_value <= 3.0:
+            raise ValueError("AM1_SCRIPTED_LEFT_SHOULDER_AMPLITUDE must be a finite number greater than zero through 3.")
+    preparation = os.environ.get("AM1_SCRIPTED_PREPARE") == "1"
+    integral_test = os.environ.get("AM1_SHOULDER_INTEGRAL_TEST") == "1"
+    if integral_test and (not preparation or os.environ.get("AM1_LEFT_SHOULDER_EVIDENCE") != "1"):
+        raise ValueError("AM1 integral experiment requires explicit preparation and shoulder evidence.")
+    if preparation and (leader_source != "scripted" or motion_profile not in {"ArmSmoke", "ArmSmokeRepeat"}):
+        raise ValueError("AM1 preparation requires scripted ArmSmoke or ArmSmokeRepeat.")
     if leader_source not in {"physical", "scripted"}:
         raise ValueError("Leader source must be physical or scripted.")
-    if leader_source == "scripted" and motion_profile != "ArmSmoke":
-        raise ValueError("Scripted leader input requires --motion-profile ArmSmoke.")
+    if leader_source == "scripted" and motion_profile not in {"ArmSmoke", "ArmSmokeRepeat", "ArmHoldBody"}:
+        raise ValueError("Scripted leader input requires --motion-profile ArmSmoke, ArmSmokeRepeat or ArmHoldBody.")
     if leader_source == "physical" and motion_profile is not None:
         raise ValueError("--motion-profile is available only for scripted leader input.")
+    if motion_profile == "ArmSmokeRepeat" and duration_seconds is not None and duration_seconds != 420:
+        raise ValueError("ArmSmokeRepeat requires the finite 420-second native ceiling.")
+    if motion_profile == "ArmHoldBody" and duration_seconds is not None and duration_seconds != 12:
+        raise ValueError("ArmHoldBody requires the finite 12-second native ceiling.")
 
 
 def _leader_launch_arguments(leader_source: str, motion_profile: str | None) -> list[str]:
     validate_leader_selection(leader_source, motion_profile)
     if leader_source == "scripted":
-        return ["-LeaderSource", "Scripted", "-MotionProfile", "ArmSmoke"]
+        return ["-LeaderSource", "Scripted", "-MotionProfile", str(motion_profile)]
     return []
 
 
-def _read_scripted_summary(path: Path) -> dict[str, Any] | None:
+def _read_scripted_summary(path: Path, *, motion_profile: str | None = "ArmSmoke") -> dict[str, Any] | None:
     summaries = []
     try:
         for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -188,10 +210,16 @@ def _read_scripted_summary(path: Path) -> dict[str, Any] | None:
         return None
     summary = summaries[0]
     if (
-        summary.get("input_source") != "scripted" or summary.get("motion_profile") != "ArmSmoke"
+        summary.get("input_source") != "scripted" or summary.get("motion_profile") != motion_profile
         or summary.get("stop_reason") not in {
             "script_complete", "manual_q", "explicit_stop", "duration_expired", "fault", "keyboard_interrupt",
         }
+    ):
+        return None
+    if motion_profile == "ArmSmokeRepeat" and summary.get("stop_reason") == "script_complete" and (
+        type(summary.get("cycles_completed")) is not int or summary["cycles_completed"] != 4
+        or type(summary.get("returns_qualified")) is not int or summary["returns_qualified"] != 4
+        or summary.get("trajectory_s") != 352
     ):
         return None
     return summary
@@ -363,7 +391,7 @@ class SessionCoordinator:
     def _record_scripted_result(self, outcome: SessionOutcome, client_log_path: Path) -> None:
         if self.leader_source != "scripted":
             return
-        summary = _read_scripted_summary(client_log_path)
+        summary = _read_scripted_summary(client_log_path, motion_profile=self.motion_profile)
         outcome.scripted_input_summary = summary
         reason = summary["stop_reason"] if summary is not None else (outcome.stop_reason or "unknown")
         cleanup = outcome.cleanup
@@ -451,6 +479,7 @@ class SessionCoordinator:
         client_log_path: Path,
         stop_requested: Callable[[], bool],
     ) -> SessionOutcome:
+        validate_leader_selection(self.leader_source, self.motion_profile, duration_seconds)
         outcome = SessionOutcome(
             session_id=session_id,
             requested_duration_seconds=duration_seconds,
@@ -778,8 +807,15 @@ class SSHRemote:
         ]
         if client_trace is not None:
             command.extend(["-v", "-E", str(client_trace)])
+        command.append(self.config.ssh_target)
+        experiment_env = [
+            f"{name}=1" for name in (
+                "AM1_LEFT_SHOULDER_EVIDENCE", "AM1_SCRIPTED_PREPARE", "AM1_SHOULDER_INTEGRAL_TEST",
+            ) if os.environ.get(name) == "1"
+        ]
+        if experiment_env:
+            command.extend(["env", *experiment_env])
         command.extend([
-            self.config.ssh_target,
             self.config.remote_python,
             self.config.remote_helper,
             "supervise",
@@ -1489,6 +1525,7 @@ def validate_local_preflight(
     repository: Path, config: SessionConfig, duration_seconds: int, *,
     leader_source: str = "physical", motion_profile: str | None = None,
 ) -> None:
+    validate_leader_selection(leader_source, motion_profile, duration_seconds)
     leader_arguments = _leader_launch_arguments(leader_source, motion_profile)
     required = [config.windows_python, config.local_config, repository / "tools" / "run_am1.ps1"]
     missing = [str(path) for path in required if not path.is_file()]
@@ -1652,7 +1689,7 @@ def _run_start_locked(
     on_session_created: Callable[[str], None] | None = None,
     console_prepare: Callable[[str], tuple[str, Path]] | None = None,
 ) -> int:
-    validate_leader_selection(leader_source, motion_profile)
+    validate_leader_selection(leader_source, motion_profile, duration_seconds)
     windows_source_head = _git_head(repository)
     active_path = _active_path(config)
     if active_path.exists():
@@ -1964,7 +2001,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "start":
             duration_seconds = parse_duration_seconds(args.duration_seconds)
-            validate_leader_selection(args.leader_source, args.motion_profile)
+            validate_leader_selection(args.leader_source, args.motion_profile, duration_seconds)
         config = SessionConfig.load(args.config)
         repository = Path(__file__).resolve().parents[1]
         if args.command == "start":

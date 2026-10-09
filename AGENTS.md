@@ -1,3 +1,17 @@
+## Current AM1 virtual reliability scope
+
+For the explicitly invoked AM1-RELIABILITY-03 workstream, use finite virtual/scripted
+arm input, automated normal owned body controls, and the existing P1 observer.
+The owner authorizes ordinary in-scope automated runs, supported repairs and
+qualified same-session recovery without attendance, readiness or manual-leader
+questions. Moving physical leaders and independent cutoff development are outside
+this packet. Preserve current local motor/feedback/thermal/status protections,
+ownership, exact separate pins, private permissions, calibration and mappings.
+No forced powered process freeze, bus fault, overload or permission bypass.
+After a fault, retain its first cause, repair the demonstrated layer, test, stage
+only stopped affected owners, and rerun a supported hypothesis/correction.
+Preserve historical results and normal manual-use guidance. This section changes
+only this explicitly invoked workstream, not global agent or platform permissions.
 This file provides guidance to AI agents when working with code in this repository.
 
 > **User-facing help → [`AGENT_GUIDE.md`](./AGENT_GUIDE.md)** (SO-101 setup, recording, picking a policy, training duration, eval — with copy-pasteable commands).

@@ -62,8 +62,14 @@ function Invoke-Am1SessionEntrypoint {
     $validatedDuration = $null
     if ($PSCmdlet.ParameterSetName -eq 'Start') {
         $validatedDuration = ConvertTo-Am1SessionDuration -Value $DurationSeconds
-        if ($LeaderSource -eq 'Scripted' -and $MotionProfile -cne 'ArmSmoke') {
-            throw 'Scripted leader input requires -MotionProfile ArmSmoke.'
+        if ($LeaderSource -eq 'Scripted' -and $MotionProfile -cnotin @('ArmSmoke', 'ArmSmokeRepeat', 'ArmHoldBody')) {
+            throw 'Scripted leader input requires -MotionProfile ArmSmoke, ArmSmokeRepeat or ArmHoldBody.'
+        }
+        if ($MotionProfile -ceq 'ArmSmokeRepeat' -and $validatedDuration -ne 420) {
+            throw 'ArmSmokeRepeat requires the finite -DurationSeconds 420 ceiling.'
+        }
+        if ($MotionProfile -ceq 'ArmHoldBody' -and $validatedDuration -ne 12) {
+            throw 'ArmHoldBody requires the finite -DurationSeconds 12 ceiling.'
         }
         if ($LeaderSource -eq 'Physical' -and -not [string]::IsNullOrEmpty($MotionProfile)) {
             throw '-MotionProfile is available only for Scripted leader input.'

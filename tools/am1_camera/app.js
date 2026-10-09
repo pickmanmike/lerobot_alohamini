@@ -12,8 +12,9 @@ const primary = document.querySelector("#primary"), thumbs = document.querySelec
 const connection = document.querySelector("#connection");
 const diagnostics = document.querySelector("#diagnostics");
 let selected = roles[0], latest = null, reportAt = 0, statusReceivedAt = 0, stream = null;
-let statusRequest = 0, acceptedStatusRequest = 0;
-const tiles = new Map(), slots = new Map(), details = new Map(), busy = new Set(), decodingRoles = new Set();
+let statusRequest = 0, acceptedStatusRequest = 0, statusUncertain = false;
+const tiles = new Map(), slots = new Map(), details = new Map(), busy = new Set(), decodingRoles = new Map();
+const snapshotRequests = new Map(), reconnects = new Map(), minimumSequences = new Map();
 const retained = new AM1RetainedFrames();
 const roleGenerations = new Map(roles.map(role => [role, 1]));
 const sourceSequences = new Map(), sourceStates = new Map(), roleRotations = new Map();
@@ -60,9 +61,14 @@ function noteProgress(role, kind, sequence) {
   if (previous !== null) item[gap] = Math.max(item[gap], now - previous);
   item[`${kind}_at`] = now; item[kind]++; item.sequence = sequence;
 }
-function bumpGeneration(role) {
+function bumpGeneration(role, transportOnly = false) {
   const next = roleGenerations.get(role) + 1;
+  if (transportOnly) minimumSequences.set(role, retained.get(role, performance.now())?.sequence ?? 0);
+  else minimumSequences.delete(role); // A reported source restart may reset sequence to one.
   roleGenerations.set(role, next); retained.setGeneration(role, next);
+  // Old in-flight work cannot claim this connection generation or block its retry.
+  const decoding = decodingRoles.get(role);
+  if (decoding) { URL.revokeObjectURL(decoding.url); decodingRoles.delete(role); }
   if (stream?.role === role) stopPrimary("source-generation-changed");
 }
 function retainedImage(tile, role) {
@@ -81,11 +87,35 @@ function paintDetails(detail, held, source, rotation) {
   const generation = detail.querySelector('[data-field="generation"]');
   if (generation) generation.textContent = held ? String(held.generation) : "Not sampled";
 }
+function frameState(role, thumbnail = false, now = performance.now()) {
+  const held = retained.get(role, now);
+  const current = held && held.generation === roleGenerations.get(role);
+  return AM1FrameState(latest?.cameras[role], reportAt, now,
+    current ? {at:held.at, age_ms:held.age_at_receipt_ms} : null,
+    thumbnail, statusReceivedAt, statusUncertain);
+}
+globalThis.AM1CameraHealth = function() {
+  const now = performance.now(), available = !!statusAvailable();
+  const finite = value => Number.isFinite(value) ? value : null;
+  return {version:1, sampled_at_ms:now, selected_role:selected,
+    status_received_age_ms:latest ? Math.max(0, now - statusReceivedAt) : null,
+    status_available:available, status_uncertain:statusUncertain || !available,
+    status_failures:timing.status_failures,
+    roles:roles.map(role => {
+      const held = retained.get(role, now), source = latest?.cameras[role];
+      const state = frameState(role, role !== selected, now);
+      return {role, identity:role, selected:role === selected, generation:roleGenerations.get(role),
+        decoded_generation:held?.generation ?? null, sequence:held?.sequence ?? null,
+        decoded_age_ms:finite(held?.age_ms), source_sequence:source?.sequence ?? null,
+        source_state:source?.state ?? "unavailable", source_age_ms:finite(state.producer_age_ms),
+        configured:source?.configured === true, fresh:state.state === "fresh",
+        status_uncertain:state.status_uncertain || !available};
+    })};
+};
 function paint(tile, role, thumbnail = false) {
   const held = retainedImage(tile, role);
   const source = latest?.cameras[role];
-  const state = AM1FrameState(source, reportAt, performance.now(),
-    held ? {at:held.at, age_ms:held.age_at_receipt_ms} : null, thumbnail, statusReceivedAt);
+  const state = frameState(role, thumbnail);
   const rotation = [0, 90, 180, 270].includes(source?.rotation_degrees) ?
     source.rotation_degrees : (roleRotations.get(role) ?? 0);
   tile.querySelector("img").dataset.rotation = String(rotation);
@@ -104,18 +134,18 @@ function paint(tile, role, thumbnail = false) {
 }
 async function showFrame(role, blob, frame, valid) {
   if (decodingRoles.has(role)) return false;
-  decodingRoles.add(role);
-  const url = URL.createObjectURL(blob), candidate = new Image();
+  const url = URL.createObjectURL(blob), candidate = new Image(), decoding = {url};
+  decodingRoles.set(role, decoding);
   candidate.src = url;
   try {
     await candidate.decode();
-    if (!valid()) { URL.revokeObjectURL(url); return false; }
+    if (!valid() || frame.sequence <= (minimumSequences.get(role) ?? 0)) { URL.revokeObjectURL(url); return false; }
     if (!retained.accept(role, frame.generation, frame.sequence, url, frame.age_ms, frame.at)) return false;
     if (role === selected) retainedImage(primary, role);
     else retainedImage(tiles.get(role), role);
     return true;
   } catch { timing.decode_failures++; URL.revokeObjectURL(url); return false; }
-  finally { decodingRoles.delete(role); }
+  finally { if (decodingRoles.get(role) === decoding) decodingRoles.delete(role); }
 }
 function stopPrimary(reason = "stopped") {
   if (stream) { timing.cancellations++; timing.last_cancel = reason; stream.controller.abort(); }
@@ -169,13 +199,13 @@ function render() {
     paint(tile, role, true);
   }
   connection.textContent = !statusAvailable() ? "Status unavailable — do not rely on these views" :
-    sourceFor(selected).state !== "fresh" && usable(selected) ? "LAN viewer · status delayed/uncertain · decoded-frame clock remains active" :
+    (statusUncertain || sourceFor(selected).state !== "fresh") && usable(selected) ? "LAN viewer · status delayed/uncertain · decoded-frame clock remains active" :
     "LAN viewer · source status and decoded-frame progress tracked separately";
   if (document.body.dataset.console === "compact") {
     const fresh = Number(primary.classList.contains("fresh")) +
       [...tiles.entries()].filter(([role,tile]) => role !== selected && tile.classList.contains("fresh")).length;
     connection.textContent = !statusAvailable() ? "Camera status unavailable — retained images are not live." :
-      `Cameras ${fresh}/5 fresh decoded views${fresh < 5 ? " — check required views; retained images are not live." : " · image ages in Details."}`;
+      `Cameras ${fresh}/5 fresh decoded views${statusUncertain ? " · status uncertain" : ""}${fresh < 5 ? " — check required views; retained images are not live." : " · image ages in Details."}`;
   }
   diagnostics.textContent = `Status request ${Math.round(timing.status_ms)} ms (max ${Math.round(timing.status_max_ms)} ms); failures ${timing.status_failures}\n` +
     `Decode failures ${timing.decode_failures}; stream cancellations ${timing.cancellations}; last ${timing.last_cancel}\n` +
@@ -199,31 +229,55 @@ async function statusLoop() {
         if (Number.isSafeInteger(source?.sequence)) sourceSequences.set(role, source.sequence);
         sourceStates.set(role, state);
       }
-      latest = next; reportAt = start; statusReceivedAt = performance.now();
+      latest = next; reportAt = start; statusReceivedAt = performance.now(); statusUncertain = false;
     }
-  } catch { if (request > acceptedStatusRequest) { timing.status_failures++; latest = null; } }
+  } catch {
+    if (request > acceptedStatusRequest) {
+      timing.status_failures++; statusUncertain = true;
+      // A failed poll cannot erase independent delivery evidence. Keep the last
+      // accepted identity and original clocks; statusAvailable still expires it.
+    }
+  }
   timing.status_ms = performance.now() - start;
   timing.status_max_ms = Math.max(timing.status_max_ms, timing.status_ms);
   render(); setTimeout(statusLoop, 250);
 }
-async function snapshots() {
-  for (const role of roles) {
-    if (role === selected || busy.has(role) || !usable(role)) continue;
-    busy.add(role); const current = roleGenerations.get(role);
-    (async () => {
-      try {
-        const at = performance.now();
-        const response = await fetch(cameraURL(`api/frame.jpeg?src=${role}&cache=500ms`), {cache:"no-store", signal:AbortSignal.timeout(1000)});
-        if (!response.ok) return;
-        const blob = await response.blob();
-        const age_ms = Number(response.headers.get("X-Frame-Age-Ms") ?? NaN);
-        const sequence = Number(response.headers.get("X-Frame-Sequence") ?? NaN);
-        if (!Number.isFinite(age_ms) || age_ms < 0 || !Number.isSafeInteger(sequence) || sequence < 1 || blob.size > 1000000) return;
-        await showFrame(role, blob, {at,age_ms,sequence,generation:current},
-                        () => current === roleGenerations.get(role) && role !== selected && usable(role));
-      } catch { /* An unsuccessful fetch or decode cannot renew the previous image clock. */ }
-      finally { busy.delete(role); }
-    })();
-  }
+function snapshot(role) {
+  if (role === selected || busy.has(role) || !usable(role)) return;
+  busy.add(role);
+  const current = roleGenerations.get(role), controller = new AbortController();
+  snapshotRequests.set(role, controller);
+  const deadline = setTimeout(() => controller.abort(), 1000);
+  (async () => {
+    try {
+      const at = performance.now();
+      const response = await fetch(cameraURL(`api/frame.jpeg?src=${role}&cache=500ms`), {cache:"no-store", signal:controller.signal});
+      if (!response.ok) return;
+      const blob = await response.blob();
+      const age_ms = Number(response.headers.get("X-Frame-Age-Ms") ?? NaN);
+      const sequence = Number(response.headers.get("X-Frame-Sequence") ?? NaN);
+      if (!Number.isFinite(age_ms) || age_ms < 0 || !Number.isSafeInteger(sequence) || sequence < 1 || blob.size > 1000000) return;
+      await showFrame(role, blob, {at,age_ms,sequence,generation:current},
+                      () => !controller.signal.aborted && current === roleGenerations.get(role) && role !== selected && usable(role));
+    } catch { /* An unsuccessful fetch or decode cannot renew the previous image clock. */ }
+    finally {
+      clearTimeout(deadline);
+      if (snapshotRequests.get(role) === controller) { snapshotRequests.delete(role); busy.delete(role); }
+    }
+  })();
 }
+async function snapshots() { for (const role of roles) snapshot(role); }
+globalThis.AM1CameraReconnect = function(role) {
+  const now = performance.now(), previous = reconnects.get(role);
+  if (!roles.includes(role) || !usable(role)) return {accepted:false, reason:"source-unqualified"};
+  if ((previous?.attempts ?? 0) >= 3) return {accepted:false, reason:"attempt-limit"};
+  if (previous && now - previous.at < 1000) return {accepted:false, reason:"retry-rate-limit"};
+  const attempt = (previous?.attempts ?? 0) + 1;
+  reconnects.set(role, {at:now, attempts:attempt});
+  snapshotRequests.get(role)?.abort(); snapshotRequests.delete(role); busy.delete(role);
+  bumpGeneration(role, true);
+  if (role === selected) render(); else snapshot(role);
+  return {accepted:true, role, identity:role, generation:roleGenerations.get(role), attempt};
+};
+
 setInterval(render, 100); setInterval(snapshots, 500); statusLoop();
