@@ -347,6 +347,9 @@ class SessionAuthority:
         if op in ("pause", "stop"):
             if self.run["status"] in TERMINAL:
                 return self._refuse("terminal")
+            fault = self.executor.evidence()["fault"]
+            if fault and not self.run["first_cause"]:
+                self.run["first_cause"] = str(fault)
             self.run["intent_revision"] += 1
             self._clear_input()
             if op == "stop":
@@ -399,7 +402,9 @@ class SessionAuthority:
                 self._finish("faulted", "dispatch_exception")
                 return self._run_result()
             self.run["dispatch"] = "acknowledged" if admitted else "unacknowledged"
-            if not admitted:
+            if admitted:
+                self.run["recovery"] = None
+            else:
                 self.run["status"] = "paused"
                 self.executor.hold()
             self._save()

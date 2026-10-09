@@ -576,3 +576,77 @@ def test_interactive_resume_persists_dispatching_before_first_effect(tmp_path):
     r = start(a, "fake-interactive")
     interactive_controls(a, r)
     a.close()
+
+
+def test_stop_retains_present_fault_without_motion_and_after_restart(tmp_path):
+    c = Clock()
+    e = CountingExecutor(c)
+    a = SessionAuthority(tmp_path, clock=c, executor=e)
+    r = start(a)
+    before = a.snapshot()["run"]["progress_s"]
+    count = e.dispatch_count
+    e.fault = "fake_local_feedback_fault"
+    c.advance(0.1)
+    result = a.handle(command("stop", run_id=r["run_id"]), "other")
+    assert result["accepted"]
+    assert result["status"] == "stopped"
+    assert e.output == "held_body_zero"
+    assert e.dispatch_count == count
+    assert a.snapshot()["run"]["progress_s"] == before
+    assert a.snapshot()["run"]["first_cause"] == "fake_local_feedback_fault"
+    a.close()
+    b = SessionAuthority(tmp_path, clock=c)
+    assert b.snapshot()["run"]["first_cause"] == "fake_local_feedback_fault"
+    assert b.snapshot()["run"]["status"] == "stopped"
+    b.close()
+
+
+@pytest.mark.parametrize("admitted", [True, False])
+def test_manual_resume_closes_only_acknowledged_recovery_episode(tmp_path, admitted):
+    c = Clock()
+
+    class ResumeExecutor(CountingExecutor):
+        def dispatch(self, recipe):
+            if self.dispatch_count:
+                self.dispatch_count += 1
+                if not admitted:
+                    return False
+                return FakeExecutor.dispatch(self, recipe)
+            return super().dispatch(recipe)
+
+    e = ResumeExecutor(c)
+    a = SessionAuthority(tmp_path, clock=c, executor=e)
+    r = start(a, "fake-finite")
+    deadline = a.snapshot()["run"]["deadline"]
+    e.required_observation = False
+    a.tick()
+    a.handle(command("pause", run_id=r["run_id"]), "owner")
+    c.advance(1)
+    e.required_observation = True
+    generation = a.handle(command("claim"), "owner")["controller_generation"]
+    connection = a.handle(command("connect", run_id=r["run_id"]), "owner")["connection_generation"]
+    base = {
+        "run_id": r["run_id"],
+        "service_incarnation": a.service_incarnation,
+        "controller_generation": generation,
+        "connection_generation": connection,
+    }
+    a.handle(command("release_input", **base), "owner")
+    result = a.handle(command("resume", **base), "owner")
+    assert result["effect_admitted"] == admitted
+    if not admitted:
+        assert a.snapshot()["run"]["recovery"]["ceiling"] == 10.0
+        assert a.snapshot()["run"]["status"] == "paused"
+        a.close()
+        return
+    assert a.snapshot()["run"]["recovery"] is None
+    c.advance(10)
+    e.required_observation = False
+    a.tick()
+    s = a.snapshot()["run"]
+    assert s["status"] == "recovering"
+    assert s["recovery"]["ceiling"] == 21.0
+    assert s["recovery_episodes"] == 2
+    assert s["deadline"] == deadline
+    assert s["first_cause"] == "required_proof_loss"
+    a.close()
