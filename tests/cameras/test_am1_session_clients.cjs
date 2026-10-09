@@ -178,3 +178,54 @@ test("accepted renewal delayed across external same-device release cannot restor
   assert.notEqual(await page.evaluate(()=>am1Remote.controllerGeneration),generation,"new acquisition requires explicit UI action");
   console.log(JSON.stringify({acceptedRenewalDelayed:true,externalReleaseAccepted:true,lossSnapshot:true,lateReplyFenced:true,noImplicitClaim:true,explicitReclaim:true}));
 });
+
+
+for(const delivery of ["delivered","delayed"]) test(`spectator Pause fences owner Resume with ${delivery} authoritative snapshot`,async t=>{
+  const f=await fixture();t.after(()=>f.close());
+  const browser=await chromium.launch({headless:true,channel:process.env.AM1_TEST_BROWSER_CHANNEL || "msedge"});t.after(()=>browser.close());
+  const a=await browser.newContext({ignoreHTTPSErrors:true}),b=await browser.newContext({ignoreHTTPSErrors:true});
+  const pa=await a.newPage(),pb=await b.newPage();
+  await enroll(pa,f.info.url,f.info.a);await enroll(pb,f.info.url,f.info.b);
+  assert.notEqual((await a.cookies())[0].value,(await b.cookies())[0].value);
+  await pa.locator('[data-operation="ClaimInput"]').click();await pa.waitForFunction(()=>am1Remote.controllerGeneration);
+  await pa.locator('[data-operation="Start"]').click();await pa.waitForFunction(()=>am1Remote.snapshot?.run?.status==="running");
+  await pa.locator('[data-operation="Pause"]').click();await pa.waitForFunction(()=>am1Remote.snapshot.run.status==="paused");
+  const revision=await pa.evaluate(()=>am1Remote.snapshot.run.intent_revision);
+  await pa.evaluate(delivery=>{
+    globalThis.sentCommands=[];globalThis.commandResults=[];globalThis.queuedSnapshot=null;
+    globalThis.delaySnapshots=delivery==="delayed";
+    const ws=am1Remote.socket,send=ws.send.bind(ws),receive=ws.onmessage;
+    ws.send=value=>{const frame=JSON.parse(value);if(frame.command)sentCommands.push(frame.command);return send(value);};
+    ws.onmessage=event=>{const frame=JSON.parse(event.data);if(frame.kind==="snapshot" && delaySnapshots){queuedSnapshot=event;return;}
+      if(frame.kind==="result")commandResults.push(frame);return receive(event);};
+    globalThis.deliverSnapshot=()=>{delaySnapshots=false;if(queuedSnapshot){receive(queuedSnapshot);queuedSnapshot=null;}};
+  },delivery);
+  await f.command({op:"delay_reply",operation:"connect"});
+  await pa.locator('[data-operation="Resume"]').click();
+  const connected=await f.command({op:"wait_reply"});assert.equal(connected.accepted,true);
+  assert.equal(connected.snapshot.run.intent_revision,revision);
+  const pauseResponse=pb.waitForResponse(response=>response.url().endsWith("/api/pause"));
+  await pb.locator('[data-operation="Pause"]').click();assert.equal((await (await pauseResponse).json()).accepted,true);
+  await pb.waitForFunction(rev=>am1Remote.snapshot.run.intent_revision>rev,revision);
+  const paused=await pb.evaluate(()=>am1Remote.snapshot.run);
+  if(delivery==="delivered")await pa.waitForFunction(rev=>am1Remote.snapshot.run.intent_revision===rev,paused.intent_revision);
+  else assert.equal(await pa.evaluate(()=>am1Remote.snapshot.run.intent_revision),revision,"new snapshot still withheld");
+  await f.command({op:"release_reply"});await pa.waitForTimeout(350);
+  const trace=await pa.evaluate(()=>({sent:sentCommands,results:commandResults}));
+  assert.equal(await pb.evaluate(()=>am1Remote.snapshot.run.status),"paused","spectator Pause must retain authority");
+  assert.equal(await pb.evaluate(()=>am1Remote.snapshot.run.progress_s),paused.progress_s,"no stale Resume dispatch/progress");
+  if(delivery==="delivered")assert.deepEqual(trace.sent.map(c=>c.op),["connect"],"current snapshot must cancel obsolete continuation");
+  else {
+    assert.deepEqual(trace.sent.map(c=>c.op),["connect","release_input","resume"]);
+    assert.equal(trace.sent.at(-1).expected_intent_revision,revision,"workflow must carry initial revision");
+    assert.equal(trace.results.at(-1).accepted,false,"authority must refuse stale revision without snapshot delivery");
+    assert.equal(trace.results.at(-1).effect_admitted,false);
+    await pa.evaluate(()=>deliverSnapshot());
+  }
+  await pa.waitForFunction(rev=>am1Remote.snapshot.run.status==="paused" && am1Remote.snapshot.run.intent_revision===rev,paused.intent_revision);
+  assert.match(await pa.locator("#session-state").innerText(),/paused/);
+  const renderedPaused=await pa.locator("#session-state").innerText();
+  await pa.locator('[data-operation="Resume"]').click();await pa.waitForFunction(()=>am1Remote.snapshot.run.status==="running");
+  await pb.waitForFunction(()=>am1Remote.snapshot.run.status==="running");
+  console.log(JSON.stringify({contexts:2,snapshotDelivery:delivery,actualSpectatorPause:true,renderedPaused,noStaleDispatch:true,freshExplicitResume:true}));
+});

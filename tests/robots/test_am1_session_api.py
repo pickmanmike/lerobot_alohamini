@@ -297,9 +297,29 @@ def test_interactive_expiry_reconnect_and_enrolled_handoff_fences(cluster):
                 "controller_generation": claim["controller_generation"],
                 "connection_generation": connection["connection_generation"],
             }
-            assert (await ws_command(wa, {"op": "resume", **ids, "operation_id": oid()}))["accepted"] is False
+            assert (
+                await ws_command(
+                    wa,
+                    {
+                        "op": "resume",
+                        **ids,
+                        "expected_intent_revision": (await snapshot(a, cluster))["run"]["intent_revision"],
+                        "operation_id": oid(),
+                    },
+                )
+            )["accepted"] is False
             assert (await ws_command(wa, {"op": "release_input", **ids}))["accepted"]
-            assert (await ws_command(wa, {"op": "resume", **ids, "operation_id": oid()}))["effect_admitted"]
+            assert (
+                await ws_command(
+                    wa,
+                    {
+                        "op": "resume",
+                        **ids,
+                        "expected_intent_revision": (await snapshot(a, cluster))["run"]["intent_revision"],
+                        "operation_id": oid(),
+                    },
+                )
+            )["effect_admitted"]
             grant = await ws_command(wa, {"op": "grant", **ids})
             assert (
                 await ws_command(
@@ -707,7 +727,17 @@ def test_wss_stop_has_reserved_admission_during_delayed_input_reply(cluster):
                 "connection_generation": connection["connection_generation"],
             }
             assert (await ws_command(ws, {"op": "release_input", **ids}))["accepted"]
-            assert (await ws_command(ws, {"op": "resume", **ids, "operation_id": oid()}))["accepted"]
+            assert (
+                await ws_command(
+                    ws,
+                    {
+                        "op": "resume",
+                        **ids,
+                        "expected_intent_revision": (await snapshot(a, cluster))["run"]["intent_revision"],
+                        "operation_id": oid(),
+                    },
+                )
+            )["accepted"]
             grant = await ws_command(ws, {"op": "grant", **ids})
             cluster.flags.write_text(json.dumps({"slow_input_response": True}))
             await ws.send_json(
@@ -767,7 +797,15 @@ def test_pending_input_is_coalesced_instead_of_replayed(cluster):
                 "connection_generation": connected["connection_generation"],
             }
             await ws_command(ws, {"op": "release_input", **ids})
-            await ws_command(ws, {"op": "resume", **ids, "operation_id": oid()})
+            await ws_command(
+                ws,
+                {
+                    "op": "resume",
+                    **ids,
+                    "expected_intent_revision": (await snapshot(a, cluster))["run"]["intent_revision"],
+                    "operation_id": oid(),
+                },
+            )
             grant = await ws_command(ws, {"op": "grant", **ids})
             cluster.flags.write_text(json.dumps({"slow_input_response": True}))
 

@@ -37,6 +37,10 @@ class AM1SessionTransport {
         if(this.socket!==ws)return;
         const value=JSON.parse(event.data);
         if(value.kind==="snapshot") {
+          const previous=this.snapshot?.run,next=value.snapshot.run;
+          if(previous?.run_id!==next?.run_id || previous?.intent_revision!==next?.intent_revision) {
+            this.intent++;this.held.clear();
+          }
           this.snapshot=value.snapshot;
           if(value.revision) {ws.send(JSON.stringify({ack:value.revision}));this.connected=true;}
           const controller=this.snapshot.controller;
@@ -95,7 +99,7 @@ class AM1SessionTransport {
   }
   async resume() {
     this.held.clear();
-    const epoch=this.epoch,intent=++this.intent,generation=this.controllerGeneration;
+    const epoch=this.epoch,intent=++this.intent,generation=this.controllerGeneration,revision=this.snapshot?.run?.intent_revision;
     const current=()=>this.connected && epoch===this.epoch && intent===this.intent && generation===this.controllerGeneration;
     const connected=await this.command({op:"connect",run_id:this.snapshot?.run?.run_id});
     if(!current())return connected; // Preserve the admitted result; cancel only its continuation.
@@ -103,7 +107,7 @@ class AM1SessionTransport {
     this.connection=connected.connection_generation;this.snapshot=connected.snapshot;this.seq=0;
     const released=await this.command({op:"release_input",...this.identities()});
     if(!current() || !released.accepted)return released;
-    const result=await this.command({op:"resume",...this.identities(),operation_id:crypto.randomUUID()});
+    const result=await this.command({op:"resume",...this.identities(),expected_intent_revision:revision,operation_id:crypto.randomUUID()});
     if(current())this.render(this,result.reason);return result;
   }
   async releaseInput() {

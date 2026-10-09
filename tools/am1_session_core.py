@@ -386,6 +386,9 @@ class SessionAuthority:
             self.released = True
             return {"accepted": True, "status": "released", "effect_admitted": True}
         if op == "resume":
+            revision = c.get("expected_intent_revision")
+            if type(revision) is not int or revision != self.run["intent_revision"]:
+                return self._refuse("stale or malformed intent revision")
             e = self.executor.evidence()
             if (
                 self.run["status"] != "paused"

@@ -112,9 +112,13 @@ def test_interactive_grant_expiry_and_reconnect_release(tmp_path):
         "controller_generation": a.handle(command("claim"), "owner")["controller_generation"],
         "connection_generation": h["connection_generation"],
     }
-    assert not a.handle(command("resume", **base), "owner")["accepted"]
+    assert not a.handle(
+        command("resume", **base, expected_intent_revision=a.snapshot()["run"]["intent_revision"]), "owner"
+    )["accepted"]
     assert a.handle(command("release_input", **base), "owner")["accepted"]
-    assert a.handle(command("resume", **base), "owner")["accepted"]
+    assert a.handle(
+        command("resume", **base, expected_intent_revision=a.snapshot()["run"]["intent_revision"]), "owner"
+    )["accepted"]
     g = a.handle(command("grant", **base), "owner")
     inp = command("input", **base, grant_id=g["grant_id"], seq=1, target=[0.2])
     assert a.handle(inp, "owner")["effect_admitted"]
@@ -237,7 +241,9 @@ def test_input_rejects_boolean_sequence_and_stale_connection(tmp_path):
         "connection_generation": connection,
     }
     a.handle(command("release_input", **base), "owner")
-    a.handle(command("resume", **base), "owner")
+    a.handle(
+        command("resume", **base, expected_intent_revision=a.snapshot()["run"]["intent_revision"]), "owner"
+    )
     grant = a.handle(command("grant", **base), "owner")["grant_id"]
     assert not a.handle(command("input", **base, grant_id=grant, seq=True, target=[0.1]), "owner")["accepted"]
     a.handle(command("connect", run_id=r["run_id"]), "owner")
@@ -375,7 +381,9 @@ def interactive_controls(a, r):
         "connection_generation": connection,
     }
     a.handle(command("release_input", **base), "owner")
-    assert a.handle(command("resume", **base), "owner")["accepted"]
+    assert a.handle(
+        command("resume", **base, expected_intent_revision=a.snapshot()["run"]["intent_revision"]), "owner"
+    )["accepted"]
     return base
 
 
@@ -632,7 +640,9 @@ def test_manual_resume_closes_only_acknowledged_recovery_episode(tmp_path, admit
         "connection_generation": connection,
     }
     a.handle(command("release_input", **base), "owner")
-    result = a.handle(command("resume", **base), "owner")
+    result = a.handle(
+        command("resume", **base, expected_intent_revision=a.snapshot()["run"]["intent_revision"]), "owner"
+    )
     assert result["effect_admitted"] == admitted
     if not admitted:
         assert a.snapshot()["run"]["recovery"]["ceiling"] == 10.0
@@ -685,5 +695,79 @@ def test_generation_fenced_claim_cannot_reacquire_after_authority_loss(tmp_path,
         explicit = authority.handle(command("claim"), "owner")
         assert explicit["accepted"], "explicit acquisition remains available"
         assert explicit["controller_generation"] != generation
+    finally:
+        authority.close()
+
+
+@pytest.mark.parametrize("expected", [None, True, False, 1.0, "1", -1, {}, [], "missing", "old", "future"])
+def test_resume_requires_exact_integer_expected_intent_revision(tmp_path, expected):
+    clock = Clock()
+    executor = CountingExecutor(clock)
+    authority = SessionAuthority(tmp_path, clock=clock, executor=executor)
+    try:
+        run = start(authority)
+        assert authority.handle(command("pause", run_id=run["run_id"]), "spectator")["accepted"]
+        controller = authority.handle(command("claim"), "owner")["controller_generation"]
+        connected = authority.handle(command("connect", run_id=run["run_id"]), "owner")
+        ids = {
+            "run_id": run["run_id"],
+            "service_incarnation": authority.service_incarnation,
+            "controller_generation": controller,
+            "connection_generation": connected["connection_generation"],
+        }
+        assert authority.handle(command("release_input", **ids), "owner")["accepted"]
+        request = command("resume", **ids)
+        revision = authority.snapshot()["run"]["intent_revision"]
+        if expected != "missing":
+            request["expected_intent_revision"] = (
+                revision - 1 if expected == "old" else revision + 1 if expected == "future" else expected
+            )
+        count = executor.dispatch_count
+        result = authority.handle(request, "owner")
+        assert not result["accepted"], "missing, malformed or stale revision must refuse before dispatch"
+        assert not result["effect_admitted"]
+        assert authority.snapshot()["run"]["status"] == "paused"
+        assert executor.dispatch_count == count
+        assert authority.snapshot()["run"]["intent_revision"] == revision
+    finally:
+        authority.close()
+
+
+def test_admitted_resume_retry_remains_truthful_after_later_spectator_pause(tmp_path):
+    clock = Clock()
+    executor = CountingExecutor(clock)
+    authority = SessionAuthority(tmp_path, clock=clock, executor=executor)
+    try:
+        run = start(authority)
+        authority.handle(command("pause", run_id=run["run_id"]), "spectator")
+        controller = authority.handle(command("claim"), "owner")["controller_generation"]
+        connected = authority.handle(command("connect", run_id=run["run_id"]), "owner")
+        ids = {
+            "run_id": run["run_id"],
+            "service_incarnation": authority.service_incarnation,
+            "controller_generation": controller,
+            "connection_generation": connected["connection_generation"],
+        }
+        authority.handle(command("release_input", **ids), "owner")
+        request = command(
+            "resume", **ids, expected_intent_revision=authority.snapshot()["run"]["intent_revision"]
+        )
+        admitted = authority.handle(request, "owner")
+        assert admitted["accepted"] and admitted["effect_admitted"]
+        assert authority.handle(command("pause", run_id=run["run_id"]), "spectator")["accepted"]
+        count = executor.dispatch_count
+        assert authority.handle(request, "owner") == admitted
+        assert authority.snapshot()["run"]["status"] == "paused"
+        assert executor.dispatch_count == count
+        authority.handle(command("release_input", **ids), "owner")
+        stale = dict(request, operation_id=str(uuid.uuid4()))
+        assert not authority.handle(stale, "owner")["accepted"]
+        fresh = dict(
+            stale,
+            operation_id=str(uuid.uuid4()),
+            expected_intent_revision=authority.snapshot()["run"]["intent_revision"],
+        )
+        assert authority.handle(fresh, "owner")["effect_admitted"]
+        assert executor.dispatch_count == count + 1
     finally:
         authority.close()
