@@ -166,7 +166,6 @@ class SessionAuthority:
         with self.mutex:
             if self.closed:
                 return self._refuse("closed")
-            self.tick()
             if not isinstance(command, dict) or not isinstance(device_id, str) or not device_id:
                 return self._refuse("invalid command or trusted identity")
             if "device_id" in command:
@@ -189,7 +188,21 @@ class SessionAuthority:
                     result = {"accepted": True, "status": "uncertain", "effect_admitted": False}
                     self.db.execute("INSERT INTO mutations VALUES (?,?,?)", (oid, digest, json.dumps(result)))
                     self.db.commit()
+                protective = (
+                    command.get("op") in {"pause", "stop"}
+                    and self.run
+                    and command.get("run_id") == self.run["run_id"]
+                    and self.run["status"] not in TERMINAL
+                )
+                if protective:
+                    # Lease/grant expiry still runs, but operator intent precedes motion admission.
+                    self._expire_controls(self.clock())
+                    self.last_tick = self.clock()
+                else:
+                    self.tick()
                 result = self._handle(command, device_id)
+                if protective:
+                    self.tick()
                 if oid:
                     self.db.execute("UPDATE mutations SET result=? WHERE id=?", (json.dumps(result), oid))
                     self.db.commit()
@@ -263,6 +276,12 @@ class SessionAuthority:
                 return self._refuse("current controller lease required")
             if self.run and (self.run["uncertain"] or self.run["status"] not in TERMINAL):
                 return self._refuse("reconciliation or terminal run required")
+            evidence = self.executor.evidence()
+            if evidence["fault"] or not all(
+                evidence[k] for k in ("feedback", "required_observation", "native_ack")
+            ):
+                self.executor.hold()
+                return self._refuse("fresh qualified feedback/proof and acknowledgement required")
             self.run = {
                 "run_id": str(uuid.uuid4()),
                 "operation_id": oid,
@@ -287,6 +306,12 @@ class SessionAuthority:
                 "INSERT INTO operations VALUES (?,?,?,?)", (oid, digest, d, json.dumps(self._run_result()))
             )
             self._save()
+            if recipe.mode == "interactive":
+                self.run["status"] = "paused"
+                self.executor.hold()
+                self._event("start")
+                self._save()
+                return self._run_result()
             self.run["dispatch"] = "dispatching"
             self._save()
             try:
@@ -365,12 +390,24 @@ class SessionAuthority:
             self.run["intent_revision"] += 1
             self.run["status"] = "running"
             self.last_tick = now
-            self.executor.dispatch(RECIPES[self.run["recipe"]])
+            self.run["dispatch"] = "dispatching"
             self._save()
-            return {"accepted": True, "status": "running", "effect_admitted": True}
+            try:
+                admitted = self.executor.dispatch(RECIPES[self.run["recipe"]])
+            except Exception:
+                self.run["uncertain"] = True
+                self._finish("faulted", "dispatch_exception")
+                return self._run_result()
+            self.run["dispatch"] = "acknowledged" if admitted else "unacknowledged"
+            if not admitted:
+                self.run["status"] = "paused"
+                self.executor.hold()
+            self._save()
+            return {"accepted": True, "status": self.run["status"], "effect_admitted": admitted}
         if op == "grant":
             if self.run["status"] != "running" or RECIPES[self.run["recipe"]].mode != "interactive":
                 return self._refuse("interactive running required")
+            self._clear_input()
             self.grant = {"id": str(uuid.uuid4()), "issued": now, "expires": now + 0.25}
             return {
                 "accepted": True,
@@ -399,6 +436,15 @@ class SessionAuthority:
             return {"accepted": True, "status": "input", "effect_admitted": self.executor.apply(target)}
         return self._refuse("unknown operation")
 
+    def _expire_controls(self, now):
+        if self.controller and now >= self.controller["expires"]:
+            self.controller = None
+            self.connection = None
+            self._clear_input()
+            self._event("presence_expired")
+        if self.grant and now >= self.grant["expires"]:
+            self._clear_input()
+
     def tick(self):
         with self.mutex:
             if self.closed:
@@ -406,13 +452,7 @@ class SessionAuthority:
             now = self.clock()
             dt = max(0.0, min(0.1, now - self.last_tick))
             self.last_tick = now
-            if self.controller and now >= self.controller["expires"]:
-                self.controller = None
-                self.connection = None
-                self._clear_input()
-                self._event("presence_expired")
-            if self.grant and now >= self.grant["expires"]:
-                self._clear_input()
+            self._expire_controls(now)
             r = self.run
             previous_status = r["status"] if r else None
             if not r or r["status"] in TERMINAL:
@@ -422,9 +462,7 @@ class SessionAuthority:
                 self._finish("faulted", str(e["fault"]))
                 return
             if now >= r["deadline"]:
-                self._finish(
-                    "completed" if RECIPES[r["recipe"]].mode == "finite" else "stopped", "live_deadline"
-                )
+                self._finish("stopped", "live_deadline")
                 return
             qualified = e["feedback"] and e["required_observation"] and e["native_ack"]
             if r["status"] == "running" and not qualified:
@@ -447,8 +485,13 @@ class SessionAuthority:
                     return
                 if qualified and e["pose_aligned"] and recovery["revision"] == r["intent_revision"]:
                     r["status"] = "running"
-                    self.executor.dispatch(RECIPES[r["recipe"]])
-                    self._event("recovered")
+                    admitted = self.executor.dispatch(RECIPES[r["recipe"]])
+                    if admitted:
+                        r["recovery"] = None
+                        self._event("recovered")
+                    else:
+                        r["status"] = "recovering"
+                        self.executor.hold()
             elif r["status"] == "running" and RECIPES[r["recipe"]].mode == "finite":
                 r["progress_s"] = min(RECIPES[r["recipe"]].trajectory_s, r["progress_s"] + dt)
                 if r["progress_s"] >= RECIPES[r["recipe"]].trajectory_s:

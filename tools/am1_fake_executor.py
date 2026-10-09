@@ -20,7 +20,7 @@ class FakeExecutor:
         return {
             "source": "fake-injected",
             "feedback": self.feedback and self.feedback_age_s <= 0.25,
-            "required_observation": self.required_observation and self.observation_age_s <= 0.25,
+            "required_observation": self.required_observation and self.observation_age_s <= 0.5,
             "optional_quality": self.optional_quality,
             "pose_aligned": self.pose_aligned,
             "native_ack": self.native_ack,
