@@ -116,3 +116,65 @@ test("late REST claim cannot restore authority after reconnect and interactive U
     console.log(JSON.stringify({delayedClaimFenced:true,interactiveBlurHeld:true,explicitHandoff:true,reloadNoReplay:true,spectatorStop:true,contexts:2}));
   } finally {await a.close();await b.close();await browser.close();await f.close();}
 });
+
+
+for(const delayed of ["connect","release_input"]) test(`later accepted Pause fences Resume after delayed real ${delayed} reply`,async t=>{
+  const f=await fixture();t.after(()=>f.close());
+  const browser=await chromium.launch({headless:true,channel:process.env.AM1_TEST_BROWSER_CHANNEL || "msedge"});t.after(()=>browser.close());
+  const context=await browser.newContext({ignoreHTTPSErrors:true}),page=await context.newPage();
+  await enroll(page,f.info.url,f.info.a);
+  await page.locator('[data-operation="ClaimInput"]').click();await page.waitForFunction(()=>am1Remote.controllerGeneration);
+  await page.locator('[data-operation="Start"]').click();await page.waitForFunction(()=>am1Remote.snapshot?.run?.status==="running");
+  await page.locator('[data-operation="Pause"]').click();await page.waitForFunction(()=>am1Remote.snapshot.run.status==="paused");
+  await f.command({op:"delay_reply",operation:delayed});
+  // Existing socket also gets an observer; this wraps send without changing real transport.
+  await page.evaluate(()=>{globalThis.sentCommands=[];const ws=am1Remote.socket,send=ws.send.bind(ws);ws.send=value=>{const frame=JSON.parse(value);if(frame.command)sentCommands.push(frame.command.op);return send(value);};});
+  await page.locator('[data-operation="Resume"]').click();
+  const admitted=await f.command({op:"wait_reply"});assert.equal(admitted.accepted,true);
+  let paused;const pauseReply=new Promise(resolve=>paused=resolve);
+  await page.route("**/api/pause",async route=>{const response=await route.fetch();const result=await response.json();await route.fulfill({response});paused(result);});
+  await page.locator('[data-operation="Pause"]').click();
+  assert.equal((await pauseReply).accepted,true,"later protective request must actually reach owner");
+  const before=await page.evaluate(()=>am1Remote.snapshot.run.progress_s);
+  await f.command({op:"release_reply"});await page.waitForTimeout(400);
+  const after=await page.evaluate(()=>({run:am1Remote.snapshot.run,sent:sentCommands}));
+  assert.equal(after.run.status,"paused","late Resume continuation must not override later Pause");
+  assert.equal(after.run.progress_s,before,"paused owner must admit no progress after late reply");
+  assert.deepEqual(after.sent,delayed==="connect"?["connect"]:["connect","release_input"],"no later continuation command may be sent");
+  console.log(JSON.stringify({delayedRealReply:delayed,laterPauseAccepted:true,rendered:await page.locator("#session-state").innerText(),noResumeDispatch:true}));
+});
+
+test("accepted renewal delayed across external same-device release cannot restore authority or silently reacquire",async t=>{
+  const f=await fixture();t.after(()=>f.close());
+  const browser=await chromium.launch({headless:true,channel:process.env.AM1_TEST_BROWSER_CHANNEL || "msedge"});t.after(()=>browser.close());
+  const context=await browser.newContext({ignoreHTTPSErrors:true}),page=await context.newPage();
+  await enroll(page,f.info.url,f.info.a);
+  await page.locator('[data-operation="ClaimInput"]').click();await page.waitForFunction(()=>am1Remote.controllerGeneration);
+  const generation=await page.evaluate(()=>am1Remote.controllerGeneration);
+  let captured,release;const admitted=new Promise(resolve=>captured=resolve),gate=new Promise(resolve=>release=resolve);let once=false;
+  const renewals=[];
+  await page.route("**/api/claim",async route=>{
+    renewals.push(route.request().postDataJSON());
+    if(once)return route.continue();once=true;
+    const response=await route.fetch();captured(await response.json());await gate;await route.fulfill({response});
+  });
+  t.after(()=>release());
+  const reply=await admitted;assert.equal(reply.accepted,true);assert.equal(reply.controller_generation,generation);
+  const external=await page.evaluate(async()=>{const response=await fetch("/api/release",{method:"POST",headers:{"Content-Type":"application/json","X-AM1-CSRF":am1Remote.csrf},body:JSON.stringify({operation_id:crypto.randomUUID()})});return response.json();});
+  assert.equal(external.accepted,true);
+  await page.waitForFunction(()=>am1Remote.snapshot.controller===null && am1Remote.controllerGeneration===null);
+  await page.evaluate(()=>{globalThis.restoredGenerations=[];const render=am1Remote.render;am1Remote.render=(...args)=>{if(am1Remote.controllerGeneration)restoredGenerations.push(am1Remote.controllerGeneration);return render(...args);};});
+  release();await page.waitForTimeout(1100);
+  assert.deepEqual(await page.evaluate(()=>restoredGenerations),[],"late reply cannot even transiently restore lost authority");
+  const state=await page.evaluate(()=>({controller:am1Remote.snapshot.controller,local:am1Remote.controllerGeneration}));
+  assert.equal(state.local,null,"late accepted renewal cannot restore lost local authority");
+  assert.equal(state.controller,null,"timer cannot silently acquire a replacement lease");
+  assert.equal(renewals.length,1,"no further renewal after observed loss");
+  assert.equal(renewals[0].controller_generation,generation,"periodic renewal must be fenced at authority");
+  await page.locator(".session-details > summary").click();
+  assert.match(await page.locator("#gate-state").innerText(),/Spectator/);
+  await page.unroute("**/api/claim");
+  await page.locator('[data-operation="ClaimInput"]').click();await page.waitForFunction(()=>am1Remote.controllerGeneration);
+  assert.notEqual(await page.evaluate(()=>am1Remote.controllerGeneration),generation,"new acquisition requires explicit UI action");
+  console.log(JSON.stringify({acceptedRenewalDelayed:true,externalReleaseAccepted:true,lossSnapshot:true,lateReplyFenced:true,noImplicitClaim:true,explicitReclaim:true}));
+});

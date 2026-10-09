@@ -216,6 +216,9 @@ class SessionAuthority:
         if op == "snapshot":
             return {"accepted": True, "status": "snapshot", "snapshot": self.snapshot()}
         if op == "claim":
+            # A supplied generation is renewal-only, atomically fenced after expiry.
+            if "controller_generation" in c and not self._owned(c, d):
+                return self._refuse("controller renewal fence")
             if self.controller and self.controller["device_id"] != d:
                 return self._refuse("controller occupied")
             if not self.controller:

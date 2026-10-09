@@ -650,3 +650,40 @@ def test_manual_resume_closes_only_acknowledged_recovery_episode(tmp_path, admit
     assert s["deadline"] == deadline
     assert s["first_cause"] == "required_proof_loss"
     a.close()
+
+
+@pytest.mark.parametrize("loss", ["expiry", "release", "replacement"])
+def test_generation_fenced_claim_cannot_reacquire_after_authority_loss(tmp_path, loss):
+    clock = Clock()
+    authority = SessionAuthority(tmp_path, clock=clock)
+    try:
+        generation = authority.handle(command("claim"), "owner")["controller_generation"]
+        clock.advance(0.5)
+        renewed = authority.handle(command("claim", controller_generation=generation), "owner")
+        assert renewed["accepted"]
+        assert renewed["controller_generation"] == generation
+        assert not authority.handle(command("claim", controller_generation=generation), "other")["accepted"]
+        if loss == "expiry":
+            clock.advance(1.501)
+            authority.tick()
+            assert authority.snapshot()["controller"] is None
+        else:
+            assert authority.handle(command("release"), "owner")["accepted"]
+            if loss == "replacement":
+                replacement = authority.handle(command("claim"), "owner")["controller_generation"]
+                assert replacement != generation
+        before = authority.snapshot()["controller"]
+        stale = authority.handle(command("claim", controller_generation=generation), "owner")
+        assert not stale["accepted"], "renewal must never acquire or renew a different generation"
+        after = authority.snapshot()["controller"]
+        if loss == "replacement":
+            assert after == before, "stale renewal must not extend replacement presence"
+        else:
+            assert after is None
+        for invalid in (None, "", False, 123, []):
+            assert not authority.handle(command("claim", controller_generation=invalid), "owner")["accepted"]
+        explicit = authority.handle(command("claim"), "owner")
+        assert explicit["accepted"], "explicit acquisition remains available"
+        assert explicit["controller_generation"] != generation
+    finally:
+        authority.close()

@@ -142,6 +142,15 @@ if __name__ == "__main__":
         class DelayedReplyIPC(IPCClient):
             async def request(self, command, device):
                 result = await super().request(command, device)
+                if flags_path.exists():
+                    flags = json.loads(flags_path.read_text())
+                    if (
+                        command.get("op") == flags.get("delay_reply")
+                        and not flags_path.with_suffix(".reply").exists()
+                    ):
+                        flags_path.with_suffix(".reply").write_text(json.dumps(result))
+                        while not flags_path.with_suffix(".release").exists():
+                            await asyncio.sleep(0.01)
                 if (
                     command.get("op") == "start"
                     and flags_path.exists()
@@ -228,6 +237,17 @@ if __name__ == "__main__":
                         ),
                         flush=True,
                     )
+                elif command["op"] == "delay_reply":
+                    cluster.flags.with_suffix(".reply").unlink(missing_ok=True)
+                    cluster.flags.with_suffix(".release").unlink(missing_ok=True)
+                    cluster.flags.write_text(json.dumps({"delay_reply": command["operation"]}))
+                    print(json.dumps({"ready": True}), flush=True)
+                elif command["op"] == "wait_reply":
+                    result = wait_file(cluster.flags.with_suffix(".reply"), cluster.gateway)
+                    print(json.dumps(result), flush=True)
+                elif command["op"] == "release_reply":
+                    cluster.flags.with_suffix(".release").write_text("release")
+                    print(json.dumps({"released": True}), flush=True)
                 elif command["op"] == "restart_owner":
                     cluster.stop("owner")
                     cluster.start_owner()

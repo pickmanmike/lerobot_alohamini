@@ -4,10 +4,10 @@ class AM1SessionTransport {
   constructor(render) {
     this.render=render; this.snapshot=null; this.connected=false; this.csrf=null; this.device=null;
     this.control=false; this.controllerGeneration=null; this.connection=null; this.held=new Set();
-    this.pending=new Map(); this.seq=0; this.socket=null; this.inputBusy=false; this.epoch=0;
+    this.pending=new Map(); this.seq=0; this.socket=null; this.inputBusy=false; this.epoch=0; this.intent=0;
   }
   clear(reason="disconnected") {
-    this.epoch++; this.held.clear(); this.connection=null; this.controllerGeneration=null; this.seq=0;
+    this.epoch++; this.intent++; this.held.clear(); this.connection=null; this.controllerGeneration=null; this.seq=0;
     for(const p of this.pending.values()) p.reject(Error(reason));
     this.pending.clear(); this.inputBusy=false;
   }
@@ -39,7 +39,10 @@ class AM1SessionTransport {
         if(value.kind==="snapshot") {
           this.snapshot=value.snapshot;
           if(value.revision) {ws.send(JSON.stringify({ack:value.revision}));this.connected=true;}
-          if(this.snapshot.controller?.device_id!==this.device) {this.held.clear();this.controllerGeneration=null;this.connection=null;}
+          const controller=this.snapshot.controller;
+          if(this.controllerGeneration && (controller?.device_id!==this.device || controller.controller_generation!==this.controllerGeneration))
+            this.clear("Controller generation changed");
+          if(controller?.device_id!==this.device) {this.held.clear();this.connection=null;}
           this.render(this);
         } else if(value.kind==="result") {
           const pending=this.pending.get(value.id);if(pending){this.pending.delete(value.id);pending.resolve(value);}
@@ -66,12 +69,17 @@ class AM1SessionTransport {
     return {run_id:this.snapshot?.run?.run_id, service_incarnation:this.snapshot?.service_incarnation,
       controller_generation:this.controllerGeneration, connection_generation:this.connection};
   }
-  async claim() {
+  async claim(generation) {
     const epoch=this.epoch;
-    const result=await this.post("claim",{});
-    if(epoch!==this.epoch || !this.connected)return result;
+    const result=await this.post("claim",generation===undefined ? {} : {controller_generation:generation});
+    if(epoch!==this.epoch || !this.connected || (generation!==undefined && generation!==this.controllerGeneration))return result;
     if(result.accepted)this.controllerGeneration=result.controller_generation;
+    else if(generation!==undefined)this.clear("Controller renewal refused");
     this.render(this,result.reason);return result;
+  }
+  async renew() {
+    const generation=this.controllerGeneration;
+    if(generation) return this.claim(generation);
   }
   async start(recipe) {
     const payload={operation_id:crypto.randomUUID(),recipe,controller_generation:this.controllerGeneration};
@@ -81,19 +89,22 @@ class AM1SessionTransport {
     this.render(this,result.reason);return result;
   }
   async protective(op) {
-    this.held.clear();
+    this.intent++; this.held.clear();
     const result=await this.post(op,{run_id:this.snapshot?.run?.run_id,operation_id:crypto.randomUUID()});
     this.render(this,result.reason);return result;
   }
   async resume() {
     this.held.clear();
+    const epoch=this.epoch,intent=++this.intent,generation=this.controllerGeneration;
+    const current=()=>this.connected && epoch===this.epoch && intent===this.intent && generation===this.controllerGeneration;
     const connected=await this.command({op:"connect",run_id:this.snapshot?.run?.run_id});
+    if(!current())return connected; // Preserve the admitted result; cancel only its continuation.
     if(!connected.accepted){this.render(this,connected.reason);return connected;}
     this.connection=connected.connection_generation;this.snapshot=connected.snapshot;this.seq=0;
     const released=await this.command({op:"release_input",...this.identities()});
-    if(!released.accepted)return released;
+    if(!current() || !released.accepted)return released;
     const result=await this.command({op:"resume",...this.identities(),operation_id:crypto.randomUUID()});
-    this.render(this,result.reason);return result;
+    if(current())this.render(this,result.reason);return result;
   }
   async releaseInput() {
     this.held.clear();
@@ -102,10 +113,10 @@ class AM1SessionTransport {
   }
   async input() {
     if(this.inputBusy || !this.held.size || !this.connection || this.snapshot?.run?.status!=="running" || this.snapshot.run.recipe!=="fake-interactive")return;
-    this.inputBusy=true;const epoch=this.epoch;
+    this.inputBusy=true;const epoch=this.epoch,intent=this.intent;
     try {
       const grant=await this.command({op:"grant",...this.identities()});
-      if(epoch!==this.epoch || !grant.accepted || !this.held.size)return;
+      if(epoch!==this.epoch || intent!==this.intent || !grant.accepted || !this.held.size)return;
       // Sample current keys after issuance; no target queue or reconnect replay.
       const target=[Number(this.held.has("w"))-Number(this.held.has("s")),Number(this.held.has("a"))-Number(this.held.has("d")),Number(this.held.has("u"))-Number(this.held.has("j"))];
       const result=await this.command({op:"input",...this.identities(),grant_id:grant.grant_id,seq:++this.seq,target});
@@ -167,6 +178,6 @@ globalThis.AM1RemoteInitialize=function() {
   window.addEventListener("pagehide",()=>{transport.held.clear();transport.socket?.close();});
   document.querySelector('[data-help="touch"]').onclick=()=>{const help=document.querySelector("#control-help");help.hidden=!help.hidden;};
   setInterval(()=>transport.input(),100);
-  setInterval(()=>{if(transport.connected&&transport.controllerGeneration)transport.claim().catch(()=>{transport.clear();});},500);
+  setInterval(()=>{if(transport.connected&&transport.controllerGeneration)transport.renew().catch(()=>{});},500);
   render(transport);transport.initialize().catch(error=>render(transport,error.message));
 };
