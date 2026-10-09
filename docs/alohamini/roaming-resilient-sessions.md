@@ -6,8 +6,10 @@ HTTPS/WebSocket gateway, and independently supervised P1 observation. Reuse the
 existing UI and protected motor backend. SSH remains administrative access.
 
 The owner approved this design and the exact stage-1 fake-only implementation.
-Stage 1 is implemented on `codex/am1-persistent-session-fake`; final whole-branch
-review/publication remains pending. This does not qualify or deploy stages 2–4.
+Stage 1 is implemented on `codex/am1-persistent-session-fake`. Whole-branch
+review completed and identified one cross-client Pause ordering defect; its
+correction and covering evidence are recorded below. The stacked follow-up is
+a fake-only draft checkpoint. This does not qualify or deploy stages 2–4.
 The owner replaced the proposed connection-continuity handoff and canceled the
 Wi-Fi Roaming Aggressiveness experiment and its administrator question. Do not
 resume that transaction. No deployed motor/camera owner, adapter, firewall, listener or private
@@ -466,8 +468,12 @@ sabotage or powered-process termination.
 
 ## Implemented stage 1: Windows fake-only persistent session
 
-The committed implementation through `b21cd2878415ebb21bd160a93436ce345307b78f`
-has clean task-level reviews, including scoped re-review of both transport races.
+The committed implementation through `2b10537bfe420bb931ef34a3c7827d14922417ea`
+includes the task-level corrections, final cross-client Pause revision fence
+and unsupported fake-control correction. Task-level scoped reviews passed at
+`b21cd287`. The completed whole-branch review at documentation checkpoint `7761edd0` found one additional Important
+cross-client ordering defect, corrected in `4b91656d`; this records the correction
+and tests, without predicting its scoped re-review verdict or publication outcome.
 This is fake execution and synthetic proof, not captured pixels or physical
 movement. The existing motor, calibration, mapping, feedback, current, thermal,
 status, permissions and separate deployment pins above are unchanged. PR #16
@@ -533,6 +539,17 @@ normalized `target` values. Reconnect clears targets, requires snapshot ack,
 explicit connect, fresh empty release, alignment/current evidence and Resume.
 Interactive Start begins paused/held. Finite authorization remains separate
 from controller/viewer presence and keeps the original run/seed/deadline.
+
+Resume requires `expected_intent_revision`: a strict JSON integer (not boolean,
+float, string, null or collection) equal to the current run `intent_revision`.
+Missing, old or future revisions refuse atomically before dispatch, even when a
+later spectator Pause snapshot has not reached the controller. The UI captures
+this revision at the deliberate Resume click, carries it unchanged through
+Connect and empty Release, and cancels obsolete continuations when an
+authoritative run/revision change arrives. A fresh deliberate Resume from the
+current paused revision remains available. An exact retry of an already admitted
+Resume returns its stored historical result without dispatching again or
+superseding a later Pause; a new operation UUID with that stale revision refuses.
 
 The actual snapshot includes `service_incarnation`, `controller`, `run`,
 `evidence`, and latest 64 `events`. Run fields include `progress_s`, `deadline`,
@@ -616,7 +633,7 @@ current-user protected DACL, Linux intends directories 0700/files 0600.
 
 ### Verification, corrections and remaining limits
 
-Root independently checked committed `b21cd287` with the exact locked overlay,
+Root independently checked committed `2b10537b` with the exact locked overlay,
 shared `UV_PROJECT_ENVIRONMENT`, `--no-sync`, and candidate `src` plus root:
 
 ```text
@@ -624,12 +641,24 @@ uv run --no-sync python -B -m pytest tests/robots/test_am1_session_api.py tests/
 node --test tests/cameras/test_am1_session_clients.cjs tests/cameras/test_am1_console_ui.cjs tests/cameras/test_am1_console_layout.cjs tests/cameras/test_am1_virtual_bench.cjs
 ```
 
-Python: **255 passed, 1 skipped in 60.81 seconds**, exit 0. Node: **52 passed,
-0 failed or skipped in 28.650 seconds**, exit 0. These are the final corrected
-root counts, not historical/interim 252/49 or implementer subsets. Scoped Ruff
-check/format of eight new Python files, baseline-to-candidate whitespace and
-`uv lock --check --offline` passed; all ten overlay versions matched lock.
-This is focused coverage, not a full repository or endurance run.
+Python: **267 passed, 1 skipped in 62.26 seconds**, exit 0. Node: **54 passed,
+0 failed or skipped in 40.1056224 seconds**, exit 0. These are root's fresh final
+corrected-source counts at `2b10537b`, including the cross-client revision and
+unsupported Z/X checks. Root checked Ruff/format for all eight fake-slice Python
+files and baseline-to-source whitespace; all passed. The single Windows skip is
+[test_am1_unified_session.py](../../tests/robots/test_am1_unified_session.py#L1569):
+POSIX process-group signal semantics; it establishes no Linux qualification.
+Prior offline lock checks passed and all ten overlay versions matched lock;
+all 335 existing package records remain unchanged. This is focused coverage,
+not a full repository or endurance run.
+
+The earlier independently verified `b21cd287` checkpoint remains historical:
+255 Python passed/1 skipped in 60.81 seconds and 52 Node passed in 28.650 seconds.
+Interim 252/49 counts and implementer subsets are not substituted for the fresh
+root evidence above. One later implementer Node attempt had 53 passed and one
+initial interactive Resume timeout before the new Z/X assertions; its isolated
+and covering repeats passed unchanged. That failed attempt is retained without
+an inferred diagnosis.
 
 Coverage includes real crash boundaries and uncertain/no autoplay; lost Start
 reply and same-operation dedup; real independent owner/gateway PIDs and OS lock
@@ -652,19 +681,37 @@ UTF-8 rendering and a blocked close-handshake slot. Bounded abort reclaimed four
 fresh clients while owner progress continued; client 1006 was reported honestly.
 An initial CRLF whitespace failure was corrected in a dedicated LF-only commit.
 
-Both final Important UI races had real assertion failures before correction:
+Both task-level Important UI races had real assertion failures before correction:
 a delayed Connect/release reply let pending Resume override a later accepted
 Pause; a late renewal reply restored lost ownership and empty periodic Claim
 could silently reacquire. Resume now checks protective intent, connection epoch
 and held generation after every await; authoritative ownership loss/change
 invalidates outstanding work. Atomic renew-only Claim prevents reacquisition.
-Final loaded tests observe accepted real replies and actual rendered state,
+Loaded tests observe accepted real replies and actual rendered state,
 including transient authority restoration, rather than substituting mocked core
 results. Task-level scoped re-review passed both fixes.
 
-**Deferred minor discrepancy:** visible fake Z/X controls do not contribute to
-the fake target mapping. They are not qualified fake controls; the source was
-not changed in this documentation task. Legacy physical mappings remain intact.
+The completed whole-branch review then exposed the cross-client boundary:
+A's delayed accepted Connect could override control-capable spectator B's later
+accepted Pause, even after A received the current paused snapshot. Both actual
+two-browser regressions failed by returning the run to running, with B's snapshot
+delivered or temporarily withheld. The correction binds Resume to its initially
+captured authority intent revision. Delivered snapshots cancel before follow-up
+Release/Resume; withheld delivery still produces a real authority refusal, no
+new dispatch and unchanged paused progress. Both cases render paused and then
+accept a fresh deliberate Resume with the current revision. Eleven strict/missing/
+stale revision cases and admitted-before-Pause deduplication also have core
+coverage. Whole-branch documentation specification and quality passed; the
+single Important source correction and evidence refresh are this final wave.
+The remote-only Z/X follow-up is `2b10537b`; it changes no Python authority or legacy bootstrap.
+
+**Minor fake-control correction:** Z/X have no represented fake target axis.
+Their remote fake buttons are disabled and visibly/accessibly labelled
+“Unavailable in fake mode”; Z/X keyboard and pointer input is ignored. The
+loaded interactive UI regression first failed with both unsupported keys held,
+then verifies empty held state, no fake intent and disabled labelled buttons.
+Supported fake W input and the existing handoff path still work. This adds no
+fake axis and preserves every legacy physical mapping/bootstrap.
 
 Windows exercised; Linux Unix socket/flock/permissions execution must be
 separately qualified before stage 2. Browser contexts prove neither real

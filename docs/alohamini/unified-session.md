@@ -7,8 +7,11 @@ Roaming Aggressiveness experiment and administrator question. Do not execute
 that adapter transaction or request its elevation. The current deliverable is
 the [owner-approved consolidated persistent-session architecture](roaming-resilient-sessions.md),
 with stage 1 implemented and task-reviewed on the fake-only follow-up branch.
-Windows focused checks passed; final whole-branch review/publication and Linux
-qualification remain pending. Stage 2 Pi owner/extracted finite profile is next;
+Whole-branch review completed; its cross-client Pause ordering finding was
+corrected with an atomic Resume intent revision fence and real two-browser
+coverage. Fresh Windows focused evidence is recorded in the consolidated
+architecture; the stacked follow-up remains a fake-only draft checkpoint. Linux
+qualification remains pending. Stage 2 Pi owner/extracted finite profile is next;
 no powered independence claim precedes stage 3 observer proof. Reliability
 milestones below remain open; preserve their repairs, evidence and separate
 private deployment pins.
