@@ -99,6 +99,15 @@ test("late REST claim cannot restore authority after reconnect and interactive U
     await pa.locator("#fake-recipe").selectOption("fake-interactive");
     await pa.locator('[data-operation="Start"]').click();await pa.waitForFunction(()=>am1Remote.snapshot?.run?.status==="paused");
     await pa.locator('[data-operation="Resume"]').click();await pa.waitForFunction(()=>am1Remote.snapshot.run.status==="running"&&am1Remote.connection);
+    await pa.keyboard.down("z");await pa.keyboard.down("x");await pa.waitForTimeout(150);
+    assert.deepEqual(await pa.evaluate(()=>[...am1Remote.held]),[],"unsupported fake Z/X must not hold or send zero targets");
+    assert.equal(await pa.evaluate(()=>am1Remote.snapshot.run.intent),null);
+    await pa.keyboard.up("z");await pa.keyboard.up("x");
+    for(const key of ["z","x"]) {
+      assert.equal(await pa.locator(`[data-body-key="${key}"]`).isDisabled(),true,"unsupported fake button must be disabled");
+      assert.match(await pa.locator(`[data-body-key="${key}"]`).innerText(),/Unavailable.*fake/i);
+      assert.match(await pa.locator(`[data-body-key="${key}"]`).getAttribute("aria-label"),/unavailable.*fake/i);
+    }
     await pa.keyboard.down("w");await pa.waitForFunction(()=>am1Remote.snapshot.run.intent?.[0]===1);
     await pa.evaluate(()=>dispatchEvent(new Event("blur")));
     await pa.waitForFunction(()=>am1Remote.snapshot.run.intent===null);

@@ -158,6 +158,11 @@ globalThis.AM1RemoteInitialize=function() {
   for(const button of document.querySelectorAll("[data-operation], [data-body-key]")) {
     button.removeAttribute("data-tip");button.title="Fake session control";
     if(button.dataset.operation)button.setAttribute("aria-label",`${button.dataset.operation} fake session`);
+    if(button.dataset.bodyKey==="z" || button.dataset.bodyKey==="x") {
+      button.disabled=true;button.title="Unavailable in fake mode";
+      button.setAttribute("aria-label",`${button.dataset.bodyKey.toUpperCase()} unavailable in fake mode`);
+      button.querySelector("span").textContent="Unavailable in fake mode";
+    }
   }
   const transport=globalThis.am1Remote=new AM1SessionTransport(render);
   const act=async fn=>{try{await fn();}catch(error){render(transport,error.message);}};
@@ -171,9 +176,10 @@ globalThis.AM1RemoteInitialize=function() {
     else if(op==="Handoff")act(async()=> {await transport.releaseInput();const result=await transport.post("handoff",{operation_id:crypto.randomUUID(),target_device_id:document.querySelector("#handoff-device").value});transport.clear("handoff");render(transport,result.reason);});
   });
   const typing=target=>target?.closest("input,textarea,select,[contenteditable]");
-  document.addEventListener("keydown",event=> {if(typing(event.target)||event.repeat)return;const key=event.key.toLowerCase();if("wasdujzx".includes(key)&&transport.connection){transport.held.add(key);event.preventDefault();}});
-  document.addEventListener("keyup",event=> {transport.held.delete(event.key.toLowerCase());if(!transport.held.size)transport.releaseInput();});
+  document.addEventListener("keydown",event=> {if(typing(event.target)||event.repeat)return;const key=event.key.toLowerCase();if("wasduj".includes(key)&&transport.connection){transport.held.add(key);event.preventDefault();}});
+  document.addEventListener("keyup",event=> {const key=event.key.toLowerCase();if(!"wasduj".includes(key))return;transport.held.delete(key);if(!transport.held.size)transport.releaseInput();});
   for(const button of document.querySelectorAll("[data-body-key]")) {
+    if(button.disabled)continue;
     button.addEventListener("pointerdown",event=>{if(transport.connection){button.setPointerCapture(event.pointerId);transport.held.add(button.dataset.bodyKey);}});
     for(const name of ["pointerup","pointercancel","lostpointercapture"])button.addEventListener(name,()=>{transport.held.delete(button.dataset.bodyKey);if(!transport.held.size)transport.releaseInput();});
   }
