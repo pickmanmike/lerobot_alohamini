@@ -1,15 +1,17 @@
 # AM1 roaming-resilient sessions
 
-**AM1-SESSION-ARCHITECTURE-01 · 2026-10-09 · design for owner review.**
+**AM1-SESSION-ARCHITECTURE-01 · 2026-10-09 · owner-approved design; stage 1 implemented, fake-only.**
 Choose a Pi-owned session authority and finite executor, an authenticated LAN
 HTTPS/WebSocket gateway, and independently supervised P1 observation. Reuse the
 existing UI and protected motor backend. SSH remains administrative access.
 
-This publication authorizes no architecture implementation or deployment.
+The owner approved this design and the exact stage-1 fake-only implementation.
+Stage 1 is implemented on `codex/am1-persistent-session-fake`; final whole-branch
+review/publication remains pending. This does not qualify or deploy stages 2–4.
 The owner replaced the proposed connection-continuity handoff and canceled the
 Wi-Fi Roaming Aggressiveness experiment and its administrator question. Do not
-resume that transaction. No motor/camera owner, adapter, firewall, listener or
-private configuration was changed for this design.
+resume that transaction. No deployed motor/camera owner, adapter, firewall, listener or private
+configuration was changed; stage 1 uses dedicated loopback development listeners.
 
 ## Verified baseline and remaining acceptance
 
@@ -99,9 +101,11 @@ withdraws coverage rather than publishing a fresh heartbeat as observation.
 The smallest service stack is **aiohttp + Python stdlib** (`asyncio`, `ssl`,
 `sqlite3`, bounded queues), alongside existing Pillow and pyzmq.
 [aiohttp supports HTTP and WebSocket](https://docs.aiohttp.org/en/stable/web_quickstart.html);
-it is locked at 3.14.1 but is neither a declared AM1 dependency nor installed in
-the inspected shared environment. Add a scoped `am1-session` extra and resolved
-lock delta in implementation; do not rely on optional transitive installation.
+the approved design baseline had it locked at 3.14.1 but undeclared for AM1
+and absent from the shared environment. Stage 1 now declares the scoped
+`am1-session` extra, preserving all 335 locked package versions. The developer
+setup below uses a dedicated temporary HTTP overlay without synchronizing the
+shared environment; do not rely on optional transitive installation.
 FastAPI/Uvicorn and a separate WebSocket library are unnecessary. No ROS, MQTT,
 cloud control plane, Kubernetes, GPU stack or new general autonomy framework.
 
@@ -171,7 +175,9 @@ sequenceDiagram
 
 ## Proposed message and storage contract
 
-Names are proposals. Use allowlisted recipe IDs rather than executable commands,
+This section preserves the approved target proposal. Stage 1 uses the actual
+routes and fields documented below, rather than these illustrative names.
+Use allowlisted recipe IDs rather than executable commands,
 arbitrary file paths, scripts or unreviewed control parameters.
 
 | Operation | Minimal contract |
@@ -405,11 +411,11 @@ promises. Existing motor repairs are retained work, not a rewrite allowance.
 
 ## Exact first-slice implementation brief
 
-Approval requested is for **stage 1 only, fake hardware**, on the stacked
+The owner approved **stage 1 only, fake hardware**, on the stacked
 follow-up branch. No motor/camera access, Pi/P1 install, listener/firewall change,
 adapter elevation or runtime architecture deployment is included.
 
-| Proposed file | Responsibility |
+| Approved file seam | Responsibility |
 | --- | --- |
 | `examples/alohamini/am1_session_contract.py` | Hardware-free immutable identity/spec/evidence/result schemas; allowlisted finite/interactive test recipes |
 | `tools/am1_session_core.py` | Resident authority actor; atomic claim/intent revision, operation deduplication, SQLite minimal store, common OS ownership lock and reconciliation state |
@@ -458,22 +464,237 @@ stage 2. Actual phone codec, certificate trust, mDNS and roam evidence belongs
 to later device acceptance. Deterministic fake interruption needs no WLAN
 sabotage or powered-process termination.
 
+## Implemented stage 1: Windows fake-only persistent session
+
+The committed implementation through `b21cd2878415ebb21bd160a93436ce345307b78f`
+has clean task-level reviews, including scoped re-review of both transport races.
+This is fake execution and synthetic proof, not captured pixels or physical
+movement. The existing motor, calibration, mapping, feedback, current, thermal,
+status, permissions and separate deployment pins above are unchanged. PR #16
+remains open/draft at documentation checkpoint `b4a1b6ed`, dependent base
+`integrate/am1-local-teleop` remains `9aa6d3b0`, and main remains `ab4462b7`.
+The implementation follow-up depends on PR #16; no merge, retarget or whole
+checkpoint deployment has occurred.
+
+### Actual authority and transport contract
+
+[SessionAuthority](../../tools/am1_session_core.py) owns SQLite operation/run
+history, first cause, immutable deadlines, recovery and the real OS-backed
+`owner.lock`. [FakeExecutor](../../tools/am1_fake_executor.py) imports no hardware.
+[OwnerServer](../../tools/am1_session_ipc.py) owns a 50 ms tick thread, independent
+of gateway reads or subscribers. Snapshot calls do not drive progression.
+The [gateway](../../tools/am1_session_service.py) is a separate aiohttp process;
+[session_transport.js](../../tools/am1_console_ui/session_transport.js) reuses
+console assets through the narrow remote bootstrap in `app.js`. The gateway
+renders remote HTML and omits independent camera assets; legacy bootstrap and
+manual-use guidance remain available.
+
+The immutable [recipe registry](../../examples/alohamini/am1_session_contract.py)
+contains only `fake-finite` (352 trajectory seconds / 420 Live seconds),
+`fake-finite-short` (1 / 12 seconds), and `fake-interactive` (420 Live seconds),
+with seed 17. Arbitrary scripts, paths, hardware parameters and extra Start
+parameters refuse. `SessionAuthority.handle(command, device_id)` takes an
+adapter-authenticated identity; a supplied command `device_id` is rejected.
+
+Actual identities are UUID `operation_id`, `run_id`, `service_incarnation`,
+`controller_generation` and private `connection_generation`, not the earlier
+illustrative `service_generation`/`recipe_id`. Commands use `op`; Start uses
+`recipe`. Operation identity deduplicates durable requests and cannot cross
+command classes. Acceptance is distinct from `effect_admitted`; persistence
+before dispatch cannot guarantee exactly-once physical effects. Interrupted
+or unacknowledged work becomes interrupted/uncertain on owner restart, with a
+new incarnation and no autoplay. Reconcile and a new deliberate Start are
+required; retrying historical operations never dispatches again.
+
+| Actual endpoint | Contract |
+| --- | --- |
+| `GET /`, `/assets/{app.js,session_transport.js,style.css}` | Fake console and allowlisted assets only |
+| `POST /api/enroll` | `{code}` with exact Origin; one-use local pairing sets Secure HttpOnly SameSiteStrict `__Host-am1-device` cookie; returns device identity, CSRF and control capability, no credential |
+| `GET /api/session`, `/api/state` | Authenticated session metadata / `{snapshot}` |
+| `POST /api/attach`, `GET /api/ws` | Attach returns `{snapshot,revision,ticket}`; WSS uses cookie/Origin and first text `{ticket}`, then server snapshot and client `{ack:revision}` before input; no ticket in URL |
+| `POST /api/{claim,start,lookup,release,handoff,pause,resume,stop,reconcile,connect,release_input,grant,input}` | Route supplies `op`; body uses core schema and trusted gateway identity. Interactive connect/release_input/resume/grant/input require acknowledged WSS and refuse REST invocation |
+| `POST /api/revoke` | Revoke the authenticated device; local CLI can revoke another enrolled device |
+
+WSS commands are `{id,command}` with bounded correlation ID; replies are
+`{kind:"result",id,...result}`, plus coalesced snapshots or `unavailable`.
+Viewer attach never calls core `connect` or claims control. Enrolled devices
+have separate view/control capabilities; an input spectator with control
+capability can still Pause/Stop. Handoff requires an enrolled control-capable
+target. Revocation fences cookies, tickets, WSS and controller presence,
+including a locally revoked controller with no WSS connection.
+
+`claim` **without** a `controller_generation` key is explicit acquisition.
+`claim` **with** that key is atomic renew-only: it requires an alive same-device
+matching generation under the authority mutex. Expired, absent, old, malformed
+or foreign generation refuses and can never acquire a new lease. The UI renewal
+timer supplies its captured generation. Presence lasts 1.5 seconds; private
+input grants last at most 250 ms from issuance, with increasing `seq` and finite
+normalized `target` values. Reconnect clears targets, requires snapshot ack,
+explicit connect, fresh empty release, alignment/current evidence and Resume.
+Interactive Start begins paused/held. Finite authorization remains separate
+from controller/viewer presence and keeps the original run/seed/deadline.
+
+The actual snapshot includes `service_incarnation`, `controller`, `run`,
+`evidence`, and latest 64 `events`. Run fields include `progress_s`, `deadline`,
+`remaining_s`, `trajectory_remaining_s`, `intent_revision`, `recovery`,
+`recovery_episodes`, `first_cause`, `uncertain`, `dispatch` and `cleanup`.
+Connection generations/grants stay in private controller replies. Feedback
+freshness is 250 ms and required synthetic observation freshness 500 ms;
+optional quality grants no authority. Terminal fake cleanup is `held_body_zero`.
+
+**Recovery ruling:** a distinct qualified-and-acknowledged completed recovery
+closes its episode. Later distinct loss may get its own 10-second ceiling,
+within max three total episodes and the unchanged original Live deadline.
+An unfinished episode never renews its ceiling. Manual qualified Resume closes
+its prior episode; explicit Pause/Stop/ownership changes fence recovery, and
+Stop retains an already-present first fault. Cost if this ruling proves wrong:
+revise fake recovery behavior and tests; no physical deployment is affected.
+
+Private bytes-only IPC has separate authenticated normal/protective lanes,
+4-byte framing, strict JSON, 4 KiB requests / 64 KiB replies and 1-second partial
+I/O deadlines. Windows uses authenticated loopback sockets; Linux Unix sockets
+and flock remain unexecuted. HTTP admits 16 normal / 4 protective requests,
+8 / 2 IPC calls and per-device 40 / 10 requests per second. WSS admits four total
+pending/verified clients, 64 KiB queued plus in-flight output, latest snapshot,
+6 normal / 2 protective commands per peer and one in-flight / one latest pending
+input. Pause/Stop use the reserved lane even during a delayed input reply.
+Slow nonreaders are disconnected with best-effort 1013 then bounded transport
+abort; a congested client may observe 1006. No logs/download/media endpoint or
+blocked subscriber participates in owner cadence.
+
+### Reproducible focused developer setup
+
+Use the existing shared environment and a **fresh dedicated temporary** HTTP
+dependency overlay. Run from the candidate checkout; `$candidate` below is that
+checkout's absolute path and `$sharedEnvironment` is the existing environment.
+These are dedicated fake processes, not OS services. The sole new optional extra
+is `am1-session = ["aiohttp==3.14.1"]`; all 335 existing package versions remain
+unchanged. The initial overlay accidentally used four newer transitives
+(idna, multidict, propcache, yarl); final checks used these ten exact lock pins.
+The session's ignored scratch directory is not required:
+
+```powershell
+$candidate = (Get-Location).Path
+$sharedEnvironment = 'C:\Users\pickm\lerobot_alohamini_client\.venv'
+$httpOverlay = Join-Path ([IO.Path]::GetTempPath()) ('am1-http-' + [guid]::NewGuid())
+uv pip install --python "$sharedEnvironment\Scripts\python.exe" --no-deps --target $httpOverlay aiohttp==3.14.1 aiohappyeyeballs==2.7.1 aiosignal==1.4.0 attrs==26.1.0 frozenlist==1.8.0 idna==3.18 multidict==6.7.1 propcache==0.5.2 yarl==1.24.2 typing-extensions==4.16.0
+if ($LASTEXITCODE -ne 0) { throw 'Locked HTTP overlay failed' }
+$env:UV_PROJECT_ENVIRONMENT = $sharedEnvironment
+$env:PYTHONPATH = "$httpOverlay;$candidate\src;$candidate"
+$env:AM1_TEST_PYTHON = "$sharedEnvironment\Scripts\python.exe"
+```
+
+Use the existing bundled Node runtime and its dependency directory as
+`NODE_PATH` for Playwright; final checks used
+`C:/Users/pickm/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules`
+and headless msedge. No broad reinstall, upgrade or shared-environment sync is
+needed. Python integration clients verify a generated test CA through normal
+`ssl.create_default_context(cafile=...)`. Browser `ignoreHTTPSErrors` is confined
+to dedicated test contexts; the service has no production TLS bypass.
+
+From separate terminals with that Python environment, substitute newly created
+dedicated private fake state directories and configured certificate/key paths:
+
+```text
+uv run --no-sync python -B -m tools.am1_session_ipc owner --state <NEW-FAKE-OWNER-DIR>
+uv run --no-sync python -B -m tools.am1_session_service gateway --owner-state <OWNER-DIR> --auth-state <NEW-FAKE-AUTH-DIR> --cert <CERT.pem> --key <PRIVATE-KEY.pem> --ready-file <PRIVATE-READY.json>
+uv run --no-sync python -B -m tools.am1_session_service pair --auth-state <AUTH-DIR> --control
+uv run --no-sync python -B -m tools.am1_session_service revoke --auth-state <AUTH-DIR> --device-id <DEVICE-UUID>
+```
+
+Loopback TLS only (127.0.0.1, ephemeral port by default); configured cert/key,
+TLS 1.2 minimum, exact Host/Origin/CSRF, no HTTP fallback, OS trust installation,
+firewall change or network listener deployment. Ready JSON contains URL/PID
+only. Pair writes a 60-second one-use code to private `pairing.json`; enter it
+in the HTTPS console, explicitly Claim, select Fake recipe and Start. Omit
+`--control` for a view-only enrollment. Interactive Resume performs explicit
+connect/fresh release/qualification. No credential, attach ticket or IPC secret
+belongs in argv, URLs or logs. State paths must be fresh/empty or correctly
+marked dedicated fake namespaces, never an existing AM1 configuration, shared
+folder or repository. Linked/junction paths refuse; Windows uses an exact
+current-user protected DACL, Linux intends directories 0700/files 0600.
+
+### Verification, corrections and remaining limits
+
+Root independently checked committed `b21cd287` with the exact locked overlay,
+shared `UV_PROJECT_ENVIRONMENT`, `--no-sync`, and candidate `src` plus root:
+
+```text
+uv run --no-sync python -B -m pytest tests/robots/test_am1_session_api.py tests/robots/test_am1_persistent_session.py tests/robots/test_am1_unified_session.py tests/robots/test_am1_console_pause_race.py tests/robots/test_am1_virtual_bench.py tests/robots/test_am1_arm_hold_body.py -q
+node --test tests/cameras/test_am1_session_clients.cjs tests/cameras/test_am1_console_ui.cjs tests/cameras/test_am1_console_layout.cjs tests/cameras/test_am1_virtual_bench.cjs
+```
+
+Python: **255 passed, 1 skipped in 60.81 seconds**, exit 0. Node: **52 passed,
+0 failed or skipped in 28.650 seconds**, exit 0. These are the final corrected
+root counts, not historical/interim 252/49 or implementer subsets. Scoped Ruff
+check/format of eight new Python files, baseline-to-candidate whitespace and
+`uv lock --check --offline` passed; all ten overlay versions matched lock.
+This is focused coverage, not a full repository or endurance run.
+
+Coverage includes real crash boundaries and uncertain/no autoplay; lost Start
+reply and same-operation dedup; real independent owner/gateway PIDs and OS lock
+contention; two separately enrolled browser contexts with distinct cookies and
+actual Enrollment/Claim/Start/Pause/Stop/Handoff/Resume UI actions; finite viewer
+loss/reload/gateway replacement preserving one run, seed, progress and deadline;
+interactive grant expiry, blur, reconnect and handoff without replay; required
+versus optional synthetic proof; explicit Pause/Stop and first-fault retention;
+strict JSON/IPC/output bounds and real TCP/TLS nonreader slot reclamation.
+
+Demonstrated failures were retained and corrected: initial candidate imports
+accidentally resolved an older editable checkout (fixed explicit import paths);
+initial timing-sensitive AF_PIPE failure passed isolated repeat; four newer
+HTTP transitives required the exact locked overlay. Core review exposed stale
+grant reuse, progression before protective intent, dispatch without fresh proof,
+false deadline completion, first-fault loss and unclosed manual recovery. Gateway
+checks exposed client-slot double counting, Windows explicit DACL/linked-state
+acceptance, exponent overflow, local revoke fencing, lost-reply false refusal,
+UTF-8 rendering and a blocked close-handshake slot. Bounded abort reclaimed four
+fresh clients while owner progress continued; client 1006 was reported honestly.
+An initial CRLF whitespace failure was corrected in a dedicated LF-only commit.
+
+Both final Important UI races had real assertion failures before correction:
+a delayed Connect/release reply let pending Resume override a later accepted
+Pause; a late renewal reply restored lost ownership and empty periodic Claim
+could silently reacquire. Resume now checks protective intent, connection epoch
+and held generation after every await; authoritative ownership loss/change
+invalidates outstanding work. Atomic renew-only Claim prevents reacquisition.
+Final loaded tests observe accepted real replies and actual rendered state,
+including transient authority restoration, rather than substituting mocked core
+results. Task-level scoped re-review passed both fixes.
+
+**Deferred minor discrepancy:** visible fake Z/X controls do not contribute to
+the fake target mapping. They are not qualified fake controls; the source was
+not changed in this documentation task. Legacy physical mappings remain intact.
+
+Windows exercised; Linux Unix socket/flock/permissions execution must be
+separately qualified before stage 2. Browser contexts prove neither real
+phone/AP roaming nor device certificate trust, mobile codecs or required camera
+pixels. Stages 2–4, the full original four-cycle 352/420 workload, comparable
+normal-rest restart and 12-second ArmHoldBody remain pending. The single next
+stage is reviewed stage 2: Pi owner/extracted finite profile over the existing
+protected backend. No powered independence claim precedes stage 3 observer proof.
+Rollback stops only dedicated fake processes and removes generated fake state,
+certificates and temporary overlay when no longer needed; legacy deployment is
+untouched. Keep the managed worktree and historical logs.
+
 ## Publication review and decision
 
-This is a documentation-only checkpoint. One independent focused read-only
-review inspected the actual document against the full architecture packet and
+The original design checkpoint `b4a1b6ed061e75a72b965ff684692dd066b1e20f`
+was documentation-only, distinct from runtime baseline `6e50fd6b`. One
+independent focused read-only review inspected the actual document against the full architecture packet and
 found no actionable material gaps in lifetime, ownership, duplicate effects,
 observation validity, security, portability or scope. Source audits covered
 lifecycle, finite input/observation and media/access feasibility. Documentation
 checks passed for local links/source anchors, private-data exclusion, balanced
 diagram fences and diff whitespace. No runtime tests or device actions were
-performed for this design; historical test results are not new test passes.
+performed for that original design checkpoint; stage-1 focused results are
+reported separately above. Historical test results are not new test passes.
 
 Rollback of this publication is an ordinary documentation revert. Later code
 rollback is component-specific, with original pins/private permissions retained,
 verified stopped affected owners and one enabled motion path. No automatic
 switch to a second serial owner.
 
-**Owner decision:** approve this consolidated design and authorize the exact
-stage-1 fake-only implementation brief on the stacked follow-up branch.
+**Owner decision (approved):** consolidated design and exact stage-1 fake-only
+implementation brief on the stacked follow-up branch.
 Deployment and subsequent hardware stages remain separately reviewable.

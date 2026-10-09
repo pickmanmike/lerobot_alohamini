@@ -5,10 +5,13 @@
 The owner replaced the proposed connection-continuity handoff and canceled the
 Roaming Aggressiveness experiment and administrator question. Do not execute
 that adapter transaction or request its elevation. The current deliverable is
-the [consolidated persistent-session design](../../alohamini/roaming-resilient-sessions.md),
-source inspection, migration and fake-only slice brief for review before
-implementation. Reliability milestones below remain open; preserve their
-repairs, evidence and separate private deployment pins.
+the [owner-approved consolidated persistent-session architecture](../../alohamini/roaming-resilient-sessions.md),
+with stage 1 implemented and task-reviewed on the fake-only follow-up branch.
+Windows focused checks passed; final whole-branch review/publication and Linux
+qualification remain pending. Stage 2 Pi owner/extracted finite profile is next;
+no powered independence claim precedes stage 3 observer proof. Reliability
+milestones below remain open; preserve their repairs, evidence and separate
+private deployment pins.
 
 > Execute this short plan in the existing PR #16 worktree using the debugging, TDD, execution and verification workflows. The supplied packet authorizes proceeding through repair, bounded execution and publication without another design or attendance gate.
 
