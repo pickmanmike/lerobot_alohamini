@@ -1,5 +1,15 @@
 # AM1 supervised unified Local session
 
+## Current direction: AM1-SESSION-ARCHITECTURE-01
+
+The owner replaced the proposed connection-continuity handoff and canceled the
+Roaming Aggressiveness experiment and administrator question. Do not execute
+that adapter transaction or request its elevation. The current deliverable is
+the [consolidated persistent-session design](roaming-resilient-sessions.md),
+source inspection, migration and fake-only slice brief for review before
+implementation. Reliability milestones below remain open; preserve their
+repairs, evidence and separate private deployment pins.
+
 ## AM1-RELIABILITY-03 — current virtual reliability workstream
 
 For a finite live-payload comparison, `--delivery-jpeg-quality-percent 15` reduces

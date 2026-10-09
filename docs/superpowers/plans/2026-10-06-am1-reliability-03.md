@@ -1,5 +1,15 @@
 # AM1 virtual continuity and useful motion implementation plan
 
+## Current direction: AM1-SESSION-ARCHITECTURE-01
+
+The owner replaced the proposed connection-continuity handoff and canceled the
+Roaming Aggressiveness experiment and administrator question. Do not execute
+that adapter transaction or request its elevation. The current deliverable is
+the [consolidated persistent-session design](../../alohamini/roaming-resilient-sessions.md),
+source inspection, migration and fake-only slice brief for review before
+implementation. Reliability milestones below remain open; preserve their
+repairs, evidence and separate private deployment pins.
+
 > Execute this short plan in the existing PR #16 worktree using the debugging, TDD, execution and verification workflows. The supplied packet authorizes proceeding through repair, bounded execution and publication without another design or attendance gate.
 
 **Goal:** Complete useful four-cycle virtual operation with honest current observation, bounded qualified recovery and measured motion.
