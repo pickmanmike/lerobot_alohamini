@@ -65,7 +65,7 @@ Interfaces: fresh per-run owned UUID and immutable finite source budget (maximum
 - [ ] Small bounded ordinary profile/actual response, then 88-second ArmSmoke with arms-only zero body/lift, real return/cleanup.
 - [ ] Full four-cycle 352/420 workload, brief browser detach/reattach and launch-SSH-independent lifetime; natural recoveries only.
 - [ ] Ordinary finish/natural rest, one comparable automatic full run, conditional original twelve-second ArmHoldBody W/A/U/J press/release with separately declared body gains.
-- [ ] Preserve first failed layer and repair before another supported attempt; publish actual results, dependent draft PR, private evidence indices, authenticated use path and component-specific rollback.
+- [x] Preserve and analyze the first failed layer before another attempt; publish available actual results, the precise native startup obstruction, dependent draft PR, private evidence indices, authenticated use path and component-specific rollback. No supported software omission was found and no unchanged retry occurred.
 
 ## Verification checkpoint
 
@@ -92,3 +92,5 @@ normal-rest repeat and conditional body operation are **uncompleted**, blocked a
 the precisely recorded native lift layer. See the
 [operating report](../../alohamini/protected-physical-sessions.md) for publication,
 verification, actual evidence distinctions and component-specific rollback.
+Publication: [draft PR #20](https://github.com/pickmanmike/lerobot_alohamini/pull/20)
+depends on accepted #19; the full physical milestone remains uncompleted.

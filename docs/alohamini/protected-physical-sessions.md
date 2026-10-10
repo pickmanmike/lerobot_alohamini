@@ -7,6 +7,9 @@ The first actual physical startup failed the existing lift post-home stationary
 qualification **before native Live or arm trajectory admission**. Physical
 reliability is incomplete. Simulation remains the default.
 
+Published for review in [draft PR #20](https://github.com/pickmanmike/lerobot_alohamini/pull/20),
+explicitly dependent on accepted PR #19.
+
 ## Actual operating result
 
 | Requested milestone | Actual result |
