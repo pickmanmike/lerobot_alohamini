@@ -790,3 +790,199 @@ def test_bounded_body_and_request_evidence_cannot_promote_client_default_zero():
         assert e.sample["body_feedback"]["x.vel"] == 0.1
     finally:
         e.close()
+
+
+class BodyTranslationHost(ControlledHost):
+    """Real client/host/lift translation, with an inert recording bus only."""
+
+    def __init__(self, clock, *, height=12.3, homed=True, explicit_zero=False, preparing=False):
+        super().__init__()
+        from lerobot.robots.alohamini.alohamini import AlohaMini
+        from lerobot.robots.alohamini.alohamini_client import AlohaMiniClient
+        from lerobot.robots.alohamini.config_alohamini import AlohaMiniClientConfig
+        from lerobot.robots.alohamini.lift_axis import LiftAxis, LiftAxisConfig
+
+        class RecordingBus:
+            is_connected = True
+            motors = {"lift_axis": object()}
+
+            def __init__(self):
+                self.rows = []
+
+            def write(self, register, motor, value, **kwargs):
+                self.rows.append((register, motor, value))
+
+            def sync_write(self, register, values, **kwargs):
+                self.rows.append((register, "base", dict(values)))
+
+        self.clock, self.preparing = clock, preparing
+        self.explicit_zero, self.height = explicit_zero, height
+        self.records, self.body_requests = [], []
+        self.bus = RecordingBus()
+        self.axis = LiftAxis(LiftAxisConfig(), self.bus, None)
+        self.axis.is_homed = homed
+        self.client = object.__new__(AlohaMiniClient)
+        self.client.teleop_keys = AlohaMiniClientConfig(remote_ip="127.0.0.1", cameras={}).teleop_keys
+        self.client.last_remote_state = {"lift_axis.height_mm": height}
+        self.client.speed_levels, self.client.speed_index = [{"xy": 0.15, "theta": 45}], 0
+        self.robot = object.__new__(AlohaMini)
+        self.robot.config = SimpleNamespace(robot_model="alohamini1", max_relative_target=20.0)
+        self.robot.cameras, self.robot.left_bus, self.robot.right_bus = {}, self.bus, None
+        self.robot.base_motors = []
+        self.robot.wheel_radius, self.robot.base_radius = 0.05, 0.15
+        self.robot.lift, self.robot.logs = self.axis, {}
+        self.robot._lift_operation = SimpleNamespace(
+            apply_action=lambda action: self.axis.apply_action(action, height_mm=height)
+        )
+        # Arm acquisition is ControlledHost's measured fixture; no arm devices exist.
+        self.robot.hold_follower_arms = lambda: None
+        self.robot._limit_gripper_goal_by_current = lambda _bus, goals: goals
+        self.robot._limit_joint_goal_by_current = lambda _bus, goals: goals
+        self.robot._encode_am1_arm_goals = lambda _bus, goals, _raw: (goals, None)
+
+    def start(self, run_id, incarnation, recipe, cancel):
+        from lerobot.robots.alohamini.alohamini_host import AM1LocalControl
+
+        super().start(run_id, incarnation, recipe, cancel)
+        self.control = AM1LocalControl(run_id=run_id, host_incarnation=incarnation)
+
+    def poll(self, previous):
+        self.clock.advance(0.1)
+        sample = super().poll(previous)
+        sample["at"] = self.clock()
+        if self.preparing:
+            sample["positions"]["arm_left_shoulder_lift.pos"] = 110.0
+        return sample
+
+    def body_action(self, elapsed):
+        body = module().body_recipe_action(self.client, elapsed)
+        if self.explicit_zero:
+            body["lift_axis.vel"] = 0
+        self.body_requests.append((elapsed, dict(body)))
+        return body
+
+    def send(self, action):
+        before = len(self.bus.rows)
+        assert self.control.apply(self.robot, action)
+        writes = self.bus.rows[before:]
+        lift = [value for register, motor, value in writes if motor == "lift_axis"]
+        self.records.append(
+            {"action": dict(action), "lift_writes": lift, "accepted": self.control.accepted_action}
+        )
+        super().send(action)
+
+    def finish(self, status):
+        self.robot.stop_motion()
+        return super().finish(status)
+
+
+def body_translation_executor(**kwargs):
+    from examples.alohamini.am1_session_contract import RECIPES
+    from tests.robots.test_am1_persistent_session import Clock
+
+    clock = Clock()
+    host = BodyTranslationHost(clock, **kwargs)
+    e = module().PhysicalExecutor(
+        {"shoulder_amplitude": 1.5, "source_pins": {}},
+        observation(),
+        clock=clock,
+        io_factory=lambda *_: host,
+    )
+    recipe = RECIPES["physical-arm-hold-body"]
+    e.bind_run("10000000-0000-4000-8000-000000000001", recipe)
+    assert e.begin(recipe)
+    until(lambda: e.evidence()["lifecycle"]["phase"] == "live")
+    until(lambda: e.dispatch(recipe))
+    return host, e
+
+
+def test_worker_body_height_pulses_reach_original_lift_and_release_zero():
+    host, e = body_translation_executor()
+    try:
+        until(lambda: e.advance(host.clock(), 0)["progress_s"] >= 4.4, timeout=4)
+        up = [r for r in host.records if r["action"].get("lift_axis.height_mm") == host.height + 50]
+        down = [r for r in host.records if r["action"].get("lift_axis.height_mm") == host.height - 50]
+        assert up and down
+        assert all(r["lift_writes"][-1] == -1300 for r in up)
+        assert all(r["lift_writes"][-1] == 1300 for r in down)
+        assert all("lift_axis.vel" not in r["action"] for r in up + down)
+        assert any(r["accepted"].get("x.vel") == 0.15 for r in host.records if r["accepted"])
+        assert any(r["accepted"].get("theta.vel") == 45 for r in host.records if r["accepted"])
+        released = [r for r in host.records if r["action"].get("lift_axis.height_mm") == host.height]
+        assert released and all(r["lift_writes"][-1] == 0 for r in released)
+        assert all(r["action"]["lift_axis.vel"] == 0 for r in released)
+    finally:
+        e.close()
+        e.worker.join(2)
+
+
+def test_worker_explicit_velocity_zero_still_overrides_height_request():
+    host, e = body_translation_executor(explicit_zero=True)
+    try:
+        until(lambda: any(r["action"].get("lift_axis.height_mm") == host.height + 50 for r in host.records))
+        up = [r for r in host.records if r["action"].get("lift_axis.height_mm") == host.height + 50]
+        assert up and all(r["action"]["lift_axis.vel"] == 0 for r in up)
+        assert all(r["lift_writes"] == [-1300, 0] for r in up)
+    finally:
+        e.close()
+        e.worker.join(2)
+
+
+@pytest.mark.parametrize(
+    "options,target_delta",
+    [({"height": 5.0}, -50), ({"height": 600.0}, 50), ({"homed": False}, 50)],
+)
+def test_worker_height_translation_retains_lift_floor_soft_max_and_home_guards(options, target_delta):
+    host, e = body_translation_executor(**options)
+    try:
+        until(
+            lambda: any(
+                r["action"].get("lift_axis.height_mm") == host.height + target_delta for r in host.records
+            )
+        )
+        pulse = [
+            r for r in host.records if r["action"].get("lift_axis.height_mm") == host.height + target_delta
+        ]
+        assert pulse and all(r["lift_writes"][-1] == 0 for r in pulse)
+    finally:
+        e.close()
+        e.worker.join(2)
+
+
+@pytest.mark.parametrize("interruption", ["hold", "pause", "stop", "input_loss"])
+def test_worker_body_pulse_interruption_returns_actual_zero(interruption):
+    host, e = body_translation_executor()
+    try:
+        until(lambda: any(r["lift_writes"] and r["lift_writes"][-1] == -1300 for r in host.records))
+        if interruption == "stop":
+            e.finish("stopped")
+            until(lambda: e.evidence()["lifecycle"]["phase"] == "terminal")
+        else:
+            if interruption == "input_loss":
+                e.observation.qualified = False
+            else:
+                if interruption == "pause":
+                    e.set_intent_revision(1)
+                e.hold()
+            until(lambda: e.evidence()["hold_acknowledged"])
+            assert all(host.records[-1]["action"][k] == 0 for k in module().ZERO_BODY)
+            assert "lift_axis.height_mm" not in host.records[-1]["action"]
+        assert [v for _, motor, v in host.bus.rows if motor == "lift_axis"][-1] == 0
+        assert e.evidence()["fault"] is None
+    finally:
+        e.close()
+        e.worker.join(2)
+
+
+def test_worker_body_preparation_never_calls_or_applies_height_recipe():
+    host, e = body_translation_executor(preparing=True)
+    try:
+        until(lambda: e.advance(host.clock(), 0)["preparation_s"] >= 1)
+        assert e.advance(host.clock(), 0)["preparing"]
+        assert host.body_requests == []
+        assert all(all(r["action"][k] == 0 for k in module().ZERO_BODY) for r in host.records)
+        assert all("lift_axis.height_mm" not in r["action"] for r in host.records)
+        assert all(v == 0 for _, motor, v in host.bus.rows if motor == "lift_axis")
+    finally:
+        e.close()
+        e.worker.join(2)

@@ -539,7 +539,11 @@ class PhysicalExecutor:
                             and self._dispatch_ack
                             and not getattr(self.task.provider, "preparing", False)
                         ):
-                            action.update(io.body_action(self.task.provider.elapsed_s))
+                            body = io.body_action(self.task.provider.elapsed_s)
+                            if "lift_axis.height_mm" in body and "lift_axis.vel" not in body:
+                                # Preserve the original height request without inventing velocity precedence.
+                                action.pop("lift_axis.vel")
+                            action.update(body)
                     self._action_sequence += 1
                     action["_am1_local_control"] = {
                         "version": 1,
