@@ -139,13 +139,13 @@ def private_directory(path):
     return path
 
 
-def private_json(path, value):
+def private_json(path, value, limit=RESPONSE_LIMIT):
     path = Path(path)
     temporary = path.with_suffix(".new")
     with temporary.open("wb") as stream:
         if os.name != "nt":
             os.fchmod(stream.fileno(), 0o600)
-        stream.write(encode(value))
+        stream.write(encode(value, limit))
     temporary.replace(path)
 
 
@@ -230,7 +230,15 @@ class OwnerServer:
             async with asyncio.timeout(IO_TIMEOUT):
                 async with self.slots[protective]:
                     # Never call tick before a protective operation; core owns ordering.
-                    if command == {"op": "snapshot"}:
+                    if command.get("op") == "observation_sync":
+                        if (
+                            protective
+                            or envelope["device"] != "observation-worker"
+                            or set(command) != {"op", "evidence"}
+                        ):
+                            raise ValueError("private observation envelope")
+                        result = await asyncio.to_thread(self.observation_sync, command["evidence"])
+                    elif command == {"op": "snapshot"}:
                         snapshot = await asyncio.to_thread(self.authority.snapshot)
                         result = {"accepted": True, "status": "snapshot", "snapshot": snapshot}
                     else:
@@ -243,6 +251,18 @@ class OwnerServer:
             writer.close()
             with contextlib.suppress(TimeoutError, ConnectionError):
                 await asyncio.wait_for(writer.wait_closed(), IO_TIMEOUT)
+
+    def observation_sync(self, evidence):
+        with self.authority.mutex:
+            observation = getattr(self.authority.executor, "observation", None)
+            if observation is None:
+                raise ValueError("real observation mode not selected")
+            if evidence is not None:
+                observation.publish(evidence)
+            return {
+                "request": observation.request,
+                "consumption": dict(observation.evidence(), consumed_at=self.authority.clock()),
+            }
 
     async def close(self):
         for server in self.servers:

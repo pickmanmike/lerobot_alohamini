@@ -21,7 +21,7 @@ class AM1SessionTransport {
   async initialize() {
     const response=await fetch("/api/session");
     if(!response.ok) {this.render(this,"Enter a local one-use pairing code.");return;}
-    const device=await response.json(); this.csrf=device.csrf; this.device=device.device_id;this.control=device.control;
+    const device=await response.json(); this.csrf=device.csrf; this.device=device.device_id;this.control=device.control;this.optionalVideo=device.optional_p1_video;
     await this.attach();
   }
   async attach() {
@@ -147,7 +147,19 @@ globalThis.AM1RemoteInitialize=function() {
     state.textContent=run ? `Fake session · ${run.status} · ${run.progress_s.toFixed(2)} s` : "Fake session · no run";
     document.querySelector("#session-details").textContent=JSON.stringify(transport.snapshot,null,2);
     document.querySelector("#live-countdown").textContent=run ? `Original Live budget: ${Math.ceil(run.remaining_s || 0)} s remaining` : "No fake run";
-    document.querySelector("#connection").textContent=`${transport.connected ? "Connected" : "Disconnected"} · Cameras and hardware unavailable in fake mode`;
+    const realObservation=transport.snapshot?.evidence?.observation_provenance==="real-p1/pi-decoded";
+    document.querySelector("#connection").textContent=`${transport.connected ? "Connected" : "Disconnected"} · ${realObservation ? `Real P1 observation · ${transport.snapshot?.evidence?.required_observation ? "current images validated on Pi" : "current image proof unavailable"} · motor feedback and commands simulated` : "Cameras and hardware unavailable in fake mode"}`;
+    if(transport.optionalVideo&&!transport.videoView&&globalThis.AM1P1View) {
+      const root=document.querySelector("#am1-camera-root");root.replaceChildren();
+      const label=document.createElement("p");label.textContent="Optional external P1 view · separate from required Pi image validation";
+      const video=document.createElement("video");video.muted=true;video.autoplay=true;video.playsInline=true;video.controls=true;video.style.maxWidth="640px";video.style.width="100%";
+      const status=document.createElement("p");status.textContent="View closed · task and finite capture continue independently";
+      const open=document.createElement("button");open.type="button";open.textContent="Connect P1 view";
+      const close=document.createElement("button");close.type="button";close.textContent="Close view";
+      const view=transport.videoView=new AM1P1View(video,()=>transport.csrf,message=>status.textContent=message);
+      open.onclick=()=>view.start();close.onclick=()=>{view.stop();status.textContent="View closed · task observation continues independently";};
+      window.addEventListener("pagehide",()=>view.stop());root.append(label,video,status,open,close);
+    }
     document.querySelector("#gate-state").textContent=transport.controllerGeneration ? "Explicit controller; accepted requests require actual fake acknowledgement." : "Spectator; viewing does not claim input.";
     if(message){notice.textContent=message;notice.hidden=false;}
     document.querySelector("#pairing-panel").hidden=Boolean(transport.device);
@@ -164,7 +176,7 @@ globalThis.AM1RemoteInitialize=function() {
   claimButton.textContent="Claim input";options.prepend(claimButton);
   document.querySelector('label[for="duration-seconds"]').hidden=true;
   const camera=document.querySelector("#am1-camera-root");camera.replaceChildren();camera.textContent="Cameras unavailable · synthetic fake evidence only";
-  document.querySelector("#control-help").textContent="Explicitly claim input before Start. Finite authorization survives browser closure. Interactive work needs a fresh connected snapshot, empty release and qualified Resume. Disconnect, blur and handoff clear held keys. Pause and Stop remain available to enrolled control-capable spectators. No physical hardware or cameras are used.";
+  document.querySelector("#control-help").textContent="Explicitly claim input before Start. Finite authorization survives browser closure. Interactive work needs a fresh connected snapshot, empty release and qualified Resume. Disconnect, blur and handoff clear held keys. Pause and Stop remain available to enrolled control-capable spectators. Motor feedback and commands remain simulated. When configured, real P1 images qualify observation on Pi; optional browser video has no control authority.";
   document.querySelector('[data-operation="Approve"]').hidden=true;
   for(const button of document.querySelectorAll("[data-operation], [data-body-key]")) {
     button.removeAttribute("data-tip");button.title="Fake session control";

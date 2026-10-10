@@ -286,9 +286,13 @@ class SessionAuthority:
             if self.run and (self.run["uncertain"] or self.run["status"] not in TERMINAL):
                 return self._refuse("reconciliation or terminal run required")
             evidence = self.executor.evidence()
-            if evidence["fault"] or not all(
-                evidence[k] for k in ("feedback", "required_observation", "native_ack")
-            ):
+            preparing_observation = getattr(self.executor, "observation", None) is not None
+            required_keys = (
+                ("feedback", "native_ack")
+                if preparing_observation
+                else ("feedback", "required_observation", "native_ack")
+            )
+            if evidence["fault"] or not all(evidence[k] for k in required_keys):
                 self.executor.hold()
                 return self._refuse("fresh qualified feedback/proof and acknowledgement required")
             self.run = {
@@ -324,6 +328,8 @@ class SessionAuthority:
             self.run["dispatch"] = "dispatching"
             self._save()
             try:
+                if preparing_observation:
+                    self.executor.bind_run(self.run["run_id"], recipe)
                 admitted = self.executor.begin(recipe)
             except Exception:
                 self.run["uncertain"] = True
@@ -331,6 +337,9 @@ class SessionAuthority:
                 return self._run_result()
             self.run["dispatch"] = "acknowledged" if admitted else "unacknowledged"
             self.run["status"] = "running" if recipe.mode == "finite" and admitted else "paused"
+            if admitted and preparing_observation:
+                self.run["status"] = "preparing"
+                self.run["preparation_ceiling"] = min(now + 20, self.run["deadline"])
             self.last_tick = now
             self._event("start")
             self._save()
@@ -482,7 +491,14 @@ class SessionAuthority:
                 self._finish("stopped", "live_deadline")
                 return
             qualified = e["feedback"] and e["required_observation"] and e["native_ack"]
-            if r["status"] == "running" and not qualified:
+            if r["status"] == "preparing":
+                if now >= r["preparation_ceiling"]:
+                    self._finish("faulted", "observation_preparation_timeout")
+                    return
+                if qualified and e["pose_aligned"] and self.executor.dispatch(RECIPES[r["recipe"]]):
+                    r["status"] = "running"
+                    self._event("observation_qualified")
+            elif r["status"] == "running" and not qualified:
                 r["recovery_episodes"] += 1
                 r["first_cause"] = r["first_cause"] or (
                     "feedback_loss" if not e["feedback"] else "required_proof_loss"

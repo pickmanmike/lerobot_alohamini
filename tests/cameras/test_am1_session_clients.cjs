@@ -270,3 +270,40 @@ test("simulated provider UI Pause and Resume preserve one seed and original dead
     assert.equal(await page.evaluate(()=>am1Remote.snapshot.run.cleanup),"simulated_hold_acknowledged");
   } finally {await context.close();await browser.close();await f.close();}
 });
+
+test("loaded optional P1 view keeps media mutations scoped and task identity unchanged", async t => {
+  const f=await fixture();t.after(()=>f.close());
+  const browser=await chromium.launch({headless:true,channel:process.env.AM1_TEST_BROWSER_CHANNEL||"msedge"});t.after(()=>browser.close());
+  const context=await browser.newContext({ignoreHTTPSErrors:true});const page=await context.newPage();
+  const media=[],errors=[];page.on('pageerror',error=>errors.push(error.message));
+  await page.route('**/api/session',async route=>{const response=await route.fetch();const value=await response.json();await route.fulfill({response,json:{...value,optional_p1_video:true}});});
+  await page.route('**/api/media**',async route=>{
+    const r=route.request();media.push({method:r.method(),url:r.url(),csrf:r.headers()['x-am1-csrf'],body:r.postData()});
+    if(r.method()==='POST')await route.fulfill({status:201,headers:{'Content-Type':'application/sdp','ETag':'"fixture"','Location':'/api/media/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'},body:'v=0\r\n'});
+    else await route.fulfill({status:204});
+  });
+  await page.addInitScript(()=>{
+    globalThis.RTCPeerConnection=class {
+      addTransceiver(){} close(){} async createOffer(){return {sdp:'v=0\r\na=ice-ufrag:fixture\r\na=ice-pwd:fixturepassword\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:0\r\n'};}
+      async setLocalDescription(){this.onicecandidate({candidate:{sdpMLineIndex:0,candidate:'candidate:1 1 UDP 1 127.0.0.1 5000 typ host'}});}
+      async setRemoteDescription(){}
+    };
+  });
+  await enroll(page,f.info.url,f.info.a);
+  await page.locator('[data-operation="ClaimInput"]').click();await page.waitForFunction(()=>am1Remote.controllerGeneration);
+  await page.locator('[data-operation="Start"]').click();await page.waitForFunction(()=>am1Remote.snapshot?.run?.status==='running');
+  const before=await page.evaluate(()=>am1Remote.snapshot.run);
+  await page.getByRole('button',{name:'Connect P1 view',exact:true}).click();
+  await page.waitForFunction(()=>am1Remote.videoView?.handle && !am1Remote.videoView.flushing);
+  await page.getByRole('button',{name:'Close view',exact:true}).click();
+  await page.waitForTimeout(100);
+  const after=await page.evaluate(()=>am1Remote.snapshot.run);
+  assert.equal(after.run_id,before.run_id);assert.equal(after.deadline,before.deadline);
+  assert.deepEqual(media.map(r=>r.method),['POST','PATCH','DELETE']);
+  for(const request of media)assert.ok(request.csrf);
+  assert.match(await page.locator('#am1-camera-root').innerText(),/separate from required Pi image validation/);
+  await page.evaluate(()=>{am1Remote.snapshot.evidence.observation_provenance='real-p1/pi-decoded';am1Remote.render(am1Remote);});
+  assert.match(await page.locator('#connection').innerText(),/Real P1 observation.*simulated/);
+  assert.deepEqual(errors,[]);
+  await context.close();
+});

@@ -50,12 +50,16 @@ class PiExecutor:
     restart_cleanup = "unknown_after_restart"
     recipes = frozenset({"sim-arm-smoke", "sim-arm-smoke-repeat", "sim-arm-hold-body"})
 
-    def __init__(self, io, admission_directory, clock=time.monotonic, shoulder_amplitude=1.5):
+    def __init__(
+        self, io, admission_directory, clock=time.monotonic, shoulder_amplitude=1.5, observation=None
+    ):
         if not isinstance(io, SimulatedIO):
             raise TypeError("this trial accepts only simulated IO")
         if not 0 < shoulder_amplitude <= 3:
             raise ValueError("invalid simulated shoulder amplitude")
         self.io, self.clock = io, clock
+        self.observation = observation
+        self.observation_preparing = False
         self.admission_directory = admission_directory
         self.shoulder_amplitude = shoulder_amplitude
         self.task = None
@@ -113,33 +117,50 @@ class PiExecutor:
                 self.task.check(self.clock())
             except (ValueError, OSError, RuntimeError) as exc:
                 self.fault = self.fault or str(exc)
+        observation = self.observation.evidence() if self.observation else None
         return {
             "source": self.source,
             "feedback": feedback,
-            "required_observation": True,
+            "required_observation": observation["qualified"] if observation else True,
             "optional_quality": True,
             "pose_aligned": aligned,
             "hold_acknowledged": self.hold_ack,
             "native_ack": self.io.acknowledge,
             "fault": self.fault or self.io.fault,
             "feedback_age_s": age,
-            "observation_age_s": 0,
-            "observation_provenance": "simulated-no-camera",
+            "observation_age_s": observation["age_s"] if observation else 0,
+            "observation_provenance": "real-p1/pi-decoded" if observation else "simulated-no-camera",
+            "observation": observation,
+            "motor_commands_provenance": "simulated-backend",
+            "feedback_provenance": "simulated-backend",
             "ack_provenance": "simulated-backend",
             "feedback_sequence": self.sample["sequence"] if valid else None,
         }
+
+    def bind_run(self, run_id, recipe):
+        if self.observation:
+            self.observation.begin(run_id, recipe.live_s)
 
     def begin(self, recipe):
         if self.task and not self.task.finished:
             raise RuntimeError("previous finite task is still active")
         self.task = None
         self.fault = None
+        if self.observation:
+            self.admission = acquire_session_admission(self.admission_directory)
+            self.task = FiniteTask(recipe, self.sample["positions"], self.clock(), self.shoulder_amplitude)
+            self.hold()
+            self.observation_preparing = True
+            return True
         return self.dispatch(recipe)
 
     def dispatch(self, recipe):
         e = self.evidence()
         if not self.supports(recipe) or not e["feedback"] or not e["native_ack"] or e["fault"]:
             return False
+        if self.observation and not e["required_observation"]:
+            return False
+        self.observation_preparing = False
         if self.task is None:
             try:
                 self.admission = acquire_session_admission(self.admission_directory)
@@ -191,6 +212,9 @@ class PiExecutor:
         return self.hold_ack
 
     def finish(self, status):
+        if self.observation:
+            self.observation.stop()
+        self.observation_preparing = False
         acknowledged = self.hold()
         if self.task:
             self.task.finish(status)
@@ -210,6 +234,9 @@ def main():
     parser = argparse.ArgumentParser(description="Isolated simulated finite AM1 owner; no hardware backend")
     parser.add_argument("--state", required=True)
     parser.add_argument("--simulated-admission-state", required=True)
+    parser.add_argument(
+        "--observation-source", help="Private exact P1 source identity JSON; opt-in real images"
+    )
     args = parser.parse_args()
     from tools.am1_session_ipc import run_owner
 
@@ -219,7 +246,17 @@ def main():
     amplitude = float(raw)
     if not math.isfinite(amplitude) or not 0 < amplitude <= 3:
         parser.error("private mapped shoulder amplitude must be finite and greater than zero through 3")
-    executor = PiExecutor(SimulatedIO(), args.simulated_admission_state, shoulder_amplitude=amplitude)
+    observation = None
+    if args.observation_source:
+        from pathlib import Path
+
+        from tools.am1_observation import ObservationMailbox
+        from tools.am1_session_ipc import strict_json
+
+        observation = ObservationMailbox(strict_json(Path(args.observation_source).read_bytes()))
+    executor = PiExecutor(
+        SimulatedIO(), args.simulated_admission_state, shoulder_amplitude=amplitude, observation=observation
+    )
     asyncio.run(run_owner(args.state, executor))
 
 
