@@ -148,7 +148,9 @@ class PiExecutor:
         self.fault = None
         if self.observation:
             self.admission = acquire_session_admission(self.admission_directory)
-            self.task = FiniteTask(recipe, self.sample["positions"], self.clock(), self.shoulder_amplitude)
+            self.task = FiniteTask(
+                recipe, self.sample["positions"], self.clock(), self.shoulder_amplitude, start_held=True
+            )
             self.hold()
             self.observation_preparing = True
             return True

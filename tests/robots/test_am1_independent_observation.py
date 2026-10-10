@@ -420,3 +420,52 @@ def test_p1_adapter_actual_loopback_capture_lifecycle_without_camera(tmp_path, m
             await server.wait_closed()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("proof_delay", [9.0, 18.0])
+def test_source_wait_defers_boundary_acquisition_but_never_original_preparation_deadline(
+    tmp_path, proof_delay
+):
+    m = module()
+    c = Clock()
+    source = request()
+    box = m.ObservationMailbox({key: source[key] for key in m.SOURCE_KEYS}, clock=c)
+    io = SimulatedIO(c)
+    executor = PiExecutor(io, tmp_path / "admission", clock=c, observation=box)
+    authority = SessionAuthority(tmp_path / "owner", clock=c, executor=executor)
+    try:
+        result = start(authority, "sim-arm-smoke-repeat")
+        task = executor.task
+        admission = executor.admission
+        original_reference = dict(task.provider.origin)
+        original_admitted_at = task.admitted_at
+        original_deadline = authority.run["deadline"]
+        for _ in range(round(proof_delay * 10)):
+            c.advance(0.1)
+            authority.tick()
+        assert authority.run["status"] == "preparing" and authority.run["progress_s"] == 0
+        r = m.BoundReceiver(tmp_path / "frames", box.request, clock=c)
+        for seq in range(1, 66):
+            c.advance(0.1)
+            box.publish(feed(r, box.request, c, seq))
+            authority.tick()
+            if authority.run["status"] == "faulted":
+                break
+        assert executor.task is task
+        assert task.admitted_at == original_admitted_at
+        assert authority.run["run_id"] == result["run_id"] and authority.run["deadline"] == original_deadline
+        assert task.admissions == 1
+        if proof_delay == 9:
+            assert authority.run["status"] == "running", authority.run["first_cause"]
+            assert authority.run["progress_s"] > 0
+            assert task.original_seed == original_reference and executor.admission is admission
+        else:
+            assert authority.run["status"] == "faulted"
+            assert (
+                authority.run["first_cause"]
+                == "20-second preparation wall deadline expired without a qualified seed"
+            )
+            assert 20 <= c() - original_admitted_at < 20.2
+            assert task.original_seed is None
+    finally:
+        authority.close()
