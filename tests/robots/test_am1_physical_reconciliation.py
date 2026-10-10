@@ -82,6 +82,160 @@ def test_actual_stopped_reconciliation_does_not_require_ended_live_feedback_or_r
         authority.close()
 
 
+def full_sized_receipt(authority, operation_id):
+    """Full stopped records/calibration and monitor events, without hardware access."""
+    _, _, proof = stopped_proof()
+    rows = proof["readback"]["calibration_comparison"] = []
+    for side in ("left", "right"):
+        motors = [
+            "arm_" + side + "_" + joint
+            for joint in (
+                "shoulder_pan",
+                "shoulder_lift",
+                "elbow_flex",
+                "wrist_flex",
+                "wrist_roll",
+                "gripper",
+            )
+        ]
+        if side == "left":
+            motors += ["base_left_wheel", "base_back_wheel", "base_right_wheel", "lift_axis"]
+        for motor in motors:
+            for register, value in (
+                ("ID", 1),
+                ("Model_Number", 777),
+                ("Homing_Offset", 0),
+                ("Min_Position_Limit", 0),
+                ("Max_Position_Limit", 4095),
+            ):
+                rows.append(
+                    {
+                        "bus": side,
+                        "motor": motor,
+                        "register": register,
+                        "value": value,
+                        "cached_expected": value,
+                        "matches": True,
+                        "read_started_at_monotonic_s": 99.12345678901234,
+                        "read_completed_at_monotonic_s": 99.12445678901234,
+                    }
+                )
+    stationary = proof["readback"]["lift_stationary"]
+    for record in stationary["samples"]:
+        record.update(
+            acceleration_raw=254,
+            elapsed_s=0.41234567890123,
+            present_load_raw=0,
+            lock=0,
+            voltage_v=11.5,
+            temperature_window={
+                "aggregation": "maximum_per_occupied_slot",
+                "count": 5,
+                "high_count": 0,
+                "numeric_outlier_count": 0,
+                "ready": True,
+                "slot_s": 0.1,
+                "span_s": 0.41234567890123,
+                "values_c": [34] * 5,
+            },
+        )
+    stationary["events"] = copy.deepcopy(stationary["samples"])
+    # The failed native cleanup retains its actual readback as separate history.
+    authority.run["physical_result"]["readback"] = copy.deepcopy(proof["readback"])
+    before = copy.deepcopy(authority.run)
+    accepted = acknowledged(before, operation_id)
+    proof.update({key: value for key, value in accepted.items() if key != "acknowledgment"})
+    proof["acknowledgment"] = accepted["acknowledgment"]
+    proof["acknowledgment"].update(
+        original_terminal_run_sha256=proof["original_terminal_run_sha256"],
+        completed_at_monotonic_s=100.02,
+        validation_basis="fresh-native-proof",
+    )
+    return proof
+
+
+def test_snapshot_references_full_actual_reconciliation_within_existing_ipc_limit_without_mutation(tmp_path):
+    from tools.am1_session_ipc import RESPONSE_LIMIT, encode
+
+    authority, executor, run_id = terminal_authority(tmp_path)
+    try:
+        request = command("reconcile", run_id=run_id)
+        proof = full_sized_receipt(authority, request["operation_id"])
+        # A real-sized full proof plus original cleanup exceeds the wire contract.
+        with pytest.raises(ValueError, match="message too large"):
+            encode(
+                {"id": str(uuid.uuid4()), "result": {"run": dict(authority.run, reconciliation=proof)}},
+                RESPONSE_LIMIT,
+            )
+        executor.reconcile = lambda *args, **kwargs: proof
+        assert authority.handle(request, "owner")["accepted"]
+        original = copy.deepcopy(authority.run)
+        durable = authority.db.execute("SELECT data FROM state WHERE id=1").fetchone()[0]
+        snapshot = authority.snapshot()
+        wire = encode({"id": str(uuid.uuid4()), "result": snapshot}, RESPONSE_LIMIT)
+        reference = snapshot["run"]["reconciliation"]
+        assert len(wire) <= RESPONSE_LIMIT
+        assert reference["kind"] == "am1-actual-stopped-reconciliation"
+        assert reference["presentation_version"] == 1
+        assert reference["evidence_reference"] == {
+            "kind": "am1-stopped-reconciliation-reference",
+            "version": 1,
+        }
+        for key in (
+            "run_id",
+            "host_incarnation",
+            "reconciliation_id",
+            "original_terminal_run_sha256",
+            "cleanup",
+            "uncertain",
+            "started_at_monotonic_s",
+            "completed_at_monotonic_s",
+            "acknowledgment",
+        ):
+            assert reference[key] == proof[key]
+        assert reference["proof_sha256"] == proof["acknowledgment"]["proof_sha256"]
+        assert "readback" not in reference and "source" not in reference
+        assert authority.run == original and authority.run["reconciliation"] == proof
+        assert authority.db.execute("SELECT data FROM state WHERE id=1").fetchone()[0] == durable
+        snapshot["run"]["reconciliation"]["acknowledgment"]["validated"] = False
+        assert authority.run == original
+    finally:
+        authority.close()
+
+
+@pytest.mark.parametrize(
+    "broken", ["kind", "ack", "run", "hash", "readback", "timestamp", "source", "readback_shape", "ack_size"]
+)
+def test_snapshot_does_not_project_malformed_reconciliation_as_qualified(tmp_path, broken):
+    authority, executor, run_id = terminal_authority(tmp_path)
+    try:
+        proof = full_sized_receipt(authority, str(uuid.uuid4()))
+        authority.run.update(uncertain=False, reconciliation=proof)
+        if broken == "kind":
+            proof["kind"] = "simulated-stopped-reconciliation"
+        elif broken == "ack":
+            del proof["acknowledgment"]
+        elif broken == "run":
+            proof["run_id"] = str(uuid.uuid4())
+        elif broken == "hash":
+            proof["original_terminal_run_sha256"] = "b" * 64
+        elif broken == "readback":
+            proof["readback"]["verified"] = False
+        elif broken == "source":
+            executor.source = "fake"
+        elif broken == "readback_shape":
+            proof["readback"] = ["not a qualified readback"]
+        elif broken == "ack_size":
+            proof["acknowledgment"]["unexpected_unbounded_data"] = "x" * 4096
+        else:
+            proof["completed_at_monotonic_s"] = "not a native acquisition timestamp"
+        before = copy.deepcopy(authority.run)
+        assert authority.snapshot()["run"]["reconciliation"] == proof
+        assert authority.run == before and authority.run["run_id"] == run_id
+    finally:
+        authority.close()
+
+
 @pytest.mark.parametrize("broken", ["boolean", "run", "incarnation", "hash", "ack", "operation"])
 def test_physical_reconcile_refuses_boolean_foreign_or_unacknowledged_proof(tmp_path, broken):
     authority, executor, run_id = terminal_authority(tmp_path)

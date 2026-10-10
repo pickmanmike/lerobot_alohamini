@@ -17,6 +17,76 @@ from tools.am1_fake_executor import FakeExecutor
 TERMINAL = {"stopped", "completed", "faulted", "interrupted"}
 
 
+def _reconciliation_reference(run):
+    """Present an acknowledged receipt; keep full evidence in the durable run."""
+    receipt = run.get("reconciliation")
+    if not isinstance(receipt, dict) or run.get("uncertain") is not False:
+        return receipt
+    ack = receipt.get("acknowledgment")
+    if not isinstance(ack, dict):
+        return receipt
+    original = dict(run)
+    original.pop("reconciliation", None)
+    original["uncertain"] = True
+    from tools.am1_physical_reconciliation import acknowledged_receipt
+
+    try:
+        if not acknowledged_receipt(receipt, original, ack.get("consumed_operation_id")):
+            return receipt
+        for key in ("run_id", "host_incarnation", "reconciliation_id"):
+            if uuid_text(receipt[key]) != receipt[key]:
+                return receipt
+        for key in ("operation_id", "consumed_operation_id"):
+            if uuid_text(ack[key]) != ack[key]:
+                return receipt
+        times = [
+            receipt["started_at_monotonic_s"],
+            receipt["completed_at_monotonic_s"],
+            ack["completed_at_monotonic_s"],
+        ]
+        if any(type(value) not in (int, float) or not math.isfinite(value) for value in times):
+            return receipt
+        rb = receipt.get("readback") or {}
+        proof_hash = ack["proof_sha256"]
+        if not (
+            0 <= times[0] <= times[1] <= times[2]
+            and type(receipt.get("version")) is int
+            and type(ack.get("version")) is int
+            and receipt.get("no_actuation") is True
+            and isinstance(rb, dict)
+            and rb.get("verified") is True
+            and rb.get("buses_closed") is True
+            and rb.get("lift_readback") == "qualified"
+            and ack.get("original_terminal_run_sha256") == receipt["original_terminal_run_sha256"]
+            and ack.get("validation_basis") in ("fresh-native-proof", "durable-ack-resume")
+            and len(proof_hash) == 64
+            and all(c in "0123456789abcdef" for c in proof_hash)
+            and len(json.dumps(ack, allow_nan=False, separators=(",", ":")).encode()) <= 4096
+        ):
+            return receipt
+    except (KeyError, TypeError, ValueError):
+        return receipt
+    fields = (
+        "version",
+        "kind",
+        "run_id",
+        "host_incarnation",
+        "reconciliation_id",
+        "original_terminal_run_sha256",
+        "cleanup",
+        "uncertain",
+        "started_at_monotonic_s",
+        "completed_at_monotonic_s",
+        "acknowledgment",
+    )
+    return {
+        **{key: receipt[key] for key in fields},
+        "presentation_version": 1,
+        "evidence_reference": {"kind": "am1-stopped-reconciliation-reference", "version": 1},
+        "proof_sha256": proof_hash,
+    }
+
+
 class OwnerLock:
     """Shared namespace lock for fake authority and fake legacy contenders."""
 
@@ -771,6 +841,13 @@ class SessionAuthority:
 
     def snapshot(self):
         with self.mutex:
+            run = None if not self.run else dict(self.run)
+            if (
+                run is not None
+                and "reconciliation" in run
+                and self.executor.source == "protected-physical-provider"
+            ):
+                run["reconciliation"] = _reconciliation_reference(self.run)
             return json.loads(
                 json.dumps(
                     {
@@ -783,9 +860,9 @@ class SessionAuthority:
                             "presence_expires": self.controller["expires"],
                         },
                         "run": None
-                        if not self.run
+                        if run is None
                         else dict(
-                            self.run,
+                            run,
                             remaining_s=None
                             if self.run["deadline"] is None
                             else max(0, self.run["deadline"] - self.clock()),
