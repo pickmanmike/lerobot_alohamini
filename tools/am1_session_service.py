@@ -213,9 +213,14 @@ class Peer:
 
 
 class Gateway:
-    def __init__(self, owner_state, auth_state):
+    def __init__(self, owner_state, auth_state, media_config=None):
         self.ipc = IPCClient(owner_state)
         self.auth = AuthStore(auth_state)
+        self.media = None
+        if media_config:
+            from tools.am1_media_proxy import WHEPProxy
+
+            self.media = WHEPProxy(self.auth, media_config)
         self.origin = None
         self.peers = set()
         self.pending_ws = 0
@@ -226,7 +231,7 @@ class Gateway:
         self.protective = asyncio.Semaphore(2)
         self.revision = 0
         self.incarnation = str(uuid.uuid4())
-        self.app = web.Application(client_max_size=CONTROL_LIMIT, middlewares=[self.boundary])
+        self.app = web.Application(client_max_size=65536, middlewares=[self.boundary])
         self.app.router.add_get("/", self.html)
         self.app.router.add_get("/assets/{name}", self.asset)
         self.app.router.add_post("/api/enroll", self.enroll)
@@ -237,29 +242,48 @@ class Gateway:
         for op in OPS:
             self.app.router.add_post("/api/" + op, self.operation)
         self.app.router.add_get("/api/ws", self.websocket)
+        self.app.router.add_post("/api/media", self.media_request)
+        self.app.router.add_patch("/api/media/{handle}", self.media_request)
+        self.app.router.add_delete("/api/media/{handle}", self.media_request)
+        self.app.router.add_post("/api/media/{handle}/keepalive", self.media_request)
         self.app.on_startup.append(self.start)
         self.app.on_cleanup.append(self.cleanup)
 
     @web.middleware
     async def boundary(self, request, handler):
         try:
-            for header in ("Host", "Origin", "X-AM1-CSRF", "Cookie", "Content-Type", "Content-Length"):
+            for header in (
+                "Host",
+                "Origin",
+                "X-AM1-CSRF",
+                "Cookie",
+                "Content-Type",
+                "Content-Length",
+                "If-Match",
+            ):
                 if len(request.headers.getall(header, [])) > 1:
                     raise web.HTTPBadRequest(reason="ambiguous headers")
             if not request.secure or request.headers.get("Host") != self.origin.removeprefix("https://"):
                 raise web.HTTPForbidden(reason="origin boundary")
             if request.query_string:
                 raise web.HTTPBadRequest(reason="query not supported")
-            mutation = request.method == "POST"
+            mutation = request.method in {"POST", "PATCH", "DELETE"}
+            media = request.path == "/api/media" or request.path.startswith("/api/media/")
             websocket = request.path == "/api/ws"
             if (mutation or websocket) and request.headers.get("Origin") != self.origin:
                 raise web.HTTPForbidden(reason="Origin")
             if mutation:
-                if request.content_length is None or request.content_length > CONTROL_LIMIT:
+                limit = 65536 if media else CONTROL_LIMIT
+                if request.content_length is None or request.content_length > limit:
                     raise web.HTTPRequestEntityTooLarge(
-                        max_size=CONTROL_LIMIT, actual_size=request.content_length or 0
+                        max_size=limit, actual_size=request.content_length or 0
                     )
-                if request.content_type != "application/json":
+                expected_type = "application/json"
+                if media and not request.path.endswith("/keepalive"):
+                    expected_type = (
+                        "application/sdp" if request.method == "POST" else "application/trickle-ice-sdpfrag"
+                    )
+                if request.method != "DELETE" and request.content_type != expected_type:
                     raise web.HTTPUnsupportedMediaType()
             if request.path.startswith("/api/") and request.path != "/api/enroll":
                 cookie_parts = [
@@ -311,6 +335,23 @@ class Gateway:
         except (OSError, TimeoutError, asyncio.IncompleteReadError):
             return web.json_response(unknown_outcome(), status=503)
 
+    async def media_request(self, request):
+        if not self.media:
+            raise web.HTTPNotFound(reason="optional video disabled")
+        data = await asyncio.wait_for(request.read(), 1)
+        method = request.method
+        if request.path.endswith("/keepalive"):
+            if strict_json(data) != {}:
+                raise web.HTTPBadRequest()
+            method = "KEEPALIVE"
+        if method == "DELETE" and data:
+            raise web.HTTPBadRequest()
+        status, body, headers = await self.media.exchange(
+            method, request["device"]["id"], request.match_info.get("handle"), data, request.headers
+        )
+        headers["Cache-Control"] = "no-store"
+        return web.Response(status=status, body=body, headers=headers)
+
     async def body(self, request):
         value = strict_json(await asyncio.wait_for(request.read(), 1))
         if not isinstance(value, dict):
@@ -347,7 +388,7 @@ class Gateway:
         )
         text = text.replace(
             '<script defer src="/camera/assets/app.js"></script>',
-            '<script defer src="/assets/session_transport.js"></script>',
+            '<script defer src="/assets/p1_view.js"></script><script defer src="/assets/session_transport.js"></script>',
         )
         text = text.replace(
             '<body data-console="compact">', '<body data-console="compact" data-session-mode="remote-fake">'
@@ -357,13 +398,13 @@ class Gateway:
             content_type="text/html",
             headers={
                 "Cache-Control": "no-store",
-                "Content-Security-Policy": "default-src 'self'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'",
+                "Content-Security-Policy": "default-src 'self'; connect-src 'self'; media-src 'self' blob:; img-src 'self' data:; frame-ancestors 'none'",
             },
         )
 
     async def asset(self, request):
         name = request.match_info["name"]
-        if name not in {"app.js", "session_transport.js", "style.css"}:
+        if name not in {"app.js", "session_transport.js", "p1_view.js", "style.css"}:
             raise web.HTTPNotFound()
         return web.FileResponse(ASSETS / name)
 
@@ -382,7 +423,12 @@ class Gateway:
     async def session(self, request):
         d = request["device"]
         return web.json_response(
-            {"device_id": d["id"], "csrf": d["csrf"], "control": bool(d["control"])},
+            {
+                "device_id": d["id"],
+                "csrf": d["csrf"],
+                "control": bool(d["control"]),
+                "optional_p1_video": self.media is not None,
+            },
             headers={"Cache-Control": "no-store"},
         )
 
@@ -685,9 +731,13 @@ class Gateway:
                     peer.put({"kind": "unavailable"}, True)
 
     async def start(self, app):
+        if self.media:
+            await self.media.start()
         self.publisher = asyncio.create_task(self.publish())
 
     async def cleanup(self, app):
+        if self.media:
+            await self.media.close()
         self.publisher.cancel()
         await asyncio.gather(self.publisher, return_exceptions=True)
         for peer in list(self.peers):
@@ -735,7 +785,10 @@ async def run_gateway(args):
     tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     tls.minimum_version = ssl.TLSVersion.TLSv1_2
     tls.load_cert_chain(args.cert, args.key)
-    gateway = Gateway(args.owner_state, args.auth_state)
+    media_config = (
+        strict_json(Path(args.media_config).read_bytes()) if getattr(args, "media_config", None) else None
+    )
+    gateway = Gateway(args.owner_state, args.auth_state, media_config)
     runner = web.AppRunner(
         gateway.app,
         access_log=None,
@@ -764,6 +817,7 @@ def main():
     gateway = subs.add_parser("gateway")
     for name in ("owner-state", "auth-state", "cert", "key", "ready-file"):
         gateway.add_argument("--" + name, required=True)
+    gateway.add_argument("--media-config", help="Private optional named TLS WHEP source configuration")
     gateway.add_argument("--host", default="127.0.0.1")
     gateway.add_argument("--origin", help="Exact HTTPS origin required for explicit private LAN listener")
     gateway.add_argument("--port", type=int, default=0)
