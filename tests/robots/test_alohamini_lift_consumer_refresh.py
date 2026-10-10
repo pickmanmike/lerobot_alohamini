@@ -151,7 +151,14 @@ def host_case(operating_robot, monkeypatch, tmp_path):
         monkeypatch.setattr(robot, "hold_follower_arms", hold)
         monkeypatch.setattr(robot, "get_observation", observation)
         monkeypatch.setattr(host, "AlohaMini", lambda config: robot)
-        monkeypatch.setattr(host, "AM1LocalControl", lambda: control)
+
+        def local_control(*, run_id=None, host_incarnation=None):
+            # This legacy CLI fixture has no protected IPC handoff binding. Keep
+            # the real local controller while matching the host's owner API.
+            assert run_id is None and host_incarnation is None
+            return control
+
+        monkeypatch.setattr(host, "AM1LocalControl", local_control)
         monkeypatch.setattr(host.time, "perf_counter", clock.monotonic)
         monkeypatch.setattr("sys.argv", ["host", "--robot_model", "alohamini1", "--no_cameras"])
         monkeypatch.setattr(host, "AlohaMiniHost", lambda config: SimpleNamespace(

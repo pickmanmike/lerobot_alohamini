@@ -765,10 +765,17 @@ class MotorFeedbackComparison:
         on_sample: Callable[[dict[str, Any]], None] | None = None,
         require_quiet_motion_feedback: bool = False,
         am1_post_home_origin_raw: int | None = None,
+        cleanup_temperature_ready: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         """Require one bounded window of fresh, mutually consistent feedback."""
         qualification_started = self.monotonic()
         deadline = qualification_started + timeout_s
+        if cleanup_temperature_ready is not None and (
+            (phase, expected_torque, expected_goal, timeout_s)
+            != ("cleanup_readback", 0, 0, SETTLE_TIMEOUT_S)
+            or not callable(cleanup_temperature_ready)
+        ):
+            raise ValueError("Cleanup thermal readiness requires the original one-second off/zero transition.")
         readiness = None
         if am1_post_home_origin_raw is not None:
             if (phase, expected_torque, expected_goal, require_quiet_motion_feedback, timeout_s) != (
@@ -808,6 +815,8 @@ class MotorFeedbackComparison:
                         f"{phase}: no complete stationary window within {timeout_s:g} second.",
                     )
                 self.sleep(min(POLL_S, deadline - now))
+                if cleanup_temperature_ready is not None and self.monotonic() >= deadline:
+                    self.refuse(last_record, f"{phase}: no complete stationary window within {timeout_s:g} second.")
                 if readiness is not None and self.monotonic() >= deadline:
                     bounded = readiness.qualify_bounded(self.monotonic())
                     if bounded is not None:
@@ -914,6 +923,13 @@ class MotorFeedbackComparison:
             window_s = candidate[-1][0] - candidate[0][0]
             if len(candidate) < required_samples or window_s < required_window_s:
                 continue
+
+            if cleanup_temperature_ready is not None:
+                thermal_ready = cleanup_temperature_ready()
+                if type(thermal_ready) is not bool:
+                    raise ValueError("Cleanup thermal readiness must return an explicit Boolean.")
+                if not thermal_ready:
+                    continue
 
             evidence = {
                 "sample_count": len(candidate),

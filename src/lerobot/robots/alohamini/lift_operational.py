@@ -55,7 +55,9 @@ class TemperatureWindow:
         if now < self._last_sample_at or now - oldest_required > self.MAX_AGE_S:
             self.refuse("temperature: five-slot feedback window is stale (>0.5 s).")
 
-    def update(self, value: int, now: float, *, cold_start: bool = False) -> dict[str, Any]:
+    def update(
+        self, value: int, now: float, *, cold_start: bool = False, expire_old_slots: bool = False,
+    ) -> dict[str, Any]:
         if self.failure is not None:
             raise self.failure
         if (
@@ -68,6 +70,14 @@ class TemperatureWindow:
             now <= self._last_sample_at or now - self._last_sample_at > self.MAX_AGE_S
         ):
             self.refuse("temperature: repeated, backward or stale feedback timestamp.")
+        if type(expire_old_slots) is not bool:
+            raise ValueError("Thermal slot expiry must be explicitly selected.")
+        if expire_old_slots:
+            # Only the separate off/zero cleanup collector selects this. Missing
+            # occupied slots reduce its count; fresh reads must fill all five.
+            # The powered collector retains its original immediate age refusal.
+            while self.samples and now - self.samples[0][0] > self.MAX_AGE_S:
+                self.samples.popleft()
         # Integer nanoseconds avoid floating-point 0.1-boundary drift. The first
         # real reading anchors slots for the whole process, never each phase.
         sample_ns = round(now * 1_000_000_000)
@@ -390,17 +400,45 @@ class OperationalLift(InstalledLiftCheck):
         # Cleanup evidence may be fresh even after a latched fault. It never clears
         # that fault or rearms; genuine status/transport/zero/off failures still fail.
         temperature_check = self.monitor.temperature_check
+        cleanup_window = TemperatureWindow()
+        cleanup_window.samples.extend(self.temperature.samples)
+        for name in ("_origin_ns", "_last_slot", "_last_sample_at", "outliers"):
+            setattr(cleanup_window, name, getattr(self.temperature, name))
 
         def cleanup_temperature(record: dict[str, Any], cold: bool) -> None:
             record.update(cleanup_only=True, earlier_failure=str(self.failure) if self.failure else None)
             if self.failure is None:
-                # A previously healthy session must still fail on newly confirmed
-                # heat during shutdown. Carry the actual history across this edge.
-                self._check_temperature(record, cold)
+                # sample() already checked fresh transport and actual mode/off/
+                # zero/current/status. Preserve every unexpired real peak; never
+                # manufacture a vote for the slot missed during ordinary shutdown.
+                try:
+                    if record["request_duration_s"] > 0.04:
+                        raise feedback.ComparisonRefusal("lift feedback exceeded its 40 ms request budget.")
+                    record["temperature_window"] = cleanup_window.update(
+                        record["temperature_c"], record["sample_monotonic_s"],
+                        cold_start=cold, expire_old_slots=True,
+                    )
+                    record["temperature_collection"] = "off-zero-fresh-slots-v1"
+                except feedback.ComparisonRefusal as error:
+                    record["temperature_history"] = list(cleanup_window.samples)
+                    record["temperature_slot_s"] = cleanup_window.SLOT_S
+                    record["numeric_outlier_count"] = cleanup_window.outliers
+                    self.failure = error
+                    raise
 
         self.monitor.temperature_check = cleanup_temperature
         try:
-            super().cleanup_readback()
-            self.monitor.record("shutdown_verified", numeric_outlier_count=self.temperature.outliers)
+            self.bus.expected_goal = 0
+            self.bus.expected_torque = 0
+            write_register(self.bus, "Torque_Enable", self.lift.cfg.name, 0)
+            self.monitor.qualify_stationary(
+                "cleanup_readback", expected_torque=0, expected_goal=0,
+                allow_settling=True, timeout_s=feedback.SETTLE_TIMEOUT_S,
+                cleanup_temperature_ready=lambda: self.failure is not None or cleanup_window.ready,
+            )
+            if self.failure is None:
+                cleanup_window.assert_fresh(time.monotonic())
+            self.lift.mark_unhomed()
+            self.monitor.record("shutdown_verified", numeric_outlier_count=cleanup_window.outliers)
         finally:
             self.monitor.temperature_check = temperature_check

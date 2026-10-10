@@ -510,12 +510,25 @@ class SessionAuthority:
                 return self._refuse("no uncertainty")
             if not self.controller or self.controller["device_id"] != d:
                 return self._refuse("owner required")
+            physical_reconciliation = None
             if self.asynchronous:
                 reconcile = getattr(self.executor, "reconcile", None)
-                if not reconcile or not reconcile(self.run["run_id"]):
+                if self.executor.source == "protected-physical-provider":
+                    from tools.am1_physical_reconciliation import acknowledged_receipt
+
+                    physical_reconciliation = (
+                        reconcile(json.loads(json.dumps(self.run)), operation_id=c["operation_id"])
+                        if reconcile
+                        else None
+                    )
+                    if not acknowledged_receipt(physical_reconciliation, self.run, c["operation_id"]):
+                        return self._refuse("actual physical cleanup reconciliation pending or unqualified")
+                elif not reconcile or not reconcile(self.run["run_id"]):
                     return self._refuse("actual physical cleanup reconciliation required")
-            if not self._evidence()["feedback"]:
+            if physical_reconciliation is None and not self._evidence()["feedback"]:
                 return self._refuse("feedback required")
+            if physical_reconciliation is not None:
+                self.run["reconciliation"] = physical_reconciliation
             self.run["uncertain"] = False
             self._save()
             return {"accepted": True, "status": "reconciled"}

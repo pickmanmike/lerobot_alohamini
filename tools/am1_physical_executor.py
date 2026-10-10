@@ -131,6 +131,7 @@ class PhysicalExecutor:
             "terminal_status": None,
         }
         self._wake = threading.Event()
+        self._reconciliation_worker = None
 
     def supports(self, recipe):
         return recipe.name in self.recipes and recipe.seed is None and recipe.mode == "finite"
@@ -157,10 +158,12 @@ class PhysicalExecutor:
             if (
                 not self.supports(recipe)
                 or (self.worker and self.worker.is_alive())
+                or (self._reconciliation_worker and self._reconciliation_worker.thread.is_alive())
                 or self._lifecycle["uncertain"]
             ):
                 raise RuntimeError("previous physical owner is active or uncertain, or recipe unsupported")
             self.run_id, self.recipe = run_id, recipe
+            self._reconciliation_worker = None
             self.host_incarnation = __import__("uuid").uuid4().__str__()
             self.revision = 0
             self.desired = "hold"
@@ -258,6 +261,12 @@ class PhysicalExecutor:
                 "host_incarnation": self.host_incarnation,
                 "lifecycle": copy.deepcopy(self._lifecycle),
                 "transport_issue": self._transient,
+                "reconciliation": {
+                    "state": self._reconciliation_worker.state,
+                    "error": self._reconciliation_worker.error,
+                }
+                if self._reconciliation_worker
+                else None,
                 **self.sensing_metadata(),
             }
 
@@ -308,12 +317,28 @@ class PhysicalExecutor:
             self._wake.set()
             return {"pending": True, "cleanup": None, "uncertain": False}
 
-    def reconcile(self, run_id=None):
-        return (
-            False  # Administrative reconciliation requires fresh stopped bus evidence, never a Boolean clear.
-        )
+    def reconcile(self, run=None, *, operation_id=None):
+        from tools.am1_physical_reconciliation import ReconciliationWorker, terminal_run_hash
+
+        if not isinstance(run, dict) or not isinstance(operation_id, str):
+            return False
+        with self.mutex:
+            if self.worker and self.worker.is_alive():
+                return False
+            worker = self._reconciliation_worker
+            if worker and terminal_run_hash(worker.run) != terminal_run_hash(run):
+                return False
+            if worker is None or not worker.thread.is_alive() and worker.state in ("error", "expired"):
+                self._reconciliation_worker = ReconciliationWorker(self.config, run, operation_id)
+                return False
+            receipt = worker.request(operation_id)
+            if isinstance(receipt, dict):
+                self._lifecycle["uncertain"] = False
+            return receipt
 
     def close(self):
+        if self._reconciliation_worker:
+            self._reconciliation_worker.close()
         self.finish("interrupted")
 
     def _run(self):
