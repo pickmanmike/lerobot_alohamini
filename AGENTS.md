@@ -1,3 +1,21 @@
+## Current AM1 mobile local observation scope
+
+For the explicitly invoked AM1-MOBILE-LOCAL-01 continuation, AM1 remains wireless.
+Use an explicitly selected, immutable local-camera-required sensing policy with
+simulated motor IO; P1 recording/viewing is temporary advisory engineering evidence.
+Preserve the separate strict P1-required diagnostic, its original 500 ms rules and
+failed results. Never downgrade an active run or fill missing local evidence with
+synthetic/cached proof. Local freshness uses original completed upstream arrival
+on Pi, not sensor exposure, and must expire at 500 ms through actual consumption.
+Reuse the existing exclusive camera-only owner/config/roles; decode outside the
+Unix-only task owner. No motor buses, live backend, calibration change, Wi-Fi
+experiment, Ethernet prerequisite or manual leader/shoulder action is authorized.
+Preserve ownership, protections, independent supervisors, exact separate component
+pins, private permissions, trust/enrollment, historical physical results and the
+unmerged dependent PR stack. Required-local loss holds/freezes and recovers only
+within the existing episode/admission/seed/deadline limits; optional P1/browser
+loss cannot spend recovery episodes or interrupt a healthy local task.
+
 ## Current AM1 virtual reliability scope
 
 For the explicitly invoked AM1-RELIABILITY-03 workstream, use finite virtual/scripted
