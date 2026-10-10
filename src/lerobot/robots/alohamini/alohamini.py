@@ -715,7 +715,12 @@ class AlohaMini(Robot):
         normal motor I/O after an exception. The Feetech SDK can otherwise retain
         its single-transaction busy flag when ``KeyboardInterrupt`` escapes a read.
         """
+        self._am1_shutdown_in_progress = True
         errors: list[str] = []
+        previous_evidence = getattr(self, "_am1_shutdown_evidence", None)
+        already_closed = not any(bus is not None and bus.is_connected for bus in (self.left_bus, self.right_bus))
+        if getattr(self, "_am1_protected_cleanup", False) and already_closed and previous_evidence is not None:
+            errors.extend(previous_evidence.get("cleanup_errors", []))
 
         if recover_interrupted_bus_io and self.config.robot_model == "alohamini1":
             for bus_name, bus in (("left", self.left_bus), ("right", self.right_bus)):
@@ -766,6 +771,42 @@ class AlohaMini(Robot):
             except Exception as error:
                 errors.append(f"verify final motor shutdown state: {error}")
 
+        if getattr(self, "_am1_protected_cleanup", False) and not (already_closed and previous_evidence is not None):
+            evidence = {"verified": False, "readbacks": [], "started_at_monotonic_s": time.monotonic()}
+            self._am1_shutdown_evidence = evidence
+            for bus_name, bus in (("left", self.left_bus), ("right", self.right_bus)):
+                if bus is None and bus_name == "right" and getattr(self.config, "no_follower", False):
+                    continue  # This legacy body/lift owner never configured right-arm motors.
+                if bus is None or not bus.is_connected:
+                    errors.append(f"AM1 cleanup readback: {bus_name} bus unavailable")
+                    continue
+                registers = [("Torque_Enable", name) for name in bus.motors]
+                if bus is self.left_bus:
+                    registers += [("Goal_Velocity", name) for name in (*self.base_motors, self.lift.cfg.name)
+                                  if name in bus.motors]
+                for register, name in registers:
+                    row = {"bus": bus_name, "motor": name, "register": register,
+                           "read_started_at_monotonic_s": time.monotonic()}
+                    evidence["readbacks"].append(row)
+                    try:
+                        value = bus.read(register, name, normalize=False, num_retry=REGISTER_RETRIES)
+                        if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+                            raise RuntimeError("shutdown readback was not a raw integer")
+                        row["value"] = int(value)
+                        if value != 0:
+                            raise RuntimeError(f"shutdown {register} remained {value}; expected zero")
+                    except Exception as error:
+                        row["error"] = f"{type(error).__name__}: {error}"
+                        errors.append(f"AM1 cleanup readback {bus_name}/{name}/{register}: {error}")
+                    finally:
+                        row["read_completed_at_monotonic_s"] = time.monotonic()
+            evidence["lift_readback"] = "qualified" if operation is not None and not errors else "unavailable-or-failed"
+            evidence["selected_gain_restore_required"] = bool(
+                integral_trial is not None and integral_trial.restore_required
+            )
+            evidence["completed_at_monotonic_s"] = time.monotonic()
+            evidence["verified"] = not errors
+
         for name, camera in self.cameras.items():
             if not camera.is_connected:
                 continue
@@ -784,6 +825,12 @@ class AlohaMini(Robot):
                     errors.append(f"close {bus_name} bus: {error}")
 
         self.lift.mark_unhomed()
+        if getattr(self, "_am1_protected_cleanup", False):
+            self._am1_shutdown_evidence["cleanup_errors"] = list(errors)
+            self._am1_shutdown_evidence["buses_closed"] = close_buses and not any(
+                bus is not None and bus.is_connected for bus in (self.left_bus, self.right_bus)
+            )
+            self._am1_shutdown_evidence["verified"] = not errors
         for error in errors:
             logger.error("AlohaMini shutdown issue: %s", error)
         return errors

@@ -131,6 +131,7 @@ class AM1SessionTransport {
 globalThis.AM1SessionTransport=AM1SessionTransport;
 globalThis.AM1RemoteInitialize=function() {
   const state=document.querySelector("#session-state"),notice=document.querySelector("#control-notice");
+  const defaultControlHelp="Explicitly claim input before Start. Finite authorization survives browser closure. Interactive work needs a fresh connected snapshot, empty release and qualified Resume. Disconnect, blur and handoff clear held keys. Pause and Stop remain available to enrolled control-capable spectators. Motor feedback and commands remain simulated. When configured, real P1 images qualify observation on Pi; optional browser video has no control authority.";
   const render=(transport,message)=> {
     const run=transport.snapshot?.run;
     const recipes=transport.snapshot?.recipes, select=document.querySelector("#fake-recipe");
@@ -142,14 +143,23 @@ globalThis.AM1RemoteInitialize=function() {
       if([...select.options].some(option=>option.value===previous))select.value=previous;
       select.dataset.recipes=JSON.stringify(recipes);
     }
+    const physicalRun=run?.source==="protected-physical-provider" || run?.recipe?.startsWith("physical-");
+    const physical=physicalRun || recipes?.some(name=>name.startsWith("physical-"));
     const simulated=run?.source==="simulated-provider" || recipes?.some(name=>name.startsWith("sim-"));
-    document.querySelector("#view-heading").textContent=simulated ? "Simulated finite provider session" : "Fake persistent session";
-    state.textContent=run ? `Fake session · ${run.status} · ${run.progress_s.toFixed(2)} s` : "Fake session · no run";
+    const priorTest=physical && run && !physicalRun, priorKind=simulated ? "simulated" : "synthetic";
+    document.querySelector("#view-heading").textContent=physical ? "Physical finite AM1 session" : simulated ? "Simulated finite provider session" : "Fake persistent session";
+    state.textContent=run ? `${priorTest ? `Prior ${priorKind}` : physical ? "Physical" : "Fake"} session · ${run.status} · ${run.progress_s.toFixed(2)} s` : `${physical ? "Physical" : "Fake"} session · no run`;
     document.querySelector("#session-details").textContent=JSON.stringify(transport.snapshot,null,2);
-    document.querySelector("#live-countdown").textContent=run ? `Original Live budget: ${Math.ceil(run.remaining_s || 0)} s remaining` : "No fake run";
+    const terminal=run && ["stopped","completed","faulted","interrupted"].includes(run.status);
+    document.querySelector("#live-countdown").textContent=priorTest ? `Prior ${priorKind} result · cleanup: ${run.cleanup || "unknown"}; physical Start required` :
+      physical && run?.status==="finishing" ? "Physical finishing · measured cleanup pending; native Live countdown pending" :
+      physical && terminal ? `Physical session ended · cleanup: ${run.cleanup || "unknown"}` :
+      physical && run && !Number.isFinite(run.native_live_at) ? "Physical startup · native Live countdown pending" :
+      run ? `Original Live budget: ${Math.ceil(run.remaining_s || 0)} s remaining` : physical ? "No physical run · Start required" : "No fake run";
     const evidence=transport.snapshot?.evidence;
     const observationLabel={"real-p1/pi-decoded":"Required P1 observation", "real-local-camera/pi-decoded-arrival":`Required local ${evidence?.sensing_source?.role || "camera"} observation`}[evidence?.observation_provenance];
-    document.querySelector("#connection").textContent=`${transport.connected ? "Connected" : "Disconnected"} · ${observationLabel ? `${observationLabel} · ${evidence?.required_observation ? "current images validated on Pi" : "current image proof unavailable"} · motor feedback and commands simulated` : "Cameras and hardware unavailable in fake mode"}`;
+    const observationStatus=observationLabel ? `${observationLabel} · ${evidence?.required_observation ? "current images validated on Pi" : "current image proof unavailable"}` : "Task observation policy shown in current status";
+    document.querySelector("#connection").textContent=`${transport.connected ? "Connected" : "Disconnected"} · ${physical ? `${observationStatus} · actual motor feedback ${evidence?.feedback ? "current" : "unavailable"} · protected-host ACK ${evidence?.native_ack ? "current" : "pending"}` : observationLabel ? `${observationStatus} · motor feedback and commands simulated` : "Cameras and hardware unavailable in fake mode"}`;
     if(transport.optionalVideo&&!transport.videoView&&globalThis.AM1P1View) {
       const root=document.querySelector("#am1-camera-root");root.replaceChildren();
       const label=document.createElement("p");label.textContent="Optional external P1 view · separate from required Pi image validation";
@@ -161,7 +171,26 @@ globalThis.AM1RemoteInitialize=function() {
       open.onclick=()=>view.start();close.onclick=()=>{view.stop();status.textContent="View closed · task observation continues independently";};
       window.addEventListener("pagehide",()=>view.stop());root.append(label,video,status,open,close);
     }
-    document.querySelector("#gate-state").textContent=transport.controllerGeneration ? "Explicit controller; accepted requests require actual fake acknowledgement." : "Spectator; viewing does not claim input.";
+    document.querySelector("#gate-state").textContent=transport.controllerGeneration ? physical ? "Explicit controller; physical Start activates the protected host. Request acceptance is separate from protected-host ACK and measured motion." : "Explicit controller; accepted requests require actual fake acknowledgement." : "Spectator; viewing does not claim input.";
+    document.querySelector("#control-help").textContent=physical ? "Explicitly claim input before physical Start. Start activates the selected bounded recipe through the protected motor host. Viewing, enrollment and reconnection do not start motion. Finite authorization survives browser closure. Pause and Stop remain available to enrolled control-capable spectators. Actual feedback and protected-host ACK are reported separately; an accepted command does not prove joint motion. Body inputs belong to the selected finite recipe. Required camera evidence is validated on Pi; optional P1 viewing is advisory." : defaultControlHelp;
+    if(!transport.videoView)document.querySelector("#am1-camera-root").textContent=physical ? "Task camera evidence is validated on Pi; optional P1 viewing is advisory." : "Cameras unavailable · synthetic fake evidence only";
+    for(const button of document.querySelectorAll("[data-operation], [data-body-key]")) {
+      button.title=physical ? "Physical finite session control" : "Fake session control";
+      if(button.dataset.operation)button.setAttribute("aria-label",`${button.dataset.operation} ${physical ? "physical" : "fake"} session`);
+      if(button.dataset.bodyKey) {
+        const unavailable=button.dataset.bodyKey==="z" || button.dataset.bodyKey==="x";
+        button.disabled=physical || unavailable;
+        if(physical) {
+          button.title="Body inputs belong to the selected finite physical recipe";
+          button.setAttribute("aria-label",`${button.dataset.bodyKey.toUpperCase()} provided by selected physical recipe`);
+          if(unavailable)button.querySelector("span").textContent="Unavailable in finite physical recipes";
+        } else if(unavailable) {
+          button.title="Unavailable in fake mode";
+          button.setAttribute("aria-label",`${button.dataset.bodyKey.toUpperCase()} unavailable in fake mode`);
+          button.querySelector("span").textContent="Unavailable in fake mode";
+        }
+      }
+    }
     if(message){notice.textContent=message;notice.hidden=false;}
     document.querySelector("#pairing-panel").hidden=Boolean(transport.device);
     for(const button of document.querySelectorAll("[data-operation]"))button.disabled=!transport.control || !transport.connected;
@@ -177,7 +206,7 @@ globalThis.AM1RemoteInitialize=function() {
   claimButton.textContent="Claim input";options.prepend(claimButton);
   document.querySelector('label[for="duration-seconds"]').hidden=true;
   const camera=document.querySelector("#am1-camera-root");camera.replaceChildren();camera.textContent="Cameras unavailable · synthetic fake evidence only";
-  document.querySelector("#control-help").textContent="Explicitly claim input before Start. Finite authorization survives browser closure. Interactive work needs a fresh connected snapshot, empty release and qualified Resume. Disconnect, blur and handoff clear held keys. Pause and Stop remain available to enrolled control-capable spectators. Motor feedback and commands remain simulated. When configured, real P1 images qualify observation on Pi; optional browser video has no control authority.";
+  document.querySelector("#control-help").textContent=defaultControlHelp;
   document.querySelector('[data-operation="Approve"]').hidden=true;
   for(const button of document.querySelectorAll("[data-operation], [data-body-key]")) {
     button.removeAttribute("data-tip");button.title="Fake session control";

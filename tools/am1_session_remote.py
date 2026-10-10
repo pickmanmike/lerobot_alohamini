@@ -496,7 +496,7 @@ class RemoteSupervisor:
             self.lock_stream = acquire_session_admission(state_directory)
         except RuntimeError as exc:
             self.lock_stream = None
-            raise SessionRefusal("Another AM1 unified session supervisor is active; refusing takeover.") from exc
+            raise SessionRefusal(str(exc)) from exc
         self.session_root.mkdir(parents=True, exist_ok=False, mode=0o700)
         os.chmod(self.session_root, 0o700)
         _validate_repository(Path(self.args.session_repository), self.args.session_head, "session helper")
@@ -524,6 +524,11 @@ class RemoteSupervisor:
         )
 
     def _spawn(self, name: str, command: list[str], env: dict[str, str]) -> OwnedChild:
+        pass_fds = ()
+        if name == "host":
+            if self.lock_stream is None or self.lock_stream.closed:
+                raise SessionRefusal("Motor host requires this supervisor's held canonical admission.")
+            pass_fds = (self.lock_stream.fileno(),)
         control_path = self.session_root / f"{name}-control.log"
         control_stream = control_path.open("w", encoding="utf-8", buffering=1)
         process = subprocess.Popen(
@@ -534,6 +539,8 @@ class RemoteSupervisor:
             text=True,
             env=env,
             start_new_session=True,
+            close_fds=True,
+            pass_fds=pass_fds,
         )
         child = OwnedChild(name, process, process.pid, control_path, control_stream=control_stream)
         self.children[name] = child
@@ -611,9 +618,16 @@ class RemoteSupervisor:
         env = dict(os.environ)
         env["AM1_LOG_DIRECTORY"] = self.args.log_directory
         env["AM1_SYNC_SHOULDER_READBACK"] = "1"
+        admission_arguments = []
+        if self.lock_stream is not None:
+            admission_arguments = [
+                "--am1-admission-fd", str(self.lock_stream.fileno()),
+                "--am1-physical-state-directory", self.args.state_directory,
+            ]
         child = self._spawn(
             "host",
-            ["bash", str(Path(self.args.motor_repository) / "tools" / "run_am1_host.sh"), "--mode", "local"],
+            ["bash", str(Path(self.args.motor_repository) / "tools" / "run_am1_host.sh"),
+             "--mode", "local", *admission_arguments],
             env,
         )
         log_path = self._wait_for(

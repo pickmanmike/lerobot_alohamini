@@ -258,7 +258,7 @@ class AlohaMiniClient(Robot):
             if self.command_send_timeout_ms is not None:
                 self.zmq_cmd_socket.setsockopt(zmq.SNDTIMEO, self.command_send_timeout_ms)
                 self.zmq_cmd_socket.setsockopt(zmq.LINGER, 0)
-            zmq_cmd_locator = f"tcp://{self.remote_ip}:{self.port_zmq_cmd}"
+            zmq_cmd_locator = self.config.command_endpoint or f"tcp://{self.remote_ip}:{self.port_zmq_cmd}"
             self.zmq_cmd_socket.connect(zmq_cmd_locator)
 
             # Request-driven observation transport with a small bounded window.
@@ -267,7 +267,7 @@ class AlohaMiniClient(Robot):
                 self.zmq_observation_socket.setsockopt(zmq.LINGER, 0)
             self.zmq_observation_socket.setsockopt(zmq.RCVHWM, self.observation_request_window)
             self.zmq_observation_socket.setsockopt(zmq.SNDHWM, self.observation_request_window)
-            zmq_observations_locator = f"tcp://{self.remote_ip}:{self.port_zmq_observations}"
+            zmq_observations_locator = self.config.observation_endpoint or f"tcp://{self.remote_ip}:{self.port_zmq_observations}"
             self.zmq_observation_socket.connect(zmq_observations_locator)
 
             if self.config.robot_model == "alohamini1":

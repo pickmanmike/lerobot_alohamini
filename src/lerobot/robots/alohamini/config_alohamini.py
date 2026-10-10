@@ -75,6 +75,9 @@ class AlohaMiniConfig(RobotConfig):
 
 @dataclass
 class AlohaMiniHostConfig:
+    # AM1 opt-in private filesystem transport; ordinary/AM2 TCP remains unchanged.
+    protected_run_directory: str | None = None
+
     # Network Configuration
     port_zmq_cmd: int = 5555
     port_zmq_observations: int = 5556
@@ -97,6 +100,8 @@ class AlohaMiniHostConfig:
 class AlohaMiniClientConfig(RobotConfig):
     # Network Configuration
     remote_ip: str
+    command_endpoint: str | None = None
+    observation_endpoint: str | None = None
     port_zmq_cmd: int = 5555
     port_zmq_observations: int = 5556
     observation_request_window: int = 3

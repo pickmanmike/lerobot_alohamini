@@ -2,7 +2,7 @@
 
 from functools import partial
 
-from .am1_scripted_prepare import PreparedScriptedInput
+from .am1_scripted_prepare import SHOULDER, PreparedScriptedInput
 from .scripted_leader import ArmHoldBodyInput, ScriptedLeaderInput
 from .scripted_leader_repeat import ArmSmokeRepeatInput
 
@@ -14,11 +14,25 @@ JOINT_KEYS = tuple(
 
 
 class FiniteTask:
-    def __init__(self, recipe, positions, now, shoulder_amplitude, *, start_held=False):
+    def __init__(
+        self,
+        recipe,
+        positions,
+        now,
+        shoulder_amplitude,
+        *,
+        start_held=False,
+        feedback_provenance="simulated-feedback",
+    ):
+        self.feedback_provenance = feedback_provenance
+        self.initial_measured_reference = dict(positions)
         profile = {
             "sim-arm-smoke": ("ArmSmoke", ScriptedLeaderInput),
             "sim-arm-smoke-repeat": ("ArmSmokeRepeat", ArmSmokeRepeatInput),
             "sim-arm-hold-body": ("ArmHoldBody", ArmHoldBodyInput),
+            "physical-arm-smoke": ("ArmSmoke", ScriptedLeaderInput),
+            "physical-arm-smoke-repeat": ("ArmSmokeRepeat", ArmSmokeRepeatInput),
+            "physical-arm-hold-body": ("ArmHoldBody", ArmHoldBodyInput),
         }[recipe.name]
         self.profile = profile[0]
         self.admitted_at = now
@@ -26,7 +40,19 @@ class FiniteTask:
         self.cycles_completed = self.returns_qualified = 0
         self.original_seed = None
         self.joint_amplitudes = dict.fromkeys(JOINT_KEYS, 3.0)
-        if self.profile == "ArmHoldBody":
+        prepare_body = (
+            recipe.name == "physical-arm-hold-body" and not -100.0 <= positions.get(SHOULDER, 0.0) <= 100.0
+        )
+        if self.profile == "ArmHoldBody" and prepare_body:
+            self.provider = PreparedScriptedInput(
+                positions,
+                joint_keys=JOINT_KEYS,
+                fps=10,
+                provider=ArmHoldBodyInput,
+                motion_profile=self.profile,
+                emit=self.record,
+            )
+        elif self.profile == "ArmHoldBody":
             self.provider = profile[1](positions, joint_keys=JOINT_KEYS, fps=10, emit=self.record)
             self.original_seed = dict(positions)
         else:
@@ -120,5 +146,6 @@ class FiniteTask:
             "joint_amplitudes": self.joint_amplitudes,
             "feedback_sequence": self.sequence,
             "profile": self.profile,
-            "provenance": "existing-provider/simulated-feedback",
+            "provenance": "existing-provider/" + self.feedback_provenance,
+            "initial_measured_reference": self.initial_measured_reference,
         }

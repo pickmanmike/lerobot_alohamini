@@ -1,4 +1,4 @@
-"""Explicitly simulated Pi executor. This module has no live backend factory."""
+"""Pi owner entrypoint. Simulation remains default; physical selection is explicit and separately adapted."""
 
 import argparse
 import asyncio
@@ -271,10 +271,45 @@ class PiExecutor:
         self.finish("owner_shutdown")
 
 
+def select_executor(
+    backend, physical_config, *, admission_directory, shoulder_amplitude, observation, sensing_policy
+):
+    if backend == "simulated":
+        if physical_config is not None or admission_directory is None:
+            raise ValueError(
+                "simulated mode requires its isolated admission and forbids physical configuration"
+            )
+        return PiExecutor(
+            SimulatedIO(),
+            admission_directory,
+            shoulder_amplitude=shoulder_amplitude,
+            observation=observation,
+            sensing_policy=sensing_policy,
+        )
+    if (
+        backend != "protected-physical"
+        or physical_config is None
+        or sensing_policy != "local-camera-required"
+    ):
+        raise ValueError(
+            "explicit protected physical configuration and local-camera-required policy required"
+        )
+    from tools.am1_physical_executor import PhysicalExecutor
+
+    if physical_config.get("shoulder_amplitude") != shoulder_amplitude:
+        raise ValueError("private mapped physical amplitude disagrees with protected recipe")
+    return PhysicalExecutor(physical_config, observation)
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Isolated simulated finite AM1 owner; no hardware backend")
+    parser = argparse.ArgumentParser(description="Pi-owned finite AM1 owner; simulation by default")
     parser.add_argument("--state", required=True)
-    parser.add_argument("--simulated-admission-state", required=True)
+    parser.add_argument("--simulated-admission-state")
+    parser.add_argument("--backend", choices=("simulated", "protected-physical"), default="simulated")
+    parser.add_argument(
+        "--physical-config",
+        help="Private exact protected component configuration; explicit live backend only",
+    )
     parser.add_argument("--sensing-policy", choices=("simulated", "p1-required", "local-camera-required"))
     parser.add_argument(
         "--observation-source",
@@ -303,13 +338,27 @@ def main():
             observation = LocalObservationMailbox(source)
         else:
             observation = ObservationMailbox(source)
-    executor = PiExecutor(
-        SimulatedIO(),
-        args.simulated_admission_state,
-        shoulder_amplitude=amplitude,
-        observation=observation,
-        sensing_policy=args.sensing_policy,
-    )
+    physical_config = None
+    if args.physical_config:
+        if args.backend != "protected-physical":
+            parser.error("physical configuration forbidden in default simulated mode")
+        from pathlib import Path
+
+        from tools.am1_camera_viewer import load_private
+        from tools.am1_session_ipc import strict_json
+
+        physical_config = load_private(args.physical_config)
+    try:
+        executor = select_executor(
+            args.backend,
+            physical_config,
+            admission_directory=args.simulated_admission_state,
+            shoulder_amplitude=amplitude,
+            observation=observation,
+            sensing_policy=args.sensing_policy,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
     asyncio.run(run_owner(args.state, executor))
 
 

@@ -59,6 +59,7 @@ class SessionAuthority:
     def __init__(self, state_directory, clock=time.monotonic, wall_clock=time.time, executor=None):
         self.clock, self.wall_clock = clock, wall_clock
         self.executor = executor or FakeExecutor(clock)
+        self.asynchronous = getattr(self.executor, "asynchronous", False) is True
         self.directory = Path(state_directory)
         self.directory.mkdir(parents=True, exist_ok=True)
         self.owner_lock = OwnerLock(self.directory / "owner.lock")
@@ -96,7 +97,88 @@ class SessionAuthority:
             self.run["first_cause"] = self.run["first_cause"] or "service_restart"
             self._event("service_restart")
             self._save()
-        self.executor.hold()
+        self._hold()
+
+    def _set_executor_revision(self):
+        if self.asynchronous and self.run:
+            self.executor.set_intent_revision(self.run["intent_revision"])
+
+    def _hold(self):
+        self._set_executor_revision()
+        return self.executor.hold()
+
+    def _evidence(self):
+        if not self.asynchronous:
+            return self.executor.evidence()
+        try:
+            return self.executor.evidence()
+        except (OSError, RuntimeError, ValueError) as exc:
+            return {
+                "feedback": False,
+                "required_observation": False,
+                "native_ack": False,
+                "pose_aligned": False,
+                "fault": str(exc),
+            }
+
+    def _physical_lifecycle(self, evidence, now):
+        """Consume cached exact-run receipts; never execute blocking backend work."""
+        run = self.run
+        lifecycle = evidence.get("lifecycle")
+        matching = isinstance(lifecycle, dict) and lifecycle.get("run_id") == run["run_id"]
+        if matching and run.get("backend_incarnation") is not None:
+            matching = lifecycle.get("backend_incarnation") == run["backend_incarnation"]
+        if run["status"] == "finishing":
+            if matching and lifecycle.get("phase") == "terminal":
+                cleanup = lifecycle.get("cleanup")
+                uncertain = lifecycle.get("uncertain")
+                if isinstance(cleanup, str) and cleanup and type(uncertain) is bool:
+                    run["physical_result"] = json.loads(json.dumps(lifecycle, allow_nan=False))
+                    run["native_first_cause"] = run["physical_result"].get("first_cause")
+                    run["first_cause"] = run["first_cause"] or run["native_first_cause"]
+                    run["cleanup"] = cleanup
+                    run["uncertain"] = run["uncertain"] or uncertain
+                    run["status"] = run["requested_terminal"]
+                    if lifecycle.get("terminal_status") == "faulted":
+                        run["status"] = "faulted"
+                    self._event(run["status"])
+                    self._save()
+                    return True
+            if now >= run["finish_ceiling"]:
+                run.update(
+                    status=run["requested_terminal"], cleanup="physical_cleanup_unknown", uncertain=True
+                )
+                run["first_cause"] = run["first_cause"] or "physical_cleanup_timeout"
+                self._event(run["status"])
+                self._save()
+            return True
+        if run.get("native_live_at") is not None:
+            return False
+        if now >= run["startup_deadline"]:
+            self._finish("faulted", "physical_startup_timeout")
+            return True
+        native_live_at = lifecycle.get("native_live_at") if matching else None
+        if not (
+            matching
+            and lifecycle.get("phase") == "live"
+            and type(native_live_at) in (int, float)
+            and math.isfinite(native_live_at)
+            and run["accepted_at"] <= native_live_at <= now
+        ):
+            return True
+        run["native_live_at"] = native_live_at
+        incarnation = lifecycle.get("backend_incarnation")
+        if isinstance(incarnation, str) and incarnation:
+            run["backend_incarnation"] = incarnation
+        run["deadline"] = native_live_at + RECIPES[run["recipe"]].live_s
+        run["preparation_ceiling"] = min(native_live_at + 20, run["deadline"])
+        run["dispatch"] = "acknowledged"
+        if run["status"] == "starting":
+            run["status"] = "preparing"
+        self.last_tick = now
+        self._event("native_live_admitted")
+        self._save()
+        return False
 
     def _event(self, kind):
         event = {
@@ -163,18 +245,51 @@ class SessionAuthority:
         self.released = False
         if self.run:
             self.run["intent"] = None
-        if not self.run or self.run["status"] != "running" or RECIPES[self.run["recipe"]].mode != "finite":
-            self.executor.hold()
+        finite_owned = (
+            self.run
+            and RECIPES[self.run["recipe"]].mode == "finite"
+            and (
+                self.run["status"] == "running"
+                or self.asynchronous
+                and self.run["status"] in {"starting", "preparing", "resuming"}
+            )
+        )
+        if not finite_owned:
+            self._hold()
 
     def _finish(self, status, cause=None):
+        if cause and not self.run["first_cause"]:
+            self.run["first_cause"] = cause
+        if self.asynchronous:
+            if self.run["status"] == "finishing":
+                if status == "stopped" and self.run["requested_terminal"] != "faulted":
+                    self.run["requested_terminal"] = status
+                    self._save()
+                return
+            self.run["status"] = "finishing"
+            self.run["requested_terminal"] = status
+            self.run["finish_ceiling"] = self.clock() + 60
+            self.run["intent"] = None
+            self.run["cleanup"] = None
+            self._set_executor_revision()
+            try:
+                outcome = self.executor.finish(status)
+            except (OSError, RuntimeError, ValueError) as exc:
+                outcome = {"cleanup": "physical_cleanup_unknown", "uncertain": True}
+                self.run["first_cause"] = self.run["first_cause"] or str(exc)
+            if not outcome.get("pending"):
+                self.run["status"] = status
+                self.run["cleanup"] = outcome["cleanup"]
+                self.run["uncertain"] = self.run["uncertain"] or outcome["uncertain"]
+            self._event(self.run["status"])
+            self._save()
+            return
         self.run["status"] = status
         self.run["intent"] = None
         outcome = self.executor.finish(status)
         self.run["cleanup"] = outcome["cleanup"]
         self.run["uncertain"] = self.run["uncertain"] or outcome["uncertain"]
-        if cause and not self.run["first_cause"]:
-            self.run["first_cause"] = cause
-        self.executor.hold()
+        self._hold()
         self._event(status)
         self._save()
 
@@ -295,26 +410,26 @@ class SessionAuthority:
                 return self._refuse("current controller lease required")
             if self.run and (self.run["uncertain"] or self.run["status"] not in TERMINAL):
                 return self._refuse("reconciliation or terminal run required")
-            evidence = self.executor.evidence()
+            evidence = self._evidence()
             preparing_observation = getattr(self.executor, "observation", None) is not None
             required_keys = (
                 ("feedback", "native_ack")
                 if preparing_observation
                 else ("feedback", "required_observation", "native_ack")
             )
-            if evidence["fault"] or not all(evidence[k] for k in required_keys):
-                self.executor.hold()
+            if evidence["fault"] or not self.asynchronous and not all(evidence[k] for k in required_keys):
+                self._hold()
                 return self._refuse("fresh qualified feedback/proof and acknowledgement required")
             self.run = {
                 "run_id": str(uuid.uuid4()),
                 "operation_id": oid,
                 "recipe": recipe.name,
                 "source": self.executor.source,
-                "seed": recipe.seed,
+                "seed": None if self.asynchronous else recipe.seed,
                 "status": "accepted",
                 "dispatch": "accepted",
                 "progress_s": 0.0,
-                "deadline": now + recipe.live_s,
+                "deadline": None if self.asynchronous else now + recipe.live_s,
                 "first_cause": None,
                 "uncertain": False,
                 "intent": None,
@@ -332,9 +447,34 @@ class SessionAuthority:
                 "INSERT INTO operations VALUES (?,?,?,?)", (oid, digest, d, json.dumps(self._run_result()))
             )
             self._save()
+            if self.asynchronous:
+                self.run.update(
+                    status="starting", accepted_at=now, native_live_at=None, startup_deadline=now + 180
+                )
+                self._save()
+                try:
+                    self.executor.bind_run(self.run["run_id"], recipe)
+                    self._set_executor_revision()
+                    if not self.executor.begin(recipe):
+                        self._finish("faulted", "physical_startup_unaccepted")
+                    else:
+                        lifecycle = self._evidence().get("lifecycle", {})
+                        startup_deadline = lifecycle.get("startup_deadline")
+                        if (
+                            lifecycle.get("run_id") == self.run["run_id"]
+                            and type(startup_deadline) in (int, float)
+                            and math.isfinite(startup_deadline)
+                            and now < startup_deadline <= now + 180
+                        ):
+                            self.run["startup_deadline"] = startup_deadline
+                        self._event("start")
+                        self._save()
+                except (OSError, RuntimeError, ValueError) as exc:
+                    self._finish("faulted", str(exc))
+                return self._run_result()
             if recipe.mode == "interactive":
                 self.run["status"] = "paused"
-                self.executor.hold()
+                self._hold()
                 self._event("start")
                 self._save()
                 return self._run_result()
@@ -370,7 +510,11 @@ class SessionAuthority:
                 return self._refuse("no uncertainty")
             if not self.controller or self.controller["device_id"] != d:
                 return self._refuse("owner required")
-            if not self.executor.evidence()["feedback"]:
+            if self.asynchronous:
+                reconcile = getattr(self.executor, "reconcile", None)
+                if not reconcile or not reconcile(self.run["run_id"]):
+                    return self._refuse("actual physical cleanup reconciliation required")
+            if not self._evidence()["feedback"]:
                 return self._refuse("feedback required")
             self.run["uncertain"] = False
             self._save()
@@ -378,7 +522,12 @@ class SessionAuthority:
         if op in ("pause", "stop"):
             if self.run["status"] in TERMINAL:
                 return self._refuse("terminal")
-            fault = self.executor.evidence()["fault"]
+            if self.asynchronous and self.run["status"] == "finishing":
+                if op == "stop":
+                    self._finish("stopped")
+                    return {"accepted": True, "status": "finishing", "effect_admitted": False}
+                return self._refuse("physical finishing already in progress")
+            fault = self._evidence()["fault"]
             if fault and not self.run["first_cause"]:
                 self.run["first_cause"] = str(fault)
             self.run["intent_revision"] += 1
@@ -387,10 +536,10 @@ class SessionAuthority:
                 self._finish("stopped")
             else:
                 self.run["status"] = "paused"
-                self.executor.hold()
+                self._hold()
                 self._event("pause")
                 self._save()
-            return {"accepted": True, "status": self.run["status"], "effect_admitted": True}
+            return {"accepted": True, "status": self.run["status"], "effect_admitted": not self.asynchronous}
         if self.run["status"] in TERMINAL:
             return self._refuse("terminal")
         if op == "connect":
@@ -417,14 +566,17 @@ class SessionAuthority:
             revision = c.get("expected_intent_revision")
             if type(revision) is not int or revision != self.run["intent_revision"]:
                 return self._refuse("stale or malformed intent revision")
-            e = self.executor.evidence()
+            e = self._evidence()
             if (
                 self.run["status"] != "paused"
+                or self.asynchronous
+                and self.run.get("native_live_at") is None
                 or not self.released
                 or not all(e[k] for k in ("feedback", "required_observation", "pose_aligned", "native_ack"))
             ):
                 return self._refuse("qualified release/alignment required")
             self.run["intent_revision"] += 1
+            self._set_executor_revision()
             self.run["status"] = "running"
             self.last_tick = now
             self.run["dispatch"] = "dispatching"
@@ -438,9 +590,16 @@ class SessionAuthority:
             self.run["dispatch"] = "acknowledged" if admitted else "unacknowledged"
             if admitted:
                 self.run["recovery"] = None
+            elif self.asynchronous:
+                self.run["status"] = "resuming"
+                self.run["resume_ceiling"] = min(
+                    now + 10,
+                    self.run["deadline"],
+                    self.run["recovery"]["ceiling"] if self.run["recovery"] else self.run["deadline"],
+                )
             else:
                 self.run["status"] = "paused"
-                self.executor.hold()
+                self._hold()
             self._save()
             return {"accepted": True, "status": self.run["status"], "effect_admitted": admitted}
         if op == "grant":
@@ -468,7 +627,7 @@ class SessionAuthority:
                 or any(type(x) not in (int, float) or not math.isfinite(x) or abs(x) > 1 for x in target)
             ):
                 return self._refuse("invalid normalized fake target")
-            if self.run["status"] != "running" or not self.executor.evidence()["feedback"]:
+            if self.run["status"] != "running" or not self._evidence()["feedback"]:
                 return self._refuse("not qualified")
             self.connection["seq"] = seq
             self.run["intent"] = list(target)
@@ -496,9 +655,14 @@ class SessionAuthority:
             previous_status = r["status"] if r else None
             if not r or r["status"] in TERMINAL:
                 return
-            e = self.executor.evidence()
+            e = self._evidence()
+            if self.asynchronous and r["status"] == "finishing":
+                self._physical_lifecycle(e, now)
+                return
             if e["fault"]:
                 self._finish("faulted", str(e["fault"]))
+                return
+            if self.asynchronous and self._physical_lifecycle(e, now):
                 return
             if now >= r["deadline"]:
                 self._finish("stopped", "live_deadline")
@@ -508,10 +672,35 @@ class SessionAuthority:
                 if now >= r["preparation_ceiling"]:
                     self._finish("faulted", "observation_preparation_timeout")
                     return
-                if qualified and e["pose_aligned"] and self.executor.dispatch(RECIPES[r["recipe"]]):
-                    r["status"] = "running"
-                    self._event("observation_qualified")
-            elif r["status"] == "running" and not qualified:
+                if qualified and e["pose_aligned"]:
+                    try:
+                        self._set_executor_revision()
+                        admitted = self.executor.dispatch(RECIPES[r["recipe"]])
+                    except (OSError, RuntimeError, ValueError) as exc:
+                        self._finish("faulted", str(exc))
+                        return
+                    if admitted:
+                        r["status"] = "running"
+                        self._event("observation_qualified")
+            elif self.asynchronous and r["status"] == "resuming":
+                if now >= r["resume_ceiling"]:
+                    self._finish("faulted", "physical_resume_timeout")
+                    return
+                if qualified and e["pose_aligned"]:
+                    try:
+                        self._set_executor_revision()
+                        admitted = self.executor.dispatch(RECIPES[r["recipe"]])
+                    except (OSError, RuntimeError, ValueError) as exc:
+                        self._finish("faulted", str(exc))
+                        return
+                    if admitted:
+                        r["status"] = "running"
+                        r["dispatch"] = "acknowledged"
+                        r["recovery"] = None
+                        self._event("resumed")
+            elif r["status"] == "running" and not (
+                qualified and (not self.asynchronous or e.get("active_acknowledged") is True)
+            ):
                 r["recovery_episodes"] += 1
                 r["first_cause"] = r["first_cause"] or (
                     "feedback_loss" if not e["feedback"] else "required_proof_loss"
@@ -531,12 +720,13 @@ class SessionAuthority:
                     return
                 if qualified and e["pose_aligned"] and recovery["revision"] == r["intent_revision"]:
                     try:
+                        self._set_executor_revision()
                         admitted = self.executor.dispatch(RECIPES[r["recipe"]])
                     except Exception:
                         r["uncertain"] = True
                         self._finish("faulted", "dispatch_exception")
                         return
-                    fault = self.executor.evidence()["fault"]
+                    fault = self._evidence()["fault"]
                     if fault:
                         self._finish("faulted", str(fault))
                         return
@@ -546,9 +736,14 @@ class SessionAuthority:
                         self._event("recovered")
                     else:
                         r["status"] = "recovering"
-                        self.executor.hold()
+                        if not self.asynchronous:
+                            self._hold()
             elif r["status"] == "running" and RECIPES[r["recipe"]].mode == "finite":
-                execution = self.executor.advance(now, dt)
+                try:
+                    execution = self.executor.advance(now, dt)
+                except (OSError, RuntimeError, ValueError) as exc:
+                    self._finish("faulted", str(exc))
+                    return
                 r["execution"] = execution
                 r["progress_s"] = execution["progress_s"]
                 if execution.get("fault"):
@@ -585,7 +780,7 @@ class SessionAuthority:
                             if RECIPES[self.run["recipe"]].trajectory_s is None
                             else max(0, RECIPES[self.run["recipe"]].trajectory_s - self.run["progress_s"]),
                         ),
-                        "evidence": self.executor.evidence(),
+                        "evidence": self._evidence(),
                         "recipes": [
                             name for name, recipe in RECIPES.items() if self.executor.supports(recipe)
                         ],
@@ -595,6 +790,20 @@ class SessionAuthority:
             )
 
     def close(self):
+        if self.asynchronous:
+            with self.mutex:
+                if self.closed:
+                    return
+                self.closed = True
+            # Physical worker shutdown may join bounded homing/cleanup work. It must
+            # not prevent worker receipt publication or status reads via this mutex.
+            try:
+                self.executor.close()
+            finally:
+                with self.mutex:
+                    self.db.close()
+                    self.owner_lock.close()
+            return
         with self.mutex:
             if self.closed:
                 return
