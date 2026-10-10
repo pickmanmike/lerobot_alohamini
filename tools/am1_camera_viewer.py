@@ -493,10 +493,10 @@ def validate_credentials(value):
     if not isinstance(value, dict) or set(value) != {"username", "password"}:
         raise ValueError("Expected private username and password only")
     if not isinstance(value["username"], str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value["username"]):
-        raise ValueError("Username must contain 1â€“64 ASCII letters, digits, underscore or dash")
+        raise ValueError("Username must contain 1–64 ASCII letters, digits, underscore or dash")
     password = value["password"]
     if not isinstance(password, str) or not 12 <= len(password) <= 256 or any(ord(c) < 32 or ord(c) > 126 for c in password):
-        raise ValueError("Use 12â€“256 printable ASCII characters for the private viewing password")
+        raise ValueError("Use 12–256 printable ASCII characters for the private viewing password")
     return value
 
 
@@ -617,12 +617,12 @@ def main(argv=None):
     modes.add_argument("--init-auth", action="store_true", help="Enter private browser credentials locally")
     parser.add_argument("--bind", help="Explicit LAN IPv4 address for --configure")
     parser.add_argument("--camera", action="append", default=[], metavar="ROLE=CAPTURE_PATH")
-    parser.add_argument("--duration", type=float, help="Optional bounded camera-only check, 1â€“120 seconds")
+    parser.add_argument("--duration", type=float, help="Optional bounded camera-only check, 1–120 seconds")
     args = parser.parse_args(argv)
     if args.config is None:
         args.config = home / ".config/am1-camera" / ("identification.json" if args.identify else "cameras.json")
     if args.duration is not None and not 1 <= args.duration <= 120:
-        parser.error("--duration must be finite and within 1â€“120 seconds")
+        parser.error("--duration must be finite and within 1–120 seconds")
     if not args.configure and (args.bind or args.camera):
         parser.error("--bind and --camera are only for --configure")
     try:

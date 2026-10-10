@@ -303,7 +303,7 @@ test("loaded optional P1 view keeps media mutations scoped and task identity unc
   for(const request of media)assert.ok(request.csrf);
   assert.match(await page.locator('#am1-camera-root').innerText(),/separate from required Pi image validation/);
   await page.evaluate(()=>{am1Remote.snapshot.evidence.observation_provenance='real-p1/pi-decoded';am1Remote.render(am1Remote);});
-  assert.match(await page.locator('#connection').innerText(),/Real P1 observation.*simulated/);
+  assert.match(await page.locator('#connection').innerText(),/Required P1 observation.*simulated/);
   assert.deepEqual(errors,[]);
   await context.close();
 });

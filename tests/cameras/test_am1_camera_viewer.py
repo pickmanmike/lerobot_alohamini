@@ -222,7 +222,7 @@ class CameraCoreTests(unittest.TestCase):
         self.assertEqual(store.status()["sequence"], 0)
 
     def test_native_uvc_zero_alignment_padding_is_preserved_without_reencoding(self):
-        # Observed native camera JPEGs end with EOI followed by 0â€“7 alignment zeros.
+        # Observed native camera JPEGs end with EOI followed by 0–7 alignment zeros.
         store = self.viewer.FrameStore()
         for count in range(8):
             payload = JPEG + b"\0" * count
