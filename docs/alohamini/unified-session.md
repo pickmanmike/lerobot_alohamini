@@ -1,5 +1,13 @@
 # AM1 supervised unified Local session
 
+## Native Pi simulated session continuation
+
+AM1-SESSION-PI-01 implements the isolated non-actuating stage-2 slice, stacked on accepted draft #17. Existing finite providers run natively against simulated feedback; no physical or camera IO is available. Final native executable c4256e9c: 106 passes / one Windows-only DACL skip, exit 0. Focused runtime review and corrective regressions passed. Normal deployments and separate private pins are preserved.
+
+The independent transient user units am1-pi01-owner.service and am1-pi01-gateway.service are idle, with no boot autostart or task autoplay. The exact direct HTTPS URL and short ordinary enrollment/start and rollback helpers are in the private local trial record. Windows' current-user CA Security Warning consent is still required; the direct two-context demonstration and real-time full provider workload are pending that consent, so this packet is not complete yet. No TLS exceptions or required SSH tunnel are used.
+
+Rollback stops only those trial units/listener and removes only introduced current-user trust by the recorded exact thumbprint; retain private evidence/state and the branch. Existing motor/helper/camera checkouts, credentials, calibration and normal permissions remain unchanged. See the [consolidated native-slice contract and evidence](roaming-resilient-sessions.md#implemented-stage-2-slice-native-pi-simulated-hardware). P1 independence, useful physical movement, full powered workload and normal-rest restart remain later bounded work.
+
 ## Current direction: AM1-SESSION-ARCHITECTURE-01
 
 The owner replaced the proposed connection-continuity handoff and canceled the
