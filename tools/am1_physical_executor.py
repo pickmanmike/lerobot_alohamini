@@ -56,6 +56,20 @@ def read_physical_sample(client, run_id, host_incarnation, previous_sequence, *,
         "at": at,
         "ack": dict(marker),
         "observation": dict(observation),
+        "body_feedback": {
+            key: observation[key]
+            for key in ("x.vel", "y.vel", "theta.vel", "lift_axis.vel", "lift_axis.height_mm")
+            if key in client.latest_raw_observation_keys
+            and type(observation.get(key)) in (int, float)
+            and math.isfinite(observation[key])
+        },
+        "timing": {
+            "read_started_at_monotonic_s": started,
+            "acquired_at_monotonic_s": completed,
+            "original_request_sent_at_monotonic_s": received - request_age,
+            "reply_received_at_monotonic_s": received,
+            "original_request_roundtrip_age_s": request_age,
+        },
         "provenance": "protected-host/measured-feedback",
     }
 
@@ -237,6 +251,8 @@ class PhysicalExecutor:
                 "observation": o,
                 "feedback_sequence": s["sequence"] if s else None,
                 "measured_positions": s["positions"] if s else None,
+                "measured_body": s.get("body_feedback", {}) if s else None,
+                "feedback_timing": s.get("timing") if s else None,
                 "accepted_host_action": ack,
                 "acknowledged_intent_revision": ack.get("intent_revision"),
                 "host_incarnation": self.host_incarnation,

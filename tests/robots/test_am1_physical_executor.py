@@ -577,3 +577,36 @@ def test_ordinary_stop_waits_for_pending_registration_then_stops_once(monkeypatc
     unit.stop()
     assert len([args for args in seen if "stop" in args]) == 1
     assert len([args for args in seen if "show" in args]) == 2
+
+
+def test_bounded_body_and_request_evidence_cannot_promote_client_default_zero():
+    m = module()
+    client = client_sample()
+    observation = client.get_observation()
+    observation.update(
+        {"x.vel": 0.1, "y.vel": 0.0, "theta.vel": 0.0, "lift_axis.height_mm": 12.0, "lift_axis.vel": 0}
+    )
+    client.latest_raw_observation_keys = frozenset(
+        (*JOINT_KEYS, "x.vel", "y.vel", "theta.vel", "lift_axis.height_mm")
+    )
+    sample = m.read_physical_sample(client, "run", "host", 4, clock=lambda: 10.0)
+    assert sample["body_feedback"] == {
+        "x.vel": 0.1,
+        "y.vel": 0.0,
+        "theta.vel": 0.0,
+        "lift_axis.height_mm": 12.0,
+    }
+    assert "lift_axis.vel" not in sample["body_feedback"]
+    assert sample["timing"]["reply_received_at_monotonic_s"] == 9.99
+    assert sample["timing"]["original_request_sent_at_monotonic_s"] == pytest.approx(9.96)
+    host = ControlledHost()
+    e = executor(host)
+    try:
+        e.sample = sample
+        evidence = e.evidence()
+        assert evidence["measured_body"] == sample["body_feedback"]
+        assert evidence["feedback_timing"] == sample["timing"]
+        evidence["measured_body"]["x.vel"] = 9.0
+        assert e.sample["body_feedback"]["x.vel"] == 0.1
+    finally:
+        e.close()
