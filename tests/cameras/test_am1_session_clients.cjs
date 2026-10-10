@@ -307,3 +307,22 @@ test("loaded optional P1 view keeps media mutations scoped and task identity unc
   assert.deepEqual(errors,[]);
   await context.close();
 });
+
+test("loaded UI identifies required local camera and keeps optional P1 separate", async t=>{
+  const f=await fixture(true);t.after(()=>f.close());
+  const browser=await chromium.launch({headless:true,channel:process.env.AM1_TEST_BROWSER_CHANNEL || "msedge"});t.after(()=>browser.close());
+  const context=await browser.newContext({ignoreHTTPSErrors:true}),page=await context.newPage();
+  await enroll(page,f.info.url,f.info.a);
+  // Exercise the actual renderer with a protocol snapshot, no simulated camera backend.
+  await page.evaluate(()=>{
+    am1Remote.socket.onmessage=()=>{};
+    Object.assign(am1Remote.snapshot.evidence,{sensing_policy:"local-camera-required",
+      sensing_source:{role:"chest"},observation_provenance:"real-local-camera/pi-decoded-arrival",
+      required_observation:true,optional_quality:false});
+    am1Remote.render(am1Remote);
+  });
+  assert.match(await page.locator("#connection").innerText(),/Required local chest observation.*current images validated on Pi.*motor feedback and commands simulated/);
+  await page.evaluate(()=>{am1Remote.snapshot.evidence.required_observation=false;am1Remote.render(am1Remote);});
+  assert.match(await page.locator("#connection").innerText(),/Required local chest observation.*current image proof unavailable/);
+  await context.close();
+});

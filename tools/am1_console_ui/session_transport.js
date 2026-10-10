@@ -147,8 +147,9 @@ globalThis.AM1RemoteInitialize=function() {
     state.textContent=run ? `Fake session · ${run.status} · ${run.progress_s.toFixed(2)} s` : "Fake session · no run";
     document.querySelector("#session-details").textContent=JSON.stringify(transport.snapshot,null,2);
     document.querySelector("#live-countdown").textContent=run ? `Original Live budget: ${Math.ceil(run.remaining_s || 0)} s remaining` : "No fake run";
-    const realObservation=transport.snapshot?.evidence?.observation_provenance==="real-p1/pi-decoded";
-    document.querySelector("#connection").textContent=`${transport.connected ? "Connected" : "Disconnected"} · ${realObservation ? `Real P1 observation · ${transport.snapshot?.evidence?.required_observation ? "current images validated on Pi" : "current image proof unavailable"} · motor feedback and commands simulated` : "Cameras and hardware unavailable in fake mode"}`;
+    const evidence=transport.snapshot?.evidence;
+    const observationLabel={"real-p1/pi-decoded":"Required P1 observation", "real-local-camera/pi-decoded-arrival":`Required local ${evidence?.sensing_source?.role || "camera"} observation`}[evidence?.observation_provenance];
+    document.querySelector("#connection").textContent=`${transport.connected ? "Connected" : "Disconnected"} · ${observationLabel ? `${observationLabel} · ${evidence?.required_observation ? "current images validated on Pi" : "current image proof unavailable"} · motor feedback and commands simulated` : "Cameras and hardware unavailable in fake mode"}`;
     if(transport.optionalVideo&&!transport.videoView&&globalThis.AM1P1View) {
       const root=document.querySelector("#am1-camera-root");root.replaceChildren();
       const label=document.createElement("p");label.textContent="Optional external P1 view · separate from required Pi image validation";

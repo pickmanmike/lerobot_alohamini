@@ -126,6 +126,16 @@ class SessionAuthority:
             "operation_id": self.run["operation_id"],
             "uncertain": self.run["uncertain"],
             "effect_admitted": self.run["dispatch"] == "acknowledged",
+            **{
+                k: self.run[k]
+                for k in (
+                    "sensing_policy",
+                    "sensing_source",
+                    "observation_provenance",
+                    "observation_freshness_basis",
+                )
+                if k in self.run
+            },
         }
 
     def _refuse(self, reason):
@@ -315,6 +325,9 @@ class SessionAuthority:
                 "service_incarnation": self.service_incarnation,
                 "started_wall": self.wall_clock(),
             }
+            metadata = getattr(self.executor, "sensing_metadata", None)
+            if metadata:
+                self.run.update(metadata())
             self.db.execute(
                 "INSERT INTO operations VALUES (?,?,?,?)", (oid, digest, d, json.dumps(self._run_result()))
             )
