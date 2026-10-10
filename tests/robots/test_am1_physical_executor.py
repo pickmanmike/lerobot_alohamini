@@ -7,6 +7,12 @@ from types import SimpleNamespace
 import pytest
 
 from examples.alohamini.am1_finite_task import JOINT_KEYS
+from tests.robots import test_alohamini_lift_operational as operational_tests
+
+# Reuse the actual protected operation and grouped fake-bus fixture unchanged.
+operating_robot = operational_tests.operating_robot
+qualified_idle = operational_tests.qualified_idle
+poll_idle_feedback = operational_tests.poll_idle_feedback
 
 
 def module():
@@ -908,7 +914,12 @@ def test_worker_body_height_pulses_reach_original_lift_and_release_zero():
         assert all("lift_axis.vel" not in r["action"] for r in up + down)
         assert any(r["accepted"].get("x.vel") == 0.15 for r in host.records if r["accepted"])
         assert any(r["accepted"].get("theta.vel") == 45 for r in host.records if r["accepted"])
-        released = [r for r in host.records if r["action"].get("lift_axis.height_mm") == host.height]
+        released = [
+            r
+            for r in host.records
+            if "lift_axis.height_mm" not in r["action"]
+            and r["action"]["_am1_local_control"]["mode"] == "active"
+        ]
         assert released and all(r["lift_writes"][-1] == 0 for r in released)
         assert all(r["action"]["lift_axis.vel"] == 0 for r in released)
     finally:
@@ -986,3 +997,136 @@ def test_worker_body_preparation_never_calls_or_applies_height_recipe():
     finally:
         e.close()
         e.worker.join(2)
+
+
+def operational_body_translation_host(qualified_idle, monkeypatch):
+    """Keep the actual protected lift operation; record its existing inert bus writes."""
+    robot, clock = qualified_idle
+    host = BodyTranslationHost(clock.monotonic, height=robot._lift_operation.height_mm)
+    host.robot, host.axis, host.bus = robot, robot.lift, robot.left_bus
+    host.bus.rows = []
+    write = host.bus.write
+
+    def recorded_write(register, motor, value, **options):
+        write(register, motor, value, **options)
+        host.bus.rows.append((register, motor, value))
+
+    monkeypatch.setattr(host.bus, "write", recorded_write)
+    monkeypatch.setattr(robot, "hold_follower_arms", lambda: None)
+    host.start(
+        "10000000-0000-4000-8000-000000000001",
+        "20000000-0000-4000-8000-000000000001",
+        "physical-arm-hold-body",
+        None,
+    )
+    return host, robot._lift_operation, clock
+
+
+def send_operational_body_recipe(host, elapsed, *, action_overrides=None):
+    action = host.body_action(elapsed)
+    action.update(action_overrides or {})
+    action["_am1_local_control"] = {
+        "version": 1,
+        "mode": "active",
+        "epoch": 0,
+        "run_id": host.run_id,
+        "host_incarnation": host.incarnation,
+        "intent_revision": 0,
+        "action_sequence": len(host.records),
+    }
+    host.send(action)
+
+
+@pytest.mark.parametrize("elapsed", [1.0, 2.0, 2.2, 2.7, 2.9, 3.6, 4.3, 11.9])
+def test_finite_body_release_writes_zero_without_requalifying_uncertain_operational_lift(
+    qualified_idle,
+    monkeypatch,
+    elapsed,
+):
+    host, op, clock = operational_body_translation_host(qualified_idle, monkeypatch)
+    for _ in range(3):
+        poll_idle_feedback(host.robot, clock, velocity=50)
+    assert op._idle_uncertain
+    qualified_at, anchor, zero_reference = op._idle_qualified_at, op._last_idle_height, op.lift._z0_deg
+    band, samples, thermal = op._idle_uncertain_band, list(op._stationary), list(op.temperature.samples)
+    reads = len(op.transport.group_reads)
+    send_operational_body_recipe(host, elapsed)
+    assert host.records[-1]["lift_writes"] == [0]
+    assert host.records[-1]["action"]["lift_axis.vel"] == 0
+    assert "lift_axis.height_mm" not in host.records[-1]["action"]
+    assert host.records[-1]["accepted"]["x.vel"] == (0.15 if elapsed == 2.0 else 0)
+    assert host.records[-1]["accepted"]["theta.vel"] == (45 if elapsed == 2.7 else 0)
+    assert op._idle_uncertain and op._idle_qualified_at == qualified_at
+    assert op._idle_uncertain_band == band and list(op._stationary) == samples
+    assert op._last_idle_height == anchor and op.lift._z0_deg == zero_reference
+    assert list(op.temperature.samples) == thermal and len(op.transport.group_reads) == reads
+    assert op.failure is None and op.bus.expected_goal == 0
+
+
+@pytest.mark.parametrize(
+    "elapsed,overrides",
+    [
+        (3.4, None),
+        (4.1, None),
+        (3.4, {"lift_axis.vel": 0}),  # Arbitrary height + explicit zero remains a height request.
+        (1.0, {"lift_axis.vel": 200}),
+        (1.0, {"lift_axis.vel": -200}),
+    ],
+)
+def test_finite_body_new_lift_motion_still_refuses_uncertain_operational_feedback(
+    qualified_idle,
+    monkeypatch,
+    elapsed,
+    overrides,
+):
+    host, op, clock = operational_body_translation_host(qualified_idle, monkeypatch)
+    for _ in range(3):
+        poll_idle_feedback(host.robot, clock, velocity=-50)
+    assert op._idle_uncertain
+    before = len(host.bus.rows)
+    with pytest.raises(RuntimeError, match="new lift motion refused.*uncertain") as caught:
+        send_operational_body_recipe(host, elapsed, action_overrides=overrides)
+    assert op.failure is caught.value and op._idle_uncertain
+    assert len(host.bus.rows) == before and op.bus.expected_goal == 0
+
+
+def test_finite_body_lift_pulse_requires_genuine_operational_requalification(qualified_idle, monkeypatch):
+    host, op, clock = operational_body_translation_host(qualified_idle, monkeypatch)
+    for _ in range(3):
+        poll_idle_feedback(host.robot, clock, velocity=50)
+    assert op._idle_uncertain
+    zero_reference, anchor = op.lift._z0_deg, op._last_idle_height
+    qualified_at = op._idle_qualified_at
+    send_operational_body_recipe(host, 2.2)
+    assert op._idle_uncertain and op._idle_qualified_at == qualified_at
+    for _ in range(7):
+        poll_idle_feedback(host.robot, clock)
+    assert not op._idle_uncertain and op._idle_qualified_at > qualified_at
+    send_operational_body_recipe(host, 3.4)
+    assert host.records[-1]["lift_writes"] == [-1300]
+    assert host.records[-1]["action"]["lift_axis.height_mm"] == host.height + 50
+    assert "lift_axis.vel" not in host.records[-1]["action"]
+    assert op.lift._z0_deg == zero_reference and op._last_idle_height == anchor
+    assert op.failure is None
+
+
+def test_finite_body_zero_releases_cannot_extend_operational_uncertainty_deadline(
+    qualified_idle,
+    monkeypatch,
+):
+    host, op, clock = operational_body_translation_host(qualified_idle, monkeypatch)
+    for _ in range(3):
+        poll_idle_feedback(host.robot, clock, velocity=50)
+    qualified_at = op._idle_qualified_at
+    assert op._idle_uncertain
+    with pytest.raises(RuntimeError, match="failed stopped qualification within 1 s") as caught:
+        for _ in range(40):
+            send_operational_body_recipe(host, 2.2)
+            assert op._idle_uncertain and op._idle_qualified_at == qualified_at
+            poll_idle_feedback(host.robot, clock, velocity=50)
+    assert op.failure is caught.value and op.bus.expected_goal == 0
+    assert 1.0 <= clock.now - qualified_at < 1.036
+    before = len(host.bus.rows)
+    with pytest.raises(RuntimeError) as repeated:
+        send_operational_body_recipe(host, 2.2)
+    assert repeated.value is caught.value and len(host.bus.rows) == before

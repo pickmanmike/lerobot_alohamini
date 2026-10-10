@@ -81,7 +81,13 @@ def body_recipe_action(client, elapsed):
         if start <= elapsed < start + 0.2 - 1e-9:
             keys = [key]
             break
-    return {**client._from_keyboard_to_base_action(keys), **client._from_keyboard_to_lift_action(keys)}
+    lift = client._from_keyboard_to_lift_action(keys)
+    # This recipe's original no-U/J mapping redundantly requests the current
+    # height alongside zero velocity. Send the stop alone; the protected lift
+    # operation keeps its stopped uncertainty and refuses genuine height motion.
+    if keys in ([], ["w"], ["a"]) and lift.get("lift_axis.vel") == 0:
+        lift.pop("lift_axis.height_mm", None)
+    return {**client._from_keyboard_to_base_action(keys), **lift}
 
 
 class PhysicalExecutor:
