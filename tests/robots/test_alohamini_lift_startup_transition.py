@@ -105,7 +105,7 @@ def test_normal_start_keeps_zero_until_five_fresh_quiet_post_home_samples(operat
 
 
 @pytest.mark.parametrize("flags", [[(0, 0), (50, 1)], [(0, 0), (0, 1)]], ids=["velocity", "moving"])
-def test_alternating_post_home_flags_stop_on_original_deadline_without_relief(
+def test_alternating_post_home_flags_use_bounded_am1_deadline_before_relief(
     operating_robot,
     capsys,
     flags,
@@ -120,29 +120,24 @@ def test_alternating_post_home_flags_stop_on_original_deadline_without_relief(
         repeat=True,
     )
     try:
-        with pytest.raises(RuntimeError, match="AlohaMini motor activation failed") as failure:
-            robot.connect(calibrate=False)
-        primary = failure.value.__cause__
-        assert primary is robot._lift_operation.failure
-        assert "post_home" in str(primary) and "stationary" in str(primary) and "1" in str(primary)
+        robot.connect(calibrate=False)
         records = operational_records(capsys)
         samples = [row for row in records if row["phase"] == "post_home" and not row.get("rejected")]
-        rejected = next(row for row in records if row["phase"] == "post_home" and row.get("rejected"))
-        # A single original deadline governs all candidate resets. One already
-        # started grouped read retains its unchanged 40 ms request allowance.
-        assert 0.95 <= rejected["sample_monotonic_s"] - samples[0]["sample_monotonic_s"] <= 1.04
+        qualified = next(row for row in records if row["phase"] == "post_home_stationary_qualified")
+        # Strict quiet retains the entire original opportunity. Only the
+        # explicitly identified AM1 alternative may proceed at that deadline.
+        assert 0.95 <= commands[0] - samples[0]["sample_monotonic_s"] <= 1.04
+        assert qualified["readiness_branch"] == "bounded_indicator"
+        assert qualified["motion_feedback_quiet"] is False
+        assert qualified["whole_phase_position_excursion_raw"] == 0
         assert len(samples) >= 5
         assert [(row["present_velocity_raw"], row["moving"]) for row in samples] == [
             flags[index % len(flags)] for index in range(len(samples))
         ]
         assert len({row["sample_monotonic_s"] for row in samples}) == len(samples)
         assert all(row["goal_velocity_raw"] == 0 and row["torque_enable"] == 1 for row in samples)
-        assert not commands
-        assert not any(
-            row["phase"] in ("post_home_stationary_qualified", "relief", "operational_ready")
-            for row in records
-        )
-        assert any(row["phase"] == "shutdown_verified" for row in records)
+        assert len(commands) == 1
+        assert any(row["phase"] == "operational_ready" for row in records)
     finally:
         if bus.is_connected:
             robot.disconnect()

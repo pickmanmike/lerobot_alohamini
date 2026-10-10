@@ -11,7 +11,12 @@ from lerobot.motors.feetech import FeetechMotorsBus
 from lerobot.robots.alohamini import alohamini as robot_module
 from lerobot.robots.alohamini import lift_relief
 from lerobot.robots.alohamini.config_alohamini import AlohaMiniConfig
-from tests.robots.test_alohamini_lift_relief import Clock, GroupedLiftTransport, LiftBus
+from tests.robots.test_alohamini_lift_relief import (
+    Clock,
+    GroupedLiftTransport,
+    LiftBus,
+    mock_physical_admission,
+)
 
 
 @pytest.fixture
@@ -19,6 +24,7 @@ def operating_robot(monkeypatch, tmp_path):
     clock = Clock()
     monkeypatch.setattr(lift_relief.time, "monotonic", clock.monotonic)
     monkeypatch.setattr(lift_relief.time, "sleep", clock.sleep)
+    mock_physical_admission(monkeypatch)
 
     def bus_factory(**kwargs):
         bus = LiftBus(clock, **kwargs)

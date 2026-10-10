@@ -192,6 +192,7 @@ class OperationalLift(InstalledLiftCheck):
             result, _ = self.home_and_relieve(
                 allow_one_count_variation=True, qualify_initial_direction=True,
                 require_quiet_post_home=True,
+                am1_post_home_readiness=True,
             )
             self._goal_since = time.monotonic()
             self.poll()

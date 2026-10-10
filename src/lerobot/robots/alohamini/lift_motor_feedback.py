@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import signal
 import time
 from collections.abc import Callable
@@ -17,7 +18,6 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from lerobot.utils.import_utils import require_package
-
 
 MOTOR_ID = 11
 BAUD_RATE = 1_000_000
@@ -478,6 +478,111 @@ def _default_emit(record: dict[str, Any]) -> None:
     print("[LIFT MOTOR FEEDBACK] " + json.dumps(record, separators=(",", ":")), flush=True)
 
 
+class _AM1PostHomeReadiness:
+    """Strict-first, whole-phase evidence for the installed AM1 zero transition.
+
+    Intermittent indicators remain reported motion evidence. They may qualify
+    only at the original deadline, without averaging signs or resetting drift.
+    """
+
+    def __init__(self, monitor: MotorFeedbackComparison, origin: int, deadline: float):
+        self.monitor = monitor
+        self.origin = origin
+        self.deadline = deadline
+        self.records: list[dict[str, Any]] = []
+        self.recent: list[dict[str, Any]] = []
+        self.last_stamp: float | None = None
+        self.last_position = origin
+        self.offset = self.minimum = self.maximum = 0
+        self.step_sign = self.direction_steps = 0
+        self.bounded = True
+
+    def observe(self, record: dict[str, Any], now: float) -> None:
+        stamp = float(record["sample_monotonic_s"])
+        duration = float(record["request_duration_s"])
+        if (
+            not math.isfinite(stamp)
+            or not math.isfinite(duration)
+            or not 0 <= now - stamp <= POLL_S + 1e-9
+            or not 0 <= duration <= self.monitor.sample_timeout_ms / 1000 + 1e-9
+            or (self.last_stamp is not None and stamp <= self.last_stamp)
+        ):
+            self.monitor.refuse(record, "post_home: feedback was not fresh and advancing.")
+        self.last_stamp = stamp
+        position = int(record["present_position_raw"])
+        step = _position_delta(self.last_position, position)
+        self.last_position = position
+        self.offset += step
+        self.minimum = min(self.minimum, self.offset)
+        self.maximum = max(self.maximum, self.offset)
+        if step:
+            sign = 1 if step > 0 else -1
+            self.direction_steps = self.direction_steps + 1 if sign == self.step_sign else 1
+            self.step_sign = sign
+            if self.direction_steps >= STATIONARY_PERSISTENT_SAMPLES:
+                self.monitor.refuse(record, "post_home: continuing same-direction position motion.")
+        velocity = int(record["present_velocity_raw"])
+        moving = int(record["moving"])
+        if moving not in (0, 1):
+            self.monitor.refuse(record, "post_home: Moving readback was not 0 or 1.")
+        self.recent = [*self.recent[-(STATIONARY_PERSISTENT_SAMPLES - 1) :], record]
+        if len(self.recent) == STATIONARY_PERSISTENT_SAMPLES:
+            velocities = [int(row["present_velocity_raw"]) for row in self.recent]
+            if (
+                all(int(row["moving"]) == 1 for row in self.recent)
+                or all(value > STILL_VELOCITY_RAW for value in velocities)
+                or all(value < -STILL_VELOCITY_RAW for value in velocities)
+            ):
+                self.monitor.refuse(record, "post_home: persistent velocity or Moving evidence.")
+        # Disqualifiers apply to the whole phase, including a final in-flight
+        # read. Neither candidate resets nor later quiet samples erase them.
+        self.bounded = self.bounded and (
+            self.maximum - self.minimum <= STATIONARY_POSITION_TOLERANCE_RAW
+            and abs(self.offset) <= STATIONARY_POSITION_TOLERANCE_RAW
+            and abs(velocity) <= STATIONARY_REPORTED_VELOCITY_LIMIT_RAW
+        )
+        if stamp <= self.deadline:
+            self.records.append(record)
+
+    def evidence(self) -> dict[str, Any]:
+        return {
+            "readiness_policy": "am1-post-home-v1",
+            "am1_post_home_origin_raw": self.origin,
+            "whole_phase_position_excursion_raw": self.maximum - self.minimum,
+            "whole_phase_position_drift_raw": self.offset,
+            "readiness_deadline_monotonic_s": self.deadline,
+        }
+
+    def qualify_bounded(self, now: float) -> dict[str, Any] | None:
+        if not self.bounded or len(self.records) < 5:
+            return None
+        first, last = self.records[0], self.records[-1]
+        window = last["sample_monotonic_s"] - first["sample_monotonic_s"]
+        if window < 4 * POLL_S or now - last["sample_monotonic_s"] > POLL_S + 1e-9:
+            return None
+        evidence = {
+            **self.evidence(),
+            "readiness_branch": "bounded_indicator",
+            "motion_feedback_quiet": False,
+            "sample_count": len(self.records),
+            "window_s": round(window, 3),
+            "position_resolution_raw": 4096,
+            "position_tolerance_raw": STATIONARY_POSITION_TOLERANCE_RAW,
+            "position_origin_raw": self.origin,
+            "position_offsets_raw": [
+                _position_delta(self.origin, int(row["present_position_raw"])) for row in self.records
+            ],
+            "position_excursion_raw": self.maximum - self.minimum,
+            "position_drift_raw": self.offset,
+            "present_velocity_raw": [int(row["present_velocity_raw"]) for row in self.records],
+            "moving": [int(row["moving"]) for row in self.records],
+            "expected_torque": 1,
+            "expected_goal_velocity_raw": 0,
+        }
+        self.monitor.record("post_home_stationary_qualified", **evidence)
+        return {**last, "stationary_qualification": evidence}
+
+
 class MotorFeedbackComparison:
     def __init__(
         self,
@@ -659,10 +764,22 @@ class MotorFeedbackComparison:
         timeout_s: float = STATIONARY_TIMEOUT_S,
         on_sample: Callable[[dict[str, Any]], None] | None = None,
         require_quiet_motion_feedback: bool = False,
+        am1_post_home_origin_raw: int | None = None,
     ) -> dict[str, Any]:
         """Require one bounded window of fresh, mutually consistent feedback."""
         qualification_started = self.monotonic()
         deadline = qualification_started + timeout_s
+        readiness = None
+        if am1_post_home_origin_raw is not None:
+            if (phase, expected_torque, expected_goal, require_quiet_motion_feedback, timeout_s) != (
+                "post_home",
+                1,
+                0,
+                True,
+                SETTLE_TIMEOUT_S,
+            ):
+                raise ValueError("AM1 post-home readiness requires its original strict zero transition.")
+            readiness = _AM1PostHomeReadiness(self, am1_post_home_origin_raw, deadline)
         candidate: list[tuple[float, dict[str, Any]]] = []
         last_record: dict[str, Any] | None = None
         required_samples = self.min_stationary_samples
@@ -682,11 +799,22 @@ class MotorFeedbackComparison:
             if last_record is not None:
                 now = self.monotonic()
                 if now >= deadline:
+                    if readiness is not None:
+                        bounded = readiness.qualify_bounded(now)
+                        if bounded is not None:
+                            return bounded
                     self.refuse(
                         last_record,
                         f"{phase}: no complete stationary window within {timeout_s:g} second.",
                     )
                 self.sleep(min(POLL_S, deadline - now))
+                if readiness is not None and self.monotonic() >= deadline:
+                    bounded = readiness.qualify_bounded(self.monotonic())
+                    if bounded is not None:
+                        return bounded
+                    self.refuse(
+                        last_record, f"{phase}: no complete stationary window within {timeout_s:g} second."
+                    )
 
             record = self.sample(
                 phase,
@@ -698,14 +826,24 @@ class MotorFeedbackComparison:
             sampled_at = self.monotonic()
             last_record = record
 
+            if readiness is not None:
+                readiness.observe(record, sampled_at)
+                if on_sample is not None:
+                    on_sample(record)
+
             if sampled_at > deadline:
+                if readiness is not None:
+                    bounded = readiness.qualify_bounded(sampled_at)
+                    if bounded is not None:
+                        return bounded
                 self.refuse(
                     record,
                     f"{phase}: stationary feedback exceeded the {timeout_s:g}-second qualification limit.",
                 )
-            if max_position_delta_raw is not None and abs(
-                int(record["position_delta_raw"])
-            ) > max_position_delta_raw:
+            if (
+                max_position_delta_raw is not None
+                and abs(int(record["position_delta_raw"])) > max_position_delta_raw
+            ):
                 self.refuse(
                     record,
                     f"{phase}: travel exceeded {max_position_delta_raw} raw ticks.",
@@ -733,10 +871,7 @@ class MotorFeedbackComparison:
 
             proposed = [*candidate, (sampled_at, record)]
             origin = int(proposed[0][1]["present_position_raw"])
-            offsets = [
-                _position_delta(origin, int(sample["present_position_raw"]))
-                for _, sample in proposed
-            ]
+            offsets = [_position_delta(origin, int(sample["present_position_raw"])) for _, sample in proposed]
             excursion = max(offsets) - min(offsets)
             drift = offsets[-1]
             if (
@@ -773,7 +908,7 @@ class MotorFeedbackComparison:
                         candidate = [(sampled_at, record)]
                     continue
 
-            if on_sample is not None:
+            if on_sample is not None and readiness is None:
                 on_sample(record)
 
             window_s = candidate[-1][0] - candidate[0][0]
@@ -789,15 +924,16 @@ class MotorFeedbackComparison:
                 "position_offsets_raw": offsets,
                 "position_excursion_raw": excursion,
                 "position_drift_raw": drift,
-                "present_velocity_raw": [
-                    int(sample["present_velocity_raw"]) for _, sample in candidate
-                ],
+                "present_velocity_raw": [int(sample["present_velocity_raw"]) for _, sample in candidate],
                 "moving": [int(sample["moving"]) for _, sample in candidate],
                 "expected_torque": expected_torque,
                 "expected_goal_velocity_raw": expected_goal,
             }
             if require_quiet_motion_feedback:
                 evidence["motion_feedback_quiet"] = True
+            if readiness is not None:
+                evidence.update(readiness.evidence())
+                evidence["readiness_branch"] = "strict_quiet"
             self.record(f"{phase}_stationary_qualified", **evidence)
             return {**candidate[-1][1], "stationary_qualification": evidence}
 
