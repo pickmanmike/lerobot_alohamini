@@ -501,9 +501,18 @@ class SessionAuthority:
                     self._finish("faulted", "recovery_timeout")
                     return
                 if qualified and e["pose_aligned"] and recovery["revision"] == r["intent_revision"]:
-                    r["status"] = "running"
-                    admitted = self.executor.dispatch(RECIPES[r["recipe"]])
+                    try:
+                        admitted = self.executor.dispatch(RECIPES[r["recipe"]])
+                    except Exception:
+                        r["uncertain"] = True
+                        self._finish("faulted", "dispatch_exception")
+                        return
+                    fault = self.executor.evidence()["fault"]
+                    if fault:
+                        self._finish("faulted", str(fault))
+                        return
                     if admitted:
+                        r["status"] = "running"
                         r["recovery"] = None
                         self._event("recovered")
                     else:

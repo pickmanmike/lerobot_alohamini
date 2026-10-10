@@ -496,3 +496,115 @@ def test_failed_frame_ack_cannot_publish_progress_or_completion(tmp_path, monkey
         assert a.run["first_cause"] == "backend_command_unacknowledged"
     finally:
         a.close()
+
+
+def test_recovery_send_exception_terminalizes_without_killing_resident_tick(tmp_path, monkeypatch):
+    import asyncio
+    import time
+
+    from tools.am1_session_ipc import OwnerServer
+
+    async def scenario():
+        io = runtime().SimulatedIO()
+        executor = runtime().PiExecutor(io, tmp_path / "admission")
+        owner = OwnerServer(tmp_path / "owner", executor)
+        await owner.start()
+        a = owner.authority
+
+        async def wait_status(status):
+            for _ in range(40):
+                if a.snapshot()["run"]["status"] == status:
+                    return
+                await asyncio.sleep(0.05)
+            assert a.snapshot()["run"]["status"] == status
+
+        try:
+            assert start(a, "sim-arm-smoke-repeat")["effect_admitted"]
+            io.feedback_enabled = False
+            await wait_status("recovering")
+
+            def broken_send(action):
+                raise OSError("recovery send failed")
+
+            monkeypatch.setattr(io, "send", broken_send)
+            io.feedback_enabled = True
+            await wait_status("faulted")
+            state = a.snapshot()["run"]
+            assert state["first_cause"] == "feedback_loss"
+            assert state["status"] == "faulted"
+            assert executor.fault == "recovery send failed"
+            assert owner.ticker.is_alive()
+            last_tick = a.last_tick
+            await asyncio.sleep(0.15)
+            assert a.last_tick > last_tick
+            # An explicit test-only backend repair permits a separate finite run;
+            # its unchanged resident ticker must still enforce its own deadline.
+            monkeypatch.undo()
+            executor.fault = None
+            assert start(a, "sim-arm-hold-body")["effect_admitted"]
+            with a.mutex:
+                a.run["deadline"] = time.monotonic() + 0.15
+            await wait_status("stopped")
+            assert a.snapshot()["run"]["first_cause"] == "live_deadline"
+        finally:
+            await owner.close()
+
+    asyncio.run(scenario())
+
+
+def test_idempotent_hold_preserves_alignment_but_new_target_staleness_and_ack_loss_clear_it(tmp_path):
+    c = Clock()
+    io, e, a = build(tmp_path, c)
+    try:
+        run = start(a, "sim-arm-smoke-repeat")
+        advance(a, c, 6)
+        a.handle(command("pause", run_id=run["run_id"]), "viewer")
+        advance(a, c, 0.4)
+        assert e.evidence()["pose_aligned"]
+        e.hold()
+        assert e.evidence()["pose_aligned"]
+        io.positions["arm_left_elbow_flex.pos"] += 2
+        e.hold()
+        assert not e.evidence()["pose_aligned"]
+        advance(a, c, 0.4)
+        assert e.evidence()["pose_aligned"]
+        io.hold_acknowledge = False
+        e.hold()
+        assert not e.evidence()["pose_aligned"]
+        io.hold_acknowledge = True
+        advance(a, c, 0.4)
+        assert e.evidence()["pose_aligned"]
+        io.freeze_sequence = True
+        c.advance(0.3)
+        e.hold()
+        assert not e.evidence()["pose_aligned"]
+    finally:
+        a.close()
+
+
+def test_authority_contains_recovery_adapter_exception_and_retains_first_cause(tmp_path):
+    from tools.am1_fake_executor import FakeExecutor
+
+    class BrokenRecovery(FakeExecutor):
+        def dispatch(self, recipe):
+            if getattr(self, "already_dispatched", False):
+                raise OSError("adapter recovery failed")
+            self.already_dispatched = True
+            return super().dispatch(recipe)
+
+    c = Clock()
+    e = BrokenRecovery(c)
+    a = SessionAuthority(tmp_path, clock=c, executor=e)
+    try:
+        start(a, "fake-finite")
+        e.feedback = False
+        a.tick()
+        e.feedback = True
+        c.advance(0.1)
+        a.tick()
+        assert a.run["status"] == "faulted"
+        assert a.run["first_cause"] == "feedback_loss"
+        assert a.run["uncertain"]
+        assert a.run["progress_s"] == 0
+    finally:
+        a.close()

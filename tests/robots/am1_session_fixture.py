@@ -222,7 +222,7 @@ if __name__ == "__main__":
         asyncio.run(run_owner(sys.argv[2], PrivateProofExecutor()))
         sys.exit(0)
     with tempfile.TemporaryDirectory(prefix="am1-fake-browser-") as temporary:
-        cluster = Cluster(temporary)
+        cluster = Cluster(temporary, simulated="--simulated" in sys.argv)
         try:
             print(
                 json.dumps(

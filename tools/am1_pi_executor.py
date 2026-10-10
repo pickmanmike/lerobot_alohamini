@@ -146,9 +146,14 @@ class PiExecutor:
             except RuntimeError:
                 return False
             self.task = FiniteTask(recipe, self.sample["positions"], self.clock(), self.shoulder_amplitude)
-        if not self.io.send(self.task.provider.get_action()):
+        try:
+            if not self.io.send(self.task.provider.get_action()):
+                return False
+            self.task.resume(self.clock())
+        except (ValueError, OSError, RuntimeError) as exc:
+            self.fault = self.fault or str(exc)
+            self.task.hold()
             return False
-        self.task.resume(self.clock())
         return True
 
     def advance(self, now, dt):
@@ -165,11 +170,24 @@ class PiExecutor:
         return {"progress_s": 0, "complete": False, "fault": self.fault}
 
     def hold(self):
-        if self.task:
+        was_active = self.task is not None and self.task.active
+        was_acknowledged = self.hold_ack
+        previous_target = dict(self.io.target)
+        if was_active:
             self.task.hold()
         self.hold_ack = self.io.hold()
-        self.aligned_samples.clear()
-        self.alignment_sequence = -1
+        # Connect/release may repeat a protective hold immediately before Resume.
+        # Preserve qualification only for the same acknowledged, still-fresh target.
+        if (
+            was_active
+            or not was_acknowledged
+            or not self.hold_ack
+            or self.io.target != previous_target
+            or not self.aligned_samples
+            or self.clock() - self.aligned_samples[-1] > 0.25
+        ):
+            self.aligned_samples.clear()
+            self.alignment_sequence = -1
         return self.hold_ack
 
     def finish(self, status):
