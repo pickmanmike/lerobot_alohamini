@@ -1,18 +1,25 @@
 # AM1 roaming-resilient sessions
 
-**AM1-SESSION-ARCHITECTURE-01 · owner-approved design. The current AM1-MOBILE-LOCAL-01 slice selects real robot-local camera input with simulated motor IO and advisory P1 evidence. The separate strict P1 diagnostic remains failed.**
+**Current continuation: [AM1 protected physical sessions](protected-physical-sessions.md).**
+The protected adapter is implemented and reviewed. Its first actual startup failed
+the preserved lift post-home quiet-feedback qualification before Live or arm
+trajectory. Actual cleanup was verified, followed by explicit stopped rollback
+to the accepted idle services. Full physical reliability remains incomplete;
+the operating report records exact staged/restored versions and the failed layer.
+
+**AM1-SESSION-ARCHITECTURE-01 · owner-approved design. The accepted AM1-MOBILE-LOCAL-01 slice selects real robot-local camera input with simulated motor IO and advisory P1 evidence. The separate strict P1 diagnostic remains failed.**
 Choose a Pi-owned session authority and finite executor, an authenticated LAN
 HTTPS/WebSocket gateway, an independently supervised required-input worker and
 optional P1 engineering recording/viewing. Reuse the
 existing UI and protected motor backend. SSH remains administrative access. AM1
 remains wireless; a temporary engineering observer is not a permanent runtime
-dependency. Actual motor-backend integration remains a later protected slice.
+dependency. The separate protected motor-backend continuation is recorded above.
 
 The owner approved this design and the exact stage-1 fake-only implementation.
 Stage 1 is implemented on `codex/am1-persistent-session-fake`. Whole-branch
 review completed and identified one cross-client Pause ordering defect; its
 correction and covering evidence are recorded below. The stacked follow-up is
-a fake-only draft checkpoint. The completed AM1-SESSION-PI-01 isolated simulation slice and the current AM1-OBSERVATION-01 real-image/simulated-motor continuation are recorded separately below. Physical activation remains outside this packet.
+a fake-only draft checkpoint. The completed AM1-SESSION-PI-01 isolated simulation slice and AM1-OBSERVATION-01 real-image/simulated-motor continuation are recorded separately below. Those prior packets excluded physical activation; their original results remain unchanged.
 The owner replaced the proposed connection-continuity handoff and canceled the
 Wi-Fi Roaming Aggressiveness experiment and its administrator question. Do not
 resume that transaction. Normal motor/helper/onboard-camera deployments and the canceled adapter transaction remain unchanged. Stage 1 uses loopback development listeners; later isolated trial listeners, trust and component-specific permissions are recorded with their own evidence below.

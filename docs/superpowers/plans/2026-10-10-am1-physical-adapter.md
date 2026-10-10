@@ -60,8 +60,8 @@ Interfaces: fresh per-run owned UUID and immutable finite source budget (maximum
 ## Task 4: Review, stopped staging and progressive execution
 
 - [x] One focused changed-interface review, evidence-driven corrections and final affected executable checks.
-- [ ] Verify actual stopped owners, clean exact source pins/environment/calibration; perform exclusive true bus reads without configuring connect.
-- [ ] Stage only affected reviewed components; resident service idle and gateway without device access. Preserve explicit stopped rollback.
+- [x] Verify actual stopped owners, clean exact source pins/environment/calibration; perform exclusive true bus reads without configuring connect.
+- [x] Stage only affected reviewed components; resident service idle and gateway without device access. Preserve explicit stopped rollback.
 - [ ] Small bounded ordinary profile/actual response, then 88-second ArmSmoke with arms-only zero body/lift, real return/cleanup.
 - [ ] Full four-cycle 352/420 workload, brief browser detach/reattach and launch-SSH-independent lifetime; natural recoveries only.
 - [ ] Ordinary finish/natural rest, one comparable automatic full run, conditional original twelve-second ArmHoldBody W/A/U/J press/release with separately declared body gains.
@@ -72,3 +72,23 @@ Interfaces: fresh per-run owned UUID and immutable finite source budget (maximum
 Focused implementation and the five changed-interface review corrections passed the final native cohort: 142 passed, no skips. The corrected camera-only run qualified five advancing actual images (maximum original arrival age 39.5 ms) and one ordinary stop produced a clean release acknowledgment before its finite deadline. Independent process, listener and device audits found no remaining owner. The first caller route failure remains in private evidence. Motor device reads and powered operation have not begun at this checkpoint.
 
 A narrow review follow-up caught and corrected pending-unit launch/Stop ordering and an already acknowledged watchdog hold between authority ticks. Their failing regressions were observed, then 129 affected Windows checks and 42 native Pi checks passed. The original session/recovery deadlines remain unchanged.
+
+## Actual physical checkpoint and closeout
+
+Actual stopped inspection completed 260 reads plus 16 pings with all expected
+zero rows and unchanged calibration. Exact matched motor/helper and isolated
+executor/camera sources were staged, then resident services launched idle.
+Run `303353c8-297c-4e24-86d3-d4bfb25f813a` failed the existing lift post-home
+one-second stationary qualification before native Live or arm trajectory.
+Its original host log and full cause chain are retained. No supported launch
+integration omission was found; the unchanged native predicate correctly refused
+the actual feedback. No threshold widening, skip-home or unchanged retry followed.
+
+Actual twenty-zero readback, lift qualification, bus closure and camera release
+were verified. Explicit stopped rollback restored original matched motor/helper,
+private Windows pin bytes and accepted idle services; both histories and trust
+remain preserved. Small/full arm movement, physical reattachment/recovery,
+normal-rest repeat and conditional body operation are **uncompleted**, blocked at
+the precisely recorded native lift layer. See the
+[operating report](../../alohamini/protected-physical-sessions.md) for publication,
+verification, actual evidence distinctions and component-specific rollback.
