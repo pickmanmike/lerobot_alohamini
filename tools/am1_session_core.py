@@ -250,6 +250,125 @@ class SessionAuthority:
         self._save()
         return False
 
+    def _physical_completion(self, evidence, now):
+        """Validate one cached final return despite its subsequent intentional hold.
+
+        Current required inputs still qualify. Only the completed return's active
+        epoch may be historical; no transport or native work runs under this lock.
+        """
+        run = self.run
+        if not (
+            self.asynchronous
+            and run["status"] in {"running", "resuming"}
+            and RECIPES[run["recipe"]].mode == "finite"
+            and evidence["feedback"]
+            and evidence["required_observation"]
+            and not evidence.get("transport_issue")
+        ):
+            return None
+        receipt = evidence.get("finite_completion")
+        lifecycle = evidence.get("lifecycle")
+        current_ack = evidence.get("accepted_host_action")
+        if not all(isinstance(value, dict) for value in (receipt, lifecycle, current_ack)):
+            return None
+        reack = receipt.get("return_reacknowledgment")
+        if "return_reacknowledgment" in receipt and not (
+            isinstance(reack, dict)
+            and type(reack.get("sample_count")) is int
+            and reack["sample_count"] == 3
+            and type(reack.get("span_s")) in (int, float)
+            and math.isfinite(reack["span_s"])
+            and reack["span_s"] >= 0.2 - 1e-9
+            and type(reack.get("first_feedback_sequence")) is int
+            and type(receipt.get("feedback_sequence")) is int
+            and 0 <= reack["first_feedback_sequence"] < receipt["feedback_sequence"]
+        ):
+            return None
+        incarnation = run.get("backend_incarnation")
+        identity = {
+            "run_id": run["run_id"],
+            "host_incarnation": incarnation,
+            "intent_revision": run["intent_revision"],
+        }
+        ack = receipt.get("accepted_host_action")
+        execution = receipt.get("execution")
+        if not (
+            incarnation
+            and lifecycle.get("phase") == "live"
+            and lifecycle.get("run_id") == run["run_id"]
+            and lifecycle.get("backend_incarnation") == incarnation
+            and isinstance(ack, dict)
+            and isinstance(execution, dict)
+            and all(
+                container.get(key) == value
+                for container in (receipt, ack, current_ack)
+                for key, value in identity.items()
+            )
+            and receipt.get("recipe") == run["recipe"]
+            and receipt.get("required_observation") is True
+            and ack.get("state") == "active"
+            and type(ack.get("epoch")) is int
+            and ack["epoch"] >= 0
+            and type(ack.get("accepted_action_sequence")) is int
+            and ack["accepted_action_sequence"] >= 0
+        ):
+            return None
+        acquired = receipt.get("feedback_at_monotonic_s")
+        completed = receipt.get("completed_at_monotonic_s")
+        sequence = receipt.get("feedback_sequence")
+        current_sequence = evidence.get("feedback_sequence")
+        seed, positions = execution.get("original_seed"), receipt.get("measured_positions")
+        returns = 4 if run["recipe"].endswith("-repeat") else 1
+        cycles = returns if "arm-smoke" in run["recipe"] else 0
+        if not (
+            all(type(value) in (int, float) and math.isfinite(value) for value in (acquired, completed))
+            and run["native_live_at"] <= acquired <= completed <= now < run["deadline"]
+            # Preserve the physical adapter's original one-second acquisition/request bound.
+            and completed - acquired < 1.0
+            and type(sequence) is int
+            and sequence >= 0
+            and type(current_sequence) is int
+            and current_sequence >= sequence
+            and execution.get("feedback_sequence") == sequence
+            and execution.get("complete") is True
+            and execution.get("preparing") is False
+            and type(execution.get("admissions")) is int
+            and execution["admissions"] == 1
+            and type(execution.get("returns_qualified")) is int
+            and execution["returns_qualified"] == returns
+            and type(execution.get("cycles_completed")) is int
+            and execution["cycles_completed"] == cycles
+            and type(execution.get("progress_s")) in (int, float)
+            and math.isfinite(execution["progress_s"])
+            and execution.get("progress_s") == RECIPES[run["recipe"]].trajectory_s
+            and isinstance(seed, dict)
+            and seed
+            and isinstance(positions, dict)
+            and set(seed) == set(positions)
+            and all(
+                type(value) in (int, float) and math.isfinite(value)
+                for value in (*seed.values(), *positions.values())
+            )
+        ):
+            return None
+        fields = (
+            "run_id",
+            "host_incarnation",
+            "intent_revision",
+            "recipe",
+            "completed_at_monotonic_s",
+            "feedback_at_monotonic_s",
+            "feedback_sequence",
+            "accepted_host_action",
+            "required_observation",
+            "measured_positions",
+            "execution",
+            "return_reacknowledgment",
+        )
+        return json.loads(
+            json.dumps({key: receipt[key] for key in fields if key in receipt}, allow_nan=False)
+        )
+
     def _event(self, kind):
         event = {
             "kind": kind,
@@ -749,6 +868,19 @@ class SessionAuthority:
                 return
             if now >= r["deadline"]:
                 self._finish("stopped", "live_deadline")
+                return
+            if self.asynchronous and r["status"] == "resuming" and now >= r["resume_ceiling"]:
+                self._finish("faulted", "physical_resume_timeout")
+                return
+            completion = self._physical_completion(e, now)
+            if completion is not None:
+                r["completion_receipt"] = completion
+                r["execution"] = completion["execution"]
+                r["progress_s"] = completion["execution"]["progress_s"]
+                if completion["execution"].get("fault"):
+                    self._finish("faulted", completion["execution"]["fault"])
+                else:
+                    self._finish("completed")
                 return
             qualified = e["feedback"] and e["required_observation"] and e["native_ack"]
             if r["status"] == "preparing":

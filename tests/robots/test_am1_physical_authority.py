@@ -1,6 +1,10 @@
 """Real-lifecycle authority gates exercised with non-actuating asynchronous receipts."""
 
+import copy
+import json
 import uuid
+
+import pytest
 
 from tests.robots.test_am1_persistent_session import Clock, command, start
 from tools.am1_session_core import SessionAuthority
@@ -460,5 +464,245 @@ def test_already_acknowledged_watchdog_hold_opens_bounded_recovery(tmp_path):
         assert authority.run["status"] == "running"
         assert authority.run["recovery"] is None
         assert authority.run["deadline"] == deadline
+    finally:
+        authority.close()
+
+
+def completed_handoff(authority, executor, clock):
+    """Model the worker's final measured return followed by its ordinary hold."""
+    from examples.alohamini.am1_finite_task import JOINT_KEYS
+
+    ack = {
+        "run_id": authority.run["run_id"],
+        "host_incarnation": executor.backend_incarnation,
+        "intent_revision": authority.run["intent_revision"],
+        "epoch": 2,
+        "state": "active",
+        "accepted_action_sequence": 40,
+    }
+    execution = {
+        "progress_s": 352.0,
+        "complete": True,
+        "fault": None,
+        "preparing": False,
+        "original_seed": dict.fromkeys(JOINT_KEYS, 7.0),
+        "admissions": 1,
+        "returns_qualified": 4,
+        "cycles_completed": 4,
+        "feedback_sequence": 41,
+    }
+    receipt = {
+        "run_id": authority.run["run_id"],
+        "host_incarnation": executor.backend_incarnation,
+        "intent_revision": authority.run["intent_revision"],
+        "recipe": authority.run["recipe"],
+        "completed_at_monotonic_s": clock(),
+        "feedback_at_monotonic_s": clock(),
+        "feedback_sequence": 41,
+        "accepted_host_action": ack,
+        "required_observation": True,
+        "measured_positions": dict.fromkeys(JOINT_KEYS, 7.0),
+        "execution": execution,
+    }
+    executor.active_ack = False
+    original = executor.evidence
+    current_ack = dict(ack, epoch=3, state="paused", accepted_action_sequence=42)
+    executor.evidence = lambda: dict(
+        original(),
+        finite_completion=copy.deepcopy(receipt),
+        accepted_host_action=current_ack,
+        feedback_sequence=43,
+    )
+    return receipt, current_ack
+
+
+def test_completed_measured_return_is_consumed_before_intentional_hold_recovery(tmp_path):
+    clock, executor, authority = build(tmp_path)
+    try:
+        start(authority, "sim-arm-smoke-repeat")
+        admit_live(authority, executor, clock)
+        original_deadline = authority.run["deadline"]
+        clock.advance(0.8)
+        receipt, _ = completed_handoff(authority, executor, clock)
+        executor.advance = lambda *_: pytest.fail("completion must use the atomic evidence receipt")
+        clock.advance(0.1)
+        authority.tick()
+        assert authority.run["status"] == "finishing"
+        assert authority.run["requested_terminal"] == "completed"
+        assert authority.run["recovery_episodes"] == 0
+        assert authority.run["first_cause"] is None
+        assert authority.run["deadline"] == original_deadline
+        assert authority.run["execution"] == receipt["execution"]
+        assert authority.run["completion_receipt"] == receipt
+        persisted = json.loads(authority.db.execute("SELECT * FROM state").fetchone()[1])
+        assert persisted["completion_receipt"] == receipt
+        receipt["execution"]["original_seed"][next(iter(receipt["execution"]["original_seed"]))] = 99
+        assert set(authority.run["execution"]["original_seed"].values()) == {7.0}
+        assert executor.finishes == 1
+    finally:
+        authority.close()
+
+
+@pytest.mark.parametrize("loss", ["feedback", "observation", "foreign_ack"])
+def test_completed_receipt_does_not_bypass_current_required_input_loss(tmp_path, loss):
+    clock, executor, authority = build(tmp_path)
+    try:
+        start(authority, "sim-arm-smoke-repeat")
+        admit_live(authority, executor, clock)
+        clock.advance(0.8)
+        _, ack = completed_handoff(authority, executor, clock)
+        original = executor.evidence
+        if loss == "foreign_ack":
+            ack["host_incarnation"] = str(uuid.uuid4())
+            executor.evidence = lambda: dict(original(), native_ack=False)
+        else:
+            key = "feedback" if loss == "feedback" else "required_observation"
+            executor.evidence = lambda: dict(original(), **{key: False})
+        authority.tick()
+        assert authority.run["status"] == "recovering"
+        assert authority.run["recovery_episodes"] == 1
+        assert executor.finishes == 0
+    finally:
+        authority.close()
+
+
+@pytest.mark.parametrize("precedence", ["fault", "execution_fault", "deadline", "pause", "stop"])
+def test_completion_handoff_preserves_fault_deadline_and_operator_precedence(tmp_path, precedence):
+    clock, executor, authority = build(tmp_path)
+    try:
+        run = start(authority, "sim-arm-smoke-repeat")
+        admit_live(authority, executor, clock)
+        clock.advance(0.8)
+        receipt, _ = completed_handoff(authority, executor, clock)
+        if precedence == "fault":
+            executor.fault = "native hard fault after final return"
+        elif precedence == "execution_fault":
+            receipt["execution"]["fault"] = "final return fault"
+        elif precedence == "deadline":
+            clock.advance(authority.run["deadline"] - clock())
+        else:
+            authority.handle(command(precedence, run_id=run["run_id"]), "viewer")
+        authority.tick()
+        expected = "paused" if precedence == "pause" else "finishing"
+        assert authority.run["status"] == expected
+        if precedence in {"fault", "execution_fault"}:
+            assert authority.run["requested_terminal"] == "faulted"
+            assert authority.run["first_cause"] == (
+                executor.fault if precedence == "fault" else "final return fault"
+            )
+        elif precedence in {"deadline", "stop"}:
+            assert authority.run["requested_terminal"] == "stopped"
+        assert authority.run["recovery_episodes"] == 0
+    finally:
+        authority.close()
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "run",
+        "incarnation",
+        "revision",
+        "recipe",
+        "future",
+        "stale_final",
+        "sequence",
+        "no_return",
+        "no_cycles",
+        "not_complete",
+        "unqualified_camera",
+        "no_final_feedback",
+        "bool_admissions",
+        "bool_returns",
+        "bool_cycles",
+        "bool_progress",
+    ],
+)
+def test_invalid_completion_receipt_cannot_turn_elapsed_trajectory_into_completion(tmp_path, invalid):
+    clock, executor, authority = build(tmp_path)
+    try:
+        start(authority, "sim-arm-smoke-repeat")
+        admit_live(authority, executor, clock)
+        clock.advance(0.8)
+        receipt, _ = completed_handoff(authority, executor, clock)
+        if invalid in {"run", "incarnation", "recipe"}:
+            field = {"run": "run_id", "incarnation": "host_incarnation", "recipe": "recipe"}[invalid]
+            receipt[field] = "foreign"
+        elif invalid == "revision":
+            receipt["intent_revision"] += 1
+        elif invalid == "future":
+            receipt["completed_at_monotonic_s"] = clock() + 1
+        elif invalid == "stale_final":
+            clock.advance(1)
+            receipt["completed_at_monotonic_s"] = clock()
+        elif invalid == "sequence":
+            receipt["feedback_sequence"] += 1
+        elif invalid == "unqualified_camera":
+            receipt["required_observation"] = False
+        elif invalid == "no_final_feedback":
+            receipt["measured_positions"] = {}
+        elif invalid.startswith("bool_"):
+            field = {
+                "bool_admissions": "admissions",
+                "bool_returns": "returns_qualified",
+                "bool_cycles": "cycles_completed",
+                "bool_progress": "progress_s",
+            }[invalid]
+            receipt["execution"][field] = True
+        else:
+            field = {
+                "no_return": "returns_qualified",
+                "no_cycles": "cycles_completed",
+                "not_complete": "complete",
+            }[invalid]
+            receipt["execution"][field] = 0
+        authority.tick()
+        assert authority.run["status"] == "recovering"
+        assert authority.run["recovery_episodes"] == 1
+        assert executor.finishes == 0
+    finally:
+        authority.close()
+
+
+@pytest.mark.parametrize(
+    "case", ["qualified", "original_return", "two_samples", "required_loss", "resume_ceiling"]
+)
+def test_completed_resume_requires_new_return_reacknowledgment_with_original_ceiling(tmp_path, case):
+    clock, executor, authority = build(tmp_path)
+    try:
+        start(authority, "sim-arm-smoke-repeat")
+        admit_live(authority, executor, clock)
+        clock.advance(0.8)
+        receipt, _ = completed_handoff(authority, executor, clock)
+        authority.run.update(status="resuming", resume_ceiling=clock() + 10)
+        executor.dispatch_ack = False
+        receipt["return_reacknowledgment"] = {
+            "sample_count": 3,
+            "span_s": 0.2,
+            "first_feedback_sequence": 39,
+        }
+        if case == "original_return":
+            receipt.pop("return_reacknowledgment")
+        elif case == "two_samples":
+            receipt["return_reacknowledgment"]["sample_count"] = 2
+        elif case == "required_loss":
+            executor.qualified = False
+        elif case == "resume_ceiling":
+            clock.advance(10)
+        deadline = authority.run["deadline"]
+        authority.tick()
+        if case in {"qualified", "original_return", "resume_ceiling"}:
+            assert authority.run["status"] == "finishing"
+            assert authority.run["requested_terminal"] == (
+                "completed" if case != "resume_ceiling" else "faulted"
+            )
+            assert authority.run["first_cause"] == (
+                None if case != "resume_ceiling" else "physical_resume_timeout"
+            )
+        else:
+            assert authority.run["status"] == "resuming"
+            assert executor.finishes == 0
+        assert authority.run["deadline"] == deadline
+        assert authority.run["recovery_episodes"] == 0
     finally:
         authority.close()

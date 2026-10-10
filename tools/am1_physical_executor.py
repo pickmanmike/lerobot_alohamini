@@ -121,6 +121,8 @@ class PhysicalExecutor:
         self._hold_reference = None
         self._dispatch_ack = False
         self._execution = {"progress_s": 0.0, "complete": False, "fault": None}
+        self._finite_completion = None
+        self._completion_returns = []
         self._lifecycle = {
             "run_id": None,
             "phase": "idle",
@@ -178,6 +180,8 @@ class PhysicalExecutor:
             self._hold_reference = None
             self._dispatch_ack = False
             self._execution = {"progress_s": 0.0, "complete": False, "fault": None}
+            self._finite_completion = None
+            self._completion_returns = []
             self._lifecycle = {
                 "run_id": run_id,
                 "phase": "startup",
@@ -203,6 +207,8 @@ class PhysicalExecutor:
                 raise ValueError("physical intent revision must not regress")
             if revision != self.revision:
                 self.revision = revision
+                self._finite_completion = None
+                self._completion_returns = []
                 self.desired = "hold"
                 self._dispatch_ack = False
                 self._aligned = []
@@ -248,6 +254,7 @@ class PhysicalExecutor:
                 "hold_acknowledged": bool(hold),
                 "native_ack": bool(hold or active_ack),
                 "active_acknowledged": bool(active_ack),
+                "finite_completion": copy.deepcopy(self._finite_completion),
                 "fault": self._fault,
                 "feedback_age_s": age,
                 "observation_age_s": o["age_s"],
@@ -290,6 +297,7 @@ class PhysicalExecutor:
 
     def hold(self):
         with self.mutex:
+            self._completion_returns = []
             if self._lifecycle["phase"] not in ("startup", "live"):
                 return False  # Idle/restart/finished inspection never opens or commands hardware.
             if self.desired != "hold":
@@ -393,6 +401,7 @@ class PhysicalExecutor:
                         self._dispatch_ack = False
                         self._aligned = []
                         self._hold_reference = None
+                        self._completion_returns = []
                     latest_ack = self.sample["ack"] if self.sample else {}
                     if (
                         fresh
@@ -406,6 +415,7 @@ class PhysicalExecutor:
                         self._dispatch_ack = False
                         self._aligned = []
                         self._hold_reference = None
+                        self._completion_returns = []
                     desired = "active" if self.desired == "active" and fresh and observed else "pause"
                     if self._epoch_mode != desired or self._epoch_revision != self.revision:
                         if desired == "pause":
@@ -464,10 +474,62 @@ class PhysicalExecutor:
                             self._dispatch_ack = True
                             if not self.task.active:
                                 self.task.resume(self.clock())
-                            if self.task.advance(self.clock(), self.sample):
+                            was_complete = self.task.complete
+                            advanced = self.task.advance(self.clock(), self.sample)
+                            if advanced:
                                 self._execution = dict(self.task.snapshot(), fault=None)
                             if self.task.complete:
-                                self.desired = "hold"
+                                reack = None
+                                qualified_return = advanced and not was_complete
+                                if advanced and was_complete and self._finite_completion is None:
+                                    # An explicit revision change can follow an already qualified
+                                    # completion. Re-acknowledge its original return, never restart
+                                    # or rebase the finite provider, before holding again.
+                                    for key, origin in self.task.original_seed.items():
+                                        limit = (
+                                            1.0
+                                            if self.task.profile == "ArmHoldBody"
+                                            else self.task.joint_amplitudes[key]
+                                        )
+                                        if abs(self.sample["positions"][key] - origin) > limit:
+                                            raise ValueError(
+                                                f"{self.task.profile} return exceeds the original envelope for {key}"
+                                            )
+                                    self._completion_returns.append(
+                                        (self.sample["at"], self.sample["sequence"])
+                                    )
+                                    self._completion_returns = self._completion_returns[-3:]
+                                    span = self._completion_returns[-1][0] - self._completion_returns[0][0]
+                                    qualified_return = (
+                                        len(self._completion_returns) == 3 and span >= 0.2 - 1e-9
+                                    )
+                                    if qualified_return:
+                                        reack = {
+                                            "sample_count": 3,
+                                            "span_s": span,
+                                            "first_feedback_sequence": self._completion_returns[0][1],
+                                        }
+                                if qualified_return and self._finite_completion is None:
+                                    # Freeze the actual qualified return and active ACK before the
+                                    # ordinary hold advances the host epoch. Publish atomically with
+                                    # current evidence; a later hold must not replace this proof.
+                                    self._finite_completion = {
+                                        "run_id": self.run_id,
+                                        "host_incarnation": self.host_incarnation,
+                                        "intent_revision": self.revision,
+                                        "recipe": self.recipe.name,
+                                        "completed_at_monotonic_s": self.clock(),
+                                        "feedback_at_monotonic_s": self.sample["at"],
+                                        "feedback_sequence": self.sample["sequence"],
+                                        "accepted_host_action": copy.deepcopy(ack),
+                                        "required_observation": observed,
+                                        "measured_positions": copy.deepcopy(self.sample["positions"]),
+                                        "execution": copy.deepcopy(self._execution),
+                                    }
+                                    if reack is not None:
+                                        self._finite_completion["return_reacknowledgment"] = reack
+                                if self._finite_completion is not None:
+                                    self.desired = "hold"
                         self.task.check(self.clock())
                     action = dict(ZERO_BODY)
                     if desired == "active" and self.task:
@@ -497,6 +559,7 @@ class PhysicalExecutor:
                         self._dispatch_ack = False
                         self._aligned = []
                         self._hold_reference = None
+                        self._completion_returns = []
                 self._wake.wait(1 / 30)
                 self._wake.clear()
         except StartupCancelledError:

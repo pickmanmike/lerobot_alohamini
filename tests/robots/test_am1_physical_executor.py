@@ -268,6 +268,186 @@ def test_required_input_loss_holds_independently_of_web_and_fences_revision():
         e.worker.join(2)
 
 
+def test_actual_finite_return_receipt_survives_worker_hold_until_authority_consumes(tmp_path):
+    from examples.alohamini.am1_session_contract import RECIPES
+    from tests.robots.test_am1_persistent_session import Clock, start
+    from tools.am1_session_core import SessionAuthority
+
+    clock = Clock()
+
+    class SteppedHost(ControlledHost):
+        def poll(self, previous):
+            clock.advance(0.1)
+            sample = super().poll(previous)
+            sample["at"] = clock()
+            return sample
+
+    host = SteppedHost()
+    e = module().PhysicalExecutor(
+        {"shoulder_amplitude": 1.5, "source_pins": {}},
+        observation(),
+        clock=clock,
+        io_factory=lambda *_: host,
+    )
+    authority = SessionAuthority(tmp_path, clock=clock, executor=e)
+    try:
+        start(authority, "physical-arm-hold-body")
+
+        def admitted():
+            authority.tick()
+            return authority.run["status"] == "running"
+
+        until(admitted)
+        deadline = authority.run["deadline"]
+        # Execute the unchanged 12-second provider and real three-sample return gate.
+        # Only the injected host clock is accelerated; elapsed trajectory is not completion.
+        until(lambda: e.advance(clock(), 0)["progress_s"] == 12, timeout=7)
+        assert not e.advance(clock(), 0)["complete"]
+        assert e.evidence().get("finite_completion") is None
+        until(lambda: e.advance(clock(), 0)["complete"])
+        until(lambda: e.evidence()["hold_acknowledged"])
+        evidence = e.evidence()
+        assert not evidence["active_acknowledged"]
+        receipt = evidence.get("finite_completion")
+        assert receipt is not None
+        assert receipt["execution"]["returns_qualified"] == 1
+        assert receipt["execution"]["admissions"] == 1
+        assert receipt["feedback_sequence"] == receipt["execution"]["feedback_sequence"]
+        assert receipt["feedback_sequence"] < evidence["feedback_sequence"]
+        assert receipt["accepted_host_action"]["state"] == "active"
+        assert receipt["accepted_host_action"]["epoch"] < evidence["accepted_host_action"]["epoch"]
+        assert receipt["run_id"] == authority.run["run_id"]
+        assert receipt["host_incarnation"] == authority.run["backend_incarnation"]
+        assert receipt["measured_positions"] == dict.fromkeys(JOINT_KEYS, 7.0)
+        receipt["measured_positions"][JOINT_KEYS[0]] = 99
+        assert e.evidence()["finite_completion"]["measured_positions"][JOINT_KEYS[0]] == 7
+        authority.tick()
+        assert authority.run["status"] == "finishing"
+        assert authority.run["requested_terminal"] == "completed"
+        assert authority.run["recovery_episodes"] == 0
+        assert authority.run["first_cause"] is None
+        assert authority.run["deadline"] == deadline
+        until(lambda: e.evidence()["lifecycle"]["phase"] == "terminal")
+        authority.tick()
+        assert authority.run["status"] == "completed"
+        assert authority.run["cleanup"] == "physical_readback_verified"
+        # A revision change fences even a retained genuine completion receipt.
+        e.set_intent_revision(1)
+        assert e.evidence()["finite_completion"] is None
+        assert authority.run["completion_receipt"]["intent_revision"] == 0
+        assert authority.run["completion_receipt"]["execution"]["returns_qualified"] == 1
+        assert e.supports(RECIPES["physical-arm-hold-body"])
+    finally:
+        authority.close()
+        e.worker.join(2)
+
+
+@pytest.mark.parametrize("pause_boundary", ["before_final_return", "after_final_return"])
+def test_actual_pause_resume_requires_fresh_acknowledged_return(tmp_path, pause_boundary):
+    from tests.robots.test_am1_persistent_session import Clock, command, start
+    from tools.am1_session_core import SessionAuthority
+
+    clock = Clock()
+
+    class SteppedHost(ControlledHost):
+        allow_active_ack = True
+
+        def poll(self, previous):
+            clock.advance(0.1)
+            sample = super().poll(previous)
+            sample["at"] = clock()
+            return sample
+
+        def send(self, action):
+            if action["_am1_local_control"]["mode"] == "active" and not self.allow_active_ack:
+                self.actions.append(action)
+            else:
+                super().send(action)
+
+    host = SteppedHost()
+    e = module().PhysicalExecutor(
+        {"shoulder_amplitude": 1.5, "source_pins": {}},
+        observation(),
+        clock=clock,
+        io_factory=lambda *_: host,
+    )
+    authority = SessionAuthority(tmp_path, clock=clock, executor=e)
+    try:
+        run = start(authority, "physical-arm-hold-body")
+
+        def admitted():
+            authority.tick()
+            return authority.run["status"] == "running"
+
+        until(admitted)
+        deadline = authority.run["deadline"]
+        if pause_boundary == "after_final_return":
+            until(lambda: e.evidence().get("finite_completion") is not None, timeout=7)
+        else:
+            until(lambda: e.advance(clock(), 0)["progress_s"] >= 11.8, timeout=7)
+        seed = dict(e.task.original_seed)
+        assert e.task.complete == (pause_boundary == "after_final_return")
+        assert authority.run["status"] == "running"
+        paused = authority.handle(command("pause", run_id=run["run_id"]), "viewer")
+        assert paused["accepted"] and authority.run["status"] == "paused"
+        assert e.evidence()["finite_completion"] is None
+        until(lambda: e.evidence()["pose_aligned"])
+        claim = authority.handle(command("claim"), "owner")
+        connection = authority.handle(command("connect", run_id=run["run_id"]), "owner")
+        controls = {
+            "run_id": run["run_id"],
+            "controller_generation": claim["controller_generation"],
+            "connection_generation": connection["connection_generation"],
+            "service_incarnation": authority.service_incarnation,
+        }
+        assert authority.handle(command("release_input", **controls), "owner")["accepted"]
+        host.allow_active_ack = False
+        resumed = authority.handle(
+            command("resume", expected_intent_revision=authority.run["intent_revision"], **controls), "owner"
+        )
+        assert resumed["accepted"] and authority.run["status"] == "resuming"
+        revision = authority.run["intent_revision"]
+
+        def active_requested():
+            authority.tick()
+            return e._epoch_mode == "active"
+
+        until(active_requested)
+        before = e.evidence()["feedback_sequence"]
+        until(lambda: e.evidence()["feedback_sequence"] >= before + 3)
+        assert e.evidence()["finite_completion"] is None
+        host.allow_active_ack = True
+        until(lambda: e.evidence().get("finite_completion") is not None)
+        until(lambda: e.evidence()["hold_acknowledged"])
+        receipt = e.evidence()["finite_completion"]
+        assert receipt["intent_revision"] == revision
+        if pause_boundary == "after_final_return":
+            assert receipt["return_reacknowledgment"]["sample_count"] == 3
+            assert receipt["return_reacknowledgment"]["span_s"] >= 0.2 - 1e-9
+        else:
+            assert "return_reacknowledgment" not in receipt
+        assert receipt["execution"]["original_seed"] == seed
+        assert receipt["execution"]["admissions"] == 1
+        assert receipt["execution"]["returns_qualified"] == 1
+        assert receipt["execution"]["progress_s"] == 12
+        # The native hold can also precede the authority consuming Resume's ACK.
+        authority.tick()
+        assert authority.run["status"] == "finishing"
+        assert authority.run["requested_terminal"] == "completed"
+        assert authority.run["recovery_episodes"] == 0
+        assert authority.run["first_cause"] is None
+        assert authority.run["deadline"] == deadline
+        assert e.task.original_seed == seed
+        assert all(
+            all(a[k] == 0 for k in module().ZERO_BODY)
+            for a in host.actions
+            if a["_am1_local_control"]["intent_revision"] == revision
+        )
+    finally:
+        authority.close()
+        e.worker.join(2)
+
+
 def test_expected_transport_loss_survives_and_partial_finish_stays_uncertain():
     host = ControlledHost()
     e = executor(host)
