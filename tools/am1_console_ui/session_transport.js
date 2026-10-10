@@ -133,6 +133,17 @@ globalThis.AM1RemoteInitialize=function() {
   const state=document.querySelector("#session-state"),notice=document.querySelector("#control-notice");
   const render=(transport,message)=> {
     const run=transport.snapshot?.run;
+    const recipes=transport.snapshot?.recipes, select=document.querySelector("#fake-recipe");
+    if(recipes && select.dataset.recipes!==JSON.stringify(recipes)) {
+      const previous=select.value;
+      select.replaceChildren(...recipes.filter(name=>name!=="fake-finite-short").map(name=> {
+        const option=document.createElement("option"); option.value=name; option.textContent=name; return option;
+      }));
+      if([...select.options].some(option=>option.value===previous))select.value=previous;
+      select.dataset.recipes=JSON.stringify(recipes);
+    }
+    const simulated=run?.source==="simulated-provider" || recipes?.some(name=>name.startsWith("sim-"));
+    document.querySelector("#view-heading").textContent=simulated ? "Simulated finite provider session" : "Fake persistent session";
     state.textContent=run ? `Fake session · ${run.status} · ${run.progress_s.toFixed(2)} s` : "Fake session · no run";
     document.querySelector("#session-details").textContent=JSON.stringify(transport.snapshot,null,2);
     document.querySelector("#live-countdown").textContent=run ? `Original Live budget: ${Math.ceil(run.remaining_s || 0)} s remaining` : "No fake run";
@@ -147,7 +158,7 @@ globalThis.AM1RemoteInitialize=function() {
   panel.innerHTML='<label>Local pairing code <input id="pairing-code" type="password" autocomplete="off"></label><button id="pair-device" type="button">Enroll device</button>';
   document.querySelector("header").append(panel);
   const options=document.createElement("div");
-  options.innerHTML='<label>Fake recipe <select id="fake-recipe"><option value="fake-finite">Finite</option><option value="fake-interactive">Interactive</option></select></label> <label>Handoff device ID <input id="handoff-device"></label><button data-operation="Handoff" type="button">Handoff</button>';
+  options.innerHTML='<label>Session recipe <select id="fake-recipe"><option value="fake-finite">Finite</option><option value="fake-interactive">Interactive</option></select></label> <label>Handoff device ID <input id="handoff-device"></label><button data-operation="Handoff" type="button">Handoff</button>';
   document.querySelector(".control-actions").append(options);
   const claimButton=document.querySelector('[data-operation="ClaimInput"]');
   claimButton.textContent="Claim input";options.prepend(claimButton);

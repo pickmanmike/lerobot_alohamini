@@ -1,4 +1,4 @@
-"""Durable fake-only authority. All mutation is serialized; no hardware imports."""
+"""Durable session authority. Explicit executor outcomes; no hardware imports."""
 
 import hashlib
 import json
@@ -87,7 +87,11 @@ class SessionAuthority:
         self.run = json.loads(row[0]) if row else None
         if self.run and self.run["status"] not in TERMINAL:
             self.run.update(
-                status="interrupted", uncertain=True, deadline=None, intent=None, cleanup="held_body_zero"
+                status="interrupted",
+                uncertain=True,
+                deadline=None,
+                intent=None,
+                cleanup=self.executor.restart_cleanup,
             )
             self.run["first_cause"] = self.run["first_cause"] or "service_restart"
             self._event("service_restart")
@@ -155,7 +159,9 @@ class SessionAuthority:
     def _finish(self, status, cause=None):
         self.run["status"] = status
         self.run["intent"] = None
-        self.run["cleanup"] = "held_body_zero"
+        outcome = self.executor.finish(status)
+        self.run["cleanup"] = outcome["cleanup"]
+        self.run["uncertain"] = self.run["uncertain"] or outcome["uncertain"]
         if cause and not self.run["first_cause"]:
             self.run["first_cause"] = cause
         self.executor.hold()
@@ -262,7 +268,7 @@ class SessionAuthority:
             if self.db.execute("SELECT 1 FROM mutations WHERE id=?", (oid,)).fetchone():
                 return self._refuse("operation conflict")
             recipe = RECIPES.get(c.get("recipe"))
-            if not recipe:
+            if not recipe or not self.executor.supports(recipe):
                 return self._refuse("unknown fake recipe")
             if set(c) - {"op", "operation_id", "recipe", "controller_generation"}:
                 return self._refuse("recipe parameters forbidden")
@@ -289,7 +295,7 @@ class SessionAuthority:
                 "run_id": str(uuid.uuid4()),
                 "operation_id": oid,
                 "recipe": recipe.name,
-                "source": "fake",
+                "source": self.executor.source,
                 "seed": recipe.seed,
                 "status": "accepted",
                 "dispatch": "accepted",
@@ -318,7 +324,7 @@ class SessionAuthority:
             self.run["dispatch"] = "dispatching"
             self._save()
             try:
-                admitted = self.executor.dispatch(recipe)
+                admitted = self.executor.begin(recipe)
             except Exception:
                 self.run["uncertain"] = True
                 self._finish("faulted", "dispatch_exception")
@@ -504,8 +510,13 @@ class SessionAuthority:
                         r["status"] = "recovering"
                         self.executor.hold()
             elif r["status"] == "running" and RECIPES[r["recipe"]].mode == "finite":
-                r["progress_s"] = min(RECIPES[r["recipe"]].trajectory_s, r["progress_s"] + dt)
-                if r["progress_s"] >= RECIPES[r["recipe"]].trajectory_s:
+                execution = self.executor.advance(now, dt)
+                r["execution"] = execution
+                r["progress_s"] = execution["progress_s"]
+                if execution.get("fault"):
+                    self._finish("faulted", execution["fault"])
+                    return
+                if execution["complete"]:
                     self._finish("completed")
                     return
             if r["status"] != previous_status or now - self.last_checkpoint >= 1.0:
@@ -537,6 +548,9 @@ class SessionAuthority:
                             else max(0, RECIPES[self.run["recipe"]].trajectory_s - self.run["progress_s"]),
                         ),
                         "evidence": self.executor.evidence(),
+                        "recipes": [
+                            name for name, recipe in RECIPES.items() if self.executor.supports(recipe)
+                        ],
                         "events": list(self.events),
                     }
                 )
@@ -546,7 +560,7 @@ class SessionAuthority:
         with self.mutex:
             if self.closed:
                 return
-            self.executor.hold()
+            self.executor.close()
             self.closed = True
             self.db.close()
             self.owner_lock.close()

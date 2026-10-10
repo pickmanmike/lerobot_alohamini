@@ -4,6 +4,28 @@ import time
 
 
 class FakeExecutor:
+    source = "fake"
+    restart_cleanup = "held_body_zero"
+
+    def supports(self, recipe):
+        return recipe.name.startswith("fake-")
+
+    def begin(self, recipe):
+        self.progress_s = 0.0
+        self.recipe = recipe
+        return self.dispatch(recipe)
+
+    def advance(self, now, dt):
+        self.progress_s = min(self.recipe.trajectory_s, self.progress_s + dt)
+        return {"progress_s": self.progress_s, "complete": self.progress_s >= self.recipe.trajectory_s}
+
+    def finish(self, status):
+        self.hold()
+        return {"cleanup": "held_body_zero", "uncertain": False}
+
+    def close(self):
+        self.hold()
+
     def __init__(self, clock=time.monotonic):
         self.clock = clock
         self.feedback = True
