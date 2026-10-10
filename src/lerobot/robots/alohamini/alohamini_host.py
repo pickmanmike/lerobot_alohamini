@@ -19,10 +19,14 @@ import json
 import logging
 import math
 import os
+import signal
+import stat
 import time
 from collections import deque
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
+from uuid import UUID, uuid4
 
 import cv2
 import zmq
@@ -37,17 +41,35 @@ AM1_LOCAL_FEEDBACK_KEY = "_am1_local_feedback"
 class AM1LocalControl:
     """AM1-only host-side pause latch on the existing motor-owner thread."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, run_id: str | None = None, host_incarnation: str | None = None) -> None:
+        if (run_id is None) != (host_incarnation is None):
+            raise ValueError("AM1 protected control requires both run and host identity")
+        self.binding = None if run_id is None else {
+            "run_id": str(UUID(run_id)), "host_incarnation": str(UUID(host_incarnation)),
+        }
+        self.intent_revision = -1
+        self.accepted_action_sequence = -1
+        self.accepted_action = None
         self.state = "ready"
         self.epoch = -1
         self.observation_id = 0
 
-    def annotate(self, observation: dict) -> None:
+    def annotate(self, observation: dict, *, acquired_at: float | None = None) -> None:
         self.observation_id += 1
         observation[AM1_LOCAL_FEEDBACK_KEY] = {
             "version": 1, "state": self.state, "epoch": self.epoch,
             "observation_id": self.observation_id,
         }
+        if self.binding is not None:
+            if acquired_at is None or not math.isfinite(acquired_at):
+                raise RuntimeError("AM1 protected feedback requires actual acquisition time")
+            observation[AM1_LOCAL_FEEDBACK_KEY].update(
+                **self.binding, intent_revision=self.intent_revision,
+                acquired_at_monotonic_s=acquired_at,
+                accepted_action_sequence=self.accepted_action_sequence,
+                accepted_action=self.accepted_action,
+                write_acknowledged=False,
+            )
 
     def watchdog_stop(self, robot: AlohaMini) -> None:
         robot.stop_motion()
@@ -59,6 +81,8 @@ class AM1LocalControl:
     def apply(self, robot: AlohaMini, command: dict) -> bool:
         marker = command.get(AM1_LOCAL_CONTROL_KEY)
         if marker is None:
+            if self.binding is not None:
+                raise RuntimeError("AM1 protected control binding is missing")
             if self.state != "ready":
                 zero_keys = {"x.vel", "y.vel", "theta.vel", "lift_axis.vel"}
                 if set(command) != zero_keys or any(
@@ -76,22 +100,38 @@ class AM1LocalControl:
                 return True
             robot.send_action(command)
             return True
+        expected_keys = {"version", "mode", "epoch"}
+        if self.binding is not None:
+            expected_keys |= {"run_id", "host_incarnation", "intent_revision", "action_sequence"}
+            if not isinstance(marker, dict) or any(marker.get(k) != v for k, v in self.binding.items()):
+                raise RuntimeError("AM1 protected control binding differs from this run/host")
+            if type(marker.get("intent_revision")) is not int or marker["intent_revision"] < 0:
+                raise RuntimeError("AM1 protected intent revision is invalid")
+            if type(marker.get("action_sequence")) is not int or marker["action_sequence"] < 0:
+                raise RuntimeError("AM1 protected action sequence is invalid")
         if (
             not isinstance(marker, dict)
-            or set(marker) != {"version", "mode", "epoch"}
+            or set(marker) != expected_keys
             or marker.get("version") != 1
             or type(marker.get("epoch")) is not int
             or marker["epoch"] < 0
             or marker.get("mode") not in {"active", "pause"}
         ):
             raise RuntimeError("Invalid AM1 Local control marker")
+        if self.binding is not None and marker["action_sequence"] <= self.accepted_action_sequence:
+            return False  # Duplicate/stale enqueue never reapplies a motor action.
         if self.state == "stopped":
             return False
         mode, epoch = marker["mode"], marker["epoch"]
         if epoch < self.epoch:
             return False
+        if self.binding is not None and marker["intent_revision"] < self.intent_revision:
+            raise RuntimeError("AM1 protected intent revision regressed")
         if mode == "pause":
             if epoch == self.epoch and self.state == "paused":
+                if self.binding is not None:
+                    self.intent_revision = marker["intent_revision"]
+                    self.accepted_action_sequence = marker["action_sequence"]
                 return True
             expected = (
                 1 if self.state == "ready"
@@ -102,6 +142,10 @@ class AM1LocalControl:
             robot.stop_motion()
             robot.hold_follower_arms()
             self.state, self.epoch = "paused", epoch
+            if self.binding is not None:
+                self.intent_revision = marker["intent_revision"]
+                self.accepted_action_sequence = marker["action_sequence"]
+                self.accepted_action = {"mode": "measured_arm_hold", "body_velocity": 0.0}
             logging.warning("AM1 Local PAUSED: measured-position hold acknowledged; epoch=%s", epoch)
             return True
         if epoch == self.epoch and self.state == "paused":
@@ -114,36 +158,270 @@ class AM1LocalControl:
         action = {key: value for key, value in command.items() if key != AM1_LOCAL_CONTROL_KEY}
         if resuming and any(float(action.get(key, 0)) != 0 for key in ("x.vel", "y.vel", "theta.vel", "lift_axis.vel")):
             raise RuntimeError("AM1 Local first resumed action must have zero body velocity")
-        robot.send_action(action)
+        accepted = robot.send_action(action)
         self.state, self.epoch = "active", epoch
+        if self.binding is not None:
+            self.intent_revision = marker["intent_revision"]
+            self.accepted_action_sequence = marker["action_sequence"]
+            self.accepted_action = None if accepted is None else {
+                key: _jsonable(value) for key, value in accepted.items()
+                if type(_jsonable(value)) in (int, float) and math.isfinite(_jsonable(value))
+            }
         if resuming:
             logging.info("AM1 Local RECOVERED: first bounded action applied; epoch=%s", epoch)
         return True
+
+
+def _private_directory(path: Path) -> None:
+    info = path.stat(follow_symlinks=False)
+    if path.is_symlink() or not stat.S_ISDIR(info.st_mode):
+        raise RuntimeError("AM1 physical directory must be an actual owned directory")
+    if os.name != "nt" and (info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077):
+        raise RuntimeError("AM1 physical directory requires current owner and mode 0700")
+
+
+class AM1PhysicalAdmission:
+    """Canonical admission before effects, plus an independent serial-owner lock.
+
+    An inherited descriptor is the parent's already locked open-file description.
+    Never unlock it from the child: closing our duplicate preserves the parent.
+    """
+
+    def __init__(self, state_directory: str | Path, *, inherited_fd: int | None = None):
+        if os.name == "nt":
+            raise RuntimeError("AM1 physical motor ownership requires native Pi flock")
+        import fcntl
+
+        self.canonical = self.serial = None
+        directory = Path(state_directory).expanduser()
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _private_directory(directory)
+        if any((directory / name).exists() or (directory / name).is_symlink()
+               for name in ("cleanup-uncertain.json", "physical-in-progress.json")):
+            raise RuntimeError("AM1 physical cleanup requires actual stopped reconciliation")
+        lock_path = directory / "active.lock"
+        try:
+            if inherited_fd is None:
+                self.canonical = self._open_lock(lock_path)
+                try:
+                    fcntl.flock(self.canonical.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError as error:
+                    raise RuntimeError("Another AM1 physical owner is active; refusing takeover") from error
+            else:
+                info = os.fstat(inherited_fd)
+                target = lock_path.stat(follow_symlinks=False)
+                if (info.st_dev, info.st_ino) != (target.st_dev, target.st_ino) or not stat.S_ISREG(info.st_mode):
+                    raise RuntimeError("AM1 inherited admission descriptor is not canonical active.lock")
+                probe = self._open_lock(lock_path)
+                try:
+                    try:
+                        fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        pass
+                    else:
+                        raise RuntimeError("AM1 inherited admission descriptor was not already locked")
+                    # This succeeds only on the already owning open-file description.
+                    fcntl.flock(inherited_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                finally:
+                    probe.close()
+                self.canonical = os.fdopen(os.dup(inherited_fd), "a+b")
+            self.directory = directory
+            self.acquire_serial_owner()
+        except BaseException:
+            self.close()
+            raise
+
+    @staticmethod
+    def _open_lock(path: Path):
+        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags, 0o600)
+        try:
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
+                raise RuntimeError("AM1 physical lock requires owned mode 0600 regular file")
+            return os.fdopen(descriptor, "a+b")
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    def acquire_serial_owner(self) -> None:
+        import fcntl
+
+        if self.serial is not None:
+            return
+        self.serial = self._open_lock(self.directory / "serial-owner.lock")
+        try:
+            fcntl.flock(self.serial.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            raise RuntimeError("Another AM1 serial owner is active; refusing takeover") from error
+
+    def claim_run(self, *, run_id: str, host_incarnation: str, scope: str) -> None:
+        """Persist ownership before constructing anything that can touch a device.
+
+        File locks disappear on abrupt process death; this record deliberately does
+        not. Only this owner's complete actual cleanup receipt may clear it.
+        """
+        if scope not in ("protected", "legacy"):
+            raise ValueError("AM1 physical owner scope must be protected or legacy")
+        record = {
+            "version": 1, "kind": "am1-physical-in-progress",
+            "run_id": str(UUID(run_id)), "host_incarnation": str(UUID(host_incarnation)),
+            "scope": scope, "owner_pid": os.getpid(),
+            "claimed_at_monotonic_s": time.monotonic(),
+        }
+        path = self.directory / "physical-in-progress.json"
+        try:
+            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError as error:
+            raise RuntimeError("AM1 unfinished physical owner requires actual stopped reconciliation") from error
+        # Even a partial write or persistence failure keeps the record in place.
+        # Removing it on error could hide a crash with uncertain device state.
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(record, stream, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        _fsync_directory(self.directory)
+        self.in_progress = record
+
+    def finish_run(self, receipt: dict) -> bool:
+        """Clear only our durable claim after every actual bus close is qualified."""
+        record = getattr(self, "in_progress", None)
+        readback = receipt.get("readback")
+        if (record is None or receipt.get("uncertain") is not False
+            or receipt.get("cleanup") != "physical_readback_verified"
+            or not isinstance(readback, dict) or not readback.get("verified")
+            or not readback.get("buses_closed") or receipt.get("cleanup_errors")
+            or any(receipt.get(key) != record[key] for key in ("run_id", "host_incarnation"))):
+            return False
+        path = self.directory / "physical-in-progress.json"
+        if path.is_symlink() or json.loads(path.read_text(encoding="utf-8")) != record:
+            raise RuntimeError("AM1 durable owner changed; actual stopped reconciliation is required")
+        path.unlink()
+        _fsync_directory(self.directory)
+        self.in_progress = None
+        return True
+
+    def close(self) -> None:
+        for stream in (self.serial, self.canonical):
+            if stream is not None:
+                stream.close()
+        self.serial = self.canonical = None
+
+
+def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        return  # Mock-only Windows checks; native Pi ownership requires POSIX.
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _atomic_private_json(path: Path, payload: dict) -> None:
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def write_am1_cleanup_receipt(args, robot, first_error: BaseException | None, cleanup_errors: list[str]) -> dict:
+    readback = getattr(robot, "_am1_shutdown_evidence", None)
+    verified = bool(isinstance(readback, dict) and readback.get("verified")
+                    and readback.get("buses_closed") and not cleanup_errors)
+
+    def cause_chain(error):
+        chain = []
+        while error is not None:
+            chain.append({"cause": f"{type(error).__name__}: {error}", "notes": list(getattr(error, "__notes__", []))})
+            error = error.__cause__
+        return chain
+
+    requested_stop = getattr(args, "_am1_stop_interruption", None)
+    expected_stop = None
+    if requested_stop is not None:
+        expected_stop = {
+            "signal": getattr(args, "_am1_stop_signal", None),
+            "interruption": cause_chain(requested_stop),
+        }
+    if first_error is not None and first_error is requested_stop:
+        # Cancellation is ordinary only after actual, complete stopped readback.
+        # Any genuine cleanup failure keeps its own cause and the stop remains
+        # visible separately, including notes from an interrupted startup.
+        first_error = getattr(args, "_am1_cleanup_first_error", None)
+        if not verified and first_error is None:
+            first_error = RuntimeError("Physical cleanup was not verified after requested Stop")
+    error_chain = cause_chain(first_error)
+    result = {
+        "version": 1,
+        "run_id": getattr(args, "_am1_physical_run_id", args.am1_run_id),
+        "host_incarnation": getattr(args, "_am1_physical_host_incarnation", args.am1_host_incarnation),
+        "cleanup": "physical_readback_verified" if verified else "physical_cleanup_unknown",
+        "uncertain": not verified,
+        "first_cause": None if not error_chain else error_chain[-1]["cause"],
+        "first_error_chain": error_chain, "expected_stop": expected_stop,
+        "cleanup_errors": list(cleanup_errors), "readback": readback,
+        "completed_at_monotonic_s": time.monotonic(),
+        "provenance": "protected-host/actual-motor-readback",
+    }
+    path = getattr(args, "_am1_physical_cleanup_receipt", args.am1_cleanup_receipt)
+    _atomic_private_json(Path(path), result)
+    if not verified and hasattr(args, "am1_physical_state_directory"):
+        _atomic_private_json(Path(args.am1_physical_state_directory) / "cleanup-uncertain.json", result)
+    return result
 
 
 class AlohaMiniHost:
     def __init__(self, config: AlohaMiniHostConfig):
         self.zmq_context = zmq.Context()
         self.zmq_cmd_socket = self.zmq_context.socket(zmq.PULL)
-        self.zmq_cmd_socket.setsockopt(zmq.CONFLATE, 1)
-        self.zmq_cmd_socket.bind(f"tcp://*:{config.port_zmq_cmd}")
-
-        # Observations are request-driven with a small bounded request window. The Host
-        # consumes at most one credit per control loop, preventing unbounded accumulation
-        # while allowing transport latency to overlap subsequent observation cycles.
         self.zmq_observation_socket = self.zmq_context.socket(zmq.ROUTER)
-        self.zmq_observation_socket.setsockopt(zmq.SNDHWM, config.observation_request_window)
-        self.zmq_observation_socket.setsockopt(zmq.RCVHWM, config.observation_request_window)
-        self.zmq_observation_socket.bind(f"tcp://*:{config.port_zmq_observations}")
-
+        self._ipc_paths: list[Path] = []
+        try:
+            if config.protected_run_directory is None:
+                endpoints = (f"tcp://*:{config.port_zmq_cmd}", f"tcp://*:{config.port_zmq_observations}")
+            else:
+                directory = Path(config.protected_run_directory)
+                _private_directory(directory)
+                socket_paths = [directory / "command.sock", directory / "observation.sock"]
+                if any(len(os.fsencode(path)) > 100 or path.exists() or path.is_symlink() for path in socket_paths):
+                    raise RuntimeError("AM1 protected sockets require fresh bounded local paths")
+                endpoints = tuple(f"ipc://{path}" for path in socket_paths)
+            self.zmq_cmd_socket.setsockopt(zmq.CONFLATE, 1)
+            self.zmq_cmd_socket.setsockopt(zmq.LINGER, 0)
+            self.zmq_cmd_socket.bind(endpoints[0])
+            if config.protected_run_directory is not None:
+                self._ipc_paths.append(socket_paths[0])
+            self.zmq_observation_socket.setsockopt(zmq.SNDHWM, config.observation_request_window)
+            self.zmq_observation_socket.setsockopt(zmq.RCVHWM, config.observation_request_window)
+            self.zmq_observation_socket.setsockopt(zmq.LINGER, 0)
+            self.zmq_observation_socket.bind(endpoints[1])
+            if config.protected_run_directory is not None:
+                self._ipc_paths.append(socket_paths[1])
+            for path in self._ipc_paths:
+                path.chmod(0o600)
+        except BaseException:
+            self.disconnect()
+            raise
         self.connection_time_s = config.connection_time_s
         self.watchdog_timeout_ms = config.watchdog_timeout_ms
         self.max_loop_freq_hz = config.max_loop_freq_hz
 
     def disconnect(self):
-        self.zmq_observation_socket.close()
-        self.zmq_cmd_socket.close()
+        self.zmq_observation_socket.close(linger=0)
+        self.zmq_cmd_socket.close(linger=0)
         self.zmq_context.term()
+        for path in self._ipc_paths:
+            path.unlink(missing_ok=True)
 
 
 class HostCommandState:
@@ -632,6 +910,13 @@ def make_parser() -> argparse.ArgumentParser:
         "--lift_readback", "--lift-readback", action="store_true",
         help="Opt-in three-second AM1 lift torque-off telemetry check; no homing, motion, or ZMQ host.",
     )
+    parser.add_argument("--am1-protected-run-directory")
+    parser.add_argument("--am1-run-id")
+    parser.add_argument("--am1-host-incarnation")
+    parser.add_argument("--am1-cleanup-receipt")
+    parser.add_argument("--am1-admission-fd", type=int)
+    parser.add_argument("--am1-host-runtime-s", type=int, default=480)
+    parser.add_argument("--am1-physical-state-directory", default=str(Path.home() / ".local/state/am1-session"))
     return parser
 
 
@@ -649,16 +934,19 @@ def make_robot_config(args: argparse.Namespace) -> AlohaMiniConfig:
 
 
 def make_host_config(args: argparse.Namespace) -> AlohaMiniHostConfig:
-    return AlohaMiniHostConfig(max_loop_freq_hz=args.max_loop_freq_hz)
+    return AlohaMiniHostConfig(
+        max_loop_freq_hz=args.max_loop_freq_hz,
+        protected_run_directory=getattr(args, "am1_protected_run_directory", None),
+        connection_time_s=(args.am1_host_runtime_s if getattr(args, "am1_protected_run_directory", None) else 6000),
+    )
 
 
 def connect_robot(robot: AlohaMini, *, skip_lift_home: bool) -> None:
     robot.connect(home_lift=not skip_lift_home)
 
 
-def main():
+def _validate_host_arguments(args):
     parser = make_parser()
-    args = parser.parse_args()
     if args.lift_relief and args.lift_readback:
         parser.error("--lift_relief and --lift_readback are mutually exclusive.")
     if args.lift_relief and (
@@ -675,11 +963,18 @@ def main():
             "--lift_readback requires AM1, --no_follower, --no_cameras, and the owning lift process."
         )
 
+
+def _run_host(args):
+    _validate_host_arguments(args)
+
     logging.info("Configuring AlohaMini")
     robot_config = make_robot_config(args)
     if args.no_follower:
         logging.info("no_follower mode: follower arms will not connect, only base and lift operate.")
     robot = AlohaMini(robot_config)
+    args._am1_robot = robot
+    # Every admitted AM1 owner needs actual cleanup proof, including legacy CLI.
+    robot._am1_protected_cleanup = args.robot_model == "alohamini1"
     left_shoulder_evidence = AM1LeftShoulderEvidence(
         enabled=(os.environ.get("AM1_LEFT_SHOULDER_EVIDENCE") == "1"
                  and args.robot_model == "alohamini1" and not args.no_follower),
@@ -705,14 +1000,23 @@ def main():
         host_config = make_host_config(args)
         host = AlohaMiniHost(host_config)
     except BaseException as error:
-        if robot.is_connected:
-            try:
+        args._am1_finishing = True
+        args._am1_cleanup_errors = []
+        try:
+            if robot.is_connected:
                 robot.disconnect(recover_interrupted_bus_io=True)
-            except BaseException as cleanup_error:
-                error.add_note(
-                    "robot disconnect also failed: "
-                    f"{type(cleanup_error).__name__}: {cleanup_error}"
-                )
+            elif args.robot_model == "alohamini1":
+                # A partially connected startup still owns its open buses.
+                issues = robot._safe_shutdown(close_buses=True, recover_interrupted_bus_io=True)
+                if issues:
+                    raise RuntimeError("AM1 startup cleanup issues: " + "; ".join(issues))
+        except BaseException as cleanup_error:
+            args._am1_cleanup_first_error = cleanup_error
+            args._am1_cleanup_errors.append(f"robot disconnect: {type(cleanup_error).__name__}: {cleanup_error}")
+            error.add_note(
+                "robot disconnect also failed: "
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )
         raise
 
     command_state = HostCommandState(
@@ -720,7 +1024,9 @@ def main():
         diagnostics_enabled=args.profile_cadence,
     )
     local_control = (
-        AM1LocalControl()
+        AM1LocalControl(
+            run_id=args.am1_run_id, host_incarnation=args.am1_host_incarnation,
+        )
         if args.robot_model == "alohamini1" and not args.no_follower
         else None
     )
@@ -806,9 +1112,13 @@ def main():
 
             if loop_timing is not None:
                 loop_timing.mark("robot_observation", time.perf_counter())
+            read_started_at = time.monotonic()
             last_observation = robot.get_observation()
+            acquired_at = time.monotonic()
             if local_control is not None:
-                local_control.annotate(last_observation)
+                local_control.annotate(last_observation, acquired_at=acquired_at)
+                if local_control.binding is not None:
+                    last_observation[AM1_LOCAL_FEEDBACK_KEY]["read_started_at_monotonic_s"] = read_started_at
             observation_done_t = time.perf_counter()
             if loop_timing is not None:
                 loop_timing.mark("observation_response", observation_done_t)
@@ -971,6 +1281,7 @@ def main():
             except BaseException as context_error:
                 fault_loop_context_error = type(context_error).__name__
     finally:
+        args._am1_finishing = True
         cleanup_errors: list[tuple[str, BaseException]] = []
         # Local mode writes directly to its log file. A failed/full sink must
         # remain an error, but reporting it must never bypass motor cleanup.
@@ -1000,6 +1311,9 @@ def main():
             except BaseException as error:
                 cleanup_errors.append(("pending lift sample", error))
 
+        args._am1_cleanup_errors = [
+            f"{operation}: {type(error).__name__}: {error}" for operation, error in cleanup_errors
+        ]
         if primary_error is not None:
             if fault_loop_context is not None:
                 try:
@@ -1017,6 +1331,7 @@ def main():
             raise primary_error
         if cleanup_errors:
             _, error = cleanup_errors[0]
+            args._am1_cleanup_first_error = error
             for later_operation, later_error in cleanup_errors[1:]:
                 error.add_note(
                     f"{later_operation} also failed: {type(later_error).__name__}: {later_error}"
@@ -1024,5 +1339,99 @@ def main():
             raise error
 
     logging.info("Finished AlohaMini cleanly")
+def main():
+    parser = make_parser()
+    args = parser.parse_args()
+    _validate_host_arguments(args)
+    protected = args.am1_protected_run_directory is not None
+    protected_fields = (args.am1_run_id, args.am1_host_incarnation, args.am1_cleanup_receipt)
+    if protected != all(value is not None for value in protected_fields) or (
+        not protected and any(value is not None for value in protected_fields)
+    ):
+        parser.error("AM1 protected transport requires run ID, host incarnation and cleanup receipt together")
+    if protected:
+        if (args.robot_model != "alohamini1" or args.no_follower or not args.no_cameras
+            or args.skip_lift_home or args.lift_relief or args.lift_readback
+            or args.max_relative_target is None or not 0 < args.max_relative_target <= 20
+            or not 0 < args.max_loop_freq_hz <= 30 or not 0 < args.am1_host_runtime_s <= 480):
+            parser.error("AM1 protected backend requires the reviewed AM1 Local camera-free bounded host")
+        directory = Path(args.am1_protected_run_directory)
+        if not directory.is_absolute():
+            parser.error("AM1 protected run directory must be absolute")
+        _private_directory(directory)
+        if Path(args.am1_cleanup_receipt).parent.resolve() != directory.resolve():
+            parser.error("AM1 cleanup receipt must be inside this protected run directory")
+        if Path(args.am1_cleanup_receipt).exists():
+            parser.error("AM1 cleanup receipt must be a fresh run-owned path")
+        try:
+            args.am1_run_id = str(UUID(args.am1_run_id))
+            args.am1_host_incarnation = str(UUID(args.am1_host_incarnation))
+        except ValueError:
+            parser.error("AM1 protected run/host identities must be UUIDs")
+    admission = None
+    first_error = None
+    original_handlers = {}
+    signal_seen = False
+
+    def stop_once(signum, frame):
+        nonlocal signal_seen
+        del frame
+        robot = getattr(args, "_am1_robot", None)
+        if getattr(args, "_am1_finishing", False) or getattr(robot, "_am1_shutdown_in_progress", False):
+            return  # Cooperative cleanup already owns zero/off; do not interrupt it.
+        if not signal_seen:
+            signal_seen = True
+            args._am1_stop_signal = signal.Signals(signum).name
+            args._am1_stop_interruption = KeyboardInterrupt()
+            raise args._am1_stop_interruption
+
+    try:
+        if args.robot_model == "alohamini1":
+            canonical_directory = Path.home() / ".local/state/am1-session"
+            if Path(args.am1_physical_state_directory).resolve() != canonical_directory.resolve():
+                raise RuntimeError("AM1 physical admission must use canonical ~/.local/state/am1-session")
+            admission = AM1PhysicalAdmission(
+                args.am1_physical_state_directory, inherited_fd=args.am1_admission_fd,
+            )
+            args._am1_physical_run_id = args.am1_run_id or str(uuid4())
+            args._am1_physical_host_incarnation = args.am1_host_incarnation or str(uuid4())
+            args._am1_physical_cleanup_receipt = args.am1_cleanup_receipt or str(
+                canonical_directory / f"physical-cleanup-{args._am1_physical_host_incarnation}.json"
+            )
+            # Retain legacy control/CLI identities as None; these internal UUIDs
+            # bind only durable physical ownership and the actual cleanup receipt.
+            admission.claim_run(
+                run_id=args._am1_physical_run_id,
+                host_incarnation=args._am1_physical_host_incarnation,
+                scope="protected" if protected else "legacy",
+            )
+            args._am1_claim_started = True
+            for signum in (signal.SIGINT, signal.SIGTERM):
+                original_handlers[signum] = signal.signal(signum, stop_once)
+        _run_host(args)
+    except BaseException as error:
+        first_error = error
+        raise
+    finally:
+        try:
+            if admission is not None and getattr(args, "_am1_claim_started", False):
+                robot = getattr(args, "_am1_robot", None)
+                errors = list(getattr(robot, "_am1_shutdown_evidence", {}).get("cleanup_errors", []))
+                errors.extend(getattr(args, "_am1_cleanup_errors", []))
+                # Readback alone cannot erase a disconnect/reporting failure.
+                try:
+                    receipt = write_am1_cleanup_receipt(args, robot, first_error, errors)
+                    admission.finish_run(receipt)
+                except BaseException as receipt_error:
+                    if first_error is None:
+                        raise
+                    first_error.add_note(f"Physical cleanup receipt also failed: {type(receipt_error).__name__}: {receipt_error}")
+        finally:
+            for signum, handler in original_handlers.items():
+                signal.signal(signum, handler)
+            if admission is not None:
+                admission.close()
+
+
 if __name__ == "__main__":
     main()

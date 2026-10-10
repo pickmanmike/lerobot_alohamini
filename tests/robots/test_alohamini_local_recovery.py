@@ -936,6 +936,9 @@ def test_real_host_loop_applies_pause_before_ack_and_drops_queued_pre_pause_acti
     )
     monkeypatch.setattr(alohamini_host, "make_host_config", lambda args: object())
     monkeypatch.setattr(
+        alohamini_host, "AM1PhysicalAdmission", lambda *args, **kwargs: SimpleNamespace(close=lambda: None, claim_run=lambda **kw: None, finish_run=lambda receipt: None),
+    )
+    monkeypatch.setattr(
         alohamini_host,
         "make_robot_config",
         lambda args: SimpleNamespace(robot_model="alohamini1", no_follower=False),
@@ -945,9 +948,13 @@ def test_real_host_loop_applies_pause_before_ack_and_drops_queued_pre_pause_acti
             robot_model="alohamini1", no_follower=False, no_cameras=True,
             skip_lift_home=False, lift_relief=False, lift_readback=False,
             profile_timing=False, profile_cadence=False, profile_lift_diagnostics=False,
+            am1_protected_run_directory=None, am1_run_id=None, am1_host_incarnation=None,
+            am1_cleanup_receipt=None, am1_admission_fd=None,
+            am1_physical_state_directory=str(Path.home() / ".local/state/am1-session"),
         ),
     ))
 
+    monkeypatch.setattr(alohamini_host, "write_am1_cleanup_receipt", lambda *args: {})
     alohamini_host.main()
 
     assert events[:3] == [

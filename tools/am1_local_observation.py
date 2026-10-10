@@ -43,12 +43,25 @@ def finite_time(value):
     return type(value) in (int, float) and math.isfinite(value) and value >= 0
 
 
+def camera_owned_session(value):
+    """Only a valid UUID conveys a source lease; ordinary viewers have none."""
+    if not value:
+        return None
+    try:
+        return str(uuid.UUID(value))
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
 class LocalObservationMailbox:
     """Latest decoded evidence, retaining upstream arrival through actual consumption."""
 
-    def __init__(self, source, clock=time.monotonic):
+    def __init__(self, source, clock=time.monotonic, *, require_owned_session=False):
         self.source = local_source_identity(source)
         self.clock = clock
+        if type(require_owned_session) is not bool:
+            raise ValueError("camera owned-session policy must be an explicit Boolean")
+        self.require_owned_session = require_owned_session
         self.request = self.record = None
         self.reason = "no current decoded local image"
         self.current_source_generation = None
@@ -64,6 +77,7 @@ class LocalObservationMailbox:
             active=True,
             started_at=self.clock(),
             timing_basis=TIMING_BASIS,
+            require_owned_session=self.require_owned_session,
         )
         self.record = None
         self.last_sequence = 0
@@ -83,6 +97,9 @@ class LocalObservationMailbox:
             return
         self.record = None
         self.reason = str(record.get("reason", "invalid or unqualified local evidence"))[:160]
+        if self.request["require_owned_session"] and record.get("owned_session") != self.request["run_id"]:
+            self.reason = "required camera owned session differs from current run"
+            return
         try:
             source_generation = (
                 str(uuid.UUID(record["owner_generation"])),
@@ -138,6 +155,7 @@ class LocalObservationMailbox:
             "generation": self.request["generation"] if self.request else None,
             "owner_generation": record["owner_generation"] if record else None,
             "capture_generation": record["capture_generation"] if record else None,
+            "owned_session": record.get("owned_session") if record else None,
             "arrived_at": record["arrived_at"] if record else None,
             "decoded_at": record["decoded_at"] if record else None,
             "frame_sha256": record["frame_sha256"] if record else None,
@@ -157,6 +175,7 @@ class LocalReceiver:
         self.started_at = binding["started_at"]
         self.clock = clock
         self.current_generation = None
+        self.owned_session = None
         self.retired_generations = set()
         self.last_sequence = 0
         self.record = None
@@ -185,6 +204,7 @@ class LocalReceiver:
                 str(uuid.UUID(headers["X-Camera-Owner-Generation"])),
                 str(uuid.UUID(headers["X-Camera-Capture-Generation"])),
             )
+            self.owned_session = camera_owned_session(headers.get("X-Camera-Owned-Session"))
             if generation in self.retired_generations:
                 raise ValueError("retired camera generation replay")
             arrived = float(headers["X-Frame-Arrived-Monotonic-S"])
@@ -203,6 +223,8 @@ class LocalReceiver:
                 self.current_generation = generation
                 self.last_sequence = 0
                 self.unqualify("camera generation requires current qualification")
+            if self.record and self.record.get("owned_session") != self.owned_session:
+                self.unqualify("camera owned session changed")
             if (
                 self.record
                 and generation == self.current_generation
@@ -242,6 +264,7 @@ class LocalReceiver:
                 self.binding,
                 owner_generation=generation[0],
                 capture_generation=generation[1],
+                owned_session=self.owned_session,
                 arrived_at=arrived,
                 decoded_at=decoded,
                 sequence=sequence,
@@ -262,7 +285,7 @@ class LocalReceiver:
         if not fresh:
             self.arrivals.clear()
         return dict(
-            record or self.binding,
+            record or dict(self.binding, owned_session=self.owned_session),
             qualified=qualified,
             reason=self.reason
             if record is None

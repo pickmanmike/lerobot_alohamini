@@ -1,4 +1,4 @@
-"""Immutable non-actuating session recipes and JSON validation."""
+"""Immutable explicitly selected session recipes and JSON validation."""
 
 import uuid
 from dataclasses import dataclass
@@ -11,7 +11,7 @@ class Recipe:
     mode: str
     trajectory_s: float | None
     live_s: float
-    seed: int = 17
+    seed: int | None = 17
 
 
 RECIPES = MappingProxyType(
@@ -21,6 +21,9 @@ RECIPES = MappingProxyType(
         "sim-arm-smoke": Recipe("sim-arm-smoke", "finite", 88.0, 180.0),
         "sim-arm-smoke-repeat": Recipe("sim-arm-smoke-repeat", "finite", 352.0, 420.0),
         "sim-arm-hold-body": Recipe("sim-arm-hold-body", "finite", 12.0, 30.0),
+        "physical-arm-smoke": Recipe("physical-arm-smoke", "finite", 88.0, 180.0, seed=None),
+        "physical-arm-smoke-repeat": Recipe("physical-arm-smoke-repeat", "finite", 352.0, 420.0, seed=None),
+        "physical-arm-hold-body": Recipe("physical-arm-hold-body", "finite", 12.0, 30.0, seed=None),
         "fake-interactive": Recipe("fake-interactive", "interactive", None, 420.0),
     }
 )
