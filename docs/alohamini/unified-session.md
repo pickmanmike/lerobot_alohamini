@@ -1,6 +1,24 @@
 # AM1 supervised unified Local session
 
-## Native Pi simulated session continuation
+## Independent P1 observation with simulated motor IO — current continuation
+
+AM1-OBSERVATION-01 implements real P1 images decoded on Pi and one optional browser view. Isolated staged sources are Pi `7a266890703aae36f69a8d98e548d4c2e13710e5` and P1 `2d9e365f1e302694633e7b1c916a38fb15cc50cc`, separately pinned from normal physical components. All motor feedback, commands and task cleanup remain simulated. **Combined target acceptance has not been achieved: required-image delivery remains an unresolved blocker after bounded diagnosis.** The historical simulation results below do not supply actual camera/video or physical acceptance.
+
+Use the existing private access/enrollment record and independent idle services, then explicitly claim and start the fixed authorized recipe. The owner admits one task, requests one finite source generation, and waits held for current decoded proof inside its original preparation/Live limits. Source capture is finite and independent of viewers and administrative SSH. The optional Connect P1 view / Close view controls affect viewing only. Required-image loss freezes the same provider; qualified recovery keeps the same task, seed and deadlines under the existing at-most-three ten-second episodes. Pause/Stop and authority revisions prevail. Verify simulated task cleanup and actual recording/camera release separately.
+
+The first target admission failed before trajectory because the eight-second provider acquisition timer had started while awaiting proof. The correction delays only that acquisition start until qualified dispatch, retaining one reference/admission and the original twenty-second preparation ceiling and Live deadline; no freshness policy changed. Keep the failed attempt and source terminal result. The corrected second run also failed before trajectory, after 4.2 seconds of preparation: its retained first cause was required-proof loss, and a fourth loss exhausted the unchanged three-episode recovery budget. Pi accepted 77 frames and rejected seven; that count is not continuous coverage. No software transport repair is claimed.
+
+A single bounded direct-WSS diagnostic excluding owner IPC still measured a 2.273-second maximum receive gap and substantial downstream added delay. Its measured source writes, event-loop lag and Pi decoding were much shorter; the downstream transport/OS cause remains unresolved. Its client did not receive terminal release acknowledgment, while independently read original P1 metadata and recording hashes verified the diagnostic clip and corrected failed-run recording, with clean actual camera release for both; the diagnostic recorded 18.0696 seconds. Preserve both outcomes. An idle scheduled-task stop also left its child process; separately guarded private cleanup followed confirmed release, and the original launcher/source pin was restored. The [consolidated measurements and limitations](roaming-resilient-sessions.md#verification-and-supported-startup-correction) retain these distinctions.
+
+One bounded twenty-five-second idle OS packet trace was inconclusive for the historical delivery gap: the selected flow reconnected after preflight, leaving four packets. The trace and its sole filter were stopped/removed and inactive state verified; no second trace was taken. Idle retransmission and duplicate-segment/D-SACK observations do not establish loss versus delay or a Wi-Fi/radio cause. Bounded diagnosis identified no supported software repair; the environment/transport limitation remains unresolved.
+
+The full 352/420 workload, detach/return, actual decoded browser video and optional gateway/media restart acceptance remain undemonstrated for real observation. Final source release and component availability must be recorded with that supported acceptance; no physical milestone follows from simulated feedback or current pixels alone.
+
+See the [implemented interfaces, private schemas and placeholder CLI examples](roaming-resilient-sessions.md#implemented-stage-3-slice-real-p1-observation-simulated-motor-io). Operational addresses, tokens, selected device identity, certificate material, private paths and mapped amplitudes stay in the private component record. Preserve existing enrollment/trust; no TLS exception or forwarding tunnel is part of this path. Service availability does not authorize endless recording or boot autoplay.
+
+Rollback only the introduced observation/media resources and affected stopped trial executable/configuration pins. This current procedure supersedes the historical stage-2 instruction below to remove its introduced CA: that CA is now shared and must be retained with enrollment and trust. Restore the prior Pi owner/gateway working directory and remove the optional flags while retaining original owner/auth history, enrollment and shared CA/trust. Stop P1 normally and verify recording release before removing its new supervisor/media process or narrowly introduced permission. Preserve unrelated P1 services/cameras and every normal motor/helper/onboard-camera pin, mapping and calibration. The real backend, canonical physical ownership arbitration, physical acknowledgements and actual powered workload remain a later reviewed packet.
+
+## Native Pi simulated session continuation — historical stage-2 evidence
 
 AM1-SESSION-PI-01 implements the isolated non-actuating stage-2 slice, stacked on accepted draft #17. Existing finite providers run natively against simulated feedback; no physical or camera IO is available. Final native executable c4256e9c: 106 passes / one Windows-only DACL skip, exit 0. Focused runtime review and corrective regressions passed. Normal deployments and separate private pins are preserved.
 
@@ -20,7 +38,7 @@ corrected with an atomic Resume intent revision fence and real two-browser
 coverage. Fresh Windows focused evidence is recorded in the consolidated
 architecture. Those pending Linux/stage-2 statements describe the historical
 stage-1 checkpoint; native simulated qualification is recorded above and in the
-consolidated continuation. Stage 3 independent P1 proof remains the next scope;
+consolidated continuation. Stage 3 independent P1 proof is now implemented with combined acceptance pending above;
 no powered independence claim precedes stage 3 observer proof. Reliability
 milestones below remain open; preserve their repairs, evidence and separate
 private deployment pins.
