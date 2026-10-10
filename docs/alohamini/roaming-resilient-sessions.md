@@ -1,6 +1,6 @@
 # AM1 roaming-resilient sessions
 
-**AM1-SESSION-ARCHITECTURE-01 · 2026-10-09 · owner-approved design; stage 1 implemented, fake-only.**
+**AM1-SESSION-ARCHITECTURE-01 · 2026-10-09 · owner-approved design; stage 1 and native Pi simulated slice implemented and verified.**
 Choose a Pi-owned session authority and finite executor, an authenticated LAN
 HTTPS/WebSocket gateway, and independently supervised P1 observation. Reuse the
 existing UI and protected motor backend. SSH remains administrative access.
@@ -9,11 +9,10 @@ The owner approved this design and the exact stage-1 fake-only implementation.
 Stage 1 is implemented on `codex/am1-persistent-session-fake`. Whole-branch
 review completed and identified one cross-client Pause ordering defect; its
 correction and covering evidence are recorded below. The stacked follow-up is
-a fake-only draft checkpoint. This does not qualify or deploy stages 2–4.
+a fake-only draft checkpoint. AM1-SESSION-PI-01 now authorizes the isolated non-actuating stage-2 slice described below; stages 3/4 and physical activation remain outside this packet.
 The owner replaced the proposed connection-continuity handoff and canceled the
 Wi-Fi Roaming Aggressiveness experiment and its administrator question. Do not
-resume that transaction. No deployed motor/camera owner, adapter, firewall, listener or private
-configuration was changed; stage 1 uses dedicated loopback development listeners.
+resume that transaction. Normal motor/helper/camera deployments, private configuration, adapter and firewall remain unchanged. Stage 1 uses loopback development listeners; the isolated stage-2 trial listener and current-user trust consent are described below.
 
 ## Verified baseline and remaining acceptance
 
@@ -29,14 +28,13 @@ verified before publication. Source references below describe this inspected che
 | Component | Preserved configured / recorded pin | Verification in this design |
 | --- | --- | --- |
 | Windows served session | `e55d390bf6e957b9adc52ccf62b69476db12a20d` | Private session config and local checkout agree |
-| Pi session helper | `8e6a0cf616cb2000df1d0e996ab27a19d2fb2fba` | Private config read; current live checkout unverified |
-| Pi motor | `f03de9c3b8c4f1d9e69b6951584119113ca4c5da` | Private config read; current live checkout unverified |
-| Pi cameras | `9b1f0670e7068f7d39eb50270a118e3807418355` | Private config read; current live checkout unverified |
+| Pi session helper | `8e6a0cf616cb2000df1d0e996ab27a19d2fb2fba` | Native Pi checkout head verified; clean |
+| Pi motor | `f03de9c3b8c4f1d9e69b6951584119113ca4c5da` | Native Pi checkout head verified; clean |
+| Pi cameras | `9b1f0670e7068f7d39eb50270a118e3807418355` | Native Pi checkout head verified; clean |
 | Latest recorded observer receiver | `22c5e8892911c5074936ef785a8d2a64a95fbe07` | Inspected candidate receiver SHA-256 `43b9caa554615366d1fc01aa1139f9c7f0767528abb911bf31efac62adb3eb78` |
 | P1 capture source | Separate source artifact | Candidate SHA-256 `93d7fb0c35408d96dc4a3c68b14adc7146680c4752091e7c7eb1c5eeb2c449ce` |
 
-One bounded read-only SSH query for Pi checkout heads returned 255. This does
-not establish live ownership, torque or connectivity state. Exact host/device
+The original bounded read-only SSH query for Pi checkout heads returned 255. AM1-SESSION-PI-01 later verified the three clean Pi checkout heads against the separate private pins, after the owner restored target access. Neither source-head check establishes physical torque or ownership state. Exact host/device
 identity, route, repository/environment paths, credentials and calibration stay
 in the existing private configuration. P1 expected identity and exact camera
 selection were checked privately; use that configuration during later
@@ -496,7 +494,7 @@ renders remote HTML and omits independent camera assets; legacy bootstrap and
 manual-use guidance remain available.
 
 The immutable [recipe registry](../../examples/alohamini/am1_session_contract.py)
-contains only `fake-finite` (352 trajectory seconds / 420 Live seconds),
+exposed only `fake-finite` at the stage-1 checkpoint (352 trajectory seconds / 420 Live seconds),
 `fake-finite-short` (1 / 12 seconds), and `fake-interactive` (420 Live seconds),
 with seed 17. Arbitrary scripts, paths, hardware parameters and extra Start
 parameters refuse. `SessionAuthority.handle(command, device_id)` takes an
@@ -570,7 +568,7 @@ revise fake recovery behavior and tests; no physical deployment is affected.
 Private bytes-only IPC has separate authenticated normal/protective lanes,
 4-byte framing, strict JSON, 4 KiB requests / 64 KiB replies and 1-second partial
 I/O deadlines. Windows uses authenticated loopback sockets; Linux Unix sockets
-and flock remain unexecuted. HTTP admits 16 normal / 4 protective requests,
+and flock were unexecuted at stage 1 and are now qualified below. HTTP admits 16 normal / 4 protective requests,
 8 / 2 IPC calls and per-device 40 / 10 requests per second. WSS admits four total
 pending/verified clients, 64 KiB queued plus in-flight output, latest snapshot,
 6 normal / 2 protective commands per peer and one in-flight / one latest pending
@@ -713,13 +711,13 @@ then verifies empty held state, no fake intent and disabled labelled buttons.
 Supported fake W input and the existing handoff path still work. This adds no
 fake axis and preserves every legacy physical mapping/bootstrap.
 
-Windows exercised; Linux Unix socket/flock/permissions execution must be
-separately qualified before stage 2. Browser contexts prove neither real
+At the stage-1 checkpoint, only Windows execution was qualified. The native
+Pi continuation below now supplies the Linux Unix socket/flock/permissions evidence. Browser contexts prove neither real
 phone/AP roaming nor device certificate trust, mobile codecs or required camera
-pixels. Stages 2–4, the full original four-cycle 352/420 workload, comparable
-normal-rest restart and 12-second ArmHoldBody remain pending. The single next
-stage is reviewed stage 2: Pi owner/extracted finite profile over the existing
-protected backend. No powered independence claim precedes stage 3 observer proof.
+pixels. Stage-1 remaining scope was stages 2–4, the full original four-cycle 352/420 workload, comparable
+normal-rest restart and 12-second ArmHoldBody remain pending. The planned next
+stage at that checkpoint was stage 2. Its non-actuating continuation is now
+recorded below; protected physical-backend activation remains separate. No powered independence claim precedes stage 3 observer proof.
 Rollback stops only dedicated fake processes and removes generated fake state,
 certificates and temporary overlay when no longer needed; legacy deployment is
 untouched. Keep the managed worktree and historical logs.
@@ -745,3 +743,35 @@ switch to a second serial owner.
 **Owner decision (approved):** consolidated design and exact stage-1 fake-only
 implementation brief on the stacked follow-up branch.
 Deployment and subsequent hardware stages remain separately reviewable.
+
+## Implemented stage 2 slice: native Pi, simulated hardware
+
+AM1-SESSION-PI-01 extends the accepted Windows fake milestone with a separate native Pi trial. This is the non-actuating portion of stage 2. The normal motor/helper/camera deployments retain their separate private pins and clean checkouts; calibration hash and private state protections were checked. No hardware, P1 capture, normal robot connect or powered test was performed.
+
+The actual existing providers now run through [FiniteTask](../../examples/alohamini/am1_finite_task.py), [portable session admission](../../examples/alohamini/am1_session_runtime.py) and [PiExecutor](../../tools/am1_pi_executor.py). The CLI constructs only SimulatedIO; it has no live backend factory. Known recipes are sim-arm-smoke (88 trajectory / 180 Live), sim-arm-smoke-repeat (352 / 420), and sim-arm-hold-body (12 / 30). Smoke recipes reuse PreparedScriptedInput and the existing 20-second preparation wall ceiling. The selected shoulder uses the privately supplied physical-equivalent amplitude; timing and other mapping remain unchanged. One admission and original prepared seed survive detach/reattach. The 50 ms authority tick admits at most one 10 Hz provider frame, using advancing simulated feedback; delayed ticks cannot add catch-up progress.
+
+Authority delegates finite progression/outcome to the executor. run.execution reports the actual selected profile, preparation, original seed, admissions, advancing sequence, cycle and return qualification. Evidence remains explicitly simulated-backend / simulated-no-camera. Completion requires the existing provider's return qualifications; a timer or accepted HTTP request does not establish a measured outcome. Cleanup labels simulated_hold_acknowledged and simulated_cleanup_unacknowledged describe only simulated backend acknowledgement. Unfinished owner restart yields interrupted / uncertain / unknown_after_restart, a new incarnation and no autoplay or claimed old cleanup.
+
+Recovery remains settled: completed qualified executor-acknowledged recovery closes an episode; a later distinct loss can receive another bounded <=10-second episode, at most three total inside the original Live deadline. The adapter qualifies three advancing aligned samples over >=0.2 seconds plus backend hold acknowledgement. Repeated unchanged-target holds preserve only still-fresh qualification. Explicit Pause/Stop, ownership and intent revision fences remain authoritative; gateway success does not acknowledge the executor.
+
+The shared legacy/new active.lock admission helper is exercised with fake contenders and used by legacy source preflight. The isolated trial has a separate admission namespace and owner.lock; this does not deploy canonical physical arbitration or authorize a second motor owner. Existing manual entrypoints remain available.
+
+Target-host baseline at PR #17 head 261c509e: native Linux aarch64 / Python 3.13.5, 75 passed and one Windows-only DACL skip, explicit exit 0. This exercises Unix-domain IPC, flock, permissions, separate processes and SQLite restart. Dedicated runtime/test environment uses the existing exact locked HTTP and pytest pins; dependency delta is zero, with no Torch, device SDK, camera or serial install. Separate-UID private reads were denied. A disposable service demonstrated private devices and denied IPv4 socket creation for the owner.
+
+Final executable source: c4256e9c5eae7c3f81c18bd8321615394f742b7f, descended from accepted PR #17 head 261c509e2bdcf2f57a5b0786dd9ae23263e20fc0. Final root native checks: **106 passed / one Windows-only DACL skip in 28.40 seconds, exit 0**. Selected files: test_am1_pi_session_runtime.py, test_am1_persistent_session.py and test_am1_session_api.py, using the dedicated target environment, --noconftest, plugin autoload disabled and a short private temporary base path. These cover actual finite generation with simulated/injected feedback, no-hardware constructors/imports, admission contention, fresh acknowledgements, backend faults, restart and existing authority/API intent-revision, renewal and backpressure regressions. Author final affected checks: 107 Windows passes in 41.37 seconds, plus one actual simulated-provider UI Pause/Resume pass in 7.6176552 seconds. Reuse stage-1 historical Windows evidence above; no full historical rerun or dependency upgrade.
+
+One focused changed-interface review found two Important issues. Actual regressions reproduced the ordinary simulated UI Resume timeout and an escaping recovery send error that killed the autonomous ticker. The correction preserves only fresh unchanged-target acknowledged hold qualification, contains/latches dispatch errors, retains original first cause and verifies a living ticker enforcing a later explicit test deadline. Scoped correction review passed spec and quality with no remaining actionable findings. The earlier stage-1 undiagnosed initial-Resume failure remains separate; these newly reproduced defects do not supply a retrospective diagnosis.
+
+**Verified direct proof at c4256e9c:** two independently enrolled Edge contexts on Duffy used the isolated Pi listener through direct HTTPS/WSS, an identity-matching certificate and accepted Windows current-user trial-CA trust. Node's lost-response request helper explicitly trusted the same CA; neither client disabled verification. An accepted Start response was dropped, then the same operation ID was replayed/looked up: one Start event, one run and one task admission. Closing/returning the first context and independently attached second context preserved the original run, prepared seed and deadline. Gateway-only restart preserved owner PID/incarnation and advancing progress. Explicit Claim followed by ordinary Pause/Resume retained the same seed and admission.
+
+The real existing ArmSmokeRepeat provider completed **352 trajectory seconds, four cycles and four qualified returns**, with **one admission**, in approximately **359.19 seconds of the original 420-second Live budget** (60.81 seconds remaining at the completion snapshot). Completion and simulated_hold_acknowledged came from the simulated backend/provider path, rather than a gateway counter. The subsequent real-time simulated ArmHoldBody provider completed 12 seconds and its return qualification. A separately started, progressing ArmSmoke run was interrupted by owner restart: new incarnation, interrupted/uncertain, unknown_after_restart, no remaining deadline and no autoplay. Explicit reconciliation acknowledged that uncertainty without replay; it did not verify old physical cleanup. Zero legacy/controller/camera requests or page errors were observed; direct trial exited 0.
+
+The administrative launch SSH connection had exited before the browser run. Both services remained owned by the existing user manager, not a shell; later administrative pairing/inspection/restart connections were allowed and no SSH forwarding was configured. This proves the tested simulated task and browser path do not depend on the launch connection. It does not establish P1/media independence, physical SSH independence, actual second-device acceptance or AP roaming.
+
+Private attempts are retained: initial certificate-loader/untrusted-browser failure; Node request-helper CA mismatch before any admitted run; and a partial continuity attempt whose returning client's lease expired and whose harness omitted explicit Claim before Resume. Owner inspection showed qualified held feedback and no backend fault; normal Stop acknowledged cleanup before the corrected workflow rerun. Failed-attempt enrollments were revoked. These scoped harness corrections changed no product source, extended no deadline and provide no diagnosis of the historical stage-1 initial-Resume timeout. AM1-SESSION-PI-01 is complete for its isolated simulated scope; no remaining human permission step.
+
+The exact private URL, ordinary enrollment/start helper, service commands, trust thumbprint and rollback helper are stored in the local private trial record. Public documentation contains no operational address, enrollment material, CA key or private path. The dedicated trial owner and gateway are independent transient user services with no boot autostart or automatic Start. Both use private device namespaces and NoNewPrivileges; owner address families are Unix-only. The gateway opt-in binds one explicit private IPv4 address with an exact configured HTTPS origin, matching leaf certificate and current-user client trust. Existing Host/Origin/CSRF/capability guards remain. No certificate exception, firewall/router change, essential SSH tunnel or normal service deployment is involved.
+
+Rollback stops only am1-pi01-gateway.service and am1-pi01-owner.service, closing the trial listener, and removes only the introduced current-user CA by exact recorded thumbprint. Retain private evidence, generated state, branch and isolated checkout for diagnosis; no normal runtime pin, permission, credential or worktree is removed. The trial certificate is deliberately short-lived; later continued access requires renewed explicit trust/identity preparation.
+
+The next bounded packet is independent P1 required observation and the selected media path. The physical four-cycle workload, useful joint return, automatic restart from natural rest and 12-second ArmHoldBody remain unfinished. Two contexts and direct cross-host traffic establish software continuity only; actual second-device/AP roaming, P1 media and powered SSH independence remain untested.

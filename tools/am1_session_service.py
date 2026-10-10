@@ -1,9 +1,11 @@
-"""Loopback fake HTTPS/WSS gateway. Lifetime is independent of the resident owner."""
+"""Non-actuating HTTPS/WSS gateway with explicit LAN opt-in and independent lifetime."""
 
 import argparse
 import asyncio
 import hashlib
+import ipaddress
 import os
+import re
 import secrets
 import socket
 import sqlite3
@@ -13,6 +15,7 @@ import uuid
 from collections import deque
 from contextlib import contextmanager
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from aiohttp import WSMsgType, web
 
@@ -692,9 +695,43 @@ class Gateway:
             await peer.close()
 
 
+def validate_listener(host, port, origin):
+    """Explicit single-interface LAN opt-in; default development loopback preserved."""
+    address = ipaddress.ip_address(host)
+    lan = any(
+        address in ipaddress.ip_network(network)
+        for network in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+    )
+    if host != "127.0.0.1" and not lan:
+        raise ValueError("listener requires loopback or one explicit private LAN IPv4 address")
+    if not (port == 0 or 1024 <= port <= 65535):
+        raise ValueError("unprivileged listener port required")
+    if origin is None:
+        if host != "127.0.0.1":
+            raise ValueError("LAN listener requires a separately configured exact HTTPS origin")
+        return None
+    parsed = urlsplit(origin)
+    if (
+        not port
+        or parsed.scheme != "https"
+        or parsed.username
+        or parsed.password
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+        or parsed.port != port
+        or not parsed.hostname
+        or parsed.hostname != parsed.hostname.lower()
+        or not re.fullmatch(r"[a-z0-9]+(?:[a-z0-9.-]*[a-z0-9])?", parsed.hostname)
+        or ".." in parsed.hostname
+        or origin != f"https://{parsed.hostname}:{port}"
+    ):
+        raise ValueError("exact HTTPS origin with matching configured port required")
+    return origin
+
+
 async def run_gateway(args):
-    if args.host != "127.0.0.1" or not (args.port == 0 or 1024 <= args.port <= 65535):
-        raise ValueError("fake developer gateway requires loopback and an unprivileged development port")
+    origin = validate_listener(args.host, args.port, getattr(args, "origin", None))
     tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     tls.minimum_version = ssl.TLSVersion.TLSv1_2
     tls.load_cert_chain(args.cert, args.key)
@@ -712,7 +749,7 @@ async def run_gateway(args):
     site = web.TCPSite(runner, args.host, args.port, ssl_context=tls)
     await site.start()
     port = site._server.sockets[0].getsockname()[1]
-    gateway.origin = f"https://127.0.0.1:{port}"
+    gateway.origin = origin or f"https://127.0.0.1:{port}"
     # Ready metadata contains no credential, pairing code or private IPC address.
     private_json(args.ready_file, {"url": gateway.origin, "pid": os.getpid()})
     try:
@@ -728,6 +765,7 @@ def main():
     for name in ("owner-state", "auth-state", "cert", "key", "ready-file"):
         gateway.add_argument("--" + name, required=True)
     gateway.add_argument("--host", default="127.0.0.1")
+    gateway.add_argument("--origin", help="Exact HTTPS origin required for explicit private LAN listener")
     gateway.add_argument("--port", type=int, default=0)
     pair = subs.add_parser("pair")
     pair.add_argument("--auth-state", required=True)
