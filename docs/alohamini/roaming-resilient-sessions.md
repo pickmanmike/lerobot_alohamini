@@ -1,6 +1,6 @@
 # AM1 roaming-resilient sessions
 
-**AM1-SESSION-ARCHITECTURE-01 · 2026-10-09 · owner-approved design; native Pi simulated slice qualified, direct trust consent pending.**
+**AM1-SESSION-ARCHITECTURE-01 · 2026-10-09 · owner-approved design; stage 1 and native Pi simulated slice implemented and verified.**
 Choose a Pi-owned session authority and finite executor, an authenticated LAN
 HTTPS/WebSocket gateway, and independently supervised P1 observation. Reuse the
 existing UI and protected motor backend. SSH remains administrative access.
@@ -711,13 +711,13 @@ then verifies empty held state, no fake intent and disabled labelled buttons.
 Supported fake W input and the existing handoff path still work. This adds no
 fake axis and preserves every legacy physical mapping/bootstrap.
 
-At the stage-1 checkpoint, Windows was exercised and Linux Unix socket/flock/permissions execution had to be
-separately qualified before stage 2. Browser contexts prove neither real
+At the stage-1 checkpoint, only Windows execution was qualified. The native
+Pi continuation below now supplies the Linux Unix socket/flock/permissions evidence. Browser contexts prove neither real
 phone/AP roaming nor device certificate trust, mobile codecs or required camera
 pixels. Stage-1 remaining scope was stages 2–4, the full original four-cycle 352/420 workload, comparable
-normal-rest restart and 12-second ArmHoldBody remain pending. The single next
-stage is reviewed stage 2: Pi owner/extracted finite profile over the existing
-protected backend. No powered independence claim precedes stage 3 observer proof.
+normal-rest restart and 12-second ArmHoldBody remain pending. The planned next
+stage at that checkpoint was stage 2. Its non-actuating continuation is now
+recorded below; protected physical-backend activation remains separate. No powered independence claim precedes stage 3 observer proof.
 Rollback stops only dedicated fake processes and removes generated fake state,
 certificates and temporary overlay when no longer needed; legacy deployment is
 untouched. Keep the managed worktree and historical logs.
@@ -762,7 +762,13 @@ Final executable source: c4256e9c5eae7c3f81c18bd8321615394f742b7f, descended fro
 
 One focused changed-interface review found two Important issues. Actual regressions reproduced the ordinary simulated UI Resume timeout and an escaping recovery send error that killed the autonomous ticker. The correction preserves only fresh unchanged-target acknowledged hold qualification, contains/latches dispatch errors, retains original first cause and verifies a living ticker enforcing a later explicit test deadline. Scoped correction review passed spec and quality with no remaining actionable findings. The earlier stage-1 undiagnosed initial-Resume failure remains separate; these newly reproduced defects do not supply a retrospective diagnosis.
 
-**Direct proof remains pending Windows consent:** the current-user trial CA import is waiting at Windows' Security Warning. An earlier certificate-loader error left trust absent; actual Edge rejected the site with ERR_CERT_AUTHORITY_INVALID, retained privately. No exception or silent machine-wide trust workaround was used. The automated two-context driver is prepared and gated on the reviewed source. Its lost accepted Start reconciliation, browser return, gateway restart, ordinary simulated Resume, real-time four-cycle provider completion and separate uncertain owner restart have not yet run on the target listener. The launch SSH connection has exited and the services run under the existing user manager, but this process evidence alone is not direct-client continuity proof. AM1-SESSION-PI-01 remains incomplete until that trusted browser demonstration is verified.
+**Verified direct proof at c4256e9c:** two independently enrolled Edge contexts on Duffy used the isolated Pi listener through direct HTTPS/WSS, an identity-matching certificate and accepted Windows current-user trial-CA trust. Node's lost-response request helper explicitly trusted the same CA; neither client disabled verification. An accepted Start response was dropped, then the same operation ID was replayed/looked up: one Start event, one run and one task admission. Closing/returning the first context and independently attached second context preserved the original run, prepared seed and deadline. Gateway-only restart preserved owner PID/incarnation and advancing progress. Explicit Claim followed by ordinary Pause/Resume retained the same seed and admission.
+
+The real existing ArmSmokeRepeat provider completed **352 trajectory seconds, four cycles and four qualified returns**, with **one admission**, in approximately **359.19 seconds of the original 420-second Live budget** (60.81 seconds remaining at the completion snapshot). Completion and simulated_hold_acknowledged came from the simulated backend/provider path, rather than a gateway counter. The subsequent real-time simulated ArmHoldBody provider completed 12 seconds and its return qualification. A separately started, progressing ArmSmoke run was interrupted by owner restart: new incarnation, interrupted/uncertain, unknown_after_restart, no remaining deadline and no autoplay. Explicit reconciliation acknowledged that uncertainty without replay; it did not verify old physical cleanup. Zero legacy/controller/camera requests or page errors were observed; direct trial exited 0.
+
+The administrative launch SSH connection had exited before the browser run. Both services remained owned by the existing user manager, not a shell; later administrative pairing/inspection/restart connections were allowed and no SSH forwarding was configured. This proves the tested simulated task and browser path do not depend on the launch connection. It does not establish P1/media independence, physical SSH independence, actual second-device acceptance or AP roaming.
+
+Private attempts are retained: initial certificate-loader/untrusted-browser failure; Node request-helper CA mismatch before any admitted run; and a partial continuity attempt whose returning client's lease expired and whose harness omitted explicit Claim before Resume. Owner inspection showed qualified held feedback and no backend fault; normal Stop acknowledged cleanup before the corrected workflow rerun. Failed-attempt enrollments were revoked. These scoped harness corrections changed no product source, extended no deadline and provide no diagnosis of the historical stage-1 initial-Resume timeout. AM1-SESSION-PI-01 is complete for its isolated simulated scope; no remaining human permission step.
 
 The exact private URL, ordinary enrollment/start helper, service commands, trust thumbprint and rollback helper are stored in the local private trial record. Public documentation contains no operational address, enrollment material, CA key or private path. The dedicated trial owner and gateway are independent transient user services with no boot autostart or automatic Start. Both use private device namespaces and NoNewPrivileges; owner address families are Unix-only. The gateway opt-in binds one explicit private IPv4 address with an exact configured HTTPS origin, matching leaf certificate and current-user client trust. Existing Host/Origin/CSRF/capability guards remain. No certificate exception, firewall/router change, essential SSH tunnel or normal service deployment is involved.
 
