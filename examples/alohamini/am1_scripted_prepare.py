@@ -8,6 +8,11 @@ import time
 from collections.abc import Callable, Mapping
 from typing import Any
 
+if __package__:
+    from .am1_session_contract import LEFT_ELBOW_RESPONSE
+else:
+    from am1_session_contract import LEFT_ELBOW_RESPONSE
+
 SHOULDER = "arm_left_shoulder_lift.pos"
 
 
@@ -33,7 +38,8 @@ class PreparedScriptedInput:
             raise ValueError("preparation requires the exact AM1 12-joint seed at 10 Hz")
         self.motion_profile = motion_profile or getattr(provider, "motion_profile", None)
         if self.motion_profile not in {
-            "ArmSmoke", "ArmSmokeRepeat", "ArmHoldBody", "LeftElbowCompare", "LeftElbowDwellCompare"
+            "ArmSmoke", "ArmSmokeRepeat", "ArmHoldBody", "LeftElbowCompare", "LeftElbowDwellCompare",
+            LEFT_ELBOW_RESPONSE.profile,
         }:
             raise ValueError("preparation requires an explicitly supported finite profile")
         self.origin = {key: float(initial_positions[key]) for key in joint_keys}
@@ -48,6 +54,7 @@ class PreparedScriptedInput:
         self.duration_s = {
             "ArmSmoke": 88.0, "ArmSmokeRepeat": 352.0, "ArmHoldBody": 12.0,
             "LeftElbowCompare": 18.0, "LeftElbowDwellCompare": 24.0,
+            LEFT_ELBOW_RESPONSE.profile: LEFT_ELBOW_RESPONSE.trajectory_s,
         }[self.motion_profile]
         self.preparation_elapsed_s = 0.0
         self._program = None
@@ -103,6 +110,13 @@ class PreparedScriptedInput:
     @property
     def complete(self) -> bool:
         return False if self.preparing else self._program.complete
+
+    @property
+    def characterization(self):
+        return None if self.preparing else getattr(self._program, "characterization", None)
+
+    def validate_final_feedback(self, now, observed, selected_feedback):
+        self._program.validate_final_feedback(now, observed, selected_feedback)
 
     def _record(self, event: str, **fields: Any) -> None:
         self._pending_events.append(
@@ -185,11 +199,13 @@ class PreparedScriptedInput:
         observation_sequence: int,
         *,
         defer_events: bool = False,
+        selected_feedback=None,
     ) -> None:
         if self._finished or self.complete:
             return
         if not self.preparing:
-            self._program.advance(now, observed, observation_sequence, defer_events=True)
+            kwargs = {"selected_feedback": selected_feedback} if self.motion_profile == LEFT_ELBOW_RESPONSE.profile else {}
+            self._program.advance(now, observed, observation_sequence, defer_events=True, **kwargs)
             self._program.flush_events()
             if not defer_events:
                 self.flush_events()

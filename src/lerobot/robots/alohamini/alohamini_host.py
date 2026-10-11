@@ -1141,6 +1141,7 @@ def _run_host(args):
                 local_control.annotate(last_observation, acquired_at=acquired_at)
                 if local_control.binding is not None:
                     last_observation[AM1_LOCAL_FEEDBACK_KEY]["read_started_at_monotonic_s"] = read_started_at
+                selected_evidence.publish(robot, local_control, last_observation)
             observation_done_t = time.perf_counter()
             if loop_timing is not None:
                 loop_timing.mark("observation_response", observation_done_t)
@@ -1178,7 +1179,7 @@ def _run_host(args):
             if lift_operation is not None:
                 lift_operation.emit_pending_sample()
 
-            # Five sparse readbacks share the owner after ordinary control and
+            # Bounded sparse readbacks share the owner after ordinary control and
             # response delivery. Their full time still counts toward next poll.
             if local_control is not None:
                 selected_evidence.report(robot, local_control, last_observation)

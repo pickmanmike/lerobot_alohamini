@@ -1,3 +1,40 @@
+## Current AM1 elbow response continuation
+
+For the explicitly invoked AM1-ELBOW-RESPONSE-02 continuation, the owner completed
+the requested power-off elbow inspection and found no apparent issue. Record that
+inspection as completed; do not request the same generic inspection again. The
+owner also reports successful same-elbow movement in other project contexts.
+Compare actual working and failing conditions, distinguishing the owner report
+from source-bound native positive-control evidence.
+
+Use current relevant camera views, existing native samples and the sole protected
+motor owner. Reuse the verified available idle candidate and existing stager,
+operation and analysis tools. Opposite-direction, same-elbow positive-control and
+response-characterization work must follow the new packet's actual finite bounds,
+local limits, conditional experiment evidence and restoration rules; do not infer
+missing experiment permissions or settings from earlier packets. Preserve command
+acceptance, actual movement and program completion as separate results, every
+prior failure, private permissions, calibration, ownership, local protections,
+simulation default and the dependent unmerged PR stack. Root alone operates
+hardware. AM1 stays wireless, P1 advisory, software durability retains its defined
+meaning, and AM2 is unchanged. No repeated mechanical-inspection request, speculative
+settings change, generic endurance handoff, network tuning or merge is included.
+
+The uploaded packet is now available. A separate signed characterization may use
+at most ±10 normalized units about one fresh frozen reference, slope no greater
+than one normalized unit per second, short holds, and the stricter existing raw,
+calibration, relative, current and clearance limits. Local decisions must stop
+expansion on useful response or adverse evidence and qualify return before another
+departure; no rebasing. Maximum packet budgets are 120 trajectory/180 Live seconds.
+Keep recipe/admission/owner/completion metadata from the same selected definition.
+
+A selected-only I0→I1 comparison is conditional on demonstrated inadequate
+small-error effort and verified installed-model/firmware support. Preserve the
+actual stopped baseline and verified restoration on completion or failure; all
+other gains/settings/limits remain unchanged. Hard obstruction, sensing ambiguity
+or adverse current/load evidence excludes that trial. Do not prepare or apply it
+merely because small commands failed.
+
 ## Current AM1 motion quality and durability scope
 
 For the explicitly invoked AM1-MOTION-QUALITY-01 continuation, retain the accepted

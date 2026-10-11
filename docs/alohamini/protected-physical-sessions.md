@@ -4,7 +4,9 @@ AM1-MOTION-QUALITY-01 is complete through its evidence-backed limitation path.
 Two bounded left-elbow comparisons show that the live servo goal changes correctly,
 but the sampled position does not move. Longer holds do not improve the response.
 The selected-profile completion defect is repaired; useful elbow movement remains
-unqualified pending one power-off inspection. The reviewed candidate is available
+unqualified in that recorded comparison. The owner has since completed the
+requested power-off inspection and found no apparent issue. The AM1-ELBOW-RESPONSE-02
+signed response continuation below is in progress. The reviewed candidate is available
 idle through the existing opt-in physical route, with verified cleanup.
 
 Durability means software fault tolerance, connection and control continuity,
@@ -19,6 +21,35 @@ Required observation remains actual Pi-local camera evidence. Browser/administra
 launch connections do not own execution or renew the deadline. Older checkpoint
 and rollback results below are historical; the following section records the
 current deployment and the new evidence.
+
+## Elbow response continuation, 2026-10-11 (in progress)
+
+The owner completed the requested power-off elbow inspection and reports no apparent
+issue. That action is satisfied; it is not a pending mechanical-inspection request.
+The owner also reports successful elbow motion elsewhere. Independently retained
+August20 native evidence confirms left elbow raw2155→2260 (+105 ticks) for a
+requested +10, normalized response +9.507/final error +0.493. It used a lower
+starting pose, a five-second ramp at5Hz and current up to13mA; it proves one outward
+movement rather than repeated outward/return tracking. Its exact deployed SHA,
+live gain readbacks and original wire/acquisition bytes were not retained. The
+historical calibration range864..3073/homing1845 agrees with the current mapping.
+
+The current packet authorizes a separate signed finite characterization with one
+frozen fresh reference, other eleven targets held, body zero, at most ±10 normalized
+units, slope at most one normalized unit per second and the stricter existing
+raw/calibration/relative/current/clearance guards. The candidate tests −3 twice
+first; only locally qualified return and nonadverse original feedback permit the
++10 positive comparison. Original18/24 recipes and their failed motion verdicts
+remain unchanged. Command acceptance, program completion, original envelope
+qualification and actual useful movement remain distinct results.
+
+Current external P1 capture failed certificate-expiry validation before Start;
+no frames or motor effects occurred. No trust exception was used. Actual current
+finite Pi views are retained privately: qualified chest, forward and right-wrist
+pixels lack a useful selected-elbow angle; first left-wrist/backward requests
+returned503. Required local-camera authority and optional P1 delivery remain
+separate. Source checks, focused review and affected-component staging are underway;
+no new powered characterization or gain-setting comparison has yet occurred.
 
 ## Motion-quality result, 2026-10-11
 
@@ -119,7 +150,7 @@ goal-register update**. Binding, loose coupling, inadequate output torque,
 internal servo behavior and measurement fault are not distinguished by this
 record. No speculative tuning or forced movement is justified.
 
-The one necessary next human action is: **with motor power off, inspect the left
+The original motion-quality closeout requested: **with motor power off, inspect the left
 elbow linkage and servo-horn/coupling for interference or loose attachment;
 report what is found without forcing movement or changing settings.** No manual
 leader or shoulder placement is requested. This packet has completed its

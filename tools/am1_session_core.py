@@ -11,7 +11,7 @@ import uuid
 from collections import deque
 from pathlib import Path
 
-from examples.alohamini.am1_session_contract import RECIPES, uuid_text
+from examples.alohamini.am1_session_contract import LEFT_ELBOW_RESPONSE, RECIPES, uuid_text
 from tools.am1_fake_executor import FakeExecutor
 
 TERMINAL = {"stopped", "completed", "faulted", "interrupted"}
@@ -318,7 +318,13 @@ class SessionAuthority:
         sequence = receipt.get("feedback_sequence")
         current_sequence = evidence.get("feedback_sequence")
         seed, positions = execution.get("original_seed"), receipt.get("measured_positions")
-        if run["recipe"] in {"physical-left-elbow-compare", "physical-left-elbow-dwell-compare"}:
+        duration = RECIPES[run["recipe"]].trajectory_s
+        if run["recipe"] == LEFT_ELBOW_RESPONSE.recipe_name:
+            expected = LEFT_ELBOW_RESPONSE.completion_expectation(execution)
+            if expected is None:
+                return None
+            duration, cycles, returns = expected
+        elif run["recipe"] in {"physical-left-elbow-compare", "physical-left-elbow-dwell-compare"}:
             returns, cycles = 1, 2
         else:
             returns = 4 if run["recipe"].endswith("-repeat") else 1
@@ -343,7 +349,7 @@ class SessionAuthority:
             and execution["cycles_completed"] == cycles
             and type(execution.get("progress_s")) in (int, float)
             and math.isfinite(execution["progress_s"])
-            and execution.get("progress_s") == RECIPES[run["recipe"]].trajectory_s
+            and execution.get("progress_s") == duration
             and isinstance(seed, dict)
             and seed
             and isinstance(positions, dict)
@@ -997,6 +1003,14 @@ class SessionAuthority:
     def snapshot(self):
         with self.mutex:
             run = None if not self.run else dict(self.run)
+            trajectory = None if run is None else RECIPES[run["recipe"]].trajectory_s
+            if run is not None and run["recipe"] == LEFT_ELBOW_RESPONSE.recipe_name:
+                execution = run.get("execution")
+                branch = LEFT_ELBOW_RESPONSE.branch_expectation(
+                    execution.get("characterization") if isinstance(execution, dict) else None
+                )
+                if branch is not None:
+                    trajectory = branch[0]
             if (
                 run is not None
                 and "reconciliation" in run
@@ -1022,8 +1036,8 @@ class SessionAuthority:
                             if self.run["deadline"] is None
                             else max(0, self.run["deadline"] - self.clock()),
                             trajectory_remaining_s=None
-                            if RECIPES[self.run["recipe"]].trajectory_s is None
-                            else max(0, RECIPES[self.run["recipe"]].trajectory_s - self.run["progress_s"]),
+                            if trajectory is None
+                            else max(0, trajectory - self.run["progress_s"]),
                         ),
                         "evidence": self._evidence(),
                         "recipes": [

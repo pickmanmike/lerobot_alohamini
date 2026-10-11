@@ -45,6 +45,7 @@ class AM1SelectedJointEvidence:
         self.reference = self.endpoint = self.profile = None
         self.progress = -1.0
         self.attempted = set()
+        self.sparse_receipts = {}
         self.last_observation_id = -1
 
     def deactivate(self, robot):
@@ -79,30 +80,55 @@ class AM1SelectedJointEvidence:
         if (
             type(profile) is not str
             or type(phase) is not str
-            or profile not in PROFILES
             or phase not in PHASES
             or type(cycle) is not int
-            or cycle not in (0, 1, 2)
         ):
+            raise RuntimeError("Invalid selected joint evidence profile/phase/cycle")
+        signed = None
+        if profile not in PROFILES:
+            # The literal shared file is projected into this motor owner too.
+            # Ordinary and retained profiles do not acquire this dependency.
+            from examples.alohamini.am1_session_contract import LEFT_ELBOW_RESPONSE
+
+            if profile != LEFT_ELBOW_RESPONSE.profile or not LEFT_ELBOW_RESPONSE.context_valid(metadata):
+                raise RuntimeError("Invalid selected joint signed profile context")
+            signed = LEFT_ELBOW_RESPONSE
+            calibration = robot.left_bus.calibration.get(MOTOR)
+            if (
+                calibration is None
+                or type(calibration.id) is not int
+                or calibration.id != 3
+                or type(calibration.drive_mode) is not int
+                or calibration.drive_mode not in (0, 1)
+                or type(calibration.homing_offset) is not int
+                or type(calibration.range_min) is not int
+                or type(calibration.range_max) is not int
+                or not 0 <= calibration.range_min < calibration.range_max <= 4095
+            ):
+                raise RuntimeError(
+                    "Selected joint signed context requires the actual bounded ID3 calibration"
+                )
+        elif cycle not in (0, 1, 2):
             raise RuntimeError("Invalid selected joint evidence profile/phase/cycle")
         numeric = ("progress_s", "reference", "endpoint_target", "requested_target")
         if not all(_number(metadata[k]) for k in numeric):
             raise RuntimeError("Selected joint evidence requires finite numeric context")
         progress, reference, endpoint, requested = (float(metadata[k]) for k in numeric)
-        if not 0 <= progress <= PROFILES[profile] or progress < self.progress:
+        duration = PROFILES[profile] if signed is None else signed.trajectory_s
+        if not 0 <= progress <= duration or progress < self.progress:
             raise RuntimeError("Selected joint evidence progress regressed or exceeded its finite profile")
         expected_endpoint = reference + (3.0 if reference <= 97.0 else -3.0)
         if (
             not -100 <= reference <= 100
             or not -100 <= endpoint <= 100
-            or not math.isclose(endpoint, expected_endpoint, rel_tol=0, abs_tol=1e-9)
+            or (signed is None and not math.isclose(endpoint, expected_endpoint, rel_tol=0, abs_tol=1e-9))
         ):
             raise RuntimeError("Selected joint evidence changed the original bounded endpoint")
         if not _number(cleaned.get(POSITION)) or float(cleaned[POSITION]) != requested:
             raise RuntimeError("Selected joint requested context differs from the incoming action")
         if not min(reference, endpoint) - 1e-9 <= requested <= max(reference, endpoint) + 1e-9:
             raise RuntimeError("Selected joint requested action exceeds its declared excursion")
-        if (
+        if signed is None and (
             (phase == "baseline" and cycle != 0)
             or (phase == "final" and cycle != 2)
             or (phase not in ("baseline", "final") and cycle not in (1, 2))
@@ -125,12 +151,18 @@ class AM1SelectedJointEvidence:
         for key in ("x.vel", "y.vel", "theta.vel", "lift_axis.vel"):
             if not _number(cleaned.get(key)) or float(cleaned[key]) != 0:
                 raise RuntimeError("Selected joint comparison requires ordinary body-zero commands")
-        if self.reference is not None and (reference, endpoint, profile) != (
-            self.reference,
-            self.endpoint,
-            self.profile,
-        ):
-            raise RuntimeError("Selected joint evidence changed the original reference/profile")
+        if self.reference is not None:
+            if (reference, profile) != (self.reference, self.profile):
+                raise RuntimeError("Selected joint evidence changed the original reference/profile")
+            if endpoint != self.endpoint and (
+                signed is None
+                or (self.context is not None and self.context["phase"] == "final")
+                or self.endpoint != reference - 3
+                or endpoint != reference + 10
+                or progress < signed.decision_s
+                or cycle not in (3, 4)
+            ):
+                raise RuntimeError("Selected joint evidence changed or reversed its frozen endpoint")
         self.reference, self.endpoint, self.profile = reference, endpoint, profile
         self.progress, self.context = progress, copy.deepcopy(metadata)
         robot._am1_selected_joint_evidence_context = copy.deepcopy(metadata)
@@ -191,18 +223,51 @@ class AM1SelectedJointEvidence:
         result["present_position_normalized"] = float(robot_position(bus, result["present_position_raw"]))
         return result
 
-    def report(self, robot, control, observation):
+    def _matched_marker(self, control, observation):
         if not self.enabled or self.context is None or control.binding is None or control.state != "active":
-            return
+            return None
         marker = observation.get("_am1_local_feedback", {})
-        matched = (
-            isinstance(marker, dict)
-            and all(marker.get(k) == v for k, v in control.binding.items())
-            and marker.get("epoch") == control.epoch
-            and marker.get("intent_revision") == control.intent_revision
-            and marker.get("accepted_action_sequence") == control.accepted_action_sequence
-        )
-        if not matched:
+        if (
+            not isinstance(marker, dict)
+            or type(marker.get("version")) is not int
+            or marker["version"] != 1
+            or marker.get("state") != "active"
+            or any(
+                type(marker.get(key)) is not int
+                for key in ("epoch", "intent_revision", "accepted_action_sequence")
+            )
+            or any(marker.get(k) != v for k, v in control.binding.items())
+            or marker.get("epoch") != control.epoch
+            or marker.get("intent_revision") != control.intent_revision
+            or marker.get("accepted_action_sequence") != control.accepted_action_sequence
+            or type(marker.get("observation_id")) is not int
+            or not _number(marker.get("acquired_at_monotonic_s"))
+        ):
+            return None
+        return marker
+
+    def publish(self, robot, control, observation):
+        """Copy actual caches before response; never read, emit or renew timestamps."""
+        outer = observation.get("_am1_local_feedback")
+        if isinstance(outer, dict):
+            outer.pop("selected_joint", None)
+        marker = self._matched_marker(control, observation)
+        if marker is None:
+            return
+        marker["selected_joint"] = {
+            **self._base(robot, control, marker),
+            "position": copy.deepcopy(getattr(robot, "_am1_selected_joint_position", None)),
+            "current": copy.deepcopy(getattr(robot, "_am1_selected_joint_current", None)),
+            "sparse_receipts": copy.deepcopy(self.sparse_receipts),
+        }
+
+    def _emit_sparse(self, row):
+        self.sparse_receipts[row["sample_key"]] = copy.deepcopy(row)
+        self.emit(row)
+
+    def report(self, robot, control, observation):
+        marker = self._matched_marker(control, observation)
+        if marker is None:
             return  # No new labeled acquisition can be inferred from a stale/foreign view.
         row = self._base(robot, control, marker)
         position = copy.deepcopy(getattr(robot, "_am1_selected_joint_position", None))
@@ -235,7 +300,7 @@ class AM1SelectedJointEvidence:
                 unavailable_reason="ordinary selected acquisition unavailable",
                 read_completed_at_monotonic_s=self.clock(),
             )
-            self.emit(sparse)
+            self._emit_sparse(sparse)
             return
         bus = robot.left_bus
         transport = DirectSdkTransport(
@@ -269,7 +334,7 @@ class AM1SelectedJointEvidence:
             primary = error
         sparse["read_completed_at_monotonic_s"] = self.clock()
         try:
-            self.emit(sparse)
+            self._emit_sparse(sparse)
         except BaseException as emit_error:
             if primary is None:
                 raise

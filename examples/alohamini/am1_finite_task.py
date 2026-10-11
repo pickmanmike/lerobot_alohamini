@@ -3,10 +3,12 @@
 from functools import partial
 
 from .am1_scripted_prepare import SHOULDER, PreparedScriptedInput
+from .am1_session_contract import LEFT_ELBOW_RESPONSE
 from .scripted_leader import (
     ArmHoldBodyInput,
     LeftElbowCompareInput,
     LeftElbowDwellCompareInput,
+    LeftElbowResponseCharacterizeInput,
     ScriptedLeaderInput,
 )
 from .scripted_leader_repeat import ArmSmokeRepeatInput
@@ -40,6 +42,7 @@ class FiniteTask:
             "physical-arm-hold-body": ("ArmHoldBody", ArmHoldBodyInput),
             "physical-left-elbow-compare": ("LeftElbowCompare", LeftElbowCompareInput),
             "physical-left-elbow-dwell-compare": ("LeftElbowDwellCompare", LeftElbowDwellCompareInput),
+            LEFT_ELBOW_RESPONSE.recipe_name: (LEFT_ELBOW_RESPONSE.profile, LeftElbowResponseCharacterizeInput),
         }[recipe.name]
         self.profile = profile[0]
         self.admitted_at = now
@@ -47,6 +50,8 @@ class FiniteTask:
         self.cycles_completed = self.returns_qualified = 0
         self.original_seed = None
         self.joint_amplitudes = dict.fromkeys(JOINT_KEYS, 3.0)
+        if self.profile == LEFT_ELBOW_RESPONSE.profile:
+            self.joint_amplitudes[LEFT_ELBOW_RESPONSE.joint] = 10.0
         prepare_body = (
             recipe.name == "physical-arm-hold-body" and not -100.0 <= positions.get(SHOULDER, 0.0) <= 100.0
         )
@@ -63,7 +68,7 @@ class FiniteTask:
             self.provider = profile[1](positions, joint_keys=JOINT_KEYS, fps=10, emit=self.record)
             self.original_seed = dict(positions)
         else:
-            if self.profile in {"LeftElbowCompare", "LeftElbowDwellCompare"}:
+            if self.profile in {"LeftElbowCompare", "LeftElbowDwellCompare", LEFT_ELBOW_RESPONSE.profile}:
                 provider = profile[1]
             else:
                 self.joint_amplitudes["arm_left_shoulder_lift.pos"] = shoulder_amplitude
@@ -119,13 +124,17 @@ class FiniteTask:
             return False
         if sample["sequence"] <= self.sequence:
             return False
-        self.provider.advance(now, sample["positions"], sample["sequence"])
+        was_complete = self.provider.complete
+        kwargs = {"selected_feedback": sample.get("selected_joint")} if self.profile == LEFT_ELBOW_RESPONSE.profile else {}
+        self.provider.advance(now, sample["positions"], sample["sequence"], **kwargs)
+        if was_complete and self.profile == LEFT_ELBOW_RESPONSE.profile:
+            self.provider.validate_final_feedback(now, sample["positions"], sample.get("selected_joint"))
         if self.provider.complete:
             if self.profile == "ArmSmokeRepeat":
                 self.complete = True
             else:
                 for key, origin in self.original_seed.items():
-                    limit = 1.0 if self.profile == "ArmHoldBody" else self.joint_amplitudes[key]
+                    limit = 1.0 if self.profile in {"ArmHoldBody", LEFT_ELBOW_RESPONSE.profile} else self.joint_amplitudes[key]
                     if abs(sample["positions"][key] - origin) > limit:
                         raise ValueError(f"{self.profile} return exceeds the original envelope for {key}")
                 self.return_first = now if self.return_first is None else self.return_first
@@ -135,6 +144,8 @@ class FiniteTask:
                     self.cycles_completed = (
                         2
                         if self.profile in {"LeftElbowCompare", "LeftElbowDwellCompare"}
+                        else len(self.provider.characterization["cycles"])
+                        if self.profile == LEFT_ELBOW_RESPONSE.profile
                         else int(self.profile == "ArmSmoke")
                     )
                     self.complete = True
@@ -148,7 +159,7 @@ class FiniteTask:
         self.active = False
 
     def snapshot(self):
-        return {
+        result = {
             "progress_s": self.provider.elapsed_s,
             "complete": self.complete,
             "preparing": getattr(self.provider, "preparing", False),
@@ -163,3 +174,6 @@ class FiniteTask:
             "provenance": "existing-provider/" + self.feedback_provenance,
             "initial_measured_reference": self.initial_measured_reference,
         }
+        if self.profile == LEFT_ELBOW_RESPONSE.profile:
+            result["characterization"] = self.provider.characterization
+        return result

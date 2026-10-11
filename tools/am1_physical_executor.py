@@ -6,6 +6,7 @@ import threading
 import time
 
 from examples.alohamini.am1_finite_task import JOINT_KEYS
+from examples.alohamini.am1_session_contract import LEFT_ELBOW_RESPONSE
 
 FEEDBACK_MAX_AGE_S = 1.0  # Existing AM1 Local original request/acquisition contract.
 ZERO_BODY = {"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0, "lift_axis.vel": 0}
@@ -50,11 +51,22 @@ def read_physical_sample(client, run_id, host_incarnation, previous_sequence, *,
     positions = {key: observation.get(key) for key in JOINT_KEYS}
     if any(type(v) not in (int, float) or not math.isfinite(v) for v in positions.values()):
         raise ValueError("invalid actual arm feedback")
+    selected = marker.get("selected_joint")
+    if selected is not None:
+        if not isinstance(selected, dict) or type(selected.get("version")) is not int or selected["version"] != 1:
+            raise ValueError("invalid selected native feedback")
+        fields = {
+            "run_id": run_id, "host_incarnation": host_incarnation, "epoch": marker.get("epoch"),
+            "intent_revision": marker.get("intent_revision"), "action_sequence": marker.get("accepted_action_sequence"),
+            "observation_id": sequence, "acquired_at_monotonic_s": completed,
+        }
+        if any(selected.get(k) != v or type(selected.get(k)) is not type(v) for k, v in fields.items()):
+            raise ValueError("foreign selected native feedback binding")
     return {
         "positions": positions,
         "sequence": sequence,
         "at": at,
-        "ack": dict(marker),
+        "ack": {k: v for k, v in marker.items() if k != "selected_joint"},
         "observation": dict(observation),
         "body_feedback": {
             key: observation[key]
@@ -71,6 +83,7 @@ def read_physical_sample(client, run_id, host_incarnation, previous_sequence, *,
             "original_request_roundtrip_age_s": request_age,
         },
         "provenance": "protected-host/measured-feedback",
+        **({"selected_joint": copy.deepcopy(selected)} if selected is not None else {}),
     }
 
 
@@ -94,7 +107,9 @@ class PhysicalExecutor:
     source = "protected-physical-provider"
     asynchronous = True
     restart_cleanup = "physical_cleanup_unknown_after_restart"
-    selected_joint_recipes = frozenset({"physical-left-elbow-compare", "physical-left-elbow-dwell-compare"})
+    selected_joint_recipes = frozenset({
+        "physical-left-elbow-compare", "physical-left-elbow-dwell-compare", LEFT_ELBOW_RESPONSE.recipe_name,
+    })
     recipes = (
         frozenset({"physical-arm-smoke", "physical-arm-smoke-repeat", "physical-arm-hold-body"})
         | selected_joint_recipes
@@ -164,6 +179,7 @@ class PhysicalExecutor:
                 "physical-arm-hold-body": "ordinary-body-baseline-no-integral-trial",
                 "physical-left-elbow-compare": "ordinary-baseline-selected-elbow-evidence-no-gain-trial",
                 "physical-left-elbow-dwell-compare": "ordinary-baseline-selected-elbow-evidence-no-gain-trial",
+                LEFT_ELBOW_RESPONSE.recipe_name: "ordinary-baseline-signed-elbow-response-no-gain-trial",
             },
         }
 
@@ -576,7 +592,7 @@ class PhysicalExecutor:
                                     for key, origin in self.task.original_seed.items():
                                         limit = (
                                             1.0
-                                            if self.task.profile == "ArmHoldBody"
+                                            if self.task.profile in {"ArmHoldBody", LEFT_ELBOW_RESPONSE.profile}
                                             else self.task.joint_amplitudes[key]
                                         )
                                         if abs(self.sample["positions"][key] - origin) > limit:
