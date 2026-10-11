@@ -181,6 +181,9 @@ class OriginalElbowReturn:
     return_limit = staticmethod(SignedElbowResponse.return_limit)
 
     def validate_artifact(self, value):
+        return self._validate_artifact(value)
+
+    def _validate_artifact(self, value, *, allow_source_transition=False):
         heads = ("original_motor_head", "original_executor_head", "stopped_motor_head",
                  "stopped_executor_head", "admission_motor_head")
         hashes = ("original_manifest_sha256", "original_log_sha256", "original_terminal_sha256",
@@ -218,7 +221,8 @@ class OriginalElbowReturn:
         if not calibration["range_min"] <= start < raw or not 0 < distance <= 3:
             raise ValueError("archived elbow-return would change direction or escalate excursion")
         if (
-            value["stopped_goal_raw"] != raw or value["original_motor_head"] != value["stopped_motor_head"]
+            value["stopped_goal_raw"] != raw
+            or not allow_source_transition and value["original_motor_head"] != value["stopped_motor_head"]
             or any(value[k] != 0 for k in ("stopped_torque_enable", "stopped_current_raw", "stopped_mode", "stopped_status"))
             or value["model_number"] != 777 or not 0 <= value["firmware_major"] <= 255
             or not 0 <= value["firmware_minor"] <= 255
@@ -308,6 +312,331 @@ class OriginalElbowReturn:
 LEFT_ELBOW_ORIGINAL_RETURN = OriginalElbowReturn()
 
 
+@dataclass(frozen=True)
+class ElbowRecovery(OriginalElbowReturn):
+    """Explicit current-pose hypothesis; historical return verdict stays intact."""
+
+    recipe_name: str = "physical-left-elbow-recovery-i0"
+    profile: str = "LeftElbowRecoveryI0"
+    integral: int = 0
+    mode: str = "return"
+    hold_s: float = 0.5
+    current_cap_ma: float = 100.0
+
+    def validate_artifact(self, value):
+        # Only the new experiment permits intervening reviewed motor source.
+        LEFT_ELBOW_ORIGINAL_RETURN._validate_artifact(value, allow_source_transition=True)
+        if (value["firmware_major"], value["firmware_minor"]) != (3, 10):
+            raise ValueError("current-pose recovery requires the installed firmware 3.10")
+        return value
+
+    def phase(self, progress):
+        if self.mode == "return":
+            return super().phase(progress)
+        if progress < 2:
+            return 0, "baseline", 0.0
+        if progress >= 16:
+            return 2, "final", 0.0
+        cycle = min(int((progress - 2) // 7) + 1, 2)
+        within = progress - 2 - (cycle - 1) * 7
+        if within < 3:
+            return cycle, "outbound", within / 3
+        if within < 3.5:
+            return cycle, "endpoint", 1.0
+        if within < 6.5:
+            return cycle, "return", 1 - (within - 3.5) / 3
+        return cycle, "origin", 0.0
+
+    def sample_key(self, progress):
+        cycle, phase, _ = self.phase(progress)
+        if phase == "baseline":
+            return "baseline"
+        if self.mode == "return":
+            return "cycle1_origin" if progress >= self.trajectory_s - 0.2 - 1e-9 else None
+        if phase == "endpoint":
+            return f"cycle{cycle}_endpoint"
+        if phase == "origin" and progress >= (9 if cycle == 1 else 16) - 0.2 - 1e-9:
+            return f"cycle{cycle}_origin"
+        return "final_origin" if phase == "final" and progress >= 17.8 - 1e-9 else None
+
+    def context_valid(self, context):
+        if self.mode == "return":
+            return super().context_valid(context)
+        if not isinstance(context, dict) or context.get("profile") != self.profile:
+            return False
+        values = [context.get(k) for k in ("progress_s", "reference", "endpoint_target", "requested_target")]
+        if not all(type(v) in (int, float) and math.isfinite(v) for v in values):
+            return False
+        progress, reference, endpoint, requested = values
+        if not 0 <= progress <= self.trajectory_s or not -100 <= reference < reference + 3 <= 100:
+            return False
+        cycle, phase, fraction = self.phase(progress)
+        return (
+            type(context.get("cycle")) is int
+            and context["cycle"] == cycle
+            and context.get("phase") == phase
+            and context.get("sample_key") == self.sample_key(progress)
+            and math.isclose(endpoint, reference + 3, abs_tol=1e-9, rel_tol=0)
+            and math.isclose(requested, reference + fraction * 3, abs_tol=1e-9, rel_tol=0)
+        )
+
+    @staticmethod
+    def window_valid(window):
+        clocks = {
+            f"{end}_{name}_{part}_at"
+            for end in ("first", "last")
+            for name in ("current", "position")
+            for part in ("started", "completed")
+        }
+        if (
+            not isinstance(window, dict)
+            or set(window)
+            != clocks
+            | {
+                "sample_count",
+                "qualified_at_monotonic_s",
+                "current_span_s",
+                "position_span_s",
+            }
+            or type(window["sample_count"]) is not int
+            or not 3 <= window["sample_count"] <= 20
+            or not all(
+                type(window[k]) in (int, float) and math.isfinite(window[k])
+                for k in set(window) - {"sample_count"}
+            )
+        ):
+            return False
+        for name in ("current", "position"):
+            first, last = window[f"first_{name}_completed_at"], window[f"last_{name}_completed_at"]
+            start, last_start = window[f"first_{name}_started_at"], window[f"last_{name}_started_at"]
+            qualified = window["qualified_at_monotonic_s"]
+            if (
+                not 0 <= start <= first < last <= qualified
+                or not start <= last_start <= last
+                or qualified - start > 0.5
+                or qualified - last_start > 0.5
+                or last - first < 0.2 - 1e-9
+                or not math.isclose(window[f"{name}_span_s"], last - first, rel_tol=0, abs_tol=1e-9)
+            ):
+                return False
+        return True
+
+    def gain_trial_valid(self, gain, *, run_id, host_incarnation, now=None):
+        if not isinstance(gain, dict) or gain.get("active_verified") is not True:
+            return False
+        if gain.get("state", gain.get("status")) != "active" or gain.get("status", "active") != "active":
+            return False
+        at, binding, registers = (
+            gain.get("active_verified_at_monotonic_s"),
+            gain.get("binding"),
+            gain.get("active_registers"),
+        )
+        expected_binding = {
+            "run_id": run_id,
+            "host_incarnation": host_incarnation,
+            "recipe": self.recipe_name,
+            "integral": self.integral,
+        }
+        if (
+            type(at) not in (int, float)
+            or not math.isfinite(at)
+            or at < 0
+            or now is not None
+            and (type(now) not in (int, float) or not math.isfinite(now) or at > now)
+            or not isinstance(binding, dict)
+            or binding != expected_binding
+            or not all(type(binding.get(k)) is str and binding[k] for k in ("run_id", "host_incarnation"))
+            or type(binding.get("integral")) is not int
+            or type(gain.get("integral")) is not int
+            or gain["integral"] != self.integral
+            or not isinstance(registers, dict)
+        ):
+            return False
+        expected = {
+            "Model_Number": 777,
+            "Firmware_Major_Version": 3,
+            "Firmware_Minor_Version": 10,
+            "Operating_Mode": 0,
+            "P_Coefficient": 16,
+            "D_Coefficient": 32,
+            "I_Coefficient": self.integral,
+            "Lock": 1,
+            "Torque_Enable": 1,
+        }
+        if any(type(registers.get(k)) is not int or registers[k] != v for k, v in expected.items()):
+            return False
+        if (
+            not all(
+                type(registers.get(k)) is int
+                for k in ("Min_Position_Limit", "Max_Position_Limit", "Present_Current")
+            )
+            or not 0 <= registers["Min_Position_Limit"] < registers["Max_Position_Limit"] <= 4095
+            or abs(registers["Present_Current"]) * 6.5 >= self.current_cap_ma
+        ):
+            return False
+        original = gain.get("original_registers")
+        if (
+            not isinstance(original, dict)
+            or any(
+                type(original.get(k)) is not int or original[k] != v
+                for k, v in {
+                    "I_Coefficient": 0,
+                    "P_Coefficient": 16,
+                    "D_Coefficient": 32,
+                    "Torque_Enable": 0,
+                }.items()
+            )
+            or type(original.get("Lock")) is not int
+            or original["Lock"] not in (0, 1)
+        ):
+            return False
+        before, active = gain.get("original_bytes"), gain.get("active_bytes")
+        return (
+            isinstance(before, dict)
+            and set(before) == {"24", "25"}
+            and all(type(v) is int and 0 <= v <= 255 for v in before.values())
+            and isinstance(active, dict)
+            and set(active) == set(before)
+            and all(type(v) is int for v in active.values())
+            and active == before
+        )
+
+    def completion_expectation(self, execution, reference, artifact_sha256):
+        if not isinstance(execution, dict):
+            return None
+        try:
+            self.validate_artifact(reference)
+        except (ValueError, TypeError, KeyError):
+            return None
+        if (
+            type(artifact_sha256) is not str
+            or len(artifact_sha256) != 64
+            or any(c not in "0123456789abcdef" for c in artifact_sha256)
+        ):
+            return None
+        outcome, seed = execution.get("recovery"), execution.get("original_seed")
+        if (
+            not isinstance(outcome, dict)
+            or not isinstance(seed, dict)
+            or not self.window_valid(outcome.get("final_window"))
+        ):
+            return None
+        gain = outcome.get("gain_trial")
+        binding = gain.get("binding", {}) if isinstance(gain, dict) else {}
+        if not self.gain_trial_valid(
+            gain,
+            run_id=binding.get("run_id"),
+            host_incarnation=binding.get("host_incarnation"),
+            now=outcome["final_window"]["qualified_at_monotonic_s"],
+        ):
+            return None
+        starting = self.encoded_goal(seed.get(self.joint), reference["calibration"])
+        expected = {
+            "recipe": self.recipe_name,
+            "profile": self.profile,
+            "mode": self.mode,
+            "expected_integral": self.integral,
+            "hold_s": self.hold_s,
+            "current_cap_ma": self.current_cap_ma,
+            "artifact_sha256": artifact_sha256,
+            "original_run_id": reference["original_run_id"],
+            "historical_target_raw": reference["reference_raw"],
+            "calibration": reference["calibration"],
+            "starting_raw": starting,
+        }
+        residual, noise, progress = (
+            outcome.get(k)
+            for k in ("final_return_residual_raw", "baseline_noise_raw", "max_toward_target_raw")
+        )
+        if (
+            starting is None
+            or any(outcome.get(k) != v for k, v in expected.items())
+            or type(outcome.get("expected_integral")) is not int
+            or type(outcome.get("starting_raw")) is not int
+            or any(type(v) is not int or not 0 <= v <= 4095 for v in (residual, noise, progress))
+            or type(outcome.get("target_attained")) is not bool
+        ):
+            return None
+        registers = gain["active_registers"]
+        if (registers["Min_Position_Limit"], registers["Max_Position_Limit"]) != (
+            reference["calibration"]["range_min"],
+            reference["calibration"]["range_max"],
+        ):
+            return None
+        target = starting if self.mode == "confirm" else reference["reference_raw"]
+        target_normalized = seed[self.joint] if self.mode == "confirm" else reference["reference_normalized"]
+        present = outcome.get("origin_present_raw")
+        limit = self.return_limit(noise) if self.mode == "confirm" else 2
+        attained = residual <= limit and type(present) is int and abs(present - target) <= limit
+        upper = (
+            self.encoded_goal(target_normalized + 3, reference["calibration"])
+            if self.mode == "confirm"
+            else target
+        )
+        if upper is None or progress > upper - starting + limit or residual > upper - starting + limit:
+            return None
+        if (
+            outcome.get("reference_raw") != target
+            or outcome.get("reference_normalized") != target_normalized
+            or type(outcome.get("reference_raw")) is not int
+            or type(outcome.get("origin_goal_raw")) is not int
+            or outcome["origin_goal_raw"] != target
+            or type(present) is not int
+            or not reference["calibration"]["range_min"] <= present <= reference["calibration"]["range_max"]
+            or not starting - limit <= present <= upper + limit
+            or outcome["target_attained"] != attained
+        ):
+            return None
+        cycles = outcome.get("cycles")
+        if not isinstance(cycles, list) or len(cycles) != (2 if self.mode == "confirm" else 0):
+            return None
+        if self.mode == "confirm":
+            if not attained or not -100 <= target_normalized < target_normalized + 3 <= 100:
+                return None
+            goal = self.encoded_goal(target_normalized + 3, reference["calibration"])
+            threshold = LEFT_ELBOW_RESPONSE.response_threshold(goal - starting, noise)
+            for index, row in enumerate(cycles, 1):
+                if (
+                    not isinstance(row, dict)
+                    or type(row.get("cycle")) is not int
+                    or row["cycle"] != index
+                    or type(row.get("endpoint_goal_raw")) is not int
+                    or row["endpoint_goal_raw"] != goal
+                    or type(row.get("signed_response_raw")) is not int
+                    or row["signed_response_raw"] < threshold
+                    or row.get("response_threshold_raw") != threshold
+                    or row.get("return_qualified") is not True
+                    or type(row.get("return_residual_raw")) is not int
+                    or not 0 <= row["return_residual_raw"] <= limit
+                ):
+                    return None
+        elif not 0 < target_normalized - seed[self.joint] <= 3:
+            return None
+        counts = len(cycles), len(cycles) if self.mode == "confirm" else int(attained)
+        if execution.get("progress_s") != self.trajectory_s or any(
+            type(execution.get(k)) is not int or execution[k] != v
+            for k, v in zip(("cycles_completed", "returns_qualified"), counts, strict=True)
+        ):
+            return None
+        return self.trajectory_s, *counts
+
+
+ELBOW_RECOVERY_DEFINITIONS = MappingProxyType(
+    {
+        f"physical-left-elbow-recovery-i{integral}{suffix}": ElbowRecovery(
+            recipe_name=f"physical-left-elbow-recovery-i{integral}{suffix}",
+            profile=f"LeftElbowRecoveryI{integral}{label}",
+            integral=integral,
+            mode="confirm" if suffix == "-confirm" else "return",
+            hold_s=2.0 if suffix == "-dwell" else 0.5,
+            trajectory_s=18.0 if suffix == "-confirm" else 7.0 if suffix == "-dwell" else 5.5,
+        )
+        for integral in (0, 1)
+        for suffix, label in (("", ""), ("-dwell", "Dwell"), ("-confirm", "Confirm"))
+    }
+)
+
+
 RECIPES = MappingProxyType(
     {
         "fake-finite": Recipe("fake-finite", "finite", 352.0, 420.0),
@@ -330,6 +659,8 @@ RECIPES = MappingProxyType(
             LEFT_ELBOW_ORIGINAL_RETURN.recipe_name, "finite", LEFT_ELBOW_ORIGINAL_RETURN.trajectory_s,
             LEFT_ELBOW_ORIGINAL_RETURN.live_s, seed=None,
         ),
+        **{name: Recipe(name, "finite", definition.trajectory_s, definition.live_s, seed=None)
+           for name, definition in ELBOW_RECOVERY_DEFINITIONS.items()},
         "fake-interactive": Recipe("fake-interactive", "interactive", None, 420.0),
     }
 )

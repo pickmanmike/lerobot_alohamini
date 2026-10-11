@@ -979,8 +979,33 @@ def _validate_host_arguments(args):
         )
 
 
+def elbow_recovery_binding(args):
+    """Only a reviewed protected recipe can select the owner-scoped ID3 trial."""
+    integral = os.environ.get("AM1_ELBOW_RECOVERY")
+    recipe = os.environ.get("AM1_ELBOW_RECOVERY_RECIPE")
+    if integral is None and recipe is None:
+        return None
+    from examples.alohamini.am1_session_contract import ELBOW_RECOVERY_DEFINITIONS
+
+    definition = ELBOW_RECOVERY_DEFINITIONS.get(recipe)
+    if (
+        definition is None or integral != f"I{definition.integral}"
+        or os.environ.get("AM1_SCRIPTED_PREPARE") != "1"
+        or os.environ.get("AM1_SELECTED_JOINT_EVIDENCE") != "1"
+        or args.robot_model != "alohamini1" or args.no_follower or not args.no_cameras
+        or not getattr(args, "am1_protected_run_directory", None)
+        or not args.am1_run_id or not args.am1_host_incarnation
+    ):
+        raise ValueError("Elbow recovery requires an exact protected recipe and its existing preparation/evidence gates")
+    identity = {"run_id": str(UUID(args.am1_run_id)), "host_incarnation": str(UUID(args.am1_host_incarnation))}
+    if identity != {"run_id": args.am1_run_id, "host_incarnation": args.am1_host_incarnation}:
+        raise ValueError("Elbow recovery requires canonical protected run identities")
+    return {**identity, "recipe": recipe, "integral": definition.integral}
+
+
 def _run_host(args):
     _validate_host_arguments(args)
+    recovery_binding = elbow_recovery_binding(args)
 
     logging.info("Configuring AlohaMini")
     robot_config = make_robot_config(args)
@@ -1001,6 +1026,8 @@ def _run_host(args):
                  and args.am1_run_id is not None and args.am1_host_incarnation is not None),
     )
     robot._am1_selected_joint_evidence_enabled = selected_evidence.enabled
+    if recovery_binding is not None:
+        robot._am1_elbow_recovery_binding = recovery_binding
 
     if args.lift_relief:
         from .lift_relief import run_lift_relief
@@ -1094,7 +1121,7 @@ def _run_host(args):
                 command_received_t = time.monotonic()
                 command_received_wall_time_ns = command_state.capture_wall_time_ns()
                 data = dict(json.loads(msg))
-                #print(f"Received action: {data}")   # debug 
+                #print(f"Received action: {data}")   # debug
                 if local_control is not None:
                     command_received = local_control.apply(robot, data)
                 else:
@@ -1141,6 +1168,7 @@ def _run_host(args):
                 local_control.annotate(last_observation, acquired_at=acquired_at)
                 if local_control.binding is not None:
                     last_observation[AM1_LOCAL_FEEDBACK_KEY]["read_started_at_monotonic_s"] = read_started_at
+                selected_evidence.guard_recovery(robot, local_control, last_observation)
                 selected_evidence.publish(robot, local_control, last_observation)
             observation_done_t = time.perf_counter()
             if loop_timing is not None:

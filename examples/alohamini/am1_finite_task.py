@@ -3,12 +3,13 @@
 from functools import partial
 
 from .am1_scripted_prepare import SHOULDER, PreparedScriptedInput
-from .am1_session_contract import LEFT_ELBOW_ORIGINAL_RETURN, LEFT_ELBOW_RESPONSE
+from .am1_session_contract import ELBOW_RECOVERY_DEFINITIONS, LEFT_ELBOW_ORIGINAL_RETURN, LEFT_ELBOW_RESPONSE
 from .scripted_leader import (
     ArmHoldBodyInput,
     LeftElbowCompareInput,
     LeftElbowDwellCompareInput,
     LeftElbowOriginalReturnInput,
+    LeftElbowRecoveryInput,
     LeftElbowResponseCharacterizeInput,
     ScriptedLeaderInput,
 )
@@ -33,9 +34,11 @@ class FiniteTask:
         feedback_provenance="simulated-feedback",
         return_reference=None,
         reference_sha256=None,
+        recovery_comparator=None,
     ):
         self.feedback_provenance = feedback_provenance
         self.initial_measured_reference = dict(positions)
+        self.recovery_definition = ELBOW_RECOVERY_DEFINITIONS.get(recipe.name)
         profile = {
             "sim-arm-smoke": ("ArmSmoke", ScriptedLeaderInput),
             "sim-arm-smoke-repeat": ("ArmSmokeRepeat", ArmSmokeRepeatInput),
@@ -45,14 +48,28 @@ class FiniteTask:
             "physical-arm-hold-body": ("ArmHoldBody", ArmHoldBodyInput),
             "physical-left-elbow-compare": ("LeftElbowCompare", LeftElbowCompareInput),
             "physical-left-elbow-dwell-compare": ("LeftElbowDwellCompare", LeftElbowDwellCompareInput),
-            LEFT_ELBOW_RESPONSE.recipe_name: (LEFT_ELBOW_RESPONSE.profile, LeftElbowResponseCharacterizeInput),
-            LEFT_ELBOW_ORIGINAL_RETURN.recipe_name: (LEFT_ELBOW_ORIGINAL_RETURN.profile, LeftElbowOriginalReturnInput),
+            LEFT_ELBOW_RESPONSE.recipe_name: (
+                LEFT_ELBOW_RESPONSE.profile,
+                LeftElbowResponseCharacterizeInput,
+            ),
+            LEFT_ELBOW_ORIGINAL_RETURN.recipe_name: (
+                LEFT_ELBOW_ORIGINAL_RETURN.profile,
+                LeftElbowOriginalReturnInput,
+            ),
+            **{
+                name: (d.profile, partial(LeftElbowRecoveryInput, definition=d))
+                for name, d in ELBOW_RECOVERY_DEFINITIONS.items()
+            },
         }[recipe.name]
         self.profile = profile[0]
-        if self.profile == LEFT_ELBOW_ORIGINAL_RETURN.profile:
+        if self.recovery_definition is not None:
+            self.recovery_definition.validate_artifact(return_reference)
+        elif self.profile == LEFT_ELBOW_ORIGINAL_RETURN.profile:
             LEFT_ELBOW_ORIGINAL_RETURN.validate_artifact(return_reference)
         elif return_reference is not None or reference_sha256 is not None:
             raise ValueError("retained return reference forbidden for ordinary recipes")
+        if recovery_comparator is not None and self.recovery_definition is None:
+            raise ValueError("recovery comparator forbidden for ordinary recipes")
         self.admitted_at = now
         self.admissions = 1
         self.cycles_completed = self.returns_qualified = 0
@@ -76,8 +93,17 @@ class FiniteTask:
             self.provider = profile[1](positions, joint_keys=JOINT_KEYS, fps=10, emit=self.record)
             self.original_seed = dict(positions)
         else:
-            if self.profile == LEFT_ELBOW_ORIGINAL_RETURN.profile:
-                provider = partial(profile[1], return_reference=return_reference, reference_sha256=reference_sha256)
+            if self.recovery_definition is not None:
+                provider = partial(
+                    profile[1],
+                    return_reference=return_reference,
+                    reference_sha256=reference_sha256,
+                    recovery_comparator=recovery_comparator,
+                )
+            elif self.profile == LEFT_ELBOW_ORIGINAL_RETURN.profile:
+                provider = partial(
+                    profile[1], return_reference=return_reference, reference_sha256=reference_sha256
+                )
             elif self.profile in {"LeftElbowCompare", "LeftElbowDwellCompare", LEFT_ELBOW_RESPONSE.profile}:
                 provider = profile[1]
             else:
@@ -112,6 +138,12 @@ class FiniteTask:
             self.returns_qualified += 1
 
     def check(self, now):
+        if (
+            not self.finished
+            and self.recovery_definition is not None
+            and now - self.admitted_at >= self.recovery_definition.live_s
+        ):
+            raise ValueError("60-second recovery Live deadline expired")
         if not self.finished and getattr(self.provider, "preparing", False) and now - self.admitted_at >= 20:
             raise ValueError("20-second preparation wall deadline expired without a qualified seed")
 
@@ -134,9 +166,18 @@ class FiniteTask:
             return False
         if sample["sequence"] <= self.sequence:
             return False
-        selected = self.profile in {LEFT_ELBOW_RESPONSE.profile, LEFT_ELBOW_ORIGINAL_RETURN.profile} and not self.provider.preparing
+        selected = (
+            self.recovery_definition is not None
+            or self.profile
+            in {
+                LEFT_ELBOW_RESPONSE.profile,
+                LEFT_ELBOW_ORIGINAL_RETURN.profile,
+            }
+        ) and not self.provider.preparing
         if (
-            selected and sample.get("selected_joint") is None and self.provider.awaiting_initial_feedback
+            selected
+            and sample.get("selected_joint") is None
+            and self.provider.awaiting_initial_feedback
             and now - self.last_frame < 0.1 - 1e-9
         ):
             return False
@@ -147,14 +188,37 @@ class FiniteTask:
         if now - self.last_frame < 0.1 - 1e-9:
             return False
         was_complete = self.provider.complete
-        kwargs = {"selected_feedback": sample.get("selected_joint")} if self.profile in {
-            LEFT_ELBOW_RESPONSE.profile, LEFT_ELBOW_ORIGINAL_RETURN.profile,
-        } else {}
+        kwargs = (
+            {"selected_feedback": sample.get("selected_joint")}
+            if self.recovery_definition is not None
+            or self.profile
+            in {
+                LEFT_ELBOW_RESPONSE.profile,
+                LEFT_ELBOW_ORIGINAL_RETURN.profile,
+            }
+            else {}
+        )
         self.provider.advance(now, sample["positions"], sample["sequence"], **kwargs)
-        if was_complete and self.profile in {LEFT_ELBOW_RESPONSE.profile, LEFT_ELBOW_ORIGINAL_RETURN.profile}:
+        if was_complete and (
+            self.recovery_definition is not None
+            or self.profile
+            in {
+                LEFT_ELBOW_RESPONSE.profile,
+                LEFT_ELBOW_ORIGINAL_RETURN.profile,
+            }
+        ):
             self.provider.validate_final_feedback(now, sample["positions"], sample.get("selected_joint"))
         if self.provider.complete:
-            if self.profile == LEFT_ELBOW_ORIGINAL_RETURN.profile:
+            if self.recovery_definition is not None:
+                outcome = self.provider.recovery
+                self.cycles_completed = len(outcome["cycles"])
+                self.returns_qualified = (
+                    self.cycles_completed
+                    if self.recovery_definition.mode == "confirm"
+                    else int(outcome["target_attained"])
+                )
+                self.complete = True
+            elif self.profile == LEFT_ELBOW_ORIGINAL_RETURN.profile:
                 # The provider has already proven the original raw reference
                 # using both real acquisition windows and the same-intent readback.
                 self.returns_qualified, self.cycles_completed, self.complete = 1, 0, True
@@ -162,7 +226,11 @@ class FiniteTask:
                 self.complete = True
             else:
                 for key, origin in self.original_seed.items():
-                    limit = 1.0 if self.profile in {"ArmHoldBody", LEFT_ELBOW_RESPONSE.profile} else self.joint_amplitudes[key]
+                    limit = (
+                        1.0
+                        if self.profile in {"ArmHoldBody", LEFT_ELBOW_RESPONSE.profile}
+                        else self.joint_amplitudes[key]
+                    )
                     if abs(sample["positions"][key] - origin) > limit:
                         raise ValueError(f"{self.profile} return exceeds the original envelope for {key}")
                 self.return_first = now if self.return_first is None else self.return_first
@@ -206,4 +274,6 @@ class FiniteTask:
             result["characterization"] = self.provider.characterization
         if self.profile == LEFT_ELBOW_ORIGINAL_RETURN.profile:
             result["retained_return"] = self.provider.retained_return
+        if self.recovery_definition is not None:
+            result["recovery"] = self.provider.recovery
         return result

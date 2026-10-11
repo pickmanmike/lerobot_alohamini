@@ -9,9 +9,17 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 if __package__:
-    from .am1_session_contract import LEFT_ELBOW_ORIGINAL_RETURN, LEFT_ELBOW_RESPONSE
+    from .am1_session_contract import (
+        ELBOW_RECOVERY_DEFINITIONS,
+        LEFT_ELBOW_ORIGINAL_RETURN,
+        LEFT_ELBOW_RESPONSE,
+    )
 else:
-    from am1_session_contract import LEFT_ELBOW_ORIGINAL_RETURN, LEFT_ELBOW_RESPONSE
+    from am1_session_contract import (
+        ELBOW_RECOVERY_DEFINITIONS,
+        LEFT_ELBOW_ORIGINAL_RETURN,
+        LEFT_ELBOW_RESPONSE,
+    )
 
 
 class ScriptedLeaderInput:
@@ -743,6 +751,345 @@ class LeftElbowOriginalReturnInput(LeftElbowResponseCharacterizeInput):
         next_progress = round(self.elapsed_s + min(now - self._last_tick, self._frame_s), 9)
         if self.elapsed_s < 2 <= next_progress:
             self._qualify_start(now)
+        if next_progress >= self.duration_s:
+            self._qualify_final(now)
+        ScriptedLeaderInput.advance(self, now, observed, observation_sequence, defer_events=defer_events)
+
+
+class LeftElbowRecoveryInput(LeftElbowOriginalReturnInput):
+    """One explicit bounded recovery workload, with independent actual gain proof."""
+
+    def __init__(self, *args, definition, recovery_comparator=None, **kwargs):
+        if not any(definition is item for item in ELBOW_RECOVERY_DEFINITIONS.values()):
+            raise ValueError("an exact frozen recovery definition is required")
+        self.definition, self.motion_profile = definition, definition.profile
+        self._recovery_comparator = copy.deepcopy(recovery_comparator)
+        super().__init__(*args, **kwargs)
+
+    def _selected_plan(self):
+        self._initialize_selected_feedback()
+        self._starting_raw = self.definition.encoded_goal(
+            self.origin[self.selected_joint], self._retained["calibration"]
+        )
+        if self._starting_raw is None:
+            raise ValueError("recovery measured start is unrepresentable")
+        self._reference = (
+            self.origin[self.selected_joint]
+            if self.definition.mode == "confirm"
+            else self._retained["reference_normalized"]
+        )
+        self._baseline_raw = (
+            self._starting_raw if self.definition.mode == "confirm" else self._retained["reference_raw"]
+        )
+        if self.definition.mode == "confirm":
+            if not -100 <= self._reference < self._reference + 3 <= 100:
+                raise ValueError("recovery confirmation corridor is unrepresentable")
+            self.targets[self.selected_joint] = self._reference + 3
+        else:
+            if not 0 < self._reference - self.origin[self.selected_joint] <= 3:
+                raise ValueError("recovery return would change direction or exceed its corridor")
+            self.targets[self.selected_joint] = self._reference
+        self._noise = 0
+        self._final_window = None
+        self._origin_goal = self._origin_present = None
+        self._target_attained = False
+        self._max_toward = 0
+        self._trend = None
+        self._error_sign = self._error_peak = self._growing_crossings = 0
+        self._error_goal = None
+        self._gain_trial = None
+        self._validate_comparator()
+        self.duration_s = self.definition.trajectory_s
+        self._record(
+            "am1_scripted_recovery_plan",
+            recipe=self.definition.recipe_name,
+            starting_raw=self._starting_raw,
+            historical_target_raw=self._retained["reference_raw"],
+            reference_raw=self._baseline_raw,
+            expected_integral=self.definition.integral,
+            current_cap_ma=self.definition.current_cap_ma,
+            hold_s=self.definition.hold_s,
+            trajectory_s=self.duration_s,
+            live_ceiling_s=self.definition.live_s,
+            other_joints="fresh measured targets held exactly",
+            body="zero",
+        )
+
+    @property
+    def diagnostic_context(self):
+        cycle, phase, fraction = self.definition.phase(self.elapsed_s)
+        start = self.origin[self.selected_joint]
+        endpoint = self._reference + 3 if self.definition.mode == "confirm" else start
+        requested = (
+            self._reference + fraction * 3
+            if self.definition.mode == "confirm"
+            else start + fraction * (self._reference - start)
+        )
+        return {
+            "profile": self.motion_profile,
+            "progress_s": self.elapsed_s,
+            "phase": phase,
+            "cycle": cycle,
+            "reference": self._reference,
+            "endpoint_target": endpoint,
+            "requested_target": requested,
+            "sample_key": self.definition.sample_key(self.elapsed_s),
+        }
+
+    def _position(self):
+        _, phase, fraction = self.definition.phase(self.elapsed_s)
+        return (
+            (None if phase in {"baseline", "final"} else self.joint_keys.index(self.selected_joint)),
+            phase,
+            fraction,
+        )
+
+    @property
+    def recovery(self):
+        return {
+            "recipe": self.definition.recipe_name,
+            "profile": self.motion_profile,
+            "mode": self.definition.mode,
+            "expected_integral": self.definition.integral,
+            "hold_s": self.definition.hold_s,
+            "current_cap_ma": self.definition.current_cap_ma,
+            "artifact_sha256": self._reference_sha256,
+            "original_run_id": self._retained["original_run_id"],
+            "historical_target_raw": self._retained["reference_raw"],
+            "reference_raw": self._baseline_raw,
+            "reference_normalized": self._reference,
+            "calibration": copy.deepcopy(self._retained["calibration"]),
+            "starting_raw": self._starting_raw,
+            "baseline_noise_raw": self._noise,
+            "max_toward_target_raw": self._max_toward,
+            "target_attained": self._target_attained,
+            "final_return_residual_raw": self._final_residual,
+            "final_window": copy.deepcopy(self._final_window),
+            "origin_goal_raw": self._origin_goal,
+            "origin_present_raw": self._origin_present,
+            "cycles": copy.deepcopy(self._cycles),
+            "gain_trial": copy.deepcopy(self._gain_trial),
+            "comparator": copy.deepcopy(self._recovery_comparator),
+        }
+
+    def _validate_comparator(self):
+        value = self._recovery_comparator
+        if self.definition.integral != 1 or self.definition.mode != "return":
+            if value is not None:
+                raise ValueError("recovery comparator is only valid for an I1 return workload")
+            return
+        required = {
+            "run_id",
+            "host_incarnation",
+            "proof_sha256",
+            "initial_measured_reference",
+            "calibration",
+            "trajectory_s",
+            "hold_s",
+            "integral",
+        }
+        if not isinstance(value, dict) or set(value) != required:
+            raise ValueError("recovery I1 requires an exact matched I0 comparator")
+        proof = value["proof_sha256"]
+        baseline = value["initial_measured_reference"]
+        if (
+            not all(type(value[k]) is str and value[k] for k in ("run_id", "host_incarnation"))
+            or type(proof) is not str
+            or len(proof) != 64
+            or any(c not in "0123456789abcdef" for c in proof)
+            or type(value["integral"]) is not int
+            or value["integral"] != 0
+            or value["calibration"] != self._retained["calibration"]
+            or value["trajectory_s"] != self.definition.trajectory_s
+            or value["hold_s"] != self.definition.hold_s
+            or not isinstance(baseline, dict)
+            or set(baseline) != set(self.origin)
+            or not all(self._number(v) for v in baseline.values())
+        ):
+            raise ValueError("recovery comparator source, settings, timing or vector differs")
+        baseline_raw = self.definition.encoded_goal(
+            baseline[self.selected_joint], self._retained["calibration"]
+        )
+        if (
+            baseline_raw is None
+            or abs(baseline_raw - self._starting_raw) > 2
+            or any(abs(baseline[k] - v) > 1 for k, v in self.origin.items() if k != self.selected_joint)
+        ):
+            raise ValueError("recovery comparator initial pose differs; no repositioning is permitted")
+
+    def _rising_current_window(self, samples):
+        # Only this explicit I1 workload records a sub-cap rise as hypothesis evidence.
+        return None if self.definition.integral == 1 else super()._rising_current_window(samples)
+
+    def _feedback(self, now, observed, feedback):
+        current = feedback.get("current") if isinstance(feedback, dict) else None
+        if (
+            isinstance(current, dict)
+            and self._number(current.get("ma"))
+            and abs(current["ma"]) >= self.definition.current_cap_ma
+        ):
+            self._adverse_reason = "recovery selected current reached the 100 mA experimental cap"
+            raise ValueError(self._adverse_reason)
+        LeftElbowResponseCharacterizeInput._feedback(self, now, observed, feedback)
+        endpoint = (
+            self._reference + 3 if self.definition.mode == "confirm" else self.origin[self.selected_joint]
+        )
+        if not math.isclose(feedback["context"]["endpoint_target"], endpoint, abs_tol=1e-9, rel_tol=0):
+            raise ValueError("recovery phase proof differs from its frozen measured start/endpoint")
+        if self._motor["calibration"] != self._retained["calibration"]:
+            raise ValueError("recovery live calibration differs from its archived provenance")
+        gain = feedback.get("gain_trial")
+        if not self.definition.gain_trial_valid(
+            gain, run_id=feedback["run_id"], host_incarnation=feedback["host_incarnation"], now=now
+        ):
+            raise ValueError("recovery actual gain proof differs from its selected owner/setting")
+        if self._gain_trial is not None and self._gain_trial != gain:
+            raise ValueError("recovery actual gain proof changed during its workload")
+        registers = gain["active_registers"]
+        if (registers["Min_Position_Limit"], registers["Max_Position_Limit"]) != (
+            self._retained["calibration"]["range_min"],
+            self._retained["calibration"]["range_max"],
+        ):
+            raise ValueError("recovery actual gain proof calibration range differs")
+        self._gain_trial = copy.deepcopy(gain)
+        raw, context = feedback["position"]["raw"], feedback["context"]
+        limit = self.definition.return_limit(self._noise) if self.definition.mode == "confirm" else 2
+        upper = self.definition.encoded_goal(self.targets[self.selected_joint], self._retained["calibration"])
+        if not self._starting_raw - limit <= raw <= upper + limit:
+            raise ValueError("recovery wrong-direction response left its bounded approach envelope")
+        self._max_toward = max(self._max_toward, raw - self._starting_raw)
+        phase_key = context["cycle"], context["phase"]
+        direction = -1 if self.definition.mode == "confirm" and context["phase"] == "return" else 1
+        if (
+            self._trend is not None
+            and self._trend[:2] == phase_key
+            and context["phase"] in {"return", "outbound"}
+            and (raw - self._trend[2]) * direction < -max(2, self._noise)
+        ):
+            raise ValueError("recovery measured motion reversed the commanded direction")
+        self._trend = *phase_key, raw
+        goal = feedback["action"]["expected_goal_raw"]
+        if goal != self._error_goal:
+            self._error_goal = goal
+            self._error_sign = self._error_peak = self._growing_crossings = 0
+        error = raw - goal
+        sign = 1 if error > 0 else -1
+        if abs(error) > max(2, self._noise):
+            if self._error_sign and sign != self._error_sign and abs(error) > self._error_peak:
+                self._growing_crossings += 1
+            self._error_sign, self._error_peak = sign, abs(error)
+            if self._growing_crossings >= 3:
+                raise ValueError("recovery growing oscillation crossed its target three times")
+        samples = self._phase_samples[phase_key]
+        if self.definition.integral == 0 and context["phase"] == "origin" and len(samples) >= 4:
+            adverse = self._rising_current_window(samples)
+            if adverse is not None:
+                self._adverse_reason = (
+                    "recovery endpoint has sustained rising current without measured response"
+                )
+                self._record(
+                    "am1_scripted_recovery_adverse",
+                    reason=self._adverse_reason,
+                    actual_current_window=adverse,
+                )
+                raise ValueError(self._adverse_reason)
+
+    def _qualify_start(self, now):
+        samples = self._recent_suffix(self._baseline, "recovery measured baseline", now=now)
+        receipt = self._receipt("baseline", now)
+        if receipt["action"]["expected_goal_raw"] != self._starting_raw or any(
+            abs(row["raw"] - self._starting_raw) > 2 for row in samples
+        ):
+            raise ValueError("recovery fresh measured baseline differs from its initial hold")
+        self._noise = self._baseline_extrema[1] - self._baseline_extrema[0]
+
+    def _qualify_recovery_cycle(self, cycle, now):
+        endpoint = self._receipt(f"cycle{cycle}_endpoint", now)
+        origin = self._receipt(f"cycle{cycle}_origin", now, fresh=True)
+        returned = self._recent_suffix(
+            self._phase_samples.get((cycle, "origin"), []), "recovery returned", now=now
+        )
+        endpoint_rows = self._recent_suffix(
+            self._phase_samples.get((cycle, "endpoint"), []), "recovery endpoint"
+        )
+        residual = max(abs(row["raw"] - self._baseline_raw) for row in returned)
+        goal = endpoint["action"]["expected_goal_raw"]
+        threshold = LEFT_ELBOW_RESPONSE.response_threshold(goal - self._baseline_raw, self._noise)
+        response = max(row["raw"] - self._baseline_raw for row in endpoint_rows)
+        if (
+            residual > self.definition.return_limit(self._noise)
+            or origin["decoded"]["goal_position_raw"] != self._baseline_raw
+            or abs(origin["decoded"]["present_position_raw"] - self._baseline_raw)
+            > self.definition.return_limit(self._noise)
+        ):
+            raise ValueError("recovery confirmation did not return before another departure")
+        if response < threshold:
+            raise ValueError("recovery confirmation lacks useful measured movement")
+        self._cycles.append(
+            {
+                "cycle": cycle,
+                "endpoint_goal_raw": goal,
+                "signed_response_raw": response,
+                "response_threshold_raw": threshold,
+                "return_residual_raw": residual,
+                "return_qualified": True,
+            }
+        )
+
+    def _qualify_final(self, now):
+        confirm = self.definition.mode == "confirm"
+        origin = self._receipt("final_origin" if confirm else "cycle1_origin", now, fresh=True)
+        samples = self._recent_suffix(
+            self._phase_samples.get((2, "final") if confirm else (1, "origin"), []),
+            "recovery final position",
+            now=now,
+        )
+        decoded = origin["decoded"]
+        residual = max(abs(row["raw"] - self._baseline_raw) for row in samples)
+        if (
+            decoded["goal_position_raw"] != self._baseline_raw
+            or type(decoded["present_position_raw"]) is not int
+        ):
+            raise ValueError("recovery original goal/present proof differs")
+        limit = self.definition.return_limit(self._noise) if confirm else 2
+        attained = residual <= limit and abs(decoded["present_position_raw"] - self._baseline_raw) <= limit
+        if confirm and not attained:
+            raise ValueError("recovery confirmation final return left its original envelope")
+        self._final_residual, self._target_attained = residual, attained
+        self._origin_goal, self._origin_present = (
+            decoded["goal_position_raw"],
+            decoded["present_position_raw"],
+        )
+        self._final_window = {
+            "sample_count": len(samples),
+            "qualified_at_monotonic_s": now,
+            "current_span_s": samples[-1]["at"] - samples[0]["at"],
+            "position_span_s": samples[-1]["position_at"] - samples[0]["position_at"],
+            **{
+                f"{end}_{name}_{part}_at": row[key]
+                for end, row in (("first", samples[0]), ("last", samples[-1]))
+                for name, part, key in (
+                    ("current", "started", "current_started"),
+                    ("current", "completed", "at"),
+                    ("position", "started", "position_started"),
+                    ("position", "completed", "position_at"),
+                )
+            },
+        }
+
+    def advance(self, now, observed, observation_sequence, *, defer_events=False, selected_feedback=None):
+        if self._last_tick is None or self.complete:
+            return
+        if not math.isfinite(now) or now < self._last_tick or observation_sequence <= self._sequence:
+            raise ValueError("recovery clock/feedback sequence is invalid")
+        self.collect_feedback(now, observed, observation_sequence, selected_feedback=selected_feedback)
+        next_progress = round(self.elapsed_s + min(now - self._last_tick, self._frame_s), 9)
+        if self.elapsed_s < 2 <= next_progress:
+            self._qualify_start(now)
+        if self.definition.mode == "confirm":
+            for cycle, boundary in ((1, 9), (2, 16)):
+                if self.elapsed_s < boundary <= next_progress:
+                    self._qualify_recovery_cycle(cycle, now)
         if next_progress >= self.duration_s:
             self._qualify_final(now)
         ScriptedLeaderInput.advance(self, now, observed, observation_sequence, defer_events=defer_events)

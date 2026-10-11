@@ -34,6 +34,7 @@ from lerobot.utils.decorators import check_if_already_connected, check_if_not_co
 
 from ..robot import Robot
 from ..utils import ensure_safe_goal_position
+from .am1_elbow_integral import ELBOW as RECOVERY_ELBOW, AM1ElbowIntegralTrial
 from .am1_shoulder_integral import AM1ShoulderIntegralTrial
 from .config_alohamini import AlohaMiniConfig
 from .lift_axis import LiftAxis, LiftAxisConfig, LiftHomeResult
@@ -475,18 +476,34 @@ class AlohaMini(Robot):
         # Aloha Mini 1's established motor Phase must remain untouched, so apply the
         # same runtime delay/acceleration profile explicitly without reading or writing Phase.
         for name in bus.motors:
+            if bus is getattr(self, "left_bus", None) and name == RECOVERY_ELBOW and getattr(self, "_am1_elbow_integral_trial", None) is not None:
+                continue  # The selected trial preserves its actual baseline settings.
             write_register(bus, "Return_Delay_Time", name, 0)
             write_register(bus, "Maximum_Acceleration", name, 254)
             write_register(bus, "Acceleration", name, 254)
 
     def configure(self) -> None:
         """Configure motor modes and gains while leaving all torque disabled."""
-        set_torque_enabled(self.left_bus, self.left_bus.motors, enabled=False)
+        previous_elbow = getattr(self, "_am1_elbow_integral_trial", None)
+        if previous_elbow is not None:
+            previous_elbow.restore(self)
+        integral = AM1ElbowIntegralTrial.requested_integral()
+        elbow_trial = None
+        if integral is not None:
+            elbow_trial = AM1ElbowIntegralTrial(integral=integral)
+            self._am1_elbow_integral_trial = elbow_trial
+            elbow_trial.prepare(self)
+            elbow_trial.disable_torque(self)
+        else:
+            self._am1_elbow_integral_trial = None
+        set_torque_enabled(self.left_bus, [n for n in self.left_bus.motors if elbow_trial is None or n != RECOVERY_ELBOW], enabled=False)
         previous_trial = getattr(self, "_am1_shoulder_integral_trial", None)
         if previous_trial is not None:
             previous_trial.restore(self)
         self._configure_bus_defaults(self.left_bus)
         for name in self.left_arm_motors:
+            if elbow_trial is not None and name == RECOVERY_ELBOW:
+                continue
             write_register(self.left_bus, "Operating_Mode", name, OperatingMode.POSITION.value)
             # Preserve the existing Aloha Mini follower-arm PID profile.
             write_register(self.left_bus, "P_Coefficient", name, 16)
@@ -510,6 +527,8 @@ class AlohaMini(Robot):
         # Retain the trial before its first write, including partially applied failures.
         self._am1_shoulder_integral_trial = AM1ShoulderIntegralTrial()
         self._am1_shoulder_integral_trial.configure(self)
+        if elbow_trial is not None:
+            elbow_trial.apply(self)
 
     def _seed_arm_goals(self, bus: FeetechMotorsBus, motors: list[str]) -> None:
         present_positions = {
@@ -694,6 +713,9 @@ class AlohaMini(Robot):
                     for name in names:
                         self._require_am1_activation_fresh("after_home")
                         set_torque_enabled(bus, (name,), enabled=True)
+            elbow_trial = getattr(self, "_am1_elbow_integral_trial", None)
+            if elbow_trial is not None:
+                elbow_trial.verify_active(self)
         except BaseException as error:
             cleanup_errors = self._safe_shutdown(close_buses=True, recover_interrupted_bus_io=True)
             if isinstance(error, (KeyboardInterrupt, SystemExit)):
@@ -752,10 +774,20 @@ class AlohaMini(Robot):
                 continue
             for name in bus.motors:
                 try:
-                    set_torque_enabled(bus, (name,), enabled=False)
+                    elbow_trial = getattr(self, "_am1_elbow_integral_trial", None)
+                    if bus is self.left_bus and name == RECOVERY_ELBOW and elbow_trial is not None:
+                        elbow_trial.disable_torque(self)
+                    else:
+                        set_torque_enabled(bus, (name,), enabled=False)
                 except Exception as error:
                     errors.append(f"disable {bus_name}/{name}: {error}")
 
+        elbow_trial = getattr(self, "_am1_elbow_integral_trial", None)
+        if elbow_trial is not None:
+            try:
+                elbow_trial.restore(self)
+            except BaseException as error:
+                errors.append(f"restore AM1 selected elbow integral: {type(error).__name__}: {error}")
         integral_trial = getattr(self, "_am1_shoulder_integral_trial", None)
         if integral_trial is not None:
             try:
@@ -803,8 +835,11 @@ class AlohaMini(Robot):
                         row["read_completed_at_monotonic_s"] = time.monotonic()
             evidence["lift_readback"] = "qualified" if operation is not None and not errors else "unavailable-or-failed"
             evidence["selected_gain_restore_required"] = bool(
-                integral_trial is not None and integral_trial.restore_required
+                (integral_trial is not None and integral_trial.restore_required)
+                or (elbow_trial is not None and elbow_trial.restore_required)
             )
+            if elbow_trial is not None:
+                evidence["elbow_integral"] = elbow_trial.evidence
             evidence["completed_at_monotonic_s"] = time.monotonic()
             evidence["verified"] = not errors
 
@@ -1567,7 +1602,9 @@ class AlohaMini(Robot):
     def _selected_joint_evidence_active(self) -> bool:
         return bool(
             getattr(self, "_am1_selected_joint_evidence_enabled", False)
-            and getattr(self, "_am1_selected_joint_evidence_context", None) is not None
+            and (getattr(self, "_am1_selected_joint_evidence_context", None) is not None
+                 or (getattr(self, "_am1_elbow_integral_trial", None) is not None
+                     and self._am1_elbow_integral_trial.restore_required))
             and getattr(self.config, "robot_model", None) == "alohamini1"
         )
 
@@ -1585,6 +1622,9 @@ class AlohaMini(Robot):
                 "read_started_at_monotonic_s": selected_started,
                 "read_completed_at_monotonic_s": time.monotonic(),
             }
+            elbow_trial = getattr(self, "_am1_elbow_integral_trial", None)
+            if elbow_trial is not None and elbow_trial.restore_required:
+                elbow_trial.check_current(raw, float(limit_ma))
         right_curr_raw = {}
         if getattr(self, "right_bus", None):
             right_curr_raw = self.right_bus.sync_read("Present_Current", list(self.right_bus.motors.keys()))

@@ -47,6 +47,10 @@ class AM1SelectedJointEvidence:
         self.attempted = set()
         self.sparse_receipts = {}
         self.last_observation_id = -1
+        self.recovery_started_at = None
+        self.recovery_initial_raw = None
+        self.recovery_phase = None
+        self.recovery_peak = None
 
     def deactivate(self, robot):
         self.context = None
@@ -89,14 +93,30 @@ class AM1SelectedJointEvidence:
             # The literal shared file is projected into this motor owner too.
             # Ordinary and retained profiles do not acquire this dependency.
             from examples.alohamini.am1_session_contract import (
+                ELBOW_RECOVERY_DEFINITIONS,
                 LEFT_ELBOW_ORIGINAL_RETURN,
                 LEFT_ELBOW_RESPONSE,
             )
 
-            definitions = {d.profile: d for d in (LEFT_ELBOW_RESPONSE, LEFT_ELBOW_ORIGINAL_RETURN)}
+            definitions = {
+                d.profile: d
+                for d in (
+                    LEFT_ELBOW_RESPONSE,
+                    LEFT_ELBOW_ORIGINAL_RETURN,
+                    *ELBOW_RECOVERY_DEFINITIONS.values(),
+                )
+            }
             signed = definitions.get(profile)
             if signed is None or not signed.context_valid(metadata):
                 raise RuntimeError("Invalid selected joint signed profile context")
+            if profile in {d.profile for d in ELBOW_RECOVERY_DEFINITIONS.values()}:
+                recovery_binding = getattr(robot, "_am1_elbow_recovery_binding", None)
+                if not isinstance(recovery_binding, dict) or recovery_binding != {
+                    **binding,
+                    "recipe": signed.recipe_name,
+                    "integral": signed.integral,
+                }:
+                    raise RuntimeError("Selected recovery profile differs from its protected owner admission")
             calibration = robot.left_bus.calibration.get(MOTOR)
             if (
                 calibration is None
@@ -138,8 +158,13 @@ class AM1SelectedJointEvidence:
             or (phase not in ("baseline", "final") and cycle not in (1, 2))
         ):
             raise RuntimeError("Selected joint evidence phase and cycle differ")
-        original_return = signed is not None and signed.profile == "LeftElbowOriginalReturn"
-        if phase in ("baseline", "origin", "final") and requested != (endpoint if original_return and phase == "baseline" else reference):
+        original_return = signed is not None and (
+            signed.profile == "LeftElbowOriginalReturn"
+            or getattr(signed, "mode", None) in {"return", "dwell"}
+        )
+        if phase in ("baseline", "origin", "final") and requested != (
+            endpoint if original_return and phase == "baseline" else reference
+        ):
             raise RuntimeError("Selected joint origin phase differs from its frozen reference")
         if phase == "endpoint" and requested != endpoint:
             raise RuntimeError("Selected joint endpoint phase differs from its fixed target")
@@ -151,6 +176,8 @@ class AM1SelectedJointEvidence:
             if phase in ("endpoint", "origin")
             else None
         )
+        if signed is not None and hasattr(signed, "integral"):
+            expected_key = signed.sample_key(progress)
         if sample_key is not None and sample_key != expected_key:
             raise RuntimeError("Selected joint evidence sample key differs from its phase")
         for key in ("x.vel", "y.vel", "theta.vel", "lift_axis.vel"):
@@ -164,7 +191,7 @@ class AM1SelectedJointEvidence:
                 or (self.context is not None and self.context["phase"] == "final")
                 or self.endpoint != reference - 3
                 or endpoint != reference + 10
-                or progress < signed.decision_s
+                or progress < getattr(signed, "decision_s", float("inf"))
                 or cycle not in (3, 4)
             ):
                 raise RuntimeError("Selected joint evidence changed or reversed its frozen endpoint")
@@ -172,6 +199,131 @@ class AM1SelectedJointEvidence:
         self.progress, self.context = progress, copy.deepcopy(metadata)
         robot._am1_selected_joint_evidence_context = copy.deepcopy(metadata)
         return cleaned
+
+    def guard_recovery(self, robot, control, observation):
+        """Bound the selected admission on every ordinary owner tick, including holds."""
+        del observation
+        binding = getattr(robot, "_am1_elbow_recovery_binding", None)
+        if binding is None:
+            return
+        from examples.alohamini.am1_session_contract import ELBOW_RECOVERY_DEFINITIONS
+
+        definition = (
+            ELBOW_RECOVERY_DEFINITIONS.get(binding.get("recipe")) if isinstance(binding, dict) else None
+        )
+        if (
+            definition is None
+            or not self.enabled
+            or control.binding is None
+            or binding
+            != {**control.binding, "recipe": definition.recipe_name, "integral": definition.integral}
+        ):
+            raise RuntimeError("Recovery owner binding is unavailable or differs")
+        now = self.clock()
+        if self.recovery_started_at is None and control.state in {"paused", "active"} and control.epoch >= 0:
+            self.recovery_started_at = now
+        if self.recovery_started_at is not None and now - self.recovery_started_at >= definition.live_s:
+            raise RuntimeError("Recovery 60-second native Live ceiling expired")
+        current = getattr(robot, "_am1_selected_joint_current", None)
+        position = getattr(robot, "_am1_selected_joint_position", None)
+        for cache in (position, current):
+            if (
+                not isinstance(cache, dict)
+                or not all(
+                    _number(cache.get(k))
+                    for k in ("read_started_at_monotonic_s", "read_completed_at_monotonic_s")
+                )
+                or not 0
+                <= cache["read_started_at_monotonic_s"]
+                <= cache["read_completed_at_monotonic_s"]
+                <= now
+                or now - cache["read_started_at_monotonic_s"] > 0.5
+            ):
+                raise RuntimeError("Recovery native original position/current acquisition is unavailable")
+        if not _number(current.get("ma")) or abs(current["ma"]) >= definition.current_cap_ma:
+            raise RuntimeError("Recovery selected software effort ceiling reached")
+        raw = position.get("raw")
+        calibration = robot.left_bus.calibration.get(MOTOR)
+        if (
+            type(raw) is not int
+            or calibration is None
+            or not calibration.range_min <= raw <= calibration.range_max
+        ):
+            raise RuntimeError("Recovery native position exceeds its calibration")
+        if self.recovery_initial_raw is None:
+            self.recovery_initial_raw = raw
+        initial = self.recovery_initial_raw
+        if definition.mode in {"return", "dwell"}:
+            target = 2472
+            distance = (target - initial) / (calibration.range_max - calibration.range_min) * 200
+            if not 0 <= distance <= 3 or not initial - 2 <= raw <= target + 2:
+                raise RuntimeError("Recovery native position left its measured-start target corridor")
+        else:
+            excursion = math.ceil((calibration.range_max - calibration.range_min) * 3 / 200)
+            if abs(raw - initial) > excursion + 2:
+                raise RuntimeError("Recovery native position left its frozen confirmation corridor")
+        context = self.context
+        if context is None or control.state != "active":
+            return
+        direction = None
+        if context["phase"] in {"outbound", "endpoint"}:
+            direction = 1 if context["endpoint_target"] > context["reference"] else -1
+        elif context["phase"] in {"return", "origin"}:
+            direction = 1 if definition.mode in {"return", "dwell"} else -1
+        if direction is not None:
+            phase = (context["cycle"], direction)
+            if phase != self.recovery_phase:
+                self.recovery_phase, self.recovery_peak = phase, raw
+            if direction * (raw - self.recovery_peak) < -2:
+                raise RuntimeError("Recovery native position reversed or oscillated against the approach")
+            self.recovery_peak = (
+                max(self.recovery_peak, raw) if direction > 0 else min(self.recovery_peak, raw)
+            )
+
+    @staticmethod
+    def recovery_gain_proof(robot):
+        """Expose bounded actual settings, keeping the durable write ledger private."""
+        trial = getattr(robot, "_am1_elbow_integral_trial", None)
+        if trial is None:
+            return None
+        evidence = trial.evidence
+        keys = (
+            "schema_version",
+            "state",
+            "status",
+            "restore_required",
+            "integral",
+            "binding",
+            "motor",
+            "motor_id",
+            "motor_model",
+            "cached_calibration",
+            "original_registers",
+            "original_bytes",
+            "active_registers",
+            "active_bytes",
+            "active_verified",
+            "active_verified_at_monotonic_s",
+            "first_failure",
+        )
+        proof = {key: copy.deepcopy(evidence[key]) for key in keys if key in evidence}
+        rows = [
+            row
+            for row in evidence.get("events", [])
+            if isinstance(row, dict)
+            and row.get("phase") == "baseline"
+            and row.get("operation") == "read"
+            and _number(row.get("started_at_monotonic_s"))
+            and _number(row.get("completed_at_monotonic_s"))
+        ]
+        if rows:
+            proof["original_read_window"] = {
+                "started_at_monotonic_s": min(row["started_at_monotonic_s"] for row in rows),
+                "completed_at_monotonic_s": max(row["completed_at_monotonic_s"] for row in rows),
+            }
+        if len(json.dumps(proof, allow_nan=False, separators=(",", ":")).encode()) > 4096:
+            raise RuntimeError("Recovery actual gain proof exceeds its bounded feedback frame")
+        return proof
 
     def _base(self, robot, control, marker):
         bus, motor = robot.left_bus, robot.left_bus.motors[MOTOR]
@@ -197,6 +349,11 @@ class AM1SelectedJointEvidence:
                 },
             },
             "action": copy.deepcopy(getattr(robot, "_am1_selected_joint_action", None)),
+            **(
+                {"gain_trial": self.recovery_gain_proof(robot)}
+                if getattr(robot, "_am1_elbow_integral_trial", None) is not None
+                else {}
+            ),
         }
 
     def _decoded(self, bus, payload):

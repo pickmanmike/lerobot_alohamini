@@ -6,13 +6,17 @@ import threading
 import time
 
 from examples.alohamini.am1_finite_task import JOINT_KEYS
-from examples.alohamini.am1_session_contract import LEFT_ELBOW_ORIGINAL_RETURN, LEFT_ELBOW_RESPONSE
+from examples.alohamini.am1_session_contract import (
+    ELBOW_RECOVERY_DEFINITIONS,
+    LEFT_ELBOW_ORIGINAL_RETURN,
+    LEFT_ELBOW_RESPONSE,
+)
 
 FEEDBACK_MAX_AGE_S = 1.0  # Existing AM1 Local original request/acquisition contract.
 ZERO_BODY = {"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0, "lift_axis.vel": 0}
 
 
-def load_elbow_return_reference(config):
+def load_elbow_return_reference(config, *, definition=LEFT_ELBOW_ORIGINAL_RETURN):
     """Read one exact private archived proof; it supplies no browser parameters."""
     import hashlib
     import os
@@ -31,14 +35,16 @@ def load_elbow_return_reference(config):
     descriptor = os.open(spec["path"], os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     with os.fdopen(descriptor, "rb") as stream:
         info = os.fstat(stream.fileno())
-        if not stat.S_ISREG(info.st_mode) or info.st_size > 16384 or (
-            os.name == "posix" and (info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_size > 16384
+            or (os.name == "posix" and (info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077))
         ):
             raise ValueError("owned private small regular elbow return reference required")
         raw = stream.read(16385)
     if hashlib.sha256(raw).hexdigest() != spec["sha256"]:
         raise ValueError("elbow return reference content hash differs")
-    value = LEFT_ELBOW_ORIGINAL_RETURN.validate_artifact(strict_json(raw))
+    value = definition.validate_artifact(strict_json(raw))
     if value["admission_motor_head"] != config.get("host_head"):
         raise ValueError("elbow return reference admission motor source differs")
     return copy.deepcopy(value)
@@ -85,12 +91,20 @@ def read_physical_sample(client, run_id, host_incarnation, previous_sequence, *,
         raise ValueError("invalid actual arm feedback")
     selected = marker.get("selected_joint")
     if selected is not None:
-        if not isinstance(selected, dict) or type(selected.get("version")) is not int or selected["version"] != 1:
+        if (
+            not isinstance(selected, dict)
+            or type(selected.get("version")) is not int
+            or selected["version"] != 1
+        ):
             raise ValueError("invalid selected native feedback")
         fields = {
-            "run_id": run_id, "host_incarnation": host_incarnation, "epoch": marker.get("epoch"),
-            "intent_revision": marker.get("intent_revision"), "action_sequence": marker.get("accepted_action_sequence"),
-            "observation_id": sequence, "acquired_at_monotonic_s": completed,
+            "run_id": run_id,
+            "host_incarnation": host_incarnation,
+            "epoch": marker.get("epoch"),
+            "intent_revision": marker.get("intent_revision"),
+            "action_sequence": marker.get("accepted_action_sequence"),
+            "observation_id": sequence,
+            "acquired_at_monotonic_s": completed,
         }
         if any(selected.get(k) != v or type(selected.get(k)) is not type(v) for k, v in fields.items()):
             raise ValueError("foreign selected native feedback binding")
@@ -139,10 +153,15 @@ class PhysicalExecutor:
     source = "protected-physical-provider"
     asynchronous = True
     restart_cleanup = "physical_cleanup_unknown_after_restart"
-    selected_joint_recipes = frozenset({
-        "physical-left-elbow-compare", "physical-left-elbow-dwell-compare", LEFT_ELBOW_RESPONSE.recipe_name,
-        LEFT_ELBOW_ORIGINAL_RETURN.recipe_name,
-    })
+    selected_joint_recipes = frozenset(
+        {
+            "physical-left-elbow-compare",
+            "physical-left-elbow-dwell-compare",
+            LEFT_ELBOW_RESPONSE.recipe_name,
+            LEFT_ELBOW_ORIGINAL_RETURN.recipe_name,
+            *ELBOW_RECOVERY_DEFINITIONS,
+        }
+    )
     recipes = (
         frozenset({"physical-arm-smoke", "physical-arm-smoke-repeat", "physical-arm-hold-body"})
         | selected_joint_recipes
@@ -158,11 +177,21 @@ class PhysicalExecutor:
         self.config = copy.deepcopy(config)
         self.return_reference = None
         self.return_reference_error = None
+        self.recovery_reference = None
+        self.recovery_prerequisite = None
         if "elbow_return_reference" in config:
             try:
                 self.return_reference = load_elbow_return_reference(config)
             except (ValueError, OSError) as error:
                 self.return_reference_error = str(error)
+            try:
+                self.recovery_reference = load_elbow_return_reference(
+                    config,
+                    definition=next(iter(ELBOW_RECOVERY_DEFINITIONS.values())),
+                )
+            except (ValueError, OSError) as error:
+                if self.return_reference is None:
+                    self.return_reference_error = str(error)
         self.observation = observation
         self.observation.require_owned_session = True
         self.clock = clock
@@ -201,8 +230,27 @@ class PhysicalExecutor:
         self._reconciliation_worker = None
 
     def supports(self, recipe):
-        return (recipe.name in self.recipes and recipe.seed is None and recipe.mode == "finite"
-                and (recipe.name != LEFT_ELBOW_ORIGINAL_RETURN.recipe_name or self.return_reference is not None))
+        return (
+            recipe.name in self.recipes
+            and recipe.seed is None
+            and recipe.mode == "finite"
+            and (recipe.name != LEFT_ELBOW_ORIGINAL_RETURN.recipe_name or self.return_reference is not None)
+            and (recipe.name not in ELBOW_RECOVERY_DEFINITIONS or self.recovery_reference is not None)
+        )
+
+    def set_recovery_prerequisite(self, proof):
+        """The native authority supplies its retained prior run, never browser parameters."""
+        with self.mutex:
+            if self.worker and self.worker.is_alive():
+                raise RuntimeError("Recovery prerequisite cannot change during an active owner")
+            self.recovery_prerequisite = copy.deepcopy(proof)
+
+    def _reference_for_recipe(self):
+        return (
+            self.recovery_reference
+            if self.recipe and self.recipe.name in ELBOW_RECOVERY_DEFINITIONS
+            else self.return_reference
+        )
 
     def sensing_metadata(self):
         return {
@@ -214,7 +262,10 @@ class PhysicalExecutor:
             "feedback_provenance": "protected-host/measured-feedback",
             "ack_provenance": "protected-host/action-epoch-feedback-not-servo-ack",
             "backend_contract": copy.deepcopy(self.config),
-            "retained_return_reference": copy.deepcopy(self.return_reference),
+            "retained_return_reference": copy.deepcopy(
+                self._reference_for_recipe() or self.recovery_reference
+            ),
+            "recovery_prerequisite": copy.deepcopy(self.recovery_prerequisite),
             "return_reference_error": self.return_reference_error,
             "gain_recipes": {
                 "physical-arm-smoke": "selected-shoulder-i1-with-verified-i0-restore",
@@ -503,7 +554,17 @@ class PhysicalExecutor:
 
         io = None
         try:
-            if self.recipe.name == LEFT_ELBOW_ORIGINAL_RETURN.recipe_name and load_elbow_return_reference(self.config) != self.return_reference:
+            definition = ELBOW_RECOVERY_DEFINITIONS.get(self.recipe.name, LEFT_ELBOW_ORIGINAL_RETURN)
+            loaded = (
+                load_elbow_return_reference(self.config, definition=definition)
+                if self.recipe.name in ELBOW_RECOVERY_DEFINITIONS
+                else load_elbow_return_reference(self.config)
+                if self.recipe.name == LEFT_ELBOW_ORIGINAL_RETURN.recipe_name
+                else None
+            )
+            if self.recipe.name in {LEFT_ELBOW_ORIGINAL_RETURN.recipe_name, *ELBOW_RECOVERY_DEFINITIONS} and (
+                loaded != self._reference_for_recipe()
+            ):
                 raise ValueError("frozen elbow return reference changed before IO")
             factory = self.io_factory or ProtectedHostRun
             io = factory(self.config)
@@ -614,9 +675,22 @@ class PhysicalExecutor:
                                 self.config["shoulder_amplitude"],
                                 start_held=True,
                                 feedback_provenance="protected-host/measured-feedback",
-                                **({"return_reference": self.return_reference,
-                                    "reference_sha256": self.config["elbow_return_reference"]["sha256"]}
-                                   if self.recipe.name == LEFT_ELBOW_ORIGINAL_RETURN.recipe_name else {}),
+                                **(
+                                    {
+                                        "return_reference": self._reference_for_recipe(),
+                                        "reference_sha256": self.config["elbow_return_reference"]["sha256"],
+                                    }
+                                    if self.recipe.name
+                                    in {LEFT_ELBOW_ORIGINAL_RETURN.recipe_name, *ELBOW_RECOVERY_DEFINITIONS}
+                                    else {}
+                                ),
+                                **(
+                                    {"recovery_comparator": copy.deepcopy(self.recovery_prerequisite)}
+                                    if self.recipe.name in ELBOW_RECOVERY_DEFINITIONS
+                                    and ELBOW_RECOVERY_DEFINITIONS[self.recipe.name].integral == 1
+                                    and ELBOW_RECOVERY_DEFINITIONS[self.recipe.name].mode == "return"
+                                    else {}
+                                ),
                             )
                             self._execution = dict(self.task.snapshot(), fault=None)
                     if self.task:
@@ -639,11 +713,21 @@ class PhysicalExecutor:
                                     # completion. Re-acknowledge its original return, never restart
                                     # or rebase the finite provider, before holding again.
                                     for key, origin in self.task.original_seed.items():
-                                        if self.recipe.name == LEFT_ELBOW_ORIGINAL_RETURN.recipe_name and key == LEFT_ELBOW_ORIGINAL_RETURN.joint:
-                                            origin = self.task.provider.retained_return["reference_normalized"]
+                                        if (
+                                            self.recipe.name == LEFT_ELBOW_ORIGINAL_RETURN.recipe_name
+                                            and key == LEFT_ELBOW_ORIGINAL_RETURN.joint
+                                        ):
+                                            origin = self.task.provider.retained_return[
+                                                "reference_normalized"
+                                            ]
                                         limit = (
                                             1.0
-                                            if self.task.profile in {"ArmHoldBody", LEFT_ELBOW_RESPONSE.profile, LEFT_ELBOW_ORIGINAL_RETURN.profile}
+                                            if self.task.profile
+                                            in {
+                                                "ArmHoldBody",
+                                                LEFT_ELBOW_RESPONSE.profile,
+                                                LEFT_ELBOW_ORIGINAL_RETURN.profile,
+                                            }
                                             else self.task.joint_amplitudes[key]
                                         )
                                         if abs(self.sample["positions"][key] - origin) > limit:
@@ -879,7 +963,9 @@ class ProtectedHostRun:
 
     def start(self, run_id, incarnation, recipe, cancel):
         if recipe.name == LEFT_ELBOW_ORIGINAL_RETURN.recipe_name:
-            load_elbow_return_reference(self.config)  # Refuse before source checks, camera or host construction.
+            load_elbow_return_reference(self.config)  # Preserve the old strict pre-IO interface.
+        elif recipe.name in ELBOW_RECOVERY_DEFINITIONS:
+            load_elbow_return_reference(self.config, definition=ELBOW_RECOVERY_DEFINITIONS[recipe.name])
         import os
         from pathlib import Path
 
@@ -941,7 +1027,13 @@ class ProtectedHostRun:
         env["AM1_SYNC_SHOULDER_READBACK"] = "1"
         env["AM1_LEFT_SHOULDER_EVIDENCE"] = "1"
         # Never carry the arm-only selected integral experiment into the body recipe.
-        for k in ("AM1_SHOULDER_INTEGRAL_TEST", "AM1_SCRIPTED_PREPARE", "AM1_SELECTED_JOINT_EVIDENCE"):
+        for k in (
+            "AM1_SHOULDER_INTEGRAL_TEST",
+            "AM1_SCRIPTED_PREPARE",
+            "AM1_SELECTED_JOINT_EVIDENCE",
+            "AM1_ELBOW_RECOVERY",
+            "AM1_ELBOW_RECOVERY_RECIPE",
+        ):
             env.pop(k, None)
         if recipe.name in ("physical-arm-smoke", "physical-arm-smoke-repeat"):
             env["AM1_SHOULDER_INTEGRAL_TEST"] = "1"
@@ -951,6 +1043,9 @@ class ProtectedHostRun:
                 env.pop(k, None)
             env["AM1_SCRIPTED_PREPARE"] = "1"
             env["AM1_SELECTED_JOINT_EVIDENCE"] = "1"
+        if recipe.name in ELBOW_RECOVERY_DEFINITIONS:
+            env["AM1_ELBOW_RECOVERY"] = f"I{ELBOW_RECOVERY_DEFINITIONS[recipe.name].integral}"
+            env["AM1_ELBOW_RECOVERY_RECIPE"] = recipe.name
         self.host_log = (self.run_directory / "host-launch.log").open("xb")
         host_command = [
             self.config["host_python"],
@@ -987,6 +1082,8 @@ class ProtectedHostRun:
                 "AM1_SHOULDER_INTEGRAL_TEST",
                 "AM1_SCRIPTED_PREPARE",
                 "AM1_SELECTED_JOINT_EVIDENCE",
+                "AM1_ELBOW_RECOVERY",
+                "AM1_ELBOW_RECOVERY_RECIPE",
             )
             if k in env
         }

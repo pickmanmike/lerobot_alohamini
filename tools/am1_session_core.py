@@ -12,6 +12,7 @@ from collections import deque
 from pathlib import Path
 
 from examples.alohamini.am1_session_contract import (
+    ELBOW_RECOVERY_DEFINITIONS,
     LEFT_ELBOW_ORIGINAL_RETURN,
     LEFT_ELBOW_RESPONSE,
     RECIPES,
@@ -333,12 +334,39 @@ class SessionAuthority:
             backend = evidence.get("backend_contract")
             spec = backend.get("elbow_return_reference") if isinstance(backend, dict) else None
             reference = evidence.get("retained_return_reference")
-            if not isinstance(spec, dict) or not isinstance(reference, dict) or reference.get("admission_motor_head") != backend.get("host_head"):
+            if (
+                not isinstance(spec, dict)
+                or not isinstance(reference, dict)
+                or reference.get("admission_motor_head") != backend.get("host_head")
+            ):
                 return None
             expected = LEFT_ELBOW_ORIGINAL_RETURN.completion_expectation(
-                execution, reference, spec.get("sha256"),
+                execution,
+                reference,
+                spec.get("sha256"),
             )
             if expected is None:
+                return None
+            duration, cycles, returns = expected
+        elif run["recipe"] in ELBOW_RECOVERY_DEFINITIONS:
+            definition = ELBOW_RECOVERY_DEFINITIONS[run["recipe"]]
+            backend = evidence.get("backend_contract")
+            spec = backend.get("elbow_return_reference") if isinstance(backend, dict) else None
+            reference = evidence.get("retained_return_reference")
+            if (
+                not isinstance(spec, dict)
+                or not isinstance(reference, dict)
+                or reference.get("admission_motor_head") != backend.get("host_head")
+            ):
+                return None
+            expected = definition.completion_expectation(execution, reference, spec.get("sha256"))
+            gain = execution.get("recovery", {}).get("gain_trial")
+            if expected is None or not definition.gain_trial_valid(
+                gain,
+                run_id=run["run_id"],
+                host_incarnation=incarnation,
+                now=receipt.get("completed_at_monotonic_s"),
+            ):
                 return None
             duration, cycles, returns = expected
         elif run["recipe"] in {"physical-left-elbow-compare", "physical-left-elbow-dwell-compare"}:
@@ -380,13 +408,39 @@ class SessionAuthority:
         if run["recipe"] == LEFT_ELBOW_ORIGINAL_RETURN.recipe_name:
             from examples.alohamini.am1_finite_task import JOINT_KEYS
 
-            raw = LEFT_ELBOW_ORIGINAL_RETURN.encoded_goal(positions.get(LEFT_ELBOW_ORIGINAL_RETURN.joint), reference["calibration"])
+            raw = LEFT_ELBOW_ORIGINAL_RETURN.encoded_goal(
+                positions.get(LEFT_ELBOW_ORIGINAL_RETURN.joint), reference["calibration"]
+            )
             window = execution["retained_return"]["final_window"]
-            if (set(seed) != set(JOINT_KEYS)
-                or raw is None or abs(raw - reference["reference_raw"]) > 2
-                or min(window["first_current_started_at"], window["first_position_started_at"]) < run["native_live_at"]
+            if (
+                set(seed) != set(JOINT_KEYS)
+                or raw is None
+                or abs(raw - reference["reference_raw"]) > 2
+                or min(window["first_current_started_at"], window["first_position_started_at"])
+                < run["native_live_at"]
                 or window["qualified_at_monotonic_s"] > completed
-                or any(abs(positions[k] - v) > 1 for k, v in seed.items() if k != LEFT_ELBOW_ORIGINAL_RETURN.joint)):
+                or any(
+                    abs(positions[k] - v) > 1
+                    for k, v in seed.items()
+                    if k != LEFT_ELBOW_ORIGINAL_RETURN.joint
+                )
+            ):
+                return None
+        if run["recipe"] in ELBOW_RECOVERY_DEFINITIONS:
+            from examples.alohamini.am1_finite_task import JOINT_KEYS
+
+            outcome = execution["recovery"]
+            window = outcome["final_window"]
+            raw = definition.encoded_goal(positions.get(definition.joint), reference["calibration"])
+            if (
+                set(seed) != set(JOINT_KEYS)
+                or raw is None
+                or min(window["first_current_started_at"], window["first_position_started_at"])
+                < run["native_live_at"]
+                or window["qualified_at_monotonic_s"] > completed
+                or abs(raw - outcome["reference_raw"]) > outcome["final_return_residual_raw"]
+                or any(abs(positions[k] - v) > 1 for k, v in seed.items() if k != definition.joint)
+            ):
                 return None
         fields = (
             "run_id",
@@ -518,6 +572,159 @@ class SessionAuthority:
         self._hold()
         self._event(status)
         self._save()
+
+    def elbow_recovery_prerequisite(self, recipe, evidence):
+        """Qualify only this authority's retained native result before replacing its run."""
+        definition = ELBOW_RECOVERY_DEFINITIONS.get(recipe.name)
+        previous = self.run
+        if definition is None or not isinstance(previous, dict):
+            return None
+        old = ELBOW_RECOVERY_DEFINITIONS.get(previous.get("recipe"))
+        try:
+            from tools.am1_physical_executor import qualified_cleanup_receipt
+
+            receipt = previous.get("completion_receipt")
+            lifecycle = previous.get("physical_result")
+            execution = previous.get("execution")
+            reference = previous.get("retained_return_reference")
+            spec = previous.get("backend_contract", {}).get("elbow_return_reference", {})
+            if (
+                old is None
+                or previous.get("source") != "protected-physical-provider"
+                or previous.get("status") != "completed"
+                or previous.get("uncertain") is not False
+                or previous.get("cleanup") != "physical_readback_verified"
+                or previous.get("first_cause") is not None
+                or not isinstance(receipt, dict)
+                or not isinstance(lifecycle, dict)
+                or evidence.get("lifecycle") != lifecycle
+                or lifecycle.get("phase") != "terminal"
+                or lifecycle.get("terminal_status") != "completed"
+                or lifecycle.get("uncertain") is not False
+                or lifecycle.get("cleanup_errors") != []
+                or lifecycle.get("first_cause") is not None
+                or receipt.get("run_id") != previous["run_id"]
+                or receipt.get("recipe") != old.recipe_name
+                or receipt.get("execution") != execution
+                or receipt.get("host_incarnation") != previous.get("backend_incarnation")
+                or lifecycle.get("run_id") != previous["run_id"]
+                or lifecycle.get("backend_incarnation") != receipt["host_incarnation"]
+                or old.completion_expectation(execution, reference, spec.get("sha256")) is None
+                or not qualified_cleanup_receipt(
+                    lifecycle.get("readback"), previous["run_id"], receipt["host_incarnation"]
+                )
+            ):
+                return None
+            motor_receipt = lifecycle["readback"]
+            readback = motor_receipt.get("readback")
+            camera = lifecycle.get("camera_release")
+            release = camera.get("release_evidence") if isinstance(camera, dict) else None
+            if (
+                type(motor_receipt.get("version")) is not int
+                or not isinstance(readback, dict)
+                or readback.get("buses_closed") is not True
+                or readback.get("verified") is not True
+                or readback.get("cleanup_errors") != []
+                or readback.get("selected_gain_restore_required") is not False
+                or not isinstance(camera, dict)
+                or type(camera.get("version")) is not int
+                or camera["version"] != 1
+                or camera.get("session_id") != previous["run_id"]
+                or camera.get("state") != "released"
+                or camera.get("errors") != []
+                or camera.get("runtime_failed") is not False
+                or not isinstance(release, dict)
+                or type(release.get("backend_returncode")) is not int
+                or release["backend_returncode"] != 0
+                or any(
+                    release.get(k) is not True
+                    for k in (
+                        "backend_exited",
+                        "readers_joined",
+                        "viewer_socket_closed",
+                        "runtime_config_removed",
+                    )
+                )
+            ):
+                return None
+            gain = execution["recovery"].get("gain_trial")
+            if not old.gain_trial_valid(
+                gain,
+                run_id=previous["run_id"],
+                host_incarnation=receipt["host_incarnation"],
+                now=receipt["completed_at_monotonic_s"],
+            ):
+                return None
+            restored = lifecycle["readback"]["readback"].get("elbow_integral")
+            if (
+                not isinstance(restored, dict)
+                or restored.get("state") != "restored"
+                or restored.get("restore_required") is not False
+                or restored.get("binding") != gain["binding"]
+                or type(restored.get("restored_integral_readback")) is not int
+                or restored["restored_integral_readback"] != 0
+                or type(restored.get("restored_lock_readback")) is not int
+                or restored["restored_lock_readback"] != gain["original_registers"]["Lock"]
+                or restored.get("first_failure") is not None
+            ):
+                return None
+            outcome = execution["recovery"]
+            # Directed partial recovery is a separate question from the old half-excursion benchmark.
+            useful = outcome["max_toward_target_raw"] >= outcome["baseline_noise_raw"] + 3
+            if definition.mode == "confirm":
+                eligible = (
+                    old.mode == "return"
+                    and old.integral == definition.integral
+                    and useful
+                    and outcome["target_attained"]
+                )
+            elif definition.hold_s == 2:
+                eligible = (
+                    (
+                        old.mode == "return"
+                        and old.integral == 1
+                        and old.hold_s == 0.5
+                        and useful
+                        and outcome["target_attained"] is False
+                    )
+                    if definition.integral == 0
+                    else (
+                        old.mode == "return"
+                        and old.integral == 0
+                        and old.hold_s == 2
+                        and isinstance(previous.get("recovery_prerequisite"), dict)
+                        and previous["recovery_prerequisite"].get("integral") == 1
+                        and previous["recovery_prerequisite"].get("hold_s") == 0.5
+                    )
+                )
+            else:
+                eligible = old.mode == "return" and old.integral == 0 and old.hold_s == 0.5
+            if not eligible:
+                return None
+            from examples.alohamini.am1_finite_task import JOINT_KEYS
+
+            initial = execution.get("initial_measured_reference")
+            if (
+                not isinstance(initial, dict)
+                or set(initial) != set(JOINT_KEYS)
+                or not all(type(v) in (int, float) and math.isfinite(v) for v in initial.values())
+            ):
+                return None
+            digest = hashlib.sha256(
+                json.dumps(previous, sort_keys=True, allow_nan=False, separators=(",", ":")).encode()
+            ).hexdigest()
+            return {
+                "run_id": previous["run_id"],
+                "host_incarnation": receipt["host_incarnation"],
+                "proof_sha256": digest,
+                "initial_measured_reference": json.loads(json.dumps(initial)),
+                "calibration": json.loads(json.dumps(outcome["calibration"])),
+                "trajectory_s": old.trajectory_s,
+                "hold_s": old.hold_s,
+                "integral": old.integral,
+            }
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return None
 
     def handle(self, command, device_id):
         with self.mutex:
@@ -666,6 +873,28 @@ class SessionAuthority:
             ):
                 self._hold()
                 return self._refuse("fresh qualified feedback/proof and acknowledgement required")
+            recovery_prerequisite = None
+            recovery_definition = ELBOW_RECOVERY_DEFINITIONS.get(recipe.name)
+            if recovery_definition is not None:
+                first_i0 = (
+                    recovery_definition.integral == 0
+                    and recovery_definition.mode == "return"
+                    and recovery_definition.hold_s == 0.5
+                )
+                if not first_i0:
+                    recovery_prerequisite = self.elbow_recovery_prerequisite(recipe, evidence)
+                    if recovery_prerequisite is None:
+                        return self._refuse(
+                            "recovery comparison requires its own qualified native prior outcome and restored settings"
+                        )
+                setter = getattr(self.executor, "set_recovery_prerequisite", None)
+                if callable(setter):
+                    try:
+                        setter(recovery_prerequisite)
+                    except RuntimeError as error:
+                        return self._refuse(str(error))
+                elif not first_i0:
+                    return self._refuse("recovery prerequisite requires the protected native executor")
             self.run = {
                 "run_id": str(uuid.uuid4()),
                 "operation_id": oid,
@@ -686,6 +915,8 @@ class SessionAuthority:
                 "service_incarnation": self.service_incarnation,
                 "started_wall": self.wall_clock(),
             }
+            if recovery_definition is not None:
+                self.run["recovery_prerequisite"] = recovery_prerequisite
             metadata = getattr(self.executor, "sensing_metadata", None)
             if metadata:
                 self.run.update(metadata())
@@ -1069,7 +1300,18 @@ class SessionAuthority:
                         ),
                         "evidence": self._evidence(),
                         "recipes": [
-                            name for name, recipe in RECIPES.items() if self.executor.supports(recipe)
+                            name
+                            for name, recipe in RECIPES.items()
+                            if self.executor.supports(recipe)
+                            and (
+                                name not in ELBOW_RECOVERY_DEFINITIONS
+                                or (
+                                    ELBOW_RECOVERY_DEFINITIONS[name].integral == 0
+                                    and ELBOW_RECOVERY_DEFINITIONS[name].mode == "return"
+                                    and ELBOW_RECOVERY_DEFINITIONS[name].hold_s == 0.5
+                                )
+                                or self.elbow_recovery_prerequisite(recipe, self._evidence()) is not None
+                            )
                         ],
                         "events": list(self.events),
                     }

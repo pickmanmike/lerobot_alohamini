@@ -1,4 +1,39 @@
-## Current AM1 elbow response continuation
+## Current AM1 current-pose recovery continuation
+
+For AM1-ELBOW-RECOVERY-03, the owner explicitly authorizes a NEW recovery experiment
+from the freshly measured position toward retained raw2472. Restoration is its
+outcome, not a prerequisite. The old2472±2 admission/return requirement remains
+binding only on the historical signed/original-return runs and their failed results.
+Do not rewrite those runs or request manual old-reference positioning.
+
+Reuse current motor25ea/helper0fe/executor3823/manifest b0be idle as the starting
+installation. Implement one owner-scoped selected-ID3 volatile I0/I1 return-only
+comparison with actual baseline, private restoration obligation before any write,
+verified torque0/Lock1, initial measured hold before enable, and verified original-I
+then original-Lock restoration on every exit. Preserve individual24/25, P/D, all
+device limits, calibration and hard-fault guards. Unknown restoration stays uncertain.
+The exact new I1 policy records subthreshold current rise over its finite hold;
+software current cap≤100mA, wrong-direction/instability and all ordinary guards remain.
+Use original2/3/.5 timing/60Live; a labelled≤2s hold comparison or≤2 small confirmation
+cycles is conditional on actual response and the packet's bounds, not automatic.
+Match actual poses/settings before calling1073 a matched I0 comparator; one fresh
+I0 is permitted only where missing baseline evidence requires it. Freeze other11
+measured targets and command body/lift zero after normal startup.
+
+Repair the actual P1 credential expiry using the existing trusted provisioning,
+validated chain/endpoint/time and explicit dependent reconciliation if its CA needs
+renewal. Never disable TLS/hostname checks or move clocks. Existing finite audio-off
+capture is advisory; useful pixels/visual limits are reported separately from motor
+proof. AM1 stays wireless, P1 advisory, AM2 unchanged, simulation default, no autoplay,
+no merge/retarget/force/history rewrite, no permanent gain, generic inspection or
+network redesign. Root alone operates physical hardware/capture and stages affected
+stopped owners after focused source/restore review and native verification.
+
+Durability retains its software fault-tolerance/connection/control/state/recovery
+meaning. Preserve88/352/352/body12 source-bound milestones, oldfailedreceipts, separate
+pins/privatepermissions and matchedrollback; no unchanged endurance campaign.
+
+## Historical AM1 elbow response continuation (superseded for new recovery03 only)
 
 For the explicitly invoked AM1-ELBOW-RESPONSE-02 continuation, the owner completed
 the requested power-off elbow inspection and found no apparent issue. Record that
