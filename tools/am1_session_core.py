@@ -318,8 +318,11 @@ class SessionAuthority:
         sequence = receipt.get("feedback_sequence")
         current_sequence = evidence.get("feedback_sequence")
         seed, positions = execution.get("original_seed"), receipt.get("measured_positions")
-        returns = 4 if run["recipe"].endswith("-repeat") else 1
-        cycles = returns if "arm-smoke" in run["recipe"] else 0
+        if run["recipe"] in {"physical-left-elbow-compare", "physical-left-elbow-dwell-compare"}:
+            returns, cycles = 1, 2
+        else:
+            returns = 4 if run["recipe"].endswith("-repeat") else 1
+            cycles = returns if "arm-smoke" in run["recipe"] else 0
         if not (
             all(type(value) in (int, float) and math.isfinite(value) for value in (acquired, completed))
             and run["native_live_at"] <= acquired <= completed <= now < run["deadline"]
