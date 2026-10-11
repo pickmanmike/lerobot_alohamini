@@ -1,3 +1,33 @@
+## Current AM1 motion quality and durability scope
+
+For the explicitly invoked AM1-MOTION-QUALITY-01 continuation, retain the accepted
+bounded physical continuity milestones at their recorded sources. Durability means
+software fault tolerance, connection and control continuity, state preservation,
+and recovery with minimal human intervention; it does not mean physical wear or
+mechanical lifespan. Assess these dimensions separately from useful joint response.
+No hardware-endurance campaign or unchanged full-workload rerun is included.
+
+Begin with left follower elbow ID3 using existing finite virtual control, the sole
+protected motor owner and real local-camera-required observation; AM1 stays wireless
+and P1 is advisory. Resolve the demonstrated target/encoding/write/readback/response
+layer with a short selected-joint comparison: one frozen reference, other eleven
+joint targets held, body zero, original 3/.5/3/.5-second timing, at most 30 trajectory
+and 60 Live seconds. A separately labelled dwell comparison may use holds up to two
+seconds without increasing excursion, force, rate, gains or current limits.
+
+Use existing native samples and only missing sparse same-owner register evidence.
+Keep program completion, original return-envelope qualification and actual repeated
+outward/return motion as separate verdicts. Preserve prior failures, calibration,
+private permissions, ownership, protections, component-specific deployments and the
+unmerged PR20 -> PR19 -> PR18 -> PR17 -> PR16 stack. Root alone operates hardware.
+Reuse the existing staging, operation and analysis tools; stage only reviewed stopped
+affected owners. Leave a qualified candidate available idle through the existing
+opt-in route, with simulation default and matched rollback accessible. No merge,
+boot autoplay, network tuning, manual leader/shoulder action, AM2 changes, speculative
+motor tuning or additional architecture is authorized by this packet. Actual rewiring
+or mechanical adjustment requires power off and one specific human action only when
+the observed limitation requires it.
+
 ## Current AM1 lift startup and protected physical scope
 
 For the explicitly invoked AM1-LIFT-STARTUP-01 continuation, use the existing

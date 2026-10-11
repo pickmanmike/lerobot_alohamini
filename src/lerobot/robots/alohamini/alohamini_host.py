@@ -33,6 +33,7 @@ import zmq
 
 from .alohamini import AlohaMini
 from .config_alohamini import AlohaMiniConfig, AlohaMiniHostConfig
+from .selected_joint_evidence import MARKER as AM1_SELECTED_JOINT_EVIDENCE_KEY, AM1SelectedJointEvidence
 
 AM1_LOCAL_CONTROL_KEY = "_am1_local_control"
 AM1_LOCAL_FEEDBACK_KEY = "_am1_local_feedback"
@@ -41,7 +42,8 @@ AM1_LOCAL_FEEDBACK_KEY = "_am1_local_feedback"
 class AM1LocalControl:
     """AM1-only host-side pause latch on the existing motor-owner thread."""
 
-    def __init__(self, *, run_id: str | None = None, host_incarnation: str | None = None) -> None:
+    def __init__(self, *, run_id: str | None = None, host_incarnation: str | None = None,
+                 selected_evidence: AM1SelectedJointEvidence | None = None) -> None:
         if (run_id is None) != (host_incarnation is None):
             raise ValueError("AM1 protected control requires both run and host identity")
         self.binding = None if run_id is None else {
@@ -53,6 +55,7 @@ class AM1LocalControl:
         self.state = "ready"
         self.epoch = -1
         self.observation_id = 0
+        self.selected_evidence = selected_evidence
 
     def annotate(self, observation: dict, *, acquired_at: float | None = None) -> None:
         self.observation_id += 1
@@ -72,6 +75,8 @@ class AM1LocalControl:
             )
 
     def watchdog_stop(self, robot: AlohaMini) -> None:
+        if self.selected_evidence is not None:
+            self.selected_evidence.deactivate(robot)
         robot.stop_motion()
         if self.state == "active":
             robot.hold_follower_arms()
@@ -79,6 +84,10 @@ class AM1LocalControl:
             logging.warning("AM1 Local watchdog held follower arms at measured positions; epoch=%s", self.epoch)
 
     def apply(self, robot: AlohaMini, command: dict) -> bool:
+        if AM1_SELECTED_JOINT_EVIDENCE_KEY in command and (
+            self.selected_evidence is None or self.binding is None
+        ):
+            raise RuntimeError("Selected joint evidence requires the opted-in protected AM1 owner")
         marker = command.get(AM1_LOCAL_CONTROL_KEY)
         if marker is None:
             if self.binding is not None:
@@ -123,11 +132,15 @@ class AM1LocalControl:
         if self.state == "stopped":
             return False
         mode, epoch = marker["mode"], marker["epoch"]
+        if AM1_SELECTED_JOINT_EVIDENCE_KEY in command and mode != "active":
+            raise RuntimeError("Selected joint evidence requires an ordinary active action")
         if epoch < self.epoch:
             return False
         if self.binding is not None and marker["intent_revision"] < self.intent_revision:
             raise RuntimeError("AM1 protected intent revision regressed")
         if mode == "pause":
+            if self.selected_evidence is not None:
+                self.selected_evidence.deactivate(robot)
             if epoch == self.epoch and self.state == "paused":
                 if self.binding is not None:
                     self.intent_revision = marker["intent_revision"]
@@ -156,6 +169,8 @@ class AM1LocalControl:
         if not (starting or resuming or continuing):
             raise RuntimeError("AM1 Local active epoch requires the acknowledged pause sequence")
         action = {key: value for key, value in command.items() if key != AM1_LOCAL_CONTROL_KEY}
+        if self.selected_evidence is not None:
+            action = self.selected_evidence.prepare(robot, action, self.binding)
         if resuming and any(float(action.get(key, 0)) != 0 for key in ("x.vel", "y.vel", "theta.vel", "lift_axis.vel")):
             raise RuntimeError("AM1 Local first resumed action must have zero body velocity")
         accepted = robot.send_action(action)
@@ -980,6 +995,12 @@ def _run_host(args):
                  and args.robot_model == "alohamini1" and not args.no_follower),
     )
     robot._am1_left_shoulder_evidence_enabled = left_shoulder_evidence.enabled
+    selected_evidence = AM1SelectedJointEvidence(
+        enabled=(os.environ.get("AM1_SELECTED_JOINT_EVIDENCE") == "1"
+                 and args.robot_model == "alohamini1" and not args.no_follower
+                 and args.am1_run_id is not None and args.am1_host_incarnation is not None),
+    )
+    robot._am1_selected_joint_evidence_enabled = selected_evidence.enabled
 
     if args.lift_relief:
         from .lift_relief import run_lift_relief
@@ -1026,6 +1047,7 @@ def _run_host(args):
     local_control = (
         AM1LocalControl(
             run_id=args.am1_run_id, host_incarnation=args.am1_host_incarnation,
+            selected_evidence=selected_evidence,
         )
         if args.robot_model == "alohamini1" and not args.no_follower
         else None
@@ -1155,6 +1177,11 @@ def _run_host(args):
             # A slow sink still counts toward the next poll's unchanged deadline.
             if lift_operation is not None:
                 lift_operation.emit_pending_sample()
+
+            # Five sparse readbacks share the owner after ordinary control and
+            # response delivery. Their full time still counts toward next poll.
+            if local_control is not None:
+                selected_evidence.report(robot, local_control, last_observation)
 
             lift_diagnostics_done_t = time.perf_counter()
             if loop_timing is not None:

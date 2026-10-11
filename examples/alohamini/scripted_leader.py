@@ -18,6 +18,8 @@ class ScriptedLeaderInput:
 
     motion_profile = "ArmSmoke"
     hold_only = False
+    selected_joint = None
+    endpoint_hold_s = 0.5
 
     def __init__(
         self, initial_positions: Mapping[str, float], *, joint_keys: tuple[str, ...],
@@ -52,6 +54,8 @@ class ScriptedLeaderInput:
         self.joint_keys = joint_keys
         self.elapsed_s = 0.0
         self.duration_s = 12.0 if self.hold_only else 2.0 + len(joint_keys) * 7.0 + 2.0
+        if self.selected_joint is not None:
+            self.duration_s = 4.0 + 2 * (6.0 + 2 * self.endpoint_hold_s)
         self._frame_s = 1.0 / fps
         self._last_tick: float | None = None
         self._sequence = -1
@@ -67,7 +71,13 @@ class ScriptedLeaderInput:
                 for key, value in self.origin.items()
             }
         )
-        if self.hold_only:
+        if self.selected_joint is not None:
+            self.targets = dict(self.origin, **{self.selected_joint: self.targets[self.selected_joint]})
+            self._record("am1_scripted_selected_plan", joint=self.selected_joint,
+                         origin=self.origin[self.selected_joint], target=self.targets[self.selected_joint],
+                         ramp_s=3.0, endpoint_hold_s=self.endpoint_hold_s, cycles=2,
+                         baseline_s=2.0, final_s=2.0, duration_s=self.duration_s)
+        elif self.hold_only:
             self._record("am1_scripted_hold_plan", duration_s=12.0, origin=dict(self.origin),
                          meaning="fixed measured-arm targets; normal owned body input allowed")
         else:
@@ -181,3 +191,63 @@ class ArmHoldBodyInput(ScriptedLeaderInput):
 
     motion_profile = "ArmHoldBody"
     hold_only = True
+
+
+class LeftElbowCompareInput(ScriptedLeaderInput):
+    """Opt-in two-cycle elbow comparison with the original three-unit ramp."""
+
+    motion_profile = "LeftElbowCompare"
+    selected_joint = "arm_left_elbow_flex.pos"
+
+    def __init__(self, initial_positions, *, joint_keys, fps, emit=None, joint_amplitudes=None):
+        if joint_amplitudes is not None:
+            raise ValueError("selected elbow comparison does not accept amplitude overrides")
+        if self.selected_joint not in joint_keys:
+            raise ValueError("selected elbow comparison requires the exact AM1 elbow key")
+        super().__init__(initial_positions, joint_keys=joint_keys, fps=fps, emit=emit)
+
+    def _selected_position(self):
+        t = self.elapsed_s
+        if t < 2.0:
+            return 0, "baseline", 0.0
+        if t >= self.duration_s - 2.0:
+            return 2, "final", 0.0
+        period = 6.0 + 2 * self.endpoint_hold_s
+        cycle = min(int((t - 2.0) // period) + 1, 2)
+        within = t - 2.0 - (cycle - 1) * period
+        if within < 3.0:
+            return cycle, "outbound", within / 3.0
+        if within < 3.0 + self.endpoint_hold_s:
+            return cycle, "endpoint", 1.0
+        if within < 6.0 + self.endpoint_hold_s:
+            return cycle, "return", 1.0 - (within - 3.0 - self.endpoint_hold_s) / 3.0
+        return cycle, "origin", 0.0
+
+    def _position(self):
+        _, phase, fraction = self._selected_position()
+        index = None if phase in {"baseline", "final"} else self.joint_keys.index(self.selected_joint)
+        return index, phase, fraction
+
+    @property
+    def diagnostic_context(self):
+        cycle, phase, _ = self._selected_position()
+        sample_key = "baseline" if phase == "baseline" else (
+            f"cycle{cycle}_{phase}" if phase in {"endpoint", "origin"} else None
+        )
+        return {
+            "profile": self.motion_profile,
+            "progress_s": self.elapsed_s,
+            "phase": phase,
+            "cycle": cycle,
+            "reference": self.origin[self.selected_joint],
+            "endpoint_target": self.targets[self.selected_joint],
+            "requested_target": self._action[self.selected_joint],
+            "sample_key": sample_key,
+        }
+
+
+class LeftElbowDwellCompareInput(LeftElbowCompareInput):
+    """Separately selected two-second endpoint/origin dwell comparison."""
+
+    motion_profile = "LeftElbowDwellCompare"
+    endpoint_hold_s = 2.0

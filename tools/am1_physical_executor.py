@@ -94,7 +94,11 @@ class PhysicalExecutor:
     source = "protected-physical-provider"
     asynchronous = True
     restart_cleanup = "physical_cleanup_unknown_after_restart"
-    recipes = frozenset({"physical-arm-smoke", "physical-arm-smoke-repeat", "physical-arm-hold-body"})
+    selected_joint_recipes = frozenset({"physical-left-elbow-compare", "physical-left-elbow-dwell-compare"})
+    recipes = (
+        frozenset({"physical-arm-smoke", "physical-arm-smoke-repeat", "physical-arm-hold-body"})
+        | selected_joint_recipes
+    )
 
     def __init__(self, config, observation, *, clock=time.monotonic, io_factory=None):
         from tools.am1_local_observation import LocalObservationMailbox
@@ -158,6 +162,8 @@ class PhysicalExecutor:
                 "physical-arm-smoke": "selected-shoulder-i1-with-verified-i0-restore",
                 "physical-arm-smoke-repeat": "selected-shoulder-i1-with-verified-i0-restore",
                 "physical-arm-hold-body": "ordinary-body-baseline-no-integral-trial",
+                "physical-left-elbow-compare": "ordinary-baseline-selected-elbow-evidence-no-gain-trial",
+                "physical-left-elbow-dwell-compare": "ordinary-baseline-selected-elbow-evidence-no-gain-trial",
             },
         }
 
@@ -616,6 +622,10 @@ class PhysicalExecutor:
                     action = dict(ZERO_BODY)
                     if desired == "active" and self.task:
                         action.update({"arm_" + k: v for k, v in self.task.provider.get_action().items()})
+                        if self.recipe.name in self.selected_joint_recipes and not getattr(
+                            self.task.provider, "preparing", False
+                        ):
+                            action["_am1_selected_joint_evidence"] = self.task.provider.diagnostic_context
                         if (
                             self.recipe.name == "physical-arm-hold-body"
                             and self._dispatch_ack
@@ -862,11 +872,16 @@ class ProtectedHostRun:
         env["AM1_SYNC_SHOULDER_READBACK"] = "1"
         env["AM1_LEFT_SHOULDER_EVIDENCE"] = "1"
         # Never carry the arm-only selected integral experiment into the body recipe.
-        for k in ("AM1_SHOULDER_INTEGRAL_TEST", "AM1_SCRIPTED_PREPARE"):
+        for k in ("AM1_SHOULDER_INTEGRAL_TEST", "AM1_SCRIPTED_PREPARE", "AM1_SELECTED_JOINT_EVIDENCE"):
             env.pop(k, None)
         if recipe.name in ("physical-arm-smoke", "physical-arm-smoke-repeat"):
             env["AM1_SHOULDER_INTEGRAL_TEST"] = "1"
             env["AM1_SCRIPTED_PREPARE"] = "1"
+        if recipe.name in PhysicalExecutor.selected_joint_recipes:
+            for k in ("AM1_SYNC_SHOULDER_READBACK", "AM1_LEFT_SHOULDER_EVIDENCE"):
+                env.pop(k, None)
+            env["AM1_SCRIPTED_PREPARE"] = "1"
+            env["AM1_SELECTED_JOINT_EVIDENCE"] = "1"
         self.host_log = (self.run_directory / "host-launch.log").open("xb")
         host_command = [
             self.config["host_python"],
@@ -902,6 +917,7 @@ class ProtectedHostRun:
                 "AM1_LEFT_SHOULDER_EVIDENCE",
                 "AM1_SHOULDER_INTEGRAL_TEST",
                 "AM1_SCRIPTED_PREPARE",
+                "AM1_SELECTED_JOINT_EVIDENCE",
             )
             if k in env
         }

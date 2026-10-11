@@ -24,6 +24,10 @@ RECIPES = MappingProxyType(
         "physical-arm-smoke": Recipe("physical-arm-smoke", "finite", 88.0, 180.0, seed=None),
         "physical-arm-smoke-repeat": Recipe("physical-arm-smoke-repeat", "finite", 352.0, 420.0, seed=None),
         "physical-arm-hold-body": Recipe("physical-arm-hold-body", "finite", 12.0, 30.0, seed=None),
+        "physical-left-elbow-compare": Recipe("physical-left-elbow-compare", "finite", 18.0, 60.0, seed=None),
+        "physical-left-elbow-dwell-compare": Recipe(
+            "physical-left-elbow-dwell-compare", "finite", 24.0, 60.0, seed=None
+        ),
         "fake-interactive": Recipe("fake-interactive", "interactive", None, 420.0),
     }
 )

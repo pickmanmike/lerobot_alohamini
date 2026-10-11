@@ -39,6 +39,7 @@ from .config_alohamini import AlohaMiniConfig
 from .lift_axis import LiftAxis, LiftAxisConfig, LiftHomeResult
 from .model_specs import arm_state_keys_for_robot_model, validate_robot_model
 from .motor_safety import REGISTER_RETRIES, set_torque_enabled, write_register
+from .selected_joint_evidence import MOTOR as SELECTED_JOINT_MOTOR, POSITION as SELECTED_JOINT_POSITION
 
 logger = logging.getLogger(__name__)
 
@@ -1092,11 +1093,22 @@ class AlohaMini(Robot):
         # arm_pos = self.left_bus.sync_read("Present_Position", self.arm_motors)
 
         #print(f"Left arm motors: {self.left_arm_motors}, Right arm motors: {self.right_arm_motors}")  # debug
-        left_pos = (
-            self._read_arm_positions(self.left_bus, self.left_arm_motors)
-            if self.left_arm_motors
-            else {}
-        )
+        selected = self._selected_joint_evidence_active()
+        selected_raw = {} if selected else None
+        selected_started = time.monotonic() if selected else None
+        left_pos = {}
+        if self.left_arm_motors:
+            left_pos = (
+                self._read_arm_positions(self.left_bus, self.left_arm_motors, raw_positions=selected_raw)
+                if selected else self._read_arm_positions(self.left_bus, self.left_arm_motors)
+            )
+        if selected and SELECTED_JOINT_MOTOR in selected_raw:
+            self._am1_selected_joint_position = {
+                "raw": int(selected_raw[SELECTED_JOINT_MOTOR]),
+                "normalized": float(left_pos[SELECTED_JOINT_MOTOR]),
+                "read_started_at_monotonic_s": selected_started,
+                "read_completed_at_monotonic_s": time.monotonic(),
+            }
         left_arm_done_t = time.perf_counter()
 
 
@@ -1193,6 +1205,7 @@ class AlohaMini(Robot):
         left_pos  = {k: v for k, v in action.items() if k.endswith(".pos") and k.startswith("arm_left_") and k.replace(".pos", "") in self.left_bus.motors}
         right_pos = {k: v for k, v in action.items() if k.endswith(".pos") and k.startswith("arm_right_") and self.right_bus is not None and k.replace(".pos", "") in self.right_bus.motors}
         requested_arm_pos = {**left_pos, **right_pos}
+        selected = self._selected_joint_evidence_active() and SELECTED_JOINT_POSITION in left_pos
         right_wrist_observed = None
 
 
@@ -1234,6 +1247,7 @@ class AlohaMini(Robot):
             gp_right = {k: (v, present_right[k.replace(".pos", "")]) for k, v in right_pos.items()}
             right_pos = ensure_safe_goal_position(gp_right, self.config.max_relative_target)
         relative_limit_done_t = time.perf_counter()
+        selected_relative = left_pos.get(SELECTED_JOINT_POSITION) if selected else None
 
         left_pos = self._limit_gripper_goal_by_current(self.left_bus, left_pos)
         left_gripper_limit_done_t = time.perf_counter()
@@ -1245,6 +1259,7 @@ class AlohaMini(Robot):
         if self.right_bus and right_pos:
             right_pos = self._limit_joint_goal_by_current(self.right_bus, right_pos)
         right_joint_limit_done_t = time.perf_counter()
+        selected_current = left_pos.get(SELECTED_JOINT_POSITION) if selected else None
 
         left_pos, left_raw_goals = self._encode_am1_arm_goals(self.left_bus, left_pos, present_left_raw)
         right_raw_goals = None
@@ -1260,11 +1275,36 @@ class AlohaMini(Robot):
 
         #print(f"[{filename}:{lineno}]Sending left_pos:{left_pos}, right_pos:{right_pos}, base_wheel_goal_vel:{base_wheel_goal_vel}")  # debug
     
-        if left_pos:
-            if left_raw_goals is not None:
-                self.left_bus.sync_write("Goal_Position", left_raw_goals, normalize=False)
-            else:
-                self.left_bus.sync_write("Goal_Position", {k.replace(".pos", ""): v for k, v in left_pos.items()})
+        if selected:
+            raw_goal = int(left_raw_goals[SELECTED_JOINT_MOTOR])
+            encoded = self.left_bus._encode_sign("Goal_Position", {3: raw_goal})[3]
+            self._am1_selected_joint_action = {
+                "requested": float(requested_arm_pos[SELECTED_JOINT_POSITION]),
+                "relative_limited": float(selected_relative), "current_limited": float(selected_current),
+                "final_normalized": float(left_pos[SELECTED_JOINT_POSITION]),
+                "expected_goal_raw": raw_goal, "encoded_goal_word": int(encoded),
+                "encoded_goal_bytes": self.left_bus._split_into_byte_chunks(encoded, 2),
+                "write_started_at_monotonic_s": time.monotonic(),
+                "sync_write_returned": False, "write_acknowledged": False,
+            }
+        try:
+            if left_pos:
+                if left_raw_goals is not None:
+                    self.left_bus.sync_write("Goal_Position", left_raw_goals, normalize=False)
+                else:
+                    self.left_bus.sync_write("Goal_Position", {k.replace(".pos", ""): v for k, v in left_pos.items()})
+            if selected:
+                self._am1_selected_joint_action["sync_write_returned"] = True
+        except BaseException as error:
+            if selected:
+                self._am1_selected_joint_action["write_completed_at_monotonic_s"] = time.monotonic()
+                error.add_note("AM1 selected joint action context: " + json.dumps(
+                    self._am1_selected_joint_action, allow_nan=False, separators=(",", ":"),
+                ))
+            raise
+        finally:
+            if selected and "write_completed_at_monotonic_s" not in self._am1_selected_joint_action:
+                self._am1_selected_joint_action["write_completed_at_monotonic_s"] = time.monotonic()
         left_write_done_t = time.perf_counter()
         if self.right_bus and right_pos:
             if right_raw_goals is not None:
@@ -1299,6 +1339,8 @@ class AlohaMini(Robot):
             "right_wrist_final": final_arm_pos.get("arm_right_wrist_flex.pos"),
             "right_wrist_observed": right_wrist_observed,
         }
+        if selected:
+            self.logs["action_diagnostics"]["selected_joint"] = dict(self._am1_selected_joint_action)
         shoulder = "arm_right_shoulder_lift.pos"
         if getattr(self.config, "robot_model", None) == "alohamini1" and shoulder in requested_arm_pos:
             self.logs["action_diagnostics"]["right_shoulder"] = {
@@ -1522,11 +1564,27 @@ class AlohaMini(Robot):
         if failures:
             raise RuntimeError(f"Failed to hold AM1 follower arms: {'; '.join(failures)}")
 
+    def _selected_joint_evidence_active(self) -> bool:
+        return bool(
+            getattr(self, "_am1_selected_joint_evidence_enabled", False)
+            and getattr(self, "_am1_selected_joint_evidence_context", None) is not None
+            and getattr(self.config, "robot_model", None) == "alohamini1"
+        )
+
     def read_and_check_currents(self, limit_ma, print_currents):
         """Read left/right bus currents (mA), print them, and enforce overcurrent protection"""
         scale = 6.5  # sts3215 current unit conversion factor
         left_curr_raw = {}
+        selected = self._selected_joint_evidence_active()
+        selected_started = time.monotonic() if selected else None
         left_curr_raw = self.left_bus.sync_read("Present_Current", list(self.left_bus.motors.keys()))
+        if selected and SELECTED_JOINT_MOTOR in left_curr_raw:
+            raw = int(left_curr_raw[SELECTED_JOINT_MOTOR])
+            self._am1_selected_joint_current = {
+                "raw": raw, "ma": raw * scale,
+                "read_started_at_monotonic_s": selected_started,
+                "read_completed_at_monotonic_s": time.monotonic(),
+            }
         right_curr_raw = {}
         if getattr(self, "right_bus", None):
             right_curr_raw = self.right_bus.sync_read("Present_Current", list(self.right_bus.motors.keys()))

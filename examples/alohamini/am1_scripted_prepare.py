@@ -32,8 +32,10 @@ class PreparedScriptedInput:
         if fps != 10 or len(joint_keys) != 12 or set(initial_positions) != set(joint_keys):
             raise ValueError("preparation requires the exact AM1 12-joint seed at 10 Hz")
         self.motion_profile = motion_profile or getattr(provider, "motion_profile", None)
-        if self.motion_profile not in {"ArmSmoke", "ArmSmokeRepeat", "ArmHoldBody"}:
-            raise ValueError("preparation supports only ArmSmoke, ArmSmokeRepeat and ArmHoldBody")
+        if self.motion_profile not in {
+            "ArmSmoke", "ArmSmokeRepeat", "ArmHoldBody", "LeftElbowCompare", "LeftElbowDwellCompare"
+        }:
+            raise ValueError("preparation requires an explicitly supported finite profile")
         self.origin = {key: float(initial_positions[key]) for key in joint_keys}
         if SHOULDER not in self.origin:
             raise ValueError("preparation requires the selected left shoulder-lift")
@@ -43,9 +45,10 @@ class PreparedScriptedInput:
             if not math.isfinite(value) or not lower - margin <= value <= 100 + margin:
                 raise ValueError(f"preparation seed {key} is outside its qualified initial range")
         self.joint_keys, self._fps, self._provider = joint_keys, fps, provider
-        self.duration_s = {"ArmSmoke": 88.0, "ArmSmokeRepeat": 352.0, "ArmHoldBody": 12.0}[
-            self.motion_profile
-        ]
+        self.duration_s = {
+            "ArmSmoke": 88.0, "ArmSmokeRepeat": 352.0, "ArmHoldBody": 12.0,
+            "LeftElbowCompare": 18.0, "LeftElbowDwellCompare": 24.0,
+        }[self.motion_profile]
         self.preparation_elapsed_s = 0.0
         self._program = None
         self._action = dict(self.origin)
@@ -92,6 +95,10 @@ class PreparedScriptedInput:
     @property
     def elapsed_s(self) -> float:
         return 0.0 if self.preparing else self._program.elapsed_s
+
+    @property
+    def diagnostic_context(self):
+        return None if self.preparing else getattr(self._program, "diagnostic_context", None)
 
     @property
     def complete(self) -> bool:

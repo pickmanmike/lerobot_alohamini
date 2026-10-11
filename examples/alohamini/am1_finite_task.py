@@ -3,7 +3,12 @@
 from functools import partial
 
 from .am1_scripted_prepare import SHOULDER, PreparedScriptedInput
-from .scripted_leader import ArmHoldBodyInput, ScriptedLeaderInput
+from .scripted_leader import (
+    ArmHoldBodyInput,
+    LeftElbowCompareInput,
+    LeftElbowDwellCompareInput,
+    ScriptedLeaderInput,
+)
 from .scripted_leader_repeat import ArmSmokeRepeatInput
 
 JOINT_KEYS = tuple(
@@ -33,6 +38,8 @@ class FiniteTask:
             "physical-arm-smoke": ("ArmSmoke", ScriptedLeaderInput),
             "physical-arm-smoke-repeat": ("ArmSmokeRepeat", ArmSmokeRepeatInput),
             "physical-arm-hold-body": ("ArmHoldBody", ArmHoldBodyInput),
+            "physical-left-elbow-compare": ("LeftElbowCompare", LeftElbowCompareInput),
+            "physical-left-elbow-dwell-compare": ("LeftElbowDwellCompare", LeftElbowDwellCompareInput),
         }[recipe.name]
         self.profile = profile[0]
         self.admitted_at = now
@@ -56,8 +63,11 @@ class FiniteTask:
             self.provider = profile[1](positions, joint_keys=JOINT_KEYS, fps=10, emit=self.record)
             self.original_seed = dict(positions)
         else:
-            self.joint_amplitudes["arm_left_shoulder_lift.pos"] = shoulder_amplitude
-            provider = partial(profile[1], joint_amplitudes=self.joint_amplitudes)
+            if self.profile in {"LeftElbowCompare", "LeftElbowDwellCompare"}:
+                provider = profile[1]
+            else:
+                self.joint_amplitudes["arm_left_shoulder_lift.pos"] = shoulder_amplitude
+                provider = partial(profile[1], joint_amplitudes=self.joint_amplitudes)
             self.provider = PreparedScriptedInput(
                 positions,
                 joint_keys=JOINT_KEYS,
@@ -122,7 +132,11 @@ class FiniteTask:
                 self.return_count += 1
                 if self.return_count >= 3 and now - self.return_first >= 0.2 - 1e-9:
                     self.returns_qualified = 1
-                    self.cycles_completed = int(self.profile == "ArmSmoke")
+                    self.cycles_completed = (
+                        2
+                        if self.profile in {"LeftElbowCompare", "LeftElbowDwellCompare"}
+                        else int(self.profile == "ArmSmoke")
+                    )
                     self.complete = True
         self.sequence = sample["sequence"]
         self.last_frame = now
