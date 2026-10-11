@@ -1,3 +1,40 @@
+## Current AM1 lift startup and protected physical scope
+
+For the explicitly invoked AM1-LIFT-STARTUP-01 continuation, use the existing
+Pi-owned protected physical backend, finite virtual/scripted arm input, normal
+owned body controls and real local-camera-required observation. Simulation remains
+the default; live source and actual evidence must be explicit. AM1 remains wireless
+and P1 recording/viewing remains advisory. The owner authorizes bounded in-scope
+runs, supported repairs and qualified recovery without attendance, readiness,
+manual leader or shoulder-placement questions. No Ethernet prerequisite, Wi-Fi
+tuning, optional-media work, architecture replacement, powered freeze, bus fault,
+overload, EEPROM/gain workaround or permission bypass is included.
+
+Preserve calibration/mappings, normal-rest acquisition, source identity, exclusive
+host/bus ownership, private permissions, exact separate component pins, all local
+motion/current/thermal/status/travel/transport protections and ordinary Pause/Stop.
+Record the post-home readiness branch and retain its original one-second budget,
+fresh actual samples and original strict five-sample/0.2-second window. The AM1
+bounded alternative additionally requires the one-count whole-phase encoder
+envelope and rejects persistent motion; that whole-phase eligibility bound does
+not apply to an otherwise qualified original strict window. Cleanup-only thermal
+collection keeps genuine slot peaks and original stopped qualification bounds;
+Live rules remain unchanged.
+
+Retain faults/first causes/original receipts. Unknown physical cleanup blocks rearm
+and ordinary stopped staging/rollback. Separate exact-run native read-only proof
+and regular product Reconcile acknowledgment may qualify actual stopped state
+under both locks with actual source/calibration/no-owner evidence and durable
+archives/ACK. They add separate reconciliation and clear uncertainty, never rewrite
+failed status, original unknown cleanup, reference/progress or deadline. Repair the
+demonstrated layer, test/review, stage stopped affected owners, then continue a
+supported correction or planned comparable confirmation. Recovery permits at most
+three bounded episodes in the original deadline; completed qualified executor-
+acknowledged recovery closes its episode, allowing a distinct later one. Reattachment
+cannot home, reseed or renew time. Judge usefulness from actual motion/feedback,
+not timers/counters. Preserve failed P1/303/d589 results, accepted simulation and
+the unmerged dependent PR stack. This scope applies only to this authorized packet.
+
 ## Current AM1 mobile local observation scope
 
 For the explicitly invoked AM1-MOBILE-LOCAL-01 continuation, AM1 remains wireless.

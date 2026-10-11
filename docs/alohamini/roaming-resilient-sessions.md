@@ -1,11 +1,29 @@
 # AM1 roaming-resilient sessions
 
-**Current continuation: [AM1 protected physical sessions](protected-physical-sessions.md).**
-The protected adapter is implemented and reviewed. Its first actual startup failed
-the preserved lift post-home quiet-feedback qualification before Live or arm
-trajectory. Actual cleanup was verified, followed by explicit stopped rollback
-to the accepted idle services. Full physical reliability remains incomplete;
-the operating report records exact staged/restored versions and the failed layer.
+**Current continuation: [AM1 protected physical sessions](protected-physical-sessions.md), AM1-LIFT-STARTUP-01.**
+The focused lift startup, cleanup and finite-completion repairs now have actual
+physical results: an 88-second comparison, four-cycle 352-second repeat with browser
+reattachment, automatic 352-second restart from ordinary rest, and the original
+12-second body recipe completed with known motor/lift/bus/camera cleanup. Small-run
+shoulder response was measured. Static arm segments remain a material limit;
+cycle/return counters do not establish useful movement of every joint. Genuine
+required-input-loss recovery remains separate evidence. The body check measured mapped wheel response and directional up/down lift pulses,
+without establishing arrival at the requested 50 mm targets or floor movement. No
+body pixels were viewed for visual corroboration. The full chronology, measurements
+and preserved failures are in the report.
+
+Matched restoration returned normal motor f03/helper 8e and original Windows
+1443-byte configuration/ACL. The physical executor a1d and camera a0e remain
+separately pinned with complete history retained. Original accepted c500 services
+are active idle without autoplay or a substituted historical run. The final audit
+verified clean sources, unchanged calibration/private permissions/trust, both locks,
+no hardware owners and no uncertainty markers. The cached terminal-fault Start
+repair has reviewed/native-tested evidence; the completed body run used a fresh
+resident, so it is not a physical same-process test of that cached branch.
+
+Simulation remains the default, AM1 stays wireless, required sensing is real local
+camera evidence and P1 is advisory. Draft #20 remains dependent on
+#19 -> #18 -> #17 -> #16, unmerged; actual pins and results are in the operating report.
 
 **AM1-SESSION-ARCHITECTURE-01 · owner-approved design. The accepted AM1-MOBILE-LOCAL-01 slice selects real robot-local camera input with simulated motor IO and advisory P1 evidence. The separate strict P1 diagnostic remains failed.**
 Choose a Pi-owned session authority and finite executor, an authenticated LAN
@@ -47,8 +65,10 @@ source-only invocation retains strict P1 behavior. There is no browser policy
 switch or active fallback. Each durable run/result carries `sensing_policy`,
 `sensing_source`, `observation_provenance` and `observation_freshness_basis`.
 Local mode reports `real-local-camera/pi-decoded-arrival` and
-`pi-upstream-arrival-monotonic`. All modes still construct only `SimulatedIO`;
-there is **no live motor backend factory**.
+`pi-upstream-arrival-monotonic`. At the accepted AM1-MOBILE-LOCAL-01 milestone these modes used simulated motor IO.
+Simulation remains the default. The separately selected protected physical backend
+and its actual evidence are described in [protected physical sessions](protected-physical-sessions.md).
+It does not downgrade the strict P1 diagnostic or an active run's sensing policy.
 
 The adapter reuses the existing exclusive camera-only launcher, private config,
 authentication, go2rtc 1.9.14 and role mapping. It consumes **chest** through the
