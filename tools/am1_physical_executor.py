@@ -6,10 +6,42 @@ import threading
 import time
 
 from examples.alohamini.am1_finite_task import JOINT_KEYS
-from examples.alohamini.am1_session_contract import LEFT_ELBOW_RESPONSE
+from examples.alohamini.am1_session_contract import LEFT_ELBOW_ORIGINAL_RETURN, LEFT_ELBOW_RESPONSE
 
 FEEDBACK_MAX_AGE_S = 1.0  # Existing AM1 Local original request/acquisition contract.
 ZERO_BODY = {"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0, "lift_axis.vel": 0}
+
+
+def load_elbow_return_reference(config):
+    """Read one exact private archived proof; it supplies no browser parameters."""
+    import hashlib
+    import os
+    import stat
+    from pathlib import Path
+
+    from tools.am1_session_ipc import strict_json
+
+    spec = config.get("elbow_return_reference")
+    if not isinstance(spec, dict) or set(spec) != {"path", "sha256"}:
+        raise ValueError("explicit private elbow return reference required")
+    if type(spec["path"]) is not str or not Path(spec["path"]).is_absolute():
+        raise ValueError("absolute private elbow return reference path required")
+    if Path(spec["path"]).is_symlink():
+        raise ValueError("private elbow return reference cannot be a symlink")
+    descriptor = os.open(spec["path"], os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    with os.fdopen(descriptor, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 16384 or (
+            os.name == "posix" and (info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077)
+        ):
+            raise ValueError("owned private small regular elbow return reference required")
+        raw = stream.read(16385)
+    if hashlib.sha256(raw).hexdigest() != spec["sha256"]:
+        raise ValueError("elbow return reference content hash differs")
+    value = LEFT_ELBOW_ORIGINAL_RETURN.validate_artifact(strict_json(raw))
+    if value["admission_motor_head"] != config.get("host_head"):
+        raise ValueError("elbow return reference admission motor source differs")
+    return copy.deepcopy(value)
 
 
 class StartupCancelledError(RuntimeError):
@@ -109,6 +141,7 @@ class PhysicalExecutor:
     restart_cleanup = "physical_cleanup_unknown_after_restart"
     selected_joint_recipes = frozenset({
         "physical-left-elbow-compare", "physical-left-elbow-dwell-compare", LEFT_ELBOW_RESPONSE.recipe_name,
+        LEFT_ELBOW_ORIGINAL_RETURN.recipe_name,
     })
     recipes = (
         frozenset({"physical-arm-smoke", "physical-arm-smoke-repeat", "physical-arm-hold-body"})
@@ -123,6 +156,13 @@ class PhysicalExecutor:
                 "physical backend requires explicit private config and actual local-camera adapter"
             )
         self.config = copy.deepcopy(config)
+        self.return_reference = None
+        self.return_reference_error = None
+        if "elbow_return_reference" in config:
+            try:
+                self.return_reference = load_elbow_return_reference(config)
+            except (ValueError, OSError) as error:
+                self.return_reference_error = str(error)
         self.observation = observation
         self.observation.require_owned_session = True
         self.clock = clock
@@ -161,7 +201,8 @@ class PhysicalExecutor:
         self._reconciliation_worker = None
 
     def supports(self, recipe):
-        return recipe.name in self.recipes and recipe.seed is None and recipe.mode == "finite"
+        return (recipe.name in self.recipes and recipe.seed is None and recipe.mode == "finite"
+                and (recipe.name != LEFT_ELBOW_ORIGINAL_RETURN.recipe_name or self.return_reference is not None))
 
     def sensing_metadata(self):
         return {
@@ -173,6 +214,8 @@ class PhysicalExecutor:
             "feedback_provenance": "protected-host/measured-feedback",
             "ack_provenance": "protected-host/action-epoch-feedback-not-servo-ack",
             "backend_contract": copy.deepcopy(self.config),
+            "retained_return_reference": copy.deepcopy(self.return_reference),
+            "return_reference_error": self.return_reference_error,
             "gain_recipes": {
                 "physical-arm-smoke": "selected-shoulder-i1-with-verified-i0-restore",
                 "physical-arm-smoke-repeat": "selected-shoulder-i1-with-verified-i0-restore",
@@ -180,6 +223,7 @@ class PhysicalExecutor:
                 "physical-left-elbow-compare": "ordinary-baseline-selected-elbow-evidence-no-gain-trial",
                 "physical-left-elbow-dwell-compare": "ordinary-baseline-selected-elbow-evidence-no-gain-trial",
                 LEFT_ELBOW_RESPONSE.recipe_name: "ordinary-baseline-signed-elbow-response-no-gain-trial",
+                LEFT_ELBOW_ORIGINAL_RETURN.recipe_name: "ordinary-configuration-original-reference-return-no-gain-trial",
             },
         }
 
@@ -459,6 +503,8 @@ class PhysicalExecutor:
 
         io = None
         try:
+            if self.recipe.name == LEFT_ELBOW_ORIGINAL_RETURN.recipe_name and load_elbow_return_reference(self.config) != self.return_reference:
+                raise ValueError("frozen elbow return reference changed before IO")
             factory = self.io_factory or ProtectedHostRun
             io = factory(self.config)
             if isinstance(io, SimulatedIO) or getattr(io, "provenance", None) != "protected-host":
@@ -568,6 +614,9 @@ class PhysicalExecutor:
                                 self.config["shoulder_amplitude"],
                                 start_held=True,
                                 feedback_provenance="protected-host/measured-feedback",
+                                **({"return_reference": self.return_reference,
+                                    "reference_sha256": self.config["elbow_return_reference"]["sha256"]}
+                                   if self.recipe.name == LEFT_ELBOW_ORIGINAL_RETURN.recipe_name else {}),
                             )
                             self._execution = dict(self.task.snapshot(), fault=None)
                     if self.task:
@@ -590,9 +639,11 @@ class PhysicalExecutor:
                                     # completion. Re-acknowledge its original return, never restart
                                     # or rebase the finite provider, before holding again.
                                     for key, origin in self.task.original_seed.items():
+                                        if self.recipe.name == LEFT_ELBOW_ORIGINAL_RETURN.recipe_name and key == LEFT_ELBOW_ORIGINAL_RETURN.joint:
+                                            origin = self.task.provider.retained_return["reference_normalized"]
                                         limit = (
                                             1.0
-                                            if self.task.profile in {"ArmHoldBody", LEFT_ELBOW_RESPONSE.profile}
+                                            if self.task.profile in {"ArmHoldBody", LEFT_ELBOW_RESPONSE.profile, LEFT_ELBOW_ORIGINAL_RETURN.profile}
                                             else self.task.joint_amplitudes[key]
                                         )
                                         if abs(self.sample["positions"][key] - origin) > limit:
@@ -783,7 +834,7 @@ class ProtectedHostRun:
             "calibration_files",
             "source_pins",
         }
-        if set(config) != required or config["version"] != 1:
+        if set(config) not in (required, required | {"elbow_return_reference"}) or config["version"] != 1:
             raise ValueError("exact protected backend configuration required")
         if not 0 < float(config["shoulder_amplitude"]) <= 3 or not config["calibration_files"]:
             raise ValueError("actual calibration and mapped amplitude required")
@@ -827,6 +878,8 @@ class ProtectedHostRun:
                 raise RuntimeError("preserved calibration content changed")
 
     def start(self, run_id, incarnation, recipe, cancel):
+        if recipe.name == LEFT_ELBOW_ORIGINAL_RETURN.recipe_name:
+            load_elbow_return_reference(self.config)  # Refuse before source checks, camera or host construction.
         import os
         from pathlib import Path
 

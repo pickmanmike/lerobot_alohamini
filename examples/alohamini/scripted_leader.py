@@ -9,9 +9,9 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 if __package__:
-    from .am1_session_contract import LEFT_ELBOW_RESPONSE
+    from .am1_session_contract import LEFT_ELBOW_ORIGINAL_RETURN, LEFT_ELBOW_RESPONSE
 else:
-    from am1_session_contract import LEFT_ELBOW_RESPONSE
+    from am1_session_contract import LEFT_ELBOW_ORIGINAL_RETURN, LEFT_ELBOW_RESPONSE
 
 
 class ScriptedLeaderInput:
@@ -267,6 +267,7 @@ class LeftElbowResponseCharacterizeInput(ScriptedLeaderInput):
 
     motion_profile = LEFT_ELBOW_RESPONSE.profile
     selected_joint = LEFT_ELBOW_RESPONSE.joint
+    definition = LEFT_ELBOW_RESPONSE
 
     def _selected_plan(self):
         q0 = self.origin[self.selected_joint]
@@ -274,6 +275,14 @@ class LeftElbowResponseCharacterizeInput(ScriptedLeaderInput):
             raise ValueError("signed elbow endpoints exceed the original command range")
         self.duration_s = LEFT_ELBOW_RESPONSE.trajectory_s
         self.targets[self.selected_joint] = q0 - 3
+        self._reference = q0
+        self._initialize_selected_feedback()
+        self._record("am1_scripted_selected_plan", joint=self.selected_joint, origin=q0,
+                     signed_conditions=[-3.0, 10.0], slope_norm_per_s=1.0,
+                     decision_s=16.0, completion_alternatives=[18.0, 60.0],
+                     live_ceiling_s=180.0, other_joints="one frozen original seed", body="zero")
+
+    def _initialize_selected_feedback(self):
         self._expanded = False
         self._branch = None
         self._identity = None
@@ -290,10 +299,6 @@ class LeftElbowResponseCharacterizeInput(ScriptedLeaderInput):
         self._final_residual = None
         self._collected_sequence = -1
         self._cycles = []
-        self._record("am1_scripted_selected_plan", joint=self.selected_joint, origin=q0,
-                     signed_conditions=[-3.0, 10.0], slope_norm_per_s=1.0,
-                     decision_s=16.0, completion_alternatives=[18.0, 60.0],
-                     live_ceiling_s=180.0, other_joints="one frozen original seed", body="zero")
 
     @property
     def diagnostic_context(self):
@@ -382,10 +387,10 @@ class LeftElbowResponseCharacterizeInput(ScriptedLeaderInput):
         if not isinstance(feedback, dict) or feedback.get("version") != 1:
             raise ValueError("signed characterization requires actual selected feedback")
         context, action = feedback.get("context"), feedback.get("action")
-        if not LEFT_ELBOW_RESPONSE.context_valid(context) or not isinstance(action, dict):
+        if not self.definition.context_valid(context) or not isinstance(action, dict):
             raise ValueError("signed selected phase/action proof is malformed")
         if (
-            context["reference"] != self.origin[self.selected_joint]
+            context["reference"] != self._reference
             or not 0 <= self.elapsed_s - context["progress_s"] <= .5 + 1e-9
         ):
             raise ValueError("signed selected feedback is ahead of or too far behind the commanded phase")
@@ -434,7 +439,7 @@ class LeftElbowResponseCharacterizeInput(ScriptedLeaderInput):
             raise ValueError("signed selected action was limited or differs from its command")
         if type(action.get("expected_goal_raw")) is not int or action.get("sync_write_returned") is not True:
             raise ValueError("signed selected actual encoded write attempt unavailable")
-        expected = LEFT_ELBOW_RESPONSE.encoded_goal(requested, calibration)
+        expected = self.definition.encoded_goal(requested, calibration)
         if action["expected_goal_raw"] != expected:
             raise ValueError("signed selected actual encoder goal differs from its normalized command")
         final = (expected - calibration["range_min"]) / (
@@ -446,7 +451,7 @@ class LeftElbowResponseCharacterizeInput(ScriptedLeaderInput):
             raise ValueError("signed selected final normalized target differs from the actual encoded goal")
         if abs(current["ma"]) >= 1800:
             raise ValueError("signed selected current reached the existing joint hold bound")
-        if abs(observed[self.selected_joint] - self.origin[self.selected_joint]) > 10:
+        if abs(observed[self.selected_joint] - self._reference) > 10:
             raise ValueError("signed selected position exceeds the absolute original envelope")
         for key in self.origin:
             if key != self.selected_joint and abs(observed[key] - self.origin[key]) > 1:
@@ -488,7 +493,9 @@ class LeftElbowResponseCharacterizeInput(ScriptedLeaderInput):
         self._sparse = copy.deepcopy(receipts)
         for key in self._sparse:
             self._receipt(key, now)
-        if context["phase"] == "endpoint" and len(samples) >= 4:
+        if (context["phase"] == "endpoint" or (
+            self.definition is LEFT_ELBOW_ORIGINAL_RETURN and context["phase"] == "origin"
+        )) and len(samples) >= 4:
             last = self._rising_current_window(samples)
             if last is not None:
                 self._adverse_reason = "signed endpoint has sustained rising current without measured response"
@@ -517,8 +524,8 @@ class LeftElbowResponseCharacterizeInput(ScriptedLeaderInput):
             raise ValueError("signed origin sparse proof belongs to an earlier control intent")
         context, action, decoded = receipt.get("context"), receipt.get("action"), receipt.get("decoded")
         if (
-            not LEFT_ELBOW_RESPONSE.context_valid(context) or context["sample_key"] != key
-            or context["reference"] != self.origin[self.selected_joint]
+            not self.definition.context_valid(context) or context["sample_key"] != key
+            or context["reference"] != self._reference
             or receipt.get("sample_key") != key or receipt.get("motor") != self._motor
             or not isinstance(action, dict) or not isinstance(decoded, dict)
             or receipt.get("goal_matches_expected_raw") is not True
@@ -535,7 +542,7 @@ class LeftElbowResponseCharacterizeInput(ScriptedLeaderInput):
         requested = context["requested_target"]
         if not all(self._number(action.get(k)) and math.isclose(action[k], requested, abs_tol=1e-9, rel_tol=0)
                    for k in ("requested", "relative_limited", "current_limited")) or (
-            action["expected_goal_raw"] != LEFT_ELBOW_RESPONSE.encoded_goal(requested, self._motor["calibration"])
+            action["expected_goal_raw"] != self.definition.encoded_goal(requested, self._motor["calibration"])
         ):
             raise ValueError("signed sparse phase actual action differs from its declared encoded target")
         calibration = self._motor["calibration"]
@@ -632,3 +639,110 @@ class LeftElbowResponseCharacterizeInput(ScriptedLeaderInput):
         for phase in ("origin", "endpoint"):
             cycle = self.diagnostic_context["cycle"]
             self._phase_samples.pop((cycle, phase), None)
+
+
+class LeftElbowOriginalReturnInput(LeftElbowResponseCharacterizeInput):
+    """One slower approach from stopped rest to a preserved original target."""
+
+    motion_profile = LEFT_ELBOW_ORIGINAL_RETURN.profile
+    definition = LEFT_ELBOW_ORIGINAL_RETURN
+
+    def __init__(self, *args, return_reference, reference_sha256, **kwargs):
+        self._retained = copy.deepcopy(self.definition.validate_artifact(return_reference))
+        self._reference_sha256 = reference_sha256
+        super().__init__(*args, **kwargs)
+
+    def _selected_plan(self):
+        self._reference = self._retained["reference_normalized"]
+        self._initialize_selected_feedback()
+        self._baseline_raw = self._retained["reference_raw"]
+        self._noise = self._retained["baseline_noise_raw"]
+        self._final_window = None
+        self._origin_goal = self._origin_present = None
+        self.duration_s = self.definition.trajectory_s
+        start = self.definition.encoded_goal(self.origin[self.selected_joint], self._retained["calibration"])
+        if start is None or abs(start - self._retained["stopped_position_raw"]) > 2 or not 0 < self._reference - self.origin[self.selected_joint] <= 3:
+            raise ValueError("return-only starting pose differs from the archived stopped rest")
+        self.targets[self.selected_joint] = self._reference
+        self._record("am1_scripted_original_return_plan", original_run_id=self._retained["original_run_id"],
+                     artifact_sha256=self._reference_sha256, starting_raw=start, reference_raw=self._baseline_raw,
+                     ramp_s=3.0, hold_s=.5, trajectory_s=5.5, live_ceiling_s=60,
+                     other_joints="fresh measured targets held exactly", body="zero", gain_trial=False)
+
+    @property
+    def diagnostic_context(self):
+        cycle, phase, fraction = self.definition.phase(self.elapsed_s)
+        start = self.origin[self.selected_joint]
+        return {
+            "profile": self.motion_profile, "progress_s": self.elapsed_s, "phase": phase, "cycle": cycle,
+            "reference": self._reference, "endpoint_target": start,
+            "requested_target": start + fraction * (self._reference - start),
+            "sample_key": self.definition.sample_key(self.elapsed_s),
+        }
+
+    def _position(self):
+        _, phase, fraction = self.definition.phase(self.elapsed_s)
+        return (None if phase == "baseline" else self.joint_keys.index(self.selected_joint)), phase, fraction
+
+    @property
+    def retained_return(self):
+        return {
+            "artifact_sha256": self._reference_sha256, "original_run_id": self._retained["original_run_id"],
+            "reference_raw": self._baseline_raw, "reference_normalized": self._reference,
+            "baseline_noise_raw": self._retained["baseline_noise_raw"],
+            "calibration": copy.deepcopy(self._retained["calibration"]),
+            "starting_raw": self.definition.encoded_goal(self.origin[self.selected_joint], self._retained["calibration"]),
+            "final_return_residual_raw": self._final_residual,
+            "final_window": copy.deepcopy(self._final_window),
+            "origin_goal_raw": self._origin_goal, "origin_present_raw": self._origin_present,
+        }
+
+    def _feedback(self, now, observed, feedback):
+        super()._feedback(now, observed, feedback)
+        if self._motor["calibration"] != self._retained["calibration"]:
+            raise ValueError("return-only live calibration differs from the retained original reference")
+        raw = feedback["position"]["raw"]
+        if not self._retained["stopped_position_raw"] - 2 <= raw <= self._baseline_raw + 2:
+            raise ValueError("return-only actual position left its bounded approach envelope")
+
+    def _qualify_start(self, now):
+        samples = self._recent_suffix(self._baseline, "return-only baseline", now=now)
+        receipt = self._receipt("baseline", now)
+        expected = self.definition.encoded_goal(self.origin[self.selected_joint], self._retained["calibration"])
+        if receipt["action"]["expected_goal_raw"] != expected or any(
+            abs(row["raw"] - self._retained["stopped_position_raw"]) > 2 for row in samples
+        ):
+            raise ValueError("return-only fresh baseline differs from the archived stopped rest")
+        self._noise = self._baseline_extrema[1] - self._baseline_extrema[0]
+
+    def _qualify_final(self, now):
+        origin = self._receipt("cycle1_origin", now, fresh=True)
+        samples = self._recent_suffix(self._phase_samples.get((1, "origin"), []), "original return", now=now)
+        residual = max(abs(row["raw"] - self._baseline_raw) for row in samples)
+        decoded = origin["decoded"]
+        if residual > 2 or decoded["goal_position_raw"] != self._baseline_raw or (
+            type(decoded["present_position_raw"]) is not int or abs(decoded["present_position_raw"] - self._baseline_raw) > 2
+        ):
+            raise ValueError("return-only did not reach its original raw envelope")
+        self._final_residual = residual
+        self._origin_goal, self._origin_present = decoded["goal_position_raw"], decoded["present_position_raw"]
+        self._final_window = {
+            "sample_count": len(samples), "qualified_at_monotonic_s": now,
+            "current_span_s": samples[-1]["at"] - samples[0]["at"],
+            "position_span_s": samples[-1]["position_at"] - samples[0]["position_at"],
+            **{f"{end}_{name}_{part}_at": row[key]
+               for end, row in (("first", samples[0]), ("last", samples[-1]))
+               for name, part, key in (("current", "started", "current_started"), ("current", "completed", "at"),
+                                       ("position", "started", "position_started"), ("position", "completed", "position_at"))},
+        }
+
+    def advance(self, now, observed, observation_sequence, *, defer_events=False, selected_feedback=None):
+        if self._last_tick is None or self.complete:
+            return
+        self.collect_feedback(now, observed, observation_sequence, selected_feedback=selected_feedback)
+        next_progress = round(self.elapsed_s + min(now - self._last_tick, self._frame_s), 9)
+        if self.elapsed_s < 2 <= next_progress:
+            self._qualify_start(now)
+        if next_progress >= self.duration_s:
+            self._qualify_final(now)
+        ScriptedLeaderInput.advance(self, now, observed, observation_sequence, defer_events=defer_events)

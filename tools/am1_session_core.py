@@ -11,7 +11,12 @@ import uuid
 from collections import deque
 from pathlib import Path
 
-from examples.alohamini.am1_session_contract import LEFT_ELBOW_RESPONSE, RECIPES, uuid_text
+from examples.alohamini.am1_session_contract import (
+    LEFT_ELBOW_ORIGINAL_RETURN,
+    LEFT_ELBOW_RESPONSE,
+    RECIPES,
+    uuid_text,
+)
 from tools.am1_fake_executor import FakeExecutor
 
 TERMINAL = {"stopped", "completed", "faulted", "interrupted"}
@@ -324,6 +329,18 @@ class SessionAuthority:
             if expected is None:
                 return None
             duration, cycles, returns = expected
+        elif run["recipe"] == LEFT_ELBOW_ORIGINAL_RETURN.recipe_name:
+            backend = evidence.get("backend_contract")
+            spec = backend.get("elbow_return_reference") if isinstance(backend, dict) else None
+            reference = evidence.get("retained_return_reference")
+            if not isinstance(spec, dict) or not isinstance(reference, dict) or reference.get("admission_motor_head") != backend.get("host_head"):
+                return None
+            expected = LEFT_ELBOW_ORIGINAL_RETURN.completion_expectation(
+                execution, reference, spec.get("sha256"),
+            )
+            if expected is None:
+                return None
+            duration, cycles, returns = expected
         elif run["recipe"] in {"physical-left-elbow-compare", "physical-left-elbow-dwell-compare"}:
             returns, cycles = 1, 2
         else:
@@ -360,6 +377,17 @@ class SessionAuthority:
             )
         ):
             return None
+        if run["recipe"] == LEFT_ELBOW_ORIGINAL_RETURN.recipe_name:
+            from examples.alohamini.am1_finite_task import JOINT_KEYS
+
+            raw = LEFT_ELBOW_ORIGINAL_RETURN.encoded_goal(positions.get(LEFT_ELBOW_ORIGINAL_RETURN.joint), reference["calibration"])
+            window = execution["retained_return"]["final_window"]
+            if (set(seed) != set(JOINT_KEYS)
+                or raw is None or abs(raw - reference["reference_raw"]) > 2
+                or min(window["first_current_started_at"], window["first_position_started_at"]) < run["native_live_at"]
+                or window["qualified_at_monotonic_s"] > completed
+                or any(abs(positions[k] - v) > 1 for k, v in seed.items() if k != LEFT_ELBOW_ORIGINAL_RETURN.joint)):
+                return None
         fields = (
             "run_id",
             "host_incarnation",

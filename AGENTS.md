@@ -8,8 +8,10 @@ Compare actual working and failing conditions, distinguishing the owner report
 from source-bound native positive-control evidence.
 
 Use current relevant camera views, existing native samples and the sole protected
-motor owner. Reuse the verified available idle candidate and existing stager,
-operation and analysis tools. Opposite-direction, same-elbow positive-control and
+motor owner. Reuse the source-qualified available idle candidate and existing
+stager, operation and analysis tools. Available idle preserves the failed run and
+known cleanup; it does not qualify a new matched reference or useful return.
+Opposite-direction, same-elbow positive-control and
 response-characterization work must follow the new packet's actual finite bounds,
 local limits, conditional experiment evidence and restoration rules; do not infer
 missing experiment permissions or settings from earlier packets. Preserve command
@@ -40,9 +42,21 @@ negative command, but zero measured reversal and a 19-tick residual against the
 original two-tick return band. Its known-cleanup first cause is retained. The
 native-cadence repair qualifies original real acquisitions; it does not qualify
 that nonreturn. Do not repeat, rebase or admit positive expansion merely to get
-past the former sampling-window error. No integral change has been applied;
-installed-firmware register semantics and a supported nonpersistent stopped
-write/restore procedure must be established before that conditional experiment.
+past the former sampling-window error. Stopped probe881a subsequently read elbow
+position2453/goal2472 with torque off/current0, matching model777/fw3.10 and
+calibration, all sixteen torque registers off/four body goals zero, both buses
+closed and no foreign owner. That stopped state does not qualify the original
+reference or return. One bounded return-only I0 comparison is being prepared to
+isolate normal-startup command history; no physical result is claimed.
+
+No I1 change has been applied. The retrieved primary manufacturer STS manual
+v1.1 defines one-byte position-I at23 and Lock55=1 changes as nonpersistent.
+Applying that documented STS interface to installed model777/fw3.10 is supported
+inference; it does not prove an I1 response. Preserve addresses24/25 unchanged.
+The existing shoulder trial targets ID2 and its torque-off path writes Lock0,
+so it does not supply the selected-ID3 volatile path. Fresh actual I/Lock baseline
+and a reviewed stopped procedure with verified Lock1 for both I1 and I0 restoration
+remain required; no permanent tuning or EEPROM cycling is authorized.
 
 ## Current AM1 motion quality and durability scope
 

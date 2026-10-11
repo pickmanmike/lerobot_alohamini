@@ -88,11 +88,15 @@ class AM1SelectedJointEvidence:
         if profile not in PROFILES:
             # The literal shared file is projected into this motor owner too.
             # Ordinary and retained profiles do not acquire this dependency.
-            from examples.alohamini.am1_session_contract import LEFT_ELBOW_RESPONSE
+            from examples.alohamini.am1_session_contract import (
+                LEFT_ELBOW_ORIGINAL_RETURN,
+                LEFT_ELBOW_RESPONSE,
+            )
 
-            if profile != LEFT_ELBOW_RESPONSE.profile or not LEFT_ELBOW_RESPONSE.context_valid(metadata):
+            definitions = {d.profile: d for d in (LEFT_ELBOW_RESPONSE, LEFT_ELBOW_ORIGINAL_RETURN)}
+            signed = definitions.get(profile)
+            if signed is None or not signed.context_valid(metadata):
                 raise RuntimeError("Invalid selected joint signed profile context")
-            signed = LEFT_ELBOW_RESPONSE
             calibration = robot.left_bus.calibration.get(MOTOR)
             if (
                 calibration is None
@@ -134,7 +138,8 @@ class AM1SelectedJointEvidence:
             or (phase not in ("baseline", "final") and cycle not in (1, 2))
         ):
             raise RuntimeError("Selected joint evidence phase and cycle differ")
-        if phase in ("baseline", "origin", "final") and requested != reference:
+        original_return = signed is not None and signed.profile == "LeftElbowOriginalReturn"
+        if phase in ("baseline", "origin", "final") and requested != (endpoint if original_return and phase == "baseline" else reference):
             raise RuntimeError("Selected joint origin phase differs from its frozen reference")
         if phase == "endpoint" and requested != endpoint:
             raise RuntimeError("Selected joint endpoint phase differs from its fixed target")

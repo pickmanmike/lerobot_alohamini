@@ -9,9 +9,9 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 if __package__:
-    from .am1_session_contract import LEFT_ELBOW_RESPONSE
+    from .am1_session_contract import LEFT_ELBOW_ORIGINAL_RETURN, LEFT_ELBOW_RESPONSE
 else:
-    from am1_session_contract import LEFT_ELBOW_RESPONSE
+    from am1_session_contract import LEFT_ELBOW_ORIGINAL_RETURN, LEFT_ELBOW_RESPONSE
 
 SHOULDER = "arm_left_shoulder_lift.pos"
 
@@ -40,6 +40,7 @@ class PreparedScriptedInput:
         if self.motion_profile not in {
             "ArmSmoke", "ArmSmokeRepeat", "ArmHoldBody", "LeftElbowCompare", "LeftElbowDwellCompare",
             LEFT_ELBOW_RESPONSE.profile,
+            LEFT_ELBOW_ORIGINAL_RETURN.profile,
         }:
             raise ValueError("preparation requires an explicitly supported finite profile")
         self.origin = {key: float(initial_positions[key]) for key in joint_keys}
@@ -47,7 +48,7 @@ class PreparedScriptedInput:
             raise ValueError("preparation requires the selected left shoulder-lift")
         for key, value in self.origin.items():
             lower = 0.0 if key.endswith("gripper.pos") else -100.0
-            margin = 20.0 if key == SHOULDER else 0.0
+            margin = 20.0 if key == SHOULDER and self.motion_profile != LEFT_ELBOW_ORIGINAL_RETURN.profile else 0.0
             if not math.isfinite(value) or not lower - margin <= value <= 100 + margin:
                 raise ValueError(f"preparation seed {key} is outside its qualified initial range")
         self.joint_keys, self._fps, self._provider = joint_keys, fps, provider
@@ -55,6 +56,7 @@ class PreparedScriptedInput:
             "ArmSmoke": 88.0, "ArmSmokeRepeat": 352.0, "ArmHoldBody": 12.0,
             "LeftElbowCompare": 18.0, "LeftElbowDwellCompare": 24.0,
             LEFT_ELBOW_RESPONSE.profile: LEFT_ELBOW_RESPONSE.trajectory_s,
+            LEFT_ELBOW_ORIGINAL_RETURN.profile: LEFT_ELBOW_ORIGINAL_RETURN.trajectory_s,
         }[self.motion_profile]
         self.preparation_elapsed_s = 0.0
         self._program = None
@@ -66,6 +68,9 @@ class PreparedScriptedInput:
             else (-99.0 if self.origin[SHOULDER] <= -99 else self.origin[SHOULDER])
         )
         self._action[SHOULDER] = self._boundary
+        if self.motion_profile == LEFT_ELBOW_ORIGINAL_RETURN.profile:
+            self._boundary = self._inward = self.origin[SHOULDER]
+            self._action = dict(self.origin)
         self._initial_error = max(1.0, abs(self.origin[SHOULDER] - self._boundary))
         self._phase = "boundary"
         self._phase_progress = 0.0
@@ -114,6 +119,10 @@ class PreparedScriptedInput:
     @property
     def characterization(self):
         return None if self.preparing else getattr(self._program, "characterization", None)
+
+    @property
+    def retained_return(self):
+        return None if self.preparing else getattr(self._program, "retained_return", None)
 
     def validate_final_feedback(self, now, observed, selected_feedback):
         self._program.validate_final_feedback(now, observed, selected_feedback)
@@ -213,7 +222,9 @@ class PreparedScriptedInput:
         if self._finished or self.complete:
             return
         if not self.preparing:
-            kwargs = {"selected_feedback": selected_feedback} if self.motion_profile == LEFT_ELBOW_RESPONSE.profile else {}
+            kwargs = {"selected_feedback": selected_feedback} if self.motion_profile in {
+                LEFT_ELBOW_RESPONSE.profile, LEFT_ELBOW_ORIGINAL_RETURN.profile,
+            } else {}
             self._program.advance(now, observed, observation_sequence, defer_events=True, **kwargs)
             self._program.flush_events()
             if not defer_events:
@@ -266,7 +277,7 @@ class PreparedScriptedInput:
                 self._qualified.clear()
                 self._qualification_started = None
         elif self._stationary(observed, final=True):
-            seed = dict(observed)
+            seed = dict(self.origin) if self.motion_profile == LEFT_ELBOW_ORIGINAL_RETURN.profile else dict(observed)
             self._record(
                 "am1_scripted_preparation_complete",
                 observation_sequence=observation_sequence,
