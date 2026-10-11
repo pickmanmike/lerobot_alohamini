@@ -724,3 +724,309 @@ def test_matched_i1_dwell_remains_admissible_after_static_fresh_i0_dwell():
     )
     assert proof is not None and proof["initial_measured_reference"] == dict(p.origin)
     assert proof["trajectory_s"] == 7 and proof["hold_s"] == 2 and proof["integral"] == 0
+
+
+def reporting_authority(run, evidence):
+    import threading
+    from collections import deque
+
+    from tools.am1_session_core import SessionAuthority
+
+    authority = SessionAuthority.__new__(SessionAuthority)
+    authority.run = copy.deepcopy(run)
+    authority.run.setdefault("deadline", None)
+    authority.run.setdefault("progress_s", authority.run["execution"]["progress_s"])
+    authority.mutex = threading.RLock()
+    authority.clock = lambda: 100.0
+    authority.service_incarnation = str(uuid4())
+    authority.controller = None
+    authority.events = deque(
+        (
+            {"sequence": i, "at": 90.0 + i / 100, "run_id": run["run_id"], "event": "snapshot"}
+            for i in range(64)
+        ),
+        maxlen=64,
+    )
+    authority.executor = SimpleNamespace(source="protected-physical-provider", supports=lambda _: False)
+    authority._evidence = lambda: copy.deepcopy(evidence)
+    return authority
+
+
+def reporting_run(integral=0, suffix=""):
+    from tests.robots.test_am1_elbow_recovery import drive, execution, provider
+
+    p = provider(integral, suffix)
+    drive(p)
+    run = prior_native_i0()
+    result = execution(p)
+    result["recovery"]["gain_trial"]["binding"].update(
+        run_id=run["run_id"], host_incarnation=run["backend_incarnation"]
+    )
+    run.update(recipe=p.definition.recipe_name, execution=result)
+    run["completion_receipt"].update(recipe=p.definition.recipe_name, execution=copy.deepcopy(result))
+    gain = copy.deepcopy(result["recovery"]["gain_trial"])
+    gain.update(
+        schema_version=1,
+        state="restored",
+        status="restored",
+        restore_required=False,
+        restored_integral_readback=0,
+        restored_lock_readback=gain["original_registers"]["Lock"],
+        restored_bytes=copy.deepcopy(gain["original_bytes"]),
+        restored_at_monotonic_s=19.0,
+        first_failure=None,
+        snapshot_path="/private/gain-journal.json",
+        events=[
+            {
+                "operation": "read",
+                "register": "I_Coefficient",
+                "phase": "restored",
+                "started_at_monotonic_s": 18.001 + i / 1000,
+                "completed_at_monotonic_s": 18.0015 + i / 1000,
+                "value": 0,
+            }
+            for i in range(69 + 4 * integral)
+        ],
+    )
+    gain["original_registers"].update(
+        Model_Number=777,
+        Firmware_Major_Version=3,
+        Firmware_Minor_Version=10,
+        Operating_Mode=0,
+        Goal_Position=2472,
+        Present_Position=2458,
+        Min_Position_Limit=864,
+        Max_Position_Limit=3073,
+    )
+    gain.update(
+        motor="arm_left_elbow_flex",
+        motor_id=3,
+        motor_model="sts3215",
+        cached_calibration=copy.deepcopy(result["recovery"]["calibration"]),
+    )
+    run["physical_result"]["readback"]["readback"]["elbow_integral"] = gain
+    for i, row in enumerate(run["physical_result"]["readback"]["readback"]["readbacks"]):
+        row.update(
+            read_started_at_monotonic_s=167106.201 + i / 1000,
+            read_completed_at_monotonic_s=167106.2015 + i / 1000,
+        )
+    return run
+
+
+@pytest.mark.parametrize("integral,suffix", [(0, ""), (1, ""), (0, "-confirm"), (1, "-confirm")])
+def test_terminal_snapshot_bounds_only_duplicate_gain_ledger_and_preserves_full_native_run(integral, suffix):
+    import json
+
+    from tools.am1_session_ipc import CONTROL_LIMIT, RESPONSE_LIMIT, encode
+
+    run = reporting_run(integral, suffix)
+    original = copy.deepcopy(run)
+    evidence = {
+        "source": run["source"],
+        "lifecycle": copy.deepcopy(run["physical_result"]),
+        "finite_completion": copy.deepcopy(run["completion_receipt"]),
+        "backend_contract": copy.deepcopy(run["backend_contract"]),
+        "retained_return_reference": copy.deepcopy(run["retained_return_reference"]),
+    }
+    authority = reporting_authority(run, evidence)
+    view = authority.snapshot()
+    public = view["evidence"]["lifecycle"]["readback"]["readback"]
+    gain = public["elbow_integral"]
+    assert "events" not in gain and "snapshot_path" not in gain
+    assert {
+        k: v for k, v in view["run"].items() if k not in {"remaining_s", "trajectory_remaining_s"}
+    } == authority.run
+    assert authority.run == dict(original, deadline=None, progress_s=original["execution"]["progress_s"])
+    assert authority._evidence() == evidence
+    assert len(public["readbacks"]) == 20 and all(
+        type(row["value"]) is int and row["value"] == 0 for row in public["readbacks"]
+    )
+    clocks = {"read_started_at_monotonic_s", "read_completed_at_monotonic_s"}
+    original_rows = original["physical_result"]["readback"]["readback"]["readbacks"]
+    assert public["readbacks"] == [{k: v for k, v in row.items() if k not in clocks} for row in original_rows]
+    assert all(
+        clocks <= set(row) for row in view["run"]["physical_result"]["readback"]["readback"]["readbacks"]
+    )
+    assert view["evidence"]["lifecycle"]["camera_release"] == original["physical_result"]["camera_release"]
+    restored = original["physical_result"]["readback"]["readback"]["elbow_integral"]
+    for key in (
+        "state",
+        "status",
+        "restore_required",
+        "integral",
+        "binding",
+        "original_registers",
+        "original_bytes",
+        "restored_bytes",
+        "restored_integral_readback",
+        "restored_lock_readback",
+        "restored_at_monotonic_s",
+        "first_failure",
+    ):
+        assert gain[key] == restored[key]
+    framed = encode(
+        {"id": str(uuid4()), "result": {"accepted": True, "status": "snapshot", "snapshot": view}}
+    )
+    assert len(framed) <= RESPONSE_LIMIT == 65536 and CONTROL_LIMIT == 4096
+    if suffix == "-confirm":
+        assert (
+            view["run"]["execution"]["cycles_completed"] == view["run"]["execution"]["returns_qualified"] == 2
+        )
+    view["evidence"]["lifecycle"]["readback"]["readback"]["elbow_integral"]["original_registers"]["Lock"] = 9
+    assert authority.run["physical_result"]["readback"]["readback"]["elbow_integral"] == restored
+    assert json.dumps(authority._evidence(), sort_keys=True) == json.dumps(evidence, sort_keys=True)
+
+
+def test_terminal_snapshot_preserves_restore_failure_and_ordinary_evidence():
+    run = reporting_run()
+    lifecycle = run["physical_result"]
+    gain = lifecycle["readback"]["readback"]["elbow_integral"]
+    failure = {"type": "TimeoutError", "message": "original restore read failed", "at_monotonic_s": 19.0}
+    gain.update(state="restore_failed", status="restore_failed", restore_required=True, first_failure=failure)
+    evidence = {"source": run["source"], "lifecycle": copy.deepcopy(lifecycle)}
+    authority = reporting_authority(run, evidence)
+    view = authority.snapshot()
+    public = view["evidence"]["lifecycle"]["readback"]["readback"]["elbow_integral"]
+    assert public["first_failure"] == failure and public["restore_required"] is True
+    assert authority._evidence() == evidence
+    evidence["lifecycle"]["readback"]["readback"].pop("elbow_integral")
+    authority = reporting_authority(run, evidence)
+    assert authority.snapshot()["evidence"] == evidence
+
+
+def idle_recovery_evidence(run):
+    return {
+        "source": "protected-physical-provider",
+        "backend_contract": copy.deepcopy(run["backend_contract"]),
+        "retained_return_reference": copy.deepcopy(run["retained_return_reference"]),
+        "lifecycle": {
+            "run_id": None,
+            "phase": "idle",
+            "startup_deadline": None,
+            "native_live_at": None,
+            "cleanup": None,
+            "uncertain": False,
+            "terminal_status": None,
+        },
+        **dict.fromkeys(
+            ("feedback", "native_ack", "active_acknowledged", "hold_acknowledged", "pose_aligned"), False
+        ),
+        **dict.fromkeys(
+            (
+                "fault",
+                "transport_issue",
+                "reconciliation",
+                "host_incarnation",
+                "finite_completion",
+                "feedback_sequence",
+                "measured_positions",
+                "measured_body",
+                "feedback_timing",
+                "acknowledged_intent_revision",
+                "recovery_prerequisite",
+                "return_reference_error",
+            )
+        ),
+        "accepted_host_action": {},
+    }
+
+
+def test_retained_completed_i0_qualifies_only_after_verified_idle_restart():
+    from examples.alohamini.am1_session_contract import RECIPES
+
+    run = prior_native_i0()
+    run["service_incarnation"] = str(uuid4())
+    run["intent"] = None
+    evidence = idle_recovery_evidence(run)
+    authority = reporting_authority(run, evidence)
+    authority.executor.supports = lambda recipe: recipe.name == "physical-left-elbow-recovery-i1"
+    before = copy.deepcopy(authority.run)
+    proof = authority.elbow_recovery_prerequisite(RECIPES["physical-left-elbow-recovery-i1"], evidence)
+    assert proof is not None and proof["run_id"] == run["run_id"]
+    assert "physical-left-elbow-recovery-i1" in authority.snapshot()["recipes"]
+    assert authority.run == before and authority._evidence() == evidence
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "unknown",
+        "foreign_run",
+        "live",
+        "ack",
+        "feedback",
+        "host",
+        "fault",
+        "transport",
+        "reconciliation",
+        "completion",
+        "accepted_action",
+        "config",
+        "reference",
+        "same_service",
+        "unknown_service",
+        "intent",
+        "restored_i",
+        "restored_lock",
+        "restore_required",
+        "untyped_idle",
+        "missing_idle_field",
+        "typed_config",
+    ],
+)
+def test_retained_recovery_restart_refuses_unknown_active_foreign_or_changed_proof(fault):
+    from examples.alohamini.am1_session_contract import RECIPES
+
+    run = prior_native_i0()
+    run["service_incarnation"] = str(uuid4())
+    run["intent"] = None
+    evidence = idle_recovery_evidence(run)
+    authority = reporting_authority(run, evidence)
+    if fault == "untyped_idle":
+        evidence["lifecycle"]["uncertain"] = 0
+    elif fault == "missing_idle_field":
+        evidence.pop("measured_positions")
+    elif fault == "typed_config":
+        authority.run["backend_contract"]["version"] = 1
+        evidence["backend_contract"]["version"] = True
+    elif fault == "unknown":
+        evidence["lifecycle"]["uncertain"] = True
+    elif fault == "foreign_run":
+        evidence["lifecycle"]["run_id"] = str(uuid4())
+    elif fault == "live":
+        evidence["lifecycle"]["phase"] = "live"
+    elif fault == "ack":
+        evidence["active_acknowledged"] = True
+    elif fault == "feedback":
+        evidence["feedback"] = True
+    elif fault == "host":
+        evidence["host_incarnation"] = str(uuid4())
+    elif fault == "fault":
+        evidence["fault"] = "original native fault"
+    elif fault == "transport":
+        evidence["transport_issue"] = "feedback unavailable"
+    elif fault == "reconciliation":
+        evidence["reconciliation"] = {"state": "unknown"}
+    elif fault == "completion":
+        evidence["finite_completion"] = copy.deepcopy(run["completion_receipt"])
+    elif fault == "accepted_action":
+        evidence["accepted_host_action"] = {"state": "active"}
+    elif fault == "config":
+        evidence["backend_contract"]["host_head"] = "b" * 40
+    elif fault == "reference":
+        evidence["retained_return_reference"]["reference_raw"] += 1
+    elif fault == "same_service":
+        authority.service_incarnation = run["service_incarnation"]
+    elif fault == "unknown_service":
+        authority.service_incarnation = None
+    elif fault == "intent":
+        authority.run["intent"] = {"state": "active"}
+    else:
+        gain = authority.run["physical_result"]["readback"]["readback"]["elbow_integral"]
+        if fault == "restored_i":
+            gain["restored_integral_readback"] = 1
+        elif fault == "restored_lock":
+            gain["restored_lock_readback"] = 1
+        else:
+            gain["restore_required"] = True
+    assert authority.elbow_recovery_prerequisite(RECIPES["physical-left-elbow-recovery-i1"], evidence) is None

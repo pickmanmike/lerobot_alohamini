@@ -131,6 +131,118 @@ class OwnerLock:
         self.stream.close()
 
 
+def _public_physical_evidence(evidence):
+    """Bound the duplicate gain ledger; the durable run retains the complete proof."""
+    if not isinstance(evidence, dict):
+        return evidence
+    lifecycle = evidence.get("lifecycle")
+    if not isinstance(lifecycle, dict) or lifecycle.get("phase") != "terminal":
+        return evidence
+    receipt = lifecycle.get("readback")
+    readback = receipt.get("readback") if isinstance(receipt, dict) else None
+    gain = readback.get("elbow_integral") if isinstance(readback, dict) else None
+    if not isinstance(gain, dict):
+        return evidence
+    fields = (
+        "schema_version",
+        "state",
+        "status",
+        "restore_required",
+        "integral",
+        "binding",
+        "motor",
+        "motor_id",
+        "motor_model",
+        "cached_calibration",
+        "original_registers",
+        "original_bytes",
+        "restored_bytes",
+        "restored_integral_readback",
+        "restored_lock_readback",
+        "restored_at_monotonic_s",
+        "first_failure",
+    )
+    public_gain = {key: gain[key] for key in fields if key in gain}
+    public_readback = dict(readback, elbow_integral=public_gain)
+    rows = readback.get("readbacks")
+    if isinstance(rows, list):
+        duplicate_clocks = {"read_started_at_monotonic_s", "read_completed_at_monotonic_s"}
+        public_readback["readbacks"] = [
+            {key: value for key, value in row.items() if key not in duplicate_clocks}
+            if isinstance(row, dict)
+            else row
+            for row in rows
+        ]
+    public_receipt = dict(receipt, readback=public_readback)
+    return dict(evidence, lifecycle=dict(lifecycle, readback=public_receipt))
+
+
+def _retained_recovery_idle(evidence, previous, service_incarnation):
+    """A new idle owner may reuse a completed proof with identical material bindings."""
+    old_service = previous.get("service_incarnation")
+    if (
+        not isinstance(service_incarnation, str)
+        or not isinstance(old_service, str)
+        or uuid_text(service_incarnation) != service_incarnation
+        or uuid_text(old_service) != old_service
+        or old_service == service_incarnation
+        or "intent" not in previous
+        or previous["intent"] is not None
+    ):
+        return False
+    for key in ("backend_contract", "retained_return_reference"):
+        old, current = previous.get(key), evidence.get(key)
+        if (
+            not isinstance(old, dict)
+            or not isinstance(current, dict)
+            or json.dumps(old, sort_keys=True, allow_nan=False)
+            != json.dumps(current, sort_keys=True, allow_nan=False)
+        ):
+            return False
+    return (
+        evidence.get("source") == previous.get("source") == "protected-physical-provider"
+        and evidence.get("lifecycle")
+        == {
+            "run_id": None,
+            "phase": "idle",
+            "startup_deadline": None,
+            "native_live_at": None,
+            "cleanup": None,
+            "uncertain": False,
+            "terminal_status": None,
+        }
+        and evidence["lifecycle"]["uncertain"] is False
+        and all(
+            evidence.get(key) is False
+            for key in (
+                "feedback",
+                "native_ack",
+                "active_acknowledged",
+                "hold_acknowledged",
+                "pose_aligned",
+            )
+        )
+        and all(
+            key in evidence and evidence[key] is None
+            for key in (
+                "fault",
+                "transport_issue",
+                "reconciliation",
+                "host_incarnation",
+                "finite_completion",
+                "feedback_sequence",
+                "measured_positions",
+                "measured_body",
+                "feedback_timing",
+                "acknowledged_intent_revision",
+                "recovery_prerequisite",
+                "return_reference_error",
+            )
+        )
+        and evidence.get("accepted_host_action") == {}
+    )
+
+
 class SessionAuthority:
     def __init__(self, state_directory, clock=time.monotonic, wall_clock=time.time, executor=None):
         self.clock, self.wall_clock = clock, wall_clock
@@ -597,7 +709,10 @@ class SessionAuthority:
                 or previous.get("first_cause") is not None
                 or not isinstance(receipt, dict)
                 or not isinstance(lifecycle, dict)
-                or evidence.get("lifecycle") != lifecycle
+                or not (
+                    evidence.get("lifecycle") == lifecycle
+                    or _retained_recovery_idle(evidence, previous, getattr(self, "service_incarnation", None))
+                )
                 or lifecycle.get("phase") != "terminal"
                 or lifecycle.get("terminal_status") != "completed"
                 or lifecycle.get("uncertain") is not False
@@ -1298,7 +1413,7 @@ class SessionAuthority:
                             if trajectory is None
                             else max(0, trajectory - self.run["progress_s"]),
                         ),
-                        "evidence": self._evidence(),
+                        "evidence": _public_physical_evidence(self._evidence()),
                         "recipes": [
                             name
                             for name, recipe in RECIPES.items()
