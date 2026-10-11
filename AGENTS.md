@@ -46,8 +46,25 @@ past the former sampling-window error. Stopped probe881a subsequently read elbow
 position2453/goal2472 with torque off/current0, matching model777/fw3.10 and
 calibration, all sixteen torque registers off/four body goals zero, both buses
 closed and no foreign owner. That stopped state does not qualify the original
-reference or return. One bounded return-only I0 comparison is being prepared to
-isolate normal-startup command history; no physical result is claimed.
+reference or return. The one bounded unchanged-setting return-only comparison
+1073c54a subsequently seeded actual2453 and approached retained2472 without a new
+departure. All171 native positions stayed2453; the live goal reached2472, current
+was0..26mA, and genuine original-reference qualification refused the19-tick residual.
+Its first cause and verified motor/body/lift/camera cleanup remain intact. Final
+stopped probe f79f894d still read2453/2472 with torque0/current0 and no owners;
+natural release did not restore the original reference.
+
+No supported further commanded restoration has been established inside the packet's
+bounds. Another departure, rebase or escalation conflicts with its return-before-
+departure rule, and a matched original-waveform I1 comparison is unavailable at
+this displaced pose. The specific remaining prerequisite is supported restoration
+of selected left elbow to original2472±2, independently verified while stopped;
+it is not another generic inspection or manual shoulder request. Restoration alone
+would not satisfy the remaining gain-trial evidence and restoration prerequisites.
+Useful repeated elbow response remains unqualified. Record this sharply identified
+residual, the completed diagnostics and software repair without claiming repaired
+motion. The reviewed candidate is available idle at motor25ea/executor3823,
+manifest b0be, with known terminal cleanup; this does not qualify elbow return.
 
 No I1 change has been applied. The retrieved primary manufacturer STS manual
 v1.1 defines one-byte position-I at23 and Lock55=1 changes as nonpersistent.
