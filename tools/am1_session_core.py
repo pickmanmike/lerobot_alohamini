@@ -606,7 +606,27 @@ class SessionAuthority:
                 if preparing_observation
                 else ("feedback", "required_observation", "native_ack")
             )
-            if evidence["fault"] or not self.asynchronous and not all(evidence[k] for k in required_keys):
+            historical_fault_clean = False
+            if (
+                evidence["fault"]
+                and self.asynchronous
+                and self.executor.source == "protected-physical-provider"
+            ):
+                qualify = getattr(self.executor, "can_start_after_fault", None)
+                historical_fault_clean = (
+                    isinstance(self.run, dict)
+                    and evidence["fault"] == self.run.get("first_cause")
+                    and isinstance(evidence.get("lifecycle"), dict)
+                    and evidence["lifecycle"] == self.run.get("physical_result")
+                    and callable(qualify)
+                    and qualify(self.run) is True
+                )
+            if (
+                evidence["fault"]
+                and not historical_fault_clean
+                or not self.asynchronous
+                and not all(evidence[k] for k in required_keys)
+            ):
                 self._hold()
                 return self._refuse("fresh qualified feedback/proof and acknowledgement required")
             self.run = {

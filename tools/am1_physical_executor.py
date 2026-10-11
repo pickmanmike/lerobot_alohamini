@@ -161,6 +161,82 @@ class PhysicalExecutor:
             },
         }
 
+    def can_start_after_fault(self, run):
+        """Allow a fresh startup after this exact resident fault's verified cleanup.
+
+        This checks cached terminal evidence only. It neither clears the original
+        fault nor reuses its feedback to admit the next run's physical effects.
+        """
+        with self.mutex:
+            lifecycle = self._lifecycle
+            if not (
+                isinstance(run, dict)
+                and run.get("status") == "faulted"
+                and run.get("uncertain") is False
+                and run.get("cleanup") == "physical_readback_verified"
+                and run.get("run_id") == self.run_id
+                and isinstance(self._fault, str)
+                and self._fault
+                and run.get("first_cause") == self._fault
+                and lifecycle.get("run_id") == self.run_id
+                and lifecycle.get("backend_incarnation") == self.host_incarnation
+                and run.get("backend_incarnation", self.host_incarnation) == self.host_incarnation
+                and lifecycle.get("phase") == "terminal"
+                and lifecycle.get("terminal_status") == "faulted"
+                and lifecycle.get("uncertain") is False
+                and lifecycle.get("cleanup") == "physical_readback_verified"
+                and lifecycle.get("cleanup_errors") == []
+                and run.get("physical_result") == lifecycle
+                and not (self.worker and self.worker.is_alive())
+                and not (self._reconciliation_worker and self._reconciliation_worker.thread.is_alive())
+            ):
+                return False
+            try:
+                from examples.alohamini.am1_session_contract import uuid_text
+
+                if (
+                    uuid_text(self.run_id) != self.run_id
+                    or uuid_text(self.host_incarnation) != self.host_incarnation
+                ):
+                    return False
+                receipt = lifecycle.get("readback")
+                readback = receipt.get("readback") if isinstance(receipt, dict) else None
+                camera = lifecycle.get("camera_release")
+                if not (
+                    isinstance(readback, dict)
+                    and type(receipt.get("version")) is int
+                    and readback.get("verified") is True
+                    and readback.get("buses_closed") is True
+                    and readback.get("cleanup_errors") == []
+                    and readback.get("selected_gain_restore_required") is False
+                    and qualified_cleanup_receipt(receipt, self.run_id, self.host_incarnation)
+                    and isinstance(camera, dict)
+                    and type(camera.get("version")) is int
+                    and camera["version"] == 1
+                    and camera.get("session_id") == self.run_id
+                    and camera.get("state") == "released"
+                    and camera.get("errors") == []
+                    and camera.get("runtime_failed") is False
+                ):
+                    return False
+                release = camera.get("release_evidence")
+                return bool(
+                    isinstance(release, dict)
+                    and type(release.get("backend_returncode")) is int
+                    and release["backend_returncode"] == 0
+                    and all(
+                        release.get(k) is True
+                        for k in (
+                            "backend_exited",
+                            "readers_joined",
+                            "viewer_socket_closed",
+                            "runtime_config_removed",
+                        )
+                    )
+                )
+            except (AttributeError, KeyError, TypeError, ValueError):
+                return False  # Malformed cached cleanup never becomes permission to start.
+
     def bind_run(self, run_id, recipe):
         with self.mutex:
             if (

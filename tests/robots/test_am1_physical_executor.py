@@ -1,6 +1,8 @@
 """Real adapter boundaries; injected hardware never opens a serial device."""
 
+import copy
 import importlib
+import threading
 import time
 from types import SimpleNamespace
 
@@ -1130,3 +1132,279 @@ def test_finite_body_zero_releases_cannot_extend_operational_uncertainty_deadlin
     with pytest.raises(RuntimeError) as repeated:
         send_operational_body_recipe(host, 2.2)
     assert repeated.value is caught.value and len(host.bus.rows) == before
+
+
+def terminal_cleanup_outcome(run_id, incarnation, status):
+    """Complete inert host outcome matching the existing twenty-read cleanup contract."""
+    joints = ("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper")
+    readbacks = [
+        {"bus": side, "motor": f"arm_{side}_{joint}", "register": "Torque_Enable", "value": 0}
+        for side in ("left", "right")
+        for joint in joints
+    ] + [
+        {"bus": "left", "motor": motor, "register": register, "value": 0}
+        for motor in ("base_left_wheel", "base_back_wheel", "base_right_wheel", "lift_axis")
+        for register in ("Torque_Enable", "Goal_Velocity")
+    ]
+    receipt = {
+        "version": 1,
+        "run_id": run_id,
+        "host_incarnation": incarnation,
+        "cleanup": "physical_readback_verified",
+        "uncertain": False,
+        "cleanup_errors": [],
+        "first_cause": "ComparisonRefusal: baseline: persistent motion",
+        "readback": {
+            "verified": True,
+            "buses_closed": True,
+            "lift_readback": "qualified",
+            "selected_gain_restore_required": False,
+            "cleanup_errors": [],
+            "readbacks": readbacks,
+        },
+    }
+    return {
+        "cleanup": "physical_readback_verified",
+        "uncertain": False,
+        "terminal_status": status,
+        "first_cause": receipt["first_cause"],
+        "readback": receipt,
+        "backend_incarnation": incarnation,
+        "cleanup_errors": [],
+        "camera_release": {
+            "version": 1,
+            "session_id": run_id,
+            "state": "released",
+            "errors": [],
+            "runtime_failed": False,
+            "release_evidence": {
+                "backend_exited": True,
+                "backend_returncode": 0,
+                "readers_joined": True,
+                "viewer_socket_closed": True,
+                "runtime_config_removed": True,
+            },
+        },
+    }
+
+
+class StartupFaultThenBlockedHost(ControlledHost):
+    def __init__(self):
+        super().__init__()
+        self.cleanup_release = threading.Event()
+        self.next_start_entered = threading.Event()
+        self.next_start_release = threading.Event()
+
+    def start(self, run_id, incarnation, recipe, cancel):
+        super().start(run_id, incarnation, recipe, cancel)
+        if self.started == 1:
+            raise RuntimeError(
+                "protected host exited during startup; inspect original host log and cleanup receipt"
+            )
+        self.next_start_entered.set()
+        while not self.next_start_release.wait(0.005):
+            cancel()
+
+    def finish(self, status):
+        if self.started == 1:
+            assert self.cleanup_release.wait(2)
+        return terminal_cleanup_outcome(self.run_id, self.incarnation, status)
+
+
+def historical_fault_authority(tmp_path):
+    from tests.robots.test_am1_persistent_session import start
+    from tools.am1_session_core import SessionAuthority
+
+    host = StartupFaultThenBlockedHost()
+    e = executor(host)
+    authority = SessionAuthority(tmp_path, executor=e)
+    first = start(authority, "physical-arm-hold-body")
+    until(lambda: e.evidence()["fault"] is not None)
+    authority.tick()
+    assert authority.run["status"] == "finishing"
+    host.cleanup_release.set()
+    until(lambda: e.evidence()["lifecycle"]["phase"] == "terminal")
+    e.worker.join(2)
+    authority.tick()
+    assert authority.run["status"] == "faulted"
+    assert authority.run["native_live_at"] is None and authority.run["deadline"] is None
+    assert authority.run["uncertain"] is False and authority.run["cleanup"] == "physical_readback_verified"
+    assert len(authority.run["physical_result"]["readback"]["readback"]["readbacks"]) == 20
+    return authority, e, host, first
+
+
+def test_terminal_start_after_known_startup_fault_requires_new_native_admission(tmp_path):
+    from tests.robots.test_am1_persistent_session import start
+
+    authority, e, host, first = historical_fault_authority(tmp_path)
+    try:
+        original = authority.run
+        saved = copy.deepcopy(original)
+        fault = e.evidence()["fault"]
+        assert fault == original["first_cause"]
+        assert e.evidence()["feedback"] is False and e.evidence()["native_ack"] is False
+        old_incarnation = e.host_incarnation
+        old_operation = authority.db.execute(
+            "SELECT result FROM operations WHERE id=?", (first["operation_id"],)
+        ).fetchone()
+        result = start(authority, "physical-arm-hold-body")
+        assert result["accepted"]  # Existing unconditional historical-fault veto deadlocks here.
+        assert result["status"] == "starting" and result["effect_admitted"] is False
+        assert host.next_start_entered.wait(1)
+        assert result["run_id"] != first["run_id"] and e.host_incarnation != old_incarnation
+        assert authority.run["deadline"] is None and authority.run["native_live_at"] is None
+        assert authority.run["progress_s"] == 0 and authority.run["recovery_episodes"] == 0
+        assert saved == original  # Original fault, native cause and full cleanup remain immutable.
+        assert (
+            authority.db.execute(
+                "SELECT result FROM operations WHERE id=?", (first["operation_id"],)
+            ).fetchone()
+            == old_operation
+        )
+        assert e.evidence()["fault"] is None  # Only ordinary accepted new-run bind resets its cache.
+        host.next_start_release.set()
+        until(lambda: e.evidence()["lifecycle"]["phase"] == "live")
+        authority.tick()
+        assert authority.run["backend_incarnation"] == e.host_incarnation
+        assert (
+            authority.run["native_live_at"] is not None
+            and authority.run["deadline"] > authority.run["native_live_at"]
+        )
+        assert saved == original
+    finally:
+        host.cleanup_release.set()
+        host.next_start_release.set()
+        authority.close()
+        e.worker.join(2)
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        "uncertain",
+        "unknown_cleanup",
+        "not_terminal",
+        "foreign_lifecycle",
+        "foreign_incarnation",
+        "foreign_receipt",
+        "missing_row",
+        "bool_zero",
+        "malformed_row",
+        "unqualified_lift",
+        "readback_unverified",
+        "bool_receipt_version",
+        "missing_restore_flag",
+        "bus_open",
+        "camera_foreign",
+        "camera_backend_live",
+        "camera_exit_failure",
+        "worker",
+        "reconciler",
+    ],
+)
+def test_terminal_start_refuses_unqualified_or_active_previous_physical_owner(tmp_path, changed):
+    from tests.robots.test_am1_persistent_session import start
+
+    authority, e, host, _ = historical_fault_authority(tmp_path)
+    try:
+        lifecycle = e._lifecycle
+        receipt = lifecycle["readback"]
+        readback = receipt["readback"]
+        camera = lifecycle["camera_release"]
+        if changed == "uncertain":
+            lifecycle["uncertain"] = True
+        elif changed == "unknown_cleanup":
+            lifecycle["cleanup"] = "physical_cleanup_unknown"
+        elif changed == "not_terminal":
+            lifecycle["phase"] = "finishing"
+        elif changed == "foreign_lifecycle":
+            lifecycle["run_id"] = "10000000-0000-4000-8000-000000000001"
+        elif changed == "foreign_incarnation":
+            lifecycle["backend_incarnation"] = "10000000-0000-4000-8000-000000000001"
+        elif changed == "foreign_receipt":
+            receipt["host_incarnation"] = "10000000-0000-4000-8000-000000000001"
+        elif changed == "missing_row":
+            readback["readbacks"].pop()
+        elif changed == "bool_zero":
+            readback["readbacks"][0]["value"] = False
+        elif changed == "malformed_row":
+            readback["readbacks"][0] = None
+        elif changed == "unqualified_lift":
+            readback["lift_readback"] = "unknown"
+        elif changed == "readback_unverified":
+            readback["verified"] = False
+        elif changed == "bool_receipt_version":
+            receipt["version"] = True
+        elif changed == "missing_restore_flag":
+            readback.pop("selected_gain_restore_required")
+        elif changed == "bus_open":
+            readback["buses_closed"] = False
+        elif changed == "camera_foreign":
+            camera["session_id"] = "10000000-0000-4000-8000-000000000001"
+        elif changed == "camera_backend_live":
+            camera["release_evidence"]["backend_exited"] = False
+        elif changed == "camera_exit_failure":
+            camera["release_evidence"]["backend_returncode"] = 1
+        elif changed == "worker":
+            e.worker = SimpleNamespace(is_alive=lambda: True, join=lambda *_: None)
+        elif changed == "reconciler":
+            e._reconciliation_worker = SimpleNamespace(
+                thread=SimpleNamespace(is_alive=lambda: True),
+                state="pending",
+                error=None,
+                close=lambda: None,
+            )
+        authority.run["physical_result"] = copy.deepcopy(lifecycle)
+        saved = copy.deepcopy(authority.run)
+        fault = e.evidence()["fault"]
+        result = start(authority, "physical-arm-hold-body")
+        assert not result["accepted"] and not result["effect_admitted"]
+        assert authority.run == saved and e.evidence()["fault"] == fault
+        assert host.started == 1 and not host.next_start_entered.is_set()
+    finally:
+        host.cleanup_release.set()
+        host.next_start_release.set()
+        authority.close()
+        e.worker.join(2)
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_terminal_start_other_executor_fault_has_no_physical_exception(tmp_path, asynchronous):
+    from tests.robots.test_am1_persistent_session import start
+    from tools.am1_fake_executor import FakeExecutor
+    from tools.am1_session_core import SessionAuthority
+
+    e = FakeExecutor()
+    e.asynchronous = asynchronous
+    e.fault = "current fake fault"
+    authority = SessionAuthority(tmp_path, executor=e)
+    try:
+        result = start(authority)
+        assert not result["accepted"] and not result["effect_admitted"]
+        assert authority.run is None and e.fault == "current fake fault"
+    finally:
+        authority.close()
+
+
+def test_terminal_start_current_evidence_failure_cannot_inherit_historical_permission(tmp_path):
+    from tests.robots.test_am1_persistent_session import start
+
+    authority, e, host, _ = historical_fault_authority(tmp_path)
+    original_evidence = e.observation.evidence
+    fault = e.evidence()["fault"]
+
+    def unavailable():
+        raise RuntimeError(fault)  # Even identical wording is a current adapter failure.
+
+    try:
+        e.observation.evidence = unavailable
+        result = start(authority, "physical-arm-hold-body")
+        assert not result["accepted"] and not result["effect_admitted"]
+        assert authority.run["status"] == "faulted" and e._fault == fault
+        assert host.started == 1
+    finally:
+        e.observation.evidence = original_evidence
+        host.cleanup_release.set()
+        host.next_start_release.set()
+        authority.close()
+        e.worker.join(2)
