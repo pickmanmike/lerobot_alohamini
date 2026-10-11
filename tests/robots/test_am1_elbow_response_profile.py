@@ -18,6 +18,25 @@ KEY = "arm_left_elbow_flex.pos"
 RECIPE = "physical-left-elbow-response-characterize"
 PROFILE = "LeftElbowResponseCharacterize"
 CALIBRATION = {"drive_mode": 0, "homing_offset": 1845, "range_min": 864, "range_max": 3073}
+# Original d850 origin acquisition clocks; separate position/current completions
+# remain literal, with no synthesized nominal 10 Hz timestamps.
+ORIGIN_CLOCKS = (
+    (152408.673558182, 152408.675418069, 152408.678407176, 152408.680376877),
+    (152408.705558176, 152408.707421155, 152408.710440780, 152408.713338758),
+    (152408.739614907, 152408.741424553, 152408.744542826, 152408.747369137),
+    (152408.773619268, 152408.775431766, 152408.778416910, 152408.780381648),
+    (152408.807564852, 152408.809426701, 152408.812433327, 152408.814387491),
+    (152408.842387490, 152408.843429747, 152408.846466503, 152408.849337962),
+    (152408.873565281, 152408.875430426, 152408.878414774, 152408.880392456),
+    (152408.907586734, 152408.909437861, 152408.912434005, 152408.914385058),
+    (152408.940586078, 152408.942434520, 152408.945431127, 152408.947389773),
+    (152408.974571199, 152408.976435418, 152408.979422377, 152408.981388578),
+    (152409.010612853, 152409.012503666, 152409.016434901, 152409.018390139),
+    (152409.040587331, 152409.042436384, 152409.045426639, 152409.047389563),
+    (152409.073576397, 152409.075436895, 152409.078418594, 152409.080394795),
+    (152409.108581090, 152409.110442884, 152409.113426343, 152409.115379044),
+    (152409.141621434, 152409.143475802, 152409.146477169, 152409.149365387),
+)
 MOTOR = {
     "bus": "left",
     "name": KEY[:-4],
@@ -794,3 +813,162 @@ def test_full_sparse_proof_stays_local_and_authority_ack_frame_remains_bounded(m
         assert sample["selected_joint"]["sparse_receipts"] == note["sparse_receipts"]
     finally:
         a.close()
+
+
+def test_signed_task_collects_distinct_native_feedback_between_unchanged_ten_hz_actions():
+    task = FiniteTask(contract.RECIPES[RECIPE], seed(norm(2472)), 0, 1.5)
+    sequence = 0
+    while task.provider.preparing:
+        sequence += 1
+        task.advance(sequence / 10, {"positions": seed(norm(2472)), "sequence": sequence})
+    p = task.provider._program
+    feed = Feedback(p)
+    task.last_frame = p._last_tick = ORIGIN_CLOCKS[0][3] - 0.01
+    advances = 0
+    for clocks in ORIGIN_CLOCKS:
+        sequence += 1
+        now = clocks[3] + 0.01
+        positions, selected = feed.get(now, sequence)
+        positions[KEY] = norm(2472)
+        selected["position"].update(
+            raw=2472,
+            normalized=norm(2472),
+            read_started_at_monotonic_s=clocks[0],
+            read_completed_at_monotonic_s=clocks[1],
+        )
+        selected["current"].update(
+            read_started_at_monotonic_s=clocks[2],
+            read_completed_at_monotonic_s=clocks[3],
+        )
+        advances += task.advance(
+            now, {"positions": positions, "sequence": sequence, "selected_joint": selected}
+        )
+    assert len(p._baseline) == len(ORIGIN_CLOCKS)
+    assert advances == 4 and p.elapsed_s == 0.4
+    assert [row["position_at"] for row in p._baseline] == [row[1] for row in ORIGIN_CLOCKS]
+
+
+@pytest.mark.parametrize("returned_raw", [2472, 2453])
+def test_original_native_return_clocks_qualify_a_suffix_but_preserve_real_nonreturn(
+    monkeypatch, returned_raw
+):
+    p = provider()
+    p._baseline_raw, p._noise = 2472, 0
+    origin = [
+        {
+            "at": row[3],
+            "position_at": row[1],
+            "current_started": row[2],
+            "position_started": row[0],
+            "raw": returned_raw,
+            "current_ma": 19.5,
+            "goal_raw": 2472,
+        }
+        for row in ORIGIN_CLOCKS[:12]
+    ]
+    endpoint = [
+        dict(
+            row,
+            at=row["at"] - 3.6,
+            position_at=row["position_at"] - 3.6,
+            current_started=row["current_started"] - 3.6,
+            position_started=row["position_started"] - 3.6,
+            raw=2453,
+            goal_raw=2438,
+        )
+        for row in origin
+    ]
+    p._phase_samples.update({(1, "origin"): origin, (1, "endpoint"): endpoint})
+    # This contrast isolates the production acquisition-window/raw-return guard;
+    # sparse provenance itself is covered by the full binding cases above.
+    monkeypatch.setattr(p, "_receipt", lambda *_args, **_kwargs: {"action": {"expected_goal_raw": 2438}})
+    now = 152409.140846676  # Original failing adapter reply receipt.
+    if returned_raw == 2453:
+        with pytest.raises(ValueError, match="original raw envelope"):
+            p._qualify_cycle(1, now)
+        assert p.characterization["cycles"] == [] and p.characterization["branch"] is None
+    else:
+        p._qualify_cycle(1, now)
+        assert p.characterization["cycles"][0]["signed_response_raw"] == 19
+        assert p.characterization["cycles"][0]["response_threshold_raw"] == 17
+
+
+def test_dense_native_current_plateaus_preserve_time_qualified_rising_current_refusal():
+    p = provider()
+    feed = run(p, negative_moves=False, until=5)
+    base_now = 5.0
+    with pytest.raises(ValueError, match="sustained rising current"):
+        for index in range(1, 11):
+            now = base_now + index / 30
+            ma = 13.0 + (index // 3) * 6.5
+            positions, selected = feed.get(now, 50 + index, current=ma)
+            p.advance(now, positions, 50 + index, selected_feedback=selected)
+    assert p.elapsed_s < 5.5 and p._adverse_reason is not None
+
+
+@pytest.mark.parametrize("currents", [(0, 6.5, 0, 13, 0, 19.5), (0, 6.5, 6.4, 13, 19.5, 26)])
+def test_real_current_decreases_cannot_be_skipped_to_invent_a_sustained_rise(currents):
+    p = provider()
+    feed = run(p, negative_moves=False, until=5)
+    for index, ma in enumerate(currents, 1):
+        now = 5 + index * 0.05
+        positions, selected = feed.get(now, 50 + index, current=ma)
+        p.advance(now, positions, 50 + index, selected_feedback=selected)
+    assert p._adverse_reason is None and p.elapsed_s == 5.3
+
+
+def test_time_qualified_endpoint_keeps_a_genuine_earlier_retained_peak():
+    p = provider()
+    first_endpoint = True
+
+    def mutate(p, positions, selected):
+        nonlocal first_endpoint
+        if p.diagnostic_context["phase"] == "endpoint" and first_endpoint:
+            first_endpoint = False
+            positions[KEY] = norm(2379)
+            selected["position"].update(raw=2379, normalized=norm(2379))
+
+    run(p, negative_moves=False, until=9, mutate=mutate)
+    assert p.characterization["cycles"][0]["signed_response_raw"] == 20
+
+
+@pytest.mark.parametrize("handoff", ["first_reply", "overdue", "after_real_proof"])
+def test_actual_reader_prepared_seed_handoff_wait_is_only_the_first_existing_frame(handoff):
+    task = FiniteTask(contract.RECIPES[RECIPE], seed(norm(2399)), 0, 1.5)
+    sequence = 0
+    while task.provider.preparing:
+        sequence += 1
+        task.advance(sequence / 10, {"positions": seed(norm(2399)), "sequence": sequence})
+    p = task.provider._program
+    original_seed, frame_at = copy.deepcopy(task.original_seed), task.last_frame
+
+    def read(now, number, selected=None):
+        client = client_sample(now)
+        client.get_observation = lambda: seed(norm(2399))
+        client.latest_observation_received_at = now - 0.001
+        client.latest_am1_local_feedback.update(
+            state="active",
+            observation_id=number,
+            epoch=0,
+            intent_revision=0,
+            accepted_action_sequence=number,
+            read_started_at_monotonic_s=now - 0.015,
+            acquired_at_monotonic_s=now - 0.005,
+        )
+        if selected is not None:
+            client.latest_am1_local_feedback["selected_joint"] = selected
+        return read_physical_sample(client, "run", "host", number - 1, clock=lambda: now)
+
+    now = frame_at + (0.133 if handoff == "overdue" else 0.033)
+    if handoff == "after_real_proof":
+        _, selected = Feedback(p).get(now, 100)
+        assert not task.advance(now, read(now, 100, selected))
+        now += 0.033
+    sample = read(now, 101)
+    if handoff == "first_reply":
+        assert not task.advance(now, sample)
+        assert task.last_frame == frame_at and p.elapsed_s == 0
+        assert task.original_seed == original_seed and p._collected_sequence == -1
+    else:
+        with pytest.raises(ValueError, match="requires actual selected feedback"):
+            task.advance(now, sample)

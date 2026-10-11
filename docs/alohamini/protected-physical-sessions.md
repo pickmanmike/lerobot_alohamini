@@ -44,12 +44,65 @@ remain unchanged. Command acceptance, program completion, original envelope
 qualification and actual useful movement remain distinct results.
 
 Current external P1 capture failed certificate-expiry validation before Start;
-no frames or motor effects occurred. No trust exception was used. Actual current
-finite Pi views are retained privately: qualified chest, forward and right-wrist
-pixels lack a useful selected-elbow angle; first left-wrist/backward requests
-returned503. Required local-camera authority and optional P1 delivery remain
-separate. Source checks, focused review and affected-component staging are underway;
-no new powered characterization or gain-setting comparison has yet occurred.
+no P1 frames or motor effects occurred through that attempt. No trust exception
+was used. A later finite camera-only check obtained and inspected actual fresh
+chest, forward, backward, left-wrist and right-wrist pixels. None contains a useful
+view of the selected elbow linkage. They are current images, not visual motion
+confirmation. The five distinct required chest samples had maximum upstream-arrival
+age53ms, and the original30-second source lease ended normally with all checked
+video/serial devices unowned. Required local-camera authority and advisory P1 remain
+separate.
+
+The first new signed physical run, `d85018ee-3dd6-45fe-b66a-b9288644b04b`, used
+motor `d957011d4090b0264df21dd2e90d07f7e185b664` and executor
+`286566f46636c04a447acd28ec53f9d33ff59d19`, with unchanged calibration/settings.
+Ordinary normal-rest startup succeeded. Its fresh frozen elbow reference was
+raw2472 / normalized45.586238, a higher starting pose than both the old +3 tests
+and the historical +10 positive control. Other eleven joint targets stayed frozen;
+body/lift commands stayed zero after startup. It requested q0−3 with three-second
+outward/return ramps and half-second holds through the sole protected owner.
+
+| Actual phase | Encoded/live goal | Measured position | Current/load | Result |
+|---|---:|---:|---|---|
+| Baseline | 2472 | 2472 | 0mA | 61 native baseline samples, raw range0 |
+| Negative endpoint | 2438 | 2453 | 19.5mA /72 | 34-tick command, 19-tick outward response; threshold17 |
+| Original return | 2472 | 2453 | 26mA /−88 | Zero measured reversal, 19-tick residual; return band2 |
+
+All three sparse native ID3 replies match their recorded44-byte packets and
+checksums. Torque1, position mode0, status0, voltage11.8V and temperature30C do not
+establish shaft torque or hidden mechanical condition. There are277 unique selected
+measurements. The endpoint has16 measurements spanning.503027s; all93 return
+measurements and15 origin measurements stay at2453. No second negative cycle or
++10 expansion occurred.
+
+The run faulted at8.9 trajectory seconds, one admission, zero qualified cycles,
+zero final returns and zero recoveries. Its retained original first cause is
+`ValueError: signed cycle lacks three distinct returned acquisitions`; known
+`physical_readback_verified` cleanup has uncertaintyfalse, all20 motor/body
+readbacks zero, buses closed, lift cleanup qualified and camera normally released.
+Program completion, envelope qualification and useful repeated response all failed.
+The outward response alone passes the predeclared response threshold.
+
+This exposed a separate software seam: distinct native feedback arriving between
+10Hz trajectory steps was discarded, and qualification selected only the latest
+three retained rows. Native acquisitions remain near30Hz; a representative original
+three-row bracket spans.198052s current/.199007s position, just below the existing.2s
+rule. Exact internal worker membership was not serialized, so that bracket is a
+comparison rather than a claimed internal trace. The correction collects each
+distinct original native acquisition independently of unchanged10Hz trajectory
+advancement, then qualifies a bounded recent suffix spanning at least.2s in BOTH
+original clocks. The original.5s freshness, deadline, seed, limits and two-tick raw
+return band remain. Intermediate equal-current plateaus do not conceal a sustained
+rise; genuine current decreases break that trend. The first preparing-action reply
+can wait only inside the original first.1s interval before initial selected proof;
+progress and deadline do not reset.
+
+Offline replay of the complete saved selected evidence now qualifies eight actual
+fresh origin acquisitions over.233s and refuses the measured19-tick nonreturn.
+The other eleven joints are held mock inputs in that replay, not new physical
+feedback. The repair corrects feedback qualification; it does not repair or relabel
+the actual motion failure. No fresh physical rerun, larger departure, calibration
+change or I1 setting has followed the failed return.
 
 ## Motion-quality result, 2026-10-11
 

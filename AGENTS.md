@@ -35,6 +35,15 @@ other gains/settings/limits remain unchanged. Hard obstruction, sensing ambiguit
 or adverse current/load evidence excludes that trial. Do not prepare or apply it
 merely because small commands failed.
 
+Current signed native run d85018ee measured 19 encoder ticks outward on a 34-tick
+negative command, but zero measured reversal and a 19-tick residual against the
+original two-tick return band. Its known-cleanup first cause is retained. The
+native-cadence repair qualifies original real acquisitions; it does not qualify
+that nonreturn. Do not repeat, rebase or admit positive expansion merely to get
+past the former sampling-window error. No integral change has been applied;
+installed-firmware register semantics and a supported nonpersistent stopped
+write/restore procedure must be established before that conditional experiment.
+
 ## Current AM1 motion quality and durability scope
 
 For the explicitly invoked AM1-MOTION-QUALITY-01 continuation, retain the accepted

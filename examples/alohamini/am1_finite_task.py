@@ -120,9 +120,21 @@ class FiniteTask:
 
     def advance(self, now, sample):
         self.check(now)
-        if not self.active or self.finished or now - self.last_frame < 0.1 - 1e-9:
+        if not self.active or self.finished:
             return False
         if sample["sequence"] <= self.sequence:
+            return False
+        selected = self.profile == LEFT_ELBOW_RESPONSE.profile and not self.provider.preparing
+        if (
+            selected and sample.get("selected_joint") is None and self.provider.awaiting_initial_feedback
+            and now - self.last_frame < 0.1 - 1e-9
+        ):
+            return False
+        if selected and not self.provider.collect_feedback(
+            now, sample["positions"], sample["sequence"], selected_feedback=sample.get("selected_joint")
+        ):
+            return False
+        if now - self.last_frame < 0.1 - 1e-9:
             return False
         was_complete = self.provider.complete
         kwargs = {"selected_feedback": sample.get("selected_joint")} if self.profile == LEFT_ELBOW_RESPONSE.profile else {}

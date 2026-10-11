@@ -279,6 +279,7 @@ class LeftElbowResponseCharacterizeInput(ScriptedLeaderInput):
         self._identity = None
         self._motor = None
         self._baseline = []
+        self._baseline_extrema = None
         self._baseline_raw = self._noise = None
         self._phase_samples = {}
         self._sparse = {}
@@ -287,6 +288,7 @@ class LeftElbowResponseCharacterizeInput(ScriptedLeaderInput):
         self._current_binding = None
         self._adverse_reason = None
         self._final_residual = None
+        self._collected_sequence = -1
         self._cycles = []
         self._record("am1_scripted_selected_plan", joint=self.selected_joint, origin=q0,
                      signed_conditions=[-3.0, 10.0], slope_norm_per_s=1.0,
@@ -323,6 +325,58 @@ class LeftElbowResponseCharacterizeInput(ScriptedLeaderInput):
     @staticmethod
     def _number(value):
         return type(value) in (int, float) and math.isfinite(value)
+
+    def collect_feedback(self, now, observed, observation_sequence, *, selected_feedback=None):
+        if self._adverse_reason is not None:
+            raise ValueError(self._adverse_reason)
+        if type(observation_sequence) is not int or observation_sequence < self._collected_sequence:
+            raise ValueError("signed native feedback sequence regressed")
+        if observation_sequence == self._collected_sequence:
+            return False
+        self._feedback(now, observed, selected_feedback)
+        self._collected_sequence = observation_sequence
+        return True
+
+    @property
+    def awaiting_initial_feedback(self):
+        return self._collected_sequence < 0 and self.elapsed_s == 0
+
+    @staticmethod
+    def _recent_suffix(samples, label, *, now=None):
+        if len(samples) < 3 or samples[-1]["at"] - samples[0]["at"] < .2 - 1e-9:
+            raise ValueError(f"signed {label} lacks three distinct actual acquisitions")
+        if samples[-1]["position_at"] - samples[0]["position_at"] < .2 - 1e-9:
+            raise ValueError(f"signed {label} position acquisition span is too short")
+        for start in range(len(samples) - 3, -1, -1):
+            suffix = samples[start:]
+            if any(suffix[-1][k] - suffix[0][k] < .2 - 1e-9 for k in ("at", "position_at")):
+                continue
+            if now is not None and any(
+                now - row[k] > .5 for row in suffix for k in ("current_started", "position_started")
+            ):
+                raise ValueError(f"signed {label} original acquisition is stale")
+            return suffix
+        raise ValueError(f"signed {label} acquisition window unavailable")
+
+    def _rising_current_window(self, samples):
+        for start, first in enumerate(samples):
+            chosen, raw = [first], [first["raw"]]
+            previous = first
+            for row in samples[start + 1:]:
+                raw.append(row["raw"])
+                if (
+                    row["goal_raw"] != first["goal_raw"] or max(raw) - min(raw) > self._noise
+                    or row["current_ma"] < previous["current_ma"]
+                ):
+                    break
+                previous = row
+                if row["current_ma"] - chosen[-1]["current_ma"] < 6.5 - 1e-9:
+                    continue
+                if len(chosen) < 3:
+                    chosen.append(row)
+                elif row["at"] - first["at"] >= .2 - 1e-9:
+                    return [*chosen, row]
+        return None
 
     def _feedback(self, now, observed, feedback):
         if not isinstance(feedback, dict) or feedback.get("version") != 1:
@@ -407,6 +461,8 @@ class LeftElbowResponseCharacterizeInput(ScriptedLeaderInput):
         row = {
             "at": current["read_completed_at_monotonic_s"], "raw": position["raw"],
             "position_at": position["read_completed_at_monotonic_s"],
+            "current_started": current["read_started_at_monotonic_s"],
+            "position_started": position["read_started_at_monotonic_s"],
             "current_ma": abs(current["ma"]), "goal_raw": action["expected_goal_raw"],
         }
         phase_key = (context["cycle"], context["phase"])
@@ -418,6 +474,14 @@ class LeftElbowResponseCharacterizeInput(ScriptedLeaderInput):
         del samples[:-20]
         if context["phase"] == "baseline":
             self._baseline.append(row)
+            del self._baseline[:-20]
+            if self._baseline_extrema is None:
+                self._baseline_extrema = (row["raw"], row["raw"])
+            else:
+                self._baseline_extrema = (
+                    min(self._baseline_extrema[0], row["raw"]),
+                    max(self._baseline_extrema[1], row["raw"]),
+                )
         receipts = feedback.get("sparse_receipts")
         if not isinstance(receipts, dict):
             raise ValueError("signed selected sparse phase evidence unavailable")
@@ -425,14 +489,8 @@ class LeftElbowResponseCharacterizeInput(ScriptedLeaderInput):
         for key in self._sparse:
             self._receipt(key, now)
         if context["phase"] == "endpoint" and len(samples) >= 4:
-            last = samples[-4:]
-            if (
-                last[-1]["at"] - last[0]["at"] >= .2 - 1e-9
-                and len({v["goal_raw"] for v in last}) == 1
-                and max(v["raw"] for v in last) - min(v["raw"] for v in last) <= self._noise
-                and all(b["current_ma"] - a["current_ma"] >= 6.5 - 1e-9
-                        for a, b in zip(last[:-1], last[1:], strict=True))
-            ):
+            last = self._rising_current_window(samples)
+            if last is not None:
                 self._adverse_reason = "signed endpoint has sustained rising current without measured response"
                 self._record("am1_scripted_signed_adverse", reason=self._adverse_reason,
                              actual_current_window=copy.deepcopy(last))
@@ -501,25 +559,18 @@ class LeftElbowResponseCharacterizeInput(ScriptedLeaderInput):
         return receipt
 
     def _qualify_baseline(self, now):
-        if len(self._baseline) < 3 or self._baseline[-1]["at"] - self._baseline[0]["at"] < .2 - 1e-9:
-            raise ValueError("signed baseline lacks actual distinct feedback")
-        if self._baseline[-1]["position_at"] - self._baseline[0]["position_at"] < .2 - 1e-9:
-            raise ValueError("signed baseline position acquisition span is too short")
+        samples = self._recent_suffix(self._baseline, "baseline", now=now)
         baseline = self._receipt("baseline", now)
         self._baseline_raw = baseline["action"]["expected_goal_raw"]
-        self._noise = max(v["raw"] for v in self._baseline) - min(v["raw"] for v in self._baseline)
+        self._noise = self._baseline_extrema[1] - self._baseline_extrema[0]
         if any(abs(v["raw"] - self._baseline_raw) > LEFT_ELBOW_RESPONSE.return_limit(self._noise)
-               for v in self._baseline[-3:]):
+               for v in samples):
             raise ValueError("signed baseline did not qualify the original reference")
 
     def _qualify_cycle(self, cycle, now):
         endpoint = self._receipt(f"cycle{cycle}_endpoint", now)
         self._receipt(f"cycle{cycle}_origin", now, fresh=True)
-        samples = self._phase_samples.get((cycle, "origin"), [])[-3:]
-        if len(samples) < 3 or samples[-1]["at"] - samples[0]["at"] < .2 - 1e-9:
-            raise ValueError("signed cycle lacks three distinct returned acquisitions")
-        if samples[-1]["position_at"] - samples[0]["position_at"] < .2 - 1e-9:
-            raise ValueError("signed returned position acquisition span is too short")
+        samples = self._recent_suffix(self._phase_samples.get((cycle, "origin"), []), "returned", now=now)
         residual = max(abs(v["raw"] - self._baseline_raw) for v in samples)
         if residual > LEFT_ELBOW_RESPONSE.return_limit(self._noise):
             raise ValueError("signed cycle did not return to its original raw envelope")
@@ -528,10 +579,7 @@ class LeftElbowResponseCharacterizeInput(ScriptedLeaderInput):
         if excursion == 0 or (excursion < 0) != (cycle <= 2):
             raise ValueError("signed endpoint actual encoder direction differs")
         rows = self._phase_samples.get((cycle, "endpoint"), [])
-        if len(rows) < 3 or rows[-1]["at"] - rows[0]["at"] < .2 - 1e-9:
-            raise ValueError("signed endpoint lacks distinct actual feedback")
-        if rows[-1]["position_at"] - rows[0]["position_at"] < .2 - 1e-9:
-            raise ValueError("signed endpoint position acquisition span is too short")
+        self._recent_suffix(rows, "endpoint")
         signed = max((v["raw"] - self._baseline_raw) * (1 if excursion > 0 else -1) for v in rows)
         result = {
             "cycle": cycle, "endpoint_goal_raw": goal, "signed_response_raw": signed,
@@ -541,18 +589,19 @@ class LeftElbowResponseCharacterizeInput(ScriptedLeaderInput):
         self._cycles.append(result)
         self._record("am1_scripted_signed_cycle_qualified", **result)
 
-    def _qualify_final(self):
-        samples = self._phase_samples.get((4 if self._expanded else 2, "final"), [])[-3:]
-        if len(samples) < 3 or any(samples[-1][k] - samples[0][k] < .2 - 1e-9 for k in ("at", "position_at")):
-            raise ValueError("signed final raw return lacks three distinct actual acquisitions")
+    def _qualify_final(self, now):
+        samples = self._recent_suffix(
+            self._phase_samples.get((4 if self._expanded else 2, "final"), []), "final raw return", now=now
+        )
         residual = max(abs(v["raw"] - self._baseline_raw) for v in samples)
         if residual > LEFT_ELBOW_RESPONSE.return_limit(self._noise):
             raise ValueError("signed final raw return exceeds the original measured envelope")
         self._final_residual = residual
 
     def validate_final_feedback(self, now, observed, selected_feedback):
-        self._feedback(now, observed, selected_feedback)
-        self._qualify_final()
+        sequence = selected_feedback.get("observation_id") if isinstance(selected_feedback, dict) else None
+        self.collect_feedback(now, observed, sequence, selected_feedback=selected_feedback)
+        self._qualify_final(now)
 
     def advance(self, now, observed, observation_sequence, *, defer_events=False, selected_feedback=None):
         if self._last_tick is None or self.complete:
@@ -561,7 +610,7 @@ class LeftElbowResponseCharacterizeInput(ScriptedLeaderInput):
             raise ValueError(self._adverse_reason)
         if not math.isfinite(now) or now < self._last_tick or observation_sequence <= self._sequence:
             raise ValueError("signed clock/feedback sequence is invalid")
-        self._feedback(now, observed, selected_feedback)
+        self.collect_feedback(now, observed, observation_sequence, selected_feedback=selected_feedback)
         next_progress = round(self.elapsed_s + min(now - self._last_tick, self._frame_s), 9)
         if self.elapsed_s < 2 <= next_progress:
             self._qualify_baseline(now)
@@ -575,7 +624,7 @@ class LeftElbowResponseCharacterizeInput(ScriptedLeaderInput):
                     self.duration_s = 18.0 if useful else LEFT_ELBOW_RESPONSE.trajectory_s
                     self._record("am1_scripted_signed_branch", **self.characterization)
         if next_progress >= self.duration_s:
-            self._qualify_final()
+            self._qualify_final(now)
         super().advance(now, observed, observation_sequence, defer_events=defer_events)
 
     def freeze(self):

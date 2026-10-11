@@ -118,6 +118,15 @@ class PreparedScriptedInput:
     def validate_final_feedback(self, now, observed, selected_feedback):
         self._program.validate_final_feedback(now, observed, selected_feedback)
 
+    def collect_feedback(self, now, observed, observation_sequence, *, selected_feedback=None):
+        return self._program.collect_feedback(
+            now, observed, observation_sequence, selected_feedback=selected_feedback
+        )
+
+    @property
+    def awaiting_initial_feedback(self):
+        return not self.preparing and self._program.awaiting_initial_feedback
+
     def _record(self, event: str, **fields: Any) -> None:
         self._pending_events.append(
             {
