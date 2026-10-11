@@ -1,24 +1,250 @@
 # AM1 protected physical sessions
 
-AM1-LIFT-STARTUP-01 now has actual bounded startup, cleanup and finite-workload
-results through the Pi-owned protected backend: a small measured shoulder check,
-an 88-second comparison, four-cycle 352-second repeat, automatic 352-second restart
-from ordinary rest and the original 12-second body recipe completed with verified
-cleanup. Some arm joints remained static in saved long-run segments; counters do
-not establish useful movement of every joint. Every earlier failure and its first
-cause remains retained. Matched restoration returned normal motor/helper and
-original Windows configuration, while retaining the physical history and original
-simulated services idle. Quantified body analysis confirms mapped wheel response and bounded up/down lift
-pulses; arrival at the requested 50 mm targets and floor travel were not demonstrated.
+AM1-MOTION-QUALITY-01 is complete through its evidence-backed limitation path.
+Two bounded left-elbow comparisons show that the live servo goal changes correctly,
+but the sampled position does not move. Longer holds do not improve the response.
+The selected-profile completion defect is repaired; useful elbow movement remains
+unqualified pending one power-off inspection. The reviewed candidate is available
+idle through the existing opt-in physical route, with verified cleanup.
+
+Durability means software fault tolerance, connection and control continuity,
+state preservation, and recovery with minimal human intervention. Physical wear
+and mechanical lifespan were not assessed. The accepted 88/352/352/body12 continuity
+milestones remain achieved at their recorded sources; they were not rerun unchanged.
 Simulation remains the default, AM1 stays wireless and P1 remains advisory.
 
 This continues [draft PR #20](https://github.com/pickmanmike/lerobot_alohamini/pull/20),
-dependent on #19 -> #18 -> #17 -> #16 without merge/retarget. Required observation
-remains actual Pi-local camera evidence. Browser/administrative launch connections
-do not own task execution or renew its deadline. Original adapter history below
-records its earlier failure/restoration, not the current deployment.
+dependent on #19 -> #18 -> #17 -> #16 without merge, retarget or history rewrite.
+Required observation remains actual Pi-local camera evidence. Browser/administrative
+launch connections do not own execution or renew the deadline. Older checkpoint
+and rollback results below are historical; the following section records the
+current deployment and the new evidence.
 
-## Current physical evidence
+## Motion-quality result, 2026-10-11
+
+### Target, live register and measured response
+
+The verified mapping is left follower elbow, left bus ID3, STS3215,
+`range_m100_100`, calibration range 864..3073, drive mode 0 and homing offset 1845.
+Each selected run freezes its fresh measured reference for both repetitions:
+normalized 38.9769126301494 / raw 2399. Requested +3 gives normalized
+41.9769126301494; the existing encoder produces raw 2432 / bytes `[128, 9]`,
+which normalizes to 41.964689904934346. Return raw 2399 uses bytes `[95, 9]`.
+Other eleven joint targets stay at the acquired vector; body commands remain zero
+after ordinary normal-rest startup. No gains, calibration, Phase, excursion,
+rate, current or torque ceilings were changed.
+
+The original comparison uses 3-second outward/return ramps and 0.5-second
+endpoint/origin holds. The separately labelled dwell comparison extends only
+those holds to two seconds. Each has two cycles, one final qualification against
+the original return envelope, and an unchanged 60-second Live deadline. Native
+position acquisitions and provider progress retain their distinct clocks.
+
+| Run / tested executor | Program / original envelope | Measured motion | Recovery / cleanup |
+|---|---|---|---|
+| First selected18 `3a16b482-1e20-4092-ab42-8621d44cd3f0` / `82b7a2a487437701d1e286c0b6322bf5bcd86e51` | Completed 18 / two cycles / one final qualified return | 563 unique positions, all raw 2399; baseline 61 samples/range 0; maximum acquisition gap 378.037 ms | Three completion-boundary proof-loss episodes; actual input loss was not demonstrated. Verified cleanup, uncertainty false; original first cause retained. |
+| Corrected selected18 `4f3a3516-b6db-4651-b2d3-12ee5d1a235d` / `b8558888ed43cbf5cc8cbf6bfaf493ccc21602fe` | Completed 18 / two cycles / one final qualified return | 553 unique positions, all raw 2399; baseline 60/range 0; acquisition span 18.479854 s, maximum gap 54.999 ms | Zero episodes, no outer/native first cause; verified cleanup, uncertainty false. |
+| Dwell24 `a188f2dd-a591-45ff-aa74-2dc8aaa07c29` / `b8558888ed43cbf5cc8cbf6bfaf493ccc21602fe` | Completed 24 / two cycles / one final qualified return | 737 unique positions, all raw 2399; baseline 61/range 0; acquisition span 24.611119 s, maximum gap 51.009 ms | Zero episodes, no outer/native first cause; verified cleanup, uncertainty false. Final completed state 30.423700 s after Live, within the original 60 s. |
+
+Five sparse grouped reads per run, performed by the same existing motor owner,
+retain original request/reply bytes, checksums and native acquisition timestamps.
+In every run both endpoint readbacks contain actual Goal_Position 2432 and present
+position 2399; both origins contain goal/present 2399. Broadcast send acceptance
+is not an individual servo ACK. Corrected18 reads took 1.433..1.517 ms;
+dwell24 reads took 1.394..1.546 ms. These were five observations rather than
+continuous full-register polling; no competing serial connection was opened.
+
+All ten corrected18/dwell packets are valid, torque enabled 1, position mode 0,
+torque limit 1000, status/error 0, voltage 11.8 V and temperature 30 C.
+Corrected18 endpoint current was 52 mA with load -140/-144; dwell endpoints were
+58.5/52 mA with load -140/-140. Endpoint Moving was 1 while measured position and
+velocity stayed unchanged. Origin current/load returned to zero, although sparse
+origin Moving still read 1. Electrical response and Moving do not establish
+output torque, linkage motion, a mechanical obstruction or an encoder defect.
+The prior stopped P16/I0/D32, deadzone 1/1, startup force 16 and torque/max 1000
+settings did not demonstrate configuration drift; they were not changed or
+repeatedly swept.
+
+The useful-response rule was declared before physical operation: each cycle
+must leave the original raw reference in the commanded direction and reverse by
+at least `max(4, ceil(0.5 * encoded excursion), 3 * baseline range)` ticks;
+final residual must be at most `max(2, 3 * baseline range)`. Missing phases or
+fewer than three baseline acquisitions are inconclusive. For these 33-tick
+commands the required outward and return reduction are each 17 ticks, with
+residual at most two. This is reporting, not a change to historical control or
+return-envelope acceptance.
+
+| Comparison | Cycle | Commanded ticks | Sampled outward / return reduction | Final residual | Useful repeated response |
+|---|---:|---:|---|---:|---|
+| Corrected18 | 1 and 2 | 33 | 0 / 0 ticks | 0 | Failed both cycles |
+| Dwell24 | 1 and 2 | 33 | 0 / 0 ticks | 0 | Failed both cycles |
+
+Corrected18 has 15 samples in each endpoint and origin hold; dwell24 has 60 in
+each, spanning 1.971..1.975 seconds. Ramps are also covered with advancing native
+acquisitions. No response threshold crossing was observed, so response delay is
+unestablished; motion between acquisitions remains unobserved. Being inside the
+seed envelope without leaving it is not outward-and-return movement. Longer
+dwell did not fix delayed response.
+
+### Demonstrated repair and remaining limitation
+
+The first selected run exposed a completion dispatch defect: the new recipe
+names were assigned zero expected cycles, so their truthful two-cycle completion
+receipt was refused and ordinary hold subsequently lost its active proof.
+Commit `64052bc5a36289aaf50a27c42db35ede65fe7477` maps only the two exact selected
+recipe names to two cycles/one final return. Original input/fault, identity,
+incarnation, revision, executor-ACK, sequence, finite-reference, measured-return,
+admission and deadline guards remain. Original ArmSmoke/Repeat rules are unchanged.
+The original three episodes remain recorded. The two new actual runs complete
+with zero episodes; this demonstrates the corrected completion boundary rather
+than genuine required-input-loss recovery or improved elbow response.
+
+A separate pre-Live attempt `66fc4cbb-46ae-4854-8420-6b0f0d9670cf` remains failed:
+outer cause `ValueError: protected host feedback marker missing`, native first
+cause `ComparisonRefusal: temperature: five-slot feedback window is stale (>0.5 s).`
+There was no Live, trajectory admission or recovery episode; cleanup qualified.
+Original timestamps show a 133.987 ms startup handoff skipping one temperature
+slot, then a retained peak aged to 517.997 ms. The older successful handoff took
+85.020 ms. The unchanged guard correctly refused the retained peak even though
+the latest raw read was fresh. One bounded unchanged retry tested the timing/slot
+hypothesis and succeeded as 4f3. No thermal guard, slot age or deadline was relaxed.
+The exact startup substage is untimed and timing sensitivity remains unresolved;
+this is not a claim that transient startup refusal is cured.
+
+Correct mapping, encoded commands, native writes and live goals now have actual
+evidence. Static advancing native position rows and five same-owner register
+readbacks do not support a mapping, clipping, omitted-write or stale-browser
+repair. The remaining response limitation is **downstream of the correct servo
+goal-register update**. Binding, loose coupling, inadequate output torque,
+internal servo behavior and measurement fault are not distinguished by this
+record. No speculative tuning or forced movement is justified.
+
+The one necessary next human action is: **with motor power off, inspect the left
+elbow linkage and servo-horn/coupling for interference or loose attachment;
+report what is found without forcing movement or changing settings.** No manual
+leader or shoulder placement is requested. This packet has completed its
+available software, bounded comparison, review and reporting work; useful elbow
+movement remains unqualified pending that specific physical evidence.
+
+Other saved weak segments remain separate unknowns: repeated right shoulder
+lift and left wrist flex, and the later left-pan seed offset. Their saved position
+limitations do not contain the selected live-goal/current chain needed to establish
+this same cause. No all-joint gain experiment or unchanged 352-second workload
+was added. Moving physical leaders, multi-device physical input and genuine
+physical required-input-loss recovery remain separately unproved.
+
+### Observation, cleanup and focused verification
+
+The corrected18 witness was copied while the native run was running at progress
+4.6, sequence 298, decoded 640x480, arrival age 175.117 ms, with original metadata
+and matching pixel hash. The actual pixels were inspected: room/ceiling/chair,
+without an adequate view of the elbow. First selected18 retained pixels were
+also inspected and explicitly labelled historical. The dwell witness attempt
+arrived after completion and refused; no qualifying saved dwell frame is claimed.
+Actual required local-image delivery and same-run camera-release receipts qualified
+independently. Neither a validated image nor absent saved pixels establishes
+visual elbow motion.
+
+The existing advisory P1 clip (42,218,876 bytes; SHA256
+`7a85413c8cdce9148e72dbea9c635d882ace79e29d129e1e1b6fc104efa5d6cc`)
+was inspected at 28/35 seconds. It covers the earlier failed startup, not these
+selected comparisons. Arms/lift are visible, but it cannot determine the present
+elbow cause. No additional media framework or mandatory P1 delivery was introduced;
+images, auth and private configuration remain outside Git.
+
+Both new native cleanups verify 16 torque-off and four zero body-velocity
+readbacks, stationary qualified lift, closed buses and no cleanup error. Camera
+release matches the same run, exit 0, joined readers, closed socket and removed
+runtime configuration; the terminal physical result separately binds the host
+incarnation. Gain restoration was not
+required for these ordinary-baseline recipes. Final independent ownership
+inspection also found no serial, motor or camera-device owner.
+
+| Affected check | Result and scope |
+|---|---|
+| Selected finite profiles / owner diagnostics | Windows 23 + 29 focused passes; exact isolated native candidate 52 passes in 3.34 s. Source `afd3789cdea0311b4daf74cf46c9dcc6b612e2c0`; imports bound to the selected candidate, no foreign compiled/source imports. |
+| Selected completion and original completion guards | Windows 55 passes; native 69 passes in 0.51 s with exact corrected Core import, source `64052bc5a36289aaf50a27c42db35ede65fe7477`. |
+| Existing private analysis | Six meaningful checks, including static-completed and second-static-cycle cases; native UUID/incarnation/calibration/timestamp/phase checks and deduplication. No runtime acceptance change. |
+| Existing private staging/projection tools | Core-only stager 21 offline passes, projection builder 16, explicit named-ref fetch regression one real local Git RED-to-GREEN check. Earlier 50 stager checks retained for unchanged paths. |
+| Legacy Windows cohort | 172 passed, six native skips, nine `fcntl.flock` platform failures before host construction retained separately. This is not an all-suite-pass claim. |
+
+The initial existing-stager bundle fetch lacked an advertised HEAD; no component
+checkout or Start occurred. The 48-file partial deployment and failure were
+preserved, matched rollback/original idle qualified, and the explicit named-ref
+fetch correction passed its regression before the same manifest staged.
+The later Core-only advance reused that stager, sole-parent projection builder,
+original nine-key manifest and native terminal-history bindings. Exact typed
+history/counts, original cleanup/camera bytes and the original simulated DB/WAL
+history were preserved; no replacement subsystem, wrapper, unit or hash protocol
+was introduced.
+
+### Actually active components and ordinary use
+
+Final native verification on 2026-10-11 found the existing three resident services
+active and available idle, with latest run a188 completed, known cleanup and
+uncertainty false; there is no hardware task owner or autoplay. The original
+simulated history files are byte-identical to their pre-stage records and retained
+while its services are stopped. Calibration remains
+`f3ffa9d5d531fe0213c8847f28baef292de027996f0a0267e0657a8c45037394`;
+private bytes/permissions and existing CA trust/enrollments are preserved.
+
+| Component | Current actual source / state |
+|---|---|
+| Normal motor | `81490b7d6f202fc13c606ee7132ed19c9cd7cb44`, reviewed selected-owner diagnostic projection, clean |
+| Normal helper | `0fe3997f12b9cdfdd01fda6f4c6b102781252448`, unchanged from first selected stage, clean |
+| Physical executor / gateway / worker | `b8558888ed43cbf5cc8cbf6bfaf493ccc21602fe`, existing opt-in resident available idle, clean |
+| Current native manifest | `5ab2e37a72b359037fb1752b5060e556823e7f149e5d9ced0adedb08ff9c1fae`; separate exact pins, deployment directory `5ab2e37a72b35903` |
+| Windows served console | `e55d390bf6e957b9adc52ccf62b69476db12a20d`, unchanged; 1443-byte private configuration changes only the two reviewed motor/helper pins, SHA256 `442719a4ce437eb9a1b6cc83562434c576d5232e5f04ade6866685219edb8890`, original owner-only ACL preserved |
+| Accepted simulation | `c500204946a56862bb36ada3518ba5f248c02fa7`, stopped; original completed cb5 history retained unchanged, accessible matched rollback |
+| Isolated / normal onboard camera | `a0e94bc5298c021f785eaaee4ef0e2c44283f3d7` / `9b1f0670e7068f7d39eb50270a118e3807418355`, unchanged, clean |
+| Strict observer / advisory P1 | `7a266890703aae36f69a8d98e548d4c2e13710e5` / `2d9e365f1e302694633e7b1c916a38fb15cc50cc`, unchanged; failed strict diagnostic preserved |
+
+Use the existing trusted HTTPS console at the configured Pi 8443 endpoint:
+attach with the enrolled browser, Claim, select an allowlisted recipe and Start;
+Pause/Stop use that same authenticated route. Pairing, page opening, Claim and
+resident launch alone do not move hardware. The selected recipes are
+`physical-left-elbow-compare` and `physical-left-elbow-dwell-compare`; they expose
+the unresolved motion limitation and are not useful-tracking qualification.
+Simulation remains the code default; the current resident was explicitly staged
+with the protected-physical backend and real-local-camera-required policy.
+A docs-only review commit does not change these executable pins.
+
+The existing private controller verifies the available idle route without Start:
+
+```powershell
+ssh am1-pi 'python -B /home/pickmanmike/.local/share/am1-lift-startup-01/staging/staging-control-motion-quality-01.py verify-existing-idle --manifest /home/pickmanmike/.local/share/am1-lift-startup-01/staging/motion-quality-core-manifest.json'
+```
+
+Matched rollback remains an explicit procedure after known terminal cleanup;
+it is available but was not executed after these qualified comparisons. From
+the existing managed worktree, use the reviewed native controller, literal
+Windows pin helper, then original-service idle restoration in this order:
+
+```powershell
+ssh am1-pi 'python -B /home/pickmanmike/.local/share/am1-lift-startup-01/staging/staging-control-motion-quality-01.py rollback-stopped --manifest /home/pickmanmike/.local/share/am1-lift-startup-01/staging/motion-quality-core-manifest.json'
+if ($LASTEXITCODE -ne 0) { throw 'Stopped rollback refused; do not continue.' }
+uv run --no-sync --project C:/Users/pickm/lerobot_alohamini_client python .cache/am1-lift-startup-01/prepare_next_operation.py pins-restore --manifest .cache/am1-motion-quality-01/projections/executor-core-reviewed-01/executor-motion-quality-manifest.json --manifest-sha256 5ab2e37a72b359037fb1752b5060e556823e7f149e5d9ced0adedb08ff9c1fae
+if ($LASTEXITCODE -ne 0) { throw 'Pin restoration failed; do not continue.' }
+$config = 'C:/Users/pickm/lerobot_alohamini_client/.worktrees/am1-console-implementation/config/am1.session.json'
+$prior = Get-Content -LiteralPath .cache/am1-motion-quality-01/final-state/windows-config-invariants.private.json -Raw -ErrorAction Stop | ConvertFrom-Json
+if ((Get-FileHash -LiteralPath $config -Algorithm SHA256 -ErrorAction Stop).Hash.ToLower() -ne 'e1c4c81a885f37108eff453916a83c4e9866d53326be408dafb4aad7faa5e7e2' -or (Get-Acl -LiteralPath $config -ErrorAction Stop).Sddl -ne $prior.Sddl) { throw 'Original bytes/ACL verification failed; do not restore services.' }
+ssh am1-pi 'python -B /home/pickmanmike/.local/share/am1-lift-startup-01/staging/staging-control-motion-quality-01.py restore-original-idle --manifest /home/pickmanmike/.local/share/am1-lift-startup-01/staging/motion-quality-core-manifest.json --windows-original-pins-restored-sha256 e1c4c81a885f37108eff453916a83c4e9866d53326be408dafb4aad7faa5e7e2'
+```
+
+This stops only the three affected residents, preserves physical history,
+restores matched f03 motor/8e helper and original 1443-byte e1 Windows bytes,
+then restores c500 simulated services idle without task Start. These commands
+require the retained private artifacts in this managed worktree; they are not
+general installation commands. Unknown cleanup refuses ordinary rollback/rearm; separate real reconciliation is required.
+Camera projections, calibration, trust and private permissions remain separate.
+
+Integration recommendation: review the focused diagnostic and completion repair
+in the existing dependent PR stack, keeping its separate component projections
+and historical results. Do not label useful joint response repaired. No merge is
+authorized by this packet; broader dependable interactive control still requires
+the specific elbow-response evidence and separate unproved input modes above.
+
+## Retained AM1-LIFT-STARTUP-01 physical evidence
 
 | Milestone | Actual result |
 |---|---|
@@ -56,7 +282,7 @@ reads, kept torque off at both bookends and closed its bus without actuation or
 first cause. It read position mode 0, CW/CCW deadzone 1/1, P16/I0/D32, minimum startup
 force 16, torque limit/max 1000/1000, goal/present 2400, voltage 119, temperature 30 and
 current 0. These values do not establish an obvious configured deadzone or disabled
-torque-limit cause. An actual live raw goal-register receipt is still missing.
+torque-limit cause. At that historical checkpoint, an actual live raw goal-register receipt was still missing; the selected comparisons above now provide it.
 The finding remains limited; no mechanical blocker, gain repair or all-joint
 usefulness is inferred from this stopped snapshot.
 
@@ -532,7 +758,7 @@ isolated candidate: 73 candidate imports, zero foreign compiled extensions and
 zero robot imports outside the candidate. Tests remain separate from actual
 physical receipts and measured response.
 
-| Component | Final actual staged or restored pin/state |
+| Component | Historical lift-startup closeout staged or restored pin/state |
 |---|---|
 | Normal motor host | `f03de9c3b8c4f1d9e69b6951584119113ca4c5da`, actual matched restored normal source |
 | Normal Pi helper | `8e6a0cf616cb2000df1d0e996ab27a19d2fb2fba`, matched restored helper |
@@ -542,7 +768,7 @@ physical receipts and measured response.
 | Windows console/private config | Clean `e55d390bf6e957b9adc52ccf62b69476db12a20d`; original 1443-byte private config/e1 hash, owner-only ACL and CA trust verified |
 | Normal onboard camera / strict observer / P1 capture | Normal camera `9b1f0670e7068f7d39eb50270a118e3807418355`; strict observer `7a266890703aae36f69a8d98e548d4c2e13710e5` clean; P1 source `2d9e365f1e302694633e7b1c916a38fb15cc50cc` and advisory histories unchanged |
 
-**Final actual state:** matched restoration and final audit qualified; no hardware
+**Historical lift-startup closeout state:** matched restoration and final audit qualified; no hardware
 owners or uncertainty markers, original simulated services idle.
 
 The final actual audit (attempt 02), SHA `b5a1a37d83e6c08e1213ebfefb05c1420299cf190b9c6609f5d1b0a39c955724`, qualified all seven

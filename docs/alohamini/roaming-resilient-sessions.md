@@ -1,29 +1,33 @@
 # AM1 roaming-resilient sessions
 
-**Current continuation: [AM1 protected physical sessions](protected-physical-sessions.md), AM1-LIFT-STARTUP-01.**
-The focused lift startup, cleanup and finite-completion repairs now have actual
-physical results: an 88-second comparison, four-cycle 352-second repeat with browser
-reattachment, automatic 352-second restart from ordinary rest, and the original
-12-second body recipe completed with known motor/lift/bus/camera cleanup. Small-run
-shoulder response was measured. Static arm segments remain a material limit;
-cycle/return counters do not establish useful movement of every joint. Genuine
-required-input-loss recovery remains separate evidence. The body check measured mapped wheel response and directional up/down lift pulses,
-without establishing arrival at the requested 50 mm targets or floor movement. No
-body pixels were viewed for visual corroboration. The full chronology, measurements
-and preserved failures are in the report.
+**Current continuation: [AM1 protected physical sessions](protected-physical-sessions.md), AM1-MOTION-QUALITY-01.**
+The accepted 88/352/352/body12 physical continuity milestones remain achieved at
+their recorded sources; they were not rerun unchanged. Durability means software
+fault tolerance, connection/control continuity, state preservation and recovery
+with minimal human intervention. No wear or mechanical-lifespan campaign was added.
 
-Matched restoration returned normal motor f03/helper 8e and original Windows
-1443-byte configuration/ACL. The physical executor a1d and camera a0e remain
-separately pinned with complete history retained. Original accepted c500 services
-are active idle without autoplay or a substituted historical run. The final audit
-verified clean sources, unchanged calibration/private permissions/trust, both locks,
-no hardware owners and no uncertainty markers. The cached terminal-fault Start
-repair has reviewed/native-tested evidence; the completed body run used a fresh
-resident, so it is not a physical same-process test of that cached branch.
+The focused two-cycle left-elbow comparisons now retain original encoded commands,
+five sparse same-owner live-register packets and advancing native position samples.
+Both corrected18 and separately labelled dwell24 complete with qualified cleanup
+and zero recoveries, but all 553/737 acquired positions stay raw2399 despite actual
+endpoint goal2432. Longer holds do not improve measured response. Program completion,
+original return-envelope qualification and useful movement remain separate results.
+The selected-recipe completion dispatch is repaired; the remaining response
+limitation is downstream of the correct servo goal update. The report specifies
+one power-off linkage/horn-coupling inspection, without speculative tuning.
+
+The actually active candidate is motor81490/helper0fe/executorb855 under the separate
+5ab2 manifest, available idle via the existing opt-in route, with latest a188 terminal
+and known cleanup. Original c500 simulated history and f03/8e/e1 matched rollback
+remain accessible. Calibration, private permissions, trust and earlier failures
+are preserved. Actual inspected images lack an adequate selected-elbow angle;
+validated local-image delivery does not establish visual joint motion.
 
 Simulation remains the default, AM1 stays wireless, required sensing is real local
 camera evidence and P1 is advisory. Draft #20 remains dependent on
-#19 -> #18 -> #17 -> #16, unmerged; actual pins and results are in the operating report.
+#19 -> #18 -> #17 -> #16, unmerged; exact pins, tests, limitations, normal use and
+rollback commands are in the operating report.
+
 
 **AM1-SESSION-ARCHITECTURE-01 · owner-approved design. The accepted AM1-MOBILE-LOCAL-01 slice selects real robot-local camera input with simulated motor IO and advisory P1 evidence. The separate strict P1 diagnostic remains failed.**
 Choose a Pi-owned session authority and finite executor, an authenticated LAN
