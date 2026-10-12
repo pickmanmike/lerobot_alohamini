@@ -132,13 +132,40 @@ class OwnerLock:
         self.stream.close()
 
 
-def _public_physical_evidence(evidence):
-    """Bound the duplicate gain ledger; the durable run retains the complete proof."""
+def _public_physical_evidence(evidence, run=None):
+    """Bound duplicate terminal evidence; the durable run retains the complete proof."""
     if not isinstance(evidence, dict):
         return evidence
     lifecycle = evidence.get("lifecycle")
     if not isinstance(lifecycle, dict) or lifecycle.get("phase") != "terminal":
         return evidence
+    completion = evidence.get("finite_completion")
+    if isinstance(run, dict) and isinstance(completion, dict):
+        execution, retained = completion.get("execution"), run.get("completion_receipt")
+        try:
+            if (
+                evidence.get("source") == run.get("source") == "protected-physical-provider"
+                and run.get("status") in TERMINAL
+                and uuid_text(run.get("run_id")) == run.get("run_id")
+                and uuid_text(run.get("backend_incarnation")) == run.get("backend_incarnation")
+                and completion.get("run_id") == lifecycle.get("run_id") == run.get("run_id")
+                and completion.get("host_incarnation")
+                == lifecycle.get("backend_incarnation")
+                == run.get("backend_incarnation")
+                and isinstance(execution, dict)
+                and isinstance(retained, dict)
+                and _canonical(completion) == _canonical(retained)
+            ):
+                public_completion = {key: value for key, value in completion.items() if key != "execution"}
+                public_completion["execution_reference"] = {
+                    "kind": "am1-finite-completion-execution-reference",
+                    "version": 1,
+                    "field": "run.completion_receipt.execution",
+                    "sha256": hashlib.sha256(_canonical(execution)).hexdigest(),
+                }
+                evidence = dict(evidence, finite_completion=public_completion)
+        except (TypeError, ValueError):
+            pass  # Malformed or different evidence remains complete and unqualified.
     receipt = lifecycle.get("readback")
     readback = receipt.get("readback") if isinstance(receipt, dict) else None
     gain = readback.get("elbow_integral") if isinstance(readback, dict) else None
@@ -1982,7 +2009,7 @@ class SessionAuthority:
                             if trajectory is None
                             else max(0, trajectory - self.run["progress_s"]),
                         ),
-                        "evidence": _public_physical_evidence(self._evidence()),
+                        "evidence": _public_physical_evidence(self._evidence(), run),
                         "recipes": [
                             name
                             for name, recipe in RECIPES.items()

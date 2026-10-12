@@ -895,6 +895,92 @@ def test_terminal_snapshot_preserves_restore_failure_and_ordinary_evidence():
     assert authority.snapshot()["evidence"] == evidence
 
 
+@pytest.mark.parametrize(
+    "bad",
+    [
+        None,
+        "live",
+        "foreign_run",
+        "foreign_host",
+        "different_execution",
+        "different_ack",
+        "missing_receipt",
+        "rewritten_number_type",
+        "matching_none",
+        "invalid_uuid",
+    ],
+)
+def test_terminal_snapshot_references_only_exact_duplicate_completion_execution(bad):
+    import hashlib
+    import json
+
+    run = reporting_run(1)
+    run["execution"]["recovery"].update(target_attained=False, final_return_residual_raw=14)
+    run["execution"]["recovery"]["current_cap_ma"] = 100.0
+    run["execution"]["returns_qualified"] = 0
+    run["completion_receipt"]["execution"] = copy.deepcopy(run["execution"])
+    run["completion_receipt"]["accepted_host_action"] = {
+        "run_id": run["run_id"],
+        "host_incarnation": run["backend_incarnation"],
+        "intent_revision": 0,
+        "epoch": 0,
+        "state": "active",
+        "accepted_action_sequence": 1,
+        "accepted_action": {},
+    }
+    evidence = {
+        "source": run["source"],
+        "lifecycle": copy.deepcopy(run["physical_result"]),
+        "finite_completion": copy.deepcopy(run["completion_receipt"]),
+    }
+    if bad == "live":
+        evidence["lifecycle"]["phase"] = "live"
+    elif bad == "foreign_run":
+        evidence["finite_completion"]["run_id"] = str(uuid4())
+    elif bad == "foreign_host":
+        evidence["finite_completion"]["host_incarnation"] = str(uuid4())
+    elif bad == "different_execution":
+        evidence["finite_completion"]["execution"]["recovery"]["target_attained"] = True
+    elif bad == "different_ack":
+        evidence["finite_completion"]["accepted_host_action"]["epoch"] += 1
+    elif bad == "missing_receipt":
+        run.pop("completion_receipt")
+    elif bad == "rewritten_number_type":
+        evidence["finite_completion"]["execution"]["recovery"]["current_cap_ma"] = 100
+        assert evidence["finite_completion"] == run["completion_receipt"]
+    elif bad in {"matching_none", "invalid_uuid"}:
+        identity = None if bad == "matching_none" else "not-a-canonical-uuid"
+        run.update(run_id=identity, backend_incarnation=identity)
+        run["completion_receipt"].update(run_id=identity, host_incarnation=identity)
+        evidence["lifecycle"].update(run_id=identity, backend_incarnation=identity)
+        evidence["finite_completion"].update(run_id=identity, host_incarnation=identity)
+    original_run, original_evidence = copy.deepcopy(run), copy.deepcopy(evidence)
+    authority = reporting_authority(run, evidence)
+    view = authority.snapshot()
+    public = view["evidence"]["finite_completion"]
+    if bad:
+        assert public == original_evidence["finite_completion"]
+    else:
+        actual = original_run["completion_receipt"]["execution"]
+        assert "execution" not in public
+        assert public["execution_reference"] == {
+            "kind": "am1-finite-completion-execution-reference",
+            "version": 1,
+            "field": "run.completion_receipt.execution",
+            "sha256": hashlib.sha256(
+                json.dumps(actual, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+            ).hexdigest(),
+        }
+        assert {key: value for key, value in public.items() if key != "execution_reference"} == {
+            key: value for key, value in original_evidence["finite_completion"].items() if key != "execution"
+        }
+        assert view["run"]["completion_receipt"]["execution"] == actual
+        assert view["run"]["execution"]["recovery"]["target_attained"] is False
+        assert view["run"]["execution"]["returns_qualified"] == 0
+    expected = dict(original_run, deadline=None, progress_s=original_run["execution"]["progress_s"])
+    assert authority.run == expected and authority._evidence() == original_evidence
+
+
 def idle_recovery_evidence(run):
     return {
         "source": "protected-physical-provider",
