@@ -2,12 +2,11 @@
 
 ## Current continuation: AM1-VISIBLE-CONTROL-04
 
-The new opt-in `physical-left-elbow-positive-control` tests an ordinary positive
-out-and-back from the actual measured pose at unchanged P16/I0/D32. At this source
-checkpoint, focused software verification is complete or under final review; the
-new physical comparison and deployment are still pending. Recovery03 repairs and
-all historical results below remain retained. No further gain experiment is
-included.
+The opt-in `physical-left-elbow-positive-control` is implemented, reviewed and
+staged available idle. Its physical comparison has not started: the latest spare
+P1 camera view leaves AM1 out of frame, so packet §3's camera-only adjustment
+is pending. Earlier useful imagery remains historical. Recovery03 repairs and
+negative matched I0/I1 results remain intact. No further gain experiment is included.
 
 The sole protected owner reads actual selected ID3 settings before configuration,
 skips its settings/default writes, then verifies unchanged settings after normal
@@ -31,13 +30,88 @@ stationary/nonadverse feedback and known cleanup. It retains original q0, admits
 fresh hold and records at most2 acquisition seconds at≤1unit/second before the
 same28-second waveform. No commanded or manual old-reference matching is added.
 
-The current bounded P1 preview shows both arms and elbow linkages. Its original
-49.2772-second audio-off recording delivered387 images and released normally;
-inspected original frames at2 and8 seconds provide useful framing. No camera
-re-aim was required. P1 remains advisory; actual Pi-local images remain required.
-Images and raw records stay private. Normal service/page start does not actuate;
-use the existing trusted virtual console's explicit Claim and selected Start.
-Simulation remains the default. AM1 stays wireless and AM2 remains untouched.
+The earlier 49.2772-second P1 preview showed both arms and elbow linkages.
+The refreshed recording independently completed 86.9595 seconds with audio off
+and verified normal P1 source release. Its original frames at 0.25, 8 and 70 seconds
+leave AM1 out of view. The separate optional Pi-to-P1 delivery failed with
+ConnectionError after 15 frames and left release unconfirmed in that client's
+summary; that failure remains. Independent recording verification does not turn
+failed delivery into a pass. Existing TLS expiry-ahead checks passed without
+reenrollment or exceptions. No network tuning was used. Useful current elbow
+framing is required before this experiment's excursion. P1 remains advisory;
+actual Pi-local images remain required by task authority. Images and raw logs
+remain private. The only pending physical action is camera framing: with the AM1 session stopped
+and motor power off, re-aim only the spare P1 camera and keep camera/cable outside
+the movement area. Leave the elbow in its current pose; no repeated inspection.
+
+The same final four-module cohort passed 291 cases on Windows and 291 natively
+in the Pi's existing Python 3.12 environment. All 12 changed-module imports matched;
+no foreign compiled imports or robot imports outside the isolated candidate were
+found. Native tests had PrivateDevices and a 180-second budget. Six browser
+reporting cases, 40 existing analyzer cases and 43 private staging/reference cases
+also passed; these overlap earlier checks and are not summed. Independent source,
+interface and bound-artifact reviews found no remaining blocker.
+
+Focused fixes preserve legal floor-encoded endpoints and the fixed reference
+through pause, make completion re-acknowledgment idempotent, separate original
+measured origin from encoded goal and prevent baseline/endpoint drift from being
+counted as commanded movement. Original endpoint acquisitions must remain fresh
+before the first actual return. No gain, calibration, motion limit or continuous
+reader was added.
+
+Actual full-wrapper serialization reproduced completion overflow. The public view
+keeps complete `run.execution`; its exact completion-receipt duplicate uses the
+existing versioned SHA reference. All outer receipt fields, full native history,
+internal evidence and complete durable proof remain intact. Strict fixed-reference
+hydration in the existing private stager preserves typed native-history comparison.
+Malformed/different/active proofs stay full. Known reporting errors preserve the
+admitted operation/run identity, clear stale readiness and do not cause duplicate
+automatic Start. Caps remain 4,096/65,536 bytes. Real owner-wrapper/socket mock
+sizes are 47,878 bytes primary, 47,863 static and 50,006 qualified confirmation;
+typed saved I0/I1 wrappers remain 52,446/56,908. These are presentation mocks/replays,
+not new physical movement proof, and differ from historical 66,282→61,338 and the
+52,462-byte actual idle response.
+
+| Available-idle component | Exact pin |
+|---|---|
+| Reviewed source | `c56b0b6d3ce91f47c16b17b456279a6614a57ef6` |
+| Motor, four changed files | `c94eee25658ea6bee7f41aeccfe4abe5f87c38af` |
+| Runtime, nine changed files | `c694ae0861ca67ec7f79f0b6d7f6cb02717c180f` |
+| Deployment manifest | `d76b62903f329e340ed9ff3689f410c408c84e3595a4d11835ca57e015048cdd` |
+| Windows private configuration SHA | `a73a398ad035aba84502088eeba51cf6a153273e7dc090a4abf5a701497cd974` |
+
+Helper `0fe3997f12b9cdfdd01fda6f4c6b102781252448`, isolated camera
+`a0e94bc5298c021f785eaaee4ef0e2c44283f3d7`, normal camera
+`9b1f0670e7068f7d39eb50270a118e3807418355`, P1 capture
+`2d9e365f1e302694633e7b1c916a38fb15cc50cc`, Windows console
+`e55d390bf6e957b9adc52ccf62b69476db12a20d` and calibration
+`f3ffa9d5d531fe0213c8847f28baef292de027996f0a0267e0657a8c45037394`
+remain unchanged.
+
+Only stopped affected owners were staged, with exact 4/9 deltas, single f03/f8
+parents, old-ref CAS and immutable predecessor archives. A first pre-stop attempt
+refused a mistaken historical partial-config hash. The current and original
+material files proved byte-identical: 1,489 bytes, raw SHA
+`8b26fd88e21e6075458fcffcce63097df99ce9e1327f65e4e5dd318610a2ba62`.
+Only the scoped expected raw-hash literal/binding was corrected. Historical hashes
+and the strict raw check remain. Subsequent staging/idle qualification preserved
+Sim/SQL/WAL/private archives and calibration. The new physical config omits the
+historical 2472 reference. Windows literal pin substitution preserved its ACL.
+
+Two fresh trusted browser views preserve completed 79def, failed target attainment,
+residual 14 and idle lifecycle, with zero controls sent. No new motor task,
+visible/measured response, coarse result or fine residual is claimed.
+
+After useful framing is verified, use the existing trusted virtual console's
+explicit Claim and selected Start. The primary acquires fresh q0; a conditional
+confirmation retains that absolute reference. Page/service start does not actuate.
+Simulation default and no autoplay remain. Original matched stopped rollback
+remains motor `f03de9c3b8c4f1d9e69b6951584119113ca4c5da`, helper
+`8e6a0cf616cb2000df1d0e996ab27a19d2fb2fba`, original Windows configuration
+and accepted simulation `c500204946a56862bb36ada3518ba5f248c02fa7`.
+Predecessor ee8/3771/1ed and all historical physical records are retained.
+The draft #20 → #19 → #18 → #17 → #16 stack is unchanged; no merge is authorized.
+AM1 stays wireless and AM2 remains untouched.
 
 Durability means software fault tolerance, connection/control continuity, state
 preservation and recovery with minimal human intervention. Genuine physical

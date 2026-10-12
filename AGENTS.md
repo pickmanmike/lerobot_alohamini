@@ -16,8 +16,11 @@ fresh stationary evidence and noise discriminability. One confirmation is condit
 on coarsepass/nonadverse/known cleanup and retains fixed originalq0/envelope, with
 bounded separately recorded acquisition; never reseed away drift.
 
-Current P1 preview shows both arms/elbow linkages; use its repaired existing bounded
-audio-off capture and inspect actual current images. P1 stays advisory; the real
+The earlier P1 preview showed both arms/elbow linkages. The latest inspected
+recording leaves AM1 out of view. With the session stopped and motor power off,
+re-aim only the spare P1 camera; keep camera/cable outside the movement area.
+Verify useful current framing before this excursion and keep the robot pose unchanged.
+Use the existing bounded audio-off capture and inspect current images. P1 stays advisory; the real
 Pi-local camera remains required. Root alone operates hardware/capture/staging.
 Run focused full-wrapper actual IPC tests before motion and surface concrete reporting
 failures promptly. Preserve complete private native proof, original65536/4096 caps,

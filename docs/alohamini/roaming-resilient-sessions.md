@@ -1,10 +1,11 @@
 # AM1 roaming-resilient sessions
 
 **Current continuation: [AM1 protected physical sessions](protected-physical-sessions.md),
-AM1-VISIBLE-CONTROL-04.** The new independent +10 out-and-back keeps I0 unchanged,
-separates actual movement from diagnostic completion and preserves the software
-durability scope. Physical evaluation of that recipe is pending at this source
-checkpoint. The following Recovery03 results remain historical.
+AM1-VISIBLE-CONTROL-04.** The independent +10 recipe is reviewed, tested natively
+and staged available idle at unchanged I0. The physical comparison is pending the
+packet's permitted camera-only framing correction; no new motor task has started.
+Program completion, actual movement and fine residual remain separate, and software
+durability retains its fault-tolerance meaning. Recovery03 results below remain historical.
 
 **Retained AM1-ELBOW-RECOVERY-03:** The matched current-pose I0/I1 programs completed5.5seconds, but both stayed
 raw2458 despite goal2472: zero useful approach/residual14. I1 increased sampled
