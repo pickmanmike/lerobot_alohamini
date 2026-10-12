@@ -1,37 +1,79 @@
 ## Current AM1 current-pose recovery continuation
 
-For AM1-ELBOW-RECOVERY-03, the owner explicitly authorizes a NEW recovery experiment
-from the freshly measured position toward retained raw2472. Restoration is its
-outcome, not a prerequisite. The old2472±2 admission/return requirement remains
-binding only on the historical signed/original-return runs and their failed results.
-Do not rewrite those runs or request manual old-reference positioning.
+For AM1-ELBOW-RECOVERY-03, restoration toward retained raw2472 is the measured outcome
+of a NEW experiment from the freshly qualified current pose, not a universal start
+prerequisite. Keep the strict old2472±2 rule and failed results attached to their
+historical signed/original-return runs. The owner completed the requested elbow
+inspection without finding an apparent issue; do not request it again or ask for
+manual old-reference positioning.
 
-Reuse current motor25ea/helper0fe/executor3823/manifest b0be idle as the starting
-installation. Implement one owner-scoped selected-ID3 volatile I0/I1 return-only
-comparison with actual baseline, private restoration obligation before any write,
-verified torque0/Lock1, initial measured hold before enable, and verified original-I
-then original-Lock restoration on every exit. Preserve individual24/25, P/D, all
-device limits, calibration and hard-fault guards. Unknown restoration stays uncertain.
-The exact new I1 policy records subthreshold current rise over its finite hold;
-software current cap≤100mA, wrong-direction/instability and all ordinary guards remain.
-Use original2/3/.5 timing/60Live; a labelled≤2s hold comparison or≤2 small confirmation
-cycles is conditional on actual response and the packet's bounds, not automatic.
-Match actual poses/settings before calling1073 a matched I0 comparator; one fresh
-I0 is permitted only where missing baseline evidence requires it. Freeze other11
-measured targets and command body/lift zero after normal startup.
+The fresh I0 control f778 completed its finite5.5-second program from measured2458,
+but goal2472 produced zero measured approach and a14-tick residual. Its actual
+P16/I0/D32/model777/fw3.10/mode0 baseline, original I0/Lock0 and individual24/25
+restoration are retained. Use this qualified native comparator; do not repeat I0
+merely because an I1 startup failed. Matched I1 `79defe8b...` now completed5.5seconds
+from the exact same2458/all12 pose and calibration, live gainI1 verified, but all173
+native positions stayed2458 despite goal2472: zero approach/residual14. Sampled
+current rose to39mA vs I0's19.5mA; no useful partial response or target attainment.
+Original I0/Lock0/24=16/25=0 and all20zero/lift/bus/camera cleanup were verified,
+no native fault/uncertainty/no owners. Longer hold/confirmation are not justified;
+do not claim repaired control or a dead servo, add another gain/target, force reset,
+or repeat inspection. Preserve both zero-Live thermal faults45d4 and
+173b, their actual configured/active-stage distinction and known cleanup. The bounded
+private receipt continuation retains the original full comparator and exact reviewed
+acquisition-only source chain; it does not clear either fault or reset an old run.
 
-Repair the actual P1 credential expiry using the existing trusted provisioning,
-validated chain/endpoint/time and explicit dependent reconciliation if its CA needs
-renewal. Never disable TLS/hostname checks or move clocks. Existing finite audio-off
-capture is advisory; useful pixels/visual limits are reported separately from motor
-proof. AM1 stays wireless, P1 advisory, AM2 unchanged, simulation default, no autoplay,
-no merge/retarget/force/history rewrite, no permanent gain, generic inspection or
-network redesign. Root alone operates physical hardware/capture and stages affected
-stopped owners after focused source/restore review and native verification.
+Only the selected ID3 volatile I0/I1 owner transaction is authorized. Persist its
+actual baseline/restoration obligation before writes, verify torque0/Lock1, seed the
+fresh measured hold before ordinary enable, verify the selected gain after activation,
+and restore/verify original I then original Lock on every exit. Preserve P/D,
+individual24/25, limits, calibration and all existing local protections. Unknown
+restoration remains uncertain. Match actual starting poses/settings/target/timing;
+never force an old pose merely to create an A/B match.
 
-Durability retains its software fault-tolerance/connection/control/state/recovery
-meaning. Preserve88/352/352/body12 source-bound milestones, oldfailedreceipts, separate
-pins/privatepermissions and matchedrollback; no unchanged endurance campaign.
+Use the existing2-second baseline/3-second approach/.5-second hold and60Live budget,
+body/lift zero after startup and the other eleven freshly measured targets held.
+The selected software current cap is at most100mA; wrong-direction/instability and
+all hard faults remain decisive. Only this explicit I1 policy records subthreshold
+finite-hold current rise as experimental evidence. A labelled hold at most2seconds
+or at most2 small confirmation cycles is conditional on actual useful response and
+qualified prerequisites, not automatic expansion.
+
+The actual P1 credential expiry was repaired through existing trusted provisioning
+with unchanged keys/identities and verified endpoints. Its finite audio-off clip
+works but the inspected frames do not show the left elbow or adjacent links. P1 is
+advisory; real Pi-local camera proof remains required. No TLS/hostname exception or
+clock change is permitted. Keep AM1 wireless, AM2 unchanged, simulation default,
+no autoplay, permanent tuning, network redesign or unchanged endurance campaign.
+Root alone stages affected stopped owners and operates physical runs/capture.
+
+Durability means software fault tolerance, connection/control continuity, state
+preservation and recovery with minimal human intervention. Preserve the accepted
+88/352/352/body12 milestones and all historical failures, separate pins, private
+permissions, calibration and matched rollback. Keep draft#20 dependent on
+#19 -> #18 -> #17 -> #16 without merge, retarget, force or history rewrite.
+
+Current reporting source is `43c066468426b528aa7aa31f342172cb7e6fc480`, motor
+`3771bdaae024251510e95bc236a164c6763a7a34`, executor
+`1edfb14a4a123cf7cd9ef5dab03fe1c6a3f2ae13`, deployment manifest
+`ee8ff072f5bdf70860a737771bbb8a431435e821eb50678dd332fe1a94b8d327`. The
+physical material contract remains byte-identical under `a0fd156...ed506`; it records
+the evaluated I1 execution provenance, not the current reporting executor. Motor,
+helper, camera, private reference and Windows pins/ACL remain unchanged by the
+Core-only reporting repair. Private evidence stays0600; only source reads admit0700.
+Native203 acquisition/linked checks,136 source-reader checks and146 final integration
+checks each have exact10-source module audits; these cohorts overlap. The size repair
+reduces only duplicate public presentation, retaining full native/SQL/internal proof
+and the65536/4096 IPC caps. The controlled native-type replay is66282→61338bytes;
+the separately reacquired idle IPC response is52462bytes. Two fresh trusted browser
+pages reattached to the same completed I1, targetfalse/residual14/zero cycles and
+returns, lifecycleidle, without sending operations or bypassing TLS. Final18-file
+audit verified three active idle services, no hardware owners, unchanged private
+files/calibration/original c500 history and the original completed native hash.
+Matched stopped rollback is retained and unexecuted; use only the current
+terminal-reporting controller/manifest and materiala0fd Windows pin/ACL guard.
+The I1 hypothesis is evaluated negatively. Do not repeat the completed motion
+solely to repair presentation.
 
 ## Historical AM1 elbow response continuation (superseded for new recovery03 only)
 
@@ -110,7 +152,7 @@ so it does not supply the selected-ID3 volatile path. Fresh actual I/Lock baseli
 and a reviewed stopped procedure with verified Lock1 for both I1 and I0 restoration
 remain required; no permanent tuning or EEPROM cycling is authorized.
 
-## Current AM1 motion quality and durability scope
+## Retained AM1-MOTION-QUALITY-01 scope and achieved milestones
 
 For the explicitly invoked AM1-MOTION-QUALITY-01 continuation, retain the accepted
 bounded physical continuity milestones at their recorded sources. Durability means
@@ -140,7 +182,7 @@ motor tuning or additional architecture is authorized by this packet. Actual rew
 or mechanical adjustment requires power off and one specific human action only when
 the observed limitation requires it.
 
-## Current AM1 lift startup and protected physical scope
+## Retained AM1-LIFT-STARTUP-01 scope and protections
 
 For the explicitly invoked AM1-LIFT-STARTUP-01 continuation, use the existing
 Pi-owned protected physical backend, finite virtual/scripted arm input, normal

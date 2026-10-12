@@ -1,35 +1,207 @@
 # AM1 protected physical sessions
 
-AM1-ELBOW-RESPONSE-02 has finished its available bounded diagnostics, corrections,
-review and staging through the packet's residual-limitation path. The owner completed
-the elbow inspection without finding an apparent issue. Historical same-elbow
-movement was recovered; the new opposite-direction command produced19 encoder ticks
-of outward movement, but no return. A separate original-reference approach then
-produced zero movement, and stopped readback confirmed the19-tick residual persists.
-Useful repeated elbow response remains unqualified. The specific missing prerequisite
-is supported restoration of the selected elbow to retained raw2472±2, independently
-verified while stopped; no supported autonomous restoration within the packet's
-bounds has been established. This is not a request to repeat the inspection.
+AM1-ELBOW-RECOVERY-03 evaluated the matched current-pose I0/I1 return-only
+hypothesis. Both programs completed5.5seconds, but all measured positions stayed
+raw2458 despite goal2472: residual14, zero useful approach and no target attainment.
+Temporary I1 increased sampled approach current from0..19.5mA to0..39mA without
+measured movement. Original I0/Lock0/individual24/25 and known motor/body/lift/camera
+cleanup were verified. Longer hold and repeated confirmation are not justified by
+this result. Trusted advisory capture works, but inspected frames do not show the
+selected elbow. The public terminal-reporting size defect is corrected, and two
+fresh trusted browser pages reattached to the retained completed result. The three
+existing services are active and idle with no hardware owners; matched rollback
+is retained and unexecuted.
 
-The demonstrated native feedback-window defect is corrected and tested. The reviewed
-candidate is available idle through the existing opt-in physical route, preserving
-both failed runs and their verified cleanup. Available idle does not qualify the
-original elbow reference or authorize another departure, rebase or gain comparison.
+The new packet makes restoration an outcome to measure. The old2472±2 prerequisite
+remains binding on the old failed runs; it is not a universal admission requirement
+for this new experiment. The owner's elbow inspection is completed. Historical
+same-elbow movement and these results do not establish a physical cause.
 
-Durability means software fault tolerance, connection and control continuity,
-state preservation, and recovery with minimal human intervention. Physical wear
-and mechanical lifespan were not assessed. The accepted 88/352/352/body12 continuity
-milestones remain achieved at their recorded sources; they were not rerun unchanged.
-Simulation remains the default, AM1 stays wireless and P1 remains advisory.
+Durability means software fault tolerance, connection/control continuity, state
+preservation and recovery with minimal human intervention. The source-bound
+88/352/352/body12 milestones remain achieved and were not rerun unchanged. Wear
+and mechanical lifespan were not assessed. Simulation remains default, AM1 stays
+wireless, required sensing remains actual Pi-local camera evidence and P1 is advisory.
+Draft [PR#20](https://github.com/pickmanmike/lerobot_alohamini/pull/20) remains dependent
+on #19 -> #18 -> #17 -> #16, unmerged, without retarget or history rewrite.
 
-This continues [draft PR #20](https://github.com/pickmanmike/lerobot_alohamini/pull/20),
-dependent on #19 -> #18 -> #17 -> #16 without merge, retarget or history rewrite.
-Required observation remains actual Pi-local camera evidence. Browser/administrative
-launch connections do not own execution or renew the deadline. Older checkpoint
-and rollback results below are historical; the following section records the
-current deployment and the new evidence.
+## Current-pose recovery and observer repair: AM1-ELBOW-RECOVERY-03
 
-## Elbow response continuation, 2026-10-11: bounded result and residual
+The new diagnostic keeps three identities separate: historical target2472, each
+fresh measured starting pose, and the new run. It approaches the retained target
+within3 normalized units, after ordinary startup and a measured initial hold; it
+holds the other eleven measured targets and body/lift zero. The first comparison
+uses2seconds baseline,3seconds approach and.5seconds endpoint hold under60Live.
+A software current cap at most100mA, wrong-direction/instability checks and all
+ordinary current/thermal/voltage/status/feedback/ownership guards stay active.
+Temporary I1 changes only the selected ID3 integral coefficient with Lock1; P/D,
+individual addresses24/25, limits and calibration stay unchanged. Each exit verifies
+original I and then original Lock restoration while torque is off.
+
+| Native operation | Actual result | Restoration/meaning |
+|---|---|---|
+| I0 `f77856fd-79c1-4de3-8403-e911c537aa0c` | Completed5.5s; 176 selected acquisitions stayed2458, encoded/live target2472, zero approach, residual14; approach current0..19.5mA; zero cycles/qualified returns | Actual P16/I0/D32, model777/fw3.10/mode0, original I0/Lock0 and24=16/25=0 verified; known motor/body/lift/camera cleanup, uncertaintyfalse. Completion honestly retains failed attainment and absent useful partial response. |
+| I1 `45d4ef46-3cfe-4b4f-9b66-2a15946aa459` | Progress0/noLive; configured and active I1 verified, then five-slot thermal freshness refused | Original I0/Lock0/24/25 restored with known cleanup; no I1 motion conclusion. |
+| I1 `173b6c0e-3188-4a3e-83a5-08b2b431d0f9` | Progress0/noLive; configured I1 verified, activation failed earlier on the same thermal freshness guard; active verification was never reached | Original I0/Lock0/24/25 restored with known cleanup. Absent active proof is recorded honestly; no I1 motion conclusion. |
+| Matched I1 `79defe8b-fe12-42fd-88a5-a88de76ac133` /host `ecef9250-0db6-4d41-8bca-c7483fc902a8` | Completed5.5s;173 selected acquisitions stayed2458; requested/encoded/live goal2472 (`[168,9]`), zero approach/wrong direction/overshoot, residual14; approach current0..39mA; zero cycles/qualified returns | Live I1/model777/fw3.10/mode0/P16/D32 verified; original I0/Lock0 and24=16/25=0 restored, no remaining restoration obligation; all20 zeros/lift/buses/camera verified/no owners. No native first fault; uncertaintyfalse. Target attainment/useful partial responsefalse. |
+
+The fresh I0 was needed because1073 lacked an actual matched gain baseline and
+current rest had changed from2453 to2458. It is not a rewrite of1073 or a repeated
+old signed benchmark. Any I1 comparison must freshly match this I0's selected start
+within2raw ticks, comparable other-joint poses, calibration/settings, target, rate
+and timing. If those conditions change, the match is refused or reported honestly;
+no commanded reset is added for comparison purity. Partial progress and strict
+2472±2 attainment remain distinct from the old repeated-response benchmark.
+
+The actual I1 initial measured reference matches the I0 across all12 joints exactly,
+as does calibration and2/3/.5 timing/60Live/100mA cap. Its initial measured command
+hold was2458. Two sparse same-owner replies retain the live goal/position evidence;
+its final qualifying window has7 acquisitions spanning more than.2seconds on both
+original clocks. The full original native completed run is36,845canonical bytes,
+SHA256 `eac17ce176890d5352a80953d64d59c3d83fbf74590f4dbeb9975dbe5934fd3a`;
+cleanup `2d1900ebec5dc088630cb91183622d00c4a1cfcafddc97f553e6840d34f363e7`
+and camera release `26e0a1957837d6229ebb8853eca672a6d6743651bae78a5fdc040f7657447252`
+remain separately bound. Greater sampled current is evidence of the tested setting's
+effect on this workload; it does not establish shaft torque or a mechanical cause.
+
+Neither the labelled longer-hold comparison nor confirmation cycles were performed:
+there was no useful partial approach or attained control to satisfy their conditional
+gates. Do not reinterpret clean program completion as repaired response, infer a
+dead servo/encoder, or repeat the completed generic inspection. The retained lower-
+pose historical +10 movement and signed negative19-tick response establish distinct
+working conditions, not an unmatched remedy for this2458 approach. The remaining
+physical mechanism is unknown. A discriminating next evidence need is an adequate
+view of the selected shaft/link and adjacent mechanism, paired with the existing
+native goal/position/current record, to resolve visual behavior across those working
+and static conditions; this is not authorization here for another gain, larger
+command, forced reset or blind repeat.
+
+The first I0 also exposed a reporting boundary: duplicate terminal gain evidence
+made the public response exceed its existing IPC limit while the native run had
+already completed. Only the duplicate public lifecycle presentation was bounded;
+full native run/SQL/private receipts, all20 zero readbacks and original clocks stay
+unchanged. Response/control caps remain65536/4096. The qualified native I0 remains
+available as the comparator after a strictly verified idle owner restart.
+
+The matched I1 later exposed another presentation boundary: the browser waited in
+finishing until its12-minute timeout although the native program and cleanup were
+already complete. The controlled native-type reconstruction using the actual full
+native terminal and cached presentation metadata was66,282bytes; the corrected
+public presentation encodes at61,338bytes under the unchanged65,536response cap.
+Only an exact terminal duplicate of `run.completion_receipt.execution`, with matching
+canonical run/host UUIDs and complete typed canonical receipt equality, becomes a
+SHA256 reference in public evidence. Full run/execution/completion/SQL/private/internal
+proof remains unchanged. Malformed, foreign, active or unequal evidence stays full.
+The original JavaScript-type controlled66,250-byte replay remains a separate retained
+negative case. These controlled reconstructions are distinct from the fresh final
+idle IPC response, measured at52,462bytes. Two newly opened trusted HTTPS pages
+connected and reattached to completed5.5/targetfalse/residual14/cycles0/returns0/
+lifecycleidle, with zero operations and no TLS exceptions. This
+reporting correction used stopped affected owners and did not rerun the physical
+comparison. The earlier browser timeout remains separate from the native result;
+keep the65,536/4,096 IPC caps and every original clock.
+
+The two I1 faults identify startup acquisition timing, not demonstrated elbow
+response. The first repair supplies due same-owner full lift reads across existing
+activation/handoff boundaries. The second services a newly occupied original100ms
+thermal slot as well as the existing50ms raw poll interval: a lower same-slot read
+retains its earlier peak and cannot renew that peak's age. The original window,
+origin, peak timestamps,.5s freshness,3-of5 heat latch and all poll protections are
+unchanged. A sealed private continuation links the exact original I0 comparator,
+both retained faults and the reviewed acquisition-only source transitions. Final
+repository bytes are verified; no historical row, fault or old deadline is rewritten.
+
+The acquisition/linked-continuation candidate passed203 focused native mock tests
+across the five affected files. A subsequent staging check identified the unchanged
+owner-only executable host launcher at mode0700; the source reader had accepted
+only0600/0644. The one-line repair accepts0700 only for source reads; private
+receipt reads remain0600 and ownership/path/link/bounds/stability/hash checks remain.
+No file permission was changed. The final reader candidate `1dd4f89f01492991cf6138d1f26fb2effa387817`
+then passed136 affected integration tests natively in7.11s, including the seven
+source/private permission contrasts. Both native runs audited10 reviewed source-module
+imports with no foreign compiled/source imports. These overlapping cohorts confirm
+software behavior, not physical I1 response or genuine input-loss recovery. The
+final reporting source `43c066468426b528aa7aa31f342172cb7e6fc480` passed146 native
+integration checks in8.02s (wrapper8.887s), again auditing all10 reviewed modules
+with no foreign source/compiled imports. Its native result SHA256 is
+`40936b4c13abfc3fcc5c2f499f92adb4a96a12372390c4049a887bbd7b768351`.
+These cohorts overlap; their counts are not added as independent checks.
+
+The evaluated physical I1 projection uses motor `3771bdaae024251510e95bc236a164c6763a7a34`,
+helper `0fe3997f12b9cdfdd01fda6f4c6b102781252448`, executor
+`3429a5a8d6356207820fa19d24fd018e35453062`, isolated camera
+`a0e94bc5298c021f785eaaee4ef0e2c44283f3d7`, and manifest
+`a0fd156d87667231c811a390975f402230e6a9fac7cfd07e9df141372a8ed506`.
+The reader-only projection preserves the motor and private version1 reference SHA256
+`8556c0a031ed9b87c6f42e39b12e6fce38491a3ef3646e393a2823cf78fe7657`.
+These material pins were used for the evaluated native I1. The current Core-only
+reporting executor is `1edfb14a4a123cf7cd9ef5dab03fe1c6a3f2ae13`, separately bound
+by deployment manifest `ee8ff072f5bdf70860a737771bbb8a431435e821eb50678dd332fe1a94b8d327`.
+The existing physical configuration and material manifesta0fd remain byte-identical;
+that retained executor3429 is execution provenance, not the current reporting owner.
+Motor/helper/cameras/reference remain unchanged. The final native audit verified18
+actual source files, all three existing active idle services, no hardware owners and
+the unchanged full completed79defe8b canonical hash. Private files, calibrationf3
+and original c500 database/WAL history remain preserved; no hardware was started
+during the reporting advance.
+
+The expired P1 leaf was identified at verified TLS before capture. Existing CA/P1/
+gateway credentials were renewed with the same keys and endpoint identities,
+365-day CA/90-day leaf validity, dependent endpoint verification and no TLS or clock
+exception. The existing caller now refuses expired/insufficient lease validity and
+records a modest14-day renewal warning. One trusted audio-off capture delivered
+800frames; independently probed original MP4 duration87.1588s,15,357,045bytes,
+SHA256 `c58119058e3418c3eda19d30b2fe0410a6b1991600371802665eaffeaa8b1ba0`.
+The source stopped normally and released the camera. Original frames at2/20/40s
+show an obstructed close-up without the selected left elbow or adjacent links;
+working capture does not establish visual elbow motion or hidden clearance.
+
+| Final operating item | Verified publication value |
+|---|---|
+| Current reporting source/executor/deployment | `43c066468426b528aa7aa31f342172cb7e6fc480` / `1edfb14a4a123cf7cd9ef5dab03fe1c6a3f2ae13` / `ee8ff072f5bdf70860a737771bbb8a431435e821eb50678dd332fe1a94b8d327`; Core only |
+| Retained physical material provenance | `a0fd156d87667231c811a390975f402230e6a9fac7cfd07e9df141372a8ed506`; physical configuration bytes, motor3771/helper0fe/cameraa0/reference8556 unchanged |
+| Windows served console/private pins | `e55d390bf6e957b9adc52ccf62b69476db12a20d`;1443bytes, SHA256 `ae457432edac3d8f2df24d0ec6032dd6c48ed2ff7ac2d76c584f97eb7ca45f66`, original owner-only ACL unchanged |
+| P1 source/trust | `2d9e365f1e302694633e7b1c916a38fb15cc50cc`; renewed CA/leaf hashes unchanged in final audit; trusted capture retained |
+| Normal and isolated camera sources | Normal `9b1f0670e7068f7d39eb50270a118e3807418355`; isolated `a0e94bc5298c021f785eaaee4ef0e2c44283f3d7`, unchanged |
+| Completed native terminal/restoration/cleanup | `79defe8b...`, original full canonicaleac17/cleanup2d190/camera26e0 unchanged; original I0/Lock0/24/25 restored, known cleanup/no owners |
+| Current available idle | Three existing services active/idle; required no-owner/private/calibration/history audit qualified; two fresh HTTPS pages connected/reattached with zero operations and no TLS exceptions |
+| Matched stopped rollback | Exact current terminal-reporting controller/manifest plus materiala0fd Windows guard below; retained and unexecuted |
+
+The following matched rollback is retained for deliberate use; it was not executed
+as part of this final verification. Run it from the reviewed worktree. Stop on any
+failed controller/helper call, hash or ACL mismatch. The current terminal-reporting
+controller validates its literal manifest and known cleanup under both admission
+locks. It restores the retained original motor/helper before the separately gated
+original Windows pins and accepted c500 simulation idle route. It does not erase
+new run receipts or the old simulation history.
+
+```powershell
+$ErrorActionPreference = 'Stop'
+$sessionConfig = 'C:/Users/pickm/lerobot_alohamini_client/.worktrees/am1-console-implementation/config/am1.session.json'
+if ((Get-FileHash -LiteralPath $sessionConfig -Algorithm SHA256).Hash.ToLowerInvariant() -ne 'ae457432edac3d8f2df24d0ec6032dd6c48ed2ff7ac2d76c584f97eb7ca45f66') { throw 'Current material pins changed' }
+$recordedAcl = (Get-Acl -LiteralPath $sessionConfig).Sddl
+ssh am1-pi '/home/pickmanmike/.local/share/am1-session-pi-01/venv/bin/python -B /home/pickmanmike/.local/share/am1-lift-startup-01/staging/staging-control-recovery03-terminal-reporting.py rollback-stopped --terminal-reporting --manifest /home/pickmanmike/.local/share/am1-lift-startup-01/staging/elbow-recovery03-terminal-reporting-manifest.json'
+if ($LASTEXITCODE -ne 0) { throw 'Stopped rollback failed; do not continue' }
+uv run --no-sync --project C:/Users/pickm/lerobot_alohamini_client python .cache/am1-lift-startup-01/prepare_next_operation.py pins-restore --recovery03-startup-second --manifest .cache/am1-motion-quality-01/projections/elbow-recovery03-reader-executor-reviewed-01/executor-motion-quality-manifest.json --manifest-sha256 a0fd156d87667231c811a390975f402230e6a9fac7cfd07e9df141372a8ed506 --prior-manifest .cache/am1-motion-quality-01/projections/elbow-recovery03-startup-executor-reviewed-01/executor-motion-quality-manifest.json --prior-manifest-sha256 d73ce8db91a95f20bb4ff74b7801961d462ecd08340198e273cdea8d4bdbd2b9
+if ($LASTEXITCODE -ne 0) { throw 'Original pin restoration failed; do not restore idle' }
+if ((Get-FileHash -LiteralPath $sessionConfig -Algorithm SHA256).Hash.ToLowerInvariant() -ne 'e1c4c81a885f37108eff453916a83c4e9866d53326be408dafb4aad7faa5e7e2') { throw 'Original pins do not match' }
+if ((Get-Acl -LiteralPath $sessionConfig).Sddl -cne $recordedAcl) { throw 'Original ACL does not match' }
+ssh am1-pi '/home/pickmanmike/.local/share/am1-session-pi-01/venv/bin/python -B /home/pickmanmike/.local/share/am1-lift-startup-01/staging/staging-control-recovery03-terminal-reporting.py restore-original-idle --terminal-reporting --manifest /home/pickmanmike/.local/share/am1-lift-startup-01/staging/elbow-recovery03-terminal-reporting-manifest.json --windows-original-pins-restored-sha256 e1c4c81a885f37108eff453916a83c4e9866d53326be408dafb4aad7faa5e7e2'
+if ($LASTEXITCODE -ne 0) { throw 'Original idle restoration failed' }
+```
+
+Do not substitute historical b0be/f4ae/e166/d73 controller commands for the final
+terminal-reporting variant. The materiala0fd pin helper is intentionally retained
+because current physical configuration bytes are unchanged; deploymentee8ff binds
+the current reporting owner separately. Unknown cleanup requires genuine
+reconciliation. Preserve normal-use guidance, original permissions/calibration and
+all historical rollback artifacts. Remaining startup sensitivity or genuine physical
+required-input-loss recovery is reported separately; neither this motor diagnostic
+nor a successful retry qualifies those unrelated durability behaviors.
+
+## Historical AM1-ELBOW-RESPONSE-02 checkpoint
+
+The following results, original-reference prerequisite, setting statements and deployment commands describe that earlier checkpoint. The current recovery experiment and reporting deployment above supersede its pending actions; its measurements and verdicts are retained.
 
 The owner completed the requested power-off elbow inspection and reports no apparent
 issue. That action is satisfied; it is not a pending mechanical-inspection request.
@@ -772,7 +944,7 @@ Exact comparison found only those 13 representation differences. The private sta
 native durable JSON; strict validators, browser evidence and the
 original refusal remain unchanged. No numeric-normalization bypass was introduced.
 
-## Current verification and actual final deployment
+## Historical AM1-LIFT-STARTUP-01 verification and deployment
 
 The lift/cleanup correction received clear focused review. Its isolated native
 affected cohort passed **365 tests in 12.17 seconds, exit 0, zero skips**, using

@@ -1,33 +1,51 @@
 # AM1 roaming-resilient sessions
 
-**Current continuation: [AM1 protected physical sessions](protected-physical-sessions.md), AM1-MOTION-QUALITY-01.**
-The accepted 88/352/352/body12 physical continuity milestones remain achieved at
-their recorded sources; they were not rerun unchanged. Durability means software
-fault tolerance, connection/control continuity, state preservation and recovery
-with minimal human intervention. No wear or mechanical-lifespan campaign was added.
+**Current continuation: [AM1 protected physical sessions](protected-physical-sessions.md),
+AM1-ELBOW-RECOVERY-03.** The matched current-pose I0/I1 programs completed5.5seconds, but both stayed
+raw2458 despite goal2472: zero useful approach/residual14. I1 increased sampled
+current to39mA vs I0's19.5mA without movement. All12 starting poses/calibration/timing
+matched; live I1 and verified original I0/Lock0/individual24/25 restoration are
+retained with all20zero/lift/bus/camera cleanup/no owners/no native fault. Two earlier
+I1 thermal faults ended before Live and remain preserved. No longer hold or
+confirmation is justified. Native completion is distinct from the browser's later
+terminal-reporting size timeout. Its public duplicate evidence is now bounded,
+and two fresh trusted browser pages reattached to the unchanged completed native
+result. Current services are available and idle; matched rollback is retained and
+unexecuted. Goal acceptance, useful partial movement, strict attainment,
+program completion and repeated control remain separate results.
 
-The focused two-cycle left-elbow comparisons now retain original encoded commands,
-five sparse same-owner live-register packets and advancing native position samples.
-Both corrected18 and separately labelled dwell24 complete with qualified cleanup
-and zero recoveries, but all 553/737 acquired positions stay raw2399 despite actual
-endpoint goal2432. Longer holds do not improve measured response. Program completion,
-original return-envelope qualification and useful movement remain separate results.
-The selected-recipe completion dispatch is repaired; the remaining response
-limitation is downstream of the correct servo goal update. The report specifies
-one power-off linkage/horn-coupling inspection, without speculative tuning.
+The new packet authorizes measured-start recovery toward retained2472; the old
+2472±2 prerequisite applies to the historical failed runs, not all future AM1 use.
+The requested elbow inspection is completed. Trusted P1 audio-off capture is
+restored: the original87.1588-second clip delivered800frames and released normally,
+but inspected frames do not show the left elbow or adjacent links. Required sensing
+remains actual Pi-local camera evidence; P1 stays advisory.
 
-The actually active candidate is motor81490/helper0fe/executorb855 under the separate
-5ab2 manifest, available idle via the existing opt-in route, with latest a188 terminal
-and known cleanup. Original c500 simulated history and f03/8e/e1 matched rollback
-remain accessible. Calibration, private permissions, trust and earlier failures
-are preserved. Actual inspected images lack an adequate selected-elbow angle;
-validated local-image delivery does not establish visual joint motion.
+The acquisition/linked-comparator correction has203 focused native mock checks;
+the final source-only0700 reader correction has136 native integration checks,
+including its seven permission contrasts. Both audit10 reviewed source-module imports with
+no foreign code; cohorts overlap. Final reporting source
+`43c066468426b528aa7aa31f342172cb7e6fc480` passed146 native integration checks in
+8.02s with the same10-module audit. Current motor3771/executor1edf are separately
+bound by deploymentee8ff; the unchanged materiala0fd contract preserves evaluated
+I1 execution provenance, not the current reporting executor. Controlled native-type
+terminal replay is66282→61338bytes; independently reacquired idle IPC is52462bytes
+under the unchanged65536cap. Final18-file audit verified three active idle services,
+no owners and unchanged full native terminal/private files/calibration/c500 history.
+Windows e55/current1443-byte AE45 pins and original ACL remain unchanged; P1 source
+2d9 and renewed trusted credentials are separately verified. Preserve
+all native faults/full receipts and separate source pins, calibration, permissions,
+simulation history and matched rollback. Simulation is default, AM1 stays wireless,
+AM2 is unchanged and there is no autoplay or permanent tuning. Draft#20 remains
+unmerged and dependent on #19 -> #18 -> #17 -> #16.
 
-Simulation remains the default, AM1 stays wireless, required sensing is real local
-camera evidence and P1 is advisory. Draft #20 remains dependent on
-#19 -> #18 -> #17 -> #16, unmerged; exact pins, tests, limitations, normal use and
-rollback commands are in the operating report.
-
+Durability means software fault tolerance, connection/control continuity, state
+preservation and recovery with minimal human intervention. The accepted88/352/352/
+body12 milestones remain achieved at their recorded sources and were not rerun
+unchanged. Wear/mechanical lifespan and genuine physical required-input-loss recovery
+were not established by this continuation. Detailed current evidence and limits are
+in the linked report. The retained architecture and source-dated milestones follow;
+current operating state above supersedes older deployment and pending-action statements.
 
 **AM1-SESSION-ARCHITECTURE-01 · owner-approved design. The accepted AM1-MOBILE-LOCAL-01 slice selects real robot-local camera input with simulated motor IO and advisory P1 evidence. The separate strict P1 diagnostic remains failed.**
 Choose a Pi-owned session authority and finite executor, an authenticated LAN
