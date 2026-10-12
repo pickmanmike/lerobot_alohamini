@@ -1,11 +1,16 @@
 # AM1 roaming-resilient sessions
 
 **Current continuation: [AM1 protected physical sessions](protected-physical-sessions.md),
-AM1-VISIBLE-CONTROL-04.** The independent +10 recipe is reviewed, tested natively
-and staged available idle at unchanged I0. The physical comparison is pending the
-packet's permitted camera-only framing correction; no new motor task has started.
-Program completion, actual movement and fine residual remain separate, and software
-durability retains its fault-tolerance meaning. Recovery03 results below remain historical.
+AM1-VISIBLE-CONTROL-04.** One unchanged-I0 positive comparison started normally,
+then faulted at5.9 seconds at the selected100 mA sampled-current guard. All182
+published positions stayedraw2458 despite encoded writes reaching2498; relevant
+current P1 images show no resolvable elbow excursion. No endpoint/return/fine
+qualification or confirmation followed. Native/browser fault and known cleanup
+agree; exact separate candidate pins remain verified available idle. The next
+discriminator is actual selected live Goal_Position/current at the guarded boundary.
+Program, visible/measured response and qualification remain separate. Software
+durability retains its fault-tolerance meaning; genuine physical input-loss recovery
+remains unproved. Recovery03 results below remain historical.
 
 **Retained AM1-ELBOW-RECOVERY-03:** The matched current-pose I0/I1 programs completed5.5seconds, but both stayed
 raw2458 despite goal2472: zero useful approach/residual14. I1 increased sampled

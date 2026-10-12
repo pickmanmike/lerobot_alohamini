@@ -2,11 +2,63 @@
 
 ## Current continuation: AM1-VISIBLE-CONTROL-04
 
-The opt-in `physical-left-elbow-positive-control` is implemented, reviewed and
-staged available idle. Its physical comparison has not started: the latest spare
-P1 camera view leaves AM1 out of frame, so packet §3's camera-only adjustment
-is pending. Earlier useful imagery remains historical. Recovery03 repairs and
-negative matched I0/I1 results remain intact. No further gain experiment is included.
+The reviewed `physical-left-elbow-positive-control` was physically evaluated once
+from the freshly measured pose at unchanged I0. It reached the selected 100 mA
+sampled-current boundary before useful movement or the full endpoint. The candidate
+is verified available idle with known cleanup. Recovery03 repairs and the negative
+matched I0/I1 result remain intact; no gain or cap change was made.
+
+Run `f7e7ae6d-d305-448a-90b6-5f2ae3bc8b19`, host
+`43784281-4a45-4e54-8804-c3afc67ccfae`, froze the same actual raw2458 origin
+(normalized44.31869624264374). Its planned +10 endpoint was2568: E=110 ticks,
+coarse movement55 ticks in each direction and residual22 ticks. Normal startup
+succeeded. The finite program faulted at5.9 seconds before endpoint, return or
+final qualification; no conditional confirmation was justified.
+
+| Result | Actual evidence |
+|---|---|
+| Program | Faulted at5.9 of28 nominal seconds; cycles0, returns0 |
+| Published measured response | 182 unique ordinary acquisitions:63 baseline/119 outbound; every selected position2458 |
+| Encoded command | Last published write2498 (+40 ticks), requested q0+3.7; sync write returned, no servo acknowledgment |
+| Live servo goal | Sparse baseline Goal2458 matched. No post-baseline Goal_Position readback before the abort |
+| Current | Published maximum91 mA; last84.5 mA. Exact triggering read unavailable |
+| Visible response | No resolvable commanded elbow pivot in inspected relevant original frames; dark/backlit fine visual limit |
+| Coarse functional check | Unqualified/inconclusive under this cap: no endpoint or return coverage |
+| Fine residual | No qualified final-return window; no precision success claimed |
+| Cleanup | Twenty typed zero readbacks, lift qualification, buses closed and same-run required camera released; uncertaintyfalse |
+
+The native first cause is `RuntimeError: Visible selected software effort ceiling
+reached`, at host loop274 during the existing ordinary current read. The previous
+loop completed33.432 ms; the failed loop elapsed23.961 ms. Published selected
+position acquisition gaps peaked50.965181 ms. These records establish a current
+boundary, not a demonstrated scheduling or freshness defect. The integer conversion
+and unchanged guard imply a triggering magnitude of at least16 raw units (104 mA),
+but that is a source-derived lower bound, not the observed missing sample or a
+hardware peak-current estimate.
+
+The owner later recorded consequential `feedback_loss` and one recovery episode
+when native acquisitions stopped. Full native cleanup preserves the effort-ceiling
+cause, and the browser displays it in the lifecycle evidence. Both causes remain;
+no historical first cause was rewritten. This protective abort is not a successful
+physical required-input-loss recovery demonstration.
+
+Baseline sparse ID3/model777/mode0 Goal2458 and wire traces establish the measured
+hold. Actual before/active settings remain P16/I0/D32, Goal_Time0, Goal_Velocity0,
+Acceleration254 and the unchanged individual24/25/85 values. All other targets
+held their fresh measured values; body/lift goals stayed zero after startup.
+An encoded write2498 does not prove a later servo Goal_Position2498 readback.
+The successful August20 +105-tick condition had another pose and waveform and
+incomplete setting provenance; this capped partial run does not reproduce it.
+
+The next discriminating evidence is selected live Goal_Position plus the actual
+cap-triggering current at this guarded boundary through the sole owner. That
+would separate dispatch/register acceptance from the physical response boundary.
+No decoding, mapping, dispatch, timing or qualification defect was demonstrated,
+so no further software correction or unchanged powered retry is justified by this
+comparison. It neither identifies friction/gravity/firmware as a cause nor proves
+a failed servo. Raising the cap, changing settings, forcing an old pose or doing
+another generic inspection is outside this result. The packet's informative
+next-layer result is achieved; useful out-and-back control remains unresolved.
 
 The sole protected owner reads actual selected ID3 settings before configuration,
 skips its settings/default writes, then verifies unchanged settings after normal
@@ -16,8 +68,9 @@ to q0+10, 2 seconds endpoint, 10 seconds return to q0, 2 seconds origin and 2 se
 final evidence: 28 nominal, 30 maximum trajectory, 60 Live and the existing180
 startup budget. Slope is at most1 normalized unit/second, without catch-up; the
 new q0±10 envelope and all stricter calibration/raw/relative/clearance limits stay
-active. Sampled software current remains at most100mA or a stricter local limit;
-this is not a hardware peak-current guarantee.
+active. The sampled-current guard uses a 100 mA threshold or a stricter local
+limit and stops when a sample reaches or exceeds it. This is not a hardware
+peak-current guarantee.
 
 Program completion, actual visible motion, measured coarse response and fine
 residual are separate. Exact encoded goal excursion E sets ceil(E/2) movement in
@@ -30,19 +83,30 @@ stationary/nonadverse feedback and known cleanup. It retains original q0, admits
 fresh hold and records at most2 acquisition seconds at≤1unit/second before the
 same28-second waveform. No commanded or manual old-reference matching is added.
 
-The earlier 49.2772-second P1 preview showed both arms and elbow linkages.
-The refreshed recording independently completed 86.9595 seconds with audio off
-and verified normal P1 source release. Its original frames at 0.25, 8 and 70 seconds
-leave AM1 out of view. The separate optional Pi-to-P1 delivery failed with
-ConnectionError after 15 frames and left release unconfirmed in that client's
-summary; that failure remains. Independent recording verification does not turn
-failed delivery into a pass. Existing TLS expiry-ahead checks passed without
-reenrollment or exceptions. No network tuning was used. Useful current elbow
-framing is required before this experiment's excursion. P1 remains advisory;
-actual Pi-local images remain required by task authority. Images and raw logs
-remain private. The only pending physical action is camera framing: with the AM1 session stopped
-and motor power off, re-aim only the spare P1 camera and keep camera/cable outside
-the movement area. Leave the elbow in its current pose; no repeated inspection.
+The owner's permitted camera-only adjustment was completed before motion, with
+session stopped, motor power off, robot pose unchanged and camera/cable clear.
+A fresh31.5864-second audio-off preview released normally; original2/8-second
+frames showed both elbow linkages and the nearby movement area. Earlier49.2772
+useful imagery and the later86.9595-second out-of-view recording remain historical,
+including that client's ConnectionError/15-frame/release-unconfirmed result.
+
+One original audio-off recording then spanned startup, the actual bounded trial
+and cleanup. Its independent verification is456.285 seconds,79,452,143 bytes,
+SHA `513b115b4ba85f3a28ad6a5da445c44d7a7161c7c462b72b12ca73969dc43256`,
+zero audio streams and actual P1 source release. Original frames at60/68/72/76/82
+video seconds were inspected. No resolvable selected elbow pivot is visible;
+small visual effects cannot be excluded by this backlit finite-frame comparison.
+P1 PTS/source QPC/UTC, Pi acquisition monotonic and Duffy observation UTC remain
+separate; their correlation is approximate, with no exposure-clock equivalence.
+
+Optional Pi-to-P1 delivery separately failed with ConnectionError after346 received
+frames and an unconfirmed-release client summary. That failed result is unchanged.
+The original source recorder continued independently. After the run, its exact
+existing source Stop function confirmed normal release using the same controller/
+request identities; it sent no new camera or motor Start. This does not turn failed
+delivery into a pass. Existing trust/expiry checks passed without reenrollment,
+TLS exception or network tuning. P1 remains advisory; real Pi-local camera evidence
+was required and its same-run release is verified. Images and raw logs stay private.
 
 The same final four-module cohort passed 291 cases on Windows and 291 natively
 in the Pi's existing Python 3.12 environment. All 12 changed-module imports matched;
@@ -98,13 +162,23 @@ and the strict raw check remain. Subsequent staging/idle qualification preserved
 Sim/SQL/WAL/private archives and calibration. The new physical config omits the
 historical 2472 reference. Windows literal pin substitution preserved its ACL.
 
-Two fresh trusted browser views preserve completed 79def, failed target attainment,
-residual 14 and idle lifecycle, with zero controls sent. No new motor task,
-visible/measured response, coarse result or fine residual is claimed.
+Before this comparison, two fresh trusted views preserved completed79def,
+failed target attainment/residual14 and idle lifecycle with zero controls sent.
+After f7e7 faulted, another two fresh trusted views reattached to that same fault,
+original seed/deadline and unchangedc94/d76 pins, with zero controls or TLS exceptions.
+Every parsed native-run value agrees after removing only the two documented
+remaining-time presentation fields; this is not raw byte or numeric lexical identity.
+The full14,713-byte canonical native artifact remains private and unchanged, SHA
+`2e9d79860475d8028fc53cdb9d4c1643579bdc88ac4c5c0a7e32bbdd55a8b28b`.
+Native and browser agree on faulted5.9/known cleanup/uncertaintyfalse without manual
+motor rescue, a duplicate Start or a terminal reporting timeout. Actual final idle
+qualification checked exact-run receipts, source/pins/private files and no device owners.
 
-After useful framing is verified, use the existing trusted virtual console's
-explicit Claim and selected Start. The primary acquires fresh q0; a conditional
-confirmation retains that absolute reference. Page/service start does not actuate.
+The executed operation was explicit Claim and Start of
+`physical-left-elbow-positive-control` through the existing trusted virtual console.
+No confirmation or second departure followed the cap abort. Future discriminating
+work needs its supported bounded scope; available idle does not make this failed
+waveform a passing operating recipe. Page/service start does not actuate.
 Simulation default and no autoplay remain. Original matched stopped rollback
 remains motor `f03de9c3b8c4f1d9e69b6951584119113ca4c5da`, helper
 `8e6a0cf616cb2000df1d0e996ab27a19d2fb2fba`, original Windows configuration

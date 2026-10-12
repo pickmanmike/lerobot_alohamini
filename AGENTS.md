@@ -1,36 +1,48 @@
 ## Current AM1 visible positive-control continuation
 
-For AM1-VISIBLE-CONTROL-04, preserve the completed Recovery03 software repairs and
-negative matched I0/I1 results. Original I0 remains restored; no new gain experiment
-or permanent tuning is authorized. Use one independent fresh-pose +10 out-and-back
-at unchanged baseline settings through the sole protected motor owner. Freeze all12
-measured targets, keep other11 held and body/lift zero after startup. New q0±10
-absolute envelope and all stricter limits, slope<=1 unit/s, cap100mA or stricter,
-28 nominal/30 trajectory/60 Live/180 startup seconds. No old2472/manual matching,
-repeat elbow inspection, attendance questions or unchanged endurance campaign.
+AM1-VISIBLE-CONTROL-04 has one actual bounded comparison, f7e7ae6d-d305-448a-90b6-5f2ae3bc8b19.
+It started normally from measured raw2458 at unchanged P16/I0/D32, then faulted at
+5.9 program seconds when the selected 100 mA sampled-current guard stopped the host.
+All182 published selected positions stayed2458; encoded writes reached2498, but
+only baseline live Goal2458 was read back. Published current peaked91 mA; the exact
+triggering read was not retained. Native effort-ceiling cause and consequential
+owner feedback_loss are both preserved. No endpoint, return, coarse/fine qualification
+or conditional confirmation exists; do not repeat this unchanged capped condition.
 
-Program completion, current visible motion, measured coarse outward/reverse response
-and fine residual are separate. Coarse thresholds are each direction>=50% exact
-encoded excursion and final originalq0 residual<=20%, with advancing phase coverage,
-fresh stationary evidence and noise discriminability. One confirmation is conditional
-on coarsepass/nonadverse/known cleanup and retains fixed originalq0/envelope, with
-bounded separately recorded acquisition; never reseed away drift.
+The owner completed the camera-only adjustment with the robot pose unchanged.
+Current original P1 frames show both elbow linkages; inspected relevant physical-run
+frames show no resolvable commanded pivot, with dark/backlit fine visual limitations.
+The original audio-off source recording completed and released; separate optional
+Pi-to-P1 delivery failure remains failed. P1 is advisory; the real Pi-local camera
+remains required. No repeated elbow inspection, camera adjustment, old2472/manual
+matching, attendance question, network tuning or mechanical endurance campaign.
+Root alone operates devices/capture/staging; other agents inspect source/evidence.
 
-The earlier P1 preview showed both arms/elbow linkages. The latest inspected
-recording leaves AM1 out of view. With the session stopped and motor power off,
-re-aim only the spare P1 camera; keep camera/cable outside the movement area.
-Verify useful current framing before this excursion and keep the robot pose unchanged.
-Use the existing bounded audio-off capture and inspect current images. P1 stays advisory; the real
-Pi-local camera remains required. Root alone operates hardware/capture/staging.
-Run focused full-wrapper actual IPC tests before motion and surface concrete reporting
-failures promptly. Preserve complete private native proof, original65536/4096 caps,
-all local operating guards, simulation default/no autoplay, calibration, private
-permissions, component-specific pins and matched stopped rollback. AM1 wireless,
-AM2 untouched. Draft PR20 remains dependent19->18->17->16; no merge/retarget/force.
+Retain completed Recovery03 repairs and negative matched I0/I1 results. Original I0
+remains restored; no more gain experiments or permanent tuning. The protected recipe
+freezes all12 fresh targets, holds other11 and body/lift zero after startup. Its
+q0+10 and fixed q0 return stay inside q0±10 and all stricter limits, slope<=1 unit/s,
+cap100mA or stricter, 28 nominal/30 trajectory/60 Live/180 startup seconds. A
+confirmation requires actual coarsepass/nonadverse/known cleanup and retains the
+original reference; it is not authorized by this incomplete result.
+
+Program completion, visible motion, measured response, coarse qualification and
+fine residual remain separate. The next evidence discriminator is selected live
+Goal_Position readback plus the actual cap-triggering current at the same guarded
+boundary through the sole owner; do not assume an encoded write is a servo readback.
+No decoding, mapping, dispatch, timing or qualification defect was demonstrated,
+so no additional software patch, cap increase or powered retry is justified now.
+
+The candidate is verified available idle after known all20zero/lift/bus/camera
+cleanup, without uncertainty or device owners. Two fresh trusted browser views
+reattached to the same fault with zero controls; parsed values match the full private
+native record except the two documented countdown fields. Preserve sourcec56,
+motorc94, runtimec694, manifestd76, exact separate pins/private ACL/calibration,
+original65536/4096 caps, simulation default/no autoplay and matched stopped rollback.
+AM1 wireless, AM2 untouched; draft20->19->18->17->16, no merge/retarget/force.
 Durability means software fault tolerance, connection/control continuity, state
 preservation and recovery with minimal human intervention, not mechanical lifespan.
-The overall dependable-control goal and genuine physical input-loss recovery remain
-open beyond this bounded joint comparison.
+The broader dependable-control goal and genuine physical input-loss recovery remain open.
 
 ## Historical AM1 current-pose recovery continuation (superseded for new Visible04 only)
 
