@@ -1681,7 +1681,9 @@ class AlohaMini(Robot):
             }
             visible = getattr(self, "_am1_visible_control_evidence", None)
             if getattr(self, "_am1_visible_control_binding", None) is not None:
-                visible.check_visible_current(self, raw, float(limit_ma))
+                visible.check_visible_current(
+                    self, raw, float(limit_ma), source="ordinary_current", sample=self._am1_selected_joint_current,
+                )
             elbow_trial = getattr(self, "_am1_elbow_integral_trial", None)
             if elbow_trial is not None and elbow_trial.restore_required:
                 elbow_trial.check_current(raw, float(limit_ma))

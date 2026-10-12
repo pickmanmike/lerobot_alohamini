@@ -1,4 +1,57 @@
-## Current AM1 visible positive-control continuation
+## Current AM1 elbow movement through completion scope
+
+The owner explicitly invoked AM1-ELBOW-TO-COMPLETION-06. It completely replaces the
+proposed AM1-FAULT-EVIDENCE-05, which was never sent, and supersedes contradictory
+present restrictions in the historical packets below. Continue the evidence-driven
+repair loop until the left follower elbow moves intentionally and usefully, reverses
+and demonstrates short repeatable control, or actual evidence establishes a specific
+necessary physical/access action unavailable to our tools. One diagnostic, cap trip,
+report or artificial attempt quota does not complete this assignment.
+
+Successive supported finite experiments and justified diagnostic-only changes are
+authorized without per-iteration attendance/readiness/permission questions. The old
+100 mA diagnostic threshold is not immutable. Reassess it using installed model,
+actual configuration, load/pose, real current and working records before replacing
+it. Catalog maxima or ordinary software ceiling alone do not establish a loaded
+joint budget. Keep hardware/device current/torque limits, genuine stall/current/
+thermal/voltage/status/feedback/travel/ownership protections and normal cleanup.
+No blind retries, force escalation, stalled holds, unbounded motion or fault clearing.
+A fault ends that experiment, not the investigation; preserve its first causes.
+
+Repair missing live trigger evidence in memory before cleanup, then publish through
+existing channels without delaying protection. Obtain necessary same-owner live goal
+readbacks; never invent the lost f7e7 sample or substitute torque-off values for it.
+Compare working +105/negative conditions honestly; vary important conditions with
+finite local bounds, tracked references/displacement and unchanged P16/I0/D32 first.
+An evidence-supported selected setting comparison may be temporary, narrow and
+verified/restored through the existing supported volatile mechanism. No blind gain
+sweep, firmware/ID/baud/Phase/calibration reset or permanent hardware tuning.
+
+Reuse current idle candidate, existing finite provider, a small validated selected
+parameter interface, normal virtual controls, native evidence/analyzer/stager/tests.
+Root alone operates devices/camera/SSH/Git/staging. Hold uninvolved joint targets,
+body/lift zero after startup unless a separately declared supported slow pose change
+is necessary and within current feedback/limits/visible clearance. Do not move the
+base or force motion through contact. Start fresh measured poses after known cleanup,
+track total displacement and preserve old return errors without manual raw2472 matching.
+The elbow inspection, camera adjustment and trusted certificate repair are completed;
+do not ask for them again unless a concrete new unavailable action is demonstrated.
+
+AM1 wireless; P1 advisory and existing real Pi-local required-camera policy retained;
+AM2 untouched. No Ethernet/network tuning, new architecture/framework, broad installer,
+mechanical wear campaign, physical leaders, autoplay, merge/retarget/force/history
+rewrite or private credential/image publication. Stage only stopped affected owners;
+preserve exact separate pins/private ACL/calibration/history and matched rollback.
+Check actual full serialized status/control when evidence changes; do focused tests,
+changed-interface review/native verification, and narrow correction rechecks.
+
+Durability means software fault tolerance, connection/control continuity, state
+preservation and recovery with minimal human intervention, not mechanical lifespan.
+Keep program completion, visible response, measured movement, return accuracy and
+repeatability distinct. Useful repeated movement is the completion condition; the
+broader genuine physical required-input-loss recovery remains a separate milestone.
+
+## Historical AM1 visible positive-control continuation (superseded for new packet06)
 
 AM1-VISIBLE-CONTROL-04 has one actual bounded comparison, f7e7ae6d-d305-448a-90b6-5f2ae3bc8b19.
 It started normally from measured raw2458 at unchanged P16/I0/D32, then faulted at

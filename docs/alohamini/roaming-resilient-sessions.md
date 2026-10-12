@@ -1,5 +1,12 @@
 # AM1 roaming-resilient sessions
 
+**Active scope: AM1-ELBOW-TO-COMPLETION-06.** The repair loop continues until useful,
+intentional repeated elbow movement is demonstrated or a concrete required physical/
+access action is unavailable. The old 100 mA threshold is an experimental restriction
+to reassess with evidence. Packet06 replaces unsent FAULT-EVIDENCE-05; prior results
+below remain historical. Source/deployment are being verified before changed experiments.
+
+
 **Current continuation: [AM1 protected physical sessions](protected-physical-sessions.md),
 AM1-VISIBLE-CONTROL-04.** One unchanged-I0 positive comparison started normally,
 then faulted at5.9 seconds at the selected100 mA sampled-current guard. All182

@@ -14,6 +14,7 @@ if __package__:
         LEFT_ELBOW_ORIGINAL_RETURN,
         LEFT_ELBOW_POSITIVE_CONTROL,
         LEFT_ELBOW_RESPONSE,
+        SelectedElbowExperiment,
     )
 else:
     from am1_session_contract import (
@@ -21,6 +22,7 @@ else:
         LEFT_ELBOW_ORIGINAL_RETURN,
         LEFT_ELBOW_POSITIVE_CONTROL,
         LEFT_ELBOW_RESPONSE,
+        SelectedElbowExperiment,
     )
 
 
@@ -461,7 +463,13 @@ class LeftElbowResponseCharacterizeInput(ScriptedLeaderInput):
             raise ValueError("signed selected final normalized target differs from the actual encoded goal")
         if abs(current["ma"]) >= 1800:
             raise ValueError("signed selected current reached the existing joint hold bound")
-        if abs(observed[self.selected_joint] - self._reference) > 10:
+        if isinstance(self.definition, SelectedElbowExperiment):
+            magnitude = abs(self.definition.excursion_norm)
+            low = self.definition.encoded_goal(self._reference-magnitude, calibration)
+            high = self.definition.encoded_goal(self._reference+magnitude, calibration)
+            if not low <= position["raw"] <= high:
+                raise ValueError("signed selected position exceeds the absolute encoded experiment envelope")
+        elif abs(observed[self.selected_joint] - self._reference) > 10:
             raise ValueError("signed selected position exceeds the absolute original envelope")
         for key in self.origin:
             if key != self.selected_joint and abs(observed[key] - self.origin[key]) > 1:
@@ -658,7 +666,12 @@ class LeftElbowPositiveControlInput(LeftElbowResponseCharacterizeInput):
     selected_joint = LEFT_ELBOW_POSITIVE_CONTROL.joint
     definition = LEFT_ELBOW_POSITIVE_CONTROL
 
-    def __init__(self, *args, positive_comparator=None, **kwargs):
+    def __init__(self, *args, positive_comparator=None, definition=None, **kwargs):
+        if definition is not None:
+            if not isinstance(definition, SelectedElbowExperiment):
+                raise ValueError("selected experiment requires its exact validated definition")
+            self.definition = definition
+            self.motion_profile = definition.profile
         self._positive_comparator = copy.deepcopy(positive_comparator)
         super().__init__(*args, **kwargs)
 
@@ -670,7 +683,10 @@ class LeftElbowPositiveControlInput(LeftElbowResponseCharacterizeInput):
         self._acquisition_s = 0.0 if prior is None else 2.0
         if (not self._number(self._reference) or abs(self._reference - self._admitted_reference) > 2):
             raise ValueError("positive confirmation acquisition exceeds two units")
-        if not -100 <= self._reference - 10 <= self._reference + 10 <= 100:
+        self._excursion = getattr(self.definition, "excursion_norm", 10.0)
+        self._raw_direction = 1 if self._excursion > 0 else -1
+        magnitude = abs(self._excursion)
+        if not -100 <= self._reference - magnitude <= self._reference + magnitude <= 100:
             raise ValueError("positive control full absolute corridor unavailable")
         if prior is not None:
             previous_seed = prior.get("original_seed")
@@ -685,8 +701,10 @@ class LeftElbowPositiveControlInput(LeftElbowResponseCharacterizeInput):
             if uuid_text(prior["run_id"]) != prior["run_id"]:
                 raise ValueError("positive confirmation prior identity invalid")
         self.origin[self.selected_joint] = self._reference
-        self.targets = dict(self.origin, **{self.selected_joint:self._reference + 10})
-        self.duration_s = 28 + self._acquisition_s
+        self.targets = dict(self.origin, **{self.selected_joint:self._reference + self._excursion})
+        self.duration_s = self.definition.nominal_trajectory_s + self._acquisition_s
+        if isinstance(self.definition, SelectedElbowExperiment) and self.duration_s > self.definition.trajectory_s:
+            raise ValueError("selected confirmation acquisition exceeds its finite trajectory envelope")
         self._initialize_selected_feedback()
         self._visible_settings = None
         self._positive_outcome = None
@@ -699,23 +717,27 @@ class LeftElbowPositiveControlInput(LeftElbowResponseCharacterizeInput):
         self._tracking = {}
         self._record("am1_scripted_positive_plan", reference=dict(self.origin),
                      admitted_reference=self._admitted_reference, acquisition_s=self._acquisition_s,
-                     ramp_s=10, endpoint_hold_s=2, origin_hold_s=2, final_hold_s=2,
-                     live_ceiling_s=60, current_cap_ma=100, settings="read-only P16/I0/D32")
+                     ramp_s=getattr(self.definition, "ramp_s", 10),
+                     endpoint_hold_s=getattr(self.definition, "endpoint_dwell_s", 2), origin_hold_s=2, final_hold_s=2,
+                     live_ceiling_s=self.definition.live_s, current_cap_ma=self.definition.current_cap_ma,
+                     settings="read-only P16/I0/D32",
+                     **({"experiment": self.definition.summary()} if isinstance(self.definition, SelectedElbowExperiment) else {}))
 
     @property
     def diagnostic_context(self):
         cycle, phase, _ = self.definition.phase(self.elapsed_s, self._acquisition_s)
         return {"profile":self.motion_profile, "progress_s":self.elapsed_s, "phase":phase, "cycle":cycle,
-                "reference":self._reference, "endpoint_target":self._reference + 10,
+                "reference":self._reference, "endpoint_target":self._reference + self._excursion,
                 "requested_target":self._action[self.selected_joint],
                 "sample_key":self.definition.sample_key(self.elapsed_s, self._acquisition_s),
-                "acquisition_s":self._acquisition_s, "admitted_reference":self._admitted_reference}
+                "acquisition_s":self._acquisition_s, "admitted_reference":self._admitted_reference,
+                **({"experiment_sha256":self.definition.sha256} if isinstance(self.definition, SelectedElbowExperiment) else {})}
 
     def _position(self):
         _, phase, fraction = self.definition.phase(self.elapsed_s, self._acquisition_s)
         if phase == "acquire":
             requested = self._admitted_reference + (self._reference - self._admitted_reference) * self.elapsed_s / 2
-            fraction = (requested - self._reference) / 10
+            fraction = (requested - self._reference) / self._excursion
         return (None if phase in {"baseline", "origin", "final"} else self.joint_keys.index(self.selected_joint),
                 phase, fraction)
 
@@ -726,12 +748,13 @@ class LeftElbowPositiveControlInput(LeftElbowResponseCharacterizeInput):
         return {"program_completed":False, "coarse_functional_pass":False,
                 "reference_normalized":self._reference, "admitted_reference":self._admitted_reference,
                 "acquisition_s":self._acquisition_s,
-                "confirmation_of":None if self._positive_comparator is None else self._positive_comparator["run_id"]}
+                "confirmation_of":None if self._positive_comparator is None else self._positive_comparator["run_id"],
+                **({"experiment":self.definition.summary()} if isinstance(self.definition, SelectedElbowExperiment) else {})}
 
     def _feedback(self, now, observed, feedback):
         current = feedback.get("current") if isinstance(feedback, dict) else None
-        if not isinstance(current, dict) or not self._number(current.get("ma")) or abs(current["ma"]) >= 100:
-            raise ValueError("positive control sampled current reached 100 mA or is unavailable")
+        if not isinstance(current, dict) or not self._number(current.get("ma")) or abs(current["ma"]) >= self.definition.current_cap_ma:
+            raise ValueError(f"positive control sampled current reached {self.definition.current_cap_ma:g} mA or is unavailable")
         proof = feedback.get("visible_control")
         if not self.definition.settings_valid(proof, feedback.get("run_id"), feedback.get("host_incarnation")):
             raise ValueError("positive control actual unchanged I0 settings proof unavailable")
@@ -744,11 +767,16 @@ class LeftElbowPositiveControlInput(LeftElbowResponseCharacterizeInput):
         calibration = self._motor["calibration"]
         registers = proof["active"]["registers"]
         if (not 0 <= registers["Min_Position_Limit"] < registers["Max_Position_Limit"] <= 4095
-                or self.definition.encoded_goal(self._reference-10,calibration) < registers["Min_Position_Limit"]
-                or self.definition.encoded_goal(self._reference+10,calibration) > registers["Max_Position_Limit"]
+                or self.definition.encoded_goal(self._reference-abs(self._excursion),calibration) < registers["Min_Position_Limit"]
+                or self.definition.encoded_goal(self._reference+abs(self._excursion),calibration) > registers["Max_Position_Limit"]
                 or registers["Homing_Offset"] != calibration["homing_offset"]
                 or self._positive_comparator is not None and calibration != self._positive_comparator["calibration"]):
             raise ValueError("positive control settings/calibration or comparison differs")
+        encoded_delta = (self.definition.encoded_goal(self._reference+self._excursion,calibration)
+                         - self.definition.encoded_goal(self._reference,calibration))
+        self._raw_direction = 1 if encoded_delta > 0 else -1
+        if isinstance(self.definition, SelectedElbowExperiment) and not self.definition.criteria_valid(abs(encoded_delta)):
+            raise ValueError("selected experiment raw criteria differ from its actual encoded excursion")
         self._visible_settings = copy.deepcopy(proof)
         if self._measured_origin_raw is None:
             if self.elapsed_s != 0 or context["progress_s"] != 0:
@@ -791,18 +819,20 @@ class LeftElbowPositiveControlInput(LeftElbowResponseCharacterizeInput):
                 raise ValueError("positive actual endpoint packet/window differs")
             self._endpoint_window=self._window(suffix,now)
             self._endpoint_anchor_proof=copy.deepcopy(self._endpoint_proofs[-1])
-            self._endpoint_peak_proof=copy.deepcopy(max(self._endpoint_proofs,key=lambda proof:proof["position"]["raw"]))
+            self._endpoint_peak_proof=copy.deepcopy(max(self._endpoint_proofs,key=lambda proof:self._raw_direction*proof["position"]["raw"]))
             self._first_return_proof=self._measurement_proof(feedback,now)
         band = max(2, self._noise or 0)
         old = self._tracking.get(phase)
         if old is not None:
-            if phase == "outbound" and row["raw"] < old["extreme"] - band:
+            if phase == "outbound" and self._raw_direction*(row["raw"]-old["extreme"]) < -band:
                 raise ValueError("positive control moved in the wrong outward direction")
-            if phase == "return" and row["raw"] > old["extreme"] + band:
+            if phase == "return" and self._raw_direction*(row["raw"]-old["extreme"]) > band:
                 raise ValueError("positive control moved in the wrong return direction")
         error = row["raw"] - row["goal_raw"]
         track = old or {"extreme":row["raw"], "goal":row["goal_raw"], "sign":0, "crossings":0, "error":0}
-        track["extreme"] = max(track["extreme"], row["raw"]) if phase == "outbound" else min(track["extreme"], row["raw"])
+        track["extreme"] = (max(track["extreme"], row["raw"])
+                            if (phase == "outbound") == (self._raw_direction > 0)
+                            else min(track["extreme"], row["raw"]))
         sign = 0 if abs(error) <= band else (1 if error > 0 else -1)
         if track["goal"] == row["goal_raw"] and sign and track["sign"] and sign != track["sign"] and abs(error) > track["error"]:
             track["crossings"] += 1
@@ -822,8 +852,8 @@ class LeftElbowPositiveControlInput(LeftElbowResponseCharacterizeInput):
 
     def _receipt(self,key,now,*,fresh=False):
         receipt = super()._receipt(key,now,fresh=fresh)
-        if abs(receipt["decoded"]["present_current_ma"]) >= 100:
-            raise ValueError("positive control sparse sampled current reached 100 mA")
+        if abs(receipt["decoded"]["present_current_ma"]) >= self.definition.current_cap_ma:
+            raise ValueError(f"positive control sparse sampled current reached {self.definition.current_cap_ma:g} mA")
         return receipt
 
     @staticmethod
@@ -862,17 +892,19 @@ class LeftElbowPositiveControlInput(LeftElbowResponseCharacterizeInput):
         endpoint_raw = ep["decoded"]["goal_position_raw"]
         if origin["decoded"]["goal_position_raw"] != self._baseline_raw:
             raise ValueError("positive control final encoded goal differs")
-        excursion = endpoint_raw - self._baseline_raw
+        excursion = abs(endpoint_raw - self._baseline_raw)
         if excursion <= 0:
-            raise ValueError("positive control encoded positive excursion unavailable")
+            raise ValueError("positive control encoded excursion unavailable")
         anchor = self._endpoint_anchor_proof["position"]["raw"]
-        outward = max(0, self._endpoint_peak_proof["position"]["raw"] - self._outward_anchor_raw)
-        reverse = max(0, anchor - min(r["raw"] for r in samples))
+        outward = max(0, self._raw_direction*(self._endpoint_peak_proof["position"]["raw"] - self._outward_anchor_raw))
+        reverse = max(0, max(self._raw_direction*(anchor-r["raw"]) for r in samples))
         residual = max(abs(r["raw"]-self._measured_origin_raw) for r in samples)
         residual = max(residual, abs(origin["decoded"]["present_position_raw"]-self._measured_origin_raw))
         goal_residual=max(max(abs(r["raw"]-self._baseline_raw) for r in samples),abs(origin["decoded"]["present_position_raw"]-self._baseline_raw))
         discriminating = self.definition.noise_discriminating(excursion,self._noise)
-        coarse = discriminating and outward >= math.ceil(excursion/2) and reverse >= math.ceil(excursion/2) and residual <= math.floor(excursion/5)
+        minimum = getattr(self.definition, "minimum_response_raw", math.ceil(excursion/2))
+        tolerance = getattr(self.definition, "return_tolerance_raw", math.floor(excursion/5))
+        coarse = discriminating and outward >= minimum and reverse >= minimum and residual <= tolerance
         self._positive_outcome = {"program_completed":True, "coarse_functional_pass":coarse,
             "fine_return_pass":residual <= 2, "noise_discriminating":discriminating,
             "reference_normalized":self._reference, "admitted_reference":self._admitted_reference,
@@ -896,7 +928,8 @@ class LeftElbowPositiveControlInput(LeftElbowResponseCharacterizeInput):
             "other_joint_admission_differences":{} if self._positive_comparator is None else {
                 k:self._admission_reference[k]-v for k,v in self._positive_comparator["original_seed"].items() if k != self.selected_joint},
             "visible_control":copy.deepcopy(self._visible_settings), "phase_coverage":copy.deepcopy(self._coverage),
-            "phase_receipts":copy.deepcopy(self._sparse), "final_window":self._window(samples,now)}
+            "phase_receipts":copy.deepcopy(self._sparse), "final_window":self._window(samples,now),
+            **({"experiment":self.definition.summary()} if isinstance(self.definition, SelectedElbowExperiment) else {})}
 
     def advance(self, now, observed, observation_sequence, *, defer_events=False, selected_feedback=None):
         if self._last_tick is None or self.complete:

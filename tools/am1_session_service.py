@@ -479,6 +479,17 @@ class Gateway:
         op = command.get("op")
         if op not in OPS or "device_id" in command:
             raise ValueError("operation")
+        selected_recipe = "physical-left-elbow-experiment"
+        if "selected_experiment" in command or command.get("recipe") == selected_recipe:
+            from examples.alohamini.am1_session_contract import SelectedElbowExperiment
+
+            if op != "start" or command.get("recipe") != selected_recipe:
+                raise ValueError("selected experiment requires its explicit Start recipe")
+            try:
+                encode(command, CONTROL_LIMIT)
+                SelectedElbowExperiment.from_payload(command.get("selected_experiment"))
+            except (AttributeError, TypeError, ValueError) as error:
+                raise ValueError("invalid selected experiment Start descriptor") from error
         if "confirmation_of" in command:
             value = command["confirmation_of"]
             try:

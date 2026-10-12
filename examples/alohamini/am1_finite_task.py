@@ -3,7 +3,13 @@
 from functools import partial
 
 from .am1_scripted_prepare import SHOULDER, PreparedScriptedInput
-from .am1_session_contract import ELBOW_RECOVERY_DEFINITIONS, LEFT_ELBOW_ORIGINAL_RETURN, LEFT_ELBOW_POSITIVE_CONTROL, LEFT_ELBOW_RESPONSE
+from .am1_session_contract import (
+    ELBOW_RECOVERY_DEFINITIONS,
+    LEFT_ELBOW_ORIGINAL_RETURN,
+    LEFT_ELBOW_POSITIVE_CONTROL,
+    LEFT_ELBOW_RESPONSE,
+    SelectedElbowExperiment,
+)
 from .scripted_leader import (
     ArmHoldBodyInput,
     LeftElbowCompareInput,
@@ -37,7 +43,14 @@ class FiniteTask:
         reference_sha256=None,
         recovery_comparator=None,
         positive_comparator=None,
+        selected_experiment=None,
     ):
+        if recipe.name == SelectedElbowExperiment.recipe_name:
+            if not isinstance(selected_experiment, SelectedElbowExperiment):
+                raise ValueError("selected experiment recipe requires its validated definition")
+        elif selected_experiment is not None:
+            raise ValueError("selected experiment definition forbidden for ordinary recipes")
+        self.selected_experiment = selected_experiment
         self.feedback_provenance = feedback_provenance
         self.initial_measured_reference = dict(positions)
         self.recovery_definition = ELBOW_RECOVERY_DEFINITIONS.get(recipe.name)
@@ -51,6 +64,7 @@ class FiniteTask:
             "physical-left-elbow-compare": ("LeftElbowCompare", LeftElbowCompareInput),
             "physical-left-elbow-dwell-compare": ("LeftElbowDwellCompare", LeftElbowDwellCompareInput),
             LEFT_ELBOW_POSITIVE_CONTROL.recipe_name: (LEFT_ELBOW_POSITIVE_CONTROL.profile, LeftElbowPositiveControlInput),
+            SelectedElbowExperiment.recipe_name: (SelectedElbowExperiment.profile, LeftElbowPositiveControlInput),
             LEFT_ELBOW_RESPONSE.recipe_name: (
                 LEFT_ELBOW_RESPONSE.profile,
                 LeftElbowResponseCharacterizeInput,
@@ -65,7 +79,8 @@ class FiniteTask:
             },
         }[recipe.name]
         self.profile = profile[0]
-        self.positive_definition = LEFT_ELBOW_POSITIVE_CONTROL if self.profile == LEFT_ELBOW_POSITIVE_CONTROL.profile else None
+        self.positive_definition = (selected_experiment if selected_experiment is not None
+                                    else LEFT_ELBOW_POSITIVE_CONTROL if self.profile == LEFT_ELBOW_POSITIVE_CONTROL.profile else None)
         if positive_comparator is not None and self.positive_definition is None:
             raise ValueError("positive comparator forbidden for ordinary recipes")
         if self.recovery_definition is not None:
@@ -83,6 +98,8 @@ class FiniteTask:
         self.joint_amplitudes = dict.fromkeys(JOINT_KEYS, 3.0)
         if self.profile in {LEFT_ELBOW_RESPONSE.profile, LEFT_ELBOW_POSITIVE_CONTROL.profile}:
             self.joint_amplitudes[LEFT_ELBOW_RESPONSE.joint] = 10.0
+        if selected_experiment is not None:
+            self.joint_amplitudes[selected_experiment.joint] = abs(selected_experiment.excursion_norm)
         prepare_body = (
             recipe.name == "physical-arm-hold-body" and not -100.0 <= positions.get(SHOULDER, 0.0) <= 100.0
         )
@@ -100,7 +117,8 @@ class FiniteTask:
             self.original_seed = dict(positions)
         else:
             if self.positive_definition is not None:
-                provider = partial(profile[1], positive_comparator=positive_comparator)
+                provider = partial(profile[1], positive_comparator=positive_comparator,
+                                   **({"definition":selected_experiment} if selected_experiment is not None else {}))
             elif self.recovery_definition is not None:
                 provider = partial(
                     profile[1],
@@ -124,9 +142,10 @@ class FiniteTask:
                 provider=provider,
                 motion_profile=self.profile,
                 emit=self.record,
+                **({"duration_s":selected_experiment.nominal_trajectory_s} if selected_experiment is not None else {}),
             )
         if self.positive_definition is not None and positive_comparator is not None:
-            self.provider.duration_s = 30.0
+            self.provider.duration_s = self.positive_definition.nominal_trajectory_s + 2.0
         # Real observation can take time to qualify. Keep this admission/reference and its
         # original 20-second wall ceiling, but begin boundary acquisition only when dispatched.
         if not start_held:
@@ -151,7 +170,7 @@ class FiniteTask:
         if (
             not self.finished
             and (self.recovery_definition is not None or self.positive_definition is not None)
-            and now - self.admitted_at >= 60
+            and now - self.admitted_at >= (self.positive_definition.live_s if self.positive_definition is not None else 60)
         ):
             raise ValueError("60-second recovery Live deadline expired")
         if not self.finished and getattr(self.provider, "preparing", False) and now - self.admitted_at >= 20:
@@ -183,6 +202,7 @@ class FiniteTask:
                 LEFT_ELBOW_RESPONSE.profile,
                 LEFT_ELBOW_ORIGINAL_RETURN.profile,
                 LEFT_ELBOW_POSITIVE_CONTROL.profile,
+                SelectedElbowExperiment.profile,
             }
         ) and not self.provider.preparing
         if (
@@ -207,6 +227,7 @@ class FiniteTask:
                 LEFT_ELBOW_RESPONSE.profile,
                 LEFT_ELBOW_ORIGINAL_RETURN.profile,
                 LEFT_ELBOW_POSITIVE_CONTROL.profile,
+                SelectedElbowExperiment.profile,
             }
             else {}
         )
@@ -218,6 +239,7 @@ class FiniteTask:
                 LEFT_ELBOW_RESPONSE.profile,
                 LEFT_ELBOW_ORIGINAL_RETURN.profile,
                 LEFT_ELBOW_POSITIVE_CONTROL.profile,
+                SelectedElbowExperiment.profile,
             }
         ):
             self.provider.validate_final_feedback(now, sample["positions"], sample.get("selected_joint"))
@@ -294,6 +316,8 @@ class FiniteTask:
             result["retained_return"] = self.provider.retained_return
         if self.positive_definition is not None:
             result["positive_control"] = self.provider.positive_control
+        if self.selected_experiment is not None:
+            result["experiment"] = self.selected_experiment.summary()
         if self.recovery_definition is not None:
             result["recovery"] = self.provider.recovery
         return result

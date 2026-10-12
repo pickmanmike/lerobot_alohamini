@@ -3,7 +3,7 @@
 class AM1SessionTransport {
   static outcomeText(run) {
     const outcome=run?.execution?.positive_control;
-    if(run?.source!=="protected-physical-provider" || run.recipe!=="physical-left-elbow-positive-control" || run.status!=="completed" ||
+    if(run?.source!=="protected-physical-provider" || !["physical-left-elbow-positive-control","physical-left-elbow-experiment"].includes(run.recipe) || run.status!=="completed" ||
       outcome?.program_completed!==true || typeof outcome.coarse_functional_pass!=="boolean" || typeof outcome.fine_return_pass!=="boolean" ||
       !Number.isInteger(outcome.final_return_residual_raw) || outcome.final_return_residual_raw<0)return null;
     return `Diagnostic completed · coarse movement ${outcome.coarse_functional_pass ? "passed" : "not achieved"} · fine return ${outcome.fine_return_pass ? "passed" : "not achieved"} · final error ${outcome.final_return_residual_raw} raw ticks`;
@@ -107,12 +107,25 @@ class AM1SessionTransport {
     const generation=this.controllerGeneration;
     if(generation) return this.claim(generation);
   }
-  async start(recipe,confirmationOf=null) {
+  async start(recipe,confirmationOf=null,selectedExperiment=null) {
     const payload={operation_id:crypto.randomUUID(),recipe,controller_generation:this.controllerGeneration};
+    if(recipe==="physical-left-elbow-experiment" || selectedExperiment!==null) {
+      const keys=["schema_version","envelope_sha256","excursion_norm","ramp_s","endpoint_dwell_s","current_cap_ma","live_ceiling_s","minimum_response_raw","return_tolerance_raw","goal_readback_checkpoints_s"];
+      const value=selectedExperiment,points=value?.goal_readback_checkpoints_s;
+      if(recipe!=="physical-left-elbow-experiment" || !value || typeof value!=="object" || Array.isArray(value)
+        || Object.keys(value).length!==keys.length || keys.some(key=>!Object.hasOwn(value,key))
+        || value.schema_version!==1 || typeof value.envelope_sha256!=="string" || !/^[0-9a-f]{64}$/.test(value.envelope_sha256)
+        || ["excursion_norm","ramp_s","endpoint_dwell_s","current_cap_ma","live_ceiling_s"].some(key=>typeof value[key]!=="number" || !Number.isFinite(value[key]))
+        || ["minimum_response_raw","return_tolerance_raw"].some(key=>!Number.isInteger(value[key]) || value[key]<0 || value[key]>4095)
+        || !Array.isArray(points) || points.length>2 || points.some((point,index)=>typeof point!=="number" || !Number.isFinite(point) || point<=0 || index>0 && point<=points[index-1]))throw Error("Exact selected experiment descriptor required");
+      const frozen=JSON.parse(JSON.stringify(value));
+      Object.freeze(frozen.goal_readback_checkpoints_s);payload.selected_experiment=Object.freeze(frozen);
+    }
     if(confirmationOf!==null) {
       if(recipe!=="physical-left-elbow-positive-control" || typeof confirmationOf!=="string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(confirmationOf))throw Error("Canonical positive-control confirmation UUID required");
       payload.confirmation_of=confirmationOf;
     }
+    Object.freeze(payload);
     // Outcome-loss retry uses the same immutable operation identity, never a new Start.
     let result;
     try {result=await this.post("start",payload);} catch(error) {if(error.reportingError)throw error;result=await this.post("start",payload);}

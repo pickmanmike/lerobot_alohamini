@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import argparse
+import copy
 import json
 import logging
 import math
@@ -388,6 +389,15 @@ def write_am1_cleanup_receipt(args, robot, first_error: BaseException | None, cl
         "completed_at_monotonic_s": time.monotonic(),
         "provenance": "protected-host/actual-motor-readback",
     }
+    fault = getattr(robot, "_am1_selected_joint_fault", None)
+    if isinstance(fault, dict):
+        result["selected_joint_fault"] = copy.deepcopy(fault)
+    experiment = getattr(robot, "_am1_selected_joint_experiment", None)
+    if isinstance(experiment, dict):
+        result["selected_joint_experiment"] = copy.deepcopy(experiment)
+    capture_error = getattr(robot, "_am1_selected_joint_fault_capture_error", None)
+    if capture_error is not None:
+        result["selected_joint_fault_capture_error"] = capture_error
     path = getattr(args, "_am1_physical_cleanup_receipt", args.am1_cleanup_receipt)
     _atomic_private_json(Path(path), result)
     if not verified and hasattr(args, "am1_physical_state_directory"):
@@ -929,6 +939,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--am1-run-id")
     parser.add_argument("--am1-host-incarnation")
     parser.add_argument("--am1-cleanup-receipt")
+    parser.add_argument("--am1-selected-experiment-file")
     parser.add_argument("--am1-admission-fd", type=int)
     parser.add_argument("--am1-host-runtime-s", type=int, default=480)
     parser.add_argument("--am1-physical-state-directory", default=str(Path.home() / ".local/state/am1-session"))
@@ -981,13 +992,16 @@ def _validate_host_arguments(args):
 
 
 def visible_control_binding(args):
-    """Only the explicit protected Visible04 recipe enables read-only I0 control."""
+    """Bind the explicit read-only I0 recipe and its immutable selected condition."""
     recipe = os.environ.get("AM1_VISIBLE_CONTROL_RECIPE")
+    experiment_file = getattr(args, "am1_selected_experiment_file", None)
     if recipe is None:
+        if experiment_file is not None:
+            raise ValueError("Selected experiment file requires its explicit protected recipe")
         return None
-    from examples.alohamini.am1_session_contract import LEFT_ELBOW_POSITIVE_CONTROL, uuid_text
+    from examples.alohamini.am1_session_contract import LEFT_ELBOW_POSITIVE_CONTROL, SelectedElbowExperiment, uuid_text
 
-    if (recipe != LEFT_ELBOW_POSITIVE_CONTROL.recipe_name
+    if (recipe not in {LEFT_ELBOW_POSITIVE_CONTROL.recipe_name, SelectedElbowExperiment.recipe_name}
         or os.environ.get("AM1_SCRIPTED_PREPARE") != "1"
         or os.environ.get("AM1_SELECTED_JOINT_EVIDENCE") != "1"
         or os.environ.get("AM1_ELBOW_RECOVERY") is not None
@@ -998,7 +1012,32 @@ def visible_control_binding(args):
         or uuid_text(args.am1_run_id) != args.am1_run_id
         or uuid_text(args.am1_host_incarnation) != args.am1_host_incarnation):
         raise ValueError("Visible control requires its exact protected recipe and read-only I0 owner")
-    return {"run_id":args.am1_run_id,"host_incarnation":args.am1_host_incarnation,"recipe":recipe}
+    binding = {"run_id":args.am1_run_id,"host_incarnation":args.am1_host_incarnation,"recipe":recipe}
+    if recipe == LEFT_ELBOW_POSITIVE_CONTROL.recipe_name:
+        if experiment_file is not None:
+            raise ValueError("Historical positive control cannot inherit a selected experiment")
+        return binding
+    path = Path(experiment_file) if experiment_file is not None else None
+    directory = Path(args.am1_protected_run_directory)
+    if (path is None or not path.is_absolute() or path.name != "selected-experiment.json"
+            or path.parent.resolve() != directory.resolve() or path.is_symlink()):
+        raise ValueError("Selected experiment requires its exact private run-owned file")
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        metadata = os.fstat(descriptor)
+        if (not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o600
+                or not hasattr(os, "geteuid") or metadata.st_uid != os.geteuid()
+                or not 0 < metadata.st_size <= 4096):
+            raise ValueError("Selected experiment file must be a bounded current-owner-only regular file")
+        data = os.read(descriptor, 4097)
+    finally:
+        os.close(descriptor)
+    definition = SelectedElbowExperiment.from_payload(json.loads(data))
+    canonical = json.dumps(definition.payload, sort_keys=True, allow_nan=False, separators=(",", ":")).encode()
+    if data != canonical:
+        raise ValueError("Selected experiment file must contain its exact canonical finite JSON")
+    args._am1_selected_elbow_experiment = definition
+    return dict(binding, experiment_sha256=definition.sha256)
 
 
 def elbow_recovery_binding(args):
@@ -1054,6 +1093,10 @@ def _run_host(args):
     if visible_binding is not None:
         robot._am1_visible_control_binding = visible_binding
         robot._am1_visible_control_evidence = selected_evidence
+        experiment = getattr(args, "_am1_selected_elbow_experiment", None)
+        if experiment is not None:
+            robot._am1_selected_elbow_experiment = experiment
+            robot._am1_selected_joint_experiment = experiment.summary()
 
     if args.lift_relief:
         from .lift_relief import run_lift_relief
@@ -1066,6 +1109,7 @@ def _run_host(args):
 
     primary_error: BaseException | None = None
     interrupted_motor_io = False
+    keyboard_interrupted = False
     try:
         logging.info("Connecting AlohaMini")
         connect_robot(robot, skip_lift_home=args.skip_lift_home)
@@ -1091,6 +1135,13 @@ def _run_host(args):
                 "robot disconnect also failed: "
                 f"{type(cleanup_error).__name__}: {cleanup_error}"
             )
+        try:
+            selected_evidence.emit_pending_fault(robot)
+        except BaseException as reporting_error:
+            args._am1_cleanup_errors.append(
+                f"pending selected joint fault: {type(reporting_error).__name__}: {reporting_error}"
+            )
+            error.add_note(f"pending selected joint fault also failed: {type(reporting_error).__name__}: {reporting_error}")
         raise
 
     command_state = HostCommandState(
@@ -1350,13 +1401,14 @@ def _run_host(args):
 
     except KeyboardInterrupt:
         interrupted_motor_io = True
-        try:
-            print("Keyboard interrupt received. Exiting...")
-        except BaseException as error:
-            primary_error = error
+        keyboard_interrupted = True
     except BaseException as error:
         interrupted_motor_io = True
         primary_error = error
+        try:
+            selected_evidence.enrich_fault(robot, local_control)
+        except BaseException as context_error:
+            robot._am1_selected_joint_fault_capture_error = type(context_error).__name__
         if loop_timing is not None:
             # Capture BEFORE cleanup, attach AFTER it. Cleanup time must not be
             # misreported as poll/log/observation delay, or diagnostic I/O delay zero/off.
@@ -1371,14 +1423,6 @@ def _run_host(args):
     finally:
         args._am1_finishing = True
         cleanup_errors: list[tuple[str, BaseException]] = []
-        # Local mode writes directly to its log file. A failed/full sink must
-        # remain an error, but reporting it must never bypass motor cleanup.
-        try:
-            print("Shutting down AlohaMini Host.")
-            if args.profile_cadence:
-                print_cadence_report(command_state)
-        except BaseException as error:
-            cleanup_errors.append(("shutdown reporting", error))
         try:
             if robot.is_connected:
                 robot.disconnect(recover_interrupted_bus_io=interrupted_motor_io)
@@ -1388,6 +1432,22 @@ def _run_host(args):
             host.disconnect()
         except BaseException as error:
             cleanup_errors.append(("host disconnect", error))
+
+        # Every exit message is after zero/off and socket cleanup. A blocked
+        # or failed sink must never delay the protective motor requests.
+        try:
+            if keyboard_interrupted:
+                print("Keyboard interrupt received. Exiting...")
+            print("Shutting down AlohaMini Host.")
+            if args.profile_cadence:
+                print_cadence_report(command_state)
+        except BaseException as error:
+            cleanup_errors.append(("shutdown reporting", error))
+
+        try:
+            selected_evidence.emit_pending_fault(robot)
+        except BaseException as error:
+            cleanup_errors.append(("pending selected joint fault", error))
 
         # A consumer failure or Ctrl+C can bypass the normal end-of-tick emit.
         # Preserve that genuine sample, but only after motor/socket cleanup:

@@ -11,6 +11,7 @@ from examples.alohamini.am1_session_contract import (
     LEFT_ELBOW_ORIGINAL_RETURN,
     LEFT_ELBOW_POSITIVE_CONTROL,
     LEFT_ELBOW_RESPONSE,
+    SelectedElbowExperiment,
 )
 
 FEEDBACK_MAX_AGE_S = 1.0  # Existing AM1 Local original request/acquisition contract.
@@ -160,6 +161,7 @@ class PhysicalExecutor:
             "physical-left-elbow-dwell-compare",
             LEFT_ELBOW_RESPONSE.recipe_name,
             LEFT_ELBOW_POSITIVE_CONTROL.recipe_name,
+            SelectedElbowExperiment.recipe_name,
             LEFT_ELBOW_ORIGINAL_RETURN.recipe_name,
             *ELBOW_RECOVERY_DEFINITIONS,
         }
@@ -220,6 +222,7 @@ class PhysicalExecutor:
         self._finite_completion = None
         self._completion_returns = []
         self.positive_prerequisite = None
+        self.selected_experiment = None
         self._lifecycle = {
             "run_id": None,
             "phase": "idle",
@@ -254,8 +257,26 @@ class PhysicalExecutor:
                 raise RuntimeError("Positive prerequisite cannot change during an active owner")
             self.positive_prerequisite = copy.deepcopy(proof)
 
+    def set_selected_experiment(self, definition):
+        """Freeze only an authority-validated descriptor before native admission."""
+        with self.mutex:
+            if self.worker and self.worker.is_alive():
+                raise RuntimeError("Selected experiment cannot change during an active owner")
+            if definition is not None and not isinstance(definition, SelectedElbowExperiment):
+                raise ValueError("Validated selected experiment definition required")
+            self.selected_experiment = (
+                SelectedElbowExperiment.from_payload(definition.payload) if definition is not None else None
+            )
+
+    def _live_ceiling(self):
+        return (
+            self.selected_experiment.live_s
+            if self.recipe.name == SelectedElbowExperiment.recipe_name and self.selected_experiment is not None
+            else self.recipe.live_s
+        )
+
     def _reference_for_recipe(self):
-        if self.recipe and self.recipe.name == LEFT_ELBOW_POSITIVE_CONTROL.recipe_name:
+        if self.recipe and self.recipe.name in {LEFT_ELBOW_POSITIVE_CONTROL.recipe_name, SelectedElbowExperiment.recipe_name}:
             return None
         return (
             self.recovery_reference
@@ -368,6 +389,8 @@ class PhysicalExecutor:
 
     def bind_run(self, run_id, recipe):
         with self.mutex:
+            if recipe.name == SelectedElbowExperiment.recipe_name and self.selected_experiment is None:
+                raise RuntimeError("Selected experiment definition required before binding")
             if (
                 not self.supports(recipe)
                 or (self.worker and self.worker.is_alive())
@@ -402,7 +425,7 @@ class PhysicalExecutor:
                 "uncertain": False,
                 "terminal_status": None,
             }
-            self.observation.begin(run_id, recipe.live_s)
+            self.observation.begin(run_id, self._live_ceiling())
 
     def begin(self, recipe):
         with self.mutex:
@@ -590,7 +613,11 @@ class PhysicalExecutor:
                     raise RuntimeError("physical startup deadline expired")
 
             io.observation = self.observation
-            io.start(self.run_id, self.host_incarnation, self.recipe, cancel)
+            io.start(
+                self.run_id, self.host_incarnation, self.recipe, cancel,
+                **({"selected_experiment": self.selected_experiment.payload}
+                   if self.recipe.name == SelectedElbowExperiment.recipe_name else {}),
+            )
             while True:
                 with self.mutex:
                     if self.finish_status:
@@ -599,7 +626,7 @@ class PhysicalExecutor:
                         cancel()
                     if (
                         self._lifecycle["native_live_at"] is not None
-                        and self.clock() >= self._lifecycle["native_live_at"] + self.recipe.live_s
+                        and self.clock() >= self._lifecycle["native_live_at"] + self._live_ceiling()
                     ):
                         self.finish_status = "stopped"
                         break
@@ -687,6 +714,8 @@ class PhysicalExecutor:
                                 self.config["shoulder_amplitude"],
                                 start_held=True,
                                 feedback_provenance="protected-host/measured-feedback",
+                                **({"selected_experiment": self.selected_experiment}
+                                   if self.recipe.name == SelectedElbowExperiment.recipe_name else {}),
                                 **({"positive_comparator": copy.deepcopy(self.positive_prerequisite)}
                                    if self.recipe.name == LEFT_ELBOW_POSITIVE_CONTROL.recipe_name else {}),
                                 **(
@@ -736,7 +765,7 @@ class PhysicalExecutor:
                                             ]
                                         limit = (
                                             (10.0 if key == LEFT_ELBOW_POSITIVE_CONTROL.joint else 1.0)
-                                            if self.recipe.name == LEFT_ELBOW_POSITIVE_CONTROL.recipe_name else
+                                            if self.recipe.name in {LEFT_ELBOW_POSITIVE_CONTROL.recipe_name, SelectedElbowExperiment.recipe_name} else
                                             1.0
                                             if self.task.profile
                                             in {
@@ -977,7 +1006,14 @@ class ProtectedHostRun:
             if hashlib.sha256(Path(path).read_bytes()).hexdigest() != digest:
                 raise RuntimeError("preserved calibration content changed")
 
-    def start(self, run_id, incarnation, recipe, cancel):
+    def start(self, run_id, incarnation, recipe, cancel, *, selected_experiment=None):
+        definition = None
+        if recipe.name == SelectedElbowExperiment.recipe_name:
+            if selected_experiment is None:
+                raise ValueError("Selected experiment descriptor required before native IO")
+            definition = SelectedElbowExperiment.from_payload(selected_experiment)
+        elif selected_experiment is not None:
+            raise ValueError("Selected experiment descriptor forbidden for ordinary recipes")
         if recipe.name == LEFT_ELBOW_ORIGINAL_RETURN.recipe_name:
             load_elbow_return_reference(self.config)  # Preserve the old strict pre-IO interface.
         elif recipe.name in ELBOW_RECOVERY_DEFINITIONS:
@@ -1002,6 +1038,14 @@ class ProtectedHostRun:
         self.run_directory = root / run_id[:8]
         self.run_directory.mkdir(mode=0o700)
         self.receipt = self.run_directory / "cleanup.json"
+        experiment_file = None
+        if definition is not None:
+            import json
+
+            experiment_file = self.run_directory / "selected-experiment.json"
+            descriptor = os.open(experiment_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                json.dump(definition.payload, stream, sort_keys=True, separators=(",", ":"), allow_nan=False)
         env = dict(os.environ)
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         env["AM1_CAMERA_PYTHON"] = self.config["camera_python"]
@@ -1060,7 +1104,7 @@ class ProtectedHostRun:
                 env.pop(k, None)
             env["AM1_SCRIPTED_PREPARE"] = "1"
             env["AM1_SELECTED_JOINT_EVIDENCE"] = "1"
-        if recipe.name == LEFT_ELBOW_POSITIVE_CONTROL.recipe_name:
+        if recipe.name in {LEFT_ELBOW_POSITIVE_CONTROL.recipe_name, SelectedElbowExperiment.recipe_name}:
             env["AM1_VISIBLE_CONTROL_RECIPE"] = recipe.name
         if recipe.name in ELBOW_RECOVERY_DEFINITIONS:
             env["AM1_ELBOW_RECOVERY"] = f"I{ELBOW_RECOVERY_DEFINITIONS[recipe.name].integral}"
@@ -1092,6 +1136,8 @@ class ProtectedHostRun:
             "--am1-physical-state-directory",
             str(state),
         ]
+        if experiment_file is not None:
+            host_command.extend(["--am1-selected-experiment-file", str(experiment_file)])
         host_environment = {
             k: env[k]
             for k in (

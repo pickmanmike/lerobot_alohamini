@@ -14,6 +14,7 @@ if __package__:
         LEFT_ELBOW_ORIGINAL_RETURN,
         LEFT_ELBOW_POSITIVE_CONTROL,
         LEFT_ELBOW_RESPONSE,
+        SelectedElbowExperiment,
     )
 else:
     from am1_session_contract import (
@@ -21,11 +22,12 @@ else:
         LEFT_ELBOW_ORIGINAL_RETURN,
         LEFT_ELBOW_POSITIVE_CONTROL,
         LEFT_ELBOW_RESPONSE,
+        SelectedElbowExperiment,
     )
 
 SHOULDER = "arm_left_shoulder_lift.pos"
 RECOVERY_PROFILES = frozenset(d.profile for d in ELBOW_RECOVERY_DEFINITIONS.values())
-MEASURED_SEED_PROFILES = RECOVERY_PROFILES | {LEFT_ELBOW_ORIGINAL_RETURN.profile, LEFT_ELBOW_POSITIVE_CONTROL.profile}
+MEASURED_SEED_PROFILES = RECOVERY_PROFILES | {LEFT_ELBOW_ORIGINAL_RETURN.profile, LEFT_ELBOW_POSITIVE_CONTROL.profile, SelectedElbowExperiment.profile}
 
 
 class PreparedScriptedInput:
@@ -45,6 +47,7 @@ class PreparedScriptedInput:
         provider: Callable[..., Any],
         motion_profile: str | None = None,
         emit: Callable[[dict[str, Any]], None] | None = None,
+        duration_s: float | None = None,
     ) -> None:
         if fps != 10 or len(joint_keys) != 12 or set(initial_positions) != set(joint_keys):
             raise ValueError("preparation requires the exact AM1 12-joint seed at 10 Hz")
@@ -58,6 +61,7 @@ class PreparedScriptedInput:
             LEFT_ELBOW_RESPONSE.profile,
             LEFT_ELBOW_ORIGINAL_RETURN.profile,
             LEFT_ELBOW_POSITIVE_CONTROL.profile,
+            SelectedElbowExperiment.profile,
             *RECOVERY_PROFILES,
         }:
             raise ValueError("preparation requires an explicitly supported finite profile")
@@ -79,8 +83,13 @@ class PreparedScriptedInput:
             LEFT_ELBOW_RESPONSE.profile: LEFT_ELBOW_RESPONSE.trajectory_s,
             LEFT_ELBOW_ORIGINAL_RETURN.profile: LEFT_ELBOW_ORIGINAL_RETURN.trajectory_s,
             LEFT_ELBOW_POSITIVE_CONTROL.profile: LEFT_ELBOW_POSITIVE_CONTROL.nominal_trajectory_s,
+            SelectedElbowExperiment.profile: duration_s,
             **{d.profile: d.trajectory_s for d in ELBOW_RECOVERY_DEFINITIONS.values()},
         }[self.motion_profile]
+        if self.motion_profile == SelectedElbowExperiment.profile and (
+            type(duration_s) not in (int, float) or not math.isfinite(duration_s) or not 0 < duration_s <= 30
+        ):
+            raise ValueError("selected experiment preparation requires its validated finite duration")
         self.preparation_elapsed_s = 0.0
         self._program = None
         self._action = dict(self.origin)
@@ -255,6 +264,7 @@ class PreparedScriptedInput:
         if not self.preparing:
             kwargs = {"selected_feedback": selected_feedback} if self.motion_profile in {
                 LEFT_ELBOW_RESPONSE.profile, LEFT_ELBOW_ORIGINAL_RETURN.profile, LEFT_ELBOW_POSITIVE_CONTROL.profile,
+                SelectedElbowExperiment.profile,
                 *RECOVERY_PROFILES,
             } else {}
             self._program.advance(now, observed, observation_sequence, defer_events=True, **kwargs)

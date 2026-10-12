@@ -60,6 +60,11 @@ class AM1SelectedJointEvidence:
         self.visible_phase = self.visible_peak = self.visible_goal = None
         self.visible_current_rows = deque(maxlen=20)
         self.visible_position_rows = deque(maxlen=20)
+        self.last_live_goal = None
+        self._fault_emitted = False
+        self._pending_sparse = None
+        self.goal_checkpoint_attempted = set()
+        self.goal_readbacks = {}
 
     VISIBLE_STATIC_REGISTERS = (
         "Firmware_Major_Version",
@@ -96,9 +101,14 @@ class AM1SelectedJointEvidence:
         actual = getattr(robot, "_am1_visible_control_binding", None)
         if actual is None:
             return None
-        from examples.alohamini.am1_session_contract import LEFT_ELBOW_POSITIVE_CONTROL, uuid_text
+        from examples.alohamini.am1_session_contract import LEFT_ELBOW_POSITIVE_CONTROL, SelectedElbowExperiment, uuid_text
 
         expected = actual if binding is None else binding
+        experiment = getattr(robot, "_am1_selected_elbow_experiment", None)
+        definition = LEFT_ELBOW_POSITIVE_CONTROL if experiment is None else experiment
+        keys = {"run_id", "host_incarnation", "recipe"}
+        if experiment is not None:
+            keys.add("experiment_sha256")
         motor = robot.left_bus.motors.get(MOTOR)
         if (
             not self.enabled
@@ -106,9 +116,11 @@ class AM1SelectedJointEvidence:
             or getattr(robot, "_am1_visible_control_evidence", None) is not self
             or getattr(robot.config, "robot_model", None) != "alohamini1"
             or not isinstance(actual, dict)
-            or set(actual) != {"run_id", "host_incarnation", "recipe"}
+            or set(actual) != keys
             or actual != expected
-            or actual["recipe"] != LEFT_ELBOW_POSITIVE_CONTROL.recipe_name
+            or (experiment is not None and not isinstance(experiment, SelectedElbowExperiment))
+            or actual["recipe"] != definition.recipe_name
+            or (experiment is not None and actual["experiment_sha256"] != experiment.sha256)
             or uuid_text(actual["run_id"]) != actual["run_id"]
             or uuid_text(actual["host_incarnation"]) != actual["host_incarnation"]
             or motor is None
@@ -117,15 +129,37 @@ class AM1SelectedJointEvidence:
             or motor.norm_mode is not MotorNormMode.RANGE_M100_100
         ):
             raise RuntimeError("Visible control differs from its exact opted-in protected owner")
-        return LEFT_ELBOW_POSITIVE_CONTROL
+        return definition
 
-    def _visible_settings_read(self, robot):
+    def _visible_settings_read(self, robot, *, source):
         bus = robot.left_bus
         transport = DirectSdkTransport(
             bus.port, motor_id=3, port_handler=bus.port_handler, packet_handler=bus.packet_handler
         )
         started = self.clock()
         payload, first_trace = transport.read_group(0, 71, timeout_ms=40.0)
+        first_completed = self.clock()
+        current = int(bus._decode_sign("Present_Current", {3: int.from_bytes(payload[69:71], "little")})[3])
+        present = int(bus._decode_sign("Present_Position", {3: int.from_bytes(payload[56:58], "little")})[3])
+        sample = {
+            "raw": current, "ma": current * 6.5,
+            "read_started_at_monotonic_s": started, "read_completed_at_monotonic_s": first_completed,
+        }
+        position = {
+            "raw": present, "normalized": float(robot_position(bus, present)),
+            "read_started_at_monotonic_s": started, "read_completed_at_monotonic_s": first_completed,
+        }
+        if source == "settings_active":
+            self.last_live_goal = {
+                "source": source,
+                "goal_position_raw": int(bus._decode_sign("Goal_Position", {3: int.from_bytes(payload[42:44], "little")})[3]),
+                "read_started_at_monotonic_s": started, "read_completed_at_monotonic_s": first_completed,
+                "torque_enable": payload[40], "operating_mode": payload[33], "status": payload[65],
+            }
+        self.check_visible_current(
+            robot, current, getattr(robot, "_joint_current_limit_ma", 100),
+            source=source, sample=sample, position=position,
+        )
         maximum, second_trace = transport.read_group(85, 1, timeout_ms=40.0)
         ended = self.clock()
         registers = {}
@@ -151,7 +185,7 @@ class AM1SelectedJointEvidence:
             raise RuntimeError("Visible read-only baseline requires its explicit owner")
         if self.visible_settings is not None:
             raise RuntimeError("Visible selected baseline cannot be replaced")
-        before, traces = self._visible_settings_read(robot)
+        before, traces = self._visible_settings_read(robot, source="settings_before")
         self.visible_settings = {
             "version": 1,
             "binding": copy.deepcopy(binding),
@@ -189,13 +223,12 @@ class AM1SelectedJointEvidence:
             or not 0 <= registers["Min_Position_Limit"] < registers["Max_Position_Limit"] <= 4095
         ):
             raise RuntimeError("Visible selected actual baseline identity/settings differ")
-        self.check_visible_current(robot, registers["Present_Current"], definition.current_cap_ma)
 
     def verify_visible_active(self, robot):
         definition = self._visible_definition(robot)
         if definition is None or self.visible_settings is None:
             raise RuntimeError("Visible active settings require their original baseline")
-        active, traces = self._visible_settings_read(robot)
+        active, traces = self._visible_settings_read(robot, source="settings_active")
         self.visible_settings["active"] = active
         before = self.visible_settings["before"]
         original = {
@@ -220,7 +253,6 @@ class AM1SelectedJointEvidence:
                 "unchanged": self.visible_settings["unchanged"],
             }
         )
-        self.check_visible_current(robot, active["registers"]["Present_Current"], definition.current_cap_ma)
         if not definition.settings_valid(self.visible_settings):
             raise RuntimeError("Visible selected active settings changed or were unqualified")
 
@@ -232,13 +264,73 @@ class AM1SelectedJointEvidence:
             raise RuntimeError("Visible actual settings proof exceeds its bounded feedback frame")
         return proof
 
-    def check_visible_current(self, robot, raw, ordinary_limit):
+    def capture_fault(self, robot, reason, *, source, current=None, position=None, ordinary_limit=None):
+        """Retain the first rejected context without reads, emits or serialization."""
+        if getattr(robot, "_am1_selected_joint_fault", None) is not None:
+            return
+        try:
+            definition = self._visible_definition(robot)
+            robot._am1_selected_joint_fault = {
+                "version": 1,
+                "kind": "fault_context",
+                **copy.deepcopy(getattr(robot, "_am1_visible_control_binding", None) or {}),
+                "motor": {"bus": "left", "name": MOTOR, "id": 3, "model": "sts3215"},
+                "reason": reason,
+                "source": source,
+                "captured_at_monotonic_s": self.clock(),
+                "current_scale_ma_per_raw": 6.5,
+                "current": copy.deepcopy(current),
+                "diagnostic_current_cap_ma": None if definition is None else definition.current_cap_ma,
+                "ordinary_limit_ma": ordinary_limit,
+                "effective_limit_ma": (
+                    min(definition.current_cap_ma, ordinary_limit)
+                    if definition is not None and ordinary_limit is not None else None
+                ),
+                "comparison": "abs(current_ma) >= effective_limit_ma" if ordinary_limit is not None else None,
+                "context": copy.deepcopy(self.context),
+                "action": copy.deepcopy(getattr(robot, "_am1_selected_joint_action", None)),
+                "position": copy.deepcopy(
+                    position if position is not None else getattr(robot, "_am1_selected_joint_position", None)
+                ),
+                "last_completed_live_goal": copy.deepcopy(self.last_live_goal),
+            }
+        except BaseException as error:
+            # A diagnostic failure cannot replace or delay the protective refusal.
+            robot._am1_selected_joint_fault_capture_error = type(error).__name__
+
+    def enrich_fault(self, robot, control):
+        fault = getattr(robot, "_am1_selected_joint_fault", None)
+        if isinstance(fault, dict) and control is not None and "control" not in fault:
+            fault["control"] = {
+                **copy.deepcopy(control.binding or {}),
+                "state": control.state,
+                "epoch": control.epoch,
+                "intent_revision": control.intent_revision,
+                "accepted_action_sequence": control.accepted_action_sequence,
+                "last_completed_observation_id": control.observation_id,
+            }
+
+    def emit_pending_fault(self, robot):
+        fault = getattr(robot, "_am1_selected_joint_fault", None)
+        if isinstance(fault, dict) and not self._fault_emitted:
+            self._fault_emitted = True
+            self.emit(copy.deepcopy(fault))
+        if self._pending_sparse is not None:
+            row, self._pending_sparse = self._pending_sparse, None
+            self.emit(row)
+
+    def check_visible_current(self, robot, raw, ordinary_limit, *, source="cached_current", sample=None, position=None):
         definition = self._visible_definition(robot)
         if definition is None:
             return
         if type(raw) is not int or not _number(ordinary_limit) or ordinary_limit <= 0:
             raise RuntimeError("Visible actual selected current is unavailable")
         if abs(raw * 6.5) >= min(definition.current_cap_ma, ordinary_limit):
+            self.capture_fault(
+                robot, "Visible selected software effort ceiling reached", source=source,
+                current=sample if sample is not None else getattr(robot, "_am1_selected_joint_current", None),
+                position=position, ordinary_limit=ordinary_limit,
+            )
             raise RuntimeError("Visible selected software effort ceiling reached")
 
     def deactivate(self, robot):
@@ -271,10 +363,14 @@ class AM1SelectedJointEvidence:
             raise RuntimeError("Invalid selected joint evidence context keys")
         profile, phase, cycle = metadata.get("profile"), metadata.get("phase"), metadata.get("cycle")
         visible = self._visible_definition(robot)
+        if visible is not None and profile != visible.profile:
+            raise RuntimeError("Selected profile differs from its frozen protected experiment")
         visible_context = visible is not None and profile == visible.profile
         expected_keys = (
             CONTEXT_KEYS | {"acquisition_s", "admitted_reference"} if visible_context else CONTEXT_KEYS
         )
+        if visible_context and getattr(robot, "_am1_selected_elbow_experiment", None) is not None:
+            expected_keys |= {"experiment_sha256"}
         if set(metadata) != expected_keys:
             raise RuntimeError("Invalid selected joint evidence context keys")
         if (
@@ -304,6 +400,8 @@ class AM1SelectedJointEvidence:
                     *ELBOW_RECOVERY_DEFINITIONS.values(),
                 )
             }
+            if visible is not None:
+                definitions[visible.profile] = visible
             signed = definitions.get(profile)
             if signed is None or not signed.context_valid(metadata):
                 raise RuntimeError("Invalid selected joint signed profile context")
@@ -499,10 +597,13 @@ class AM1SelectedJointEvidence:
         """Enforce the new finite probe on cached native reads, never another bus reader."""
         definition = self._visible_definition(robot)
         binding = getattr(robot, "_am1_visible_control_binding", None)
+        expected_binding = {**(control.binding or {}), "recipe": definition.recipe_name} if definition is not None else None
+        if expected_binding is not None and getattr(robot, "_am1_selected_elbow_experiment", None) is not None:
+            expected_binding["experiment_sha256"] = definition.sha256
         if (
             definition is None
             or control.binding is None
-            or binding != {**control.binding, "recipe": definition.recipe_name}
+            or binding != expected_binding
             or not definition.settings_valid(self.visible_settings)
         ):
             raise RuntimeError("Visible actual read-only settings/owner binding is unavailable")
@@ -529,7 +630,10 @@ class AM1SelectedJointEvidence:
                 raise RuntimeError("Visible native original position/current acquisition is unavailable")
         if not _number(current.get("ma")) or current.get("ma") != current.get("raw", float("nan")) * 6.5:
             raise RuntimeError("Visible actual selected current is unavailable")
-        self.check_visible_current(robot, current.get("raw"), getattr(robot, "_joint_current_limit_ma", 100))
+        self.check_visible_current(
+            robot, current.get("raw"), getattr(robot, "_joint_current_limit_ma", 100),
+            source="cached_guard", sample=current,
+        )
         raw, calibration = position.get("raw"), robot.left_bus.calibration[MOTOR]
         registers = self.visible_settings["before"]["registers"]
         low = max(calibration.range_min, registers["Min_Position_Limit"])
@@ -551,7 +655,8 @@ class AM1SelectedJointEvidence:
         material = {
             k: int(getattr(calibration, k)) for k in ("drive_mode", "homing_offset", "range_min", "range_max")
         }
-        endpoints = [definition.encoded_goal(reference + delta, material) for delta in (-10, 10)]
+        magnitude = abs(getattr(definition, "excursion_norm", 10.0))
+        endpoints = [definition.encoded_goal(reference + delta, material) for delta in (-magnitude, magnitude)]
         if any(value is None for value in endpoints) or not max(low, min(endpoints)) <= raw <= min(
             high, max(endpoints)
         ):
@@ -560,11 +665,12 @@ class AM1SelectedJointEvidence:
             return
         direction = None
         sign = -1 if robot.left_bus.apply_drive_mode and calibration.drive_mode else 1
+        outward_direction = sign * (1 if getattr(definition, "excursion_norm", 10.0) > 0 else -1)
         phase = context["phase"]
         if phase in {"outbound", "endpoint"}:
-            direction = sign
+            direction = outward_direction
         elif phase in {"return", "origin", "final"}:
-            direction = -sign
+            direction = -outward_direction
         elif phase == "acquire" and context["reference"] != context["admitted_reference"]:
             direction = sign * (1 if context["reference"] > context["admitted_reference"] else -1)
         if direction is not None:
@@ -776,11 +882,17 @@ class AM1SelectedJointEvidence:
             "position": copy.deepcopy(getattr(robot, "_am1_selected_joint_position", None)),
             "current": copy.deepcopy(getattr(robot, "_am1_selected_joint_current", None)),
             "sparse_receipts": copy.deepcopy(self.sparse_receipts),
+            **({"goal_readbacks": copy.deepcopy(self.goal_readbacks)}
+               if getattr(robot, "_am1_selected_elbow_experiment", None) is not None else {}),
         }
 
     def _emit_sparse(self, row):
-        self.sparse_receipts[row["sample_key"]] = copy.deepcopy(row)
+        self._retain_sparse(row)
         self.emit(row)
+
+    def _retain_sparse(self, row):
+        retained = self.goal_readbacks if "checkpoint_s" in row else self.sparse_receipts
+        retained[row["sample_key"]] = copy.deepcopy(row)
 
     def report(self, robot, control, observation):
         marker = self._matched_marker(control, observation)
@@ -794,9 +906,21 @@ class AM1SelectedJointEvidence:
             self.last_observation_id = observation_id
             self.emit({**row, "kind": "native_trace", "position": position, "current": current})
         key = self.context["sample_key"]
+        checkpoint = None
         if key is None or key in self.attempted:
-            return
-        self.attempted.add(key)  # One attempt even if the diagnostic reply is unavailable.
+            definition = getattr(robot, "_am1_selected_elbow_experiment", None)
+            if definition is None:
+                return
+            progress = self.context["progress_s"] - self.context["acquisition_s"]
+            for index, point in enumerate(definition.goal_readback_checkpoints_s):
+                if progress >= point and index not in self.goal_checkpoint_attempted:
+                    self.goal_checkpoint_attempted.add(index)
+                    key, checkpoint = f"goal_checkpoint_{index + 1}", point
+                    break
+            if checkpoint is None:
+                return
+        else:
+            self.attempted.add(key)  # One attempt even if the diagnostic reply is unavailable.
         started = self.clock()
         sparse = {
             **row,
@@ -806,6 +930,7 @@ class AM1SelectedJointEvidence:
             "diagnostic_available": False,
             "decoded": None,
             "trace": None,
+            **({"checkpoint_s": checkpoint} if checkpoint is not None else {}),
         }
         if any(
             not isinstance(v, dict)
@@ -829,14 +954,33 @@ class AM1SelectedJointEvidence:
         primary = None
         try:
             payload, trace = transport.read_group(33, 38, timeout_ms=40.0)
+            completed = self.clock()
             sparse["trace"] = trace
             decoded = self._decoded(bus, payload)
             sparse["decoded"] = decoded
+            source = "goal_checkpoint" if checkpoint is not None else "sparse_readback"
+            self.last_live_goal = {
+                "source": source, "sample_key": key,
+                "goal_position_raw": decoded["goal_position_raw"],
+                "read_started_at_monotonic_s": started, "read_completed_at_monotonic_s": completed,
+                "torque_enable": decoded["torque_enable"], "operating_mode": decoded["operating_mode"],
+                "status": decoded["status"], "context": copy.deepcopy(self.context),
+                "action": copy.deepcopy(row["action"]),
+            }
             if decoded["status"] != 0 or decoded["torque_enable"] != 1 or decoded["operating_mode"] != 0:
                 raise RuntimeError("Selected joint readback reported status/torque/mode fault")
             if self.visible_settings is not None:
                 self.check_visible_current(
-                    robot, decoded["present_current_raw"], getattr(robot, "_joint_current_limit_ma", 100)
+                    robot, decoded["present_current_raw"], getattr(robot, "_joint_current_limit_ma", 100),
+                    source=source,
+                    sample={
+                        "raw": decoded["present_current_raw"], "ma": decoded["present_current_ma"],
+                        "read_started_at_monotonic_s": started, "read_completed_at_monotonic_s": completed,
+                    },
+                    position={
+                        "raw": decoded["present_position_raw"], "normalized": decoded["present_position_normalized"],
+                        "read_started_at_monotonic_s": started, "read_completed_at_monotonic_s": completed,
+                    },
                 )
                 before = self.visible_settings["before"]["registers"]
                 fields = {
@@ -863,6 +1007,10 @@ class AM1SelectedJointEvidence:
             sparse["unavailable_reason"] = f"{type(error).__name__}: {error}"
             primary = error
         sparse["read_completed_at_monotonic_s"] = self.clock()
+        if primary is not None and getattr(robot, "_am1_visible_control_binding", None) is not None:
+            self._retain_sparse(sparse)
+            self._pending_sparse = copy.deepcopy(sparse)
+            raise primary
         try:
             self._emit_sparse(sparse)
         except BaseException as emit_error:

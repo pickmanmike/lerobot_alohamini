@@ -18,11 +18,28 @@ from examples.alohamini.am1_session_contract import (
     LEFT_ELBOW_POSITIVE_CONTROL,
     LEFT_ELBOW_RESPONSE,
     RECIPES,
+    SelectedElbowExperiment,
     uuid_text,
 )
 from tools.am1_fake_executor import FakeExecutor
 
 TERMINAL = {"stopped", "completed", "faulted", "interrupted"}
+
+
+def _selected_experiment_definition(run):
+    """Recover the exact admitted condition; a descriptor alone cannot grant authority."""
+    if (
+        not isinstance(run, dict)
+        or run.get("recipe") != SelectedElbowExperiment.recipe_name
+        or run.get("source") != "protected-physical-provider"
+        or run.get("confirmation_of") is not None
+    ):
+        return None
+    try:
+        definition = SelectedElbowExperiment.from_payload(run.get("selected_experiment"))
+        return definition if definition.sha256 == run.get("selected_experiment_sha256") else None
+    except (AttributeError, TypeError, ValueError):
+        return None
 
 
 def _reconciliation_reference(run):
@@ -210,8 +227,14 @@ def _positive_completion_reference(evidence, run):
     """One public duplicate may refer to the complete execution already in this run."""
     try:
         receipt, execution, lifecycle = run["completion_receipt"], run["execution"], evidence["lifecycle"]
+        definition = (
+            _selected_experiment_definition(run)
+            if run.get("recipe") == SelectedElbowExperiment.recipe_name
+            else LEFT_ELBOW_POSITIVE_CONTROL
+        )
         if not (
-            run.get("recipe") == LEFT_ELBOW_POSITIVE_CONTROL.recipe_name
+            definition is not None
+            and run.get("recipe") == definition.recipe_name
             and run.get("source") == evidence.get("source") == "protected-physical-provider"
             and run.get("status") in TERMINAL
             and uuid_text(run.get("run_id")) == run.get("run_id")
@@ -227,7 +250,8 @@ def _positive_completion_reference(evidence, run):
             and receipt.get("recipe") == run["recipe"]
             and _canonical(execution) == _canonical(receipt.get("execution"))
             and _canonical(evidence.get("finite_completion")) == _canonical(receipt)
-            and LEFT_ELBOW_POSITIVE_CONTROL.completion_expectation(execution) is not None
+            and (not isinstance(definition, SelectedElbowExperiment) or execution.get("experiment") == definition.summary())
+            and definition.completion_expectation(execution) is not None
         ):
             return None
         return {
@@ -472,7 +496,11 @@ class SessionAuthority:
         incarnation = lifecycle.get("backend_incarnation")
         if isinstance(incarnation, str) and incarnation:
             run["backend_incarnation"] = incarnation
-        run["deadline"] = native_live_at + RECIPES[run["recipe"]].live_s
+        definition = _selected_experiment_definition(run)
+        if run["recipe"] == SelectedElbowExperiment.recipe_name and definition is None:
+            self._finish("faulted", "selected experiment durable descriptor is unavailable")
+            return True
+        run["deadline"] = native_live_at + (definition.live_s if definition else RECIPES[run["recipe"]].live_s)
         run["preparation_ceiling"] = min(native_live_at + 20, run["deadline"])
         run["dispatch"] = "acknowledged"
         if run["status"] == "starting":
@@ -551,8 +579,19 @@ class SessionAuthority:
         current_sequence = evidence.get("feedback_sequence")
         seed, positions = execution.get("original_seed"), receipt.get("measured_positions")
         duration = RECIPES[run["recipe"]].trajectory_s
-        if run["recipe"] == LEFT_ELBOW_POSITIVE_CONTROL.recipe_name:
-            expected = LEFT_ELBOW_POSITIVE_CONTROL.completion_expectation(execution)
+        positive_definition = None
+        if run["recipe"] in {LEFT_ELBOW_POSITIVE_CONTROL.recipe_name, SelectedElbowExperiment.recipe_name}:
+            positive_definition = (
+                _selected_experiment_definition(run)
+                if run["recipe"] == SelectedElbowExperiment.recipe_name
+                else LEFT_ELBOW_POSITIVE_CONTROL
+            )
+            if positive_definition is None or (
+                isinstance(positive_definition, SelectedElbowExperiment)
+                and execution.get("experiment") != positive_definition.summary()
+            ):
+                return None
+            expected = positive_definition.completion_expectation(execution)
             if expected is None:
                 return None
             duration, cycles, returns = expected
@@ -636,7 +675,7 @@ class SessionAuthority:
             )
         ):
             return None
-        if run["recipe"] == LEFT_ELBOW_POSITIVE_CONTROL.recipe_name:
+        if positive_definition is not None:
             from examples.alohamini.am1_finite_task import JOINT_KEYS
 
             outcome = execution["positive_control"]
@@ -656,11 +695,11 @@ class SessionAuthority:
                 or any(origin_receipt[k] != ack[k] for k in ("epoch","intent_revision"))
                 or origin_receipt["action_sequence"] > ack["accepted_action_sequence"]
                 or origin_receipt["observation_id"] > sequence
-                or not LEFT_ELBOW_POSITIVE_CONTROL.settings_valid(outcome["visible_control"],run["run_id"],incarnation)
+                or not positive_definition.settings_valid(outcome["visible_control"],run["run_id"],incarnation)
                 or min(window["first_current_started_at"],window["first_position_started_at"]) < run["native_live_at"]
                 or not window["qualified_at_monotonic_s"] <= completed
                 or completed-window["last_position_started_at"] > .5
-                or any(abs(positions[k]-v) > (10 if k == LEFT_ELBOW_POSITIVE_CONTROL.joint else 1) for k,v in seed.items())
+                or any(abs(positions[k]-v) > (10 if k == positive_definition.joint else 1) for k,v in seed.items())
                 or outcome.get("confirmation_of") != run.get("confirmation_of")):
                 return None
         if run["recipe"] == LEFT_ELBOW_ORIGINAL_RETURN.recipe_name:
@@ -1662,6 +1701,15 @@ class SessionAuthority:
             allowed = {"op", "operation_id", "recipe", "controller_generation"}
             if recipe.name == LEFT_ELBOW_POSITIVE_CONTROL.recipe_name:
                 allowed.add("confirmation_of")
+            selected_definition = None
+            if recipe.name == SelectedElbowExperiment.recipe_name:
+                allowed.add("selected_experiment")
+                if self.executor.source != "protected-physical-provider":
+                    return self._refuse("selected experiment requires the protected physical source")
+                try:
+                    selected_definition = SelectedElbowExperiment.from_payload(c.get("selected_experiment"))
+                except (AttributeError, TypeError, ValueError) as error:
+                    return self._refuse(str(error))
             if set(c) - allowed:
                 return self._refuse("recipe parameters forbidden")
             confirmation_of = c.get("confirmation_of")
@@ -1672,7 +1720,8 @@ class SessionAuthority:
                 except (ValueError,TypeError,AttributeError):
                     return self._refuse("canonical positive confirmation identity required")
             canonical = json.dumps(
-                {"recipe": recipe.name, "device_id": d, **({"confirmation_of":confirmation_of} if confirmation_of else {})},
+                {"recipe": recipe.name, "device_id": d, **({"confirmation_of":confirmation_of} if confirmation_of else {}),
+                 **({"selected_experiment":selected_definition.payload} if selected_definition else {})},
                 sort_keys=True, separators=(",", ":")
             )
             digest = hashlib.sha256(canonical.encode()).hexdigest()
@@ -1716,6 +1765,14 @@ class SessionAuthority:
                 self._hold()
                 return self._refuse("fresh qualified feedback/proof and acknowledgement required")
             positive_prerequisite = None
+            selected_setter = getattr(self.executor, "set_selected_experiment", None)
+            if callable(selected_setter):
+                try:
+                    selected_setter(selected_definition)
+                except (RuntimeError, ValueError) as error:
+                    return self._refuse(str(error))
+            elif selected_definition is not None:
+                return self._refuse("selected experiment requires the protected executor")
             if recipe.name == LEFT_ELBOW_POSITIVE_CONTROL.recipe_name:
                 if confirmation_of is not None:
                     positive_prerequisite = self.positive_control_prerequisite(confirmation_of,evidence)
@@ -1777,6 +1834,9 @@ class SessionAuthority:
             if recipe.name == LEFT_ELBOW_POSITIVE_CONTROL.recipe_name:
                 self.run["confirmation_of"] = confirmation_of
                 self.run["positive_prerequisite"] = positive_prerequisite
+            if selected_definition is not None:
+                self.run["selected_experiment"] = selected_definition.payload
+                self.run["selected_experiment_sha256"] = selected_definition.sha256
             if recovery_definition is not None:
                 self.run["recovery_prerequisite"] = recovery_prerequisite
                 if continuation_note is not None:
@@ -2129,6 +2189,10 @@ class SessionAuthority:
             trajectory = None if run is None else RECIPES[run["recipe"]].trajectory_s
             if run is not None and run["recipe"] == LEFT_ELBOW_POSITIVE_CONTROL.recipe_name:
                 trajectory = 28.0 + (2.0 if run.get("confirmation_of") is not None else 0.0)
+            if run is not None and run["recipe"] == SelectedElbowExperiment.recipe_name:
+                definition = _selected_experiment_definition(run)
+                if definition is not None:
+                    trajectory = definition.nominal_trajectory_s
             if run is not None and run["recipe"] == LEFT_ELBOW_RESPONSE.recipe_name:
                 execution = run.get("execution")
                 branch = LEFT_ELBOW_RESPONSE.branch_expectation(
@@ -2180,6 +2244,8 @@ class SessionAuthority:
                             name
                             for name, recipe in RECIPES.items()
                             if self.executor.supports(recipe)
+                            and (name != SelectedElbowExperiment.recipe_name
+                                 or self.executor.source == "protected-physical-provider")
                             and (
                                 name not in ELBOW_RECOVERY_DEFINITIONS
                                 or (

@@ -1,6 +1,13 @@
 # AM1 protected physical sessions
 
-## Current continuation: AM1-VISIBLE-CONTROL-04
+**Active scope: AM1-ELBOW-TO-COMPLETION-06.** The repair loop continues until useful,
+intentional repeated elbow movement is demonstrated or a concrete required physical/
+access action is unavailable. The old 100 mA threshold is an experimental restriction
+to reassess with evidence. Packet06 replaces unsent FAULT-EVIDENCE-05; prior results
+below remain historical. Source/deployment are being verified before changed experiments.
+
+
+## Retained AM1-VISIBLE-CONTROL-04 result
 
 The reviewed `physical-left-elbow-positive-control` was physically evaluated once
 from the freshly measured pose at unchanged I0. It reached the selected 100 mA

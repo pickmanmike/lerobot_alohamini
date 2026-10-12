@@ -1,7 +1,10 @@
 """Immutable explicitly selected session recipes and JSON validation."""
 
+import hashlib
+import json
 import math
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 
@@ -282,6 +285,12 @@ class PositiveElbowControl:
 
     @staticmethod
     def settings_valid(proof, run_id=None, host_incarnation=None):
+        return PositiveElbowControl._settings_valid(proof, run_id, host_incarnation)
+
+    @staticmethod
+    def _settings_valid(proof, run_id=None, host_incarnation=None, *,
+                        recipe_name="physical-left-elbow-positive-control", current_cap_ma=100.0,
+                        experiment_sha256=None):
         import hashlib
         import json
 
@@ -296,8 +305,12 @@ class PositiveElbowControl:
                     or type(proof["version"]) is not int or proof["version"] != 1 or proof["unchanged"] is not True):
                 return False
             binding = proof["binding"]
-            if (set(binding) != {"run_id", "host_incarnation", "recipe"}
-                    or binding["recipe"] != "physical-left-elbow-positive-control"
+            binding_keys = {"run_id", "host_incarnation", "recipe"}
+            if experiment_sha256 is not None:
+                binding_keys.add("experiment_sha256")
+            if (set(binding) != binding_keys
+                    or binding["recipe"] != recipe_name
+                    or experiment_sha256 is not None and binding.get("experiment_sha256") != experiment_sha256
                     or not all(type(binding[k]) is str and binding[k] for k in binding)
                     or run_id is not None and binding["run_id"] != run_id
                     or host_incarnation is not None and binding["host_incarnation"] != host_incarnation):
@@ -312,7 +325,7 @@ class PositiveElbowControl:
                         or any(r[k] != v for k, v in {"Model_Number":777, "Firmware_Major_Version":3,
                             "Firmware_Minor_Version":10, "ID":3, "Operating_Mode":0, "P_Coefficient":16,
                             "I_Coefficient":0, "D_Coefficient":32, "Torque_Enable":torque, "Lock":torque,
-                            "Status":0}.items()) or abs(r["Present_Current"]) * 6.5 >= 100):
+                            "Status":0}.items()) or abs(r["Present_Current"]) * 6.5 >= current_cap_ma):
                     return False
                 a, b = item["read_started_at_monotonic_s"], item["read_completed_at_monotonic_s"]
                 if not all(type(v) in (int, float) and math.isfinite(v) for v in (a,b)) or not 0 <= previous <= a <= b:
@@ -351,15 +364,22 @@ class PositiveElbowControl:
         if not all(type(o.get(k)) is int for k in nums) or min(o[k] for k in nums if k != "reverse_anchor_raw") < 0:
             return None
         q0, calibration = o.get("reference_normalized"), o.get("calibration")
+        delta = getattr(self, "excursion_norm", 10.0)
+        magnitude = abs(delta)
         acquisition = o.get("acquisition_s")
         if (acquisition not in (0, 2) or type(acquisition) not in (int, float)
-                or not -100 <= seed.get(self.joint, -1000) - 10 <= seed.get(self.joint, 1000) + 10 <= 100
+                or not -100 <= seed.get(self.joint, -1000) - magnitude <= seed.get(self.joint, 1000) + magnitude <= 100
                 or seed[self.joint] != q0 or self.encoded_goal(q0, calibration) != o["reference_raw"]
-                or self.encoded_goal(q0 + 10, calibration) != o["endpoint_raw"]
-                or o["encoded_excursion_raw"] != o["endpoint_raw"] - o["reference_raw"]
+                or self.encoded_goal(q0 + delta, calibration) != o["endpoint_raw"]
+                or o["encoded_excursion_raw"] != abs(o["endpoint_raw"] - o["reference_raw"])
                 or o["encoded_excursion_raw"] <= 0 or o.get("program_completed") is not True
                 or o.get("adverse") is not False or not self.window_valid(o.get("final_window"))
                 or not self.settings_valid(o.get("visible_control"))):
+            return None
+        direction = 1 if o["endpoint_raw"] > o["reference_raw"] else -1
+        if isinstance(self, SelectedElbowExperiment) and (
+            o.get("experiment") != self.summary() or not self.criteria_valid(o["encoded_excursion_raw"])
+        ):
             return None
         measured=self.measured_origin(q0,calibration)
         binding=o["visible_control"]["binding"]
@@ -391,7 +411,7 @@ class PositiveElbowControl:
             or endpoint_window["last_position_completed_at"] != endpoint["position"]["read_completed_at_monotonic_s"]
             or peak["captured_at_monotonic_s"] > departure["captured_at_monotonic_s"]
             or endpoint["position"]["raw"] != o["reverse_anchor_raw"]
-            or o["outward_response_raw"] != max(0,peak["position"]["raw"]-o["outward_anchor_raw"])):
+            or o["outward_response_raw"] != max(0,direction*(peak["position"]["raw"]-o["outward_anchor_raw"]))):
             return None
         coverage, receipts = o.get("phase_coverage"), o.get("phase_receipts")
         if not isinstance(coverage,dict) or not isinstance(receipts,dict) or set(receipts) != {"baseline","cycle1_endpoint","cycle1_origin"}:
@@ -418,7 +438,7 @@ class PositiveElbowControl:
                 or not isinstance(action,dict) or action.get("expected_goal_raw") != goal
                 or not isinstance(decoded,dict) or type(decoded.get("goal_position_raw")) is not int
                 or type(decoded.get("present_current_ma")) not in (int,float)
-                or not math.isfinite(decoded["present_current_ma"]) or abs(decoded["present_current_ma"]) >= 100
+                or not math.isfinite(decoded["present_current_ma"]) or abs(decoded["present_current_ma"]) >= self.current_cap_ma
                 or decoded["goal_position_raw"] != goal or any(type(decoded.get(k)) is not int or decoded[k] != v for k,v in
                     {"status":0,"torque_enable":1,"operating_mode":0}.items())
                 or not all(type(r.get(k)) is int and r[k] >= 0 for k in ("epoch","intent_revision","action_sequence","observation_id"))
@@ -448,21 +468,186 @@ class PositiveElbowControl:
             return None
         excursion = o["encoded_excursion_raw"]
         discriminating = self.noise_discriminating(excursion,o["baseline_noise_raw"])
-        coarse = (discriminating and o["outward_response_raw"] >= math.ceil(excursion / 2)
-                  and o["reverse_response_raw"] >= math.ceil(excursion / 2)
-                  and o["final_return_residual_raw"] <= math.floor(excursion / 5))
+        minimum = getattr(self, "minimum_response_raw", math.ceil(excursion / 2))
+        tolerance = getattr(self, "return_tolerance_raw", math.floor(excursion / 5))
+        coarse = (discriminating and o["outward_response_raw"] >= minimum
+                  and o["reverse_response_raw"] >= minimum
+                  and o["final_return_residual_raw"] <= tolerance)
         if (o.get("noise_discriminating") is not discriminating or o.get("coarse_functional_pass") is not coarse
                 or o.get("fine_return_pass") is not (o["final_return_residual_raw"] <= 2)
                 or (acquisition == 0) != (o.get("confirmation_of") is None)
                 or acquisition == 2 and uuid_text(o.get("confirmation_of")) != o["confirmation_of"]
-                or execution.get("progress_s") != 28 + acquisition
+                or execution.get("progress_s") != self.nominal_trajectory_s + acquisition
                 or type(execution.get("cycles_completed")) is not int or execution["cycles_completed"] != 1
                 or type(execution.get("returns_qualified")) is not int or execution["returns_qualified"] != int(coarse)):
             return None
-        return 28 + acquisition, 1, int(coarse)
+        return self.nominal_trajectory_s + acquisition, 1, int(coarse)
 
 
 LEFT_ELBOW_POSITIVE_CONTROL = PositiveElbowControl()
+
+
+# This reviewed initial envelope is replaceable when new evidence supports a
+# different finite condition. It is not a packet-wide physical operating limit.
+SELECTED_ELBOW_EXPERIMENT_ENVELOPE = MappingProxyType({
+    "schema_version": 1,
+    "scope": "AM1-ELBOW-TO-COMPLETION-06/initial-negative-comparator",
+    "maximum_excursion_norm": 10.0,
+    "maximum_slope_norm_per_s": 1.0,
+    "maximum_endpoint_dwell_s": 2.0,
+    "maximum_trajectory_s": 30.0,
+    "maximum_live_s": 60.0,
+    "maximum_current_ma": 100.0,
+    "minimum_response_fraction": 0.5,
+    "maximum_return_fraction": 0.2,
+    "maximum_goal_readbacks": 2,
+})
+SELECTED_ELBOW_EXPERIMENT_ENVELOPE_SHA256 = hashlib.sha256(json.dumps(
+    dict(SELECTED_ELBOW_EXPERIMENT_ENVELOPE), sort_keys=True, allow_nan=False,
+    separators=(",", ":"),
+).encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class SelectedElbowExperiment:
+    """One validated, pinned finite condition on the existing selected provider."""
+
+    schema_version: int
+    envelope_sha256: str
+    excursion_norm: float
+    ramp_s: float
+    endpoint_dwell_s: float
+    current_cap_ma: float
+    live_ceiling_s: float
+    minimum_response_raw: int
+    return_tolerance_raw: int
+    goal_readback_checkpoints_s: tuple[float, ...]
+
+    recipe_name = "physical-left-elbow-experiment"
+    profile = "LeftElbowExperiment"
+    joint = "arm_left_elbow_flex.pos"
+    trajectory_s = 30.0
+    encoded_goal = staticmethod(SignedElbowResponse.encoded_goal)
+    noise_discriminating = staticmethod(PositiveElbowControl.noise_discriminating)
+    measured_origin = staticmethod(PositiveElbowControl.measured_origin)
+    window_valid = staticmethod(PositiveElbowControl.window_valid)
+    measurement_proof_valid = PositiveElbowControl.measurement_proof_valid
+    completion_expectation = PositiveElbowControl.completion_expectation
+    _completion_expectation = PositiveElbowControl._completion_expectation
+
+    def __post_init__(self):
+        e = SELECTED_ELBOW_EXPERIMENT_ENVELOPE
+        if (type(self.schema_version) is not int or self.schema_version != 1
+                or self.envelope_sha256 != SELECTED_ELBOW_EXPERIMENT_ENVELOPE_SHA256):
+            raise ValueError("selected experiment requires its exact schema and approved envelope pin")
+        values = (self.excursion_norm, self.ramp_s, self.endpoint_dwell_s,
+                  self.current_cap_ma, self.live_ceiling_s)
+        if not all(type(v) in (int, float) and math.isfinite(v) for v in values):
+            raise ValueError("selected experiment requires finite numeric conditions")
+        if (not 0 < abs(self.excursion_norm) <= e["maximum_excursion_norm"]
+                or self.ramp_s <= 0 or abs(self.excursion_norm) / self.ramp_s > e["maximum_slope_norm_per_s"]
+                or not 0.3 <= self.endpoint_dwell_s <= e["maximum_endpoint_dwell_s"]
+                or not 0 < self.current_cap_ma <= e["maximum_current_ma"]
+                or self.nominal_trajectory_s > e["maximum_trajectory_s"]
+                or not self.nominal_trajectory_s < self.live_ceiling_s <= e["maximum_live_s"]):
+            raise ValueError("selected experiment exceeds its approved finite effort/trajectory envelope")
+        if (type(self.minimum_response_raw) is not int or not 1 <= self.minimum_response_raw <= 4095
+                or type(self.return_tolerance_raw) is not int or not 0 <= self.return_tolerance_raw <= 4095):
+            raise ValueError("selected experiment requires bounded integer raw criteria")
+        points = self.goal_readback_checkpoints_s
+        if (type(points) is not tuple or len(points) > e["maximum_goal_readbacks"]
+                or not all(type(v) in (int, float) and math.isfinite(v)
+                           and 0 < v < self.nominal_trajectory_s for v in points)
+                or any(b <= a for a, b in zip(points, points[1:]))):
+            raise ValueError("selected experiment live goal checkpoints must be bounded and strictly ordered")
+        object.__setattr__(self, "_sha256", hashlib.sha256(json.dumps(
+            self.payload, sort_keys=True, allow_nan=False, separators=(",", ":"),
+        ).encode()).hexdigest())
+
+    @classmethod
+    def from_payload(cls, value):
+        keys = {"schema_version", "envelope_sha256", "excursion_norm", "ramp_s", "endpoint_dwell_s",
+                "current_cap_ma", "live_ceiling_s", "minimum_response_raw", "return_tolerance_raw",
+                "goal_readback_checkpoints_s"}
+        if not isinstance(value, Mapping) or set(value) != keys:
+            raise ValueError("exact selected experiment payload required")
+        points = value["goal_readback_checkpoints_s"]
+        if type(points) is not list:
+            raise ValueError("selected experiment checkpoint JSON list required")
+        return cls(**dict(value, goal_readback_checkpoints_s=tuple(points)))
+
+    @property
+    def payload(self):
+        return {k: list(v) if k == "goal_readback_checkpoints_s" else v
+                for k, v in self.__dict__.items() if not k.startswith("_")}
+
+    @property
+    def sha256(self):
+        return self._sha256
+
+    @property
+    def nominal_trajectory_s(self):
+        return 6.0 + 2 * self.ramp_s + self.endpoint_dwell_s
+
+    @property
+    def live_s(self):
+        return self.live_ceiling_s
+
+    def summary(self):
+        return dict(self.payload, sha256=self.sha256, nominal_trajectory_s=self.nominal_trajectory_s,
+                    trajectory_s=self.trajectory_s)
+
+    def criteria_valid(self, excursion_raw):
+        return (type(excursion_raw) is int and excursion_raw > 0
+                and math.ceil(excursion_raw / 2) <= self.minimum_response_raw <= excursion_raw
+                and self.return_tolerance_raw <= math.floor(excursion_raw / 5))
+
+    def phase(self, progress, acquisition_s=0):
+        t = progress - acquisition_s
+        if t < 0:
+            return 0, "acquire", 0.0
+        if t < 2:
+            return 0, "baseline", 0.0
+        if t < 2 + self.ramp_s:
+            return 1, "outbound", (t - 2) / self.ramp_s
+        if t < 2 + self.ramp_s + self.endpoint_dwell_s:
+            return 1, "endpoint", 1.0
+        end = 2 + 2 * self.ramp_s + self.endpoint_dwell_s
+        if t < end:
+            return 1, "return", 1 - (t - 2 - self.ramp_s - self.endpoint_dwell_s) / self.ramp_s
+        return 1, "origin" if t < end + 2 else "final", 0.0
+
+    def sample_key(self, progress, acquisition_s=0):
+        _, phase, _ = self.phase(progress, acquisition_s)
+        return ("baseline" if phase == "baseline" else "cycle1_endpoint" if phase == "endpoint"
+                else "cycle1_origin" if progress >= acquisition_s + self.nominal_trajectory_s - .2 - 1e-9 else None)
+
+    def context_valid(self, c):
+        keys = {"profile", "progress_s", "phase", "cycle", "reference", "endpoint_target", "requested_target",
+                "sample_key", "acquisition_s", "admitted_reference", "experiment_sha256"}
+        if (not isinstance(c, dict) or set(c) != keys or c["profile"] != self.profile
+                or c["experiment_sha256"] != self.sha256):
+            return False
+        if not all(type(c[k]) in (int, float) and math.isfinite(c[k]) for k in
+                   ("progress_s", "reference", "endpoint_target", "requested_target", "acquisition_s", "admitted_reference")):
+            return False
+        t, q0, acquired, admitted = c["progress_s"], c["reference"], c["acquisition_s"], c["admitted_reference"]
+        magnitude = abs(self.excursion_norm)
+        if (acquired not in (0, 2) or not 0 <= t <= self.nominal_trajectory_s + acquired
+                or not -100 <= q0 - magnitude <= q0 + magnitude <= 100
+                or abs(admitted - q0) > 2 or acquired == 0 and admitted != q0):
+            return False
+        cycle, phase, fraction = self.phase(t, acquired)
+        target = admitted + (q0 - admitted) * t / 2 if phase == "acquire" else q0 + self.excursion_norm * fraction
+        return (type(c["cycle"]) is int and c["cycle"] == cycle and c["phase"] == phase
+                and c["sample_key"] == self.sample_key(t, acquired)
+                and math.isclose(c["endpoint_target"], q0 + self.excursion_norm, abs_tol=1e-9, rel_tol=0)
+                and math.isclose(c["requested_target"], target, abs_tol=1e-9, rel_tol=0))
+
+    def settings_valid(self, proof, run_id=None, host_incarnation=None):
+        return PositiveElbowControl._settings_valid(
+            proof, run_id, host_incarnation, recipe_name=self.recipe_name,
+            current_cap_ma=self.current_cap_ma, experiment_sha256=self.sha256)
 
 
 @dataclass(frozen=True)
@@ -951,6 +1136,9 @@ RECIPES = MappingProxyType(
         ),
         LEFT_ELBOW_POSITIVE_CONTROL.recipe_name: Recipe(
             LEFT_ELBOW_POSITIVE_CONTROL.recipe_name, "finite", 30.0, 60.0, seed=None,
+        ),
+        SelectedElbowExperiment.recipe_name: Recipe(
+            SelectedElbowExperiment.recipe_name, "finite", 30.0, 60.0, seed=None,
         ),
         LEFT_ELBOW_RESPONSE.recipe_name: Recipe(
             LEFT_ELBOW_RESPONSE.recipe_name, "finite", LEFT_ELBOW_RESPONSE.trajectory_s,
