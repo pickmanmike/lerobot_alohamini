@@ -15,6 +15,7 @@ import threading
 import uuid
 from pathlib import Path
 
+from tools.am1_local_observation import LocalObservationMailbox
 from tools.am1_session_core import SessionAuthority
 
 CONTROL_LIMIT = 4096
@@ -297,21 +298,29 @@ class OwnerServer:
             if protective and command.get("op") not in PROTECTIVE:
                 raise ValueError("protective lane")
             async with asyncio.timeout(IO_TIMEOUT):
-                async with self.slots[protective]:
-                    # Never call tick before a protective operation; core owns ordering.
-                    if command.get("op") == "observation_sync":
-                        if (
-                            protective
-                            or envelope["device"] != "observation-worker"
-                            or set(command) != {"op", "evidence"}
-                        ):
-                            raise ValueError("private observation envelope")
-                        result = await asyncio.to_thread(self.observation_sync, command["evidence"])
-                    elif command == {"op": "snapshot"}:
-                        snapshot = await asyncio.to_thread(self.authority.snapshot)
-                        result = {"accepted": True, "status": "snapshot", "snapshot": snapshot}
+                if command.get("op") == "observation_sync":
+                    if (
+                        protective
+                        or envelope["device"] != "observation-worker"
+                        or set(command) != {"op", "evidence"}
+                    ):
+                        raise ValueError("private observation envelope")
+                    observation = getattr(self.authority.executor, "observation", None)
+                    if type(observation) is LocalObservationMailbox:
+                        # This short, IO-free mailbox operation cannot queue behind ordinary
+                        # control slots or their thread pool. Connection/body caps still apply.
+                        result = observation.sync(command["evidence"])
                     else:
-                        result = await asyncio.to_thread(self.authority.handle, command, envelope["device"])
+                        async with self.slots[protective]:
+                            result = await asyncio.to_thread(self.observation_sync, command["evidence"])
+                else:
+                    async with self.slots[protective]:
+                        # Never call tick before a protective operation; core owns ordering.
+                        if command == {"op": "snapshot"}:
+                            snapshot = await asyncio.to_thread(self.authority.snapshot)
+                            result = {"accepted": True, "status": "snapshot", "snapshot": snapshot}
+                        else:
+                            result = await asyncio.to_thread(self.authority.handle, command, envelope["device"])
             try:
                 await write_frame(writer, {"id": envelope["id"], "result": result}, RESPONSE_LIMIT)
             except ResponseLimitError as exc:
@@ -330,6 +339,11 @@ class OwnerServer:
                 await asyncio.wait_for(writer.wait_closed(), IO_TIMEOUT)
 
     def observation_sync(self, evidence):
+        observation = getattr(self.authority.executor, "observation", None)
+        if type(observation) is LocalObservationMailbox:
+            # Local frames must not wait behind control evidence, native sends or disk IO.
+            # The mailbox fences its own run/generation/lifecycle in a short, IO-free lock.
+            return observation.sync(evidence)
         with self.authority.mutex:
             observation = getattr(self.authority.executor, "observation", None)
             if observation is None:

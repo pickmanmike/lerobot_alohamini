@@ -10,6 +10,7 @@ import math
 import re
 import socket
 import subprocess
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -62,42 +63,54 @@ class LocalObservationMailbox:
         if type(require_owned_session) is not bool:
             raise ValueError("camera owned-session policy must be an explicit Boolean")
         self.require_owned_session = require_owned_session
-        self.request = self.record = None
+        self._mutex = threading.RLock()
+        self._request = self.record = None
         self.reason = "no current decoded local image"
         self.current_source_generation = None
         self.retired_generations = set()
         self.last_sequence = 0
 
+    @property
+    def request(self):
+        with self._mutex:
+            return None if self._request is None else dict(self._request)
+
     def begin(self, run_id, live_s):
-        uuid.UUID(run_id)
-        self.request = dict(
-            self.source,
-            run_id=run_id,
-            generation=str(uuid.uuid4()),
-            active=True,
-            started_at=self.clock(),
-            timing_basis=TIMING_BASIS,
-            require_owned_session=self.require_owned_session,
-        )
-        self.record = None
-        self.last_sequence = 0
-        self.current_source_generation = None
-        self.reason = "no current decoded local image"
+        with self._mutex:
+            uuid.UUID(run_id)
+            self._request = dict(
+                self.source,
+                run_id=run_id,
+                generation=str(uuid.uuid4()),
+                active=True,
+                started_at=self.clock(),
+                timing_basis=TIMING_BASIS,
+                require_owned_session=self.require_owned_session,
+            )
+            self.record = None
+            self.last_sequence = 0
+            self.current_source_generation = None
+            self.reason = "no current decoded local image"
 
     def stop(self):
-        if self.request:
-            self.request = dict(self.request, active=False)
-        self.record = None
+        with self._mutex:
+            if self._request:
+                self._request = dict(self._request, active=False)
+            self.record = None
 
     def publish(self, record):
+        with self._mutex:
+            self._publish(record)
+
+    def _publish(self, record):
         # A delayed optional/P1/previous-run delivery has no authority over this run.
-        if not self.request or not self.request["active"] or not isinstance(record, dict):
+        if not self._request or not self._request["active"] or not isinstance(record, dict):
             return
-        if any(record.get(k) != self.request[k] for k in LOCAL_BINDING_KEYS):
+        if any(record.get(k) != self._request[k] for k in LOCAL_BINDING_KEYS):
             return
         self.record = None
         self.reason = str(record.get("reason", "invalid or unqualified local evidence"))[:160]
-        if self.request["require_owned_session"] and record.get("owned_session") != self.request["run_id"]:
+        if self._request["require_owned_session"] and record.get("owned_session") != self._request["run_id"]:
             self.reason = "required camera owned session differs from current run"
             return
         try:
@@ -114,7 +127,7 @@ class LocalObservationMailbox:
             return
         if not all(finite_time(record.get(k)) for k in ("arrived_at", "decoded_at")):
             return
-        if not self.request["started_at"] <= record["arrived_at"] <= record["decoded_at"] <= self.clock():
+        if not self._request["started_at"] <= record["arrived_at"] <= record["decoded_at"] <= self.clock():
             return
         if self.clock() - record["arrived_at"] > 0.5:
             self.reason = "original local arrival expired at owner consumption"
@@ -142,8 +155,23 @@ class LocalObservationMailbox:
         self.reason = None
 
     def evidence(self):
+        with self._mutex:
+            return self._evidence(self.clock())
+
+    def sync(self, record):
+        """Consume a delivery and snapshot its request without the control-owner lock."""
+        with self._mutex:
+            if record is not None:
+                self._publish(record)
+            consumed_at = self.clock()
+            return {
+                "request": None if self._request is None else dict(self._request),
+                "consumption": dict(self._evidence(consumed_at), consumed_at=consumed_at),
+            }
+
+    def _evidence(self, now):
         record = self.record
-        age = self.clock() - record["arrived_at"] if record else None
+        age = now - record["arrived_at"] if record else None
         qualified = record is not None and 0 <= age <= 0.5
         return {
             "qualified": qualified,
@@ -152,7 +180,7 @@ class LocalObservationMailbox:
             if record is None
             else (None if qualified else "original local arrival expired at owner consumption"),
             "sequence": record["sequence"] if record else None,
-            "generation": self.request["generation"] if self.request else None,
+            "generation": self._request["generation"] if self._request else None,
             "owner_generation": record["owner_generation"] if record else None,
             "capture_generation": record["capture_generation"] if record else None,
             "owned_session": record.get("owned_session") if record else None,
@@ -402,6 +430,7 @@ class LocalObservationWorker:
                             while not response.content.at_eof() and len(jpeg) <= MAX_JPEG:
                                 jpeg += await response.content.read(MAX_JPEG + 1 - len(jpeg))
                             await asyncio.to_thread(self.receiver.accept, jpeg, response.headers)
+                            await self.sync(self.receiver.evidence())
                     await asyncio.sleep(0.075)
                 except (ClientError, ValueError, KeyError, OSError, TimeoutError) as exc:
                     if self.receiver:
