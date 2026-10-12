@@ -101,7 +101,11 @@ class AM1SelectedJointEvidence:
         actual = getattr(robot, "_am1_visible_control_binding", None)
         if actual is None:
             return None
-        from examples.alohamini.am1_session_contract import LEFT_ELBOW_POSITIVE_CONTROL, SelectedElbowExperiment, uuid_text
+        from examples.alohamini.am1_session_contract import (
+            LEFT_ELBOW_POSITIVE_CONTROL,
+            SelectedElbowExperiment,
+            uuid_text,
+        )
 
         expected = actual if binding is None else binding
         experiment = getattr(robot, "_am1_selected_elbow_experiment", None)

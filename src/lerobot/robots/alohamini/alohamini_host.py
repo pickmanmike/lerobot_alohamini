@@ -999,7 +999,11 @@ def visible_control_binding(args):
         if experiment_file is not None:
             raise ValueError("Selected experiment file requires its explicit protected recipe")
         return None
-    from examples.alohamini.am1_session_contract import LEFT_ELBOW_POSITIVE_CONTROL, SelectedElbowExperiment, uuid_text
+    from examples.alohamini.am1_session_contract import (
+        LEFT_ELBOW_POSITIVE_CONTROL,
+        SelectedElbowExperiment,
+        uuid_text,
+    )
 
     if (recipe not in {LEFT_ELBOW_POSITIVE_CONTROL.recipe_name, SelectedElbowExperiment.recipe_name}
         or os.environ.get("AM1_SCRIPTED_PREPARE") != "1"

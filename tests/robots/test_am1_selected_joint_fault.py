@@ -7,8 +7,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from lerobot.robots.alohamini import alohamini as robot_module
-from lerobot.robots.alohamini import alohamini_host as host
+from lerobot.robots.alohamini import alohamini as robot_module, alohamini_host as host
+from tests.robots.test_alohamini_lift_motor_feedback import status
 from tests.robots.test_am1_selected_joint_evidence import (
     attach_port,
     binding,
@@ -16,11 +16,10 @@ from tests.robots.test_am1_selected_joint_evidence import (
     context,
     group_payload,
     observe,
+    visible_guard,
     visible_register_packet,
     visible_robot,
-    visible_guard,
 )
-from tests.robots.test_alohamini_lift_motor_feedback import status
 
 
 @pytest.mark.parametrize("raw,ordinary_limit,threshold", [(16, 2000.0, 100.0), (-16, 2000.0, 100.0), (14, 80.0, 80.0)])
@@ -281,7 +280,7 @@ def test_new_negative_experiment_guard_accepts_declared_direction_and_rejects_re
     obj, evidence, control, definition = experiment_robot(monkeypatch)
     for sequence, (progress, raw) in enumerate(((2.0, 2000), (3.0, 1990), (4.0, 1980)), 1):
         control.apply(obj, command(control.binding, experiment_context(definition, progress), sequence=sequence))
-        observation = observe(obj, control)
+        observe(obj, control)
         obj._am1_selected_joint_position["raw"] = raw
         evidence.guard_visible(obj, control)
     obj._am1_selected_joint_position["raw"] = 1984
