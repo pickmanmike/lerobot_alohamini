@@ -4,11 +4,20 @@
 intentional repeated elbow movement is demonstrated or a concrete required physical/
 access action is unavailable. The old 100 mA threshold is an experimental restriction
 to reassess with evidence. Packet06 replaces unsent FAULT-EVIDENCE-05; prior results
-below remain historical. Source/deployment are being verified before changed experiments.
+below remain historical. Exact deployed and prepared versions are recorded below.
 
 
-**Current continuation: [AM1 protected physical sessions](protected-physical-sessions.md),
-AM1-VISIBLE-CONTROL-04.** One unchanged-I0 positive comparison started normally,
+**Current continuation: [AM1-ELBOW-TO-COMPLETION-06](protected-physical-sessions.md#am1-elbow-to-completion-06-results-and-status).**
+The loop captured exact117/104 mA fault acquisitions, negative movement and partial
+positive return, and repaired camera delivery plus measured-startup response-guard
+integration. Final reviewed/native checks pass; useful repeated out-and-back
+control remains unresolved. Pi SSH/gateway became unreachable from both Duffy and
+P1 before staging the next correction. The linked record separates deployed and
+prepared pins, retains all earlier failures and describes the pending150 mA finite
+condition. P1 remains advisory; strict freshness and software durability remain
+in scope. No network or architecture change is proposed for this access failure.
+
+**Retained AM1-VISIBLE-CONTROL-04:** One unchanged-I0 positive comparison started normally,
 then faulted at5.9 seconds at the selected100 mA sampled-current guard. All182
 published positions stayedraw2458 despite encoded writes reaching2498; relevant
 current P1 images show no resolvable elbow excursion. No endpoint/return/fine

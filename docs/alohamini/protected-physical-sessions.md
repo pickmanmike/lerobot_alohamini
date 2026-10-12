@@ -4,8 +4,131 @@
 intentional repeated elbow movement is demonstrated or a concrete required physical/
 access action is unavailable. The old 100 mA threshold is an experimental restriction
 to reassess with evidence. Packet06 replaces unsent FAULT-EVIDENCE-05; prior results
-below remain historical. Source/deployment are being verified before changed experiments.
+below remain historical. Exact deployed and prepared versions are recorded below.
 
+
+## AM1-ELBOW-TO-COMPLETION-06 results and status
+
+Useful repeated out-and-back movement is still unresolved. The elbow inspection
+and camera adjustment are completed. The current correction is implemented,
+reviewed and verified natively; the next physical comparison awaits restored Pi
+access. SSH22 and gateway8443 became unreachable from both Duffy and the reachable
+P1 before staging began. The preceding motor run had verified cleanup. No new
+motor Start has been issued for the prepared correction.
+
+| Finite condition | Actual measured response | Result |
+|---|---|---|
+| `3eef62bd-b65f-4dc2-9841-602bc8e71957`, -10 normalized/10-second ramps/2-second dwell/100 mA | Fresh2459 to2362:97 ticks outward;12 ticks partial return to2374 | Owner required_proof_loss at program progress19.6; later native117 mA trigger at19.9 during return/rejoin; no qualified final return |
+| `bd388b47-02b6-4b9b-bc8f-bb6130a4b74e`, same waveform after camera repair | Fresh2379 to2282:97 ticks outward;29 ticks positive return to2311 | Original raw16 x6.5=104 mA native trigger at21.2 seconds, without initiating camera hold; program/final return unqualified |
+| `735ce338-e8c0-4f3d-a3e4-c418b960414d`, planned +10/150 mA | Program progress0; normal preparation hold had position/goal2312 and current0 | New response guard incorrectly required finite context during measured preparation; no enrolled movement result |
+
+All original causes, twenty typed zero readbacks, bus closure and separate same-run
+required-camera releases are retained. The first two runs contain635/671 unique
+ordinary acquisitions. Trigger evidence is captured in memory before cleanup;
+it does not substitute torque-off readings for live current. The second run's
+18/19-second grouped replies read actual goals2312/2323, positions2282/2288,
+currents45.5/65 mA, temperature30 C, voltage11.8 V and status0 with torque enabled.
+The live goals matched encoded commands. Target2348 written at the later fault
+is not an actual Goal_Position readback.
+
+The29-tick positive return occurred over about3.05 wall seconds after breakaway.
+This establishes response under the old diagnostic cap, not complete reversal,
+fine precision or repeatability. Its pre-release2311 position is148 ticks below
+the first2459 reference. Neither a fresh seed nor the third2312 startup hold erases
+that departure. Inspected relevant P1 frames support outward linkage movement;
+partial return and fine residual are not visually quantified. Optional P1 delivery
+errors and verified original recording releases remain separate from required
+Pi-local observation.
+
+### Software corrections and conditional operating envelope
+
+The first camera loss included551.876 ms from completed decode to owner consumption,
+beyond the unchanged500 ms freshness rule. Local delivery was coupled to the
+control mutex, normal admission slots and worker pool. Actual OwnerServer tests
+reproduced those delays. Authenticated local-camera mailbox delivery now uses a
+short independent lock and publishes immediately after decode. Original clocks,
+source/session/generation/replay validation, freshness rules and strict P1-required
+diagnostics remain intact. The second physical run had no initiating observation
+loss and maximum running camera age148.057 ms. Exact original lock occupancy was
+not captured, so attribution among those coupled mechanisms remains bounded.
+
+A separately pinned150 mA diagnostic envelope retains the original100 mA envelope
+and all hardware settings. It allows at most10 normalized units,1 unit/second,
+2-second endpoint dwell,30-second trajectory and60-second native Live. When signed
+commanded error reaches30 raw ticks, the local guard requires3 signed ticks within
+1.2 seconds, using the longer original position/current clock span. Changed goals,
+current dips, duplicate reads and two-tick jitter cannot renew unresolved exposure.
+Protective Pause/Stop remain available; unresolved continuity loss refuses further
+actuation.
+
+The startup correction permits only an initial fresh measured hold before finite
+context. It freezes target, measured origin, actual integer codec goal and owner
+binding, representing floor encoding and one tick of settling separately. Zero
+body intent, original current/setting/clock/raw limits and the60-second ceiling
+remain enforced. Startup drift of30 ticks refuses before another write and after
+a native read. The original20-second preparation limit also applies before the
+first finite-context assignment/write. Once programme context begins, the startup
+exception cannot reopen. No provider, architecture, gains or deadline reset changed.
+
+The next comparison remains conditional: +10 normalized/10-second ramps/2-second
+dwell/150 mA sampled threshold/60-second Live,56-tick minimum outward and reverse
+response,22-tick coarse measured-origin return tolerance and live-goal probes at
+5/10 seconds. It starts from a fresh measured pose. Two supported finite out-and-back
+runs must demonstrate useful repeatability. Program completion, live goal acceptance,
+measured/visible movement, coarse qualification and fine residual stay separate.
+The corrected150 mA condition has not yet established useful physical movement.
+
+The150 mA budget is a conservative finite hypothesis supported by the uninterrupted
+responding return, measured electrical/status values and original settings. It is
+not a continuous loaded-joint rating. P16/I0/D32, Torque_Limit1000, calibration and
+genuine device/ordinary host protections remain unchanged. Manufacturer
+[12 V variant information](https://www.feetechrc.com/525603.html) and the
+[datasheet](https://www.feetechrc.com/Data/feetechrc/upload/file/20240507/6385067068652648096680943.pdf)
+provide context, not this loaded test budget; model777 alone does not identify the
+voltage variant. Both diagnostic thresholds are sampled software refusals, not
+analog limits on between-acquisition peaks. No permanent tuning was performed.
+
+### Verification and exact deployment state
+
+Native mock cohorts passed308 initial evidence/interface cases,90 camera-delivery
+cases,144 response-guard cases and170 startup-integration cases. After independent
+review found the first-context20-second hole, only the65-case guard cohort was
+rerun natively on the final correction. These are separate overlapping cohorts,
+not an aggregate total. Actual candidate imports/native compiled modules were
+verified under PrivateDevices. The independent deadline recheck passes all three
+boundary cases. Full HTTPS/owner socket/WSS serialization passes8 cases, including
+actual generated150 mA fault/phase shapes and all20 retained cleanup rows; the
+largest response is61696 bytes under the unchanged65536-byte ceiling. Mock tests
+prove software and transport behavior, not physical movement.
+
+| State | Exact pin |
+|---|---|
+| Final reviewed code | `740c92003b5d0be59543443dd16ad5300a21c79f` |
+| Last verified deployed motor | `3b31b0054829e57c62f4bd086d919ff890e2cabd` |
+| Last verified deployed runtime | `cad480b71d03c23d4811ce35c6ad27156d4e01ef` |
+| Last verified deployed manifest | `462d0c3e5bf3391ec7d4a83d1a901735d71ba929902d4d45e64f4488112cf535` |
+| Prepared motor, not staged | `c9c1f0e38aba59ade6f47f762e160e8df4f19dd5` |
+| Prepared runtime, not staged | `5c96319375e7bf3b9da5f1d064fca0be87e83545` |
+| Prepared manifest, not staged | `c1be7d3633137920f74f15c5d0702ec136d3273250e2a303d7f1cc5b1d515967` |
+
+Last verified native private config is1235 bytes/mode0600/SHA256
+`de84a2a527d16fb8ab4e971255891179cdbd289ae4ef22105048c24784b489fc`;
+Windows config is1443 bytes with preserved ACL/SHA256
+`2bb715bf9b3966bb462aabf79d701e4deb11809413a1ce9cf631f18fb3b8d70b`.
+Unchanged separate pins: helper `0fe3997f12b9cdfdd01fda6f4c6b102781252448`,
+isolated camera `a0e94bc5298c021f785eaaee4ef0e2c44283f3d7`, normal camera
+`9b1f0670e7068f7d39eb50270a118e3807418355`, P1
+`2d9e365f1e302694633e7b1c916a38fb15cc50cc`, Windows console
+`e55d390bf6e957b9adc52ccf62b69476db12a20d`, calibration SHA256
+`f3ffa9d5d531fe0213c8847f28baef292de027996f0a0267e0657a8c45037394`.
+Normal physical deployments, original simulation, private trust/permissions/history,
+matched rollback and predecessor refs/bundles/manifests are retained. Only stopped
+affected owners may stage the prepared pair. PR20 stays draft on19→18→17→16;
+no merge or history rewrite is authorized.
+
+Durability means software fault tolerance, connection/control continuity, state
+preservation and recovery with minimal human intervention. No hardware-endurance
+or mechanical-lifespan campaign is part of this result.
 
 ## Retained AM1-VISIBLE-CONTROL-04 result
 
