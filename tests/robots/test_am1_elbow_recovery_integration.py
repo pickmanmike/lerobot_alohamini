@@ -1321,3 +1321,283 @@ def test_startup_continuation_keeps_zero_live_fault_and_fresh_idle_boundaries(tm
     original = copy.deepcopy(authority.run)
     assert authority.elbow_recovery_prerequisite(RECIPES[authority.run["recipe"]], evidence) is None
     assert authority.run == original
+
+
+def linked_startup_continuation_fixture(tmp_path):
+    import hashlib
+    import json
+
+    from tests.robots.test_am1_physical_executor import terminal_cleanup_outcome
+    from tools.am1_session_core import _canonical
+
+    authority, _, first, receipt, intermediate_manifest = startup_continuation_fixture(tmp_path)
+    old_raw = receipt.read_bytes()
+    old_sha = hashlib.sha256(old_raw).hexdigest()
+    archive = tmp_path / ("elbow-recovery-startup-continuation." + old_sha + ".json")
+    archive.write_bytes(old_raw)
+    archive.chmod(0o600)
+    run = copy.deepcopy(authority.run)
+    run.update(
+        run_id=str(uuid4()),
+        service_incarnation=str(uuid4()),
+        backend_contract=copy.deepcopy(first["source_transition"]["after"]),
+        retained_return_reference=copy.deepcopy(first["source_transition"]["after_reference"]),
+    )
+    run["startup_continuation"] = {
+        "failed_run_id": first["failed_run_id"],
+        "prior_run_id": first["prior_run"]["run_id"],
+        "receipt_sha256": old_sha,
+    }
+    incarnation = str(uuid4())
+    life = terminal_cleanup_outcome(run["run_id"], incarnation, "faulted")
+    life.update(
+        run_id=run["run_id"],
+        phase="terminal",
+        native_live_at=None,
+        first_cause=run["native_first_cause"],
+        run_directory=str(tmp_path / "second-run"),
+    )
+    gain = copy.deepcopy(authority.run["physical_result"]["readback"]["readback"]["elbow_integral"])
+    gain["binding"] = {
+        "run_id": run["run_id"],
+        "host_incarnation": incarnation,
+        "recipe": run["recipe"],
+        "integral": 1,
+    }
+    for key in ("active_registers", "active_bytes", "active_verified", "active_verified_at_monotonic_s"):
+        gain.pop(key, None)
+    gain["before_apply_bytes"] = copy.deepcopy(gain["original_bytes"])
+    original = gain["original_registers"]
+    original.update(Min_Position_Limit=864, Max_Position_Limit=3073, Torque_Enable=0)
+    events = []
+
+    def event(phase, register=None, value=None, address=None):
+        start = 1.0 + len(events) * 0.01
+        row = {
+            "phase": phase,
+            "operation": "read",
+            "value": value,
+            "started_at_monotonic_s": start,
+            "completed_at_monotonic_s": start + 0.005,
+        }
+        if register is not None:
+            row["register"] = register
+        else:
+            row.update(address=address, width=1)
+        events.append(row)
+
+    for phase, fields in (
+        ("baseline", original),
+        (
+            "before_apply",
+            {k: v for k, v in original.items() if k not in {"Present_Position", "Goal_Position"}},
+        ),
+    ):
+        for key, value in fields.items():
+            event(phase, key, 1 if phase == "before_apply" and key == "Lock" else value)
+        for address, value in gain["original_bytes"].items():
+            event(phase, value=value, address=int(address))
+    event("configured", "I_Coefficient", 1)
+    event("restored", "I_Coefficient", 0)
+    for key, value in original.items():
+        if key not in {"Present_Position", "Goal_Position", "I_Coefficient", "Lock", "Torque_Enable"}:
+            event("restored", key, value)
+    for address, value in gain["original_bytes"].items():
+        event("restored", value=value, address=int(address))
+    event("restore_original_lock_verify", "Lock", 0)
+    gain["events"] = events
+    gain["restored_at_monotonic_s"] = events[-1]["completed_at_monotonic_s"] + 0.001
+    life["readback"]["readback"]["elbow_integral"] = gain
+    run["physical_result"] = life
+    run_dir = Path(life["run_directory"])
+    run_dir.mkdir()
+    cleanup = run_dir / "cleanup.json"
+    cleanup.write_bytes(_canonical(life["readback"]))
+    cleanup.chmod(0o600)
+    camera = Path(run["backend_contract"]["camera_state"]) / ("release-" + run["run_id"] + ".json")
+    camera.write_bytes(_canonical(life["camera_release"]))
+    camera.chmod(0o600)
+    final_manifest = json.loads(intermediate_manifest.read_bytes())
+    final_manifest["motor"].update(head="b" * 40, bundle_sha256="c" * 64)
+    delta = "src/lerobot/robots/alohamini/alohamini.py"
+    target = Path(run["backend_contract"]["host_repository"]) / delta
+    target.write_bytes(b"final reviewed acquisition repair")
+    row = next(r for r in final_manifest["motor"]["files"] if r["path"] == delta)
+    before_sha = row["sha256"]
+    row["sha256"] = hashlib.sha256(target.read_bytes()).hexdigest()
+    final_path = tmp_path / "final-manifest.json"
+    final_path.write_bytes(_canonical(final_manifest))
+    final_path.chmod(0o600)
+    before = copy.deepcopy(run["backend_contract"])
+    after = copy.deepcopy(before)
+    after.update(host_head="b" * 40, source_pins=str(final_path))
+    reference = copy.deepcopy(run["retained_return_reference"])
+    after_reference = dict(reference, admission_motor_head="b" * 40)
+    ref_path = tmp_path / "final-reference.json"
+    ref_path.write_bytes(_canonical(after_reference))
+    ref_path.chmod(0o600)
+    after["elbow_return_reference"] = {
+        "path": str(ref_path),
+        "sha256": hashlib.sha256(ref_path.read_bytes()).hexdigest(),
+    }
+    record = {
+        "version": 1,
+        "kind": "am1-elbow-startup-continuation",
+        "failed_run_id": run["run_id"],
+        "failed_terminal_sha256": hashlib.sha256(_canonical(run)).hexdigest(),
+        "failed_cleanup_sha256": hashlib.sha256(cleanup.read_bytes()).hexdigest(),
+        "failed_camera_sha256": hashlib.sha256(camera.read_bytes()).hexdigest(),
+        "prior_run": copy.deepcopy(first["prior_run"]),
+        "source_transition": {
+            "before": before,
+            "after": after,
+            "before_reference": reference,
+            "after_reference": after_reference,
+            "changed_motor_files": {delta: {"before_sha256": before_sha, "after_sha256": row["sha256"]}},
+        },
+    }
+    receipt.write_bytes(_canonical(record))
+    evidence = idle_recovery_evidence(
+        dict(run, backend_contract=after, retained_return_reference=after_reference)
+    )
+    authority = reporting_authority(run, evidence)
+    authority.directory = tmp_path
+    return authority, evidence, record, receipt, archive, final_path
+
+
+def test_linked_configured_only_startup_reuses_exact_prior_after_two_source_steps(tmp_path):
+    from examples.alohamini.am1_session_contract import RECIPES
+
+    authority, evidence, _, _, _, _ = linked_startup_continuation_fixture(tmp_path)
+    original = copy.deepcopy(authority.run)
+    proof = authority.elbow_recovery_prerequisite(RECIPES[authority.run["recipe"]], evidence)
+    assert proof == authority.run["recovery_prerequisite"] and authority.run == original
+    assert set(authority._startup_continuation_note) == {"failed_run_id", "prior_run_id", "receipt_sha256"}
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "missing_archive",
+        "tampered_archive",
+        "foreign_note",
+        "recursive",
+        "hardlink",
+        "active_false",
+        "active_phase",
+        "stage_order",
+        "configured",
+        "configured_event",
+        "clock",
+        "gain_failure",
+        "original_pid",
+        "original_torque",
+        "restore_bytes",
+        "byte_event",
+        "intermediate_source",
+        "foreign_delta",
+        "final_material",
+        "final_file",
+        "live",
+        "execution",
+        "unknown",
+        "camera",
+        "active_owner",
+    ],
+)
+def test_linked_startup_refuses_missing_or_changed_source_stage_cleanup_and_archive(tmp_path, bad):
+    import hashlib
+    import json
+    import os
+
+    from examples.alohamini.am1_session_contract import RECIPES
+    from tools.am1_session_core import _canonical
+
+    authority, evidence, record, receipt, archive, manifest = linked_startup_continuation_fixture(tmp_path)
+    gain = authority.run["physical_result"]["readback"]["readback"]["elbow_integral"]
+    if bad == "missing_archive":
+        archive.unlink()
+    elif bad == "tampered_archive":
+        archive.write_bytes(archive.read_bytes() + b" ")
+    elif bad == "foreign_note":
+        authority.run["startup_continuation"]["failed_run_id"] = str(uuid4())
+    elif bad == "recursive":
+        old = json.loads(archive.read_bytes())
+        old["source_transition"]["before"] = copy.deepcopy(authority.run["backend_contract"])
+        raw = _canonical(old)
+        digest = hashlib.sha256(raw).hexdigest()
+        new_archive = archive.with_name("elbow-recovery-startup-continuation." + digest + ".json")
+        new_archive.write_bytes(raw)
+        new_archive.chmod(0o600)
+        authority.run["startup_continuation"]["receipt_sha256"] = digest
+    elif bad == "hardlink":
+        os.link(archive, tmp_path / "alias.json")
+    elif bad == "active_false":
+        gain["active_verified"] = False
+    elif bad == "active_phase":
+        gain["events"][-1]["phase"] = "active"
+    elif bad == "stage_order":
+        event = next(r for r in gain["events"] if r["phase"] == "configured")
+        gain["events"].remove(event)
+        gain["events"].append(event)
+        for i, row in enumerate(gain["events"]):
+            row.update(started_at_monotonic_s=1.0 + i * 0.01, completed_at_monotonic_s=1.005 + i * 0.01)
+        gain["restored_at_monotonic_s"] = gain["events"][-1]["completed_at_monotonic_s"] + 0.001
+    elif bad == "configured":
+        gain["configured_integral_readback"] = 0
+    elif bad == "configured_event":
+        gain["events"] = [r for r in gain["events"] if r["phase"] != "configured"]
+    elif bad == "clock":
+        gain["events"][-1]["started_at_monotonic_s"] = 0.0
+    elif bad == "gain_failure":
+        gain["first_failure"] = {"type": "RuntimeError", "message": "gain mismatch"}
+    elif bad == "original_pid":
+        gain["original_registers"]["P_Coefficient"] = 32
+    elif bad == "original_torque":
+        gain["original_registers"]["Torque_Enable"] = 1
+    elif bad == "restore_bytes":
+        gain["restored_bytes"]["25"] = 1
+    elif bad == "byte_event":
+        gain["events"] = [
+            r for r in gain["events"] if not (r["phase"] == "restored" and r.get("address") == 25)
+        ]
+    elif bad == "intermediate_source":
+        authority.run["backend_contract"]["host_head"] = "e" * 40
+        record["source_transition"]["before"] = copy.deepcopy(authority.run["backend_contract"])
+    elif bad in {"foreign_delta", "final_material"}:
+        value = json.loads(manifest.read_bytes())
+        if bad == "foreign_delta":
+            next(r for r in value["motor"]["files"] if r["path"].endswith("alohamini_client.py"))[
+                "sha256"
+            ] = "e" * 64
+        else:
+            value["camera"]["head"] = "e" * 40
+        manifest.write_bytes(_canonical(value))
+    elif bad == "final_file":
+        (
+            Path(authority.run["backend_contract"]["host_repository"])
+            / "src/lerobot/robots/alohamini/alohamini_client.py"
+        ).write_bytes(b"foreign actual bytes")
+    elif bad == "live":
+        authority.run["native_live_at"] = 1.0
+    elif bad == "execution":
+        authority.run["execution"] = {"progress_s": 0}
+    elif bad == "unknown":
+        authority.run["uncertain"] = True
+    elif bad == "camera":
+        authority.run["physical_result"]["camera_release"]["session_id"] = str(uuid4())
+    else:
+        evidence["active_acknowledged"] = True
+    cleanup = Path(authority.run["physical_result"]["run_directory"]) / "cleanup.json"
+    cleanup.write_bytes(_canonical(authority.run["physical_result"]["readback"]))
+    record["failed_cleanup_sha256"] = hashlib.sha256(cleanup.read_bytes()).hexdigest()
+    camera = Path(authority.run["backend_contract"]["camera_state"]) / (
+        "release-" + authority.run["run_id"] + ".json"
+    )
+    camera.write_bytes(_canonical(authority.run["physical_result"]["camera_release"]))
+    record["failed_camera_sha256"] = hashlib.sha256(camera.read_bytes()).hexdigest()
+    record["failed_terminal_sha256"] = hashlib.sha256(_canonical(authority.run)).hexdigest()
+    receipt.write_bytes(_canonical(record))
+    original = copy.deepcopy(authority.run)
+    assert authority.elbow_recovery_prerequisite(RECIPES[authority.run["recipe"]], evidence) is None
+    assert authority.run == original

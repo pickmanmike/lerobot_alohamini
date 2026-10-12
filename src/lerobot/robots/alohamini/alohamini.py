@@ -582,9 +582,16 @@ class AlohaMini(Robot):
                 or now < stamp
             ):
                 raise ComparisonRefusal("startup: original lift acquisition clock is unavailable or invalid.")
-            if now - stamp >= POLL_S:
+            window = operation.temperature
+            current_slot = (round(now * 1_000_000_000) - window._origin_ns) // round(
+                window.SLOT_S * 1_000_000_000
+            )
+            # A lower reply in the same slot retains its earlier peak. Acquire
+            # the next original slot before that peak can age out, even when
+            # the nominal raw poll interval has not yet elapsed.
+            if now - stamp >= POLL_S or current_slot > window._last_slot:
                 operation.poll()
-            operation.temperature.assert_fresh(time.monotonic())
+            window.assert_fresh(time.monotonic())
         except BaseException as error:
             if operation.failure is None:
                 operation.failure = error

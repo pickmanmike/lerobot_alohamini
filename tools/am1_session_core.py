@@ -753,7 +753,89 @@ class SessionAuthority:
     def _startup_source_transition(self, record, evidence):
         from tools.am1_session_ipc import strict_json
 
-        transition = record["source_transition"]
+        transition, prior = record["source_transition"], record["prior_run"]
+        before, after = transition["before"], transition["after"]
+        paths = {
+            "src/lerobot/robots/alohamini/alohamini.py",
+            "src/lerobot/robots/alohamini/alohamini_host.py",
+        }
+        if (
+            _canonical(before) != _canonical(self.run["backend_contract"])
+            or _canonical(after) != _canonical(evidence.get("backend_contract"))
+            or _canonical(transition["before_reference"]) != _canonical(self.run["retained_return_reference"])
+            or _canonical(transition["after_reference"])
+            != _canonical(evidence.get("retained_return_reference"))
+        ):
+            return False
+        note = self.run.get("startup_continuation")
+        if note is None:
+            if (
+                _canonical(before) != _canonical(prior["backend_contract"])
+                or _canonical(transition["before_reference"])
+                != _canonical(prior["retained_return_reference"])
+                or set(transition["changed_motor_files"]) != paths
+            ):
+                return False
+        else:
+            if (
+                not isinstance(note, dict)
+                or set(note) != {"failed_run_id", "prior_run_id", "receipt_sha256"}
+                or any(uuid_text(note[k]) != note[k] for k in ("failed_run_id", "prior_run_id"))
+                or note["prior_run_id"] != prior["run_id"]
+                or note["failed_run_id"] in (self.run["run_id"], prior["run_id"])
+                or not isinstance(note["receipt_sha256"], str)
+                or len(note["receipt_sha256"]) != 64
+                or any(c not in "0123456789abcdef" for c in note["receipt_sha256"])
+            ):
+                return False
+            archive = self.directory / (
+                "elbow-recovery-startup-continuation." + note["receipt_sha256"] + ".json"
+            )
+            raw = _continuation_bytes(archive)
+            old = strict_json(raw)
+            fields = {
+                "version",
+                "kind",
+                "failed_run_id",
+                "failed_terminal_sha256",
+                "failed_cleanup_sha256",
+                "failed_camera_sha256",
+                "prior_run",
+                "source_transition",
+            }
+            if (
+                hashlib.sha256(raw).hexdigest() != note["receipt_sha256"]
+                or not isinstance(old, dict)
+                or set(old) != fields
+                or type(old["version"]) is not int
+                or old["version"] != 1
+                or old["kind"] != "am1-elbow-startup-continuation"
+                or old["failed_run_id"] != note["failed_run_id"]
+                or any(
+                    not isinstance(old[k], str)
+                    or len(old[k]) != 64
+                    or any(c not in "0123456789abcdef" for c in old[k])
+                    for k in ("failed_terminal_sha256", "failed_cleanup_sha256", "failed_camera_sha256")
+                )
+                or _canonical(old["prior_run"]) != _canonical(prior)
+            ):
+                return False
+            previous = old["source_transition"]
+            if (
+                _canonical(previous["before"]) != _canonical(prior["backend_contract"])
+                or _canonical(previous["before_reference"]) != _canonical(prior["retained_return_reference"])
+                or _canonical(previous["after"]) != _canonical(before)
+                or _canonical(previous["after_reference"]) != _canonical(transition["before_reference"])
+                or set(previous["changed_motor_files"]) != paths
+                or not self._startup_material_transition(previous, historical=True)
+            ):
+                return False
+        return self._startup_material_transition(transition, all_final=note is not None)
+
+    def _startup_material_transition(self, transition, *, historical=False, all_final=False):
+        """Historical intermediate manifests are sealed; final bytes belong to the current checkout."""
+        from tools.am1_session_ipc import strict_json
+
         paths = {
             "src/lerobot/robots/alohamini/alohamini.py",
             "src/lerobot/robots/alohamini/alohamini_host.py",
@@ -767,22 +849,16 @@ class SessionAuthority:
         }:
             return False
         before, after = transition["before"], transition["after"]
-        prior = record["prior_run"]
+        changed = set(transition["changed_motor_files"])
         if (
-            _canonical(before) != _canonical(self.run["backend_contract"])
-            or _canonical(before) != _canonical(prior["backend_contract"])
-            or _canonical(after) != _canonical(evidence.get("backend_contract"))
-            or set(before) != set(after)
+            set(before) != set(after)
             or {k for k in before if _canonical(before[k]) != _canonical(after[k])}
             - {"host_head", "source_pins", "elbow_return_reference"}
             or before["host_head"] == after["host_head"]
-            or _canonical(transition["before_reference"]) != _canonical(prior["retained_return_reference"])
-            or _canonical(transition["before_reference"]) != _canonical(self.run["retained_return_reference"])
-            or _canonical(transition["after_reference"])
-            != _canonical(evidence.get("retained_return_reference"))
             or _canonical(transition["after_reference"])
             != _canonical(dict(transition["before_reference"], admission_motor_head=after["host_head"]))
-            or set(transition["changed_motor_files"]) != paths
+            or not changed
+            or not changed <= paths
         ):
             return False
         motor_paths = (
@@ -874,24 +950,120 @@ class SessionAuthority:
         ) or any(old_manifest["motor"][k] != new_manifest["motor"][k] for k in ("base", "ref")):
             return False
         old, new = rows
-        if {p for p in old if old[p] != new[p]} != paths:
+        if {p for p in old if old[p] != new[p]} != changed:
             return False
-        for path in paths:
+        for path in changed:
             row = transition["changed_motor_files"][path]
             if (
                 set(row) != {"before_sha256", "after_sha256"}
                 or row["before_sha256"] != old[path]
                 or row["after_sha256"] != new[path]
-                or hashlib.sha256(
-                    _continuation_bytes(
-                        Path(after["host_repository"]) / path,
-                        limit=262144,
-                        source=True,
-                    )
-                ).hexdigest()
-                != new[path]
             ):
                 return False
+        if not historical:
+            for path in motor_paths if all_final else changed:
+                if (
+                    hashlib.sha256(
+                        _continuation_bytes(Path(after["host_repository"]) / path, limit=262144, source=True)
+                    ).hexdigest()
+                    != new[path]
+                ):
+                    return False
+        return True
+
+    @staticmethod
+    def _startup_configured_only(gain, calibration):
+        """Known configured/restored stage, never an invented active verification."""
+        if any(
+            k in gain
+            for k in ("active_verified", "active_registers", "active_bytes", "active_verified_at_monotonic_s")
+        ) or gain.get("before_apply_bytes") != gain.get("original_bytes"):
+            return False
+        events = gain.get("events")
+        if not isinstance(events, list) or not 1 <= len(events) <= 128:
+            return False
+        end = 0.0
+        for row in events:
+            if (
+                not isinstance(row, dict)
+                or row.get("operation") not in ("read", "write")
+                or not isinstance(row.get("phase"), str)
+                or row["phase"].startswith("active")
+                or row.get("error") is not None
+                or row.get("error_type") is not None
+                or type(row.get("value")) is not int
+            ):
+                return False
+            start, completed = row.get("started_at_monotonic_s"), row.get("completed_at_monotonic_s")
+            if (
+                any(type(t) not in (int, float) or not math.isfinite(t) for t in (start, completed))
+                or not end <= start <= completed
+            ):
+                return False
+            end = completed
+        phases = ("baseline", "before_apply", "configured", "restored", "restore_original_lock_verify")
+        previous = 0.0
+        for phase in phases:
+            rows = [r for r in events if r["phase"] == phase and r["operation"] == "read"]
+            if not rows or min(r["started_at_monotonic_s"] for r in rows) < previous:
+                return False
+            previous = max(r["completed_at_monotonic_s"] for r in rows)
+        restored_at = gain.get("restored_at_monotonic_s")
+        if type(restored_at) not in (int, float) or not math.isfinite(restored_at) or restored_at < end:
+            return False
+
+        def read(phase, key, expected):
+            rows = [
+                r
+                for r in events
+                if r["phase"] == phase and r["operation"] == "read" and r.get("register") == key
+            ]
+            return len(rows) == 1 and rows[0]["value"] == expected
+
+        original = gain["original_registers"]
+        expected = {
+            "Model_Number": 777,
+            "Firmware_Major_Version": 3,
+            "Firmware_Minor_Version": 10,
+            "Operating_Mode": 0,
+            "P_Coefficient": 16,
+            "D_Coefficient": 32,
+            "Min_Position_Limit": calibration["range_min"],
+            "Max_Position_Limit": calibration["range_max"],
+        }
+        if (
+            any(
+                type(original.get(k)) is not int or original[k] != v
+                for k, v in dict(expected, Torque_Enable=0).items()
+            )
+            or not all(
+                read("baseline", k, v)
+                for k, v in dict(expected, I_Coefficient=0, Lock=0, Torque_Enable=0).items()
+            )
+            or not all(
+                read("before_apply", k, v)
+                for k, v in dict(expected, I_Coefficient=0, Lock=1, Torque_Enable=0).items()
+            )
+            or not all(read("restored", k, v) for k, v in expected.items())
+            or not read("configured", "I_Coefficient", 1)
+            or not read("restored", "I_Coefficient", 0)
+            or not read("restore_original_lock_verify", "Lock", 0)
+        ):
+            return False
+        for phase in ("baseline", "before_apply", "restored"):
+            for address, value in gain["original_bytes"].items():
+                rows = [
+                    r
+                    for r in events
+                    if r["phase"] == phase and r["operation"] == "read" and r.get("address") == int(address)
+                ]
+                if (
+                    len(rows) != 1
+                    or type(rows[0].get("width")) is not int
+                    or rows[0]["width"] != 1
+                    or rows[0]["value"] != value
+                ):
+                    return False
         return True
 
     def _startup_continuation(self, recipe, evidence):
@@ -967,24 +1139,31 @@ class SessionAuthority:
             }
             active = gain.get("active_registers")
             original_bytes = gain.get("original_bytes")
+            linked = run.get("startup_continuation") is not None
             if (
                 any(
                     type(original.get(k)) is not int or original[k] != v
                     for k, v in expected_registers.items()
                 )
-                or not isinstance(active, dict)
+                or type(gain.get("configured_integral_readback")) is not int
+                or gain["configured_integral_readback"] != 1
+                or not isinstance(original_bytes, dict)
+                or set(original_bytes) != {"24", "25"}
+                or any(type(v) is not int or not 0 <= v <= 255 for v in original_bytes.values())
+                or gain.get("restored_bytes") != original_bytes
+            ):
+                return None
+            if linked:
+                if not self._startup_configured_only(gain, run["recovery_prerequisite"]["calibration"]):
+                    return None
+            elif (
+                not isinstance(active, dict)
+                or gain.get("active_verified") is not True
+                or gain.get("active_bytes") != original_bytes
                 or any(
                     type(active.get(k)) is not int or active[k] != v
                     for k, v in dict(expected_registers, I_Coefficient=1, Lock=1, Torque_Enable=1).items()
                 )
-                or type(gain.get("configured_integral_readback")) is not int
-                or gain["configured_integral_readback"] != 1
-                or gain.get("active_verified") is not True
-                or not isinstance(original_bytes, dict)
-                or set(original_bytes) != {"24", "25"}
-                or any(type(v) is not int or not 0 <= v <= 255 for v in original_bytes.values())
-                or gain.get("active_bytes") != original_bytes
-                or gain.get("restored_bytes") != original_bytes
             ):
                 return None
             camera = lifecycle["camera_release"]

@@ -158,7 +158,15 @@ def startup(monkeypatch, tmp_path):
             # test_am1_startup_thermal_handoff and the operational-lift suites.
             self.failure = None
             self.last_record = {"sample_monotonic_s": owner.time.monotonic()}
-            self.temperature = SimpleNamespace(assert_fresh=lambda now: None)
+            # Explicit mock interface for the original-slot startup scheduler.
+            # This fixture replaces lift I/O; real Window voting/clock guards
+            # remain exercised by the two dedicated thermal startup suites.
+            self.temperature = SimpleNamespace(
+                SLOT_S=0.1,
+                _origin_ns=round(self.last_record["sample_monotonic_s"] * 1_000_000_000),
+                _last_slot=0,
+                assert_fresh=lambda now: None,
+            )
 
         def raise_if_faulted(self):
             if self.failure is not None:
@@ -166,6 +174,9 @@ def startup(monkeypatch, tmp_path):
 
         def poll(self):
             self.last_record = {"sample_monotonic_s": owner.time.monotonic()}
+            self.temperature._last_slot = (
+                round(self.last_record["sample_monotonic_s"] * 1_000_000_000) - self.temperature._origin_ns
+            ) // round(self.temperature.SLOT_S * 1_000_000_000)
 
         def start(self):
             state.home_calls += 1

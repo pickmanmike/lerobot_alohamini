@@ -83,7 +83,8 @@ def test_not_due_startup_boundary_does_not_read_or_stamp_new_evidence(startup_wi
     operation = robot._lift_operation
     old = operation.last_record
     peaks = list(operation.temperature.samples)
-    at(clock, first + 0.025)
+    # Remain in the SAME original slot as well as below the raw poll interval.
+    at(clock, first + 0.005)
     monkeypatch.setattr(operation.transport, "read_group", lambda *a, **k: pytest.fail("not due"))
     robot._refresh_am1_startup_lift_feedback()
     assert operation.last_record is old and list(operation.temperature.samples) == peaks
