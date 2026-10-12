@@ -1,4 +1,35 @@
-## Current AM1 current-pose recovery continuation
+## Current AM1 visible positive-control continuation
+
+For AM1-VISIBLE-CONTROL-04, preserve the completed Recovery03 software repairs and
+negative matched I0/I1 results. Original I0 remains restored; no new gain experiment
+or permanent tuning is authorized. Use one independent fresh-pose +10 out-and-back
+at unchanged baseline settings through the sole protected motor owner. Freeze all12
+measured targets, keep other11 held and body/lift zero after startup. New q0±10
+absolute envelope and all stricter limits, slope<=1 unit/s, cap100mA or stricter,
+28 nominal/30 trajectory/60 Live/180 startup seconds. No old2472/manual matching,
+repeat elbow inspection, attendance questions or unchanged endurance campaign.
+
+Program completion, current visible motion, measured coarse outward/reverse response
+and fine residual are separate. Coarse thresholds are each direction>=50% exact
+encoded excursion and final originalq0 residual<=20%, with advancing phase coverage,
+fresh stationary evidence and noise discriminability. One confirmation is conditional
+on coarsepass/nonadverse/known cleanup and retains fixed originalq0/envelope, with
+bounded separately recorded acquisition; never reseed away drift.
+
+Current P1 preview shows both arms/elbow linkages; use its repaired existing bounded
+audio-off capture and inspect actual current images. P1 stays advisory; the real
+Pi-local camera remains required. Root alone operates hardware/capture/staging.
+Run focused full-wrapper actual IPC tests before motion and surface concrete reporting
+failures promptly. Preserve complete private native proof, original65536/4096 caps,
+all local operating guards, simulation default/no autoplay, calibration, private
+permissions, component-specific pins and matched stopped rollback. AM1 wireless,
+AM2 untouched. Draft PR20 remains dependent19->18->17->16; no merge/retarget/force.
+Durability means software fault tolerance, connection/control continuity, state
+preservation and recovery with minimal human intervention, not mechanical lifespan.
+The overall dependable-control goal and genuine physical input-loss recovery remain
+open beyond this bounded joint comparison.
+
+## Historical AM1 current-pose recovery continuation (superseded for new Visible04 only)
 
 For AM1-ELBOW-RECOVERY-03, restoration toward retained raw2472 is the measured outcome
 of a NEW experiment from the freshly qualified current pose, not a universal start

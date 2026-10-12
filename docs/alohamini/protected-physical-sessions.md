@@ -1,5 +1,51 @@
 # AM1 protected physical sessions
 
+## Current continuation: AM1-VISIBLE-CONTROL-04
+
+The new opt-in `physical-left-elbow-positive-control` tests an ordinary positive
+out-and-back from the actual measured pose at unchanged P16/I0/D32. At this source
+checkpoint, focused software verification is complete or under final review; the
+new physical comparison and deployment are still pending. Recovery03 repairs and
+all historical results below remain retained. No further gain experiment is
+included.
+
+The sole protected owner reads actual selected ID3 settings before configuration,
+skips its settings/default writes, then verifies unchanged settings after normal
+activation. The other eleven targets hold their newly measured values; body/lift
+remain zero after startup. The waveform is 2 seconds baseline, 10 seconds outward
+to q0+10, 2 seconds endpoint, 10 seconds return to q0, 2 seconds origin and 2 seconds
+final evidence: 28 nominal, 30 maximum trajectory, 60 Live and the existing180
+startup budget. Slope is at most1 normalized unit/second, without catch-up; the
+new q0±10 envelope and all stricter calibration/raw/relative/clearance limits stay
+active. Sampled software current remains at most100mA or a stricter local limit;
+this is not a hardware peak-current guarantee.
+
+Program completion, actual visible motion, measured coarse response and fine
+residual are separate. Exact encoded goal excursion E sets ceil(E/2) movement in
+each direction and floor(E/5) final residual. Outward movement uses the qualified
+late baseline; reverse movement uses the qualified late endpoint. Return residual
+uses the original actual measured q0, with encoded-goal residual reported separately.
+Noise must leave both fixed criteria discriminating. Fine return remains2 ticks.
+One explicit `confirmation_of` UUID may qualify a short repeat after coarse pass,
+stationary/nonadverse feedback and known cleanup. It retains original q0, admits a
+fresh hold and records at most2 acquisition seconds at≤1unit/second before the
+same28-second waveform. No commanded or manual old-reference matching is added.
+
+The current bounded P1 preview shows both arms and elbow linkages. Its original
+49.2772-second audio-off recording delivered387 images and released normally;
+inspected original frames at2 and8 seconds provide useful framing. No camera
+re-aim was required. P1 remains advisory; actual Pi-local images remain required.
+Images and raw records stay private. Normal service/page start does not actuate;
+use the existing trusted virtual console's explicit Claim and selected Start.
+Simulation remains the default. AM1 stays wireless and AM2 remains untouched.
+
+Durability means software fault tolerance, connection/control continuity, state
+preservation and recovery with minimal human intervention. Genuine physical
+required-input-loss recovery remains unproved. No unchanged endurance repeat,
+permanent tuning, new architecture, merge or history rewrite is included.
+
+## Retained Recovery03 checkpoint
+
 AM1-ELBOW-RECOVERY-03 evaluated the matched current-pose I0/I1 return-only
 hypothesis. Both programs completed5.5seconds, but all measured positions stayed
 raw2458 despite goal2472: residual14, zero useful approach and no target attainment.

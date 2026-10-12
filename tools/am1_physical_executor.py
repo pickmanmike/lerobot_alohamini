@@ -9,6 +9,7 @@ from examples.alohamini.am1_finite_task import JOINT_KEYS
 from examples.alohamini.am1_session_contract import (
     ELBOW_RECOVERY_DEFINITIONS,
     LEFT_ELBOW_ORIGINAL_RETURN,
+    LEFT_ELBOW_POSITIVE_CONTROL,
     LEFT_ELBOW_RESPONSE,
 )
 
@@ -158,6 +159,7 @@ class PhysicalExecutor:
             "physical-left-elbow-compare",
             "physical-left-elbow-dwell-compare",
             LEFT_ELBOW_RESPONSE.recipe_name,
+            LEFT_ELBOW_POSITIVE_CONTROL.recipe_name,
             LEFT_ELBOW_ORIGINAL_RETURN.recipe_name,
             *ELBOW_RECOVERY_DEFINITIONS,
         }
@@ -217,6 +219,7 @@ class PhysicalExecutor:
         self._execution = {"progress_s": 0.0, "complete": False, "fault": None}
         self._finite_completion = None
         self._completion_returns = []
+        self.positive_prerequisite = None
         self._lifecycle = {
             "run_id": None,
             "phase": "idle",
@@ -245,7 +248,15 @@ class PhysicalExecutor:
                 raise RuntimeError("Recovery prerequisite cannot change during an active owner")
             self.recovery_prerequisite = copy.deepcopy(proof)
 
+    def set_positive_prerequisite(self, proof):
+        with self.mutex:
+            if self.worker and self.worker.is_alive():
+                raise RuntimeError("Positive prerequisite cannot change during an active owner")
+            self.positive_prerequisite = copy.deepcopy(proof)
+
     def _reference_for_recipe(self):
+        if self.recipe and self.recipe.name == LEFT_ELBOW_POSITIVE_CONTROL.recipe_name:
+            return None
         return (
             self.recovery_reference
             if self.recipe and self.recipe.name in ELBOW_RECOVERY_DEFINITIONS
@@ -266,6 +277,7 @@ class PhysicalExecutor:
                 self._reference_for_recipe() or self.recovery_reference
             ),
             "recovery_prerequisite": copy.deepcopy(self.recovery_prerequisite),
+            "positive_prerequisite": copy.deepcopy(self.positive_prerequisite),
             "return_reference_error": self.return_reference_error,
             "gain_recipes": {
                 "physical-arm-smoke": "selected-shoulder-i1-with-verified-i0-restore",
@@ -675,6 +687,8 @@ class PhysicalExecutor:
                                 self.config["shoulder_amplitude"],
                                 start_held=True,
                                 feedback_provenance="protected-host/measured-feedback",
+                                **({"positive_comparator": copy.deepcopy(self.positive_prerequisite)}
+                                   if self.recipe.name == LEFT_ELBOW_POSITIVE_CONTROL.recipe_name else {}),
                                 **(
                                     {
                                         "return_reference": self._reference_for_recipe(),
@@ -721,6 +735,8 @@ class PhysicalExecutor:
                                                 "reference_normalized"
                                             ]
                                         limit = (
+                                            (10.0 if key == LEFT_ELBOW_POSITIVE_CONTROL.joint else 1.0)
+                                            if self.recipe.name == LEFT_ELBOW_POSITIVE_CONTROL.recipe_name else
                                             1.0
                                             if self.task.profile
                                             in {
@@ -1033,6 +1049,7 @@ class ProtectedHostRun:
             "AM1_SELECTED_JOINT_EVIDENCE",
             "AM1_ELBOW_RECOVERY",
             "AM1_ELBOW_RECOVERY_RECIPE",
+            "AM1_VISIBLE_CONTROL_RECIPE",
         ):
             env.pop(k, None)
         if recipe.name in ("physical-arm-smoke", "physical-arm-smoke-repeat"):
@@ -1043,6 +1060,8 @@ class ProtectedHostRun:
                 env.pop(k, None)
             env["AM1_SCRIPTED_PREPARE"] = "1"
             env["AM1_SELECTED_JOINT_EVIDENCE"] = "1"
+        if recipe.name == LEFT_ELBOW_POSITIVE_CONTROL.recipe_name:
+            env["AM1_VISIBLE_CONTROL_RECIPE"] = recipe.name
         if recipe.name in ELBOW_RECOVERY_DEFINITIONS:
             env["AM1_ELBOW_RECOVERY"] = f"I{ELBOW_RECOVERY_DEFINITIONS[recipe.name].integral}"
             env["AM1_ELBOW_RECOVERY_RECIPE"] = recipe.name
@@ -1084,6 +1103,7 @@ class ProtectedHostRun:
                 "AM1_SELECTED_JOINT_EVIDENCE",
                 "AM1_ELBOW_RECOVERY",
                 "AM1_ELBOW_RECOVERY_RECIPE",
+            "AM1_VISIBLE_CONTROL_RECIPE",
             )
             if k in env
         }

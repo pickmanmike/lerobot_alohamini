@@ -1,9 +1,11 @@
 """Opt-in selected-elbow evidence on the existing AM1 motor-owner thread."""
 
 import copy
+import hashlib
 import json
 import math
 import time
+from collections import deque
 
 from lerobot.motors import MotorNormMode
 from lerobot.motors.motors_bus import get_address
@@ -33,7 +35,8 @@ def _number(value):
 
 
 def _print(row):
-    print(PREFIX + json.dumps(row, allow_nan=False, separators=(",", ":")), flush=True)
+    prefix = "[AM1 SELECTED SETTINGS] " if row.get("kind") == "visible_settings" else PREFIX
+    print(prefix + json.dumps(row, allow_nan=False, separators=(",", ":")), flush=True)
 
 
 class AM1SelectedJointEvidence:
@@ -51,6 +54,192 @@ class AM1SelectedJointEvidence:
         self.recovery_initial_raw = None
         self.recovery_phase = None
         self.recovery_peak = None
+        self.visible_settings = None
+        self.visible_started_at = None
+        self.visible_initial_raw = None
+        self.visible_phase = self.visible_peak = self.visible_goal = None
+        self.visible_current_rows = deque(maxlen=20)
+        self.visible_position_rows = deque(maxlen=20)
+
+    VISIBLE_STATIC_REGISTERS = (
+        "Firmware_Major_Version",
+        "Firmware_Minor_Version",
+        "Model_Number",
+        "ID",
+        "Return_Delay_Time",
+        "Min_Position_Limit",
+        "Max_Position_Limit",
+        "Homing_Offset",
+        "Phase",
+        "P_Coefficient",
+        "I_Coefficient",
+        "D_Coefficient",
+        "Operating_Mode",
+        "Acceleration",
+        "Goal_Time",
+        "Goal_Velocity",
+        "Torque_Limit",
+        "Maximum_Acceleration",
+    )
+    VISIBLE_DYNAMIC_REGISTERS = (
+        "Torque_Enable",
+        "Lock",
+        "Goal_Position",
+        "Present_Position",
+        "Present_Current",
+        "Status",
+        "Present_Voltage",
+        "Present_Temperature",
+    )
+
+    def _visible_definition(self, robot, binding=None):
+        actual = getattr(robot, "_am1_visible_control_binding", None)
+        if actual is None:
+            return None
+        from examples.alohamini.am1_session_contract import LEFT_ELBOW_POSITIVE_CONTROL, uuid_text
+
+        expected = actual if binding is None else binding
+        motor = robot.left_bus.motors.get(MOTOR)
+        if (
+            not self.enabled
+            or not getattr(robot, "_am1_selected_joint_evidence_enabled", False)
+            or getattr(robot, "_am1_visible_control_evidence", None) is not self
+            or getattr(robot.config, "robot_model", None) != "alohamini1"
+            or not isinstance(actual, dict)
+            or set(actual) != {"run_id", "host_incarnation", "recipe"}
+            or actual != expected
+            or actual["recipe"] != LEFT_ELBOW_POSITIVE_CONTROL.recipe_name
+            or uuid_text(actual["run_id"]) != actual["run_id"]
+            or uuid_text(actual["host_incarnation"]) != actual["host_incarnation"]
+            or motor is None
+            or motor.id != 3
+            or motor.model != "sts3215"
+            or motor.norm_mode is not MotorNormMode.RANGE_M100_100
+        ):
+            raise RuntimeError("Visible control differs from its exact opted-in protected owner")
+        return LEFT_ELBOW_POSITIVE_CONTROL
+
+    def _visible_settings_read(self, robot):
+        bus = robot.left_bus
+        transport = DirectSdkTransport(
+            bus.port, motor_id=3, port_handler=bus.port_handler, packet_handler=bus.packet_handler
+        )
+        started = self.clock()
+        payload, first_trace = transport.read_group(0, 71, timeout_ms=40.0)
+        maximum, second_trace = transport.read_group(85, 1, timeout_ms=40.0)
+        ended = self.clock()
+        registers = {}
+        for name in (*self.VISIBLE_STATIC_REGISTERS, *self.VISIBLE_DYNAMIC_REGISTERS):
+            address, width = get_address(bus.model_ctrl_table, bus.motors[MOTOR].model, name)
+            if name == "Maximum_Acceleration":
+                raw = int(maximum[0])
+            else:
+                if not 0 <= address < address + width <= 71:
+                    raise RuntimeError("Visible selected settings table differs")
+                raw = int.from_bytes(payload[address : address + width], "little")
+            registers[name] = int(bus._decode_sign(name, {3: raw})[3])
+        return {
+            "registers": registers,
+            "individual_bytes": {"24": payload[24], "25": payload[25]},
+            "read_started_at_monotonic_s": started,
+            "read_completed_at_monotonic_s": ended,
+        }, [first_trace, second_trace]
+
+    def prepare_visible(self, robot, binding):
+        definition = self._visible_definition(robot, binding)
+        if definition is None:
+            raise RuntimeError("Visible read-only baseline requires its explicit owner")
+        if self.visible_settings is not None:
+            raise RuntimeError("Visible selected baseline cannot be replaced")
+        before, traces = self._visible_settings_read(robot)
+        self.visible_settings = {
+            "version": 1,
+            "binding": copy.deepcopy(binding),
+            "before": before,
+            "active": None,
+            "unchanged": False,
+            "settings_sha256": None,
+        }
+        self.emit(
+            {
+                "kind": "visible_settings",
+                "phase": "before",
+                **copy.deepcopy(binding),
+                "settings": copy.deepcopy(before),
+                "traces": traces,
+            }
+        )
+        registers, calibration = before["registers"], robot.left_bus.calibration[MOTOR]
+        expected = {
+            "Model_Number": 777,
+            "Firmware_Major_Version": 3,
+            "Firmware_Minor_Version": 10,
+            "ID": 3,
+            "Operating_Mode": 0,
+            "P_Coefficient": 16,
+            "I_Coefficient": 0,
+            "D_Coefficient": 32,
+            "Torque_Enable": 0,
+            "Lock": 0,
+            "Status": 0,
+            "Homing_Offset": calibration.homing_offset,
+        }
+        if (
+            any(registers[k] != value for k, value in expected.items())
+            or not 0 <= registers["Min_Position_Limit"] < registers["Max_Position_Limit"] <= 4095
+        ):
+            raise RuntimeError("Visible selected actual baseline identity/settings differ")
+        self.check_visible_current(robot, registers["Present_Current"], definition.current_cap_ma)
+
+    def verify_visible_active(self, robot):
+        definition = self._visible_definition(robot)
+        if definition is None or self.visible_settings is None:
+            raise RuntimeError("Visible active settings require their original baseline")
+        active, traces = self._visible_settings_read(robot)
+        self.visible_settings["active"] = active
+        before = self.visible_settings["before"]
+        original = {
+            "registers": {k: before["registers"][k] for k in self.VISIBLE_STATIC_REGISTERS},
+            "individual_bytes": before["individual_bytes"],
+        }
+        now = {
+            "registers": {k: active["registers"][k] for k in self.VISIBLE_STATIC_REGISTERS},
+            "individual_bytes": active["individual_bytes"],
+        }
+        self.visible_settings["unchanged"] = original == now
+        self.visible_settings["settings_sha256"] = hashlib.sha256(
+            json.dumps(original, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+        ).hexdigest()
+        self.emit(
+            {
+                "kind": "visible_settings",
+                "phase": "active",
+                **self.visible_settings["binding"],
+                "settings": copy.deepcopy(active),
+                "traces": traces,
+                "unchanged": self.visible_settings["unchanged"],
+            }
+        )
+        self.check_visible_current(robot, active["registers"]["Present_Current"], definition.current_cap_ma)
+        if not definition.settings_valid(self.visible_settings):
+            raise RuntimeError("Visible selected active settings changed or were unqualified")
+
+    def visible_control_proof(self, robot):
+        if self._visible_definition(robot) is None or self.visible_settings is None:
+            return None
+        proof = copy.deepcopy(self.visible_settings)
+        if len(json.dumps(proof, allow_nan=False, separators=(",", ":")).encode()) > 4096:
+            raise RuntimeError("Visible actual settings proof exceeds its bounded feedback frame")
+        return proof
+
+    def check_visible_current(self, robot, raw, ordinary_limit):
+        definition = self._visible_definition(robot)
+        if definition is None:
+            return
+        if type(raw) is not int or not _number(ordinary_limit) or ordinary_limit <= 0:
+            raise RuntimeError("Visible actual selected current is unavailable")
+        if abs(raw * 6.5) >= min(definition.current_cap_ma, ordinary_limit):
+            raise RuntimeError("Visible selected software effort ceiling reached")
 
     def deactivate(self, robot):
         self.context = None
@@ -78,13 +267,20 @@ class AM1SelectedJointEvidence:
         ):
             raise RuntimeError("Selected joint evidence differs from the established left ID3 mapping")
         metadata = action[MARKER]
-        if not isinstance(metadata, dict) or set(metadata) != CONTEXT_KEYS:
+        if not isinstance(metadata, dict):
             raise RuntimeError("Invalid selected joint evidence context keys")
-        profile, phase, cycle = metadata["profile"], metadata["phase"], metadata["cycle"]
+        profile, phase, cycle = metadata.get("profile"), metadata.get("phase"), metadata.get("cycle")
+        visible = self._visible_definition(robot)
+        visible_context = visible is not None and profile == visible.profile
+        expected_keys = (
+            CONTEXT_KEYS | {"acquisition_s", "admitted_reference"} if visible_context else CONTEXT_KEYS
+        )
+        if set(metadata) != expected_keys:
+            raise RuntimeError("Invalid selected joint evidence context keys")
         if (
             type(profile) is not str
             or type(phase) is not str
-            or phase not in PHASES
+            or phase not in (PHASES | {"acquire"} if visible_context else PHASES)
             or type(cycle) is not int
         ):
             raise RuntimeError("Invalid selected joint evidence profile/phase/cycle")
@@ -95,6 +291,7 @@ class AM1SelectedJointEvidence:
             from examples.alohamini.am1_session_contract import (
                 ELBOW_RECOVERY_DEFINITIONS,
                 LEFT_ELBOW_ORIGINAL_RETURN,
+                LEFT_ELBOW_POSITIVE_CONTROL,
                 LEFT_ELBOW_RESPONSE,
             )
 
@@ -103,6 +300,7 @@ class AM1SelectedJointEvidence:
                 for d in (
                     LEFT_ELBOW_RESPONSE,
                     LEFT_ELBOW_ORIGINAL_RETURN,
+                    LEFT_ELBOW_POSITIVE_CONTROL,
                     *ELBOW_RECOVERY_DEFINITIONS.values(),
                 )
             }
@@ -150,7 +348,17 @@ class AM1SelectedJointEvidence:
             raise RuntimeError("Selected joint evidence changed the original bounded endpoint")
         if not _number(cleaned.get(POSITION)) or float(cleaned[POSITION]) != requested:
             raise RuntimeError("Selected joint requested context differs from the incoming action")
-        if not min(reference, endpoint) - 1e-9 <= requested <= max(reference, endpoint) + 1e-9:
+        lower = (
+            min(reference, endpoint, metadata["admitted_reference"])
+            if visible_context
+            else min(reference, endpoint)
+        )
+        upper = (
+            max(reference, endpoint, metadata["admitted_reference"])
+            if visible_context
+            else max(reference, endpoint)
+        )
+        if not lower - 1e-9 <= requested <= upper + 1e-9:
             raise RuntimeError("Selected joint requested action exceeds its declared excursion")
         if signed is None and (
             (phase == "baseline" and cycle != 0)
@@ -176,8 +384,12 @@ class AM1SelectedJointEvidence:
             if phase in ("endpoint", "origin")
             else None
         )
-        if signed is not None and hasattr(signed, "integral"):
-            expected_key = signed.sample_key(progress)
+        if signed is not None and (hasattr(signed, "integral") or visible_context):
+            expected_key = (
+                signed.sample_key(progress, metadata["acquisition_s"])
+                if visible_context
+                else signed.sample_key(progress)
+            )
         if sample_key is not None and sample_key != expected_key:
             raise RuntimeError("Selected joint evidence sample key differs from its phase")
         for key in ("x.vel", "y.vel", "theta.vel", "lift_axis.vel"):
@@ -203,6 +415,9 @@ class AM1SelectedJointEvidence:
     def guard_recovery(self, robot, control, observation):
         """Bound the selected admission on every ordinary owner tick, including holds."""
         del observation
+        if getattr(robot, "_am1_visible_control_binding", None) is not None:
+            self.guard_visible(robot, control)
+            return
         binding = getattr(robot, "_am1_elbow_recovery_binding", None)
         if binding is None:
             return
@@ -280,6 +495,138 @@ class AM1SelectedJointEvidence:
                 max(self.recovery_peak, raw) if direction > 0 else min(self.recovery_peak, raw)
             )
 
+    def guard_visible(self, robot, control):
+        """Enforce the new finite probe on cached native reads, never another bus reader."""
+        definition = self._visible_definition(robot)
+        binding = getattr(robot, "_am1_visible_control_binding", None)
+        if (
+            definition is None
+            or control.binding is None
+            or binding != {**control.binding, "recipe": definition.recipe_name}
+            or not definition.settings_valid(self.visible_settings)
+        ):
+            raise RuntimeError("Visible actual read-only settings/owner binding is unavailable")
+        now = self.clock()
+        if self.visible_started_at is None and control.state in {"paused", "active"} and control.epoch >= 0:
+            self.visible_started_at = now
+        if self.visible_started_at is not None and now - self.visible_started_at >= definition.live_s:
+            raise RuntimeError("Visible 60-second native Live ceiling expired")
+        position = getattr(robot, "_am1_selected_joint_position", None)
+        current = getattr(robot, "_am1_selected_joint_current", None)
+        for cache in (position, current):
+            if (
+                not isinstance(cache, dict)
+                or not all(
+                    _number(cache.get(k))
+                    for k in ("read_started_at_monotonic_s", "read_completed_at_monotonic_s")
+                )
+                or not 0
+                <= cache["read_started_at_monotonic_s"]
+                <= cache["read_completed_at_monotonic_s"]
+                <= now
+                or now - cache["read_started_at_monotonic_s"] > 0.5
+            ):
+                raise RuntimeError("Visible native original position/current acquisition is unavailable")
+        if not _number(current.get("ma")) or current.get("ma") != current.get("raw", float("nan")) * 6.5:
+            raise RuntimeError("Visible actual selected current is unavailable")
+        self.check_visible_current(robot, current.get("raw"), getattr(robot, "_joint_current_limit_ma", 100))
+        raw, calibration = position.get("raw"), robot.left_bus.calibration[MOTOR]
+        registers = self.visible_settings["before"]["registers"]
+        low = max(calibration.range_min, registers["Min_Position_Limit"])
+        high = min(calibration.range_max, registers["Max_Position_Limit"])
+        if type(raw) is not int or not low <= raw <= high:
+            raise RuntimeError("Visible native position exceeds actual calibrated/raw limits")
+        if self.visible_initial_raw is None:
+            self.visible_initial_raw = raw
+        context = self.context
+        # Keep the original declared reference through pauses. Before declaration,
+        # the measured start supplies the envelope without moving any actuator.
+        reference = (
+            self.reference
+            if self.reference is not None
+            else context["reference"]
+            if context is not None
+            else robot_position(robot.left_bus, self.visible_initial_raw)
+        )
+        material = {
+            k: int(getattr(calibration, k)) for k in ("drive_mode", "homing_offset", "range_min", "range_max")
+        }
+        endpoints = [definition.encoded_goal(reference + delta, material) for delta in (-10, 10)]
+        if any(value is None for value in endpoints) or not max(low, min(endpoints)) <= raw <= min(
+            high, max(endpoints)
+        ):
+            raise RuntimeError("Visible native position left its frozen absolute excursion")
+        if context is None or control.state != "active":
+            return
+        direction = None
+        sign = -1 if robot.left_bus.apply_drive_mode and calibration.drive_mode else 1
+        phase = context["phase"]
+        if phase in {"outbound", "endpoint"}:
+            direction = sign
+        elif phase in {"return", "origin", "final"}:
+            direction = -sign
+        elif phase == "acquire" and context["reference"] != context["admitted_reference"]:
+            direction = sign * (1 if context["reference"] > context["admitted_reference"] else -1)
+        if direction is not None:
+            leg = (context["cycle"], direction)
+            if leg != self.visible_phase:
+                self.visible_phase, self.visible_peak = leg, raw
+            if direction * (raw - self.visible_peak) < -2:
+                raise RuntimeError("Visible native position reversed against its intended direction")
+            self.visible_peak = max(self.visible_peak, raw) if direction > 0 else min(self.visible_peak, raw)
+        action = getattr(robot, "_am1_selected_joint_action", None)
+        goal = action.get("expected_goal_raw") if isinstance(action, dict) else None
+        if type(goal) is not int:
+            return  # Cap, original clocks and absolute geometry still apply without an action trace.
+        if goal != self.visible_goal:
+            self.visible_goal = goal
+            self.visible_current_rows.clear()
+            self.visible_position_rows.clear()
+        point = (
+            position["read_completed_at_monotonic_s"],
+            current["read_completed_at_monotonic_s"],
+            raw,
+            abs(current["ma"]),
+        )
+        if not self.visible_position_rows or point[0] > self.visible_position_rows[-1][0]:
+            self.visible_position_rows.append(point)
+        errors = [item for item in self.visible_position_rows if item[2] != goal]
+        growing, start, previous, previous_time = 0, None, None, None
+        for item in errors:
+            error = item[2] - goal
+            if previous is not None and previous * error < 0:
+                if abs(error) > abs(previous):
+                    growing += 1
+                    if start is None:
+                        start = previous_time
+                else:
+                    growing, start = 0, None
+            previous, previous_time = error, item[0]
+            if growing >= 3 and abs(error) > 2 and start is not None and item[0] - start >= 0.2 - 1e-9:
+                raise RuntimeError("Visible native fixed-goal growing position instability")
+        if self.visible_current_rows and point[1] <= self.visible_current_rows[-1][1]:
+            return
+        if self.visible_current_rows and point[3] < self.visible_current_rows[-1][3]:
+            self.visible_current_rows.clear()  # Any chronological decrease breaks a rising candidate.
+        self.visible_current_rows.append(point)
+        if phase not in {"endpoint", "origin", "final"}:
+            return  # The predefined slow ramp is allowed before response appears.
+        for start in range(len(self.visible_current_rows)):
+            rows = list(self.visible_current_rows)[start:]
+            if (
+                len(rows) < 4
+                or rows[-1][0] - rows[0][0] < 0.2 - 1e-9
+                or rows[-1][1] - rows[0][1] < 0.2 - 1e-9
+            ):
+                continue
+            # Equal plateaus and positive substeps remain in chronological order.
+            selected, rises = rows[0][3], 0
+            for item in rows[1:]:
+                if item[3] - selected >= 6.5 - 1e-9:
+                    selected, rises = item[3], rises + 1
+            if rises >= 3 and max(item[2] for item in rows) - min(item[2] for item in rows) <= 2:
+                raise RuntimeError("Visible native static endpoint adverse current rise")
+
     @staticmethod
     def recovery_gain_proof(robot):
         """Expose bounded actual settings, keeping the durable write ledger private."""
@@ -350,6 +697,11 @@ class AM1SelectedJointEvidence:
             },
             "action": copy.deepcopy(getattr(robot, "_am1_selected_joint_action", None)),
             **(
+                {"visible_control": self.visible_control_proof(robot)}
+                if getattr(robot, "_am1_visible_control_binding", None) is not None
+                else {}
+            ),
+            **(
                 {"gain_trial": self.recovery_gain_proof(robot)}
                 if getattr(robot, "_am1_elbow_integral_trial", None) is not None
                 else {}
@@ -373,6 +725,9 @@ class AM1SelectedJointEvidence:
             "voltage_raw": "Present_Voltage",
             "temperature_c": "Present_Temperature",
         }
+        if self.visible_settings is not None:
+            names["acceleration_raw"] = "Acceleration"
+            names["lock"] = "Lock"
         result = {}
         for key, register in names.items():
             address, width = get_address(bus.model_ctrl_table, bus.motors[MOTOR].model, register)
@@ -479,6 +834,19 @@ class AM1SelectedJointEvidence:
             sparse["decoded"] = decoded
             if decoded["status"] != 0 or decoded["torque_enable"] != 1 or decoded["operating_mode"] != 0:
                 raise RuntimeError("Selected joint readback reported status/torque/mode fault")
+            if self.visible_settings is not None:
+                self.check_visible_current(
+                    robot, decoded["present_current_raw"], getattr(robot, "_joint_current_limit_ma", 100)
+                )
+                before = self.visible_settings["before"]["registers"]
+                fields = {
+                    "goal_time_raw": "Goal_Time",
+                    "goal_velocity_raw": "Goal_Velocity",
+                    "acceleration_raw": "Acceleration",
+                    "torque_limit_raw": "Torque_Limit",
+                }
+                if decoded["lock"] != 1 or any(decoded[k] != before[v] for k, v in fields.items()):
+                    raise RuntimeError("Visible live selected settings changed from their read-only baseline")
             sparse["diagnostic_available"] = True
             sparse["goal_matches_expected_raw"] = (
                 decoded["goal_position_raw"] == row["action"]["expected_goal_raw"]

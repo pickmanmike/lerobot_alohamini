@@ -1,19 +1,36 @@
 "use strict";
 // Remote fake mode never instantiates the legacy body input, owner restore or camera adapters.
 class AM1SessionTransport {
+  static outcomeText(run) {
+    const outcome=run?.execution?.positive_control;
+    if(run?.source!=="protected-physical-provider" || run.recipe!=="physical-left-elbow-positive-control" || run.status!=="completed" ||
+      outcome?.program_completed!==true || typeof outcome.coarse_functional_pass!=="boolean" || typeof outcome.fine_return_pass!=="boolean" ||
+      !Number.isInteger(outcome.final_return_residual_raw) || outcome.final_return_residual_raw<0)return null;
+    return `Diagnostic completed · coarse movement ${outcome.coarse_functional_pass ? "passed" : "not achieved"} · fine return ${outcome.fine_return_pass ? "passed" : "not achieved"} · final error ${outcome.final_return_residual_raw} raw ticks`;
+  }
   constructor(render) {
     this.render=render; this.snapshot=null; this.connected=false; this.csrf=null; this.device=null;
     this.control=false; this.controllerGeneration=null; this.connection=null; this.held=new Set();
     this.pending=new Map(); this.seq=0; this.socket=null; this.inputBusy=false; this.epoch=0; this.intent=0;
+    this.reportingError=null;
   }
   clear(reason="disconnected") {
     this.epoch++; this.intent++; this.held.clear(); this.connection=null; this.controllerGeneration=null; this.seq=0;
     for(const p of this.pending.values()) p.reject(Error(reason));
     this.pending.clear(); this.inputBusy=false;
   }
+  reportingFailure(value) {
+    this.reportingError=value;this.connected=false;this.clear(value.reason);
+    this.render(this,value.reason);
+  }
   async post(path,body) {
     const response=await fetch(`/api/${path}`,{method:"POST",headers:{"Content-Type":"application/json","X-AM1-CSRF":this.csrf || ""},body:JSON.stringify(body)});
     const result=await response.json();
+    if(result.status==="reporting_error") {
+      this.reportingFailure(result);
+      if(!response.ok) {const error=Error(result.reason);error.reportingError=result;throw error;}
+      return result;
+    }
     if(!response.ok) throw Error(result.reason || "Request refused");
     return result;
   }
@@ -37,6 +54,7 @@ class AM1SessionTransport {
         if(this.socket!==ws)return;
         const value=JSON.parse(event.data);
         if(value.kind==="snapshot") {
+          this.reportingError=null;
           const previous=this.snapshot?.run,next=value.snapshot.run;
           if(previous?.run_id!==next?.run_id || previous?.intent_revision!==next?.intent_revision) {
             this.intent++;this.held.clear();
@@ -50,7 +68,11 @@ class AM1SessionTransport {
           this.render(this);
         } else if(value.kind==="result") {
           const pending=this.pending.get(value.id);if(pending){this.pending.delete(value.id);pending.resolve(value);}
-        } else if(value.kind==="unavailable") {this.clear("owner unavailable");this.render(this,"Owner unavailable; inspect current status after reconnect.");}
+          if(value.status==="reporting_error")this.reportingFailure(value);
+        } else if(value.kind==="unavailable") {
+          if(value.status==="reporting_error")this.reportingFailure(value);
+          else {this.connected=false;this.clear("owner unavailable");this.render(this,"Owner unavailable; inspect current status after reconnect.");}
+        }
       };
       ws.onclose=()=> {
         if(this.socket!==ws)return;
@@ -85,11 +107,15 @@ class AM1SessionTransport {
     const generation=this.controllerGeneration;
     if(generation) return this.claim(generation);
   }
-  async start(recipe) {
+  async start(recipe,confirmationOf=null) {
     const payload={operation_id:crypto.randomUUID(),recipe,controller_generation:this.controllerGeneration};
+    if(confirmationOf!==null) {
+      if(recipe!=="physical-left-elbow-positive-control" || typeof confirmationOf!=="string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(confirmationOf))throw Error("Canonical positive-control confirmation UUID required");
+      payload.confirmation_of=confirmationOf;
+    }
     // Outcome-loss retry uses the same immutable operation identity, never a new Start.
     let result;
-    try {result=await this.post("start",payload);} catch {result=await this.post("start",payload);}
+    try {result=await this.post("start",payload);} catch(error) {if(error.reportingError)throw error;result=await this.post("start",payload);}
     this.render(this,result.reason);return result;
   }
   async protective(op) {
@@ -153,7 +179,7 @@ globalThis.AM1RemoteInitialize=function() {
     const terminal=run && ["stopped","completed","faulted","interrupted"].includes(run.status);
     document.querySelector("#live-countdown").textContent=priorTest ? `Prior ${priorKind} result · cleanup: ${run.cleanup || "unknown"}; physical Start required` :
       physical && run?.status==="finishing" ? "Physical finishing · measured cleanup pending; native Live countdown pending" :
-      physical && terminal ? `Physical session ended · cleanup: ${run.cleanup || "unknown"}` :
+      physical && terminal ? `${AM1SessionTransport.outcomeText(run) || "Physical session ended"} · cleanup: ${run.cleanup || "unknown"}` :
       physical && run && !Number.isFinite(run.native_live_at) ? "Physical startup · native Live countdown pending" :
       run ? `Original Live budget: ${Math.ceil(run.remaining_s || 0)} s remaining` : physical ? "No physical run · Start required" : "No fake run";
     const evidence=transport.snapshot?.evidence;

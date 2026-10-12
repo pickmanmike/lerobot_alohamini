@@ -17,6 +17,7 @@
 import json
 import logging
 import math
+import os
 import sys
 import time
 from collections.abc import Callable
@@ -476,7 +477,7 @@ class AlohaMini(Robot):
         # Aloha Mini 1's established motor Phase must remain untouched, so apply the
         # same runtime delay/acceleration profile explicitly without reading or writing Phase.
         for name in bus.motors:
-            if bus is getattr(self, "left_bus", None) and name == RECOVERY_ELBOW and getattr(self, "_am1_elbow_integral_trial", None) is not None:
+            if bus is getattr(self, "left_bus", None) and name == RECOVERY_ELBOW and (getattr(self, "_am1_elbow_integral_trial", None) is not None or getattr(self, "_am1_visible_control_binding", None) is not None):
                 continue  # The selected trial preserves its actual baseline settings.
             write_register(bus, "Return_Delay_Time", name, 0)
             write_register(bus, "Maximum_Acceleration", name, 254)
@@ -484,6 +485,14 @@ class AlohaMini(Robot):
 
     def configure(self) -> None:
         """Configure motor modes and gains while leaving all torque disabled."""
+        visible = getattr(self, "_am1_visible_control_evidence", None)
+        visible_binding = getattr(self, "_am1_visible_control_binding", None)
+        if visible_binding is not None:
+            if (visible is None or AM1ElbowIntegralTrial.requested_integral() is not None
+                or getattr(self, "_am1_elbow_integral_trial", None) is not None
+                or os.environ.get("AM1_SHOULDER_INTEGRAL_TEST") == "1"):
+                raise RuntimeError("Visible control requires read-only I0 settings without an integral trial")
+            visible.prepare_visible(self, visible_binding)
         previous_elbow = getattr(self, "_am1_elbow_integral_trial", None)
         if previous_elbow is not None:
             previous_elbow.restore(self)
@@ -502,7 +511,7 @@ class AlohaMini(Robot):
             previous_trial.restore(self)
         self._configure_bus_defaults(self.left_bus)
         for name in self.left_arm_motors:
-            if elbow_trial is not None and name == RECOVERY_ELBOW:
+            if name == RECOVERY_ELBOW and (elbow_trial is not None or visible_binding is not None):
                 continue
             write_register(self.left_bus, "Operating_Mode", name, OperatingMode.POSITION.value)
             # Preserve the existing Aloha Mini follower-arm PID profile.
@@ -760,6 +769,9 @@ class AlohaMini(Robot):
             elbow_trial = getattr(self, "_am1_elbow_integral_trial", None)
             if elbow_trial is not None:
                 elbow_trial.verify_active(self)
+            visible = getattr(self, "_am1_visible_control_evidence", None)
+            if getattr(self, "_am1_visible_control_binding", None) is not None:
+                visible.verify_visible_active(self)
         except BaseException as error:
             cleanup_errors = self._safe_shutdown(close_buses=True, recover_interrupted_bus_io=True)
             if isinstance(error, (KeyboardInterrupt, SystemExit)):
@@ -1647,6 +1659,7 @@ class AlohaMini(Robot):
         return bool(
             getattr(self, "_am1_selected_joint_evidence_enabled", False)
             and (getattr(self, "_am1_selected_joint_evidence_context", None) is not None
+                 or getattr(self, "_am1_visible_control_binding", None) is not None
                  or (getattr(self, "_am1_elbow_integral_trial", None) is not None
                      and self._am1_elbow_integral_trial.restore_required))
             and getattr(self.config, "robot_model", None) == "alohamini1"
@@ -1666,6 +1679,9 @@ class AlohaMini(Robot):
                 "read_started_at_monotonic_s": selected_started,
                 "read_completed_at_monotonic_s": time.monotonic(),
             }
+            visible = getattr(self, "_am1_visible_control_evidence", None)
+            if getattr(self, "_am1_visible_control_binding", None) is not None:
+                visible.check_visible_current(self, raw, float(limit_ma))
             elbow_trial = getattr(self, "_am1_elbow_integral_trial", None)
             if elbow_trial is not None and elbow_trial.restore_required:
                 elbow_trial.check_current(raw, float(limit_ma))

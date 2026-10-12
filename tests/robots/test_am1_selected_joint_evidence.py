@@ -120,13 +120,33 @@ def observe(obj, control):
     return observation
 
 
-def group_payload(*, goal=2000, present=2000, current=2, torque=1, mode=0, servo_status=0):
+def group_payload(
+    *,
+    goal=2000,
+    present=2000,
+    current=2,
+    torque=1,
+    mode=0,
+    servo_status=0,
+    goal_time=123,
+    goal_velocity=32775,
+    acceleration=0,
+    lock=0,
+):
     data = bytearray(38)
-    data[0], data[7], data[29], data[30], data[32] = mode, torque, 119, 30, servo_status
+    data[0], data[7], data[8], data[22], data[29], data[30], data[32] = (
+        mode,
+        torque,
+        acceleration,
+        lock,
+        119,
+        30,
+        servo_status,
+    )
     for address, value in (
         (42, goal),
-        (44, 123),
-        (46, 32775),
+        (44, goal_time),
+        (46, goal_velocity),
         (48, 1000),
         (56, present),
         (60, 1027),
@@ -487,3 +507,485 @@ def test_optional_sparse_coverage_refuses_ordinary_samples_older_than_half_secon
     assert sparse["diagnostic_available"] is False
     assert sparse["unavailable_reason"] == "ordinary selected acquisition unavailable"
     assert control.state == "active" and control.accepted_action_sequence == 1
+
+
+def visible_identity():
+    return {**binding(), "recipe": "physical-left-elbow-positive-control"}
+
+
+def visible_register_packet(
+    *,
+    torque=0,
+    integral=0,
+    mode=0,
+    goal=2000,
+    present=2000,
+    current=0,
+    acceleration=77,
+    range_min=1000,
+    range_max=3000,
+):
+    data = bytearray(71)
+    fields = {
+        0: (3, 1),
+        1: (10, 1),
+        3: (777, 2),
+        5: (3, 1),
+        7: (6, 1),
+        9: (range_min, 2),
+        11: (range_max, 2),
+        18: (17, 1),
+        21: (16, 1),
+        22: (32, 1),
+        23: (integral, 1),
+        24: (16, 1),
+        25: (0, 1),
+        31: (1845, 2),
+        33: (mode, 1),
+        40: (torque, 1),
+        41: (acceleration, 1),
+        42: (goal, 2),
+        44: (0, 2),
+        46: (0, 2),
+        48: (1000, 2),
+        55: (torque, 1),
+        56: (present, 2),
+        62: (119, 1),
+        63: (30, 1),
+        65: (0, 1),
+        69: (current, 2),
+    }
+    for address, (value, width) in fields.items():
+        data[address : address + width] = value.to_bytes(width, "little")
+    return bytes(data)
+
+
+def visible_robot(monkeypatch, packets=()):
+    obj, reads, writes = robot(monkeypatch)
+    evidence, rows = sampler()
+    identity = visible_identity()
+    obj._am1_visible_control_binding = identity
+    obj._am1_visible_control_evidence = evidence
+    port = attach_port(obj, packets)
+    return obj, evidence, rows, identity, port, reads, writes
+
+
+def test_visible_readonly_settings_proof_keeps_actual_85_and_packets(monkeypatch):
+    obj, evidence, rows, ident, port, reads, writes = visible_robot(
+        monkeypatch,
+        [
+            status(visible_register_packet(), motor_id=3),
+            status(bytes([91]), motor_id=3),
+            status(visible_register_packet(torque=1), motor_id=3),
+            status(bytes([91]), motor_id=3),
+        ],
+    )
+    assert callable(getattr(evidence, "prepare_visible", None)), (
+        "Visible04 pre-configure read-only proof missing"
+    )
+    evidence.prepare_visible(obj, ident)
+    evidence.verify_visible_active(obj)
+    proof = evidence.visible_control_proof(obj)
+    assert proof["binding"] == ident and proof["unchanged"] is True
+    assert proof["before"]["registers"]["I_Coefficient"] == proof["active"]["registers"]["I_Coefficient"] == 0
+    assert (
+        proof["before"]["registers"]["Maximum_Acceleration"]
+        == proof["active"]["registers"]["Maximum_Acceleration"]
+        == 91
+    )
+    assert proof["before"]["registers"]["Acceleration"] == 77
+    assert proof["before"]["individual_bytes"] == {"24": 16, "25": 0}
+    assert [(p[5], p[6], p[7]) for p in port.writes] == [(0, 71, 3), (85, 1, 3), (0, 71, 3), (85, 1, 3)]
+    assert not reads and not writes
+    assert len(json.dumps(proof)) < 4096
+    assert len(rows) == 2 and all(row["kind"] == "visible_settings" for row in rows)
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "integral",
+        "mode",
+        "foreign_binding",
+        "timeout",
+        "changed_acceleration",
+        "changed_max_acceleration",
+        "current_cap",
+    ],
+)
+def test_visible_settings_mismatch_never_becomes_qualified(monkeypatch, bad):
+    before = visible_register_packet(integral=1 if bad == "integral" else 0, mode=1 if bad == "mode" else 0)
+    active = visible_register_packet(
+        torque=1,
+        acceleration=78 if bad == "changed_acceleration" else 77,
+        current=16 if bad == "current_cap" else 0,
+    )
+    packets = [
+        status(before, motor_id=3),
+        status(bytes([91]), motor_id=3),
+        status(active, motor_id=3),
+        status(bytes([92 if bad == "changed_max_acceleration" else 91]), motor_id=3),
+    ]
+    if bad == "timeout":
+        packets = [b""]
+    obj, evidence, rows, ident, port, reads, writes = visible_robot(monkeypatch, packets)
+    if bad == "foreign_binding":
+        ident = dict(ident, run_id=str(uuid4()))
+    assert callable(getattr(evidence, "prepare_visible", None)), (
+        "Visible04 pre-configure read-only proof missing"
+    )
+    with pytest.raises((RuntimeError, ValueError)):
+        evidence.prepare_visible(obj, ident)
+        evidence.verify_visible_active(obj)
+    assert not reads and not writes
+
+
+def test_visible_host_recipe_binding_has_no_integral_trial(monkeypatch):
+    monkeypatch.setenv("AM1_VISIBLE_CONTROL_RECIPE", "physical-left-elbow-positive-control")
+    monkeypatch.setenv("AM1_SCRIPTED_PREPARE", "1")
+    monkeypatch.setenv("AM1_SELECTED_JOINT_EVIDENCE", "1")
+    args = SimpleNamespace(
+        robot_model="alohamini1",
+        no_follower=False,
+        no_cameras=True,
+        am1_run_id=str(uuid4()),
+        am1_host_incarnation=str(uuid4()),
+        am1_protected_run_directory="/private/run",
+    )
+    assert callable(getattr(host, "visible_control_binding", None)), "Visible04 exact recipe binding missing"
+    actual = host.visible_control_binding(args)
+    assert actual == {
+        "run_id": args.am1_run_id,
+        "host_incarnation": args.am1_host_incarnation,
+        "recipe": "physical-left-elbow-positive-control",
+    }
+    monkeypatch.setenv("AM1_ELBOW_RECOVERY", "I1")
+    with pytest.raises(ValueError):
+        host.visible_control_binding(args)
+
+
+def test_visible_cache_is_continuous_before_diagnostic_context(monkeypatch):
+    obj, reads, writes = robot(monkeypatch)
+    obj._am1_visible_control_binding = visible_identity()
+    obj._am1_visible_control_evidence = sampler()[0]
+    obj.get_observation()
+    assert getattr(obj, "_am1_selected_joint_position", None) is not None
+    assert getattr(obj, "_am1_selected_joint_current", None) is not None
+
+
+def visible_guard(monkeypatch, *, current_raw=0, initial_raw=2000, range_min=1000, range_max=3000):
+    obj, evidence, rows, ident, port, reads, writes = visible_robot(
+        monkeypatch,
+        [
+            status(
+                visible_register_packet(
+                    present=initial_raw, goal=initial_raw, range_min=range_min, range_max=range_max
+                ),
+                motor_id=3,
+            ),
+            status(bytes([91]), motor_id=3),
+            status(
+                visible_register_packet(
+                    torque=1, present=initial_raw, goal=initial_raw, range_min=range_min, range_max=range_max
+                ),
+                motor_id=3,
+            ),
+            status(bytes([91]), motor_id=3),
+        ],
+    )
+    obj.left_bus.calibration[ELBOW].range_min = range_min
+    obj.left_bus.calibration[ELBOW].range_max = range_max
+    clock = [1.0]
+    evidence.clock = lambda: clock[0]
+    evidence.prepare_visible(obj, ident)
+    evidence.verify_visible_active(obj)
+    control = SimpleNamespace(
+        binding={k: ident[k] for k in ("run_id", "host_incarnation")}, state="paused", epoch=1
+    )
+
+    def sample(raw=initial_raw, current=current_raw):
+        obj._am1_selected_joint_position = {
+            "raw": raw,
+            "read_started_at_monotonic_s": clock[0] - 0.01,
+            "read_completed_at_monotonic_s": clock[0],
+        }
+        obj._am1_selected_joint_current = {
+            "raw": current,
+            "ma": current * 6.5,
+            "read_started_at_monotonic_s": clock[0] - 0.01,
+            "read_completed_at_monotonic_s": clock[0],
+        }
+
+    sample()
+    return obj, evidence, control, clock, sample, port
+
+
+def test_visible_native_paused_cap_has_no_extra_bus_read(monkeypatch):
+    obj, evidence, control, clock, sample, port = visible_guard(monkeypatch, current_raw=16)
+    assert callable(getattr(evidence, "guard_visible", None)), "Visible04 native guard missing"
+    count = len(port.writes)
+    with pytest.raises(RuntimeError, match="effort"):
+        evidence.guard_recovery(obj, control, {})
+    assert len(port.writes) == count
+
+
+def test_visible_native_live_deadline_and_first_clock_do_not_reset(monkeypatch):
+    obj, evidence, control, clock, sample, port = visible_guard(monkeypatch)
+    assert callable(getattr(evidence, "guard_visible", None)), "Visible04 native guard missing"
+    evidence.guard_recovery(obj, control, {})
+    obj._am1_selected_joint_current["read_started_at_monotonic_s"] = 0.1
+    with pytest.raises(RuntimeError, match="acquisition"):
+        evidence.guard_recovery(obj, control, {})
+    clock[0] = 61
+    sample()
+    with pytest.raises(RuntimeError, match="60-second"):
+        evidence.guard_recovery(obj, control, {})
+
+
+def test_visible_wrong_direction_stays_enforced_during_changing_ramp_goals(monkeypatch):
+    obj, evidence, control, clock, sample, port = visible_guard(monkeypatch)
+    assert callable(getattr(evidence, "guard_visible", None)), "Visible04 native guard missing"
+    evidence.guard_recovery(obj, control, {})
+    control.state = "active"
+    evidence.context = {
+        "phase": "outbound",
+        "cycle": 1,
+        "reference": 0.0,
+        "endpoint_target": 10.0,
+        "admitted_reference": 0.0,
+    }
+    obj._am1_selected_joint_action = {"expected_goal_raw": 2005}
+    clock[0] = 1.1
+    sample(2005)
+    evidence.guard_recovery(obj, control, {})
+    obj._am1_selected_joint_action = {"expected_goal_raw": 2006}
+    clock[0] = 1.2
+    sample(2002)
+    with pytest.raises(RuntimeError, match="direction"):
+        evidence.guard_recovery(obj, control, {})
+
+
+@pytest.mark.parametrize(
+    "currents,refused", [([0, 1, 2, 3], True), ([0, 1, 0, 2, 0, 3], False), ([0, 1, 1, 2, 2, 3], True)]
+)
+def test_visible_static_endpoint_actual_current_rise_has_chronological_drop_reset(
+    monkeypatch, currents, refused
+):
+    obj, evidence, control, clock, sample, port = visible_guard(monkeypatch)
+    assert callable(getattr(evidence, "guard_visible", None)), "Visible04 native guard missing"
+    evidence.guard_recovery(obj, control, {})
+    control.state = "active"
+    evidence.context = {
+        "phase": "endpoint",
+        "cycle": 1,
+        "reference": 0.0,
+        "endpoint_target": 10.0,
+        "admitted_reference": 0.0,
+    }
+    obj._am1_selected_joint_action = {"expected_goal_raw": 2100}
+
+    def run():
+        for current in currents:
+            clock[0] += 0.1
+            sample(2000, current)
+            evidence.guard_recovery(obj, control, {})
+
+    if refused:
+        with pytest.raises(RuntimeError, match="adverse"):
+            run()
+    else:
+        run()
+
+
+def test_visible_fixed_goal_growing_crossings_are_native_instability(monkeypatch):
+    obj, evidence, control, clock, sample, port = visible_guard(monkeypatch)
+    evidence.guard_recovery(obj, control, {})
+    control.state = "active"
+    evidence.context = {
+        "phase": "baseline",
+        "cycle": 0,
+        "reference": 0.0,
+        "endpoint_target": 10.0,
+        "admitted_reference": 0.0,
+    }
+    obj._am1_selected_joint_action = {"expected_goal_raw": 2000}
+    with pytest.raises(RuntimeError, match="instability"):
+        for raw in [2001, 1998, 2003, 1996]:
+            clock[0] += 0.1
+            sample(raw)
+            evidence.guard_recovery(obj, control, {})
+
+
+def test_visible_planned_goal_changes_do_not_count_as_growing_crossings(monkeypatch):
+    obj, evidence, control, clock, sample, port = visible_guard(monkeypatch)
+    evidence.guard_recovery(obj, control, {})
+    control.state = "active"
+    evidence.context = {
+        "phase": "outbound",
+        "cycle": 1,
+        "reference": 0.0,
+        "endpoint_target": 10.0,
+        "admitted_reference": 0.0,
+    }
+    for raw, goal in [(2000, 2001), (2005, 2003), (2006, 2009), (2013, 2009)]:
+        obj._am1_selected_joint_action = {"expected_goal_raw": goal}
+        clock[0] += 0.1
+        sample(raw)
+        evidence.guard_recovery(obj, control, {})
+
+
+def test_visible_configure_skips_only_actual_selected_settings(monkeypatch):
+    obj, evidence, rows, ident, port, reads, writes = visible_robot(
+        monkeypatch, [status(visible_register_packet(), motor_id=3), status(bytes([91]), motor_id=3)]
+    )
+    events = []
+    monkeypatch.setattr(
+        obj.left_bus,
+        "write",
+        lambda register, motor, value, **kwargs: events.append((register, motor, value)),
+    )
+    obj.lift.configure = lambda **kwargs: None
+    obj.configure()
+    immutable = set(evidence.VISIBLE_STATIC_REGISTERS) | {"Minimum_Startup_Force"}
+    assert not [row for row in events if row[1] == ELBOW and row[0] in immutable]
+    assert ("Torque_Enable", ELBOW, 0) in events and ("Lock", ELBOW, 0) in events
+    assert ("Maximum_Acceleration", "base_left_wheel", 254) in events
+    assert evidence.visible_settings["before"]["registers"]["Maximum_Acceleration"] == 91
+    assert evidence.visible_settings["before"]["registers"]["Acceleration"] == 77
+    assert getattr(obj, "_am1_elbow_integral_trial", None) is None
+
+
+@pytest.mark.parametrize("acquisition,admitted", [(0, 0.0), (2, -1.0)])
+def test_visible_exact_context_and_final_sparse_key_reuse_three_owner_reads(
+    monkeypatch, acquisition, admitted
+):
+    from examples.alohamini.am1_session_contract import LEFT_ELBOW_POSITIVE_CONTROL
+
+    definition = LEFT_ELBOW_POSITIVE_CONTROL
+
+    packets = [
+        status(visible_register_packet(), motor_id=3),
+        status(bytes([91]), motor_id=3),
+        status(visible_register_packet(torque=1), motor_id=3),
+        status(bytes([91]), motor_id=3),
+    ]
+    for goal in (2000, 2100, 2000):
+        packets.append(
+            status(
+                group_payload(goal=goal, current=0, goal_time=0, goal_velocity=0, acceleration=77, lock=1),
+                motor_id=3,
+            )
+        )
+    obj, evidence, rows, ident, port, reads, writes = visible_robot(monkeypatch, packets)
+    evidence.prepare_visible(obj, ident)
+    evidence.verify_visible_active(obj)
+    identity = {k: ident[k] for k in ("run_id", "host_incarnation")}
+    control = host.AM1LocalControl(**identity, selected_evidence=evidence)
+    for sequence, t in enumerate(
+        (acquisition, acquisition + 13.0, acquisition + 25.0, acquisition + 27.8), 1
+    ):
+        cycle, phase, fraction = definition.phase(t, acquisition)
+        c = context(
+            profile=definition.profile,
+            progress_s=t,
+            phase=phase,
+            cycle=cycle,
+            reference=0.0,
+            endpoint_target=10.0,
+            requested_target=10 * fraction,
+            sample_key=definition.sample_key(t, acquisition),
+            acquisition_s=acquisition,
+            admitted_reference=admitted,
+        )
+        assert control.apply(obj, command(identity, c, sequence=sequence))
+        observation = observe(obj, control)
+        evidence.publish(obj, control, observation)
+        assert (
+            observation[host.AM1_LOCAL_FEEDBACK_KEY]["selected_joint"]["visible_control"]["unchanged"] is True
+        )
+        evidence.report(obj, control, observation)
+    probes = [row for row in rows if row["kind"] == "sparse_readback"]
+    assert [row["sample_key"] for row in probes] == ["baseline", "cycle1_endpoint", "cycle1_origin"]
+    assert probes[-1]["context"]["phase"] == "final" and len(port.writes) == 7
+    assert all(row["decoded"]["acceleration_raw"] == 77 for row in probes)
+    assert all(row["action"]["write_acknowledged"] is False for row in probes)
+
+
+@pytest.mark.parametrize("bad", ["no_cameras", "recipe", "uuid", "shoulder"])
+def test_visible_malformed_or_gain_admission_is_refused_before_owner(monkeypatch, bad):
+    monkeypatch.setenv("AM1_VISIBLE_CONTROL_RECIPE", "physical-left-elbow-positive-control")
+    monkeypatch.setenv("AM1_SCRIPTED_PREPARE", "1")
+    monkeypatch.setenv("AM1_SELECTED_JOINT_EVIDENCE", "1")
+    a = SimpleNamespace(
+        robot_model="alohamini1",
+        no_follower=False,
+        no_cameras=True,
+        am1_run_id=str(uuid4()),
+        am1_host_incarnation=str(uuid4()),
+        am1_protected_run_directory="/private",
+    )
+    if bad == "no_cameras":
+        a.no_cameras = False
+    elif bad == "recipe":
+        monkeypatch.setenv("AM1_VISIBLE_CONTROL_RECIPE", "physical-left-elbow-recovery-i1")
+    elif bad == "uuid":
+        a.am1_run_id = "not-a-uuid"
+    else:
+        monkeypatch.setenv("AM1_SHOULDER_INTEGRAL_TEST", "1")
+    with pytest.raises(ValueError):
+        host.visible_control_binding(a)
+
+
+def test_visible_absolute_envelope_uses_actual_encoder_endpoints(monkeypatch):
+    from examples.alohamini.am1_session_contract import LEFT_ELBOW_POSITIVE_CONTROL
+
+    definition = LEFT_ELBOW_POSITIVE_CONTROL
+
+    obj, evidence, control, clock, sample, port = visible_guard(
+        monkeypatch, initial_raw=1224, range_min=864, range_max=3073
+    )
+    calibration = {
+        k: int(getattr(obj.left_bus.calibration[ELBOW], k))
+        for k in ("drive_mode", "homing_offset", "range_min", "range_max")
+    }
+    q0 = obj._normalize_arm_feedback(obj.left_bus, {ELBOW: 1224})[ELBOW]
+    _, actual = obj._encode_am1_arm_goals(obj.left_bus, {KEY: q0 + 10}, {ELBOW: 1224})
+    assert definition.encoded_goal(q0, calibration) == 1223
+    assert definition.encoded_goal(q0 + 10, calibration) == actual[ELBOW] == 1334
+    evidence.reference = q0
+    evidence.context = {
+        "phase": "outbound",
+        "cycle": 1,
+        "reference": q0,
+        "endpoint_target": q0 + 10,
+        "admitted_reference": q0,
+    }
+    evidence.guard_recovery(obj, control, {})
+    count = len(port.writes)
+    clock[0] = 1.1
+    sample(actual[ELBOW])
+    evidence.guard_recovery(obj, control, {})
+    clock[0] = 1.2
+    sample(actual[ELBOW] + 1)
+    with pytest.raises(RuntimeError, match="absolute excursion"):
+        evidence.guard_recovery(obj, control, {})
+    assert len(port.writes) == count
+
+
+def test_visible_pause_never_recenters_confirmation_absolute_reference(monkeypatch):
+    obj, evidence, control, clock, sample, port = visible_guard(monkeypatch, initial_raw=2020)
+    evidence.reference = 0.0
+    evidence.context = {
+        "phase": "acquire",
+        "cycle": 0,
+        "reference": 0.0,
+        "endpoint_target": 10.0,
+        "admitted_reference": 2.0,
+    }
+    evidence.guard_recovery(obj, control, {})
+    evidence.deactivate(obj)
+    assert evidence.context is None and evidence.reference == 0.0
+    clock[0] = 1.1
+    sample(2110)
+    with pytest.raises(RuntimeError, match="absolute excursion"):
+        evidence.guard_recovery(obj, control, {})

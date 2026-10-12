@@ -979,6 +979,28 @@ def _validate_host_arguments(args):
         )
 
 
+
+def visible_control_binding(args):
+    """Only the explicit protected Visible04 recipe enables read-only I0 control."""
+    recipe = os.environ.get("AM1_VISIBLE_CONTROL_RECIPE")
+    if recipe is None:
+        return None
+    from examples.alohamini.am1_session_contract import LEFT_ELBOW_POSITIVE_CONTROL, uuid_text
+
+    if (recipe != LEFT_ELBOW_POSITIVE_CONTROL.recipe_name
+        or os.environ.get("AM1_SCRIPTED_PREPARE") != "1"
+        or os.environ.get("AM1_SELECTED_JOINT_EVIDENCE") != "1"
+        or os.environ.get("AM1_ELBOW_RECOVERY") is not None
+        or os.environ.get("AM1_ELBOW_RECOVERY_RECIPE") is not None
+        or os.environ.get("AM1_SHOULDER_INTEGRAL_TEST") == "1"
+        or args.robot_model != "alohamini1" or args.no_follower or not getattr(args,"no_cameras",False)
+        or not getattr(args, "am1_protected_run_directory", None)
+        or uuid_text(args.am1_run_id) != args.am1_run_id
+        or uuid_text(args.am1_host_incarnation) != args.am1_host_incarnation):
+        raise ValueError("Visible control requires its exact protected recipe and read-only I0 owner")
+    return {"run_id":args.am1_run_id,"host_incarnation":args.am1_host_incarnation,"recipe":recipe}
+
+
 def elbow_recovery_binding(args):
     """Only a reviewed protected recipe can select the owner-scoped ID3 trial."""
     integral = os.environ.get("AM1_ELBOW_RECOVERY")
@@ -1005,6 +1027,7 @@ def elbow_recovery_binding(args):
 
 def _run_host(args):
     _validate_host_arguments(args)
+    visible_binding = visible_control_binding(args)
     recovery_binding = elbow_recovery_binding(args)
 
     logging.info("Configuring AlohaMini")
@@ -1028,6 +1051,9 @@ def _run_host(args):
     robot._am1_selected_joint_evidence_enabled = selected_evidence.enabled
     if recovery_binding is not None:
         robot._am1_elbow_recovery_binding = recovery_binding
+    if visible_binding is not None:
+        robot._am1_visible_control_binding = visible_binding
+        robot._am1_visible_control_evidence = selected_evidence
 
     if args.lift_relief:
         from .lift_relief import run_lift_relief

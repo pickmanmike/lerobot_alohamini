@@ -12,12 +12,14 @@ if __package__:
     from .am1_session_contract import (
         ELBOW_RECOVERY_DEFINITIONS,
         LEFT_ELBOW_ORIGINAL_RETURN,
+        LEFT_ELBOW_POSITIVE_CONTROL,
         LEFT_ELBOW_RESPONSE,
     )
 else:
     from am1_session_contract import (
         ELBOW_RECOVERY_DEFINITIONS,
         LEFT_ELBOW_ORIGINAL_RETURN,
+        LEFT_ELBOW_POSITIVE_CONTROL,
         LEFT_ELBOW_RESPONSE,
     )
 
@@ -647,6 +649,284 @@ class LeftElbowResponseCharacterizeInput(ScriptedLeaderInput):
         for phase in ("origin", "endpoint"):
             cycle = self.diagnostic_context["cycle"]
             self._phase_samples.pop((cycle, phase), None)
+
+
+class LeftElbowPositiveControlInput(LeftElbowResponseCharacterizeInput):
+    """One baseline I0 out/back waveform; precision is a reported outcome."""
+
+    motion_profile = LEFT_ELBOW_POSITIVE_CONTROL.profile
+    selected_joint = LEFT_ELBOW_POSITIVE_CONTROL.joint
+    definition = LEFT_ELBOW_POSITIVE_CONTROL
+
+    def __init__(self, *args, positive_comparator=None, **kwargs):
+        self._positive_comparator = copy.deepcopy(positive_comparator)
+        super().__init__(*args, **kwargs)
+
+    def _selected_plan(self):
+        self._admission_reference = dict(self.origin)
+        self._admitted_reference = self.origin[self.selected_joint]
+        prior = self._positive_comparator
+        self._reference = self._admitted_reference if prior is None else prior["reference_normalized"]
+        self._acquisition_s = 0.0 if prior is None else 2.0
+        if (not self._number(self._reference) or abs(self._reference - self._admitted_reference) > 2):
+            raise ValueError("positive confirmation acquisition exceeds two units")
+        if not -100 <= self._reference - 10 <= self._reference + 10 <= 100:
+            raise ValueError("positive control full absolute corridor unavailable")
+        if prior is not None:
+            previous_seed = prior.get("original_seed")
+            if not isinstance(previous_seed,dict) or set(previous_seed) != set(self.origin) or any(
+                not self._number(v) or abs(self.origin[k]-v) > 1 for k,v in previous_seed.items() if k != self.selected_joint
+            ):
+                raise ValueError("positive confirmation held-joint admission differs from prior conditions")
+            if __package__:
+                from .am1_session_contract import uuid_text
+            else:
+                from am1_session_contract import uuid_text
+            if uuid_text(prior["run_id"]) != prior["run_id"]:
+                raise ValueError("positive confirmation prior identity invalid")
+        self.origin[self.selected_joint] = self._reference
+        self.targets = dict(self.origin, **{self.selected_joint:self._reference + 10})
+        self.duration_s = 28 + self._acquisition_s
+        self._initialize_selected_feedback()
+        self._visible_settings = None
+        self._positive_outcome = None
+        self._coverage = {}
+        self._measured_origin_raw = self._measured_origin_proof = self._admission_origin_proof = None
+        self._baseline_anchor_proof = self._baseline_window = self._outward_anchor_raw = None
+        self._baseline_closed = False
+        self._endpoint_proofs=[]
+        self._endpoint_window=self._endpoint_anchor_proof=self._endpoint_peak_proof=self._first_return_proof=None
+        self._tracking = {}
+        self._record("am1_scripted_positive_plan", reference=dict(self.origin),
+                     admitted_reference=self._admitted_reference, acquisition_s=self._acquisition_s,
+                     ramp_s=10, endpoint_hold_s=2, origin_hold_s=2, final_hold_s=2,
+                     live_ceiling_s=60, current_cap_ma=100, settings="read-only P16/I0/D32")
+
+    @property
+    def diagnostic_context(self):
+        cycle, phase, _ = self.definition.phase(self.elapsed_s, self._acquisition_s)
+        return {"profile":self.motion_profile, "progress_s":self.elapsed_s, "phase":phase, "cycle":cycle,
+                "reference":self._reference, "endpoint_target":self._reference + 10,
+                "requested_target":self._action[self.selected_joint],
+                "sample_key":self.definition.sample_key(self.elapsed_s, self._acquisition_s),
+                "acquisition_s":self._acquisition_s, "admitted_reference":self._admitted_reference}
+
+    def _position(self):
+        _, phase, fraction = self.definition.phase(self.elapsed_s, self._acquisition_s)
+        if phase == "acquire":
+            requested = self._admitted_reference + (self._reference - self._admitted_reference) * self.elapsed_s / 2
+            fraction = (requested - self._reference) / 10
+        return (None if phase in {"baseline", "origin", "final"} else self.joint_keys.index(self.selected_joint),
+                phase, fraction)
+
+    @property
+    def positive_control(self):
+        if self._positive_outcome is not None:
+            return copy.deepcopy(self._positive_outcome)
+        return {"program_completed":False, "coarse_functional_pass":False,
+                "reference_normalized":self._reference, "admitted_reference":self._admitted_reference,
+                "acquisition_s":self._acquisition_s,
+                "confirmation_of":None if self._positive_comparator is None else self._positive_comparator["run_id"]}
+
+    def _feedback(self, now, observed, feedback):
+        current = feedback.get("current") if isinstance(feedback, dict) else None
+        if not isinstance(current, dict) or not self._number(current.get("ma")) or abs(current["ma"]) >= 100:
+            raise ValueError("positive control sampled current reached 100 mA or is unavailable")
+        proof = feedback.get("visible_control")
+        if not self.definition.settings_valid(proof, feedback.get("run_id"), feedback.get("host_incarnation")):
+            raise ValueError("positive control actual unchanged I0 settings proof unavailable")
+        if self._visible_settings is not None and proof != self._visible_settings:
+            raise ValueError("positive control immutable settings proof changed")
+        context = feedback.get("context", {})
+        if context.get("acquisition_s") != self._acquisition_s or context.get("admitted_reference") != self._admitted_reference:
+            raise ValueError("positive control acquisition reference changed")
+        super()._feedback(now, observed, feedback)
+        calibration = self._motor["calibration"]
+        registers = proof["active"]["registers"]
+        if (not 0 <= registers["Min_Position_Limit"] < registers["Max_Position_Limit"] <= 4095
+                or self.definition.encoded_goal(self._reference-10,calibration) < registers["Min_Position_Limit"]
+                or self.definition.encoded_goal(self._reference+10,calibration) > registers["Max_Position_Limit"]
+                or registers["Homing_Offset"] != calibration["homing_offset"]
+                or self._positive_comparator is not None and calibration != self._positive_comparator["calibration"]):
+            raise ValueError("positive control settings/calibration or comparison differs")
+        self._visible_settings = copy.deepcopy(proof)
+        if self._measured_origin_raw is None:
+            if self.elapsed_s != 0 or context["progress_s"] != 0:
+                raise ValueError("positive original measured reference lacks its first native acquisition")
+            measured=self.definition.measured_origin(self._reference,calibration)
+            admitted=self.definition.measured_origin(self._admitted_reference,calibration)
+            native=self._measurement_proof(feedback,now)
+            if measured is None or admitted is None or feedback["position"]["raw"] not in {admitted,self.definition.encoded_goal(self._admitted_reference,calibration)}:
+                raise ValueError("positive first native acquisition differs from frozen measured reference")
+            self._measured_origin_raw=measured
+            if self._positive_comparator is None:
+                self._measured_origin_proof=native
+            else:
+                prior=self._positive_comparator
+                if prior.get("measured_origin_raw") != measured or not self.definition.measurement_proof_valid(prior.get("measured_origin_proof"),self._reference,calibration,run_id=prior["run_id"]):
+                    raise ValueError("positive confirmation original measured provenance differs")
+                self._measured_origin_proof=copy.deepcopy(prior["measured_origin_proof"])
+                self._admission_origin_proof=native
+        phase, cycle = context["phase"], context["cycle"]
+        row = self._phase_samples[(cycle,phase)][-1]
+        cov = self._coverage.setdefault(phase, {"sample_count":0, "first_current_at":row["at"],
+            "first_position_at":row["position_at"], "minimum_raw":row["raw"], "maximum_raw":row["raw"]})
+        cov.update(sample_count=cov["sample_count"]+1, last_current_at=row["at"], last_position_at=row["position_at"],
+                   minimum_raw=min(cov["minimum_raw"],row["raw"]), maximum_raw=max(cov["maximum_raw"],row["raw"]))
+        if phase=="baseline":
+            if self._baseline_closed:
+                raise ValueError("positive baseline phase regressed after departure")
+            self._baseline_anchor_proof=self._measurement_proof(feedback,now)
+            if self._baseline_raw is not None:
+                self._qualify_positive_baseline(now)
+        elif phase=="outbound":
+            self._baseline_closed=True
+        if phase=="endpoint":
+            self._endpoint_proofs.append(self._measurement_proof(feedback,now))
+            del self._endpoint_proofs[:-20]
+        if phase=="return" and self._first_return_proof is None:
+            endpoint=self._phase_samples.get((1,"endpoint"),[])
+            suffix=self._recent_suffix(endpoint,"positive endpoint before actual return",now=now)
+            if not self._endpoint_proofs or self._endpoint_proofs[-1]["position"]["read_completed_at_monotonic_s"] != suffix[-1]["position_at"]:
+                raise ValueError("positive actual endpoint packet/window differs")
+            self._endpoint_window=self._window(suffix,now)
+            self._endpoint_anchor_proof=copy.deepcopy(self._endpoint_proofs[-1])
+            self._endpoint_peak_proof=copy.deepcopy(max(self._endpoint_proofs,key=lambda proof:proof["position"]["raw"]))
+            self._first_return_proof=self._measurement_proof(feedback,now)
+        band = max(2, self._noise or 0)
+        old = self._tracking.get(phase)
+        if old is not None:
+            if phase == "outbound" and row["raw"] < old["extreme"] - band:
+                raise ValueError("positive control moved in the wrong outward direction")
+            if phase == "return" and row["raw"] > old["extreme"] + band:
+                raise ValueError("positive control moved in the wrong return direction")
+        error = row["raw"] - row["goal_raw"]
+        track = old or {"extreme":row["raw"], "goal":row["goal_raw"], "sign":0, "crossings":0, "error":0}
+        track["extreme"] = max(track["extreme"], row["raw"]) if phase == "outbound" else min(track["extreme"], row["raw"])
+        sign = 0 if abs(error) <= band else (1 if error > 0 else -1)
+        if track["goal"] == row["goal_raw"] and sign and track["sign"] and sign != track["sign"] and abs(error) > track["error"]:
+            track["crossings"] += 1
+            if track["crossings"] >= 3:
+                raise ValueError("positive control has growing instability at an unchanged goal")
+        track.update(goal=row["goal_raw"], sign=sign, error=abs(error))
+        self._tracking[phase] = track
+        if phase in {"origin", "final"} and self._rising_current_window(self._phase_samples[(cycle,phase)]) is not None:
+            self._adverse_reason = "positive control sustained rising current at an unchanged goal"
+            raise ValueError(self._adverse_reason)
+
+    @staticmethod
+    def _measurement_proof(feedback,now):
+        return {"captured_at_monotonic_s":now,**{k:copy.deepcopy(feedback[k]) for k in
+            ("version","run_id","host_incarnation","epoch","intent_revision","action_sequence","observation_id",
+             "acquired_at_monotonic_s","context","motor","position","action")}}
+
+    def _receipt(self,key,now,*,fresh=False):
+        receipt = super()._receipt(key,now,fresh=fresh)
+        if abs(receipt["decoded"]["present_current_ma"]) >= 100:
+            raise ValueError("positive control sparse sampled current reached 100 mA")
+        return receipt
+
+    @staticmethod
+    def _window(samples, now):
+        return {"sample_count":len(samples), "qualified_at_monotonic_s":now,
+                "current_span_s":samples[-1]["at"]-samples[0]["at"],
+                "position_span_s":samples[-1]["position_at"]-samples[0]["position_at"],
+                **{f"{end}_{name}_{part}_at":row[key]
+                   for end,row in (("first",samples[0]),("last",samples[-1]))
+                   for name,part,key in (("current","started","current_started"),("current","completed","at"),
+                                         ("position","started","position_started"),("position","completed","position_at"))}}
+
+    def _qualify_positive_baseline(self, now):
+        receipt = self._receipt("baseline", now)
+        samples = self._recent_suffix(self._baseline, "positive baseline", now=now)
+        self._baseline_raw = receipt["action"]["expected_goal_raw"]
+        if self._baseline_raw != self.definition.encoded_goal(self._reference, self._motor["calibration"]):
+            raise ValueError("positive control baseline reference differs")
+        self._noise = self._baseline_extrema[1] - self._baseline_extrema[0]
+        self._outward_anchor_raw=samples[-1]["raw"]
+        self._baseline_window=self._window(samples,now)
+        if max(abs(r["raw"] - self._baseline_raw) for r in samples) > max(2,self._noise):
+            raise ValueError("positive control declared reference is not acquired")
+
+    def _qualify_positive_final(self, now):
+        origin = self._receipt("cycle1_origin", now, fresh=True)
+        samples = self._recent_suffix(self._phase_samples.get((1,"final"),[]), "positive final", now=now)
+        if self._first_return_proof is None or self._endpoint_window is None:
+            raise ValueError("positive actual reverse lacks its qualified endpoint window")
+        for phase in ("baseline", "outbound", "endpoint", "return", "origin", "final"):
+            c = self._coverage.get(phase, {})
+            if (c.get("sample_count",0) < 3 or c.get("last_current_at",0)-c.get("first_current_at",0) < .2-1e-9
+                    or c.get("last_position_at",0)-c.get("first_position_at",0) < .2-1e-9):
+                raise ValueError("positive control actual phase coverage missing: " + phase)
+        ep = self._receipt("cycle1_endpoint", now)
+        endpoint_raw = ep["decoded"]["goal_position_raw"]
+        if origin["decoded"]["goal_position_raw"] != self._baseline_raw:
+            raise ValueError("positive control final encoded goal differs")
+        excursion = endpoint_raw - self._baseline_raw
+        if excursion <= 0:
+            raise ValueError("positive control encoded positive excursion unavailable")
+        anchor = self._endpoint_anchor_proof["position"]["raw"]
+        outward = max(0, self._endpoint_peak_proof["position"]["raw"] - self._outward_anchor_raw)
+        reverse = max(0, anchor - min(r["raw"] for r in samples))
+        residual = max(abs(r["raw"]-self._measured_origin_raw) for r in samples)
+        residual = max(residual, abs(origin["decoded"]["present_position_raw"]-self._measured_origin_raw))
+        goal_residual=max(max(abs(r["raw"]-self._baseline_raw) for r in samples),abs(origin["decoded"]["present_position_raw"]-self._baseline_raw))
+        discriminating = self.definition.noise_discriminating(excursion,self._noise)
+        coarse = discriminating and outward >= math.ceil(excursion/2) and reverse >= math.ceil(excursion/2) and residual <= math.floor(excursion/5)
+        self._positive_outcome = {"program_completed":True, "coarse_functional_pass":coarse,
+            "fine_return_pass":residual <= 2, "noise_discriminating":discriminating,
+            "reference_normalized":self._reference, "admitted_reference":self._admitted_reference,
+            "reference_raw":self._baseline_raw, "endpoint_raw":endpoint_raw, "encoded_excursion_raw":excursion,
+            "outward_response_raw":outward, "reverse_response_raw":reverse, "reverse_anchor_raw":anchor,
+            "final_return_residual_raw":residual, "baseline_noise_raw":self._noise,
+            "measured_origin_raw":self._measured_origin_raw,"encoded_goal_residual_raw":goal_residual,
+            "measured_origin_proof":copy.deepcopy(self._measured_origin_proof),
+            "admission_origin_proof":copy.deepcopy(self._admission_origin_proof),
+            "outward_anchor_raw":self._outward_anchor_raw,
+            "baseline_anchor_proof":copy.deepcopy(self._baseline_anchor_proof),"baseline_window":copy.deepcopy(self._baseline_window),
+            "endpoint_anchor_proof":copy.deepcopy(self._endpoint_anchor_proof),
+            "endpoint_peak_proof":copy.deepcopy(self._endpoint_peak_proof),
+            "first_return_proof":copy.deepcopy(self._first_return_proof),"endpoint_window":copy.deepcopy(self._endpoint_window),
+            "calibration":copy.deepcopy(self._motor["calibration"]), "adverse":False,
+            "stationary":max(r["raw"] for r in samples)-min(r["raw"] for r in samples) <= 2,
+            "acquisition_s":self._acquisition_s,
+            "confirmation_of":None if self._positive_comparator is None else self._positive_comparator["run_id"],
+            "admission_reference":copy.deepcopy(self._admission_reference),
+            "comparison_reference":None if self._positive_comparator is None else copy.deepcopy(self._positive_comparator["original_seed"]),
+            "other_joint_admission_differences":{} if self._positive_comparator is None else {
+                k:self._admission_reference[k]-v for k,v in self._positive_comparator["original_seed"].items() if k != self.selected_joint},
+            "visible_control":copy.deepcopy(self._visible_settings), "phase_coverage":copy.deepcopy(self._coverage),
+            "phase_receipts":copy.deepcopy(self._sparse), "final_window":self._window(samples,now)}
+
+    def advance(self, now, observed, observation_sequence, *, defer_events=False, selected_feedback=None):
+        if self._last_tick is None or self.complete:
+            return
+        if not math.isfinite(now) or now < self._last_tick or observation_sequence <= self._sequence:
+            raise ValueError("positive control clock/feedback sequence invalid")
+        self.collect_feedback(now, observed, observation_sequence, selected_feedback=selected_feedback)
+        next_progress = round(self.elapsed_s + min(now-self._last_tick,self._frame_s),9)
+        if self.elapsed_s < self._acquisition_s+2 <= next_progress:
+            self._qualify_positive_baseline(now)
+        if next_progress >= self.duration_s:
+            self._qualify_positive_final(now)
+        ScriptedLeaderInput.advance(self, now, observed, observation_sequence, defer_events=defer_events)
+
+    def validate_final_feedback(self, now, observed, selected_feedback):
+        # FiniteTask may already have collected this same original acquisition.
+        # Re-ACK keeps the frozen waveform and requires fresh bounded final proof.
+        sequence = selected_feedback.get("observation_id") if isinstance(selected_feedback,dict) else None
+        self.collect_feedback(now,observed,sequence,selected_feedback=selected_feedback)
+        self._qualify_positive_final(now)
+
+    def freeze(self):
+        ScriptedLeaderInput.freeze(self)
+        self._tracking.clear()
+        cycle,phase,_ = self.definition.phase(self.elapsed_s,self._acquisition_s)
+        self._phase_samples.pop((cycle,phase),None)
+        if phase == "baseline":
+            self._baseline.clear()
+        if phase == "endpoint" and self._first_return_proof is None:
+            self._endpoint_proofs.clear()
 
 
 class LeftElbowOriginalReturnInput(LeftElbowResponseCharacterizeInput):

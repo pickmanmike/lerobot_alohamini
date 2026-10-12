@@ -168,6 +168,304 @@ LEFT_ELBOW_RESPONSE = SignedElbowResponse()
 
 
 @dataclass(frozen=True)
+class PositiveElbowControl:
+    """Separate visible I0 out/back control with truthful coarse and fine scores."""
+
+    recipe_name: str = "physical-left-elbow-positive-control"
+    profile: str = "LeftElbowPositiveControl"
+    joint: str = "arm_left_elbow_flex.pos"
+    trajectory_s: float = 30.0
+    nominal_trajectory_s: float = 28.0
+    live_s: float = 60.0
+    current_cap_ma: float = 100.0
+    encoded_goal = staticmethod(SignedElbowResponse.encoded_goal)
+
+    def phase(self, progress, acquisition_s=0):
+        t = progress - acquisition_s
+        if t < 0:
+            return 0, "acquire", 0.0
+        if t < 2:
+            return 0, "baseline", 0.0
+        if t < 12:
+            return 1, "outbound", (t - 2) / 10
+        if t < 14:
+            return 1, "endpoint", 1.0
+        if t < 24:
+            return 1, "return", 1 - (t - 14) / 10
+        return 1, "origin" if t < 26 else "final", 0.0
+
+    def sample_key(self, progress, acquisition_s=0):
+        _, phase, _ = self.phase(progress, acquisition_s)
+        return ("baseline" if phase == "baseline" else "cycle1_endpoint" if phase == "endpoint"
+                else "cycle1_origin" if progress >= acquisition_s + 27.8 - 1e-9 else None)
+
+    def context_valid(self, c):
+        keys = {"profile", "progress_s", "phase", "cycle", "reference", "endpoint_target",
+                "requested_target", "sample_key", "acquisition_s", "admitted_reference"}
+        if not isinstance(c, dict) or set(c) != keys or c["profile"] != self.profile:
+            return False
+        nums = ("progress_s", "reference", "endpoint_target", "requested_target", "acquisition_s", "admitted_reference")
+        if not all(type(c[k]) in (int, float) and math.isfinite(c[k]) for k in nums):
+            return False
+        t, q0, acquisition, admitted = c["progress_s"], c["reference"], c["acquisition_s"], c["admitted_reference"]
+        if (acquisition not in (0, 2) or not 0 <= t <= 28 + acquisition
+                or not -100 <= q0 - 10 <= q0 + 10 <= 100
+                or abs(admitted - q0) > 2 or acquisition == 0 and admitted != q0):
+            return False
+        cycle, phase, fraction = self.phase(t, acquisition)
+        target = admitted + (q0 - admitted) * t / 2 if phase == "acquire" else q0 + 10 * fraction
+        return (type(c["cycle"]) is int and c["cycle"] == cycle and c["phase"] == phase
+                and c["sample_key"] == self.sample_key(t, acquisition)
+                and math.isclose(c["endpoint_target"], q0 + 10, abs_tol=1e-9, rel_tol=0)
+                and math.isclose(c["requested_target"], target, abs_tol=1e-9, rel_tol=0))
+
+    @staticmethod
+    def noise_discriminating(excursion_raw, noise_raw):
+        return noise_raw < math.ceil(excursion_raw / 2) and noise_raw < math.floor(excursion_raw / 5)
+
+    @staticmethod
+    def measured_origin(normalized, calibration):
+        """Invert the frozen native normalized seed, never the floor-encoded goal."""
+        if SignedElbowResponse.encoded_goal(normalized,calibration) is None:
+            return None
+        span=calibration["range_max"]-calibration["range_min"]
+        raw=round((normalized+100)/200*span+calibration["range_min"])
+        actual=(raw-calibration["range_min"])/span*200-100
+        return raw if math.isclose(normalized,actual,abs_tol=1e-9,rel_tol=0) else None
+
+    def measurement_proof_valid(self, proof, normalized, calibration, *, run_id=None, host_incarnation=None):
+        try:
+            if (not isinstance(proof,dict) or type(proof.get("version")) is not int or proof["version"] != 1
+                or run_id is not None and proof.get("run_id") != run_id
+                or host_incarnation is not None and proof.get("host_incarnation") != host_incarnation
+                or not all(type(proof.get(k)) is int and proof[k]>=0 for k in ("epoch","intent_revision","action_sequence","observation_id"))
+                or not self.context_valid(proof.get("context"))):
+                return False
+            motor,position,context,action=proof["motor"],proof["position"],proof["context"],proof["action"]
+            measured=self.measured_origin(normalized,calibration)
+            goal=self.encoded_goal(normalized,calibration)
+            captured=proof["captured_at_monotonic_s"]
+            first,last=position["read_started_at_monotonic_s"],position["read_completed_at_monotonic_s"]
+            if (measured is None or abs(measured-goal)>1 or motor.get("calibration") != calibration
+                or (motor.get("bus"),motor.get("name"),motor.get("id"),motor.get("model"),motor.get("normalization"))
+                   != ("left",self.joint[:-4],3,"sts3215","range_m100_100")
+                or type(position.get("raw")) is not int
+                or not all(type(v) in (int,float) and math.isfinite(v) for v in (captured,first,last,proof["acquired_at_monotonic_s"],position["normalized"]))
+                or not 0<=first<=last<=captured or captured-first>.5
+                or not 0<=proof["acquired_at_monotonic_s"]<=captured
+                or not math.isclose(position["normalized"],(position["raw"]-calibration["range_min"])/(calibration["range_max"]-calibration["range_min"])*200-100,abs_tol=1e-9,rel_tol=0)
+                or action.get("expected_goal_raw") != self.encoded_goal(context["requested_target"],calibration)
+                or action.get("sync_write_returned") is not True):
+                return False
+            return True
+        except (KeyError,ValueError,TypeError,AttributeError):
+            return False
+
+    @staticmethod
+    def window_valid(w):
+        if not isinstance(w, dict) or type(w.get("sample_count")) is not int or not 3 <= w["sample_count"] <= 20:
+            return False
+        keys = {f"{end}_{name}_{part}_at" for end in ("first", "last")
+                for name in ("current", "position") for part in ("started", "completed")}
+        keys |= {"qualified_at_monotonic_s", "current_span_s", "position_span_s"}
+        if set(w) != keys | {"sample_count"} or not all(type(w[k]) in (int, float) and math.isfinite(w[k]) for k in keys):
+            return False
+        now = w["qualified_at_monotonic_s"]
+        for name in ("current", "position"):
+            a, b = w[f"first_{name}_completed_at"], w[f"last_{name}_completed_at"]
+            sa, sb = w[f"first_{name}_started_at"], w[f"last_{name}_started_at"]
+            if (not 0 <= sa <= a < b <= now or not sa <= sb <= b
+                    or now - sa > .5 or now - sb > .5 or b - a < .2 - 1e-9
+                    or not math.isclose(w[f"{name}_span_s"], b - a, abs_tol=1e-9, rel_tol=0)):
+                return False
+        return True
+
+    @staticmethod
+    def settings_valid(proof, run_id=None, host_incarnation=None):
+        import hashlib
+        import json
+
+        static = {"Firmware_Major_Version", "Firmware_Minor_Version", "Model_Number", "ID",
+                  "Return_Delay_Time", "Min_Position_Limit", "Max_Position_Limit", "Homing_Offset", "Phase",
+                  "P_Coefficient", "I_Coefficient", "D_Coefficient", "Operating_Mode", "Acceleration",
+                  "Goal_Time", "Goal_Velocity", "Torque_Limit", "Maximum_Acceleration"}
+        dynamic = {"Torque_Enable", "Lock", "Goal_Position", "Present_Position", "Present_Current", "Status",
+                   "Present_Voltage", "Present_Temperature"}
+        try:
+            if (set(proof) != {"version", "binding", "before", "active", "unchanged", "settings_sha256"}
+                    or type(proof["version"]) is not int or proof["version"] != 1 or proof["unchanged"] is not True):
+                return False
+            binding = proof["binding"]
+            if (set(binding) != {"run_id", "host_incarnation", "recipe"}
+                    or binding["recipe"] != "physical-left-elbow-positive-control"
+                    or not all(type(binding[k]) is str and binding[k] for k in binding)
+                    or run_id is not None and binding["run_id"] != run_id
+                    or host_incarnation is not None and binding["host_incarnation"] != host_incarnation):
+                return False
+            previous = 0
+            for name, torque in (("before", 0), ("active", 1)):
+                item = proof[name]
+                r, ib = item["registers"], item["individual_bytes"]
+                if (set(item) != {"registers", "individual_bytes", "read_started_at_monotonic_s", "read_completed_at_monotonic_s"}
+                        or set(r) != static | dynamic or not all(type(v) is int for v in r.values())
+                        or set(ib) != {"24", "25"} or not all(type(v) is int and 0 <= v <= 255 for v in ib.values())
+                        or any(r[k] != v for k, v in {"Model_Number":777, "Firmware_Major_Version":3,
+                            "Firmware_Minor_Version":10, "ID":3, "Operating_Mode":0, "P_Coefficient":16,
+                            "I_Coefficient":0, "D_Coefficient":32, "Torque_Enable":torque, "Lock":torque,
+                            "Status":0}.items()) or abs(r["Present_Current"]) * 6.5 >= 100):
+                    return False
+                a, b = item["read_started_at_monotonic_s"], item["read_completed_at_monotonic_s"]
+                if not all(type(v) in (int, float) and math.isfinite(v) for v in (a,b)) or not 0 <= previous <= a <= b:
+                    return False
+                previous = b
+            before, active = proof["before"], proof["active"]
+            material = {"registers":{k:before["registers"][k] for k in static}, "individual_bytes":before["individual_bytes"]}
+            return (all(before["registers"][k] == active["registers"][k] for k in static)
+                    and before["individual_bytes"] == active["individual_bytes"]
+                    and hashlib.sha256(json.dumps(material, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+                    == proof["settings_sha256"])
+        except (KeyError, TypeError, AttributeError):
+            return False
+
+    def completion_expectation(self, execution):
+        try:
+            return self._completion_expectation(execution)
+        except (ValueError,TypeError,KeyError,AttributeError,OverflowError):
+            return None
+
+    def _completion_expectation(self, execution):
+        if not isinstance(execution, dict):
+            return None
+        o, seed = execution.get("positive_control"), execution.get("original_seed")
+        if not isinstance(o, dict) or not isinstance(seed, dict):
+            return None
+        if type(o.get("reference_normalized")) not in (int,float) or not math.isfinite(o["reference_normalized"]):
+            return None
+        joint_keys = {f"arm_{side}_{joint}.pos" for side in ("left","right") for joint in
+                      ("shoulder_pan","shoulder_lift","elbow_flex","wrist_flex","wrist_roll","gripper")}
+        if set(seed) != joint_keys or not all(type(v) in (int,float) and math.isfinite(v) for v in seed.values()):
+            return None
+        nums = ("reference_raw", "endpoint_raw", "encoded_excursion_raw", "outward_response_raw",
+                "reverse_response_raw", "final_return_residual_raw", "baseline_noise_raw", "reverse_anchor_raw",
+                "measured_origin_raw", "outward_anchor_raw", "encoded_goal_residual_raw")
+        if not all(type(o.get(k)) is int for k in nums) or min(o[k] for k in nums if k != "reverse_anchor_raw") < 0:
+            return None
+        q0, calibration = o.get("reference_normalized"), o.get("calibration")
+        acquisition = o.get("acquisition_s")
+        if (acquisition not in (0, 2) or type(acquisition) not in (int, float)
+                or not -100 <= seed.get(self.joint, -1000) - 10 <= seed.get(self.joint, 1000) + 10 <= 100
+                or seed[self.joint] != q0 or self.encoded_goal(q0, calibration) != o["reference_raw"]
+                or self.encoded_goal(q0 + 10, calibration) != o["endpoint_raw"]
+                or o["encoded_excursion_raw"] != o["endpoint_raw"] - o["reference_raw"]
+                or o["encoded_excursion_raw"] <= 0 or o.get("program_completed") is not True
+                or o.get("adverse") is not False or not self.window_valid(o.get("final_window"))
+                or not self.settings_valid(o.get("visible_control"))):
+            return None
+        measured=self.measured_origin(q0,calibration)
+        binding=o["visible_control"]["binding"]
+        original=o.get("measured_origin_proof")
+        baseline=o.get("baseline_anchor_proof")
+        baseline_window=o.get("baseline_window")
+        if (measured is None or o["measured_origin_raw"] != measured
+            or not self.measurement_proof_valid(original,q0,calibration,
+                run_id=binding["run_id"] if acquisition==0 else o.get("confirmation_of"),
+                host_incarnation=binding["host_incarnation"] if acquisition==0 else None)
+            or original["context"]["progress_s"] != 0
+            or original["context"]["reference"] != q0
+            or original["position"]["raw"] not in {measured,self.encoded_goal(q0,calibration)}
+            or not self.measurement_proof_valid(baseline,q0,calibration,run_id=binding["run_id"],host_incarnation=binding["host_incarnation"])
+            or baseline["context"]["phase"] != "baseline" or baseline["context"]["reference"] != q0
+            or baseline["position"]["raw"] != o["outward_anchor_raw"]
+            or not self.window_valid(baseline_window)
+            or baseline_window["last_position_completed_at"] != baseline["position"]["read_completed_at_monotonic_s"]
+            or baseline_window["qualified_at_monotonic_s"] != baseline["captured_at_monotonic_s"]):
+            return None
+        endpoint,peak,departure=o.get("endpoint_anchor_proof"),o.get("endpoint_peak_proof"),o.get("first_return_proof")
+        endpoint_window=o.get("endpoint_window")
+        for item,phase in ((endpoint,"endpoint"),(peak,"endpoint"),(departure,"return")):
+            if (not self.measurement_proof_valid(item,q0,calibration,run_id=binding["run_id"],host_incarnation=binding["host_incarnation"])
+                or item["context"]["phase"] != phase or item["context"]["reference"] != q0):
+                return None
+        if (not self.window_valid(endpoint_window)
+            or endpoint_window["qualified_at_monotonic_s"] != departure["captured_at_monotonic_s"]
+            or endpoint_window["last_position_completed_at"] != endpoint["position"]["read_completed_at_monotonic_s"]
+            or peak["captured_at_monotonic_s"] > departure["captured_at_monotonic_s"]
+            or endpoint["position"]["raw"] != o["reverse_anchor_raw"]
+            or o["outward_response_raw"] != max(0,peak["position"]["raw"]-o["outward_anchor_raw"])):
+            return None
+        coverage, receipts = o.get("phase_coverage"), o.get("phase_receipts")
+        if not isinstance(coverage,dict) or not isinstance(receipts,dict) or set(receipts) != {"baseline","cycle1_endpoint","cycle1_origin"}:
+            return None
+        for phase in ("baseline","outbound","endpoint","return","origin","final"):
+            c = coverage.get(phase)
+            if (not isinstance(c,dict) or type(c.get("sample_count")) is not int or c["sample_count"] < 3
+                or not all(type(c.get(k)) in (int,float) and math.isfinite(c[k]) for k in
+                    ("first_current_at","last_current_at","first_position_at","last_position_at"))
+                or any(not 0 <= c[f"first_{name}_at"] < c[f"last_{name}_at"] <= o["final_window"]["qualified_at_monotonic_s"]
+                       or c[f"last_{name}_at"]-c[f"first_{name}_at"] < .2-1e-9 for name in ("current","position"))
+                or type(c.get("minimum_raw")) is not int or type(c.get("maximum_raw")) is not int
+                or not calibration["range_min"] <= c["minimum_raw"] <= c["maximum_raw"] <= calibration["range_max"]):
+                return None
+        binding = o["visible_control"]["binding"]
+        for key,r in receipts.items():
+            context,action,decoded = r.get("context"),r.get("action"),r.get("decoded")
+            goal = o["endpoint_raw"] if key == "cycle1_endpoint" else o["reference_raw"]
+            if (r.get("run_id") != binding["run_id"] or r.get("host_incarnation") != binding["host_incarnation"]
+                or r.get("sample_key") != key or not self.context_valid(context) or context["sample_key"] != key
+                or context["reference"] != q0 or context["acquisition_s"] != acquisition
+                or context["admitted_reference"] != o.get("admitted_reference")
+                or r.get("diagnostic_available") is not True or r.get("goal_matches_expected_raw") is not True
+                or not isinstance(action,dict) or action.get("expected_goal_raw") != goal
+                or not isinstance(decoded,dict) or type(decoded.get("goal_position_raw")) is not int
+                or type(decoded.get("present_current_ma")) not in (int,float)
+                or not math.isfinite(decoded["present_current_ma"]) or abs(decoded["present_current_ma"]) >= 100
+                or decoded["goal_position_raw"] != goal or any(type(decoded.get(k)) is not int or decoded[k] != v for k,v in
+                    {"status":0,"torque_enable":1,"operating_mode":0}.items())
+                or not all(type(r.get(k)) is int and r[k] >= 0 for k in ("epoch","intent_revision","action_sequence","observation_id"))
+                or not all(type(r.get(k)) in (int,float) and math.isfinite(r[k]) for k in
+                    ("read_started_at_monotonic_s","read_completed_at_monotonic_s","acquired_at_monotonic_s"))
+                or not 0 <= r["acquired_at_monotonic_s"] <= r["read_started_at_monotonic_s"] <= r["read_completed_at_monotonic_s"] <= o["final_window"]["qualified_at_monotonic_s"]):
+                return None
+        origin = receipts["cycle1_origin"]
+        if (o["final_window"]["qualified_at_monotonic_s"]-origin["read_started_at_monotonic_s"] > .5
+            or type(origin["decoded"].get("present_position_raw")) is not int
+            or abs(origin["decoded"]["present_position_raw"]-o["measured_origin_raw"]) > o["final_return_residual_raw"]):
+            return None
+        admitted, compared = o.get("admission_reference"),o.get("comparison_reference")
+        if (not isinstance(admitted,dict) or set(admitted) != joint_keys
+            or not all(type(v) in (int,float) and math.isfinite(v) for v in admitted.values())
+            or admitted[self.joint] != o.get("admitted_reference")
+            or any(admitted[k] != seed[k] for k in joint_keys if k != self.joint)):
+            return None
+        if acquisition == 0:
+            if admitted != seed or compared is not None or o.get("other_joint_admission_differences") != {}:
+                return None
+        elif (not isinstance(compared,dict) or set(compared) != joint_keys or compared[self.joint] != q0
+              or abs(admitted[self.joint]-q0) > 2
+              or not all(type(v) in (int,float) and math.isfinite(v) for v in compared.values())
+              or any(abs(admitted[k]-compared[k]) > 1 for k in joint_keys if k != self.joint)
+              or o.get("other_joint_admission_differences") != {k:admitted[k]-compared[k] for k in joint_keys if k != self.joint}):
+            return None
+        excursion = o["encoded_excursion_raw"]
+        discriminating = self.noise_discriminating(excursion,o["baseline_noise_raw"])
+        coarse = (discriminating and o["outward_response_raw"] >= math.ceil(excursion / 2)
+                  and o["reverse_response_raw"] >= math.ceil(excursion / 2)
+                  and o["final_return_residual_raw"] <= math.floor(excursion / 5))
+        if (o.get("noise_discriminating") is not discriminating or o.get("coarse_functional_pass") is not coarse
+                or o.get("fine_return_pass") is not (o["final_return_residual_raw"] <= 2)
+                or (acquisition == 0) != (o.get("confirmation_of") is None)
+                or acquisition == 2 and uuid_text(o.get("confirmation_of")) != o["confirmation_of"]
+                or execution.get("progress_s") != 28 + acquisition
+                or type(execution.get("cycles_completed")) is not int or execution["cycles_completed"] != 1
+                or type(execution.get("returns_qualified")) is not int or execution["returns_qualified"] != int(coarse)):
+            return None
+        return 28 + acquisition, 1, int(coarse)
+
+
+LEFT_ELBOW_POSITIVE_CONTROL = PositiveElbowControl()
+
+
+@dataclass(frozen=True)
 class OriginalElbowReturn:
     """One approach to an archived original reference, never a new departure."""
 
@@ -650,6 +948,9 @@ RECIPES = MappingProxyType(
         "physical-left-elbow-compare": Recipe("physical-left-elbow-compare", "finite", 18.0, 60.0, seed=None),
         "physical-left-elbow-dwell-compare": Recipe(
             "physical-left-elbow-dwell-compare", "finite", 24.0, 60.0, seed=None
+        ),
+        LEFT_ELBOW_POSITIVE_CONTROL.recipe_name: Recipe(
+            LEFT_ELBOW_POSITIVE_CONTROL.recipe_name, "finite", 30.0, 60.0, seed=None,
         ),
         LEFT_ELBOW_RESPONSE.recipe_name: Recipe(
             LEFT_ELBOW_RESPONSE.recipe_name, "finite", LEFT_ELBOW_RESPONSE.trajectory_s,

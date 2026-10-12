@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import contextlib
 import hashlib
 import ipaddress
 import os
@@ -22,6 +23,7 @@ from aiohttp import WSMsgType, web
 from tools.am1_session_ipc import (
     CONTROL_LIMIT,
     IPCClient,
+    ReportingError,
     encode,
     private_directory,
     private_json,
@@ -322,6 +324,8 @@ class Gateway:
                 {"accepted": False, "status": "refused", "reason": exc.reason, "effect_admitted": False},
                 status=exc.status,
             )
+        except ReportingError as exc:
+            return web.json_response(exc.result, status=503, headers={"Cache-Control": "no-store"})
         except (ValueError, TypeError, KeyError, UnicodeError):
             return web.json_response(
                 {
@@ -372,7 +376,10 @@ class Gateway:
                 return await self.ipc.request(command, device)
 
     async def current(self):
-        return (await self.call({"op": "snapshot"}, "gateway-view"))["snapshot"]
+        result = await self.call({"op": "snapshot"}, "gateway-view")
+        if result.get("status") == "reporting_error":
+            raise ReportingError(result)
+        return result["snapshot"]
 
     def next_revision(self):
         self.revision += 1
@@ -472,6 +479,20 @@ class Gateway:
         op = command.get("op")
         if op not in OPS or "device_id" in command:
             raise ValueError("operation")
+        if "confirmation_of" in command:
+            value = command["confirmation_of"]
+            try:
+                canonical = isinstance(value, str) and str(uuid.UUID(value)) == value
+            except ValueError:
+                canonical = False
+            if (
+                op != "start"
+                or command.get("recipe") != "physical-left-elbow-positive-control"
+                or not canonical
+            ):
+                raise ValueError(
+                    "confirmation requires the explicit positive-control recipe and canonical UUID"
+                )
         if op == "handoff" and not self.auth.capable(command.get("target_device_id")):
             raise web.HTTPForbidden(reason="enrolled control target required")
         if op in INTERACTIVE:
@@ -492,7 +513,7 @@ class Gateway:
                     "effect_admitted": False,
                 }
         result = await self.call(command, device["id"])
-        if peer and op == "connect" and result.get("accepted"):
+        if peer and op == "connect" and result.get("accepted") and result.get("status") != "reporting_error":
             peer.connection = result["connection_generation"]
         return result
 
@@ -665,6 +686,12 @@ class Gateway:
                 ):
                     raise ValueError("command envelope")
                 self.enqueue(peer, value)
+        except ReportingError as exc:
+            with contextlib.suppress(TimeoutError, ConnectionError):
+                await asyncio.wait_for(
+                    ws.send_str(encode(dict(exc.result, kind="unavailable")).decode()), 0.5
+                )
+            await close_socket(ws, request.transport, 1013)
         except (
             ValueError,
             TypeError,
@@ -726,6 +753,11 @@ class Gateway:
                             ),
                             True,
                         )
+            except ReportingError as exc:
+                for peer in list(self.peers):
+                    peer.ack = False
+                    peer.revision = self.next_revision()
+                    peer.put(dict(exc.result, kind="unavailable"), True)
             except (OSError, ValueError, TimeoutError, asyncio.IncompleteReadError):
                 for peer in list(self.peers):
                     peer.put({"kind": "unavailable"}, True)

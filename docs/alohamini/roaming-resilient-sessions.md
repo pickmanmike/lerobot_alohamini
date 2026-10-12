@@ -1,7 +1,12 @@
 # AM1 roaming-resilient sessions
 
 **Current continuation: [AM1 protected physical sessions](protected-physical-sessions.md),
-AM1-ELBOW-RECOVERY-03.** The matched current-pose I0/I1 programs completed5.5seconds, but both stayed
+AM1-VISIBLE-CONTROL-04.** The new independent +10 out-and-back keeps I0 unchanged,
+separates actual movement from diagnostic completion and preserves the software
+durability scope. Physical evaluation of that recipe is pending at this source
+checkpoint. The following Recovery03 results remain historical.
+
+**Retained AM1-ELBOW-RECOVERY-03:** The matched current-pose I0/I1 programs completed5.5seconds, but both stayed
 raw2458 despite goal2472: zero useful approach/residual14. I1 increased sampled
 current to39mA vs I0's19.5mA without movement. All12 starting poses/calibration/timing
 matched; live I1 and verified original I0/Lock0/individual24/25 restoration are

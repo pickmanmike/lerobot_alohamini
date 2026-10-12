@@ -15,6 +15,7 @@ from pathlib import Path
 from examples.alohamini.am1_session_contract import (
     ELBOW_RECOVERY_DEFINITIONS,
     LEFT_ELBOW_ORIGINAL_RETURN,
+    LEFT_ELBOW_POSITIVE_CONTROL,
     LEFT_ELBOW_RESPONSE,
     RECIPES,
     uuid_text,
@@ -203,6 +204,40 @@ def _public_physical_evidence(evidence, run=None):
         ]
     public_receipt = dict(receipt, readback=public_readback)
     return dict(evidence, lifecycle=dict(lifecycle, readback=public_receipt))
+
+
+def _positive_completion_reference(evidence, run):
+    """One public duplicate may refer to the complete execution already in this run."""
+    try:
+        receipt, execution, lifecycle = run["completion_receipt"], run["execution"], evidence["lifecycle"]
+        if not (
+            run.get("recipe") == LEFT_ELBOW_POSITIVE_CONTROL.recipe_name
+            and run.get("source") == evidence.get("source") == "protected-physical-provider"
+            and run.get("status") in TERMINAL
+            and uuid_text(run.get("run_id")) == run.get("run_id")
+            and uuid_text(run.get("backend_incarnation")) == run.get("backend_incarnation")
+            and isinstance(receipt, dict)
+            and isinstance(execution, dict)
+            and isinstance(lifecycle, dict)
+            and lifecycle.get("phase") == "terminal"
+            and receipt.get("run_id") == lifecycle.get("run_id") == run["run_id"]
+            and receipt.get("host_incarnation")
+            == lifecycle.get("backend_incarnation")
+            == run["backend_incarnation"]
+            and receipt.get("recipe") == run["recipe"]
+            and _canonical(execution) == _canonical(receipt.get("execution"))
+            and _canonical(evidence.get("finite_completion")) == _canonical(receipt)
+            and LEFT_ELBOW_POSITIVE_CONTROL.completion_expectation(execution) is not None
+        ):
+            return None
+        return {
+            "kind": "am1-finite-completion-execution-reference",
+            "version": 1,
+            "field": "run.execution",
+            "sha256": hashlib.sha256(_canonical(execution)).hexdigest(),
+        }
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return None
 
 
 def _retained_recovery_idle(evidence, previous, service_incarnation):
@@ -516,7 +551,12 @@ class SessionAuthority:
         current_sequence = evidence.get("feedback_sequence")
         seed, positions = execution.get("original_seed"), receipt.get("measured_positions")
         duration = RECIPES[run["recipe"]].trajectory_s
-        if run["recipe"] == LEFT_ELBOW_RESPONSE.recipe_name:
+        if run["recipe"] == LEFT_ELBOW_POSITIVE_CONTROL.recipe_name:
+            expected = LEFT_ELBOW_POSITIVE_CONTROL.completion_expectation(execution)
+            if expected is None:
+                return None
+            duration, cycles, returns = expected
+        elif run["recipe"] == LEFT_ELBOW_RESPONSE.recipe_name:
             expected = LEFT_ELBOW_RESPONSE.completion_expectation(execution)
             if expected is None:
                 return None
@@ -596,6 +636,33 @@ class SessionAuthority:
             )
         ):
             return None
+        if run["recipe"] == LEFT_ELBOW_POSITIVE_CONTROL.recipe_name:
+            from examples.alohamini.am1_finite_task import JOINT_KEYS
+
+            outcome = execution["positive_control"]
+            window = outcome["final_window"]
+            origin_receipt = outcome["phase_receipts"]["cycle1_origin"]
+            prerequisite = run.get("positive_prerequisite")
+            if run.get("confirmation_of") is not None and (
+                not isinstance(prerequisite,dict) or prerequisite.get("run_id") != outcome["confirmation_of"]
+                or prerequisite.get("original_seed") != outcome["comparison_reference"]
+                or prerequisite.get("reference_normalized") != outcome["reference_normalized"]
+                or prerequisite.get("calibration") != outcome["calibration"]
+                or prerequisite.get("measured_origin_raw") != outcome["measured_origin_raw"]
+                or prerequisite.get("measured_origin_proof") != outcome["measured_origin_proof"]
+            ):
+                return None
+            if (set(seed) != set(JOINT_KEYS)
+                or any(origin_receipt[k] != ack[k] for k in ("epoch","intent_revision"))
+                or origin_receipt["action_sequence"] > ack["accepted_action_sequence"]
+                or origin_receipt["observation_id"] > sequence
+                or not LEFT_ELBOW_POSITIVE_CONTROL.settings_valid(outcome["visible_control"],run["run_id"],incarnation)
+                or min(window["first_current_started_at"],window["first_position_started_at"]) < run["native_live_at"]
+                or not window["qualified_at_monotonic_s"] <= completed
+                or completed-window["last_position_started_at"] > .5
+                or any(abs(positions[k]-v) > (10 if k == LEFT_ELBOW_POSITIVE_CONTROL.joint else 1) for k,v in seed.items())
+                or outcome.get("confirmation_of") != run.get("confirmation_of")):
+                return None
         if run["recipe"] == LEFT_ELBOW_ORIGINAL_RETURN.recipe_name:
             from examples.alohamini.am1_finite_task import JOINT_KEYS
 
@@ -1271,6 +1338,64 @@ class SessionAuthority:
         except (OSError, AttributeError, KeyError, TypeError, ValueError):
             return None
 
+    def positive_control_prerequisite(self, confirmation_of, evidence):
+        """One explicit confirmation of this authority's intact completed primary."""
+        from tools.am1_physical_executor import qualified_cleanup_receipt
+
+        old = self.run
+        try:
+            if (not isinstance(old,dict) or uuid_text(confirmation_of) != confirmation_of
+                or old.get("run_id") != confirmation_of or old.get("recipe") != LEFT_ELBOW_POSITIVE_CONTROL.recipe_name
+                or old.get("source") != "protected-physical-provider" or old.get("status") != "completed"
+                or old.get("uncertain") is not False or old.get("first_cause") is not None
+                or old.get("cleanup") != "physical_readback_verified" or old.get("confirmation_of") is not None
+                or old.get("backend_contract") != evidence.get("backend_contract") or evidence.get("fault") is not None):
+                return None
+            receipt, lifecycle, execution = old["completion_receipt"],old["physical_result"],old["execution"]
+            outcome = execution["positive_control"]
+            if (receipt.get("execution") != execution or receipt.get("run_id") != confirmation_of
+                or receipt.get("recipe") != LEFT_ELBOW_POSITIVE_CONTROL.recipe_name
+                or receipt.get("host_incarnation") != old.get("backend_incarnation")
+                or LEFT_ELBOW_POSITIVE_CONTROL.completion_expectation(execution) is None
+                or outcome.get("confirmation_of") is not None or outcome.get("coarse_functional_pass") is not True
+                or outcome.get("stationary") is not True or outcome.get("adverse") is not False
+                or lifecycle.get("run_id") != confirmation_of or lifecycle.get("backend_incarnation") != receipt["host_incarnation"]
+                or lifecycle.get("phase") != "terminal" or lifecycle.get("terminal_status") != "completed"
+                or lifecycle.get("uncertain") is not False or lifecycle.get("cleanup_errors") != []
+                or lifecycle.get("first_cause") is not None
+                or not LEFT_ELBOW_POSITIVE_CONTROL.settings_valid(outcome["visible_control"],confirmation_of,receipt["host_incarnation"])
+                or not qualified_cleanup_receipt(lifecycle.get("readback"),confirmation_of,receipt["host_incarnation"])):
+                return None
+            current = evidence.get("lifecycle")
+            if current != lifecycle:
+                if (current != {"run_id":None,"phase":"idle","startup_deadline":None,"native_live_at":None,
+                                "cleanup":None,"uncertain":False,"terminal_status":None}
+                    or old.get("service_incarnation") == getattr(self,"service_incarnation",None)
+                    or evidence.get("source") != "protected-physical-provider"
+                    or any(evidence.get(k) is not False for k in ("feedback","native_ack","active_acknowledged","hold_acknowledged","pose_aligned"))
+                    or any(evidence.get(k) is not None for k in ("transport_issue","reconciliation","host_incarnation","finite_completion"))
+                    or evidence.get("accepted_host_action") != {}):
+                    return None
+            readback = lifecycle["readback"]["readback"]
+            camera = lifecycle.get("camera_release")
+            release = camera.get("release_evidence") if isinstance(camera,dict) else None
+            if (readback.get("verified") is not True or readback.get("buses_closed") is not True
+                or readback.get("cleanup_errors") != [] or readback.get("selected_gain_restore_required") is not False
+                or not isinstance(camera,dict) or type(camera.get("version")) is not int or camera["version"] != 1
+                or camera.get("session_id") != confirmation_of or camera.get("state") != "released"
+                or camera.get("errors") != [] or camera.get("runtime_failed") is not False
+                or not isinstance(release,dict) or type(release.get("backend_returncode")) is not int
+                or release["backend_returncode"] != 0 or any(release.get(k) is not True for k in
+                    ("backend_exited","readers_joined","viewer_socket_closed","runtime_config_removed"))):
+                return None
+            return {"run_id":confirmation_of,"reference_normalized":outcome["reference_normalized"],
+                    "original_seed":dict(execution["original_seed"]),
+                    "measured_origin_raw":outcome["measured_origin_raw"],
+                    "measured_origin_proof":outcome["measured_origin_proof"],
+                    "calibration":outcome["calibration"],"proof_sha256":hashlib.sha256(_canonical(receipt)).hexdigest()}
+        except (KeyError,ValueError,TypeError,AttributeError):
+            return None
+
     def elbow_recovery_prerequisite(self, recipe, evidence):
         self._startup_continuation_note = None
         proof = self._recovery_prerequisite_from(recipe, evidence, self.run)
@@ -1534,10 +1659,21 @@ class SessionAuthority:
             recipe = RECIPES.get(c.get("recipe"))
             if not recipe or not self.executor.supports(recipe):
                 return self._refuse("unknown fake recipe")
-            if set(c) - {"op", "operation_id", "recipe", "controller_generation"}:
+            allowed = {"op", "operation_id", "recipe", "controller_generation"}
+            if recipe.name == LEFT_ELBOW_POSITIVE_CONTROL.recipe_name:
+                allowed.add("confirmation_of")
+            if set(c) - allowed:
                 return self._refuse("recipe parameters forbidden")
+            confirmation_of = c.get("confirmation_of")
+            if "confirmation_of" in c:
+                try:
+                    if uuid_text(confirmation_of) != confirmation_of:
+                        return self._refuse("canonical positive confirmation identity required")
+                except (ValueError,TypeError,AttributeError):
+                    return self._refuse("canonical positive confirmation identity required")
             canonical = json.dumps(
-                {"recipe": recipe.name, "device_id": d}, sort_keys=True, separators=(",", ":")
+                {"recipe": recipe.name, "device_id": d, **({"confirmation_of":confirmation_of} if confirmation_of else {})},
+                sort_keys=True, separators=(",", ":")
             )
             digest = hashlib.sha256(canonical.encode()).hexdigest()
             row = self.db.execute("SELECT hash,device,result FROM operations WHERE id=?", (oid,)).fetchone()
@@ -1579,6 +1715,20 @@ class SessionAuthority:
             ):
                 self._hold()
                 return self._refuse("fresh qualified feedback/proof and acknowledgement required")
+            positive_prerequisite = None
+            if recipe.name == LEFT_ELBOW_POSITIVE_CONTROL.recipe_name:
+                if confirmation_of is not None:
+                    positive_prerequisite = self.positive_control_prerequisite(confirmation_of,evidence)
+                    if positive_prerequisite is None:
+                        return self._refuse("positive confirmation requires qualified primary native outcome and known cleanup")
+                setter = getattr(self.executor,"set_positive_prerequisite",None)
+                if callable(setter):
+                    try:
+                        setter(positive_prerequisite)
+                    except RuntimeError as error:
+                        return self._refuse(str(error))
+                elif confirmation_of is not None:
+                    return self._refuse("positive confirmation requires protected executor")
             recovery_prerequisite = None
             recovery_definition = ELBOW_RECOVERY_DEFINITIONS.get(recipe.name)
             if recovery_definition is not None:
@@ -1624,6 +1774,9 @@ class SessionAuthority:
                 "service_incarnation": self.service_incarnation,
                 "started_wall": self.wall_clock(),
             }
+            if recipe.name == LEFT_ELBOW_POSITIVE_CONTROL.recipe_name:
+                self.run["confirmation_of"] = confirmation_of
+                self.run["positive_prerequisite"] = positive_prerequisite
             if recovery_definition is not None:
                 self.run["recovery_prerequisite"] = recovery_prerequisite
                 if continuation_note is not None:
@@ -1974,6 +2127,8 @@ class SessionAuthority:
         with self.mutex:
             run = None if not self.run else dict(self.run)
             trajectory = None if run is None else RECIPES[run["recipe"]].trajectory_s
+            if run is not None and run["recipe"] == LEFT_ELBOW_POSITIVE_CONTROL.recipe_name:
+                trajectory = 28.0 + (2.0 if run.get("confirmation_of") is not None else 0.0)
             if run is not None and run["recipe"] == LEFT_ELBOW_RESPONSE.recipe_name:
                 execution = run.get("execution")
                 branch = LEFT_ELBOW_RESPONSE.branch_expectation(
@@ -1987,6 +2142,17 @@ class SessionAuthority:
                 and self.executor.source == "protected-physical-provider"
             ):
                 run["reconciliation"] = _reconciliation_reference(self.run)
+            evidence = self._evidence()
+            reference = _positive_completion_reference(evidence, run) if run is not None else None
+            public_evidence = _public_physical_evidence(evidence, run)
+            if reference is not None:
+                public_receipt = {
+                    key: value for key, value in run["completion_receipt"].items() if key != "execution"
+                }
+                run["completion_receipt"] = dict(public_receipt, execution_reference=reference)
+                public_evidence = dict(
+                    public_evidence, finite_completion=dict(public_receipt, execution_reference=reference)
+                )
             return json.loads(
                 json.dumps(
                     {
@@ -2009,7 +2175,7 @@ class SessionAuthority:
                             if trajectory is None
                             else max(0, trajectory - self.run["progress_s"]),
                         ),
-                        "evidence": _public_physical_evidence(self._evidence(), run),
+                        "evidence": public_evidence,
                         "recipes": [
                             name
                             for name, recipe in RECIPES.items()

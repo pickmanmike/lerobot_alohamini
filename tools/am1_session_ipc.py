@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import contextlib
 import csv
+import hashlib
 import json
 import math
 import os
@@ -20,6 +21,74 @@ CONTROL_LIMIT = 4096
 RESPONSE_LIMIT = 65536
 IO_TIMEOUT = 1.0
 PROTECTIVE = {"pause", "stop", "release"}
+
+
+class ResponseLimitError(ValueError):
+    def __init__(self, size):
+        super().__init__("message too large")
+        self.size = size
+
+
+class ReportingError(ValueError):
+    """A handled owner request whose full presentation could not be delivered."""
+
+    def __init__(self, result):
+        super().__init__(result["reason"])
+        self.result = result
+
+
+def reporting_error(result, size):
+    # Fixed scalar projection only; never substitute a refused/unknown operation outcome.
+    fields = ("accepted", "status", "effect_admitted", "run_id", "operation_id", "uncertain")
+    outcome = {
+        key: result[key]
+        for key in fields
+        if key in result
+        and (
+            type(result[key]) in (bool, int, float)
+            or result[key] is None
+            or isinstance(result[key], str)
+            and len(result[key]) <= 128
+        )
+    }
+    snapshot = result.get("snapshot")
+    run = snapshot.get("run") if isinstance(snapshot, dict) else None
+    summary = {}
+    if isinstance(run, dict):
+        for key in (
+            "run_id",
+            "backend_incarnation",
+            "status",
+            "recipe",
+            "intent_revision",
+            "progress_s",
+            "cleanup",
+            "uncertain",
+            "first_cause",
+            "native_first_cause",
+        ):
+            value = run.get(key)
+            if key not in run:
+                continue
+            if isinstance(value, str) and len(value) > 512:
+                summary[key] = {"prefix": value[:512], "sha256": hashlib.sha256(value.encode()).hexdigest()}
+            elif value is None or type(value) in (bool, int, float, str):
+                summary[key] = value
+    error = {
+        "status": "reporting_error",
+        "code": "response_limit",
+        "reason": "Owner response exceeds the 65536-byte presentation limit; inspect the recorded operation outcome.",
+        "response_bytes": size,
+        "response_limit": RESPONSE_LIMIT,
+        "operation_result": outcome,
+        "run_summary": summary,
+    }
+    for key in ("accepted", "effect_admitted", "run_id", "operation_id", "uncertain"):
+        if key in outcome:
+            error[key] = outcome[key]
+    if "run_id" not in error and "run_id" in summary:
+        error["run_id"] = summary["run_id"]
+    return error
 
 
 def strict_json(data):
@@ -46,7 +115,7 @@ def strict_json(data):
 def encode(value, limit=RESPONSE_LIMIT):
     data = json.dumps(value, allow_nan=False, separators=(",", ":")).encode()
     if len(data) > limit:
-        raise ValueError("message too large")
+        raise ResponseLimitError(len(data))
     return data
 
 
@@ -243,7 +312,15 @@ class OwnerServer:
                         result = {"accepted": True, "status": "snapshot", "snapshot": snapshot}
                     else:
                         result = await asyncio.to_thread(self.authority.handle, command, envelope["device"])
-            await write_frame(writer, {"id": envelope["id"], "result": result}, RESPONSE_LIMIT)
+            try:
+                await write_frame(writer, {"id": envelope["id"], "result": result}, RESPONSE_LIMIT)
+            except ResponseLimitError as exc:
+                # Encoding happens before writer.write; the one correlated fallback is a complete frame.
+                await write_frame(
+                    writer,
+                    {"id": envelope["id"], "result": reporting_error(result, exc.size)},
+                    RESPONSE_LIMIT,
+                )
         except (TimeoutError, ValueError, TypeError, KeyError, asyncio.IncompleteReadError, ConnectionError):
             pass
         finally:

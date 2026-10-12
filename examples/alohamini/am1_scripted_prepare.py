@@ -12,18 +12,20 @@ if __package__:
     from .am1_session_contract import (
         ELBOW_RECOVERY_DEFINITIONS,
         LEFT_ELBOW_ORIGINAL_RETURN,
+        LEFT_ELBOW_POSITIVE_CONTROL,
         LEFT_ELBOW_RESPONSE,
     )
 else:
     from am1_session_contract import (
         ELBOW_RECOVERY_DEFINITIONS,
         LEFT_ELBOW_ORIGINAL_RETURN,
+        LEFT_ELBOW_POSITIVE_CONTROL,
         LEFT_ELBOW_RESPONSE,
     )
 
 SHOULDER = "arm_left_shoulder_lift.pos"
 RECOVERY_PROFILES = frozenset(d.profile for d in ELBOW_RECOVERY_DEFINITIONS.values())
-MEASURED_SEED_PROFILES = RECOVERY_PROFILES | {LEFT_ELBOW_ORIGINAL_RETURN.profile}
+MEASURED_SEED_PROFILES = RECOVERY_PROFILES | {LEFT_ELBOW_ORIGINAL_RETURN.profile, LEFT_ELBOW_POSITIVE_CONTROL.profile}
 
 
 class PreparedScriptedInput:
@@ -55,6 +57,7 @@ class PreparedScriptedInput:
             "LeftElbowDwellCompare",
             LEFT_ELBOW_RESPONSE.profile,
             LEFT_ELBOW_ORIGINAL_RETURN.profile,
+            LEFT_ELBOW_POSITIVE_CONTROL.profile,
             *RECOVERY_PROFILES,
         }:
             raise ValueError("preparation requires an explicitly supported finite profile")
@@ -75,6 +78,7 @@ class PreparedScriptedInput:
             "LeftElbowDwellCompare": 24.0,
             LEFT_ELBOW_RESPONSE.profile: LEFT_ELBOW_RESPONSE.trajectory_s,
             LEFT_ELBOW_ORIGINAL_RETURN.profile: LEFT_ELBOW_ORIGINAL_RETURN.trajectory_s,
+            LEFT_ELBOW_POSITIVE_CONTROL.profile: LEFT_ELBOW_POSITIVE_CONTROL.nominal_trajectory_s,
             **{d.profile: d.trajectory_s for d in ELBOW_RECOVERY_DEFINITIONS.values()},
         }[self.motion_profile]
         self.preparation_elapsed_s = 0.0
@@ -142,6 +146,10 @@ class PreparedScriptedInput:
     @property
     def retained_return(self):
         return None if self.preparing else getattr(self._program, "retained_return", None)
+
+    @property
+    def positive_control(self):
+        return {"program_completed":False, "coarse_functional_pass":False} if self.preparing else self._program.positive_control
 
     @property
     def recovery(self):
@@ -246,7 +254,7 @@ class PreparedScriptedInput:
             return
         if not self.preparing:
             kwargs = {"selected_feedback": selected_feedback} if self.motion_profile in {
-                LEFT_ELBOW_RESPONSE.profile, LEFT_ELBOW_ORIGINAL_RETURN.profile,
+                LEFT_ELBOW_RESPONSE.profile, LEFT_ELBOW_ORIGINAL_RETURN.profile, LEFT_ELBOW_POSITIVE_CONTROL.profile,
                 *RECOVERY_PROFILES,
             } else {}
             self._program.advance(now, observed, observation_sequence, defer_events=True, **kwargs)
