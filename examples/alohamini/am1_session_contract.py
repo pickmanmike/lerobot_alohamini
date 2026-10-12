@@ -677,6 +677,19 @@ class SelectedElbowExperiment:
             proof, run_id, host_incarnation, recipe_name=self.recipe_name,
             current_cap_ma=self.current_cap_ma, experiment_sha256=self.sha256)
 
+    def startup_hold_valid(self, requested_target, frozen_raw, calibration):
+        """Qualify one measured preparation hold, preserving actual floor encoding.
+
+        The initial input has not yet seeded its finite context. Its measured raw
+        reference and encoded integer goal remain distinct, as in normal proofs.
+        This exception belongs only to the separately pinned response envelope.
+        """
+        if self.response_rule is None or type(frozen_raw) is not int:
+            return False
+        measured = self.measured_origin(requested_target, calibration)
+        goal = self.encoded_goal(requested_target, calibration)
+        return measured == frozen_raw and type(goal) is int and goal in {frozen_raw, frozen_raw - 1}
+
 
 @dataclass(frozen=True)
 class OriginalElbowReturn:

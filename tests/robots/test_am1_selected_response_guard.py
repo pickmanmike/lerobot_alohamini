@@ -48,6 +48,7 @@ def guarded(monkeypatch, *, historical=False, excursion=10.0):
             status(bytes([91]), motor_id=3),
         ],
     )
+
     definition = descriptor(historical=historical, excursion_norm=excursion)
     obj._am1_selected_elbow_experiment = definition
     identity.update(recipe=definition.recipe_name, experiment_sha256=definition.sha256)
@@ -145,6 +146,265 @@ def guarded(monkeypatch, *, historical=False, excursion=10.0):
         writes=writes,
         rows=rows,
     )
+
+
+def startup_fixture(monkeypatch):
+    from lerobot.robots.alohamini import alohamini as robot_module
+
+    g = guarded(monkeypatch)
+    g.control.state, g.control.epoch, g.control.intent_revision = "paused", 1, 0
+    monkeypatch.setattr(robot_module.time, "monotonic", lambda: g.now[0])
+    startup_observe(g, 0.8)
+    return g
+
+
+def startup_observe(g, at, *, raw=2000, current=0):
+    g.now[0] = at
+    g.robot._am1_selected_joint_position = {
+        "raw": raw,
+        "normalized": (raw - 1000) / 10 - 100,
+        "read_started_at_monotonic_s": at - 0.02,
+        "read_completed_at_monotonic_s": at - 0.01,
+    }
+    g.robot._am1_selected_joint_current = {
+        "raw": current,
+        "ma": current * 6.5,
+        "read_started_at_monotonic_s": at - 0.005,
+        "read_completed_at_monotonic_s": at,
+    }
+    observation = {}
+    g.control.annotate(observation, acquired_at=at)
+    g.evidence.guard_recovery(g.robot, g.control, observation)
+    return observation
+
+
+def startup_action(g, *, requested=0.0, sequence=12, metadata=None, **body):
+    result = {
+        "arm_left_elbow_flex.pos": requested,
+        "x.vel": 0,
+        "y.vel": 0,
+        "theta.vel": 0,
+        "lift_axis.vel": 0,
+        host.AM1_LOCAL_CONTROL_KEY: {
+            "version": 1,
+            "mode": "active",
+            "epoch": 2,
+            "intent_revision": 0,
+            "action_sequence": sequence,
+            **g.control.binding,
+        },
+        **body,
+    }
+    if metadata is not None:
+        result["_am1_selected_joint_evidence"] = metadata
+    return result
+
+
+def startup_send(g, action, at):
+    g.now[0] = at
+    assert g.control.apply(g.robot, action)
+    observation = g.robot.get_observation()
+    g.control.annotate(observation, acquired_at=at)
+    g.evidence.guard_recovery(g.robot, g.control, observation)
+    return observation
+
+
+def test_actual_local_control_preparation_hold_then_first_context_is_supported(monkeypatch):
+    g = startup_fixture(monkeypatch)
+    startup_send(g, startup_action(g), 1)
+    assert g.control.state == "active" and g.control.epoch == 2
+    assert g.evidence.context is None and g.evidence.response_boundary is None
+    startup_observe(g, 3.2)
+    metadata = context(
+        profile=g.definition.profile,
+        progress_s=0,
+        phase="baseline",
+        cycle=0,
+        reference=0.0,
+        endpoint_target=10.0,
+        requested_target=0.0,
+        sample_key="baseline",
+        acquisition_s=0.0,
+        admitted_reference=0.0,
+        experiment_sha256=g.definition.sha256,
+    )
+    startup_send(g, startup_action(g, sequence=13, metadata=metadata), 3.21)
+    assert g.evidence.response_boundary["status"] == "tracking"
+    before = (len(g.writes), len(g.port.writes))
+    with pytest.raises(RuntimeError, match="response"):
+        g.control.apply(g.robot, startup_action(g, sequence=14))
+    assert (len(g.writes), len(g.port.writes)) == before
+    assert g.control.accepted_action_sequence == 13
+    # Protective Pause must still execute after the rejected unmarked command.
+    protective = []
+    monkeypatch.setattr(g.robot, "stop_motion", lambda: protective.append("stop"))
+    monkeypatch.setattr(g.robot, "hold_follower_arms", lambda: protective.append("measured-hold"))
+    pause = startup_action(g, sequence=15)
+    pause[host.AM1_LOCAL_CONTROL_KEY].update(mode="pause", epoch=3)
+    assert g.control.apply(g.robot, pause)
+    assert g.control.state == "paused" and g.evidence.context is None
+    assert protective == ["stop", "measured-hold"]
+
+
+@pytest.mark.parametrize(
+    "change",
+    [{"requested": 3}, {"x.vel": 1}, {"lift_axis.vel": 0.1}, {"lift_axis.height_mm": 2}, {"requested": True}],
+)
+def test_unmarked_startup_movement_refuses_before_actual_send(monkeypatch, change):
+    g = startup_fixture(monkeypatch)
+    g.now[0] = 1
+    before = (len(g.writes), len(g.port.writes), g.control.accepted_action_sequence)
+    with pytest.raises(RuntimeError, match="response|startup"):
+        g.control.apply(g.robot, startup_action(g, **change))
+    assert (len(g.writes), len(g.port.writes), g.control.accepted_action_sequence) == before
+
+
+def test_startup_initial_single_tick_settling_freezes_target_without_drift(monkeypatch):
+    g = startup_fixture(monkeypatch)
+    startup_observe(g, 0.9, raw=2001)
+    startup_send(g, startup_action(g), 1)
+    startup_observe(g, 1.1, raw=2001)
+    before = (len(g.writes), g.control.accepted_action_sequence)
+    with pytest.raises(RuntimeError, match="response|startup"):
+        g.control.apply(g.robot, startup_action(g, requested=0.1, sequence=13))
+    assert (len(g.writes), g.control.accepted_action_sequence) == before
+
+
+def test_startup_hold_20_second_wall_is_not_the_moving_leg_window(monkeypatch):
+    g = startup_fixture(monkeypatch)
+    startup_send(g, startup_action(g), 1)
+    startup_observe(g, 19.9)
+    startup_send(g, startup_action(g, sequence=13), 20)
+    startup_observe(g, 20.99)
+    g.now[0] = 21
+    before = len(g.writes)
+    with pytest.raises(RuntimeError, match="20 seconds"):
+        g.control.apply(g.robot, startup_action(g, sequence=14))
+    assert len(g.writes) == before
+    assert g.evidence.deactivate(g.robot) is None
+
+
+@pytest.mark.parametrize("route", ["prepare", "postread"])
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_startup_hold_drift_at_30_raw_refuses_without_another_write(monkeypatch, route, sign):
+    g = startup_fixture(monkeypatch)
+    startup_send(g, startup_action(g), 1)
+    # Subthreshold error remains an ordinary hold, without a precision/stall claim.
+    startup_observe(g, 1.05, raw=2000 + sign * 29)
+    g.now[0] = 1.1
+    g.robot._am1_selected_joint_position.update(
+        raw=2000 + sign * 30,
+        normalized=sign * 3.0,
+        read_started_at_monotonic_s=1.08,
+        read_completed_at_monotonic_s=1.09,
+    )
+    g.robot._am1_selected_joint_current.update(
+        read_started_at_monotonic_s=1.095,
+        read_completed_at_monotonic_s=1.1,
+    )
+    before = (len(g.writes), len(g.port.writes), g.control.accepted_action_sequence)
+    with pytest.raises(RuntimeError, match="startup"):
+        if route == "prepare":
+            g.control.apply(g.robot, startup_action(g, sequence=13))
+        else:
+            observation = {}
+            g.control.annotate(observation, acquired_at=1.1)
+            g.evidence.guard_recovery(g.robot, g.control, observation)
+    assert (len(g.writes), len(g.port.writes), g.control.accepted_action_sequence) == before
+    fault = g.robot._am1_selected_joint_fault
+    assert fault["position"]["raw"] == 2000 + sign * 30
+    assert fault["action"]["expected_goal_raw"] == 2000
+    assert fault["response_boundary"]["failure_kind"] == "unavailable"
+
+
+def test_startup_stale_original_cache_and_cap_refuse_before_send(monkeypatch):
+    g = startup_fixture(monkeypatch)
+    g.now[0] = 1.4
+    before = len(g.writes)
+    with pytest.raises(RuntimeError, match="acquisition|startup|response"):
+        g.control.apply(g.robot, startup_action(g))
+    assert len(g.writes) == before
+    # A new fixture isolates actual cap priority over malformed startup motion.
+    g = startup_fixture(monkeypatch)
+    g.robot._am1_selected_joint_current.update(raw=24, ma=156.0)
+    g.now[0] = 1
+    before = len(g.writes)
+    with pytest.raises(RuntimeError, match="effort"):
+        g.control.apply(g.robot, startup_action(g, requested=3))
+    assert len(g.writes) == before
+    assert g.robot._am1_selected_joint_fault["source"] == "cached_guard"
+
+
+@pytest.mark.parametrize("raw", [1224, 1655, 1686, 2312, 2399, 2458])
+def test_startup_contract_keeps_measured_origin_separate_from_actual_floor_goal(raw):
+    d = descriptor()
+    calibration = {"drive_mode": 0, "homing_offset": 1845, "range_min": 864, "range_max": 3073}
+    requested = (raw - 864) / 2209 * 200 - 100
+    assert d.startup_hold_valid(requested, raw, calibration)
+    assert d.encoded_goal(requested, calibration) in {raw, raw - 1}
+    assert not d.startup_hold_valid(requested, raw + 1, calibration)
+    assert not descriptor(historical=True).startup_hold_valid(requested, raw, calibration)
+
+
+@pytest.mark.parametrize("raw", [1224, 1655, 1686, 2312, 2399, 2458])
+def test_real_prepared_input_handoff_preserves_measured_reference_before_floor_encoding(raw):
+    from functools import partial
+
+    from examples.alohamini.am1_finite_task import JOINT_KEYS
+    from examples.alohamini.am1_scripted_prepare import PreparedScriptedInput
+    from examples.alohamini.scripted_leader import LeftElbowPositiveControlInput
+    from tests.robots.test_am1_selected_elbow_profiles import seed
+
+    d = descriptor()
+    q0 = (raw - 864) / 2209 * 200 - 100
+    initial = seed(q0)
+    prepared = PreparedScriptedInput(
+        initial,
+        joint_keys=JOINT_KEYS,
+        fps=10,
+        provider=partial(LeftElbowPositiveControlInput, definition=d),
+        motion_profile=d.profile,
+        duration_s=d.nominal_trajectory_s,
+        emit=lambda _: None,
+    )
+    prepared.admit(0)
+    for sequence in range(1, 35):
+        prepared.advance(sequence / 10, initial, sequence)
+        if not prepared.preparing:
+            break
+    assert not prepared.preparing
+    metadata = prepared.diagnostic_context
+    assert metadata["progress_s"] == 0 and metadata["phase"] == "baseline"
+    assert metadata["admitted_reference"] == metadata["reference"] == metadata["requested_target"] == q0
+    assert prepared.get_action()["left_elbow_flex.pos"] == q0
+    assert d.context_valid(metadata)
+
+
+def test_first_finite_handoff_accepts_fresh_single_tick_seed_without_reopening_startup(monkeypatch):
+    g = startup_fixture(monkeypatch)
+    startup_send(g, startup_action(g), 1)
+    startup_observe(g, 3.2, raw=2001)
+    metadata = context(
+        profile=g.definition.profile,
+        progress_s=0,
+        phase="baseline",
+        cycle=0,
+        reference=0.1,
+        endpoint_target=10.1,
+        requested_target=0.1,
+        sample_key="baseline",
+        acquisition_s=0.0,
+        admitted_reference=0.1,
+        experiment_sha256=g.definition.sha256,
+    )
+    g.now[0] = 3.21
+    assert g.control.apply(g.robot, startup_action(g, requested=0.1, sequence=13, metadata=metadata))
+    assert g.evidence.reference == 0.1 and g.evidence.profile == g.definition.profile
+    g.evidence.deactivate(g.robot)
+    before = len(g.writes)
+    with pytest.raises(RuntimeError, match="response"):
+        g.control.apply(g.robot, startup_action(g, sequence=14))
+    assert len(g.writes) == before
 
 
 def test_separate_150_pin_preserves_literal_initial_envelope_and_payload_shape():

@@ -70,6 +70,8 @@ class AM1SelectedJointEvidence:
         self._response_last_acquisitions = None
         self._response_last_current_raw = None
         self._response_continuity_lost = False
+        self._response_startup_hold = None
+        self._response_startup_acquisitions = None
 
     VISIBLE_STATIC_REGISTERS = (
         "Firmware_Major_Version",
@@ -359,6 +361,13 @@ class AM1SelectedJointEvidence:
     def prepare(self, robot, action, binding):
         cleaned = {k: v for k, v in action.items() if k != MARKER}
         if MARKER not in action:
+            candidate = getattr(robot, "_am1_selected_elbow_experiment", None)
+            if candidate is not None and getattr(candidate, "response_rule", None) is not None:
+                definition = self._visible_definition(robot)
+                actual = robot._am1_visible_control_binding
+                if binding != {k: actual[k] for k in ("run_id", "host_incarnation")}:
+                    self._response_refuse(robot, "Selected response startup owner binding is unavailable")
+                self._prepare_response_startup_hold(robot, cleaned, definition)
             self.deactivate(robot)
             return cleaned
         if (
@@ -532,6 +541,16 @@ class AM1SelectedJointEvidence:
                 or cycle not in (3, 4)
             ):
                 raise RuntimeError("Selected joint evidence changed or reversed its frozen endpoint")
+        startup = self._response_startup_hold
+        if (visible is not None and getattr(visible, "response_rule", None) is not None
+                and startup is not None and self.profile is None):
+            _, position, material = self._response_startup_pair(robot, visible)
+            admitted = metadata["admitted_reference"]
+            measured = visible.measured_origin(admitted, material)
+            if (progress != 0 or requested != admitted
+                    or not visible.startup_hold_valid(admitted, measured, material)
+                    or abs(measured - position["raw"]) > 1):
+                self._response_refuse(robot, "Selected response first finite measured pose is unavailable")
         self.reference, self.endpoint, self.profile = reference, endpoint, profile
         self.progress, self.context = progress, copy.deepcopy(metadata)
         robot._am1_selected_joint_evidence_context = copy.deepcopy(metadata)
@@ -825,6 +844,99 @@ class AM1SelectedJointEvidence:
         except Exception:
             return False  # A missing/invalid diagnostic must never obstruct protective release.
 
+    def _response_startup_pair(self, robot, definition):
+        now = self.clock()
+        if (self.visible_started_at is not None
+                and now - self.visible_started_at >= definition.live_s):
+            raise RuntimeError("Visible 60-second native Live ceiling expired")
+        if not definition.settings_valid(self.visible_settings):
+            self._response_refuse(robot, "Selected response startup settings are unavailable")
+        position = getattr(robot, "_am1_selected_joint_position", None)
+        current = getattr(robot, "_am1_selected_joint_current", None)
+        for cache in (position, current):
+            if (not isinstance(cache, dict)
+                    or not all(_number(cache.get(k)) for k in
+                               ("read_started_at_monotonic_s", "read_completed_at_monotonic_s"))
+                    or not 0 <= cache["read_started_at_monotonic_s"] <= cache["read_completed_at_monotonic_s"] <= now
+                    or now - cache["read_started_at_monotonic_s"] > .5):
+                self._response_refuse(robot, "Selected response startup original acquisition is unavailable")
+        if (type(current.get("raw")) is not int or not _number(current.get("ma"))
+                or current["ma"] != current["raw"] * 6.5):
+            self._response_refuse(robot, "Selected response startup actual current is unavailable")
+        self.check_visible_current(robot, current.get("raw"), getattr(robot, "_joint_current_limit_ma", 100),
+                                   source="cached_guard", sample=current)
+        acquisitions = tuple(cache[k] for cache in (position, current) for k in
+                             ("read_started_at_monotonic_s", "read_completed_at_monotonic_s"))
+        if (self._response_startup_acquisitions is not None
+                and any(new < old for new, old in zip(acquisitions, self._response_startup_acquisitions))):
+            self._response_refuse(robot, "Selected response startup original acquisition regressed")
+        calibration = {k: int(getattr(robot.left_bus.calibration[MOTOR], k)) for k in
+                       ("drive_mode", "homing_offset", "range_min", "range_max")}
+        registers = self.visible_settings["before"]["registers"]
+        if (type(position.get("raw")) is not int
+                or not max(calibration["range_min"], registers["Min_Position_Limit"]) <= position["raw"]
+                <= min(calibration["range_max"], registers["Max_Position_Limit"])):
+            self._response_refuse(robot, "Selected response startup actual position is unavailable")
+        self._response_startup_acquisitions = acquisitions
+        return now, position, calibration
+
+    def _prepare_response_startup_hold(self, robot, action, definition):
+        now, position, calibration = self._response_startup_pair(robot, definition)
+        if (self.reference is not None or self.profile is not None or self._response_window is not None
+                or self._response_continuity_lost):
+            self._response_refuse(robot, "Selected response finite context is missing before active actuation")
+        body = {"x.vel", "y.vel", "theta.vel", "lift_axis.vel"}
+        if (not body <= set(action) or any(not _number(action[k]) or action[k] != 0 for k in body)
+                or any(k not in body and not (k.startswith("arm_") and k.endswith(".pos")) for k in action)
+                or any(not _number(v) for v in action.values())):
+            self._response_refuse(robot, "Selected response startup requires zero body intent")
+        requested = action.get(POSITION)
+        measured = definition.measured_origin(requested, calibration)
+        if not definition.startup_hold_valid(requested, measured, calibration):
+            self._response_refuse(robot, "Selected response startup measured hold is unavailable")
+        startup = self._response_startup_hold
+        binding = getattr(robot, "_am1_visible_control_binding", None)
+        goal = definition.encoded_goal(requested, calibration)
+        if startup is None:
+            # One tick of sample-to-send settling is explicit; never clip, drift or renew the hold.
+            if abs(measured - position["raw"]) > 1:
+                self._response_refuse(robot, "Selected response startup requested movement is unavailable")
+            self._response_startup_hold = {"requested": requested, "measured_raw": measured,
+                                          "goal_raw": goal, "calibration": calibration,
+                                          "binding": copy.deepcopy(binding), "started_at": now}
+        elif (requested != startup["requested"] or goal != startup["goal_raw"]
+              or calibration != startup["calibration"] or binding != startup["binding"]):
+            self._response_refuse(robot, "Selected response startup frozen hold changed")
+        elif now - startup["started_at"] >= 20:
+            self._response_refuse(robot, "Selected response startup measured hold exceeded 20 seconds")
+        elif abs(position["raw"] - startup["goal_raw"]) >= definition.response_rule["commanded_error_raw"]:
+            self._response_refuse(robot, "Selected response startup held position left tracking bound")
+
+    def _guard_response_startup_hold(self, robot, control, marker, definition, position, current):
+        now, _, calibration = self._response_startup_pair(robot, definition)
+        startup = self._response_startup_hold
+        action = getattr(robot, "_am1_selected_joint_action", None)
+        if (startup is None or marker is None or self.reference is not None or self.profile is not None
+                or self._response_window is not None or self._response_continuity_lost
+                or startup["binding"] != getattr(robot, "_am1_visible_control_binding", None)
+                or calibration != startup["calibration"]
+                or not isinstance(action, dict) or action.get("requested") != startup["requested"]
+                or action.get("expected_goal_raw") != startup["goal_raw"]
+                or not definition.startup_hold_valid(action.get("requested"), startup["measured_raw"], calibration)
+                or action.get("sync_write_returned") is not True):
+            self._response_refuse(robot, "Selected response startup active hold is unavailable")
+        if now - startup["started_at"] >= 20:
+            self._response_refuse(robot, "Selected response startup measured hold exceeded 20 seconds")
+        if abs(position["raw"] - startup["goal_raw"]) >= definition.response_rule["commanded_error_raw"]:
+            self._response_refuse(robot, "Selected response startup held position left tracking bound")
+        if (not all(_number(action.get(k)) for k in
+                    ("write_started_at_monotonic_s", "write_completed_at_monotonic_s"))
+                or not 0 <= action["write_started_at_monotonic_s"] <= action["write_completed_at_monotonic_s"]
+                <= position["read_started_at_monotonic_s"]
+                or max(position["read_completed_at_monotonic_s"], current["read_completed_at_monotonic_s"])
+                > marker["acquired_at_monotonic_s"]):
+            self._response_refuse(robot, "Selected response startup action/acquisition ordering is unavailable")
+
     def _guard_response(self, robot, control, observation, definition, position, current):
         rule = definition.response_rule
         if control.state != "active":
@@ -838,8 +950,12 @@ class AM1SelectedJointEvidence:
         if self._response_continuity_lost:
             self._response_refuse(robot, "Selected response continuity unavailable after protective hold",
                                   failure_kind="continuity_lost")
-        marker = self._matched_marker(control, observation if isinstance(observation, dict) else {})
         context = self.context
+        marker = self._matched_marker(control, observation if isinstance(observation, dict) else {},
+                                      require_context=context is not None or self.profile is not None)
+        if context is None and self.reference is None and self.profile is None:
+            self._guard_response_startup_hold(robot, control, marker, definition, position, current)
+            return
         if marker is None or not definition.context_valid(context):
             self._response_refuse(robot, "Selected response active source/context is unavailable")
         action = getattr(robot, "_am1_selected_joint_action", None)
@@ -1045,8 +1161,9 @@ class AM1SelectedJointEvidence:
         result["present_position_normalized"] = float(robot_position(bus, result["present_position_raw"]))
         return result
 
-    def _matched_marker(self, control, observation):
-        if not self.enabled or self.context is None or control.binding is None or control.state != "active":
+    def _matched_marker(self, control, observation, *, require_context=True):
+        if (not self.enabled or require_context and self.context is None
+                or control.binding is None or control.state != "active"):
             return None
         marker = observation.get("_am1_local_feedback", {})
         if (
