@@ -555,7 +555,44 @@ class AlohaMini(Robot):
 
     AM1_ACTIVATION_MAX_RAW_AGE_S = 1.0
 
+    def _refresh_am1_startup_lift_feedback(self) -> None:
+        """Keep the existing lift acquisition continuous through AM1 activation.
+
+        This runs only on the owner thread at startup boundaries. A due read
+        retains the same thermal slots, clocks and latched fault; a gap is never
+        converted to five new lows. Ordinary host-loop cadence is unchanged.
+        """
+        if self.config.robot_model != "alohamini1":
+            return
+        operation = getattr(self, "_lift_operation", None)
+        if operation is None:
+            return  # Homing was explicitly skipped; preserve that existing path.
+        from .lift_motor_feedback import POLL_S, ComparisonRefusal
+
+        try:
+            operation.raise_if_faulted()
+            record = operation.last_record
+            stamp = record.get("sample_monotonic_s") if isinstance(record, dict) else None
+            now = time.monotonic()
+            if (
+                isinstance(stamp, bool)
+                or not isinstance(stamp, (int, float))
+                or not math.isfinite(stamp)
+                or not math.isfinite(now)
+                or now < stamp
+            ):
+                raise ComparisonRefusal("startup: original lift acquisition clock is unavailable or invalid.")
+            if now - stamp >= POLL_S:
+                operation.poll()
+            operation.temperature.assert_fresh(time.monotonic())
+        except BaseException as error:
+            if operation.failure is None:
+                operation.failure = error
+            raise
+
     def _require_am1_activation_fresh(self, phase: str) -> None:
+        if phase == "after_home":
+            self._refresh_am1_startup_lift_feedback()
         expected = len(self.left_arm_motors) + len(self.right_arm_motors)
         if not expected:
             return

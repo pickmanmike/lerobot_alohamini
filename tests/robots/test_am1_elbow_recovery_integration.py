@@ -1,6 +1,7 @@
 """Recovery admission and sole-owner guards; injected caches only."""
 
 import copy
+from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -735,7 +736,7 @@ def reporting_authority(run, evidence):
     authority = SessionAuthority.__new__(SessionAuthority)
     authority.run = copy.deepcopy(run)
     authority.run.setdefault("deadline", None)
-    authority.run.setdefault("progress_s", authority.run["execution"]["progress_s"])
+    authority.run.setdefault("progress_s", (authority.run.get("execution") or {}).get("progress_s", 0.0))
     authority.mutex = threading.RLock()
     authority.clock = lambda: 100.0
     authority.service_incarnation = str(uuid4())
@@ -1030,3 +1031,293 @@ def test_retained_recovery_restart_refuses_unknown_active_foreign_or_changed_pro
         else:
             gain["restore_required"] = True
     assert authority.elbow_recovery_prerequisite(RECIPES["physical-left-elbow-recovery-i1"], evidence) is None
+
+
+def startup_continuation_fixture(tmp_path):
+    import hashlib
+
+    from tests.robots.test_am1_physical_executor import terminal_cleanup_outcome
+    from tools.am1_session_core import _canonical
+
+    def private(path, value):
+        path.write_bytes(_canonical(value))
+        path.chmod(0o600)
+
+    prior = prior_native_i0()
+    ref = copy.deepcopy(prior["retained_return_reference"])
+    before_ref = tmp_path / "before-reference.json"
+    private(before_ref, ref)
+    ref_sha = hashlib.sha256(before_ref.read_bytes()).hexdigest()
+    prior["backend_contract"]["elbow_return_reference"] = {"path": str(before_ref), "sha256": ref_sha}
+    prior["execution"]["recovery"]["artifact_sha256"] = ref_sha
+    prior["completion_receipt"]["execution"] = copy.deepcopy(prior["execution"])
+    prior.update(service_incarnation=str(uuid4()), intent=None, deadline=60.0, progress_s=5.5)
+    paths = [
+        "src/lerobot/robots/alohamini/" + name
+        for name in (
+            "alohamini.py",
+            "alohamini_client.py",
+            "alohamini_host.py",
+            "config_alohamini.py",
+            "lift_motor_feedback.py",
+            "lift_operational.py",
+            "lift_relief.py",
+            "selected_joint_evidence.py",
+            "am1_elbow_integral.py",
+        )
+    ] + ["tools/run_am1_host.sh", "examples/alohamini/am1_session_contract.py"]
+    motor = tmp_path / "motor"
+    changed = {}
+    old_rows = []
+    new_rows = []
+    for path in paths:
+        before = hashlib.sha256(("before " + path).encode()).hexdigest()
+        is_changed = path.endswith(("/alohamini.py", "/alohamini_host.py"))
+        data = ("after " if is_changed else "before ") + path
+        target = motor / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(data)
+        target.chmod(0o644)
+        after = hashlib.sha256(target.read_bytes()).hexdigest()
+        old_rows.append({"path": path, "sha256": before})
+        new_rows.append({"path": path, "sha256": after})
+        if is_changed:
+            changed[path] = {"before_sha256": before, "after_sha256": after}
+
+    def manifest(head, rows, bundle):
+        return {
+            "version": 2,
+            "motor": {
+                "base": "1" * 40,
+                "head": head,
+                "ref": "refs/heads/reviewed",
+                "files": rows,
+                "bundle_sha256": bundle,
+            },
+            "helper": {"head": "2" * 40},
+            "camera": {"head": "3" * 40},
+            "calibration_sha256": "4" * 64,
+            "lift_delta_files": [],
+            "executor_base": "5" * 40,
+            "executor_head": "6" * 40,
+            "executor_bundle_sha256": "7" * 64,
+        }
+
+    before_manifest = tmp_path / "before-manifest.json"
+    after_manifest = tmp_path / "after-manifest.json"
+    private(before_manifest, manifest(prior["backend_contract"]["host_head"], old_rows, "8" * 64))
+    private(after_manifest, manifest("a" * 40, new_rows, "9" * 64))
+    prior["backend_contract"].update(
+        source_pins=str(before_manifest), host_repository=str(motor), camera_state=str(tmp_path / "camera")
+    )
+    failed = copy.deepcopy(prior)
+    failed.update(
+        run_id=str(uuid4()),
+        recipe="physical-left-elbow-recovery-i1",
+        status="faulted",
+        progress_s=0,
+        deadline=None,
+        native_live_at=None,
+        first_cause="startup timeout",
+        native_first_cause="ComparisonRefusal: temperature: five-slot feedback window is stale (>0.5 s).",
+        recovery_episodes=0,
+    )
+    failed.pop("execution")
+    failed.pop("completion_receipt")
+    proof_authority = reporting_authority(prior, {"lifecycle": copy.deepcopy(prior["physical_result"])})
+    from examples.alohamini.am1_session_contract import RECIPES
+
+    failed["recovery_prerequisite"] = proof_authority.elbow_recovery_prerequisite(
+        RECIPES[failed["recipe"]], proof_authority._evidence()
+    )
+    incarnation = str(uuid4())
+    life = terminal_cleanup_outcome(failed["run_id"], incarnation, "faulted")
+    life.update(
+        run_id=failed["run_id"],
+        phase="terminal",
+        native_live_at=None,
+        first_cause=failed["native_first_cause"],
+        run_directory=str(tmp_path / "run"),
+    )
+    gain = copy.deepcopy(prior["execution"]["recovery"]["gain_trial"])
+    gain.update(
+        state="restored",
+        status="restored",
+        integral=1,
+        restore_required=False,
+        configured_integral_readback=1,
+        active_verified=True,
+        restored_integral_readback=0,
+        restored_lock_readback=0,
+        restored_bytes=copy.deepcopy(gain["original_bytes"]),
+        first_failure=None,
+    )
+    gain["binding"] = {
+        "run_id": failed["run_id"],
+        "host_incarnation": incarnation,
+        "recipe": failed["recipe"],
+        "integral": 1,
+    }
+    gain["original_registers"].update(
+        Model_Number=777, Firmware_Major_Version=3, Firmware_Minor_Version=10, Operating_Mode=0
+    )
+    gain["active_registers"]["I_Coefficient"] = 1
+    life["readback"]["readback"]["elbow_integral"] = gain
+    failed["physical_result"] = life
+    run_dir = Path(life["run_directory"])
+    run_dir.mkdir()
+    private(run_dir / "cleanup.json", life["readback"])
+    camera_dir = tmp_path / "camera"
+    camera_dir.mkdir()
+    camera_file = camera_dir / ("release-" + failed["run_id"] + ".json")
+    private(camera_file, life["camera_release"])
+    after = copy.deepcopy(prior["backend_contract"])
+    after.update(host_head="a" * 40, source_pins=str(after_manifest))
+    after_ref = copy.deepcopy(ref)
+    after_ref["admission_motor_head"] = "a" * 40
+    ref_file = tmp_path / "after-reference.json"
+    private(ref_file, after_ref)
+    after["elbow_return_reference"] = {
+        "path": str(ref_file),
+        "sha256": hashlib.sha256(ref_file.read_bytes()).hexdigest(),
+    }
+    record = {
+        "version": 1,
+        "kind": "am1-elbow-startup-continuation",
+        "failed_run_id": failed["run_id"],
+        "failed_terminal_sha256": hashlib.sha256(_canonical(failed)).hexdigest(),
+        "failed_cleanup_sha256": hashlib.sha256((run_dir / "cleanup.json").read_bytes()).hexdigest(),
+        "failed_camera_sha256": hashlib.sha256(camera_file.read_bytes()).hexdigest(),
+        "prior_run": prior,
+        "source_transition": {
+            "before": copy.deepcopy(prior["backend_contract"]),
+            "after": after,
+            "before_reference": ref,
+            "after_reference": after_ref,
+            "changed_motor_files": changed,
+        },
+    }
+    evidence = idle_recovery_evidence(
+        dict(failed, backend_contract=after, retained_return_reference=after_ref)
+    )
+    authority = reporting_authority(failed, evidence)
+    authority.directory = tmp_path
+    receipt = tmp_path / "elbow-recovery-startup-continuation.json"
+    private(receipt, record)
+    return authority, evidence, record, receipt, after_manifest
+
+
+def test_owned_startup_continuation_revalidates_full_private_proof_without_public_duplication(tmp_path):
+    from examples.alohamini.am1_session_contract import RECIPES
+    from tools.am1_session_ipc import encode
+
+    authority, evidence, record, _, _ = startup_continuation_fixture(tmp_path)
+    original = copy.deepcopy(authority.run)
+    proof = authority.elbow_recovery_prerequisite(RECIPES[authority.run["recipe"]], evidence)
+    assert proof == authority.run["recovery_prerequisite"] and authority.run == original
+    assert set(authority._startup_continuation_note) == {"failed_run_id", "prior_run_id", "receipt_sha256"}
+    assert "prior_run" not in authority.snapshot()["evidence"] and authority.run == original
+    assert (
+        len(
+            encode(
+                {
+                    "id": str(uuid4()),
+                    "result": {"accepted": True, "status": "snapshot", "snapshot": authority.snapshot()},
+                }
+            )
+        )
+        <= 65536
+    )
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "duplicate_manifest",
+        "missing_manifest",
+        "extra_manifest",
+        "other_file",
+        "camera_material",
+        "gain_bytes_missing",
+        "gain_pid",
+        "gain_identity",
+        "configured_i",
+        "active_unverified",
+    ],
+)
+def test_startup_continuation_requires_closed_source_shape_and_actual_gain_restore(tmp_path, bad):
+    import hashlib
+    import json
+
+    from examples.alohamini.am1_session_contract import RECIPES
+    from tools.am1_session_core import _canonical
+
+    authority, evidence, record, receipt, manifest_path = startup_continuation_fixture(tmp_path)
+    if bad in {"duplicate_manifest", "missing_manifest", "extra_manifest", "other_file", "camera_material"}:
+        manifest = json.loads(manifest_path.read_bytes())
+        if bad == "duplicate_manifest":
+            manifest["motor"]["files"].append(copy.deepcopy(manifest["motor"]["files"][0]))
+        elif bad == "missing_manifest":
+            manifest["motor"]["files"].pop()
+        elif bad == "extra_manifest":
+            manifest["unexpected"] = True
+        elif bad == "other_file":
+            manifest["motor"]["files"][1]["sha256"] = "e" * 64
+        else:
+            manifest["camera"]["head"] = "f" * 40
+        manifest_path.write_bytes(_canonical(manifest))
+    else:
+        gain = authority.run["physical_result"]["readback"]["readback"]["elbow_integral"]
+        if bad == "gain_bytes_missing":
+            gain.pop("original_bytes")
+            gain.pop("restored_bytes")
+        elif bad == "gain_pid":
+            gain["original_registers"]["P_Coefficient"] = 32
+        elif bad == "gain_identity":
+            gain["original_registers"]["Model_Number"] = 778
+        elif bad == "configured_i":
+            gain["configured_integral_readback"] = 0
+        else:
+            gain["active_verified"] = False
+        record["failed_terminal_sha256"] = hashlib.sha256(_canonical(authority.run)).hexdigest()
+        cleanup = Path(authority.run["physical_result"]["run_directory"]) / "cleanup.json"
+        cleanup.write_bytes(_canonical(authority.run["physical_result"]["readback"]))
+        record["failed_cleanup_sha256"] = hashlib.sha256(cleanup.read_bytes()).hexdigest()
+        receipt.write_bytes(_canonical(record))
+    original = copy.deepcopy(authority.run)
+    assert authority.elbow_recovery_prerequisite(RECIPES[authority.run["recipe"]], evidence) is None
+    assert authority.run == original
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["live", "progress", "unknown", "native_cause", "prior", "comparator", "active_owner", "foreign_owner"],
+)
+def test_startup_continuation_keeps_zero_live_fault_and_fresh_idle_boundaries(tmp_path, bad):
+    import hashlib
+
+    from examples.alohamini.am1_session_contract import RECIPES
+    from tools.am1_session_core import _canonical
+
+    authority, evidence, record, receipt, _ = startup_continuation_fixture(tmp_path)
+    if bad == "live":
+        authority.run["native_live_at"] = 1.0
+    elif bad == "progress":
+        authority.run["progress_s"] = 0.1
+    elif bad == "unknown":
+        authority.run["uncertain"] = True
+    elif bad == "native_cause":
+        authority.run["native_first_cause"] = "Different startup fault"
+    elif bad == "prior":
+        record["prior_run"]["first_cause"] = "altered original"
+    elif bad == "comparator":
+        authority.run["recovery_prerequisite"]["hold_s"] = 2.0
+    elif bad == "active_owner":
+        evidence["active_acknowledged"] = True
+    else:
+        evidence["lifecycle"]["service_incarnation"] = str(uuid4())
+    record["failed_terminal_sha256"] = hashlib.sha256(_canonical(authority.run)).hexdigest()
+    receipt.write_bytes(_canonical(record))
+    original = copy.deepcopy(authority.run)
+    assert authority.elbow_recovery_prerequisite(RECIPES[authority.run["recipe"]], evidence) is None
+    assert authority.run == original

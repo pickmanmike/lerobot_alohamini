@@ -5,6 +5,7 @@ import json
 import math
 import os
 import sqlite3
+import stat
 import threading
 import time
 import uuid
@@ -241,6 +242,57 @@ def _retained_recovery_idle(evidence, previous, service_incarnation):
         )
         and evidence.get("accepted_host_action") == {}
     )
+
+
+def _continuation_bytes(path, *, limit=65536, source=False):
+    path = Path(path)
+    if (
+        not path.is_absolute()
+        or path.resolve() != path
+        or any(p.is_symlink() or p.is_junction() for p in (path, *path.parents))
+    ):
+        raise ValueError("literal ordinary continuation evidence required")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    fd = os.open(path, flags)
+    try:
+        info = os.fstat(fd)
+        uid = getattr(os, "getuid", lambda: info.st_uid)()
+        modes = (0o600, 0o644) if source else (0o600,)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or info.st_uid != uid
+            or not 0 < info.st_size <= limit
+            or os.name != "nt"
+            and stat.S_IMODE(info.st_mode) not in modes
+        ):
+            raise ValueError("owned bounded continuation evidence required")
+        with os.fdopen(fd, "rb", closefd=False) as stream:
+            raw = stream.read(limit + 1)
+        after = os.fstat(fd)
+        stable = (
+            "st_dev",
+            "st_ino",
+            "st_mode",
+            "st_nlink",
+            "st_uid",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+        if (
+            len(raw) != info.st_size
+            or len(raw) > limit
+            or any(getattr(after, k) != getattr(info, k) for k in stable)
+        ):
+            raise ValueError("continuation evidence changed during read")
+        return raw
+    finally:
+        os.close(fd)
+
+
+def _canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
 
 
 class SessionAuthority:
@@ -685,10 +737,342 @@ class SessionAuthority:
         self._event(status)
         self._save()
 
+    def _startup_literal_receipts(self, run, record):
+        lifecycle = run["physical_result"]
+        cleanup = _continuation_bytes(Path(lifecycle["run_directory"]) / "cleanup.json")
+        camera = _continuation_bytes(
+            Path(run["backend_contract"]["camera_state"]) / ("release-" + run["run_id"] + ".json")
+        )
+        return (
+            hashlib.sha256(cleanup).hexdigest() == record["failed_cleanup_sha256"]
+            and hashlib.sha256(camera).hexdigest() == record["failed_camera_sha256"]
+            and _canonical(json.loads(cleanup)) == _canonical(lifecycle["readback"])
+            and _canonical(json.loads(camera)) == _canonical(lifecycle["camera_release"])
+        )
+
+    def _startup_source_transition(self, record, evidence):
+        from tools.am1_session_ipc import strict_json
+
+        transition = record["source_transition"]
+        paths = {
+            "src/lerobot/robots/alohamini/alohamini.py",
+            "src/lerobot/robots/alohamini/alohamini_host.py",
+        }
+        if set(transition) != {
+            "before",
+            "after",
+            "before_reference",
+            "after_reference",
+            "changed_motor_files",
+        }:
+            return False
+        before, after = transition["before"], transition["after"]
+        prior = record["prior_run"]
+        if (
+            _canonical(before) != _canonical(self.run["backend_contract"])
+            or _canonical(before) != _canonical(prior["backend_contract"])
+            or _canonical(after) != _canonical(evidence.get("backend_contract"))
+            or set(before) != set(after)
+            or {k for k in before if _canonical(before[k]) != _canonical(after[k])}
+            - {"host_head", "source_pins", "elbow_return_reference"}
+            or before["host_head"] == after["host_head"]
+            or _canonical(transition["before_reference"]) != _canonical(prior["retained_return_reference"])
+            or _canonical(transition["before_reference"]) != _canonical(self.run["retained_return_reference"])
+            or _canonical(transition["after_reference"])
+            != _canonical(evidence.get("retained_return_reference"))
+            or _canonical(transition["after_reference"])
+            != _canonical(dict(transition["before_reference"], admission_motor_head=after["host_head"]))
+            or set(transition["changed_motor_files"]) != paths
+        ):
+            return False
+        motor_paths = (
+            paths
+            | {
+                "src/lerobot/robots/alohamini/" + name
+                for name in (
+                    "alohamini_client.py",
+                    "config_alohamini.py",
+                    "lift_motor_feedback.py",
+                    "lift_operational.py",
+                    "lift_relief.py",
+                    "selected_joint_evidence.py",
+                    "am1_elbow_integral.py",
+                )
+            }
+            | {"tools/run_am1_host.sh", "examples/alohamini/am1_session_contract.py"}
+        )
+        manifest_fields = {
+            "version",
+            "motor",
+            "helper",
+            "camera",
+            "calibration_sha256",
+            "lift_delta_files",
+            "executor_base",
+            "executor_head",
+            "executor_bundle_sha256",
+        }
+        projection_fields = {"base", "head", "ref", "files", "bundle_sha256"}
+        manifests, rows = [], []
+
+        def digest(value, length):
+            return (
+                isinstance(value, str)
+                and len(value) == length
+                and all(c in "0123456789abcdef" for c in value)
+            )
+
+        for config in (before, after):
+            manifest = strict_json(_continuation_bytes(config["source_pins"]))
+            motor = manifest.get("motor")
+            if (
+                set(manifest) != manifest_fields
+                or type(manifest.get("version")) is not int
+                or manifest["version"] != 2
+                or not isinstance(motor, dict)
+                or set(motor) != projection_fields
+                or motor["head"] != config["host_head"]
+                or not digest(motor["base"], 40)
+                or not digest(motor["head"], 40)
+                or not digest(motor["bundle_sha256"], 64)
+                or not isinstance(motor["ref"], str)
+                or not motor["ref"].startswith("refs/heads/")
+                or not isinstance(motor["files"], list)
+                or len(motor["files"]) != 11
+                or not digest(manifest["executor_base"], 40)
+                or not digest(manifest["executor_head"], 40)
+                or not digest(manifest["executor_bundle_sha256"], 64)
+                or not digest(manifest["calibration_sha256"], 64)
+            ):
+                return False
+            file_rows = {}
+            for row in motor["files"]:
+                if (
+                    not isinstance(row, dict)
+                    or set(row) != {"path", "sha256"}
+                    or row["path"] not in motor_paths
+                    or row["path"] in file_rows
+                    or not digest(row["sha256"], 64)
+                ):
+                    return False
+                file_rows[row["path"]] = row["sha256"]
+            if set(file_rows) != motor_paths:
+                return False
+            manifests.append(manifest)
+            rows.append(file_rows)
+            ref = config["elbow_return_reference"]
+            if (
+                set(ref) != {"path", "sha256"}
+                or not digest(ref["sha256"], 64)
+                or hashlib.sha256(_continuation_bytes(ref["path"])).hexdigest() != ref["sha256"]
+            ):
+                return False
+        old_manifest, new_manifest = manifests
+        if any(
+            _canonical(old_manifest[k]) != _canonical(new_manifest[k])
+            for k in manifest_fields - {"motor", "executor_head", "executor_bundle_sha256"}
+        ) or any(old_manifest["motor"][k] != new_manifest["motor"][k] for k in ("base", "ref")):
+            return False
+        old, new = rows
+        if {p for p in old if old[p] != new[p]} != paths:
+            return False
+        for path in paths:
+            row = transition["changed_motor_files"][path]
+            if (
+                set(row) != {"before_sha256", "after_sha256"}
+                or row["before_sha256"] != old[path]
+                or row["after_sha256"] != new[path]
+                or hashlib.sha256(
+                    _continuation_bytes(
+                        Path(after["host_repository"]) / path,
+                        limit=262144,
+                        source=True,
+                    )
+                ).hexdigest()
+                != new[path]
+            ):
+                return False
+        return True
+
+    def _startup_continuation(self, recipe, evidence):
+        from tools.am1_physical_executor import qualified_cleanup_receipt
+        from tools.am1_session_ipc import strict_json
+
+        run = self.run
+        definition = ELBOW_RECOVERY_DEFINITIONS.get(recipe.name)
+        if (
+            definition is None
+            or definition.integral != 1
+            or definition.mode != "return"
+            or definition.hold_s != 0.5
+            or not isinstance(run, dict)
+            or run.get("recipe") != recipe.name
+            or run.get("status") != "faulted"
+            or run.get("source") != "protected-physical-provider"
+            or run.get("uncertain") is not False
+            or run.get("cleanup") != "physical_readback_verified"
+            or type(run.get("progress_s")) not in (int, float)
+            or run["progress_s"] != 0
+            or run.get("native_live_at") is not None
+            or run.get("deadline") is not None
+            or run.get("execution") is not None
+            or run.get("completion_receipt") is not None
+            or run.get("intent") is not None
+            or run.get("recovery_episodes") != 0
+            or run.get("native_first_cause")
+            != "ComparisonRefusal: temperature: five-slot feedback window is stale (>0.5 s)."
+        ):
+            return None
+        try:
+            raw = _continuation_bytes(self.directory / "elbow-recovery-startup-continuation.json")
+            record = strict_json(raw)
+            fields = {
+                "version",
+                "kind",
+                "failed_run_id",
+                "failed_terminal_sha256",
+                "failed_cleanup_sha256",
+                "failed_camera_sha256",
+                "prior_run",
+                "source_transition",
+            }
+            if (
+                not isinstance(record, dict)
+                or set(record) != fields
+                or type(record["version"]) is not int
+                or record["version"] != 1
+                or record["kind"] != "am1-elbow-startup-continuation"
+                or record["failed_run_id"] != run["run_id"]
+                or record["failed_terminal_sha256"] != hashlib.sha256(_canonical(run)).hexdigest()
+                or not isinstance(record["prior_run"], dict)
+                or hashlib.sha256(_canonical(record["prior_run"])).hexdigest()
+                != run["recovery_prerequisite"]["proof_sha256"]
+                or not self._startup_source_transition(record, evidence)
+                or not self._startup_literal_receipts(run, record)
+            ):
+                return None
+            lifecycle = run["physical_result"]
+            incarnation = lifecycle["backend_incarnation"]
+            receipt = lifecycle["readback"]
+            rb = receipt["readback"]
+            gain = rb["elbow_integral"]
+            original = gain["original_registers"]
+            expected_registers = {
+                "Model_Number": 777,
+                "Firmware_Major_Version": 3,
+                "Firmware_Minor_Version": 10,
+                "Operating_Mode": 0,
+                "P_Coefficient": 16,
+                "D_Coefficient": 32,
+            }
+            active = gain.get("active_registers")
+            original_bytes = gain.get("original_bytes")
+            if (
+                any(
+                    type(original.get(k)) is not int or original[k] != v
+                    for k, v in expected_registers.items()
+                )
+                or not isinstance(active, dict)
+                or any(
+                    type(active.get(k)) is not int or active[k] != v
+                    for k, v in dict(expected_registers, I_Coefficient=1, Lock=1, Torque_Enable=1).items()
+                )
+                or type(gain.get("configured_integral_readback")) is not int
+                or gain["configured_integral_readback"] != 1
+                or gain.get("active_verified") is not True
+                or not isinstance(original_bytes, dict)
+                or set(original_bytes) != {"24", "25"}
+                or any(type(v) is not int or not 0 <= v <= 255 for v in original_bytes.values())
+                or gain.get("active_bytes") != original_bytes
+                or gain.get("restored_bytes") != original_bytes
+            ):
+                return None
+            camera = lifecycle["camera_release"]
+            release = camera["release_evidence"]
+            if (
+                uuid_text(incarnation) != incarnation
+                or lifecycle.get("run_id") != run["run_id"]
+                or lifecycle.get("phase") != "terminal"
+                or lifecycle.get("terminal_status") != "faulted"
+                or lifecycle.get("native_live_at") is not None
+                or lifecycle.get("uncertain") is not False
+                or lifecycle.get("cleanup_errors") != []
+                or not qualified_cleanup_receipt(receipt, run["run_id"], incarnation)
+                or type(receipt.get("version")) is not int
+                or rb.get("buses_closed") is not True
+                or rb.get("cleanup_errors") != []
+                or rb.get("selected_gain_restore_required") is not False
+                or gain.get("state") != "restored"
+                or gain.get("status") != "restored"
+                or gain.get("restore_required") is not False
+                or type(gain.get("integral")) is not int
+                or gain["integral"] != 1
+                or gain.get("binding")
+                != {
+                    "run_id": run["run_id"],
+                    "host_incarnation": incarnation,
+                    "recipe": recipe.name,
+                    "integral": 1,
+                }
+                or type(original.get("I_Coefficient")) is not int
+                or original["I_Coefficient"] != 0
+                or type(original.get("Lock")) is not int
+                or original["Lock"] != 0
+                or type(gain.get("restored_integral_readback")) is not int
+                or gain["restored_integral_readback"] != 0
+                or type(gain.get("restored_lock_readback")) is not int
+                or gain["restored_lock_readback"] != 0
+                or gain.get("restored_bytes") != gain.get("original_bytes")
+                or gain.get("first_failure") is not None
+                or type(camera.get("version")) is not int
+                or camera["version"] != 1
+                or camera.get("session_id") != run["run_id"]
+                or camera.get("state") != "released"
+                or camera.get("errors") != []
+                or camera.get("runtime_failed") is not False
+                or type(release.get("backend_returncode")) is not int
+                or release["backend_returncode"] != 0
+                or any(
+                    release.get(k) is not True
+                    for k in (
+                        "backend_exited",
+                        "readers_joined",
+                        "viewer_socket_closed",
+                        "runtime_config_removed",
+                    )
+                )
+            ):
+                return None
+            transition = record["source_transition"]
+            # Compare the new idle owner against the explicitly validated material transition.
+            expected_idle = dict(
+                run,
+                backend_contract=transition["after"],
+                retained_return_reference=transition["after_reference"],
+            )
+            if not _retained_recovery_idle(evidence, expected_idle, self.service_incarnation):
+                return None
+            prior = record["prior_run"]
+            proof = self._recovery_prerequisite_from(recipe, {}, prior, retained=True)
+            if proof is None or _canonical(proof) != _canonical(run["recovery_prerequisite"]):
+                return None
+            self._startup_continuation_note = {
+                "failed_run_id": run["run_id"],
+                "prior_run_id": prior["run_id"],
+                "receipt_sha256": hashlib.sha256(raw).hexdigest(),
+            }
+            return proof
+        except (OSError, AttributeError, KeyError, TypeError, ValueError):
+            return None
+
     def elbow_recovery_prerequisite(self, recipe, evidence):
+        self._startup_continuation_note = None
+        proof = self._recovery_prerequisite_from(recipe, evidence, self.run)
+        return proof if proof is not None else self._startup_continuation(recipe, evidence)
+
+    def _recovery_prerequisite_from(self, recipe, evidence, previous, *, retained=False):
         """Qualify only this authority's retained native result before replacing its run."""
         definition = ELBOW_RECOVERY_DEFINITIONS.get(recipe.name)
-        previous = self.run
         if definition is None or not isinstance(previous, dict):
             return None
         old = ELBOW_RECOVERY_DEFINITIONS.get(previous.get("recipe"))
@@ -710,7 +1094,8 @@ class SessionAuthority:
                 or not isinstance(receipt, dict)
                 or not isinstance(lifecycle, dict)
                 or not (
-                    evidence.get("lifecycle") == lifecycle
+                    retained
+                    or evidence.get("lifecycle") == lifecycle
                     or _retained_recovery_idle(evidence, previous, getattr(self, "service_incarnation", None))
                 )
                 or lifecycle.get("phase") != "terminal"
@@ -1010,6 +1395,9 @@ class SessionAuthority:
                         return self._refuse(str(error))
                 elif not first_i0:
                     return self._refuse("recovery prerequisite requires the protected native executor")
+            continuation_note = (
+                getattr(self, "_startup_continuation_note", None) if recovery_prerequisite else None
+            )
             self.run = {
                 "run_id": str(uuid.uuid4()),
                 "operation_id": oid,
@@ -1032,6 +1420,8 @@ class SessionAuthority:
             }
             if recovery_definition is not None:
                 self.run["recovery_prerequisite"] = recovery_prerequisite
+                if continuation_note is not None:
+                    self.run["startup_continuation"] = dict(continuation_note)
             metadata = getattr(self.executor, "sensing_metadata", None)
             if metadata:
                 self.run.update(metadata())

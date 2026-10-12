@@ -1092,6 +1092,12 @@ def _run_host(args):
     logging.info("Waiting for commands...")
 
     try:
+        # One final same-owner startup boundary before ordinary loop timing.
+        # Only a due genuine read can refresh the retained original thermal slots.
+        if (
+            args.robot_model == "alohamini1" and getattr(robot, "_lift_operation", None) is not None
+        ):
+            robot._refresh_am1_startup_lift_feedback()
         # Business logic
         start = time.perf_counter()
         duration = 0

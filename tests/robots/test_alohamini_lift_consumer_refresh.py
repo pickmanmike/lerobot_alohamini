@@ -49,66 +49,74 @@ def host_case(operating_robot, monkeypatch, tmp_path):
 
         def connect(**kwargs):
             original_connect(calibrate=False, **kwargs)
-            op = robot._lift_operation
-            if mode == "resume":
-                control.apply(robot, {host.AM1_LOCAL_CONTROL_KEY: {"version": 1, "mode": "pause", "epoch": 1}})
-            # Five *real grouped reads* in occupied slots. Do not reset history or
-            # stamp synthetic lows into it. The final same-slot read models the
-            # saved 468.019 ms age plus 35.05 ms of consumer-path work.
-            origin = op.temperature._origin_ns / 1e9
-            start = origin + math.ceil((clock.now - origin) / 0.1) * 0.1
-            for index in range(5):
-                clock.sleep(start + index * 0.1 - clock.now - 0.002)
-                if refresh_fault == "high" and index >= 3:
-                    robot.left_bus.registers[("Present_Temperature", "lift_axis")] = 60
-                op.poll()
-            robot.left_bus.registers[("Present_Temperature", "lift_axis")] = 30
-            clock.sleep(start + 0.466019 - clock.now)
-            state.start_ticks = robot.lift._extended_ticks
-            state.start_zero = robot.lift._z0_deg
-            state.initial_writes = len(robot.left_bus.events)
-            read = op.transport.read_group
-            emit = op.emit
-            sample = op.monitor.sample
+            original_handoff = robot._refresh_am1_startup_lift_feedback
 
-            def sample_phase(phase, **kwargs):
-                state.sample_phase = phase
-                return sample(phase, **kwargs)
+            def handoff():
+                # Complete the REAL startup acquisition before injecting the
+                # unchanged ordinary-loop consumer timing/fault scenario.
+                original_handoff()
+                op = robot._lift_operation
+                if mode == "resume":
+                    control.apply(robot, {host.AM1_LOCAL_CONTROL_KEY: {"version": 1, "mode": "pause", "epoch": 1}})
+                # Five *real grouped reads* in occupied slots. Do not reset history or
+                # stamp synthetic lows into it. The final same-slot read models the
+                # saved 468.019 ms age plus 35.05 ms of consumer-path work.
+                origin = op.temperature._origin_ns / 1e9
+                start = origin + math.ceil((clock.now - origin) / 0.1) * 0.1
+                for index in range(5):
+                    clock.sleep(start + index * 0.1 - clock.now - 0.002)
+                    if refresh_fault == "high" and index >= 3:
+                        robot.left_bus.registers[("Present_Temperature", "lift_axis")] = 60
+                    op.poll()
+                robot.left_bus.registers[("Present_Temperature", "lift_axis")] = 30
+                clock.sleep(start + 0.466019 - clock.now)
+                state.start_ticks = robot.lift._extended_ticks
+                state.start_zero = robot.lift._z0_deg
+                state.initial_writes = len(robot.left_bus.events)
+                read = op.transport.read_group
+                emit = op.emit
+                sample = op.monitor.sample
 
-            def read_group(*args, **kwargs):
-                if state.sample_phase == "live":
-                    state.runtime_reads.append(clock.now)
-                    if len(state.runtime_reads) == 2:
-                        if refresh_fault == "delayed":
-                            clock.sleep(0.04)  # Plus the ordinary 2 ms reply.
-                        elif refresh_fault == "cancel":
-                            raise KeyboardInterrupt
-                        elif refresh_fault == "transport":
-                            raise feedback.TransportRefusal("synthetic bad checksum", {"checksum_ok": False})
-                        else:
-                            changes = {
-                                "high": ("Present_Temperature", 60), "status": ("Status", 4),
-                                "current": ("Present_Current", 400), "voltage": ("Present_Voltage", 20),
-                            }
-                            if refresh_fault in changes:
-                                register, value = changes[refresh_fault]
-                                robot.left_bus.read_sequences[(register, "lift_axis")] = [value]
-                else:
-                    # Fresh cleanup evidence never clears the prior refusal.
-                    for register, value in (("Status", 0), ("Present_Temperature", 30), ("Present_Voltage", 120)):
-                        robot.left_bus.registers[(register, "lift_axis")] = value
-                return read(*args, **kwargs)
+                def sample_phase(phase, **kwargs):
+                    state.sample_phase = phase
+                    return sample(phase, **kwargs)
 
-            def emit_sample(record):
-                if record["phase"] == "live":
-                    (state.rejected if record.get("rejected") else state.records).append(dict(record))
-                    state.events.append("sample_log")
-                emit(record)
+                def read_group(*args, **kwargs):
+                    if state.sample_phase == "live":
+                        state.runtime_reads.append(clock.now)
+                        if len(state.runtime_reads) == 2:
+                            if refresh_fault == "delayed":
+                                clock.sleep(0.04)  # Plus the ordinary 2 ms reply.
+                            elif refresh_fault == "cancel":
+                                raise KeyboardInterrupt
+                            elif refresh_fault == "transport":
+                                raise feedback.TransportRefusal("synthetic bad checksum", {"checksum_ok": False})
+                            else:
+                                changes = {
+                                    "high": ("Present_Temperature", 60), "status": ("Status", 4),
+                                    "current": ("Present_Current", 400), "voltage": ("Present_Voltage", 20),
+                                }
+                                if refresh_fault in changes:
+                                    register, value = changes[refresh_fault]
+                                    robot.left_bus.read_sequences[(register, "lift_axis")] = [value]
+                    else:
+                        # Fresh cleanup evidence never clears the prior refusal.
+                        for register, value in (("Status", 0), ("Present_Temperature", 30), ("Present_Voltage", 120)):
+                            robot.left_bus.registers[(register, "lift_axis")] = value
+                    return read(*args, **kwargs)
 
-            op.transport.read_group = read_group
-            op.monitor.sample = sample_phase
-            op.emit = emit_sample
-            op.monitor.emit = emit_sample
+                def emit_sample(record):
+                    if record["phase"] == "live":
+                        (state.rejected if record.get("rejected") else state.records).append(dict(record))
+                        state.events.append("sample_log")
+                    emit(record)
+
+                op.transport.read_group = read_group
+                op.monitor.sample = sample_phase
+                op.emit = emit_sample
+                op.monitor.emit = emit_sample
+
+            robot._refresh_am1_startup_lift_feedback = handoff
 
         original_action = robot.send_action
         original_observation = robot.get_observation
@@ -152,10 +160,11 @@ def host_case(operating_robot, monkeypatch, tmp_path):
         monkeypatch.setattr(robot, "get_observation", observation)
         monkeypatch.setattr(host, "AlohaMini", lambda config: robot)
 
-        def local_control(*, run_id=None, host_incarnation=None):
+        def local_control(*, run_id=None, host_incarnation=None, selected_evidence=None):
             # This legacy CLI fixture has no protected IPC handoff binding. Keep
             # the real local controller while matching the host's owner API.
             assert run_id is None and host_incarnation is None
+            assert selected_evidence is None or selected_evidence.enabled is False
             return control
 
         monkeypatch.setattr(host, "AM1LocalControl", local_control)

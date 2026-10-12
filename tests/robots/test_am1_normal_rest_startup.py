@@ -153,6 +153,19 @@ def startup(monkeypatch, tmp_path):
     class LiftIO:
         def __init__(self, robot):
             self.robot, self.lift = robot, robot.lift
+            # This coordinate/encoding fixture replaces lift I/O completely.
+            # Real acquisition/thermal semantics are exercised separately by
+            # test_am1_startup_thermal_handoff and the operational-lift suites.
+            self.failure = None
+            self.last_record = {"sample_monotonic_s": owner.time.monotonic()}
+            self.temperature = SimpleNamespace(assert_fresh=lambda now: None)
+
+        def raise_if_faulted(self):
+            if self.failure is not None:
+                raise self.failure
+
+        def poll(self):
+            self.last_record = {"sample_monotonic_s": owner.time.monotonic()}
 
         def start(self):
             state.home_calls += 1
@@ -161,7 +174,9 @@ def startup(monkeypatch, tmp_path):
             bus.settle(SHOULDER, bus.present(SHOULDER) + state.home_delta)
             # Keep actual lift configuration, home, zero reference and handoff.
             # The register transport models its external hard-stop feedback.
-            return self.lift.home()
+            result = self.lift.home()
+            self.poll()
+            return result
 
         def contribute_observation(self, observation):
             self.lift.contribute_observation(observation)
