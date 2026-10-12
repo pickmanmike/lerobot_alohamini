@@ -544,7 +544,9 @@ class AM1SelectedJointEvidence:
         startup = self._response_startup_hold
         if (visible is not None and getattr(visible, "response_rule", None) is not None
                 and startup is not None and self.profile is None):
-            _, position, material = self._response_startup_pair(robot, visible)
+            now, position, material = self._response_startup_pair(robot, visible)
+            if now - startup["started_at"] >= 20:
+                self._response_refuse(robot, "Selected response startup measured hold exceeded 20 seconds")
             admitted = metadata["admitted_reference"]
             measured = visible.measured_origin(admitted, material)
             if (progress != 0 or requested != admitted

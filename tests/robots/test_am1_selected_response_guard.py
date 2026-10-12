@@ -284,6 +284,40 @@ def test_startup_hold_20_second_wall_is_not_the_moving_leg_window(monkeypatch):
     assert g.evidence.deactivate(g.robot) is None
 
 
+@pytest.mark.parametrize("elapsed,accepted", [(19.999, True), (20.0, False), (20.001, False)])
+def test_first_finite_context_retains_original_startup_deadline_before_send(monkeypatch, elapsed, accepted):
+    g = startup_fixture(monkeypatch)
+    startup_send(g, startup_action(g), 1.0)
+    startup_observe(g, 1.0 + elapsed - 0.01)
+    metadata = context(
+        profile=g.definition.profile,
+        progress_s=0,
+        phase="baseline",
+        cycle=0,
+        reference=0.0,
+        endpoint_target=10.0,
+        requested_target=0.0,
+        sample_key="baseline",
+        acquisition_s=0.0,
+        admitted_reference=0.0,
+        experiment_sha256=g.definition.sha256,
+    )
+    action = startup_action(g, sequence=13, metadata=metadata)
+    g.now[0] = 1.0 + elapsed
+    before = (len(g.writes), len(g.port.writes), g.control.accepted_action_sequence)
+    if accepted:
+        startup_send(g, action, g.now[0])
+        assert len(g.writes) > before[0] and g.control.accepted_action_sequence == 13
+        assert g.evidence.profile == g.definition.profile
+        assert g.evidence.response_boundary["status"] == "tracking"
+    else:
+        with pytest.raises(RuntimeError, match="startup measured hold exceeded 20 seconds"):
+            g.control.apply(g.robot, action)
+        assert (len(g.writes), len(g.port.writes), g.control.accepted_action_sequence) == before
+        assert g.evidence.reference is None and g.evidence.profile is None and g.evidence.context is None
+        assert g.evidence._response_startup_hold["started_at"] == 1.0
+
+
 @pytest.mark.parametrize("route", ["prepare", "postread"])
 @pytest.mark.parametrize("sign", [-1, 1])
 def test_startup_hold_drift_at_30_raw_refuses_without_another_write(monkeypatch, route, sign):
