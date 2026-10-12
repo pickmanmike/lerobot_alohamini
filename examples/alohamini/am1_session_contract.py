@@ -507,6 +507,21 @@ SELECTED_ELBOW_EXPERIMENT_ENVELOPE_SHA256 = hashlib.sha256(json.dumps(
     separators=(",", ":"),
 ).encode()).hexdigest()
 
+# The uninterrupted negative return showed useful motion at the old cap. This
+# separately reviewed condition permits 150 mA only with a local response bound.
+SELECTED_ELBOW_EXPERIMENT_RESPONSE_ENVELOPE = MappingProxyType({
+    **dict(SELECTED_ELBOW_EXPERIMENT_ENVELOPE),
+    "scope": "AM1-ELBOW-TO-COMPLETION-06/evidence-supported-response",
+    "maximum_current_ma": 150.0,
+    "response_commanded_error_raw": 30,
+    "response_minimum_raw": 3,
+    "response_window_s": 1.2,
+})
+SELECTED_ELBOW_EXPERIMENT_RESPONSE_ENVELOPE_SHA256 = hashlib.sha256(json.dumps(
+    dict(SELECTED_ELBOW_EXPERIMENT_RESPONSE_ENVELOPE), sort_keys=True, allow_nan=False,
+    separators=(",", ":"),
+).encode()).hexdigest()
+
 
 @dataclass(frozen=True)
 class SelectedElbowExperiment:
@@ -536,10 +551,14 @@ class SelectedElbowExperiment:
     _completion_expectation = PositiveElbowControl._completion_expectation
 
     def __post_init__(self):
-        e = SELECTED_ELBOW_EXPERIMENT_ENVELOPE
+        envelopes = {
+            SELECTED_ELBOW_EXPERIMENT_ENVELOPE_SHA256: SELECTED_ELBOW_EXPERIMENT_ENVELOPE,
+            SELECTED_ELBOW_EXPERIMENT_RESPONSE_ENVELOPE_SHA256: SELECTED_ELBOW_EXPERIMENT_RESPONSE_ENVELOPE,
+        }
         if (type(self.schema_version) is not int or self.schema_version != 1
-                or self.envelope_sha256 != SELECTED_ELBOW_EXPERIMENT_ENVELOPE_SHA256):
+                or type(self.envelope_sha256) is not str or self.envelope_sha256 not in envelopes):
             raise ValueError("selected experiment requires its exact schema and approved envelope pin")
+        e = envelopes[self.envelope_sha256]
         values = (self.excursion_norm, self.ramp_s, self.endpoint_dwell_s,
                   self.current_cap_ma, self.live_ceiling_s)
         if not all(type(v) in (int, float) and math.isfinite(v) for v in values):
@@ -563,6 +582,11 @@ class SelectedElbowExperiment:
         object.__setattr__(self, "_sha256", hashlib.sha256(json.dumps(
             self.payload, sort_keys=True, allow_nan=False, separators=(",", ":"),
         ).encode()).hexdigest())
+        object.__setattr__(self, "_response_rule", None if "response_window_s" not in e else MappingProxyType({
+            "commanded_error_raw": e["response_commanded_error_raw"],
+            "minimum_response_raw": e["response_minimum_raw"],
+            "window_s": e["response_window_s"],
+        }))
 
     @classmethod
     def from_payload(cls, value):
@@ -584,6 +608,10 @@ class SelectedElbowExperiment:
     @property
     def sha256(self):
         return self._sha256
+
+    @property
+    def response_rule(self):
+        return self._response_rule
 
     @property
     def nominal_trajectory_s(self):

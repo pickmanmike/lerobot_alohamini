@@ -15,7 +15,7 @@ actual configuration, load/pose, real current and working records before replaci
 it. Catalog maxima or ordinary software ceiling alone do not establish a loaded
 joint budget. Keep hardware/device current/torque limits, genuine stall/current/
 thermal/voltage/status/feedback/travel/ownership protections and normal cleanup.
-No blind retries, force escalation, stalled holds, unbounded motion or fault clearing.
+No blind retries, blind force escalation, prolonged stalled holds, unbounded motion or fault clearing.
 A fault ends that experiment, not the investigation; preserve its first causes.
 
 Repair missing live trigger evidence in memory before cleanup, then publish through

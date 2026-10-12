@@ -65,6 +65,11 @@ class AM1SelectedJointEvidence:
         self._pending_sparse = None
         self.goal_checkpoint_attempted = set()
         self.goal_readbacks = {}
+        self.response_boundary = None
+        self._response_window = None
+        self._response_last_acquisitions = None
+        self._response_last_current_raw = None
+        self._response_continuity_lost = False
 
     VISIBLE_STATIC_REGISTERS = (
         "Firmware_Major_Version",
@@ -297,6 +302,8 @@ class AM1SelectedJointEvidence:
                     position if position is not None else getattr(robot, "_am1_selected_joint_position", None)
                 ),
                 "last_completed_live_goal": copy.deepcopy(self.last_live_goal),
+                **({"response_boundary": copy.deepcopy(self.response_boundary)}
+                   if self.response_boundary is not None else {}),
             }
         except BaseException as error:
             # A diagnostic failure cannot replace or delay the protective refusal.
@@ -338,6 +345,14 @@ class AM1SelectedJointEvidence:
             raise RuntimeError("Visible selected software effort ceiling reached")
 
     def deactivate(self, robot):
+        # Protective Pause/Stop must always proceed. Retain an unresolved active
+        # obligation so paused/coasting motion cannot qualify a later admission.
+        if self._response_window is not None:
+            if self._response_tracking_current(robot):
+                self._response_window = None
+            else:
+                self._response_continuity_lost = True
+                self.response_boundary = dict(self.response_boundary, status="continuity_lost")
         self.context = None
         robot._am1_selected_joint_evidence_context = None
 
@@ -494,6 +509,14 @@ class AM1SelectedJointEvidence:
             )
         if sample_key is not None and sample_key != expected_key:
             raise RuntimeError("Selected joint evidence sample key differs from its phase")
+        if getattr(visible, "response_rule", None) is not None and self._response_window is not None:
+            leg = (cycle, self._response_direction(robot, visible, metadata))
+            if self._response_continuity_lost or self.context is None or leg != self._response_window["leg"]:
+                if not self._response_continuity_lost and self._response_tracking_current(robot):
+                    self._response_window = None
+                else:
+                    self._response_refuse(robot, "Selected response continuity unavailable before active actuation",
+                                          failure_kind="continuity_lost")
         for key in ("x.vel", "y.vel", "theta.vel", "lift_axis.vel"):
             if not _number(cleaned.get(key)) or float(cleaned[key]) != 0:
                 raise RuntimeError("Selected joint comparison requires ordinary body-zero commands")
@@ -516,9 +539,8 @@ class AM1SelectedJointEvidence:
 
     def guard_recovery(self, robot, control, observation):
         """Bound the selected admission on every ordinary owner tick, including holds."""
-        del observation
         if getattr(robot, "_am1_visible_control_binding", None) is not None:
-            self.guard_visible(robot, control)
+            self.guard_visible(robot, control, observation)
             return
         binding = getattr(robot, "_am1_elbow_recovery_binding", None)
         if binding is None:
@@ -597,7 +619,7 @@ class AM1SelectedJointEvidence:
                 max(self.recovery_peak, raw) if direction > 0 else min(self.recovery_peak, raw)
             )
 
-    def guard_visible(self, robot, control):
+    def guard_visible(self, robot, control, observation=None):
         """Enforce the new finite probe on cached native reads, never another bus reader."""
         definition = self._visible_definition(robot)
         binding = getattr(robot, "_am1_visible_control_binding", None)
@@ -665,6 +687,8 @@ class AM1SelectedJointEvidence:
             high, max(endpoints)
         ):
             raise RuntimeError("Visible native position left its frozen absolute excursion")
+        if getattr(definition, "response_rule", None) is not None:
+            self._guard_response(robot, control, observation, definition, position, current)
         if context is None or control.state != "active":
             return
         direction = None
@@ -738,6 +762,175 @@ class AM1SelectedJointEvidence:
                 raise RuntimeError("Visible native static endpoint adverse current rise")
 
     @staticmethod
+    def _response_direction(robot, definition, context):
+        if not isinstance(context, dict):
+            return None
+        calibration = robot.left_bus.calibration[MOTOR]
+        sign = -1 if robot.left_bus.apply_drive_mode and calibration.drive_mode else 1
+        outward = sign * (1 if definition.excursion_norm > 0 else -1)
+        if context["phase"] in {"outbound", "endpoint"}:
+            return outward
+        if context["phase"] in {"return", "origin", "final"}:
+            return -outward
+        if context["phase"] == "acquire" and context["reference"] != context["admitted_reference"]:
+            return sign * (1 if context["reference"] > context["admitted_reference"] else -1)
+        return None
+
+    def _response_refuse(self, robot, reason, *, failure_kind="unavailable"):
+        if self.response_boundary is None:
+            self.response_boundary = {"version": 1, "status": "unavailable"}
+        else:
+            self.response_boundary = dict(self.response_boundary, status="refused")
+        self.response_boundary["failure_kind"] = failure_kind
+        self.capture_fault(
+            robot, reason, source="response_guard",
+            current=getattr(robot, "_am1_selected_joint_current", None),
+            ordinary_limit=getattr(robot, "_joint_current_limit_ma", 100),
+        )
+        fault = getattr(robot, "_am1_selected_joint_fault", None)
+        if isinstance(fault, dict) and fault.get("source") == "response_guard":
+            fault["comparison"] = reason
+        raise RuntimeError(reason)
+
+    def _response_tracking_current(self, robot):
+        """Only the last valid active tracking acquisition can retire exposure."""
+        try:
+            boundary = self.response_boundary
+            if (self._response_continuity_lost or not isinstance(boundary, dict)
+                    or boundary.get("status") != "tracking"
+                    or boundary["signed_commanded_error_raw"] >= boundary["commanded_error_threshold_raw"]):
+                return False
+            definition = getattr(robot, "_am1_selected_elbow_experiment", None)
+            if definition is None or not definition.context_valid(self.context):
+                return False
+            actual = getattr(robot, "_am1_visible_control_binding", {})
+            expected = self._response_window["binding"]
+            if (actual.get("run_id"), actual.get("host_incarnation"), actual.get("experiment_sha256")) != (
+                expected[0], expected[1], expected[4]
+            ):
+                return False
+            position, current = robot._am1_selected_joint_position, robot._am1_selected_joint_current
+            acquisitions = tuple(cache[key] for cache in (position, current) for key in
+                                 ("read_started_at_monotonic_s", "read_completed_at_monotonic_s"))
+            now = self.clock()
+            return (
+                acquisitions == self._response_last_acquisitions
+                and all(_number(t) and 0 <= t <= now for t in acquisitions)
+                and all(now - cache["read_started_at_monotonic_s"] <= 0.5 for cache in (position, current))
+                and type(position.get("raw")) is int and position["raw"] == boundary["last_position_raw"]
+                and type(current.get("raw")) is int and current["raw"] == self._response_last_current_raw
+                and current.get("ma") == current["raw"] * 6.5
+                and robot._am1_selected_joint_action.get("expected_goal_raw") == boundary["last_encoded_goal_raw"]
+            )
+        except Exception:
+            return False  # A missing/invalid diagnostic must never obstruct protective release.
+
+    def _guard_response(self, robot, control, observation, definition, position, current):
+        rule = definition.response_rule
+        if control.state != "active":
+            if self._response_window is not None:
+                if self._response_tracking_current(robot):
+                    self._response_window = None
+                else:
+                    self._response_continuity_lost = True
+                    self.response_boundary = dict(self.response_boundary, status="continuity_lost")
+            return  # Existing protective hold/cap/cleanup always retain authority.
+        if self._response_continuity_lost:
+            self._response_refuse(robot, "Selected response continuity unavailable after protective hold",
+                                  failure_kind="continuity_lost")
+        marker = self._matched_marker(control, observation if isinstance(observation, dict) else {})
+        context = self.context
+        if marker is None or not definition.context_valid(context):
+            self._response_refuse(robot, "Selected response active source/context is unavailable")
+        action = getattr(robot, "_am1_selected_joint_action", None)
+        material = {k: int(getattr(robot.left_bus.calibration[MOTOR], k))
+                    for k in ("drive_mode", "homing_offset", "range_min", "range_max")}
+        goal = definition.encoded_goal(context["requested_target"], material)
+        if (not isinstance(action, dict) or type(action.get("expected_goal_raw")) is not int
+                or action["expected_goal_raw"] != goal or action.get("sync_write_returned") is not True
+                or action.get("requested") != context["requested_target"]):
+            self._response_refuse(robot, "Selected response actual encoded action is unavailable")
+        if (not all(_number(action.get(k)) for k in
+                    ("write_started_at_monotonic_s", "write_completed_at_monotonic_s"))
+                or not 0 <= action["write_started_at_monotonic_s"] <= action["write_completed_at_monotonic_s"]
+                <= position["read_started_at_monotonic_s"]
+                or max(position["read_completed_at_monotonic_s"], current["read_completed_at_monotonic_s"])
+                > marker["acquired_at_monotonic_s"]):
+            self._response_refuse(robot, "Selected response action/acquisition ordering is unavailable")
+        acquisitions = tuple(cache[key] for cache in (position, current) for key in
+                             ("read_started_at_monotonic_s", "read_completed_at_monotonic_s"))
+        if self._response_last_acquisitions is not None:
+            if any(new < old for new, old in zip(acquisitions, self._response_last_acquisitions)):
+                self._response_refuse(robot, "Selected response original acquisition regressed")
+            if any(new == old for new, old in zip(acquisitions, self._response_last_acquisitions)):
+                return  # Duplicate/partial acquisitions neither credit motion nor reset exposure.
+        direction = self._response_direction(robot, definition, context)
+        leg = (context["cycle"], direction)
+        binding = (control.binding["run_id"], control.binding["host_incarnation"],
+                   control.epoch, control.intent_revision, definition.sha256)
+        window = self._response_window
+        if window is not None and (window["leg"] != leg or window["binding"] != binding):
+            self._response_refuse(robot, "Selected response active leg/owner continuity is unavailable",
+                                  failure_kind="continuity_lost")
+        self._response_last_acquisitions = acquisitions
+        self._response_last_current_raw = current["raw"]
+        raw = position["raw"]
+        error = 0 if direction is None else direction * (goal - raw)
+        latest = {
+            "version": 1, "commanded_error_threshold_raw": rule["commanded_error_raw"],
+            "minimum_response_raw": rule["minimum_response_raw"], "window_s": rule["window_s"],
+            "cycle": context["cycle"], "direction": direction, "last_position_raw": raw,
+            "last_encoded_goal_raw": goal, "signed_commanded_error_raw": error,
+            "last_position_started_at_monotonic_s": position["read_started_at_monotonic_s"],
+            "last_current_started_at_monotonic_s": current["read_started_at_monotonic_s"],
+            "last_position_completed_at_monotonic_s": position["read_completed_at_monotonic_s"],
+            "last_current_completed_at_monotonic_s": current["read_completed_at_monotonic_s"],
+        }
+        if window is not None:
+            response = direction * (raw - window["raw"])
+            elapsed = max(position["read_completed_at_monotonic_s"] - window["position_at"],
+                          current["read_completed_at_monotonic_s"] - window["current_at"])
+            window["count"] += 1
+            latest.update(
+                anchor_position_raw=window["raw"],
+                anchor_position_started_at_monotonic_s=window["position_started"],
+                anchor_current_started_at_monotonic_s=window["current_started"],
+                anchor_position_completed_at_monotonic_s=window["position_at"],
+                anchor_current_completed_at_monotonic_s=window["current_at"],
+                signed_response_raw=response, elapsed_s=elapsed, distinct_sample_count=window["count"],
+            )
+            self.response_boundary = dict(latest, status="pending")
+            if error < rule["commanded_error_raw"]:
+                self.response_boundary["status"] = "tracking"
+                if response >= rule["minimum_response_raw"]:
+                    self._response_window = None
+                return  # Keep the anchor across subthreshold two-tick jitter.
+            if (elapsed > rule["window_s"] + 1e-9
+                    or elapsed >= rule["window_s"] - 1e-9 and response < rule["minimum_response_raw"]):
+                self._response_refuse(robot, "Selected response not established within 1.2 seconds",
+                                      failure_kind="nonresponse")
+            if response >= rule["minimum_response_raw"]:
+                self._response_window = None
+            else:
+                return
+        elif error < rule["commanded_error_raw"]:
+            self.response_boundary = dict(latest, status="tracking")
+            return
+        if error >= rule["commanded_error_raw"]:
+            self._response_window = {
+                "leg": leg, "binding": binding, "raw": raw, "position_at": position["read_completed_at_monotonic_s"],
+                "position_started": position["read_started_at_monotonic_s"],
+                "current_started": current["read_started_at_monotonic_s"],
+                "current_at": current["read_completed_at_monotonic_s"], "count": 1,
+            }
+            self.response_boundary = dict(latest, status="pending", anchor_position_raw=raw,
+                anchor_position_started_at_monotonic_s=position["read_started_at_monotonic_s"],
+                anchor_current_started_at_monotonic_s=current["read_started_at_monotonic_s"],
+                anchor_position_completed_at_monotonic_s=position["read_completed_at_monotonic_s"],
+                anchor_current_completed_at_monotonic_s=current["read_completed_at_monotonic_s"],
+                signed_response_raw=0, elapsed_s=0.0, distinct_sample_count=1)
+
+    @staticmethod
     def recovery_gain_proof(robot):
         """Expose bounded actual settings, keeping the durable write ledger private."""
         trial = getattr(robot, "_am1_elbow_integral_trial", None)
@@ -806,6 +999,8 @@ class AM1SelectedJointEvidence:
                 },
             },
             "action": copy.deepcopy(getattr(robot, "_am1_selected_joint_action", None)),
+            **({"response_boundary": copy.deepcopy(self.response_boundary)}
+               if self.response_boundary is not None else {}),
             **(
                 {"visible_control": self.visible_control_proof(robot)}
                 if getattr(robot, "_am1_visible_control_binding", None) is not None
