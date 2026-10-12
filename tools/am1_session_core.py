@@ -257,7 +257,7 @@ def _continuation_bytes(path, *, limit=65536, source=False):
     try:
         info = os.fstat(fd)
         uid = getattr(os, "getuid", lambda: info.st_uid)()
-        modes = (0o600, 0o644) if source else (0o600,)
+        modes = (0o600, 0o644, 0o700) if source else (0o600,)
         if (
             not stat.S_ISREG(info.st_mode)
             or info.st_nlink != 1

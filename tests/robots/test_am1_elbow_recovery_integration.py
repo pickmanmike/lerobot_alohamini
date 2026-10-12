@@ -1601,3 +1601,52 @@ def test_linked_startup_refuses_missing_or_changed_source_stage_cleanup_and_arch
     original = copy.deepcopy(authority.run)
     assert authority.elbow_recovery_prerequisite(RECIPES[authority.run["recipe"]], evidence) is None
     assert authority.run == original
+
+
+@pytest.mark.parametrize(
+    "mode,source,allowed",
+    [
+        (0o700, True, True),
+        (0o700, False, False),
+        (0o720, True, False),
+        (0o660, True, False),
+        (0o600, False, True),
+        (0o644, True, True),
+        (0o644, False, False),
+    ],
+)
+def test_continuation_reader_preserves_posix_private_modes_with_owned_executable_source(
+    tmp_path, monkeypatch, mode, source, allowed
+):
+    import os
+    import stat
+
+    import tools.am1_session_core as core
+
+    path = tmp_path / "owned-file"
+    data = b"unchanged owned executable source or private proof"
+    path.write_bytes(data)
+    actual_os = os
+
+    def fstat(fd):
+        row = actual_os.fstat(fd)
+        fields = {
+            k: getattr(row, k)
+            for k in ("st_dev", "st_ino", "st_nlink", "st_uid", "st_size", "st_mtime_ns", "st_ctime_ns")
+        }
+        return SimpleNamespace(**fields, st_mode=stat.S_IFREG | mode)
+
+    # Windows does not represent POSIX execute/privacy bits. Inject ONLY fstat
+    # mode and the POSIX policy selector; actual opened bytes/path/link/UID and
+    # bounded-read checks still run. Native runs use the same portable contrast.
+    policy_os = SimpleNamespace(**vars(actual_os))
+    policy_os.name = "posix"
+    policy_os.fstat = fstat
+    policy_os.getuid = lambda: path.stat().st_uid
+    monkeypatch.setattr(core, "os", policy_os)
+    if allowed:
+        assert core._continuation_bytes(path, source=source) == data
+    else:
+        with pytest.raises(ValueError, match="owned bounded"):
+            core._continuation_bytes(path, source=source)
+    assert path.read_bytes() == data
