@@ -1,52 +1,68 @@
 # AM1 roaming-resilient sessions
 
-**AM1-ELBOW-TO-COMPLETION-06 result:** useful, intentional repeated elbow movement
-is demonstrated within the declared finite coarse envelope. Fine return precision
-remains unachieved. The old 100 mA threshold was an experimental restriction reassessed
-with evidence. Packet06 replaces unsent FAULT-EVIDENCE-05; prior results below remain
-historical.
+**Current result: [AM1-OPERATION-RECOVERY-07](protected-physical-sessions.md#am1-operation-recovery-07-results-and-status).**
+The existing-console **Left elbow coarse bench v1 · two cycles** preset completed
+58 program seconds and two measured out-and-back cycles on one fixed raw2429
+reference, including one genuine required-local-image interruption and qualified
+same-task recovery. The actual result is **two completed cycles / one qualified
+return**, not a two-of-two coarse benchmark pass. Cycle1 measured71/59/12 ticks;
+cycle2 after recovery measured57/53/16, missing the unchanged56-tick reverse criterion
+by3. Both fine2-tick returns failed. Sampled current peaked149.5 mA under the retained
+150 mA guard; no gain, cap or qualification criterion changed.
 
-**Current result: [AM1-ELBOW-TO-COMPLETION-06](protected-physical-sessions.md#am1-elbow-to-completion-06-results-and-status).**
-Pi recovery, the separately pinned150 mA/45-tick condition, both Core reporting
-repairs and the subsequent HTTP-spacing correction are deployed. Trials06/07 measured 2384→2457→2401 and 2401→2476→2418:
-73/75 outward ticks,56/58 reverse ticks and 17-tick residuals against the same56/56/22
-coarse criteria, with maximum 123.5 mA in each. Both native programs reached 28/cycle1/
-qualified return1; the separate2-tick fine-return criterion failed in both.
-Trial06 retains its original111417-byte finishing overflow and normal owner Stop,
-separate from its completed physical receipt. The first Core stage's original83436-byte
-idle overflow before any new Start also remains retained. The final Core candidate
-passed69 Windows and 69 native checks; bounded idle TLS reports reached 54106/65536 bytes.
+The owned one-second local delivery marker aged original required input beyond
+500 ms and expired locally. Measured hold, fresh matching source/feedback and real
+native acknowledgment closed one recovery episode in1.183449 seconds. The retained
+bridge began with goal2441 equal to measured2441 and froze task progress28.3;
+76 native rows completed its1.086464-second cursor over2.515928 seconds of actual
+write time. Original run/operation/source identities, measured seed and90-second
+Live deadline remained fixed. The recovered `required_proof_loss` is retained;
+there was no native fault in this completed run. A separate five-second browser
+closure continued progress46.2→51.1 on the same task.
 
-Trial07 reached normal owner completed status and continued from 25.1→28 during a
-five-second browser closure with unchanged run UUID, deadline, measured seed and
-service incarnation. No causes/recovery episodes occurred; uncertainty false and
-20-zero/bus/qualified-lift/required-camera cleanup were retained. The post-run check
-verified available idle. All 212 captured running snapshots had qualified local images,
-maximum original-arrival age224.637 ms. The supported lift samples still include
-nonzero measured velocity/moving indicators; qualification does not erase those values.
+Known cleanup retained20 typed zeros, qualified lift/bus proof and exact same-run
+required-camera release, with uncertainty false. Original advisory P1 frames show
+pivot and reversal; independent237.7881-second source verification confirmed release
+and zero audio streams. It does not establish angular/fine precision or an
+exposure-to-servo clock bridge. The first b72 attempt's incomplete-bridge software
+refusal, original cause and cleanup remain preserved; the exact native admission
+clock/refused request were unrecorded, so its bus-gap cause is not invented.
 
-Linked original P1 recordings independently verified release/audio0 and show visible
-outward pivot and return toward the starting orientation. Trial07's87.659-second
-recording met its 90-second budget; the Pi advisory release-unconfirmed outcome remains
-separate from original-source release and required local-camera proof. The linked
-report contains exact current and stopped rollback pins, actual live Goal replies,
-the fixed30-tick startup bound and all preceding failures. Useful repeated coarse
-movement is demonstrated conditionally; universal performance, required-input-loss
-recovery, angular/fine precision and an exposure-to-servo timing bridge are unqualified.
+Current motor/runtime/manifest are `da2e1b` / `b9f6c1` / `a2b426`, from reviewed
+corrected source `df865`. Exact full pins, descriptor, stopped rollback and evidence
+are in the linked report. The shared bounded status and authenticated SHA-bound
+full typed detail preserve truthful current state and earlier results. Reconnect
+queries the original operation and cannot Stop or duplicate Start; only an actual
+authentication401 can justify new enrollment. Pause/Stop precedence and genuine
+current/thermal/status/feedback/travel/source/ownership protections remain intact.
 
-Final saved-actual07 real TLS wrapper reconstructions retained oversized HTTP state/
-attach responses67442/67553 bytes (status200); these are not original live wire captures.
-The HTTP-only whitespace correction passed77 Windows and77 native reporting checks,
-with state63338/attach63445/Owner63429/WSS63408 bytes under the65536-byte bound.
-Service-only stopped staging is complete at runtime145621/manifestfbfb; motor051 and
-Coree666 are unchanged, and physical trial07 remains tied to d08/a971/ec7.
-A trusted authenticated real Pi state GET after staging returned200/no-store/JSON,
-54258 wire bytes, and recovered the whole typed original07 native history exactly.
-Current lifecycle is idle with no current finite-completion evidence; completed
-history survived restart, without a new hardware task or powered trial. Exact pins,
-config and wire hashes are in the linked report. The working packet's conditional
-coarse-movement goal is achieved; fine2-tick return and required-input-loss recovery
-remain unqualified.
+Persistent idle installation is verified after the reviewed permission-preflight
+correction: three exact mode0600 user units are active with restart-on-failure/5-second
+backoff/60-second three-start limit. The same full completed7ce history and counts,
+private bytes and trust remain intact; current idle has no task, capture or hardware
+owner and no current qualification. A locally scheduled ordinary idle reboot restored
+all three exact enabled services, the same sources/trust/auth/private bytes and
+native7ce history/counts. Boot changed to `0df44237-f502-4d74-8964-95bb6347ffd4`;
+there was no automatic task/capture, and original enrollment returned HTTP200 without
+TLS exceptions or new pairing. The preceding update/reboot outage remains unexplained.
+
+The first post-reboot Start `041d4c3e-c252-46c2-983b-5c564e7742e8` started normally
+and moved64 outward ticks (2445→2509), then faulted at13.1 during deliberate endpoint
+dwell: goal2555/raw2509/error46,104 mA,37 distinct acquisitions and no additional
+movement over1.204516 seconds. Its pending window began at outbound11.9, not solely
+in dwell. The old rule correctly refused it; zero cycles/returns and known cleanup
+remain recorded. **Pending:** a separately pinned coarse-qualified dwell policy and
+successful ordinary Start. This supported correction keeps150/45/3/1.2 and56/22/fine2
+limits, native proof and genuine protections rather than raising effort. Packet07 is
+not yet complete. AM1 stays wireless, P1 advisory, AM2 unchanged and simulation the
+default. No permanent tuning, I1/tiny-return campaign, endurance claim or merge.
+
+Packet06's accepted73/56/17 and75/58/17 coarse comparisons, fine2 failures and all
+older100/150 mA failures remain source-dated history. Trial06 retains its physical
+completion versus owner Stop after111417-byte overflow; trial07 completed normally
+at its earlier pins. Earlier required-input-loss recovery remained unproved until
+the distinct packet07 task above. Historical deployment/pending statements below
+apply to those recorded versions, not the current operating state.
 
 **Retained AM1-VISIBLE-CONTROL-04:** One unchanged-I0 positive comparison started normally,
 then faulted at5.9 seconds at the selected100 mA sampled-current guard. All182

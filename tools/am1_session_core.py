@@ -15,7 +15,7 @@ from pathlib import Path
 
 from examples.alohamini.am1_session_contract import (
     ELBOW_RECOVERY_DEFINITIONS,
-    LEFT_ELBOW_COARSE_BENCH_V1,
+    LEFT_ELBOW_COARSE_BENCH_V2,
     LEFT_ELBOW_ORIGINAL_RETURN,
     LEFT_ELBOW_POSITIVE_CONTROL,
     LEFT_ELBOW_RESPONSE,
@@ -2445,7 +2445,7 @@ class SessionAuthority:
             )
 
             view["presets"] = [dict(SELECTED_ELBOW_OPERATION_PRESET,
-                selected_experiment=LEFT_ELBOW_COARSE_BENCH_V1.payload)] if (
+                selected_experiment=LEFT_ELBOW_COARSE_BENCH_V2.payload)] if (
                     SelectedElbowExperiment.recipe_name in view["recipes"]
                     and self.executor.source == "protected-physical-provider") else []
             if self.executor.source != "protected-physical-provider":

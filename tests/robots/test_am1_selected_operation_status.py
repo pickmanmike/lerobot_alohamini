@@ -10,6 +10,7 @@ import pytest
 
 from examples.alohamini.am1_session_contract import (
     LEFT_ELBOW_COARSE_BENCH_V1,
+    LEFT_ELBOW_COARSE_BENCH_V2,
     SELECTED_ELBOW_OPERATION_PRESET,
 )
 from tests.robots.test_am1_persistent_session import command
@@ -58,7 +59,7 @@ def test_supported_versioned_preset_is_shared_metadata_with_its_exact_descriptor
     _, _, authority, _ = build(tmp_path)
     try:
         assert authority.snapshot()["presets"] == [
-            dict(SELECTED_ELBOW_OPERATION_PRESET, selected_experiment=LEFT_ELBOW_COARSE_BENCH_V1.payload)
+            dict(SELECTED_ELBOW_OPERATION_PRESET, selected_experiment=LEFT_ELBOW_COARSE_BENCH_V2.payload)
         ]
         authority.executor.source = "fake-provider"
         assert authority.snapshot()["presets"] == []

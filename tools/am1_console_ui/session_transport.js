@@ -134,8 +134,10 @@ class AM1SessionTransport {
     this.render(this,result.reason);return result;
   }
   async startPreset(id) {
+    const versions={"left-elbow-coarse-bench-v1":1,"left-elbow-coarse-bench-v2":2};
+    const version=typeof id==="string" && Object.hasOwn(versions,id) ? versions[id] : null;
     const preset=this.snapshot?.presets?.find(value=>value.id===id);
-    if(!preset || preset.version!==1 || preset.recipe!=="physical-left-elbow-experiment")throw Error("Current named preset required");
+    if(version===null || !preset || preset.version!==version || preset.recipe!=="physical-left-elbow-experiment")throw Error("Current named preset required");
     return this.start(preset.recipe,null,preset.selected_experiment);
   }
   async readDetail(reference,{raw=false}={}) {

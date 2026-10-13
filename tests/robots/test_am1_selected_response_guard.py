@@ -13,9 +13,11 @@ from tests.robots.test_alohamini_lift_motor_feedback import status
 from tests.robots.test_am1_selected_joint_evidence import context, visible_register_packet, visible_robot
 
 
-def descriptor(*, historical=False, tracking=False, operation=False, **changes):
+def descriptor(*, historical=False, tracking=False, operation=False, qualified_dwell=False, **changes):
     name = (
-        "SELECTED_ELBOW_EXPERIMENT_OPERATION_ENVELOPE_SHA256"
+        "SELECTED_ELBOW_EXPERIMENT_OPERATION_DWELL_ENVELOPE_SHA256"
+        if qualified_dwell
+        else "SELECTED_ELBOW_EXPERIMENT_OPERATION_ENVELOPE_SHA256"
         if operation
         else "SELECTED_ELBOW_EXPERIMENT_ENVELOPE_SHA256"
         if historical
@@ -25,6 +27,10 @@ def descriptor(*, historical=False, tracking=False, operation=False, **changes):
     )
     pin = getattr(contract, name, None)
     assert pin is not None, "separately pinned response envelope is missing"
+    if qualified_dwell:
+        return contract.SelectedElbowExperiment.from_payload(
+            {**contract.LEFT_ELBOW_COARSE_BENCH_V2.payload, **changes}
+        )
     return contract.SelectedElbowExperiment.from_payload(
         {
             "schema_version": 2 if operation else 1,
@@ -34,8 +40,8 @@ def descriptor(*, historical=False, tracking=False, operation=False, **changes):
             "endpoint_dwell_s": 2.0,
             "current_cap_ma": 100.0 if historical else 150.0,
             "live_ceiling_s": 90.0 if operation else 60.0,
-            "minimum_response_raw": 55,
-            "return_tolerance_raw": 20,
+            "minimum_response_raw": 56 if qualified_dwell else 55,
+            "return_tolerance_raw": 22 if qualified_dwell else 20,
             "goal_readback_checkpoints_s": [18.0, 19.0],
             **({"cycle_count": 2, "intercycle_hold_s": 6} if operation else {}),
             **changes,
@@ -113,8 +119,11 @@ def guarded(
     excursion=10.0,
     tracking=False,
     operation=False,
+    qualified_dwell=False,
     reference=0.0,
     calibration=None,
+    clock_offset=0.0,
+    definition_changes=None,
 ):
     material = calibration or {"drive_mode": 0, "homing_offset": 1845, "range_min": 1000, "range_max": 3000}
     seed_raw = contract.SelectedElbowExperiment.encoded_goal(reference, material)
@@ -138,7 +147,9 @@ def guarded(
         id=3, **material
     )
     definition = descriptor(
-        historical=historical, tracking=tracking, operation=operation, excursion_norm=excursion
+        historical=historical, tracking=tracking, operation=operation, qualified_dwell=qualified_dwell,
+        excursion_norm=10 if qualified_dwell and excursion == 10 else excursion,
+        **(definition_changes or {})
     )
     obj._am1_selected_elbow_experiment = definition
     identity.update(recipe=definition.recipe_name, experiment_sha256=definition.sha256)
@@ -155,9 +166,10 @@ def guarded(
     original_counts = (len(port.writes), len(reads), len(writes), len(rows))
 
     def tick(at, raw=None, current=12, progress=None, *, mutate=None, run_guard=True, context_overrides=None):
+        progress = 5 + at - 1 if progress is None else progress
+        at += clock_offset
         now[0] = at
         raw = seed_raw if raw is None else raw
-        progress = 5 + at - 1 if progress is None else progress
         cycle, phase, fraction = definition.phase(progress)
         metadata = context(
             profile=definition.profile,
@@ -1049,3 +1061,284 @@ def test_boundary_is_retained_in_existing_feedback_and_full_fault_serializer(mon
         g.tick(2.21)
     receipt = {"selected_joint_fault": g.robot._am1_selected_joint_fault}
     assert json.loads(json.dumps(receipt))["selected_joint_fault"]["response_boundary"]["elapsed_s"] >= 1.2
+
+
+def operation03_guard(monkeypatch, *, qualified_dwell=True, clock_offset=0.0):
+    return guarded(
+        monkeypatch,
+        operation=True,
+        qualified_dwell=qualified_dwell,
+        reference=(2445.2 - 1000) / 11.05 - 100,
+        calibration={"drive_mode": 0, "homing_offset": 1845, "range_min": 1000, "range_max": 3210},
+        clock_offset=clock_offset,
+    )
+
+
+def operation03_plateau(monkeypatch, *, qualified_dwell=True, clock_offset=0.0):
+    """Real native guard path with the recorded 2445 -> 2509 outward response."""
+    g = operation03_guard(monkeypatch, qualified_dwell=qualified_dwell, clock_offset=clock_offset)
+    g.tick(1.9, raw=2445, progress=1.9, current=16)
+    g.tick(2.0, raw=2445, progress=2.0, current=16)
+    for n in range(1, 100):
+        at = 2 + n / 10
+        g.tick(at, raw=min(2509, 2445 + round(n * 0.65)), progress=at, current=16)
+    assert g.robot._am1_selected_joint_action["expected_goal_raw"] == 2554
+    assert g.evidence.response_boundary["anchor_position_raw"] == 2509
+    return g
+
+
+def test_v2_coarse_response_retires_timely_late_window_at_constant_endpoint(monkeypatch):
+    g = operation03_plateau(monkeypatch)
+    for at in (12.0, 12.2, 12.6, 13.11, 13.9):
+        g.tick(at, raw=2509, progress=at, current=16)
+    boundary = g.evidence.response_boundary
+    assert boundary["status"] == "coarse_qualified_dwell"
+    assert boundary["signed_commanded_error_raw"] == 46
+    assert boundary["coarse_dwell_proof"]["leg_origin_raw"] == 2445
+    assert boundary["coarse_dwell_proof"]["signed_leg_response_raw"] == 64
+    retired = boundary["coarse_dwell_proof"]["retired_window"]
+    assert retired["status"] == "retired_at_coarse_qualified_dwell"
+    assert retired["signed_response_raw"] == 0
+    assert retired["elapsed_s"] == pytest.approx(0.1)
+    assert retired["anchor_position_raw"] == 2509
+    assert getattr(g.robot, "_am1_selected_joint_fault", None) is None
+    g.tick(14, raw=2509, progress=14, current=16)
+    assert g.evidence.response_boundary["status"] != "coarse_qualified_dwell"
+
+
+def test_retained_v1_still_requires_late_window_response_in_endpoint(monkeypatch):
+    g = operation03_plateau(monkeypatch, qualified_dwell=False)
+    g.tick(12, raw=2509, progress=12, current=16)
+    with pytest.raises(RuntimeError, match="response"):
+        g.tick(13.11, raw=2509, progress=13.11, current=16)
+    boundary = g.robot._am1_selected_joint_fault["response_boundary"]
+    assert boundary["failure_kind"] == "nonresponse" and boundary["signed_response_raw"] == 0
+
+
+def test_qualified_dwell_cannot_retire_an_already_expired_moving_window(monkeypatch):
+    g = operation03_plateau(monkeypatch)
+    with pytest.raises(RuntimeError, match="response"):
+        g.tick(13.11, raw=2509, progress=12, current=16)
+    assert g.robot._am1_selected_joint_fault["response_boundary"]["failure_kind"] == "nonresponse"
+
+
+@pytest.mark.parametrize("start_phase", ["absent", "stale", "second_cycle_without_hold"])
+def test_qualified_dwell_requires_fresh_actual_same_leg_origin(monkeypatch, start_phase):
+    g = operation03_guard(monkeypatch)
+    if start_phase == "stale":
+        g.tick(1, raw=2445, progress=1.9)
+    if start_phase == "second_cycle_without_hold":
+        g.tick(1.9, raw=2445, progress=1.9)
+        g.tick(2, raw=2445, progress=2)
+    base = 32 if start_phase == "second_cycle_without_hold" else 2
+    g.tick(3, raw=2509, progress=base + 9.9)
+    g.tick(3.1, raw=2509, progress=base + 10)
+    with pytest.raises(RuntimeError, match="response"):
+        g.tick(4.21, raw=2509, progress=base + 11.1)
+
+
+def test_coarse_dwell_does_not_disable_static_adverse_current_or_reversal(monkeypatch):
+    g = operation03_plateau(monkeypatch)
+    g.tick(12, raw=2509, progress=12, current=16)
+    for at, current in ((12.1, 17), (12.2, 18)):
+        g.tick(at, raw=2509, progress=at, current=current)
+    with pytest.raises(RuntimeError, match="adverse current"):
+        g.tick(12.3, raw=2509, progress=12.3, current=19)
+
+
+def test_coarse_dwell_preserves_current_cap_priority(monkeypatch):
+    g = operation03_plateau(monkeypatch)
+    with pytest.raises(RuntimeError, match="effort"):
+        g.tick(12, raw=2509, progress=12, current=24)
+    assert g.robot._am1_selected_joint_fault["source"] == "cached_guard"
+
+
+def test_coarse_dwell_rejects_retreat_against_intended_direction(monkeypatch):
+    g = operation03_plateau(monkeypatch)
+    g.tick(12, raw=2509, progress=12, current=16)
+    with pytest.raises(RuntimeError, match="reversed"):
+        g.tick(12.1, raw=2506, progress=12.1, current=16)
+
+
+def test_under_56_actual_ticks_cannot_earn_coarse_dwell(monkeypatch):
+    g = operation03_guard(monkeypatch)
+    g.tick(1.9, raw=2445, progress=1.9)
+    g.tick(2, raw=2445, progress=2)
+    g.tick(3, raw=2500, progress=11.9)
+    g.tick(3.1, raw=2500, progress=12)
+    with pytest.raises(RuntimeError, match="response"):
+        g.tick(4.21, raw=2500, progress=13.1)
+
+
+def test_second_cycle_origin_is_actual_interhold_position_after_recovery(monkeypatch):
+    g = guarded(monkeypatch, operation=True, qualified_dwell=True)
+    g.tick(1.9, raw=2017, progress=28)
+    g.evidence.deactivate(g.robot)
+    g.control.epoch = 1
+    g.tick(2, raw=2017, progress=28, context_overrides=operation_rejoin())
+    g.tick(2.1, raw=2017, progress=28, context_overrides=operation_rejoin(0.1))
+    for n in range(2, 18):
+        g.tick(2 + n / 10, raw=2017, progress=28, context_overrides=operation_rejoin(n / 10))
+    g.tick(3.8, raw=2017, progress=28)
+    g.tick(3.9, raw=2017, progress=31.9)
+    g.tick(4, raw=2017, progress=32)
+    g.tick(4.1, raw=2073, progress=41.9)
+    g.tick(4.2, raw=2073, progress=42)
+    boundary = g.evidence.response_boundary
+    assert boundary["status"] == "coarse_qualified_dwell"
+    assert boundary["coarse_dwell_proof"]["leg_origin_raw"] == 2017
+    assert boundary["coarse_dwell_proof"]["signed_leg_response_raw"] == 56
+    assert g.evidence.reference == 0
+    g.tick(5.3, raw=2073, progress=43.1)
+    assert getattr(g.robot, "_am1_selected_joint_fault", None) is None
+
+
+def test_coarse_dwell_full_native_feedback_keeps_original_serialization_limits(monkeypatch):
+    g = operation03_plateau(monkeypatch, clock_offset=23441.123456789)
+    observation = g.tick(12, raw=2509, progress=12, current=16)
+    g.evidence.publish(g.robot, g.control, observation)
+    boundary = observation[host.AM1_LOCAL_FEEDBACK_KEY]["selected_joint"]["response_boundary"]
+    assert len(json.dumps(boundary, allow_nan=False, separators=(",", ":")).encode()) <= 4096
+    assert len(host.build_observation_multipart(observation, [])[0]) < 65536
+    certificate = boundary["coarse_dwell_proof"]["qualified"]
+    assert certificate["position_read_completed_at_monotonic_s"] == pytest.approx(23453.113456789)
+    assert boundary["coarse_dwell_proof"]["retired_window"]["signed_response_raw"] == 0
+
+
+@pytest.mark.parametrize(
+    "invalid", ["future_marker", "foreign_marker", "wrong_goal", "old_position", "duplicate_current"]
+)
+def test_v2_dwell_never_qualifies_unmatched_or_nonadvancing_native_acquisition(monkeypatch, invalid):
+    g = operation03_plateau(monkeypatch)
+    old_current = copy.deepcopy(g.robot._am1_selected_joint_current)
+
+    def corrupt(obj, observation):
+        marker = observation[host.AM1_LOCAL_FEEDBACK_KEY]
+        if invalid == "future_marker":
+            marker["acquired_at_monotonic_s"] = 100
+        elif invalid == "foreign_marker":
+            marker["run_id"] = "foreign"
+        elif invalid == "wrong_goal":
+            obj._am1_selected_joint_action["expected_goal_raw"] += 1
+        elif invalid == "old_position":
+            obj._am1_selected_joint_position["read_started_at_monotonic_s"] = 10
+        else:
+            obj._am1_selected_joint_current = copy.deepcopy(old_current)
+
+    if invalid == "duplicate_current":
+        g.tick(12, raw=2509, progress=12, current=16, mutate=corrupt)
+        assert g.evidence.response_boundary["status"] == "pending"
+        with pytest.raises(RuntimeError, match="response"):
+            g.tick(13.11, raw=2509, progress=13.11, current=16)
+    else:
+        with pytest.raises(RuntimeError):
+            g.tick(12, raw=2509, progress=12, current=16, mutate=corrupt)
+    assert g.evidence.response_boundary.get("status") != "coarse_qualified_dwell"
+
+
+@pytest.mark.parametrize("changed", ["pause", "epoch", "intent"])
+def test_v2_dwell_origin_is_not_reused_after_control_continuity_changes(monkeypatch, changed):
+    g = operation03_plateau(monkeypatch)
+    g.tick(12, raw=2509, progress=12, current=16)
+    if changed == "pause":
+        g.evidence.deactivate(g.robot)
+        g.control.state = "paused"
+        g.control.epoch = 1
+        g.evidence.guard_recovery(g.robot, g.control, {})
+        g.control.state = "active"
+        g.control.epoch = 2
+    elif changed == "epoch":
+        g.control.epoch = 1
+    else:
+        g.control.intent_revision = 1
+    g.tick(12.2, raw=2509, progress=12.2, current=16)
+    assert g.evidence.response_boundary["status"] == "pending"
+    with pytest.raises(RuntimeError, match="response"):
+        g.tick(13.41, raw=2509, progress=13.41, current=16)
+
+
+def test_v2_moving_phase_stall_still_faults_before_a_later_endpoint_can_qualify(monkeypatch):
+    g = operation03_guard(monkeypatch)
+    g.tick(1.9, raw=2445, progress=1.9, current=16)
+    g.tick(2, raw=2445, progress=2, current=16)
+    g.tick(3, raw=2445, progress=7, current=16)
+    with pytest.raises(RuntimeError, match="response"):
+        g.tick(4.21, raw=2445, progress=8.21, current=16)
+    boundary = g.robot._am1_selected_joint_fault["response_boundary"]
+    assert boundary["failure_kind"] == "nonresponse" and boundary["signed_response_raw"] == 0
+
+
+def test_v2_second_cycle_cannot_credit_original_q0_instead_of_actual_start(monkeypatch):
+    g = guarded(
+        monkeypatch,
+        operation=True,
+        qualified_dwell=True,
+        calibration={"drive_mode": 0, "homing_offset": 1845, "range_min": 1000, "range_max": 3400},
+    )
+    g.tick(1.9, raw=2217, progress=31.9)
+    g.tick(2, raw=2217, progress=32)
+    g.tick(3, raw=2272, progress=41.9)
+    g.tick(3.1, raw=2272, progress=42)
+    assert g.evidence.reference == 0
+    assert g.evidence.response_boundary["status"] == "pending"
+    with pytest.raises(RuntimeError, match="response"):
+        g.tick(4.21, raw=2272, progress=43.1)
+
+
+def test_v2_qualified_dwell_preserves_original_native_live_deadline(monkeypatch):
+    g = operation03_plateau(monkeypatch)
+    g.tick(12, raw=2509, progress=12, current=16)
+    with pytest.raises(RuntimeError, match="Live ceiling"):
+        g.tick(92, raw=2509, progress=13, current=16)
+
+
+def test_v2_duplicate_complete_frame_cannot_create_or_refresh_a_dwell_proof(monkeypatch):
+    g = operation03_plateau(monkeypatch)
+    before = copy.deepcopy(g.evidence.response_boundary)
+    observation = g.tick(12, raw=2509, progress=12, current=16, run_guard=False)
+    previous_position = g.robot._am1_selected_joint_position
+    previous_current = g.robot._am1_selected_joint_current
+    previous_position.update(read_started_at_monotonic_s=11.88, read_completed_at_monotonic_s=11.89)
+    previous_current.update(read_started_at_monotonic_s=11.895, read_completed_at_monotonic_s=11.9)
+    g.robot._am1_selected_joint_action.update(
+        write_started_at_monotonic_s=11.87, write_completed_at_monotonic_s=11.875
+    )
+    observation[host.AM1_LOCAL_FEEDBACK_KEY]["read_started_at_monotonic_s"] = 11.88
+    g.evidence.guard_recovery(g.robot, g.control, observation)
+    assert g.evidence.response_boundary == before
+    with pytest.raises(RuntimeError, match="response"):
+        g.tick(13.11, raw=2509, progress=13.11, current=16)
+
+
+def test_dwell_fixture_exercises_exact_named_v2_descriptor(monkeypatch):
+    g = operation03_guard(monkeypatch)
+    assert g.definition.sha256 == "31336b83330fb5398778b4cfc0397011a3ae063d47efdf9c02e62d685475d473"
+    assert g.definition.goal_readback_checkpoints_s == (5, 37)
+
+
+@pytest.mark.parametrize(
+    "changes", [{"minimum_response_raw": 60}, {"excursion_norm": 9, "minimum_response_raw": 50}]
+)
+def test_other_valid_v2_conditions_cannot_retire_the_diagnosed_endpoint_obligation(monkeypatch, changes):
+    excursion = changes.get("excursion_norm", 10)
+    g = guarded(
+        monkeypatch,
+        operation=True,
+        qualified_dwell=True,
+        excursion=excursion,
+        reference=(2445.2 - 1000) / 11.05 - 100,
+        calibration={"drive_mode": 0, "homing_offset": 1845, "range_min": 1000, "range_max": 3210},
+        definition_changes={"minimum_response_raw": changes["minimum_response_raw"]},
+    )
+    g.tick(1.9, raw=2445, progress=1.9, current=16)
+    g.tick(2, raw=2445, progress=2, current=16)
+    measured = 2509 if excursion == 10 else 2498
+    g.tick(3, raw=measured, progress=11.9, current=16)
+    g.tick(3.1, raw=measured, progress=12, current=16)
+    assert g.definition.envelope_sha256 == contract.LEFT_ELBOW_COARSE_BENCH_V2.envelope_sha256
+    assert g.definition.sha256 != contract.LEFT_ELBOW_COARSE_BENCH_V2.sha256
+    with pytest.raises(RuntimeError, match="response"):
+        g.tick(4.21, raw=measured, progress=13.1, current=16)
+    boundary = g.robot._am1_selected_joint_fault["response_boundary"]
+    assert boundary["failure_kind"] == "nonresponse" and boundary["signed_response_raw"] == 0
+    assert "coarse_dwell_proof" not in boundary

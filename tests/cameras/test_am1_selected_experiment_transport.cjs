@@ -51,3 +51,30 @@ test("named coarse bench preset uses the existing selected recipe and immutable 
     await assert.rejects(()=>transport.start(recipe,null,bad),/experiment/i);
   assert.equal(requests.length,1);
 });
+
+
+function operationDescriptor(){return {...descriptor(),schema_version:2,
+  envelope_sha256:"2d55c9e82d82ea3e66b6bf336853ad84a84cbf2cc3a62ff5e30a7f2f6f55ecef",
+  excursion_norm:10,ramp_s:10,endpoint_dwell_s:2,current_cap_ma:150,live_ceiling_s:90,
+  goal_readback_checkpoints_s:[5,37],cycle_count:2,intercycle_hold_s:6};}
+test("reviewed V2 preset issues one ordinary Start with its unchanged shared descriptor",async()=>{
+  const data={...operationDescriptor(),envelope_sha256:"ea8ed4e0abd5222734cd77cffc22c50739d53ab4cbde999016b33606af7648f5"},original=JSON.stringify(data),requests=[];
+  assert.equal(require("node:crypto").createHash("sha256").update(JSON.stringify(Object.fromEntries(Object.keys(data).sort().map(key=>[key,data[key]])))).digest("hex"),"31336b83330fb5398778b4cfc0397011a3ae063d47efdf9c02e62d685475d473");
+  const transport=fixture(async(url,options)=>{requests.push([url,JSON.parse(options.body)]);return {ok:true,json:async()=>({accepted:true,status:"starting"})};});
+  transport.snapshot={presets:[{id:"left-elbow-coarse-bench-v2",version:2,label:"Left elbow coarse bench v2 · two cycles",recipe,selected_experiment:data}]};
+  await transport.startPreset("left-elbow-coarse-bench-v2");
+  assert.equal(requests.length,1);assert.equal(requests[0][0],"/api/start");
+  assert.equal(JSON.stringify(requests[0][1].selected_experiment),original);
+  assert.equal(requests[0][1].controller_generation,"claimed");assert.equal(typeof requests[0][1].operation_id,"string");
+  assert.equal(JSON.stringify(data),original);
+});
+for(const [name,id,version] of [
+  ["unknown ID","unreviewed-preset",1],["V2 ID with V1 version","left-elbow-coarse-bench-v2",1],
+  ["V1 ID with V2 version","left-elbow-coarse-bench-v1",2],["version3","left-elbow-coarse-bench-v2",3],
+  ["boolean version","left-elbow-coarse-bench-v2",true],["string version","left-elbow-coarse-bench-v2","2"],
+  ["boolean ID",true,1],["false ID",false,1],
+])test("named preset rejects "+name+" before any control request",async()=>{
+  let calls=0;const transport=fixture(async()=>{calls++;return {ok:true,json:async()=>({accepted:true})};});
+  transport.snapshot={presets:[{id,version,recipe,selected_experiment:operationDescriptor()}]};
+  await assert.rejects(()=>transport.startPreset(id),/preset/i);assert.equal(calls,0);
+});

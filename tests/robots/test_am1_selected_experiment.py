@@ -716,3 +716,19 @@ def test_selected_sparse_receipt_uses_its_declared_smaller_cap_with_a_quiet_late
         with pytest.raises(ValueError, match="80 mA"):
             p.advance(0.1, positions, 1, selected_feedback=item)
         assert p.elapsed_s == 0
+
+
+def test_qualified_dwell_pin_preserves_historical_payload_and_fixed_waveform():
+    old = contract.LEFT_ELBOW_COARSE_BENCH_V1
+    new = getattr(contract, "LEFT_ELBOW_COARSE_BENCH_V2", None)
+    assert new is not None, "current qualified-dwell definition missing"
+    assert old.sha256 == "07480c167c2f94b80565decfe251f586adfc349d9a657124b331b15c2d114ab1"
+    assert old.envelope_sha256 == "2d55c9e82d82ea3e66b6bf336853ad84a84cbf2cc3a62ff5e30a7f2f6f55ecef"
+    assert new.sha256 != old.sha256 and new.envelope_sha256 != old.envelope_sha256
+    for at in [0, 1.9, 2, 11.9, 12, 13.9, 14, 26, 28, 31.9, 32, 41.9, 42, 44, 58]:
+        assert old.phase(at) == new.phase(at) and old.sample_key(at) == new.sample_key(at)
+    assert new.minimum_response_raw == 56 and new.return_tolerance_raw == 22
+    assert new.response_rule["qualified_endpoint_dwell"] is True
+    assert "qualified_endpoint_dwell" not in old.response_rule
+    assert contract.SelectedElbowExperiment.from_payload(old.payload).sha256 == old.sha256
+    assert contract.SelectedElbowExperiment.from_payload(new.payload).sha256 == new.sha256

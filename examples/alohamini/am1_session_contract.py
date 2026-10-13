@@ -562,6 +562,20 @@ SELECTED_ELBOW_EXPERIMENT_OPERATION_ENVELOPE_SHA256 = hashlib.sha256(json.dumps(
 ).encode()).hexdigest()
 
 
+# This separate diagnostic policy distinguishes a useful coarse outward leg
+# followed by its intentional constant-target dwell from a moving-leg stall.
+# Earlier envelope hashes and their response obligations remain unchanged.
+SELECTED_ELBOW_EXPERIMENT_OPERATION_DWELL_ENVELOPE = MappingProxyType({
+    **dict(SELECTED_ELBOW_EXPERIMENT_OPERATION_ENVELOPE),
+    "scope": "AM1-OPERATION-RECOVERY-07/fixed-reference-coarse-bench-v2",
+    "qualified_endpoint_dwell": True,
+})
+SELECTED_ELBOW_EXPERIMENT_OPERATION_DWELL_ENVELOPE_SHA256 = hashlib.sha256(json.dumps(
+    dict(SELECTED_ELBOW_EXPERIMENT_OPERATION_DWELL_ENVELOPE), sort_keys=True, allow_nan=False,
+    separators=(",", ":"),
+).encode()).hexdigest()
+
+
 @dataclass(frozen=True)
 class SelectedElbowExperiment:
     """One validated, pinned finite condition on the existing selected provider."""
@@ -595,6 +609,8 @@ class SelectedElbowExperiment:
             SELECTED_ELBOW_EXPERIMENT_RESPONSE_ENVELOPE_SHA256: SELECTED_ELBOW_EXPERIMENT_RESPONSE_ENVELOPE,
             SELECTED_ELBOW_EXPERIMENT_TRACKING_ENVELOPE_SHA256: SELECTED_ELBOW_EXPERIMENT_TRACKING_ENVELOPE,
             SELECTED_ELBOW_EXPERIMENT_OPERATION_ENVELOPE_SHA256: SELECTED_ELBOW_EXPERIMENT_OPERATION_ENVELOPE,
+            SELECTED_ELBOW_EXPERIMENT_OPERATION_DWELL_ENVELOPE_SHA256:
+                SELECTED_ELBOW_EXPERIMENT_OPERATION_DWELL_ENVELOPE,
         }
         if (type(self.schema_version) is not int or self.schema_version not in (1, 2)
                 or type(self.envelope_sha256) is not str or self.envelope_sha256 not in envelopes):
@@ -632,6 +648,7 @@ class SelectedElbowExperiment:
             "commanded_error_raw": e["response_commanded_error_raw"],
             "minimum_response_raw": e["response_minimum_raw"],
             "window_s": e["response_window_s"],
+            **({"qualified_endpoint_dwell": True} if e.get("qualified_endpoint_dwell") is True else {}),
         }))
         object.__setattr__(self, "_startup_hold_error_raw", None if "response_window_s" not in e
                            else e.get("startup_hold_error_raw", 30))
@@ -852,8 +869,12 @@ LEFT_ELBOW_COARSE_BENCH_V1 = SelectedElbowExperiment.from_payload({
     "live_ceiling_s":90, "minimum_response_raw":56, "return_tolerance_raw":22,
     "goal_readback_checkpoints_s":[5,37], "cycle_count":2, "intercycle_hold_s":6,
 })
+LEFT_ELBOW_COARSE_BENCH_V2 = SelectedElbowExperiment.from_payload({
+    **LEFT_ELBOW_COARSE_BENCH_V1.payload,
+    "envelope_sha256": SELECTED_ELBOW_EXPERIMENT_OPERATION_DWELL_ENVELOPE_SHA256,
+})
 SELECTED_ELBOW_OPERATION_PRESET = MappingProxyType({
-    "id":"left-elbow-coarse-bench-v1", "version":1, "label":"Left elbow coarse bench v1 · two cycles",
+    "id":"left-elbow-coarse-bench-v2", "version":2, "label":"Left elbow coarse bench v2 · two cycles",
     "recipe":SelectedElbowExperiment.recipe_name,
 })
 

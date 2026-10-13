@@ -73,6 +73,9 @@ class AM1SelectedJointEvidence:
         self._response_startup_hold = None
         self._response_rejoin = None
         self._response_startup_acquisitions = None
+        self._response_origin_candidate = None
+        self._response_leg_origin = None
+        self._response_dwell = None
 
     VISIBLE_STATIC_REGISTERS = (
         "Firmware_Major_Version",
@@ -358,6 +361,7 @@ class AM1SelectedJointEvidence:
                 self.response_boundary = dict(self.response_boundary, status="continuity_lost")
         self.context = None
         self._response_rejoin = None
+        self._response_origin_candidate = self._response_leg_origin = self._response_dwell = None
         robot._am1_selected_joint_evidence_context = None
 
     def prepare(self, robot, action, binding):
@@ -991,9 +995,139 @@ class AM1SelectedJointEvidence:
                 > marker["acquired_at_monotonic_s"]):
             self._response_refuse(robot, "Selected response startup action/acquisition ordering is unavailable")
 
+    @staticmethod
+    def _response_native_certificate(context, marker, position, current):
+        # The full original native row remains in the normal evidence stream.
+        # These bounded clocks/IDs identify it without duplicating its payload.
+        return {
+            "observation_id": marker["observation_id"],
+            "progress_s": context["progress_s"],
+            "phase": context["phase"],
+            "position_raw": position["raw"],
+            "position_read_started_at_monotonic_s": position["read_started_at_monotonic_s"],
+            "position_read_completed_at_monotonic_s": position["read_completed_at_monotonic_s"],
+            "current_read_started_at_monotonic_s": current["read_started_at_monotonic_s"],
+            "current_read_completed_at_monotonic_s": current["read_completed_at_monotonic_s"],
+            "acquired_at_monotonic_s": marker["acquired_at_monotonic_s"],
+        }
+
+
+    @staticmethod
+    def _response_coarse_policy(definition):
+        from examples.alohamini.am1_session_contract import LEFT_ELBOW_COARSE_BENCH_V2
+
+        # The evidence supports this named condition, not every geometry-valid
+        # descriptor that can be represented under the new envelope.
+        return (
+            definition.response_rule.get("qualified_endpoint_dwell") is True
+            and definition.sha256 == LEFT_ELBOW_COARSE_BENCH_V2.sha256
+        )
+
+    def _response_coarse_origin(self, definition, binding, marker, position, current, direction):
+        context = self.context
+        if not self._response_coarse_policy(definition):
+            return
+        key = (*binding, context["cycle"], direction)
+        candidate, origin, dwell = (
+            self._response_origin_candidate,
+            self._response_leg_origin,
+            self._response_dwell,
+        )
+        if origin is not None and origin["key"] != key:
+            self._response_leg_origin = self._response_dwell = None
+        if dwell is not None and dwell["key"] != key:
+            self._response_dwell = None
+        phase = context["phase"]
+        certificate = self._response_native_certificate(context, marker, position, current)
+        if phase in {"baseline", "intercycle_hold"}:
+            self._response_leg_origin = self._response_dwell = None
+            self._response_origin_candidate = {
+                "binding": binding,
+                "cycle": 1 if phase == "baseline" else 2,
+                "certificate": certificate,
+            }
+            return
+        if phase == "outbound":
+            if self._response_leg_origin is None and candidate is not None:
+                previous = candidate["certificate"]
+                if (
+                    candidate["binding"] == binding
+                    and candidate["cycle"] == context["cycle"]
+                    and marker["acquired_at_monotonic_s"] - previous["position_read_started_at_monotonic_s"]
+                    <= 0.5
+                    and marker["acquired_at_monotonic_s"] - previous["current_read_started_at_monotonic_s"] <= 0.5
+                ):
+                    self._response_leg_origin = {"key": key, "origin": previous, "first_outbound": certificate}
+            self._response_origin_candidate = None
+            return
+        self._response_origin_candidate = None
+        if phase != "endpoint":
+            # Recovery/rejoin, a new cycle or owner epoch must acquire a fresh
+            # actual leg origin. Paused/coasting movement never earns this proof.
+            self._response_leg_origin = self._response_dwell = None
+
+
+    def _response_coarse_dwell(self, definition, binding, marker, position, current, latest, window):
+        context, origin = self.context, self._response_leg_origin
+        if (
+            not self._response_coarse_policy(definition)
+            or context["phase"] != "endpoint"
+            or origin is None
+            or origin["key"] != (*binding, context["cycle"], latest["direction"])
+            or context["requested_target"] != context["endpoint_target"]
+        ):
+            return False
+        response = latest["direction"] * (position["raw"] - origin["origin"]["position_raw"])
+        if response < definition.minimum_response_raw:
+            self._response_dwell = None
+            return False
+        dwell = self._response_dwell
+        if dwell is None:
+            # A first timely endpoint acquisition can explicitly retire its
+            # late moving window. Already expired exposure remains a refusal.
+            if window is not None and latest["elapsed_s"] >= definition.response_rule["window_s"] - 1e-9:
+                return False
+            retired = (
+                None
+                if window is None
+                else dict(
+                    latest,
+                    status="retired_at_coarse_qualified_dwell",
+                    anchor_phase=window["coarse_anchor_phase"],
+                    anchor_progress_s=window["coarse_anchor_progress_s"],
+                )
+            )
+            proof = {
+                "version": 1,
+                "binding": dict(
+                    zip(("run_id", "host_incarnation", "epoch", "intent_revision", "experiment_sha256"), binding)
+                ),
+                "cycle": context["cycle"],
+                "direction": latest["direction"],
+                "leg_origin_raw": origin["origin"]["position_raw"],
+                "minimum_leg_response_raw": definition.minimum_response_raw,
+                "signed_leg_response_raw": response,
+                "origin": copy.deepcopy(origin["origin"]),
+                "first_outbound": copy.deepcopy(origin["first_outbound"]),
+                "qualified": self._response_native_certificate(context, marker, position, current),
+                "retired_window": retired,
+            }
+            self._response_dwell = dwell = {
+                "key": origin["key"],
+                "goal": latest["last_encoded_goal_raw"],
+                "proof": proof,
+            }
+        if latest["last_encoded_goal_raw"] != dwell["goal"]:
+            return False
+        self._response_window = None
+        proof = dict(dwell["proof"], signed_leg_response_raw=response)
+        self.response_boundary = dict(latest, status="coarse_qualified_dwell", coarse_dwell_proof=proof)
+        return True  # Only this response policy; outer local guards still run.
+
     def _guard_response(self, robot, control, observation, definition, position, current):
         rule = definition.response_rule
         if control.state != "active":
+            self._response_origin_candidate = self._response_leg_origin = self._response_dwell = None
             if self._response_window is not None:
                 if self._response_tracking_current(robot):
                     self._response_window = None
@@ -1012,6 +1146,9 @@ class AM1SelectedJointEvidence:
             return
         if marker is None or not definition.context_valid(context):
             self._response_refuse(robot, "Selected response active source/context is unavailable")
+        if (rule.get("qualified_endpoint_dwell") is True
+                and marker["acquired_at_monotonic_s"] > self.clock()):
+            self._response_refuse(robot, "Selected response original marker acquisition is unavailable")
         action = getattr(robot, "_am1_selected_joint_action", None)
         material = {k: int(getattr(robot.left_bus.calibration[MOTOR], k))
                     for k in ("drive_mode", "homing_offset", "range_min", "range_max")}
@@ -1044,6 +1181,7 @@ class AM1SelectedJointEvidence:
                                   failure_kind="continuity_lost")
         self._response_last_acquisitions = acquisitions
         self._response_last_current_raw = current["raw"]
+        self._response_coarse_origin(definition, binding, marker, position, current, direction)
         raw = position["raw"]
         error = 0 if direction is None else direction * (goal - raw)
         latest = {
@@ -1070,6 +1208,8 @@ class AM1SelectedJointEvidence:
                 signed_response_raw=response, elapsed_s=elapsed, distinct_sample_count=window["count"],
             )
             self.response_boundary = dict(latest, status="pending")
+            if self._response_coarse_dwell(definition, binding, marker, position, current, latest, window):
+                return
             if error < rule["commanded_error_raw"]:
                 self.response_boundary["status"] = "tracking"
                 if response >= rule["minimum_response_raw"]:
@@ -1083,6 +1223,8 @@ class AM1SelectedJointEvidence:
                 self._response_window = None
             else:
                 return
+        elif self._response_coarse_dwell(definition, binding, marker, position, current, latest, window):
+            return
         elif error < rule["commanded_error_raw"]:
             self.response_boundary = dict(latest, status="tracking")
             return
@@ -1092,6 +1234,9 @@ class AM1SelectedJointEvidence:
                 "position_started": position["read_started_at_monotonic_s"],
                 "current_started": current["read_started_at_monotonic_s"],
                 "current_at": current["read_completed_at_monotonic_s"], "count": 1,
+                **({"coarse_anchor_phase": context["phase"],
+                    "coarse_anchor_progress_s": context["progress_s"]}
+                   if rule.get("qualified_endpoint_dwell") is True else {}),
             }
             self.response_boundary = dict(latest, status="pending", anchor_position_raw=raw,
                 anchor_position_started_at_monotonic_s=position["read_started_at_monotonic_s"],
