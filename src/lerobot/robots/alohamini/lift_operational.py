@@ -179,25 +179,182 @@ class OperationalLift(InstalledLiftCheck):
         if self.failure is not None:
             raise self.failure
 
+    def _qualify_startup_off(self) -> dict[str, Any]:
+        """Acquire observed off state, then prove the unchanged strict baseline."""
+        previous_clock = None
+
+        def clock(record: dict[str, Any] | None = None) -> float:
+            nonlocal previous_clock
+            value = self.monitor.monotonic()
+            if (
+                type(value) not in (int, float)
+                or not math.isfinite(value)
+                or value < 0
+                or previous_clock is not None
+                and value < previous_clock
+            ):
+                self.refuse(
+                    {**(record or {"phase": "startup_off_clock"}), "invalid_clock_value_repr": repr(value)},
+                    "startup off: original clock was invalid or regressed.",
+                )
+            previous_clock = value
+            return value
+
+        requested_at = clock()
+        deadline = requested_at + feedback.STATIONARY_TIMEOUT_S
+        request = self.monitor.record(
+            "startup_off_request_started",
+            requested_at_monotonic_s=requested_at,
+            absolute_deadline_monotonic_s=deadline,
+            timeout_s=feedback.STATIONARY_TIMEOUT_S,
+            write_evidence="requested start and helper return; not proof of wire effect",
+        )
+
+        def remaining(record: dict[str, Any]) -> float:
+            value = deadline - clock(record)
+            if value <= 0:
+                self.refuse(record, "startup off: original deadline expired before the next operation.")
+            return value
+
+        # Keep the existing helper's SDK retry/readback behavior. There is no
+        # additional request, enabled write, outer retry or renewed deadline.
+        for register in ("Goal_Velocity", "Torque_Enable"):
+            remaining(request)
+            started = clock(request)
+            try:
+                write_register(self.bus, register, self.lift.cfg.name, 0)
+            except BaseException as error:
+                try:
+                    self.monitor.record(
+                        "startup_off_write_helper_failed",
+                        register=register,
+                        requested_value=0,
+                        requested_at_monotonic_s=started,
+                        helper_failed_at_monotonic_s=clock(request),
+                        absolute_deadline_monotonic_s=deadline,
+                        error_type=type(error).__name__,
+                        error=str(error),
+                        wire_effect="unqualified",
+                    )
+                except BaseException as diagnostic_error:
+                    error.add_note("Startup off write diagnostic also failed: " + type(diagnostic_error).__name__)
+                raise  # Preserve the write's first cause even if diagnostic timing fails.
+            helper_returned_at = clock(request)
+            request = self.monitor.record(
+                "startup_off_write_helper_returned",
+                register=register,
+                requested_value=0,
+                requested_at_monotonic_s=started,
+                helper_returned_at_monotonic_s=helper_returned_at,
+                absolute_deadline_monotonic_s=deadline,
+                wire_effect="not established by helper return",
+            )
+            remaining(request)
+
+        anchor = None
+        minimum = maximum = 0
+        last_stamp = None
+
+        def observe(record: dict[str, Any]) -> None:
+            nonlocal anchor, minimum, maximum, last_stamp
+            stamp = record["sample_monotonic_s"]
+            now = clock(record)
+            duration = record["request_duration_s"]
+            if (
+                type(stamp) not in (int, float)
+                or not math.isfinite(stamp)
+                or not helper_returned_at <= stamp <= now <= deadline
+            ):
+                self.refuse(
+                    record, "startup off: original feedback timestamp was outside the off request interval."
+                )
+            if (
+                type(duration) not in (int, float)
+                or not math.isfinite(duration)
+                or not 0 <= duration <= self.monitor.sample_timeout_ms / 1000
+            ):
+                self.refuse(record, "startup off: original request duration was outside the 40 ms budget.")
+            if last_stamp is not None and stamp <= last_stamp:
+                self.refuse(record, "startup off: original feedback timestamp did not advance.")
+            last_stamp = stamp
+            if int(record["torque_enable"]) not in (0, 1):
+                self.refuse(record, "startup off: torque readback was not 0 or 1.")
+            if (
+                int(record["moving"]) != 0
+                or abs(int(record["present_velocity_raw"])) > feedback.STILL_VELOCITY_RAW
+            ):
+                self.refuse(record, "startup off: motion feedback was not quiet.")
+            if float(record["present_current_ma"]) >= feedback.CURRENT_ABORT_MA:
+                self.refuse(record, "startup off: stationary current reached 200 mA.")
+            raw = int(record["present_position_raw"])
+            if anchor is None:
+                anchor = raw
+            offset = feedback._position_delta(anchor, raw)
+            minimum, maximum = min(minimum, offset), max(maximum, offset)
+            record["startup_off_position_origin_raw"] = anchor
+            record["startup_off_position_delta_raw"] = offset
+            if (
+                maximum - minimum > feedback.STATIONARY_POSITION_TOLERANCE_RAW
+                or abs(offset) > feedback.STATIONARY_POSITION_TOLERANCE_RAW
+            ):
+                self.refuse(record, "startup off: whole-phase position excursion or drift exceeded one tick.")
+
+        while True:
+            budget = min(self.monitor.sample_timeout_ms, remaining(request) * 1000)
+            record = self.monitor.sample(
+                "startup_off_acquisition",
+                expected_torque=None,
+                expected_goal=0,
+                cold_start=True,
+                timeout_ms=budget,
+                emit_sample=False,
+            )
+            record["absolute_deadline_monotonic_s"] = deadline
+            if clock(record) > deadline:
+                self.refuse(record, "startup off: original deadline exceeded by acquisition feedback.")
+            observe(record)
+            self.emit(record)
+            if int(record["torque_enable"]) == 0:
+                break  # This first zero is acquisition evidence, not a baseline vote.
+            self.monitor.sleep(min(feedback.POLL_S, remaining(record)))
+            remaining(record)
+
+        stationary_samples = self.monitor.min_stationary_samples
+        self.monitor.min_stationary_samples = 1 + math.ceil(
+            (self.temperature.SIZE - 1) * self.temperature.SLOT_S / feedback.POLL_S
+        )
+        try:
+            baseline = self.monitor.qualify_stationary(
+                "baseline",
+                expected_torque=0,
+                expected_goal=0,
+                cold_start=True,
+                absolute_deadline_s=deadline,
+                on_sample=observe,
+            )
+        finally:
+            self.monitor.min_stationary_samples = stationary_samples
+        if clock(baseline) > deadline:
+            self.refuse(baseline, "startup off: original deadline exceeded by complete baseline.")
+        self.monitor.record(
+            "startup_off_baseline_qualified",
+            sample_monotonic_s=baseline["sample_monotonic_s"],
+            requested_at_monotonic_s=requested_at,
+            absolute_deadline_monotonic_s=deadline,
+            first_acquired_off_at_monotonic_s=record["sample_monotonic_s"],
+            position_origin_raw=anchor,
+            whole_phase_position_excursion_raw=maximum - minimum,
+            whole_phase_position_drift_raw=feedback._position_delta(
+                anchor, int(baseline["present_position_raw"])
+            ),
+            strict_baseline=baseline["stationary_qualification"],
+        )
+        return baseline
+
     def start(self):
         try:
             self.monitor.read_configuration()
-            # All ordinary setup writes have finished. Final off follows zero/Lock/mode.
-            write_register(self.bus, "Goal_Velocity", self.lift.cfg.name, 0)
-            write_register(self.bus, "Torque_Enable", self.lift.cfg.name, 0)
-            # Extend only the existing torque-off baseline to span four 100 ms
-            # intervals at the unchanged 50 ms poll. Every slot must contain a
-            # genuine fresh reply. No sleeps/extra reads enter ordinary poll().
-            stationary_samples = self.monitor.min_stationary_samples
-            self.monitor.min_stationary_samples = 1 + math.ceil(
-                (self.temperature.SIZE - 1) * self.temperature.SLOT_S / feedback.POLL_S
-            )
-            try:
-                self.monitor.qualify_stationary(
-                    "baseline", expected_torque=0, expected_goal=0, cold_start=True,
-                )
-            finally:
-                self.monitor.min_stationary_samples = stationary_samples
+            self._qualify_startup_off()
             self.temperature.assert_fresh(time.monotonic())
             result, _ = self.home_and_relieve(
                 allow_one_count_variation=True, qualify_initial_direction=True,

@@ -766,10 +766,39 @@ class MotorFeedbackComparison:
         require_quiet_motion_feedback: bool = False,
         am1_post_home_origin_raw: int | None = None,
         cleanup_temperature_ready: Callable[[], bool] | None = None,
+        absolute_deadline_s: float | None = None,
     ) -> dict[str, Any]:
         """Require one bounded window of fresh, mutually consistent feedback."""
-        qualification_started = self.monotonic()
+        last_record: dict[str, Any] | None = None
+        previous_clock = None
+        if absolute_deadline_s is not None:
+            if (type(absolute_deadline_s) not in (int, float) or not math.isfinite(absolute_deadline_s)
+                    or type(timeout_s) not in (int, float) or not math.isfinite(timeout_s) or timeout_s <= 0
+                    or phase != "baseline" or type(expected_torque) is not int or expected_torque != 0
+                    or type(expected_goal) is not int or expected_goal != 0
+                    or cold_start is not True or allow_settling is not False
+                    or start_position is not None or max_position_delta_raw is not None
+                    or require_quiet_motion_feedback or am1_post_home_origin_raw is not None
+                    or cleanup_temperature_ready is not None):
+                raise ValueError("Absolute deadline requires the bounded strict torque-off startup baseline.")
+
+        def clock() -> float:
+            nonlocal previous_clock
+            value = self.monotonic()
+            if absolute_deadline_s is not None:
+                if (type(value) not in (int, float) or not math.isfinite(value) or value < 0
+                        or previous_clock is not None and value < previous_clock):
+                    self.refuse({**(last_record or {"phase": phase}), "invalid_clock_value_repr": repr(value)},
+                                f"{phase}: original startup clock was invalid or regressed.")
+                previous_clock = value
+            return value
+
+        qualification_started = clock()
         deadline = qualification_started + timeout_s
+        if absolute_deadline_s is not None:
+            if absolute_deadline_s > deadline:
+                raise ValueError("Absolute startup deadline exceeds the existing relative qualification budget.")
+            deadline = absolute_deadline_s
         if cleanup_temperature_ready is not None and (
             (phase, expected_torque, expected_goal, timeout_s)
             != ("cleanup_readback", 0, 0, SETTLE_TIMEOUT_S)
@@ -788,7 +817,6 @@ class MotorFeedbackComparison:
                 raise ValueError("AM1 post-home readiness requires its original strict zero transition.")
             readiness = _AM1PostHomeReadiness(self, am1_post_home_origin_raw, deadline)
         candidate: list[tuple[float, dict[str, Any]]] = []
-        last_record: dict[str, Any] | None = None
         required_samples = self.min_stationary_samples
         required_window_s = STATIONARY_WINDOW_S
         if require_quiet_motion_feedback:
@@ -803,8 +831,11 @@ class MotorFeedbackComparison:
             self.refuse(record, reason)
 
         while True:
+            if absolute_deadline_s is not None and clock() >= deadline:
+                self.refuse(last_record or {"phase": phase, "absolute_deadline_monotonic_s": deadline},
+                            f"{phase}: original startup deadline expired before feedback read.")
             if last_record is not None:
-                now = self.monotonic()
+                now = clock()
                 if now >= deadline:
                     if readiness is not None:
                         bounded = readiness.qualify_bounded(now)
@@ -815,24 +846,34 @@ class MotorFeedbackComparison:
                         f"{phase}: no complete stationary window within {timeout_s:g} second.",
                     )
                 self.sleep(min(POLL_S, deadline - now))
-                if cleanup_temperature_ready is not None and self.monotonic() >= deadline:
+                if absolute_deadline_s is not None and clock() >= deadline:
+                    self.refuse(last_record, f"{phase}: original startup deadline expired after polling sleep.")
+                if cleanup_temperature_ready is not None and clock() >= deadline:
                     self.refuse(last_record, f"{phase}: no complete stationary window within {timeout_s:g} second.")
-                if readiness is not None and self.monotonic() >= deadline:
-                    bounded = readiness.qualify_bounded(self.monotonic())
+                if readiness is not None and clock() >= deadline:
+                    bounded = readiness.qualify_bounded(clock())
                     if bounded is not None:
                         return bounded
                     self.refuse(
                         last_record, f"{phase}: no complete stationary window within {timeout_s:g} second."
                     )
 
+            sample_budget = None
+            if absolute_deadline_s is not None:
+                remaining = deadline - clock()
+                if remaining <= 0:
+                    self.refuse(last_record or {"phase": phase},
+                                f"{phase}: original startup deadline expired before feedback read.")
+                sample_budget = min(self.sample_timeout_ms, remaining * 1000)
             record = self.sample(
                 phase,
                 expected_torque=expected_torque,
                 expected_goal=expected_goal,
                 cold_start=cold_start,
                 start_position=start_position,
+                **({"timeout_ms": sample_budget} if absolute_deadline_s is not None else {}),
             )
-            sampled_at = self.monotonic()
+            sampled_at = clock()
             last_record = record
 
             if readiness is not None:

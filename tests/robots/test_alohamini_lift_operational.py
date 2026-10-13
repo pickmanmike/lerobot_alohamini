@@ -1937,3 +1937,487 @@ def test_host_fault_timing_history_is_bounded_and_snapshot_is_independent():
     later = timing.snapshot(101.0)
     assert later["recent_completed_loops"][-2]["phase_ms"]["sample_log"] >= 0
     assert later["omitted_completed_loop_count"] == 93
+
+
+def inject_startup_off_feedback(monkeypatch, robot, *, torque=(1, 0), faults=None):
+    """Inject original grouped feedback bytes before real policy decoding."""
+    from lerobot.robots.alohamini import lift_motor_feedback as feedback
+
+    original = feedback.MotorFeedbackComparison.sample
+    observed = []
+    clocks = {}
+    index = 0
+
+    def sample(monitor, phase, **kwargs):
+        clocks.setdefault(id(monitor), monitor.monotonic)
+        if phase not in {"startup_off_acquisition", "baseline"}:
+            monitor.monotonic = clocks[id(monitor)]
+        nonlocal index
+        if phase in {"startup_off_acquisition", "baseline"}:
+            selected = torque[min(index, len(torque) - 1)]
+            robot.left_bus.read_sequences[("Torque_Enable", "lift_axis")] = [selected]
+            robot.left_bus.read_sequences[("Present_Current", "lift_axis")] = [1]
+            if faults:
+                faults(index, phase, monitor)
+            index += 1
+        result = original(monitor, phase, **kwargs)
+        if phase in {"startup_off_acquisition", "baseline"}:
+            observed.append(result)
+        return result
+
+    monkeypatch.setattr(feedback.MotorFeedbackComparison, "sample", sample)
+    return observed
+
+
+def assert_no_startup_motion(robot):
+    assert not any(
+        event[1] == "write"
+        and event[3] == "lift_axis"
+        and (
+            (event[2] == "Torque_Enable" and event[4] == 1) or (event[2] == "Goal_Velocity" and event[4] != 0)
+        )
+        for event in robot.left_bus.events
+        if len(event) == 5
+    )
+    assert not robot.left_bus.is_connected
+
+
+def test_transient_on_feedback_must_acquire_off_then_collect_all_nine_strict_baseline_samples(
+    operating_robot,
+    monkeypatch,
+    capsys,
+):
+    robot, _ = operating_robot
+    observed = inject_startup_off_feedback(monkeypatch, robot, torque=(1, 1, 0))
+    robot.connect(calibrate=False)
+    records = operational_records(capsys)
+    acquisition = [r for r in records if r["phase"] == "startup_off_acquisition"]
+    baseline = [r for r in records if r["phase"] == "baseline"]
+    assert [r["torque_enable"] for r in acquisition] == [1, 1, 0]
+    assert len(baseline) == 9 and all(r["torque_enable"] == 0 for r in baseline)
+    assert baseline[0]["sample_monotonic_s"] > acquisition[-1]["sample_monotonic_s"]
+    assert baseline[-1]["sample_monotonic_s"] - baseline[0]["sample_monotonic_s"] >= 0.4
+    assert baseline[-1]["temperature_window"]["count"] == 5
+    assert len(observed) == 12
+    assert all(r["group_trace"]["response_payload_bytes"] for r in acquisition)
+    request = next(r for r in records if r["phase"] == "startup_off_request_started")
+    qualified = next(r for r in records if r["phase"] == "startup_off_baseline_qualified")
+    assert qualified["sample_monotonic_s"] <= request["absolute_deadline_monotonic_s"]
+    assert request["timeout_s"] == 0.6
+    robot.disconnect()
+
+
+def test_persistent_on_readback_refuses_with_one_original_deadline_and_no_motion(
+    operating_robot,
+    monkeypatch,
+    capsys,
+):
+    robot, _ = operating_robot
+    observed = inject_startup_off_feedback(monkeypatch, robot, torque=(1,))
+    with pytest.raises(RuntimeError, match="AlohaMini motor activation failed"):
+        robot.connect(calibrate=False)
+    assert len(observed) > 1
+    assert all(r["torque_enable"] == 1 for r in observed)
+    records = operational_records(capsys)
+    assert not any(r["phase"] == "baseline" for r in records)
+    assert any(r.get("rejected") and "deadline" in r["rejection_reason"] for r in records)
+    assert_no_startup_motion(robot)
+
+
+@pytest.mark.parametrize(
+    "register,value",
+    [
+        ("Moving", 1),
+        ("Present_Velocity", 6),
+        ("Present_Current", 31),
+        ("Status", 8),
+        ("Operating_Mode", 0),
+        ("Present_Voltage", 0),
+        ("Torque_Enable", 2),
+        ("Goal_Velocity", 1),
+    ],
+)
+def test_off_acquisition_preserves_immediate_motion_current_and_hard_feedback_refusals(
+    operating_robot,
+    monkeypatch,
+    capsys,
+    register,
+    value,
+):
+    robot, _ = operating_robot
+
+    def fault(index, phase, monitor):
+        if index == 0:
+            robot.left_bus.read_sequences[(register, "lift_axis")] = [value]
+
+    inject_startup_off_feedback(monkeypatch, robot, faults=fault)
+    with pytest.raises(RuntimeError, match="AlohaMini motor activation failed"):
+        robot.connect(calibrate=False)
+    records = operational_records(capsys)
+    assert any(r.get("rejected") for r in records)
+    assert not any(r["phase"] == "operational_ready" for r in records)
+    assert_no_startup_motion(robot)
+
+
+def test_acquisition_position_anchor_survives_the_strict_baseline_phase(
+    operating_robot,
+    monkeypatch,
+    capsys,
+):
+    robot, _ = operating_robot
+
+    def fault(index, phase, monitor):
+        if index in (1, 2):
+            robot.left_bus.position = 1000 + index
+
+    inject_startup_off_feedback(monkeypatch, robot, torque=(1, 0), faults=fault)
+    with pytest.raises(RuntimeError, match="AlohaMini motor activation failed"):
+        robot.connect(calibrate=False)
+    records = operational_records(capsys)
+    assert any(r.get("rejected") and "position" in r["rejection_reason"] for r in records)
+    assert_no_startup_motion(robot)
+
+
+def test_late_zero_does_not_reset_the_baseline_deadline_or_authorize_motion(
+    operating_robot,
+    monkeypatch,
+    capsys,
+):
+    robot, _ = operating_robot
+    inject_startup_off_feedback(monkeypatch, robot, torque=(1, 1, 1, 1, 0))
+    with pytest.raises(RuntimeError, match="AlohaMini motor activation failed"):
+        robot.connect(calibrate=False)
+    records = operational_records(capsys)
+    assert any(r["phase"] == "baseline" for r in records)
+    assert not any(r["phase"] == "startup_off_baseline_qualified" for r in records)
+    assert_no_startup_motion(robot)
+
+
+def test_later_baseline_on_sample_still_refuses_immediately(
+    operating_robot,
+    monkeypatch,
+    capsys,
+):
+    robot, _ = operating_robot
+    inject_startup_off_feedback(monkeypatch, robot, torque=(0, 0, 1))
+    with pytest.raises(RuntimeError, match="AlohaMini motor activation failed"):
+        robot.connect(calibrate=False)
+    records = operational_records(capsys)
+    assert any(r.get("rejected") and r["phase"] == "baseline" and r["torque_enable"] == 1 for r in records)
+    assert_no_startup_motion(robot)
+
+
+def test_startup_off_write_latency_consumes_the_original_baseline_deadline(
+    operating_robot,
+    monkeypatch,
+    capsys,
+):
+    robot, clock = operating_robot
+    original = robot.left_bus.write
+    delayed = []
+
+    def write(register, motor, value, **kwargs):
+        operation = getattr(robot, "_lift_operation", None)
+        if (
+            not delayed
+            and operation is not None
+            and operation.monitor.config
+            and (register, motor, value) == ("Goal_Velocity", "lift_axis", 0)
+        ):
+            delayed.append(True)
+            clock.sleep(0.25)
+        return original(register, motor, value, **kwargs)
+
+    monkeypatch.setattr(robot.left_bus, "write", write)
+    with pytest.raises(RuntimeError, match="AlohaMini motor activation failed"):
+        robot.connect(calibrate=False)
+    assert delayed
+    records = operational_records(capsys)
+    assert not any(r["phase"] == "startup_off_baseline_qualified" for r in records)
+    assert_no_startup_motion(robot)
+
+
+def test_strict_absolute_startup_budget_launches_no_feedback_read_after_expiry(
+    operating_robot,
+    capsys,
+):
+    from lerobot.robots.alohamini.lift_operational import OperationalLift
+    from lerobot.robots.alohamini import lift_motor_feedback as feedback
+
+    robot, clock = operating_robot
+    op = OperationalLift(robot)
+    op.monitor.read_configuration()
+    op.monitor.min_stationary_samples = 9
+    before = len(op.transport.group_reads)
+    deadline = clock.now + 0.10
+    with pytest.raises(feedback.ComparisonRefusal, match="deadline"):
+        op.monitor.qualify_stationary(
+            "baseline", expected_torque=0, expected_goal=0, cold_start=True, absolute_deadline_s=deadline
+        )
+    records = operational_records(capsys)
+    samples = [r for r in records if r["phase"] == "baseline" and not r.get("rejected")]
+    assert len(op.transport.group_reads) - before == 2
+    assert all(r["sample_monotonic_s"] <= deadline for r in samples)
+    assert clock.now == pytest.approx(deadline)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"phase": "post_home"},
+        {"expected_torque": 1},
+        {"cold_start": False},
+        {"allow_settling": True},
+        {"absolute_deadline_s": float("nan")},
+        {"absolute_deadline_s": True},
+    ],
+)
+def test_absolute_deadline_option_is_closed_to_the_strict_startup_baseline(
+    operating_robot,
+    change,
+):
+    from lerobot.robots.alohamini.lift_operational import OperationalLift
+
+    robot, clock = operating_robot
+    op = OperationalLift(robot)
+    op.monitor.read_configuration()
+    before = len(op.transport.group_reads)
+    arguments = dict(
+        phase="baseline",
+        expected_torque=0,
+        expected_goal=0,
+        cold_start=True,
+        absolute_deadline_s=clock.now + 0.1,
+    )
+    arguments.update(change)
+    with pytest.raises(ValueError):
+        op.monitor.qualify_stationary(**arguments)
+    assert len(op.transport.group_reads) == before
+
+
+@pytest.mark.parametrize("stamp_kind", ["future", "before_request", "boolean"])
+def test_startup_off_rejects_original_samples_outside_its_actual_request_clock(
+    operating_robot,
+    monkeypatch,
+    capsys,
+    stamp_kind,
+):
+    robot, clock = operating_robot
+
+    def fault(index, phase, monitor):
+        if index == 0:
+            stamp = (
+                clock.now + 1
+                if stamp_kind == "future"
+                else clock.now - 1
+                if stamp_kind == "before_request"
+                else True
+            )
+            monkeypatch.setattr(monitor, "monotonic", lambda: stamp)
+
+    inject_startup_off_feedback(monkeypatch, robot, faults=fault)
+    with pytest.raises(RuntimeError, match="AlohaMini motor activation failed"):
+        robot.connect(calibrate=False)
+    records = operational_records(capsys)
+    rejected = [r for r in records if r.get("rejected") and r["phase"] == "startup_off_acquisition"]
+    assert len(rejected) == 1
+    assert any(
+        word in rejected[0]["rejection_reason"]
+        for word in ("original feedback timestamp", "clock", "deadline")
+    )
+    assert rejected[0]["torque_enable"] == 1
+    assert rejected[0]["group_trace"]["response_payload_bytes"]
+    assert_no_startup_motion(robot)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"expected_torque": False},
+        {"expected_goal": False},
+        {"cold_start": 1},
+        {"allow_settling": 0},
+        {"timeout_s": False},
+        {"timeout_s": float("nan")},
+    ],
+)
+def test_absolute_deadline_startup_scope_requires_exact_typed_existing_conditions(
+    operating_robot,
+    change,
+):
+    from lerobot.robots.alohamini.lift_operational import OperationalLift
+
+    robot, clock = operating_robot
+    op = OperationalLift(robot)
+    op.monitor.read_configuration()
+    before = len(op.transport.group_reads)
+    arguments = dict(
+        phase="baseline",
+        expected_torque=0,
+        expected_goal=0,
+        cold_start=True,
+        absolute_deadline_s=clock.now + 0.1,
+    )
+    arguments.update(change)
+    with pytest.raises(ValueError):
+        op.monitor.qualify_stationary(**arguments)
+    assert len(op.transport.group_reads) == before
+
+
+@pytest.mark.parametrize("fault", ["nan", "regressed", "negative"])
+def test_absolute_startup_collector_checks_current_clock_before_any_io(operating_robot, monkeypatch, fault):
+    from lerobot.robots.alohamini.lift_operational import OperationalLift
+    from lerobot.robots.alohamini import lift_motor_feedback as feedback
+
+    robot, clock = operating_robot
+    op = OperationalLift(robot)
+    op.monitor.read_configuration()
+    before = len(op.transport.group_reads)
+    calls = [0]
+
+    def source_clock():
+        calls[0] += 1
+        if calls[0] == 2:
+            return float("nan") if fault == "nan" else clock.now - 0.1 if fault == "regressed" else -1
+        return clock.monotonic()
+
+    monkeypatch.setattr(op.monitor, "monotonic", source_clock)
+    with pytest.raises(feedback.ComparisonRefusal, match="clock"):
+        op.monitor.qualify_stationary(
+            "baseline",
+            expected_torque=0,
+            expected_goal=0,
+            cold_start=True,
+            absolute_deadline_s=clock.now + 0.1,
+        )
+    assert len(op.transport.group_reads) == before
+
+
+@pytest.mark.parametrize("register", ["Goal_Velocity", "Torque_Enable"])
+def test_initial_off_helper_failure_is_recorded_without_outer_rewrite_or_home(
+    operating_robot,
+    monkeypatch,
+    capsys,
+    register,
+):
+    robot, _ = operating_robot
+    original = robot.left_bus.write
+    attempts = []
+
+    def write(name, motor, value, **kwargs):
+        op = getattr(robot, "_lift_operation", None)
+        if (
+            not attempts
+            and op is not None
+            and op.monitor.config
+            and (name, motor, value) == (register, "lift_axis", 0)
+        ):
+            attempts.append((name, motor, value))
+            if name == "Torque_Enable":
+                robot.left_bus.registers[(name, motor)] = 1
+            raise RuntimeError("modeled unsuccessful initial off helper request")
+        return original(name, motor, value, **kwargs)
+
+    monkeypatch.setattr(robot.left_bus, "write", write)
+    with pytest.raises(RuntimeError, match="AlohaMini motor activation failed"):
+        robot.connect(calibrate=False)
+    records = operational_records(capsys)
+    failures = [r for r in records if r["phase"] == "startup_off_write_helper_failed"]
+    assert len(attempts) == len(failures) == 1
+    assert failures[0]["register"] == register and failures[0]["wire_effect"] == "unqualified"
+    assert_no_startup_motion(robot)
+
+
+@pytest.mark.parametrize("fault", ["transport", "late_request", "duplicate_stamp", "negative_duration"])
+def test_off_acquisition_preserves_original_group_and_request_timing_faults(
+    operating_robot,
+    monkeypatch,
+    capsys,
+    fault,
+):
+    robot, clock = operating_robot
+
+    def inject(index, phase, monitor):
+        if fault == "transport" and index == 0:
+            robot.left_bus.read_sequences[("Status", "lift_axis")] = [
+                TimeoutError("modeled missing group reply")
+            ]
+        elif fault == "late_request" and index == 0:
+            fired = []
+
+            def hook(register):
+                if register == "Torque_Enable" and not fired:
+                    fired.append(True)
+                    clock.sleep(0.041)
+
+            robot.left_bus.hook = hook
+        elif fault == "duplicate_stamp" and index == 1:
+            stamp = records[0]["sample_monotonic_s"]
+            monkeypatch.setattr(monitor, "monotonic", lambda: stamp)
+        elif fault == "negative_duration" and index == 0:
+            original = monitor.monotonic
+            calls = [0]
+
+            def bad_request_clock():
+                calls[0] += 1
+                return original() + 0.02 if calls[0] == 1 else original()
+
+            monkeypatch.setattr(monitor, "monotonic", bad_request_clock)
+
+    records = inject_startup_off_feedback(monkeypatch, robot, torque=(1, 0), faults=inject)
+    with pytest.raises(RuntimeError, match="AlohaMini motor activation failed"):
+        robot.connect(calibrate=False)
+    logged = operational_records(capsys)
+    assert any(r.get("rejected") for r in logged)
+    assert not any(r["phase"] == "operational_ready" for r in logged)
+    assert_no_startup_motion(robot)
+
+
+def test_original_thermal_outlier_and_slot_origin_survive_acquisition_to_baseline(
+    operating_robot,
+    monkeypatch,
+    capsys,
+):
+    robot, _ = operating_robot
+
+    def fault(index, phase, monitor):
+        robot.left_bus.read_sequences[("Present_Temperature", "lift_axis")] = [93 if index == 0 else 30]
+
+    inject_startup_off_feedback(monkeypatch, robot, torque=(1, 1, 0), faults=fault)
+    robot.connect(calibrate=False)
+    records = operational_records(capsys)
+    acquisition = [r for r in records if r["phase"] == "startup_off_acquisition"]
+    baseline = [r for r in records if r["phase"] == "baseline"]
+    assert acquisition[0]["temperature_c"] == 93
+    assert robot._lift_operation.temperature._origin_ns == round(acquisition[0]["sample_monotonic_s"] * 1e9)
+    assert baseline[-1]["temperature_window"]["numeric_outlier_count"] == 1
+    assert baseline[-1]["temperature_window"]["ready"]
+    robot.disconnect()
+
+
+def test_failed_off_write_retains_first_cause_when_its_diagnostic_clock_also_fails(
+    operating_robot,
+    monkeypatch,
+):
+    robot, _ = operating_robot
+    original = robot.left_bus.write
+    fired = []
+
+    def write(name, motor, value, **kwargs):
+        op = getattr(robot, "_lift_operation", None)
+        if (
+            not fired
+            and op is not None
+            and op.monitor.config
+            and (name, motor, value) == ("Goal_Velocity", "lift_axis", 0)
+        ):
+            fired.append(True)
+            monkeypatch.setattr(op.monitor, "monotonic", lambda: float("nan"))
+            raise RuntimeError("original modeled off write failure")
+        return original(name, motor, value, **kwargs)
+
+    monkeypatch.setattr(robot.left_bus, "write", write)
+    with pytest.raises(RuntimeError, match="AlohaMini motor activation failed") as caught:
+        robot.connect(calibrate=False)
+    assert str(caught.value.__cause__) == "original modeled off write failure"
+    assert_no_startup_motion(robot)
