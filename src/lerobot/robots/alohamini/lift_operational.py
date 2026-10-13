@@ -254,6 +254,7 @@ class OperationalLift(InstalledLiftCheck):
         anchor = None
         minimum = maximum = 0
         last_stamp = None
+        recent_motion: deque[dict[str, Any]] = deque(maxlen=feedback.STATIONARY_PERSISTENT_SAMPLES)
 
         def observe(record: dict[str, Any]) -> None:
             nonlocal anchor, minimum, maximum, last_stamp
@@ -279,11 +280,11 @@ class OperationalLift(InstalledLiftCheck):
             last_stamp = stamp
             if int(record["torque_enable"]) not in (0, 1):
                 self.refuse(record, "startup off: torque readback was not 0 or 1.")
-            if (
-                int(record["moving"]) != 0
-                or abs(int(record["present_velocity_raw"])) > feedback.STILL_VELOCITY_RAW
-            ):
-                self.refuse(record, "startup off: motion feedback was not quiet.")
+            velocity, moving = int(record["present_velocity_raw"]), int(record["moving"])
+            if moving not in (0, 1):
+                self.refuse(record, "startup off: Moving readback was not 0 or 1.")
+            if abs(velocity) > feedback.STATIONARY_REPORTED_VELOCITY_LIMIT_RAW:
+                self.refuse(record, "startup off: reported velocity exceeded the stationary evidence bound.")
             if float(record["present_current_ma"]) >= feedback.CURRENT_ABORT_MA:
                 self.refuse(record, "startup off: stationary current reached 200 mA.")
             raw = int(record["present_position_raw"])
@@ -298,7 +299,24 @@ class OperationalLift(InstalledLiftCheck):
                 or abs(offset) > feedback.STATIONARY_POSITION_TOLERANCE_RAW
             ):
                 self.refuse(record, "startup off: whole-phase position excursion or drift exceeded one tick.")
-
+            # Retain the ordinary stationary indicator policy across acquisition
+            # and baseline. Isolated indicators cannot replace the whole fresh
+            # off window, and changing phase cannot erase a persistent sequence.
+            recent_motion.append(record)
+            velocities = [int(sample["present_velocity_raw"]) for sample in recent_motion]
+            record["startup_off_recent_velocity_raw"] = velocities
+            record["startup_off_recent_moving"] = [int(sample["moving"]) for sample in recent_motion]
+            if len(recent_motion) == feedback.STATIONARY_PERSISTENT_SAMPLES:
+                moving_without_velocity = all(
+                    int(sample["moving"]) == 1 and abs(int(sample["present_velocity_raw"])) <= feedback.STILL_VELOCITY_RAW
+                    for sample in recent_motion
+                )
+                same_positive = all(value > feedback.STILL_VELOCITY_RAW for value in velocities)
+                same_negative = all(value < -feedback.STILL_VELOCITY_RAW for value in velocities)
+                if moving_without_velocity or same_positive or same_negative:
+                    self.refuse(
+                        record, "startup off: velocity or Moving reported persistent motion during the stationary window."
+                    )
         while True:
             budget = min(self.monitor.sample_timeout_ms, remaining(request) * 1000)
             record = self.monitor.sample(
@@ -318,6 +336,12 @@ class OperationalLift(InstalledLiftCheck):
                 break  # This first zero is acquisition evidence, not a baseline vote.
             self.monitor.sleep(min(feedback.POLL_S, remaining(record)))
             remaining(record)
+
+        # Preserve the ordinary 50 ms cadence across this new phase boundary;
+        # three reports must not become a shorter persistence test. This sleep
+        # consumes the original deadline and cannot renew thermal readiness.
+        self.monitor.sleep(min(feedback.POLL_S, remaining(record)))
+        remaining(record)
 
         stationary_samples = self.monitor.min_stationary_samples
         self.monitor.min_stationary_samples = 1 + math.ceil(

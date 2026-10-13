@@ -367,7 +367,7 @@ def test_initial_relief_direction_deadline_is_fixed_and_stops_without_upward_pro
     def write(register, motor, value, **kwargs):
         original_write(register, motor, value, **kwargs)
         if (register, motor, int(value)) == ("Goal_Velocity", "lift_axis", -200):
-            clock.sleep(0.035)  # Synthetic acknowledgement time: deadline starts AFTER this.
+            clock.sleep(0.025)  # Synthetic finite helper latency; keep thermal slots fresh to isolate this deadline.
         writes.append((clock.now, register, motor, int(value)))
 
     def hook(register):
@@ -2027,8 +2027,8 @@ def test_persistent_on_readback_refuses_with_one_original_deadline_and_no_motion
 @pytest.mark.parametrize(
     "register,value",
     [
-        ("Moving", 1),
-        ("Present_Velocity", 6),
+        ("Moving", 2),
+        ("Present_Velocity", 51),
         ("Present_Current", 31),
         ("Status", 8),
         ("Operating_Mode", 0),
@@ -2421,3 +2421,187 @@ def test_failed_off_write_retains_first_cause_when_its_diagnostic_clock_also_fai
         robot.connect(calibrate=False)
     assert str(caught.value.__cause__) == "original modeled off write failure"
     assert_no_startup_motion(robot)
+
+
+def test_two_isolated_acquisition_baseline_motion_indicators_still_need_the_full_off_window(
+    operating_robot,
+    monkeypatch,
+    capsys,
+):
+    robot, _ = operating_robot
+
+    def fault(index, phase, monitor):
+        robot.left_bus.read_sequences[("Present_Velocity", "lift_axis")] = [-50 if index < 2 else 0]
+        robot.left_bus.read_sequences[("Moving", "lift_axis")] = [1 if index < 2 else 0]
+
+    inject_startup_off_feedback(monkeypatch, robot, torque=(0,), faults=fault)
+    robot.connect(calibrate=False)
+    records = operational_records(capsys)
+    acquisition = [r for r in records if r["phase"] == "startup_off_acquisition"]
+    baseline = [r for r in records if r["phase"] == "baseline"]
+    assert acquisition[0]["present_velocity_raw"] == baseline[0]["present_velocity_raw"] == -50
+    assert all(r["present_position_raw"] == 1000 for r in acquisition + baseline)
+    assert len(baseline) == 9 and all(r["torque_enable"] == 0 for r in baseline)
+    assert baseline[-1]["sample_monotonic_s"] - baseline[0]["sample_monotonic_s"] >= 0.4
+    assert any(r["phase"] == "startup_off_baseline_qualified" for r in records)
+    robot.disconnect()
+
+
+def test_original_stationary_indicator_pattern_qualifies_without_expanding_encoder_bound(
+    operating_robot,
+    monkeypatch,
+    capsys,
+):
+    robot, _ = operating_robot
+    velocities = [-50, 50, 0, 0, 0, 0, 0, 0, -50]
+
+    def fault(index, phase, monitor):
+        velocity = velocities[index - 1] if 1 <= index <= 9 else 0
+        robot.left_bus.read_sequences[("Present_Velocity", "lift_axis")] = [velocity]
+        robot.left_bus.read_sequences[("Moving", "lift_axis")] = [int(velocity != 0)]
+        robot.left_bus.position = 1001 if 2 <= index <= 8 else 1000
+
+    inject_startup_off_feedback(monkeypatch, robot, torque=(0,), faults=fault)
+    robot.connect(calibrate=False)
+    records = operational_records(capsys)
+    baseline = [r for r in records if r["phase"] == "baseline"]
+    assert [r["present_velocity_raw"] for r in baseline] == velocities
+    assert (
+        max(r["present_position_raw"] for r in baseline) - min(r["present_position_raw"] for r in baseline)
+        == 1
+    )
+    qualified = next(r for r in records if r["phase"] == "startup_off_baseline_qualified")
+    assert qualified["whole_phase_position_excursion_raw"] == 1
+    assert qualified["whole_phase_position_drift_raw"] == 0
+    robot.disconnect()
+
+
+@pytest.mark.parametrize("velocity", [-50, 50, 0])
+def test_three_persistent_acquisition_indicators_refuse_before_home(
+    operating_robot,
+    monkeypatch,
+    capsys,
+    velocity,
+):
+    robot, _ = operating_robot
+
+    def fault(index, phase, monitor):
+        robot.left_bus.read_sequences[("Present_Velocity", "lift_axis")] = [velocity]
+        robot.left_bus.read_sequences[("Moving", "lift_axis")] = [1]
+
+    inject_startup_off_feedback(monkeypatch, robot, torque=(1, 1, 1, 0), faults=fault)
+    with pytest.raises(RuntimeError, match="AlohaMini motor activation failed"):
+        robot.connect(calibrate=False)
+    records = operational_records(capsys)
+    samples = [r for r in records if r["phase"] == "startup_off_acquisition" and not r.get("rejected")]
+    rejected = [r for r in records if r["phase"] == "startup_off_acquisition" and r.get("rejected")]
+    assert len(samples) == 2 and len(rejected) == 1
+    assert "persistent motion" in rejected[0]["rejection_reason"]
+    assert_no_startup_motion(robot)
+
+
+@pytest.mark.parametrize("velocity", [-50, 50, 0])
+def test_persistent_stationary_indicator_obligation_carries_from_acquisition_into_baseline(
+    operating_robot,
+    monkeypatch,
+    capsys,
+    velocity,
+):
+    robot, _ = operating_robot
+
+    def fault(index, phase, monitor):
+        robot.left_bus.read_sequences[("Present_Velocity", "lift_axis")] = [velocity]
+        robot.left_bus.read_sequences[("Moving", "lift_axis")] = [1]
+
+    inject_startup_off_feedback(monkeypatch, robot, torque=(0,), faults=fault)
+    with pytest.raises(RuntimeError, match="AlohaMini motor activation failed"):
+        robot.connect(calibrate=False)
+    records = operational_records(capsys)
+    acquisition = [r for r in records if r["phase"] == "startup_off_acquisition" and not r.get("rejected")]
+    baseline = [r for r in records if r["phase"] == "baseline" and not r.get("rejected")]
+    rejected = [r for r in records if r["phase"] == "baseline" and r.get("rejected")]
+    assert len(acquisition) == 1 and len(baseline) == 2 and len(rejected) == 1
+    assert "persistent motion" in rejected[0]["rejection_reason"]
+    assert_no_startup_motion(robot)
+
+
+def test_off_acquisition_to_baseline_keeps_original_poll_cadence_inside_one_deadline(
+    operating_robot,
+    monkeypatch,
+    capsys,
+):
+    from lerobot.robots.alohamini import lift_motor_feedback as feedback
+
+    robot, _ = operating_robot
+    inject_startup_off_feedback(monkeypatch, robot, torque=(0,))
+    robot.connect(calibrate=False)
+    records = operational_records(capsys)
+    acquired = next(r for r in records if r["phase"] == "startup_off_acquisition")
+    baseline = [r for r in records if r["phase"] == "baseline"]
+    request = next(r for r in records if r["phase"] == "startup_off_request_started")
+    assert baseline[0]["sample_monotonic_s"] - acquired["sample_monotonic_s"] >= feedback.POLL_S
+    assert len(baseline) == 9
+    assert baseline[-1]["sample_monotonic_s"] <= request["absolute_deadline_monotonic_s"]
+    robot.disconnect()
+
+
+def test_short_indicator_pulse_across_acquisition_boundary_cannot_manufacture_persistence(
+    operating_robot,
+    monkeypatch,
+    capsys,
+):
+    robot, clock = operating_robot
+    pulse = []
+
+    def fault(index, phase, monitor):
+        if not pulse:
+            pulse.append(clock.now)
+        robot.left_bus.read_sequences[("Present_Velocity", "lift_axis")] = [0]
+        robot.left_bus.read_sequences[("Moving", "lift_axis")] = [int(clock.now - pulse[0] < 0.08)]
+
+    inject_startup_off_feedback(monkeypatch, robot, torque=(0,), faults=fault)
+    robot.connect(calibrate=False)
+    records = operational_records(capsys)
+    acquisition = [r for r in records if r["phase"] == "startup_off_acquisition"]
+    baseline = [r for r in records if r["phase"] == "baseline"]
+    assert acquisition[0]["moving"] == baseline[0]["moving"] == 1
+    assert baseline[1]["moving"] == 0
+    assert len(baseline) == 9 and all(r["present_position_raw"] == 1000 for r in baseline)
+    assert any(r["phase"] == "startup_off_baseline_qualified" for r in records)
+    robot.disconnect()
+
+
+def test_original_35ms_relief_helper_latency_retains_the_earlier_thermal_stale_refusal(
+    operating_robot,
+    monkeypatch,
+    capsys,
+):
+    robot, clock = operating_robot
+    bus = robot.left_bus
+    bus.up_factor = 0
+    original_write = bus.write
+
+    def write(register, motor, value, **kwargs):
+        original_write(register, motor, value, **kwargs)
+        if (register, motor, int(value)) == ("Goal_Velocity", "lift_axis", -200):
+            clock.sleep(0.035)  # Earlier fake condition retained as its own thermal-fault check.
+
+    def hook(register):
+        operation = getattr(robot, "_lift_operation", None)
+        if operation is not None and operation.reader.phase == "relief" and register == "Present_Velocity":
+            bus.read_sequences[(register, "lift_axis")] = [0]
+
+    monkeypatch.setattr(bus, "write", write)
+    bus.hook = hook
+    with pytest.raises(RuntimeError, match="AlohaMini motor activation failed") as caught:
+        robot.connect(calibrate=False)
+    assert "temperature: five-slot feedback window is stale" in str(caught.value.__cause__)
+    assert caught.value.__cause__ is robot._lift_operation.failure
+    records = operational_records(capsys)
+    rejected = next(r for r in records if r.get("rejected") and r["phase"] == "relief")
+    assert rejected["sample_monotonic_s"] - rejected["temperature_history"][0][0] > 0.5
+    assert not any(r["phase"] in {"relief_direction_qualified", "operational_ready"} for r in records)
+    assert any(r["phase"] == "shutdown_verified" for r in records)
+    assert bus.registers[("Goal_Velocity", "lift_axis")] == 0
+    assert bus.registers[("Torque_Enable", "lift_axis")] == 0
+    assert not bus.is_connected
