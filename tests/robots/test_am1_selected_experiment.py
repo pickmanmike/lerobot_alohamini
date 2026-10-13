@@ -205,6 +205,188 @@ def operation_definition(**changes):
     return contract.SelectedElbowExperiment.from_payload(operation_payload(**changes))
 
 
+def rejoin_sample(p, now, sequence, *, context=None, write_completed=None):
+    """Returned native bus operation plus original, independently acquired caches."""
+    positions, item = OperationFeedback(p).get(now, sequence)
+    if context is not None:
+        item["context"] = copy.deepcopy(context)
+        requested = context["requested_target"]
+        encoded = p.definition.encoded_goal(requested, item["motor"]["calibration"])
+        item["action"].update(
+            requested=requested,
+            relative_limited=requested,
+            current_limited=requested,
+            expected_goal_raw=encoded,
+            final_normalized=norm(encoded),
+        )
+    completed = now - 0.010 if write_completed is None else write_completed
+    item["action"].update(
+        write_started_at_monotonic_s=completed - 0.002,
+        write_completed_at_monotonic_s=completed,
+        write_acknowledged=False,
+    )
+    return positions, item
+
+
+def captured_rejoin_provider():
+    """Replay b72b04a4's frozen cursor; this fixture does not claim new movement."""
+    p = scripted_leader.LeftElbowPositiveControlInput(
+        seed(norm(2418)),
+        joint_keys=JOINT_KEYS,
+        fps=10,
+        definition=operation_definition(),
+        emit=lambda _: None,
+    )
+    p.elapsed_s = 28.2
+    p.prepare_rejoin(20604.33, dict(p.origin, **{KEY: norm(2429)}), 1026, 20604.32805421)
+    p._rejoin["elapsed_s"] = 0.5
+    p._action[KEY] = 41.1930737890448
+    # Synthetic owner schedule, not the unrecorded previous native prepare clock.
+    p.admit(20605.101940067)
+    return p
+
+
+def test_captured_repeated_half_second_writes_bound_next_cursor_by_returned_native_clock():
+    p = captured_rejoin_provider()
+    original = dict(p.origin)
+    captured_rows = (
+        (
+            987,
+            20605.127683199,
+            20605.117710994,
+            20605.118550583,
+            20605.120207337,
+            20605.121651609,
+            20605.124653988,
+            20605.126595499,
+            6.5,
+        ),
+        (
+            988,
+            20605.158685145,
+            20605.149715992,
+            20605.150554489,
+            20605.15082721,
+            20605.152651222,
+            20605.155651082,
+            20605.15759789,
+            0,
+        ),
+        (
+            989,
+            20605.194859629,
+            20605.181701545,
+            20605.18405413,
+            20605.184703016,
+            20605.186667546,
+            20605.18967111,
+            20605.192595229,
+            0,
+        ),
+    )
+    for sequence, now, started, completed, ps, pc, cs, cc, current in captured_rows:
+        positions, item = rejoin_sample(p, now, sequence, write_completed=completed)
+        item["action"]["write_started_at_monotonic_s"] = started
+        item["position"].update(
+            raw=2429,
+            normalized=norm(2429),
+            read_started_at_monotonic_s=ps,
+            read_completed_at_monotonic_s=pc,
+        )
+        item["current"].update(
+            raw=round(current / 6.5),
+            ma=current,
+            read_started_at_monotonic_s=cs,
+            read_completed_at_monotonic_s=cc,
+        )
+        positions[KEY] = norm(2429)
+        p.collect_feedback(now, positions, sequence, selected_feedback=item)
+    # The capture clock is an upper bound for owner processing, not a claimed guard dt.
+    capture = 20605.201940067
+    # The guard retains its first changed-cursor clock through identical retransmits.
+    available = capture - captured_rows[0][3]
+    p.advance(capture, positions, sequence, selected_feedback=item)
+    assert p._rejoin["elapsed_s"] - 0.5 == pytest.approx(available)
+    assert p.diagnostic_context["requested_target"] >= 41.1930737890448 - available - 1e-9
+    assert p.elapsed_s == 28.2 and p.origin == original
+    assert item["action"]["write_acknowledged"] is False
+
+
+def test_rejoin_waits_for_native_cursor_without_catching_up_after_snapshot_delay():
+    p = captured_rejoin_provider()
+    previous = copy.deepcopy(p.diagnostic_context)
+    previous["rejoin"]["elapsed_s"] = 0.4
+    previous["requested_target"] = previous["rejoin"]["held_target"] - 0.4
+    for sequence, now in ((989, 20605.201940067), (990, 20605.301940067)):
+        positions, item = rejoin_sample(p, now, sequence, context=previous)
+        p.advance(now, positions, sequence, selected_feedback=item)
+        assert p._rejoin["elapsed_s"] == 0.5
+    now = 20605.401940067
+    positions, item = rejoin_sample(p, now, 991, write_completed=now - 0.02)
+    p.advance(now, positions, 991, selected_feedback=item)
+    assert p._rejoin["elapsed_s"] == pytest.approx(0.52)
+    assert p.elapsed_s == 28.2
+
+
+@pytest.mark.parametrize(
+    "clock_change",
+    [
+        {"write_completed_at_monotonic_s": None},
+        {"write_completed_at_monotonic_s": True},
+        {"write_completed_at_monotonic_s": float("nan")},
+        {"write_started_at_monotonic_s": -1},
+        {"write_started_at_monotonic_s": 20605.201940067},
+        {"write_completed_at_monotonic_s": 20605.301940067},
+    ],
+)
+def test_rejoin_invalid_returned_bus_clock_cannot_create_cursor_progress(clock_change):
+    p = captured_rejoin_provider()
+    now = 20605.201940067
+    positions, item = rejoin_sample(p, now, 989)
+    item["action"].update(clock_change)
+    with pytest.raises(ValueError, match="rejoin.*write"):
+        p.advance(now, positions, 989, selected_feedback=item)
+    assert p._rejoin["elapsed_s"] == 0.5 and p.elapsed_s == 28.2
+
+
+def test_rejoin_backwards_returned_write_clock_cannot_create_cursor_progress():
+    p = captured_rejoin_provider()
+    first = 20605.201940067
+    positions, item = rejoin_sample(p, first, 989)
+    p.collect_feedback(first, positions, 989, selected_feedback=item)
+    now = first + 0.1
+    positions, item = rejoin_sample(p, now, 990, write_completed=first - 0.02)
+    with pytest.raises(ValueError, match="rejoin.*write"):
+        p.advance(now, positions, 990, selected_feedback=item)
+    assert p._rejoin["elapsed_s"] == 0.5
+
+
+def test_rejoin_stale_acquisitions_cannot_reuse_a_valid_returned_write_for_progress():
+    p = captured_rejoin_provider()
+    now = 20605.201940067
+    positions, item = rejoin_sample(p, now, 989)
+    p.collect_feedback(now, positions, 989, selected_feedback=item)
+    with pytest.raises(ValueError, match="rejoin.*stale"):
+        p._advance_rejoin(now + 0.6)
+    assert p._rejoin["elapsed_s"] == 0.5
+
+
+def test_rejoin_waits_without_a_returned_native_cursor_and_drops_proof_on_protective_freeze():
+    p = captured_rejoin_provider()
+    p._advance_rejoin(20605.201940067)
+    assert p._rejoin["elapsed_s"] == 0.5
+    positions, item = rejoin_sample(p, 20605.301940067, 989)
+    p.collect_feedback(20605.301940067, positions, 989, selected_feedback=item)
+    p.freeze()
+    new_hold = dict(p.origin, **{KEY: norm(2425)})
+    p.prepare_rejoin(20605.401940067, new_hold, 990, 20605.395940067)
+    p.admit(20605.401940067)
+    p._advance_rejoin(20605.501940067)
+    assert p._rejoin["elapsed_s"] == 0
+    assert p.diagnostic_context["requested_target"] == new_hold[KEY]
+    assert p.elapsed_s == 28.2 and p.origin[KEY] == norm(2418)
+
+
 def test_operation_rejoin_starts_at_measured_hold_without_progress_or_seed_catchup():
     p = provider(operation_definition())
     p.admit(0)
@@ -219,10 +401,14 @@ def test_operation_rejoin_starts_at_measured_hold_without_progress_or_seed_catch
     assert c["phase"] == "rejoin" and c["progress_s"] == progress
     assert c["rejoin"]["elapsed_s"] == 0 and p.definition.context_valid(c)
     p.admit(40)
+    positions, item = rejoin_sample(p, 40.1, 701, write_completed=40)
+    p.collect_feedback(40.1, positions, 701, selected_feedback=item)
     p._advance_rejoin(40.1)
     assert abs(p.get_action()[KEY.removeprefix("arm_")] - held[KEY]) <= 0.1 + 1e-9
     assert p.elapsed_s == progress and p.origin == original
-    p._advance_rejoin(49)  # A delayed caller cannot catch up its goal.
+    positions, item = rejoin_sample(p, 49, 702, write_completed=48.9)
+    p.collect_feedback(49, positions, 702, selected_feedback=item)
+    p._advance_rejoin(49)  # A delayed caller still requires fresh native proof and cannot catch up.
     assert abs(p.get_action()[KEY.removeprefix("arm_")] - held[KEY]) <= 0.2 + 1e-9
     assert p.elapsed_s == progress
 

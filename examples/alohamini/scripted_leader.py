@@ -718,6 +718,7 @@ class LeftElbowPositiveControlInput(LeftElbowResponseCharacterizeInput):
         self._intercycle_anchor_proof = None
         self._rejoin = None
         self._rejoin_targets = None
+        self._rejoin_native_feedback = None
         self._measured_origin_raw = self._measured_origin_proof = self._admission_origin_proof = None
         self._baseline_anchor_proof = self._baseline_window = self._outward_anchor_raw = None
         self._baseline_closed = False
@@ -763,13 +764,25 @@ class LeftElbowPositiveControlInput(LeftElbowResponseCharacterizeInput):
         self._rejoin = {"held_target":positions[self.selected_joint], "retained_target":retained[self.selected_joint],
             "elapsed_s":0.0, "duration_s":duration, "observation_id":observation_id,
             "acquired_at_monotonic_s":acquired_at}
+        self._rejoin_native_feedback = None
         self._action = dict(positions)
 
     def _advance_rejoin(self, now):
         if self._last_tick is None or not self._number(now) or now < self._last_tick:
             raise ValueError("rejoin clock is unavailable or regressed")
+        proof = self._rejoin_native_feedback
+        if (proof is None or proof["context"]["rejoin"] != self._rejoin
+                or proof["context"]["progress_s"] != self.elapsed_s):
+            self._last_tick = now
+            return  # A queued owner command is not an actual returned native write.
+        if any(not 0 <= now-proof[k]["read_started_at_monotonic_s"] <= .5 for k in ("position", "current")):
+            raise ValueError("rejoin native write proof is stale or regressed")
+        # Native prepare precedes this returned bus operation. Pacing from the
+        # original same-owner completion also bounds the next native prepare;
+        # repeated writes never justify catch-up or imply a per-servo ACK.
+        available = now-proof["cursor_write_completed_at_monotonic_s"]
         self._rejoin["elapsed_s"] = min(self._rejoin["duration_s"],
-            self._rejoin["elapsed_s"]+min(now-self._last_tick,self._frame_s))
+            self._rejoin["elapsed_s"]+min(now-self._last_tick,self._frame_s,available))
         self._last_tick = now
         duration = self._rejoin["duration_s"]
         fraction = 1.0 if duration == 0 else self._rejoin["elapsed_s"]/duration
@@ -824,6 +837,20 @@ class LeftElbowPositiveControlInput(LeftElbowResponseCharacterizeInput):
             raise ValueError("selected experiment raw criteria differ from its actual encoded excursion")
         self._visible_settings = copy.deepcopy(proof)
         if context.get("phase") == "rejoin":
+            action = feedback["action"]
+            started, completed = (action.get(k) for k in
+                ("write_started_at_monotonic_s", "write_completed_at_monotonic_s"))
+            previous = self._rejoin_native_feedback
+            if (not self._number(started) or not self._number(completed)
+                    or not 0 <= started <= completed <= min(feedback[k]["read_started_at_monotonic_s"]
+                        for k in ("position", "current"))
+                    or previous is not None and completed < previous["action"]["write_completed_at_monotonic_s"]):
+                raise ValueError("rejoin actual native write clocks are unavailable or regressed")
+            self._rejoin_native_feedback = {k:copy.deepcopy(feedback[k])
+                for k in ("context", "action", "position", "current")}
+            self._rejoin_native_feedback["cursor_write_completed_at_monotonic_s"] = (
+                previous["cursor_write_completed_at_monotonic_s"]
+                if previous is not None and previous["context"] == context else completed)
             return  # Real bridge acquisitions do not count as programme phase coverage.
         if self._measured_origin_raw is None:
             if self.elapsed_s != 0 or context["progress_s"] != 0:
@@ -1040,6 +1067,7 @@ class LeftElbowPositiveControlInput(LeftElbowResponseCharacterizeInput):
             if (context.get("phase") == "rejoin" and context.get("rejoin") == self._rejoin
                     and self._rejoin["elapsed_s"] == self._rejoin["duration_s"]):
                 self._rejoin = self._rejoin_targets = None
+                self._rejoin_native_feedback = None
                 self._last_tick = now
             else:
                 self._advance_rejoin(now)
@@ -1066,6 +1094,7 @@ class LeftElbowPositiveControlInput(LeftElbowResponseCharacterizeInput):
 
     def freeze(self):
         ScriptedLeaderInput.freeze(self)
+        self._rejoin_native_feedback = None
         self._tracking.clear()
         cycle,phase,_ = self.definition.phase(self.elapsed_s,self._acquisition_s)
         self._phase_samples.pop((cycle,phase),None)
