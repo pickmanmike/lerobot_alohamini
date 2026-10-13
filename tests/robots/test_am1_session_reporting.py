@@ -536,10 +536,8 @@ def test_positive_duplicate_reference_requires_exact_typed_terminal_proof(bad):
         assert reference is None
 
 
-def selected_finishing_record(phase="finishing"):
-    """Retained actual06 proof; only owner/lifecycle state is reconstructed for reporting."""
-    from examples.alohamini.am1_session_contract import SelectedElbowExperiment
-
+def selected_native_record():
+    """The exact retained actual06 durable record, without presentation fields."""
     root = Path(
         os.environ.get(
             "AM1_REPORTING_FIXTURES", ".cache/am1-visible-control-04/reporting-tests/native-fixtures"
@@ -559,6 +557,14 @@ def selected_finishing_record(phase="finishing"):
         == "576157ed3817afca89f26001489931adea1496cdd31357febf8c2f2e2a8a525e"
     )
     assert run["status"] == "stopped" and run["physical_result"]["terminal_status"] == "completed"
+    return run
+
+
+def selected_finishing_record(phase="finishing"):
+    """Retained actual06 proof; only owner/lifecycle state is reconstructed for reporting."""
+    from examples.alohamini.am1_session_contract import SelectedElbowExperiment
+
+    run = selected_native_record()
     run.update(status="finishing", cleanup=None, requested_terminal="completed")
     run["physical_result"]["phase"] = phase
     if phase == "finishing":
@@ -685,3 +691,167 @@ def test_actual_selected_finishing_stop_remains_exact_owned_and_socket_usable(tm
     finally:
         authority.executor, authority.asynchronous = nonactuating_executor, False
         authority.close()
+
+
+def selected_idle_provider(run):
+    from tests.robots.test_am1_physical_executor import ControlledHost, executor
+    from tools.am1_local_observation import LocalObservationMailbox
+
+    provider = executor(ControlledHost())
+    provider.config = copy.deepcopy(run["backend_contract"])
+    provider.config["source_pins"] = "/private/reviewed-idle-runtime-manifest.json"
+    provider.clock = lambda: 100.0
+    provider.observation = LocalObservationMailbox(run["sensing_source"], clock=provider.clock)
+    provider.io_factory = lambda *_: pytest.fail("Retained idle reporting opened a physical IO owner")
+    assert provider.worker is None and provider.run_id is None and provider._finite_completion is None
+    return provider
+
+
+def selected_idle_authority(tmp_path):
+    from tests.robots.test_am1_elbow_recovery_integration import reporting_authority
+    from tools.am1_session_core import SessionAuthority
+
+    run = selected_native_record()
+    writer = SessionAuthority(tmp_path / "authority", clock=lambda: 100.0)
+    try:
+        writer.run = copy.deepcopy(run)
+        writer._save()
+    finally:
+        writer.close()
+    provider = selected_idle_provider(run)
+    authority = SessionAuthority(tmp_path / "authority", clock=provider.clock, executor=provider)
+    authority.events = reporting_authority(run, provider.evidence()).events
+    assert authority.run == run and authority.service_incarnation != run["service_incarnation"]
+    return authority
+
+
+def test_actual_selected_retained_idle_proof_fits_socket_without_current_completion(
+    tmp_path, record_property
+):
+    authority = selected_idle_authority(tmp_path)
+    try:
+        original, evidence = copy.deepcopy(authority.run), authority.executor.evidence()
+        assert evidence["lifecycle"]["phase"] == "idle" and evidence["finite_completion"] is None
+        assert evidence["host_incarnation"] is None and evidence["accepted_host_action"] == {}
+        assert evidence["backend_contract"] != original["backend_contract"]
+        result, _ = asyncio.run(exchange(None, {"op": "snapshot"}, authority=authority))
+        assert result["status"] == "snapshot" and result["accepted"] is True
+        view = result["snapshot"]
+        record_property("actual06_retained_idle_socket_result_bytes", len(ipc.encode(result)))
+        assert view["evidence"] == evidence
+        assert view["evidence"]["finite_completion"] is None
+        public = copy.deepcopy(view["run"])
+        assert public["execution"] == original["execution"]
+        reference = public["completion_receipt"].pop("execution_reference")
+        assert reference["field"] == "run.execution"
+        assert (
+            reference["sha256"]
+            == hashlib.sha256(
+                json.dumps(original["execution"], sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+        )
+        public["completion_receipt"]["execution"] = copy.deepcopy(public["execution"])
+        public.pop("remaining_s")
+        public.pop("trajectory_remaining_s")
+        assert json.dumps(public, sort_keys=True) == json.dumps(original, sort_keys=True)
+        assert authority.run == original and authority.executor.evidence() == evidence
+        assert authority.executor.worker is None and authority.executor._reconciliation_worker is None
+    finally:
+        authority.close()
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        None,
+        "running",
+        "finishing",
+        "foreign_source",
+        "current_host",
+        "current_run",
+        "current_completion",
+        "current_ack",
+        "current_feedback",
+        "current_uncertain",
+        "current_uncertain_zero",
+        "owner_uncertain",
+        "cleanup_uncertain",
+        "owner_cleanup",
+        "cleanup_row",
+        "camera_session",
+        "camera_release",
+        "foreign_receipt_run",
+        "foreign_receipt_host",
+        "foreign_lifecycle",
+        "invalid_uuid",
+        "different",
+        "partial",
+        "preparing",
+        "bad_proof",
+        "numeric_type",
+        "foreign_descriptor",
+        "foreign_definition",
+    ],
+)
+def test_selected_retained_idle_reference_requires_exact_complete_known_cleanup(bad):
+    from tools.am1_session_core import _positive_completion_reference
+
+    run = selected_native_record()
+    evidence = selected_idle_provider(run).evidence()
+    if bad in {"running", "finishing"}:
+        run["status"] = bad
+    elif bad == "foreign_source":
+        evidence["source"] = "simulated-provider"
+    elif bad == "current_host":
+        evidence["host_incarnation"] = str(uuid.uuid4())
+    elif bad == "current_run":
+        evidence["lifecycle"]["run_id"] = str(uuid.uuid4())
+    elif bad == "current_completion":
+        evidence["finite_completion"] = copy.deepcopy(run["completion_receipt"])
+    elif bad == "current_ack":
+        evidence["accepted_host_action"] = {"run_id": run["run_id"]}
+    elif bad == "current_feedback":
+        evidence["feedback"] = True
+    elif bad == "current_uncertain":
+        evidence["lifecycle"]["uncertain"] = True
+    elif bad == "current_uncertain_zero":
+        evidence["lifecycle"]["uncertain"] = 0
+    elif bad == "owner_uncertain":
+        run["uncertain"] = True
+    elif bad == "cleanup_uncertain":
+        run["physical_result"]["uncertain"] = True
+    elif bad == "owner_cleanup":
+        run["cleanup"] = "physical_cleanup_unknown"
+    elif bad == "cleanup_row":
+        run["physical_result"]["readback"]["readback"]["readbacks"][0]["value"] = 1
+    elif bad == "camera_session":
+        run["physical_result"]["camera_release"]["session_id"] = str(uuid.uuid4())
+    elif bad == "camera_release":
+        run["physical_result"]["camera_release"]["release_evidence"]["readers_joined"] = False
+    elif bad == "foreign_receipt_run":
+        run["completion_receipt"]["run_id"] = str(uuid.uuid4())
+    elif bad == "foreign_receipt_host":
+        run["completion_receipt"]["host_incarnation"] = str(uuid.uuid4())
+    elif bad == "foreign_lifecycle":
+        run["physical_result"]["backend_incarnation"] = str(uuid.uuid4())
+    elif bad == "invalid_uuid":
+        run["run_id"] = run["completion_receipt"]["run_id"] = "invalid"
+    elif bad == "different":
+        run["execution"]["feedback_sequence"] += 1
+    elif bad == "foreign_descriptor":
+        run["selected_experiment_sha256"] = "0" * 64
+    elif bad in {"partial", "preparing", "bad_proof", "numeric_type", "foreign_definition"}:
+        if bad == "partial":
+            run["execution"]["complete"] = False
+        elif bad == "preparing":
+            run["execution"]["preparing"] = True
+        elif bad == "bad_proof":
+            run["execution"]["positive_control"]["phase_receipts"].pop("cycle1_origin")
+        elif bad == "numeric_type":
+            run["execution"]["cycles_completed"] = 1.0
+        else:
+            run["execution"]["experiment"]["sha256"] = "0" * 64
+        run["completion_receipt"]["execution"] = copy.deepcopy(run["execution"])
+    before_run, before_evidence = copy.deepcopy(run), copy.deepcopy(evidence)
+    assert (_positive_completion_reference(evidence, run) is not None) is (bad is None)
+    assert run == before_run and evidence == before_evidence

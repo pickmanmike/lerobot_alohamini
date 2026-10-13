@@ -227,6 +227,52 @@ def _positive_completion_reference(evidence, run):
     """Matched receipt duplicates may refer to retained execution during cleanup too."""
     try:
         receipt, execution, lifecycle = run["completion_receipt"], run["execution"], evidence["lifecycle"]
+        retained_idle = (
+            lifecycle == {
+                "run_id": None, "phase": "idle", "startup_deadline": None, "native_live_at": None,
+                "cleanup": None, "uncertain": False, "terminal_status": None,
+            }
+            and lifecycle["uncertain"] is False
+            and all(evidence.get(key) is False for key in (
+                "feedback", "required_observation", "native_ack", "active_acknowledged",
+                "hold_acknowledged", "pose_aligned",
+            ))
+            and all(key in evidence and evidence[key] is None for key in (
+                "host_incarnation", "finite_completion", "fault", "transport_issue", "reconciliation",
+                "feedback_sequence", "measured_positions", "measured_body", "feedback_timing",
+                "acknowledged_intent_revision",
+            ))
+            and evidence.get("accepted_host_action") == {}
+        )
+        if retained_idle:
+            from tools.am1_physical_executor import qualified_cleanup_receipt
+
+            lifecycle = run.get("physical_result")
+            motor = lifecycle.get("readback") if isinstance(lifecycle, dict) else None
+            readback = motor.get("readback") if isinstance(motor, dict) else None
+            camera = lifecycle.get("camera_release") if isinstance(lifecycle, dict) else None
+            release = camera.get("release_evidence") if isinstance(camera, dict) else None
+            if not (
+                run.get("status") in TERMINAL and run.get("uncertain") is False
+                and run.get("intent") is None and run.get("cleanup") == "physical_readback_verified"
+                and isinstance(execution, dict) and execution.get("complete") is True
+                and execution.get("preparing") is False and isinstance(lifecycle, dict)
+                and lifecycle.get("phase") == "terminal" and lifecycle.get("uncertain") is False
+                and lifecycle.get("cleanup") == run["cleanup"] and lifecycle.get("cleanup_errors") == []
+                and qualified_cleanup_receipt(motor, run["run_id"], run["backend_incarnation"])
+                and type(motor.get("version")) is int and isinstance(readback, dict)
+                and readback.get("buses_closed") is True and readback.get("verified") is True
+                and readback.get("cleanup_errors") == []
+                and readback.get("selected_gain_restore_required") is False
+                and isinstance(camera, dict) and type(camera.get("version")) is int and camera["version"] == 1
+                and camera.get("session_id") == run["run_id"] and camera.get("state") == "released"
+                and camera.get("errors") == [] and camera.get("runtime_failed") is False
+                and isinstance(release, dict) and type(release.get("backend_returncode")) is int
+                and release["backend_returncode"] == 0 and all(release.get(key) is True for key in (
+                    "backend_exited", "readers_joined", "viewer_socket_closed", "runtime_config_removed",
+                ))
+            ):
+                return None
         definition = (
             _selected_experiment_definition(run)
             if run.get("recipe") == SelectedElbowExperiment.recipe_name
@@ -256,7 +302,7 @@ def _positive_completion_reference(evidence, run):
             == run["backend_incarnation"]
             and receipt.get("recipe") == run["recipe"]
             and _canonical(execution) == _canonical(receipt.get("execution"))
-            and _canonical(evidence.get("finite_completion")) == _canonical(receipt)
+            and (retained_idle or _canonical(evidence.get("finite_completion")) == _canonical(receipt))
             and (not isinstance(definition, SelectedElbowExperiment) or execution.get("experiment") == definition.summary())
             and definition.completion_expectation(execution) is not None
         ):
@@ -2221,9 +2267,10 @@ class SessionAuthority:
                     key: value for key, value in run["completion_receipt"].items() if key != "execution"
                 }
                 run["completion_receipt"] = dict(public_receipt, execution_reference=reference)
-                public_evidence = dict(
-                    public_evidence, finite_completion=dict(public_receipt, execution_reference=reference)
-                )
+                if isinstance(evidence.get("finite_completion"), dict):
+                    public_evidence = dict(
+                        public_evidence, finite_completion=dict(public_receipt, execution_reference=reference)
+                    )
             return json.loads(
                 json.dumps(
                     {
