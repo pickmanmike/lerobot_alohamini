@@ -224,7 +224,7 @@ def _public_physical_evidence(evidence, run=None):
 
 
 def _positive_completion_reference(evidence, run):
-    """One public duplicate may refer to the complete execution already in this run."""
+    """Matched receipt duplicates may refer to retained execution during cleanup too."""
     try:
         receipt, execution, lifecycle = run["completion_receipt"], run["execution"], evidence["lifecycle"]
         definition = (
@@ -236,13 +236,20 @@ def _positive_completion_reference(evidence, run):
             definition is not None
             and run.get("recipe") == definition.recipe_name
             and run.get("source") == evidence.get("source") == "protected-physical-provider"
-            and run.get("status") in TERMINAL
+            and run.get("status") in TERMINAL | {"finishing"}
             and uuid_text(run.get("run_id")) == run.get("run_id")
             and uuid_text(run.get("backend_incarnation")) == run.get("backend_incarnation")
             and isinstance(receipt, dict)
             and isinstance(execution, dict)
             and isinstance(lifecycle, dict)
-            and lifecycle.get("phase") == "terminal"
+            and (
+                lifecycle.get("phase") == "terminal"
+                or run.get("status") == "finishing" and lifecycle.get("phase") == "finishing"
+            )
+            and (
+                run.get("status") != "finishing"
+                or execution.get("complete") is True and execution.get("preparing") is False
+            )
             and receipt.get("run_id") == lifecycle.get("run_id") == run["run_id"]
             and receipt.get("host_incarnation")
             == lifecycle.get("backend_incarnation")

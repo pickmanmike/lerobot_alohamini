@@ -8,17 +8,20 @@ below remain historical. Exact deployed and prepared versions are recorded below
 
 
 **Current continuation: [AM1-ELBOW-TO-COMPLETION-06](protected-physical-sessions.md#am1-elbow-to-completion-06-results-and-status).**
-Pi access returned after the owner's update/recovery, and the reviewed startup
-correction is deployed. Trial04 refused during lift baseline with known cleanup.
-Trial05 started normally and moved the elbow2312→2384:72 positive ticks, with actual
-live-goal acceptance and original P1 linkage-pivot evidence. The deployed30-tick
-response guard then refused at91 mA/error38 after only2 ticks in1.203 seconds,
-before reversal; owner feedback_loss followed. Required local imagery stayed
-qualified and all20 zero/lift/bus/camera cleanup evidence is retained. A separately
-pinned150 mA/45-tick moving condition is implemented and reviewed, not deployed; the3-tick/
-1.2-second rule and fixed30-tick startup drift boundary remain. The linked record
-contains exact deployed/rollback pins and all prior failures. Useful repeated
-out-and-back control is unresolved; angular precision and reversal remain unproved.
+Pi recovery and the separately pinned150 mA/45-tick moving condition are deployed.
+Trial06 established one native coarse cycle:2384→2457→2401,73 outward ticks,56 reverse
+ticks and17-tick residual, with maximum123.5 mA. Native program28/cycle1/qualified
+return1 and coarse pass remain retained; fine return failed. A real111417-byte
+finishing report exceeded the65536-byte limit before the browser displayed completion.
+Normal Stop left owner status stopped and physical status completed, with no original
+first cause, uncertaintyfalse and verified20-zero/lift/bus/required-camera cleanup.
+Local camera stayed qualified. The advisory P1 ConnectionError/release-unconfirmed
+outcome remains retained; independent original237.6864-second audio-off recording
+verification confirmed release, outward pivot and return toward starting orientation.
+Core's report-bound repair is in progress. The linked record contains exact current/
+rollback pins, the fixed30-tick startup bound and all prior failures. Useful repeatability
+and the overall workstream remain open pending a second supported cycle; angular/fine
+precision and an exposure-to-servo timing bridge remain unmeasured.
 
 **Retained AM1-VISIBLE-CONTROL-04:** One unchanged-I0 positive comparison started normally,
 then faulted at5.9 seconds at the selected100 mA sampled-current guard. All182

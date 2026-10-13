@@ -36,9 +36,9 @@ def oversized_result(accepted=True):
     }
 
 
-async def exchange(result, command=None, secret="correct", protective=False):
+async def exchange(result, command=None, secret="correct", protective=False, authority=None):
     calls = []
-    authority = SimpleNamespace(
+    authority = authority or SimpleNamespace(
         handle=lambda c, d: (calls.append((c, d)) or copy.deepcopy(result)),
         snapshot=lambda: result["snapshot"],
     )
@@ -534,3 +534,154 @@ def test_positive_duplicate_reference_requires_exact_typed_terminal_proof(bad):
         assert reference is not None and run == original
     else:
         assert reference is None
+
+
+def selected_finishing_record(phase="finishing"):
+    """Retained actual06 proof; only owner/lifecycle state is reconstructed for reporting."""
+    from examples.alohamini.am1_session_contract import SelectedElbowExperiment
+
+    root = Path(
+        os.environ.get(
+            "AM1_REPORTING_FIXTURES", ".cache/am1-visible-control-04/reporting-tests/native-fixtures"
+        )
+    )
+    path = root / "1838.json"
+    if "AM1_REPORTING_FIXTURES" not in os.environ and not path.exists():
+        pytest.skip("Actual06 private reporting fixture is not installed")
+    raw = path.read_bytes()  # An explicitly configured fixture is mandatory, including its hash.
+    assert (
+        hashlib.sha256(raw).hexdigest() == "3a0cdaab475c6e61ea32c3fc8b23234043831f6e43b66ab73730068dbf30e506"
+    )
+    run = json.loads(raw)
+    canonical = json.dumps(run, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    assert (
+        hashlib.sha256(canonical).hexdigest()
+        == "576157ed3817afca89f26001489931adea1496cdd31357febf8c2f2e2a8a525e"
+    )
+    assert run["status"] == "stopped" and run["physical_result"]["terminal_status"] == "completed"
+    run.update(status="finishing", cleanup=None, requested_terminal="completed")
+    run["physical_result"]["phase"] = phase
+    if phase == "finishing":
+        run["physical_result"]["cleanup"] = None
+    provider, evidence = physical_evidence(run)
+    provider.selected_experiment = SelectedElbowExperiment.from_payload(run["selected_experiment"])
+    return run, provider, evidence
+
+
+@pytest.mark.parametrize("phase", ["finishing", "terminal"])
+def test_actual_selected_finishing_proof_fits_without_premature_cleanup(phase, record_property):
+    from tests.robots.test_am1_elbow_recovery_integration import reporting_authority
+
+    run, provider, evidence = selected_finishing_record(phase)
+    authority = reporting_authority(run, evidence)
+    authority.executor = provider
+    original, original_evidence = copy.deepcopy(authority.run), copy.deepcopy(evidence)
+    execution_bytes = len(json.dumps(run["execution"], separators=(",", ":"), sort_keys=True).encode())
+    assert execution_bytes == 29212 and 3 * execution_bytes > ipc.RESPONSE_LIMIT
+    view = authority.snapshot()
+    result = {"accepted": True, "status": "snapshot", "snapshot": view}
+    size = len(ipc.encode({"id": str(uuid.uuid4()), "result": result}, ipc.RESPONSE_LIMIT))
+    record_property("actual06_" + phase + "_owner_snapshot_bytes", size)
+    reply, calls = asyncio.run(exchange(result, {"op": "snapshot"}))
+    assert calls == [] and reply == result
+    public_run = view["run"]
+    assert public_run["status"] == "finishing" and public_run["cleanup"] is None
+    assert public_run["requested_terminal"] == "completed" and public_run["uncertain"] is False
+    assert public_run["first_cause"] is None and view["evidence"]["lifecycle"]["phase"] == phase
+    assert public_run["execution"] == original["execution"]
+    assert public_run["physical_result"] == original["physical_result"]
+    assert len(public_run["physical_result"]["readback"]["readback"]["readbacks"]) == 20
+    reference = public_run["completion_receipt"]["execution_reference"]
+    assert reference["field"] == "run.execution"
+    assert (
+        reference["sha256"]
+        == hashlib.sha256(
+            json.dumps(run["execution"], sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    )
+    assert view["evidence"]["finite_completion"]["execution_reference"] == reference
+    assert "execution" not in public_run["completion_receipt"]
+    assert "execution" not in view["evidence"]["finite_completion"]
+    assert authority.run == original and authority._evidence() == original_evidence
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        None,
+        "running",
+        "live",
+        "foreign_run",
+        "foreign_host",
+        "different",
+        "partial",
+        "preparing",
+        "bad_proof",
+        "foreign_definition",
+        "foreign_descriptor",
+        "foreign_source",
+    ],
+)
+def test_selected_finishing_reference_requires_whole_exact_bound_completion(bad):
+    from tools.am1_session_core import _positive_completion_reference
+
+    run, _, evidence = selected_finishing_record()
+    if bad == "running":
+        run["status"] = "running"
+    elif bad == "live":
+        evidence["lifecycle"]["phase"] = "live"
+    elif bad == "foreign_run":
+        evidence["lifecycle"]["run_id"] = str(uuid.uuid4())
+    elif bad == "foreign_host":
+        evidence["lifecycle"]["backend_incarnation"] = str(uuid.uuid4())
+    elif bad == "different":
+        run["execution"]["feedback_sequence"] += 1
+    elif bad in {"partial", "preparing", "bad_proof", "foreign_definition"}:
+        if bad == "partial":
+            run["execution"]["complete"] = False
+        elif bad == "preparing":
+            run["execution"]["preparing"] = True
+        elif bad == "bad_proof":
+            run["execution"]["positive_control"]["phase_receipts"].pop("cycle1_origin")
+        else:
+            run["execution"]["experiment"]["sha256"] = "0" * 64
+        run["completion_receipt"]["execution"] = copy.deepcopy(run["execution"])
+        evidence["finite_completion"] = copy.deepcopy(run["completion_receipt"])
+    elif bad == "foreign_descriptor":
+        run["selected_experiment_sha256"] = "0" * 64
+    elif bad == "foreign_source":
+        evidence["source"] = "simulated-provider"
+    original, original_evidence = copy.deepcopy(run), copy.deepcopy(evidence)
+    reference = _positive_completion_reference(evidence, run)
+    assert (reference is not None) is (bad is None)
+    assert run == original and evidence == original_evidence
+
+
+def test_actual_selected_finishing_stop_remains_exact_owned_and_socket_usable(tmp_path, record_property):
+    from tools.am1_session_core import SessionAuthority
+
+    run, provider, evidence = selected_finishing_record()
+    # A real authority/database handles Stop; the provider consumes only retained cached proof.
+    authority = SessionAuthority(tmp_path / "authority", clock=lambda: 100.0)
+    nonactuating_executor = authority.executor
+    authority.executor, authority.asynchronous = provider, True
+    authority.run = copy.deepcopy(run)
+    authority.run["finish_ceiling"] = 160.0
+    authority._evidence = lambda: copy.deepcopy(evidence)
+    before = copy.deepcopy(authority.run["execution"])
+    command = {"op": "stop", "run_id": run["run_id"], "operation_id": str(uuid.uuid4())}
+    try:
+        result, _ = asyncio.run(exchange(None, command, protective=True, authority=authority))
+        assert result == {"accepted": True, "status": "finishing", "effect_admitted": False}
+        assert authority.run["requested_terminal"] == "stopped"
+        assert authority.run["cleanup"] is None and authority.run["first_cause"] is None
+        assert authority.run["execution"] == before and provider.worker is None
+        reply, _ = asyncio.run(exchange(None, {"op": "snapshot"}, authority=authority))
+        assert reply["status"] == "snapshot" and reply["snapshot"]["run"]["status"] == "finishing"
+        record_property("actual06_post_stop_socket_result_bytes", len(ipc.encode(reply)))
+        assert authority.db.execute("SELECT count(*) FROM mutations").fetchone()[0] == 1
+        assert asyncio.run(exchange(None, command, protective=True, authority=authority))[0] == result
+        assert authority.db.execute("SELECT count(*) FROM mutations").fetchone()[0] == 1
+    finally:
+        authority.executor, authority.asynchronous = nonactuating_executor, False
+        authority.close()
