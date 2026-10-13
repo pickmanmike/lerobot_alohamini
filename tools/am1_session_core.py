@@ -1,5 +1,6 @@
 """Durable session authority. Explicit executor outcomes; no hardware imports."""
 
+import base64
 import hashlib
 import json
 import math
@@ -9,15 +10,17 @@ import stat
 import threading
 import time
 import uuid
-from collections import deque
+from collections import OrderedDict, deque
 from pathlib import Path
 
 from examples.alohamini.am1_session_contract import (
     ELBOW_RECOVERY_DEFINITIONS,
+    LEFT_ELBOW_COARSE_BENCH_V1,
     LEFT_ELBOW_ORIGINAL_RETURN,
     LEFT_ELBOW_POSITIVE_CONTROL,
     LEFT_ELBOW_RESPONSE,
     RECIPES,
+    SELECTED_ELBOW_OPERATION_PRESET,
     SelectedElbowExperiment,
     uuid_text,
 )
@@ -434,6 +437,129 @@ def _canonical(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
 
 
+STATUS_DETAIL_LIMIT = 8192
+STATUS_DETAIL_CACHE_BYTES = 8 * 1024**2
+STATUS_REFERENCE_KEYS = {
+    "kind",
+    "version",
+    "service_incarnation",
+    "run_id",
+    "operation_id",
+    "host_incarnation",
+    "field",
+    "sha256",
+    "bytes",
+}
+
+
+def _status_small(value, keys=None, limit=4096):
+    """Shared presentation only; omitted bulk has an explicit full field reference."""
+    if not isinstance(value, dict):
+        return value
+    result = {}
+    for key, item in value.items():
+        if keys is not None and key not in keys:
+            continue
+        if item is None or type(item) in (bool, int, float):
+            result[key] = item
+        elif isinstance(item, str):
+            result[key] = (
+                item
+                if len(item) <= 512
+                else {"prefix": item[:512], "sha256": hashlib.sha256(item.encode()).hexdigest()}
+            )
+        elif len(_canonical(item)) <= limit:
+            result[key] = item
+    return result
+
+
+def _status_execution(value):
+    if not isinstance(value, dict):
+        return value
+    essential = {
+        "profile",
+        "provenance",
+        "progress_s",
+        "preparing",
+        "preparation_s",
+        "complete",
+        "fault",
+        "cycles_completed",
+        "returns_qualified",
+        "admissions",
+        "feedback_sequence",
+        "original_seed",
+        "initial_measured_reference",
+    }
+    result = _status_small(value, essential, 2048)
+    # Named outcome dictionaries share scalar summaries across every finite recipe.
+    for key, item in value.items():
+        if isinstance(item, dict) and key not in essential:
+            scalars = {k: v for k, v in item.items() if v is None or type(v) in (bool, int, float, str)}
+            if scalars:
+                result[key] = _status_small(scalars, limit=512)
+    return result
+
+
+def _status_lifecycle(value, *, rows=False):
+    if not isinstance(value, dict):
+        return value
+    keys = {
+        "version",
+        "run_id",
+        "backend_incarnation",
+        "host_incarnation",
+        "phase",
+        "cleanup",
+        "uncertain",
+        "cleanup_errors",
+        "first_cause",
+        "native_live_at",
+        "startup_deadline",
+        "terminal_status",
+        "requested_status",
+    }
+    result = _status_small(value, keys)
+    receipt = value.get("readback")
+    if isinstance(receipt, dict):
+        public = _status_small(
+            receipt,
+            {
+                "version",
+                "run_id",
+                "host_incarnation",
+                "cleanup",
+                "uncertain",
+                "cleanup_errors",
+                "first_cause",
+                "completed_at_monotonic_s",
+                "first_error_chain",
+                "expected_stop",
+                "selected_joint_fault",
+            },
+        )
+        readback = receipt.get("readback")
+        if isinstance(readback, dict):
+            fields = {
+                "verified",
+                "buses_closed",
+                "lift_readback",
+                "cleanup_errors",
+                "selected_gain_restore_required",
+            }
+            if rows:
+                fields.add("readbacks")
+            public["readback"] = _status_small(readback, fields, 8192)
+        result["readback"] = public
+    camera = value.get("camera_release")
+    if isinstance(camera, dict):
+        result["camera_release"] = _status_small(
+            camera,
+            {"version", "session_id", "state", "errors", "runtime_failed", "release_evidence", "released_at"},
+        )
+    return result
+
+
 class SessionAuthority:
     def __init__(self, state_directory, clock=time.monotonic, wall_clock=time.time, executor=None):
         self.clock, self.wall_clock = clock, wall_clock
@@ -733,7 +859,7 @@ class SessionAuthority:
 
             outcome = execution["positive_control"]
             window = outcome["final_window"]
-            origin_receipt = outcome["phase_receipts"]["cycle1_origin"]
+            origin_receipt = outcome["phase_receipts"][f"cycle{cycles}_origin"]
             prerequisite = run.get("positive_prerequisite")
             if run.get("confirmation_of") is not None and (
                 not isinstance(prerequisite,dict) or prerequisite.get("run_id") != outcome["confirmation_of"]
@@ -829,6 +955,8 @@ class SessionAuthority:
                 (json.dumps(self._run_result()), self.run["operation_id"]),
             )
         self.db.commit()
+
+        self._archive_terminal()
 
     def _run_result(self):
         return {
@@ -1864,6 +1992,7 @@ class SessionAuthority:
             continuation_note = (
                 getattr(self, "_startup_continuation_note", None) if recovery_prerequisite else None
             )
+            self._archive_terminal()
             self.run = {
                 "run_id": str(uuid.uuid4()),
                 "operation_id": oid,
@@ -2271,7 +2400,7 @@ class SessionAuthority:
                     public_evidence = dict(
                         public_evidence, finite_completion=dict(public_receipt, execution_reference=reference)
                     )
-            return json.loads(
+            view = json.loads(
                 json.dumps(
                     {
                         "service_incarnation": self.service_incarnation,
@@ -2314,6 +2443,294 @@ class SessionAuthority:
                     }
                 )
             )
+
+            view["presets"] = [dict(SELECTED_ELBOW_OPERATION_PRESET,
+                selected_experiment=LEFT_ELBOW_COARSE_BENCH_V1.payload)] if (
+                    SelectedElbowExperiment.recipe_name in view["recipes"]
+                    and self.executor.source == "protected-physical-provider") else []
+            if self.executor.source != "protected-physical-provider":
+                return view
+            return self._essential_status(view, evidence)
+
+    def _status_reference(self, field, value):
+        raw = _canonical(value)
+        run = self.run or {}
+        reference = dict(
+            kind="am1-status-field-reference",
+            version=1,
+            service_incarnation=run.get("service_incarnation", self.service_incarnation)
+            if field == "run"
+            else self.service_incarnation,
+            run_id=run.get("run_id"),
+            operation_id=run.get("operation_id"),
+            host_incarnation=run.get("backend_incarnation")
+            or (
+                run.get("physical_result", {}).get("backend_incarnation")
+                if isinstance(run.get("physical_result"), dict)
+                else None
+            ),
+            field=field,
+            sha256=hashlib.sha256(raw).hexdigest(),
+            bytes=len(raw),
+        )
+        cache = getattr(self, "_status_details", None)
+        if cache is None:
+            self._status_details = cache = OrderedDict()
+        key = _canonical(reference)
+        if len(raw) <= STATUS_DETAIL_CACHE_BYTES:
+            cache[key] = raw
+            cache.move_to_end(key)
+            while len(cache) > 64 or sum(map(len, cache.values())) > STATUS_DETAIL_CACHE_BYTES:
+                cache.popitem(last=False)
+        return reference
+
+
+    def _essential_status(self, view, evidence):
+        run = view["run"]
+        native_reference = self._status_reference("run", self.run) if run is not None else None
+        evidence_reference = self._status_reference("evidence", evidence)
+        events_reference = self._status_reference("events", view["events"])
+        if run is not None:
+            keys = {
+                "run_id",
+                "operation_id",
+                "recipe",
+                "source",
+                "status",
+                "dispatch",
+                "progress_s",
+                "deadline",
+                "first_cause",
+                "native_first_cause",
+                "uncertain",
+                "intent",
+                "intent_revision",
+                "recovery",
+                "recovery_episodes",
+                "cleanup",
+                "service_incarnation",
+                "backend_incarnation",
+                "native_live_at",
+                "startup_deadline",
+                "finish_ceiling",
+                "resume_ceiling",
+                "requested_terminal",
+                "remaining_s",
+                "trajectory_remaining_s",
+                "selected_experiment",
+                "selected_experiment_sha256",
+                "sensing_policy",
+                "sensing_source",
+                "observation_provenance",
+                "observation_freshness_basis",
+                "backend_contract",
+            }
+            public = _status_small(run, keys)
+            public["execution"] = _status_execution(run.get("execution"))
+            public["physical_result"] = _status_lifecycle(run.get("physical_result"), rows=True)
+            receipt = run.get("completion_receipt")
+            if isinstance(receipt, dict):
+                public["completion_receipt"] = _status_small(
+                    receipt,
+                    {
+                        "run_id",
+                        "host_incarnation",
+                        "intent_revision",
+                        "recipe",
+                        "completed_at_monotonic_s",
+                        "feedback_at_monotonic_s",
+                        "feedback_sequence",
+                        "required_observation",
+                        "return_reacknowledgment",
+                    },
+                )
+            public["details_reference"] = native_reference
+            view["run"] = public
+        keys = {
+            "source",
+            "feedback",
+            "required_observation",
+            "optional_quality",
+            "optional_observation",
+            "pose_aligned",
+            "hold_acknowledged",
+            "native_ack",
+            "active_acknowledged",
+            "fault",
+            "feedback_age_s",
+            "observation_age_s",
+            "observation",
+            "feedback_sequence",
+            "measured_positions",
+            "measured_body",
+            "feedback_timing",
+            "accepted_host_action",
+            "acknowledged_intent_revision",
+            "host_incarnation",
+            "transport_issue",
+            "reconciliation",
+            "sensing_policy",
+            "sensing_source",
+            "observation_provenance",
+            "observation_freshness_basis",
+            "motor_commands_provenance",
+            "feedback_provenance",
+            "ack_provenance",
+            "backend_contract",
+            "retained_return_reference",
+        }
+        public = _status_small(evidence, keys)
+        public["lifecycle"] = _status_lifecycle(evidence.get("lifecycle"))
+        completion = evidence.get("finite_completion")
+        public["finite_completion"] = _status_small(
+            completion,
+            {
+                "run_id",
+                "host_incarnation",
+                "intent_revision",
+                "recipe",
+                "completed_at_monotonic_s",
+                "feedback_at_monotonic_s",
+                "feedback_sequence",
+                "required_observation",
+                "return_reacknowledgment",
+            },
+        )
+        public["details_reference"] = evidence_reference
+        view.update(
+            evidence=public,
+            events=view["events"][-8:],
+            events_reference=events_reference,
+            status_projection={"kind": "am1-essential-status", "version": 1},
+        )
+        return view
+
+
+    def _archive_terminal(self):
+        if (
+            not self.run
+            or self.run.get("source") != "protected-physical-provider"
+            or self.run.get("status") not in TERMINAL
+        ):
+            return
+        from tools.am1_session_ipc import private_json, strict_json
+
+        run_id = uuid_text(self.run["run_id"])
+        raw = _canonical(self.run)
+        sha = hashlib.sha256(raw).hexdigest()
+        directory = self.directory / "run-results" / run_id
+        for path in (directory.parent, directory):
+            if path.is_symlink() or path.is_junction():
+                raise ValueError("redirected native result archive")
+            path.mkdir(mode=0o700, exist_ok=True)
+            info = path.stat()
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or os.name != "nt"
+                and (info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700)
+            ):
+                raise ValueError("private native result archive required")
+        target = directory / (sha + ".json")
+        if target.exists():
+            if _continuation_bytes(target, limit=STATUS_DETAIL_CACHE_BYTES) != raw:
+                raise ValueError("original native result archive changed")
+        else:
+            temporary = target.with_suffix(".new")
+            if temporary.is_symlink() or temporary.is_junction():
+                raise ValueError("redirected native archive temporary")
+            if temporary.exists():
+                _continuation_bytes(temporary, limit=STATUS_DETAIL_CACHE_BYTES)
+            private_json(target, strict_json(raw), limit=STATUS_DETAIL_CACHE_BYTES)
+
+
+    def snapshot_detail(self, command):
+        """Authenticated caller already owns the read path; never tick, act or reseed."""
+        with self.mutex:
+            if (
+                not isinstance(command, dict)
+                or set(command) != {"op", "reference", "offset", "limit"}
+                or command["op"] != "snapshot"
+            ):
+                raise ValueError("closed detail command required")
+            reference, offset, limit = command["reference"], command["offset"], command["limit"]
+            if not isinstance(reference, dict) or set(reference) != STATUS_REFERENCE_KEYS:
+                raise ValueError("closed native field reference required")
+            if (
+                reference.get("kind") != "am1-status-field-reference"
+                or type(reference.get("version")) is not int
+                or reference["version"] != 1
+                or reference.get("field") not in {"run", "evidence", "events"}
+                or type(reference.get("bytes")) is not int
+                or not 0 < reference["bytes"] <= STATUS_DETAIL_CACHE_BYTES
+                or not isinstance(reference.get("sha256"), str)
+                or len(reference["sha256"]) != 64
+                or any(c not in "0123456789abcdef" for c in reference["sha256"])
+                or type(offset) is not int
+                or not 0 <= offset < reference["bytes"]
+                or type(limit) is not int
+                or not 1 <= limit <= STATUS_DETAIL_LIMIT
+            ):
+                raise ValueError("bounded native field reference required")
+            for key in ("service_incarnation", "run_id", "operation_id", "host_incarnation"):
+                if reference[key] is not None and uuid_text(reference[key]) != reference[key]:
+                    raise ValueError("canonical native detail identity required")
+            raw = getattr(self, "_status_details", {}).get(_canonical(reference))
+            if raw is None and reference["field"] == "run" and reference["run_id"] is not None:
+                try:
+                    directory = self.directory / "run-results" / reference["run_id"]
+                    for ancestor in (directory.parent, directory):
+                        info = ancestor.lstat()
+                        if (
+                            ancestor.is_symlink()
+                            or ancestor.is_junction()
+                            or not stat.S_ISDIR(info.st_mode)
+                            or os.name != "nt"
+                            and (info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700)
+                        ):
+                            raise ValueError("redirected or nonprivate native archive")
+                    raw = _continuation_bytes(
+                        directory / (reference["sha256"] + ".json"), limit=STATUS_DETAIL_CACHE_BYTES
+                    )
+                    value = json.loads(raw)
+                    host = value.get("backend_incarnation") or (
+                        value.get("physical_result", {}).get("backend_incarnation")
+                        if isinstance(value.get("physical_result"), dict)
+                        else None
+                    )
+                    if (
+                        _canonical(value) != raw
+                        or value.get("status") not in TERMINAL
+                        or host != reference["host_incarnation"]
+                        or any(
+                            value.get(k) != reference[r]
+                            for k, r in (
+                                ("run_id", "run_id"),
+                                ("operation_id", "operation_id"),
+                                ("service_incarnation", "service_incarnation"),
+                            )
+                        )
+                    ):
+                        raise ValueError("foreign archived native result")
+                except (OSError, AttributeError, KeyError, TypeError) as error:
+                    raise ValueError("native detail reference unavailable") from error
+            if (
+                raw is None
+                or len(raw) != reference["bytes"]
+                or hashlib.sha256(raw).hexdigest() != reference["sha256"]
+            ):
+                raise ValueError("stale or unavailable native detail reference")
+            data = raw[offset : offset + limit]
+            return dict(
+                accepted=True,
+                status="detail",
+                reference=reference,
+                offset=offset,
+                length=len(data),
+                total_bytes=len(raw),
+                encoding="base64",
+                data=base64.b64encode(data).decode("ascii"),
+            )
+
 
     def close(self):
         if self.asynchronous:

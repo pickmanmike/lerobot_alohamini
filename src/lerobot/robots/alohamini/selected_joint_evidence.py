@@ -71,6 +71,7 @@ class AM1SelectedJointEvidence:
         self._response_last_current_raw = None
         self._response_continuity_lost = False
         self._response_startup_hold = None
+        self._response_rejoin = None
         self._response_startup_acquisitions = None
 
     VISIBLE_STATIC_REGISTERS = (
@@ -356,6 +357,7 @@ class AM1SelectedJointEvidence:
                 self._response_continuity_lost = True
                 self.response_boundary = dict(self.response_boundary, status="continuity_lost")
         self.context = None
+        self._response_rejoin = None
         robot._am1_selected_joint_evidence_context = None
 
     def prepare(self, robot, action, binding):
@@ -399,12 +401,16 @@ class AM1SelectedJointEvidence:
         )
         if visible_context and getattr(robot, "_am1_selected_elbow_experiment", None) is not None:
             expected_keys |= {"experiment_sha256"}
+        composed = visible_context and getattr(visible, "schema_version", 1) == 2
+        if composed:
+            expected_keys.add("rejoin")
         if set(metadata) != expected_keys:
             raise RuntimeError("Invalid selected joint evidence context keys")
         if (
             type(profile) is not str
             or type(phase) is not str
-            or phase not in (PHASES | {"acquire"} if visible_context else PHASES)
+            or phase not in (PHASES | {"acquire", "intercycle_hold", "rejoin"} if composed
+                             else PHASES | {"acquire"} if visible_context else PHASES)
             or type(cycle) is not int
         ):
             raise RuntimeError("Invalid selected joint evidence profile/phase/cycle")
@@ -484,6 +490,8 @@ class AM1SelectedJointEvidence:
             if visible_context
             else max(reference, endpoint)
         )
+        if composed and phase == "rejoin":
+            lower, upper = reference-abs(visible.excursion_norm), reference+abs(visible.excursion_norm)
         if not lower - 1e-9 <= requested <= upper + 1e-9:
             raise RuntimeError("Selected joint requested action exceeds its declared excursion")
         if signed is None and (
@@ -526,6 +534,8 @@ class AM1SelectedJointEvidence:
                 else:
                     self._response_refuse(robot, "Selected response continuity unavailable before active actuation",
                                           failure_kind="continuity_lost")
+        if composed:
+            self._prepare_response_rejoin(robot, visible, metadata)
         for key in ("x.vel", "y.vel", "theta.vel", "lift_axis.vel"):
             if not _number(cleaned.get(key)) or float(cleaned[key]) != 0:
                 raise RuntimeError("Selected joint comparison requires ordinary body-zero commands")
@@ -658,7 +668,7 @@ class AM1SelectedJointEvidence:
         if self.visible_started_at is None and control.state in {"paused", "active"} and control.epoch >= 0:
             self.visible_started_at = now
         if self.visible_started_at is not None and now - self.visible_started_at >= definition.live_s:
-            raise RuntimeError("Visible 60-second native Live ceiling expired")
+            raise RuntimeError(f"Visible {definition.live_s:g}-second native Live ceiling expired")
         position = getattr(robot, "_am1_selected_joint_position", None)
         current = getattr(robot, "_am1_selected_joint_current", None)
         for cache in (position, current):
@@ -722,6 +732,8 @@ class AM1SelectedJointEvidence:
             direction = -outward_direction
         elif phase == "acquire" and context["reference"] != context["admitted_reference"]:
             direction = sign * (1 if context["reference"] > context["admitted_reference"] else -1)
+        if getattr(definition, "schema_version", 1) == 2:
+            direction = self._response_direction(robot, definition, context)
         if direction is not None:
             leg = (context["cycle"], direction)
             if leg != self.visible_phase:
@@ -791,11 +803,51 @@ class AM1SelectedJointEvidence:
         outward = sign * (1 if definition.excursion_norm > 0 else -1)
         if context["phase"] in {"outbound", "endpoint"}:
             return outward
-        if context["phase"] in {"return", "origin", "final"}:
+        if context["phase"] in {"return", "origin", "final", "intercycle_hold"}:
             return -outward
+        if context["phase"] == "rejoin":
+            rejoin = context["rejoin"]
+            delta = rejoin["retained_target"]-rejoin["held_target"]
+            return None if delta == 0 else sign*(1 if delta > 0 else -1)
         if context["phase"] == "acquire" and context["reference"] != context["admitted_reference"]:
             return sign * (1 if context["reference"] > context["admitted_reference"] else -1)
         return None
+
+    def _prepare_response_rejoin(self, robot, definition, metadata):
+        """Validate the measured bridge before any native write; retain response obligations."""
+        rejoin = metadata["rejoin"]
+        previous = self._response_rejoin
+        if rejoin is None:
+            if previous is not None and (previous["value"]["elapsed_s"] != previous["value"]["duration_s"]
+                                         or metadata["progress_s"] != previous["progress_s"]):
+                self._response_refuse(robot, "Selected response rejoin ended before its retained goal")
+            self._response_rejoin = None
+            return
+        now = self.clock()
+        if previous is None:
+            position = getattr(robot, "_am1_selected_joint_position", None)
+            calibration = {k:int(getattr(robot.left_bus.calibration[MOTOR],k)) for k in
+                           ("drive_mode","homing_offset","range_min","range_max")}
+            goal = definition.encoded_goal(rejoin["held_target"], calibration)
+            if (rejoin["elapsed_s"] != 0 or self.profile is None or self.context is not None
+                    or not 0 <= now-rejoin["acquired_at_monotonic_s"] <= .5
+                    or not isinstance(position,dict) or type(position.get("raw")) is not int
+                    or not _number(position.get("read_started_at_monotonic_s"))
+                    or not _number(position.get("read_completed_at_monotonic_s"))
+                    or not 0 <= position["read_started_at_monotonic_s"] <= position["read_completed_at_monotonic_s"] <= now
+                    or now-position["read_started_at_monotonic_s"] > .5
+                    or abs(goal-position["raw"]) > 1):
+                self._response_refuse(robot, "Selected response rejoin measured hold is unavailable")
+        else:
+            old = previous["value"]
+            stable = ("held_target","retained_target","duration_s","observation_id","acquired_at_monotonic_s")
+            delta = rejoin["elapsed_s"]-old["elapsed_s"]
+            if (any(rejoin[k] != old[k] for k in stable) or metadata["progress_s"] != previous["progress_s"]
+                    or not 0 <= delta <= min(.1,now-previous["at"])+1e-9):
+                self._response_refuse(robot, "Selected response rejoin rate or frozen origin is unavailable")
+        self._response_rejoin = {"value":copy.deepcopy(rejoin),
+            "at":previous["at"] if previous is not None and delta == 0 else now,
+            "progress_s":metadata["progress_s"]}
 
     def _response_refuse(self, robot, reason, *, failure_kind="unavailable"):
         if self.response_boundary is None:
@@ -850,7 +902,7 @@ class AM1SelectedJointEvidence:
         now = self.clock()
         if (self.visible_started_at is not None
                 and now - self.visible_started_at >= definition.live_s):
-            raise RuntimeError("Visible 60-second native Live ceiling expired")
+            raise RuntimeError(f"Visible {definition.live_s:g}-second native Live ceiling expired")
         if not definition.settings_valid(self.visible_settings):
             self._response_refuse(robot, "Selected response startup settings are unavailable")
         position = getattr(robot, "_am1_selected_joint_position", None)

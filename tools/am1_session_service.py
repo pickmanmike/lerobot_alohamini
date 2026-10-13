@@ -273,7 +273,10 @@ class Gateway:
                     raise web.HTTPBadRequest(reason="ambiguous headers")
             if not request.secure or request.headers.get("Host") != self.origin.removeprefix("https://"):
                 raise web.HTTPForbidden(reason="origin boundary")
-            if request.query_string:
+            if request.query_string and not (
+                request.method == "GET" and request.path == "/api/state"
+                and len(request.query_string.encode()) <= CONTROL_LIMIT
+            ):
                 raise web.HTTPBadRequest(reason="query not supported")
             mutation = request.method in {"POST", "PATCH", "DELETE"}
             media = request.path == "/api/media" or request.path.startswith("/api/media/")
@@ -446,8 +449,26 @@ class Gateway:
         )
 
     async def state(self, request):
+        query = getattr(request, "query", {})
+        if query:
+            if len(query) != 3 or set(query) != {"reference", "offset", "limit"}:
+                raise ValueError("closed detail query required")
+            if any(not query[k].isascii() or not query[k].isdigit() for k in ("offset", "limit")):
+                raise ValueError("integer detail bounds required")
+            command = dict(
+                op="snapshot",
+                reference=strict_json(query["reference"]),
+                offset=int(query["offset"]),
+                limit=int(query["limit"]),
+            )
+            result = await self.call(command, "gateway-view")
+            if result.get("status") == "reporting_error":
+                raise ReportingError(result)
+            return web.json_response(result, dumps=_compact_http_json, headers={"Cache-Control": "no-store"})
         return web.json_response(
-            {"snapshot": await self.current()}, dumps=_compact_http_json, headers={"Cache-Control": "no-store"}
+            {"snapshot": await self.current()},
+            dumps=_compact_http_json,
+            headers={"Cache-Control": "no-store"},
         )
 
     async def attach(self, request):

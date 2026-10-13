@@ -346,7 +346,7 @@ class PositiveElbowControl:
         except (ValueError,TypeError,KeyError,AttributeError,OverflowError):
             return None
 
-    def _completion_expectation(self, execution):
+    def _completion_expectation(self, execution, *, cycle=1, composed=False, completed_progress=None):
         if not isinstance(execution, dict):
             return None
         o, seed = execution.get("positive_control"), execution.get("original_seed")
@@ -372,7 +372,8 @@ class PositiveElbowControl:
                 or seed[self.joint] != q0 or self.encoded_goal(q0, calibration) != o["reference_raw"]
                 or self.encoded_goal(q0 + delta, calibration) != o["endpoint_raw"]
                 or o["encoded_excursion_raw"] != abs(o["endpoint_raw"] - o["reference_raw"])
-                or o["encoded_excursion_raw"] <= 0 or o.get("program_completed") is not True
+                or o["encoded_excursion_raw"] <= 0
+                or o.get("cycle_completed" if composed else "program_completed") is not True
                 or o.get("adverse") is not False or not self.window_valid(o.get("final_window"))
                 or not self.settings_valid(o.get("visible_control"))):
             return None
@@ -394,7 +395,8 @@ class PositiveElbowControl:
             or original["context"]["reference"] != q0
             or original["position"]["raw"] not in {measured,self.encoded_goal(q0,calibration)}
             or not self.measurement_proof_valid(baseline,q0,calibration,run_id=binding["run_id"],host_incarnation=binding["host_incarnation"])
-            or baseline["context"]["phase"] != "baseline" or baseline["context"]["reference"] != q0
+            or baseline["context"]["phase"] != ("intercycle_hold" if composed and cycle == 2 else "baseline")
+            or baseline["context"]["reference"] != q0
             or baseline["position"]["raw"] != o["outward_anchor_raw"]
             or not self.window_valid(baseline_window)
             or baseline_window["last_position_completed_at"] != baseline["position"]["read_completed_at_monotonic_s"]
@@ -404,19 +406,27 @@ class PositiveElbowControl:
         endpoint_window=o.get("endpoint_window")
         for item,phase in ((endpoint,"endpoint"),(peak,"endpoint"),(departure,"return")):
             if (not self.measurement_proof_valid(item,q0,calibration,run_id=binding["run_id"],host_incarnation=binding["host_incarnation"])
-                or item["context"]["phase"] != phase or item["context"]["reference"] != q0):
+                or item["context"]["phase"] != phase or item["context"]["reference"] != q0
+                or composed and item["context"]["cycle"] != cycle):
                 return None
+        if composed and (type(o.get("cycle")) is not int or o["cycle"] != cycle or type(o.get("starting_raw")) is not int
+                         or o["starting_raw"] != baseline["position"]["raw"]):
+            return None
         if (not self.window_valid(endpoint_window)
             or endpoint_window["qualified_at_monotonic_s"] != departure["captured_at_monotonic_s"]
             or endpoint_window["last_position_completed_at"] != endpoint["position"]["read_completed_at_monotonic_s"]
             or peak["captured_at_monotonic_s"] > departure["captured_at_monotonic_s"]
-            or endpoint["position"]["raw"] != o["reverse_anchor_raw"]
+            or (peak if composed else endpoint)["position"]["raw"] != o["reverse_anchor_raw"]
             or o["outward_response_raw"] != max(0,direction*(peak["position"]["raw"]-o["outward_anchor_raw"]))):
             return None
         coverage, receipts = o.get("phase_coverage"), o.get("phase_receipts")
-        if not isinstance(coverage,dict) or not isinstance(receipts,dict) or set(receipts) != {"baseline","cycle1_endpoint","cycle1_origin"}:
+        if not isinstance(coverage,dict) or not isinstance(receipts,dict) or set(receipts) != {"baseline",f"cycle{cycle}_endpoint",f"cycle{cycle}_origin"}:
             return None
-        for phase in ("baseline","outbound","endpoint","return","origin","final"):
+        phases = ("baseline","outbound","endpoint","return","origin","final")
+        if composed:
+            phases = (("baseline","outbound","endpoint","return","origin") if cycle == 1 else
+                      ("intercycle_hold","outbound","endpoint","return","origin","final"))
+        for phase in phases:
             c = coverage.get(phase)
             if (not isinstance(c,dict) or type(c.get("sample_count")) is not int or c["sample_count"] < 3
                 or not all(type(c.get(k)) in (int,float) and math.isfinite(c[k]) for k in
@@ -429,7 +439,7 @@ class PositiveElbowControl:
         binding = o["visible_control"]["binding"]
         for key,r in receipts.items():
             context,action,decoded = r.get("context"),r.get("action"),r.get("decoded")
-            goal = o["endpoint_raw"] if key == "cycle1_endpoint" else o["reference_raw"]
+            goal = o["endpoint_raw"] if key == f"cycle{cycle}_endpoint" else o["reference_raw"]
             if (r.get("run_id") != binding["run_id"] or r.get("host_incarnation") != binding["host_incarnation"]
                 or r.get("sample_key") != key or not self.context_valid(context) or context["sample_key"] != key
                 or context["reference"] != q0 or context["acquisition_s"] != acquisition
@@ -446,7 +456,7 @@ class PositiveElbowControl:
                     ("read_started_at_monotonic_s","read_completed_at_monotonic_s","acquired_at_monotonic_s"))
                 or not 0 <= r["acquired_at_monotonic_s"] <= r["read_started_at_monotonic_s"] <= r["read_completed_at_monotonic_s"] <= o["final_window"]["qualified_at_monotonic_s"]):
                 return None
-        origin = receipts["cycle1_origin"]
+        origin = receipts[f"cycle{cycle}_origin"]
         if (o["final_window"]["qualified_at_monotonic_s"]-origin["read_started_at_monotonic_s"] > .5
             or type(origin["decoded"].get("present_position_raw")) is not int
             or abs(origin["decoded"]["present_position_raw"]-o["measured_origin_raw"]) > o["final_return_residual_raw"]):
@@ -477,11 +487,11 @@ class PositiveElbowControl:
                 or o.get("fine_return_pass") is not (o["final_return_residual_raw"] <= 2)
                 or (acquisition == 0) != (o.get("confirmation_of") is None)
                 or acquisition == 2 and uuid_text(o.get("confirmation_of")) != o["confirmation_of"]
-                or execution.get("progress_s") != self.nominal_trajectory_s + acquisition
+                or execution.get("progress_s") != (self.nominal_trajectory_s + acquisition if completed_progress is None else completed_progress)
                 or type(execution.get("cycles_completed")) is not int or execution["cycles_completed"] != 1
                 or type(execution.get("returns_qualified")) is not int or execution["returns_qualified"] != int(coarse)):
             return None
-        return self.nominal_trajectory_s + acquisition, 1, int(coarse)
+        return execution["progress_s"], 1, int(coarse)
 
 
 LEFT_ELBOW_POSITIVE_CONTROL = PositiveElbowControl()
@@ -537,6 +547,21 @@ SELECTED_ELBOW_EXPERIMENT_TRACKING_ENVELOPE_SHA256 = hashlib.sha256(json.dumps(
 ).encode()).hexdigest()
 
 
+SELECTED_ELBOW_EXPERIMENT_OPERATION_ENVELOPE = MappingProxyType({
+    **dict(SELECTED_ELBOW_EXPERIMENT_TRACKING_ENVELOPE),
+    "schema_version": 2,
+    "scope": "AM1-OPERATION-RECOVERY-07/fixed-reference-coarse-bench-v1",
+    "maximum_trajectory_s": 60.0,
+    "maximum_live_s": 90.0,
+    "cycle_count": 2,
+    "intercycle_hold_s": 6.0,
+})
+SELECTED_ELBOW_EXPERIMENT_OPERATION_ENVELOPE_SHA256 = hashlib.sha256(json.dumps(
+    dict(SELECTED_ELBOW_EXPERIMENT_OPERATION_ENVELOPE), sort_keys=True, allow_nan=False,
+    separators=(",", ":"),
+).encode()).hexdigest()
+
+
 @dataclass(frozen=True)
 class SelectedElbowExperiment:
     """One validated, pinned finite condition on the existing selected provider."""
@@ -551,29 +576,35 @@ class SelectedElbowExperiment:
     minimum_response_raw: int
     return_tolerance_raw: int
     goal_readback_checkpoints_s: tuple[float, ...]
+    cycle_count: int = 1
+    intercycle_hold_s: float = 0.0
 
     recipe_name = "physical-left-elbow-experiment"
     profile = "LeftElbowExperiment"
     joint = "arm_left_elbow_flex.pos"
-    trajectory_s = 30.0
     encoded_goal = staticmethod(SignedElbowResponse.encoded_goal)
     noise_discriminating = staticmethod(PositiveElbowControl.noise_discriminating)
     measured_origin = staticmethod(PositiveElbowControl.measured_origin)
     window_valid = staticmethod(PositiveElbowControl.window_valid)
     measurement_proof_valid = PositiveElbowControl.measurement_proof_valid
     completion_expectation = PositiveElbowControl.completion_expectation
-    _completion_expectation = PositiveElbowControl._completion_expectation
 
     def __post_init__(self):
         envelopes = {
             SELECTED_ELBOW_EXPERIMENT_ENVELOPE_SHA256: SELECTED_ELBOW_EXPERIMENT_ENVELOPE,
             SELECTED_ELBOW_EXPERIMENT_RESPONSE_ENVELOPE_SHA256: SELECTED_ELBOW_EXPERIMENT_RESPONSE_ENVELOPE,
             SELECTED_ELBOW_EXPERIMENT_TRACKING_ENVELOPE_SHA256: SELECTED_ELBOW_EXPERIMENT_TRACKING_ENVELOPE,
+            SELECTED_ELBOW_EXPERIMENT_OPERATION_ENVELOPE_SHA256: SELECTED_ELBOW_EXPERIMENT_OPERATION_ENVELOPE,
         }
-        if (type(self.schema_version) is not int or self.schema_version != 1
+        if (type(self.schema_version) is not int or self.schema_version not in (1, 2)
                 or type(self.envelope_sha256) is not str or self.envelope_sha256 not in envelopes):
             raise ValueError("selected experiment requires its exact schema and approved envelope pin")
         e = envelopes[self.envelope_sha256]
+        if (self.schema_version != e["schema_version"] or type(self.cycle_count) is not int
+                or self.cycle_count != e.get("cycle_count", 1)
+                or type(self.intercycle_hold_s) not in (int, float) or not math.isfinite(self.intercycle_hold_s)
+                or self.intercycle_hold_s != e.get("intercycle_hold_s", 0.0)):
+            raise ValueError("selected composition requires its exact cycle count and additional hold")
         values = (self.excursion_norm, self.ramp_s, self.endpoint_dwell_s,
                   self.current_cap_ma, self.live_ceiling_s)
         if not all(type(v) in (int, float) and math.isfinite(v) for v in values):
@@ -610,6 +641,8 @@ class SelectedElbowExperiment:
         keys = {"schema_version", "envelope_sha256", "excursion_norm", "ramp_s", "endpoint_dwell_s",
                 "current_cap_ma", "live_ceiling_s", "minimum_response_raw", "return_tolerance_raw",
                 "goal_readback_checkpoints_s"}
+        if isinstance(value, Mapping) and value.get("schema_version") == 2:
+            keys |= {"cycle_count", "intercycle_hold_s"}
         if not isinstance(value, Mapping) or set(value) != keys:
             raise ValueError("exact selected experiment payload required")
         points = value["goal_readback_checkpoints_s"]
@@ -620,7 +653,8 @@ class SelectedElbowExperiment:
     @property
     def payload(self):
         return {k: list(v) if k == "goal_readback_checkpoints_s" else v
-                for k, v in self.__dict__.items() if not k.startswith("_")}
+                for k, v in self.__dict__.items() if not k.startswith("_")
+                and (self.schema_version == 2 or k not in {"cycle_count", "intercycle_hold_s"})}
 
     @property
     def sha256(self):
@@ -636,7 +670,13 @@ class SelectedElbowExperiment:
 
     @property
     def nominal_trajectory_s(self):
+        if self.schema_version == 2:
+            return 4.0 + self.cycle_count * (2 * self.ramp_s + self.endpoint_dwell_s + 2.0) + self.intercycle_hold_s
         return 6.0 + 2 * self.ramp_s + self.endpoint_dwell_s
+
+    @property
+    def trajectory_s(self):
+        return 60.0 if self.schema_version == 2 else 30.0
 
     @property
     def live_s(self):
@@ -651,12 +691,75 @@ class SelectedElbowExperiment:
                 and math.ceil(excursion_raw / 2) <= self.minimum_response_raw <= excursion_raw
                 and self.return_tolerance_raw <= math.floor(excursion_raw / 5))
 
+    def _completion_expectation(self, execution):
+        if self.schema_version == 1:
+            return PositiveElbowControl._completion_expectation(self, execution)
+        if not isinstance(execution, dict) or not isinstance(execution.get("positive_control"), dict):
+            return None
+        o = execution["positive_control"]
+        cycles = o.get("cycles")
+        if not isinstance(cycles, list) or len(cycles) != self.cycle_count:
+            return None
+        first_end = 2 + 2*self.ramp_s + self.endpoint_dwell_s + 2
+        results = []
+        for cycle, row in enumerate(cycles, 1):
+            progress = first_end if cycle == 1 else self.nominal_trajectory_s
+            result = PositiveElbowControl._completion_expectation(self, dict(execution,
+                positive_control=row, progress_s=progress, cycles_completed=1,
+                returns_qualified=int(row.get("coarse_functional_pass") is True)),
+                cycle=cycle, composed=True, completed_progress=progress)
+            if result is None:
+                return None
+            results.append(result)
+        same = ("reference_normalized", "admitted_reference", "reference_raw", "endpoint_raw",
+                "encoded_excursion_raw", "measured_origin_raw", "measured_origin_proof", "calibration",
+                "admission_reference", "visible_control", "experiment", "baseline_noise_raw")
+        if any(cycles[0].get(k) != cycles[1].get(k) or o.get(k) != cycles[0].get(k) for k in same):
+            return None
+        hold = o.get("intercycle_hold")
+        if (not isinstance(hold, dict) or set(hold) != {"window", "anchor_proof", "starting_raw", "reference_raw"}
+                or hold["window"] != cycles[1]["baseline_window"]
+                or hold["anchor_proof"] != cycles[1]["baseline_anchor_proof"]
+                or hold["starting_raw"] != cycles[1]["starting_raw"] or hold["reference_raw"] != o["reference_raw"]
+                or not self.window_valid(hold["window"])
+                or hold["anchor_proof"]["context"]["phase"] != "intercycle_hold"
+                or abs(hold["starting_raw"]-o["measured_origin_raw"]) > self.return_tolerance_raw):
+            return None
+        coarse = all(c["coarse_functional_pass"] for c in cycles)
+        fine = all(c["fine_return_pass"] for c in cycles)
+        qualified = sum(result[2] for result in results)
+        if (o.get("program_completed") is not True or o.get("coarse_functional_pass") is not coarse
+                or o.get("fine_return_pass") is not fine
+                or o.get("outward_response_raw") != min(c["outward_response_raw"] for c in cycles)
+                or o.get("reverse_response_raw") != min(c["reverse_response_raw"] for c in cycles)
+                or o.get("final_return_residual_raw") != max(c["final_return_residual_raw"] for c in cycles)
+                or execution.get("progress_s") != self.nominal_trajectory_s
+                or type(execution.get("cycles_completed")) is not int or execution["cycles_completed"] != 2
+                or type(execution.get("returns_qualified")) is not int or execution["returns_qualified"] != qualified):
+            return None
+        return self.nominal_trajectory_s, self.cycle_count, qualified
+
     def phase(self, progress, acquisition_s=0):
         t = progress - acquisition_s
         if t < 0:
             return 0, "acquire", 0.0
         if t < 2:
             return 0, "baseline", 0.0
+        if self.schema_version == 2:
+            cycle_s = 2 * self.ramp_s + self.endpoint_dwell_s + 2.0
+            if t < 2 + cycle_s:
+                cycle, within = 1, t - 2
+            elif t < 2 + cycle_s + self.intercycle_hold_s:
+                return 1, "intercycle_hold", 0.0
+            else:
+                cycle, within = 2, t - 2 - cycle_s - self.intercycle_hold_s
+            if within < self.ramp_s:
+                return cycle, "outbound", within / self.ramp_s
+            if within < self.ramp_s + self.endpoint_dwell_s:
+                return cycle, "endpoint", 1.0
+            if within < 2 * self.ramp_s + self.endpoint_dwell_s:
+                return cycle, "return", 1 - (within - self.ramp_s - self.endpoint_dwell_s) / self.ramp_s
+            return cycle, "origin" if within < cycle_s else "final", 0.0
         if t < 2 + self.ramp_s:
             return 1, "outbound", (t - 2) / self.ramp_s
         if t < 2 + self.ramp_s + self.endpoint_dwell_s:
@@ -667,13 +770,26 @@ class SelectedElbowExperiment:
         return 1, "origin" if t < end + 2 else "final", 0.0
 
     def sample_key(self, progress, acquisition_s=0):
-        _, phase, _ = self.phase(progress, acquisition_s)
+        cycle, phase, _ = self.phase(progress, acquisition_s)
+        if self.schema_version == 2:
+            if phase == "baseline":
+                return "baseline"
+            if phase == "endpoint":
+                return f"cycle{cycle}_endpoint"
+            first_end = acquisition_s + 2 + 2 * self.ramp_s + self.endpoint_dwell_s + 2
+            if cycle == 1 and phase == "origin" and progress >= first_end - .2 - 1e-9:
+                return "cycle1_origin"
+            if cycle == 2 and progress >= acquisition_s + self.nominal_trajectory_s - .2 - 1e-9:
+                return "cycle2_origin"
+            return None
         return ("baseline" if phase == "baseline" else "cycle1_endpoint" if phase == "endpoint"
                 else "cycle1_origin" if progress >= acquisition_s + self.nominal_trajectory_s - .2 - 1e-9 else None)
 
     def context_valid(self, c):
         keys = {"profile", "progress_s", "phase", "cycle", "reference", "endpoint_target", "requested_target",
                 "sample_key", "acquisition_s", "admitted_reference", "experiment_sha256"}
+        if self.schema_version == 2:
+            keys.add("rejoin")
         if (not isinstance(c, dict) or set(c) != keys or c["profile"] != self.profile
                 or c["experiment_sha256"] != self.sha256):
             return False
@@ -682,14 +798,32 @@ class SelectedElbowExperiment:
             return False
         t, q0, acquired, admitted = c["progress_s"], c["reference"], c["acquisition_s"], c["admitted_reference"]
         magnitude = abs(self.excursion_norm)
-        if (acquired not in (0, 2) or not 0 <= t <= self.nominal_trajectory_s + acquired
+        if (acquired not in (0, 2) or self.schema_version == 2 and acquired != 0
+                or not 0 <= t <= self.nominal_trajectory_s + acquired
                 or not -100 <= q0 - magnitude <= q0 + magnitude <= 100
                 or abs(admitted - q0) > 2 or acquired == 0 and admitted != q0):
             return False
         cycle, phase, fraction = self.phase(t, acquired)
         target = admitted + (q0 - admitted) * t / 2 if phase == "acquire" else q0 + self.excursion_norm * fraction
+        rejoin = c.get("rejoin")
+        if rejoin is not None:
+            if (self.schema_version != 2 or not isinstance(rejoin, dict)
+                    or set(rejoin) != {"held_target", "retained_target", "elapsed_s", "duration_s",
+                                      "observation_id", "acquired_at_monotonic_s"}
+                    or not all(type(rejoin[k]) in (int,float) and math.isfinite(rejoin[k]) for k in
+                               ("held_target","retained_target","elapsed_s","duration_s","acquired_at_monotonic_s"))
+                    or type(rejoin["observation_id"]) is not int or rejoin["observation_id"] < 0
+                    or rejoin["acquired_at_monotonic_s"] < 0
+                    or not q0-magnitude <= rejoin["held_target"] <= q0+magnitude
+                    or not math.isclose(rejoin["retained_target"],target,abs_tol=1e-9,rel_tol=0)
+                    or not abs(target-rejoin["held_target"]) <= rejoin["duration_s"] <= 2*magnitude
+                    or not 0 <= rejoin["elapsed_s"] <= rejoin["duration_s"]):
+                return False
+            phase = "rejoin"
+            f = 1 if rejoin["duration_s"] == 0 else rejoin["elapsed_s"]/rejoin["duration_s"]
+            target = rejoin["held_target"]+(target-rejoin["held_target"])*f
         return (type(c["cycle"]) is int and c["cycle"] == cycle and c["phase"] == phase
-                and c["sample_key"] == self.sample_key(t, acquired)
+                and c["sample_key"] == (None if rejoin is not None else self.sample_key(t, acquired))
                 and math.isclose(c["endpoint_target"], q0 + self.excursion_norm, abs_tol=1e-9, rel_tol=0)
                 and math.isclose(c["requested_target"], target, abs_tol=1e-9, rel_tol=0))
 
@@ -710,6 +844,18 @@ class SelectedElbowExperiment:
         measured = self.measured_origin(requested_target, calibration)
         goal = self.encoded_goal(requested_target, calibration)
         return measured == frozen_raw and type(goal) is int and goal in {frozen_raw, frozen_raw - 1}
+
+
+LEFT_ELBOW_COARSE_BENCH_V1 = SelectedElbowExperiment.from_payload({
+    "schema_version":2, "envelope_sha256":SELECTED_ELBOW_EXPERIMENT_OPERATION_ENVELOPE_SHA256,
+    "excursion_norm":10, "ramp_s":10, "endpoint_dwell_s":2, "current_cap_ma":150,
+    "live_ceiling_s":90, "minimum_response_raw":56, "return_tolerance_raw":22,
+    "goal_readback_checkpoints_s":[5,37], "cycle_count":2, "intercycle_hold_s":6,
+})
+SELECTED_ELBOW_OPERATION_PRESET = MappingProxyType({
+    "id":"left-elbow-coarse-bench-v1", "version":1, "label":"Left elbow coarse bench v1 · two cycles",
+    "recipe":SelectedElbowExperiment.recipe_name,
+})
 
 
 @dataclass(frozen=True)

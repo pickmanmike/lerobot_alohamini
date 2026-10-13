@@ -142,7 +142,8 @@ class FiniteTask:
                 provider=provider,
                 motion_profile=self.profile,
                 emit=self.record,
-                **({"duration_s":selected_experiment.nominal_trajectory_s} if selected_experiment is not None else {}),
+                **({"duration_s":selected_experiment.nominal_trajectory_s,
+                    "selected_experiment":selected_experiment} if selected_experiment is not None else {}),
             )
         if self.positive_definition is not None and positive_comparator is not None:
             self.provider.duration_s = self.positive_definition.nominal_trajectory_s + 2.0
@@ -172,7 +173,8 @@ class FiniteTask:
             and (self.recovery_definition is not None or self.positive_definition is not None)
             and now - self.admitted_at >= (self.positive_definition.live_s if self.positive_definition is not None else 60)
         ):
-            raise ValueError("60-second recovery Live deadline expired")
+            ceiling = self.positive_definition.live_s if self.positive_definition is not None else 60
+            raise ValueError(f"{ceiling:g}-second recovery Live deadline expired")
         if not self.finished and getattr(self.provider, "preparing", False) and now - self.admitted_at >= 20:
             raise ValueError("20-second preparation wall deadline expired without a qualified seed")
 
@@ -182,6 +184,21 @@ class FiniteTask:
             self.provider.admit(now)
             self.last_frame = now
             self.active = True
+
+    def prepare_resume(self, now, sample):
+        """Bind the first resumed goal to the acknowledged measured native hold."""
+        self.check(now)
+        if (self.active or self.finished or self.complete or self.provider.preparing
+                or self.provider.awaiting_initial_feedback or self.positive_definition is None
+                or getattr(self.positive_definition, "schema_version", 1) != 2):
+            return
+        ack = sample.get("ack", {}) if isinstance(sample, dict) else {}
+        identity = self.provider._program._identity
+        if (ack.get("state") != "paused" or identity is None
+                or (ack.get("run_id"),ack.get("host_incarnation")) != identity
+                or sample.get("provenance") != "protected-host/measured-feedback"):
+            raise ValueError("selected rejoin requires its acknowledged measured hold")
+        self.provider.prepare_rejoin(now, sample["positions"], sample["sequence"], sample["at"])
 
     def hold(self):
         self.provider.freeze()
@@ -245,9 +262,18 @@ class FiniteTask:
             self.provider.validate_final_feedback(now, sample["positions"], sample.get("selected_joint"))
         if self.positive_definition is not None and not self.provider.preparing:
             self.original_seed = dict(self.provider.origin)
+            if self.selected_experiment is not None and self.selected_experiment.schema_version == 2:
+                rows = self.provider.positive_control.get("cycles", [])
+                completed = [row for row in rows if row.get("cycle_completed") is True]
+                self.cycles_completed = len(completed)
+                self.returns_qualified = sum(int(row["coarse_functional_pass"]) for row in completed)
         if self.provider.complete:
             if self.positive_definition is not None:
-                self.cycles_completed, self.returns_qualified = 1, int(self.provider.positive_control["coarse_functional_pass"])
+                outcome = self.provider.positive_control
+                rows = outcome.get("cycles")
+                self.cycles_completed = len(rows) if isinstance(rows, list) else 1
+                self.returns_qualified = (sum(int(row["coarse_functional_pass"]) for row in rows)
+                                         if isinstance(rows, list) else int(outcome["coarse_functional_pass"]))
                 self.complete = True
             elif self.recovery_definition is not None:
                 outcome = self.provider.recovery

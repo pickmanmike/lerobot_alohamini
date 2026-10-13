@@ -112,9 +112,11 @@ class AM1SessionTransport {
     if(recipe==="physical-left-elbow-experiment" || selectedExperiment!==null) {
       const keys=["schema_version","envelope_sha256","excursion_norm","ramp_s","endpoint_dwell_s","current_cap_ma","live_ceiling_s","minimum_response_raw","return_tolerance_raw","goal_readback_checkpoints_s"];
       const value=selectedExperiment,points=value?.goal_readback_checkpoints_s;
+      if(value?.schema_version===2)keys.push("cycle_count","intercycle_hold_s");
       if(recipe!=="physical-left-elbow-experiment" || !value || typeof value!=="object" || Array.isArray(value)
         || Object.keys(value).length!==keys.length || keys.some(key=>!Object.hasOwn(value,key))
-        || value.schema_version!==1 || typeof value.envelope_sha256!=="string" || !/^[0-9a-f]{64}$/.test(value.envelope_sha256)
+        || ![1,2].includes(value.schema_version) || value.schema_version===2 && (value.cycle_count!==2 || value.intercycle_hold_s!==6)
+        || typeof value.envelope_sha256!=="string" || !/^[0-9a-f]{64}$/.test(value.envelope_sha256)
         || ["excursion_norm","ramp_s","endpoint_dwell_s","current_cap_ma","live_ceiling_s"].some(key=>typeof value[key]!=="number" || !Number.isFinite(value[key]))
         || ["minimum_response_raw","return_tolerance_raw"].some(key=>!Number.isInteger(value[key]) || value[key]<0 || value[key]>4095)
         || !Array.isArray(points) || points.length>2 || points.some((point,index)=>typeof point!=="number" || !Number.isFinite(point) || point<=0 || index>0 && point<=points[index-1]))throw Error("Exact selected experiment descriptor required");
@@ -130,6 +132,39 @@ class AM1SessionTransport {
     let result;
     try {result=await this.post("start",payload);} catch(error) {if(error.reportingError)throw error;result=await this.post("start",payload);}
     this.render(this,result.reason);return result;
+  }
+  async startPreset(id) {
+    const preset=this.snapshot?.presets?.find(value=>value.id===id);
+    if(!preset || preset.version!==1 || preset.recipe!=="physical-left-elbow-experiment")throw Error("Current named preset required");
+    return this.start(preset.recipe,null,preset.selected_experiment);
+  }
+  async readDetail(reference,{raw=false}={}) {
+    const keys=["kind","version","service_incarnation","run_id","operation_id","host_incarnation","field","sha256","bytes"];
+    if(!reference || typeof reference!=="object" || Array.isArray(reference) || Object.keys(reference).length!==keys.length
+      || keys.some(key=>!Object.hasOwn(reference,key)) || reference.kind!=="am1-status-field-reference" || reference.version!==1
+      || !["run","evidence","events"].includes(reference.field) || typeof reference.sha256!=="string" || !/^[0-9a-f]{64}$/.test(reference.sha256)
+      || !Number.isInteger(reference.bytes) || reference.bytes<1 || reference.bytes>8*1024*1024
+      || reference.run_id!==this.snapshot?.run?.run_id
+      || this.snapshot?.run?.operation_id && reference.operation_id!==this.snapshot.run.operation_id)throw Error("Current bounded details reference required");
+    const frozen=JSON.parse(JSON.stringify(reference)),serialized=JSON.stringify(frozen),bytes=new Uint8Array(frozen.bytes);
+    for(let offset=0;offset<bytes.length;) {
+      const response=await fetch(`/api/state?reference=${encodeURIComponent(serialized)}&offset=${offset}&limit=8192`);
+      const value=await response.json();
+      if(!response.ok || value.accepted!==true || value.status!=="detail")throw Error(value.reason || "Native details unavailable");
+      if(reference.run_id!==this.snapshot?.run?.run_id || !value.reference || Object.keys(value.reference).length!==keys.length
+        || keys.some(key=>value.reference[key]!==frozen[key])
+        || value.offset!==offset || value.total_bytes!==bytes.length || value.encoding!=="base64"
+        || !Number.isInteger(value.length) || value.length<1 || value.length>8192 || offset+value.length>bytes.length
+        || typeof value.data!=="string")throw Error("Native details identity or chunk differs");
+      const chunk=atob(value.data);
+      if(chunk.length!==value.length)throw Error("Native details chunk length differs");
+      for(let i=0;i<chunk.length;i++)bytes[offset+i]=chunk.charCodeAt(i);
+      offset+=chunk.length;
+    }
+    const digest=Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256",bytes)),b=>b.toString(16).padStart(2,"0")).join("");
+    if(digest!==frozen.sha256)throw Error("Native details hash differs");
+    const text=new TextDecoder("utf-8",{fatal:true}).decode(bytes);
+    return raw ? text : JSON.parse(text);
   }
   async protective(op) {
     this.intent++; this.held.clear();
@@ -173,14 +208,17 @@ globalThis.AM1RemoteInitialize=function() {
   const defaultControlHelp="Explicitly claim input before Start. Finite authorization survives browser closure. Interactive work needs a fresh connected snapshot, empty release and qualified Resume. Disconnect, blur and handoff clear held keys. Pause and Stop remain available to enrolled control-capable spectators. Motor feedback and commands remain simulated. When configured, real P1 images qualify observation on Pi; optional browser video has no control authority.";
   const render=(transport,message)=> {
     const run=transport.snapshot?.run;
-    const recipes=transport.snapshot?.recipes, select=document.querySelector("#fake-recipe");
-    if(recipes && select.dataset.recipes!==JSON.stringify(recipes)) {
+    const recipes=transport.snapshot?.recipes,presets=transport.snapshot?.presets || [], select=document.querySelector("#fake-recipe");
+    const selection=JSON.stringify([recipes,presets]);
+    if(recipes && select.dataset.recipes!==selection) {
       const previous=select.value;
-      select.replaceChildren(...recipes.filter(name=>name!=="fake-finite-short").map(name=> {
+      const ordinary=recipes.filter(name=>name!=="fake-finite-short" && !presets.some(preset=>preset.recipe===name)).map(name=> {
         const option=document.createElement("option"); option.value=name; option.textContent=name; return option;
-      }));
+      });
+      const named=presets.map(preset=>{const option=document.createElement("option");option.value=preset.id;option.textContent=preset.label;return option;});
+      select.replaceChildren(...ordinary,...named);
       if([...select.options].some(option=>option.value===previous))select.value=previous;
-      select.dataset.recipes=JSON.stringify(recipes);
+      select.dataset.recipes=selection;
     }
     const physicalRun=run?.source==="protected-physical-provider" || run?.recipe?.startsWith("physical-");
     const physical=physicalRun || recipes?.some(name=>name.startsWith("physical-"));
@@ -262,7 +300,8 @@ globalThis.AM1RemoteInitialize=function() {
   document.querySelector(".control-actions").addEventListener("click",event=> {
     const op=event.target.closest("[data-operation]")?.dataset.operation;
     if(op==="ClaimInput")act(()=>transport.claim());
-    else if(op==="Start")act(()=>transport.start(document.querySelector("#fake-recipe").value));
+    else if(op==="Start")act(()=>{const selected=document.querySelector("#fake-recipe").value;
+      return transport.snapshot?.presets?.some(preset=>preset.id===selected) ? transport.startPreset(selected) : transport.start(selected);});
     else if(op==="Pause" || op==="Stop")act(()=>transport.protective(op.toLowerCase()));
     else if(op==="Resume")act(()=>transport.resume());
     else if(op==="Handoff")act(async()=> {await transport.releaseInput();const result=await transport.post("handoff",{operation_id:crypto.randomUUID(),target_device_id:document.querySelector("#handoff-device").value});transport.clear("handoff");render(transport,result.reason);});

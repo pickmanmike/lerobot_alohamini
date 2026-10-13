@@ -195,10 +195,12 @@ def test_delayed_foreign_p1_record_cannot_invalidate_current_local_proof(tmp_pat
     assert not box.evidence()["qualified"]
 
 
-def test_local_worker_real_http_and_owner_ipc_expire_and_recover(tmp_path, monkeypatch):
+@pytest.mark.parametrize("boundary", ["legacy", "finite", "pause", "stop", "native_fault"])
+def test_local_worker_real_http_and_owner_ipc_expire_and_recover(tmp_path, monkeypatch, boundary):
     import asyncio
     import socket
     import threading
+    import time
 
     from tools import am1_camera_viewer as viewer
     from tools.am1_session_ipc import OwnerServer
@@ -255,17 +257,61 @@ def test_local_worker_real_http_and_owner_ipc_expire_and_recover(tmp_path, monke
 
         try:
             result = start(owner.authority, "sim-arm-smoke-repeat")
-            await until(lambda: owner.authority.snapshot()["run"]["status"] == "running")
+            await until(
+                lambda: owner.authority.snapshot()["run"]["status"] == "running"
+                and owner.authority.executor.task.original_seed is not None
+            )
             before = owner.authority.snapshot()
             pause = tmp_path / "worker" / "pause-delivery"
-            pause.touch()
+            original_arrival = before["evidence"]["observation"]["arrived_at"]
+            original_seed = dict(owner.authority.executor.task.original_seed)
+            if boundary == "legacy":
+                pause.touch()
+            else:
+                request = box.request
+                began = time.monotonic()
+                marker = {key: request[key] for key in m.LOCAL_BINDING_KEYS}
+                marker.update(
+                    schema_version=1, started_at_monotonic_s=began, expires_at_monotonic_s=began + 1.0
+                )
+                viewer.write_private(pause, marker)
             await until(lambda: owner.authority.snapshot()["run"]["status"] == "recovering")
             held = owner.authority.snapshot()["run"]["progress_s"]
-            await asyncio.sleep(0.2)
+            expired = worker.receiver.evidence()
+            assert not box.evidence()["qualified"] and not expired["qualified"]
+            assert time.monotonic() - expired["arrived_at"] > 0.5
+            assert expired["arrived_at"] >= original_arrival
+            expired_arrival = expired["arrived_at"]
+            await asyncio.sleep(0.15)
             assert owner.authority.snapshot()["run"]["progress_s"] == held
-            pause.unlink()
+            if boundary == "legacy":
+                pause.unlink()
+            elif boundary in {"pause", "stop"}:
+                owner.authority.handle(command(boundary, run_id=result["run_id"]), "owner")
+            elif boundary == "native_fault":
+                owner.authority.executor.io.fault = "fixture_native_hard_fault"
+                owner.authority.tick()
+            if boundary in {"pause", "stop", "native_fault"}:
+                await asyncio.sleep(1.1)
+                terminal = owner.authority.snapshot()
+                assert (
+                    terminal["run"]["status"]
+                    == {"pause": "paused", "stop": "stopped", "native_fault": "faulted"}[boundary]
+                )
+                assert terminal["run"]["progress_s"] == held
+                assert terminal["run"]["deadline"] == before["run"]["deadline"]
+                if boundary == "native_fault":
+                    assert terminal["run"]["first_cause"] == "required_proof_loss"
+                    assert owner.authority.executor.io.fault == "fixture_native_hard_fault"
+                assert pause.exists()
+                return
             await until(lambda: owner.authority.snapshot()["run"]["status"] == "running")
             after = owner.authority.snapshot()
+            if boundary == "finite":
+                assert pause.exists(), "finite release must not require external file removal"
+                assert time.monotonic() >= began + 1.0
+                assert after["evidence"]["observation"]["arrived_at"] > expired_arrival
+                assert owner.authority.executor.task.original_seed == original_seed
             assert after["run"]["run_id"] == result["run_id"]
             assert after["run"]["deadline"] == before["run"]["deadline"]
             assert after["run"]["recovery_episodes"] == 1

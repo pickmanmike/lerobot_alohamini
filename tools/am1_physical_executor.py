@@ -675,6 +675,9 @@ class PhysicalExecutor:
                             self._aligned = []
                             self._hold_reference = None
                         else:
+                            if (self.task and self.recipe.name == SelectedElbowExperiment.recipe_name
+                                    and self.selected_experiment.schema_version == 2):
+                                self.task.prepare_resume(self.clock(), self.sample)
                             self._epoch += 1
                         self._epoch_mode = desired
                         self._epoch_revision = self.revision

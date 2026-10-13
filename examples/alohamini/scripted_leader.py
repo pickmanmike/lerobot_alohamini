@@ -679,6 +679,9 @@ class LeftElbowPositiveControlInput(LeftElbowResponseCharacterizeInput):
         self._admission_reference = dict(self.origin)
         self._admitted_reference = self.origin[self.selected_joint]
         prior = self._positive_comparator
+        self._composed = isinstance(self.definition, SelectedElbowExperiment) and self.definition.schema_version == 2
+        if self._composed and prior is not None:
+            raise ValueError("composed operation requires one fresh measured origin")
         self._reference = self._admitted_reference if prior is None else prior["reference_normalized"]
         self._acquisition_s = 0.0 if prior is None else 2.0
         if (not self._number(self._reference) or abs(self._reference - self._admitted_reference) > 2):
@@ -709,6 +712,12 @@ class LeftElbowPositiveControlInput(LeftElbowResponseCharacterizeInput):
         self._visible_settings = None
         self._positive_outcome = None
         self._coverage = {}
+        self._cycle_coverage = {1: self._coverage, 2: {}} if self._composed else None
+        self._cycle_outcomes = []
+        self._intercycle_hold = None
+        self._intercycle_anchor_proof = None
+        self._rejoin = None
+        self._rejoin_targets = None
         self._measured_origin_raw = self._measured_origin_proof = self._admission_origin_proof = None
         self._baseline_anchor_proof = self._baseline_window = self._outward_anchor_raw = None
         self._baseline_closed = False
@@ -726,12 +735,46 @@ class LeftElbowPositiveControlInput(LeftElbowResponseCharacterizeInput):
     @property
     def diagnostic_context(self):
         cycle, phase, _ = self.definition.phase(self.elapsed_s, self._acquisition_s)
+        if self._rejoin is not None:
+            phase = "rejoin"
         return {"profile":self.motion_profile, "progress_s":self.elapsed_s, "phase":phase, "cycle":cycle,
                 "reference":self._reference, "endpoint_target":self._reference + self._excursion,
                 "requested_target":self._action[self.selected_joint],
-                "sample_key":self.definition.sample_key(self.elapsed_s, self._acquisition_s),
+                "sample_key":None if self._rejoin is not None else self.definition.sample_key(self.elapsed_s, self._acquisition_s),
                 "acquisition_s":self._acquisition_s, "admitted_reference":self._admitted_reference,
-                **({"experiment_sha256":self.definition.sha256} if isinstance(self.definition, SelectedElbowExperiment) else {})}
+                **({"experiment_sha256":self.definition.sha256} if isinstance(self.definition, SelectedElbowExperiment) else {}),
+                **({"rejoin":copy.deepcopy(self._rejoin)} if self._composed else {})}
+
+    def prepare_rejoin(self, now, positions, observation_id, acquired_at):
+        if (not self._composed or self.complete or self._last_tick is not None
+                or not self._number(now) or not self._number(acquired_at) or not 0 <= now-acquired_at <= .5
+                or type(observation_id) is not int or observation_id < 0
+                or not isinstance(positions, dict) or set(positions) != set(self.origin)
+                or not all(self._number(v) for v in positions.values())):
+            raise ValueError("rejoin requires an original fresh measured hold acquisition")
+        magnitude = abs(self._excursion)
+        if (not self._reference-magnitude <= positions[self.selected_joint] <= self._reference+magnitude
+                or any(abs(positions[k]-self.origin[k]) > 1 for k in positions if k != self.selected_joint)):
+            raise ValueError("rejoin measured hold exceeds the original frozen envelope")
+        _, _, fraction = self.definition.phase(self.elapsed_s, self._acquisition_s)
+        retained = dict(self.origin, **{self.selected_joint:self._reference+self._excursion*fraction})
+        duration = max(abs(retained[k]-positions[k]) for k in retained)
+        self._rejoin_targets = (dict(positions), retained)
+        self._rejoin = {"held_target":positions[self.selected_joint], "retained_target":retained[self.selected_joint],
+            "elapsed_s":0.0, "duration_s":duration, "observation_id":observation_id,
+            "acquired_at_monotonic_s":acquired_at}
+        self._action = dict(positions)
+
+    def _advance_rejoin(self, now):
+        if self._last_tick is None or not self._number(now) or now < self._last_tick:
+            raise ValueError("rejoin clock is unavailable or regressed")
+        self._rejoin["elapsed_s"] = min(self._rejoin["duration_s"],
+            self._rejoin["elapsed_s"]+min(now-self._last_tick,self._frame_s))
+        self._last_tick = now
+        duration = self._rejoin["duration_s"]
+        fraction = 1.0 if duration == 0 else self._rejoin["elapsed_s"]/duration
+        held, retained = self._rejoin_targets
+        self._action = {k:held[k]+fraction*(retained[k]-held[k]) for k in held}
 
     def _position(self):
         _, phase, fraction = self.definition.phase(self.elapsed_s, self._acquisition_s)
@@ -749,7 +792,9 @@ class LeftElbowPositiveControlInput(LeftElbowResponseCharacterizeInput):
                 "reference_normalized":self._reference, "admitted_reference":self._admitted_reference,
                 "acquisition_s":self._acquisition_s,
                 "confirmation_of":None if self._positive_comparator is None else self._positive_comparator["run_id"],
-                **({"experiment":self.definition.summary()} if isinstance(self.definition, SelectedElbowExperiment) else {})}
+                **({"experiment":self.definition.summary()} if isinstance(self.definition, SelectedElbowExperiment) else {}),
+                **({"cycles":copy.deepcopy(self._cycle_outcomes), "intercycle_hold":copy.deepcopy(self._intercycle_hold)}
+                   if self._composed else {})}
 
     def _feedback(self, now, observed, feedback):
         current = feedback.get("current") if isinstance(feedback, dict) else None
@@ -778,6 +823,8 @@ class LeftElbowPositiveControlInput(LeftElbowResponseCharacterizeInput):
         if isinstance(self.definition, SelectedElbowExperiment) and not self.definition.criteria_valid(abs(encoded_delta)):
             raise ValueError("selected experiment raw criteria differ from its actual encoded excursion")
         self._visible_settings = copy.deepcopy(proof)
+        if context.get("phase") == "rejoin":
+            return  # Real bridge acquisitions do not count as programme phase coverage.
         if self._measured_origin_raw is None:
             if self.elapsed_s != 0 or context["progress_s"] != 0:
                 raise ValueError("positive original measured reference lacks its first native acquisition")
@@ -797,6 +844,8 @@ class LeftElbowPositiveControlInput(LeftElbowResponseCharacterizeInput):
                 self._admission_origin_proof=native
         phase, cycle = context["phase"], context["cycle"]
         row = self._phase_samples[(cycle,phase)][-1]
+        if self._composed:
+            self._coverage = self._cycle_coverage[2 if phase == "intercycle_hold" else max(1, cycle)]
         cov = self._coverage.setdefault(phase, {"sample_count":0, "first_current_at":row["at"],
             "first_position_at":row["position_at"], "minimum_raw":row["raw"], "maximum_raw":row["raw"]})
         cov.update(sample_count=cov["sample_count"]+1, last_current_at=row["at"], last_position_at=row["position_at"],
@@ -809,11 +858,13 @@ class LeftElbowPositiveControlInput(LeftElbowResponseCharacterizeInput):
                 self._qualify_positive_baseline(now)
         elif phase=="outbound":
             self._baseline_closed=True
+        if self._composed and phase == "intercycle_hold":
+            self._intercycle_anchor_proof = self._measurement_proof(feedback, now)
         if phase=="endpoint":
             self._endpoint_proofs.append(self._measurement_proof(feedback,now))
             del self._endpoint_proofs[:-20]
         if phase=="return" and self._first_return_proof is None:
-            endpoint=self._phase_samples.get((1,"endpoint"),[])
+            endpoint=self._phase_samples.get((cycle,"endpoint"),[])
             suffix=self._recent_suffix(endpoint,"positive endpoint before actual return",now=now)
             if not self._endpoint_proofs or self._endpoint_proofs[-1]["position"]["read_completed_at_monotonic_s"] != suffix[-1]["position_at"]:
                 raise ValueError("positive actual endpoint packet/window differs")
@@ -822,7 +873,8 @@ class LeftElbowPositiveControlInput(LeftElbowResponseCharacterizeInput):
             self._endpoint_peak_proof=copy.deepcopy(max(self._endpoint_proofs,key=lambda proof:self._raw_direction*proof["position"]["raw"]))
             self._first_return_proof=self._measurement_proof(feedback,now)
         band = max(2, self._noise or 0)
-        old = self._tracking.get(phase)
+        tracking_key = (cycle, phase) if self._composed else phase
+        old = self._tracking.get(tracking_key)
         if old is not None:
             if phase == "outbound" and self._raw_direction*(row["raw"]-old["extreme"]) < -band:
                 raise ValueError("positive control moved in the wrong outward direction")
@@ -839,7 +891,7 @@ class LeftElbowPositiveControlInput(LeftElbowResponseCharacterizeInput):
             if track["crossings"] >= 3:
                 raise ValueError("positive control has growing instability at an unchanged goal")
         track.update(goal=row["goal_raw"], sign=sign, error=abs(error))
-        self._tracking[phase] = track
+        self._tracking[tracking_key] = track
         if phase in {"origin", "final"} and self._rising_current_window(self._phase_samples[(cycle,phase)]) is not None:
             self._adverse_reason = "positive control sustained rising current at an unchanged goal"
             raise ValueError(self._adverse_reason)
@@ -879,23 +931,40 @@ class LeftElbowPositiveControlInput(LeftElbowResponseCharacterizeInput):
             raise ValueError("positive control declared reference is not acquired")
 
     def _qualify_positive_final(self, now):
-        origin = self._receipt("cycle1_origin", now, fresh=True)
-        samples = self._recent_suffix(self._phase_samples.get((1,"final"),[]), "positive final", now=now)
+        cycle = 2 if self._composed else 1
+        self._qualify_positive_cycle(now, cycle, "final")
+        if self._composed:
+            final = self._cycle_outcomes[-1]
+            self._positive_outcome = dict(copy.deepcopy(final), program_completed=True,
+                coarse_functional_pass=all(c["coarse_functional_pass"] for c in self._cycle_outcomes),
+                fine_return_pass=all(c["fine_return_pass"] for c in self._cycle_outcomes),
+                outward_response_raw=min(c["outward_response_raw"] for c in self._cycle_outcomes),
+                reverse_response_raw=min(c["reverse_response_raw"] for c in self._cycle_outcomes),
+                final_return_residual_raw=max(c["final_return_residual_raw"] for c in self._cycle_outcomes),
+                cycles=copy.deepcopy(self._cycle_outcomes), intercycle_hold=copy.deepcopy(self._intercycle_hold))
+
+    def _qualify_positive_cycle(self, now, cycle, final_phase):
+        origin = self._receipt(f"cycle{cycle}_origin", now, fresh=True)
+        samples = self._recent_suffix(self._phase_samples.get((cycle,final_phase),[]), "positive final", now=now)
         if self._first_return_proof is None or self._endpoint_window is None:
             raise ValueError("positive actual reverse lacks its qualified endpoint window")
-        for phase in ("baseline", "outbound", "endpoint", "return", "origin", "final"):
+        required = ("baseline", "outbound", "endpoint", "return", "origin", "final")
+        if self._composed:
+            required = (("baseline", "outbound", "endpoint", "return", "origin") if cycle == 1 else
+                        ("intercycle_hold", "outbound", "endpoint", "return", "origin", "final"))
+        for phase in required:
             c = self._coverage.get(phase, {})
             if (c.get("sample_count",0) < 3 or c.get("last_current_at",0)-c.get("first_current_at",0) < .2-1e-9
                     or c.get("last_position_at",0)-c.get("first_position_at",0) < .2-1e-9):
                 raise ValueError("positive control actual phase coverage missing: " + phase)
-        ep = self._receipt("cycle1_endpoint", now)
+        ep = self._receipt(f"cycle{cycle}_endpoint", now)
         endpoint_raw = ep["decoded"]["goal_position_raw"]
         if origin["decoded"]["goal_position_raw"] != self._baseline_raw:
             raise ValueError("positive control final encoded goal differs")
         excursion = abs(endpoint_raw - self._baseline_raw)
         if excursion <= 0:
             raise ValueError("positive control encoded excursion unavailable")
-        anchor = self._endpoint_anchor_proof["position"]["raw"]
+        anchor = (self._endpoint_peak_proof if self._composed else self._endpoint_anchor_proof)["position"]["raw"]
         outward = max(0, self._raw_direction*(self._endpoint_peak_proof["position"]["raw"] - self._outward_anchor_raw))
         reverse = max(0, max(self._raw_direction*(anchor-r["raw"]) for r in samples))
         residual = max(abs(r["raw"]-self._measured_origin_raw) for r in samples)
@@ -905,7 +974,7 @@ class LeftElbowPositiveControlInput(LeftElbowResponseCharacterizeInput):
         minimum = getattr(self.definition, "minimum_response_raw", math.ceil(excursion/2))
         tolerance = getattr(self.definition, "return_tolerance_raw", math.floor(excursion/5))
         coarse = discriminating and outward >= minimum and reverse >= minimum and residual <= tolerance
-        self._positive_outcome = {"program_completed":True, "coarse_functional_pass":coarse,
+        outcome = {"program_completed":True, "coarse_functional_pass":coarse,
             "fine_return_pass":residual <= 2, "noise_discriminating":discriminating,
             "reference_normalized":self._reference, "admitted_reference":self._admitted_reference,
             "reference_raw":self._baseline_raw, "endpoint_raw":endpoint_raw, "encoded_excursion_raw":excursion,
@@ -928,8 +997,37 @@ class LeftElbowPositiveControlInput(LeftElbowResponseCharacterizeInput):
             "other_joint_admission_differences":{} if self._positive_comparator is None else {
                 k:self._admission_reference[k]-v for k,v in self._positive_comparator["original_seed"].items() if k != self.selected_joint},
             "visible_control":copy.deepcopy(self._visible_settings), "phase_coverage":copy.deepcopy(self._coverage),
-            "phase_receipts":copy.deepcopy(self._sparse), "final_window":self._window(samples,now),
+            "phase_receipts":copy.deepcopy({k:v for k,v in self._sparse.items()
+                if not self._composed or k in {"baseline", f"cycle{cycle}_endpoint", f"cycle{cycle}_origin"}}),
+            "final_window":self._window(samples,now),
             **({"experiment":self.definition.summary()} if isinstance(self.definition, SelectedElbowExperiment) else {})}
+        if self._composed:
+            outcome.pop("program_completed")
+            outcome.update(cycle=cycle, cycle_completed=True, starting_raw=self._outward_anchor_raw)
+            if len(self._cycle_outcomes) == cycle:
+                self._cycle_outcomes[-1] = outcome
+            elif len(self._cycle_outcomes) == cycle - 1:
+                self._cycle_outcomes.append(outcome)
+            else:
+                raise ValueError("composed cycle qualification order differs")
+        else:
+            self._positive_outcome = outcome
+
+    def _qualify_intercycle_hold(self, now):
+        samples = self._recent_suffix(self._phase_samples.get((1,"intercycle_hold"), []),
+                                      "measured intercycle hold", now=now)
+        proof = self._intercycle_anchor_proof
+        if (proof is None or proof["position"]["read_completed_at_monotonic_s"] != samples[-1]["position_at"]
+                or max(abs(r["raw"]-self._measured_origin_raw) for r in samples) > self.definition.return_tolerance_raw):
+            raise ValueError("measured intercycle hold differs from the original return envelope")
+        self._intercycle_hold = {"window":self._window(samples, now), "anchor_proof":copy.deepcopy(proof),
+                                "starting_raw":samples[-1]["raw"], "reference_raw":self._baseline_raw}
+        self._baseline_anchor_proof = copy.deepcopy(proof)
+        self._baseline_window = self._window(samples, now)
+        self._outward_anchor_raw = samples[-1]["raw"]
+        self._coverage = self._cycle_coverage[2]
+        self._endpoint_proofs = []
+        self._endpoint_window = self._endpoint_anchor_proof = self._endpoint_peak_proof = self._first_return_proof = None
 
     def advance(self, now, observed, observation_sequence, *, defer_events=False, selected_feedback=None):
         if self._last_tick is None or self.complete:
@@ -937,9 +1035,24 @@ class LeftElbowPositiveControlInput(LeftElbowResponseCharacterizeInput):
         if not math.isfinite(now) or now < self._last_tick or observation_sequence <= self._sequence:
             raise ValueError("positive control clock/feedback sequence invalid")
         self.collect_feedback(now, observed, observation_sequence, selected_feedback=selected_feedback)
+        if self._rejoin is not None:
+            context = selected_feedback.get("context", {})
+            if (context.get("phase") == "rejoin" and context.get("rejoin") == self._rejoin
+                    and self._rejoin["elapsed_s"] == self._rejoin["duration_s"]):
+                self._rejoin = self._rejoin_targets = None
+                self._last_tick = now
+            else:
+                self._advance_rejoin(now)
+            return
         next_progress = round(self.elapsed_s + min(now-self._last_tick,self._frame_s),9)
         if self.elapsed_s < self._acquisition_s+2 <= next_progress:
             self._qualify_positive_baseline(now)
+        if self._composed:
+            end = 2 + 2*self.definition.ramp_s + self.definition.endpoint_dwell_s + 2
+            if self.elapsed_s < end <= next_progress:
+                self._qualify_positive_cycle(now, 1, "origin")
+            if self.elapsed_s < end+self.definition.intercycle_hold_s <= next_progress:
+                self._qualify_intercycle_hold(now)
         if next_progress >= self.duration_s:
             self._qualify_positive_final(now)
         ScriptedLeaderInput.advance(self, now, observed, observation_sequence, defer_events=defer_events)

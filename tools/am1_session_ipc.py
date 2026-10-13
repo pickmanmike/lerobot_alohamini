@@ -316,7 +316,9 @@ class OwnerServer:
                 else:
                     async with self.slots[protective]:
                         # Never call tick before a protective operation; core owns ordering.
-                        if command == {"op": "snapshot"}:
+                        if command.get("op") == "snapshot" and command != {"op": "snapshot"}:
+                            result = await asyncio.to_thread(self.authority.snapshot_detail, command)
+                        elif command == {"op": "snapshot"}:
                             snapshot = await asyncio.to_thread(self.authority.snapshot)
                             result = {"accepted": True, "status": "snapshot", "snapshot": snapshot}
                         else:

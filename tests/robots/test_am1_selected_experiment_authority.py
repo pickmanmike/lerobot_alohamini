@@ -237,8 +237,10 @@ def test_selected_terminal_full_wrapper_references_complete_internal_native_exec
     wrapper = {"id": str(uuid.uuid4()), "result": {"accepted": True, "status": "snapshot", "snapshot": snapshot}}
     assert len(encode(wrapper, RESPONSE_LIMIT)) < RESPONSE_LIMIT
     public = snapshot["run"]["completion_receipt"]
-    assert "execution" not in public and public["execution_reference"]["field"] == "run.execution"
-    assert public["execution_reference"]["sha256"] == hashlib.sha256(
-        json.dumps(execution, sort_keys=True, allow_nan=False, separators=(",", ":")).encode()).hexdigest()
-    assert snapshot["evidence"]["finite_completion"]["execution_reference"] == public["execution_reference"]
-    assert snapshot["run"]["execution"] == execution and authority.run == original
+    from tests.robots.test_am1_status_details import resolve
+
+    assert "execution" not in public
+    assert resolve(authority, snapshot["run"]["details_reference"])["execution"] == execution
+    assert resolve(authority, snapshot["evidence"]["details_reference"])["finite_completion"]["execution"] == execution
+    assert snapshot["run"]["execution"]["cycles_completed"] == execution["cycles_completed"]
+    assert authority.run == original

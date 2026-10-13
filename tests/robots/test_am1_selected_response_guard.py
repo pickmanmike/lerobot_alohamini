@@ -13,9 +13,11 @@ from tests.robots.test_alohamini_lift_motor_feedback import status
 from tests.robots.test_am1_selected_joint_evidence import context, visible_register_packet, visible_robot
 
 
-def descriptor(*, historical=False, tracking=False, **changes):
+def descriptor(*, historical=False, tracking=False, operation=False, **changes):
     name = (
-        "SELECTED_ELBOW_EXPERIMENT_ENVELOPE_SHA256"
+        "SELECTED_ELBOW_EXPERIMENT_OPERATION_ENVELOPE_SHA256"
+        if operation
+        else "SELECTED_ELBOW_EXPERIMENT_ENVELOPE_SHA256"
         if historical
         else "SELECTED_ELBOW_EXPERIMENT_TRACKING_ENVELOPE_SHA256"
         if tracking
@@ -25,23 +27,94 @@ def descriptor(*, historical=False, tracking=False, **changes):
     assert pin is not None, "separately pinned response envelope is missing"
     return contract.SelectedElbowExperiment.from_payload(
         {
-            "schema_version": 1,
+            "schema_version": 2 if operation else 1,
             "envelope_sha256": pin,
             "excursion_norm": 10.0,
             "ramp_s": 10.0,
             "endpoint_dwell_s": 2.0,
             "current_cap_ma": 100.0 if historical else 150.0,
-            "live_ceiling_s": 60.0,
+            "live_ceiling_s": 90.0 if operation else 60.0,
             "minimum_response_raw": 55,
             "return_tolerance_raw": 20,
             "goal_readback_checkpoints_s": [18.0, 19.0],
+            **({"cycle_count": 2, "intercycle_hold_s": 6} if operation else {}),
             **changes,
         }
     )
 
 
+def operation_rejoin(elapsed=0):
+    return {
+        "phase": "rejoin",
+        "sample_key": None,
+        "requested_target": 1.7 - elapsed,
+        "rejoin": {
+            "held_target": 1.7,
+            "retained_target": 0.0,
+            "elapsed_s": elapsed,
+            "duration_s": 1.7,
+            "observation_id": 1,
+            "acquired_at_monotonic_s": 1.9,
+        },
+    }
+
+
+def test_operation_native_intercycle_hold_and_measured_rejoin_keep_frozen_progress(monkeypatch):
+    g = guarded(monkeypatch, operation=True)
+    g.tick(1.9, raw=2017, progress=28)
+    g.evidence.deactivate(g.robot)
+    g.tick(2.0, raw=2017, progress=28, context_overrides=operation_rejoin())
+    g.tick(2.05, raw=2017, progress=28, context_overrides=operation_rejoin())
+    g.tick(2.1, raw=2016, progress=28, context_overrides=operation_rejoin(0.1))
+    assert g.evidence.progress == 28 and g.evidence.reference == 0
+    assert g.evidence.response_boundary["direction"] == -1
+    assert g.evidence.response_boundary["status"] == "tracking"
+
+
+def test_operation_native_rejoin_refuses_a_clock_jump_before_actuation(monkeypatch):
+    g = guarded(monkeypatch, operation=True)
+    g.tick(1.9, raw=2017, progress=28)
+    g.evidence.deactivate(g.robot)
+    g.tick(2.0, raw=2017, progress=28, context_overrides=operation_rejoin())
+    with pytest.raises(RuntimeError, match="rejoin.*rate"):
+        g.tick(2.1, raw=2016, progress=28, context_overrides=operation_rejoin(0.2))
+
+
+def test_operation_native_rejoin_cannot_erase_unresolved_response_on_pause(monkeypatch):
+    g = guarded(monkeypatch, operation=True)
+    g.tick(1.0, raw=2000, progress=7)
+    assert g.evidence.response_boundary["status"] == "pending"
+    g.evidence.deactivate(g.robot)
+    with pytest.raises(RuntimeError, match="continuity"):
+        g.tick(
+            1.1,
+            raw=2000,
+            progress=7,
+            context_overrides={
+                "phase": "rejoin",
+                "sample_key": None,
+                "requested_target": 0.0,
+                "rejoin": {
+                    "held_target": 0.0,
+                    "retained_target": 5.0,
+                    "elapsed_s": 0.0,
+                    "duration_s": 5.0,
+                    "observation_id": 1,
+                    "acquired_at_monotonic_s": 1.0,
+                },
+            },
+        )
+
+
 def guarded(
-    monkeypatch, *, historical=False, excursion=10.0, tracking=False, reference=0.0, calibration=None
+    monkeypatch,
+    *,
+    historical=False,
+    excursion=10.0,
+    tracking=False,
+    operation=False,
+    reference=0.0,
+    calibration=None,
 ):
     material = calibration or {"drive_mode": 0, "homing_offset": 1845, "range_min": 1000, "range_max": 3000}
     seed_raw = contract.SelectedElbowExperiment.encoded_goal(reference, material)
@@ -64,7 +137,9 @@ def guarded(
     obj.left_bus.calibration["arm_left_elbow_flex"] = type(obj.left_bus.calibration["arm_left_elbow_flex"])(
         id=3, **material
     )
-    definition = descriptor(historical=historical, tracking=tracking, excursion_norm=excursion)
+    definition = descriptor(
+        historical=historical, tracking=tracking, operation=operation, excursion_norm=excursion
+    )
     obj._am1_selected_elbow_experiment = definition
     identity.update(recipe=definition.recipe_name, experiment_sha256=definition.sha256)
     now = [0.5]
@@ -79,7 +154,7 @@ def guarded(
     sequence = [0]
     original_counts = (len(port.writes), len(reads), len(writes), len(rows))
 
-    def tick(at, raw=None, current=12, progress=None, *, mutate=None, run_guard=True):
+    def tick(at, raw=None, current=12, progress=None, *, mutate=None, run_guard=True, context_overrides=None):
         now[0] = at
         raw = seed_raw if raw is None else raw
         progress = 5 + at - 1 if progress is None else progress
@@ -96,7 +171,9 @@ def guarded(
             acquisition_s=0.0,
             admitted_reference=reference,
             experiment_sha256=definition.sha256,
+            **({"rejoin": None} if operation else {}),
         )
+        metadata.update(context_overrides or {})
         evidence.prepare(
             obj,
             {

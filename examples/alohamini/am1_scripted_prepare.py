@@ -48,6 +48,7 @@ class PreparedScriptedInput:
         motion_profile: str | None = None,
         emit: Callable[[dict[str, Any]], None] | None = None,
         duration_s: float | None = None,
+        selected_experiment: SelectedElbowExperiment | None = None,
     ) -> None:
         if fps != 10 or len(joint_keys) != 12 or set(initial_positions) != set(joint_keys):
             raise ValueError("preparation requires the exact AM1 12-joint seed at 10 Hz")
@@ -86,10 +87,17 @@ class PreparedScriptedInput:
             SelectedElbowExperiment.profile: duration_s,
             **{d.profile: d.trajectory_s for d in ELBOW_RECOVERY_DEFINITIONS.values()},
         }[self.motion_profile]
-        if self.motion_profile == SelectedElbowExperiment.profile and (
-            type(duration_s) not in (int, float) or not math.isfinite(duration_s) or not 0 < duration_s <= 30
+        if selected_experiment is not None and (
+            self.motion_profile != SelectedElbowExperiment.profile
+            or not isinstance(selected_experiment, SelectedElbowExperiment)
+            or duration_s != selected_experiment.nominal_trajectory_s
         ):
-            raise ValueError("selected experiment preparation requires its validated finite duration")
+            raise ValueError("selected preparation requires its exact validated descriptor duration")
+        if self.motion_profile == SelectedElbowExperiment.profile:
+            ceiling = 30 if selected_experiment is None else selected_experiment.trajectory_s
+            if (type(duration_s) not in (int, float) or not math.isfinite(duration_s)
+                    or not 0 < duration_s <= ceiling):
+                raise ValueError("selected experiment preparation requires its validated finite duration")
         self.preparation_elapsed_s = 0.0
         self._program = None
         self._action = dict(self.origin)
@@ -226,6 +234,11 @@ class PreparedScriptedInput:
         self._qualification_started = None
         if not self.preparing:
             self._program.freeze()
+
+    def prepare_rejoin(self, now, positions, observation_id, acquired_at):
+        if self.preparing:
+            raise ValueError("a measured rejoin requires the existing finite seed")
+        self._program.prepare_rejoin(now, positions, observation_id, acquired_at)
 
     def _stationary(self, observed: Mapping[str, float], *, final: bool) -> bool:
         valid = all(abs(observed[key] - self._action[key]) <= 1 for key in self.joint_keys)

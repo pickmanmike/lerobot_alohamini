@@ -1,65 +1,40 @@
-## Current AM1 elbow movement through completion scope
+## Current AM1 repeatable operation and recovery scope
 
-The owner explicitly invoked AM1-ELBOW-TO-COMPLETION-06. It completely replaces the
-proposed AM1-FAULT-EVIDENCE-05, which was never sent, and supersedes contradictory
-present restrictions in the historical packets below. Continue the evidence-driven
-repair loop until the left follower elbow moves intentionally and usefully, reverses
-and demonstrates short repeatable control, or actual evidence establishes a specific
-necessary physical/access action unavailable to our tools. One diagnostic, cap trip,
-report or artificial attempt quota does not complete this assignment.
+The owner explicitly invoked AM1-OPERATION-RECOVERY-07 and accepts packet06's
+coarse elbow movement at its recorded sources. Preserve that behavior and its
+fine-position limits. Continue through a reusable versioned existing-console
+preset, two fixed-reference finite cycles, genuine required-local-input hold and
+qualified same-task recovery, truthful completion, usable next explicit Start,
+and persistent idle console after reboot. Do not reopen I1/tiny-return or replace
+completion with one experiment/report/quota. Repair demonstrated layers and
+continue supported finite, locally monitored sequences; preserve every first cause.
 
-Successive supported finite experiments and justified diagnostic-only changes are
-authorized without per-iteration attendance/readiness/permission questions. The old
-100 mA diagnostic threshold is not immutable. Reassess it using installed model,
-actual configuration, load/pose, real current and working records before replacing
-it. Catalog maxima or ordinary software ceiling alone do not establish a loaded
-joint budget. Keep hardware/device current/torque limits, genuine stall/current/
-thermal/voltage/status/feedback/travel/ownership protections and normal cleanup.
-No blind retries, blind force escalation, prolonged stalled holds, unbounded motion or fault clearing.
-A fault ends that experiment, not the investigation; preserve its first causes.
+Start with the tested +10/10-second-ramp/2-second-dwell/150mA sampled-current and
+45-tick moving condition, fixed30-tick startup bound, unchanged P16/I0/D32,
+calibration/device limits and genuine current/thermal/status/feedback/travel/ownership
+protections. Freeze one admitted task reference, not a new origin each cycle.
+Keep command acceptance, measured/visible motion, coarse performance, fine residual,
+program completion and cleanup separate. No blind retry/effort escalation/tuning.
 
-Repair missing live trigger evidence in memory before cleanup, then publish through
-existing channels without delaying protection. Obtain necessary same-owner live goal
-readbacks; never invent the lost f7e7 sample or substitute torque-off values for it.
-Compare working +105/negative conditions honestly; vary important conditions with
-finite local bounds, tracked references/displacement and unchanged P16/I0/D32 first.
-An evidence-supported selected setting comparison may be temporary, narrow and
-verified/restored through the existing supported volatile mechanism. No blind gain
-sweep, firmware/ID/baud/Phase/calibration reset or permanent hardware tuning.
+Root alone operates devices, SSH, cameras, Git and staging. Reuse the current idle
+candidate and existing provider, console, operation helper, analyzer, tests, native
+mock environment, builders and stager. Stage only stopped affected owners; retain
+exact separate pins/private permissions/typed native history and matched rollback.
+A reporting/view error is not Stop and must not duplicate Start. Required-image
+loss must use genuine source age and fresh same-run recovery with executor ACK,
+original deadline, at most3 bounded episodes and Pause/Stop precedence.
 
-Reuse current idle candidate, existing finite provider, a small validated selected
-parameter interface, normal virtual controls, native evidence/analyzer/stager/tests.
-Root alone operates devices/camera/SSH/Git/staging. Hold uninvolved joint targets,
-body/lift zero after startup unless a separately declared supported slow pose change
-is necessary and within current feedback/limits/visible clearance. Do not move the
-base or force motion through contact. Start fresh measured poses after known cleanup,
-track total displacement and preserve old return errors without manual raw2472 matching.
-The elbow inspection, camera adjustment and trusted certificate repair are completed;
-do not ask for them again unless a concrete new unavailable action is demonstrated.
-
-AM1 wireless; P1 advisory and existing real Pi-local required-camera policy retained;
-AM2 untouched. No Ethernet/network tuning, new architecture/framework, broad installer,
-mechanical wear campaign, physical leaders, autoplay, merge/retarget/force/history
-rewrite or private credential/image publication. Stage only stopped affected owners;
-preserve exact separate pins/private ACL/calibration/history and matched rollback.
-Check actual full serialized status/control when evidence changes; do focused tests,
-changed-interface review/native verification, and narrow correction rechecks.
-
+Persist only the existing idle owner/gateway/local worker, with no motor/camera
+initialization or automatic Start/replay. Reboot only after known cleanup/no task.
+AM1 wireless; P1 advisory; AM2 untouched. Pi recovery, camera framing and generic
+elbow inspection are completed. No manual positioning/leaders/readiness questions,
+network tuning, new architecture/framework, permanent tuning, merge/retarget/force/
+history rewrite or credential/household-image publication is authorized.
 Durability means software fault tolerance, connection/control continuity, state
 preservation and recovery with minimal human intervention, not mechanical lifespan.
-Keep program completion, visible response, measured movement, return accuracy and
-repeatability distinct. Useful repeated movement is the completion condition; the
-broader genuine physical required-input-loss recovery remains a separate milestone.
-
-Verified packet06 outcome: two successive measured coarse out-and-back cycles
-under the separately pinned +10/10-second-ramp/2-second-dwell/150 mA condition
-and 45-tick moving-response boundary. Trials06/07 measured73/56/17 and75/58/17
-outward/reverse/residual ticks. The second completed normally across browser
-closure and reattachment with its original run, seed and deadline preserved.
-Useful repeated control is established for this tested condition; the separate
-2-tick fine-return criterion failed. See the current protected physical-session
-record for exact source/deployment/rollback pins and retained failures.
-
+Packet06 trials06/07 remain73/56/17 and75/58/17 ticks from different fresh origins;
+only trial07 completed its owner lifecycle. Neither proves fine2 or required-input
+recovery. Full accepted results and older restrictions remain historical in docs.
 ## Historical AM1 visible positive-control continuation (superseded for new packet06)
 
 AM1-VISIBLE-CONTROL-04 has one actual bounded comparison, f7e7ae6d-d305-448a-90b6-5f2ae3bc8b19.

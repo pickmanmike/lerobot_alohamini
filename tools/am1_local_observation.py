@@ -7,8 +7,10 @@ import io
 import ipaddress
 import json
 import math
+import os
 import re
 import socket
+import stat
 import subprocess
 import threading
 import time
@@ -370,6 +372,64 @@ class LocalObservationWorker:
         self.current = None
         self.last_logged = self.last_sent = None
         self.log_records = self.log_bytes = 0
+        self._delivery_pause = None
+
+    def _delivery_paused(self, request, now):
+        """One private, immutable one-second interruption of this exact local request."""
+        from tools.am1_session_ipc import strict_json
+
+        if not isinstance(request, dict) or request.get("active") is not True or not finite_time(now):
+            return False
+        if any(request.get(key) != self.source[key] for key in LOCAL_SOURCE_KEYS):
+            return False
+        binding = tuple(request.get(key) for key in LOCAL_BINDING_KEYS)
+        if self._delivery_pause is not None and self._delivery_pause[0] == binding:
+            return self._delivery_pause[1] <= now < self._delivery_pause[2]
+        path = self.directory / "pause-delivery"
+        try:
+            if path.is_symlink():
+                return False
+            descriptor = os.open(
+                path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+            )
+            with os.fdopen(descriptor, "rb") as stream:
+                info = os.fstat(stream.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_size > 4096:
+                    return False
+                raw = stream.read(4097)
+            if not raw:
+                # Preserve the original manual boundary only for non-owned diagnostics.
+                return request.get("require_owned_session") is False
+            if (
+                len(raw) > 4096
+                or os.name != "nt"
+                and (info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600)
+            ):
+                return False
+            marker = strict_json(raw)
+            if not isinstance(marker, dict) or set(marker) != {
+                "schema_version",
+                "started_at_monotonic_s",
+                "expires_at_monotonic_s",
+                *LOCAL_BINDING_KEYS,
+            }:
+                return False
+            began, expires = marker["started_at_monotonic_s"], marker["expires_at_monotonic_s"]
+            if not (
+                type(marker["schema_version"]) is int
+                and marker["schema_version"] == 1
+                and all(marker[key] == request.get(key) for key in LOCAL_BINDING_KEYS)
+                and finite_time(began)
+                and finite_time(expires)
+                and expires == began + 1.0
+                and finite_time(request.get("started_at"))
+                and request["started_at"] <= began <= now < expires
+            ):
+                return False
+            self._delivery_pause = (binding, began, expires)
+            return True
+        except (OSError, ValueError, TypeError, KeyError, UnicodeError):
+            return False
 
     async def sync(self, evidence):
         from tools.am1_session_ipc import encode
@@ -417,7 +477,7 @@ class LocalObservationWorker:
                         self.receiver = LocalReceiver(self.directory / request["generation"], request)
                         self.last_logged = self.last_sent = None
                         self.log_records = self.log_bytes = 0
-                    if not (self.directory / "pause-delivery").exists():
+                    if not self._delivery_paused(request, time.monotonic()):
                         async with session.get(
                             self.config["url"],
                             headers={"Authorization": authorization},

@@ -79,7 +79,10 @@ def test_actual_owner_consumes_decoded_frame_while_owner_mutex_is_busy(tmp_path)
         owner.authority.close()
 
 
-def test_authenticated_socket_delivery_avoids_saturated_owner_slots_and_threads(tmp_path):
+@pytest.mark.parametrize("finite_expiry", [False, True])
+def test_authenticated_socket_delivery_avoids_saturated_owner_slots_and_threads(
+    tmp_path, monkeypatch, finite_expiry
+):
     async def scenario():
         # Match the constrained Pi pool: six ordinary plus two protective waiters.
         asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=8))
@@ -135,6 +138,44 @@ def test_authenticated_socket_delivery_avoids_saturated_owner_slots_and_threads(
                         0.2,
                     )
                     delivered_promptly = True
+                    if finite_expiry:
+                        import json
+
+                        worker, _, _, marker = finite_delivery_worker(tmp_path / "finite", monkeypatch)
+                        began = clock()
+                        marker.update({key: box.request[key] for key in marker if key in box.request})
+                        marker.update(started_at_monotonic_s=began, expires_at_monotonic_s=began + 1.0)
+                        (worker.directory / "pause-delivery").write_text(json.dumps(marker))
+                        assert worker._delivery_paused(box.request, clock())
+                        clock.advance(0.501)
+                        expired = await asyncio.wait_for(
+                            client.request(
+                                {"op": "observation_sync", "evidence": None}, "observation-worker"
+                            ),
+                            0.2,
+                        )
+                        assert not expired["consumption"]["qualified"]
+                        assert expired["consumption"]["arrived_at"] == frame["arrived_at"]
+                        assert expired["consumption"]["age_s"] > 0.5
+                        clock.now = began + 1.0
+                        assert not worker._delivery_paused(box.request, clock())
+                        receiver = LocalReceiver(tmp_path / "new-pixels", box.request, clock=clock)
+                        for sequence in range(4, 7):
+                            current_headers = headers(
+                                clock, sequence, frame["owner_generation"], frame["capture_generation"]
+                            )
+                            current_headers["X-Camera-Owned-Session"] = box.request["run_id"]
+                            assert receiver.accept(jpeg(), current_headers)
+                            resumed = await asyncio.wait_for(
+                                client.request(
+                                    {"op": "observation_sync", "evidence": receiver.evidence()},
+                                    "observation-worker",
+                                ),
+                                0.2,
+                            )
+                            assert resumed["consumption"]["qualified"] is (sequence == 6)
+                            clock.advance(0.11)
+                        assert resumed["consumption"]["arrived_at"] > frame["arrived_at"]
                 except TimeoutError:
                     clock.advance(0.55)
             await asyncio.gather(*pending, return_exceptions=True)
@@ -145,7 +186,7 @@ def test_authenticated_socket_delivery_avoids_saturated_owner_slots_and_threads(
         assert result["consumption"]["qualified"]
         assert result["consumption"]["arrived_at"] == frame["arrived_at"]
         assert result["consumption"]["decoded_at"] == frame["decoded_at"]
-        assert result["consumption"]["consumed_at"] == clock()
+        assert result["consumption"]["consumed_at"] == frame["decoded_at"]
 
     asyncio.run(scenario())
 
@@ -430,3 +471,193 @@ def test_worker_delivers_actual_decode_before_existing_pacing_sleep(tmp_path, mo
     monkeypatch.setattr(local.asyncio, "sleep", pacing)
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(worker.run())
+
+
+def finite_delivery_worker(tmp_path, monkeypatch, *, owned=True):
+    from tools import am1_local_observation as local
+    from tools.am1_camera_viewer import write_private
+
+    clock = Clock()
+    box = LocalObservationMailbox(source(), clock=clock, require_owned_session=owned)
+    box.begin(str(uuid4()), 90)
+    credentials = tmp_path / "credentials.json"
+    write_private(credentials, {"username": "fixture", "password": "fixture-password"})
+    monkeypatch.setattr(local, "validate_local_endpoint", lambda *_: None)
+    worker = LocalObservationWorker(
+        {
+            "owner_state": str(tmp_path / "owner"),
+            "state": str(tmp_path / "worker"),
+            "url": "http://127.0.0.1:9999/api/frame.jpeg?src=chest",
+            "credentials": str(credentials),
+            "source": source(),
+        }
+    )
+    marker = {key: box.request[key] for key in local.LOCAL_BINDING_KEYS}
+    marker.update(schema_version=1, started_at_monotonic_s=0.0, expires_at_monotonic_s=1.0)
+    write_private(worker.directory / "pause-delivery", marker)
+    return worker, box, clock, marker
+
+
+def test_finite_delivery_marker_expires_locally_without_removal_or_timestamp_renewal(tmp_path, monkeypatch):
+    worker, box, clock, _ = finite_delivery_worker(tmp_path, monkeypatch)
+    receiver = LocalReceiver(tmp_path / "pixels", box.request, clock=clock)
+    owner, capture = str(uuid4()), str(uuid4())
+    for seq in range(1, 4):
+        clock.advance(0.11)
+        packet = headers(clock, seq, owner, capture)
+        packet["X-Camera-Owned-Session"] = box.request["run_id"]
+        assert receiver.accept(jpeg(), packet)
+        box.publish(receiver.evidence())
+    original = box.evidence()
+    assert original["qualified"] and worker._delivery_paused(box.request, clock())
+    clock.advance(0.501)
+    box.publish(receiver.evidence())
+    assert not box.evidence()["qualified"]
+    assert receiver.evidence()["arrived_at"] == original["arrived_at"]
+    assert receiver.evidence()["decoded_at"] == original["decoded_at"]
+    assert worker._delivery_paused(box.request, 0.999)
+    assert not worker._delivery_paused(box.request, 1.0)
+    assert (worker.directory / "pause-delivery").exists()
+    clock.now = 1.01
+    for seq in range(4, 7):
+        packet = headers(clock, seq, owner, capture)
+        packet["X-Camera-Owned-Session"] = box.request["run_id"]
+        assert receiver.accept(jpeg(), packet)
+        box.publish(receiver.evidence())
+        if seq < 6:
+            assert not box.evidence()["qualified"]
+        clock.advance(0.11)
+    assert box.evidence()["qualified"] and box.evidence()["arrived_at"] > original["arrived_at"]
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "extra",
+        "version_bool",
+        "version",
+        "run",
+        "generation",
+        "source",
+        "machine",
+        "device",
+        "role",
+        "framing",
+        "started_bool",
+        "expires_bool",
+        "nan",
+        "infinity",
+        "negative",
+        "future",
+        "before_request",
+        "long",
+        "short",
+        "duplicate",
+        "malformed",
+        "oversize",
+        "empty",
+        "inactive",
+    ],
+)
+def test_finite_delivery_marker_refuses_foreign_malformed_or_unbounded_input(tmp_path, monkeypatch, bad):
+    import json
+
+    from tools.am1_camera_viewer import write_private
+
+    worker, box, clock, marker = finite_delivery_worker(tmp_path, monkeypatch)
+    request = box.request
+    raw = None
+    if bad == "extra":
+        marker["unknown"] = 1
+    elif bad == "version_bool":
+        marker["schema_version"] = True
+    elif bad == "version":
+        marker["schema_version"] = 2
+    elif bad in {"run", "generation"}:
+        marker["run_id" if bad == "run" else "generation"] = str(uuid4())
+    elif bad in {"source", "machine", "device", "role", "framing"}:
+        marker["framing_revision" if bad == "framing" else bad] = "foreign"
+    elif bad == "started_bool":
+        marker["started_at_monotonic_s"] = False
+    elif bad == "expires_bool":
+        marker["expires_at_monotonic_s"] = True
+    elif bad == "nan":
+        raw = json.dumps(dict(marker, started_at_monotonic_s=float("nan")))
+    elif bad == "infinity":
+        raw = json.dumps(dict(marker, expires_at_monotonic_s=float("inf")))
+    elif bad == "negative":
+        marker.update(started_at_monotonic_s=-1.0, expires_at_monotonic_s=0.0)
+    elif bad == "future":
+        marker.update(started_at_monotonic_s=1.0, expires_at_monotonic_s=2.0)
+    elif bad == "before_request":
+        request["started_at"] = 0.1
+    elif bad == "long":
+        marker["expires_at_monotonic_s"] = 1.001
+    elif bad == "short":
+        marker["expires_at_monotonic_s"] = 0.999
+    elif bad == "duplicate":
+        raw = json.dumps(marker)[:-1] + ',"schema_version":1}'
+    elif bad == "malformed":
+        raw = "not JSON"
+    elif bad == "oversize":
+        raw = json.dumps(marker) + " " * 4097
+    elif bad == "empty":
+        raw = ""
+    elif bad == "inactive":
+        request["active"] = False
+    path = worker.directory / "pause-delivery"
+    if raw is None:
+        path.unlink()
+        write_private(path, marker)
+    else:
+        path.write_text(raw)
+        path.chmod(0o600)
+    assert not worker._delivery_paused(request, clock())
+
+
+def test_finite_delivery_latch_cannot_be_extended_or_reused_by_later_task(tmp_path, monkeypatch):
+    import json
+
+    worker, box, _, marker = finite_delivery_worker(tmp_path, monkeypatch)
+    assert worker._delivery_paused(box.request, 0.0)
+    marker.update(started_at_monotonic_s=0.8, expires_at_monotonic_s=1.8)
+    (worker.directory / "pause-delivery").write_text(json.dumps(marker))
+    assert worker._delivery_paused(box.request, 0.9)
+    assert not worker._delivery_paused(box.request, 1.0)
+    assert not worker._delivery_paused(box.request, 1.2)
+    box.stop()
+    assert not worker._delivery_paused(box.request, 0.9)
+    box.begin(str(uuid4()), 90)
+    assert not worker._delivery_paused(box.request, 0.9)
+
+
+def test_empty_delivery_marker_is_only_legacy_nonowned_diagnostic(tmp_path, monkeypatch):
+    worker, box, _, _ = finite_delivery_worker(tmp_path, monkeypatch, owned=False)
+    (worker.directory / "pause-delivery").write_bytes(b"")
+    assert worker._delivery_paused(box.request, 0.0)
+    box.require_owned_session = True
+    box.begin(str(uuid4()), 90)
+    assert not worker._delivery_paused(box.request, 0.0)
+
+
+@pytest.mark.skipif(__import__("os").name == "nt", reason="native POSIX marker ownership/mode checks")
+@pytest.mark.parametrize("bad", ["mode", "owner", "symlink", "directory"])
+def test_finite_delivery_marker_requires_actual_private_regular_owned_file(tmp_path, monkeypatch, bad):
+    import os
+
+    from tools import am1_local_observation as local
+
+    worker, box, _, _ = finite_delivery_worker(tmp_path, monkeypatch)
+    path = worker.directory / "pause-delivery"
+    if bad == "mode":
+        path.chmod(0o644)
+    elif bad == "owner":
+        monkeypatch.setattr(local.os, "getuid", lambda: os.stat(path).st_uid + 1)
+    elif bad == "symlink":
+        target = worker.directory / "other-marker"
+        path.rename(target)
+        path.symlink_to(target)
+    else:
+        path.unlink()
+        path.mkdir()
+    assert not worker._delivery_paused(box.request, 0.0)

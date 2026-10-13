@@ -38,3 +38,16 @@ test("selected completed program reports the actual separate movement verdict",(
   assert.match(transport.constructor.outcomeText(run),/coarse movement passed/);
   assert.equal(transport.constructor.outcomeText({...run,status:"running"}),null);
 });
+test("named coarse bench preset uses the existing selected recipe and immutable schema2 Start",async()=>{
+  const data={...descriptor(),schema_version:2,envelope_sha256:"b".repeat(64),excursion_norm:10,
+    current_cap_ma:150,live_ceiling_s:90,goal_readback_checkpoints_s:[5,37],cycle_count:2,intercycle_hold_s:6};
+  const requests=[],transport=fixture(async(url,options)=>{requests.push(JSON.parse(options.body));return {ok:true,json:async()=>({accepted:true})};});
+  transport.snapshot={presets:[{id:"left-elbow-coarse-bench-v1",version:1,label:"Two cycles",recipe,selected_experiment:data}]};
+  await transport.startPreset("left-elbow-coarse-bench-v1");
+  assert.equal(requests.length,1);assert.equal(requests[0].recipe,recipe);
+  assert.deepEqual(requests[0].selected_experiment,data);
+  await assert.rejects(()=>transport.startPreset("missing"),/preset/i);
+  for(const bad of [{...data,cycle_count:3},{...data,intercycle_hold_s:7},{...data,unknown:1}])
+    await assert.rejects(()=>transport.start(recipe,null,bad),/experiment/i);
+  assert.equal(requests.length,1);
+});

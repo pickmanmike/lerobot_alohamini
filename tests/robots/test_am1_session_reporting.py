@@ -1,6 +1,7 @@
 """Real bounded IPC frames and gateway reporting without hardware owners."""
 
 import asyncio
+import base64
 import copy
 import hashlib
 import json
@@ -13,6 +14,21 @@ import pytest
 
 from tools import am1_session_ipc as ipc
 from tools.am1_session_service import Gateway
+
+
+def native_status_field(authority, reference):
+    """Rehydrate exact typed native evidence through the bounded shared read contract."""
+    raw = bytearray()
+    while len(raw) < reference["bytes"]:
+        reply = authority.snapshot_detail(
+            dict(op="snapshot", reference=reference, offset=len(raw), limit=8192)
+        )
+        assert reply["reference"] == reference and reply["offset"] == len(raw)
+        data = base64.b64decode(reply["data"], validate=True)
+        assert reply["length"] == len(data) and 0 < len(data) <= 8192
+        raw.extend(data)
+    assert len(raw) == reference["bytes"] and hashlib.sha256(raw).hexdigest() == reference["sha256"]
+    return ipc.strict_json(raw)
 
 
 def oversized_result(accepted=True):
@@ -300,10 +316,9 @@ def test_saved_native_typed_terminal_record_full_snapshot_socket(name, record_pr
     reply, calls = asyncio.run(exchange(result, {"op": "snapshot"}))
     assert reply == result and calls == []
     assert reply["snapshot"]["run"]["execution"]["recovery"]["target_attained"] is False
-    assert (
-        reply["snapshot"]["run"]["physical_result"]["readback"]["readback"]["elbow_integral"]["state"]
-        == "restored"
-    )
+    retained = native_status_field(authority, reply["snapshot"]["run"]["details_reference"])
+    assert retained == original
+    assert retained["physical_result"]["readback"]["readback"]["elbow_integral"]["state"] == "restored"
     assert authority.run == original and authority._evidence() == evidence
 
 
@@ -461,7 +476,9 @@ def test_legitimate_positive_full_phase_record_fits_snapshot_and_socket(state, r
     record_property(state + "_full_wrapped_bytes", full_size)
     reply, calls = asyncio.run(exchange(result, {"op": "snapshot"}))
     assert calls == [] and reply == result
-    outcome = reply["snapshot"]["run"]["execution"]["positive_control"]
+    retained = native_status_field(authority, reply["snapshot"]["run"]["details_reference"])
+    assert retained == original
+    outcome = retained["execution"]["positive_control"]
     assert outcome["program_completed"] is complete
     if complete:
         assert set(outcome["phase_coverage"]) == {
@@ -475,20 +492,21 @@ def test_legitimate_positive_full_phase_record_fits_snapshot_and_socket(state, r
         assert outcome["coarse_functional_pass"] is (state != "completed-static")
         public_receipt = reply["snapshot"]["run"]["completion_receipt"]
         assert "execution" not in public_receipt
-        reference = public_receipt["execution_reference"]
-        assert reference["kind"] == "am1-finite-completion-execution-reference" and reference["version"] == 1
-        assert reference["field"] == "run.execution"
+        reference = reply["snapshot"]["run"]["details_reference"]
+        assert reference["kind"] == "am1-status-field-reference" and reference["version"] == 1
+        assert reference["field"] == "run"
         assert (
             reference["sha256"]
             == hashlib.sha256(
-                json.dumps(execution, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+                json.dumps(original, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
             ).hexdigest()
         )
-        assert reply["snapshot"]["evidence"]["finite_completion"]["execution_reference"] == reference
-        assert {k: v for k, v in public_receipt.items() if k != "execution_reference"} == {
-            k: v for k, v in original["completion_receipt"].items() if k != "execution"
-        }
-        assert reply["snapshot"]["run"]["execution"] == original["execution"]
+        assert (
+            native_status_field(authority, reply["snapshot"]["evidence"]["details_reference"])
+            == original_evidence
+        )
+        assert retained["completion_receipt"] == original["completion_receipt"]
+        assert retained["execution"] == original["execution"]
         assert set(outcome["phase_receipts"]) == {"baseline", "cycle1_endpoint", "cycle1_origin"}
         assert all(
             r["run_id"] == run["run_id"] and r["trace"]["response_complete"] is True
@@ -594,20 +612,13 @@ def test_actual_selected_finishing_proof_fits_without_premature_cleanup(phase, r
     assert public_run["status"] == "finishing" and public_run["cleanup"] is None
     assert public_run["requested_terminal"] == "completed" and public_run["uncertain"] is False
     assert public_run["first_cause"] is None and view["evidence"]["lifecycle"]["phase"] == phase
-    assert public_run["execution"] == original["execution"]
-    assert public_run["physical_result"] == original["physical_result"]
+    retained = native_status_field(authority, public_run["details_reference"])
+    assert retained == original and retained["execution"] == original["execution"]
+    assert retained["physical_result"] == original["physical_result"]
     assert len(public_run["physical_result"]["readback"]["readback"]["readbacks"]) == 20
-    reference = public_run["completion_receipt"]["execution_reference"]
-    assert reference["field"] == "run.execution"
-    assert (
-        reference["sha256"]
-        == hashlib.sha256(
-            json.dumps(run["execution"], sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest()
-    )
-    assert view["evidence"]["finite_completion"]["execution_reference"] == reference
     assert "execution" not in public_run["completion_receipt"]
     assert "execution" not in view["evidence"]["finite_completion"]
+    assert native_status_field(authority, view["evidence"]["details_reference"]) == original_evidence
     assert authority.run == original and authority._evidence() == original_evidence
 
 
@@ -738,21 +749,11 @@ def test_actual_selected_retained_idle_proof_fits_socket_without_current_complet
         assert result["status"] == "snapshot" and result["accepted"] is True
         view = result["snapshot"]
         record_property("actual06_retained_idle_socket_result_bytes", len(ipc.encode(result)))
-        assert view["evidence"] == evidence
+        assert native_status_field(authority, view["evidence"]["details_reference"]) == evidence
         assert view["evidence"]["finite_completion"] is None
-        public = copy.deepcopy(view["run"])
+        assert view["evidence"]["accepted_host_action"] == {}
+        public = native_status_field(authority, view["run"]["details_reference"])
         assert public["execution"] == original["execution"]
-        reference = public["completion_receipt"].pop("execution_reference")
-        assert reference["field"] == "run.execution"
-        assert (
-            reference["sha256"]
-            == hashlib.sha256(
-                json.dumps(original["execution"], sort_keys=True, separators=(",", ":")).encode()
-            ).hexdigest()
-        )
-        public["completion_receipt"]["execution"] = copy.deepcopy(public["execution"])
-        public.pop("remaining_s")
-        public.pop("trajectory_remaining_s")
         assert json.dumps(public, sort_keys=True) == json.dumps(original, sort_keys=True)
         assert authority.run == original and authority.executor.evidence() == evidence
         assert authority.executor.worker is None and authority.executor._reconciliation_worker is None
@@ -914,7 +915,7 @@ def test_compact_http_json_preserves_typed_masked_strings_and_rejects_nonfinite(
 
     value = {
         "masked": "<masked>",
-        "text": "literal spaces : ,\n雪",
+        "text": "literal spaces : ,\né›ª",
         "int": 1,
         "float": 1.0,
         "boolean": True,
