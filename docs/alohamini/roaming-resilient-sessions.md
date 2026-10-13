@@ -8,14 +8,17 @@ below remain historical. Exact deployed and prepared versions are recorded below
 
 
 **Current continuation: [AM1-ELBOW-TO-COMPLETION-06](protected-physical-sessions.md#am1-elbow-to-completion-06-results-and-status).**
-The loop captured exact117/104 mA fault acquisitions, negative movement and partial
-positive return, and repaired camera delivery plus measured-startup response-guard
-integration. Final reviewed/native checks pass; useful repeated out-and-back
-control remains unresolved. Pi SSH/gateway became unreachable from both Duffy and
-P1 before staging the next correction. The linked record separates deployed and
-prepared pins, retains all earlier failures and describes the pending150 mA finite
-condition. P1 remains advisory; strict freshness and software durability remain
-in scope. No network or architecture change is proposed for this access failure.
+Pi access returned after the owner's update/recovery, and the reviewed startup
+correction is deployed. Trial04 refused during lift baseline with known cleanup.
+Trial05 started normally and moved the elbow2312→2384:72 positive ticks, with actual
+live-goal acceptance and original P1 linkage-pivot evidence. The deployed30-tick
+response guard then refused at91 mA/error38 after only2 ticks in1.203 seconds,
+before reversal; owner feedback_loss followed. Required local imagery stayed
+qualified and all20 zero/lift/bus/camera cleanup evidence is retained. A separately
+pinned150 mA/45-tick moving condition is implemented and reviewed, not deployed; the3-tick/
+1.2-second rule and fixed30-tick startup drift boundary remain. The linked record
+contains exact deployed/rollback pins and all prior failures. Useful repeated
+out-and-back control is unresolved; angular precision and reversal remain unproved.
 
 **Retained AM1-VISIBLE-CONTROL-04:** One unchanged-I0 positive comparison started normally,
 then faulted at5.9 seconds at the selected100 mA sampled-current guard. All182

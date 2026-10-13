@@ -911,7 +911,7 @@ class AM1SelectedJointEvidence:
             self._response_refuse(robot, "Selected response startup frozen hold changed")
         elif now - startup["started_at"] >= 20:
             self._response_refuse(robot, "Selected response startup measured hold exceeded 20 seconds")
-        elif abs(position["raw"] - startup["goal_raw"]) >= definition.response_rule["commanded_error_raw"]:
+        elif abs(position["raw"] - startup["goal_raw"]) >= definition.startup_hold_error_raw:
             self._response_refuse(robot, "Selected response startup held position left tracking bound")
 
     def _guard_response_startup_hold(self, robot, control, marker, definition, position, current):
@@ -929,7 +929,7 @@ class AM1SelectedJointEvidence:
             self._response_refuse(robot, "Selected response startup active hold is unavailable")
         if now - startup["started_at"] >= 20:
             self._response_refuse(robot, "Selected response startup measured hold exceeded 20 seconds")
-        if abs(position["raw"] - startup["goal_raw"]) >= definition.response_rule["commanded_error_raw"]:
+        if abs(position["raw"] - startup["goal_raw"]) >= definition.startup_hold_error_raw:
             self._response_refuse(robot, "Selected response startup held position left tracking bound")
         if (not all(_number(action.get(k)) for k in
                     ("write_started_at_monotonic_s", "write_completed_at_monotonic_s"))

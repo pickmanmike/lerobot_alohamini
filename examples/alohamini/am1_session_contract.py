@@ -522,6 +522,20 @@ SELECTED_ELBOW_EXPERIMENT_RESPONSE_ENVELOPE_SHA256 = hashlib.sha256(json.dumps(
     separators=(",", ":"),
 ).encode()).hexdigest()
 
+# The positive trial moved 72 raw ticks, then held a measured 38..41 tick
+# command gap. This separate diagnostic condition permits investigating its intended reversal
+# without changing effort, exposure, waveform or the original startup hold bound.
+SELECTED_ELBOW_EXPERIMENT_TRACKING_ENVELOPE = MappingProxyType({
+    **dict(SELECTED_ELBOW_EXPERIMENT_RESPONSE_ENVELOPE),
+    "scope": "AM1-ELBOW-TO-COMPLETION-06/evidence-supported-endpoint-tracking",
+    "response_commanded_error_raw": 45,
+    "startup_hold_error_raw": 30,
+})
+SELECTED_ELBOW_EXPERIMENT_TRACKING_ENVELOPE_SHA256 = hashlib.sha256(json.dumps(
+    dict(SELECTED_ELBOW_EXPERIMENT_TRACKING_ENVELOPE), sort_keys=True, allow_nan=False,
+    separators=(",", ":"),
+).encode()).hexdigest()
+
 
 @dataclass(frozen=True)
 class SelectedElbowExperiment:
@@ -554,6 +568,7 @@ class SelectedElbowExperiment:
         envelopes = {
             SELECTED_ELBOW_EXPERIMENT_ENVELOPE_SHA256: SELECTED_ELBOW_EXPERIMENT_ENVELOPE,
             SELECTED_ELBOW_EXPERIMENT_RESPONSE_ENVELOPE_SHA256: SELECTED_ELBOW_EXPERIMENT_RESPONSE_ENVELOPE,
+            SELECTED_ELBOW_EXPERIMENT_TRACKING_ENVELOPE_SHA256: SELECTED_ELBOW_EXPERIMENT_TRACKING_ENVELOPE,
         }
         if (type(self.schema_version) is not int or self.schema_version != 1
                 or type(self.envelope_sha256) is not str or self.envelope_sha256 not in envelopes):
@@ -587,6 +602,8 @@ class SelectedElbowExperiment:
             "minimum_response_raw": e["response_minimum_raw"],
             "window_s": e["response_window_s"],
         }))
+        object.__setattr__(self, "_startup_hold_error_raw", None if "response_window_s" not in e
+                           else e.get("startup_hold_error_raw", 30))
 
     @classmethod
     def from_payload(cls, value):
@@ -612,6 +629,10 @@ class SelectedElbowExperiment:
     @property
     def response_rule(self):
         return self._response_rule
+
+    @property
+    def startup_hold_error_raw(self):
+        return self._startup_hold_error_raw
 
     @property
     def nominal_trajectory_s(self):

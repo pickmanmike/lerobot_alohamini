@@ -13,10 +13,12 @@ from tests.robots.test_alohamini_lift_motor_feedback import status
 from tests.robots.test_am1_selected_joint_evidence import context, visible_register_packet, visible_robot
 
 
-def descriptor(*, historical=False, **changes):
+def descriptor(*, historical=False, tracking=False, **changes):
     name = (
         "SELECTED_ELBOW_EXPERIMENT_ENVELOPE_SHA256"
         if historical
+        else "SELECTED_ELBOW_EXPERIMENT_TRACKING_ENVELOPE_SHA256"
+        if tracking
         else "SELECTED_ELBOW_EXPERIMENT_RESPONSE_ENVELOPE_SHA256"
     )
     pin = getattr(contract, name, None)
@@ -38,18 +40,31 @@ def descriptor(*, historical=False, **changes):
     )
 
 
-def guarded(monkeypatch, *, historical=False, excursion=10.0):
+def guarded(
+    monkeypatch, *, historical=False, excursion=10.0, tracking=False, reference=0.0, calibration=None
+):
+    material = calibration or {"drive_mode": 0, "homing_offset": 1845, "range_min": 1000, "range_max": 3000}
+    seed_raw = contract.SelectedElbowExperiment.encoded_goal(reference, material)
+    registers = {
+        "range_min": material["range_min"],
+        "range_max": material["range_max"],
+        "goal": seed_raw,
+        "present": seed_raw,
+    }
     obj, evidence, rows, identity, port, reads, writes = visible_robot(
         monkeypatch,
         [
-            status(visible_register_packet(), motor_id=3),
+            status(visible_register_packet(**registers), motor_id=3),
             status(bytes([91]), motor_id=3),
-            status(visible_register_packet(torque=1), motor_id=3),
+            status(visible_register_packet(torque=1, **registers), motor_id=3),
             status(bytes([91]), motor_id=3),
         ],
     )
 
-    definition = descriptor(historical=historical, excursion_norm=excursion)
+    obj.left_bus.calibration["arm_left_elbow_flex"] = type(obj.left_bus.calibration["arm_left_elbow_flex"])(
+        id=3, **material
+    )
+    definition = descriptor(historical=historical, tracking=tracking, excursion_norm=excursion)
     obj._am1_selected_elbow_experiment = definition
     identity.update(recipe=definition.recipe_name, experiment_sha256=definition.sha256)
     now = [0.5]
@@ -64,8 +79,9 @@ def guarded(monkeypatch, *, historical=False, excursion=10.0):
     sequence = [0]
     original_counts = (len(port.writes), len(reads), len(writes), len(rows))
 
-    def tick(at, raw=2000, current=12, progress=None, *, mutate=None, run_guard=True):
+    def tick(at, raw=None, current=12, progress=None, *, mutate=None, run_guard=True):
         now[0] = at
+        raw = seed_raw if raw is None else raw
         progress = 5 + at - 1 if progress is None else progress
         cycle, phase, fraction = definition.phase(progress)
         metadata = context(
@@ -73,12 +89,12 @@ def guarded(monkeypatch, *, historical=False, excursion=10.0):
             progress_s=progress,
             phase=phase,
             cycle=cycle,
-            reference=0.0,
-            endpoint_target=excursion,
-            requested_target=excursion * fraction,
+            reference=reference,
+            endpoint_target=reference + excursion,
+            requested_target=reference + excursion * fraction,
             sample_key=definition.sample_key(progress),
             acquisition_s=0.0,
-            admitted_reference=0.0,
+            admitted_reference=reference,
             experiment_sha256=definition.sha256,
         )
         evidence.prepare(
@@ -100,12 +116,7 @@ def guarded(monkeypatch, *, historical=False, excursion=10.0):
             "requested": metadata["requested_target"],
             "expected_goal_raw": definition.encoded_goal(
                 metadata["requested_target"],
-                {
-                    "drive_mode": 0,
-                    "homing_offset": 1845,
-                    "range_min": 1000,
-                    "range_max": 3000,
-                },
+                material,
             ),
             "sync_write_returned": True,
             "write_started_at_monotonic_s": at - 0.03,
@@ -113,7 +124,10 @@ def guarded(monkeypatch, *, historical=False, excursion=10.0):
         }
         obj._am1_selected_joint_position = {
             "raw": raw,
-            "normalized": (raw - 1000) / 10 - 100,
+            "normalized": (raw - material["range_min"])
+            / (material["range_max"] - material["range_min"])
+            * 200
+            - 100,
             "read_started_at_monotonic_s": at - 0.02,
             "read_completed_at_monotonic_s": at - 0.01,
         }
@@ -148,10 +162,10 @@ def guarded(monkeypatch, *, historical=False, excursion=10.0):
     )
 
 
-def startup_fixture(monkeypatch):
+def startup_fixture(monkeypatch, *, tracking=False):
     from lerobot.robots.alohamini import alohamini as robot_module
 
-    g = guarded(monkeypatch)
+    g = guarded(monkeypatch, tracking=tracking)
     g.control.state, g.control.epoch, g.control.intent_revision = "paused", 1, 0
     monkeypatch.setattr(robot_module.time, "monotonic", lambda: g.now[0])
     startup_observe(g, 0.8)
@@ -285,8 +299,11 @@ def test_startup_hold_20_second_wall_is_not_the_moving_leg_window(monkeypatch):
 
 
 @pytest.mark.parametrize("elapsed,accepted", [(19.999, True), (20.0, False), (20.001, False)])
-def test_first_finite_context_retains_original_startup_deadline_before_send(monkeypatch, elapsed, accepted):
-    g = startup_fixture(monkeypatch)
+@pytest.mark.parametrize("tracking", [False, True])
+def test_first_finite_context_retains_original_startup_deadline_before_send(
+    monkeypatch, elapsed, accepted, tracking
+):
+    g = startup_fixture(monkeypatch, tracking=tracking)
     startup_send(g, startup_action(g), 1.0)
     startup_observe(g, 1.0 + elapsed - 0.01)
     metadata = context(
@@ -462,6 +479,162 @@ def test_separate_150_pin_preserves_literal_initial_envelope_and_payload_shape()
         descriptor(current_cap_ma=150.01)
 
 
+def test_tracking45_is_separately_pinned_with_unchanged_effort_shape_and_startup30():
+    initial, original, tracking = descriptor(historical=True), descriptor(), descriptor(tracking=True)
+    assert initial.envelope_sha256 == "62d3b365458639a3b3f436cb4da9d7314060bf8898c24f3edafd6e87ff73c742"
+    assert original.envelope_sha256 == "069b64bcb205f2ef4c188c804fc3d2f7a622179dfa098496dd71d8de0cf1084f"
+    assert original.response_rule == {"commanded_error_raw": 30, "minimum_response_raw": 3, "window_s": 1.2}
+    assert tracking.envelope_sha256 not in {initial.envelope_sha256, original.envelope_sha256}
+    assert tracking.response_rule == {"commanded_error_raw": 45, "minimum_response_raw": 3, "window_s": 1.2}
+    assert tracking.startup_hold_error_raw == original.startup_hold_error_raw == 30
+    assert set(tracking.payload) == set(original.payload) == set(initial.payload)
+    assert tracking.current_cap_ma == original.current_cap_ma == 150
+    assert tracking.nominal_trajectory_s == original.nominal_trajectory_s == 28
+    assert contract.SelectedElbowExperiment.from_payload(tracking.payload).summary() == tracking.summary()
+    with pytest.raises(ValueError):
+        descriptor(tracking=True, current_cap_ma=150.01)
+
+
+@pytest.mark.parametrize("tracking", [False, True])
+def test_actual05_endpoint_plateau38_40_distinguishes_tracking45_from_original30(monkeypatch, tracking):
+    calibration = {"drive_mode": 0, "homing_offset": 1845, "range_min": 864, "range_max": 3073}
+    reference = (2312 - 864) / 2209 * 200 - 100
+    g = guarded(monkeypatch, tracking=tracking, reference=reference, calibration=calibration)
+    g.tick(10.0, raw=2382, current=12, progress=11.8)
+    g.tick(10.4, raw=2382, current=12, progress=12.2)
+    g.tick(10.8, raw=2383, current=15, progress=12.6)
+    if not tracking:
+        with pytest.raises(RuntimeError, match="response"):
+            g.tick(11.203055786, raw=2384, current=14, progress=12.9)
+        fault = g.robot._am1_selected_joint_fault
+        assert fault["response_boundary"]["signed_response_raw"] == 2
+        assert fault["response_boundary"]["signed_commanded_error_raw"] == 38
+        return
+    g.tick(11.203055786, raw=2384, current=14, progress=12.9)
+    assert g.evidence.response_boundary["status"] == "tracking"
+    assert g.evidence.response_boundary["last_encoded_goal_raw"] == 2422
+    assert g.evidence.response_boundary["signed_commanded_error_raw"] == 38
+    g.tick(11.303055786, raw=2384, current=14, progress=14)
+    assert g.evidence.response_boundary["direction"] == -1
+    assert g.evidence.response_boundary["status"] == "tracking"
+    assert getattr(g.robot, "_am1_selected_joint_fault", None) is None
+
+
+@pytest.mark.parametrize("excursion", [-10.0, 10.0])
+@pytest.mark.parametrize("response", [0, 2, 3])
+def test_tracking45_large_deficit_retains_signed3_response_maxclock1_2_rule(monkeypatch, excursion, response):
+    g = guarded(monkeypatch, tracking=True, excursion=excursion)
+    sign = 1 if excursion > 0 else -1
+    g.tick(1, raw=2000, progress=7)
+    g.tick(1.6, raw=2000 + sign * min(response, 1), current=5, progress=7.6)
+    if response < 3:
+        with pytest.raises(RuntimeError, match="response"):
+            g.tick(2.2, raw=2000 + sign * response, current=4, progress=8.2)
+        boundary = g.robot._am1_selected_joint_fault["response_boundary"]
+        assert boundary["commanded_error_threshold_raw"] == 45
+        assert boundary["signed_response_raw"] == response
+    else:
+        g.tick(2.2, raw=2000 + sign * response, current=4, progress=8.2)
+        assert g.evidence.response_boundary["status"] == "pending"
+        assert g.evidence.response_boundary["anchor_position_raw"] == 2000 + sign * 3
+        assert g.evidence.response_boundary["distinct_sample_count"] == 1
+
+
+@pytest.mark.parametrize("route", ["prepare", "postread"])
+def test_tracking45_startup_still_refuses30_raw_drift_before_another_write(monkeypatch, route):
+    g = startup_fixture(monkeypatch, tracking=True)
+    startup_send(g, startup_action(g), 1)
+    g.now[0] = 1.1
+    g.robot._am1_selected_joint_position.update(
+        raw=2030, normalized=3.0, read_started_at_monotonic_s=1.08, read_completed_at_monotonic_s=1.09
+    )
+    g.robot._am1_selected_joint_current.update(
+        read_started_at_monotonic_s=1.095, read_completed_at_monotonic_s=1.1
+    )
+    before = len(g.writes)
+    with pytest.raises(RuntimeError, match="startup"):
+        if route == "prepare":
+            g.control.apply(g.robot, startup_action(g, sequence=13))
+        else:
+            observation = {}
+            g.control.annotate(observation, acquired_at=1.1)
+            g.evidence.guard_recovery(g.robot, g.control, observation)
+    assert len(g.writes) == before
+
+
+def test_tracking45_jitter_current_dips_and_goal_reduction_do_not_renew_large_error_window(monkeypatch):
+    g = guarded(monkeypatch, tracking=True)
+    g.tick(1, raw=2000, progress=6.5)
+    g.tick(1.1, raw=2002, current=5, progress=6.6)
+    assert g.evidence.response_boundary["status"] == "tracking"
+    assert g.evidence.response_boundary["anchor_position_raw"] == 2000
+    with pytest.raises(RuntimeError, match="response"):
+        g.tick(2.21, raw=2002, current=4, progress=6.7)
+    assert g.robot._am1_selected_joint_fault["response_boundary"]["signed_response_raw"] == 2
+
+
+def test_tracking45_protective_hold_cannot_credit_or_erase_unresolved_movement(monkeypatch):
+    g = guarded(monkeypatch, tracking=True)
+    g.tick(1, progress=7)
+    g.tick(1.6, raw=2003, progress=7.6)
+    assert g.evidence.response_boundary["anchor_position_raw"] == 2003
+    assert g.evidence.deactivate(g.robot) is None
+    g.control.state, g.control.epoch = "paused", 1
+    g.evidence.guard_recovery(g.robot, g.control, {})
+    g.control.state, g.control.epoch = "active", 2
+    with pytest.raises(RuntimeError, match="response"):
+        g.tick(1.7, raw=2006, progress=7.7)
+    fault = g.robot._am1_selected_joint_fault
+    assert fault["response_boundary"]["failure_kind"] == "continuity_lost"
+    assert fault["response_boundary"]["anchor_position_raw"] == 2003
+
+
+def test_tracking45_cap_still_precedes_expired_response_fault(monkeypatch):
+    g = guarded(monkeypatch, tracking=True)
+    g.tick(1, progress=7)
+    with pytest.raises(RuntimeError, match="effort"):
+        g.tick(2.21, current=24, progress=8.21)
+    fault = g.robot._am1_selected_joint_fault
+    assert fault["current"]["ma"] == 156
+    assert fault["effective_limit_ma"] == 150
+    assert fault["source"] == "cached_guard"
+
+
+def test_tracking45_wire_task_provider_and_simulated_measured_verdict_remain_coherent():
+    from examples.alohamini.am1_finite_task import FiniteTask
+    from tests.robots.test_am1_selected_experiment import provider, run_selected
+
+    d = descriptor(
+        tracking=True,
+        excursion_norm=10,
+        ramp_s=10,
+        endpoint_dwell_s=2,
+        current_cap_ma=150,
+        live_ceiling_s=60,
+        minimum_response_raw=56,
+        return_tolerance_raw=22,
+        goal_readback_checkpoints_s=[5, 10],
+    )
+    wire = contract.SelectedElbowExperiment.from_payload(json.loads(json.dumps(d.payload)))
+    assert wire.sha256 == d.sha256 and wire.summary() == d.summary()
+    p = provider(wire)
+    task = FiniteTask(contract.RECIPES[d.recipe_name], p.origin, 0, 3, selected_experiment=wire)
+    assert task.snapshot()["experiment"] == d.summary()
+    assert task.provider.get_action()["left_shoulder_lift.pos"] == 99.8
+    run_selected(p)  # Explicitly simulated measured trajectory, not physical movement.
+    proof = p.positive_control
+    assert proof["experiment"] == d.summary()
+    assert proof["coarse_functional_pass"] is True
+    execution = {
+        "original_seed": p.origin,
+        "progress_s": 28,
+        "cycles_completed": 1,
+        "returns_qualified": 1,
+        "positive_control": proof,
+    }
+    assert d.completion_expectation(execution) == (28, 1, 1)
+
+
 @pytest.mark.parametrize("excursion", [10.0, -10.0])
 def test_moving_goals_and_current_dips_do_not_erase_nonresponse(monkeypatch, excursion):
     g = guarded(monkeypatch, excursion=excursion)
@@ -553,8 +726,9 @@ def test_three_ticks_at_exact_boundary_qualify_with_original_start_and_completio
     assert boundary["last_current_completed_at_monotonic_s"] == 2.2
 
 
-def test_valid_shrinking_pair_skew_cannot_credit_a_late_position_response(monkeypatch):
-    g = guarded(monkeypatch)
+@pytest.mark.parametrize("tracking", [False, True])
+def test_valid_shrinking_pair_skew_cannot_credit_a_late_position_response(monkeypatch, tracking):
+    g = guarded(monkeypatch, tracking=tracking)
 
     def anchor_skew(obj, observation):
         obj._am1_selected_joint_action.update(
@@ -582,9 +756,9 @@ def test_valid_shrinking_pair_skew_cannot_credit_a_late_position_response(monkey
         )
         observation[host.AM1_LOCAL_FEEDBACK_KEY]["read_started_at_monotonic_s"] = 2.22
 
-    g.tick(1.20, progress=5, mutate=anchor_skew)
+    g.tick(1.20, progress=7 if tracking else 5, mutate=anchor_skew)
     with pytest.raises(RuntimeError, match="response"):
-        g.tick(2.231, raw=2003, progress=6.2, mutate=later_skew)
+        g.tick(2.231, raw=2003, progress=8.2 if tracking else 6.2, mutate=later_skew)
     fault = g.robot._am1_selected_joint_fault
     assert fault["source"] == "response_guard"
     assert fault["response_boundary"]["failure_kind"] == "nonresponse"
@@ -681,15 +855,16 @@ def test_endpoint_with97_ticks_and_subthreshold_error_reverses_normally(monkeypa
     assert getattr(g.robot, "_am1_selected_joint_fault", None) is None
 
 
-def test_exact_duplicate_frame_and_clocks_neither_credit_nor_renew_window(monkeypatch):
-    g = guarded(monkeypatch)
-    observation = g.tick(1)
+@pytest.mark.parametrize("tracking", [False, True])
+def test_exact_duplicate_frame_and_clocks_neither_credit_nor_renew_window(monkeypatch, tracking):
+    g = guarded(monkeypatch, tracking=tracking)
+    observation = g.tick(1, progress=7 if tracking else None)
     before = copy.deepcopy(g.evidence.response_boundary)
     g.now[0] = 1.2
     g.evidence.guard_recovery(g.robot, g.control, observation)
     assert g.evidence.response_boundary == before
     with pytest.raises(RuntimeError, match="response"):
-        g.tick(2.21)
+        g.tick(2.21, progress=8.21 if tracking else None)
 
 
 @pytest.mark.parametrize(
