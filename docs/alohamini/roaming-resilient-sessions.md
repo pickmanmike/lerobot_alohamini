@@ -7,8 +7,8 @@ with evidence. Packet06 replaces unsent FAULT-EVIDENCE-05; prior results below r
 historical.
 
 **Current result: [AM1-ELBOW-TO-COMPLETION-06](protected-physical-sessions.md#am1-elbow-to-completion-06-results-and-status).**
-Pi recovery, the separately pinned150 mA/45-tick condition and both Core reporting
-repairs are deployed. Trials06/07 measured 2384→2457→2401 and 2401→2476→2418:
+Pi recovery, the separately pinned150 mA/45-tick condition, both Core reporting
+repairs and the subsequent HTTP-spacing correction are deployed. Trials06/07 measured 2384→2457→2401 and 2401→2476→2418:
 73/75 outward ticks,56/58 reverse ticks and 17-tick residuals against the same56/56/22
 coarse criteria, with maximum 123.5 mA in each. Both native programs reached 28/cycle1/
 qualified return1; the separate2-tick fine-return criterion failed in both.
@@ -34,10 +34,19 @@ the fixed30-tick startup bound and all preceding failures. Useful repeated coars
 movement is demonstrated conditionally; universal performance, required-input-loss
 recovery, angular/fine precision and an exposure-to-servo timing bridge are unqualified.
 
-Final saved actual07 HTTP-wrapper checks found default-spacing overhead67442/67553
-bytes. A reviewed HTTP-only compact encoder passed77 Windows checks and full
-wrappers below65536; native verification and runtime-only staging remain pending.
-The accepted physical movement and browser continuity result remains intact.
+Final saved-actual07 real TLS wrapper reconstructions retained oversized HTTP state/
+attach responses67442/67553 bytes (status200); these are not original live wire captures.
+The HTTP-only whitespace correction passed77 Windows and77 native reporting checks,
+with state63338/attach63445/Owner63429/WSS63408 bytes under the65536-byte bound.
+Service-only stopped staging is complete at runtime145621/manifestfbfb; motor051 and
+Coree666 are unchanged, and physical trial07 remains tied to d08/a971/ec7.
+A trusted authenticated real Pi state GET after staging returned200/no-store/JSON,
+54258 wire bytes, and recovered the whole typed original07 native history exactly.
+Current lifecycle is idle with no current finite-completion evidence; completed
+history survived restart, without a new hardware task or powered trial. Exact pins,
+config and wire hashes are in the linked report. The working packet's conditional
+coarse-movement goal is achieved; fine2-tick return and required-input-loss recovery
+remain unqualified.
 
 **Retained AM1-VISIBLE-CONTROL-04:** One unchanged-I0 positive comparison started normally,
 then faulted at5.9 seconds at the selected100 mA sampled-current guard. All182

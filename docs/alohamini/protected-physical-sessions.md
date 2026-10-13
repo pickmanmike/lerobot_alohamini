@@ -295,13 +295,17 @@ Normal launch and post-run idle verification still require actual full owner sna
 | State | Exact pin |
 |---|---|
 | Reviewed motor/45-tick source | `0b0ce8b9204cc9272e25156c33a62b5cf30a8869` |
-| Reviewed final Core source | `ec7bb3448f1763abd43fd06f4e20b66070d8048b` |
-| Deployed Core file SHA256 | `e6669cfb3f6e2479b9eda9468619cfda572351b24dbe92775e49b81e76bf3660` |
-| Current deployed motor, unchanged through both Core stages | `05191b9eac2ba8d35cc7746aa28d1e9b424f9eef` |
-| Current deployed runtime | `d08adb220d95dce018d3f3349845dc45d767a2cc` |
-| Current deployed manifest | `a971221b263b2d606405d564aafc1a72090dff684ef7d6bf6d17de11ffe6f4ee` |
-| Immediate stopped rollback runtime | `c6a999e7f8a235fbeadaaa50f9691c6847f3bcf8` |
-| Immediate stopped rollback manifest | `9c103328b306161a1bf708e3287155d6b0eebbe359ed4622fb9da5003f1ec109` |
+| Reviewed final Core source, unchanged by service stage | `ec7bb3448f1763abd43fd06f4e20b66070d8048b` |
+| Current reviewed service source candidate | `8b0fa7cb611172fd0d8481386021cd33712c1439` |
+| Deployed Core file SHA256, unchanged | `e6669cfb3f6e2479b9eda9468619cfda572351b24dbe92775e49b81e76bf3660` |
+| Deployed service file SHA256 | `803ab4a3e15491a5bf9d113eb87253c1a358d44577b60e2ac9e5b1b1f5ebeaf6` |
+| Current deployed motor, unchanged through Core and service stages | `05191b9eac2ba8d35cc7746aa28d1e9b424f9eef` |
+| Current deployed runtime | `145621be86492995ff10bf074409dfd745af94f9` |
+| Current deployed manifest | `fbfb23039985d1278e412b64b57a6e89334ac559f5223af1af086382adc091de` |
+| Trial07 runtime and immediate stopped rollback | `d08adb220d95dce018d3f3349845dc45d767a2cc` |
+| Trial07 manifest and immediate stopped rollback | `a971221b263b2d606405d564aafc1a72090dff684ef7d6bf6d17de11ffe6f4ee` |
+| Retained first Core reporting runtime | `c6a999e7f8a235fbeadaaa50f9691c6847f3bcf8` |
+| Retained first Core reporting manifest | `9c103328b306161a1bf708e3287155d6b0eebbe359ed4622fb9da5003f1ec109` |
 | Retained first coarse-cycle runtime | `00a2329323c00cbd26781bc5e00e0943904dae35` |
 | Retained first coarse-cycle manifest | `83b16b66f6bb828bf8e5144a2f0dfc058ec833bbff8587c4da9c87964cfc9956` |
 | Earlier startup rollback motor | `c9c1f0e38aba59ade6f47f762e160e8df4f19dd5` |
@@ -312,12 +316,14 @@ Normal launch and post-run idle verification still require actual full owner sna
 | Earlier retained manifest | `462d0c3e5bf3391ec7d4a83d1a901735d71ba929902d4d45e64f4488112cf535` |
 
 Current verified native private config is 1235 bytes/mode0600/SHA256
-`9a3f5cdb183c15a2758a48da9122ff3c9783722a09037f7df01fb4b8d2f05428`;
+`1394296f749db366fc08063a9da5dafdf1287cc509275e35ed7d577a43f2dc6d`;
 Windows config remains1443 bytes with preserved ACL/SHA256
 `1543fee835edab63ab11008aedc809669d405b4c3b57bf2f2fffebbb390c6f59`.
-Immediate matched stopped rollback retains native config
-`5dce269e13f3b0d64299871b9849a25527c0d2ba03777db3cf731b6fdc00a0f9`
-and the same Windows bytes. The first coarse-cycle version retains native config
+Immediate matched stopped rollback retains the trial07 native config
+`9a3f5cdb183c15a2758a48da9122ff3c9783722a09037f7df01fb4b8d2f05428`
+and the same Windows bytes. The preceding Core-only stage retains native config
+`5dce269e13f3b0d64299871b9849a25527c0d2ba03777db3cf731b6fdc00a0f9`.
+The first coarse-cycle version retains native config
 `54824e2416a5378df98b0a38e1982d632945ec25dbb627a5cdd2af1884f4b687`.
 Earlier startup rollback config hashes remain native
 `565741d7b8bac9575d88db9a720fea689e761cea2226f9ea381ec56b04f2d552` and Windows
@@ -335,24 +341,43 @@ Normal physical deployments, original simulation, private trust/permissions/hist
 matched rollback and predecessor refs/bundles/manifests are retained. Further staging
 or matched rollback requires known cleanup and stopped affected owners. The final
 Core reporting correction is deployed and actual trial07 completed; available idle
-was verified after cleanup.
+was verified after cleanup. The subsequent service-only stage preserves motor/Core
+bytes and the original trial07 record; it was verified by read-only state inspection,
+with no additional powered run or new hardware task.
 PR20 stays draft on19→18→17→16; no merge or history rewrite is authorized.
 
 Durability means software fault tolerance, connection/control continuity, state
 preservation and recovery with minimal human intervention. No hardware-endurance
 or mechanical-lifespan campaign is part of this result.
 
-Final actual07 saved-object transport verification retained HTTP state/attach
-responses67442/67553 bytes (status200), above the requested65536-byte full-wrapper
-bound, while compact Owner/WSS frames remained63429/63408 bytes. These are real
-private socket/TLS reconstructions from the saved decoded public snapshot, not
-original live wire captures. The reviewed Gateway correction compacts only the two
-HTTP snapshot responses; payloads, masking, status, controls and limits are unchanged.
-All77 affected Windows reporting checks passed (69 retained plus8 new); the
-unmodified full helper now measures state63338/attach63445/Owner63429/WSS63408.
-Native77 verification and Service-only stopped staging are pending. The achieved
-physical07 result is unchanged and no additional powered run is required for this
-encoder-only correction.
+Final saved-actual07 transport verification retained HTTP state/attach responses
+67442/67553 bytes (status200), above the requested65536-byte full-wrapper bound,
+while compact Owner/WSS frames remained63429/63408 bytes. These negative findings
+are real private socket/TLS reconstructions from the saved decoded public snapshot,
+not original live wire captures. The reviewed Gateway correction compacts whitespace
+only in the two HTTP snapshot responses; payloads, masking, status, controls and
+limits are unchanged. All77 affected Windows and77 native reporting checks passed
+(69 retained plus8 new); the37-path source/import audit found no wrong imports or
+foreign compiled modules. Independent reviews were clear. The unchanged full helper
+now measures HTTP state63338/attach63445/Owner63429/WSS63408 bytes.
+
+Service-only stopped staging is complete at the current145621/fbfb pins above.
+A trusted authenticated real Pi `GET /api/state` then returned status200 with
+`Cache-Control: no-store`, JSON content type and54258 wire bytes, SHA256
+`4b413c543500f011a44e3a26fe6667108eacea89617ce9af36a673d950d228dc`.
+Raw response parsing and the existing stager's history rehydration recovered the
+whole typed original07 native record exactly, retaining its completed status and
+original SHA256
+`81ee7e1252c9c1697b6f4b1b8e603bde9f554d8636e504fbf4d5d303a7ca97d5`.
+The current owner lifecycle is idle and current `finite_completion` is null; the
+retained completed program is history, not newly acquired finite evidence. Original
+history survived owner restart, and this read-only check started no new hardware task.
+
+The working packet is achieved within the stated finite coarse criteria. Physical
+trial07 remains pinned to d08/a971 and Core candidate ec7 above; the later service
+spacing correction changes its presentation only. No additional powered run was
+performed or claimed. Fine2-tick return, universal performance and recovery from
+required physical-input loss remain unqualified milestones.
 
 ## Retained AM1-VISIBLE-CONTROL-04 result
 
