@@ -51,6 +51,15 @@ Keep program completion, visible response, measured movement, return accuracy an
 repeatability distinct. Useful repeated movement is the completion condition; the
 broader genuine physical required-input-loss recovery remains a separate milestone.
 
+Verified packet06 outcome: two successive measured coarse out-and-back cycles
+under the separately pinned +10/10-second-ramp/2-second-dwell/150 mA condition
+and 45-tick moving-response boundary. Trials06/07 measured73/56/17 and75/58/17
+outward/reverse/residual ticks. The second completed normally across browser
+closure and reattachment with its original run, seed and deadline preserved.
+Useful repeated control is established for this tested condition; the separate
+2-tick fine-return criterion failed. See the current protected physical-session
+record for exact source/deployment/rollback pins and retained failures.
+
 ## Historical AM1 visible positive-control continuation (superseded for new packet06)
 
 AM1-VISIBLE-CONTROL-04 has one actual bounded comparison, f7e7ae6d-d305-448a-90b6-5f2ae3bc8b19.

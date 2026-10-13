@@ -1,27 +1,43 @@
 # AM1 roaming-resilient sessions
 
-**Active scope: AM1-ELBOW-TO-COMPLETION-06.** The repair loop continues until useful,
-intentional repeated elbow movement is demonstrated or a concrete required physical/
-access action is unavailable. The old 100 mA threshold is an experimental restriction
-to reassess with evidence. Packet06 replaces unsent FAULT-EVIDENCE-05; prior results
-below remain historical. Exact deployed and prepared versions are recorded below.
+**AM1-ELBOW-TO-COMPLETION-06 result:** useful, intentional repeated elbow movement
+is demonstrated within the declared finite coarse envelope. Fine return precision
+remains unachieved. The old 100 mA threshold was an experimental restriction reassessed
+with evidence. Packet06 replaces unsent FAULT-EVIDENCE-05; prior results below remain
+historical.
 
+**Current result: [AM1-ELBOW-TO-COMPLETION-06](protected-physical-sessions.md#am1-elbow-to-completion-06-results-and-status).**
+Pi recovery, the separately pinned150 mA/45-tick condition and both Core reporting
+repairs are deployed. Trials06/07 measured 2384→2457→2401 and 2401→2476→2418:
+73/75 outward ticks,56/58 reverse ticks and 17-tick residuals against the same56/56/22
+coarse criteria, with maximum 123.5 mA in each. Both native programs reached 28/cycle1/
+qualified return1; the separate2-tick fine-return criterion failed in both.
+Trial06 retains its original111417-byte finishing overflow and normal owner Stop,
+separate from its completed physical receipt. The first Core stage's original83436-byte
+idle overflow before any new Start also remains retained. The final Core candidate
+passed69 Windows and 69 native checks; bounded idle TLS reports reached 54106/65536 bytes.
 
-**Current continuation: [AM1-ELBOW-TO-COMPLETION-06](protected-physical-sessions.md#am1-elbow-to-completion-06-results-and-status).**
-Pi recovery and the separately pinned150 mA/45-tick moving condition are deployed.
-Trial06 established one native coarse cycle:2384→2457→2401,73 outward ticks,56 reverse
-ticks and17-tick residual, with maximum123.5 mA. Native program28/cycle1/qualified
-return1 and coarse pass remain retained; fine return failed. A real111417-byte
-finishing report exceeded the65536-byte limit before the browser displayed completion.
-Normal Stop left owner status stopped and physical status completed, with no original
-first cause, uncertaintyfalse and verified20-zero/lift/bus/required-camera cleanup.
-Local camera stayed qualified. The advisory P1 ConnectionError/release-unconfirmed
-outcome remains retained; independent original237.6864-second audio-off recording
-verification confirmed release, outward pivot and return toward starting orientation.
-Core's report-bound repair is in progress. The linked record contains exact current/
-rollback pins, the fixed30-tick startup bound and all prior failures. Useful repeatability
-and the overall workstream remain open pending a second supported cycle; angular/fine
-precision and an exposure-to-servo timing bridge remain unmeasured.
+Trial07 reached normal owner completed status and continued from 25.1→28 during a
+five-second browser closure with unchanged run UUID, deadline, measured seed and
+service incarnation. No causes/recovery episodes occurred; uncertainty false and
+20-zero/bus/qualified-lift/required-camera cleanup were retained. The post-run check
+verified available idle. All 212 captured running snapshots had qualified local images,
+maximum original-arrival age224.637 ms. The supported lift samples still include
+nonzero measured velocity/moving indicators; qualification does not erase those values.
+
+Linked original P1 recordings independently verified release/audio0 and show visible
+outward pivot and return toward the starting orientation. Trial07's87.659-second
+recording met its 90-second budget; the Pi advisory release-unconfirmed outcome remains
+separate from original-source release and required local-camera proof. The linked
+report contains exact current and stopped rollback pins, actual live Goal replies,
+the fixed30-tick startup bound and all preceding failures. Useful repeated coarse
+movement is demonstrated conditionally; universal performance, required-input-loss
+recovery, angular/fine precision and an exposure-to-servo timing bridge are unqualified.
+
+Final saved actual07 HTTP-wrapper checks found default-spacing overhead67442/67553
+bytes. A reviewed HTTP-only compact encoder passed77 Windows checks and full
+wrappers below65536; native verification and runtime-only staging remain pending.
+The accepted physical movement and browser continuity result remains intact.
 
 **Retained AM1-VISIBLE-CONTROL-04:** One unchanged-I0 positive comparison started normally,
 then faulted at5.9 seconds at the selected100 mA sampled-current guard. All182

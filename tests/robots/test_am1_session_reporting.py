@@ -855,3 +855,124 @@ def test_selected_retained_idle_reference_requires_exact_complete_known_cleanup(
     before_run, before_evidence = copy.deepcopy(run), copy.deepcopy(evidence)
     assert (_positive_completion_reference(evidence, run) is not None) is (bad is None)
     assert run == before_run and evidence == before_evidence
+
+
+def actual_selected_final_snapshot():
+    root = Path(
+        os.environ.get(
+            "AM1_REPORTING_FIXTURES", ".cache/am1-visible-control-04/reporting-tests/native-fixtures"
+        )
+    )
+    path = root / "9a45-final.json"
+    if "AM1_REPORTING_FIXTURES" not in os.environ and not path.exists():
+        pytest.skip("Actual07 private final snapshot is not installed")
+    raw = path.read_bytes()
+    assert (
+        hashlib.sha256(raw).hexdigest() == "1fe0f0db9906485d29d2834ca4674755334560a13080d8156201d475c3cd269d"
+    )
+    value = ipc.strict_json(raw)
+    assert value["run"]["run_id"] == "9a45da93-1f2b-4f97-aa7b-523ba9f0419c"
+    assert value["run"]["status"] == "completed" and value["run"]["uncertain"] is False
+    return value
+
+
+def snapshot_http_gateway(value):
+    gateway = Gateway.__new__(Gateway)
+    gateway.tickets, gateway.revision, gateway.incarnation = {}, 0, str(uuid.uuid4())
+
+    async def current():
+        return copy.deepcopy(value)
+
+    async def body(request):
+        return {}
+
+    gateway.current, gateway.body = current, body
+    return gateway
+
+
+@pytest.mark.parametrize("route", ["state", "attach"])
+def test_actual_selected_final_http_wrappers_fit_without_payload_changes(route, record_property):
+    value = actual_selected_final_snapshot()
+    original = copy.deepcopy(value)
+    gateway = snapshot_http_gateway(value)
+    response = asyncio.run(getattr(gateway, route)({"device": {"id": "offline-viewer"}}))
+    record_property("actual07_compact_http_" + route + "_bytes", len(response.body))
+    assert response.status == 200 and len(response.body) <= ipc.RESPONSE_LIMIT
+    assert response.content_type == "application/json"
+    decoded = ipc.strict_json(response.body)
+    assert decoded["snapshot"] == original and value == original
+    if route == "state":
+        assert set(decoded) == {"snapshot"} and response.headers["Cache-Control"] == "no-store"
+    else:
+        assert set(decoded) == {"snapshot", "ticket", "revision"}
+        assert decoded["revision"] == gateway.incarnation + ":1"
+        assert len(gateway.tickets) == 1 and len(decoded["ticket"]) == 43
+
+
+def test_compact_http_json_preserves_typed_masked_strings_and_rejects_nonfinite():
+    from tools.am1_session_service import _compact_http_json
+
+    value = {
+        "masked": "<masked>",
+        "text": "literal spaces : ,\n雪",
+        "int": 1,
+        "float": 1.0,
+        "boolean": True,
+        "none": None,
+        "nested": [False, {}, []],
+    }
+    original = copy.deepcopy(value)
+    encoded = _compact_http_json(value)
+    assert encoded == json.dumps(value, separators=(",", ":"), allow_nan=False)
+    assert ipc.strict_json(encoded) == value and value == original
+    assert type(ipc.strict_json(encoded)["float"]) is float
+    for bad in (float("nan"), float("inf"), -float("inf")):
+        with pytest.raises(ValueError):
+            _compact_http_json({"value": bad})
+
+
+@pytest.mark.parametrize("route", ["state", "attach"])
+def test_snapshot_http_nonfinite_output_refuses_without_replacing_payload(route):
+    value = {"run": {"run_id": "saved", "position": float("nan")}}
+    gateway = snapshot_http_gateway(value)
+    with pytest.raises(ValueError):
+        asyncio.run(getattr(gateway, route)({"device": {"id": "offline-viewer"}}))
+    assert value["run"]["run_id"] == "saved"
+
+
+@pytest.mark.parametrize("route", ["state", "attach"])
+def test_snapshot_http_correlated_reporting_error_is_not_serialized_as_snapshot(route):
+    value = {
+        "accepted": True,
+        "status": "reporting_error",
+        "code": "response_limit",
+        "reason": "full response too large",
+        "run_id": str(uuid.uuid4()),
+        "operation_result": {"accepted": True, "status": "snapshot"},
+    }
+    gateway = snapshot_http_gateway(None)
+
+    async def unavailable():
+        raise ipc.ReportingError(value)
+
+    gateway.current = unavailable
+    with pytest.raises(ipc.ReportingError) as caught:
+        asyncio.run(getattr(gateway, route)({"device": {"id": "offline-viewer"}}))
+    assert caught.value.result == value
+
+
+def test_compact_snapshot_attach_still_refuses_unexpected_body_before_snapshot():
+    gateway = snapshot_http_gateway(None)
+    calls = []
+
+    async def body(request):
+        return {"unrequested": True}
+
+    async def current():
+        calls.append("snapshot")
+        return {}
+
+    gateway.body, gateway.current = body, current
+    with pytest.raises(ValueError, match="attach payload"):
+        asyncio.run(gateway.attach({"device": {"id": "offline-viewer"}}))
+    assert calls == [] and gateway.tickets == {}

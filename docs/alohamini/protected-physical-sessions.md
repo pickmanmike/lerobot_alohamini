@@ -1,48 +1,57 @@
 # AM1 protected physical sessions
 
-**Active scope: AM1-ELBOW-TO-COMPLETION-06.** The repair loop continues until useful,
-intentional repeated elbow movement is demonstrated or a concrete required physical/
-access action is unavailable. The old 100 mA threshold is an experimental restriction
-to reassess with evidence. Packet06 replaces unsent FAULT-EVIDENCE-05; prior results
-below remain historical. Exact deployed versions and candidate status are recorded below.
+**AM1-ELBOW-TO-COMPLETION-06 result:** useful, intentional repeated elbow movement
+is demonstrated within the declared finite coarse envelope. Fine return precision
+remains unachieved. The old 100 mA threshold was an experimental restriction reassessed
+with evidence. Packet06 replaces unsent FAULT-EVIDENCE-05; prior results below remain
+historical. Exact deployed versions, limits and retained rollback states follow.
 
 
 ## AM1-ELBOW-TO-COMPLETION-06 results and status
 
-The first measured coarse out-and-back cycle is established; useful repeated control
-remains unresolved. The elbow inspection and corrected P1 framing are verified.
+Trials06 and 07 establish two measured, visible coarse out-and-back cycles from fresh
+poses under the separately pinned 150 mA/45-tick moving condition. Trial07 reached
+normal owner `completed` at progress 28, retained one cycle and one qualified return,
+and continued during a five-second browser closure. The declared 56-tick outward,
+56-tick reverse and 22-tick measured-origin residual criteria passed in both runs.
+The separate 2-tick fine-return criterion failed in both. This demonstrates useful
+repeated movement for this finite condition, without claiming universal performance,
+hardware endurance or recovery from required-input loss. Each per-run analyzer correctly
+leaves `useful_repeated_response` unset for its single cycle; the repeated coarse result
+is an explicit comparison of the two original runs, not a rewritten per-run score.
+
 Pi access returned after the owner's update/recovery; a fresh native audit reported
-kernel `6.18.50+rpt-rpi-2712` and retained the preceding fault and private state.
-Trial04 refused during lift baseline, and trial05 demonstrated positive movement
-before its30-tick response refusal. The separately pinned150 mA/45-tick condition
-is now reviewed, natively verified and deployed. Trial06 completed its native finite
-program and coarse return, then exposed a report-size gap during finishing. The
-owner was normally stopped after that reporting error. The narrow Core reporting
-repair has passed40 focused Windows checks and independent review; native verification
-and runtime-only staging are pending. A second supported cycle remains outstanding.
+kernel `6.18.50+rpt-rpi-2712` and retained the preceding faults and private state.
+Trial04 refused during lift baseline, and trial05 moved positively before its original
+30-tick response refusal. Trial06 physically completed its finite program but exposed
+a finishing report overflow and was normally stopped. The first Core-only reporting
+repair then exposed a retained-idle overflow before any new Start. Both report gaps
+were repaired, independently reviewed, tested and staged with stopped affected owners.
+Trial07 completed with known cleanup, and the post-run check verified available idle.
 
 | Finite condition | Actual measured response | Result |
 |---|---|---|
-| `3eef62bd-b65f-4dc2-9841-602bc8e71957`, -10 normalized/10-second ramps/2-second dwell/100 mA | Fresh2459 to2362:97 ticks outward;12 ticks partial return to2374 | Owner required_proof_loss at program progress19.6; later native117 mA trigger at19.9 during return/rejoin; no qualified final return |
-| `bd388b47-02b6-4b9b-bc8f-bb6130a4b74e`, same waveform after camera repair | Fresh2379 to2282:97 ticks outward;29 ticks positive return to2311 | Original raw16 x6.5=104 mA native trigger at21.2 seconds, without initiating camera hold; program/final return unqualified |
-| `735ce338-e8c0-4f3d-a3e4-c418b960414d`, planned +10/150 mA | Program progress0; normal preparation hold had position/goal2312 and current0 | New response guard incorrectly required finite context during measured preparation; no enrolled movement result |
-| `353e9358-15b9-4581-8ea4-2b2691ec9b79`, planned +10/150 mA after startup repair | Lift baseline position344/current0; elbow program progress0, no native Live | Valid torque readback1 instead of0; protected startup refusal and known cleanup; no elbow movement result |
-| `34c519a4-be7c-43f8-9ff1-b90ce70508c3`, +10/10-second ramps/2-second dwell/150 mA | Fresh2312 to2384:72 ticks positive; published maximum117 mA; actual endpoint Goal2422 | Moving-response guard at30-tick error refused before reversal: original91 mA, error38, only2 ticks in1.203 seconds; owner feedback_loss followed; no qualified cycle/return |
-| `183838e6-f726-45b2-b660-5bbd6c531bec`, same waveform/150 mA with45-tick moving bound | Fresh2384 to2457 to2401:73 outward/56 reverse/residual17; maximum123.5 mA | Native program28/cycle1/qualified return1; coarse pass, fine return false. Physical receipt completed; owner stopped after111417-byte report overflow and normal Stop; no native/owner first cause, known cleanup |
+| `3eef62bd-b65f-4dc2-9841-602bc8e71957`, -10 normalized/10-second ramps/2-second dwell/100 mA | Fresh2459 to 2362:97 ticks outward;12 ticks partial return to 2374 | Owner required_proof_loss at program progress 19.6; later native117 mA trigger at 19.9 during return/rejoin; no qualified final return |
+| `bd388b47-02b6-4b9b-bc8f-bb6130a4b74e`, same waveform after camera repair | Fresh2379 to 2282:97 ticks outward;29 ticks positive return to 2311 | Original raw 16 x6.5=104 mA native trigger at 21.2 seconds, without initiating camera hold; program/final return unqualified |
+| `735ce338-e8c0-4f3d-a3e4-c418b960414d`, planned +10/150 mA | Program progress 0; normal preparation hold had position/goal2312 and current 0 | New response guard incorrectly required finite context during measured preparation; no enrolled movement result |
+| `353e9358-15b9-4581-8ea4-2b2691ec9b79`, planned +10/150 mA after startup repair | Lift baseline position 344/current 0; elbow program progress 0, no native Live | Valid torque readback1 instead of0; protected startup refusal and known cleanup; no elbow movement result |
+| `34c519a4-be7c-43f8-9ff1-b90ce70508c3`, +10/10-second ramps/2-second dwell/150 mA | Fresh2312 to 2384:72 ticks positive; published maximum 117 mA; actual endpoint Goal 2422 | Moving-response guard at 30-tick error refused before reversal: original91 mA, error 38, only2 ticks in 1.203 seconds; owner feedback_loss followed; no qualified cycle/return |
+| `183838e6-f726-45b2-b660-5bbd6c531bec`, same waveform/150 mA with 45-tick moving bound | Fresh2384 to 2457 to 2401:73 outward/56 reverse/residual 17; maximum 123.5 mA | Native program28/cycle1/qualified return1; coarse pass, fine return false. Physical receipt completed; owner stopped after111417-byte report overflow and normal Stop; no native/owner first cause, known cleanup |
+| `9a45da93-1f2b-4f97-aa7b-523ba9f0419c`, same condition after Core reporting repairs | Fresh2401 to 2476 to 2418:75 outward/58 reverse/residual 17; maximum 123.5 mA | Normal owner completed at 28/cycle1/qualified return1; coarse pass, fine return false; browser closure preserved run/deadline/seed/service; no causes/recovery, known cleanup and verified available idle |
 
 All original causes, twenty typed zero readbacks, bus closure and separate same-run
 required-camera releases are retained. The first two runs contain635/671 unique
 ordinary acquisitions. Trigger evidence is captured in memory before cleanup;
 it does not substitute torque-off readings for live current. The second run's
-18/19-second grouped replies read actual goals2312/2323, positions2282/2288,
-currents45.5/65 mA, temperature30 C, voltage11.8 V and status0 with torque enabled.
+18/19-second grouped replies read actual goals 2312/2323, positions 2282/2288,
+currents 45.5/65 mA, temperature30 C, voltage11.8 V and status0 with torque enabled.
 The live goals matched encoded commands. Target2348 written at the later fault
 is not an actual Goal_Position readback.
 
 The29-tick positive return occurred over about3.05 wall seconds after breakaway.
 This establishes response under the old diagnostic cap, not complete reversal,
-fine precision or repeatability. Its pre-release2311 position is148 ticks below
-the first2459 reference. Neither a fresh seed nor the third2312 startup hold erases
+fine precision or repeatability. Its pre-release2311 position is 148 ticks below
+the first 2459 reference. Neither a fresh seed nor the third2312 startup hold erases
 that departure. Inspected relevant P1 frames support outward linkage movement;
 partial return and fine residual are not visually quantified. Optional P1 delivery
 errors and verified original recording releases remain separate from required
@@ -50,89 +59,143 @@ Pi-local observation.
 
 Trial04's native first cause remains `ComparisonRefusal: baseline: torque readback
 did not match 0.`; the owner separately retained the protected-host startup-exit
-cause. Its complete ID-11 group reply read torque1/Lock0/goal velocity0, position344,
-current0, velocity0, moving0 and status0. Ordinary startup already writes goal velocity
+cause. Its complete ID-11 group reply read torque 1/Lock0/goal velocity0, position 344,
+current 0, velocity0, moving0 and status0. Ordinary startup already writes goal velocity
 zero and torque zero last before baseline. Earlier successful startup traces had the
-same configuration torque1/Lock0 followed by baseline torque0. Cleanup subsequently
-proved torque0 and five stationary samples over0.208 seconds. The startup discrepancy's
+same configuration torque 1/Lock0 followed by baseline torque 0. Cleanup subsequently
+proved torque 0 and five stationary samples over 0.208 seconds. The startup discrepancy's
 cause remains unproved; trial05 requalified the baseline/home afresh and passed.
 
 Trial05 contains410 ordinary selected acquisitions, all in active epoch2, with maximum
 position/current acquisition gaps50.979/50.966 ms. Its5/10-second live-goal replies read
-goals2345/2400, positions2312/2364 and current65 mA; the endpoint reply read Goal2422,
-position2382 and current78 mA. These replies retained torque1/mode0/status0, temperature
-31 C and voltage11.8 V. Goal acceptance and the measured72-tick positive response are
+goals 2345/2400, positions 2312/2364 and current 65 mA; the endpoint reply read Goal 2422,
+position 2382 and current 78 mA. These replies retained torque 1/mode0/status0, temperature
+31 C and voltage11.8 V. Goal acceptance and the measured 72-tick positive response are
 established. Endpoint attainment, reversal, return and repeated control remain unqualified.
 
-The native response window rearmed at raw2382/progress11.8 with original position/current
+The native response window rearmed at raw 2382/progress 11.8 with original position/current
 completion clocks2189.981987805/2189.986905019. The rejected poll completed those reads
-at2191.185019962/2191.189960805 and captured raw2384/current14 x6.5=91 mA at2191.192293811.
-The longer original span was1.203055786 seconds over37 distinct acquisition pairs;
-signed response was2 ticks and remaining encoded-goal error38. The then-deployed30-tick/
+at 2191.185019962/2191.189960805 and captured raw 2384/current 14 x6.5=91 mA at 2191.192293811.
+The longer original span was 1.203055786 seconds over 37 distinct acquisition pairs;
+signed response was 2 ticks and remaining encoded-goal error 38. The then-deployed30-tick/
 3-tick/1.2-second rule correctly refused that under-cap boundary. The rejected poll
 is separate fault evidence and adds no successful ordinary observation. Original fault
 fields agree across the host log, native durable receipt and browser response.
 
-Owner `feedback_loss` followed the native fault by about168 ms. All116 running browser
+Owner `feedback_loss` followed the native fault by about168 ms. All 116 running browser
 snapshots retained qualified local images, with maximum original-arrival age157.569 ms;
-no initiating camera hold/rejoin preceded this response refusal. All20 typed zero
-readbacks, five stationary lift samples over0.208 seconds, bus closure and original
-same-run required-camera release were verified, with uncertaintyfalse.
+no initiating camera hold/rejoin preceded this response refusal. All 20 typed zero
+readbacks, five stationary lift samples over 0.208 seconds, bus closure and original
+same-run required-camera release were verified, with uncertainty false.
 
 Corrected P1 framing was independently verified before trial05. The linked original
 advisory recording's41/55-second frames show linkage pivot consistent with the positive
 encoder response. Its original source released normally, and independent recording
 verification found zero audio streams. Angular precision, reversal and fine residual
 were not measured visually. This advisory record remains separate from required local
-camera proof. Trial05's powered2384 position remained75 ticks below the first2459
+camera proof. Trial05's powered2384 position remained75 ticks below the first 2459
 reference; the elbow's final torque-off resting position was not read in cleanup.
 
 Trial06 retained897 ordinary selected acquisitions in active epoch2. Its actual live
-Goal replies were2384 at baseline,2417 at5 seconds,2472 at10 seconds,2494 at endpoint
-and2384 at final return. The corresponding positions were2384/2384/2436/2451/2401,
-and sampled currents0/65/65/117/19.5 mA. All matched their encoded commands, with
-torque1/mode0/status0, temperature31 C and voltage11.7–11.8 V. The sampled maximum
-was123.5 mA. The one45-error pending window gained5 signed ticks within67.959 ms;
+Goal replies were 2384 at baseline,2417 at 5 seconds,2472 at 10 seconds,2494 at endpoint
+and 2384 at final return. The corresponding positions were 2384/2384/2436/2451/2401,
+and sampled currents 0/65/65/117/19.5 mA. All matched their encoded commands, with
+torque 1/mode0/status0, temperature31 C and voltage11.7–11.8 V. The sampled maximum
+was 123.5 mA. The one45-error pending window gained 5 signed ticks within 67.959 ms;
 all other published boundaries were tracking. No native current/response fault,
-initiating local-camera loss or recovery episode occurred. All228 running browser
+initiating local-camera loss or recovery episode occurred. All 228 running browser
 snapshots retained qualified local proof, with maximum original-arrival age182.694 ms.
 
-The native provider retained progress28/complete true/cycle1/qualified return1 and a
-coarse functional pass:73 outward ticks,56 reverse ticks and17-tick measured-origin
-residual against the56/56/22 criteria. Seven-sample baseline, endpoint and final
-windows spanned at least0.200 seconds; baseline noise was0. Fine return failed the
+The native provider retained progress 28/complete true/cycle1/qualified return1 and a
+coarse functional pass:73 outward ticks,56 reverse ticks and 17-tick measured-origin
+residual against the 56/56/22 criteria. Seven-sample baseline, endpoint and final
+windows spanned at least0.200 seconds; baseline noise was 0. Fine return failed the
 separate2-tick criterion. Final qualification occurred32.680 wall seconds after
-native Live, including preparation and slower finite dispatch. This is one measured
-coarse cycle, with repeatability still open. Relevant original P1 frames support
+native Live, including preparation and slower finite dispatch. This is the first
+measured coarse cycle; trial07 supplies a second fresh-pose comparison. Relevant original P1 frames support
 outward pivot and return toward starting orientation, separately from encoder
-qualification. Final powered2401 remained58 ticks below the first2459
+qualification. Final powered2401 remained58 ticks below the first 2459
 reference, and the torque-off elbow resting position was not read in cleanup.
 
 The real finishing report exceeded the unchanged65536-byte presentation limit at
 111417 bytes, before the browser displayed a completed result. The normal exact-run
 Stop left owner status `stopped`, while the physical receipt retained `completed`.
-Both original first causes are null and uncertaintyfalse; the native completed
-program/coarse measurements remain retained. The reviewed Core repair extends the
+Both original first causes are null and uncertainty false; the native completed
+program/coarse measurements remain retained. The first Core repair extended the
 existing SHA-bound identical-execution references to qualified finishing records,
-retaining one complete execution and unchanged status/cleanup/Stop semantics. The
-40 focused Windows checks and full socket/TLS wrappers passed; the largest wrapper
-was63352 bytes below the unchanged65536-byte limit. Native verification and a new
-runtime pin remain pending. The overflow is not relabeled as a
-native motion fault or a completed owner lifecycle.
+retaining one complete execution and unchanged status/cleanup/Stop semantics.
+Its 40 Windows and 40 native checks passed; the largest finishing wrapper was 63352
+bytes below the unchanged65536-byte limit. After that runtime-only stage, launch-idle
+started the three idle units but the actual retained snapshot still reported an83436-byte
+presentation overflow before any Start. Both original refusals remain retained.
+The final Core repair gives idle reports a public reference to retained history,
+without presenting stored terminal execution as current finite evidence. It passed
+69 Windows and 69 native checks (the retained40 plus29 new cases), including real
+socket/TLS wrappers; the largest idle TLS report was 54106/65536 bytes. Trial07 then
+reported normal completion. Trial06's original overflow is not relabeled as a native
+motion fault or a completed owner lifecycle.
 
-Trial06 cleanup retained all20 typed torque/goal-velocity zero readbacks, bus closure
+Trial06 cleanup retained all 20 typed torque/goal-velocity zero readbacks, bus closure
 and original same-run required-camera release. Its supported lift qualification
-retained five samples over0.208 seconds at raw351 with zero position drift, alongside
+retained five samples over 0.208 seconds at raw 351 with zero position drift, alongside
 present-velocity indicators[50,0,0,0,-50] and moving indicators[1,0,0,0,1].
 The linked optional P1 client `555f6642-9119-4d86-ab7d-7636ceb0af0c` separately recorded
 `ConnectionError`/`release-unconfirmed`. Independent original-source verification
-confirmed normal release and zero audio streams for its237.6864-second recording,
-within the240-second budget, with SHA256
+confirmed normal release and zero audio streams for its 237.6864-second recording,
+within the 240-second budget, with SHA256
 `4d1eff6c7e8ce2cf271821f678b86e4e7f8d4228e92cbc4ff73ce9b840ffac23`.
 Inspected original36/50/65-second frames show outward linkage pivot and return toward
 starting orientation. Angular/fine precision is unmeasured, and approximate PTS/UTC
 alignment does not provide an exposure-to-servo clock bridge. The advisory-client
 failure, independent source release and required local-camera release remain separate.
+
+Trial07 enrolled automatically through normal startup from fresh raw 2401. Its host
+incarnation was `ccc432d7-8f35-4d89-bad4-2197fb55ce8f`. All 897 unique ordinary selected
+acquisitions were retained. Actual live Goal replies at baseline/5 seconds/10 seconds/
+endpoint/final return were 2401/2434/2489/2511/2401, matching encoded commands.
+Corresponding positions were 2401/2401/2453/2468/2418 and currents 0/58.5/71.5/110.5/26 mA.
+These replies retained torque 1/mode0/status0, temperature30 C and voltage11.8 V.
+The ordinary sampled maximum was 123.5 mA. All 897 published response boundaries were
+tracking, with maximum signed commanded error 44; no current or response refusal occurred.
+
+The second cycle measured 75 ticks outward,58 reverse and 17 residual against the same
+56/56/22 coarse criteria. Baseline noise was 0; baseline/endpoint/final windows contained
+8/7/7 acquisitions spanning at least0.200 seconds. Final qualification occurred32.625
+wall seconds after native Live. Fine return again failed the separate2-tick criterion.
+The powered final2418 position remained41 ticks below the first 2459 reference; neither
+a new seed nor coarse qualification erases that departure. The torque-off elbow resting
+position was not read in cleanup.
+
+The browser closed for five seconds at progress 25.1 and returned to the same run at 28,
+then normal completed status. Run UUID, deadline9080.593278634, original measured seed
+and service incarnation `0a92bc99-8500-4fb3-8016-ba65f8ae2a06` were preserved.
+There was no native/owner first cause, uncertainty remained false, and recovery episodes
+remained 0. All 212 captured running snapshots had qualified required local images;
+maximum original-arrival age was 224.637 ms. This demonstrates browser detachment
+continuity, without exercising loss and recovery of the required local input.
+
+Trial07 cleanup retained all 20 typed torque/goal-velocity zero readbacks, bus closure
+and the original same-run required-camera release. Supported lift qualification
+retained five samples over 0.208 seconds at raw 353 with zero position drift;
+present-velocity indicators[50,0,0,0,0] and moving indicators[1,0,0,0,0] remain visible.
+Qualification does not mean every measured velocity/moving indicator was zero:
+after torque-off, lift cleanup settled from raw 308 toward353 before the final five
+stationary samples. Required camera release retained all four release flags and no
+errors; its optional device-fuser check was not performed. A retained abandoned right
+transaction recovery warning did not become a first cause or cleanup failure.
+A late-printed lift live row was acquired at 9053.228092726, before cleanup; file order
+alone does not show re-energization. The post-run stopped-state check verified
+available idle without a new hardware task.
+
+The linked optional P1 client `d00b93c4-f227-425c-8b96-089e58b6cd4d` retained its Pi
+`release-unconfirmed` outcome. Independent original-source verification confirmed
+normal release and zero audio streams for the 87.659-second,15642002-byte recording
+within its 90-second budget, SHA256
+`92adbfdef685f9e698ca3fb8992f1fe0f593e09787f3cfedd403abc7b87e1410`.
+Inspected original43/56/70-second frames show outward linkage pivot and return toward
+starting orientation. Angular/fine precision and an exposure-to-servo clock bridge
+remain unmeasured. Advisory delivery, independent source release and required local
+camera proof remain separate.
 
 ### Software corrections and conditional operating envelope
 
@@ -148,7 +211,7 @@ not captured, so attribution among those coupled mechanisms remains bounded.
 
 The retained150 mA/30-tick diagnostic envelope preserves the original100 mA
 envelope and all hardware settings. It allows at most10 normalized units,1 unit/second,
-2-second endpoint dwell,30-second trajectory and60-second native Live. When signed
+2-second endpoint dwell,30-second trajectory and 60-second native Live. When signed
 commanded error reaches30 raw ticks, the local guard requires3 signed ticks within
 1.2 seconds, using the longer original position/current clock span. Changed goals,
 current dips, duplicate reads and two-tick jitter cannot renew unresolved exposure.
@@ -158,7 +221,7 @@ actuation.
 The startup correction permits only an initial fresh measured hold before finite
 context. It freezes target, measured origin, actual integer codec goal and owner
 binding, representing floor encoding and one tick of settling separately. Zero
-body intent, original current/setting/clock/raw limits and the60-second ceiling
+body intent, original current/setting/clock/raw limits and the 60-second ceiling
 remain enforced. Startup drift of30 ticks refuses before another write and after
 a native read. The original20-second preparation limit also applies before the
 first finite-context assignment/write. Once programme context begins, the startup
@@ -167,18 +230,19 @@ exception cannot reopen. No provider, architecture, gains or deadline reset chan
 The separately pinned150 mA/45-tick moving condition is now deployed. Trial05 showed
 positive response with published moving/endpoint gaps no larger than41 ticks, then
 an under-cap30-tick response refusal before reversal. The distinct condition moves
-only the signed moving-error obligation to45 ticks and retains3 signed ticks within
-1.2 seconds. The measured-startup drift boundary remains fixed at30 ticks. The original
+only the signed moving-error obligation to 45 ticks and retains3 signed ticks within
+1.2 seconds. The measured-startup drift boundary remains fixed at 30 ticks. The original
 100 mA and previous150 mA/30-tick conditions and their verdicts remain retained.
 
 The deployed comparison keeps +10 normalized/10-second ramps/2-second dwell,150 mA
 sampled current,60-second Live,56-tick minimum outward and reverse response,22-tick
-coarse measured-origin return tolerance and live-goal probes at5/10 seconds. It starts
+coarse measured-origin return tolerance and live-goal probes at 5/10 seconds. It starts
 from a fresh measured pose. All other settings, clocks, deadlines, source/ownership,
 current/thermal/status/travel guards and Pause/Stop authority remain unchanged. The
-next supported comparison awaits the report-bound repair and retains this condition.
-Program completion, actual live-goal acceptance, measured/visible movement, coarse
-qualification and fine residual stay separate; useful repeated control is unresolved.
+two supported comparisons retained this condition. Program completion, actual live-goal
+acceptance, measured/visible movement, coarse qualification and fine residual stay
+separate. Useful repeated coarse control is demonstrated within these declared limits;
+fine return and required-input-loss recovery remain unqualified.
 
 The150 mA budget is a conservative finite hypothesis supported by the uninterrupted
 responding return, trial05's measured positive response/electrical/status values and
@@ -194,45 +258,68 @@ analog limits on between-acquisition peaks. No permanent tuning was performed.
 ### Verification and exact deployment state
 
 The45-tick condition passed85 focused guard checks on Windows and in the existing
-native3.12 environment (65 historical and20 new cases), plus31 affected analyzer
+native3.12 environment (65 historical and 20 new cases), plus31 affected analyzer
 checks. Independent review was clear. The reused full HTTPS/owner-socket/WSS fixtures
 passed8 cases, including3 for the new condition; tested terminal responses reached
 61696/65536 bytes, with one normal Start effect/deduplication retained. Those mocks
 covered terminal envelopes and did not cover the real finishing response that later
-exceeded the limit. The exposed Core report-bound gap is being repaired; the earlier
-checks remain recorded within their actual scope. These checks do not establish
-physical repeatability. The separately selected envelope is
+exceeded the limit. Both exposed Core report-bound gaps are now repaired and natively
+verified; the earlier checks remain recorded within their actual scope. Software checks
+alone do not establish physical repeatability; trials06/07 supply the actual coarse
+comparisons. The separately selected envelope is
 `f2bcff7c00c9b65b32f87978b13b6c2609610b07cf1644f3dcb9b885898a5ff3`.
 
 Native mock cohorts passed308 initial evidence/interface cases,90 camera-delivery
-cases,144 response-guard cases and170 startup-integration cases. After independent
-review found the first-context20-second hole, only the65-case guard cohort was
+cases,144 response-guard cases and 170 startup-integration cases. After independent
+review found the first-context20-second hole, only the 65-case guard cohort was
 rerun natively on the final correction. These are separate overlapping cohorts,
 not an aggregate total. Actual candidate imports/native compiled modules were
 verified under PrivateDevices. The independent deadline recheck passes all three
 boundary cases. Full HTTPS/owner socket/WSS serialization passes8 cases, including
-actual generated150 mA fault/phase shapes and all20 retained cleanup rows; the
-largest response is61696 bytes under the unchanged65536-byte ceiling. Mock tests
+actual generated150 mA fault/phase shapes and all 20 retained cleanup rows; the
+largest response is 61696 bytes under the unchanged65536-byte ceiling. Mock tests
 prove software and transport behavior, not physical movement.
+
+The narrow private stager reporting modifier was independently reviewed and passed
+219 offline checks (63 new and 156 retained). It admits only an explicit selected06
+continuation with unchanged motor and exactly the reviewed Core delta. The original
+1838 overflow, fresh authenticated original-operation lookup, full read-only native
+terminal row and exact cleanup/camera bindings must agree under existing stopped
+admission before any Stop. Original native/lookup/error records are retained before
+Stop; no snapshot or missing idle-launch receipt is fabricated. The reviewed helper
+SHA256 is `d92b4aba4b27ac3032ef3e410bfea0da1a3225562e6ff995f0b1aacba62007ed`;
+the admitted original error SHA256 is
+`882e186d524e9a48208b2fab33df514c9983cd85d7200c05a481bee6ec61bdf8`.
+Normal launch and post-run idle verification still require actual full owner snapshots.
 
 | State | Exact pin |
 |---|---|
-| Current reviewed motor/runtime source | `0b0ce8b9204cc9272e25156c33a62b5cf30a8869` |
+| Reviewed motor/45-tick source | `0b0ce8b9204cc9272e25156c33a62b5cf30a8869` |
+| Reviewed final Core source | `ec7bb3448f1763abd43fd06f4e20b66070d8048b` |
+| Deployed Core file SHA256 | `e6669cfb3f6e2479b9eda9468619cfda572351b24dbe92775e49b81e76bf3660` |
+| Current deployed motor, unchanged through both Core stages | `05191b9eac2ba8d35cc7746aa28d1e9b424f9eef` |
+| Current deployed runtime | `d08adb220d95dce018d3f3349845dc45d767a2cc` |
+| Current deployed manifest | `a971221b263b2d606405d564aafc1a72090dff684ef7d6bf6d17de11ffe6f4ee` |
+| Immediate stopped rollback runtime | `c6a999e7f8a235fbeadaaa50f9691c6847f3bcf8` |
+| Immediate stopped rollback manifest | `9c103328b306161a1bf708e3287155d6b0eebbe359ed4622fb9da5003f1ec109` |
+| Retained first coarse-cycle runtime | `00a2329323c00cbd26781bc5e00e0943904dae35` |
+| Retained first coarse-cycle manifest | `83b16b66f6bb828bf8e5144a2f0dfc058ec833bbff8587c4da9c87964cfc9956` |
+| Earlier startup rollback motor | `c9c1f0e38aba59ade6f47f762e160e8df4f19dd5` |
+| Earlier startup rollback runtime | `5c96319375e7bf3b9da5f1d064fca0be87e83545` |
+| Earlier startup rollback manifest | `c1be7d3633137920f74f15c5d0702ec136d3273250e2a303d7f1cc5b1d515967` |
 | Earlier retained motor | `3b31b0054829e57c62f4bd086d919ff890e2cabd` |
 | Earlier retained runtime | `cad480b71d03c23d4811ce35c6ad27156d4e01ef` |
 | Earlier retained manifest | `462d0c3e5bf3391ec7d4a83d1a901735d71ba929902d4d45e64f4488112cf535` |
-| Immediate rollback motor | `c9c1f0e38aba59ade6f47f762e160e8df4f19dd5` |
-| Immediate rollback runtime | `5c96319375e7bf3b9da5f1d064fca0be87e83545` |
-| Immediate rollback manifest | `c1be7d3633137920f74f15c5d0702ec136d3273250e2a303d7f1cc5b1d515967` |
-| Current deployed motor | `05191b9eac2ba8d35cc7746aa28d1e9b424f9eef` |
-| Current deployed runtime | `00a2329323c00cbd26781bc5e00e0943904dae35` |
-| Current deployed manifest | `83b16b66f6bb828bf8e5144a2f0dfc058ec833bbff8587c4da9c87964cfc9956` |
 
-Current verified native private config is1235 bytes/mode0600/SHA256
-`54824e2416a5378df98b0a38e1982d632945ec25dbb627a5cdd2af1884f4b687`;
-Windows config is1443 bytes with preserved ACL/SHA256
+Current verified native private config is 1235 bytes/mode0600/SHA256
+`9a3f5cdb183c15a2758a48da9122ff3c9783722a09037f7df01fb4b8d2f05428`;
+Windows config remains1443 bytes with preserved ACL/SHA256
 `1543fee835edab63ab11008aedc809669d405b4c3b57bf2f2fffebbb390c6f59`.
-Immediate matched rollback config hashes remain native
+Immediate matched stopped rollback retains native config
+`5dce269e13f3b0d64299871b9849a25527c0d2ba03777db3cf731b6fdc00a0f9`
+and the same Windows bytes. The first coarse-cycle version retains native config
+`54824e2416a5378df98b0a38e1982d632945ec25dbb627a5cdd2af1884f4b687`.
+Earlier startup rollback config hashes remain native
 `565741d7b8bac9575d88db9a720fea689e761cea2226f9ea381ec56b04f2d552` and Windows
 `07e07d6c5d09468690d5c5e898357fd5906855fb7631a66ce8b3cbdfadbb520b`.
 Earlier retained config hashes remain native
@@ -246,13 +333,26 @@ isolated camera `a0e94bc5298c021f785eaaee4ef0e2c44283f3d7`, normal camera
 `f3ffa9d5d531fe0213c8847f28baef292de027996f0a0267e0657a8c45037394`.
 Normal physical deployments, original simulation, private trust/permissions/history,
 matched rollback and predecessor refs/bundles/manifests are retained. Further staging
-or matched rollback requires known cleanup and stopped affected owners. The report-bound
-Core correction is in progress; its reviewed source and candidate runtime pins are pending.
+or matched rollback requires known cleanup and stopped affected owners. The final
+Core reporting correction is deployed and actual trial07 completed; available idle
+was verified after cleanup.
 PR20 stays draft on19→18→17→16; no merge or history rewrite is authorized.
 
 Durability means software fault tolerance, connection/control continuity, state
 preservation and recovery with minimal human intervention. No hardware-endurance
 or mechanical-lifespan campaign is part of this result.
+
+Final actual07 saved-object transport verification retained HTTP state/attach
+responses67442/67553 bytes (status200), above the requested65536-byte full-wrapper
+bound, while compact Owner/WSS frames remained63429/63408 bytes. These are real
+private socket/TLS reconstructions from the saved decoded public snapshot, not
+original live wire captures. The reviewed Gateway correction compacts only the two
+HTTP snapshot responses; payloads, masking, status, controls and limits are unchanged.
+All77 affected Windows reporting checks passed (69 retained plus8 new); the
+unmodified full helper now measures state63338/attach63445/Owner63429/WSS63408.
+Native77 verification and Service-only stopped staging are pending. The achieved
+physical07 result is unchanged and no additional powered run is required for this
+encoder-only correction.
 
 ## Retained AM1-VISIBLE-CONTROL-04 result
 

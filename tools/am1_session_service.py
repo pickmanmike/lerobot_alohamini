@@ -5,6 +5,7 @@ import asyncio
 import contextlib
 import hashlib
 import ipaddress
+import json
 import os
 import re
 import secrets
@@ -58,6 +59,11 @@ def unknown_outcome():
         "reason": "owner outcome unknown; inspect state or lookup the same operation",
         "effect_admitted": None,
     }
+
+
+def _compact_http_json(value):
+    """Serialize complete HTTP snapshot payloads without separator whitespace."""
+    return json.dumps(value, allow_nan=False, separators=(",", ":"))
 
 
 async def close_socket(ws, transport, code=1000):
@@ -440,7 +446,9 @@ class Gateway:
         )
 
     async def state(self, request):
-        return web.json_response({"snapshot": await self.current()}, headers={"Cache-Control": "no-store"})
+        return web.json_response(
+            {"snapshot": await self.current()}, dumps=_compact_http_json, headers={"Cache-Control": "no-store"}
+        )
 
     async def attach(self, request):
         if await self.body(request):
@@ -452,7 +460,8 @@ class Gateway:
         ticket = secrets.token_urlsafe(32)
         self.tickets[digest(ticket)] = (request["device"]["id"], now + 5)
         return web.json_response(
-            {"ticket": ticket, "snapshot": await self.current(), "revision": self.next_revision()}
+            {"ticket": ticket, "snapshot": await self.current(), "revision": self.next_revision()},
+            dumps=_compact_http_json,
         )
 
     async def fence(self, device):
