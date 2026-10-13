@@ -1931,11 +1931,10 @@ class SessionAuthority:
                 qualify = getattr(self.executor, "can_start_after_fault", None)
                 historical_fault_clean = (
                     isinstance(self.run, dict)
-                    and evidence["fault"] == self.run.get("first_cause")
                     and isinstance(evidence.get("lifecycle"), dict)
                     and evidence["lifecycle"] == self.run.get("physical_result")
                     and callable(qualify)
-                    and qualify(self.run) is True
+                    and qualify(self.run, observed_fault=evidence["fault"]) is True
                 )
             if (
                 evidence["fault"]

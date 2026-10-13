@@ -1408,3 +1408,213 @@ def test_terminal_start_current_evidence_failure_cannot_inherit_historical_permi
         host.next_start_release.set()
         authority.close()
         e.worker.join(2)
+
+
+class LiveFeedbackFaultThenBlockedHost(StartupFaultThenBlockedHost):
+    """Real worker lifecycle with distinct owner, executor and native causes."""
+
+    native_cause = "RuntimeError: Visible selected software effort ceiling reached"
+
+    def __init__(self):
+        super().__init__()
+        self.native_exit = threading.Event()
+
+    def start(self, run_id, incarnation, recipe, cancel):
+        ControlledHost.start(self, run_id, incarnation, recipe, cancel)
+        if self.started > 1:
+            self.healthy = True
+            self.native_exit.clear()
+            self.next_start_entered.set()
+            while not self.next_start_release.wait(0.005):
+                cancel()
+
+    def poll(self, previous):
+        if self.native_exit.is_set():
+            raise RuntimeError("protected host exited; inspect original host log and cleanup receipt")
+        return ControlledHost.poll(self, previous)
+
+    def finish(self, status):
+        if self.started == 1:
+            assert self.cleanup_release.wait(2)
+        outcome = terminal_cleanup_outcome(self.run_id, self.incarnation, status)
+        outcome["first_cause"] = self.native_cause
+        outcome["readback"]["first_cause"] = self.native_cause
+        return outcome
+
+
+def historical_live_feedback_fault_authority(tmp_path):
+    from tests.robots.test_am1_persistent_session import start
+    from tools.am1_session_core import SessionAuthority
+
+    host = LiveFeedbackFaultThenBlockedHost()
+    e = executor(host)
+    authority = SessionAuthority(tmp_path, executor=e)
+    first = start(authority, "physical-arm-hold-body")
+
+    def admitted():
+        authority.tick()
+        return authority.run["status"] == "running"
+
+    until(admitted)
+    original_deadline = authority.run["deadline"]
+    assert authority.run["native_live_at"] is not None
+    host.healthy = False
+    until(lambda: e.evidence()["feedback"] is False)
+    authority.tick()
+    assert authority.run["status"] == "recovering"
+    assert authority.run["first_cause"] == "feedback_loss"
+    host.native_exit.set()
+    until(lambda: e.evidence()["fault"] is not None)
+    authority.tick()
+    assert authority.run["status"] == "finishing"
+    host.cleanup_release.set()
+    until(lambda: e.evidence()["lifecycle"]["phase"] == "terminal")
+    e.worker.join(2)
+    authority.tick()
+    assert authority.run["status"] == "faulted"
+    assert authority.run["uncertain"] is False and authority.run["cleanup"] == "physical_readback_verified"
+    assert authority.run["first_cause"] == "feedback_loss"
+    assert authority.run["native_first_cause"] == host.native_cause
+    assert authority.run["deadline"] == original_deadline
+    assert authority.run["native_first_cause"] != e.evidence()["fault"]
+    return authority, e, host, first
+
+
+def test_live_feedback_loss_and_distinct_native_fault_allow_only_fresh_next_start_after_cleanup(tmp_path):
+    from tests.robots.test_am1_persistent_session import start
+
+    authority, e, host, first = historical_live_feedback_fault_authority(tmp_path)
+    try:
+        original = authority.run
+        saved = copy.deepcopy(original)
+        resident_fault = e.evidence()["fault"]
+        old_incarnation = e.host_incarnation
+        old_operation = authority.db.execute(
+            "SELECT result FROM operations WHERE id=?", (first["operation_id"],)
+        ).fetchone()
+        result = start(authority, "physical-arm-hold-body")
+        assert result["accepted"] and result["status"] == "starting" and result["effect_admitted"] is False
+        assert host.next_start_entered.wait(1)
+        assert result["run_id"] != first["run_id"] and e.host_incarnation != old_incarnation
+        assert authority.run["native_live_at"] is None and authority.run["deadline"] is None
+        assert authority.run["progress_s"] == 0 and authority.run["recovery_episodes"] == 0
+        assert authority.run["first_cause"] is None and e.evidence()["fault"] is None
+        assert saved == original and resident_fault != original["first_cause"]
+        assert (
+            authority.db.execute(
+                "SELECT result FROM operations WHERE id=?", (first["operation_id"],)
+            ).fetchone()
+            == old_operation
+        )
+        host.next_start_release.set()
+        until(lambda: e.evidence()["lifecycle"]["phase"] == "live")
+        authority.tick()
+        assert authority.run["native_live_at"] is not None
+        assert authority.run["backend_incarnation"] == e.host_incarnation
+        assert saved == original
+    finally:
+        host.cleanup_release.set()
+        host.next_start_release.set()
+        authority.close()
+        e.worker.join(2)
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        "missing_run_native",
+        "missing_lifecycle_native",
+        "missing_receipt_native",
+        "run_native_mismatch",
+        "lifecycle_native_mismatch",
+        "receipt_native_mismatch",
+        "bool_native",
+        "empty_native",
+        "missing_owner",
+        "bool_owner",
+        "empty_owner",
+    ],
+)
+def test_distinct_cause_start_admission_refuses_missing_malformed_or_foreign_binding(tmp_path, changed):
+    from tests.robots.test_am1_persistent_session import start
+
+    authority, e, host, _ = historical_live_feedback_fault_authority(tmp_path)
+    try:
+        lifecycle = e._lifecycle
+        if changed == "missing_run_native":
+            authority.run.pop("native_first_cause")
+        elif changed == "missing_lifecycle_native":
+            lifecycle.pop("first_cause")
+        elif changed == "missing_receipt_native":
+            lifecycle["readback"].pop("first_cause")
+        elif changed == "run_native_mismatch":
+            authority.run["native_first_cause"] = "foreign native cause"
+        elif changed == "lifecycle_native_mismatch":
+            lifecycle["first_cause"] = "foreign native cause"
+        elif changed == "receipt_native_mismatch":
+            lifecycle["readback"]["first_cause"] = "foreign native cause"
+        elif changed in {"bool_native", "empty_native"}:
+            cause = False if changed == "bool_native" else ""
+            authority.run["native_first_cause"] = lifecycle["first_cause"] = lifecycle["readback"][
+                "first_cause"
+            ] = cause
+        elif changed == "missing_owner":
+            authority.run.pop("first_cause")
+        elif changed == "bool_owner":
+            authority.run["first_cause"] = False
+        else:
+            authority.run["first_cause"] = ""
+        authority.run["physical_result"] = copy.deepcopy(lifecycle)
+        saved = copy.deepcopy(authority.run)
+        result = start(authority, "physical-arm-hold-body")
+        assert not result["accepted"] and not result["effect_admitted"]
+        assert authority.run == saved and host.started == 1 and not host.next_start_entered.is_set()
+    finally:
+        host.cleanup_release.set()
+        host.next_start_release.set()
+        authority.close()
+        e.worker.join(2)
+
+
+@pytest.mark.parametrize("observed", [None, False, "", "foreign cached fault"])
+def test_observed_executor_fault_must_match_resident_typed_fault_under_terminal_binding(tmp_path, observed):
+    authority, e, host, _ = historical_live_feedback_fault_authority(tmp_path)
+    try:
+        assert e.can_start_after_fault(authority.run, observed_fault=observed) is False
+    finally:
+        host.cleanup_release.set()
+        host.next_start_release.set()
+        authority.close()
+        e.worker.join(2)
+
+
+def test_terminal_fault_qualifier_requires_observed_fault_keyword(tmp_path):
+    authority, e, host, _ = historical_fault_authority(tmp_path)
+    try:
+        with pytest.raises(TypeError):
+            e.can_start_after_fault(authority.run)
+    finally:
+        host.cleanup_release.set()
+        host.next_start_release.set()
+        authority.close()
+        e.worker.join(2)
+
+
+def test_executor_only_fault_with_explicit_consistent_native_none_still_requires_fresh_admission(tmp_path):
+    from tests.robots.test_am1_persistent_session import start
+
+    authority, e, host, _ = historical_fault_authority(tmp_path)
+    try:
+        e._lifecycle["first_cause"] = e._lifecycle["readback"]["first_cause"] = None
+        authority.run["native_first_cause"] = None
+        authority.run["physical_result"] = copy.deepcopy(e._lifecycle)
+        original = copy.deepcopy(authority.run)
+        result = start(authority, "physical-arm-hold-body")
+        assert result["accepted"] and not result["effect_admitted"]
+        assert host.next_start_entered.wait(1) and authority.run["native_live_at"] is None
+        assert original["first_cause"] and original["native_first_cause"] is None
+    finally:
+        host.cleanup_release.set()
+        host.next_start_release.set()
+        authority.close()
+        e.worker.join(2)

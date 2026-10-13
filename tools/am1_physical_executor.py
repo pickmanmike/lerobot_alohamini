@@ -311,11 +311,12 @@ class PhysicalExecutor:
             },
         }
 
-    def can_start_after_fault(self, run):
+    def can_start_after_fault(self, run, *, observed_fault):
         """Allow a fresh startup after this exact resident fault's verified cleanup.
 
-        This checks cached terminal evidence only. It neither clears the original
-        fault nor reuses its feedback to admit the next run's physical effects.
+        This checks cached terminal evidence only. The current executor fault is
+        matched under its mutex; owner and native first causes remain separate.
+        It neither clears them nor admits effects without new-run feedback.
         """
         with self.mutex:
             lifecycle = self._lifecycle
@@ -327,7 +328,10 @@ class PhysicalExecutor:
                 and run.get("run_id") == self.run_id
                 and isinstance(self._fault, str)
                 and self._fault
-                and run.get("first_cause") == self._fault
+                and type(observed_fault) is str
+                and observed_fault == self._fault
+                and type(run.get("first_cause")) is str
+                and bool(run["first_cause"])
                 and lifecycle.get("run_id") == self.run_id
                 and lifecycle.get("backend_incarnation") == self.host_incarnation
                 and run.get("backend_incarnation", self.host_incarnation) == self.host_incarnation
@@ -352,8 +356,15 @@ class PhysicalExecutor:
                 receipt = lifecycle.get("readback")
                 readback = receipt.get("readback") if isinstance(receipt, dict) else None
                 camera = lifecycle.get("camera_release")
+                native_cause = lifecycle.get("first_cause")
                 if not (
-                    isinstance(readback, dict)
+                    "native_first_cause" in run
+                    and "first_cause" in lifecycle
+                    and isinstance(receipt, dict)
+                    and "first_cause" in receipt
+                    and (native_cause is None or type(native_cause) is str and bool(native_cause))
+                    and run["native_first_cause"] == native_cause == receipt["first_cause"]
+                    and isinstance(readback, dict)
                     and type(receipt.get("version")) is int
                     and readback.get("verified") is True
                     and readback.get("buses_closed") is True
