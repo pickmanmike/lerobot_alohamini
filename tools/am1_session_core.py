@@ -28,6 +28,14 @@ from tools.am1_fake_executor import FakeExecutor
 
 TERMINAL = {"stopped", "completed", "faulted", "interrupted"}
 
+# An ordinary named choice reuses the existing signed finite descriptor. It does
+# not extend the separately pinned positive endpoint-dwell exception.
+LEFT_ELBOW_NEGATIVE_COARSE_BENCH_V2 = SelectedElbowExperiment.from_payload(
+    {
+        **LEFT_ELBOW_COARSE_BENCH_V2.payload,
+        "excursion_norm": -10,
+    }
+)
 
 def _selected_experiment_definition(run):
     """Recover the exact admitted condition; a descriptor alone cannot grant authority."""
@@ -2443,10 +2451,25 @@ class SessionAuthority:
                 )
             )
 
-            view["presets"] = [dict(SELECTED_ELBOW_OPERATION_PRESET,
-                selected_experiment=LEFT_ELBOW_COARSE_BENCH_V2.payload)] if (
+            view["presets"] = (
+                [
+                    dict(
+                        id="left-elbow-negative-coarse-bench-v2",
+                        version=2,
+                        label="Left elbow negative coarse bench v2 · two cycles · fine position unqualified",
+                        recipe=SelectedElbowExperiment.recipe_name,
+                        selected_experiment=LEFT_ELBOW_NEGATIVE_COARSE_BENCH_V2.payload,
+                        selected_experiment_sha256=LEFT_ELBOW_NEGATIVE_COARSE_BENCH_V2.sha256,
+                    ),
+                    dict(SELECTED_ELBOW_OPERATION_PRESET, selected_experiment=LEFT_ELBOW_COARSE_BENCH_V2.payload),
+                ]
+                if (
                     SelectedElbowExperiment.recipe_name in view["recipes"]
-                    and self.executor.source == "protected-physical-provider") else []
+                    and self.executor.source == "protected-physical-provider"
+                )
+                else []
+            )
+
             if self.executor.source != "protected-physical-provider":
                 return view
             return self._essential_status(view, evidence)

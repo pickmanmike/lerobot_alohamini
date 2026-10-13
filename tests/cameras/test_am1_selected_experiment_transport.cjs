@@ -78,3 +78,43 @@ for(const [name,id,version] of [
   transport.snapshot={presets:[{id,version,recipe,selected_experiment:operationDescriptor()}]};
   await assert.rejects(()=>transport.startPreset(id),/preset/i);assert.equal(calls,0);
 });
+
+
+const NEGATIVE_ID="left-elbow-negative-coarse-bench-v2",NEGATIVE_SHA="86c16ecbcfcb864b0ddb9caaff25d306a9c4d991730f853d6e09e91b50bbdd1c";
+function negativeDescriptor(){return {...operationDescriptor(),excursion_norm:-10,
+ envelope_sha256:"ea8ed4e0abd5222734cd77cffc22c50739d53ab4cbde999016b33606af7648f5"};}
+function negativePreset(){return {id:NEGATIVE_ID,version:2,recipe,label:"Negative coarse response",selected_experiment:negativeDescriptor(),selected_experiment_sha256:NEGATIVE_SHA};}
+
+test("negative V2 named preset submits one ordinary immutable exact signed condition",async()=>{
+ const data=negativePreset(),original=JSON.stringify(data.selected_experiment),requests=[];
+ assert.equal(require("node:crypto").createHash("sha256").update(JSON.stringify(Object.fromEntries(Object.keys(data.selected_experiment).sort().map(key=>[key,data.selected_experiment[key]])))).digest("hex"),NEGATIVE_SHA);
+ const transport=fixture(async(url,options)=>{requests.push(JSON.parse(options.body));return {ok:true,json:async()=>({accepted:true,status:"starting"})};});
+ transport.snapshot={presets:[data]};await transport.startPreset(NEGATIVE_ID);
+ assert.equal(requests.length,1);assert.equal(requests[0].recipe,recipe);
+ assert.equal(JSON.stringify(requests[0].selected_experiment),original);
+ assert.equal(requests[0].selected_experiment.excursion_norm,-10);
+ assert.equal(requests[0].selected_experiment.return_tolerance_raw,22);
+ assert.equal(requests[0].selected_experiment.minimum_response_raw,56);
+ assert.equal(requests[0].controller_generation,"claimed");
+});
+
+for(const [name,change] of [
+ ["positive direction under negative ID",p=>p.selected_experiment.excursion_norm=10],
+ ["altered response criteria",p=>p.selected_experiment.minimum_response_raw=55],
+ ["altered return criteria",p=>p.selected_experiment.return_tolerance_raw=35],
+ ["altered current",p=>p.selected_experiment.current_cap_ma=151],
+ ["altered ramp",p=>p.selected_experiment.ramp_s=9],
+ ["foreign envelope",p=>p.selected_experiment.envelope_sha256="a".repeat(64)],
+ ["altered checkpoints",p=>p.selected_experiment.goal_readback_checkpoints_s[1]=38],
+ ["wrong descriptor hash",p=>p.selected_experiment_sha256="a".repeat(64)],
+ ["missing descriptor hash",p=>delete p.selected_experiment_sha256],
+ ["wrong version",p=>p.version=1],
+ ["boolean scalar",p=>p.selected_experiment.cycle_count=true],
+ ["string scalar",p=>p.selected_experiment.current_cap_ma="150"],
+ ["extra descriptor key",p=>p.selected_experiment.raw_origin=2474],
+ ["missing descriptor key",p=>delete p.selected_experiment.live_ceiling_s],
+])test("negative named preset refuses "+name+" before HTTP",async()=>{
+ let calls=0;const transport=fixture(async()=>{calls++;return {ok:true,json:async()=>({accepted:true})};});
+ const p=negativePreset();change(p);transport.snapshot={presets:[p]};
+ await assert.rejects(()=>transport.startPreset(NEGATIVE_ID),/preset/i);assert.equal(calls,0);
+});

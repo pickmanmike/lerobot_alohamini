@@ -134,10 +134,17 @@ class AM1SessionTransport {
     this.render(this,result.reason);return result;
   }
   async startPreset(id) {
-    const versions={"left-elbow-coarse-bench-v1":1,"left-elbow-coarse-bench-v2":2};
+    const versions={"left-elbow-coarse-bench-v1":1,"left-elbow-coarse-bench-v2":2,"left-elbow-negative-coarse-bench-v2":2};
     const version=typeof id==="string" && Object.hasOwn(versions,id) ? versions[id] : null;
     const preset=this.snapshot?.presets?.find(value=>value.id===id);
     if(version===null || !preset || preset.version!==version || preset.recipe!=="physical-left-elbow-experiment")throw Error("Current named preset required");
+    if(id==="left-elbow-negative-coarse-bench-v2") {
+      const value=preset.selected_experiment,expected={schema_version:2,envelope_sha256:"ea8ed4e0abd5222734cd77cffc22c50739d53ab4cbde999016b33606af7648f5",
+        excursion_norm:-10,ramp_s:10,endpoint_dwell_s:2,current_cap_ma:150,live_ceiling_s:90,minimum_response_raw:56,return_tolerance_raw:22,cycle_count:2,intercycle_hold_s:6};
+      if(preset.selected_experiment_sha256!=="86c16ecbcfcb864b0ddb9caaff25d306a9c4d991730f853d6e09e91b50bbdd1c" || !value || typeof value!=="object" || Array.isArray(value)
+        || Object.keys(value).length!==Object.keys(expected).length+1 || Object.entries(expected).some(([key,wanted])=>!Object.hasOwn(value,key) || value[key]!==wanted)
+        || !Object.hasOwn(value,"goal_readback_checkpoints_s") || !Array.isArray(value.goal_readback_checkpoints_s) || JSON.stringify(value.goal_readback_checkpoints_s)!=="[5,37]")throw Error("Exact negative named preset required");
+    }
     return this.start(preset.recipe,null,preset.selected_experiment);
   }
   async readDetail(reference,{raw=false}={}) {
