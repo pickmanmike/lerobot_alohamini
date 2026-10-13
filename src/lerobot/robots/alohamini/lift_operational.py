@@ -256,7 +256,7 @@ class OperationalLift(InstalledLiftCheck):
         last_stamp = None
         recent_motion: deque[dict[str, Any]] = deque(maxlen=feedback.STATIONARY_PERSISTENT_SAMPLES)
 
-        def observe(record: dict[str, Any]) -> None:
+        def observe(record: dict[str, Any]) -> bool:
             nonlocal anchor, minimum, maximum, last_stamp
             stamp = record["sample_monotonic_s"]
             now = clock(record)
@@ -314,9 +314,18 @@ class OperationalLift(InstalledLiftCheck):
                 same_positive = all(value > feedback.STILL_VELOCITY_RAW for value in velocities)
                 same_negative = all(value < -feedback.STILL_VELOCITY_RAW for value in velocities)
                 if moving_without_velocity or same_positive or same_negative:
-                    self.refuse(
-                        record, "startup off: velocity or Moving reported persistent motion during the stationary window."
-                    )
+                    if record["phase"] == "startup_off_acquisition":
+                        self.refuse(
+                            record, "startup off: velocity or Moving reported persistent motion during the stationary window."
+                        )
+                    record["startup_off_motion_candidate_reset"] = True
+                    record["startup_off_indicator_sample_times"] = [
+                        sample["sample_monotonic_s"] for sample in recent_motion
+                    ]
+                    record["startup_off_indicator_phases"] = [sample["phase"] for sample in recent_motion]
+                    return True
+            record["startup_off_motion_candidate_reset"] = False
+            return False
         while True:
             budget = min(self.monitor.sample_timeout_ms, remaining(request) * 1000)
             record = self.monitor.sample(
@@ -355,6 +364,7 @@ class OperationalLift(InstalledLiftCheck):
                 cold_start=True,
                 absolute_deadline_s=deadline,
                 on_sample=observe,
+                startup_off_candidate_reset=True,
             )
         finally:
             self.monitor.min_stationary_samples = stationary_samples

@@ -762,15 +762,29 @@ class MotorFeedbackComparison:
         max_position_delta_raw: int | None = None,
         allow_settling: bool = False,
         timeout_s: float = STATIONARY_TIMEOUT_S,
-        on_sample: Callable[[dict[str, Any]], None] | None = None,
+        on_sample: Callable[[dict[str, Any]], None | bool] | None = None,
         require_quiet_motion_feedback: bool = False,
         am1_post_home_origin_raw: int | None = None,
         cleanup_temperature_ready: Callable[[], bool] | None = None,
         absolute_deadline_s: float | None = None,
+        startup_off_candidate_reset: bool = False,
     ) -> dict[str, Any]:
         """Require one bounded window of fresh, mutually consistent feedback."""
         last_record: dict[str, Any] | None = None
         previous_clock = None
+        if type(startup_off_candidate_reset) is not bool:
+            raise ValueError("Startup off candidate reset must be an explicit Boolean.")
+        if startup_off_candidate_reset and (
+            absolute_deadline_s is None
+            or not callable(on_sample)
+            or type(self.min_stationary_samples) is not int
+            or self.min_stationary_samples != 9
+            or timeout_s != STATIONARY_TIMEOUT_S
+        ):
+            raise ValueError(
+                "Startup off reset requires the original absolute baseline budget, observer and nine samples."
+            )
+
         if absolute_deadline_s is not None:
             if (type(absolute_deadline_s) not in (int, float) or not math.isfinite(absolute_deadline_s)
                     or type(timeout_s) not in (int, float) or not math.isfinite(timeout_s) or timeout_s <= 0
@@ -819,6 +833,8 @@ class MotorFeedbackComparison:
         candidate: list[tuple[float, dict[str, Any]]] = []
         required_samples = self.min_stationary_samples
         required_window_s = STATIONARY_WINDOW_S
+        if startup_off_candidate_reset:
+            required_window_s = max(required_window_s, 8 * POLL_S)
         if require_quiet_motion_feedback:
             required_samples = max(required_samples, 5)
             required_window_s = max(required_window_s, 4 * POLL_S)
@@ -829,6 +845,33 @@ class MotorFeedbackComparison:
                 candidate = []
                 return
             self.refuse(record, reason)
+
+        reset_count = 0
+        last_reset_at = None
+
+
+        def reset_startup_candidate(record: dict[str, Any], sampled_at: float, source: str) -> None:
+            nonlocal candidate, reset_count, last_reset_at
+            discarded = len(candidate)
+            candidate = [(sampled_at, record)]
+            reset_count += 1
+            last_reset_at = sampled_at
+            self.emit(
+                {
+                    **record,
+                    "phase": "baseline_stationary_candidate_reset",
+                    "startup_off_motion_candidate_reset": True,
+                    "candidate_reset": {
+                        "version": 1,
+                        "source": source,
+                        "reason": "persistent_motion_indicator",
+                        "discarded_candidate_samples": discarded,
+                        "required_samples": required_samples,
+                        "trigger_sample_monotonic_s": record["sample_monotonic_s"],
+                        "absolute_deadline_monotonic_s": deadline,
+                    },
+                }
+            )
 
         while True:
             if absolute_deadline_s is not None and clock() >= deadline:
@@ -899,6 +942,14 @@ class MotorFeedbackComparison:
                     f"{phase}: travel exceeded {max_position_delta_raw} raw ticks.",
                 )
 
+            observer_reset = False
+            if startup_off_candidate_reset:
+                observer_reset = on_sample(record)
+                if type(observer_reset) is not bool:
+                    self.refuse(record, "baseline: whole-phase observer must return an explicit Boolean reset signal.")
+                if record.get("startup_off_motion_candidate_reset", False) is not observer_reset:
+                    self.refuse(record, "baseline: whole-phase reset signal differs from recorded provenance.")
+
             velocity = int(record["present_velocity_raw"])
             moving = int(record["moving"])
             if moving not in (0, 1):
@@ -917,6 +968,10 @@ class MotorFeedbackComparison:
                 reject_or_reset(
                     record, f"{phase}: motion feedback was not quiet during the stationary window."
                 )
+                continue
+
+            if observer_reset:
+                reset_startup_candidate(record, sampled_at, "whole_phase_observer")
                 continue
 
             proposed = [*candidate, (sampled_at, record)]
@@ -949,6 +1004,9 @@ class MotorFeedbackComparison:
                 same_positive = all(value > STILL_VELOCITY_RAW for value in velocities)
                 same_negative = all(value < -STILL_VELOCITY_RAW for value in velocities)
                 if moving_without_velocity or same_positive or same_negative:
+                    if startup_off_candidate_reset:
+                        reset_startup_candidate(record, sampled_at, "candidate_window")
+                        continue
                     reject_or_reset(
                         record,
                         f"{phase}: velocity or Moving reported persistent motion during "
@@ -958,7 +1016,7 @@ class MotorFeedbackComparison:
                         candidate = [(sampled_at, record)]
                     continue
 
-            if on_sample is not None and readiness is None:
+            if on_sample is not None and readiness is None and not startup_off_candidate_reset:
                 on_sample(record)
 
             window_s = candidate[-1][0] - candidate[0][0]
@@ -986,6 +1044,9 @@ class MotorFeedbackComparison:
                 "expected_torque": expected_torque,
                 "expected_goal_velocity_raw": expected_goal,
             }
+            if startup_off_candidate_reset:
+                evidence["startup_off_candidate_reset_count"] = reset_count
+                evidence["startup_off_last_reset_at_monotonic_s"] = last_reset_at
             if require_quiet_motion_feedback:
                 evidence["motion_feedback_quiet"] = True
             if readiness is not None:

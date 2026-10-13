@@ -2501,7 +2501,7 @@ def test_three_persistent_acquisition_indicators_refuse_before_home(
 
 
 @pytest.mark.parametrize("velocity", [-50, 50, 0])
-def test_persistent_stationary_indicator_obligation_carries_from_acquisition_into_baseline(
+def test_persistent_startup_off_indicators_reset_candidates_but_still_expire_original_deadline(
     operating_robot,
     monkeypatch,
     capsys,
@@ -2520,8 +2520,16 @@ def test_persistent_stationary_indicator_obligation_carries_from_acquisition_int
     acquisition = [r for r in records if r["phase"] == "startup_off_acquisition" and not r.get("rejected")]
     baseline = [r for r in records if r["phase"] == "baseline" and not r.get("rejected")]
     rejected = [r for r in records if r["phase"] == "baseline" and r.get("rejected")]
-    assert len(acquisition) == 1 and len(baseline) == 2 and len(rejected) == 1
-    assert "persistent motion" in rejected[0]["rejection_reason"]
+    resets = [r for r in records if r["phase"] == "baseline_stationary_candidate_reset"]
+    request = next(r for r in records if r["phase"] == "startup_off_request_started")
+    assert len(acquisition) == 1 and len(baseline) > 2 and len(rejected) == 1
+    assert len(resets) > 1
+    assert resets[0]["startup_off_indicator_phases"] == ["startup_off_acquisition", "baseline", "baseline"]
+    assert all(r["startup_off_recent_velocity_raw"] == [velocity] * 3 for r in resets)
+    assert all(r["candidate_reset"]["absolute_deadline_monotonic_s"] == request["absolute_deadline_monotonic_s"] for r in resets)
+    assert "deadline" in rejected[0]["rejection_reason"]
+    assert not any(r["phase"] == "startup_off_baseline_qualified" for r in records)
+    assert all(r["sample_monotonic_s"] <= request["absolute_deadline_monotonic_s"] for r in baseline)
     assert_no_startup_motion(robot)
 
 
@@ -2605,3 +2613,217 @@ def test_original_35ms_relief_helper_latency_retains_the_earlier_thermal_stale_r
     assert bus.registers[("Goal_Velocity", "lift_axis")] == 0
     assert bus.registers[("Torque_Enable", "lift_axis")] == 0
     assert not bus.is_connected
+
+
+def test_startup08_persistent_indicator_candidate_must_settle_to_a_full_new_window(
+    operating_robot,
+    monkeypatch,
+    capsys,
+):
+    robot, _ = operating_robot
+
+    def fault(index, phase, monitor):
+        velocity = -50 if 1 <= index <= 3 else 0
+        robot.left_bus.read_sequences[("Present_Velocity", "lift_axis")] = [velocity]
+        robot.left_bus.read_sequences[("Moving", "lift_axis")] = [int(velocity != 0)]
+
+    inject_startup_off_feedback(monkeypatch, robot, torque=(0,), faults=fault)
+    robot.connect(calibrate=False)
+    records = operational_records(capsys)
+    resets = [r for r in records if r["phase"] == "baseline_stationary_candidate_reset"]
+    baseline = [r for r in records if r["phase"] == "baseline"]
+    request = next(r for r in records if r["phase"] == "startup_off_request_started")
+    qualified = next(r for r in records if r["phase"] == "startup_off_baseline_qualified")
+    assert len(resets) == 1 and len(baseline) == 11
+    assert resets[0]["startup_off_motion_candidate_reset"] is True
+    assert resets[0]["startup_off_recent_velocity_raw"] == [-50, -50, -50]
+    assert qualified["strict_baseline"]["sample_count"] == 9
+    assert qualified["strict_baseline"]["window_s"] >= 0.4
+    assert qualified["sample_monotonic_s"] - request["requested_at_monotonic_s"] == pytest.approx(0.574)
+    assert qualified["sample_monotonic_s"] <= request["absolute_deadline_monotonic_s"]
+    assert all(r["torque_enable"] == 0 and r["present_position_raw"] == 1000 for r in baseline)
+    assert baseline[-1]["temperature_window"]["count"] == 5
+    assert baseline[-1]["temperature_window"]["ready"]
+    robot.disconnect()
+
+
+@pytest.mark.parametrize("velocity", [-50, 50, 0])
+def test_crossphase_persistent_indicator_resets_even_with_only_two_baseline_votes(
+    operating_robot,
+    monkeypatch,
+    capsys,
+    velocity,
+):
+    robot, _ = operating_robot
+
+    def fault(index, phase, monitor):
+        robot.left_bus.read_sequences[("Present_Velocity", "lift_axis")] = [velocity if index <= 2 else 0]
+        robot.left_bus.read_sequences[("Moving", "lift_axis")] = [1 if index <= 2 else 0]
+
+    inject_startup_off_feedback(monkeypatch, robot, torque=(0,), faults=fault)
+    robot.connect(calibrate=False)
+    records = operational_records(capsys)
+    resets = [r for r in records if r["phase"] == "baseline_stationary_candidate_reset"]
+    baseline = [r for r in records if r["phase"] == "baseline"]
+    qualified = next(r for r in records if r["phase"] == "startup_off_baseline_qualified")
+    assert len(resets) == 1 and len(baseline) == 10
+    assert resets[0]["startup_off_recent_velocity_raw"] == [velocity] * 3
+    assert qualified["strict_baseline"]["sample_count"] == 9
+    assert qualified["strict_baseline"]["window_s"] >= 0.4
+    robot.disconnect()
+
+
+def test_startup_candidate_reset_cannot_hide_whole_phase_two_tick_drift(
+    operating_robot,
+    monkeypatch,
+    capsys,
+):
+    robot, _ = operating_robot
+
+    def fault(index, phase, monitor):
+        velocity = -50 if 1 <= index <= 3 else 0
+        robot.left_bus.read_sequences[("Present_Velocity", "lift_axis")] = [velocity]
+        robot.left_bus.position = 1001 if 1 <= index <= 3 else 1002 if index >= 4 else 1000
+
+    inject_startup_off_feedback(monkeypatch, robot, torque=(0,), faults=fault)
+    with pytest.raises(RuntimeError, match="AlohaMini motor activation failed"):
+        robot.connect(calibrate=False)
+    records = operational_records(capsys)
+    assert any(r["phase"] == "baseline_stationary_candidate_reset" for r in records)
+    assert any(r.get("rejected") and "whole-phase position" in r["rejection_reason"] for r in records)
+    assert_no_startup_motion(robot)
+
+
+@pytest.mark.parametrize("last_indicator", [4, 8])
+def test_late_or_repeated_startup_candidate_reset_cannot_renew_the_original_deadline(
+    operating_robot,
+    monkeypatch,
+    capsys,
+    last_indicator,
+):
+    robot, _ = operating_robot
+
+    def fault(index, phase, monitor):
+        velocity = -50 if 1 <= index <= last_indicator else 0
+        robot.left_bus.read_sequences[("Present_Velocity", "lift_axis")] = [velocity]
+        robot.left_bus.read_sequences[("Moving", "lift_axis")] = [int(velocity != 0)]
+
+    inject_startup_off_feedback(monkeypatch, robot, torque=(0,), faults=fault)
+    with pytest.raises(RuntimeError, match="AlohaMini motor activation failed"):
+        robot.connect(calibrate=False)
+    records = operational_records(capsys)
+    request = next(r for r in records if r["phase"] == "startup_off_request_started")
+    resets = [r for r in records if r["phase"] == "baseline_stationary_candidate_reset"]
+    baseline = [r for r in records if r["phase"] == "baseline" and not r.get("rejected")]
+    assert len(resets) >= 2
+    assert all(
+        r["candidate_reset"]["absolute_deadline_monotonic_s"] == request["absolute_deadline_monotonic_s"]
+        for r in resets
+    )
+    assert all(r["sample_monotonic_s"] <= request["absolute_deadline_monotonic_s"] for r in baseline)
+    assert any(r.get("rejected") and "deadline" in r["rejection_reason"] for r in records)
+    assert not any(r["phase"] == "startup_off_baseline_qualified" for r in records)
+    assert_no_startup_motion(robot)
+
+
+@pytest.mark.parametrize("fault_at", [3, 4])
+@pytest.mark.parametrize(
+    "register,value",
+    [
+        ("Moving", 2),
+        ("Present_Velocity", 51),
+        ("Present_Current", 31),
+        ("Status", 8),
+        ("Operating_Mode", 0),
+        ("Present_Voltage", 0),
+        ("Torque_Enable", 1),
+        ("Goal_Velocity", 1),
+    ],
+)
+def test_startup_candidate_reset_cannot_hide_hard_feedback_at_or_after_its_trigger(
+    operating_robot,
+    monkeypatch,
+    capsys,
+    fault_at,
+    register,
+    value,
+):
+    robot, _ = operating_robot
+
+    def fault(index, phase, monitor):
+        velocity = -50 if 1 <= index <= 3 else 0
+        robot.left_bus.read_sequences[("Present_Velocity", "lift_axis")] = [velocity]
+        robot.left_bus.read_sequences[("Moving", "lift_axis")] = [int(velocity != 0)]
+        if index == fault_at:
+            robot.left_bus.read_sequences[(register, "lift_axis")] = [value]
+
+    inject_startup_off_feedback(monkeypatch, robot, torque=(0,), faults=fault)
+    with pytest.raises(RuntimeError, match="AlohaMini motor activation failed"):
+        robot.connect(calibrate=False)
+    records = operational_records(capsys)
+    assert any(r.get("rejected") and r["phase"] == "baseline" for r in records)
+    resets = [r for r in records if r["phase"] == "baseline_stationary_candidate_reset"]
+    assert len(resets) == (1 if fault_at == 4 else 0)
+    assert not any(r["phase"] == "startup_off_baseline_qualified" for r in records)
+    assert_no_startup_motion(robot)
+
+
+@pytest.mark.parametrize("fault", ["duplicate_stamp", "late_request"])
+def test_startup_candidate_reset_preserves_original_feedback_clock_and_request_budget_after_reset(
+    operating_robot,
+    monkeypatch,
+    capsys,
+    fault,
+):
+    robot, clock = operating_robot
+    observed = []
+
+    def inject(index, phase, monitor):
+        velocity = -50 if 1 <= index <= 3 else 0
+        robot.left_bus.read_sequences[("Present_Velocity", "lift_axis")] = [velocity]
+        robot.left_bus.read_sequences[("Moving", "lift_axis")] = [int(velocity != 0)]
+        if index == 4 and fault == "duplicate_stamp":
+            monkeypatch.setattr(monitor, "monotonic", lambda: observed[-1]["sample_monotonic_s"])
+        elif index == 4 and fault == "late_request":
+            fired = []
+
+            def hook(register):
+                if register == "Torque_Enable" and not fired:
+                    fired.append(True)
+                    clock.sleep(0.041)
+
+            robot.left_bus.hook = hook
+
+    observed = inject_startup_off_feedback(monkeypatch, robot, torque=(0,), faults=inject)
+    with pytest.raises(RuntimeError, match="AlohaMini motor activation failed"):
+        robot.connect(calibrate=False)
+    records = operational_records(capsys)
+    assert len([r for r in records if r["phase"] == "baseline_stationary_candidate_reset"]) == 1
+    rejected = [r for r in records if r.get("rejected") and r["phase"] == "baseline"]
+    assert len(rejected) == 1
+    assert any(word in rejected[0]["rejection_reason"] for word in ("timestamp", "clock", "40 ms"))
+    assert not any(r["phase"] == "startup_off_baseline_qualified" for r in records)
+    assert_no_startup_motion(robot)
+
+
+def test_startup_candidate_reset_cannot_clear_the_original_thermal_slot_history(
+    operating_robot,
+    monkeypatch,
+    capsys,
+):
+    robot, _ = operating_robot
+
+    def fault(index, phase, monitor):
+        velocity = -50 if 1 <= index <= 3 else 0
+        robot.left_bus.read_sequences[("Present_Velocity", "lift_axis")] = [velocity]
+        robot.left_bus.read_sequences[("Moving", "lift_axis")] = [int(velocity != 0)]
+        robot.left_bus.read_sequences[("Present_Temperature", "lift_axis")] = [60]
+
+    inject_startup_off_feedback(monkeypatch, robot, torque=(0,), faults=fault)
+    with pytest.raises(RuntimeError, match="AlohaMini motor activation failed"):
+        robot.connect(calibrate=False)
+    records = operational_records(capsys)
+    assert len([r for r in records if r["phase"] == "baseline_stationary_candidate_reset"]) == 1
+    assert any(r.get("rejected") and "3/5" in r["rejection_reason"] for r in records)
+    assert not any(r["phase"] == "startup_off_baseline_qualified" for r in records)
+    assert_no_startup_motion(robot)

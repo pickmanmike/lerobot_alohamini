@@ -1243,3 +1243,146 @@ def test_partial_open_failure_still_requests_zero_torque_off_and_close() -> None
     assert (feedback.TORQUE_ENABLE_ADDRESS, 1, 0) in transport.writes
     assert transport.closed
     assert records[-1]["status"] == "refused"
+
+
+def test_explicit_startup_reset_collects_a_new_nine_sample_candidate_within_original_deadline():
+    clock = FakeClock()
+    records = []
+    seen = []
+    # Each original scripted group reply consumes 1.7 ms; no production clock tolerance is added.
+    transport = ScriptedFeedbackTransport(
+        clock=clock,
+        samples=[
+            {
+                "present_velocity": -50 if index < 3 else 0,
+                "moving": int(index < 3),
+                "at_s": 0.0017 + index * 0.0517,
+            }
+            for index in range(11)
+        ],
+    )
+    comparison = make_comparison(transport, clock, records)
+    comparison.min_stationary_samples = 9
+    result = comparison.qualify_stationary(
+        "baseline",
+        expected_torque=0,
+        expected_goal=0,
+        cold_start=True,
+        absolute_deadline_s=0.6,
+        startup_off_candidate_reset=True,
+        on_sample=lambda record: seen.append(record["sample_monotonic_s"]) or False,
+    )
+    assert len(seen) == 11
+    assert result["stationary_qualification"]["sample_count"] == 9
+    assert result["stationary_qualification"]["window_s"] >= 0.4
+    assert result["sample_monotonic_s"] == pytest.approx(0.5187)
+    assert any(r["phase"] == "baseline_stationary_candidate_reset" for r in records)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"phase": "cleanup_readback"},
+        {"expected_torque": 1},
+        {"expected_goal": 1},
+        {"cold_start": False},
+        {"absolute_deadline_s": None},
+        {"on_sample": None},
+        {"startup_off_candidate_reset": 1},
+        {"allow_settling": True},
+        {"required_samples": 5},
+        {"required_samples": True},
+        {"timeout_s": 0.7},
+        {"timeout_s": float("nan")},
+        {"expected_torque": False},
+        {"expected_goal": False},
+        {"startup_off_candidate_reset": None},
+    ],
+)
+def test_startup_candidate_reset_selector_is_closed_before_io(change):
+    clock = FakeClock()
+    records = []
+    transport = ScriptedFeedbackTransport(clock=clock)
+    comparison = make_comparison(transport, clock, records)
+    comparison.min_stationary_samples = change.get("required_samples", 9)
+    arguments = dict(
+        phase="baseline",
+        expected_torque=0,
+        expected_goal=0,
+        cold_start=True,
+        absolute_deadline_s=0.6,
+        startup_off_candidate_reset=True,
+        on_sample=lambda record: False,
+    )
+    arguments.update({k: v for k, v in change.items() if k != "required_samples"})
+    before = len(transport.group_reads)
+    with pytest.raises(ValueError):
+        comparison.qualify_stationary(**arguments)
+    assert len(transport.group_reads) == before
+
+
+@pytest.mark.parametrize("signal,recorded", [(None, False), (1, True), (True, False), (False, True)])
+def test_startup_candidate_reset_observer_requires_typed_matched_recorded_signal(signal, recorded):
+    clock = FakeClock()
+    records = []
+    transport = ScriptedFeedbackTransport(clock=clock)
+    comparison = make_comparison(transport, clock, records)
+    comparison.min_stationary_samples = 9
+
+    def observe(record):
+        record["startup_off_motion_candidate_reset"] = recorded
+        return signal
+
+    with pytest.raises(feedback.ComparisonRefusal, match="observer|provenance"):
+        comparison.qualify_stationary(
+            "baseline",
+            expected_torque=0,
+            expected_goal=0,
+            cold_start=True,
+            absolute_deadline_s=0.6,
+            startup_off_candidate_reset=True,
+            on_sample=observe,
+        )
+    assert len(transport.group_reads) == 1
+    assert not any(r["phase"] == "baseline_stationary_candidate_reset" for r in records)
+
+
+def test_default_stationary_policy_still_refuses_persistent_indicators_without_candidate_reset():
+    clock = FakeClock()
+    records = []
+    transport = ScriptedFeedbackTransport(
+        clock=clock, samples=[{"present_velocity": -50, "moving": 1} for _ in range(3)]
+    )
+    comparison = make_comparison(transport, clock, records)
+    comparison.min_stationary_samples = 9
+    with pytest.raises(feedback.ComparisonRefusal, match="persistent motion"):
+        comparison.qualify_stationary("baseline", expected_torque=0, expected_goal=0, cold_start=True)
+    assert len(transport.group_reads) == 3
+    assert not any(r["phase"] == "baseline_stationary_candidate_reset" for r in records)
+
+
+def test_selected_startup_reset_preserves_zero_latency_boundary_evidence_truthfully():
+    clock = FakeClock()
+    records = []
+    seen = []
+    transport = ScriptedFeedbackTransport(
+        clock=clock,
+        samples=[{"present_velocity": -50, "moving": 1} for _ in range(3)]
+        + [{"present_velocity": 0, "moving": 0} for _ in range(9)],
+    )
+    comparison = make_comparison(transport, clock, records)
+    comparison.min_stationary_samples = 9
+    result = comparison.qualify_stationary(
+        "baseline",
+        expected_torque=0,
+        expected_goal=0,
+        cold_start=True,
+        absolute_deadline_s=0.6,
+        startup_off_candidate_reset=True,
+        on_sample=lambda record: seen.append(record["sample_monotonic_s"]) or False,
+    )
+    # Binary representation puts nine votes just short of .4 s, so a tenth is needed.
+    assert len(seen) == 12
+    assert result["stationary_qualification"]["sample_count"] == 10
+    assert result["sample_monotonic_s"] == pytest.approx(0.55)
+    assert result["sample_monotonic_s"] <= 0.6
