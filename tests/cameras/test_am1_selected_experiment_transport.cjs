@@ -118,3 +118,64 @@ for(const [name,change] of [
  const p=negativePreset();change(p);transport.snapshot={presets:[p]};
  await assert.rejects(()=>transport.startPreset(NEGATIVE_ID),/preset/i);assert.equal(calls,0);
 });
+
+
+const NEGATIVE_V3_ID="left-elbow-negative-coarse-bench-v3",NEGATIVE_V3_SHA="c73ef75706fcce9b1772b0927071e5ce41dc6c382cd60760c7033add48d1c709";
+const NEGATIVE_V3_ENVELOPE="6be735becc951f027f6c5886c1fd8f8f323118e8d6ff7931d46107e935a60c1c";
+function negativeV3Descriptor(){return {...negativeDescriptor(),envelope_sha256:NEGATIVE_V3_ENVELOPE,intercycle_hold_tolerance_raw:40};}
+function negativeV3Preset(){return {id:NEGATIVE_V3_ID,version:3,recipe,label:"Negative stable hold 40 · return 22 · fine position unqualified",
+ selected_experiment:negativeV3Descriptor(),selected_experiment_sha256:NEGATIVE_V3_SHA};}
+
+test("negative V3 named preset submits one immutable exact condition with separate hold and return limits",async()=>{
+ const p=negativeV3Preset(),original=JSON.stringify(p.selected_experiment),requests=[];
+ assert.equal(require("node:crypto").createHash("sha256").update(JSON.stringify(Object.fromEntries(Object.keys(p.selected_experiment).sort().map(key=>[key,p.selected_experiment[key]])))).digest("hex"),NEGATIVE_V3_SHA);
+ const transport=fixture(async(url,options)=>{requests.push(JSON.parse(options.body));return {ok:true,json:async()=>({accepted:true,status:"starting"})};});
+ transport.snapshot={presets:[p]};await transport.startPreset(NEGATIVE_V3_ID);
+ assert.equal(requests.length,1);assert.equal(requests[0].recipe,recipe);
+ assert.equal(JSON.stringify(requests[0].selected_experiment),original);
+ assert.equal(requests[0].selected_experiment.intercycle_hold_tolerance_raw,40);
+ assert.equal(requests[0].selected_experiment.return_tolerance_raw,22);
+ assert.equal(requests[0].selected_experiment.minimum_response_raw,56);
+ assert.equal(requests[0].controller_generation,"claimed");assert.equal(JSON.stringify(p.selected_experiment),original);
+});
+
+for(const [name,change] of [
+ ["positive direction",p=>p.selected_experiment.excursion_norm=10],
+ ["old envelope",p=>p.selected_experiment.envelope_sha256=negativeDescriptor().envelope_sha256],
+ ["schema3",p=>p.selected_experiment.schema_version=3],
+ ["ramp9",p=>p.selected_experiment.ramp_s=9],
+ ["dwell1",p=>p.selected_experiment.endpoint_dwell_s=1],
+ ["current149",p=>p.selected_experiment.current_cap_ma=149],
+ ["live89",p=>p.selected_experiment.live_ceiling_s=89],
+ ["response55",p=>p.selected_experiment.minimum_response_raw=55],
+ ["return35",p=>p.selected_experiment.return_tolerance_raw=35],
+ ["one cycle",p=>p.selected_experiment.cycle_count=1],
+ ["hold5",p=>p.selected_experiment.intercycle_hold_s=5],
+ ["hold tolerance41",p=>p.selected_experiment.intercycle_hold_tolerance_raw=41],
+ ["boolean hold tolerance",p=>p.selected_experiment.intercycle_hold_tolerance_raw=true],
+ ["string hold tolerance",p=>p.selected_experiment.intercycle_hold_tolerance_raw="40"],
+ ["missing hold tolerance",p=>delete p.selected_experiment.intercycle_hold_tolerance_raw],
+ ["extra spread scalar",p=>p.selected_experiment.intercycle_hold_spread_raw=2],
+ ["checkpoint38",p=>p.selected_experiment.goal_readback_checkpoints_s[1]=38],
+ ["wrong SHA",p=>p.selected_experiment_sha256="a".repeat(64)],
+ ["missing SHA",p=>delete p.selected_experiment_sha256],
+ ["version2",p=>p.version=2],["boolean version",p=>p.version=true],["string version",p=>p.version="3"],
+])test("negative V3 named preset rejects "+name+" before invoking Start",async()=>{
+ const p=negativeV3Preset();change(p);const transport=fixture(()=>{});transport.snapshot={presets:[p]};
+ let starts=0;transport.start=async()=>{starts++;return {accepted:true};};
+ await assert.rejects(()=>transport.startPreset(NEGATIVE_V3_ID),/preset/i);assert.equal(starts,0);
+});
+
+test("generic selected Start accepts only the literal V3 condition under its new envelope",async()=>{
+ const requests=[],transport=fixture(async(url,options)=>{requests.push(JSON.parse(options.body));return {ok:true,json:async()=>({accepted:true})};});
+ await transport.start(recipe,null,negativeV3Descriptor());
+ assert.equal(requests.length,1);assert.equal(requests[0].selected_experiment.intercycle_hold_tolerance_raw,40);
+ for(const value of [
+  {...negativeDescriptor(),intercycle_hold_tolerance_raw:40},
+  {...negativeV3Descriptor(),intercycle_hold_tolerance_raw:41},
+  {...negativeV3Descriptor(),return_tolerance_raw:35},
+  {...negativeV3Descriptor(),excursion_norm:10},
+  {...negativeV3Descriptor(),goal_readback_checkpoints_s:[5,38]},
+ ])await assert.rejects(()=>transport.start(recipe,null,value),/experiment/i);
+ assert.equal(requests.length,1);
+});

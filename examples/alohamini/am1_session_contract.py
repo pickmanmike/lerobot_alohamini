@@ -400,7 +400,9 @@ class PositiveElbowControl:
             or baseline["position"]["raw"] != o["outward_anchor_raw"]
             or not self.window_valid(baseline_window)
             or baseline_window["last_position_completed_at"] != baseline["position"]["read_completed_at_monotonic_s"]
-            or baseline_window["qualified_at_monotonic_s"] != baseline["captured_at_monotonic_s"]):
+            or (baseline_window["qualified_at_monotonic_s"] > baseline["captured_at_monotonic_s"]
+                if composed and cycle == 2 and getattr(self, "intercycle_hold_admission_rule", None) is not None
+                else baseline_window["qualified_at_monotonic_s"] != baseline["captured_at_monotonic_s"])):
             return None
         endpoint,peak,departure=o.get("endpoint_anchor_proof"),o.get("endpoint_peak_proof"),o.get("first_return_proof")
         endpoint_window=o.get("endpoint_window")
@@ -576,6 +578,21 @@ SELECTED_ELBOW_EXPERIMENT_OPERATION_DWELL_ENVELOPE_SHA256 = hashlib.sha256(json.
 ).encode()).hexdigest()
 
 
+# Stable coarse hold admission is distinct from return and fine-position scoring.
+# This named negative condition retains the original moving response obligations.
+SELECTED_ELBOW_EXPERIMENT_NEGATIVE_HOLD_ENVELOPE = MappingProxyType({
+    **dict(SELECTED_ELBOW_EXPERIMENT_OPERATION_ENVELOPE),
+    "scope": "AM1-OPERATION-RECOVERY-07/fixed-reference-negative-coarse-bench-v3",
+    "intercycle_hold_tolerance_raw": 40,
+    "intercycle_hold_spread_raw": 2,
+    "intercycle_hold_max_samples": 12,
+})
+SELECTED_ELBOW_EXPERIMENT_NEGATIVE_HOLD_ENVELOPE_SHA256 = hashlib.sha256(json.dumps(
+    dict(SELECTED_ELBOW_EXPERIMENT_NEGATIVE_HOLD_ENVELOPE), sort_keys=True, allow_nan=False,
+    separators=(",", ":"),
+).encode()).hexdigest()
+
+
 @dataclass(frozen=True)
 class SelectedElbowExperiment:
     """One validated, pinned finite condition on the existing selected provider."""
@@ -592,6 +609,7 @@ class SelectedElbowExperiment:
     goal_readback_checkpoints_s: tuple[float, ...]
     cycle_count: int = 1
     intercycle_hold_s: float = 0.0
+    intercycle_hold_tolerance_raw: int | None = None
 
     recipe_name = "physical-left-elbow-experiment"
     profile = "LeftElbowExperiment"
@@ -611,11 +629,25 @@ class SelectedElbowExperiment:
             SELECTED_ELBOW_EXPERIMENT_OPERATION_ENVELOPE_SHA256: SELECTED_ELBOW_EXPERIMENT_OPERATION_ENVELOPE,
             SELECTED_ELBOW_EXPERIMENT_OPERATION_DWELL_ENVELOPE_SHA256:
                 SELECTED_ELBOW_EXPERIMENT_OPERATION_DWELL_ENVELOPE,
+            SELECTED_ELBOW_EXPERIMENT_NEGATIVE_HOLD_ENVELOPE_SHA256:
+                SELECTED_ELBOW_EXPERIMENT_NEGATIVE_HOLD_ENVELOPE,
         }
         if (type(self.schema_version) is not int or self.schema_version not in (1, 2)
                 or type(self.envelope_sha256) is not str or self.envelope_sha256 not in envelopes):
             raise ValueError("selected experiment requires its exact schema and approved envelope pin")
         e = envelopes[self.envelope_sha256]
+        if self.envelope_sha256 == SELECTED_ELBOW_EXPERIMENT_NEGATIVE_HOLD_ENVELOPE_SHA256:
+            exact = {"schema_version": 2, "excursion_norm": -10, "ramp_s": 10,
+                     "endpoint_dwell_s": 2, "current_cap_ma": 150, "live_ceiling_s": 90,
+                     "minimum_response_raw": 56, "return_tolerance_raw": 22,
+                     "cycle_count": 2, "intercycle_hold_s": 6, "intercycle_hold_tolerance_raw": 40}
+            if (any(type(getattr(self, key)) is not int or getattr(self, key) != value
+                    for key, value in exact.items())
+                    or self.goal_readback_checkpoints_s != (5, 37)
+                    or any(type(value) is not int for value in self.goal_readback_checkpoints_s)):
+                raise ValueError("exact named negative coarse hold condition required")
+        elif self.intercycle_hold_tolerance_raw is not None:
+            raise ValueError("hold admission belongs only to its separately pinned negative condition")
         if (self.schema_version != e["schema_version"] or type(self.cycle_count) is not int
                 or self.cycle_count != e.get("cycle_count", 1)
                 or type(self.intercycle_hold_s) not in (int, float) or not math.isfinite(self.intercycle_hold_s)
@@ -660,6 +692,9 @@ class SelectedElbowExperiment:
                 "goal_readback_checkpoints_s"}
         if isinstance(value, Mapping) and value.get("schema_version") == 2:
             keys |= {"cycle_count", "intercycle_hold_s"}
+        if (isinstance(value, Mapping)
+                and value.get("envelope_sha256") == SELECTED_ELBOW_EXPERIMENT_NEGATIVE_HOLD_ENVELOPE_SHA256):
+            keys.add("intercycle_hold_tolerance_raw")
         if not isinstance(value, Mapping) or set(value) != keys:
             raise ValueError("exact selected experiment payload required")
         points = value["goal_readback_checkpoints_s"]
@@ -671,7 +706,9 @@ class SelectedElbowExperiment:
     def payload(self):
         return {k: list(v) if k == "goal_readback_checkpoints_s" else v
                 for k, v in self.__dict__.items() if not k.startswith("_")
-                and (self.schema_version == 2 or k not in {"cycle_count", "intercycle_hold_s"})}
+                and (self.schema_version == 2 or k not in {"cycle_count", "intercycle_hold_s"})
+                and (k != "intercycle_hold_tolerance_raw"
+                     or self.envelope_sha256 == SELECTED_ELBOW_EXPERIMENT_NEGATIVE_HOLD_ENVELOPE_SHA256)}
 
     @property
     def sha256(self):
@@ -680,6 +717,153 @@ class SelectedElbowExperiment:
     @property
     def response_rule(self):
         return self._response_rule
+
+    @property
+    def intercycle_hold_admission_rule(self):
+        if self.envelope_sha256 != SELECTED_ELBOW_EXPERIMENT_NEGATIVE_HOLD_ENVELOPE_SHA256:
+            return None
+        return MappingProxyType({"tolerance_raw": 40, "spread_raw": 2, "maximum_samples": 12})
+
+    @staticmethod
+    def _hold_certificate(proof):
+        return {"observation_id": proof["observation_id"], "action_sequence": proof["action_sequence"],
+                "current_raw": proof["current"]["raw"],
+                "progress_s": proof["context"]["progress_s"], "phase": proof["context"]["phase"],
+                "position_raw": proof["position"]["raw"],
+                **{f"{name}_read_{part}_at_monotonic_s": proof[name][f"read_{part}_at_monotonic_s"]
+                   for name in ("position", "current") for part in ("started", "completed")},
+                "acquired_at_monotonic_s": proof["acquired_at_monotonic_s"]}
+
+    def intercycle_hold_admission_valid(self, proof, anchor, origin, *, now):
+        """Validate current native hold evidence without changing return scoring."""
+        try:
+            keys = {"version", "status", "binding", "calibration", "reference_normalized",
+                    "measured_origin_raw", "expected_goal_raw", "original_reference", "hold_cursor",
+                    "qualified_at_monotonic_s", "rows"}
+            if (self.intercycle_hold_admission_rule is None or not isinstance(proof, dict)
+                    or set(proof) != keys or type(proof["version"]) is not int or proof["version"] != 1
+                    or proof["status"] != "ready" or type(now) not in (int, float) or not math.isfinite(now)):
+                return False
+            binding, material, q0 = proof["binding"], proof["calibration"], proof["reference_normalized"]
+            if (not isinstance(binding, dict)
+                    or set(binding) != {"run_id", "host_incarnation", "experiment_sha256", "epoch", "intent_revision"}
+                    or any(type(binding[k]) is not str or uuid_text(binding[k]) != binding[k]
+                           for k in ("run_id", "host_incarnation"))
+                    or binding["experiment_sha256"] != self.sha256
+                    or any(type(binding[k]) is not int or binding[k] < 0 for k in ("epoch", "intent_revision"))
+                    or not self.measurement_proof_valid(anchor, q0, material,
+                        run_id=binding["run_id"], host_incarnation=binding["host_incarnation"])
+                    or not self.measurement_proof_valid(origin, q0, material,
+                        run_id=binding["run_id"], host_incarnation=binding["host_incarnation"])
+                    or any(anchor[k] != binding[k] for k in ("epoch", "intent_revision"))
+                    or anchor["context"]["phase"] != "intercycle_hold" or anchor["context"]["cycle"] != 1
+                    or anchor["context"]["reference"] != q0 or anchor["context"]["requested_target"] != q0
+                    or origin["context"]["progress_s"] != 0 or origin["context"]["phase"] != "baseline"
+                    or origin["context"]["reference"] != q0 or origin["position"]["raw"] != self.measured_origin(q0, material)
+                    or type(proof["measured_origin_raw"]) is not int
+                    or proof["measured_origin_raw"] != self.measured_origin(q0, material)
+                    or type(proof["expected_goal_raw"]) is not int
+                    or proof["expected_goal_raw"] != self.encoded_goal(q0, material)):
+                return False
+            for native in (origin, anchor):
+                current = native["current"]
+                times = [native["acquired_at_monotonic_s"], native["captured_at_monotonic_s"],
+                         *[native[name][f"read_{part}_at_monotonic_s"]
+                           for name in ("position", "current") for part in ("started", "completed")]]
+                if (not all(type(v) in (int, float) and math.isfinite(v) and v >= 0 for v in times)
+                        or type(current["raw"]) is not int or type(current["ma"]) not in (int, float)
+                        or not math.isfinite(current["ma"]) or current["ma"] != current["raw"] * 6.5
+                        or abs(current["ma"]) >= self.current_cap_ma
+                        or not native["acquired_at_monotonic_s"] <= native["captured_at_monotonic_s"] <= now
+                        or any(not 0 <= native[name]["read_started_at_monotonic_s"]
+                               <= native[name]["read_completed_at_monotonic_s"] <= native["acquired_at_monotonic_s"]
+                               or native["captured_at_monotonic_s"] - native[name]["read_started_at_monotonic_s"] > .5
+                               for name in ("position", "current"))):
+                    return False
+            original = proof["original_reference"]
+            if (not isinstance(original, dict) or set(original) != {"epoch", "intent_revision", "certificate"}
+                    or any(type(original[k]) is not int or original[k] != origin[k] for k in ("epoch", "intent_revision"))):
+                return False
+            first_native, owner_origin = original["certificate"], self._hold_certificate(origin)
+            clockkeys = {"acquired_at_monotonic_s", *[f"{name}_read_{part}_at_monotonic_s"
+                         for name in ("position", "current") for part in ("started", "completed")]}
+            if (not isinstance(first_native, dict) or set(first_native) != set(owner_origin)
+                    or any(type(first_native[k]) is not int or not 0 <= first_native[k] <= owner_origin[k]
+                           for k in ("observation_id", "action_sequence"))
+                    or type(first_native["current_raw"]) is not int
+                    or abs(first_native["current_raw"]) * 6.5 >= self.current_cap_ma
+                    or type(first_native["position_raw"]) is not int
+                    or first_native["position_raw"] != proof["measured_origin_raw"]
+                    or first_native["phase"] != "baseline" or type(first_native["progress_s"]) not in (int, float)
+                    or first_native["progress_s"] != 0
+                    or any(type(first_native[k]) not in (int, float) or not math.isfinite(first_native[k])
+                           or not 0 <= first_native[k] <= owner_origin[k] for k in clockkeys)
+                    or any(not first_native[f"{name}_read_started_at_monotonic_s"]
+                           <= first_native[f"{name}_read_completed_at_monotonic_s"] <= first_native["acquired_at_monotonic_s"]
+                           or first_native["acquired_at_monotonic_s"] - first_native[f"{name}_read_started_at_monotonic_s"] > .5
+                           for name in ("position", "current"))
+                    or first_native["observation_id"] == owner_origin["observation_id"] and first_native != owner_origin
+                    or first_native["observation_id"] < owner_origin["observation_id"]
+                       and first_native["acquired_at_monotonic_s"] >= owner_origin["acquired_at_monotonic_s"]):
+                return False
+            cursor = proof["hold_cursor"]
+            certkeys = set(self._hold_certificate(origin))
+            if (not isinstance(cursor, dict)
+                    or set(cursor) != {"action_sequence", "write_completed_at_monotonic_s", "certificate"}
+                    or type(cursor["action_sequence"]) is not int or cursor["action_sequence"] < 0
+                    or not isinstance(cursor["certificate"], dict) or set(cursor["certificate"]) != certkeys):
+                return False
+            cert, done = cursor["certificate"], cursor["write_completed_at_monotonic_s"]
+            times = [done, proof["qualified_at_monotonic_s"], *[cert[k] for k in certkeys
+                     if k not in {"phase", "position_raw", "current_raw", "action_sequence", "observation_id"}]]
+            if (not all(type(v) in (int, float) and math.isfinite(v) and v >= 0 for v in times)
+                    or cert["phase"] != "intercycle_hold" or type(cert["position_raw"]) is not int
+                    or type(cert["action_sequence"]) is not int or cert["action_sequence"] != cursor["action_sequence"]
+                    or type(cert["current_raw"]) is not int or abs(cert["current_raw"]) * 6.5 >= self.current_cap_ma
+                    or type(cert["observation_id"]) is not int or cert["observation_id"] < 0
+                    or not 26 <= cert["progress_s"] < 32
+                    or not done <= cert["position_read_started_at_monotonic_s"]
+                       <= cert["position_read_completed_at_monotonic_s"] <= cert["acquired_at_monotonic_s"]
+                    or not 0 <= cert["current_read_started_at_monotonic_s"]
+                       <= cert["current_read_completed_at_monotonic_s"] <= cert["acquired_at_monotonic_s"]
+                    or not cert["acquired_at_monotonic_s"] <= proof["qualified_at_monotonic_s"] <= now):
+                return False
+            rows = proof["rows"]
+            if type(rows) is not list or not 3 <= len(rows) <= 12:
+                return False
+            previous = None
+            for row in rows:
+                if (type(row) is not list or len(row) != 12
+                        or not all(type(row[k]) is int and row[k] >= 0 for k in (0, 1, 3))
+                        or type(row[6]) is not int or abs(row[6]) * 6.5 >= self.current_cap_ma
+                        or not all(type(row[k]) in (int, float) and math.isfinite(row[k]) and row[k] >= 0
+                                   for k in (2, 4, 5, 7, 8, 9, 10, 11))
+                        or not 26 <= row[2] < 32 or not row[10] <= row[11] <= row[4] <= row[5] <= row[9]
+                        or not done <= row[7] <= row[8] <= row[9] <= proof["qualified_at_monotonic_s"]
+                        or row[4] < done or now - min(row[4], row[7]) > .5
+                        or row[0] < cert["observation_id"] or row[1] < cursor["action_sequence"]
+                        or abs(row[3] - proof["measured_origin_raw"]) > 40):
+                    return False
+                if previous is not None and (row[0] != previous[0] + 1 or row[1] < previous[1]
+                        or row[2] < previous[2] or any(row[k] <= previous[k] for k in (4, 5, 7, 8, 9))
+                        or row[10] < previous[10] or row[11] < previous[11]):
+                    return False
+                previous = row
+            first, last = rows[0], rows[-1]
+            actual = [anchor["observation_id"], anchor["action_sequence"], anchor["context"]["progress_s"],
+                      anchor["position"]["raw"], anchor["position"]["read_started_at_monotonic_s"],
+                      anchor["position"]["read_completed_at_monotonic_s"], anchor["current"]["raw"],
+                      anchor["current"]["read_started_at_monotonic_s"], anchor["current"]["read_completed_at_monotonic_s"],
+                      anchor["acquired_at_monotonic_s"], anchor["action"]["write_started_at_monotonic_s"],
+                      anchor["action"]["write_completed_at_monotonic_s"]]
+            return (last == actual and max(r[3] for r in rows) - min(r[3] for r in rows) <= 2
+                    and all(last[k] - first[k] >= .2 - 1e-9 for k in (5, 8))
+                    and anchor["action"]["expected_goal_raw"] == proof["expected_goal_raw"]
+                    and anchor["acquired_at_monotonic_s"] <= proof["qualified_at_monotonic_s"]
+                        <= anchor["captured_at_monotonic_s"] <= now
+                    and len(json.dumps(proof, allow_nan=False, separators=(",", ":")).encode()) <= 4096)
+        except (KeyError, ValueError, TypeError, AttributeError, OverflowError):
+            return False
 
     @property
     def startup_hold_error_raw(self):
@@ -734,14 +918,33 @@ class SelectedElbowExperiment:
         if any(cycles[0].get(k) != cycles[1].get(k) or o.get(k) != cycles[0].get(k) for k in same):
             return None
         hold = o.get("intercycle_hold")
-        if (not isinstance(hold, dict) or set(hold) != {"window", "anchor_proof", "starting_raw", "reference_raw"}
+        hold_keys = {"window", "anchor_proof", "starting_raw", "reference_raw"}
+        if self.intercycle_hold_admission_rule is not None:
+            hold_keys.add("admission_proof")
+        if (not isinstance(hold, dict) or set(hold) != hold_keys
                 or hold["window"] != cycles[1]["baseline_window"]
                 or hold["anchor_proof"] != cycles[1]["baseline_anchor_proof"]
                 or hold["starting_raw"] != cycles[1]["starting_raw"] or hold["reference_raw"] != o["reference_raw"]
                 or not self.window_valid(hold["window"])
                 or hold["anchor_proof"]["context"]["phase"] != "intercycle_hold"
-                or abs(hold["starting_raw"]-o["measured_origin_raw"]) > self.return_tolerance_raw):
+                or abs(hold["starting_raw"]-o["measured_origin_raw"])
+                   > (self.intercycle_hold_tolerance_raw or self.return_tolerance_raw)):
             return None
+        if self.intercycle_hold_admission_rule is not None:
+            if not self.intercycle_hold_admission_valid(hold["admission_proof"], hold["anchor_proof"],
+                    o["measured_origin_proof"], now=hold["anchor_proof"]["captured_at_monotonic_s"]):
+                return None
+            rows, window = hold["admission_proof"]["rows"], hold["window"]
+            # The owner may receive a subset of the contiguous native samples.
+            cells = {"position": (4, 5), "current": (7, 8)}
+            matching = [row for row in rows if all(
+                row[parts[part]] == window[f"first_{name}_{label}_at"]
+                for name, parts in cells.items() for part, label in enumerate(("started", "completed")))]
+            if (window["qualified_at_monotonic_s"] != hold["admission_proof"]["qualified_at_monotonic_s"]
+                    or len(matching) != 1 or window["sample_count"] != len(rows)
+                    or any(rows[-1][parts[part]] != window[f"last_{name}_{label}_at"]
+                           for name, parts in cells.items() for part, label in enumerate(("started", "completed")))):
+                return None
         coarse = all(c["coarse_functional_pass"] for c in cycles)
         fine = all(c["fine_return_pass"] for c in cycles)
         qualified = sum(result[2] for result in results)
@@ -872,6 +1075,12 @@ LEFT_ELBOW_COARSE_BENCH_V1 = SelectedElbowExperiment.from_payload({
 LEFT_ELBOW_COARSE_BENCH_V2 = SelectedElbowExperiment.from_payload({
     **LEFT_ELBOW_COARSE_BENCH_V1.payload,
     "envelope_sha256": SELECTED_ELBOW_EXPERIMENT_OPERATION_DWELL_ENVELOPE_SHA256,
+})
+LEFT_ELBOW_NEGATIVE_COARSE_BENCH_V3 = SelectedElbowExperiment.from_payload({
+    **LEFT_ELBOW_COARSE_BENCH_V1.payload,
+    "envelope_sha256": SELECTED_ELBOW_EXPERIMENT_NEGATIVE_HOLD_ENVELOPE_SHA256,
+    "excursion_norm": -10,
+    "intercycle_hold_tolerance_raw": 40,
 })
 SELECTED_ELBOW_OPERATION_PRESET = MappingProxyType({
     "id":"left-elbow-coarse-bench-v2", "version":2, "label":"Left elbow coarse bench v2 · two cycles",

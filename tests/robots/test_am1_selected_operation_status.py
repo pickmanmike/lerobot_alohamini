@@ -11,6 +11,7 @@ import pytest
 from examples.alohamini.am1_session_contract import (
     LEFT_ELBOW_COARSE_BENCH_V1,
     LEFT_ELBOW_COARSE_BENCH_V2,
+    LEFT_ELBOW_NEGATIVE_COARSE_BENCH_V3,
     SELECTED_ELBOW_OPERATION_PRESET,
 )
 from tests.robots.test_am1_persistent_session import command
@@ -59,6 +60,14 @@ def test_supported_versioned_preset_is_shared_metadata_with_its_exact_descriptor
     _, _, authority, _ = build(tmp_path)
     try:
         assert authority.snapshot()["presets"] == [
+            dict(
+                id="left-elbow-negative-coarse-bench-v3",
+                version=3,
+                label="Left elbow negative coarse bench v3 · two cycles · stable hold 40 · return 22 · fine position unqualified",
+                recipe="physical-left-elbow-experiment",
+                selected_experiment=LEFT_ELBOW_NEGATIVE_COARSE_BENCH_V3.payload,
+                selected_experiment_sha256="c73ef75706fcce9b1772b0927071e5ce41dc6c382cd60760c7033add48d1c709",
+            ),
             dict(
                 id="left-elbow-negative-coarse-bench-v2",
                 version=2,
@@ -193,5 +202,36 @@ def test_negative_catalog_condition_uses_one_fresh_ordinary_start_with_exact_pre
         )
         assert current["selected_experiment"] == authority.run["selected_experiment"] == original
         assert authority.snapshot()["run"]["trajectory_remaining_s"] == 58
+    finally:
+        authority.close()
+
+
+
+def test_negative_v3_catalog_starts_exact_condition_and_preserves_separate_hold_return_limits(tmp_path):
+    _, executor, authority, request = build(tmp_path)
+    try:
+        catalog = authority.snapshot()["presets"]
+        assert [preset["id"] for preset in catalog] == [
+            "left-elbow-negative-coarse-bench-v3", "left-elbow-negative-coarse-bench-v2", "left-elbow-coarse-bench-v2"
+        ]
+        preset = catalog[0]
+        original = copy.deepcopy(preset["selected_experiment"])
+        request["selected_experiment"] = preset["selected_experiment"]
+        result = authority.handle(request, "owner")
+        assert result["accepted"] and result["status"] == "starting"
+        assert executor.started == 1 and len(executor.selected) == 1
+        assert authority.run["selected_experiment"] == original
+        assert authority.run["selected_experiment_sha256"] == "c73ef75706fcce9b1772b0927071e5ce41dc6c382cd60760c7033add48d1c709"
+        assert original["intercycle_hold_tolerance_raw"] == 40 and original["return_tolerance_raw"] == 22
+        assert original["minimum_response_raw"] == 56 and original["excursion_norm"] == -10
+        assert original["goal_readback_checkpoints_s"] == [5, 37]
+        assert authority.run["first_cause"] is None and authority.run["status"] != "completed"
+        assert authority.handle(request, "owner")["run_id"] == result["run_id"] and executor.started == 1
+        preset["selected_experiment"]["intercycle_hold_tolerance_raw"] = 41
+        current = authority.snapshot()["presets"][0]
+        assert current["selected_experiment"] == authority.run["selected_experiment"] == original
+        assert authority.snapshot()["run"]["trajectory_remaining_s"] == 58
+        assert "intercycle_hold_tolerance_raw" not in catalog[1]["selected_experiment"]
+        assert "intercycle_hold_tolerance_raw" not in catalog[2]["selected_experiment"]
     finally:
         authority.close()

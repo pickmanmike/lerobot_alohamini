@@ -113,6 +113,8 @@ class AM1SessionTransport {
       const keys=["schema_version","envelope_sha256","excursion_norm","ramp_s","endpoint_dwell_s","current_cap_ma","live_ceiling_s","minimum_response_raw","return_tolerance_raw","goal_readback_checkpoints_s"];
       const value=selectedExperiment,points=value?.goal_readback_checkpoints_s;
       if(value?.schema_version===2)keys.push("cycle_count","intercycle_hold_s");
+      const negativeHold=value?.envelope_sha256==="6be735becc951f027f6c5886c1fd8f8f323118e8d6ff7931d46107e935a60c1c";
+      if(negativeHold)keys.push("intercycle_hold_tolerance_raw");
       if(recipe!=="physical-left-elbow-experiment" || !value || typeof value!=="object" || Array.isArray(value)
         || Object.keys(value).length!==keys.length || keys.some(key=>!Object.hasOwn(value,key))
         || ![1,2].includes(value.schema_version) || value.schema_version===2 && (value.cycle_count!==2 || value.intercycle_hold_s!==6)
@@ -120,6 +122,12 @@ class AM1SessionTransport {
         || ["excursion_norm","ramp_s","endpoint_dwell_s","current_cap_ma","live_ceiling_s"].some(key=>typeof value[key]!=="number" || !Number.isFinite(value[key]))
         || ["minimum_response_raw","return_tolerance_raw"].some(key=>!Number.isInteger(value[key]) || value[key]<0 || value[key]>4095)
         || !Array.isArray(points) || points.length>2 || points.some((point,index)=>typeof point!=="number" || !Number.isFinite(point) || point<=0 || index>0 && point<=points[index-1]))throw Error("Exact selected experiment descriptor required");
+      if(negativeHold) {
+        const expected={schema_version:2,excursion_norm:-10,ramp_s:10,endpoint_dwell_s:2,current_cap_ma:150,
+          live_ceiling_s:90,minimum_response_raw:56,return_tolerance_raw:22,cycle_count:2,intercycle_hold_s:6,
+          intercycle_hold_tolerance_raw:40};
+        if(Object.entries(expected).some(([key,wanted])=>value[key]!==wanted) || JSON.stringify(points)!=="[5,37]")throw Error("Exact selected experiment descriptor required");
+      }
       const frozen=JSON.parse(JSON.stringify(value));
       Object.freeze(frozen.goal_readback_checkpoints_s);payload.selected_experiment=Object.freeze(frozen);
     }
@@ -134,14 +142,18 @@ class AM1SessionTransport {
     this.render(this,result.reason);return result;
   }
   async startPreset(id) {
-    const versions={"left-elbow-coarse-bench-v1":1,"left-elbow-coarse-bench-v2":2,"left-elbow-negative-coarse-bench-v2":2};
+    const versions={"left-elbow-coarse-bench-v1":1,"left-elbow-coarse-bench-v2":2,"left-elbow-negative-coarse-bench-v2":2,"left-elbow-negative-coarse-bench-v3":3};
     const version=typeof id==="string" && Object.hasOwn(versions,id) ? versions[id] : null;
     const preset=this.snapshot?.presets?.find(value=>value.id===id);
     if(version===null || !preset || preset.version!==version || preset.recipe!=="physical-left-elbow-experiment")throw Error("Current named preset required");
-    if(id==="left-elbow-negative-coarse-bench-v2") {
-      const value=preset.selected_experiment,expected={schema_version:2,envelope_sha256:"ea8ed4e0abd5222734cd77cffc22c50739d53ab4cbde999016b33606af7648f5",
+    if(id==="left-elbow-negative-coarse-bench-v2" || id==="left-elbow-negative-coarse-bench-v3") {
+      const negativeHold=id==="left-elbow-negative-coarse-bench-v3";
+      const value=preset.selected_experiment,expected={schema_version:2,
+        envelope_sha256:negativeHold ? "6be735becc951f027f6c5886c1fd8f8f323118e8d6ff7931d46107e935a60c1c" : "ea8ed4e0abd5222734cd77cffc22c50739d53ab4cbde999016b33606af7648f5",
         excursion_norm:-10,ramp_s:10,endpoint_dwell_s:2,current_cap_ma:150,live_ceiling_s:90,minimum_response_raw:56,return_tolerance_raw:22,cycle_count:2,intercycle_hold_s:6};
-      if(preset.selected_experiment_sha256!=="86c16ecbcfcb864b0ddb9caaff25d306a9c4d991730f853d6e09e91b50bbdd1c" || !value || typeof value!=="object" || Array.isArray(value)
+      if(negativeHold)expected.intercycle_hold_tolerance_raw=40;
+      const sha256=negativeHold ? "c73ef75706fcce9b1772b0927071e5ce41dc6c382cd60760c7033add48d1c709" : "86c16ecbcfcb864b0ddb9caaff25d306a9c4d991730f853d6e09e91b50bbdd1c";
+      if(preset.selected_experiment_sha256!==sha256 || !value || typeof value!=="object" || Array.isArray(value)
         || Object.keys(value).length!==Object.keys(expected).length+1 || Object.entries(expected).some(([key,wanted])=>!Object.hasOwn(value,key) || value[key]!==wanted)
         || !Object.hasOwn(value,"goal_readback_checkpoints_s") || !Array.isArray(value.goal_readback_checkpoints_s) || JSON.stringify(value.goal_readback_checkpoints_s)!=="[5,37]")throw Error("Exact negative named preset required");
     }

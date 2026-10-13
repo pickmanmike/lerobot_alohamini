@@ -337,3 +337,335 @@ def test_ordinary_physical_worker_never_emits_selected_context():
     finally:
         e.close()
         e.worker.join(2)
+
+
+class NegativeHoldFeedback:
+    """Finite simulated Native rows; this fixture never accesses a device."""
+
+    def __init__(self, provider, *, residual=35, cached_current_before_repeat=False, outward=75):
+        import copy
+
+        from tests.robots.test_am1_positive_control import PositiveFeedback
+
+        self.provider = provider
+        self.feedback = PositiveFeedback(provider)
+        self.residual = residual
+        self.outward = outward
+        self.cached_current_before_repeat = cached_current_before_repeat
+        self.epoch = self.intent_revision = 0
+        self.original = self.cursor = None
+        self.rows = []
+        self.proof = None
+        self.copy = copy.deepcopy
+
+    @staticmethod
+    def certificate(item):
+        return {
+            "observation_id": item["observation_id"],
+            "action_sequence": item["action_sequence"], "current_raw": item["current"]["raw"],
+            "progress_s": item["context"]["progress_s"],
+            "phase": item["context"]["phase"],
+            "position_raw": item["position"]["raw"],
+            **{
+                f"{name}_read_{part}_at_monotonic_s": item[name][f"read_{part}_at_monotonic_s"]
+                for name in ("position", "current")
+                for part in ("started", "completed")
+            },
+            "acquired_at_monotonic_s": item["acquired_at_monotonic_s"],
+        }
+
+    def get(self, now, sequence):
+        from tests.robots.test_am1_elbow_response_profile import norm
+
+        p = self.provider
+        positions, item = self.feedback.get(now, sequence)
+        context = item["context"]
+        cycle, phase, fraction = p.definition.phase(context["progress_s"], context["acquisition_s"])
+        offset = (
+            0 if phase == "baseline"
+            else round((self.outward if cycle == 1 else self.outward-self.residual)*fraction
+                       + (0 if cycle == 1 else self.residual)) if phase == "outbound"
+            else self.outward if phase == "endpoint"
+            else round(self.residual+(self.outward-self.residual)*fraction) if phase == "return"
+            else self.residual
+        )
+        measured = 2399+(1 if p.definition.excursion_norm > 0 else -1)*offset
+        item.update(run_id="12345678-1234-1234-1234-123456789abc",
+                    host_incarnation="abcdef12-1234-1234-1234-123456789abc",
+                    epoch=self.epoch, intent_revision=self.intent_revision)
+        item["position"].update(raw=measured, normalized=norm(measured))
+        positions[ELBOW] = norm(measured)
+        item["action"].update(
+            write_started_at_monotonic_s=now-.010,
+            write_completed_at_monotonic_s=now-.008,
+            write_acknowledged=False,
+        )
+        item["visible_control"]["binding"].update(
+            recipe="physical-left-elbow-experiment", experiment_sha256=p.definition.sha256,
+            run_id=item["run_id"], host_incarnation=item["host_incarnation"],
+        )
+        key = context["sample_key"]
+        if key is not None and key not in p._verified_receipts:
+            receipt = item["sparse_receipts"][key]
+            receipt.update(run_id=item["run_id"], host_incarnation=item["host_incarnation"],
+                           epoch=self.epoch, intent_revision=self.intent_revision)
+            receipt["decoded"]["present_position_raw"] = measured
+            self.feedback.receipts[key] = self.copy(receipt)
+        if self.original is None:
+            self.original = {
+                "epoch": self.epoch,
+                "intent_revision": self.intent_revision,
+                "certificate": self.certificate(item),
+            }
+        if context["phase"] == "intercycle_hold":
+            if self.cursor is not None and self.cached_current_before_repeat:
+                item["current"].update(read_started_at_monotonic_s=now-.012,
+                                       read_completed_at_monotonic_s=now-.011)
+            row = [
+                sequence, sequence, context["progress_s"], measured,
+                item["position"]["read_started_at_monotonic_s"],
+                item["position"]["read_completed_at_monotonic_s"], item["current"]["raw"],
+                item["current"]["read_started_at_monotonic_s"],
+                item["current"]["read_completed_at_monotonic_s"], item["acquired_at_monotonic_s"],
+                item["action"]["write_started_at_monotonic_s"],
+                item["action"]["write_completed_at_monotonic_s"],
+            ]
+            if self.cursor is None:
+                self.cursor = {
+                    "action_sequence": sequence,
+                    "write_completed_at_monotonic_s": row[-1],
+                    "certificate": self.certificate(item),
+                }
+            self.rows.append(row)
+            del self.rows[:-12]
+            if len(self.rows) >= 7:
+                self.proof = {
+                    "version": 1, "status": "ready",
+                    "binding": {
+                        "run_id": item["run_id"], "host_incarnation": item["host_incarnation"],
+                        "experiment_sha256": p.definition.sha256,
+                        "epoch": self.epoch, "intent_revision": self.intent_revision,
+                    },
+                    "calibration": self.copy(item["motor"]["calibration"]),
+                    "reference_normalized": p.origin[ELBOW], "measured_origin_raw": 2399,
+                    "expected_goal_raw": p.definition.encoded_goal(p.origin[ELBOW], item["motor"]["calibration"]),
+                    "original_reference": self.copy(self.original), "hold_cursor": self.copy(self.cursor),
+                    "qualified_at_monotonic_s": now, "rows": self.copy(self.rows),
+                }
+                item["intercycle_hold_admission"] = self.copy(self.proof)
+        return positions, item
+
+    def recover(self):
+        self.epoch += 1
+        self.intent_revision += 1
+        self.rows.clear()
+        self.cursor = self.proof = None
+
+
+def negative_hold_provider(definition=None):
+    from examples.alohamini import am1_session_contract as contract
+    from tests.robots.test_am1_elbow_response_profile import norm
+
+    return scripted_leader.LeftElbowPositiveControlInput(
+        seed(norm(2399)), joint_keys=JOINT_KEYS, fps=10, emit=lambda _: None,
+        definition=definition or contract.LEFT_ELBOW_NEGATIVE_COARSE_BENCH_V3,
+    )
+
+
+def run_negative_hold(p, feed, *, stop=58, start_sequence=0, clock_offset=0, mutate=None, skip_consumption=False, ipc_delay=0, skip_first_baseline=False):
+    p.admit(clock_offset + start_sequence/30)
+    for sequence in range(start_sequence+1, start_sequence+1901):
+        now = clock_offset+sequence/30
+        positions, item = feed.get(now-ipc_delay, sequence)
+        if mutate is not None:
+            mutate(item)
+        if skip_first_baseline and sequence == start_sequence+1:
+            continue
+        if skip_consumption and item["context"]["phase"] == "intercycle_hold" and sequence % 4 == 1:
+            continue
+        p.collect_feedback(now, positions, sequence, selected_feedback=item)
+        if sequence % 3 == 0:
+            p.advance(now, positions, sequence, selected_feedback=item)
+        if p.complete or p.elapsed_s >= stop:
+            return sequence, now, positions, item
+    pytest.fail("negative simulated provider did not reach its finite boundary")
+
+
+def test_negative_v3_native_hold_admits_35_without_reseeding_or_changing_return_verdicts():
+    p = negative_hold_provider()
+    original = dict(p.origin)
+    feed = NegativeHoldFeedback(p)
+    run_negative_hold(p, feed)
+    outcome = p.positive_control
+    assert p.complete and p.elapsed_s == 58 and p.origin == original
+    assert outcome["program_completed"] is True
+    assert outcome["coarse_functional_pass"] is False and outcome["fine_return_pass"] is False
+    assert [cycle["starting_raw"] for cycle in outcome["cycles"]] == [2399, 2364]
+    assert [cycle["final_return_residual_raw"] for cycle in outcome["cycles"]] == [35, 35]
+    assert [cycle["reference_raw"] for cycle in outcome["cycles"]] == [2399, 2399]
+    hold = outcome["intercycle_hold"]
+    assert hold["admission_proof"] == feed.proof
+    assert hold["starting_raw"] == 2364 and hold["reference_raw"] == 2399
+    assert hold["admission_proof"]["hold_cursor"]["certificate"]["phase"] == "intercycle_hold"
+    assert hold["admission_proof"]["rows"][-1][2] == 31.9
+    assert hold["anchor_proof"]["action"]["write_acknowledged"] is False
+    execution = dict(original_seed=original, progress_s=58, cycles_completed=2,
+                     returns_qualified=0, positive_control=outcome)
+    assert p.definition.completion_expectation(execution) == (58, 2, 0)
+
+
+@pytest.mark.parametrize("change", ["residual41", "spread3", "stale", "missing", "foreign",
+                                    "actual_suffix", "original_reference"])
+def test_negative_v3_refuses_unqualified_native_hold_before_second_departure(change):
+    p = negative_hold_provider()
+    feed = NegativeHoldFeedback(p, residual=41 if change == "residual41" else 17)
+    original = dict(p.origin)
+
+    def mutate(item):
+        if item["context"]["phase"] != "intercycle_hold":
+            return
+        proof = item.get("intercycle_hold_admission")
+        if change == "missing":
+            item.pop("intercycle_hold_admission", None)
+        elif proof is not None:
+            if change == "spread3":
+                proof["rows"][-2][3] -= 3
+            elif change == "stale":
+                proof["qualified_at_monotonic_s"] -= 1
+            elif change == "foreign":
+                proof["binding"]["host_incarnation"] = "foreign"
+            elif change == "actual_suffix":
+                proof["rows"][-2][3] -= 1
+            elif change == "original_reference":
+                proof["original_reference"]["certificate"]["observation_id"] += 1
+
+    with pytest.raises(ValueError, match="intercycle hold"):
+        run_negative_hold(p, feed, stop=32, mutate=mutate)
+    assert p.elapsed_s == 31.9 and p.origin == original and not p.complete
+    assert len(p.positive_control["cycles"]) == 1
+
+
+def test_negative_v3_recovery_requires_fresh_native_hold_and_keeps_original_reference():
+    p = negative_hold_provider()
+    feed = NegativeHoldFeedback(p)
+    sequence, now, positions, _ = run_negative_hold(p, feed, stop=31.9)
+    original_seed = dict(p.origin)
+    original_proof = p._measured_origin_proof.copy()
+    old_proof = feed.copy(feed.proof)
+    p.freeze()
+    feed.recover()
+    p.prepare_rejoin(now+10, positions, sequence+1, now+9.999)
+    assert p.origin == original_seed and p._measured_origin_proof == original_proof
+    p.admit(now+10)
+    index, at = sequence, now+10
+    while p._rejoin is not None:
+        index += 1
+        at += .1
+        positions, item = feed.get(at, index)
+        item["action"].update(write_started_at_monotonic_s=at-.102,
+                              write_completed_at_monotonic_s=at-.1)
+        p.advance(at, positions, index, selected_feedback=item)
+        assert p.elapsed_s == 31.9
+        assert index < sequence+100
+    for _ in range(9):
+        index += 1
+        at += 1/30
+        positions, item = feed.get(at, index)
+        item["intercycle_hold_admission"] = feed.copy(old_proof)
+        p.collect_feedback(at, positions, index, selected_feedback=item)
+    with pytest.raises(ValueError, match="intercycle hold"):
+        p.advance(at, positions, index, selected_feedback=item)
+    assert p.elapsed_s == 31.9 and p.origin == original_seed
+    assert p._measured_origin_proof == original_proof
+    index += 1
+    at += .1
+    positions, item = feed.get(at, index)
+    p.advance(at, positions, index, selected_feedback=item)
+    assert p.elapsed_s == 32 and p.origin == original_seed
+    hold = p.positive_control["intercycle_hold"]
+    assert hold["admission_proof"]["binding"]["epoch"] == 1
+    assert hold["admission_proof"]["original_reference"]["epoch"] == 0
+    assert p._measured_origin_proof == original_proof and p._measured_origin_raw == 2399
+
+
+def test_old_v2_still_refuses_35_raw_hold_and_keeps_four_key_hold_shape():
+    from examples.alohamini import am1_session_contract as contract
+
+    p = negative_hold_provider(contract.LEFT_ELBOW_COARSE_BENCH_V2)
+    feed = NegativeHoldFeedback(p)
+    with pytest.raises(ValueError, match="original return envelope"):
+        run_negative_hold(p, feed, stop=32)
+    assert p.elapsed_s == 31.9 and p.origin[ELBOW] == feed.proof["reference_normalized"]
+    p = negative_hold_provider(contract.LEFT_ELBOW_COARSE_BENCH_V2)
+    run_negative_hold(p, NegativeHoldFeedback(p, residual=17), stop=32)
+    assert set(p.positive_control["intercycle_hold"]) == {"window", "anchor_proof", "starting_raw", "reference_raw"}
+
+
+@pytest.mark.parametrize("skip_consumption", [False, True])
+def test_negative_v3_matches_native_rows_when_owner_skips_cache_snapshots(skip_consumption):
+    p = negative_hold_provider()
+    feed = NegativeHoldFeedback(p)
+    run_negative_hold(p, feed, stop=32, skip_consumption=skip_consumption)
+    hold = p.positive_control["intercycle_hold"]
+    assert hold["starting_raw"] == 2364 and p.elapsed_s == 32
+    assert hold["window"]["sample_count"] >= 3
+    assert len(hold["admission_proof"]["rows"]) == 12
+
+
+def test_negative_v3_cached_current_can_precede_latest_identical_native_hold_write():
+    p = negative_hold_provider()
+    feed = NegativeHoldFeedback(p, cached_current_before_repeat=True)
+    run_negative_hold(p, feed, stop=32)
+    row = p.positive_control["intercycle_hold"]["admission_proof"]["rows"][-1]
+    assert row[8] < row[11] <= row[4]
+    assert p.elapsed_s == 32 and p.positive_control["intercycle_hold"]["starting_raw"] == 2364
+
+
+@pytest.mark.parametrize("counter", ["epoch", "intent_revision"])
+def test_negative_v3_binding_change_cannot_count_previous_admission_acquisitions(counter):
+    p = negative_hold_provider()
+    feed = NegativeHoldFeedback(p)
+    sequence, now, _, _ = run_negative_hold(p, feed, stop=31.9)
+    original = feed.copy(p._measured_origin_proof)
+    setattr(feed, counter, 1)
+    # Adversarial claim retaining old rows under a new outer binding. Actual
+    # provider feedback under that binding consists of only this acquisition.
+    positions, item = feed.get(now+.1, sequence+1)
+    with pytest.raises(ValueError, match="intercycle hold"):
+        p.advance(now+.1, positions, sequence+1, selected_feedback=item)
+    assert p.elapsed_s == 31.9 and p._measured_origin_proof == original
+
+
+
+@pytest.mark.parametrize("skip_first_baseline", [False,True])
+def test_negative_v3_completed_two_cycles_preserve_distinct_delayed_owner_capture(skip_first_baseline):
+    import copy
+    p = negative_hold_provider()
+    original = dict(p.origin)
+    run_negative_hold(p,NegativeHoldFeedback(p,outward=100),ipc_delay=.025,skip_first_baseline=skip_first_baseline)
+    outcome = p.positive_control
+    hold = outcome["intercycle_hold"]
+    assert p.complete and p.origin == original and p.elapsed_s == 58
+    assert outcome["program_completed"] is True
+    assert [row["outward_response_raw"] for row in outcome["cycles"]] == [100,65]
+    assert [row["reverse_response_raw"] for row in outcome["cycles"]] == [65,65]
+    assert [row["final_return_residual_raw"] for row in outcome["cycles"]] == [35,35]
+    assert outcome["coarse_functional_pass"] is False and outcome["fine_return_pass"] is False
+    assert hold["window"]["qualified_at_monotonic_s"] == hold["admission_proof"]["qualified_at_monotonic_s"]
+    assert hold["admission_proof"]["qualified_at_monotonic_s"] < hold["anchor_proof"]["captured_at_monotonic_s"]
+    if skip_first_baseline:
+        assert hold["admission_proof"]["original_reference"]["certificate"]["observation_id"] < outcome["measured_origin_proof"]["observation_id"]
+    execution = dict(original_seed=original,progress_s=58,cycles_completed=2,returns_qualified=0,positive_control=outcome)
+    assert p.definition.completion_expectation(execution) == (58,2,0)
+    for invalid in ("window_clock_replaced_by_capture","capture_before_qualification","future_qualification"):
+        altered = copy.deepcopy(execution)
+        item = altered["positive_control"]["intercycle_hold"]
+        if invalid == "window_clock_replaced_by_capture":
+            item["window"]["qualified_at_monotonic_s"] = item["anchor_proof"]["captured_at_monotonic_s"]
+            altered["positive_control"]["cycles"][1]["baseline_window"] = copy.deepcopy(item["window"])
+        elif invalid == "capture_before_qualification":
+            item["anchor_proof"]["captured_at_monotonic_s"] = item["admission_proof"]["qualified_at_monotonic_s"]-.001
+            altered["positive_control"]["cycles"][1]["baseline_anchor_proof"] = copy.deepcopy(item["anchor_proof"])
+        else:
+            item["admission_proof"]["qualified_at_monotonic_s"] = item["anchor_proof"]["captured_at_monotonic_s"]+.001
+        assert p.definition.completion_expectation(altered) is None

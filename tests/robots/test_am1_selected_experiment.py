@@ -732,3 +732,48 @@ def test_qualified_dwell_pin_preserves_historical_payload_and_fixed_waveform():
     assert "qualified_endpoint_dwell" not in old.response_rule
     assert contract.SelectedElbowExperiment.from_payload(old.payload).sha256 == old.sha256
     assert contract.SelectedElbowExperiment.from_payload(new.payload).sha256 == new.sha256
+
+
+
+def negative_v3_payload(**changes):
+    definition = getattr(contract, "LEFT_ELBOW_NEGATIVE_COARSE_BENCH_V3", None)
+    assert definition is not None, "separately pinned negative hold admission condition missing"
+    return dict(definition.payload, **changes)
+
+
+def test_negative_v3_separates_stable_hold_admission_from_original_return_and_fine_scoring():
+    d = contract.SelectedElbowExperiment.from_payload(negative_v3_payload())
+    assert d.schema_version == 2 and d.excursion_norm == -10
+    assert d.intercycle_hold_tolerance_raw == 40
+    assert d.return_tolerance_raw == 22 and d.minimum_response_raw == 56
+    assert d.current_cap_ma == 150 and d.nominal_trajectory_s == 58 and d.live_s == 90
+    assert d.cycle_count == 2 and d.intercycle_hold_s == 6
+    assert d.goal_readback_checkpoints_s == (5, 37)
+    assert "qualified_endpoint_dwell" not in d.response_rule
+    assert d.response_rule == {"commanded_error_raw":45,"minimum_response_raw":3,"window_s":1.2}
+    assert d.startup_hold_error_raw == 30
+    assert contract.SelectedElbowExperiment.from_payload(d.payload).sha256 == d.sha256
+    assert d.sha256 not in {contract.LEFT_ELBOW_COARSE_BENCH_V1.sha256, contract.LEFT_ELBOW_COARSE_BENCH_V2.sha256}
+    for old, digest in [(contract.LEFT_ELBOW_COARSE_BENCH_V1,"07480c167c2f94b80565decfe251f586adfc349d9a657124b331b15c2d114ab1"),
+                        (contract.LEFT_ELBOW_COARSE_BENCH_V2,"31336b83330fb5398778b4cfc0397011a3ae063d47efdf9c02e62d685475d473")]:
+        assert old.sha256 == digest and "intercycle_hold_tolerance_raw" not in old.payload
+        assert contract.SelectedElbowExperiment.from_payload(old.payload).sha256 == digest
+
+
+@pytest.mark.parametrize("change", [
+    {"schema_version":3}, {"excursion_norm":10}, {"ramp_s":9}, {"endpoint_dwell_s":1},
+    {"current_cap_ma":149}, {"live_ceiling_s":89}, {"minimum_response_raw":55},
+    {"return_tolerance_raw":35}, {"cycle_count":1}, {"intercycle_hold_s":5},
+    {"goal_readback_checkpoints_s":[5,38]}, {"intercycle_hold_tolerance_raw":True},
+    {"intercycle_hold_tolerance_raw":40.0}, {"intercycle_hold_tolerance_raw":41},
+    {"intercycle_hold_spread_raw":3},
+])
+def test_negative_v3_condition_is_closed_without_altering_old_geometric_envelopes(change):
+    with pytest.raises((ValueError, TypeError)):
+        contract.SelectedElbowExperiment.from_payload(negative_v3_payload(**change))
+
+
+def test_hold_admission_field_cannot_be_added_to_an_old_v2_condition():
+    for old in (contract.LEFT_ELBOW_COARSE_BENCH_V1, contract.LEFT_ELBOW_COARSE_BENCH_V2):
+        with pytest.raises(ValueError):
+            contract.SelectedElbowExperiment.from_payload(dict(old.payload, intercycle_hold_tolerance_raw=40))

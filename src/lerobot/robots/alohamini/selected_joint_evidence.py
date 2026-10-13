@@ -76,6 +76,13 @@ class AM1SelectedJointEvidence:
         self._response_origin_candidate = None
         self._response_leg_origin = None
         self._response_dwell = None
+        self._hold_origin = None
+        self._hold_binding = self._hold_cursor = self._hold_anchor = None
+        self._hold_rows = deque(maxlen=12)
+        self.intercycle_hold_admission = None
+        self._hold_departed = False
+        self._hold_departure = None
+        self._hold_pending_departure = None
 
     VISIBLE_STATIC_REGISTERS = (
         "Firmware_Major_Version",
@@ -308,7 +315,7 @@ class AM1SelectedJointEvidence:
                     position if position is not None else getattr(robot, "_am1_selected_joint_position", None)
                 ),
                 "last_completed_live_goal": copy.deepcopy(self.last_live_goal),
-                **({"response_boundary": copy.deepcopy(self.response_boundary)}
+            **({"response_boundary": copy.deepcopy(self.response_boundary)}
                    if self.response_boundary is not None else {}),
             }
         except BaseException as error:
@@ -362,9 +369,10 @@ class AM1SelectedJointEvidence:
         self.context = None
         self._response_rejoin = None
         self._response_origin_candidate = self._response_leg_origin = self._response_dwell = None
+        self._clear_hold_admission()
         robot._am1_selected_joint_evidence_context = None
 
-    def prepare(self, robot, action, binding):
+    def prepare(self, robot, action, binding, *, control_marker=None):
         cleaned = {k: v for k, v in action.items() if k != MARKER}
         if MARKER not in action:
             candidate = getattr(robot, "_am1_selected_elbow_experiment", None)
@@ -567,6 +575,8 @@ class AM1SelectedJointEvidence:
                     or not visible.startup_hold_valid(admitted, measured, material)
                     or abs(measured - position["raw"]) > 1):
                 self._response_refuse(robot, "Selected response first finite measured pose is unavailable")
+        if visible is not None and getattr(visible, "intercycle_hold_admission_rule", None) is not None:
+            self._prepare_hold_departure(robot, visible, metadata, binding, control_marker)
         self.reference, self.endpoint, self.profile = reference, endpoint, profile
         self.progress, self.context = progress, copy.deepcopy(metadata)
         robot._am1_selected_joint_evidence_context = copy.deepcopy(metadata)
@@ -724,6 +734,8 @@ class AM1SelectedJointEvidence:
             raise RuntimeError("Visible native position left its frozen absolute excursion")
         if getattr(definition, "response_rule", None) is not None:
             self._guard_response(robot, control, observation, definition, position, current)
+        if getattr(definition, "intercycle_hold_admission_rule", None) is not None:
+            self._guard_hold_admission(robot, control, observation, definition, position, current, now)
         if context is None or control.state != "active":
             return
         direction = None
@@ -797,6 +809,162 @@ class AM1SelectedJointEvidence:
                     selected, rises = item[3], rises + 1
             if rises >= 3 and max(item[2] for item in rows) - min(item[2] for item in rows) <= 2:
                 raise RuntimeError("Visible native static endpoint adverse current rise")
+
+    def _clear_hold_admission(self, *, discard_departure=False):
+        self._hold_binding = self._hold_cursor = self._hold_anchor = None
+        self._hold_rows.clear()
+        self.intercycle_hold_admission = None
+        self._hold_pending_departure = None
+        if discard_departure:
+            self._hold_departure = None
+        # A matched returned first departure is an original-task fact. Pause
+        # clears current eligibility, not the fact that cycle two already began.
+        self._hold_departed = self._hold_departure is not None
+
+    def abort_hold_admission(self):
+        self._clear_hold_admission(discard_departure=True)
+
+    @staticmethod
+    def _hold_original_key(binding, definition, reference, calibration):
+        return {**{k: binding[k] for k in ("run_id", "host_incarnation")},
+                "experiment_sha256": definition.sha256, "reference": reference,
+                "calibration": calibration, "measured_origin_raw": definition.measured_origin(reference, calibration)}
+
+    def _prepare_hold_departure(self, robot, definition, context, binding, marker):
+        keys = {"version", "mode", "run_id", "host_incarnation", "epoch", "intent_revision", "action_sequence"}
+        if (not isinstance(marker, dict) or set(marker) != keys or type(marker["version"]) is not int
+                or marker["version"] != 1 or marker["mode"] != "active"
+                or any(marker[k] != v for k, v in binding.items())
+                or any(type(marker[k]) is not int or marker[k] < 0
+                       for k in ("epoch", "intent_revision", "action_sequence"))):
+            raise RuntimeError("Selected intercycle hold incoming owner marker is unavailable")
+        incoming = {**binding, "experiment_sha256": definition.sha256,
+                    "epoch": marker["epoch"], "intent_revision": marker["intent_revision"]}
+        calibration = {k: int(getattr(robot.left_bus.calibration[MOTOR], k))
+                       for k in ("drive_mode", "homing_offset", "range_min", "range_max")}
+        original_key = self._hold_original_key(binding, definition, context["reference"], calibration)
+        if self._hold_origin is not None:
+            original = self._hold_origin
+            retained_key = {**{k: original[k] for k in ("run_id", "host_incarnation")},
+                "experiment_sha256": original["context"]["experiment_sha256"],
+                "reference": original["context"]["reference"], "calibration": original["motor"]["calibration"],
+                "measured_origin_raw": original["position"]["raw"]}
+            if original_key != retained_key:
+                self._clear_hold_admission(discard_departure=True)
+                raise RuntimeError("Selected intercycle hold original task identity changed before write")
+        if self._hold_departure is not None and self._hold_departure["original_key"] != original_key:
+            self._clear_hold_admission(discard_departure=True)
+            raise RuntimeError("Selected intercycle hold returned departure belongs to another task")
+        if self._hold_binding is not None and incoming != self._hold_binding:
+            self._clear_hold_admission()
+        if context["phase"] == "rejoin":
+            self._clear_hold_admission()
+        if context["cycle"] == 2 and context["phase"] == "outbound" and not self._hold_departed:
+            if (self._hold_binding != incoming or self._hold_origin is None or self._hold_anchor is None
+                    or not definition.intercycle_hold_admission_valid(self.intercycle_hold_admission,
+                        self._hold_anchor, self._hold_origin, now=self.clock())
+                    or marker["action_sequence"] <= self._hold_anchor["action_sequence"]):
+                raise RuntimeError("Selected intercycle hold native admission is unavailable before departure")
+            self._hold_pending_departure = copy.deepcopy(marker)
+
+    def _guard_hold_admission(self, robot, control, observation, definition, position, current, now):
+        if control.state != "active" or self.context is None:
+            self._clear_hold_admission()
+            return
+        marker = self._matched_marker(control, observation if isinstance(observation, dict) else {})
+        if (marker is None or not _number(now) or marker["acquired_at_monotonic_s"] > now
+                or any(type(marker[k]) is not int or marker[k] < 0 for k in
+                       ("epoch", "intent_revision", "accepted_action_sequence", "observation_id"))):
+            raise RuntimeError("Selected intercycle hold original marker is unavailable")
+        binding = {**control.binding, "experiment_sha256": definition.sha256,
+                   "epoch": control.epoch, "intent_revision": control.intent_revision}
+        if self._hold_binding != binding:
+            self._clear_hold_admission()
+            self._hold_binding = binding
+        row = {**self._base(robot, control, marker), "position": copy.deepcopy(position),
+               "current": copy.deepcopy(current), "captured_at_monotonic_s": now}
+        row.pop("intercycle_hold_admission", None)
+        context, action = self.context, row["action"]
+        if not definition.measurement_proof_valid(row, self.reference, row["motor"]["calibration"],
+                run_id=binding["run_id"], host_incarnation=binding["host_incarnation"]):
+            raise RuntimeError("Selected intercycle hold actual native source is unavailable")
+        original_key = (binding["run_id"], binding["host_incarnation"], definition.sha256)
+        if self._hold_origin is not None and self._hold_origin["context"]["experiment_sha256"] != definition.sha256:
+            raise RuntimeError("Selected intercycle hold original definition changed")
+        if (self._hold_origin is None and context["phase"] == "baseline" and context["progress_s"] == 0
+                and position["raw"] == definition.measured_origin(self.reference, row["motor"]["calibration"])):
+            self._hold_origin = copy.deepcopy(row)
+        if self._hold_origin is not None and original_key[:2] != (
+                self._hold_origin["run_id"], self._hold_origin["host_incarnation"]):
+            raise RuntimeError("Selected intercycle hold original owner changed")
+        if context["cycle"] == 2 and context["phase"] == "outbound":
+            if not self._hold_departed:
+                pending = self._hold_pending_departure
+                if (pending is None or any(pending[k] != binding[k]
+                        for k in ("run_id", "host_incarnation", "epoch", "intent_revision"))
+                        or pending["action_sequence"] != row["action_sequence"]):
+                    raise RuntimeError("Selected intercycle hold departure lacks its returned matching write")
+                self._hold_departure = {
+                    "original_key": self._hold_original_key(binding, definition, self.reference, row["motor"]["calibration"]),
+                    "epoch": row["epoch"], "intent_revision": row["intent_revision"],
+                    "action_sequence": row["action_sequence"],
+                    "certificate": self._response_native_certificate(context, marker, position, current),
+                }
+                self._hold_departed = True
+                self._hold_pending_departure = None
+            self.intercycle_hold_admission = None
+            return
+        if context["phase"] != "intercycle_hold" or context["cycle"] != 1:
+            self._hold_cursor = self._hold_anchor = None
+            self._hold_rows.clear()
+            self.intercycle_hold_admission = None
+            return
+        accepted = control.accepted_action
+        if (not isinstance(accepted, dict) or any(not _number(accepted.get(k)) or accepted[k] != 0
+                for k in ("x.vel", "y.vel", "theta.vel", "lift_axis.vel"))
+                or accepted.get(POSITION) != self.reference
+                or action["expected_goal_raw"] != definition.encoded_goal(self.reference, row["motor"]["calibration"])):
+            raise RuntimeError("Selected intercycle hold accepted body-zero action is unavailable")
+        certificate = definition._hold_certificate(row)
+        if self._hold_cursor is None:
+            self._hold_cursor = {"action_sequence": row["action_sequence"],
+                "write_completed_at_monotonic_s": action["write_completed_at_monotonic_s"],
+                "certificate": certificate}
+        item = [row["observation_id"], row["action_sequence"], context["progress_s"], position["raw"],
+                position["read_started_at_monotonic_s"], position["read_completed_at_monotonic_s"], current["raw"],
+                current["read_started_at_monotonic_s"], current["read_completed_at_monotonic_s"],
+                marker["acquired_at_monotonic_s"], action["write_started_at_monotonic_s"],
+                action["write_completed_at_monotonic_s"]]
+        done = self._hold_cursor["write_completed_at_monotonic_s"]
+        previous = self._hold_rows[-1] if self._hold_rows else None
+        if previous is not None and (item[0] <= previous[0] or any(item[k] <= previous[k] for k in (4, 5, 7, 8, 9))):
+            self._hold_rows.clear()
+            self.intercycle_hold_admission = None
+            return
+        if (previous is not None and item[0] != previous[0] + 1
+                or min(item[4], item[7]) < done or self._hold_origin is None
+                or abs(item[3] - self._hold_origin["position"]["raw"]) > 40):
+            self._hold_rows.clear()
+            self.intercycle_hold_admission = None
+            return
+        self._hold_rows.append(item)
+        self._hold_anchor = row
+        self.intercycle_hold_admission = None
+        for count in range(3, len(self._hold_rows) + 1):
+            rows = list(self._hold_rows)[-count:]
+            if any(rows[-1][k] - rows[0][k] < .2 - 1e-9 for k in (5, 8)):
+                continue
+            proof = {"version": 1, "status": "ready", "binding": binding,
+                     "calibration": row["motor"]["calibration"], "reference_normalized": self.reference,
+                     "measured_origin_raw": self._hold_origin["position"]["raw"],
+                     "expected_goal_raw": definition.encoded_goal(self.reference, row["motor"]["calibration"]),
+                     "original_reference": {"epoch": self._hold_origin["epoch"],
+                         "intent_revision": self._hold_origin["intent_revision"],
+                         "certificate": definition._hold_certificate(self._hold_origin)},
+                     "hold_cursor": self._hold_cursor, "qualified_at_monotonic_s": now, "rows": rows}
+            if definition.intercycle_hold_admission_valid(proof, row, self._hold_origin, now=now):
+                self.intercycle_hold_admission = copy.deepcopy(proof)
+            break  # Only the freshest contiguous qualifying suffix is eligible.
 
     @staticmethod
     def _response_direction(robot, definition, context):
@@ -1314,6 +1482,8 @@ class AM1SelectedJointEvidence:
                 },
             },
             "action": copy.deepcopy(getattr(robot, "_am1_selected_joint_action", None)),
+            **({"intercycle_hold_admission": copy.deepcopy(self.intercycle_hold_admission)}
+               if self.intercycle_hold_admission is not None else {}),
             **({"response_boundary": copy.deepcopy(self.response_boundary)}
                if self.response_boundary is not None else {}),
             **(

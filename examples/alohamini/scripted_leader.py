@@ -716,6 +716,11 @@ class LeftElbowPositiveControlInput(LeftElbowResponseCharacterizeInput):
         self._cycle_outcomes = []
         self._intercycle_hold = None
         self._intercycle_anchor_proof = None
+        self._hold_admission_rule = getattr(self.definition, "intercycle_hold_admission_rule", None)
+        self._intercycle_admission_proof = None
+        self._intercycle_admission_binding = None
+        self._intercycle_last_native = self._intercycle_cursor_barrier = None
+        self._intercycle_native_rows = []
         self._rejoin = None
         self._rejoin_targets = None
         self._rejoin_native_feedback = None
@@ -765,6 +770,8 @@ class LeftElbowPositiveControlInput(LeftElbowResponseCharacterizeInput):
             "elapsed_s":0.0, "duration_s":duration, "observation_id":observation_id,
             "acquired_at_monotonic_s":acquired_at}
         self._rejoin_native_feedback = None
+        if self._hold_admission_rule is not None:
+            self._clear_intercycle_admission()
         self._action = dict(positions)
 
     def _advance_rejoin(self, now):
@@ -821,7 +828,14 @@ class LeftElbowPositiveControlInput(LeftElbowResponseCharacterizeInput):
         context = feedback.get("context", {})
         if context.get("acquisition_s") != self._acquisition_s or context.get("admitted_reference") != self._admitted_reference:
             raise ValueError("positive control acquisition reference changed")
+        if self._hold_admission_rule is not None:
+            binding = tuple(feedback.get(k) for k in ("run_id", "host_incarnation", "epoch", "intent_revision"))
+            if self._intercycle_admission_binding not in (None, binding):
+                self._clear_intercycle_admission()
+            self._intercycle_admission_binding = binding
         super()._feedback(now, observed, feedback)
+        if self._hold_admission_rule is not None:
+            self._intercycle_last_native = (feedback["acquired_at_monotonic_s"],feedback["action_sequence"])
         calibration = self._motor["calibration"]
         registers = proof["active"]["registers"]
         if (not 0 <= registers["Min_Position_Limit"] < registers["Max_Position_Limit"] <= 4095
@@ -887,6 +901,18 @@ class LeftElbowPositiveControlInput(LeftElbowResponseCharacterizeInput):
             self._baseline_closed=True
         if self._composed and phase == "intercycle_hold":
             self._intercycle_anchor_proof = self._measurement_proof(feedback, now)
+            if self._hold_admission_rule is not None:
+                self._intercycle_admission_proof = copy.deepcopy(feedback.get("intercycle_hold_admission"))
+                self._intercycle_native_rows.append({"sample":copy.deepcopy(row), "native_row":[
+                    feedback["observation_id"], feedback["action_sequence"], context["progress_s"],
+                    feedback["position"]["raw"], feedback["position"]["read_started_at_monotonic_s"],
+                    feedback["position"]["read_completed_at_monotonic_s"], feedback["current"]["raw"],
+                    feedback["current"]["read_started_at_monotonic_s"],
+                    feedback["current"]["read_completed_at_monotonic_s"], feedback["acquired_at_monotonic_s"],
+                    feedback["action"].get("write_started_at_monotonic_s"),
+                    feedback["action"].get("write_completed_at_monotonic_s"),
+                ]})
+                del self._intercycle_native_rows[:-self._hold_admission_rule["maximum_samples"]]
         if phase=="endpoint":
             self._endpoint_proofs.append(self._measurement_proof(feedback,now))
             del self._endpoint_proofs[:-20]
@@ -923,11 +949,21 @@ class LeftElbowPositiveControlInput(LeftElbowResponseCharacterizeInput):
             self._adverse_reason = "positive control sustained rising current at an unchanged goal"
             raise ValueError(self._adverse_reason)
 
-    @staticmethod
-    def _measurement_proof(feedback,now):
-        return {"captured_at_monotonic_s":now,**{k:copy.deepcopy(feedback[k]) for k in
-            ("version","run_id","host_incarnation","epoch","intent_revision","action_sequence","observation_id",
-             "acquired_at_monotonic_s","context","motor","position","action")}}
+    def _measurement_proof(self,feedback,now):
+        keys = ("version","run_id","host_incarnation","epoch","intent_revision","action_sequence","observation_id",
+                "acquired_at_monotonic_s","context","motor","position","action")
+        if self._hold_admission_rule is not None:
+            keys += ("current",)
+        return {"captured_at_monotonic_s":now,**{k:copy.deepcopy(feedback[k]) for k in keys}}
+
+    def _clear_intercycle_admission(self):
+        # Keep the frozen reference and its original measured provenance.
+        # A new owner binding cannot relabel an old first-write cursor/window.
+        if self._intercycle_last_native is not None:
+            self._intercycle_cursor_barrier = self._intercycle_last_native
+        self._intercycle_admission_proof = self._intercycle_anchor_proof = None
+        self._intercycle_admission_binding = None
+        self._intercycle_native_rows.clear()
 
     def _receipt(self,key,now,*,fresh=False):
         receipt = super()._receipt(key,now,fresh=fresh)
@@ -1041,16 +1077,46 @@ class LeftElbowPositiveControlInput(LeftElbowResponseCharacterizeInput):
             self._positive_outcome = outcome
 
     def _qualify_intercycle_hold(self, now):
-        samples = self._recent_suffix(self._phase_samples.get((1,"intercycle_hold"), []),
-                                      "measured intercycle hold", now=now)
         proof = self._intercycle_anchor_proof
-        if (proof is None or proof["position"]["read_completed_at_monotonic_s"] != samples[-1]["position_at"]
-                or max(abs(r["raw"]-self._measured_origin_raw) for r in samples) > self.definition.return_tolerance_raw):
-            raise ValueError("measured intercycle hold differs from the original return envelope")
-        self._intercycle_hold = {"window":self._window(samples, now), "anchor_proof":copy.deepcopy(proof),
+        admission, rule = self._intercycle_admission_proof, self._hold_admission_rule
+        if rule is None:
+            samples = self._recent_suffix(self._phase_samples.get((1,"intercycle_hold"), []),
+                                          "measured intercycle hold", now=now)
+            if (proof is None or proof["position"]["read_completed_at_monotonic_s"] != samples[-1]["position_at"]
+                    or max(abs(r["raw"]-self._measured_origin_raw) for r in samples) > self.definition.return_tolerance_raw):
+                raise ValueError("measured intercycle hold differs from the original return envelope")
+        else:
+            if not self.definition.intercycle_hold_admission_valid(
+                    admission, proof, self._measured_origin_proof, now=now):
+                raise ValueError("measured intercycle hold Native admission proof is unavailable or differs")
+            if self._intercycle_cursor_barrier is not None:
+                acquired, sequence = self._intercycle_cursor_barrier
+                cursor = admission["hold_cursor"]
+                if (cursor["write_completed_at_monotonic_s"] <= acquired
+                        or cursor["action_sequence"] <= sequence):
+                    raise ValueError("measured intercycle hold Native cursor predates the cleared owner binding")
+            native = {row[0]:row for row in admission["rows"]}
+            first, last = admission["rows"][0][0], admission["rows"][-1][0]
+            actual = [row for row in self._intercycle_native_rows if first <= row["native_row"][0] <= last]
+            # IPC may skip original Native rows; every consumed row in this
+            # interval must still match, including the full latest acquisition.
+            if (not actual or actual[-1]["native_row"] != admission["rows"][-1]
+                    or any(native.get(row["native_row"][0]) != row["native_row"] for row in actual)):
+                raise ValueError("measured intercycle hold Native rows differ from actual provider feedback")
+            # Native paired acquisitions are the qualified window. The owner may
+            # consume only a subset at its independent frame rate.
+            samples = [{"raw": row[3], "position_started": row[4], "position_at": row[5],
+                        "current_started": row[7], "at": row[8]} for row in admission["rows"]]
+            if (max(abs(row["raw"]-self._measured_origin_raw) for row in samples) > rule["tolerance_raw"]
+                    or max(row["raw"] for row in samples)-min(row["raw"] for row in samples) > rule["spread_raw"]):
+                raise ValueError("measured intercycle hold exceeds its stable admission envelope")
+        qualified_at = now if rule is None else admission["qualified_at_monotonic_s"]
+        self._intercycle_hold = {"window":self._window(samples, qualified_at), "anchor_proof":copy.deepcopy(proof),
                                 "starting_raw":samples[-1]["raw"], "reference_raw":self._baseline_raw}
+        if rule is not None:
+            self._intercycle_hold["admission_proof"] = copy.deepcopy(admission)
         self._baseline_anchor_proof = copy.deepcopy(proof)
-        self._baseline_window = self._window(samples, now)
+        self._baseline_window = self._window(samples, qualified_at)
         self._outward_anchor_raw = samples[-1]["raw"]
         self._coverage = self._cycle_coverage[2]
         self._endpoint_proofs = []
@@ -1095,6 +1161,8 @@ class LeftElbowPositiveControlInput(LeftElbowResponseCharacterizeInput):
     def freeze(self):
         ScriptedLeaderInput.freeze(self)
         self._rejoin_native_feedback = None
+        if self._hold_admission_rule is not None:
+            self._clear_intercycle_admission()
         self._tracking.clear()
         cycle,phase,_ = self.definition.phase(self.elapsed_s,self._acquisition_s)
         self._phase_samples.pop((cycle,phase),None)

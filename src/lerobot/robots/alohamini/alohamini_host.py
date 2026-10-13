@@ -170,11 +170,26 @@ class AM1LocalControl:
         if not (starting or resuming or continuing):
             raise RuntimeError("AM1 Local active epoch requires the acknowledged pause sequence")
         action = {key: value for key, value in command.items() if key != AM1_LOCAL_CONTROL_KEY}
+        hold_admission = False
         if self.selected_evidence is not None:
-            action = self.selected_evidence.prepare(robot, action, self.binding)
+            definition = getattr(robot, "_am1_selected_elbow_experiment", None)
+            hold_admission = getattr(definition, "intercycle_hold_admission_rule", None) is not None
+            if hold_admission:
+                action = self.selected_evidence.prepare(robot, action, self.binding, control_marker=marker)
+            else:
+                action = self.selected_evidence.prepare(robot, action, self.binding)
         if resuming and any(float(action.get(key, 0)) != 0 for key in ("x.vel", "y.vel", "theta.vel", "lift_axis.vel")):
             raise RuntimeError("AM1 Local first resumed action must have zero body velocity")
-        accepted = robot.send_action(action)
+        if hold_admission:
+            try:
+                accepted = robot.send_action(action)
+            except BaseException:
+                self.selected_evidence.abort_hold_admission()
+                raise
+            if accepted is None:
+                self.selected_evidence.abort_hold_admission()
+        else:
+            accepted = robot.send_action(action)
         self.state, self.epoch = "active", epoch
         if self.binding is not None:
             self.intent_revision = marker["intent_revision"]
