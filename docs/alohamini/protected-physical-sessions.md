@@ -1,3 +1,76 @@
+## AM1-INTEGRATE-OPERATE-08 current release
+
+The owner accepts Operation07's bounded same-task recovery and next ordinary Start.
+Recovery14 completed58 program seconds/two useful fixed-reference elbow cycles
+after actual required Pi-local image loss:94/63/31 and60/59/33 outward/reverse/residual
+ticks, both movement directions≥56, zero qualified elbow returns and false coarse22/
+fine2. Body15 completed unchanged12-second ArmHoldBody from resulting normal rest
+with all12 arms held. Fine-position control, floor travel and full teleoperation
+remain unqualified. Current P1 footage supports nominal13, not recovery14.
+
+Packet08 conditionally authorizes ordinary integration of PRs #16–#20 only into
+`integrate/am1-local-teleop`, superseding the older named-target no-merge/no-retarget
+restrictions. Main, force/history rewrite, protection bypass, branch deletion,
+permanent tuning and autoplay remain outside authorization.
+
+| Release fact | Root's verified receipt |
+|---|---|
+| Reviewed source, integration target and required checks | Reviewed release correction source `a53aaad949df7f7b71db0a61eb8904d5d2fd7088`, target `integrate/am1-local-teleop` only, dependency order #16 → #17 → #18 → #19 → #20. After verified ordinary merges, final identities and dispositions will be recorded in the packet08 closeout on [PR #20](https://github.com/pickmanmike/lerobot_alohamini/pull/20) and the existing private ordinary-use card; main remains `ab4462b713aeb24d0473f1ec6c8812290ab19510`. |
+| Actual corrected component pins/import roots/runtime manifest | Motor `b68bfeee10df32c97865783bd4d37801f0006596`; runtime `52f1e75a308097ec38b390bdac3ed695d6cd83cf`; manifest `f35a2077a74f4c7c491a932be5a9a3700580d79da96fa4c6fb7f7c5f0ad7055a`. Only the standalone diagnostic entry and browser UI changed; all other listed motor/runtime files and independent pins are unchanged. |
+| Existing matched stopped rollback | Immediate matched stopped rollback: motor `5760a553b47a66469a8cb68aeef400ae132375ab`, runtime `0c026118cf9c35be3c436d3c250ebd3ae41ac1e1`, manifest `27bc702c185877a5e8e72dc7693c39b419d4ed778d5cc33cfa3636b78777a10a`. Its earlier runtime87799/e410 rollback remains preserved; use the existing matched stager and literal current terminal evidence. |
+| Enrolled read-only idle/status/preset/action proof | Actual corrected enrolled-client proof connected after one injected viewer-only HTTP503, preserved enrollment, retrieved completed recovery14/body15 and SHA-verified body15 native details (13749 bytes), and exposed v3/hold40/return22/fine-unqualified. Three user services are active/enabled; native history is unchanged, no new task, unchanged boot, no hardware/camera owner. Live body buttons are disabled for the finite physical backend. |
+
+Two demonstrated integration defects were corrected within existing interfaces.
+The lift diagnostic now takes canonical/serial ownership and a durable claim before
+SDK construction; completion requires literal ID11 zero/off/stationary feedback,
+transport close and a private0600 receipt, with uncertainty retained on cleanup
+failure. Its transport/comparison/profile/parser/feedback definitions are unchanged.
+Browser initialize/attach now preserves enrollment on transient status, report and
+network failure and uses one cancelable300/500 ms read-only retry; only actual401
+clears stale metadata to reveal the existing enrollment form. Pagehide cancels
+retry, persisted pageshow requests fresh state, and an obsolete attach failure
+cannot disconnect a newer view. Browser view recovery sends no Claim/Start/Stop/input operation.
+Focused browser regression17 passed; configured existing loaded-client/reporting/
+selected-transport cohort81 passed/0 failed/0 skipped. These are software/protocol
+checks, not new physical-input qualification. Typed/hash-bound full-detail and
+actual65536-cap expectations match the existing interface; limits remain65536/4096.
+Other final affected-source checks: 638 affected Windows tests passed (16 platform skips), 314 native tests passed (no skips), and 81 frontend tests passed. Independent cumulative review cleared. Full repository/pre-commit/community-template items remain unperformed; main-only CI has no run for this target. Available branch/ruleset metadata reports no required contexts, while the detailed protection read returned403. Integration will use ordinary server-enforced merges.
+
+Source integration is separate from deployment. Packet-entry physical evidence
+belongs to operating source `f3bdef6faa76dcf41852486c07b48c5ecde29acf`, motor
+`5760a553b47a66469a8cb68aeef400ae132375ab`, runtime
+`0c026118cf9c35be3c436d3c250ebd3ae41ac1e1`, manifest
+`27bc702c185877a5e8e72dc7693c39b419d4ed778d5cc33cfa3636b78777a10a`.
+The corrected-deployment row follows actual stopped staging/import/interface
+receipts, separately from the reviewed source. Preserve separate helper/camera/P1/Windows/calibration
+pins, trust/permissions and history. These diagnostic/view changes leave the tested
+motion path unchanged and do not justify another recovery14/body15/boot/homing/352
+run. Earlier idle boot proof and later idle service restarts remain distinct.
+
+Use the current trusted enrolled console, Claim input and explicitly Start
+**Left elbow negative coarse bench v3 · two cycles · stable hold 40 · return 22 ·
+fine position unqualified**, preset `left-elbow-negative-coarse-bench-v3`, version3.
+Opening a page, enrollment, Claim and reconnect do not start motors. Pause/Stop
+take precedence; Resume needs current qualified inputs/native ACK. View/report
+failure is not Stop or re-enrollment: query/rejoin the accepted operation without
+duplicate Start. Only actual401 uses the existing enrollment flow. After a real
+fault retain first cause, repair the demonstrated layer and require known cleanup
+before supported Start; uncertain cleanup does not authorize takeover.
+
+Finite viewer loss and actual required-image recovery are separate, both retaining
+the same task/reference/deadline. Live virtual arms, browser body/lift and PC USB
+leaders remain missing through the persistent protected-physical input adapter.
+Historical Windows manual-control and fake interactive/handoff results are separate.
+See the [actual capability map and next slice](roaming-resilient-sessions.md#am1-integrate-operate-08-input-capabilities):
+one fresh, expiring mapped virtual arm stream through the existing owner/backend,
+then both arms/body. No new controller or transport framework is part of this release.
+
+All following evidence/guidance remains at its recorded versions. Its historical
+unmerged/unfinished statements do not reopen accepted Operation07 or override
+packet08's named-target authorization; no historical result is rewritten.
+
+Durability means software fault tolerance, connection/control continuity, preserved state and recovery with minimal human intervention, not mechanical lifespan. AM1 stays wireless, P1 advisory and AM2 untouched; simulation is the source default and service startup cannot replay motor activity.
+
 # AM1 protected physical sessions
 
 **AM1-OPERATION-RECOVERY-07:** an ordinary fixed-reference task completed two useful

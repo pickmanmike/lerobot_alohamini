@@ -1,3 +1,76 @@
+## Active AM1-INTEGRATE-OPERATE-08 scope
+
+The owner accepts Operation07 as the achieved bounded physical same-task recovery
+and next-Start milestone, with its stated positioning limits. Do not reopen that
+milestone because fine positioning or future input modes remain unfinished.
+
+Packet08 conditionally authorizes ordinary integration of PRs #16–#20 into
+`integrate/am1-local-teleop` only after applicable review/checks. This supersedes
+older no-merge/no-retarget restrictions only for those named PRs/target. No main
+merge, protection bypass, force/history rewrite, branch deletion, permanent tuning
+or autoplay is authorized. Root alone operates Git/devices/SSH/staging.
+Reviewed source, target and check status: Reviewed release correction source `a53aaad949df7f7b71db0a61eb8904d5d2fd7088`, target `integrate/am1-local-teleop` only, dependency order #16 → #17 → #18 → #19 → #20. After verified ordinary merges, final identities and dispositions will be recorded in the packet08 closeout on [PR #20](https://github.com/pickmanmike/lerobot_alohamini/pull/20) and the existing private ordinary-use card; main remains `ab4462b713aeb24d0473f1ec6c8812290ab19510`. 638 affected Windows tests passed (16 platform skips), 314 native tests passed (no skips), and 81 frontend tests passed. Independent cumulative review cleared. Full repository/pre-commit/community-template items remain unperformed; main-only CI has no run for this target. Available branch/ruleset metadata reports no required contexts, while the detailed protection read returned403. Integration will use ordinary server-enforced merges.
+
+Recovery14 completed58 program seconds/two useful fixed-reference elbow cycles:
+94/63/31 and60/59/33 outward/reverse/original-reference residual ticks. Both movement
+directions meet56; zero elbow returns qualify, coarse22/fine2 remain false. Actual
+required-local-image loss caused measured hold/body zero and qualified same-task
+recovery without reseeding or renewing the original90-second deadline. Body15 next
+explicit normal-rest Start completed unchanged12-second ArmHoldBody with all12
+arms held; raised-bench response is not floor-travel proof. P1 footage covers
+nominal13, not recovery14. Preserve every earlier result and manual-use instruction.
+
+Two existing-interface corrections are scoped to packet08: the lift diagnostic
+acquires canonical/serial admission and a durable claim before SDK construction,
+then requires literal ID11 zero/off/stationary feedback, transport close and a
+mode0600 receipt before claim completion; failed cleanup retains uncertainty.
+Its transport/comparison/profile/parser/feedback definitions remain unchanged.
+Browser initialize/attach treats only actual401 as enrollment loss, retains trust
+on transient status/report/network failure, and uses one bounded read-only retry.
+Pagehide cancels retry; persisted pageshow reattaches fresh with empty intent;
+obsolete attach responses cannot invalidate a newer connection. Typed/hash-bound
+detail/nonmutation and actual65536-cap checks were corrected to existing interfaces,
+without changing65536/4096 limits. The verified browser cohort passed81 tests with no failures or skips; affected
+source checks and their platform limits are recorded above.
+
+Integrated source is distinct from actual deployment. Packet-entry successful source
+is `f3bdef6faa76dcf41852486c07b48c5ecde29acf`, motor
+`5760a553b47a66469a8cb68aeef400ae132375ab`, runtime
+`0c026118cf9c35be3c436d3c250ebd3ae41ac1e1`, manifest
+`27bc702c185877a5e8e72dc7693c39b419d4ed778d5cc33cfa3636b78777a10a`.
+Actual corrected staging/import/idle proof and matched rollback:
+Motor `b68bfeee10df32c97865783bd4d37801f0006596`; runtime `52f1e75a308097ec38b390bdac3ed695d6cd83cf`; manifest `f35a2077a74f4c7c491a932be5a9a3700580d79da96fa4c6fb7f7c5f0ad7055a`. Only the standalone diagnostic entry and browser UI changed; all other listed motor/runtime files and independent pins are unchanged. Immediate matched stopped rollback: motor `5760a553b47a66469a8cb68aeef400ae132375ab`, runtime `0c026118cf9c35be3c436d3c250ebd3ae41ac1e1`, manifest `27bc702c185877a5e8e72dc7693c39b419d4ed778d5cc33cfa3636b78777a10a`. Its earlier runtime87799/e410 rollback remains preserved; use the existing matched stager and literal current terminal evidence. Stage only stopped affected components
+through the existing matched procedure after known cleanup. Preserve separate pins,
+calibration, private trust/permissions and history. These ownership/view changes do
+not change the exercised motion path; do not repeat completed recovery14/body15,
+boot/homing or unchanged352-second work for a Git SHA. Service restart never starts
+or replays a task. Missing status is not re-enrollment or Stop; query the accepted
+operation without duplicate Start. Uncertain cleanup never authorizes takeover.
+
+Ordinary v3 Start launches a finite Pi-owned preset: practical hold40 is separate
+from return22/fine2. Finite physical presets/viewer reconnect are exercised. Live
+browser body/lift and PC USB leaders have separate historical Windows Local coverage
+but are missing through the new persistent physical owner; live virtual arms are
+also missing there. Fake interactive/handoff tests do not qualify physical streaming.
+Current boundaries are the finite physical registry, `PhysicalExecutor._run`, and
+fake-only Core/UI `input`; exact entrypoints are in the current roaming-session map.
+
+The next focused packet adds one mapped, expiring virtual arm target stream through
+the existing owner/protected backend, with other measured joints held/body zero,
+then both arms/body. Reuse mappings, held acquisition, qualified release/alignment/
+Resume, current run/controller/connection/grant/sequence fences and local guards.
+Enforce250 ms intention expiry at native cadence; new grants/reconnect must not
+extend or replay old targets. PC leaders stay on the PC and human leader movement
+is not a prerequisite. No controller/dashboard/framework, transport rebuild,
+P1/Ethernet requirement or network tuning is included. AM1 wireless/P1 advisory/AM2
+untouched, simulation default and no autoplay remain.
+
+The sections below retain their original workstreams/versions. For packet08 this
+prefix resolves their expired integration and unfinished-milestone prerequisites;
+their evidence, protections and ordinary manual guidance remain intact.
+
+Durability means software fault tolerance, connection/control continuity, preserved state and recovery with minimal human intervention, not mechanical lifespan. AM1 stays wireless, P1 advisory and AM2 untouched; simulation is the source default and service startup cannot replay motor activity.
+
 ## Current AM1 repeatable operation and recovery scope
 
 AM1-OPERATION-RECOVERY-07 achieved bounded ordinary elbow movement, genuine
