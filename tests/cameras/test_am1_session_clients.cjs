@@ -464,6 +464,7 @@ test("loaded protocol-fixture live elbow jogs reverse and blur requires new qual
   assert(firstFresh.command.target["arm_left_elbow_flex.pos"]>=2 && firstFresh.command.target["arm_left_elbow_flex.pos"]<=2.1);
   assert(result.frames.every(frame=>Object.keys(frame.command.target).join()==="arm_left_elbow_flex.pos"));
   for(let index=1;index<4;index++)assert(result.frames[index].at-result.frames[index-1].at>=40,"nominal cadence does not burst/replay");
+  assert((result.frames[2].at-result.frames[0].at)/2<85,"immediate physical grant/input replies use the ordinary page nominal20Hz schedule");
   await page.keyboard.up("]");assert.deepEqual(errors,[]);
   console.log(JSON.stringify({testOnlyProtocolFixture:true,physicalEvidenceProved:false,ordinaryJogButtons:true,mappedInputSamples:result.frames.length,newGestureAfterResume:true}));
 });

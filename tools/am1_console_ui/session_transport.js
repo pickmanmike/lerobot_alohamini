@@ -310,7 +310,7 @@ class AM1SessionTransport {
     this.elbowJog=direction;return true;
   }
   async liveInput() {
-    if(this.inputBusy || !this.elbowJog || !this.elbowInput() || this.liveInputs.size>=2 || this.pending.size>=6
+    if(this.inputBusy || !this.elbowJog || !this.elbowInput() || this.liveInputs.size>=1 || this.pending.size>=6
       || this.socket?.readyState!==WebSocket.OPEN || this.socket.bufferedAmount>0)return;
     this.inputBusy=true;
     const epoch=this.epoch,intent=this.intent,ids=Object.freeze(this.identities());
@@ -320,7 +320,7 @@ class AM1SessionTransport {
       const grant=await this.command({op:"grant",...ids});
       if(!current())return;
       if(!grant.accepted){this.clearGesture(true);return;}
-      if(this.socket.bufferedAmount>0 || this.liveInputs.size>=2)return;
+      if(this.socket.bufferedAmount>0 || this.liveInputs.size>=1)return;
       // Pi times remain opaque. Only Core/native decide whether this original grant is still valid.
       // Sample current intent after issuance; skipped/gapped ticks never accumulate displacement.
       const value=this.elbowInput(),now=performance.now(),dt=Math.max(0,Math.min((now-this.elbowAt)/1000,0.1));
@@ -489,7 +489,8 @@ globalThis.AM1RemoteInitialize=function() {
   window.addEventListener("pagehide",()=>transport.detach());
   window.addEventListener("pageshow",event=>{if(event.persisted)transport.restore();});
   document.querySelector('[data-help="touch"]').onclick=()=>{const help=document.querySelector("#control-help");help.hidden=!help.hidden;};
-  setInterval(()=>transport.input(),100);
+  setInterval(()=>{if(transport.isLiveElbow())transport.input();},50);
+  setInterval(()=>{if(!transport.isLiveElbow())transport.input();},100);
   setInterval(()=>{if(transport.connected&&transport.controllerGeneration)transport.renew().catch(()=>{});},500);
   render(transport);transport.initialize().catch(error=>render(transport,error.message));
 };

@@ -62,16 +62,28 @@ test("live elbow drops buffered and excess ticks without accumulating displaceme
   const f=await liveFixture();assert.equal(typeof f.transport.setElbowJog,"function");f.transport.setElbowJog(-1);
   f.transport.socket.bufferedAmount=1;await f.transport.input();assert.equal(f.frames.length,0);
   f.transport.socket.bufferedAmount=0;f.setNow(5000);
-  for(let index=0;index<2;index++){
-    const tick=f.transport.input();f.reply("grant",{accepted:true,grant_id:`g${index}`,issued:10,expires:10.25});await tick;
-  }
-  assert.equal(f.frames.filter(frame=>frame.command?.op==="input").length,2);
-  for(let index=0;index<20;index++)await f.transport.input();
-  assert.equal(f.frames.length,4,"two input promises and one current grant bound the stream");
+  const tick=f.transport.input();f.reply("grant",{accepted:true,grant_id:"g0",issued:10,expires:10.25});await tick;
+  for(let index=0;index<20;index++)f.transport.input();
+  assert.equal(f.frames.length,2,"one unresolved physical input must prevent a newer grant");
   assert.equal(f.frames[1].command.target["arm_left_elbow_flex.pos"],3.9,"callback gaps cannot catch up displacement");
-  f.reply("input",{accepted:false,status:"superseded"});await Promise.resolve();
-  assert.equal(f.transport.elbowJog,-1,"superseded old input is not loss of the current gesture");
+  f.reply("input",{accepted:false,status:"superseded"});await Promise.resolve();await Promise.resolve();await Promise.resolve();
+  assert.equal(f.transport.elbowJog,-1,"superseded input is not loss of the current gesture");
   f.transport.clear();
+});
+test("a pending physical input prevents grant rotation until its ACK settles bounded work",async()=>{
+  const f=await liveFixture();try{
+    f.transport.setElbowJog(-1);f.setNow(1050);
+    const first=f.transport.input();f.reply("grant",{accepted:true,grant_id:"first",issued:100,expires:100.25});await first;
+    assert.equal(f.transport.liveInputs.size,1);assert.equal(f.transport.pending.size,1);
+    const deferred=f.transport.input();assert.equal(f.frames.length,2,"grantB must not overtake still pending inputA at Core");await deferred;
+    f.reply("input",{accepted:true,status:"input"});await Promise.resolve();await Promise.resolve();await Promise.resolve();
+    assert.equal(f.transport.liveInputs.size,0);assert.equal(f.transport.pending.size,0);assert.equal(f.transport.elbowJog,-1);
+    f.setNow(1100);const next=f.transport.input();assert.equal(f.frames.at(-1).command.op,"grant");
+    f.reply("grant",{accepted:true,grant_id:"second",issued:200,expires:200.25});await next;
+    const input=f.frames.at(-1).command;assert.equal(input.grant_id,"second");assert.equal(input.seq,2);
+    assert.deepEqual(Object.keys(input.target),["arm_left_elbow_flex.pos"]);assert(Math.abs(input.target["arm_left_elbow_flex.pos"]-3.9)<1e-12);assert.equal(input.valid_until_monotonic_s,undefined);
+    f.reply("input",{accepted:true,status:"input"});
+  }finally{f.transport.clear();}
 });
 const reporting={accepted:true,status:"reporting_error",code:"response_limit",reason:"Owner response exceeds the presentation limit",effect_admitted:true,
   run_id:"actual-new-run",operation_result:{accepted:true,status:"starting",effect_admitted:true,run_id:"actual-new-run"}};
@@ -240,15 +252,18 @@ test("an old input refusal cannot clear a newly qualified measured-cursor gestur
 });
 
 
-test("an expired older input reply cannot cancel current intent sampled by a newer pending grant",async()=>{
+test("a prior revision's late input refusal settles its fence before the fresh gesture obtains a new grant",async()=>{
   const f=await liveFixture();f.transport.setElbowJog(-1);f.setNow(1100);
   const first=f.transport.input();f.reply("grant",{accepted:true,grant_id:"a",issued:10,expires:10.25});await first;
-  const next=f.transport.input();
-  f.reply("input",{accepted:false,status:"refused",reason:"expired grant"});await Promise.resolve();await Promise.resolve();
-  assert.equal(f.transport.elbowJog,-1,"the newer pending grant still samples current intentional input");
-  f.setNow(1200);f.reply("grant",{accepted:true,grant_id:"b",issued:11,expires:11.25});await next;
-  assert.equal(f.frames.at(-1).command.grant_id,"b");assert.equal(f.frames.at(-1).command.seq,2);
-  assert.deepEqual(f.frames.at(-1).command.target,{"arm_left_elbow_flex.pos":3.8});f.reply("input",{accepted:true});
+  const snapshot=JSON.parse(JSON.stringify(f.transport.snapshot));snapshot.run.intent_revision=8;
+  Object.assign(snapshot.run.live_input,{cursor_norm:2,cursor_feedback_sequence:40,cursor_intent_revision:8});
+  f.transport.socket.onmessage({data:JSON.stringify({kind:"snapshot",revision:2,snapshot})});assert.equal(f.transport.setElbowJog(1),true);
+  await f.transport.input();assert.equal(f.frames.filter(frame=>frame.command?.op==="grant").length,1);
+  f.reply("input",{accepted:false,status:"refused",reason:"expired grant"});await Promise.resolve();await Promise.resolve();await Promise.resolve();
+  assert.equal(f.transport.elbowJog,1);assert.equal(f.transport.liveInputs.size,0);assert.equal(f.transport.pending.size,0);
+  f.setNow(1150);const next=f.transport.input();f.reply("grant",{accepted:true,grant_id:"b",issued:11,expires:11.25});await next;
+  assert.equal(f.frames.at(-1).command.grant_id,"b");assert.equal(f.frames.at(-1).command.intent_revision,8);
+  assert.deepEqual(f.frames.at(-1).command.target,{"arm_left_elbow_flex.pos":2.05});f.reply("input",{accepted:true});
 });
 
 
