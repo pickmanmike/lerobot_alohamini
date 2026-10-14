@@ -1,61 +1,88 @@
 # AM1 roaming-resilient sessions
 
 **Current result: [AM1-OPERATION-RECOVERY-07](protected-physical-sessions.md#am1-operation-recovery-07-results-and-status).**
-The existing-console **Left elbow coarse bench v1 · two cycles** preset completed
-58 program seconds and two measured out-and-back cycles on one fixed raw2429
-reference, including one genuine required-local-image interruption and qualified
-same-task recovery. The actual result is **two completed cycles / one qualified
-return**, not a two-of-two coarse benchmark pass. Cycle1 measured71/59/12 ticks;
-cycle2 after recovery measured57/53/16, missing the unchanged56-tick reverse criterion
-by3. Both fine2-tick returns failed. Sampled current peaked149.5 mA under the retained
-150 mA guard; no gain, cap or qualification criterion changed.
+Recovery14 completed58 program seconds and two useful measured out-and-back cycles
+after genuine required-local-image loss and qualified same-task recovery. The next
+explicit normal-rest Start completed the unchanged12-second body recipe. Program
+completion, useful movement and accuracy remain separate: fixed original raw2339
+produced94/63/31 and60/59/33 outward/reverse/residual ticks, zero qualified returns,
+false coarse22 and false fine2 qualification.
 
-The owned one-second local delivery marker aged original required input beyond
-500 ms and expired locally. Measured hold, fresh matching source/feedback and real
-native acknowledgment closed one recovery episode in1.183449 seconds. The retained
-bridge began with goal2441 equal to measured2441 and froze task progress28.3;
-76 native rows completed its1.086464-second cursor over2.515928 seconds of actual
-write time. Original run/operation/source identities, measured seed and90-second
-Live deadline remained fixed. The recovered `required_proof_loss` is retained;
-there was no native fault in this completed run. A separate five-second browser
-closure continued progress46.2→51.1 on the same task.
+The ordinary **Left elbow negative coarse bench v3 · two cycles · stable hold 40 · return 22 · fine position unqualified**
+preset retains one measured reference/endpoint and the original90-second deadline.
+Use the existing trusted enrolled console, Claim input and explicitly Start;
+preset ID `left-elbow-negative-coarse-bench-v3`, version3. Pause/Resume/Stop retain
+precedence. Reconnecting queries the accepted operation and reattaches; it does not
+Stop/replay/duplicate Start. See the linked report for the private config location,
+ordinary recipe, original native evidence and matched stopped rollback.
 
-Known cleanup retained20 typed zeros, qualified lift/bus proof and exact same-run
-required-camera release, with uncertainty false. Original advisory P1 frames show
-pivot and reversal; independent237.7881-second source verification confirmed release
-and zero audio streams. It does not establish angular/fine precision or an
-exposure-to-servo clock bridge. The first b72 attempt's incomplete-bridge software
-refusal, original cause and cleanup remain preserved; the exact native admission
-clock/refused request were unrecorded, so its bus-gap cause is not invented.
+Practical hold admission≤40/spread≤2 uses fresh3–12 contiguous paired Native samples
+spanning≥0.2 seconds. Independent scoring remains56 outward/56 reverse/residual≤22,
+with fine residual≤2. The150 mA selected cap, gains/calibration and genuine local
+motion, thermal/status, source/feedback and ownership protections remain unchanged.
 
-Current motor/runtime/manifest are `da2e1b` / `b9f6c1` / `a2b426`, from reviewed
-corrected source `df865`. Exact full pins, descriptor, stopped rollback and evidence
-are in the linked report. The shared bounded status and authenticated SHA-bound
-full typed detail preserve truthful current state and earlier results. Reconnect
-queries the original operation and cannot Stop or duplicate Start; only an actual
-authentication401 can justify new enrollment. Pause/Stop precedence and genuine
-current/thermal/status/feedback/travel/source/ownership protections remain intact.
+Final run `b77cf5fe-9b4d-4d4a-b12c-cc2eb8198499` used a locally expiring one-second
+required-image delivery marker. Real input age0.505616 seconds caused measured hold
+at frozen progress27.6; seven Native acknowledgments retained12 arms/lift with zero
+drift and body intent. Fresh matching images/feedback and Native ACK closed episode1
+in1.340681265 seconds. Original run/reference/deadline remained fixed; rejoin began at
+the measured hold without a jump. Native program finish74.613 and Owner completion
+77.221871403 seconds after Live remained inside the original90 seconds. Browser
+reattachment46.1→51.1 retained the same task/seed/deadline; one Start/zero Stop and no
+helper/reporting error. Historical `required_proof_loss` remains recorded.
 
-Persistent idle installation is verified after the reviewed permission-preflight
-correction: three exact mode0600 user units are active with restart-on-failure/5-second
-backoff/60-second three-start limit. The same full completed7ce history and counts,
-private bytes and trust remain intact; current idle has no task, capture or hardware
-owner and no current qualification. A locally scheduled ordinary idle reboot restored
-all three exact enabled services, the same sources/trust/auth/private bytes and
-native7ce history/counts. Boot changed to `0df44237-f502-4d74-8964-95bb6347ffd4`;
-there was no automatic task/capture, and original enrollment returned HTTP200 without
-TLS exceptions or new pairing. The preceding update/reboot outage remains unexplained.
+Next run `4c89cdf9-1d39-439a-bc7a-e44f9d7b402d` admitted fresh normal rest after the
+preceding final raw2306 and completed the original12-second `ArmHoldBody` recipe.
+Its zero arm cycles/one generic body return is distinct from elbow accuracy. All12
+held arms had zero seed drift; measured wheel/lift command response is a raised-bench
+check without a floor-travel claim. Component-specific body/lift guards and its
+unconfirmed startup temperature-outlier warning remain retained. Both final runs have
+actual20-zero/lift/bus/camera cleanup, no Native hardware fault and uncertainty false.
 
-The first post-reboot Start `041d4c3e-c252-46c2-983b-5c564e7742e8` started normally
-and moved64 outward ticks (2445→2509), then faulted at13.1 during deliberate endpoint
-dwell: goal2555/raw2509/error46,104 mA,37 distinct acquisitions and no additional
-movement over1.204516 seconds. Its pending window began at outbound11.9, not solely
-in dwell. The old rule correctly refused it; zero cycles/returns and known cleanup
-remain recorded. **Pending:** a separately pinned coarse-qualified dwell policy and
-successful ordinary Start. This supported correction keeps150/45/3/1.2 and56/22/fine2
-limits, native proof and genuine protections rather than raising effort. Packet07 is
-not yet complete. AM1 stays wireless, P1 advisory, AM2 unchanged and simulation the
-default. No permanent tuning, I1/tiny-return campaign, endurance claim or merge.
+Nominal11 completed two cycles from raw2439:101/68/33 and64/63/34 ticks, with zero
+qualified returns. Recovery12 qualified its genuine interruption in1.080170836 seconds
+and browser46.1→50.8, then faulted55.4 on a provider rising-current diagnosis. Its
+historical required loss, distinct later fault and Native first cause null stay separate.
+An original sparse Native subsequence reproduces that diagnosis, but an omitted
+Native acquisition contains a real decrease; the full Provider collection list was
+not retained. The reviewed V3-only correction requires contiguous original Native IDs,
+one epoch/intent and advancing clocks before inferring uninterrupted rising current.
+Native protections stay unchanged. New-source nominal13 completed normally but its
+arm-helper import failed before the marker and a later helper assertion failed;
+no Stop and no required-loss/detachment proof. Correcting the existing helper import
+context enabled recovery14, without another operating-source change. Earlier7ce/09/10
+results remain versioned in the linked report.
+
+P1 remains advisory. Original nominal11 views show coarse pivot/reversal, with source
+release/zero audio, while its separate optional-delivery connection error remains
+failed. Current237.9869-second P1 capture covers nominal13 only; source and native
+caller released normally, audio zero. Inspected dark/backlit stills show qualitative
+small pose differences, without angular precision or recovery14 visual evidence.
+Actual current Pi-local images independently qualified required recovery14 observation.
+
+Three private idle services restore the interface without automatically initializing
+motors/capture or starting/replaying a task. One actual idle reboot was verified at
+earlier source `df865…`; current affected staging/service restarts preserved idle
+definitions/private permissions/trust/history without autoplay. These are separately
+recorded facts, not another current-source reboot test.
+
+Current operating source `f3bdef6faa76dcf41852486c07b48c5ecde29acf` deploys motor
+`5760a553b47a66469a8cb68aeef400ae132375ab`, runtime
+`0c026118cf9c35be3c436d3c250ebd3ae41ac1e1`, manifest
+`27bc702c185877a5e8e72dc7693c39b419d4ed778d5cc33cfa3636b78777a10a`.
+The final fix affects only the runtime provider. Exact separate pins/calibration,
+private permissions/ACL, trust and typed history remain preserved; the linked report
+records the immediate matched rollback. Owner/HTTP/WSS frames stay bounded65536 bytes,
+the Native hold-proof wrapper4096, with authenticated SHA-bound private full details.
+Focused results are279 Windows/423 native checks across overlapping cohorts, reported
+separately;199 reader checks preserve eight older outputs exactly.
+
+A completed qualified executor-acknowledged recovery closes its episode. A later
+distinct loss may receive another bounded episode, at most three total, without
+renewing the original deadline. AM1 remains wireless, P1 advisory, AM2 unchanged,
+simulation default and PR20 stacked on19→18→17→16 without merge authorization.
+Durability means software fault tolerance, connection/control continuity, state
+preservation and recovery with minimal human intervention, not mechanical lifespan.
 
 Packet06's accepted73/56/17 and75/58/17 coarse comparisons, fine2 failures and all
 older100/150 mA failures remain source-dated history. Trial06 retains its physical

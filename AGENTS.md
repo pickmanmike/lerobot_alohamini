@@ -1,40 +1,64 @@
 ## Current AM1 repeatable operation and recovery scope
 
-The owner explicitly invoked AM1-OPERATION-RECOVERY-07 and accepts packet06's
-coarse elbow movement at its recorded sources. Preserve that behavior and its
-fine-position limits. Continue through a reusable versioned existing-console
-preset, two fixed-reference finite cycles, genuine required-local-input hold and
-qualified same-task recovery, truthful completion, usable next explicit Start,
-and persistent idle console after reboot. Do not reopen I1/tiny-return or replace
-completion with one experiment/report/quota. Repair demonstrated layers and
-continue supported finite, locally monitored sequences; preserve every first cause.
+AM1-OPERATION-RECOVERY-07 achieved bounded ordinary elbow movement, genuine
+required-local-image hold/recovery, truthful completion and a usable next explicit
+normal-rest Start at source `f3bdef6faa76dcf41852486c07b48c5ecde29acf`.
+Recovery14 `b77cf5fe-9b4d-4d4a-b12c-cc2eb8198499` completed58 program seconds/two cycles
+from fixed original raw2339/encoded endpoint2228:94/63/31 and60/59/33 outward/reverse/
+original-reference residual ticks. Both directions meet56; zero returns qualify,
+coarse22/fine2 remain false. Next Start `4c89cdf9-1d39-439a-bc7a-e44f9d7b402d`
+completed the unchanged12-second ArmHoldBody recipe; generic body qualification is
+separate from elbow accuracy. Preserve every earlier recorded success/failure.
 
-Start with the tested +10/10-second-ramp/2-second-dwell/150mA sampled-current and
-45-tick moving condition, fixed30-tick startup bound, unchanged P16/I0/D32,
-calibration/device limits and genuine current/thermal/status/feedback/travel/ownership
-protections. Freeze one admitted task reference, not a new origin each cycle.
-Keep command acceptance, measured/visible motion, coarse performance, fine residual,
-program completion and cleanup separate. No blind retry/effort escalation/tuning.
+Use the ordinary named `left-elbow-negative-coarse-bench-v3`, version3 condition:
+−10 normalized excursion/10-second ramps/2-second dwell/150mA sampled selected cap,
+two cycles/6-second inter-cycle hold/58 nominal/60 trajectory/original90-second Live.
+Fresh Native admission≤40 raw residual/spread≤2 uses3–12 contiguous paired samples
+spanning≥0.2 seconds; scoring stays56/56/22 and fine2. Freeze one original reference/
+endpoint through cycles and recovery; never reseed from hold or reset the deadline.
+Keep command acceptance/live-goal/measured/visible motion, completion, coarse/fine,
+body qualification and cleanup separate. Simulation remains the default.
 
-Root alone operates devices, SSH, cameras, Git and staging. Reuse the current idle
-candidate and existing provider, console, operation helper, analyzer, tests, native
-mock environment, builders and stager. Stage only stopped affected owners; retain
-exact separate pins/private permissions/typed native history and matched rollback.
-A reporting/view error is not Stop and must not duplicate Start. Required-image
-loss must use genuine source age and fresh same-run recovery with executor ACK,
-original deadline, at most3 bounded episodes and Pause/Stop precedence.
+Recovery14 closed a qualified executor-acknowledged episode in1.340681265 seconds,
+then moved usefully and finished within the original90 seconds. Browser46.1→51.1
+retained the same task/seed/deadline. Retain historical required_proof_loss and any
+later distinct evidence fault. A qualified closed episode permits a later distinct
+bounded episode, at most3 total; Pause/Stop precedence remains. View/report failure
+is not Stop: query the accepted operation without duplicate Start or unnecessary
+re-enrollment. A real fault requires known stopped cleanup and a supported repair
+before the next explicit Start; uncertain cleanup does not authorize takeover.
 
-Persist only the existing idle owner/gateway/local worker, with no motor/camera
-initialization or automatic Start/replay. Reboot only after known cleanup/no task.
-AM1 wireless; P1 advisory; AM2 untouched. Pi recovery, camera framing and generic
-elbow inspection are completed. No manual positioning/leaders/readiness questions,
-network tuning, new architecture/framework, permanent tuning, merge/retarget/force/
-history rewrite or credential/household-image publication is authorized.
-Durability means software fault tolerance, connection/control continuity, state
-preservation and recovery with minimal human intervention, not mechanical lifespan.
-Packet06 trials06/07 remain73/56/17 and75/58/17 ticks from different fresh origins;
-only trial07 completed its owner lifecycle. Neither proves fine2 or required-input
-recovery. Full accepted results and older restrictions remain historical in docs.
+The last repair is V3-only runtime-provider rising-current inference: contiguous
+original Native observation IDs, unchanged epoch/intent and advancing clocks are
+required; a sparse view cannot prove an uninterrupted rise. Preserve trial12's fault
+and absence of its complete Provider collection list. Native current/thermal/status/
+instability,45 moving/30 startup/3-tick1.2-second response, P16/I0/D32, calibration/
+device limits and ownership remain unchanged. Supported repairs may correct a
+demonstrated diagnostic assertion; no blind retry/effort escalation, I1/tiny-return
+investigation or permanent tuning.
+
+Current motor `5760a553b47a66469a8cb68aeef400ae132375ab`, runtime
+`0c026118cf9c35be3c436d3c250ebd3ae41ac1e1`, manifest
+`27bc702c185877a5e8e72dc7693c39b419d4ed778d5cc33cfa3636b78777a10a`.
+Immediate matched rollback retains that motor/runtime
+`87799c93e8ae622a84e2e63e485db23cb63eea75`/manifest
+`e410ecb59b94786cd27a871d69401d7ca7246bd4176185e5f97f7f0326aa3fcd`.
+Root alone operates devices/SSH/cameras/Git/staging. Reuse the current candidate and
+existing provider/console/helpers/analyzer/native mock/builders/stager; stage only
+stopped affected owners after known cleanup, preserving exact separate pins, private
+permissions/ACL, calibration, typed history and matched rollback. No new framework.
+
+Persist only the existing idle owner/gateway/local worker, with no automatic motor/
+capture initialization or task Start/replay. The actual idle reboot is proof at its
+earlier df865 source; current affected staging/service restarts are separate facts,
+not another boot test. AM1 wireless/P1 advisory/AM2 untouched. Current P1 imagery
+covers nominal13, not recovery14; actual local images qualify required observation.
+No manual positioning/leaders/readiness/attendance questions, network tuning,
+merge/retarget/force/history rewrite or credential/household-image publication.
+PR stack20→19→18→17→16 remains explicit. Durability means software fault tolerance,
+connection/control continuity, state preservation and recovery with minimal human
+intervention, not physical wear/mechanical lifespan. No hardware-endurance campaign.
+
 ## Historical AM1 visible positive-control continuation (superseded for new packet06)
 
 AM1-VISIBLE-CONTROL-04 has one actual bounded comparison, f7e7ae6d-d305-448a-90b6-5f2ae3bc8b19.
