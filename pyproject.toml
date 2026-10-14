@@ -92,6 +92,7 @@ dependencies = [
 
 # Optional dependencies
 [project.optional-dependencies]
+am1-session = ["aiohttp==3.14.1"] # Fake persistent-session HTTPS/WSS gateway only.
 
 # ── Feature-scoped extras ──────────────────────────────────
 dataset = [

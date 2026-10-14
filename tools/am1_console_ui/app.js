@@ -246,7 +246,9 @@ class AM1ConsolePresentation {
 }
 globalThis.AM1ConsolePresentation = AM1ConsolePresentation;
 
-if (typeof document !== "undefined") {
+if (typeof document !== "undefined" && document.body?.dataset.sessionMode === "remote-fake") {
+  globalThis.AM1RemoteInitialize();
+} else if (typeof document !== "undefined") {
   const csrf = document.querySelector('meta[name="am1-csrf"]').content;
   const stateText = document.querySelector("#session-state");
   const notice = document.querySelector("#control-notice");
