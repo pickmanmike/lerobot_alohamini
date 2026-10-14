@@ -11,6 +11,7 @@ from examples.alohamini.am1_session_contract import (
     LEFT_ELBOW_ORIGINAL_RETURN,
     LEFT_ELBOW_POSITIVE_CONTROL,
     LEFT_ELBOW_RESPONSE,
+    LIVE_ELBOW_SPECS,
     SelectedElbowExperiment,
 )
 
@@ -205,6 +206,7 @@ class PhysicalExecutor:
         self.mutex = threading.RLock()
         self.worker = None
         self.run_id = self.recipe = None
+        self.live_spec = None
         self.host_incarnation = None
         self.revision = 0
         self.desired = "hold"
@@ -244,9 +246,11 @@ class PhysicalExecutor:
 
     def supports(self, recipe):
         return (
-            (recipe.name in self.recipes or recipe.name == LIVE_RECIPE)
+            (recipe.name in self.recipes or recipe.name in LIVE_ELBOW_SPECS)
             and recipe.seed is None
-            and recipe.mode == ("interactive" if recipe.name == LIVE_RECIPE else "finite")
+            and recipe.mode == ("interactive" if recipe.name in LIVE_ELBOW_SPECS else "finite")
+            and (recipe.name not in LIVE_ELBOW_SPECS or recipe.trajectory_s is None
+                 and recipe.live_s == LIVE_ELBOW_SPECS[recipe.name].live_s)
             and (recipe.name != LEFT_ELBOW_ORIGINAL_RETURN.recipe_name or self.return_reference is not None)
             and (recipe.name not in ELBOW_RECOVERY_DEFINITIONS or self.recovery_reference is not None)
         )
@@ -417,6 +421,7 @@ class PhysicalExecutor:
             ):
                 raise RuntimeError("previous physical owner is active or uncertain, or recipe unsupported")
             self.run_id, self.recipe = run_id, recipe
+            self.live_spec = LIVE_ELBOW_SPECS.get(recipe.name)
             self._reconciliation_worker = None
             self.host_incarnation = __import__("uuid").uuid4().__str__()
             self.revision = 0
@@ -503,14 +508,15 @@ class PhysicalExecutor:
     def apply(self, target, *, valid_until_monotonic_s, intent_revision, run_id, service_incarnation,
               controller_generation, connection_generation, host_incarnation, grant_id, seq):
         with self.mutex:
-            if (self.recipe is None or self.recipe.name != LIVE_RECIPE or self.finish_status
+            joint = self.live_spec.joint if self.live_spec is not None else None
+            if (self.recipe is None or self.live_spec is None or self.finish_status
                     or self._lifecycle["phase"] != "live" or self.desired != "active"
                     or run_id != self.run_id or host_incarnation != self.host_incarnation
                     or intent_revision != self.revision or self._live_binding != {
                         "service_incarnation": service_incarnation, "controller_generation": controller_generation,
                         "connection_generation": connection_generation}
-                    or not isinstance(target, dict) or set(target) != {LIVE_JOINT}
-                    or type(target[LIVE_JOINT]) not in (int, float) or not math.isfinite(target[LIVE_JOINT])
+                    or not isinstance(target, dict) or set(target) != {joint}
+                    or type(target[joint]) not in (int, float) or not math.isfinite(target[joint])
                     or type(valid_until_monotonic_s) not in (int, float) or not math.isfinite(valid_until_monotonic_s)
                     or self.clock() >= valid_until_monotonic_s
                     or valid_until_monotonic_s > self.clock() + .25 + 1e-9
@@ -518,7 +524,8 @@ class PhysicalExecutor:
                     or type(grant_id) is not str or not grant_id):
                 return False
             corridor = (self.sample or {}).get("ack", {}).get("live_input", {})
-            if (not corridor or not corridor.get("corridor_min_norm", float("inf")) <= target[LIVE_JOINT]
+            if (not corridor or corridor.get("joint") != joint
+                    or not corridor.get("corridor_min_norm", float("inf")) <= target[joint]
                     <= corridor.get("corridor_max_norm", float("-inf"))):
                 return False
             self._live_target = {"target": copy.deepcopy(target), "grant_id": grant_id, "seq": seq,
@@ -552,7 +559,7 @@ class PhysicalExecutor:
                 and ack.get("epoch") == self._epoch
                 and self._epoch_mode == "active"
             )
-            live_transition = bool(self.recipe is not None and self.recipe.name == LIVE_RECIPE
+            live_transition = bool(self.live_spec is not None
                 and matched and revision and self.desired == "active" and ack.get("state") == "paused"
                 and self._epoch_mode == "active" and ack.get("epoch") == self._epoch - 1
                 and len(self._aligned) >= 3 and self._aligned[-1] - self._aligned[0] >= .2 - 1e-9)
@@ -584,8 +591,8 @@ class PhysicalExecutor:
                 "host_incarnation": self.host_incarnation,
                 "lifecycle": copy.deepcopy(self._lifecycle),
                 "transport_issue": self._transient,
-                **({"live_input": copy.deepcopy(self._live_expired or ack.get("live_input", {"state": "held", "joint": LIVE_JOINT}))}
-                   if self.recipe is not None and self.recipe.name == LIVE_RECIPE else {}),
+                **({"live_input": copy.deepcopy(self._live_expired or ack.get("live_input", {"state": "held", "joint": self.live_spec.joint}))}
+                   if self.live_spec is not None else {}),
                 "reconciliation": {
                     "state": self._reconciliation_worker.state,
                     "error": self._reconciliation_worker.error,
@@ -611,7 +618,7 @@ class PhysicalExecutor:
                     return False
                 self.desired = "active"
             self._wake.set()
-            return self._dispatch_ack or (self.recipe.name == LIVE_RECIPE and self.evidence()["native_ack"])
+            return self._dispatch_ack or (self.live_spec is not None and self.evidence()["native_ack"])
 
     def hold(self):
         with self.mutex:
@@ -673,7 +680,8 @@ class PhysicalExecutor:
         from tools.am1_pi_executor import SimulatedIO
 
         io = None
-        live_input = self.recipe.name == LIVE_RECIPE
+        live_spec = self.live_spec
+        live_input = live_spec is not None
         try:
             definition = ELBOW_RECOVERY_DEFINITIONS.get(self.recipe.name, LEFT_ELBOW_ORIGINAL_RETURN)
             loaded = (
@@ -840,7 +848,7 @@ class PhysicalExecutor:
                         native = copy.deepcopy(ack.get("live_input", {}))
                         self._execution = {"progress_s": 0 if self._lifecycle["native_live_at"] is None else
                             max(0, self.clock() - self._lifecycle["native_live_at"]), "complete": False,
-                            "fault": self._fault, "profile": "LiveLeftElbow", "live_input": native,
+                            "fault": self._fault, "profile": live_spec.profile, "live_input": native,
                             "provenance": "browser-origin/protected-host/measured-feedback"}
                     if self.task:
                         if desired == "pause":
@@ -1211,12 +1219,12 @@ class ProtectedHostRun:
         if recipe.name in ("physical-arm-smoke", "physical-arm-smoke-repeat"):
             env["AM1_SHOULDER_INTEGRAL_TEST"] = "1"
             env["AM1_SCRIPTED_PREPARE"] = "1"
-        if recipe.name in PhysicalExecutor.selected_joint_recipes or recipe.name == LIVE_RECIPE:
+        if recipe.name in PhysicalExecutor.selected_joint_recipes or recipe.name in LIVE_ELBOW_SPECS:
             for k in ("AM1_SYNC_SHOULDER_READBACK", "AM1_LEFT_SHOULDER_EVIDENCE"):
                 env.pop(k, None)
             env["AM1_SCRIPTED_PREPARE"] = "1"
             env["AM1_SELECTED_JOINT_EVIDENCE"] = "1"
-        if recipe.name in {LEFT_ELBOW_POSITIVE_CONTROL.recipe_name, SelectedElbowExperiment.recipe_name, LIVE_RECIPE}:
+        if recipe.name in {LEFT_ELBOW_POSITIVE_CONTROL.recipe_name, SelectedElbowExperiment.recipe_name, *LIVE_ELBOW_SPECS}:
             env["AM1_VISIBLE_CONTROL_RECIPE"] = recipe.name
         if recipe.name in ELBOW_RECOVERY_DEFINITIONS:
             env["AM1_ELBOW_RECOVERY"] = f"I{ELBOW_RECOVERY_DEFINITIONS[recipe.name].integral}"

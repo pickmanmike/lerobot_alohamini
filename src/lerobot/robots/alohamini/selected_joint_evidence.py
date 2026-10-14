@@ -31,17 +31,30 @@ PHASES = {"baseline", "outbound", "endpoint", "return", "origin", "final"}
 LIVE_RECIPE = "physical-live-left-elbow"
 
 
+def live_elbow_spec(recipe):
+    """Resolve the checkout-only contract only for an opted-in recipe."""
+    if recipe is None:
+        return None
+    from examples.alohamini.am1_session_contract import LIVE_ELBOW_SPECS
+
+    return LIVE_ELBOW_SPECS.get(recipe)
+
+
 class _LiveElbowDefinition:
     recipe_name = LIVE_RECIPE
     profile = "LiveLeftElbow"
     current_cap_ma = 150.0
     live_s = 90.0
 
-    @staticmethod
-    def settings_valid(proof):
+    def __init__(self, spec=None):
+        if spec is not None:
+            self.recipe_name, self.profile = spec.recipe, spec.profile
+            self.current_cap_ma, self.live_s = spec.current_cap_ma, spec.live_s
+
+    def settings_valid(self, proof):
         from examples.alohamini.am1_session_contract import PositiveElbowControl
 
-        return PositiveElbowControl._settings_valid(proof, recipe_name=LIVE_RECIPE, current_cap_ma=150.0)
+        return PositiveElbowControl._settings_valid(proof, recipe_name=self.recipe_name, current_cap_ma=self.current_cap_ma)
 
 
 LIVE_ELBOW_DEFINITION = _LiveElbowDefinition()
@@ -61,6 +74,8 @@ class AM1SelectedJointEvidence:
 
     def __init__(self, *, enabled=False, clock=time.monotonic, emit=_print):
         self.enabled, self.clock, self.emit = enabled, clock, emit
+        self.live_spec = None
+        self._live_definition = LIVE_ELBOW_DEFINITION
         self.context = None
         self.reference = self.endpoint = self.profile = None
         self.progress = -1.0
@@ -104,6 +119,21 @@ class AM1SelectedJointEvidence:
         self.live_response = None
         self.live_goal_checkpoint_at = None
 
+    @property
+    def motor(self):
+        return MOTOR if self.live_spec is None else self.live_spec.joint.removesuffix(".pos")
+
+    @property
+    def position(self):
+        return POSITION if self.live_spec is None else self.live_spec.joint
+
+    @property
+    def side(self):
+        return "left" if self.live_spec is None else self.live_spec.side
+
+    def _bus(self, robot):
+        return getattr(robot, self.side + "_bus")
+
     VISIBLE_STATIC_REGISTERS = (
         "Firmware_Major_Version",
         "Firmware_Minor_Version",
@@ -145,14 +175,20 @@ class AM1SelectedJointEvidence:
             uuid_text,
         )
 
+        spec = live_elbow_spec(actual.get("recipe"))
+        if self.live_spec is not None and spec != self.live_spec:
+            raise RuntimeError("Visible selected joint cannot change after binding")
+        if spec is not None and self.live_spec is None:
+            self.live_spec = spec
+            self._live_definition = _LiveElbowDefinition(spec)
         expected = actual if binding is None else binding
         experiment = getattr(robot, "_am1_selected_elbow_experiment", None)
-        definition = (LIVE_ELBOW_DEFINITION if actual.get("recipe") == LIVE_RECIPE
+        definition = (self._live_definition if spec is not None
                       else LEFT_ELBOW_POSITIVE_CONTROL if experiment is None else experiment)
         keys = {"run_id", "host_incarnation", "recipe"}
         if experiment is not None:
             keys.add("experiment_sha256")
-        motor = robot.left_bus.motors.get(MOTOR)
+        motor = self._bus(robot).motors.get(self.motor)
         if (
             not self.enabled
             or not getattr(robot, "_am1_selected_joint_evidence_enabled", False)
@@ -175,7 +211,7 @@ class AM1SelectedJointEvidence:
         return definition
 
     def _visible_settings_read(self, robot, *, source):
-        bus = robot.left_bus
+        bus = self._bus(robot)
         transport = DirectSdkTransport(
             bus.port, motor_id=3, port_handler=bus.port_handler, packet_handler=bus.packet_handler
         )
@@ -189,7 +225,7 @@ class AM1SelectedJointEvidence:
             "read_started_at_monotonic_s": started, "read_completed_at_monotonic_s": first_completed,
         }
         position = {
-            "raw": present, "normalized": float(robot_position(bus, present)),
+            "raw": present, "normalized": float(robot_position(bus, present, self.motor)),
             "read_started_at_monotonic_s": started, "read_completed_at_monotonic_s": first_completed,
         }
         if source == "settings_active":
@@ -207,7 +243,7 @@ class AM1SelectedJointEvidence:
         ended = self.clock()
         registers = {}
         for name in (*self.VISIBLE_STATIC_REGISTERS, *self.VISIBLE_DYNAMIC_REGISTERS):
-            address, width = get_address(bus.model_ctrl_table, bus.motors[MOTOR].model, name)
+            address, width = get_address(bus.model_ctrl_table, bus.motors[self.motor].model, name)
             if name == "Maximum_Acceleration":
                 raw = int(maximum[0])
             else:
@@ -246,7 +282,7 @@ class AM1SelectedJointEvidence:
                 "traces": traces,
             }
         )
-        registers, calibration = before["registers"], robot.left_bus.calibration[MOTOR]
+        registers, calibration = before["registers"], self._bus(robot).calibration[self.motor]
         expected = {
             "Model_Number": 777,
             "Firmware_Major_Version": 3,
@@ -317,7 +353,7 @@ class AM1SelectedJointEvidence:
                 "version": 1,
                 "kind": "fault_context",
                 **copy.deepcopy(getattr(robot, "_am1_visible_control_binding", None) or {}),
-                "motor": {"bus": "left", "name": MOTOR, "id": 3, "model": "sts3215"},
+                "motor": {"bus": self.side, "name": self.motor, "id": 3, "model": "sts3215"},
                 "reason": reason,
                 "source": source,
                 "captured_at_monotonic_s": self.clock(),
@@ -379,7 +415,7 @@ class AM1SelectedJointEvidence:
             raise RuntimeError("Visible selected software effort ceiling reached")
 
     def deactivate(self, robot):
-        if getattr(robot, "_am1_visible_control_binding", {}).get("recipe") == LIVE_RECIPE:
+        if live_elbow_spec((getattr(robot, "_am1_visible_control_binding", None) or {}).get("recipe")) is not None:
             self.deactivate_live(robot)
             return
         # Protective Pause/Stop must always proceed. Retain an unresolved active
@@ -398,7 +434,7 @@ class AM1SelectedJointEvidence:
 
     def prepare(self, robot, action, binding, *, control_marker=None):
         cleaned = {k: v for k, v in action.items() if k != MARKER}
-        if getattr(robot, "_am1_visible_control_binding", {}).get("recipe") == LIVE_RECIPE:
+        if live_elbow_spec((getattr(robot, "_am1_visible_control_binding", None) or {}).get("recipe")) is not None:
             if MARKER in action:
                 raise RuntimeError("Live selected control cannot inherit finite diagnostic context")
             return cleaned
@@ -420,7 +456,7 @@ class AM1SelectedJointEvidence:
             raise RuntimeError("Selected joint evidence requires the opted-in protected AM1 owner")
         if getattr(robot.config, "robot_model", None) != "alohamini1":
             raise RuntimeError("Selected joint evidence is AM1-only")
-        motor = robot.left_bus.motors.get(MOTOR)
+        motor = self._bus(robot).motors.get(self.motor)
         if (
             motor is None
             or motor.id != 3
@@ -487,7 +523,7 @@ class AM1SelectedJointEvidence:
                     "integral": signed.integral,
                 }:
                     raise RuntimeError("Selected recovery profile differs from its protected owner admission")
-            calibration = robot.left_bus.calibration.get(MOTOR)
+            calibration = self._bus(robot).calibration.get(self.motor)
             if (
                 calibration is None
                 or type(calibration.id) is not int
@@ -518,7 +554,7 @@ class AM1SelectedJointEvidence:
             or (signed is None and not math.isclose(endpoint, expected_endpoint, rel_tol=0, abs_tol=1e-9))
         ):
             raise RuntimeError("Selected joint evidence changed the original bounded endpoint")
-        if not _number(cleaned.get(POSITION)) or float(cleaned[POSITION]) != requested:
+        if not _number(cleaned.get(self.position)) or float(cleaned[self.position]) != requested:
             raise RuntimeError("Selected joint requested context differs from the incoming action")
         lower = (
             min(reference, endpoint, metadata["admitted_reference"])
@@ -655,7 +691,7 @@ class AM1SelectedJointEvidence:
         if not _number(current.get("ma")) or abs(current["ma"]) >= definition.current_cap_ma:
             raise RuntimeError("Recovery selected software effort ceiling reached")
         raw = position.get("raw")
-        calibration = robot.left_bus.calibration.get(MOTOR)
+        calibration = self._bus(robot).calibration.get(self.motor)
         if (
             type(raw) is not int
             or calibration is None
@@ -694,7 +730,7 @@ class AM1SelectedJointEvidence:
 
     def guard_visible(self, robot, control, observation=None):
         """Enforce the new finite probe on cached native reads, never another bus reader."""
-        if getattr(robot, "_am1_visible_control_binding", {}).get("recipe") == LIVE_RECIPE:
+        if live_elbow_spec((getattr(robot, "_am1_visible_control_binding", None) or {}).get("recipe")) is not None:
             self.guard_live(robot, control)
             return
         definition = self._visible_definition(robot)
@@ -736,7 +772,7 @@ class AM1SelectedJointEvidence:
             robot, current.get("raw"), getattr(robot, "_joint_current_limit_ma", 100),
             source="cached_guard", sample=current,
         )
-        raw, calibration = position.get("raw"), robot.left_bus.calibration[MOTOR]
+        raw, calibration = position.get("raw"), self._bus(robot).calibration[self.motor]
         registers = self.visible_settings["before"]["registers"]
         low = max(calibration.range_min, registers["Min_Position_Limit"])
         high = min(calibration.range_max, registers["Max_Position_Limit"])
@@ -752,7 +788,7 @@ class AM1SelectedJointEvidence:
             if self.reference is not None
             else context["reference"]
             if context is not None
-            else robot_position(robot.left_bus, self.visible_initial_raw)
+            else robot_position(self._bus(robot), self.visible_initial_raw, self.motor)
         )
         material = {
             k: int(getattr(calibration, k)) for k in ("drive_mode", "homing_offset", "range_min", "range_max")
@@ -770,7 +806,7 @@ class AM1SelectedJointEvidence:
         if context is None or control.state != "active":
             return
         direction = None
-        sign = -1 if robot.left_bus.apply_drive_mode and calibration.drive_mode else 1
+        sign = -1 if self._bus(robot).apply_drive_mode and calibration.drive_mode else 1
         outward_direction = sign * (1 if getattr(definition, "excursion_norm", 10.0) > 0 else -1)
         phase = context["phase"]
         if phase in {"outbound", "endpoint"}:
@@ -858,15 +894,18 @@ class AM1SelectedJointEvidence:
 
         if self.live_admission is not None:
             raise RuntimeError("Live native admission cannot replace its measured origin")
-        if not LIVE_ELBOW_DEFINITION.settings_valid(self.visible_settings):
+        self._visible_definition(robot)
+        if not self._live_definition.settings_valid(self.visible_settings):
             raise RuntimeError("Live selected read-only settings are unavailable")
-        calibration = robot.left_bus.calibration[MOTOR]
+        calibration = self._bus(robot).calibration[self.motor]
         material = {k: int(getattr(calibration, k)) for k in ("drive_mode", "homing_offset", "range_min", "range_max")}
         position = getattr(robot, "_am1_selected_joint_position", {})
         raw = position.get("raw")
         endpoints = [SignedElbowResponse.encoded_goal(summary[k], material)
                      for k in ("corridor_min_norm", "corridor_max_norm")]
-        positive = SignedElbowResponse.encoded_goal(summary["reference_norm"] + 10, material)
+        measured_span = 10 if self.side == "left" else 3
+        positive = SignedElbowResponse.encoded_goal(summary["reference_norm"] + measured_span, material)
+        negative = SignedElbowResponse.encoded_goal(summary["reference_norm"] - measured_span, material)
         registers = self.visible_settings["before"]["registers"]
         low = max(material["range_min"], registers["Min_Position_Limit"])
         high = min(material["range_max"], registers["Max_Position_Limit"])
@@ -874,9 +913,10 @@ class AM1SelectedJointEvidence:
                 or not low <= raw <= high):
             raise RuntimeError("Live actual selected raw admission/encoded corridor is unavailable")
         summary.update(measured_origin_raw=raw, corridor_min_raw=min(endpoints), corridor_max_raw=max(endpoints))
-        # Command corridor is negative-only; preserve the prior diagnostic
-        # measured +/-ten envelope, including literal measured/floor quantization.
-        summary.update(measured_min_raw=max(low, min(*endpoints, raw)),
+        # Preserve left measured +/-ten behavior. Right uses its own +/-three
+        # measured guard, distinct from the positive-only command corridor.
+        summary.update(measured_min_raw=max(low, min(*endpoints, raw) if self.side == "left"
+                                                      else min(raw, low if negative is None else negative)),
                        measured_max_raw=min(high, max(raw, endpoints[1], high if positive is None else positive)))
         self.live_admission = copy.deepcopy(summary)
 
@@ -888,13 +928,14 @@ class AM1SelectedJointEvidence:
         robot._am1_selected_joint_evidence_context = None
 
     def live_action(self, robot, summary):
-        self.context = {"profile": "LiveLeftElbow", "requested_target": summary["cursor_norm"],
+        self.context = {"profile": self._live_definition.profile, "requested_target": summary["cursor_norm"],
                         "reference": summary["reference_norm"], "phase": summary["state"]}
         robot._am1_selected_joint_evidence_context = copy.deepcopy(self.context)
 
     def guard_live(self, robot, control):
         now = self.clock()
-        if not LIVE_ELBOW_DEFINITION.settings_valid(self.visible_settings):
+        self._visible_definition(robot)
+        if not self._live_definition.settings_valid(self.visible_settings):
             raise RuntimeError("Live actual selected baseline settings are unavailable")
         position = getattr(robot, "_am1_selected_joint_position", None)
         current = getattr(robot, "_am1_selected_joint_current", None)
@@ -1000,7 +1041,7 @@ class AM1SelectedJointEvidence:
         """A few existing-owner readbacks; broadcast completion remains unacknowledged."""
         now = self.clock()
         state = control.live_snapshot()["state"]
-        target = None if control.live_sample is None else control.live_sample["target"][POSITION]
+        target = None if control.live_sample is None else control.live_sample["target"][self.position]
         cursor = control.live_snapshot().get("cursor_norm")
         direction = 0 if target is None or target == cursor else (1 if target > cursor else -1)
         checkpoint = (state, control.epoch, direction)
@@ -1061,7 +1102,7 @@ class AM1SelectedJointEvidence:
             raise RuntimeError("Selected intercycle hold incoming owner marker is unavailable")
         incoming = {**binding, "experiment_sha256": definition.sha256,
                     "epoch": marker["epoch"], "intent_revision": marker["intent_revision"]}
-        calibration = {k: int(getattr(robot.left_bus.calibration[MOTOR], k))
+        calibration = {k: int(getattr(self._bus(robot).calibration[self.motor], k))
                        for k in ("drive_mode", "homing_offset", "range_min", "range_max")}
         original_key = self._hold_original_key(binding, definition, context["reference"], calibration)
         if self._hold_origin is not None:
@@ -1143,7 +1184,7 @@ class AM1SelectedJointEvidence:
         accepted = control.accepted_action
         if (not isinstance(accepted, dict) or any(not _number(accepted.get(k)) or accepted[k] != 0
                 for k in ("x.vel", "y.vel", "theta.vel", "lift_axis.vel"))
-                or accepted.get(POSITION) != self.reference
+                or accepted.get(self.position) != self.reference
                 or action["expected_goal_raw"] != definition.encoded_goal(self.reference, row["motor"]["calibration"])):
             raise RuntimeError("Selected intercycle hold accepted body-zero action is unavailable")
         certificate = definition._hold_certificate(row)
@@ -1219,7 +1260,7 @@ class AM1SelectedJointEvidence:
         now = self.clock()
         if previous is None:
             position = getattr(robot, "_am1_selected_joint_position", None)
-            calibration = {k:int(getattr(robot.left_bus.calibration[MOTOR],k)) for k in
+            calibration = {k:int(getattr(self._bus(robot).calibration[self.motor],k)) for k in
                            ("drive_mode","homing_offset","range_min","range_max")}
             goal = definition.encoded_goal(rejoin["held_target"], calibration)
             if (rejoin["elapsed_s"] != 0 or self.profile is None or self.context is not None
@@ -1317,7 +1358,7 @@ class AM1SelectedJointEvidence:
         if (self._response_startup_acquisitions is not None
                 and any(new < old for new, old in zip(acquisitions, self._response_startup_acquisitions))):
             self._response_refuse(robot, "Selected response startup original acquisition regressed")
-        calibration = {k: int(getattr(robot.left_bus.calibration[MOTOR], k)) for k in
+        calibration = {k: int(getattr(self._bus(robot).calibration[self.motor], k)) for k in
                        ("drive_mode", "homing_offset", "range_min", "range_max")}
         registers = self.visible_settings["before"]["registers"]
         if (type(position.get("raw")) is not int
@@ -1337,7 +1378,7 @@ class AM1SelectedJointEvidence:
                 or any(k not in body and not (k.startswith("arm_") and k.endswith(".pos")) for k in action)
                 or any(not _number(v) for v in action.values())):
             self._response_refuse(robot, "Selected response startup requires zero body intent")
-        requested = action.get(POSITION)
+        requested = action.get(self.position)
         measured = definition.measured_origin(requested, calibration)
         if not definition.startup_hold_valid(requested, measured, calibration):
             self._response_refuse(robot, "Selected response startup measured hold is unavailable")
@@ -1539,7 +1580,7 @@ class AM1SelectedJointEvidence:
                 and marker["acquired_at_monotonic_s"] > self.clock()):
             self._response_refuse(robot, "Selected response original marker acquisition is unavailable")
         action = getattr(robot, "_am1_selected_joint_action", None)
-        material = {k: int(getattr(robot.left_bus.calibration[MOTOR], k))
+        material = {k: int(getattr(self._bus(robot).calibration[self.motor], k))
                     for k in ("drive_mode", "homing_offset", "range_min", "range_max")}
         goal = definition.encoded_goal(context["requested_target"], material)
         if (not isinstance(action, dict) or type(action.get("expected_goal_raw")) is not int
@@ -1680,8 +1721,8 @@ class AM1SelectedJointEvidence:
         return proof
 
     def _base(self, robot, control, marker):
-        bus, motor = robot.left_bus, robot.left_bus.motors[MOTOR]
-        calibration = bus.calibration[MOTOR]
+        bus, motor = self._bus(robot), self._bus(robot).motors[self.motor]
+        calibration = bus.calibration[self.motor]
         return {
             "version": 1,
             **control.binding,
@@ -1692,8 +1733,8 @@ class AM1SelectedJointEvidence:
             "acquired_at_monotonic_s": marker.get("acquired_at_monotonic_s"),
             "context": copy.deepcopy(self.context),
             "motor": {
-                "bus": "left",
-                "name": MOTOR,
+                "bus": self.side,
+                "name": self.motor,
                 "id": motor.id,
                 "model": motor.model,
                 "normalization": motor.norm_mode.value,
@@ -1741,14 +1782,14 @@ class AM1SelectedJointEvidence:
             names["lock"] = "Lock"
         result = {}
         for key, register in names.items():
-            address, width = get_address(bus.model_ctrl_table, bus.motors[MOTOR].model, register)
+            address, width = get_address(bus.model_ctrl_table, bus.motors[self.motor].model, register)
             if address < 33 or address + width > 71:
                 raise RuntimeError("Selected motor table differs from the bounded feedback group")
             word = int.from_bytes(payload[address - 33 : address - 33 + width], "little")
             result[key] = int(bus._decode_sign(register, {3: word})[3])
         result["present_current_ma"] = result["present_current_raw"] * 6.5
         result["voltage_v"] = result["voltage_raw"] / 10
-        result["present_position_normalized"] = float(robot_position(bus, result["present_position_raw"]))
+        result["present_position_normalized"] = float(robot_position(bus, result["present_position_raw"], self.motor))
         return result
 
     def _matched_marker(self, control, observation, *, require_context=True):
@@ -1854,7 +1895,7 @@ class AM1SelectedJointEvidence:
             )
             self._emit_sparse(sparse)
             return
-        bus = robot.left_bus
+        bus = self._bus(robot)
         transport = DirectSdkTransport(
             bus.port,
             motor_id=3,
@@ -1931,8 +1972,8 @@ class AM1SelectedJointEvidence:
             raise primary
 
 
-def robot_position(bus, raw):
+def robot_position(bus, raw, motor=MOTOR):
     """Same unbounded measured normalization as the ordinary AM1 observation."""
-    calibration = bus.calibration[MOTOR]
+    calibration = bus.calibration[motor]
     value = (raw - calibration.range_min) / (calibration.range_max - calibration.range_min) * 200 - 100
     return -value if bus.apply_drive_mode and calibration.drive_mode else value

@@ -21,6 +21,7 @@ from urllib.parse import urlsplit
 
 from aiohttp import WSMsgType, web
 
+from examples.alohamini.am1_session_contract import LIVE_ELBOW_SPECS
 from tools.am1_session_ipc import (
     CONTROL_LIMIT,
     IPCClient,
@@ -756,7 +757,7 @@ class Gateway:
                         if (
                             controller
                             and controller["device_id"] == peer.device
-                            and state.get("run", {}).get("recipe") in {"fake-interactive", "physical-live-left-elbow"}
+                            and state.get("run", {}).get("recipe") in {"fake-interactive", *LIVE_ELBOW_SPECS}
                         ):
                             await self.call(
                                 {
@@ -766,7 +767,7 @@ class Gateway:
                                     "controller_generation": controller["controller_generation"],
                                     "connection_generation": peer.connection,
                                     **({"host_incarnation": state.get("evidence", {}).get("host_incarnation")}
-                                       if state["run"]["recipe"] == "physical-live-left-elbow" else {}),
+                                       if state["run"]["recipe"] in LIVE_ELBOW_SPECS else {}),
                                 },
                                 peer.device,
                             )

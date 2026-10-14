@@ -384,7 +384,8 @@ test("loaded UI distinguishes test-only physical protocol startup, native Live a
 });
 
 
-test("loaded protocol-fixture live elbow jogs reverse and blur requires new qualified input",async t=>{
+for(const selected of [{recipe:"physical-live-left-elbow",joint:"arm_left_elbow_flex.pos",side:"left",label:"Left elbow",profile:"LiveLeftElbow"},
+  {recipe:"physical-live-right-elbow",joint:"arm_right_elbow_flex.pos",side:"right",label:"Right elbow",profile:"LiveRightElbow"}])test("loaded protocol-fixture "+selected.side+" elbow selects before Start and keeps fresh run-bound input",async t=>{
   const f=await fixture();t.after(()=>f.close());
   const browser=await chromium.launch({headless:true,channel:process.env.AM1_TEST_BROWSER_CHANNEL || "msedge"});t.after(()=>browser.close());
   const context=await browser.newContext({ignoreHTTPSErrors:true});t.after(()=>context.close());const page=await context.newPage();
@@ -395,17 +396,20 @@ test("loaded protocol-fixture live elbow jogs reverse and blur requires new qual
   await page.waitForFunction(()=>am1Remote.snapshot.run.status==='running'&&am1Remote.connection);
   const actualController=await page.evaluate(()=>am1Remote.controllerGeneration);
   // Loaded ordinary controls/transport only. Injected wire replies are not physical/backend evidence.
-  await page.evaluate(()=>{
+  await page.evaluate(selected=>{
     const ws=am1Remote.socket,send=ws.send.bind(ws),receive=ws.onmessage;
     ws.onmessage=event=>{if(JSON.parse(event.data).kind!=="snapshot")receive(event);};
     const generation=am1Remote.controllerGeneration;globalThis.fixtureRenewals=0;const renew=am1Remote.renew.bind(am1Remote);am1Remote.renew=()=>{fixtureRenewals++;return renew();};am1Remote.connection="fixture-connection";
-    am1Remote.snapshot={service_incarnation:"fixture-owner",recipes:["physical-live-left-elbow"],presets:[],
+    am1Remote.snapshot={service_incarnation:"fixture-owner",recipes:["physical-live-left-elbow","physical-live-right-elbow"],presets:[],
+      live_elbow_recipes:[{recipe:"physical-live-left-elbow",joint:"arm_left_elbow_flex.pos",side:"left",label:"Left elbow",profile:"LiveLeftElbow",rate_norm_per_s:1},
+        {recipe:"physical-live-right-elbow",joint:"arm_right_elbow_flex.pos",side:"right",label:"Right elbow",profile:"LiveRightElbow",rate_norm_per_s:1}],
       controller:{device_id:am1Remote.device,controller_generation:generation},evidence:{feedback:true,native_ack:true,
-        measured_positions:{"arm_left_elbow_flex.pos":4},required_observation:true},
-      run:{run_id:"test-only-live-protocol",recipe:"physical-live-left-elbow",source:"protected-physical-provider",status:"running",
+        measured_positions:{[selected.joint]:4},required_observation:true},
+      run:{run_id:"test-only-live-protocol",recipe:selected.recipe,source:"protected-physical-provider",status:"running",
         intent_revision:7,backend_incarnation:"fixture-host",progress_s:0,native_live_at:810,deadline:900,remaining_s:90,
-        live_input:{joint:"arm_left_elbow_flex.pos",reference_norm:5,corridor_min_norm:-5,corridor_max_norm:5,
+        live_input:{joint:selected.joint,side:selected.side,label:selected.label,profile:selected.profile,rate_norm_per_s:1,reference_norm:selected.side==="right"?1:5,corridor_min_norm:selected.side==="right"?1:-5,corridor_max_norm:selected.side==="right"?4:5,
           cursor_norm:4,cursor_feedback_sequence:30,cursor_intent_revision:7,state:"awaiting_input"}}};
+    globalThis.fixtureLiveRun=am1Remote.snapshot.run;am1Remote.snapshot.run=null;
     globalThis.liveFrames=[];globalThis.wireFrames=[];
     ws.send=serialized=>{
       const frame=JSON.parse(serialized);wireFrames.push({at:performance.now(),kind:frame.command?.op||Object.keys(frame)[0]});if(!frame.command)return send(serialized);
@@ -434,7 +438,21 @@ test("loaded protocol-fixture live elbow jogs reverse and blur requires new qual
       },0);
     };
     am1Remote.render(am1Remote);
-  });
+  },selected);
+  const starts=[];await page.route("**/api/start",async route=>{starts.push(route.request().postDataJSON());await route.fulfill({json:{accepted:true,status:"starting"}});});
+  assert.equal(await page.locator("#fake-recipe").isDisabled(),false);
+  for(const option of ["physical-live-left-elbow","physical-live-right-elbow"])assert(await page.locator('#fake-recipe option[value="'+option+'"]').count());
+  await page.locator("#fake-recipe").selectOption(selected.recipe);
+  assert.match(await page.locator("#live-elbow-controls h2").innerText(),new RegExp(selected.label,"i"));
+  assert.match(await page.locator('[data-elbow-jog="1"]').getAttribute("aria-label"),new RegExp(selected.label,"i"));
+  await page.locator('[data-operation="Start"]').click();await page.waitForTimeout(100);
+  assert.equal(starts.length,1);assert.equal(starts[0].recipe,selected.recipe);
+  await page.evaluate(()=>{am1Remote.snapshot.run=fixtureLiveRun;am1Remote.render(am1Remote);});
+  assert.equal(await page.locator("#fake-recipe").isDisabled(),true);assert.equal(await page.locator("#fake-recipe").inputValue(),selected.recipe);
+  await page.evaluate(()=>{const select=document.querySelector("#fake-recipe");select.value=select.value==="physical-live-left-elbow"?"physical-live-right-elbow":"physical-live-left-elbow";select.dispatchEvent(new Event("change"));});
+  assert.equal(await page.locator("#fake-recipe").inputValue(),selected.recipe);
+  await assert.rejects(()=>page.evaluate(recipe=>am1Remote.start(recipe),selected.recipe==="physical-live-left-elbow"?"physical-live-right-elbow":"physical-live-left-elbow"),/active|frozen/i);
+  assert.equal(starts.length,1);
   for(const key of ["w","s","a","d","u","j","z","x"])assert.equal(await page.locator(`[data-body-key="${key}"]`).isDisabled(),true);
   assert.equal(await page.locator('[data-elbow-jog="-1"]').isDisabled(),false);
   await page.keyboard.down("w");await page.keyboard.up("w");assert.deepEqual(await page.evaluate(()=>[...am1Remote.held]),[]);
@@ -443,9 +461,9 @@ test("loaded protocol-fixture live elbow jogs reverse and blur requires new qual
   assert.equal(await page.evaluate(()=>am1Remote.elbowInput()!==null),true,"disabled body pointer release must not revoke the live elbow lane");
   const negative=page.locator('[data-elbow-jog="-1"]');await negative.hover();await page.mouse.down();
   await page.waitForFunction(()=>liveFrames.filter(frame=>frame.command.op==="input").length>=22);
-  const before=await page.evaluate(()=>liveFrames.filter(frame=>frame.command.op==="input").at(-1).command.target["arm_left_elbow_flex.pos"]);
+  const before=await page.evaluate(key=>liveFrames.filter(frame=>frame.command.op==="input").at(-1).command.target[key],selected.joint);
   await page.keyboard.down("]");
-  await page.waitForFunction(value=>liveFrames.filter(frame=>frame.command.op==="input").at(-1).command.target["arm_left_elbow_flex.pos"]>value,before);
+  await page.waitForFunction(({key,value})=>liveFrames.filter(frame=>frame.command.op==="input").at(-1).command.target[key]>value,{key:selected.joint,value:before});
   await page.mouse.up(); // Releasing the older negative gesture cannot cancel the current positive gesture.
   await page.evaluate(()=>dispatchEvent(new Event("blur")));
   assert.equal(await page.locator('[data-elbow-jog="1"]').isDisabled(),true,"blur immediately disables stale live controls");
@@ -466,8 +484,8 @@ test("loaded protocol-fixture live elbow jogs reverse and blur requires new qual
   const result=await page.evaluate(()=>({run:am1Remote.snapshot.run,frames:liveFrames.filter(frame=>frame.command.op==="input"),wire:wireFrames,renewals:fixtureRenewals}));
   assert.equal(result.run.run_id,"test-only-live-protocol");assert.equal(result.run.deadline,900);
   const firstFresh=result.frames.find(frame=>frame.command.intent_revision===9);
-  assert(firstFresh.command.target["arm_left_elbow_flex.pos"]>=2 && firstFresh.command.target["arm_left_elbow_flex.pos"]<=2.1);
-  assert(result.frames.every(frame=>Object.keys(frame.command.target).join()==="arm_left_elbow_flex.pos"));
+  assert(firstFresh.command.target[selected.joint]>=2 && firstFresh.command.target[selected.joint]<=2.1);
+  assert(result.frames.every(frame=>Object.keys(frame.command.target).join()===selected.joint));
   for(let index=1;index<4;index++)assert(result.frames[index].at-result.frames[index-1].at>=40,"nominal cadence does not burst/replay");
   assert((result.frames[2].at-result.frames[0].at)/2<85,"immediate physical grant/input replies use the ordinary page nominal16.7Hz schedule");
   const beforeBlur=result.frames.filter(frame=>frame.command.intent_revision===7);
@@ -476,5 +494,9 @@ test("loaded protocol-fixture live elbow jogs reverse and blur requires new qual
   assert(result.renewals>=2,"actual claimed controller keeps HTTP presence renewal enabled");
   const allWireMax=Math.max(...result.wire.map(frame=>result.wire.filter(row=>row.at>=frame.at&&row.at<frame.at+1000).length));assert(allWireMax<=40,"all outgoing TEXT frames remain within gateway40 budget");
   await page.keyboard.up("]");assert.deepEqual(errors,[]);
-  console.log(JSON.stringify({testOnlyProtocolFixture:true,physicalEvidenceProved:false,ordinaryJogButtons:true,mappedInputSamples:result.frames.length,newGestureAfterResume:true}));
+  await page.evaluate(()=>{am1Remote.snapshot.run.status="stopped";am1Remote.snapshot.run.uncertain=false;am1Remote.snapshot.run.cleanup="physical_readback_verified";am1Remote.render(am1Remote);});
+  assert.equal(await page.locator("#fake-recipe").isDisabled(),false,"known terminal cleanup permits next preStart selection");
+  await page.locator("#fake-recipe").selectOption(selected.side==="left"?"physical-live-right-elbow":"physical-live-left-elbow");
+  assert.match(await page.locator("#live-elbow-controls h2").innerText(),selected.side==="left"?/right elbow/i:/left elbow/i,"next preStart preview follows the new selection");
+  console.log(JSON.stringify({selectedSide:selected.side,testOnlyProtocolFixture:true,physicalEvidenceProved:false,ordinaryJogButtons:true,mappedInputSamples:result.frames.length,newGestureAfterResume:true}));
 });

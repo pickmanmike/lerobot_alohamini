@@ -305,7 +305,7 @@ def test_cached_client_observation_never_advances_host_ack_or_sample_sequence(tm
 
 
 @contextmanager
-def actual_mock_host(*, expected_error=None, live=False):
+def actual_mock_host(*, expected_error=None, live=False, live_recipe=host.AM1_LIVE_RECIPE):
     """Run the production native loop; replace only its physical robot object."""
     ready = threading.Event()
     receipts = queue.Queue()
@@ -381,7 +381,7 @@ def actual_mock_host(*, expected_error=None, live=False):
 
         environment = {"AM1_LEFT_SHOULDER_EVIDENCE": "0", "AM1_SYNC_SHOULDER_READBACK": "0"}
         if live:
-            environment.update(AM1_VISIBLE_CONTROL_RECIPE=host.AM1_LIVE_RECIPE,
+            environment.update(AM1_VISIBLE_CONTROL_RECIPE=live_recipe,
                                AM1_SELECTED_JOINT_EVIDENCE="1", AM1_SCRIPTED_PREPARE="1",
                                AM1_SHOULDER_INTEGRAL_TEST="0")
         with (

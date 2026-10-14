@@ -8,6 +8,46 @@ from tools.am1_fake_executor import FakeExecutor
 from tools.am1_session_core import SessionAuthority
 
 
+def test_live_elbow_specs_are_exact_and_match_admitted_recipe_limits():
+    from examples.alohamini import am1_session_contract as contract
+
+    specs = getattr(contract, "LIVE_ELBOW_SPECS", {})
+    assert set(specs) == {"physical-live-left-elbow", "physical-live-right-elbow"}
+    expected = [
+        ("physical-live-left-elbow", "arm_left_elbow_flex.pos", "left", "LiveLeftElbow", -10.0, 0.0),
+        ("physical-live-right-elbow", "arm_right_elbow_flex.pos", "right", "LiveRightElbow", 0.0, 3.0),
+    ]
+    for recipe, joint, side, profile, minimum, maximum in expected:
+        spec = specs[recipe]
+        assert spec.recipe == recipe and spec.joint == joint and spec.side == side
+        assert spec.profile == profile
+        assert (spec.corridor_min_delta_norm, spec.corridor_max_delta_norm) == (minimum, maximum)
+        assert spec.rate_norm_per_s == 1.0 and spec.current_cap_ma == 150.0 and spec.live_s == 90.0
+        assert spec.summary()["joint"] == joint and spec.summary()["recipe"] == recipe
+        assert contract.RECIPES[recipe].mode == "interactive"
+        assert contract.RECIPES[recipe].seed is None
+        assert contract.RECIPES[recipe].trajectory_s is None
+        assert contract.RECIPES[recipe].live_s == 90.0
+    assert specs.get("physical-live-shoulder") is None
+    assert specs.get("arm_right_elbow_flex.pos") is None
+
+
+def test_live_elbow_registry_and_spec_cannot_change_after_selection():
+    from dataclasses import FrozenInstanceError
+
+    from examples.alohamini import am1_session_contract as contract
+
+    specs = getattr(contract, "LIVE_ELBOW_SPECS", {})
+    assert "physical-live-right-elbow" in specs
+    with pytest.raises(TypeError):
+        specs["physical-live-right-elbow"] = specs["physical-live-left-elbow"]
+    with pytest.raises(FrozenInstanceError):
+        specs["physical-live-right-elbow"].joint = "arm_left_elbow_flex.pos"
+    summary = specs["physical-live-right-elbow"].summary()
+    summary["joint"] = "arm_left_elbow_flex.pos"
+    assert specs["physical-live-right-elbow"].joint == "arm_right_elbow_flex.pos"
+
+
 class Clock:
     def __init__(self):
         self.now = 0.0
@@ -774,7 +814,7 @@ def test_admitted_resume_retry_remains_truthful_after_later_spectator_pause(tmp_
 
 # These tests exercise the real physical adapter/worker with the existing simulated host IO.
 @pytest.fixture
-def physical_live_authority(tmp_path):
+def physical_live_authority(tmp_path, request):
     from tests.robots.test_am1_live_native import ExecutorNativeHost
     from tests.robots.test_am1_physical_executor import executor, until
 
@@ -782,7 +822,7 @@ def physical_live_authority(tmp_path):
     e = executor(host)
     a = SessionAuthority(tmp_path, executor=e)
     try:
-        r = start(a, "physical-live-left-elbow")
+        r = start(a, getattr(request, "param", "physical-live-left-elbow"))
         assert r["accepted"], r
         until(lambda: (a.tick() or a.snapshot()["run"]["status"] == "paused"))
         yield a, e, host, r
@@ -818,6 +858,110 @@ def physical_live_controls(a, r):
     return base
 
 
+@pytest.mark.parametrize("physical_live_authority", [
+    "physical-live-left-elbow", "physical-live-right-elbow",
+], indirect=True)
+def test_physical_live_selected_recipe_controls_only_its_frozen_joint(physical_live_authority):
+    from examples.alohamini.am1_finite_task import JOINT_KEYS
+    from tests.robots.test_am1_physical_executor import until
+    from tools.am1_session_ipc import CONTROL_LIMIT, RESPONSE_LIMIT, encode, strict_json
+
+    a, e, host, r = physical_live_authority
+    right = a.run["recipe"] == "physical-live-right-elbow"
+    joint, other = ("arm_right_elbow_flex.pos", "arm_left_elbow_flex.pos") if right else (
+        "arm_left_elbow_flex.pos", "arm_right_elbow_flex.pos")
+    view = a.snapshot()
+    assert {item["recipe"] for item in view["live_elbow_recipes"]} == {
+        "physical-live-left-elbow", "physical-live-right-elbow"}
+    live = view["run"]["live_input"]
+    assert live["joint"] == joint and live["side"] == ("right" if right else "left")
+    assert live["profile"] == ("LiveRightElbow" if right else "LiveLeftElbow")
+    assert live["rate_norm_per_s"] == 1.0
+    assert (live["corridor_min_norm"], live["corridor_max_norm"]) == ((0.0, 3.0) if right else (-10.0, 0.0))
+    base = physical_live_controls(a, r)
+    other_recipe = "physical-live-left-elbow" if right else "physical-live-right-elbow"
+    assert not a.handle(command("start", operation_id=str(uuid.uuid4()), recipe=other_recipe,
+                                controller_generation=base["controller_generation"]), "owner")["accepted"]
+    grant = a.handle(command("grant", **base), "owner")
+    invalid = command("input", **base, grant_id=grant["grant_id"], seq=1, target={other: 0.0})
+    assert not a.handle(invalid, "owner")["accepted"]
+    frame = command("input", **base, grant_id=grant["grant_id"], seq=1, target={joint: .3 if right else -.3})
+    assert len(encode(frame, CONTROL_LIMIT)) < CONTROL_LIMIT
+    assert a.handle(frame, "owner")["accepted"]
+    until(lambda: host.control.live_snapshot().get("last_input_seq") == 1)
+    assert all(host.control.accepted_action[k] == 0.0 for k in JOINT_KEYS if k != joint)
+    latest = [event[1] for event in host.robot.events if event[0] == "action"][-1]
+    assert all(latest[k] == 0.0 for k in ("x.vel", "y.vel", "theta.vel", "lift_axis.vel"))
+    a.tick()
+    raw = encode({"id": str(uuid.uuid4()), "result": a.snapshot()})
+    assert len(raw) < RESPONSE_LIMIT
+    assert strict_json(raw)["result"]["run"]["recipe"] == (
+        "physical-live-right-elbow" if right else "physical-live-left-elbow")
+
+
+def test_physical_live_admission_refuses_native_joint_different_from_selected_recipe(tmp_path):
+    from examples.alohamini.am1_session_contract import RECIPES
+    from tests.robots.test_am1_live_native import ExecutorNativeHost
+    from tests.robots.test_am1_physical_executor import executor, until
+
+    host = ExecutorNativeHost()
+    real_start = host.start
+    host.start = lambda run, incarnation, recipe, cancel: real_start(
+        run, incarnation, RECIPES["physical-live-left-elbow"], cancel)
+    e = executor(host)
+    a = SessionAuthority(tmp_path, executor=e)
+    try:
+        r = start(a, "physical-live-right-elbow")
+        assert r["accepted"]
+        until(lambda: e.evidence()["lifecycle"]["phase"] == "live")
+        a.tick()
+        assert a.run["first_cause"] == "physical_live_recipe_mismatch"
+        assert a.run["status"] in {"finishing", "faulted"}
+        assert a.run["intent"] is None
+    finally:
+        a.close()
+        e.worker.join(2)
+
+
+@pytest.mark.parametrize("foreign", [None, "run_id", "host_incarnation", "intent_revision", "action_sequence"])
+def test_physical_live_bounded_native_write_proof_requires_current_ack_identity(
+    physical_live_authority, foreign
+):
+    import copy
+
+    from tools.am1_session_ipc import RESPONSE_LIMIT, encode, strict_json
+
+    a, e, host, r = physical_live_authority
+    evidence = copy.deepcopy(e.evidence())
+    acknowledgment = evidence["accepted_host_action"]
+    evidence["live_input"].update(
+        measured_origin_raw=2000, corridor_min_raw=1889, corridor_max_raw=2000, accepted_target_norm=-0.3,
+        encoded_goal_raw=1996, goal_write_returned=True,
+        goal_write_started_at_monotonic_s=10.0, goal_write_completed_at_monotonic_s=10.01,
+        goal_action_sequence=acknowledgment["accepted_action_sequence"],
+        rejected_bulk={"data": "x" * 100000},
+    )
+    if foreign == "action_sequence":
+        evidence["live_input"]["goal_action_sequence"] += 1
+    elif foreign is not None:
+        acknowledgment[foreign] = "foreign" if foreign != "intent_revision" else a.run["intent_revision"] - 1
+    projected = a._live_input_status(evidence)
+    view = a.snapshot()
+    view["run"]["live_input"] = projected
+    view["evidence"]["live_input"] = projected
+    raw = encode({"id": str(uuid.uuid4()), "result": view})
+    assert len(raw) < RESPONSE_LIMIT and "rejected_bulk" not in strict_json(raw)["result"]["run"]["live_input"]
+    assert projected["measured_origin_raw"] == 2000
+    assert projected["accepted_target_norm"] == -0.3
+    if foreign is None:
+        assert projected["encoded_goal_raw"] == 1996
+        assert projected["goal_write_returned"] is True
+        assert projected["goal_write_completed_at_monotonic_s"] == 10.01
+        assert projected["goal_action_sequence"] == acknowledgment["accepted_action_sequence"]
+    else:
+        assert "encoded_goal_raw" not in projected and "goal_write_returned" not in projected
+
+
 def test_physical_live_grant_renewal_preserves_sample_until_original_expiry(physical_live_authority):
     import time
 
@@ -846,15 +990,20 @@ def test_physical_live_grant_renewal_preserves_sample_until_original_expiry(phys
     assert a.snapshot()["run"]["deadline"] == deadline
 
 
+@pytest.mark.parametrize("physical_live_authority", [
+    "physical-live-left-elbow", "physical-live-right-elbow",
+], indirect=True)
 def test_physical_live_reacquisition_retains_reference_and_deadline(physical_live_authority):
     import time
 
     a, e, host, r = physical_live_authority
+    right = a.run["recipe"] == "physical-live-right-elbow"
+    joint = "arm_right_elbow_flex.pos" if right else "arm_left_elbow_flex.pos"
     base = physical_live_controls(a, r)
     initial = a.snapshot()["run"]
     grant = a.handle(command("grant", **base), "owner")
     assert a.handle(command("input", **base, grant_id=grant["grant_id"], seq=1,
-                            target={"arm_left_elbow_flex.pos": -0.5}), "owner")["accepted"]
+                            target={joint: 0.5 if right else -0.5}), "owner")["accepted"]
     time.sleep(max(0, grant["expires"] - time.monotonic()) + 0.03)
     a.tick()
     assert a.run["status"] == "paused"
@@ -867,10 +1016,10 @@ def test_physical_live_reacquisition_retains_reference_and_deadline(physical_liv
     assert current["live_input"]["cursor_intent_revision"] == fresh["intent_revision"]
     assert current["live_input"]["cursor_norm"] == 0.0
     assert not a.handle(command("input", **base, grant_id=grant["grant_id"], seq=2,
-                                target={"arm_left_elbow_flex.pos": -1.0}), "owner")["accepted"]
+                                target={joint: 1.0 if right else -1.0}), "owner")["accepted"]
     new_grant = a.handle(command("grant", **fresh), "owner")
     assert a.handle(command("input", **fresh, grant_id=new_grant["grant_id"], seq=1,
-                            target={"arm_left_elbow_flex.pos": -0.2}), "owner")["accepted"]
+                            target={joint: 0.2 if right else -0.2}), "owner")["accepted"]
     assert e.task is None and e.worker.is_alive()
 
 

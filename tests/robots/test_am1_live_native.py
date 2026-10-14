@@ -8,6 +8,11 @@ import pytest
 from examples.alohamini.am1_finite_task import JOINT_KEYS
 from lerobot.robots.alohamini import alohamini_host as host
 from tests.robots.test_am1_protected_host_boundary import Motor, binding
+from lerobot.motors import MotorCalibration
+from lerobot.motors.feetech import FeetechMotorsBus
+from tests.robots.test_am1_selected_joint_evidence import robot as selected_robot
+from tests.robots.test_am1_selected_joint_evidence import visible_register_packet, visible_robot
+from tests.robots.test_alohamini_lift_motor_feedback import status
 
 KEY = "arm_left_elbow_flex.pos"
 
@@ -148,7 +153,7 @@ class ExecutorNativeHost:
         self.actions = []
 
     def start(self, run_id, incarnation, recipe, cancel):
-        self.control = host.AM1LocalControl(run_id=run_id, host_incarnation=incarnation, live=True)
+        self.control = host.AM1LocalControl(run_id=run_id, host_incarnation=incarnation, live=True, live_recipe=recipe.name)
 
     def poll(self, previous):
         import time
@@ -238,7 +243,11 @@ def test_grant_readiness_does_not_clear_an_applied_sample():
     assert len(robot.events) == count and control.live_sample == original
 
 
-def test_production_host_ipc_expiry_retains_same_run_and_new_intent_resumes():
+@pytest.mark.parametrize("recipe,joint,direction", [
+    ("physical-live-left-elbow", "arm_left_elbow_flex.pos", -1),
+    ("physical-live-right-elbow", "arm_right_elbow_flex.pos", 1),
+])
+def test_production_host_ipc_expiry_retains_same_run_and_new_intent_resumes(recipe, joint, direction):
     import os
     import time
 
@@ -246,12 +255,13 @@ def test_production_host_ipc_expiry_retains_same_run_and_new_intent_resumes():
         pytest.skip("filesystem IPC production host is exercised in isolated native Pi checks")
     from tests.robots.test_am1_physical_ipc_transport import actual_mock_host, receive_feedback
 
-    with actual_mock_host(live=True) as peer:
+    with actual_mock_host(live=True, live_recipe=recipe) as peer:
         owner = {k: str(uuid4()) for k in ("service_incarnation", "controller_generation", "connection_generation")}
         peer.client.send_action(frame(peer.identity, owner, sequence=1))
         _, initial = receive_feedback(peer, lambda m: m.get("live_input", {}).get("state") == "held")
         expiry = time.monotonic() + .25
-        target = sample(expiry=expiry, target=-.5)
+        target = sample(expiry=expiry, target=direction * .5)
+        target["target"] = {joint: direction * .5}
         peer.client.send_action(frame(peer.identity, owner, sequence=2, mode="active", epoch=2, sample=target))
         _, active = receive_feedback(peer, lambda m: m.get("live_input", {}).get("state") == "active")
         assert active["live_input"]["valid_until_monotonic_s"] == expiry
@@ -261,7 +271,8 @@ def test_production_host_ipc_expiry_retains_same_run_and_new_intent_resumes():
         _, held = receive_feedback(peer, lambda m: m.get("epoch") == 3 and m.get("state") == "paused")
         assert held["live_input"]["live_deadline_monotonic_s"] == initial["live_input"]["live_deadline_monotonic_s"]
         peer.client.send_action(frame(peer.identity, owner, sequence=4, mode="active", epoch=4, revision=1,
-                                      sample=sample(seq=2, expiry=time.monotonic() + .25, target=-1)))
+                                      sample={"target": {joint: direction}, "grant_id": str(uuid4()), "seq": 2,
+                                              "valid_until_monotonic_s": time.monotonic() + .25}))
         assert receive_feedback(peer, lambda m: m.get("epoch") == 4 and m.get("state") == "active")
 
 
@@ -407,3 +418,404 @@ def test_live_optional_goal_timeout_does_not_clear_motor_fault_or_rearm(monkeypa
     evidence.report_live_goal(robot, control)
     row = next(iter(evidence.goal_readbacks.values()))
     assert row["diagnostic_available"] is False and control.state == "paused"
+
+
+# Right elbow coverage uses independent fixture names; left fixtures above stay unchanged.
+
+
+
+
+RIGHT_RECIPE = "physical-live-right-elbow"
+RIGHT = "arm_right_elbow_flex"
+RIGHT_KEY = RIGHT + ".pos"
+LEFT_KEY = "arm_left_elbow_flex.pos"
+
+
+def right_lane():
+    now = [10.0]
+    identity = {"run_id": str(uuid4()), "host_incarnation": str(uuid4())}
+    owner = dict.fromkeys(("service_incarnation", "controller_generation", "connection_generation"))
+    owner.update({key: str(uuid4()) for key in owner})
+    control = host.AM1LocalControl(**identity, live=True, live_recipe=RIGHT_RECIPE, clock=lambda: now[0])
+    obj = MeasuredMotor()
+    obj.positions[RIGHT_KEY] = -10.0
+    obj.positions[LEFT_KEY] = 19.0
+    return now, identity, owner, control, obj
+
+
+def right_sample(*, seq=1, expiry=10.25, target=-8.0, key=RIGHT_KEY):
+    return {"target": {key: target}, "grant_id": str(uuid4()), "seq": seq,
+            "valid_until_monotonic_s": expiry}
+
+
+def test_right_native_freezes_positive_corridor_and_moves_only_right():
+    now, identity, owner, control, obj = right_lane()
+    assert control.apply(obj, frame(identity, owner, sequence=1))
+    assert control.live_snapshot()["joint"] == RIGHT_KEY
+    assert control.live_snapshot()["corridor_min_norm"] == -10.0
+    assert control.live_snapshot()["corridor_max_norm"] == -7.0
+    now[0] = 10.1
+    assert control.apply(obj, frame(identity, owner, sequence=2, mode="active", epoch=2, sample=right_sample()))
+    action = obj.events[-1][1]
+    assert action[RIGHT_KEY] == pytest.approx(-9.9)
+    assert LEFT_KEY not in action
+    assert control.accepted_action[LEFT_KEY] == 19.0
+    assert all(action[k] == 0 for k in ("x.vel", "y.vel", "theta.vel", "lift_axis.vel"))
+
+
+@pytest.mark.parametrize("key,target", [(LEFT_KEY, 18.0), (RIGHT_KEY, -10.01), (RIGHT_KEY, -6.99)])
+def test_right_rejects_wrong_joint_or_outside_original_corridor(key, target):
+    now, identity, owner, control, obj = right_lane()
+    control.apply(obj, frame(identity, owner, sequence=1))
+    now[0] = 10.1
+    before = control.live_snapshot()
+    events = len(obj.events)
+    assert not control.apply(obj, frame(identity, owner, sequence=2, mode="active", epoch=2,
+                                        sample=right_sample(key=key, target=target)))
+    assert control.live_snapshot() == before
+    assert len(obj.events) == events
+
+
+def test_right_expiry_rejoin_preserves_reference_deadline_and_other_hold():
+    now, identity, owner, control, obj = right_lane()
+    control.apply(obj, frame(identity, owner, sequence=1))
+    deadline = control.live_snapshot()["live_deadline_monotonic_s"]
+    now[0] = 10.1
+    control.apply(obj, frame(identity, owner, sequence=2, mode="active", epoch=2, sample=right_sample()))
+    now[0] = 10.26
+    assert control.check_live(obj)
+    assert obj.events[-2:] == [("zero",), ("hold",)]
+    obj.positions[RIGHT_KEY], obj.positions[LEFT_KEY] = -9.95, 18.5
+    assert control.apply(obj, frame(identity, owner, sequence=3, epoch=3, revision=1))
+    summary = control.live_snapshot()
+    assert summary["cursor_norm"] == -9.95
+    assert summary["reference_norm"] == -10.0
+    assert summary["live_deadline_monotonic_s"] == deadline
+    assert control.live_held[LEFT_KEY] == 19.0
+    now[0] = 10.3
+    assert control.apply(obj, frame(identity, owner, sequence=4, mode="active", epoch=4, revision=1,
+                                    sample=right_sample(seq=2, expiry=10.5, target=-10)))
+    assert obj.events[-1][1][RIGHT_KEY] < -9.95
+
+
+def right_packet(*, torque=0, goal=1817, present=1817, phase=12):
+    packet = bytearray(visible_register_packet(torque=torque, range_min=827, range_max=3039,
+                                               goal=goal, present=present))
+    packet[18] = phase
+    packet[31:33] = (2048 + 658).to_bytes(2, "little")
+    return bytes(packet)
+
+
+def right_robot(monkeypatch, packets=(), *, position=1817):
+    obj, evidence, rows, identity, port, reads, writes = visible_robot(monkeypatch, packets)
+    original_bus = obj.left_bus
+    motor = original_bus.motors["arm_left_elbow_flex"]
+    right_bus = FeetechMotorsBus("right-selected-test", {RIGHT: motor},
+                                {RIGHT: MotorCalibration(3, 0, -658, 827, 3039)})
+    right_bus.port_handler, right_bus.packet_handler = original_bus.port_handler, original_bus.packet_handler
+    monkeypatch.setattr(right_bus, "_sync_write",
+                        lambda address, length, values, **kwargs: writes.append((address, length, dict(values))) or 0)
+    obj.right_bus, obj.right_arm_motors = right_bus, [RIGHT]
+    left, _, left_writes = selected_robot(monkeypatch, position=2200, current=7)
+    obj.left_bus, obj.left_arm_motors, obj.base_motors = left.left_bus, left.left_arm_motors, left.base_motors
+
+    def right_read(address, length, ids, **kwargs):
+        reads.append((address, length, tuple(ids)))
+        return dict.fromkeys(ids, position if address == 56 else 2 if address == 69 else 0), 0
+
+    monkeypatch.setattr(right_bus, "_sync_read", right_read)
+    identity["recipe"] = RIGHT_RECIPE
+    obj._am1_visible_control_binding = identity
+    return obj, evidence, rows, identity, port, reads, writes, left_writes
+
+
+def right_guard(monkeypatch, *, start=1817):
+    obj, evidence, rows, identity, port, reads, writes, left_writes = right_robot(monkeypatch, [
+        status(right_packet(present=start, goal=start), motor_id=3), status(bytes([91]), motor_id=3),
+        status(right_packet(torque=1, present=start, goal=start), motor_id=3),
+        status(bytes([91]), motor_id=3)], position=start)
+    now = [10.0]
+    evidence.clock = lambda: now[0]
+    evidence.prepare_visible(obj, identity)
+    evidence.verify_visible_active(obj)
+    obj.get_observation()
+    obj.read_and_check_currents(1800, False)
+    q0 = (start - 827) / 2212 * 200 - 100
+    summary = {"reference_norm": q0, "corridor_min_norm": q0,
+               "corridor_max_norm": q0 + 3,
+               "live_admitted_at_monotonic_s": 10, "live_deadline_monotonic_s": 100}
+    obj._am1_selected_joint_position.update(read_started_at_monotonic_s=9.98, read_completed_at_monotonic_s=9.99)
+    obj._am1_selected_joint_current.update(read_started_at_monotonic_s=9.98, read_completed_at_monotonic_s=9.99)
+    evidence.admit_live(obj, summary)
+    control = host.AM1LocalControl(**{k: identity[k] for k in ("run_id", "host_incarnation")},
+                                  live=True, live_recipe=RIGHT_RECIPE, selected_evidence=evidence,
+                                  clock=lambda: now[0])
+    control.state = "paused"
+    return obj, evidence, control, summary, now, port, writes, left_writes
+
+
+def test_right_owned_settings_feedback_and_encoded_envelopes(monkeypatch):
+    obj, evidence, control, summary, now, port, writes, left_writes = right_guard(monkeypatch)
+    assert evidence.visible_settings["before"]["registers"]["Phase"] == 12
+    assert evidence.visible_settings["before"]["registers"]["Homing_Offset"] == -658
+    assert obj._am1_selected_joint_position["raw"] == 1817
+    assert obj._am1_selected_joint_position["normalized"] == pytest.approx(-10.488245931283899)
+    assert obj._am1_selected_joint_current["raw"] == 2
+    assert summary["measured_origin_raw"] == 1817
+    assert summary["corridor_min_raw"] == 1817
+    assert summary["corridor_max_raw"] == 1850
+    assert summary["measured_min_raw"] == 1783
+    assert summary["measured_max_raw"] == 1850
+    evidence.guard_live(obj, control)
+    obj._am1_selected_joint_position["raw"] = 1782
+    with pytest.raises(RuntimeError, match="corridor"):
+        evidence.guard_live(obj, control)
+
+
+def test_right_selected_action_uses_right_encoded_write_and_provenance(monkeypatch):
+    obj, evidence, control, summary, now, port, writes, left_writes = right_guard(monkeypatch)
+    obj.send_action({RIGHT_KEY: -7.488245931283899, "x.vel": 0, "y.vel": 0, "theta.vel": 0, "lift_axis.vel": 0})
+    action = obj._am1_selected_joint_action
+    assert action["expected_goal_raw"] == 1850
+    assert action["sync_write_returned"] is True
+    assert action["encoded_goal_word"] == 1850
+    assert [row for row in writes if row[0] == 42][-1][2] == {3: 1850}
+    assert not [row for row in left_writes if row[0] == 42]
+    assert evidence._base(obj, control, {})["motor"]["bus"] == "right"
+    assert evidence._base(obj, control, {})["motor"]["name"] == RIGHT
+
+
+def test_right_configuration_preserves_selected_baseline_settings(monkeypatch):
+    obj, evidence, rows, identity, port, reads, writes, left_writes = right_robot(monkeypatch, [
+        status(right_packet(), motor_id=3), status(bytes([91]), motor_id=3)])
+    events = []
+    for side, bus in (("left", obj.left_bus), ("right", obj.right_bus)):
+        monkeypatch.setattr(bus, "write",
+                            lambda register, motor, value, _side=side, **kwargs:
+                            events.append((_side, register, motor, value)))
+    obj.lift.configure = lambda **kwargs: None
+    obj.configure()
+    immutable = set(evidence.VISIBLE_STATIC_REGISTERS) | {"Minimum_Startup_Force"}
+    assert not [r for r in events if r[0] == "right" and r[2] == RIGHT and r[1] in immutable]
+    assert ("left", "P_Coefficient", "arm_left_elbow_flex", 16) in events
+    assert ("right", "Torque_Enable", RIGHT, 0) in events
+
+
+def test_right_binding_cannot_switch_after_settings_acquisition(monkeypatch):
+    obj, evidence, control, summary, now, port, writes, left_writes = right_guard(monkeypatch)
+    obj._am1_visible_control_binding["recipe"] = "physical-live-left-elbow"
+    with pytest.raises(RuntimeError):
+        evidence.guard_live(obj, control)
+
+
+
+
+def native_right_ready(monkeypatch):
+    from examples.alohamini.am1_finite_task import JOINT_KEYS
+
+    obj, evidence, control, summary, now, port, writes, left_writes = right_guard(monkeypatch)
+    control.state, control.epoch = "ready", -1
+    control._live_summary.update(summary)
+    measured = dict.fromkeys(JOINT_KEYS, 0.0)
+    measured[RIGHT_KEY] = -10.488245931283899
+    obj.get_observation = lambda: dict(measured)
+    obj.stop_motion = lambda: None
+    obj.hold_follower_arms = lambda: None
+    identity = dict(control.binding)
+    owner = {k: str(uuid4()) for k in ("service_incarnation", "controller_generation", "connection_generation")}
+    assert control.apply(obj, frame(identity, owner, sequence=1))
+    return obj, control, now, identity, owner, writes
+
+
+def test_right_live_summary_exports_only_actual_current_selected_write(monkeypatch):
+    obj, control, now, identity, owner, writes = native_right_ready(monkeypatch)
+    now[0] = 10.1
+    assert control.apply(obj, frame(identity, owner, sequence=2, mode="active", epoch=2,
+                                    sample=right_sample(target=-7.488245931283899)))
+    summary, actual = control.live_snapshot(), obj._am1_selected_joint_action
+    assert summary["encoded_goal_raw"] == 1818
+    assert summary["goal_write_returned"] is True
+    assert summary["goal_write_started_at_monotonic_s"] == actual["write_started_at_monotonic_s"]
+    assert summary["goal_write_completed_at_monotonic_s"] == actual["write_completed_at_monotonic_s"]
+    assert summary["goal_action_sequence"] == 2
+    assert actual["joint"] == RIGHT_KEY
+    assert actual["action_sequence"] == 2
+
+
+@pytest.mark.parametrize("bad", ["stale", "wrong_joint", "failed_write", "wrong_sequence"])
+def test_right_live_summary_never_relabels_unmatched_cache_as_current_write(monkeypatch, bad):
+    obj, control, now, identity, owner, writes = native_right_ready(monkeypatch)
+    now[0] = 10.1
+    assert control.apply(obj, frame(identity, owner, sequence=2, mode="active", epoch=2,
+                                    sample=right_sample(target=-7.488245931283899)))
+    assert control.live_snapshot()["encoded_goal_raw"] == 1818
+    original_send = obj.send_action
+
+    def changed(action):
+        if bad == "stale":
+            return dict(action)
+        result = original_send(action)
+        if bad == "wrong_joint":
+            obj._am1_selected_joint_action["joint"] = LEFT_KEY
+        elif bad == "failed_write":
+            obj._am1_selected_joint_action["sync_write_returned"] = False
+        else:
+            obj._am1_selected_joint_action["action_sequence"] = 2
+        return result
+
+    monkeypatch.setattr(obj, "send_action", changed)
+    now[0] = 10.15
+    assert control.apply(obj, frame(identity, owner, sequence=3, mode="active", epoch=2,
+                                    sample=right_sample(seq=2, expiry=10.4, target=-7.488245931283899)))
+    assert "encoded_goal_raw" not in control.live_snapshot()
+    assert "goal_action_sequence" not in control.live_snapshot()
+
+
+def test_right_expiry_before_actual_write_never_exports_write_proof(monkeypatch):
+    obj, control, now, identity, owner, writes = native_right_ready(monkeypatch)
+    original_read = obj._read_arm_positions
+
+    def delayed(*args, **kwargs):
+        result = original_read(*args, **kwargs)
+        now[0] = 10.26
+        return result
+
+    monkeypatch.setattr(obj, "_read_arm_positions", delayed)
+    now[0] = 10.1
+    assert not control.apply(obj, frame(identity, owner, sequence=2, mode="active", epoch=2,
+                                        sample=right_sample(target=-7.488245931283899)))
+    assert not [r for r in writes if r[0] == 42]
+    assert "encoded_goal_raw" not in control.live_snapshot()
+    assert control.live_snapshot()["state"] == "expired"
+
+
+
+def test_right_measured_guard_clips_to_its_actual_lower_calibrated_limit(monkeypatch):
+    obj, evidence, control, summary, now, port, writes, left_writes = right_guard(monkeypatch, start=838)
+    assert summary["corridor_min_raw"] == 838
+    assert summary["corridor_max_raw"] == 871
+    assert summary["measured_min_raw"] == 827
+    assert summary["measured_max_raw"] == 871
+    obj._am1_selected_joint_position.update(raw=827, normalized=-100)
+    evidence.guard_live(obj, control)
+
+
+@pytest.mark.parametrize("left_raw,expected_type,expected_events", [
+    (25, RuntimeError, ["left-read", "left-check"]),
+    (2, OSError, ["left-read", "left-check", "right-read"]),
+])
+def test_selected_left_current_is_checked_before_right_transport_failure(
+    monkeypatch, left_raw, expected_type, expected_events
+):
+    from types import SimpleNamespace
+
+    obj, evidence, control, summary, now = live_guard(monkeypatch)
+    events = []
+    original_left_read = obj.left_bus.sync_read
+    original_check = evidence.check_visible_current
+
+    def left_read(register, motors, **kwargs):
+        events.append("left-read")
+        assert register == "Present_Current"
+        result = original_left_read(register, motors, **kwargs)
+        result["arm_left_elbow_flex"] = left_raw
+        return result
+
+    def check(*args, **kwargs):
+        events.append("left-check")
+        assert kwargs["source"] == "ordinary_current"
+        assert kwargs["sample"]["raw"] == left_raw
+        return original_check(*args, **kwargs)
+
+    def right_read(*args, **kwargs):
+        events.append("right-read")
+        raise OSError("right transport sentinel")
+
+    monkeypatch.setattr(obj.left_bus, "sync_read", left_read)
+    monkeypatch.setattr(evidence, "check_visible_current", check)
+    obj.right_bus = SimpleNamespace(motors={"arm_right_elbow_flex": object()}, sync_read=right_read)
+    with pytest.raises(expected_type):
+        obj.read_and_check_currents(1800, False)
+    assert events == expected_events
+    sample = obj._am1_selected_joint_current
+    assert sample["raw"] == left_raw
+    assert sample["ma"] == left_raw * 6.5
+    assert sample["read_started_at_monotonic_s"] <= sample["read_completed_at_monotonic_s"]
+    if left_raw == 25:
+        fault = obj._am1_selected_joint_fault
+        assert fault["motor"]["bus"] == "left"
+        assert fault["current"]["raw"] == 25
+        assert fault["source"] == "ordinary_current"
+
+
+def test_selected_right_current_is_checked_immediately_after_its_own_read(monkeypatch):
+    obj, evidence, control, summary, now, port, writes, left_writes = right_guard(monkeypatch)
+    events = []
+    original_check = evidence.check_visible_current
+
+    def left_read(register, motors, **kwargs):
+        events.append("left-read")
+        return dict.fromkeys(motors, 2)
+
+    def right_read(register, motors, **kwargs):
+        events.append("right-read")
+        return dict.fromkeys(motors, 25)
+
+    def check(*args, **kwargs):
+        events.append("right-check")
+        assert kwargs["source"] == "ordinary_current"
+        assert kwargs["sample"]["raw"] == 25
+        return original_check(*args, **kwargs)
+
+    monkeypatch.setattr(obj.left_bus, "sync_read", left_read)
+    monkeypatch.setattr(obj.right_bus, "sync_read", right_read)
+    monkeypatch.setattr(evidence, "check_visible_current", check)
+    with pytest.raises(RuntimeError, match="effort ceiling"):
+        obj.read_and_check_currents(1800, False)
+    assert events == ["left-read", "right-read", "right-check"]
+    assert obj._am1_selected_joint_fault["motor"]["bus"] == "right"
+    assert obj._am1_selected_joint_fault["current"]["raw"] == 25
+
+
+def test_default_native_imports_and_disabled_evidence_do_not_require_examples(tmp_path):
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    script = """
+import importlib.abc
+import sys
+from types import SimpleNamespace
+
+class NoExamples(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "examples" or fullname.startswith("examples."):
+            raise ModuleNotFoundError("default package attempted checkout-only examples import")
+        return None
+
+sys.meta_path.insert(0, NoExamples())
+from lerobot.robots.alohamini.alohamini import AlohaMini
+from lerobot.robots.alohamini.selected_joint_evidence import MOTOR, POSITION, AM1SelectedJointEvidence
+from lerobot.robots.alohamini.alohamini_host import AM1LocalControl
+assert MOTOR == "arm_left_elbow_flex"
+assert POSITION == "arm_left_elbow_flex.pos"
+assert AM1LocalControl(live=False).live is False
+evidence = AM1SelectedJointEvidence(enabled=False)
+for robot in (SimpleNamespace(), SimpleNamespace(_am1_visible_control_binding=None)):
+    evidence.deactivate(robot)
+    assert evidence.prepare(robot, {"x.vel": 0}, {}) == {"x.vel": 0}
+    try:
+        evidence.guard_visible(robot, None)
+    except RuntimeError as error:
+        assert "settings/owner binding" in str(error)
+    else:
+        raise AssertionError("unbound visible guard unexpectedly admitted operation")
+print("default native imports and disabled paths passed")
+"""
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[2] / "src")
+    result = subprocess.run([sys.executable, "-c", script], cwd=tmp_path, env=environment,
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "default native imports and disabled paths passed" in result.stdout

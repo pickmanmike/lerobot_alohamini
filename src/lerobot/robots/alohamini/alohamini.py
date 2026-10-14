@@ -468,6 +468,12 @@ class AlohaMini(Robot):
 
 
 
+    def _selected_joint_identity(self):
+        evidence = getattr(self, "_am1_visible_control_evidence", None)
+        if evidence is not None and getattr(evidence, "live_spec", None) is not None:
+            return evidence._bus(self), evidence.motor, evidence.position
+        return self.left_bus, SELECTED_JOINT_MOTOR, SELECTED_JOINT_POSITION
+
     def _configure_bus_defaults(self, bus: FeetechMotorsBus) -> None:
         if self.config.robot_model != "alohamini1":
             bus.configure_motors()
@@ -477,7 +483,11 @@ class AlohaMini(Robot):
         # Aloha Mini 1's established motor Phase must remain untouched, so apply the
         # same runtime delay/acceleration profile explicitly without reading or writing Phase.
         for name in bus.motors:
-            if bus is getattr(self, "left_bus", None) and name == RECOVERY_ELBOW and (getattr(self, "_am1_elbow_integral_trial", None) is not None or getattr(self, "_am1_visible_control_binding", None) is not None):
+            selected_bus, selected_motor, _ = self._selected_joint_identity()
+            if (bus is getattr(self, "left_bus", None) and name == RECOVERY_ELBOW
+                    and getattr(self, "_am1_elbow_integral_trial", None) is not None
+                    or getattr(self, "_am1_visible_control_binding", None) is not None
+                    and bus is selected_bus and name == selected_motor):
                 continue  # The selected trial preserves its actual baseline settings.
             write_register(bus, "Return_Delay_Time", name, 0)
             write_register(bus, "Maximum_Acceleration", name, 254)
@@ -511,7 +521,10 @@ class AlohaMini(Robot):
             previous_trial.restore(self)
         self._configure_bus_defaults(self.left_bus)
         for name in self.left_arm_motors:
-            if name == RECOVERY_ELBOW and (elbow_trial is not None or visible_binding is not None):
+            if name == RECOVERY_ELBOW and elbow_trial is not None or (
+                visible_binding is not None and self.left_bus is self._selected_joint_identity()[0]
+                and name == self._selected_joint_identity()[1]
+            ):
                 continue
             write_register(self.left_bus, "Operating_Mode", name, OperatingMode.POSITION.value)
             # Preserve the existing Aloha Mini follower-arm PID profile.
@@ -526,6 +539,9 @@ class AlohaMini(Robot):
             set_torque_enabled(self.right_bus, self.right_bus.motors, enabled=False)
             self._configure_bus_defaults(self.right_bus)
             for name in self.right_arm_motors:
+                if (visible_binding is not None and self.right_bus is self._selected_joint_identity()[0]
+                        and name == self._selected_joint_identity()[1]):
+                    continue
                 write_register(self.right_bus, "Operating_Mode", name, OperatingMode.POSITION.value)
                 write_register(self.right_bus, "P_Coefficient", name, 16)
                 write_register(self.right_bus, "I_Coefficient", name, 0)
@@ -1186,17 +1202,18 @@ class AlohaMini(Robot):
         #print(f"Left arm motors: {self.left_arm_motors}, Right arm motors: {self.right_arm_motors}")  # debug
         selected = self._selected_joint_evidence_active()
         selected_raw = {} if selected else None
-        selected_started = time.monotonic() if selected else None
+        selected_bus, selected_motor, selected_key = self._selected_joint_identity()
+        selected_started = time.monotonic() if selected and selected_bus is self.left_bus else None
         left_pos = {}
         if self.left_arm_motors:
             left_pos = (
                 self._read_arm_positions(self.left_bus, self.left_arm_motors, raw_positions=selected_raw)
-                if selected else self._read_arm_positions(self.left_bus, self.left_arm_motors)
+                if selected and selected_bus is self.left_bus else self._read_arm_positions(self.left_bus, self.left_arm_motors)
             )
-        if selected and SELECTED_JOINT_MOTOR in selected_raw:
+        if selected and selected_bus is self.left_bus and selected_motor in selected_raw:
             self._am1_selected_joint_position = {
-                "raw": int(selected_raw[SELECTED_JOINT_MOTOR]),
-                "normalized": float(left_pos[SELECTED_JOINT_MOTOR]),
+                "raw": int(selected_raw[selected_motor]),
+                "normalized": float(left_pos[selected_motor]),
                 "read_started_at_monotonic_s": selected_started,
                 "read_completed_at_monotonic_s": time.monotonic(),
             }
@@ -1212,11 +1229,20 @@ class AlohaMini(Robot):
         )
         base_done_t = time.perf_counter()
 
+        if selected and selected_bus is self.right_bus:
+            selected_started = time.monotonic()
         right_pos = (
-            self._read_arm_positions(self.right_bus, self.right_arm_motors)
-            if self.right_bus and self.right_arm_motors
-            else {}
+            self._read_arm_positions(self.right_bus, self.right_arm_motors, raw_positions=selected_raw)
+            if self.right_bus and self.right_arm_motors and selected and selected_bus is self.right_bus
+            else self._read_arm_positions(self.right_bus, self.right_arm_motors)
+            if self.right_bus and self.right_arm_motors else {}
         )
+        if selected and selected_bus is self.right_bus and selected_motor in selected_raw:
+            self._am1_selected_joint_position = {
+                "raw": int(selected_raw[selected_motor]), "normalized": float(right_pos[selected_motor]),
+                "read_started_at_monotonic_s": selected_started,
+                "read_completed_at_monotonic_s": time.monotonic(),
+            }
         right_arm_done_t = time.perf_counter()
 
         left_arm_state = {f"{k}.pos": v for k, v in left_pos.items()}
@@ -1297,7 +1323,8 @@ class AlohaMini(Robot):
         left_pos  = {k: v for k, v in action.items() if k.endswith(".pos") and k.startswith("arm_left_") and k.replace(".pos", "") in self.left_bus.motors}
         right_pos = {k: v for k, v in action.items() if k.endswith(".pos") and k.startswith("arm_right_") and self.right_bus is not None and k.replace(".pos", "") in self.right_bus.motors}
         requested_arm_pos = {**left_pos, **right_pos}
-        selected = self._selected_joint_evidence_active() and SELECTED_JOINT_POSITION in left_pos
+        selected_bus, selected_motor, selected_key = self._selected_joint_identity()
+        selected = self._selected_joint_evidence_active() and selected_key in requested_arm_pos
         right_wrist_observed = None
 
 
@@ -1340,7 +1367,7 @@ class AlohaMini(Robot):
             gp_right = {k: (v, present_right[k.replace(".pos", "")]) for k, v in right_pos.items()}
             right_pos = ensure_safe_goal_position(gp_right, self.config.max_relative_target)
         relative_limit_done_t = time.perf_counter()
-        selected_relative = left_pos.get(SELECTED_JOINT_POSITION) if selected else None
+        selected_relative = {**left_pos, **right_pos}.get(selected_key) if selected else None
 
         left_pos = self._limit_gripper_goal_by_current(self.left_bus, left_pos)
         left_gripper_limit_done_t = time.perf_counter()
@@ -1352,7 +1379,7 @@ class AlohaMini(Robot):
         if self.right_bus and right_pos:
             right_pos = self._limit_joint_goal_by_current(self.right_bus, right_pos)
         right_joint_limit_done_t = time.perf_counter()
-        selected_current = left_pos.get(SELECTED_JOINT_POSITION) if selected else None
+        selected_current = {**left_pos, **right_pos}.get(selected_key) if selected else None
 
         left_pos, left_raw_goals = self._encode_am1_arm_goals(self.left_bus, left_pos, present_left_raw)
         right_raw_goals = None
@@ -1369,43 +1396,50 @@ class AlohaMini(Robot):
         #print(f"[{filename}:{lineno}]Sending left_pos:{left_pos}, right_pos:{right_pos}, base_wheel_goal_vel:{base_wheel_goal_vel}")  # debug
     
         if selected:
-            raw_goal = int(left_raw_goals[SELECTED_JOINT_MOTOR])
-            encoded = self.left_bus._encode_sign("Goal_Position", {3: raw_goal})[3]
+            selected_raw_goals = left_raw_goals if selected_bus is self.left_bus else right_raw_goals
+            raw_goal = int(selected_raw_goals[selected_motor])
+            encoded = selected_bus._encode_sign("Goal_Position", {3: raw_goal})[3]
             self._am1_selected_joint_action = {
-                "requested": float(requested_arm_pos[SELECTED_JOINT_POSITION]),
+                **(getattr(self, "_am1_live_action_binding", None) or {}),
+                "joint": selected_key, "motor": selected_motor,
+                "side": "left" if selected_bus is self.left_bus else "right",
+                "requested": float(requested_arm_pos[selected_key]),
                 "relative_limited": float(selected_relative), "current_limited": float(selected_current),
-                "final_normalized": float(left_pos[SELECTED_JOINT_POSITION]),
+                "final_normalized": float({**left_pos, **right_pos}[selected_key]),
                 "expected_goal_raw": raw_goal, "encoded_goal_word": int(encoded),
-                "encoded_goal_bytes": self.left_bus._split_into_byte_chunks(encoded, 2),
+                "encoded_goal_bytes": selected_bus._split_into_byte_chunks(encoded, 2),
                 "write_started_at_monotonic_s": time.monotonic(),
                 "sync_write_returned": False, "write_acknowledged": False,
             }
-        try:
-            if left_pos:
+        def write_arm_goals(bus, positions, raw_goals):
+            if not positions:
+                return
+            observed = selected and bus is selected_bus
+            if observed:
+                self._am1_selected_joint_action["write_started_at_monotonic_s"] = time.monotonic()
+            try:
                 live_before_write()
-                if left_raw_goals is not None:
-                    self.left_bus.sync_write("Goal_Position", left_raw_goals, normalize=False)
+                if raw_goals is not None:
+                    bus.sync_write("Goal_Position", raw_goals, normalize=False)
                 else:
-                    self.left_bus.sync_write("Goal_Position", {k.replace(".pos", ""): v for k, v in left_pos.items()})
-            if selected:
-                self._am1_selected_joint_action["sync_write_returned"] = True
-        except BaseException as error:
-            if selected:
-                self._am1_selected_joint_action["write_completed_at_monotonic_s"] = time.monotonic()
-                error.add_note("AM1 selected joint action context: " + json.dumps(
-                    self._am1_selected_joint_action, allow_nan=False, separators=(",", ":"),
-                ))
-            raise
-        finally:
-            if selected and "write_completed_at_monotonic_s" not in self._am1_selected_joint_action:
-                self._am1_selected_joint_action["write_completed_at_monotonic_s"] = time.monotonic()
+                    bus.sync_write("Goal_Position", {k.removesuffix(".pos"): v for k, v in positions.items()})
+                if observed:
+                    self._am1_selected_joint_action["sync_write_returned"] = True
+            except BaseException as error:
+                if observed:
+                    self._am1_selected_joint_action["write_completed_at_monotonic_s"] = time.monotonic()
+                    error.add_note("AM1 selected joint action context: " + json.dumps(
+                        self._am1_selected_joint_action, allow_nan=False, separators=(",", ":"),
+                    ))
+                raise
+            finally:
+                if observed and "write_completed_at_monotonic_s" not in self._am1_selected_joint_action:
+                    self._am1_selected_joint_action["write_completed_at_monotonic_s"] = time.monotonic()
+
+        write_arm_goals(self.left_bus, left_pos, left_raw_goals)
         left_write_done_t = time.perf_counter()
-        if self.right_bus and right_pos:
-            live_before_write()
-            if right_raw_goals is not None:
-                self.right_bus.sync_write("Goal_Position", right_raw_goals, normalize=False)
-            else:
-                self.right_bus.sync_write("Goal_Position", {k.replace(".pos", ""): v for k, v in right_pos.items()})
+        if self.right_bus:
+            write_arm_goals(self.right_bus, right_pos, right_raw_goals)
         right_write_done_t = time.perf_counter()
         live_before_write()
         self.left_bus.sync_write("Goal_Velocity", base_wheel_goal_vel)
@@ -1675,14 +1709,15 @@ class AlohaMini(Robot):
         scale = 6.5  # sts3215 current unit conversion factor
         left_curr_raw = {}
         selected = self._selected_joint_evidence_active()
-        selected_started = time.monotonic() if selected else None
-        left_curr_raw = self.left_bus.sync_read("Present_Current", list(self.left_bus.motors.keys()))
-        if selected and SELECTED_JOINT_MOTOR in left_curr_raw:
-            raw = int(left_curr_raw[SELECTED_JOINT_MOTOR])
+        selected_bus, selected_motor, _ = self._selected_joint_identity()
+        def check_selected_current(currents, started, completed):
+            if selected_motor not in currents:
+                return
+            raw = int(currents[selected_motor])
             self._am1_selected_joint_current = {
                 "raw": raw, "ma": raw * scale,
-                "read_started_at_monotonic_s": selected_started,
-                "read_completed_at_monotonic_s": time.monotonic(),
+                "read_started_at_monotonic_s": started,
+                "read_completed_at_monotonic_s": completed,
             }
             visible = getattr(self, "_am1_visible_control_evidence", None)
             if getattr(self, "_am1_visible_control_binding", None) is not None:
@@ -1692,9 +1727,18 @@ class AlohaMini(Robot):
             elbow_trial = getattr(self, "_am1_elbow_integral_trial", None)
             if elbow_trial is not None and elbow_trial.restore_required:
                 elbow_trial.check_current(raw, float(limit_ma))
+
+        selected_started = time.monotonic() if selected and selected_bus is self.left_bus else None
+        left_curr_raw = self.left_bus.sync_read("Present_Current", list(self.left_bus.motors.keys()))
+        if selected and selected_bus is self.left_bus:
+            check_selected_current(left_curr_raw, selected_started, time.monotonic())
         right_curr_raw = {}
         if getattr(self, "right_bus", None):
+            if selected and selected_bus is self.right_bus:
+                selected_started = time.monotonic()
             right_curr_raw = self.right_bus.sync_read("Present_Current", list(self.right_bus.motors.keys()))
+            if selected and selected_bus is self.right_bus:
+                check_selected_current(right_curr_raw, selected_started, time.monotonic())
 
         now = time.monotonic()
         if print_currents and (now - self._last_currents_log_t >= 1.0):

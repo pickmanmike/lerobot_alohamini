@@ -1,3 +1,30 @@
+## Active AM1-LIVE-ARMS-10 scope
+
+PR21 is integrated into integrate/am1-local-teleop at
+48a3ed39b7591837ed6771a586daec7c1b8b5b8b after focused review and checks.
+Packet10 authorizes one focused follow-up, unmerged, offering pre-Start left or
+right elbow selection through the existing browser/Pi/native path. Only one
+selected joint moves; the other11 hold and body/lift commands remain zero after
+normal startup. Left behavior stays q0-10..q0; right uses its actual calibrated
+mapping, q0..q0+3 at at most1 normalized unit/s, with unchanged settings and local
+protections. Freeze selection/reference/corridor/deadline per run. Preserve
+original Pi250ms expiry at every native write boundary,60ms client sampling,
+one unresolved input, fresh gesture after release/qualified Resume/reconnection,
+original90s Live ceiling, local required imagery and no replay/autoplay.
+Root alone handles Git/devices/SSH/staging; agents own disjoint source/test scopes.
+Reuse existing tools and matched affected-component staging while stopped;
+preserve independent pins, private state, rollback and original results. No main
+merge, force/protection bypass/branch deletion, new follow-up merge, gain tuning,
+fine-return gate, bimanual/body/lift/USB-leader expansion, network/camera redesign,
+manual leader/shoulder/readiness questions or AM2 work. AM1 stays wireless and P1
+advisory. Durability means software fault tolerance, state/control continuity and
+recovery with minimal human intervention, not mechanical wear. Each sequence is
+finite and locally monitored; no arbitrary packet-wide attempt quota. Report
+current-target error separately from original-reference residual; prove the
+return goal reached plus bounded dwell before diagnosing inability to return.
+Historical scopes/results below remain at their recorded versions. Packet10
+supersedes Packet09's no-merge rule only for PR21 and the named integration target.
+
 ## Active AM1-LIVE-VIRTUAL-09 scope
 
 Packet08 is complete. Packet09 authorizes one focused branch from the actual
