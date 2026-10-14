@@ -583,6 +583,8 @@ class SessionAuthority:
         self.controller = None
         self.connection = None
         self.grant = None
+        self.applied_input = None
+        self._live_activation_epoch = None
         self.released = False
         self.events = deque(maxlen=64)
         self.last_tick = clock()
@@ -689,6 +691,15 @@ class SessionAuthority:
             self._finish("faulted", "selected experiment durable descriptor is unavailable")
             return True
         run["deadline"] = native_live_at + (definition.live_s if definition else RECIPES[run["recipe"]].live_s)
+        if self._physical_interactive():
+            live = evidence.get("live_input", {})
+            native_deadline = lifecycle.get("native_deadline_monotonic_s", live.get("live_deadline_monotonic_s"))
+            if native_deadline is not None:
+                if (type(native_deadline) not in (int, float) or not math.isfinite(native_deadline)
+                        or abs(native_deadline - run["deadline"]) > 1e-6):
+                    self._finish("faulted", "physical_live_deadline_mismatch")
+                    return True
+                run["deadline"] = native_deadline
         run["preparation_ceiling"] = min(native_live_at + 20, run["deadline"])
         run["dispatch"] = "acknowledged"
         if run["status"] == "starting":
@@ -1007,8 +1018,55 @@ class SessionAuthority:
             and cmd.get("service_incarnation") == self.service_incarnation
         )
 
+    def _physical_interactive(self):
+        return bool(
+            self.run and self.run["recipe"] == "physical-live-left-elbow"
+            and self.executor.source == "protected-physical-provider"
+        )
+
+    def _bind_executor_control(self):
+        if not self._physical_interactive() or not self.controller or not self.connection:
+            return
+        self.executor.bind_control(
+            run_id=self.run["run_id"], service_incarnation=self.service_incarnation,
+            controller_generation=self.controller["generation"],
+            connection_generation=self.connection["generation"],
+            host_incarnation=self.executor.host_incarnation,
+            intent_revision=self.run["intent_revision"],
+        )
+
+    def _pause_live_input(self, reason):
+        if not self._physical_interactive() or self.run["status"] in TERMINAL | {"finishing"}:
+            return
+        if self.run["status"] != "paused":
+            self.run["intent_revision"] += 1
+            self.run["status"] = "paused"
+            self.run["recovery"] = None
+            self._clear_input()
+            self._event(reason)
+            self._save()
+
+    def _live_input_status(self, evidence):
+        value = evidence.get("live_input")
+        if not self._physical_interactive() or not isinstance(value, dict):
+            return None
+        keys = {
+            "state", "joint", "reference_norm", "corridor_min_norm", "corridor_max_norm",
+            "cursor_norm", "cursor_feedback_sequence", "cursor_intent_revision", "last_input_seq",
+            "valid_until_monotonic_s", "accepted_at_monotonic_s", "live_admitted_at_monotonic_s",
+            "live_deadline_monotonic_s", "expiry_detected_at_monotonic_s",
+            "hold_started_at_monotonic_s", "hold_completed_at_monotonic_s", "cadence", "last_input_gap_s",
+        }
+        return dict(
+            _status_small(value, keys, 1024), run_id=self.run["run_id"],
+            service_incarnation=self.service_incarnation, host_incarnation=self.executor.host_incarnation,
+            intent_revision=self.run["intent_revision"],
+        )
+
     def _clear_input(self):
         self.grant = None
+        self.applied_input = None
+        self._live_activation_epoch = None
         self.released = False
         if self.run:
             self.run["intent"] = None
@@ -1837,6 +1895,9 @@ class SessionAuthority:
     def _handle(self, c, d):
         op = c.get("op")
         now = self.clock()
+        if (self._physical_interactive() and self.run["status"] == "finishing"
+                and op in {"connect", "release", "handoff", "release_input", "resume", "grant", "input"}):
+            return self._refuse("physical finishing already in progress")
         if op == "snapshot":
             return {"accepted": True, "status": "snapshot", "snapshot": self.snapshot()}
         if op == "claim":
@@ -2005,6 +2066,7 @@ class SessionAuthority:
                 "run_id": str(uuid.uuid4()),
                 "operation_id": oid,
                 "recipe": recipe.name,
+                "mode": recipe.mode,
                 "source": self.executor.source,
                 "seed": None if self.asynchronous else recipe.seed,
                 "status": "accepted",
@@ -2046,6 +2108,16 @@ class SessionAuthority:
                 try:
                     self.executor.bind_run(self.run["run_id"], recipe)
                     self._set_executor_revision()
+                    # A private admission-only connection cannot accept client input.
+                    # The acknowledged browser connect replaces it under a newer intent revision.
+                    if self._physical_interactive() and not self.executor.bind_control(
+                        run_id=self.run["run_id"], service_incarnation=self.service_incarnation,
+                        controller_generation=self.controller["generation"],
+                        connection_generation=str(uuid.uuid4()),
+                        host_incarnation=self.executor.host_incarnation,
+                        intent_revision=self.run["intent_revision"],
+                    ):
+                        raise RuntimeError("physical live admission binding refused")
                     if not self.executor.begin(recipe):
                         self._finish("faulted", "physical_startup_unaccepted")
                     else:
@@ -2149,8 +2221,16 @@ class SessionAuthority:
         if op == "connect":
             if not self.controller or self.controller["device_id"] != d:
                 return self._refuse("controller required")
+            if self._physical_interactive() and (
+                not self._owned(c, d) or c.get("service_incarnation") != self.service_incarnation
+                or c.get("host_incarnation") != self.executor.host_incarnation
+            ):
+                return self._refuse("stale physical control identity")
             self.connection = {"device_id": d, "generation": str(uuid.uuid4()), "seq": -1}
+            if self._physical_interactive():
+                self.run["intent_revision"] += 1
             self._clear_input()
+            self._bind_executor_control()
             if RECIPES[self.run["recipe"]].mode == "interactive":
                 self.run["status"] = "paused"
             self._save()
@@ -2163,10 +2243,21 @@ class SessionAuthority:
         if not self._connection_valid(c, d):
             return self._refuse("stale control generation")
         if op == "release_input":
+            if self._physical_interactive() and set(c) - {
+                "op", "run_id", "service_incarnation", "controller_generation", "connection_generation",
+                "host_incarnation", "intent_revision",
+            }:
+                return self._refuse("empty physical release required")
+            if self._physical_interactive():
+                if c.get("host_incarnation") != self.executor.host_incarnation:
+                    return self._refuse("stale physical host identity")
+                self._pause_live_input("input_released")
             self._clear_input()
             self.released = True
-            return {"accepted": True, "status": "released", "effect_admitted": True}
+            return {"accepted": True, "status": "released", "effect_admitted": not self.asynchronous}
         if op == "resume":
+            if self._physical_interactive() and c.get("host_incarnation") != self.executor.host_incarnation:
+                return self._refuse("stale physical host identity")
             revision = c.get("expected_intent_revision")
             if type(revision) is not int or revision != self.run["intent_revision"]:
                 return self._refuse("stale or malformed intent revision")
@@ -2181,11 +2272,16 @@ class SessionAuthority:
                 return self._refuse("qualified release/alignment required")
             self.run["intent_revision"] += 1
             self._set_executor_revision()
+            self._bind_executor_control()
             self.run["status"] = "running"
             self.last_tick = now
             self.run["dispatch"] = "dispatching"
             self._save()
             try:
+                activation_epoch = (
+                    self._evidence()["accepted_host_action"]["epoch"] + 1
+                    if self._physical_interactive() else None
+                )
                 admitted = self.executor.dispatch(RECIPES[self.run["recipe"]])
             except Exception:
                 self.run["uncertain"] = True
@@ -2194,6 +2290,9 @@ class SessionAuthority:
             self.run["dispatch"] = "acknowledged" if admitted else "unacknowledged"
             if admitted:
                 self.run["recovery"] = None
+                if self._physical_interactive():
+                    self._live_activation_epoch = activation_epoch
+                    self.run["resume_ceiling"] = min(now + 10, self.run["deadline"])
             elif self.asynchronous:
                 self.run["status"] = "resuming"
                 self.run["resume_ceiling"] = min(
@@ -2209,7 +2308,13 @@ class SessionAuthority:
         if op == "grant":
             if self.run["status"] != "running" or RECIPES[self.run["recipe"]].mode != "interactive":
                 return self._refuse("interactive running required")
-            self._clear_input()
+            if self._physical_interactive():
+                if (type(c.get("intent_revision")) is not int
+                        or c["intent_revision"] != self.run["intent_revision"]
+                        or c.get("host_incarnation") != self.executor.host_incarnation):
+                    return self._refuse("stale physical intent identity")
+            else:
+                self._clear_input()  # Fake compatibility: a new grant intentionally clears fake output.
             self.grant = {"id": str(uuid.uuid4()), "issued": now, "expires": now + 0.25}
             return {
                 "accepted": True,
@@ -2225,26 +2330,62 @@ class SessionAuthority:
                 return self._refuse("expired grant")
             if type(seq) is not int or seq <= self.connection["seq"]:
                 return self._refuse("sequence must increase")
-            if (
+            physical = self._physical_interactive()
+            if physical:
+                allowed = {
+                    "op", "run_id", "service_incarnation", "controller_generation", "connection_generation",
+                    "host_incarnation", "intent_revision", "grant_id", "seq", "target",
+                }
+                if (set(c) - allowed or type(c.get("intent_revision")) is not int
+                        or c["intent_revision"] != self.run["intent_revision"]
+                        or c.get("host_incarnation") != self.executor.host_incarnation):
+                    return self._refuse("stale or malformed physical intent identity")
+                if (not isinstance(target, dict) or set(target) != {"arm_left_elbow_flex.pos"}
+                        or type(target["arm_left_elbow_flex.pos"]) not in (int, float)
+                        or not math.isfinite(target["arm_left_elbow_flex.pos"])):
+                    return self._refuse("invalid named physical target")
+            elif (
                 not isinstance(target, list)
                 or not 1 <= len(target) <= 16
                 or any(type(x) not in (int, float) or not math.isfinite(x) or abs(x) > 1 for x in target)
             ):
                 return self._refuse("invalid normalized fake target")
-            if self.run["status"] != "running" or not self._evidence()["feedback"]:
+            e = self._evidence()
+            if self.run["status"] != "running" or not e["feedback"] or physical and not e["required_observation"]:
                 return self._refuse("not qualified")
+            if physical:
+                expiry = self.grant["expires"]
+                accepted = self.executor.apply(
+                    target, valid_until_monotonic_s=expiry, intent_revision=self.run["intent_revision"],
+                    run_id=self.run["run_id"], service_incarnation=self.service_incarnation,
+                    controller_generation=self.controller["generation"],
+                    connection_generation=self.connection["generation"],
+                    host_incarnation=self.executor.host_incarnation, grant_id=self.grant["id"], seq=seq,
+                )
+                if not accepted:
+                    return self._refuse("physical input mailbox refused")
+                self.applied_input = {"expires": expiry, "seq": seq, "intent_revision": self.run["intent_revision"]}
+                self.run["intent"] = dict(target)
+            else:
+                accepted = self.executor.apply(target)
+                self.run["intent"] = list(target)
             self.connection["seq"] = seq
-            self.run["intent"] = list(target)
-            return {"accepted": True, "status": "input", "effect_admitted": self.executor.apply(target)}
+            return {"accepted": True, "status": "input", "effect_admitted": accepted}
         return self._refuse("unknown operation")
 
     def _expire_controls(self, now):
         if self.controller and now >= self.controller["expires"]:
             self.controller = None
             self.connection = None
+            self._pause_live_input("presence_expired")
             self._clear_input()
             self._event("presence_expired")
-        if self.grant and now >= self.grant["expires"]:
+        if self._physical_interactive():
+            if self.applied_input and now >= self.applied_input["expires"]:
+                self._pause_live_input("input_expired")
+            elif self.grant and now >= self.grant["expires"]:
+                self.grant = None  # An unused grant is not a movement sample or a hold request.
+        elif self.grant and now >= self.grant["expires"]:
             self._clear_input()
 
     def tick(self):
@@ -2260,6 +2401,14 @@ class SessionAuthority:
             if not r or r["status"] in TERMINAL:
                 return
             e = self._evidence()
+            if self._physical_interactive():
+                try:
+                    execution = self.executor.advance(now, dt)
+                except (OSError, RuntimeError, ValueError) as exc:
+                    self._finish("faulted", str(exc))
+                    return
+                r["execution"] = execution
+                r["progress_s"] = execution["progress_s"]
             if self.asynchronous and r["status"] == "finishing":
                 self._physical_lifecycle(e, now)
                 return
@@ -2284,12 +2433,35 @@ class SessionAuthority:
                 else:
                     self._finish("completed")
                 return
+            live_input = self._live_input_status(e)
+            if live_input is not None:
+                r["live_input"] = live_input
+                if (live_input.get("state") == "expired" and r["status"] in {"running", "resuming"}
+                        and e.get("acknowledged_intent_revision") == r["intent_revision"]):
+                    self._pause_live_input("native_input_expired")
+                    return
             qualified = e["feedback"] and e["required_observation"] and e["native_ack"]
+            # Only the measured hold immediately preceding this Resume's active
+            # epoch may bridge its first native ACK. A watchdog's later hold must
+            # enter the existing bounded recovery, even before the first sample.
+            live_transition = self._physical_interactive() and self._live_activation_epoch is not None and (
+                e.get("accepted_host_action", {}).get("state") == "paused"
+                and e.get("accepted_host_action", {}).get("epoch") == self._live_activation_epoch - 1
+                and now < r["resume_ceiling"]
+            )
+            if e.get("active_acknowledged") is True:
+                self._live_activation_epoch = None
             if r["status"] == "preparing":
                 if now >= r["preparation_ceiling"]:
                     self._finish("faulted", "observation_preparation_timeout")
                     return
                 if qualified and e["pose_aligned"]:
+                    if self._physical_interactive():
+                        r["status"] = "paused"
+                        self._hold()
+                        self._event("observation_qualified")
+                        self._save()
+                        return
                     try:
                         self._set_executor_revision()
                         admitted = self.executor.dispatch(RECIPES[r["recipe"]])
@@ -2305,6 +2477,10 @@ class SessionAuthority:
                     return
                 if qualified and e["pose_aligned"]:
                     try:
+                        activation_epoch = (
+                            e["accepted_host_action"]["epoch"] + 1
+                            if self._physical_interactive() else None
+                        )
                         self._set_executor_revision()
                         admitted = self.executor.dispatch(RECIPES[r["recipe"]])
                     except (OSError, RuntimeError, ValueError) as exc:
@@ -2314,13 +2490,17 @@ class SessionAuthority:
                         r["status"] = "running"
                         r["dispatch"] = "acknowledged"
                         r["recovery"] = None
+                        if self._physical_interactive():
+                            self._live_activation_epoch = activation_epoch
                         self._event("resumed")
             elif r["status"] == "running" and not (
-                qualified and (not self.asynchronous or e.get("active_acknowledged") is True)
+                qualified and (not self.asynchronous or live_transition
+                               or e.get("active_acknowledged") is True)
             ):
                 r["recovery_episodes"] += 1
                 r["first_cause"] = r["first_cause"] or (
-                    "feedback_loss" if not e["feedback"] else "required_proof_loss"
+                    "feedback_loss" if not e["feedback"] else
+                    "native_active_ack_loss" if self._physical_interactive() and qualified else "required_proof_loss"
                 )
                 ceiling = r["recovery"]["ceiling"] if r["recovery"] else min(now + 10, r["deadline"])
                 r["recovery"] = {"started": now, "ceiling": ceiling, "revision": r["intent_revision"]}
@@ -2336,6 +2516,9 @@ class SessionAuthority:
                     self._finish("faulted", "recovery_timeout")
                     return
                 if qualified and e["pose_aligned"] and recovery["revision"] == r["intent_revision"]:
+                    if self._physical_interactive():
+                        self._pause_live_input("live_sensing_requalified")
+                        return
                     try:
                         self._set_executor_revision()
                         admitted = self.executor.dispatch(RECIPES[r["recipe"]])
@@ -2399,6 +2582,8 @@ class SessionAuthority:
             evidence = self._evidence()
             reference = _positive_completion_reference(evidence, run) if run is not None else None
             public_evidence = _public_physical_evidence(evidence, run)
+            if self._physical_interactive() and run is not None:
+                run["live_input"] = self._live_input_status(evidence)
             if reference is not None:
                 public_receipt = {
                     key: value for key, value in run["completion_receipt"].items() if key != "execution"
@@ -2555,6 +2740,8 @@ class SessionAuthority:
                 "observation_provenance",
                 "observation_freshness_basis",
                 "backend_contract",
+                "mode",
+                "live_input",
             }
             public = _status_small(run, keys)
             public["execution"] = _status_execution(run.get("execution"))
@@ -2609,8 +2796,11 @@ class SessionAuthority:
             "ack_provenance",
             "backend_contract",
             "retained_return_reference",
+            "live_input",
         }
         public = _status_small(evidence, keys)
+        if self._physical_interactive():
+            public["live_input"] = self._live_input_status(evidence)
         public["lifecycle"] = _status_lifecycle(evidence.get("lifecycle"))
         completion = evidence.get("finite_completion")
         public["finite_completion"] = _status_small(

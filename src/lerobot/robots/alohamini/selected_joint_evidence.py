@@ -28,6 +28,23 @@ CONTEXT_KEYS = {
     "sample_key",
 }
 PHASES = {"baseline", "outbound", "endpoint", "return", "origin", "final"}
+LIVE_RECIPE = "physical-live-left-elbow"
+
+
+class _LiveElbowDefinition:
+    recipe_name = LIVE_RECIPE
+    profile = "LiveLeftElbow"
+    current_cap_ma = 150.0
+    live_s = 90.0
+
+    @staticmethod
+    def settings_valid(proof):
+        from examples.alohamini.am1_session_contract import PositiveElbowControl
+
+        return PositiveElbowControl._settings_valid(proof, recipe_name=LIVE_RECIPE, current_cap_ma=150.0)
+
+
+LIVE_ELBOW_DEFINITION = _LiveElbowDefinition()
 
 
 def _number(value):
@@ -83,6 +100,9 @@ class AM1SelectedJointEvidence:
         self._hold_departed = False
         self._hold_departure = None
         self._hold_pending_departure = None
+        self.live_admission = None
+        self.live_response = None
+        self.live_goal_checkpoint_at = None
 
     VISIBLE_STATIC_REGISTERS = (
         "Firmware_Major_Version",
@@ -127,7 +147,8 @@ class AM1SelectedJointEvidence:
 
         expected = actual if binding is None else binding
         experiment = getattr(robot, "_am1_selected_elbow_experiment", None)
-        definition = LEFT_ELBOW_POSITIVE_CONTROL if experiment is None else experiment
+        definition = (LIVE_ELBOW_DEFINITION if actual.get("recipe") == LIVE_RECIPE
+                      else LEFT_ELBOW_POSITIVE_CONTROL if experiment is None else experiment)
         keys = {"run_id", "host_incarnation", "recipe"}
         if experiment is not None:
             keys.add("experiment_sha256")
@@ -358,6 +379,9 @@ class AM1SelectedJointEvidence:
             raise RuntimeError("Visible selected software effort ceiling reached")
 
     def deactivate(self, robot):
+        if getattr(robot, "_am1_visible_control_binding", {}).get("recipe") == LIVE_RECIPE:
+            self.deactivate_live(robot)
+            return
         # Protective Pause/Stop must always proceed. Retain an unresolved active
         # obligation so paused/coasting motion cannot qualify a later admission.
         if self._response_window is not None:
@@ -374,6 +398,10 @@ class AM1SelectedJointEvidence:
 
     def prepare(self, robot, action, binding, *, control_marker=None):
         cleaned = {k: v for k, v in action.items() if k != MARKER}
+        if getattr(robot, "_am1_visible_control_binding", {}).get("recipe") == LIVE_RECIPE:
+            if MARKER in action:
+                raise RuntimeError("Live selected control cannot inherit finite diagnostic context")
+            return cleaned
         if MARKER not in action:
             candidate = getattr(robot, "_am1_selected_elbow_experiment", None)
             if candidate is not None and getattr(candidate, "response_rule", None) is not None:
@@ -666,6 +694,9 @@ class AM1SelectedJointEvidence:
 
     def guard_visible(self, robot, control, observation=None):
         """Enforce the new finite probe on cached native reads, never another bus reader."""
+        if getattr(robot, "_am1_visible_control_binding", {}).get("recipe") == LIVE_RECIPE:
+            self.guard_live(robot, control)
+            return
         definition = self._visible_definition(robot)
         binding = getattr(robot, "_am1_visible_control_binding", None)
         expected_binding = {**(control.binding or {}), "recipe": definition.recipe_name} if definition is not None else None
@@ -820,6 +851,196 @@ class AM1SelectedJointEvidence:
         # A matched returned first departure is an original-task fact. Pause
         # clears current eligibility, not the fact that cycle two already began.
         self._hold_departed = self._hold_departure is not None
+
+    def admit_live(self, robot, summary):
+        """Freeze actual native geometry once; never infer a raw excursion size."""
+        from examples.alohamini.am1_session_contract import SignedElbowResponse
+
+        if self.live_admission is not None:
+            raise RuntimeError("Live native admission cannot replace its measured origin")
+        if not LIVE_ELBOW_DEFINITION.settings_valid(self.visible_settings):
+            raise RuntimeError("Live selected read-only settings are unavailable")
+        calibration = robot.left_bus.calibration[MOTOR]
+        material = {k: int(getattr(calibration, k)) for k in ("drive_mode", "homing_offset", "range_min", "range_max")}
+        position = getattr(robot, "_am1_selected_joint_position", {})
+        raw = position.get("raw")
+        endpoints = [SignedElbowResponse.encoded_goal(summary[k], material)
+                     for k in ("corridor_min_norm", "corridor_max_norm")]
+        positive = SignedElbowResponse.encoded_goal(summary["reference_norm"] + 10, material)
+        registers = self.visible_settings["before"]["registers"]
+        low = max(material["range_min"], registers["Min_Position_Limit"])
+        high = min(material["range_max"], registers["Max_Position_Limit"])
+        if (type(raw) is not int or any(type(v) is not int or not low <= v <= high for v in endpoints)
+                or not low <= raw <= high):
+            raise RuntimeError("Live actual selected raw admission/encoded corridor is unavailable")
+        summary.update(measured_origin_raw=raw, corridor_min_raw=min(endpoints), corridor_max_raw=max(endpoints))
+        # Command corridor is negative-only; preserve the prior diagnostic
+        # measured +/-ten envelope, including literal measured/floor quantization.
+        summary.update(measured_min_raw=max(low, min(*endpoints, raw)),
+                       measured_max_raw=min(high, max(raw, endpoints[1], high if positive is None else positive)))
+        self.live_admission = copy.deepcopy(summary)
+
+    def deactivate_live(self, robot):
+        # A returned measured hold ends live command exposure. It does not clear
+        # the native first fault or change the original geometry/settings/budget.
+        self.context = None
+        self.live_response = None
+        robot._am1_selected_joint_evidence_context = None
+
+    def live_action(self, robot, summary):
+        self.context = {"profile": "LiveLeftElbow", "requested_target": summary["cursor_norm"],
+                        "reference": summary["reference_norm"], "phase": summary["state"]}
+        robot._am1_selected_joint_evidence_context = copy.deepcopy(self.context)
+
+    def guard_live(self, robot, control):
+        now = self.clock()
+        if not LIVE_ELBOW_DEFINITION.settings_valid(self.visible_settings):
+            raise RuntimeError("Live actual selected baseline settings are unavailable")
+        position = getattr(robot, "_am1_selected_joint_position", None)
+        current = getattr(robot, "_am1_selected_joint_current", None)
+        for cache in (position, current):
+            if (not isinstance(cache, dict) or any(not _number(cache.get(k)) for k in
+                    ("read_started_at_monotonic_s", "read_completed_at_monotonic_s"))
+                    or not 0 <= cache["read_started_at_monotonic_s"] <= cache["read_completed_at_monotonic_s"] <= now
+                    or now - cache["read_started_at_monotonic_s"] > .5):
+                raise RuntimeError("Live original selected acquisition is unavailable")
+        self.check_visible_current(robot, current.get("raw"), getattr(robot, "_joint_current_limit_ma", 100),
+                                   source="cached_guard", sample=current, position=position)
+        if not _number(current.get("ma")) or current["ma"] != current.get("raw", float("nan")) * 6.5:
+            raise RuntimeError("Live actual selected current is unavailable")
+        admission = self.live_admission
+        if admission is None:
+            return  # Actual startup budget/activation checks remain in their existing layer.
+        raw = position.get("raw")
+        low, high = admission["measured_min_raw"], admission["measured_max_raw"]
+        if type(raw) is not int or not low <= raw <= high:
+            raise RuntimeError("Live selected position left its original encoded corridor")
+        action = getattr(robot, "_am1_selected_joint_action", None)
+        if control.state != "active" or control.live_sample is None:
+            self.live_response = None
+            # The preparation/readiness hold has its historical thirty-tick
+            # command-error bound; fresh measured expiry holds seed literal raw.
+            if control.state == "active" and isinstance(action, dict) and type(action.get("expected_goal_raw")) is int:
+                if abs(action["expected_goal_raw"] - raw) >= 30:
+                    raise RuntimeError("Live startup measured hold exceeded thirty raw ticks")
+            return
+        if not isinstance(action, dict) or type(action.get("expected_goal_raw")) is not int:
+            raise RuntimeError("Live actual selected action is unavailable")
+        goal = action["expected_goal_raw"]
+        self._guard_live_fixed_goal(position, current, goal)
+        error = goal - raw
+        direction = 0 if error == 0 else (1 if error > 0 else -1)
+        window = self.live_response
+        # Fresh reversal or an acknowledged release changes command exposure;
+        # original motor faults still raise normally and are never reclassified.
+        if window is not None and window["direction"] != direction:
+            window = self.live_response = None
+        if abs(error) < 45:
+            self.live_response = None
+            self.response_boundary = {"version": 1, "status": "tracking", "signed_commanded_error_raw": abs(error)}
+            return
+        acquisition = position["read_completed_at_monotonic_s"]
+        if window is None:
+            self.live_response = {"direction": direction, "raw": raw, "at": acquisition}
+            return
+        elapsed = acquisition - window["at"]
+        response = direction * (raw - window["raw"])
+        self.response_boundary = {"version": 1, "status": "pending", "elapsed_s": elapsed,
+                                  "signed_response_raw": response, "signed_commanded_error_raw": abs(error)}
+        if response >= 3:
+            self.live_response = None
+        elif elapsed >= 1.2:
+            self.capture_fault(robot, "Live selected response not established within 1.2 seconds", source="response_guard",
+                               current=current, position=position)
+            raise RuntimeError("Live selected response not established within 1.2 seconds")
+
+    def _guard_live_fixed_goal(self, position, current, goal):
+        # These are the existing chronological fixed-goal protections, without
+        # assigning a browser stream a synthetic finite phase or cycle number.
+        if goal != self.visible_goal:
+            self.visible_goal = goal
+            self.visible_position_rows.clear()
+            self.visible_current_rows.clear()
+        point = (position["read_completed_at_monotonic_s"], current["read_completed_at_monotonic_s"],
+                 position["raw"], abs(current["ma"]))
+        if not self.visible_position_rows or point[0] > self.visible_position_rows[-1][0]:
+            self.visible_position_rows.append(point)
+        growing, start, previous, previous_time = 0, None, None, None
+        for item in self.visible_position_rows:
+            error = item[2] - goal
+            if error == 0:
+                continue
+            if previous is not None and previous * error < 0:
+                if abs(error) > abs(previous):
+                    growing += 1
+                    if start is None:
+                        start = previous_time
+                else:
+                    growing, start = 0, None
+            previous, previous_time = error, item[0]
+            if growing >= 3 and abs(error) > 2 and item[0] - start >= .2 - 1e-9:
+                raise RuntimeError("Live native fixed-goal growing position instability")
+        if self.visible_current_rows and point[1] <= self.visible_current_rows[-1][1]:
+            return
+        if self.visible_current_rows and point[3] < self.visible_current_rows[-1][3]:
+            self.visible_current_rows.clear()
+        self.visible_current_rows.append(point)
+        for index in range(len(self.visible_current_rows)):
+            rows = list(self.visible_current_rows)[index:]
+            if len(rows) < 4 or min(rows[-1][0] - rows[0][0], rows[-1][1] - rows[0][1]) < .2 - 1e-9:
+                continue
+            level, rises = rows[0][3], 0
+            for item in rows[1:]:
+                if item[3] - level >= 6.5 - 1e-9:
+                    level, rises = item[3], rises + 1
+            if rises >= 3 and max(item[2] for item in rows) - min(item[2] for item in rows) <= 2:
+                raise RuntimeError("Live native static command adverse current rise")
+
+    def report_live_goal(self, robot, control):
+        """A few existing-owner readbacks; broadcast completion remains unacknowledged."""
+        now = self.clock()
+        state = control.live_snapshot()["state"]
+        target = None if control.live_sample is None else control.live_sample["target"][POSITION]
+        cursor = control.live_snapshot().get("cursor_norm")
+        direction = 0 if target is None or target == cursor else (1 if target > cursor else -1)
+        checkpoint = (state, control.epoch, direction)
+        if checkpoint in self.attempted or (self.live_goal_checkpoint_at is not None and now - self.live_goal_checkpoint_at < 1):
+            return
+        self.attempted.add(checkpoint)
+        self.live_goal_checkpoint_at = now
+        try:
+            sample, traces = self._visible_settings_read(robot, source="settings_active")
+        except TransportRefusal as error:
+            from scservo_sdk import COMM_RX_TIMEOUT
+            # Preserve the existing optional sparse timeout policy. A malformed
+            # response or actual motor/setting refusal remains a native fault.
+            if error.trace.get("response_bytes") != [] or error.trace.get("comm_result") != COMM_RX_TIMEOUT:
+                raise
+            self.goal_readbacks[f"{state}_{control.epoch}"] = {"state": state, "diagnostic_available": False,
+                "unavailable_reason": type(error).__name__, "read_completed_at_monotonic_s": self.clock()}
+            return
+        if any(sample["registers"][k] != self.visible_settings["active"]["registers"][k]
+               for k in self.VISIBLE_STATIC_REGISTERS):
+            raise RuntimeError("Live selected settings changed from their read-only baseline")
+        if (sample["registers"]["Status"] != 0 or sample["registers"]["Torque_Enable"] != 1
+                or sample["registers"]["Operating_Mode"] != 0 or sample["registers"]["Lock"] != 1):
+            raise RuntimeError("Live selected actual status fault")
+        expected = getattr(robot, "_am1_selected_joint_action", {}).get("expected_goal_raw")
+        row = {"kind": "live_goal_readback", **control.binding, "epoch": control.epoch,
+               "intent_revision": control.intent_revision, "state": state,
+               "action_sequence": control.accepted_action_sequence,
+               "last_input_seq": control.live_snapshot()["last_input_seq"],
+               "requested_goal_raw": expected,
+               "goal_matches_expected_raw": None if expected is None else sample["registers"]["Goal_Position"] == expected,
+               "goal_position_raw": sample["registers"]["Goal_Position"],
+               "present_position_raw": sample["registers"]["Present_Position"],
+               "temperature_c": sample["registers"]["Present_Temperature"],
+               "read_started_at_monotonic_s": sample["read_started_at_monotonic_s"],
+               "read_completed_at_monotonic_s": sample["read_completed_at_monotonic_s"], "traces": traces}
+        self.goal_readbacks[f"{state}_{control.epoch}_{direction}"] = row
+        while len(self.goal_readbacks) > 8:
+            self.goal_readbacks.pop(next(iter(self.goal_readbacks)))
+        self.emit(row)
 
     def abort_hold_admission(self):
         self._clear_hold_admission(discard_departure=True)
@@ -1531,15 +1752,16 @@ class AM1SelectedJointEvidence:
         return result
 
     def _matched_marker(self, control, observation, *, require_context=True):
-        if (not self.enabled or require_context and self.context is None
-                or control.binding is None or control.state != "active"):
+        live = getattr(control, "live", False)
+        if (not self.enabled or require_context and self.context is None and not live
+                or control.binding is None or control.state not in ({"active", "paused"} if live else {"active"})):
             return None
         marker = observation.get("_am1_local_feedback", {})
         if (
             not isinstance(marker, dict)
             or type(marker.get("version")) is not int
             or marker["version"] != 1
-            or marker.get("state") != "active"
+            or marker.get("state") != control.state
             or any(
                 type(marker.get(key)) is not int
                 for key in ("epoch", "intent_revision", "accepted_action_sequence")
@@ -1568,7 +1790,7 @@ class AM1SelectedJointEvidence:
             "current": copy.deepcopy(getattr(robot, "_am1_selected_joint_current", None)),
             "sparse_receipts": copy.deepcopy(self.sparse_receipts),
             **({"goal_readbacks": copy.deepcopy(self.goal_readbacks)}
-               if getattr(robot, "_am1_selected_elbow_experiment", None) is not None else {}),
+               if getattr(robot, "_am1_selected_elbow_experiment", None) is not None or getattr(control, "live", False) else {}),
         }
 
     def _emit_sparse(self, row):
@@ -1590,6 +1812,9 @@ class AM1SelectedJointEvidence:
         if type(observation_id) is int and observation_id > self.last_observation_id:
             self.last_observation_id = observation_id
             self.emit({**row, "kind": "native_trace", "position": position, "current": current})
+        if getattr(control, "live", False):
+            self.report_live_goal(robot, control)
+            return
         key = self.context["sample_key"]
         checkpoint = None
         if key is None or key in self.attempted:

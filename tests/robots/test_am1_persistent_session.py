@@ -1,4 +1,4 @@
-"""Fake authority behavior tests; no physical adapters."""
+"""Authority behavior with fake executors and real physical adapters using simulated device IO."""
 
 import uuid
 
@@ -771,3 +771,413 @@ def test_admitted_resume_retry_remains_truthful_after_later_spectator_pause(tmp_
         assert executor.dispatch_count == count + 1
     finally:
         authority.close()
+
+# These tests exercise the real physical adapter/worker with the existing simulated host IO.
+@pytest.fixture
+def physical_live_authority(tmp_path):
+    from tests.robots.test_am1_live_native import ExecutorNativeHost
+    from tests.robots.test_am1_physical_executor import executor, until
+
+    host = ExecutorNativeHost()
+    e = executor(host)
+    a = SessionAuthority(tmp_path, executor=e)
+    try:
+        r = start(a, "physical-live-left-elbow")
+        assert r["accepted"], r
+        until(lambda: (a.tick() or a.snapshot()["run"]["status"] == "paused"))
+        yield a, e, host, r
+    finally:
+        a.close()
+        if e.worker:
+            e.worker.join(2)
+
+
+def physical_live_controls(a, r):
+    from tests.robots.test_am1_physical_executor import until
+
+    snapshot = a.snapshot()
+    generation = snapshot["controller"]["controller_generation"]
+    assert a.handle(command("claim", controller_generation=generation), "owner")["accepted"]
+    base = {
+        "run_id": r["run_id"],
+        "service_incarnation": snapshot["service_incarnation"],
+        "controller_generation": generation,
+        "host_incarnation": snapshot["evidence"]["host_incarnation"],
+    }
+    connected = a.handle(command("connect", **base), "owner")
+    assert connected["accepted"], connected
+    base["connection_generation"] = connected["connection_generation"]
+    assert a.handle(command("release_input", **base), "owner")["accepted"]
+    until(lambda: a.snapshot()["evidence"]["pose_aligned"])
+    result = a.handle(
+        command("resume", **base, expected_intent_revision=a.run["intent_revision"]), "owner"
+    )
+    assert result["accepted"], result
+    until(lambda: (a.tick() or a.run["status"] == "running"))
+    base["intent_revision"] = a.run["intent_revision"]
+    return base
+
+
+def test_physical_live_grant_renewal_preserves_sample_until_original_expiry(physical_live_authority):
+    import time
+
+    a, e, host, r = physical_live_authority
+    base = physical_live_controls(a, r)
+    deadline = a.run["deadline"]
+    grant = a.handle(command("grant", **base), "owner")
+    assert grant["accepted"]
+    accepted = a.handle(command("input", **base, grant_id=grant["grant_id"], seq=1,
+                                target={"arm_left_elbow_flex.pos": -0.5}), "owner")
+    assert accepted["accepted"] and accepted["effect_admitted"]
+    time.sleep(0.08)
+    before = len(host.actions)
+    renewal = a.handle(command("grant", **base), "owner")
+    assert renewal["accepted"]
+    assert a.run["intent"] == {"arm_left_elbow_flex.pos": -0.5}
+    assert a.run["status"] == "running"
+    assert a.run["first_cause"] is None
+    time.sleep(0.07)
+    assert all(action["_am1_local_control"]["mode"] == "active" for action in host.actions[before:])
+    time.sleep(max(0, grant["expires"] - time.monotonic()) + 0.03)
+    a.tick()
+    assert a.run["status"] == "paused"
+    assert a.run["intent"] is None
+    assert a.run["first_cause"] is None
+    assert a.snapshot()["run"]["deadline"] == deadline
+
+
+def test_physical_live_reacquisition_retains_reference_and_deadline(physical_live_authority):
+    import time
+
+    a, e, host, r = physical_live_authority
+    base = physical_live_controls(a, r)
+    initial = a.snapshot()["run"]
+    grant = a.handle(command("grant", **base), "owner")
+    assert a.handle(command("input", **base, grant_id=grant["grant_id"], seq=1,
+                            target={"arm_left_elbow_flex.pos": -0.5}), "owner")["accepted"]
+    time.sleep(max(0, grant["expires"] - time.monotonic()) + 0.03)
+    a.tick()
+    assert a.run["status"] == "paused"
+    fresh = physical_live_controls(a, r)
+    current = a.snapshot()["run"]
+    assert current["run_id"] == initial["run_id"]
+    assert current["deadline"] == initial["deadline"]
+    assert current["live_input"]["reference_norm"] == initial["live_input"]["reference_norm"]
+    assert current["live_input"]["corridor_min_norm"] == initial["live_input"]["corridor_min_norm"]
+    assert current["live_input"]["cursor_intent_revision"] == fresh["intent_revision"]
+    assert current["live_input"]["cursor_norm"] == 0.0
+    assert not a.handle(command("input", **base, grant_id=grant["grant_id"], seq=2,
+                                target={"arm_left_elbow_flex.pos": -1.0}), "owner")["accepted"]
+    new_grant = a.handle(command("grant", **fresh), "owner")
+    assert a.handle(command("input", **fresh, grant_id=new_grant["grant_id"], seq=1,
+                            target={"arm_left_elbow_flex.pos": -0.2}), "owner")["accepted"]
+    assert e.task is None and e.worker.is_alive()
+
+
+@pytest.mark.parametrize("before_first_sample", [False, True])
+def test_physical_live_native_watchdog_hold_requires_same_run_resume(
+    physical_live_authority, before_first_sample
+):
+    from tests.robots.test_am1_physical_executor import until
+
+    a, e, host, r = physical_live_authority
+    base = physical_live_controls(a, r)
+    until(lambda: a.snapshot()["evidence"]["active_acknowledged"])
+    initial = a.snapshot()["run"]
+    if not before_first_sample:
+        grant = a.handle(command("grant", **base), "owner")
+        assert a.handle(command("input", **base, grant_id=grant["grant_id"], seq=1,
+                                target={"arm_left_elbow_flex.pos": -0.5}), "owner")["accepted"]
+        until(lambda: host.control.live_snapshot().get("last_input_seq") == 1)
+    # Invoke the production native watchdog against simulated motor IO. Its fresh
+    # measured hold retains sensing/native ACK while revoking the active epoch.
+    with e.mutex:
+        host.control.watchdog_stop(host.robot)
+    until(lambda: e.evidence()["hold_acknowledged"])
+    evidence = e.evidence()
+    assert all(evidence[k] for k in ("feedback", "required_observation", "native_ack"))
+    assert not evidence["active_acknowledged"]
+    a.tick()
+    assert a.run["status"] == "recovering"
+    assert a.run["first_cause"] == "native_active_ack_loss"
+    until(lambda: (a.tick() or a.run["status"] == "paused"))
+    assert a.run["intent"] is None
+    assert not a.handle(command("grant", **base), "owner")["accepted"]
+    assert a.handle(command("release_input", **base), "owner")["accepted"]
+    until(lambda: e.evidence()["pose_aligned"])
+    assert a.handle(command("claim", controller_generation=base["controller_generation"]), "owner")["accepted"]
+    resumed = a.handle(command("resume", **base, expected_intent_revision=a.run["intent_revision"]), "owner")
+    assert resumed["accepted"], resumed
+    until(lambda: (a.tick() or a.run["status"] == "running"))
+    base["intent_revision"] = a.run["intent_revision"]
+    fresh = a.handle(command("grant", **base), "owner")
+    assert a.handle(command("input", **base, grant_id=fresh["grant_id"], seq=2,
+                            target={"arm_left_elbow_flex.pos": -0.2}), "owner")["accepted"]
+    until(lambda: host.control.live_snapshot().get("last_input_seq") == 2)
+    current = a.snapshot()["run"]
+    assert current["run_id"] == initial["run_id"]
+    assert current["native_live_at"] == initial["native_live_at"]
+    assert current["deadline"] == initial["deadline"]
+    assert current["live_input"]["reference_norm"] == initial["live_input"]["reference_norm"]
+    assert current["first_cause"] == "native_active_ack_loss"
+
+
+def test_physical_live_resume_initial_native_transition_does_not_pause(physical_live_authority):
+    from tests.robots.test_am1_physical_executor import until
+
+    a, e, host, r = physical_live_authority
+    snapshot = a.snapshot()
+    base = dict(run_id=r["run_id"], service_incarnation=a.service_incarnation,
+                controller_generation=snapshot["controller"]["controller_generation"],
+                host_incarnation=e.host_incarnation)
+    connected = a.handle(command("connect", **base), "owner")
+    base["connection_generation"] = connected["connection_generation"]
+    assert a.handle(command("release_input", **base), "owner")["accepted"]
+    until(lambda: e.evidence()["pose_aligned"])
+    assert a.handle(command("resume", **base, expected_intent_revision=a.run["intent_revision"]), "owner")["accepted"]
+
+    def observe_initial_transition():
+        # Fence only the simulated worker so Core can inspect the exact held
+        # predecessor ACK immediately after admitting dispatch, before the send.
+        with e.mutex:
+            a.tick()
+            if a.run["status"] != "running":
+                return False
+            evidence = e.evidence()
+            assert evidence["native_ack"] and not evidence["active_acknowledged"]
+            a.tick()
+            assert a.run["status"] == "running"
+            assert a.run["first_cause"] is None
+            return True
+
+    until(observe_initial_transition)
+    until(lambda: e.evidence()["active_acknowledged"])
+    a.tick()
+    assert a.run["status"] == "running"
+
+
+def test_physical_live_resume_cannot_rebase_transition_on_post_dispatch_watchdog(
+    physical_live_authority, monkeypatch
+):
+    from tests.robots.test_am1_physical_executor import until
+
+    a, e, host, r = physical_live_authority
+    snapshot = a.snapshot()
+    base = dict(run_id=r["run_id"], service_incarnation=a.service_incarnation,
+                controller_generation=snapshot["controller"]["controller_generation"],
+                host_incarnation=e.host_incarnation)
+    connected = a.handle(command("connect", **base), "owner")
+    base["connection_generation"] = connected["connection_generation"]
+    assert a.handle(command("release_input", **base), "owner")["accepted"]
+    until(lambda: e.evidence()["pose_aligned"])
+    assert a.handle(command("claim", controller_generation=base["controller_generation"]), "owner")["accepted"]
+    initial = a.snapshot()["run"]
+    real_save, real_dispatch = a._save, e.dispatch
+    admitted_predecessor = []
+
+    def delayed_save():
+        real_save()
+        if a.run["status"] == "running" and a.run["dispatch"] == "dispatching":
+            # A slow durable checkpoint can let the revised measured hold
+            # qualify before the first Resume dispatch, without mocking its ACK.
+            until(lambda: e.evidence()["pose_aligned"])
+
+    def dispatch_then_watchdog(recipe):
+        admitted_predecessor.append(e.evidence()["accepted_host_action"]["epoch"])
+        admitted = real_dispatch(recipe)
+        assert admitted
+        until(lambda: e.evidence()["active_acknowledged"])
+        with e.mutex:
+            host.control.watchdog_stop(host.robot)
+        until(lambda: e.evidence()["hold_acknowledged"])
+        return admitted
+
+    monkeypatch.setattr(a, "_save", delayed_save)
+    monkeypatch.setattr(e, "dispatch", dispatch_then_watchdog)
+    result = a.handle(command("resume", **base, expected_intent_revision=a.run["intent_revision"]), "owner")
+    assert result["accepted"] and result["effect_admitted"]
+    assert e.evidence()["accepted_host_action"]["epoch"] == admitted_predecessor[0] + 2
+    a.tick()
+    assert a.run["status"] == "recovering"
+    assert a.run["first_cause"] == "native_active_ack_loss"
+    assert not a.handle(command("grant", **base, intent_revision=a.run["intent_revision"]), "owner")["accepted"]
+    assert a.run["deadline"] == initial["deadline"]
+    assert a.run["native_live_at"] == initial["native_live_at"]
+
+
+def test_physical_live_progress_is_retained_in_bounded_views_and_terminal(physical_live_authority):
+    import json
+
+    from tests.robots.test_am1_physical_executor import until
+    from tools.am1_session_ipc import RESPONSE_LIMIT, encode, strict_json
+
+    a, e, host, r = physical_live_authority
+    physical_live_controls(a, r)
+    until(lambda: e.advance(0, 0)["progress_s"] > 0.1)
+    a.tick()
+    assert a.run["progress_s"] > 0.1
+    assert a.run["execution"]["profile"] == "LiveLeftElbow"
+    for view in (a.snapshot(),):
+        raw = encode({"id": str(uuid.uuid4()), "result": view})
+        assert len(raw) < RESPONSE_LIMIT
+        run = strict_json(raw)["result"]["run"]
+        assert run["progress_s"] > 0.1
+        assert run["execution"]["profile"] == "LiveLeftElbow"
+        assert run["execution"]["complete"] is False
+    assert a.handle(command("stop", run_id=r["run_id"]), "owner")["accepted"]
+    until(lambda: (a.tick() or a.run["status"] == "stopped"))
+    assert a.run["progress_s"] > 0.1
+    assert a.run["execution"]["profile"] == "LiveLeftElbow"
+    retained = json.loads(a.db.execute("SELECT data FROM state WHERE id=1").fetchone()[0])
+    assert retained["execution"] == a.run["execution"]
+    assert retained["cleanup"] == "physical_readback_verified"
+
+
+@pytest.mark.parametrize("changes", [
+    {"seq": True}, {"target": [0.5]}, {"target": {"arm_right_elbow_flex.pos": -0.5}},
+    {"target": {"arm_left_elbow_flex.pos": -0.5, "arm_right_elbow_flex.pos": 7.0}},
+    {"target": {"arm_left_elbow_flex.pos": True}}, {"intent_revision": 99},
+    {"host_incarnation": str(uuid.uuid4())}, {"valid_until_monotonic_s": 9999999999.0},
+])
+def test_physical_live_refuses_unqualified_target_and_identity(physical_live_authority, changes):
+    a, e, host, r = physical_live_authority
+    base = physical_live_controls(a, r)
+    grant = a.handle(command("grant", **base), "owner")
+    frame = command("input", **base, grant_id=grant["grant_id"], seq=1,
+                    target={"arm_left_elbow_flex.pos": -0.5})
+    frame.update(changes)
+    assert not a.handle(frame, "owner")["accepted"]
+    assert a.run["intent"] is None
+
+
+def test_physical_live_connect_and_pending_frames_cannot_cross_pause(physical_live_authority):
+    a, e, host, r = physical_live_authority
+    base = physical_live_controls(a, r)
+    connection = a.connection["generation"]
+    stale = dict(base, controller_generation=str(uuid.uuid4()))
+    assert not a.handle(command("connect", **stale), "owner")["accepted"]
+    assert a.connection["generation"] == connection
+    grant = a.handle(command("grant", **base), "owner")
+    assert a.handle(command("pause", run_id=r["run_id"]), "owner")["accepted"]
+    assert not a.handle(command("grant", **base), "owner")["accepted"]
+    assert not a.handle(command("input", **base, grant_id=grant["grant_id"], seq=1,
+                                target={"arm_left_elbow_flex.pos": -0.5}), "owner")["accepted"]
+    assert a.run["status"] == "paused"
+    assert a.run["intent"] is None
+
+def test_physical_live_explicit_recipe_has_bounded_native_lifetime():
+    from examples.alohamini.am1_session_contract import RECIPES
+
+    recipe = RECIPES.get("physical-live-left-elbow")
+    assert recipe is not None, "explicit physical live selection is missing"
+    assert recipe.mode == "interactive"
+    assert recipe.seed is None
+    assert recipe.trajectory_s is None
+    assert recipe.live_s == 90.0
+
+
+def test_physical_live_release_requires_new_qualified_resume(physical_live_authority):
+    a, e, host, r = physical_live_authority
+    base = physical_live_controls(a, r)
+    grant = a.handle(command("grant", **base), "owner")
+    assert a.handle(command("input", **base, grant_id=grant["grant_id"], seq=1,
+                            target={"arm_left_elbow_flex.pos": -0.5}), "owner")["accepted"]
+    assert a.handle(command("release_input", **base), "owner")["accepted"]
+    assert a.run["status"] == "paused"
+    assert a.run["intent"] is None
+    assert not a.handle(command("grant", **base), "owner")["accepted"]
+    assert not a.handle(command("release_input", **base, target={}), "owner")["accepted"]
+
+
+@pytest.mark.parametrize("late_op", ["connect", "release", "handoff", "release_input", "resume", "grant", "input"])
+def test_physical_live_pending_stop_fences_late_controls_and_allows_next_start(physical_live_authority, late_op):
+    from tests.robots.test_am1_physical_executor import until
+
+    a, e, host, first = physical_live_authority
+    base = physical_live_controls(a, first)
+    grant = a.handle(command("grant", **base), "owner")
+    frame = command(late_op, **base)
+    if late_op == "handoff":
+        frame["target_device_id"] = "replacement-controller"
+    elif late_op == "resume":
+        frame["expected_intent_revision"] = a.run["intent_revision"]
+    elif late_op == "input":
+        frame.update(grant_id=grant["grant_id"], seq=1, target={"arm_left_elbow_flex.pos": -0.5})
+    # This existing test-only adapter RLock makes the cleanup scheduling window deterministic.
+    # No physical process/device is involved; the worker uses simulated measured device IO.
+    with e.mutex:
+        stopped = a.handle(command("stop", run_id=first["run_id"]), "owner")
+        assert stopped["accepted"] and stopped["status"] == "finishing"
+        revision = a.run["intent_revision"]
+        generation = a.controller["generation"]
+        renewed = a.handle(command("claim", controller_generation=generation), "owner")
+        assert renewed["accepted"]
+        assert a.run["status"] == "finishing"
+        assert a.run["requested_terminal"] == "stopped"
+        refused = a.handle(frame, "owner")
+        assert not refused["accepted"], refused
+        assert a.run["status"] == "finishing"
+        assert a.run["requested_terminal"] == "stopped"
+        assert a.run["intent_revision"] == revision
+        assert a.controller["generation"] == generation
+        assert e.finish_status == "stopped"
+    until(lambda: (a.tick() or a.run["status"] == "stopped"))
+    until(lambda: not e.worker.is_alive())
+    assert a.run["cleanup"] == "physical_readback_verified"
+    assert a.run["uncertain"] is False
+    assert a.run["physical_result"]["phase"] == "terminal"
+    assert a.run["physical_result"]["run_id"] == first["run_id"]
+    assert a.run["first_cause"] is None
+    assert not a.handle(command("connect", **base), "owner")["accepted"]
+    assert a.run["status"] == "stopped"
+    assert a.handle(command("claim", controller_generation=generation), "owner")["accepted"]
+    next_run = a.handle(command("start", operation_id=str(uuid.uuid4()), recipe="physical-live-left-elbow",
+                                controller_generation=generation), "owner")
+    assert next_run["accepted"], next_run
+    assert next_run["run_id"] != first["run_id"]
+    until(lambda: (a.tick() or a.run["status"] == "paused"))
+    assert a.run["native_live_at"] is not None
+    assert a.run["deadline"] - a.run["native_live_at"] == 90.0
+
+
+@pytest.mark.parametrize("cached_native_fault", [None, "retained native motor/feedback fault"])
+def test_physical_live_expired_presence_claim_and_pause_preserve_finishing(physical_live_authority, cached_native_fault):
+    import time
+
+    from tests.robots.test_am1_physical_executor import until
+
+    a, e, host, first = physical_live_authority
+    physical_live_controls(a, first)
+    with e.mutex:
+        # Exercise the authority's existing cached-native-fault contract with simulated IO.
+        e._fault = cached_native_fault
+        stopped = a.handle(command("stop", run_id=first["run_id"]), "owner")
+        assert stopped["accepted"] and stopped["status"] == "finishing"
+        revision = a.run["intent_revision"]
+        old_generation = a.controller["generation"]
+        time.sleep(max(0, a.controller["expires"] - a.clock()) + 0.02)
+        a.tick()
+        assert a.controller is None
+        assert a.run["status"] == "finishing"
+        assert a.run["requested_terminal"] == "stopped"
+        assert a.run["first_cause"] == cached_native_fault
+        claimed = a.handle(command("claim"), "replacement-controller")
+        assert claimed["accepted"]
+        assert claimed["controller_generation"] != old_generation
+        assert a.controller["device_id"] == "replacement-controller"
+        assert a.run["status"] == "finishing"
+        assert a.run["intent_revision"] == revision
+        assert not a.handle(command("pause", run_id=first["run_id"]), "replacement-controller")["accepted"]
+        assert a.run["status"] == "finishing"
+        assert a.run["requested_terminal"] == "stopped"
+        assert a.run["first_cause"] == cached_native_fault
+        assert e.finish_status == "stopped"
+        assert e._fault == cached_native_fault
+    until(lambda: (a.tick() or a.run["status"] == "stopped"))
+    until(lambda: not e.worker.is_alive())
+    assert a.run["cleanup"] == "physical_readback_verified"
+    assert a.run["uncertain"] is False
+    assert a.run["physical_result"]["phase"] == "terminal"
+    assert a.run["physical_result"]["run_id"] == first["run_id"]
+    assert a.run["first_cause"] == cached_native_fault
+    assert e._fault == cached_native_fault
