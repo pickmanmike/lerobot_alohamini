@@ -1337,6 +1337,91 @@ def make_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _run_owned_comparison(args: argparse.Namespace, profile: ComparisonProfile) -> int:
+    # Keep admission imports out of the injected comparator and module-import path.
+    from copy import deepcopy
+    from pathlib import Path
+    from uuid import uuid4
+
+    from . import alohamini_host as ownership
+
+    state = Path.home() / ".local/state/am1-session"
+    admission = ownership.AM1PhysicalAdmission(state)
+    run_id, incarnation = str(uuid4()), str(uuid4())
+    retained: dict[str, Any] = {}
+    transport = None
+    result = None
+    primary: BaseException | None = None
+    claimed = False
+
+    def emit(record: dict[str, Any]) -> None:
+        if record.get("phase") in ("cleanup_readback", "cleanup_readback_stationary_qualified", "result"):
+            retained[record["phase"]] = deepcopy(record)
+        _default_emit(record)
+
+    try:
+        admission.claim_run(run_id=run_id, host_incarnation=incarnation, scope="legacy")
+        claimed = True
+        transport = DirectSdkTransport(
+            args.port, motor_id=args.motor_id, baud_rate=args.baud_rate,
+            motion_velocity_raw=profile.motion_velocity_raw,
+        )
+        result = run_comparison(transport, profile=profile, specimen=args.specimen, emit=emit)
+    except BaseException as error:
+        primary = error
+        raise
+    finally:
+        try:
+            if claimed:
+                outcome = retained.get("result")
+                sample = retained.get("cleanup_readback")
+                qualification = retained.get("cleanup_readback_stationary_qualified")
+                errors = list(outcome.get("cleanup_errors", [])) if isinstance(outcome, dict) else [
+                    "Diagnostic terminal cleanup record unavailable"
+                ]
+                closed = transport is not None and getattr(transport, "opened", True) is False
+                verified = bool(
+                    primary is None and type(result) is int and result in (0, 1, 2, 130)
+                    and isinstance(outcome, dict) and outcome.get("cleanup_errors") == []
+                    and isinstance(sample, dict) and sample.get("torque_enable") == 0
+                    and sample.get("goal_velocity_raw") == 0
+                    and isinstance(qualification, dict) and closed and not errors
+                )
+                if not verified and not errors:
+                    errors.append("Diagnostic stopped readback and close were not completely verified")
+                cause = f"{type(primary).__name__}: {primary}" if primary is not None else (
+                    None if isinstance(outcome, dict) and outcome.get("status") == "pass"
+                    else (outcome.get("reason") or outcome.get("status")) if isinstance(outcome, dict)
+                    else "Diagnostic terminal result unavailable"
+                )
+                receipt = {
+                    "version": 1, "run_id": run_id, "host_incarnation": incarnation,
+                    "cleanup": "physical_readback_verified" if verified else "physical_cleanup_unknown",
+                    "uncertain": not verified, "first_cause": cause,
+                    "cleanup_errors": errors, "diagnostic_result": outcome,
+                    "readback": {
+                        "verified": verified, "buses_closed": closed, "diagnostic_motor_id": MOTOR_ID,
+                        "sample": sample, "stationary_qualification": qualification,
+                    },
+                    "completed_at_monotonic_s": time.monotonic(),
+                    "provenance": "standalone-lift-diagnostic/actual-sdk-readback",
+                }
+                ownership._atomic_private_json(state / f"physical-cleanup-{incarnation}.json", receipt)
+                if verified:
+                    if not admission.finish_run(receipt):
+                        raise RuntimeError("Diagnostic durable owner could not finish; reconciliation required")
+                else:
+                    ownership._atomic_private_json(state / "cleanup-uncertain.json", receipt)
+                    if result == 0:
+                        result = 1
+        except BaseException as receipt_error:
+            if primary is None:
+                raise
+            primary.add_note(f"Diagnostic cleanup receipt also failed: {type(receipt_error).__name__}: {receipt_error}")
+        finally:
+            admission.close()
+    return result
+
 def main(argv: list[str] | None = None) -> int:
     parser = make_parser()
     args = parser.parse_args(argv)
@@ -1360,13 +1445,7 @@ def main(argv: list[str] | None = None) -> int:
         "Keep the platform mechanically unloaded, the servo securely mounted, and power removal accessible.",
         flush=True,
     )
-    transport = DirectSdkTransport(
-        args.port,
-        motor_id=args.motor_id,
-        baud_rate=args.baud_rate,
-        motion_velocity_raw=selected_profile.motion_velocity_raw,
-    )
-    result = run_comparison(transport, profile=selected_profile, specimen=args.specimen)
+    result = _run_owned_comparison(args, selected_profile)
     if result == 0:
         print("LIFT_MOTOR_FEEDBACK_PASS", flush=True)
     else:

@@ -13,6 +13,7 @@ class AM1SessionTransport {
     this.control=false; this.controllerGeneration=null; this.connection=null; this.held=new Set();
     this.pending=new Map(); this.seq=0; this.socket=null; this.inputBusy=false; this.epoch=0; this.intent=0;
     this.reportingError=null;
+    this.reconnectTimer=null;this.detached=false;this.initialization=0;
   }
   clear(reason="disconnected") {
     this.epoch++; this.intent++; this.held.clear(); this.connection=null; this.controllerGeneration=null; this.seq=0;
@@ -23,9 +24,10 @@ class AM1SessionTransport {
     this.reportingError=value;this.connected=false;this.clear(value.reason);
     this.render(this,value.reason);
   }
-  async post(path,body) {
+  async post(path,body,epoch) {
     const response=await fetch(`/api/${path}`,{method:"POST",headers:{"Content-Type":"application/json","X-AM1-CSRF":this.csrf || ""},body:JSON.stringify(body)});
     const result=await response.json();
+    if(epoch!==undefined && (this.detached || epoch!==this.epoch))return {status:"superseded"};
     if(result.status==="reporting_error") {
       this.reportingFailure(result);
       if(!response.ok) {const error=Error(result.reason);error.reportingError=result;throw error;}
@@ -35,17 +37,50 @@ class AM1SessionTransport {
     return result;
   }
   async enroll(code) {await this.post("enroll",{code}); await this.initialize();}
+  cancelReconnect() {
+    if(this.reconnectTimer!==null)clearTimeout(this.reconnectTimer);
+    this.reconnectTimer=null;
+  }
+  reconnect(delay) {
+    if(this.detached || this.reconnectTimer!==null)return;
+    this.reconnectTimer=setTimeout(()=>{this.reconnectTimer=null;return this.initialize();},delay);
+  }
+  detach() {
+    this.detached=true;this.initialization++;this.cancelReconnect();this.connected=false;this.clear("Page detached");
+    const socket=this.socket;this.socket=null;socket?.close();
+  }
+  restore() {
+    if(!this.detached)return;
+    this.detached=false;return this.initialize();
+  }
   async initialize() {
-    const response=await fetch("/api/session");
-    if(!response.ok) {this.render(this,"Enter a local one-use pairing code.");return;}
-    const device=await response.json(); this.csrf=device.csrf; this.device=device.device_id;this.control=device.control;this.optionalVideo=device.optional_p1_video;
-    await this.attach();
+    if(this.detached)return;
+    const initialization=++this.initialization;this.cancelReconnect();this.connected=false;this.clear();
+    const socket=this.socket;this.socket=null;socket?.close();
+    try {
+      const response=await fetch("/api/session");
+      if(this.detached || initialization!==this.initialization)return;
+      if(!response.ok) {
+        if(response.status===401) {this.device=null;this.csrf=null;this.control=false;this.optionalVideo=false;this.render(this,"Enter a local one-use pairing code.");return;}
+        throw Error(`Session unavailable (HTTP ${response.status}); reconnecting to current state.`);
+      }
+      const device=await response.json();
+      if(this.detached || initialization!==this.initialization)return;
+      this.csrf=device.csrf;this.device=device.device_id;this.control=device.control;this.optionalVideo=device.optional_p1_video;
+      await this.attach();
+    } catch(error) {
+      if(this.detached || initialization!==this.initialization)return;
+      this.connected=false;this.clear();this.render(this,`Session unavailable: ${error.message}`);this.reconnect(500);
+    }
   }
   async attach() {
-    this.clear();
-    const epoch=this.epoch;
+    if(this.detached)return;
+    this.cancelReconnect();this.connected=false;this.clear();
+    const epoch=this.epoch,initialization=this.initialization;
     try {
-      const attached=await this.post("attach",{});
+      const attached=await this.post("attach",{},epoch);
+      if(this.detached || initialization!==this.initialization)return;
+      if(attached.status==="reporting_error") {this.reconnect(500);return;}
       if(epoch!==this.epoch)return;
       this.snapshot=attached.snapshot;
       const ws=this.socket=new WebSocket(`${location.origin.replace("https:","wss:")}/api/ws`);
@@ -60,7 +95,7 @@ class AM1SessionTransport {
             this.intent++;this.held.clear();
           }
           this.snapshot=value.snapshot;
-          if(value.revision) {ws.send(JSON.stringify({ack:value.revision}));this.connected=true;}
+          if(value.revision) {ws.send(JSON.stringify({ack:value.revision}));this.connected=true;this.cancelReconnect();}
           const controller=this.snapshot.controller;
           if(this.controllerGeneration && (controller?.device_id!==this.device || controller.controller_generation!==this.controllerGeneration))
             this.clear("Controller generation changed");
@@ -77,10 +112,10 @@ class AM1SessionTransport {
       ws.onclose=()=> {
         if(this.socket!==ws)return;
         this.connected=false;this.clear();this.render(this,"Disconnected; controls cleared. Reconnecting to current state.");
-        setTimeout(()=>this.attach().catch(()=>{}),300);
+        this.reconnect(300);
       };
       ws.onerror=()=>ws.close();
-    } catch(error) {this.connected=false;this.render(this,error.message);setTimeout(()=>this.attach().catch(()=>{}),500);}
+    } catch(error) {if(this.detached || initialization!==this.initialization || epoch!==this.epoch && !error.reportingError)return;this.connected=false;this.render(this,`Session unavailable: ${error.message}`);this.reconnect(500);}
   }
   command(command) {
     if(!this.connected || this.socket?.readyState!==WebSocket.OPEN || this.pending.size>=8)return Promise.reject(Error("Current connected snapshot required"));
@@ -337,7 +372,8 @@ globalThis.AM1RemoteInitialize=function() {
   }
   window.addEventListener("blur",()=>transport.releaseInput());
   document.addEventListener("visibilitychange",()=>{if(document.hidden)transport.releaseInput();});
-  window.addEventListener("pagehide",()=>{transport.held.clear();transport.socket?.close();});
+  window.addEventListener("pagehide",()=>transport.detach());
+  window.addEventListener("pageshow",event=>{if(event.persisted)transport.restore();});
   document.querySelector('[data-help="touch"]').onclick=()=>{const help=document.querySelector("#control-help");help.hidden=!help.hidden;};
   setInterval(()=>transport.input(),100);
   setInterval(()=>{if(transport.connected&&transport.controllerGeneration)transport.renew().catch(()=>{});},500);

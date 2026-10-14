@@ -72,7 +72,7 @@ def test_complete_native_bulk_never_obscures_shared_essential_status(bulk):
                 }
             )
         )
-        < 20000
+        <= ipc.RESPONSE_LIMIT
     )
     assert view["run"]["run_id"] == original["run_id"]
     assert view["run"]["status"] == original["status"] and view["run"]["uncertain"] is False

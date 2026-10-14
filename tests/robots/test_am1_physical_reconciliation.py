@@ -172,32 +172,27 @@ def test_snapshot_references_full_actual_reconciliation_within_existing_ipc_limi
         original = copy.deepcopy(authority.run)
         durable = authority.db.execute("SELECT data FROM state WHERE id=1").fetchone()[0]
         snapshot = authority.snapshot()
-        wire = encode({"id": str(uuid.uuid4()), "result": snapshot}, RESPONSE_LIMIT)
-        reference = snapshot["run"]["reconciliation"]
+        wire = encode(
+            {
+                "id": str(uuid.uuid4()),
+                "result": {"accepted": True, "status": "snapshot", "snapshot": snapshot},
+            },
+            RESPONSE_LIMIT,
+        )
         assert len(wire) <= RESPONSE_LIMIT
-        assert reference["kind"] == "am1-actual-stopped-reconciliation"
-        assert reference["presentation_version"] == 1
-        assert reference["evidence_reference"] == {
-            "kind": "am1-stopped-reconciliation-reference",
-            "version": 1,
-        }
-        for key in (
-            "run_id",
-            "host_incarnation",
-            "reconciliation_id",
-            "original_terminal_run_sha256",
-            "cleanup",
-            "uncertain",
-            "started_at_monotonic_s",
-            "completed_at_monotonic_s",
-            "acknowledgment",
-        ):
-            assert reference[key] == proof[key]
-        assert reference["proof_sha256"] == proof["acknowledgment"]["proof_sha256"]
-        assert "readback" not in reference and "source" not in reference
+        assert "reconciliation" not in snapshot["run"]
+        reference = snapshot["run"]["details_reference"]
+        assert reference["kind"] == "am1-status-field-reference" and reference["field"] == "run"
+        from tests.robots.test_am1_status_details import resolve
+
+        detailed = resolve(authority, reference)
+        assert detailed == original and detailed["reconciliation"] == proof
+        assert detailed["reconciliation"]["kind"] == "am1-actual-stopped-reconciliation"
+        assert detailed["reconciliation"]["readback"] == proof["readback"]
+        assert detailed["reconciliation"]["source"] == proof["source"]
         assert authority.run == original and authority.run["reconciliation"] == proof
         assert authority.db.execute("SELECT data FROM state WHERE id=1").fetchone()[0] == durable
-        snapshot["run"]["reconciliation"]["acknowledgment"]["validated"] = False
+        detailed["reconciliation"]["acknowledgment"]["validated"] = False
         assert authority.run == original
     finally:
         authority.close()
@@ -230,7 +225,18 @@ def test_snapshot_does_not_project_malformed_reconciliation_as_qualified(tmp_pat
         else:
             proof["completed_at_monotonic_s"] = "not a native acquisition timestamp"
         before = copy.deepcopy(authority.run)
-        assert authority.snapshot()["run"]["reconciliation"] == proof
+        snapshot = authority.snapshot()
+        if executor.source == "protected-physical-provider":
+            from tests.robots.test_am1_status_details import resolve
+            from tools.am1_session_core import _reconciliation_reference
+
+            assert "reconciliation" not in snapshot["run"]
+            detailed = resolve(authority, snapshot["run"]["details_reference"])
+            assert detailed == before and detailed["reconciliation"] == proof
+            assert "presentation_version" not in detailed["reconciliation"]
+            assert _reconciliation_reference(before) == proof
+        else:
+            assert snapshot["run"]["reconciliation"] == proof
         assert authority.run == before and authority.run["run_id"] == run_id
     finally:
         authority.close()

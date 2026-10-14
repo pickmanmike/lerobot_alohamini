@@ -1386,3 +1386,174 @@ def test_selected_startup_reset_preserves_zero_latency_boundary_evidence_truthfu
     assert result["stationary_qualification"]["sample_count"] == 10
     assert result["sample_monotonic_s"] == pytest.approx(0.55)
     assert result["sample_monotonic_s"] <= 0.6
+
+
+def test_direct_cli_refuses_active_owner_before_transport_construction(monkeypatch):
+    from lerobot.robots.alohamini import alohamini_host as host
+
+    def conflict(*args, **kwargs):
+        raise RuntimeError("Another AM1 physical owner is active")
+
+    def must_not_construct(*args, **kwargs):
+        raise AssertionError("diagnostic transport constructed before physical admission")
+
+    monkeypatch.setattr(host, "AM1PhysicalAdmission", conflict)
+    monkeypatch.setattr(feedback, "DirectSdkTransport", must_not_construct)
+    with pytest.raises(RuntimeError, match="physical owner"):
+        feedback.main([])
+
+
+@pytest.mark.parametrize("outcome, expected", [("pass", 0), ("refused", 2), ("error", 1), ("interrupt", 130)])
+def test_direct_cli_retains_claim_through_actual_cleanup_then_releases(monkeypatch, tmp_path, outcome, expected):
+    import json
+    from pathlib import Path
+
+    from lerobot.robots.alohamini import alohamini_host as host
+
+    state = tmp_path / ".local/state/am1-session"
+    state.mkdir(parents=True, mode=0o700)
+    clock = FakeClock()
+    class Transport(FakeTransport):
+        def close(self):
+            super().close()
+            self.opened = False
+
+    transport = Transport(clock=clock)
+    closed = []
+    admission_type = host.AM1PhysicalAdmission
+
+    class Admission(admission_type):
+        def __init__(self, directory):
+            assert Path(directory) == state
+            self.directory = state
+            self.canonical = self.serial = None
+
+        def close(self):
+            assert transport.closed
+            closed.append(True)
+            super().close()
+
+    def construct(*args, **kwargs):
+        record = json.loads((state / "physical-in-progress.json").read_text())
+        assert record["scope"] == "legacy"
+        return transport
+
+    def authorize(_prompt):
+        assert (state / "physical-in-progress.json").exists()
+        if outcome == "error":
+            raise EOFError("original input loss")
+        if outcome == "interrupt":
+            raise KeyboardInterrupt()
+        return "ROTATE" if outcome == "pass" else "rotate"
+
+    run = feedback.run_comparison
+    monkeypatch.setattr(host.Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr(host, "AM1PhysicalAdmission", Admission)
+    monkeypatch.setattr(feedback, "DirectSdkTransport", construct)
+    monkeypatch.setattr(feedback, "run_comparison", lambda transport, **kw: run(
+        transport, input_fn=authorize, monotonic=clock.monotonic, sleep=clock.sleep, **kw,
+    ))
+    assert feedback.main([]) == expected
+    assert transport.closed and closed == [True]
+    assert not (state / "physical-in-progress.json").exists()
+    receipts = list(state.glob("physical-cleanup-*.json"))
+    assert len(receipts) == 1
+    receipt = json.loads(receipts[0].read_text())
+    assert receipt["cleanup"] == "physical_readback_verified"
+    assert receipt["uncertain"] is False
+    assert receipt["readback"]["buses_closed"] is True
+    assert receipt["readback"]["diagnostic_motor_id"] == 11
+    if outcome == "error":
+        assert receipt["diagnostic_result"]["reason"] == "original input loss"
+
+
+@pytest.mark.parametrize("failure", ["readback", "close", "constructor", "missing_proof"])
+def test_direct_cli_unknown_cleanup_keeps_durable_claim(monkeypatch, tmp_path, failure):
+    import json
+    from pathlib import Path
+
+    from lerobot.robots.alohamini import alohamini_host as host
+
+    state = tmp_path / ".local/state/am1-session"
+    state.mkdir(parents=True, mode=0o700)
+    clock = FakeClock()
+    admission_type = host.AM1PhysicalAdmission
+
+    class Admission(admission_type):
+        def __init__(self, directory):
+            assert Path(directory) == state
+            self.directory = state
+            self.canonical = self.serial = None
+
+    class Transport(FakeTransport):
+        fail_feedback = False
+
+        def read_group(self, start, length, **kwargs):
+            if self.fail_feedback and failure == "readback":
+                raise feedback.TransportRefusal("actual cleanup read loss", {})
+            return super().read_group(start, length, **kwargs)
+
+        def close(self):
+            super().close()
+            self.opened = False
+            if failure == "close":
+                raise RuntimeError("actual close failure")
+
+    transport = Transport(clock=clock)
+
+    def construct(*args, **kwargs):
+        assert (state / "physical-in-progress.json").exists()
+        if failure == "constructor":
+            raise RuntimeError("transport initialization failed")
+        return transport
+
+    def authorize(_prompt):
+        transport.fail_feedback = True
+        return "rotate"
+
+    run = feedback.run_comparison
+    monkeypatch.setattr(host.Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr(host, "AM1PhysicalAdmission", Admission)
+    monkeypatch.setattr(feedback, "DirectSdkTransport", construct)
+    monkeypatch.setattr(feedback, "run_comparison", lambda transport, **kw: 0 if failure == "missing_proof" else run(
+        transport, input_fn=authorize, monotonic=clock.monotonic, sleep=clock.sleep, **kw,
+    ))
+    if failure == "constructor":
+        with pytest.raises(RuntimeError, match="initialization failed"):
+            feedback.main([])
+    else:
+        assert feedback.main([]) != 0
+    marker = json.loads((state / "physical-in-progress.json").read_text())
+    receipt = json.loads((state / "cleanup-uncertain.json").read_text())
+    assert receipt["run_id"] == marker["run_id"]
+    assert receipt["host_incarnation"] == marker["host_incarnation"]
+    assert receipt["cleanup"] == "physical_cleanup_unknown"
+    assert receipt["uncertain"] is True
+
+@pytest.mark.skipif(__import__("os").name == "nt", reason="Actual AM1 physical arbitration requires native Pi flock")
+@pytest.mark.parametrize("contender", ["active", "serial", "physical-in-progress", "cleanup-uncertain"])
+def test_direct_cli_actual_admission_blocks_conflicts_before_transport(monkeypatch, tmp_path, contender):
+    from lerobot.robots.alohamini import alohamini_host as host
+
+    state = tmp_path / ".local/state/am1-session"
+    state.mkdir(parents=True, mode=0o700)
+    owner = None
+    if contender in ("active", "serial"):
+        owner = host.AM1PhysicalAdmission(state)
+        if contender == "serial":
+            owner.canonical.close()
+            owner.canonical = None
+    else:
+        (state / (contender + ".json")).write_text("{}", encoding="utf-8")
+
+    def must_not_construct(*args, **kwargs):
+        raise AssertionError("diagnostic touched transport with a conflicting physical owner")
+
+    monkeypatch.setattr(host.Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr(feedback, "DirectSdkTransport", must_not_construct)
+    try:
+        with pytest.raises(RuntimeError, match="owner|reconciliation"):
+            feedback.main([])
+    finally:
+        if owner is not None:
+            owner.close()
