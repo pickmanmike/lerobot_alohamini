@@ -376,11 +376,28 @@ class LeftElbowResponseCharacterizeInput(ScriptedLeaderInput):
         raise ValueError(f"signed {label} acquisition window unavailable")
 
     def _rising_current_window(self, samples):
+        native_continuity = getattr(self.definition, "intercycle_hold_admission_rule", None) is not None
+        native_keys = ("native_observation_id", "native_epoch", "native_intent_revision")
+        def original_marker(row):
+            return (all(type(row.get(k)) is int and row[k] >= 0 for k in native_keys)
+                    and all(self._number(row.get(k)) for k in ("at", "position_at")))
         for start, first in enumerate(samples):
+            if native_continuity and not original_marker(first):
+                continue
             chosen, raw = [first], [first["raw"]]
             previous = first
             for row in samples[start + 1:]:
                 raw.append(row["raw"])
+                if native_continuity and (
+                    not original_marker(row)
+                    or row["native_observation_id"] != previous["native_observation_id"] + 1
+                    or any(row[k] != first[k] for k in ("native_epoch", "native_intent_revision"))
+                    or any(row[k] <= previous[k] for k in ("at", "position_at"))
+                ):
+                    # A sparse client view cannot prove that current kept rising
+                    # through omitted Native acquisitions. The sole motor owner's
+                    # independent current/thermal/status guards remain active.
+                    break
                 if (
                     row["goal_raw"] != first["goal_raw"] or max(raw) - min(raw) > self._noise
                     or row["current_ma"] < previous["current_ma"]
@@ -488,6 +505,9 @@ class LeftElbowResponseCharacterizeInput(ScriptedLeaderInput):
             "position_started": position["read_started_at_monotonic_s"],
             "current_ma": abs(current["ma"]), "goal_raw": action["expected_goal_raw"],
         }
+        if getattr(self.definition, "intercycle_hold_admission_rule", None) is not None:
+            row.update(native_observation_id=feedback["observation_id"], native_epoch=feedback["epoch"],
+                       native_intent_revision=feedback["intent_revision"])
         phase_key = (context["cycle"], context["phase"])
         samples = self._phase_samples.setdefault(phase_key, [])
         if samples and row["at"] <= samples[-1]["at"]:

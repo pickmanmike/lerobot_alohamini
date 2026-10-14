@@ -472,13 +472,15 @@ def negative_hold_provider(definition=None):
     )
 
 
-def run_negative_hold(p, feed, *, stop=58, start_sequence=0, clock_offset=0, mutate=None, skip_consumption=False, ipc_delay=0, skip_first_baseline=False):
+def run_negative_hold(p, feed, *, stop=58, start_sequence=0, clock_offset=0, mutate=None, skip_consumption=False, ipc_delay=0, skip_first_baseline=False, skip_final_decline=False):
     p.admit(clock_offset + start_sequence/30)
     for sequence in range(start_sequence+1, start_sequence+1901):
         now = clock_offset+sequence/30
         positions, item = feed.get(now-ipc_delay, sequence)
         if mutate is not None:
             mutate(item)
+        if skip_final_decline and item["context"]["cycle"] == 2 and item["context"]["phase"] in {"origin","final"} and sequence % 8 == 5:
+            continue
         if skip_first_baseline and sequence == start_sequence+1:
             continue
         if skip_consumption and item["context"]["phase"] == "intercycle_hold" and sequence % 4 == 1:
@@ -669,3 +671,112 @@ def test_negative_v3_completed_two_cycles_preserve_distinct_delayed_owner_captur
         else:
             item["admission_proof"]["qualified_at_monotonic_s"] = item["anchor_proof"]["captured_at_monotonic_s"]+.001
         assert p.definition.completion_expectation(altered) is None
+
+
+
+def test_v3_actual12_sparse_original_current_window_cannot_assert_continuous_rise():
+    p = negative_hold_provider()
+    p._noise = 0
+    # Genuine source rows from run7408da64's original hash23374500...877965.
+    # This reproduces a sparse detector candidate, not the unretained complete
+    # sequence of every Provider collect. Native2143 contains a current decline.
+    facts = [(2138,30482.814118203,30482.809158487,8),(2139,30482.848070456,30482.842198426,8),
+             (2140,30482.884068633,30482.878182066,9),(2141,30482.915068742,30482.909188583,10),
+             (2144,30483.016072929,30483.010136325,11)]
+    samples = [dict(at=at,position_at=position_at,raw=2371,current_ma=current*6.5,goal_raw=2405,
+        native_observation_id=oid,native_epoch=4,native_intent_revision=0) for oid,at,position_at,current in facts]
+    assert p._rising_current_window(samples) is None
+
+
+@pytest.mark.parametrize("recovery", [False,True])
+def test_v3_composed_nominal_and_recovery_finish_with_sparse_native_hold_jitter(recovery):
+    p = negative_hold_provider()
+    original = dict(p.origin)
+    feed = NegativeHoldFeedback(p,outward=100)
+    if recovery:
+        sequence,now,positions,_ = run_negative_hold(p,feed,stop=27.2)
+        reference = feed.copy(p._measured_origin_proof)
+        p.freeze();feed.recover()
+        p.prepare_rejoin(now+1,positions,sequence+1,now+.999)
+        p.admit(now+1)
+        index,at = sequence,now+1
+        while p._rejoin is not None:
+            index+=1;at+=.1
+            positions,item = feed.get(at,index)
+            item["action"].update(write_started_at_monotonic_s=at-.102,write_completed_at_monotonic_s=at-.1)
+            p.advance(at,positions,index,selected_feedback=item)
+            assert p.elapsed_s == 27.2
+            assert index < sequence+100
+        assert p._measured_origin_proof == reference
+        start_sequence,offset = index,at-index/30
+    else:
+        start_sequence,offset = 0,0
+    def jitter(item):
+        if item["context"]["cycle"] == 2 and item["context"]["phase"] in {"origin","final"}:
+            raw = (8,8,9,10,11,8,11,9)[item["observation_id"]%8]
+            item["current"].update(raw=raw,ma=raw*6.5)
+    run_negative_hold(p,feed,start_sequence=start_sequence,clock_offset=offset,mutate=jitter,skip_final_decline=True)
+    assert p.complete and p.elapsed_s == 58 and p.origin == original and p._adverse_reason is None
+    outcome=p.positive_control
+    assert outcome["program_completed"] and outcome["coarse_functional_pass"] is False
+    execution=dict(original_seed=original,progress_s=58,cycles_completed=2,returns_qualified=0,positive_control=outcome)
+    assert p.definition.completion_expectation(execution) == (58,2,0)
+
+
+
+@pytest.mark.parametrize("change", [None,"gap","epoch","intent","duplicate","reverse","missing","bool","clock_duplicate","clock_reverse"])
+def test_v3_rising_current_inference_requires_original_contiguous_native_acquisitions(change):
+    p=negative_hold_provider();p._noise=0
+    rows=[dict(at=i*.1,position_at=i*.1,raw=2371,goal_raw=2405,current_ma=(8+i)*6.5,
+        native_observation_id=100+i,native_epoch=4,native_intent_revision=0) for i in range(4)]
+    if change=="gap":rows[2]["native_observation_id"]+=2
+    elif change=="epoch":rows[2]["native_epoch"]+=2
+    elif change=="intent":rows[2]["native_intent_revision"]+=1
+    elif change=="duplicate":rows[2]["native_observation_id"]=rows[1]["native_observation_id"]
+    elif change=="reverse":rows[2]["native_observation_id"]=99
+    elif change=="missing":rows[2].pop("native_observation_id")
+    elif change=="bool":rows[2]["native_observation_id"]=True
+    elif change=="clock_duplicate":rows[2]["at"]=rows[1]["at"]
+    elif change=="clock_reverse":rows[2]["position_at"]=rows[1]["position_at"]-.001
+    assert (p._rising_current_window(rows) is not None) is (change is None)
+
+
+def test_old_v2_rising_current_diagnostic_keeps_its_retained_sparse_view_behavior():
+    from examples.alohamini import am1_session_contract as contract
+    p=negative_hold_provider(contract.LEFT_ELBOW_COARSE_BENCH_V2);p._noise=0
+    rows=[dict(at=i*.1,position_at=i*.1,raw=2371,goal_raw=2405,current_ma=(8+i)*6.5) for i in range(4)]
+    assert p._rising_current_window(rows) is not None
+
+
+@pytest.mark.parametrize("invalid", [None,True,-1])
+def test_v3_missing_or_corrupt_native_identity_still_refuses_the_feedback_contract(invalid):
+    p=negative_hold_provider();p.admit(0);feed=NegativeHoldFeedback(p)
+    positions,item=feed.get(.1,1)
+    item["observation_id"]=invalid
+    with pytest.raises(ValueError,match="ACK counters"):
+        p.advance(.1,positions,1,selected_feedback=item)
+    assert p.elapsed_s==0 and not p.complete
+
+
+def test_v3_whole_composed_provider_still_faults_on_genuine_contiguous_current_rise():
+    p=negative_hold_provider();feed=NegativeHoldFeedback(p,outward=100)
+    index=[0]
+    def rise(item):
+        if item["context"]["cycle"]==2 and item["context"]["phase"]=="origin":
+            index[0]+=1
+            raw=8+min(3,(index[0]-1)//3)
+            item["current"].update(raw=raw,ma=raw*6.5)
+    with pytest.raises(ValueError,match="sustained rising current"):
+        run_negative_hold(p,feed,mutate=rise)
+    assert not p.complete and p._adverse_reason is not None
+
+
+
+def test_v3_sparse_native_view_still_rejects_the_unchanged_sampled_current_cap():
+    p=negative_hold_provider();p.admit(0);feed=NegativeHoldFeedback(p)
+    positions,item=feed.get(.1,1)
+    item["observation_id"] = 100
+    item["current"].update(raw=24,ma=156)
+    with pytest.raises(ValueError,match="150 mA"):
+        p.advance(.1,positions,100,selected_feedback=item)
+    assert p.elapsed_s==0 and not p.complete
