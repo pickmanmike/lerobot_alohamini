@@ -104,9 +104,26 @@ def activation(monkeypatch):
     )
     state = SimpleNamespace(robot=robot, events=events, home_change=None, home_calls=0, clock=clock)
 
+    def case_time(): return clock.now
+
+    # Lift IO is replaced here; retain the original-slot scheduler interface.
     class Operation:
         def __init__(self, source):
             self.lift = source.lift
+            self.failure = None
+            self.last_record = {"sample_monotonic_s": case_time()}
+            self.temperature = SimpleNamespace(
+                SLOT_S=.1, _origin_ns=round(case_time() * 1e9), _last_slot=0,
+                assert_fresh=lambda now: None,
+            )
+
+        def raise_if_faulted(self):
+            if self.failure is not None:
+                raise self.failure
+
+        def poll(self):
+            self.last_record = {"sample_monotonic_s": case_time()}
+            self.temperature._last_slot = (round(case_time() * 1e9) - self.temperature._origin_ns) // 100_000_000
 
         def start(self):
             state.home_calls += 1
@@ -114,6 +131,7 @@ def activation(monkeypatch):
             robot.left_bus.write("Torque_Enable", "lift_axis", 1, normalize=False)
             if state.home_change is not None:
                 state.home_change(robot)
+            self.poll()
             return "home-result"
 
         def cleanup_readback(self):
@@ -414,3 +432,157 @@ def test_refused_activation_restores_actual_integral_trial_only_after_torque_off
     assert not energizing(case.events) and not goals(case.events) and case.home_calls == 0
     assert robot.left_bus.registers[("I_Coefficient", name)] == 0
     assert json.loads(snapshot.read_text(encoding="utf-8"))["status"] == "restored"
+
+
+def protected_endpoint_case(case, monkeypatch, recipe="physical-live-right-elbow"):
+    """Installed Packet10 endpoint; fake registers and clocks, no physical IO."""
+    from uuid import uuid4
+    from examples.alohamini.am1_session_contract import LIVE_ELBOW_SPECS
+    robot = case.robot
+    robot.config.no_follower = False
+    spec = LIVE_ELBOW_SPECS[recipe]
+    robot._am1_visible_control_binding = {"run_id": str(uuid4()), "host_incarnation": str(uuid4()), "recipe": recipe}
+    selected_bus = getattr(robot, spec.side + "_bus")
+    robot._am1_visible_control_evidence = SimpleNamespace(
+        live_spec=spec, motor=spec.joint.removesuffix(".pos"), position=spec.joint,
+        _bus=lambda robot: selected_bus, verify_visible_active=lambda robot: None,
+        emit=lambda row: case.events.append(("live_evidence", row)),
+    )
+    for bus in (robot.left_bus, robot.right_bus):
+        bus.apply_drive_mode = False
+        bus.model_resolution_table = {"sts3215": 4096}
+        bus._id_to_name = lambda ident, source=bus: next(n for n, m in source.motors.items() if m.id == ident)
+        bus._normalize = lambda values, source=bus: owner.FeetechMotorsBus._normalize(source, values)
+        bus._id_to_model = lambda ident: "sts3215"
+        bus.sync_read = lambda reg, names, normalize=False, num_retry=0, source=bus: {
+            name: source.read(reg, name, normalize=normalize, num_retry=num_retry) for name in names}
+    name = "arm_left_shoulder_lift"
+    robot.left_bus.calibration[name] = MotorCalibration(2, 0, 515, 848, 3223)
+    for bus in (robot.left_bus, robot.right_bus):
+        for motor in bus.motors:
+            bus.registers.update({(reg, motor): value for reg, value in (
+                ("ID", bus.motors[motor].id), ("Model_Number", 777),
+                ("Firmware_Major_Version", 3), ("Firmware_Minor_Version", 10),
+                ("Operating_Mode", 0), ("Phase", 12), ("CW_Dead_Zone", 1), ("CCW_Dead_Zone", 1),
+                ("P_Coefficient", 16), ("I_Coefficient", 0), ("D_Coefficient", 32),
+                ("Present_Current", 0), ("Status", 0), ("Present_Temperature", 35),
+                ("Present_Velocity", 0), ("Moving", 0), ("Present_Voltage", 118),
+                ("Min_Voltage_Limit", 40), ("Max_Voltage_Limit", 140), ("Max_Temperature_Limit", 70),
+            )})
+    robot.left_bus.registers.update({(reg, name): value for reg, value in (
+        ("Min_Position_Limit", 848), ("Max_Position_Limit", 3223), ("Homing_Offset", 515),
+        ("Present_Position", 3224), ("Goal_Position", 3224),
+    )})
+    monkeypatch.setattr(owner.time, "sleep", lambda seconds: setattr(case.clock, "now", case.clock.now + seconds))
+    # This fixture replaces lift IO; dedicated startup thermal tests retain real lift coverage.
+    robot._refresh_am1_startup_lift_feedback = lambda: None
+    return robot
+
+
+@pytest.mark.parametrize("recipe", ["physical-live-left-elbow", "physical-live-right-elbow"])
+@pytest.mark.parametrize("home", [False, True])
+def test_protected_live_endpoint_seeds_only_representable_goal_and_freezes_acknowledged_map(activation, monkeypatch, recipe, home):
+    robot = protected_endpoint_case(activation, monkeypatch, recipe)
+    robot.activate_motors(home_lift=home)
+    shoulder_goals = [row for row in goals(activation.events) if row[3] == "arm_left_shoulder_lift"]
+    assert [row[4] for row in shoulder_goals] == [3223]
+    assert robot.left_bus.registers["Present_Position", "arm_left_shoulder_lift"] == 3224
+    proof = robot._am1_live_endpoint_evidence
+    assert {row["phase"] for row in proof} == {"before_home", "after_home"}
+    assert all(len(row["samples"]) >= 9 and row["window_s"] >= .4 and len(row["temperature_slots"]) == 5 for row in proof)
+    commands = robot.am1_live_arm_commands(dict(robot._am1_visible_control_binding))
+    assert commands["arm_left_shoulder_lift.pos"] == 100
+    assert len(commands) == 12
+    first_enable = next(i for i, row in enumerate(activation.events) if row in energizing(activation.events) and row[3].startswith("arm_"))
+    before = activation.events[:first_enable]
+    assert len([row for row in before if row[0] == "read" and row[2] == "Goal_Position" and row[3].startswith("arm_")]) >= 12
+
+
+@pytest.mark.parametrize("register,value", [("Present_Current", 24), ("Status", 1), ("Present_Temperature", 60), ("Present_Velocity", 1), ("Moving", 1), ("Phase", 13), ("CW_Dead_Zone", 2), ("ID", 3), ("Model_Number", 1), ("I_Coefficient", 1)])
+def test_protected_live_endpoint_health_settings_refuses_before_home_or_any_arm_goal(activation, monkeypatch, register, value):
+    robot = protected_endpoint_case(activation, monkeypatch)
+    robot.left_bus.registers[register, "arm_left_shoulder_lift"] = value
+    with pytest.raises(RuntimeError, match="activation failed"):
+        robot.activate_motors()
+    assert not goals(activation.events) and not energizing(activation.events) and activation.home_calls == 0
+
+
+@pytest.mark.parametrize("side,joint,raw", [("left", "shoulder_lift", 3225), ("right", "shoulder_lift", 2201), ("left", "elbow_flex", 2201)])
+def test_protected_live_endpoint_exception_never_expands_other_joint_or_larger_range(activation, monkeypatch, side, joint, raw):
+    robot = protected_endpoint_case(activation, monkeypatch)
+    getattr(robot, side + "_bus").registers["Present_Position", f"arm_{side}_{joint}"] = raw
+    with pytest.raises(RuntimeError):robot.activate_motors()
+    assert not goals(activation.events) and activation.home_calls == 0
+
+
+def test_protected_live_hold_only_selected_goal_changes_and_current_map_mismatch_refuses(activation, monkeypatch):
+    robot = protected_endpoint_case(activation, monkeypatch)
+    robot.activate_motors(home_lift=False)
+    nonselected = {name: bus.registers["Goal_Position", name] for bus in (robot.left_bus, robot.right_bus) for name in bus.calibration if name != "arm_right_elbow_flex"}
+    # Other-joint feedback moves by one tick; it must never reseed eleven goals.
+    for bus in (robot.left_bus, robot.right_bus):
+        for name in bus.calibration:bus.registers["Present_Position", name] += 1
+    boundary = len(activation.events)
+    robot.hold_follower_arms()
+    assert [(row[1], row[3]) for row in goals(activation.events[boundary:])] == [("right", "arm_right_elbow_flex")]
+    assert all(bus.registers["Goal_Position", name] == nonselected[name] for bus in (robot.left_bus, robot.right_bus) for name in bus.calibration if name in nonselected)
+    robot.left_bus.registers["Goal_Position", "arm_left_shoulder_lift"] = 3224
+    boundary = len(activation.events)
+    with pytest.raises(RuntimeError):robot.hold_follower_arms()
+    assert not goals(activation.events[boundary:])
+
+
+@pytest.mark.parametrize("mutation", ["missing", "binding", "calibration", "stale"])
+def test_protected_live_hold_missing_changed_or_stale_map_is_refusal_not_reseed(activation, monkeypatch, mutation):
+    robot = protected_endpoint_case(activation, monkeypatch)
+    robot.activate_motors(home_lift=False)
+    if mutation == "missing":robot._am1_live_frozen_holds = None
+    elif mutation == "binding":robot._am1_visible_control_binding["host_incarnation"] = "00000000-0000-0000-0000-000000000000"
+    elif mutation == "calibration":robot.left_bus.calibration["arm_left_wrist_flex"].range_max += 1
+    else:robot.right_bus.on_read = lambda reg, name: setattr(activation.clock, "now", activation.clock.now + .3)
+    boundary = len(activation.events)
+    with pytest.raises(RuntimeError):robot.hold_follower_arms()
+    assert not goals(activation.events[boundary:])
+
+
+@pytest.mark.parametrize("mutation", ["binding", "calibration"])
+def test_protected_live_startup_mutation_after_seed_refuses_before_arm_enable(activation, monkeypatch, mutation):
+    robot = protected_endpoint_case(activation, monkeypatch)
+    def mutate(register, name, value):
+        if register == "Goal_Position" and name == "arm_right_gripper":
+            if mutation == "binding":robot._am1_visible_control_binding["recipe"] = "physical-live-unknown"
+            else:robot.left_bus.calibration["arm_left_wrist_flex"].homing_offset += 1
+    robot.right_bus.on_write = mutate
+    with pytest.raises(RuntimeError):robot.activate_motors(home_lift=False)
+    assert not energizing(activation.events)
+    assert robot._am1_live_frozen_holds is None
+
+
+def test_protected_endpoint_known_current_fault_precedes_later_read_failure(activation, monkeypatch):
+    robot = protected_endpoint_case(activation, monkeypatch)
+    robot._am1_activation_readbacks = []
+    robot._am1_live_endpoint_evidence = []
+    name = "arm_left_shoulder_lift"
+    robot.left_bus.registers["Present_Current", name] = 24
+    robot.left_bus.read_faults["Status", name] = OSError("later status unavailable")
+    with pytest.raises(RuntimeError, match="endpoint.*qualification failed"):
+        robot._qualify_am1_live_endpoint(robot.left_bus, name, (2, 0, 515, 848, 3223), phase="before_home")
+    assert not any(row[:4] == ("read", "left", "Status", name) for row in activation.events)
+    assert not goals(activation.events)
+
+
+def test_protected_live_raw_ack_evidence_is_json_safe_for_numpy_bus_values(activation, monkeypatch):
+    import numpy as np
+    robot = protected_endpoint_case(activation, monkeypatch)
+    read = robot.left_bus.read
+    robot.left_bus.read = lambda *args, **kwargs: np.int64(read(*args, **kwargs))
+    robot.activate_motors(home_lift=False)
+    rows = [row[1] for row in activation.events if row[0] == "live_evidence"]
+    assert rows and json.loads(json.dumps(rows))[0]["kind"] == "protected_live_startup_raw_goals"
+
+
+def test_protected_endpoint_rejects_negative_unsigned_current(activation, monkeypatch):
+    robot = protected_endpoint_case(activation, monkeypatch)
+    robot.left_bus.registers["Present_Current", "arm_left_shoulder_lift"] = -1
+    with pytest.raises(RuntimeError):robot.activate_motors(home_lift=False)
+    assert not energizing(activation.events) and not goals(activation.events)

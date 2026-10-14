@@ -21,6 +21,10 @@ class MeasuredMotor(Motor):
     def __init__(self):
         super().__init__()
         self.positions = dict.fromkeys(JOINT_KEYS, 0.0)
+        self.acknowledged_commands = dict.fromkeys(JOINT_KEYS, 0.0)
+
+    def am1_live_arm_commands(self, binding):
+        return dict(self.acknowledged_commands)
 
     def get_observation(self):
         return dict(self.positions)
@@ -382,17 +386,19 @@ def test_nonselected_out_of_command_range_pose_keeps_its_existing_raw_hold(monke
     robot.left_bus.motors[other] = Servo(2, "sts3215", MotorNormMode.RANGE_M100_100)
     robot.left_bus._id_to_model_dict[2] = "sts3215"
     robot.left_bus._id_to_name_dict[2] = other
-    robot.left_bus.calibration[other] = MotorCalibration(2, 0, 1845, 1000, 3000)
+    robot.left_bus.calibration[other] = MotorCalibration(2, 0, 515, 848, 3223)
     robot.left_arm_motors.append(other)
     robot.left_bus.write = lambda *args, **kwargs: None
     robot.lift.stop = lambda: None
     robot.hold_follower_arms = lambda: None
-    robot.get_observation = lambda: {**dict.fromkeys(JOINT_KEYS, 0.0), other + ".pos": 120.0}
+    robot.get_observation = lambda: {**dict.fromkeys(JOINT_KEYS, 0.0), other + ".pos": 100.08421052631579}
+    robot.am1_live_arm_commands = lambda binding: {**dict.fromkeys(JOINT_KEYS, 0.0), other + ".pos": 100.0}
     control.apply(robot, frame(identity, owner, sequence=1))
     now[0] = 10.1
     control.apply(robot, frame(identity, owner, sequence=2, mode="active", epoch=2, sample=sample()))
     assert not [row for row in writes if row[0] == 42 and 2 in row[2]]
-    assert control.accepted_action[other + ".pos"] == 120.0
+    assert control.accepted_action[other + ".pos"] == 100.0
+    assert robot.get_observation()[other + ".pos"] == 100.08421052631579
 
 
 def test_live_goal_readback_reports_actual_servo_goal_separately_from_requested_write(monkeypatch):
@@ -440,6 +446,7 @@ def right_lane():
     obj = MeasuredMotor()
     obj.positions[RIGHT_KEY] = -10.0
     obj.positions[LEFT_KEY] = 19.0
+    obj.acknowledged_commands[LEFT_KEY] = 19.0
     return now, identity, owner, control, obj
 
 
@@ -819,3 +826,101 @@ print("default native imports and disabled paths passed")
                             capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "default native imports and disabled paths passed" in result.stdout
+
+
+from tests.robots.test_am1_pre_activation import activation as endpoint_activation, protected_endpoint_case
+
+
+@pytest.mark.parametrize("recipe,direction", [("physical-live-left-elbow", -1), ("physical-live-right-elbow", 1)])
+def test_real_frozen_eleven_goals_across_live_owned_hold_boundaries(endpoint_activation, monkeypatch, recipe, direction):
+    from lerobot.robots.alohamini import alohamini as owner_module
+    case = endpoint_activation
+    robot = protected_endpoint_case(case, monkeypatch, recipe)
+    robot.activate_motors(home_lift=False)
+    spec = host.live_elbow_spec(recipe)
+    key, motor = spec.joint, spec.joint.removesuffix(".pos")
+    selected_bus = getattr(robot, spec.side + "_bus")
+    original_goals = {(side, name): bus.registers["Goal_Position", name]
+                      for side, bus in (("left", robot.left_bus), ("right", robot.right_bus))
+                      for name in bus.calibration if name != motor}
+    def observation():
+        return {name + ".pos": value for bus in (robot.left_bus, robot.right_bus)
+                for name, value in robot._normalize_arm_feedback(bus, {
+                    name: bus.registers["Present_Position", name] for name in bus.calibration}).items()}
+    robot.get_observation = observation
+    robot.stop_motion = lambda: case.events.append(("owned_body_zero",))
+    # Active device transport is injected; all hold/admission behavior is the real owner.
+    def send(action):
+        target = action.get(key)
+        if target is not None:
+            raw = owner_module.FeetechMotorsBus._unnormalize(selected_bus, {3: target})[3]
+            selected_bus.write("Goal_Position", motor, raw, normalize=False)
+        assert all(action[name] == 0 for name in ("x.vel", "y.vel", "theta.vel", "lift_axis.vel"))
+        return dict(action)
+    robot.send_action = send
+    identity = {name: robot._am1_visible_control_binding[name] for name in ("run_id", "host_incarnation")}
+    control = host.AM1LocalControl(**identity, live=True, live_recipe=recipe, clock=lambda: case.clock.now)
+    client = {name: str(uuid4()) for name in ("service_incarnation", "controller_generation", "connection_generation")}
+    boundary = len(case.events)
+    assert control.apply(robot, frame(identity, client, sequence=1))
+    initial = control.live_snapshot()
+    assert control.live_held["arm_left_shoulder_lift.pos"] == 100
+    assert observation()["arm_left_shoulder_lift.pos"] == 100.08421052631579
+    def active(sequence, epoch, revision, seq):
+        case.clock.now += .05
+        intent = {"target": {key: direction}, "grant_id": str(uuid4()), "seq": seq,
+                  "valid_until_monotonic_s": case.clock.now + .25}
+        assert control.apply(robot, frame(identity, client, sequence=sequence, mode="active", epoch=epoch,
+                                          revision=revision, sample=intent))
+        return intent
+    active(2, 2, 0, 1)
+    assert control.apply(robot, frame(identity, client, sequence=3, epoch=3, revision=1))  # Release.
+    last = active(4, 4, 1, 2)  # Resume.
+    case.clock.now = last["valid_until_monotonic_s"] + .001
+    assert control.check_live(robot) and control.live_snapshot()["state"] == "expired"
+    assert control.apply(robot, frame(identity, client, sequence=5, epoch=5, revision=2))
+    active(6, 6, 2, 3)
+    control.watchdog_stop(robot)
+    assert control.apply(robot, frame(identity, client, sequence=7, epoch=7, revision=3))
+    active(8, 8, 3, 4)
+    # This is the existing outer sender's exact body-zero cleanup shape.
+    assert control.apply(robot, {name: 0 for name in ("x.vel", "y.vel", "theta.vel", "lift_axis.vel")})
+    assert control.state == "stopped"
+    stopped_boundary = len(case.events)
+    case.clock.now = initial["live_deadline_monotonic_s"]
+    assert not control.check_live(robot)
+    assert control.state == "stopped"
+    assert not control.apply(robot, frame(identity, client, sequence=9, epoch=9, revision=4))
+    assert len(case.events) == stopped_boundary
+    assert control.live_snapshot()["reference_norm"] == initial["reference_norm"]
+    assert control.live_snapshot()["live_deadline_monotonic_s"] == initial["live_deadline_monotonic_s"]
+    assert all(bus.registers["Goal_Position", name] == original_goals[side, name]
+               for side, bus in (("left", robot.left_bus), ("right", robot.right_bus))
+               for name in bus.calibration if name != motor)
+    writes = [row for row in case.events[boundary:] if row[0] == "write" and row[2] == "Goal_Position"]
+    assert writes and all(row[1] == spec.side and row[3] == motor for row in writes)
+    traces = [row[1] for row in case.events if row[0] == "live_evidence"]
+    startup = next(row for row in traces if row["kind"] == "protected_live_startup_raw_goals")
+    assert len(startup["acknowledged_goals"]) == 12
+    assert all(row["raw_goal"] == row["readback"]["raw"] for row in startup["acknowledged_goals"])
+    holds = [row for row in traces if row["kind"] == "protected_live_hold_raw_goals"]
+    assert len(holds) >= 6 and all(sum(len(group["raw_goals"]) for group in row["nonselected_readbacks"]) == 11 for row in holds)
+
+
+@pytest.mark.parametrize("mutation", ["not_admitted", "bool", "nan", "nonzero", "missing", "extra", "foreign_binding"])
+def test_owned_body_zero_cleanup_is_closed_and_never_admits_unqualified_or_foreign_live(mutation):
+    now, identity, client, control, robot = lane()
+    command = {name: 0 for name in ("x.vel", "y.vel", "theta.vel", "lift_axis.vel")}
+    control.apply(robot, frame(identity, client, sequence=1, admitted=mutation != "not_admitted"))
+    if mutation == "bool":command["x.vel"] = False
+    elif mutation == "nan":command["x.vel"] = float("nan")
+    elif mutation == "nonzero":command["x.vel"] = 1
+    elif mutation == "missing":command.pop("lift_axis.vel")
+    elif mutation == "extra":command[KEY] = 0
+    elif mutation == "foreign_binding":
+        robot.am1_live_arm_commands = lambda binding: (_ for _ in ()).throw(RuntimeError("foreign frozen binding"))
+    before = len(robot.events)
+    if mutation == "foreign_binding":
+        with pytest.raises(RuntimeError):control.apply(robot, command)
+    else:assert not control.apply(robot, command)
+    assert len(robot.events) == before

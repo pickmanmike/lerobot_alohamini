@@ -1,18 +1,28 @@
 # AM1 live elbow selection - Packet10
 
-The same browser-to-Pi physical input path now implements a choice of left or
-right elbow before Start. One selected joint receives live targets per run; the
-other eleven arm commands remain held and body/lift commands stay zero after
-normal startup. Focused offline verification passed. **Packet10 physical
-qualification remains pending in this draft.** The reviewed matched pair was
-staged and the served page verified. Its first ordinary right-elbow Start
-faulted before Live: left shoulder-lift raw3224 exceeded the unchanged calibrated
-upper endpoint3223. Eight subsequent torque-off reads were also3224. No right
-jog occurred, no limit was widened, and the trial remains failed. Fresh stopped
-diagnostic evidence qualifies all20 zero/off registers, the lift and80 calibration
-comparisons; it does not by itself reconcile authority uncertainty or authorize
-another Start. The focused incomplete-startup reconciliation repair is under
-review.
+The same browser-to-Pi physical input path implements a choice of left or right
+elbow before Start. One selected joint receives live targets per run; the other
+eleven arm commands remain held and body/lift commands stay zero after normal
+startup. **Packet10 physical qualification remains pending in this draft.**
+The first ordinary right-elbow Start faulted before Live: left shoulder-lift
+raw3224 exceeded the unchanged command endpoint3223. No right jog occurred.
+The original failed run, first cause and incomplete-startup cleanup result remain
+unchanged. A separate fresh native proof covered all20 zero/off registers,
+stationary lift feedback, thermal qualification and80 calibration comparisons.
+Ordinary Reconcile consumed its durable acknowledgement within the existing
+180-second freshness window. The authority uncertainty was then resolved, and
+the exact matched runtime restored; this did not make the failed trial pass.
+
+A subsequent read-only shoulder diagnostic found actual Goal_Position3224 and
+Present_Position3224, with nine stationary, fault-free samples over0.416 seconds
+and five thermal slots at35-36C. Calibration/EEPROM limits remain848..3223,
+offset515, Phase12, P16/I0/D32 and directional dead zones1. The accepted Packet09
+run had also recorded205 measured shoulder samples at3224. Source inspection
+identified later measured holds copying that feedback into the raw goal register.
+The focused repair is under implementation: qualify a representable goal3223
+without widening limits, keep measured3224 explicit, and preserve acknowledged
+nonselected goals through every protected live hold. Another powered Start
+awaits exact verification, review and matched staging of that repair.
 
 [PR21](https://github.com/pickmanmike/lerobot_alohamini/pull/21) was ordinarily
 merged into `integrate/am1-local-teleop` at

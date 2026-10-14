@@ -531,3 +531,47 @@ def test_invalid_legacy_scope_refuses_before_claim_or_physical_admission(monkeyp
     with pytest.raises(SystemExit, match="2"):
         host.main()
     assert not attempted
+
+
+@pytest.mark.parametrize("cause,expected", [
+    ("stopped_at_entry", "Owned Live Stop received."),
+    ("stopped_after_command", "Owned Live Stop received."),
+    ("live_budget", "Live time budget expired."),
+    ("legacy_timer", "Cycle time reached."),
+])
+def test_real_host_loop_completion_stdout_reports_actual_exit_cause(monkeypatch, capsys, cause, expected):
+    from tests.robots.test_am1_live_native import lane, frame
+    now, identity, client, control, robot = lane()
+    zero = dict.fromkeys(("x.vel", "y.vel", "theta.vel", "lift_axis.vel"), 0)
+    if cause == "legacy_timer":
+        control = host.AM1LocalControl()
+    else:
+        assert control.apply(robot, frame(identity, client, sequence=1))
+        if cause == "stopped_at_entry":assert control.apply(robot, zero)
+        elif cause == "live_budget":now[0] = control.live_snapshot()["live_deadline_monotonic_s"]
+    original_deadline = control.live_snapshot().get("live_deadline_monotonic_s")
+    robot.logs, robot.cameras, robot.is_connected = {}, {}, True
+    def disconnected(**kwargs):
+        robot.events.append(("disconnect",))
+        robot.is_connected = False
+    robot.disconnect = disconnected
+    command_socket = SimpleNamespace(recv_string=lambda flags: json.dumps(zero))
+    motor_host = SimpleNamespace(connection_time_s=0 if cause == "legacy_timer" else 10,
+        max_loop_freq_hz=30, watchdog_timeout_ms=1000, zmq_cmd_socket=command_socket,
+        disconnect=lambda: robot.events.append(("host_disconnect",)))
+    monkeypatch.setattr(host, "AlohaMini", lambda config: robot)
+    monkeypatch.setattr(host, "connect_robot", lambda *args, **kwargs: None)
+    monkeypatch.setattr(host, "AlohaMiniHost", lambda config: motor_host)
+    monkeypatch.setattr(host, "AM1LocalControl", lambda **kwargs: control)
+    monkeypatch.setattr(host, "visible_control_binding", lambda args: None)
+    monkeypatch.setattr(host, "elbow_recovery_binding", lambda args: None)
+    args = host.make_parser().parse_args(["--no_cameras"])
+    host._run_host(args)
+    output = capsys.readouterr().out
+    assert expected in output
+    assert all(message not in output for message in
+               ("Owned Live Stop received.", "Live time budget expired.", "Cycle time reached.") if message != expected)
+    assert control.live_snapshot().get("live_deadline_monotonic_s") == original_deadline
+    assert control.state == ("ready" if cause == "legacy_timer" else "paused" if cause == "live_budget" else "stopped")
+    assert robot.events[-2:] == [("disconnect",), ("host_disconnect",)]
+    assert args._am1_cleanup_errors == []

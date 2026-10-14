@@ -105,6 +105,8 @@ class AM1LocalControl:
         """Runs on the motor owner even when no new owner/gateway command arrives."""
         if not self.live:
             return True
+        if self.state == "stopped":
+            return False  # A cleanup Stop cannot be reopened by expiry/watchdog ticks.
         now = self.clock()
         deadline = self._live_summary.get("live_deadline_monotonic_s")
         if deadline is not None and now >= deadline:
@@ -134,7 +136,8 @@ class AM1LocalControl:
         if any(type(measured.get(k)) not in (int, float) or not math.isfinite(measured[k]) for k in joint_keys):
             raise RuntimeError("Live admission requires complete actual measured follower arms")
         if self.live_held is None:
-            self.live_held = {k: float(measured[k]) for k in joint_keys}
+            self.live_held = robot.am1_live_arm_commands({**self.binding, "recipe": self.live_spec.recipe})
+            self.live_held[self.live_spec.joint] = float(measured[self.live_spec.joint])
         else:
             self.live_held[self.live_spec.joint] = float(measured[self.live_spec.joint])
         self._live_summary.update(cursor_norm=self.live_held[self.live_spec.joint],
@@ -207,6 +210,8 @@ class AM1LocalControl:
         action = {k: v for k, v in command.items() if k != AM1_LOCAL_CONTROL_KEY}
         action[AM1_LOCAL_CONTROL_KEY] = standard
         if marker["mode"] == "pause":
+            # Verify this caller's acknowledged map before any protected hold.
+            robot.am1_live_arm_commands({**self.binding, "recipe": self.live_spec.recipe})
             accepted = self._apply_standard(robot, action)
             if not accepted:
                 return False
@@ -327,6 +332,16 @@ class AM1LocalControl:
 
     def apply(self, robot: AlohaMini, command: dict) -> bool:
         if self.live:
+            zero_keys = {"x.vel", "y.vel", "theta.vel", "lift_axis.vel"}
+            if (self.state != "ready" and self.binding is not None
+                    and "live_admitted_at_monotonic_s" in self._live_summary and set(command) == zero_keys
+                    and all(type(value) in (int, float) and value == 0 for value in command.values())):
+                # The outer sender's existing body-zero cleanup has no live grant.
+                # It can only stop this owned run and retain its frozen raw holds.
+                robot.am1_live_arm_commands({**self.binding, "recipe": self.live_spec.recipe})
+                self._live_hold(robot)
+                self.state = "stopped"
+                return True
             return self._apply_live(robot, command)
         return self._apply_standard(robot, command)
 
@@ -1670,7 +1685,13 @@ def _run_host(args):
             duration = time.perf_counter() - start
             if loop_timing is not None:
                 loop_timing.finish(time.perf_counter())
-        print("Cycle time reached.")
+        if local_control is not None and local_control.live and local_control.state == "stopped":
+            print("Owned Live Stop received.")
+        elif (local_control is not None and local_control.live
+              and local_control.live_snapshot().get("state") == "budget_expired"):
+            print("Live time budget expired.")
+        else:
+            print("Cycle time reached.")
 
     except KeyboardInterrupt:
         interrupted_motor_io = True

@@ -187,6 +187,8 @@ class InjectedLiveMotorHardware(InjectedMotorHardware):
         from tests.robots.test_alohamini_lift_motor_feedback import ByteStreamPort, status
         from tests.robots.test_am1_selected_joint_evidence import visible_register_packet
 
+        left, right = arm_state_keys_for_robot_model("alohamini1")
+        self.fixture_acknowledged_arm_commands = {**dict.fromkeys((*left, *right), 0.0), SHOULDER: 2.0}
         self.live_spec = host.live_elbow_spec(live_recipe)
         if self.live_spec is None:
             raise ValueError("Injected live fixture requires an allowlisted elbow recipe")
@@ -222,6 +224,11 @@ class InjectedLiveMotorHardware(InjectedMotorHardware):
                 return super().writePort(packet)
 
         self.selected_bus.port_handler = SimulatedSettingsPort()
+
+    def am1_live_arm_commands(self, identity):
+        if identity != self._am1_visible_control_binding:
+            raise RuntimeError("simulated accepted goal binding differs")
+        return dict(self.fixture_acknowledged_arm_commands)
 
     def connect(self, *, home_lift):
         super().connect(home_lift=home_lift)

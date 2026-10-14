@@ -98,6 +98,10 @@ def robot(monkeypatch, *, enabled=True, position=2000, current=2):
     obj._gripper_open_direction, obj._gripper_hold_close_step = {}, 3
     obj._last_currents_log_t, obj._overcurrent_count, obj._overcurrent_trip_n = 0.0, {}, 3
     obj._am1_selected_joint_evidence_enabled = enabled
+    # This fixture replaces startup/device IO; explicitly declare its accepted holds.
+    from examples.alohamini.am1_finite_task import JOINT_KEYS
+    obj.fixture_acknowledged_arm_commands = dict.fromkeys(JOINT_KEYS, 0.0)
+    obj.am1_live_arm_commands = lambda identity: dict(obj.fixture_acknowledged_arm_commands)
     return obj, reads, writes
 
 
