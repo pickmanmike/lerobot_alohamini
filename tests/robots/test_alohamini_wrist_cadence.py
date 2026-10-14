@@ -21,6 +21,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from lerobot.motors import Motor, MotorCalibration, MotorNormMode
+from lerobot.motors.feetech import FeetechMotorsBus
 from lerobot.robots.alohamini import alohamini_host
 from lerobot.robots.alohamini.alohamini import AlohaMini
 from lerobot.robots.alohamini.alohamini_host import make_parser
@@ -114,22 +116,36 @@ class ActionBus:
     ):
         self.positions = positions
         self.currents = currents or dict.fromkeys(positions, 0.0)
-        self.motors = dict.fromkeys(positions)
+        self.motors = {
+            name: Motor(index, "sts3215", MotorNormMode.RANGE_M100_100)
+            for index, name in enumerate(positions, 1)
+        }
         if base:
-            self.motors.update(
-                dict.fromkeys(("base_left_wheel", "base_back_wheel", "base_right_wheel"))
-            )
+            self.motors.update({
+                name: Motor(index, "sts3215", MotorNormMode.RANGE_M100_100)
+                for index, name in enumerate(("base_left_wheel", "base_back_wheel", "base_right_wheel"), 8)
+            })
+        self.calibration = {
+            name: MotorCalibration(motor.id, 0, 0, 1000, 3000) for name, motor in self.motors.items()
+        }
+        normalizer = FeetechMotorsBus("unused-test-port", self.motors, self.calibration)
+        self.apply_drive_mode = normalizer.apply_drive_mode
+        self.model_resolution_table = normalizer.model_resolution_table
+        self._normalize, self._unnormalize = normalizer._normalize, normalizer._unnormalize
         self.is_connected = True
         self.writes: list[tuple[str, dict[str, float]]] = []
 
-    def sync_read(self, register: str, motors: list[str]) -> dict[str, float]:
+    def sync_read(self, register: str, motors: list[str], *, normalize: bool = True) -> dict[str, float]:
         if register == "Present_Position":
-            return {motor: self.positions[motor] for motor in motors}
+            if normalize:
+                return {motor: self.positions[motor] for motor in motors}
+            values = self._unnormalize({self.motors[motor].id: self.positions[motor] for motor in motors})
+            return {motor: values[self.motors[motor].id] for motor in motors}
         if register == "Present_Current":
             return {motor: self.currents[motor] for motor in motors}
         raise AssertionError(f"Unexpected read: {register}")
 
-    def sync_write(self, register: str, values: dict[str, float]) -> None:
+    def sync_write(self, register: str, values: dict[str, float], *, normalize: bool = True) -> None:
         self.writes.append((register, values))
 
 
@@ -236,7 +252,8 @@ def test_am1_shoulder_trace_pairs_transmitted_goal_with_owner_readback(capsys):
     alohamini_host.print_startup_shoulder_report(robot, command, {f"{shoulder}.pos": 55.4061045})
     record = json.loads(capsys.readouterr().out.split("] ", 1)[1])
     assert reads == [("Goal_Position", shoulder, 0)]
-    assert record["requested"] == record["final"] == 41.879637
+    assert record["requested"] == 41.879637
+    assert record["final"] == pytest.approx(41.8)  # actual encoded position from synthetic calibration
     assert record["goal_position_readback"] == 41.88
     assert record["observed_position"] == 55.4061045
     assert record["sync_write_returned"] is True and record["write_acknowledged"] is False

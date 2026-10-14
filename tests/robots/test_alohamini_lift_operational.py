@@ -6,6 +6,8 @@ import json
 
 import pytest
 
+from lerobot.motors import MotorCalibration
+from lerobot.motors.feetech import FeetechMotorsBus
 from lerobot.robots.alohamini import alohamini as robot_module
 from lerobot.robots.alohamini import lift_relief
 from lerobot.robots.alohamini.config_alohamini import AlohaMiniConfig
@@ -21,7 +23,36 @@ def operating_robot(monkeypatch, tmp_path):
     def bus_factory(**kwargs):
         bus = LiftBus(clock, **kwargs)
         bus.is_calibrated = True
-        bus.sync_read = lambda register, motors: {name: bus.read(register, name) for name in motors}
+        bus.calibration = {
+            name: MotorCalibration(motor.id, 0, 0, 1000, 2200)
+            for name, motor in bus.motors.items()
+        }
+        # The fixture claims a calibrated stopped owner; its EEPROM must carry
+        # the same synthetic limits/offset as that cache before activation.
+        for name, calibration in bus.calibration.items():
+            for register, value in (("Min_Position_Limit", calibration.range_min),
+                                    ("Max_Position_Limit", calibration.range_max),
+                                    ("Homing_Offset", calibration.homing_offset)):
+                bus.registers[(register, name)] = value
+        normalizer = FeetechMotorsBus("unused-test-port", bus.motors, bus.calibration)
+        bus.apply_drive_mode = normalizer.apply_drive_mode
+        bus.model_resolution_table = normalizer.model_resolution_table
+        bus._normalize, bus._unnormalize = normalizer._normalize, normalizer._unnormalize
+        original_read = bus.read
+
+        def calibrated_read(register, name, *, normalize=True, **options):
+            value = original_read(register, name, normalize=normalize, **options)
+            if register == "Present_Position" and name.startswith("arm_") and not normalize:
+                # These fixtures declare arm positions in normalized units; model
+                # the same raw register representation as the real bus.
+                motor = bus.motors[name]
+                return bus._unnormalize({motor.id: value})[motor.id]
+            return value
+
+        bus.read = calibrated_read
+        bus.sync_read = lambda register, motors, **options: {
+            name: bus.read(register, name, **options) for name in motors
+        }
         bus.sync_write = lambda register, values, **kwargs: [
             bus.write(register, name, value, **kwargs) for name, value in values.items()
         ]
@@ -1854,3 +1885,49 @@ def test_host_loop_context_excludes_skip_home_and_other_models(operating_robot, 
     host.main()
     assert legacy_home == ([True] if home else [])
     assert not robot.left_bus.is_connected
+
+
+def test_host_fault_timing_retains_slow_loop_after_one_healthy_iteration():
+    from lerobot.robots.alohamini.alohamini_host import AM1HostLoopTiming
+
+    timing = AM1HostLoopTiming()
+    timing.begin(100.0)
+    timing.mark("sample_log", 100.002)
+    timing.mark("sleep", 100.143)
+    timing.finish(100.144)
+    timing.begin(100.144)
+    timing.mark("sample_log", 100.146)
+    timing.finish(100.177)
+    timing.begin(100.177)
+    context = timing.snapshot(100.179)
+
+    assert context["previous_loop"]["loop_index"] == 2
+    assert context["current_loop"]["loop_index"] == 3
+    delayed, healthy = context["recent_completed_loops"]
+    assert delayed["loop_index"] == 1
+    assert delayed["phase_ms"]["sample_log"] == pytest.approx(141)
+    assert delayed["completed"] and healthy["completed"]
+    assert context["current_loop"]["completed"] is False
+    assert context["omitted_completed_loop_count"] == 0
+
+
+def test_host_fault_timing_history_is_bounded_and_snapshot_is_independent():
+    from lerobot.robots.alohamini.alohamini_host import AM1HostLoopTiming
+
+    timing = AM1HostLoopTiming()
+    for index in range(100):
+        timing.begin(float(index))
+        timing.mark("sample_log", index + 0.001)
+        timing.finish(index + 0.033)
+    context = timing.snapshot(100.0)
+
+    assert len(context["recent_completed_loops"]) == context["completed_loop_history_limit"] == 8
+    assert context["omitted_completed_loop_count"] == 92
+    assert [r["loop_index"] for r in context["recent_completed_loops"]] == list(range(93, 101))
+    context["recent_completed_loops"][-1]["phase_ms"]["sample_log"] = -1
+    context["previous_loop"]["phase_ms"]["sample_log"] = -2
+    timing.begin(100.0)
+    timing.finish(100.033)
+    later = timing.snapshot(101.0)
+    assert later["recent_completed_loops"][-2]["phase_ms"]["sample_log"] >= 0
+    assert later["omitted_completed_loop_count"] == 93

@@ -142,6 +142,7 @@ class ConsoleSnapshot:
         self.observation: dict[str, Any] = {"sequence": None, "host_observation_id": None,
                                             "host_state": None, "host_epoch": None,
                                             "acquired_at_ns": None, "age_ms": None}
+        self.recovery_pose = None
         self.action: dict[str, Any] = {"sequence": None, "send_interval_ms": None,
                                        "acquired_at_ns": None, "age_ms": None}
         self.phase = "idle"
@@ -215,6 +216,14 @@ class ConsoleSnapshot:
                                 "wall_time_ns": event.get("wall_time_ns")})
             return
         if kind == "host_feedback" and acquired is not None:
+            follower, target = event.get("follower_positions"), event.get("arm_target")
+            if (isinstance(follower, dict) and isinstance(target, dict)
+                    and all(_numeric(follower.get(k)) is not None and _numeric(target.get(k)) is not None
+                            for k in ARM_KEYS)):
+                self.recovery_pose = {"acquired_at_ns": acquired, "joint_count": len(ARM_KEYS),
+                                      "max_difference": max(abs(follower[k] - target[k]) for k in ARM_KEYS)}
+            else:
+                self.recovery_pose = None
             self.observation.update(sequence=event.get("observation_sequence"),
                                     host_state=event.get("host_state"), host_epoch=event.get("host_epoch"),
                                     host_observation_id=event.get("host_observation_id"),
@@ -309,6 +318,9 @@ class ConsoleSnapshot:
         observation = dict(self.observation)
         acquired = observation["acquired_at_ns"]
         observation["age_ms"] = round(max(0, now_ns - acquired) / 1e6, 3) if acquired is not None else None
+        recovery_pose = None if self.recovery_pose is None else dict(self.recovery_pose)
+        if recovery_pose is not None:
+            recovery_pose["age_ms"] = (now_ns - recovery_pose["acquired_at_ns"]) / 1e6
         action = dict(self.action)
         acquired = action["acquired_at_ns"]
         action["age_ms"] = round(max(0, now_ns - acquired) / 1e6, 3) if acquired is not None else None
@@ -327,5 +339,5 @@ class ConsoleSnapshot:
         return {"servos": {identity: copy_fields(parts) for identity, parts in self.servos.items()},
                 "body": copy_fields(self.body), "body_targets": copy_fields(self.body_targets),
                 "system": copy_fields(self.system), "system_sample_pi_wall_ns": self.system_sample_pi_wall_ns,
-                "cameras": cameras, "observation": observation,
+                "cameras": cameras, "observation": observation, "recovery_pose": recovery_pose,
                 "action": action, "events": list(self.events), "phase": self.phase}

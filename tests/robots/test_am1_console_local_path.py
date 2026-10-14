@@ -54,13 +54,16 @@ class FakeSessionIO:
         self.output_records = []
         self.native_marker_delay_s = 0  # Explicit failure model; unchanged nominal workload.
         self.finalization_delay_s = 0
+        self.cleanup_before_finalization = False
+        self.stop_exit_code = 0
         self.native_closed_at = None
 
     def parse_duration_seconds(self, value):
         return int(value)
 
-    def validate_leader_selection(self, source, profile):
-        assert (source, profile) in {("physical", None), ("scripted", "ArmSmoke")}
+    def validate_leader_selection(self, source, profile, duration=None):
+        from tools.am1_session import validate_leader_selection
+        validate_leader_selection(source, profile, duration)
 
     def request_stop(self, config, *, expected_session_id, wait):
         self.stopped.set()
@@ -136,7 +139,7 @@ class FakeSessionIO:
                     host_feedback[0] = {"state": "paused", "epoch": epoch}
                     if not native.wait_gate("resume", host_epoch=epoch,
                                             cancel=self.stopped.is_set, timeout_s=8):
-                        return 0 if self.stopped.is_set() else 2
+                        return self.stop_exit_code if self.stopped.is_set() else 2
                     epoch += 1
                     host_feedback[0] = {"state": "active", "epoch": epoch}  # Not the UI approval itself.
                     native.note_live_admitted(host_epoch=epoch)
@@ -150,7 +153,7 @@ class FakeSessionIO:
                     output_offset += len(data)
                     last_output = now
                 time.sleep(.02)
-            return 0
+            return self.stop_exit_code if self.stopped.is_set() else 0
         except BaseException as exc:
             self.error = exc
             raise
@@ -160,11 +163,17 @@ class FakeSessionIO:
                 telemetry_thread.join(1)
             native.disconnect()
             self.native_closed_at = time.monotonic()
+            if self.cleanup_before_finalization:
+                emit({"event": "client_exited", "exit_code": self.stop_exit_code if self.stopped.is_set() else 0})
+                emit({"event": "cleanup", "cleanup_verified": True})
             if self.finalization_delay_s:
                 time.sleep(self.finalization_delay_s)
             emit({"event": "cleanup", "cleanup_verified": True})
-            emit({"event": "session_complete", "session_id": identity,
-                  "cleanup_verified": not native.is_connected and not native._worker.is_alive()})
+            completed = {"event": "session_complete", "session_id": identity,
+                         "cleanup_verified": not native.is_connected and not native._worker.is_alive()}
+            if self.stopped.is_set() and self.stop_exit_code == 130:
+                completed.update(final_exit_code=130, operator_stopped=True)
+            emit(completed)
 
     def _startup(self, native, emit):
         # Import only function code; all device boundaries below are synthetic
@@ -617,7 +626,8 @@ class FakeCamera(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
         elif self.path.startswith("/api/frame.jpeg"):
-            time.sleep(getattr(self.server, "snapshot_delay_s", 0))
+            role = self.path.split("src=", 1)[-1].split("&", 1)[0]
+            time.sleep(getattr(self.server, "snapshot_role_delays", {}).get(role, getattr(self.server, "snapshot_delay_s", 0)))
             body = self.jpeg
             self.send_response(200)
             self.send_header("Content-Type", "image/jpeg")
@@ -629,6 +639,9 @@ class FakeCamera(BaseHTTPRequestHandler):
             self.end_headers()
             try:
                 for _ in range(getattr(self.server, "frame_count", 60)):
+                    if getattr(self.server,"drop_primary_frames",False):
+                        time.sleep(getattr(self.server,"frame_period_s",.1))
+                        continue
                     self.wfile.write((f"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {len(self.jpeg)}\r\n"
                                       f"X-Frame-Sequence: {int(time.monotonic()*getattr(self.server, 'sequence_rate', 10))}\r\nX-Frame-Age-Ms: 0\r\n\r\n").encode()
                                      + self.jpeg + b"\r\n")
@@ -713,14 +726,21 @@ def test_owned_native_process_keeps_real_pipe_and_stops(tmp_path, startup_second
     assert adapter.state()["cleanup_verified"] is True
 
 
-@pytest.mark.parametrize("duration", ["0", "1800", "NaN"])
-def test_bench_refuses_unqualified_native_duration_before_browser(tmp_path, duration):
+@pytest.mark.parametrize('scenario,identity,duration', [
+    ('ArmSmoke', 'AM1-RELIABILITY-01-arm-01', '0'),
+    ('ArmSmoke', 'AM1-RELIABILITY-01-arm-01', '1800'),
+    ('ArmSmoke', 'AM1-RELIABILITY-01-arm-01', 'NaN'),
+    ('ArmSmokeRepeat', 'AM1-RELIABILITY-02-arm-01', '180'),
+    ('ArmSmokeRepeat', 'AM1-RELIABILITY-02-arm-01', '421'),
+    ('PhysicalLeader', 'AM1-RELIABILITY-02-physical-01', '420'),
+])
+def test_bench_refuses_unqualified_native_duration_before_browser(tmp_path, scenario, identity, duration):
     node = shutil.which("node")
     if not node or subprocess.run([node, "-e", "require('playwright')"], capture_output=True).returncode:
         pytest.skip("Node/Playwright unavailable")
     evidence = tmp_path / "bench.json"
     result = subprocess.run([node, str(ROOT / "tools/am1_reliability_bench.cjs"),
-        "http://127.0.0.1:1/", "ArmSmoke", "AM1-RELIABILITY-01-arm-01", str(evidence), "1" * 40, duration],
+        "http://127.0.0.1:1/", scenario, identity, str(evidence), "1" * 40, duration],
         capture_output=True, text=True, timeout=10)
     assert result.returncode == 1 and "Native duration must be an established finite scenario" in result.stderr
     assert not evidence.exists()
@@ -729,7 +749,7 @@ def test_bench_refuses_unqualified_native_duration_before_browser(tmp_path, dura
 @pytest.mark.skipif(sys.platform != "win32", reason="Actual AF_PIPE is Windows-only")
 @pytest.mark.parametrize("case", ["healthy", "navigation", "blur", "hidden", "body-delay",
                                       "body-presence-loss", "short-browser-stall",
-                                      "body-reject", "body-denied", "state-reject", "state-delay", "pending-stop", "camera-delay", "approval-order", "startup-approval", "bench-body", "bench-arm", "bench-arm-short", "bench-pause", "bench-foreign", "bench-monitor-failure", "bench-camera-loss", "bench-finalize", "bench-finalize-stall", "bench-finalize-late-result"])
+                                      "body-reject", "body-denied", "state-reject", "state-delay", "pending-stop", "camera-delay", "approval-order", "startup-approval", "bench-body", "bench-arm", "bench-arm-short", "bench-repeat", "bench-physical", "bench-pause", "bench-foreign", "bench-monitor-failure", "bench-frontend-state-reject", "bench-frontend-state-reset", "bench-camera-loss", "bench-camera-readiness-timeout", "bench-finalize", "bench-finalize-stall", "bench-finalize-late-result", "bench-finalize-verified", "bench-virtual-budget-stop", "bench-virtual-optional-camera", "bench-virtual-recovery", "bench-virtual-operator", "bench-virtual-body", "bench-virtual-required-camera", "bench-virtual-start-refusal"])
 def test_browser_loopback_native_path(tmp_path, case):
     node = shutil.which("node")
     if not node or subprocess.run([node, "-e", "require('playwright')"], capture_output=True).returncode:
@@ -743,6 +763,14 @@ def test_browser_loopback_native_path(tmp_path, case):
         session.finalization_delay_s = 12
     if case == "bench-finalize-late-result":
         session.finalization_delay_s = 9.5
+    if case in {"bench-finalize-verified", "bench-virtual-budget-stop"}:
+        # External log collection follows verified client/host cleanup, and
+        # can outlast the input pipe's unchanged unverified-cleanup deadline.
+        session.cleanup_before_finalization = True
+        session.finalization_delay_s = 11.5
+    if case == "bench-virtual-budget-stop":
+        session.live_duration_s = 30
+        session.stop_exit_code = 130
     startup_release = threading.Event()
     if case == "startup-approval":
         def before_gate(stage, emit):
@@ -750,8 +778,26 @@ def test_browser_loopback_native_path(tmp_path, case):
                 emit({"event": "test_before_live_gate"})
                 assert startup_release.wait(5), "frontend must deliver a real startup blur before requesting the gate"
         session.before_gate = before_gate
-    camera = ThreadingHTTPServer(("127.0.0.1", 0), FakeCamera)
+    virtual_case = case.startswith("bench-virtual-")
+    camera_handler = FakeCamera
+    if virtual_case:
+        import random
+        encoded = io.BytesIO()
+        pixels = random.Random(11).randbytes(80 * 60 * 3)
+        Image.frombytes("RGB", (80, 60), pixels).resize((640, 480), Image.Resampling.BILINEAR).save(encoded, format="JPEG", quality=40)
+        assert 30 * 1024 <= len(encoded.getvalue()) <= 38 * 1024
+        class RepresentativeCamera(FakeCamera):
+            jpeg = encoded.getvalue()
+        camera_handler = RepresentativeCamera
+    camera = ThreadingHTTPServer(("127.0.0.1", 0), camera_handler)
     camera.daemon_threads = True
+    if virtual_case:
+        camera.frame_count = 240
+        camera.frame_period_s = 1 / 15
+        camera.sequence_rate = 1000
+    if case == "bench-camera-readiness-timeout":
+        camera.frame_count = 0
+        camera.snapshot_delay_s = 3
     if case == "camera-delay":
         session.on_live = lambda: setattr(camera, "snapshot_delay_s", .65)
     if case == "bench-camera-loss":
@@ -776,6 +822,89 @@ def test_browser_loopback_native_path(tmp_path, case):
                 real_operation({"kind": "Start", "duration_seconds": 12})
             return real_operation(payload)
         adapter.operation = competing_start
+    observer_stop, observer_lost = threading.Event(), [False]
+    observer_thread, output_replay, coverage_thread = None, [], None
+    coverage_errors = []
+    virtual_config_path = tmp_path / "virtual-config.json"
+    if virtual_case:
+        health_path = tmp_path / "latest-health.json"
+        virtual_config_path.write_text(json.dumps({"observer_health_path": str(health_path),
+            "observer_generation": "fake-capture-03", "verified_coverage": ["arms", "lift"],
+            "required_camera_roles": ["forward"] if case in {"bench-virtual-required-camera", "bench-virtual-body"} else [],
+            "recovery_episode_seconds": 10, "max_recoveries": 3}))
+        def observer_updates():
+            sequence = 0
+            while not observer_stop.is_set():
+                sequence += 1
+                report = {"generation": "fake-capture-03", "running": not observer_lost[0],
+                    "recording": True, "challenge_qualified": not observer_lost[0], "nonce": f"challenge-{sequence}",
+                    "sequence": sequence, "source_system_relative_ticks": sequence*1_000_000, "capture_age_ms": 20, "round_trip_ms": 10,
+                    "received_wall_time_ms": time.time_ns() / 1_000_000}
+                temporary = health_path.with_suffix(".tmp")
+                temporary.write_text(json.dumps(report))
+                for _ in range(10):
+                    try:
+                        temporary.replace(health_path)
+                        break
+                    except PermissionError:
+                        # Windows readers can briefly deny replacement. Retry
+                        # this unchanged report boundedly, then publish a later
+                        # source sample; never re-age the retained health file.
+                        if observer_stop.wait(.01):
+                            return
+                observer_stop.wait(.1)
+        observer_thread = threading.Thread(target=observer_updates, daemon=True)
+        observer_thread.start()
+        def virtual_live():
+            nonlocal coverage_thread
+            if case == "bench-virtual-optional-camera":
+                threading.Timer(1, lambda: setattr(camera, "snapshot_role_delays", {"chest": 3, "wrist_left": 3})).start()
+                threading.Timer(4, lambda: setattr(camera, "snapshot_role_delays", {})).start()
+                replay = SyntheticOutputReplay(tmp_path / "representative-output", adapter.state()["session_id"], adapter._emit)
+                output_replay.append(replay)
+                replay.start()
+            elif case == "bench-virtual-required-camera":
+                threading.Timer(1,lambda:setattr(camera,"drop_primary_frames",True)).start()
+                threading.Timer(2.5,lambda:setattr(camera,"drop_primary_frames",False)).start()
+            elif case == "bench-virtual-recovery":
+                threading.Timer(1, lambda: observer_lost.__setitem__(0, True)).start()
+                threading.Timer(2, lambda: observer_lost.__setitem__(0, False)).start()
+            elif case == "bench-virtual-operator":
+                adapter._bridge.request_pause("operator")
+            elif case == "bench-virtual-budget-stop":
+                def coverage_episodes():
+                    for episode in range(1, 5):
+                        observer_lost[0] = True
+                        if episode == 4:
+                            return  # Current real policy must Stop instead of a fourth Resume.
+                        episode_deadline = time.monotonic() + 8
+                        while not observer_stop.wait(.02):
+                            policy = adapter._bench_policy
+                            if policy is not None and policy.seen_pause:
+                                break
+                            assert time.monotonic() < episode_deadline, "native coverage hold did not arrive"
+                        observer_lost[0] = False
+                        while not observer_stop.wait(.02):
+                            if adapter._bench_policy.recovery_count == episode:
+                                break
+                            assert time.monotonic() < episode_deadline, "qualified recovery did not complete"
+                        if observer_stop.wait(.4):
+                            return
+                def run_coverage_episodes():
+                    try:
+                        coverage_episodes()
+                    except BaseException as error:
+                        coverage_errors.append(error)
+                coverage_thread = threading.Thread(target=run_coverage_episodes, daemon=True)
+                coverage_thread.start()
+        session.on_live = virtual_live
+    native_states = []
+    real_emit = adapter._emit
+    def observed_emit(event):
+        if event.get("event") == "test_native_state":
+            native_states.append(event)
+        return real_emit(event)
+    adapter._emit = observed_emit
     received = []
     real_body_input = adapter.body_input
     def observed_body_input(payload):
@@ -786,6 +915,15 @@ def test_browser_loopback_native_path(tmp_path, case):
         return result
     adapter.body_input = observed_body_input
     server = ConsoleServer(("127.0.0.1", 0), config, auth, adapter)
+    if case == "bench-virtual-start-refusal":
+        class RefusedStart(ConsoleHandler):
+            def do_POST(self):  # noqa: N802 — actual handler boundary refusal.
+                if self.path == "/api/operation":
+                    self._drain_small_post_body()
+                    self.send_error(503, "Synthetic Start service refusal")
+                    return
+                super().do_POST()
+        server.RequestHandlerClass = RefusedStart
     if case == "bench-monitor-failure":
         failures = [0]
         session.on_live = lambda: failures.__setitem__(0, 2)
@@ -797,6 +935,21 @@ def test_browser_loopback_native_path(tmp_path, case):
                     return
                 super().do_GET()
         server.RequestHandlerClass = FailedBenchReads
+    if case in {"bench-frontend-state-reject", "bench-frontend-state-reset"}:
+        failures = [False]
+        session.on_live = lambda: failures.__setitem__(0, True)
+        class FailedFrontendReads(ConsoleHandler):
+            def do_GET(self):  # noqa: N802 — BaseHTTPRequestHandler requires this method name.
+                if self.path == "/api/state" and not self.headers.get("X-AM1-Bench-Monitor") and failures[0]:
+                    if case == "bench-frontend-state-reject":
+                        self.send_error(503, "Fake frontend read failure")
+                    else:
+                        self.close_connection = True
+                        self.connection.shutdown(2)
+                        self.connection.close()
+                    return
+                super().do_GET()
+        server.RequestHandlerClass = FailedFrontendReads
     if case == "bench-finalize-late-result":
         delayed = [False]
         class LateTerminalRead(ConsoleHandler):
@@ -808,28 +961,63 @@ def test_browser_loopback_native_path(tmp_path, case):
                     time.sleep(1.5)
                 super().do_GET()
         server.RequestHandlerClass = LateTerminalRead
+    if case == "bench-virtual-budget-stop":
+        class StopBetweenMonitorReads(ConsoleHandler):
+            def do_GET(self):  # noqa: N802 — delay only the external monitor request.
+                if (self.path == "/api/state" and self.headers.get("X-AM1-Bench-Monitor")
+                        and observer_lost[0] and adapter._bench_policy is not None
+                        and adapter._bench_policy.recovery_count == 3):
+                    # The real adapter's monitor can Stop and the real native
+                    # pipe can close between two benchmark status replies.
+                    closed_deadline = time.monotonic() + 2
+                    while session.native_closed_at is None and time.monotonic() < closed_deadline:
+                        time.sleep(.01)
+                super().do_GET()
+        server.RequestHandlerClass = StopBetweenMonitorReads
     threads = [threading.Thread(target=s.serve_forever, daemon=True) for s in (camera, server)]
-    before = FakeCamera.requests
+    before = camera_handler.requests
     for thread in threads:
         thread.start()
     try:
-        arm_bench = case in {"bench-arm", "bench-arm-short"}
+        arm_bench = case in {"bench-arm", "bench-arm-short", "bench-repeat", "bench-virtual-budget-stop", "bench-virtual-optional-camera", "bench-virtual-recovery", "bench-virtual-operator", "bench-virtual-required-camera", "bench-virtual-start-refusal"}
+        bench_scenario = ('ArmSmokeRepeat' if case in {'bench-repeat','bench-virtual-budget-stop','bench-virtual-optional-camera','bench-virtual-recovery','bench-virtual-operator','bench-virtual-required-camera','bench-virtual-start-refusal'} else
+                          'PhysicalLeader' if case == 'bench-physical' else
+                          'ArmSmoke' if arm_bench else 'BodyPressRelease')
+        bench_identity = (('AM1-RELIABILITY-03-arm-01' if arm_bench else 'AM1-RELIABILITY-03-body-01') if virtual_case else
+                          'AM1-RELIABILITY-02-physical-01' if case == 'bench-physical' else
+                          'AM1-RELIABILITY-02-arm-01' if case == 'bench-repeat' else
+                          'AM1-RELIABILITY-01-arm-01' if arm_bench else 'AM1-RELIABILITY-01-body-01')
         driver = ([node, str(ROOT / "tools/am1_reliability_bench.cjs"),
                    f"http://127.0.0.1:{server.server_port}",
-                   "ArmSmoke" if arm_bench else "BodyPressRelease",
-                   "AM1-RELIABILITY-01-arm-01" if arm_bench else "AM1-RELIABILITY-01-body-01",
+                   bench_scenario, bench_identity,
                    str(tmp_path / "bench.json"), "1" * 40]
                   if case.startswith("bench-") else
                   [node, str(ROOT / "tests/cameras/am1_console_local_driver.cjs"),
                    f"http://127.0.0.1:{server.server_port}", case])
         if case == "bench-arm-short":
             driver.append("30")
-        result = subprocess.run(driver,
+        bench_environment = dict(os.environ)
+        if virtual_case:
+            bench_environment["AM1_BENCH_VIRTUAL_CONFIG"] = str(virtual_config_path)
+        else:
+            bench_environment.pop("AM1_BENCH_VIRTUAL_CONFIG", None)
+        result = subprocess.run(driver, env=bench_environment,
                                 capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=35)
+        assert not coverage_errors, coverage_errors
+        if case in {'bench-repeat', 'bench-physical'}:
+            assert result.returncode == 0, result.stdout + result.stderr
         intervals = [(seq, round((at - previous[1])*1000), active)
                      for previous, (seq, at, active) in zip(received, received[1:])]
         if case.startswith("bench-"):
+            assert (tmp_path / "bench.json").exists(), result.stdout + result.stderr
             evidence = json.loads((tmp_path / "bench.json").read_text())
+            if case == "bench-virtual-start-refusal":
+                assert result.returncode == 1
+                assert evidence["start_count"] == 1 and session.run_count == 0
+                assert evidence["session_id"] is None and evidence["failure"] == "Start HTTP 503"
+                assert any(record["event"] == "operation_http_error" and record["kind"] == "Start" for record in evidence["records"])
+                assert not session.stopped.is_set(), "An unowned refused Start must not receive Stop"
+                return
             assert evidence["start_count"] == session.run_count == 1
             if case == "bench-foreign":
                 assert result.returncode == 1
@@ -839,14 +1027,66 @@ def test_browser_loopback_native_path(tmp_path, case):
                 return
             assert evidence["cleanup_verified"] is True
             operations = [record["kind"] for record in evidence["records"] if record["event"] == "operation_result"]
-            assert not {"Resume", "Approve", "ClaimInput"}.intersection(operations)
-            if case in {"bench-pause", "bench-monitor-failure", "bench-camera-loss", "bench-finalize-stall", "bench-finalize-late-result"}:
+            assert not {"Approve", "ClaimInput"}.intersection(operations)
+            if not virtual_case or case in {"bench-virtual-optional-camera","bench-virtual-operator"}:
+                assert "Resume" not in operations
+            if case in {"bench-pause", "bench-monitor-failure", "bench-frontend-state-reject", "bench-frontend-state-reset", "bench-camera-loss", "bench-camera-readiness-timeout", "bench-finalize-stall", "bench-finalize-late-result", "bench-virtual-budget-stop", "bench-virtual-operator"}:
                 assert result.returncode == 1
                 assert evidence["failure"]
-                if case in {"bench-pause", "bench-monitor-failure"}:
+                if case == "bench-virtual-operator":
+                    assert evidence["failure"] in {"Pause is not recoverable: operator", "Input pause: operator"}
+                    assert evidence["recovery_attempts"] == 0
+                elif case == "bench-virtual-budget-stop":
+                    assert "recovery budget exhausted" in evidence["failure"]
+                    assert "stop cause unavailable" in evidence["failure"]
+                    assert "finalization deadline" not in evidence["failure"]
+                    assert evidence["final_exit_code"] == 130
+                    assert evidence["recovery_attempts"] == operations.count("Resume") == 3
+                    stopped = evidence["virtual_stop"]
+                    assert stopped["session_id"] == evidence["session_id"]
+                    assert stopped["reason"] == "recovery budget exhausted"
+                    assert stopped["reason_basis"] == "same-session stop event"
+                    assert stopped["cause"] is None and stopped["cause_basis"] == "unavailable"
+                    assert stopped["observed_pause_cause"] == "bench required coverage"
+                    assert stopped["observed_pause_cause_basis"] == "last observed policy"
+                    assert stopped["recovery_count"] == 3
+                    recorded_stop = next(record for record in evidence["records"]
+                                         if record["event"] == "virtual_bench_stop")
+                    assert not any(record["event"] == "operation_result" and record["kind"] == "Resume"
+                                   and record["received_wall_time_ms"] >= recorded_stop["received_wall_time_ms"]
+                                   for record in evidence["records"])
+                elif case in {"bench-pause", "bench-monitor-failure"}:
                     assert evidence["pulses"] == []
                 elif case == "bench-camera-loss":
                     assert "Required camera view lost" in evidence["failure"]
+                    camera_states = [record for record in evidence["records"]
+                                     if record["event"] == "state" and record.get("camera_summary")]
+                    assert camera_states[-1]["camera_evidence"]["diagnostics"].startswith("Status request")
+                    assert len(camera_states[-1]["camera_evidence"]["roles"]) == 5
+                elif case == "bench-camera-readiness-timeout":
+                    assert "Timeout 5000ms" in evidence["failure"]
+                    snapshot = next(record for record in evidence["records"]
+                                    if record["event"] == "camera_readiness_failure")
+                    live = next(record for record in evidence["records"]
+                                if record["event"] == "state" and record.get("phase") == "live")
+                    assert snapshot["failure_wall_time_ms"] >= live["received_wall_time_ms"] + 4500
+                    assert not snapshot["camera_evidence"]["summary"].startswith("Cameras 5/5")
+                    assert len(snapshot["camera_evidence"]["roles"]) == 5
+                    assert all(not role["fresh"] for role in snapshot["camera_evidence"]["roles"])
+                elif case in {"bench-frontend-state-reject", "bench-frontend-state-reset"}:
+                    assert any(record.get("input_pause_reason") == "state-request-failed"
+                               for record in evidence["records"])
+                    network = evidence["frontend_state_network"]
+                    assert network["http_status_counts"]["200"] > 0
+                    if case == "bench-frontend-state-reject":
+                        assert network["http_status_counts"]["503"] > 0
+                        assert network["request_failure_count"] == 0
+                        assert any(record["event"] == "frontend_state_http_error" and record["status"] == 503
+                                   for record in evidence["records"])
+                    else:
+                        assert network["request_failure_count"] > 0
+                        assert any(record["event"] == "frontend_state_request_failed" and record["reason"]
+                                   for record in evidence["records"])
                 else:
                     assert "finalization deadline" in evidence["failure"]
                 if case != "bench-finalize-late-result":
@@ -854,16 +1094,50 @@ def test_browser_loopback_native_path(tmp_path, case):
             else:
                 assert evidence["failure"] is None
                 assert "Stop" not in operations
+                if case == "bench-finalize-verified":
+                    closed = [record for record in evidence["records"] if record["event"] == "state"
+                              and record.get("input_pause_reason") == "pipe disconnected"]
+                    assert closed and closed[0]["cleanup_verified"] is True
+                    assert evidence["finished_wall_time_ms"] - closed[0]["received_wall_time_ms"] >= 11000
                 arm_duration = 30 if case == "bench-arm-short" else 180
-                assert session.start_requests == ([(arm_duration, "scripted", "ArmSmoke")] if arm_bench else [(12, "physical", None)])
+                if virtual_case:
+                    assert session.start_requests == ([(420, 'scripted', 'ArmSmokeRepeat')] if arm_bench else [(12, 'scripted', 'ArmHoldBody')])
+                    assert evidence["virtual_bench_policy"]["verified_coverage"] == ["arms", "lift"]
+                    if case == "bench-virtual-optional-camera":
+                        assert any(record["event"] == "camera_quality" and not record["all_five_fresh"] for record in evidence["records"])
+                        assert any(record["event"] == "optional_camera_reconnect" and record["role"] in {"chest", "wrist_left"} for record in evidence["records"])
+                        assert evidence["recovery_attempts"] == 0
+                    elif case in {"bench-virtual-recovery", "bench-virtual-required-camera"}:
+                        if case == "bench-virtual-recovery":
+                            assert evidence["recovery_attempts"] == 1
+                        else:
+                            # A real 15 fps decoder can also stall under this workload;
+                            # each distinct measured loss must use the same finite budget.
+                            assert 1 <= evidence["recovery_attempts"] <= 3
+                            assert any(record["event"] == "bench_hold_result" and
+                                       record["missing_required_roles"] == ["forward"]
+                                       for record in evidence["records"])
+                        assert operations.count("Resume") == evidence["recovery_attempts"]
+                        recovery_requests = [record for record in evidence["records"]
+                                             if record["event"] == "qualified_recovery_request"]
+                        assert len({record["pause_sequence"] for record in recovery_requests}) == len(recovery_requests)
+                        assert all(record["cause"] == "bench required coverage" for record in recovery_requests)
+                        assert any(record["paused"] and record["keys"] == [] for record in native_states)
+                        assert any(not record["paused"] for record in native_states[1:])
+                elif case == 'bench-repeat':
+                    assert session.start_requests == [(420, 'scripted', 'ArmSmokeRepeat')]
+                elif case == 'bench-physical':
+                    assert session.start_requests == [(180, 'physical', None)]
+                else:
+                    assert session.start_requests == ([(arm_duration, "scripted", "ArmSmoke")] if arm_bench else [(12, "physical", None)])
                 assert [pulse["key"] for pulse in evidence["pulses"]] == ([] if arm_bench else ["w", "a", "u", "j"])
-        if case not in {"bench-pause", "bench-monitor-failure", "bench-camera-loss", "bench-finalize-stall", "bench-finalize-late-result"}:
+        if case not in {"bench-pause", "bench-monitor-failure", "bench-frontend-state-reject", "bench-frontend-state-reset", "bench-camera-loss", "bench-camera-readiness-timeout", "bench-finalize-stall", "bench-finalize-late-result", "bench-virtual-budget-stop", "bench-virtual-operator"}:
             assert result.returncode == 0, result.stdout + result.stderr + f"\nServer body arrivals: {intervals[-20:]}"
         assert session.error is None
-        assert FakeCamera.requests > before
+        assert camera_handler.requests > before
         assert adapter.wait(3), "session cleanup worker must terminate before verdict"
         final = adapter.state()
-        assert final["phase"] == "complete"
+        assert final["phase"] == ("operator_stopped" if case == "bench-virtual-budget-stop" else "complete")
         assert final["error"] is None
         assert final["cleanup_verified"] is True
         assert not session.native.is_connected
@@ -872,6 +1146,16 @@ def test_browser_loopback_native_path(tmp_path, case):
     finally:
         session.stopped.set()
         adapter.wait(3)
+        observer_stop.set()
+        if coverage_thread:
+            coverage_thread.join(2)
+        if observer_thread:
+            observer_thread.join(2)
+        for replay in output_replay:
+            replay.stop()
+            summary = replay.summary()
+            assert summary["bursts"] >= 1 and summary["forwarded_chunks"]["host"] > 20
+            assert 39_000 < summary["produced_bytes"]["host"] / summary["elapsed_s"] < 50_000
         for owner in (server, camera):
             owner.shutdown()
             owner.server_close()

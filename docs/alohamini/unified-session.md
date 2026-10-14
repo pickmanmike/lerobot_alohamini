@@ -1,5 +1,500 @@
 # AM1 supervised unified Local session
 
+## Current direction: AM1-SESSION-ARCHITECTURE-01
+
+The owner replaced the proposed connection-continuity handoff and canceled the
+Roaming Aggressiveness experiment and administrator question. Do not execute
+that adapter transaction or request its elevation. The current deliverable is
+the [consolidated persistent-session design](roaming-resilient-sessions.md),
+source inspection, migration and fake-only slice brief for review before
+implementation. Reliability milestones below remain open; preserve their
+repairs, evidence and separate private deployment pins.
+
+## AM1-RELIABILITY-03 — current virtual reliability workstream
+
+For a finite live-payload comparison, `--delivery-jpeg-quality-percent 15` reduces
+only live 640×360 JPEG quality. Omission or explicit `45` preserves the existing
+0.45 value; 10 fps capture and 1280×720 H264 recording remain unchanged. Private
+transport/result records retain the request, and the source terminal reports the
+applied choice. This payload-pressure hypothesis does not qualify delivery or
+relax observation limits; inspect current framing before powered admission.
+
+The subsequent smaller-payload attempt had no SSH loss and completed two cycles
+before a Resume request lost current coverage between preparation and forwarding.
+Its ordinary Stop and cleanup succeeded; the workload remained incomplete. The
+runner now keeps that one request held within its original recovery episode and
+requires the same owner, pause, gate and fresh proof before forwarding. Expiry,
+operator intervention, ownership changes and backend refusal remain terminal.
+No recovery count, motion timeline or observation limit is reset.
+
+Execute finite virtual/scripted arm input and automated owned body controls,
+with the existing spare P1 observer current throughout useful runs. The owner
+authorizes supported software repairs, bounded ordinary runs and qualified
+same-session recovery without attendance/readiness/manual-leader actions.
+Manual-leader acceptance and independent cutoff development are outside this
+packet; older procedural prerequisites do not apply to this workstream.
+
+Preserve actual motor/thermal/current/status/feedback limits, ownership, private
+configuration/calibration/mappings, exact separate pins and rollback. Do not
+force a powered process freeze, bus fault or overload. Optional camera quality
+issues must be recorded separately from required observation coverage and motion
+authority. Actual required-coverage loss must hold/freeze, then qualify bounded
+recovery; explicit user Pause/Stop and real motor faults are not cleared.
+
+Target one four-cycle ArmSmokeRepeat: 352 trajectory seconds, original seed and
+existing amplitudes/rates/holds, within the unchanged 420-second native ceiling.
+Completion requires characterized useful outward and return motion, current
+observer evidence, focused review/tests and exact deployment/publication proof.
+Do not substitute another diagnostic-only result for this completion loop.
+
+The explicit virtual bench uses numeric role health and a fresh nonce-qualified
+P1 image. Required coverage keeps a 500 ms causal source-age bound. Tagged
+precise local QPC round trips subtract only the original same-P1 elapsed time
+between challenge receipt and capture, with a conservative one-millisecond
+precision margin and contradiction checks; legacy records retain the full
+round-trip bound. Startup stabilization requires a current continuous twenty
+seconds of fresh delivery. Cumulative startup gaps and the whole-invocation
+uninterrupted verdict remain separate from that current qualification. Transient Windows
+health-file sharing refusals
+retain only an accepted record until its original expiry and expose uncertainty.
+All five camera views remain a separate quality result; optional view loss has
+bounded role-local reconnects. Required coverage loss freezes the existing
+trajectory and permits at most three qualified same-session recoveries, each
+within ten seconds. The absolute native deadline remains unchanged. A later
+operator Pause, Stop, foreign owner or motor fault revokes automatic recovery.
+
+The supported short ArmHoldBody profile holds all twelve fresh measured arm
+targets and permits normal owned body commands for twelve seconds. Other
+scripted arm profiles continue to send zero body velocity. Body execution must
+declare inspected current scene coverage in addition to P1 arms/lift coverage.
+
+Software validation currently includes nine loaded real HTTP/frontend/native
+pipe cases and 49 camera/pure-policy Node tests. These cover optional degradation,
+required observation hold/recovery, explicit operator refusal, scripted body
+commands, refused Start and existing packet-02 behavior. The first packet-03
+thirty-second powered diagnostic completed with verified cleanup and one
+qualified same-session observation recovery. Continuous P1 recording covered
+the run; selected event images and clips were retained and inspected. The
+observer's current startup window qualified separately from cumulative earlier
+gaps. Its uninterrupted-delivery verdict remains separate from recovered motion.
+
+The diagnostic exposed feedback clipping at the arm command range, which hid
+actual movement and return error. AM1 feedback now retains the calibrated affine
+measurement beyond command endpoints; command range and current/relative limits
+remain enforced. Encoded targets round inward within the existing relative
+limit, and incompatible protected holds refuse before either arm write.
+Actual shoulder return and the four-cycle workload remain pending.
+
+The scoped preparation and selected integral-gain experiment passed 153 focused
+tests and was staged while the motor owner was stopped. It uses the same
+qualified live owner, finite inward preparation, one fresh program seed and the
+unchanged original trajectory. The selected I1 experiment records its original
+registers before writing and verifies restoration to I0 with torque off.
+The first powered I1 trial advanced only preparation, then failed on lift temperature
+history before the original program began. Its original cleanup_unknown remains unchanged. A
+later stopped-owner read verified all sixteen motors torque-off, zero body velocity goals
+and restored I0; the actual gain snapshot separately verifies I1-to-I0 restoration. Return
+and four-cycle completion remain pending.
+
+A subsequent P1 capture acquired all 660 seconds and released normally, while
+its receiver failed after delayed return delivery and an SSH connection reset.
+Original source acquisition, JPEG, JSON and socket-write timings stayed fast at
+matched delay spikes. An original 20-second qualification window is retained
+separately from current stale status and the failed receiver verdict. The next
+lossless-compression experiment failed current qualification and stopped with
+verified camera release; it does not demonstrate improved delivery. It showed
+that a forwarding channel can stall while the source-owning SSH process remains
+alive. Recovery now rebuilds a forwarding-only connection on a new local port
+to the same capture, preserving its remote port, generation, token, original
+nonce timestamps, deadline and three-attempt/five-second budget. Original owner
+and delivery failure verdicts remain separate from later cleanup. All 77 focused
+observer tests pass. The next capture, with compression off, recorded the actual preparation
+and interruption with no socket losses or reconnects, then stopped and released normally.
+Its original freshness gaps remain recorded and its whole-capture uninterrupted verdict is
+false. The verified finalized recording is retained privately; actual motion still requires
+current delivery and inspected framing.
+
+The failed preparation reproduced a lift history freshness decision crossing 500 ms between
+two clock reads, while current raw feedback remained fresh and the preceding eight loops
+stayed within their normal scheduling interval. The focused correction revalidates raw feedback
+and evaluates the history decision at one actual timestamp; any real grouped refresh then
+takes a fresh completion timestamp. Original readings, old peaks and both 500 ms limits
+remain enforced. All 172 affected thermal tests pass, including the crossing and refusal of
+raw feedback that expires before refresh authorization. Independent review found no
+actionable blocker; powered completion remains pending.
+
+Two later observer launches failed during staging before capture, and read-only input probes
+did not establish a repeatable delimiter cause. An explicit file-copy staging option now
+uploads inert files, verifies their exact sizes, hashes and invocation identity, and publishes
+the capture only after a validated acknowledgement. Directory creation, upload and finalization
+share the original thirty-second deadline; phase and first-failure evidence remain private.
+Default stdin staging is unchanged. All 89 observer tests pass, including real local PowerShell
+validation and timeout/corruption refusals. A finite passive capture subsequently staged through
+this path, qualified a genuine current startup window, then stopped with verified camera release.
+Its original delivery gaps remain recorded separately; this is not combined motion evidence.
+
+AM1 activation now verifies all arm mappings, cached calibration and current EEPROM limits,
+torque-off and raw positions before powered lift setup. After homing it takes fresh raw arm
+positions, seeds both buses, verifies all accepted goals, and checks the original raw-vector
+age before each torque enable. Goal readbacks never renew position freshness. Unsupported
+resting poses refuse without substituting an EEPROM boundary or widening preparation.
+All 491 affected activation, lift, gain rollback, native preparation, recovery, body-hold and
+launcher tests pass. Independent review found no actionable blocker; AM2 follows its existing
+activation path. The owner clarified in AM1-RELIABILITY-03A that the present shoulder
+pose is ordinary normal rest. Resolve its coordinate/calibration/startup-acquisition
+mismatch, then prove positive automatic startup, useful return, the original workload
+and Stop → natural rest → Start. Manual placement inside the old interval is not a
+startup prerequisite. The earlier refusal and support request remain historical evidence.
+
+The normal-rest investigation recovered the original commissioning record. It asked for full
+ROM, but the selected shoulder upper endpoint remained one tick beyond the chosen midpoint;
+the opposite side was never captured. A reviewed affected-joint correction now uses the
+stable, owner-qualified and visually inspected natural-rest operating reference. It changes
+only that endpoint in the private cache and persistent servo setting, with an exact original
+backup, unchanged offset/direction/Phase and verified closed/reopened-bus readback. This is
+not a newly measured hard mechanical maximum or a claim of whole-range clearance.
+
+The optional `AM1_SCRIPTED_LEFT_SHOULDER_AMPLITUDE` reduction preserves the selected joint's
+original physical excursion under the corrected span. It is checked before remote startup,
+permits only finite positive reductions through the original three units, and applies only
+to the unified virtual ArmSmoke/Repeat path. Four cycles reuse the same mapping and seed;
+the selected return envelope is reduced in the same units while other joints keep their
+original envelope. Plan events label the remapped recipe; timing remains 88/352 seconds.
+The flag must be absent for ordinary manual input and ArmHoldBody. Old normalized shoulder
+poses/datasets are not numerically comparable under the corrected map: convert through the
+saved raw affine mapping before reuse. Leader calibration remains unchanged; normal manual
+startup continues its existing synchronization using the corrected follower coordinates.
+
+Final focused checks: 254 startup, corrected-endpoint/restart, virtual amplitude, early
+preflight, preparation and launcher cases pass. Three unsafe-startup mutations and endpoint
+exclusion are caught. New modules are lint-clean; modified legacy files introduce no new
+lint findings. Independent source review is clear; software checks remain separate from
+actual motion qualification.
+
+Earlier corrected-map automatic starts succeeded from normal rest. The short I0 baseline showed too
+little selected-joint motion to prove useful return. The scoped reversible I1 comparison
+showed a gradual small excursion and actual later return near the original seed, with
+normal cleanup and verified restoration to I0. Images independently show reversal without
+new contact or an abrupt startup move. The tighter immediate-return criterion did not pass;
+this result establishes a delayed useful return, not precision tracking at every phase.
+
+The next ArmSmokeRepeat attempt completed two cycles and two original boundary
+qualifications, reaching 220.053 of 352 trajectory seconds after 3.188 seconds of preparation.
+Three required-observation losses recovered in the same session; a fourth freshness loss
+exhausted the unchanged recovery budget and triggered ordinary owned Stop. Cleanup was
+verified. A subsequent benchmark finalization timeout occurred during stopped-session log
+collection; it is secondary to the preserved observation-budget stop. Full completion and
+the planned comparable restart confirmation remain pending. Investigate the demonstrated
+response-delivery delay before another powered repeat; keep original source ages, ownership,
+freshness thresholds, trajectory, seed and recovery budgets unchanged.
+
+A later smaller-live-JPEG comparison had no transport loss but stopped at 217.039/352
+trajectory seconds when current observation expired between Resume preparation and
+forwarding. The same-episode held-request correction was tested and staged. Its next
+actual attempt refused before Live on two repeated lift velocity/position direction
+disagreements; no trajectory or Resume ran. The original cleanup_unknown verdict remains.
+A separate exclusive read-only inspection subsequently verified all sixteen motors off,
+zero body goals, selected gain I0 and unchanged corrected calibration. A conservative
+post-home quiet-feedback transition passed 341 focused checks and was staged within the
+existing settling budget. The next observer capture stopped before startup admission on
+a delivery stall, leaving the lift transition unexercised at that point. A
+secondary receiver defect was reproduced: synchronous cleanup lookup blocked the live
+source FIFO during forwarding recovery. The narrow ordered-EOF/Stop lookup correction
+passed 217 focused observer cases and independent regression checks. Original source
+ages, identities and recovery limits remain unchanged; the initial transport stall and
+the lift hypothesis's physical effectiveness remain unproven.
+
+The latest automatic start from normal rest reached Live through the quiet-feedback
+transition. It rejected a moving post-home sample, then required five quiet samples
+over 0.208 seconds within the original settling deadline. Relief direction subsequently
+qualified under the unchanged guard. This demonstrates startup admission on this attempt;
+it does not establish the earlier lift disagreement's physical cause or longer endurance.
+The run completed three cycles and three measured envelope boundaries: 326.754 of 352
+trajectory seconds after 3.218 seconds of preparation, with 338.913 seconds in Live.
+Three observation losses recovered automatically in the same session; a fourth exhausted
+the original recovery budget and triggered ordinary Stop with cleanup verified. The held
+Resume correction was exercised without owner input. Original recording and timing
+records are retained. All four gaps had steady source cadence and delayed shared receipt;
+no retained Wi-Fi security event overlaps the powered run. The failing transport layer
+remains under investigation. Later useful selected-shoulder return remains distinct from
+the failed tighter immediate-return criterion and from unproven return of every joint.
+
+A further receiver correction preserves partial newline-framed records through an idle
+read without retiring a still-owned connection. Complete coalesced records retain their
+original receipt time; an unfinished EOF record never grants authority. Real EOF/reset
+and operating-system transport errors retain bounded forwarding recovery. The first idle
+anchors the original five-second deadline; stale, replayed, foreign or late-processed
+frames cannot renew it. The post-decode deadline check can unqualify a briefly published
+actually fresh frame; no lifecycle renewal is inferred from that publication. The
+233 affected observer checks passed with background-thread warnings treated as errors.
+This repairs receiver framing/idle classification, not the initial shared IP delay.
+An isolated comparison with additional outbound gateway activity still retained two
+half-second delivery gaps and does not establish a mitigation. No adapter or network
+permission setting was changed. All original failed/partial results remain unchanged.
+
+A camera-only attempt with that correction lost delivery before robot Start. The
+receiver sent Stop 5.012 seconds after the original idle indication; repeated idle
+records belonged to cleanup, not a renewed recovery budget. The original failed
+receiver verdict is retained. After connectivity returned, the same generation's
+final artifact independently verified finite capture completion and camera release.
+A local Wi-Fi security stop occurred 14 ms after the last decoded receipt, followed
+by repeated reauthentication and failed connections to both known device hosts.
+This identifies a connection event at this failure boundary, not its driver or
+access-point mechanism or the cause of earlier gaps without matching events.
+A one-property roaming comparison and exact rollback are being prepared;
+no adapter, permission or motor setting has been changed by this investigation.
+
+Full completion, comparable automatic restart from resulting normal rest and the
+conditional body check remain pending; PR #16 remains draft.
+Plan: [AM1-03 executable plan](../superpowers/plans/2026-10-06-am1-reliability-03.md).
+Historical packet-02/01 evidence below retains its original verdicts.
+
+## AM1-RELIABILITY-02 — integration and bounded follow-ups
+
+PR #14 was merged ordinarily into `integrate/am1-local-teleop` as
+`7da4cb2ab249f4a83e87edd97fb19e9f2bebc62b`, with parents `8b5f8963` and
+`915a32d4`. PR #15 was then retargeted, its actual ten-file incremental diff
+reviewed, and merged as `9aa6d3b042a92e538213b0c684fd52d000b9cc7c`, with
+parents `7da4cb2a` and `39647399`. Each merge tree equals its reviewed PR
+head. Both PRs are closed as merged; remote integration matches. Main remains
+`ab4462b713aeb24d0473f1ec6c8812290ab19510`; no protection bypass was used.
+The latest posted PR #15 review and final focused code review found no blocker.
+GitHub returned no commit status contexts or PR workflow runs for either head.
+Prior test results below retain their actual source versions; integration did
+not trigger another broad suite or powered trial.
+
+### Restored access and virtual-control results — October 6, 2026
+
+The owner restored both leaders and the spare observer, then directed bounded
+virtual arm/body controls without attendance requests or owner leader/key
+movements. This supersedes the earlier attendance and owner-movement instructions
+for these ordinary checks. Existing guards and excluded fault scenarios remain.
+Moving physical-leader input is untested; the 180-second scenario is prepared.
+
+Both original leader identities are present at their existing COM assignments,
+and the non-actuating 180-second preflight passes with unchanged calibration.
+The intended P1 observer host and existing remote access were verified. Only
+the spare camera was initialized and its supported modes enumerated. Two private
+1280×720/10 fps NV12, six-second H264 clips without audio were normally stopped
+and released, retrieved with matching SHA256 hashes, and completely decoded
+(56 and 55 frames). Three images per clip retain decoder presentation timestamps;
+two new frames from each clip were inspected. Recording request/acknowledgment
+times are separate from within-clip presentation timestamps. The second clip
+overlaps arm-01 and shows both arms and the lift, with blocky early video and
+some changing positions. It does not quantify three-unit tracking or isolate
+a joint. Base supports and the disconnect are outside the view. Unrelated
+cameras/services were untouched; imagery and access/device metadata stay private.
+
+These are packet-02 attempts. Keep the packet-01 verdicts below unchanged.
+
+| Attempt | Actual result |
+| --- | --- |
+| body-01 | Refused before Live: expected motors absent on the left follower/body bus. No native client or pulses. Host 1, camera 0, original session 2 / cleanup_unknown. The owner confirmed follower power was off and restored it. |
+| body-02 | 12.086 seconds Live, frontend W/A/U/J press/release, 120 sends, zero feedback timeout/recovery or body-input expiration; session/client/host/camera exit 0 and verified cleanup. |
+| arm-01 | 51.503 seconds Live, 48.172/88 trajectory seconds, then Pi temperature-history freshness refusal. One freeze, recovery epoch 1, no completed recovery. Native 130 after fault Stop, host 1, original session 2 / cleanup_unknown. |
+| arm-02 | Frontend state-request-failed during camera startup, before motor host/native client/Live/pulses. Owned Stop: operator_stopped/130, verified cleanup, camera 0. HTTP versus JSON/UI-processing cause is unknown. |
+| arm-03 | 6.135 seconds Live, 2.105/88 trajectory seconds, then runner Stop on a five-second required-camera-view timeout. Session/native 130, host/camera 0, verified cleanup; 13 empty polls, zero freezes/recovery. |
+| arm-04 | One complete 88.000-second commanded trajectory in 88.803 seconds Live, 883 sends; all runtime exits 0, verified cleanup. Three preserved empty polls, no feedback recovery/stale latch. Small-return tracking remains incomplete. |
+| arm-05 | One ArmSmokeRepeat attempt: 54.096 seconds Live, 51.009/352 trajectory seconds, 538 sends. Required chest/left-wrist decoded views became stale; owned Stop, session/native 130, host/camera 0, verified cleanup. Ten preserved empty polls, zero freezes/recovery/stale latch; no completed cycle or boundary. |
+
+After body-01 and again after arm-01, a reviewed exclusive one-shot invocation
+of the installed normal zero/off routine freshly verified all 16 torque
+registers and four body/lift velocity goals were zero and closed both ports.
+It held both ownership locks, checked exact motor/source identities, protected
+cancellation cleanup, and preserved calibration and each original summary byte
+for byte. Seven private fake verifier cases pass. These are separate register
+proofs, not retroactive successful cleanup or full motion/thermal qualification.
+Each permitted replacement of a stopped idle console before a deliberate new
+attempt. No recovery approval or automatic restart was used.
+
+Body-02 operational lift samples were 30–33 C, at most 65 mA, status zero,
+11.3–11.9 V, with largest adjacent raw-read gap 61.023 ms. Up/down goal and
+measured velocities were ±200 raw; height ranged 10.356–11.074 mm and ended
+at 10.356 mm. All-phase logs also retain an unexplained isolated startup 68 C
+reading/warning and homing current up to 435.5 mA. Those are separate from
+operational maxima. Wheel displacement is unmeasured. Static leader reads and
+startup synchronization do not qualify moving physical input.
+
+Arm-01 operational lift samples were 31–34 C, at most 32.5 mA, status zero
+and 11.7–11.9 V. The unchanged temperature guard correctly refused five genuine
+slot peaks spanning 512.023 ms against its 500 ms limit. Offline replay of
+actual acquisition timestamps reproduces the first fault. The initiating
+adjacent-read gap was 143.022 ms; the next group read took 1.440 ms. This
+locates delay after the prior sample in owner-loop work/scheduling, but the
+specific phase/cause was not retained. The old snapshot contained a subsequent
+healthy loop and the current refusing loop. Later empty-poll/error output
+follows the dead host and is not a successful recovery. Wi-Fi, logging,
+servo failure and overheating are not established causes.
+
+Seven completed arm-01 endpoints had maximum error 1.596 normalized units.
+Left shoulder-lift responded +2.9975 to its +3-unit command, then stayed there
+through the small return request and origin hold. Arm-04 again showed +2.9975
+outward response without the small return. Its maximum outbound endpoint error
+was 2.6896; final maximum seed displacement was 2.9975. Other joints showed
+mixed partial return. Arm-05 left shoulder-lift reached +3.3306 and retained
+that displacement through return/origin hold. No repeat boundary was reached.
+These are normalized units, not degrees. Outward response is measured; precise
+small-return response is unresolved. Gains, amplitudes and calibration stay unchanged.
+
+Arm-04 operational lift samples were 32–35 C, at most 39 mA, status zero,
+11.7–11.9 V; largest adjacent gap 60.028 ms. One isolated startup temperature
+warning remains in the logs. Its sole script freeze is the normal terminal
+finally call after completion, not a feedback pause. Arm-05 operational lift
+samples were 32–35 C, at most 39 mA, status zero, 11.7–11.9 V, with largest
+adjacent gap 62.022 ms and no temperature warning. Arm-04/05 lift height stayed
+within 10.397–10.418 mm. Temperature/current measurements here are lift-only.
+
+### Diagnostics and observation limits
+
+A reviewed host-only diagnostic retains eight completed loop timings plus the
+current loop, independent snapshot copies and an explicit omitted-loop count.
+It adds no motor reads, control threads, IO, sleeps or periodic output and
+does not change temperature policy. RED/green regressions and 14 focused host
+fault/loop tests pass; lint adds no finding. Staging used stopped owners, exact
+old/new file hashes, a one-file diff, clean detached source and an in-place
+private motor-pin update preserving permissions.
+
+The bench now records passive frontend state HTTP/failure/page-error evidence
+and bounded per-role decoded-image ages, sequences, source labels and decode
+diagnostics. It retains at most 700 records with an explicit dropped count.
+Fake frontend 503/disconnect cases were RED, then five affected checks passed.
+Camera-loss was RED, then four affected checks passed; the exact readiness
+timeout regression also passed after RED. A readiness-failure snapshot starts
+without awaiting it before owned Stop. Evidence finalization waits at most one
+second after cleanup and preserves failure timing if the snapshot is unavailable.
+No served Control behavior, camera threshold, recovery approval or retry changed.
+At final bench source 1a8ac290, all seven affected fake-browser cases passed
+(39 deselected); AST/JavaScript syntax and diff checks also passed.
+
+Arm-03 recorded 196 frontend state HTTP 200 responses, zero failed state
+requests/page errors. Pi source cameras stayed fresh while decoded views were
+intermittently stale. A subsequent exclusive camera-only 60-second run exited 0.
+Its 35-second read-only browser check retained 24 DOM samples, all five views
+fresh, with zero status/decode failures/cancellations and maximum primary display
+gap 495 ms. That demonstrates availability, not repair of the interruption.
+Arm-04 recorded 316 state HTTP 200 responses and 416 retained Live camera samples
+all five fresh; 37 earlier ring records were evicted.
+
+Arm-05 recorded 249 state HTTP 200 responses, zero failed state requests/page
+errors, and no dropped records. At the first camera refusal, chest and left
+wrist image ages were 1653/1652 ms against the 1500 ms thumbnail limit; the
+other views remained fresh. Diagnostics showed three camera-status failures,
+maximum status request 1517 ms, and zero decode failures/stream cancellations.
+Pi acquisition remained fresh at roughly 15–20 fps with maximum source gaps
+under 71 ms. The delay is in delivery of decoded views; its exact layer is
+not yet established. No full cycle or continuous-duration pass follows from
+this interrupted attempt.
+
+A corrected camera-only 120-second diagnostic then exited 0 without motor
+access; a fresh source/owner audit found clean pins and no remaining owner.
+Its 105-second read-only browser capture recorded 105 DOM samples, all five
+views fresh, with no dropped record, failed request, decode failure or stream
+cancellation. It received 213 state, 366 camera-status and 840 snapshot HTTP 200
+responses. Maximum snapshot duration was 802.615 ms, mainly waiting for
+response bytes after a roughly 2 ms local connection/request start; maximum
+status duration was 447.513 ms. This does not isolate network versus proxy/Pi
+waiting and is not a matched powered camera repair. The earlier SSH TCP
+connection timeout and the mistakenly requested 180-second camera diagnostic
+are retained separately: both failed before capture, the latter at the installed
+120-second duration guard. That guard was not changed.
+
+### Opt-in finite repetition
+
+Ordinary `ArmSmoke` and its 30/180-second runner options remain unchanged.
+`ArmSmokeRepeat` composes four existing 88-second trajectories in one native
+Local session. It retains one original fresh frozen seed, inward 3-unit targets,
+three-second ramps, original holds, 10 Hz cadence and existing freshness/recovery
+rules. No cycle homes, synchronizes, reconnects or starts a new session. The
+352 trajectory seconds include the original holds; boundary time is excluded.
+
+At every boundary, including the fourth, three distinct sender-admitted fresh
+advancing observations must span at least 0.2 seconds and remain within 3
+normalized units of the original seed. A pause clears the partial qualification
+window and elapsed wall time. Outside-tolerance feedback refuses through normal
+cleanup; no reseeding, corrective jump or automatic retry is permitted.
+
+This is an envelope admission check. Its tolerance equals the commanded excursion,
+so it does not prove precise physical return: offline replay of the actual
+arm-04 final pose at 2.9975 units qualifies with three advancing synthetic
+observations. The replay is not powered evidence. Original-seed retention still
+prevents cumulative rebasing across cycles. A successful workload requires one
+profile-specific terminal summary, four cycles and four qualified boundaries.
+The native ceiling is exactly 420 seconds throughout console/session/native
+and PowerShell launch paths. Scripted profiles disable body/lift input.
+
+`PhysicalLeader` remains a separately selected ordinary 180-second session
+for actual movements of both physical leaders and 200 ms owned frontend W/A/U/J
+pulses. The latest owner-directed virtual checks did not exercise moving leaders.
+
+At runtime source 7249eec3, affected core verification was **304 passed, 1 skipped**
+(POSIX process-group test on Windows); affected bench cases were **18 passed**.
+Nine affected tests reran after test-only lint repairs. Fake native entrypoint
+tests complete four cycles with one connection/admission; real sender tests
+refuse stale/lost admission at boundaries. Real frontend/HTTP/Windows pipe tests
+verify dispatch and owned cleanup. These are not powered endurance evidence.
+AST, JavaScript syntax and diff checks pass. Ruff 0.14.1 comparison adds no
+findings against integration (63 inherited findings in seven checked files).
+
+### Working paths, deployment and rollback
+
+Candidate branch: `codex/am1-reliability-02`, based on `9aa6d3b0`, in
+`C:\Users\pickm\.codex\worktrees\am1-reliability-01\lerobot_alohamini_client`.
+Shell: PowerShell 7. Use the existing
+`C:\Users\pickm\lerobot_alohamini_client\.venv` with `uv run --no-sync` and
+the candidate root/`src` on `PYTHONPATH`; no installation is required.
+
+The post-merge comparison from Windows 81c10a84 to integration 9aa6d3b0 was
+documentation-only and did not justify deployment. Reviewed finite-repeat
+runtime 7249eec309f9ebdf4bbc469c1cc888cb2e2fe673 was subsequently staged on
+Windows. Pi helper remains 8e6a0cf616cb2000df1d0e996ab27a19d2fb2fba and
+camera remains 9b1f0670e7068f7d39eb50270a118e3807418355. Only Pi motor
+changed, to host-history diagnostic 6d99b263d609c4048602a1ac5c48dda679f65c74,
+parent c3fc683d; its file matches candidate host commit 81034618. The separate
+passive bench runner is 1a8ac290, not the served Windows runtime.
+
+Configured deployment directory:
+`C:\Users\pickm\lerobot_alohamini_client\.worktrees\am1-console-implementation`.
+Existing launch:
+
+```powershell
+$env:UV_PROJECT_ENVIRONMENT = 'C:\Users\pickm\lerobot_alohamini_client\.venv'
+$env:PYTHONPATH = "$PWD\src;$PWD"
+uv run --no-sync python -m tools.am1_console --config config\am1.session.json --no-browser
+```
+
+Rollback only while stopped/unowned: restore Windows detached
+81c10a8497fda8eea36bac3ea6861f9e6ff5ed05 and only its private Windows pin
+from the preserved backup. Independently restore Pi motor detached
+c3fc683d645ea1c355e69a72f705a8bbadde6a1a and only its private motor pin.
+Preserve private-file permissions, mappings, calibration and separate pins.
+
+Use the reviewed candidate bench with the existing installed Node/Playwright,
+`AM1_BENCH_HEADLESS=0`, the actual configured Windows head, and a new private
+evidence path/identity for each deliberate invocation. Page opening never Starts.
+Ordinary launch syntax is `node tools\am1_reliability_bench.cjs <console-url>
+<scenario> <new-identity> <new-private-json> <actual-windows-head>`.
+Prepared scenarios are PhysicalLeader (180 seconds) and ArmSmokeRepeat (420).
+
+### Remaining physical evidence and stop capability
+
+The older packet-01 shoulder-lift sample was clipped at normalized 100 during
+a 100→97 request. Normalized 100 cannot distinguish physical nonmovement from
+raw feedback outside calibration. New outward response establishes movement
+within the interval; small return remains unqualified. Existing command and
+feedback logs do not establish a servo failure or an active arm current limit.
+No competing motor reader/controller or undocumented tuning was introduced.
+
+Read-only installation checks found the existing follower USB aliases and no
+configured AM1 independent motor-disable unit. Stop, watchdog and torque-off
+cleanup depend on the owning motor process. The physical disconnect is outside
+the observer view, so independent cutoff capability is not visually verified
+or qualified. Recommend a reachable, appropriately rated local cutoff of AM1
+motor supplies that works independently of Windows, Pi and the network.
+New wiring/dock hardware is outside this packet. Retain the owner's arm
+swing-down confirmation; it does not establish process-freeze protection.
+Process freeze, forced bus fault, overload and unrestricted/automatic recovery
+remain excluded. AM2 is untouched.
+
 ## AM1-RELIABILITY-01 — October 6, 2026
 
 For this packet the owner authorizes finite automated bench operation with the
@@ -62,7 +557,9 @@ camera-auth file outside Git. If necessary, set `NODE_PATH` to the existing
 Playwright installation. For the current packet's finite arm scenario:
 
 ```powershell
-node tools/am1_reliability_bench.cjs http://127.0.0.1:8765/ ArmSmoke AM1-RELIABILITY-01-arm-02 <private-absolute-evidence-path> 81c10a8497fda8eea36bac3ea6861f9e6ff5ed05 30
+node tools/am1_reliability_bench.cjs http://127.0.0.1:8765/ ArmSmoke
+AM1-RELIABILITY-01-arm-02 <private-absolute-evidence-path>
+81c10a8497fda8eea36bac3ea6861f9e6ff5ed05 30
 ```
 
 The optional final argument permits only the short 30-second native arm limit or
@@ -185,7 +682,8 @@ config backup, after checking for intervening private edits):
 git switch --detach 915a32d4d9ac42433c1aee95f4f0c74f348c5dda
 $am1RollbackConfig = Get-Content -LiteralPath config/am1.session.json -Raw | ConvertFrom-Json
 $am1RollbackConfig.windows_session_head = '915a32d4d9ac42433c1aee95f4f0c74f348c5dda'
-$am1RollbackConfig | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath config/am1.session.json -Encoding utf8
+$am1RollbackConfig | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath
+config/am1.session.json -Encoding utf8
 ```
 
 Normal preflight must pass again before Start. The older DirectBrowser entrypoint
@@ -226,7 +724,9 @@ shutdown, required-view loss, manual pause, foreign-owner refusal, failed monito
 reads, delayed finalization, stalled finalization and late terminal response:
 
 ```powershell
-uv run --no-sync python -m pytest -p no:cacheprovider tests/robots/test_am1_console_bridge.py tests/robots/test_am1_console_local_path.py -k 'bench or inflight_read' -q --tb=short
+uv run --no-sync python -m pytest -p no:cacheprovider
+tests/robots/test_am1_console_bridge.py tests/robots/test_am1_console_local_path.py -k
+'bench or inflight_read' -q --tb=short
 node --test tests/cameras/test_am1_console_ui.cjs
 node --check tools/am1_reliability_bench.cjs
 git diff --check
@@ -436,7 +936,8 @@ expire after 250 ms of accepted-browser silence, independently of the approved
 1.5-second browser-presence allowance. A short gap clears held movement: release
 the controls, then deliberately press again; it does not by itself pause the arms.
 Leaving Control, losing focus, failed input/state requests or lost presence still
-clear body input and request measured-arm pause. Resume and exceptional realignment require explicit on-page approval
+clear body input and request measured-arm pause. Resume and exceptional realignment require
+explicit on-page approval
 and fresh host/follower/leader qualification. Q on Control or Stop from any page
 requests the existing exact-session cleanup. Do not treat a returned Stop request
 as verified shutdown: wait for the final session result. The exact result folder
@@ -886,7 +1387,8 @@ if practical manual use exposes a material usability problem. Keep P16 and the
 existing profile, calibration, gains and limits.
 
 Ordinary startup automatically aligns followers to held-still physical leaders;
-manual matching is optional, not required. Historical shoulder/arbitrary-pose, camera acquisition/browser delivery
+manual matching is optional, not required. Historical shoulder/arbitrary-pose, camera
+acquisition/browser delivery
 (including the 1.138 s display gap), long-duration and unattended-use limitations
 remain. Network infrastructure remediation is external. See the short
 [everyday reference](#everyday-supervised-use); historical records below are not

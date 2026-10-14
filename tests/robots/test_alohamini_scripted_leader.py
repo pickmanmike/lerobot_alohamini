@@ -250,6 +250,150 @@ def test_provider_refuses_duplicate_feedback_and_clock_regression():
         provider.advance(0, pose(m), 2)
 
 
+def repeat_provider(m, *, records=None):
+    factory = getattr(m, "ArmSmokeRepeatInput", None)
+    assert factory is not None, "opt-in repeated native provider is missing"
+    return factory(pose(m), joint_keys=m.AM1_ARM_POSITION_KEYS, fps=10,
+                   emit=(records if records is not None else []).append)
+
+
+def first_repeat_boundary(provider, initial):
+    provider.admit(0)
+    for seq in range(1, 881):
+        provider.advance(seq / 10, initial, seq)
+    assert provider.elapsed_s == pytest.approx(88)
+    assert not provider.complete
+
+
+def test_repeat_completes_four_continuous_cycles_with_one_original_seed():
+    m = module()
+    original = pose(m)
+    mutable_seed = dict(original)
+    records = []
+    factory = getattr(m, "ArmSmokeRepeatInput", None)
+    assert factory is not None, "opt-in repeated native provider is missing"
+    provider = factory(mutable_seed, joint_keys=m.AM1_ARM_POSITION_KEYS, fps=10, emit=records.append)
+    mutable_seed.update({k: v + 2 for k, v in mutable_seed.items()})
+    provider.admit(0)
+    previous = provider.get_action()
+    for seq in range(1, 3701):
+        measured = {f"arm_{k}": v + .5 for k, v in previous.items()}
+        provider.advance(seq / 10, measured, seq)
+        current = provider.get_action()
+        assert max(abs(current[k] - previous[k]) for k in current) <= .101
+        assert sum(current[k.removeprefix('arm_')] != v for k, v in original.items()) <= 1
+        previous = current
+        if provider.complete:
+            break
+    assert provider.complete and provider.elapsed_s == pytest.approx(352)
+    assert seq > 3520  # Fresh boundary windows are evidence, never trajectory padding.
+    assert provider.origin == original
+    plans = [r for r in records if r['event'] == 'am1_scripted_segment_plan']
+    assert len(plans) == 48
+    assert all(r['origin'] == original[r['joint']] and r['target'] == original[r['joint']] + 3 for r in plans)
+    assert not any(r['event'] == 'am1_scripted_input_summary' for r in records)
+    provider.finish('script_complete')
+    summaries = [r for r in records if r['event'] == 'am1_scripted_input_summary']
+    assert len(summaries) == 1
+    assert summaries[0]['profile_complete'] is True
+    assert summaries[0]['motion_profile'] == 'ArmSmokeRepeat'
+    assert summaries[0]['cycles_completed'] == summaries[0]['returns_qualified'] == 4
+
+
+def test_repeat_boundary_needs_three_advancing_returns_over_point_two_seconds():
+    m = module()
+    records = []
+    provider = repeat_provider(m, records=records)
+    first_repeat_boundary(provider, pose(m))
+    original_action = provider.get_action()
+    for seq, now in [(881, 88.1), (882, 88.2)]:
+        provider.advance(now, pose(m), seq)
+        assert provider.elapsed_s == 88 and provider.get_action() == original_action
+    provider.advance(88.3, pose(m), 883)
+    provider.advance(88.4, pose(m), 884)
+    assert provider.elapsed_s == pytest.approx(88.1)
+    boundary = [r for r in records if r['event'] == 'am1_scripted_return_qualified']
+    assert len(boundary) == 1 and boundary[0]['cycle'] == 1
+    assert boundary[0]['sample_count'] == 3 and boundary[0]['span_s'] >= .2 - 1e-9
+
+
+def test_repeat_refuses_drift_duplicate_or_invalid_boundary_feedback():
+    m = module()
+    provider = repeat_provider(m)
+    first_repeat_boundary(provider, pose(m))
+    with pytest.raises(ValueError, match='sequence'):
+        provider.advance(88.1, pose(m), 880)
+    drift = pose(m)
+    drift[m.AM1_ARM_POSITION_KEYS[0]] += 3.01
+    with pytest.raises(ValueError, match='return'):
+        provider.advance(88.2, drift, 881)
+    assert provider.elapsed_s == 88 and not provider.complete
+    assert provider.origin == pose(m)
+
+
+def test_repeat_freeze_discards_partial_return_window_without_catchup():
+    m = module()
+    provider = repeat_provider(m)
+    first_repeat_boundary(provider, pose(m))
+    provider.advance(88.1, pose(m), 881)
+    provider.advance(88.2, pose(m), 882)
+    provider.freeze()
+    provider.advance(299.0, pose(m), 883)
+    provider.admit(300.0)
+    provider.advance(300.1, pose(m), 884)
+    provider.advance(300.2, pose(m), 885)
+    assert provider.elapsed_s == 88 and not provider.complete
+    provider.advance(300.3, pose(m), 886)
+    provider.advance(320.0, pose(m), 887)
+    assert provider.elapsed_s == pytest.approx(88.1)
+    assert provider.origin == pose(m)
+
+
+def test_repeat_cancellation_at_boundary_never_starts_another_cycle():
+    m = module()
+    records = []
+    provider = repeat_provider(m, records=records)
+    first_repeat_boundary(provider, pose(m))
+    provider.advance(88.1, pose(m), 881)
+    provider.finish('explicit_stop')
+    provider.admit(100.0)
+    provider.advance(100.1, pose(m), 882)
+    provider.finish('script_complete')
+    assert provider.elapsed_s == 88 and not provider.complete
+    assert len([r for r in records if r['event'] == 'am1_scripted_segment_plan']) == 12
+    summary = [r for r in records if r['event'] == 'am1_scripted_input_summary']
+    assert len(summary) == 1 and summary[0]['stop_reason'] == 'explicit_stop'
+    assert summary[0]['profile_complete'] is False
+
+
+@pytest.mark.parametrize('losing_state', ['paused', 'epoch', 'stopped', 'finished', 'dead', 'duration', 'fault', 'stale'])
+def test_real_sender_blocks_repeat_boundary_when_admission_or_feedback_is_lost(losing_state):
+    m = module()
+    provider = repeat_provider(m)
+    first_repeat_boundary(provider, pose(m))
+    sender = m.AM1LiveActionSender(
+        object(), initial_action=m.make_am1_live_action(pose(m)), initial_observation_sequence=880,
+        fps=10, duration_s=1 if losing_state == 'duration' else 420, profile_cadence=False,
+        recovery_enabled=True, monotonic=lambda: 88.1,
+    )
+    sender._thread = SimpleNamespace(is_alive=lambda: losing_state != 'dead')
+    sender._live_started_at = 0
+    if losing_state == 'paused':
+        sender._recovery_state = 'paused'
+    if losing_state == 'epoch':
+        sender._recovery_epoch = 2
+    if losing_state == 'stopped':
+        sender._stop_requested.set()
+    if losing_state == 'finished':
+        sender._finished.set()
+    if losing_state == 'fault':
+        sender._error = RuntimeError('real sender fault')
+    sample = m.AM1LiveSample(881, 87 if losing_state == 'stale' else 88.1,
+                            pose(m), pose(m), pose(m), 0.0)
+    assert sender.advance_scripted_input(provider, sample, epoch=0, clock_active=True) is None
+    assert provider.elapsed_s == 88 and not provider.complete and provider.returns_qualified == 0
+
+
 class LocalHarness:
     """Synchronous fake worker/host: actual startup and Local producer run with fake time."""
 
@@ -397,6 +541,45 @@ class LocalHarness:
         args = m.parse_args(arguments(tmp_path / "stop") + ["--duration_s", str(duration)], platform_name="Windows")
         return m.run_teleoperation(args, input_fn=input_fn or (lambda prompt: ""),
                                   monotonic=self.clock, sleep_fn=self.sleep)
+
+
+@pytest.mark.parametrize('cancel_after', [None, 88.1])
+def test_actual_native_entrypoint_dispatches_repeat_and_preserves_cancellation(
+    monkeypatch, tmp_path, capsys, cancel_after,
+):
+    m = module()
+    harness = LocalHarness(monkeypatch, m, quit_after=cancel_after)
+    args = m.parse_args(arguments(tmp_path / 'stop') +
+                        ['--motion_profile', 'ArmSmokeRepeat', '--duration_s', '420'], platform_name='Windows')
+    factory = m.ArmSmokeRepeatInput
+    def provider(*a, **kw):
+        harness.provider = factory(*a, **kw)
+        return harness.provider
+    monkeypatch.setattr(m, 'ArmSmokeRepeatInput', provider)
+    assert m.run_teleoperation(args, input_fn=lambda prompt: '',
+                               monotonic=harness.clock, sleep_fn=harness.sleep) == 0
+    output = capsys.readouterr().out
+    summary = [json.loads(line) for line in output.splitlines()
+               if line.startswith('{') and json.loads(line).get('event') == 'am1_scripted_input_summary']
+    assert len(summary) == 1 and summary[0]['motion_profile'] == 'ArmSmokeRepeat'
+    assert summary[0]['profile_complete'] is (cancel_after is None)
+    assert summary[0]['stop_reason'] == ('script_complete' if cancel_after is None else 'manual_q')
+    assert sum(e[0] == 'connect' for e in harness.events) == 1
+    assert sum(e[0] == 'admitted' for e in harness.events) == 1
+    assert harness.events.index(('private_socket_close_and_join',)) < harness.events.index(('disconnect',))
+    if cancel_after is None:
+        assert summary[0]['trajectory_s'] == 352
+        assert summary[0]['cycles_completed'] == summary[0]['returns_qualified'] == 4
+    else:
+        assert not harness.provider.complete and harness.provider.elapsed_s < 100
+
+
+@pytest.mark.parametrize('duration', [0, 180, 419, 421, 1800])
+def test_repeat_native_ceiling_cannot_be_omitted_shortened_or_extended(tmp_path, duration):
+    m = module()
+    with pytest.raises(SystemExit):
+        m.parse_args(arguments(tmp_path / 'stop') +
+                     ['--motion_profile', 'ArmSmokeRepeat', '--duration_s', str(duration)], platform_name='Windows')
 
 
 @pytest.mark.parametrize("kind", ["empty", "old_reply", "combined_age"])

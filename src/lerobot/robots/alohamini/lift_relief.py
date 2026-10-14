@@ -719,6 +719,7 @@ class InstalledLiftCheck:
 
     def home_and_relieve(
         self, *, allow_one_count_variation: bool = False, qualify_initial_direction: bool = False,
+        require_quiet_post_home: bool = False,
     ) -> tuple[Any, float]:
         """The same bounded mechanics for the opt-in comparison and normal AM1 startup."""
         self.reader.set_phase("setup_position")
@@ -737,6 +738,7 @@ class InstalledLiftCheck:
             expected_goal=0,
             allow_settling=True,
             timeout_s=grouped_feedback.SETTLE_TIMEOUT_S,
+            require_quiet_motion_feedback=require_quiet_post_home,
         )
         post_home_height = self._height_from_record(post_home)
         self.monitor.record("post_home_height", height_mm=round(post_home_height, 4))

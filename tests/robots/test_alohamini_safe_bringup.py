@@ -21,6 +21,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from lerobot.motors import Motor, MotorCalibration, MotorNormMode
 from lerobot.robots.alohamini import alohamini as alohamini_module
 from lerobot.robots.alohamini import alohamini_calibrate as calibrate_module
 from lerobot.robots.alohamini import alohamini_lift_home as lift_home_module
@@ -146,6 +147,15 @@ def make_activation_robot(*, fail_arm_enable: bool = False):
     right_names = ("arm_right_shoulder_pan", "arm_right_gripper")
     left = FakeBus("left", left_names, events)
     right = FakeBus("right", right_names, events)
+    for bus in (left, right):
+        bus.motors = {name: Motor(index, "sts3215", MotorNormMode.RANGE_M100_100)
+                      for index, name in enumerate(bus.motors, 1)}
+        bus.calibration = {name: MotorCalibration(motor.id, 0, 0, 0, 4095)
+                           for name, motor in bus.motors.items() if name.startswith("arm_")}
+        for name in bus.calibration:
+            bus.registers[("Min_Position_Limit", name)] = 0
+            bus.registers[("Max_Position_Limit", name)] = 4095
+            bus.registers[("Homing_Offset", name)] = 0
     left.registers[("Present_Position", "arm_left_shoulder_pan")] = 101
     left.registers[("Present_Position", "arm_left_gripper")] = 202
     right.registers[("Present_Position", "arm_right_shoulder_pan")] = 303

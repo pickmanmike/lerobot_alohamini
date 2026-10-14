@@ -6,11 +6,11 @@ diagnostic profiles retain their single-reading policy for historical comparison
 
 from __future__ import annotations
 
-from collections import deque
-from dataclasses import replace
 import json
 import math
 import time
+from collections import deque
+from dataclasses import replace
 from typing import Any
 
 from . import lift_motor_feedback as feedback
@@ -191,6 +191,7 @@ class OperationalLift(InstalledLiftCheck):
             self.temperature.assert_fresh(time.monotonic())
             result, _ = self.home_and_relieve(
                 allow_one_count_variation=True, qualify_initial_direction=True,
+                require_quiet_post_home=True,
             )
             self._goal_since = time.monotonic()
             self.poll()
@@ -350,10 +351,17 @@ class OperationalLift(InstalledLiftCheck):
             # margin. Only still-fresh RAW feedback permits one genuine read;
             # never catch/clear a latched window refusal or retry until qualified.
             self.temperature.assert_fresh(now, refreshing=True)
-            if now - self.temperature.samples[0][0] > self.temperature.MAX_AGE_S:
+            # Decide and qualify the cached history at the same actual clock.
+            # Recheck RAW freshness here: work in the first guard cannot grant
+            # permission to read after the latest acquisition itself expires.
+            history_now = time.monotonic()
+            self.temperature.assert_fresh(history_now, refreshing=True)
+            if history_now - self.temperature.samples[0][0] > self.temperature.MAX_AGE_S:
                 self.poll(defer_sample_log=True)
-            # The full five-slot policy still decides, including read duration.
-            self.temperature.assert_fresh(time.monotonic())
+                history_now = time.monotonic()
+            # After a real read this is its actual completion-time guard; with
+            # no read there is no intervening work or second-clock boundary race.
+            self.temperature.assert_fresh(history_now)
         except BaseException as error:
             self.failure = error
             raise

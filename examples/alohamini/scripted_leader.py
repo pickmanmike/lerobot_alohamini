@@ -16,14 +16,34 @@ class ScriptedLeaderInput:
     Feedback is evidence, not a new trajectory origin.
     """
 
+    motion_profile = "ArmSmoke"
+    hold_only = False
+
     def __init__(
         self, initial_positions: Mapping[str, float], *, joint_keys: tuple[str, ...],
         fps: int, emit: Callable[[dict[str, Any]], None] | None = None,
+        joint_amplitudes: Mapping[str, float] | None = None,
     ) -> None:
         if set(initial_positions) != set(joint_keys) or len(joint_keys) != 12:
             raise ValueError("scripted seed requires the exact AM1 arm-position key set")
         if fps != 10:
             raise ValueError("ArmSmoke requires the reviewed 10 Hz cadence")
+        if self.hold_only and joint_amplitudes is not None:
+            raise ValueError("hold-only input does not accept joint amplitude overrides")
+        self.joint_amplitudes = dict.fromkeys(joint_keys, 3.0)
+        if joint_amplitudes is not None:
+            if not isinstance(joint_amplitudes, Mapping) or set(joint_amplitudes) - set(joint_keys):
+                raise ValueError("joint amplitude overrides require known AM1 arm-position keys")
+            for key, amplitude in joint_amplitudes.items():
+                if isinstance(amplitude, bool):
+                    raise ValueError("joint amplitude must be finite and greater than zero through 3")
+                try:
+                    amplitude = float(amplitude)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("joint amplitude must be finite and greater than zero through 3") from exc
+                if not math.isfinite(amplitude) or not 0 < amplitude <= 3.0:
+                    raise ValueError("joint amplitude must be finite and greater than zero through 3")
+                self.joint_amplitudes[key] = amplitude
         self.origin = {key: float(initial_positions[key]) for key in joint_keys}
         for key, value in self.origin.items():
             lower = 0.0 if key.endswith("gripper.pos") else -100.0
@@ -31,7 +51,7 @@ class ScriptedLeaderInput:
                 raise ValueError(f"scripted seed {key} is outside {lower}..100")
         self.joint_keys = joint_keys
         self.elapsed_s = 0.0
-        self.duration_s = 2.0 + len(joint_keys) * 7.0 + 2.0
+        self.duration_s = 12.0 if self.hold_only else 2.0 + len(joint_keys) * 7.0 + 2.0
         self._frame_s = 1.0 / fps
         self._last_tick: float | None = None
         self._sequence = -1
@@ -41,14 +61,23 @@ class ScriptedLeaderInput:
         self._finished = False
         self._pending_events: list[dict[str, Any]] = []
         self._emit = emit or (lambda record: print(json.dumps(record, sort_keys=True), flush=True))
-        self.targets = {
-            key: value + (3.0 if value <= 97.0 else -3.0)
-            for key, value in self.origin.items()
-        }
-        for key in joint_keys:
-            self._record("am1_scripted_segment_plan", joint=key, origin=self.origin[key],
-                         target=self.targets[key], amplitude=self.targets[key] - self.origin[key],
-                         ramp_s=3.0, endpoint_hold_s=0.5, reduced=False, skipped=False)
+        self.targets = (
+            dict(self.origin) if self.hold_only else {
+                key: value + (self.joint_amplitudes[key] if value <= 97.0 else -self.joint_amplitudes[key])
+                for key, value in self.origin.items()
+            }
+        )
+        if self.hold_only:
+            self._record("am1_scripted_hold_plan", duration_s=12.0, origin=dict(self.origin),
+                         meaning="fixed measured-arm targets; normal owned body input allowed")
+        else:
+            for key in joint_keys:
+                self._record("am1_scripted_segment_plan", joint=key, origin=self.origin[key],
+                             target=self.targets[key], amplitude=self.targets[key] - self.origin[key],
+                             ramp_s=3.0, endpoint_hold_s=0.5,
+                             reduced=self.joint_amplitudes[key] < 3.0, skipped=False,
+                             recipe="mapped_physical_excursion" if self.joint_amplitudes[key] < 3.0 else "original",
+                             timing_changed=False)
         self.flush_events()
 
     @property
@@ -56,7 +85,7 @@ class ScriptedLeaderInput:
         return self.elapsed_s >= self.duration_s
 
     def _record(self, event: str, **fields: Any) -> None:
-        self._pending_events.append({"event": event, "input_source": "scripted", "motion_profile": "ArmSmoke",
+        self._pending_events.append({"event": event, "input_source": "scripted", "motion_profile": self.motion_profile,
                                      "trajectory_s": round(self.elapsed_s, 6), "wall_time_ns": time.time_ns(), **fields})
 
     def flush_events(self) -> None:
@@ -77,6 +106,8 @@ class ScriptedLeaderInput:
         self._last_tick = None
 
     def _position(self) -> tuple[int | None, str, float]:
+        if self.hold_only:
+            return None, "measured_hold", 0.0
         t = self.elapsed_s
         if t < 2.0:
             return None, "baseline", 0.0
@@ -143,3 +174,10 @@ class ScriptedLeaderInput:
                      profile_complete=self.complete, observation_sequence=self._sequence,
                      requested=dict(self._action), observed=self._observed)
         self.flush_events()
+
+
+class ArmHoldBodyInput(ScriptedLeaderInput):
+    """Explicit short body check using one frozen fresh follower-arm seed."""
+
+    motion_profile = "ArmHoldBody"
+    hold_only = True
