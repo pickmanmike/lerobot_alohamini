@@ -1,5 +1,13 @@
 # AM1 supervised unified Local session
 
+## Native Pi simulated session continuation
+
+AM1-SESSION-PI-01 implements the isolated non-actuating stage-2 slice, stacked on accepted draft #17. Existing finite providers run natively against simulated feedback; no physical or camera IO is available. Final native executable c4256e9c: 106 passes / one Windows-only DACL skip, exit 0. Focused runtime review and corrective regressions passed. Normal deployments and separate private pins are preserved.
+
+The independent transient user units am1-pi01-owner.service and am1-pi01-gateway.service provide the isolated simulated trial, with no boot autostart or task autoplay. The exact direct HTTPS URL and short ordinary enrollment/start and rollback helpers are in the private local trial record. Accepted current-user CA trust and direct two-context testing passed: lost Start reconciliation, detach/return, independent enrollment, gateway restart and explicit Claim/Pause/Resume preserved one run, original seed and deadline. The existing ArmSmokeRepeat provider completed 352 trajectory seconds/four qualified cycles in about 359.19/420 Live seconds with one admission; simulated ArmHoldBody completed 12 seconds. A separate owner restart produced interrupted/uncertain/new incarnation/no autoplay, then explicit reconciliation without replay. Launch SSH had exited before the browser proof. AM1-SESSION-PI-01 is complete within simulated scope; no remaining permission step. No TLS exceptions or required SSH tunnel are used.
+
+Rollback stops only those trial units/listener and removes only introduced current-user trust by the recorded exact thumbprint; retain private evidence/state and the branch. Existing motor/helper/camera checkouts, credentials, calibration and normal permissions remain unchanged. See the [consolidated native-slice contract and evidence](roaming-resilient-sessions.md#implemented-stage-2-slice-native-pi-simulated-hardware). P1 independence, useful physical movement, full powered workload and normal-rest restart remain later bounded work.
+
 ## Current direction: AM1-SESSION-ARCHITECTURE-01
 
 The owner replaced the proposed connection-continuity handoff and canceled the
@@ -10,8 +18,9 @@ with stage 1 implemented and task-reviewed on the fake-only follow-up branch.
 Whole-branch review completed; its cross-client Pause ordering finding was
 corrected with an atomic Resume intent revision fence and real two-browser
 coverage. Fresh Windows focused evidence is recorded in the consolidated
-architecture; the stacked follow-up remains a fake-only draft checkpoint. Linux
-qualification remains pending. Stage 2 Pi owner/extracted finite profile is next;
+architecture. Those pending Linux/stage-2 statements describe the historical
+stage-1 checkpoint; native simulated qualification is recorded above and in the
+consolidated continuation. Stage 3 independent P1 proof remains the next scope;
 no powered independence claim precedes stage 3 observer proof. Reliability
 milestones below remain open; preserve their repairs, evidence and separate
 private deployment pins.

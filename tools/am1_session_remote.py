@@ -26,6 +26,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, TextIO
 
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from examples.alohamini.am1_session_runtime import acquire_session_admission  # noqa: E402
+
 
 SESSION_ID_PATTERN = re.compile(r"^[0-9]{8}T[0-9]{6}-[0-9a-f]{8}$")
 TERMINAL_STATES = {"complete", "fault", "cleanup_unknown", "refused"}
@@ -488,13 +492,9 @@ class RemoteSupervisor:
         state_directory = Path(self.args.state_directory)
         state_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(state_directory, 0o700)
-        import fcntl
-
-        self.lock_stream = (state_directory / "active.lock").open("a+", encoding="utf-8")
         try:
-            fcntl.flock(self.lock_stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            self.lock_stream.close()
+            self.lock_stream = acquire_session_admission(state_directory)
+        except RuntimeError as exc:
             self.lock_stream = None
             raise SessionRefusal("Another AM1 unified session supervisor is active; refusing takeover.") from exc
         self.session_root.mkdir(parents=True, exist_ok=False, mode=0o700)

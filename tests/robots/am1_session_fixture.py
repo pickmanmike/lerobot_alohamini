@@ -27,9 +27,10 @@ def wait_file(path, process):
 
 
 class Cluster:
-    def __init__(self, directory):
+    def __init__(self, directory, simulated=False):
         from tools.am1_session_ipc import private_directory
 
+        self.simulated = simulated
         self.directory = private_directory(directory)
         self.owner_dir = self.directory / "owner"
         self.auth_dir = self.directory / "auth"
@@ -73,15 +74,29 @@ class Cluster:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
-            env=os.environ.copy(),
+            env=dict(
+                os.environ, **({"AM1_SCRIPTED_LEFT_SHOULDER_AMPLITUDE": "1.5"} if self.simulated else {})
+            ),
         )
 
     def start_owner(self):
         metadata = self.owner_dir / "ipc.json"
         metadata.unlink(missing_ok=True)
-        self.owner = self.spawn(
-            [str(Path(__file__).resolve()), "--owner", str(self.owner_dir), str(self.flags)]
-        )
+        if self.simulated:
+            self.owner = self.spawn(
+                [
+                    "-m",
+                    "tools.am1_pi_executor",
+                    "--state",
+                    str(self.owner_dir),
+                    "--simulated-admission-state",
+                    str(self.directory / "simulated-admission"),
+                ]
+            )
+        else:
+            self.owner = self.spawn(
+                [str(Path(__file__).resolve()), "--owner", str(self.owner_dir), str(self.flags)]
+            )
         wait_file(metadata, self.owner)
 
     def start_gateway(self):
@@ -207,7 +222,7 @@ if __name__ == "__main__":
         asyncio.run(run_owner(sys.argv[2], PrivateProofExecutor()))
         sys.exit(0)
     with tempfile.TemporaryDirectory(prefix="am1-fake-browser-") as temporary:
-        cluster = Cluster(temporary)
+        cluster = Cluster(temporary, simulated="--simulated" in sys.argv)
         try:
             print(
                 json.dumps(

@@ -3,8 +3,8 @@ const {test} = require("node:test"), assert = require("node:assert/strict");
 const {spawn} = require("node:child_process"), readline = require("node:readline");
 const {chromium} = require("playwright");
 
-async function fixture() {
-  const worker = spawn(process.env.AM1_TEST_PYTHON, ["-B", "tests/robots/am1_session_fixture.py", "--browser"], {stdio:["pipe","pipe","pipe"], env:process.env});
+async function fixture(simulated=false) {
+  const worker = spawn(process.env.AM1_TEST_PYTHON, ["-B", "tests/robots/am1_session_fixture.py", "--browser", ...(simulated ? ["--simulated"] : [])], {stdio:["pipe","pipe","pipe"], env:process.env});
   let error = ""; worker.stderr.on("data", data => error += data);
   const lines = readline.createInterface({input:worker.stdout});
   const pending = [];
@@ -237,4 +237,36 @@ for(const delivery of ["delivered","delayed"]) test(`spectator Pause fences owne
   await pa.locator('[data-operation="Resume"]').click();await pa.waitForFunction(()=>am1Remote.snapshot.run.status==="running");
   await pb.waitForFunction(()=>am1Remote.snapshot.run.status==="running");
   console.log(JSON.stringify({contexts:2,snapshotDelivery:delivery,actualSpectatorPause:true,renderedPaused,noStaleDispatch:true,freshExplicitResume:true}));
+});
+
+test("simulated provider UI Pause and Resume preserve one seed and original deadline", async t => {
+  const f=await fixture(true);
+  t.after(()=>f.close());
+  const browser=await chromium.launch({headless:true,channel:process.env.AM1_TEST_BROWSER_CHANNEL || "msedge"});
+  t.after(()=>browser.close());
+  const context=await browser.newContext({ignoreHTTPSErrors:true});
+  const page=await context.newPage();
+  try {
+    await enroll(page,f.info.url,f.info.a);
+    await page.locator('[data-operation="ClaimInput"]').click();
+    await page.waitForFunction(()=>am1Remote.controllerGeneration);
+    await page.locator("#fake-recipe").selectOption("sim-arm-smoke-repeat");
+    await page.locator('[data-operation="Start"]').click();
+    await page.waitForFunction(()=>am1Remote.snapshot?.run?.progress_s>.2);
+    const before=await page.evaluate(()=>am1Remote.snapshot.run);
+    await page.locator('[data-operation="Pause"]').click();
+    await page.waitForFunction(()=>am1Remote.snapshot?.run?.status==="paused" && am1Remote.snapshot.evidence.pose_aligned);
+    const paused=await page.evaluate(()=>am1Remote.snapshot.run.progress_s);
+    await page.locator('[data-operation="Resume"]').click();
+    await page.waitForFunction(p=>am1Remote.snapshot?.run?.status==="running" && am1Remote.snapshot.run.progress_s>p,paused,{timeout:3000});
+    const after=await page.evaluate(()=>am1Remote.snapshot.run);
+    assert.equal(after.run_id,before.run_id);
+    assert.equal(after.deadline,before.deadline);
+    assert.deepEqual(after.execution.original_seed,before.execution.original_seed);
+    assert.equal(after.execution.admissions,1);
+    assert.equal(after.recovery_episodes,0);
+    await page.locator('[data-operation="Stop"]').click();
+    await page.waitForFunction(()=>am1Remote.snapshot?.run?.status==="stopped");
+    assert.equal(await page.evaluate(()=>am1Remote.snapshot.run.cleanup),"simulated_hold_acknowledged");
+  } finally {await context.close();await browser.close();await f.close();}
 });

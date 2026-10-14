@@ -1,4 +1,4 @@
-"""Immutable, explicitly fake session recipes and JSON validation."""
+"""Immutable non-actuating session recipes and JSON validation."""
 
 import uuid
 from dataclasses import dataclass
@@ -18,6 +18,9 @@ RECIPES = MappingProxyType(
     {
         "fake-finite": Recipe("fake-finite", "finite", 352.0, 420.0),
         "fake-finite-short": Recipe("fake-finite-short", "finite", 1.0, 12.0),
+        "sim-arm-smoke": Recipe("sim-arm-smoke", "finite", 88.0, 180.0),
+        "sim-arm-smoke-repeat": Recipe("sim-arm-smoke-repeat", "finite", 352.0, 420.0),
+        "sim-arm-hold-body": Recipe("sim-arm-hold-body", "finite", 12.0, 30.0),
         "fake-interactive": Recipe("fake-interactive", "interactive", None, 420.0),
     }
 )

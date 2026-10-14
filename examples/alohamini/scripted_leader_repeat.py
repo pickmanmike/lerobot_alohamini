@@ -7,7 +7,10 @@ import time
 from collections.abc import Callable, Mapping
 from typing import Any
 
-from scripted_leader import ScriptedLeaderInput
+if __package__:
+    from .scripted_leader import ScriptedLeaderInput
+else:
+    from scripted_leader import ScriptedLeaderInput
 
 
 class ArmSmokeRepeatInput:
