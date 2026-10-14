@@ -17,6 +17,7 @@
 import json
 import logging
 import math
+import os
 import sys
 import time
 from collections.abc import Callable
@@ -34,11 +35,13 @@ from lerobot.utils.decorators import check_if_already_connected, check_if_not_co
 
 from ..robot import Robot
 from ..utils import ensure_safe_goal_position
+from .am1_elbow_integral import ELBOW as RECOVERY_ELBOW, AM1ElbowIntegralTrial
 from .am1_shoulder_integral import AM1ShoulderIntegralTrial
 from .config_alohamini import AlohaMiniConfig
 from .lift_axis import LiftAxis, LiftAxisConfig, LiftHomeResult
 from .model_specs import arm_state_keys_for_robot_model, validate_robot_model
 from .motor_safety import REGISTER_RETRIES, set_torque_enabled, write_register
+from .selected_joint_evidence import MOTOR as SELECTED_JOINT_MOTOR, POSITION as SELECTED_JOINT_POSITION
 
 logger = logging.getLogger(__name__)
 
@@ -474,18 +477,42 @@ class AlohaMini(Robot):
         # Aloha Mini 1's established motor Phase must remain untouched, so apply the
         # same runtime delay/acceleration profile explicitly without reading or writing Phase.
         for name in bus.motors:
+            if bus is getattr(self, "left_bus", None) and name == RECOVERY_ELBOW and (getattr(self, "_am1_elbow_integral_trial", None) is not None or getattr(self, "_am1_visible_control_binding", None) is not None):
+                continue  # The selected trial preserves its actual baseline settings.
             write_register(bus, "Return_Delay_Time", name, 0)
             write_register(bus, "Maximum_Acceleration", name, 254)
             write_register(bus, "Acceleration", name, 254)
 
     def configure(self) -> None:
         """Configure motor modes and gains while leaving all torque disabled."""
-        set_torque_enabled(self.left_bus, self.left_bus.motors, enabled=False)
+        visible = getattr(self, "_am1_visible_control_evidence", None)
+        visible_binding = getattr(self, "_am1_visible_control_binding", None)
+        if visible_binding is not None:
+            if (visible is None or AM1ElbowIntegralTrial.requested_integral() is not None
+                or getattr(self, "_am1_elbow_integral_trial", None) is not None
+                or os.environ.get("AM1_SHOULDER_INTEGRAL_TEST") == "1"):
+                raise RuntimeError("Visible control requires read-only I0 settings without an integral trial")
+            visible.prepare_visible(self, visible_binding)
+        previous_elbow = getattr(self, "_am1_elbow_integral_trial", None)
+        if previous_elbow is not None:
+            previous_elbow.restore(self)
+        integral = AM1ElbowIntegralTrial.requested_integral()
+        elbow_trial = None
+        if integral is not None:
+            elbow_trial = AM1ElbowIntegralTrial(integral=integral)
+            self._am1_elbow_integral_trial = elbow_trial
+            elbow_trial.prepare(self)
+            elbow_trial.disable_torque(self)
+        else:
+            self._am1_elbow_integral_trial = None
+        set_torque_enabled(self.left_bus, [n for n in self.left_bus.motors if elbow_trial is None or n != RECOVERY_ELBOW], enabled=False)
         previous_trial = getattr(self, "_am1_shoulder_integral_trial", None)
         if previous_trial is not None:
             previous_trial.restore(self)
         self._configure_bus_defaults(self.left_bus)
         for name in self.left_arm_motors:
+            if name == RECOVERY_ELBOW and (elbow_trial is not None or visible_binding is not None):
+                continue
             write_register(self.left_bus, "Operating_Mode", name, OperatingMode.POSITION.value)
             # Preserve the existing Aloha Mini follower-arm PID profile.
             write_register(self.left_bus, "P_Coefficient", name, 16)
@@ -509,6 +536,8 @@ class AlohaMini(Robot):
         # Retain the trial before its first write, including partially applied failures.
         self._am1_shoulder_integral_trial = AM1ShoulderIntegralTrial()
         self._am1_shoulder_integral_trial.configure(self)
+        if elbow_trial is not None:
+            elbow_trial.apply(self)
 
     def _seed_arm_goals(self, bus: FeetechMotorsBus, motors: list[str]) -> None:
         present_positions = {
@@ -535,7 +564,51 @@ class AlohaMini(Robot):
 
     AM1_ACTIVATION_MAX_RAW_AGE_S = 1.0
 
+    def _refresh_am1_startup_lift_feedback(self) -> None:
+        """Keep the existing lift acquisition continuous through AM1 activation.
+
+        This runs only on the owner thread at startup boundaries. A due read
+        retains the same thermal slots, clocks and latched fault; a gap is never
+        converted to five new lows. Ordinary host-loop cadence is unchanged.
+        """
+        if self.config.robot_model != "alohamini1":
+            return
+        operation = getattr(self, "_lift_operation", None)
+        if operation is None:
+            return  # Homing was explicitly skipped; preserve that existing path.
+        from .lift_motor_feedback import POLL_S, ComparisonRefusal
+
+        try:
+            operation.raise_if_faulted()
+            record = operation.last_record
+            stamp = record.get("sample_monotonic_s") if isinstance(record, dict) else None
+            now = time.monotonic()
+            if (
+                isinstance(stamp, bool)
+                or not isinstance(stamp, (int, float))
+                or not math.isfinite(stamp)
+                or not math.isfinite(now)
+                or now < stamp
+            ):
+                raise ComparisonRefusal("startup: original lift acquisition clock is unavailable or invalid.")
+            window = operation.temperature
+            current_slot = (round(now * 1_000_000_000) - window._origin_ns) // round(
+                window.SLOT_S * 1_000_000_000
+            )
+            # A lower reply in the same slot retains its earlier peak. Acquire
+            # the next original slot before that peak can age out, even when
+            # the nominal raw poll interval has not yet elapsed.
+            if now - stamp >= POLL_S or current_slot > window._last_slot:
+                operation.poll()
+            window.assert_fresh(time.monotonic())
+        except BaseException as error:
+            if operation.failure is None:
+                operation.failure = error
+            raise
+
     def _require_am1_activation_fresh(self, phase: str) -> None:
+        if phase == "after_home":
+            self._refresh_am1_startup_lift_feedback()
         expected = len(self.left_arm_motors) + len(self.right_arm_motors)
         if not expected:
             return
@@ -693,6 +766,12 @@ class AlohaMini(Robot):
                     for name in names:
                         self._require_am1_activation_fresh("after_home")
                         set_torque_enabled(bus, (name,), enabled=True)
+            elbow_trial = getattr(self, "_am1_elbow_integral_trial", None)
+            if elbow_trial is not None:
+                elbow_trial.verify_active(self)
+            visible = getattr(self, "_am1_visible_control_evidence", None)
+            if getattr(self, "_am1_visible_control_binding", None) is not None:
+                visible.verify_visible_active(self)
         except BaseException as error:
             cleanup_errors = self._safe_shutdown(close_buses=True, recover_interrupted_bus_io=True)
             if isinstance(error, (KeyboardInterrupt, SystemExit)):
@@ -715,7 +794,12 @@ class AlohaMini(Robot):
         normal motor I/O after an exception. The Feetech SDK can otherwise retain
         its single-transaction busy flag when ``KeyboardInterrupt`` escapes a read.
         """
+        self._am1_shutdown_in_progress = True
         errors: list[str] = []
+        previous_evidence = getattr(self, "_am1_shutdown_evidence", None)
+        already_closed = not any(bus is not None and bus.is_connected for bus in (self.left_bus, self.right_bus))
+        if getattr(self, "_am1_protected_cleanup", False) and already_closed and previous_evidence is not None:
+            errors.extend(previous_evidence.get("cleanup_errors", []))
 
         if recover_interrupted_bus_io and self.config.robot_model == "alohamini1":
             for bus_name, bus in (("left", self.left_bus), ("right", self.right_bus)):
@@ -746,10 +830,20 @@ class AlohaMini(Robot):
                 continue
             for name in bus.motors:
                 try:
-                    set_torque_enabled(bus, (name,), enabled=False)
+                    elbow_trial = getattr(self, "_am1_elbow_integral_trial", None)
+                    if bus is self.left_bus and name == RECOVERY_ELBOW and elbow_trial is not None:
+                        elbow_trial.disable_torque(self)
+                    else:
+                        set_torque_enabled(bus, (name,), enabled=False)
                 except Exception as error:
                     errors.append(f"disable {bus_name}/{name}: {error}")
 
+        elbow_trial = getattr(self, "_am1_elbow_integral_trial", None)
+        if elbow_trial is not None:
+            try:
+                elbow_trial.restore(self)
+            except BaseException as error:
+                errors.append(f"restore AM1 selected elbow integral: {type(error).__name__}: {error}")
         integral_trial = getattr(self, "_am1_shoulder_integral_trial", None)
         if integral_trial is not None:
             try:
@@ -765,6 +859,45 @@ class AlohaMini(Robot):
                 motor_shutdown_check()
             except Exception as error:
                 errors.append(f"verify final motor shutdown state: {error}")
+
+        if getattr(self, "_am1_protected_cleanup", False) and not (already_closed and previous_evidence is not None):
+            evidence = {"verified": False, "readbacks": [], "started_at_monotonic_s": time.monotonic()}
+            self._am1_shutdown_evidence = evidence
+            for bus_name, bus in (("left", self.left_bus), ("right", self.right_bus)):
+                if bus is None and bus_name == "right" and getattr(self.config, "no_follower", False):
+                    continue  # This legacy body/lift owner never configured right-arm motors.
+                if bus is None or not bus.is_connected:
+                    errors.append(f"AM1 cleanup readback: {bus_name} bus unavailable")
+                    continue
+                registers = [("Torque_Enable", name) for name in bus.motors]
+                if bus is self.left_bus:
+                    registers += [("Goal_Velocity", name) for name in (*self.base_motors, self.lift.cfg.name)
+                                  if name in bus.motors]
+                for register, name in registers:
+                    row = {"bus": bus_name, "motor": name, "register": register,
+                           "read_started_at_monotonic_s": time.monotonic()}
+                    evidence["readbacks"].append(row)
+                    try:
+                        value = bus.read(register, name, normalize=False, num_retry=REGISTER_RETRIES)
+                        if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+                            raise RuntimeError("shutdown readback was not a raw integer")
+                        row["value"] = int(value)
+                        if value != 0:
+                            raise RuntimeError(f"shutdown {register} remained {value}; expected zero")
+                    except Exception as error:
+                        row["error"] = f"{type(error).__name__}: {error}"
+                        errors.append(f"AM1 cleanup readback {bus_name}/{name}/{register}: {error}")
+                    finally:
+                        row["read_completed_at_monotonic_s"] = time.monotonic()
+            evidence["lift_readback"] = "qualified" if operation is not None and not errors else "unavailable-or-failed"
+            evidence["selected_gain_restore_required"] = bool(
+                (integral_trial is not None and integral_trial.restore_required)
+                or (elbow_trial is not None and elbow_trial.restore_required)
+            )
+            if elbow_trial is not None:
+                evidence["elbow_integral"] = elbow_trial.evidence
+            evidence["completed_at_monotonic_s"] = time.monotonic()
+            evidence["verified"] = not errors
 
         for name, camera in self.cameras.items():
             if not camera.is_connected:
@@ -784,6 +917,12 @@ class AlohaMini(Robot):
                     errors.append(f"close {bus_name} bus: {error}")
 
         self.lift.mark_unhomed()
+        if getattr(self, "_am1_protected_cleanup", False):
+            self._am1_shutdown_evidence["cleanup_errors"] = list(errors)
+            self._am1_shutdown_evidence["buses_closed"] = close_buses and not any(
+                bus is not None and bus.is_connected for bus in (self.left_bus, self.right_bus)
+            )
+            self._am1_shutdown_evidence["verified"] = not errors
         for error in errors:
             logger.error("AlohaMini shutdown issue: %s", error)
         return errors
@@ -1045,11 +1184,22 @@ class AlohaMini(Robot):
         # arm_pos = self.left_bus.sync_read("Present_Position", self.arm_motors)
 
         #print(f"Left arm motors: {self.left_arm_motors}, Right arm motors: {self.right_arm_motors}")  # debug
-        left_pos = (
-            self._read_arm_positions(self.left_bus, self.left_arm_motors)
-            if self.left_arm_motors
-            else {}
-        )
+        selected = self._selected_joint_evidence_active()
+        selected_raw = {} if selected else None
+        selected_started = time.monotonic() if selected else None
+        left_pos = {}
+        if self.left_arm_motors:
+            left_pos = (
+                self._read_arm_positions(self.left_bus, self.left_arm_motors, raw_positions=selected_raw)
+                if selected else self._read_arm_positions(self.left_bus, self.left_arm_motors)
+            )
+        if selected and SELECTED_JOINT_MOTOR in selected_raw:
+            self._am1_selected_joint_position = {
+                "raw": int(selected_raw[SELECTED_JOINT_MOTOR]),
+                "normalized": float(left_pos[SELECTED_JOINT_MOTOR]),
+                "read_started_at_monotonic_s": selected_started,
+                "read_completed_at_monotonic_s": time.monotonic(),
+            }
         left_arm_done_t = time.perf_counter()
 
 
@@ -1146,6 +1296,7 @@ class AlohaMini(Robot):
         left_pos  = {k: v for k, v in action.items() if k.endswith(".pos") and k.startswith("arm_left_") and k.replace(".pos", "") in self.left_bus.motors}
         right_pos = {k: v for k, v in action.items() if k.endswith(".pos") and k.startswith("arm_right_") and self.right_bus is not None and k.replace(".pos", "") in self.right_bus.motors}
         requested_arm_pos = {**left_pos, **right_pos}
+        selected = self._selected_joint_evidence_active() and SELECTED_JOINT_POSITION in left_pos
         right_wrist_observed = None
 
 
@@ -1187,6 +1338,7 @@ class AlohaMini(Robot):
             gp_right = {k: (v, present_right[k.replace(".pos", "")]) for k, v in right_pos.items()}
             right_pos = ensure_safe_goal_position(gp_right, self.config.max_relative_target)
         relative_limit_done_t = time.perf_counter()
+        selected_relative = left_pos.get(SELECTED_JOINT_POSITION) if selected else None
 
         left_pos = self._limit_gripper_goal_by_current(self.left_bus, left_pos)
         left_gripper_limit_done_t = time.perf_counter()
@@ -1198,6 +1350,7 @@ class AlohaMini(Robot):
         if self.right_bus and right_pos:
             right_pos = self._limit_joint_goal_by_current(self.right_bus, right_pos)
         right_joint_limit_done_t = time.perf_counter()
+        selected_current = left_pos.get(SELECTED_JOINT_POSITION) if selected else None
 
         left_pos, left_raw_goals = self._encode_am1_arm_goals(self.left_bus, left_pos, present_left_raw)
         right_raw_goals = None
@@ -1213,11 +1366,36 @@ class AlohaMini(Robot):
 
         #print(f"[{filename}:{lineno}]Sending left_pos:{left_pos}, right_pos:{right_pos}, base_wheel_goal_vel:{base_wheel_goal_vel}")  # debug
     
-        if left_pos:
-            if left_raw_goals is not None:
-                self.left_bus.sync_write("Goal_Position", left_raw_goals, normalize=False)
-            else:
-                self.left_bus.sync_write("Goal_Position", {k.replace(".pos", ""): v for k, v in left_pos.items()})
+        if selected:
+            raw_goal = int(left_raw_goals[SELECTED_JOINT_MOTOR])
+            encoded = self.left_bus._encode_sign("Goal_Position", {3: raw_goal})[3]
+            self._am1_selected_joint_action = {
+                "requested": float(requested_arm_pos[SELECTED_JOINT_POSITION]),
+                "relative_limited": float(selected_relative), "current_limited": float(selected_current),
+                "final_normalized": float(left_pos[SELECTED_JOINT_POSITION]),
+                "expected_goal_raw": raw_goal, "encoded_goal_word": int(encoded),
+                "encoded_goal_bytes": self.left_bus._split_into_byte_chunks(encoded, 2),
+                "write_started_at_monotonic_s": time.monotonic(),
+                "sync_write_returned": False, "write_acknowledged": False,
+            }
+        try:
+            if left_pos:
+                if left_raw_goals is not None:
+                    self.left_bus.sync_write("Goal_Position", left_raw_goals, normalize=False)
+                else:
+                    self.left_bus.sync_write("Goal_Position", {k.replace(".pos", ""): v for k, v in left_pos.items()})
+            if selected:
+                self._am1_selected_joint_action["sync_write_returned"] = True
+        except BaseException as error:
+            if selected:
+                self._am1_selected_joint_action["write_completed_at_monotonic_s"] = time.monotonic()
+                error.add_note("AM1 selected joint action context: " + json.dumps(
+                    self._am1_selected_joint_action, allow_nan=False, separators=(",", ":"),
+                ))
+            raise
+        finally:
+            if selected and "write_completed_at_monotonic_s" not in self._am1_selected_joint_action:
+                self._am1_selected_joint_action["write_completed_at_monotonic_s"] = time.monotonic()
         left_write_done_t = time.perf_counter()
         if self.right_bus and right_pos:
             if right_raw_goals is not None:
@@ -1252,6 +1430,8 @@ class AlohaMini(Robot):
             "right_wrist_final": final_arm_pos.get("arm_right_wrist_flex.pos"),
             "right_wrist_observed": right_wrist_observed,
         }
+        if selected:
+            self.logs["action_diagnostics"]["selected_joint"] = dict(self._am1_selected_joint_action)
         shoulder = "arm_right_shoulder_lift.pos"
         if getattr(self.config, "robot_model", None) == "alohamini1" and shoulder in requested_arm_pos:
             self.logs["action_diagnostics"]["right_shoulder"] = {
@@ -1475,11 +1655,38 @@ class AlohaMini(Robot):
         if failures:
             raise RuntimeError(f"Failed to hold AM1 follower arms: {'; '.join(failures)}")
 
+    def _selected_joint_evidence_active(self) -> bool:
+        return bool(
+            getattr(self, "_am1_selected_joint_evidence_enabled", False)
+            and (getattr(self, "_am1_selected_joint_evidence_context", None) is not None
+                 or getattr(self, "_am1_visible_control_binding", None) is not None
+                 or (getattr(self, "_am1_elbow_integral_trial", None) is not None
+                     and self._am1_elbow_integral_trial.restore_required))
+            and getattr(self.config, "robot_model", None) == "alohamini1"
+        )
+
     def read_and_check_currents(self, limit_ma, print_currents):
         """Read left/right bus currents (mA), print them, and enforce overcurrent protection"""
         scale = 6.5  # sts3215 current unit conversion factor
         left_curr_raw = {}
+        selected = self._selected_joint_evidence_active()
+        selected_started = time.monotonic() if selected else None
         left_curr_raw = self.left_bus.sync_read("Present_Current", list(self.left_bus.motors.keys()))
+        if selected and SELECTED_JOINT_MOTOR in left_curr_raw:
+            raw = int(left_curr_raw[SELECTED_JOINT_MOTOR])
+            self._am1_selected_joint_current = {
+                "raw": raw, "ma": raw * scale,
+                "read_started_at_monotonic_s": selected_started,
+                "read_completed_at_monotonic_s": time.monotonic(),
+            }
+            visible = getattr(self, "_am1_visible_control_evidence", None)
+            if getattr(self, "_am1_visible_control_binding", None) is not None:
+                visible.check_visible_current(
+                    self, raw, float(limit_ma), source="ordinary_current", sample=self._am1_selected_joint_current,
+                )
+            elbow_trial = getattr(self, "_am1_elbow_integral_trial", None)
+            if elbow_trial is not None and elbow_trial.restore_required:
+                elbow_trial.check_current(raw, float(limit_ma))
         right_curr_raw = {}
         if getattr(self, "right_bus", None):
             right_curr_raw = self.right_bus.sync_read("Present_Current", list(self.right_bus.motors.keys()))

@@ -720,6 +720,7 @@ class InstalledLiftCheck:
     def home_and_relieve(
         self, *, allow_one_count_variation: bool = False, qualify_initial_direction: bool = False,
         require_quiet_post_home: bool = False,
+        am1_post_home_readiness: bool = False,
     ) -> tuple[Any, float]:
         """The same bounded mechanics for the opt-in comparison and normal AM1 startup."""
         self.reader.set_phase("setup_position")
@@ -732,6 +733,20 @@ class InstalledLiftCheck:
             zero_reference="process-local, unchanged",
         )
 
+        post_home_min_height = post_home_max_height = 0.0
+
+        def check_post_home_position(record: dict[str, Any]) -> None:
+            nonlocal post_home_min_height, post_home_max_height
+            height = self._height_from_record(record)
+            record["height_mm"] = height
+            post_home_min_height = min(post_home_min_height, height)
+            post_home_max_height = max(post_home_max_height, height)
+            if (
+                not math.isfinite(height) or abs(height) > 0.5
+                or post_home_max_height - post_home_min_height > 0.5
+            ):
+                self.refuse(record, "post_home: process-local zero exceeded its stationary bound.")
+
         post_home = self.monitor.qualify_stationary(
             "post_home",
             expected_torque=1,
@@ -739,8 +754,16 @@ class InstalledLiftCheck:
             allow_settling=True,
             timeout_s=grouped_feedback.SETTLE_TIMEOUT_S,
             require_quiet_motion_feedback=require_quiet_post_home,
+            am1_post_home_origin_raw=result.final_position_raw if am1_post_home_readiness else None,
+            on_sample=check_post_home_position if am1_post_home_readiness else None,
         )
-        post_home_height = self._height_from_record(post_home)
+        # The AM1 callback already advanced the sole accumulator. A bounded
+        # receipt can predate the final in-flight read; never replay that older
+        # encoder value into the current owner or change its original zero.
+        post_home_height = (
+            float(post_home["height_mm"]) if am1_post_home_readiness
+            else self._height_from_record(post_home)
+        )
         self.monitor.record("post_home_height", height_mm=round(post_home_height, 4))
         if abs(post_home_height) > 0.5:
             self.refuse(post_home, "post_home: process-local zero was not stationary at the stop.")

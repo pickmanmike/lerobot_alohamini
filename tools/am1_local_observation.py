@@ -7,9 +7,12 @@ import io
 import ipaddress
 import json
 import math
+import os
 import re
 import socket
+import stat
 import subprocess
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -43,46 +46,75 @@ def finite_time(value):
     return type(value) in (int, float) and math.isfinite(value) and value >= 0
 
 
+def camera_owned_session(value):
+    """Only a valid UUID conveys a source lease; ordinary viewers have none."""
+    if not value:
+        return None
+    try:
+        return str(uuid.UUID(value))
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
 class LocalObservationMailbox:
     """Latest decoded evidence, retaining upstream arrival through actual consumption."""
 
-    def __init__(self, source, clock=time.monotonic):
+    def __init__(self, source, clock=time.monotonic, *, require_owned_session=False):
         self.source = local_source_identity(source)
         self.clock = clock
-        self.request = self.record = None
+        if type(require_owned_session) is not bool:
+            raise ValueError("camera owned-session policy must be an explicit Boolean")
+        self.require_owned_session = require_owned_session
+        self._mutex = threading.RLock()
+        self._request = self.record = None
         self.reason = "no current decoded local image"
         self.current_source_generation = None
         self.retired_generations = set()
         self.last_sequence = 0
 
+    @property
+    def request(self):
+        with self._mutex:
+            return None if self._request is None else dict(self._request)
+
     def begin(self, run_id, live_s):
-        uuid.UUID(run_id)
-        self.request = dict(
-            self.source,
-            run_id=run_id,
-            generation=str(uuid.uuid4()),
-            active=True,
-            started_at=self.clock(),
-            timing_basis=TIMING_BASIS,
-        )
-        self.record = None
-        self.last_sequence = 0
-        self.current_source_generation = None
-        self.reason = "no current decoded local image"
+        with self._mutex:
+            uuid.UUID(run_id)
+            self._request = dict(
+                self.source,
+                run_id=run_id,
+                generation=str(uuid.uuid4()),
+                active=True,
+                started_at=self.clock(),
+                timing_basis=TIMING_BASIS,
+                require_owned_session=self.require_owned_session,
+            )
+            self.record = None
+            self.last_sequence = 0
+            self.current_source_generation = None
+            self.reason = "no current decoded local image"
 
     def stop(self):
-        if self.request:
-            self.request = dict(self.request, active=False)
-        self.record = None
+        with self._mutex:
+            if self._request:
+                self._request = dict(self._request, active=False)
+            self.record = None
 
     def publish(self, record):
+        with self._mutex:
+            self._publish(record)
+
+    def _publish(self, record):
         # A delayed optional/P1/previous-run delivery has no authority over this run.
-        if not self.request or not self.request["active"] or not isinstance(record, dict):
+        if not self._request or not self._request["active"] or not isinstance(record, dict):
             return
-        if any(record.get(k) != self.request[k] for k in LOCAL_BINDING_KEYS):
+        if any(record.get(k) != self._request[k] for k in LOCAL_BINDING_KEYS):
             return
         self.record = None
         self.reason = str(record.get("reason", "invalid or unqualified local evidence"))[:160]
+        if self._request["require_owned_session"] and record.get("owned_session") != self._request["run_id"]:
+            self.reason = "required camera owned session differs from current run"
+            return
         try:
             source_generation = (
                 str(uuid.UUID(record["owner_generation"])),
@@ -97,7 +129,7 @@ class LocalObservationMailbox:
             return
         if not all(finite_time(record.get(k)) for k in ("arrived_at", "decoded_at")):
             return
-        if not self.request["started_at"] <= record["arrived_at"] <= record["decoded_at"] <= self.clock():
+        if not self._request["started_at"] <= record["arrived_at"] <= record["decoded_at"] <= self.clock():
             return
         if self.clock() - record["arrived_at"] > 0.5:
             self.reason = "original local arrival expired at owner consumption"
@@ -125,8 +157,23 @@ class LocalObservationMailbox:
         self.reason = None
 
     def evidence(self):
+        with self._mutex:
+            return self._evidence(self.clock())
+
+    def sync(self, record):
+        """Consume a delivery and snapshot its request without the control-owner lock."""
+        with self._mutex:
+            if record is not None:
+                self._publish(record)
+            consumed_at = self.clock()
+            return {
+                "request": None if self._request is None else dict(self._request),
+                "consumption": dict(self._evidence(consumed_at), consumed_at=consumed_at),
+            }
+
+    def _evidence(self, now):
         record = self.record
-        age = self.clock() - record["arrived_at"] if record else None
+        age = now - record["arrived_at"] if record else None
         qualified = record is not None and 0 <= age <= 0.5
         return {
             "qualified": qualified,
@@ -135,9 +182,10 @@ class LocalObservationMailbox:
             if record is None
             else (None if qualified else "original local arrival expired at owner consumption"),
             "sequence": record["sequence"] if record else None,
-            "generation": self.request["generation"] if self.request else None,
+            "generation": self._request["generation"] if self._request else None,
             "owner_generation": record["owner_generation"] if record else None,
             "capture_generation": record["capture_generation"] if record else None,
+            "owned_session": record.get("owned_session") if record else None,
             "arrived_at": record["arrived_at"] if record else None,
             "decoded_at": record["decoded_at"] if record else None,
             "frame_sha256": record["frame_sha256"] if record else None,
@@ -157,6 +205,7 @@ class LocalReceiver:
         self.started_at = binding["started_at"]
         self.clock = clock
         self.current_generation = None
+        self.owned_session = None
         self.retired_generations = set()
         self.last_sequence = 0
         self.record = None
@@ -185,6 +234,7 @@ class LocalReceiver:
                 str(uuid.UUID(headers["X-Camera-Owner-Generation"])),
                 str(uuid.UUID(headers["X-Camera-Capture-Generation"])),
             )
+            self.owned_session = camera_owned_session(headers.get("X-Camera-Owned-Session"))
             if generation in self.retired_generations:
                 raise ValueError("retired camera generation replay")
             arrived = float(headers["X-Frame-Arrived-Monotonic-S"])
@@ -203,6 +253,8 @@ class LocalReceiver:
                 self.current_generation = generation
                 self.last_sequence = 0
                 self.unqualify("camera generation requires current qualification")
+            if self.record and self.record.get("owned_session") != self.owned_session:
+                self.unqualify("camera owned session changed")
             if (
                 self.record
                 and generation == self.current_generation
@@ -242,6 +294,7 @@ class LocalReceiver:
                 self.binding,
                 owner_generation=generation[0],
                 capture_generation=generation[1],
+                owned_session=self.owned_session,
                 arrived_at=arrived,
                 decoded_at=decoded,
                 sequence=sequence,
@@ -262,7 +315,7 @@ class LocalReceiver:
         if not fresh:
             self.arrivals.clear()
         return dict(
-            record or self.binding,
+            record or dict(self.binding, owned_session=self.owned_session),
             qualified=qualified,
             reason=self.reason
             if record is None
@@ -319,6 +372,64 @@ class LocalObservationWorker:
         self.current = None
         self.last_logged = self.last_sent = None
         self.log_records = self.log_bytes = 0
+        self._delivery_pause = None
+
+    def _delivery_paused(self, request, now):
+        """One private, immutable one-second interruption of this exact local request."""
+        from tools.am1_session_ipc import strict_json
+
+        if not isinstance(request, dict) or request.get("active") is not True or not finite_time(now):
+            return False
+        if any(request.get(key) != self.source[key] for key in LOCAL_SOURCE_KEYS):
+            return False
+        binding = tuple(request.get(key) for key in LOCAL_BINDING_KEYS)
+        if self._delivery_pause is not None and self._delivery_pause[0] == binding:
+            return self._delivery_pause[1] <= now < self._delivery_pause[2]
+        path = self.directory / "pause-delivery"
+        try:
+            if path.is_symlink():
+                return False
+            descriptor = os.open(
+                path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+            )
+            with os.fdopen(descriptor, "rb") as stream:
+                info = os.fstat(stream.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_size > 4096:
+                    return False
+                raw = stream.read(4097)
+            if not raw:
+                # Preserve the original manual boundary only for non-owned diagnostics.
+                return request.get("require_owned_session") is False
+            if (
+                len(raw) > 4096
+                or os.name != "nt"
+                and (info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600)
+            ):
+                return False
+            marker = strict_json(raw)
+            if not isinstance(marker, dict) or set(marker) != {
+                "schema_version",
+                "started_at_monotonic_s",
+                "expires_at_monotonic_s",
+                *LOCAL_BINDING_KEYS,
+            }:
+                return False
+            began, expires = marker["started_at_monotonic_s"], marker["expires_at_monotonic_s"]
+            if not (
+                type(marker["schema_version"]) is int
+                and marker["schema_version"] == 1
+                and all(marker[key] == request.get(key) for key in LOCAL_BINDING_KEYS)
+                and finite_time(began)
+                and finite_time(expires)
+                and expires == began + 1.0
+                and finite_time(request.get("started_at"))
+                and request["started_at"] <= began <= now < expires
+            ):
+                return False
+            self._delivery_pause = (binding, began, expires)
+            return True
+        except (OSError, ValueError, TypeError, KeyError, UnicodeError):
+            return False
 
     async def sync(self, evidence):
         from tools.am1_session_ipc import encode
@@ -366,7 +477,7 @@ class LocalObservationWorker:
                         self.receiver = LocalReceiver(self.directory / request["generation"], request)
                         self.last_logged = self.last_sent = None
                         self.log_records = self.log_bytes = 0
-                    if not (self.directory / "pause-delivery").exists():
+                    if not self._delivery_paused(request, time.monotonic()):
                         async with session.get(
                             self.config["url"],
                             headers={"Authorization": authorization},
@@ -379,6 +490,7 @@ class LocalObservationWorker:
                             while not response.content.at_eof() and len(jpeg) <= MAX_JPEG:
                                 jpeg += await response.content.read(MAX_JPEG + 1 - len(jpeg))
                             await asyncio.to_thread(self.receiver.accept, jpeg, response.headers)
+                            await self.sync(self.receiver.evidence())
                     await asyncio.sleep(0.075)
                 except (ClientError, ValueError, KeyError, OSError, TimeoutError) as exc:
                     if self.receiver:

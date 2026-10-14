@@ -26,6 +26,12 @@ def acquire_session_admission(state_directory):
             import fcntl
 
             fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if any(
+            (directory / name).exists() or (directory / name).is_symlink()
+            for name in ("physical-in-progress.json", "cleanup-uncertain.json")
+        ):
+            stream.close()
+            raise RuntimeError("AM1 physical cleanup is unknown; actual stopped reconciliation required")
         return stream
     except OSError as exc:
         stream.close()

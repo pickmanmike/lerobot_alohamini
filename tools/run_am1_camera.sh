@@ -28,8 +28,7 @@ printf 'CAMERA_LOG=%s\nRuntime output goes directly to disk. Ctrl+C HERE stops t
     printf 'CAMERA_PYTHON=%s\n' "$python"
     printf 'CAMERA_BINARY_VERSION=go2rtc-1.9.14-arm64\n'
 } >>"$log_path" || exit 2
-PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 "$python" "$viewer" "$@" >>"$log_path" 2>&1
-camera_exit=$?
-printf 'CAMERA_EXIT_CODE=%s\n' "$camera_exit" >>"$log_path" || exit 2
-printf 'CAMERA_EXIT_CODE=%s\nCAMERA_LOG=%s\n' "$camera_exit" "$log_path"
-exit "$camera_exit"
+# One service main process owns cooperative child cleanup. CAMERA_EXIT_CODE is
+# written by the viewer after cleanup, not by a competing shell signal handler.
+export PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+exec "$python" "$viewer" "$@" >>"$log_path" 2>&1

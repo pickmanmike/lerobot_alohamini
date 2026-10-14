@@ -1,34 +1,86 @@
 "use strict";
 // Remote fake mode never instantiates the legacy body input, owner restore or camera adapters.
 class AM1SessionTransport {
+  static outcomeText(run) {
+    const outcome=run?.execution?.positive_control;
+    if(run?.source!=="protected-physical-provider" || !["physical-left-elbow-positive-control","physical-left-elbow-experiment"].includes(run.recipe) || run.status!=="completed" ||
+      outcome?.program_completed!==true || typeof outcome.coarse_functional_pass!=="boolean" || typeof outcome.fine_return_pass!=="boolean" ||
+      !Number.isInteger(outcome.final_return_residual_raw) || outcome.final_return_residual_raw<0)return null;
+    return `Diagnostic completed · coarse movement ${outcome.coarse_functional_pass ? "passed" : "not achieved"} · fine return ${outcome.fine_return_pass ? "passed" : "not achieved"} · final error ${outcome.final_return_residual_raw} raw ticks`;
+  }
   constructor(render) {
     this.render=render; this.snapshot=null; this.connected=false; this.csrf=null; this.device=null;
     this.control=false; this.controllerGeneration=null; this.connection=null; this.held=new Set();
     this.pending=new Map(); this.seq=0; this.socket=null; this.inputBusy=false; this.epoch=0; this.intent=0;
+    this.reportingError=null;
+    this.reconnectTimer=null;this.detached=false;this.initialization=0;
   }
   clear(reason="disconnected") {
     this.epoch++; this.intent++; this.held.clear(); this.connection=null; this.controllerGeneration=null; this.seq=0;
     for(const p of this.pending.values()) p.reject(Error(reason));
     this.pending.clear(); this.inputBusy=false;
   }
-  async post(path,body) {
+  reportingFailure(value) {
+    this.reportingError=value;this.connected=false;this.clear(value.reason);
+    this.render(this,value.reason);
+  }
+  async post(path,body,epoch) {
     const response=await fetch(`/api/${path}`,{method:"POST",headers:{"Content-Type":"application/json","X-AM1-CSRF":this.csrf || ""},body:JSON.stringify(body)});
     const result=await response.json();
+    if(epoch!==undefined && (this.detached || epoch!==this.epoch))return {status:"superseded"};
+    if(result.status==="reporting_error") {
+      this.reportingFailure(result);
+      if(!response.ok) {const error=Error(result.reason);error.reportingError=result;throw error;}
+      return result;
+    }
     if(!response.ok) throw Error(result.reason || "Request refused");
     return result;
   }
   async enroll(code) {await this.post("enroll",{code}); await this.initialize();}
+  cancelReconnect() {
+    if(this.reconnectTimer!==null)clearTimeout(this.reconnectTimer);
+    this.reconnectTimer=null;
+  }
+  reconnect(delay) {
+    if(this.detached || this.reconnectTimer!==null)return;
+    this.reconnectTimer=setTimeout(()=>{this.reconnectTimer=null;return this.initialize();},delay);
+  }
+  detach() {
+    this.detached=true;this.initialization++;this.cancelReconnect();this.connected=false;this.clear("Page detached");
+    const socket=this.socket;this.socket=null;socket?.close();
+  }
+  restore() {
+    if(!this.detached)return;
+    this.detached=false;return this.initialize();
+  }
   async initialize() {
-    const response=await fetch("/api/session");
-    if(!response.ok) {this.render(this,"Enter a local one-use pairing code.");return;}
-    const device=await response.json(); this.csrf=device.csrf; this.device=device.device_id;this.control=device.control;this.optionalVideo=device.optional_p1_video;
-    await this.attach();
+    if(this.detached)return;
+    const initialization=++this.initialization;this.cancelReconnect();this.connected=false;this.clear();
+    const socket=this.socket;this.socket=null;socket?.close();
+    try {
+      const response=await fetch("/api/session");
+      if(this.detached || initialization!==this.initialization)return;
+      if(!response.ok) {
+        if(response.status===401) {this.device=null;this.csrf=null;this.control=false;this.optionalVideo=false;this.render(this,"Enter a local one-use pairing code.");return;}
+        throw Error(`Session unavailable (HTTP ${response.status}); reconnecting to current state.`);
+      }
+      const device=await response.json();
+      if(this.detached || initialization!==this.initialization)return;
+      this.csrf=device.csrf;this.device=device.device_id;this.control=device.control;this.optionalVideo=device.optional_p1_video;
+      await this.attach();
+    } catch(error) {
+      if(this.detached || initialization!==this.initialization)return;
+      this.connected=false;this.clear();this.render(this,`Session unavailable: ${error.message}`);this.reconnect(500);
+    }
   }
   async attach() {
-    this.clear();
-    const epoch=this.epoch;
+    if(this.detached)return;
+    this.cancelReconnect();this.connected=false;this.clear();
+    const epoch=this.epoch,initialization=this.initialization;
     try {
-      const attached=await this.post("attach",{});
+      const attached=await this.post("attach",{},epoch);
+      if(this.detached || initialization!==this.initialization)return;
+      if(attached.status==="reporting_error") {this.reconnect(500);return;}
       if(epoch!==this.epoch)return;
       this.snapshot=attached.snapshot;
       const ws=this.socket=new WebSocket(`${location.origin.replace("https:","wss:")}/api/ws`);
@@ -37,12 +89,13 @@ class AM1SessionTransport {
         if(this.socket!==ws)return;
         const value=JSON.parse(event.data);
         if(value.kind==="snapshot") {
+          this.reportingError=null;
           const previous=this.snapshot?.run,next=value.snapshot.run;
           if(previous?.run_id!==next?.run_id || previous?.intent_revision!==next?.intent_revision) {
             this.intent++;this.held.clear();
           }
           this.snapshot=value.snapshot;
-          if(value.revision) {ws.send(JSON.stringify({ack:value.revision}));this.connected=true;}
+          if(value.revision) {ws.send(JSON.stringify({ack:value.revision}));this.connected=true;this.cancelReconnect();}
           const controller=this.snapshot.controller;
           if(this.controllerGeneration && (controller?.device_id!==this.device || controller.controller_generation!==this.controllerGeneration))
             this.clear("Controller generation changed");
@@ -50,15 +103,19 @@ class AM1SessionTransport {
           this.render(this);
         } else if(value.kind==="result") {
           const pending=this.pending.get(value.id);if(pending){this.pending.delete(value.id);pending.resolve(value);}
-        } else if(value.kind==="unavailable") {this.clear("owner unavailable");this.render(this,"Owner unavailable; inspect current status after reconnect.");}
+          if(value.status==="reporting_error")this.reportingFailure(value);
+        } else if(value.kind==="unavailable") {
+          if(value.status==="reporting_error")this.reportingFailure(value);
+          else {this.connected=false;this.clear("owner unavailable");this.render(this,"Owner unavailable; inspect current status after reconnect.");}
+        }
       };
       ws.onclose=()=> {
         if(this.socket!==ws)return;
         this.connected=false;this.clear();this.render(this,"Disconnected; controls cleared. Reconnecting to current state.");
-        setTimeout(()=>this.attach().catch(()=>{}),300);
+        this.reconnect(300);
       };
       ws.onerror=()=>ws.close();
-    } catch(error) {this.connected=false;this.render(this,error.message);setTimeout(()=>this.attach().catch(()=>{}),500);}
+    } catch(error) {if(this.detached || initialization!==this.initialization || epoch!==this.epoch && !error.reportingError)return;this.connected=false;this.render(this,`Session unavailable: ${error.message}`);this.reconnect(500);}
   }
   command(command) {
     if(!this.connected || this.socket?.readyState!==WebSocket.OPEN || this.pending.size>=8)return Promise.reject(Error("Current connected snapshot required"));
@@ -85,12 +142,85 @@ class AM1SessionTransport {
     const generation=this.controllerGeneration;
     if(generation) return this.claim(generation);
   }
-  async start(recipe) {
+  async start(recipe,confirmationOf=null,selectedExperiment=null) {
     const payload={operation_id:crypto.randomUUID(),recipe,controller_generation:this.controllerGeneration};
+    if(recipe==="physical-left-elbow-experiment" || selectedExperiment!==null) {
+      const keys=["schema_version","envelope_sha256","excursion_norm","ramp_s","endpoint_dwell_s","current_cap_ma","live_ceiling_s","minimum_response_raw","return_tolerance_raw","goal_readback_checkpoints_s"];
+      const value=selectedExperiment,points=value?.goal_readback_checkpoints_s;
+      if(value?.schema_version===2)keys.push("cycle_count","intercycle_hold_s");
+      const negativeHold=value?.envelope_sha256==="6be735becc951f027f6c5886c1fd8f8f323118e8d6ff7931d46107e935a60c1c";
+      if(negativeHold)keys.push("intercycle_hold_tolerance_raw");
+      if(recipe!=="physical-left-elbow-experiment" || !value || typeof value!=="object" || Array.isArray(value)
+        || Object.keys(value).length!==keys.length || keys.some(key=>!Object.hasOwn(value,key))
+        || ![1,2].includes(value.schema_version) || value.schema_version===2 && (value.cycle_count!==2 || value.intercycle_hold_s!==6)
+        || typeof value.envelope_sha256!=="string" || !/^[0-9a-f]{64}$/.test(value.envelope_sha256)
+        || ["excursion_norm","ramp_s","endpoint_dwell_s","current_cap_ma","live_ceiling_s"].some(key=>typeof value[key]!=="number" || !Number.isFinite(value[key]))
+        || ["minimum_response_raw","return_tolerance_raw"].some(key=>!Number.isInteger(value[key]) || value[key]<0 || value[key]>4095)
+        || !Array.isArray(points) || points.length>2 || points.some((point,index)=>typeof point!=="number" || !Number.isFinite(point) || point<=0 || index>0 && point<=points[index-1]))throw Error("Exact selected experiment descriptor required");
+      if(negativeHold) {
+        const expected={schema_version:2,excursion_norm:-10,ramp_s:10,endpoint_dwell_s:2,current_cap_ma:150,
+          live_ceiling_s:90,minimum_response_raw:56,return_tolerance_raw:22,cycle_count:2,intercycle_hold_s:6,
+          intercycle_hold_tolerance_raw:40};
+        if(Object.entries(expected).some(([key,wanted])=>value[key]!==wanted) || JSON.stringify(points)!=="[5,37]")throw Error("Exact selected experiment descriptor required");
+      }
+      const frozen=JSON.parse(JSON.stringify(value));
+      Object.freeze(frozen.goal_readback_checkpoints_s);payload.selected_experiment=Object.freeze(frozen);
+    }
+    if(confirmationOf!==null) {
+      if(recipe!=="physical-left-elbow-positive-control" || typeof confirmationOf!=="string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(confirmationOf))throw Error("Canonical positive-control confirmation UUID required");
+      payload.confirmation_of=confirmationOf;
+    }
+    Object.freeze(payload);
     // Outcome-loss retry uses the same immutable operation identity, never a new Start.
     let result;
-    try {result=await this.post("start",payload);} catch {result=await this.post("start",payload);}
+    try {result=await this.post("start",payload);} catch(error) {if(error.reportingError)throw error;result=await this.post("start",payload);}
     this.render(this,result.reason);return result;
+  }
+  async startPreset(id) {
+    const versions={"left-elbow-coarse-bench-v1":1,"left-elbow-coarse-bench-v2":2,"left-elbow-negative-coarse-bench-v2":2,"left-elbow-negative-coarse-bench-v3":3};
+    const version=typeof id==="string" && Object.hasOwn(versions,id) ? versions[id] : null;
+    const preset=this.snapshot?.presets?.find(value=>value.id===id);
+    if(version===null || !preset || preset.version!==version || preset.recipe!=="physical-left-elbow-experiment")throw Error("Current named preset required");
+    if(id==="left-elbow-negative-coarse-bench-v2" || id==="left-elbow-negative-coarse-bench-v3") {
+      const negativeHold=id==="left-elbow-negative-coarse-bench-v3";
+      const value=preset.selected_experiment,expected={schema_version:2,
+        envelope_sha256:negativeHold ? "6be735becc951f027f6c5886c1fd8f8f323118e8d6ff7931d46107e935a60c1c" : "ea8ed4e0abd5222734cd77cffc22c50739d53ab4cbde999016b33606af7648f5",
+        excursion_norm:-10,ramp_s:10,endpoint_dwell_s:2,current_cap_ma:150,live_ceiling_s:90,minimum_response_raw:56,return_tolerance_raw:22,cycle_count:2,intercycle_hold_s:6};
+      if(negativeHold)expected.intercycle_hold_tolerance_raw=40;
+      const sha256=negativeHold ? "c73ef75706fcce9b1772b0927071e5ce41dc6c382cd60760c7033add48d1c709" : "86c16ecbcfcb864b0ddb9caaff25d306a9c4d991730f853d6e09e91b50bbdd1c";
+      if(preset.selected_experiment_sha256!==sha256 || !value || typeof value!=="object" || Array.isArray(value)
+        || Object.keys(value).length!==Object.keys(expected).length+1 || Object.entries(expected).some(([key,wanted])=>!Object.hasOwn(value,key) || value[key]!==wanted)
+        || !Object.hasOwn(value,"goal_readback_checkpoints_s") || !Array.isArray(value.goal_readback_checkpoints_s) || JSON.stringify(value.goal_readback_checkpoints_s)!=="[5,37]")throw Error("Exact negative named preset required");
+    }
+    return this.start(preset.recipe,null,preset.selected_experiment);
+  }
+  async readDetail(reference,{raw=false}={}) {
+    const keys=["kind","version","service_incarnation","run_id","operation_id","host_incarnation","field","sha256","bytes"];
+    if(!reference || typeof reference!=="object" || Array.isArray(reference) || Object.keys(reference).length!==keys.length
+      || keys.some(key=>!Object.hasOwn(reference,key)) || reference.kind!=="am1-status-field-reference" || reference.version!==1
+      || !["run","evidence","events"].includes(reference.field) || typeof reference.sha256!=="string" || !/^[0-9a-f]{64}$/.test(reference.sha256)
+      || !Number.isInteger(reference.bytes) || reference.bytes<1 || reference.bytes>8*1024*1024
+      || reference.run_id!==this.snapshot?.run?.run_id
+      || this.snapshot?.run?.operation_id && reference.operation_id!==this.snapshot.run.operation_id)throw Error("Current bounded details reference required");
+    const frozen=JSON.parse(JSON.stringify(reference)),serialized=JSON.stringify(frozen),bytes=new Uint8Array(frozen.bytes);
+    for(let offset=0;offset<bytes.length;) {
+      const response=await fetch(`/api/state?reference=${encodeURIComponent(serialized)}&offset=${offset}&limit=8192`);
+      const value=await response.json();
+      if(!response.ok || value.accepted!==true || value.status!=="detail")throw Error(value.reason || "Native details unavailable");
+      if(reference.run_id!==this.snapshot?.run?.run_id || !value.reference || Object.keys(value.reference).length!==keys.length
+        || keys.some(key=>value.reference[key]!==frozen[key])
+        || value.offset!==offset || value.total_bytes!==bytes.length || value.encoding!=="base64"
+        || !Number.isInteger(value.length) || value.length<1 || value.length>8192 || offset+value.length>bytes.length
+        || typeof value.data!=="string")throw Error("Native details identity or chunk differs");
+      const chunk=atob(value.data);
+      if(chunk.length!==value.length)throw Error("Native details chunk length differs");
+      for(let i=0;i<chunk.length;i++)bytes[offset+i]=chunk.charCodeAt(i);
+      offset+=chunk.length;
+    }
+    const digest=Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256",bytes)),b=>b.toString(16).padStart(2,"0")).join("");
+    if(digest!==frozen.sha256)throw Error("Native details hash differs");
+    const text=new TextDecoder("utf-8",{fatal:true}).decode(bytes);
+    return raw ? text : JSON.parse(text);
   }
   async protective(op) {
     this.intent++; this.held.clear();
@@ -131,25 +261,38 @@ class AM1SessionTransport {
 globalThis.AM1SessionTransport=AM1SessionTransport;
 globalThis.AM1RemoteInitialize=function() {
   const state=document.querySelector("#session-state"),notice=document.querySelector("#control-notice");
+  const defaultControlHelp="Explicitly claim input before Start. Finite authorization survives browser closure. Interactive work needs a fresh connected snapshot, empty release and qualified Resume. Disconnect, blur and handoff clear held keys. Pause and Stop remain available to enrolled control-capable spectators. Motor feedback and commands remain simulated. When configured, real P1 images qualify observation on Pi; optional browser video has no control authority.";
   const render=(transport,message)=> {
     const run=transport.snapshot?.run;
-    const recipes=transport.snapshot?.recipes, select=document.querySelector("#fake-recipe");
-    if(recipes && select.dataset.recipes!==JSON.stringify(recipes)) {
+    const recipes=transport.snapshot?.recipes,presets=transport.snapshot?.presets || [], select=document.querySelector("#fake-recipe");
+    const selection=JSON.stringify([recipes,presets]);
+    if(recipes && select.dataset.recipes!==selection) {
       const previous=select.value;
-      select.replaceChildren(...recipes.filter(name=>name!=="fake-finite-short").map(name=> {
+      const ordinary=recipes.filter(name=>name!=="fake-finite-short" && !presets.some(preset=>preset.recipe===name)).map(name=> {
         const option=document.createElement("option"); option.value=name; option.textContent=name; return option;
-      }));
+      });
+      const named=presets.map(preset=>{const option=document.createElement("option");option.value=preset.id;option.textContent=preset.label;return option;});
+      select.replaceChildren(...ordinary,...named);
       if([...select.options].some(option=>option.value===previous))select.value=previous;
-      select.dataset.recipes=JSON.stringify(recipes);
+      select.dataset.recipes=selection;
     }
+    const physicalRun=run?.source==="protected-physical-provider" || run?.recipe?.startsWith("physical-");
+    const physical=physicalRun || recipes?.some(name=>name.startsWith("physical-"));
     const simulated=run?.source==="simulated-provider" || recipes?.some(name=>name.startsWith("sim-"));
-    document.querySelector("#view-heading").textContent=simulated ? "Simulated finite provider session" : "Fake persistent session";
-    state.textContent=run ? `Fake session · ${run.status} · ${run.progress_s.toFixed(2)} s` : "Fake session · no run";
+    const priorTest=physical && run && !physicalRun, priorKind=simulated ? "simulated" : "synthetic";
+    document.querySelector("#view-heading").textContent=physical ? "Physical finite AM1 session" : simulated ? "Simulated finite provider session" : "Fake persistent session";
+    state.textContent=run ? `${priorTest ? `Prior ${priorKind}` : physical ? "Physical" : "Fake"} session · ${run.status} · ${run.progress_s.toFixed(2)} s` : `${physical ? "Physical" : "Fake"} session · no run`;
     document.querySelector("#session-details").textContent=JSON.stringify(transport.snapshot,null,2);
-    document.querySelector("#live-countdown").textContent=run ? `Original Live budget: ${Math.ceil(run.remaining_s || 0)} s remaining` : "No fake run";
+    const terminal=run && ["stopped","completed","faulted","interrupted"].includes(run.status);
+    document.querySelector("#live-countdown").textContent=priorTest ? `Prior ${priorKind} result · cleanup: ${run.cleanup || "unknown"}; physical Start required` :
+      physical && run?.status==="finishing" ? "Physical finishing · measured cleanup pending; native Live countdown pending" :
+      physical && terminal ? `${AM1SessionTransport.outcomeText(run) || "Physical session ended"} · cleanup: ${run.cleanup || "unknown"}` :
+      physical && run && !Number.isFinite(run.native_live_at) ? "Physical startup · native Live countdown pending" :
+      run ? `Original Live budget: ${Math.ceil(run.remaining_s || 0)} s remaining` : physical ? "No physical run · Start required" : "No fake run";
     const evidence=transport.snapshot?.evidence;
     const observationLabel={"real-p1/pi-decoded":"Required P1 observation", "real-local-camera/pi-decoded-arrival":`Required local ${evidence?.sensing_source?.role || "camera"} observation`}[evidence?.observation_provenance];
-    document.querySelector("#connection").textContent=`${transport.connected ? "Connected" : "Disconnected"} · ${observationLabel ? `${observationLabel} · ${evidence?.required_observation ? "current images validated on Pi" : "current image proof unavailable"} · motor feedback and commands simulated` : "Cameras and hardware unavailable in fake mode"}`;
+    const observationStatus=observationLabel ? `${observationLabel} · ${evidence?.required_observation ? "current images validated on Pi" : "current image proof unavailable"}` : "Task observation policy shown in current status";
+    document.querySelector("#connection").textContent=`${transport.connected ? "Connected" : "Disconnected"} · ${physical ? `${observationStatus} · actual motor feedback ${evidence?.feedback ? "current" : "unavailable"} · protected-host ACK ${evidence?.native_ack ? "current" : "pending"}` : observationLabel ? `${observationStatus} · motor feedback and commands simulated` : "Cameras and hardware unavailable in fake mode"}`;
     if(transport.optionalVideo&&!transport.videoView&&globalThis.AM1P1View) {
       const root=document.querySelector("#am1-camera-root");root.replaceChildren();
       const label=document.createElement("p");label.textContent="Optional external P1 view · separate from required Pi image validation";
@@ -161,7 +304,26 @@ globalThis.AM1RemoteInitialize=function() {
       open.onclick=()=>view.start();close.onclick=()=>{view.stop();status.textContent="View closed · task observation continues independently";};
       window.addEventListener("pagehide",()=>view.stop());root.append(label,video,status,open,close);
     }
-    document.querySelector("#gate-state").textContent=transport.controllerGeneration ? "Explicit controller; accepted requests require actual fake acknowledgement." : "Spectator; viewing does not claim input.";
+    document.querySelector("#gate-state").textContent=transport.controllerGeneration ? physical ? "Explicit controller; physical Start activates the protected host. Request acceptance is separate from protected-host ACK and measured motion." : "Explicit controller; accepted requests require actual fake acknowledgement." : "Spectator; viewing does not claim input.";
+    document.querySelector("#control-help").textContent=physical ? "Explicitly claim input before physical Start. Start activates the selected bounded recipe through the protected motor host. Viewing, enrollment and reconnection do not start motion. Finite authorization survives browser closure. Pause and Stop remain available to enrolled control-capable spectators. Actual feedback and protected-host ACK are reported separately; an accepted command does not prove joint motion. Body inputs belong to the selected finite recipe. Required camera evidence is validated on Pi; optional P1 viewing is advisory." : defaultControlHelp;
+    if(!transport.videoView)document.querySelector("#am1-camera-root").textContent=physical ? "Task camera evidence is validated on Pi; optional P1 viewing is advisory." : "Cameras unavailable · synthetic fake evidence only";
+    for(const button of document.querySelectorAll("[data-operation], [data-body-key]")) {
+      button.title=physical ? "Physical finite session control" : "Fake session control";
+      if(button.dataset.operation)button.setAttribute("aria-label",`${button.dataset.operation} ${physical ? "physical" : "fake"} session`);
+      if(button.dataset.bodyKey) {
+        const unavailable=button.dataset.bodyKey==="z" || button.dataset.bodyKey==="x";
+        button.disabled=physical || unavailable;
+        if(physical) {
+          button.title="Body inputs belong to the selected finite physical recipe";
+          button.setAttribute("aria-label",`${button.dataset.bodyKey.toUpperCase()} provided by selected physical recipe`);
+          if(unavailable)button.querySelector("span").textContent="Unavailable in finite physical recipes";
+        } else if(unavailable) {
+          button.title="Unavailable in fake mode";
+          button.setAttribute("aria-label",`${button.dataset.bodyKey.toUpperCase()} unavailable in fake mode`);
+          button.querySelector("span").textContent="Unavailable in fake mode";
+        }
+      }
+    }
     if(message){notice.textContent=message;notice.hidden=false;}
     document.querySelector("#pairing-panel").hidden=Boolean(transport.device);
     for(const button of document.querySelectorAll("[data-operation]"))button.disabled=!transport.control || !transport.connected;
@@ -177,7 +339,7 @@ globalThis.AM1RemoteInitialize=function() {
   claimButton.textContent="Claim input";options.prepend(claimButton);
   document.querySelector('label[for="duration-seconds"]').hidden=true;
   const camera=document.querySelector("#am1-camera-root");camera.replaceChildren();camera.textContent="Cameras unavailable · synthetic fake evidence only";
-  document.querySelector("#control-help").textContent="Explicitly claim input before Start. Finite authorization survives browser closure. Interactive work needs a fresh connected snapshot, empty release and qualified Resume. Disconnect, blur and handoff clear held keys. Pause and Stop remain available to enrolled control-capable spectators. Motor feedback and commands remain simulated. When configured, real P1 images qualify observation on Pi; optional browser video has no control authority.";
+  document.querySelector("#control-help").textContent=defaultControlHelp;
   document.querySelector('[data-operation="Approve"]').hidden=true;
   for(const button of document.querySelectorAll("[data-operation], [data-body-key]")) {
     button.removeAttribute("data-tip");button.title="Fake session control";
@@ -194,7 +356,8 @@ globalThis.AM1RemoteInitialize=function() {
   document.querySelector(".control-actions").addEventListener("click",event=> {
     const op=event.target.closest("[data-operation]")?.dataset.operation;
     if(op==="ClaimInput")act(()=>transport.claim());
-    else if(op==="Start")act(()=>transport.start(document.querySelector("#fake-recipe").value));
+    else if(op==="Start")act(()=>{const selected=document.querySelector("#fake-recipe").value;
+      return transport.snapshot?.presets?.some(preset=>preset.id===selected) ? transport.startPreset(selected) : transport.start(selected);});
     else if(op==="Pause" || op==="Stop")act(()=>transport.protective(op.toLowerCase()));
     else if(op==="Resume")act(()=>transport.resume());
     else if(op==="Handoff")act(async()=> {await transport.releaseInput();const result=await transport.post("handoff",{operation_id:crypto.randomUUID(),target_device_id:document.querySelector("#handoff-device").value});transport.clear("handoff");render(transport,result.reason);});
@@ -209,7 +372,8 @@ globalThis.AM1RemoteInitialize=function() {
   }
   window.addEventListener("blur",()=>transport.releaseInput());
   document.addEventListener("visibilitychange",()=>{if(document.hidden)transport.releaseInput();});
-  window.addEventListener("pagehide",()=>{transport.held.clear();transport.socket?.close();});
+  window.addEventListener("pagehide",()=>transport.detach());
+  window.addEventListener("pageshow",event=>{if(event.persisted)transport.restore();});
   document.querySelector('[data-help="touch"]').onclick=()=>{const help=document.querySelector("#control-help");help.hidden=!help.hidden;};
   setInterval(()=>transport.input(),100);
   setInterval(()=>{if(transport.connected&&transport.controllerGeneration)transport.renew().catch(()=>{});},500);

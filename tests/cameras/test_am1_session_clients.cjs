@@ -326,3 +326,59 @@ test("loaded UI identifies required local camera and keeps optional P1 separate"
   assert.match(await page.locator("#connection").innerText(),/Required local chest observation.*current image proof unavailable/);
   await context.close();
 });
+
+test("loaded UI distinguishes test-only physical protocol startup, native Live and measured finishing", async t=>{
+  const f=await fixture();t.after(()=>f.close());
+  const browser=await chromium.launch({headless:true,channel:process.env.AM1_TEST_BROWSER_CHANNEL || "msedge"});t.after(()=>browser.close());
+  const context=await browser.newContext({ignoreHTTPSErrors:true}),page=await context.newPage();
+  const actuatorRequests=[],errors=[];
+  page.on("request",request=>{if(/\/api\/(start|body|operation|heartbeat)/.test(request.url()))actuatorRequests.push(request.url());});
+  page.on("pageerror",error=>errors.push(error.message));
+  await enroll(page,f.info.url,f.info.a);
+  // Protocol-fixture rendering only: no physical backend, hardware feedback or Start.
+  await page.evaluate(()=>{
+    am1Remote.socket.onmessage=()=>{};
+    am1Remote.renew=async()=>null;
+    am1Remote.controllerGeneration="test-only-protocol-fixture";
+    am1Remote.snapshot.recipes=["physical-arm-smoke","physical-arm-smoke-repeat","physical-arm-hold-body"];
+    am1Remote.snapshot.run={run_id:"test-only-protocol-fixture",source:"protected-physical-provider",
+      recipe:"physical-arm-smoke-repeat",status:"starting",progress_s:0,remaining_s:null,
+      native_live_at:null,deadline:null,cleanup:null};
+    Object.assign(am1Remote.snapshot.evidence,{feedback:false,native_ack:false,
+      sensing_source:{role:"chest"},observation_provenance:"real-local-camera/pi-decoded-arrival",
+      required_observation:false,feedback_provenance:"test-only-protocol-fixture"});
+    am1Remote.render(am1Remote);
+  });
+  assert.match(await page.locator("#view-heading").innerText(),/Physical/);
+  assert.match(await page.locator("#session-state").innerText(),/Physical session.*starting/);
+  assert.match(await page.locator("#live-countdown").innerText(),/native Live.*pending/i);
+  assert.match(await page.locator("#connection").innerText(),/actual motor feedback unavailable.*protected.host ACK pending/i);
+  assert.match(await page.locator('[data-operation="Stop"]').getAttribute("aria-label"),/Stop physical session/);
+  assert.match(await page.locator("#gate-state").textContent(),/protected.host/i);
+  assert.match(await page.locator("#control-help").textContent(),/physical/i);
+  for(const selector of ["#view-heading","#session-state","#connection","#gate-state","#control-help","#am1-camera-root"])
+    assert.doesNotMatch(await page.locator(selector).textContent(),/Fake|simulated/i);
+  await page.evaluate(()=>{
+    Object.assign(am1Remote.snapshot.run,{status:"running",native_live_at:20,deadline:440,remaining_s:419});
+    Object.assign(am1Remote.snapshot.evidence,{feedback:true,native_ack:true,required_observation:true});
+    am1Remote.render(am1Remote);
+  });
+  assert.match(await page.locator("#connection").innerText(),/actual motor feedback current.*protected.host ACK current/i);
+  assert.match(await page.locator("#live-countdown").innerText(),/419 s remaining/);
+  await page.evaluate(()=>{am1Remote.snapshot.run.status="finishing";am1Remote.render(am1Remote);});
+  assert.match(await page.locator("#session-state").innerText(),/Physical session.*finishing/);
+  assert.match(await page.locator("#live-countdown").innerText(),/finishing.*cleanup.*pending/i);
+  assert.doesNotMatch(await page.locator("#live-countdown").innerText(),/419 s remaining/);
+  await page.evaluate(()=>{
+    Object.assign(am1Remote.snapshot.run,{source:"simulated-provider",recipe:"sim-arm-smoke-repeat",
+      status:"completed",progress_s:352,cleanup:"simulated_hold_acknowledged"});
+    am1Remote.render(am1Remote);
+  });
+  assert.match(await page.locator("#view-heading").innerText(),/Physical/);
+  assert.match(await page.locator("#session-state").innerText(),/Prior simulated session.*completed/);
+  assert.match(await page.locator("#live-countdown").innerText(),/Prior simulated result.*simulated_hold_acknowledged/);
+  assert.deepEqual(actuatorRequests,[]);assert.deepEqual(errors,[]);
+  console.log(JSON.stringify({testOnlyProtocolFixture:true,physicalEvidenceProved:false,startRequests:0,
+    renderedStartup:true,renderedNativeLive:true,renderedFinishing:true}));
+  await context.close();
+});

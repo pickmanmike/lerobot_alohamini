@@ -2,8 +2,10 @@
 
 import argparse
 import asyncio
+import contextlib
 import hashlib
 import ipaddress
+import json
 import os
 import re
 import secrets
@@ -22,6 +24,7 @@ from aiohttp import WSMsgType, web
 from tools.am1_session_ipc import (
     CONTROL_LIMIT,
     IPCClient,
+    ReportingError,
     encode,
     private_directory,
     private_json,
@@ -56,6 +59,11 @@ def unknown_outcome():
         "reason": "owner outcome unknown; inspect state or lookup the same operation",
         "effect_admitted": None,
     }
+
+
+def _compact_http_json(value):
+    """Serialize complete HTTP snapshot payloads without separator whitespace."""
+    return json.dumps(value, allow_nan=False, separators=(",", ":"))
 
 
 async def close_socket(ws, transport, code=1000):
@@ -265,7 +273,10 @@ class Gateway:
                     raise web.HTTPBadRequest(reason="ambiguous headers")
             if not request.secure or request.headers.get("Host") != self.origin.removeprefix("https://"):
                 raise web.HTTPForbidden(reason="origin boundary")
-            if request.query_string:
+            if request.query_string and not (
+                request.method == "GET" and request.path == "/api/state"
+                and len(request.query_string.encode()) <= CONTROL_LIMIT
+            ):
                 raise web.HTTPBadRequest(reason="query not supported")
             mutation = request.method in {"POST", "PATCH", "DELETE"}
             media = request.path == "/api/media" or request.path.startswith("/api/media/")
@@ -322,6 +333,8 @@ class Gateway:
                 {"accepted": False, "status": "refused", "reason": exc.reason, "effect_admitted": False},
                 status=exc.status,
             )
+        except ReportingError as exc:
+            return web.json_response(exc.result, status=503, headers={"Cache-Control": "no-store"})
         except (ValueError, TypeError, KeyError, UnicodeError):
             return web.json_response(
                 {
@@ -372,7 +385,10 @@ class Gateway:
                 return await self.ipc.request(command, device)
 
     async def current(self):
-        return (await self.call({"op": "snapshot"}, "gateway-view"))["snapshot"]
+        result = await self.call({"op": "snapshot"}, "gateway-view")
+        if result.get("status") == "reporting_error":
+            raise ReportingError(result)
+        return result["snapshot"]
 
     def next_revision(self):
         self.revision += 1
@@ -433,7 +449,27 @@ class Gateway:
         )
 
     async def state(self, request):
-        return web.json_response({"snapshot": await self.current()}, headers={"Cache-Control": "no-store"})
+        query = getattr(request, "query", {})
+        if query:
+            if len(query) != 3 or set(query) != {"reference", "offset", "limit"}:
+                raise ValueError("closed detail query required")
+            if any(not query[k].isascii() or not query[k].isdigit() for k in ("offset", "limit")):
+                raise ValueError("integer detail bounds required")
+            command = dict(
+                op="snapshot",
+                reference=strict_json(query["reference"]),
+                offset=int(query["offset"]),
+                limit=int(query["limit"]),
+            )
+            result = await self.call(command, "gateway-view")
+            if result.get("status") == "reporting_error":
+                raise ReportingError(result)
+            return web.json_response(result, dumps=_compact_http_json, headers={"Cache-Control": "no-store"})
+        return web.json_response(
+            {"snapshot": await self.current()},
+            dumps=_compact_http_json,
+            headers={"Cache-Control": "no-store"},
+        )
 
     async def attach(self, request):
         if await self.body(request):
@@ -445,7 +481,8 @@ class Gateway:
         ticket = secrets.token_urlsafe(32)
         self.tickets[digest(ticket)] = (request["device"]["id"], now + 5)
         return web.json_response(
-            {"ticket": ticket, "snapshot": await self.current(), "revision": self.next_revision()}
+            {"ticket": ticket, "snapshot": await self.current(), "revision": self.next_revision()},
+            dumps=_compact_http_json,
         )
 
     async def fence(self, device):
@@ -472,6 +509,31 @@ class Gateway:
         op = command.get("op")
         if op not in OPS or "device_id" in command:
             raise ValueError("operation")
+        selected_recipe = "physical-left-elbow-experiment"
+        if "selected_experiment" in command or command.get("recipe") == selected_recipe:
+            from examples.alohamini.am1_session_contract import SelectedElbowExperiment
+
+            if op != "start" or command.get("recipe") != selected_recipe:
+                raise ValueError("selected experiment requires its explicit Start recipe")
+            try:
+                encode(command, CONTROL_LIMIT)
+                SelectedElbowExperiment.from_payload(command.get("selected_experiment"))
+            except (AttributeError, TypeError, ValueError) as error:
+                raise ValueError("invalid selected experiment Start descriptor") from error
+        if "confirmation_of" in command:
+            value = command["confirmation_of"]
+            try:
+                canonical = isinstance(value, str) and str(uuid.UUID(value)) == value
+            except ValueError:
+                canonical = False
+            if (
+                op != "start"
+                or command.get("recipe") != "physical-left-elbow-positive-control"
+                or not canonical
+            ):
+                raise ValueError(
+                    "confirmation requires the explicit positive-control recipe and canonical UUID"
+                )
         if op == "handoff" and not self.auth.capable(command.get("target_device_id")):
             raise web.HTTPForbidden(reason="enrolled control target required")
         if op in INTERACTIVE:
@@ -492,7 +554,7 @@ class Gateway:
                     "effect_admitted": False,
                 }
         result = await self.call(command, device["id"])
-        if peer and op == "connect" and result.get("accepted"):
+        if peer and op == "connect" and result.get("accepted") and result.get("status") != "reporting_error":
             peer.connection = result["connection_generation"]
         return result
 
@@ -665,6 +727,12 @@ class Gateway:
                 ):
                     raise ValueError("command envelope")
                 self.enqueue(peer, value)
+        except ReportingError as exc:
+            with contextlib.suppress(TimeoutError, ConnectionError):
+                await asyncio.wait_for(
+                    ws.send_str(encode(dict(exc.result, kind="unavailable")).decode()), 0.5
+                )
+            await close_socket(ws, request.transport, 1013)
         except (
             ValueError,
             TypeError,
@@ -726,6 +794,11 @@ class Gateway:
                             ),
                             True,
                         )
+            except ReportingError as exc:
+                for peer in list(self.peers):
+                    peer.ack = False
+                    peer.revision = self.next_revision()
+                    peer.put(dict(exc.result, kind="unavailable"), True)
             except (OSError, ValueError, TimeoutError, asyncio.IncompleteReadError):
                 for peer in list(self.peers):
                     peer.put({"kind": "unavailable"}, True)

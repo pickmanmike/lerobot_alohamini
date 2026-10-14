@@ -153,6 +153,30 @@ def startup(monkeypatch, tmp_path):
     class LiftIO:
         def __init__(self, robot):
             self.robot, self.lift = robot, robot.lift
+            # This coordinate/encoding fixture replaces lift I/O completely.
+            # Real acquisition/thermal semantics are exercised separately by
+            # test_am1_startup_thermal_handoff and the operational-lift suites.
+            self.failure = None
+            self.last_record = {"sample_monotonic_s": owner.time.monotonic()}
+            # Explicit mock interface for the original-slot startup scheduler.
+            # This fixture replaces lift I/O; real Window voting/clock guards
+            # remain exercised by the two dedicated thermal startup suites.
+            self.temperature = SimpleNamespace(
+                SLOT_S=0.1,
+                _origin_ns=round(self.last_record["sample_monotonic_s"] * 1_000_000_000),
+                _last_slot=0,
+                assert_fresh=lambda now: None,
+            )
+
+        def raise_if_faulted(self):
+            if self.failure is not None:
+                raise self.failure
+
+        def poll(self):
+            self.last_record = {"sample_monotonic_s": owner.time.monotonic()}
+            self.temperature._last_slot = (
+                round(self.last_record["sample_monotonic_s"] * 1_000_000_000) - self.temperature._origin_ns
+            ) // round(self.temperature.SLOT_S * 1_000_000_000)
 
         def start(self):
             state.home_calls += 1
@@ -161,7 +185,9 @@ def startup(monkeypatch, tmp_path):
             bus.settle(SHOULDER, bus.present(SHOULDER) + state.home_delta)
             # Keep actual lift configuration, home, zero reference and handoff.
             # The register transport models its external hard-stop feedback.
-            return self.lift.home()
+            result = self.lift.home()
+            self.poll()
+            return result
 
         def contribute_observation(self, observation):
             self.lift.contribute_observation(observation)

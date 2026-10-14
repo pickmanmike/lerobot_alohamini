@@ -1,0 +1,181 @@
+"use strict";
+const {test}=require("node:test"),assert=require("node:assert/strict"),fs=require("node:fs"),vm=require("node:vm"),path=require("node:path");
+const source=fs.readFileSync(path.join(__dirname,"../../tools/am1_console_ui/session_transport.js"),"utf8");
+const recipe="physical-left-elbow-experiment";
+function descriptor(){return {schema_version:1,envelope_sha256:"a".repeat(64),excursion_norm:-10,ramp_s:10,
+  endpoint_dwell_s:2,current_cap_ma:100,live_ceiling_s:60,minimum_response_raw:56,return_tolerance_raw:22,goal_readback_checkpoints_s:[4,5]};}
+function fixture(fetch){const context={fetch,crypto:require("node:crypto").webcrypto,console,setTimeout:()=>1,clearTimeout:()=>{},
+  location:{origin:"https://test.invalid"},WebSocket:class{static OPEN=1;}};
+  vm.runInNewContext(source,context);const transport=new context.AM1SessionTransport(()=>{});
+  transport.connected=true;transport.controllerGeneration="claimed";return transport;}
+test("outcome-loss retry freezes descriptor and uses the same selected Start UUID",async()=>{
+  const data=descriptor(),original=JSON.stringify(data),requests=[];
+  const transport=fixture(async(url,options)=>{requests.push(JSON.parse(options.body));if(requests.length===1){data.current_cap_ma=900;data.goal_readback_checkpoints_s.push(6);throw Error("outcome lost");}
+    return {ok:true,json:async()=>({accepted:true,status:"starting"})};});
+  await transport.start(recipe,null,data);
+  assert.equal(requests.length,2);assert.equal(requests[0].operation_id,requests[1].operation_id);
+  assert.equal(JSON.stringify(requests[0].selected_experiment),original);assert.deepEqual(requests[1],requests[0]);
+});
+test("selected descriptor is mandatory, closed and recipe-scoped before HTTP",async()=>{
+  let calls=0;const transport=fixture(async()=>{calls++;return {ok:true,json:async()=>({accepted:true})};});
+  for(const data of [null,{...descriptor(),raw_origin:2458},{...descriptor(),integral:1},{...descriptor(),current_cap_ma:NaN},
+    {...descriptor(),goal_readback_checkpoints_s:[true]}])await assert.rejects(()=>transport.start(recipe,null,data),/experiment/i);
+  await assert.rejects(()=>transport.start("physical-left-elbow-positive-control",null,descriptor()),/experiment/i);
+  await assert.rejects(()=>transport.start(recipe,"df51bc69-3f68-42bf-9c73-35fd4be520f6",descriptor()),/confirmation/i);
+  assert.equal(calls,0);
+});
+test("known selected Start reporting error preserves admitted outcome without retry",async()=>{
+  let calls=0;const transport=fixture(async()=>{calls++;return {ok:true,json:async()=>({accepted:true,status:"reporting_error",
+    code:"response_limit",reason:"Owner response exceeds presentation limit",effect_admitted:true,run_id:"actual-run"})};});
+  const result=await transport.start(recipe,null,descriptor());
+  assert.equal(calls,1);assert.equal(result.effect_admitted,true);assert.equal(transport.connected,false);
+});
+test("selected completed program reports the actual separate movement verdict",()=>{
+  const transport=fixture(()=>{}),run={source:"protected-physical-provider",recipe,status:"completed",
+    execution:{positive_control:{program_completed:true,coarse_functional_pass:false,fine_return_pass:true,final_return_residual_raw:0}}};
+  assert.match(transport.constructor.outcomeText(run),/coarse movement not achieved/);
+  run.execution.positive_control.coarse_functional_pass=true;
+  assert.match(transport.constructor.outcomeText(run),/coarse movement passed/);
+  assert.equal(transport.constructor.outcomeText({...run,status:"running"}),null);
+});
+test("named coarse bench preset uses the existing selected recipe and immutable schema2 Start",async()=>{
+  const data={...descriptor(),schema_version:2,envelope_sha256:"b".repeat(64),excursion_norm:10,
+    current_cap_ma:150,live_ceiling_s:90,goal_readback_checkpoints_s:[5,37],cycle_count:2,intercycle_hold_s:6};
+  const requests=[],transport=fixture(async(url,options)=>{requests.push(JSON.parse(options.body));return {ok:true,json:async()=>({accepted:true})};});
+  transport.snapshot={presets:[{id:"left-elbow-coarse-bench-v1",version:1,label:"Two cycles",recipe,selected_experiment:data}]};
+  await transport.startPreset("left-elbow-coarse-bench-v1");
+  assert.equal(requests.length,1);assert.equal(requests[0].recipe,recipe);
+  assert.deepEqual(requests[0].selected_experiment,data);
+  await assert.rejects(()=>transport.startPreset("missing"),/preset/i);
+  for(const bad of [{...data,cycle_count:3},{...data,intercycle_hold_s:7},{...data,unknown:1}])
+    await assert.rejects(()=>transport.start(recipe,null,bad),/experiment/i);
+  assert.equal(requests.length,1);
+});
+
+
+function operationDescriptor(){return {...descriptor(),schema_version:2,
+  envelope_sha256:"2d55c9e82d82ea3e66b6bf336853ad84a84cbf2cc3a62ff5e30a7f2f6f55ecef",
+  excursion_norm:10,ramp_s:10,endpoint_dwell_s:2,current_cap_ma:150,live_ceiling_s:90,
+  goal_readback_checkpoints_s:[5,37],cycle_count:2,intercycle_hold_s:6};}
+test("reviewed V2 preset issues one ordinary Start with its unchanged shared descriptor",async()=>{
+  const data={...operationDescriptor(),envelope_sha256:"ea8ed4e0abd5222734cd77cffc22c50739d53ab4cbde999016b33606af7648f5"},original=JSON.stringify(data),requests=[];
+  assert.equal(require("node:crypto").createHash("sha256").update(JSON.stringify(Object.fromEntries(Object.keys(data).sort().map(key=>[key,data[key]])))).digest("hex"),"31336b83330fb5398778b4cfc0397011a3ae063d47efdf9c02e62d685475d473");
+  const transport=fixture(async(url,options)=>{requests.push([url,JSON.parse(options.body)]);return {ok:true,json:async()=>({accepted:true,status:"starting"})};});
+  transport.snapshot={presets:[{id:"left-elbow-coarse-bench-v2",version:2,label:"Left elbow coarse bench v2 · two cycles",recipe,selected_experiment:data}]};
+  await transport.startPreset("left-elbow-coarse-bench-v2");
+  assert.equal(requests.length,1);assert.equal(requests[0][0],"/api/start");
+  assert.equal(JSON.stringify(requests[0][1].selected_experiment),original);
+  assert.equal(requests[0][1].controller_generation,"claimed");assert.equal(typeof requests[0][1].operation_id,"string");
+  assert.equal(JSON.stringify(data),original);
+});
+for(const [name,id,version] of [
+  ["unknown ID","unreviewed-preset",1],["V2 ID with V1 version","left-elbow-coarse-bench-v2",1],
+  ["V1 ID with V2 version","left-elbow-coarse-bench-v1",2],["version3","left-elbow-coarse-bench-v2",3],
+  ["boolean version","left-elbow-coarse-bench-v2",true],["string version","left-elbow-coarse-bench-v2","2"],
+  ["boolean ID",true,1],["false ID",false,1],
+])test("named preset rejects "+name+" before any control request",async()=>{
+  let calls=0;const transport=fixture(async()=>{calls++;return {ok:true,json:async()=>({accepted:true})};});
+  transport.snapshot={presets:[{id,version,recipe,selected_experiment:operationDescriptor()}]};
+  await assert.rejects(()=>transport.startPreset(id),/preset/i);assert.equal(calls,0);
+});
+
+
+const NEGATIVE_ID="left-elbow-negative-coarse-bench-v2",NEGATIVE_SHA="86c16ecbcfcb864b0ddb9caaff25d306a9c4d991730f853d6e09e91b50bbdd1c";
+function negativeDescriptor(){return {...operationDescriptor(),excursion_norm:-10,
+ envelope_sha256:"ea8ed4e0abd5222734cd77cffc22c50739d53ab4cbde999016b33606af7648f5"};}
+function negativePreset(){return {id:NEGATIVE_ID,version:2,recipe,label:"Negative coarse response",selected_experiment:negativeDescriptor(),selected_experiment_sha256:NEGATIVE_SHA};}
+
+test("negative V2 named preset submits one ordinary immutable exact signed condition",async()=>{
+ const data=negativePreset(),original=JSON.stringify(data.selected_experiment),requests=[];
+ assert.equal(require("node:crypto").createHash("sha256").update(JSON.stringify(Object.fromEntries(Object.keys(data.selected_experiment).sort().map(key=>[key,data.selected_experiment[key]])))).digest("hex"),NEGATIVE_SHA);
+ const transport=fixture(async(url,options)=>{requests.push(JSON.parse(options.body));return {ok:true,json:async()=>({accepted:true,status:"starting"})};});
+ transport.snapshot={presets:[data]};await transport.startPreset(NEGATIVE_ID);
+ assert.equal(requests.length,1);assert.equal(requests[0].recipe,recipe);
+ assert.equal(JSON.stringify(requests[0].selected_experiment),original);
+ assert.equal(requests[0].selected_experiment.excursion_norm,-10);
+ assert.equal(requests[0].selected_experiment.return_tolerance_raw,22);
+ assert.equal(requests[0].selected_experiment.minimum_response_raw,56);
+ assert.equal(requests[0].controller_generation,"claimed");
+});
+
+for(const [name,change] of [
+ ["positive direction under negative ID",p=>p.selected_experiment.excursion_norm=10],
+ ["altered response criteria",p=>p.selected_experiment.minimum_response_raw=55],
+ ["altered return criteria",p=>p.selected_experiment.return_tolerance_raw=35],
+ ["altered current",p=>p.selected_experiment.current_cap_ma=151],
+ ["altered ramp",p=>p.selected_experiment.ramp_s=9],
+ ["foreign envelope",p=>p.selected_experiment.envelope_sha256="a".repeat(64)],
+ ["altered checkpoints",p=>p.selected_experiment.goal_readback_checkpoints_s[1]=38],
+ ["wrong descriptor hash",p=>p.selected_experiment_sha256="a".repeat(64)],
+ ["missing descriptor hash",p=>delete p.selected_experiment_sha256],
+ ["wrong version",p=>p.version=1],
+ ["boolean scalar",p=>p.selected_experiment.cycle_count=true],
+ ["string scalar",p=>p.selected_experiment.current_cap_ma="150"],
+ ["extra descriptor key",p=>p.selected_experiment.raw_origin=2474],
+ ["missing descriptor key",p=>delete p.selected_experiment.live_ceiling_s],
+])test("negative named preset refuses "+name+" before HTTP",async()=>{
+ let calls=0;const transport=fixture(async()=>{calls++;return {ok:true,json:async()=>({accepted:true})};});
+ const p=negativePreset();change(p);transport.snapshot={presets:[p]};
+ await assert.rejects(()=>transport.startPreset(NEGATIVE_ID),/preset/i);assert.equal(calls,0);
+});
+
+
+const NEGATIVE_V3_ID="left-elbow-negative-coarse-bench-v3",NEGATIVE_V3_SHA="c73ef75706fcce9b1772b0927071e5ce41dc6c382cd60760c7033add48d1c709";
+const NEGATIVE_V3_ENVELOPE="6be735becc951f027f6c5886c1fd8f8f323118e8d6ff7931d46107e935a60c1c";
+function negativeV3Descriptor(){return {...negativeDescriptor(),envelope_sha256:NEGATIVE_V3_ENVELOPE,intercycle_hold_tolerance_raw:40};}
+function negativeV3Preset(){return {id:NEGATIVE_V3_ID,version:3,recipe,label:"Negative stable hold 40 · return 22 · fine position unqualified",
+ selected_experiment:negativeV3Descriptor(),selected_experiment_sha256:NEGATIVE_V3_SHA};}
+
+test("negative V3 named preset submits one immutable exact condition with separate hold and return limits",async()=>{
+ const p=negativeV3Preset(),original=JSON.stringify(p.selected_experiment),requests=[];
+ assert.equal(require("node:crypto").createHash("sha256").update(JSON.stringify(Object.fromEntries(Object.keys(p.selected_experiment).sort().map(key=>[key,p.selected_experiment[key]])))).digest("hex"),NEGATIVE_V3_SHA);
+ const transport=fixture(async(url,options)=>{requests.push(JSON.parse(options.body));return {ok:true,json:async()=>({accepted:true,status:"starting"})};});
+ transport.snapshot={presets:[p]};await transport.startPreset(NEGATIVE_V3_ID);
+ assert.equal(requests.length,1);assert.equal(requests[0].recipe,recipe);
+ assert.equal(JSON.stringify(requests[0].selected_experiment),original);
+ assert.equal(requests[0].selected_experiment.intercycle_hold_tolerance_raw,40);
+ assert.equal(requests[0].selected_experiment.return_tolerance_raw,22);
+ assert.equal(requests[0].selected_experiment.minimum_response_raw,56);
+ assert.equal(requests[0].controller_generation,"claimed");assert.equal(JSON.stringify(p.selected_experiment),original);
+});
+
+for(const [name,change] of [
+ ["positive direction",p=>p.selected_experiment.excursion_norm=10],
+ ["old envelope",p=>p.selected_experiment.envelope_sha256=negativeDescriptor().envelope_sha256],
+ ["schema3",p=>p.selected_experiment.schema_version=3],
+ ["ramp9",p=>p.selected_experiment.ramp_s=9],
+ ["dwell1",p=>p.selected_experiment.endpoint_dwell_s=1],
+ ["current149",p=>p.selected_experiment.current_cap_ma=149],
+ ["live89",p=>p.selected_experiment.live_ceiling_s=89],
+ ["response55",p=>p.selected_experiment.minimum_response_raw=55],
+ ["return35",p=>p.selected_experiment.return_tolerance_raw=35],
+ ["one cycle",p=>p.selected_experiment.cycle_count=1],
+ ["hold5",p=>p.selected_experiment.intercycle_hold_s=5],
+ ["hold tolerance41",p=>p.selected_experiment.intercycle_hold_tolerance_raw=41],
+ ["boolean hold tolerance",p=>p.selected_experiment.intercycle_hold_tolerance_raw=true],
+ ["string hold tolerance",p=>p.selected_experiment.intercycle_hold_tolerance_raw="40"],
+ ["missing hold tolerance",p=>delete p.selected_experiment.intercycle_hold_tolerance_raw],
+ ["extra spread scalar",p=>p.selected_experiment.intercycle_hold_spread_raw=2],
+ ["checkpoint38",p=>p.selected_experiment.goal_readback_checkpoints_s[1]=38],
+ ["wrong SHA",p=>p.selected_experiment_sha256="a".repeat(64)],
+ ["missing SHA",p=>delete p.selected_experiment_sha256],
+ ["version2",p=>p.version=2],["boolean version",p=>p.version=true],["string version",p=>p.version="3"],
+])test("negative V3 named preset rejects "+name+" before invoking Start",async()=>{
+ const p=negativeV3Preset();change(p);const transport=fixture(()=>{});transport.snapshot={presets:[p]};
+ let starts=0;transport.start=async()=>{starts++;return {accepted:true};};
+ await assert.rejects(()=>transport.startPreset(NEGATIVE_V3_ID),/preset/i);assert.equal(starts,0);
+});
+
+test("generic selected Start accepts only the literal V3 condition under its new envelope",async()=>{
+ const requests=[],transport=fixture(async(url,options)=>{requests.push(JSON.parse(options.body));return {ok:true,json:async()=>({accepted:true})};});
+ await transport.start(recipe,null,negativeV3Descriptor());
+ assert.equal(requests.length,1);assert.equal(requests[0].selected_experiment.intercycle_hold_tolerance_raw,40);
+ for(const value of [
+  {...negativeDescriptor(),intercycle_hold_tolerance_raw:40},
+  {...negativeV3Descriptor(),intercycle_hold_tolerance_raw:41},
+  {...negativeV3Descriptor(),return_tolerance_raw:35},
+  {...negativeV3Descriptor(),excursion_norm:10},
+  {...negativeV3Descriptor(),goal_readback_checkpoints_s:[5,38]},
+ ])await assert.rejects(()=>transport.start(recipe,null,value),/experiment/i);
+ assert.equal(requests.length,1);
+});

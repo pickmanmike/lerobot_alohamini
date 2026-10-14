@@ -262,6 +262,34 @@ class GroupedLiftTransport:
         raise AssertionError("installed relief writes must remain owned by LiftAxis")
 
 
+def mock_physical_admission(monkeypatch):
+    # These legacy diagnostic tests already inject serial I/O. Isolate only the
+    # native ownership/receipt boundary as well: no Linux flock or canonical
+    # user-state writes enter the fake rig. Dedicated admission tests remain real.
+    class InMemoryAdmission:
+        def __init__(self, *_args, **_kwargs):
+            self.claim = None
+
+        def claim_run(self, **binding):
+            self.claim = binding
+
+        def finish_run(self, receipt):
+            if receipt["uncertain"]:
+                return False
+            self.claim = None
+            return True
+
+        def close(self):
+            pass
+
+    def in_memory_cleanup_receipt(_args, robot, _first_error, errors):
+        readback = getattr(robot, "_am1_shutdown_evidence", {})
+        return {"uncertain": not (readback.get("verified") and readback.get("buses_closed") and not errors)}
+
+    monkeypatch.setattr(host, "AM1PhysicalAdmission", InMemoryAdmission)
+    monkeypatch.setattr(host, "write_am1_cleanup_receipt", in_memory_cleanup_receipt)
+
+
 @pytest.fixture
 def rig(monkeypatch, tmp_path):
     clock = Clock()
@@ -269,6 +297,7 @@ def rig(monkeypatch, tmp_path):
     robots = []
     monkeypatch.setattr(lift_axis.time, "monotonic", clock.monotonic)
     monkeypatch.setattr(lift_axis.time, "sleep", clock.sleep)
+    mock_physical_admission(monkeypatch)
 
     def make_bus(**kwargs):
         bus = LiftBus(clock, **kwargs)
@@ -344,7 +373,12 @@ def test_relief_uses_grouped_dynamic_feedback_instead_of_scalar_samples(rig, cap
     assert buses[0].grouped_transport.group_reads.count(
         (feedback.FEEDBACK_START, feedback.FEEDBACK_LENGTH)
     ) > 0
-    assert not [event for event in buses[0].events if event[1] == "read"]
+    # Dynamic samples remain grouped; protected cleanup independently verifies
+    # the two zero/off registers through the ordinary bus readback path.
+    assert [event for event in buses[0].events if event[1] == "read"] == [
+        ("left", "read", "Torque_Enable", "lift_axis"),
+        ("left", "read", "Goal_Velocity", "lift_axis"),
+    ]
 
 
 def test_standalone_relief_keeps_immediate_wrong_sign_refusal(rig, monkeypatch, capsys):
@@ -780,8 +814,13 @@ def test_each_grouped_feedback_sample_advances_the_fake_encoder_once(rig, capsys
     feedback_reads = bus.grouped_transport.group_reads.count(
         (feedback.FEEDBACK_START, feedback.FEEDBACK_LENGTH)
     )
-    assert bus.refresh_count == feedback_reads > 0
-    assert not [event for event in bus.events if event[1] == "read"]
+    cleanup_reads = [event for event in bus.events if event[1] == "read"]
+    assert cleanup_reads == [
+        ("left", "read", "Torque_Enable", "lift_axis"),
+        ("left", "read", "Goal_Velocity", "lift_axis"),
+    ]
+    assert feedback_reads > 0
+    assert bus.refresh_count == feedback_reads + len(cleanup_reads)
     assert_stopped(bus)
 
 

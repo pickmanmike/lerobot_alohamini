@@ -1,18 +1,266 @@
+## AM1-INTEGRATE-OPERATE-08 input capabilities
+
+Operation07 is accepted as the achieved bounded physical same-task recovery and
+next-Start milestone. Recovery14 completed58 program seconds/two useful fixed-
+reference elbow cycles within its original90-second deadline; body15 completed
+unchanged12-second ArmHoldBody from normal rest. Residual31/33, zero qualified elbow
+returns and false coarse22/fine2 remain limits. Fine positioning, floor travel and
+future input modes do not reopen this accepted result.
+
+Packet08 conditionally authorizes ordinary integration of PRs #16–#20 only into
+`integrate/am1-local-teleop`, superseding the older named-target no-merge/no-retarget
+restrictions. No main, force/history rewrite, protection bypass, branch deletion,
+permanent tuning or autoplay is authorized. Reviewed correction source is `a53aaad949df7f7b71db0a61eb8904d5d2fd7088`,
+with dependency order #16 → #17 → #18 → #19 → #20. After verified ordinary merges,
+final identities and dispositions will be recorded in the packet08 closeout on
+[PR #20](https://github.com/pickmanmike/lerobot_alohamini/pull/20) and the existing
+private ordinary-use card. Main remains `ab4462b713aeb24d0473f1ec6c8812290ab19510`.
+
+Actual corrected installation: motor `b68bfeee10df32c97865783bd4d37801f0006596`,
+runtime `52f1e75a308097ec38b390bdac3ed695d6cd83cf`, manifest
+`f35a2077a74f4c7c491a932be5a9a3700580d79da96fa4c6fb7f7c5f0ad7055a`. Only the
+standalone diagnostic entry and browser UI changed; independent pins and other
+listed motor/runtime files remain unchanged. Immediate matched stopped rollback:
+motor `5760a553b47a66469a8cb68aeef400ae132375ab`, runtime
+`0c026118cf9c35be3c436d3c250ebd3ae41ac1e1`, manifest
+`27bc702c185877a5e8e72dc7693c39b419d4ed778d5cc33cfa3636b78777a10a`. The earlier
+runtime87799/e410 rollback remains preserved as a second-level record. Use the
+existing matched stager after known cleanup and literal current terminal evidence.
+
+The corrected enrolled-client proof reconnected after one injected viewer-only
+HTTP503 while preserving enrollment, retrieved completed recovery14/body15 and
+SHA-verified body15 native details (13749 bytes), and exposed v3/hold40/return22/
+fine-unqualified. Three user services are active/enabled; native history is
+unchanged, no new task was created, boot is unchanged and no hardware/camera owner
+is active. Live body buttons remain disabled for the finite physical backend.
+
+An integrated source SHA is distinct from deployed pins. Recovery14/body15 retain
+their actual physical evidence at operating source
+`f3bdef6faa76dcf41852486c07b48c5ecde29acf` and the recorded pre-correction
+component pins in the [Operation07 report](protected-physical-sessions.md#am1-operation-recovery-07-results-and-status).
+The current installation adds ownership/view corrections and does not supply a
+new motion/reboot result or justify repeating unchanged physical work.
+
+The scoped fixes fence the lift diagnostic before SDK construction and complete
+its durable claim only after literal ID11 stopped feedback/close/private receipt,
+and repair browser initialization so transient failures retain enrollment and retry
+read-only state. Actual401 alone reveals the existing enrollment form. Pagehide
+cancels retry, persisted pageshow reattaches fresh, and old attach failure cannot
+replace a newer successful connection. Existing loaded-browser/client/reporting/
+selected-transport cohort81 passed/0 failed/0 skipped. Other final affected checks:
+638 affected Windows tests passed (16 platform skips), 314 native tests passed (no skips), and 81 frontend tests passed. Independent cumulative review cleared. Full repository/pre-commit/community-template items remain unperformed; main-only CI has no run for this target. Available branch/ruleset metadata reports no required contexts, while the detailed protection read returned403. Integration will use ordinary server-enforced merges. Typed/hash-bound full-detail/cap tests
+match existing interfaces; no motion mapping, gain, protection or65536/4096 limit
+is relaxed.
+
+| Capability | Current qualification | Actual entrypoint/boundary |
+|---|---|---|
+| Finite Pi-owned arm/body presets | Implemented and physically exercised within recorded conditions | [Finite registry](../../examples/alohamini/am1_session_contract.py#L1568), [explicit backend selection](../../tools/am1_pi_executor.py#L274), [finite physical provider](../../tools/am1_physical_executor.py#L724), [local body pulses](../../tools/am1_physical_executor.py#L138) |
+| Live browser body/lift | Missing through persistent protected owner; historical Windows Local path physically exercised separately | New [sender](../../tools/am1_console_ui/session_transport.js#L248) is fake-only, [physical buttons](../../tools/am1_console_ui/session_transport.js#L315) disabled; legacy [owned browser keys](../../tools/am1_console.py#L613), [lease](../../examples/alohamini/am1_console_bridge.py#L178) |
+| Live virtual/synthetic-leader arms | Missing through persistent protected owner; finite scripted targets exist | [Mapped scripted frame](../../examples/alohamini/scripted_leader.py#L128), [fake-list Core input](../../tools/am1_session_core.py#L2228); physical executor has no live `apply` mailbox |
+| PC USB physical leaders through new owner | Missing authenticated adapter; legacy PC sampling/manual Local path physically exercised separately | [Both-leader sampler](../../src/lerobot/teleoperators/bi_so_leader/bi_so_leader.py#L81), [normalized configuration](../../examples/alohamini/teleoperate_bi.py#L1936), [USB launch selection](../../tools/run_am1.ps1#L243) |
+| Viewer reconnect/active-controller handoff | Finite physical viewer reconnect exercised; interactive handoff protocol fake-tested, physical streaming handoff untested | [Generation rotation](../../tools/am1_session_core.py#L1859), [connection reset](../../tools/am1_session_core.py#L2152), [loaded fake handoff](../../tests/cameras/test_am1_session_clients.cjs#L76); [disconnect release](../../tools/am1_session_service.py#L759) remains fake-only |
+
+Viewing idle lifecycle, retained recovery14/body15 and backend/preset versions does
+not start hardware. Finite execution survives losing its viewer only while local
+feedback/required observation qualify. Missing status is not re-enrollment and
+view failure is not Stop; query/rejoin the accepted operation without duplicate
+Start. Active live intention must expire when input stops arriving. Green fake
+interactive tests do not establish physical input coverage.
+
+The smallest next focused packet adds one bounded mapped virtual arm target source
+through the existing persistent owner/protected backend, initially one supported
+arm path with other measured joints held/body zero, then both arms/body. Reuse
+held-pose acquisition, current calibration/mappings, local sensing/guards,
+ownership and cleanup. PC leaders stay on the PC; human movement is not required.
+
+Exact existing wire sequence: acknowledged `/api/attach` → `/api/ws` snapshot,
+`connect`, empty `release_input`, qualified `resume(expected_intent_revision)`,
+`grant`, then `input` with current run/service/controller/connection/grant identities
+and increasing integer `seq`. Proposed physical targets reuse the exact twelve
+[named normalized arm keys/ranges](../../examples/alohamini/teleoperate_bi.py#L721),
+with a latest-only `PhysicalExecutor.apply(target, *, valid_until_monotonic_s,
+intent_revision)` mailbox, existing `ProtectedHostRun.send`, and host control
+epoch/run/incarnation/revision/action-sequence fencing.
+
+Enforce the original250 ms Pi grant expiry at native cadence, independently of
+gateway/authority stalls: discard intention and request acknowledged measured hold/
+body stop. Keep the separate1.5-second presence lease and release/alignment/Resume
+gates. New grants alone cannot extend the old applied frame; reconnect/handoff
+cannot replay targets or renew the Live deadline. Core currently clears/holds on
+every fake grant and the physical worker always creates `FiniteTask`; those two
+boundaries need a physical interactive lane, not simply enabling fake UI. Keep
+acceptance, native ACK and measured motion separate. No controller/dashboard/
+framework, transport rebuild, P1/Ethernet dependency or network tuning is included.
+
+All following stages/results/guidance remain at their original sources. Their
+historical unfinished/no-merge statements do not override the accepted milestone
+or packet08's narrow authorization. Normal manual guidance remains in its own scope.
+
+Durability means software fault tolerance, connection/control continuity, preserved state and recovery with minimal human intervention, not mechanical lifespan. AM1 stays wireless, P1 advisory and AM2 untouched; simulation is the source default and service startup cannot replay motor activity.
+
 # AM1 roaming-resilient sessions
 
-**AM1-SESSION-ARCHITECTURE-01 · owner-approved design. The current AM1-MOBILE-LOCAL-01 slice selects real robot-local camera input with simulated motor IO and advisory P1 evidence. The separate strict P1 diagnostic remains failed.**
+**Current result: [AM1-OPERATION-RECOVERY-07](protected-physical-sessions.md#am1-operation-recovery-07-results-and-status).**
+Recovery14 completed58 program seconds and two useful measured out-and-back cycles
+after genuine required-local-image loss and qualified same-task recovery. The next
+explicit normal-rest Start completed the unchanged12-second body recipe. Program
+completion, useful movement and accuracy remain separate: fixed original raw2339
+produced94/63/31 and60/59/33 outward/reverse/residual ticks, zero qualified returns,
+false coarse22 and false fine2 qualification.
+
+The ordinary **Left elbow negative coarse bench v3 · two cycles · stable hold 40 · return 22 · fine position unqualified**
+preset retains one measured reference/endpoint and the original90-second deadline.
+Use the existing trusted enrolled console, Claim input and explicitly Start;
+preset ID `left-elbow-negative-coarse-bench-v3`, version3. Pause/Resume/Stop retain
+precedence. Reconnecting queries the accepted operation and reattaches; it does not
+Stop/replay/duplicate Start. See the linked report for the private config location,
+ordinary recipe, original native evidence and matched stopped rollback.
+
+Practical hold admission≤40/spread≤2 uses fresh3–12 contiguous paired Native samples
+spanning≥0.2 seconds. Independent scoring remains56 outward/56 reverse/residual≤22,
+with fine residual≤2. The150 mA selected cap, gains/calibration and genuine local
+motion, thermal/status, source/feedback and ownership protections remain unchanged.
+
+Final run `b77cf5fe-9b4d-4d4a-b12c-cc2eb8198499` used a locally expiring one-second
+required-image delivery marker. Real input age0.505616 seconds caused measured hold
+at frozen progress27.6; seven Native acknowledgments retained12 arms/lift with zero
+drift and body intent. Fresh matching images/feedback and Native ACK closed episode1
+in1.340681265 seconds. Original run/reference/deadline remained fixed; rejoin began at
+the measured hold without a jump. Native program finish74.613 and Owner completion
+77.221871403 seconds after Live remained inside the original90 seconds. Browser
+reattachment46.1→51.1 retained the same task/seed/deadline; one Start/zero Stop and no
+helper/reporting error. Historical `required_proof_loss` remains recorded.
+
+Next run `4c89cdf9-1d39-439a-bc7a-e44f9d7b402d` admitted fresh normal rest after the
+preceding final raw2306 and completed the original12-second `ArmHoldBody` recipe.
+Its zero arm cycles/one generic body return is distinct from elbow accuracy. All12
+held arms had zero seed drift; measured wheel/lift command response is a raised-bench
+check without a floor-travel claim. Component-specific body/lift guards and its
+unconfirmed startup temperature-outlier warning remain retained. Both final runs have
+actual20-zero/lift/bus/camera cleanup, no Native hardware fault and uncertainty false.
+
+Nominal11 completed two cycles from raw2439:101/68/33 and64/63/34 ticks, with zero
+qualified returns. Recovery12 qualified its genuine interruption in1.080170836 seconds
+and browser46.1→50.8, then faulted55.4 on a provider rising-current diagnosis. Its
+historical required loss, distinct later fault and Native first cause null stay separate.
+An original sparse Native subsequence reproduces that diagnosis, but an omitted
+Native acquisition contains a real decrease; the full Provider collection list was
+not retained. The reviewed V3-only correction requires contiguous original Native IDs,
+one epoch/intent and advancing clocks before inferring uninterrupted rising current.
+Native protections stay unchanged. New-source nominal13 completed normally but its
+arm-helper import failed before the marker and a later helper assertion failed;
+no Stop and no required-loss/detachment proof. Correcting the existing helper import
+context enabled recovery14, without another operating-source change. Earlier7ce/09/10
+results remain versioned in the linked report.
+
+P1 remains advisory. Original nominal11 views show coarse pivot/reversal, with source
+release/zero audio, while its separate optional-delivery connection error remains
+failed. Current237.9869-second P1 capture covers nominal13 only; source and native
+caller released normally, audio zero. Inspected dark/backlit stills show qualitative
+small pose differences, without angular precision or recovery14 visual evidence.
+Actual current Pi-local images independently qualified required recovery14 observation.
+
+Three private idle services restore the interface without automatically initializing
+motors/capture or starting/replaying a task. One actual idle reboot was verified at
+earlier source `df865…`; current affected staging/service restarts preserved idle
+definitions/private permissions/trust/history without autoplay. These are separately
+recorded facts, not another current-source reboot test.
+
+Current operating source `f3bdef6faa76dcf41852486c07b48c5ecde29acf` deploys motor
+`5760a553b47a66469a8cb68aeef400ae132375ab`, runtime
+`0c026118cf9c35be3c436d3c250ebd3ae41ac1e1`, manifest
+`27bc702c185877a5e8e72dc7693c39b419d4ed778d5cc33cfa3636b78777a10a`.
+The final fix affects only the runtime provider. Exact separate pins/calibration,
+private permissions/ACL, trust and typed history remain preserved; the linked report
+records the immediate matched rollback. Owner/HTTP/WSS frames stay bounded65536 bytes,
+the Native hold-proof wrapper4096, with authenticated SHA-bound private full details.
+Focused results are279 Windows/423 native checks across overlapping cohorts, reported
+separately;199 reader checks preserve eight older outputs exactly.
+
+A completed qualified executor-acknowledged recovery closes its episode. A later
+distinct loss may receive another bounded episode, at most three total, without
+renewing the original deadline. AM1 remains wireless, P1 advisory, AM2 unchanged,
+simulation default and PR20 stacked on19→18→17→16 without merge authorization.
+Durability means software fault tolerance, connection/control continuity, state
+preservation and recovery with minimal human intervention, not mechanical lifespan.
+
+Packet06's accepted73/56/17 and75/58/17 coarse comparisons, fine2 failures and all
+older100/150 mA failures remain source-dated history. Trial06 retains its physical
+completion versus owner Stop after111417-byte overflow; trial07 completed normally
+at its earlier pins. Earlier required-input-loss recovery remained unproved until
+the distinct packet07 task above. Historical deployment/pending statements below
+apply to those recorded versions, not the current operating state.
+
+**Retained AM1-VISIBLE-CONTROL-04:** One unchanged-I0 positive comparison started normally,
+then faulted at5.9 seconds at the selected100 mA sampled-current guard. All182
+published positions stayedraw2458 despite encoded writes reaching2498; relevant
+current P1 images show no resolvable elbow excursion. No endpoint/return/fine
+qualification or confirmation followed. Native/browser fault and known cleanup
+agree; exact separate candidate pins remain verified available idle. The next
+discriminator is actual selected live Goal_Position/current at the guarded boundary.
+Program, visible/measured response and qualification remain separate. Software
+durability retains its fault-tolerance meaning; genuine physical input-loss recovery
+remains unproved. Recovery03 results below remain historical.
+
+**Retained AM1-ELBOW-RECOVERY-03:** The matched current-pose I0/I1 programs completed5.5seconds, but both stayed
+raw2458 despite goal2472: zero useful approach/residual14. I1 increased sampled
+current to39mA vs I0's19.5mA without movement. All12 starting poses/calibration/timing
+matched; live I1 and verified original I0/Lock0/individual24/25 restoration are
+retained with all20zero/lift/bus/camera cleanup/no owners/no native fault. Two earlier
+I1 thermal faults ended before Live and remain preserved. No longer hold or
+confirmation is justified. Native completion is distinct from the browser's later
+terminal-reporting size timeout. Its public duplicate evidence is now bounded,
+and two fresh trusted browser pages reattached to the unchanged completed native
+result. Current services are available and idle; matched rollback is retained and
+unexecuted. Goal acceptance, useful partial movement, strict attainment,
+program completion and repeated control remain separate results.
+
+The new packet authorizes measured-start recovery toward retained2472; the old
+2472±2 prerequisite applies to the historical failed runs, not all future AM1 use.
+The requested elbow inspection is completed. Trusted P1 audio-off capture is
+restored: the original87.1588-second clip delivered800frames and released normally,
+but inspected frames do not show the left elbow or adjacent links. Required sensing
+remains actual Pi-local camera evidence; P1 stays advisory.
+
+The acquisition/linked-comparator correction has203 focused native mock checks;
+the final source-only0700 reader correction has136 native integration checks,
+including its seven permission contrasts. Both audit10 reviewed source-module imports with
+no foreign code; cohorts overlap. Final reporting source
+`43c066468426b528aa7aa31f342172cb7e6fc480` passed146 native integration checks in
+8.02s with the same10-module audit. Current motor3771/executor1edf are separately
+bound by deploymentee8ff; the unchanged materiala0fd contract preserves evaluated
+I1 execution provenance, not the current reporting executor. Controlled native-type
+terminal replay is66282→61338bytes; independently reacquired idle IPC is52462bytes
+under the unchanged65536cap. Final18-file audit verified three active idle services,
+no owners and unchanged full native terminal/private files/calibration/c500 history.
+Windows e55/current1443-byte AE45 pins and original ACL remain unchanged; P1 source
+2d9 and renewed trusted credentials are separately verified. Preserve
+all native faults/full receipts and separate source pins, calibration, permissions,
+simulation history and matched rollback. Simulation is default, AM1 stays wireless,
+AM2 is unchanged and there is no autoplay or permanent tuning. Draft#20 remains
+unmerged and dependent on #19 -> #18 -> #17 -> #16.
+
+Durability means software fault tolerance, connection/control continuity, state
+preservation and recovery with minimal human intervention. The accepted88/352/352/
+body12 milestones remain achieved at their recorded sources and were not rerun
+unchanged. Wear/mechanical lifespan and genuine physical required-input-loss recovery
+were not established by this continuation. Detailed current evidence and limits are
+in the linked report. The retained architecture and source-dated milestones follow;
+current operating state above supersedes older deployment and pending-action statements.
+
+**AM1-SESSION-ARCHITECTURE-01 · owner-approved design. The accepted AM1-MOBILE-LOCAL-01 slice selects real robot-local camera input with simulated motor IO and advisory P1 evidence. The separate strict P1 diagnostic remains failed.**
 Choose a Pi-owned session authority and finite executor, an authenticated LAN
 HTTPS/WebSocket gateway, an independently supervised required-input worker and
 optional P1 engineering recording/viewing. Reuse the
 existing UI and protected motor backend. SSH remains administrative access. AM1
 remains wireless; a temporary engineering observer is not a permanent runtime
-dependency. Actual motor-backend integration remains a later protected slice.
+dependency. The separate protected motor-backend continuation is recorded above.
 
 The owner approved this design and the exact stage-1 fake-only implementation.
 Stage 1 is implemented on `codex/am1-persistent-session-fake`. Whole-branch
 review completed and identified one cross-client Pause ordering defect; its
 correction and covering evidence are recorded below. The stacked follow-up is
-a fake-only draft checkpoint. The completed AM1-SESSION-PI-01 isolated simulation slice and the current AM1-OBSERVATION-01 real-image/simulated-motor continuation are recorded separately below. Physical activation remains outside this packet.
+a fake-only draft checkpoint. The completed AM1-SESSION-PI-01 isolated simulation slice and AM1-OBSERVATION-01 real-image/simulated-motor continuation are recorded separately below. Those prior packets excluded physical activation; their original results remain unchanged.
 The owner replaced the proposed connection-continuity handoff and canceled the
 Wi-Fi Roaming Aggressiveness experiment and its administrator question. Do not
 resume that transaction. Normal motor/helper/onboard-camera deployments and the canceled adapter transaction remain unchanged. Stage 1 uses loopback development listeners; later isolated trial listeners, trust and component-specific permissions are recorded with their own evidence below.
@@ -40,8 +288,10 @@ source-only invocation retains strict P1 behavior. There is no browser policy
 switch or active fallback. Each durable run/result carries `sensing_policy`,
 `sensing_source`, `observation_provenance` and `observation_freshness_basis`.
 Local mode reports `real-local-camera/pi-decoded-arrival` and
-`pi-upstream-arrival-monotonic`. All modes still construct only `SimulatedIO`;
-there is **no live motor backend factory**.
+`pi-upstream-arrival-monotonic`. At the accepted AM1-MOBILE-LOCAL-01 milestone these modes used simulated motor IO.
+Simulation remains the default. The separately selected protected physical backend
+and its actual evidence are described in [protected physical sessions](protected-physical-sessions.md).
+It does not downgrade the strict P1 diagnostic or an active run's sensing policy.
 
 The adapter reuses the existing exclusive camera-only launcher, private config,
 authentication, go2rtc 1.9.14 and role mapping. It consumes **chest** through the

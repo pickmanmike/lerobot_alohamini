@@ -54,11 +54,19 @@ lift_relief=false
 lift_readback=false
 lift_motor_feedback=false
 startup_comparison=""
+protected_arguments=()
+protected_transport=false
 while (($#)); do
     case "$1" in
         --mode)
             (($# >= 2)) || { die "--mode requires arms, base, lift, or local"; exit $?; }
             mode="$2"
+            shift 2
+            ;;
+        --am1-protected-run-directory|--am1-run-id|--am1-host-incarnation|--am1-cleanup-receipt|--am1-admission-fd|--am1-physical-state-directory|--am1-host-runtime-s)
+            (($# >= 2)) || { die "$1 requires a value"; exit $?; }
+            [[ "$1" != "--am1-protected-run-directory" ]] || protected_transport=true
+            protected_arguments+=("$1" "$2")
             shift 2
             ;;
         --print-command)
@@ -132,12 +140,17 @@ if [[ -n "$startup_comparison" ]]; then
     }
 fi
 
+if [[ "$protected_transport" == true && "$mode" != "local" ]]; then
+    die "protected transport requires the reviewed --mode local recipe"
+    exit $?
+fi
+
 script_path="${BASH_SOURCE[0]//\\//}"
 script_parent="${script_path%/*}"
 [[ "$script_parent" != "$script_path" ]] || script_parent="."
 script_dir="$(cd -- "$script_parent" && pwd -P)"
 repository_root="$(cd -- "$script_dir/.." && pwd -P)"
-python_path="$repository_root/.venv/bin/python"
+python_path="${AM1_MOTOR_PYTHON:-$repository_root/.venv/bin/python}"
 
 if [[ "$lift_motor_feedback" == true ]]; then
     command=(
@@ -203,6 +216,8 @@ else
         --profile_cadence
     )
 fi
+
+command+=("${protected_arguments[@]}")
 
 if [[ "$print_command" == true ]]; then
     quote_command "${command[@]}"

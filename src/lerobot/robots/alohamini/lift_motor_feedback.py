@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import signal
 import time
 from collections.abc import Callable
@@ -17,7 +18,6 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from lerobot.utils.import_utils import require_package
-
 
 MOTOR_ID = 11
 BAUD_RATE = 1_000_000
@@ -478,6 +478,111 @@ def _default_emit(record: dict[str, Any]) -> None:
     print("[LIFT MOTOR FEEDBACK] " + json.dumps(record, separators=(",", ":")), flush=True)
 
 
+class _AM1PostHomeReadiness:
+    """Strict-first, whole-phase evidence for the installed AM1 zero transition.
+
+    Intermittent indicators remain reported motion evidence. They may qualify
+    only at the original deadline, without averaging signs or resetting drift.
+    """
+
+    def __init__(self, monitor: MotorFeedbackComparison, origin: int, deadline: float):
+        self.monitor = monitor
+        self.origin = origin
+        self.deadline = deadline
+        self.records: list[dict[str, Any]] = []
+        self.recent: list[dict[str, Any]] = []
+        self.last_stamp: float | None = None
+        self.last_position = origin
+        self.offset = self.minimum = self.maximum = 0
+        self.step_sign = self.direction_steps = 0
+        self.bounded = True
+
+    def observe(self, record: dict[str, Any], now: float) -> None:
+        stamp = float(record["sample_monotonic_s"])
+        duration = float(record["request_duration_s"])
+        if (
+            not math.isfinite(stamp)
+            or not math.isfinite(duration)
+            or not 0 <= now - stamp <= POLL_S + 1e-9
+            or not 0 <= duration <= self.monitor.sample_timeout_ms / 1000 + 1e-9
+            or (self.last_stamp is not None and stamp <= self.last_stamp)
+        ):
+            self.monitor.refuse(record, "post_home: feedback was not fresh and advancing.")
+        self.last_stamp = stamp
+        position = int(record["present_position_raw"])
+        step = _position_delta(self.last_position, position)
+        self.last_position = position
+        self.offset += step
+        self.minimum = min(self.minimum, self.offset)
+        self.maximum = max(self.maximum, self.offset)
+        if step:
+            sign = 1 if step > 0 else -1
+            self.direction_steps = self.direction_steps + 1 if sign == self.step_sign else 1
+            self.step_sign = sign
+            if self.direction_steps >= STATIONARY_PERSISTENT_SAMPLES:
+                self.monitor.refuse(record, "post_home: continuing same-direction position motion.")
+        velocity = int(record["present_velocity_raw"])
+        moving = int(record["moving"])
+        if moving not in (0, 1):
+            self.monitor.refuse(record, "post_home: Moving readback was not 0 or 1.")
+        self.recent = [*self.recent[-(STATIONARY_PERSISTENT_SAMPLES - 1) :], record]
+        if len(self.recent) == STATIONARY_PERSISTENT_SAMPLES:
+            velocities = [int(row["present_velocity_raw"]) for row in self.recent]
+            if (
+                all(int(row["moving"]) == 1 for row in self.recent)
+                or all(value > STILL_VELOCITY_RAW for value in velocities)
+                or all(value < -STILL_VELOCITY_RAW for value in velocities)
+            ):
+                self.monitor.refuse(record, "post_home: persistent velocity or Moving evidence.")
+        # Disqualifiers apply to the whole phase, including a final in-flight
+        # read. Neither candidate resets nor later quiet samples erase them.
+        self.bounded = self.bounded and (
+            self.maximum - self.minimum <= STATIONARY_POSITION_TOLERANCE_RAW
+            and abs(self.offset) <= STATIONARY_POSITION_TOLERANCE_RAW
+            and abs(velocity) <= STATIONARY_REPORTED_VELOCITY_LIMIT_RAW
+        )
+        if stamp <= self.deadline:
+            self.records.append(record)
+
+    def evidence(self) -> dict[str, Any]:
+        return {
+            "readiness_policy": "am1-post-home-v1",
+            "am1_post_home_origin_raw": self.origin,
+            "whole_phase_position_excursion_raw": self.maximum - self.minimum,
+            "whole_phase_position_drift_raw": self.offset,
+            "readiness_deadline_monotonic_s": self.deadline,
+        }
+
+    def qualify_bounded(self, now: float) -> dict[str, Any] | None:
+        if not self.bounded or len(self.records) < 5:
+            return None
+        first, last = self.records[0], self.records[-1]
+        window = last["sample_monotonic_s"] - first["sample_monotonic_s"]
+        if window < 4 * POLL_S or now - last["sample_monotonic_s"] > POLL_S + 1e-9:
+            return None
+        evidence = {
+            **self.evidence(),
+            "readiness_branch": "bounded_indicator",
+            "motion_feedback_quiet": False,
+            "sample_count": len(self.records),
+            "window_s": round(window, 3),
+            "position_resolution_raw": 4096,
+            "position_tolerance_raw": STATIONARY_POSITION_TOLERANCE_RAW,
+            "position_origin_raw": self.origin,
+            "position_offsets_raw": [
+                _position_delta(self.origin, int(row["present_position_raw"])) for row in self.records
+            ],
+            "position_excursion_raw": self.maximum - self.minimum,
+            "position_drift_raw": self.offset,
+            "present_velocity_raw": [int(row["present_velocity_raw"]) for row in self.records],
+            "moving": [int(row["moving"]) for row in self.records],
+            "expected_torque": 1,
+            "expected_goal_velocity_raw": 0,
+        }
+        self.monitor.record("post_home_stationary_qualified", **evidence)
+        return {**last, "stationary_qualification": evidence}
+
+
 class MotorFeedbackComparison:
     def __init__(
         self,
@@ -657,16 +762,79 @@ class MotorFeedbackComparison:
         max_position_delta_raw: int | None = None,
         allow_settling: bool = False,
         timeout_s: float = STATIONARY_TIMEOUT_S,
-        on_sample: Callable[[dict[str, Any]], None] | None = None,
+        on_sample: Callable[[dict[str, Any]], None | bool] | None = None,
         require_quiet_motion_feedback: bool = False,
+        am1_post_home_origin_raw: int | None = None,
+        cleanup_temperature_ready: Callable[[], bool] | None = None,
+        absolute_deadline_s: float | None = None,
+        startup_off_candidate_reset: bool = False,
     ) -> dict[str, Any]:
         """Require one bounded window of fresh, mutually consistent feedback."""
-        qualification_started = self.monotonic()
-        deadline = qualification_started + timeout_s
-        candidate: list[tuple[float, dict[str, Any]]] = []
         last_record: dict[str, Any] | None = None
+        previous_clock = None
+        if type(startup_off_candidate_reset) is not bool:
+            raise ValueError("Startup off candidate reset must be an explicit Boolean.")
+        if startup_off_candidate_reset and (
+            absolute_deadline_s is None
+            or not callable(on_sample)
+            or type(self.min_stationary_samples) is not int
+            or self.min_stationary_samples != 9
+            or timeout_s != STATIONARY_TIMEOUT_S
+        ):
+            raise ValueError(
+                "Startup off reset requires the original absolute baseline budget, observer and nine samples."
+            )
+
+        if absolute_deadline_s is not None:
+            if (type(absolute_deadline_s) not in (int, float) or not math.isfinite(absolute_deadline_s)
+                    or type(timeout_s) not in (int, float) or not math.isfinite(timeout_s) or timeout_s <= 0
+                    or phase != "baseline" or type(expected_torque) is not int or expected_torque != 0
+                    or type(expected_goal) is not int or expected_goal != 0
+                    or cold_start is not True or allow_settling is not False
+                    or start_position is not None or max_position_delta_raw is not None
+                    or require_quiet_motion_feedback or am1_post_home_origin_raw is not None
+                    or cleanup_temperature_ready is not None):
+                raise ValueError("Absolute deadline requires the bounded strict torque-off startup baseline.")
+
+        def clock() -> float:
+            nonlocal previous_clock
+            value = self.monotonic()
+            if absolute_deadline_s is not None:
+                if (type(value) not in (int, float) or not math.isfinite(value) or value < 0
+                        or previous_clock is not None and value < previous_clock):
+                    self.refuse({**(last_record or {"phase": phase}), "invalid_clock_value_repr": repr(value)},
+                                f"{phase}: original startup clock was invalid or regressed.")
+                previous_clock = value
+            return value
+
+        qualification_started = clock()
+        deadline = qualification_started + timeout_s
+        if absolute_deadline_s is not None:
+            if absolute_deadline_s > deadline:
+                raise ValueError("Absolute startup deadline exceeds the existing relative qualification budget.")
+            deadline = absolute_deadline_s
+        if cleanup_temperature_ready is not None and (
+            (phase, expected_torque, expected_goal, timeout_s)
+            != ("cleanup_readback", 0, 0, SETTLE_TIMEOUT_S)
+            or not callable(cleanup_temperature_ready)
+        ):
+            raise ValueError("Cleanup thermal readiness requires the original one-second off/zero transition.")
+        readiness = None
+        if am1_post_home_origin_raw is not None:
+            if (phase, expected_torque, expected_goal, require_quiet_motion_feedback, timeout_s) != (
+                "post_home",
+                1,
+                0,
+                True,
+                SETTLE_TIMEOUT_S,
+            ):
+                raise ValueError("AM1 post-home readiness requires its original strict zero transition.")
+            readiness = _AM1PostHomeReadiness(self, am1_post_home_origin_raw, deadline)
+        candidate: list[tuple[float, dict[str, Any]]] = []
         required_samples = self.min_stationary_samples
         required_window_s = STATIONARY_WINDOW_S
+        if startup_off_candidate_reset:
+            required_window_s = max(required_window_s, 8 * POLL_S)
         if require_quiet_motion_feedback:
             required_samples = max(required_samples, 5)
             required_window_s = max(required_window_s, 4 * POLL_S)
@@ -678,38 +846,109 @@ class MotorFeedbackComparison:
                 return
             self.refuse(record, reason)
 
+        reset_count = 0
+        last_reset_at = None
+
+
+        def reset_startup_candidate(record: dict[str, Any], sampled_at: float, source: str) -> None:
+            nonlocal candidate, reset_count, last_reset_at
+            discarded = len(candidate)
+            candidate = [(sampled_at, record)]
+            reset_count += 1
+            last_reset_at = sampled_at
+            self.emit(
+                {
+                    **record,
+                    "phase": "baseline_stationary_candidate_reset",
+                    "startup_off_motion_candidate_reset": True,
+                    "candidate_reset": {
+                        "version": 1,
+                        "source": source,
+                        "reason": "persistent_motion_indicator",
+                        "discarded_candidate_samples": discarded,
+                        "required_samples": required_samples,
+                        "trigger_sample_monotonic_s": record["sample_monotonic_s"],
+                        "absolute_deadline_monotonic_s": deadline,
+                    },
+                }
+            )
+
         while True:
+            if absolute_deadline_s is not None and clock() >= deadline:
+                self.refuse(last_record or {"phase": phase, "absolute_deadline_monotonic_s": deadline},
+                            f"{phase}: original startup deadline expired before feedback read.")
             if last_record is not None:
-                now = self.monotonic()
+                now = clock()
                 if now >= deadline:
+                    if readiness is not None:
+                        bounded = readiness.qualify_bounded(now)
+                        if bounded is not None:
+                            return bounded
                     self.refuse(
                         last_record,
                         f"{phase}: no complete stationary window within {timeout_s:g} second.",
                     )
                 self.sleep(min(POLL_S, deadline - now))
+                if absolute_deadline_s is not None and clock() >= deadline:
+                    self.refuse(last_record, f"{phase}: original startup deadline expired after polling sleep.")
+                if cleanup_temperature_ready is not None and clock() >= deadline:
+                    self.refuse(last_record, f"{phase}: no complete stationary window within {timeout_s:g} second.")
+                if readiness is not None and clock() >= deadline:
+                    bounded = readiness.qualify_bounded(clock())
+                    if bounded is not None:
+                        return bounded
+                    self.refuse(
+                        last_record, f"{phase}: no complete stationary window within {timeout_s:g} second."
+                    )
 
+            sample_budget = None
+            if absolute_deadline_s is not None:
+                remaining = deadline - clock()
+                if remaining <= 0:
+                    self.refuse(last_record or {"phase": phase},
+                                f"{phase}: original startup deadline expired before feedback read.")
+                sample_budget = min(self.sample_timeout_ms, remaining * 1000)
             record = self.sample(
                 phase,
                 expected_torque=expected_torque,
                 expected_goal=expected_goal,
                 cold_start=cold_start,
                 start_position=start_position,
+                **({"timeout_ms": sample_budget} if absolute_deadline_s is not None else {}),
             )
-            sampled_at = self.monotonic()
+            sampled_at = clock()
             last_record = record
 
+            if readiness is not None:
+                readiness.observe(record, sampled_at)
+                if on_sample is not None:
+                    on_sample(record)
+
             if sampled_at > deadline:
+                if readiness is not None:
+                    bounded = readiness.qualify_bounded(sampled_at)
+                    if bounded is not None:
+                        return bounded
                 self.refuse(
                     record,
                     f"{phase}: stationary feedback exceeded the {timeout_s:g}-second qualification limit.",
                 )
-            if max_position_delta_raw is not None and abs(
-                int(record["position_delta_raw"])
-            ) > max_position_delta_raw:
+            if (
+                max_position_delta_raw is not None
+                and abs(int(record["position_delta_raw"])) > max_position_delta_raw
+            ):
                 self.refuse(
                     record,
                     f"{phase}: travel exceeded {max_position_delta_raw} raw ticks.",
                 )
+
+            observer_reset = False
+            if startup_off_candidate_reset:
+                observer_reset = on_sample(record)
+                if type(observer_reset) is not bool:
+                    self.refuse(record, "baseline: whole-phase observer must return an explicit Boolean reset signal.")
+                if record.get("startup_off_motion_candidate_reset", False) is not observer_reset:
+                    self.refuse(record, "baseline: whole-phase reset signal differs from recorded provenance.")
 
             velocity = int(record["present_velocity_raw"])
             moving = int(record["moving"])
@@ -731,12 +970,13 @@ class MotorFeedbackComparison:
                 )
                 continue
 
+            if observer_reset:
+                reset_startup_candidate(record, sampled_at, "whole_phase_observer")
+                continue
+
             proposed = [*candidate, (sampled_at, record)]
             origin = int(proposed[0][1]["present_position_raw"])
-            offsets = [
-                _position_delta(origin, int(sample["present_position_raw"]))
-                for _, sample in proposed
-            ]
+            offsets = [_position_delta(origin, int(sample["present_position_raw"])) for _, sample in proposed]
             excursion = max(offsets) - min(offsets)
             drift = offsets[-1]
             if (
@@ -764,6 +1004,9 @@ class MotorFeedbackComparison:
                 same_positive = all(value > STILL_VELOCITY_RAW for value in velocities)
                 same_negative = all(value < -STILL_VELOCITY_RAW for value in velocities)
                 if moving_without_velocity or same_positive or same_negative:
+                    if startup_off_candidate_reset:
+                        reset_startup_candidate(record, sampled_at, "candidate_window")
+                        continue
                     reject_or_reset(
                         record,
                         f"{phase}: velocity or Moving reported persistent motion during "
@@ -773,12 +1016,19 @@ class MotorFeedbackComparison:
                         candidate = [(sampled_at, record)]
                     continue
 
-            if on_sample is not None:
+            if on_sample is not None and readiness is None and not startup_off_candidate_reset:
                 on_sample(record)
 
             window_s = candidate[-1][0] - candidate[0][0]
             if len(candidate) < required_samples or window_s < required_window_s:
                 continue
+
+            if cleanup_temperature_ready is not None:
+                thermal_ready = cleanup_temperature_ready()
+                if type(thermal_ready) is not bool:
+                    raise ValueError("Cleanup thermal readiness must return an explicit Boolean.")
+                if not thermal_ready:
+                    continue
 
             evidence = {
                 "sample_count": len(candidate),
@@ -789,15 +1039,19 @@ class MotorFeedbackComparison:
                 "position_offsets_raw": offsets,
                 "position_excursion_raw": excursion,
                 "position_drift_raw": drift,
-                "present_velocity_raw": [
-                    int(sample["present_velocity_raw"]) for _, sample in candidate
-                ],
+                "present_velocity_raw": [int(sample["present_velocity_raw"]) for _, sample in candidate],
                 "moving": [int(sample["moving"]) for _, sample in candidate],
                 "expected_torque": expected_torque,
                 "expected_goal_velocity_raw": expected_goal,
             }
+            if startup_off_candidate_reset:
+                evidence["startup_off_candidate_reset_count"] = reset_count
+                evidence["startup_off_last_reset_at_monotonic_s"] = last_reset_at
             if require_quiet_motion_feedback:
                 evidence["motion_feedback_quiet"] = True
+            if readiness is not None:
+                evidence.update(readiness.evidence())
+                evidence["readiness_branch"] = "strict_quiet"
             self.record(f"{phase}_stationary_qualified", **evidence)
             return {**candidate[-1][1], "stationary_qualification": evidence}
 
@@ -1083,6 +1337,91 @@ def make_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _run_owned_comparison(args: argparse.Namespace, profile: ComparisonProfile) -> int:
+    # Keep admission imports out of the injected comparator and module-import path.
+    from copy import deepcopy
+    from pathlib import Path
+    from uuid import uuid4
+
+    from . import alohamini_host as ownership
+
+    state = Path.home() / ".local/state/am1-session"
+    admission = ownership.AM1PhysicalAdmission(state)
+    run_id, incarnation = str(uuid4()), str(uuid4())
+    retained: dict[str, Any] = {}
+    transport = None
+    result = None
+    primary: BaseException | None = None
+    claimed = False
+
+    def emit(record: dict[str, Any]) -> None:
+        if record.get("phase") in ("cleanup_readback", "cleanup_readback_stationary_qualified", "result"):
+            retained[record["phase"]] = deepcopy(record)
+        _default_emit(record)
+
+    try:
+        admission.claim_run(run_id=run_id, host_incarnation=incarnation, scope="legacy")
+        claimed = True
+        transport = DirectSdkTransport(
+            args.port, motor_id=args.motor_id, baud_rate=args.baud_rate,
+            motion_velocity_raw=profile.motion_velocity_raw,
+        )
+        result = run_comparison(transport, profile=profile, specimen=args.specimen, emit=emit)
+    except BaseException as error:
+        primary = error
+        raise
+    finally:
+        try:
+            if claimed:
+                outcome = retained.get("result")
+                sample = retained.get("cleanup_readback")
+                qualification = retained.get("cleanup_readback_stationary_qualified")
+                errors = list(outcome.get("cleanup_errors", [])) if isinstance(outcome, dict) else [
+                    "Diagnostic terminal cleanup record unavailable"
+                ]
+                closed = transport is not None and getattr(transport, "opened", True) is False
+                verified = bool(
+                    primary is None and type(result) is int and result in (0, 1, 2, 130)
+                    and isinstance(outcome, dict) and outcome.get("cleanup_errors") == []
+                    and isinstance(sample, dict) and sample.get("torque_enable") == 0
+                    and sample.get("goal_velocity_raw") == 0
+                    and isinstance(qualification, dict) and closed and not errors
+                )
+                if not verified and not errors:
+                    errors.append("Diagnostic stopped readback and close were not completely verified")
+                cause = f"{type(primary).__name__}: {primary}" if primary is not None else (
+                    None if isinstance(outcome, dict) and outcome.get("status") == "pass"
+                    else (outcome.get("reason") or outcome.get("status")) if isinstance(outcome, dict)
+                    else "Diagnostic terminal result unavailable"
+                )
+                receipt = {
+                    "version": 1, "run_id": run_id, "host_incarnation": incarnation,
+                    "cleanup": "physical_readback_verified" if verified else "physical_cleanup_unknown",
+                    "uncertain": not verified, "first_cause": cause,
+                    "cleanup_errors": errors, "diagnostic_result": outcome,
+                    "readback": {
+                        "verified": verified, "buses_closed": closed, "diagnostic_motor_id": MOTOR_ID,
+                        "sample": sample, "stationary_qualification": qualification,
+                    },
+                    "completed_at_monotonic_s": time.monotonic(),
+                    "provenance": "standalone-lift-diagnostic/actual-sdk-readback",
+                }
+                ownership._atomic_private_json(state / f"physical-cleanup-{incarnation}.json", receipt)
+                if verified:
+                    if not admission.finish_run(receipt):
+                        raise RuntimeError("Diagnostic durable owner could not finish; reconciliation required")
+                else:
+                    ownership._atomic_private_json(state / "cleanup-uncertain.json", receipt)
+                    if result == 0:
+                        result = 1
+        except BaseException as receipt_error:
+            if primary is None:
+                raise
+            primary.add_note(f"Diagnostic cleanup receipt also failed: {type(receipt_error).__name__}: {receipt_error}")
+        finally:
+            admission.close()
+    return result
+
 def main(argv: list[str] | None = None) -> int:
     parser = make_parser()
     args = parser.parse_args(argv)
@@ -1106,13 +1445,7 @@ def main(argv: list[str] | None = None) -> int:
         "Keep the platform mechanically unloaded, the servo securely mounted, and power removal accessible.",
         flush=True,
     )
-    transport = DirectSdkTransport(
-        args.port,
-        motor_id=args.motor_id,
-        baud_rate=args.baud_rate,
-        motion_velocity_raw=selected_profile.motion_velocity_raw,
-    )
-    result = run_comparison(transport, profile=selected_profile, specimen=args.specimen)
+    result = _run_owned_comparison(args, selected_profile)
     if result == 0:
         print("LIFT_MOTOR_FEEDBACK_PASS", flush=True)
     else:

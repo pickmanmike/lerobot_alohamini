@@ -12,6 +12,7 @@ import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import ipaddress
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -43,6 +44,68 @@ def log_record(message, *, file=None):
     with _LOG_LOCK:
         print(message, file=file, flush=True)
 
+
+
+class CameraStopRequest:
+    """Idempotent cooperative request; further signals cannot interrupt cleanup."""
+
+    def __init__(self):
+        self.event = threading.Event()
+        self.reason = None
+
+    def request(self, signum, frame):
+        if self.reason is None:
+            self.reason = "signal:" + signal.Signals(signum).name
+        # Only set a flag in the signal handler: Event.set can deadlock if the
+        # handler interrupted cleanup while its condition lock was held.
+
+    def expire(self):
+        if self.reason is None:
+            self.reason = "source-budget-expired"
+
+
+class OwnedCameraLease:
+    """One finite source budget. Its retained UUID record cannot be renewed."""
+
+    def __init__(self, state_dir, session_id, budget, clock=time.monotonic):
+        try:
+            valid_id = str(uuid.UUID(session_id))
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise ValueError("Owned camera session requires a canonical UUID") from exc
+        if valid_id != session_id:
+            raise ValueError("Owned camera session requires a canonical UUID")
+        if type(budget) not in (int, float) or not math.isfinite(budget) or not 1 <= budget <= 900:
+            raise ValueError("Owned camera source budget must be finite and within 1–900 seconds")
+        self.clock = clock
+        self._used = False
+        self._claim_lock = threading.Lock()
+        self.session_id = session_id
+        self.started_at = clock()
+        self.deadline = self.started_at + budget
+        self.path = Path(state_dir) / f"lease-{session_id}.json"
+        self.release_path = Path(state_dir) / f"release-{session_id}.json"
+        write_private(self.path, {
+            "version": 1, "session_id": session_id, "source_budget_seconds": budget,
+            "started_at": self.started_at, "deadline": self.deadline,
+            "camera_pid": os.getpid(), "freshness": "complete upstream frame arrival",
+        })
+
+    def claim(self):
+        with self._claim_lock:
+            if self._used or self.release_path.exists():
+                raise RuntimeError("Owned camera lease already used")
+            self._used = True
+
+    def expired(self):
+        return self.clock() >= self.deadline
+
+    def acknowledge_release(self, errors, evidence, runtime_failed, stop_reason):
+        write_private(self.release_path, {
+            "version": 1, "session_id": self.session_id, "deadline": self.deadline,
+            "released_at": self.clock(), "state": "released" if not errors else "release-incomplete",
+            "runtime_failed": runtime_failed, "stop_reason": stop_reason,
+            "errors": errors, "release_evidence": evidence,
+        })
 
 def validate_config(config, identify=False):
     required = {"version", "bind", "port", "cameras"}
@@ -225,6 +288,7 @@ class ViewerServer(ThreadingHTTPServer):
         self.rotations = dict(rotations or {})
         self.identification = set(stores) == set(PREVIEW_ROLES)
         self.stop_event = threading.Event()
+        self.source_lease = None
         self.slots = threading.BoundedSemaphore(24)
         value = f"{credentials['username']}:{credentials['password']}".encode()
         self.authorization = b"Basic " + base64.b64encode(value)
@@ -343,6 +407,9 @@ class ViewerHandler(BaseHTTPRequestHandler):
         if role not in self.server.configured:
             self.reply(404)
             return
+        if self.server.source_lease is not None and self.server.source_lease.expired():
+            self.reply(503, b"Owned camera source budget expired")
+            return
         store = self.server.stores[role]
         sample = store.snapshot()
         if sample is None:
@@ -364,11 +431,15 @@ class ViewerHandler(BaseHTTPRequestHandler):
                 "X-Camera-Role": role,
                 "X-Camera-Owner-Generation": self.server.owner_generation,
                 "X-Camera-Capture-Generation": metadata["capture_generation"],
+                "X-Camera-Owned-Session": self.server.source_lease.session_id
+                if self.server.source_lease is not None else "",
             })
             return
         self.send_view_headers(200, "multipart/x-mixed-replace; boundary=frame")
         last = 0
         while not self.server.stop_event.is_set():
+            if self.server.source_lease is not None and self.server.source_lease.expired():
+                break
             sample = store.snapshot()
             if sample is None:
                 break
@@ -541,19 +612,30 @@ def preflight(config, binary):
             raise RuntimeError(f"camera backend port unavailable (errno={exc.errno})") from exc
 
 
-def run_viewer(config, credentials, binary, state_dir, duration=None, identify=False):
-    preflight(config, binary)
+def run_viewer(config, credentials, binary, state_dir, duration=None, identify=False,
+               stop_request=None, lease=None):
+    if lease is not None:
+        lease.claim()
     stores = {role: FrameStore() for role in (PREVIEW_ROLES if identify else ROLES)}
-    stop = threading.Event()
+    stop_request = stop_request or CameraStopRequest()
+    stop = stop_request.event
     workers, server, child, backend_path = [], None, None, None
     primary_failure = False
     try:
+        if lease is not None and lease.expired():
+            raise RuntimeError("Owned camera lease expired before startup")
+        preflight(config, binary)
+        if stop_request.reason is not None:
+            return 0
+        if lease is not None and lease.expired():
+            raise RuntimeError("Owned camera lease expired during preflight")
         try:
             server = make_server((config["bind"], config["port"]), stores, config["cameras"], credentials,
                                  config.get("rotations", {}))
         except OSError as exc:
             raise RuntimeError(f"camera viewer gateway unavailable (errno={exc.errno})") from exc
         server.timeout = 0.2
+        server.source_lease = lease
         password = secrets.token_urlsafe(32)
         fd, name = tempfile.mkstemp(prefix="backend-", suffix=".json", dir=state_dir)
         backend_path = Path(name)
@@ -575,7 +657,10 @@ def run_viewer(config, credentials, binary, state_dir, duration=None, identify=F
         log_record("CAMERA_CONFIGURED_ROLES=" + ",".join(config["cameras"]))
         log_record("CAMERA_REQUEST=MJPG 640x480 30fps; delivered rate follows below")
         started = last_report = time.monotonic()
-        while duration is None or time.monotonic() - started < duration:
+        while stop_request.reason is None and (duration is None or time.monotonic() - started < duration):
+            if lease is not None and lease.expired():
+                stop_request.expire()
+                break
             if child.poll() is not None:
                 raise RuntimeError("Camera backend exited unexpectedly")
             server.handle_request()
@@ -586,17 +671,36 @@ def run_viewer(config, credentials, binary, state_dir, duration=None, identify=F
                       separators=(",", ":")))
                 last_report = now
     except KeyboardInterrupt:
-        log_record("CAMERA_STOP_REQUESTED")
+        stop_request.request(signal.SIGINT, None)
     except BaseException:
         primary_failure = True
         raise
     finally:
+        if stop_request.reason is not None:
+            log_record("CAMERA_STOP_REQUESTED reason=" + stop_request.reason)
         errors = cleanup(stop, workers, server, child)
         if backend_path is not None:
             try:
                 backend_path.unlink()
             except OSError as exc:
                 errors.append(f"private-runtime-cleanup:{type(exc).__name__}")
+        if lease is not None:
+            backend_returncode = None if child is None else child.poll()
+            evidence = {
+                "backend_exited": child is None or backend_returncode is not None,
+                "backend_pid": None if child is None else child.pid,
+                "backend_returncode": backend_returncode,
+                "readers_joined": not any(worker.is_alive() for worker in workers),
+                "viewer_socket_closed": not any(error.startswith("http-close:") for error in errors),
+                "runtime_config_removed": backend_path is None or not backend_path.exists(),
+                "device_fuser_checked": False,
+            }
+            if not evidence["backend_exited"]:
+                errors.append("backend-not-exited")
+            try:
+                lease.acknowledge_release(errors, evidence, primary_failure, stop_request.reason)
+            except OSError as exc:
+                errors.append(f"release-acknowledgment:{type(exc).__name__}")
         log_record("CAMERA_CLEANUP_ERRORS=" + json.dumps(errors))
         if errors and not primary_failure:
             raise RuntimeError("Camera cleanup failed; inspect the private log")
@@ -618,7 +722,15 @@ def main(argv=None):
     parser.add_argument("--bind", help="Explicit LAN IPv4 address for --configure")
     parser.add_argument("--camera", action="append", default=[], metavar="ROLE=CAPTURE_PATH")
     parser.add_argument("--duration", type=float, help="Optional bounded camera-only check, 1–120 seconds")
+    parser.add_argument("--owned-session", help="Fresh owned-session UUID; one-use finite source lease")
+    parser.add_argument("--source-budget-seconds", type=float,
+                        help="Owned source lifetime including startup and finishing, 1–900 seconds")
     args = parser.parse_args(argv)
+    if (args.owned_session is None) != (args.source_budget_seconds is None):
+        parser.error("--owned-session and --source-budget-seconds must be supplied together")
+    if args.owned_session is not None and (args.duration is not None or args.check or args.configure
+                                           or args.init_auth or args.identify):
+        parser.error("Owned sessions require the ordinary capture mode and their own source budget")
     if args.config is None:
         args.config = home / ".config/am1-camera" / ("identification.json" if args.identify else "cameras.json")
     if args.duration is not None and not 1 <= args.duration <= 120:
@@ -661,12 +773,20 @@ def main(argv=None):
         fd = os.open(args.state_dir / "viewer.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, "w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            previous = signal.signal(signal.SIGTERM, lambda signum, frame: (_ for _ in ()).throw(KeyboardInterrupt()))
+            stop_request = CameraStopRequest()
+            previous = {sig: signal.signal(sig, stop_request.request) for sig in (signal.SIGTERM, signal.SIGINT)}
             try:
                 stage = "camera-preflight-or-runtime"
-                return run_viewer(config, credentials, args.binary, args.state_dir, args.duration, identify=args.identify)
+                lease = None
+                if args.owned_session is not None:
+                    stage = "owned-camera-lease"
+                    lease = OwnedCameraLease(args.state_dir, args.owned_session, args.source_budget_seconds)
+                stage = "camera-preflight-or-runtime"
+                return run_viewer(config, credentials, args.binary, args.state_dir, args.duration,
+                                  identify=args.identify, stop_request=stop_request, lease=lease)
             finally:
-                signal.signal(signal.SIGTERM, previous)
+                for sig, handler in previous.items():
+                    signal.signal(sig, handler)
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
         # Never print user values, response bodies, URLs or credentials from an exception.
         if isinstance(exc, (ValueError, RuntimeError)):
@@ -680,4 +800,6 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    exit_code = main()
+    log_record(f"CAMERA_EXIT_CODE={exit_code}")
+    raise SystemExit(exit_code)
