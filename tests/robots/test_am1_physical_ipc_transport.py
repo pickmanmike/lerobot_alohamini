@@ -8,6 +8,7 @@ import stat
 import tempfile
 import threading
 import time
+import traceback
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -398,7 +399,7 @@ def actual_mock_host(*, expected_error=None, live=False, live_recipe=host.AM1_LI
             client = make_client(directory, directory / "calibration")
             try:
                 assert ready.wait(2), "mock host did not reach transport construction"
-                assert not errors
+                assert not errors, "".join("".join(traceback.format_exception(error)) for error in errors)
                 client.connect()
                 yield SimpleNamespace(
                     client=client,
@@ -427,7 +428,7 @@ def actual_mock_host(*, expected_error=None, live=False, live_recipe=host.AM1_LI
                 assert not (directory / "command.sock").exists()
                 assert not (directory / "observation.sock").exists()
                 if expected_error is None:
-                    assert not errors
+                    assert not errors, "".join("".join(traceback.format_exception(error)) for error in errors)
                 else:
                     assert len(errors) == 1 and expected_error in str(errors[0])
 
