@@ -817,6 +817,154 @@ def test_literal_loader_binds_original_unknown_receipt_camera_and_markers(tmp_pa
     assert markers == {"cleanup-uncertain.json": original, "physical-in-progress.json": None}
 
 
+def incomplete_preactivation_fixture(tmp_path, monkeypatch):
+    m, config, run, proof, state, _, _ = loader_fixture(tmp_path, monkeypatch)
+    run.update(native_live_at=None, progress_s=0.0, cleanup="physical_cleanup_unknown")
+    run["native_first_cause"] = (
+        "RuntimeError: AM1 arm activation refused: 'arm_left_shoulder_lift' raw position 3224 "
+        "is outside verified calibration limits 848..3223."
+    )
+    proof["original_first_cause"] = run["native_first_cause"]
+    run["physical_result"].update(phase="terminal", run_id=run["run_id"], native_live_at=None,
+                                  cleanup="physical_cleanup_unknown", uncertain=True)
+    old = run["physical_result"]["readback"]
+    old.update(cleanup="physical_readback_verified", uncertain=False, cleanup_errors=[],
+               provenance="protected-host/actual-motor-readback", first_cause=run["native_first_cause"],
+               first_error_chain=[{"cause": "RuntimeError: AlohaMini motor activation failed.", "notes": []},
+                                  {"cause": run["native_first_cause"], "notes": []}])
+    old["readback"] = dict(
+        verified=True, buses_closed=True, lift_readback="unavailable-or-failed",
+        selected_gain_restore_required=False, cleanup_errors=[], started_at_monotonic_s=99.0,
+        completed_at_monotonic_s=99.5, readbacks=copy.deepcopy(proof["readback"]["readbacks"]),
+    )
+    proof["original_cleanup_origin"] = "preactivation-lift-unqualified"
+    proof["original_markers"] = dict.fromkeys(m.MARKERS)
+    (state / "cleanup-uncertain.json").unlink()
+    return m, config, run, proof, state
+
+
+def publish_incomplete_fixture(config, run, proof, state):
+    old = run["physical_result"]["readback"]
+    original = canonical(old) + b"\n"
+    (Path(config["run_root"]) / run["run_id"][:8] / "cleanup.json").write_bytes(original)
+    proof["original_cleanup_sha256"] = hashlib.sha256(original).hexdigest()
+    proof["original_terminal_run_sha256"] = hashlib.sha256(canonical(run)).hexdigest()
+    raw = canonical(proof)
+    (state / ("reconciliation-" + run["run_id"] + ".json")).write_bytes(raw)
+    return raw
+
+
+def test_incomplete_preactivation_lift_origin_still_requires_fresh_proof_and_durable_ack(tmp_path, monkeypatch):
+    m, config, run, proof, state = incomplete_preactivation_fixture(tmp_path, monkeypatch)
+    raw = publish_incomplete_fixture(config, run, proof, state)
+    original_run = copy.deepcopy(run)
+    actual, received, inventory = m.load_qualified_proof(config, run)
+    assert actual == proof and received == raw and inventory == dict.fromkeys(m.MARKERS)
+    operation = str(uuid.uuid4())
+    acknowledgment = m.archive_and_ack(config, actual, received, inventory, operation)
+    receipt = dict(actual, acknowledgment=dict(acknowledgment, consumed_operation_id=operation))
+    assert m.acknowledged_receipt(receipt, run, operation)
+    assert run == original_run
+    assert all(not (state / name).exists() for name in m.MARKERS)
+    assert m.load_qualified_proof(config, run)[2] == inventory
+
+
+@pytest.mark.parametrize("broken", [
+    "origin_missing", "origin_foreign", "live_started", "progress", "progress_boolean", "not_faulted",
+    "native_live_started", "host_uncertain", "host_unknown", "lift_qualified", "buses_open", "unverified",
+    "cleanup_error", "restore_pending", "nonzero", "boolean_zero", "missing_row", "duplicate_row", "late_row",
+    "marker_inventory", "marker_appeared", "native_cause", "unrelated_cause", "error_chain_missing",
+    "fresh_lift_missing", "fresh_thermal_stale",
+])
+def test_incomplete_lift_origin_cannot_promote_other_failures_or_weaken_stopped_proof(tmp_path, monkeypatch, broken):
+    m, config, run, proof, state = incomplete_preactivation_fixture(tmp_path, monkeypatch)
+    old = run["physical_result"]["readback"]
+    rb = old["readback"]
+    if broken == "origin_missing":
+        proof.pop("original_cleanup_origin")
+    elif broken == "origin_foreign":
+        proof["original_cleanup_origin"] = "ordinary-completion"
+    elif broken == "live_started":
+        run["native_live_at"] = 98.0
+    elif broken == "native_live_started":
+        run["physical_result"]["native_live_at"] = 98.0
+    elif broken in {"progress", "progress_boolean"}:
+        run["progress_s"] = 0.1 if broken == "progress" else False
+    elif broken == "not_faulted":
+        run["status"] = "stopped"
+    elif broken == "host_uncertain":
+        old["uncertain"] = True
+    elif broken == "host_unknown":
+        old["cleanup"] = "physical_cleanup_unknown"
+    elif broken == "lift_qualified":
+        rb["lift_readback"] = "qualified"
+    elif broken == "buses_open":
+        rb["buses_closed"] = False
+    elif broken == "unverified":
+        rb["verified"] = False
+    elif broken == "cleanup_error":
+        rb["cleanup_errors"] = ["actual failure"]
+    elif broken == "restore_pending":
+        rb["selected_gain_restore_required"] = True
+    elif broken in {"nonzero", "boolean_zero"}:
+        rb["readbacks"][0]["value"] = 1 if broken == "nonzero" else False
+    elif broken == "missing_row":
+        rb["readbacks"].pop()
+    elif broken == "duplicate_row":
+        rb["readbacks"][0] = copy.deepcopy(rb["readbacks"][1])
+    elif broken == "late_row":
+        rb["readbacks"][0]["read_completed_at_monotonic_s"] += .05
+    elif broken == "marker_inventory":
+        proof["original_markers"][m.MARKERS[0]] = {"sha256": "a" * 64}
+    elif broken == "marker_appeared":
+        (state / m.MARKERS[1]).write_bytes(b"foreign")
+    elif broken == "native_cause":
+        old["first_cause"] = "different native failure"
+    elif broken == "unrelated_cause":
+        cause = "RuntimeError: unrelated thermal-window failure"
+        old["first_cause"] = run["native_first_cause"] = proof["original_first_cause"] = cause
+        old["first_error_chain"][-1]["cause"] = cause
+    elif broken == "error_chain_missing":
+        old.pop("first_error_chain")
+    elif broken == "fresh_lift_missing":
+        proof["readback"].pop("lift_stationary")
+    else:
+        proof["readback"]["lift_stationary"]["temperature_slots"][0][0] = 99.0
+    publish_incomplete_fixture(config, run, proof, state)
+    with pytest.raises((ValueError, RuntimeError)):
+        m.load_qualified_proof(config, run)
+
+
+def test_incomplete_origin_marker_appearance_after_validation_refuses_ack(tmp_path, monkeypatch):
+    m, config, run, proof, state = incomplete_preactivation_fixture(tmp_path, monkeypatch)
+    publish_incomplete_fixture(config, run, proof, state)
+    actual, raw, inventory = m.load_qualified_proof(config, run)
+    (state / m.MARKERS[0]).write_bytes(b"foreign")
+    with pytest.raises(ValueError):
+        m.archive_and_ack(config, actual, raw, inventory, str(uuid.uuid4()))
+    assert (state / m.MARKERS[0]).read_bytes() == b"foreign"
+    assert not list(state.glob("reconciliation-ack-*"))
+
+
+def test_incomplete_origin_marker_appearance_during_ack_cannot_return_qualified_receipt(tmp_path, monkeypatch):
+    m, config, run, proof, state = incomplete_preactivation_fixture(tmp_path, monkeypatch)
+    publish_incomplete_fixture(config, run, proof, state)
+    actual, raw, inventory = m.load_qualified_proof(config, run)
+    original_write = m._write_new_or_same
+
+    def changed_during_ack(path, data):
+        original_write(path, data)
+        if path.name.startswith("reconciliation-ack-"):
+            (state / m.MARKERS[1]).write_bytes(b"foreign")
+
+    monkeypatch.setattr(m, "_write_new_or_same", changed_during_ack)
+    with pytest.raises(ValueError):
+        m.archive_and_ack(config, actual, raw, inventory, str(uuid.uuid4()))
+    assert (state / m.MARKERS[1]).read_bytes() == b"foreign"
+    with pytest.raises(ValueError):
+        m.load_qualified_proof(config, run)
+
+
 @pytest.mark.parametrize(
     "broken", ["missing_marker", "marker", "receipt", "camera", "proof_nonfinite", "unknown_marker"]
 )

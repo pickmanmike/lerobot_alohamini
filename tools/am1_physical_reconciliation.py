@@ -15,6 +15,7 @@ from pathlib import Path
 
 MARKERS = ("cleanup-uncertain.json", "physical-in-progress.json")
 CACHE_S = 5.0
+INCOMPLETE_PREACTIVATION_ORIGIN = "preactivation-lift-unqualified"
 
 
 def canonical(value):
@@ -77,6 +78,66 @@ def expected_readbacks():
         ("left", motor, register) for motor in body for register in ("Torque_Enable", "Goal_Velocity")
     )
     return rows
+
+
+def validate_cleanup_origin(run, proof, receipt):
+    """Qualify an explicit incomplete origin without promoting its old lift proof."""
+    origin = proof.get("original_cleanup_origin")
+    if origin is None:
+        require(
+            receipt.get("cleanup") == "physical_cleanup_unknown" and receipt.get("uncertain") is True,
+            "literal unchanged original unknown cleanup receipt required",
+        )
+        return False
+    require(origin == INCOMPLETE_PREACTIVATION_ORIGIN, "unsupported original cleanup origin")
+    lifecycle, rb = run.get("physical_result") or {}, receipt.get("readback") or {}
+    require(
+        run.get("status") == "faulted" and run.get("uncertain") is True
+        and "native_live_at" in run and run["native_live_at"] is None
+        and number(run.get("progress_s")) and run["progress_s"] == 0
+        and lifecycle.get("phase") == "terminal" and lifecycle.get("uncertain") is True
+        and lifecycle.get("cleanup") == "physical_cleanup_unknown"
+        and "native_live_at" in lifecycle and lifecycle["native_live_at"] is None
+        and lifecycle.get("readback") == receipt,
+        "exact uncertain preactivation terminal origin required",
+    )
+    require(
+        type(receipt.get("version")) is int and receipt["version"] == 1
+        and receipt.get("run_id") == run.get("run_id")
+        and receipt.get("host_incarnation") == lifecycle.get("backend_incarnation") == proof.get("host_incarnation")
+        and receipt.get("first_cause") == run.get("native_first_cause") == proof.get("original_first_cause")
+        and isinstance(receipt.get("first_cause"), str) and bool(receipt["first_cause"])
+        and receipt.get("provenance") == "protected-host/actual-motor-readback"
+        and receipt.get("cleanup") == "physical_readback_verified" and receipt.get("uncertain") is False
+        and receipt.get("cleanup_errors") == [] and receipt.get("expected_stop") is None
+        and rb.get("verified") is True and rb.get("buses_closed") is True
+        and rb.get("lift_readback") == "unavailable-or-failed"
+        and rb.get("cleanup_errors") == [] and rb.get("selected_gain_restore_required") is False,
+        "only incomplete lift proof with otherwise actual known off cleanup may use this origin",
+    )
+    chain = receipt.get("first_error_chain")
+    require(
+        receipt["first_cause"].startswith("RuntimeError: AM1 arm activation refused: ")
+        and isinstance(chain, list) and len(chain) == 2
+        and chain[0].get("cause") == "RuntimeError: AlohaMini motor activation failed."
+        and chain[1].get("cause") == receipt["first_cause"],
+        "original preactivation arm-guard cause and complete error chain required",
+    )
+    started, completed = rb.get("started_at_monotonic_s"), rb.get("completed_at_monotonic_s")
+    rows = rb.get("readbacks")
+    require(
+        number(started) and number(completed) and 0 <= started <= completed
+        and isinstance(rows, list) and len(rows) == 20
+        and {(r.get("bus"), r.get("motor"), r.get("register")) for r in rows} == expected_readbacks(),
+        "original twenty distinct timed zero/off readbacks required",
+    )
+    for row in rows:
+        _timed_row(row, started, completed)
+    require(
+        proof.get("original_markers") == dict.fromkeys(MARKERS),
+        "incomplete preactivation origin requires both original markers absent",
+    )
+    return True
 
 
 def _timed_row(row, started, completed):
@@ -666,11 +727,10 @@ def load_qualified_proof(config, run):
         and old == (run.get("physical_result") or {}).get("readback")
         and old.get("run_id") == run_id
         and old.get("host_incarnation") == proof["host_incarnation"]
-        and old.get("cleanup") == "physical_cleanup_unknown"
-        and old.get("uncertain") is True
         and old.get("first_cause") == proof["original_first_cause"],
         "literal unchanged original unknown cleanup receipt required",
     )
+    incomplete_origin = validate_cleanup_origin(run, proof, old)
     camera_raw = _private_bytes(Path(config["camera_state"]) / ("release-" + run_id + ".json"))
     require(
         sha(camera_raw) == proof.get("camera_release_sha256")
@@ -680,7 +740,8 @@ def load_qualified_proof(config, run):
     )
     markers = proof.get("original_markers")
     require(
-        isinstance(markers, dict) and set(markers) == set(MARKERS) and markers[MARKERS[0]] is not None,
+        isinstance(markers, dict) and set(markers) == set(MARKERS)
+        and (incomplete_origin or markers[MARKERS[0]] is not None),
         "exact original unknown marker inventory required",
     )
     originals = {}
@@ -792,6 +853,12 @@ def archive_and_ack(config, proof, raw, originals, operation_id):
         if data is not None and (state / name).exists():
             require(_private_bytes(state / name) == data, "marker changed during guarded ACK")
             (state / name).unlink()
+    if proof.get("original_cleanup_origin") == INCOMPLETE_PREACTIVATION_ORIGIN:
+        require(
+            originals == dict.fromkeys(MARKERS)
+            and all(not (state / name).exists() and not (state / name).is_symlink() for name in MARKERS),
+            "both incomplete-origin markers must remain absent through durable ACK",
+        )
     _fsync_directory(state)
     return ack
 
