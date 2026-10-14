@@ -34,6 +34,7 @@ import zmq
 
 from .alohamini import AlohaMini
 from .config_alohamini import AlohaMiniConfig, AlohaMiniHostConfig
+from .model_specs import arm_state_keys_for_robot_model
 from .selected_joint_evidence import MARKER as AM1_SELECTED_JOINT_EVIDENCE_KEY, AM1SelectedJointEvidence
 
 AM1_LOCAL_CONTROL_KEY = "_am1_local_control"
@@ -114,13 +115,14 @@ class AM1LocalControl:
                 last_grant_age_at_write_s=max(0, now - (self.live_sample["valid_until_monotonic_s"] - .25)))
 
     def _refresh_live_cursor(self, robot: AlohaMini) -> None:
-        from examples.alohamini.am1_finite_task import JOINT_KEYS
-
+        # The motor projection carries native model definitions and the shared
+        # session contract, not runtime finite providers or their dependencies.
+        joint_keys = tuple(key for side in arm_state_keys_for_robot_model("alohamini1") for key in side)
         measured = robot.get_observation()
-        if any(type(measured.get(k)) not in (int, float) or not math.isfinite(measured[k]) for k in JOINT_KEYS):
+        if any(type(measured.get(k)) not in (int, float) or not math.isfinite(measured[k]) for k in joint_keys):
             raise RuntimeError("Live admission requires complete actual measured follower arms")
         if self.live_held is None:
-            self.live_held = {k: float(measured[k]) for k in JOINT_KEYS}
+            self.live_held = {k: float(measured[k]) for k in joint_keys}
         else:
             self.live_held[AM1_LIVE_JOINT] = float(measured[AM1_LIVE_JOINT])
         self._live_summary.update(cursor_norm=self.live_held[AM1_LIVE_JOINT],

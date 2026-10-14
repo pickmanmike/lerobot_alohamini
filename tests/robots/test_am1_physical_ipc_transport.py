@@ -57,6 +57,46 @@ def test_live_fixture_invalid_registers_are_rejected_by_production_guard():
         robot.connect(home_lift=True)
 
 
+def test_live_admission_uses_native_keys_without_runtime_provider_imports(monkeypatch):
+    """Match the motor projection: shared contract exists, runtime providers do not."""
+    import builtins
+
+    from tests.robots.test_am1_live_native import frame, sample
+
+    binding = identity()
+    robot = InjectedLiveMotorHardware(SimpleNamespace(robot_model="alohamini1"))
+    now = [10.0]
+    evidence = host.AM1SelectedJointEvidence(enabled=True, emit=lambda _: None)
+    robot._am1_selected_joint_evidence_enabled = True
+    robot._am1_visible_control_binding = {**binding, "recipe": host.AM1_LIVE_RECIPE}
+    robot._am1_visible_control_evidence = evidence
+    control = host.AM1LocalControl(**binding, selected_evidence=evidence, live=True, clock=lambda: now[0])
+    owner = {k: str(uuid4()) for k in ("service_incarnation", "controller_generation", "connection_generation")}
+    native_keys = tuple(k for side in arm_state_keys_for_robot_model("alohamini1") for k in side)
+    original_import = builtins.__import__
+
+    def motor_projection_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if ((name.startswith("examples.alohamini.") and name != "examples.alohamini.am1_session_contract")
+                or name.startswith("tools.")):
+            raise ModuleNotFoundError(f"No module named '{name}'", name=name)
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", motor_projection_import)
+    robot.connect(home_lift=True)
+    assert control.apply(robot, frame(binding, owner, sequence=1))
+    assert set(control.live_held) == set(native_keys) and len(control.live_held) == 12
+    admission = control.live_snapshot()
+    now[0] = 10.1
+    assert control.apply(robot, frame(binding, owner, sequence=2, mode="active", epoch=2,
+                                      sample=sample(expiry=10.25, target=-.5)))
+    now[0] = 10.26
+    assert control.check_live(robot)
+    assert control.state == "paused" and control.live_snapshot()["state"] == "expired"
+    assert control.apply(robot, frame(binding, owner, sequence=3, epoch=3, revision=1))
+    assert control.live_snapshot()["reference_norm"] == admission["reference_norm"]
+    assert control.live_snapshot()["live_deadline_monotonic_s"] == admission["live_deadline_monotonic_s"]
+
+
 def identity():
     return {"run_id": str(uuid4()), "host_incarnation": str(uuid4())}
 
