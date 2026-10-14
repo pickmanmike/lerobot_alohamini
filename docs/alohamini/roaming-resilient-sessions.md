@@ -1,3 +1,40 @@
+## AM1-LIVE-VIRTUAL-09 current input capability
+
+The browser now streams one current normalized left-elbow target through the
+persistent Pi owner/protected physical backend. Live run881200e3 demonstrated
+83/58 raw outward/reverse movement, original-reference residual25, then56/38
+movement after qualified input-expiry recovery in the same run. Browser rejoin
+with fresh input produced16 outward ticks; its measured reversal remains unproven.
+Fine2/return22 and broader teleoperation remain unqualified.
+
+Select `physical-live-left-elbow`, Claim, explicitly Start, qualify Resume and use
+Elbow −/+/[ / ]. Original Pi250 ms expiry reaches each native write boundary;
+reconnection requires fresh hold qualification and new input. One raw2183 reference,
+encoded2072..2183 corridor and native90-second deadline remained fixed through
+both reattachments. Other eleven arms held; body/lift commands stayed zero after
+startup. Simulation and finite presets retain their existing semantics.
+
+| Capability | Current boundary |
+|---|---|
+| One live virtual left elbow | Implemented, physically measured, expiry and browser reattachment exercised |
+| Finite Pi-owned arm/body presets | Prior accepted milestones retained at their original sources |
+| Other joints, bimanual live input | Next extension of the same named-target/expiry/ownership contract; unqualified |
+| Live body/lift and PC USB leaders | Unsupported through this physical lane; controls remain disabled |
+
+Operating source `751ba2dde82e32c54d177c3951ab0f1771b493d0`; motor
+`a4bc18b6411d605f4f35bbc8bc5dc9f4a7568719`, runtime
+`f1649f4a8ffe030fb0a60eefb7d0fb449bd047bf`, manifest
+`cb1a9c47ab98889556fff912a5fc2a1a7f40398b43bbe2c5e2c6e60f7eb7835b`.
+See the [physical results, tests, selection and matched rollback](live-virtual-input-09.md).
+Actual native cleanup and the enrolled available-idle interface were verified;
+service startup does not start or replay motor activity. P1 is unavailable advisory
+media; actual Pi-local observation remains required. Source publication is separate
+from these tested component pins. No merge is authorized for this new PR.
+
+The following Packet08 capability map and all later reports remain historical at
+their recorded versions; they do not undo this one-joint qualification. Durability
+continues to mean software fault tolerance and preserved connection/control/state.
+
 ## AM1-INTEGRATE-OPERATE-08 input capabilities
 
 Operation07 is accepted as the achieved bounded physical same-task recovery and

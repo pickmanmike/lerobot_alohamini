@@ -18,6 +18,13 @@ attempt quota or fine-return prerequisite. Implementation note:
 docs/alohamini/live-virtual-input-09.md. Historical scopes below remain at their
 recorded versions; packet09 governs this continuation.
 
+Packet09 physical boundary achieved at operating source751ba2dd: real browser
+left-elbow streaming, original-expiry measured hold, fresh same-run movement and
+browser reattachment; native run881200e3 stopped with known cleanup. Fine return
+and broader teleoperation remain unqualified. See the Packet09 report for exact
+deployments/tests/rollback. Preserve available idle and no merge authority; do
+not repeat unchanged motor/reboot workloads for documentation publication.
+
 ## Active AM1-INTEGRATE-OPERATE-08 scope
 
 The owner accepts Operation07 as the achieved bounded physical same-task recovery

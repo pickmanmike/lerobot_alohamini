@@ -1,3 +1,29 @@
+## AM1-LIVE-VIRTUAL-09 current operating result
+
+One physical left-elbow joint is now controlled by fresh browser-origin targets
+through the persistent Pi owner/protected native host. One run demonstrated83/58
+raw outward/reverse response, then56/38 after qualified input-expiry recovery with
+the same raw2183 reference, encoded2072..2183 corridor and original90-second Live
+deadline. Browser reconnect acquired fresh control and produced16 outward ticks;
+its measured reverse is unproven. Residuals25/43/59 and the weaker second return
+remain visible limitations: fine2, return22 and full teleoperation are unqualified.
+The UI exercise completed; the native run stopped with known all20-readback/lift/
+bus/camera cleanup and uncertainty=false.
+
+The [Packet09 report](live-virtual-input-09.md) records exact source/deployment,
+original-expiry timing, tests, failed predecessors, rollback and ordinary selection.
+Current motorA4/runtimef164/manifestcb1 remain qualified available idle after the
+actual served enrolled-page check. Other eleven arm targets held; body/lift commands
+stayed zero after normal startup. Actual Pi-local images remained required; P1 had
+no camera-capable session, so new visual elbow confirmation is unavailable. AM1
+remains wireless, AM2 untouched, and persistent service startup cannot replay motion.
+
+New source targets `integrate/am1-local-teleop` without merge authority. Closed
+PR16–20 and the integrated baseline remain intact. All Packet08/Operation07 and
+older evidence below retain their original versions and limitations; no unchanged
+physical/recovery/reboot workload was repeated for publication. Durability remains
+software fault tolerance, state preservation and recoverable control continuity.
+
 ## AM1-INTEGRATE-OPERATE-08 current release
 
 The owner accepts Operation07's bounded same-task recovery and next ordinary Start.
