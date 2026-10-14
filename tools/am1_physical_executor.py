@@ -16,6 +16,8 @@ from examples.alohamini.am1_session_contract import (
 
 FEEDBACK_MAX_AGE_S = 1.0  # Existing AM1 Local original request/acquisition contract.
 ZERO_BODY = {"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0, "lift_axis.vel": 0}
+LIVE_RECIPE = "physical-live-left-elbow"
+LIVE_JOINT = "arm_left_elbow_flex.pos"
 
 
 def load_elbow_return_reference(config, *, definition=LEFT_ELBOW_ORIGINAL_RETURN):
@@ -234,12 +236,17 @@ class PhysicalExecutor:
         }
         self._wake = threading.Event()
         self._reconciliation_worker = None
+        self._live_binding = None
+        self._live_target = None
+        self._live_last_seq = -1
+        self._live_admission_requested = False
+        self._live_expired = None
 
     def supports(self, recipe):
         return (
-            recipe.name in self.recipes
+            (recipe.name in self.recipes or recipe.name == LIVE_RECIPE)
             and recipe.seed is None
-            and recipe.mode == "finite"
+            and recipe.mode == ("interactive" if recipe.name == LIVE_RECIPE else "finite")
             and (recipe.name != LEFT_ELBOW_ORIGINAL_RETURN.recipe_name or self.return_reference is not None)
             and (recipe.name not in ELBOW_RECOVERY_DEFINITIONS or self.recovery_reference is not None)
         )
@@ -416,6 +423,11 @@ class PhysicalExecutor:
             self.desired = "hold"
             self.finish_status = None
             self.sample = self.task = None
+            self._live_binding = None
+            self._live_target = None
+            self._live_last_seq = -1
+            self._live_admission_requested = False
+            self._live_expired = None
             self._fault = self._transient = None
             self._epoch = -1
             self._epoch_mode = None
@@ -451,6 +463,8 @@ class PhysicalExecutor:
             if type(revision) is not int or revision < self.revision:
                 raise ValueError("physical intent revision must not regress")
             if revision != self.revision:
+                self._live_target = None
+                self._live_expired = None
                 self.revision = revision
                 self._finite_completion = None
                 self._completion_returns = []
@@ -459,6 +473,59 @@ class PhysicalExecutor:
                 self._aligned = []
                 self._hold_reference = None
         self._wake.set()
+
+    def bind_control(self, *, run_id, service_incarnation, controller_generation, connection_generation,
+                     host_incarnation, intent_revision):
+        with self.mutex:
+            if run_id != self.run_id or host_incarnation != self.host_incarnation:
+                return False
+            if (type(service_incarnation) is not str or not service_incarnation
+                    or any(type(v) is not str or not v for v in (controller_generation, connection_generation))
+                    or type(intent_revision) is not int or intent_revision < 0
+                    or intent_revision < self.revision):
+                return False
+            owner = {"service_incarnation": service_incarnation, "controller_generation": controller_generation,
+                     "connection_generation": connection_generation}
+            if owner != self._live_binding or intent_revision != self.revision:
+                self._live_expired = None
+                if owner != self._live_binding:
+                    self._live_last_seq = -1
+                self._live_binding = owner
+                self._live_target = None
+                self.revision = intent_revision
+                self.desired = "hold"
+                self._dispatch_ack = False
+                self._aligned = []
+                self._hold_reference = None
+            self._wake.set()
+            return True
+
+    def apply(self, target, *, valid_until_monotonic_s, intent_revision, run_id, service_incarnation,
+              controller_generation, connection_generation, host_incarnation, grant_id, seq):
+        with self.mutex:
+            if (self.recipe is None or self.recipe.name != LIVE_RECIPE or self.finish_status
+                    or self._lifecycle["phase"] != "live" or self.desired != "active"
+                    or run_id != self.run_id or host_incarnation != self.host_incarnation
+                    or intent_revision != self.revision or self._live_binding != {
+                        "service_incarnation": service_incarnation, "controller_generation": controller_generation,
+                        "connection_generation": connection_generation}
+                    or not isinstance(target, dict) or set(target) != {LIVE_JOINT}
+                    or type(target[LIVE_JOINT]) not in (int, float) or not math.isfinite(target[LIVE_JOINT])
+                    or type(valid_until_monotonic_s) not in (int, float) or not math.isfinite(valid_until_monotonic_s)
+                    or self.clock() >= valid_until_monotonic_s
+                    or valid_until_monotonic_s > self.clock() + .25 + 1e-9
+                    or type(seq) is not int or seq <= self._live_last_seq
+                    or type(grant_id) is not str or not grant_id):
+                return False
+            corridor = (self.sample or {}).get("ack", {}).get("live_input", {})
+            if (not corridor or not corridor.get("corridor_min_norm", float("inf")) <= target[LIVE_JOINT]
+                    <= corridor.get("corridor_max_norm", float("-inf"))):
+                return False
+            self._live_target = {"target": copy.deepcopy(target), "grant_id": grant_id, "seq": seq,
+                                 "valid_until_monotonic_s": valid_until_monotonic_s}
+            self._live_last_seq = seq
+            self._wake.set()
+            return True
 
     def evidence(self):
         with self.mutex:
@@ -485,6 +552,10 @@ class PhysicalExecutor:
                 and ack.get("epoch") == self._epoch
                 and self._epoch_mode == "active"
             )
+            live_transition = bool(self.recipe is not None and self.recipe.name == LIVE_RECIPE
+                and matched and revision and self.desired == "active" and ack.get("state") == "paused"
+                and self._epoch_mode == "active" and ack.get("epoch") == self._epoch - 1
+                and len(self._aligned) >= 3 and self._aligned[-1] - self._aligned[0] >= .2 - 1e-9)
             aligned = bool(
                 hold and len(self._aligned) >= 3 and self._aligned[-1] - self._aligned[0] >= 0.2 - 1e-9
             )
@@ -497,7 +568,7 @@ class PhysicalExecutor:
                 "optional_observation": {"required": False, "state": "not-requested", "qualified": False},
                 "pose_aligned": aligned or bool(self._dispatch_ack and active_ack),
                 "hold_acknowledged": bool(hold),
-                "native_ack": bool(hold or active_ack),
+                "native_ack": bool(hold or active_ack or live_transition),
                 "active_acknowledged": bool(active_ack),
                 "finite_completion": copy.deepcopy(self._finite_completion),
                 "fault": self._fault,
@@ -513,6 +584,8 @@ class PhysicalExecutor:
                 "host_incarnation": self.host_incarnation,
                 "lifecycle": copy.deepcopy(self._lifecycle),
                 "transport_issue": self._transient,
+                **({"live_input": copy.deepcopy(self._live_expired or ack.get("live_input", {"state": "held", "joint": LIVE_JOINT}))}
+                   if self.recipe is not None and self.recipe.name == LIVE_RECIPE else {}),
                 "reconciliation": {
                     "state": self._reconciliation_worker.state,
                     "error": self._reconciliation_worker.error,
@@ -538,10 +611,11 @@ class PhysicalExecutor:
                     return False
                 self.desired = "active"
             self._wake.set()
-            return self._dispatch_ack
+            return self._dispatch_ack or (self.recipe.name == LIVE_RECIPE and self.evidence()["native_ack"])
 
     def hold(self):
         with self.mutex:
+            self._live_target = None
             self._completion_returns = []
             if self._lifecycle["phase"] not in ("startup", "live"):
                 return False  # Idle/restart/finished inspection never opens or commands hardware.
@@ -599,6 +673,7 @@ class PhysicalExecutor:
         from tools.am1_pi_executor import SimulatedIO
 
         io = None
+        live_input = self.recipe.name == LIVE_RECIPE
         try:
             definition = ELBOW_RECOVERY_DEFINITIONS.get(self.recipe.name, LEFT_ELBOW_ORIGINAL_RETURN)
             loaded = (
@@ -664,6 +739,8 @@ class PhysicalExecutor:
                         self._hold_reference = None
                         self._completion_returns = []
                     latest_ack = self.sample["ack"] if self.sample else {}
+                    if live_input and latest_ack.get("live_input", {}).get("state") == "expired":
+                        self._live_expired = copy.deepcopy(latest_ack["live_input"])
                     if (
                         fresh
                         and self._epoch_mode == "active"
@@ -711,8 +788,16 @@ class PhysicalExecutor:
                         else:
                             self._aligned = []
                             self._hold_reference = dict(positions)
+                        if live_input and observed and len(self._aligned) >= 3 and self._aligned[-1] - self._aligned[0] >= .2 - 1e-9:
+                            self._live_admission_requested = True
+                            admitted = ack.get("live_input", {})
+                            if self._lifecycle["phase"] == "startup" and admitted.get("live_admitted_at_monotonic_s") is not None:
+                                self._lifecycle.update(phase="live", native_live_at=admitted["live_admitted_at_monotonic_s"],
+                                    native_deadline_monotonic_s=admitted["live_deadline_monotonic_s"],
+                                    backend_incarnation=self.host_incarnation)
                         if (
                             self._lifecycle["phase"] == "startup"
+                            and not live_input
                             and observed
                             and len(self._aligned) >= 3
                             and self._aligned[-1] - self._aligned[0] >= 0.2 - 1e-9
@@ -750,6 +835,13 @@ class PhysicalExecutor:
                                 ),
                             )
                             self._execution = dict(self.task.snapshot(), fault=None)
+                    if live_input:
+                        self._dispatch_ack = bool(matched and ack.get("state") == "active")
+                        native = copy.deepcopy(ack.get("live_input", {}))
+                        self._execution = {"progress_s": 0 if self._lifecycle["native_live_at"] is None else
+                            max(0, self.clock() - self._lifecycle["native_live_at"]), "complete": False,
+                            "fault": self._fault, "profile": "LiveLeftElbow", "live_input": native,
+                            "provenance": "browser-origin/protected-host/measured-feedback"}
                     if self.task:
                         if desired == "pause":
                             if self.task.active:
@@ -856,6 +948,12 @@ class PhysicalExecutor:
                         "intent_revision": self.revision,
                         "action_sequence": self._action_sequence,
                     }
+                    if live_input:
+                        # One stored sample, unchanged through every native send.
+                        marker = action["_am1_local_control"]
+                        marker.update(version=2, live_binding=copy.deepcopy(self._live_binding),
+                            live_admitted=self._live_admission_requested,
+                            live_input=copy.deepcopy(self._live_target) if desired == "active" else None)
                     # Bound send is outside authority; the worker mutex fences concurrent Pause/Stop.
                     try:
                         io.send(action)
@@ -1113,12 +1211,12 @@ class ProtectedHostRun:
         if recipe.name in ("physical-arm-smoke", "physical-arm-smoke-repeat"):
             env["AM1_SHOULDER_INTEGRAL_TEST"] = "1"
             env["AM1_SCRIPTED_PREPARE"] = "1"
-        if recipe.name in PhysicalExecutor.selected_joint_recipes:
+        if recipe.name in PhysicalExecutor.selected_joint_recipes or recipe.name == LIVE_RECIPE:
             for k in ("AM1_SYNC_SHOULDER_READBACK", "AM1_LEFT_SHOULDER_EVIDENCE"):
                 env.pop(k, None)
             env["AM1_SCRIPTED_PREPARE"] = "1"
             env["AM1_SELECTED_JOINT_EVIDENCE"] = "1"
-        if recipe.name in {LEFT_ELBOW_POSITIVE_CONTROL.recipe_name, SelectedElbowExperiment.recipe_name}:
+        if recipe.name in {LEFT_ELBOW_POSITIVE_CONTROL.recipe_name, SelectedElbowExperiment.recipe_name, LIVE_RECIPE}:
             env["AM1_VISIBLE_CONTROL_RECIPE"] = recipe.name
         if recipe.name in ELBOW_RECOVERY_DEFINITIONS:
             env["AM1_ELBOW_RECOVERY"] = f"I{ELBOW_RECOVERY_DEFINITIONS[recipe.name].integral}"

@@ -1,3 +1,23 @@
+## Active AM1-LIVE-VIRTUAL-09 scope
+
+Packet08 is complete. Packet09 authorizes one focused branch from the actual
+integration tip and a new unmerged PR to integrate/am1-local-teleop. Preserve
+closed PR16-20, all recorded physical evidence, private state and separate pins.
+Implement one browser-streamed normalized left elbow target through the existing
+persistent owner/protected backend. Preserve original Pi-issued250 ms expiry to
+the native write boundary, latest-only work, identity/sequence fencing, qualified
+same-run recovery, fixed q0-10..q0 corridor and native90-second Live deadline.
+Other11 arms hold measured admission targets; body/lift zero after normal startup.
+Retain simulation default and finite recipe semantics. No gain/calibration tuning,
+network/camera redesign, manual leader/shoulder/readiness requests, AM2 work,
+autoplay or merge. Root alone operates Git/devices/SSH/staging.
+Durability means software fault tolerance, preserved state, connection/control
+continuity and recovery with minimal human intervention, not mechanical wear.
+Use the packet's finite locally monitored checks and existing tools; no packet-wide
+attempt quota or fine-return prerequisite. Implementation note:
+docs/alohamini/live-virtual-input-09.md. Historical scopes below remain at their
+recorded versions; packet09 governs this continuation.
+
 ## Active AM1-INTEGRATE-OPERATE-08 scope
 
 The owner accepts Operation07 as the achieved bounded physical same-task recovery

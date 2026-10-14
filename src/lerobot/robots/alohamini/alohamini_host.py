@@ -38,13 +38,20 @@ from .selected_joint_evidence import MARKER as AM1_SELECTED_JOINT_EVIDENCE_KEY, 
 
 AM1_LOCAL_CONTROL_KEY = "_am1_local_control"
 AM1_LOCAL_FEEDBACK_KEY = "_am1_local_feedback"
+AM1_LIVE_RECIPE = "physical-live-left-elbow"
+AM1_LIVE_JOINT = "arm_left_elbow_flex.pos"
+
+
+class AM1LiveInputExpired(Exception):
+    """An acknowledged native release, distinct from every motor/feedback fault."""
 
 
 class AM1LocalControl:
     """AM1-only host-side pause latch on the existing motor-owner thread."""
 
     def __init__(self, *, run_id: str | None = None, host_incarnation: str | None = None,
-                 selected_evidence: AM1SelectedJointEvidence | None = None) -> None:
+                 selected_evidence: AM1SelectedJointEvidence | None = None,
+                 live: bool = False, clock: Callable[[], float] = time.monotonic) -> None:
         if (run_id is None) != (host_incarnation is None):
             raise ValueError("AM1 protected control requires both run and host identity")
         self.binding = None if run_id is None else {
@@ -57,6 +64,197 @@ class AM1LocalControl:
         self.epoch = -1
         self.observation_id = 0
         self.selected_evidence = selected_evidence
+        self.live = live
+        self.clock = clock
+        self.live_binding = None
+        self.live_sample = None
+        self.live_held = None
+        self.live_cursor_at = None
+        self._live_summary = {"state": "held", "joint": AM1_LIVE_JOINT, "last_input_seq": -1}
+
+    def live_snapshot(self) -> dict:
+        return copy.deepcopy(self._live_summary)
+
+    def _live_hold(self, robot: AlohaMini, *, expired: bool = False) -> None:
+        summary = self._live_summary
+        summary["hold_started_at_monotonic_s"] = self.clock()
+        robot.stop_motion()
+        robot.hold_follower_arms()
+        summary["hold_completed_at_monotonic_s"] = self.clock()
+        self.state = "paused"
+        summary["state"] = "expired" if expired else "held"
+        self.accepted_action = {"mode": "measured_arm_hold", "body_velocity": 0.0}
+        self.live_sample = None
+        if self.selected_evidence is not None:
+            self.selected_evidence.deactivate_live(robot)
+
+    def check_live(self, robot: AlohaMini) -> bool:
+        """Runs on the motor owner even when no new owner/gateway command arrives."""
+        if not self.live:
+            return True
+        now = self.clock()
+        deadline = self._live_summary.get("live_deadline_monotonic_s")
+        if deadline is not None and now >= deadline:
+            if self._live_summary["state"] != "budget_expired":
+                self._live_hold(robot)
+                self._live_summary["state"] = "budget_expired"
+            return False
+        if self.live_sample is not None and now >= self.live_sample["valid_until_monotonic_s"]:
+            self._live_summary["expiry_detected_at_monotonic_s"] = now
+            self._live_hold(robot, expired=True)
+        return True
+
+    def before_live_write(self, robot: AlohaMini) -> None:
+        valid = self.check_live(robot)
+        if not valid or self._live_summary["state"] == "expired":
+            raise AM1LiveInputExpired()
+        if self.live_sample is not None:
+            now = self.clock()
+            self._live_summary.update(last_write_checked_at_monotonic_s=now,
+                last_grant_age_at_write_s=max(0, now - (self.live_sample["valid_until_monotonic_s"] - .25)))
+
+    def _refresh_live_cursor(self, robot: AlohaMini) -> None:
+        from examples.alohamini.am1_finite_task import JOINT_KEYS
+
+        measured = robot.get_observation()
+        if any(type(measured.get(k)) not in (int, float) or not math.isfinite(measured[k]) for k in JOINT_KEYS):
+            raise RuntimeError("Live admission requires complete actual measured follower arms")
+        if self.live_held is None:
+            self.live_held = {k: float(measured[k]) for k in JOINT_KEYS}
+        else:
+            self.live_held[AM1_LIVE_JOINT] = float(measured[AM1_LIVE_JOINT])
+        self._live_summary.update(cursor_norm=self.live_held[AM1_LIVE_JOINT],
+                                  cursor_feedback_sequence=self.observation_id,
+                                  cursor_intent_revision=self.intent_revision)
+        self.live_cursor_at = self.clock()
+
+    def _apply_live(self, robot: AlohaMini, command: dict) -> bool:
+        marker = command.get(AM1_LOCAL_CONTROL_KEY)
+        base = {"version", "mode", "epoch", "run_id", "host_incarnation", "intent_revision", "action_sequence"}
+        if (not isinstance(marker, dict) or set(marker) != base | {"live_binding", "live_input", "live_admitted"}
+                or marker.get("version") != 2 or type(marker.get("live_admitted")) is not bool
+                or any(marker.get(k) != v for k, v in (self.binding or {}).items())
+                or any(type(marker.get(k)) is not int or marker[k] < 0 for k in
+                       ("epoch", "intent_revision", "action_sequence"))
+                or marker.get("mode") not in {"active", "pause"}
+                or set(command) != {AM1_LOCAL_CONTROL_KEY, "x.vel", "y.vel", "theta.vel", "lift_axis.vel"}
+                or any(type(command[k]) not in (int, float) or command[k] != 0 for k in
+                       ("x.vel", "y.vel", "theta.vel", "lift_axis.vel"))):
+            return False
+        if marker["action_sequence"] <= self.accepted_action_sequence or marker["intent_revision"] < self.intent_revision:
+            return False
+        owner = marker["live_binding"]
+        if (not isinstance(owner, dict) or set(owner) != {"service_incarnation", "controller_generation", "connection_generation"}
+                or type(owner["service_incarnation"]) is not str or not owner["service_incarnation"]
+                or any(type(owner[k]) is not str or not owner[k] for k in ("controller_generation", "connection_generation"))):
+            return False
+        try:
+            if any(str(UUID(value)) != value for value in owner.values()):
+                return False
+        except ValueError:
+            return False
+        if self.live_binding != owner:
+            if marker["mode"] != "pause" or (self.live_binding is not None and marker["intent_revision"] <= self.intent_revision):
+                return False
+        # Identity/epoch eligibility precedes EVERY stored-sample mutation.
+        if marker["mode"] == "active" and not (
+                (self.state == "active" and marker["epoch"] == self.epoch)
+                or (self.state == "paused" and marker["epoch"] == self.epoch + 1 and marker["epoch"] % 2 == 0)):
+            return False
+        if marker["mode"] == "active" and marker["intent_revision"] != self.intent_revision:
+            return False
+        original = marker["live_input"]
+        if marker["mode"] == "pause" and original is not None:
+            return False
+        if original is not None:
+            if (not isinstance(original, dict) or set(original) != {"target", "grant_id", "seq", "valid_until_monotonic_s"}
+                    or type(original["seq"]) is not int or original["seq"] < 0
+                    or type(original["grant_id"]) is not str or not original["grant_id"]
+                    or type(original["valid_until_monotonic_s"]) not in (int, float)
+                    or not math.isfinite(original["valid_until_monotonic_s"])
+                    or not isinstance(original["target"], dict) or set(original["target"]) != {AM1_LIVE_JOINT}
+                    or type(original["target"][AM1_LIVE_JOINT]) not in (int, float)
+                    or not math.isfinite(original["target"][AM1_LIVE_JOINT])):
+                return False
+            last = self._live_summary["last_input_seq"]
+            if original["seq"] < last or (original["seq"] == last and original != self.live_sample):
+                return False
+        # Expiry never depends on a successfully parsed arriving command.
+        if not self.check_live(robot):
+            return False
+        if original is not None and self.clock() >= original["valid_until_monotonic_s"]:
+            return False
+        if original is not None and original["valid_until_monotonic_s"] > self.clock() + .25 + 1e-9:
+            return False
+        if marker["mode"] == "active" and self.state == "paused" and marker["epoch"] != self.epoch + 1:
+            return False
+        standard = {k: marker[k] for k in base}
+        standard["version"] = 1
+        action = {k: v for k, v in command.items() if k != AM1_LOCAL_CONTROL_KEY}
+        action[AM1_LOCAL_CONTROL_KEY] = standard
+        if marker["mode"] == "pause":
+            accepted = self._apply_standard(robot, action)
+            if not accepted:
+                return False
+            changed = self.live_binding != owner
+            self.live_binding = copy.deepcopy(owner)
+            self.live_sample = None
+            if changed:
+                self._live_summary["last_input_seq"] = -1
+            self._live_summary["state"] = "held"
+            self._refresh_live_cursor(robot)
+            if marker["live_admitted"] and "live_admitted_at_monotonic_s" not in self._live_summary:
+                now = self.clock()
+                q0 = self.live_held[AM1_LIVE_JOINT]
+                if not -90 <= q0 <= 100:
+                    raise RuntimeError("Live measured origin cannot contain its negative ten-unit corridor")
+                self._live_summary.update(reference_norm=q0, corridor_min_norm=q0 - 10,
+                    corridor_max_norm=q0, live_admitted_at_monotonic_s=now, live_deadline_monotonic_s=now + 90)
+                if self.selected_evidence is not None:
+                    self.selected_evidence.admit_live(robot, self._live_summary)
+            return True
+        if self.live_held is None or "live_deadline_monotonic_s" not in self._live_summary:
+            return False
+        if original is None:
+            # Readiness does not remove or renew an already applied sample.
+            if self.live_sample is not None:
+                return False
+            self._live_summary["state"] = "awaiting_input"
+        else:
+            desired = original["target"][AM1_LIVE_JOINT]
+            if not self._live_summary["corridor_min_norm"] <= desired <= self._live_summary["corridor_max_norm"]:
+                return False
+            if original != self.live_sample:
+                now = self.clock()
+                previous = self._live_summary.get("accepted_at_monotonic_s")
+                self._live_summary.update(last_input_seq=original["seq"], grant_id=original["grant_id"],
+                    valid_until_monotonic_s=original["valid_until_monotonic_s"], accepted_at_monotonic_s=now,
+                    last_input_gap_s=None if previous is None else now - previous)
+                self.live_sample = copy.deepcopy(original)
+            self._live_summary["state"] = "active"
+        now = self.clock()
+        cursor = self._live_summary["cursor_norm"]
+        desired = cursor if original is None else original["target"][AM1_LIVE_JOINT]
+        step = max(0, now - self.live_cursor_at)
+        next_cursor = cursor + max(-step, min(step, desired - cursor))
+        # All eleven nonselected goals already have acknowledged literal raw
+        # measured holds. Re-encoding their affine feedback would floor/clamp
+        # setup poses and could move a joint the client cannot select.
+        action[AM1_LIVE_JOINT] = next_cursor
+        robot._am1_live_before_write = lambda: self.before_live_write(robot)
+        try:
+            accepted = self._apply_standard(robot, action)
+        except AM1LiveInputExpired:
+            return False
+        if accepted:
+            self.accepted_action = {**self.live_held, **(self.accepted_action or {})}
+            self._live_summary["cursor_norm"] = next_cursor
+            self._live_summary["accepted_target_norm"] = self.accepted_action.get(AM1_LIVE_JOINT)
+            self._live_summary["nonselected_hold"] = "native-measured-raw-goals"
+            self.live_cursor_at = self.clock()
+            if self.selected_evidence is not None:
+                self.selected_evidence.live_action(robot, self._live_summary)
+        return accepted
 
     def annotate(self, observation: dict, *, acquired_at: float | None = None) -> None:
         self.observation_id += 1
@@ -74,6 +272,8 @@ class AM1LocalControl:
                 accepted_action=self.accepted_action,
                 write_acknowledged=False,
             )
+            if self.live:
+                observation[AM1_LOCAL_FEEDBACK_KEY]["live_input"] = self.live_snapshot()
 
     def watchdog_stop(self, robot: AlohaMini) -> None:
         if self.selected_evidence is not None:
@@ -85,6 +285,11 @@ class AM1LocalControl:
             logging.warning("AM1 Local watchdog held follower arms at measured positions; epoch=%s", self.epoch)
 
     def apply(self, robot: AlohaMini, command: dict) -> bool:
+        if self.live:
+            return self._apply_live(robot, command)
+        return self._apply_standard(robot, command)
+
+    def _apply_standard(self, robot: AlohaMini, command: dict) -> bool:
         if AM1_SELECTED_JOINT_EVIDENCE_KEY in command and (
             self.selected_evidence is None or self.binding is None
         ):
@@ -1020,7 +1225,7 @@ def visible_control_binding(args):
         uuid_text,
     )
 
-    if (recipe not in {LEFT_ELBOW_POSITIVE_CONTROL.recipe_name, SelectedElbowExperiment.recipe_name}
+    if (recipe not in {LEFT_ELBOW_POSITIVE_CONTROL.recipe_name, SelectedElbowExperiment.recipe_name, AM1_LIVE_RECIPE}
         or os.environ.get("AM1_SCRIPTED_PREPARE") != "1"
         or os.environ.get("AM1_SELECTED_JOINT_EVIDENCE") != "1"
         or os.environ.get("AM1_ELBOW_RECOVERY") is not None
@@ -1032,7 +1237,7 @@ def visible_control_binding(args):
         or uuid_text(args.am1_host_incarnation) != args.am1_host_incarnation):
         raise ValueError("Visible control requires its exact protected recipe and read-only I0 owner")
     binding = {"run_id":args.am1_run_id,"host_incarnation":args.am1_host_incarnation,"recipe":recipe}
-    if recipe == LEFT_ELBOW_POSITIVE_CONTROL.recipe_name:
+    if recipe in {LEFT_ELBOW_POSITIVE_CONTROL.recipe_name, AM1_LIVE_RECIPE}:
         if experiment_file is not None:
             raise ValueError("Historical positive control cannot inherit a selected experiment")
         return binding
@@ -1171,6 +1376,7 @@ def _run_host(args):
         AM1LocalControl(
             run_id=args.am1_run_id, host_incarnation=args.am1_host_incarnation,
             selected_evidence=selected_evidence,
+            live=visible_binding is not None and visible_binding["recipe"] == AM1_LIVE_RECIPE,
         )
         if args.robot_model == "alohamini1" and not args.no_follower
         else None
@@ -1206,6 +1412,8 @@ def _run_host(args):
         lift_diagnostics_report_start_t = cadence_report_start_t
 
         while duration < host.connection_time_s:
+            if local_control is not None and not local_control.check_live(robot):
+                break
             loop_start_t = time.perf_counter()
             if loop_timing is not None:
                 loop_timing.begin(loop_start_t)
@@ -1260,6 +1468,9 @@ def _run_host(args):
                     local_control.watchdog_stop(robot)
                 else:
                     robot.stop_motion()
+
+            if local_control is not None and not local_control.check_live(robot):
+                break
 
             if loop_timing is not None:
                 loop_timing.mark("robot_observation", time.perf_counter())

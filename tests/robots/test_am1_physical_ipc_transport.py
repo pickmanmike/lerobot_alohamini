@@ -26,6 +26,37 @@ SHOULDER = "arm_left_shoulder_lift.pos"
 BODY = {"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0, "lift_axis.vel": 0.0}
 
 
+def test_live_fixture_admission_uses_actual_settings_guard():
+    """Cross-platform reproduction of the previously skipped live admission."""
+    from tests.robots.test_am1_live_native import frame
+
+    binding = identity()
+    robot = InjectedLiveMotorHardware(SimpleNamespace(robot_model="alohamini1"))
+    evidence = host.AM1SelectedJointEvidence(enabled=True, emit=lambda _: None)
+    robot._am1_selected_joint_evidence_enabled = True
+    robot._am1_visible_control_binding = {**binding, "recipe": host.AM1_LIVE_RECIPE}
+    robot._am1_visible_control_evidence = evidence
+    control = host.AM1LocalControl(**binding, selected_evidence=evidence, live=True)
+    owner = {k: str(uuid4()) for k in ("service_incarnation", "controller_generation", "connection_generation")}
+    robot.connect(home_lift=True)
+    assert control.apply(robot, frame(binding, owner, sequence=1))
+    assert control.live_snapshot()["measured_origin_raw"] == 2000
+    assert evidence.visible_settings["unchanged"] is True
+    assert len(robot.left_bus.port_handler.writes) == 4
+
+
+def test_live_fixture_invalid_registers_are_rejected_by_production_guard():
+    binding = identity()
+    robot = InjectedLiveMotorHardware(SimpleNamespace(robot_model="alohamini1"))
+    evidence = host.AM1SelectedJointEvidence(enabled=True, emit=lambda _: None)
+    robot._am1_selected_joint_evidence_enabled = True
+    robot._am1_visible_control_binding = {**binding, "recipe": host.AM1_LIVE_RECIPE}
+    robot._am1_visible_control_evidence = evidence
+    robot.register_bytes[21] = 15  # Actual simulated P byte differs from required16.
+    with pytest.raises(RuntimeError, match="identity/settings"):
+        robot.connect(home_lift=True)
+
+
 def identity():
     return {"run_id": str(uuid4()), "host_incarnation": str(uuid4())}
 
@@ -85,6 +116,83 @@ class InjectedMotorHardware:
     def disconnect(self, *, recover_interrupted_bus_io):
         self.events.append(("mock-disconnect", recover_interrupted_bus_io))
         self.is_connected = False
+
+
+class InjectedLiveMotorHardware(InjectedMotorHardware):
+    """Simulated device/settings IO with the production selected guard enabled."""
+
+    def __init__(self, config=None):
+        super().__init__(config)
+        from lerobot.motors import Motor, MotorCalibration, MotorNormMode
+        from lerobot.motors.feetech import FeetechMotorsBus
+        from tests.robots.test_alohamini_lift_motor_feedback import ByteStreamPort, status
+        from tests.robots.test_am1_selected_joint_evidence import visible_register_packet
+
+        self.torque_enabled = 0
+        self.goal_raw = self.present_raw = 2000
+        self.current_raw = 0
+        self.register_bytes = {}
+        self._joint_current_limit_ma = 1800.0
+        selected = "arm_left_elbow_flex"
+        self.left_bus = FeetechMotorsBus(
+            "unused-live-ipc-settings", {selected: Motor(3, "sts3215", MotorNormMode.RANGE_M100_100)},
+            {selected: MotorCalibration(3, 0, 1845, 1000, 3000)},
+        )
+        device = self
+
+        class SimulatedSettingsPort(ByteStreamPort):
+            def writePort(self, packet):  # noqa: N802 - actual vendor SDK interface
+                start, length = packet[5], packet[6]
+                registers = bytearray(visible_register_packet(
+                    torque=device.torque_enabled, goal=device.goal_raw, present=device.present_raw,
+                    current=device.current_raw,
+                ))
+                for address, value in device.register_bytes.items():
+                    registers[address] = value
+                payload = bytes([91]) if start == 85 else bytes(registers[start:start + length])
+                self.responses.append(status(payload, motor_id=3))
+                return super().writePort(packet)
+
+        self.left_bus.port_handler = SimulatedSettingsPort()
+
+    def connect(self, *, home_lift):
+        super().connect(home_lift=home_lift)
+        evidence = self._am1_visible_control_evidence
+        evidence.prepare_visible(self, self._am1_visible_control_binding)
+        self.torque_enabled = 1
+        evidence.verify_visible_active(self)
+
+    def send_action(self, action):
+        before_write = getattr(self, "_am1_live_before_write", lambda: None)
+        before_write()
+        key = "arm_left_elbow_flex.pos"
+        if key in action:
+            started = time.monotonic()
+            self.goal_raw = self.left_bus._unnormalize({3: float(action[key])})[3]
+            self._am1_selected_joint_action = {
+                "requested": float(action[key]), "expected_goal_raw": self.goal_raw,
+                "write_started_at_monotonic_s": started, "write_completed_at_monotonic_s": time.monotonic(),
+                "sync_write_returned": True, "write_acknowledged": False,
+            }
+        return super().send_action(action)
+
+    def hold_follower_arms(self):
+        self.goal_raw = self.present_raw
+        super().hold_follower_arms()
+
+    def get_observation(self):
+        started = time.monotonic()
+        result = super().get_observation()
+        completed = time.monotonic()
+        self._am1_selected_joint_position = {
+            "raw": self.present_raw, "normalized": result["arm_left_elbow_flex.pos"],
+            "read_started_at_monotonic_s": started, "read_completed_at_monotonic_s": completed,
+        }
+        self._am1_selected_joint_current = {
+            "raw": self.current_raw, "ma": self.current_raw * 6.5,
+            "read_started_at_monotonic_s": started, "read_completed_at_monotonic_s": completed,
+        }
+        return result
 
 
 def make_client(directory, calibration_dir):
@@ -157,7 +265,7 @@ def test_cached_client_observation_never_advances_host_ack_or_sample_sequence(tm
 
 
 @contextmanager
-def actual_mock_host(*, expected_error=None):
+def actual_mock_host(*, expected_error=None, live=False):
     """Run the production native loop; replace only its physical robot object."""
     ready = threading.Event()
     receipts = queue.Queue()
@@ -194,7 +302,7 @@ def actual_mock_host(*, expected_error=None):
         )
 
         def robot_factory(config):
-            robot = InjectedMotorHardware(config)
+            robot = InjectedLiveMotorHardware(config) if live else InjectedMotorHardware(config)
             hardware.append(robot)
             return robot
 
@@ -231,12 +339,20 @@ def actual_mock_host(*, expected_error=None):
                 errors.append(error)
                 ready.set()
 
+        environment = {"AM1_LEFT_SHOULDER_EVIDENCE": "0", "AM1_SYNC_SHOULDER_READBACK": "0"}
+        if live:
+            environment.update(AM1_VISIBLE_CONTROL_RECIPE=host.AM1_LIVE_RECIPE,
+                               AM1_SELECTED_JOINT_EVIDENCE="1", AM1_SCRIPTED_PREPARE="1",
+                               AM1_SHOULDER_INTEGRAL_TEST="0")
         with (
             patch.object(host, "AlohaMini", side_effect=robot_factory),
             patch.object(host, "AlohaMiniHost", side_effect=host_factory),
             patch.object(host, "AM1LocalControl", side_effect=control_factory),
-            patch.dict(os.environ, {"AM1_LEFT_SHOULDER_EVIDENCE": "0", "AM1_SYNC_SHOULDER_READBACK": "0"}),
+            patch.dict(os.environ, environment),
         ):
+            if live:
+                for name in ("AM1_ELBOW_RECOVERY", "AM1_ELBOW_RECOVERY_RECIPE"):
+                    os.environ.pop(name, None)
             thread = threading.Thread(target=run, name="mock-physical-host", daemon=True)
             thread.start()
             client = make_client(directory, directory / "calibration")

@@ -1588,6 +1588,7 @@ RECIPES = MappingProxyType(
         ),
         **{name: Recipe(name, "finite", definition.trajectory_s, definition.live_s, seed=None)
            for name, definition in ELBOW_RECOVERY_DEFINITIONS.items()},
+        "physical-live-left-elbow": Recipe("physical-live-left-elbow", "interactive", None, 90.0, seed=None),
         "fake-interactive": Recipe("fake-interactive", "interactive", None, 420.0),
     }
 )

@@ -1292,6 +1292,7 @@ class AlohaMini(Robot):
             np.ndarray: the action sent to the motors, potentially clipped.
         """
         action_start_t = time.perf_counter()
+        live_before_write = getattr(self, "_am1_live_before_write", lambda: None)
         # arm_goal_pos = {k: v for k, v in action.items() if k.endswith(".pos")}
         left_pos  = {k: v for k, v in action.items() if k.endswith(".pos") and k.startswith("arm_left_") and k.replace(".pos", "") in self.left_bus.motors}
         right_pos = {k: v for k, v in action.items() if k.endswith(".pos") and k.startswith("arm_right_") and self.right_bus is not None and k.replace(".pos", "") in self.right_bus.motors}
@@ -1316,6 +1317,7 @@ class AlohaMini(Robot):
         #     arm_goal_pos = arm_safe_goal_pos
 
         operation = getattr(self, "_lift_operation", None)
+        live_before_write()
         if operation is not None:
             operation.apply_action(action)
         else:
@@ -1380,6 +1382,7 @@ class AlohaMini(Robot):
             }
         try:
             if left_pos:
+                live_before_write()
                 if left_raw_goals is not None:
                     self.left_bus.sync_write("Goal_Position", left_raw_goals, normalize=False)
                 else:
@@ -1398,11 +1401,13 @@ class AlohaMini(Robot):
                 self._am1_selected_joint_action["write_completed_at_monotonic_s"] = time.monotonic()
         left_write_done_t = time.perf_counter()
         if self.right_bus and right_pos:
+            live_before_write()
             if right_raw_goals is not None:
                 self.right_bus.sync_write("Goal_Position", right_raw_goals, normalize=False)
             else:
                 self.right_bus.sync_write("Goal_Position", {k.replace(".pos", ""): v for k, v in right_pos.items()})
         right_write_done_t = time.perf_counter()
+        live_before_write()
         self.left_bus.sync_write("Goal_Velocity", base_wheel_goal_vel)
         base_write_done_t = time.perf_counter()
 

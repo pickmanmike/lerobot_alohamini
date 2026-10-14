@@ -756,7 +756,7 @@ class Gateway:
                         if (
                             controller
                             and controller["device_id"] == peer.device
-                            and state.get("run", {}).get("recipe") == "fake-interactive"
+                            and state.get("run", {}).get("recipe") in {"fake-interactive", "physical-live-left-elbow"}
                         ):
                             await self.call(
                                 {
@@ -765,6 +765,8 @@ class Gateway:
                                     "service_incarnation": state["service_incarnation"],
                                     "controller_generation": controller["controller_generation"],
                                     "connection_generation": peer.connection,
+                                    **({"host_incarnation": state.get("evidence", {}).get("host_incarnation")}
+                                       if state["run"]["recipe"] == "physical-live-left-elbow" else {}),
                                 },
                                 peer.device,
                             )

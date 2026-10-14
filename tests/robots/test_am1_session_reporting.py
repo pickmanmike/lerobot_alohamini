@@ -977,3 +977,106 @@ def test_compact_snapshot_attach_still_refuses_unexpected_body_before_snapshot()
     with pytest.raises(ValueError, match="attach payload"):
         asyncio.run(gateway.attach({"device": {"id": "offline-viewer"}}))
     assert calls == [] and gateway.tickets == {}
+
+
+def test_live_gateway_real_owner_adapter_preserves_original_expiry_and_reacquires(tmp_path):
+    from tests.robots.test_am1_live_native import ExecutorNativeHost
+    from tests.robots.test_am1_physical_executor import executor
+
+    async def scenario():
+        host = ExecutorNativeHost()
+        e = executor(host)
+        owner_dir = tmp_path / "live-owner"
+        owner = ipc.OwnerServer(owner_dir, executor=e)
+        gateway = Gateway(owner_dir, tmp_path / "live-auth")
+        enrolled = gateway.auth.enroll(gateway.auth.pair(control=True))
+        device = {"id": enrolled["device_id"], "control": True}
+        peer = SimpleNamespace(ack=True, connection=None)
+        await owner.start()
+
+        async def wait_for(predicate):
+            for _ in range(200):
+                if predicate():
+                    return
+                await asyncio.sleep(0.01)
+            assert predicate(), "bounded live gateway condition did not qualify"
+
+        async def connect_resume():
+            state = owner.authority.snapshot()
+            base = {
+                "run_id": state["run"]["run_id"], "service_incarnation": state["service_incarnation"],
+                "controller_generation": claim["controller_generation"],
+                "host_incarnation": state["evidence"]["host_incarnation"],
+            }
+            assert (await gateway.dispatch({"op": "claim", "controller_generation": claim["controller_generation"]}, device))["accepted"]
+            connected = await gateway.dispatch(dict(base, op="connect"), device, peer)
+            assert connected["accepted"], connected
+            base["connection_generation"] = connected["connection_generation"]
+            assert (await gateway.dispatch(dict(base, op="release_input"), device, peer))["accepted"]
+            await wait_for(lambda: owner.authority.snapshot()["evidence"]["pose_aligned"])
+            resumed = await gateway.dispatch(dict(base, op="resume", operation_id=str(uuid.uuid4()),
+                                                  expected_intent_revision=owner.authority.run["intent_revision"]), device, peer)
+            assert resumed["accepted"], resumed
+            await wait_for(lambda: owner.authority.run["status"] == "running")
+            base["intent_revision"] = owner.authority.run["intent_revision"]
+            return base
+
+        presence = None
+        try:
+            claim = await gateway.dispatch({"op": "claim"}, device)
+            async def renew_presence():
+                while True:
+                    await asyncio.sleep(0.2)
+                    await gateway.dispatch({"op": "claim", "controller_generation": claim["controller_generation"]}, device)
+            presence = asyncio.create_task(renew_presence())
+            started = await gateway.dispatch({"op": "start", "operation_id": str(uuid.uuid4()),
+                                              "recipe": "physical-live-left-elbow",
+                                              "controller_generation": claim["controller_generation"]}, device)
+            assert started["accepted"], started
+            await wait_for(lambda: owner.authority.run["status"] == "paused")
+            initial = owner.authority.snapshot()["run"]
+            base = await connect_resume()
+            grant = await gateway.dispatch(dict(base, op="grant"), device, peer)
+            frame = dict(base, op="input", grant_id=grant["grant_id"], seq=1,
+                         target={"arm_left_elbow_flex.pos": -0.5})
+            reply = await gateway.dispatch(frame, device, peer)
+            assert reply["accepted"] and reply["effect_admitted"]
+            assert set(reply) == {"accepted", "status", "effect_admitted"}
+            assert len(ipc.encode(reply)) < 256
+            await asyncio.sleep(0.06)
+            renewal = await gateway.dispatch(dict(base, op="grant"), device, peer)
+            assert renewal["accepted"]
+            assert owner.authority.run["intent"] == frame["target"]
+            assert owner.authority.run["status"] == "running"
+            await asyncio.sleep(max(0, grant["expires"] - __import__("time").monotonic()) + 0.08)
+            assert owner.authority.run["status"] == "paused"
+            assert owner.authority.run["intent"] is None
+            assert owner.authority.run["first_cause"] is None
+            fresh = await connect_resume()
+            retained = owner.authority.snapshot()["run"]
+            assert retained["run_id"] == initial["run_id"]
+            assert retained["deadline"] == initial["deadline"]
+            assert retained["live_input"]["reference_norm"] == initial["live_input"]["reference_norm"]
+            assert retained["live_input"]["cursor_intent_revision"] == fresh["intent_revision"]
+            assert not (await gateway.dispatch(frame, device, peer))["accepted"]
+            new_grant = await gateway.dispatch(dict(fresh, op="grant"), device, peer)
+            assert (await gateway.dispatch(dict(fresh, op="input", grant_id=new_grant["grant_id"], seq=1,
+                                                 target={"arm_left_elbow_flex.pos": -0.2}), device, peer))["accepted"]
+            snapshot_reply, _ = await exchange(None, {"op": "snapshot"}, authority=owner.authority)
+            assert snapshot_reply["status"] == "snapshot"
+            assert len(ipc.encode(snapshot_reply)) < ipc.RESPONSE_LIMIT
+            assert snapshot_reply["snapshot"]["run"]["mode"] == "interactive"
+            assert e.task is None and host.control.binding["run_id"] == initial["run_id"]
+            stopped = await gateway.dispatch({"op": "stop", "operation_id": str(uuid.uuid4()),
+                                              "run_id": initial["run_id"]}, device, peer)
+            assert stopped["accepted"]
+            await wait_for(lambda: owner.authority.run["status"] == "stopped")
+        finally:
+            if presence:
+                presence.cancel()
+                await asyncio.gather(presence, return_exceptions=True)
+            await owner.close()
+            if e.worker:
+                e.worker.join(2)
+
+    asyncio.run(scenario())
