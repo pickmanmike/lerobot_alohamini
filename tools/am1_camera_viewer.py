@@ -24,6 +24,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from urllib.parse import parse_qs, urlsplit
 
 
@@ -32,6 +33,15 @@ PREVIEW_ROLES = ("preview_1", "preview_2", "preview_3", "preview_4", "preview_5"
 MAX_JPEG = 1_000_000
 FRESH_SECONDS = 0.5
 BINARY_SHA256 = "359fabade8a7a51e81a55fe6df6b0ef81764a5e1d63179577534eaaa71904b50"
+_LOG_LOCK = threading.Lock()
+
+
+def log_record(message, *, file=None):
+    """Keep a complete line intact across reader, HTTP and main-thread output."""
+    # print writes the text and newline separately. The session supervisor
+    # parses these records, so flush=True alone does not protect their framing.
+    with _LOG_LOCK:
+        print(message, file=file, flush=True)
 
 
 def validate_config(config, identify=False):
@@ -94,6 +104,7 @@ class FrameStore:
         self.arrived = None
         self.sequence = 0
         self.connected = False
+        self.capture_generation = None
         self.received = 0
         self.max_gap = 0.0
         self.arrivals = deque(maxlen=151)
@@ -105,6 +116,8 @@ class FrameStore:
             raise ValueError("Invalid or oversized JPEG frame")
         now = self.clock()
         with self.condition:
+            if not self.connected:
+                self.capture_generation = str(uuid.uuid4())
             if self.arrived is not None:
                 self.max_gap = max(self.max_gap, now - self.arrived)
             self.frame, self.arrived = jpeg, now
@@ -128,6 +141,17 @@ class FrameStore:
             if not self._fresh(now):
                 return None
             return self.frame, self.sequence, (now - self.arrived) * 1000
+
+    def metadata_snapshot(self):
+        """Atomically retain original upstream completion, never getter/HTTP time."""
+        with self.condition:
+            if not self._fresh(self.clock()):
+                return None
+            return self.frame, {
+                "sequence": self.sequence,
+                "arrived_at": self.arrived,
+                "capture_generation": self.capture_generation,
+            }
 
     def status(self):
         with self.condition:
@@ -193,6 +217,11 @@ class ViewerServer(ThreadingHTTPServer):
     def __init__(self, address, stores, configured, credentials, rotations=None):
         self.stores = stores
         self.configured = frozenset(configured)
+        self.device_paths = dict(configured) if isinstance(configured, dict) else {
+            role: f"/dev/am_camera_{role}" for role in configured
+        }
+        self.owner_generation = str(uuid.uuid4())
+        self.machine = socket.gethostname()
         self.rotations = dict(rotations or {})
         self.identification = set(stores) == set(PREVIEW_ROLES)
         self.stop_event = threading.Event()
@@ -220,7 +249,7 @@ class ViewerServer(ThreadingHTTPServer):
 
     def handle_error(self, request, client_address):
         # Never echo request targets/auth into a traceback or public log.
-        print('CAMERA_HTTP_ERROR', flush=True)
+        log_record('CAMERA_HTTP_ERROR')
 
 
 class ViewerHandler(BaseHTTPRequestHandler):
@@ -320,8 +349,22 @@ class ViewerHandler(BaseHTTPRequestHandler):
             self.reply(503, b"Camera frame unavailable or stale")
             return
         if target.path == "/api/frame.jpeg":
-            jpeg, sequence, age = sample
-            self.reply(200, jpeg, "image/jpeg", {"X-Frame-Sequence": sequence, "X-Frame-Age-Ms": round(age, 3)})
+            atomic = store.metadata_snapshot()
+            if atomic is None:
+                self.reply(503, b"Camera frame unavailable or stale")
+                return
+            jpeg, metadata = atomic
+            self.reply(200, jpeg, "image/jpeg", {
+                "X-Frame-Sequence": metadata["sequence"],
+                "X-Frame-Age-Ms": round((store.clock() - metadata["arrived_at"]) * 1000, 3),
+                "X-Frame-Arrived-Monotonic-S": repr(metadata["arrived_at"]),
+                "X-Frame-Timing": "pi-upstream-arrival-monotonic",
+                "X-Camera-Machine": self.server.machine,
+                "X-Camera-Device": self.server.device_paths[role],
+                "X-Camera-Role": role,
+                "X-Camera-Owner-Generation": self.server.owner_generation,
+                "X-Camera-Capture-Generation": metadata["capture_generation"],
+            })
             return
         self.send_view_headers(200, "multipart/x-mixed-replace; boundary=frame")
         last = 0
@@ -388,7 +431,7 @@ class CameraReader(threading.Thread):
                 # Backend startup can first produce ECONNREFUSED. Preserve a
                 # later distinct role failure, while bounding repeated output.
                 if reason not in reported_failures and len(reported_failures) < 3:
-                    print(f"CAMERA_ROLE_UNAVAILABLE role={self.role} cause={reason}", flush=True)
+                    log_record(f"CAMERA_ROLE_UNAVAILABLE role={self.role} cause={reason}")
                     reported_failures.add(reason)
             self.stop.wait(0.5)
 
@@ -490,6 +533,9 @@ def preflight(config, binary):
         raise ValueError("Camera already owned (or device-owner check failed); stop the other owner first")
     with socket.socket() as probe:
         try:
+            # Prior backend connections may remain in TIME_WAIT after clean exit.
+            # This still refuses a live listener on Linux without SO_REUSEPORT.
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             probe.bind(("127.0.0.1", 1985))  # Refuse a pre-existing backend; never kill it.
         except OSError as exc:
             raise RuntimeError(f"camera backend port unavailable (errno={exc.errno})") from exc
@@ -524,10 +570,10 @@ def run_viewer(config, credentials, binary, state_dir, duration=None, identify=F
             worker = CameraReader(role, authorization, stores[role], stop)
             workers.append(worker)
             worker.start()
-        print(f"CAMERA_VIEW_URL=http://{config['bind']}:{config['port']}", flush=True)
-        print("CAMERA_VIEW_MODE=" + ("numbered-identification" if identify else "semantic-roles"), flush=True)
-        print("CAMERA_CONFIGURED_ROLES=" + ",".join(config["cameras"]), flush=True)
-        print("CAMERA_REQUEST=MJPG 640x480 30fps; delivered rate follows below", flush=True)
+        log_record(f"CAMERA_VIEW_URL=http://{config['bind']}:{config['port']}")
+        log_record("CAMERA_VIEW_MODE=" + ("numbered-identification" if identify else "semantic-roles"))
+        log_record("CAMERA_CONFIGURED_ROLES=" + ",".join(config["cameras"]))
+        log_record("CAMERA_REQUEST=MJPG 640x480 30fps; delivered rate follows below")
         started = last_report = time.monotonic()
         while duration is None or time.monotonic() - started < duration:
             if child.poll() is not None:
@@ -535,12 +581,12 @@ def run_viewer(config, credentials, binary, state_dir, duration=None, identify=F
             server.handle_request()
             now = time.monotonic()
             if now - last_report >= 1:
-                print("CAMERA_STATUS " + json.dumps({"elapsed_s": round(now - started, 3),
+                log_record("CAMERA_STATUS " + json.dumps({"elapsed_s": round(now - started, 3),
                       "cameras": {role: stores[role].status() for role in config["cameras"]}},
-                      separators=(",", ":")), flush=True)
+                      separators=(",", ":")))
                 last_report = now
     except KeyboardInterrupt:
-        print("CAMERA_STOP_REQUESTED", flush=True)
+        log_record("CAMERA_STOP_REQUESTED")
     except BaseException:
         primary_failure = True
         raise
@@ -551,7 +597,7 @@ def run_viewer(config, credentials, binary, state_dir, duration=None, identify=F
                 backend_path.unlink()
             except OSError as exc:
                 errors.append(f"private-runtime-cleanup:{type(exc).__name__}")
-        print("CAMERA_CLEANUP_ERRORS=" + json.dumps(errors), flush=True)
+        log_record("CAMERA_CLEANUP_ERRORS=" + json.dumps(errors))
         if errors and not primary_failure:
             raise RuntimeError("Camera cleanup failed; inspect the private log")
     return 0
@@ -587,11 +633,11 @@ def main(argv=None):
                 raise ValueError("Use each role once as ROLE=CAPTURE_PATH")
             config = validate_config({"version": 1, "bind": args.bind, "port": 1984, "cameras": dict(pairs)}, args.identify)
             write_private(args.config, config)
-            print(f"CAMERA_CONFIG_CREATED={args.config}")
+            log_record(f"CAMERA_CONFIG_CREATED={args.config}")
             return 0
         config = validate_config(load_private(args.config), args.identify)
         if args.check:
-            print("CAMERA_CONFIG_OK roles=" + ",".join(config["cameras"]) + "; no device access")
+            log_record("CAMERA_CONFIG_OK roles=" + ",".join(config["cameras"]) + "; no device access")
             return 0
         if args.init_auth:
             if not sys.stdin.isatty():
@@ -601,7 +647,7 @@ def main(argv=None):
             if password != getpass.getpass("Confirm password (hidden): "):
                 raise ValueError("Passwords did not match")
             write_private(args.credentials, validate_credentials({"username": username, "password": password}))
-            print("CAMERA_PRIVATE_AUTH_CREATED; password was not logged")
+            log_record("CAMERA_PRIVATE_AUTH_CREATED; password was not logged")
             return 0
         stage = "private-camera-credentials"
         credentials = validate_credentials(load_private(args.credentials))
@@ -629,7 +675,7 @@ def main(argv=None):
             detail = f"stage={stage} errno={exc.errno}"
         else:
             detail = f"stage={stage}"
-        print(f"CAMERA_REFUSAL {type(exc).__name__}: {detail}", file=sys.stderr)
+        log_record(f"CAMERA_REFUSAL {type(exc).__name__}: {detail}", file=sys.stderr)
         return 2
 
 

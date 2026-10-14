@@ -14,7 +14,7 @@ JOINT_KEYS = tuple(
 
 
 class FiniteTask:
-    def __init__(self, recipe, positions, now, shoulder_amplitude):
+    def __init__(self, recipe, positions, now, shoulder_amplitude, *, start_held=False):
         profile = {
             "sim-arm-smoke": ("ArmSmoke", ScriptedLeaderInput),
             "sim-arm-smoke-repeat": ("ArmSmokeRepeat", ArmSmokeRepeatInput),
@@ -40,10 +40,13 @@ class FiniteTask:
                 motion_profile=self.profile,
                 emit=self.record,
             )
-        self.provider.admit(now)
+        # Real observation can take time to qualify. Keep this admission/reference and its
+        # original 20-second wall ceiling, but begin boundary acquisition only when dispatched.
+        if not start_held:
+            self.provider.admit(now)
         self.last_frame = now
         self.sequence = -1
-        self.active = True
+        self.active = not start_held
         self.finished = False
         self.return_first = None
         self.return_count = 0

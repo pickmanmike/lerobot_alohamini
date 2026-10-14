@@ -1,18 +1,243 @@
 # AM1 roaming-resilient sessions
 
-**AM1-SESSION-ARCHITECTURE-01 · 2026-10-09 · owner-approved design; stage 1 and native Pi simulated slice implemented and verified.**
+**AM1-SESSION-ARCHITECTURE-01 · owner-approved design. The current AM1-MOBILE-LOCAL-01 slice selects real robot-local camera input with simulated motor IO and advisory P1 evidence. The separate strict P1 diagnostic remains failed.**
 Choose a Pi-owned session authority and finite executor, an authenticated LAN
-HTTPS/WebSocket gateway, and independently supervised P1 observation. Reuse the
-existing UI and protected motor backend. SSH remains administrative access.
+HTTPS/WebSocket gateway, an independently supervised required-input worker and
+optional P1 engineering recording/viewing. Reuse the
+existing UI and protected motor backend. SSH remains administrative access. AM1
+remains wireless; a temporary engineering observer is not a permanent runtime
+dependency. Actual motor-backend integration remains a later protected slice.
 
 The owner approved this design and the exact stage-1 fake-only implementation.
 Stage 1 is implemented on `codex/am1-persistent-session-fake`. Whole-branch
 review completed and identified one cross-client Pause ordering defect; its
 correction and covering evidence are recorded below. The stacked follow-up is
-a fake-only draft checkpoint. AM1-SESSION-PI-01 now authorizes the isolated non-actuating stage-2 slice described below; stages 3/4 and physical activation remain outside this packet.
+a fake-only draft checkpoint. The completed AM1-SESSION-PI-01 isolated simulation slice and the current AM1-OBSERVATION-01 real-image/simulated-motor continuation are recorded separately below. Physical activation remains outside this packet.
 The owner replaced the proposed connection-continuity handoff and canceled the
 Wi-Fi Roaming Aggressiveness experiment and its administrator question. Do not
-resume that transaction. Normal motor/helper/camera deployments, private configuration, adapter and firewall remain unchanged. Stage 1 uses loopback development listeners; the isolated stage-2 trial listener and current-user trust consent are described below.
+resume that transaction. Normal motor/helper/onboard-camera deployments and the canceled adapter transaction remain unchanged. Stage 1 uses loopback development listeners; later isolated trial listeners, trust and component-specific permissions are recorded with their own evidence below.
+
+## Implemented mobile slice: local camera required, P1 advisory
+
+AM1-MOBILE-LOCAL-01 replaces the proposed Ethernet prerequisite. Wireless
+operation is a product requirement. No adapter, roaming, router or network
+tuning accompanies this slice. The architecture and dependent PR stack remain
+[PR #19](https://github.com/pickmanmike/lerobot_alohamini/pull/19) →
+[PR #18](https://github.com/pickmanmike/lerobot_alohamini/pull/18) →
+[PR #17](https://github.com/pickmanmike/lerobot_alohamini/pull/17) →
+[PR #16](https://github.com/pickmanmike/lerobot_alohamini/pull/16), unmerged.
+
+Select the sensing policy in the isolated owner configuration before Start:
+
+| Policy | Required task input | Motor feedback, commands and cleanup | P1 role |
+| --- | --- | --- | --- |
+| `simulated` | Explicit simulated sensing | Simulated | Optional engineering evidence |
+| `p1-required` | Actual P1 images validated on Pi under the original nonce, identity, decode and 500 ms rules | Simulated | Required diagnostic source |
+| `local-camera-required` | Actual selected onboard-role JPEG decoded on Pi; original upstream-arrival age at most 500 ms through consumption | Simulated | Advisory recording/view only |
+
+The CLI validates `--sensing-policy` and `--observation-source` together. A legacy
+source-only invocation retains strict P1 behavior. There is no browser policy
+switch or active fallback. Each durable run/result carries `sensing_policy`,
+`sensing_source`, `observation_provenance` and `observation_freshness_basis`.
+Local mode reports `real-local-camera/pi-decoded-arrival` and
+`pi-upstream-arrival-monotonic`. All modes still construct only `SimulatedIO`;
+there is **no live motor backend factory**.
+
+The adapter reuses the existing exclusive camera-only launcher, private config,
+authentication, go2rtc 1.9.14 and role mapping. It consumes **chest** through the
+authenticated existing JPEG route; it opens no UVC device. The camera owner can
+preload its existing five roles. Atomic metadata attaches original arrival,
+source sequence, configured role/device, camera-owner UUID and upstream capture
+generation to the current image. Existing snapshot callers remain compatible.
+The accepted separate-camera log lock and SO_REUSEADDR repairs are retained.
+
+The separate `tools.am1_local_observation` worker checks the exact configured
+machine and a same-Pi local route before polling. It actually loads bounded
+640×480 JPEG bytes, retires old generations, and delivers only current bound
+proof through existing private IPC. A duplicate getter retains the original
+age without advancing qualification. Equal pixels at a new genuine arrival
+are valid. Stale, replayed, malformed, undecodable or restarted old-source data
+cannot be replaced by optional P1 or synthetic evidence. The owner has no decode
+or camera-network wait; its Unix-only service has `PrivateDevices=yes`.
+
+Placeholder local-source and worker schemas (operational values remain private):
+
+```json
+{"machine":"<exact Pi hostname>","source":"<local source label>","device":"<existing configured index0 camera identity>","framing_revision":"<unchanged config revision>","role":"chest"}
+```
+
+```json
+{"owner_state":"<existing private owner state>","state":"<new private local worker state>","url":"http://<verified same-Pi address>:1984/api/frame.jpeg?src=chest","credentials":"<existing private viewer credentials>","source":{"machine":"<exact Pi hostname>","source":"<local source label>","device":"<existing configured index0 camera identity>","framing_revision":"<unchanged config revision>","role":"chest"}}
+```
+
+Run the existing owner CLI with `--sensing-policy local-camera-required
+--observation-source <private source JSON>` and the separate worker with
+`python -m tools.am1_local_observation --config <private worker JSON>`, through
+independent isolated supervision and the existing scoped environment. The local
+worker needs AF_NETLINK only for a read-only route query; no network-admin
+capability is added. The owner stays AF_UNIX, and the gateway remains separately
+supervised. No launch-SSH lease or required forwarding tunnel is involved.
+
+**Timing and coverage limits:** age is time since completed upstream JPEG arrival
+on Pi, not sensor exposure. Unmeasured UVC/go2rtc upstream buffering remains a
+limitation; this is not equivalent to nonce-bound P1 cross-host source age.
+The inspected chest view has its existing 180° display rotation and shows nearby
+floor/furniture with only part of the robot. It is not external full-arm or
+hidden-wheel coverage and cannot establish powered scene safety.
+
+### Mobile target evidence and affected verification
+
+Affected Windows checks at the owner/worker source passed **107 Python tests**;
+the separate camera source passed **40**. Native Pi checks at those exact sources
+passed **146**, with one Windows-only skip. The focused source/interface review
+found one stale loaded-P1 UI label assertion and five corrupted camera range
+strings. The six-line correction at `77c0dda0` passed **40 camera checks** on
+Windows and again on Pi, plus **three affected loaded UI checks**. Scoped static
+reread resolved both findings. New adapter files passed Ruff check/format; the
+legacy camera files retained exactly their preexisting 21 full-lint findings and
+format layout, with no new debt. No unchanged historical suite was repeated.
+
+The single native target admission `cb5cb556-023e-4417-b8bf-8a0f0115802b`
+**completed four cycles, four qualified returns and 352 trajectory seconds in
+362.2166/420 Live seconds**, with 2.5 seconds of provider preparation. The mapped
+ArmSmokeRepeat recipe retained seed 17, its original simulated measured reference,
+one provider admission, service incarnation, sensing source and original deadline.
+The independent watcher saved 1,743 snapshots and verified the durable completed
+operation result. Cleanup was `simulated_hold_acknowledged`, with no uncertainty;
+this is not physical cleanup evidence.
+
+P1 was not requested/unqualified/advisory at Start and throughout. All browser
+contexts and the browser process closed at eight seconds for 15 seconds; the new
+trusted browser reattached at 23.8 seconds to the same run, with zero recovery
+episodes. Launch SSH had already exited. Active direct browser traffic reached
+the Pi gateway over `wlan0`; `eth0` was down. The required camera endpoint resolved
+as route type `local`, device `lo` on the Pi, never through the browser, P1 or a
+router. Exact addresses and socket evidence remain private.
+
+At 30 seconds the independent finite watcher paused only local worker delivery
+for 2.068 seconds. Original arrival expired at owner consumption, triggering
+`required_hold`. Program progress remained 30.4 seconds for at least 1.864 seconds.
+Actual current frames requalified and executor acknowledgment closed the episode
+after 1.976 seconds, within its original ten-second ceiling. The same admission,
+reference and deadline then completed. Exactly one episode was consumed and
+`required_proof_loss` remained the first cause. No simulated/cached fallback,
+camera theft, Wi-Fi change or powered process fault was used. Initial and
+post-recovery real chest images were decoded/inspected privately; the selected
+post-recovery image was copied with independently matched original metadata/hash.
+They become historical evidence after selection, not ongoing supervision.
+
+Two private pre-admission fixture failures are retained separately: a pairing
+command omitted candidate PYTHONPATH and was corrected; the first browser Start
+was refused without an admission and its reason was not saved. The harness now
+saves the raw claim/Start result before assertions. A fresh ordinary enrollment
+and claim admitted the one target above. No second complete simulation or product
+repair is claimed from those fixture outcomes.
+
+### Optional engineering evidence and preserved failures
+
+The strict P1 experiment below remains **failed**: its corrected run reached no
+trajectory progress and exhausted three recovery episodes; the direct diagnostic
+measured gaps up to 2.273 seconds. Current local-mode success does not repair that
+benchmark or weaken its freshness rules. Optional absence cannot gate Start,
+owner tick, recovery budget, seed, admission or original deadline.
+
+The demonstrated private startup mismatch was corrected with a prompt accepted
+operation and bounded idempotent status polling under one 55-second ceiling.
+It preserves the original 25-second acknowledgment limit, 90-second/32 MiB
+audio-off capture budget, source generation, recording and task deadlines.
+Delayed replies cannot issue a second capture or affect a newer run. Selected
+path samples are retained before assertions/cleanup. Advancing video, selected
+path, same-source reconnect and optional media replacement are separate verdicts.
+The earlier 25-second expired hook and 33.43-second late readiness stay failed.
+
+The one actual supported advisory attempt `09ebc09c-d237-4867-9f3d-a78dea4f6409`
+passed media-only in 36.05 seconds after the local task was terminal. It requested
+one source Start, received same-operation readiness at 12.47 seconds and retained
+the original 90-second/32 MiB/audio-off upper budget. Initial decoded frames
+advanced 2→14 and received bytes 74,737→161,466; after closing/reopening the view on
+the same source, frames advanced 1→11 and bytes 76,031→158,246. Both samples decoded
+baseline H264 (`42e01f`) at 640×360 and joined the actual video transport to its
+selected nonrelay UDP pair: local peer-reflexive candidate, remote host at the
+configured P1 LAN endpoint. Local candidate address was privacy-redacted; this
+does not establish every intermediate hop or a frame-age/latency guarantee.
+Optional media restart was explicitly **not attempted**.
+
+Both exact owned WHEP resources were reconciled: one DELETE 204, and one DELETE 404
+with actual database row absence and the pinned proxy's terminal-row-removal
+contract checked. This is specific owned-resource evidence, not a general rule
+that 404 means cleanup. The single source's recording hold lasted 15.955 seconds
+before normal requested Stop. The original MP4 was 15.9926 seconds/2,901,529 bytes,
+with 160 1280×720 H264 video frames and zero audio streams. Original metadata,
+independent SHA-256 and process readback confirmed actual camera release. Selected
+original frames around initial playback and reconnect were inspected: both arms
+and the lift are visible from a low, backlit angle; base/wheel coverage is limited.
+The original recording's H264 Main profile is distinct from the browser stream's
+baseline profile. Clip and selected images remain private historical evidence,
+separate from live task coverage. The strict
+worker stayed inactive and the local worker PID, task result/reference and
+owner/gateway stayed unchanged. The passing advisory view does not close strict
+P1 delivery or media replacement acceptance.
+
+One earlier browser fixture `1f08e254` timed out before source Start/capture/WHEP:
+its hidden-watcher launcher selected an array of executable paths. The private
+launcher was corrected to one exact executable; that negative pre-capture result
+is retained, distinct from the one actual finite capture above. Private affected
+status/lifecycle checks passed four Node and ten Python checks; the final eleven
+PowerShell helpers parsed. No product media framework or permission change was
+needed.
+
+### Component pins, stopped-owner rollback and next physical adapter
+
+| Component | Exact executable pin | Scope |
+| --- | --- | --- |
+| Isolated Pi owner, gateway and local worker | `c500204946a56862bb36ada3518ba5f248c02fa7` | Local-camera-required, simulated motor IO |
+| Isolated camera-only checkout | `77c0dda01dd8bda3eddff4237fcf77e92c21af12` | Metadata seam and text correction; original config/auth/backend |
+| Preserved strict Pi diagnostic / optional fixture imports | `7a266890703aae36f69a8d98e548d4c2e13710e5` | Separate unchanged strict source |
+| Independent P1 capture source | `2d9e365f1e302694633e7b1c916a38fb15cc50cc` | Original finite recording; repaired private native launchers |
+
+The accepted native Pi checkout remains separately pinned at
+`c4256e9c5eae7c3f81c18bd8321615394f742b7f`. Normal motor
+`f03de9c3b8c4f1d9e69b6951584119113ca4c5da`, helper
+`8e6a0cf616cb2000df1d0e996ab27a19d2fb2fba`, camera
+`9b1f0670e7068f7d39eb50270a118e3807418355` and Windows served
+`e55d390bf6e957b9adc52ccf62b69476db12a20d` installations remain unchanged.
+No component-wide deployment or physical activation follows from a PR head.
+
+The private rollback first verifies a terminal local run, stops only introduced
+local worker and isolated owner/gateway, then restores the saved strict trial
+configuration/pins. Stop the introduced camera owner only after checking its
+owned working directory and that this packet started it. Preserve shared
+CA/enrollments, private history, normal camera config, calibration and mappings.
+The strict P1 worker stays inactive under local mode, including after optional
+media cleanup; never restore it against an incompatible local mailbox or downgrade
+an active run. The introduced camera was bounded at 660 seconds, independent of
+SSH, and expired only after the target was terminal. Systemd retained
+`Result=timeout`/exit signal 15. A second SIGTERM interrupted the existing viewer's
+application cleanup/logging while it waited for its child; no clean application
+exit is claimed. Independent checks confirmed no viewer/backend process,
+no listeners and all five devices unowned. The single introduced temporary
+backend file was preserved privately then removed under exact stopped-owner,
+config/hash and file-ownership guards. The original private config/auth and
+normal camera pin were unchanged. This stop-acknowledgment limitation remains
+distinct from the completed local-input task and must be qualified for later
+powered use; this slice did not broaden camera lifecycle changes or repeat capture.
+
+The next slice is a **protected physical backend adapter**, using these existing
+interfaces before any powered acceptance:
+
+| Boundary | Exact existing interface and required integration |
+| --- | --- |
+| Physical admission | `acquire_session_admission` and `RemoteSupervisor.preflight` use the canonical physical `active.lock` before bus/host startup. The simulated namespace is separate. Close the competing direct-host-launch admission gap. |
+| Protected host transport | Existing `run_am1_host.sh --mode local` / `AlohaMiniHost`; make and verify protected local-only binding first. Current command/observation sockets bind wildcard addresses. The legacy SSH lease supervisor needs a robot-owned lifetime. |
+| Startup and feedback | Preserve `AlohaMini.connect/activate_motors`, activation range/calibration/raw-coordinate/freshness/seed gates, bounded startup sync and post-home quiet qualification. Reuse actual `get_observation/send_action`, advancing host feedback, current and `OperationalLift` thermal/status protections. |
+| Authority and recovery | Map exact run/host incarnation and intent revision to `AM1LocalControl.apply/annotate/watchdog_stop` and executor `begin/dispatch/advance/hold/finish`. Hold uses measured arm pose/body stop. A sender's `sync_write_returned` is not servo acknowledgment. Qualified executor acknowledgment closes each bounded episode; later loss may use another, at most three total with no deadline reset. |
+| Physical cleanup | `AlohaMini.disconnect` → `_safe_shutdown` and `OperationalLift.cleanup_readback` must supply real zero/off/readback and ownership-release results. Keep first cause, cleanup uncertainty, restart uncertainty and no autoplay; never inherit a simulated hold acknowledgment as physical proof. |
+
+Still unfinished: full physical four-cycle 352/420 workload, useful return of every
+joint, comparable automatic restart from resulting normal rest, conditional owned
+12-second body pulses, and physical browser/SSH independence. The historical
+326.754/352 powered run remains partial. No such adapter was built or energized
+in this slice.
 
 ## Verified baseline and remaining acceptance
 
@@ -246,6 +471,8 @@ Validate size/rate before allocation. Original logs/downloads are lower priority
 and cannot block motion or fabricate cleanup_unknown on normal browser closure.
 
 ## P1 media, observation and LAN access
+
+This section retains the approved design choices. Implemented interfaces, exact source pins and current acceptance status are in the [stage-3 continuation](#implemented-stage-3-slice-real-p1-observation-simulated-motor-io) below.
 
 **Choose MediaMTX on P1 with one FFmpeg live encoder fed copied WinRT frames.**
 The current owner already records 1280×720 H264/10 fps locally while its same
@@ -774,4 +1001,118 @@ The exact private URL, ordinary enrollment/start helper, service commands, trust
 
 Rollback stops only am1-pi01-gateway.service and am1-pi01-owner.service, closing the trial listener, and removes only the introduced current-user CA by exact recorded thumbprint. Retain private evidence, generated state, branch and isolated checkout for diagnosis; no normal runtime pin, permission, credential or worktree is removed. The trial certificate is deliberately short-lived; later continued access requires renewed explicit trust/identity preparation.
 
-The next bounded packet is independent P1 required observation and the selected media path. The physical four-cycle workload, useful joint return, automatic restart from natural rest and 12-second ArmHoldBody remain unfinished. Two contexts and direct cross-host traffic establish software continuity only; actual second-device/AP roaming, P1 media and powered SSH independence remain untested.
+At stage-2 closeout the next packet was independent P1 required observation and the selected media path. The later mobile continuation above explicitly selects local task sensing and advisory P1 instead. The physical four-cycle workload, useful joint return, automatic restart from natural rest and 12-second ArmHoldBody remain unfinished. Two contexts and direct cross-host traffic establish software continuity only; actual second-device/AP roaming, P1 media and powered SSH independence remain untested by stage 2.
+
+## Implemented stage 3 slice: real P1 observation, simulated motor IO
+
+AM1-OBSERVATION-01 adds the approved independent observation and optional media slice on `codex/am1-independent-observation`, stacked on PR #18 at `d71b0de3b45d2d1f1d6e2c30956ef98640d597e3`. The isolated Pi executable is `7a266890703aae36f69a8d98e548d4c2e13710e5`; the independently staged P1 source remains `2d9e365f1e302694633e7b1c916a38fb15cc50cc`. The latter includes the agent and encoder; the original WinRT capture script is unchanged. These component pins are separate from normal motor/helper/onboard-camera deployments. This continuation does not merge or retarget the pending PR stack.
+
+**Combined target acceptance: not achieved; required-image delivery remains an unresolved blocker after bounded diagnosis.** The corrected second target run also failed before trajectory. The full 352/420 workload, selected direct-LAN video path, reconnect lifecycle, detach/return and optional gateway/media replacement have not been demonstrated for this real-observation slice. One earlier media attempt passed connected/advancing baseline-H264 predicates before a private ICE guard failed; its selected-path samples were not retained. Implementation and offline checks below are not substitutes for those results. Earlier PR #17/#18 results remain historical at their recorded sources.
+
+All feedback, motor commands and task cleanup still come from `SimulatedIO`. The owner has no live backend factory or device access. In the explicit observation mode, the required observation comes from configured P1 images decoded on Pi. The optional browser video has its own availability and lifecycle; playing video does not qualify required observation, and closing or losing the view does not revoke otherwise fresh Pi-validated images. No physical return, powered cleanup, phone/AP roaming, locked-screen, logout, sleep or reboot claim follows from this slice.
+
+### Runtime and finite source boundaries
+
+[ObservationMailbox](../../tools/am1_observation.py) is one bounded in-memory slot inside the owner. The separately supervised [observation worker](../../tools/am1_observation_worker.py) owns authenticated direct WSS, image decode and private evidence writes. Private authenticated owner IPC supplies the actual owner run, immutable capture generation, exact configured machine/source/device/framing binding and fixed finite budget. Public control requests cannot supply capture paths, scripts, device selectors or arbitrary parameters. The Unix-only owner keeps network transport, decoding and media outside its finite tick.
+
+The worker reuses [ObserverReceiver](../../tools/am1_observer.py): original challenge nonce, advancing capture sequence, actual JPEG decode, original round trip and P1 QPC elapsed checks. It never compares absolute P1 QPC and Pi clock origins. Original nonce lifetime remains at most 750 ms; effective source age remains at most 500 ms through processing and owner consumption. Missing, stale, replayed, foreign-generation or undecoded evidence fails closed. Identical legitimate scene pixels are allowed. Current qualification needs three advancing frames spanning at least 0.2 seconds; the retained twenty-second continuity metric remains historical reporting rather than a recovery gate.
+
+At Start, [PiExecutor](../../tools/am1_pi_executor.py) admits one finite task and retains its starting reference. It holds while the source qualifies inside the original twenty-second preparation wall ceiling. Provider acquisition begins only at the first qualified dispatch; the original Live deadline and task admission do not move. Required-image loss freezes the same provider and uses the existing acknowledged hold/recovery policy: at most three episodes, each at most ten seconds and inside the unchanged Live budget. A completed qualified recovery closes its episode; an unfinished episode cannot renew its ceiling. Pause, Stop and authority intent revisions retain precedence. Default pure simulation remains separately labelled `simulated-no-camera`; selected real observation is `real-p1/pi-decoded`.
+
+The [P1 agent](../../tools/am1_p1_observer_agent.py) runs independently in the existing camera-capable Windows user context. It owns one private source lock and allows only known Start/attach, status, challenge and graceful Stop operations. Capture remains an explicitly requested finite operation, with an immutable run/generation, at most 660 seconds and at most 140 MiB. Deduplicated requests cannot reopen a completed capture or extend its original budget. There is no boot-triggered or endless recording. The established single exclusive WinRT owner retains audio-off recording and feeds copied JPEG bytes to proof and, independently, the optional encoder. Source terminal success, recording hash/size and actual camera release are reported separately from simulated task cleanup. An unresolved release stays unresolved after service restart.
+
+Private evidence retains bounded current frames, original source/receipt/decode/consumption timing, rejected or expired delivery, the original recording and terminal metadata. The private application-boundary delivery-loss fixture is not exposed by a browser or public API. Failed attempts and their first cause remain retained.
+
+### Optional view and authenticated media lifecycle
+
+One optional encoder receives the existing capture's copied JPEGs; it never opens another camera or reads a growing MP4. Its single pending-frame slot and bounded pipe writes isolate capture/proof from slow media. Selected output is H264 baseline, yuv420p, no B-frames, at most 640×360/10 fps and about 600 kbit/s, published through authenticated loopback RTSP/TCP. Encoder replacement can reconnect to media without recreating a valid source or Pi task.
+
+The [MediaMTX v1.21.1 configuration template](../../tools/am1_p1_mediamtx.example.yml) uses one named path with separate publish/read credentials and at most two readers. It requires an explicit private LAN WebRTC candidate and UDP port, disables unused HLS/RTMP/SRT/MoQ/API/metrics/profiling/playback listeners and configures no public ICE relay or always-available recording fallback. Substitute private deployment values; do not launch stock anonymous defaults. Exact FFmpeg binary/version and codec compatibility belong in the private deployed-component record and actual media result.
+
+The [same-origin WHEP proxy](../../tools/am1_media_proxy.py) serves `POST /api/media`, `PATCH` and `DELETE /api/media/{opaque-handle}`, plus authenticated `POST /api/media/{opaque-handle}/keepalive`. Every mutation preserves HTTPS, exact Host/Origin, enrolled-device and CSRF checks. The exact allowed upstream resource is persisted privately and bound to the enrolled device; replacement gateways can use that resource without reconstructing a URL or restarting capture. It preserves SDP, ETag/If-Match and bounded necessary Link headers, refuses redirects and exposes no arbitrary URL proxy. SDP is bounded to 64 KiB; ordinary control messages remain bounded to 4 KiB. Two media sessions are allowed, with sixty-second browser leases and a 660-second absolute resource lifetime. Expiry/revocation triggers bounded upstream cleanup; unavailable cleanup retains its exact resource for retry.
+
+The [native reader](../../tools/am1_console_ui/p1_view.js) adds CSRF to POST, trickle PATCH, DELETE and lease refresh. The existing page offers explicit Connect P1 view and Close view controls, labels the view optional, and displays current required-proof availability independently. P1-to-browser media uses the explicit LAN ICE path. Trusted HTTPS signaling alone does not demonstrate that this path or the decoded browser video works.
+
+### Private configuration and ordinary entry points
+
+Use dedicated private configuration/state directories, the existing accepted trial identity and narrowly scoped runtime dependencies. The placeholders below are schema documentation, not operational addresses, credentials or new source selections. Keep the already configured camera identity and reviewed framing revision consistent across owner and P1 source. Preserve the existing private mapped amplitude environment; no numeric mapping is supplied here.
+
+Owner source file:
+
+```json
+{"machine":"<configured P1 machine>","source":"<configured source label>","device":"<exact configured camera ID>","framing_revision":"<reviewed framing revision>"}
+```
+
+Worker file:
+
+```json
+{"owner_state":"<existing private owner state>","state":"<dedicated private worker state>","url":"wss://<trusted P1 identity>:<observer port>/observer","ca":"<existing trust bundle>","token":"<private machine token>"}
+```
+
+P1 agent file, with `media` omitted when no optional encoder is selected:
+
+```json
+{
+  "source":{"machine":"<configured P1 machine>","source":"<configured source label>","device":"<exact configured camera ID>","framing_revision":"<reviewed framing revision>"},
+  "state":"<dedicated private source state>",
+  "token":"<64 lowercase hexadecimal machine-token characters>",
+  "host":"<explicit private P1 address>","port":12345,
+  "origin":"https://<trusted P1 identity>:12345",
+  "cert":"<P1 TLS certificate file>","key":"<private P1 TLS key file>",
+  "capture_port":12346,
+  "media":{"ffmpeg":"<pinned FFmpeg executable>","rtsp_url":"rtsp://<publisher>:<secret>@127.0.0.1:12347/p1-observer"}
+}
+```
+
+The example port numbers are placeholders. The private loopback capture port, local RTSP port, observer TLS port and media TLS/UDP ports must be distinct, available and recorded for the isolated deployment. Start the agent in the working user session; do not substitute LocalSystem/session 0 or change camera privacy settings.
+
+Gateway media file:
+
+```json
+{"url":"https://<trusted P1 identity>:<media TLS port>/p1-observer/whep","ca":"<existing trust bundle>","username":"<path-scoped reader>","password":"<private reader secret>"}
+```
+
+Run from the exact recorded candidate checkout/environment through the existing independent supervisors, without boot autostart or task autoplay:
+
+```text
+python -m tools.am1_pi_executor --state <owner-state> --simulated-admission-state <existing-simulated-admission> --observation-source <owner-source.json>
+python -m tools.am1_observation_worker --config <worker.json>
+python -m tools.am1_p1_observer_agent --config <p1-agent.json>
+python -m tools.am1_session_service gateway --owner-state <owner-state> --auth-state <existing-auth-state> --cert <existing-Pi-leaf> --key <private-Pi-key> --ready-file <private-ready-file> --host <explicit-private-Pi-address> --port <Pi-TLS-port> --origin https://<trusted-Pi-identity>:<Pi-TLS-port> --media-config <gateway-media.json>
+```
+
+Retain the original gateway enrollment and trust. Enroll only through the existing local one-use pairing procedure, explicitly claim control, and choose the fixed `sim-arm-smoke-repeat` recipe for the authorized workload. Viewing and reconnecting do not claim input. Stop ends the task through simulated cleanup and separately requests normal source release; verify both outcomes. An idle available service does not itself record. Exact service commands, expiry/renewal details, listener permissions and the usable private URL belong in the private access record.
+
+### Verification and supported startup correction
+
+Author affected Windows checks at `2d9e365f`: 116 Python passes, then nine affected new checks after the final bounded source-ledger summary correction; one reader lifecycle and two loaded UI checks passed. Coverage includes actual JPEG bytes, trusted local TLS WSS/owner IPC, expiry and same-run recovery, a scripted P1 subprocess boundary with actual loopback bridge, source deduplication/release, optional encoder queue bounds, trusted WHEP upstream resources and every media mutation's auth/Origin/CSRF guards. Local browser fixtures are offline coverage, not target certificate-trust or actual camera/media acceptance. Native Pi affected checks passed 114 tests with two platform skips in 31.63 seconds at the initial executable. After the startup correction, the affected native subset passed 39 tests with one platform skip in 5.70 seconds. These are executable test results; no suite was rerun for the documentation update.
+
+The first target admission remains **failed**, with zero trajectory progress and no original trajectory seed. Source recording ended normally and reported camera release independently. A brief genuine qualified image delivery exposed the demonstrated startup defect: constructing the finite task had started the provider's eight-second boundary acquisition clock while the task was held waiting for observation. The first boundary advance therefore arrived after that timer had already elapsed. Correction `7a266890` starts provider acquisition only at qualified dispatch, retaining the same task, initial reference, admission and original twenty-second preparation/Live deadlines. Two regressions first reproduced the original failure; forty affected observation/provider tests then passed. A nine-second source wait can now prepare and advance; an eighteen-second wait still expires at the original twenty-second wall ceiling. No source-age, nonce or qualification policy was relaxed, and no transport repair is inferred from that timer diagnosis.
+
+The corrected second target run at `7a266890` also remains **failed**: zero trajectory progress, 4.2 seconds of provider preparation, and retained first cause `required_proof_loss`. A fourth required-proof loss exceeded the unchanged maximum of three recovery episodes. Pi accepted 77 frames and rejected seven; accepted-frame count does not establish uninterrupted fresh delivery. The earlier boundary-timer failure and its supported correction remain separate. No additional product transport change or relaxation of observation/recovery thresholds is supported by this result.
+
+One bounded twenty-second diagnostic used direct WSS without owner IPC and still observed long delivery gaps. The largest Pi receive gap was 2.273 seconds. Joined source/receipt sequence pairs showed about 2.179 seconds, 0.697 seconds and 0.494 seconds of additional downstream delay. During that fixture, measured P1 WSS writes were at most 16 ms, P1 event-loop lag at most 22 ms, Pi event-loop lag at most 2.1 ms, and Pi decode time about 3 ms. The measurements exclude owner-IPC coupling as the cause of that fixture's gaps; they do not identify the downstream transport/OS cause or establish that software repaired it. The bounded diagnosis identified no supported software repair or Wi-Fi, adapter or router remedy.
+
+One bounded twenty-five-second idle OS packet trace was inconclusive for the historical delivery gap: the exact selected flow reconnected after preflight, leaving only four captured packets. The trace was stopped, its sole filter removed and inactive state verified; no second trace was taken. Idle TCP retransmission and duplicate-segment/D-SACK observations are limited evidence and do not distinguish packet loss from delay or establish a Wi-Fi/radio cause. The environment/transport limitation remains unresolved.
+
+The diagnostic reported failed release confirmation because its WSS terminal status did not arrive. Independent reads of original P1 capture metadata and recording hashes verified the corrected failed-run recording and diagnostic clip; source evidence confirmed actual camera release for both. The diagnostic metadata and ledger reported normal recording for 18.0696 seconds. Keep those two outcomes distinct: the client lacked a terminal acknowledgment, while the source evidence establishes release. Neither outcome completes the full required-image workload or browser-media acceptance.
+
+Stopping the idle P1 scheduled task left its Python child alive. After source evidence confirmed release, separate guarded private cleanup targeted only the recorded idle child, checking its user identity, configuration, session and listener. It did not stop unrelated applications or a live capture. The original launcher was restored; this administrative cleanup does not change the product source pin or fix delivery.
+
+A distinct bounded media-only attempt reached connected playback and passed advancing decoded-frame, received-byte, video-time and baseline-H264 predicates before an overly strict private ICE assertion failed. That harness incorrectly required two host candidates across nominated pairs instead of joining the actual video transport to its selected pair. Samples were saved only after assertions, so no numeric playback or selected-LAN result is claimed from that attempt. The corrected private harness records evidence before assertions and requires the actual selected UDP path to the configured LAN endpoint, with host or peer-reflexive nonrelay candidates. Missing protocol remains unknown. Exact owned WHEP resources are reclaimed only after actual database absence is verified; this implies upstream terminal cleanup under the pinned proxy's only row-removal paths. A DELETE 404 alone is not general permission to ignore failures.
+
+The single corrected media-only verification also remains **failed**. Its private twenty-five-second source-start hook expired; the ready response arrived after 33.43 seconds. It reached no browser media POST, reconnect or replacement. The machine WSS connection then failed, and two administrative SSH connections timed out. These results retain the private orchestration limit and actual transport failures separately; they do not establish a network cause or justify another unchanged capture. The independently owned source finalized under its original ninety-second budget, recording 88.397 seconds with audio off. Original metadata, a separately computed file hash and actual process/source evidence confirmed recording finalization and camera release after the client lacked its acknowledgment. The original observation worker was restored, with the same terminal owner and gateway processes. Failed fixture and cleanup-hook outcomes remain failed despite this later independent cleanup.
+
+A separate camera-free target probe reproduced the Windows PowerShell 5.1 launcher defect: fail-fast native stderr redirection aborted on benign stderr and left the file empty. The source launcher now uses native stdout/stderr handles and fresh private logs while preserving configuration guards and real child exit codes. Camera-free checks retained stderr and completion for child exits zero and 37. The idle source was restored in the same camera-capable user session without requesting capture. This repairs service invocation and evidence retention; it does not repair the measured required-image delivery gaps. The optional media launcher was repaired separately while idle, after actual source release. Its replacement process/listeners were verified with the source generation, original budget and source/Pi owners unchanged. This is idle maintenance, not browser-driven restart acceptance.
+
+**Strict diagnostic results remain unachieved:** full strict-P1 workload with real-image gaps/recoveries and its combined detach/video/restart lifecycle. Its required-image delivery remains unresolved and its failures stay failed. The mobile continuation above deliberately selects local required input and makes this temporary P1 benchmark nonblocking; it does not relabel or weaken it. The physical backend and all physical reliability milestones remain outside stage 3.
+
+### Component-specific rollback and next physical scope
+
+**This stage-3 rollback supersedes the earlier stage-2 CA-removal instruction for the current shared trial.** That earlier instruction remains as a historical record; the accepted CA, enrollment and trust now serve both trial components and must be preserved. Use only the current component-specific private rollback record.
+
+Retain the accepted stage-2 checkout and all original private owner/auth/enrollment/trust state. Stop only affected isolated owners before changing executable pins. Restoring the prior owner/gateway removes their new observation/media command-line options and restores their exact prior working directory/configuration; additive session fields and the media resource table do not require deleting history or devices. Old authority marks any unfinished run interrupted/uncertain rather than replaying it. Archive the new run evidence before any state restoration.
+
+Stop the introduced P1 source normally and confirm the original recording's terminal release before removing only its introduced supervision, optional encoder/media process, scoped listener rules or leaf/configuration files. Preserve unrelated P1 services, other cameras, accepted trial CA/auth state, existing trust and all normal physical pins/calibration. Remove a permission or trust artifact only when the private component record establishes that this packet introduced it and it is no longer shared. A media/gateway restart alone does not authorize replacing a still-valid capture or task.
+
+The real backend remains unconnected to this executor. A later reviewed packet must bind the existing protected motor host, canonical legacy/new ownership arbitration, required local-only backend binding and physical startup/cleanup acknowledgements before actual arm workloads. The physical four-cycle workload, useful joint return, ordinary natural-rest restart and owned twelve-second body check remain unfinished. Current-image validation is not a semantic guarantee about every part of the scene, and simulated movement supplies no physical reliability acceptance.

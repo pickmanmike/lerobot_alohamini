@@ -351,6 +351,27 @@ class CameraHTTPTests(unittest.TestCase):
         self.assertEqual(self.request("/api/frame.jpeg?src=forward")[0], 200)
         self.assertEqual(json.loads(self.request("/status.json")[2])["cameras"]["backward"]["state"], "unavailable")
 
+    def test_snapshot_exports_atomic_original_arrival_and_capture_identity(self):
+        status, headers, body = self.request("/api/frame.jpeg?src=forward")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, JPEG)
+        self.assertEqual(headers["X-Frame-Arrived-Monotonic-S"], "10.0")
+        self.assertEqual(headers["X-Frame-Timing"], "pi-upstream-arrival-monotonic")
+        self.assertEqual(headers["X-Camera-Role"], "forward")
+        self.assertEqual(headers["X-Camera-Device"], "/dev/am_camera_forward")
+        first = headers["X-Camera-Capture-Generation"]
+        owner = headers["X-Camera-Owner-Generation"]
+        self.now[0] = 10.4
+        again = self.request("/api/frame.jpeg?src=forward")[1]
+        self.assertEqual(again["X-Frame-Arrived-Monotonic-S"], "10.0")
+        self.assertEqual(again["X-Camera-Capture-Generation"], first)
+        self.stores["forward"].disconnected()
+        self.assertEqual(self.request("/api/frame.jpeg?src=forward")[0], 503)
+        self.stores["forward"].publish(JPEG)
+        restarted = self.request("/api/frame.jpeg?src=forward")[1]
+        self.assertNotEqual(restarted["X-Camera-Capture-Generation"], first)
+        self.assertEqual(restarted["X-Camera-Owner-Generation"], owner)
+
     def test_primary_stream_contains_native_jpeg_and_sequence_without_reencoding(self):
         connection = http.client.HTTPConnection(*self.server.server_address, timeout=2)
         connection.request("GET", "/api/stream.mjpeg?src=forward", headers={"Authorization": self.auth})
@@ -575,3 +596,21 @@ class CameraLifecycleTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+def test_atomic_camera_metadata_keeps_arrival_and_changes_capture_on_reconnect():
+    viewer = load_viewer()
+    now = [10.0]
+    store = viewer.FrameStore(clock=lambda: now[0])
+    store.publish(JPEG)
+    sample = store.metadata_snapshot()
+    assert sample[0] == JPEG and sample[1]["arrived_at"] == 10.0
+    generation = sample[1]["capture_generation"]
+    now[0] = 10.4
+    assert store.metadata_snapshot()[1]["arrived_at"] == 10.0
+    assert len(store.snapshot()) == 3
+    store.disconnected()
+    assert store.metadata_snapshot() is None
+    now[0] = 10.45
+    store.publish(JPEG)
+    assert store.metadata_snapshot()[1]["capture_generation"] != generation
+    assert store.metadata_snapshot()[1]["arrived_at"] == 10.45

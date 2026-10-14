@@ -50,12 +50,34 @@ class PiExecutor:
     restart_cleanup = "unknown_after_restart"
     recipes = frozenset({"sim-arm-smoke", "sim-arm-smoke-repeat", "sim-arm-hold-body"})
 
-    def __init__(self, io, admission_directory, clock=time.monotonic, shoulder_amplitude=1.5):
+    def __init__(
+        self,
+        io,
+        admission_directory,
+        clock=time.monotonic,
+        shoulder_amplitude=1.5,
+        observation=None,
+        sensing_policy=None,
+    ):
         if not isinstance(io, SimulatedIO):
             raise TypeError("this trial accepts only simulated IO")
         if not 0 < shoulder_amplitude <= 3:
             raise ValueError("invalid simulated shoulder amplitude")
         self.io, self.clock = io, clock
+        from tools.am1_local_observation import LocalObservationMailbox
+        from tools.am1_observation import ObservationMailbox
+
+        policy = sensing_policy or ("p1-required" if observation else "simulated")
+        if policy not in ("simulated", "p1-required", "local-camera-required"):
+            raise ValueError("unknown fixed sensing policy")
+        expected = {"p1-required": ObservationMailbox, "local-camera-required": LocalObservationMailbox}
+        if (policy == "simulated" and observation is not None) or (
+            policy != "simulated" and not isinstance(observation, expected[policy])
+        ):
+            raise ValueError("fixed sensing policy requires its exact source adapter")
+        self.sensing_policy = policy
+        self.observation = observation
+        self.observation_preparing = False
         self.admission_directory = admission_directory
         self.shoulder_amplitude = shoulder_amplitude
         self.task = None
@@ -113,33 +135,73 @@ class PiExecutor:
                 self.task.check(self.clock())
             except (ValueError, OSError, RuntimeError) as exc:
                 self.fault = self.fault or str(exc)
+        observation = self.observation.evidence() if self.observation else None
         return {
             "source": self.source,
             "feedback": feedback,
-            "required_observation": True,
-            "optional_quality": True,
+            "required_observation": observation["qualified"] if observation else True,
+            "optional_quality": self.sensing_policy != "local-camera-required",
+            "optional_observation": {
+                "required": False,
+                "state": "not-requested",
+                "qualified": False,
+            },
             "pose_aligned": aligned,
             "hold_acknowledged": self.hold_ack,
             "native_ack": self.io.acknowledge,
             "fault": self.fault or self.io.fault,
             "feedback_age_s": age,
-            "observation_age_s": 0,
-            "observation_provenance": "simulated-no-camera",
+            "observation_age_s": observation["age_s"] if observation else 0,
+            **self.sensing_metadata(),
+            "observation": observation,
+            "motor_commands_provenance": "simulated-backend",
+            "feedback_provenance": "simulated-backend",
             "ack_provenance": "simulated-backend",
             "feedback_sequence": self.sample["sequence"] if valid else None,
         }
+
+    def sensing_metadata(self):
+        return {
+            "sensing_policy": self.sensing_policy,
+            "sensing_source": dict(self.observation.source) if self.observation else None,
+            "observation_provenance": {
+                "simulated": "simulated-no-camera",
+                "p1-required": "real-p1/pi-decoded",
+                "local-camera-required": "real-local-camera/pi-decoded-arrival",
+            }[self.sensing_policy],
+            "observation_freshness_basis": {
+                "simulated": "explicit-simulated-sensing",
+                "p1-required": "nonce-bound-source-age",
+                "local-camera-required": "pi-upstream-arrival-monotonic",
+            }[self.sensing_policy],
+        }
+
+    def bind_run(self, run_id, recipe):
+        if self.observation:
+            self.observation.begin(run_id, recipe.live_s)
 
     def begin(self, recipe):
         if self.task and not self.task.finished:
             raise RuntimeError("previous finite task is still active")
         self.task = None
         self.fault = None
+        if self.observation:
+            self.admission = acquire_session_admission(self.admission_directory)
+            self.task = FiniteTask(
+                recipe, self.sample["positions"], self.clock(), self.shoulder_amplitude, start_held=True
+            )
+            self.hold()
+            self.observation_preparing = True
+            return True
         return self.dispatch(recipe)
 
     def dispatch(self, recipe):
         e = self.evidence()
         if not self.supports(recipe) or not e["feedback"] or not e["native_ack"] or e["fault"]:
             return False
+        if self.observation and not e["required_observation"]:
+            return False
+        self.observation_preparing = False
         if self.task is None:
             try:
                 self.admission = acquire_session_admission(self.admission_directory)
@@ -191,6 +253,9 @@ class PiExecutor:
         return self.hold_ack
 
     def finish(self, status):
+        if self.observation:
+            self.observation.stop()
+        self.observation_preparing = False
         acknowledged = self.hold()
         if self.task:
             self.task.finish(status)
@@ -210,6 +275,11 @@ def main():
     parser = argparse.ArgumentParser(description="Isolated simulated finite AM1 owner; no hardware backend")
     parser.add_argument("--state", required=True)
     parser.add_argument("--simulated-admission-state", required=True)
+    parser.add_argument("--sensing-policy", choices=("simulated", "p1-required", "local-camera-required"))
+    parser.add_argument(
+        "--observation-source",
+        help="Private exact required source identity JSON; legacy omission of policy selects strict P1",
+    )
     args = parser.parse_args()
     from tools.am1_session_ipc import run_owner
 
@@ -219,7 +289,27 @@ def main():
     amplitude = float(raw)
     if not math.isfinite(amplitude) or not 0 < amplitude <= 3:
         parser.error("private mapped shoulder amplitude must be finite and greater than zero through 3")
-    executor = PiExecutor(SimulatedIO(), args.simulated_admission_state, shoulder_amplitude=amplitude)
+    observation = None
+    if args.observation_source:
+        from pathlib import Path
+
+        from tools.am1_observation import ObservationMailbox
+        from tools.am1_session_ipc import strict_json
+
+        source = strict_json(Path(args.observation_source).read_bytes())
+        if args.sensing_policy == "local-camera-required":
+            from tools.am1_local_observation import LocalObservationMailbox
+
+            observation = LocalObservationMailbox(source)
+        else:
+            observation = ObservationMailbox(source)
+    executor = PiExecutor(
+        SimulatedIO(),
+        args.simulated_admission_state,
+        shoulder_amplitude=amplitude,
+        observation=observation,
+        sensing_policy=args.sensing_policy,
+    )
     asyncio.run(run_owner(args.state, executor))
 
 

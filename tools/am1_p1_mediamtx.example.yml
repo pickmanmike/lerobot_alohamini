@@ -1,0 +1,51 @@
+# MediaMTX v1.21.1 only; private deployment template, replace every placeholder.
+# Schema: https://github.com/bluenviron/mediamtx/blob/v1.21.1/mediamtx.yml
+logLevel: warn
+logDestinations: [stdout]
+writeQueueSize: 64
+readTimeout: 5s
+writeTimeout: 2s
+authMethod: internal
+authInternalUsers:
+  - user: PUBLISH_USER
+    pass: PUBLISH_SECRET
+    ips: [127.0.0.1]
+    permissions:
+      - action: publish
+        path: p1-observer
+  - user: READ_USER
+    pass: READ_SECRET
+    ips: [PI_PRIVATE_ADDRESS]
+    permissions:
+      - action: read
+        path: p1-observer
+api: false
+metrics: false
+pprof: false
+playback: false
+rtsp: true
+rtspAddress: 127.0.0.1:8555
+rtspTransports: [tcp]
+rtspEncryption: "no"
+rtmp: false
+hls: false
+srt: false
+moq: false
+webrtc: true
+webrtcAddress: P1_PRIVATE_ADDRESS:8872
+webrtcEncryption: true
+webrtcServerCert: PRIVATE_CERT_PATH
+webrtcServerKey: PRIVATE_KEY_PATH
+webrtcAllowOrigins: []
+webrtcLocalUDPAddress: P1_PRIVATE_ADDRESS:8190
+webrtcLocalTCPAddress: ""
+webrtcIPsFromInterfaces: false
+webrtcAdditionalHosts: [P1_PRIVATE_ADDRESS]
+webrtcICEServers2: []
+paths:
+  p1-observer:
+    source: publisher
+    maxReaders: 2
+    overridePublisher: false
+    record: false
+    alwaysAvailable: false
