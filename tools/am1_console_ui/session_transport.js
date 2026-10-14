@@ -489,7 +489,7 @@ globalThis.AM1RemoteInitialize=function() {
   window.addEventListener("pagehide",()=>transport.detach());
   window.addEventListener("pageshow",event=>{if(event.persisted)transport.restore();});
   document.querySelector('[data-help="touch"]').onclick=()=>{const help=document.querySelector("#control-help");help.hidden=!help.hidden;};
-  setInterval(()=>{if(transport.isLiveElbow())transport.input();},50);
+  setInterval(()=>{if(transport.isLiveElbow())transport.input();},60);
   setInterval(()=>{if(!transport.isLiveElbow())transport.input();},100);
   setInterval(()=>{if(transport.connected&&transport.controllerGeneration)transport.renew().catch(()=>{});},500);
   render(transport);transport.initialize().catch(error=>render(transport,error.message));

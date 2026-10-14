@@ -389,21 +389,26 @@ test("loaded protocol-fixture live elbow jogs reverse and blur requires new qual
   const browser=await chromium.launch({headless:true,channel:process.env.AM1_TEST_BROWSER_CHANNEL || "msedge"});t.after(()=>browser.close());
   const context=await browser.newContext({ignoreHTTPSErrors:true});t.after(()=>context.close());const page=await context.newPage();
   const errors=[];page.on("pageerror",error=>errors.push(error.message));await enroll(page,f.info.url,f.info.a);
+  await page.locator('[data-operation="ClaimInput"]').click();await page.waitForFunction(()=>am1Remote.controllerGeneration);
+  await page.locator('#fake-recipe').selectOption('fake-interactive');await page.locator('[data-operation="Start"]').click();
+  await page.waitForFunction(()=>am1Remote.snapshot?.run?.status==='paused');await page.locator('[data-operation="Resume"]').click();
+  await page.waitForFunction(()=>am1Remote.snapshot.run.status==='running'&&am1Remote.connection);
+  const actualController=await page.evaluate(()=>am1Remote.controllerGeneration);
   // Loaded ordinary controls/transport only. Injected wire replies are not physical/backend evidence.
   await page.evaluate(()=>{
     const ws=am1Remote.socket,send=ws.send.bind(ws),receive=ws.onmessage;
     ws.onmessage=event=>{if(JSON.parse(event.data).kind!=="snapshot")receive(event);};
-    am1Remote.renew=async()=>null;am1Remote.controllerGeneration="fixture-controller";am1Remote.connection="fixture-connection";
+    const generation=am1Remote.controllerGeneration;globalThis.fixtureRenewals=0;const renew=am1Remote.renew.bind(am1Remote);am1Remote.renew=()=>{fixtureRenewals++;return renew();};am1Remote.connection="fixture-connection";
     am1Remote.snapshot={service_incarnation:"fixture-owner",recipes:["physical-live-left-elbow"],presets:[],
-      controller:{device_id:am1Remote.device,controller_generation:"fixture-controller"},evidence:{feedback:true,native_ack:true,
+      controller:{device_id:am1Remote.device,controller_generation:generation},evidence:{feedback:true,native_ack:true,
         measured_positions:{"arm_left_elbow_flex.pos":4},required_observation:true},
       run:{run_id:"test-only-live-protocol",recipe:"physical-live-left-elbow",source:"protected-physical-provider",status:"running",
         intent_revision:7,backend_incarnation:"fixture-host",progress_s:0,native_live_at:810,deadline:900,remaining_s:90,
         live_input:{joint:"arm_left_elbow_flex.pos",reference_norm:5,corridor_min_norm:-5,corridor_max_norm:5,
           cursor_norm:4,cursor_feedback_sequence:30,cursor_intent_revision:7,state:"awaiting_input"}}};
-    globalThis.liveFrames=[];
+    globalThis.liveFrames=[];globalThis.wireFrames=[];
     ws.send=serialized=>{
-      const frame=JSON.parse(serialized);if(!frame.command)return send(serialized);
+      const frame=JSON.parse(serialized);wireFrames.push({at:performance.now(),kind:frame.command?.op||Object.keys(frame)[0]});if(!frame.command)return send(serialized);
       liveFrames.push({command:frame.command,at:performance.now()});
       let value={accepted:true,status:frame.command.op};
       if(frame.command.op==="grant")value={accepted:true,grant_id:`fixture-grant-${liveFrames.length}`,issued:5000,expires:5000.25};
@@ -437,7 +442,7 @@ test("loaded protocol-fixture live elbow jogs reverse and blur requires new qual
   await page.locator('[data-body-key="w"]').hover();await page.mouse.down();await page.mouse.up();
   assert.equal(await page.evaluate(()=>am1Remote.elbowInput()!==null),true,"disabled body pointer release must not revoke the live elbow lane");
   const negative=page.locator('[data-elbow-jog="-1"]');await negative.hover();await page.mouse.down();
-  await page.waitForFunction(()=>liveFrames.filter(frame=>frame.command.op==="input").length>=3);
+  await page.waitForFunction(()=>liveFrames.filter(frame=>frame.command.op==="input").length>=22);
   const before=await page.evaluate(()=>liveFrames.filter(frame=>frame.command.op==="input").at(-1).command.target["arm_left_elbow_flex.pos"]);
   await page.keyboard.down("]");
   await page.waitForFunction(value=>liveFrames.filter(frame=>frame.command.op==="input").at(-1).command.target["arm_left_elbow_flex.pos"]>value,before);
@@ -450,7 +455,7 @@ test("loaded protocol-fixture live elbow jogs reverse and blur requires new qual
   await page.waitForFunction(()=>liveFrames.some(frame=>frame.command.op==="connect"));
   const connect=await page.evaluate(()=>liveFrames.find(frame=>frame.command.op==="connect").command);
   assert.equal(connect.host_incarnation,"fixture-host","physical connect carries the current host identity");
-  assert.equal(connect.service_incarnation,"fixture-owner");assert.equal(connect.controller_generation,"fixture-controller");
+  assert.equal(connect.service_incarnation,"fixture-owner");assert.equal(connect.controller_generation,actualController);
   await page.waitForFunction(()=>am1Remote.snapshot.run.intent_revision===9 && !document.querySelector('[data-elbow-jog="1"]').disabled);
   const handshake=await page.evaluate(()=>liveFrames.filter(frame=>["connect","release_input","resume"].includes(frame.command.op)));
   const resumed=handshake.find(frame=>frame.command.op==="resume"),connected=handshake.find(frame=>frame.command.op==="connect");
@@ -458,13 +463,18 @@ test("loaded protocol-fixture live elbow jogs reverse and blur requires new qual
   assert(resumed.at-connected.at>=250,"Resume must await fresh measured hold qualification");
   assert.equal(await page.evaluate(()=>am1Remote.elbowJog),0,"Resume does not replay a remembered gesture");
   await page.keyboard.down("]");await page.waitForFunction(n=>liveFrames.filter(frame=>frame.command.op==="input").length>n,count);
-  const result=await page.evaluate(()=>({run:am1Remote.snapshot.run,frames:liveFrames.filter(frame=>frame.command.op==="input")}));
+  const result=await page.evaluate(()=>({run:am1Remote.snapshot.run,frames:liveFrames.filter(frame=>frame.command.op==="input"),wire:wireFrames,renewals:fixtureRenewals}));
   assert.equal(result.run.run_id,"test-only-live-protocol");assert.equal(result.run.deadline,900);
   const firstFresh=result.frames.find(frame=>frame.command.intent_revision===9);
   assert(firstFresh.command.target["arm_left_elbow_flex.pos"]>=2 && firstFresh.command.target["arm_left_elbow_flex.pos"]<=2.1);
   assert(result.frames.every(frame=>Object.keys(frame.command.target).join()==="arm_left_elbow_flex.pos"));
   for(let index=1;index<4;index++)assert(result.frames[index].at-result.frames[index-1].at>=40,"nominal cadence does not burst/replay");
-  assert((result.frames[2].at-result.frames[0].at)/2<85,"immediate physical grant/input replies use the ordinary page nominal20Hz schedule");
+  assert((result.frames[2].at-result.frames[0].at)/2<85,"immediate physical grant/input replies use the ordinary page nominal16.7Hz schedule");
+  const beforeBlur=result.frames.filter(frame=>frame.command.intent_revision===7);
+  const maxWireWindow=Math.max(...beforeBlur.map(frame=>beforeBlur.filter(row=>row.at>=frame.at&&row.at<frame.at+1000).length))*2;
+  assert(maxWireWindow+4<=40,"whole grant/input wire traffic must reserve4 handshake/ACK frames within the existing40-frame gateway window");
+  assert(result.renewals>=2,"actual claimed controller keeps HTTP presence renewal enabled");
+  const allWireMax=Math.max(...result.wire.map(frame=>result.wire.filter(row=>row.at>=frame.at&&row.at<frame.at+1000).length));assert(allWireMax<=40,"all outgoing TEXT frames remain within gateway40 budget");
   await page.keyboard.up("]");assert.deepEqual(errors,[]);
   console.log(JSON.stringify({testOnlyProtocolFixture:true,physicalEvidenceProved:false,ordinaryJogButtons:true,mappedInputSamples:result.frames.length,newGestureAfterResume:true}));
 });
