@@ -1,3 +1,28 @@
+## AM1-LIVE-ARMS-10 implementation and pre-Start selection
+
+The [Packet10 guide](live-arms-10.md) describes the focused follow-up at feature
+checkpoint `ee0266f302a4ffbbed1e927f3f5e9cfa5857e828`.
+The candidate page offers **Left elbow** (`physical-live-left-elbow`) and
+**Right elbow** (`physical-live-right-elbow`) before Start. Claim input, select
+the side, explicitly Start, qualify Resume and begin a new [ / ] or side-labelled
+button gesture. Active or uncertain runs freeze the admitted selection;
+release/blur/gap and browser reattachment require fresh qualification and new
+input. Known terminal cleanup permits the next pre-Start choice.
+
+| Capability | Current boundary |
+|---|---|
+| Live left elbow | Accepted Packet09 physical result retained at its actual operating source |
+| Live right-elbow selection | Implemented and focused offline checks passed; Packet10 physical result/deployment pending |
+| One selected joint per run | Other eleven arm goals held; body/lift commands zero after normal startup |
+| Bimanual, live body/lift, physical leaders, precision | Unqualified; outside this extension |
+
+PR21 was ordinarily merged into `integrate/am1-local-teleop` at
+`48a3ed39b7591837ed6771a586daec7c1b8b5b8b`; integration is separate from deployment.
+The Packet10 follow-up has no automatic merge authority. Packet09/Packet08
+entries below remain at their recorded versions, including accepted movement and
+historical limitations; the new guide supersedes their older "next extension"
+descriptions only for the implemented two-choice path.
+
 ## AM1-LIVE-VIRTUAL-09 current input capability
 
 The browser now streams one current normalized left-elbow target through the
