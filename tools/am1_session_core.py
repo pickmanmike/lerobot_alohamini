@@ -584,6 +584,7 @@ class SessionAuthority:
         self.connection = None
         self.grant = None
         self.applied_input = None
+        self._live_activation_epoch = None
         self.released = False
         self.events = deque(maxlen=64)
         self.last_tick = clock()
@@ -1065,6 +1066,7 @@ class SessionAuthority:
     def _clear_input(self):
         self.grant = None
         self.applied_input = None
+        self._live_activation_epoch = None
         self.released = False
         if self.run:
             self.run["intent"] = None
@@ -2276,6 +2278,10 @@ class SessionAuthority:
             self.run["dispatch"] = "dispatching"
             self._save()
             try:
+                activation_epoch = (
+                    self._evidence()["accepted_host_action"]["epoch"] + 1
+                    if self._physical_interactive() else None
+                )
                 admitted = self.executor.dispatch(RECIPES[self.run["recipe"]])
             except Exception:
                 self.run["uncertain"] = True
@@ -2284,6 +2290,9 @@ class SessionAuthority:
             self.run["dispatch"] = "acknowledged" if admitted else "unacknowledged"
             if admitted:
                 self.run["recovery"] = None
+                if self._physical_interactive():
+                    self._live_activation_epoch = activation_epoch
+                    self.run["resume_ceiling"] = min(now + 10, self.run["deadline"])
             elif self.asynchronous:
                 self.run["status"] = "resuming"
                 self.run["resume_ceiling"] = min(
@@ -2392,6 +2401,14 @@ class SessionAuthority:
             if not r or r["status"] in TERMINAL:
                 return
             e = self._evidence()
+            if self._physical_interactive():
+                try:
+                    execution = self.executor.advance(now, dt)
+                except (OSError, RuntimeError, ValueError) as exc:
+                    self._finish("faulted", str(exc))
+                    return
+                r["execution"] = execution
+                r["progress_s"] = execution["progress_s"]
             if self.asynchronous and r["status"] == "finishing":
                 self._physical_lifecycle(e, now)
                 return
@@ -2424,6 +2441,16 @@ class SessionAuthority:
                     self._pause_live_input("native_input_expired")
                     return
             qualified = e["feedback"] and e["required_observation"] and e["native_ack"]
+            # Only the measured hold immediately preceding this Resume's active
+            # epoch may bridge its first native ACK. A watchdog's later hold must
+            # enter the existing bounded recovery, even before the first sample.
+            live_transition = self._physical_interactive() and self._live_activation_epoch is not None and (
+                e.get("accepted_host_action", {}).get("state") == "paused"
+                and e.get("accepted_host_action", {}).get("epoch") == self._live_activation_epoch - 1
+                and now < r["resume_ceiling"]
+            )
+            if e.get("active_acknowledged") is True:
+                self._live_activation_epoch = None
             if r["status"] == "preparing":
                 if now >= r["preparation_ceiling"]:
                     self._finish("faulted", "observation_preparation_timeout")
@@ -2450,6 +2477,10 @@ class SessionAuthority:
                     return
                 if qualified and e["pose_aligned"]:
                     try:
+                        activation_epoch = (
+                            e["accepted_host_action"]["epoch"] + 1
+                            if self._physical_interactive() else None
+                        )
                         self._set_executor_revision()
                         admitted = self.executor.dispatch(RECIPES[r["recipe"]])
                     except (OSError, RuntimeError, ValueError) as exc:
@@ -2459,14 +2490,17 @@ class SessionAuthority:
                         r["status"] = "running"
                         r["dispatch"] = "acknowledged"
                         r["recovery"] = None
+                        if self._physical_interactive():
+                            self._live_activation_epoch = activation_epoch
                         self._event("resumed")
             elif r["status"] == "running" and not (
-                qualified and (not self.asynchronous or self._physical_interactive()
+                qualified and (not self.asynchronous or live_transition
                                or e.get("active_acknowledged") is True)
             ):
                 r["recovery_episodes"] += 1
                 r["first_cause"] = r["first_cause"] or (
-                    "feedback_loss" if not e["feedback"] else "required_proof_loss"
+                    "feedback_loss" if not e["feedback"] else
+                    "native_active_ack_loss" if self._physical_interactive() and qualified else "required_proof_loss"
                 )
                 ceiling = r["recovery"]["ceiling"] if r["recovery"] else min(now + 10, r["deadline"])
                 r["recovery"] = {"started": now, "ceiling": ceiling, "revision": r["intent_revision"]}

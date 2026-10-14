@@ -874,6 +874,165 @@ def test_physical_live_reacquisition_retains_reference_and_deadline(physical_liv
     assert e.task is None and e.worker.is_alive()
 
 
+@pytest.mark.parametrize("before_first_sample", [False, True])
+def test_physical_live_native_watchdog_hold_requires_same_run_resume(
+    physical_live_authority, before_first_sample
+):
+    from tests.robots.test_am1_physical_executor import until
+
+    a, e, host, r = physical_live_authority
+    base = physical_live_controls(a, r)
+    until(lambda: a.snapshot()["evidence"]["active_acknowledged"])
+    initial = a.snapshot()["run"]
+    if not before_first_sample:
+        grant = a.handle(command("grant", **base), "owner")
+        assert a.handle(command("input", **base, grant_id=grant["grant_id"], seq=1,
+                                target={"arm_left_elbow_flex.pos": -0.5}), "owner")["accepted"]
+        until(lambda: host.control.live_snapshot().get("last_input_seq") == 1)
+    # Invoke the production native watchdog against simulated motor IO. Its fresh
+    # measured hold retains sensing/native ACK while revoking the active epoch.
+    with e.mutex:
+        host.control.watchdog_stop(host.robot)
+    until(lambda: e.evidence()["hold_acknowledged"])
+    evidence = e.evidence()
+    assert all(evidence[k] for k in ("feedback", "required_observation", "native_ack"))
+    assert not evidence["active_acknowledged"]
+    a.tick()
+    assert a.run["status"] == "recovering"
+    assert a.run["first_cause"] == "native_active_ack_loss"
+    until(lambda: (a.tick() or a.run["status"] == "paused"))
+    assert a.run["intent"] is None
+    assert not a.handle(command("grant", **base), "owner")["accepted"]
+    assert a.handle(command("release_input", **base), "owner")["accepted"]
+    until(lambda: e.evidence()["pose_aligned"])
+    assert a.handle(command("claim", controller_generation=base["controller_generation"]), "owner")["accepted"]
+    resumed = a.handle(command("resume", **base, expected_intent_revision=a.run["intent_revision"]), "owner")
+    assert resumed["accepted"], resumed
+    until(lambda: (a.tick() or a.run["status"] == "running"))
+    base["intent_revision"] = a.run["intent_revision"]
+    fresh = a.handle(command("grant", **base), "owner")
+    assert a.handle(command("input", **base, grant_id=fresh["grant_id"], seq=2,
+                            target={"arm_left_elbow_flex.pos": -0.2}), "owner")["accepted"]
+    until(lambda: host.control.live_snapshot().get("last_input_seq") == 2)
+    current = a.snapshot()["run"]
+    assert current["run_id"] == initial["run_id"]
+    assert current["native_live_at"] == initial["native_live_at"]
+    assert current["deadline"] == initial["deadline"]
+    assert current["live_input"]["reference_norm"] == initial["live_input"]["reference_norm"]
+    assert current["first_cause"] == "native_active_ack_loss"
+
+
+def test_physical_live_resume_initial_native_transition_does_not_pause(physical_live_authority):
+    from tests.robots.test_am1_physical_executor import until
+
+    a, e, host, r = physical_live_authority
+    snapshot = a.snapshot()
+    base = dict(run_id=r["run_id"], service_incarnation=a.service_incarnation,
+                controller_generation=snapshot["controller"]["controller_generation"],
+                host_incarnation=e.host_incarnation)
+    connected = a.handle(command("connect", **base), "owner")
+    base["connection_generation"] = connected["connection_generation"]
+    assert a.handle(command("release_input", **base), "owner")["accepted"]
+    until(lambda: e.evidence()["pose_aligned"])
+    assert a.handle(command("resume", **base, expected_intent_revision=a.run["intent_revision"]), "owner")["accepted"]
+
+    def observe_initial_transition():
+        # Fence only the simulated worker so Core can inspect the exact held
+        # predecessor ACK immediately after admitting dispatch, before the send.
+        with e.mutex:
+            a.tick()
+            if a.run["status"] != "running":
+                return False
+            evidence = e.evidence()
+            assert evidence["native_ack"] and not evidence["active_acknowledged"]
+            a.tick()
+            assert a.run["status"] == "running"
+            assert a.run["first_cause"] is None
+            return True
+
+    until(observe_initial_transition)
+    until(lambda: e.evidence()["active_acknowledged"])
+    a.tick()
+    assert a.run["status"] == "running"
+
+
+def test_physical_live_resume_cannot_rebase_transition_on_post_dispatch_watchdog(
+    physical_live_authority, monkeypatch
+):
+    from tests.robots.test_am1_physical_executor import until
+
+    a, e, host, r = physical_live_authority
+    snapshot = a.snapshot()
+    base = dict(run_id=r["run_id"], service_incarnation=a.service_incarnation,
+                controller_generation=snapshot["controller"]["controller_generation"],
+                host_incarnation=e.host_incarnation)
+    connected = a.handle(command("connect", **base), "owner")
+    base["connection_generation"] = connected["connection_generation"]
+    assert a.handle(command("release_input", **base), "owner")["accepted"]
+    until(lambda: e.evidence()["pose_aligned"])
+    assert a.handle(command("claim", controller_generation=base["controller_generation"]), "owner")["accepted"]
+    initial = a.snapshot()["run"]
+    real_save, real_dispatch = a._save, e.dispatch
+    admitted_predecessor = []
+
+    def delayed_save():
+        real_save()
+        if a.run["status"] == "running" and a.run["dispatch"] == "dispatching":
+            # A slow durable checkpoint can let the revised measured hold
+            # qualify before the first Resume dispatch, without mocking its ACK.
+            until(lambda: e.evidence()["pose_aligned"])
+
+    def dispatch_then_watchdog(recipe):
+        admitted_predecessor.append(e.evidence()["accepted_host_action"]["epoch"])
+        admitted = real_dispatch(recipe)
+        assert admitted
+        until(lambda: e.evidence()["active_acknowledged"])
+        with e.mutex:
+            host.control.watchdog_stop(host.robot)
+        until(lambda: e.evidence()["hold_acknowledged"])
+        return admitted
+
+    monkeypatch.setattr(a, "_save", delayed_save)
+    monkeypatch.setattr(e, "dispatch", dispatch_then_watchdog)
+    result = a.handle(command("resume", **base, expected_intent_revision=a.run["intent_revision"]), "owner")
+    assert result["accepted"] and result["effect_admitted"]
+    assert e.evidence()["accepted_host_action"]["epoch"] == admitted_predecessor[0] + 2
+    a.tick()
+    assert a.run["status"] == "recovering"
+    assert a.run["first_cause"] == "native_active_ack_loss"
+    assert not a.handle(command("grant", **base, intent_revision=a.run["intent_revision"]), "owner")["accepted"]
+    assert a.run["deadline"] == initial["deadline"]
+    assert a.run["native_live_at"] == initial["native_live_at"]
+
+
+def test_physical_live_progress_is_retained_in_bounded_views_and_terminal(physical_live_authority):
+    import json
+
+    from tests.robots.test_am1_physical_executor import until
+    from tools.am1_session_ipc import RESPONSE_LIMIT, encode, strict_json
+
+    a, e, host, r = physical_live_authority
+    physical_live_controls(a, r)
+    until(lambda: e.advance(0, 0)["progress_s"] > 0.1)
+    a.tick()
+    assert a.run["progress_s"] > 0.1
+    assert a.run["execution"]["profile"] == "LiveLeftElbow"
+    for view in (a.snapshot(),):
+        raw = encode({"id": str(uuid.uuid4()), "result": view})
+        assert len(raw) < RESPONSE_LIMIT
+        run = strict_json(raw)["result"]["run"]
+        assert run["progress_s"] > 0.1
+        assert run["execution"]["profile"] == "LiveLeftElbow"
+        assert run["execution"]["complete"] is False
+    assert a.handle(command("stop", run_id=r["run_id"]), "owner")["accepted"]
+    until(lambda: (a.tick() or a.run["status"] == "stopped"))
+    assert a.run["progress_s"] > 0.1
+    assert a.run["execution"]["profile"] == "LiveLeftElbow"
+    retained = json.loads(a.db.execute("SELECT data FROM state WHERE id=1").fetchone()[0])
+    assert retained["execution"] == a.run["execution"]
+    assert retained["cleanup"] == "physical_readback_verified"
+
+
 @pytest.mark.parametrize("changes", [
     {"seq": True}, {"target": [0.5]}, {"target": {"arm_right_elbow_flex.pos": -0.5}},
     {"target": {"arm_left_elbow_flex.pos": -0.5, "arm_right_elbow_flex.pos": 7.0}},
