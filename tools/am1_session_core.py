@@ -622,7 +622,7 @@ class SessionAuthority:
             self.executor.set_intent_revision(self.run["intent_revision"])
 
     def _hold(self):
-        if self._physical_interactive():
+        if self._physical_interactive() and self.run["status"] not in TERMINAL:
             self._retain_live_write_history(self._evidence(), clear_current=True)
         self._set_executor_revision()
         return self.executor.hold()

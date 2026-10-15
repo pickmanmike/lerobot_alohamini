@@ -1740,3 +1740,52 @@ def test_live_write_history_clock_reset_retains_only_prevalidated_storage(physic
         saved = a.run["live_input"].pop("last_successful_write")
         assert "last_successful_write" not in a._live_input_status(evidence)
         a.run["live_input"]["last_successful_write"] = saved
+
+
+@pytest.mark.parametrize("physical_live_authority", ["physical-live-right-elbow"], indirect=True)
+def test_live_legacy_terminal_record_reopen_is_canonically_unchanged(physical_live_authority):
+    import base64
+    import hashlib
+    import json
+    import time
+
+    from tests.robots.test_am1_live_native import ExecutorNativeHost
+    from tests.robots.test_am1_physical_executor import executor, until
+    from tools.am1_session_core import _canonical
+
+    a, e, host, r = physical_live_authority
+    assert a.handle(command("stop", run_id=r["run_id"]), "owner")["accepted"]
+    until(lambda: (a.tick() or a.run["status"] == "stopped"))
+    # Legacy d16 layout: zero inputs and a returned measured-hold write, without
+    # an input's last_successful_write. Preserve this old terminal record exactly.
+    now = time.monotonic()
+    a.run["live_input"].update(last_input_seq=-1, encoded_goal_raw=1845, goal_write_returned=True,
+                             goal_write_started_at_monotonic_s=now-.002,
+                             goal_write_completed_at_monotonic_s=now-.001, goal_action_sequence=3)
+    assert "last_successful_write" not in a.run["live_input"]
+    a._save()
+    expected = _canonical(a.run)
+    a.close()
+    replacement = executor(ExecutorNativeHost())
+    restored = SessionAuthority(a.directory, executor=replacement)
+    try:
+        durable = restored.db.execute("SELECT data FROM state WHERE id=1").fetchone()[0]
+        assert _canonical(json.loads(durable)) == expected
+        assert _canonical(restored.run) == expected
+        view = restored.snapshot()
+        reference = view["run"]["details_reference"]
+        raw = bytearray()
+        while len(raw) < reference["bytes"]:
+            reply = restored.snapshot_detail(dict(op="snapshot", reference=reference, offset=len(raw), limit=8192))
+            raw.extend(base64.b64decode(reply["data"], validate=True))
+        assert hashlib.sha256(raw).hexdigest() == reference["sha256"]
+        assert _canonical(json.loads(raw)) == expected
+        assert view["evidence"]["native_ack"] is False
+        assert view["evidence"]["active_acknowledged"] is False
+        assert restored.controller is None and restored.connection is None
+        assert restored.grant is None and restored.applied_input is None
+        assert replacement.worker is None
+        assert not restored.handle(command("grant", run_id=r["run_id"]), "owner")["accepted"]
+        assert _canonical(restored.run) == expected
+    finally:
+        restored.close()
