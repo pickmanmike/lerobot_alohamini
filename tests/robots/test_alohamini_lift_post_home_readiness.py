@@ -168,7 +168,6 @@ def test_strict_diagnostic_without_am1_opt_in_still_refuses_original_303():
         [(808, 50, 1)] * 3,
         [(808, -50, 1)] * 3,
         [(808, 0, 1)] * 3,
-        [(808, 50, 1), (808, -50, 1), (808, 50, 1)],
         [(808, 50, 0)] * 3,
     ],
 )
@@ -410,8 +409,8 @@ def test_actual_post_home_payloads_replay_with_explicit_frozen_acquisition_prove
     transport.read_group = read
     record = qualify(monitor, origin=origin)
     proof = record["stationary_qualification"]
-    assert proof["readiness_policy"] == "am1-post-home-first-quiet-v2"
-    assert proof["readiness_policy_version"] == 2
+    assert proof["readiness_policy"] == "am1-post-home-first-quiet-v3"
+    assert proof["readiness_policy_version"] == 3
     assert proof["readiness_branch"] == branch
     assert proof["am1_post_home_origin_raw"] == origin
     assert proof["stationary_acquisition_origin_raw"] == (815 if trial == "02" else 814)
@@ -494,7 +493,7 @@ def test_original_process_zero_guard_and_temperature_origin_are_never_rebased(af
 
 
 @pytest.mark.parametrize("rows", [
-    [(813,100,1),(814,50,1),(815,0,1),(815,0,0)],
+    [(813,100,1),(814,50,1),(815,0,1),(816,0,0)],
     [(813,100,0),(814,50,0),(815,50,0),(816,0,0)],
     [(813,100,1),(814,0,0),(815,50,1),(816,0,0)],
     [(813,100,1),(814,0,0),(814,50,1),(814,50,1),(814,50,1)],
@@ -518,3 +517,166 @@ def test_final_inflight_reply_cannot_hide_new_disqualifier_behind_predeadline_wi
     monitor.sleep, transport.read_group = almost_deadline, final_read
     with pytest.raises(feedback.ComparisonRefusal):qualify(monitor)
     assert transport.read_count == 21 and transport.arrivals[-1] > 1
+
+
+# Exact 18 recorded physical07 grouped payloads. Test clocks and any explicitly
+# appended continuation are simulated, not fabricated later physical evidence.
+ACTUAL_07_POST_HOME_PAYLOADS = [
+    '0114c8500ac8c801fe000000000000e8030000000000012d0364006405732500000100003b00',
+    '0114c8500ac8c801fe000000000000e8030000000000012f0300005905732500000000003500',
+    '0114c8500ac8c801fe000000000000e8030000000000012f0300005505722600000000003b00',
+    '0114c8500ac8c801fe000000000000e8030000000000012e0300005505732500000000003400',
+    '0114c8500ac8c801fe000000000000e8030000000000012f0300005505732500000000003400',
+    '0114c8500ac8c801fe000000000000e8030000000000012f0332005505732500000100003700',
+    '0114c8500ac8c801fe000000000000e8030000000000012f0300005905732500000000003500',
+    '0114c8500ac8c801fe000000000000e8030000000000012f0332005405732500000100003500',
+    '0114c8500ac8c801fe000000000000e8030000000000012e0332805805732500000100003d00',
+    '0114c8500ac8c801fe000000000000e8030000000000012f0300005505732500000000003700',
+    '0114c8500ac8c801fe000000000000e8030000000000012e0300005905732600000000003e00',
+    '0114c8500ac8c801fe000000000000e8030000000000012f0300005505722600000000003c00',
+    '0114c8500ac8c801fe000000000000e8030000000000012f0332005705722600000100003500',
+    '0114c8500ac8c801fe000000000000e8030000000000012f0300005505732600000000003500',
+    '0114c8500ac8c801fe000000000000e8030000000000012e0300005505732600000000003500',
+    '0114c8500ac8c801fe000000000000e8030000000000012f0332805905722500000100003400',
+    '0114c8500ac8c801fe000000000000e8030000000000012e0332805805732500000100003400',
+    '0114c8500ac8c801fe000000000000e8030000000000012f0332005705732500000100003400',
+]
+ACTUAL_07_POST_HOME_ROWS = [
+    (813, 100, 1), (815, 0, 0), (815, 0, 0), (814, 0, 0),
+    (815, 0, 0), (815, 50, 1), (815, 0, 0), (815, 50, 1),
+    (814, -50, 1), (815, 0, 0), (814, 0, 0), (815, 0, 0),
+    (815, 50, 1), (815, 0, 0), (814, 0, 0),
+    (815, -50, 1), (814, -50, 1), (815, 50, 1),
+]
+
+
+def test_actual07_reversed_velocity_payloads_do_not_end_acquisition_early():
+    monitor, clock, transport, emitted = comparison([(812, 0, 0)])
+    packets = [bytes.fromhex(value) for value in ACTUAL_07_POST_HOME_PAYLOADS]
+
+    class RecordedEvidenceExhausted(Exception):
+        pass
+
+    def recorded_read(start, length, **kwargs):
+        assert (start, length, kwargs['timeout_ms']) == (33, 38, 40.0)
+        if transport.read_count == len(packets):
+            raise RecordedEvidenceExhausted('no later physical07 replies are recorded')
+        payload = packets[transport.read_count]
+        transport.read_count += 1
+        clock.sleep(.002)
+        transport.arrivals.append(clock.now)
+        return payload, {'response_payload_bytes': list(payload), 'checksum_ok': True}
+
+    transport.read_group = recorded_read
+    # Finishing the original one-second window needs later actual feedback.
+    # Eighteen captured replies may demonstrate removal of an early refusal,
+    # never a new qualification that physical07 itself did not achieve.
+    with pytest.raises(RecordedEvidenceExhausted):
+        qualify(monitor, origin=812)
+    assert transport.read_count == 18 and clock.now < 1
+    assert not any(r['phase']=='post_home_stationary_qualified' for r in emitted)
+    acquired = [r for r in emitted if r['phase']=='post_home']
+    assert [(r['present_position_raw'],r['present_velocity_raw'],r['moving']) for r in acquired] == ACTUAL_07_POST_HOME_ROWS
+
+
+def test_simulated07_continuation_waits_for_original_deadline_with_frozen_band():
+    # The last two quiet replies below are explicitly synthetic continuation.
+    monitor, clock, transport, _ = comparison(ACTUAL_07_POST_HOME_ROWS + [(815,0,0)] * 2)
+    proof = qualify(monitor, origin=812)['stationary_qualification']
+    assert clock.now == pytest.approx(1.0) and transport.read_count == 20
+    assert proof['readiness_branch']=='bounded_indicator'
+    assert proof['motion_feedback_quiet'] is False
+    assert proof['readiness_policy']=='am1-post-home-first-quiet-v3'
+    assert proof['readiness_policy_version']==3
+    assert proof['am1_post_home_origin_raw']==812
+    assert proof['stationary_acquisition_origin_raw']==815
+    assert proof['stationary_acquisition_sample_index']==2
+    assert proof['whole_phase_position_excursion_raw']==3
+    assert proof['whole_phase_position_drift_raw']==3
+    assert proof['position_excursion_raw']==1 and proof['position_drift_raw']==0
+    assert proof['whole_phase_present_velocity_raw'][-5:]==[-50,-50,50,0,0]
+    assert proof['whole_phase_moving'][-5:]==[1,1,1,0,0]
+    assert proof['sample_count']==19 and proof['window_s']>=.9
+
+
+def test_reversing_moving_bits_without_first_quiet_cannot_qualify():
+    monitor, clock, transport, _ = comparison([(808,50,1),(808,-50,1),(808,50,1)])
+    with pytest.raises(feedback.ComparisonRefusal, match='stationary'):
+        qualify(monitor)
+    assert clock.now == pytest.approx(1.0) and transport.read_count == 20
+
+
+@pytest.mark.parametrize('tail', [
+    [(814,0,1)] * 3,
+    [(814,50,1)] * 3,
+    [(814,-50,1)] * 3,
+    [(814,50,0)] * 3,
+    [(814,-50,0)] * 3,
+])
+def test_actual_persistent_zero_velocity_moving_or_signed_velocity_still_abort(tail):
+    monitor, clock, _, _ = comparison([(813,100,1),(814,0,0),*tail])
+    with pytest.raises(feedback.ComparisonRefusal, match='persistent'):
+        qualify(monitor, origin=813)
+    assert clock.now < .3
+
+
+def test_reversing_moving_bits_do_not_allow_two_tick_frozen_band():
+    monitor, clock, _, _ = comparison([(813,100,1),(814,0,0),*([(816,50,1),(814,-50,1)]*10)])
+    with pytest.raises(feedback.ComparisonRefusal, match='stationary'):
+        qualify(monitor, origin=813)
+    assert clock.now <= 1
+
+
+def test_reversing_moving_bits_do_not_allow_late_first_quiet():
+    monitor, clock, _, _ = comparison([(813,50,1),(813,-50,1)]*9+[(813,0,0)]*2)
+    with pytest.raises(feedback.ComparisonRefusal, match='stationary'):
+        qualify(monitor, origin=813)
+    assert clock.now <= 1
+
+
+def test_reversing_moving_bits_do_not_hide_three_real_position_steps():
+    monitor, clock, _, _ = comparison([(813,100,1),(814,0,0),(815,-50,1),(816,50,1)])
+    with pytest.raises(feedback.ComparisonRefusal, match='position'):
+        qualify(monitor, origin=813)
+    assert clock.now < .2
+
+
+@pytest.mark.parametrize('mutation', [
+    {'status_value':1}, {'current':308}, {'temperature':55},
+    {'torque':0}, {'goal_velocity':1}, {'mode':0},
+])
+def test_reversing_moving_sequence_keeps_sample_health_guards(mutation):
+    monitor, clock, transport, _ = comparison(ACTUAL_07_POST_HOME_ROWS+[(815,0,0)]*2)
+    original_read = transport.read_group
+    def changed_read(*args, **kwargs):
+        if transport.read_count >= 8:
+            transport.mutation=mutation
+        return original_read(*args, **kwargs)
+    transport.read_group=changed_read
+    with pytest.raises(feedback.ComparisonRefusal):
+        qualify(monitor, origin=812)
+    assert clock.now < 1
+
+
+def test_wrapped_one_tick_reversing_moving_sequence_keeps_fixed_acquisition():
+    rows=[(4095,100,1),(0,0,0),*([(4095,-50,1),(0,50,1)]*10)]
+    monitor, clock, _, _ = comparison(rows)
+    proof=qualify(monitor, origin=4094)['stationary_qualification']
+    assert clock.now == pytest.approx(1.0)
+    assert proof['readiness_branch']=='bounded_indicator'
+    assert proof['am1_post_home_origin_raw']==4094
+    assert proof['stationary_acquisition_origin_raw']==0
+    assert proof['stationary_acquisition_sample_index']==2
+    assert proof['position_excursion_raw']==1 and abs(proof['position_drift_raw'])<=1
+
+
+
+def test_former_three_moving_prefix_never_qualifies_without_stationary_tail():
+    # Two positive encoder steps and a zero-velocity Moving1 frame are not
+    # three same-direction steps. Repeating this actual-style settling prefix
+    # still cannot meet the frozen one-tick band or original one-second budget.
+    rows=[(813,100,1),(814,50,1),(815,0,1),(815,0,0)]
+    monitor, clock, transport, _ = comparison(rows)
+    with pytest.raises(feedback.ComparisonRefusal, match='stationary'):
+        qualify(monitor, origin=813)
+    assert clock.now == pytest.approx(1.0) and transport.read_count == 20

@@ -534,7 +534,14 @@ class _AM1PostHomeReadiness:
         if len(self.recent) == STATIONARY_PERSISTENT_SAMPLES:
             velocities = [int(row["present_velocity_raw"]) for row in self.recent]
             if (
-                all(int(row["moving"]) == 1 for row in self.recent)
+                # Match the existing stationary/live interpretation: a
+                # persistent Moving bit without velocity is distinct from
+                # bounded quantized velocity that reverses direction.
+                all(
+                    int(row["moving"]) == 1
+                    and abs(int(row["present_velocity_raw"])) <= STILL_VELOCITY_RAW
+                    for row in self.recent
+                )
                 or all(value > STILL_VELOCITY_RAW for value in velocities)
                 or all(value < -STILL_VELOCITY_RAW for value in velocities)
             ):
@@ -569,8 +576,8 @@ class _AM1PostHomeReadiness:
 
     def evidence(self) -> dict[str, Any]:
         return {
-            "readiness_policy": "am1-post-home-first-quiet-v2",
-            "readiness_policy_version": 2,
+            "readiness_policy": "am1-post-home-first-quiet-v3",
+            "readiness_policy_version": 3,
             "am1_post_home_origin_raw": self.origin,
             "stationary_acquisition_origin_raw": None if self.acquisition is None else self.acquisition[0],
             "stationary_acquisition_at_monotonic_s": None if self.acquisition is None else self.acquisition[1],

@@ -19,17 +19,41 @@ and five thermal slots at35-36C. Calibration/EEPROM limits remain848..3223,
 offset515, Phase12, P16/I0/D32 and directional dead zones1. The accepted Packet09
 run had also recorded205 measured shoulder samples at3224. Source inspection
 identified later measured holds copying that feedback into the raw goal register.
-The focused repair is under implementation: qualify a representable goal3223
-without widening limits, keep measured3224 explicit, and preserve acknowledged
-nonselected goals through every protected live hold. Another powered Start
-awaits exact verification, review and matched staging of that repair.
+The implemented repair qualifies a representable goal3223
+without widening limits, keeps measured3224 explicit, and preserves the eleven
+acknowledged nonselected raw goals through every protected live hold. Both the
+before-home and after-home checks require fresh stationary feedback and actual
+settings/health; all twelve startup goals have actual register readbacks before
+arm enable. Later selected-joint measured holds verify the eleven frozen goals
+and change only the selected goal.
+
+A subsequent new Start exposed a distinct post-home acquisition refusal. Its
+original twenty samples and failure remain retained. The supported AM1-specific
+correction retains the original home reference and one-second deadline, freezes
+one first-observed quiet acquisition, and keeps whole-phase continuing-motion,
+fault, freshness and operating guards. It does not change gains, calibration,
+physical limits or the local home-distance protection. Exact native replay and
+negative tests cover the new bounded branch; the next physical startup used the
+existing strict-quiet branch, so that run is not physical validation of the
+bounded fallback. These changes are at executable source
+316a7b85ce4f900717fd988d989d4daa7c92e59b.
+
+The seventh bounded Start stopped before Live on three consecutive lift Moving
+flags. Its eighteen distinct acquisitions retained the original home812,
+first quiet815, and subsequent814..815 band; the final velocities were
+-50/-50/+50. The version3 correction aligns Moving-without-velocity
+classification with the existing stationary and live checks. It preserves
+same-sign velocity, actual continuing displacement, fixed first-quiet band,
+original one-second deadline and all health protections. Replay of the captured
+prefix does not fabricate the missing end of that window or make trial07 pass.
+Version3 native and physical qualification remain pending in this draft.
 
 [PR21](https://github.com/pickmanmike/lerobot_alohamini/pull/21) was ordinarily
 merged into `integrate/am1-local-teleop` at
 `48a3ed39b7591837ed6771a586daec7c1b8b5b8b`. Integration is separate from deployment.
-The focused follow-up is `codex/am1-live-arms-10`, with feature checkpoint
-`ee0266f302a4ffbbed1e927f3f5e9cfa5857e828`. Its executable files are unchanged by
-this documentation. The follow-up has no automatic merge authority; main and
+The focused follow-up is `codex/am1-live-arms-10`, with executable checkpoint
+`316a7b85ce4f900717fd988d989d4daa7c92e59b`. Documentation commits do not deploy
+or change those executable bytes. The follow-up has no automatic merge authority; main and
 the closed PR16-20 milestones remain outside this work.
 
 ## Ordinary use on the candidate page
@@ -89,7 +113,8 @@ grant and increasing sequence fences. The contract accepts only the selected
 recipe's one named joint, with no supplied hardware address or arbitrary joint
 selector. Expiry/release captures fresh measured hold and body zero; it does
 not automatically return the selected joint to q0. Nonselected joints retain
-literal native measured raw goals rather than a historical test pose.
+acknowledged native raw command goals, with explicit command/feedback separation;
+they do not copy out-of-command-bound feedback into later holds.
 
 Simultaneous bimanual input, live body/lift, physical USB-leader streaming,
 inverse kinematics and precision positioning remain outside this extension.
