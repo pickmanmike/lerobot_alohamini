@@ -1,3 +1,65 @@
+## Active AM1-LIVE-REUSE-11 result and continuing boundary
+
+PR22 is ordinarily integrated into integrate/am1-local-teleop at
+5016bc9850d0a37bc12b8244ad832f0214cc8d96. Main is unchanged. The Packet11
+follow-up remains unmerged; no merge of that follow-up is authorized.
+See docs/alohamini/live-reuse-11.md for ordinary use, exact evidence and limits.
+The Packet10/09 sections below are historical at their recorded versions.
+Packet11 supersedes Packet10's no-merge restriction ONLY for PR22/the named
+integration target, and its ordinary-release/shifted-next-Start instructions
+ONLY with the new qualified gesture and supported-workspace behavior below.
+
+One selected elbow receives live browser targets through the existing persistent
+owner/protected backend. Left behavior remains q0-10..q0. Right uses the fixed
+supported evidence1833..1867, inward commands1834..1867/span2.983725135623871,
+rate1 normalized unit/s and unchanged150mA sampled guard. Actual measured q0 is
+independent and immutable per run; only a freshly qualified gesture refreshes
+its measured cursor. Resume/reconnect/next Start cannot ratchet the workspace,
+rewrite q0, reset the original90-second Live deadline or replay old input.
+Current context includes exact calibration and fixed admission-only one-count
+allowances around left wrist-flex1546/right wrist-roll2443; actual eleven held
+Goals remain exact within each run. These allowances are not new travel authority.
+
+Connected voluntary jog release -> measured hold -> distinct new held gesture
+requests the existing qualified rearm within its original3-second opportunity;
+no separate Resume click is needed for that ordinary case. Initial Start and
+real expiry, blur/page loss, disconnect, explicit Pause/Stop or ownership loss
+still require explicit qualified Resume and new intent. Cancel/release/later
+intent fences pending replies. Pi-issued250ms expiry applies at every native
+write; retained historical write receipts never supply current authority.
+Other11 raw Goals hold; body/lift stay zero after normal startup. Simulation
+remains the default. Service startup never starts or replays motor activity.
+
+Executable sourceebbc26791b857ea14dd111c05e2717bfb18f64ba was staged as motor
+4253fba5eb6537e9495e943f6e57ef8690402ac8, unchanged runtime
+588d3b4e290d6f924cd402dfd0efb8f12391f6ac, manifest
+b3687a0b28e197390fe5e52b49edef06e396ba928b1455b1fd5d98786877470a.
+Preserve the matched673afd6fdffa947091b32fb5efdb23928f2d98d4/588d/24ff rollback,
+older pairs and separate helper/camera/manual pins. Merge/publication SHA is not
+a deployment command. Two startup feedback refresh calls preserve the existing
+thermal window/limits; no gains, calibration or protection thresholds changed.
+
+Actual05/06 both started at measuredraw1845 in the retained workspace and ended
+with verified normal cleanup. Goal1867/1834 respectively reached same-owner servo
+register readback, but measured response was0 in complete2.017/2.047-second windows.
+These are failed movement checks, not fine-position limitations or effective
+repeatability. Packet11 physical ordinary re-jog/reattachment remain unexercised;
+software checks do not supply those results. The purpose-specific next Start has
+not run because its read-only preflight could not reach the Pi. Last verified
+idle is after actual06; current reachability is unverified. Keep the private
+runner configuration PENDING until fresh native/page/source/cleanup checks pass.
+Do not expand force/travel/gains or repeat unchanged motion to hide this result.
+
+Root alone handles Git, SSH, staging and devices; agents use disjoint source or
+read-only scopes. Reuse existing tools/one runner/current configuration. Preserve
+all historical results, private trust/permissions, calibration and rollback.
+AM1 stays wireless, P1 advisory, AM2 untouched. No manual old-reference positioning,
+leader/shoulder/readiness requests, network tuning, new joints/architecture or
+hardware-endurance campaign. Durability means software fault tolerance,
+connection/control continuity, preserved state and recovery with minimal human
+intervention. A specific real connectivity failure may require restoring the
+existing link; it never authorizes network tuning or an unverified Start.
+
 ## Active AM1-LIVE-ARMS-10 result and continuing boundary
 
 PR21 is integrated into integrate/am1-local-teleop at

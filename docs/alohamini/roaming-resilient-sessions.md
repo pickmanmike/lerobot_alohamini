@@ -1,3 +1,27 @@
+## AM1-LIVE-REUSE-11: supported workspace and qualified re-jog
+
+PR22 is integrated into `integrate/am1-local-teleop` at
+`5016bc9850d0a37bc12b8244ad832f0214cc8d96`. The new reuse follow-up remains
+unmerged. The [Packet11 report](live-reuse-11.md) records ordinary use, verification,
+separate deployment identities, retained rollback and unresolved physical response.
+
+| Capability | Current evidence |
+|---|---|
+| Connected voluntary release -> fresh deliberate press | Qualified automatic rearm implemented and software-tested for both elbow selections; no extra Resume click in this case |
+| Supported right workspace reuse | Actual measured1845 admitted in fixed inward1834..1867 in two physical runs; q0 remains independent |
+| Useful repeated physical movement | Not demonstrated in Packet11: positive22/negative11 target offsets reached servo Goal readback, both measured0 |
+| Physical ordinary re-jog/reattach | Not exercised because the first-leg response gate stopped each run |
+| Purpose-specific next Start | Not exercised; read-only preflight currently cannot reach the Pi |
+| Available idle | Known stopped cleanup and three services verified after actual06; present connectivity is unavailable |
+
+Initial qualification and real expiry, blur, disconnect, explicit Pause/Stop or
+ownership loss still require explicit Resume and a new gesture. Original250ms
+native expiry,90-second Live deadline, local sensing, rate/current/motion guards
+and eleven held Goals remain. Service startup never starts or replays motors.
+The earlier Packet10/09 sections below are historical at their own versions;
+Packet11 replaces only their ordinary-release and shifted-next-Start instructions
+within the new supported admission. Durability retains its software meaning.
+
 ## AM1-LIVE-ARMS-10: one selected live elbow
 
 The [Packet10 guide](live-arms-10.md) records the implemented left/right choice,
