@@ -298,6 +298,18 @@ class AM1LocalControl:
                     goal_write_started_at_monotonic_s=actual["write_started_at_monotonic_s"],
                     goal_write_completed_at_monotonic_s=actual["write_completed_at_monotonic_s"],
                     goal_action_sequence=self.accepted_action_sequence)
+                if original is not None:
+                    # Historical input receipt only: expiry still clears the current
+                    # write proof and this record never qualifies a later action.
+                    self._live_summary["last_successful_write"] = {
+                        "version": 1, "provenance": "native-encoded-goal-helper-return/historical",
+                        **self.binding, **owner, "joint": self.live_spec.joint, "side": self.live_spec.side,
+                        "epoch": actual["epoch"], "intent_revision": actual["intent_revision"],
+                        "grant_id": original["grant_id"], "last_input_seq": original["seq"],
+                        "valid_until_monotonic_s": original["valid_until_monotonic_s"],
+                        "accepted_target_norm": self._live_summary["accepted_target_norm"],
+                        **{key: self._live_summary[key] for key in AM1_LIVE_WRITE_PROOF_FIELDS},
+                    }
             if self.selected_evidence is not None:
                 self.selected_evidence.live_action(robot, self._live_summary)
         return accepted

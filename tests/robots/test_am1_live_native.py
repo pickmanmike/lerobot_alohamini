@@ -923,3 +923,214 @@ def test_owned_body_zero_cleanup_is_closed_and_never_admits_unqualified_or_forei
         with pytest.raises(RuntimeError):control.apply(robot, command)
     else:assert not control.apply(robot, command)
     assert len(robot.events) == before
+
+
+# Historical returned-write evidence is never current active qualification.
+HISTORICAL_WRITE_KEYS = {
+    "version", "provenance", "run_id", "host_incarnation", "service_incarnation",
+    "controller_generation", "connection_generation", "joint", "side", "epoch",
+    "intent_revision", "grant_id", "last_input_seq", "valid_until_monotonic_s",
+    "accepted_target_norm", *host.AM1_LIVE_WRITE_PROOF_FIELDS,
+}
+
+
+def expected_historical_write(control, owner, original, actual):
+    return {
+        "version": 1, "provenance": "native-encoded-goal-helper-return/historical",
+        **control.binding, **owner, "joint": control.live_spec.joint,
+        "side": control.live_spec.side, "epoch": actual["epoch"],
+        "intent_revision": actual["intent_revision"], "grant_id": original["grant_id"],
+        "last_input_seq": original["seq"], "valid_until_monotonic_s": original["valid_until_monotonic_s"],
+        "accepted_target_norm": control.accepted_action[control.live_spec.joint],
+        "encoded_goal_raw": actual["expected_goal_raw"], "goal_write_returned": True,
+        "goal_write_started_at_monotonic_s": actual["write_started_at_monotonic_s"],
+        "goal_write_completed_at_monotonic_s": actual["write_completed_at_monotonic_s"],
+        "goal_action_sequence": actual["action_sequence"],
+    }
+
+
+def test_historical_write_real_right_expiry_retains_bound_success_without_current_proof(monkeypatch):
+    obj, control, now, identity, owner, writes = native_right_ready(monkeypatch)
+    original = right_sample(target=-13.488245931283899)
+    now[0] = 10.1
+    assert control.apply(obj, frame(identity, owner, sequence=2, mode="active", epoch=2, sample=original))
+    actual = copy.deepcopy(obj._am1_selected_joint_action)
+    expected = expected_historical_write(control, owner, original, actual)
+    assert actual["sync_write_returned"] is True and expected["encoded_goal_raw"] == 1815
+    now[0] = 10.26
+    assert control.check_live(obj)
+    expired = control.live_snapshot()
+    assert expired["state"] == "expired" and control.state == "paused"
+    assert not (set(host.AM1_LIVE_WRITE_PROOF_FIELDS) & set(expired))
+    assert expired["last_successful_write"] == expected
+    assert set(expired["last_successful_write"]) == HISTORICAL_WRITE_KEYS
+    assert expired["hold_completed_at_monotonic_s"] >= original["valid_until_monotonic_s"]
+    # Consumer mutation cannot alter the host's retained historical receipt.
+    expired["last_successful_write"]["encoded_goal_raw"] = -1
+    assert control.live_snapshot()["last_successful_write"] == expected
+
+
+@pytest.mark.parametrize("recipe,key,side", [
+    ("physical-live-left-elbow", KEY, "left"), (RIGHT_RECIPE, RIGHT_KEY, "right"),
+])
+def test_historical_write_both_recipes_use_verified_selected_return(monkeypatch, recipe, key, side):
+    now, identity, owner, control, obj = lane() if side == "left" else right_lane()
+    assert control.live_spec.recipe == recipe
+    original_send = obj.send_action
+
+    def returned(action):
+        result = original_send(action)
+        obj._am1_selected_joint_action = {
+            **obj._am1_live_action_binding, "side": side, "motor": key.removesuffix(".pos"),
+            "expected_goal_raw": 1900, "sync_write_returned": True,
+            "write_started_at_monotonic_s": now[0], "write_completed_at_monotonic_s": now[0],
+        }
+        return result
+
+    monkeypatch.setattr(obj, "send_action", returned)
+    assert control.apply(obj, frame(identity, owner, sequence=1))
+    original = sample() if side == "left" else right_sample()
+    now[0] = 10.1
+    assert control.apply(obj, frame(identity, owner, sequence=2, mode="active", epoch=2, sample=original))
+    expected = expected_historical_write(control, owner, original, obj._am1_selected_joint_action)
+    now[0] = 10.26
+    assert control.check_live(obj)
+    summary = control.live_snapshot()
+    assert summary["last_successful_write"] == expected
+    assert summary["last_successful_write"]["joint"] == key
+    assert summary["state"] == "expired"
+    assert not (set(host.AM1_LIVE_WRITE_PROOF_FIELDS) & set(summary))
+
+
+@pytest.mark.parametrize("bad", ["stale", "wrong_joint", "wrong_sequence", "failed_write", "foreign_host"])
+def test_historical_write_unmatched_new_attempt_cannot_relabel_previous_success(monkeypatch, bad):
+    obj, control, now, identity, owner, writes = native_right_ready(monkeypatch)
+    original = right_sample(target=-13.488245931283899)
+    now[0] = 10.1
+    assert control.apply(obj, frame(identity, owner, sequence=2, mode="active", epoch=2, sample=original))
+    expected = expected_historical_write(control, owner, original, copy.deepcopy(obj._am1_selected_joint_action))
+    original_send = obj.send_action
+
+    def unmatched(action):
+        if bad == "stale":
+            return dict(action)
+        result = original_send(action)
+        field, value = {
+            "wrong_joint": ("joint", LEFT_KEY), "wrong_sequence": ("action_sequence", 2),
+            "failed_write": ("sync_write_returned", False), "foreign_host": ("host_incarnation", str(uuid4())),
+        }[bad]
+        obj._am1_selected_joint_action[field] = value
+        return result
+
+    monkeypatch.setattr(obj, "send_action", unmatched)
+    now[0] = 10.15
+    newer = right_sample(seq=2, expiry=10.4, target=-13.488245931283899)
+    assert control.apply(obj, frame(identity, owner, sequence=3, mode="active", epoch=2, sample=newer))
+    current = control.live_snapshot()
+    assert current["grant_id"] == newer["grant_id"]
+    assert not (set(host.AM1_LIVE_WRITE_PROOF_FIELDS) & set(current))
+    assert current["last_successful_write"] == expected
+    now[0] = 10.41
+    assert control.check_live(obj)
+    assert control.live_snapshot()["last_successful_write"] == expected
+
+
+def test_historical_write_prewrite_expiry_never_creates_success(monkeypatch):
+    obj, control, now, identity, owner, writes = native_right_ready(monkeypatch)
+    original_read = obj._read_arm_positions
+
+    def delayed(*args, **kwargs):
+        result = original_read(*args, **kwargs)
+        now[0] = 10.26
+        return result
+
+    monkeypatch.setattr(obj, "_read_arm_positions", delayed)
+    now[0] = 10.1
+    assert not control.apply(obj, frame(identity, owner, sequence=2, mode="active", epoch=2,
+                                      sample=right_sample(target=-13.488245931283899)))
+    summary = control.live_snapshot()
+    assert summary["state"] == "expired"
+    assert not [row for row in writes if row[0] == 42]
+    assert "last_successful_write" not in summary
+    assert not (set(host.AM1_LIVE_WRITE_PROOF_FIELDS) & set(summary))
+
+
+def test_historical_write_pause_readiness_preserve_history_until_fresh_success(monkeypatch):
+    obj, control, now, identity, owner, writes = native_right_ready(monkeypatch)
+    now[0] = 10.1
+    original = right_sample(target=-13.488245931283899)
+    assert control.apply(obj, frame(identity, owner, sequence=2, mode="active", epoch=2, sample=original))
+    expected = expected_historical_write(control, owner, original, copy.deepcopy(obj._am1_selected_joint_action))
+    admission = {k: control.live_snapshot()[k] for k in
+                 ("reference_norm", "corridor_min_norm", "corridor_max_norm", "live_deadline_monotonic_s")}
+    now[0] = 10.26
+    assert control.check_live(obj)
+    assert control.apply(obj, frame(identity, owner, sequence=3, epoch=3, revision=1))
+    assert control.live_snapshot()["last_successful_write"] == expected
+    now[0] = 10.3
+    assert control.apply(obj, frame(identity, owner, sequence=4, mode="active", epoch=4, revision=1))
+    ready = control.live_snapshot()
+    assert ready["state"] == "awaiting_input"
+    assert ready["last_successful_write"] == expected
+    # Readiness may perform a real measured-hold write, but is not a new input receipt.
+    assert {k: ready[k] for k in admission} == admission
+    now[0] = 10.31
+    fresh = right_sample(seq=2, expiry=10.55, target=-12.0)
+    assert control.apply(obj, frame(identity, owner, sequence=5, mode="active", epoch=4, revision=1, sample=fresh))
+    changed = control.live_snapshot()
+    assert changed["last_successful_write"] == expected_historical_write(
+        control, owner, fresh, obj._am1_selected_joint_action)
+    assert changed["last_successful_write"]["goal_action_sequence"] == 5
+    assert {k: changed[k] for k in admission} == admission
+
+
+def test_historical_write_executor_expired_evidence_carries_receipt_after_hold(monkeypatch):
+    import time
+
+    from examples.alohamini.am1_session_contract import RECIPES
+    from tests.robots.test_am1_physical_executor import executor, until
+
+    io = ExecutorNativeHost()
+    original_send = io.robot.send_action
+
+    def returned(action):
+        result = original_send(action)
+        binding = getattr(io.robot, "_am1_live_action_binding", None)
+        if binding:
+            io.robot._am1_selected_joint_action = {
+                **binding, "side": "left", "motor": "arm_left_elbow_flex", "expected_goal_raw": 1900,
+                "sync_write_returned": True, "write_started_at_monotonic_s": time.monotonic(),
+                "write_completed_at_monotonic_s": time.monotonic(),
+            }
+        return result
+
+    monkeypatch.setattr(io.robot, "send_action", returned)
+    e = executor(io)
+    recipe = RECIPES["physical-live-left-elbow"]
+    e.bind_run(str(uuid4()), recipe)
+    identity = {"run_id": e.run_id, "host_incarnation": e.host_incarnation,
+                "service_incarnation": str(uuid4()), "controller_generation": str(uuid4()),
+                "connection_generation": str(uuid4()), "intent_revision": 0}
+    e.bind_control(**identity)
+    e.begin(recipe)
+    try:
+        until(lambda: e.evidence()["lifecycle"]["phase"] == "live")
+        assert e.dispatch(recipe)
+        until(lambda: e.evidence()["active_acknowledged"])
+        expiry, grant = time.monotonic() + .25, str(uuid4())
+        assert e.apply({KEY: -2}, valid_until_monotonic_s=expiry, grant_id=grant, seq=1, **identity)
+        until(lambda: e.evidence()["live_input"]["state"] == "active")
+        until(lambda: e.evidence()["live_input"]["state"] == "expired")
+        historical = e.evidence()["live_input"]["last_successful_write"]
+        assert historical["grant_id"] == grant and historical["valid_until_monotonic_s"] == expiry
+        assert historical["run_id"] == e.run_id and historical["host_incarnation"] == e.host_incarnation
+        until(lambda: e.sample["ack"]["live_input"]["state"] == "held")
+        retained = e.evidence()
+        assert retained["active_acknowledged"] is False
+        assert retained["live_input"]["state"] == "expired"
+        assert retained["live_input"]["last_successful_write"] == historical
+        assert not (set(host.AM1_LIVE_WRITE_PROOF_FIELDS) & set(retained["live_input"]))
+    finally:
+        e.finish("stopped")
+        e.worker.join(2)
+        assert not e.worker.is_alive()
