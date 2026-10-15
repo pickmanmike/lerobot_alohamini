@@ -496,6 +496,11 @@ class _AM1PostHomeReadiness:
         self.offset = self.minimum = self.maximum = 0
         self.step_sign = self.direction_steps = 0
         self.bounded = True
+        self.acquisition: tuple[int, float, int, int] | None = None
+        self.stationary_records: list[dict[str, Any]] = []
+        self.stationary_minimum = self.stationary_maximum = self.stationary_offset = 0
+        self.whole_max_abs_velocity = 0
+        self.initial_settling_exception_used = False
 
     def observe(self, record: dict[str, Any], now: float) -> None:
         stamp = float(record["sample_monotonic_s"])
@@ -534,29 +539,58 @@ class _AM1PostHomeReadiness:
                 or all(value < -STILL_VELOCITY_RAW for value in velocities)
             ):
                 self.monitor.refuse(record, "post_home: persistent velocity or Moving evidence.")
-        # Disqualifiers apply to the whole phase, including a final in-flight
-        # read. Neither candidate resets nor later quiet samples erase them.
-        self.bounded = self.bounded and (
-            self.maximum - self.minimum <= STATIONARY_POSITION_TOLERANCE_RAW
-            and abs(self.offset) <= STATIONARY_POSITION_TOLERANCE_RAW
-            and abs(velocity) <= STATIONARY_REPORTED_VELOCITY_LIMIT_RAW
-        )
+        self.whole_max_abs_velocity = max(self.whole_max_abs_velocity, abs(velocity))
+        if self.acquisition is None:
+            # Only the demonstrated FIRST +100 settling indication can enter
+            # this fallback above the existing50 bound. Strict quiet is unchanged.
+            initial_settling = not self.records and velocity == 100
+            self.initial_settling_exception_used |= initial_settling
+            self.bounded = self.bounded and (
+                abs(velocity) <= STATIONARY_REPORTED_VELOCITY_LIMIT_RAW or initial_settling
+            )
+            if moving == 0 and abs(velocity) <= STILL_VELOCITY_RAW and stamp <= self.deadline:
+                # Freeze once; later candidate resets cannot replace this origin.
+                self.acquisition = (position, stamp, len(self.records) + 1, self.offset)
+        if self.acquisition is not None:
+            self.stationary_offset = self.offset - self.acquisition[3]
+            self.stationary_minimum = min(self.stationary_minimum, self.stationary_offset)
+            self.stationary_maximum = max(self.stationary_maximum, self.stationary_offset)
+            # Include a final in-flight read in sticky disqualification, but
+            # never count an after-deadline reply as eligible stationary evidence.
+            self.bounded = self.bounded and (
+                self.stationary_maximum - self.stationary_minimum <= STATIONARY_POSITION_TOLERANCE_RAW
+                and abs(self.stationary_offset) <= STATIONARY_POSITION_TOLERANCE_RAW
+                and abs(velocity) <= STATIONARY_REPORTED_VELOCITY_LIMIT_RAW
+            )
+            if stamp <= self.deadline:
+                self.stationary_records.append(record)
         if stamp <= self.deadline:
             self.records.append(record)
 
     def evidence(self) -> dict[str, Any]:
         return {
-            "readiness_policy": "am1-post-home-v1",
+            "readiness_policy": "am1-post-home-first-quiet-v2",
+            "readiness_policy_version": 2,
             "am1_post_home_origin_raw": self.origin,
+            "stationary_acquisition_origin_raw": None if self.acquisition is None else self.acquisition[0],
+            "stationary_acquisition_at_monotonic_s": None if self.acquisition is None else self.acquisition[1],
+            "stationary_acquisition_sample_index": None if self.acquisition is None else self.acquisition[2],
+            "whole_phase_sample_count": len(self.records),
+            "whole_phase_max_abs_velocity_raw": self.whole_max_abs_velocity,
+            "whole_phase_present_position_raw": [int(row["present_position_raw"]) for row in self.records],
+            "whole_phase_present_velocity_raw": [int(row["present_velocity_raw"]) for row in self.records],
+            "whole_phase_moving": [int(row["moving"]) for row in self.records],
+            "initial_settling_exception_used": self.initial_settling_exception_used,
+            "bounded_indicator_eligible": self.bounded,
             "whole_phase_position_excursion_raw": self.maximum - self.minimum,
             "whole_phase_position_drift_raw": self.offset,
             "readiness_deadline_monotonic_s": self.deadline,
         }
 
     def qualify_bounded(self, now: float) -> dict[str, Any] | None:
-        if not self.bounded or len(self.records) < 5:
+        if not self.bounded or self.acquisition is None or len(self.stationary_records) < 5:
             return None
-        first, last = self.records[0], self.records[-1]
+        first, last = self.stationary_records[0], self.stationary_records[-1]
         window = last["sample_monotonic_s"] - first["sample_monotonic_s"]
         if window < 4 * POLL_S or now - last["sample_monotonic_s"] > POLL_S + 1e-9:
             return None
@@ -564,18 +598,18 @@ class _AM1PostHomeReadiness:
             **self.evidence(),
             "readiness_branch": "bounded_indicator",
             "motion_feedback_quiet": False,
-            "sample_count": len(self.records),
+            "sample_count": len(self.stationary_records),
             "window_s": round(window, 3),
             "position_resolution_raw": 4096,
             "position_tolerance_raw": STATIONARY_POSITION_TOLERANCE_RAW,
-            "position_origin_raw": self.origin,
+            "position_origin_raw": self.acquisition[0],
             "position_offsets_raw": [
-                _position_delta(self.origin, int(row["present_position_raw"])) for row in self.records
+                _position_delta(self.acquisition[0], int(row["present_position_raw"])) for row in self.stationary_records
             ],
-            "position_excursion_raw": self.maximum - self.minimum,
-            "position_drift_raw": self.offset,
-            "present_velocity_raw": [int(row["present_velocity_raw"]) for row in self.records],
-            "moving": [int(row["moving"]) for row in self.records],
+            "position_excursion_raw": self.stationary_maximum - self.stationary_minimum,
+            "position_drift_raw": self.stationary_offset,
+            "present_velocity_raw": [int(row["present_velocity_raw"]) for row in self.stationary_records],
+            "moving": [int(row["moving"]) for row in self.stationary_records],
             "expected_torque": 1,
             "expected_goal_velocity_raw": 0,
         }
