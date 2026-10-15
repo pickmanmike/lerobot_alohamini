@@ -285,8 +285,11 @@ def test_production_host_ipc_expiry_retains_same_run_and_new_intent_resumes(reci
         peer.client.send_action(frame(peer.identity, owner, sequence=1))
         _, initial = receive_feedback(peer, lambda m: m.get("live_input", {}).get("state") == "held")
         expiry = time.monotonic() + .25
-        target = sample(expiry=expiry, target=direction * .5)
-        target["target"] = {joint: direction * .5}
+        value = initial["live_input"]
+        target_norm = value["cursor_norm"] + direction * .5
+        assert value["corridor_min_norm"] <= target_norm <= value["corridor_max_norm"]
+        target = sample(expiry=expiry, target=target_norm)
+        target["target"] = {joint: target_norm}
         peer.client.send_action(frame(peer.identity, owner, sequence=2, mode="active", epoch=2, sample=target))
         _, active = receive_feedback(peer, lambda m: m.get("live_input", {}).get("state") == "active")
         assert active["live_input"]["valid_until_monotonic_s"] == expiry
@@ -295,8 +298,11 @@ def test_production_host_ipc_expiry_retains_same_run_and_new_intent_resumes(reci
         peer.client.send_action(frame(peer.identity, owner, sequence=3, epoch=3, revision=1))
         _, held = receive_feedback(peer, lambda m: m.get("epoch") == 3 and m.get("state") == "paused")
         assert held["live_input"]["live_deadline_monotonic_s"] == initial["live_input"]["live_deadline_monotonic_s"]
+        cursor = held["live_input"]
+        fresh_target = max(cursor["corridor_min_norm"], min(cursor["corridor_max_norm"],
+                                                        cursor["cursor_norm"] + direction))
         peer.client.send_action(frame(peer.identity, owner, sequence=4, mode="active", epoch=4, revision=1,
-                                      sample={"target": {joint: direction}, "grant_id": str(uuid4()), "seq": 2,
+                                      sample={"target": {joint: fresh_target}, "grant_id": str(uuid4()), "seq": 2,
                                               "valid_until_monotonic_s": time.monotonic() + .25}))
         assert receive_feedback(peer, lambda m: m.get("epoch") == 4 and m.get("state") == "active")
 
