@@ -16,6 +16,15 @@ class AM1SessionTransport {
       || value.rate_norm_per_s<=0 || value.rate_norm_per_s>1)return null;
     return value;
   }
+  supportedWorkspace(spec) {
+    const w=spec?.supported_workspace,keys=["version","id","context_sha256","evidence_min_raw","evidence_max_raw","command_min_raw","command_max_raw","command_min_norm","command_max_norm","span_norm","requires_current_admission"];
+    if(spec?.side!=="right"||!w||typeof w!=="object"||Object.keys(w).length!==keys.length||keys.some(key=>!Object.hasOwn(w,key))
+      ||w.version!==1||w.id!=="am1-right-elbow-retained-v1"||typeof w.context_sha256!=="string"||!/^[0-9a-f]{64}$/.test(w.context_sha256)||w.requires_current_admission!==true
+      ||![w.evidence_min_raw,w.evidence_max_raw,w.command_min_raw,w.command_max_raw].every(Number.isInteger)||w.evidence_min_raw>w.command_min_raw||w.command_min_raw>=w.command_max_raw||w.command_max_raw>w.evidence_max_raw
+      ||![w.command_min_norm,w.command_max_norm,w.span_norm].every(value=>typeof value==="number"&&Number.isFinite(value))
+       ||w.command_min_norm>=w.command_max_norm||w.span_norm<=0||w.span_norm>3||Math.abs(w.command_max_norm-w.command_min_norm-w.span_norm)>1e-9)return null;
+    return w;
+  }
   static outcomeText(run) {
     const outcome=run?.execution?.positive_control;
     if(run?.source!=="protected-physical-provider" || !["physical-left-elbow-positive-control","physical-left-elbow-experiment"].includes(run.recipe) || run.status!=="completed" ||
@@ -28,10 +37,11 @@ class AM1SessionTransport {
     this.control=false; this.controllerGeneration=null; this.connection=null; this.held=new Set();
     this.pending=new Map(); this.seq=0; this.socket=null; this.inputBusy=false; this.epoch=0; this.intent=0;
     this.reportingError=null;
-    this.elbowJog=0;this.elbowCursor=null;this.elbowBinding=null;this.elbowAt=null;this.elbowReleasedRevision=null;this.liveInputs=new Set();this.liveResume=null;
+    this.elbowJog=0;this.elbowCursor=null;this.elbowBinding=null;this.elbowAt=null;this.elbowReleasedRevision=null;this.liveInputs=new Set();this.liveResume=null;this.elbowGesture=null;this.elbowRelease=null;this.elbowStrict=false;
     this.reconnectTimer=null;this.detached=false;this.initialization=0;
   }
   clear(reason="disconnected") {
+    if(this.isLiveElbow())this.elbowStrict=true;this.elbowRelease=null;
     this.epoch++; this.intent++; this.held.clear(); this.connection=null; this.controllerGeneration=null; this.seq=0;
     for(const p of this.pending.values()) p.reject(Error(reason));
     this.pending.clear(); this.inputBusy=false;this.liveResume=null;this.clearGesture();this.elbowReleasedRevision=null;this.liveInputs.clear();
@@ -106,18 +116,20 @@ class AM1SessionTransport {
         const value=JSON.parse(event.data);
         if(value.kind==="snapshot") {
           this.reportingError=null;
-          const previous=this.snapshot?.run,next=value.snapshot.run;
+          const previous=this.snapshot?.run,next=value.snapshot.run,ownRearm=this.expectedRearmSnapshot(value.snapshot),ownRelease=this.expectedElbowRelease(value.snapshot);
+          const keepGesture=ownRearm?this.liveResume?.gesture:ownRelease&&this.elbowGesture?.release===this.elbowRelease&&this.rearmGestureCurrent(this.elbowGesture)?this.elbowGesture:null;
           if(previous?.run_id!==next?.run_id || previous?.recipe!==next?.recipe || previous?.intent_revision!==next?.intent_revision) {
-            this.intent++;this.clearGesture();
+            this.intent++;if(!ownRearm&&!ownRelease){this.elbowRelease=null;if(this.isLiveElbow())this.elbowStrict=true;}this.clearGesture(false,keepGesture);
             if(previous?.run_id!==next?.run_id)this.elbowReleasedRevision=null;
           }
           this.snapshot=value.snapshot;
+          if(next?.first_cause||next?.native_first_cause||this.snapshot.evidence?.fault){this.clearGesture(true);this.liveResume=null;}
           if(value.revision) {ws.send(JSON.stringify({ack:value.revision}));this.connected=true;this.cancelReconnect();}
           const controller=this.snapshot.controller;
           if(this.controllerGeneration && (controller?.device_id!==this.device || controller.controller_generation!==this.controllerGeneration))
             this.clear("Controller generation changed");
           if(controller?.device_id!==this.device) {this.clearGesture();this.connection=null;}
-          if(this.isLiveElbow() && next?.status!=="running")this.clearGesture();
+          if(this.isLiveElbow() && next?.status!=="running"){if(!ownRearm&&!ownRelease){this.elbowStrict=true;this.elbowRelease=null;}this.clearGesture(false,keepGesture);}
           this.render(this);
         } else if(value.kind==="result") {
           const pending=this.pending.get(value.id);if(pending){this.pending.delete(value.id);pending.resolve(value);}
@@ -264,27 +276,29 @@ class AM1SessionTransport {
     const result=await this.command({op:"resume",...this.identities(),expected_intent_revision:revision,operation_id:crypto.randomUUID()});
     if(current())this.render(this,result.reason);return result;
   }
-  async resumeLiveElbow() {
-    this.clearGesture(true);this.intent++;
+  async resumeLiveElbow(gesture=null) {
+    const automatic=gesture!==null,origin=automatic?this.elbowRelease?.revision:null;
+    if(automatic&&(!this.rearmGestureCurrent(gesture)||!this.rearmReady()))return {accepted:false,status:"superseded"};
+    this.clearGesture(!automatic,gesture);this.intent++;
     const epoch=this.epoch,ids=Object.freeze(this.identities()),recipe=this.snapshot.run.recipe,initial=this.snapshot.run.intent_revision,revision=initial+1;
-    const token=this.liveResume={};
-    const current=connected=>this.liveResume===token && this.connected && epoch===this.epoch
+    const bounds=this.elbowBounds(),token=this.liveResume={gesture,ids,recipe,initial,phase:"connect",origin,bounds};
+    const current=connected=>this.liveResume===token && (!automatic||this.rearmGestureCurrent(gesture)) && this.connected && epoch===this.epoch
       && this.controllerGeneration===ids.controller_generation && this.snapshot?.service_incarnation===ids.service_incarnation
-      && this.snapshot?.run?.run_id===ids.run_id && this.snapshot.run.recipe===recipe && this.snapshot.run.backend_incarnation===ids.host_incarnation
+      && this.snapshot?.run?.run_id===ids.run_id && this.snapshot.run.recipe===recipe && this.snapshot.run.backend_incarnation===ids.host_incarnation && this.sameElbowBounds(this.snapshot,bounds)
       && (connected ? this.connection===token.connection && this.snapshot.run.intent_revision===revision && this.snapshot.run.status==="paused"
         : [initial,revision].includes(this.snapshot.run.intent_revision) && ["running","paused","resuming"].includes(this.snapshot.run.status));
     try {
-      const connected=await this.command({op:"connect",...ids});
+      const connected=await this.command({op:"connect",...ids,...(automatic?{rearm_of_intent_revision:origin}:{})});
       if(!current(false))return connected;
       if(!connected.accepted){this.render(this,connected.reason);return connected;}
       const view=connected.snapshot,run=view?.run;
       if(typeof connected.connection_generation!=="string" || !connected.connection_generation
         || view?.service_incarnation!==ids.service_incarnation || run?.run_id!==ids.run_id || run.backend_incarnation!==ids.host_incarnation
-        || run.intent_revision!==revision || run.status!=="paused" || view.controller?.device_id!==this.device
+        || run.intent_revision!==revision || run.status!=="paused" || !this.sameElbowBounds(view,bounds) || view.controller?.device_id!==this.device
         || view.controller.controller_generation!==ids.controller_generation)throw Error("Physical connection outcome differs; inspect current status");
-      this.connection=connected.connection_generation;token.connection=this.connection;Object.freeze(token);this.seq=0;
+      this.connection=connected.connection_generation;token.connection=this.connection;token.phase="qualify";this.seq=0;
       if(this.snapshot.run.intent_revision<revision)this.snapshot=view;
-      const released=await this.command({op:"release_input",...this.identities()});
+      const released=await this.command({op:"release_input",...this.identities(),...(automatic?{rearm_of_intent_revision:origin}:{})});
       if(!current(true) || !released.accepted)return released;
       const qualified=()=>{
         const evidence=this.snapshot.evidence,value=this.snapshot.run.live_input;
@@ -292,7 +306,7 @@ class AM1SessionTransport {
           && evidence.acknowledged_intent_revision===revision && value?.cursor_intent_revision===revision
           && Number.isInteger(value.cursor_feedback_sequence) && value.cursor_feedback_sequence>=0;
       };
-      const until=performance.now()+3000;
+      const until=automatic?gesture.until:performance.now()+3000;
       while(current(true) && !qualified() && performance.now()<until)await new Promise(resolve=>setTimeout(resolve,50));
       if(!current(true))return released;
       if(!qualified()) {
@@ -300,25 +314,91 @@ class AM1SessionTransport {
         this.render(this,result.reason);return result;
       }
       // Freeze this connection's revision. Any later Pause/Stop is refused by Core even if its snapshot is delayed.
-      const result=await this.command({op:"resume",...this.identities(),expected_intent_revision:revision,operation_id:crypto.randomUUID()});
+      token.phase="resume";
+      const result=await this.command({op:"resume",...this.identities(),expected_intent_revision:revision,operation_id:crypto.randomUUID(),...(automatic?{rearm_of_intent_revision:origin}:{})});
+      const resumed=()=>this.liveResume===token&&this.connected&&epoch===this.epoch&&this.controllerGeneration===ids.controller_generation
+        &&this.connection===token.connection&&this.snapshot?.service_incarnation===ids.service_incarnation&&this.snapshot?.run?.run_id===ids.run_id
+        &&this.snapshot.run.recipe===recipe&&this.snapshot.run.backend_incarnation===ids.host_incarnation
+        &&this.snapshot.run.intent_revision===initial+2&&this.snapshot.run.status==="running";
+      if(automatic&&result.accepted){
+        const active=()=>resumed()&&this.snapshot.evidence?.native_ack===true&&this.snapshot.evidence.acknowledged_intent_revision===initial+2&&this.snapshot.run.live_input?.cursor_intent_revision===initial+2;
+        while(this.rearmGestureCurrent(gesture)&&this.liveResume===token&&!active()&&performance.now()<until)await new Promise(resolve=>setTimeout(resolve,50));
+        if(active()&&this.rearmGestureCurrent(gesture)){
+          this.elbowStrict=false;this.elbowRelease=null;gesture.phase="active";clearTimeout(gesture.timer);this.setElbowJog(gesture.direction);
+        }
+      }else if(!automatic&&result.accepted&&this.liveResume===token&&epoch===this.epoch&&(current(true)||resumed()))this.elbowStrict=false;
       if(this.liveResume===token && epoch===this.epoch)this.render(this,result.reason);return result;
     } finally {if(this.liveResume===token)this.liveResume=null;}
   }
   isLiveElbow() {return Object.hasOwn(AM1SessionTransport.liveElbows,this.snapshot?.run?.recipe) && this.snapshot.run.source==="protected-physical-provider";}
-  clearGesture(block=false) {
+  clearGesture(block=false,keepGesture=null) {
+    if(this.elbowGesture!==keepGesture){if(this.elbowGesture)clearTimeout(this.elbowGesture.timer);this.elbowGesture=null;}
+    if(block){if(this.isLiveElbow())this.elbowStrict=true;this.elbowRelease=null;}
     this.held.clear();this.elbowJog=0;this.elbowCursor=null;this.elbowBinding=null;this.elbowAt=null;
     if(block)this.liveResume=null;
     if(block && this.isLiveElbow())this.elbowReleasedRevision=this.snapshot.run.intent_revision;
   }
   elbowInput() {
     const run=this.snapshot?.run,value=run?.live_input,spec=this.liveElbowSpec();
-    if(!spec || !this.isLiveElbow() || !this.connected || !this.control || !this.controllerGeneration || !this.connection || run.status!=="running"
+    if(this.elbowStrict || !spec || !this.isLiveElbow() || !this.connected || !this.control || !this.controllerGeneration || !this.connection || run.status!=="running"
       || !Number.isInteger(run.intent_revision) || value?.joint!==spec.joint || value.side!==spec.side || value.profile!==spec.profile || value.rate_norm_per_s!==spec.rate_norm_per_s || value.cursor_intent_revision!==run.intent_revision
       || !Number.isInteger(value.cursor_feedback_sequence) || value.cursor_feedback_sequence<0
       || [value.cursor_norm,value.reference_norm,value.corridor_min_norm,value.corridor_max_norm].some(x=>typeof x!=="number" || !Number.isFinite(x))
       || value.corridor_min_norm>=value.corridor_max_norm || typeof run.backend_incarnation!=="string"
       || this.elbowReleasedRevision!==null && run.intent_revision<=this.elbowReleasedRevision)return null;
     return value;
+  }
+  elbowBounds(snapshot=this.snapshot) {
+    const run=snapshot?.run,v=run?.live_input,w=v?.workspace;
+    return Object.freeze({joint:v?.joint,reference_norm:v?.reference_norm,corridor_min_norm:v?.corridor_min_norm,corridor_max_norm:v?.corridor_max_norm,
+      deadline:run?.deadline,native_live_at:run?.native_live_at,admission_version:v?.admission_version,workspace_id:w?.id,workspace_context_sha256:w?.context_sha256,
+      workspace_min_raw:w?.evidence_min_raw,workspace_max_raw:w?.evidence_max_raw,corridor_min_raw:v?.corridor_min_raw,corridor_max_raw:v?.corridor_max_raw,measured_origin_raw:v?.measured_origin_raw});
+  }
+  sameElbowBounds(snapshot,bounds) {const current=this.elbowBounds(snapshot);return Object.entries(bounds).every(([key,value])=>current[key]===value);}
+  sameElbowContext(ids,recipe,connection=ids.connection_generation) {
+    const run=this.snapshot?.run;return this.connected&&this.control&&this.controllerGeneration===ids.controller_generation&&this.connection===connection
+      &&this.snapshot?.service_incarnation===ids.service_incarnation&&run?.run_id===ids.run_id&&run.recipe===recipe&&run.backend_incarnation===ids.host_incarnation
+      &&this.snapshot.controller?.device_id===this.device&&this.snapshot.controller.controller_generation===this.controllerGeneration;
+  }
+  expectedElbowRelease(snapshot) {
+    const r=this.elbowRelease,run=snapshot?.run,value=run?.live_input?.rearm;
+    return Boolean(r&&r.epoch===this.epoch&&this.sameElbowContext(r.ids,r.recipe)&&run?.run_id===r.ids.run_id&&run.recipe===r.recipe
+      &&snapshot.service_incarnation===r.ids.service_incarnation&&run.backend_incarnation===r.ids.host_incarnation&&run.status==="paused"&&run.intent_revision===r.revision
+      &&value?.eligible===true&&value.released_intent_revision===r.revision&&this.sameElbowBounds(snapshot,r.bounds));
+  }
+  expectedRearmSnapshot(snapshot) {
+    const t=this.liveResume,run=snapshot?.run;if(!t||!run||!this.sameElbowContext(t.ids,t.recipe,t.connection||t.ids.connection_generation)
+      ||snapshot.service_incarnation!==t.ids.service_incarnation||run.run_id!==t.ids.run_id||run.recipe!==t.recipe||run.backend_incarnation!==t.ids.host_incarnation
+      ||snapshot.controller?.device_id!==this.device||snapshot.controller.controller_generation!==t.ids.controller_generation||!this.sameElbowBounds(snapshot,t.bounds))return false;
+    if(t.gesture&&!this.rearmGestureCurrent(t.gesture))return false;
+    if(run.intent_revision===t.initial+1&&run.status==="paused")return !t.gesture||run.live_input?.rearm?.eligible===true&&run.live_input.rearm.released_intent_revision===t.origin;
+    return t.phase==="resume"&&run.intent_revision===t.initial+2&&["running","resuming"].includes(run.status);
+  }
+  rearmReady() {return this.elbowRelease?.accepted===true&&this.expectedElbowRelease(this.snapshot)&&!this.elbowStrict;}
+  rearmGestureCurrent(g) {return this.elbowGesture===g&&g.held&&g.phase==="pending"&&!this.elbowStrict&&g.epoch===this.epoch&&performance.now()<g.until;}
+  canRearmElbow() {
+    const g=this.elbowGesture,r=this.elbowRelease;if(g?.phase==="pending")return this.rearmGestureCurrent(g);
+    return Boolean(r&&!this.elbowStrict&&r.epoch===this.epoch&&this.sameElbowContext(r.ids,r.recipe)
+      &&(this.expectedElbowRelease(this.snapshot)||this.snapshot.run.status==="running"&&this.snapshot.run.intent_revision===r.ids.intent_revision));
+  }
+  pressElbowJog(direction,source) {
+    if(![-1,1].includes(direction)||typeof source!=="string"||this.elbowGesture?.source===source&&this.elbowGesture.held)return false;
+    const active=Boolean(this.elbowInput());if(!active&&!this.canRearmElbow())return false;
+    if(this.elbowGesture)clearTimeout(this.elbowGesture.timer);this.intent++;
+    const gesture=this.elbowGesture={id:crypto.randomUUID(),source,direction,held:true,epoch:this.epoch,phase:active?"active":"pending",release:active?null:this.elbowRelease,until:performance.now()+3000};
+    if(active)return this.setElbowJog(direction);
+    gesture.timer=setTimeout(()=>{if(this.elbowGesture===gesture&&gesture.phase==="pending"){this.releaseInput();this.render(this,"Rearm timed out; release controls and select Resume.");}},3000);
+    gesture.promise=(async()=>{
+      const release=this.elbowRelease;await release?.promise;
+      while(this.rearmGestureCurrent(gesture)&&!this.rearmReady())await new Promise(resolve=>setTimeout(resolve,50));
+      if(this.rearmGestureCurrent(gesture)&&this.rearmReady())await this.resumeLiveElbow(gesture);
+      if(this.elbowGesture===gesture&&gesture.phase==="pending"){await this.releaseInput();this.render(this,"Rearm did not qualify; release controls and select Resume.");}
+    })().catch(()=>{if(this.elbowGesture===gesture)this.releaseInput();});this.render(this);return true;
+  }
+  releaseElbowJog(source,voluntary=false) {
+    const gesture=this.elbowGesture;if(!gesture||gesture.source!==source)return Promise.resolve();
+    const ordinary=voluntary&&gesture.phase==="active"&&Boolean(this.elbowInput());gesture.held=false;
+    return this.releaseInput(ordinary?"voluntary_jog":undefined);
   }
   setElbowJog(direction) {
     const value=this.elbowInput();if(!value || ![-1,1].includes(direction))return false;
@@ -353,10 +433,17 @@ class AM1SessionTransport {
       this.render(this);
     } catch {if(current())this.clearGesture(true);} finally {if(epoch===this.epoch)this.inputBusy=false;}
   }
-  async releaseInput() {
-    this.intent++;this.clearGesture(true);this.render(this);
-    if(this.connected && this.connection && (this.snapshot?.run?.recipe==="fake-interactive" || this.isLiveElbow()))
-      await this.command({op:"release_input",...this.identities()}).catch(()=>{});
+  async releaseInput(kind) {
+    const ordinary=kind==="voluntary_jog"&&this.isLiveElbow()&&Boolean(this.elbowInput()),ids=Object.freeze(this.identities());
+    const release=ordinary?{ids,epoch:this.epoch,recipe:this.snapshot.run.recipe,revision:ids.intent_revision+1,accepted:false,bounds:this.elbowBounds()}:null;
+    this.intent++;this.clearGesture(!ordinary);this.liveResume=null;
+    if(ordinary){this.elbowReleasedRevision=ids.intent_revision;this.elbowRelease=release;this.elbowStrict=false;}this.render(this);
+    if(this.connected && this.connection && (this.snapshot?.run?.recipe==="fake-interactive" || this.isLiveElbow())){
+      const pending=this.command({op:"release_input",...ids,...(ordinary?{release_kind:"voluntary_jog"}:{})}).catch(()=>({accepted:false}));
+      if(release)release.promise=pending;const result=await pending;
+      if(release&&this.elbowRelease===release){release.accepted=result.accepted===true;if(!release.accepted){this.elbowStrict=true;this.elbowRelease=null;}}
+      return result;
+    }
   }
   async input() {
     if(this.isLiveElbow())return this.liveInput();
@@ -423,7 +510,7 @@ globalThis.AM1RemoteInitialize=function() {
       window.addEventListener("pagehide",()=>view.stop());root.append(label,video,status,open,close);
     }
     document.querySelector("#gate-state").textContent=transport.controllerGeneration ? physical ? "Explicit controller; physical Start activates the protected host. Request acceptance is separate from protected-host ACK and measured motion." : "Explicit controller; accepted requests require actual fake acknowledgement." : "Spectator; viewing does not claim input.";
-    document.querySelector("#control-help").textContent=liveElbow ? "Claim input, explicitly Start, then qualify Resume. Hold an elbow jog button or [ / ] to stream current mapped targets. Release, blur or an input gap requires fresh qualified Resume and a new gesture. The original 90-second Live budget continues through holds and reconnects. Other joints remain held; body and lift stay zero. Input acceptance, protected-host ACK and measured movement are separate." : physical ? "Explicitly claim input before physical Start. Start activates the selected bounded recipe through the protected motor host. Viewing, enrollment and reconnection do not start motion. Finite authorization survives browser closure. Pause and Stop remain available to enrolled control-capable spectators. Actual feedback and protected-host ACK are reported separately; an accepted command does not prove joint motion. Body inputs belong to the selected finite recipe. Required camera evidence is validated on Pi; optional P1 viewing is advisory." : defaultControlHelp;
+    document.querySelector("#control-help").textContent=liveElbow ? "Claim input, explicitly Start, then qualify Resume. Hold an elbow jog button or [ / ] to stream current mapped targets. Ordinary release holds position; a new press requests qualified rearm. Blur, expiry or reconnection requires explicit Resume and new input. The original 90-second Live budget continues through holds and reconnects. Other joints remain held; body and lift stay zero. Input acceptance, protected-host ACK and measured movement are separate." : physical ? "Explicitly claim input before physical Start. Start activates the selected bounded recipe through the protected motor host. Viewing, enrollment and reconnection do not start motion. Finite authorization survives browser closure. Pause and Stop remain available to enrolled control-capable spectators. Actual feedback and protected-host ACK are reported separately; an accepted command does not prove joint motion. Body inputs belong to the selected finite recipe. Required camera evidence is validated on Pi; optional P1 viewing is advisory." : defaultControlHelp;
     if(!transport.videoView)document.querySelector("#am1-camera-root").textContent=physical ? "Task camera evidence is validated on Pi; optional P1 viewing is advisory." : "Cameras unavailable · synthetic fake evidence only";
     for(const button of document.querySelectorAll("[data-operation], [data-body-key]")) {
       button.title=physical ? liveElbow ? "Physical live elbow session control" : "Physical finite session control" : "Fake session control";
@@ -447,13 +534,14 @@ globalThis.AM1RemoteInitialize=function() {
       elbow.hidden=!liveElbow && !selectedElbow;
       elbow.querySelector("h2").textContent=selectedElbow ? "Live "+selectedElbow.label.toLowerCase() : "Live elbow";
       for(const button of elbow.querySelectorAll("[data-elbow-jog]")) {
-        button.disabled=!transport.elbowInput();
+        button.disabled=!transport.elbowInput()&&!transport.canRearmElbow();
         const positive=button.dataset.elbowJog==="1",label=selectedElbow?.label || "Elbow";
         button.innerHTML=label+" "+(positive ? "+" : "-")+" <kbd>"+(positive ? "]" : "[")+"</kbd>";
         button.setAttribute("aria-label",label+" "+(positive ? "positive" : "negative")+" jog");
       }
       const measured=transport.snapshot?.evidence?.measured_positions?.[selectedElbow?.joint],cursor=run?.live_input?.cursor_norm;
-      elbow.querySelector("output").textContent=`Measured ${Number.isFinite(measured) ? measured.toFixed(3) : "pending"} · target ${Number.isFinite(transport.elbowCursor) ? transport.elbowCursor.toFixed(3) : Number.isFinite(cursor) ? cursor.toFixed(3) : "pending"} normalized`;
+      const workspace=transport.supportedWorkspace(selectedElbow);
+      elbow.querySelector("output").textContent=!selectionFrozen&&workspace ? `Workspace ${workspace.id} · raw ${workspace.command_min_raw} to ${workspace.command_max_raw} · span ${workspace.span_norm.toFixed(3)} normalized · current admission pending` : `Measured ${Number.isFinite(measured) ? measured.toFixed(3) : "pending"} · target ${Number.isFinite(transport.elbowCursor) ? transport.elbowCursor.toFixed(3) : Number.isFinite(cursor) ? cursor.toFixed(3) : "pending"} normalized · admitted ${Number.isFinite(run?.live_input?.corridor_min_norm) ? run.live_input.corridor_min_norm.toFixed(3) : "pending"} to ${Number.isFinite(run?.live_input?.corridor_max_norm) ? run.live_input.corridor_max_norm.toFixed(3) : "pending"} · run q0 ${Number.isFinite(run?.live_input?.reference_norm) ? run.live_input.reference_norm.toFixed(3) : "pending"}`;
     }
     if(message){notice.textContent=message;notice.hidden=false;}
     document.querySelector("#pairing-panel").hidden=Boolean(transport.device);
@@ -499,14 +587,12 @@ globalThis.AM1RemoteInitialize=function() {
   document.querySelector("#fake-recipe").addEventListener("change",()=>render(transport));
   for(const button of elbow.querySelectorAll("[data-elbow-jog]")) {
     const direction=Number(button.dataset.elbowJog);
-    button.addEventListener("pointerdown",event=>{if(transport.setElbowJog(direction))button.setPointerCapture(event.pointerId);});
-    for(const name of ["pointerup","pointercancel","lostpointercapture"])button.addEventListener(name,()=>{
-      if(transport.elbowJog===direction)transport.releaseInput();
-    });
+    button.addEventListener("pointerdown",event=>{if(transport.pressElbowJog(direction,"pointer:"+event.pointerId+":"+direction))button.setPointerCapture(event.pointerId);});
+    for(const name of ["pointerup","pointercancel","lostpointercapture"])button.addEventListener(name,event=>transport.releaseElbowJog("pointer:"+event.pointerId+":"+direction,name==="pointerup"));
   }
   const typing=target=>target?.closest("input,textarea,select,[contenteditable]");
-  document.addEventListener("keydown",event=> {if(typing(event.target)||event.repeat)return;const key=event.key.toLowerCase();if((key==="[" || key==="]") && transport.setElbowJog(key==="[" ? -1 : 1)){event.preventDefault();return;}if("wasduj".includes(key)&&transport.connection&&transport.snapshot?.run?.recipe==="fake-interactive"){transport.held.add(key);event.preventDefault();}});
-  document.addEventListener("keyup",event=> {const key=event.key.toLowerCase();if(key==="[" || key==="]"){if(transport.elbowJog===(key==="[" ? -1 : 1))transport.releaseInput();return;}if(!"wasduj".includes(key)||transport.snapshot?.run?.recipe!=="fake-interactive")return;transport.held.delete(key);if(!transport.held.size)transport.releaseInput();});
+  document.addEventListener("keydown",event=> {if(typing(event.target)||event.repeat)return;const key=event.key.toLowerCase();if((key==="[" || key==="]") && transport.pressElbowJog(key==="[" ? -1 : 1,"key:"+key)){event.preventDefault();return;}if("wasduj".includes(key)&&transport.connection&&transport.snapshot?.run?.recipe==="fake-interactive"){transport.held.add(key);event.preventDefault();}});
+  document.addEventListener("keyup",event=> {const key=event.key.toLowerCase();if(key==="[" || key==="]"){transport.releaseElbowJog("key:"+key,true);return;}if(!"wasduj".includes(key)||transport.snapshot?.run?.recipe!=="fake-interactive")return;transport.held.delete(key);if(!transport.held.size)transport.releaseInput();});
   for(const button of document.querySelectorAll("[data-body-key]")) {
     if(button.disabled)continue;
     button.addEventListener("pointerdown",event=>{if(transport.connection&&transport.snapshot?.run?.recipe==="fake-interactive"){button.setPointerCapture(event.pointerId);transport.held.add(button.dataset.bodyKey);}});

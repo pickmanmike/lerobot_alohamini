@@ -144,6 +144,7 @@ class AM1LocalControl:
                                   cursor_feedback_sequence=self.observation_id,
                                   cursor_intent_revision=self.intent_revision)
         self.live_cursor_at = self.clock()
+        return measured
 
     def _apply_live(self, robot: AlohaMini, command: dict) -> bool:
         marker = command.get(AM1_LOCAL_CONTROL_KEY)
@@ -222,7 +223,7 @@ class AM1LocalControl:
                 self._live_summary["last_input_seq"] = -1
             self._live_summary["state"] = "held"
             self._clear_live_write_proof()
-            self._refresh_live_cursor(robot)
+            measured = self._refresh_live_cursor(robot)
             if marker["live_admitted"] and "live_admitted_at_monotonic_s" not in self._live_summary:
                 now = self.clock()
                 q0 = self.live_held[self.live_spec.joint]
@@ -230,12 +231,24 @@ class AM1LocalControl:
                 high = q0 + self.live_spec.corridor_max_delta_norm
                 if not -100 <= low <= high <= 100:
                     raise RuntimeError("Live measured origin cannot contain its selected corridor")
-                self._live_summary.update(reference_norm=q0, corridor_min_norm=low,
-                    corridor_max_norm=high, side=self.live_spec.side, label=self.live_spec.label,
+                from examples.alohamini.am1_session_contract import LIVE_ELBOW_WORKSPACES
+                workspace = LIVE_ELBOW_WORKSPACES.get(self.live_spec.recipe)
+                geometry = dict(corridor_min_norm=low, corridor_max_norm=high)
+                if workspace is not None:
+                    if not callable(getattr(robot, "am1_live_workspace_context", None)):
+                        raise RuntimeError("Live workspace actual native context is unavailable")
+                    context, raw = robot.am1_live_workspace_context(
+                        {**self.binding, "recipe": self.live_spec.recipe}, measured)
+                    try:
+                        geometry = workspace.admission(context, raw, q0)
+                    except ValueError as exc:
+                        raise RuntimeError(str(exc)) from exc
+                self._live_summary.update(reference_norm=q0, **geometry,
+                    side=self.live_spec.side, label=self.live_spec.label,
                     profile=self.live_spec.profile, rate_norm_per_s=self.live_spec.rate_norm_per_s,
                     live_admitted_at_monotonic_s=now, live_deadline_monotonic_s=now + self.live_spec.live_s)
                 if self.selected_evidence is not None:
-                    self.selected_evidence.admit_live(robot, self._live_summary)
+                    self.selected_evidence.admit_live(robot, self._live_summary, measured=measured)
             return True
         if self.live_held is None or "live_deadline_monotonic_s" not in self._live_summary:
             return False

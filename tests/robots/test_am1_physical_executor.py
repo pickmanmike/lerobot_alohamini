@@ -1632,3 +1632,16 @@ def test_executor_only_fault_with_explicit_consistent_native_none_still_requires
         host.next_start_release.set()
         authority.close()
         e.worker.join(2)
+
+
+def test_right_workspace_source_refuses_configured_foreign_calibration_before_owner_io(monkeypatch):
+    from examples.alohamini.am1_session_contract import RECIPES
+    provider=object.__new__(module().ProtectedHostRun)
+    import socket
+    provider.config={"calibration_files":{"/unused/calibration.json":"a"*64},"machine":socket.gethostname(),
+                     "host_repository":"/unused/motor","host_head":"0"*40,"camera_repository":"/unused/camera","camera_head":"0"*40}
+    provider.recipe=RECIPES["physical-live-right-elbow"]
+    import subprocess
+    monkeypatch.setattr(subprocess,"check_output",lambda *a,**k: (_ for _ in ()).throw(AssertionError("No Git/source IO before workspace context refusal")))
+    with pytest.raises(RuntimeError,match="workspace.*calibration"):
+        provider._validate_source()

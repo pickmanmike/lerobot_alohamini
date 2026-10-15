@@ -1,7 +1,13 @@
 "use strict";
 const {test} = require("node:test"), assert = require("node:assert/strict");
-const {spawn} = require("node:child_process"), readline = require("node:readline");
+const {spawn,execFileSync} = require("node:child_process"), readline = require("node:readline");
 const {chromium} = require("playwright");
+
+let sharedLiveRecipeJSON;
+function sharedLiveRecipes() {
+ if(!sharedLiveRecipeJSON)sharedLiveRecipeJSON=execFileSync(process.env.AM1_TEST_PYTHON,["-B","-c","import json; from examples.alohamini.am1_session_contract import LIVE_ELBOW_SPECS; print(json.dumps([spec.summary() for spec in LIVE_ELBOW_SPECS.values()]))"],{encoding:"utf8",env:process.env});
+ return JSON.parse(sharedLiveRecipeJSON);
+}
 
 async function fixture(simulated=false) {
   const worker = spawn(process.env.AM1_TEST_PYTHON, ["-B", "tests/robots/am1_session_fixture.py", "--browser", ...(simulated ? ["--simulated"] : [])], {stdio:["pipe","pipe","pipe"], env:process.env});
@@ -389,20 +395,21 @@ for(const selected of [{recipe:"physical-live-left-elbow",joint:"arm_left_elbow_
   const f=await fixture();t.after(()=>f.close());
   const browser=await chromium.launch({headless:true,channel:process.env.AM1_TEST_BROWSER_CHANNEL || "msedge"});t.after(()=>browser.close());
   const context=await browser.newContext({ignoreHTTPSErrors:true});t.after(()=>context.close());const page=await context.newPage();
-  const errors=[];page.on("pageerror",error=>errors.push(error.message));await enroll(page,f.info.url,f.info.a);
+  const errors=[];page.on("pageerror",error=>errors.push(error.message));
+  if(process.env.AM1_TEST_TRANSPORT_ASSET)await page.route("**/assets/session_transport.js",route=>route.fulfill({contentType:"text/javascript",body:require("node:fs").readFileSync(process.env.AM1_TEST_TRANSPORT_ASSET,"utf8")}));
+  await enroll(page,f.info.url,f.info.a);
   await page.locator('[data-operation="ClaimInput"]').click();await page.waitForFunction(()=>am1Remote.controllerGeneration);
   await page.locator('#fake-recipe').selectOption('fake-interactive');await page.locator('[data-operation="Start"]').click();
   await page.waitForFunction(()=>am1Remote.snapshot?.run?.status==='paused');await page.locator('[data-operation="Resume"]').click();
   await page.waitForFunction(()=>am1Remote.snapshot.run.status==='running'&&am1Remote.connection);
   const actualController=await page.evaluate(()=>am1Remote.controllerGeneration);
   // Loaded ordinary controls/transport only. Injected wire replies are not physical/backend evidence.
-  await page.evaluate(selected=>{
-    const ws=am1Remote.socket,send=ws.send.bind(ws),receive=ws.onmessage;
+  await page.evaluate(({selected,liveRecipes})=>{
+    const ws=am1Remote.socket,send=ws.send.bind(ws),receive=ws.onmessage;globalThis.fixtureReceive=receive;
     ws.onmessage=event=>{if(JSON.parse(event.data).kind!=="snapshot")receive(event);};
     const generation=am1Remote.controllerGeneration;globalThis.fixtureRenewals=0;const renew=am1Remote.renew.bind(am1Remote);am1Remote.renew=()=>{fixtureRenewals++;return renew();};am1Remote.connection="fixture-connection";
     am1Remote.snapshot={service_incarnation:"fixture-owner",recipes:["physical-live-left-elbow","physical-live-right-elbow"],presets:[],
-      live_elbow_recipes:[{recipe:"physical-live-left-elbow",joint:"arm_left_elbow_flex.pos",side:"left",label:"Left elbow",profile:"LiveLeftElbow",rate_norm_per_s:1},
-        {recipe:"physical-live-right-elbow",joint:"arm_right_elbow_flex.pos",side:"right",label:"Right elbow",profile:"LiveRightElbow",rate_norm_per_s:1}],
+      live_elbow_recipes:liveRecipes,
       controller:{device_id:am1Remote.device,controller_generation:generation},evidence:{feedback:true,native_ack:true,
         measured_positions:{[selected.joint]:4},required_observation:true},
       run:{run_id:"test-only-live-protocol",recipe:selected.recipe,source:"protected-physical-provider",status:"running",
@@ -416,34 +423,43 @@ for(const selected of [{recipe:"physical-live-left-elbow",joint:"arm_left_elbow_
       liveFrames.push({command:frame.command,at:performance.now()});
       let value={accepted:true,status:frame.command.op};
       if(frame.command.op==="grant")value={accepted:true,grant_id:`fixture-grant-${liveFrames.length}`,issued:5000,expires:5000.25};
+      if(frame.command.op==="release_input"&&frame.command.release_kind==="voluntary_jog"){
+        const snapshot=JSON.parse(JSON.stringify(am1Remote.snapshot));snapshot.run.status="paused";snapshot.run.intent_revision++;
+        Object.assign(snapshot.run.live_input,{cursor_norm:2,cursor_intent_revision:snapshot.run.intent_revision,rearm:{eligible:true,released_intent_revision:snapshot.run.intent_revision}});
+        Object.assign(snapshot.evidence,{hold_acknowledged:true,pose_aligned:true,native_ack:true,acknowledged_intent_revision:snapshot.run.intent_revision});
+        if(globalThis.delayVoluntaryRelease){globalThis.delayVoluntaryRelease=false;globalThis.pendingVoluntaryRelease={id:frame.id,snapshot};return;}
+        receive({data:JSON.stringify({kind:"snapshot",snapshot})});
+      }
       if(frame.command.op==="connect") {
-        const snapshot=JSON.parse(JSON.stringify(am1Remote.snapshot));snapshot.run.status="paused";snapshot.run.intent_revision=8;
-        Object.assign(snapshot.run.live_input,{cursor_norm:2,cursor_feedback_sequence:40,cursor_intent_revision:8});
-        Object.assign(snapshot.evidence,{hold_acknowledged:false,pose_aligned:false,native_ack:false,acknowledged_intent_revision:7});
+        const snapshot=JSON.parse(JSON.stringify(am1Remote.snapshot)),revision=snapshot.run.intent_revision+1;snapshot.run.status="paused";snapshot.run.intent_revision=revision;
+        Object.assign(snapshot.run.live_input,{cursor_norm:2,cursor_feedback_sequence:40,cursor_intent_revision:revision});
+        Object.assign(snapshot.evidence,{hold_acknowledged:false,pose_aligned:false,native_ack:false,acknowledged_intent_revision:revision-1});
         value={accepted:true,connection_generation:"fixture-reconnected",snapshot};
         receive({data:JSON.stringify({kind:"snapshot",snapshot})}); // Own connection revision can arrive before its command reply.
         setTimeout(()=>{
           const qualified=JSON.parse(JSON.stringify(am1Remote.snapshot));
-          Object.assign(qualified.evidence,{feedback:true,required_observation:true,hold_acknowledged:true,pose_aligned:true,native_ack:true,acknowledged_intent_revision:8});
+          Object.assign(qualified.evidence,{feedback:true,required_observation:true,hold_acknowledged:true,pose_aligned:true,native_ack:true,acknowledged_intent_revision:revision});
           receive({data:JSON.stringify({kind:"snapshot",snapshot:qualified})});
         },300);
       }
       setTimeout(()=>{
         if(frame.command.op==="resume") {
-          const snapshot=JSON.parse(JSON.stringify(am1Remote.snapshot));snapshot.run.status="running";snapshot.run.intent_revision=9;
-          Object.assign(snapshot.run.live_input,{cursor_norm:2,cursor_feedback_sequence:40,cursor_intent_revision:9});
+          const snapshot=JSON.parse(JSON.stringify(am1Remote.snapshot));snapshot.run.status="running";snapshot.run.intent_revision++;
+          Object.assign(snapshot.run.live_input,{cursor_norm:2,cursor_feedback_sequence:40,cursor_intent_revision:snapshot.run.intent_revision,rearm:{eligible:false,released_intent_revision:null}});
+          snapshot.evidence.acknowledged_intent_revision=snapshot.run.intent_revision;
           receive({data:JSON.stringify({kind:"snapshot",snapshot})});
         }
         receive({data:JSON.stringify({kind:"result",id:frame.id,...value})});
       },0);
     };
     am1Remote.render(am1Remote);
-  },selected);
+  },{selected,liveRecipes:sharedLiveRecipes()});
   const starts=[];await page.route("**/api/start",async route=>{starts.push(route.request().postDataJSON());await route.fulfill({json:{accepted:true,status:"starting"}});});
   assert.equal(await page.locator("#fake-recipe").isDisabled(),false);
   for(const option of ["physical-live-left-elbow","physical-live-right-elbow"])assert(await page.locator('#fake-recipe option[value="'+option+'"]').count());
   await page.locator("#fake-recipe").selectOption(selected.recipe);
   assert.match(await page.locator("#live-elbow-controls h2").innerText(),new RegExp(selected.label,"i"));
+  if(selected.side==="right")assert.match(await page.locator("#live-elbow-controls output").innerText(),/am1-right-elbow-retained-v1.*1834.*1867.*2\.984.*admission pending/i);
   assert.match(await page.locator('[data-elbow-jog="1"]').getAttribute("aria-label"),new RegExp(selected.label,"i"));
   await page.locator('[data-operation="Start"]').click();await page.waitForTimeout(100);
   assert.equal(starts.length,1);assert.equal(starts[0].recipe,selected.recipe);
@@ -481,6 +497,22 @@ for(const selected of [{recipe:"physical-live-left-elbow",joint:"arm_left_elbow_
   assert(resumed.at-connected.at>=250,"Resume must await fresh measured hold qualification");
   assert.equal(await page.evaluate(()=>am1Remote.elbowJog),0,"Resume does not replay a remembered gesture");
   await page.keyboard.down("]");await page.waitForFunction(n=>liveFrames.filter(frame=>frame.command.op==="input").length>n,count);
+  await page.evaluate(()=>{globalThis.delayVoluntaryRelease=true;});await page.keyboard.up("]");
+  const voluntary=()=>page.evaluate(()=>liveFrames.filter(frame=>frame.command.release_kind==="voluntary_jog").length);
+  assert.equal(await voluntary(),1,"ordinary keyup records one voluntary release");
+  await negative.hover();await page.mouse.down();
+  const pendingGesture=await page.evaluate(()=>({id:am1Remote.elbowGesture?.id,jog:am1Remote.elbowJog,cursor:am1Remote.elbowCursor}));
+  assert(pendingGesture.id);assert.equal(pendingGesture.jog,0);assert.equal(pendingGesture.cursor,null);
+  await page.evaluate(()=>{const {snapshot}=pendingVoluntaryRelease;fixtureReceive({data:JSON.stringify({kind:"snapshot",snapshot})});});
+  assert.equal(await page.evaluate(()=>am1Remote.elbowGesture?.id),pendingGesture.id,"ordinary held snapshot keeps the exact new press before its release result");
+  await page.evaluate(()=>{am1Remote.socket.onmessage({data:JSON.stringify({kind:"result",id:pendingVoluntaryRelease.id,accepted:true,status:"released"})});delete globalThis.pendingVoluntaryRelease;});
+  await page.waitForFunction(()=>liveFrames.some(frame=>frame.command.op==="input"&&frame.command.intent_revision===12),{}, {timeout:3500});
+  const auto=await page.evaluate(()=>liveFrames.filter(frame=>["connect","resume"].includes(frame.command.op)&&frame.command.rearm_of_intent_revision===10));
+  assert.deepEqual(auto.map(frame=>frame.command.op),["connect","resume"],"new pointer press invokes qualified rearm without a Resume click");
+  assert(auto[1].at-auto[0].at>=250);assert.equal(auto[1].command.expected_intent_revision,11);
+  await page.mouse.up();await page.waitForFunction(()=>am1Remote.snapshot.run.status==="paused"&&am1Remote.snapshot.run.live_input.rearm?.eligible===true,{}, {timeout:2500});
+  await page.waitForTimeout(60);assert.equal(await voluntary(),2,"pointerup followed by lost capture is one release");
+  await page.keyboard.down("]");await page.waitForFunction(()=>liveFrames.some(frame=>frame.command.op==="input"&&frame.command.intent_revision===15),{}, {timeout:3500});
   const result=await page.evaluate(()=>({run:am1Remote.snapshot.run,frames:liveFrames.filter(frame=>frame.command.op==="input"),wire:wireFrames,renewals:fixtureRenewals}));
   assert.equal(result.run.run_id,"test-only-live-protocol");assert.equal(result.run.deadline,900);
   const firstFresh=result.frames.find(frame=>frame.command.intent_revision===9);

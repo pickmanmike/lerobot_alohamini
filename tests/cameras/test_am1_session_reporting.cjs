@@ -13,6 +13,34 @@ function fixture(fetch) {
   return {transport,timers,renders,setNow:value=>{now=value;},async retry(){const i=timers.findIndex(Boolean);assert(i>=0,"bounded reconnect is pending");const [f]=timers[i];timers[i]=null;await f();}};
 }
 
+let sharedLiveRecipeJSON;
+function sharedLiveRecipes() {
+ if(!sharedLiveRecipeJSON){const python=process.env.AM1_TEST_PYTHON,code="import json; from examples.alohamini.am1_session_contract import LIVE_ELBOW_SPECS; print(json.dumps([spec.summary() for spec in LIVE_ELBOW_SPECS.values()]))";
+  sharedLiveRecipeJSON=require("node:child_process").execFileSync(python||"uv",python?["-B","-c",code]:["run","--no-sync","python","-B","-c",code],{cwd:path.join(__dirname,"../.."),encoding:"utf8",env:process.env});}
+ return JSON.parse(sharedLiveRecipeJSON);
+}
+test("the actual shared right workspace summary decodes its full closed11-field schema",()=>{
+ const f=fixture(),spec=sharedLiveRecipes().find(spec=>spec.side==="right"),workspace=f.transport.supportedWorkspace(spec);
+ assert.equal(Object.keys(spec.supported_workspace).length,11);assert(workspace,"actual policy summary must remain visible before Start");
+ assert.equal(workspace.command_min_raw,1834);assert.equal(workspace.command_max_raw,1867);
+ assert.equal(workspace.command_max_norm-workspace.command_min_norm,workspace.span_norm);
+ assert.equal(f.transport.supportedWorkspace(sharedLiveRecipes().find(spec=>spec.side==="left")),null);
+});
+for(const mutation of ["missing_min_norm","missing_max_norm","inverted_norm","nonfinite_min","nonfinite_max","string_norm","inconsistent_span","wide_span","foreign_key","raw_outside_evidence"])test("shared workspace summary refuses "+mutation,()=>{
+ const f=fixture(),spec=sharedLiveRecipes().find(spec=>spec.side==="right"),w=spec.supported_workspace;
+ if(mutation==="missing_min_norm")delete w.command_min_norm;
+ if(mutation==="missing_max_norm")delete w.command_max_norm;
+ if(mutation==="inverted_norm")w.command_min_norm=w.command_max_norm;
+ if(mutation==="nonfinite_min")w.command_min_norm=NaN;
+ if(mutation==="nonfinite_max")w.command_max_norm=Infinity;
+ if(mutation==="string_norm")w.command_min_norm=String(w.command_min_norm);
+ if(mutation==="inconsistent_span")w.span_norm-=.1;
+ if(mutation==="wide_span"){w.command_max_norm=w.command_min_norm+3.01;w.span_norm=3.01;}
+ if(mutation==="foreign_key")w.arbitrary=true;
+ if(mutation==="raw_outside_evidence")w.command_max_raw=w.evidence_max_raw+1;
+ assert.equal(f.transport.supportedWorkspace(spec),null);
+});
+
 async function liveFixture() {
   const snapshot={service_incarnation:"owner",live_elbow_recipes:[{recipe:"physical-live-left-elbow",joint:"arm_left_elbow_flex.pos",side:"left",label:"Left elbow",profile:"LiveLeftElbow",rate_norm_per_s:1}],controller:{device_id:"enrolled",controller_generation:"claimed"},
     run:{run_id:"live-run",recipe:"physical-live-left-elbow",source:"protected-physical-provider",status:"running",
@@ -27,6 +55,16 @@ async function liveFixture() {
     f.transport.socket.onmessage({data:JSON.stringify({kind:"result",id:frame.id,...value})});
   };
   return {...f,frames,reply};
+}
+
+async function explicitLiveResume(f) {
+ const t=f.transport,initial=t.snapshot.run.intent_revision,task=t.resume(),s=JSON.parse(JSON.stringify(t.snapshot));
+ s.run.status="paused";s.run.intent_revision=initial+1;Object.assign(s.run.live_input,{cursor_intent_revision:initial+1});
+ s.evidence={feedback:true,required_observation:true,hold_acknowledged:true,pose_aligned:true,native_ack:true,acknowledged_intent_revision:initial+1};
+ t.socket.onmessage({data:JSON.stringify({kind:"snapshot",snapshot:s})});f.reply("connect",{accepted:true,connection_generation:"explicit-wire",snapshot:s});
+ for(let i=0;i<6;i++)await Promise.resolve();f.reply("release_input",{accepted:true});for(let i=0;i<6;i++)await Promise.resolve();
+ s.run.status="running";s.run.intent_revision=initial+2;s.run.live_input.cursor_intent_revision=initial+2;s.evidence.acknowledged_intent_revision=initial+2;
+ t.socket.onmessage({data:JSON.stringify({kind:"snapshot",snapshot:s})});f.reply("resume",{accepted:true});await task;
 }
 
 test("live elbow samples the current gesture after its grant and sends only the mapped selected key",async()=>{
@@ -52,7 +90,7 @@ test("live elbow release fences a pending grant and requires a fresh qualified r
   f.reply("release_input",{accepted:true});await released;
   f.transport.snapshot.run.intent_revision=8;
   Object.assign(f.transport.snapshot.run.live_input,{cursor_norm:2,cursor_feedback_sequence:40,cursor_intent_revision:8});
-  assert.equal(f.transport.setElbowJog(1),true);f.setNow(1200);
+  await explicitLiveResume(f);assert.equal(f.transport.setElbowJog(1),true);f.setNow(1200);
   const fresh=f.transport.input();f.reply("grant",{accepted:true,grant_id:"fresh",issued:20,expires:20.25});await fresh;
   assert.deepEqual(f.frames.at(-1).command.target,{"arm_left_elbow_flex.pos":2.1});
   f.reply("input",{accepted:true,status:"input"});assert.equal(f.transport.snapshot.run.deadline,90);
@@ -246,7 +284,7 @@ test("an old input refusal cannot clear a newly qualified measured-cursor gestur
   const snapshot=JSON.parse(JSON.stringify(f.transport.snapshot));snapshot.run.intent_revision=8;
   Object.assign(snapshot.run.live_input,{cursor_norm:2,cursor_feedback_sequence:40,cursor_intent_revision:8});
   f.transport.socket.onmessage({data:JSON.stringify({kind:"snapshot",revision:2,snapshot})});
-  assert.equal(f.transport.setElbowJog(1),true);
+  await explicitLiveResume(f);assert.equal(f.transport.setElbowJog(1),true);
   f.reply("input",{accepted:false,status:"refused",reason:"expired grant"});await Promise.resolve();await Promise.resolve();
   assert.equal(f.transport.elbowJog,1);assert.equal(f.transport.elbowCursor,2);f.transport.clear();
 });
@@ -257,12 +295,12 @@ test("a prior revision's late input refusal settles its fence before the fresh g
   const first=f.transport.input();f.reply("grant",{accepted:true,grant_id:"a",issued:10,expires:10.25});await first;
   const snapshot=JSON.parse(JSON.stringify(f.transport.snapshot));snapshot.run.intent_revision=8;
   Object.assign(snapshot.run.live_input,{cursor_norm:2,cursor_feedback_sequence:40,cursor_intent_revision:8});
-  f.transport.socket.onmessage({data:JSON.stringify({kind:"snapshot",revision:2,snapshot})});assert.equal(f.transport.setElbowJog(1),true);
+  f.transport.socket.onmessage({data:JSON.stringify({kind:"snapshot",revision:2,snapshot})});await explicitLiveResume(f);assert.equal(f.transport.setElbowJog(1),true);
   await f.transport.input();assert.equal(f.frames.filter(frame=>frame.command?.op==="grant").length,1);
   f.reply("input",{accepted:false,status:"refused",reason:"expired grant"});await Promise.resolve();await Promise.resolve();await Promise.resolve();
   assert.equal(f.transport.elbowJog,1);assert.equal(f.transport.liveInputs.size,0);assert.equal(f.transport.pending.size,0);
   f.setNow(1150);const next=f.transport.input();f.reply("grant",{accepted:true,grant_id:"b",issued:11,expires:11.25});await next;
-  assert.equal(f.frames.at(-1).command.grant_id,"b");assert.equal(f.frames.at(-1).command.intent_revision,8);
+  assert.equal(f.frames.at(-1).command.grant_id,"b");assert.equal(f.frames.at(-1).command.intent_revision,10);
   assert.deepEqual(f.frames.at(-1).command.target,{"arm_left_elbow_flex.pos":2.05});f.reply("input",{accepted:true});
 });
 
@@ -307,4 +345,156 @@ test("live elbow recipe changes fence a pending original grant without switching
 test("live recipe metadata cannot introduce an inherited nonallowlisted name",async()=>{
   const f=await liveFixture();f.transport.snapshot.live_elbow_recipes=[{recipe:"toString",joint:"arbitrary",side:"other",label:"Other",profile:"Other",rate_norm_per_s:1}];
   assert.equal(f.transport.liveElbowSpec("toString"),null);f.transport.clear();
+});
+
+async function rearmFixture(side="left") {
+ const f=await liveFixture(),t=f.transport,s=t.snapshot,recipe="physical-live-"+side+"-elbow",joint="arm_"+side+"_elbow_flex.pos",profile=side==="left"?"LiveLeftElbow":"LiveRightElbow";
+ s.live_elbow_recipes=[{recipe,joint,side,label:side[0].toUpperCase()+side.slice(1)+" elbow",profile,rate_norm_per_s:1}];s.run.recipe=recipe;
+ Object.assign(s.run.live_input,{joint,side,label:side[0].toUpperCase()+side.slice(1)+" elbow",profile,corridor_min_norm:side==="right"?2:-5});
+ const deliver=()=>t.socket.onmessage({data:JSON.stringify({kind:"snapshot",snapshot:JSON.parse(JSON.stringify(s))})});
+ const hold=(revision,rearm=true)=>{s.run.status="paused";s.run.intent_revision=revision;Object.assign(s.run.live_input,{cursor_intent_revision:revision,cursor_norm:3,cursor_feedback_sequence:40,rearm:{eligible:rearm,released_intent_revision:8}});s.evidence={feedback:true,required_observation:true,hold_acknowledged:true,pose_aligned:true,native_ack:true,acknowledged_intent_revision:revision};deliver();};
+ const flush=async()=>{for(let i=0;i<8;i++)await Promise.resolve();};
+ const release=async()=>{assert.equal(t.pressElbowJog(-1,"key:["),true);const p=t.releaseElbowJog("key:[",true);hold(8);f.reply("release_input",{accepted:true,status:"released"});await p;};
+ const qualify=async()=>{hold(9);f.reply("connect",{accepted:true,connection_generation:"fresh-wire",snapshot:JSON.parse(JSON.stringify(s))});await flush();f.reply("release_input",{accepted:true});await flush();
+  s.run.status="running";s.run.intent_revision=10;Object.assign(s.run.live_input,{cursor_intent_revision:10,cursor_norm:3,rearm:{eligible:false,released_intent_revision:null}});s.evidence.acknowledged_intent_revision=10;deliver();f.reply("resume",{accepted:true});await flush();};
+ return {...f,side,joint,deliver,hold,flush,release,qualify};
+}
+for(const side of ["left","right"])test("ordinary "+side+" release and new press rearm the same run without a separate Resume",async()=>{
+ const f=await rearmFixture(side),t=f.transport;try{await f.release();assert.equal(f.frames[0].command.release_kind,"voluntary_jog");
+  assert.equal(t.pressElbowJog(1,"key:]"),true);await f.flush();assert.equal(t.elbowJog,0);assert.equal(t.elbowCursor,null);
+  assert.equal(f.frames.at(-1).command.op,"connect");assert.equal(f.frames.at(-1).command.rearm_of_intent_revision,8);
+  await f.qualify();assert.equal(t.elbowJog,1);assert.equal(t.elbowCursor,3);
+  for(const row of f.frames.filter(row=>["connect","resume"].includes(row.command.op)||row.command.op==="release_input"&&row.command.release_kind===undefined))assert.equal(row.command.rearm_of_intent_revision,8);
+  f.setNow(1100);const tick=t.input();f.reply("grant",{accepted:true,grant_id:"new",issued:500,expires:500.25});await tick;
+  assert.deepEqual(Object.keys(f.frames.at(-1).command.target),[f.joint]);assert.equal(t.snapshot.run.deadline,90);f.reply("input",{accepted:true});
+ }finally{t.clear();}
+});
+for(const side of ["left","right"])for(const order of ["snapshot-before-result","result-before-snapshot"])test("early ordinary "+side+" re-jog keeps only its held pending gesture with "+order,async()=>{
+ const f=await rearmFixture(side),t=f.transport;try{
+  assert(t.pressElbowJog(-1,"key:["));const release=t.releaseElbowJog("key:[",true);
+  assert(t.pressElbowJog(1,"key:]"));const gesture=t.elbowGesture;
+  assert.equal(t.elbowJog,0);assert.equal(t.elbowCursor,null);assert.equal(f.frames.filter(row=>row.command.op==="connect").length,0);
+  if(order==="snapshot-before-result")f.hold(8);
+  f.reply("release_input",{accepted:true,status:"released"});await release;await f.flush();
+  if(order==="result-before-snapshot")f.hold(8);
+  for(const entry of f.timers.filter(entry=>entry?.[1]===50))entry[0]();await f.flush();
+  assert.equal(t.elbowGesture,gesture,"own release snapshot must preserve the exact newly held pending press");
+  assert.equal(t.elbowJog,0);assert.equal(t.elbowCursor,null);assert.equal(f.frames.filter(row=>row.command.op==="connect").length,1);
+  assert.equal(f.frames.at(-1).command.rearm_of_intent_revision,8);
+  await f.qualify();assert.equal(t.elbowGesture,gesture);assert.equal(t.elbowJog,1);assert.equal(t.elbowCursor,3);
+  assert.equal(f.frames.filter(row=>row.command.op==="resume").length,1);
+ }finally{t.clear();}
+});
+for(const loss of ["cancel","pause","owner","connection","bounds","timeout"])test("early ordinary re-jog cannot survive "+loss+" before its release receipt",async()=>{
+ const f=await rearmFixture(),t=f.transport;try{
+  t.pressElbowJog(-1,"key:[");const release=t.releaseElbowJog("key:[",true);t.pressElbowJog(1,"key:]");
+  if(loss==="cancel")t.releaseElbowJog("key:]",false);
+  if(loss==="timeout"){f.setNow(4000);f.timers.find(entry=>entry?.[1]===3000)[0]();}
+  const held=JSON.parse(JSON.stringify(t.snapshot));held.run.status="paused";held.run.intent_revision=8;
+  Object.assign(held.run.live_input,{cursor_intent_revision:8,rearm:{eligible:true,released_intent_revision:8}});
+  if(loss==="pause")held.run.live_input.rearm={eligible:false,released_intent_revision:null};
+  if(loss==="owner")held.controller={device_id:"other",controller_generation:"other"};
+  if(loss==="connection")t.connection="foreign-wire";
+  if(loss==="bounds")held.run.live_input.corridor_min_norm--;
+  t.socket.onmessage({data:JSON.stringify({kind:"snapshot",snapshot:held})});
+  // Cancellation may have a second strict release; ownership loss may settle all pending commands.
+  if(t.pending.size)for(const row of [...f.frames])if(row.command.op==="release_input"&&t.pending.has(row.id))t.socket.onmessage({data:JSON.stringify({kind:"result",id:row.id,accepted:true})});
+  await release;for(const entry of f.timers.filter(entry=>entry?.[1]===50))entry[0]();await f.flush();
+  assert.equal(t.elbowGesture,null);assert.equal(t.elbowJog,0);assert.equal(t.elbowCursor,null);
+  assert.equal(f.frames.filter(row=>["connect","resume","input"].includes(row.command.op)).length,0);
+ }finally{t.clear();}
+});
+test("ordinary rearm release during a pending connect cannot revive the gesture from late accepted replies",async()=>{
+ const f=await rearmFixture(),t=f.transport;try{await f.release();t.pressElbowJog(1,"pointer:2");await f.flush();
+  const cancelled=t.releaseElbowJog("pointer:2",false);f.reply("release_input",{accepted:true});await cancelled;
+  f.hold(9);f.reply("connect",{accepted:true,connection_generation:"late-wire",snapshot:JSON.parse(JSON.stringify(t.snapshot))});await f.flush();
+  assert.equal(t.elbowJog,0);assert.equal(t.pressElbowJog(1,"key:]"),false,"strict cancellation requires explicit Resume even if a later revision arrives");
+  assert.equal(f.frames.filter(row=>row.command.op==="resume").length,0);
+ }finally{t.clear();}
+});
+test("ordinary pointerup followed by lost capture emits one voluntary release and preserves its rearm receipt",async()=>{
+ const f=await rearmFixture(),t=f.transport;try{t.pressElbowJog(-1,"pointer:1");const p=t.releaseElbowJog("pointer:1",true);
+  t.releaseElbowJog("pointer:1",false);assert.equal(f.frames.filter(row=>row.command.op==="release_input").length,1);
+  f.hold(8);f.reply("release_input",{accepted:true});await p;assert.equal(t.pressElbowJog(1,"pointer:2"),true);
+ }finally{t.clear();}
+});
+
+for(const stage of ["connect","release","qualify","resume"])test("ordinary rearm cancellation at "+stage+" keeps a strict latch across late accepted snapshots",async()=>{
+ const f=await rearmFixture(),t=f.transport;try{await f.release();t.pressElbowJog(1,"key:]");await f.flush();
+  if(stage!=="connect"){
+   f.hold(9);if(stage==="qualify")Object.assign(t.snapshot.evidence,{hold_acknowledged:false,pose_aligned:false,native_ack:false});
+   f.reply("connect",{accepted:true,connection_generation:"fresh-wire",snapshot:JSON.parse(JSON.stringify(t.snapshot))});await f.flush();
+   if(stage!=="release"){f.reply("release_input",{accepted:true});await f.flush();}
+  }
+  const cancel=t.releaseElbowJog("key:]",false);f.reply("release_input",{accepted:true});await cancel;
+  if(stage==="connect")f.reply("connect",{accepted:true,connection_generation:"late-wire",snapshot:JSON.parse(JSON.stringify(t.snapshot))});
+  if(stage==="release")f.reply("release_input",{accepted:true});
+  const late=JSON.parse(JSON.stringify(t.snapshot));late.run.status="running";late.run.intent_revision=10;late.run.live_input.cursor_intent_revision=10;
+  Object.assign(late.evidence,{hold_acknowledged:true,pose_aligned:true,native_ack:true,acknowledged_intent_revision:10});t.socket.onmessage({data:JSON.stringify({kind:"snapshot",snapshot:late})});
+  if(stage==="resume")f.reply("resume",{accepted:true});for(const entry of f.timers.filter(entry=>entry?.[1]===50))entry[0]();await f.flush();
+  assert.equal(t.elbowJog,0);assert.equal(t.pressElbowJog(1,"pointer:new"),false);assert.equal(f.frames.filter(row=>row.command.op==="input").length,0);
+ }finally{t.clear();}
+});
+for(const mutation of ["pause","owner","connection","joint","reference","fault","deadline","native_live_at","admission_version","workspace_id","workspace_context","workspace_min","workspace_max","raw_min","raw_max","origin"])test("ordinary pending rearm cancels a changed "+mutation,async()=>{
+ const f=await rearmFixture(),t=f.transport;try{await f.release();t.pressElbowJog(1,"key:]");await f.flush();f.hold(9);
+  Object.assign(t.snapshot.evidence,{hold_acknowledged:false,pose_aligned:false,native_ack:false});f.reply("connect",{accepted:true,connection_generation:"fresh-wire",snapshot:JSON.parse(JSON.stringify(t.snapshot))});await f.flush();f.reply("release_input",{accepted:true});await f.flush();
+  const changed=JSON.parse(JSON.stringify(t.snapshot));
+  if(mutation==="pause")changed.run.intent_revision++;
+  if(mutation==="owner")changed.controller={device_id:"other",controller_generation:"other"};
+  if(mutation==="connection")t.connection="other";
+  if(mutation==="joint")changed.run.live_input.joint="arm_right_elbow_flex.pos";
+  if(mutation==="reference")changed.run.live_input.reference_norm++;
+  if(mutation==="fault")changed.evidence.fault="original native fault";
+  if(mutation==="deadline")changed.run.deadline++;
+  if(mutation==="native_live_at")changed.run.native_live_at=123;
+  if(mutation==="admission_version")changed.run.live_input.admission_version=2;
+  if(mutation==="workspace_id")changed.run.live_input.workspace={id:"foreign"};
+  if(mutation==="workspace_context")changed.run.live_input.workspace={context_sha256:"b".repeat(64)};
+  if(mutation==="workspace_min")changed.run.live_input.workspace={evidence_min_raw:1832};
+  if(mutation==="workspace_max")changed.run.live_input.workspace={evidence_max_raw:1868};
+  if(mutation==="raw_min")changed.run.live_input.corridor_min_raw=1834;
+  if(mutation==="raw_max")changed.run.live_input.corridor_max_raw=1867;
+  if(mutation==="origin")changed.run.live_input.measured_origin_raw=1845;
+  Object.assign(changed.evidence,{hold_acknowledged:true,pose_aligned:true,native_ack:true,acknowledged_intent_revision:9});t.socket.onmessage({data:JSON.stringify({kind:"snapshot",snapshot:changed})});
+  for(const entry of f.timers.filter(entry=>entry?.[1]===50))entry[0]();await f.flush();assert.equal(t.elbowJog,0);assert.equal(f.frames.filter(row=>row.command.op==="resume").length,0);
+ }finally{t.clear();}
+});
+test("the whole ordinary press opportunity expires at3 seconds while a connect reply is delayed",async()=>{
+ const f=await rearmFixture(),t=f.transport;try{await f.release();t.pressElbowJog(1,"pointer:1");await f.flush();f.setNow(4000);
+  const timeout=f.timers.find(entry=>entry?.[1]===3000);assert(timeout);timeout[0]();f.reply("release_input",{accepted:true});await f.flush();
+  f.hold(9);f.reply("connect",{accepted:true,connection_generation:"late-wire",snapshot:JSON.parse(JSON.stringify(t.snapshot))});await f.flush();
+  assert.equal(t.elbowJog,0);assert.equal(t.pressElbowJog(1,"key:]"),false);assert.equal(f.frames.filter(row=>row.command.op==="resume").length,0);
+ }finally{t.clear();}
+});
+test("repeated held presses and older pointer releases cannot replace or cancel a fresh reverse gesture",async()=>{
+ const f=await rearmFixture(),t=f.transport;try{assert(t.pressElbowJog(-1,"pointer:1"));const id=t.elbowGesture.id;
+  assert.equal(t.pressElbowJog(-1,"pointer:1"),false);assert.equal(t.elbowGesture.id,id);
+  assert(t.pressElbowJog(1,"key:]"));await t.releaseElbowJog("pointer:1",true);assert.equal(t.elbowJog,1);assert.equal(f.frames.length,0);
+ }finally{t.clear();}
+});
+
+test("ordinary rearm waits for current native ACK after an accepted Resume publishes running first",async()=>{
+ const f=await rearmFixture(),t=f.transport;try{await f.release();t.pressElbowJog(1,"key:]");await f.flush();f.hold(9);
+  f.reply("connect",{accepted:true,connection_generation:"fresh-wire",snapshot:JSON.parse(JSON.stringify(t.snapshot))});await f.flush();f.reply("release_input",{accepted:true});await f.flush();
+  const running=JSON.parse(JSON.stringify(t.snapshot));running.run.status="running";running.run.intent_revision=10;running.run.live_input.cursor_intent_revision=10;
+  running.evidence.native_ack=false;t.socket.onmessage({data:JSON.stringify({kind:"snapshot",snapshot:running})});f.reply("resume",{accepted:true});await f.flush();
+  assert.equal(t.elbowJog,0);assert.equal(f.frames.filter(row=>row.command.op==="release_input").length,2,"accepted Resume must await its current native ACK within the same opportunity");
+  Object.assign(running.evidence,{native_ack:true,acknowledged_intent_revision:10});t.socket.onmessage({data:JSON.stringify({kind:"snapshot",snapshot:running})});
+  for(const entry of f.timers.filter(entry=>entry?.[1]===50))entry[0]();await f.flush();assert.equal(t.elbowJog,1);
+ }finally{t.clear();}
+});
+
+test("an ordinary Resume ACK at the original3 second deadline cannot activate even after all earlier stages qualified",async()=>{
+ const f=await rearmFixture(),t=f.transport;try{await f.release();t.pressElbowJog(1,"key:]");await f.flush();f.hold(9);
+  f.reply("connect",{accepted:true,connection_generation:"fresh-wire",snapshot:JSON.parse(JSON.stringify(t.snapshot))});await f.flush();f.reply("release_input",{accepted:true});await f.flush();
+  f.setNow(4000);const running=JSON.parse(JSON.stringify(t.snapshot));running.run.status="running";running.run.intent_revision=10;running.run.live_input.cursor_intent_revision=10;running.evidence.acknowledged_intent_revision=10;
+  t.socket.onmessage({data:JSON.stringify({kind:"snapshot",snapshot:running})});f.reply("resume",{accepted:true});await f.flush();
+  assert.equal(t.elbowJog,0);assert.equal(t.pressElbowJog(1,"pointer:new"),false);assert.equal(f.frames.filter(row=>row.command.op==="input").length,0);
+ }finally{t.clear();}
+});
+test("a successfully rearmed held gesture continues ordinary granted input beyond the qualification deadline",async()=>{
+ const f=await rearmFixture(),t=f.transport;try{await f.release();t.pressElbowJog(1,"key:]");await f.flush();await f.qualify();f.setNow(9000);
+  const tick=t.input();f.reply("grant",{accepted:true,grant_id:"current",issued:900,expires:900.25});await tick;
+  assert.equal(f.frames.at(-1).command.op,"input");assert.equal(f.frames.at(-1).command.target[f.joint],3.1);f.reply("input",{accepted:true});
+ }finally{t.clear();}
 });

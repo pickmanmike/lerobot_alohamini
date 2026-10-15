@@ -1062,6 +1062,7 @@ class ProtectedHostRun:
         self.observation = None
         self.host_log = self.camera_log = None
         self.run_id = self.incarnation = None
+        self.recipe = None
         self.run_directory = None
         self.receipt = None
         required = {
@@ -1110,6 +1111,12 @@ class ProtectedHostRun:
         import subprocess
         from pathlib import Path
 
+        from examples.alohamini.am1_session_contract import LIVE_ELBOW_WORKSPACES
+        workspace = LIVE_ELBOW_WORKSPACES.get(getattr(getattr(self, "recipe", None), "name", None))
+        if workspace is not None:
+            files = self.config.get("calibration_files", {})
+            if len(files) != 1 or set(files.values()) != {workspace.calibration_sha256}:
+                raise RuntimeError("Live workspace requires the preserved full calibration content")
         if socket.gethostname() != self.config["machine"]:
             raise RuntimeError("AM1 machine identity mismatch")
         for name in ("host", "camera"):
@@ -1145,6 +1152,7 @@ class ProtectedHostRun:
         from lerobot.robots.alohamini.config_alohamini import AlohaMiniClientConfig
 
         self.run_id, self.incarnation = run_id, incarnation
+        self.recipe = recipe
         self._validate_source()
         cancel()
         state = Path(self.config["physical_state_directory"])

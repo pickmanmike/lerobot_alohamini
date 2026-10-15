@@ -888,7 +888,7 @@ class AM1SelectedJointEvidence:
         # clears current eligibility, not the fact that cycle two already began.
         self._hold_departed = self._hold_departure is not None
 
-    def admit_live(self, robot, summary):
+    def admit_live(self, robot, summary, *, measured=None):
         """Freeze actual native geometry once; never infer a raw excursion size."""
         from examples.alohamini.am1_session_contract import SignedElbowResponse
 
@@ -899,6 +899,21 @@ class AM1SelectedJointEvidence:
             raise RuntimeError("Live selected read-only settings are unavailable")
         calibration = self._bus(robot).calibration[self.motor]
         material = {k: int(getattr(calibration, k)) for k in ("drive_mode", "homing_offset", "range_min", "range_max")}
+        from examples.alohamini.am1_session_contract import LIVE_ELBOW_WORKSPACES
+        workspace = LIVE_ELBOW_WORKSPACES.get(self.live_spec.recipe)
+        if workspace is not None:
+            if measured is None:
+                measured = (getattr(robot,"_am1_workspace_observation",None) or {}).get("positions")
+            if not isinstance(measured,dict):
+                raise RuntimeError("Live workspace original observation is unavailable")
+            context, origin = robot.am1_live_workspace_context(robot._am1_visible_control_binding, measured)
+            try:
+                geometry = workspace.admission(context, summary.get("measured_origin_raw",origin), summary["reference_norm"])
+            except ValueError as exc:
+                raise RuntimeError(str(exc)) from exc
+            if "workspace" in summary and summary["workspace"] != geometry["workspace"]:
+                raise RuntimeError("Live workspace descriptor changed")
+            summary.update(geometry)
         position = getattr(robot, "_am1_selected_joint_position", {})
         raw = position.get("raw")
         endpoints = [SignedElbowResponse.encoded_goal(summary[k], material)
@@ -912,12 +927,31 @@ class AM1SelectedJointEvidence:
         if (type(raw) is not int or any(type(v) is not int or not low <= v <= high for v in endpoints)
                 or not low <= raw <= high):
             raise RuntimeError("Live actual selected raw admission/encoded corridor is unavailable")
-        summary.update(measured_origin_raw=raw, corridor_min_raw=min(endpoints), corridor_max_raw=max(endpoints))
+        if summary.get("admission_version") == 2:
+            from examples.alohamini.am1_session_contract import LIVE_ELBOW_WORKSPACES
+            workspace = LIVE_ELBOW_WORKSPACES.get(self.live_spec.recipe)
+            if (workspace is None or summary.get("workspace") != workspace.descriptor
+                    or endpoints != [workspace.command_min_raw, workspace.command_max_raw]):
+                raise RuntimeError("Live workspace native encoded descriptor differs")
+        origin = summary.get("measured_origin_raw",raw) if workspace is not None else raw
+        summary.update(measured_origin_raw=origin, corridor_min_raw=min(endpoints), corridor_max_raw=max(endpoints))
         # Preserve left measured +/-ten behavior. Right uses its own +/-three
         # measured guard, distinct from the positive-only command corridor.
         summary.update(measured_min_raw=max(low, min(*endpoints, raw) if self.side == "left"
                                                       else min(raw, low if negative is None else negative)),
                        measured_max_raw=min(high, max(raw, endpoints[1], high if positive is None else positive)))
+        if workspace is not None:
+            summary["measured_min_raw"] = max(low,negative)
+            summary["measured_max_raw"] = min(high,positive)
+            if (not summary["measured_min_raw"]<=raw<=summary["measured_max_raw"]
+                    or not summary["measured_min_raw"]<=min(endpoints)<=max(endpoints)<=summary["measured_max_raw"]):
+                raise RuntimeError("Live workspace current measurement left the original measured guard")
+            acquisition=getattr(robot,"_am1_workspace_observation",{})
+            self.emit(dict(kind="live_workspace_admission",binding=dict(robot._am1_visible_control_binding),
+                           policy=workspace.descriptor,reference_norm=summary["reference_norm"],measured_origin_raw=origin,
+                           actual_right_pose=context["right_pose"],
+                           read_started_at_monotonic_s=acquisition.get("read_started_at"),
+                           read_completed_at_monotonic_s=acquisition.get("read_completed_at")))
         self.live_admission = copy.deepcopy(summary)
 
     def deactivate_live(self, robot):

@@ -587,6 +587,7 @@ class SessionAuthority:
         self.applied_input = None
         self._live_activation_epoch = None
         self.released = False
+        self._live_rearm = None  # Volatile; restart/reconnect never restores gesture authority.
         self.events = deque(maxlen=64)
         self.last_tick = clock()
         self.last_checkpoint = clock()
@@ -1039,7 +1040,24 @@ class SessionAuthority:
             intent_revision=self.run["intent_revision"],
         )
 
+    def _rearm_matches(self, command, device, stage=None):
+        token = self._live_rearm
+        return bool(
+            token and self._physical_interactive() and self.run["status"] == "paused"
+            and self._connection_valid(command, device)
+            and command.get("host_incarnation") == self.executor.host_incarnation
+            and type(command.get("rearm_of_intent_revision")) is int
+            and command["rearm_of_intent_revision"] == token["released_intent_revision"]
+            and self.run["run_id"] == token["run_id"]
+            and self.controller["generation"] == token["controller_generation"]
+            and self.connection["generation"] == token["connection_generation"]
+            and self.run["intent_revision"] == token["current_revision"]
+            and (stage is None or token["stage"] == stage)
+            and (token["deadline"] is None or self.clock() < token["deadline"])
+        )
+
     def _pause_live_input(self, reason):
+        self._live_rearm = None
         if not self._physical_interactive() or self.run["status"] in TERMINAL | {"finishing"}:
             return
         if self.run["status"] != "paused":
@@ -1050,7 +1068,7 @@ class SessionAuthority:
             self._event(reason)
             self._save()
 
-    def _live_input_status(self, evidence):
+    def _live_input_status(self, evidence, *, include_rearm=True):
         value = evidence.get("live_input")
         if not self._physical_interactive() or not isinstance(value, dict):
             return None
@@ -1061,6 +1079,7 @@ class SessionAuthority:
             "live_deadline_monotonic_s", "expiry_detected_at_monotonic_s",
             "hold_started_at_monotonic_s", "hold_completed_at_monotonic_s", "cadence", "last_input_gap_s",
             "measured_origin_raw", "corridor_min_raw", "corridor_max_raw", "accepted_target_norm",
+            "admission_version", "workspace",
         }
         ack = evidence.get("accepted_host_action", {})
         if (
@@ -1077,15 +1096,25 @@ class SessionAuthority:
                 "encoded_goal_raw", "goal_write_returned", "goal_write_started_at_monotonic_s",
                 "goal_write_completed_at_monotonic_s", "goal_action_sequence",
             }
+        rearm = {}
+        if include_rearm and self.run["status"] not in TERMINAL | {"finishing"}:
+            token = self._live_rearm
+            eligible = bool(token and self.run["status"] == "paused" and self.controller
+                            and self.connection and self.clock() < self.controller["expires"]
+                            and (token["deadline"] is None or self.clock() < token["deadline"]))
+            rearm = {"rearm": {"eligible": eligible,
+                               "released_intent_revision": token["released_intent_revision"] if eligible else None}}
         return dict(
-            _status_small(value, keys, 1024), run_id=self.run["run_id"],
+            _status_small(value, keys, 1024), **rearm, run_id=self.run["run_id"],
             service_incarnation=self.service_incarnation, host_incarnation=self.executor.host_incarnation,
             intent_revision=self.run["intent_revision"],
             **{key: item for key, item in LIVE_ELBOW_SPECS[self.run["recipe"]].summary().items()
                if key in {"side", "label", "profile", "rate_norm_per_s"}},
         )
 
-    def _clear_input(self):
+    def _clear_input(self, *, preserve_rearm=False):
+        if not preserve_rearm:
+            self._live_rearm = None
         self.grant = None
         self.applied_input = None
         self._live_activation_epoch = None
@@ -2248,10 +2277,18 @@ class SessionAuthority:
                 or c.get("host_incarnation") != self.executor.host_incarnation
             ):
                 return self._refuse("stale physical control identity")
+            automatic = "rearm_of_intent_revision" in c
+            if automatic and not self._rearm_matches(c, d, "released"):
+                return self._refuse("ordinary rearm release fence changed; explicit Resume required")
             self.connection = {"device_id": d, "generation": str(uuid.uuid4()), "seq": -1}
             if self._physical_interactive():
                 self.run["intent_revision"] += 1
-            self._clear_input()
+            self._clear_input(preserve_rearm=automatic)
+            if automatic:
+                self._live_rearm.update(
+                    connection_generation=self.connection["generation"],
+                    current_revision=self.run["intent_revision"], stage="connected", deadline=now + 3.0,
+                )
             self._bind_executor_control()
             if RECIPES[self.run["recipe"]].mode == "interactive":
                 self.run["status"] = "paused"
@@ -2267,19 +2304,52 @@ class SessionAuthority:
         if op == "release_input":
             if self._physical_interactive() and set(c) - {
                 "op", "run_id", "service_incarnation", "controller_generation", "connection_generation",
-                "host_incarnation", "intent_revision",
+                "host_incarnation", "intent_revision", "release_kind", "rearm_of_intent_revision",
             }:
                 return self._refuse("empty physical release required")
+            automatic = "rearm_of_intent_revision" in c
+            voluntary = False
             if self._physical_interactive():
                 if c.get("host_incarnation") != self.executor.host_incarnation:
                     return self._refuse("stale physical host identity")
-                self._pause_live_input("input_released")
-            self._clear_input()
+                if c.get("release_kind") not in (None, "voluntary_jog"):
+                    return self._refuse("unknown physical release kind")
+                if automatic and ("release_kind" in c or not self._rearm_matches(c, d, "connected")):
+                    return self._refuse("ordinary rearm release fence changed; explicit Resume required")
+                if not automatic:
+                    e = self._evidence()
+                    # Feedback acquisition can cross the original grant expiry.
+                    released_at = self.clock()
+                    self._expire_controls(released_at)
+                    voluntary = bool(
+                        c.get("release_kind") == "voluntary_jog" and self.run["status"] == "running"
+                        and type(c.get("intent_revision")) is int
+                        and c["intent_revision"] == self.run["intent_revision"]
+                        and self.applied_input and released_at < self.applied_input["expires"]
+                        and not e.get("fault") and not self.run.get("first_cause")
+                        and e.get("active_acknowledged") is True
+                        and (e.get("accepted_host_action") or {}).get("state") == "active"
+                        and (e.get("live_input") or {}).get("state") != "expired"
+                        and all(e.get(key) is True for key in ("feedback", "required_observation", "native_ack"))
+                        and e.get("acknowledged_intent_revision") == self.run["intent_revision"]
+                    )
+                    self._pause_live_input("input_released")
+            self._clear_input(preserve_rearm=automatic)
             self.released = True
+            if voluntary:
+                self._live_rearm = dict(
+                    run_id=self.run["run_id"], controller_generation=self.controller["generation"],
+                    connection_generation=self.connection["generation"],
+                    released_intent_revision=self.run["intent_revision"],
+                    current_revision=self.run["intent_revision"], stage="released", deadline=None,
+                )
             return {"accepted": True, "status": "released", "effect_admitted": not self.asynchronous}
         if op == "resume":
             if self._physical_interactive() and c.get("host_incarnation") != self.executor.host_incarnation:
                 return self._refuse("stale physical host identity")
+            automatic = "rearm_of_intent_revision" in c
+            if automatic and not self._rearm_matches(c, d, "connected"):
+                return self._refuse("ordinary rearm opportunity cancelled; explicit Resume required")
             revision = c.get("expected_intent_revision")
             if type(revision) is not int or revision != self.run["intent_revision"]:
                 return self._refuse("stale or malformed intent revision")
@@ -2292,6 +2362,7 @@ class SessionAuthority:
                 or not all(e[k] for k in ("feedback", "required_observation", "pose_aligned", "native_ack"))
             ):
                 return self._refuse("qualified release/alignment required")
+            self._live_rearm = None
             self.run["intent_revision"] += 1
             self._set_executor_revision()
             self._bind_executor_control()
@@ -2456,7 +2527,7 @@ class SessionAuthority:
                 else:
                     self._finish("completed")
                 return
-            live_input = self._live_input_status(e)
+            live_input = self._live_input_status(e, include_rearm=False)
             if live_input is not None:
                 r["live_input"] = live_input
                 if (live_input.get("state") == "expired" and r["status"] in {"running", "resuming"}

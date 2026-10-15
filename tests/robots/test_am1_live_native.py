@@ -23,6 +23,25 @@ class MeasuredMotor(Motor):
         self.positions = dict.fromkeys(JOINT_KEYS, 0.0)
         self.acknowledged_commands = dict.fromkeys(JOINT_KEYS, 0.0)
 
+    def configure_workspace(self, raw=1845):
+        self.workspace_calibrations = dict(WORKSPACE_CALIBRATION)
+        self.workspace_goals = dict(WORKSPACE_GOALS)
+        self.workspace_goals[RIGHT] = raw
+        for name, value in self.workspace_goals.items():
+            calibration = self.workspace_calibrations[name]
+            fraction = (value-calibration[3])/(calibration[4]-calibration[3])
+            q = fraction*100 if name.endswith("_gripper") else fraction*200-100
+            self.positions[name+".pos"] = q
+            self.acknowledged_commands[name+".pos"] = q
+        self.workspace_raw = raw
+
+    def am1_live_workspace_context(self, binding, measured):
+        # Explicit simulated registers/context, checked by the same contract resolver.
+        return dict(robot_model="alohamini1", selected_model="sts3215",
+                    calibrations={k:list(v) for k,v in self.workspace_calibrations.items()},
+                    nonselected_goals={k:v for k,v in self.workspace_goals.items() if k!=RIGHT},
+                    right_pose={k:measured[k] for k in measured if k.startswith("arm_right_") and k!=RIGHT_KEY}), self.workspace_raw
+
     def am1_live_arm_commands(self, binding):
         return dict(self.acknowledged_commands)
 
@@ -157,6 +176,8 @@ class ExecutorNativeHost:
         self.actions = []
 
     def start(self, run_id, incarnation, recipe, cancel):
+        if recipe.name == "physical-live-right-elbow":
+            self.robot.configure_workspace()
         self.control = host.AM1LocalControl(run_id=run_id, host_incarnation=incarnation, live=True, live_recipe=recipe.name)
 
     def poll(self, previous):
@@ -444,13 +465,11 @@ def right_lane():
     owner.update({key: str(uuid4()) for key in owner})
     control = host.AM1LocalControl(**identity, live=True, live_recipe=RIGHT_RECIPE, clock=lambda: now[0])
     obj = MeasuredMotor()
-    obj.positions[RIGHT_KEY] = -10.0
-    obj.positions[LEFT_KEY] = 19.0
-    obj.acknowledged_commands[LEFT_KEY] = 19.0
+    obj.configure_workspace()
     return now, identity, owner, control, obj
 
 
-def right_sample(*, seq=1, expiry=10.25, target=-12.0, key=RIGHT_KEY):
+def right_sample(*, seq=1, expiry=10.25, target=-8.9, key=RIGHT_KEY):
     return {"target": {key: target}, "grant_id": str(uuid4()), "seq": seq,
             "valid_until_monotonic_s": expiry}
 
@@ -459,18 +478,18 @@ def test_right_native_freezes_negative_corridor_and_moves_only_right():
     now, identity, owner, control, obj = right_lane()
     assert control.apply(obj, frame(identity, owner, sequence=1))
     assert control.live_snapshot()["joint"] == RIGHT_KEY
-    assert control.live_snapshot()["corridor_min_norm"] == -13.0
-    assert control.live_snapshot()["corridor_max_norm"] == -10.0
+    assert control.live_snapshot()["corridor_min_norm"] == pytest.approx((1834-827)/2212*200-100)
+    assert control.live_snapshot()["corridor_max_norm"] == pytest.approx((1867-827)/2212*200-100)
     now[0] = 10.1
     assert control.apply(obj, frame(identity, owner, sequence=2, mode="active", epoch=2, sample=right_sample()))
     action = obj.events[-1][1]
-    assert action[RIGHT_KEY] == pytest.approx(-10.1)
+    assert action[RIGHT_KEY] == pytest.approx((1845-827)/2212*200-100-.1)
     assert LEFT_KEY not in action
-    assert control.accepted_action[LEFT_KEY] == 19.0
+    assert control.accepted_action[LEFT_KEY] == pytest.approx((2124-864)/2209*200-100)
     assert all(action[k] == 0 for k in ("x.vel", "y.vel", "theta.vel", "lift_axis.vel"))
 
 
-@pytest.mark.parametrize("key,target", [(LEFT_KEY, 18.0), (RIGHT_KEY, -13.01), (RIGHT_KEY, -9.99), (RIGHT_KEY, -7.0)])
+@pytest.mark.parametrize("key,target", [(LEFT_KEY, 18.0), (RIGHT_KEY, -13.01), (RIGHT_KEY, -9.99), (RIGHT_KEY, -5.9)])
 def test_right_rejects_wrong_joint_or_outside_original_corridor(key, target):
     now, identity, owner, control, obj = right_lane()
     control.apply(obj, frame(identity, owner, sequence=1))
@@ -492,24 +511,24 @@ def test_right_expiry_rejoin_preserves_reference_deadline_and_other_hold():
     now[0] = 10.26
     assert control.check_live(obj)
     assert obj.events[-2:] == [("zero",), ("hold",)]
-    obj.positions[RIGHT_KEY], obj.positions[LEFT_KEY] = -10.05, 18.5
+    obj.positions[RIGHT_KEY], obj.positions[LEFT_KEY] = (1845-827)/2212*200-100-.05, 18.5
     assert control.apply(obj, frame(identity, owner, sequence=3, epoch=3, revision=1))
     summary = control.live_snapshot()
-    assert summary["cursor_norm"] == -10.05
-    assert summary["reference_norm"] == -10.0
+    assert summary["cursor_norm"] == pytest.approx((1845-827)/2212*200-100-.05)
+    assert summary["reference_norm"] == pytest.approx((1845-827)/2212*200-100)
     assert summary["live_deadline_monotonic_s"] == deadline
-    assert control.live_held[LEFT_KEY] == 19.0
+    assert control.live_held[LEFT_KEY] == pytest.approx((2124-864)/2209*200-100)
     now[0] = 10.3
     count = len(obj.events)
     assert not control.apply(obj, frame(identity, owner, sequence=4, mode="active", epoch=4, revision=1,
                                         sample=right_sample(expiry=10.25)))
     assert len(obj.events) == count
     assert control.apply(obj, frame(identity, owner, sequence=4, mode="active", epoch=4, revision=1,
-                                    sample=right_sample(seq=2, expiry=10.5, target=-10)))
-    assert obj.events[-1][1][RIGHT_KEY] > -10.05
+                                    sample=right_sample(seq=2, expiry=10.5, target=(1845-827)/2212*200-100)))
+    assert obj.events[-1][1][RIGHT_KEY] > (1845-827)/2212*200-100-.05
 
 
-def right_packet(*, torque=0, goal=1817, present=1817, phase=12):
+def right_packet(*, torque=0, goal=1845, present=1845, phase=12):
     packet = bytearray(visible_register_packet(torque=torque, range_min=827, range_max=3039,
                                                goal=goal, present=present))
     packet[18] = phase
@@ -517,7 +536,7 @@ def right_packet(*, torque=0, goal=1817, present=1817, phase=12):
     return bytes(packet)
 
 
-def right_robot(monkeypatch, packets=(), *, position=1817):
+def right_robot(monkeypatch, packets=(), *, position=1845):
     obj, evidence, rows, identity, port, reads, writes = visible_robot(monkeypatch, packets)
     original_bus = obj.left_bus
     motor = original_bus.motors["arm_left_elbow_flex"]
@@ -535,12 +554,36 @@ def right_robot(monkeypatch, packets=(), *, position=1817):
         return dict.fromkeys(ids, position if address == 56 else 2 if address == 69 else 0), 0
 
     monkeypatch.setattr(right_bus, "_sync_read", right_read)
+    from lerobot.motors import Motor, MotorNormMode
+    from lerobot.robots.alohamini.alohamini import AlohaMini
+    for side in ("left", "right"):
+        bus = getattr(obj, side+"_bus")
+        names = [k for k in WORKSPACE_CALIBRATION if k.startswith("arm_"+side+"_")]
+        for name in names:
+            calibration = WORKSPACE_CALIBRATION[name]
+            bus.motors[name] = Motor(calibration[0],"sts3215",MotorNormMode.RANGE_0_100 if name.endswith("_gripper") else MotorNormMode.RANGE_M100_100)
+            bus.calibration[name] = MotorCalibration(*calibration)
+        setattr(obj,side+"_arm_motors",names)
+        bus._id_to_name_dict = {motor.id:name for name,motor in bus.motors.items()}
+        bus._id_to_model_dict = {motor.id:motor.model for motor in bus.motors.values()}
+        def read_all(address,length,ids,source=bus,**kwargs):
+            values = {}
+            for ident in ids:
+                name = source._id_to_name(ident)
+                values[ident] = (position if name==RIGHT else WORKSPACE_GOALS.get(name,0)) if address in (42,56) else 2 if address==69 else 0
+            reads.append((address,length,tuple(ids)))
+            return values,0
+        monkeypatch.setattr(bus,"_sync_read",read_all)
+    obj._am1_live_frozen_holds = tuple((getattr(obj,side+"_bus"),name,tuple(WORKSPACE_CALIBRATION[name]),position if name==RIGHT else WORKSPACE_GOALS[name])
+        for side in ("left","right") for name in getattr(obj,side+"_arm_motors"))
+    obj._am1_live_frozen_binding = {**identity,"recipe":RIGHT_RECIPE}
+    del obj.am1_live_arm_commands
     identity["recipe"] = RIGHT_RECIPE
     obj._am1_visible_control_binding = identity
     return obj, evidence, rows, identity, port, reads, writes, left_writes
 
 
-def right_guard(monkeypatch, *, start=1817):
+def right_guard(monkeypatch, *, start=1845, before_admit=None):
     obj, evidence, rows, identity, port, reads, writes, left_writes = right_robot(monkeypatch, [
         status(right_packet(present=start, goal=start), motor_id=3), status(bytes([91]), motor_id=3),
         status(right_packet(torque=1, present=start, goal=start), motor_id=3),
@@ -555,9 +598,11 @@ def right_guard(monkeypatch, *, start=1817):
     summary = {"reference_norm": q0, "corridor_min_norm": q0 - 3,
                "corridor_max_norm": q0,
                "live_admitted_at_monotonic_s": 10, "live_deadline_monotonic_s": 100}
-    obj._am1_selected_joint_position.update(read_started_at_monotonic_s=9.98, read_completed_at_monotonic_s=9.99)
-    obj._am1_selected_joint_current.update(read_started_at_monotonic_s=9.98, read_completed_at_monotonic_s=9.99)
+    if before_admit is not None:
+        before_admit(obj, summary)
     evidence.admit_live(obj, summary)
+    obj._am1_selected_joint_position.update(read_started_at_monotonic_s=9.98,read_completed_at_monotonic_s=9.99)
+    obj._am1_selected_joint_current.update(read_started_at_monotonic_s=9.98,read_completed_at_monotonic_s=9.99)
     control = host.AM1LocalControl(**{k: identity[k] for k in ("run_id", "host_incarnation")},
                                   live=True, live_recipe=RIGHT_RECIPE, selected_evidence=evidence,
                                   clock=lambda: now[0])
@@ -569,28 +614,28 @@ def test_right_owned_settings_feedback_and_encoded_envelopes(monkeypatch):
     obj, evidence, control, summary, now, port, writes, left_writes = right_guard(monkeypatch)
     assert evidence.visible_settings["before"]["registers"]["Phase"] == 12
     assert evidence.visible_settings["before"]["registers"]["Homing_Offset"] == -658
-    assert obj._am1_selected_joint_position["raw"] == 1817
-    assert obj._am1_selected_joint_position["normalized"] == pytest.approx(-10.488245931283899)
+    assert obj._am1_selected_joint_position["raw"] == 1845
+    assert obj._am1_selected_joint_position["normalized"] == pytest.approx(-7.956600361663661)
     assert obj._am1_selected_joint_current["raw"] == 2
-    assert summary["measured_origin_raw"] == 1817
-    assert summary["corridor_min_raw"] == 1783
-    assert summary["corridor_max_raw"] == 1817
-    assert summary["measured_min_raw"] == 1783
-    assert summary["measured_max_raw"] == 1850
+    assert summary["measured_origin_raw"] == 1845
+    assert summary["corridor_min_raw"] == 1834
+    assert summary["corridor_max_raw"] == 1867
+    assert summary["measured_min_raw"] == 1811
+    assert summary["measured_max_raw"] == 1878
     evidence.guard_live(obj, control)
-    obj._am1_selected_joint_position["raw"] = 1782
+    obj._am1_selected_joint_position["raw"] = 1810
     with pytest.raises(RuntimeError, match="corridor"):
         evidence.guard_live(obj, control)
 
 
 def test_right_selected_action_uses_right_encoded_write_and_provenance(monkeypatch):
     obj, evidence, control, summary, now, port, writes, left_writes = right_guard(monkeypatch)
-    obj.send_action({RIGHT_KEY: -13.488245931283899, "x.vel": 0, "y.vel": 0, "theta.vel": 0, "lift_axis.vel": 0})
+    obj.send_action({RIGHT_KEY: -8.951175406871613, "x.vel": 0, "y.vel": 0, "theta.vel": 0, "lift_axis.vel": 0})
     action = obj._am1_selected_joint_action
-    assert action["expected_goal_raw"] == 1783
+    assert action["expected_goal_raw"] == 1834
     assert action["sync_write_returned"] is True
-    assert action["encoded_goal_word"] == 1783
-    assert [row for row in writes if row[0] == 42][-1][2] == {3: 1783}
+    assert action["encoded_goal_word"] == 1834
+    assert [row for row in writes if row[0] == 42][-1][2] == {3: 1834}
     assert not [row for row in left_writes if row[0] == 42]
     assert evidence._base(obj, control, {})["motor"]["bus"] == "right"
     assert evidence._base(obj, control, {})["motor"]["name"] == RIGHT
@@ -628,7 +673,10 @@ def native_right_ready(monkeypatch):
     control.state, control.epoch = "ready", -1
     control._live_summary.update(summary)
     measured = dict.fromkeys(JOINT_KEYS, 0.0)
-    measured[RIGHT_KEY] = -10.488245931283899
+    for name, raw in WORKSPACE_GOALS.items():
+        calibration = WORKSPACE_CALIBRATION[name]
+        fraction=(raw-calibration[3])/(calibration[4]-calibration[3])
+        measured[name+".pos"] = fraction*100 if name.endswith("_gripper") else fraction*200-100
     obj.get_observation = lambda: dict(measured)
     obj.stop_motion = lambda: None
     obj.hold_follower_arms = lambda: None
@@ -642,9 +690,9 @@ def test_right_live_summary_exports_only_actual_current_selected_write(monkeypat
     obj, control, now, identity, owner, writes = native_right_ready(monkeypatch)
     now[0] = 10.1
     assert control.apply(obj, frame(identity, owner, sequence=2, mode="active", epoch=2,
-                                    sample=right_sample(target=-13.488245931283899)))
+                                    sample=right_sample(target=-8.951175406871613)))
     summary, actual = control.live_snapshot(), obj._am1_selected_joint_action
-    assert summary["encoded_goal_raw"] == 1815
+    assert summary["encoded_goal_raw"] == 1843
     assert summary["goal_write_returned"] is True
     assert summary["goal_write_started_at_monotonic_s"] == actual["write_started_at_monotonic_s"]
     assert summary["goal_write_completed_at_monotonic_s"] == actual["write_completed_at_monotonic_s"]
@@ -658,8 +706,8 @@ def test_right_live_summary_never_relabels_unmatched_cache_as_current_write(monk
     obj, control, now, identity, owner, writes = native_right_ready(monkeypatch)
     now[0] = 10.1
     assert control.apply(obj, frame(identity, owner, sequence=2, mode="active", epoch=2,
-                                    sample=right_sample(target=-13.488245931283899)))
-    assert control.live_snapshot()["encoded_goal_raw"] == 1815
+                                    sample=right_sample(target=-8.951175406871613)))
+    assert control.live_snapshot()["encoded_goal_raw"] == 1843
     original_send = obj.send_action
 
     def changed(action):
@@ -677,7 +725,7 @@ def test_right_live_summary_never_relabels_unmatched_cache_as_current_write(monk
     monkeypatch.setattr(obj, "send_action", changed)
     now[0] = 10.15
     assert control.apply(obj, frame(identity, owner, sequence=3, mode="active", epoch=2,
-                                    sample=right_sample(seq=2, expiry=10.4, target=-13.488245931283899)))
+                                    sample=right_sample(seq=2, expiry=10.4, target=-8.951175406871613)))
     assert "encoded_goal_raw" not in control.live_snapshot()
     assert "goal_action_sequence" not in control.live_snapshot()
 
@@ -694,7 +742,7 @@ def test_right_expiry_before_actual_write_never_exports_write_proof(monkeypatch)
     monkeypatch.setattr(obj, "_read_arm_positions", delayed)
     now[0] = 10.1
     assert not control.apply(obj, frame(identity, owner, sequence=2, mode="active", epoch=2,
-                                        sample=right_sample(target=-13.488245931283899)))
+                                        sample=right_sample(target=-8.951175406871613)))
     assert not [r for r in writes if r[0] == 42]
     assert "encoded_goal_raw" not in control.live_snapshot()
     assert control.live_snapshot()["state"] == "expired"
@@ -702,7 +750,7 @@ def test_right_expiry_before_actual_write_never_exports_write_proof(monkeypatch)
 
 
 def test_right_negative_command_corridor_cannot_cross_actual_calibrated_lower_limit(monkeypatch):
-    with pytest.raises(RuntimeError, match="admission/encoded corridor"):
+    with pytest.raises(RuntimeError, match="workspace|admission/encoded corridor"):
         right_guard(monkeypatch, start=838)
 
 
@@ -834,8 +882,11 @@ from tests.robots.test_am1_pre_activation import activation as endpoint_activati
 def test_real_frozen_eleven_goals_across_live_owned_hold_boundaries(endpoint_activation, monkeypatch, recipe, direction):
     from lerobot.robots.alohamini import alohamini as owner_module
     case = endpoint_activation
-    robot = protected_endpoint_case(case, monkeypatch, recipe)
-    robot.activate_motors(home_lift=False)
+    if recipe==RIGHT_RECIPE:
+        robot,_,_,_=workspace_owner(case,monkeypatch)
+    else:
+        robot=protected_endpoint_case(case,monkeypatch,recipe)
+        robot.activate_motors(home_lift=False)
     spec = host.live_elbow_spec(recipe)
     key, motor = spec.joint, spec.joint.removesuffix(".pos")
     selected_bus = getattr(robot, spec.side + "_bus")
@@ -843,9 +894,13 @@ def test_real_frozen_eleven_goals_across_live_owned_hold_boundaries(endpoint_act
                       for side, bus in (("left", robot.left_bus), ("right", robot.right_bus))
                       for name in bus.calibration if name != motor}
     def observation():
-        return {name + ".pos": value for bus in (robot.left_bus, robot.right_bus)
+        values = {name + ".pos": value for bus in (robot.left_bus, robot.right_bus)
                 for name, value in robot._normalize_arm_feedback(bus, {
                     name: bus.registers["Present_Position", name] for name in bus.calibration}).items()}
+        if recipe==RIGHT_RECIPE:
+            robot._am1_selected_joint_position=dict(raw=selected_bus.registers["Present_Position",motor],normalized=values[key],
+                read_started_at_monotonic_s=case.clock.now,read_completed_at_monotonic_s=case.clock.now)
+        return values
     robot.get_observation = observation
     robot.stop_motion = lambda: case.events.append(("owned_body_zero",))
     # Active device transport is injected; all hold/admission behavior is the real owner.
@@ -867,7 +922,7 @@ def test_real_frozen_eleven_goals_across_live_owned_hold_boundaries(endpoint_act
     assert observation()["arm_left_shoulder_lift.pos"] == 100.08421052631579
     def active(sequence, epoch, revision, seq):
         case.clock.now += .05
-        intent = {"target": {key: direction}, "grant_id": str(uuid4()), "seq": seq,
+        intent = {"target": {key: -8.9 if recipe==RIGHT_RECIPE else direction}, "grant_id": str(uuid4()), "seq": seq,
                   "valid_until_monotonic_s": case.clock.now + .25}
         assert control.apply(robot, frame(identity, client, sequence=sequence, mode="active", epoch=epoch,
                                           revision=revision, sample=intent))
@@ -951,12 +1006,12 @@ def expected_historical_write(control, owner, original, actual):
 
 def test_historical_write_real_right_expiry_retains_bound_success_without_current_proof(monkeypatch):
     obj, control, now, identity, owner, writes = native_right_ready(monkeypatch)
-    original = right_sample(target=-13.488245931283899)
+    original = right_sample(target=-8.951175406871613)
     now[0] = 10.1
     assert control.apply(obj, frame(identity, owner, sequence=2, mode="active", epoch=2, sample=original))
     actual = copy.deepcopy(obj._am1_selected_joint_action)
     expected = expected_historical_write(control, owner, original, actual)
-    assert actual["sync_write_returned"] is True and expected["encoded_goal_raw"] == 1815
+    assert actual["sync_write_returned"] is True and expected["encoded_goal_raw"] == 1843
     now[0] = 10.26
     assert control.check_live(obj)
     expired = control.live_snapshot()
@@ -1005,7 +1060,7 @@ def test_historical_write_both_recipes_use_verified_selected_return(monkeypatch,
 @pytest.mark.parametrize("bad", ["stale", "wrong_joint", "wrong_sequence", "failed_write", "foreign_host"])
 def test_historical_write_unmatched_new_attempt_cannot_relabel_previous_success(monkeypatch, bad):
     obj, control, now, identity, owner, writes = native_right_ready(monkeypatch)
-    original = right_sample(target=-13.488245931283899)
+    original = right_sample(target=-8.951175406871613)
     now[0] = 10.1
     assert control.apply(obj, frame(identity, owner, sequence=2, mode="active", epoch=2, sample=original))
     expected = expected_historical_write(control, owner, original, copy.deepcopy(obj._am1_selected_joint_action))
@@ -1024,7 +1079,7 @@ def test_historical_write_unmatched_new_attempt_cannot_relabel_previous_success(
 
     monkeypatch.setattr(obj, "send_action", unmatched)
     now[0] = 10.15
-    newer = right_sample(seq=2, expiry=10.4, target=-13.488245931283899)
+    newer = right_sample(seq=2, expiry=10.4, target=-8.951175406871613)
     assert control.apply(obj, frame(identity, owner, sequence=3, mode="active", epoch=2, sample=newer))
     current = control.live_snapshot()
     assert current["grant_id"] == newer["grant_id"]
@@ -1047,7 +1102,7 @@ def test_historical_write_prewrite_expiry_never_creates_success(monkeypatch):
     monkeypatch.setattr(obj, "_read_arm_positions", delayed)
     now[0] = 10.1
     assert not control.apply(obj, frame(identity, owner, sequence=2, mode="active", epoch=2,
-                                      sample=right_sample(target=-13.488245931283899)))
+                                      sample=right_sample(target=-8.951175406871613)))
     summary = control.live_snapshot()
     assert summary["state"] == "expired"
     assert not [row for row in writes if row[0] == 42]
@@ -1058,7 +1113,7 @@ def test_historical_write_prewrite_expiry_never_creates_success(monkeypatch):
 def test_historical_write_pause_readiness_preserve_history_until_fresh_success(monkeypatch):
     obj, control, now, identity, owner, writes = native_right_ready(monkeypatch)
     now[0] = 10.1
-    original = right_sample(target=-13.488245931283899)
+    original = right_sample(target=-8.951175406871613)
     assert control.apply(obj, frame(identity, owner, sequence=2, mode="active", epoch=2, sample=original))
     expected = expected_historical_write(control, owner, original, copy.deepcopy(obj._am1_selected_joint_action))
     admission = {k: control.live_snapshot()[k] for k in
@@ -1075,7 +1130,7 @@ def test_historical_write_pause_readiness_preserve_history_until_fresh_success(m
     # Readiness may perform a real measured-hold write, but is not a new input receipt.
     assert {k: ready[k] for k in admission} == admission
     now[0] = 10.31
-    fresh = right_sample(seq=2, expiry=10.55, target=-12.0)
+    fresh = right_sample(seq=2, expiry=10.55, target=-8.9)
     assert control.apply(obj, frame(identity, owner, sequence=5, mode="active", epoch=4, revision=1, sample=fresh))
     changed = control.live_snapshot()
     assert changed["last_successful_write"] == expected_historical_write(
@@ -1134,3 +1189,148 @@ def test_historical_write_executor_expired_evidence_carries_receipt_after_hold(m
         e.finish("stopped")
         e.worker.join(2)
         assert not e.worker.is_alive()
+
+
+# Retained AM1 bench calibration/acknowledged Goals from actual08/10.
+WORKSPACE_CALIBRATION = {
+    "arm_left_shoulder_pan": (1, 0, -1761, 731, 3438),
+    "arm_left_shoulder_lift": (2, 0, 515, 848, 3223),
+    "arm_left_elbow_flex": (3, 0, 1845, 864, 3073),
+    "arm_left_wrist_flex": (4, 0, -1939, 1314, 3208),
+    "arm_left_wrist_roll": (5, 0, 879, 0, 4095),
+    "arm_left_gripper": (6, 0, 933, 1886, 3401),
+    "arm_right_shoulder_pan": (1, 0, -1719, 752, 3456),
+    "arm_right_shoulder_lift": (2, 0, -1852, 1331, 3264),
+    "arm_right_elbow_flex": (3, 0, -658, 827, 3039),
+    "arm_right_wrist_flex": (4, 0, -1609, 1461, 3167),
+    "arm_right_wrist_roll": (5, 0, 1869, 0, 4095),
+    "arm_right_gripper": (6, 0, -1811, 1657, 3191),
+}
+WORKSPACE_GOALS = dict(zip(WORKSPACE_CALIBRATION, (2199,3223,2124,1546,2200,3167,2141,3252,1845,2772,2443,1981), strict=True))
+
+
+def workspace_owner(case, monkeypatch, raw=1845):
+    """Actual owner/frozen-map methods; only device registers and clock are injected."""
+    from lerobot.robots.alohamini import alohamini as module
+    robot = protected_endpoint_case(case, monkeypatch)
+    from lerobot.motors import MotorNormMode
+    for bus in (robot.left_bus, robot.right_bus):
+        for name in bus.calibration:
+            calibration = WORKSPACE_CALIBRATION[name]
+            bus.motors[name].norm_mode=MotorNormMode.RANGE_0_100 if name.endswith("_gripper") else MotorNormMode.RANGE_M100_100
+            bus.calibration[name] = MotorCalibration(*calibration)
+            value = raw if name == RIGHT else WORKSPACE_GOALS[name]
+            bus.registers.update({(key,name):v for key,v in (
+                ("Min_Position_Limit",calibration[3]),("Max_Position_Limit",calibration[4]),
+                ("Homing_Offset",calibration[2]),("Present_Position",3224 if name=="arm_left_shoulder_lift" else value),
+                ("Goal_Position",value),)})
+    robot.activate_motors(home_lift=False)
+    def observation():
+        result = {name+".pos":value for bus in (robot.left_bus,robot.right_bus)
+                  for name,value in robot._normalize_arm_feedback(bus,{name:bus.registers["Present_Position",name] for name in bus.calibration}).items()}
+        robot._am1_selected_joint_position = {"raw":robot.right_bus.registers["Present_Position",RIGHT],"normalized":result[RIGHT_KEY],
+            "read_started_at_monotonic_s":case.clock.now,"read_completed_at_monotonic_s":case.clock.now}
+        return result
+    robot.get_observation = observation
+    robot.stop_motion = lambda: case.events.append(("owned_body_zero",))
+    def send(action):
+        assert all(action[k]==0 for k in ("x.vel","y.vel","theta.vel","lift_axis.vel"))
+        if RIGHT_KEY in action:
+            encoded=module.FeetechMotorsBus._unnormalize(robot.right_bus,{3:action[RIGHT_KEY]})[3]
+            robot.right_bus.write("Goal_Position",RIGHT,encoded,normalize=False)
+        return dict(action)
+    robot.send_action=send
+    identity={k:robot._am1_visible_control_binding[k] for k in ("run_id","host_incarnation")}
+    control=host.AM1LocalControl(**identity,live=True,live_recipe=RIGHT_RECIPE,clock=lambda:case.clock.now)
+    owner={k:str(uuid4()) for k in ("service_incarnation","controller_generation","connection_generation")}
+    return robot,control,identity,owner
+
+
+@pytest.mark.parametrize("raw", [1845,1847])
+def test_workspace_next_start_keeps_actual_q0_and_reuses_inward_bounds(endpoint_activation,monkeypatch,raw):
+    robot,control,identity,owner=workspace_owner(endpoint_activation,monkeypatch,raw)
+    before=len(endpoint_activation.events)
+    assert control.apply(robot,frame(identity,owner,sequence=1))
+    live=control.live_snapshot()
+    assert live["reference_norm"]==pytest.approx((raw-827)/2212*200-100)
+    assert live["corridor_min_norm"]==pytest.approx((1834-827)/2212*200-100)
+    assert live["corridor_max_norm"]==pytest.approx((1867-827)/2212*200-100)
+    assert live["corridor_max_norm"]-live["corridor_min_norm"]<=3
+    assert live["measured_origin_raw"]==raw
+    assert (live["corridor_min_raw"],live["corridor_max_raw"])==(1834,1867)
+    assert live["admission_version"]==2
+    assert live["workspace"]["id"]=="am1-right-elbow-retained-v1"
+    assert robot.right_bus.registers["Goal_Position",RIGHT]==raw
+    assert not any(e[0]=="write" and e[2]=="Goal_Position" and e[4]==1867 for e in endpoint_activation.events[before:])
+
+
+@pytest.mark.parametrize("mutation", ["goal","calibration","right_pose","outside"])
+def test_workspace_native_admission_refuses_incompatible_current_context(endpoint_activation,monkeypatch,mutation):
+    robot,control,identity,owner=workspace_owner(endpoint_activation,monkeypatch)
+    if mutation=="goal":
+        # A stale frozen map must not be reinterpreted as a different permissible pose.
+        robot.right_bus.registers["Goal_Position","arm_right_shoulder_pan"]+=1
+    elif mutation=="calibration":
+        robot.right_bus.calibration[RIGHT].homing_offset=-657
+    elif mutation=="right_pose":
+        robot.right_bus.registers["Present_Position","arm_right_wrist_flex"]+=50
+    else:
+        robot.right_bus.registers["Present_Position",RIGHT]=1817
+    with pytest.raises(RuntimeError,match="workspace|acknowledged|calibration"):
+        control.apply(robot,frame(identity,owner,sequence=1))
+    assert "live_admitted_at_monotonic_s" not in control.live_snapshot()
+
+
+def test_workspace_context_accepts_one_tick_measurement_with_unchanged_actual_goals(endpoint_activation,monkeypatch):
+    robot,control,identity,owner=workspace_owner(endpoint_activation,monkeypatch)
+    robot.right_bus.registers["Present_Position","arm_right_wrist_flex"]+=1
+    assert control.apply(robot,frame(identity,owner,sequence=1))
+    assert control.live_snapshot()["measured_origin_raw"]==1845
+    assert robot.right_bus.registers["Goal_Position","arm_right_wrist_flex"]==2772
+
+
+def test_workspace_selected_admission_does_not_take_second_q0_read(monkeypatch):
+    def after_first(obj,summary):
+        obj.get_observation=lambda: (_ for _ in ()).throw(AssertionError("Do not reread/reseed the first fresh q0"))
+    obj,evidence,control,summary,*_=right_guard(monkeypatch,before_admit=after_first)
+    assert summary["measured_origin_raw"]==1845
+    assert summary["reference_norm"]==pytest.approx((1845-827)/2212*200-100)
+
+
+def test_workspace_actual_gripper_zero_to_hundred_pose_matches_retained_raw_goal(endpoint_activation,monkeypatch):
+    from lerobot.motors import MotorNormMode
+    robot,control,identity,owner=workspace_owner(endpoint_activation,monkeypatch)
+    robot.right_bus.motors["arm_right_gripper"].norm_mode=MotorNormMode.RANGE_0_100
+    assert robot.get_observation()["arm_right_gripper.pos"]==pytest.approx(21.121251629726206)
+    assert control.apply(robot,frame(identity,owner,sequence=1))
+    assert control.live_snapshot()["admission_version"]==2
+
+
+def test_workspace_owned_writes_reach_both_fixed_endpoints_across_actual_q0(monkeypatch):
+    obj,control,now,identity,owner,writes=native_right_ready(monkeypatch)
+    original=copy.deepcopy(control.live_snapshot())
+    frozen=obj._am1_live_frozen_holds
+    action_seq=1
+    input_seq=0
+    for target,expected,steps in ((original["corridor_max_norm"],1867,22),
+                                  (original["corridor_min_norm"],1834,32)):
+        for _ in range(steps):
+            now[0]+=0.1
+            action_seq+=1
+            input_seq+=1
+            assert control.apply(obj,frame(identity,owner,sequence=action_seq,mode="active",epoch=2,
+                sample=right_sample(seq=input_seq,expiry=now[0]+.25,target=target)))
+        live=control.live_snapshot()
+        assert live["encoded_goal_raw"]==expected
+        assert live["goal_write_returned"] is True
+        assert live["goal_action_sequence"]==action_seq
+        assert live["cursor_norm"]==target
+        assert live["reference_norm"]==original["reference_norm"]
+        assert live["measured_origin_raw"]==1845
+        assert live["workspace"]==original["workspace"]
+        assert live["live_deadline_monotonic_s"]==original["live_deadline_monotonic_s"]
+        assert (live["measured_min_raw"],live["measured_max_raw"])==(1811,1878)
+        assert obj._am1_live_frozen_holds==frozen
+    goals=[row for row in writes if row[0]==42]
+    assert {raw for _,_,values in goals for raw in values.values()} >= {1834,1867}
+    assert all(set(values)=={3} for _,_,values in goals)

@@ -833,6 +833,27 @@ class AlohaMini(Robot):
         return {name + ".pos": self._normalize_arm_feedback(bus, {name: goal})[name]
                 for bus, name, _, goal in frozen}
 
+    def am1_live_workspace_context(self, binding, measured):
+        """Qualify retained workspace from this sole owner's actual held-map reads."""
+        spec, frozen = self._am1_live_frozen_goal_entries(
+            binding, deadline=time.monotonic() + self.AM1_ACTIVATION_MAX_RAW_AGE_S)
+        selected = spec.joint.removesuffix(".pos")
+        position = getattr(self, "_am1_selected_joint_position", {})
+        now = time.monotonic()
+        if (type(position.get("raw")) is not int
+                or any(type(position.get(k)) not in (int, float) or not math.isfinite(position[k])
+                       for k in ("read_started_at_monotonic_s", "read_completed_at_monotonic_s"))
+                or not 0 <= position["read_started_at_monotonic_s"] <= position["read_completed_at_monotonic_s"] <= now
+                or now - position["read_started_at_monotonic_s"] > .5):
+            raise RuntimeError("Live workspace original measured acquisition is unavailable")
+        bus = getattr(self, spec.side + "_bus")
+        context = dict(robot_model=self.config.robot_model, selected_model=bus.motors[selected].model,
+                       calibrations={name: list(calibration) for _, name, calibration, _ in frozen},
+                       nonselected_goals={name: goal for _, name, _, goal in frozen if name != selected},
+                       right_pose={name + ".pos": measured.get(name + ".pos")
+                                   for _, name, _, _ in frozen if name.startswith("arm_right_") and name != selected})
+        return context, position["raw"]
+
     def _hold_am1_live_selected(self):
         deadline = time.monotonic() + self.AM1_ACTIVATION_MAX_RAW_AGE_S
         spec, frozen = self._am1_live_frozen_goal_entries(deadline=deadline)
@@ -1407,6 +1428,7 @@ class AlohaMini(Robot):
     def get_observation(self) -> RobotObservation:
         # Read actuators position for arm and vel for base
         observation_start_t = time.perf_counter()
+        arm_read_started = time.monotonic()
         # arm_pos = self.left_bus.sync_read("Present_Position", self.arm_motors)
 
         #print(f"Left arm motors: {self.left_arm_motors}, Right arm motors: {self.right_arm_motors}")  # debug
@@ -1459,6 +1481,9 @@ class AlohaMini(Robot):
         right_arm_state = {f"{k}.pos": v for k, v in right_pos.items()}
 
         obs_dict = {**left_arm_state, **right_arm_state,**base_vel}
+        if (getattr(self,"_am1_visible_control_binding",None) or {}).get("recipe")=="physical-live-right-elbow":
+            self._am1_workspace_observation = dict(positions={**left_arm_state,**right_arm_state},
+                read_started_at=arm_read_started, read_completed_at=time.monotonic())
         operation = getattr(self, "_lift_operation", None)
         if operation is not None:
             try:

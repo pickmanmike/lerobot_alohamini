@@ -877,7 +877,12 @@ def test_physical_live_selected_recipe_controls_only_its_frozen_joint(physical_l
     assert live["joint"] == joint and live["side"] == ("right" if right else "left")
     assert live["profile"] == ("LiveRightElbow" if right else "LiveLeftElbow")
     assert live["rate_norm_per_s"] == 1.0
-    assert (live["corridor_min_norm"], live["corridor_max_norm"]) == ((-3.0, 0.0) if right else (-10.0, 0.0))
+    assert (live["corridor_min_norm"], live["corridor_max_norm"]) == pytest.approx(
+        (((1834-827)/2212*200-100, (1867-827)/2212*200-100) if right else (-10.0, 0.0)))
+    if right:
+        assert live["admission_version"] == 2
+        assert live["workspace"]["id"] == "am1-right-elbow-retained-v1"
+        assert live["measured_origin_raw"] == 1845
     base = physical_live_controls(a, r)
     other_recipe = "physical-live-left-elbow" if right else "physical-live-right-elbow"
     assert not a.handle(command("start", operation_id=str(uuid.uuid4()), recipe=other_recipe,
@@ -885,11 +890,11 @@ def test_physical_live_selected_recipe_controls_only_its_frozen_joint(physical_l
     grant = a.handle(command("grant", **base), "owner")
     invalid = command("input", **base, grant_id=grant["grant_id"], seq=1, target={other: 0.0})
     assert not a.handle(invalid, "owner")["accepted"]
-    frame = command("input", **base, grant_id=grant["grant_id"], seq=1, target={joint: -.3})
+    frame = command("input", **base, grant_id=grant["grant_id"], seq=1, target={joint: live["cursor_norm"] - .3})
     assert len(encode(frame, CONTROL_LIMIT)) < CONTROL_LIMIT
     assert a.handle(frame, "owner")["accepted"]
     until(lambda: host.control.live_snapshot().get("last_input_seq") == 1)
-    assert all(host.control.accepted_action[k] == 0.0 for k in JOINT_KEYS if k != joint)
+    assert all(host.control.accepted_action[k] == host.control.live_held[k] for k in JOINT_KEYS if k != joint)
     latest = [event[1] for event in host.robot.events if event[0] == "action"][-1]
     assert all(latest[k] == 0.0 for k in ("x.vel", "y.vel", "theta.vel", "lift_axis.vel"))
     a.tick()
@@ -1003,7 +1008,7 @@ def test_physical_live_reacquisition_retains_reference_and_deadline(physical_liv
     initial = a.snapshot()["run"]
     grant = a.handle(command("grant", **base), "owner")
     assert a.handle(command("input", **base, grant_id=grant["grant_id"], seq=1,
-                            target={joint: -0.5}), "owner")["accepted"]
+                            target={joint: initial["live_input"]["cursor_norm"] - .5}), "owner")["accepted"]
     time.sleep(max(0, grant["expires"] - time.monotonic()) + 0.03)
     a.tick()
     assert a.run["status"] == "paused"
@@ -1014,12 +1019,12 @@ def test_physical_live_reacquisition_retains_reference_and_deadline(physical_liv
     assert current["live_input"]["reference_norm"] == initial["live_input"]["reference_norm"]
     assert current["live_input"]["corridor_min_norm"] == initial["live_input"]["corridor_min_norm"]
     assert current["live_input"]["cursor_intent_revision"] == fresh["intent_revision"]
-    assert current["live_input"]["cursor_norm"] == 0.0
+    assert current["live_input"]["cursor_norm"] == initial["live_input"]["reference_norm"]
     assert not a.handle(command("input", **base, grant_id=grant["grant_id"], seq=2,
                                 target={joint: -1.0}), "owner")["accepted"]
     new_grant = a.handle(command("grant", **fresh), "owner")
     assert a.handle(command("input", **fresh, grant_id=new_grant["grant_id"], seq=1,
-                            target={joint: -0.2}), "owner")["accepted"]
+                            target={joint: current["live_input"]["cursor_norm"] - .2}), "owner")["accepted"]
     assert e.task is None and e.worker.is_alive()
 
 
@@ -1330,3 +1335,136 @@ def test_physical_live_expired_presence_claim_and_pause_preserve_finishing(physi
     assert a.run["physical_result"]["run_id"] == first["run_id"]
     assert a.run["first_cause"] == cached_native_fault
     assert e._fault == cached_native_fault
+
+
+@pytest.mark.parametrize("physical_live_authority", [
+    "physical-live-left-elbow", "physical-live-right-elbow",
+], indirect=True)
+def test_live_voluntary_release_new_gesture_qualified_rearm(physical_live_authority):
+    from tests.robots.test_am1_physical_executor import until
+
+    a, e, host, r = physical_live_authority
+    base = physical_live_controls(a, r)
+    until(lambda: (a.tick() or a.snapshot()["evidence"].get("active_acknowledged") is True))
+    before = a.snapshot()["run"]
+    value = before["live_input"]
+    joint = value["joint"]
+    grant = a.handle(command("grant", **base), "owner")
+    target = max(value["corridor_min_norm"], min(value["cursor_norm"] - 0.2, value["corridor_max_norm"]))
+    assert a.handle(command("input", **base, grant_id=grant["grant_id"], seq=1,
+                            target={joint: target}), "owner")["accepted"]
+    released = a.handle(command("release_input", **base, release_kind="voluntary_jog"), "owner")
+    assert released["accepted"], released
+    revision = a.run["intent_revision"]
+    assert a.snapshot()["run"]["live_input"]["rearm"] == {
+        "eligible": True, "released_intent_revision": revision,
+    }
+    assert a.run["intent"] is None and a.run["status"] == "paused"
+    a.tick()
+    assert "rearm" not in a.run["live_input"]  # A volatile gesture permission is never durable history.
+    assert not a.handle(command("grant", **base), "owner")["accepted"]
+    connected = a.handle(command("connect", **base, rearm_of_intent_revision=revision), "owner")
+    assert connected["accepted"], connected
+    fresh = dict(base, connection_generation=connected["connection_generation"])
+    fresh.pop("intent_revision")
+    assert a.handle(command("release_input", **fresh, rearm_of_intent_revision=revision), "owner")["accepted"]
+    until(lambda: (a.tick() or a.snapshot()["evidence"].get("pose_aligned") is True))
+    resumed = a.handle(command("resume", **fresh, expected_intent_revision=revision + 1,
+                               rearm_of_intent_revision=revision), "owner")
+    assert resumed["accepted"], resumed
+    assert a.run["intent_revision"] == revision + 2
+    until(lambda: (a.tick() or a.snapshot()["evidence"].get("active_acknowledged") is True))
+    after = a.snapshot()["run"]
+    for key in ("run_id", "deadline", "native_live_at", "recovery_episodes"):
+        assert after[key] == before[key]
+    for key in ("reference_norm", "corridor_min_norm", "corridor_max_norm"):
+        assert after["live_input"][key] == value[key]
+    assert after["live_input"]["rearm"]["eligible"] is False
+    assert a.run["intent"] is None  # Rearm is not an input or replay.
+    fresh["intent_revision"] = a.run["intent_revision"]
+    grant = a.handle(command("grant", **fresh), "owner")
+    assert a.handle(command("input", **fresh, grant_id=grant["grant_id"], seq=1,
+                            target={joint: target}), "owner")["accepted"]
+
+
+@pytest.mark.parametrize("loss", ["pause", "plain_release", "expiry", "foreign_connect", "wrong_revision"])
+def test_live_rearm_cannot_cross_strict_loss(physical_live_authority, loss):
+    import time
+    from tests.robots.test_am1_physical_executor import until
+
+    a, e, host, r = physical_live_authority
+    base = physical_live_controls(a, r)
+    until(lambda: (a.tick() or a.snapshot()["evidence"].get("active_acknowledged") is True))
+    grant = a.handle(command("grant", **base), "owner")
+    assert a.handle(command("input", **base, grant_id=grant["grant_id"], seq=1,
+                            target={"arm_left_elbow_flex.pos": -0.2}), "owner")["accepted"]
+    if loss == "expiry":
+        time.sleep(max(0, grant["expires"] - time.monotonic()) + 0.02)
+        a.tick()
+    released = a.handle(command("release_input", **base, release_kind="voluntary_jog"), "owner")
+    assert released["accepted"], released
+    revision = a.run["intent_revision"]
+    if loss == "pause":
+        assert a.handle(command("pause", run_id=r["run_id"]), "another-viewer")["accepted"]
+    elif loss == "plain_release":
+        assert a.handle(command("release_input", **base), "owner")["accepted"]
+    elif loss == "foreign_connect":
+        explicit = a.handle(command("connect", **base), "owner")
+        assert explicit["accepted"]
+    elif loss == "wrong_revision":
+        revision -= 1
+    auto = a.handle(command("connect", **base, rearm_of_intent_revision=revision), "owner")
+    assert not auto["accepted"], (loss, auto)
+    assert a.run["status"] == "paused" and a.run["intent"] is None
+
+
+def test_live_initial_release_cannot_claim_ordinary_rearm(physical_live_authority):
+    a, e, host, r = physical_live_authority
+    s = a.snapshot()
+    base = dict(run_id=r["run_id"], service_incarnation=s["service_incarnation"],
+                controller_generation=s["controller"]["controller_generation"],
+                host_incarnation=s["evidence"]["host_incarnation"])
+    connected = a.handle(command("connect", **base), "owner")
+    base["connection_generation"] = connected["connection_generation"]
+    base["intent_revision"] = a.run["intent_revision"]
+    assert a.handle(command("release_input", **base, release_kind="voluntary_jog"), "owner")["accepted"]
+    assert a.snapshot()["run"]["live_input"]["rearm"]["eligible"] is False
+    assert not a.handle(command("connect", **base, rearm_of_intent_revision=a.run["intent_revision"]), "owner")["accepted"]
+
+
+@pytest.mark.parametrize("receipt", ["cached-active", "expired-paused", "paused-native"])
+def test_voluntary_release_cannot_reclassify_expiry_during_feedback(physical_live_authority, monkeypatch, receipt):
+    import copy
+    import time
+    from tests.robots.test_am1_physical_executor import until
+
+    a, e, host, r = physical_live_authority
+    base = physical_live_controls(a, r)
+    until(lambda: (a.tick() or a.snapshot()["evidence"].get("active_acknowledged") is True))
+    grant = a.handle(command("grant", **base), "owner")
+    assert a.handle(command("input", **base, grant_id=grant["grant_id"], seq=1,
+                            target={"arm_left_elbow_flex.pos": -.2}), "owner")["accepted"]
+    evidence = a._evidence
+    calls = []
+    def delayed_feedback():
+        calls.append(time.monotonic())
+        value = copy.deepcopy(evidence())
+        # The public command ticks first, then reads evidence inside release classification.
+        if len(calls) == 2:
+            assert time.monotonic() < grant["expires"]
+            if receipt != "paused-native":
+                time.sleep(grant["expires"] - time.monotonic() + .03)
+            if receipt != "cached-active":
+                value["active_acknowledged"] = False
+                value["accepted_host_action"]["state"] = "paused"
+                value["live_input"]["state"] = "expired"
+        return value
+    monkeypatch.setattr(a, "_evidence", delayed_feedback)
+    result = a.handle(command("release_input", **base, release_kind="voluntary_jog"), "owner")
+    assert result["accepted"], result  # Holding remains available.
+    assert len(calls) >= 2
+    if receipt != "paused-native":
+        assert time.monotonic() >= grant["expires"]
+    assert a.run["status"] == "paused" and a.run["intent"] is None
+    assert not a.snapshot()["run"]["live_input"]["rearm"]["eligible"]
+    assert not a.handle(command("connect", **base, rearm_of_intent_revision=a.run["intent_revision"]), "owner")["accepted"]
