@@ -1215,7 +1215,7 @@ WORKSPACE_CALIBRATION = {
 WORKSPACE_GOALS = dict(zip(WORKSPACE_CALIBRATION, (2199,3223,2124,1546,2200,3167,2141,3252,1845,2772,2443,1981), strict=True))
 
 
-def workspace_owner(case, monkeypatch, raw=1845):
+def workspace_owner(case, monkeypatch, raw=1845, *, wrist_raw=2443):
     """Actual owner/frozen-map methods; only device registers and clock are injected."""
     from lerobot.robots.alohamini import alohamini as module
     robot = protected_endpoint_case(case, monkeypatch)
@@ -1225,7 +1225,7 @@ def workspace_owner(case, monkeypatch, raw=1845):
             calibration = WORKSPACE_CALIBRATION[name]
             bus.motors[name].norm_mode=MotorNormMode.RANGE_0_100 if name.endswith("_gripper") else MotorNormMode.RANGE_M100_100
             bus.calibration[name] = MotorCalibration(*calibration)
-            value = raw if name == RIGHT else WORKSPACE_GOALS[name]
+            value = raw if name == RIGHT else wrist_raw if name == "arm_right_wrist_roll" else WORKSPACE_GOALS[name]
             bus.registers.update({(key,name):v for key,v in (
                 ("Min_Position_Limit",calibration[3]),("Max_Position_Limit",calibration[4]),
                 ("Homing_Offset",calibration[2]),("Present_Position",3224 if name=="arm_left_shoulder_lift" else value),
@@ -1340,3 +1340,79 @@ def test_workspace_owned_writes_reach_both_fixed_endpoints_across_actual_q0(monk
     goals=[row for row in writes if row[0]==42]
     assert {raw for _,_,values in goals for raw in values.values()} >= {1834,1867}
     assert all(set(values)=={3} for _,_,values in goals)
+
+
+def wrist_workspace_context(raw=2443):
+    """Existing actual AM1 fixture; preserve actual changed Goal and measured pose."""
+    goals={name:value for name,value in WORKSPACE_GOALS.items() if name!=RIGHT}
+    goals["arm_right_wrist_roll"]=raw
+    pose={}
+    for name,value in goals.items():
+        if not name.startswith("arm_right_"):continue
+        calibration=WORKSPACE_CALIBRATION[name]
+        fraction=(value-calibration[3])/(calibration[4]-calibration[3]) if type(value) is int else 0
+        pose[name+".pos"]=fraction*100 if name.endswith("_gripper") else fraction*200-100
+    return dict(robot_model="alohamini1",selected_model="sts3215",
+        calibrations={name:list(value) for name,value in WORKSPACE_CALIBRATION.items()},
+        nonselected_goals=goals,right_pose=pose)
+
+
+@pytest.mark.parametrize("raw",[2442,2443,2444])
+def test_workspace_fixed_wrist_anchor_admits_actual_one_tick_seed_without_rewrite(endpoint_activation,monkeypatch,raw):
+    robot,control,identity,owner=workspace_owner(endpoint_activation,monkeypatch,wrist_raw=raw)
+    assert control.apply(robot,frame(identity,owner,sequence=1))
+    wrist="arm_right_wrist_roll"
+    frozen=next(row for row in robot._am1_live_frozen_holds if row[1]==wrist)
+    assert frozen[3]==robot.right_bus.registers["Goal_Position",wrist]==raw
+    assert control.live_held[wrist+".pos"]==pytest.approx(raw/4095*200-100)
+    assert control.live_snapshot()["measured_origin_raw"]==1845
+    assert (control.live_snapshot()["corridor_min_raw"],control.live_snapshot()["corridor_max_raw"])==(1834,1867)
+    assert control.live_snapshot()["live_deadline_monotonic_s"]-control.live_snapshot()["live_admitted_at_monotonic_s"]==90
+
+
+@pytest.mark.parametrize("raw",[2441,2445,2443.0,True,None,"2443",float("nan")])
+def test_workspace_fixed_wrist_anchor_rejects_outside_two_ticks_or_noninteger(raw):
+    from examples.alohamini.am1_session_contract import LIVE_ELBOW_WORKSPACES
+    with pytest.raises(ValueError):LIVE_ELBOW_WORKSPACES[RIGHT_RECIPE].qualify(wrist_workspace_context(raw))
+
+
+@pytest.mark.parametrize("name",[name for name in WORKSPACE_GOALS if name not in {RIGHT,"arm_right_wrist_roll"}])
+def test_workspace_wrist_exception_keeps_other_ten_goal_coordinates_exact(name):
+    from examples.alohamini.am1_session_contract import LIVE_ELBOW_WORKSPACES
+    context=wrist_workspace_context(2444);context["nonselected_goals"][name]+=1
+    with pytest.raises(ValueError):LIVE_ELBOW_WORKSPACES[RIGHT_RECIPE].qualify(context)
+
+
+def test_workspace_wrist_exception_keeps_calibration_and_measured_pose_checks_exact():
+    from examples.alohamini.am1_session_contract import LIVE_ELBOW_WORKSPACES
+    spec=LIVE_ELBOW_WORKSPACES[RIGHT_RECIPE]
+    context=wrist_workspace_context(2444);context["calibrations"]["arm_right_wrist_roll"][2]+=1
+    with pytest.raises(ValueError):spec.qualify(context)
+    context=wrist_workspace_context(2444);context["right_pose"]["arm_right_wrist_roll.pos"]+=1.01
+    with pytest.raises(ValueError):spec.qualify(context)
+
+
+def test_workspace_wrist_fixed_anchor_does_not_ratchet_or_mutate_actual_context():
+    from examples.alohamini.am1_session_contract import LIVE_ELBOW_WORKSPACES
+    spec=LIVE_ELBOW_WORKSPACES[RIGHT_RECIPE];context=wrist_workspace_context(2444);original=copy.deepcopy(context)
+    spec.qualify(context);assert context==original
+    with pytest.raises(ValueError):spec.qualify(wrist_workspace_context(2445))
+
+
+def test_workspace_wrist_anchor_does_not_relax_same_run_frozen_goal_reads(endpoint_activation,monkeypatch):
+    robot,control,identity,owner=workspace_owner(endpoint_activation,monkeypatch,wrist_raw=2444)
+    assert control.apply(robot,frame(identity,owner,sequence=1))
+    robot.right_bus.registers["Goal_Position","arm_right_wrist_roll"]=2443
+    with pytest.raises(RuntimeError,match="acknowledged"):
+        robot.am1_live_arm_commands({**identity,"recipe":RIGHT_RECIPE})
+
+
+def test_workspace_wrist_policy_identity_covers_anchor_and_tolerance_without_schema_growth():
+    from dataclasses import replace
+    from examples.alohamini.am1_session_contract import LIVE_ELBOW_WORKSPACES
+    spec=LIVE_ELBOW_WORKSPACES[RIGHT_RECIPE]
+    assert spec.wrist_roll_goal_anchor_raw==2443 and spec.wrist_roll_goal_tolerance_raw==1
+    assert spec.context_sha256!=replace(spec,wrist_roll_goal_anchor_raw=2444).context_sha256
+    assert spec.context_sha256!=replace(spec,wrist_roll_goal_tolerance_raw=2).context_sha256
+    assert spec.context_sha256!="837dc65e96b6c905891b5cfe6fb58f5e24d35f9c4a6ce5b329642b46390958f0"
+    assert len(spec.descriptor)==5 and len(spec.summary())==11

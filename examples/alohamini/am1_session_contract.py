@@ -69,7 +69,9 @@ class LiveWorkspaceSpec:
     evidence_max_raw: int = 1867
     command_min_raw: int = 1834
     command_max_raw: int = 1867
-    # Existing owner measured-hold alignment tolerance; exact raw Goals remain required.
+    # Per-run raw Goals remain exact; only admission uses this fixed wrist anchor.
+    wrist_roll_goal_anchor_raw: int = 2443
+    wrist_roll_goal_tolerance_raw: int = 1
     pose_tolerance_norm: float = 1.0
 
     @staticmethod
@@ -84,6 +86,8 @@ class LiveWorkspaceSpec:
                                calibrations=self.calibration_context_sha256, goals=self.nonselected_goals_sha256,
                                evidence=[self.evidence_min_raw,self.evidence_max_raw],
                                command=[self.command_min_raw,self.command_max_raw], pose_tolerance_norm=self.pose_tolerance_norm,
+                               wrist_roll_goal=dict(motor="arm_right_wrist_roll", anchor_raw=self.wrist_roll_goal_anchor_raw,
+                                                    tolerance_raw=self.wrist_roll_goal_tolerance_raw),
                                normalization=dict(gripper="range_0_100",other="range_m100_100")))
 
     @property
@@ -105,10 +109,16 @@ class LiveWorkspaceSpec:
         try:
             if (not isinstance(context,dict) or set(context)!={"robot_model","selected_model","calibrations","nonselected_goals","right_pose"}
                     or context["robot_model"]!="alohamini1" or context["selected_model"]!="sts3215"
-                    or self._hash(context["calibrations"])!=self.calibration_context_sha256
-                    or self._hash(context["nonselected_goals"])!=self.nonselected_goals_sha256):
+                    or self._hash(context["calibrations"])!=self.calibration_context_sha256):
                 raise ValueError("Live workspace actual calibration or held Goal context differs")
             goals, calibration, pose = context["nonselected_goals"], context["calibrations"], context["right_pose"]
+            wrist = goals.get("arm_right_wrist_roll") if isinstance(goals, dict) else None
+            if (type(wrist) is not int
+                    or abs(wrist-self.wrist_roll_goal_anchor_raw)>self.wrist_roll_goal_tolerance_raw):
+                raise ValueError("Live workspace actual wrist Goal left its fixed raw context")
+            canonical_goals = dict(goals, arm_right_wrist_roll=self.wrist_roll_goal_anchor_raw)
+            if self._hash(canonical_goals)!=self.nonselected_goals_sha256:
+                raise ValueError("Live workspace actual calibration or held Goal context differs")
             right={name:raw for name,raw in goals.items() if name.startswith("arm_right_")}
             if set(pose)!={name+".pos" for name in right}:
                 raise ValueError("Live workspace actual right pose is incomplete")
