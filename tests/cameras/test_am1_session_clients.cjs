@@ -407,7 +407,7 @@ for(const selected of [{recipe:"physical-live-left-elbow",joint:"arm_left_elbow_
         measured_positions:{[selected.joint]:4},required_observation:true},
       run:{run_id:"test-only-live-protocol",recipe:selected.recipe,source:"protected-physical-provider",status:"running",
         intent_revision:7,backend_incarnation:"fixture-host",progress_s:0,native_live_at:810,deadline:900,remaining_s:90,
-        live_input:{joint:selected.joint,side:selected.side,label:selected.label,profile:selected.profile,rate_norm_per_s:1,reference_norm:selected.side==="right"?1:5,corridor_min_norm:selected.side==="right"?1:-5,corridor_max_norm:selected.side==="right"?4:5,
+        live_input:{joint:selected.joint,side:selected.side,label:selected.label,profile:selected.profile,rate_norm_per_s:1,reference_norm:selected.side==="right"?4:5,corridor_min_norm:selected.side==="right"?1:-5,corridor_max_norm:selected.side==="right"?4:5,
           cursor_norm:4,cursor_feedback_sequence:30,cursor_intent_revision:7,state:"awaiting_input"}}};
     globalThis.fixtureLiveRun=am1Remote.snapshot.run;am1Remote.snapshot.run=null;
     globalThis.liveFrames=[];globalThis.wireFrames=[];
@@ -460,7 +460,7 @@ for(const selected of [{recipe:"physical-live-left-elbow",joint:"arm_left_elbow_
   await page.locator('[data-body-key="w"]').hover();await page.mouse.down();await page.mouse.up();
   assert.equal(await page.evaluate(()=>am1Remote.elbowInput()!==null),true,"disabled body pointer release must not revoke the live elbow lane");
   const negative=page.locator('[data-elbow-jog="-1"]');await negative.hover();await page.mouse.down();
-  await page.waitForFunction(()=>liveFrames.filter(frame=>frame.command.op==="input").length>=22);
+  await page.waitForFunction(n=>liveFrames.filter(frame=>frame.command.op==="input").length>=n,selected.side==="right"?55:22);
   const before=await page.evaluate(key=>liveFrames.filter(frame=>frame.command.op==="input").at(-1).command.target[key],selected.joint);
   await page.keyboard.down("]");
   await page.waitForFunction(({key,value})=>liveFrames.filter(frame=>frame.command.op==="input").at(-1).command.target[key]>value,{key:selected.joint,value:before});
@@ -489,6 +489,14 @@ for(const selected of [{recipe:"physical-live-left-elbow",joint:"arm_left_elbow_
   for(let index=1;index<4;index++)assert(result.frames[index].at-result.frames[index-1].at>=40,"nominal cadence does not burst/replay");
   assert((result.frames[2].at-result.frames[0].at)/2<85,"immediate physical grant/input replies use the ordinary page nominal16.7Hz schedule");
   const beforeBlur=result.frames.filter(frame=>frame.command.intent_revision===7);
+  const bounds=result.run.live_input;
+  assert.deepEqual([bounds.corridor_min_norm-bounds.reference_norm,bounds.corridor_max_norm-bounds.reference_norm],selected.side==="right"?[-3,0]:[-10,0]);
+  assert(result.frames.every(frame=>frame.command.target[selected.joint]>=bounds.corridor_min_norm && frame.command.target[selected.joint]<=bounds.corridor_max_norm),"loaded input obeys current admitted bounds");
+  if(selected.side==="right") {
+    assert(beforeBlur[0].command.target[selected.joint]<bounds.reference_norm,"right first fresh gesture departs negatively from q0");
+    assert(beforeBlur.some(frame=>Math.abs(frame.command.target[selected.joint]-bounds.corridor_min_norm)<1e-9),"right streaming clamps at the negative endpoint");
+    assert.equal(bounds.reference_norm,4,"recovery retains the original q0 independently of measured cursor2");
+  }
   const maxWireWindow=Math.max(...beforeBlur.map(frame=>beforeBlur.filter(row=>row.at>=frame.at&&row.at<frame.at+1000).length))*2;
   assert(maxWireWindow+4<=40,"whole grant/input wire traffic must reserve4 handshake/ACK frames within the existing40-frame gateway window");
   assert(result.renewals>=2,"actual claimed controller keeps HTTP presence renewal enabled");

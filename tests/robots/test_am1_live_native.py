@@ -249,7 +249,7 @@ def test_grant_readiness_does_not_clear_an_applied_sample():
 
 @pytest.mark.parametrize("recipe,joint,direction", [
     ("physical-live-left-elbow", "arm_left_elbow_flex.pos", -1),
-    ("physical-live-right-elbow", "arm_right_elbow_flex.pos", 1),
+    ("physical-live-right-elbow", "arm_right_elbow_flex.pos", -1),
 ])
 def test_production_host_ipc_expiry_retains_same_run_and_new_intent_resumes(recipe, joint, direction):
     import os
@@ -450,27 +450,27 @@ def right_lane():
     return now, identity, owner, control, obj
 
 
-def right_sample(*, seq=1, expiry=10.25, target=-8.0, key=RIGHT_KEY):
+def right_sample(*, seq=1, expiry=10.25, target=-12.0, key=RIGHT_KEY):
     return {"target": {key: target}, "grant_id": str(uuid4()), "seq": seq,
             "valid_until_monotonic_s": expiry}
 
 
-def test_right_native_freezes_positive_corridor_and_moves_only_right():
+def test_right_native_freezes_negative_corridor_and_moves_only_right():
     now, identity, owner, control, obj = right_lane()
     assert control.apply(obj, frame(identity, owner, sequence=1))
     assert control.live_snapshot()["joint"] == RIGHT_KEY
-    assert control.live_snapshot()["corridor_min_norm"] == -10.0
-    assert control.live_snapshot()["corridor_max_norm"] == -7.0
+    assert control.live_snapshot()["corridor_min_norm"] == -13.0
+    assert control.live_snapshot()["corridor_max_norm"] == -10.0
     now[0] = 10.1
     assert control.apply(obj, frame(identity, owner, sequence=2, mode="active", epoch=2, sample=right_sample()))
     action = obj.events[-1][1]
-    assert action[RIGHT_KEY] == pytest.approx(-9.9)
+    assert action[RIGHT_KEY] == pytest.approx(-10.1)
     assert LEFT_KEY not in action
     assert control.accepted_action[LEFT_KEY] == 19.0
     assert all(action[k] == 0 for k in ("x.vel", "y.vel", "theta.vel", "lift_axis.vel"))
 
 
-@pytest.mark.parametrize("key,target", [(LEFT_KEY, 18.0), (RIGHT_KEY, -10.01), (RIGHT_KEY, -6.99)])
+@pytest.mark.parametrize("key,target", [(LEFT_KEY, 18.0), (RIGHT_KEY, -13.01), (RIGHT_KEY, -9.99), (RIGHT_KEY, -7.0)])
 def test_right_rejects_wrong_joint_or_outside_original_corridor(key, target):
     now, identity, owner, control, obj = right_lane()
     control.apply(obj, frame(identity, owner, sequence=1))
@@ -485,24 +485,28 @@ def test_right_rejects_wrong_joint_or_outside_original_corridor(key, target):
 
 def test_right_expiry_rejoin_preserves_reference_deadline_and_other_hold():
     now, identity, owner, control, obj = right_lane()
-    control.apply(obj, frame(identity, owner, sequence=1))
+    assert control.apply(obj, frame(identity, owner, sequence=1))
     deadline = control.live_snapshot()["live_deadline_monotonic_s"]
     now[0] = 10.1
-    control.apply(obj, frame(identity, owner, sequence=2, mode="active", epoch=2, sample=right_sample()))
+    assert control.apply(obj, frame(identity, owner, sequence=2, mode="active", epoch=2, sample=right_sample()))
     now[0] = 10.26
     assert control.check_live(obj)
     assert obj.events[-2:] == [("zero",), ("hold",)]
-    obj.positions[RIGHT_KEY], obj.positions[LEFT_KEY] = -9.95, 18.5
+    obj.positions[RIGHT_KEY], obj.positions[LEFT_KEY] = -10.05, 18.5
     assert control.apply(obj, frame(identity, owner, sequence=3, epoch=3, revision=1))
     summary = control.live_snapshot()
-    assert summary["cursor_norm"] == -9.95
+    assert summary["cursor_norm"] == -10.05
     assert summary["reference_norm"] == -10.0
     assert summary["live_deadline_monotonic_s"] == deadline
     assert control.live_held[LEFT_KEY] == 19.0
     now[0] = 10.3
+    count = len(obj.events)
+    assert not control.apply(obj, frame(identity, owner, sequence=4, mode="active", epoch=4, revision=1,
+                                        sample=right_sample(expiry=10.25)))
+    assert len(obj.events) == count
     assert control.apply(obj, frame(identity, owner, sequence=4, mode="active", epoch=4, revision=1,
                                     sample=right_sample(seq=2, expiry=10.5, target=-10)))
-    assert obj.events[-1][1][RIGHT_KEY] < -9.95
+    assert obj.events[-1][1][RIGHT_KEY] > -10.05
 
 
 def right_packet(*, torque=0, goal=1817, present=1817, phase=12):
@@ -548,8 +552,8 @@ def right_guard(monkeypatch, *, start=1817):
     obj.get_observation()
     obj.read_and_check_currents(1800, False)
     q0 = (start - 827) / 2212 * 200 - 100
-    summary = {"reference_norm": q0, "corridor_min_norm": q0,
-               "corridor_max_norm": q0 + 3,
+    summary = {"reference_norm": q0, "corridor_min_norm": q0 - 3,
+               "corridor_max_norm": q0,
                "live_admitted_at_monotonic_s": 10, "live_deadline_monotonic_s": 100}
     obj._am1_selected_joint_position.update(read_started_at_monotonic_s=9.98, read_completed_at_monotonic_s=9.99)
     obj._am1_selected_joint_current.update(read_started_at_monotonic_s=9.98, read_completed_at_monotonic_s=9.99)
@@ -569,8 +573,8 @@ def test_right_owned_settings_feedback_and_encoded_envelopes(monkeypatch):
     assert obj._am1_selected_joint_position["normalized"] == pytest.approx(-10.488245931283899)
     assert obj._am1_selected_joint_current["raw"] == 2
     assert summary["measured_origin_raw"] == 1817
-    assert summary["corridor_min_raw"] == 1817
-    assert summary["corridor_max_raw"] == 1850
+    assert summary["corridor_min_raw"] == 1783
+    assert summary["corridor_max_raw"] == 1817
     assert summary["measured_min_raw"] == 1783
     assert summary["measured_max_raw"] == 1850
     evidence.guard_live(obj, control)
@@ -581,12 +585,12 @@ def test_right_owned_settings_feedback_and_encoded_envelopes(monkeypatch):
 
 def test_right_selected_action_uses_right_encoded_write_and_provenance(monkeypatch):
     obj, evidence, control, summary, now, port, writes, left_writes = right_guard(monkeypatch)
-    obj.send_action({RIGHT_KEY: -7.488245931283899, "x.vel": 0, "y.vel": 0, "theta.vel": 0, "lift_axis.vel": 0})
+    obj.send_action({RIGHT_KEY: -13.488245931283899, "x.vel": 0, "y.vel": 0, "theta.vel": 0, "lift_axis.vel": 0})
     action = obj._am1_selected_joint_action
-    assert action["expected_goal_raw"] == 1850
+    assert action["expected_goal_raw"] == 1783
     assert action["sync_write_returned"] is True
-    assert action["encoded_goal_word"] == 1850
-    assert [row for row in writes if row[0] == 42][-1][2] == {3: 1850}
+    assert action["encoded_goal_word"] == 1783
+    assert [row for row in writes if row[0] == 42][-1][2] == {3: 1783}
     assert not [row for row in left_writes if row[0] == 42]
     assert evidence._base(obj, control, {})["motor"]["bus"] == "right"
     assert evidence._base(obj, control, {})["motor"]["name"] == RIGHT
@@ -638,9 +642,9 @@ def test_right_live_summary_exports_only_actual_current_selected_write(monkeypat
     obj, control, now, identity, owner, writes = native_right_ready(monkeypatch)
     now[0] = 10.1
     assert control.apply(obj, frame(identity, owner, sequence=2, mode="active", epoch=2,
-                                    sample=right_sample(target=-7.488245931283899)))
+                                    sample=right_sample(target=-13.488245931283899)))
     summary, actual = control.live_snapshot(), obj._am1_selected_joint_action
-    assert summary["encoded_goal_raw"] == 1818
+    assert summary["encoded_goal_raw"] == 1815
     assert summary["goal_write_returned"] is True
     assert summary["goal_write_started_at_monotonic_s"] == actual["write_started_at_monotonic_s"]
     assert summary["goal_write_completed_at_monotonic_s"] == actual["write_completed_at_monotonic_s"]
@@ -654,8 +658,8 @@ def test_right_live_summary_never_relabels_unmatched_cache_as_current_write(monk
     obj, control, now, identity, owner, writes = native_right_ready(monkeypatch)
     now[0] = 10.1
     assert control.apply(obj, frame(identity, owner, sequence=2, mode="active", epoch=2,
-                                    sample=right_sample(target=-7.488245931283899)))
-    assert control.live_snapshot()["encoded_goal_raw"] == 1818
+                                    sample=right_sample(target=-13.488245931283899)))
+    assert control.live_snapshot()["encoded_goal_raw"] == 1815
     original_send = obj.send_action
 
     def changed(action):
@@ -673,7 +677,7 @@ def test_right_live_summary_never_relabels_unmatched_cache_as_current_write(monk
     monkeypatch.setattr(obj, "send_action", changed)
     now[0] = 10.15
     assert control.apply(obj, frame(identity, owner, sequence=3, mode="active", epoch=2,
-                                    sample=right_sample(seq=2, expiry=10.4, target=-7.488245931283899)))
+                                    sample=right_sample(seq=2, expiry=10.4, target=-13.488245931283899)))
     assert "encoded_goal_raw" not in control.live_snapshot()
     assert "goal_action_sequence" not in control.live_snapshot()
 
@@ -690,21 +694,16 @@ def test_right_expiry_before_actual_write_never_exports_write_proof(monkeypatch)
     monkeypatch.setattr(obj, "_read_arm_positions", delayed)
     now[0] = 10.1
     assert not control.apply(obj, frame(identity, owner, sequence=2, mode="active", epoch=2,
-                                        sample=right_sample(target=-7.488245931283899)))
+                                        sample=right_sample(target=-13.488245931283899)))
     assert not [r for r in writes if r[0] == 42]
     assert "encoded_goal_raw" not in control.live_snapshot()
     assert control.live_snapshot()["state"] == "expired"
 
 
 
-def test_right_measured_guard_clips_to_its_actual_lower_calibrated_limit(monkeypatch):
-    obj, evidence, control, summary, now, port, writes, left_writes = right_guard(monkeypatch, start=838)
-    assert summary["corridor_min_raw"] == 838
-    assert summary["corridor_max_raw"] == 871
-    assert summary["measured_min_raw"] == 827
-    assert summary["measured_max_raw"] == 871
-    obj._am1_selected_joint_position.update(raw=827, normalized=-100)
-    evidence.guard_live(obj, control)
+def test_right_negative_command_corridor_cannot_cross_actual_calibrated_lower_limit(monkeypatch):
+    with pytest.raises(RuntimeError, match="admission/encoded corridor"):
+        right_guard(monkeypatch, start=838)
 
 
 @pytest.mark.parametrize("left_raw,expected_type,expected_events", [
@@ -831,7 +830,7 @@ print("default native imports and disabled paths passed")
 from tests.robots.test_am1_pre_activation import activation as endpoint_activation, protected_endpoint_case
 
 
-@pytest.mark.parametrize("recipe,direction", [("physical-live-left-elbow", -1), ("physical-live-right-elbow", 1)])
+@pytest.mark.parametrize("recipe,direction", [("physical-live-left-elbow", -1), ("physical-live-right-elbow", -1)])
 def test_real_frozen_eleven_goals_across_live_owned_hold_boundaries(endpoint_activation, monkeypatch, recipe, direction):
     from lerobot.robots.alohamini import alohamini as owner_module
     case = endpoint_activation

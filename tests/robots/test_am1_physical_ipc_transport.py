@@ -58,9 +58,10 @@ def test_live_fixture_admission_uses_actual_settings_guard(
     assert len(bus.port_handler.writes) == 4
     assert control.live_snapshot()["reference_norm"] == 0.0
     assert (control.live_snapshot()["corridor_min_norm"], control.live_snapshot()["corridor_max_norm"]) == (
-        (-10.0, 0.0) if side == "left" else (0.0, 3.0)
+        (-10.0, 0.0) if side == "left" else (-3.0, 0.0)
     )
     assert bus._unnormalize({3: 1.0})[3] == (2010 if side == "left" else 1944)
+    assert bus._unnormalize({3: -1.0})[3] == (1990 if side == "left" else 1921)
     assert evidence._base(robot, control, {})["motor"]["bus"] == side
 
 

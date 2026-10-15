@@ -6,8 +6,14 @@ Packet10 authorizes one focused follow-up, unmerged, offering pre-Start left or
 right elbow selection through the existing browser/Pi/native path. Only one
 selected joint moves; the other11 hold and body/lift commands remain zero after
 normal startup. Left behavior stays q0-10..q0; right uses its actual calibrated
-mapping, q0..q0+3 at at most1 normalized unit/s, with unchanged settings and local
-protections. Freeze selection/reference/corridor/deadline per run. Preserve
+mapping. The retained positive-only right candidate is q0..q0+3. The new
+same-width negative-first refinement is q0-3..q0, at at most1 normalized unit/s,
+with unchanged settings and local protections. Its bounded diagnostic requires
+fresh native encoded endpoints within the demonstrated same-pose raw1829..1870
+interval, the recorded right held pose, and current qualified native hold; refuse
+the diagnostic before jogging if those facts do not match. This is a new
+opposite-direction hypothesis, not a claim that command span caused the prior
+partial response. No wider command span or gain experiment is authorized. Freeze selection/reference/corridor/deadline per run. Preserve
 original Pi250ms expiry at every native write boundary,60ms client sampling,
 one unresolved input, fresh gesture after release/qualified Resume/reconnection,
 original90s Live ceiling, local required imagery and no replay/autoplay.

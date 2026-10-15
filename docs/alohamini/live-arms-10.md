@@ -56,6 +56,14 @@ The focused follow-up is `codex/am1-live-arms-10`, with executable checkpoint
 or change those executable bytes. The follow-up has no automatic merge authority; main and
 the closed PR16-20 milestones remain outside this work.
 
+The next same-width right candidate tests negative input first (q0-3), then
+explicit positive return to original q0. The prior positive-only candidate
+reached its actual return Goal1858 but moved only one commanded tick; after
+browser reattachment, actual Goal1891 produced zero net movement. Those results
+remain partial. The new comparison uses an already measured matching-pose
+interval; it does not increase the three-unit command width, the existing
+measured guard, rate, current cap or gains. Qualification remains pending.
+
 ## Ordinary use on the candidate page
 
 When this physical candidate is served, the existing enrolled AM1 page's
@@ -86,7 +94,7 @@ and the simulation default keep their existing behavior.
 | Selection | Sole target key | Admission-relative command corridor |
 |---|---|---|
 | Left elbow | `arm_left_elbow_flex.pos` | q0-10 through q0 |
-| Right elbow | `arm_right_elbow_flex.pos` | q0 through q0+3 |
+| Right elbow | `arm_right_elbow_flex.pos` | Candidate q0-3 through q0; physical qualification pending |
 
 Each q0 is that selected joint's fresh measured starting reference. Admission
 freezes its corridor and original native Live deadline for the run.

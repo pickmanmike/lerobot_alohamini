@@ -47,7 +47,7 @@ LIVE_ELBOW_SPECS = MappingProxyType({
         LiveElbowSpec("physical-live-left-elbow", "arm_left_elbow_flex.pos", "left", "Left elbow",
                       "LiveLeftElbow", -10.0, 0.0),
         LiveElbowSpec("physical-live-right-elbow", "arm_right_elbow_flex.pos", "right", "Right elbow",
-                      "LiveRightElbow", 0.0, 3.0),
+                      "LiveRightElbow", -3.0, 0.0),
     )
 })
 

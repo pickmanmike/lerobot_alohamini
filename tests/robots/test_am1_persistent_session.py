@@ -15,7 +15,7 @@ def test_live_elbow_specs_are_exact_and_match_admitted_recipe_limits():
     assert set(specs) == {"physical-live-left-elbow", "physical-live-right-elbow"}
     expected = [
         ("physical-live-left-elbow", "arm_left_elbow_flex.pos", "left", "LiveLeftElbow", -10.0, 0.0),
-        ("physical-live-right-elbow", "arm_right_elbow_flex.pos", "right", "LiveRightElbow", 0.0, 3.0),
+        ("physical-live-right-elbow", "arm_right_elbow_flex.pos", "right", "LiveRightElbow", -3.0, 0.0),
     ]
     for recipe, joint, side, profile, minimum, maximum in expected:
         spec = specs[recipe]
@@ -877,7 +877,7 @@ def test_physical_live_selected_recipe_controls_only_its_frozen_joint(physical_l
     assert live["joint"] == joint and live["side"] == ("right" if right else "left")
     assert live["profile"] == ("LiveRightElbow" if right else "LiveLeftElbow")
     assert live["rate_norm_per_s"] == 1.0
-    assert (live["corridor_min_norm"], live["corridor_max_norm"]) == ((0.0, 3.0) if right else (-10.0, 0.0))
+    assert (live["corridor_min_norm"], live["corridor_max_norm"]) == ((-3.0, 0.0) if right else (-10.0, 0.0))
     base = physical_live_controls(a, r)
     other_recipe = "physical-live-left-elbow" if right else "physical-live-right-elbow"
     assert not a.handle(command("start", operation_id=str(uuid.uuid4()), recipe=other_recipe,
@@ -885,7 +885,7 @@ def test_physical_live_selected_recipe_controls_only_its_frozen_joint(physical_l
     grant = a.handle(command("grant", **base), "owner")
     invalid = command("input", **base, grant_id=grant["grant_id"], seq=1, target={other: 0.0})
     assert not a.handle(invalid, "owner")["accepted"]
-    frame = command("input", **base, grant_id=grant["grant_id"], seq=1, target={joint: .3 if right else -.3})
+    frame = command("input", **base, grant_id=grant["grant_id"], seq=1, target={joint: -.3})
     assert len(encode(frame, CONTROL_LIMIT)) < CONTROL_LIMIT
     assert a.handle(frame, "owner")["accepted"]
     until(lambda: host.control.live_snapshot().get("last_input_seq") == 1)
@@ -1003,7 +1003,7 @@ def test_physical_live_reacquisition_retains_reference_and_deadline(physical_liv
     initial = a.snapshot()["run"]
     grant = a.handle(command("grant", **base), "owner")
     assert a.handle(command("input", **base, grant_id=grant["grant_id"], seq=1,
-                            target={joint: 0.5 if right else -0.5}), "owner")["accepted"]
+                            target={joint: -0.5}), "owner")["accepted"]
     time.sleep(max(0, grant["expires"] - time.monotonic()) + 0.03)
     a.tick()
     assert a.run["status"] == "paused"
@@ -1016,10 +1016,10 @@ def test_physical_live_reacquisition_retains_reference_and_deadline(physical_liv
     assert current["live_input"]["cursor_intent_revision"] == fresh["intent_revision"]
     assert current["live_input"]["cursor_norm"] == 0.0
     assert not a.handle(command("input", **base, grant_id=grant["grant_id"], seq=2,
-                                target={joint: 1.0 if right else -1.0}), "owner")["accepted"]
+                                target={joint: -1.0}), "owner")["accepted"]
     new_grant = a.handle(command("grant", **fresh), "owner")
     assert a.handle(command("input", **fresh, grant_id=new_grant["grant_id"], seq=1,
-                            target={joint: 0.2 if right else -0.2}), "owner")["accepted"]
+                            target={joint: -0.2}), "owner")["accepted"]
     assert e.task is None and e.worker.is_alive()
 
 

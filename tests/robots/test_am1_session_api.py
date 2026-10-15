@@ -271,7 +271,7 @@ async def ws_command(ws, command):
 
 @pytest.mark.parametrize("recipe,joint,target", [
     ("physical-live-left-elbow", "arm_left_elbow_flex.pos", -0.3),
-    ("physical-live-right-elbow", "arm_right_elbow_flex.pos", 0.3),
+    ("physical-live-right-elbow", "arm_right_elbow_flex.pos", -0.3),
 ])
 def test_physical_live_wss_close_releases_selected_run_before_sample_expiry(cluster, tmp_path, recipe, joint, target):
     from types import SimpleNamespace
