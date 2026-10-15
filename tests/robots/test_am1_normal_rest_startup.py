@@ -465,3 +465,65 @@ def test_already_in_range_start_keeps_direct_stationary_fast_path(startup):
     )
     robot.disconnect()
     assert_stopped(robot)
+
+
+# The existing operating fixture uses the real OperationalLift/TemperatureWindow
+# and sole-owner grouped packet decoder with fake mechanics, not a fake monitor.
+from tests.robots.test_alohamini_lift_operational import operating_robot
+
+
+def protected_post_home_endpoint(operating_robot):
+    from uuid import uuid4
+    from types import SimpleNamespace
+    from examples.alohamini.am1_session_contract import LIVE_ELBOW_SPECS
+    from lerobot.motors import Motor, MotorNormMode
+    robot, clock = operating_robot
+    robot.connect(calibrate=False)
+    operation = robot._lift_operation
+    assert isinstance(operation, lift_operational.OperationalLift)
+    robot.left_bus.motors[SHOULDER] = Motor(2, "sts3215", MotorNormMode.RANGE_M100_100)
+    robot.left_bus.calibration[SHOULDER] = MotorCalibration(2, 0, 515, 848, 3223)
+    static = {"ID": 2, "Model_Number": 777, "Firmware_Major_Version": 3, "Firmware_Minor_Version": 10,
+              "Min_Position_Limit": 848, "Max_Position_Limit": 3223, "Homing_Offset": 515,
+              "Phase": 12, "CW_Dead_Zone": 1, "CCW_Dead_Zone": 1, "P_Coefficient": 16,
+              "I_Coefficient": 0, "D_Coefficient": 32, "Max_Temperature_Limit": 70,
+              "Min_Voltage_Limit": 40, "Max_Voltage_Limit": 140, "Goal_Position": 3224,
+              "Present_Position": 3224, "Operating_Mode": 0, "Torque_Enable": 0,
+              "Present_Current": 0, "Status": 0, "Present_Temperature": 35,
+              "Present_Velocity": 0, "Moving": 0, "Present_Voltage": 118}
+    old_read = robot.left_bus.read
+    robot.left_bus.read = lambda reg, name, **kw: static[reg] if name == SHOULDER else old_read(reg, name, **kw)
+    spec = LIVE_ELBOW_SPECS["physical-live-right-elbow"]
+    robot.right_bus = SimpleNamespace(motors={spec.joint.removesuffix(".pos"): Motor(3, "sts3215", MotorNormMode.RANGE_M100_100)})
+    robot._am1_visible_control_binding = {"run_id": str(uuid4()), "host_incarnation": str(uuid4()), "recipe": spec.recipe}
+    robot._am1_visible_control_evidence = SimpleNamespace(live_spec=spec)
+    robot._am1_live_endpoint_evidence = []
+    return robot, clock, operation
+
+
+def test_protected_endpoint_post_home_services_real_original_lift_slots(operating_robot):
+    robot, clock, operation = protected_post_home_endpoint(operating_robot)
+    window, origin = operation.temperature, operation.temperature._origin_ns
+    before = operation.last_record
+    goal = robot._qualify_am1_live_endpoint(robot.left_bus, SHOULDER, (2, 0, 515, 848, 3223), phase="after_home")
+    assert goal == 3223 and robot._am1_live_endpoint_evidence[-1]["window_s"] >= .4
+    assert operation.temperature is window and window._origin_ns == origin
+    assert operation.last_record is not before and operation.failure is None and window.failure is None
+    assert all(clock.now - stamp <= window.MAX_AGE_S for stamp, _ in window.samples)
+    assert len(window.samples) == 5 and window.ready
+
+
+def test_protected_endpoint_post_home_missed_lift_poll_latches_original_fault(operating_robot, monkeypatch):
+    robot, clock, operation = protected_post_home_endpoint(operating_robot)
+    original = operation.poll
+    def missed():
+        clock.sleep(.6)
+        return original()
+    monkeypatch.setattr(operation, "poll", missed)
+    with pytest.raises(RuntimeError) as caught:
+        robot._qualify_am1_live_endpoint(robot.left_bus, SHOULDER, (2, 0, 515, 848, 3223), phase="after_home")
+    assert operation.failure is caught.value
+    assert "temperature" in str(caught.value) or "40 ms" in str(caught.value)
+    assert not robot._am1_live_endpoint_evidence
+    with pytest.raises(RuntimeError) as again:robot._refresh_am1_startup_lift_feedback()
+    assert again.value is caught.value

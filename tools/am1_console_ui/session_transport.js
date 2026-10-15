@@ -1,6 +1,21 @@
 "use strict";
 // Remote fake mode never instantiates the legacy body input, owner restore or camera adapters.
 class AM1SessionTransport {
+  static liveElbows=Object.freeze({
+    "physical-live-left-elbow":Object.freeze({joint:"arm_left_elbow_flex.pos",side:"left",label:"Left elbow",profile:"LiveLeftElbow"}),
+    "physical-live-right-elbow":Object.freeze({joint:"arm_right_elbow_flex.pos",side:"right",label:"Right elbow",profile:"LiveRightElbow"})
+  });
+  liveElbowSpec(recipe=this.snapshot?.run?.recipe) {
+    const allowed=Object.hasOwn(AM1SessionTransport.liveElbows,recipe) ? AM1SessionTransport.liveElbows[recipe] : null,values=this.snapshot?.live_elbow_recipes;
+    if(!allowed || !Array.isArray(values) || values.length>2)return null;
+    const matches=values.filter(value=>value?.recipe===recipe);
+    if(matches.length!==1)return null;
+    const value=matches[0];
+    if(Object.entries(allowed).some(([key,wanted])=>value[key]!==wanted)
+      || typeof value.rate_norm_per_s!=="number" || !Number.isFinite(value.rate_norm_per_s)
+      || value.rate_norm_per_s<=0 || value.rate_norm_per_s>1)return null;
+    return value;
+  }
   static outcomeText(run) {
     const outcome=run?.execution?.positive_control;
     if(run?.source!=="protected-physical-provider" || !["physical-left-elbow-positive-control","physical-left-elbow-experiment"].includes(run.recipe) || run.status!=="completed" ||
@@ -92,7 +107,7 @@ class AM1SessionTransport {
         if(value.kind==="snapshot") {
           this.reportingError=null;
           const previous=this.snapshot?.run,next=value.snapshot.run;
-          if(previous?.run_id!==next?.run_id || previous?.intent_revision!==next?.intent_revision) {
+          if(previous?.run_id!==next?.run_id || previous?.recipe!==next?.recipe || previous?.intent_revision!==next?.intent_revision) {
             this.intent++;this.clearGesture();
             if(previous?.run_id!==next?.run_id)this.elbowReleasedRevision=null;
           }
@@ -147,6 +162,10 @@ class AM1SessionTransport {
     if(generation) return this.claim(generation);
   }
   async start(recipe,confirmationOf=null,selectedExperiment=null) {
+    const active=this.snapshot?.run;
+    if(active?.source==="protected-physical-provider" && (!["stopped","completed","faulted","interrupted"].includes(active.status) || active.uncertain))
+      throw Error("Active physical recipe is frozen; finish the current run before Start.");
+    if(typeof recipe==="string" && recipe.startsWith("physical-live-") && !this.liveElbowSpec(recipe))throw Error("Current allowlisted live elbow selection required");
     const payload={operation_id:crypto.randomUUID(),recipe,controller_generation:this.controllerGeneration};
     if(recipe==="physical-left-elbow-experiment" || selectedExperiment!==null) {
       const keys=["schema_version","envelope_sha256","excursion_norm","ramp_s","endpoint_dwell_s","current_cap_ma","live_ceiling_s","minimum_response_raw","return_tolerance_raw","goal_readback_checkpoints_s"];
@@ -247,11 +266,11 @@ class AM1SessionTransport {
   }
   async resumeLiveElbow() {
     this.clearGesture(true);this.intent++;
-    const epoch=this.epoch,ids=Object.freeze(this.identities()),initial=this.snapshot.run.intent_revision,revision=initial+1;
+    const epoch=this.epoch,ids=Object.freeze(this.identities()),recipe=this.snapshot.run.recipe,initial=this.snapshot.run.intent_revision,revision=initial+1;
     const token=this.liveResume={};
     const current=connected=>this.liveResume===token && this.connected && epoch===this.epoch
       && this.controllerGeneration===ids.controller_generation && this.snapshot?.service_incarnation===ids.service_incarnation
-      && this.snapshot?.run?.run_id===ids.run_id && this.snapshot.run.backend_incarnation===ids.host_incarnation
+      && this.snapshot?.run?.run_id===ids.run_id && this.snapshot.run.recipe===recipe && this.snapshot.run.backend_incarnation===ids.host_incarnation
       && (connected ? this.connection===token.connection && this.snapshot.run.intent_revision===revision && this.snapshot.run.status==="paused"
         : [initial,revision].includes(this.snapshot.run.intent_revision) && ["running","paused","resuming"].includes(this.snapshot.run.status));
     try {
@@ -285,16 +304,16 @@ class AM1SessionTransport {
       if(this.liveResume===token && epoch===this.epoch)this.render(this,result.reason);return result;
     } finally {if(this.liveResume===token)this.liveResume=null;}
   }
-  isLiveElbow() {return this.snapshot?.run?.recipe==="physical-live-left-elbow" && this.snapshot.run.source==="protected-physical-provider";}
+  isLiveElbow() {return Object.hasOwn(AM1SessionTransport.liveElbows,this.snapshot?.run?.recipe) && this.snapshot.run.source==="protected-physical-provider";}
   clearGesture(block=false) {
     this.held.clear();this.elbowJog=0;this.elbowCursor=null;this.elbowBinding=null;this.elbowAt=null;
     if(block)this.liveResume=null;
     if(block && this.isLiveElbow())this.elbowReleasedRevision=this.snapshot.run.intent_revision;
   }
   elbowInput() {
-    const run=this.snapshot?.run,value=run?.live_input;
-    if(!this.isLiveElbow() || !this.connected || !this.control || !this.controllerGeneration || !this.connection || run.status!=="running"
-      || !Number.isInteger(run.intent_revision) || value?.joint!=="arm_left_elbow_flex.pos" || value.cursor_intent_revision!==run.intent_revision
+    const run=this.snapshot?.run,value=run?.live_input,spec=this.liveElbowSpec();
+    if(!spec || !this.isLiveElbow() || !this.connected || !this.control || !this.controllerGeneration || !this.connection || run.status!=="running"
+      || !Number.isInteger(run.intent_revision) || value?.joint!==spec.joint || value.side!==spec.side || value.profile!==spec.profile || value.rate_norm_per_s!==spec.rate_norm_per_s || value.cursor_intent_revision!==run.intent_revision
       || !Number.isInteger(value.cursor_feedback_sequence) || value.cursor_feedback_sequence<0
       || [value.cursor_norm,value.reference_norm,value.corridor_min_norm,value.corridor_max_norm].some(x=>typeof x!=="number" || !Number.isFinite(x))
       || value.corridor_min_norm>=value.corridor_max_norm || typeof run.backend_incarnation!=="string"
@@ -303,7 +322,7 @@ class AM1SessionTransport {
   }
   setElbowJog(direction) {
     const value=this.elbowInput();if(!value || ![-1,1].includes(direction))return false;
-    const binding=JSON.stringify(this.identities());
+    const binding=JSON.stringify([this.identities(),this.snapshot.run.recipe,value.joint]);
     if(this.elbowBinding!==binding || !this.elbowJog) {
       this.elbowCursor=value.cursor_norm;this.elbowBinding=binding;this.elbowAt=performance.now();
     }
@@ -313,9 +332,9 @@ class AM1SessionTransport {
     if(this.inputBusy || !this.elbowJog || !this.elbowInput() || this.liveInputs.size>=1 || this.pending.size>=6
       || this.socket?.readyState!==WebSocket.OPEN || this.socket.bufferedAmount>0)return;
     this.inputBusy=true;
-    const epoch=this.epoch,intent=this.intent,ids=Object.freeze(this.identities());
+    const epoch=this.epoch,intent=this.intent,ids=Object.freeze(this.identities()),recipe=this.snapshot.run.recipe,joint=this.elbowInput().joint;
     const current=()=>epoch===this.epoch && intent===this.intent && this.connected && this.elbowJog && this.elbowInput()
-      && JSON.stringify(this.identities())===JSON.stringify(ids);
+      && this.snapshot.run.recipe===recipe && this.elbowInput().joint===joint && JSON.stringify(this.identities())===JSON.stringify(ids);
     try {
       const grant=await this.command({op:"grant",...ids});
       if(!current())return;
@@ -325,9 +344,9 @@ class AM1SessionTransport {
       // Sample current intent after issuance; skipped/gapped ticks never accumulate displacement.
       const value=this.elbowInput(),now=performance.now(),dt=Math.max(0,Math.min((now-this.elbowAt)/1000,0.1));
       this.elbowAt=now;
-      this.elbowCursor=Math.max(value.corridor_min_norm,Math.min(value.corridor_max_norm,this.elbowCursor+this.elbowJog*dt));
+      this.elbowCursor=Math.max(value.corridor_min_norm,Math.min(value.corridor_max_norm,this.elbowCursor+this.elbowJog*dt*value.rate_norm_per_s));
       const seq=++this.seq,token={seq};this.liveInputs.add(token);
-      this.command({op:"input",...ids,grant_id:grant.grant_id,seq,target:{"arm_left_elbow_flex.pos":this.elbowCursor}})
+      this.command({op:"input",...ids,grant_id:grant.grant_id,seq,target:{[joint]:this.elbowCursor}})
         .then(result=>{if(current() && !this.inputBusy && seq===this.seq && !result.accepted && result.status!=="superseded")this.clearGesture(true);})
         .catch(()=>{if(current() && !this.inputBusy && seq===this.seq)this.clearGesture(true);})
         .finally(()=>this.liveInputs.delete(token));
@@ -336,7 +355,7 @@ class AM1SessionTransport {
   }
   async releaseInput() {
     this.intent++;this.clearGesture(true);this.render(this);
-    if(this.connected && this.connection && ["fake-interactive","physical-live-left-elbow"].includes(this.snapshot?.run?.recipe))
+    if(this.connected && this.connection && (this.snapshot?.run?.recipe==="fake-interactive" || this.isLiveElbow()))
       await this.command({op:"release_input",...this.identities()}).catch(()=>{});
   }
   async input() {
@@ -360,20 +379,23 @@ globalThis.AM1RemoteInitialize=function() {
   const render=(transport,message)=> {
     const run=transport.snapshot?.run;
     const recipes=transport.snapshot?.recipes,presets=transport.snapshot?.presets || [], select=document.querySelector("#fake-recipe");
-    const selection=JSON.stringify([recipes,presets]);
+    const selection=JSON.stringify([recipes,presets,transport.snapshot?.live_elbow_recipes]);
     if(recipes && select.dataset.recipes!==selection) {
       const previous=select.value;
       const ordinary=recipes.filter(name=>name!=="fake-finite-short" && !presets.some(preset=>preset.recipe===name)).map(name=> {
-        const option=document.createElement("option"); option.value=name; option.textContent=name; return option;
+        const option=document.createElement("option"); option.value=name; option.textContent=transport.liveElbowSpec(name)?.label || name; return option;
       });
       const named=presets.map(preset=>{const option=document.createElement("option");option.value=preset.id;option.textContent=preset.label;return option;});
       select.replaceChildren(...ordinary,...named);
       if([...select.options].some(option=>option.value===previous))select.value=previous;
       select.dataset.recipes=selection;
     }
+    const selectionFrozen=run?.source==="protected-physical-provider" && (!["stopped","completed","faulted","interrupted"].includes(run.status) || run.uncertain);
+    select.disabled=Boolean(selectionFrozen);
+    if(selectionFrozen && [...select.options].some(option=>option.value===run.recipe))select.value=run.recipe;
     const physicalRun=run?.source==="protected-physical-provider" || run?.recipe?.startsWith("physical-");
     const physical=physicalRun || recipes?.some(name=>name.startsWith("physical-"));
-    const liveElbow=transport.isLiveElbow();
+    const liveElbow=transport.isLiveElbow(),selectedElbow=transport.liveElbowSpec(liveElbow && selectionFrozen ? run.recipe : select.value);
     const simulated=run?.source==="simulated-provider" || recipes?.some(name=>name.startsWith("sim-"));
     const priorTest=physical && run && !physicalRun, priorKind=simulated ? "simulated" : "synthetic";
     document.querySelector("#view-heading").textContent=physical ? liveElbow ? "Physical live elbow AM1 session" : "Physical finite AM1 session" : simulated ? "Simulated finite provider session" : "Fake persistent session";
@@ -422,14 +444,20 @@ globalThis.AM1RemoteInitialize=function() {
     }
     const elbow=document.querySelector("#live-elbow-controls");
     if(elbow) {
-      elbow.hidden=!liveElbow && select.value!=="physical-live-left-elbow";
-      for(const button of elbow.querySelectorAll("[data-elbow-jog]"))button.disabled=!transport.elbowInput();
-      const measured=transport.snapshot?.evidence?.measured_positions?.["arm_left_elbow_flex.pos"],cursor=run?.live_input?.cursor_norm;
+      elbow.hidden=!liveElbow && !selectedElbow;
+      elbow.querySelector("h2").textContent=selectedElbow ? "Live "+selectedElbow.label.toLowerCase() : "Live elbow";
+      for(const button of elbow.querySelectorAll("[data-elbow-jog]")) {
+        button.disabled=!transport.elbowInput();
+        const positive=button.dataset.elbowJog==="1",label=selectedElbow?.label || "Elbow";
+        button.innerHTML=label+" "+(positive ? "+" : "-")+" <kbd>"+(positive ? "]" : "[")+"</kbd>";
+        button.setAttribute("aria-label",label+" "+(positive ? "positive" : "negative")+" jog");
+      }
+      const measured=transport.snapshot?.evidence?.measured_positions?.[selectedElbow?.joint],cursor=run?.live_input?.cursor_norm;
       elbow.querySelector("output").textContent=`Measured ${Number.isFinite(measured) ? measured.toFixed(3) : "pending"} · target ${Number.isFinite(transport.elbowCursor) ? transport.elbowCursor.toFixed(3) : Number.isFinite(cursor) ? cursor.toFixed(3) : "pending"} normalized`;
     }
     if(message){notice.textContent=message;notice.hidden=false;}
     document.querySelector("#pairing-panel").hidden=Boolean(transport.device);
-    for(const button of document.querySelectorAll("[data-operation]"))button.disabled=!transport.control || !transport.connected;
+    for(const button of document.querySelectorAll("[data-operation]"))button.disabled=!transport.control || !transport.connected || button.dataset.operation==="Start" && selectionFrozen;
   };
   document.querySelector("#view-heading").textContent="Fake persistent session";
   const panel=document.createElement("section");panel.id="pairing-panel";

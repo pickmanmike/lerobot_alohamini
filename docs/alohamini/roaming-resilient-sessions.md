@@ -1,3 +1,36 @@
+## AM1-LIVE-ARMS-10: one selected live elbow
+
+The [Packet10 guide](live-arms-10.md) records the implemented left/right choice,
+physical evidence, limits, exact deployment and rollback. PR21 was ordinarily
+integrated into `integrate/am1-local-teleop` at
+`48a3ed39b7591837ed6771a586daec7c1b8b5b8b`. The Packet10 follow-up stays unmerged;
+physical source`83dfe3c4ae23a989bdf11224858e6771bac190c6` is separate from integration.
+
+| Capability | Current boundary |
+|---|---|
+| Live left elbow | Accepted Packet09 behavior and positioning limits preserved |
+| Live right elbow | Actual negative26/positive6 ticks from fixedq01867; bounded two-way response demonstrated |
+| Browser reattachment | Qualified same-run Resume and fresh negative1 tick; response not comparable; final return window interrupted by real expiry |
+| One selected joint per run | Other11 raw Goals held; body/lift commands zero after startup |
+| Precision, full repeated excursions, bimanual/body/lift/physical leaders | Unqualified |
+
+On the existing enrolled page: Claim input, choose Left or Right elbow before
+explicit Start, qualify Resume, then make a new side-labelled button or [ / ]
+gesture. Release, blur, input gap and browser reattachment require fresh
+qualification and intent. Active/uncertain runs freeze selection. Verified
+terminal cleanup permits another pre-Start choice. Available idle is verified;
+service startup never starts or replays motor activity. Subsequent physical
+intervals still require supported admission; the guide identifies the tested
+1833..1867 interval and current1845 reference limitation.
+
+The final private procedure remains FAILED because genuine input expiry
+interrupted its last response window. Native measured hold completed19.812ms
+after expiry; that is not an end-to-end or hard-real-time guarantee. Required
+Pi-local images were present but did not visibly confirm the elbow; P1 was
+unavailable and remains advisory. Software durability covers continuity and
+recovery, not mechanical endurance. All Packet09/Packet08 history below remains
+at its recorded version; broader teleoperation is not implied by recipe selection.
+
 ## AM1-LIVE-VIRTUAL-09 current input capability
 
 The browser now streams one current normalized left-elbow target through the

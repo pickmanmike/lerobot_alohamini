@@ -20,6 +20,7 @@ from examples.alohamini.am1_session_contract import (
     LEFT_ELBOW_ORIGINAL_RETURN,
     LEFT_ELBOW_POSITIVE_CONTROL,
     LEFT_ELBOW_RESPONSE,
+    LIVE_ELBOW_SPECS,
     RECIPES,
     SELECTED_ELBOW_OPERATION_PRESET,
     SelectedElbowExperiment,
@@ -693,6 +694,9 @@ class SessionAuthority:
         run["deadline"] = native_live_at + (definition.live_s if definition else RECIPES[run["recipe"]].live_s)
         if self._physical_interactive():
             live = evidence.get("live_input", {})
+            if live.get("joint") != LIVE_ELBOW_SPECS[run["recipe"]].joint:
+                self._finish("faulted", "physical_live_recipe_mismatch")
+                return True
             native_deadline = lifecycle.get("native_deadline_monotonic_s", live.get("live_deadline_monotonic_s"))
             if native_deadline is not None:
                 if (type(native_deadline) not in (int, float) or not math.isfinite(native_deadline)
@@ -1020,7 +1024,7 @@ class SessionAuthority:
 
     def _physical_interactive(self):
         return bool(
-            self.run and self.run["recipe"] == "physical-live-left-elbow"
+            self.run and self.run["recipe"] in LIVE_ELBOW_SPECS
             and self.executor.source == "protected-physical-provider"
         )
 
@@ -1056,11 +1060,29 @@ class SessionAuthority:
             "valid_until_monotonic_s", "accepted_at_monotonic_s", "live_admitted_at_monotonic_s",
             "live_deadline_monotonic_s", "expiry_detected_at_monotonic_s",
             "hold_started_at_monotonic_s", "hold_completed_at_monotonic_s", "cadence", "last_input_gap_s",
+            "measured_origin_raw", "corridor_min_raw", "corridor_max_raw", "accepted_target_norm",
         }
+        ack = evidence.get("accepted_host_action", {})
+        if (
+            evidence.get("feedback") is True and evidence.get("native_ack") is True
+            and ack.get("run_id") == self.run["run_id"]
+            and ack.get("host_incarnation") == self.executor.host_incarnation
+            and ack.get("intent_revision") == self.run["intent_revision"]
+            and value.get("joint") == LIVE_ELBOW_SPECS[self.run["recipe"]].joint
+            and type(value.get("goal_action_sequence")) is int
+            and value["goal_action_sequence"] == ack.get("accepted_action_sequence")
+            and value.get("goal_write_returned") is True
+        ):
+            keys |= {
+                "encoded_goal_raw", "goal_write_returned", "goal_write_started_at_monotonic_s",
+                "goal_write_completed_at_monotonic_s", "goal_action_sequence",
+            }
         return dict(
             _status_small(value, keys, 1024), run_id=self.run["run_id"],
             service_incarnation=self.service_incarnation, host_incarnation=self.executor.host_incarnation,
             intent_revision=self.run["intent_revision"],
+            **{key: item for key, item in LIVE_ELBOW_SPECS[self.run["recipe"]].summary().items()
+               if key in {"side", "label", "profile", "rate_norm_per_s"}},
         )
 
     def _clear_input(self):
@@ -2332,6 +2354,7 @@ class SessionAuthority:
                 return self._refuse("sequence must increase")
             physical = self._physical_interactive()
             if physical:
+                joint = LIVE_ELBOW_SPECS[self.run["recipe"]].joint
                 allowed = {
                     "op", "run_id", "service_incarnation", "controller_generation", "connection_generation",
                     "host_incarnation", "intent_revision", "grant_id", "seq", "target",
@@ -2340,9 +2363,9 @@ class SessionAuthority:
                         or c["intent_revision"] != self.run["intent_revision"]
                         or c.get("host_incarnation") != self.executor.host_incarnation):
                     return self._refuse("stale or malformed physical intent identity")
-                if (not isinstance(target, dict) or set(target) != {"arm_left_elbow_flex.pos"}
-                        or type(target["arm_left_elbow_flex.pos"]) not in (int, float)
-                        or not math.isfinite(target["arm_left_elbow_flex.pos"])):
+                if (not isinstance(target, dict) or set(target) != {joint}
+                        or type(target[joint]) not in (int, float)
+                        or not math.isfinite(target[joint])):
                     return self._refuse("invalid named physical target")
             elif (
                 not isinstance(target, list)
@@ -2663,6 +2686,11 @@ class SessionAuthority:
                 )
                 else []
             )
+
+            view["live_elbow_recipes"] = [
+                spec.summary() for name, spec in LIVE_ELBOW_SPECS.items()
+                if self.executor.source == "protected-physical-provider" and self.executor.supports(RECIPES[name])
+            ]
 
             if self.executor.source != "protected-physical-provider":
                 return view

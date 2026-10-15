@@ -204,6 +204,20 @@ def executor(host):
     )
 
 
+def test_live_executor_allowlist_freezes_spec_from_bound_recipe_only():
+    from examples.alohamini.am1_session_contract import LIVE_ELBOW_SPECS, RECIPES, Recipe
+
+    e = executor(ControlledHost())
+    for name in ("physical-live-left-elbow", "physical-live-right-elbow"):
+        assert e.supports(RECIPES[name])
+    assert not e.supports(Recipe("physical-live-any-joint", "interactive", None, 90, seed=None))
+    assert not e.supports(Recipe("physical-live-right-elbow", "finite", None, 90, seed=None))
+    assert not e.supports(Recipe("physical-live-right-elbow", "interactive", None, 180, seed=None))
+    e.bind_run("selected-right", RECIPES["physical-live-right-elbow"])
+    assert e.live_spec is LIVE_ELBOW_SPECS["physical-live-right-elbow"]
+    assert e.live_spec.joint == "arm_right_elbow_flex.pos"
+
+
 def until(predicate, timeout=2):
     end = time.monotonic() + timeout
     while time.monotonic() < end:

@@ -19,6 +19,40 @@ class Recipe:
 
 
 @dataclass(frozen=True)
+class LiveElbowSpec:
+    """One allowlisted joint and immutable admission-relative live envelope."""
+
+    recipe: str
+    joint: str
+    side: str
+    label: str
+    profile: str
+    corridor_min_delta_norm: float
+    corridor_max_delta_norm: float
+    rate_norm_per_s: float = 1.0
+    current_cap_ma: float = 150.0
+    live_s: float = 90.0
+
+    def summary(self):
+        return dict(
+            recipe=self.recipe, joint=self.joint, side=self.side, label=self.label, profile=self.profile,
+            corridor_min_delta_norm=self.corridor_min_delta_norm,
+            corridor_max_delta_norm=self.corridor_max_delta_norm,
+            rate_norm_per_s=self.rate_norm_per_s, current_cap_ma=self.current_cap_ma, live_s=self.live_s,
+        )
+
+
+LIVE_ELBOW_SPECS = MappingProxyType({
+    spec.recipe: spec for spec in (
+        LiveElbowSpec("physical-live-left-elbow", "arm_left_elbow_flex.pos", "left", "Left elbow",
+                      "LiveLeftElbow", -10.0, 0.0),
+        LiveElbowSpec("physical-live-right-elbow", "arm_right_elbow_flex.pos", "right", "Right elbow",
+                      "LiveRightElbow", -3.0, 0.0),
+    )
+})
+
+
+@dataclass(frozen=True)
 class SignedElbowResponse:
     """One explicit signed diagnostic, shared by input, owner and completion."""
 
@@ -1588,7 +1622,8 @@ RECIPES = MappingProxyType(
         ),
         **{name: Recipe(name, "finite", definition.trajectory_s, definition.live_s, seed=None)
            for name, definition in ELBOW_RECOVERY_DEFINITIONS.items()},
-        "physical-live-left-elbow": Recipe("physical-live-left-elbow", "interactive", None, 90.0, seed=None),
+        **{name: Recipe(name, "interactive", None, spec.live_s, seed=None)
+           for name, spec in LIVE_ELBOW_SPECS.items()},
         "fake-interactive": Recipe("fake-interactive", "interactive", None, 420.0),
     }
 )

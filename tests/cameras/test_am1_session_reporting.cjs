@@ -14,9 +14,9 @@ function fixture(fetch) {
 }
 
 async function liveFixture() {
-  const snapshot={service_incarnation:"owner",controller:{device_id:"enrolled",controller_generation:"claimed"},
+  const snapshot={service_incarnation:"owner",live_elbow_recipes:[{recipe:"physical-live-left-elbow",joint:"arm_left_elbow_flex.pos",side:"left",label:"Left elbow",profile:"LiveLeftElbow",rate_norm_per_s:1}],controller:{device_id:"enrolled",controller_generation:"claimed"},
     run:{run_id:"live-run",recipe:"physical-live-left-elbow",source:"protected-physical-provider",status:"running",
-      backend_incarnation:"motor",intent_revision:7,deadline:90,live_input:{joint:"arm_left_elbow_flex.pos",
+      backend_incarnation:"motor",intent_revision:7,deadline:90,live_input:{joint:"arm_left_elbow_flex.pos",side:"left",label:"Left elbow",profile:"LiveLeftElbow",rate_norm_per_s:1,
         reference_norm:5,corridor_min_norm:-5,corridor_max_norm:5,cursor_norm:4,cursor_feedback_sequence:30,cursor_intent_revision:7}}};
   const f=fixture(async()=>({ok:true,json:async()=>({ticket:"current",snapshot})}));
   await f.transport.attach();
@@ -284,4 +284,27 @@ for(const changed of ["pause","connection"])test(`physical Resume qualification 
   await task;
   assert.equal(f.frames.filter(frame=>frame.command?.op==="resume").length,0,"changed authority cannot continue qualified Resume");
   f.transport.clear();
+});
+
+for(const mutation of ["wrong_joint","wrong_metadata","unsupported_recipe"])test("live elbow refuses "+mutation+" before a grant",async()=>{
+  const f=await liveFixture();
+  if(mutation==="wrong_joint")f.transport.snapshot.run.live_input.joint="arm_right_elbow_flex.pos";
+  if(mutation==="wrong_metadata")f.transport.snapshot.live_elbow_recipes[0].joint="arm_right_elbow_flex.pos";
+  if(mutation==="unsupported_recipe")f.transport.snapshot.run.recipe="physical-live-left-wrist";
+  assert.equal(f.transport.setElbowJog(1),false);await f.transport.input();
+  assert.equal(f.frames.filter(frame=>frame.command?.op==="grant").length,0);f.transport.clear();
+});
+test("live elbow recipe changes fence a pending original grant without switching its key",async()=>{
+  const f=await liveFixture();f.transport.setElbowJog(-1);const tick=f.transport.input();
+  f.transport.snapshot.run.recipe="physical-live-right-elbow";
+  f.transport.snapshot.run.live_input.joint="arm_right_elbow_flex.pos";
+  f.transport.snapshot.run.live_input.side="right";f.transport.snapshot.run.live_input.label="Right elbow";f.transport.snapshot.run.live_input.profile="LiveRightElbow";
+  f.transport.snapshot.live_elbow_recipes=[{recipe:"physical-live-right-elbow",joint:"arm_right_elbow_flex.pos",side:"right",label:"Right elbow",profile:"LiveRightElbow",rate_norm_per_s:1}];
+  f.reply("grant",{accepted:true,grant_id:"old-selection",issued:10,expires:10.25});await tick;
+  assert.equal(f.frames.filter(frame=>frame.command?.op==="input").length,0);f.transport.clear();
+});
+
+test("live recipe metadata cannot introduce an inherited nonallowlisted name",async()=>{
+  const f=await liveFixture();f.transport.snapshot.live_elbow_recipes=[{recipe:"toString",joint:"arbitrary",side:"other",label:"Other",profile:"Other",rate_norm_per_s:1}];
+  assert.equal(f.transport.liveElbowSpec("toString"),null);f.transport.clear();
 });

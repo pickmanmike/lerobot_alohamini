@@ -122,7 +122,9 @@ def test_predeadline_acquisition_remains_eligible_when_emit_returns_after_deadli
     record = qualify(monitor)
     evidence = record["stationary_qualification"]
     assert evidence["readiness_branch"] == "bounded_indicator"
-    assert evidence["sample_count"] == transport.read_count == 20
+    assert evidence["sample_count"] == 19
+    assert evidence["whole_phase_sample_count"] == transport.read_count == 20
+    assert evidence["stationary_acquisition_sample_index"] == 2
     assert record["sample_monotonic_s"] == pytest.approx(0.998)
     assert clock.now == pytest.approx(1.001)
     assert all(at < 1.0 for at in transport.arrivals)
@@ -166,7 +168,6 @@ def test_strict_diagnostic_without_am1_opt_in_still_refuses_original_303():
         [(808, 50, 1)] * 3,
         [(808, -50, 1)] * 3,
         [(808, 0, 1)] * 3,
-        [(808, 50, 1), (808, -50, 1), (808, 50, 1)],
         [(808, 50, 0)] * 3,
     ],
 )
@@ -385,3 +386,297 @@ def test_inherited_half_mm_guard_bounds_whole_phase_span_not_only_absolute_heigh
     with pytest.raises(feedback.ComparisonRefusal, match="bound"):
         operation.home_and_relieve(require_quiet_post_home=True, am1_post_home_readiness=True)
     assert clock.now < 0.1
+
+
+# Exact original grouped reply payloads; clocks below are explicitly simulated.
+# Original payload provenance and production-clock replay are retained privately.
+ACTUAL_POST_HOME_PAYLOADS = {'02': ['0114c8500ac8c801fe000000000000e8030000000000012f0364007605722600000100003c00', '0114c8500ac8c801fe000000000000e8030000000000012f0300006f05722600000000004400', '0114c8500ac8c801fe000000000000e8030000000000012f0300006f05722600000000004300', '0114c8500ac8c801fe000000000000e8030000000000012f0300006f05722600000000003c00', '0114c8500ac8c801fe000000000000e8030000000000012f0300006f05722600000000003e00', '0114c8500ac8c801fe000000000000e8030000000000012f0300006f05722600000000004200'], '03': ['0114c8500ac8c801fe000000000000e8030000000000012d0364006505722600000100003500', '0114c8500ac8c801fe000000000000e8030000000000012e0332005705732600000100003a00', '0114c8500ac8c801fe000000000000e8030000000000012e0300005705722600000000003a00', '0114c8500ac8c801fe000000000000e8030000000000012f0300005b05732600000100003c00', '0114c8500ac8c801fe000000000000e8030000000000012f0332005705722600000100003b00', '0114c8500ac8c801fe000000000000e8030000000000012e0300005b05722600000000003e00', '0114c8500ac8c801fe000000000000e8030000000000012e0300005b05722600000000003500', '0114c8500ac8c801fe000000000000e8030000000000012f0300005b05732600000000003700', '0114c8500ac8c801fe000000000000e8030000000000012e0332005905722600000100003400', '0114c8500ac8c801fe000000000000e8030000000000012f0300005705732600000000003600', '0114c8500ac8c801fe000000000000e8030000000000012e0332805a05722600000100003a00', '0114c8500ac8c801fe000000000000e8030000000000012f0332805c05722600000100003d00', '0114c8500ac8c801fe000000000000e8030000000000012e0300005b05722600000000003e00', '0114c8500ac8c801fe000000000000e8030000000000012f0332005905722600000100003d00', '0114c8500ac8c801fe000000000000e8030000000000012e0300005705732600000000003c00', '0114c8500ac8c801fe000000000000e8030000000000012e0300005705732600000000003600', '0114c8500ac8c801fe000000000000e8030000000000012e0300005705732600000000003900', '0114c8500ac8c801fe000000000000e8030000000000012f0332005705722600000100003c00', '0114c8500ac8c801fe000000000000e8030000000000012f0300005705722600000000003a00', '0114c8500ac8c801fe000000000000e8030000000000012f0300005705732600000000003500']}
+
+
+@pytest.mark.parametrize("trial,origin,branch", [("02", 814, "strict_quiet"), ("03", 813, "bounded_indicator")])
+def test_actual_post_home_payloads_replay_with_explicit_frozen_acquisition_provenance(trial, origin, branch):
+    monitor, clock, transport, emitted = comparison([(origin, 0, 0)])
+    packets = [bytes.fromhex(value) for value in ACTUAL_POST_HOME_PAYLOADS[trial]]
+    def read(start, length, **kwargs):
+        assert (start, length) == (feedback.FEEDBACK_START, feedback.FEEDBACK_LENGTH)
+        assert kwargs["timeout_ms"] == 40.0
+        assert transport.read_count < len(packets), "replay must not fabricate later replies"
+        payload = packets[transport.read_count]
+        transport.read_count += 1
+        clock.sleep(.002)
+        transport.arrivals.append(clock.now)
+        return payload, {"response_payload_bytes": list(payload), "checksum_ok": True}
+    transport.read_group = read
+    record = qualify(monitor, origin=origin)
+    proof = record["stationary_qualification"]
+    assert proof["readiness_policy"] == "am1-post-home-first-quiet-v3"
+    assert proof["readiness_policy_version"] == 3
+    assert proof["readiness_branch"] == branch
+    assert proof["am1_post_home_origin_raw"] == origin
+    assert proof["stationary_acquisition_origin_raw"] == (815 if trial == "02" else 814)
+    assert proof["stationary_acquisition_sample_index"] == (2 if trial == "02" else 3)
+    assert proof["stationary_acquisition_at_monotonic_s"] == transport.arrivals[1 if trial == "02" else 2]
+    assert proof["whole_phase_sample_count"] == transport.read_count == len(packets)
+    if trial == "03":
+        assert clock.now == pytest.approx(1.0)
+        assert proof["whole_phase_position_excursion_raw"] == proof["whole_phase_position_drift_raw"] == 2
+        assert proof["whole_phase_max_abs_velocity_raw"] == 100
+        assert proof["position_origin_raw"] == 814 and proof["position_excursion_raw"] == proof["position_drift_raw"] == 1
+        assert proof["sample_count"] == 18 and max(abs(v) for v in proof["present_velocity_raw"]) == 50
+        assert len([row for row in emitted if row["phase"] == "post_home"]) == 20
+    else:
+        assert clock.now < 1 and proof["motion_feedback_quiet"] is True
+        assert proof["sample_count"] == 5
+
+
+@pytest.mark.parametrize("prefix", [[(813,150,1)], [(813,500,1)], [(813,-100,1)], [(813,100,1),(813,100,1)]])
+def test_new_fallback_never_admits_unproven_prequiet_speed_or_repeated_settling(prefix):
+    rows = prefix + [(814,0,0),(815,50,1),(814,0,0),(815,-50,1)] * 8
+    monitor, clock, _, _ = comparison(rows)
+    with pytest.raises(feedback.ComparisonRefusal):qualify(monitor, origin=813)
+    assert clock.now <= 1
+
+
+@pytest.mark.parametrize("prefix", [[(813,150,1)], [(813,500,1)], [(813,-100,1)], [(813,100,1),(813,100,1)]])
+def test_existing_strict_quiet_priority_does_not_gain_new_prequiet_speed_rules(prefix):
+    monitor, clock, _, _ = comparison(prefix + [(814,0,0)] * 6)
+    proof = qualify(monitor, origin=813)["stationary_qualification"]
+    assert proof["readiness_branch"] == "strict_quiet" and clock.now < 1
+
+
+@pytest.mark.parametrize("rows", [
+    [(813,50,0),(813,-50,1)],
+    [(813,50,0),(813,-50,1)] * 9 + [(814,0,0)],
+    [(813,100,1),(814,0,0),(815,50,1),(814,0,0),(816,0,0),(816,-50,1),(816,0,0),(815,50,1)],
+    [(813,100,1),(814,0,0),(814,100,1),(814,0,0),(815,-50,1),(814,0,0)],
+    [(813,100,1),(814,0,0),(816,50,1),(814,0,0),(814,-50,1),(814,0,0)],
+])
+def test_frozen_first_quiet_anchor_is_required_and_never_replaced_after_disqualification(rows):
+    monitor, clock, _, _ = comparison(rows)
+    with pytest.raises(feedback.ComparisonRefusal):qualify(monitor, origin=813)
+    assert clock.now <= 1
+
+
+@pytest.mark.parametrize("after_anchor", [False,True])
+@pytest.mark.parametrize("mutation", [{"status_value":1},{"current":308},{"temperature":55},{"torque":0},{"goal_velocity":1},{"mode":0}])
+def test_full_phase_hard_guards_apply_before_and_after_frozen_acquisition(after_anchor, mutation):
+    monitor, clock, transport, _ = comparison([(813,100,1),(814,0,0),(814,0,0)])
+    read = transport.read_group
+    def mutated(*args, **kwargs):
+        if transport.read_count >= (2 if after_anchor else 0):transport.mutation = mutation
+        return read(*args, **kwargs)
+    transport.read_group = mutated
+    with pytest.raises(feedback.ComparisonRefusal):qualify(monitor, origin=813)
+    if "temperature" in mutation:
+        # Preserve the original three-of-five thermal policy, not an invented one-read gate.
+        assert transport.read_count == (7 if after_anchor else 5)
+        assert clock.now < .4
+    else:
+        assert transport.read_count == (3 if after_anchor else 1)
+        assert clock.now < .2
+
+
+@pytest.mark.parametrize("after_anchor", [False,True])
+def test_original_process_zero_guard_and_temperature_origin_are_never_rebased(after_anchor):
+    monitor, clock, transport, _ = comparison([(813,100,1),(814,0,0),(815,50,1),(814,0,0)])
+    thermal = monitor.temperature_check.__self__.temperature
+    original_origin = thermal._origin_ns
+    checked = []
+    def guard(record):
+        checked.append(record["sample_monotonic_s"])
+        if len(checked) == (3 if after_anchor else 1):
+            raise feedback.ComparisonRefusal("original0.5mm whole-phase process zero guard")
+    with pytest.raises(feedback.ComparisonRefusal, match="original0.5mm"):
+        qualify(monitor, origin=813, on_sample=guard)
+    assert len(checked) == transport.read_count == (3 if after_anchor else 1)
+    assert thermal._origin_ns == original_origin
+
+
+@pytest.mark.parametrize("rows", [
+    [(813,100,1),(814,50,1),(815,0,1),(816,0,0)],
+    [(813,100,0),(814,50,0),(815,50,0),(816,0,0)],
+    [(813,100,1),(814,0,0),(815,50,1),(816,0,0)],
+    [(813,100,1),(814,0,0),(814,50,1),(814,50,1),(814,50,1)],
+])
+def test_whole_phase_persistent_motion_counters_cross_frozen_anchor_unchanged(rows):
+    monitor, clock, _, _ = comparison(rows)
+    with pytest.raises(feedback.ComparisonRefusal, match="persistent|continuing"):
+        qualify(monitor, origin=813)
+    assert clock.now < .3
+
+
+@pytest.mark.parametrize("mutation", [{"present_position":810},{"present_velocity":100},{"status_value":1}])
+def test_final_inflight_reply_cannot_hide_new_disqualifier_behind_predeadline_window(mutation):
+    monitor, clock, transport, _ = comparison(ORIGINAL_303)
+    sleep, read = clock.sleep, transport.read_group
+    def almost_deadline(seconds):
+        sleep(seconds - .000001 if seconds < .05 and clock.now > .95 else seconds)
+    def final_read(*args, **kwargs):
+        if transport.read_count == 20:transport.mutation = mutation
+        return read(*args, **kwargs)
+    monitor.sleep, transport.read_group = almost_deadline, final_read
+    with pytest.raises(feedback.ComparisonRefusal):qualify(monitor)
+    assert transport.read_count == 21 and transport.arrivals[-1] > 1
+
+
+# Exact 18 recorded physical07 grouped payloads. Test clocks and any explicitly
+# appended continuation are simulated, not fabricated later physical evidence.
+ACTUAL_07_POST_HOME_PAYLOADS = [
+    '0114c8500ac8c801fe000000000000e8030000000000012d0364006405732500000100003b00',
+    '0114c8500ac8c801fe000000000000e8030000000000012f0300005905732500000000003500',
+    '0114c8500ac8c801fe000000000000e8030000000000012f0300005505722600000000003b00',
+    '0114c8500ac8c801fe000000000000e8030000000000012e0300005505732500000000003400',
+    '0114c8500ac8c801fe000000000000e8030000000000012f0300005505732500000000003400',
+    '0114c8500ac8c801fe000000000000e8030000000000012f0332005505732500000100003700',
+    '0114c8500ac8c801fe000000000000e8030000000000012f0300005905732500000000003500',
+    '0114c8500ac8c801fe000000000000e8030000000000012f0332005405732500000100003500',
+    '0114c8500ac8c801fe000000000000e8030000000000012e0332805805732500000100003d00',
+    '0114c8500ac8c801fe000000000000e8030000000000012f0300005505732500000000003700',
+    '0114c8500ac8c801fe000000000000e8030000000000012e0300005905732600000000003e00',
+    '0114c8500ac8c801fe000000000000e8030000000000012f0300005505722600000000003c00',
+    '0114c8500ac8c801fe000000000000e8030000000000012f0332005705722600000100003500',
+    '0114c8500ac8c801fe000000000000e8030000000000012f0300005505732600000000003500',
+    '0114c8500ac8c801fe000000000000e8030000000000012e0300005505732600000000003500',
+    '0114c8500ac8c801fe000000000000e8030000000000012f0332805905722500000100003400',
+    '0114c8500ac8c801fe000000000000e8030000000000012e0332805805732500000100003400',
+    '0114c8500ac8c801fe000000000000e8030000000000012f0332005705732500000100003400',
+]
+ACTUAL_07_POST_HOME_ROWS = [
+    (813, 100, 1), (815, 0, 0), (815, 0, 0), (814, 0, 0),
+    (815, 0, 0), (815, 50, 1), (815, 0, 0), (815, 50, 1),
+    (814, -50, 1), (815, 0, 0), (814, 0, 0), (815, 0, 0),
+    (815, 50, 1), (815, 0, 0), (814, 0, 0),
+    (815, -50, 1), (814, -50, 1), (815, 50, 1),
+]
+
+
+def test_actual07_reversed_velocity_payloads_do_not_end_acquisition_early():
+    monitor, clock, transport, emitted = comparison([(812, 0, 0)])
+    packets = [bytes.fromhex(value) for value in ACTUAL_07_POST_HOME_PAYLOADS]
+
+    class RecordedEvidenceExhausted(Exception):
+        pass
+
+    def recorded_read(start, length, **kwargs):
+        assert (start, length, kwargs['timeout_ms']) == (33, 38, 40.0)
+        if transport.read_count == len(packets):
+            raise RecordedEvidenceExhausted('no later physical07 replies are recorded')
+        payload = packets[transport.read_count]
+        transport.read_count += 1
+        clock.sleep(.002)
+        transport.arrivals.append(clock.now)
+        return payload, {'response_payload_bytes': list(payload), 'checksum_ok': True}
+
+    transport.read_group = recorded_read
+    # Finishing the original one-second window needs later actual feedback.
+    # Eighteen captured replies may demonstrate removal of an early refusal,
+    # never a new qualification that physical07 itself did not achieve.
+    with pytest.raises(RecordedEvidenceExhausted):
+        qualify(monitor, origin=812)
+    assert transport.read_count == 18 and clock.now < 1
+    assert not any(r['phase']=='post_home_stationary_qualified' for r in emitted)
+    acquired = [r for r in emitted if r['phase']=='post_home']
+    assert [(r['present_position_raw'],r['present_velocity_raw'],r['moving']) for r in acquired] == ACTUAL_07_POST_HOME_ROWS
+
+
+def test_simulated07_continuation_waits_for_original_deadline_with_frozen_band():
+    # The last two quiet replies below are explicitly synthetic continuation.
+    monitor, clock, transport, _ = comparison(ACTUAL_07_POST_HOME_ROWS + [(815,0,0)] * 2)
+    proof = qualify(monitor, origin=812)['stationary_qualification']
+    assert clock.now == pytest.approx(1.0) and transport.read_count == 20
+    assert proof['readiness_branch']=='bounded_indicator'
+    assert proof['motion_feedback_quiet'] is False
+    assert proof['readiness_policy']=='am1-post-home-first-quiet-v3'
+    assert proof['readiness_policy_version']==3
+    assert proof['am1_post_home_origin_raw']==812
+    assert proof['stationary_acquisition_origin_raw']==815
+    assert proof['stationary_acquisition_sample_index']==2
+    assert proof['whole_phase_position_excursion_raw']==3
+    assert proof['whole_phase_position_drift_raw']==3
+    assert proof['position_excursion_raw']==1 and proof['position_drift_raw']==0
+    assert proof['whole_phase_present_velocity_raw'][-5:]==[-50,-50,50,0,0]
+    assert proof['whole_phase_moving'][-5:]==[1,1,1,0,0]
+    assert proof['sample_count']==19 and proof['window_s']>=.9
+
+
+def test_reversing_moving_bits_without_first_quiet_cannot_qualify():
+    monitor, clock, transport, _ = comparison([(808,50,1),(808,-50,1),(808,50,1)])
+    with pytest.raises(feedback.ComparisonRefusal, match='stationary'):
+        qualify(monitor)
+    assert clock.now == pytest.approx(1.0) and transport.read_count == 20
+
+
+@pytest.mark.parametrize('tail', [
+    [(814,0,1)] * 3,
+    [(814,50,1)] * 3,
+    [(814,-50,1)] * 3,
+    [(814,50,0)] * 3,
+    [(814,-50,0)] * 3,
+])
+def test_actual_persistent_zero_velocity_moving_or_signed_velocity_still_abort(tail):
+    monitor, clock, _, _ = comparison([(813,100,1),(814,0,0),*tail])
+    with pytest.raises(feedback.ComparisonRefusal, match='persistent'):
+        qualify(monitor, origin=813)
+    assert clock.now < .3
+
+
+def test_reversing_moving_bits_do_not_allow_two_tick_frozen_band():
+    monitor, clock, _, _ = comparison([(813,100,1),(814,0,0),*([(816,50,1),(814,-50,1)]*10)])
+    with pytest.raises(feedback.ComparisonRefusal, match='stationary'):
+        qualify(monitor, origin=813)
+    assert clock.now <= 1
+
+
+def test_reversing_moving_bits_do_not_allow_late_first_quiet():
+    monitor, clock, _, _ = comparison([(813,50,1),(813,-50,1)]*9+[(813,0,0)]*2)
+    with pytest.raises(feedback.ComparisonRefusal, match='stationary'):
+        qualify(monitor, origin=813)
+    assert clock.now <= 1
+
+
+def test_reversing_moving_bits_do_not_hide_three_real_position_steps():
+    monitor, clock, _, _ = comparison([(813,100,1),(814,0,0),(815,-50,1),(816,50,1)])
+    with pytest.raises(feedback.ComparisonRefusal, match='position'):
+        qualify(monitor, origin=813)
+    assert clock.now < .2
+
+
+@pytest.mark.parametrize('mutation', [
+    {'status_value':1}, {'current':308}, {'temperature':55},
+    {'torque':0}, {'goal_velocity':1}, {'mode':0},
+])
+def test_reversing_moving_sequence_keeps_sample_health_guards(mutation):
+    monitor, clock, transport, _ = comparison(ACTUAL_07_POST_HOME_ROWS+[(815,0,0)]*2)
+    original_read = transport.read_group
+    def changed_read(*args, **kwargs):
+        if transport.read_count >= 8:
+            transport.mutation=mutation
+        return original_read(*args, **kwargs)
+    transport.read_group=changed_read
+    with pytest.raises(feedback.ComparisonRefusal):
+        qualify(monitor, origin=812)
+    assert clock.now < 1
+
+
+def test_wrapped_one_tick_reversing_moving_sequence_keeps_fixed_acquisition():
+    rows=[(4095,100,1),(0,0,0),*([(4095,-50,1),(0,50,1)]*10)]
+    monitor, clock, _, _ = comparison(rows)
+    proof=qualify(monitor, origin=4094)['stationary_qualification']
+    assert clock.now == pytest.approx(1.0)
+    assert proof['readiness_branch']=='bounded_indicator'
+    assert proof['am1_post_home_origin_raw']==4094
+    assert proof['stationary_acquisition_origin_raw']==0
+    assert proof['stationary_acquisition_sample_index']==2
+    assert proof['position_excursion_raw']==1 and abs(proof['position_drift_raw'])<=1
+
+
+
+def test_former_three_moving_prefix_never_qualifies_without_stationary_tail():
+    # Two positive encoder steps and a zero-velocity Moving1 frame are not
+    # three same-direction steps. Repeating this actual-style settling prefix
+    # still cannot meet the frozen one-tick band or original one-second budget.
+    rows=[(813,100,1),(814,50,1),(815,0,1),(815,0,0)]
+    monitor, clock, transport, _ = comparison(rows)
+    with pytest.raises(feedback.ComparisonRefusal, match='stationary'):
+        qualify(monitor, origin=813)
+    assert clock.now == pytest.approx(1.0) and transport.read_count == 20

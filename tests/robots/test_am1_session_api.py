@@ -269,6 +269,104 @@ async def ws_command(ws, command):
             return reply
 
 
+@pytest.mark.parametrize("recipe,joint,target", [
+    ("physical-live-left-elbow", "arm_left_elbow_flex.pos", -0.3),
+    ("physical-live-right-elbow", "arm_right_elbow_flex.pos", -0.3),
+])
+def test_physical_live_wss_close_releases_selected_run_before_sample_expiry(cluster, tmp_path, recipe, joint, target):
+    from types import SimpleNamespace
+
+    from aiohttp import web
+
+    from tests.robots.test_am1_live_native import ExecutorNativeHost
+    from tests.robots.test_am1_physical_executor import executor
+    from tools.am1_session_core import SessionAuthority
+    from tools.am1_session_service import Gateway
+
+    host = ExecutorNativeHost()
+    e = executor(host)
+    authority = SessionAuthority(tmp_path / "physical-authority", executor=e)
+
+    async def scenario():
+        gateway = Gateway(cluster.owner_dir, tmp_path / "physical-gateway-auth")
+
+        async def local_owner_request(command, device):
+            # Preserve the actual gateway/TLS/WSS/auth and real authority/worker;
+            # replace only transport to the owner with this local test boundary.
+            authority.tick()
+            if command["op"] == "snapshot":
+                return {"snapshot": authority.snapshot()}
+            return authority.handle(command, device)
+
+        gateway.ipc.request = local_owner_request
+        runner = web.AppRunner(gateway.app)
+        server_tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        server_tls.load_cert_chain(cluster.cert, cluster.key)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0, ssl_context=server_tls)
+        await site.start()
+        gateway.origin = "https://127.0.0.1:" + str(site._server.sockets[0].getsockname()[1])
+        local = SimpleNamespace(url=gateway.origin, cert=cluster.cert, pair=gateway.auth.pair)
+        session = await enrolled(local)
+        ws = None
+        try:
+            claim = (await post(session, local, "/api/claim", {}))[1]
+            started = (await post(session, local, "/api/start", dict(
+                recipe=recipe, operation_id=oid(), controller_generation=claim["controller_generation"]
+            )))[1]
+            assert started["accepted"]
+
+            async def wait_run(status):
+                ceiling = time.monotonic() + 2
+                while time.monotonic() < ceiling:
+                    authority.tick()
+                    current = authority.snapshot()
+                    if current["run"]["status"] == status:
+                        return current
+                    await asyncio.sleep(.01)
+                assert False, authority.snapshot()
+
+            current = await wait_run("paused")
+            ws, current = await ws_attached(session, local)
+            base = dict(run_id=started["run_id"], service_incarnation=current["service_incarnation"],
+                        controller_generation=claim["controller_generation"],
+                        host_incarnation=current["evidence"]["host_incarnation"])
+            connected = await ws_command(ws, dict(op="connect", **base))
+            assert connected["accepted"]
+            base["connection_generation"] = connected["connection_generation"]
+            assert (await ws_command(ws, dict(op="release_input", **base)))["accepted"]
+            ceiling = time.monotonic() + 2
+            while not authority.snapshot()["evidence"]["pose_aligned"] and time.monotonic() < ceiling:
+                await asyncio.sleep(.01)
+            assert (await ws_command(ws, dict(op="resume", **base, operation_id=oid(),
+                expected_intent_revision=authority.run["intent_revision"])))["accepted"]
+            current = await wait_run("running")
+            base["intent_revision"] = current["run"]["intent_revision"]
+            grant = await ws_command(ws, dict(op="grant", **base))
+            assert (await ws_command(ws, dict(op="input", **base, grant_id=grant["grant_id"],
+                                             seq=1, target={joint: target})))["accepted"]
+            await ws.close()
+            ws = None
+            ceiling = min(time.monotonic() + .1, grant["expires"])
+            while authority.run["status"] != "paused" and time.monotonic() < ceiling:
+                await asyncio.sleep(.005)
+            assert time.monotonic() < grant["expires"]
+            assert authority.run["status"] == "paused" and authority.run["intent"] is None
+            assert authority.events[-1]["kind"] == "input_released"
+        finally:
+            if ws:
+                await ws.close()
+            await session.close()
+            await runner.cleanup()
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        authority.close()
+        if e.worker:
+            e.worker.join(2)
+
+
 def test_interactive_expiry_reconnect_and_enrolled_handoff_fences(cluster):
     # Missing WSS generation, grant expiry or enrolled-target fences replays stale movement.
     async def scenario():
