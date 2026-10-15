@@ -1,35 +1,54 @@
-## Active AM1-LIVE-ARMS-10 scope
+## Active AM1-LIVE-ARMS-10 result and continuing boundary
 
 PR21 is integrated into integrate/am1-local-teleop at
-48a3ed39b7591837ed6771a586daec7c1b8b5b8b after focused review and checks.
-Packet10 authorizes one focused follow-up, unmerged, offering pre-Start left or
-right elbow selection through the existing browser/Pi/native path. Only one
-selected joint moves; the other11 hold and body/lift commands remain zero after
-normal startup. Left behavior stays q0-10..q0; right uses its actual calibrated
-mapping. The retained positive-only right candidate is q0..q0+3. The new
-same-width negative-first refinement is q0-3..q0, at at most1 normalized unit/s,
-with unchanged settings and local protections. Its bounded diagnostic requires
-fresh native encoded endpoints within the demonstrated same-pose raw1829..1870
-interval, the recorded right held pose, and current qualified native hold; refuse
-the diagnostic before jogging if those facts do not match. This is a new
-opposite-direction hypothesis, not a claim that command span caused the prior
-partial response. No wider command span or gain experiment is authorized. Freeze selection/reference/corridor/deadline per run. Preserve
-original Pi250ms expiry at every native write boundary,60ms client sampling,
-one unresolved input, fresh gesture after release/qualified Resume/reconnection,
-original90s Live ceiling, local required imagery and no replay/autoplay.
-Root alone handles Git/devices/SSH/staging; agents own disjoint source/test scopes.
-Reuse existing tools and matched affected-component staging while stopped;
-preserve independent pins, private state, rollback and original results. No main
-merge, force/protection bypass/branch deletion, new follow-up merge, gain tuning,
+48a3ed39b7591837ed6771a586daec7c1b8b5b8b. The focused Packet10 follow-up remains
+unmerged. See docs/alohamini/live-arms-10.md for evidence and ordinary use.
+The page offers immutable pre-Start left/right elbow selection through the same
+persistent owner and protected motor backend. One joint receives live targets;
+other11 raw Goals stay held and body/lift commands remain zero after startup.
+Left q0-10..q0 is preserved; right uses its actual mapping and q0-3..q0 at no more
+than1 normalized unit/s, with unchanged150mA sampled guard/settings/calibration.
+Physical operating source83dfe3c4ae23a989bdf11224858e6771bac190c6 is separate
+from documentation and merge SHAs. Current motor e99da9a730f103cd196f6960e90e01b8da185992,
+runtime a5be47056c9be450ae099b05e5b9ecbf6958e919, manifest
+f3353726a11e5f4a86e43f7cf56dea556c4c5d1647bc8103e6e5698d63beebb6;
+matched prior1f17/74bd/2edd and older accepted09 rollbacks remain retained.
+
+Packet10 trial10 measured26 negative outward/6 positive return ticks, then browser
+reattachment and a fresh1-tick negative response. The final positive response
+window was interrupted by genuine input expiry; the private procedure remains
+FAILED. Protected hold completed19.812ms after expiry. Post-reconnect response
+was not comparable; fine positioning and repeatable full excursions remain
+unqualified. Do not turn this bounded two-way capability into a full repeat pass.
+Current native run19d0f4f4 is stopped with verified cleanup and retained results;
+services/interface are available idle and never start/replay motors on startup.
+
+The finite diagnostic admitted freshq01867/encoded1833..1867 inside demonstrated
+same-pose1829..1870. Later fresh references are not automatically certified by
+that result. Do not blindly rerun a shifted interval: retained currentraw1845
+would derive1811..1845 outside that diagnostic admission. Preserve actual pose,
+calibration, required local imagery, qualified native initial hold, identity and
+original reference/corridor/deadline. An initial held ACK lacks the later active/
+readiness-only nonselected_hold marker; do not require an active-only field before
+input or invent an exposed browser raw-Goal map. Native raw Goal checks remain.
+
+Preserve original Pi250ms expiry at every native boundary,60ms browser cadence,
+one unresolved input, latest-valid-only delivery, fresh gestures after qualified
+Resume/release/reconnect, original90s Live ceiling and no replay/autoplay. A real
+expiry can occur between a native snapshot and a later client probe; retain its
+exact evidence and do not delete target proof or count an interrupted dwell as
+continuous. Current-target error and original-reference residual are distinct.
+
+Root alone handles Git/devices/SSH/staging; agents use disjoint source/test scopes.
+Reuse existing tools and stopped affected-component matched staging. Preserve
+private state, separate helper/camera/manual pins, calibration, rollback and all
+historical results. AM1 stays wireless, P1 advisory and AM2 untouched. No new
+follow-up/main merge, force/protection bypass, gain tuning, widened command span,
 fine-return gate, bimanual/body/lift/USB-leader expansion, network/camera redesign,
-manual leader/shoulder/readiness questions or AM2 work. AM1 stays wireless and P1
-advisory. Durability means software fault tolerance, state/control continuity and
-recovery with minimal human intervention, not mechanical wear. Each sequence is
-finite and locally monitored; no arbitrary packet-wide attempt quota. Report
-current-target error separately from original-reference residual; prove the
-return goal reached plus bounded dwell before diagnosing inability to return.
-Historical scopes/results below remain at their recorded versions. Packet10
-supersedes Packet09's no-merge rule only for PR21 and the named integration target.
+manual leader/shoulder/readiness questions or hardware-endurance campaign.
+Durability means software fault tolerance, state/control continuity and recovery
+with minimal human intervention. Historical scopes below remain at their versions;
+Packet10 supersedes Packet09 no-merge only for PR21 and its named target.
 
 ## Active AM1-LIVE-VIRTUAL-09 scope
 

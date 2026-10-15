@@ -1,27 +1,35 @@
-## AM1-LIVE-ARMS-10 implementation and pre-Start selection
+## AM1-LIVE-ARMS-10: one selected live elbow
 
-The [Packet10 guide](live-arms-10.md) describes the focused follow-up at feature
-checkpoint `ee0266f302a4ffbbed1e927f3f5e9cfa5857e828`.
-The candidate page offers **Left elbow** (`physical-live-left-elbow`) and
-**Right elbow** (`physical-live-right-elbow`) before Start. Claim input, select
-the side, explicitly Start, qualify Resume and begin a new [ / ] or side-labelled
-button gesture. Active or uncertain runs freeze the admitted selection;
-release/blur/gap and browser reattachment require fresh qualification and new
-input. Known terminal cleanup permits the next pre-Start choice.
+The [Packet10 guide](live-arms-10.md) records the implemented left/right choice,
+physical evidence, limits, exact deployment and rollback. PR21 was ordinarily
+integrated into `integrate/am1-local-teleop` at
+`48a3ed39b7591837ed6771a586daec7c1b8b5b8b`. The Packet10 follow-up stays unmerged;
+physical source`83dfe3c4ae23a989bdf11224858e6771bac190c6` is separate from integration.
 
 | Capability | Current boundary |
 |---|---|
-| Live left elbow | Accepted Packet09 physical result retained at its actual operating source |
-| Live right-elbow selection | Implemented and focused offline checks passed; Packet10 physical result/deployment pending |
-| One selected joint per run | Other eleven arm goals held; body/lift commands zero after normal startup |
-| Bimanual, live body/lift, physical leaders, precision | Unqualified; outside this extension |
+| Live left elbow | Accepted Packet09 behavior and positioning limits preserved |
+| Live right elbow | Actual negative26/positive6 ticks from fixedq01867; bounded two-way response demonstrated |
+| Browser reattachment | Qualified same-run Resume and fresh negative1 tick; response not comparable; final return window interrupted by real expiry |
+| One selected joint per run | Other11 raw Goals held; body/lift commands zero after startup |
+| Precision, full repeated excursions, bimanual/body/lift/physical leaders | Unqualified |
 
-PR21 was ordinarily merged into `integrate/am1-local-teleop` at
-`48a3ed39b7591837ed6771a586daec7c1b8b5b8b`; integration is separate from deployment.
-The Packet10 follow-up has no automatic merge authority. Packet09/Packet08
-entries below remain at their recorded versions, including accepted movement and
-historical limitations; the new guide supersedes their older "next extension"
-descriptions only for the implemented two-choice path.
+On the existing enrolled page: Claim input, choose Left or Right elbow before
+explicit Start, qualify Resume, then make a new side-labelled button or [ / ]
+gesture. Release, blur, input gap and browser reattachment require fresh
+qualification and intent. Active/uncertain runs freeze selection. Verified
+terminal cleanup permits another pre-Start choice. Available idle is verified;
+service startup never starts or replays motor activity. Subsequent physical
+intervals still require supported admission; the guide identifies the tested
+1833..1867 interval and current1845 reference limitation.
+
+The final private procedure remains FAILED because genuine input expiry
+interrupted its last response window. Native measured hold completed19.812ms
+after expiry; that is not an end-to-end or hard-real-time guarantee. Required
+Pi-local images were present but did not visibly confirm the elbow; P1 was
+unavailable and remains advisory. Software durability covers continuity and
+recovery, not mechanical endurance. All Packet09/Packet08 history below remains
+at its recorded version; broader teleoperation is not implied by recipe selection.
 
 ## AM1-LIVE-VIRTUAL-09 current input capability
 
