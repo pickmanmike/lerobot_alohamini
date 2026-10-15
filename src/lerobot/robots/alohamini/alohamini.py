@@ -937,6 +937,7 @@ class AlohaMini(Robot):
                 if protected:
                     seed_writes[name] = {"raw_goal": present, "write_started_at": started,
                                          "write_completed_at": time.monotonic()}
+                self._refresh_am1_startup_lift_feedback()
         for bus, present_positions in all_goals:
             for name, expected in present_positions.items():
                 actual = self._read_am1_activation_raw(bus, "Goal_Position", name, phase="seed_readback")
@@ -944,6 +945,7 @@ class AlohaMini(Robot):
                     raise RuntimeError(
                         f"AM1 arm activation refused: '{name}' measured goal readback {actual} differs from {expected}."
                     )
+                self._refresh_am1_startup_lift_feedback()
         if protected:
             self._am1_protected_live_spec()
             for bus, limits in qualified:
