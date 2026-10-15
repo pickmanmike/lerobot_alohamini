@@ -443,6 +443,10 @@ for(const selected of [{recipe:"physical-live-left-elbow",joint:"arm_left_elbow_
         },300);
       }
       setTimeout(()=>{
+        if(frame.command.op==="resume"&&frame.command.rearm_of_intent_revision===undefined){
+          globalThis.pendingExplicitResume={snapshot:JSON.parse(JSON.stringify(am1Remote.snapshot))};
+          receive({data:JSON.stringify({kind:"result",id:frame.id,...value})});return;
+        }
         if(frame.command.op==="resume") {
           const snapshot=JSON.parse(JSON.stringify(am1Remote.snapshot));snapshot.run.status="running";snapshot.run.intent_revision++;
           Object.assign(snapshot.run.live_input,{cursor_norm:2,cursor_feedback_sequence:40,cursor_intent_revision:snapshot.run.intent_revision,rearm:{eligible:false,released_intent_revision:null}});
@@ -490,6 +494,14 @@ for(const selected of [{recipe:"physical-live-left-elbow",joint:"arm_left_elbow_
   const connect=await page.evaluate(()=>liveFrames.find(frame=>frame.command.op==="connect").command);
   assert.equal(connect.host_incarnation,"fixture-host","physical connect carries the current host identity");
   assert.equal(connect.service_incarnation,"fixture-owner");assert.equal(connect.controller_generation,actualController);
+  await page.waitForFunction(()=>globalThis.pendingExplicitResume);
+  assert.equal(await page.evaluate(()=>Boolean(am1Remote.liveResume)),true,"accepted Resume result must retain its current qualification token");
+  await page.evaluate(()=>{const s=pendingExplicitResume.snapshot;s.run.status="resuming";s.run.intent_revision=9;s.evidence.native_ack=false;fixtureReceive({data:JSON.stringify({kind:"snapshot",snapshot:s})});});
+  await page.keyboard.down("[");await page.keyboard.up("[");
+  assert.equal(await page.evaluate(()=>am1Remote.elbowGesture),null,"a press before current qualification is ignored, never remembered");
+  await page.evaluate(()=>{const s=pendingExplicitResume.snapshot;s.run.status="running";fixtureReceive({data:JSON.stringify({kind:"snapshot",snapshot:s})});});
+  assert.equal(await page.locator('[data-elbow-jog="1"]').isDisabled(),true,"running without its current native ACK and cursor keeps controls disabled");
+  await page.evaluate(()=>{const s=pendingExplicitResume.snapshot;s.evidence.native_ack=true;s.evidence.acknowledged_intent_revision=9;s.run.live_input.cursor_intent_revision=9;fixtureReceive({data:JSON.stringify({kind:"snapshot",snapshot:s})});delete globalThis.pendingExplicitResume;});
   await page.waitForFunction(()=>am1Remote.snapshot.run.intent_revision===9 && !document.querySelector('[data-elbow-jog="1"]').disabled);
   const handshake=await page.evaluate(()=>liveFrames.filter(frame=>["connect","release_input","resume"].includes(frame.command.op)));
   const resumed=handshake.find(frame=>frame.command.op==="resume"),connected=handshake.find(frame=>frame.command.op==="connect");

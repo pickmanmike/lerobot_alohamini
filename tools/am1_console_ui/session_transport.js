@@ -118,6 +118,7 @@ class AM1SessionTransport {
           this.reportingError=null;
           const previous=this.snapshot?.run,next=value.snapshot.run,ownRearm=this.expectedRearmSnapshot(value.snapshot),ownRelease=this.expectedElbowRelease(value.snapshot);
           const keepGesture=ownRearm?this.liveResume?.gesture:ownRelease&&this.elbowGesture?.release===this.elbowRelease&&this.rearmGestureCurrent(this.elbowGesture)?this.elbowGesture:null;
+          if(this.liveResume&&!ownRearm&&!ownRelease)this.liveResume=null;
           if(previous?.run_id!==next?.run_id || previous?.recipe!==next?.recipe || previous?.intent_revision!==next?.intent_revision) {
             this.intent++;if(!ownRearm&&!ownRelease){this.elbowRelease=null;if(this.isLiveElbow())this.elbowStrict=true;}this.clearGesture(false,keepGesture);
             if(previous?.run_id!==next?.run_id)this.elbowReleasedRevision=null;
@@ -319,14 +320,16 @@ class AM1SessionTransport {
       const resumed=()=>this.liveResume===token&&this.connected&&epoch===this.epoch&&this.controllerGeneration===ids.controller_generation
         &&this.connection===token.connection&&this.snapshot?.service_incarnation===ids.service_incarnation&&this.snapshot?.run?.run_id===ids.run_id
         &&this.snapshot.run.recipe===recipe&&this.snapshot.run.backend_incarnation===ids.host_incarnation
-        &&this.snapshot.run.intent_revision===initial+2&&this.snapshot.run.status==="running";
-      if(automatic&&result.accepted){
-        const active=()=>resumed()&&this.snapshot.evidence?.native_ack===true&&this.snapshot.evidence.acknowledged_intent_revision===initial+2&&this.snapshot.run.live_input?.cursor_intent_revision===initial+2;
-        while(this.rearmGestureCurrent(gesture)&&this.liveResume===token&&!active()&&performance.now()<until)await new Promise(resolve=>setTimeout(resolve,50));
-        if(active()&&this.rearmGestureCurrent(gesture)){
-          this.elbowStrict=false;this.elbowRelease=null;gesture.phase="active";clearTimeout(gesture.timer);this.setElbowJog(gesture.direction);
+        &&this.snapshot.run.intent_revision===initial+2&&this.snapshot.run.status==="running"&&this.sameElbowBounds(this.snapshot,bounds);
+      if(result.accepted){
+        const active=()=>resumed()&&["feedback","required_observation","native_ack"].every(key=>this.snapshot.evidence?.[key]===true)
+          &&this.snapshot.evidence.acknowledged_intent_revision===initial+2&&this.snapshot.run.live_input?.cursor_intent_revision===initial+2;
+        while((!automatic||this.rearmGestureCurrent(gesture))&&this.liveResume===token&&!active()&&performance.now()<until)await new Promise(resolve=>setTimeout(resolve,50));
+        if(active()&&performance.now()<until&&(!automatic||this.rearmGestureCurrent(gesture))){
+          this.elbowStrict=false;
+          if(automatic){this.elbowRelease=null;gesture.phase="active";clearTimeout(gesture.timer);this.setElbowJog(gesture.direction);}
         }
-      }else if(!automatic&&result.accepted&&this.liveResume===token&&epoch===this.epoch&&(current(true)||resumed()))this.elbowStrict=false;
+      }
       if(this.liveResume===token && epoch===this.epoch)this.render(this,result.reason);return result;
     } finally {if(this.liveResume===token)this.liveResume=null;}
   }
@@ -371,6 +374,7 @@ class AM1SessionTransport {
       ||snapshot.service_incarnation!==t.ids.service_incarnation||run.run_id!==t.ids.run_id||run.recipe!==t.recipe||run.backend_incarnation!==t.ids.host_incarnation
       ||snapshot.controller?.device_id!==this.device||snapshot.controller.controller_generation!==t.ids.controller_generation||!this.sameElbowBounds(snapshot,t.bounds))return false;
     if(t.gesture&&!this.rearmGestureCurrent(t.gesture))return false;
+    if(!t.gesture&&t.phase==="connect"&&run.intent_revision===t.initial&&["running","paused","resuming"].includes(run.status))return true;
     if(run.intent_revision===t.initial+1&&run.status==="paused")return !t.gesture||run.live_input?.rearm?.eligible===true&&run.live_input.rearm.released_intent_revision===t.origin;
     return t.phase==="resume"&&run.intent_revision===t.initial+2&&["running","resuming"].includes(run.status);
   }

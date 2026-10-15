@@ -359,6 +359,62 @@ async function rearmFixture(side="left") {
   s.run.status="running";s.run.intent_revision=10;Object.assign(s.run.live_input,{cursor_intent_revision:10,cursor_norm:3,rearm:{eligible:false,released_intent_revision:null}});s.evidence.acknowledged_intent_revision=10;deliver();f.reply("resume",{accepted:true});await flush();};
  return {...f,side,joint,deliver,hold,flush,release,qualify};
 }
+async function pendingExplicitResume(side="left") {
+ const f=await rearmFixture(side),t=f.transport;t.snapshot.run.status="paused";t.snapshot.run.intent_revision=0;t.snapshot.run.live_input.cursor_intent_revision=0;
+ const task=t.resume(),s=JSON.parse(JSON.stringify(t.snapshot));s.run.status="paused";s.run.intent_revision=1;
+ Object.assign(s.run.live_input,{cursor_norm:3,cursor_intent_revision:1,cursor_feedback_sequence:40});
+ s.evidence={feedback:true,required_observation:true,hold_acknowledged:true,pose_aligned:true,native_ack:true,acknowledged_intent_revision:1};
+ const deliver=()=>t.socket.onmessage({data:JSON.stringify({kind:"snapshot",snapshot:JSON.parse(JSON.stringify(s))})});
+ deliver();f.reply("connect",{accepted:true,connection_generation:"explicit-wire",snapshot:JSON.parse(JSON.stringify(s))});await f.flush();
+ f.reply("release_input",{accepted:true});await f.flush();
+ const advance=async()=>{for(const entry of f.timers.filter(entry=>entry?.[1]===50))entry[0]();await f.flush();};
+ const active=()=>{s.run.status="running";s.run.intent_revision=2;s.run.live_input.cursor_intent_revision=2;s.evidence.native_ack=true;s.evidence.acknowledged_intent_revision=2;deliver();};
+ return {...f,task,s,deliver,advance,active};
+}
+for(const side of ["left","right"])for(const order of ["result-first","resuming-first"])test("explicit "+side+" Resume retains qualification through "+order+" and requires a new press after current native ACK",async()=>{
+ const f=await pendingExplicitResume(side),t=f.transport;try{
+  if(order==="result-first"){f.reply("resume",{accepted:true,status:"resuming"});await f.flush();}
+  f.s.run.status="resuming";f.s.run.intent_revision=2;f.s.evidence.native_ack=false;f.deliver();
+  if(order==="resuming-first"){f.reply("resume",{accepted:true,status:"resuming"});await f.flush();}
+  assert(t.liveResume,"own qualification token must survive the accepted result until its current running ACK");
+  assert.equal(t.elbowStrict,true);assert.equal(t.pressElbowJog(1,"key:]"),false);assert.equal(t.elbowCursor,null);
+  f.s.run.status="running";f.deliver();await f.advance();assert(t.liveResume);assert.equal(t.elbowJog,0);assert.equal(t.pressElbowJog(1,"key:]"),false);
+  f.s.evidence.native_ack=true;f.s.evidence.acknowledged_intent_revision=2;f.deliver();await f.advance();
+  assert(t.liveResume,"current ACK alone cannot substitute for its measured cursor revision");
+  f.s.run.live_input.cursor_intent_revision=2;f.deliver();await f.advance();await f.task;
+  assert.equal(t.liveResume,null);assert.equal(t.elbowStrict,false);assert.equal(t.elbowJog,0);assert.equal(t.elbowGesture,null);
+  assert(t.pressElbowJog(1,"key:new"));f.setNow(1100);const tick=t.input();f.reply("grant",{accepted:true,grant_id:"qualified",issued:5,expires:5.25});await tick;
+  assert.deepEqual(Object.keys(f.frames.at(-1).command.target),[f.joint]);assert.equal(f.frames.at(-1).command.intent_revision,2);f.reply("input",{accepted:true});
+ }finally{t.clear();}
+});
+for(const loss of ["pause","release","owner","connection","bounds","fault","deadline","new-resume"])test("accepted explicit Resume cannot reopen after "+loss+" before its delayed active snapshot",async()=>{
+ const f=await pendingExplicitResume(),t=f.transport;try{
+  f.reply("resume",{accepted:true,status:"resuming"});await f.flush();
+  if(loss==="release")t.releaseInput();
+  if(loss==="new-resume")t.resume().catch(()=>{});
+  if(loss==="connection")t.connection="foreign-wire";
+  if(loss==="deadline")f.setNow(4000);
+  const changed=JSON.parse(JSON.stringify(f.s));
+  if(loss==="pause"){changed.run.intent_revision=3;changed.run.live_input.cursor_intent_revision=3;}
+  if(loss==="owner")changed.controller={device_id:"other",controller_generation:"other"};
+  if(loss==="bounds")changed.run.live_input.corridor_min_norm--;
+  if(loss==="fault")changed.evidence.fault="retained first cause";
+  t.socket.onmessage({data:JSON.stringify({kind:"snapshot",snapshot:changed})});
+  // Deliver the old own active view immediately, before a waiting continuation can run.
+  f.active();await f.advance();await f.task;
+  assert.equal(t.elbowStrict,true);assert.equal(t.elbowJog,0);assert.equal(t.elbowCursor,null);assert.equal(t.pressElbowJog(1,"key:new"),false);
+  assert.equal(f.frames.filter(row=>["grant","input"].includes(row.command.op)).length,0);
+ }finally{t.clear();}
+});
+test("an unchanged initial held snapshot while explicit connect is pending does not cancel its own qualification",async()=>{
+ const f=await rearmFixture(),t=f.transport;try{t.snapshot.run.status="paused";const initial=JSON.parse(JSON.stringify(t.snapshot)),task=t.resume();
+  t.socket.onmessage({data:JSON.stringify({kind:"snapshot",snapshot:initial})});assert(t.liveResume);
+  f.hold(8,false);f.reply("connect",{accepted:true,connection_generation:"explicit-wire",snapshot:JSON.parse(JSON.stringify(t.snapshot))});await f.flush();f.reply("release_input",{accepted:true});await f.flush();
+  const active=JSON.parse(JSON.stringify(t.snapshot));active.run.status="running";active.run.intent_revision=9;active.run.live_input.cursor_intent_revision=9;active.evidence.acknowledged_intent_revision=9;
+  t.socket.onmessage({data:JSON.stringify({kind:"snapshot",snapshot:active})});f.reply("resume",{accepted:true});await task;assert.equal(t.elbowStrict,false);
+ }finally{t.clear();}
+});
+
 for(const side of ["left","right"])test("ordinary "+side+" release and new press rearm the same run without a separate Resume",async()=>{
  const f=await rearmFixture(side),t=f.transport;try{await f.release();assert.equal(f.frames[0].command.release_kind,"voluntary_jog");
   assert.equal(t.pressElbowJog(1,"key:]"),true);await f.flush();assert.equal(t.elbowJog,0);assert.equal(t.elbowCursor,null);

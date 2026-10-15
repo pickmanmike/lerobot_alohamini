@@ -1468,3 +1468,275 @@ def test_voluntary_release_cannot_reclassify_expiry_during_feedback(physical_liv
     assert a.run["status"] == "paused" and a.run["intent"] is None
     assert not a.snapshot()["run"]["live_input"]["rearm"]["eligible"]
     assert not a.handle(command("connect", **base, rearm_of_intent_revision=a.run["intent_revision"]), "owner")["accepted"]
+
+
+def physical_live_returned_write(a, e, host, r, monkeypatch):
+    """Real native receipt path; only the existing simulated robot's helper return is injected."""
+    import math
+    import time
+
+    from examples.alohamini.am1_session_contract import LIVE_ELBOW_SPECS
+    from tests.robots.test_am1_physical_executor import until
+
+    spec = LIVE_ELBOW_SPECS[a.run["recipe"]]
+    original = host.robot.send_action
+
+    def returned(action):
+        began = time.monotonic()
+        result = original(action)
+        binding = getattr(host.robot, "_am1_live_action_binding", None)
+        if binding:
+            minimum, span = (827, 2212) if spec.side == "right" else (864, 2209)
+            host.robot._am1_selected_joint_action = {
+                **binding, "side": spec.side, "motor": spec.joint.removesuffix(".pos"),
+                "expected_goal_raw": math.floor((action[spec.joint] + 100) / 200 * span + minimum),
+                "sync_write_returned": True, "write_started_at_monotonic_s": began,
+                "write_completed_at_monotonic_s": time.monotonic(),
+            }
+        return result
+
+    monkeypatch.setattr(host.robot, "send_action", returned)
+    base = physical_live_controls(a, r)
+    live = a.snapshot()["run"]["live_input"]
+    grant = a.handle(command("grant", **base), "owner")
+    target = max(live["corridor_min_norm"], live["cursor_norm"] - .2)
+    assert a.handle(command("input", **base, grant_id=grant["grant_id"], seq=0,
+                            target={spec.joint: target}), "owner")["accepted"]
+    until(lambda: e.evidence().get("live_input", {}).get("last_successful_write"))
+    return base, grant
+
+
+def retained_live_write_views(a, expected):
+    import base64
+    import hashlib
+    import json
+
+    from tools.am1_session_ipc import RESPONSE_LIMIT, encode
+
+    durable = json.loads(a.db.execute("SELECT data FROM state WHERE id=1").fetchone()[0])
+    assert durable["live_input"]["last_successful_write"] == expected
+    view = a.snapshot()
+    assert len(encode({"id": str(uuid.uuid4()), "result": view})) < RESPONSE_LIMIT
+    assert view["run"]["live_input"]["last_successful_write"] == expected
+    assert view["evidence"]["live_input"]["last_successful_write"] == expected
+    reference = view["run"]["details_reference"]
+    raw = bytearray()
+    while len(raw) < reference["bytes"]:
+        reply = a.snapshot_detail(dict(op="snapshot", reference=reference, offset=len(raw), limit=8192))
+        raw.extend(base64.b64decode(reply["data"], validate=True))
+    assert hashlib.sha256(raw).hexdigest() == reference["sha256"]
+    assert json.loads(raw)["live_input"]["last_successful_write"] == expected
+
+
+@pytest.mark.parametrize("physical_live_authority", [
+    "physical-live-left-elbow", "physical-live-right-elbow",
+], indirect=True)
+def test_live_write_history_survives_core_expiry_revision_and_terminal(physical_live_authority, monkeypatch):
+    import copy
+
+    from tests.robots.test_am1_physical_executor import until
+
+    a, e, host, r = physical_live_authority
+    base, grant = physical_live_returned_write(a, e, host, r, monkeypatch)
+    deadline, revision = a.run["deadline"], a.run["intent_revision"]
+    until(lambda: e.evidence()["live_input"]["state"] == "expired")
+    expected = copy.deepcopy(e.evidence()["live_input"]["last_successful_write"])
+    assert expected["valid_until_monotonic_s"] == grant["expires"]
+    a.tick()  # Expiry advances revision and clears the executor's expired-evidence cache.
+    assert a.run["status"] == "paused" and a.run["intent_revision"] > revision
+    assert a.run["deadline"] == deadline
+    retained_live_write_views(a, expected)
+    until(lambda: e.evidence().get("acknowledged_intent_revision") == a.run["intent_revision"])
+    projected = a.snapshot()["run"]["live_input"]
+    current = {"encoded_goal_raw", "goal_write_returned", "goal_write_started_at_monotonic_s",
+               "goal_write_completed_at_monotonic_s", "goal_action_sequence"}
+    assert not current.intersection(projected)
+    assert not a.handle(command("grant", **dict(base, intent_revision=a.run["intent_revision"])), "owner")["accepted"]
+    # Historical success alone cannot qualify a current Resume or ordinary rearm.
+    stale = copy.deepcopy(e.evidence())
+    stale.update(feedback=False, required_observation=False, native_ack=False, pose_aligned=False)
+    with monkeypatch.context() as patch:
+        patch.setattr(e, "evidence", lambda: copy.deepcopy(stale))
+        ids = dict(base, intent_revision=a.run["intent_revision"])
+        assert a.handle(command("release_input", **ids, release_kind="voluntary_jog"), "owner")["accepted"]
+        assert a.snapshot()["run"]["live_input"]["rearm"]["eligible"] is False
+        assert not a.handle(command("resume", **ids, expected_intent_revision=a.run["intent_revision"]), "owner")["accepted"]
+        assert a.snapshot()["evidence"]["native_ack"] is False
+    assert a.handle(command("stop", run_id=r["run_id"]), "owner")["accepted"]
+    until(lambda: (a.tick() or a.run["status"] == "stopped"))
+    retained_live_write_views(a, expected)
+
+
+@pytest.mark.parametrize("physical_live_authority", [
+    "physical-live-left-elbow", "physical-live-right-elbow",
+], indirect=True)
+def test_live_write_history_stop_before_checkpoint_retains_native_copy(physical_live_authority, monkeypatch):
+    import copy
+
+    from tests.robots.test_am1_physical_executor import until
+
+    a, e, host, r = physical_live_authority
+    physical_live_returned_write(a, e, host, r, monkeypatch)
+    assert "last_successful_write" not in a.run.get("live_input", {})
+    original, seen = e.evidence, []
+
+    def observed():
+        value = original()
+        receipt = value.get("live_input", {}).get("last_successful_write")
+        if receipt:
+            seen.append(copy.deepcopy(receipt))
+        return value
+
+    monkeypatch.setattr(e, "evidence", observed)
+    assert a.handle(command("stop", run_id=r["run_id"]), "owner")["accepted"]
+    until(lambda: (a.tick() or a.run["status"] == "stopped"))
+    assert seen, "protective Stop must capture cached native history without a pre-command tick"
+    expected = seen[-1]
+    retained_live_write_views(a, expected)
+
+
+@pytest.mark.parametrize("physical_live_authority", [
+    "physical-live-left-elbow", "physical-live-right-elbow",
+], indirect=True)
+def test_live_write_history_validation_copies_closed_native_scalars(physical_live_authority, monkeypatch):
+    import copy
+    import time
+
+    a, e, host, r = physical_live_authority
+    physical_live_returned_write(a, e, host, r, monkeypatch)
+    evidence = copy.deepcopy(e.evidence())
+    expected = copy.deepcopy(evidence["live_input"]["last_successful_write"])
+    projected = a._live_input_status(evidence)
+    assert projected["last_successful_write"] == expected
+    assert len(__import__("json").dumps(expected)) < 2048
+    projected["last_successful_write"]["encoded_goal_raw"] = -1
+    assert evidence["live_input"]["last_successful_write"] == expected
+    # First validate the positive fixture, then reject every malformed replacement
+    # without relabeling or losing this same-run retained record.
+    a.run["live_input"] = a._live_input_status(evidence, include_rearm=False)
+    corruptions = {
+        "foreign_run": {"run_id": str(uuid.uuid4())}, "foreign_host": {"host_incarnation": str(uuid.uuid4())},
+        "foreign_service": {"service_incarnation": str(uuid.uuid4())}, "wrong_joint": {"joint": "arm_left_wrist_flex.pos"},
+        "wrong_side": {"side": "other"}, "future_revision": {"intent_revision": a.run["intent_revision"] + 1},
+        "bad_owner": {"controller_generation": "not-uuid"}, "bad_connection": {"connection_generation": "NOT-UUID"},
+        "bad_grant": {"grant_id": "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA"}, "wrong_version": {"version": True},
+        "wrong_provenance": {"provenance": "client"}, "unreturned": {"goal_write_returned": False},
+        "nan": {"accepted_target_norm": float("nan")}, "infinity": {"valid_until_monotonic_s": float("inf")},
+        "bool_sequence": {"last_input_seq": True}, "negative_epoch": {"epoch": -1},
+        "negative_raw": {"encoded_goal_raw": -1}, "outside_norm": {"accepted_target_norm": 101},
+        "future_write": {"goal_write_completed_at_monotonic_s": time.monotonic() + 100},
+        "expired_before_write": {"valid_until_monotonic_s": expected["goal_write_started_at_monotonic_s"]},
+        "unordered": {"goal_write_started_at_monotonic_s": expected["goal_write_completed_at_monotonic_s"] + 1},
+        "bulk": {"unexpected": ["bulk"] * 10000}, "nested": {"grant_id": {"nested": "bad"}},
+    }
+    for label, changes in corruptions.items():
+        bad = copy.deepcopy(evidence)
+        bad["live_input"]["last_successful_write"].update(changes)
+        assert a._live_input_status(bad)["last_successful_write"] == expected, label
+        previous = a.run.pop("live_input")
+        assert "last_successful_write" not in a._live_input_status(bad), label
+        a.run["live_input"] = previous
+    cleared = dict(evidence, live_input={"state": "held", "joint": expected["joint"]})
+    assert a._live_input_status(cleared)["last_successful_write"] == expected
+    old = copy.deepcopy(expected)
+    old.update(intent_revision=0, controller_generation=str(uuid.uuid4()), connection_generation=str(uuid.uuid4()))
+    cleared["live_input"]["last_successful_write"] = old
+    assert a._live_input_status(cleared)["last_successful_write"] == old
+    # Expiry is not a receipt TTL: a returned write may complete after its old grant.
+    # A schema-only timing copy exercises a completion straddling the original expiry.
+    old["goal_write_started_at_monotonic_s"] = old["goal_write_completed_at_monotonic_s"] - .002
+    old["valid_until_monotonic_s"] = old["goal_write_completed_at_monotonic_s"] - .001
+    assert a._live_input_status(cleared)["last_successful_write"] == old
+
+
+def test_live_write_history_is_not_synthesized_without_a_receipt(physical_live_authority):
+    from tests.robots.test_am1_physical_executor import until
+
+    a, e, host, r = physical_live_authority
+    assert "last_successful_write" not in a.snapshot()["run"]["live_input"]
+    assert a.handle(command("stop", run_id=r["run_id"]), "owner")["accepted"]
+    until(lambda: (a.tick() or a.run["status"] == "stopped"))
+    assert "last_successful_write" not in (a.snapshot()["run"].get("live_input") or {})
+
+
+def test_live_write_history_terminal_reopen_keeps_original_run_binding(physical_live_authority, monkeypatch):
+    import copy
+
+    from tests.robots.test_am1_live_native import ExecutorNativeHost
+    from tests.robots.test_am1_physical_executor import executor, until
+
+    a, e, host, r = physical_live_authority
+    physical_live_returned_write(a, e, host, r, monkeypatch)
+    until(lambda: e.evidence()["live_input"]["state"] == "expired")
+    expected = copy.deepcopy(e.evidence()["live_input"]["last_successful_write"])
+    a.tick()
+    assert a.handle(command("stop", run_id=r["run_id"]), "owner")["accepted"]
+    until(lambda: (a.tick() or a.run["status"] == "stopped"))
+    a.close()
+    replacement = executor(ExecutorNativeHost())
+    restored = SessionAuthority(a.directory, executor=replacement)
+    try:
+        assert restored.service_incarnation != expected["service_incarnation"]
+        assert replacement.host_incarnation != expected["host_incarnation"]
+        assert restored.run["status"] == "stopped"
+        retained_live_write_views(restored, expected)
+        assert restored._live_input_status({})["last_successful_write"] == expected
+    finally:
+        restored.close()
+
+
+def test_live_write_history_absent_native_keeps_only_immutable_admission(physical_live_authority, monkeypatch):
+    import copy
+
+    a, e, host, r = physical_live_authority
+    physical_live_returned_write(a, e, host, r, monkeypatch)
+    a.tick()
+    stored = copy.deepcopy(a.run["live_input"])
+    immutable = {"joint", "reference_norm", "corridor_min_norm", "corridor_max_norm", "measured_origin_raw",
+                 "corridor_min_raw", "corridor_max_raw", "admission_version", "workspace",
+                 "live_admitted_at_monotonic_s", "live_deadline_monotonic_s"}
+    for evidence in ({}, {"live_input": {}}, {"live_input": {"state": "held", "joint": stored["joint"]}}):
+        result = a._live_input_status(evidence)
+        assert {k: result[k] for k in immutable if k in stored} == {k: stored[k] for k in immutable if k in stored}
+        assert result["last_successful_write"] == stored["last_successful_write"]
+        assert not {"cursor_norm", "cursor_feedback_sequence", "cursor_intent_revision",
+                    "goal_write_returned", "encoded_goal_raw", "goal_action_sequence"}.intersection(result)
+        if not evidence.get("live_input"):
+            assert "rearm" not in result and "state" not in result
+        if "workspace" in result:
+            result["workspace"]["context_sha256"] = "changed"
+            assert a.run["live_input"]["workspace"] == stored["workspace"]
+
+
+def test_live_write_history_terminal_cannot_reproject_cached_current_write(physical_live_authority, monkeypatch):
+    import copy
+
+    a, e, host, r = physical_live_authority
+    physical_live_returned_write(a, e, host, r, monkeypatch)
+    evidence = copy.deepcopy(e.evidence())
+    assert a._live_input_status(evidence)["goal_write_returned"] is True
+    status = a.run["status"]
+    try:
+        for terminal in ("finishing", "stopped"):
+            a.run["status"] = terminal
+            result = a._live_input_status(evidence)
+            assert "goal_write_returned" not in result and "encoded_goal_raw" not in result
+            assert result["last_successful_write"] == evidence["live_input"]["last_successful_write"]
+    finally:
+        a.run["status"] = status
+
+
+def test_live_write_history_clock_reset_retains_only_prevalidated_storage(physical_live_authority, monkeypatch):
+    import copy
+
+    a, e, host, r = physical_live_authority
+    physical_live_returned_write(a, e, host, r, monkeypatch)
+    evidence = copy.deepcopy(e.evidence())
+    expected = copy.deepcopy(evidence["live_input"]["last_successful_write"])
+    a.run["live_input"] = a._live_input_status(evidence, include_rearm=False)
+    with monkeypatch.context() as patch:
+        patch.setattr(a, "clock", lambda: 0.0)  # A later OS boot resets monotonic time.
+        assert a._live_input_status({})["last_successful_write"] == expected
+        saved = a.run["live_input"].pop("last_successful_write")
+        assert "last_successful_write" not in a._live_input_status(evidence)
+        a.run["live_input"]["last_successful_write"] = saved
