@@ -572,3 +572,166 @@ def test_old_original_lift_feedback_cannot_be_retimed_by_a_new_host_envelope():
     }
     with pytest.raises(FeedbackUnavailable, match="lift.*expired"):
         read_physical_sample(client, "run", "host", 4, clock=lambda: 10.0)
+
+
+def test_real_codec_core_ipc_https_wss_preserves_raw12_lift_and_actual_zero(tmp_path, monkeypatch):
+    import asyncio
+    import json
+    import ssl
+    import subprocess
+    import time
+    from types import SimpleNamespace
+
+    from aiohttp import web
+
+    from lerobot.robots.alohamini import alohamini_client as client_module, alohamini_host as host
+    from lerobot.robots.alohamini.config_alohamini import AlohaMiniClientConfig
+    from tests.robots.am1_session_fixture import OPENSSL
+    from tools.am1_leader_adapter import SessionClient, native_frame_ack
+    from tools.am1_physical_executor import read_physical_sample
+    from tools.am1_session_ipc import RESPONSE_LIMIT, OwnerServer, encode
+    from tools.am1_session_service import Gateway
+
+    a, e, ids = authority_lane(tmp_path / "authority")
+    e._epoch, e._epoch_mode = 0, "active"
+    src, zero = source(), {"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0, "lift_axis.vel": 0}
+    raw = {
+        "version": 1,
+        "positions": {
+            key: {
+                "raw": 2000 + index,
+                "normalized": 0.0,
+                "read_started_at_monotonic_s": 9.96,
+                "read_completed_at_monotonic_s": 9.98,
+            }
+            for index, key in enumerate(KEYS)
+        },
+    }
+    lift = {
+        "version": 1,
+        "present_velocity_raw": 0,
+        "height_mm": 23.0,
+        "sample_monotonic_s": 9.94,
+        "request_duration_s": 0.01,
+    }
+    control = host.AM1LocalControl(
+        run_id=e.run_id, host_incarnation=e.host_incarnation, live=True, live_recipe="physical-live-teleop"
+    )
+    control.state, control.epoch, control.intent_revision = "active", 0, 0
+    control._live_summary = {
+        **e.sample["ack"]["live_input"],
+        "state": "active",
+        "source": src,
+        "last_input_seq": 1,
+        "body": zero,
+        "accepted_target": dict.fromkeys(KEYS, 0.0),
+        "cursor": dict.fromkeys(KEYS, 0.0),
+        "reference": workspace()["reference"],
+        "live_admitted_at_monotonic_s": 9.0,
+        "live_deadline_monotonic_s": 309.0,
+    }
+    observation = {
+        **dict.fromkeys(KEYS, 0.0),
+        **zero,
+        "lift_axis.height_mm": 23.0,
+        "_am1_arm_feedback": raw,
+        "_am1_lift_feedback": lift,
+    }
+    control.annotate(observation, acquired_at=9.98)
+    observation[host.AM1_LOCAL_FEEDBACK_KEY]["read_started_at_monotonic_s"] = 9.95
+    parts = host.build_observation_multipart(observation, ())
+    native_client = client_module.AlohaMiniClient(
+        AlohaMiniClientConfig(
+            remote_ip="127.0.0.1", cameras={}, robot_model="alohamini1", calibration_dir=tmp_path
+        )
+    )
+    native_client._is_connected = True
+    native_client._last_response_request_sent_at = 9.95
+    monkeypatch.setattr(native_client, "_poll_and_get_latest_message", lambda: parts)
+    monkeypatch.setattr(
+        client_module, "time", SimpleNamespace(monotonic=lambda: 10.0, perf_counter=time.perf_counter)
+    )
+    e.sample = read_physical_sample(native_client, e.run_id, e.host_incarnation, -1, clock=lambda: 10.0)
+    assert len(json.dumps(e.sample["ack"]).encode()) > 4096
+    cert, key = tmp_path / "cert.pem", tmp_path / "key.pem"
+    subprocess.run(
+        [
+            OPENSSL,
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            str(key),
+            "-out",
+            str(cert),
+            "-days",
+            "1",
+            "-subj",
+            "/CN=localhost",
+            "-addext",
+            "subjectAltName=IP:127.0.0.1,DNS:localhost",
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+    async def scenario():
+        owner = OwnerServer(tmp_path / "ipc-owner")
+        owner.authority.close()
+        owner.authority = a
+        owner.stopping.set()  # Presentation-only fixed-clock fixture; no actuation/tick worker.
+        gateway = Gateway(owner.directory, tmp_path / "auth")
+        enrolled = gateway.auth.enroll(gateway.auth.pair(control=True))
+        a.controller["device_id"] = enrolled["device_id"]
+        tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        tls.load_cert_chain(cert, key)
+        runner = web.AppRunner(gateway.app, access_log=None, shutdown_timeout=1)
+        client = None
+        try:
+            await owner.start()
+            await runner.setup()
+            site = web.TCPSite(runner, "127.0.0.1", 0, ssl_context=tls)
+            await site.start()
+            gateway.origin = f"https://127.0.0.1:{site._server.sockets[0].getsockname()[1]}"
+            storage = tmp_path / "storage.json"
+            storage.write_text(
+                json.dumps(
+                    {
+                        "cookies": [
+                            {
+                                "name": "__Host-am1-device",
+                                "value": enrolled["token"],
+                                "domain": "127.0.0.1",
+                                "path": "/",
+                                "secure": True,
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            client = SessionClient(gateway.origin, cert, storage)
+            await client.attach()
+            await asyncio.sleep(0.12)  # Also exercise the production publication path after initial ACK.
+            snapshot = client.snapshot
+            ack = snapshot["evidence"]["accepted_host_action"]
+            assert ack["arm_feedback"] == raw and ack["lift_feedback"] == lift
+            assert "live_input" not in ack  # Only the duplicate workspace/summary is removed.
+            assert snapshot["run"]["live_input"]["workspace"] == workspace()
+            assert snapshot["run"]["live_input"]["reference"] == workspace()["reference"]
+            assert snapshot["run"]["deadline"] == 309.0
+            assert snapshot["run"]["live_input"]["source"] == src
+            assert ack["run_id"] == ids["run_id"] and ack["host_incarnation"] == ids["host_incarnation"]
+            assert ack["read_started_at_monotonic_s"] == 9.95 and ack["acquired_at_monotonic_s"] == 9.98
+            assert native_frame_ack(snapshot, 1, src, body_zero=True)
+            assert len(encode({"kind": "snapshot", "snapshot": snapshot})) < RESPONSE_LIMIT
+        finally:
+            if client:
+                await client.close()
+            await runner.cleanup()
+            a.run = None
+            await owner.close()
+
+    asyncio.run(scenario())

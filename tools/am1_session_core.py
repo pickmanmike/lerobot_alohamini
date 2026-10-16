@@ -3125,7 +3125,17 @@ class SessionAuthority:
             "retained_return_reference",
             "live_input",
         }
-        public = _status_small(evidence, keys)
+        presented_evidence = evidence
+        if run is not None and run.get("recipe") == TELEOP_RECIPE:
+            ack = evidence.get("accepted_host_action")
+            if isinstance(ack, dict):
+                # The exact live summary is already exposed separately. Keep
+                # original raw acquisition facts inside the existing ACK field
+                # without its duplicated workspace exceeding the field cap.
+                presented_evidence = {**evidence, "accepted_host_action": {
+                    key: value for key, value in ack.items() if key != "live_input"
+                }}
+        public = _status_small(presented_evidence, keys)
         if self._physical_interactive():
             public["live_input"] = self._live_input_status(evidence)
         public["lifecycle"] = _status_lifecycle(evidence.get("lifecycle"))
