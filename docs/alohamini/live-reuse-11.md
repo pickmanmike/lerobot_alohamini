@@ -1,4 +1,4 @@
-Packet12 continues this work on the same unmerged PR23. See [supported rest and right-elbow response](response-12.md) for the current fixed-context correction, conditional one-use comparison and its verification state. The Packet11 results below remain the historical record at their stated source versions; they do not qualify new physical operation.
+Packet12 outcome on the same draft, unmerged PR23: supported rest admission and a normal P16 next Start are demonstrated. Temporary P20 produced+4/-8raw and ordinary re-jog before a local current-rise fault; repeatable useful normal control remains unqualified. See [the current consolidated result](response-12.md). The Packet11 results below remain byte-preserved history at their stated sources.
 
 # AM1 ordinary re-jog and retained workspace — Packet11
 

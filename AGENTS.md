@@ -1,46 +1,46 @@
-## Active AM1-RESPONSE-12 continuation
+## Current AM1-RESPONSE-12 result and remaining boundary
 
-Execute only the owner-invoked Packet12 scope on existing PR23; keep it draft
-and unmerged while useful control remains unresolved. Packet12 supersedes the
-historical Packet11 prohibition on a current-context correction and authorizes
-only ONE reviewed, reversible same-joint response-parameter comparison. See
-[the Packet12 evidence and procedure](docs/alohamini/response-12.md).
+Packet12 continued PR23 only; it remains draft and unmerged. See
+[the consolidated evidence](docs/alohamini/response-12.md). Preserve all
+Packet11 and earlier outcomes below at their recorded source versions.
 
-Preserve the completed re-jog, fixed-workspace, Claim/renewal, startup and native
-expiry repairs. Define one fixed, measured, geometry-supported resting-context
-policy before staging; do not ratchet bounds or add per-refusal exceptions.
-All eleven actual nonselected Goals remain exact within a run. Fresh measured
-q0, command1834..1867, rate<=1, sampled150mA guard, q0+/-3 measured guard,
-original250ms grants, original90s deadline and local protections remain.
+Fixed policy am1-right-elbow-rest-neighbourhood-v2 now admits the supported
+actual rest without historical pose commands. All eleven actual held Goals
+remain exact within a run. Fresh q0 stays separate from fixed command1834..1867;
+rate<=1, sampled150mA, q0+/-3, original250ms expiry and90s deadline remain.
 
-The sole conditional comparison is right-bus ID3/model777/FW3.10, P coefficient
-address21 original16 ->20; I0/D32, Phase12 and all force/current/travel limits
-remain. It requires exact source/rollback review, a private one-use run-bound
-request, durable original snapshot before writes, volatile Lock1 write/readback,
-and restored/read-back P16 BEFORE restoring original Lock state. Normal P16/I0
-admission stays unchanged. No request or service restart may replay the trial.
-A promising trial is not permanent tuning or ordinary-use qualification.
+The permitted rightID3/FW3.10 P16->20 comparison is consumed. First setup db4b
+applied P20 in hold but stopped on the obsolete private v1 assertion before
+accepted input; original P16/Lock0 restoration is verified. Its exact nonce was
+explicitly archived after review and is permanently rejected by the installed
+consumer. Replacement aa3f admitted q01845, moved+4/-8raw and re-jogged after
+ordinary release; a later post-reattachment leg faulted on the unchanged local
+static-current-rise guard. Its final rejected sample was not logged. Retain the
+host cause and outer feedback_loss separately; do not infer a network fault,
+obstruction or software false positive. P16 was restored before originalLock0.
 
-Use original evidence first. No unchanged zero-response repetition, gain sweep,
-force increase, firmware/calibration change, new joints, network work, generic
-inspection or manual historical-pose/leader/readiness question is authorized.
-Root alone operates Git/SSH/staging/hardware; other agents stay offline in
-explicit disjoint files. Reuse existing tools, matched stopped staging and full
-rollback. AM1 wireless, P1 advisory, AM2 untouched. Durability means software
-fault tolerance, connection/control continuity, preserved state and recovery.
+Normal P16 next Start fc1f admitted fresh q01847 and finished known cleanup;
+its918ms gesture produced0raw movement. Startup reuse and useful movement are
+separate results. Repeated ordinary useful control remains unqualified.
+No additional P20 comparison, gain sweep, guard relaxation, permanent tuning
+or merge is authorized by the consumed comparison.
 
-First Packet12 setup db4b992e passed v2 native admission at actual1845, applied
-P20 in measured hold, then the private runner's obsolete v1 ID assertion stopped
-before Resume/grants/input. P16/Lock0 restoration and all cleanup are verified;
-retain this failed setup, original nonce/source/deadline and zero-input evidence.
-The same unperformed P16->20 response comparison may proceed only after the
-closed v1/v2 runner repair and reviewed archived-old-nonce replay guard are
-installed. Explicit stopped pre-input retirement must verify the exact original
-marker/native/cleanup proof; it is forbidden after any Resume/grant/input.
-No automatic retirement, repeat response comparison or new parameter value.
+Installed executable3409ce344c36944e18812134548f83b517f4837d:
+motor ce8d8c1ad0470d0660d7bffeff397948e4341f78,
+runtime0e1ef30a5322b2675e317ae7f92828db5f5633f7,
+manifest40c8ceea73fb6c49ecc3cab7432f2406cc72d2c7a5f2eaa08346843db0290f29.
+Immediate FULL matched rollback674fb45328eef574b8598455a753e3ccf81845d3 /
+9d6d173c6f600c30be83bc756d69b41d3da02ffb /
+6df3eefd9bafa3b9d19a453bc3e6ee72788052c2c8a394f0b6d4a39897c2f13b.
+The original e743/b4ec/1b6e checkpoint and older pairs remain retained.
 
-The following Packet11 result and older sections remain historical and byte
-preserved. They do not replace Packet12 authority or qualify new results.
+Available idle was verified after fc1f; runner config is PENDING. Startup never
+starts/replays motors. Root alone operates Git/SSH/staging/hardware; agents use
+disjoint offline scopes. Preserve helper/camera/manual pins, calibration,
+private state/permissions and history. AM1 wireless, P1 advisory, AM2 untouched.
+Durability means software fault tolerance, connection/control continuity,
+preserved state and recovery. No generic inspection, historical pose/leader/
+readiness question, network tuning or hardware-wear campaign is included.
 
 ## Active AM1-LIVE-REUSE-11 result and continuing boundary
 
