@@ -533,6 +533,9 @@ def consume_right_p20_request(state, directory, recipe, run_id, host_incarnation
         raise ValueError("Right P20 requires the current protected run directory")
     value, raw, info = _right_p20_file(request)
     _right_p20_request(value, source_head)
+    archived = state / ("response12-right-p20-used-" + value["request_id"] + ".json")
+    if archived.exists() or archived.is_symlink():
+        raise ValueError("Right P20 request nonce was already retired")
     consumed, target = directory / RIGHT_P20_CONSUMED_NAME, directory / RIGHT_P20_DESCRIPTOR_NAME
     if consumed.exists() or target.exists():
         raise ValueError("Right P20 request cannot be consumed twice")

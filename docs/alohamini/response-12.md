@@ -40,10 +40,18 @@ One finite positive-first out-and-back comparison is proposed from actual q0, at
 
 The saved baseline shoulder pan2141 differs from current2138. This is a context-qualified comparison, not a matched physical-context causal proof. Even a promising P20 result would remain a temporary experiment; normal-installation and next-Start results must be reported separately.
 
+## First physical setup and bounded continuation
+
+At source206d6f4e, run `db4b992e-196f-4ec7-8c16-dc595aea4047` passed actual native startup and v2 admission at fresh q0raw1845. P20 was applied and enabled in measured hold. Before Resume, any grant or streamed target, the private runner asserted its obsolete v1-only workspace ID and requested normal Stop. This is a failed setup, not a response comparison or a movement pass. Original input sequence remained−1; the recorded90s deadline was retained.
+
+The actual durable transaction and cleanup verified P16 restoration while Lock1, then originalLock0, with no restoration obligation or first failure. All sixteen torque readbacks were off, four body Goals were zero, and lift, buses and required camera cleanup were verified. Original source, request, marker, settings, deadline and failed result remain unchanged.
+
+The runner now recognizes exactly v1/v2 while still requiring the exact configured context and all native proof. An additional three-line consumer guard permanently rejects a canonical nonce whose exact retired-marker archive exists, including a dangling symlink. It preserves the global one-use marker. A separately reviewed, explicit stopped-owner procedure may retire only this fully proved pre-input setup; once any Resume/grant/input exists, it refuses. A fresh nonce can then complete the same specified P16→20 response comparison. No new parameter value, automatic retry, old-input replay or altered original run is introduced.
+
 ## Verification and deployment
 
 The runtime needs the same reviewed transaction helper as the separate motor component. A read-only check using the actual persistent owner interpreter, working directory and environment proved that its current runtime could not import that module. The target runtime therefore adds exactly that existing source file to its closed projection inventory, with the same hash as the motor projection; other source rows remain matched. No dynamic source loader is used.
 
-Exact source review, focused test evidence, matched affected-component staging, trial results and restored idle state will be recorded here before closeout. Current deployment remains unchanged while that work proceeds. No physical trial under Packet12 has yet occurred.
+Exact source review, focused test evidence, matched affected-component staging, trial results and restored idle state will be recorded here before closeout. Source206d6f4e is staged as motor674fb45328eef574b8598455a753e3ccf81845d3, runtime9d6d173c6f600c30be83bc756d69b41d3da02ffb, manifest6df3eefd9bafa3b9d19a453bc3e6ee72788052c2c8a394f0b6d4a39897c2f13b. Its full matched rollback is the original e743/b4ec/1b6e pair from the packet. The archive guard is pending reviewed module-only staging; the response comparison remains unperformed.
 
 AM1 remains wireless, P1 advisory, and AM2 untouched. Durability means software fault tolerance, connection/control continuity, preserved state and recovery. No wear campaign is included.

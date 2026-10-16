@@ -773,3 +773,56 @@ def test_right_p20_ambiguous_and_persistence_failures_are_not_silent_rearm(tmp_p
         assert not trial.restore_required
         assert r.right_bus.values[("P_Coefficient", RIGHT_P20_MOTOR)] == 16
         assert r.right_bus.values[("Lock", RIGHT_P20_MOTOR)] == 0
+
+
+
+@pytest.mark.parametrize("new_source", [False, True])
+@pytest.mark.parametrize("archive_kind", ["file", "dangling_symlink"])
+def test_right_p20_archived_nonce_refuses_rewritten_request_before_global_claim(tmp_path, new_source, archive_kind):
+    module, directory, path, request = consume_right_p20(tmp_path)
+    state = request.parent
+    archived = state / ("response12-right-p20-used-" + RIGHT_P20_RUN + ".json")
+    (state / "response12-right-p20-used.json").rename(archived)
+    original_archive = archived.read_bytes()
+    if archive_kind == "dangling_symlink":
+        archived.unlink()
+        try: archived.symlink_to(state / "absent-retirement-record")
+        except OSError: pytest.skip("native symlink privilege unavailable")
+        assert not archived.exists() and archived.is_symlink()
+    payload = right_p20_request()
+    source = "b" * 40 if new_source else "a" * 40
+    payload["source_head"] = source
+    request.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")), encoding="utf-8"); request.chmod(0o600)
+    next_run = "55555555-5555-4555-8555-555555555555"
+    next_dir = tmp_path / next_run[:8]; next_dir.mkdir(mode=0o700)
+    with pytest.raises(ValueError, match="nonce"):
+        module.consume_right_p20_request(state, next_dir, "physical-live-right-elbow", next_run, RIGHT_P20_HOST, source)
+    assert request.exists() and not list(next_dir.iterdir())
+    assert not (state / "response12-right-p20-used.json").exists()
+    if archive_kind == "file": assert archived.read_bytes() == original_archive
+    else: assert archived.is_symlink()
+
+
+@pytest.mark.parametrize("global_marker_present", [False, True])
+def test_right_p20_fresh_nonce_requires_absent_global_marker_after_explicit_retirement(tmp_path, global_marker_present):
+    module, directory, path, request = consume_right_p20(tmp_path)
+    state = request.parent
+    used = state / "response12-right-p20-used.json"
+    original_used = used.read_bytes()
+    if not global_marker_present:
+        used.rename(state / ("response12-right-p20-used-" + RIGHT_P20_RUN + ".json"))
+    payload = right_p20_request()
+    payload.update(request_id="66666666-6666-4666-8666-666666666666", source_head="b" * 40)
+    request.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")), encoding="utf-8"); request.chmod(0o600)
+    next_run = "55555555-5555-4555-8555-555555555555"
+    next_dir = tmp_path / next_run[:8]; next_dir.mkdir(mode=0o700)
+    if global_marker_present:
+        with pytest.raises(FileExistsError):
+            module.consume_right_p20_request(state, next_dir, "physical-live-right-elbow", next_run, RIGHT_P20_HOST, "b" * 40)
+        assert request.exists() and used.read_bytes() == original_used and not list(next_dir.iterdir())
+    else:
+        result = module.consume_right_p20_request(state, next_dir, "physical-live-right-elbow", next_run, RIGHT_P20_HOST, "b" * 40)
+        assert result == next_dir / "response12-right-p20.json" and not request.exists()
+        bound = module.load_right_p20_binding(result, next_dir, next_run, RIGHT_P20_HOST)
+        assert bound["request"]["request_id"] == "66666666-6666-4666-8666-666666666666"
+        assert json.loads(used.read_bytes())["request"]["request_id"] == "66666666-6666-4666-8666-666666666666"

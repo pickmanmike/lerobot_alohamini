@@ -29,6 +29,16 @@ explicit disjoint files. Reuse existing tools, matched stopped staging and full
 rollback. AM1 wireless, P1 advisory, AM2 untouched. Durability means software
 fault tolerance, connection/control continuity, preserved state and recovery.
 
+First Packet12 setup db4b992e passed v2 native admission at actual1845, applied
+P20 in measured hold, then the private runner's obsolete v1 ID assertion stopped
+before Resume/grants/input. P16/Lock0 restoration and all cleanup are verified;
+retain this failed setup, original nonce/source/deadline and zero-input evidence.
+The same unperformed P16->20 response comparison may proceed only after the
+closed v1/v2 runner repair and reviewed archived-old-nonce replay guard are
+installed. Explicit stopped pre-input retirement must verify the exact original
+marker/native/cleanup proof; it is forbidden after any Resume/grant/input.
+No automatic retirement, repeat response comparison or new parameter value.
+
 The following Packet11 result and older sections remain historical and byte
 preserved. They do not replace Packet12 authority or qualify new results.
 
