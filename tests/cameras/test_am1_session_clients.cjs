@@ -596,3 +596,63 @@ test("ordinary Claim after owner restart joins HTTP and current view without rep
  await page.locator('[data-operation="Stop"]').click();await page.waitForFunction(()=>am1Remote.snapshot.run.status==="stopped");
  console.log(JSON.stringify({realFakeOwnerRestart:true,oldTerminalIssuerRetained:true,syntheticAuthenticNilFrameOrdering:true,replyWaitsForCurrentClaimProof:true,generationFencedRenewal:true,noImplicitStart:true,explicitNextStart:true}));
 });
+
+
+
+test("loaded bounded renewal drops timer and owned Claim overlap then requires fresh Claim and Resume in the same run",async t=>{
+ const f=await fixture();t.after(()=>f.close());
+ const browser=await chromium.launch({headless:true,channel:process.env.AM1_TEST_BROWSER_CHANNEL || "msedge"});t.after(()=>browser.close());
+ const context=await browser.newContext({ignoreHTTPSErrors:true});t.after(()=>context.close());const page=await context.newPage(),errors=[];
+ page.on("pageerror",error=>errors.push(error.message));
+ await enroll(page,f.info.url,f.info.a);
+ await page.locator('[data-operation="ClaimInput"]').click();await page.waitForFunction(()=>am1Remote.controllerGeneration);
+ await page.locator('#fake-recipe').selectOption('fake-interactive');await page.locator('[data-operation="Start"]').click();
+ await page.waitForFunction(()=>am1Remote.snapshot?.run?.status==='paused');await page.locator('[data-operation="Resume"]').click();
+ await page.waitForFunction(()=>am1Remote.snapshot?.run?.status==='running'&&am1Remote.connection);
+ await page.keyboard.down('w');await page.waitForFunction(()=>am1Remote.snapshot.run.intent?.[0]===1);
+ const before=await page.evaluate(()=>({run:am1Remote.snapshot.run.run_id,deadline:am1Remote.snapshot.run.deadline,generation:am1Remote.controllerGeneration}));
+ await page.waitForFunction(()=>!am1Remote.pendingRenewal);
+ let admitted,release;const captured=new Promise(resolve=>admitted=resolve),gate=new Promise(resolve=>release=resolve),claims=[];
+ t.after(()=>release());
+ await page.route("**/api/claim",async route=>{
+  claims.push(route.request().postDataJSON());
+  if(claims.length>1)return route.continue();
+  const response=await route.fetch();admitted(await response.json());await gate;
+  try{await route.fulfill({response});}catch{} // The real client aborts this expired response.
+ });
+ const result=await captured;assert.equal(result.accepted,true);assert.equal(result.controller_generation,before.generation);
+ await page.waitForTimeout(550);await page.locator('[data-operation="ClaimInput"]').click();
+ assert.equal(claims.length,1,"real500ms timer and explicit owned Claim must drop while one request is pending");
+ await page.waitForFunction(()=>!am1Remote.controllerGeneration&&!am1Remote.pendingRenewal&&am1Remote.held.size===0);
+ assert.equal(await page.evaluate(()=>am1Remote.connection),null);assert.equal(await page.evaluate(()=>am1Remote.elbowJog),0);
+ await page.locator('.session-details > summary').click();assert.match(await page.locator('#control-notice').innerText(),/Claim.*Resume/i);
+ await page.keyboard.up('w');await page.locator('[data-operation="Pause"]').click();
+ await page.waitForFunction(()=>am1Remote.snapshot?.run?.status==='paused'&&am1Remote.snapshot.controller===null);
+ release();await page.unroute("**/api/claim");
+ await page.locator('[data-operation="ClaimInput"]').click();await page.waitForFunction(()=>am1Remote.controllerGeneration&&am1Remote.snapshot.controller?.controller_generation===am1Remote.controllerGeneration);
+ assert.notEqual(await page.evaluate(()=>am1Remote.controllerGeneration),before.generation);
+ await page.locator('[data-operation="Resume"]').click();await page.waitForFunction(()=>am1Remote.snapshot?.run?.status==='running'&&am1Remote.connection);
+ const after=await page.evaluate(()=>({run:am1Remote.snapshot.run.run_id,deadline:am1Remote.snapshot.run.deadline,intent:am1Remote.snapshot.run.intent,held:[...am1Remote.held]}));
+ assert.equal(after.run,before.run);assert.equal(after.deadline,before.deadline);assert.equal(after.intent,null);assert.deepEqual(after.held,[]);
+ await page.keyboard.down('s');await page.waitForFunction(()=>am1Remote.snapshot.run.intent?.[0]===-1);await page.keyboard.up('s');
+ await page.locator('[data-operation="Stop"]').click();await page.waitForFunction(()=>am1Remote.snapshot?.run?.status==='stopped');
+ assert.deepEqual(errors,[]);console.log(JSON.stringify({realRenewalTimer:true,maxPendingRenewal:1,timeoutClearedRole:true,explicitFreshClaim:true,sameRunResume:true,noHeldReplay:true}));
+});
+
+
+test("loaded bounded renewal cannot delay ordinary Stop while its HTTP reply is unresolved",async t=>{
+ const f=await fixture();t.after(()=>f.close());
+ const browser=await chromium.launch({headless:true,channel:process.env.AM1_TEST_BROWSER_CHANNEL || "msedge"});t.after(()=>browser.close());
+ const context=await browser.newContext({ignoreHTTPSErrors:true});t.after(()=>context.close());const page=await context.newPage();
+ await enroll(page,f.info.url,f.info.a);await page.locator('[data-operation="ClaimInput"]').click();await page.waitForFunction(()=>am1Remote.controllerGeneration);
+ await page.locator('[data-operation="Start"]').click();await page.waitForFunction(()=>am1Remote.snapshot?.run?.status==='running');
+ await page.waitForFunction(()=>!am1Remote.pendingRenewal);
+ let admitted,release;const captured=new Promise(resolve=>admitted=resolve),gate=new Promise(resolve=>release=resolve);t.after(()=>release());
+ await page.route("**/api/claim",async route=>{const response=await route.fetch();admitted();await gate;try{await route.fulfill({response});}catch{}});
+ await captured;assert.equal(await page.evaluate(()=>Boolean(am1Remote.pendingRenewal)),true);
+ const stopped=page.waitForResponse(response=>response.url().endsWith('/api/stop'));
+ await page.locator('[data-operation="Stop"]').click();assert.equal((await (await stopped).json()).accepted,true);
+ await page.waitForFunction(()=>am1Remote.snapshot?.run?.status==='stopped');
+ assert.equal(await page.evaluate(()=>Boolean(am1Remote.pendingRenewal)),true,"Stop completes before the unresolved renewal or its1s timeout");
+ release();console.log(JSON.stringify({ordinaryStopAccepted:true,renewalStillPendingAtStop:true,protectiveLaneIndependent:true}));
+});

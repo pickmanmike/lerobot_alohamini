@@ -3,7 +3,7 @@ const {test}=require("node:test"), assert=require("node:assert/strict"), fs=requ
 const source=fs.readFileSync(path.join(__dirname,"../../tools/am1_console_ui/session_transport.js"),"utf8");
 function fixture(fetch) {
   let now=1000;
-  const timers=[], renders=[], context={fetch,crypto:require("node:crypto").webcrypto,console,atob,TextDecoder,Uint8Array,performance:{now:()=>now},
+  const timers=[], renders=[], context={fetch,AbortController,crypto:require("node:crypto").webcrypto,console,atob,TextDecoder,Uint8Array,performance:{now:()=>now},
     setTimeout:(f,t)=>{timers.push([f,t]);return timers.length;},clearTimeout:id=>{timers[id-1]=null;},
     location:{origin:"https://test.invalid"},WebSocket:class {static OPEN=1; constructor(){this.readyState=1;} send(){} close(){this.readyState=3;this.onclose?.();}}};
   vm.runInNewContext(source,context);
@@ -561,18 +561,19 @@ async function claimFixture(side="right") {
  const recipe="physical-live-"+side+"-elbow",snapshot={service_incarnation:"current-owner",controller:null,
   run:{run_id:"retained-terminal",operation_id:"retained-operation",recipe,source:"protected-physical-provider",status:"faulted",service_incarnation:"historical-owner",intent_revision:1,backend_incarnation:null,progress_s:0,first_cause:"retained startup failure",native_first_cause:"retained context refusal"},
   evidence:{fault:null,lifecycle:{phase:"idle"}},events:[],live_elbow_recipes:sharedLiveRecipes()};
- const requests=[],replies=[];
+ const requests=[],replies=[],failures=[];
  const f=fixture(async(url,opts)=>{
-  requests.push({url,body:opts?.body?JSON.parse(opts.body):null});
+  requests.push({url,body:opts?.body?JSON.parse(opts.body):null,signal:opts?.signal});
   if(url==="/api/attach")return {ok:true,json:async()=>({ticket:"claim-test-ticket",snapshot:JSON.parse(JSON.stringify(snapshot))})};
-  assert.equal(url,"/api/claim");return new Promise(resolve=>replies.push(value=>resolve({ok:true,json:async()=>value})));
+  if(url==="/api/stop")return {ok:true,json:async()=>({accepted:true,status:"stopped"})};
+  assert.equal(url,"/api/claim");return new Promise((resolve,reject)=>{replies.push(value=>resolve({ok:true,json:async()=>value}));failures.push(reject);});
  });
  Object.assign(f.transport,{device:"enrolled",control:true});await f.transport.attach();
  const deliver=(view=snapshot,revision)=>f.transport.socket.onmessage({data:JSON.stringify({kind:"snapshot",snapshot:JSON.parse(JSON.stringify(view)),...(revision?{revision}:{})})});
  deliver(snapshot,"current-view:1");
  const result={accepted:true,status:"claimed",controller_generation:"new-claim-generation",presence_expires:2001.5};
  const current=()=>({...JSON.parse(JSON.stringify(snapshot)),controller:{device_id:"enrolled",controller_generation:result.controller_generation,presence_expires:result.presence_expires}});
- return {...f,snapshot,requests,replies,result,current,deliver,async flush(){for(let i=0;i<12;i++)await Promise.resolve();}};
+ return {...f,snapshot,requests,replies,failures,result,current,deliver,async flush(){for(let i=0;i<12;i++)await Promise.resolve();}};
 }
 
 for(const side of ["left","right"])for(const order of ["snapshot-first","result-first-old-null"])
@@ -692,4 +693,89 @@ test("claim renewal late reporting error cannot clear a newer connection and con
  const next=t.claim();await f.flush();f.replies[1](f.result);await f.flush();f.deliver(f.current());await next;
  f.replies[0]({accepted:false,status:"reporting_error",reason:"old renewal reporting failure",code:"response_limit"});await f.flush();await old;
  assert.equal(t.connected,true);assert.equal(t.reportingError,null);assert.equal(t.controllerGeneration,f.result.controller_generation);
+});
+
+
+
+async function renewalFixture() {
+ const f=await claimFixture(),t=f.transport;f.deliver(f.current());t.controllerGeneration=f.result.controller_generation;
+ t.connection="current-wire";t.held.add("w");t.elbowJog=-1;t.elbowCursor=4;
+ return f;
+}
+
+test("bounded renewal drops repeated timer opportunities and explicit owned Claim while fetch is deferred",async()=>{
+ const f=await renewalFixture(),t=f.transport,tasks=[];
+ try{
+  for(let tick=0;tick<8;tick++){tasks.push(t.renew());await f.flush();}
+  tasks.push(t.claim());tasks.push(t.claim(t.controllerGeneration));await f.flush();
+  assert.equal(f.requests.filter(row=>row.url==="/api/claim").length,1,"one unresolved HTTP renewal must drop further500ms opportunities and explicit renewals");
+  assert(t.pendingRenewal);assert.equal(t.pending.size,0,"WSS pending does not count the HTTP request");
+  f.replies[0](f.result);await Promise.all(tasks);assert.equal(t.pendingRenewal??null,null);
+  assert.equal(t.controllerGeneration,f.result.controller_generation);
+  await f.flush();assert.equal(f.requests.filter(row=>row.url==="/api/claim").length,1,"dropped opportunities must never replay");
+ }finally{for(const reply of f.replies)reply(f.result);await f.flush();t.clear();await Promise.all(tasks);}
+});
+
+test("bounded renewal one-second deadline aborts a never-returning fetch and clears local held authority",async()=>{
+ const f=await renewalFixture(),t=f.transport,task=t.renew();await f.flush();
+ const pending=t.pendingRenewal,request=f.requests.at(-1),timer=f.timers.find(row=>row&&row[1]===1000);
+ assert(pending&&timer);assert(request.signal);assert.equal(request.signal.aborted,false);
+ f.setNow(1999);assert.equal(t.controllerGeneration,f.result.controller_generation);
+ f.setNow(2000);timer[0]();const result=await task;
+ assert.equal(result.status,"superseded");assert.equal(request.signal.aborted,true);assert.equal(t.pendingRenewal??null,null);
+ assert.equal(t.controllerGeneration,null);assert.equal(t.connection,null);assert.deepEqual([...t.held],[]);assert.equal(t.elbowJog,0);assert.equal(t.elbowCursor,null);
+ assert.match(f.renders.at(-1),/Claim.*Resume/i);await t.renew();assert.equal(f.requests.filter(row=>row.url==="/api/claim").length,1,"timeout never auto-claims");
+ f.replies[0](f.result);await f.flush();assert.equal(t.controllerGeneration,null);
+});
+
+for(const loss of ["clear","disconnect","pagehide","service","device","generation","connection","initialization"])
+test(`bounded renewal cancels and aborts on ${loss} without late revival`,async()=>{
+ const f=await renewalFixture(),t=f.transport,task=t.renew();await f.flush();const request=f.requests.at(-1);
+ if(loss==="clear")t.clear();else if(loss==="disconnect")t.socket.onclose();else if(loss==="pagehide")t.detach();
+ else {const view=f.current();
+  if(loss==="service")view.service_incarnation="new-owner";
+  if(loss==="device")view.controller.device_id="other-device";
+  if(loss==="generation")view.controller.controller_generation="foreign-generation";
+  if(loss==="connection")t.connection="new-wire";
+  if(loss==="initialization")t.initialization++;
+  f.deliver(view);
+ }
+ assert.equal(request.signal.aborted,true);assert.equal(t.pendingRenewal??null,null);await task;
+ const before={epoch:t.epoch,connection:t.connection,generation:t.controllerGeneration,connected:t.connected};
+ f.replies[0]({accepted:false,status:"reporting_error",code:"response_limit",reason:"stale renewal presentation"});await f.flush();
+ assert.deepEqual({epoch:t.epoch,connection:t.connection,generation:t.controllerGeneration,connected:t.connected},before);
+ assert.equal(t.reportingError,null);assert.equal(f.requests.filter(row=>row.url==="/api/claim").length,1);
+});
+
+for(const result of ["accepted","refused","reporting-error"])
+test(`bounded renewal late ${result} cannot settle or clear a newer pending generation`,async()=>{
+ const f=await renewalFixture(),t=f.transport,old=t.renew();await f.flush();const oldSignal=f.requests.at(-1).signal;
+ t.clear();f.result.controller_generation="fresh-generation";f.deliver(f.current());t.controllerGeneration=f.result.controller_generation;t.connection="fresh-wire";
+ const next=t.renew();await f.flush();const pending=t.pendingRenewal,signal=f.requests.at(-1).signal;
+ assert.equal(oldSignal.aborted,true);assert(pending);assert.equal(signal.aborted,false);
+ f.replies[0](result==="accepted"?{...f.result,controller_generation:"old-generation"}:result==="refused"?{accepted:false,status:"refused",reason:"old fence"}:{accepted:false,status:"reporting_error",code:"response_limit",reason:"old reporting failure"});
+ await f.flush();await old;assert.equal(t.pendingRenewal,pending);assert.equal(signal.aborted,false);assert.equal(t.reportingError,null);assert.equal(t.controllerGeneration,"fresh-generation");
+ f.replies[1](f.result);await next;assert.equal(t.pendingRenewal??null,null);assert.equal(t.controllerGeneration,"fresh-generation");
+});
+
+for(const failure of ["network","refused","wrong-generation"])
+test(`bounded renewal current ${failure} clears authority and never restores held input`,async()=>{
+ const f=await renewalFixture(),t=f.transport,task=t.renew();await f.flush();const request=f.requests.at(-1);
+ if(failure==="network")f.failures[0](Error("synthetic renewal network failure"));
+ else f.replies[0](failure==="refused"?{accepted:false,status:"refused",reason:"controller renewal fence"}:{...f.result,controller_generation:"foreign"});
+ await task;assert.equal(t.controllerGeneration,null);assert.equal(t.pendingRenewal??null,null);assert.equal(request.signal.aborted,true);
+ assert.equal(t.elbowJog,0);assert.deepEqual([...t.held],[]);assert.match(f.renders.at(-1),/Claim.*Resume/i);
+});
+
+test("bounded renewal late current response cannot exceed its original request deadline before timer delivery",async()=>{
+ const f=await renewalFixture(),t=f.transport,task=t.renew();await f.flush();f.setNow(2000);
+ f.replies[0]({...f.result,status:"reporting_error",reason:"late reporting failure",code:"response_limit"});await task;
+ assert.equal(t.controllerGeneration,null);assert.equal(t.pendingRenewal??null,null);assert.equal(t.reportingError,null,"expired request cannot report into the current view");
+});
+
+test("bounded renewal leaves ordinary Stop independent while its HTTP result is unresolved",async()=>{
+ const f=await renewalFixture(),t=f.transport,task=t.renew();await f.flush();const pending=t.pendingRenewal;
+ const stopped=await t.protective("stop");assert.equal(stopped.accepted,true);assert.equal(stopped.status,"stopped");
+ assert.equal(f.requests.at(-1).url,"/api/stop");assert.equal(t.pendingRenewal,pending);assert.equal(t.elbowJog,0);
+ t.clear("stopped");await task;assert.equal(f.requests.find(row=>row.url==="/api/claim").signal.aborted,true);
 });
