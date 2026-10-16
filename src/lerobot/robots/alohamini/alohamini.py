@@ -713,9 +713,10 @@ class AlohaMini(Robot):
         pinned = getattr(self, "_am1_live_activation_binding", None)
         if pinned is not None and pinned != binding:
             raise RuntimeError("Protected Live startup binding changed")
-        if not isinstance(binding, dict) or binding.get("recipe") not in (
-            "physical-live-left-elbow", "physical-live-right-elbow", "physical-live-right-elbow-practical",
-        ):
+        if not isinstance(binding, dict):
+            return None
+        from examples.alohamini.am1_session_contract import LIVE_ELBOW_SPECS
+        if binding.get("recipe") not in LIVE_ELBOW_SPECS:
             return None
         from .selected_joint_evidence import live_elbow_spec
         practical_config = getattr(self, "_am1_practical_config", None)
@@ -867,6 +868,12 @@ class AlohaMini(Robot):
                        nonselected_goals={name: goal for _, name, _, goal in frozen if name != selected},
                        right_pose={name + ".pos": measured.get(name + ".pos")
                                    for _, name, _, _ in frozen if name.startswith("arm_right_") and name != selected})
+        from examples.alohamini.am1_session_contract import PRACTICAL_ELBOW_PRESETS
+        if spec.recipe in PRACTICAL_ELBOW_PRESETS:
+            # The ordinary presets qualify one combined bench context. Each
+            # run still freezes and preserves its own actual eleven hold Goals.
+            context["right_pose"] = {name + ".pos": measured.get(name + ".pos")
+                                     for _, name, _, _ in frozen}
         return context, position["raw"]
 
     def _hold_am1_live_selected(self):
@@ -1398,12 +1405,13 @@ class AlohaMini(Robot):
         if (cap is not None and practical is not None and self.config.robot_model == "alohamini1"
                 and binding.get("recipe") == practical.spec.recipe and key == practical.spec.joint):
             workspace = practical.workspace
-            # Allow the declared physical twenty-degree corridor from any
-            # admitted measured margin. This is local to the selected elbow;
-            # the ordinary relative caps and absolute workspace remain intact.
+            # Preserve the selected physical corridor from any admitted
+            # measured margin; unrelated relative caps remain intact.
             distance = max(workspace.command_max_raw - workspace.measured_min_raw,
                            workspace.measured_max_raw - workspace.command_min_raw)
-            cap = max(cap, distance * 200 / 2212)
+            bus = getattr(self, practical.spec.side + "_bus")
+            calibration = bus.calibration[key.removesuffix(".pos")]
+            cap = max(cap, distance * 200 / (calibration.range_max - calibration.range_min))
         return cap
 
     def _encode_am1_arm_goals(

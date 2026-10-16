@@ -1,3 +1,26 @@
+## Current AM1 Packet14 ordinary practical controls
+
+Packet14 completed ordinary P16 / nominal 10-degree right and left elbow controls,
+selected before Start and operated one at a time. See
+[the ordinary-use instructions and measured results](docs/alohamini/practical-controls-14.md).
+PR23 is normally integrated into integrate/am1-local-teleop at 2bbd054d.
+The focused follow-up codex/am1-practical-controls-14 remains unmerged.
+Use the demonstrated closed presets: RIGHT 1847..1960 and LEFT 2011..2124,
+about 5 degrees/s, P16/I0/D32. No further gain/amplitude experiment is implied.
+Normal Start needs no hand-built trial file. Preserve original 250 ms expiry,
+fixed 180 s deadline, qualified new gestures/rejoin, actual q0 versus fixed workspace
+versus gesture cursor, combined bench context and eleven exact held Goals per run.
+Cross-side restart was demonstrated with actual left held Goal 2101; do not impose
+its old 2124 reference or a manual pose reset. Keep fine-position limitations and
+all historical failures. Retain the bounded practical writer, cleanup, local sensing,
+current protections, separate component pins and complete matched rollback.
+Current motor/runtime/manifest: 5c97a391 / 978fadf4 / b8abad25.
+Immediate full matched rollback: 4c1771a5 / b70 / b17142c3.
+Services restore idle with no motor replay; AM1 wireless, P1 advisory, AM2 unchanged.
+Durability means software fault tolerance, connection/control continuity,
+state preservation and recovery, not physical wear or a hardware-endurance campaign.
+Prior instructions/results below remain historical at their recorded versions.
+
 ## Current AM1 Packet13 verified operation
 
 Packet13 completed useful repeated right-elbow control and a working next Start.
