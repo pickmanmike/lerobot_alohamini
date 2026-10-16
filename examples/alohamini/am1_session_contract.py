@@ -69,11 +69,13 @@ class LiveWorkspaceSpec:
     evidence_max_raw: int = 1867
     command_min_raw: int = 1834
     command_max_raw: int = 1867
-    # Per-run raw Goals remain exact; only admission uses this fixed wrist anchor.
+    # Per-run raw Goals remain exact; only admission uses these fixed anchors.
     wrist_roll_goal_anchor_raw: int = 2443
     wrist_roll_goal_tolerance_raw: int = 1
     left_wrist_flex_goal_anchor_raw: int = 1546
     left_wrist_flex_goal_tolerance_raw: int = 1
+    right_shoulder_pan_goal_anchor_raw: int = 2141
+    right_shoulder_pan_goal_tolerance_raw: int = 1
     pose_tolerance_norm: float = 1.0
 
     @staticmethod
@@ -92,6 +94,8 @@ class LiveWorkspaceSpec:
                                                     tolerance_raw=self.wrist_roll_goal_tolerance_raw),
                                left_wrist_flex_goal=dict(motor="arm_left_wrist_flex", anchor_raw=self.left_wrist_flex_goal_anchor_raw,
                                                         tolerance_raw=self.left_wrist_flex_goal_tolerance_raw),
+                               right_shoulder_pan_goal=dict(motor="arm_right_shoulder_pan", anchor_raw=self.right_shoulder_pan_goal_anchor_raw,
+                                                           tolerance_raw=self.right_shoulder_pan_goal_tolerance_raw),
                                normalization=dict(gripper="range_0_100",other="range_m100_100")))
 
     @property
@@ -124,8 +128,13 @@ class LiveWorkspaceSpec:
             if (type(left_wrist) is not int
                     or abs(left_wrist-self.left_wrist_flex_goal_anchor_raw)>self.left_wrist_flex_goal_tolerance_raw):
                 raise ValueError("Live workspace actual left wrist Goal left its fixed raw context")
+            shoulder = goals.get("arm_right_shoulder_pan")
+            if (type(shoulder) is not int
+                    or abs(shoulder-self.right_shoulder_pan_goal_anchor_raw)>self.right_shoulder_pan_goal_tolerance_raw):
+                raise ValueError("Live workspace actual right shoulder Goal left its fixed raw context")
             canonical_goals = dict(goals, arm_right_wrist_roll=self.wrist_roll_goal_anchor_raw,
-                                   arm_left_wrist_flex=self.left_wrist_flex_goal_anchor_raw)
+                                   arm_left_wrist_flex=self.left_wrist_flex_goal_anchor_raw,
+                                   arm_right_shoulder_pan=self.right_shoulder_pan_goal_anchor_raw)
             if self._hash(canonical_goals)!=self.nonselected_goals_sha256:
                 raise ValueError("Live workspace actual calibration or held Goal context differs")
             right={name:raw for name,raw in goals.items() if name.startswith("arm_right_")}
