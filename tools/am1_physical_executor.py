@@ -12,6 +12,7 @@ from examples.alohamini.am1_session_contract import (
     LEFT_ELBOW_POSITIVE_CONTROL,
     LEFT_ELBOW_RESPONSE,
     LIVE_ELBOW_SPECS,
+    PRACTICAL_ELBOW_PRESETS,
     SelectedElbowExperiment,
 )
 
@@ -1167,8 +1168,12 @@ class ProtectedHostRun:
         self.run_directory.mkdir(mode=0o700)
         self.receipt = self.run_directory / "cleanup.json"
         from lerobot.robots.alohamini.am1_elbow_integral import consume_right_p20_request
-        right_p20_file = consume_right_p20_request(state, self.run_directory, recipe.name,
-                                                 run_id, incarnation, self.config["host_head"])
+        # Named baseline presets derive fixed native settings from the authenticated
+        # recipe and this fresh run identity; experimental nonces are unrelated.
+        right_p20_file = None
+        if recipe.name not in PRACTICAL_ELBOW_PRESETS:
+            right_p20_file = consume_right_p20_request(state, self.run_directory, recipe.name,
+                                                     run_id, incarnation, self.config["host_head"])
         experiment_file = None
         if definition is not None:
             import json

@@ -38,7 +38,7 @@ import zmq
 from .alohamini import AlohaMini
 from .config_alohamini import AlohaMiniConfig, AlohaMiniHostConfig
 from .model_specs import arm_state_keys_for_robot_model
-from .selected_joint_evidence import MARKER as AM1_SELECTED_JOINT_EVIDENCE_KEY, AM1SelectedJointEvidence, live_elbow_spec, live_elbow_workspace
+from .selected_joint_evidence import MARKER as AM1_SELECTED_JOINT_EVIDENCE_KEY, AM1SelectedJointEvidence, live_elbow_config, live_elbow_spec, live_elbow_workspace
 
 AM1_LOCAL_CONTROL_KEY = "_am1_local_control"
 AM1_LOCAL_FEEDBACK_KEY = "_am1_local_feedback"
@@ -176,11 +176,11 @@ class AM1LocalControl:
         self.observation_id = 0
         self.selected_evidence = selected_evidence
         self.live = live
-        self.practical_config = practical_config
-        self.live_spec = live_elbow_spec(live_recipe, practical_config) if live else None
+        self.practical_config = live_elbow_config(live_recipe, practical_config) if live else practical_config
+        self.live_spec = live_elbow_spec(live_recipe, self.practical_config) if live else None
         if live and self.live_spec is None:
             raise ValueError("Live native recipe is not allowlisted")
-        if live and getattr(self.live_spec, "practical_motion", False) and practical_config is None:
+        if live and getattr(self.live_spec, "practical_motion", False) and self.practical_config is None:
             raise ValueError("Practical native control requires its consumed configuration")
         self.clock = clock
         self.live_binding = None
@@ -1503,7 +1503,7 @@ def _run_host(args):
     visible_binding = visible_control_binding(args)
     recovery_binding = elbow_recovery_binding(args)
     right_p20_binding = right_p20_trial_binding(args, visible_binding)
-    practical_config = None
+    practical_config = live_elbow_config(None if visible_binding is None else visible_binding["recipe"])
     if right_p20_binding is not None and right_p20_binding["kind"] == "practical13-right":
         from examples.alohamini.am1_session_contract import PracticalElbowConfig
         practical_config = PracticalElbowConfig.from_payload(right_p20_binding["request"]["config"])

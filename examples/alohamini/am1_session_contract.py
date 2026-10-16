@@ -359,6 +359,239 @@ class PracticalElbowWorkspace:
         return self.geometry(raw, reference)
 
 
+_ORDINARY_PRACTICAL_ELBOW_DATA = MappingProxyType({
+    "physical-live-right-elbow-practical-p16": ("right", 1847, 1, (3, 0, -658, 827, 3039)),
+    "physical-live-left-elbow-practical-p16": ("left", 2124, -1, (3, 0, 1845, 864, 3073)),
+})
+
+
+@dataclass(frozen=True)
+class OrdinaryPracticalElbowConfig:
+    """One closed P16 preset; Start selects identity rather than numerical authority."""
+
+    recipe: str
+
+    def __post_init__(self):
+        if type(self.recipe) is not str or self.recipe not in _ORDINARY_PRACTICAL_ELBOW_DATA:
+            raise ValueError("Ordinary practical elbow requires an allowlisted P16 recipe")
+
+    @classmethod
+    def from_payload(cls, value):
+        if not isinstance(value, dict) or set(value) != {"recipe"}:
+            raise ValueError("Ordinary practical elbow configuration requires exactly its recipe")
+        return cls(value["recipe"])
+
+    def to_payload(self):
+        return dict(recipe=self.recipe)
+
+    @property
+    def side(self):
+        return _ORDINARY_PRACTICAL_ELBOW_DATA[self.recipe][0]
+
+    @property
+    def reference_raw(self):
+        return _ORDINARY_PRACTICAL_ELBOW_DATA[self.recipe][1]
+
+    @property
+    def direction(self):
+        return _ORDINARY_PRACTICAL_ELBOW_DATA[self.recipe][2]
+
+    @property
+    def calibration(self):
+        return _ORDINARY_PRACTICAL_ELBOW_DATA[self.recipe][3]
+
+    @property
+    def spec(self):
+        span = self.calibration[4] - self.calibration[3]
+        delta = self.direction * math.floor(10 * PRACTICAL_ELBOW_COUNTS_PER_REVOLUTION / 360) * 200 / span
+        return LiveElbowSpec(self.recipe, f"arm_{self.side}_elbow_flex.pos", self.side,
+                             f"{self.side.title()} elbow practical P16", f"Live{self.side.title()}ElbowPracticalP16",
+                             min(0.0, delta), max(0.0, delta),
+                             rate_norm_per_s=5 * PRACTICAL_ELBOW_COUNTS_PER_REVOLUTION / 360 * 200 / span,
+                             current_cap_ma=500.0, live_s=180.0, practical_motion=True)
+
+    @property
+    def live_spec(self):
+        return self.spec
+
+    @property
+    def workspace(self):
+        return OrdinaryPracticalElbowWorkspace(self)
+
+    def target_raw(self, degrees):
+        if type(degrees) not in (int, float) or not math.isfinite(degrees) or degrees not in (0, 10):
+            raise ValueError("Ordinary practical targets are the fixed reference or inward ten-degree endpoint")
+        return self.reference_raw + self.direction * math.floor(degrees * PRACTICAL_ELBOW_COUNTS_PER_REVOLUTION / 360)
+
+    def target_norm(self, degrees):
+        return self.workspace.normalize(self.target_raw(degrees))
+
+    def geometry(self, raw, reference):
+        return self.workspace.geometry(raw, reference)
+
+    def settings_valid(self, proof, run_id=None, host_incarnation=None):
+        """Read-only normal startup proof, including the selected firmware ceiling."""
+        try:
+            if not isinstance(proof, dict):
+                return False
+            ordinary = json.loads(json.dumps(proof, allow_nan=False))
+            protection = None
+            for name in ("before", "active"):
+                registers = ordinary[name]["registers"]
+                actual = registers.pop("Protection_Current")
+                if type(actual) is not int or actual <= 0 or protection is not None and actual != protection:
+                    return False
+                protection = actual
+                expected = dict(Min_Position_Limit=self.calibration[3], Max_Position_Limit=self.calibration[4],
+                                Homing_Offset=self.calibration[2], Phase=12)
+                if (any(registers.get(key) != value for key, value in expected.items())
+                        or not 40 <= registers["Present_Voltage"] <= 140
+                        or not 0 <= registers["Present_Temperature"] < 55):
+                    return False
+            # The existing native hash covers its original static register set.
+            # Protection_Current is separately actual, positive and unchanged.
+            return PositiveElbowControl._settings_valid(
+                ordinary, run_id, host_incarnation, recipe_name=self.recipe,
+                current_cap_ma=min(self.spec.current_cap_ma, protection * 6.5),
+            )
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return False
+
+
+@dataclass(frozen=True)
+class OrdinaryPracticalElbowWorkspace:
+    """Fixed commands and one combined bench context; per-run holds remain actual."""
+
+    config: OrdinaryPracticalElbowConfig
+    calibration_sha256 = LiveWorkspaceSpec.calibration_sha256
+
+    @property
+    def recipe(self):
+        return self.config.recipe
+
+    @property
+    def id(self):
+        return f"am1-{self.config.side}-elbow-practical-p16-v1"
+
+    @property
+    def command_min_raw(self):
+        return min(self.config.reference_raw, self.config.target_raw(10))
+
+    @property
+    def command_max_raw(self):
+        return max(self.config.reference_raw, self.config.target_raw(10))
+
+    @property
+    def measured_min_raw(self):
+        return max(self.config.calibration[3], self.command_min_raw - 34)
+
+    @property
+    def measured_max_raw(self):
+        return min(self.config.calibration[4], self.command_max_raw + 34)
+
+    @property
+    def context_sha256(self):
+        retained = LIVE_ELBOW_WORKSPACE_POLICIES["am1-right-elbow-rest-neighbourhood-v2"]
+        return LiveWorkspaceSpec._hash(dict(
+            id=self.id, recipe=self.recipe, rest_context_sha256=retained.context_sha256,
+            config=self.config.to_payload(), calibration=self.config.calibration,
+            combined_elbows={side: dict(reference=reference, direction=direction, calibration=material,
+                command=sorted((reference, reference + direction * 113)), measured_margin_raw=34)
+                for side, reference, direction, material in _ORDINARY_PRACTICAL_ELBOW_DATA.values()},
+            counts_per_revolution=PRACTICAL_ELBOW_COUNTS_PER_REVOLUTION,
+            maximum_excursion_degrees=10, measured_margin_degrees=3,
+        ))
+
+    @property
+    def descriptor(self):
+        return dict(version=1, id=self.id, context_sha256=self.context_sha256,
+                    evidence_min_raw=self.command_min_raw, evidence_max_raw=self.command_max_raw)
+
+    def normalize(self, raw):
+        _, drive, offset, low, high = self.config.calibration
+        if type(raw) is not int or not low <= raw <= high:
+            raise ValueError("Ordinary practical normalization requires a calibrated integer raw position")
+        value = (raw - low) / (high - low) * 200 - 100
+        material = dict(drive_mode=drive, homing_offset=offset, range_min=low, range_max=high)
+        if SignedElbowResponse.encoded_goal(value, material) == raw:
+            return value
+        value = math.nextafter(value + 1e-12, math.inf)
+        if SignedElbowResponse.encoded_goal(value, material) == raw:
+            return value
+        raise ValueError("Ordinary practical target does not encode its exact selected raw position")
+
+    def summary(self):
+        low, high = self.normalize(self.command_min_raw), self.normalize(self.command_max_raw)
+        return dict(self.descriptor, command_min_raw=self.command_min_raw, command_max_raw=self.command_max_raw,
+                    command_min_norm=low, command_max_norm=high, span_norm=high - low,
+                    requires_current_admission=True, practical_motion=True, config=self.config.to_payload(),
+                    maximum_excursion_degrees=10, measured_margin_degrees=3)
+
+    def qualify(self, context):
+        retained = LIVE_ELBOW_WORKSPACE_POLICIES["am1-right-elbow-rest-neighbourhood-v2"]
+        try:
+            if (not isinstance(context, dict)
+                    or set(context) != {"robot_model", "selected_model", "calibrations", "nonselected_goals", "right_pose"}
+                    or context["robot_model"] != "alohamini1" or context["selected_model"] != "sts3215"
+                    or LiveWorkspaceSpec._hash(context["calibrations"]) != retained.calibration_context_sha256):
+                raise ValueError("Ordinary practical actual calibration or owner context differs")
+            calibrations, goals, pose = context["calibrations"], context["nonselected_goals"], context["right_pose"]
+            selected = self.config.spec.joint.removesuffix(".pos")
+            if (not isinstance(goals, dict) or set(goals) != set(calibrations) - {selected}
+                    or not isinstance(pose, dict) or set(pose) != {name + ".pos" for name in calibrations}
+                    or any(type(raw) is not int for raw in goals.values())):
+                raise ValueError("Ordinary practical actual eleven Goals or complete measured pose differs")
+            canonical = dict(goals, **{selected: self.config.reference_raw})
+            for side, reference, direction, _ in _ORDINARY_PRACTICAL_ELBOW_DATA.values():
+                name = f"arm_{side}_elbow_flex"
+                low, high = sorted((reference, reference + direction * 113))
+                if not low - 34 <= canonical[name] <= high + 34:
+                    raise ValueError("Ordinary practical other elbow Goal left the fixed combined context")
+                canonical[name] = reference
+            canonical.pop("arm_right_elbow_flex")
+            canonical = retained._canonical_goals(canonical)
+            if LiveWorkspaceSpec._hash(canonical) != retained.nonselected_goals_sha256:
+                raise ValueError("Ordinary practical actual held Goal context differs")
+            for name, raw in goals.items():
+                material, value = calibrations[name], pose[name + ".pos"]
+                fraction = (raw - material[3]) / (material[4] - material[3])
+                expected = fraction * 100 if name.endswith("_gripper") else fraction * 200 - 100
+                if type(value) not in (int, float) or not math.isfinite(value) or abs(value - expected) > retained.pose_tolerance_norm:
+                    raise ValueError("Ordinary practical actual nonselected measured pose differs")
+            value = pose[selected + ".pos"]
+            if type(value) not in (int, float) or not math.isfinite(value):
+                raise ValueError("Ordinary practical selected measured pose is unavailable")
+        except (KeyError, TypeError, OverflowError) as exc:
+            raise ValueError("Ordinary practical actual combined context is malformed") from exc
+
+    def geometry(self, raw, reference):
+        if (type(raw) is not int or not self.measured_min_raw <= raw <= self.measured_max_raw
+                or type(reference) not in (int, float) or not math.isfinite(reference)
+                or abs(reference - self.normalize(raw)) > 1e-9):
+            raise ValueError("Ordinary practical actual q0 left its fixed workspace/measured margin")
+        return dict(admission_version=2, measured_origin_raw=raw,
+                    corridor_min_norm=self.normalize(self.command_min_raw),
+                    corridor_max_norm=self.normalize(self.command_max_raw),
+                    corridor_min_raw=self.command_min_raw, corridor_max_raw=self.command_max_raw,
+                    measured_min_raw=self.measured_min_raw, measured_max_raw=self.measured_max_raw,
+                    workspace=self.descriptor)
+
+    def admission(self, context, raw, reference):
+        self.qualify(context)
+        return self.geometry(raw, reference)
+
+
+PRACTICAL_ELBOW_PRESETS = MappingProxyType({
+    recipe: OrdinaryPracticalElbowConfig(recipe) for recipe in _ORDINARY_PRACTICAL_ELBOW_DATA
+})
+LIVE_ELBOW_SPECS = MappingProxyType({
+    **LIVE_ELBOW_SPECS, **{recipe: preset.spec for recipe, preset in PRACTICAL_ELBOW_PRESETS.items()},
+})
+LIVE_ELBOW_WORKSPACES = MappingProxyType({
+    **LIVE_ELBOW_WORKSPACES, **{recipe: preset.workspace for recipe, preset in PRACTICAL_ELBOW_PRESETS.items()},
+})
+
+
 @dataclass(frozen=True)
 class SignedElbowResponse:
     """One explicit signed diagnostic, shared by input, owner and completion."""

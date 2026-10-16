@@ -31,23 +31,40 @@ PHASES = {"baseline", "outbound", "endpoint", "return", "origin", "final"}
 LIVE_RECIPE = "physical-live-left-elbow"
 
 
+def live_elbow_config(recipe, practical_config=None):
+    """Resolve ordinary settings exclusively from the authenticated recipe name."""
+    if recipe is None:
+        return practical_config
+    from examples.alohamini.am1_session_contract import PRACTICAL_ELBOW_PRESETS
+
+    ordinary = PRACTICAL_ELBOW_PRESETS.get(recipe)
+    if ordinary is not None:
+        if practical_config is not None and (
+                type(practical_config) is not type(ordinary) or practical_config != ordinary):
+            raise ValueError("Ordinary practical configuration differs from its closed recipe")
+        return ordinary
+    return practical_config
+
+
 def live_elbow_spec(recipe, practical_config=None):
     """Resolve the checkout-only contract only for an opted-in recipe."""
     if recipe is None:
         return None
     from examples.alohamini.am1_session_contract import LIVE_ELBOW_SPECS
 
+    practical_config = live_elbow_config(recipe, practical_config)
     if practical_config is not None:
         if practical_config.spec.recipe != recipe:
-            raise ValueError("Practical configuration requires its selected right recipe")
+            raise ValueError("Practical configuration requires its selected recipe")
         return practical_config.spec
     return LIVE_ELBOW_SPECS.get(recipe)
 
 
 def live_elbow_workspace(recipe, practical_config=None):
+    practical_config = live_elbow_config(recipe, practical_config)
     if practical_config is not None:
         if practical_config.spec.recipe != recipe:
-            raise ValueError("Practical workspace requires its selected right recipe")
+            raise ValueError("Practical workspace requires its selected recipe")
         return practical_config.workspace
     from examples.alohamini.am1_session_contract import LIVE_ELBOW_WORKSPACES
     return LIVE_ELBOW_WORKSPACES.get(recipe)
@@ -61,14 +78,21 @@ class _LiveElbowDefinition:
     practical_motion = False
 
     def __init__(self, spec=None):
+        self.ordinary_config = None
         if spec is not None:
             self.recipe_name, self.profile = spec.recipe, spec.profile
             self.current_cap_ma, self.live_s = spec.current_cap_ma, spec.live_s
             self.practical_motion = getattr(spec, "practical_motion", False)
+            if self.practical_motion:
+                from examples.alohamini.am1_session_contract import PRACTICAL_ELBOW_PRESETS
+                self.ordinary_config = PRACTICAL_ELBOW_PRESETS.get(spec.recipe)
 
     def settings_valid(self, proof):
         from examples.alohamini.am1_session_contract import PositiveElbowControl
 
+        if self.ordinary_config is not None:
+            return (getattr(self, "right_p20_trial", None) is None
+                    and self.ordinary_config.settings_valid(proof))
         if (getattr(self, "right_p20_trial", None) is not None
                 or isinstance(proof, dict) and "right_p20_trial" in proof):
             from .am1_elbow_integral import right_p20_settings_valid
@@ -204,7 +228,13 @@ class AM1SelectedJointEvidence:
         if spec is not None and getattr(spec, "practical_motion", False):
             config = getattr(robot, "_am1_practical_config", None)
             trial_binding = getattr(robot, "_am1_right_p20_trial_binding", None)
-            if (config is None or not isinstance(trial_binding, dict)
+            from examples.alohamini.am1_session_contract import PRACTICAL_ELBOW_PRESETS
+            ordinary = PRACTICAL_ELBOW_PRESETS.get(actual.get("recipe"))
+            if ordinary is not None:
+                if (type(config) is not type(ordinary) or config != ordinary or trial_binding is not None
+                        or getattr(robot, "_am1_right_elbow_p_trial", None) is not None):
+                    raise RuntimeError("Ordinary practical settings differ from their protected recipe")
+            elif (config is None or not isinstance(trial_binding, dict)
                     or trial_binding.get("request", {}).get("config") != config.to_payload()):
                 raise RuntimeError("Practical selected configuration differs from its consumed request")
         if self.live_spec is not None and spec != self.live_spec:

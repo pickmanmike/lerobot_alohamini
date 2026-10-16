@@ -5,7 +5,19 @@ class AM1SessionTransport {
     "physical-live-left-elbow":Object.freeze({joint:"arm_left_elbow_flex.pos",side:"left",label:"Left elbow",profile:"LiveLeftElbow"}),
     "physical-live-right-elbow":Object.freeze({joint:"arm_right_elbow_flex.pos",side:"right",label:"Right elbow",profile:"LiveRightElbow"}),
     "physical-live-right-elbow-practical":Object.freeze({joint:"arm_right_elbow_flex.pos",side:"right",label:"Right elbow practical",profile:"LiveRightElbowPractical",
-      practical_motion:true,rate_norm_per_s:5*4096/360*200/2212,current_cap_ma:500,live_s:180})
+      practical_motion:true,rate_norm_per_s:5*4096/360*200/2212,current_cap_ma:500,live_s:180}),
+    "physical-live-right-elbow-practical-p16":Object.freeze({joint:"arm_right_elbow_flex.pos",side:"right",label:"Right elbow practical P16",profile:"LiveRightElbowPracticalP16",
+      practical_motion:true,rate_norm_per_s:5*4096/360*200/2212,current_cap_ma:500,live_s:180}),
+    "physical-live-left-elbow-practical-p16":Object.freeze({joint:"arm_left_elbow_flex.pos",side:"left",label:"Left elbow practical P16",profile:"LiveLeftElbowPracticalP16",
+      practical_motion:true,rate_norm_per_s:5*4096/360*200/2209,current_cap_ma:500,live_s:180})
+  });
+  static practicalElbows=Object.freeze({
+    "physical-live-right-elbow-practical-p16":Object.freeze({id:"am1-right-elbow-practical-p16-v1",
+      context_sha256:"07a2ff4cb1ada7ac9a1b99bfcbf2c68c976e7a764b9f647ef3723a4960f00523",
+      minimum_raw:1847,maximum_raw:1960,minimum_norm:-7.775768535262202,maximum_norm:2.441229656419523}),
+    "physical-live-left-elbow-practical-p16":Object.freeze({id:"am1-left-elbow-practical-p16-v1",
+      context_sha256:"f2e11bcbd8cf67e60f3f3e2b79b4a099981172067e9e13d0a40bc51c47889d0d",
+      minimum_raw:2011,maximum_raw:2124,minimum_norm:3.847894975101852,maximum_norm:14.078768673607982})
   });
   liveElbowSpec(recipe=this.snapshot?.run?.recipe) {
     const allowed=Object.hasOwn(AM1SessionTransport.liveElbows,recipe) ? AM1SessionTransport.liveElbows[recipe] : null,values=this.snapshot?.live_elbow_recipes;
@@ -15,11 +27,24 @@ class AM1SessionTransport {
     const value=matches[0];
     if(Object.entries(allowed).some(([key,wanted])=>value[key]!==wanted)
       || typeof value.rate_norm_per_s!=="number" || !Number.isFinite(value.rate_norm_per_s)
-      || value.rate_norm_per_s<=0 || value.rate_norm_per_s>(allowed.practical_motion ? allowed.rate_norm_per_s : 1))return null;
+      || value.rate_norm_per_s<=0 || value.rate_norm_per_s>(allowed.practical_motion ? allowed.rate_norm_per_s : 1)
+      || Object.hasOwn(AM1SessionTransport.practicalElbows,recipe)&&!this.supportedWorkspace(value))return null;
     return value;
   }
   supportedWorkspace(spec) {
     const w=spec?.supported_workspace,keys=["version","id","context_sha256","evidence_min_raw","evidence_max_raw","command_min_raw","command_max_raw","command_min_norm","command_max_norm","span_norm","requires_current_admission"];
+    const preset=Object.hasOwn(AM1SessionTransport.practicalElbows,spec?.recipe) ? AM1SessionTransport.practicalElbows[spec.recipe] : null;
+    if(preset) {
+      const exact={version:1,id:preset.id,context_sha256:preset.context_sha256,
+        evidence_min_raw:preset.minimum_raw,evidence_max_raw:preset.maximum_raw,
+        command_min_raw:preset.minimum_raw,command_max_raw:preset.maximum_raw,
+        command_min_norm:preset.minimum_norm,command_max_norm:preset.maximum_norm,span_norm:preset.maximum_norm-preset.minimum_norm,
+        requires_current_admission:true,practical_motion:true,maximum_excursion_degrees:10,measured_margin_degrees:3};
+      if(!w||typeof w!=="object"||Array.isArray(w)||Object.keys(w).length!==Object.keys(exact).length+1
+        ||Object.entries(exact).some(([key,wanted])=>!Object.hasOwn(w,key)||w[key]!==wanted)
+        ||!w.config||typeof w.config!=="object"||Array.isArray(w.config)||Object.keys(w.config).length!==1||w.config.recipe!==spec.recipe)return null;
+      return w;
+    }
     if(spec?.side!=="right"||!w||typeof w!=="object"||Object.keys(w).length!==keys.length||keys.some(key=>!Object.hasOwn(w,key))
       ||w.version!==1||!["am1-right-elbow-retained-v1","am1-right-elbow-rest-neighbourhood-v2"].includes(w.id)||typeof w.context_sha256!=="string"||!/^[0-9a-f]{64}$/.test(w.context_sha256)||w.requires_current_admission!==true
       ||![w.evidence_min_raw,w.evidence_max_raw,w.command_min_raw,w.command_max_raw].every(Number.isInteger)||w.evidence_min_raw>w.command_min_raw||w.command_min_raw>=w.command_max_raw||w.command_max_raw>w.evidence_max_raw
@@ -422,6 +447,12 @@ class AM1SessionTransport {
       || [value.cursor_norm,value.reference_norm,value.corridor_min_norm,value.corridor_max_norm].some(x=>typeof x!=="number" || !Number.isFinite(x))
       || value.corridor_min_norm>=value.corridor_max_norm || typeof run.backend_incarnation!=="string"
       || this.elbowReleasedRevision!==null && run.intent_revision<=this.elbowReleasedRevision)return null;
+    const preset=Object.hasOwn(AM1SessionTransport.practicalElbows,run.recipe) ? AM1SessionTransport.practicalElbows[run.recipe] : null;
+    if(preset && (value.admission_version!==2 || value.corridor_min_raw!==preset.minimum_raw || value.corridor_max_raw!==preset.maximum_raw
+      ||value.corridor_min_norm!==preset.minimum_norm||value.corridor_max_norm!==preset.maximum_norm
+      ||!value.workspace||Object.keys(value.workspace).length!==5||value.workspace.version!==1
+      ||value.workspace.id!==preset.id||value.workspace.context_sha256!==preset.context_sha256
+      ||value.workspace.evidence_min_raw!==preset.minimum_raw||value.workspace.evidence_max_raw!==preset.maximum_raw))return null;
     return value;
   }
   elbowBounds(snapshot=this.snapshot) {

@@ -21,6 +21,7 @@ from examples.alohamini.am1_session_contract import (
     LEFT_ELBOW_POSITIVE_CONTROL,
     LEFT_ELBOW_RESPONSE,
     LIVE_ELBOW_SPECS,
+    PRACTICAL_ELBOW_PRESETS,
     RECIPES,
     SELECTED_ELBOW_OPERATION_PRESET,
     SelectedElbowExperiment,
@@ -700,6 +701,9 @@ class SessionAuthority:
             if live.get("joint") != LIVE_ELBOW_SPECS[run["recipe"]].joint:
                 self._finish("faulted", "physical_live_recipe_mismatch")
                 return True
+            if not self._practical_geometry_valid(live):
+                self._finish("faulted", "physical_live_preset_geometry_mismatch")
+                return True
             native_deadline = lifecycle.get("native_deadline_monotonic_s", live.get("live_deadline_monotonic_s"))
             if native_deadline is not None:
                 if (type(native_deadline) not in (int, float) or not math.isfinite(native_deadline)
@@ -1131,6 +1135,25 @@ class SessionAuthority:
             for key in ("encoded_goal_raw", "goal_write_returned", "goal_write_started_at_monotonic_s",
                         "goal_write_completed_at_monotonic_s", "goal_action_sequence"):
                 self.run["live_input"].pop(key, None)
+
+    def _practical_geometry_valid(self, value):
+        """Ordinary native admission must equal the server-owned fixed preset."""
+        preset = PRACTICAL_ELBOW_PRESETS.get((self.run or {}).get("recipe"))
+        if preset is None:
+            return True  # Historical diagnostics retain their own admission rules.
+        if not isinstance(value, dict) or value.get("joint") != preset.spec.joint:
+            return False
+        try:
+            expected = preset.geometry(value.get("measured_origin_raw"), value.get("reference_norm"))
+        except (TypeError, ValueError):
+            return False
+        if not all(type(value.get(key)) is type(wanted) and value[key] == wanted
+                   for key, wanted in expected.items()):
+            return False
+        previous = self.run.get("live_input") or {}
+        frozen = {"reference_norm", "measured_origin_raw", "corridor_min_norm", "corridor_max_norm",
+                  "corridor_min_raw", "corridor_max_raw", "admission_version", "workspace"}
+        return not previous or all(key not in previous or value.get(key) == previous[key] for key in frozen)
 
     def _live_input_status(self, evidence, *, include_rearm=True):
         value = evidence.get("live_input")
@@ -2530,6 +2553,13 @@ class SessionAuthority:
             if self.run["status"] != "running" or not e["feedback"] or physical and not e["required_observation"]:
                 return self._refuse("not qualified")
             if physical:
+                preset = PRACTICAL_ELBOW_PRESETS.get(self.run["recipe"])
+                if preset is not None:
+                    workspace = preset.workspace
+                    if (not self._practical_geometry_valid(e.get("live_input"))
+                            or not workspace.normalize(workspace.command_min_raw) <= target[joint]
+                            <= workspace.normalize(workspace.command_max_raw)):
+                        return self._refuse("physical target left the fixed ordinary practical preset")
                 expiry = self.grant["expires"]
                 accepted = self.executor.apply(
                     target, valid_until_monotonic_s=expiry, intent_revision=self.run["intent_revision"],
@@ -2609,6 +2639,11 @@ class SessionAuthority:
                     self._finish("faulted", completion["execution"]["fault"])
                 else:
                     self._finish("completed")
+                return
+            if (PRACTICAL_ELBOW_PRESETS.get(r["recipe"]) is not None
+                    and e.get("feedback") is True and e.get("native_ack") is True
+                    and not self._practical_geometry_valid(e.get("live_input"))):
+                self._finish("faulted", "physical_live_preset_geometry_mismatch")
                 return
             live_input = self._live_input_status(e, include_rearm=False)
             if live_input is not None:
