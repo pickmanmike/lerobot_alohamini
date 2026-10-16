@@ -344,7 +344,7 @@ def test_physical_live_wss_close_releases_selected_run_before_sample_expiry(clus
             base["intent_revision"] = current["run"]["intent_revision"]
             grant = await ws_command(ws, dict(op="grant", **base))
             assert (await ws_command(ws, dict(op="input", **base, grant_id=grant["grant_id"],
-                                             seq=1, target={joint: target})))["accepted"]
+                                             seq=1, target={joint: current["run"]["live_input"]["cursor_norm"] + target})))["accepted"]
             await ws.close()
             ws = None
             ceiling = min(time.monotonic() + .1, grant["expires"])

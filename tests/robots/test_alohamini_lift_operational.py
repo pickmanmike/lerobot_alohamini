@@ -1939,6 +1939,16 @@ def test_host_fault_timing_history_is_bounded_and_snapshot_is_independent():
     assert later["omitted_completed_loop_count"] == 93
 
 
+def initial_startup_records(capsys):
+    records = operational_records(capsys)
+    started = next(i for i, row in enumerate(records) if row["phase"] == "before_torque_off_acquisition_started")
+    completed = next(i for i, row in enumerate(records) if row["phase"] == "before_torque_off_acquisition_completed")
+    final_baseline = [row for row in records[started:completed] if row["phase"] == "baseline"]
+    assert len(final_baseline) == 9 and all(row["torque_enable"] == 0 for row in final_baseline)
+    assert final_baseline[-1]["sample_monotonic_s"] - final_baseline[0]["sample_monotonic_s"] >= 0.4
+    return records[:started]
+
+
 def inject_startup_off_feedback(monkeypatch, robot, *, torque=(1, 0), faults=None):
     """Inject original grouped feedback bytes before real policy decoding."""
     from lerobot.robots.alohamini import lift_motor_feedback as feedback
@@ -1947,13 +1957,17 @@ def inject_startup_off_feedback(monkeypatch, robot, *, torque=(1, 0), faults=Non
     observed = []
     clocks = {}
     index = 0
+    initial = True
 
     def sample(monitor, phase, **kwargs):
+        nonlocal index, initial
         clocks.setdefault(id(monitor), monitor.monotonic)
-        if phase not in {"startup_off_acquisition", "baseline"}:
+        if phase == "setup_position":
+            initial = False
+        selected_phase = initial and phase in {"startup_off_acquisition", "baseline"}
+        if not selected_phase:
             monitor.monotonic = clocks[id(monitor)]
-        nonlocal index
-        if phase in {"startup_off_acquisition", "baseline"}:
+        if selected_phase:
             selected = torque[min(index, len(torque) - 1)]
             robot.left_bus.read_sequences[("Torque_Enable", "lift_axis")] = [selected]
             robot.left_bus.read_sequences[("Present_Current", "lift_axis")] = [1]
@@ -1961,7 +1975,7 @@ def inject_startup_off_feedback(monkeypatch, robot, *, torque=(1, 0), faults=Non
                 faults(index, phase, monitor)
             index += 1
         result = original(monitor, phase, **kwargs)
-        if phase in {"startup_off_acquisition", "baseline"}:
+        if selected_phase:
             observed.append(result)
         return result
 
@@ -1990,7 +2004,7 @@ def test_transient_on_feedback_must_acquire_off_then_collect_all_nine_strict_bas
     robot, _ = operating_robot
     observed = inject_startup_off_feedback(monkeypatch, robot, torque=(1, 1, 0))
     robot.connect(calibrate=False)
-    records = operational_records(capsys)
+    records = initial_startup_records(capsys)
     acquisition = [r for r in records if r["phase"] == "startup_off_acquisition"]
     baseline = [r for r in records if r["phase"] == "baseline"]
     assert [r["torque_enable"] for r in acquisition] == [1, 1, 0]
@@ -2436,7 +2450,7 @@ def test_two_isolated_acquisition_baseline_motion_indicators_still_need_the_full
 
     inject_startup_off_feedback(monkeypatch, robot, torque=(0,), faults=fault)
     robot.connect(calibrate=False)
-    records = operational_records(capsys)
+    records = initial_startup_records(capsys)
     acquisition = [r for r in records if r["phase"] == "startup_off_acquisition"]
     baseline = [r for r in records if r["phase"] == "baseline"]
     assert acquisition[0]["present_velocity_raw"] == baseline[0]["present_velocity_raw"] == -50
@@ -2463,7 +2477,7 @@ def test_original_stationary_indicator_pattern_qualifies_without_expanding_encod
 
     inject_startup_off_feedback(monkeypatch, robot, torque=(0,), faults=fault)
     robot.connect(calibrate=False)
-    records = operational_records(capsys)
+    records = initial_startup_records(capsys)
     baseline = [r for r in records if r["phase"] == "baseline"]
     assert [r["present_velocity_raw"] for r in baseline] == velocities
     assert (
@@ -2543,7 +2557,7 @@ def test_off_acquisition_to_baseline_keeps_original_poll_cadence_inside_one_dead
     robot, _ = operating_robot
     inject_startup_off_feedback(monkeypatch, robot, torque=(0,))
     robot.connect(calibrate=False)
-    records = operational_records(capsys)
+    records = initial_startup_records(capsys)
     acquired = next(r for r in records if r["phase"] == "startup_off_acquisition")
     baseline = [r for r in records if r["phase"] == "baseline"]
     request = next(r for r in records if r["phase"] == "startup_off_request_started")
@@ -2569,7 +2583,7 @@ def test_short_indicator_pulse_across_acquisition_boundary_cannot_manufacture_pe
 
     inject_startup_off_feedback(monkeypatch, robot, torque=(0,), faults=fault)
     robot.connect(calibrate=False)
-    records = operational_records(capsys)
+    records = initial_startup_records(capsys)
     acquisition = [r for r in records if r["phase"] == "startup_off_acquisition"]
     baseline = [r for r in records if r["phase"] == "baseline"]
     assert acquisition[0]["moving"] == baseline[0]["moving"] == 1
@@ -2588,9 +2602,21 @@ def test_original_35ms_relief_helper_latency_retains_the_earlier_thermal_stale_r
     bus = robot.left_bus
     bus.up_factor = 0
     original_write = bus.write
+    setup_delay = []
 
     def write(register, motor, value, **kwargs):
         original_write(register, motor, value, **kwargs)
+        operation = getattr(robot, "_lift_operation", None)
+        if (
+            not setup_delay and operation is not None and operation.reader.last_record is not None
+            and operation.reader.phase == "setup_position"
+            and (register, motor, int(value)) == ("Goal_Velocity", "lift_axis", 0)
+        ):
+            # The final nine-sample phase shifts the slot phase by 60 ms.
+            # This external setup helper delay restores the prior occupied-slot
+            # alignment; it does not alter raw feedback timing or thermal history.
+            setup_delay.append(clock.now)
+            clock.sleep(0.04)
         if (register, motor, int(value)) == ("Goal_Velocity", "lift_axis", -200):
             clock.sleep(0.035)  # Earlier fake condition retained as its own thermal-fault check.
 
@@ -2603,11 +2629,17 @@ def test_original_35ms_relief_helper_latency_retains_the_earlier_thermal_stale_r
     bus.hook = hook
     with pytest.raises(RuntimeError, match="AlohaMini motor activation failed") as caught:
         robot.connect(calibrate=False)
+    assert len(setup_delay) == 1
     assert "temperature: five-slot feedback window is stale" in str(caught.value.__cause__)
     assert caught.value.__cause__ is robot._lift_operation.failure
     records = operational_records(capsys)
     rejected = next(r for r in records if r.get("rejected") and r["phase"] == "relief")
     assert rejected["sample_monotonic_s"] - rejected["temperature_history"][0][0] > 0.5
+    origin = next(row["sample_monotonic_s"] for row in records if "sample_monotonic_s" in row)
+    slots = [round((stamp - origin) * 1_000_000_000) // 100_000_000
+             for stamp, _temperature in rejected["temperature_history"]]
+    assert any(right - left > 1 for left, right in zip(slots, slots[1:]))
+    assert rejected["request_duration_s"] <= 0.04
     assert not any(r["phase"] in {"relief_direction_qualified", "operational_ready"} for r in records)
     assert any(r["phase"] == "shutdown_verified" for r in records)
     assert bus.registers[("Goal_Velocity", "lift_axis")] == 0
@@ -2629,7 +2661,7 @@ def test_startup08_persistent_indicator_candidate_must_settle_to_a_full_new_wind
 
     inject_startup_off_feedback(monkeypatch, robot, torque=(0,), faults=fault)
     robot.connect(calibrate=False)
-    records = operational_records(capsys)
+    records = initial_startup_records(capsys)
     resets = [r for r in records if r["phase"] == "baseline_stationary_candidate_reset"]
     baseline = [r for r in records if r["phase"] == "baseline"]
     request = next(r for r in records if r["phase"] == "startup_off_request_started")
@@ -2662,7 +2694,7 @@ def test_crossphase_persistent_indicator_resets_even_with_only_two_baseline_vote
 
     inject_startup_off_feedback(monkeypatch, robot, torque=(0,), faults=fault)
     robot.connect(calibrate=False)
-    records = operational_records(capsys)
+    records = initial_startup_records(capsys)
     resets = [r for r in records if r["phase"] == "baseline_stationary_candidate_reset"]
     baseline = [r for r in records if r["phase"] == "baseline"]
     qualified = next(r for r in records if r["phase"] == "startup_off_baseline_qualified")

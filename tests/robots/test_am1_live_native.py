@@ -13,6 +13,7 @@ from lerobot.motors.feetech import FeetechMotorsBus
 from tests.robots.test_am1_selected_joint_evidence import robot as selected_robot
 from tests.robots.test_am1_selected_joint_evidence import visible_register_packet, visible_robot
 from tests.robots.test_alohamini_lift_motor_feedback import status
+from tests.robots.test_alohamini_lift_operational import operating_robot
 
 KEY = "arm_left_elbow_flex.pos"
 
@@ -22,6 +23,25 @@ class MeasuredMotor(Motor):
         super().__init__()
         self.positions = dict.fromkeys(JOINT_KEYS, 0.0)
         self.acknowledged_commands = dict.fromkeys(JOINT_KEYS, 0.0)
+
+    def configure_workspace(self, raw=1845):
+        self.workspace_calibrations = dict(WORKSPACE_CALIBRATION)
+        self.workspace_goals = dict(WORKSPACE_GOALS)
+        self.workspace_goals[RIGHT] = raw
+        for name, value in self.workspace_goals.items():
+            calibration = self.workspace_calibrations[name]
+            fraction = (value-calibration[3])/(calibration[4]-calibration[3])
+            q = fraction*100 if name.endswith("_gripper") else fraction*200-100
+            self.positions[name+".pos"] = q
+            self.acknowledged_commands[name+".pos"] = q
+        self.workspace_raw = raw
+
+    def am1_live_workspace_context(self, binding, measured):
+        # Explicit simulated registers/context, checked by the same contract resolver.
+        return dict(robot_model="alohamini1", selected_model="sts3215",
+                    calibrations={k:list(v) for k,v in self.workspace_calibrations.items()},
+                    nonselected_goals={k:v for k,v in self.workspace_goals.items() if k!=RIGHT},
+                    right_pose={k:measured[k] for k in measured if k.startswith("arm_right_") and k!=RIGHT_KEY}), self.workspace_raw
 
     def am1_live_arm_commands(self, binding):
         return dict(self.acknowledged_commands)
@@ -157,6 +177,8 @@ class ExecutorNativeHost:
         self.actions = []
 
     def start(self, run_id, incarnation, recipe, cancel):
+        if recipe.name == "physical-live-right-elbow":
+            self.robot.configure_workspace()
         self.control = host.AM1LocalControl(run_id=run_id, host_incarnation=incarnation, live=True, live_recipe=recipe.name)
 
     def poll(self, previous):
@@ -264,8 +286,11 @@ def test_production_host_ipc_expiry_retains_same_run_and_new_intent_resumes(reci
         peer.client.send_action(frame(peer.identity, owner, sequence=1))
         _, initial = receive_feedback(peer, lambda m: m.get("live_input", {}).get("state") == "held")
         expiry = time.monotonic() + .25
-        target = sample(expiry=expiry, target=direction * .5)
-        target["target"] = {joint: direction * .5}
+        value = initial["live_input"]
+        target_norm = value["cursor_norm"] + direction * .5
+        assert value["corridor_min_norm"] <= target_norm <= value["corridor_max_norm"]
+        target = sample(expiry=expiry, target=target_norm)
+        target["target"] = {joint: target_norm}
         peer.client.send_action(frame(peer.identity, owner, sequence=2, mode="active", epoch=2, sample=target))
         _, active = receive_feedback(peer, lambda m: m.get("live_input", {}).get("state") == "active")
         assert active["live_input"]["valid_until_monotonic_s"] == expiry
@@ -274,8 +299,11 @@ def test_production_host_ipc_expiry_retains_same_run_and_new_intent_resumes(reci
         peer.client.send_action(frame(peer.identity, owner, sequence=3, epoch=3, revision=1))
         _, held = receive_feedback(peer, lambda m: m.get("epoch") == 3 and m.get("state") == "paused")
         assert held["live_input"]["live_deadline_monotonic_s"] == initial["live_input"]["live_deadline_monotonic_s"]
+        cursor = held["live_input"]
+        fresh_target = max(cursor["corridor_min_norm"], min(cursor["corridor_max_norm"],
+                                                        cursor["cursor_norm"] + direction))
         peer.client.send_action(frame(peer.identity, owner, sequence=4, mode="active", epoch=4, revision=1,
-                                      sample={"target": {joint: direction}, "grant_id": str(uuid4()), "seq": 2,
+                                      sample={"target": {joint: fresh_target}, "grant_id": str(uuid4()), "seq": 2,
                                               "valid_until_monotonic_s": time.monotonic() + .25}))
         assert receive_feedback(peer, lambda m: m.get("epoch") == 4 and m.get("state") == "active")
 
@@ -376,6 +404,348 @@ def test_live_static_command_adverse_current_rise_remains_a_native_fault(monkeyp
             evidence.guard_live(robot, control)
 
 
+def test_practical_static_current_rise_retains_exact_window_without_extra_reads():
+    from types import SimpleNamespace
+    from lerobot.robots.alohamini.selected_joint_evidence import AM1SelectedJointEvidence
+
+    emitted = []
+    evidence = AM1SelectedJointEvidence(enabled=True, emit=emitted.append)
+    evidence._live_definition = SimpleNamespace(practical_motion=True)
+    position = {"raw": 1847, "read_completed_at_monotonic_s": 10.0}
+    current = {"raw": 0, "ma": 0, "read_completed_at_monotonic_s": 10.0}
+    for index in range(4):
+        position = dict(position, read_completed_at_monotonic_s=10 + index * .1)
+        current = dict(current, raw=index, ma=index * 6.5, read_completed_at_monotonic_s=10 + index * .1)
+        evidence._guard_live_fixed_goal(position, current, 1960)
+    evidence.emit_pending_fault(SimpleNamespace())
+    assert len(emitted) == 1
+    row = emitted[0]
+    assert row["kind"] == "practical_current_rise_diagnostic"
+    assert row["would_have_aborted"] is True
+    assert row["position"] == position and row["current"] == current
+    assert row["window"] == [(10 + i * .1, 10 + i * .1, 1847, i * 6.5) for i in range(4)]
+
+
+def test_practical_effective_current_cap_keeps_ordinary_lower_limit():
+    from types import SimpleNamespace
+    from lerobot.robots.alohamini.selected_joint_evidence import AM1SelectedJointEvidence, _LiveElbowDefinition
+
+    spec = SimpleNamespace(recipe="physical-live-right-elbow-practical", profile="LiveRightElbowPractical",
+                           current_cap_ma=500, live_s=180, practical_motion=True)
+    definition = _LiveElbowDefinition(spec)
+    assert definition.practical_motion is True
+    evidence = AM1SelectedJointEvidence(enabled=True)
+    evidence._visible_definition = lambda robot: definition
+    robot = SimpleNamespace()
+    evidence.check_visible_current(robot, 76, 1800)
+    with pytest.raises(RuntimeError, match="effort"):
+        evidence.check_visible_current(robot, 77, 1800)
+    assert robot._am1_selected_joint_fault["effective_limit_ma"] == 500
+    robot = SimpleNamespace()
+    with pytest.raises(RuntimeError, match="effort"):
+        evidence.check_visible_current(robot, 16, 100)
+    assert robot._am1_selected_joint_fault["effective_limit_ma"] == 100
+    definition.hardware_current_limit_ma = 65
+    robot = SimpleNamespace()
+    with pytest.raises(RuntimeError, match="effort"):
+        evidence.check_visible_current(robot, 10, 1800)
+    assert robot._am1_selected_joint_fault["effective_limit_ma"] == 65
+
+
+def test_practical_response_window_begins_at_delivered_target_and_measures_nonresponse():
+    from types import SimpleNamespace
+    from lerobot.robots.alohamini.selected_joint_evidence import AM1SelectedJointEvidence
+
+    rows = []
+    evidence = AM1SelectedJointEvidence(enabled=True, clock=lambda: 20, emit=rows.append)
+    evidence.live_spec = SimpleNamespace(joint=RIGHT_KEY)
+    calibration = SimpleNamespace(range_min=827, range_max=3039)
+    robot = SimpleNamespace(right_bus=SimpleNamespace(calibration={RIGHT: calibration}))
+    evidence.live_spec.side = "right"
+    control = SimpleNamespace(epoch=2, intent_revision=1, live_sample={"target": {RIGHT_KEY: (1960-827)/2212*200-100}})
+    position = dict(raw=1847, read_completed_at_monotonic_s=10)
+    current = dict(raw=2, ma=13, read_completed_at_monotonic_s=10)
+    evidence._guard_practical_response(robot, control, position, current, 1900, {"write_completed_at_monotonic_s": 9.9})
+    assert evidence.live_response is None
+    evidence._guard_practical_response(robot, control, position, current, 1960, {"write_completed_at_monotonic_s": 10})
+    assert evidence.live_response["at"] == 10
+    position["read_completed_at_monotonic_s"] = 11.3
+    evidence._guard_practical_response(robot, control, position, current, 1960, {"write_completed_at_monotonic_s": 11.2})
+    assert evidence.response_boundary["status"] == "pending"
+    position["read_completed_at_monotonic_s"] = 12.01
+    evidence._guard_practical_response(robot, control, position, current, 1960, {"write_completed_at_monotonic_s": 12})
+    assert evidence.response_boundary["status"] == "measured"
+    assert evidence.response_boundary["signed_response_raw"] == 0
+    assert evidence.response_boundary["residual_raw"] == 113
+
+
+def test_practical_native_admission_large_geometry_rate_expiry_and_stop():
+    from examples.alohamini.am1_session_contract import PracticalElbowConfig
+    config = PracticalElbowConfig.from_payload(dict(reference_raw=1847, direction=1))
+    now, identity, owner, _, obj = right_lane()
+    obj.configure_workspace(raw=1847)
+    control = host.AM1LocalControl(**identity, live=True, live_recipe=config.spec.recipe,
+                                  practical_config=config, clock=lambda: now[0])
+    assert control.apply(obj, frame(identity, owner, sequence=1))
+    initial = control.live_snapshot()
+    assert initial["corridor_max_norm"] == config.target_norm(20)
+    assert initial["live_deadline_monotonic_s"] == 190
+    now[0] += .1
+    assert control.apply(obj, frame(identity, owner, sequence=2, mode="active", epoch=2,
+                                   sample=right_sample(target=config.target_norm(10))))
+    assert control.live_snapshot()["cursor_norm"] == pytest.approx(config.target_norm(0) + .1 * config.spec.rate_norm_per_s)
+    assert all(obj.events[-1][1][name] == 0 for name in ("x.vel", "y.vel", "theta.vel", "lift_axis.vel"))
+    now[0] = 10.26
+    assert control.check_live(obj) and control.live_snapshot()["state"] == "expired"
+    assert control.apply(obj, frame(identity, owner, sequence=3, epoch=3, revision=1))
+    assert control.live_snapshot()["live_deadline_monotonic_s"] == 190
+    assert control.apply(obj, {name: 0 for name in ("x.vel", "y.vel", "theta.vel", "lift_axis.vel")})
+    assert control.state == "stopped"
+    now[0] = 190
+    assert not control.check_live(obj) and control.state == "stopped"
+
+
+def test_practical_command_current_aborts_before_position_failure_or_goal_write(monkeypatch):
+    from types import SimpleNamespace
+    obj, evidence, *_ = right_robot(monkeypatch)
+    definition = SimpleNamespace(practical_motion=True, current_cap_ma=500, hardware_current_limit_ma=2015)
+    evidence.live_spec = SimpleNamespace(joint=RIGHT_KEY, side="right")
+    evidence._live_definition = definition
+    evidence._visible_definition = lambda robot: definition
+    acquisitions = []
+    def current(register, motors):
+        acquisitions.append(register)
+        return {RIGHT: 77}
+    monkeypatch.setattr(obj.right_bus, "sync_read", current)
+    monkeypatch.setattr(obj, "_read_arm_positions", lambda *args, **kwargs: pytest.fail("position read obscured current trip"))
+    with pytest.raises(RuntimeError, match="effort"):
+        obj._limit_joint_goal_by_current(obj.right_bus, {RIGHT_KEY: 0})
+    assert acquisitions == ["Present_Current"]
+    assert obj._am1_selected_joint_fault["source"] == "command_current_limiter"
+    assert obj._am1_selected_joint_fault["effective_limit_ma"] == 500
+    assert obj._joint_current_limit_ma == 1800
+
+
+def test_practical_twenty_degrees_survives_ordinary_twenty_normalized_relative_cap(monkeypatch):
+    from examples.alohamini.am1_session_contract import PracticalElbowConfig
+    from lerobot.robots.alohamini.selected_joint_evidence import _LiveElbowDefinition
+    obj, evidence, *_ = right_robot(monkeypatch, position=1847)
+    config = PracticalElbowConfig.from_payload(dict(reference_raw=1847, direction=1))
+    obj.config.max_relative_target = 20.0
+    obj._am1_practical_config = config
+    obj._am1_visible_control_binding["recipe"] = config.spec.recipe
+    evidence.live_spec = config.spec
+    evidence._live_definition = _LiveElbowDefinition(config.spec)
+    evidence._visible_definition = lambda robot: evidence._live_definition
+    obj.send_action({RIGHT_KEY: config.target_norm(20), "x.vel": 0, "y.vel": 0, "theta.vel": 0, "lift_axis.vel": 0})
+    assert obj._am1_selected_joint_action["expected_goal_raw"] == 2074
+    assert obj.config.max_relative_target == 20
+
+
+def test_practical_routine_writer_blocked_sink_keeps_owner_free_and_records_immutable():
+    import json
+    import threading
+    entered, release = threading.Event(), threading.Event()
+    output = bytearray()
+    def write(data):
+        entered.set()
+        assert release.wait(2)
+        count = min(17, len(data))
+        output.extend(data[:count])
+        return count
+    writer = host.AM1RoutineRecordWriter(write=write, capacity=8)
+    first = {"sample_monotonic_s": 65158.384830385, "temperature_c": 35}
+    try:
+        assert writer.submit("[LIFT OPERATIONAL] ", first)
+        assert entered.wait(1)
+        first["temperature_c"] = 99
+        assert writer.submit("[AM1 SELECTED JOINT] ", {"kind": "native_trace", "raw": 1929})
+        for line in ("[HOST TIMING avg ms/loop] retained", "[HOST ACTION avg ms/command] retained",
+                     "[HOST CADENCE] retained", "Owned Live Stop received."):
+            assert writer.submit_line(line, flush=True)
+        # These are ordinary owner operations while the sink remains blocked.
+        writer.raise_if_failed()
+        assert not release.is_set()
+    finally:
+        release.set()
+        writer.close(timeout=1)
+    lines = output.decode().splitlines()
+    assert json.loads(lines[0].split("] ", 1)[1]) == {"sample_monotonic_s": 65158.384830385, "temperature_c": 35}
+    assert json.loads(lines[1].split("] ", 1)[1])["kind"] == "native_trace"
+    assert lines[2:] == ["[HOST TIMING avg ms/loop] retained", "[HOST ACTION avg ms/command] retained",
+                         "[HOST CADENCE] retained", "Owned Live Stop received."]
+
+
+def test_practical_routine_writer_queue_full_and_sink_error_are_latched():
+    import threading
+    entered, release = threading.Event(), threading.Event()
+    output = []
+    def write(data):
+        entered.set()
+        assert release.wait(2)
+        output.append(bytes(data))
+        return len(data)
+    writer = host.AM1RoutineRecordWriter(write=write, capacity=1)
+    try:
+        assert writer.submit("", {"sequence": 1}) and entered.wait(1)
+        assert writer.submit("", {"sequence": 2})
+        assert not writer.submit("", {"sequence": 3})
+        with pytest.raises(RuntimeError, match="queue full") as full:
+            writer.raise_if_failed()
+    finally:
+        release.set()
+        with pytest.raises(RuntimeError, match="queue full") as closing:
+            writer.close(timeout=1)
+    assert closing.value is full.value and len(output) == 2
+    original = OSError("actual routine sink failure")
+    def failed(data):
+        raise original
+    writer = host.AM1RoutineRecordWriter(write=failed)
+    writer.submit("", {"sequence": 1})
+    with pytest.raises(OSError) as caught:
+        writer.close(timeout=1)
+    assert caught.value is original
+    with pytest.raises(OSError) as again:
+        writer.raise_if_failed()
+    assert again.value is original
+
+
+def test_practical_routine_writer_drain_timeout_is_finite():
+    import threading
+    entered, release = threading.Event(), threading.Event()
+    def write(data):
+        entered.set()
+        release.wait(2)
+        return len(data)
+    writer = host.AM1RoutineRecordWriter(write=write)
+    writer.submit("", {"sequence": 1})
+    assert entered.wait(1)
+    try:
+        with pytest.raises(TimeoutError, match="drain"):
+            writer.close(timeout=.01)
+    finally:
+        release.set()
+        writer._thread.join(1)
+
+
+def test_practical_routine_writer_bounds_bytes_and_rejects_zero_progress():
+    writer = host.AM1RoutineRecordWriter(write=lambda data: len(data))
+    assert not writer.submit("", {"oversized": "x" * 32768})
+    with pytest.raises(ValueError, match="32768 bytes"):
+        writer.close(timeout=1)
+    writer = host.AM1RoutineRecordWriter(write=lambda data: 0)
+    writer.submit("", {"sequence": 1})
+    with pytest.raises(OSError, match="invalid progress"):
+        writer.close(timeout=1)
+
+
+def test_practical_routine_writer_uses_duplicate_fd_without_text_stream_write(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    path = tmp_path / "routine-native.log"
+    with path.open("wb") as stream:
+        sink = SimpleNamespace(fileno=stream.fileno,
+                               write=lambda *args: pytest.fail("worker acquired stdout TextIO writer"))
+        monkeypatch.setattr(host, "sys", SimpleNamespace(stdout=sink))
+        writer = host.AM1RoutineRecordWriter()
+        writer.submit("[AM1 SELECTED JOINT] ", {"sample_monotonic_s": 65158.384830385})
+        writer.close(timeout=1)
+        assert not stream.closed
+    assert path.read_text() == '[AM1 SELECTED JOINT] {"sample_monotonic_s":65158.384830385}\n'
+
+
+def test_practical_blocked_log_sink_preserves_real_five_slot_polls_and_cleanup(operating_robot):
+    import json
+    import threading
+    robot, clock = operating_robot
+    robot.connect(calibrate=False)
+    operation = robot._lift_operation
+    window = operation.temperature
+    origin = window._origin_ns
+    robot.left_bus.registers[("Present_Temperature", "lift_axis")] = 35
+    entered, release = threading.Event(), threading.Event()
+    lines = []
+    def write(data):
+        entered.set()
+        assert release.wait(2)
+        lines.append(bytes(data))
+        return len(data)
+    writer = host.AM1RoutineRecordWriter(write=write)
+    first = None
+    try:
+        for index in range(20):
+            clock.sleep(.03)
+            operation.poll(defer_sample_log=True)
+            if first is None:
+                first = operation.last_record["sample_monotonic_s"]
+            writer.emit_lift_samples(operation)
+            if index == 0:
+                assert entered.wait(1)
+            writer.raise_if_failed()
+            assert window.ready and window.failure is None
+            assert clock.now - window.samples[0][0] <= .5
+        assert operation.last_record["sample_monotonic_s"] - first > .5
+        assert window._origin_ns == origin and window.MAX_AGE_S == .5
+        # A blocked diagnostic sink cannot postpone the existing zero/off path.
+        robot.disconnect()
+        assert not robot.left_bus.is_connected and not release.is_set()
+        assert robot.left_bus.registers[("Torque_Enable", "lift_axis")] == 0
+    finally:
+        if robot.left_bus.is_connected:
+            robot.disconnect()
+        release.set()
+        writer.close(timeout=1)
+    records = [json.loads(line.decode().split("] ", 1)[1]) for line in lines]
+    assert len(records) == 20 and records[0]["sample_monotonic_s"] == first
+    assert all(record["temperature_c"] == 35 for record in records)
+
+
+@pytest.mark.parametrize("normal_stop", [False, True])
+def test_practical_writer_error_still_cleans_motor_and_sockets_before_drain(monkeypatch, normal_stop):
+    from types import SimpleNamespace
+    events = []
+    original = OSError("routine writer original failure")
+    identity = binding()
+    recipe = "physical-live-right-elbow-practical"
+    obj = SimpleNamespace(is_connected=True, config=SimpleNamespace(robot_model="alohamini1"))
+    def disconnect(**kwargs):
+        events.append("motor-zero-off")
+        obj.is_connected = False
+    obj.disconnect = disconnect
+    evidence = SimpleNamespace(enabled=True, enrich_fault=lambda *args: None,
+                               emit_pending_fault=lambda *args: events.append("fault-record"))
+    class Writer:
+        def submit_line(self, message, **kwargs):
+            report(message, **kwargs)
+        def emit_selected(self, record):
+            pass
+        def raise_if_failed(self):
+            if not normal_stop:
+                raise original
+        def close(self, **kwargs):
+            events.append("drain")
+    monkeypatch.setattr(host, "AM1RoutineRecordWriter", Writer)
+    monkeypatch.setattr(host, "AM1SelectedJointEvidence", lambda **kwargs: evidence)
+    monkeypatch.setattr(host, "AlohaMini", lambda config: obj)
+    monkeypatch.setattr(host, "connect_robot", lambda *args, **kwargs: None)
+    monkeypatch.setattr(host, "visible_control_binding", lambda args: {**identity, "recipe": recipe})
+    monkeypatch.setattr(host, "right_p20_trial_binding", lambda *args: dict(kind="practical13-right", request=dict(config=dict(reference_raw=1847, direction=1))))
+    monkeypatch.setattr(host, "AM1LocalControl", lambda **kwargs: SimpleNamespace(live=True,
+        state="stopped" if normal_stop else "paused", check_live=lambda robot: not normal_stop))
+    monkeypatch.setattr(host, "AlohaMiniHost", lambda config: SimpleNamespace(watchdog_timeout_ms=1000,
+        connection_time_s=.1, max_loop_freq_hz=30, disconnect=lambda: events.append("socket-close")))
+    args = host.make_parser().parse_args(["--no_cameras", "--skip_lift_home"])
+    args.am1_run_id, args.am1_host_incarnation = identity["run_id"], identity["host_incarnation"]
+    def report(message, **kwargs):
+        if normal_stop and message == "Owned Live Stop received.":
+            events.append("normal-stop-report")
+            raise original
+    monkeypatch.setattr(host, "print", report, raising=False)
+    with pytest.raises(OSError) as caught:
+        host._run_host(args)
+    assert caught.value is original
+    assert events == ["motor-zero-off", "socket-close", *(["normal-stop-report"] if normal_stop else []), "fault-record", "drain"]
+
+
 def test_nonselected_out_of_command_range_pose_keeps_its_existing_raw_hold(monkeypatch):
     from lerobot.motors import Motor as Servo, MotorCalibration, MotorNormMode
     from tests.robots.test_am1_selected_joint_evidence import robot as selected_robot
@@ -444,13 +814,11 @@ def right_lane():
     owner.update({key: str(uuid4()) for key in owner})
     control = host.AM1LocalControl(**identity, live=True, live_recipe=RIGHT_RECIPE, clock=lambda: now[0])
     obj = MeasuredMotor()
-    obj.positions[RIGHT_KEY] = -10.0
-    obj.positions[LEFT_KEY] = 19.0
-    obj.acknowledged_commands[LEFT_KEY] = 19.0
+    obj.configure_workspace()
     return now, identity, owner, control, obj
 
 
-def right_sample(*, seq=1, expiry=10.25, target=-12.0, key=RIGHT_KEY):
+def right_sample(*, seq=1, expiry=10.25, target=-8.9, key=RIGHT_KEY):
     return {"target": {key: target}, "grant_id": str(uuid4()), "seq": seq,
             "valid_until_monotonic_s": expiry}
 
@@ -459,18 +827,18 @@ def test_right_native_freezes_negative_corridor_and_moves_only_right():
     now, identity, owner, control, obj = right_lane()
     assert control.apply(obj, frame(identity, owner, sequence=1))
     assert control.live_snapshot()["joint"] == RIGHT_KEY
-    assert control.live_snapshot()["corridor_min_norm"] == -13.0
-    assert control.live_snapshot()["corridor_max_norm"] == -10.0
+    assert control.live_snapshot()["corridor_min_norm"] == pytest.approx((1834-827)/2212*200-100)
+    assert control.live_snapshot()["corridor_max_norm"] == pytest.approx((1867-827)/2212*200-100)
     now[0] = 10.1
     assert control.apply(obj, frame(identity, owner, sequence=2, mode="active", epoch=2, sample=right_sample()))
     action = obj.events[-1][1]
-    assert action[RIGHT_KEY] == pytest.approx(-10.1)
+    assert action[RIGHT_KEY] == pytest.approx((1845-827)/2212*200-100-.1)
     assert LEFT_KEY not in action
-    assert control.accepted_action[LEFT_KEY] == 19.0
+    assert control.accepted_action[LEFT_KEY] == pytest.approx((2124-864)/2209*200-100)
     assert all(action[k] == 0 for k in ("x.vel", "y.vel", "theta.vel", "lift_axis.vel"))
 
 
-@pytest.mark.parametrize("key,target", [(LEFT_KEY, 18.0), (RIGHT_KEY, -13.01), (RIGHT_KEY, -9.99), (RIGHT_KEY, -7.0)])
+@pytest.mark.parametrize("key,target", [(LEFT_KEY, 18.0), (RIGHT_KEY, -13.01), (RIGHT_KEY, -9.99), (RIGHT_KEY, -5.9)])
 def test_right_rejects_wrong_joint_or_outside_original_corridor(key, target):
     now, identity, owner, control, obj = right_lane()
     control.apply(obj, frame(identity, owner, sequence=1))
@@ -492,24 +860,24 @@ def test_right_expiry_rejoin_preserves_reference_deadline_and_other_hold():
     now[0] = 10.26
     assert control.check_live(obj)
     assert obj.events[-2:] == [("zero",), ("hold",)]
-    obj.positions[RIGHT_KEY], obj.positions[LEFT_KEY] = -10.05, 18.5
+    obj.positions[RIGHT_KEY], obj.positions[LEFT_KEY] = (1845-827)/2212*200-100-.05, 18.5
     assert control.apply(obj, frame(identity, owner, sequence=3, epoch=3, revision=1))
     summary = control.live_snapshot()
-    assert summary["cursor_norm"] == -10.05
-    assert summary["reference_norm"] == -10.0
+    assert summary["cursor_norm"] == pytest.approx((1845-827)/2212*200-100-.05)
+    assert summary["reference_norm"] == pytest.approx((1845-827)/2212*200-100)
     assert summary["live_deadline_monotonic_s"] == deadline
-    assert control.live_held[LEFT_KEY] == 19.0
+    assert control.live_held[LEFT_KEY] == pytest.approx((2124-864)/2209*200-100)
     now[0] = 10.3
     count = len(obj.events)
     assert not control.apply(obj, frame(identity, owner, sequence=4, mode="active", epoch=4, revision=1,
                                         sample=right_sample(expiry=10.25)))
     assert len(obj.events) == count
     assert control.apply(obj, frame(identity, owner, sequence=4, mode="active", epoch=4, revision=1,
-                                    sample=right_sample(seq=2, expiry=10.5, target=-10)))
-    assert obj.events[-1][1][RIGHT_KEY] > -10.05
+                                    sample=right_sample(seq=2, expiry=10.5, target=(1845-827)/2212*200-100)))
+    assert obj.events[-1][1][RIGHT_KEY] > (1845-827)/2212*200-100-.05
 
 
-def right_packet(*, torque=0, goal=1817, present=1817, phase=12):
+def right_packet(*, torque=0, goal=1845, present=1845, phase=12):
     packet = bytearray(visible_register_packet(torque=torque, range_min=827, range_max=3039,
                                                goal=goal, present=present))
     packet[18] = phase
@@ -517,7 +885,7 @@ def right_packet(*, torque=0, goal=1817, present=1817, phase=12):
     return bytes(packet)
 
 
-def right_robot(monkeypatch, packets=(), *, position=1817):
+def right_robot(monkeypatch, packets=(), *, position=1845):
     obj, evidence, rows, identity, port, reads, writes = visible_robot(monkeypatch, packets)
     original_bus = obj.left_bus
     motor = original_bus.motors["arm_left_elbow_flex"]
@@ -535,12 +903,36 @@ def right_robot(monkeypatch, packets=(), *, position=1817):
         return dict.fromkeys(ids, position if address == 56 else 2 if address == 69 else 0), 0
 
     monkeypatch.setattr(right_bus, "_sync_read", right_read)
+    from lerobot.motors import Motor, MotorNormMode
+    from lerobot.robots.alohamini.alohamini import AlohaMini
+    for side in ("left", "right"):
+        bus = getattr(obj, side+"_bus")
+        names = [k for k in WORKSPACE_CALIBRATION if k.startswith("arm_"+side+"_")]
+        for name in names:
+            calibration = WORKSPACE_CALIBRATION[name]
+            bus.motors[name] = Motor(calibration[0],"sts3215",MotorNormMode.RANGE_0_100 if name.endswith("_gripper") else MotorNormMode.RANGE_M100_100)
+            bus.calibration[name] = MotorCalibration(*calibration)
+        setattr(obj,side+"_arm_motors",names)
+        bus._id_to_name_dict = {motor.id:name for name,motor in bus.motors.items()}
+        bus._id_to_model_dict = {motor.id:motor.model for motor in bus.motors.values()}
+        def read_all(address,length,ids,source=bus,**kwargs):
+            values = {}
+            for ident in ids:
+                name = source._id_to_name(ident)
+                values[ident] = (position if name==RIGHT else WORKSPACE_GOALS.get(name,0)) if address in (42,56) else 2 if address==69 else 0
+            reads.append((address,length,tuple(ids)))
+            return values,0
+        monkeypatch.setattr(bus,"_sync_read",read_all)
+    obj._am1_live_frozen_holds = tuple((getattr(obj,side+"_bus"),name,tuple(WORKSPACE_CALIBRATION[name]),position if name==RIGHT else WORKSPACE_GOALS[name])
+        for side in ("left","right") for name in getattr(obj,side+"_arm_motors"))
+    obj._am1_live_frozen_binding = {**identity,"recipe":RIGHT_RECIPE}
+    del obj.am1_live_arm_commands
     identity["recipe"] = RIGHT_RECIPE
     obj._am1_visible_control_binding = identity
     return obj, evidence, rows, identity, port, reads, writes, left_writes
 
 
-def right_guard(monkeypatch, *, start=1817):
+def right_guard(monkeypatch, *, start=1845, before_admit=None):
     obj, evidence, rows, identity, port, reads, writes, left_writes = right_robot(monkeypatch, [
         status(right_packet(present=start, goal=start), motor_id=3), status(bytes([91]), motor_id=3),
         status(right_packet(torque=1, present=start, goal=start), motor_id=3),
@@ -555,9 +947,11 @@ def right_guard(monkeypatch, *, start=1817):
     summary = {"reference_norm": q0, "corridor_min_norm": q0 - 3,
                "corridor_max_norm": q0,
                "live_admitted_at_monotonic_s": 10, "live_deadline_monotonic_s": 100}
-    obj._am1_selected_joint_position.update(read_started_at_monotonic_s=9.98, read_completed_at_monotonic_s=9.99)
-    obj._am1_selected_joint_current.update(read_started_at_monotonic_s=9.98, read_completed_at_monotonic_s=9.99)
+    if before_admit is not None:
+        before_admit(obj, summary)
     evidence.admit_live(obj, summary)
+    obj._am1_selected_joint_position.update(read_started_at_monotonic_s=9.98,read_completed_at_monotonic_s=9.99)
+    obj._am1_selected_joint_current.update(read_started_at_monotonic_s=9.98,read_completed_at_monotonic_s=9.99)
     control = host.AM1LocalControl(**{k: identity[k] for k in ("run_id", "host_incarnation")},
                                   live=True, live_recipe=RIGHT_RECIPE, selected_evidence=evidence,
                                   clock=lambda: now[0])
@@ -569,28 +963,28 @@ def test_right_owned_settings_feedback_and_encoded_envelopes(monkeypatch):
     obj, evidence, control, summary, now, port, writes, left_writes = right_guard(monkeypatch)
     assert evidence.visible_settings["before"]["registers"]["Phase"] == 12
     assert evidence.visible_settings["before"]["registers"]["Homing_Offset"] == -658
-    assert obj._am1_selected_joint_position["raw"] == 1817
-    assert obj._am1_selected_joint_position["normalized"] == pytest.approx(-10.488245931283899)
+    assert obj._am1_selected_joint_position["raw"] == 1845
+    assert obj._am1_selected_joint_position["normalized"] == pytest.approx(-7.956600361663661)
     assert obj._am1_selected_joint_current["raw"] == 2
-    assert summary["measured_origin_raw"] == 1817
-    assert summary["corridor_min_raw"] == 1783
-    assert summary["corridor_max_raw"] == 1817
-    assert summary["measured_min_raw"] == 1783
-    assert summary["measured_max_raw"] == 1850
+    assert summary["measured_origin_raw"] == 1845
+    assert summary["corridor_min_raw"] == 1834
+    assert summary["corridor_max_raw"] == 1867
+    assert summary["measured_min_raw"] == 1811
+    assert summary["measured_max_raw"] == 1878
     evidence.guard_live(obj, control)
-    obj._am1_selected_joint_position["raw"] = 1782
+    obj._am1_selected_joint_position["raw"] = 1810
     with pytest.raises(RuntimeError, match="corridor"):
         evidence.guard_live(obj, control)
 
 
 def test_right_selected_action_uses_right_encoded_write_and_provenance(monkeypatch):
     obj, evidence, control, summary, now, port, writes, left_writes = right_guard(monkeypatch)
-    obj.send_action({RIGHT_KEY: -13.488245931283899, "x.vel": 0, "y.vel": 0, "theta.vel": 0, "lift_axis.vel": 0})
+    obj.send_action({RIGHT_KEY: -8.951175406871613, "x.vel": 0, "y.vel": 0, "theta.vel": 0, "lift_axis.vel": 0})
     action = obj._am1_selected_joint_action
-    assert action["expected_goal_raw"] == 1783
+    assert action["expected_goal_raw"] == 1834
     assert action["sync_write_returned"] is True
-    assert action["encoded_goal_word"] == 1783
-    assert [row for row in writes if row[0] == 42][-1][2] == {3: 1783}
+    assert action["encoded_goal_word"] == 1834
+    assert [row for row in writes if row[0] == 42][-1][2] == {3: 1834}
     assert not [row for row in left_writes if row[0] == 42]
     assert evidence._base(obj, control, {})["motor"]["bus"] == "right"
     assert evidence._base(obj, control, {})["motor"]["name"] == RIGHT
@@ -628,7 +1022,10 @@ def native_right_ready(monkeypatch):
     control.state, control.epoch = "ready", -1
     control._live_summary.update(summary)
     measured = dict.fromkeys(JOINT_KEYS, 0.0)
-    measured[RIGHT_KEY] = -10.488245931283899
+    for name, raw in WORKSPACE_GOALS.items():
+        calibration = WORKSPACE_CALIBRATION[name]
+        fraction=(raw-calibration[3])/(calibration[4]-calibration[3])
+        measured[name+".pos"] = fraction*100 if name.endswith("_gripper") else fraction*200-100
     obj.get_observation = lambda: dict(measured)
     obj.stop_motion = lambda: None
     obj.hold_follower_arms = lambda: None
@@ -642,9 +1039,9 @@ def test_right_live_summary_exports_only_actual_current_selected_write(monkeypat
     obj, control, now, identity, owner, writes = native_right_ready(monkeypatch)
     now[0] = 10.1
     assert control.apply(obj, frame(identity, owner, sequence=2, mode="active", epoch=2,
-                                    sample=right_sample(target=-13.488245931283899)))
+                                    sample=right_sample(target=-8.951175406871613)))
     summary, actual = control.live_snapshot(), obj._am1_selected_joint_action
-    assert summary["encoded_goal_raw"] == 1815
+    assert summary["encoded_goal_raw"] == 1843
     assert summary["goal_write_returned"] is True
     assert summary["goal_write_started_at_monotonic_s"] == actual["write_started_at_monotonic_s"]
     assert summary["goal_write_completed_at_monotonic_s"] == actual["write_completed_at_monotonic_s"]
@@ -658,8 +1055,8 @@ def test_right_live_summary_never_relabels_unmatched_cache_as_current_write(monk
     obj, control, now, identity, owner, writes = native_right_ready(monkeypatch)
     now[0] = 10.1
     assert control.apply(obj, frame(identity, owner, sequence=2, mode="active", epoch=2,
-                                    sample=right_sample(target=-13.488245931283899)))
-    assert control.live_snapshot()["encoded_goal_raw"] == 1815
+                                    sample=right_sample(target=-8.951175406871613)))
+    assert control.live_snapshot()["encoded_goal_raw"] == 1843
     original_send = obj.send_action
 
     def changed(action):
@@ -677,7 +1074,7 @@ def test_right_live_summary_never_relabels_unmatched_cache_as_current_write(monk
     monkeypatch.setattr(obj, "send_action", changed)
     now[0] = 10.15
     assert control.apply(obj, frame(identity, owner, sequence=3, mode="active", epoch=2,
-                                    sample=right_sample(seq=2, expiry=10.4, target=-13.488245931283899)))
+                                    sample=right_sample(seq=2, expiry=10.4, target=-8.951175406871613)))
     assert "encoded_goal_raw" not in control.live_snapshot()
     assert "goal_action_sequence" not in control.live_snapshot()
 
@@ -694,7 +1091,7 @@ def test_right_expiry_before_actual_write_never_exports_write_proof(monkeypatch)
     monkeypatch.setattr(obj, "_read_arm_positions", delayed)
     now[0] = 10.1
     assert not control.apply(obj, frame(identity, owner, sequence=2, mode="active", epoch=2,
-                                        sample=right_sample(target=-13.488245931283899)))
+                                        sample=right_sample(target=-8.951175406871613)))
     assert not [r for r in writes if r[0] == 42]
     assert "encoded_goal_raw" not in control.live_snapshot()
     assert control.live_snapshot()["state"] == "expired"
@@ -702,7 +1099,7 @@ def test_right_expiry_before_actual_write_never_exports_write_proof(monkeypatch)
 
 
 def test_right_negative_command_corridor_cannot_cross_actual_calibrated_lower_limit(monkeypatch):
-    with pytest.raises(RuntimeError, match="admission/encoded corridor"):
+    with pytest.raises(RuntimeError, match="workspace|admission/encoded corridor"):
         right_guard(monkeypatch, start=838)
 
 
@@ -834,8 +1231,11 @@ from tests.robots.test_am1_pre_activation import activation as endpoint_activati
 def test_real_frozen_eleven_goals_across_live_owned_hold_boundaries(endpoint_activation, monkeypatch, recipe, direction):
     from lerobot.robots.alohamini import alohamini as owner_module
     case = endpoint_activation
-    robot = protected_endpoint_case(case, monkeypatch, recipe)
-    robot.activate_motors(home_lift=False)
+    if recipe==RIGHT_RECIPE:
+        robot,_,_,_=workspace_owner(case,monkeypatch)
+    else:
+        robot=protected_endpoint_case(case,monkeypatch,recipe)
+        robot.activate_motors(home_lift=False)
     spec = host.live_elbow_spec(recipe)
     key, motor = spec.joint, spec.joint.removesuffix(".pos")
     selected_bus = getattr(robot, spec.side + "_bus")
@@ -843,9 +1243,13 @@ def test_real_frozen_eleven_goals_across_live_owned_hold_boundaries(endpoint_act
                       for side, bus in (("left", robot.left_bus), ("right", robot.right_bus))
                       for name in bus.calibration if name != motor}
     def observation():
-        return {name + ".pos": value for bus in (robot.left_bus, robot.right_bus)
+        values = {name + ".pos": value for bus in (robot.left_bus, robot.right_bus)
                 for name, value in robot._normalize_arm_feedback(bus, {
                     name: bus.registers["Present_Position", name] for name in bus.calibration}).items()}
+        if recipe==RIGHT_RECIPE:
+            robot._am1_selected_joint_position=dict(raw=selected_bus.registers["Present_Position",motor],normalized=values[key],
+                read_started_at_monotonic_s=case.clock.now,read_completed_at_monotonic_s=case.clock.now)
+        return values
     robot.get_observation = observation
     robot.stop_motion = lambda: case.events.append(("owned_body_zero",))
     # Active device transport is injected; all hold/admission behavior is the real owner.
@@ -867,7 +1271,7 @@ def test_real_frozen_eleven_goals_across_live_owned_hold_boundaries(endpoint_act
     assert observation()["arm_left_shoulder_lift.pos"] == 100.08421052631579
     def active(sequence, epoch, revision, seq):
         case.clock.now += .05
-        intent = {"target": {key: direction}, "grant_id": str(uuid4()), "seq": seq,
+        intent = {"target": {key: -8.9 if recipe==RIGHT_RECIPE else direction}, "grant_id": str(uuid4()), "seq": seq,
                   "valid_until_monotonic_s": case.clock.now + .25}
         assert control.apply(robot, frame(identity, client, sequence=sequence, mode="active", epoch=epoch,
                                           revision=revision, sample=intent))
@@ -951,12 +1355,12 @@ def expected_historical_write(control, owner, original, actual):
 
 def test_historical_write_real_right_expiry_retains_bound_success_without_current_proof(monkeypatch):
     obj, control, now, identity, owner, writes = native_right_ready(monkeypatch)
-    original = right_sample(target=-13.488245931283899)
+    original = right_sample(target=-8.951175406871613)
     now[0] = 10.1
     assert control.apply(obj, frame(identity, owner, sequence=2, mode="active", epoch=2, sample=original))
     actual = copy.deepcopy(obj._am1_selected_joint_action)
     expected = expected_historical_write(control, owner, original, actual)
-    assert actual["sync_write_returned"] is True and expected["encoded_goal_raw"] == 1815
+    assert actual["sync_write_returned"] is True and expected["encoded_goal_raw"] == 1843
     now[0] = 10.26
     assert control.check_live(obj)
     expired = control.live_snapshot()
@@ -1005,7 +1409,7 @@ def test_historical_write_both_recipes_use_verified_selected_return(monkeypatch,
 @pytest.mark.parametrize("bad", ["stale", "wrong_joint", "wrong_sequence", "failed_write", "foreign_host"])
 def test_historical_write_unmatched_new_attempt_cannot_relabel_previous_success(monkeypatch, bad):
     obj, control, now, identity, owner, writes = native_right_ready(monkeypatch)
-    original = right_sample(target=-13.488245931283899)
+    original = right_sample(target=-8.951175406871613)
     now[0] = 10.1
     assert control.apply(obj, frame(identity, owner, sequence=2, mode="active", epoch=2, sample=original))
     expected = expected_historical_write(control, owner, original, copy.deepcopy(obj._am1_selected_joint_action))
@@ -1024,7 +1428,7 @@ def test_historical_write_unmatched_new_attempt_cannot_relabel_previous_success(
 
     monkeypatch.setattr(obj, "send_action", unmatched)
     now[0] = 10.15
-    newer = right_sample(seq=2, expiry=10.4, target=-13.488245931283899)
+    newer = right_sample(seq=2, expiry=10.4, target=-8.951175406871613)
     assert control.apply(obj, frame(identity, owner, sequence=3, mode="active", epoch=2, sample=newer))
     current = control.live_snapshot()
     assert current["grant_id"] == newer["grant_id"]
@@ -1047,7 +1451,7 @@ def test_historical_write_prewrite_expiry_never_creates_success(monkeypatch):
     monkeypatch.setattr(obj, "_read_arm_positions", delayed)
     now[0] = 10.1
     assert not control.apply(obj, frame(identity, owner, sequence=2, mode="active", epoch=2,
-                                      sample=right_sample(target=-13.488245931283899)))
+                                      sample=right_sample(target=-8.951175406871613)))
     summary = control.live_snapshot()
     assert summary["state"] == "expired"
     assert not [row for row in writes if row[0] == 42]
@@ -1058,7 +1462,7 @@ def test_historical_write_prewrite_expiry_never_creates_success(monkeypatch):
 def test_historical_write_pause_readiness_preserve_history_until_fresh_success(monkeypatch):
     obj, control, now, identity, owner, writes = native_right_ready(monkeypatch)
     now[0] = 10.1
-    original = right_sample(target=-13.488245931283899)
+    original = right_sample(target=-8.951175406871613)
     assert control.apply(obj, frame(identity, owner, sequence=2, mode="active", epoch=2, sample=original))
     expected = expected_historical_write(control, owner, original, copy.deepcopy(obj._am1_selected_joint_action))
     admission = {k: control.live_snapshot()[k] for k in
@@ -1075,7 +1479,7 @@ def test_historical_write_pause_readiness_preserve_history_until_fresh_success(m
     # Readiness may perform a real measured-hold write, but is not a new input receipt.
     assert {k: ready[k] for k in admission} == admission
     now[0] = 10.31
-    fresh = right_sample(seq=2, expiry=10.55, target=-12.0)
+    fresh = right_sample(seq=2, expiry=10.55, target=-8.9)
     assert control.apply(obj, frame(identity, owner, sequence=5, mode="active", epoch=4, revision=1, sample=fresh))
     changed = control.live_snapshot()
     assert changed["last_successful_write"] == expected_historical_write(
@@ -1134,3 +1538,431 @@ def test_historical_write_executor_expired_evidence_carries_receipt_after_hold(m
         e.finish("stopped")
         e.worker.join(2)
         assert not e.worker.is_alive()
+
+
+# Retained AM1 bench calibration/acknowledged Goals from actual08/10.
+WORKSPACE_CALIBRATION = {
+    "arm_left_shoulder_pan": (1, 0, -1761, 731, 3438),
+    "arm_left_shoulder_lift": (2, 0, 515, 848, 3223),
+    "arm_left_elbow_flex": (3, 0, 1845, 864, 3073),
+    "arm_left_wrist_flex": (4, 0, -1939, 1314, 3208),
+    "arm_left_wrist_roll": (5, 0, 879, 0, 4095),
+    "arm_left_gripper": (6, 0, 933, 1886, 3401),
+    "arm_right_shoulder_pan": (1, 0, -1719, 752, 3456),
+    "arm_right_shoulder_lift": (2, 0, -1852, 1331, 3264),
+    "arm_right_elbow_flex": (3, 0, -658, 827, 3039),
+    "arm_right_wrist_flex": (4, 0, -1609, 1461, 3167),
+    "arm_right_wrist_roll": (5, 0, 1869, 0, 4095),
+    "arm_right_gripper": (6, 0, -1811, 1657, 3191),
+}
+WORKSPACE_GOALS = dict(zip(WORKSPACE_CALIBRATION, (2199,3223,2124,1546,2200,3167,2141,3252,1845,2772,2443,1981), strict=True))
+
+
+def workspace_owner(case, monkeypatch, raw=1845, *, wrist_raw=2443, left_wrist_raw=1546, shoulder_pan_raw=2141, left_elbow_raw=2124, left_gripper_raw=3167):
+    """Actual owner/frozen-map methods; only device registers and clock are injected."""
+    from lerobot.robots.alohamini import alohamini as module
+    robot = protected_endpoint_case(case, monkeypatch)
+    from lerobot.motors import MotorNormMode
+    for bus in (robot.left_bus, robot.right_bus):
+        for name in bus.calibration:
+            calibration = WORKSPACE_CALIBRATION[name]
+            bus.motors[name].norm_mode=MotorNormMode.RANGE_0_100 if name.endswith("_gripper") else MotorNormMode.RANGE_M100_100
+            bus.calibration[name] = MotorCalibration(*calibration)
+            value = raw if name == RIGHT else wrist_raw if name == "arm_right_wrist_roll" else left_wrist_raw if name == "arm_left_wrist_flex" else shoulder_pan_raw if name == "arm_right_shoulder_pan" else left_elbow_raw if name == "arm_left_elbow_flex" else left_gripper_raw if name == "arm_left_gripper" else WORKSPACE_GOALS[name]
+            bus.registers.update({(key,name):v for key,v in (
+                ("Min_Position_Limit",calibration[3]),("Max_Position_Limit",calibration[4]),
+                ("Homing_Offset",calibration[2]),("Present_Position",3224 if name=="arm_left_shoulder_lift" else value),
+                ("Goal_Position",value),)})
+    robot.activate_motors(home_lift=False)
+    def observation():
+        result = {name+".pos":value for bus in (robot.left_bus,robot.right_bus)
+                  for name,value in robot._normalize_arm_feedback(bus,{name:bus.registers["Present_Position",name] for name in bus.calibration}).items()}
+        robot._am1_selected_joint_position = {"raw":robot.right_bus.registers["Present_Position",RIGHT],"normalized":result[RIGHT_KEY],
+            "read_started_at_monotonic_s":case.clock.now,"read_completed_at_monotonic_s":case.clock.now}
+        return result
+    robot.get_observation = observation
+    robot.stop_motion = lambda: case.events.append(("owned_body_zero",))
+    def send(action):
+        assert all(action[k]==0 for k in ("x.vel","y.vel","theta.vel","lift_axis.vel"))
+        if RIGHT_KEY in action:
+            encoded=module.FeetechMotorsBus._unnormalize(robot.right_bus,{3:action[RIGHT_KEY]})[3]
+            robot.right_bus.write("Goal_Position",RIGHT,encoded,normalize=False)
+        return dict(action)
+    robot.send_action=send
+    identity={k:robot._am1_visible_control_binding[k] for k in ("run_id","host_incarnation")}
+    control=host.AM1LocalControl(**identity,live=True,live_recipe=RIGHT_RECIPE,clock=lambda:case.clock.now)
+    owner={k:str(uuid4()) for k in ("service_incarnation","controller_generation","connection_generation")}
+    return robot,control,identity,owner
+
+
+@pytest.mark.parametrize("raw", [1845,1847])
+def test_workspace_next_start_keeps_actual_q0_and_reuses_inward_bounds(endpoint_activation,monkeypatch,raw):
+    robot,control,identity,owner=workspace_owner(endpoint_activation,monkeypatch,raw)
+    before=len(endpoint_activation.events)
+    assert control.apply(robot,frame(identity,owner,sequence=1))
+    live=control.live_snapshot()
+    assert live["reference_norm"]==pytest.approx((raw-827)/2212*200-100)
+    assert live["corridor_min_norm"]==pytest.approx((1834-827)/2212*200-100)
+    assert live["corridor_max_norm"]==pytest.approx((1867-827)/2212*200-100)
+    assert live["corridor_max_norm"]-live["corridor_min_norm"]<=3
+    assert live["measured_origin_raw"]==raw
+    assert (live["corridor_min_raw"],live["corridor_max_raw"])==(1834,1867)
+    assert live["admission_version"]==2
+    assert live["workspace"]["id"]=="am1-right-elbow-rest-neighbourhood-v2"
+    assert robot.right_bus.registers["Goal_Position",RIGHT]==raw
+    assert not any(e[0]=="write" and e[2]=="Goal_Position" and e[4]==1867 for e in endpoint_activation.events[before:])
+
+
+@pytest.mark.parametrize("mutation", ["goal","calibration","right_pose","outside"])
+def test_workspace_native_admission_refuses_incompatible_current_context(endpoint_activation,monkeypatch,mutation):
+    robot,control,identity,owner=workspace_owner(endpoint_activation,monkeypatch)
+    if mutation=="goal":
+        # A stale frozen map must not be reinterpreted as a different permissible pose.
+        robot.right_bus.registers["Goal_Position","arm_right_shoulder_pan"]+=1
+    elif mutation=="calibration":
+        robot.right_bus.calibration[RIGHT].homing_offset=-657
+    elif mutation=="right_pose":
+        robot.right_bus.registers["Present_Position","arm_right_wrist_flex"]+=50
+    else:
+        robot.right_bus.registers["Present_Position",RIGHT]=1817
+    with pytest.raises(RuntimeError,match="workspace|acknowledged|calibration"):
+        control.apply(robot,frame(identity,owner,sequence=1))
+    assert "live_admitted_at_monotonic_s" not in control.live_snapshot()
+
+
+def test_workspace_context_accepts_one_tick_measurement_with_unchanged_actual_goals(endpoint_activation,monkeypatch):
+    robot,control,identity,owner=workspace_owner(endpoint_activation,monkeypatch)
+    robot.right_bus.registers["Present_Position","arm_right_wrist_flex"]+=1
+    assert control.apply(robot,frame(identity,owner,sequence=1))
+    assert control.live_snapshot()["measured_origin_raw"]==1845
+    assert robot.right_bus.registers["Goal_Position","arm_right_wrist_flex"]==2772
+
+
+def test_workspace_selected_admission_does_not_take_second_q0_read(monkeypatch):
+    def after_first(obj,summary):
+        obj.get_observation=lambda: (_ for _ in ()).throw(AssertionError("Do not reread/reseed the first fresh q0"))
+    obj,evidence,control,summary,*_=right_guard(monkeypatch,before_admit=after_first)
+    assert summary["measured_origin_raw"]==1845
+    assert summary["reference_norm"]==pytest.approx((1845-827)/2212*200-100)
+
+
+def test_workspace_actual_gripper_zero_to_hundred_pose_matches_retained_raw_goal(endpoint_activation,monkeypatch):
+    from lerobot.motors import MotorNormMode
+    robot,control,identity,owner=workspace_owner(endpoint_activation,monkeypatch)
+    robot.right_bus.motors["arm_right_gripper"].norm_mode=MotorNormMode.RANGE_0_100
+    assert robot.get_observation()["arm_right_gripper.pos"]==pytest.approx(21.121251629726206)
+    assert control.apply(robot,frame(identity,owner,sequence=1))
+    assert control.live_snapshot()["admission_version"]==2
+
+
+def test_workspace_owned_writes_reach_both_fixed_endpoints_across_actual_q0(monkeypatch):
+    obj,control,now,identity,owner,writes=native_right_ready(monkeypatch)
+    original=copy.deepcopy(control.live_snapshot())
+    frozen=obj._am1_live_frozen_holds
+    action_seq=1
+    input_seq=0
+    for target,expected,steps in ((original["corridor_max_norm"],1867,22),
+                                  (original["corridor_min_norm"],1834,32)):
+        for _ in range(steps):
+            now[0]+=0.1
+            action_seq+=1
+            input_seq+=1
+            assert control.apply(obj,frame(identity,owner,sequence=action_seq,mode="active",epoch=2,
+                sample=right_sample(seq=input_seq,expiry=now[0]+.25,target=target)))
+        live=control.live_snapshot()
+        assert live["encoded_goal_raw"]==expected
+        assert live["goal_write_returned"] is True
+        assert live["goal_action_sequence"]==action_seq
+        assert live["cursor_norm"]==target
+        assert live["reference_norm"]==original["reference_norm"]
+        assert live["measured_origin_raw"]==1845
+        assert live["workspace"]==original["workspace"]
+        assert live["live_deadline_monotonic_s"]==original["live_deadline_monotonic_s"]
+        assert (live["measured_min_raw"],live["measured_max_raw"])==(1811,1878)
+        assert obj._am1_live_frozen_holds==frozen
+    goals=[row for row in writes if row[0]==42]
+    assert {raw for _,_,values in goals for raw in values.values()} >= {1834,1867}
+    assert all(set(values)=={3} for _,_,values in goals)
+
+
+def wrist_workspace_context(raw=2443, *, left_wrist_raw=1546, shoulder_pan_raw=2141, left_elbow_raw=2124, left_gripper_raw=3167):
+    """Existing actual AM1 fixture; preserve actual changed Goal and measured pose."""
+    goals={name:value for name,value in WORKSPACE_GOALS.items() if name!=RIGHT}
+    goals["arm_right_wrist_roll"]=raw
+    goals["arm_left_wrist_flex"]=left_wrist_raw
+    goals["arm_right_shoulder_pan"]=shoulder_pan_raw
+    goals["arm_left_elbow_flex"]=left_elbow_raw
+    goals["arm_left_gripper"]=left_gripper_raw
+    pose={}
+    for name,value in goals.items():
+        if not name.startswith("arm_right_"):continue
+        calibration=WORKSPACE_CALIBRATION[name]
+        fraction=(value-calibration[3])/(calibration[4]-calibration[3]) if type(value) is int else 0
+        pose[name+".pos"]=fraction*100 if name.endswith("_gripper") else fraction*200-100
+    return dict(robot_model="alohamini1",selected_model="sts3215",
+        calibrations={name:list(value) for name,value in WORKSPACE_CALIBRATION.items()},
+        nonselected_goals=goals,right_pose=pose)
+
+
+@pytest.mark.parametrize("raw",[2443,2444])
+def test_workspace_fixed_wrist_anchor_admits_actual_one_tick_seed_without_rewrite(endpoint_activation,monkeypatch,raw):
+    robot,control,identity,owner=workspace_owner(endpoint_activation,monkeypatch,wrist_raw=raw)
+    assert control.apply(robot,frame(identity,owner,sequence=1))
+    wrist="arm_right_wrist_roll"
+    frozen=next(row for row in robot._am1_live_frozen_holds if row[1]==wrist)
+    assert frozen[3]==robot.right_bus.registers["Goal_Position",wrist]==raw
+    assert control.live_held[wrist+".pos"]==pytest.approx(raw/4095*200-100)
+    assert control.live_snapshot()["measured_origin_raw"]==1845
+    assert (control.live_snapshot()["corridor_min_raw"],control.live_snapshot()["corridor_max_raw"])==(1834,1867)
+    assert control.live_snapshot()["live_deadline_monotonic_s"]-control.live_snapshot()["live_admitted_at_monotonic_s"]==90
+
+
+@pytest.mark.parametrize("raw",[2441,2445,2443.0,True,None,"2443",float("nan")])
+def test_workspace_fixed_wrist_anchor_rejects_outside_two_ticks_or_noninteger(raw):
+    from examples.alohamini.am1_session_contract import LIVE_ELBOW_WORKSPACES
+    with pytest.raises(ValueError):LIVE_ELBOW_WORKSPACES[RIGHT_RECIPE].qualify(wrist_workspace_context(raw))
+
+
+@pytest.mark.parametrize("name",[name for name in WORKSPACE_GOALS if name not in {RIGHT,"arm_right_wrist_roll","arm_left_wrist_flex","arm_right_shoulder_pan","arm_left_elbow_flex","arm_left_gripper"}])
+def test_workspace_rest_box_keeps_other_six_goal_coordinates_exact(name):
+    from examples.alohamini.am1_session_contract import LIVE_ELBOW_WORKSPACES
+    context=wrist_workspace_context(2444,left_wrist_raw=1547,shoulder_pan_raw=2142);context["nonselected_goals"][name]+=1
+    with pytest.raises(ValueError):LIVE_ELBOW_WORKSPACES[RIGHT_RECIPE].qualify(context)
+
+
+def test_workspace_wrist_exception_keeps_calibration_and_measured_pose_checks_exact():
+    from examples.alohamini.am1_session_contract import LIVE_ELBOW_WORKSPACES
+    spec=LIVE_ELBOW_WORKSPACES[RIGHT_RECIPE]
+    context=wrist_workspace_context(2444);context["calibrations"]["arm_right_wrist_roll"][2]+=1
+    with pytest.raises(ValueError):spec.qualify(context)
+    context=wrist_workspace_context(2444);context["right_pose"]["arm_right_wrist_roll.pos"]+=1.01
+    with pytest.raises(ValueError):spec.qualify(context)
+
+
+def test_workspace_wrist_fixed_anchor_does_not_ratchet_or_mutate_actual_context():
+    from examples.alohamini.am1_session_contract import LIVE_ELBOW_WORKSPACES
+    spec=LIVE_ELBOW_WORKSPACES[RIGHT_RECIPE];context=wrist_workspace_context(2444);original=copy.deepcopy(context)
+    spec.qualify(context);assert context==original
+    with pytest.raises(ValueError):spec.qualify(wrist_workspace_context(2445))
+
+
+def test_workspace_wrist_anchor_does_not_relax_same_run_frozen_goal_reads(endpoint_activation,monkeypatch):
+    robot,control,identity,owner=workspace_owner(endpoint_activation,monkeypatch,wrist_raw=2444)
+    assert control.apply(robot,frame(identity,owner,sequence=1))
+    robot.right_bus.registers["Goal_Position","arm_right_wrist_roll"]=2443
+    with pytest.raises(RuntimeError,match="acknowledged"):
+        robot.am1_live_arm_commands({**identity,"recipe":RIGHT_RECIPE})
+
+
+def test_workspace_wrist_policy_identity_covers_anchor_and_tolerance_without_schema_growth():
+    from dataclasses import replace
+    from examples.alohamini.am1_session_contract import LIVE_ELBOW_WORKSPACE_POLICIES
+    spec=LIVE_ELBOW_WORKSPACE_POLICIES["am1-right-elbow-retained-v1"]
+    assert spec.wrist_roll_goal_anchor_raw==2443 and spec.wrist_roll_goal_tolerance_raw==1
+    assert spec.context_sha256!=replace(spec,wrist_roll_goal_anchor_raw=2444).context_sha256
+    assert spec.context_sha256!=replace(spec,wrist_roll_goal_tolerance_raw=2).context_sha256
+    assert spec.context_sha256!="837dc65e96b6c905891b5cfe6fb58f5e24d35f9c4a6ce5b329642b46390958f0"
+    assert len(spec.descriptor)==5 and len(spec.summary())==11
+
+
+@pytest.mark.parametrize("raw", [1546,1547])
+def test_workspace_left_wrist_fixed_anchor_admits_actual_seed_without_goal_rewrite(endpoint_activation,monkeypatch,raw):
+    robot,control,identity,owner=workspace_owner(endpoint_activation,monkeypatch,wrist_raw=2444,left_wrist_raw=raw)
+    assert control.apply(robot,frame(identity,owner,sequence=1))
+    motor="arm_left_wrist_flex"
+    frozen=next(row for row in robot._am1_live_frozen_holds if row[1]==motor)
+    assert frozen[3]==robot.left_bus.registers["Goal_Position",motor]==raw
+    assert control.live_held[motor+".pos"]==pytest.approx((raw-1314)/1894*200-100)
+    assert control.live_snapshot()["measured_origin_raw"]==1845
+    assert (control.live_snapshot()["corridor_min_raw"],control.live_snapshot()["corridor_max_raw"])==(1834,1867)
+    robot.left_bus.registers["Goal_Position",motor]=raw+1
+    with pytest.raises(RuntimeError,match="acknowledged"):
+        robot.am1_live_arm_commands({**identity,"recipe":RIGHT_RECIPE})
+
+
+@pytest.mark.parametrize("raw",[1544,1548,1546.0,True,None,"1546",float("nan")])
+def test_workspace_left_wrist_fixed_anchor_rejects_two_ticks_and_wrong_types(raw):
+    from examples.alohamini.am1_session_contract import LIVE_ELBOW_WORKSPACES
+    with pytest.raises(ValueError):
+        LIVE_ELBOW_WORKSPACES[RIGHT_RECIPE].qualify(wrist_workspace_context(2444,left_wrist_raw=raw))
+
+
+def test_workspace_left_wrist_fixed_anchor_preserves_actual_context_and_calibration():
+    from examples.alohamini.am1_session_contract import LIVE_ELBOW_WORKSPACES
+    spec=LIVE_ELBOW_WORKSPACES[RIGHT_RECIPE]
+    context=wrist_workspace_context(2444,left_wrist_raw=1547);original=copy.deepcopy(context)
+    spec.qualify(context);assert context==original
+    with pytest.raises(ValueError):spec.qualify(wrist_workspace_context(2444,left_wrist_raw=1548))
+    context["calibrations"]["arm_left_wrist_flex"][2]+=1
+    with pytest.raises(ValueError):spec.qualify(context)
+
+
+def test_workspace_left_wrist_fixed_anchor_changes_policy_identity_not_schema():
+    from dataclasses import replace
+    from examples.alohamini.am1_session_contract import LIVE_ELBOW_WORKSPACE_POLICIES
+    spec=LIVE_ELBOW_WORKSPACE_POLICIES["am1-right-elbow-retained-v1"]
+    assert spec.left_wrist_flex_goal_anchor_raw==1546
+    assert spec.left_wrist_flex_goal_tolerance_raw==1
+    assert spec.context_sha256!=replace(spec,left_wrist_flex_goal_anchor_raw=1547).context_sha256
+    assert spec.context_sha256!=replace(spec,left_wrist_flex_goal_tolerance_raw=2).context_sha256
+    assert spec.context_sha256!="349363aae4d53eea1ee508775dffcbd2e363606cf6067ab7b15427bb4afcc333"
+    assert len(spec.descriptor)==5 and len(spec.summary())==11
+
+
+@pytest.mark.parametrize("raw",[2140,2141,2142])
+def test_workspace_shoulder_pan_fixed_anchor_admits_actual_seed_without_goal_rewrite(endpoint_activation,monkeypatch,raw):
+    robot,control,identity,owner=workspace_owner(endpoint_activation,monkeypatch,wrist_raw=2444,left_wrist_raw=1547,shoulder_pan_raw=raw)
+    assert control.apply(robot,frame(identity,owner,sequence=1))
+    motor="arm_right_shoulder_pan"
+    frozen=next(row for row in robot._am1_live_frozen_holds if row[1]==motor)
+    assert frozen[3]==robot.right_bus.registers["Goal_Position",motor]==raw
+    assert control.live_held[motor+".pos"]==pytest.approx((raw-752)/2704*200-100)
+    summary=control.live_snapshot()
+    assert summary["measured_origin_raw"]==1845
+    assert (summary["corridor_min_raw"],summary["corridor_max_raw"])==(1834,1867)
+    assert summary["live_deadline_monotonic_s"]-summary["live_admitted_at_monotonic_s"]==90
+    robot.right_bus.registers["Goal_Position",motor]=raw+1
+    with pytest.raises(RuntimeError,match="acknowledged"):
+        robot.am1_live_arm_commands({**identity,"recipe":RIGHT_RECIPE})
+
+
+@pytest.mark.parametrize("raw",[2137,2143,2141.0,True,None,"2141",float("nan")])
+def test_workspace_shoulder_pan_fixed_anchor_rejects_two_ticks_and_wrong_types(raw):
+    from examples.alohamini.am1_session_contract import LIVE_ELBOW_WORKSPACES
+    with pytest.raises(ValueError):
+        LIVE_ELBOW_WORKSPACES[RIGHT_RECIPE].qualify(wrist_workspace_context(2444,left_wrist_raw=1547,shoulder_pan_raw=raw))
+
+
+def test_workspace_shoulder_pan_fixed_anchor_preserves_actual_context_calibration_and_pose():
+    from examples.alohamini.am1_session_contract import LIVE_ELBOW_WORKSPACES
+    spec=LIVE_ELBOW_WORKSPACES[RIGHT_RECIPE]
+    context=wrist_workspace_context(2444,left_wrist_raw=1547,shoulder_pan_raw=2142);original=copy.deepcopy(context)
+    spec.qualify(context);assert context==original
+    with pytest.raises(ValueError):spec.qualify(wrist_workspace_context(2444,left_wrist_raw=1547,shoulder_pan_raw=2143))
+    context["calibrations"]["arm_right_shoulder_pan"][2]+=1
+    with pytest.raises(ValueError):spec.qualify(context)
+    context=copy.deepcopy(original);context["right_pose"]["arm_right_shoulder_pan.pos"]+=1.01
+    with pytest.raises(ValueError):spec.qualify(context)
+
+
+def test_workspace_shoulder_pan_fixed_anchor_is_in_policy_identity_without_schema_growth():
+    from dataclasses import replace
+    from examples.alohamini.am1_session_contract import LIVE_ELBOW_WORKSPACE_POLICIES
+    spec=LIVE_ELBOW_WORKSPACE_POLICIES["am1-right-elbow-retained-v1"]
+    assert spec.right_shoulder_pan_goal_anchor_raw==2141
+    assert spec.right_shoulder_pan_goal_tolerance_raw==1
+    assert spec.context_sha256!=replace(spec,right_shoulder_pan_goal_anchor_raw=2142).context_sha256
+    assert spec.context_sha256!=replace(spec,right_shoulder_pan_goal_tolerance_raw=2).context_sha256
+    assert spec.context_sha256!="75e93cad4c958797494679e1a5e3f9c992587004a53ef2f6aa900e38911b0fcf"
+    assert len(spec.descriptor)==5 and len(spec.summary())==11
+
+
+# Actual retained startup operands; full calibration/eight fixed Goals use the existing fixture.
+@pytest.mark.parametrize("trial,pan,left_wrist,right_wrist", [
+    ("p10-02",2141,1546,2443), ("p10-04",2141,1546,2443),
+    ("p10-05",2141,1546,2443), ("p10-06",2141,1546,2443),
+    ("p10-08",2141,1546,2443), ("p10-09",2141,1546,2443),
+    ("p10-10",2141,1546,2443), ("p11-01",2141,1546,2443),
+    ("p11-02",2141,1546,2444), ("p11-03",2141,1547,2444),
+    ("p11-04",2141,1547,2444), ("p11-05",2141,1547,2444),
+    ("p11-06",2141,1547,2444), ("p11-07",2142,1547,2444),
+    ("p11-10",2138,1547,2444),
+])
+def test_workspace_rest_box_preserves_retained_context_operands(trial,pan,left_wrist,right_wrist):
+    from examples.alohamini.am1_session_contract import LIVE_ELBOW_WORKSPACES
+    context=wrist_workspace_context(right_wrist,left_wrist_raw=left_wrist,shoulder_pan_raw=pan)
+    original=copy.deepcopy(context)
+    LIVE_ELBOW_WORKSPACES[RIGHT_RECIPE].qualify(context)
+    assert context==original,trial
+
+
+@pytest.mark.parametrize("pan,left_wrist,right_wrist,left_elbow,left_gripper", [
+    (pan,left,right,elbow,gripper) for pan in range(2138,2143) for left in (1546,1547)
+    for right in (2443,2444) for elbow in (2124,2125) for gripper in (3167,3168)
+])
+def test_workspace_rest_box_is_fixed_between_starts(pan,left_wrist,right_wrist,left_elbow,left_gripper):
+    from examples.alohamini.am1_session_contract import LIVE_ELBOW_WORKSPACES
+    spec=LIVE_ELBOW_WORKSPACES[RIGHT_RECIPE]
+    before=copy.deepcopy(spec.descriptor)
+    spec.qualify(wrist_workspace_context(right_wrist,left_wrist_raw=left_wrist,shoulder_pan_raw=pan,
+        left_elbow_raw=left_elbow,left_gripper_raw=left_gripper))
+    assert spec.descriptor==before
+    for refused in (2137,2143):
+        with pytest.raises(ValueError):
+            spec.qualify(wrist_workspace_context(right_wrist,left_wrist_raw=left_wrist,shoulder_pan_raw=refused,
+                left_elbow_raw=left_elbow,left_gripper_raw=left_gripper))
+
+
+@pytest.mark.parametrize("name,value,low,high", [
+    ("arm_right_shoulder_pan",2137,2138,2142), ("arm_right_shoulder_pan",2143,2138,2142),
+    ("arm_left_wrist_flex",1545,1546,1547), ("arm_left_wrist_flex",1548,1546,1547),
+    ("arm_right_wrist_roll",2442,2443,2444), ("arm_right_wrist_roll",2445,2443,2444),
+    ("arm_left_elbow_flex",2123,2124,2125), ("arm_left_elbow_flex",2126,2124,2125),
+    ("arm_left_gripper",3166,3167,3168), ("arm_left_gripper",3169,3167,3168),
+])
+def test_workspace_rest_box_refusal_identifies_actual_coordinate_and_fixed_bounds(name,value,low,high):
+    from examples.alohamini.am1_session_contract import LIVE_ELBOW_WORKSPACES
+    context=wrist_workspace_context();context["nonselected_goals"][name]=value
+    with pytest.raises(ValueError) as error:LIVE_ELBOW_WORKSPACES[RIGHT_RECIPE].qualify(context)
+    message=str(error.value)
+    assert all(str(part) in message for part in (name,value,low,high,"am1-right-elbow-rest-neighbourhood-v2"))
+
+
+@pytest.mark.parametrize("name",["arm_right_shoulder_pan","arm_left_wrist_flex","arm_right_wrist_roll","arm_left_elbow_flex","arm_left_gripper"])
+@pytest.mark.parametrize("value",[True,None,1.0,"2141",float("nan"),float("inf")])
+def test_workspace_rest_box_refuses_wrong_raw_types(name,value):
+    from examples.alohamini.am1_session_contract import LIVE_ELBOW_WORKSPACES
+    context=wrist_workspace_context();context["nonselected_goals"][name]=value
+    with pytest.raises(ValueError):LIVE_ELBOW_WORKSPACES[RIGHT_RECIPE].qualify(context)
+
+
+def test_workspace_rest_box_versions_policy_without_rewriting_legacy_descriptor():
+    from examples.alohamini.am1_session_contract import LIVE_ELBOW_WORKSPACES, LIVE_ELBOW_WORKSPACE_POLICIES
+    legacy=LIVE_ELBOW_WORKSPACE_POLICIES["am1-right-elbow-retained-v1"]
+    original=dict(version=1,id="am1-right-elbow-retained-v1",
+        context_sha256="8766486351b401fad533f0df28032cc7fa4fb0924739b9e6b13ab41d77b59ccf",
+        evidence_min_raw=1833,evidence_max_raw=1867)
+    assert legacy.descriptor==original
+    legacy.qualify(wrist_workspace_context(2442,left_wrist_raw=1545,shoulder_pan_raw=2140))
+    with pytest.raises(ValueError):legacy.qualify(wrist_workspace_context(2444,left_wrist_raw=1547,shoulder_pan_raw=2138))
+    current=LIVE_ELBOW_WORKSPACES[RIGHT_RECIPE]
+    assert current.id=="am1-right-elbow-rest-neighbourhood-v2"
+    assert current.context_sha256!=legacy.context_sha256
+    assert len(current.descriptor)==5 and current.descriptor["version"]==1 and len(current.summary())==11
+    assert legacy.descriptor==original
+    with pytest.raises(TypeError):LIVE_ELBOW_WORKSPACE_POLICIES[current.id]=legacy
+
+
+def test_workspace_rest_box_fresh_prospective_seed_keeps_native_eleven_holds_exact(endpoint_activation,monkeypatch):
+    robot,control,identity,owner=workspace_owner(endpoint_activation,monkeypatch,
+        wrist_raw=2444,left_wrist_raw=1547,shoulder_pan_raw=2138,left_elbow_raw=2125,left_gripper_raw=3168)
+    assert control.apply(robot,frame(identity,owner,sequence=1))
+    frozen=robot._am1_live_frozen_holds
+    live=control.live_snapshot()
+    assert live["workspace"]["id"]=="am1-right-elbow-rest-neighbourhood-v2"
+    assert live["measured_origin_raw"]==1845
+    assert (live["corridor_min_raw"],live["corridor_max_raw"])==(1834,1867)
+    assert live["live_deadline_monotonic_s"]-live["live_admitted_at_monotonic_s"]==90
+    for bus,name,value,other in ((robot.right_bus,"arm_right_shoulder_pan",2138,2139),
+                               (robot.left_bus,"arm_left_wrist_flex",1547,1546),
+                               (robot.right_bus,"arm_right_wrist_roll",2444,2443),
+                               (robot.left_bus,"arm_left_elbow_flex",2125,2124),
+                               (robot.left_bus,"arm_left_gripper",3168,3167)):
+        assert bus.registers["Goal_Position",name]==value
+        bus.registers["Goal_Position",name]=other
+        with pytest.raises(RuntimeError,match="acknowledged"):
+            robot.am1_live_arm_commands({**identity,"recipe":RIGHT_RECIPE})
+        bus.registers["Goal_Position",name]=value
+    assert robot._am1_live_frozen_holds==frozen
+
+
+def test_workspace_rest_box_fresh_passive_pp_is_prospective_seed_not_old_goal():
+    from examples.alohamini.am1_session_contract import LIVE_ELBOW_WORKSPACES
+    # Three actual stopped passes: PP2125/3168 vs retained Goal2124/3167; no write occurred.
+    context=wrist_workspace_context(2444,left_wrist_raw=1547,shoulder_pan_raw=2138,
+        left_elbow_raw=2125,left_gripper_raw=3168)
+    original=copy.deepcopy(context)
+    result=LIVE_ELBOW_WORKSPACES[RIGHT_RECIPE].admission(context,1845,-7.956600361663661)
+    assert result["measured_origin_raw"]==1845 and result["admission_version"]==2
+    assert (result["corridor_min_raw"],result["corridor_max_raw"])==(1834,1867)
+    assert context==original

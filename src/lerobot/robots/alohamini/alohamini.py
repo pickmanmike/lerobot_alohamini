@@ -516,6 +516,16 @@ class AlohaMini(Robot):
             elbow_trial.disable_torque(self)
         else:
             self._am1_elbow_integral_trial = None
+        right_p20 = None
+        if getattr(self, "_am1_right_p20_trial_binding", None) is not None:
+            from .am1_elbow_integral import AM1RightElbowProportionalTrial
+            if getattr(self, "_am1_right_elbow_p_trial", None) is not None:
+                raise RuntimeError("Right P20 owner transaction cannot be reused")
+            directory = self._am1_right_p20_trial_directory
+            right_p20 = AM1RightElbowProportionalTrial(self._am1_right_p20_trial_binding, directory)
+            self._am1_right_elbow_p_trial = right_p20
+            right_p20.prepare(self)
+            right_p20.disable_torque(self)
         set_torque_enabled(self.left_bus, [n for n in self.left_bus.motors if elbow_trial is None or n != RECOVERY_ELBOW], enabled=False)
         previous_trial = getattr(self, "_am1_shoulder_integral_trial", None)
         if previous_trial is not None:
@@ -537,7 +547,8 @@ class AlohaMini(Robot):
             write_register(self.left_bus, "Operating_Mode", name, OperatingMode.VELOCITY.value)
 
         if self.right_bus:
-            set_torque_enabled(self.right_bus, self.right_bus.motors, enabled=False)
+            set_torque_enabled(self.right_bus, [n for n in self.right_bus.motors
+                                               if right_p20 is None or n != "arm_right_elbow_flex"], enabled=False)
             self._configure_bus_defaults(self.right_bus)
             for name in self.right_arm_motors:
                 if (visible_binding is not None and self.right_bus is self._selected_joint_identity()[0]
@@ -555,6 +566,8 @@ class AlohaMini(Robot):
         self._am1_shoulder_integral_trial.configure(self)
         if elbow_trial is not None:
             elbow_trial.apply(self)
+        if right_p20 is not None:
+            right_p20.apply(self)
 
     def _seed_arm_goals(self, bus: FeetechMotorsBus, motors: list[str]) -> None:
         present_positions = {
@@ -701,14 +714,16 @@ class AlohaMini(Robot):
         if pinned is not None and pinned != binding:
             raise RuntimeError("Protected Live startup binding changed")
         if not isinstance(binding, dict) or binding.get("recipe") not in (
-            "physical-live-left-elbow", "physical-live-right-elbow",
+            "physical-live-left-elbow", "physical-live-right-elbow", "physical-live-right-elbow-practical",
         ):
             return None
         from .selected_joint_evidence import live_elbow_spec
-        spec = live_elbow_spec(binding["recipe"])
+        practical_config = getattr(self, "_am1_practical_config", None)
+        spec = live_elbow_spec(binding["recipe"], practical_config)
         evidence = getattr(self, "_am1_visible_control_evidence", None)
         if (self.config.robot_model != "alohamini1" or set(binding) != {"run_id", "host_incarnation", "recipe"}
                 or evidence is None or evidence.live_spec != spec
+                or getattr(spec, "practical_motion", False) and practical_config is None
                 or any(not isinstance(binding[key], str) or str(UUID(binding[key])) != binding[key]
                        for key in ("run_id", "host_incarnation"))):
             raise RuntimeError("Protected Live startup binding is unavailable or changed")
@@ -833,6 +848,27 @@ class AlohaMini(Robot):
         return {name + ".pos": self._normalize_arm_feedback(bus, {name: goal})[name]
                 for bus, name, _, goal in frozen}
 
+    def am1_live_workspace_context(self, binding, measured):
+        """Qualify retained workspace from this sole owner's actual held-map reads."""
+        spec, frozen = self._am1_live_frozen_goal_entries(
+            binding, deadline=time.monotonic() + self.AM1_ACTIVATION_MAX_RAW_AGE_S)
+        selected = spec.joint.removesuffix(".pos")
+        position = getattr(self, "_am1_selected_joint_position", {})
+        now = time.monotonic()
+        if (type(position.get("raw")) is not int
+                or any(type(position.get(k)) not in (int, float) or not math.isfinite(position[k])
+                       for k in ("read_started_at_monotonic_s", "read_completed_at_monotonic_s"))
+                or not 0 <= position["read_started_at_monotonic_s"] <= position["read_completed_at_monotonic_s"] <= now
+                or now - position["read_started_at_monotonic_s"] > .5):
+            raise RuntimeError("Live workspace original measured acquisition is unavailable")
+        bus = getattr(self, spec.side + "_bus")
+        context = dict(robot_model=self.config.robot_model, selected_model=bus.motors[selected].model,
+                       calibrations={name: list(calibration) for _, name, calibration, _ in frozen},
+                       nonselected_goals={name: goal for _, name, _, goal in frozen if name != selected},
+                       right_pose={name + ".pos": measured.get(name + ".pos")
+                                   for _, name, _, _ in frozen if name.startswith("arm_right_") and name != selected})
+        return context, position["raw"]
+
     def _hold_am1_live_selected(self):
         deadline = time.monotonic() + self.AM1_ACTIVATION_MAX_RAW_AGE_S
         spec, frozen = self._am1_live_frozen_goal_entries(deadline=deadline)
@@ -916,6 +952,7 @@ class AlohaMini(Robot):
                 if protected:
                     seed_writes[name] = {"raw_goal": present, "write_started_at": started,
                                          "write_completed_at": time.monotonic()}
+                self._refresh_am1_startup_lift_feedback()
         for bus, present_positions in all_goals:
             for name, expected in present_positions.items():
                 actual = self._read_am1_activation_raw(bus, "Goal_Position", name, phase="seed_readback")
@@ -923,6 +960,7 @@ class AlohaMini(Robot):
                     raise RuntimeError(
                         f"AM1 arm activation refused: '{name}' measured goal readback {actual} differs from {expected}."
                     )
+                self._refresh_am1_startup_lift_feedback()
         if protected:
             self._am1_protected_live_spec()
             for bus, limits in qualified:
@@ -995,6 +1033,9 @@ class AlohaMini(Robot):
             elbow_trial = getattr(self, "_am1_elbow_integral_trial", None)
             if elbow_trial is not None:
                 elbow_trial.verify_active(self)
+            right_p20 = getattr(self, "_am1_right_elbow_p_trial", None)
+            if right_p20 is not None:
+                right_p20.verify_active(self)
             visible = getattr(self, "_am1_visible_control_evidence", None)
             if getattr(self, "_am1_visible_control_binding", None) is not None:
                 visible.verify_visible_active(self)
@@ -1059,6 +1100,10 @@ class AlohaMini(Robot):
                     elbow_trial = getattr(self, "_am1_elbow_integral_trial", None)
                     if bus is self.left_bus and name == RECOVERY_ELBOW and elbow_trial is not None:
                         elbow_trial.disable_torque(self)
+                    elif (bus is self.right_bus and name == "arm_right_elbow_flex"
+                          and getattr(self, "_am1_right_elbow_p_trial", None) is not None
+                          and self._am1_right_elbow_p_trial._created and self._am1_right_elbow_p_trial.restore_required):
+                        self._am1_right_elbow_p_trial.disable_torque(self)
                     else:
                         set_torque_enabled(bus, (name,), enabled=False)
                 except Exception as error:
@@ -1070,6 +1115,12 @@ class AlohaMini(Robot):
                 elbow_trial.restore(self)
             except BaseException as error:
                 errors.append(f"restore AM1 selected elbow integral: {type(error).__name__}: {error}")
+        right_p20 = getattr(self, "_am1_right_elbow_p_trial", None)
+        if right_p20 is not None:
+            try:
+                right_p20.restore(self)
+            except BaseException as error:
+                errors.append(f"restore AM1 right elbow proportional: {type(error).__name__}: {error}")
         integral_trial = getattr(self, "_am1_shoulder_integral_trial", None)
         if integral_trial is not None:
             try:
@@ -1119,9 +1170,12 @@ class AlohaMini(Robot):
             evidence["selected_gain_restore_required"] = bool(
                 (integral_trial is not None and integral_trial.restore_required)
                 or (elbow_trial is not None and elbow_trial.restore_required)
+                or (right_p20 is not None and right_p20.restore_required)
             )
             if elbow_trial is not None:
                 evidence["elbow_integral"] = elbow_trial.evidence
+            if right_p20 is not None:
+                evidence["right_p20_trial"] = right_p20.evidence
             evidence["completed_at_monotonic_s"] = time.monotonic()
             evidence["verified"] = not errors
 
@@ -1335,6 +1389,23 @@ class AlohaMini(Robot):
             raw_positions.update(raw)
         return self._normalize_arm_feedback(bus, raw)
 
+    def _am1_relative_target_cap(self, key):
+        cap = self.config.max_relative_target
+        if isinstance(cap, dict):
+            cap = cap[key]
+        practical = getattr(self, "_am1_practical_config", None)
+        binding = getattr(self, "_am1_visible_control_binding", None) or {}
+        if (cap is not None and practical is not None and self.config.robot_model == "alohamini1"
+                and binding.get("recipe") == practical.spec.recipe and key == practical.spec.joint):
+            workspace = practical.workspace
+            # Allow the declared physical twenty-degree corridor from any
+            # admitted measured margin. This is local to the selected elbow;
+            # the ordinary relative caps and absolute workspace remain intact.
+            distance = max(workspace.command_max_raw - workspace.measured_min_raw,
+                           workspace.measured_max_raw - workspace.command_min_raw)
+            cap = max(cap, distance * 200 / 2212)
+        return cap
+
     def _encode_am1_arm_goals(
         self, bus: FeetechMotorsBus, goals: dict[str, float], present_raw: dict[str, int],
     ) -> tuple[dict[str, float], dict[str, int] | None]:
@@ -1372,9 +1443,7 @@ class AlohaMini(Robot):
                 raw_goals[model.id] = round(raw_hold)
             if self.config.max_relative_target is None:
                 continue
-            cap = self.config.max_relative_target
-            if isinstance(cap, dict):
-                cap = cap[key]
+            cap = self._am1_relative_target_cap(key)
             if mode is MotorNormMode.DEGREES:
                 ticks_per_unit = (bus.model_resolution_table[model.model] - 1) / 360
             else:
@@ -1407,6 +1476,7 @@ class AlohaMini(Robot):
     def get_observation(self) -> RobotObservation:
         # Read actuators position for arm and vel for base
         observation_start_t = time.perf_counter()
+        arm_read_started = time.monotonic()
         # arm_pos = self.left_bus.sync_read("Present_Position", self.arm_motors)
 
         #print(f"Left arm motors: {self.left_arm_motors}, Right arm motors: {self.right_arm_motors}")  # debug
@@ -1459,6 +1529,9 @@ class AlohaMini(Robot):
         right_arm_state = {f"{k}.pos": v for k, v in right_pos.items()}
 
         obs_dict = {**left_arm_state, **right_arm_state,**base_vel}
+        if (getattr(self,"_am1_visible_control_binding",None) or {}).get("recipe")=="physical-live-right-elbow":
+            self._am1_workspace_observation = dict(positions={**left_arm_state,**right_arm_state},
+                read_started_at=arm_read_started, read_completed_at=time.monotonic())
         operation = getattr(self, "_lift_operation", None)
         if operation is not None:
             try:
@@ -1567,7 +1640,7 @@ class AlohaMini(Robot):
                 self.left_bus, self.left_arm_motors, raw_positions=present_left_raw,
             )
             gp_left = {k: (v, present_left[k.replace(".pos", "")]) for k, v in left_pos.items()}
-            left_pos = ensure_safe_goal_position(gp_left, self.config.max_relative_target)
+            left_pos = ensure_safe_goal_position(gp_left, {key: self._am1_relative_target_cap(key) for key in gp_left})
 
         if self.right_bus and right_pos and self.config.max_relative_target is not None:
             present_right = self._read_arm_positions(
@@ -1575,7 +1648,7 @@ class AlohaMini(Robot):
             )
             right_wrist_observed = present_right.get("arm_right_wrist_flex")
             gp_right = {k: (v, present_right[k.replace(".pos", "")]) for k, v in right_pos.items()}
-            right_pos = ensure_safe_goal_position(gp_right, self.config.max_relative_target)
+            right_pos = ensure_safe_goal_position(gp_right, {key: self._am1_relative_target_cap(key) for key in gp_right})
         relative_limit_done_t = time.perf_counter()
         selected_relative = {**left_pos, **right_pos}.get(selected_key) if selected else None
 
@@ -1777,10 +1850,22 @@ class AlohaMini(Robot):
         if trace_shoulder:
             self._am1_left_shoulder_feedback = {"feedback_available": False}
         try:
+            practical_current_started = time.monotonic()
             if trace_shoulder:
                 current_started = time.monotonic()
                 current_wall_started = time.time_ns()
             currents_raw = bus.sync_read("Present_Current", target_motors)
+            # The practical selected ceiling reuses this current acquisition,
+            # before a position read or eventual goal write can obscure a trip.
+            evidence = getattr(self, "_am1_visible_control_evidence", None)
+            if evidence is not None and getattr(getattr(evidence, "_live_definition", None), "practical_motion", False):
+                selected_bus, selected_motor, _ = self._selected_joint_identity()
+                if bus is selected_bus and selected_motor in currents_raw:
+                    selected_raw = int(currents_raw[selected_motor])
+                    evidence.check_visible_current(self, selected_raw, current_limit_ma,
+                        source="command_current_limiter", sample={"raw": selected_raw, "ma": selected_raw * 6.5,
+                        "read_started_at_monotonic_s": practical_current_started,
+                        "read_completed_at_monotonic_s": time.monotonic()})
             if trace_shoulder:
                 current_completed = time.monotonic()
                 position_started = time.monotonic()
@@ -1806,6 +1891,8 @@ class AlohaMini(Robot):
             else:
                 present_pos = self._read_arm_positions(bus, target_motors)
         except Exception as e:
+            if (getattr(self, "_am1_selected_joint_fault", None) or {}).get("source") == "command_current_limiter":
+                raise
             if trace_shoulder:
                 self._am1_left_shoulder_feedback = {
                     "feedback_available": False,

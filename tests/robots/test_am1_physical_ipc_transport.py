@@ -29,7 +29,7 @@ BODY = {"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0, "lift_axis.vel": 0.0}
 
 @pytest.mark.parametrize("recipe,side,origin_raw,offset,range_min,range_max,phase", [
     ("physical-live-left-elbow", "left", 2000, 1845, 1000, 3000, 17),
-    ("physical-live-right-elbow", "right", 1933, -658, 827, 3039, 12),
+    ("physical-live-right-elbow", "right", 1845, -658, 827, 3039, 12),
 ])
 def test_live_fixture_admission_uses_actual_settings_guard(
     recipe, side, origin_raw, offset, range_min, range_max, phase
@@ -56,9 +56,9 @@ def test_live_fixture_admission_uses_actual_settings_guard(
     assert settings["Phase"] == phase
     bus = getattr(robot, side + "_bus")
     assert len(bus.port_handler.writes) == 4
-    assert control.live_snapshot()["reference_norm"] == 0.0
+    assert control.live_snapshot()["reference_norm"] == (0.0 if side=="left" else (1845-827)/2212*200-100)
     assert (control.live_snapshot()["corridor_min_norm"], control.live_snapshot()["corridor_max_norm"]) == (
-        (-10.0, 0.0) if side == "left" else (-3.0, 0.0)
+        (-10.0, 0.0) if side == "left" else ((1834-827)/2212*200-100, (1867-827)/2212*200-100)
     )
     assert bus._unnormalize({3: 1.0})[3] == (2010 if side == "left" else 1944)
     assert bus._unnormalize({3: -1.0})[3] == (1990 if side == "left" else 1921)
@@ -198,6 +198,18 @@ class InjectedLiveMotorHardware(InjectedMotorHardware):
                                       else (-658, 827, 3039))
         self.torque_enabled = 0
         self.goal_raw = self.present_raw = (range_min + range_max) // 2
+        if self.live_spec.side == "right":
+            from tests.robots.test_am1_live_native import WORKSPACE_CALIBRATION, WORKSPACE_GOALS
+            self.fixture_workspace_calibrations = dict(WORKSPACE_CALIBRATION)
+            self.fixture_workspace_goals = dict(WORKSPACE_GOALS)
+            self.fixture_frozen_workspace_goals = dict(WORKSPACE_GOALS)
+            self.goal_raw = self.present_raw = 1845
+            for name, raw in WORKSPACE_GOALS.items():
+                calibration = WORKSPACE_CALIBRATION[name]
+                fraction = (raw-calibration[3])/(calibration[4]-calibration[3])
+                norm = fraction*100 if name.endswith("_gripper") else fraction*200-100
+                self.fixture_acknowledged_arm_commands[name+".pos"] = norm
+                self.measured[name+".pos"] = norm
         self.current_raw = 0
         self.register_bytes = {}
         self._joint_current_limit_ma = 1800.0
@@ -230,6 +242,14 @@ class InjectedLiveMotorHardware(InjectedMotorHardware):
         if identity != self._am1_visible_control_binding:
             raise RuntimeError("simulated accepted goal binding differs")
         return dict(self.fixture_acknowledged_arm_commands)
+
+    def am1_live_workspace_context(self, identity, measured):
+        if identity != self._am1_visible_control_binding or self.fixture_workspace_goals != self.fixture_frozen_workspace_goals:
+            raise RuntimeError("Live workspace simulated current raw hold binding differs")
+        return dict(robot_model=self.config.robot_model, selected_model="sts3215",
+                    calibrations={k:list(v) for k,v in self.fixture_workspace_calibrations.items()},
+                    nonselected_goals={k:v for k,v in self.fixture_workspace_goals.items() if k!="arm_right_elbow_flex"},
+                    right_pose={k:measured[k] for k in measured if k.startswith("arm_right_") and k!=self.live_spec.joint}), self.present_raw
 
     def connect(self, *, home_lift):
         super().connect(home_lift=home_lift)

@@ -1,3 +1,28 @@
+## AM1-LIVE-REUSE-11: qualified re-jog and retained workspace
+
+PR22 is integrated at `5016bc9850d0a37bc12b8244ad832f0214cc8d96` into
+`integrate/am1-local-teleop`. The Packet11 follow-up remains unmerged.
+[The current report](live-reuse-11.md) records use, exact deployments and rollback.
+
+| Capability | Current evidence |
+|---|---|
+| Voluntary release -> new deliberate press | Qualified rearm implemented/software-tested for both selections; no extra Resume click in this case |
+| Right workspace reuse | Actual1845 admitted in fixed inward1834..1867 in two physical runs; q0 stays independent |
+| Useful repeated physical movement | Unqualified: both acknowledged endpoint commands measured0 in full response windows |
+| Physical ordinary re-jog/reattachment | Not reached after zero first-leg response |
+| Final short next Start | Failed before Live: actual right shoulder2138 outside fixed2141+/-1; both corrected lift off windows passed |
+| Available idle | Final native/enrolled-page checks passed; known actual10 cleanup/history retained, no new motor task |
+
+One pending renewal/1s abort and qualified fresh Claim/Resume preserve current
+authority; no late reply or old gesture replay. Original250ms target expiry,90s
+Live deadline, local sensing, rate/current/motion limits and11 actual held Goals
+remain. Fresh P1 stationary imagery is advisory. Main and AM2 are unchanged.
+Service startup never starts/replays motors. Physical-response exception is
+reported explicitly; software checks do not supply physical acceptance.
+Earlier Packet10/09 sections remain historical at their recorded source versions.
+Durability means software fault tolerance, connection/control continuity, preserved
+state and recovery with minimal human intervention, not mechanical wear.
+
 ## AM1-LIVE-ARMS-10: one selected live elbow
 
 The [Packet10 guide](live-arms-10.md) records the implemented left/right choice,

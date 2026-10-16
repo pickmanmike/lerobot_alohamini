@@ -20,8 +20,11 @@ import json
 import logging
 import math
 import os
+import queue
 import signal
 import stat
+import sys
+import threading
 import time
 from collections import deque
 from collections.abc import Callable
@@ -35,7 +38,7 @@ import zmq
 from .alohamini import AlohaMini
 from .config_alohamini import AlohaMiniConfig, AlohaMiniHostConfig
 from .model_specs import arm_state_keys_for_robot_model
-from .selected_joint_evidence import MARKER as AM1_SELECTED_JOINT_EVIDENCE_KEY, AM1SelectedJointEvidence, live_elbow_spec
+from .selected_joint_evidence import MARKER as AM1_SELECTED_JOINT_EVIDENCE_KEY, AM1SelectedJointEvidence, live_elbow_spec, live_elbow_workspace
 
 AM1_LOCAL_CONTROL_KEY = "_am1_local_control"
 AM1_LOCAL_FEEDBACK_KEY = "_am1_local_feedback"
@@ -51,12 +54,115 @@ class AM1LiveInputExpired(Exception):
     """An acknowledged native release, distinct from every motor/feedback fault."""
 
 
+class AM1RoutineRecordWriter:
+    """Practical-mode stdout work only; the worker receives immutable bytes, never hardware."""
+
+    def __init__(self, *, write=None, capacity=128):
+        if type(capacity) is not int or not 1 <= capacity <= 128:
+            raise ValueError("Routine log capacity must be bounded to 1..128 records")
+        self._queue = queue.Queue(maxsize=capacity)
+        self._failure = None
+        self._failure_lock = threading.Lock()
+        self._closed = False
+        self._fd = os.dup(sys.stdout.fileno()) if write is None else None
+        self._write = write if write is not None else lambda data: os.write(self._fd, data)
+        self._thread = threading.Thread(target=self._run, name="am1-routine-log", daemon=True)
+        self._thread.start()
+
+    def _latch(self, error):
+        with self._failure_lock:
+            if self._failure is None:
+                self._failure = error
+
+    def raise_if_failed(self):
+        if self._failure is not None:
+            raise self._failure
+
+    def submit(self, prefix, record):
+        """Freeze the original record; a full/failed sink never waits on the owner."""
+        try:
+            return self.submit_line(prefix + json.dumps(record, allow_nan=False, separators=(",", ":")))
+        except BaseException as error:
+            self._latch(error)
+        return False
+
+    def submit_line(self, line, *, flush=True):
+        """The same bounded sink for already-formatted routine and exit reports."""
+        if self._closed or self._failure is not None:
+            return False
+        try:
+            line = (line + "\n").encode()
+            if len(line) > 32768:
+                raise ValueError("Routine log record exceeds 32768 bytes")
+            self._queue.put_nowait(line)
+            return True
+        except queue.Full:
+            self._latch(RuntimeError("AM1 routine log queue full"))
+        except BaseException as error:
+            self._latch(error)
+        return False
+
+    def _run(self):
+        try:
+            while not self._closed or not self._queue.empty():
+                try:
+                    line = self._queue.get(timeout=.05)
+                except queue.Empty:
+                    continue
+                try:
+                    offset = 0
+                    while offset < len(line):
+                        count = self._write(line[offset:])
+                        if type(count) is not int or not 0 < count <= len(line) - offset:
+                            raise OSError("Routine log write made invalid progress")
+                        offset += count
+                finally:
+                    self._queue.task_done()
+        except BaseException as error:
+            self._latch(error)
+        finally:
+            if self._fd is not None:
+                os.close(self._fd)
+
+    def emit_selected(self, record):
+        prefix = "[AM1 SELECTED SETTINGS] " if record.get("kind") == "visible_settings" else "[AM1 SELECTED JOINT] "
+        self.submit(prefix, record)
+
+    def emit_lift(self, record):
+        record = {key: value for key, value in record.items() if key != "comparison_profile"}
+        self.submit("[LIFT OPERATIONAL] ", {**record,
+            "policy": "am1-confirmed-temperature-slots-relief-v2", "wall_time_ns": time.time_ns()})
+
+    def emit_lift_samples(self, operation):
+        # Only the existing routine batch changes sink. Fault/transition emits
+        # retain their existing path, and no operation object reaches the worker.
+        original = operation.emit
+        try:
+            operation.emit = self.emit_lift
+            operation.emit_pending_sample()
+        finally:
+            operation.emit = original
+
+    def close(self, *, timeout=2.0):
+        if not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or not 0 < timeout <= 2:
+            raise ValueError("Routine log drain needs a finite bound of at most two seconds")
+        self._closed = True
+        self._thread.join(timeout)
+        if self._thread.is_alive():
+            error = TimeoutError("AM1 routine log drain exceeded its finite bound")
+            self._latch(error)
+            if self._failure is not error:
+                self._failure.add_note(str(error))
+        self.raise_if_failed()
+
+
 class AM1LocalControl:
     """AM1-only host-side pause latch on the existing motor-owner thread."""
 
     def __init__(self, *, run_id: str | None = None, host_incarnation: str | None = None,
                  selected_evidence: AM1SelectedJointEvidence | None = None,
-                 live: bool = False, live_recipe: str = AM1_LIVE_RECIPE, clock: Callable[[], float] = time.monotonic) -> None:
+                 live: bool = False, live_recipe: str = AM1_LIVE_RECIPE, practical_config=None,
+                 clock: Callable[[], float] = time.monotonic) -> None:
         if (run_id is None) != (host_incarnation is None):
             raise ValueError("AM1 protected control requires both run and host identity")
         self.binding = None if run_id is None else {
@@ -70,9 +176,12 @@ class AM1LocalControl:
         self.observation_id = 0
         self.selected_evidence = selected_evidence
         self.live = live
-        self.live_spec = live_elbow_spec(live_recipe) if live else None
+        self.practical_config = practical_config
+        self.live_spec = live_elbow_spec(live_recipe, practical_config) if live else None
         if live and self.live_spec is None:
             raise ValueError("Live native recipe is not allowlisted")
+        if live and getattr(self.live_spec, "practical_motion", False) and practical_config is None:
+            raise ValueError("Practical native control requires its consumed configuration")
         self.clock = clock
         self.live_binding = None
         self.live_sample = None
@@ -144,6 +253,7 @@ class AM1LocalControl:
                                   cursor_feedback_sequence=self.observation_id,
                                   cursor_intent_revision=self.intent_revision)
         self.live_cursor_at = self.clock()
+        return measured
 
     def _apply_live(self, robot: AlohaMini, command: dict) -> bool:
         marker = command.get(AM1_LOCAL_CONTROL_KEY)
@@ -222,20 +332,31 @@ class AM1LocalControl:
                 self._live_summary["last_input_seq"] = -1
             self._live_summary["state"] = "held"
             self._clear_live_write_proof()
-            self._refresh_live_cursor(robot)
+            measured = self._refresh_live_cursor(robot)
             if marker["live_admitted"] and "live_admitted_at_monotonic_s" not in self._live_summary:
                 now = self.clock()
                 q0 = self.live_held[self.live_spec.joint]
                 low = q0 + self.live_spec.corridor_min_delta_norm
                 high = q0 + self.live_spec.corridor_max_delta_norm
-                if not -100 <= low <= high <= 100:
+                if self.practical_config is None and not -100 <= low <= high <= 100:
                     raise RuntimeError("Live measured origin cannot contain its selected corridor")
-                self._live_summary.update(reference_norm=q0, corridor_min_norm=low,
-                    corridor_max_norm=high, side=self.live_spec.side, label=self.live_spec.label,
+                workspace = live_elbow_workspace(self.live_spec.recipe, self.practical_config)
+                geometry = dict(corridor_min_norm=low, corridor_max_norm=high)
+                if workspace is not None:
+                    if not callable(getattr(robot, "am1_live_workspace_context", None)):
+                        raise RuntimeError("Live workspace actual native context is unavailable")
+                    context, raw = robot.am1_live_workspace_context(
+                        {**self.binding, "recipe": self.live_spec.recipe}, measured)
+                    try:
+                        geometry = workspace.admission(context, raw, q0)
+                    except ValueError as exc:
+                        raise RuntimeError(str(exc)) from exc
+                self._live_summary.update(reference_norm=q0, **geometry,
+                    side=self.live_spec.side, label=self.live_spec.label,
                     profile=self.live_spec.profile, rate_norm_per_s=self.live_spec.rate_norm_per_s,
                     live_admitted_at_monotonic_s=now, live_deadline_monotonic_s=now + self.live_spec.live_s)
                 if self.selected_evidence is not None:
-                    self.selected_evidence.admit_live(robot, self._live_summary)
+                    self.selected_evidence.admit_live(robot, self._live_summary, measured=measured)
             return True
         if self.live_held is None or "live_deadline_monotonic_s" not in self._live_summary:
             return False
@@ -858,10 +979,10 @@ class HostCommandState:
         return f"[HOST CADENCE] {json.dumps(snapshot, separators=(',', ':'))}"
 
 
-def print_cadence_report(command_state: HostCommandState) -> None:
+def print_cadence_report(command_state: HostCommandState, *, emit=None) -> None:
     report = command_state.format_report()
     if report is not None:
-        print(report, flush=True)
+        (print if emit is None else emit)(report, flush=True)
 
 
 class AM1HostLoopTiming:
@@ -1228,6 +1349,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--am1-host-incarnation")
     parser.add_argument("--am1-cleanup-receipt")
     parser.add_argument("--am1-selected-experiment-file")
+    parser.add_argument("--am1-right-p20-trial-file")
     parser.add_argument("--am1-admission-fd", type=int)
     parser.add_argument("--am1-host-runtime-s", type=int, default=480)
     parser.add_argument("--am1-physical-state-directory", default=str(Path.home() / ".local/state/am1-session"))
@@ -1333,6 +1455,25 @@ def visible_control_binding(args):
     return dict(binding, experiment_sha256=definition.sha256)
 
 
+def right_p20_trial_binding(args, visible_binding):
+    path = getattr(args, "am1_right_p20_trial_file", None)
+    if path is None:
+        return None
+    from .am1_elbow_integral import RIGHT_P20_RECIPE, PRACTICAL_RECIPE, load_right_p20_binding
+    recipe = None if visible_binding is None else visible_binding.get("recipe")
+    expected = dict(run_id=args.am1_run_id, host_incarnation=args.am1_host_incarnation, recipe=recipe)
+    if (visible_binding != expected or args.robot_model != "alohamini1" or args.no_follower or not args.no_cameras
+            or recipe not in (RIGHT_P20_RECIPE, PRACTICAL_RECIPE)
+            or not getattr(args, "am1_protected_run_directory", None)
+            or os.environ.get("AM1_SCRIPTED_PREPARE") != "1" or os.environ.get("AM1_SELECTED_JOINT_EVIDENCE") != "1"
+            or os.environ.get("AM1_ELBOW_RECOVERY") is not None or os.environ.get("AM1_SHOULDER_INTEGRAL_TEST") == "1"):
+        raise ValueError("Right P20 file requires its exact isolated protected right-live owner")
+    binding = load_right_p20_binding(path, args.am1_protected_run_directory, args.am1_run_id, args.am1_host_incarnation)
+    if (binding["kind"] == "practical13-right") != (recipe == PRACTICAL_RECIPE):
+        raise ValueError("Right trial file differs from its selected recipe")
+    return binding
+
+
 def elbow_recovery_binding(args):
     """Only a reviewed protected recipe can select the owner-scoped ID3 trial."""
     integral = os.environ.get("AM1_ELBOW_RECOVERY")
@@ -1361,6 +1502,14 @@ def _run_host(args):
     _validate_host_arguments(args)
     visible_binding = visible_control_binding(args)
     recovery_binding = elbow_recovery_binding(args)
+    right_p20_binding = right_p20_trial_binding(args, visible_binding)
+    practical_config = None
+    if right_p20_binding is not None and right_p20_binding["kind"] == "practical13-right":
+        from examples.alohamini.am1_session_contract import PracticalElbowConfig
+        practical_config = PracticalElbowConfig.from_payload(right_p20_binding["request"]["config"])
+    if (visible_binding is not None and visible_binding["recipe"] == "physical-live-right-elbow-practical"
+            and practical_config is None):
+        raise ValueError("Practical owner requires its fresh consumed trial configuration")
 
     logging.info("Configuring AlohaMini")
     robot_config = make_robot_config(args)
@@ -1370,6 +1519,11 @@ def _run_host(args):
     args._am1_robot = robot
     # Every admitted AM1 owner needs actual cleanup proof, including legacy CLI.
     robot._am1_protected_cleanup = args.robot_model == "alohamini1"
+    if right_p20_binding is not None:
+        robot._am1_right_p20_trial_binding = right_p20_binding
+        robot._am1_right_p20_trial_directory = args.am1_protected_run_directory
+    if practical_config is not None:
+        robot._am1_practical_config = practical_config
     left_shoulder_evidence = AM1LeftShoulderEvidence(
         enabled=(os.environ.get("AM1_LEFT_SHOULDER_EVIDENCE") == "1"
                  and args.robot_model == "alohamini1" and not args.no_follower),
@@ -1447,6 +1601,7 @@ def _run_host(args):
             selected_evidence=selected_evidence,
             live=visible_binding is not None and live_elbow_spec(visible_binding["recipe"]) is not None,
             live_recipe=AM1_LIVE_RECIPE if visible_binding is None else visible_binding["recipe"],
+            practical_config=practical_config,
         )
         if args.robot_model == "alohamini1" and not args.no_follower
         else None
@@ -1461,9 +1616,16 @@ def _run_host(args):
     )
     fault_loop_context = None
     fault_loop_context_error = None
+    routine_writer = None
+    routine_report = print
+    exit_message = None
     logging.info("Waiting for commands...")
 
     try:
+        if practical_config is not None:
+            routine_writer = AM1RoutineRecordWriter()
+            selected_evidence.emit = routine_writer.emit_selected
+            routine_report = routine_writer.submit_line
         # One final same-owner startup boundary before ordinary loop timing.
         # Only a due genuine read can refresh the retained original thermal slots.
         if (
@@ -1482,6 +1644,8 @@ def _run_host(args):
         lift_diagnostics_report_start_t = cadence_report_start_t
 
         while duration < host.connection_time_s:
+            if routine_writer is not None:
+                routine_writer.raise_if_failed()
             if local_control is not None and not local_control.check_live(robot):
                 break
             loop_start_t = time.perf_counter()
@@ -1579,7 +1743,10 @@ def _run_host(args):
                         [request_identity, request_token, *observation_parts], flags=zmq.NOBLOCK
                     )
                 except zmq.Again:
-                    logging.info("Dropping observation response, client is not ready")
+                    if routine_writer is None:
+                        logging.info("Dropping observation response, client is not ready")
+                    else:
+                        routine_report("Dropping observation response, client is not ready")
             response_send_done_t = time.perf_counter()
             if loop_timing is not None:
                 loop_timing.mark("sample_log", response_send_done_t)
@@ -1588,7 +1755,10 @@ def _run_host(args):
             # margin between this tick's grouped read and action/observation use.
             # A slow sink still counts toward the next poll's unchanged deadline.
             if lift_operation is not None:
-                lift_operation.emit_pending_sample()
+                if routine_writer is None:
+                    lift_operation.emit_pending_sample()
+                else:
+                    routine_writer.emit_lift_samples(lift_operation)
 
             # Bounded sparse readbacks share the owner after ordinary control and
             # response delivery. Their full time still counts toward next poll.
@@ -1603,7 +1773,7 @@ def _run_host(args):
                 args.profile_lift_diagnostics
                 and lift_diagnostics_now - lift_diagnostics_report_start_t >= 1.0
             ):
-                print(format_lift_diagnostic_report(robot, last_observation), flush=True)
+                routine_report(format_lift_diagnostic_report(robot, last_observation), flush=True)
                 lift_diagnostics_report_start_t = lift_diagnostics_now
                 lift_diagnostics_done_t = time.perf_counter()
             if loop_timing is not None:
@@ -1646,7 +1816,7 @@ def _run_host(args):
                     for name, value in averages.items()
                     if name.startswith("camera_")
                 )
-                print(
+                routine_report(
                     f"[HOST TIMING avg ms/loop] Hz={timing_loop_count / timing_elapsed_s:.1f} "
                     f"cmd={averages['command']:.1f} robot_obs={averages['robot_observation']:.1f} "
                     f"left={averages.get('left_arm', 0.0):.1f} base={averages.get('base', 0.0):.1f} "
@@ -1661,7 +1831,7 @@ def _run_host(args):
                         name: total_ms / timing_command_count
                         for name, total_ms in action_timing_totals_ms.items()
                     }
-                    print(
+                    routine_report(
                         f"[HOST ACTION avg ms/command] n={timing_command_count} "
                         f"prepare={action_averages.get('action_prepare', 0.0):.1f} "
                         f"lift={action_averages.get('action_lift', 0.0):.1f} "
@@ -1684,7 +1854,10 @@ def _run_host(args):
 
             cadence_now = time.monotonic()
             if args.profile_cadence and cadence_now - cadence_report_start_t >= 1.0:
-                print_cadence_report(command_state)
+                if routine_writer is None:
+                    print_cadence_report(command_state)
+                else:
+                    print_cadence_report(command_state, emit=routine_report)
                 if sync_shoulder_readback and local_control is not None and local_control.state == "ready":
                     print_startup_shoulder_report(robot, command_state, last_observation)
                 if left_shoulder_evidence.enabled and loop_timing is not None:
@@ -1698,12 +1871,12 @@ def _run_host(args):
             if loop_timing is not None:
                 loop_timing.finish(time.perf_counter())
         if local_control is not None and local_control.live and local_control.state == "stopped":
-            print("Owned Live Stop received.")
+            exit_message = "Owned Live Stop received."
         elif (local_control is not None and local_control.live
               and local_control.live_snapshot().get("state") == "budget_expired"):
-            print("Live time budget expired.")
+            exit_message = "Live time budget expired."
         else:
-            print("Cycle time reached.")
+            exit_message = "Cycle time reached."
 
     except KeyboardInterrupt:
         interrupted_motor_io = True
@@ -1742,11 +1915,16 @@ def _run_host(args):
         # Every exit message is after zero/off and socket cleanup. A blocked
         # or failed sink must never delay the protective motor requests.
         try:
+            if exit_message is not None:
+                routine_report(exit_message)
             if keyboard_interrupted:
-                print("Keyboard interrupt received. Exiting...")
-            print("Shutting down AlohaMini Host.")
+                routine_report("Keyboard interrupt received. Exiting...")
+            routine_report("Shutting down AlohaMini Host.")
             if args.profile_cadence:
-                print_cadence_report(command_state)
+                if routine_writer is None:
+                    print_cadence_report(command_state)
+                else:
+                    print_cadence_report(command_state, emit=routine_report)
         except BaseException as error:
             cleanup_errors.append(("shutdown reporting", error))
 
@@ -1761,9 +1939,17 @@ def _run_host(args):
         lift_operation = getattr(robot, "_lift_operation", None)
         if lift_operation is not None:
             try:
-                lift_operation.emit_pending_sample()
+                if routine_writer is None:
+                    lift_operation.emit_pending_sample()
+                else:
+                    routine_writer.emit_lift_samples(lift_operation)
             except BaseException as error:
                 cleanup_errors.append(("pending lift sample", error))
+        if routine_writer is not None:
+            try:
+                routine_writer.close(timeout=2.0)
+            except BaseException as error:
+                cleanup_errors.append(("routine log writer drain", error))
 
         args._am1_cleanup_errors = [
             f"{operation}: {type(error).__name__}: {error}" for operation, error in cleanup_errors

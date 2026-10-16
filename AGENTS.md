@@ -1,3 +1,155 @@
+## Current AM1 Packet13 verified operation
+
+Packet13 completed useful repeated right-elbow control and a working next Start.
+See [the measured results and ordinary recipe](docs/alohamini/practical-motion-13.md).
+Use the demonstrated P16/I0/D32, 10-degree client target recipe; larger amplitudes
+and P24/P32 were not needed or physically qualified. Batch reference1847 remains
+fixed while each run measures its own q0. Exact/fine return is not a Start gate.
+Preserve original expiry/deadline and qualified current gestures on re-jog/rejoin.
+Routine logs must not block the motor loop or zero/off cleanup. Keep source,
+motor/runtime/camera/helper pins and full rollback separate; services start idle.
+PR23 is draft/unmerged. All historical results and consumed requests below remain
+unchanged. Durability means software fault tolerance, connection/control continuity,
+state preservation and recovery; no hardware wear campaign is included.
+
+## Active AM1-PRACTICAL-MOTION-13 scope
+
+The owner explicitly invoked Packet13. It supersedes historical micro-motion
+span/q0 diagnostic limits, 100/150mA experimental ceilings, standalone low-current
+trend veto and single-comparison restriction ONLY in the selected practical-right
+mode. Keep prior results below unchanged. PR23 remains draft/unmerged.
+
+Use one compact plan, one existing parameterized runner/configuration and the
+existing owner/transaction/browser/observer/stager. Frozen batch reference;
+10-degree P16 command/return first at about5degrees/s,20degrees onlyifinsufficient;
+P24 thenP32 onlyasneeded atsamegeometry. Max20degreesone-sided, I0/D32 andfirmware
+settingsretained; volatilechangesverifiedrestored beforeoriginalLockstate.
+Provisionalselectedhostabort500mA onlyifhardware/supplyconsistent andnolowerlimit.
+Three-riseslowcurrent/staticposition becomes exactzeroreaddiagnostic onlyinmode.
+Retain singleowner/freshfeedback/status/thermal/voltage/calibratedlimits/growing
+instability/250msexpiry/Stop protections. Session180s (absolute max300), no renewal
+onrejoin. Other11actualGoals hold, body/liftzeroafternormalstartup.
+
+Findusefulvisiblemotion, stopstimulusincrease, thenrepetition/ordinaryre-jog/
+reattachment/normalrestart usingworkingrecipe. Healthy noresponse mayadvance
+approvedstep; atruefaultendsattempt andrequiresanalysis, notautomaticactivation.
+Oldconsumednoncesremainspent. No flagclearing ofuncertainty/restoration obligation.
+
+Usefocusedaffectedchecks andoneindependentsourcereviewperenforcementchange;
+onecomponentstagingpasspercodechange, no per-numbercommit/audit/reviewladder.
+AM1wireless/P1advisory/AM2untouched, no genericreadiness/leader/shoulderquestions,
+network tuning/new architecture/cutoffhardware/endurancecampaign. Rootalone
+Git/SSH/deployment/hardware; agentsofflinewithdisjointfiles. Durabilitymeans
+softwarefaulttolerance,connection/controlcontinuity,statepreservationandrecovery.
+
+## Current AM1-RESPONSE-12 result and remaining boundary
+
+Packet12 continued PR23 only; it remains draft and unmerged. See
+[the consolidated evidence](docs/alohamini/response-12.md). Preserve all
+Packet11 and earlier outcomes below at their recorded source versions.
+
+Fixed policy am1-right-elbow-rest-neighbourhood-v2 now admits the supported
+actual rest without historical pose commands. All eleven actual held Goals
+remain exact within a run. Fresh q0 stays separate from fixed command1834..1867;
+rate<=1, sampled150mA, q0+/-3, original250ms expiry and90s deadline remain.
+
+The permitted rightID3/FW3.10 P16->20 comparison is consumed. First setup db4b
+applied P20 in hold but stopped on the obsolete private v1 assertion before
+accepted input; original P16/Lock0 restoration is verified. Its exact nonce was
+explicitly archived after review and is permanently rejected by the installed
+consumer. Replacement aa3f admitted q01845, moved+4/-8raw and re-jogged after
+ordinary release; a later post-reattachment leg faulted on the unchanged local
+static-current-rise guard. Its final rejected sample was not logged. Retain the
+host cause and outer feedback_loss separately; do not infer a network fault,
+obstruction or software false positive. P16 was restored before originalLock0.
+
+Normal P16 next Start fc1f admitted fresh q01847 and finished known cleanup;
+its918ms gesture produced0raw movement. Startup reuse and useful movement are
+separate results. Repeated ordinary useful control remains unqualified.
+No additional P20 comparison, gain sweep, guard relaxation, permanent tuning
+or merge is authorized by the consumed comparison.
+
+Installed executable3409ce344c36944e18812134548f83b517f4837d:
+motor ce8d8c1ad0470d0660d7bffeff397948e4341f78,
+runtime0e1ef30a5322b2675e317ae7f92828db5f5633f7,
+manifest40c8ceea73fb6c49ecc3cab7432f2406cc72d2c7a5f2eaa08346843db0290f29.
+Immediate FULL matched rollback674fb45328eef574b8598455a753e3ccf81845d3 /
+9d6d173c6f600c30be83bc756d69b41d3da02ffb /
+6df3eefd9bafa3b9d19a453bc3e6ee72788052c2c8a394f0b6d4a39897c2f13b.
+The original e743/b4ec/1b6e checkpoint and older pairs remain retained.
+
+Available idle was verified after fc1f; runner config is PENDING. Startup never
+starts/replays motors. Root alone operates Git/SSH/staging/hardware; agents use
+disjoint offline scopes. Preserve helper/camera/manual pins, calibration,
+private state/permissions and history. AM1 wireless, P1 advisory, AM2 untouched.
+Durability means software fault tolerance, connection/control continuity,
+preserved state and recovery. No generic inspection, historical pose/leader/
+readiness question, network tuning or hardware-wear campaign is included.
+
+## Active AM1-LIVE-REUSE-11 result and continuing boundary
+
+PR22 integrated normally into integrate/am1-local-teleop at
+5016bc9850d0a37bc12b8244ad832f0214cc8d96; main is unchanged. The Packet11
+follow-up remains unmerged; no merge of it is authorized. See
+docs/alohamini/live-reuse-11.md for ordinary use, source-specific evidence and limits.
+Packet10/09 sections below are historical. Packet11 supersedes their restriction
+only for PR22/the named target and its new qualified ordinary-release/workspace use.
+
+One selected elbow receives current browser targets through the existing sole
+owner/protected backend. Left q0-10..q0 is retained. Right command1834..1867 is
+inward from evidence1833..1867, width2.983725135623871, rate1 normalized unit/s,
+150mA sampled current guard. Actual measured q0 is independent and immutable;
+new qualified gestures refresh only the cursor. Within a run, bounds/reference/original90s Live
+deadline remain immutable on Resume or reattachment. A distinct Start measures
+fresh q0 and its own deadline, re-admitting the same fixed workspace without
+shifting its bounds. Pi-issued250ms
+input expiry, local sensing and all motion/status/thermal/ownership guards remain.
+Other11 actual raw Goals hold; body/lift stay zero after normal startup.
+
+Connected voluntary release -> measured hold -> distinct new held gesture requests
+the existing qualified rearm within3s, without a separate Resume click. Initial
+Start, real expiry/blur/disconnect/Pause/ownership loss retain explicit Claim as
+needed, qualified Resume and fresh intent. Cancellation fences late replies.
+Renewal has one pending generation-bound request and a1s local abort bound;
+late replies cannot revive authority or clear a newer controller. Current failure
+clears held input; Stop remains independent. No auto Claim retry or input replay.
+Simulation remains default; persistent service startup never starts/replays motors.
+
+Executable source8ec7818e62b27e3be3ca0ebe84b3fac809a28120 is installed as
+motor e74378dbe873b1fe3534ae42ee21ccce7e634a7c (unchanged in the final stage),
+runtime b4ec80fc98e2513c8941eace745ad606333be26c, manifest
+1b6e51b66d67c5ba0004393c1471958c4be3e10b2635497f42ebe33d55574d54.
+Immediate full matched rollback: same motor e743, runtime
+1d5f73c193c23fac4c01b282f07949dad8e605c8, manifest
+86b6b11c7b0b453c6d146b1aabbf2d37349c60ab1a076ade9ad1e32794aa8722.
+Older pairs, original results, separate helper/camera/manual pins and private state
+remain retained. Publication/integration SHAs are not deployment commands.
+
+Packet11 physical05/06 acknowledged positive22/negative11 raw target offsets but
+measured0 through full2.017/2.047s windows. These are failed movement checks,
+not merely fine-position limitations. Physical ordinary re-jog/reattach remain
+unqualified. Actual06 reused measured1845 rest without shifting its workspace.
+The final short next Start10 passed repaired initial/final lift off acquisition,
+then refused before Live: right shoulder Goal2138 is outside fixed2141+/-1.
+No admitted q0/deadline/grant/jog existed. The raw seed had no normalized roundtrip;
+why/when the shoulder pose changed is unknown. Do not widen the context again,
+invent a seed, repeat unchanged powered trials or demand manual historical pose.
+All20 off/zero, lift/bus/camera cleanup are known; uncertainfalse. Current native
+run c07260e1-19ac-455a-a58b-2db5b16bf15d/hash556f344c4028055bae554d1112e8b36b67bb7d7c794229a143d5cab5a193fb5f
+is preserved. Final native/page checks verified available idle with the reviewed
+UI/workspace and no motor task. PENDING runner status is not readiness for motion.
+Fresh advisory P1 imagery shows stationary arms; it does not prove motion/clearance.
+
+The packet's explicit physical-response exception permits completing available
+software/review/publication while reporting this unresolved layer. Focused final
+browser249/0skip and native final-off384/0skip are separate scopes, not an additive
+hardware result. Reuse existing tools, stopped affected-component staging and full
+matched rollback. Root alone handles Git/SSH/staging/hardware. AM1 stays wireless,
+P1 advisory, AM2 untouched. No gains, expanded force/travel/dwell, new joints,
+network/camera redesign, manual leader/shoulder/readiness questions or hardware
+endurance campaign. Durability means software fault tolerance, control/connection
+continuity, state preservation and recovery with minimal human intervention.
+
 ## Active AM1-LIVE-ARMS-10 result and continuing boundary
 
 PR21 is integrated into integrate/am1-local-teleop at

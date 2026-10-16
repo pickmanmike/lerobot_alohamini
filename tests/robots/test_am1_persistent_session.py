@@ -877,7 +877,12 @@ def test_physical_live_selected_recipe_controls_only_its_frozen_joint(physical_l
     assert live["joint"] == joint and live["side"] == ("right" if right else "left")
     assert live["profile"] == ("LiveRightElbow" if right else "LiveLeftElbow")
     assert live["rate_norm_per_s"] == 1.0
-    assert (live["corridor_min_norm"], live["corridor_max_norm"]) == ((-3.0, 0.0) if right else (-10.0, 0.0))
+    assert (live["corridor_min_norm"], live["corridor_max_norm"]) == pytest.approx(
+        (((1834-827)/2212*200-100, (1867-827)/2212*200-100) if right else (-10.0, 0.0)))
+    if right:
+        assert live["admission_version"] == 2
+        assert live["workspace"]["id"] == "am1-right-elbow-rest-neighbourhood-v2"
+        assert live["measured_origin_raw"] == 1845
     base = physical_live_controls(a, r)
     other_recipe = "physical-live-left-elbow" if right else "physical-live-right-elbow"
     assert not a.handle(command("start", operation_id=str(uuid.uuid4()), recipe=other_recipe,
@@ -885,11 +890,11 @@ def test_physical_live_selected_recipe_controls_only_its_frozen_joint(physical_l
     grant = a.handle(command("grant", **base), "owner")
     invalid = command("input", **base, grant_id=grant["grant_id"], seq=1, target={other: 0.0})
     assert not a.handle(invalid, "owner")["accepted"]
-    frame = command("input", **base, grant_id=grant["grant_id"], seq=1, target={joint: -.3})
+    frame = command("input", **base, grant_id=grant["grant_id"], seq=1, target={joint: live["cursor_norm"] - .3})
     assert len(encode(frame, CONTROL_LIMIT)) < CONTROL_LIMIT
     assert a.handle(frame, "owner")["accepted"]
     until(lambda: host.control.live_snapshot().get("last_input_seq") == 1)
-    assert all(host.control.accepted_action[k] == 0.0 for k in JOINT_KEYS if k != joint)
+    assert all(host.control.accepted_action[k] == host.control.live_held[k] for k in JOINT_KEYS if k != joint)
     latest = [event[1] for event in host.robot.events if event[0] == "action"][-1]
     assert all(latest[k] == 0.0 for k in ("x.vel", "y.vel", "theta.vel", "lift_axis.vel"))
     a.tick()
@@ -1003,7 +1008,7 @@ def test_physical_live_reacquisition_retains_reference_and_deadline(physical_liv
     initial = a.snapshot()["run"]
     grant = a.handle(command("grant", **base), "owner")
     assert a.handle(command("input", **base, grant_id=grant["grant_id"], seq=1,
-                            target={joint: -0.5}), "owner")["accepted"]
+                            target={joint: initial["live_input"]["cursor_norm"] - .5}), "owner")["accepted"]
     time.sleep(max(0, grant["expires"] - time.monotonic()) + 0.03)
     a.tick()
     assert a.run["status"] == "paused"
@@ -1014,12 +1019,12 @@ def test_physical_live_reacquisition_retains_reference_and_deadline(physical_liv
     assert current["live_input"]["reference_norm"] == initial["live_input"]["reference_norm"]
     assert current["live_input"]["corridor_min_norm"] == initial["live_input"]["corridor_min_norm"]
     assert current["live_input"]["cursor_intent_revision"] == fresh["intent_revision"]
-    assert current["live_input"]["cursor_norm"] == 0.0
+    assert current["live_input"]["cursor_norm"] == initial["live_input"]["reference_norm"]
     assert not a.handle(command("input", **base, grant_id=grant["grant_id"], seq=2,
                                 target={joint: -1.0}), "owner")["accepted"]
     new_grant = a.handle(command("grant", **fresh), "owner")
     assert a.handle(command("input", **fresh, grant_id=new_grant["grant_id"], seq=1,
-                            target={joint: -0.2}), "owner")["accepted"]
+                            target={joint: current["live_input"]["cursor_norm"] - .2}), "owner")["accepted"]
     assert e.task is None and e.worker.is_alive()
 
 
@@ -1330,3 +1335,457 @@ def test_physical_live_expired_presence_claim_and_pause_preserve_finishing(physi
     assert a.run["physical_result"]["run_id"] == first["run_id"]
     assert a.run["first_cause"] == cached_native_fault
     assert e._fault == cached_native_fault
+
+
+@pytest.mark.parametrize("physical_live_authority", [
+    "physical-live-left-elbow", "physical-live-right-elbow",
+], indirect=True)
+def test_live_voluntary_release_new_gesture_qualified_rearm(physical_live_authority):
+    from tests.robots.test_am1_physical_executor import until
+
+    a, e, host, r = physical_live_authority
+    base = physical_live_controls(a, r)
+    until(lambda: (a.tick() or a.snapshot()["evidence"].get("active_acknowledged") is True))
+    before = a.snapshot()["run"]
+    value = before["live_input"]
+    joint = value["joint"]
+    grant = a.handle(command("grant", **base), "owner")
+    target = max(value["corridor_min_norm"], min(value["cursor_norm"] - 0.2, value["corridor_max_norm"]))
+    assert a.handle(command("input", **base, grant_id=grant["grant_id"], seq=1,
+                            target={joint: target}), "owner")["accepted"]
+    released = a.handle(command("release_input", **base, release_kind="voluntary_jog"), "owner")
+    assert released["accepted"], released
+    revision = a.run["intent_revision"]
+    assert a.snapshot()["run"]["live_input"]["rearm"] == {
+        "eligible": True, "released_intent_revision": revision,
+    }
+    assert a.run["intent"] is None and a.run["status"] == "paused"
+    a.tick()
+    assert "rearm" not in a.run["live_input"]  # A volatile gesture permission is never durable history.
+    assert not a.handle(command("grant", **base), "owner")["accepted"]
+    connected = a.handle(command("connect", **base, rearm_of_intent_revision=revision), "owner")
+    assert connected["accepted"], connected
+    fresh = dict(base, connection_generation=connected["connection_generation"])
+    fresh.pop("intent_revision")
+    assert a.handle(command("release_input", **fresh, rearm_of_intent_revision=revision), "owner")["accepted"]
+    until(lambda: (a.tick() or a.snapshot()["evidence"].get("pose_aligned") is True))
+    resumed = a.handle(command("resume", **fresh, expected_intent_revision=revision + 1,
+                               rearm_of_intent_revision=revision), "owner")
+    assert resumed["accepted"], resumed
+    assert a.run["intent_revision"] == revision + 2
+    until(lambda: (a.tick() or a.snapshot()["evidence"].get("active_acknowledged") is True))
+    after = a.snapshot()["run"]
+    for key in ("run_id", "deadline", "native_live_at", "recovery_episodes"):
+        assert after[key] == before[key]
+    for key in ("reference_norm", "corridor_min_norm", "corridor_max_norm"):
+        assert after["live_input"][key] == value[key]
+    assert after["live_input"]["rearm"]["eligible"] is False
+    assert a.run["intent"] is None  # Rearm is not an input or replay.
+    fresh["intent_revision"] = a.run["intent_revision"]
+    grant = a.handle(command("grant", **fresh), "owner")
+    assert a.handle(command("input", **fresh, grant_id=grant["grant_id"], seq=1,
+                            target={joint: target}), "owner")["accepted"]
+
+
+@pytest.mark.parametrize("loss", ["pause", "plain_release", "expiry", "foreign_connect", "wrong_revision"])
+def test_live_rearm_cannot_cross_strict_loss(physical_live_authority, loss):
+    import time
+    from tests.robots.test_am1_physical_executor import until
+
+    a, e, host, r = physical_live_authority
+    base = physical_live_controls(a, r)
+    until(lambda: (a.tick() or a.snapshot()["evidence"].get("active_acknowledged") is True))
+    grant = a.handle(command("grant", **base), "owner")
+    assert a.handle(command("input", **base, grant_id=grant["grant_id"], seq=1,
+                            target={"arm_left_elbow_flex.pos": -0.2}), "owner")["accepted"]
+    if loss == "expiry":
+        time.sleep(max(0, grant["expires"] - time.monotonic()) + 0.02)
+        a.tick()
+    released = a.handle(command("release_input", **base, release_kind="voluntary_jog"), "owner")
+    assert released["accepted"], released
+    revision = a.run["intent_revision"]
+    if loss == "pause":
+        assert a.handle(command("pause", run_id=r["run_id"]), "another-viewer")["accepted"]
+    elif loss == "plain_release":
+        assert a.handle(command("release_input", **base), "owner")["accepted"]
+    elif loss == "foreign_connect":
+        explicit = a.handle(command("connect", **base), "owner")
+        assert explicit["accepted"]
+    elif loss == "wrong_revision":
+        revision -= 1
+    auto = a.handle(command("connect", **base, rearm_of_intent_revision=revision), "owner")
+    assert not auto["accepted"], (loss, auto)
+    assert a.run["status"] == "paused" and a.run["intent"] is None
+
+
+def test_live_initial_release_cannot_claim_ordinary_rearm(physical_live_authority):
+    a, e, host, r = physical_live_authority
+    s = a.snapshot()
+    base = dict(run_id=r["run_id"], service_incarnation=s["service_incarnation"],
+                controller_generation=s["controller"]["controller_generation"],
+                host_incarnation=s["evidence"]["host_incarnation"])
+    connected = a.handle(command("connect", **base), "owner")
+    base["connection_generation"] = connected["connection_generation"]
+    base["intent_revision"] = a.run["intent_revision"]
+    assert a.handle(command("release_input", **base, release_kind="voluntary_jog"), "owner")["accepted"]
+    assert a.snapshot()["run"]["live_input"]["rearm"]["eligible"] is False
+    assert not a.handle(command("connect", **base, rearm_of_intent_revision=a.run["intent_revision"]), "owner")["accepted"]
+
+
+@pytest.mark.parametrize("receipt", ["cached-active", "expired-paused", "paused-native"])
+def test_voluntary_release_cannot_reclassify_expiry_during_feedback(physical_live_authority, monkeypatch, receipt):
+    import copy
+    import time
+    from tests.robots.test_am1_physical_executor import until
+
+    a, e, host, r = physical_live_authority
+    base = physical_live_controls(a, r)
+    until(lambda: (a.tick() or a.snapshot()["evidence"].get("active_acknowledged") is True))
+    grant = a.handle(command("grant", **base), "owner")
+    assert a.handle(command("input", **base, grant_id=grant["grant_id"], seq=1,
+                            target={"arm_left_elbow_flex.pos": -.2}), "owner")["accepted"]
+    evidence = a._evidence
+    calls = []
+    def delayed_feedback():
+        calls.append(time.monotonic())
+        value = copy.deepcopy(evidence())
+        # The public command ticks first, then reads evidence inside release classification.
+        if len(calls) == 2:
+            assert time.monotonic() < grant["expires"]
+            if receipt != "paused-native":
+                time.sleep(grant["expires"] - time.monotonic() + .03)
+            if receipt != "cached-active":
+                value["active_acknowledged"] = False
+                value["accepted_host_action"]["state"] = "paused"
+                value["live_input"]["state"] = "expired"
+        return value
+    monkeypatch.setattr(a, "_evidence", delayed_feedback)
+    result = a.handle(command("release_input", **base, release_kind="voluntary_jog"), "owner")
+    assert result["accepted"], result  # Holding remains available.
+    assert len(calls) >= 2
+    if receipt != "paused-native":
+        assert time.monotonic() >= grant["expires"]
+    assert a.run["status"] == "paused" and a.run["intent"] is None
+    assert not a.snapshot()["run"]["live_input"]["rearm"]["eligible"]
+    assert not a.handle(command("connect", **base, rearm_of_intent_revision=a.run["intent_revision"]), "owner")["accepted"]
+
+
+def physical_live_returned_write(a, e, host, r, monkeypatch):
+    """Real native receipt path; only the existing simulated robot's helper return is injected."""
+    import math
+    import time
+
+    from examples.alohamini.am1_session_contract import LIVE_ELBOW_SPECS
+    from tests.robots.test_am1_physical_executor import until
+
+    spec = LIVE_ELBOW_SPECS[a.run["recipe"]]
+    original = host.robot.send_action
+
+    def returned(action):
+        began = time.monotonic()
+        result = original(action)
+        binding = getattr(host.robot, "_am1_live_action_binding", None)
+        if binding:
+            minimum, span = (827, 2212) if spec.side == "right" else (864, 2209)
+            host.robot._am1_selected_joint_action = {
+                **binding, "side": spec.side, "motor": spec.joint.removesuffix(".pos"),
+                "expected_goal_raw": math.floor((action[spec.joint] + 100) / 200 * span + minimum),
+                "sync_write_returned": True, "write_started_at_monotonic_s": began,
+                "write_completed_at_monotonic_s": time.monotonic(),
+            }
+        return result
+
+    monkeypatch.setattr(host.robot, "send_action", returned)
+    base = physical_live_controls(a, r)
+    live = a.snapshot()["run"]["live_input"]
+    grant = a.handle(command("grant", **base), "owner")
+    target = max(live["corridor_min_norm"], live["cursor_norm"] - .2)
+    assert a.handle(command("input", **base, grant_id=grant["grant_id"], seq=0,
+                            target={spec.joint: target}), "owner")["accepted"]
+    until(lambda: e.evidence().get("live_input", {}).get("last_successful_write"))
+    return base, grant
+
+
+def retained_live_write_views(a, expected):
+    import base64
+    import hashlib
+    import json
+
+    from tools.am1_session_ipc import RESPONSE_LIMIT, encode
+
+    durable = json.loads(a.db.execute("SELECT data FROM state WHERE id=1").fetchone()[0])
+    assert durable["live_input"]["last_successful_write"] == expected
+    view = a.snapshot()
+    assert len(encode({"id": str(uuid.uuid4()), "result": view})) < RESPONSE_LIMIT
+    assert view["run"]["live_input"]["last_successful_write"] == expected
+    assert view["evidence"]["live_input"]["last_successful_write"] == expected
+    reference = view["run"]["details_reference"]
+    raw = bytearray()
+    while len(raw) < reference["bytes"]:
+        reply = a.snapshot_detail(dict(op="snapshot", reference=reference, offset=len(raw), limit=8192))
+        raw.extend(base64.b64decode(reply["data"], validate=True))
+    assert hashlib.sha256(raw).hexdigest() == reference["sha256"]
+    assert json.loads(raw)["live_input"]["last_successful_write"] == expected
+
+
+@pytest.mark.parametrize("physical_live_authority", [
+    "physical-live-left-elbow", "physical-live-right-elbow",
+], indirect=True)
+def test_live_write_history_survives_core_expiry_revision_and_terminal(physical_live_authority, monkeypatch):
+    import copy
+
+    from tests.robots.test_am1_physical_executor import until
+
+    a, e, host, r = physical_live_authority
+    base, grant = physical_live_returned_write(a, e, host, r, monkeypatch)
+    deadline, revision = a.run["deadline"], a.run["intent_revision"]
+    until(lambda: e.evidence()["live_input"]["state"] == "expired")
+    expected = copy.deepcopy(e.evidence()["live_input"]["last_successful_write"])
+    assert expected["valid_until_monotonic_s"] == grant["expires"]
+    a.tick()  # Expiry advances revision and clears the executor's expired-evidence cache.
+    assert a.run["status"] == "paused" and a.run["intent_revision"] > revision
+    assert a.run["deadline"] == deadline
+    retained_live_write_views(a, expected)
+    until(lambda: e.evidence().get("acknowledged_intent_revision") == a.run["intent_revision"])
+    projected = a.snapshot()["run"]["live_input"]
+    current = {"encoded_goal_raw", "goal_write_returned", "goal_write_started_at_monotonic_s",
+               "goal_write_completed_at_monotonic_s", "goal_action_sequence"}
+    assert not current.intersection(projected)
+    assert not a.handle(command("grant", **dict(base, intent_revision=a.run["intent_revision"])), "owner")["accepted"]
+    # Historical success alone cannot qualify a current Resume or ordinary rearm.
+    stale = copy.deepcopy(e.evidence())
+    stale.update(feedback=False, required_observation=False, native_ack=False, pose_aligned=False)
+    with monkeypatch.context() as patch:
+        patch.setattr(e, "evidence", lambda: copy.deepcopy(stale))
+        ids = dict(base, intent_revision=a.run["intent_revision"])
+        assert a.handle(command("release_input", **ids, release_kind="voluntary_jog"), "owner")["accepted"]
+        assert a.snapshot()["run"]["live_input"]["rearm"]["eligible"] is False
+        assert not a.handle(command("resume", **ids, expected_intent_revision=a.run["intent_revision"]), "owner")["accepted"]
+        assert a.snapshot()["evidence"]["native_ack"] is False
+    assert a.handle(command("stop", run_id=r["run_id"]), "owner")["accepted"]
+    until(lambda: (a.tick() or a.run["status"] == "stopped"))
+    retained_live_write_views(a, expected)
+
+
+@pytest.mark.parametrize("physical_live_authority", [
+    "physical-live-left-elbow", "physical-live-right-elbow",
+], indirect=True)
+def test_live_write_history_stop_before_checkpoint_retains_native_copy(physical_live_authority, monkeypatch):
+    import copy
+
+    from tests.robots.test_am1_physical_executor import until
+
+    a, e, host, r = physical_live_authority
+    physical_live_returned_write(a, e, host, r, monkeypatch)
+    assert "last_successful_write" not in a.run.get("live_input", {})
+    original, seen = e.evidence, []
+
+    def observed():
+        value = original()
+        receipt = value.get("live_input", {}).get("last_successful_write")
+        if receipt:
+            seen.append(copy.deepcopy(receipt))
+        return value
+
+    monkeypatch.setattr(e, "evidence", observed)
+    assert a.handle(command("stop", run_id=r["run_id"]), "owner")["accepted"]
+    until(lambda: (a.tick() or a.run["status"] == "stopped"))
+    assert seen, "protective Stop must capture cached native history without a pre-command tick"
+    expected = seen[-1]
+    retained_live_write_views(a, expected)
+
+
+@pytest.mark.parametrize("physical_live_authority", [
+    "physical-live-left-elbow", "physical-live-right-elbow",
+], indirect=True)
+def test_live_write_history_validation_copies_closed_native_scalars(physical_live_authority, monkeypatch):
+    import copy
+    import time
+
+    a, e, host, r = physical_live_authority
+    physical_live_returned_write(a, e, host, r, monkeypatch)
+    evidence = copy.deepcopy(e.evidence())
+    expected = copy.deepcopy(evidence["live_input"]["last_successful_write"])
+    projected = a._live_input_status(evidence)
+    assert projected["last_successful_write"] == expected
+    assert len(__import__("json").dumps(expected)) < 2048
+    projected["last_successful_write"]["encoded_goal_raw"] = -1
+    assert evidence["live_input"]["last_successful_write"] == expected
+    # First validate the positive fixture, then reject every malformed replacement
+    # without relabeling or losing this same-run retained record.
+    a.run["live_input"] = a._live_input_status(evidence, include_rearm=False)
+    corruptions = {
+        "foreign_run": {"run_id": str(uuid.uuid4())}, "foreign_host": {"host_incarnation": str(uuid.uuid4())},
+        "foreign_service": {"service_incarnation": str(uuid.uuid4())}, "wrong_joint": {"joint": "arm_left_wrist_flex.pos"},
+        "wrong_side": {"side": "other"}, "future_revision": {"intent_revision": a.run["intent_revision"] + 1},
+        "bad_owner": {"controller_generation": "not-uuid"}, "bad_connection": {"connection_generation": "NOT-UUID"},
+        "bad_grant": {"grant_id": "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA"}, "wrong_version": {"version": True},
+        "wrong_provenance": {"provenance": "client"}, "unreturned": {"goal_write_returned": False},
+        "nan": {"accepted_target_norm": float("nan")}, "infinity": {"valid_until_monotonic_s": float("inf")},
+        "bool_sequence": {"last_input_seq": True}, "negative_epoch": {"epoch": -1},
+        "negative_raw": {"encoded_goal_raw": -1}, "outside_norm": {"accepted_target_norm": 101},
+        "future_write": {"goal_write_completed_at_monotonic_s": time.monotonic() + 100},
+        "expired_before_write": {"valid_until_monotonic_s": expected["goal_write_started_at_monotonic_s"]},
+        "unordered": {"goal_write_started_at_monotonic_s": expected["goal_write_completed_at_monotonic_s"] + 1},
+        "bulk": {"unexpected": ["bulk"] * 10000}, "nested": {"grant_id": {"nested": "bad"}},
+    }
+    for label, changes in corruptions.items():
+        bad = copy.deepcopy(evidence)
+        bad["live_input"]["last_successful_write"].update(changes)
+        assert a._live_input_status(bad)["last_successful_write"] == expected, label
+        previous = a.run.pop("live_input")
+        assert "last_successful_write" not in a._live_input_status(bad), label
+        a.run["live_input"] = previous
+    cleared = dict(evidence, live_input={"state": "held", "joint": expected["joint"]})
+    assert a._live_input_status(cleared)["last_successful_write"] == expected
+    old = copy.deepcopy(expected)
+    old.update(intent_revision=0, controller_generation=str(uuid.uuid4()), connection_generation=str(uuid.uuid4()))
+    cleared["live_input"]["last_successful_write"] = old
+    assert a._live_input_status(cleared)["last_successful_write"] == old
+    # Expiry is not a receipt TTL: a returned write may complete after its old grant.
+    # A schema-only timing copy exercises a completion straddling the original expiry.
+    old["goal_write_started_at_monotonic_s"] = old["goal_write_completed_at_monotonic_s"] - .002
+    old["valid_until_monotonic_s"] = old["goal_write_completed_at_monotonic_s"] - .001
+    assert a._live_input_status(cleared)["last_successful_write"] == old
+
+
+def test_live_write_history_is_not_synthesized_without_a_receipt(physical_live_authority):
+    from tests.robots.test_am1_physical_executor import until
+
+    a, e, host, r = physical_live_authority
+    assert "last_successful_write" not in a.snapshot()["run"]["live_input"]
+    assert a.handle(command("stop", run_id=r["run_id"]), "owner")["accepted"]
+    until(lambda: (a.tick() or a.run["status"] == "stopped"))
+    assert "last_successful_write" not in (a.snapshot()["run"].get("live_input") or {})
+
+
+def test_live_write_history_terminal_reopen_keeps_original_run_binding(physical_live_authority, monkeypatch):
+    import copy
+
+    from tests.robots.test_am1_live_native import ExecutorNativeHost
+    from tests.robots.test_am1_physical_executor import executor, until
+
+    a, e, host, r = physical_live_authority
+    physical_live_returned_write(a, e, host, r, monkeypatch)
+    until(lambda: e.evidence()["live_input"]["state"] == "expired")
+    expected = copy.deepcopy(e.evidence()["live_input"]["last_successful_write"])
+    a.tick()
+    assert a.handle(command("stop", run_id=r["run_id"]), "owner")["accepted"]
+    until(lambda: (a.tick() or a.run["status"] == "stopped"))
+    a.close()
+    replacement = executor(ExecutorNativeHost())
+    restored = SessionAuthority(a.directory, executor=replacement)
+    try:
+        assert restored.service_incarnation != expected["service_incarnation"]
+        assert replacement.host_incarnation != expected["host_incarnation"]
+        assert restored.run["status"] == "stopped"
+        retained_live_write_views(restored, expected)
+        assert restored._live_input_status({})["last_successful_write"] == expected
+    finally:
+        restored.close()
+
+
+def test_live_write_history_absent_native_keeps_only_immutable_admission(physical_live_authority, monkeypatch):
+    import copy
+
+    a, e, host, r = physical_live_authority
+    physical_live_returned_write(a, e, host, r, monkeypatch)
+    a.tick()
+    stored = copy.deepcopy(a.run["live_input"])
+    immutable = {"joint", "reference_norm", "corridor_min_norm", "corridor_max_norm", "measured_origin_raw",
+                 "corridor_min_raw", "corridor_max_raw", "admission_version", "workspace",
+                 "live_admitted_at_monotonic_s", "live_deadline_monotonic_s"}
+    for evidence in ({}, {"live_input": {}}, {"live_input": {"state": "held", "joint": stored["joint"]}}):
+        result = a._live_input_status(evidence)
+        assert {k: result[k] for k in immutable if k in stored} == {k: stored[k] for k in immutable if k in stored}
+        assert result["last_successful_write"] == stored["last_successful_write"]
+        assert not {"cursor_norm", "cursor_feedback_sequence", "cursor_intent_revision",
+                    "goal_write_returned", "encoded_goal_raw", "goal_action_sequence"}.intersection(result)
+        if not evidence.get("live_input"):
+            assert "rearm" not in result and "state" not in result
+        if "workspace" in result:
+            result["workspace"]["context_sha256"] = "changed"
+            assert a.run["live_input"]["workspace"] == stored["workspace"]
+
+
+def test_live_write_history_terminal_cannot_reproject_cached_current_write(physical_live_authority, monkeypatch):
+    import copy
+
+    a, e, host, r = physical_live_authority
+    physical_live_returned_write(a, e, host, r, monkeypatch)
+    evidence = copy.deepcopy(e.evidence())
+    assert a._live_input_status(evidence)["goal_write_returned"] is True
+    status = a.run["status"]
+    try:
+        for terminal in ("finishing", "stopped"):
+            a.run["status"] = terminal
+            result = a._live_input_status(evidence)
+            assert "goal_write_returned" not in result and "encoded_goal_raw" not in result
+            assert result["last_successful_write"] == evidence["live_input"]["last_successful_write"]
+    finally:
+        a.run["status"] = status
+
+
+def test_live_write_history_clock_reset_retains_only_prevalidated_storage(physical_live_authority, monkeypatch):
+    import copy
+
+    a, e, host, r = physical_live_authority
+    physical_live_returned_write(a, e, host, r, monkeypatch)
+    evidence = copy.deepcopy(e.evidence())
+    expected = copy.deepcopy(evidence["live_input"]["last_successful_write"])
+    a.run["live_input"] = a._live_input_status(evidence, include_rearm=False)
+    with monkeypatch.context() as patch:
+        patch.setattr(a, "clock", lambda: 0.0)  # A later OS boot resets monotonic time.
+        assert a._live_input_status({})["last_successful_write"] == expected
+        saved = a.run["live_input"].pop("last_successful_write")
+        assert "last_successful_write" not in a._live_input_status(evidence)
+        a.run["live_input"]["last_successful_write"] = saved
+
+
+@pytest.mark.parametrize("physical_live_authority", ["physical-live-right-elbow"], indirect=True)
+def test_live_legacy_terminal_record_reopen_is_canonically_unchanged(physical_live_authority):
+    import base64
+    import hashlib
+    import json
+    import time
+
+    from tests.robots.test_am1_live_native import ExecutorNativeHost
+    from tests.robots.test_am1_physical_executor import executor, until
+    from tools.am1_session_core import _canonical
+
+    a, e, host, r = physical_live_authority
+    assert a.handle(command("stop", run_id=r["run_id"]), "owner")["accepted"]
+    until(lambda: (a.tick() or a.run["status"] == "stopped"))
+    # Legacy d16 layout: zero inputs and a returned measured-hold write, without
+    # an input's last_successful_write. Preserve this old terminal record exactly.
+    now = time.monotonic()
+    a.run["live_input"].update(last_input_seq=-1, encoded_goal_raw=1845, goal_write_returned=True,
+                             goal_write_started_at_monotonic_s=now-.002,
+                             goal_write_completed_at_monotonic_s=now-.001, goal_action_sequence=3)
+    assert "last_successful_write" not in a.run["live_input"]
+    a._save()
+    expected = _canonical(a.run)
+    a.close()
+    replacement = executor(ExecutorNativeHost())
+    restored = SessionAuthority(a.directory, executor=replacement)
+    try:
+        durable = restored.db.execute("SELECT data FROM state WHERE id=1").fetchone()[0]
+        assert _canonical(json.loads(durable)) == expected
+        assert _canonical(restored.run) == expected
+        view = restored.snapshot()
+        reference = view["run"]["details_reference"]
+        raw = bytearray()
+        while len(raw) < reference["bytes"]:
+            reply = restored.snapshot_detail(dict(op="snapshot", reference=reference, offset=len(raw), limit=8192))
+            raw.extend(base64.b64decode(reply["data"], validate=True))
+        assert hashlib.sha256(raw).hexdigest() == reference["sha256"]
+        assert _canonical(json.loads(raw)) == expected
+        assert view["evidence"]["native_ack"] is False
+        assert view["evidence"]["active_acknowledged"] is False
+        assert restored.controller is None and restored.connection is None
+        assert restored.grant is None and restored.applied_input is None
+        assert replacement.worker is None
+        assert not restored.handle(command("grant", run_id=r["run_id"]), "owner")["accepted"]
+        assert _canonical(restored.run) == expected
+    finally:
+        restored.close()
