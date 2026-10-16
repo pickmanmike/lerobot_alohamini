@@ -385,6 +385,18 @@ class OperationalLift(InstalledLiftCheck):
         )
         return baseline
 
+    def _qualify_before_torque(self) -> None:
+        # Reuse the same off acquisition and nine-sample strict baseline, with
+        # its one original 600 ms budget and the existing thermal history.
+        self.monitor.record("before_torque_off_acquisition_started")
+        baseline = self._qualify_startup_off()
+        self.bus.expected_torque = 0
+        self.monitor.record(
+            "before_torque_off_acquisition_completed",
+            sample_monotonic_s=baseline["sample_monotonic_s"],
+            strict_baseline=baseline["stationary_qualification"],
+        )
+
     def start(self):
         try:
             self.monitor.read_configuration()

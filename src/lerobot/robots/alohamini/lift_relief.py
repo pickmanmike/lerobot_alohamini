@@ -614,6 +614,21 @@ class InstalledLiftCheck:
     def refuse(self, record: dict[str, Any], reason: str) -> None:
         self.monitor.refuse(record, reason)
 
+    def _qualify_before_torque(self) -> None:
+        try:
+            write_register(self.bus, "Torque_Enable", self.lift.cfg.name, 0)
+        except Exception as error:
+            raise ReliefRefusal(
+                f"before_torque: final torque-off request failed: {error}"
+            ) from error
+        self.bus.expected_torque = 0
+        self.monitor.qualify_stationary(
+            "before_torque",
+            expected_torque=0,
+            expected_goal=0,
+            cold_start=True,
+        )
+
     def home_guard(self, phase: str, displacement_mm: float) -> None:
         if not math.isfinite(displacement_mm) or not math.isfinite(self.lift._last_tick):
             raise ReliefRefusal("homing: nonfinite position telemetry.")
@@ -630,19 +645,7 @@ class InstalledLiftCheck:
                 operating_mode=int(setup_record["operating_mode"]),
                 group_trace=setup_record["group_trace"],
             )
-            try:
-                write_register(self.bus, "Torque_Enable", self.lift.cfg.name, 0)
-            except Exception as error:
-                raise ReliefRefusal(
-                    f"before_torque: final torque-off request failed: {error}"
-                ) from error
-            self.bus.expected_torque = 0
-            self.monitor.qualify_stationary(
-                "before_torque",
-                expected_torque=0,
-                expected_goal=0,
-                cold_start=True,
-            )
+            self._qualify_before_torque()
             self.home_started = time.monotonic()
             self.reader.set_phase("homing")
             return
