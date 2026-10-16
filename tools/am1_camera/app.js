@@ -6,10 +6,26 @@ const labels = identifying ? Object.fromEntries(roles.map((role, i) => [role, `C
                             {forward: "Front", backward: "Rear", chest: "Chest", wrist_left: "Left wrist", wrist_right: "Right wrist"};
 if (identifying) document.querySelector("#view-heading").textContent = "Numbered identification · adjust focus, then confirm roles";
 const cameraRoot = document.querySelector("#am1-camera-root");
-const cameraBase = cameraRoot?.dataset.cameraBase === "/camera/" ? "/camera/" : "/";
-function cameraURL(path) { return cameraBase + path; }
+const onboard = cameraRoot?.dataset.onboard === "true";
+const cameraBase = onboard ? "/api/onboard/" : cameraRoot?.dataset.cameraBase === "/camera/" ? "/camera/" : "/";
+function cameraURL(path) {
+  if (!onboard) {
+    if(path.startsWith("api/webrtc?src="))return cameraBase+"api/webrtc/"+path.split("=")[1];
+    return cameraBase + path;
+  }
+  if (path === "status.json") return cameraBase + "status";
+  const [route, query] = path.split("?"), role = new URLSearchParams(query).get("src");
+  if (!roles.includes(role)) throw Error("Configured camera role required");
+  const name = {"api/frame.jpeg":"frame", "api/stream.mjpeg":"mjpeg", "api/webrtc":"webrtc"}[route];
+  if (!name) throw Error("Fixed camera route required");
+  return cameraBase + name + "/" + role;
+}
 const primary = document.querySelector("#primary"), thumbs = document.querySelector("#thumbnails");
-const connection = document.querySelector("#connection");
+let connection = document.querySelector("#connection");
+if (onboard) {
+  connection = document.createElement("p"); connection.id = "camera-connection";
+  cameraRoot.append(connection);
+}
 const diagnostics = document.querySelector("#diagnostics");
 let selected = roles[0], latest = null, reportAt = 0, statusReceivedAt = 0, stream = null;
 let statusRequest = 0, acceptedStatusRequest = 0, statusUncertain = false;
@@ -18,6 +34,23 @@ const snapshotRequests = new Map(), reconnects = new Map(), minimumSequences = n
 const retained = new AM1RetainedFrames();
 const roleGenerations = new Map(roles.map(role => [role, 1]));
 const sourceSequences = new Map(), sourceStates = new Map(), roleRotations = new Map();
+const videoAttempts = new Map();
+let legacyPrimary = false, primaryVideo = null, webView = null;
+if (globalThis.AM1OnboardView) {
+  primaryVideo = document.createElement("video");
+  primaryVideo.muted = true; primaryVideo.autoplay = true; primaryVideo.playsInline = true; primaryVideo.hidden = true;
+  primary.querySelector(".image-wrap").append(primaryVideo);
+  webView = new AM1OnboardView(primaryVideo, {offer:role=>cameraURL(`api/webrtc?src=${role}`),
+    progress:onboard ? "/api/onboard/progress" : null,
+    csrf:()=>globalThis.am1Remote?.csrf || document.querySelector('meta[name="am1-csrf"]')?.content || ""});
+  const rollback = document.createElement("button"); rollback.type = "button";
+  rollback.textContent = "Use explicit JPEG rollback";
+  rollback.addEventListener("click",()=>{legacyPrimary=!legacyPrimary;stopPrimary("explicit-transport-selection");
+    rollback.textContent=legacyPrimary ? "Return to WebRTC primary" : "Use explicit JPEG rollback";render();});
+  cameraRoot.append(rollback);
+  window.addEventListener("pagehide",()=>stopPrimary("page-detached"));
+}
+function webPrimary() { return !identifying && !legacyPrimary && latest?.video?.enabled === true; }
 for (const role of roles) retained.setGeneration(role, 1);
 const timing = {status_ms:0, status_max_ms:0, status_failures:0, decode_failures:0,
                 cancellations:0, last_cancel:"none"};
@@ -97,18 +130,23 @@ function frameState(role, thumbnail = false, now = performance.now()) {
 globalThis.AM1CameraHealth = function() {
   const now = performance.now(), available = !!statusAvailable();
   const finite = value => Number.isFinite(value) ? value : null;
-  return {version:1, sampled_at_ms:now, selected_role:selected,
+  return {version:1, sampled_at_ms:now, selected_role:selected, transport:webPrimary() ? "webrtc" : "mjpeg-rollback",
+    video:webView?.health() ?? null,
     status_received_age_ms:latest ? Math.max(0, now - statusReceivedAt) : null,
     status_available:available, status_uncertain:statusUncertain || !available,
     status_failures:timing.status_failures,
     roles:roles.map(role => {
       const held = retained.get(role, now), source = latest?.cameras[role];
       const state = frameState(role, role !== selected, now);
+      const decoded = role === selected && webPrimary() ? webView?.health() : null;
       return {role, identity:role, selected:role === selected, generation:roleGenerations.get(role),
-        decoded_generation:held?.generation ?? null, sequence:held?.sequence ?? null,
-        decoded_age_ms:finite(held?.age_ms), source_sequence:source?.sequence ?? null,
+        decoded_generation:decoded?.fresh ? roleGenerations.get(role) : held?.generation ?? null,
+        sequence:decoded?.decoded_frames ?? held?.sequence ?? null,
+        decoded_age_ms:finite(decoded?.decoded_age_ms ?? held?.age_ms), source_sequence:source?.sequence ?? null,
+        owner_generation:latest?.owner_generation ?? null, capture_generation:source?.capture_generation ?? null,
+        encode_generation:decoded?.encode_generation ?? null,
         source_state:source?.state ?? "unavailable", source_age_ms:finite(state.producer_age_ms),
-        configured:source?.configured === true, fresh:state.state === "fresh",
+        configured:source?.configured === true, fresh:decoded ? decoded.fresh : state.state === "fresh",
         status_uncertain:state.status_uncertain || !available};
     })};
 };
@@ -131,6 +169,19 @@ function paint(tile, role, thumbnail = false) {
     latest.cameras[role]?.configured === false || !latest.cameras[role] ? "Unassigned · use numbered identification previews" :
     state.state === "stale" ? "Mapped · stale / waiting for a decoded frame" : "Mapped · not connected / waiting for source";
   paintDetails(thumbnail ? details.get(role) : primary.querySelector("details"), held, source, rotation);
+  if (!thumbnail && webPrimary()) {
+    const video = webView?.health(), fresh = video?.fresh === true;
+    tile.classList.toggle("fresh",fresh); tile.classList.toggle("held",!!video?.decoded_frames&&!fresh);
+    tile.classList.toggle("webrtc-primary",true);
+    if (primaryVideo) {primaryVideo.hidden=false;primaryVideo.dataset.rotation=String(rotation);}
+    tile.querySelector("span").textContent=fresh ? "Live · WebRTC" : video?.decoded_frames ? "Last decoded frame / waiting" : "Connecting WebRTC · no current decoded frame";
+    tile.querySelector(".unavailable").textContent=video?.error || "Waiting for current decoded WebRTC video";
+    const detail=primary.querySelector("details");
+    detail.querySelector('[data-field="image-age"]').textContent=video?.decoded_age_ms==null ? "No decoded video" : `${Math.round(video.decoded_age_ms)} ms since decoded progress; source age tracked separately`;
+    detail.querySelector('[data-field="sequence"]').textContent=`Decoded ${video?.decoded_frames||0}; source ${source?.sequence||0}`;
+  } else if (!thumbnail) {
+    tile.classList.toggle("webrtc-primary",false); if(primaryVideo)primaryVideo.hidden=true;
+  }
 }
 async function showFrame(role, blob, frame, valid) {
   if (decodingRoles.has(role)) return false;
@@ -150,8 +201,18 @@ async function showFrame(role, blob, frame, valid) {
 function stopPrimary(reason = "stopped") {
   if (stream) { timing.cancellations++; timing.last_cancel = reason; stream.controller.abort(); }
   stream = null;
+  if (webView) void webView.stop();
 }
 function startPrimary() {
+  if (webPrimary()) {
+    const key=selected+":"+roleGenerations.get(selected), prior=videoAttempts.get(key)||{count:0,at:-Infinity};
+    if (!webView || prior.count>=3 || performance.now()-prior.at<1000) return;
+    videoAttempts.set(key,{count:prior.count+1,at:performance.now()});
+    const current={role:selected,kind:"webrtc",controller:new AbortController(),progressed:performance.now(),
+      deadline:performance.now()+6000,decoded:false}; stream=current;
+    void webView.start(selected).catch(()=>{if(stream===current)stopPrimary("webrtc-unavailable");});
+    return;
+  }
   const current = {role:selected, generation:roleGenerations.get(selected),
     controller:new AbortController(), progressed:performance.now(), pending:null, decoding:false};
   stream = current;
@@ -189,7 +250,12 @@ function render() {
   primary.dataset.role = selected;
   const allowed = usable(selected);
   if (!allowed) stopPrimary(statusAvailable() ? "source-unavailable" : "status-unavailable");
-  else if (stream && performance.now() - stream.progressed > 500) stopPrimary("display-stall");
+  else if (stream?.kind === "webrtc") {
+    const health=webView?.health();
+    if(health?.fresh){stream.progressed=performance.now();stream.decoded=true;}
+    else if(stream.decoded && performance.now()-stream.progressed>500 || performance.now()>stream.deadline && !stream.decoded)
+      stopPrimary("decoded-video-stall");
+  } else if (stream && performance.now() - stream.progressed > 500) stopPrimary("display-stall");
   if (allowed && !stream) startPrimary();
   paint(primary, selected);
   for (const [role, tile] of tiles) {
@@ -201,7 +267,8 @@ function render() {
   connection.textContent = !statusAvailable() ? "Status unavailable — do not rely on these views" :
     (statusUncertain || sourceFor(selected).state !== "fresh") && usable(selected) ? "LAN viewer · status delayed/uncertain · decoded-frame clock remains active" :
     "LAN viewer · source status and decoded-frame progress tracked separately";
-  if (document.body.dataset.console === "compact") {
+  if(webPrimary())connection.textContent=`LAN onboard primary · WebRTC · one shared 640×480 H264 encode, up to 10 fps · ${webView?.health().fresh ? "decoded video advancing" : "decoded view unavailable; required steering holds"} · source freshness separate`;
+  if (document.body.dataset.console === "compact" && !webPrimary()) {
     const fresh = Number(primary.classList.contains("fresh")) +
       [...tiles.entries()].filter(([role,tile]) => role !== selected && tile.classList.contains("fresh")).length;
     connection.textContent = !statusAvailable() ? "Camera status unavailable — retained images are not live." :
@@ -229,7 +296,13 @@ async function statusLoop() {
         if (Number.isSafeInteger(source?.sequence)) sourceSequences.set(role, source.sequence);
         sourceStates.set(role, state);
       }
+      if (webView?.binding && next.video?.role && !webView.connecting &&
+          next.video.encode_generation !== webView.binding.encode_generation) {
+        stopPrimary("shared-primary-generation-changed");
+        if(roles.includes(next.video.role))selected=next.video.role;
+      }
       latest = next; reportAt = start; statusReceivedAt = performance.now(); statusUncertain = false;
+      webView?.updateSource(next,start);
     }
   } catch {
     if (request > acceptedStatusRequest) {
@@ -278,6 +351,10 @@ globalThis.AM1CameraReconnect = function(role) {
   bumpGeneration(role, true);
   if (role === selected) render(); else snapshot(role);
   return {accepted:true, role, identity:role, generation:roleGenerations.get(role), attempt};
+};
+globalThis.AM1CameraSelect = function(role) {
+  if(!roles.includes(role))return {accepted:false,reason:"unknown-role"};
+  stopPrimary("role-switch");selected=role;render();return {accepted:true,role};
 };
 
 setInterval(render, 100); setInterval(snapshots, 500); statusLoop();

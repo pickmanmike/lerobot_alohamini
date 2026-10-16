@@ -176,8 +176,14 @@ class AM1LocalControl:
         self.observation_id = 0
         self.selected_evidence = selected_evidence
         self.live = live
-        self.practical_config = live_elbow_config(live_recipe, practical_config) if live else practical_config
-        self.live_spec = live_elbow_spec(live_recipe, self.practical_config) if live else None
+        self.teleop = live and live_recipe == "physical-live-teleop"
+        self._teleop_source = None
+        self.practical_config = live_elbow_config(live_recipe, practical_config) if live and not self.teleop else practical_config
+        if self.teleop:
+            from examples.alohamini.am1_live_teleop import TELEOP_SPEC
+            self.live_spec = TELEOP_SPEC
+        else:
+            self.live_spec = live_elbow_spec(live_recipe, self.practical_config) if live else None
         if live and self.live_spec is None:
             raise ValueError("Live native recipe is not allowlisted")
         if live and getattr(self.live_spec, "practical_motion", False) and self.practical_config is None:
@@ -187,7 +193,9 @@ class AM1LocalControl:
         self.live_sample = None
         self.live_held = None
         self.live_cursor_at = None
-        self._live_summary = {"state": "held", "joint": self.live_spec.joint if live else AM1_LIVE_JOINT, "last_input_seq": -1}
+        self._live_summary = {"state": "held", "last_input_seq": -1}
+        if not self.teleop:
+            self._live_summary["joint"] = self.live_spec.joint if live else AM1_LIVE_JOINT
 
     def live_snapshot(self) -> dict:
         return copy.deepcopy(self._live_summary)
@@ -207,7 +215,11 @@ class AM1LocalControl:
         summary["state"] = "expired" if expired else "held"
         self.accepted_action = {"mode": "measured_arm_hold", "body_velocity": 0.0}
         self.live_sample = None
-        if self.selected_evidence is not None:
+        if self.teleop:
+            summary["body"] = {"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0, "lift_axis.vel": 0}
+            for key in ("accepted_target", "held_goals_raw", "held_goal_acquisition"):
+                summary.pop(key, None)
+        if self.selected_evidence is not None and not self.teleop:
             self.selected_evidence.deactivate_live(robot)
 
     def check_live(self, robot: AlohaMini) -> bool:
@@ -453,6 +465,8 @@ class AM1LocalControl:
             )
             if self.live:
                 observation[AM1_LOCAL_FEEDBACK_KEY]["live_input"] = self.live_snapshot()
+            if self.teleop and "_am1_arm_feedback" in observation:
+                observation[AM1_LOCAL_FEEDBACK_KEY]["arm_feedback"] = copy.deepcopy(observation["_am1_arm_feedback"])
 
     def watchdog_stop(self, robot: AlohaMini) -> None:
         if self.selected_evidence is not None:
@@ -464,6 +478,15 @@ class AM1LocalControl:
             logging.warning("AM1 Local watchdog held follower arms at measured positions; epoch=%s", self.epoch)
 
     def apply(self, robot: AlohaMini, command: dict) -> bool:
+        if self.teleop:
+            from .am1_live_teleop import apply_frame
+            zero_keys = {"x.vel", "y.vel", "theta.vel", "lift_axis.vel"}
+            if (self.state != "ready" and self.binding is not None and set(command) == zero_keys
+                    and all(type(value) in (int, float) and value == 0 for value in command.values())):
+                self._live_hold(robot)
+                self.state = "stopped"
+                return True
+            return apply_frame(self, robot, command, AM1_LOCAL_CONTROL_KEY)
         if self.live:
             zero_keys = {"x.vel", "y.vel", "theta.vel", "lift_axis.vel"}
             if (self.state != "ready" and self.binding is not None
@@ -554,7 +577,11 @@ class AM1LocalControl:
                 self.intent_revision = marker["intent_revision"]
                 self.accepted_action_sequence = marker["action_sequence"]
                 self.accepted_action = {"mode": "measured_arm_hold", "body_velocity": 0.0}
-            logging.warning("AM1 Local PAUSED: measured-position hold acknowledged; epoch=%s", epoch)
+            report = getattr(robot, "_am1_routine_report", None)
+            if report is None:
+                logging.warning("AM1 Local PAUSED: measured-position hold acknowledged; epoch=%s", epoch)
+            else:
+                report(f"AM1 Local PAUSED: measured-position hold acknowledged; epoch={epoch}")
             return True
         if epoch == self.epoch and self.state == "paused":
             return False
@@ -593,7 +620,11 @@ class AM1LocalControl:
                 if type(_jsonable(value)) in (int, float) and math.isfinite(_jsonable(value))
             }
         if resuming:
-            logging.info("AM1 Local RECOVERED: first bounded action applied; epoch=%s", epoch)
+            report = getattr(robot, "_am1_routine_report", None)
+            if report is None:
+                logging.info("AM1 Local RECOVERED: first bounded action applied; epoch=%s", epoch)
+            else:
+                report(f"AM1 Local RECOVERED: first bounded action applied; epoch={epoch}")
         return True
 
 
@@ -1409,6 +1440,18 @@ def visible_control_binding(args):
         if experiment_file is not None:
             raise ValueError("Selected experiment file requires its explicit protected recipe")
         return None
+    if recipe == "physical-live-teleop":
+        binding = {"recipe": recipe, "run_id": args.am1_run_id, "host_incarnation": args.am1_host_incarnation}
+        if (experiment_file is not None or args.robot_model != "alohamini1" or args.no_follower
+                or not getattr(args, "no_cameras", False) or not getattr(args, "am1_protected_run_directory", None)
+                or os.environ.get("AM1_SCRIPTED_PREPARE") != "1"
+                or any(os.environ.get(key) is not None for key in ("AM1_ELBOW_RECOVERY", "AM1_ELBOW_RECOVERY_RECIPE", "AM1_ELBOW_INTEGRAL"))
+                or os.environ.get("AM1_SHOULDER_INTEGRAL_TEST") == "1"):
+            raise ValueError("Whole-robot teleop requires its exact protected owner")
+        if any(type(binding[key]) is not str or str(UUID(binding[key])) != binding[key]
+               for key in ("run_id", "host_incarnation")):
+            raise ValueError("Whole-robot teleop requires canonical protected identities")
+        return binding
     from examples.alohamini.am1_session_contract import (
         LEFT_ELBOW_POSITIVE_CONTROL,
         LIVE_ELBOW_SPECS,
@@ -1501,6 +1544,7 @@ def elbow_recovery_binding(args):
 def _run_host(args):
     _validate_host_arguments(args)
     visible_binding = visible_control_binding(args)
+    teleop = visible_binding is not None and visible_binding["recipe"] == "physical-live-teleop"
     recovery_binding = elbow_recovery_binding(args)
     right_p20_binding = right_p20_trial_binding(args, visible_binding)
     practical_config = live_elbow_config(None if visible_binding is None else visible_binding["recipe"])
@@ -1537,7 +1581,9 @@ def _run_host(args):
     robot._am1_selected_joint_evidence_enabled = selected_evidence.enabled
     if recovery_binding is not None:
         robot._am1_elbow_recovery_binding = recovery_binding
-    if visible_binding is not None:
+    if teleop:
+        robot._am1_teleop_binding = visible_binding
+    elif visible_binding is not None:
         robot._am1_visible_control_binding = visible_binding
         robot._am1_visible_control_evidence = selected_evidence
         experiment = getattr(args, "_am1_selected_elbow_experiment", None)
@@ -1599,7 +1645,7 @@ def _run_host(args):
         AM1LocalControl(
             run_id=args.am1_run_id, host_incarnation=args.am1_host_incarnation,
             selected_evidence=selected_evidence,
-            live=visible_binding is not None and live_elbow_spec(visible_binding["recipe"]) is not None,
+            live=teleop or visible_binding is not None and live_elbow_spec(visible_binding["recipe"]) is not None,
             live_recipe=AM1_LIVE_RECIPE if visible_binding is None else visible_binding["recipe"],
             practical_config=practical_config,
         )
@@ -1622,10 +1668,17 @@ def _run_host(args):
     logging.info("Waiting for commands...")
 
     try:
-        if practical_config is not None:
+        if practical_config is not None or teleop:
             routine_writer = AM1RoutineRecordWriter()
             selected_evidence.emit = routine_writer.emit_selected
             routine_report = routine_writer.submit_line
+            robot._am1_routine_report = routine_report
+            if teleop:
+                routine_writer.submit("[AM1 TELEOP SETTINGS] ", {
+                    "binding": robot._am1_teleop_binding,
+                    "before": robot._am1_teleop_settings,
+                    "active": robot._am1_teleop_active_settings,
+                })
         # One final same-owner startup boundary before ordinary loop timing.
         # Only a due genuine read can refresh the retained original thermal slots.
         if (

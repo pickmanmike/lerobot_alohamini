@@ -158,7 +158,13 @@ def test_websocket_ticket_binding_acknowledgement_and_revoke(cluster):
             state = await ws.receive_json(timeout=2)
             assert state["kind"] == "snapshot"
             await ws.send_json({"id": "bad", "command": {"op": "claim"}})
-            result = await ws.receive_json(timeout=2)
+            # Unacknowledged snapshots may repeat before the command result.
+            # Do not ACK them: this assertion specifically checks missing-ACK refusal.
+            async with asyncio.timeout(2):
+                while True:
+                    result = await ws.receive_json(timeout=2)
+                    if result.get("id") == "bad":
+                        break
             assert result["accepted"] is False
             await ws.send_json({"ack": state["revision"]})
             await ws.send_json({"id": "claim", "command": {"op": "claim"}})

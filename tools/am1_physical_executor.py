@@ -6,6 +6,15 @@ import threading
 import time
 
 from examples.alohamini.am1_finite_task import JOINT_KEYS
+from examples.alohamini.am1_live_teleop import (
+    TELEOP_ARM_KEYS,
+    TELEOP_RECIPE,
+    TELEOP_SPEC,
+    validate_body,
+    validate_source,
+    validate_target,
+    validate_workspace,
+)
 from examples.alohamini.am1_session_contract import (
     ELBOW_RECOVERY_DEFINITIONS,
     LEFT_ELBOW_ORIGINAL_RETURN,
@@ -95,6 +104,33 @@ def read_physical_sample(client, run_id, host_incarnation, previous_sequence, *,
     positions = {key: observation.get(key) for key in JOINT_KEYS}
     if any(type(v) not in (int, float) or not math.isfinite(v) for v in positions.values()):
         raise ValueError("invalid actual arm feedback")
+    arm_feedback = marker.get("arm_feedback")
+    if arm_feedback is not None:
+        if (
+            not isinstance(arm_feedback, dict)
+            or set(arm_feedback) != {"version", "positions"}
+            or type(arm_feedback["version"]) is not int
+            or arm_feedback["version"] != 1
+            or not isinstance(arm_feedback["positions"], dict)
+            or set(arm_feedback["positions"]) != set(TELEOP_ARM_KEYS)
+        ):
+            raise ValueError("invalid twelve-joint original native feedback")
+        for key, reading in arm_feedback["positions"].items():
+            fields = {"raw", "normalized", "read_started_at_monotonic_s", "read_completed_at_monotonic_s"}
+            if not isinstance(reading, dict) or set(reading) != fields or type(reading["raw"]) is not int:
+                raise ValueError("invalid original native raw reading")
+            raw_started, raw_completed, normalized = (
+                reading["read_started_at_monotonic_s"], reading["read_completed_at_monotonic_s"], reading["normalized"]
+            )
+            if (
+                any(type(v) not in (int, float) or not math.isfinite(v) for v in (raw_started, raw_completed, normalized))
+                or not 0 <= raw_started <= raw_completed <= completed
+                or normalized != positions[key]
+            ):
+                raise ValueError("original native raw reading differs from measured feedback")
+            at = min(at, raw_started)
+        if now - at >= FEEDBACK_MAX_AGE_S:
+            raise FeedbackUnavailable("native raw feedback original acquisition expired")
     selected = marker.get("selected_joint")
     if selected is not None:
         if (
@@ -119,7 +155,7 @@ def read_physical_sample(client, run_id, host_incarnation, previous_sequence, *,
         "sequence": sequence,
         "at": at,
         "ack": {k: v for k, v in marker.items() if k != "selected_joint"},
-        "observation": dict(observation),
+        "observation": {**observation, **({"_am1_arm_feedback": copy.deepcopy(arm_feedback)} if arm_feedback is not None else {})},
         "body_feedback": {
             key: observation[key]
             for key in ("x.vel", "y.vel", "theta.vel", "lift_axis.vel", "lift_axis.height_mm")
@@ -136,6 +172,7 @@ def read_physical_sample(client, run_id, host_incarnation, previous_sequence, *,
         },
         "provenance": "protected-host/measured-feedback",
         **({"selected_joint": copy.deepcopy(selected)} if selected is not None else {}),
+        **({"arm_feedback": copy.deepcopy(arm_feedback)} if arm_feedback is not None else {}),
     }
 
 
@@ -244,8 +281,11 @@ class PhysicalExecutor:
         self._live_last_seq = -1
         self._live_admission_requested = False
         self._live_expired = None
+        self._teleop_source = None
 
     def supports(self, recipe):
+        if recipe.name == TELEOP_RECIPE:
+            return recipe.seed is None and recipe.mode == "interactive" and recipe.trajectory_s is None and recipe.live_s == 300
         return (
             (recipe.name in self.recipes or recipe.name in LIVE_ELBOW_SPECS)
             and recipe.seed is None
@@ -422,7 +462,8 @@ class PhysicalExecutor:
             ):
                 raise RuntimeError("previous physical owner is active or uncertain, or recipe unsupported")
             self.run_id, self.recipe = run_id, recipe
-            self.live_spec = LIVE_ELBOW_SPECS.get(recipe.name)
+            self.live_spec = TELEOP_SPEC if recipe.name == TELEOP_RECIPE else LIVE_ELBOW_SPECS.get(recipe.name)
+            self._teleop_source = None
             self._reconciliation_worker = None
             self.host_incarnation = __import__("uuid").uuid4().__str__()
             self.revision = 0
@@ -507,8 +548,14 @@ class PhysicalExecutor:
             return True
 
     def apply(self, target, *, valid_until_monotonic_s, intent_revision, run_id, service_incarnation,
-              controller_generation, connection_generation, host_incarnation, grant_id, seq):
+              controller_generation, connection_generation, host_incarnation, grant_id, seq, body=None, source=None):
         with self.mutex:
+            if self.recipe is not None and self.recipe.name == TELEOP_RECIPE:
+                return self._apply_teleop(target, body=body, source=source,
+                    valid_until_monotonic_s=valid_until_monotonic_s, intent_revision=intent_revision,
+                    run_id=run_id, service_incarnation=service_incarnation, controller_generation=controller_generation,
+                    connection_generation=connection_generation, host_incarnation=host_incarnation,
+                    grant_id=grant_id, seq=seq)
             joint = self.live_spec.joint if self.live_spec is not None else None
             if (self.recipe is None or self.live_spec is None or self.finish_status
                     or self._lifecycle["phase"] != "live" or self.desired != "active"
@@ -534,6 +581,31 @@ class PhysicalExecutor:
             self._live_last_seq = seq
             self._wake.set()
             return True
+
+    def _apply_teleop(self, target, *, body, source, valid_until_monotonic_s, intent_revision,
+                      run_id, service_incarnation, controller_generation, connection_generation,
+                      host_incarnation, grant_id, seq):
+        if (self.finish_status or self._lifecycle["phase"] != "live" or self.desired != "active"
+            or run_id != self.run_id or host_incarnation != self.host_incarnation or intent_revision != self.revision
+            or self._live_binding != {"service_incarnation": service_incarnation,
+                "controller_generation": controller_generation, "connection_generation": connection_generation}
+            or type(seq) is not int or seq <= self._live_last_seq
+            or type(valid_until_monotonic_s) not in (int, float) or not math.isfinite(valid_until_monotonic_s)
+            or not self.clock() < valid_until_monotonic_s <= self.clock() + .25 + 1e-9):
+            return False
+        try:
+            workspace = validate_workspace((self.sample or {}).get("ack", {}).get("live_input", {}).get("workspace"))
+            target = validate_target(target, workspace=workspace)
+            body = validate_body(body)
+            source = validate_source(source, grant_id=grant_id, previous=self._teleop_source)
+        except (KeyError, TypeError, ValueError):
+            return False
+        self._live_target = {"target": target, "body": body, "source": source, "grant_id": grant_id, "seq": seq,
+                             "valid_until_monotonic_s": valid_until_monotonic_s}
+        self._teleop_source = copy.deepcopy(source)
+        self._live_last_seq = seq
+        self._wake.set()
+        return True
 
     def evidence(self):
         with self.mutex:
@@ -592,7 +664,7 @@ class PhysicalExecutor:
                 "host_incarnation": self.host_incarnation,
                 "lifecycle": copy.deepcopy(self._lifecycle),
                 "transport_issue": self._transient,
-                **({"live_input": copy.deepcopy(self._live_expired or ack.get("live_input", {"state": "held", "joint": self.live_spec.joint}))}
+                **({"live_input": copy.deepcopy(self._live_expired or ack.get("live_input", {"state": "held", **({} if self.live_spec is TELEOP_SPEC else {"joint": self.live_spec.joint})}))}
                    if self.live_spec is not None else {}),
                 "reconciliation": {
                     "state": self._reconciliation_worker.state,
@@ -850,7 +922,8 @@ class PhysicalExecutor:
                         self._execution = {"progress_s": 0 if self._lifecycle["native_live_at"] is None else
                             max(0, self.clock() - self._lifecycle["native_live_at"]), "complete": False,
                             "fault": self._fault, "profile": live_spec.profile, "live_input": native,
-                            "provenance": "browser-origin/protected-host/measured-feedback"}
+                            "provenance": ("leader-origin/protected-host/measured-feedback" if live_spec is TELEOP_SPEC else
+                                           "browser-origin/protected-host/measured-feedback")}
                     if self.task:
                         if desired == "pause":
                             if self.task.active:
@@ -1240,7 +1313,11 @@ class ProtectedHostRun:
                 env.pop(k, None)
             env["AM1_SCRIPTED_PREPARE"] = "1"
             env["AM1_SELECTED_JOINT_EVIDENCE"] = "1"
-        if recipe.name in {LEFT_ELBOW_POSITIVE_CONTROL.recipe_name, SelectedElbowExperiment.recipe_name, *LIVE_ELBOW_SPECS}:
+        if recipe.name == TELEOP_RECIPE:
+            for k in ("AM1_SYNC_SHOULDER_READBACK", "AM1_LEFT_SHOULDER_EVIDENCE"):
+                env.pop(k, None)
+            env["AM1_SCRIPTED_PREPARE"] = "1"
+        if recipe.name in {LEFT_ELBOW_POSITIVE_CONTROL.recipe_name, SelectedElbowExperiment.recipe_name, *LIVE_ELBOW_SPECS, TELEOP_RECIPE}:
             env["AM1_VISIBLE_CONTROL_RECIPE"] = recipe.name
         if recipe.name in ELBOW_RECOVERY_DEFINITIONS:
             env["AM1_ELBOW_RECOVERY"] = f"I{ELBOW_RECOVERY_DEFINITIONS[recipe.name].integral}"
