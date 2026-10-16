@@ -516,6 +516,16 @@ class AlohaMini(Robot):
             elbow_trial.disable_torque(self)
         else:
             self._am1_elbow_integral_trial = None
+        right_p20 = None
+        if getattr(self, "_am1_right_p20_trial_binding", None) is not None:
+            from .am1_elbow_integral import AM1RightElbowProportionalTrial
+            if getattr(self, "_am1_right_elbow_p_trial", None) is not None:
+                raise RuntimeError("Right P20 owner transaction cannot be reused")
+            directory = self._am1_right_p20_trial_directory
+            right_p20 = AM1RightElbowProportionalTrial(self._am1_right_p20_trial_binding, directory)
+            self._am1_right_elbow_p_trial = right_p20
+            right_p20.prepare(self)
+            right_p20.disable_torque(self)
         set_torque_enabled(self.left_bus, [n for n in self.left_bus.motors if elbow_trial is None or n != RECOVERY_ELBOW], enabled=False)
         previous_trial = getattr(self, "_am1_shoulder_integral_trial", None)
         if previous_trial is not None:
@@ -537,7 +547,8 @@ class AlohaMini(Robot):
             write_register(self.left_bus, "Operating_Mode", name, OperatingMode.VELOCITY.value)
 
         if self.right_bus:
-            set_torque_enabled(self.right_bus, self.right_bus.motors, enabled=False)
+            set_torque_enabled(self.right_bus, [n for n in self.right_bus.motors
+                                               if right_p20 is None or n != "arm_right_elbow_flex"], enabled=False)
             self._configure_bus_defaults(self.right_bus)
             for name in self.right_arm_motors:
                 if (visible_binding is not None and self.right_bus is self._selected_joint_identity()[0]
@@ -555,6 +566,8 @@ class AlohaMini(Robot):
         self._am1_shoulder_integral_trial.configure(self)
         if elbow_trial is not None:
             elbow_trial.apply(self)
+        if right_p20 is not None:
+            right_p20.apply(self)
 
     def _seed_arm_goals(self, bus: FeetechMotorsBus, motors: list[str]) -> None:
         present_positions = {
@@ -1018,6 +1031,9 @@ class AlohaMini(Robot):
             elbow_trial = getattr(self, "_am1_elbow_integral_trial", None)
             if elbow_trial is not None:
                 elbow_trial.verify_active(self)
+            right_p20 = getattr(self, "_am1_right_elbow_p_trial", None)
+            if right_p20 is not None:
+                right_p20.verify_active(self)
             visible = getattr(self, "_am1_visible_control_evidence", None)
             if getattr(self, "_am1_visible_control_binding", None) is not None:
                 visible.verify_visible_active(self)
@@ -1082,6 +1098,10 @@ class AlohaMini(Robot):
                     elbow_trial = getattr(self, "_am1_elbow_integral_trial", None)
                     if bus is self.left_bus and name == RECOVERY_ELBOW and elbow_trial is not None:
                         elbow_trial.disable_torque(self)
+                    elif (bus is self.right_bus and name == "arm_right_elbow_flex"
+                          and getattr(self, "_am1_right_elbow_p_trial", None) is not None
+                          and self._am1_right_elbow_p_trial._created and self._am1_right_elbow_p_trial.restore_required):
+                        self._am1_right_elbow_p_trial.disable_torque(self)
                     else:
                         set_torque_enabled(bus, (name,), enabled=False)
                 except Exception as error:
@@ -1093,6 +1113,12 @@ class AlohaMini(Robot):
                 elbow_trial.restore(self)
             except BaseException as error:
                 errors.append(f"restore AM1 selected elbow integral: {type(error).__name__}: {error}")
+        right_p20 = getattr(self, "_am1_right_elbow_p_trial", None)
+        if right_p20 is not None:
+            try:
+                right_p20.restore(self)
+            except BaseException as error:
+                errors.append(f"restore AM1 right elbow proportional: {type(error).__name__}: {error}")
         integral_trial = getattr(self, "_am1_shoulder_integral_trial", None)
         if integral_trial is not None:
             try:
@@ -1142,9 +1168,12 @@ class AlohaMini(Robot):
             evidence["selected_gain_restore_required"] = bool(
                 (integral_trial is not None and integral_trial.restore_required)
                 or (elbow_trial is not None and elbow_trial.restore_required)
+                or (right_p20 is not None and right_p20.restore_required)
             )
             if elbow_trial is not None:
                 evidence["elbow_integral"] = elbow_trial.evidence
+            if right_p20 is not None:
+                evidence["right_p20_trial"] = right_p20.evidence
             evidence["completed_at_monotonic_s"] = time.monotonic()
             evidence["verified"] = not errors
 

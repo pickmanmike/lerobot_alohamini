@@ -463,7 +463,7 @@ for(const selected of [{recipe:"physical-live-left-elbow",joint:"arm_left_elbow_
   for(const option of ["physical-live-left-elbow","physical-live-right-elbow"])assert(await page.locator('#fake-recipe option[value="'+option+'"]').count());
   await page.locator("#fake-recipe").selectOption(selected.recipe);
   assert.match(await page.locator("#live-elbow-controls h2").innerText(),new RegExp(selected.label,"i"));
-  if(selected.side==="right")assert.match(await page.locator("#live-elbow-controls output").innerText(),/am1-right-elbow-retained-v1.*1834.*1867.*2\.984.*admission pending/i);
+  if(selected.side==="right")assert.match(await page.locator("#live-elbow-controls output").innerText(),/am1-right-elbow-rest-neighbourhood-v2.*1834.*1867.*2\.984.*admission pending/i);
   assert.match(await page.locator('[data-elbow-jog="1"]').getAttribute("aria-label"),new RegExp(selected.label,"i"));
   await page.locator('[data-operation="Start"]').click();await page.waitForTimeout(100);
   assert.equal(starts.length,1);assert.equal(starts[0].recipe,selected.recipe);
@@ -655,4 +655,20 @@ test("loaded bounded renewal cannot delay ordinary Stop while its HTTP reply is 
  await page.waitForFunction(()=>am1Remote.snapshot?.run?.status==='stopped');
  assert.equal(await page.evaluate(()=>Boolean(am1Remote.pendingRenewal)),true,"Stop completes before the unresolved renewal or its1s timeout");
  release();console.log(JSON.stringify({ordinaryStopAccepted:true,renewalStillPendingAtStop:true,protectiveLaneIndependent:true}));
+});
+
+
+test("workspace metadata policy identity accepts only retained v1 and reviewed v2",()=>{
+  const {readFileSync}=require("node:fs"),vm=require("node:vm"),context={};
+  vm.runInNewContext(readFileSync("tools/am1_console_ui/session_transport.js","utf8"),context);
+  const transport=new context.AM1SessionTransport(()=>{});
+  const actual=sharedLiveRecipes().find(spec=>spec.recipe==="physical-live-right-elbow");
+  for(const id of ["am1-right-elbow-retained-v1","am1-right-elbow-rest-neighbourhood-v2"]) {
+    const spec=structuredClone(actual);spec.supported_workspace.id=id;
+    assert.equal(transport.supportedWorkspace(spec),spec.supported_workspace,id);
+  }
+  for(const id of ["am1-right-elbow-rest-neighbourhood-v3","foreign-workspace","",null]) {
+    const spec=structuredClone(actual);spec.supported_workspace.id=id;
+    assert.equal(transport.supportedWorkspace(spec),null,"unknown policy must not become supported metadata");
+  }
 });

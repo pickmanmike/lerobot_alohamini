@@ -113,6 +113,23 @@ class LiveWorkspaceSpec:
                     span_norm=self.normalize(self.command_max_raw)-self.normalize(self.command_min_raw),
                     requires_current_admission=True)
 
+    def _canonical_goals(self, goals):
+        wrist = goals.get("arm_right_wrist_roll") if isinstance(goals, dict) else None
+        if (type(wrist) is not int
+                or abs(wrist-self.wrist_roll_goal_anchor_raw)>self.wrist_roll_goal_tolerance_raw):
+            raise ValueError("Live workspace actual wrist Goal left its fixed raw context")
+        left_wrist = goals.get("arm_left_wrist_flex")
+        if (type(left_wrist) is not int
+                or abs(left_wrist-self.left_wrist_flex_goal_anchor_raw)>self.left_wrist_flex_goal_tolerance_raw):
+            raise ValueError("Live workspace actual left wrist Goal left its fixed raw context")
+        shoulder = goals.get("arm_right_shoulder_pan")
+        if (type(shoulder) is not int
+                or abs(shoulder-self.right_shoulder_pan_goal_anchor_raw)>self.right_shoulder_pan_goal_tolerance_raw):
+            raise ValueError("Live workspace actual right shoulder Goal left its fixed raw context")
+        return dict(goals, arm_right_wrist_roll=self.wrist_roll_goal_anchor_raw,
+                    arm_left_wrist_flex=self.left_wrist_flex_goal_anchor_raw,
+                    arm_right_shoulder_pan=self.right_shoulder_pan_goal_anchor_raw)
+
     def qualify(self, context):
         try:
             if (not isinstance(context,dict) or set(context)!={"robot_model","selected_model","calibrations","nonselected_goals","right_pose"}
@@ -120,21 +137,7 @@ class LiveWorkspaceSpec:
                     or self._hash(context["calibrations"])!=self.calibration_context_sha256):
                 raise ValueError("Live workspace actual calibration or held Goal context differs")
             goals, calibration, pose = context["nonselected_goals"], context["calibrations"], context["right_pose"]
-            wrist = goals.get("arm_right_wrist_roll") if isinstance(goals, dict) else None
-            if (type(wrist) is not int
-                    or abs(wrist-self.wrist_roll_goal_anchor_raw)>self.wrist_roll_goal_tolerance_raw):
-                raise ValueError("Live workspace actual wrist Goal left its fixed raw context")
-            left_wrist = goals.get("arm_left_wrist_flex")
-            if (type(left_wrist) is not int
-                    or abs(left_wrist-self.left_wrist_flex_goal_anchor_raw)>self.left_wrist_flex_goal_tolerance_raw):
-                raise ValueError("Live workspace actual left wrist Goal left its fixed raw context")
-            shoulder = goals.get("arm_right_shoulder_pan")
-            if (type(shoulder) is not int
-                    or abs(shoulder-self.right_shoulder_pan_goal_anchor_raw)>self.right_shoulder_pan_goal_tolerance_raw):
-                raise ValueError("Live workspace actual right shoulder Goal left its fixed raw context")
-            canonical_goals = dict(goals, arm_right_wrist_roll=self.wrist_roll_goal_anchor_raw,
-                                   arm_left_wrist_flex=self.left_wrist_flex_goal_anchor_raw,
-                                   arm_right_shoulder_pan=self.right_shoulder_pan_goal_anchor_raw)
+            canonical_goals = self._canonical_goals(goals)
             if self._hash(canonical_goals)!=self.nonselected_goals_sha256:
                 raise ValueError("Live workspace actual calibration or held Goal context differs")
             right={name:raw for name,raw in goals.items() if name.startswith("arm_right_")}
@@ -166,7 +169,43 @@ class LiveWorkspaceSpec:
         return self.geometry(raw,reference)
 
 
-LIVE_ELBOW_WORKSPACES = MappingProxyType({"physical-live-right-elbow": LiveWorkspaceSpec()})
+@dataclass(frozen=True)
+class LiveRestWorkspaceSpec(LiveWorkspaceSpec):
+    """Fixed observed rest-pose box; each run still freezes its actual eleven Goals."""
+
+    id: str = "am1-right-elbow-rest-neighbourhood-v2"
+    pose_box_raw: tuple[tuple[str, int, int], ...] = (
+        ("arm_right_shoulder_pan", 2138, 2142),
+        ("arm_left_wrist_flex", 1546, 1547),
+        ("arm_right_wrist_roll", 2443, 2444),
+        ("arm_left_elbow_flex", 2124, 2125),
+        ("arm_left_gripper", 3167, 3168),
+    )
+
+    @property
+    def context_sha256(self):
+        return self._hash(dict(policy_version=2, base_policy=super().context_sha256,
+                               pose_box_raw=self.pose_box_raw))
+
+    def _canonical_goals(self, goals):
+        for name, low, high in self.pose_box_raw:
+            actual = goals.get(name) if isinstance(goals, dict) else None
+            if type(actual) is not int or not low <= actual <= high:
+                raise ValueError(f"Live workspace {self.id}: {name} actual raw {actual!r}; "
+                                 f"allowed fixed [{low}, {high}]")
+        return dict(goals, arm_right_wrist_roll=self.wrist_roll_goal_anchor_raw,
+                    arm_left_wrist_flex=self.left_wrist_flex_goal_anchor_raw,
+                    arm_right_shoulder_pan=self.right_shoulder_pan_goal_anchor_raw,
+                    arm_left_elbow_flex=2124, arm_left_gripper=3167)
+
+
+# Recognize retained v1 policy identities without rewriting stored descriptors.
+LIVE_ELBOW_WORKSPACE_POLICIES = MappingProxyType({
+    spec.id: spec for spec in (LiveWorkspaceSpec(), LiveRestWorkspaceSpec())
+})
+LIVE_ELBOW_WORKSPACES = MappingProxyType({
+    "physical-live-right-elbow": LIVE_ELBOW_WORKSPACE_POLICIES["am1-right-elbow-rest-neighbourhood-v2"]
+})
 
 
 @dataclass(frozen=True)

@@ -1,3 +1,37 @@
+## Active AM1-RESPONSE-12 continuation
+
+Execute only the owner-invoked Packet12 scope on existing PR23; keep it draft
+and unmerged while useful control remains unresolved. Packet12 supersedes the
+historical Packet11 prohibition on a current-context correction and authorizes
+only ONE reviewed, reversible same-joint response-parameter comparison. See
+[the Packet12 evidence and procedure](docs/alohamini/response-12.md).
+
+Preserve the completed re-jog, fixed-workspace, Claim/renewal, startup and native
+expiry repairs. Define one fixed, measured, geometry-supported resting-context
+policy before staging; do not ratchet bounds or add per-refusal exceptions.
+All eleven actual nonselected Goals remain exact within a run. Fresh measured
+q0, command1834..1867, rate<=1, sampled150mA guard, q0+/-3 measured guard,
+original250ms grants, original90s deadline and local protections remain.
+
+The sole conditional comparison is right-bus ID3/model777/FW3.10, P coefficient
+address21 original16 ->20; I0/D32, Phase12 and all force/current/travel limits
+remain. It requires exact source/rollback review, a private one-use run-bound
+request, durable original snapshot before writes, volatile Lock1 write/readback,
+and restored/read-back P16 BEFORE restoring original Lock state. Normal P16/I0
+admission stays unchanged. No request or service restart may replay the trial.
+A promising trial is not permanent tuning or ordinary-use qualification.
+
+Use original evidence first. No unchanged zero-response repetition, gain sweep,
+force increase, firmware/calibration change, new joints, network work, generic
+inspection or manual historical-pose/leader/readiness question is authorized.
+Root alone operates Git/SSH/staging/hardware; other agents stay offline in
+explicit disjoint files. Reuse existing tools, matched stopped staging and full
+rollback. AM1 wireless, P1 advisory, AM2 untouched. Durability means software
+fault tolerance, connection/control continuity, preserved state and recovery.
+
+The following Packet11 result and older sections remain historical and byte
+preserved. They do not replace Packet12 authority or qualify new results.
+
 ## Active AM1-LIVE-REUSE-11 result and continuing boundary
 
 PR22 integrated normally into integrate/am1-local-teleop at

@@ -1166,6 +1166,9 @@ class ProtectedHostRun:
         self.run_directory = root / run_id[:8]
         self.run_directory.mkdir(mode=0o700)
         self.receipt = self.run_directory / "cleanup.json"
+        from lerobot.robots.alohamini.am1_elbow_integral import consume_right_p20_request
+        right_p20_file = consume_right_p20_request(state, self.run_directory, recipe.name,
+                                                 run_id, incarnation, self.config["host_head"])
         experiment_file = None
         if definition is not None:
             import json
@@ -1266,6 +1269,8 @@ class ProtectedHostRun:
         ]
         if experiment_file is not None:
             host_command.extend(["--am1-selected-experiment-file", str(experiment_file)])
+        if right_p20_file is not None:
+            host_command.extend(["--am1-right-p20-trial-file", str(right_p20_file)])
         host_environment = {
             k: env[k]
             for k in (

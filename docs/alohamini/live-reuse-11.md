@@ -1,3 +1,5 @@
+Packet12 continues this work on the same unmerged PR23. See [supported rest and right-elbow response](response-12.md) for the current fixed-context correction, conditional one-use comparison and its verification state. The Packet11 results below remain the historical record at their stated source versions; they do not qualify new physical operation.
+
 # AM1 ordinary re-jog and retained workspace — Packet11
 
 **The ordinary re-jog software and retained right workspace are implemented; useful repeated physical control remains unresolved.** Two physical runs acknowledged opposite endpoint Goals but measured zero response. The latest short next Start passed the corrected lift off-acquisition checks, then refused before Live because actual right shoulder Goal2138 was outside its fixed2141±1 context. A separate browser renewal scheduling defect has been corrected and reviewed. The reviewed runtime-only update is staged and verified available idle; no further powered run was performed for publication.

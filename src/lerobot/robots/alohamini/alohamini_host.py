@@ -1241,6 +1241,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--am1-host-incarnation")
     parser.add_argument("--am1-cleanup-receipt")
     parser.add_argument("--am1-selected-experiment-file")
+    parser.add_argument("--am1-right-p20-trial-file")
     parser.add_argument("--am1-admission-fd", type=int)
     parser.add_argument("--am1-host-runtime-s", type=int, default=480)
     parser.add_argument("--am1-physical-state-directory", default=str(Path.home() / ".local/state/am1-session"))
@@ -1346,6 +1347,20 @@ def visible_control_binding(args):
     return dict(binding, experiment_sha256=definition.sha256)
 
 
+def right_p20_trial_binding(args, visible_binding):
+    path = getattr(args, "am1_right_p20_trial_file", None)
+    if path is None:
+        return None
+    from .am1_elbow_integral import RIGHT_P20_RECIPE, load_right_p20_binding
+    expected = dict(run_id=args.am1_run_id, host_incarnation=args.am1_host_incarnation, recipe=RIGHT_P20_RECIPE)
+    if (visible_binding != expected or args.robot_model != "alohamini1" or args.no_follower or not args.no_cameras
+            or not getattr(args, "am1_protected_run_directory", None)
+            or os.environ.get("AM1_SCRIPTED_PREPARE") != "1" or os.environ.get("AM1_SELECTED_JOINT_EVIDENCE") != "1"
+            or os.environ.get("AM1_ELBOW_RECOVERY") is not None or os.environ.get("AM1_SHOULDER_INTEGRAL_TEST") == "1"):
+        raise ValueError("Right P20 file requires its exact isolated protected right-live owner")
+    return load_right_p20_binding(path, args.am1_protected_run_directory, args.am1_run_id, args.am1_host_incarnation)
+
+
 def elbow_recovery_binding(args):
     """Only a reviewed protected recipe can select the owner-scoped ID3 trial."""
     integral = os.environ.get("AM1_ELBOW_RECOVERY")
@@ -1374,6 +1389,7 @@ def _run_host(args):
     _validate_host_arguments(args)
     visible_binding = visible_control_binding(args)
     recovery_binding = elbow_recovery_binding(args)
+    right_p20_binding = right_p20_trial_binding(args, visible_binding)
 
     logging.info("Configuring AlohaMini")
     robot_config = make_robot_config(args)
@@ -1383,6 +1399,9 @@ def _run_host(args):
     args._am1_robot = robot
     # Every admitted AM1 owner needs actual cleanup proof, including legacy CLI.
     robot._am1_protected_cleanup = args.robot_model == "alohamini1"
+    if right_p20_binding is not None:
+        robot._am1_right_p20_trial_binding = right_p20_binding
+        robot._am1_right_p20_trial_directory = args.am1_protected_run_directory
     left_shoulder_evidence = AM1LeftShoulderEvidence(
         enabled=(os.environ.get("AM1_LEFT_SHOULDER_EVIDENCE") == "1"
                  and args.robot_model == "alohamini1" and not args.no_follower),

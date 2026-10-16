@@ -1645,3 +1645,48 @@ def test_right_workspace_source_refuses_configured_foreign_calibration_before_ow
     monkeypatch.setattr(subprocess,"check_output",lambda *a,**k: (_ for _ in ()).throw(AssertionError("No Git/source IO before workspace context refusal")))
     with pytest.raises(RuntimeError,match="workspace.*calibration"):
         provider._validate_source()
+
+
+
+@pytest.mark.parametrize("recipe,present", [("physical-live-right-elbow", True), ("physical-live-left-elbow", True),
+                                           ("physical-arm-hold-body", True), ("physical-live-right-elbow", False)])
+def test_right_p20_executor_consumes_only_one_current_request_before_owned_units(tmp_path, monkeypatch, recipe, present):
+    from tests.robots.test_am1_elbow_integral import right_p20_request, RIGHT_P20_RUN, RIGHT_P20_HOST
+    from examples.alohamini.am1_session_contract import RECIPES
+    import json
+    m = module()
+    state, root = tmp_path / "state", tmp_path / "runs"
+    state.mkdir(mode=0o700); root.mkdir(mode=0o700)
+    request = state / "response12-right-p20-request.json"
+    if present:
+        request.write_text(json.dumps(right_p20_request(), sort_keys=True, separators=(",", ":"))); request.chmod(0o600)
+    provider = object.__new__(m.ProtectedHostRun)
+    provider.config = {"physical_state_directory": str(state), "run_root": str(root), "host_head": "a" * 40,
+                       "host_repository": str(tmp_path), "host_python": "unused-python", "camera_python": "unused-python",
+                       "camera_repository": str(tmp_path), "camera_config": str(tmp_path / "config"),
+                       "camera_credentials": str(tmp_path / "credentials"), "camera_binary": str(tmp_path / "binary"),
+                       "camera_state": str(tmp_path / "camera")}
+    provider.observation = SimpleNamespace()
+    monkeypatch.setattr(provider, "_validate_source", lambda: None)
+    monkeypatch.setattr(m, "wait_required_camera", lambda *args: None)
+    owned = []
+    def unit(name, *args, **kwargs):
+        owned.append((name, args))
+        if "host" in name: raise OSError("stop before hardware host creation")
+        return SimpleNamespace()
+    monkeypatch.setattr(m, "OwnedUnit", unit)
+    if present and recipe != "physical-live-right-elbow":
+        with pytest.raises(ValueError, match="different side/body"):
+            provider.start(RIGHT_P20_RUN, RIGHT_P20_HOST, RECIPES[recipe], lambda: None)
+        assert request.exists() and not owned
+        return
+    with pytest.raises(OSError, match="before hardware"):
+        provider.start(RIGHT_P20_RUN, RIGHT_P20_HOST, RECIPES[recipe], lambda: None)
+    host_command = owned[-1][1][1]
+    if present:
+        assert not request.exists(), "trial request must be consumed before any owned unit"
+        option = host_command.index("--am1-right-p20-trial-file")
+        descriptor = root / RIGHT_P20_RUN[:8] / "response12-right-p20.json"
+        assert host_command[option + 1] == str(descriptor) and descriptor.exists()
+    else:
+        assert "--am1-right-p20-trial-file" not in host_command

@@ -881,7 +881,7 @@ def test_physical_live_selected_recipe_controls_only_its_frozen_joint(physical_l
         (((1834-827)/2212*200-100, (1867-827)/2212*200-100) if right else (-10.0, 0.0)))
     if right:
         assert live["admission_version"] == 2
-        assert live["workspace"]["id"] == "am1-right-elbow-retained-v1"
+        assert live["workspace"]["id"] == "am1-right-elbow-rest-neighbourhood-v2"
         assert live["measured_origin_raw"] == 1845
     base = physical_live_controls(a, r)
     other_recipe = "physical-live-left-elbow" if right else "physical-live-right-elbow"

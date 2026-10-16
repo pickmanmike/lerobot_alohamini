@@ -993,3 +993,58 @@ def test_visible_pause_never_recenters_confirmation_absolute_reference(monkeypat
     sample(2110)
     with pytest.raises(RuntimeError, match="absolute excursion"):
         evidence.guard_recovery(obj, control, {})
+
+
+
+def test_right_p20_raw_paired_visible_proof_is_trial_only_and_never_rewrites_pid(monkeypatch, tmp_path, request):
+    from tests.robots.test_am1_elbow_integral import right_p20_robot, RIGHT_P20_MOTOR
+    from lerobot.robots.alohamini.am1_elbow_integral import RIGHT_P20_RECIPE
+    from examples.alohamini.am1_session_contract import PositiveElbowControl
+    obj, trial, directory = right_p20_robot(tmp_path)
+    request.addfinalizer(lambda: obj._safe_shutdown(close_buses=True))
+    evidence, rows = sampler()
+    obj._am1_visible_control_evidence = evidence
+    before = bytearray(visible_register_packet(present=1845, goal=1845, range_min=827, range_max=3039))
+    before[18] = 12; before[31:33] = (2048 + 658).to_bytes(2, "little")
+    active = bytearray(before); active[21] = 20; active[40] = active[55] = 1
+    obj.right_bus.port_handler = None
+    # Full reads use the real DirectSdkTransport over a finite SDK port fixture.
+    port = attach_port(obj, [])
+    obj.right_bus.port_handler = obj.left_bus.port_handler
+    obj.right_bus.packet_handler = obj.left_bus.packet_handler
+    decoder = FeetechMotorsBus("unused-right-p20", obj.right_bus.motors, obj.right_bus.calibration)
+    obj.right_bus.port = decoder.port
+    obj.right_bus._decode_sign = decoder._decode_sign
+    obj.right_bus.model_ctrl_table = decoder.model_ctrl_table
+    obj.right_bus.apply_drive_mode = decoder.apply_drive_mode
+    port.responses = [status(bytes(before), motor_id=3), status(bytes([254]), motor_id=3),
+                    status(bytes(active), motor_id=3), status(bytes([254]), motor_id=3)]
+    evidence.prepare_visible(obj, obj._am1_visible_control_binding)
+    trial.prepare(obj); trial.disable_torque(obj); trial.apply(obj)
+    obj.right_bus.values[("Torque_Enable", RIGHT_P20_MOTOR)] = 1
+    trial.verify_active(obj)
+    evidence.verify_visible_active(obj)
+    proof = evidence.visible_control_proof(obj)
+    assert proof["before"]["registers"]["P_Coefficient"] == 16
+    assert proof["active"]["registers"]["P_Coefficient"] == 20
+    assert proof["unchanged"] is False and proof["right_p20_trial"]["restore_required"] is True
+    assert not PositiveElbowControl._settings_valid(proof, recipe_name=RIGHT_P20_RECIPE, current_cap_ma=150)
+    assert evidence._live_definition.settings_valid(proof)
+    import copy
+    masked = copy.deepcopy(proof)
+    masked.pop("right_p20_trial")
+    masked["active"]["registers"]["P_Coefficient"] = 16
+    masked["unchanged"] = True
+    assert not evidence._live_definition.settings_valid(masked), "an opted trial cannot fall back to normal proof"
+    for mutation in ("left", "integral", "p", "request", "context", "clock", "restored", "profile"):
+        bad = copy.deepcopy(proof)
+        if mutation == "left": bad["binding"]["recipe"] = "physical-live-left-elbow"
+        elif mutation == "integral": bad["active"]["registers"]["I_Coefficient"] = 1
+        elif mutation == "p": bad["active"]["registers"]["P_Coefficient"] = 21
+        elif mutation == "request": bad["right_p20_trial"]["request_sha256"] = "x" * 64
+        elif mutation == "context": bad["right_p20_trial"]["context_sha256"] = "0" * 64
+        elif mutation == "clock": bad["right_p20_trial"]["configured_at_monotonic_s"] = proof["active"]["read_completed_at_monotonic_s"] + 1
+        elif mutation == "restored": bad["right_p20_trial"]["restore_required"] = False
+        else: bad["active"]["registers"]["Torque_Limit"] += 1
+        assert not evidence._live_definition.settings_valid(bad), mutation
+    assert len(json.dumps(proof, separators=(",", ":"))) < 4096

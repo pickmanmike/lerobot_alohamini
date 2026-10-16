@@ -54,6 +54,16 @@ class _LiveElbowDefinition:
     def settings_valid(self, proof):
         from examples.alohamini.am1_session_contract import PositiveElbowControl
 
+        if (getattr(self, "right_p20_trial", None) is not None
+                or isinstance(proof, dict) and "right_p20_trial" in proof):
+            from .am1_elbow_integral import RIGHT_P20_RECIPE, right_p20_settings_valid
+            trial = getattr(self, "right_p20_trial", None)
+            try:
+                return (self.recipe_name == RIGHT_P20_RECIPE and trial is not None
+                        and isinstance(proof, dict) and proof.get("right_p20_trial") == trial.receipt
+                        and right_p20_settings_valid(proof))
+            except (RuntimeError, ValueError, OSError):
+                return False
         return PositiveElbowControl._settings_valid(proof, recipe_name=self.recipe_name, current_cap_ma=self.current_cap_ma)
 
 
@@ -319,6 +329,15 @@ class AM1SelectedJointEvidence:
             "individual_bytes": active["individual_bytes"],
         }
         self.visible_settings["unchanged"] = original == now
+        trial = getattr(robot, "_am1_right_elbow_p_trial", None)
+        if trial is not None:
+            from .am1_elbow_integral import AM1RightElbowProportionalTrial, RIGHT_P20_RECIPE
+            if (not isinstance(trial, AM1RightElbowProportionalTrial) or definition.recipe_name != RIGHT_P20_RECIPE
+                    or trial.binding != getattr(robot, "_am1_right_p20_trial_binding", None)):
+                raise RuntimeError("Visible P20 proof requires its exact right one-use trial")
+            trial._same_owner(robot)
+            self._live_definition.right_p20_trial = trial
+            self.visible_settings["right_p20_trial"] = trial.receipt
         self.visible_settings["settings_sha256"] = hashlib.sha256(
             json.dumps(original, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
         ).hexdigest()

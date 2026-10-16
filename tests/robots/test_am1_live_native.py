@@ -1215,7 +1215,7 @@ WORKSPACE_CALIBRATION = {
 WORKSPACE_GOALS = dict(zip(WORKSPACE_CALIBRATION, (2199,3223,2124,1546,2200,3167,2141,3252,1845,2772,2443,1981), strict=True))
 
 
-def workspace_owner(case, monkeypatch, raw=1845, *, wrist_raw=2443, left_wrist_raw=1546, shoulder_pan_raw=2141):
+def workspace_owner(case, monkeypatch, raw=1845, *, wrist_raw=2443, left_wrist_raw=1546, shoulder_pan_raw=2141, left_elbow_raw=2124, left_gripper_raw=3167):
     """Actual owner/frozen-map methods; only device registers and clock are injected."""
     from lerobot.robots.alohamini import alohamini as module
     robot = protected_endpoint_case(case, monkeypatch)
@@ -1225,7 +1225,7 @@ def workspace_owner(case, monkeypatch, raw=1845, *, wrist_raw=2443, left_wrist_r
             calibration = WORKSPACE_CALIBRATION[name]
             bus.motors[name].norm_mode=MotorNormMode.RANGE_0_100 if name.endswith("_gripper") else MotorNormMode.RANGE_M100_100
             bus.calibration[name] = MotorCalibration(*calibration)
-            value = raw if name == RIGHT else wrist_raw if name == "arm_right_wrist_roll" else left_wrist_raw if name == "arm_left_wrist_flex" else shoulder_pan_raw if name == "arm_right_shoulder_pan" else WORKSPACE_GOALS[name]
+            value = raw if name == RIGHT else wrist_raw if name == "arm_right_wrist_roll" else left_wrist_raw if name == "arm_left_wrist_flex" else shoulder_pan_raw if name == "arm_right_shoulder_pan" else left_elbow_raw if name == "arm_left_elbow_flex" else left_gripper_raw if name == "arm_left_gripper" else WORKSPACE_GOALS[name]
             bus.registers.update({(key,name):v for key,v in (
                 ("Min_Position_Limit",calibration[3]),("Max_Position_Limit",calibration[4]),
                 ("Homing_Offset",calibration[2]),("Present_Position",3224 if name=="arm_left_shoulder_lift" else value),
@@ -1265,7 +1265,7 @@ def test_workspace_next_start_keeps_actual_q0_and_reuses_inward_bounds(endpoint_
     assert live["measured_origin_raw"]==raw
     assert (live["corridor_min_raw"],live["corridor_max_raw"])==(1834,1867)
     assert live["admission_version"]==2
-    assert live["workspace"]["id"]=="am1-right-elbow-retained-v1"
+    assert live["workspace"]["id"]=="am1-right-elbow-rest-neighbourhood-v2"
     assert robot.right_bus.registers["Goal_Position",RIGHT]==raw
     assert not any(e[0]=="write" and e[2]=="Goal_Position" and e[4]==1867 for e in endpoint_activation.events[before:])
 
@@ -1342,12 +1342,14 @@ def test_workspace_owned_writes_reach_both_fixed_endpoints_across_actual_q0(monk
     assert all(set(values)=={3} for _,_,values in goals)
 
 
-def wrist_workspace_context(raw=2443, *, left_wrist_raw=1546, shoulder_pan_raw=2141):
+def wrist_workspace_context(raw=2443, *, left_wrist_raw=1546, shoulder_pan_raw=2141, left_elbow_raw=2124, left_gripper_raw=3167):
     """Existing actual AM1 fixture; preserve actual changed Goal and measured pose."""
     goals={name:value for name,value in WORKSPACE_GOALS.items() if name!=RIGHT}
     goals["arm_right_wrist_roll"]=raw
     goals["arm_left_wrist_flex"]=left_wrist_raw
     goals["arm_right_shoulder_pan"]=shoulder_pan_raw
+    goals["arm_left_elbow_flex"]=left_elbow_raw
+    goals["arm_left_gripper"]=left_gripper_raw
     pose={}
     for name,value in goals.items():
         if not name.startswith("arm_right_"):continue
@@ -1359,7 +1361,7 @@ def wrist_workspace_context(raw=2443, *, left_wrist_raw=1546, shoulder_pan_raw=2
         nonselected_goals=goals,right_pose=pose)
 
 
-@pytest.mark.parametrize("raw",[2442,2443,2444])
+@pytest.mark.parametrize("raw",[2443,2444])
 def test_workspace_fixed_wrist_anchor_admits_actual_one_tick_seed_without_rewrite(endpoint_activation,monkeypatch,raw):
     robot,control,identity,owner=workspace_owner(endpoint_activation,monkeypatch,wrist_raw=raw)
     assert control.apply(robot,frame(identity,owner,sequence=1))
@@ -1378,8 +1380,8 @@ def test_workspace_fixed_wrist_anchor_rejects_outside_two_ticks_or_noninteger(ra
     with pytest.raises(ValueError):LIVE_ELBOW_WORKSPACES[RIGHT_RECIPE].qualify(wrist_workspace_context(raw))
 
 
-@pytest.mark.parametrize("name",[name for name in WORKSPACE_GOALS if name not in {RIGHT,"arm_right_wrist_roll","arm_left_wrist_flex","arm_right_shoulder_pan"}])
-def test_workspace_fixed_anchors_keep_other_eight_goal_coordinates_exact(name):
+@pytest.mark.parametrize("name",[name for name in WORKSPACE_GOALS if name not in {RIGHT,"arm_right_wrist_roll","arm_left_wrist_flex","arm_right_shoulder_pan","arm_left_elbow_flex","arm_left_gripper"}])
+def test_workspace_rest_box_keeps_other_six_goal_coordinates_exact(name):
     from examples.alohamini.am1_session_contract import LIVE_ELBOW_WORKSPACES
     context=wrist_workspace_context(2444,left_wrist_raw=1547,shoulder_pan_raw=2142);context["nonselected_goals"][name]+=1
     with pytest.raises(ValueError):LIVE_ELBOW_WORKSPACES[RIGHT_RECIPE].qualify(context)
@@ -1411,8 +1413,8 @@ def test_workspace_wrist_anchor_does_not_relax_same_run_frozen_goal_reads(endpoi
 
 def test_workspace_wrist_policy_identity_covers_anchor_and_tolerance_without_schema_growth():
     from dataclasses import replace
-    from examples.alohamini.am1_session_contract import LIVE_ELBOW_WORKSPACES
-    spec=LIVE_ELBOW_WORKSPACES[RIGHT_RECIPE]
+    from examples.alohamini.am1_session_contract import LIVE_ELBOW_WORKSPACE_POLICIES
+    spec=LIVE_ELBOW_WORKSPACE_POLICIES["am1-right-elbow-retained-v1"]
     assert spec.wrist_roll_goal_anchor_raw==2443 and spec.wrist_roll_goal_tolerance_raw==1
     assert spec.context_sha256!=replace(spec,wrist_roll_goal_anchor_raw=2444).context_sha256
     assert spec.context_sha256!=replace(spec,wrist_roll_goal_tolerance_raw=2).context_sha256
@@ -1420,7 +1422,7 @@ def test_workspace_wrist_policy_identity_covers_anchor_and_tolerance_without_sch
     assert len(spec.descriptor)==5 and len(spec.summary())==11
 
 
-@pytest.mark.parametrize("raw", [1545,1546,1547])
+@pytest.mark.parametrize("raw", [1546,1547])
 def test_workspace_left_wrist_fixed_anchor_admits_actual_seed_without_goal_rewrite(endpoint_activation,monkeypatch,raw):
     robot,control,identity,owner=workspace_owner(endpoint_activation,monkeypatch,wrist_raw=2444,left_wrist_raw=raw)
     assert control.apply(robot,frame(identity,owner,sequence=1))
@@ -1454,8 +1456,8 @@ def test_workspace_left_wrist_fixed_anchor_preserves_actual_context_and_calibrat
 
 def test_workspace_left_wrist_fixed_anchor_changes_policy_identity_not_schema():
     from dataclasses import replace
-    from examples.alohamini.am1_session_contract import LIVE_ELBOW_WORKSPACES
-    spec=LIVE_ELBOW_WORKSPACES[RIGHT_RECIPE]
+    from examples.alohamini.am1_session_contract import LIVE_ELBOW_WORKSPACE_POLICIES
+    spec=LIVE_ELBOW_WORKSPACE_POLICIES["am1-right-elbow-retained-v1"]
     assert spec.left_wrist_flex_goal_anchor_raw==1546
     assert spec.left_wrist_flex_goal_tolerance_raw==1
     assert spec.context_sha256!=replace(spec,left_wrist_flex_goal_anchor_raw=1547).context_sha256
@@ -1481,7 +1483,7 @@ def test_workspace_shoulder_pan_fixed_anchor_admits_actual_seed_without_goal_rew
         robot.am1_live_arm_commands({**identity,"recipe":RIGHT_RECIPE})
 
 
-@pytest.mark.parametrize("raw",[2139,2143,2141.0,True,None,"2141",float("nan")])
+@pytest.mark.parametrize("raw",[2137,2143,2141.0,True,None,"2141",float("nan")])
 def test_workspace_shoulder_pan_fixed_anchor_rejects_two_ticks_and_wrong_types(raw):
     from examples.alohamini.am1_session_contract import LIVE_ELBOW_WORKSPACES
     with pytest.raises(ValueError):
@@ -1502,11 +1504,122 @@ def test_workspace_shoulder_pan_fixed_anchor_preserves_actual_context_calibratio
 
 def test_workspace_shoulder_pan_fixed_anchor_is_in_policy_identity_without_schema_growth():
     from dataclasses import replace
-    from examples.alohamini.am1_session_contract import LIVE_ELBOW_WORKSPACES
-    spec=LIVE_ELBOW_WORKSPACES[RIGHT_RECIPE]
+    from examples.alohamini.am1_session_contract import LIVE_ELBOW_WORKSPACE_POLICIES
+    spec=LIVE_ELBOW_WORKSPACE_POLICIES["am1-right-elbow-retained-v1"]
     assert spec.right_shoulder_pan_goal_anchor_raw==2141
     assert spec.right_shoulder_pan_goal_tolerance_raw==1
     assert spec.context_sha256!=replace(spec,right_shoulder_pan_goal_anchor_raw=2142).context_sha256
     assert spec.context_sha256!=replace(spec,right_shoulder_pan_goal_tolerance_raw=2).context_sha256
     assert spec.context_sha256!="75e93cad4c958797494679e1a5e3f9c992587004a53ef2f6aa900e38911b0fcf"
     assert len(spec.descriptor)==5 and len(spec.summary())==11
+
+
+# Actual retained startup operands; full calibration/eight fixed Goals use the existing fixture.
+@pytest.mark.parametrize("trial,pan,left_wrist,right_wrist", [
+    ("p10-02",2141,1546,2443), ("p10-04",2141,1546,2443),
+    ("p10-05",2141,1546,2443), ("p10-06",2141,1546,2443),
+    ("p10-08",2141,1546,2443), ("p10-09",2141,1546,2443),
+    ("p10-10",2141,1546,2443), ("p11-01",2141,1546,2443),
+    ("p11-02",2141,1546,2444), ("p11-03",2141,1547,2444),
+    ("p11-04",2141,1547,2444), ("p11-05",2141,1547,2444),
+    ("p11-06",2141,1547,2444), ("p11-07",2142,1547,2444),
+    ("p11-10",2138,1547,2444),
+])
+def test_workspace_rest_box_preserves_retained_context_operands(trial,pan,left_wrist,right_wrist):
+    from examples.alohamini.am1_session_contract import LIVE_ELBOW_WORKSPACES
+    context=wrist_workspace_context(right_wrist,left_wrist_raw=left_wrist,shoulder_pan_raw=pan)
+    original=copy.deepcopy(context)
+    LIVE_ELBOW_WORKSPACES[RIGHT_RECIPE].qualify(context)
+    assert context==original,trial
+
+
+@pytest.mark.parametrize("pan,left_wrist,right_wrist,left_elbow,left_gripper", [
+    (pan,left,right,elbow,gripper) for pan in range(2138,2143) for left in (1546,1547)
+    for right in (2443,2444) for elbow in (2124,2125) for gripper in (3167,3168)
+])
+def test_workspace_rest_box_is_fixed_between_starts(pan,left_wrist,right_wrist,left_elbow,left_gripper):
+    from examples.alohamini.am1_session_contract import LIVE_ELBOW_WORKSPACES
+    spec=LIVE_ELBOW_WORKSPACES[RIGHT_RECIPE]
+    before=copy.deepcopy(spec.descriptor)
+    spec.qualify(wrist_workspace_context(right_wrist,left_wrist_raw=left_wrist,shoulder_pan_raw=pan,
+        left_elbow_raw=left_elbow,left_gripper_raw=left_gripper))
+    assert spec.descriptor==before
+    for refused in (2137,2143):
+        with pytest.raises(ValueError):
+            spec.qualify(wrist_workspace_context(right_wrist,left_wrist_raw=left_wrist,shoulder_pan_raw=refused,
+                left_elbow_raw=left_elbow,left_gripper_raw=left_gripper))
+
+
+@pytest.mark.parametrize("name,value,low,high", [
+    ("arm_right_shoulder_pan",2137,2138,2142), ("arm_right_shoulder_pan",2143,2138,2142),
+    ("arm_left_wrist_flex",1545,1546,1547), ("arm_left_wrist_flex",1548,1546,1547),
+    ("arm_right_wrist_roll",2442,2443,2444), ("arm_right_wrist_roll",2445,2443,2444),
+    ("arm_left_elbow_flex",2123,2124,2125), ("arm_left_elbow_flex",2126,2124,2125),
+    ("arm_left_gripper",3166,3167,3168), ("arm_left_gripper",3169,3167,3168),
+])
+def test_workspace_rest_box_refusal_identifies_actual_coordinate_and_fixed_bounds(name,value,low,high):
+    from examples.alohamini.am1_session_contract import LIVE_ELBOW_WORKSPACES
+    context=wrist_workspace_context();context["nonselected_goals"][name]=value
+    with pytest.raises(ValueError) as error:LIVE_ELBOW_WORKSPACES[RIGHT_RECIPE].qualify(context)
+    message=str(error.value)
+    assert all(str(part) in message for part in (name,value,low,high,"am1-right-elbow-rest-neighbourhood-v2"))
+
+
+@pytest.mark.parametrize("name",["arm_right_shoulder_pan","arm_left_wrist_flex","arm_right_wrist_roll","arm_left_elbow_flex","arm_left_gripper"])
+@pytest.mark.parametrize("value",[True,None,1.0,"2141",float("nan"),float("inf")])
+def test_workspace_rest_box_refuses_wrong_raw_types(name,value):
+    from examples.alohamini.am1_session_contract import LIVE_ELBOW_WORKSPACES
+    context=wrist_workspace_context();context["nonselected_goals"][name]=value
+    with pytest.raises(ValueError):LIVE_ELBOW_WORKSPACES[RIGHT_RECIPE].qualify(context)
+
+
+def test_workspace_rest_box_versions_policy_without_rewriting_legacy_descriptor():
+    from examples.alohamini.am1_session_contract import LIVE_ELBOW_WORKSPACES, LIVE_ELBOW_WORKSPACE_POLICIES
+    legacy=LIVE_ELBOW_WORKSPACE_POLICIES["am1-right-elbow-retained-v1"]
+    original=dict(version=1,id="am1-right-elbow-retained-v1",
+        context_sha256="8766486351b401fad533f0df28032cc7fa4fb0924739b9e6b13ab41d77b59ccf",
+        evidence_min_raw=1833,evidence_max_raw=1867)
+    assert legacy.descriptor==original
+    legacy.qualify(wrist_workspace_context(2442,left_wrist_raw=1545,shoulder_pan_raw=2140))
+    with pytest.raises(ValueError):legacy.qualify(wrist_workspace_context(2444,left_wrist_raw=1547,shoulder_pan_raw=2138))
+    current=LIVE_ELBOW_WORKSPACES[RIGHT_RECIPE]
+    assert current.id=="am1-right-elbow-rest-neighbourhood-v2"
+    assert current.context_sha256!=legacy.context_sha256
+    assert len(current.descriptor)==5 and current.descriptor["version"]==1 and len(current.summary())==11
+    assert legacy.descriptor==original
+    with pytest.raises(TypeError):LIVE_ELBOW_WORKSPACE_POLICIES[current.id]=legacy
+
+
+def test_workspace_rest_box_fresh_prospective_seed_keeps_native_eleven_holds_exact(endpoint_activation,monkeypatch):
+    robot,control,identity,owner=workspace_owner(endpoint_activation,monkeypatch,
+        wrist_raw=2444,left_wrist_raw=1547,shoulder_pan_raw=2138,left_elbow_raw=2125,left_gripper_raw=3168)
+    assert control.apply(robot,frame(identity,owner,sequence=1))
+    frozen=robot._am1_live_frozen_holds
+    live=control.live_snapshot()
+    assert live["workspace"]["id"]=="am1-right-elbow-rest-neighbourhood-v2"
+    assert live["measured_origin_raw"]==1845
+    assert (live["corridor_min_raw"],live["corridor_max_raw"])==(1834,1867)
+    assert live["live_deadline_monotonic_s"]-live["live_admitted_at_monotonic_s"]==90
+    for bus,name,value,other in ((robot.right_bus,"arm_right_shoulder_pan",2138,2139),
+                               (robot.left_bus,"arm_left_wrist_flex",1547,1546),
+                               (robot.right_bus,"arm_right_wrist_roll",2444,2443),
+                               (robot.left_bus,"arm_left_elbow_flex",2125,2124),
+                               (robot.left_bus,"arm_left_gripper",3168,3167)):
+        assert bus.registers["Goal_Position",name]==value
+        bus.registers["Goal_Position",name]=other
+        with pytest.raises(RuntimeError,match="acknowledged"):
+            robot.am1_live_arm_commands({**identity,"recipe":RIGHT_RECIPE})
+        bus.registers["Goal_Position",name]=value
+    assert robot._am1_live_frozen_holds==frozen
+
+
+def test_workspace_rest_box_fresh_passive_pp_is_prospective_seed_not_old_goal():
+    from examples.alohamini.am1_session_contract import LIVE_ELBOW_WORKSPACES
+    # Three actual stopped passes: PP2125/3168 vs retained Goal2124/3167; no write occurred.
+    context=wrist_workspace_context(2444,left_wrist_raw=1547,shoulder_pan_raw=2138,
+        left_elbow_raw=2125,left_gripper_raw=3168)
+    original=copy.deepcopy(context)
+    result=LIVE_ELBOW_WORKSPACES[RIGHT_RECIPE].admission(context,1845,-7.956600361663661)
+    assert result["measured_origin_raw"]==1845 and result["admission_version"]==2
+    assert (result["corridor_min_raw"],result["corridor_max_raw"])==(1834,1867)
+    assert context==original

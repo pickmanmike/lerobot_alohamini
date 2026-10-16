@@ -19,7 +19,7 @@ class AM1SessionTransport {
   supportedWorkspace(spec) {
     const w=spec?.supported_workspace,keys=["version","id","context_sha256","evidence_min_raw","evidence_max_raw","command_min_raw","command_max_raw","command_min_norm","command_max_norm","span_norm","requires_current_admission"];
     if(spec?.side!=="right"||!w||typeof w!=="object"||Object.keys(w).length!==keys.length||keys.some(key=>!Object.hasOwn(w,key))
-      ||w.version!==1||w.id!=="am1-right-elbow-retained-v1"||typeof w.context_sha256!=="string"||!/^[0-9a-f]{64}$/.test(w.context_sha256)||w.requires_current_admission!==true
+      ||w.version!==1||!["am1-right-elbow-retained-v1","am1-right-elbow-rest-neighbourhood-v2"].includes(w.id)||typeof w.context_sha256!=="string"||!/^[0-9a-f]{64}$/.test(w.context_sha256)||w.requires_current_admission!==true
       ||![w.evidence_min_raw,w.evidence_max_raw,w.command_min_raw,w.command_max_raw].every(Number.isInteger)||w.evidence_min_raw>w.command_min_raw||w.command_min_raw>=w.command_max_raw||w.command_max_raw>w.evidence_max_raw
       ||![w.command_min_norm,w.command_max_norm,w.span_norm].every(value=>typeof value==="number"&&Number.isFinite(value))
        ||w.command_min_norm>=w.command_max_norm||w.span_norm<=0||w.span_norm>3||Math.abs(w.command_max_norm-w.command_min_norm-w.span_norm)>1e-9)return null;
