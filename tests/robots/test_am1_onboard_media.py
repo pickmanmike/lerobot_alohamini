@@ -63,17 +63,31 @@ def test_stalled_encoder_cannot_hold_capture_store_or_refresh_source_generation(
     store.publish(jpeg)
 
     def blocked(command, **kwargs):
-        return subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], **kwargs)
+        process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], **kwargs)
+        if sys.platform == "linux":
+            import fcntl
+
+            # Pi pages can make the default pipe larger than this whole JPEG.
+            # Request one small pipe before the feeder starts; Linux rounds to
+            # its actual page size, which must still force this write to block.
+            fcntl.fcntl(process.stdin.fileno(), fcntl.F_SETPIPE_SZ, 4096)
+            assert fcntl.fcntl(process.stdin.fileno(), fcntl.F_GETPIPE_SZ) < len(jpeg)
+        return process
 
     encoder = module().SharedPrimaryEncoder({"chest": store}, "ffmpeg", process_factory=blocked)
     try:
         first = encoder.select("chest")
-        time.sleep(0.3)
+        deadline = time.monotonic() + 2.0
+        while encoder.status()["failure"] is None and time.monotonic() < deadline:
+            if encoder.write_started is None:
+                store.publish(jpeg)  # A delayed feeder still gets a fresh original sample.
+            time.sleep(0.01)
         assert encoder.status()["failure"] == "encoder-write-stall"
+        before_sequence = store.snapshot()[1]
         start = time.monotonic()
         for _ in range(30):
             store.publish(jpeg)
-        assert store.snapshot()[1] == 31 and time.monotonic() - start < 0.25
+        assert store.snapshot()[1] == before_sequence + 30 and time.monotonic() - start < 0.25
         store.disconnected()
         store.publish(jpeg)
         assert encoder.status()["capture_generation"] == first["capture_generation"]
