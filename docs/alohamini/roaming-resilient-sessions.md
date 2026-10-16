@@ -1,26 +1,27 @@
-## AM1-LIVE-REUSE-11: supported workspace and qualified re-jog
+## AM1-LIVE-REUSE-11: qualified re-jog and retained workspace
 
-PR22 is integrated into `integrate/am1-local-teleop` at
-`5016bc9850d0a37bc12b8244ad832f0214cc8d96`. The new reuse follow-up remains
-unmerged. The [Packet11 report](live-reuse-11.md) records ordinary use, verification,
-separate deployment identities, retained rollback and unresolved physical response.
+PR22 is integrated at `5016bc9850d0a37bc12b8244ad832f0214cc8d96` into
+`integrate/am1-local-teleop`. The Packet11 follow-up remains unmerged.
+[The current report](live-reuse-11.md) records use, exact deployments and rollback.
 
 | Capability | Current evidence |
 |---|---|
-| Connected voluntary release -> fresh deliberate press | Qualified automatic rearm implemented and software-tested for both elbow selections; no extra Resume click in this case |
-| Supported right workspace reuse | Actual measured1845 admitted in fixed inward1834..1867 in two physical runs; q0 remains independent |
-| Useful repeated physical movement | Not demonstrated in Packet11: positive22/negative11 target offsets reached servo Goal readback, both measured0 |
-| Physical ordinary re-jog/reattach | Not exercised because the first-leg response gate stopped each run |
-| Purpose-specific next Start | Not exercised; read-only preflight currently cannot reach the Pi |
-| Available idle | Known stopped cleanup and three services verified after actual06; present connectivity is unavailable |
+| Voluntary release -> new deliberate press | Qualified rearm implemented/software-tested for both selections; no extra Resume click in this case |
+| Right workspace reuse | Actual1845 admitted in fixed inward1834..1867 in two physical runs; q0 stays independent |
+| Useful repeated physical movement | Unqualified: both acknowledged endpoint commands measured0 in full response windows |
+| Physical ordinary re-jog/reattachment | Not reached after zero first-leg response |
+| Final short next Start | Failed before Live: actual right shoulder2138 outside fixed2141+/-1; both corrected lift off windows passed |
+| Available idle | Final native/enrolled-page checks passed; known actual10 cleanup/history retained, no new motor task |
 
-Initial qualification and real expiry, blur, disconnect, explicit Pause/Stop or
-ownership loss still require explicit Resume and a new gesture. Original250ms
-native expiry,90-second Live deadline, local sensing, rate/current/motion guards
-and eleven held Goals remain. Service startup never starts or replays motors.
-The earlier Packet10/09 sections below are historical at their own versions;
-Packet11 replaces only their ordinary-release and shifted-next-Start instructions
-within the new supported admission. Durability retains its software meaning.
+One pending renewal/1s abort and qualified fresh Claim/Resume preserve current
+authority; no late reply or old gesture replay. Original250ms target expiry,90s
+Live deadline, local sensing, rate/current/motion limits and11 actual held Goals
+remain. Fresh P1 stationary imagery is advisory. Main and AM2 are unchanged.
+Service startup never starts/replays motors. Physical-response exception is
+reported explicitly; software checks do not supply physical acceptance.
+Earlier Packet10/09 sections remain historical at their recorded source versions.
+Durability means software fault tolerance, connection/control continuity, preserved
+state and recovery with minimal human intervention, not mechanical wear.
 
 ## AM1-LIVE-ARMS-10: one selected live elbow
 

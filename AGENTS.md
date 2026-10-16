@@ -1,64 +1,66 @@
 ## Active AM1-LIVE-REUSE-11 result and continuing boundary
 
-PR22 is ordinarily integrated into integrate/am1-local-teleop at
-5016bc9850d0a37bc12b8244ad832f0214cc8d96. Main is unchanged. The Packet11
-follow-up remains unmerged; no merge of that follow-up is authorized.
-See docs/alohamini/live-reuse-11.md for ordinary use, exact evidence and limits.
-The Packet10/09 sections below are historical at their recorded versions.
-Packet11 supersedes Packet10's no-merge restriction ONLY for PR22/the named
-integration target, and its ordinary-release/shifted-next-Start instructions
-ONLY with the new qualified gesture and supported-workspace behavior below.
+PR22 integrated normally into integrate/am1-local-teleop at
+5016bc9850d0a37bc12b8244ad832f0214cc8d96; main is unchanged. The Packet11
+follow-up remains unmerged; no merge of it is authorized. See
+docs/alohamini/live-reuse-11.md for ordinary use, source-specific evidence and limits.
+Packet10/09 sections below are historical. Packet11 supersedes their restriction
+only for PR22/the named target and its new qualified ordinary-release/workspace use.
 
-One selected elbow receives live browser targets through the existing persistent
-owner/protected backend. Left behavior remains q0-10..q0. Right uses the fixed
-supported evidence1833..1867, inward commands1834..1867/span2.983725135623871,
-rate1 normalized unit/s and unchanged150mA sampled guard. Actual measured q0 is
-independent and immutable per run; only a freshly qualified gesture refreshes
-its measured cursor. Resume/reconnect/next Start cannot ratchet the workspace,
-rewrite q0, reset the original90-second Live deadline or replay old input.
-Current context includes exact calibration and fixed admission-only one-count
-allowances around left wrist-flex1546/right wrist-roll2443; actual eleven held
-Goals remain exact within each run. These allowances are not new travel authority.
+One selected elbow receives current browser targets through the existing sole
+owner/protected backend. Left q0-10..q0 is retained. Right command1834..1867 is
+inward from evidence1833..1867, width2.983725135623871, rate1 normalized unit/s,
+150mA sampled current guard. Actual measured q0 is independent and immutable;
+new qualified gestures refresh only the cursor. Within a run, bounds/reference/original90s Live
+deadline remain immutable on Resume or reattachment. A distinct Start measures
+fresh q0 and its own deadline, re-admitting the same fixed workspace without
+shifting its bounds. Pi-issued250ms
+input expiry, local sensing and all motion/status/thermal/ownership guards remain.
+Other11 actual raw Goals hold; body/lift stay zero after normal startup.
 
-Connected voluntary jog release -> measured hold -> distinct new held gesture
-requests the existing qualified rearm within its original3-second opportunity;
-no separate Resume click is needed for that ordinary case. Initial Start and
-real expiry, blur/page loss, disconnect, explicit Pause/Stop or ownership loss
-still require explicit qualified Resume and new intent. Cancel/release/later
-intent fences pending replies. Pi-issued250ms expiry applies at every native
-write; retained historical write receipts never supply current authority.
-Other11 raw Goals hold; body/lift stay zero after normal startup. Simulation
-remains the default. Service startup never starts or replays motor activity.
+Connected voluntary release -> measured hold -> distinct new held gesture requests
+the existing qualified rearm within3s, without a separate Resume click. Initial
+Start, real expiry/blur/disconnect/Pause/ownership loss retain explicit Claim as
+needed, qualified Resume and fresh intent. Cancellation fences late replies.
+Renewal has one pending generation-bound request and a1s local abort bound;
+late replies cannot revive authority or clear a newer controller. Current failure
+clears held input; Stop remains independent. No auto Claim retry or input replay.
+Simulation remains default; persistent service startup never starts/replays motors.
 
-Executable sourceebbc26791b857ea14dd111c05e2717bfb18f64ba was staged as motor
-4253fba5eb6537e9495e943f6e57ef8690402ac8, unchanged runtime
-588d3b4e290d6f924cd402dfd0efb8f12391f6ac, manifest
-b3687a0b28e197390fe5e52b49edef06e396ba928b1455b1fd5d98786877470a.
-Preserve the matched673afd6fdffa947091b32fb5efdb23928f2d98d4/588d/24ff rollback,
-older pairs and separate helper/camera/manual pins. Merge/publication SHA is not
-a deployment command. Two startup feedback refresh calls preserve the existing
-thermal window/limits; no gains, calibration or protection thresholds changed.
+Executable source8ec7818e62b27e3be3ca0ebe84b3fac809a28120 is installed as
+motor e74378dbe873b1fe3534ae42ee21ccce7e634a7c (unchanged in the final stage),
+runtime b4ec80fc98e2513c8941eace745ad606333be26c, manifest
+1b6e51b66d67c5ba0004393c1471958c4be3e10b2635497f42ebe33d55574d54.
+Immediate full matched rollback: same motor e743, runtime
+1d5f73c193c23fac4c01b282f07949dad8e605c8, manifest
+86b6b11c7b0b453c6d146b1aabbf2d37349c60ab1a076ade9ad1e32794aa8722.
+Older pairs, original results, separate helper/camera/manual pins and private state
+remain retained. Publication/integration SHAs are not deployment commands.
 
-Actual05/06 both started at measuredraw1845 in the retained workspace and ended
-with verified normal cleanup. Goal1867/1834 respectively reached same-owner servo
-register readback, but measured response was0 in complete2.017/2.047-second windows.
-These are failed movement checks, not fine-position limitations or effective
-repeatability. Packet11 physical ordinary re-jog/reattachment remain unexercised;
-software checks do not supply those results. The purpose-specific next Start has
-not run because its read-only preflight could not reach the Pi. Last verified
-idle is after actual06; current reachability is unverified. Keep the private
-runner configuration PENDING until fresh native/page/source/cleanup checks pass.
-Do not expand force/travel/gains or repeat unchanged motion to hide this result.
+Packet11 physical05/06 acknowledged positive22/negative11 raw target offsets but
+measured0 through full2.017/2.047s windows. These are failed movement checks,
+not merely fine-position limitations. Physical ordinary re-jog/reattach remain
+unqualified. Actual06 reused measured1845 rest without shifting its workspace.
+The final short next Start10 passed repaired initial/final lift off acquisition,
+then refused before Live: right shoulder Goal2138 is outside fixed2141+/-1.
+No admitted q0/deadline/grant/jog existed. The raw seed had no normalized roundtrip;
+why/when the shoulder pose changed is unknown. Do not widen the context again,
+invent a seed, repeat unchanged powered trials or demand manual historical pose.
+All20 off/zero, lift/bus/camera cleanup are known; uncertainfalse. Current native
+run c07260e1-19ac-455a-a58b-2db5b16bf15d/hash556f344c4028055bae554d1112e8b36b67bb7d7c794229a143d5cab5a193fb5f
+is preserved. Final native/page checks verified available idle with the reviewed
+UI/workspace and no motor task. PENDING runner status is not readiness for motion.
+Fresh advisory P1 imagery shows stationary arms; it does not prove motion/clearance.
 
-Root alone handles Git, SSH, staging and devices; agents use disjoint source or
-read-only scopes. Reuse existing tools/one runner/current configuration. Preserve
-all historical results, private trust/permissions, calibration and rollback.
-AM1 stays wireless, P1 advisory, AM2 untouched. No manual old-reference positioning,
-leader/shoulder/readiness requests, network tuning, new joints/architecture or
-hardware-endurance campaign. Durability means software fault tolerance,
-connection/control continuity, preserved state and recovery with minimal human
-intervention. A specific real connectivity failure may require restoring the
-existing link; it never authorizes network tuning or an unverified Start.
+The packet's explicit physical-response exception permits completing available
+software/review/publication while reporting this unresolved layer. Focused final
+browser249/0skip and native final-off384/0skip are separate scopes, not an additive
+hardware result. Reuse existing tools, stopped affected-component staging and full
+matched rollback. Root alone handles Git/SSH/staging/hardware. AM1 stays wireless,
+P1 advisory, AM2 untouched. No gains, expanded force/travel/dwell, new joints,
+network/camera redesign, manual leader/shoulder/readiness questions or hardware
+endurance campaign. Durability means software fault tolerance, control/connection
+continuity, state preservation and recovery with minimal human intervention.
 
 ## Active AM1-LIVE-ARMS-10 result and continuing boundary
 
