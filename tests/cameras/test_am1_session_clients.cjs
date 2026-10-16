@@ -552,3 +552,47 @@ for(const selected of [{recipe:"physical-live-left-elbow",joint:"arm_left_elbow_
   assert.match(await page.locator("#live-elbow-controls h2").innerText(),selected.side==="left"?/right elbow/i:/left elbow/i,"next preStart preview follows the new selection");
   console.log(JSON.stringify({selectedSide:selected.side,testOnlyProtocolFixture:true,physicalEvidenceProved:false,ordinaryJogButtons:true,mappedInputSamples:result.frames.length,newGestureAfterResume:true}));
 });
+
+
+test("ordinary Claim after owner restart joins HTTP and current view without replaying an old nil snapshot",async t=>{
+ const f=await fixture();t.after(()=>f.close());
+ const browser=await chromium.launch({headless:true,channel:process.env.AM1_TEST_BROWSER_CHANNEL || "msedge"});t.after(()=>browser.close());
+ const context=await browser.newContext({ignoreHTTPSErrors:true}),page=await context.newPage();t.after(()=>context.close());
+ await enroll(page,f.info.url,f.info.a);
+ await page.locator('[data-operation="ClaimInput"]').click();await page.waitForFunction(()=>am1Remote.controllerGeneration&&am1Remote.snapshot.controller?.controller_generation===am1Remote.controllerGeneration);
+ await page.locator('[data-operation="Start"]').click();await page.waitForFunction(()=>am1Remote.snapshot.run?.status==="running");
+ await page.locator('[data-operation="Stop"]').click();await page.waitForFunction(()=>am1Remote.snapshot.run?.status==="stopped");
+ const retained=await page.evaluate(()=>JSON.parse(JSON.stringify(am1Remote.snapshot.run))),oldService=await page.evaluate(()=>am1Remote.snapshot.service_incarnation);
+ await f.command({op:"restart_owner"});await page.reload();
+ await page.waitForFunction(old=>am1Remote.connected&&am1Remote.snapshot.service_incarnation!==old&&am1Remote.snapshot.run?.status==="stopped",oldService);
+ assert.equal(await page.evaluate(()=>am1Remote.snapshot.run.service_incarnation),retained.service_incarnation,"historical issuer remains unchanged");
+ assert.equal(await page.evaluate(()=>am1Remote.controllerGeneration),null);
+ const afterRestart=await page.evaluate(()=>JSON.parse(JSON.stringify(am1Remote.snapshot.run)));
+ const starts=[];page.on("request",request=>{if(request.url().endsWith("/api/start"))starts.push(request.postDataJSON());});
+ await page.evaluate(()=>{
+  const ws=am1Remote.socket,receive=ws.onmessage;globalThis.claimSavedNil=JSON.stringify({kind:"snapshot",snapshot:JSON.parse(JSON.stringify(am1Remote.snapshot))});
+  globalThis.claimHeldFrames=[];globalThis.claimReceive=raw=>receive.call(ws,{data:raw});
+  ws.onmessage=event=>{const value=JSON.parse(event.data);if(value.kind==="snapshot")claimHeldFrames.push(event.data);else receive.call(ws,event);};
+  globalThis.claimRestoreReceive=()=>{ws.onmessage=receive;};
+ });
+ const response=page.waitForResponse(value=>value.url().endsWith("/api/claim"));
+ await page.locator('[data-operation="ClaimInput"]').click();const accepted=await (await response).json();assert.equal(accepted.accepted,true);
+ await page.waitForFunction(()=>am1Remote.pendingClaim?.result?.accepted===true);
+ assert.equal(await page.evaluate(()=>am1Remote.controllerGeneration),null,"HTTP alone grants no local authority");
+ await page.evaluate(()=>claimReceive(claimSavedNil));
+ assert.equal(await page.evaluate(()=>am1Remote.controllerGeneration),null);assert.equal(await page.evaluate(()=>Boolean(am1Remote.pendingClaim)),true);
+ await page.waitForFunction(generation=>claimHeldFrames.some(raw=>JSON.parse(raw).snapshot.controller?.controller_generation===generation),accepted.controller_generation);
+ await page.evaluate(generation=>{const raw=claimHeldFrames.find(raw=>JSON.parse(raw).snapshot.controller?.controller_generation===generation);claimRestoreReceive();claimReceive(raw);},accepted.controller_generation);
+ await page.waitForFunction(generation=>am1Remote.controllerGeneration===generation&&am1Remote.snapshot.controller?.controller_generation===generation,accepted.controller_generation);
+ await page.waitForTimeout(1100);
+ const current=await page.evaluate(()=>({generation:am1Remote.controllerGeneration,controller:am1Remote.snapshot.controller,run:am1Remote.snapshot.run,service:am1Remote.snapshot.service_incarnation,connection:am1Remote.connection}));
+ assert.equal(current.generation,accepted.controller_generation);assert.equal(current.controller.controller_generation,accepted.controller_generation);
+ assert(current.controller.presence_expires>accepted.presence_expires,"ordinary generation-fenced renewal remains active");
+ const durable=({remaining_s,trajectory_remaining_s,...run})=>run;
+ assert.equal(JSON.stringify(durable(current.run)),JSON.stringify(durable(afterRestart)),"Claim cannot rewrite retained durable terminal contents");
+ assert.equal(current.connection,null);assert.deepEqual(starts,[],"Claim qualification does not issue an implicit Start");
+ await page.locator('[data-operation="Start"]').click();await page.waitForFunction(old=>am1Remote.snapshot.run?.run_id!==old&&am1Remote.snapshot.run.status==="running",retained.run_id);
+ assert.equal(starts.length,1);assert.equal(await page.evaluate(()=>am1Remote.snapshot.run.service_incarnation),current.service);
+ await page.locator('[data-operation="Stop"]').click();await page.waitForFunction(()=>am1Remote.snapshot.run.status==="stopped");
+ console.log(JSON.stringify({realFakeOwnerRestart:true,oldTerminalIssuerRetained:true,syntheticAuthenticNilFrameOrdering:true,replyWaitsForCurrentClaimProof:true,generationFencedRenewal:true,noImplicitStart:true,explicitNextStart:true}));
+});

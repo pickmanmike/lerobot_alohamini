@@ -35,12 +35,13 @@ class AM1SessionTransport {
   constructor(render) {
     this.render=render; this.snapshot=null; this.connected=false; this.csrf=null; this.device=null;
     this.control=false; this.controllerGeneration=null; this.connection=null; this.held=new Set();
-    this.pending=new Map(); this.seq=0; this.socket=null; this.inputBusy=false; this.epoch=0; this.intent=0;
+    this.pending=new Map(); this.pendingClaim=null; this.seq=0; this.socket=null; this.inputBusy=false; this.epoch=0; this.intent=0;
     this.reportingError=null;
     this.elbowJog=0;this.elbowCursor=null;this.elbowBinding=null;this.elbowAt=null;this.elbowReleasedRevision=null;this.liveInputs=new Set();this.liveResume=null;this.elbowGesture=null;this.elbowRelease=null;this.elbowStrict=false;
     this.reconnectTimer=null;this.detached=false;this.initialization=0;
   }
   clear(reason="disconnected") {
+    this.cancelClaim(reason);
     if(this.isLiveElbow())this.elbowStrict=true;this.elbowRelease=null;
     this.epoch++; this.intent++; this.held.clear(); this.connection=null; this.controllerGeneration=null; this.seq=0;
     for(const p of this.pending.values()) p.reject(Error(reason));
@@ -50,10 +51,10 @@ class AM1SessionTransport {
     this.reportingError=value;this.connected=false;this.clear(value.reason);
     this.render(this,value.reason);
   }
-  async post(path,body,epoch) {
+  async post(path,body,epoch,current) {
     const response=await fetch(`/api/${path}`,{method:"POST",headers:{"Content-Type":"application/json","X-AM1-CSRF":this.csrf || ""},body:JSON.stringify(body)});
     const result=await response.json();
-    if(epoch!==undefined && (this.detached || epoch!==this.epoch))return {status:"superseded"};
+    if(epoch!==undefined && (this.detached || epoch!==this.epoch) || current && !current())return {status:"superseded"};
     if(result.status==="reporting_error") {
       this.reportingFailure(result);
       if(!response.ok) {const error=Error(result.reason);error.reportingError=result;throw error;}
@@ -130,6 +131,7 @@ class AM1SessionTransport {
           if(this.controllerGeneration && (controller?.device_id!==this.device || controller.controller_generation!==this.controllerGeneration))
             this.clear("Controller generation changed");
           if(controller?.device_id!==this.device) {this.clearGesture();this.connection=null;}
+          this.qualifyClaim();
           if(this.isLiveElbow() && next?.status!=="running"){if(!ownRearm&&!ownRelease){this.elbowStrict=true;this.elbowRelease=null;}this.clearGesture(false,keepGesture);}
           this.render(this);
         } else if(value.kind==="result") {
@@ -162,13 +164,59 @@ class AM1SessionTransport {
       controller_generation:this.controllerGeneration, connection_generation:this.connection,
       ...(this.isLiveElbow() ? {host_incarnation:this.snapshot.run.backend_incarnation,intent_revision:this.snapshot.run.intent_revision} : {})};
   }
+  cancelClaim(reason) {
+    const pending=this.pendingClaim;if(!pending)return;
+    this.pendingClaim=null;if(pending.timer)clearTimeout(pending.timer);
+    pending.resolve(pending.result || {status:"superseded",reason});
+  }
+  claimCurrent(pending) {
+    return Boolean(pending)&&this.pendingClaim===pending&&this.connected&&this.control&&pending.epoch===this.epoch&&pending.intent===this.intent
+      &&pending.initialization===this.initialization&&pending.socket===this.socket&&pending.connection===this.connection&&pending.device===this.device
+      &&pending.service===this.snapshot?.service_incarnation&&performance.now()<pending.until;
+  }
+  qualifyClaim() {
+    const pending=this.pendingClaim;if(!pending)return;
+    if(!this.claimCurrent(pending)) {
+      this.cancelClaim("Claim context changed or expired");return;
+    }
+    const controller=this.snapshot?.controller,result=pending.result;
+    if(controller && controller.device_id!==pending.device) {this.cancelClaim("Controller changed");return;}
+    if(!result)return;
+    if(typeof result.controller_generation!=="string" || !result.controller_generation
+      || typeof result.presence_expires!=="number" || !Number.isFinite(result.presence_expires) || result.presence_expires<=0
+      || controller && (controller.controller_generation!==result.controller_generation
+        || typeof controller.presence_expires!=="number" || !Number.isFinite(controller.presence_expires))) {
+      this.cancelClaim("Current controller proof differs");return;
+    }
+    if(Array.isArray(this.snapshot.events)&&this.snapshot.events.some(event=>event.kind==="presence_expired"
+      &&event.service_incarnation===pending.service&&typeof event.at==="number"&&Number.isFinite(event.at)&&event.at>=result.presence_expires)) {
+      this.cancelClaim("Controller presence expired");return;
+    }
+    if(!controller || controller.presence_expires<result.presence_expires)return;
+    this.controllerGeneration=result.controller_generation;this.cancelClaim();
+  }
   async claim(generation) {
-    const epoch=this.epoch;
-    const result=await this.post("claim",generation===undefined ? {} : {controller_generation:generation});
-    if(epoch!==this.epoch || !this.connected || (generation!==undefined && generation!==this.controllerGeneration))return result;
-    if(result.accepted)this.controllerGeneration=result.controller_generation;
-    else if(generation!==undefined)this.clear("Controller renewal refused");
-    this.render(this,result.reason);return result;
+    if(generation===undefined) {this.cancelClaim("Newer explicit Claim");generation=this.controllerGeneration || undefined;}
+    const epoch=this.epoch,service=this.snapshot?.service_incarnation,socket=this.socket,connection=this.connection,initialization=this.initialization,device=this.device;
+    if(generation!==undefined) {
+      const current=()=>epoch===this.epoch&&this.connected&&generation===this.controllerGeneration&&service===this.snapshot?.service_incarnation
+        &&socket===this.socket&&connection===this.connection&&initialization===this.initialization&&device===this.device;
+      const result=await this.post("claim",{controller_generation:generation},epoch,current);
+      if(!current())return result;
+      if(!result.accepted || result.controller_generation!==generation)this.clear("Controller renewal refused");
+      this.render(this,result.reason);return result;
+    }
+    if(!this.connected || !this.control || !this.device || typeof service!=="string" || !service)return {status:"superseded",reason:"Current connected controller view required"};
+    return new Promise((resolve,reject)=>{
+      const pending=this.pendingClaim={epoch,service,intent:this.intent,initialization:this.initialization,socket:this.socket,connection:this.connection,device:this.device,until:performance.now()+1500,result:null,resolve};
+      pending.timer=setTimeout(()=>{if(this.pendingClaim===pending){this.cancelClaim("Claim qualification expired");this.render(this,"Claim view did not qualify; use Claim input again.");}},1500);
+      this.post("claim",{},epoch,()=>this.claimCurrent(pending)).then(result=>{
+        if(this.pendingClaim!==pending)return;
+        pending.result=result;
+        if(!result.accepted)this.cancelClaim(result.reason);else this.qualifyClaim();
+        this.render(this,this.pendingClaim===pending ? "Claim accepted; waiting for the current controller view." : result.reason);
+      },error=>{if(this.pendingClaim===pending){this.pendingClaim=null;clearTimeout(pending.timer);reject(error);}});
+    });
   }
   async renew() {
     const generation=this.controllerGeneration;

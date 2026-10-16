@@ -554,3 +554,142 @@ test("a successfully rearmed held gesture continues ordinary granted input beyon
   assert.equal(f.frames.at(-1).command.op,"input");assert.equal(f.frames.at(-1).command.target[f.joint],3.1);f.reply("input",{accepted:true});
  }finally{t.clear();}
 });
+
+
+// Claim response/snapshot orderings are synthetic; terminal metadata follows actual08's shape.
+async function claimFixture(side="right") {
+ const recipe="physical-live-"+side+"-elbow",snapshot={service_incarnation:"current-owner",controller:null,
+  run:{run_id:"retained-terminal",operation_id:"retained-operation",recipe,source:"protected-physical-provider",status:"faulted",service_incarnation:"historical-owner",intent_revision:1,backend_incarnation:null,progress_s:0,first_cause:"retained startup failure",native_first_cause:"retained context refusal"},
+  evidence:{fault:null,lifecycle:{phase:"idle"}},events:[],live_elbow_recipes:sharedLiveRecipes()};
+ const requests=[],replies=[];
+ const f=fixture(async(url,opts)=>{
+  requests.push({url,body:opts?.body?JSON.parse(opts.body):null});
+  if(url==="/api/attach")return {ok:true,json:async()=>({ticket:"claim-test-ticket",snapshot:JSON.parse(JSON.stringify(snapshot))})};
+  assert.equal(url,"/api/claim");return new Promise(resolve=>replies.push(value=>resolve({ok:true,json:async()=>value})));
+ });
+ Object.assign(f.transport,{device:"enrolled",control:true});await f.transport.attach();
+ const deliver=(view=snapshot,revision)=>f.transport.socket.onmessage({data:JSON.stringify({kind:"snapshot",snapshot:JSON.parse(JSON.stringify(view)),...(revision?{revision}:{})})});
+ deliver(snapshot,"current-view:1");
+ const result={accepted:true,status:"claimed",controller_generation:"new-claim-generation",presence_expires:2001.5};
+ const current=()=>({...JSON.parse(JSON.stringify(snapshot)),controller:{device_id:"enrolled",controller_generation:result.controller_generation,presence_expires:result.presence_expires}});
+ return {...f,snapshot,requests,replies,result,current,deliver,async flush(){for(let i=0;i<12;i++)await Promise.resolve();}};
+}
+
+for(const side of ["left","right"])for(const order of ["snapshot-first","result-first-old-null"])
+test(`claim qualification ${side} ${order} preserves old terminal and requires current view`,async()=>{
+ const f=await claimFixture(side),t=f.transport,history=JSON.stringify(f.snapshot.run);let completed=false;
+ const task=t.claim().then(value=>{completed=true;return value;});await f.flush();
+ if(order==="snapshot-first")f.deliver(f.current());
+ f.replies[0](f.result);await f.flush();
+ if(order==="result-first-old-null"){
+  assert.equal(t.controllerGeneration,null,"HTTP acceptance alone must not enable authority");
+  assert.equal(completed,false,"qualification waits within the original opportunity");
+  f.deliver(f.snapshot);await f.flush();
+  assert.equal(t.controllerGeneration,null,"queued pre-claim nil view grants no authority");
+  assert(t.pendingClaim,"queued old nil cannot destroy the legitimate pending explicit claim");
+  f.deliver(f.current());
+ }
+ const result=await task;assert.equal(result.accepted,true);assert.equal(t.controllerGeneration,f.result.controller_generation);
+ assert.equal(t.snapshot.controller.controller_generation,t.controllerGeneration);assert.equal(t.pendingClaim??null,null);
+ assert.equal(t.snapshot.service_incarnation,"current-owner");assert.equal(t.snapshot.run.service_incarnation,"historical-owner");
+ assert.equal(JSON.stringify(t.snapshot.run),history,"current claim cannot rewrite the terminal history");
+ assert.equal(f.requests.filter(x=>x.url!=="/api/attach").length,1,"no implicit Claim retry or control request");
+ assert.equal(t.connection,null);assert.equal(t.elbowJog,0);assert.equal(t.elbowCursor,null);
+});
+
+for(const loss of ["clear","disconnect","pagehide","service","foreign-device","foreign-generation","new-intent","local-deadline","native-expiry"])
+test(`claim qualification loss ${loss} cannot be revived by a late accepted reply`,async()=>{
+ const f=await claimFixture(),t=f.transport,task=t.claim();await f.flush();
+ if(loss==="clear")t.clear("explicit local loss");
+ else if(loss==="disconnect")t.socket.onclose();
+ else if(loss==="pagehide")t.detach();
+ else if(loss==="service"){const view=f.current();view.service_incarnation="newer-owner";f.deliver(view);}
+ else if(loss==="foreign-device"){const view=f.current();view.controller.device_id="other-enrolled";f.deliver(view);}
+ else if(loss==="foreign-generation"){f.replies[0](f.result);await f.flush();const view=f.current();view.controller.controller_generation="newer-foreign-generation";f.deliver(view);}
+ else if(loss==="new-intent"){t.intent++;f.deliver(f.snapshot);}
+ else if(loss==="local-deadline")f.setNow(2500);
+ else {f.replies[0](f.result);await f.flush();const view=JSON.parse(JSON.stringify(f.snapshot));view.events=[{kind:"presence_expired",service_incarnation:"current-owner",at:f.result.presence_expires}];f.deliver(view);}
+ if(!["foreign-generation","native-expiry"].includes(loss))f.replies[0](f.result);
+ await f.flush();if(loss!=="pagehide")f.deliver(f.current());await f.flush();await task;
+ assert.equal(t.controllerGeneration,null,"late HTTP/current-looking view cannot restore canceled authority");
+ assert.equal(t.pendingClaim??null,null);assert.equal(f.requests.filter(x=>x.url==="/api/claim").length,1);
+ assert.equal(t.elbowJog,0);assert.equal(t.connection,null);
+});
+
+test("claim qualification newer explicit claim cancels old accepted continuation",async()=>{
+ const f=await claimFixture(),t=f.transport,old=t.claim();await f.flush();const next=t.claim();await f.flush();
+ f.replies[0](f.result);await f.flush();assert.equal(t.controllerGeneration,null);
+ f.replies[1](f.result);await f.flush();assert.equal(t.controllerGeneration,null);
+ f.deliver(f.current());await Promise.all([old,next]);assert.equal(t.controllerGeneration,f.result.controller_generation);
+ assert.equal(f.requests.filter(x=>x.url==="/api/claim").length,2);
+});
+
+test("claim qualification timeout is finite even when the REST result never arrives",async()=>{
+ const f=await claimFixture(),t=f.transport,task=t.claim();await f.flush();
+ const timer=f.timers.find(value=>value&&value[1]===1500);assert(timer,"one original1.5s claim opportunity required");
+ f.setNow(2500);timer[0]();const result=await task;assert.equal(result.status,"superseded");
+ assert.equal(t.controllerGeneration,null);assert.equal(t.pendingClaim??null,null);assert.equal(f.requests.filter(x=>x.url==="/api/claim").length,1);
+ f.replies[0](f.result);await f.flush();f.deliver(f.current());await f.flush();assert.equal(t.controllerGeneration,null);
+});
+
+for(const bad of ["missing-reply-expiry","nonfinite-reply-expiry","missing-snapshot-expiry","nonfinite-snapshot-expiry"])
+test(`claim qualification refuses incomplete producer proof ${bad}`,async()=>{
+ const f=await claimFixture(),t=f.transport,task=t.claim(),reply={...f.result},view=f.current();await f.flush();
+ if(bad==="missing-reply-expiry")delete reply.presence_expires;
+ else if(bad==="nonfinite-reply-expiry")reply.presence_expires=NaN;
+ else if(bad==="missing-snapshot-expiry")delete view.controller.presence_expires;
+ else view.controller.presence_expires=NaN;
+ f.replies[0](reply);await f.flush();f.deliver(view);await f.flush();
+ if(t.pendingClaim){f.setNow(2500);const timer=f.timers.find(value=>value&&value[1]===1500);timer[0]();}
+ await task;assert.equal(t.controllerGeneration,null);assert.equal(t.pendingClaim??null,null);
+});
+
+test("claim qualification compares only same-owner server expiry values and rejects expired epochs",async()=>{
+ const f=await claimFixture(),t=f.transport,task=t.claim();await f.flush();f.replies[0](f.result);await f.flush();
+ const old=f.current();old.controller.presence_expires-=0.1;old.events=[{kind:"presence_expired",service_incarnation:"historical-owner",at:999999}];f.deliver(old);await f.flush();
+ assert.equal(t.controllerGeneration,null,"a pre-renewal proof cannot confirm the returned presence interval");
+ f.deliver(f.current());await task;assert.equal(t.controllerGeneration,f.result.controller_generation);
+ f.deliver(f.snapshot);assert.equal(t.controllerGeneration,null,"observed controller loss after confirmation remains immediate");
+});
+
+test("claim renewal supplied generation never adopts another generation from HTTP",async()=>{
+ const f=await claimFixture(),t=f.transport;f.deliver(f.current());t.controllerGeneration=f.result.controller_generation;
+ const task=t.claim(t.controllerGeneration);await f.flush();f.replies[0]({...f.result,controller_generation:"unexpected-generation"});await task;
+ assert.equal(t.controllerGeneration,null);assert.equal(t.pendingClaim??null,null);
+ assert.equal(f.requests.at(-1).body.controller_generation,f.result.controller_generation);
+});
+
+
+test("claim qualification connection change cancels without changing the newer connection",async()=>{
+ const f=await claimFixture(),t=f.transport,task=t.claim();await f.flush();t.connection="newer-connection";
+ f.replies[0](f.result);await f.flush();f.deliver(f.current());await task;
+ assert.equal(t.controllerGeneration,null);assert.equal(t.pendingClaim??null,null);assert.equal(t.connection,"newer-connection");
+});
+
+test("claim qualification is independent of browser and owner clock offsets",async()=>{
+ const f=await claimFixture(),t=f.transport;f.setNow(5000000);const task=t.claim();await f.flush();
+ f.replies[0](f.result);await f.flush();assert.equal(t.controllerGeneration,null);f.deliver(f.current());await task;
+ assert.equal(t.controllerGeneration,f.result.controller_generation);assert.equal(f.timers.filter(Boolean).length,0);
+});
+
+
+for(const replacement of ["new-connection","same-epoch-new-claim"])
+test(`claim qualification late reporting error cannot clear ${replacement}`,async()=>{
+ const f=await claimFixture(),t=f.transport,old=t.claim();await f.flush();
+ if(replacement==="new-connection"){t.socket.onclose();await t.attach();f.deliver(f.snapshot,"new-view:1");}
+ const next=t.claim();await f.flush();const pending=t.pendingClaim;
+ f.replies[0]({accepted:false,status:"reporting_error",reason:"old claim reporting failure",code:"response_limit"});await f.flush();
+ assert.equal(t.connected,true,"stale presentation failure cannot disconnect the newer context");
+ assert.equal(t.pendingClaim,pending,"stale presentation failure cannot cancel the newer explicit Claim");
+ assert.equal(t.reportingError,null);
+ f.replies[1](f.result);await f.flush();f.deliver(f.current());await Promise.all([old,next]);
+ assert.equal(t.controllerGeneration,f.result.controller_generation);assert.equal(t.reportingError,null);
+});
+
+test("claim renewal late reporting error cannot clear a newer connection and confirmed role",async()=>{
+ const f=await claimFixture(),t=f.transport;f.deliver(f.current());t.controllerGeneration=f.result.controller_generation;
+ const old=t.renew();await f.flush();t.socket.onclose();await t.attach();f.deliver(f.snapshot,"new-view:1");
+ const next=t.claim();await f.flush();f.replies[1](f.result);await f.flush();f.deliver(f.current());await next;
+ f.replies[0]({accepted:false,status:"reporting_error",reason:"old renewal reporting failure",code:"response_limit"});await f.flush();await old;
+ assert.equal(t.connected,true);assert.equal(t.reportingError,null);assert.equal(t.controllerGeneration,f.result.controller_generation);
+});
