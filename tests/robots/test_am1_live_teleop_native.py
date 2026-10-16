@@ -245,6 +245,12 @@ def test_actual_observation_keeps_unclipped_raw_and_original_bus_read_interval(m
     robot._am1_teleop_binding = {"recipe": "physical-live-teleop"}
     robot.right_arm_motors = []
     robot.lift = SimpleNamespace(contribute_observation=lambda obs: None)
+    original_lift = {"present_velocity_raw": -3, "sample_monotonic_s": 49.94, "request_duration_s": 0.02}
+    robot._lift_operation = SimpleNamespace(
+        contribute_observation=lambda obs: obs.update({"lift_axis.height_mm": 12.5, "lift_axis.vel": -3}),
+        last_record=original_lift,
+        height_mm=12.5,
+    )
     robot.read_and_check_currents = lambda **kwargs: None
     monkeypatch.setattr(native, "poll_health", lambda source: None)
     now = [50.0]
@@ -262,6 +268,8 @@ def test_actual_observation_keeps_unclipped_raw_and_original_bus_read_interval(m
     assert original["normalized"] > 100
     assert original["read_started_at_monotonic_s"] == 50
     assert original["read_completed_at_monotonic_s"] == 50.03
+    assert measured["_am1_lift_feedback"] == {"version": 1, "height_mm": 12.5, **original_lift}
+    assert robot._lift_operation.last_record == original_lift
 
 
 def test_original_raw_feedback_survives_inside_existing_client_retained_marker():
@@ -277,11 +285,21 @@ def test_original_raw_feedback_survives_inside_existing_client_retained_marker()
             }
         }
     }
-    observation = {"_am1_arm_feedback": copy.deepcopy(raw)}
+    lift = {
+        "version": 1,
+        "height_mm": 12.5,
+        "present_velocity_raw": 0,
+        "sample_monotonic_s": 9.9,
+        "request_duration_s": 0.02,
+    }
+    observation = {"_am1_arm_feedback": copy.deepcopy(raw), "_am1_lift_feedback": copy.deepcopy(lift)}
     control.annotate(observation, acquired_at=10.0)
     assert observation[host.AM1_LOCAL_FEEDBACK_KEY]["arm_feedback"] == raw
+    assert observation[host.AM1_LOCAL_FEEDBACK_KEY]["lift_feedback"] == lift
     observation["_am1_arm_feedback"]["positions"][KEYS[0]]["raw"] = 0
+    observation["_am1_lift_feedback"]["present_velocity_raw"] = 200
     assert observation[host.AM1_LOCAL_FEEDBACK_KEY]["arm_feedback"] == raw
+    assert observation[host.AM1_LOCAL_FEEDBACK_KEY]["lift_feedback"] == lift
 
 
 def test_actual_routine_current_and_contact_output_uses_bounded_sink(monkeypatch):

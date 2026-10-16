@@ -131,6 +131,31 @@ def read_physical_sample(client, run_id, host_incarnation, previous_sequence, *,
             at = min(at, raw_started)
         if now - at >= FEEDBACK_MAX_AGE_S:
             raise FeedbackUnavailable("native raw feedback original acquisition expired")
+    lift_feedback = marker.get("lift_feedback")
+    if lift_feedback is not None:
+        fields = {"version", "present_velocity_raw", "height_mm", "sample_monotonic_s", "request_duration_s"}
+        if (
+            not isinstance(lift_feedback, dict) or set(lift_feedback) != fields
+            or type(lift_feedback["version"]) is not int or lift_feedback["version"] != 1
+            or type(lift_feedback["present_velocity_raw"]) is not int
+            or not {"lift_axis.vel", "lift_axis.height_mm"} <= client.latest_raw_observation_keys
+        ):
+            raise ValueError("original native lift feedback missing or malformed")
+        height, sampled, duration = (lift_feedback[key] for key in
+                                    ("height_mm", "sample_monotonic_s", "request_duration_s"))
+        if (
+            any(type(v) not in (int, float) or not math.isfinite(v) for v in (height, sampled, duration))
+            or not 0 <= duration <= sampled <= completed
+            or height != observation.get("lift_axis.height_mm")
+        ):
+            raise ValueError("original native lift feedback interval/value differs")
+        # Keep the existing sample timestamp and transaction duration. The
+        # conservative original start is never replaced by host/client receipt.
+        at = min(at, sampled - duration)
+        if now - at >= FEEDBACK_MAX_AGE_S:
+            raise FeedbackUnavailable("native lift feedback original acquisition expired")
+        observation = {**observation, "lift_axis.vel": lift_feedback["present_velocity_raw"],
+                       "_am1_lift_feedback": copy.deepcopy(lift_feedback)}
     selected = marker.get("selected_joint")
     if selected is not None:
         if (
@@ -169,10 +194,12 @@ def read_physical_sample(client, run_id, host_incarnation, previous_sequence, *,
             "original_request_sent_at_monotonic_s": received - request_age,
             "reply_received_at_monotonic_s": received,
             "original_request_roundtrip_age_s": request_age,
+            **({"lift_feedback": copy.deepcopy(lift_feedback)} if lift_feedback is not None else {}),
         },
         "provenance": "protected-host/measured-feedback",
         **({"selected_joint": copy.deepcopy(selected)} if selected is not None else {}),
         **({"arm_feedback": copy.deepcopy(arm_feedback)} if arm_feedback is not None else {}),
+        **({"lift_feedback": copy.deepcopy(lift_feedback)} if lift_feedback is not None else {}),
     }
 
 

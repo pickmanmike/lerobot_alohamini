@@ -467,6 +467,8 @@ class AM1LocalControl:
                 observation[AM1_LOCAL_FEEDBACK_KEY]["live_input"] = self.live_snapshot()
             if self.teleop and "_am1_arm_feedback" in observation:
                 observation[AM1_LOCAL_FEEDBACK_KEY]["arm_feedback"] = copy.deepcopy(observation["_am1_arm_feedback"])
+            if self.teleop and "_am1_lift_feedback" in observation:
+                observation[AM1_LOCAL_FEEDBACK_KEY]["lift_feedback"] = copy.deepcopy(observation["_am1_lift_feedback"])
 
     def watchdog_stop(self, robot: AlohaMini) -> None:
         if self.selected_evidence is not None:

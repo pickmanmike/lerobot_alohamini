@@ -1571,6 +1571,12 @@ class AlohaMini(Robot):
         if operation is not None:
             try:
                 operation.contribute_observation(obs_dict)
+                if teleop:
+                    obs_dict["_am1_lift_feedback"] = {
+                        "version": 1, "height_mm": operation.height_mm,
+                        **{key: operation.last_record[key] for key in (
+                            "present_velocity_raw", "sample_monotonic_s", "request_duration_s")},
+                    }
             except BaseException as error:
                 # Fault-only in-memory evidence: do not print or perform another
                 # serial read here. Preserve the original refusal through cleanup.

@@ -486,3 +486,89 @@ def test_real_host_codec_and_client_preserve_original_twelve_raw_reads(tmp_path,
         assert sample["observation"]["_am1_arm_feedback"] == raw_feedback
         assert sample["at"] == client._last_response_request_sent_at
         assert sample["arm_feedback"] is not raw_feedback
+
+
+@pytest.mark.parametrize("velocity", [0, 17])
+def test_real_codec_retains_original_lift_velocity_for_actual_body_zero(tmp_path, monkeypatch, velocity):
+    import time
+
+    from lerobot.robots.alohamini import alohamini_host as host
+    from lerobot.robots.alohamini.alohamini_client import AlohaMiniClient
+    from lerobot.robots.alohamini.config_alohamini import AlohaMiniClientConfig
+    from tools.am1_leader_adapter import native_frame_ack
+    from tools.am1_physical_executor import read_physical_sample
+
+    now = time.monotonic()
+    original = {
+        "version": 1,
+        "present_velocity_raw": velocity,
+        "height_mm": 23.0,
+        "sample_monotonic_s": now - 0.06,
+        "request_duration_s": 0.01,
+    }
+    run_id, incarnation = str(uuid4()), str(uuid4())
+    control = host.AM1LocalControl(
+        run_id=run_id, host_incarnation=incarnation, live=True, live_recipe="physical-live-teleop"
+    )
+    observation = {
+        **dict.fromkeys(KEYS, 7.0),
+        "x.vel": 0.0,
+        "y.vel": 0.0,
+        "theta.vel": 0.0,
+        "lift_axis.vel": velocity,
+        "lift_axis.height_mm": 23.0,
+        "_am1_lift_feedback": original,
+    }
+    control.annotate(observation, acquired_at=now - 0.02)
+    observation[host.AM1_LOCAL_FEEDBACK_KEY]["read_started_at_monotonic_s"] = now - 0.04
+    parts = host.build_observation_multipart(observation, ())
+    client = AlohaMiniClient(
+        AlohaMiniClientConfig(
+            remote_ip="127.0.0.1", robot_model="alohamini1", cameras={}, calibration_dir=tmp_path
+        )
+    )
+    client._is_connected = True
+    client._last_response_request_sent_at = now - 0.05
+    monkeypatch.setattr(client, "_poll_and_get_latest_message", lambda: parts)
+    sample = read_physical_sample(client, run_id, incarnation, -1)
+    assert "lift_axis.vel" not in client.last_remote_state
+    assert sample["body_feedback"]["lift_axis.vel"] == velocity
+    assert sample["lift_feedback"] == sample["ack"]["lift_feedback"] == original
+    assert sample["timing"]["lift_feedback"] == original
+    assert sample["at"] == original["sample_monotonic_s"] - original["request_duration_s"]
+    src = {"source_id": str(uuid4()), "sample_seq": 1, "grant_id": str(uuid4())}
+    snapshot = {
+        "run": {
+            "live_input": {
+                "last_input_seq": 1,
+                "source": src,
+                "body": {"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0, "lift_axis.vel": 0},
+            }
+        },
+        "evidence": {
+            "active_acknowledged": True,
+            "feedback": True,
+            "native_ack": True,
+            "measured_body": sample["body_feedback"],
+        },
+    }
+    assert native_frame_ack(snapshot, 1, src, body_zero=True) is (velocity == 0)
+
+
+def test_old_original_lift_feedback_cannot_be_retimed_by_a_new_host_envelope():
+    from tests.robots.test_am1_physical_executor import client_sample
+    from tools.am1_physical_executor import FeedbackUnavailable, read_physical_sample
+
+    client = client_sample()
+    observation = client.get_observation()
+    observation.update({"lift_axis.vel": 0, "lift_axis.height_mm": 23.0})
+    client.latest_raw_observation_keys = frozenset(observation)
+    client.latest_am1_local_feedback["lift_feedback"] = {
+        "version": 1,
+        "present_velocity_raw": 0,
+        "height_mm": 23.0,
+        "sample_monotonic_s": 8.9,
+        "request_duration_s": 0.01,
+    }
+    with pytest.raises(FeedbackUnavailable, match="lift.*expired"):
+        read_physical_sample(client, "run", "host", 4, clock=lambda: 10.0)
