@@ -13,6 +13,7 @@ from lerobot.motors.feetech import FeetechMotorsBus
 from tests.robots.test_am1_selected_joint_evidence import robot as selected_robot
 from tests.robots.test_am1_selected_joint_evidence import visible_register_packet, visible_robot
 from tests.robots.test_alohamini_lift_motor_feedback import status
+from tests.robots.test_alohamini_lift_operational import operating_robot
 
 KEY = "arm_left_elbow_flex.pos"
 
@@ -539,6 +540,210 @@ def test_practical_twenty_degrees_survives_ordinary_twenty_normalized_relative_c
     obj.send_action({RIGHT_KEY: config.target_norm(20), "x.vel": 0, "y.vel": 0, "theta.vel": 0, "lift_axis.vel": 0})
     assert obj._am1_selected_joint_action["expected_goal_raw"] == 2074
     assert obj.config.max_relative_target == 20
+
+
+def test_practical_routine_writer_blocked_sink_keeps_owner_free_and_records_immutable():
+    import json
+    import threading
+    entered, release = threading.Event(), threading.Event()
+    output = bytearray()
+    def write(data):
+        entered.set()
+        assert release.wait(2)
+        count = min(17, len(data))
+        output.extend(data[:count])
+        return count
+    writer = host.AM1RoutineRecordWriter(write=write, capacity=8)
+    first = {"sample_monotonic_s": 65158.384830385, "temperature_c": 35}
+    try:
+        assert writer.submit("[LIFT OPERATIONAL] ", first)
+        assert entered.wait(1)
+        first["temperature_c"] = 99
+        assert writer.submit("[AM1 SELECTED JOINT] ", {"kind": "native_trace", "raw": 1929})
+        for line in ("[HOST TIMING avg ms/loop] retained", "[HOST ACTION avg ms/command] retained",
+                     "[HOST CADENCE] retained", "Owned Live Stop received."):
+            assert writer.submit_line(line, flush=True)
+        # These are ordinary owner operations while the sink remains blocked.
+        writer.raise_if_failed()
+        assert not release.is_set()
+    finally:
+        release.set()
+        writer.close(timeout=1)
+    lines = output.decode().splitlines()
+    assert json.loads(lines[0].split("] ", 1)[1]) == {"sample_monotonic_s": 65158.384830385, "temperature_c": 35}
+    assert json.loads(lines[1].split("] ", 1)[1])["kind"] == "native_trace"
+    assert lines[2:] == ["[HOST TIMING avg ms/loop] retained", "[HOST ACTION avg ms/command] retained",
+                         "[HOST CADENCE] retained", "Owned Live Stop received."]
+
+
+def test_practical_routine_writer_queue_full_and_sink_error_are_latched():
+    import threading
+    entered, release = threading.Event(), threading.Event()
+    output = []
+    def write(data):
+        entered.set()
+        assert release.wait(2)
+        output.append(bytes(data))
+        return len(data)
+    writer = host.AM1RoutineRecordWriter(write=write, capacity=1)
+    try:
+        assert writer.submit("", {"sequence": 1}) and entered.wait(1)
+        assert writer.submit("", {"sequence": 2})
+        assert not writer.submit("", {"sequence": 3})
+        with pytest.raises(RuntimeError, match="queue full") as full:
+            writer.raise_if_failed()
+    finally:
+        release.set()
+        with pytest.raises(RuntimeError, match="queue full") as closing:
+            writer.close(timeout=1)
+    assert closing.value is full.value and len(output) == 2
+    original = OSError("actual routine sink failure")
+    def failed(data):
+        raise original
+    writer = host.AM1RoutineRecordWriter(write=failed)
+    writer.submit("", {"sequence": 1})
+    with pytest.raises(OSError) as caught:
+        writer.close(timeout=1)
+    assert caught.value is original
+    with pytest.raises(OSError) as again:
+        writer.raise_if_failed()
+    assert again.value is original
+
+
+def test_practical_routine_writer_drain_timeout_is_finite():
+    import threading
+    entered, release = threading.Event(), threading.Event()
+    def write(data):
+        entered.set()
+        release.wait(2)
+        return len(data)
+    writer = host.AM1RoutineRecordWriter(write=write)
+    writer.submit("", {"sequence": 1})
+    assert entered.wait(1)
+    try:
+        with pytest.raises(TimeoutError, match="drain"):
+            writer.close(timeout=.01)
+    finally:
+        release.set()
+        writer._thread.join(1)
+
+
+def test_practical_routine_writer_bounds_bytes_and_rejects_zero_progress():
+    writer = host.AM1RoutineRecordWriter(write=lambda data: len(data))
+    assert not writer.submit("", {"oversized": "x" * 32768})
+    with pytest.raises(ValueError, match="32768 bytes"):
+        writer.close(timeout=1)
+    writer = host.AM1RoutineRecordWriter(write=lambda data: 0)
+    writer.submit("", {"sequence": 1})
+    with pytest.raises(OSError, match="invalid progress"):
+        writer.close(timeout=1)
+
+
+def test_practical_routine_writer_uses_duplicate_fd_without_text_stream_write(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    path = tmp_path / "routine-native.log"
+    with path.open("wb") as stream:
+        sink = SimpleNamespace(fileno=stream.fileno,
+                               write=lambda *args: pytest.fail("worker acquired stdout TextIO writer"))
+        monkeypatch.setattr(host, "sys", SimpleNamespace(stdout=sink))
+        writer = host.AM1RoutineRecordWriter()
+        writer.submit("[AM1 SELECTED JOINT] ", {"sample_monotonic_s": 65158.384830385})
+        writer.close(timeout=1)
+        assert not stream.closed
+    assert path.read_text() == '[AM1 SELECTED JOINT] {"sample_monotonic_s":65158.384830385}\n'
+
+
+def test_practical_blocked_log_sink_preserves_real_five_slot_polls_and_cleanup(operating_robot):
+    import json
+    import threading
+    robot, clock = operating_robot
+    robot.connect(calibrate=False)
+    operation = robot._lift_operation
+    window = operation.temperature
+    origin = window._origin_ns
+    robot.left_bus.registers[("Present_Temperature", "lift_axis")] = 35
+    entered, release = threading.Event(), threading.Event()
+    lines = []
+    def write(data):
+        entered.set()
+        assert release.wait(2)
+        lines.append(bytes(data))
+        return len(data)
+    writer = host.AM1RoutineRecordWriter(write=write)
+    first = None
+    try:
+        for index in range(20):
+            clock.sleep(.03)
+            operation.poll(defer_sample_log=True)
+            if first is None:
+                first = operation.last_record["sample_monotonic_s"]
+            writer.emit_lift_samples(operation)
+            if index == 0:
+                assert entered.wait(1)
+            writer.raise_if_failed()
+            assert window.ready and window.failure is None
+            assert clock.now - window.samples[0][0] <= .5
+        assert operation.last_record["sample_monotonic_s"] - first > .5
+        assert window._origin_ns == origin and window.MAX_AGE_S == .5
+        # A blocked diagnostic sink cannot postpone the existing zero/off path.
+        robot.disconnect()
+        assert not robot.left_bus.is_connected and not release.is_set()
+        assert robot.left_bus.registers[("Torque_Enable", "lift_axis")] == 0
+    finally:
+        if robot.left_bus.is_connected:
+            robot.disconnect()
+        release.set()
+        writer.close(timeout=1)
+    records = [json.loads(line.decode().split("] ", 1)[1]) for line in lines]
+    assert len(records) == 20 and records[0]["sample_monotonic_s"] == first
+    assert all(record["temperature_c"] == 35 for record in records)
+
+
+@pytest.mark.parametrize("normal_stop", [False, True])
+def test_practical_writer_error_still_cleans_motor_and_sockets_before_drain(monkeypatch, normal_stop):
+    from types import SimpleNamespace
+    events = []
+    original = OSError("routine writer original failure")
+    identity = binding()
+    recipe = "physical-live-right-elbow-practical"
+    obj = SimpleNamespace(is_connected=True, config=SimpleNamespace(robot_model="alohamini1"))
+    def disconnect(**kwargs):
+        events.append("motor-zero-off")
+        obj.is_connected = False
+    obj.disconnect = disconnect
+    evidence = SimpleNamespace(enabled=True, enrich_fault=lambda *args: None,
+                               emit_pending_fault=lambda *args: events.append("fault-record"))
+    class Writer:
+        def submit_line(self, message, **kwargs):
+            report(message, **kwargs)
+        def emit_selected(self, record):
+            pass
+        def raise_if_failed(self):
+            if not normal_stop:
+                raise original
+        def close(self, **kwargs):
+            events.append("drain")
+    monkeypatch.setattr(host, "AM1RoutineRecordWriter", Writer)
+    monkeypatch.setattr(host, "AM1SelectedJointEvidence", lambda **kwargs: evidence)
+    monkeypatch.setattr(host, "AlohaMini", lambda config: obj)
+    monkeypatch.setattr(host, "connect_robot", lambda *args, **kwargs: None)
+    monkeypatch.setattr(host, "visible_control_binding", lambda args: {**identity, "recipe": recipe})
+    monkeypatch.setattr(host, "right_p20_trial_binding", lambda *args: dict(kind="practical13-right", request=dict(config=dict(reference_raw=1847, direction=1))))
+    monkeypatch.setattr(host, "AM1LocalControl", lambda **kwargs: SimpleNamespace(live=True,
+        state="stopped" if normal_stop else "paused", check_live=lambda robot: not normal_stop))
+    monkeypatch.setattr(host, "AlohaMiniHost", lambda config: SimpleNamespace(watchdog_timeout_ms=1000,
+        connection_time_s=.1, max_loop_freq_hz=30, disconnect=lambda: events.append("socket-close")))
+    args = host.make_parser().parse_args(["--no_cameras", "--skip_lift_home"])
+    args.am1_run_id, args.am1_host_incarnation = identity["run_id"], identity["host_incarnation"]
+    def report(message, **kwargs):
+        if normal_stop and message == "Owned Live Stop received.":
+            events.append("normal-stop-report")
+            raise original
+    monkeypatch.setattr(host, "print", report, raising=False)
+    with pytest.raises(OSError) as caught:
+        host._run_host(args)
+    assert caught.value is original
+    assert events == ["motor-zero-off", "socket-close", *(["normal-stop-report"] if normal_stop else []), "fault-record", "drain"]
 
 
 def test_nonselected_out_of_command_range_pose_keeps_its_existing_raw_hold(monkeypatch):

@@ -20,8 +20,11 @@ import json
 import logging
 import math
 import os
+import queue
 import signal
 import stat
+import sys
+import threading
 import time
 from collections import deque
 from collections.abc import Callable
@@ -49,6 +52,108 @@ AM1_LIVE_WRITE_PROOF_FIELDS = (
 
 class AM1LiveInputExpired(Exception):
     """An acknowledged native release, distinct from every motor/feedback fault."""
+
+
+class AM1RoutineRecordWriter:
+    """Practical-mode stdout work only; the worker receives immutable bytes, never hardware."""
+
+    def __init__(self, *, write=None, capacity=128):
+        if type(capacity) is not int or not 1 <= capacity <= 128:
+            raise ValueError("Routine log capacity must be bounded to 1..128 records")
+        self._queue = queue.Queue(maxsize=capacity)
+        self._failure = None
+        self._failure_lock = threading.Lock()
+        self._closed = False
+        self._fd = os.dup(sys.stdout.fileno()) if write is None else None
+        self._write = write if write is not None else lambda data: os.write(self._fd, data)
+        self._thread = threading.Thread(target=self._run, name="am1-routine-log", daemon=True)
+        self._thread.start()
+
+    def _latch(self, error):
+        with self._failure_lock:
+            if self._failure is None:
+                self._failure = error
+
+    def raise_if_failed(self):
+        if self._failure is not None:
+            raise self._failure
+
+    def submit(self, prefix, record):
+        """Freeze the original record; a full/failed sink never waits on the owner."""
+        try:
+            return self.submit_line(prefix + json.dumps(record, allow_nan=False, separators=(",", ":")))
+        except BaseException as error:
+            self._latch(error)
+        return False
+
+    def submit_line(self, line, *, flush=True):
+        """The same bounded sink for already-formatted routine and exit reports."""
+        if self._closed or self._failure is not None:
+            return False
+        try:
+            line = (line + "\n").encode()
+            if len(line) > 32768:
+                raise ValueError("Routine log record exceeds 32768 bytes")
+            self._queue.put_nowait(line)
+            return True
+        except queue.Full:
+            self._latch(RuntimeError("AM1 routine log queue full"))
+        except BaseException as error:
+            self._latch(error)
+        return False
+
+    def _run(self):
+        try:
+            while not self._closed or not self._queue.empty():
+                try:
+                    line = self._queue.get(timeout=.05)
+                except queue.Empty:
+                    continue
+                try:
+                    offset = 0
+                    while offset < len(line):
+                        count = self._write(line[offset:])
+                        if type(count) is not int or not 0 < count <= len(line) - offset:
+                            raise OSError("Routine log write made invalid progress")
+                        offset += count
+                finally:
+                    self._queue.task_done()
+        except BaseException as error:
+            self._latch(error)
+        finally:
+            if self._fd is not None:
+                os.close(self._fd)
+
+    def emit_selected(self, record):
+        prefix = "[AM1 SELECTED SETTINGS] " if record.get("kind") == "visible_settings" else "[AM1 SELECTED JOINT] "
+        self.submit(prefix, record)
+
+    def emit_lift(self, record):
+        record = {key: value for key, value in record.items() if key != "comparison_profile"}
+        self.submit("[LIFT OPERATIONAL] ", {**record,
+            "policy": "am1-confirmed-temperature-slots-relief-v2", "wall_time_ns": time.time_ns()})
+
+    def emit_lift_samples(self, operation):
+        # Only the existing routine batch changes sink. Fault/transition emits
+        # retain their existing path, and no operation object reaches the worker.
+        original = operation.emit
+        try:
+            operation.emit = self.emit_lift
+            operation.emit_pending_sample()
+        finally:
+            operation.emit = original
+
+    def close(self, *, timeout=2.0):
+        if not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or not 0 < timeout <= 2:
+            raise ValueError("Routine log drain needs a finite bound of at most two seconds")
+        self._closed = True
+        self._thread.join(timeout)
+        if self._thread.is_alive():
+            error = TimeoutError("AM1 routine log drain exceeded its finite bound")
+            self._latch(error)
+            if self._failure is not error:
+                self._failure.add_note(str(error))
+        self.raise_if_failed()
 
 
 class AM1LocalControl:
@@ -874,10 +979,10 @@ class HostCommandState:
         return f"[HOST CADENCE] {json.dumps(snapshot, separators=(',', ':'))}"
 
 
-def print_cadence_report(command_state: HostCommandState) -> None:
+def print_cadence_report(command_state: HostCommandState, *, emit=None) -> None:
     report = command_state.format_report()
     if report is not None:
-        print(report, flush=True)
+        (print if emit is None else emit)(report, flush=True)
 
 
 class AM1HostLoopTiming:
@@ -1511,9 +1616,16 @@ def _run_host(args):
     )
     fault_loop_context = None
     fault_loop_context_error = None
+    routine_writer = None
+    routine_report = print
+    exit_message = None
     logging.info("Waiting for commands...")
 
     try:
+        if practical_config is not None:
+            routine_writer = AM1RoutineRecordWriter()
+            selected_evidence.emit = routine_writer.emit_selected
+            routine_report = routine_writer.submit_line
         # One final same-owner startup boundary before ordinary loop timing.
         # Only a due genuine read can refresh the retained original thermal slots.
         if (
@@ -1532,6 +1644,8 @@ def _run_host(args):
         lift_diagnostics_report_start_t = cadence_report_start_t
 
         while duration < host.connection_time_s:
+            if routine_writer is not None:
+                routine_writer.raise_if_failed()
             if local_control is not None and not local_control.check_live(robot):
                 break
             loop_start_t = time.perf_counter()
@@ -1629,7 +1743,10 @@ def _run_host(args):
                         [request_identity, request_token, *observation_parts], flags=zmq.NOBLOCK
                     )
                 except zmq.Again:
-                    logging.info("Dropping observation response, client is not ready")
+                    if routine_writer is None:
+                        logging.info("Dropping observation response, client is not ready")
+                    else:
+                        routine_report("Dropping observation response, client is not ready")
             response_send_done_t = time.perf_counter()
             if loop_timing is not None:
                 loop_timing.mark("sample_log", response_send_done_t)
@@ -1638,7 +1755,10 @@ def _run_host(args):
             # margin between this tick's grouped read and action/observation use.
             # A slow sink still counts toward the next poll's unchanged deadline.
             if lift_operation is not None:
-                lift_operation.emit_pending_sample()
+                if routine_writer is None:
+                    lift_operation.emit_pending_sample()
+                else:
+                    routine_writer.emit_lift_samples(lift_operation)
 
             # Bounded sparse readbacks share the owner after ordinary control and
             # response delivery. Their full time still counts toward next poll.
@@ -1653,7 +1773,7 @@ def _run_host(args):
                 args.profile_lift_diagnostics
                 and lift_diagnostics_now - lift_diagnostics_report_start_t >= 1.0
             ):
-                print(format_lift_diagnostic_report(robot, last_observation), flush=True)
+                routine_report(format_lift_diagnostic_report(robot, last_observation), flush=True)
                 lift_diagnostics_report_start_t = lift_diagnostics_now
                 lift_diagnostics_done_t = time.perf_counter()
             if loop_timing is not None:
@@ -1696,7 +1816,7 @@ def _run_host(args):
                     for name, value in averages.items()
                     if name.startswith("camera_")
                 )
-                print(
+                routine_report(
                     f"[HOST TIMING avg ms/loop] Hz={timing_loop_count / timing_elapsed_s:.1f} "
                     f"cmd={averages['command']:.1f} robot_obs={averages['robot_observation']:.1f} "
                     f"left={averages.get('left_arm', 0.0):.1f} base={averages.get('base', 0.0):.1f} "
@@ -1711,7 +1831,7 @@ def _run_host(args):
                         name: total_ms / timing_command_count
                         for name, total_ms in action_timing_totals_ms.items()
                     }
-                    print(
+                    routine_report(
                         f"[HOST ACTION avg ms/command] n={timing_command_count} "
                         f"prepare={action_averages.get('action_prepare', 0.0):.1f} "
                         f"lift={action_averages.get('action_lift', 0.0):.1f} "
@@ -1734,7 +1854,10 @@ def _run_host(args):
 
             cadence_now = time.monotonic()
             if args.profile_cadence and cadence_now - cadence_report_start_t >= 1.0:
-                print_cadence_report(command_state)
+                if routine_writer is None:
+                    print_cadence_report(command_state)
+                else:
+                    print_cadence_report(command_state, emit=routine_report)
                 if sync_shoulder_readback and local_control is not None and local_control.state == "ready":
                     print_startup_shoulder_report(robot, command_state, last_observation)
                 if left_shoulder_evidence.enabled and loop_timing is not None:
@@ -1748,12 +1871,12 @@ def _run_host(args):
             if loop_timing is not None:
                 loop_timing.finish(time.perf_counter())
         if local_control is not None and local_control.live and local_control.state == "stopped":
-            print("Owned Live Stop received.")
+            exit_message = "Owned Live Stop received."
         elif (local_control is not None and local_control.live
               and local_control.live_snapshot().get("state") == "budget_expired"):
-            print("Live time budget expired.")
+            exit_message = "Live time budget expired."
         else:
-            print("Cycle time reached.")
+            exit_message = "Cycle time reached."
 
     except KeyboardInterrupt:
         interrupted_motor_io = True
@@ -1792,11 +1915,16 @@ def _run_host(args):
         # Every exit message is after zero/off and socket cleanup. A blocked
         # or failed sink must never delay the protective motor requests.
         try:
+            if exit_message is not None:
+                routine_report(exit_message)
             if keyboard_interrupted:
-                print("Keyboard interrupt received. Exiting...")
-            print("Shutting down AlohaMini Host.")
+                routine_report("Keyboard interrupt received. Exiting...")
+            routine_report("Shutting down AlohaMini Host.")
             if args.profile_cadence:
-                print_cadence_report(command_state)
+                if routine_writer is None:
+                    print_cadence_report(command_state)
+                else:
+                    print_cadence_report(command_state, emit=routine_report)
         except BaseException as error:
             cleanup_errors.append(("shutdown reporting", error))
 
@@ -1811,9 +1939,17 @@ def _run_host(args):
         lift_operation = getattr(robot, "_lift_operation", None)
         if lift_operation is not None:
             try:
-                lift_operation.emit_pending_sample()
+                if routine_writer is None:
+                    lift_operation.emit_pending_sample()
+                else:
+                    routine_writer.emit_lift_samples(lift_operation)
             except BaseException as error:
                 cleanup_errors.append(("pending lift sample", error))
+        if routine_writer is not None:
+            try:
+                routine_writer.close(timeout=2.0)
+            except BaseException as error:
+                cleanup_errors.append(("routine log writer drain", error))
 
         args._am1_cleanup_errors = [
             f"{operation}: {type(error).__name__}: {error}" for operation, error in cleanup_errors
