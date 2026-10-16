@@ -1,3 +1,17 @@
+## Current AM1 Packet13 verified operation
+
+Packet13 completed useful repeated right-elbow control and a working next Start.
+See [the measured results and ordinary recipe](docs/alohamini/practical-motion-13.md).
+Use the demonstrated P16/I0/D32, 10-degree client target recipe; larger amplitudes
+and P24/P32 were not needed or physically qualified. Batch reference1847 remains
+fixed while each run measures its own q0. Exact/fine return is not a Start gate.
+Preserve original expiry/deadline and qualified current gestures on re-jog/rejoin.
+Routine logs must not block the motor loop or zero/off cleanup. Keep source,
+motor/runtime/camera/helper pins and full rollback separate; services start idle.
+PR23 is draft/unmerged. All historical results and consumed requests below remain
+unchanged. Durability means software fault tolerance, connection/control continuity,
+state preservation and recovery; no hardware wear campaign is included.
+
 ## Active AM1-PRACTICAL-MOTION-13 scope
 
 The owner explicitly invoked Packet13. It supersedes historical micro-motion
