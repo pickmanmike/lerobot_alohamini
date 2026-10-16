@@ -32,6 +32,7 @@ class LiveElbowSpec:
     rate_norm_per_s: float = 1.0
     current_cap_ma: float = 150.0
     live_s: float = 90.0
+    practical_motion: bool = False
 
     def summary(self):
         result = dict(
@@ -43,7 +44,15 @@ class LiveElbowSpec:
         workspace = LIVE_ELBOW_WORKSPACES.get(self.recipe)
         if workspace is not None:
             result["supported_workspace"] = workspace.summary()
+        if self.practical_motion:
+            result["practical_motion"] = True
         return result
+
+
+PRACTICAL_ELBOW_RECIPE = "physical-live-right-elbow-practical"
+PRACTICAL_ELBOW_COUNTS_PER_REVOLUTION = 4096
+PRACTICAL_ELBOW_MAX_EXCURSION_RAW = math.floor(20 * PRACTICAL_ELBOW_COUNTS_PER_REVOLUTION / 360)
+PRACTICAL_ELBOW_RATE_NORM_PER_S = 5 * PRACTICAL_ELBOW_COUNTS_PER_REVOLUTION / 360 * 200 / 2212
 
 
 LIVE_ELBOW_SPECS = MappingProxyType({
@@ -52,6 +61,10 @@ LIVE_ELBOW_SPECS = MappingProxyType({
                       "LiveLeftElbow", -10.0, 0.0),
         LiveElbowSpec("physical-live-right-elbow", "arm_right_elbow_flex.pos", "right", "Right elbow",
                       "LiveRightElbow", -3.0, 0.0),
+        LiveElbowSpec(PRACTICAL_ELBOW_RECIPE, "arm_right_elbow_flex.pos", "right", "Right elbow practical",
+                      "LiveRightElbowPractical", 0.0, PRACTICAL_ELBOW_MAX_EXCURSION_RAW * 200 / 2212,
+                      rate_norm_per_s=PRACTICAL_ELBOW_RATE_NORM_PER_S, current_cap_ma=500.0,
+                      live_s=180.0, practical_motion=True),
     )
 })
 
@@ -206,6 +219,144 @@ LIVE_ELBOW_WORKSPACE_POLICIES = MappingProxyType({
 LIVE_ELBOW_WORKSPACES = MappingProxyType({
     "physical-live-right-elbow": LIVE_ELBOW_WORKSPACE_POLICIES["am1-right-elbow-rest-neighbourhood-v2"]
 })
+
+
+@dataclass(frozen=True)
+class PracticalElbowConfig:
+    """One checked batch reference/direction; numerical stimuli do not reseed it."""
+
+    reference_raw: int
+    direction: int
+
+    def __post_init__(self):
+        endpoint = (self.reference_raw + self.direction * PRACTICAL_ELBOW_MAX_EXCURSION_RAW
+                    if type(self.reference_raw) is int and type(self.direction) is int else None)
+        if (type(self.reference_raw) is not int or type(self.direction) is not int or self.direction not in (-1, 1)
+                or not 827 <= self.reference_raw <= 3039 or not 827 <= endpoint <= 3039):
+            raise ValueError("Practical elbow requires one fixed raw reference/direction within calibrated limits")
+
+    @classmethod
+    def from_payload(cls, value):
+        if not isinstance(value, dict) or set(value) != {"reference_raw", "direction"}:
+            raise ValueError("Practical elbow configuration requires exactly reference_raw and direction")
+        return cls(**value)
+
+    def to_payload(self):
+        return dict(reference_raw=self.reference_raw, direction=self.direction)
+
+    @property
+    def spec(self):
+        return LIVE_ELBOW_SPECS[PRACTICAL_ELBOW_RECIPE]
+
+    @property
+    def live_spec(self):
+        return self.spec
+
+    @property
+    def workspace(self):
+        return PracticalElbowWorkspace(self)
+
+    def target_raw(self, degrees):
+        if type(degrees) not in (int, float) or not math.isfinite(degrees) or degrees not in (0, 10, 20):
+            raise ValueError("Practical elbow targets are the fixed reference or inward 10/20 degree excursions")
+        counts = math.floor(degrees * PRACTICAL_ELBOW_COUNTS_PER_REVOLUTION / 360)
+        return self.reference_raw + self.direction * counts
+
+    def target_norm(self, degrees):
+        return self.workspace.normalize(self.target_raw(degrees))
+
+    def geometry(self, raw, reference):
+        return self.workspace.geometry(raw, reference)
+
+
+@dataclass(frozen=True)
+class PracticalElbowWorkspace:
+    """Fixed one-sided twenty-degree commands with retained v2 rest admission."""
+
+    config: PracticalElbowConfig
+    id = "am1-right-elbow-practical-v1"
+    recipe = PRACTICAL_ELBOW_RECIPE
+    calibration_sha256 = LiveWorkspaceSpec.calibration_sha256
+
+    @property
+    def command_min_raw(self):
+        return min(self.config.reference_raw, self.config.target_raw(20))
+
+    @property
+    def command_max_raw(self):
+        return max(self.config.reference_raw, self.config.target_raw(20))
+
+    @property
+    def measured_min_raw(self):
+        # A fresh actual q0 can differ from the fixed command reference. This is
+        # three physical degrees, not the historical three normalized units.
+        margin = math.floor(3 * PRACTICAL_ELBOW_COUNTS_PER_REVOLUTION / 360)
+        return max(827, self.command_min_raw - margin)
+
+    @property
+    def measured_max_raw(self):
+        margin = math.floor(3 * PRACTICAL_ELBOW_COUNTS_PER_REVOLUTION / 360)
+        return min(3039, self.command_max_raw + margin)
+
+    @property
+    def context_sha256(self):
+        retained = LIVE_ELBOW_WORKSPACE_POLICIES["am1-right-elbow-rest-neighbourhood-v2"]
+        return LiveWorkspaceSpec._hash(dict(id=self.id, recipe=self.recipe,
+            rest_context_sha256=retained.context_sha256, config=self.config.to_payload(),
+            counts_per_revolution=PRACTICAL_ELBOW_COUNTS_PER_REVOLUTION,
+            maximum_excursion_degrees=20, measured_margin_degrees=3))
+
+    @property
+    def descriptor(self):
+        # Keep the established descriptor shape; the distinct policy identity
+        # binds this checked practical workspace rather than old motion results.
+        return dict(version=1, id=self.id, context_sha256=self.context_sha256,
+                    evidence_min_raw=self.command_min_raw, evidence_max_raw=self.command_max_raw)
+
+    @staticmethod
+    def normalize(raw):
+        if type(raw) is not int or not 827 <= raw <= 3039:
+            raise ValueError("Practical elbow normalization requires one calibrated integer raw position")
+        value = LiveWorkspaceSpec.normalize(raw)
+        material = dict(drive_mode=0, homing_offset=-658, range_min=827, range_max=3039)
+        # The installed encoder truncates. Avoid a floating-point round trip
+        # silently delivering the preceding count at some otherwise exact raws.
+        if SignedElbowResponse.encoded_goal(value, material) == raw:
+            return value
+        # Advancing one ULP of a near-zero normalized value can be too small
+        # to survive the encoder's +100. This bounded offset is below 1e-9
+        # normalized units and still delivers exactly the chosen raw count.
+        value = math.nextafter(value + 1e-12, math.inf)
+        if SignedElbowResponse.encoded_goal(value, material) == raw:
+            return value
+        raise ValueError("Practical elbow normalized target does not encode its exact raw position")
+
+    def summary(self):
+        return dict(self.descriptor, command_min_raw=self.command_min_raw, command_max_raw=self.command_max_raw,
+                    command_min_norm=self.normalize(self.command_min_raw),
+                    command_max_norm=self.normalize(self.command_max_raw),
+                    span_norm=self.normalize(self.command_max_raw) - self.normalize(self.command_min_raw),
+                    requires_current_admission=True, practical_motion=True, config=self.config.to_payload(),
+                    maximum_excursion_degrees=20, measured_margin_degrees=3)
+
+    def qualify(self, context):
+        LIVE_ELBOW_WORKSPACE_POLICIES["am1-right-elbow-rest-neighbourhood-v2"].qualify(context)
+
+    def geometry(self, raw, reference):
+        if (type(raw) is not int or not self.measured_min_raw <= raw <= self.measured_max_raw
+                or type(reference) not in (int, float) or not math.isfinite(reference)
+                or abs(reference - self.normalize(raw)) > 1e-9):
+            raise ValueError("Practical elbow actual q0 left its fixed checked workspace/measured margin")
+        return dict(admission_version=2, measured_origin_raw=raw,
+                    corridor_min_norm=self.normalize(self.command_min_raw),
+                    corridor_max_norm=self.normalize(self.command_max_raw),
+                    corridor_min_raw=self.command_min_raw, corridor_max_raw=self.command_max_raw,
+                    measured_min_raw=self.measured_min_raw, measured_max_raw=self.measured_max_raw,
+                    workspace=self.descriptor)
+
+    def admission(self, context, raw, reference):
+        self.qualify(context)
+        return self.geometry(raw, reference)
 
 
 @dataclass(frozen=True)

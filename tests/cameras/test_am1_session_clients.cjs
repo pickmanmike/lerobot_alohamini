@@ -390,6 +390,43 @@ test("loaded UI distinguishes test-only physical protocol startup, native Live a
 });
 
 
+test("loaded practical UI displays admitted bounds rate and original180-second ceiling",async t=>{
+ const browser=await chromium.launch({headless:true,channel:process.env.AM1_TEST_BROWSER_CHANNEL || "msedge"});t.after(()=>browser.close());
+ const context=await browser.newContext({ignoreHTTPSErrors:true});t.after(()=>context.close());const page=await context.newPage();
+ const fs=require("node:fs"),path=require("node:path"),assets=path.join(__dirname,"../../tools/am1_console_ui");
+ await page.setContent(fs.readFileSync(path.join(assets,"index.html"),"utf8").replace(/<script[^>]*>[\s\S]*?<\/script>/g,""));
+ await page.addScriptTag({path:path.join(assets,"session_transport.js")});
+ await page.evaluate(()=>{AM1SessionTransport.prototype.initialize=async()=>null;AM1RemoteInitialize();});
+ const spec={recipe:"physical-live-right-elbow-practical",joint:"arm_right_elbow_flex.pos",side:"right",label:"Right elbow practical",
+  profile:"LiveRightElbowPractical",rate_norm_per_s:5*4096/360*200/2212,current_cap_ma:500,live_s:180,practical_motion:true};
+ const starts=[];page.on("request",request=>{if(/\/api\/start/.test(request.url()))starts.push(request.url());});
+ await page.evaluate(({spec,liveRecipes})=>{
+  am1Remote.renew=async()=>null;
+  am1Remote.snapshot={service_incarnation:"fixture-owner",recipes:liveRecipes.map(value=>value.recipe),presets:[],live_elbow_recipes:liveRecipes,
+   evidence:{feedback:true,native_ack:true,required_observation:true,measured_positions:{[spec.joint]:-7.776}},run:null};
+  am1Remote.render(am1Remote);document.querySelector("#fake-recipe").value=spec.recipe;am1Remote.render(am1Remote);
+ },{spec,liveRecipes:[...sharedLiveRecipes().filter(value=>value.recipe!==spec.recipe),spec]});
+ assert.match(await page.locator("#live-elbow-controls h2").innerText(),/right elbow practical/i);
+ assert.match(await page.locator("#live-elbow-controls output").innerText(),/admission pending/i);
+ await page.evaluate(spec=>{
+  const low=(1847-827)/2212*200-100,high=(2074-827)/2212*200-100;
+  am1Remote.snapshot.run={run_id:"test-only-practical-protocol",recipe:spec.recipe,source:"protected-physical-provider",status:"running",
+   intent_revision:7,backend_incarnation:"fixture-host",progress_s:0,native_live_at:810,deadline:990,remaining_s:180,
+   live_input:{joint:spec.joint,side:spec.side,label:spec.label,profile:spec.profile,rate_norm_per_s:spec.rate_norm_per_s,
+    reference_norm:low,corridor_min_norm:low,corridor_max_norm:high,cursor_norm:low+.25,cursor_feedback_sequence:30,cursor_intent_revision:7,
+    workspace:{version:1,id:"am1-right-elbow-practical-v1",context_sha256:"a".repeat(64),evidence_min_raw:1847,evidence_max_raw:2074}}};
+  am1Remote.render(am1Remote);
+ },spec);
+ assert.match(await page.locator("#control-help").innerText(),/original 180-second Live budget/);
+ assert.match(await page.locator("#live-elbow-controls output").innerText(),/admitted -7\.776 to 12\.749/);
+ assert.match(await page.locator("#live-elbow-controls output").innerText(),/5\.144 normalized\/s/);
+ assert.match(await page.locator("#live-elbow-controls output").innerText(),/run q0 -7\.776/);
+ await page.evaluate(()=>{am1Remote.snapshot.run.live_input.rate_norm_per_s=.5;am1Remote.render(am1Remote);});
+ assert.match(await page.locator("#live-elbow-controls output").innerText(),/0\.500 normalized\/s/,"active reporting shows the actual native rate");
+ assert.equal(await page.evaluate(()=>am1Remote.elbowInput()),null,"a mismatched native rate cannot authorize input");
+ assert.deepEqual(starts,[],"rendering a practical candidate or admitted payload cannot Start a run");
+});
+
 for(const selected of [{recipe:"physical-live-left-elbow",joint:"arm_left_elbow_flex.pos",side:"left",label:"Left elbow",profile:"LiveLeftElbow"},
   {recipe:"physical-live-right-elbow",joint:"arm_right_elbow_flex.pos",side:"right",label:"Right elbow",profile:"LiveRightElbow"}])test("loaded protocol-fixture "+selected.side+" elbow selects before Start and keeps fresh run-bound input",async t=>{
   const f=await fixture();t.after(()=>f.close());

@@ -473,6 +473,8 @@ RIGHT_P20_RECIPE = "physical-live-right-elbow"
 RIGHT_P20_REQUEST_NAME = "response12-right-p20-request.json"
 RIGHT_P20_DESCRIPTOR_NAME = "response12-right-p20.json"
 RIGHT_P20_CONSUMED_NAME = "response12-right-p20-consumed.json"
+PRACTICAL_KIND = "practical13-right"
+PRACTICAL_RECIPE = "physical-live-right-elbow-practical"
 
 
 def _right_p20_json(value):
@@ -506,6 +508,17 @@ def _right_p20_file(path):
 
 def _right_p20_request(value, source_head=None):
     import re
+    if isinstance(value, dict) and value.get("kind") == PRACTICAL_KIND:
+        from examples.alohamini.am1_session_contract import PracticalElbowConfig
+        if (set(value) != {"version", "kind", "request_id", "source_head", "config", "proportional"}
+                or type(value["version"]) is not int or value["version"] != 1
+                or type(value["proportional"]) is not int or value["proportional"] not in (16, 24, 32)
+                or type(value["source_head"]) is not str or re.fullmatch("[0-9a-f]{40}", value["source_head"]) is None
+                or source_head is not None and value["source_head"] != source_head
+                or str(UUID(value["request_id"])) != value["request_id"]):
+            raise ValueError("Practical request differs from its closed current-source configuration")
+        PracticalElbowConfig.from_payload(value["config"])
+        return value
     from examples.alohamini.am1_session_contract import LIVE_ELBOW_WORKSPACES
     workspace = LIVE_ELBOW_WORKSPACES[RIGHT_P20_RECIPE]
     if (not isinstance(value, dict) or set(value) != {"version", "kind", "request_id", "source_head", "workspace_id", "context_sha256"}
@@ -521,10 +534,15 @@ def _right_p20_request(value, source_head=None):
 def consume_right_p20_request(state, directory, recipe, run_id, host_incarnation, source_head):
     """Move the one request once before any device owner starts; no retry queue."""
     state, directory = Path(state), Path(directory)
-    request = state / RIGHT_P20_REQUEST_NAME
+    practical = recipe == PRACTICAL_RECIPE
+    prefix = PRACTICAL_KIND if practical else "response12-right-p20"
+    kind = PRACTICAL_KIND if practical else RIGHT_P20_KIND
+    request = state / (prefix + "-request.json")
     if not request.exists() and not request.is_symlink():
+        if practical:
+            raise ValueError("Practical recipe requires one fresh private request")
         return None
-    if recipe != RIGHT_P20_RECIPE:
+    if recipe not in (RIGHT_P20_RECIPE, PRACTICAL_RECIPE):
         raise ValueError("Right P20 request is forbidden for a different side/body recipe")
     if any(str(UUID(value)) != value for value in (run_id, host_incarnation)):
         raise ValueError("Right P20 requires canonical current run/host identities")
@@ -533,17 +551,19 @@ def consume_right_p20_request(state, directory, recipe, run_id, host_incarnation
         raise ValueError("Right P20 requires the current protected run directory")
     value, raw, info = _right_p20_file(request)
     _right_p20_request(value, source_head)
-    archived = state / ("response12-right-p20-used-" + value["request_id"] + ".json")
+    if value["kind"] != kind:
+        raise ValueError("Right trial request kind differs from selected recipe")
+    archived = state / (prefix + "-used-" + value["request_id"] + ".json")
     if archived.exists() or archived.is_symlink():
         raise ValueError("Right P20 request nonce was already retired")
-    consumed, target = directory / RIGHT_P20_CONSUMED_NAME, directory / RIGHT_P20_DESCRIPTOR_NAME
+    consumed, target = directory / (prefix + "-consumed.json"), directory / (prefix + ".json")
     if consumed.exists() or target.exists():
         raise ValueError("Right P20 request cannot be consumed twice")
     current = request.stat(follow_symlinks=False)
     if (current.st_dev, current.st_ino, current.st_size) != (info.st_dev, info.st_ino, info.st_size):
         raise ValueError("Right P20 request changed before consumption")
-    used = state / "response12-right-p20-used.json"
-    used_value = dict(version=1, kind=RIGHT_P20_KIND, run_id=run_id, host_incarnation=host_incarnation,
+    used = archived if practical else state / "response12-right-p20-used.json"
+    used_value = dict(version=1, kind=kind, run_id=run_id, host_incarnation=host_incarnation,
                       request_sha256=hashlib.sha256(raw).hexdigest(), request=value)
     descriptor = os.open(used, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
     with os.fdopen(descriptor, "wb") as stream:
@@ -556,7 +576,7 @@ def consume_right_p20_request(state, directory, recipe, run_id, host_incarnation
     retained, retained_raw, retained_info = _right_p20_file(consumed)
     if retained_raw != raw or (retained_info.st_dev, retained_info.st_ino) != (info.st_dev, info.st_ino):
         raise ValueError("Right P20 original changed during consumption")
-    bound = dict(version=1, kind=RIGHT_P20_KIND, run_id=run_id, host_incarnation=host_incarnation,
+    bound = dict(version=1, kind=kind, run_id=run_id, host_incarnation=host_incarnation,
                  request_sha256=hashlib.sha256(raw).hexdigest(), request=retained)
     descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
     with os.fdopen(descriptor, "wb") as stream:
@@ -567,16 +587,21 @@ def consume_right_p20_request(state, directory, recipe, run_id, host_incarnation
 
 def load_right_p20_binding(path, directory, run_id, host_incarnation):
     directory, path = Path(directory), Path(path)
-    if (directory.name != run_id[:8] or path != directory / RIGHT_P20_DESCRIPTOR_NAME
+    practical = path.name == PRACTICAL_KIND + ".json"
+    prefix = PRACTICAL_KIND if practical else "response12-right-p20"
+    kind = PRACTICAL_KIND if practical else RIGHT_P20_KIND
+    if (directory.name != run_id[:8] or path != directory / (prefix + ".json")
             or any(str(UUID(value)) != value for value in (run_id, host_incarnation))):
         raise ValueError("Right P20 descriptor requires the exact current protected path/run/host")
     value, _, _ = _right_p20_file(path)
     if (not isinstance(value, dict) or set(value) != {"version", "kind", "run_id", "host_incarnation", "request_sha256", "request"}
-            or type(value["version"]) is not int or value["version"] != 1 or value["kind"] != RIGHT_P20_KIND
+            or type(value["version"]) is not int or value["version"] != 1 or value["kind"] != kind
             or value["run_id"] != run_id or value["host_incarnation"] != host_incarnation):
         raise ValueError("Right P20 descriptor identity differs")
     request = _right_p20_request(value["request"])
-    retained, raw, _ = _right_p20_file(directory / RIGHT_P20_CONSUMED_NAME)
+    if request["kind"] != kind:
+        raise ValueError("Right trial consumed request kind differs")
+    retained, raw, _ = _right_p20_file(directory / (prefix + "-consumed.json"))
     if request != retained or hashlib.sha256(raw).hexdigest() != value["request_sha256"]:
         raise ValueError("Right P20 original request content/hash differs")
     return copy.deepcopy(value)
@@ -590,13 +615,23 @@ _RIGHT_P20_PRESERVED = tuple(k for k in _RIGHT_P20_REGISTERS if k not in {
 
 
 class AM1RightElbowProportionalTrial(AM1ElbowIntegralTrial):
-    """One fixed right-ID3 P16→20 transaction; inherit only durable-state machinery."""
+    """One consumed right-ID3 transaction with a durable original and restoration."""
 
     def __init__(self, binding, directory):
-        super().__init__(integral=0, snapshot_path=Path(directory) / "response12-right-p20-original.json")
+        self.practical = binding.get("kind") == PRACTICAL_KIND
+        self.kind = PRACTICAL_KIND if self.practical else RIGHT_P20_KIND
+        self.recipe = PRACTICAL_RECIPE if self.practical else RIGHT_P20_RECIPE
+        self.prefix = PRACTICAL_KIND if self.practical else "response12-right-p20"
+        self.proportional = binding["request"]["proportional"] if self.practical else 20
+        self.current_cap_ma = 500 if self.practical else 150
+        self.config = None
+        if self.practical:
+            from examples.alohamini.am1_session_contract import PracticalElbowConfig
+            self.config = PracticalElbowConfig.from_payload(binding["request"]["config"])
+        super().__init__(integral=0, snapshot_path=Path(directory) / (self.prefix + "-original.json"))
         self.binding = copy.deepcopy(binding)
         self.directory = Path(directory)
-        self._snapshot = {"schema_version": 1, "kind": RIGHT_P20_KIND, "events": []}
+        self._snapshot = {"schema_version": 1, "kind": self.kind, "events": []}
 
     @staticmethod
     def _owner(robot):
@@ -619,11 +654,11 @@ class AM1RightElbowProportionalTrial(AM1ElbowIntegralTrial):
         bus, identity = self._owner(robot)
         binding = self.binding
         visible = {k: binding[k] for k in ("run_id", "host_incarnation")}
-        visible["recipe"] = RIGHT_P20_RECIPE
+        visible["recipe"] = self.recipe
         if (bus is not self._bus or identity != self._identity
                 or getattr(robot, "_am1_right_p20_trial_binding", None) != binding
                 or getattr(robot, "_am1_visible_control_binding", None) != visible
-                or load_right_p20_binding(self.directory / RIGHT_P20_DESCRIPTOR_NAME, self.directory,
+                or load_right_p20_binding(self.directory / (self.prefix + ".json"), self.directory,
                                           binding["run_id"], binding["host_incarnation"]) != binding):
             raise RuntimeError("Right P20 requires its same owner/mapping/current one-use binding")
         return bus
@@ -655,7 +690,10 @@ class AM1RightElbowProportionalTrial(AM1ElbowIntegralTrial):
                         ID=3, Operating_Mode=0, Torque_Enable=0, Lock=0, P_Coefficient=16,
                         I_Coefficient=0, D_Coefficient=32, Min_Position_Limit=827, Max_Position_Limit=3039,
                         Homing_Offset=-658, Phase=12, CW_Dead_Zone=1, CCW_Dead_Zone=1)
-        if any(original[k] != value for k, value in expected.items()) or not 1834 <= original["Present_Position"] <= 1867:
+        present = original["Present_Position"]
+        low, high = ((self.config.workspace.measured_min_raw, self.config.workspace.measured_max_raw)
+                     if self.practical else (1834, 1867))
+        if any(original[k] != value for k, value in expected.items()) or not low <= present <= high:
             raise RuntimeError("Right P20 actual stopped baseline differs from reviewed original")
         self._snapshot.update(binding=copy.deepcopy(self.binding), motor=RIGHT_P20_MOTOR, motor_id=3,
                               original_registers=original, original_bytes=self._bytes(phase="baseline"),
@@ -668,7 +706,7 @@ class AM1RightElbowProportionalTrial(AM1ElbowIntegralTrial):
             raise
 
     def _write(self, register, value, *, phase, reconcile=False):
-        allowed = {"Torque_Enable": (0,), "Lock": (0, 1), "P_Coefficient": (16, 20)}
+        allowed = {"Torque_Enable": (0,), "Lock": (0, 1), "P_Coefficient": (16, self.proportional)}
         if register not in allowed or type(value) is not int or value not in allowed[register]:
             raise ValueError("Right P20 transaction cannot write that register/value")
         row = dict(operation="write", register=register, value=value, phase=phase, started_at_monotonic_s=time.monotonic())
@@ -716,8 +754,9 @@ class AM1RightElbowProportionalTrial(AM1ElbowIntegralTrial):
             if any(self._read(k, phase="before_apply") != value for k, value in
                    {"Torque_Enable": 0, "Lock": 1, "P_Coefficient": 16}.items()):
                 raise RuntimeError("Right P20 requires actual Torque0/Lock1/P16 immediately before apply")
-            self._write("P_Coefficient", 20, phase="configure_proportional")
-            self._snapshot.update(configured_p_readback=20, configured_at_monotonic_s=time.monotonic())
+            if self.proportional != 16:
+                self._write("P_Coefficient", self.proportional, phase="configure_proportional")
+            self._snapshot.update(configured_p_readback=self.proportional, configured_at_monotonic_s=time.monotonic())
             self._persist_snapshot("configured")
         except BaseException as error:
             self._failure("configure_failed", error)
@@ -728,8 +767,8 @@ class AM1RightElbowProportionalTrial(AM1ElbowIntegralTrial):
             self._preserved(robot, phase="active")
             actual = {k: self._read(k, phase="active") for k in
                       ("P_Coefficient", "Lock", "Torque_Enable", "Present_Current", "Status")}
-            if (actual["P_Coefficient"] != 20 or actual["Lock"] != 1 or actual["Torque_Enable"] != 1
-                    or actual["Status"] != 0 or abs(actual["Present_Current"]) * 6.5 >= 150):
+            if (actual["P_Coefficient"] != self.proportional or actual["Lock"] != 1 or actual["Torque_Enable"] != 1
+                    or actual["Status"] != 0 or abs(actual["Present_Current"]) * 6.5 >= self.current_cap_ma):
                 raise RuntimeError("Right P20 active gain/Lock/torque/current/status refused")
             self._persist_snapshot("active")
         except BaseException as error:
@@ -738,13 +777,16 @@ class AM1RightElbowProportionalTrial(AM1ElbowIntegralTrial):
 
     @property
     def receipt(self):
-        if not self.restore_required or self._snapshot.get("configured_p_readback") != 20:
+        if not self.restore_required or self._snapshot.get("configured_p_readback") != self.proportional:
             raise RuntimeError("Right P20 receipt requires its applied outstanding obligation")
         request = self.binding["request"]
-        return dict(version=1, kind=RIGHT_P20_KIND, run_id=self.binding["run_id"],
+        workspace = None if self.config is None else self.config.workspace
+        return dict(version=1, kind=self.kind, run_id=self.binding["run_id"],
                     host_incarnation=self.binding["host_incarnation"], request_sha256=self.binding["request_sha256"],
-                    source_head=request["source_head"], workspace_id=request["workspace_id"],
-                    context_sha256=request["context_sha256"], original_p=16, configured_p=20,
+                    source_head=request["source_head"], workspace_id=request["workspace_id"] if workspace is None else workspace.id,
+                    context_sha256=request["context_sha256"] if workspace is None else workspace.context_sha256,
+                    **({"config": self.config.to_payload()} if self.practical else {}),
+                    original_p=16, configured_p=self.proportional,
                     restore_required=True, prepared_at_monotonic_s=self._snapshot["prepared_at_monotonic_s"],
                     configured_at_monotonic_s=self._snapshot["configured_at_monotonic_s"])
 
@@ -777,28 +819,42 @@ def right_p20_settings_valid(proof, run_id=None, host_incarnation=None):
               "D_Coefficient", "Operating_Mode", "Acceleration", "Goal_Time", "Goal_Velocity", "Torque_Limit", "Maximum_Acceleration"}
     dynamic = {"Torque_Enable", "Lock", "Goal_Position", "Present_Position", "Present_Current", "Status", "Present_Voltage", "Present_Temperature"}
     try:
+        trial = proof["right_p20_trial"]
+        practical = trial.get("kind") == PRACTICAL_KIND
+        recipe, kind, configured_p, current_cap = RIGHT_P20_RECIPE, RIGHT_P20_KIND, 20, 150
+        workspace = LIVE_ELBOW_WORKSPACES[RIGHT_P20_RECIPE]
+        if practical:
+            from examples.alohamini.am1_session_contract import PracticalElbowConfig
+            config = PracticalElbowConfig.from_payload(trial["config"])
+            workspace = config.workspace
+            recipe, kind, configured_p, current_cap = PRACTICAL_RECIPE, PRACTICAL_KIND, trial["configured_p"], 500
+            if type(configured_p) is not int or configured_p not in (16, 24, 32):
+                return False
+            static.add("Protection_Current")
         if (set(proof) != {"version", "binding", "before", "active", "unchanged", "settings_sha256", "right_p20_trial"}
-                or type(proof["version"]) is not int or proof["version"] != 1 or proof["unchanged"] is not False):
+                or type(proof["version"]) is not int or proof["version"] != 1
+                or proof["unchanged"] is not (configured_p == 16)):
             return False
         b, trial = proof["binding"], proof["right_p20_trial"]
-        if (set(b) != {"run_id", "host_incarnation", "recipe"} or b["recipe"] != RIGHT_P20_RECIPE
+        if (set(b) != {"run_id", "host_incarnation", "recipe"} or b["recipe"] != recipe
                 or any(str(UUID(b[k])) != b[k] for k in ("run_id", "host_incarnation"))
                 or run_id is not None and b["run_id"] != run_id
                 or host_incarnation is not None and b["host_incarnation"] != host_incarnation):
             return False
         keys = {"version", "kind", "run_id", "host_incarnation", "request_sha256", "source_head", "workspace_id",
                 "context_sha256", "original_p", "configured_p", "restore_required", "prepared_at_monotonic_s", "configured_at_monotonic_s"}
-        workspace = LIVE_ELBOW_WORKSPACES[RIGHT_P20_RECIPE]
+        if practical:
+            keys.add("config")
         if (set(trial) != keys or type(trial["version"]) is not int or trial["version"] != 1
-                or trial["kind"] != RIGHT_P20_KIND or trial["run_id"] != b["run_id"] or trial["host_incarnation"] != b["host_incarnation"]
+                or trial["kind"] != kind or trial["run_id"] != b["run_id"] or trial["host_incarnation"] != b["host_incarnation"]
                 or trial["restore_required"] is not True or type(trial["original_p"]) is not int or trial["original_p"] != 16
-                or type(trial["configured_p"]) is not int or trial["configured_p"] != 20
+                or type(trial["configured_p"]) is not int or trial["configured_p"] != configured_p
                 or type(trial["request_sha256"]) is not str or re.fullmatch("[0-9a-f]{64}", trial["request_sha256"]) is None
                 or type(trial["source_head"]) is not str or re.fullmatch("[0-9a-f]{40}", trial["source_head"]) is None
                 or trial["workspace_id"] != workspace.id or trial["context_sha256"] != workspace.context_sha256):
             return False
         previous = 0
-        for name, torque, p in (("before", 0, 16), ("active", 1, 20)):
+        for name, torque, p in (("before", 0, 16), ("active", 1, configured_p)):
             item = proof[name]; values, raw_bytes = item["registers"], item["individual_bytes"]
             a, z = item["read_started_at_monotonic_s"], item["read_completed_at_monotonic_s"]
             if (set(item) != {"registers", "individual_bytes", "read_started_at_monotonic_s", "read_completed_at_monotonic_s"}
@@ -807,7 +863,8 @@ def right_p20_settings_valid(proof, run_id=None, host_incarnation=None):
                     or any(values[k] != v for k, v in dict(Model_Number=777,Firmware_Major_Version=3,Firmware_Minor_Version=10,
                         ID=3,Operating_Mode=0,P_Coefficient=p,I_Coefficient=0,D_Coefficient=32,Torque_Enable=torque,Lock=torque,
                         Status=0,Min_Position_Limit=827,Max_Position_Limit=3039,Homing_Offset=-658,Phase=12).items())
-                    or abs(values["Present_Current"]) * 6.5 >= 150
+                    or practical and values.get("Protection_Current", 0) <= 0
+                    or abs(values["Present_Current"]) * 6.5 >= min(current_cap, values["Protection_Current"] * 6.5 if practical else current_cap)
                     or any(type(v) not in (int,float) or not math.isfinite(v) for v in (a,z)) or not 0 <= previous <= a <= z):
                 return False
             previous = z
@@ -816,7 +873,9 @@ def right_p20_settings_valid(proof, run_id=None, host_incarnation=None):
         if (any(type(v) not in (int,float) or not math.isfinite(v) for v in (prepared,configured))
                 or not before["read_completed_at_monotonic_s"] <= prepared <= configured <= active["read_started_at_monotonic_s"]):
             return False
-        material = dict(registers={k:before["registers"][k] for k in static},individual_bytes=before["individual_bytes"])
+        # Hardware current is decoded from the already-read block. The historical
+        # settings digest retains its exact register subset; equality covers it above.
+        material = dict(registers={k:before["registers"][k] for k in static - {"Protection_Current"}},individual_bytes=before["individual_bytes"])
         return (all(before["registers"][k] == active["registers"][k] for k in static - {"P_Coefficient"})
                 and before["individual_bytes"] == active["individual_bytes"]
                 and hashlib.sha256(_right_p20_json(material)).hexdigest() == proof["settings_sha256"])

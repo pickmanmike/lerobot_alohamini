@@ -1,3 +1,33 @@
+## Active AM1-PRACTICAL-MOTION-13 scope
+
+The owner explicitly invoked Packet13. It supersedes historical micro-motion
+span/q0 diagnostic limits, 100/150mA experimental ceilings, standalone low-current
+trend veto and single-comparison restriction ONLY in the selected practical-right
+mode. Keep prior results below unchanged. PR23 remains draft/unmerged.
+
+Use one compact plan, one existing parameterized runner/configuration and the
+existing owner/transaction/browser/observer/stager. Frozen batch reference;
+10-degree P16 command/return first at about5degrees/s,20degrees onlyifinsufficient;
+P24 thenP32 onlyasneeded atsamegeometry. Max20degreesone-sided, I0/D32 andfirmware
+settingsretained; volatilechangesverifiedrestored beforeoriginalLockstate.
+Provisionalselectedhostabort500mA onlyifhardware/supplyconsistent andnolowerlimit.
+Three-riseslowcurrent/staticposition becomes exactzeroreaddiagnostic onlyinmode.
+Retain singleowner/freshfeedback/status/thermal/voltage/calibratedlimits/growing
+instability/250msexpiry/Stop protections. Session180s (absolute max300), no renewal
+onrejoin. Other11actualGoals hold, body/liftzeroafternormalstartup.
+
+Findusefulvisiblemotion, stopstimulusincrease, thenrepetition/ordinaryre-jog/
+reattachment/normalrestart usingworkingrecipe. Healthy noresponse mayadvance
+approvedstep; atruefaultendsattempt andrequiresanalysis, notautomaticactivation.
+Oldconsumednoncesremainspent. No flagclearing ofuncertainty/restoration obligation.
+
+Usefocusedaffectedchecks andoneindependentsourcereviewperenforcementchange;
+onecomponentstagingpasspercodechange, no per-numbercommit/audit/reviewladder.
+AM1wireless/P1advisory/AM2untouched, no genericreadiness/leader/shoulderquestions,
+network tuning/new architecture/cutoffhardware/endurancecampaign. Rootalone
+Git/SSH/deployment/hardware; agentsofflinewithdisjointfiles. Durabilitymeans
+softwarefaulttolerance,connection/controlcontinuity,statepreservationandrecovery.
+
 ## Current AM1-RESPONSE-12 result and remaining boundary
 
 Packet12 continued PR23 only; it remains draft and unmerged. See

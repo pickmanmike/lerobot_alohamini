@@ -3,17 +3,19 @@
 class AM1SessionTransport {
   static liveElbows=Object.freeze({
     "physical-live-left-elbow":Object.freeze({joint:"arm_left_elbow_flex.pos",side:"left",label:"Left elbow",profile:"LiveLeftElbow"}),
-    "physical-live-right-elbow":Object.freeze({joint:"arm_right_elbow_flex.pos",side:"right",label:"Right elbow",profile:"LiveRightElbow"})
+    "physical-live-right-elbow":Object.freeze({joint:"arm_right_elbow_flex.pos",side:"right",label:"Right elbow",profile:"LiveRightElbow"}),
+    "physical-live-right-elbow-practical":Object.freeze({joint:"arm_right_elbow_flex.pos",side:"right",label:"Right elbow practical",profile:"LiveRightElbowPractical",
+      practical_motion:true,rate_norm_per_s:5*4096/360*200/2212,current_cap_ma:500,live_s:180})
   });
   liveElbowSpec(recipe=this.snapshot?.run?.recipe) {
     const allowed=Object.hasOwn(AM1SessionTransport.liveElbows,recipe) ? AM1SessionTransport.liveElbows[recipe] : null,values=this.snapshot?.live_elbow_recipes;
-    if(!allowed || !Array.isArray(values) || values.length>2)return null;
+    if(!allowed || !Array.isArray(values) || values.length>Object.keys(AM1SessionTransport.liveElbows).length)return null;
     const matches=values.filter(value=>value?.recipe===recipe);
     if(matches.length!==1)return null;
     const value=matches[0];
     if(Object.entries(allowed).some(([key,wanted])=>value[key]!==wanted)
       || typeof value.rate_norm_per_s!=="number" || !Number.isFinite(value.rate_norm_per_s)
-      || value.rate_norm_per_s<=0 || value.rate_norm_per_s>1)return null;
+      || value.rate_norm_per_s<=0 || value.rate_norm_per_s>(allowed.practical_motion ? allowed.rate_norm_per_s : 1))return null;
     return value;
   }
   supportedWorkspace(spec) {
@@ -558,6 +560,7 @@ globalThis.AM1RemoteInitialize=function() {
     const physicalRun=run?.source==="protected-physical-provider" || run?.recipe?.startsWith("physical-");
     const physical=physicalRun || recipes?.some(name=>name.startsWith("physical-"));
     const liveElbow=transport.isLiveElbow(),selectedElbow=transport.liveElbowSpec(liveElbow && selectionFrozen ? run.recipe : select.value);
+    const liveBudget=Number.isFinite(run?.deadline)&&Number.isFinite(run?.native_live_at)&&run.deadline>run.native_live_at ? Math.round(run.deadline-run.native_live_at) : selectedElbow?.live_s || 90;
     const simulated=run?.source==="simulated-provider" || recipes?.some(name=>name.startsWith("sim-"));
     const priorTest=physical && run && !physicalRun, priorKind=simulated ? "simulated" : "synthetic";
     document.querySelector("#view-heading").textContent=physical ? liveElbow ? "Physical live elbow AM1 session" : "Physical finite AM1 session" : simulated ? "Simulated finite provider session" : "Fake persistent session";
@@ -585,7 +588,7 @@ globalThis.AM1RemoteInitialize=function() {
       window.addEventListener("pagehide",()=>view.stop());root.append(label,video,status,open,close);
     }
     document.querySelector("#gate-state").textContent=transport.controllerGeneration ? physical ? "Explicit controller; physical Start activates the protected host. Request acceptance is separate from protected-host ACK and measured motion." : "Explicit controller; accepted requests require actual fake acknowledgement." : "Spectator; viewing does not claim input.";
-    document.querySelector("#control-help").textContent=liveElbow ? "Claim input, explicitly Start, then qualify Resume. Hold an elbow jog button or [ / ] to stream current mapped targets. Ordinary release holds position; a new press requests qualified rearm. Blur, expiry or reconnection requires explicit Resume and new input. The original 90-second Live budget continues through holds and reconnects. Other joints remain held; body and lift stay zero. Input acceptance, protected-host ACK and measured movement are separate." : physical ? "Explicitly claim input before physical Start. Start activates the selected bounded recipe through the protected motor host. Viewing, enrollment and reconnection do not start motion. Finite authorization survives browser closure. Pause and Stop remain available to enrolled control-capable spectators. Actual feedback and protected-host ACK are reported separately; an accepted command does not prove joint motion. Body inputs belong to the selected finite recipe. Required camera evidence is validated on Pi; optional P1 viewing is advisory." : defaultControlHelp;
+    document.querySelector("#control-help").textContent=liveElbow ? `Claim input, explicitly Start, then qualify Resume. Hold an elbow jog button or [ / ] to stream current mapped targets. Ordinary release holds position; a new press requests qualified rearm. Blur, expiry or reconnection requires explicit Resume and new input. The original ${liveBudget}-second Live budget continues through holds and reconnects. Other joints remain held; body and lift stay zero. Input acceptance, protected-host ACK and measured movement are separate.` : physical ? "Explicitly claim input before physical Start. Start activates the selected bounded recipe through the protected motor host. Viewing, enrollment and reconnection do not start motion. Finite authorization survives browser closure. Pause and Stop remain available to enrolled control-capable spectators. Actual feedback and protected-host ACK are reported separately; an accepted command does not prove joint motion. Body inputs belong to the selected finite recipe. Required camera evidence is validated on Pi; optional P1 viewing is advisory." : defaultControlHelp;
     if(!transport.videoView)document.querySelector("#am1-camera-root").textContent=physical ? "Task camera evidence is validated on Pi; optional P1 viewing is advisory." : "Cameras unavailable · synthetic fake evidence only";
     for(const button of document.querySelectorAll("[data-operation], [data-body-key]")) {
       button.title=physical ? liveElbow ? "Physical live elbow session control" : "Physical finite session control" : "Fake session control";
@@ -615,8 +618,9 @@ globalThis.AM1RemoteInitialize=function() {
         button.setAttribute("aria-label",label+" "+(positive ? "positive" : "negative")+" jog");
       }
       const measured=transport.snapshot?.evidence?.measured_positions?.[selectedElbow?.joint],cursor=run?.live_input?.cursor_norm;
-      const workspace=transport.supportedWorkspace(selectedElbow);
-      elbow.querySelector("output").textContent=!selectionFrozen&&workspace ? `Workspace ${workspace.id} · raw ${workspace.command_min_raw} to ${workspace.command_max_raw} · span ${workspace.span_norm.toFixed(3)} normalized · current admission pending` : `Measured ${Number.isFinite(measured) ? measured.toFixed(3) : "pending"} · target ${Number.isFinite(transport.elbowCursor) ? transport.elbowCursor.toFixed(3) : Number.isFinite(cursor) ? cursor.toFixed(3) : "pending"} normalized · admitted ${Number.isFinite(run?.live_input?.corridor_min_norm) ? run.live_input.corridor_min_norm.toFixed(3) : "pending"} to ${Number.isFinite(run?.live_input?.corridor_max_norm) ? run.live_input.corridor_max_norm.toFixed(3) : "pending"} · run q0 ${Number.isFinite(run?.live_input?.reference_norm) ? run.live_input.reference_norm.toFixed(3) : "pending"}`;
+      const workspace=transport.supportedWorkspace(selectedElbow),actualRate=selectionFrozen ? run?.live_input?.rate_norm_per_s : selectedElbow?.rate_norm_per_s;
+      const rate=Number.isFinite(actualRate) ? actualRate.toFixed(3)+" normalized/s" : "pending";
+      elbow.querySelector("output").textContent=!selectionFrozen&&selectedElbow ? workspace ? `Workspace ${workspace.id} · raw ${workspace.command_min_raw} to ${workspace.command_max_raw} · span ${workspace.span_norm.toFixed(3)} normalized · rate ${rate} · current admission pending` : `${selectedElbow.label} · rate ${rate} · current admission pending` : `Measured ${Number.isFinite(measured) ? measured.toFixed(3) : "pending"} · target ${Number.isFinite(transport.elbowCursor) ? transport.elbowCursor.toFixed(3) : Number.isFinite(cursor) ? cursor.toFixed(3) : "pending"} normalized · admitted ${Number.isFinite(run?.live_input?.corridor_min_norm) ? run.live_input.corridor_min_norm.toFixed(3) : "pending"} to ${Number.isFinite(run?.live_input?.corridor_max_norm) ? run.live_input.corridor_max_norm.toFixed(3) : "pending"} · rate ${rate} · run q0 ${Number.isFinite(run?.live_input?.reference_norm) ? run.live_input.reference_norm.toFixed(3) : "pending"}`;
     }
     if(message){notice.textContent=message;notice.hidden=false;}
     document.querySelector("#pairing-panel").hidden=Boolean(transport.device);

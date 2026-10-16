@@ -561,6 +561,66 @@ def right_p20_robot(tmp_path):
     return r, trial, directory
 
 
+def practical_robot(tmp_path, proportional):
+    module = right_p20_module()
+    state, directory, old_request = right_p20_files(tmp_path)
+    legacy_marker = state / "response12-right-p20-used.json"
+    legacy_marker.write_bytes(b"retained-packet12-consumption")
+    old_request.unlink()
+    request = dict(version=1, kind="practical13-right", request_id=RIGHT_P20_RUN,
+                   source_head="a" * 40, config=dict(reference_raw=1847, direction=1), proportional=proportional)
+    practical = state / "practical13-right-request.json"
+    practical.write_bytes(module._right_p20_json(request)); practical.chmod(0o600)
+    path = module.consume_right_p20_request(state, directory, "physical-live-right-elbow-practical",
+                                            RIGHT_P20_RUN, RIGHT_P20_HOST, "a" * 40)
+    assert path == directory / "practical13-right.json"
+    assert legacy_marker.read_bytes() == b"retained-packet12-consumption"
+    assert (state / ("practical13-right-used-" + RIGHT_P20_RUN + ".json")).exists()
+    binding = module.load_right_p20_binding(path, directory, RIGHT_P20_RUN, RIGHT_P20_HOST)
+    # Reuse the actual transaction fake, replacing only its private binding.
+    separate = tmp_path / "legacy-fixture"; separate.mkdir()
+    r, _, _ = right_p20_robot(separate)
+    r._am1_right_p20_trial_binding = binding
+    r._am1_visible_control_binding["recipe"] = "physical-live-right-elbow-practical"
+    r._am1_right_p20_trial_directory = str(directory)
+    trial = module.AM1RightElbowProportionalTrial(binding, directory)
+    r._am1_right_elbow_p_trial = trial
+    r._am1_practical_config = trial.config
+    return r, trial, directory, request, legacy_marker
+
+
+@pytest.mark.parametrize("proportional", [16, 24, 32])
+def test_practical_fresh_transaction_restores_p16_and_keeps_packet12_consumed(tmp_path, proportional):
+    r, trial, directory, request, legacy_marker = practical_robot(tmp_path, proportional)
+    trial.prepare(r); trial.disable_torque(r); trial.apply(r)
+    assert r.right_bus.values[("P_Coefficient", RIGHT_P20_MOTOR)] == proportional
+    r.right_bus.values[("Torque_Enable", RIGHT_P20_MOTOR)] = 1
+    r.right_bus.values[("Present_Current", RIGHT_P20_MOTOR)] = 76
+    trial.verify_active(r)
+    assert trial.receipt["configured_p"] == proportional
+    assert trial.receipt["config"] == request["config"]
+    r.right_bus.values[("Present_Current", RIGHT_P20_MOTOR)] = 77
+    with pytest.raises(RuntimeError, match="current"):
+        trial.verify_active(r)
+    trial.restore(r)
+    assert r.right_bus.values[("P_Coefficient", RIGHT_P20_MOTOR)] == 16
+    assert r.right_bus.values[("Lock", RIGHT_P20_MOTOR)] == 0
+    assert not trial.restore_required
+    assert legacy_marker.read_bytes() == b"retained-packet12-consumption"
+    if proportional == 16:
+        module = right_p20_module()
+        state = legacy_marker.parent
+        repeated = dict(request, source_head="b" * 40)
+        retry = state / "practical13-right-request.json"
+        retry.write_bytes(module._right_p20_json(repeated)); retry.chmod(0o600)
+        next_run = "55555555-5555-4555-8555-555555555555"
+        next_directory = directory.parent / next_run[:8]; next_directory.mkdir(mode=0o700)
+        with pytest.raises(ValueError, match="nonce"):
+            module.consume_right_p20_request(state, next_directory, "physical-live-right-elbow-practical",
+                                            next_run, RIGHT_P20_HOST, "b" * 40)
+        assert retry.exists() and not list(next_directory.iterdir())
+
+
 def test_right_p20_request_is_one_use_and_original_is_retained(tmp_path):
     module, directory, path, request = consume_right_p20(tmp_path)
     assert not request.exists()

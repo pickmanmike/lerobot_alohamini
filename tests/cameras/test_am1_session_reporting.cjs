@@ -19,6 +19,19 @@ function sharedLiveRecipes() {
   sharedLiveRecipeJSON=require("node:child_process").execFileSync(python||"uv",python?["-B","-c",code]:["run","--no-sync","python","-B","-c",code],{cwd:path.join(__dirname,"../.."),encoding:"utf8",env:process.env});}
  return JSON.parse(sharedLiveRecipeJSON);
 }
+
+test("practical live metadata admits its larger mapped rate while legacy metadata remains bounded",()=>{
+ const f=fixture(),practical={recipe:"physical-live-right-elbow-practical",joint:"arm_right_elbow_flex.pos",side:"right",label:"Right elbow practical",
+  profile:"LiveRightElbowPractical",rate_norm_per_s:5*4096/360*200/2212,current_cap_ma:500,live_s:180,practical_motion:true};
+ f.transport.snapshot.live_elbow_recipes=[...sharedLiveRecipes(),practical].filter((spec,index,all)=>all.findIndex(other=>other.recipe===spec.recipe)===index);
+ assert.equal(f.transport.liveElbowSpec(practical.recipe)?.profile,"LiveRightElbowPractical");
+ for(const mutation of [spec=>spec.rate_norm_per_s+=.01,spec=>spec.practical_motion=false,spec=>spec.live_s=301,spec=>spec.current_cap_ma=501]){
+  const changed=structuredClone(practical);mutation(changed);f.transport.snapshot.live_elbow_recipes=[changed];
+  assert.equal(f.transport.liveElbowSpec(practical.recipe),null);
+ }
+ const legacy=sharedLiveRecipes().find(spec=>spec.recipe==="physical-live-right-elbow");legacy.rate_norm_per_s=practical.rate_norm_per_s;
+ f.transport.snapshot.live_elbow_recipes=[legacy];assert.equal(f.transport.liveElbowSpec(legacy.recipe),null);
+});
 test("the actual shared right workspace summary decodes its full closed11-field schema",()=>{
  const f=fixture(),spec=sharedLiveRecipes().find(spec=>spec.side==="right"),workspace=f.transport.supportedWorkspace(spec);
  assert.equal(Object.keys(spec.supported_workspace).length,11);assert(workspace,"actual policy summary must remain visible before Start");
@@ -66,6 +79,30 @@ async function explicitLiveResume(f) {
  s.run.status="running";s.run.intent_revision=initial+2;s.run.live_input.cursor_intent_revision=initial+2;s.evidence.acknowledged_intent_revision=initial+2;
  t.socket.onmessage({data:JSON.stringify({kind:"snapshot",snapshot:s})});f.reply("resume",{accepted:true});await task;
 }
+
+test("practical stream uses actual mapped admission and fresh gesture cursors within one original deadline",async()=>{
+ const f=await liveFixture(),t=f.transport,spec=sharedLiveRecipes().find(value=>value.recipe==="physical-live-right-elbow-practical");
+ assert(spec,"actual shared practical spec required");t.snapshot.live_elbow_recipes=sharedLiveRecipes();
+ Object.assign(t.snapshot.run,{recipe:spec.recipe,deadline:990,native_live_at:810});
+ const low=(1847-827)/2212*200-100,high=(2074-827)/2212*200-100;
+ Object.assign(t.snapshot.run.live_input,{joint:spec.joint,side:spec.side,label:spec.label,profile:spec.profile,rate_norm_per_s:spec.rate_norm_per_s,
+  reference_norm:low,corridor_min_norm:low,corridor_max_norm:high,cursor_norm:low,cursor_feedback_sequence:30,cursor_intent_revision:7,
+  admission_version:2,workspace:{version:1,id:"am1-right-elbow-practical-v1",context_sha256:"a".repeat(64),evidence_min_raw:1847,evidence_max_raw:2074}});
+ assert.equal(t.setElbowJog(1),true);f.setNow(1100);const first=t.input();
+ f.reply("grant",{accepted:true,grant_id:"first",issued:810,expires:810.25});await first;
+ const target=f.frames.at(-1).command;assert.deepEqual(Object.keys(target.target),[spec.joint]);
+ assert(Math.abs(target.target[spec.joint]-(low+.1*spec.rate_norm_per_s))<1e-10);
+ assert.equal(target.valid_until_monotonic_s,undefined,"browser cannot renew native250ms expiry");
+ f.reply("input",{accepted:true,status:"input"});await Promise.resolve();await Promise.resolve();
+ const release=t.releaseInput();f.reply("release_input",{accepted:true});await release;
+ Object.assign(t.snapshot.run.live_input,{cursor_norm:low+1,cursor_feedback_sequence:40,cursor_intent_revision:8});t.snapshot.run.intent_revision=8;
+ await explicitLiveResume(f);assert.equal(t.setElbowJog(-1),true);f.setNow(1200);const next=t.input();
+ f.reply("grant",{accepted:true,grant_id:"second",issued:820,expires:820.25});await next;
+ assert(Math.abs(f.frames.at(-1).command.target[spec.joint]-(low+1-.1*spec.rate_norm_per_s))<1e-10,"new gesture starts at fresh measured cursor");
+ assert.equal(t.snapshot.run.live_input.reference_norm,low);assert.equal(t.snapshot.run.live_input.corridor_max_norm,high);
+ assert.equal(t.snapshot.run.deadline,990);assert.equal(t.snapshot.run.native_live_at,810);
+ f.reply("input",{accepted:true,status:"input"});t.clear();
+});
 
 test("live elbow samples the current gesture after its grant and sends only the mapped selected key",async()=>{
   const f=await liveFixture();

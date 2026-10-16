@@ -35,7 +35,7 @@ import zmq
 from .alohamini import AlohaMini
 from .config_alohamini import AlohaMiniConfig, AlohaMiniHostConfig
 from .model_specs import arm_state_keys_for_robot_model
-from .selected_joint_evidence import MARKER as AM1_SELECTED_JOINT_EVIDENCE_KEY, AM1SelectedJointEvidence, live_elbow_spec
+from .selected_joint_evidence import MARKER as AM1_SELECTED_JOINT_EVIDENCE_KEY, AM1SelectedJointEvidence, live_elbow_spec, live_elbow_workspace
 
 AM1_LOCAL_CONTROL_KEY = "_am1_local_control"
 AM1_LOCAL_FEEDBACK_KEY = "_am1_local_feedback"
@@ -56,7 +56,8 @@ class AM1LocalControl:
 
     def __init__(self, *, run_id: str | None = None, host_incarnation: str | None = None,
                  selected_evidence: AM1SelectedJointEvidence | None = None,
-                 live: bool = False, live_recipe: str = AM1_LIVE_RECIPE, clock: Callable[[], float] = time.monotonic) -> None:
+                 live: bool = False, live_recipe: str = AM1_LIVE_RECIPE, practical_config=None,
+                 clock: Callable[[], float] = time.monotonic) -> None:
         if (run_id is None) != (host_incarnation is None):
             raise ValueError("AM1 protected control requires both run and host identity")
         self.binding = None if run_id is None else {
@@ -70,9 +71,12 @@ class AM1LocalControl:
         self.observation_id = 0
         self.selected_evidence = selected_evidence
         self.live = live
-        self.live_spec = live_elbow_spec(live_recipe) if live else None
+        self.practical_config = practical_config
+        self.live_spec = live_elbow_spec(live_recipe, practical_config) if live else None
         if live and self.live_spec is None:
             raise ValueError("Live native recipe is not allowlisted")
+        if live and getattr(self.live_spec, "practical_motion", False) and practical_config is None:
+            raise ValueError("Practical native control requires its consumed configuration")
         self.clock = clock
         self.live_binding = None
         self.live_sample = None
@@ -229,10 +233,9 @@ class AM1LocalControl:
                 q0 = self.live_held[self.live_spec.joint]
                 low = q0 + self.live_spec.corridor_min_delta_norm
                 high = q0 + self.live_spec.corridor_max_delta_norm
-                if not -100 <= low <= high <= 100:
+                if self.practical_config is None and not -100 <= low <= high <= 100:
                     raise RuntimeError("Live measured origin cannot contain its selected corridor")
-                from examples.alohamini.am1_session_contract import LIVE_ELBOW_WORKSPACES
-                workspace = LIVE_ELBOW_WORKSPACES.get(self.live_spec.recipe)
+                workspace = live_elbow_workspace(self.live_spec.recipe, self.practical_config)
                 geometry = dict(corridor_min_norm=low, corridor_max_norm=high)
                 if workspace is not None:
                     if not callable(getattr(robot, "am1_live_workspace_context", None)):
@@ -1351,14 +1354,19 @@ def right_p20_trial_binding(args, visible_binding):
     path = getattr(args, "am1_right_p20_trial_file", None)
     if path is None:
         return None
-    from .am1_elbow_integral import RIGHT_P20_RECIPE, load_right_p20_binding
-    expected = dict(run_id=args.am1_run_id, host_incarnation=args.am1_host_incarnation, recipe=RIGHT_P20_RECIPE)
+    from .am1_elbow_integral import RIGHT_P20_RECIPE, PRACTICAL_RECIPE, load_right_p20_binding
+    recipe = None if visible_binding is None else visible_binding.get("recipe")
+    expected = dict(run_id=args.am1_run_id, host_incarnation=args.am1_host_incarnation, recipe=recipe)
     if (visible_binding != expected or args.robot_model != "alohamini1" or args.no_follower or not args.no_cameras
+            or recipe not in (RIGHT_P20_RECIPE, PRACTICAL_RECIPE)
             or not getattr(args, "am1_protected_run_directory", None)
             or os.environ.get("AM1_SCRIPTED_PREPARE") != "1" or os.environ.get("AM1_SELECTED_JOINT_EVIDENCE") != "1"
             or os.environ.get("AM1_ELBOW_RECOVERY") is not None or os.environ.get("AM1_SHOULDER_INTEGRAL_TEST") == "1"):
         raise ValueError("Right P20 file requires its exact isolated protected right-live owner")
-    return load_right_p20_binding(path, args.am1_protected_run_directory, args.am1_run_id, args.am1_host_incarnation)
+    binding = load_right_p20_binding(path, args.am1_protected_run_directory, args.am1_run_id, args.am1_host_incarnation)
+    if (binding["kind"] == "practical13-right") != (recipe == PRACTICAL_RECIPE):
+        raise ValueError("Right trial file differs from its selected recipe")
+    return binding
 
 
 def elbow_recovery_binding(args):
@@ -1390,6 +1398,13 @@ def _run_host(args):
     visible_binding = visible_control_binding(args)
     recovery_binding = elbow_recovery_binding(args)
     right_p20_binding = right_p20_trial_binding(args, visible_binding)
+    practical_config = None
+    if right_p20_binding is not None and right_p20_binding["kind"] == "practical13-right":
+        from examples.alohamini.am1_session_contract import PracticalElbowConfig
+        practical_config = PracticalElbowConfig.from_payload(right_p20_binding["request"]["config"])
+    if (visible_binding is not None and visible_binding["recipe"] == "physical-live-right-elbow-practical"
+            and practical_config is None):
+        raise ValueError("Practical owner requires its fresh consumed trial configuration")
 
     logging.info("Configuring AlohaMini")
     robot_config = make_robot_config(args)
@@ -1402,6 +1417,8 @@ def _run_host(args):
     if right_p20_binding is not None:
         robot._am1_right_p20_trial_binding = right_p20_binding
         robot._am1_right_p20_trial_directory = args.am1_protected_run_directory
+    if practical_config is not None:
+        robot._am1_practical_config = practical_config
     left_shoulder_evidence = AM1LeftShoulderEvidence(
         enabled=(os.environ.get("AM1_LEFT_SHOULDER_EVIDENCE") == "1"
                  and args.robot_model == "alohamini1" and not args.no_follower),
@@ -1479,6 +1496,7 @@ def _run_host(args):
             selected_evidence=selected_evidence,
             live=visible_binding is not None and live_elbow_spec(visible_binding["recipe"]) is not None,
             live_recipe=AM1_LIVE_RECIPE if visible_binding is None else visible_binding["recipe"],
+            practical_config=practical_config,
         )
         if args.robot_model == "alohamini1" and not args.no_follower
         else None

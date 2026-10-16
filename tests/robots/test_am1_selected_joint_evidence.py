@@ -996,17 +996,23 @@ def test_visible_pause_never_recenters_confirmation_absolute_reference(monkeypat
 
 
 
-def test_right_p20_raw_paired_visible_proof_is_trial_only_and_never_rewrites_pid(monkeypatch, tmp_path, request):
-    from tests.robots.test_am1_elbow_integral import right_p20_robot, RIGHT_P20_MOTOR
+@pytest.mark.parametrize("proportional", [20, 16, 24, 32])
+def test_right_p20_raw_paired_visible_proof_is_trial_only_and_never_rewrites_pid(monkeypatch, tmp_path, request, proportional):
+    from tests.robots.test_am1_elbow_integral import right_p20_robot, practical_robot, RIGHT_P20_MOTOR
     from lerobot.robots.alohamini.am1_elbow_integral import RIGHT_P20_RECIPE
     from examples.alohamini.am1_session_contract import PositiveElbowControl
-    obj, trial, directory = right_p20_robot(tmp_path)
+    if proportional == 20:
+        obj, trial, directory = right_p20_robot(tmp_path)
+    else:
+        obj, trial, directory, _, _ = practical_robot(tmp_path, proportional)
     request.addfinalizer(lambda: obj._safe_shutdown(close_buses=True))
     evidence, rows = sampler()
     obj._am1_visible_control_evidence = evidence
     before = bytearray(visible_register_packet(present=1845, goal=1845, range_min=827, range_max=3039))
     before[18] = 12; before[31:33] = (2048 + 658).to_bytes(2, "little")
-    active = bytearray(before); active[21] = 20; active[40] = active[55] = 1
+    if proportional != 20:
+        before[28:30] = (310).to_bytes(2, "little")
+    active = bytearray(before); active[21] = proportional; active[40] = active[55] = 1
     obj.right_bus.port_handler = None
     # Full reads use the real DirectSdkTransport over a finite SDK port fixture.
     port = attach_port(obj, [])
@@ -1026,8 +1032,19 @@ def test_right_p20_raw_paired_visible_proof_is_trial_only_and_never_rewrites_pid
     evidence.verify_visible_active(obj)
     proof = evidence.visible_control_proof(obj)
     assert proof["before"]["registers"]["P_Coefficient"] == 16
-    assert proof["active"]["registers"]["P_Coefficient"] == 20
-    assert proof["unchanged"] is False and proof["right_p20_trial"]["restore_required"] is True
+    assert proof["active"]["registers"]["P_Coefficient"] == proportional
+    assert proof["unchanged"] is (proportional == 16) and proof["right_p20_trial"]["restore_required"] is True
+    if proportional != 20:
+        assert proof["before"]["registers"]["Protection_Current"] == 310
+        assert evidence._live_definition.hardware_current_limit_ma == 2015
+        from tests.robots.test_am1_live_native import MeasuredMotor
+        measured = MeasuredMotor(); measured.configure_workspace()
+        obj.am1_live_workspace_context = measured.am1_live_workspace_context
+        obj._am1_selected_joint_position = dict(raw=1845)
+        summary = dict(reference_norm=(1845-827)/2212*200-100)
+        evidence.admit_live(obj, summary, measured=measured.positions)
+        assert summary["corridor_min_raw"] == 1847 and summary["corridor_max_raw"] == 2074
+        assert summary["measured_min_raw"] == 1813 and summary["measured_max_raw"] == 2108
     assert not PositiveElbowControl._settings_valid(proof, recipe_name=RIGHT_P20_RECIPE, current_cap_ma=150)
     assert evidence._live_definition.settings_valid(proof)
     import copy
@@ -1036,7 +1053,7 @@ def test_right_p20_raw_paired_visible_proof_is_trial_only_and_never_rewrites_pid
     masked["active"]["registers"]["P_Coefficient"] = 16
     masked["unchanged"] = True
     assert not evidence._live_definition.settings_valid(masked), "an opted trial cannot fall back to normal proof"
-    for mutation in ("left", "integral", "p", "request", "context", "clock", "restored", "profile"):
+    for mutation in ("left", "integral", "p", "request", "context", "clock", "restored", "profile", "hardware"):
         bad = copy.deepcopy(proof)
         if mutation == "left": bad["binding"]["recipe"] = "physical-live-left-elbow"
         elif mutation == "integral": bad["active"]["registers"]["I_Coefficient"] = 1
@@ -1045,6 +1062,7 @@ def test_right_p20_raw_paired_visible_proof_is_trial_only_and_never_rewrites_pid
         elif mutation == "context": bad["right_p20_trial"]["context_sha256"] = "0" * 64
         elif mutation == "clock": bad["right_p20_trial"]["configured_at_monotonic_s"] = proof["active"]["read_completed_at_monotonic_s"] + 1
         elif mutation == "restored": bad["right_p20_trial"]["restore_required"] = False
-        else: bad["active"]["registers"]["Torque_Limit"] += 1
+        elif mutation == "profile": bad["active"]["registers"]["Torque_Limit"] += 1
+        else: bad["active"]["registers"]["Protection_Current"] = 0
         assert not evidence._live_definition.settings_valid(bad), mutation
     assert len(json.dumps(proof, separators=(",", ":"))) < 4096

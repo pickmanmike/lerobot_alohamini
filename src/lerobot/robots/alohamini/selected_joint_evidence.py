@@ -31,13 +31,26 @@ PHASES = {"baseline", "outbound", "endpoint", "return", "origin", "final"}
 LIVE_RECIPE = "physical-live-left-elbow"
 
 
-def live_elbow_spec(recipe):
+def live_elbow_spec(recipe, practical_config=None):
     """Resolve the checkout-only contract only for an opted-in recipe."""
     if recipe is None:
         return None
     from examples.alohamini.am1_session_contract import LIVE_ELBOW_SPECS
 
+    if practical_config is not None:
+        if practical_config.spec.recipe != recipe:
+            raise ValueError("Practical configuration requires its selected right recipe")
+        return practical_config.spec
     return LIVE_ELBOW_SPECS.get(recipe)
+
+
+def live_elbow_workspace(recipe, practical_config=None):
+    if practical_config is not None:
+        if practical_config.spec.recipe != recipe:
+            raise ValueError("Practical workspace requires its selected right recipe")
+        return practical_config.workspace
+    from examples.alohamini.am1_session_contract import LIVE_ELBOW_WORKSPACES
+    return LIVE_ELBOW_WORKSPACES.get(recipe)
 
 
 class _LiveElbowDefinition:
@@ -45,21 +58,23 @@ class _LiveElbowDefinition:
     profile = "LiveLeftElbow"
     current_cap_ma = 150.0
     live_s = 90.0
+    practical_motion = False
 
     def __init__(self, spec=None):
         if spec is not None:
             self.recipe_name, self.profile = spec.recipe, spec.profile
             self.current_cap_ma, self.live_s = spec.current_cap_ma, spec.live_s
+            self.practical_motion = getattr(spec, "practical_motion", False)
 
     def settings_valid(self, proof):
         from examples.alohamini.am1_session_contract import PositiveElbowControl
 
         if (getattr(self, "right_p20_trial", None) is not None
                 or isinstance(proof, dict) and "right_p20_trial" in proof):
-            from .am1_elbow_integral import RIGHT_P20_RECIPE, right_p20_settings_valid
+            from .am1_elbow_integral import right_p20_settings_valid
             trial = getattr(self, "right_p20_trial", None)
             try:
-                return (self.recipe_name == RIGHT_P20_RECIPE and trial is not None
+                return (trial is not None and self.recipe_name == trial.recipe
                         and isinstance(proof, dict) and proof.get("right_p20_trial") == trial.receipt
                         and right_p20_settings_valid(proof))
             except (RuntimeError, ValueError, OSError):
@@ -185,7 +200,13 @@ class AM1SelectedJointEvidence:
             uuid_text,
         )
 
-        spec = live_elbow_spec(actual.get("recipe"))
+        spec = live_elbow_spec(actual.get("recipe"), getattr(robot, "_am1_practical_config", None))
+        if spec is not None and getattr(spec, "practical_motion", False):
+            config = getattr(robot, "_am1_practical_config", None)
+            trial_binding = getattr(robot, "_am1_right_p20_trial_binding", None)
+            if (config is None or not isinstance(trial_binding, dict)
+                    or trial_binding.get("request", {}).get("config") != config.to_payload()):
+                raise RuntimeError("Practical selected configuration differs from its consumed request")
         if self.live_spec is not None and spec != self.live_spec:
             raise RuntimeError("Visible selected joint cannot change after binding")
         if spec is not None and self.live_spec is None:
@@ -238,6 +259,12 @@ class AM1SelectedJointEvidence:
             "raw": present, "normalized": float(robot_position(bus, present, self.motor)),
             "read_started_at_monotonic_s": started, "read_completed_at_monotonic_s": first_completed,
         }
+        hardware_current = None
+        if getattr(self._live_definition, "practical_motion", False):
+            hardware_current = int.from_bytes(payload[28:30], "little")
+            if hardware_current <= 0:
+                raise RuntimeError("Practical selected hardware current protection is unavailable")
+            self._live_definition.hardware_current_limit_ma = hardware_current * 6.5
         if source == "settings_active":
             self.last_live_goal = {
                 "source": source,
@@ -261,6 +288,8 @@ class AM1SelectedJointEvidence:
                     raise RuntimeError("Visible selected settings table differs")
                 raw = int.from_bytes(payload[address : address + width], "little")
             registers[name] = int(bus._decode_sign(name, {3: raw})[3])
+        if hardware_current is not None:
+            registers["Protection_Current"] = hardware_current
         return {
             "registers": registers,
             "individual_bytes": {"24": payload[24], "25": payload[25]},
@@ -331,8 +360,8 @@ class AM1SelectedJointEvidence:
         self.visible_settings["unchanged"] = original == now
         trial = getattr(robot, "_am1_right_elbow_p_trial", None)
         if trial is not None:
-            from .am1_elbow_integral import AM1RightElbowProportionalTrial, RIGHT_P20_RECIPE
-            if (not isinstance(trial, AM1RightElbowProportionalTrial) or definition.recipe_name != RIGHT_P20_RECIPE
+            from .am1_elbow_integral import AM1RightElbowProportionalTrial
+            if (not isinstance(trial, AM1RightElbowProportionalTrial) or definition.recipe_name != trial.recipe
                     or trial.binding != getattr(robot, "_am1_right_p20_trial_binding", None)):
                 raise RuntimeError("Visible P20 proof requires its exact right one-use trial")
             trial._same_owner(robot)
@@ -381,7 +410,7 @@ class AM1SelectedJointEvidence:
                 "diagnostic_current_cap_ma": None if definition is None else definition.current_cap_ma,
                 "ordinary_limit_ma": ordinary_limit,
                 "effective_limit_ma": (
-                    min(definition.current_cap_ma, ordinary_limit)
+                    min(definition.current_cap_ma, ordinary_limit, getattr(definition, "hardware_current_limit_ma", definition.current_cap_ma))
                     if definition is not None and ordinary_limit is not None else None
                 ),
                 "comparison": "abs(current_ma) >= effective_limit_ma" if ordinary_limit is not None else None,
@@ -425,7 +454,8 @@ class AM1SelectedJointEvidence:
             return
         if type(raw) is not int or not _number(ordinary_limit) or ordinary_limit <= 0:
             raise RuntimeError("Visible actual selected current is unavailable")
-        if abs(raw * 6.5) >= min(definition.current_cap_ma, ordinary_limit):
+        if abs(raw * 6.5) >= min(definition.current_cap_ma, ordinary_limit,
+                                  getattr(definition, "hardware_current_limit_ma", definition.current_cap_ma)):
             self.capture_fault(
                 robot, "Visible selected software effort ceiling reached", source=source,
                 current=sample if sample is not None else getattr(robot, "_am1_selected_joint_current", None),
@@ -918,8 +948,7 @@ class AM1SelectedJointEvidence:
             raise RuntimeError("Live selected read-only settings are unavailable")
         calibration = self._bus(robot).calibration[self.motor]
         material = {k: int(getattr(calibration, k)) for k in ("drive_mode", "homing_offset", "range_min", "range_max")}
-        from examples.alohamini.am1_session_contract import LIVE_ELBOW_WORKSPACES
-        workspace = LIVE_ELBOW_WORKSPACES.get(self.live_spec.recipe)
+        workspace = live_elbow_workspace(self.live_spec.recipe, getattr(robot, "_am1_practical_config", None))
         if workspace is not None:
             if measured is None:
                 measured = (getattr(robot,"_am1_workspace_observation",None) or {}).get("positions")
@@ -947,8 +976,6 @@ class AM1SelectedJointEvidence:
                 or not low <= raw <= high):
             raise RuntimeError("Live actual selected raw admission/encoded corridor is unavailable")
         if summary.get("admission_version") == 2:
-            from examples.alohamini.am1_session_contract import LIVE_ELBOW_WORKSPACES
-            workspace = LIVE_ELBOW_WORKSPACES.get(self.live_spec.recipe)
             if (workspace is None or summary.get("workspace") != workspace.descriptor
                     or endpoints != [workspace.command_min_raw, workspace.command_max_raw]):
                 raise RuntimeError("Live workspace native encoded descriptor differs")
@@ -959,12 +986,17 @@ class AM1SelectedJointEvidence:
         summary.update(measured_min_raw=max(low, min(*endpoints, raw) if self.side == "left"
                                                       else min(raw, low if negative is None else negative)),
                        measured_max_raw=min(high, max(raw, endpoints[1], high if positive is None else positive)))
-        if workspace is not None:
+        if getattr(self._live_definition, "practical_motion", False):
+            geometry = workspace.geometry(raw, summary["reference_norm"])
+            summary.update(measured_min_raw=max(low, geometry["measured_min_raw"]),
+                           measured_max_raw=min(high, geometry["measured_max_raw"]))
+        elif workspace is not None:
             summary["measured_min_raw"] = max(low,negative)
             summary["measured_max_raw"] = min(high,positive)
             if (not summary["measured_min_raw"]<=raw<=summary["measured_max_raw"]
                     or not summary["measured_min_raw"]<=min(endpoints)<=max(endpoints)<=summary["measured_max_raw"]):
                 raise RuntimeError("Live workspace current measurement left the original measured guard")
+        if workspace is not None:
             acquisition=getattr(robot,"_am1_workspace_observation",{})
             self.emit(dict(kind="live_workspace_admission",binding=dict(robot._am1_visible_control_binding),
                            policy=workspace.descriptor,reference_norm=summary["reference_norm"],measured_origin_raw=origin,
@@ -976,6 +1008,12 @@ class AM1SelectedJointEvidence:
     def deactivate_live(self, robot):
         # A returned measured hold ends live command exposure. It does not clear
         # the native first fault or change the original geometry/settings/budget.
+        if getattr(self._live_definition, "practical_motion", False) and self.live_response is not None:
+            if self.response_boundary is not None and self.response_boundary.get("status") == "pending":
+                if self._pending_sparse is None:
+                    self._pending_sparse = dict(kind="practical_response_diagnostic", status="interrupted",
+                                                window=copy.deepcopy(self.live_response),
+                                                interrupted_at_monotonic_s=self.clock())
         self.context = None
         self.live_response = None
         robot._am1_selected_joint_evidence_context = None
@@ -1022,6 +1060,9 @@ class AM1SelectedJointEvidence:
             raise RuntimeError("Live actual selected action is unavailable")
         goal = action["expected_goal_raw"]
         self._guard_live_fixed_goal(position, current, goal)
+        if getattr(self._live_definition, "practical_motion", False):
+            self._guard_practical_response(robot, control, position, current, goal, action)
+            return
         error = goal - raw
         direction = 0 if error == 0 else (1 if error > 0 else -1)
         window = self.live_response
@@ -1055,6 +1096,7 @@ class AM1SelectedJointEvidence:
             self.visible_goal = goal
             self.visible_position_rows.clear()
             self.visible_current_rows.clear()
+            self._current_rise_recorded = False
         point = (position["read_completed_at_monotonic_s"], current["read_completed_at_monotonic_s"],
                  position["raw"], abs(current["ma"]))
         if not self.visible_position_rows or point[0] > self.visible_position_rows[-1][0]:
@@ -1088,7 +1130,48 @@ class AM1SelectedJointEvidence:
                 if item[3] - level >= 6.5 - 1e-9:
                     level, rises = item[3], rises + 1
             if rises >= 3 and max(item[2] for item in rows) - min(item[2] for item in rows) <= 2:
+                if getattr(self._live_definition, "practical_motion", False):
+                    if not getattr(self, "_current_rise_recorded", False):
+                        self._current_rise_recorded = True
+                        self._pending_sparse = dict(kind="practical_current_rise_diagnostic", would_have_aborted=True,
+                            reason="Live native static command adverse current rise", goal_raw=goal,
+                            position=copy.deepcopy(position), current=copy.deepcopy(current), window=copy.deepcopy(rows))
+                    return
                 raise RuntimeError("Live native static command adverse current rise")
+
+    def _guard_practical_response(self, robot, control, position, current, goal, action):
+        """Measure a finite opportunity after delivery; healthy nonresponse is an outcome."""
+        calibration = self._bus(robot).calibration[self.motor]
+        target = control.live_sample["target"][self.position]
+        target_raw = int((target + 100) / 200 * (calibration.range_max - calibration.range_min) + calibration.range_min)
+        opportunity = (control.epoch, control.intent_revision, target_raw)
+        window = self.live_response
+        if window is not None and tuple(window["opportunity"]) != opportunity:
+            if not window.get("complete", False):
+                if self._pending_sparse is None:
+                    self._pending_sparse = dict(kind="practical_response_diagnostic", status="interrupted", window=copy.deepcopy(window))
+            window = self.live_response = None
+        if goal != target_raw:
+            self.response_boundary = dict(version=1, status="ramping", target_raw=target_raw, delivered_goal_raw=goal)
+            return
+        delivered = action.get("write_completed_at_monotonic_s")
+        if not _number(delivered):
+            raise RuntimeError("Practical response requires actual target delivery time")
+        if window is None:
+            window = self.live_response = dict(opportunity=opportunity, raw=position["raw"], at=delivered,
+                target_raw=target_raw, direction=1 if target_raw >= position["raw"] else -1, complete=False)
+        if window["complete"]:
+            return
+        elapsed = position["read_completed_at_monotonic_s"] - window["at"]
+        response = window["direction"] * (position["raw"] - window["raw"])
+        self.response_boundary = dict(version=1, status="measured" if elapsed >= 2 else "pending", window_s=2.0,
+            elapsed_s=max(0, elapsed), signed_response_raw=response, residual_raw=abs(target_raw-position["raw"]),
+            target_raw=target_raw, delivered_at_monotonic_s=window["at"])
+        if elapsed >= 2:
+            window["complete"] = True
+            if self._pending_sparse is None:
+                self._pending_sparse = dict(kind="practical_response_diagnostic", **copy.deepcopy(self.response_boundary),
+                    window=copy.deepcopy(window), position=copy.deepcopy(position), current=copy.deepcopy(current))
 
     def report_live_goal(self, robot, control):
         """A few existing-owner readbacks; broadcast completion remains unacknowledged."""
@@ -1113,8 +1196,8 @@ class AM1SelectedJointEvidence:
             self.goal_readbacks[f"{state}_{control.epoch}"] = {"state": state, "diagnostic_available": False,
                 "unavailable_reason": type(error).__name__, "read_completed_at_monotonic_s": self.clock()}
             return
-        if any(sample["registers"][k] != self.visible_settings["active"]["registers"][k]
-               for k in self.VISIBLE_STATIC_REGISTERS):
+        protected = (*self.VISIBLE_STATIC_REGISTERS, "Protection_Current") if self._live_definition.practical_motion else self.VISIBLE_STATIC_REGISTERS
+        if any(sample["registers"][k] != self.visible_settings["active"]["registers"][k] for k in protected):
             raise RuntimeError("Live selected settings changed from their read-only baseline")
         if (sample["registers"]["Status"] != 0 or sample["registers"]["Torque_Enable"] != 1
                 or sample["registers"]["Operating_Mode"] != 0 or sample["registers"]["Lock"] != 1):
@@ -1896,6 +1979,8 @@ class AM1SelectedJointEvidence:
         retained[row["sample_key"]] = copy.deepcopy(row)
 
     def report(self, robot, control, observation):
+        if getattr(self._live_definition, "practical_motion", False):
+            self.emit_pending_fault(robot)
         marker = self._matched_marker(control, observation)
         if marker is None:
             return  # No new labeled acquisition can be inferred from a stale/foreign view.

@@ -403,6 +403,144 @@ def test_live_static_command_adverse_current_rise_remains_a_native_fault(monkeyp
             evidence.guard_live(robot, control)
 
 
+def test_practical_static_current_rise_retains_exact_window_without_extra_reads():
+    from types import SimpleNamespace
+    from lerobot.robots.alohamini.selected_joint_evidence import AM1SelectedJointEvidence
+
+    emitted = []
+    evidence = AM1SelectedJointEvidence(enabled=True, emit=emitted.append)
+    evidence._live_definition = SimpleNamespace(practical_motion=True)
+    position = {"raw": 1847, "read_completed_at_monotonic_s": 10.0}
+    current = {"raw": 0, "ma": 0, "read_completed_at_monotonic_s": 10.0}
+    for index in range(4):
+        position = dict(position, read_completed_at_monotonic_s=10 + index * .1)
+        current = dict(current, raw=index, ma=index * 6.5, read_completed_at_monotonic_s=10 + index * .1)
+        evidence._guard_live_fixed_goal(position, current, 1960)
+    evidence.emit_pending_fault(SimpleNamespace())
+    assert len(emitted) == 1
+    row = emitted[0]
+    assert row["kind"] == "practical_current_rise_diagnostic"
+    assert row["would_have_aborted"] is True
+    assert row["position"] == position and row["current"] == current
+    assert row["window"] == [(10 + i * .1, 10 + i * .1, 1847, i * 6.5) for i in range(4)]
+
+
+def test_practical_effective_current_cap_keeps_ordinary_lower_limit():
+    from types import SimpleNamespace
+    from lerobot.robots.alohamini.selected_joint_evidence import AM1SelectedJointEvidence, _LiveElbowDefinition
+
+    spec = SimpleNamespace(recipe="physical-live-right-elbow-practical", profile="LiveRightElbowPractical",
+                           current_cap_ma=500, live_s=180, practical_motion=True)
+    definition = _LiveElbowDefinition(spec)
+    assert definition.practical_motion is True
+    evidence = AM1SelectedJointEvidence(enabled=True)
+    evidence._visible_definition = lambda robot: definition
+    robot = SimpleNamespace()
+    evidence.check_visible_current(robot, 76, 1800)
+    with pytest.raises(RuntimeError, match="effort"):
+        evidence.check_visible_current(robot, 77, 1800)
+    assert robot._am1_selected_joint_fault["effective_limit_ma"] == 500
+    robot = SimpleNamespace()
+    with pytest.raises(RuntimeError, match="effort"):
+        evidence.check_visible_current(robot, 16, 100)
+    assert robot._am1_selected_joint_fault["effective_limit_ma"] == 100
+    definition.hardware_current_limit_ma = 65
+    robot = SimpleNamespace()
+    with pytest.raises(RuntimeError, match="effort"):
+        evidence.check_visible_current(robot, 10, 1800)
+    assert robot._am1_selected_joint_fault["effective_limit_ma"] == 65
+
+
+def test_practical_response_window_begins_at_delivered_target_and_measures_nonresponse():
+    from types import SimpleNamespace
+    from lerobot.robots.alohamini.selected_joint_evidence import AM1SelectedJointEvidence
+
+    rows = []
+    evidence = AM1SelectedJointEvidence(enabled=True, clock=lambda: 20, emit=rows.append)
+    evidence.live_spec = SimpleNamespace(joint=RIGHT_KEY)
+    calibration = SimpleNamespace(range_min=827, range_max=3039)
+    robot = SimpleNamespace(right_bus=SimpleNamespace(calibration={RIGHT: calibration}))
+    evidence.live_spec.side = "right"
+    control = SimpleNamespace(epoch=2, intent_revision=1, live_sample={"target": {RIGHT_KEY: (1960-827)/2212*200-100}})
+    position = dict(raw=1847, read_completed_at_monotonic_s=10)
+    current = dict(raw=2, ma=13, read_completed_at_monotonic_s=10)
+    evidence._guard_practical_response(robot, control, position, current, 1900, {"write_completed_at_monotonic_s": 9.9})
+    assert evidence.live_response is None
+    evidence._guard_practical_response(robot, control, position, current, 1960, {"write_completed_at_monotonic_s": 10})
+    assert evidence.live_response["at"] == 10
+    position["read_completed_at_monotonic_s"] = 11.3
+    evidence._guard_practical_response(robot, control, position, current, 1960, {"write_completed_at_monotonic_s": 11.2})
+    assert evidence.response_boundary["status"] == "pending"
+    position["read_completed_at_monotonic_s"] = 12.01
+    evidence._guard_practical_response(robot, control, position, current, 1960, {"write_completed_at_monotonic_s": 12})
+    assert evidence.response_boundary["status"] == "measured"
+    assert evidence.response_boundary["signed_response_raw"] == 0
+    assert evidence.response_boundary["residual_raw"] == 113
+
+
+def test_practical_native_admission_large_geometry_rate_expiry_and_stop():
+    from examples.alohamini.am1_session_contract import PracticalElbowConfig
+    config = PracticalElbowConfig.from_payload(dict(reference_raw=1847, direction=1))
+    now, identity, owner, _, obj = right_lane()
+    obj.configure_workspace(raw=1847)
+    control = host.AM1LocalControl(**identity, live=True, live_recipe=config.spec.recipe,
+                                  practical_config=config, clock=lambda: now[0])
+    assert control.apply(obj, frame(identity, owner, sequence=1))
+    initial = control.live_snapshot()
+    assert initial["corridor_max_norm"] == config.target_norm(20)
+    assert initial["live_deadline_monotonic_s"] == 190
+    now[0] += .1
+    assert control.apply(obj, frame(identity, owner, sequence=2, mode="active", epoch=2,
+                                   sample=right_sample(target=config.target_norm(10))))
+    assert control.live_snapshot()["cursor_norm"] == pytest.approx(config.target_norm(0) + .1 * config.spec.rate_norm_per_s)
+    assert all(obj.events[-1][1][name] == 0 for name in ("x.vel", "y.vel", "theta.vel", "lift_axis.vel"))
+    now[0] = 10.26
+    assert control.check_live(obj) and control.live_snapshot()["state"] == "expired"
+    assert control.apply(obj, frame(identity, owner, sequence=3, epoch=3, revision=1))
+    assert control.live_snapshot()["live_deadline_monotonic_s"] == 190
+    assert control.apply(obj, {name: 0 for name in ("x.vel", "y.vel", "theta.vel", "lift_axis.vel")})
+    assert control.state == "stopped"
+    now[0] = 190
+    assert not control.check_live(obj) and control.state == "stopped"
+
+
+def test_practical_command_current_aborts_before_position_failure_or_goal_write(monkeypatch):
+    from types import SimpleNamespace
+    obj, evidence, *_ = right_robot(monkeypatch)
+    definition = SimpleNamespace(practical_motion=True, current_cap_ma=500, hardware_current_limit_ma=2015)
+    evidence.live_spec = SimpleNamespace(joint=RIGHT_KEY, side="right")
+    evidence._live_definition = definition
+    evidence._visible_definition = lambda robot: definition
+    acquisitions = []
+    def current(register, motors):
+        acquisitions.append(register)
+        return {RIGHT: 77}
+    monkeypatch.setattr(obj.right_bus, "sync_read", current)
+    monkeypatch.setattr(obj, "_read_arm_positions", lambda *args, **kwargs: pytest.fail("position read obscured current trip"))
+    with pytest.raises(RuntimeError, match="effort"):
+        obj._limit_joint_goal_by_current(obj.right_bus, {RIGHT_KEY: 0})
+    assert acquisitions == ["Present_Current"]
+    assert obj._am1_selected_joint_fault["source"] == "command_current_limiter"
+    assert obj._am1_selected_joint_fault["effective_limit_ma"] == 500
+    assert obj._joint_current_limit_ma == 1800
+
+
+def test_practical_twenty_degrees_survives_ordinary_twenty_normalized_relative_cap(monkeypatch):
+    from examples.alohamini.am1_session_contract import PracticalElbowConfig
+    from lerobot.robots.alohamini.selected_joint_evidence import _LiveElbowDefinition
+    obj, evidence, *_ = right_robot(monkeypatch, position=1847)
+    config = PracticalElbowConfig.from_payload(dict(reference_raw=1847, direction=1))
+    obj.config.max_relative_target = 20.0
+    obj._am1_practical_config = config
+    obj._am1_visible_control_binding["recipe"] = config.spec.recipe
+    evidence.live_spec = config.spec
+    evidence._live_definition = _LiveElbowDefinition(config.spec)
+    evidence._visible_definition = lambda robot: evidence._live_definition
+    obj.send_action({RIGHT_KEY: config.target_norm(20), "x.vel": 0, "y.vel": 0, "theta.vel": 0, "lift_axis.vel": 0})
+    assert obj._am1_selected_joint_action["expected_goal_raw"] == 2074
+    assert obj.config.max_relative_target == 20
+
+
 def test_nonselected_out_of_command_range_pose_keeps_its_existing_raw_hold(monkeypatch):
     from lerobot.motors import Motor as Servo, MotorCalibration, MotorNormMode
     from tests.robots.test_am1_selected_joint_evidence import robot as selected_robot
