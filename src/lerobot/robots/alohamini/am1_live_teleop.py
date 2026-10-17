@@ -8,6 +8,7 @@ import copy
 import json
 import math
 import time
+from contextlib import suppress
 from uuid import UUID
 
 RECIPE = "physical-live-teleop"
@@ -75,6 +76,8 @@ def _fault(robot, reason, side, register, raw, timing, *, offending_motor=None, 
     error = RuntimeError("AM1 teleop " + reason)
     # Diagnostic failure must never replace or postpone the original guard.
     try:
+        if getattr(robot, "_am1_teleop_first_error", None) is None:
+            robot._am1_teleop_first_error = error
         if getattr(robot, "_am1_teleop_fault", None) is None:
             robot._am1_teleop_fault = {
                 "reason": reason,
@@ -87,6 +90,30 @@ def _fault(robot, reason, side, register, raw, timing, *, offending_motor=None, 
                 "offending_value": copy.deepcopy(raw.get(offending_motor)),
                 "comparison": copy.deepcopy(comparison),
             }
+            current = getattr(robot, "_am1_teleop_group_receipts", {}).get(side)
+            if (
+                current is not None
+                and current["binding"] == robot._am1_teleop_binding
+                and current["request"]["register"] == register
+            ):
+                started, completed = (
+                    timing["read_started_at_monotonic_s"],
+                    timing["read_completed_at_monotonic_s"],
+                )
+                call_started = current["group_call_started_at_monotonic_s"]
+                call_completed = current["group_call_completed_at_monotonic_s"]
+                matching = (
+                    call_completed is not None
+                    and current["comm_result"] == 0
+                    and started <= call_started <= call_completed <= completed
+                )
+                in_flight = (
+                    call_completed is None
+                    and raw.get("packet") is not None
+                    and call_started <= started <= completed
+                )
+                if matching or in_flight:
+                    robot._am1_teleop_fault["group_reply"] = copy.deepcopy(current)
         note = "[AM1 TELEOP FAULT] " + json.dumps(
             robot._am1_teleop_fault,
             allow_nan=False,
@@ -200,10 +227,162 @@ def check_health(robot, records, *, active):
                 raise RuntimeError("AM1 teleop actual configured voltage limit: " + name)
 
 
+def _install_group_reply_guard(robot, side, bus):
+    """Validate original AM1 group replies before the SDK can slice their data."""
+    from lerobot.motors.feetech.tables import MODEL_CONTROL_TABLE
+
+    binding = tuple(sorted(robot._am1_teleop_binding.items()))
+    reader, ph, port = bus.sync_reader, bus.packet_handler, bus.port_handler
+    mapping = tuple((name, motor.id, motor.model) for name, motor in bus.motors.items())
+    installed = getattr(bus, "_am1_teleop_reply_guard", None)
+    if installed is not None:
+        if installed != (robot, binding, reader, ph, port, mapping, reader.txRxPacket, ph.rxPacket):
+            raise RuntimeError("AM1 teleop group reply guard owner changed")
+        return
+    original, original_rx = reader.txRxPacket, ph.rxPacket
+    if (
+        reader.ph is not ph
+        or reader.port is not port
+        or getattr(original, "__self__", None) is not reader
+        or getattr(original, "__func__", None) is not getattr(type(reader), "txRxPacket", None)
+        or getattr(original_rx, "__self__", None) is not ph
+        or getattr(original_rx, "__func__", None) is not getattr(type(ph), "rxPacket", None)
+    ):
+        raise RuntimeError("AM1 teleop group reply reader already wrapped or differs")
+    table = MODEL_CONTROL_TABLE["sts3215"]
+    receipts = getattr(robot, "_am1_teleop_group_receipts", None)
+    if receipts is None:
+        receipts = robot._am1_teleop_group_receipts = {}
+
+    def guarded():
+        if getattr(robot, "_am1_teleop_first_error", None) is not None:
+            raise robot._am1_teleop_first_error
+        receipts.pop(side, None)  # Never attribute a previous register/transaction to this call.
+        request, receipt = {"binding": dict(binding), "side": side}, None
+
+        def refuse(reason, raw=None, timing=None):
+            comparison = None
+            with suppress(Exception):
+                comparison = {"units": "raw_packet_bytes", "request": copy.deepcopy(request)}
+            _fault(
+                robot,
+                reason,
+                side,
+                request.get("register", "sync_read"),
+                raw or {},
+                timing or {},
+                comparison=comparison,
+            )
+
+        def owner_valid():
+            try:
+                return (
+                    binding_valid(robot)
+                    and tuple(sorted(robot._am1_teleop_binding.items())) == binding
+                    and getattr(robot, side + "_bus") is bus
+                    and bus.is_connected
+                    and bus.sync_reader is reader
+                    and bus.packet_handler is ph
+                    and bus.port_handler is port
+                    and reader.ph is ph
+                    and reader.port is port
+                    and tuple((name, motor.id, motor.model) for name, motor in bus.motors.items()) == mapping
+                    and reader.txRxPacket is guarded
+                )
+            except Exception:
+                return False
+
+        if not owner_valid() or ph.rxPacket != original_rx:
+            refuse("group reply protected owner/binding changed")
+        address, width, ids = reader.start_address, reader.data_length, tuple(reader.data_dict)
+        request.update(address=address, width=width, ids=list(ids))
+        id_names = {motor_id: name for name, motor_id, _model in mapping}
+        if (
+            type(address) is not int
+            or type(width) is not int
+            or (address, width) not in table.values()
+            or width not in (1, 2)
+            or not ids
+            or len(ids) > min(10, len(mapping))
+            or len(set(ids)) != len(ids)
+            or len(id_names) != len(mapping)
+            or any(type(motor_id) is not int or motor_id not in id_names for motor_id in ids)
+        ):
+            refuse("group reply request differs from the bound AM1 register/IDs")
+        request.update(
+            address=address,
+            width=width,
+            ids=list(ids),
+            motors=[id_names[motor_id] for motor_id in ids],
+            register=next(name for name, spec in table.items() if spec == (address, width)),
+        )
+        receipt = receipts[side] = {
+            "binding": dict(binding),
+            "request": copy.deepcopy(request),
+            "group_call_started_at_monotonic_s": time.monotonic(),
+            "group_call_completed_at_monotonic_s": None,
+            "comm_result": None,
+            "packets": [],
+        }
+        seen = set()
+
+        def checked_rx(*args, **kwargs):
+            started = time.monotonic()
+            packet, result = original_rx(*args, **kwargs)
+            completed = time.monotonic()
+            timing = {"read_started_at_monotonic_s": started, "read_completed_at_monotonic_s": completed}
+            raw = {}
+            try:
+                raw = {"packet": list(packet[:256]), "device_error": packet[4] if len(packet) > 4 else None}
+                if len(receipt["packets"]) < 10:
+                    receipt["packets"].append({**copy.deepcopy(raw), **timing, "comm_result": result})
+            except Exception:
+                pass  # Optional capture cannot replace a proven receive guard.
+            if result != 0:
+                return packet, result  # The SDK retains its original transport-failure behavior.
+            if not owner_valid() or (reader.start_address, reader.data_length, tuple(reader.data_dict)) != (
+                address,
+                width,
+                ids,
+            ):
+                refuse("group reply owner/request changed during acquisition", raw, timing)
+            if (
+                type(packet) is not list
+                or len(packet) < 6
+                or len(packet) > 256
+                or any(type(byte) is not int or not 0 <= byte <= 255 for byte in packet)
+                or packet[:2] != [255, 255]
+                or packet[-1] != ((~sum(packet[2:-1])) & 255)
+            ):
+                refuse("group reply invalid frame/header/checksum", raw, timing)
+            if packet[4] != 0:
+                refuse("group reply actual device error: " + str(packet[4]), raw, timing)
+            if packet[2] not in ids or packet[2] in seen:
+                refuse("group reply unexpected or duplicate motor ID", raw, timing)
+            if packet[3] != width + 2 or len(packet) != width + 6:
+                refuse("group reply payload width differs from original request", raw, timing)
+            seen.add(packet[2])
+            return packet, result
+
+        ph.rxPacket = checked_rx
+        try:
+            result = original()
+            receipt["comm_result"] = result
+            return result
+        finally:
+            ph.rxPacket = original_rx
+            receipt["group_call_completed_at_monotonic_s"] = time.monotonic()
+
+    reader.txRxPacket = guarded
+    bus._am1_teleop_reply_guard = (robot, binding, reader, ph, port, mapping, guarded, original_rx)
+
+
 def prepare_settings(robot):
     """Capture installed position-role settings without writing a tuning profile."""
     if not binding_valid(robot):
         raise RuntimeError("AM1 teleop settings need the protected binding")
+    for side, bus, _names in _groups(robot):
+        _install_group_reply_guard(robot, side, bus)
     records = read_groups(robot, (*STATIC, *HEALTH), active=False)
     robot._am1_teleop_settings = records
     for side, bus, names in _groups(robot):
@@ -497,6 +676,9 @@ def check_sampled_current(robot, side, values, started, completed):
 
 
 def before_write(control, robot):
+    # A legacy force limiter can catch read errors; the original hard fault still fences every later write.
+    if getattr(robot, "_am1_teleop_first_error", None) is not None:
+        raise robot._am1_teleop_first_error
     # Expiry is checked again after local validation and at every real write.
     control.before_live_write(robot)
     if not binding_valid(robot) or robot._am1_teleop_binding != {**control.binding, "recipe": RECIPE}:

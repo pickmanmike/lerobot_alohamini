@@ -30,21 +30,28 @@ valid required local observation/diagnostic evidence. Separate decoded view prog
 from capture freshness and motor health; optional loss cannot consume unrelated
 recovery budgets. Keep media work and routine logs outside the motor loop.
 
-Current known stopped deployment: motor 7d12ad1264750d64e0f8b40edc625e08974581c4,
+Current known stopped deployment: motor ff9d5e460dd1a15b3b93abb387d7bf6bf78604a8,
 protected runtime 7447480924c288fed3a76fc981433b41c7bfcefe, camera
 bc3442b54d9c574a8feddb0ade642c9b351e59f9; manifest
+d20c49f53b8967f945f7e0b007d3df089b31861d71116929ee9ddf09b9064749.
+Helper/manual remains 0fe3997f. Immediate matched rollback retains motor
+7d12ad1264750d64e0f8b40edc625e08974581c4 with the same runtime/camera and manifest
 e4e694ffbdfeb387c781e1bb3ab1ebc35cd79e506f88164f0ff424206ee0e1bf.
-Helper/manual remains 0fe3997f. Immediate matched rollback retains the same motor
-and camera with runtime 34a97f816a78b8c7b5fda77b55c13a26b9df80b3 and manifest
-c78dac7f081d16dd667a739863f84aa93ec5044d8fad0f17b241a17805aadb36.
-Combined07 has verified cleanup after an actual left shoulder-pan temperature-guard
-fault. Its triggering numerical reading was not exported; do not infer overheating
-or corrupted feedback from the prior 35 C reading and configured 70 C limit. Preserve
-that fault and original results. The representative workload and next Start remain
-unfinished. Repair the original fault-boundary evidence and check current thermal
-health through stopped sole ownership before another supported run. Preserve
-calibration, trust, private permissions, source imports and separate full component
-rollback bundles.
+Combined08 has verified cleanup after the left shoulder-pan temperature guard.
+The repaired original fault receipt records decoded grouped temperature126 against
+installed70, with other left-arm readings31..37. Actual physical temperature versus
+reply provenance remains unresolved; Combined07's trigger remains unknown. A prior
+stopped sole-owner236-read diagnostic found all20offzero,12healthyarms and five
+left-pan35 readings, without changing history or calibrations. Preserve both results.
+The representative workload and next Start remain unfinished. A stopped comparison
+retained360valid replies; decoded values matched their own payloads, without
+reproducing the active126 reading. A proven SDK short/error-reply decoding defect
+is being corrected at the AM1 group-read boundary, with original packet evidence
+and a sticky prewrite fault fence. Do not claim it caused Combined08. Retain the
+genuine thermal/status/current protections and original first causes; review and
+stage the focused integrity repair before another supported operating run.
+Preserve calibration, trust, private permissions, source imports and separate full
+component rollback bundles.
 Tasks stay stopped during editing/staging; services restore idle without replay.
 AM1 stays wireless, P1 advisory, AM2 untouched. No network tuning, Ethernet,
 manual shoulder/leader readiness questionnaire, new cutoff hardware or architecture.
