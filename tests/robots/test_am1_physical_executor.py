@@ -504,8 +504,8 @@ def pending_native_worker():
     e.worker = threading.Thread(target=e._run, daemon=True)
     e.worker.start()
 
-    def step():
-        requests.put(module().PendingSample(copy.deepcopy(e.sample)))
+    def step(polled=None):
+        requests.put(module().PendingSample(copy.deepcopy(e.sample)) if polled is None else polled)
         e._wake.set()
         return actions.get(timeout=2)
 
@@ -2233,3 +2233,134 @@ def test_practical_executor_consumes_fresh_private_request_before_any_owned_unit
     assert bound["kind"] == "practical13-right" and bound["request"]["proportional"] == proportional
     assert bound["request"]["config"] == {"reference_raw":1847, "direction":1}
     assert bound["run_id"] == RIGHT_P20_RUN and bound["host_incarnation"] == RIGHT_P20_HOST
+
+
+
+def test_unacknowledged_pause_revision_coalescing_preserves_expiry_and_fresh_rejoin(monkeypatch):
+    """Synthetic source race, not a reconstructed missing Combined21 command.
+
+    Reuse the actual worker/native owner, holding back its first queued pause
+    until two authority revisions coalesce. The250ms input expiry stays real.
+    """
+    from tests.robots.test_am1_live_teleop_native import sample
+
+    now, robot, control, e, step, stop = pending_native_worker()
+    original_apply, deliver, native_errors = control.apply, [False], []
+    original = copy.deepcopy(e._live_target)
+    frozen = control.live_snapshot()
+    def apply(owned_robot, action):
+        if not deliver[0] and action["_am1_local_control"]["mode"] == "pause":
+            return False  # Latest-only transport has not delivered this pause.
+        try:
+            return original_apply(owned_robot, action)
+        except RuntimeError as error:
+            native_errors.append(str(error))
+            return False
+    monkeypatch.setattr(control, "apply", apply)
+    def feedback():
+        observation = robot.get_observation()
+        control.annotate(observation, acquired_at=now[0])
+        return dict(e.sample, sequence=control.observation_id, at=now[0],
+                    positions=robot.get_observation(), observation=observation,
+                    ack=copy.deepcopy(observation["_am1_local_feedback"]))
+    try:
+        now[0] = original["valid_until_monotonic_s"] + 0.01
+        assert control.check_live(robot)
+        assert control.state == "paused" and control.epoch == 2
+        assert control.live_sample is None and control.live_snapshot()["state"] == "expired"
+        assert control.live_snapshot()["valid_until_monotonic_s"] == original["valid_until_monotonic_s"]
+        e.hold()
+        pending = step()["_am1_local_control"]
+        assert (pending["mode"], pending["epoch"]) == ("pause", 3)
+        e.set_intent_revision(1)
+        e.set_intent_revision(2)
+        deliver[0] = True
+        current = step()["_am1_local_control"]
+        assert native_errors == [], native_errors
+        assert (current["epoch"], current["intent_revision"]) == (3, 2)
+        assert control.state == "paused" and control.epoch == 3 and control.intent_revision == 2
+        assert not e.evidence()["native_ack"] and e._aligned == [] and not e.dispatch(e.recipe)
+        for when in (10.27, 10.38, 10.49):
+            now[0] = when
+            held = step(feedback())["_am1_local_control"]
+            assert held["mode"] == "pause" and held["epoch"] == 3
+        assert e.evidence()["hold_acknowledged"] and e.evidence()["pose_aligned"]
+        assert e.dispatch(e.recipe)
+        now[0] = 10.5
+        active = step(feedback())["_am1_local_control"]
+        assert (active["mode"], active["epoch"], active["intent_revision"]) == ("active", 4, 2)
+        now[0] = 10.51
+        step(feedback())
+        identity = dict(run_id=e.run_id, host_incarnation=e.host_incarnation,
+                        intent_revision=2, **e._live_binding)
+        assert not e.apply(original["target"], body=original["body"], source=original["source"],
+                           valid_until_monotonic_s=original["valid_until_monotonic_s"],
+                           grant_id=original["grant_id"], seq=1, **identity)
+        fresh = sample(control, seq=2, expiry=now[0] + 0.25,
+                       source_id=original["source"]["source_id"], acquired=2.01)
+        args = dict(target=fresh["target"], body=fresh["body"], source=fresh["source"],
+                    valid_until_monotonic_s=fresh["valid_until_monotonic_s"],
+                    grant_id=fresh["grant_id"], seq=2, **identity)
+        assert not e.apply(**dict(args, host_incarnation="foreign-host"))
+        assert e.apply(**args)
+        assert not e.apply(**args)  # Original input sequence is still anti-replay.
+        step()
+        assert control.live_snapshot()["last_input_seq"] == 2
+        assert control.live_snapshot()["valid_until_monotonic_s"] == fresh["valid_until_monotonic_s"]
+        assert control.live_snapshot()["workspace"] == frozen["workspace"]
+        assert control.live_snapshot()["live_deadline_monotonic_s"] == frozen["live_deadline_monotonic_s"]
+        assert e.run_id == control.binding["run_id"] and e._fault is None
+    finally:
+        stop()
+
+
+@pytest.mark.parametrize("wrong", ["run", "host", "revision", "epoch", "state", "stale"])
+def test_pending_pause_ack_must_prove_exact_fresh_accepted_epoch_before_advancing(wrong):
+    now, robot, control, e, step, stop = pending_native_worker()
+    try:
+        e.hold()
+        assert step()["_am1_local_control"]["epoch"] == 3
+        measured = robot.get_observation()
+        control.annotate(measured, acquired_at=now[0])
+        polled = dict(e.sample, sequence=control.observation_id, at=now[0], observation=measured,
+                      ack=copy.deepcopy(measured["_am1_local_feedback"]))
+        ack = polled["ack"]
+        if wrong == "run":
+            ack["run_id"] = "foreign-run"
+        elif wrong == "host":
+            ack["host_incarnation"] = "foreign-host"
+        elif wrong == "revision":
+            ack["intent_revision"] -= 1
+        elif wrong == "epoch":
+            ack["epoch"] -= 2
+        elif wrong == "state":
+            ack["state"] = "active"
+        else:
+            polled["at"] = now[0] - 1.0
+        e.set_intent_revision(1)
+        marker = step(polled)["_am1_local_control"]
+        assert (marker["mode"], marker["epoch"], marker["intent_revision"]) == ("pause", 3, 1)
+        assert e._aligned == [] and not e.evidence()["native_ack"] and not e.dispatch(e.recipe)
+        assert control.state == "paused" and control.epoch == 3
+        assert e._fault is None
+    finally:
+        stop()
+
+
+def test_pending_pause_ack_exact_accepted_hold_preserves_existing_plus_two_rule():
+    now, robot, control, e, step, stop = pending_native_worker()
+    try:
+        e.hold()
+        assert step()["_am1_local_control"]["epoch"] == 3
+        measured = robot.get_observation()
+        control.annotate(measured, acquired_at=now[0])
+        accepted = dict(e.sample, sequence=control.observation_id, at=now[0], observation=measured,
+                        ack=copy.deepcopy(measured["_am1_local_feedback"]))
+        e.set_intent_revision(1)
+        marker = step(accepted)["_am1_local_control"]
+        assert (marker["mode"], marker["epoch"], marker["intent_revision"]) == ("pause", 5, 1)
+        assert control.state == "paused" and control.epoch == 5 and control.intent_revision == 1
+        assert e._aligned == [] and not e.evidence()["native_ack"]
+        assert e._fault is None
+    finally:
+        stop()

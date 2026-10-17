@@ -941,9 +941,21 @@ class PhysicalExecutor:
                         desired = "pause"  # Cached ACK cannot activate a new revision/epoch.
                     if self._epoch_mode != desired or self._epoch_revision != self.revision:
                         if desired == "pause":
-                            self._epoch = (
-                                1 if self._epoch < 0 else self._epoch + (2 if self._epoch % 2 else 1)
+                            # Revisions can coalesce before a queued pause reaches
+                            # the host. Keep its pending odd epoch until original
+                            # current feedback proves that pause was accepted.
+                            pause_acknowledged = (
+                                usable
+                                and latest_ack.get("run_id") == self.run_id
+                                and latest_ack.get("host_incarnation") == self.host_incarnation
+                                and latest_ack.get("state") == "paused"
+                                and latest_ack.get("epoch") == self._epoch
+                                and latest_ack.get("intent_revision") == self._epoch_revision
                             )
+                            if self._epoch_mode != "pause" or pause_acknowledged:
+                                self._epoch = (
+                                    1 if self._epoch < 0 else self._epoch + (2 if self._epoch % 2 else 1)
+                                )
                             self._aligned = []
                             self._hold_reference = None
                         else:
