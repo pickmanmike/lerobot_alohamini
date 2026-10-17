@@ -11,6 +11,7 @@ import argparse
 import asyncio
 import contextlib
 import json
+import math
 import ssl
 import time
 from pathlib import Path
@@ -203,6 +204,22 @@ def expired_input_refusal(error):
             "reason": "expired grant",
             "effect_admitted": False,
         }.items()
+    )
+
+
+def recovery_grant_refusal(error):
+    return (
+        isinstance(error, CommandRefusedError)
+        and getattr(error, "operation", None) == "grant"
+        and all(
+            error.response.get(key) == value and type(error.response.get(key)) is type(value)
+            for key, value in {
+                "accepted": False,
+                "status": "refused",
+                "reason": "interactive running required",
+                "effect_admitted": False,
+            }.items()
+        )
     )
 
 
@@ -400,14 +417,20 @@ class SessionClient:
             await asyncio.sleep(0.45)
             await self.post("claim", {"controller_generation": self.generation})
 
-    async def resume(self):
+    async def resume(self, *, check=None):
+        if check:
+            check(self.snapshot)
         connected = await self.command(dict(op="connect", **self.identities()))
         self.connection = connected["connection_generation"]
         self.snapshot = connected["snapshot"]
         self.sequence = 0
+        if check:
+            check(self.snapshot)
         await self.command(dict(op="release_input", **self.identities()))
 
         def qualified():
+            if check:
+                check(self.snapshot)
             evidence, run = self.snapshot.get("evidence", {}), self.snapshot.get("run", {})
             live = run.get("live_input") or evidence.get("live_input") or {}
             return (
@@ -434,13 +457,16 @@ class SessionClient:
                 operation_id=str(uuid4()),
             )
         )
-        await self.wait(
-            lambda: (
+
+        def active():
+            if check:
+                check(self.snapshot)
+            return (
                 self.snapshot["run"]["status"] == "running"
                 and self.snapshot["evidence"].get("active_acknowledged") is True
-            ),
-            5,
-        )
+            )
+
+        await self.wait(active, 5)
 
     async def detach(self):
         self._detaching = True
@@ -463,6 +489,244 @@ def _live(snapshot):
     return (
         (snapshot.get("run") or {}).get("live_input") or snapshot.get("evidence", {}).get("live_input") or {}
     )
+
+
+class SameRunRecovery:
+    """Observe the existing Core episode before permitting explicit rejoin."""
+
+    def __init__(self, client, record):
+        self.client, self.record = client, record
+        state, live = client.snapshot, _live(client.snapshot)
+        self.original = json.loads(
+            json.dumps(
+                {
+                    "run": {
+                        key: state["run"][key]
+                        for key in ("run_id", "recipe", "backend_incarnation", "native_live_at", "deadline")
+                    },
+                    "service": state["service_incarnation"],
+                    "controller": {"device_id": client.device, "controller_generation": client.generation},
+                    "workspace": live["workspace"],
+                    "reference": live["reference"],
+                },
+                allow_nan=False,
+            )
+        )
+        self.episodes, self.cause, self.pause_recoveries = 0, None, 0
+        self.check(state)
+
+    def history_qualified(self, state):
+        run = state.get("run") or {}
+        return run.get("first_cause") == self.cause and run.get("recovery_episodes") == self.episodes
+
+    def check(self, state, *, history=True):
+        run, evidence, live = state.get("run") or {}, state.get("evidence", {}), _live(state)
+        if (
+            any(run.get(k) != v for k, v in self.original["run"].items())
+            or state.get("service_incarnation") != self.original["service"]
+            or any(
+                (state.get("controller") or {}).get(k) != v for k, v in self.original["controller"].items()
+            )
+            or self.client.device != self.original["controller"]["device_id"]
+            or self.client.generation != self.original["controller"]["controller_generation"]
+            or live.get("workspace") != self.original["workspace"]
+            or live.get("reference") != self.original["reference"]
+        ):
+            raise RuntimeError("original run ownership/reference/workspace/Live/deadline changed")
+        count = run.get("recovery_episodes")
+        if type(count) is not int or not self.episodes <= count <= 3:
+            raise RuntimeError("original native recovery episode budget changed/exhausted")
+        if (
+            run.get("uncertain") is not False
+            or evidence.get("fault")
+            or run.get("native_first_cause")
+            or run.get("status") in {"stopped", "faulted", "interrupted", "completed", "finishing"}
+        ):
+            raise RuntimeError(
+                "current native recovery unsafe: "
+                + str(evidence.get("fault") or run.get("native_first_cause") or run.get("status"))
+            )
+        if history and not self.history_qualified(state):
+            raise RuntimeError("native recovery history has not qualified")
+        if history and run.get("status") == "recovering":
+            raise RuntimeError("native recovery must qualify before explicit Resume")
+
+    async def resume(
+        self, *, wall_deadline=None, require_episode=False, refusal_identity=None, expected_pause=None
+    ):
+        # This is the existing authenticated owner read, not a WSS freshness
+        # guess. Anchor BEFORE the read so HTTP time cannot extend the ceiling.
+        requested = time.monotonic()
+        state = (
+            await asyncio.wait_for(
+                self.client.get("state"), None if wall_deadline is None else max(0, wall_deadline - requested)
+            )
+        )["snapshot"]
+        self.client.snapshot = state
+        self.record(
+            {
+                "event": "owner_rejoin_state",
+                "snapshot": state,
+                "request_started_at_monotonic_s": requested,
+                "response_observed_at_monotonic_s": time.monotonic(),
+            }
+        )
+        self.check(state, history=False)
+        recovered, local_ceiling, episode = False, wall_deadline, None
+        if state["run"]["status"] != "recovering" and (require_episode or expected_pause):
+            run = state["run"]
+            event = next(
+                (
+                    v
+                    for v in reversed(state.get("events", []))
+                    if v.get("run_id") == self.original["run"]["run_id"]
+                    and v.get("service_incarnation") == self.original["service"]
+                ),
+                {},
+            )
+            allowed = {"required_view_expired", "input_expired", "native_input_expired"}
+            if (
+                run["status"] != "paused"
+                or run.get("recovery") is not None
+                or not self.history_qualified(state)
+                or event.get("kind") not in allowed
+                or expected_pause is not None
+                and event.get("kind") != expected_pause
+                or require_episode
+                and (
+                    not refusal_identity
+                    or run["intent_revision"] != refusal_identity.get("intent_revision", -2) + 1
+                )
+                or self.pause_recoveries >= 3
+            ):
+                raise RuntimeError(
+                    "original native recovery descriptor/current cause-specific pause unavailable"
+                )
+            self.pause_recoveries += 1
+            self.record({"event": "cause_specific_hold", "cause": event["kind"], "snapshot": state})
+        if state["run"]["status"] == "recovering":
+            run = state["run"]
+            episode = run.get("recovery")
+            if (
+                not isinstance(episode, dict)
+                or set(episode) != {"started", "ceiling", "revision"}
+                or any(
+                    type(episode[k]) not in (int, float) or not math.isfinite(episode[k])
+                    for k in ("started", "ceiling")
+                )
+                or type(episode["revision"]) is not int
+                or episode["revision"] != run["intent_revision"]
+                or not episode["started"]
+                < episode["ceiling"]
+                <= min(episode["started"] + 10, run["deadline"])
+                or run["recovery_episodes"] != self.episodes + 1
+                or run.get("first_cause")
+                not in {"feedback_loss", "native_active_ack_loss", "required_proof_loss"}
+            ):
+                raise RuntimeError("original native recovery descriptor unavailable/invalid")
+            episode = dict(episode)
+            remaining = run.get("remaining_s")
+            if type(remaining) not in (int, float) or not math.isfinite(remaining):
+                raise RuntimeError("original native recovery clock unavailable")
+            pi_now = run["deadline"] - remaining
+            if not episode["started"] <= pi_now < episode["ceiling"]:
+                raise TimeoutError("original native recovery ceiling exhausted")
+            local_ceiling = min(
+                requested + episode["ceiling"] - pi_now,
+                wall_deadline if wall_deadline is not None else float("inf"),
+            )
+            cause, count, connection = run["first_cause"], run["recovery_episodes"], self.client.connection
+            self.record(
+                {
+                    "event": "native_recovery_wait",
+                    "original_recovery": episode,
+                    "snapshot": state,
+                    "local_ceiling_monotonic_s": local_ceiling,
+                }
+            )
+            while True:
+                self.check(state, history=False)
+                current, evidence, live = state["run"], state.get("evidence", {}), _live(state)
+                if (
+                    self.client.connection != connection
+                    or current.get("first_cause") != cause
+                    or current["recovery_episodes"] != count
+                ):
+                    raise RuntimeError("original native recovery ownership/episode changed")
+                if time.monotonic() >= local_ceiling:
+                    raise TimeoutError("original native recovery ceiling exhausted")
+                if current["status"] == "paused":
+                    event = next(
+                        (
+                            v
+                            for v in reversed(state.get("events", []))
+                            if v.get("run_id") == self.original["run"]["run_id"]
+                            and v.get("service_incarnation") == self.original["service"]
+                        ),
+                        {},
+                    )
+                    qualified_event = (
+                        event.get("kind") == "live_sensing_requalified"
+                        and type(event.get("at")) in (int, float)
+                        and episode["started"] <= event["at"] < episode["ceiling"]
+                    )
+                    revision = episode["revision"] + 1
+                    if (
+                        not qualified_event
+                        or current.get("recovery") is not None
+                        or current["intent_revision"] != revision
+                    ):
+                        raise RuntimeError("current native recovery qualification transition missing")
+                    ack = evidence.get("accepted_host_action") or {}
+                    if (
+                        all(
+                            evidence.get(k) is True
+                            for k in (
+                                "feedback",
+                                "required_observation",
+                                "hold_acknowledged",
+                                "pose_aligned",
+                                "native_ack",
+                            )
+                        )
+                        and evidence.get("acknowledged_intent_revision") == revision
+                        and ack.get("run_id") == self.original["run"]["run_id"]
+                        and ack.get("host_incarnation") == self.original["run"]["backend_incarnation"]
+                        and ack.get("intent_revision") == revision
+                        and ack.get("state") == "paused"
+                        and live.get("cursor_intent_revision") == revision
+                        and live.get("required_view", {}).get("qualified") is True
+                    ):
+                        self.episodes, self.cause, recovered = count, cause, True
+                        break
+                elif current["status"] != "recovering" or current.get("recovery") != episode:
+                    raise RuntimeError("original native recovery descriptor changed")
+                await asyncio.sleep(min(0.05, max(0, local_ceiling - time.monotonic())))
+                state = (
+                    await asyncio.wait_for(self.client.get("state"), max(0, local_ceiling - time.monotonic()))
+                )["snapshot"]
+                self.client.snapshot = state
+                self.record(
+                    {
+                        "event": "native_recovery_observed",
+                        "snapshot": state,
+                        "original_recovery": episode,
+                        "local_ceiling_monotonic_s": local_ceiling,
+                    }
+                )
+        self.check(state)  # A cleared descriptor alone never proves a closed episode.
+        timeout = None if local_ceiling is None else max(0, local_ceiling - time.monotonic())
+        await asyncio.wait_for(self.client.resume(check=self.check), timeout)
+        self.check(self.client.snapshot)
+        if recovered:
+            self.record(
+                {
+                    "event": "qualified_native_recovery",
+                    "original_recovery": episode,
+                    "snapshot": self.client.snapshot,
+                }
+            )
+        return recovered
 
 
 def native_frame_ack(snapshot, sequence, source, *, body_zero=False):
@@ -488,7 +752,23 @@ async def send_leader_sample(client, producer, body, record, *, phase, progress_
     """One original grant/acquisition/send. A refused sample is never resent."""
     identity = client.identities()
     grant_started = time.perf_counter()
-    grant = await client.command(dict(op="grant", **identity))
+    try:
+        grant = await client.command(dict(op="grant", **identity))
+    except CommandRefusedError as error:
+        error.operation = "grant"
+        error.identity = dict(identity)
+        record(
+            {
+                "event": "leader_grant_rejected",
+                "identity": identity,
+                "phase": phase,
+                "progress_s": progress_s,
+                "receipt": error.response,
+                "grant_timing": error.timing,
+                "grant_request_started_at_monotonic_s": grant_started,
+            }
+        )
+        raise
     received = time.perf_counter()
     frame = await asyncio.to_thread(producer.capture, grant, body=body, grant_received_at=received)
     frame = producer.serialize(frame)
@@ -549,6 +829,7 @@ async def run(args):
 
     client = None
     source = producer = workload = renewal = keyboard = None
+    frame_count, recovery = 0, None
     started = False
     owned_run_id = None
     first_error = None
@@ -657,10 +938,31 @@ async def run(args):
         producer = FrameProducer(source)
         producer.workspace = workspace
         producer.native_cursor = _live(client.snapshot)["cursor"]
-        await client.resume()
+        recovery = SameRunRecovery(client, record)
+        await recovery.resume()
         if workload and not args.next_start_seconds:
             workload.admit(time.monotonic())
-        active_at, interrupted, frame_count, recoveries = time.monotonic(), False, 0, 0
+        active_at, interrupted, frame_count = time.monotonic(), False, 0
+
+        def wall_deadline():
+            duration = args.next_start_seconds or (args.duration_seconds if workload is None else None)
+            return None if duration is None else active_at + duration
+
+        async def rejoin(*, require_episode=False, refusal_identity=None, expected_pause=None, until=None):
+            if workload:
+                workload.freeze()
+            recovered = await recovery.resume(
+                wall_deadline=until if until is not None else wall_deadline(),
+                require_episode=require_episode,
+                refusal_identity=refusal_identity,
+                expected_pause=expected_pause,
+            )
+            producer.native_cursor = _live(client.snapshot)["cursor"]
+            producer.reacquire = True
+            if workload and not args.next_start_seconds:
+                workload.admit(time.monotonic())
+            return recovered
+
         last_phase = None
         while True:
             if renewal.done():
@@ -668,6 +970,7 @@ async def run(args):
             state = client.snapshot
             if state["run"]["run_id"] != run_id or state["run"]["deadline"] != deadline:
                 raise RuntimeError("original run identity/deadline changed")
+            recovery.check(state, history=state["run"]["status"] != "recovering")
             wall_elapsed = time.monotonic() - active_at
             if (
                 args.next_start_seconds
@@ -677,6 +980,9 @@ async def run(args):
             ):
                 break
             if state["run"]["status"] != "running":
+                if state["run"]["status"] == "recovering":
+                    await rejoin(require_episode=True)
+                    continue
                 cause = next(
                     (
                         v.get("kind")
@@ -689,23 +995,17 @@ async def run(args):
                 if (
                     state["run"]["status"] != "paused"
                     or cause not in {"required_view_expired", "input_expired", "native_input_expired"}
-                    or state["run"].get("first_cause")
+                    or not recovery.history_qualified(state)
                     or state["run"].get("uncertain")
-                    or recoveries >= 3
+                    or recovery.pause_recoveries >= 3
                 ):
                     raise RuntimeError(
                         "input held: "
                         + str(state["run"].get("first_cause") or cause or _live(state).get("state"))
                     )
-                recoveries += 1
                 if workload:
                     workload.freeze()
-                record({"event": "cause_specific_hold", "cause": cause, "snapshot": state})
-                await client.resume()
-                producer.native_cursor = _live(client.snapshot)["cursor"]
-                producer.reacquire = True
-                if workload and not args.next_start_seconds:
-                    workload.admit(time.monotonic())
+                await rejoin(expected_pause=cause)
                 record({"event": "qualified_hold_recovery", "cause": cause, "snapshot": client.snapshot})
             if (
                 args.interrupt_at_seconds is not None
@@ -724,11 +1024,7 @@ async def run(args):
                 await client.attach()
                 await client.claim()
                 renewal = asyncio.create_task(client.renew())
-                await client.resume()
-                producer.native_cursor = _live(client.snapshot)["cursor"]
-                producer.reacquire = True
-                if not args.next_start_seconds:
-                    workload.admit(time.monotonic())
+                await rejoin()
                 record(
                     {
                         "event": "qualified_reattachment",
@@ -769,14 +1065,20 @@ async def run(args):
                 original_body = dict(body)
                 body.pop("lift_axis.height_mm")
                 record({"event": "body_velocity_precedence", "original": original_body, "sent": body})
-            sent = await send_leader_sample(
-                client,
-                producer,
-                body,
-                record,
-                phase=phase,
-                progress_s=workload.elapsed_s if workload else None,
-            )
+            try:
+                sent = await send_leader_sample(
+                    client,
+                    producer,
+                    body,
+                    record,
+                    phase=phase,
+                    progress_s=workload.elapsed_s if workload else None,
+                )
+            except CommandRefusedError as error:
+                if not recovery_grant_refusal(error):
+                    raise
+                await rejoin(require_episode=True, refusal_identity=error.identity)
+                continue
             if sent is None:
                 if workload:
                     workload.freeze()
@@ -825,24 +1127,30 @@ async def run(args):
             remaining = 2 - (time.monotonic() - qualification_at)
             if remaining <= 0:
                 raise RuntimeError("terminal current native body-zero feedback did not qualify")
+            attempt_budget = asyncio.timeout(remaining)
             try:
-                sent = await asyncio.wait_for(
-                    send_leader_sample(
+                async with attempt_budget:
+                    sent = await send_leader_sample(
                         client,
                         producer,
                         ZERO_BODY,
                         record,
                         phase="terminal_zero_qualification",
                         progress_s=workload.elapsed_s if workload else None,
-                    ),
-                    remaining,
-                )
+                    )
             except TimeoutError as error:
-                if time.monotonic() - qualification_at >= 2:
+                if attempt_budget.expired():
                     raise RuntimeError(
                         "terminal current native body-zero feedback did not qualify"
                     ) from error
                 raise
+            except CommandRefusedError as error:
+                if not recovery_grant_refusal(error):
+                    raise
+                await rejoin(
+                    require_episode=True, refusal_identity=error.identity, until=qualification_at + 2
+                )
+                continue
             if sent is None:
                 await asyncio.sleep(min(0.03, max(0, 2 - (time.monotonic() - qualification_at))))
                 continue
@@ -865,7 +1173,8 @@ async def run(args):
             final_native_ack=final,
             final_body_zero=True,
             interrupted=interrupted,
-            qualified_recoveries=recoveries,
+            qualified_recoveries=recovery.pause_recoveries,
+            qualified_native_recovery_episodes=recovery.episodes,
             terminal_qualification_seconds=time.monotonic() - qualification_at,
             endpoint_error_normalized={
                 k: final["evidence"]["measured_positions"][k] - frame["target"][k] for k in TELEOP_ARM_KEYS
@@ -878,6 +1187,15 @@ async def run(args):
         summary["last_raw_leaders"] = getattr(source, "last_raw", None)
         if workload:
             workload.freeze()
+            summary.update(
+                active_progress_s=workload.elapsed_s, phases_completed=sorted(workload.phases_completed)
+            )
+        summary["frame_count"] = frame_count
+        if recovery:
+            summary.update(
+                qualified_native_recovery_episodes=recovery.episodes,
+                qualified_recoveries=recovery.pause_recoveries,
+            )
     finally:
 
         async def cleanup_step(name, operation, timeout):
