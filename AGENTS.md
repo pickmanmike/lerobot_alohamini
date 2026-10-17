@@ -29,20 +29,24 @@ required local observation/diagnostic evidence. Decoded progress/source age and
 camera generations remain distinct from control health. Keep media/routine logs
 outside motor polling; optional output cannot consume unrelated recovery budgets.
 
-Installed motor 168915d04a9345e5b064a3d23142999f5c96b8e1,
+Installed motor 2c5b12be35567d4e942a557e8add4793f38c3755,
 runtime 68118e4e9dddf8dddaa3ea6cbf64f54fdd511980,
 camera bc3442b54d9c574a8feddb0ade642c9b351e59f9,
-manifest 7964ad0623af7589b944ec3cbe2975ee2a86050a265c833769ea99979875416d.
+manifest c7e1e65609fb0b45007dc35a7c6ba41160b2231c9aadc459c74cee67fe8c8983.
 Helper/manual 0fe3997f and original calibration/private trust remain unchanged.
-Full matched rollback: same motor/camera, runtime 7447480924c288fed3a76fc981433b41c7bfcefe,
-manifest 01d2bed7c629d3416354ab31556ae998a270b9220bb09c31d8b30369332982df.
+Full matched rollback: motor168915d04a9345e5b064a3d23142999f5c96b8e1,
+same runtime/camera, manifest7964ad0623af7589b944ec3cbe2975ee2a86050a265c833769ea99979875416d.
 Stage10 verified actual owner runtime/src/client9315af5b import; nine native
 request-accounting cases passed. Combined11 reached Live/255 accepted frames and
 24.44 active PC seconds, then stopped on valid left-elbow temperature98 versus70.
 All originals/full history and certain cleanup remain retained; full program,
 planned gap/view switch and next Start remain unfinished. Later stopped reads32
 are a distinct condition, not disproof of98. Exact-TX/prior-health evidence checks
-passed139 tests; affected motor staging is pending.
+passed139 tests and all ten stage11 idle-only phases. Combined12 stopped before
+Live on post-home readiness: first reported+150 then stable814..815, while the
+existing fallback admits only exact first+100. Its original fault/cleanup remain;
+replace the brittle fingerprint using the existing homing envelope and retain
+all subsequent stationary, geometry, health and original deadline requirements.
 
 Tasks stay stopped for source edits and affected-component staging. Verify actual
 owner imports, preserve separate full matched rollback bundles, calibration and

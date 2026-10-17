@@ -507,8 +507,8 @@ def test_actual_post_home_payloads_replay_with_explicit_frozen_acquisition_prove
     transport.read_group = read
     record = qualify(monitor, origin=origin)
     proof = record["stationary_qualification"]
-    assert proof["readiness_policy"] == "am1-post-home-qualified-window-v4"
-    assert proof["readiness_policy_version"] == 4
+    assert proof["readiness_policy"] == "am1-post-home-initial-settling-window-v5"
+    assert proof["readiness_policy_version"] == 5
     assert proof["readiness_branch"] == branch
     assert proof["am1_post_home_origin_raw"] == origin
     assert proof["stationary_acquisition_origin_raw"] == (815 if trial == "02" else 814)
@@ -527,11 +527,14 @@ def test_actual_post_home_payloads_replay_with_explicit_frozen_acquisition_prove
         assert proof["sample_count"] == 5
 
 
-@pytest.mark.parametrize("prefix", [[(813,150,1)], [(813,500,1)], [(813,-100,1)], [(813,100,1),(813,100,1)]])
+@pytest.mark.parametrize(
+    "prefix", [[(813, 201, 1)], [(813, 500, 1)], [(813, -100, 1)], [(813, 100, 1), (813, 100, 1)]]
+)
 def test_new_fallback_never_admits_unproven_prequiet_speed_or_repeated_settling(prefix):
-    rows = prefix + [(814,0,0),(815,50,1),(814,0,0),(815,-50,1)] * 8
+    rows = prefix + [(814, 0, 0), (815, 50, 1), (814, 0, 0), (815, -50, 1)] * 8
     monitor, clock, _, _ = comparison(rows)
-    with pytest.raises(feedback.ComparisonRefusal):qualify(monitor, origin=813)
+    with pytest.raises(feedback.ComparisonRefusal):
+        qualify(monitor, origin=813)
     assert clock.now <= 1
 
 
@@ -684,8 +687,8 @@ def test_simulated07_continuation_waits_for_original_deadline_with_frozen_band()
     assert clock.now == pytest.approx(1.0) and transport.read_count == 20
     assert proof['readiness_branch']=='bounded_indicator'
     assert proof['motion_feedback_quiet'] is False
-    assert proof['readiness_policy']=='am1-post-home-qualified-window-v4'
-    assert proof['readiness_policy_version']==4
+    assert proof['readiness_policy']=='am1-post-home-initial-settling-window-v5'
+    assert proof['readiness_policy_version']==5
     assert proof['am1_post_home_origin_raw']==812
     assert proof['stationary_acquisition_origin_raw']==815
     assert proof['stationary_acquisition_sample_index']==2
@@ -778,3 +781,283 @@ def test_former_three_moving_prefix_never_qualifies_without_stationary_tail():
     with pytest.raises(feedback.ComparisonRefusal, match='stationary'):
         qualify(monitor, origin=813)
     assert clock.now == pytest.approx(1.0) and transport.read_count == 20
+
+
+# Original full reply payloads/times, rebased only onto the explicit simulated clock.
+# Combined11 host SHA176770928f2337a19bebfb110d4bd2c5dad81c9ceaa8659031d82eb7c247a319.
+# Combined12 host SHA79b564377826687e9345c0a0b665441526bb4f57146b2eecdde71128c5fbb8ce.
+ACTUAL_11_12_POST_HOME = {
+    "11": (
+        (
+            102177.401516198,
+            0.0017413280002074316,
+            "0114c8500ac8c801fe000000000000e8030000000000012c0364006705722500000100003900",
+        ),
+        (
+            102177.453572837,
+            0.0018356229993514717,
+            "0114c8500ac8c801fe000000000000e8030000000000012e0300005905722500000000003900",
+        ),
+        (
+            102177.505545033,
+            0.0016443649947177619,
+            "0114c8500ac8c801fe000000000000e8030000000000012f0332005805722500000100003e00",
+        ),
+        (
+            102177.557602246,
+            0.0017595489916857332,
+            "0114c8500ac8c801fe000000000000e8030000000000012f0332805905722500000100003d00",
+        ),
+        (
+            102177.609557886,
+            0.0016235310031333938,
+            "0114c8500ac8c801fe000000000000e8030000000000012f0300005505722500000000003400",
+        ),
+        (
+            102177.661597397,
+            0.001758864993462339,
+            "0114c8500ac8c801fe000000000000e8030000000000012f0332805a05722500000100003600",
+        ),
+        (
+            102177.713561462,
+            0.0016722719883546233,
+            "0114c8500ac8c801fe000000000000e8030000000000012f0300005505722500000000003900",
+        ),
+        (
+            102177.766021508,
+            0.0021629930124618113,
+            "0114c8500ac8c801fe000000000000e8030000000000012f0300005505722500000000003700",
+        ),
+        (
+            102177.818572998,
+            0.0014322550123324618,
+            "0114c8500ac8c801fe000000000000e8030000000000012e0332805a05722500000100003700",
+        ),
+        (
+            102177.870608915,
+            0.0017348830006085336,
+            "0114c8500ac8c801fe000000000000e8030000000000012e0300005505722500000000003800",
+        ),
+        (
+            102177.922571741,
+            0.0016834940033731982,
+            "0114c8500ac8c801fe000000000000e8030000000000012f0332005805722500000100003600",
+        ),
+        (
+            102177.974640102,
+            0.0017863459943328053,
+            "0114c8500ac8c801fe000000000000e8030000000000012f0332805905722500000100003700",
+        ),
+        (
+            102178.026589446,
+            0.0016523090016562492,
+            "0114c8500ac8c801fe000000000000e8030000000000012f0332005705722500000100003a00",
+        ),
+        (
+            102178.078600771,
+            0.0017184390017064288,
+            "0114c8500ac8c801fe000000000000e8030000000000012e0300005505722500000000003b00",
+        ),
+        (
+            102178.130651466,
+            0.0017414379981346428,
+            "0114c8500ac8c801fe000000000000e8030000000000012e0332005605722500000100003400",
+        ),
+        (
+            102178.18258544,
+            0.0016464939981233329,
+            "0114c8500ac8c801fe000000000000e8030000000000012e0300005505722500000000003c00",
+        ),
+        (
+            102178.234578394,
+            0.0017011980089591816,
+            "0114c8500ac8c801fe000000000000e8030000000000012f0300005505722500000000003500",
+        ),
+        (
+            102178.286592108,
+            0.0017386609979439527,
+            "0114c8500ac8c801fe000000000000e8030000000000012f0332005605722400000100003b00",
+        ),
+        (
+            102178.338636211,
+            0.0017674380069365725,
+            "0114c8500ac8c801fe000000000000e8030000000000012e0332805705722500000100003b00",
+        ),
+        (
+            102178.390883628,
+            0.0019510120037011802,
+            "0114c8500ac8c801fe000000000000e8030000000000012e0332805905722500000100003400",
+        ),
+    ),
+    "12": (
+        (
+            103321.641086659,
+            0.001719252992188558,
+            "0114c8500ac8c801fe000000000000e8030000000000012c0396006805722500000100003c00",
+        ),
+        (
+            103321.696161501,
+            0.0017790120036806911,
+            "0114c8500ac8c801fe000000000000e8030000000000012e0300005d05722500000000003f00",
+        ),
+        (
+            103321.748099632,
+            0.0016741050058044493,
+            "0114c8500ac8c801fe000000000000e8030000000000012e0300005d05722500000000003900",
+        ),
+        (
+            103321.800105152,
+            0.0017366420070175081,
+            "0114c8500ac8c801fe000000000000e8030000000000012f0332805c05722500000100003900",
+        ),
+        (
+            103321.85209906,
+            0.0017401049990439788,
+            "0114c8500ac8c801fe000000000000e8030000000000012f0300005d05712500000000003e00",
+        ),
+        (
+            103321.904099172,
+            0.001751179006532766,
+            "0114c8500ac8c801fe000000000000e8030000000000012e0332005805722500000100003b00",
+        ),
+        (
+            103321.956109543,
+            0.0017584749875823036,
+            "0114c8500ac8c801fe000000000000e8030000000000012f0300005905722500000000003d00",
+        ),
+        (
+            103322.008123211,
+            0.0017414559988537803,
+            "0114c8500ac8c801fe000000000000e8030000000000012f0332005b05722500000100003e00",
+        ),
+        (
+            103322.06010686,
+            0.0016716790123609826,
+            "0114c8500ac8c801fe000000000000e8030000000000012e0300005d05722500000000003700",
+        ),
+        (
+            103322.112126527,
+            0.0017798449989641085,
+            "0114c8500ac8c801fe000000000000e8030000000000012e0332005a05722500000100003a00",
+        ),
+        (
+            103322.164116269,
+            0.0017261789907934144,
+            "0114c8500ac8c801fe000000000000e8030000000000012e0332005805722500000100003500",
+        ),
+        (
+            103322.216117622,
+            0.0017557899991516024,
+            "0114c8500ac8c801fe000000000000e8030000000000012f0300005905722500000000003900",
+        ),
+        (
+            103322.268121123,
+            0.0017534009966766462,
+            "0114c8500ac8c801fe000000000000e8030000000000012f0300005d05722500000000003600",
+        ),
+        (
+            103322.320120216,
+            0.0017497719964012504,
+            "0114c8500ac8c801fe000000000000e8030000000000012e0332005805722500000100003b00",
+        ),
+        (
+            103322.372123495,
+            0.0017729570099618286,
+            "0114c8500ac8c801fe000000000000e8030000000000012e0300005d05722500000000003a00",
+        ),
+        (
+            103322.424125774,
+            0.0017566790047567338,
+            "0114c8500ac8c801fe000000000000e8030000000000012f0332005b05722500000100003c00",
+        ),
+        (
+            103322.476158052,
+            0.0017760310001904145,
+            "0114c8500ac8c801fe000000000000e8030000000000012f0300005905722500000000003600",
+        ),
+        (
+            103322.528132887,
+            0.0017086050065699965,
+            "0114c8500ac8c801fe000000000000e8030000000000012e0332005a05722500000100003b00",
+        ),
+        (
+            103322.580132832,
+            0.0017551420023664832,
+            "0114c8500ac8c801fe000000000000e8030000000000012e0300005d05722500000000003a00",
+        ),
+        (
+            103322.632137185,
+            0.0017572899960214272,
+            "0114c8500ac8c801fe000000000000e8030000000000012f0300005905722500000000003300",
+        ),
+    ),
+}
+
+
+@pytest.mark.parametrize("trial", ["11", "12"])
+def test_actual11_and12_initial_settling_replay_keeps_original_zero_and_deadline(trial):
+    samples = ACTUAL_11_12_POST_HOME[trial]
+    monitor, clock, transport, _ = comparison([(812, 0, 0)])
+    first_start = samples[0][0] - samples[0][1]
+    original_sleep = clock.sleep
+
+    def scheduled_sleep(seconds):
+        if 0.04 <= seconds <= feedback.POLL_S and transport.read_count < len(samples):
+            stamp, duration, _ = samples[transport.read_count]
+            clock.now = stamp - duration - first_start
+        else:
+            original_sleep(seconds)
+
+    def original_reply(start, length, **kwargs):
+        assert (start, length, kwargs["timeout_ms"]) == (33, 38, 40)
+        stamp, _, payload = samples[transport.read_count]
+        transport.read_count += 1
+        clock.now = stamp - first_start
+        transport.arrivals.append(clock.now)
+        return bytes.fromhex(payload), {
+            "response_payload_bytes": list(bytes.fromhex(payload)),
+            "checksum_ok": True,
+        }
+
+    monitor.sleep, transport.read_group = scheduled_sleep, original_reply
+    proof = qualify(monitor, origin=812)["stationary_qualification"]
+    assert proof["readiness_branch"] == "bounded_indicator" and proof["motion_feedback_quiet"] is False
+    assert proof["am1_post_home_origin_raw"] == 812 and proof["position_origin_raw"] == 814
+    assert proof["first_reported_velocity_raw"] == (100 if trial == "11" else 150)
+    assert proof["initial_settling_velocity_bound_raw"] == 200
+    assert proof["initial_settling_exception_used"] is True
+    assert proof["candidate_qualified_sample_index"] == 6 and proof["candidate_reset_count"] == 0
+    assert proof["position_excursion_raw"] == 1 and proof["sample_count"] == 19
+    assert clock.now == pytest.approx(1) and transport.read_count == 20
+    assert all(stamp < 1 for stamp in transport.arrivals)
+
+
+@pytest.mark.parametrize("first", [50, 100, 150, 200])
+def test_first_positive_settling_uses_existing_normal_home_envelope_only(first):
+    tail = [(814, 0, 0), (815, 50, 1), (814, 0, 0), (815, -50, 1)] * 5
+    monitor, clock, transport, _ = comparison([(812, first, 1), *tail])
+    proof = qualify(monitor, origin=812)["stationary_qualification"]
+    assert proof["first_reported_velocity_raw"] == first
+    assert proof["initial_settling_velocity_bound_raw"] == 200
+    assert proof["initial_settling_exception_used"] is (first > 50)
+    assert proof["whole_phase_max_abs_velocity_raw"] == first
+    assert proof["readiness_branch"] == "bounded_indicator" and proof["motion_feedback_quiet"] is False
+    assert clock.now == pytest.approx(1) and transport.read_count == 20
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        [(812, 201, 1)],
+        [(812, -150, 1)],
+        [(812, 0, 0), (814, 150, 1)],
+        [(812, 100, 1), (814, 100, 1)],
+    ],
+)
+def test_initial_settling_exception_cannot_admit_excess_reverse_or_later_speed(prefix):
+    tail = [(814, 0, 0), (815, 50, 1), (814, 0, 0), (815, -50, 1)] * 5
+    monitor, clock, _, emitted = comparison([*prefix, *tail])
+    with pytest.raises(feedback.ComparisonRefusal):
+        qualify(monitor, origin=812)
+    assert clock.now <= 1
+    assert not any(row["phase"] == "post_home_stationary_qualified" for row in emitted)
