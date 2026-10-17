@@ -16,13 +16,13 @@ PR [#25](https://github.com/pickmanmike/lerobot_alohamini/pull/25), branch `code
 
 | Component | Recorded installed identity |
 | --- | --- |
-| Motor | `6328bb524bc4e42c70f9896d66904177c1830277` |
+| Motor | `5302594d15a70ba1873eb2bd5ea2c9f02bc6e1d8` |
 | Runtime | `68118e4e9dddf8dddaa3ea6cbf64f54fdd511980` |
 | Camera | `bc3442b54d9c574a8feddb0ade642c9b351e59f9` |
 | Helper/manual | `0fe3997f12b9cdfdd01fda6f4c6b102781252448` |
-| Manifest | `de681ad6f73f2639a1971b96eee41214b5edfdc1730082e7f77b78a3c6795dbb` |
+| Manifest | `1190ea195ea24906abbd16f5bd8d4a5f7aa7b73313d56b7364f73af5bb9c3ea6` |
 
-Immediate full matched rollback: motor `2fbc8265b15393dcc799e603223b8902844e2919`, same runtime/camera/helper, manifest `1d64de8e1e2f05938a39fae7a67a9a3ff3b19f94ae456f311116c41e52bbbd57`. Exact private bundle/staging pointers remain in `.cache/am1-teleop-consolidation-16/current-state-16-published.private.md`. Published source, tested source and actual service imports are separate facts; check interpreter/cwd/import roots before a consequential change is credited as installed.
+Immediate full matched predecessor: motor `6328bb524bc4e42c70f9896d66904177c1830277`, same runtime/camera/helper, manifest `de681ad6f73f2639a1971b96eee41214b5edfdc1730082e7f77b78a3c6795dbb`; older full rollback retained. Current cleanup uncertainty must be reconciled before ordinary staging or rollback. Exact private bundle/staging pointers remain in `.cache/am1-teleop-consolidation-16/current-state-16-published.private.md`. Published source, tested source and actual service imports are separate facts; check interpreter/cwd/import roots before a consequential change is credited as installed.
 
 ## Carry-forward decisions
 
@@ -35,6 +35,6 @@ Immediate full matched rollback: motor `2fbc8265b15393dcc799e603223b8902844e2919
 
 Later bounded AM1 packets supersede the stale August software/assembly/permission snapshots. The explicitly invoked reliability work permits finite scripted/virtual arm input, automated normal owned body controls, existing advisory P1 and qualified same-session recovery without generic attendance/readiness/manual-leader requests. Preserve existing motor/feedback/thermal/status protections, ownership, exact separate pins, private permissions, calibration and mappings. Physical leader movement and independent cutoff work remain outside that packet; no powered freeze, induced bus fault, overload or permission bypass is authorized.
 
-Packet18 supersedes proposed diagnostic-first Packet17; do not assume it executed. Packet15 wrist expansion remains superseded by Packet16. The narrow parity correction passed 385 affected checks, scoped Ruff and independent review; staging and combined-operation results remain pending in [current state](current-state.md). The checkpoint's new follower guards reject single numeric highs despite the retained lift confirmation policy; restore accepted behavior with explicit role scope and offline positive/fault contrasts rather than restarting spike-causation research.
+Packet18 supersedes proposed diagnostic-first Packet17; do not assume it executed. Packet15 wrist expansion remains superseded by Packet16. Shared follower thermal confirmation was reviewed and staged after 385 focused checks. Combined16 then failed before Live on a cool stale window, with no program progress. The original refusal remains valid; due-sampling hooks across startup configuration/calibration passed 455 affected checks, and a narrow stopped-reconciliation correction passed 135 checks/one existing Windows skip. Both follow-up repairs still need actual affected staging/qualification. Follow [current state](current-state.md) for source and deployment changes.
 
-Combined15 remains a failed partial run with verified cleanup; full 172.5-active-second program, planned input gap, selected-view switch and brief next Start remain unqualified. Once the narrow correction is reviewed and staged under the existing stopped-owner process, return to that original Packet16 combined workload under its fixed 300-second ceiling. Physical USB identity/stationary sampling and a short human leader movement remain separate later evidence; virtual results do not establish them.
+Combined15 remains a failed partial run with verified cleanup; Combined16's 20 off/zero reads and camera release are verified but lift qualification is unavailable, so Core correctly retains cleanup uncertainty. The next action is supported fresh stopped reconciliation, reviewed staging, then the original 172.5-active-second/300-second-ceiling combined workload, planned input gap, selected-view switch and brief next Start. Physical USB identity/stationary sampling and human leader ergonomics remain distinct later evidence.
