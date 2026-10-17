@@ -16,6 +16,7 @@ from pathlib import Path
 MARKERS = ("cleanup-uncertain.json", "physical-in-progress.json")
 CACHE_S = 5.0
 INCOMPLETE_PREACTIVATION_ORIGIN = "preactivation-lift-unqualified"
+PREHOME_COOL_STALE_ORIGIN = "prehome-cool-thermal-stale-lift-unqualified"
 
 
 def canonical(value):
@@ -80,6 +81,145 @@ def expected_readbacks():
     return rows
 
 
+def _original_origin_note(chain, prefix):
+    notes = []
+    for entry in chain:
+        values = entry.get("notes")
+        require(
+            isinstance(values, list) and all(type(value) is str for value in values),
+            "complete original prehome error notes required",
+        )
+        notes.extend(value for value in values if value.startswith(prefix))
+    require(len(notes) == 1 and len(notes[0]) <= 16384, "one bounded original prehome note required")
+    value = _json(notes[0][len(prefix) :])
+    require(isinstance(value, dict), "original prehome note object required")
+    return value
+
+
+def _validate_prehome_cool_stale_origin(run, receipt, chain):
+    """Recognize only retained cool, stale pre-home evidence; never qualify the lift."""
+    require(
+        isinstance(chain, list)
+        and len(chain) == 2
+        and all(isinstance(entry, dict) for entry in chain)
+        and chain[0].get("cause") == "RuntimeError: AlohaMini motor activation failed."
+        and chain[1].get("cause") == receipt["first_cause"],
+        "original prehome activation wrapper and complete error chain required",
+    )
+    fault = _original_origin_note(chain, "[AM1 TELEOP FAULT] ")
+    rest = _original_origin_note(chain, "Original normal-rest acquisition: ")
+    binding = {
+        "recipe": "physical-live-teleop",
+        "run_id": run["run_id"],
+        "host_incarnation": receipt["host_incarnation"],
+    }
+    require(
+        run.get("recipe") == "physical-live-teleop"
+        and rest.get("binding") == binding
+        and fault.get("binding") == binding
+        and rest.get("phase") == "before_home"
+        and rest.get("qualified") is False
+        and rest.get("samples") == []
+        and rest.get("first_cause") == receipt["first_cause"],
+        "original same-run before-home refusal without acquisition or homing required",
+    )
+    side, motor = fault.get("side"), fault.get("offending_motor")
+    joints = ("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper")
+    names = ["arm_" + str(side) + "_" + joint for joint in joints]
+    suffix = "; temperature: five-slot feedback window is stale (>0.5 s)."
+    require(
+        side in ("left", "right")
+        and motor in names
+        and fault.get("register") == "Present_Temperature"
+        and fault.get("reason") == "actual configured temperature limit: " + motor + suffix
+        and receipt["first_cause"] == "RuntimeError: AM1 teleop " + fault["reason"],
+        "only exact mapped-arm cool thermal-window stale cause may use this origin",
+    )
+    comparison = fault.get("comparison") or {}
+    thermal = comparison.get("temperature") or {}
+    configured = (comparison.get("configured") or {}).get("Max_Temperature_Limit") or {}
+    ceiling, raw = configured.get("value"), fault.get("raw")
+    require(
+        type(ceiling) is int
+        and 0 < ceiling <= 100
+        and thermal.get("ceiling_c") == ceiling
+        and type(thermal.get("ceiling_c")) is int
+        and comparison.get("units") == "raw_register"
+        and comparison.get("lower_inclusive") == 0
+        and comparison.get("upper_exclusive") == ceiling
+        and thermal.get("high_count") == 0
+        and thermal.get("numeric_outlier_count") == 0
+        and thermal.get("first_cause") == suffix.removeprefix("; ")
+        and isinstance(raw, dict)
+        and set(raw) == set(names)
+        and all(type(value) is int and 0 <= value < ceiling for value in raw.values())
+        and type(fault.get("offending_value")) is int
+        and fault["offending_value"] == raw[motor],
+        "original configured cool values without high votes or outliers required",
+    )
+    started, completed = fault.get("read_started_at_monotonic_s"), fault.get("read_completed_at_monotonic_s")
+    slots = thermal.get("samples")
+    require(
+        number(started)
+        and number(completed)
+        and 0 <= started <= completed
+        and number(rest.get("started_at"))
+        and rest["started_at"] <= started
+        and completed <= receipt["readback"]["started_at_monotonic_s"]
+        and isinstance(slots, list)
+        and len(slots) == 5
+        and all(
+            isinstance(row, list)
+            and len(row) == 2
+            and number(row[0])
+            and 0 <= row[0] <= completed
+            and type(row[1]) is int
+            and 0 <= row[1] < ceiling
+            for row in slots
+        ),
+        "original timed cool five-slot stale evidence required",
+    )
+    times = [row[0] for row in slots]
+    require(
+        all(a < b for a, b in zip(times, times[1:], strict=False))
+        and len({(round(at * 1e9) - round(times[0] * 1e9)) // 100_000_000 for at in times}) == 5
+        and completed - times[0] > 0.5
+        and times[-1] == completed
+        and slots[-1][1] == raw[motor],
+        "original advancing occupied slots must demonstrate cool stale history",
+    )
+    group = fault.get("group_reply") or {}
+    request, packets = group.get("request") or {}, group.get("packets")
+    require(
+        group.get("binding") == binding
+        and request.get("binding") == binding
+        and request.get("side") == side
+        and request.get("address") == 63
+        and request.get("width") == 1
+        and request.get("ids") == [1, 2, 3, 4, 5, 6]
+        and request.get("motors") == names
+        and request.get("register") == "Present_Temperature"
+        and group.get("comm_result") == 0
+        and isinstance(packets, list)
+        and len(packets) == 6,
+        "original exact one-byte six-motor temperature group required",
+    )
+    for ident, name, record in zip(range(1, 7), names, packets, strict=True):
+        require(isinstance(record, dict), "original temperature packet record required")
+        packet = record.get("packet")
+        require(
+            record.get("comm_result") == 0
+            and record.get("device_error") == 0
+            and isinstance(packet, list)
+            and len(packet) == 7
+            and all(type(value) is int and 0 <= value <= 255 for value in packet)
+            and packet[:5] == [255, 255, ident, 3, 0]
+            and packet[5] == raw[name]
+            and sum(packet[2:]) & 255 == 255,
+            "original checksum-valid cool temperature replies without device errors required",
+        )
+
+
 def validate_cleanup_origin(run, proof, receipt):
     """Qualify an explicit incomplete origin without promoting its old lift proof."""
     origin = proof.get("original_cleanup_origin")
@@ -89,45 +229,68 @@ def validate_cleanup_origin(run, proof, receipt):
             "literal unchanged original unknown cleanup receipt required",
         )
         return False
-    require(origin == INCOMPLETE_PREACTIVATION_ORIGIN, "unsupported original cleanup origin")
+    require(
+        origin in (INCOMPLETE_PREACTIVATION_ORIGIN, PREHOME_COOL_STALE_ORIGIN),
+        "unsupported original cleanup origin",
+    )
     lifecycle, rb = run.get("physical_result") or {}, receipt.get("readback") or {}
     require(
-        run.get("status") == "faulted" and run.get("uncertain") is True
-        and "native_live_at" in run and run["native_live_at"] is None
-        and number(run.get("progress_s")) and run["progress_s"] == 0
-        and lifecycle.get("phase") == "terminal" and lifecycle.get("uncertain") is True
+        run.get("status") == "faulted"
+        and run.get("uncertain") is True
+        and "native_live_at" in run
+        and run["native_live_at"] is None
+        and number(run.get("progress_s"))
+        and run["progress_s"] == 0
+        and lifecycle.get("phase") == "terminal"
+        and lifecycle.get("uncertain") is True
         and lifecycle.get("cleanup") == "physical_cleanup_unknown"
-        and "native_live_at" in lifecycle and lifecycle["native_live_at"] is None
+        and "native_live_at" in lifecycle
+        and lifecycle["native_live_at"] is None
         and lifecycle.get("readback") == receipt,
         "exact uncertain preactivation terminal origin required",
     )
     require(
-        type(receipt.get("version")) is int and receipt["version"] == 1
+        type(receipt.get("version")) is int
+        and receipt["version"] == 1
         and receipt.get("run_id") == run.get("run_id")
-        and receipt.get("host_incarnation") == lifecycle.get("backend_incarnation") == proof.get("host_incarnation")
+        and receipt.get("host_incarnation")
+        == lifecycle.get("backend_incarnation")
+        == proof.get("host_incarnation")
         and receipt.get("first_cause") == run.get("native_first_cause") == proof.get("original_first_cause")
-        and isinstance(receipt.get("first_cause"), str) and bool(receipt["first_cause"])
+        and isinstance(receipt.get("first_cause"), str)
+        and bool(receipt["first_cause"])
         and receipt.get("provenance") == "protected-host/actual-motor-readback"
-        and receipt.get("cleanup") == "physical_readback_verified" and receipt.get("uncertain") is False
-        and receipt.get("cleanup_errors") == [] and receipt.get("expected_stop") is None
-        and rb.get("verified") is True and rb.get("buses_closed") is True
+        and receipt.get("cleanup") == "physical_readback_verified"
+        and receipt.get("uncertain") is False
+        and receipt.get("cleanup_errors") == []
+        and receipt.get("expected_stop") is None
+        and rb.get("verified") is True
+        and rb.get("buses_closed") is True
         and rb.get("lift_readback") == "unavailable-or-failed"
-        and rb.get("cleanup_errors") == [] and rb.get("selected_gain_restore_required") is False,
+        and rb.get("cleanup_errors") == []
+        and rb.get("selected_gain_restore_required") is False,
         "only incomplete lift proof with otherwise actual known off cleanup may use this origin",
     )
     chain = receipt.get("first_error_chain")
-    require(
-        receipt["first_cause"].startswith("RuntimeError: AM1 arm activation refused: ")
-        and isinstance(chain, list) and len(chain) == 2
-        and chain[0].get("cause") == "RuntimeError: AlohaMini motor activation failed."
-        and chain[1].get("cause") == receipt["first_cause"],
-        "original preactivation arm-guard cause and complete error chain required",
-    )
+    if origin == PREHOME_COOL_STALE_ORIGIN:
+        _validate_prehome_cool_stale_origin(run, receipt, chain)
+    else:
+        require(
+            receipt["first_cause"].startswith("RuntimeError: AM1 arm activation refused: ")
+            and isinstance(chain, list)
+            and len(chain) == 2
+            and chain[0].get("cause") == "RuntimeError: AlohaMini motor activation failed."
+            and chain[1].get("cause") == receipt["first_cause"],
+            "original preactivation arm-guard cause and complete error chain required",
+        )
     started, completed = rb.get("started_at_monotonic_s"), rb.get("completed_at_monotonic_s")
     rows = rb.get("readbacks")
     require(
-        number(started) and number(completed) and 0 <= started <= completed
-        and isinstance(rows, list) and len(rows) == 20
+        number(started)
+        and number(completed)
+        and 0 <= started <= completed
+        and isinstance(rows, list)
+        and len(rows) == 20
         and {(r.get("bus"), r.get("motor"), r.get("register")) for r in rows} == expected_readbacks(),
         "original twenty distinct timed zero/off readbacks required",
     )
@@ -740,7 +903,8 @@ def load_qualified_proof(config, run):
     )
     markers = proof.get("original_markers")
     require(
-        isinstance(markers, dict) and set(markers) == set(MARKERS)
+        isinstance(markers, dict)
+        and set(markers) == set(MARKERS)
         and (incomplete_origin or markers[MARKERS[0]] is not None),
         "exact original unknown marker inventory required",
     )
@@ -853,7 +1017,7 @@ def archive_and_ack(config, proof, raw, originals, operation_id):
         if data is not None and (state / name).exists():
             require(_private_bytes(state / name) == data, "marker changed during guarded ACK")
             (state / name).unlink()
-    if proof.get("original_cleanup_origin") == INCOMPLETE_PREACTIVATION_ORIGIN:
+    if proof.get("original_cleanup_origin") in (INCOMPLETE_PREACTIVATION_ORIGIN, PREHOME_COOL_STALE_ORIGIN):
         require(
             originals == dict.fromkeys(MARKERS)
             and all(not (state / name).exists() and not (state / name).is_symlink() for name in MARKERS),

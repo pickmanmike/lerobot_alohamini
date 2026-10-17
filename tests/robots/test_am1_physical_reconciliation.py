@@ -825,18 +825,35 @@ def incomplete_preactivation_fixture(tmp_path, monkeypatch):
         "is outside verified calibration limits 848..3223."
     )
     proof["original_first_cause"] = run["native_first_cause"]
-    run["physical_result"].update(phase="terminal", run_id=run["run_id"], native_live_at=None,
-                                  cleanup="physical_cleanup_unknown", uncertain=True)
-    old = run["physical_result"]["readback"]
-    old.update(cleanup="physical_readback_verified", uncertain=False, cleanup_errors=[],
-               provenance="protected-host/actual-motor-readback", first_cause=run["native_first_cause"],
-               first_error_chain=[{"cause": "RuntimeError: AlohaMini motor activation failed.", "notes": []},
-                                  {"cause": run["native_first_cause"], "notes": []}])
-    old["readback"] = dict(
-        verified=True, buses_closed=True, lift_readback="unavailable-or-failed",
-        selected_gain_restore_required=False, cleanup_errors=[], started_at_monotonic_s=99.0,
-        completed_at_monotonic_s=99.5, readbacks=copy.deepcopy(proof["readback"]["readbacks"]),
+    run["physical_result"].update(
+        phase="terminal",
+        run_id=run["run_id"],
+        native_live_at=None,
+        cleanup="physical_cleanup_unknown",
+        uncertain=True,
     )
+    old = run["physical_result"]["readback"]
+    old.update(
+        cleanup="physical_readback_verified",
+        uncertain=False,
+        cleanup_errors=[],
+        provenance="protected-host/actual-motor-readback",
+        first_cause=run["native_first_cause"],
+        first_error_chain=[
+            {"cause": "RuntimeError: AlohaMini motor activation failed.", "notes": []},
+            {"cause": run["native_first_cause"], "notes": []},
+        ],
+    )
+    old["readback"] = {
+        "verified": True,
+        "buses_closed": True,
+        "lift_readback": "unavailable-or-failed",
+        "selected_gain_restore_required": False,
+        "cleanup_errors": [],
+        "started_at_monotonic_s": 99.0,
+        "completed_at_monotonic_s": 99.5,
+        "readbacks": copy.deepcopy(proof["readback"]["readbacks"]),
+    }
     proof["original_cleanup_origin"] = "preactivation-lift-unqualified"
     proof["original_markers"] = dict.fromkeys(m.MARKERS)
     (state / "cleanup-uncertain.json").unlink()
@@ -854,7 +871,9 @@ def publish_incomplete_fixture(config, run, proof, state):
     return raw
 
 
-def test_incomplete_preactivation_lift_origin_still_requires_fresh_proof_and_durable_ack(tmp_path, monkeypatch):
+def test_incomplete_preactivation_lift_origin_still_requires_fresh_proof_and_durable_ack(
+    tmp_path, monkeypatch
+):
     m, config, run, proof, state = incomplete_preactivation_fixture(tmp_path, monkeypatch)
     raw = publish_incomplete_fixture(config, run, proof, state)
     original_run = copy.deepcopy(run)
@@ -869,14 +888,40 @@ def test_incomplete_preactivation_lift_origin_still_requires_fresh_proof_and_dur
     assert m.load_qualified_proof(config, run)[2] == inventory
 
 
-@pytest.mark.parametrize("broken", [
-    "origin_missing", "origin_foreign", "live_started", "progress", "progress_boolean", "not_faulted",
-    "native_live_started", "host_uncertain", "host_unknown", "lift_qualified", "buses_open", "unverified",
-    "cleanup_error", "restore_pending", "nonzero", "boolean_zero", "missing_row", "duplicate_row", "late_row",
-    "marker_inventory", "marker_appeared", "native_cause", "unrelated_cause", "error_chain_missing",
-    "fresh_lift_missing", "fresh_thermal_stale",
-])
-def test_incomplete_lift_origin_cannot_promote_other_failures_or_weaken_stopped_proof(tmp_path, monkeypatch, broken):
+@pytest.mark.parametrize(
+    "broken",
+    [
+        "origin_missing",
+        "origin_foreign",
+        "live_started",
+        "progress",
+        "progress_boolean",
+        "not_faulted",
+        "native_live_started",
+        "host_uncertain",
+        "host_unknown",
+        "lift_qualified",
+        "buses_open",
+        "unverified",
+        "cleanup_error",
+        "restore_pending",
+        "nonzero",
+        "boolean_zero",
+        "missing_row",
+        "duplicate_row",
+        "late_row",
+        "marker_inventory",
+        "marker_appeared",
+        "native_cause",
+        "unrelated_cause",
+        "error_chain_missing",
+        "fresh_lift_missing",
+        "fresh_thermal_stale",
+    ],
+)
+def test_incomplete_lift_origin_cannot_promote_other_failures_or_weaken_stopped_proof(
+    tmp_path, monkeypatch, broken
+):
     m, config, run, proof, state = incomplete_preactivation_fixture(tmp_path, monkeypatch)
     old = run["physical_result"]["readback"]
     rb = old["readback"]
@@ -913,7 +958,7 @@ def test_incomplete_lift_origin_cannot_promote_other_failures_or_weaken_stopped_
     elif broken == "duplicate_row":
         rb["readbacks"][0] = copy.deepcopy(rb["readbacks"][1])
     elif broken == "late_row":
-        rb["readbacks"][0]["read_completed_at_monotonic_s"] += .05
+        rb["readbacks"][0]["read_completed_at_monotonic_s"] += 0.05
     elif broken == "marker_inventory":
         proof["original_markers"][m.MARKERS[0]] = {"sha256": "a" * 64}
     elif broken == "marker_appeared":
@@ -946,7 +991,9 @@ def test_incomplete_origin_marker_appearance_after_validation_refuses_ack(tmp_pa
     assert not list(state.glob("reconciliation-ack-*"))
 
 
-def test_incomplete_origin_marker_appearance_during_ack_cannot_return_qualified_receipt(tmp_path, monkeypatch):
+def test_incomplete_origin_marker_appearance_during_ack_cannot_return_qualified_receipt(
+    tmp_path, monkeypatch
+):
     m, config, run, proof, state = incomplete_preactivation_fixture(tmp_path, monkeypatch)
     publish_incomplete_fixture(config, run, proof, state)
     actual, raw, inventory = m.load_qualified_proof(config, run)
@@ -1212,3 +1259,235 @@ def test_actual_calibration_comparison_must_cover_every_owned_motor_and_match_pr
     rows[0]["cached_expected"] += 1
     with pytest.raises(ValueError):
         m.validate_calibration_evidence(proof, cached)
+
+
+# Exact Combined16 original note bytes; isolated loader sessions below rebind only IDs.
+# Their later stopped-proof continuation is synthetic and does not qualify Combined16.
+ACTUAL16_COOL_STALE_FAULT_NOTE = (
+    '[AM1 TELEOP FAULT] {"reason":"actual configured temperature limit: arm_left_shoulder_pan; '
+    'temperature: five-slot feedback window is stale (>0.5 s).","side":"left","register":"Present_Te'
+    'mperature","raw":{"arm_left_shoulder_pan":32,"arm_left_shoulder_lift":31,"arm_left_elbow_flex":'
+    '28,"arm_left_wrist_flex":30,"arm_left_wrist_roll":29,"arm_left_gripper":34},"read_started_at_mo'
+    'notonic_s":155503.029919034,"read_completed_at_monotonic_s":155503.031678142,"binding":{"recipe'
+    '":"physical-live-teleop","run_id":"94358dfa-4363-4658-9fd4-'
+    'fe0dc82c5499","host_incarnation":"acf244a1-c2a4-482e-b648-'
+    '558edc31d35e"},"offending_motor":"arm_left_shoulder_pan","offending_value":32,"comparison":{"un'
+    'its":"raw_register","lower_inclusive":0,"upper_exclusive":70,"temperature":{"ceiling_c":70,"sam'
+    'ples":[[155502.524492496,32],[155502.624574612,32],[155502.724499211,32],[155502.824513753,32],'
+    '[155503.031678142,32]],"high_count":0,"numeric_outlier_count":0,"first_cause":"temperature: '
+    'five-slot feedback window is stale (>0.5 s)."},"configured":{"Max_Temperature_Limit":{"value":7'
+    '0,"read_started_at_monotonic_s":155502.410460883,"read_completed_at_monotonic_s":155502.4124485'
+    '28}}},"prior_successful_health":null,"group_reply":{"binding":{"host_incarnation":"acf244a1-'
+    'c2a4-482e-b648-558edc31d35e","recipe":"physical-live-teleop","run_id":"94358dfa-4363-4658-9fd4-'
+    'fe0dc82c5499"},"request":{"binding":{"host_incarnation":"acf244a1-c2a4-482e-b648-'
+    '558edc31d35e","recipe":"physical-live-teleop","run_id":"94358dfa-4363-4658-9fd4-'
+    'fe0dc82c5499"},"side":"left","address":63,"width":1,"ids":[1,2,3,4,5,6],"motors":["arm_left_sho'
+    'ulder_pan","arm_left_shoulder_lift","arm_left_elbow_flex","arm_left_wrist_flex","arm_left_wrist'
+    '_roll","arm_left_gripper"],"register":"Present_Temperature"},"group_call_started_at_monotonic_s'
+    '":155503.030073663,"group_call_completed_at_monotonic_s":155503.031652272,"comm_result":0,"pack'
+    'ets":[{"packet":[255,255,1,3,0,32,219],"device_error":0,"read_started_at_monotonic_s":155503.03'
+    '04097,"read_completed_at_monotonic_s":155503.031312384,"comm_result":0},{"packet":[255,255,2,3,'
+    '0,31,219],"device_error":0,"read_started_at_monotonic_s":155503.031407458,"read_completed_at_mo'
+    'notonic_s":155503.031425921,"comm_result":0},{"packet":[255,255,3,3,0,28,221],"device_error":0,'
+    '"read_started_at_monotonic_s":155503.031464254,"read_completed_at_monotonic_s":155503.031478717'
+    ',"comm_result":0},{"packet":[255,255,4,3,0,30,218],"device_error":0,"read_started_at_monotonic_'
+    's":155503.031511772,"read_completed_at_monotonic_s":155503.031524772,"comm_result":0},{"packet"'
+    ':[255,255,5,3,0,29,218],"device_error":0,"read_started_at_monotonic_s":155503.031555791,"read_c'
+    'ompleted_at_monotonic_s":155503.031571031,"comm_result":0},{"packet":[255,255,6,3,0,34,212],"de'
+    'vice_error":0,"read_started_at_monotonic_s":155503.031603679,"read_completed_at_monotonic_s":15'
+    '5503.031619383,"comm_result":0}],"transmit":{"packet":[255,255,254,10,130,63,1,1,2,3,4,5,6,32],'
+    '"write_started_at_monotonic_s":155503.030138719,"write_completed_at_monotonic_s":155503.0303932'
+    '93,"result":14}}}'
+)
+
+ACTUAL16_BEFORE_HOME_NOTE = (
+    'Original normal-rest acquisition: {"phase":"before_home","binding":{"recipe":"physical-live-tel'
+    'eop","run_id":"94358dfa-4363-4658-9fd4-fe0dc82c5499","host_incarnation":"acf244a1-c2a4-482e-'
+    "b648-"
+    '558edc31d35e"},"calibration":[2,0,515,848,3223],"operating_displacement_bound_degrees":0.5,"ini'
+    'tial_measured_raw":3223,"qualified":false,"samples":[],"settings":{},"started_at":155503.029860'
+    '108,"first_cause":"RuntimeError: AM1 teleop actual configured temperature limit: '
+    'arm_left_shoulder_pan; temperature: five-slot feedback window is stale (>0.5 s)."}'
+)
+
+
+def cool_stale_preactivation_fixture(tmp_path, monkeypatch):
+    """Retain original packet/times; rebind the isolated session and use synthetic fresh proof."""
+    m, config, run, proof, state = incomplete_preactivation_fixture(tmp_path, monkeypatch)
+    fault = json.loads(ACTUAL16_COOL_STALE_FAULT_NOTE.removeprefix("[AM1 TELEOP FAULT] "))
+    rest = json.loads(ACTUAL16_BEFORE_HOME_NOTE.removeprefix("Original normal-rest acquisition: "))
+    binding = {
+        "recipe": "physical-live-teleop",
+        "run_id": run["run_id"],
+        "host_incarnation": proof["host_incarnation"],
+    }
+    fault["binding"] = fault["group_reply"]["binding"] = fault["group_reply"]["request"]["binding"] = binding
+    rest["binding"] = binding
+    run["recipe"] = "physical-live-teleop"
+    run["native_first_cause"] = rest["first_cause"]
+    proof.update(
+        original_cleanup_origin="prehome-cool-thermal-stale-lift-unqualified",
+        original_first_cause=run["native_first_cause"],
+    )
+    old = run["physical_result"]["readback"]
+    old["first_cause"] = run["native_first_cause"]
+    old["first_error_chain"] = [
+        {"cause": "RuntimeError: AlohaMini motor activation failed.", "notes": []},
+        {
+            "cause": run["native_first_cause"],
+            "notes": [
+                "[AM1 TELEOP FAULT] " + json.dumps(fault),
+                "Original normal-rest acquisition: " + json.dumps(rest),
+            ],
+        },
+    ]
+    # Synthetic original stop register timing follows the retained fault note.
+    rb = old["readback"]
+    rb["started_at_monotonic_s"] = fault["read_completed_at_monotonic_s"] + 0.02
+    for index, row in enumerate(rb["readbacks"]):
+        row["read_started_at_monotonic_s"] = rb["started_at_monotonic_s"] + index * 0.001
+        row["read_completed_at_monotonic_s"] = row["read_started_at_monotonic_s"] + 0.0005
+    rb["completed_at_monotonic_s"] = rb["started_at_monotonic_s"] + 0.03
+    return m, config, run, proof, state
+
+
+def test_prehome_cool_stale_origin_requires_fresh_stopped_proof_and_separate_durable_ack(
+    tmp_path, monkeypatch
+):
+    m, config, run, proof, state = cool_stale_preactivation_fixture(tmp_path, monkeypatch)
+    raw = publish_incomplete_fixture(config, run, proof, state)
+    before = copy.deepcopy(run)
+    actual, received, inventory = m.load_qualified_proof(config, run)
+    assert actual == proof and received == raw and inventory == dict.fromkeys(m.MARKERS)
+    operation = str(uuid.uuid4())
+    ack = m.archive_and_ack(config, actual, received, inventory, operation)
+    assert m.acknowledged_receipt(
+        {**actual, "acknowledgment": {**ack, "consumed_operation_id": operation}}, run, operation
+    )
+    assert run == before and run["uncertain"] is True and run["status"] == "faulted"
+    assert all(not (state / name).exists() for name in m.MARKERS)
+
+
+@pytest.mark.parametrize(
+    "broken",
+    [
+        "old_origin",
+        "live",
+        "progress",
+        "post_home",
+        "rest_missing",
+        "rest_duplicate",
+        "rest_qualified",
+        "rest_samples",
+        "binding",
+        "first_cause",
+        "partial_chain",
+        "fault_duplicate",
+        "fault_malformed",
+        "numeric_high",
+        "slot_high",
+        "slot_duplicate",
+        "not_stale",
+        "high_count",
+        "outlier_count",
+        "ceiling",
+        "impossible_ceiling",
+        "device_error",
+        "packet_error",
+        "packet_checksum",
+        "packet_width",
+        "packet_missing",
+        "packet_raw",
+        "group_error",
+        "raw_boolean",
+        "cleanup_error",
+        "nonzero",
+        "fresh_lift_missing",
+        "fresh_thermal_stale",
+    ],
+)
+def test_prehome_cool_stale_origin_cannot_admit_heat_device_fault_or_incomplete_proof(
+    tmp_path, monkeypatch, broken
+):
+    m, config, run, proof, state = cool_stale_preactivation_fixture(tmp_path, monkeypatch)
+    old = run["physical_result"]["readback"]
+    notes = old["first_error_chain"][1]["notes"]
+    fault = json.loads(notes[0].removeprefix("[AM1 TELEOP FAULT] "))
+    rest = json.loads(notes[1].removeprefix("Original normal-rest acquisition: "))
+    if broken == "old_origin":
+        proof["original_cleanup_origin"] = "preactivation-lift-unqualified"
+    elif broken == "live":
+        run["native_live_at"] = 99.0
+    elif broken == "progress":
+        run["progress_s"] = 0.1
+    elif broken == "post_home":
+        rest["phase"] = "after_home"
+    elif broken == "rest_qualified":
+        rest["qualified"] = True
+    elif broken == "rest_samples":
+        rest["samples"] = [{"position": 3223}]
+    elif broken == "binding":
+        fault["binding"]["run_id"] = str(uuid.uuid4())
+    elif broken == "first_cause":
+        rest["first_cause"] = "RuntimeError: genuine motor error"
+    elif broken == "numeric_high":
+        fault["offending_value"] = fault["raw"]["arm_left_shoulder_pan"] = 90
+    elif broken == "slot_high":
+        fault["comparison"]["temperature"]["samples"][0][1] = 90
+    elif broken == "slot_duplicate":
+        fault["comparison"]["temperature"]["samples"][1][0] = fault["comparison"]["temperature"]["samples"][
+            0
+        ][0]
+    elif broken == "not_stale":
+        fault["comparison"]["temperature"]["samples"][0][0] += 0.02
+    elif broken in {"high_count", "outlier_count"}:
+        fault["comparison"]["temperature"][
+            "high_count" if broken == "high_count" else "numeric_outlier_count"
+        ] = 1
+    elif broken == "ceiling":
+        fault["comparison"]["temperature"]["ceiling_c"] = 90
+    elif broken == "impossible_ceiling":
+        fault["comparison"]["temperature"]["ceiling_c"] = 150
+        fault["comparison"]["configured"]["Max_Temperature_Limit"]["value"] = 150
+        fault["comparison"]["upper_exclusive"] = 150
+    elif broken == "device_error":
+        fault["group_reply"]["packets"][0]["device_error"] = 4
+    elif broken == "packet_error":
+        fault["group_reply"]["packets"][0]["packet"][4] = 4
+    elif broken == "packet_checksum":
+        fault["group_reply"]["packets"][0]["packet"][-1] ^= 1
+    elif broken == "packet_width":
+        fault["group_reply"]["request"]["width"] = 38
+    elif broken == "packet_missing":
+        fault["group_reply"]["packets"].pop()
+    elif broken == "packet_raw":
+        fault["raw"]["arm_left_shoulder_pan"] = 33
+    elif broken == "group_error":
+        fault["group_reply"]["comm_result"] = -1
+    elif broken == "raw_boolean":
+        fault["offending_value"] = False
+    elif broken == "cleanup_error":
+        old["cleanup_errors"] = ["failed"]
+    elif broken == "nonzero":
+        old["readback"]["readbacks"][0]["value"] = 1
+    elif broken == "fresh_lift_missing":
+        proof["readback"].pop("lift_stationary")
+    elif broken == "fresh_thermal_stale":
+        proof["readback"]["lift_stationary"]["temperature_slots"][0][0] = 90.0
+    notes[:] = [
+        "[AM1 TELEOP FAULT] " + json.dumps(fault),
+        "Original normal-rest acquisition: " + json.dumps(rest),
+    ]
+    if broken == "rest_missing":
+        notes.pop()
+    elif broken == "rest_duplicate":
+        notes.append(notes[1])
+    elif broken == "fault_duplicate":
+        notes.append(notes[0])
+    elif broken == "fault_malformed":
+        notes[0] = "[AM1 TELEOP FAULT] {bad"
+    elif broken == "partial_chain":
+        old["first_error_chain"].pop(0)
+    publish_incomplete_fixture(config, run, proof, state)
+    with pytest.raises((ValueError, RuntimeError)):
+        m.load_qualified_proof(config, run)
