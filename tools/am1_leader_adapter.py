@@ -16,7 +16,7 @@ import ssl
 import time
 from pathlib import Path
 from urllib.parse import urlsplit
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from examples.alohamini.am1_live_teleop import (
     TELEOP_ARM_KEYS,
@@ -195,6 +195,31 @@ class CommandRefusedError(RuntimeError):
         super().__init__(self.reason)
 
 
+class HTTPOutcomeError(RuntimeError):
+    """A bounded original HTTP outcome; refusal and ambiguity remain distinct."""
+
+    def __init__(self, status, response, *, detail="unqualified authenticated HTTP outcome"):
+        self.http_status = status
+        self.response, self.response_error = None, None
+        try:
+            raw = json.dumps(response, allow_nan=False, separators=(",", ":"))
+            if len(raw.encode()) > 65536:
+                raise ValueError("HTTP outcome exceeds64KiB")
+            self.response = json.loads(raw)
+        except (TypeError, ValueError) as error:
+            self.response_error = str(error)
+        self.non_admitted = isinstance(self.response, dict) and all(
+            (
+                self.response.get("accepted") is False,
+                self.response.get("effect_admitted") is False,
+                self.response.get("status") == "refused",
+                self.response.get("uncertain", False) is False,
+            )
+        )
+        reason = self.response.get("reason") if isinstance(self.response, dict) else None
+        super().__init__(reason if isinstance(reason, str) else detail)
+
+
 def expired_input_refusal(error):
     return isinstance(error, CommandRefusedError) and all(
         error.response.get(key) == value and type(error.response.get(key)) is type(value)
@@ -278,15 +303,42 @@ class SessionClient:
             return result
 
     async def post(self, path, body):
+        from aiohttp import ContentTypeError
+
         async with self.http.post(
             self.origin + "/api/" + path,
             json=body,
             headers={"X-AM1-CSRF": self.csrf or ""},
             allow_redirects=False,
         ) as response:
-            result = await response.json()
-            if response.status != 200 or result.get("accepted") is False:
-                raise RuntimeError(result.get("reason", "authenticated session operation refused"))
+            try:
+                result = await response.json()
+            except (ValueError, UnicodeError, ContentTypeError) as error:
+                raise HTTPOutcomeError(response.status, None, detail="invalid HTTP JSON outcome") from error
+            if (
+                response.status != 200
+                or not isinstance(result, dict)
+                or result.get("accepted") is False
+                or result.get("status") == "unknown"
+                or result.get("accepted") is None
+                and result.get("uncertain") is True
+            ):
+                raise HTTPOutcomeError(response.status, result)
+            if path == "start":
+                run_id = result.get("run_id")
+                try:
+                    owned = (
+                        result.get("accepted") is True
+                        and type(run_id) is str
+                        and str(UUID(run_id)) == run_id
+                        and result.get("operation_id") == body["operation_id"]
+                    )
+                except (TypeError, ValueError):
+                    owned = False
+                if not owned:
+                    raise HTTPOutcomeError(
+                        response.status, result, detail="unqualified Start receipt identity"
+                    )
             return result
 
     async def attach(self):
@@ -886,23 +938,40 @@ async def run(args):
         record(
             {"event": "start_requested", "operation_id": start_body["operation_id"], "recipe": TELEOP_RECIPE}
         )
+
+        def start_error(error, attempt):
+            detail = {"attempt": attempt, "error_type": type(error).__name__, "message": str(error)}
+            if isinstance(error, HTTPOutcomeError):
+                detail.update(
+                    http_status=error.http_status,
+                    response=error.response,
+                    response_error=error.response_error,
+                    non_admitted=error.non_admitted,
+                )
+            return detail
+
         try:
             start_receipt = await client.post("start", start_body)
-        except (OSError, TimeoutError, aiohttp.ClientError) as original:
-            attempt = {"attempt": 1, "error_type": type(original).__name__, "message": str(original)}
+        except (OSError, TimeoutError, aiohttp.ClientError, HTTPOutcomeError) as original:
+            attempt = start_error(original, 1)
+            if isinstance(original, HTTPOutcomeError) and original.non_admitted:
+                summary.update(
+                    start_outcome_uncertain=False, native_cleanup_uncertain=False, start_refusal=attempt
+                )
+                record(dict(event="start_refused", operation_id=start_body["operation_id"], **attempt))
+                raise
             summary["start_ambiguous_attempts"].append(attempt)
             record(dict(event="start_outcome_ambiguous", operation_id=start_body["operation_id"], **attempt))
             try:
                 # Existing durable operation identity is retried once unchanged.
                 start_receipt = await client.post("start", start_body)
-            except (OSError, TimeoutError, aiohttp.ClientError) as retry_error:
-                summary["start_ambiguous_attempts"].append(
-                    {"attempt": 2, "error_type": type(retry_error).__name__, "message": str(retry_error)}
+            except (OSError, TimeoutError, aiohttp.ClientError, HTTPOutcomeError) as retry_error:
+                retry = start_error(retry_error, 2)
+                summary["start_ambiguous_attempts"].append(retry)
+                record(
+                    dict(event="start_outcome_ambiguous", operation_id=start_body["operation_id"], **retry)
                 )
                 raise original from retry_error
-        except RuntimeError:
-            summary.update(start_outcome_uncertain=False, native_cleanup_uncertain=False)
-            raise
         owned_run_id = start_receipt["run_id"]
         summary["owned_run_id"] = owned_run_id
         summary["start_outcome_uncertain"] = False

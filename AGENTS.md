@@ -8,9 +8,10 @@ presets as diagnostics; fine positioning and household tasks remain unproven.
 
 Packet16 replaces proposed wrist Packet15. PR24 integrated normally into
 integrate/am1-local-teleop at386d3c37; this focused follow-up remains unmerged.
-Main/AM2 are unchanged. Complete the representative172.5 active-second program
-under its original fixed300s native ceiling, selected onboard WebRTC with one view
-switch, controlled input interruption/qualified rejoin, then brief next Start.
+Main/AM2 are unchanged. The declared target remains the representative172.5
+active-second program under its original fixed300s native ceiling, selected onboard
+WebRTC with one view switch, controlled input interruption/qualified rejoin, then
+brief next Start. The unresolved fault below currently blocks that qualification.
 Do not credit idle padding or interactive Stop as finite-program completion.
 
 Preserve original raw feedback/acquisition times, calibrated units/directions,
@@ -37,23 +38,29 @@ Helper/manual 0fe3997f and original calibration/private trust remain unchanged.
 Full matched rollback: motor2fbc8265b15393dcc799e603223b8902844e2919,
 same runtime/camera, manifest1d64de8e1e2f05938a39fae7a67a9a3ff3b19f94ae456f311116c41e52bbbd57.
 Stage10 verified actual owner runtime/src/client9315af5b import and nine native
-request-accounting cases. Original attempts01..14 remain retained by source version.
-Combined14 reached17.34 active seconds/180 Core frames; two ordinary expiry rejoins
-qualified, then valid shoulder-lift temperature74 versus installed70 stopped the
-host. The prior same-binding read34 about59ms earlier does not establish heat or
-reply origin. Known20 off/zero cleanup and all original/full-history evidence remain.
-The full172.5s program, planned gap/view switch and next Start remain unfinished.
+request-accounting cases. Original attempts01..15 remain retained by source version.
+Combined15 reached11.002 active seconds/116 Core frames; two required-view expiry
+holds qualified fresh rejoin, then a valid38-byte payload in a44-byte reply reported
+shoulder-lift temperature90 versus installed70. The prior same-binding read34
+about41ms earlier does not establish physical heating or reply-origin cause.
+Known20 off/zero cleanup, lift qualification, closed buses/camera release and all
+original/full-history evidence remain. The full172.5s program, planned input gap,
+view switch and next Start are NOT qualified. Do not repeat that powered workload
+unchanged or relax thermal policy to obtain a passing result.
 
-A prospective live-only health acquisition change uses one exact33..70 SDK block
-per six-motor arm instead of six one-byte transactions. It preserves original
-acquisition intervals, all health limits and first causes; valid74 still faults.
-The stopped read-only comparison verified20 transactions/120 packets and supported
-field offsets with unchanged history/private state. Its cause relationship to
-Combined14 is unproved. The source passed160 affected tests and focused review;
-all ten motor-only stage13 phases passed with no task started. Runtime/camera remain unchanged; the supported combined trial is next.
+Live health uses one exact33..70 SDK block per frozen six-motor arm, preserving
+original times/limits/first causes. It passed160 affected tests and the stopped
+installed-firmware comparison; all ten motor-only stage13 phases passed. The new
+full-width90 result leaves the temperature boundary unresolved. Source framing,
+measured response, accepted commands and program completion remain distinct.
 Ordinary expiry pauses retain cause/current-feedback/ACK/expiry/deadline checks;
 no separate PC pause quota is imposed. The genuine native three-episode recovery
-budget remains. The PC-only correction passed67 focused adapter tests.
+budget remains. Ambiguous HTTP Start outcomes retain the original operation
+identity through one unchanged-operation retry. Only an initial explicit refusal
+establishes nonadmission; a refusal after ambiguity does not settle that outcome.
+Matching accepted Core identities establish ownership even before native ACK or
+with uncertain fault cleanup. This PC-only correction passed80 adapter tests
+without actuation and independent review; installed Pi pins remain unchanged.
 
 Tasks stay stopped for source edits and affected-component staging. Verify actual
 owner imports, preserve separate full matched rollback bundles, calibration and

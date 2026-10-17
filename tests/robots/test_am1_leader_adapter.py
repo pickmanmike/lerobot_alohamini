@@ -493,6 +493,17 @@ def test_real_wss_clean_close_ends_qualified_wait_before_timeout(tmp_path):
         "zero_inner_timeout",
         "ordinary_pauses",
         "ordinary_pauses_no_ack",
+        "http_start_recovered",
+        "http_start_unknown200",
+        "http_start_unknown",
+        "http_start_refused",
+        "http_start_retry_refused",
+        "http_start_retry_lost",
+        "http_start_terminal_uncertain",
+        "http_start_pending",
+        "http_start_malformed",
+        "http_start_foreign_receipt",
+        "http_start_bad_runid",
     ],
 )
 def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id(
@@ -503,7 +514,15 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
     from types import SimpleNamespace
 
     m = adapter()
-    prelive = {"admission_fault", "admission_terminal", "terminal_stop_race", "foreign_terminal"}
+    production_post = m.SessionClient.post
+    http_start = failure is not None and failure.startswith("http_start_")
+    prelive = {
+        "admission_fault",
+        "admission_terminal",
+        "terminal_stop_race",
+        "foreign_terminal",
+        "http_start_terminal_uncertain",
+    }
     dropped = failure in {
         "expired_first",
         "expired_zero",
@@ -547,7 +566,79 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
             instances.append(self)
 
         async def attach(self):
-            pass
+            if http_start:
+                from aiohttp import ClientSession, web
+
+                from tools.am1_session_service import unknown_outcome
+
+                async def start(request):
+                    body = await request.json()
+                    self.start_requests.append(body)
+                    attempt = len(self.start_requests)
+                    self.starts = len({x["operation_id"] for x in self.start_requests})
+                    refusal = {
+                        "accepted": False,
+                        "status": "refused",
+                        "effect_admitted": False,
+                        "reason": "known nonadmission",
+                    }
+                    if (
+                        failure == "http_start_refused"
+                        or failure == "http_start_retry_refused"
+                        and attempt == 2
+                    ):
+                        return web.json_response(refusal, status=403)
+                    if failure == "http_start_retry_lost" and attempt == 2:
+                        request.transport.close()
+                        return web.json_response(unknown_outcome(), status=503)
+                    if failure == "http_start_terminal_uncertain":
+                        return web.json_response(
+                            {
+                                "accepted": True,
+                                "status": "faulted",
+                                "run_id": owned_id,
+                                "operation_id": body["operation_id"],
+                                "uncertain": True,
+                                "effect_admitted": False,
+                            }
+                        )
+                    if attempt == 1 or failure in {"http_start_unknown", "http_start_malformed"}:
+                        if failure not in {
+                            "http_start_recovered",
+                            "http_start_unknown200",
+                            "http_start_pending",
+                        }:
+                            self.snapshot = self.state(foreign_id)
+                        if failure == "http_start_malformed" and attempt == 1:
+                            return web.Response(text="not JSON", content_type="application/json")
+                        return web.json_response(
+                            unknown_outcome(), status=200 if failure == "http_start_unknown200" else 503
+                        )
+                    return web.json_response(
+                        {
+                            "accepted": True,
+                            "status": "starting" if failure == "http_start_pending" else "accepted",
+                            "uncertain": False,
+                            "effect_admitted": failure != "http_start_pending",
+                            "run_id": foreign_id
+                            if failure == "http_start_foreign_receipt"
+                            else "invalid"
+                            if failure == "http_start_bad_runid"
+                            else owned_id,
+                            "operation_id": str(uuid4())
+                            if failure == "http_start_foreign_receipt"
+                            else body["operation_id"],
+                        }
+                    )
+
+                app = web.Application()
+                app.router.add_post("/api/start", start)
+                self.http_runner = web.AppRunner(app, access_log=None)
+                await self.http_runner.setup()
+                site = web.TCPSite(self.http_runner, "127.0.0.1", 0)
+                await site.start()
+                self.origin = f"http://127.0.0.1:{site._server.sockets[0].getsockname()[1]}"
+                self.http, self.csrf = ClientSession(), "existing-test-csrf"
 
         async def claim(self):
             pass
@@ -605,6 +696,8 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
 
         async def post(self, op, payload):
             if op == "start":
+                if http_start:
+                    return await production_post(self, op, payload)
                 self.starts = 1  # Simulated durable server deduplicates this operation.
                 self.start_requests.append(copy.deepcopy(payload))
                 if failure == "start_unknown" or failure == "start_lost" and len(self.start_requests) == 1:
@@ -663,8 +756,10 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                         native_live_at=None,
                         first_cause="generic owning layer failure",
                         native_first_cause="injected original pre-Live native fault",
-                        cleanup="unknown" if failure == "admission_fault" else "physical_readback_verified",
-                        uncertain=failure == "admission_fault",
+                        cleanup="unknown"
+                        if failure in {"admission_fault", "http_start_terminal_uncertain"}
+                        else "physical_readback_verified",
+                        uncertain=failure in {"admission_fault", "http_start_terminal_uncertain"},
                     )
             assert predicate()
 
@@ -795,6 +890,9 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
 
         async def close(self):
             self.closed += 1
+            if http_start:
+                await self.http.close()
+                await self.http_runner.cleanup()
 
     monkeypatch.setattr(m, "SessionClient", Session)
     sources = []
@@ -847,6 +945,77 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
         args.duration_seconds = 0.03
     if foreign_boundary:
         args.next_start_seconds = 0.001
+    if http_start:
+        import json
+
+        resolved = failure in {"http_start_recovered", "http_start_unknown200", "http_start_pending"}
+        if failure == "http_start_terminal_uncertain":
+            with pytest.raises(RuntimeError, match="native admission faulted"):
+                asyncio.run(asyncio.wait_for(m.run(args), 20))
+            summary = json.loads((tmp_path / "evidence" / "summary.json").read_text())
+        elif resolved:
+            summary = asyncio.run(asyncio.wait_for(m.run(args), 20))
+        else:
+            with pytest.raises(m.HTTPOutcomeError):
+                asyncio.run(asyncio.wait_for(m.run(args), 20))
+            summary = json.loads((tmp_path / "evidence" / "summary.json").read_text())
+            assert summary["failure_type"] == "HTTPOutcomeError"
+        session = instances[0]
+        requests = session.start_requests
+        assert len(requests) == (
+            1 if failure in {"http_start_refused", "http_start_terminal_uncertain"} else 2
+        )
+        assert requests[0]["operation_id"] == summary["start_operation_id"]
+        assert all(value == requests[0] for value in requests)
+        assert session.starts == 1 and session.closed == 1 and sources[0].closed == 1
+        records = [
+            json.loads(line) for line in (tmp_path / "evidence" / "frames.jsonl").read_text().splitlines()
+        ]
+        assert records[0]["event"] == "start_requested"
+        assert records[0]["operation_id"] == summary["start_operation_id"]
+        assert all(
+            x["operation_id"] == summary["start_operation_id"]
+            for x in records
+            if x["event"] in {"start_outcome_ambiguous", "start_refused"}
+        )
+        assert summary["producer_program_complete"] is False
+        if failure == "http_start_terminal_uncertain":
+            assert summary["owned_run_id"] == owned_id and summary["start_outcome_uncertain"] is False
+            assert summary["native_cleanup_uncertain"] is True and session.stops == []
+            assert summary["start_ambiguous_attempts"] == []
+            assert summary["native_admission_terminal"]["run"]["run_id"] == owned_id
+            assert summary["terminal_failure"]["cause"] == "injected original pre-Live native fault"
+            assert summary["cleanup_errors"][0]["step"] == "native_stop"
+            return
+        assert summary["cleanup_errors"] == []
+        if failure == "http_start_refused":
+            assert (
+                summary["start_outcome_uncertain"] is False and summary["native_cleanup_uncertain"] is False
+            )
+            assert summary["start_refusal"]["response"]["effect_admitted"] is False
+            assert summary["start_ambiguous_attempts"] == [] and session.stops == []
+        else:
+            attempts = summary["start_ambiguous_attempts"]
+            assert len(attempts) == (1 if resolved else 2)
+            assert attempts[0]["http_status"] == (
+                200 if failure in {"http_start_unknown200", "http_start_malformed"} else 503
+            )
+            if failure != "http_start_malformed":
+                assert attempts[0]["response"]["accepted"] is None
+                assert attempts[0]["response"]["uncertain"] is True
+            if resolved:
+                assert summary["owned_run_id"] == owned_id and session.stops == [owned_id]
+                assert (
+                    summary["start_outcome_uncertain"] is False
+                    and summary["native_cleanup_uncertain"] is False
+                )
+            else:
+                assert "owned_run_id" not in summary and session.stops == []
+                assert (
+                    summary["start_outcome_uncertain"] is True and summary["native_cleanup_uncertain"] is True
+                )
+                assert summary["failure"] == attempts[0]["message"]
+        return
     if ordinary_case:
         args.next_start_seconds, args.duration_seconds = None, 0.05
         if failure == "ordinary_pauses_no_ack":
@@ -1348,6 +1517,69 @@ def test_grant_race_only_rejoins_current_ordinary_pause_with_unchanged_qualified
             await guard.resume(require_episode=True, refusal_identity={"intent_revision": 2})
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("terminal_uncertain", [False, True])
+def test_actual_core_start_receipt_owns_pending_or_terminal_uncertain_run(tmp_path, terminal_uncertain):
+    import asyncio
+    from types import SimpleNamespace
+
+    from tests.robots.test_am1_live_teleop_executor import admitted_executor
+    from tools.am1_session_core import SessionAuthority
+
+    m = adapter()
+    e, ids = admitted_executor()
+    e.hold = lambda: True
+    e.evidence = lambda: {
+        "feedback": True,
+        "native_ack": True,
+        "fault": None,
+        "required_observation": True,
+        "lifecycle": {},
+    }
+    e.begin = (
+        (lambda _: (_ for _ in ()).throw(RuntimeError("injected startup fault")))
+        if terminal_uncertain
+        else lambda _: True
+    )
+    e.finish = lambda _: {"cleanup": "unknown", "uncertain": True}
+    authority = SessionAuthority(tmp_path / "authority", clock=lambda: 10.0, executor=e)
+    body = {
+        "operation_id": str(uuid4()),
+        "recipe": "physical-live-teleop",
+        "controller_generation": ids["controller_generation"],
+    }
+    try:
+        authority.controller = {
+            "device_id": "pc",
+            "generation": ids["controller_generation"],
+            "expires": 11.5,
+        }
+        result = authority._handle(dict(body, op="start"), "pc")
+        assert result["accepted"] is True and result["operation_id"] == body["operation_id"]
+        assert result["status"] == ("faulted" if terminal_uncertain else "starting")
+        assert result["uncertain"] is terminal_uncertain and result["effect_admitted"] is False
+
+        class Response:
+            status = 200
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                pass
+
+            async def json(self):
+                return result
+
+        client = SimpleNamespace(
+            origin="https://fixture",
+            csrf="csrf",
+            http=SimpleNamespace(post=lambda *args, **kwargs: Response()),
+        )
+        assert asyncio.run(m.SessionClient.post(client, "start", body)) == result
+    finally:
+        authority.close()
 
 
 def test_original_recovery_ceiling_includes_authenticated_read_time_without_reanchoring():
