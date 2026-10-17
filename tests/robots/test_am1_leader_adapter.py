@@ -184,7 +184,9 @@ def test_terminal_ack_requires_current_source_and_actual_body_zero():
         assert not m.native_frame_ack(bad, 7, source, body_zero=True)
 
 
-@pytest.mark.parametrize("failure", [None, "stop", "renew", "start_lost", "start_unknown", "terminal_fault"])
+@pytest.mark.parametrize(
+    "failure", [None, "stop", "renew", "start_lost", "start_unknown", "terminal_fault", "admission_fault"]
+)
 def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id(
     tmp_path, monkeypatch, failure
 ):
@@ -262,19 +264,41 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 raise ClientOSError(5, "injected Stop transport failure")
             self.snapshot = self.state(owned_id)
             self.snapshot["run"].update(
-                status="faulted" if failure == "terminal_fault" else "stopped",
-                cleanup="physical_readback_verified",
-                first_cause="retained genuine native fault" if failure == "terminal_fault" else None,
+                status="faulted" if failure in {"terminal_fault", "admission_fault"} else "stopped",
+                cleanup="unknown" if failure == "admission_fault" else "physical_readback_verified",
+                uncertain=failure == "admission_fault",
+                first_cause="retained genuine native fault"
+                if failure in {"terminal_fault", "admission_fault"}
+                else None,
             )
+            if failure == "admission_fault":
+                self.snapshot["run"].update(
+                    native_live_at=None, native_first_cause="injected original pre-Live native fault"
+                )
             return {"accepted": True, "status": "stopped"}
 
         async def wait(self, predicate, timeout):
             if self.snapshot["run"] is None:
                 assert not predicate()
                 self.snapshot = self.state(foreign_id)
+                if failure == "admission_fault":
+                    self.snapshot["run"].update(
+                        status="faulted",
+                        native_live_at=None,
+                        native_first_cause="another run's historical fault",
+                    )
                 assert not predicate(), "same recipe on another run is not this accepted Start"
                 self.saw_foreign += 1
                 self.snapshot = self.state(owned_id)
+                if failure == "admission_fault":
+                    self.snapshot["run"].update(
+                        status="faulted",
+                        native_live_at=None,
+                        first_cause="generic owning layer failure",
+                        native_first_cause="injected original pre-Live native fault",
+                        cleanup="unknown",
+                        uncertain=True,
+                    )
             assert predicate()
 
         def identities(self):
@@ -355,6 +379,12 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
         if failure == "terminal_fault":
             assert summary["native_cleanup_uncertain"] is False and summary["cleanup_errors"] == []
             assert summary["terminal_failure"]["cause"] == "retained genuine native fault"
+        if failure == "admission_fault":
+            assert summary["native_admission_terminal"]["run"]["run_id"] == owned_id
+            assert summary["failure"] == "native admission faulted: injected original pre-Live native fault"
+            assert summary["native_cleanup_uncertain"] is True
+            assert summary["cleanup_errors"][0]["step"] == "native_stop"
+            assert "run_id" not in summary and "final_native_ack" not in summary
     else:
         summary = asyncio.run(m.run(args))
     session = instances[0]
@@ -364,9 +394,9 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
         and session.closed == 1
     )
     assert session.saw_foreign == (0 if failure == "start_unknown" else 1)
-    if failure != "start_unknown":
+    if failure not in {"start_unknown", "admission_fault"}:
         assert summary["run_id"] == owned_id
-    if failure not in {"stop", "start_unknown", "terminal_fault"}:
+    if failure not in {"stop", "start_unknown", "terminal_fault", "admission_fault"}:
         assert summary["native_terminal"]["run"]["status"] == "stopped"
     if failure in {"start_lost", "start_unknown"}:
         assert len(session.start_requests) == 2 and session.start_requests[0] == session.start_requests[1]

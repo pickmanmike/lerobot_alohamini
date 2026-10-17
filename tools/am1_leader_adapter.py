@@ -521,14 +521,27 @@ async def run(args):
         summary["owned_run_id"] = owned_run_id
         summary["start_outcome_uncertain"] = False
         started = True
-        await client.wait(
-            lambda: (
-                (client.snapshot.get("run") or {}).get("run_id") == owned_run_id
-                and (client.snapshot.get("run") or {}).get("recipe") == TELEOP_RECIPE
-                and (client.snapshot.get("run") or {}).get("native_live_at") is not None
-            ),
-            180,
-        )
+
+        def native_admitted():
+            state = client.snapshot or {}
+            run = state.get("run") or {}
+            if run.get("run_id") != owned_run_id or run.get("recipe") != TELEOP_RECIPE:
+                return False
+            if run.get("status") in {"faulted", "interrupted", "stopped", "completed"}:
+                # Freeze the actual owned-run failure before ordinary Stop and
+                # cleanup reporting can replace the current snapshot.
+                summary["native_admission_terminal"] = json.loads(json.dumps(state, allow_nan=False))
+                record({"event": "native_admission_terminal", "snapshot": state})
+                cause = (
+                    run.get("native_first_cause")
+                    or run.get("first_cause")
+                    or state.get("evidence", {}).get("fault")
+                    or "terminal before native Live"
+                )
+                raise RuntimeError("native admission " + run["status"] + ": " + str(cause))
+            return run.get("native_live_at") is not None
+
+        await client.wait(native_admitted, 180)
         workspace = validate_workspace(_live(client.snapshot)["workspace"])
         run_id, deadline = client.snapshot["run"]["run_id"], client.snapshot["run"]["deadline"]
         summary.update(run_id=run_id, original_native_deadline=deadline, workspace=workspace)
