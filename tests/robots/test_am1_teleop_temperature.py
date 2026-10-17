@@ -353,3 +353,85 @@ def test_startup_failure_retains_compact_original_warning_context_before_writer_
         entry["value_c"] == 92 and entry["sample_monotonic_s"] == warning["sample_monotonic_s"]
         for entry in snapshot.get("temperature_warnings", [])
     )
+
+
+def test_combined16_saved_stopped_peaks_still_refuse_the_actual_missing_slot():
+    # Actual retained peaks from Combined16's FIRST failure, not a complete
+    # baseline or a synthetic continuation of that failed run. Earlier peaks
+    # absent from the stopped snapshot are deliberately not manufactured.
+    saved = [
+        (155502.524492496, 32), (155502.624574612, 32), (155502.724499211, 32),
+        (155502.824513753, 32), (155503.031678142, 32),
+    ]
+    window = TemperatureWindow(ceiling_c=70)
+    for when, value in saved[:-1]:
+        window.update(value, when)
+    with pytest.raises(RuntimeError, match="five-slot feedback window is stale") as caught:
+        window.update(saved[-1][1], saved[-1][0])
+    assert list(window.samples) == saved
+    assert window.outliers == 0
+    assert saved[-1][0] - saved[0][0] == pytest.approx(0.507185646)
+    with pytest.raises(RuntimeError) as repeated:
+        window.update(32, 155503.04)
+    assert repeated.value is caught.value
+
+
+def test_actual_connect_calibration_scans_and_before_home_keep_due_follower_slots(
+    activation, monkeypatch,
+):
+    from lerobot.motors import MotorCalibration
+    from lerobot.motors.feetech import FeetechMotorsBus
+
+    robot = resting_robot(activation, monkeypatch, raw=3223)
+    originals = {key: state["window"] for key, state in robot._am1_teleop_temperatures.items()}
+    boundary, scans = len(activation.events), []
+    # Synthetic allocation across real existing operations; Combined16 only
+    # measured their aggregate unrefreshed gap of0.207164389s, not each stage.
+    # 24 torque/Lock writes*.0035 +lift.017164389 +96 calibration reads*.001
+    # +10 before-home reads*.001 reproduces that aggregate before rest.
+    for bus in (robot.left_bus, robot.right_bus):
+        for name, motor in bus.motors.items():
+            if name not in bus.calibration:
+                bus.calibration[name] = MotorCalibration(motor.id, 0, 0, 1000, 2200)
+        bus.protocol_version = 0
+        bus.read_calibration = FeetechMotorsBus.read_calibration.__get__(bus)
+        bus.is_connected = False
+        bus.connect = lambda _bus=bus, **_: setattr(_bus, "is_connected", True)
+        bus.on_read = lambda *_: setattr(activation.clock, "now", activation.clock.now + 0.001)
+        bus.on_write = lambda *_: setattr(activation.clock, "now", activation.clock.now + 0.0035)
+    def calibrated(bus):
+        began = len(activation.events)
+        result = FeetechMotorsBus.is_calibrated.fget(bus)
+        scans.append((bus.side, len(activation.events) - began))
+        return result
+
+    monkeypatch.setattr(type(robot.left_bus), "is_calibrated", property(calibrated), raising=False)
+    robot.lift.configure = lambda **_: setattr(activation.clock, "now", activation.clock.now + 0.017164389)
+    robot.connect(calibrate=True, home_lift=True)
+    assert activation.home_calls == 1
+    assert all(entry["qualified"] for entry in robot._am1_teleop_rest_evidence)
+    assert all(state["window"] is originals[key] for key, state in robot._am1_teleop_temperatures.items())
+    assert all(state["window"].ready for state in robot._am1_teleop_temperatures.values())
+    assert scans == [("left", 30), ("right", 18), ("left", 30), ("right", 18)]
+    startup = activation.events[boundary:]
+    home = next(index for index, event in enumerate(startup) if event[0] == "home")
+    assert [
+        event[2:5] for event in startup[:home]
+        if event[0] == "write" and event[2] in {"Torque_Enable", "Lock"} and event[3].startswith("arm_")
+    ] == [
+        (register, name, 0)
+        for name in (*robot.left_arm_motors, *robot.right_arm_motors)
+        for register in ("Torque_Enable", "Lock")
+    ]
+
+
+def test_startup_calibration_false_still_short_circuits_the_right_chain(activation, monkeypatch):
+    robot = configured_robot(activation)
+
+    def calibrated(bus):
+        if bus is robot.right_bus:
+            pytest.fail("left calibration refusal must still short-circuit the right-chain scan")
+        return False
+
+    monkeypatch.setattr(type(robot.left_bus), "is_calibrated", property(calibrated), raising=False)
+    assert robot.is_calibrated is False

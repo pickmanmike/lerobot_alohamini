@@ -324,6 +324,19 @@ class AlohaMini(Robot):
 
     @property
     def is_calibrated(self) -> bool:
+        if getattr(self, "_am1_teleop_binding", None) is not None:
+            from .am1_live_teleop import refresh_startup_temperatures
+
+            # Each existing bus check performs its original calibration reads.
+            # Keep due follower slots continuous between the two chain scans.
+            refresh_startup_temperatures(self)
+            left_calibrated = self.left_bus.is_calibrated
+            refresh_startup_temperatures(self)
+            if not left_calibrated or self.right_bus is None:
+                return left_calibrated
+            right_calibrated = self.right_bus.is_calibrated
+            refresh_startup_temperatures(self)
+            return right_calibrated
         return self.left_bus.is_calibrated and (
             self.right_bus.is_calibrated if self.right_bus else True
         )
@@ -497,13 +510,17 @@ class AlohaMini(Robot):
     def configure(self) -> None:
         """Configure motor modes and gains while leaving all torque disabled."""
         if getattr(self, "_am1_teleop_binding", None) is not None:
-            from .am1_live_teleop import prepare_settings
+            from .am1_live_teleop import prepare_settings, refresh_startup_temperatures
             prepare_settings(self)
-            set_torque_enabled(self.left_bus, self.left_arm_motors, enabled=False)
-            set_torque_enabled(self.right_bus, self.right_arm_motors, enabled=False)
+            for bus, names in ((self.left_bus, self.left_arm_motors), (self.right_bus, self.right_arm_motors)):
+                for name in names:
+                    refresh_startup_temperatures(self)
+                    set_torque_enabled(bus, (name,), enabled=False)
             # The lift retains its existing velocity-mode homing/relief policy.
             # No arm gain, acceleration, gearing or calibration is rewritten.
+            refresh_startup_temperatures(self)
             self.lift.configure(force=True)
+            refresh_startup_temperatures(self)
             return
         visible = getattr(self, "_am1_visible_control_evidence", None)
         visible_binding = getattr(self, "_am1_visible_control_binding", None)
@@ -676,6 +693,10 @@ class AlohaMini(Robot):
         return identity
 
     def _read_am1_activation_raw(self, bus: FeetechMotorsBus, register: str, name: str, *, phase: str, num_retry: int = REGISTER_RETRIES) -> int:
+        if getattr(self, "_am1_teleop_binding", None) is not None:
+            from .am1_live_teleop import refresh_startup_temperatures
+
+            refresh_startup_temperatures(self)
         started_at = time.monotonic()
         record = {"phase": phase, "motor": name, "register": register, "read_started_at": started_at}
         try:
