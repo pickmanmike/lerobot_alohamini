@@ -963,6 +963,23 @@ def poll_health(robot):
     """Actual installed device limits; contact/nonresponse keep their role semantics."""
     binding = copy.deepcopy(robot._am1_teleop_binding)
     records = read_groups(robot, LIVE_HEALTH, active=True, _live_health=True)
+    # The other bus can finish after a new anchored slot becomes due. Acquire
+    # that slot once before consuming the original windows; never retry a
+    # latched fault or refresh a stale last RAW receipt.
+    states = robot._am1_teleop_temperatures
+    now = time.monotonic()
+    if any(
+        (round(now * 1e9) - state["window"]._origin_ns) // round(state["window"].SLOT_S * 1e9)
+        > state["window"]._last_slot
+        for state in states.values()
+    ):
+        for state in states.values():
+            state["window"].assert_fresh(now, refreshing=True)
+        temperatures = read_groups(robot, ("Present_Temperature",), active=True)
+        for side, fresh in temperatures.items():
+            for key in ("registers", "timing"):
+                records[side][key]["Present_Temperature"] = fresh[key]["Present_Temperature"]
+            records[side]["temperature"] = fresh["temperature"]
     check_health(robot, records, active=True)
     for side, _, names in _groups(robot):
         if any(records[side]["registers"]["Operating_Mode"][name] != 0 for name in names):

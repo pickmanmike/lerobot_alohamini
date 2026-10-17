@@ -435,3 +435,159 @@ def test_startup_calibration_false_still_short_circuits_the_right_chain(activati
 
     monkeypatch.setattr(type(robot.left_bus), "is_calibrated", property(calibrated), raising=False)
     assert robot.is_calibrated is False
+
+
+
+def combined20_live_boundary(activation, *, right_delay=0.004, recent_highs=False):
+    """Synthetic same-owner handoff using saved20 origin/peaks and real SDK reads.
+
+    The bridging readings and right-bus4ms duration are synthetic fixture inputs,
+    not additional records or a continuation of the historical failed run.
+    """
+    from tests.robots.test_am1_teleop_settings import reply_packet, sdk_bus
+
+    robot = configured_robot(activation, initial_temperature=31)
+    robot._am1_teleop_startup_temperature = False
+    saved = [
+        166142.864883104, 166142.984871457, 166143.074904165,
+        166143.194007574, 166143.276878311,
+    ]
+    for (side, motor_id), state in robot._am1_teleop_temperatures.items():
+        origin = 166119.062919393 if side == "left" else 166119.126953826
+        window = TemperatureWindow(ceiling_c=70)
+        first_slot = (round(saved[0] * 1e9) - round(origin * 1e9)) // 100_000_000
+        bridge = [origin + index * 0.1 for index in range(first_slot)]
+        isolated = 166135.653541218 if (side, motor_id) == ("left", 1) else None
+        for when in sorted([*bridge, *([isolated] if isolated else [])]):
+            window.update(125 if when == isolated else 31, when)
+        for index, when in enumerate(saved):
+            window.update(70 if recent_highs and side == "left" and motor_id == 1 and index >= 3 else 31, when)
+        window.update(31, 166143.317915514)
+        state["window"] = window
+    narrow = []
+    for side, bus, names in teleop._groups(robot):
+        wide_respond = bus.port_handler.respond
+        sdk_bus(robot, side, [])
+        for name in names:
+            bus.registers["Torque_Enable", name] = bus.registers["Lock", name] = 1
+        bus.on_read = lambda *_, _side=side: setattr(
+            activation.clock, "now", activation.clock.now + (
+                0.003906161 if _side == "left" else right_delay
+            ),
+        )
+
+        def respond(packet, _bus=bus, _wide=wide_respond, _side=side, _names=names):
+            if packet[5:7] == [33, 38]:
+                return _wide(packet)
+            assert packet[5:7] == [63, 1]
+            narrow.append((_side, activation.clock.now))
+            activation.clock.now += 0.004
+            return [
+                byte for name in _names
+                for byte in reply_packet(
+                    _bus.motors[name].id, [_bus.registers["Present_Temperature", name]],
+                    error=getattr(_bus, "thermal_device_error", 0),
+                )
+            ]
+
+        bus.port_handler.respond = respond
+        bus.port_handler.writes.clear()
+    activation.clock.now = 166143.358028699
+    return robot, narrow
+
+
+def test_live_consumer_saved20_boundary_acquires_next_real_slot_before_strict_check(activation):
+    robot, narrow = combined20_live_boundary(activation)
+    originals = {key: state["window"] for key, state in robot._am1_teleop_temperatures.items()}
+    origin = originals["left", 1]._origin_ns
+    teleop.poll_health(robot)
+    assert [side for side, _ in narrow] == ["left", "right"]
+    thermal = robot._am1_teleop_temperatures["left", 1]["window"]
+    assert thermal is originals["left", 1] and thermal._origin_ns == origin
+    assert thermal.outliers == 1 and len(thermal.samples) == 5
+    assert thermal.samples[0] == (166142.984871457, 31)
+    assert thermal.samples[-1][0] == pytest.approx(166143.369934860)
+    health = robot._am1_teleop_health["left"]
+    assert health["timing"]["Status"]["read_completed_at_monotonic_s"] == pytest.approx(166143.361934860)
+    assert health["timing"]["Present_Temperature"]["read_completed_at_monotonic_s"] == thermal._last_sample_at
+    assert health["temperature"]["arm_left_shoulder_pan"]["samples"] == list(thermal.samples)
+    for state in robot._am1_teleop_temperatures.values():
+        state["window"].assert_fresh(activation.clock.now)
+    assert all(state["window"] is originals[key] for key, state in robot._am1_teleop_temperatures.items())
+
+
+def test_live_consumer_without_new_slot_keeps_exact_original_wide_reads(activation):
+    robot, narrow = combined20_live_boundary(activation, right_delay=0.0005)
+    teleop.poll_health(robot)
+    assert narrow == []
+    assert [len(bus.port_handler.writes) for bus in (robot.left_bus, robot.right_bus)] == [1, 1]
+    assert robot._am1_teleop_temperatures["left", 1]["window"].samples[0][0] == 166142.864883104
+
+
+@pytest.mark.parametrize("problem", ["stale_raw", "latched"])
+def test_live_consumer_due_pass_refuses_lost_raw_or_latched_history_before_extra_io(
+    activation, monkeypatch, problem,
+):
+    robot, narrow = combined20_live_boundary(activation)
+    original = teleop.read_groups
+    window = robot._am1_teleop_temperatures["left", 1]["window"]
+    def delayed(*args, **kwargs):
+        records = original(*args, **kwargs)
+        if problem == "stale_raw":
+            activation.clock.now += 0.501
+        else:
+            with pytest.raises(RuntimeError):
+                window.refuse("retained thermal first cause")
+        return records
+    monkeypatch.setattr(teleop, "read_groups", delayed)
+    with pytest.raises(RuntimeError, match="stale|retained thermal first cause"):
+        teleop.poll_health(robot)
+    assert narrow == []
+    assert [len(bus.port_handler.writes) for bus in (robot.left_bus, robot.right_bus)] == [1, 1]
+    assert window.failure is not None
+
+
+def test_live_consumer_due_read_cannot_erase_confirmed_high_slots(activation):
+    robot, narrow = combined20_live_boundary(activation, recent_highs=True)
+    old_right = robot.right_bus.on_read
+    def heat_after_left(*args):
+        old_right(*args)
+        robot.left_bus.registers["Present_Temperature", "arm_left_shoulder_pan"] = 70
+    robot.right_bus.on_read = heat_after_left
+    with pytest.raises(RuntimeError, match="majority"):
+        teleop.poll_health(robot)
+    window = robot._am1_teleop_temperatures["left", 1]["window"]
+    assert [side for side, _ in narrow] == ["left"]
+    assert sum(value >= 70 for _, value in window.samples) == 3
+    assert list(window.samples)[-3:-1] == [(166143.194007574, 70), (166143.276878311, 70)]
+    first = robot._am1_teleop_first_error
+    writes = len(robot.left_bus.port_handler.writes)
+    with pytest.raises(RuntimeError) as repeated:
+        teleop.poll_health(robot)
+    assert repeated.value is first and len(robot.left_bus.port_handler.writes) == writes
+
+
+def test_live_consumer_due_read_retains_actual_device_error_guard(activation):
+    robot, narrow = combined20_live_boundary(activation)
+    robot.left_bus.thermal_device_error = 126
+    with pytest.raises(RuntimeError, match="actual device error"):
+        teleop.poll_health(robot)
+    assert [side for side, _ in narrow] == ["left"]
+    assert robot._am1_teleop_fault["group_reply"]["packets"][0]["device_error"] == 126
+
+
+def test_live_consumer_stale_after_one_due_pass_still_faults_without_retry(activation, monkeypatch):
+    robot, narrow = combined20_live_boundary(activation)
+    original = teleop.read_groups
+    def delayed(*args, **kwargs):
+        records = original(*args, **kwargs)
+        if args[1] == ("Present_Temperature",):
+            activation.clock.now += 0.12
+        return records
+    monkeypatch.setattr(teleop, "read_groups", delayed)
+    with pytest.raises(RuntimeError, match="five-slot feedback window is stale"):
+        teleop.poll_health(robot)
+    assert [side for side, _ in narrow] == ["left", "right"]
+    window = robot._am1_teleop_temperatures["left", 1]["window"]
+    assert activation.clock.now - window._last_sample_at < 0.5
+    assert activation.clock.now - window.samples[0][0] > 0.5
