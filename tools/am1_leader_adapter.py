@@ -232,6 +232,25 @@ def expired_input_refusal(error):
     )
 
 
+def mailbox_input_refusal(error):
+    identity = getattr(error, "identity", None)
+    keys = {"run_id", "service_incarnation", "controller_generation", "connection_generation",
+            "host_incarnation", "intent_revision"}
+    return (
+        isinstance(error, CommandRefusedError)
+        and getattr(error, "operation", None) == "input"
+        and isinstance(identity, dict) and set(identity) == keys
+        and type(identity["intent_revision"]) is int and identity["intent_revision"] >= 0
+        and all(type(identity[key]) is str and identity[key] for key in keys - {"intent_revision"})
+        and error.response.get("uncertain", False) is False
+        and all(
+            error.response.get(key) == value and type(error.response.get(key)) is type(value)
+            for key, value in {"accepted": False, "status": "refused",
+                               "reason": "physical input mailbox refused", "effect_admitted": False}.items()
+        )
+    )
+
+
 def recovery_grant_refusal(error):
     return (
         isinstance(error, CommandRefusedError)
@@ -608,6 +627,21 @@ class SameRunRecovery:
     ):
         # This is the existing authenticated owner read, not a WSS freshness
         # guess. Anchor BEFORE the read so HTTP time cannot extend the ceiling.
+        mailbox_refusal = expected_pause == "native_input_expired" and refusal_identity is not None
+        if mailbox_refusal:
+            binding = {"run_id": self.original["run"]["run_id"], "service_incarnation": self.original["service"],
+                       "controller_generation": self.original["controller"]["controller_generation"],
+                       "connection_generation": self.client.connection,
+                       "host_incarnation": self.original["run"]["backend_incarnation"]}
+            if (
+                not isinstance(refusal_identity, dict)
+                or set(refusal_identity) != {*binding, "intent_revision"}
+                or any(type(refusal_identity[k]) is not type(v) or refusal_identity[k] != v
+                       for k, v in binding.items())
+                or type(refusal_identity["intent_revision"]) is not int
+                or refusal_identity["intent_revision"] < 0
+            ):
+                raise RuntimeError("original mailbox input refusal identity changed")
         requested = time.monotonic()
         state = (
             await asyncio.wait_for(
@@ -624,6 +658,13 @@ class SameRunRecovery:
             }
         )
         self.check(state, history=False)
+        if mailbox_refusal and (
+            self.client.connection != refusal_identity["connection_generation"]
+            or state["run"]["status"] != "paused"
+            or type(state["run"].get("intent_revision")) is not int
+            or state["run"]["intent_revision"] != refusal_identity["intent_revision"] + 1
+        ):
+            raise RuntimeError("original mailbox input refusal/current ordinary pause unavailable")
         recovered, local_ceiling, episode = False, wall_deadline, None
         if state["run"]["status"] != "recovering" and (require_episode or expected_pause):
             run = state["run"]
@@ -767,6 +808,8 @@ class SameRunRecovery:
                 )
         self.check(state)  # A cleared descriptor alone never proves a closed episode.
         timeout = None if local_ceiling is None else max(0, local_ceiling - time.monotonic())
+        if mailbox_refusal and self.client.connection != refusal_identity["connection_generation"]:
+            raise RuntimeError("original mailbox input refusal connection changed before Resume")
         await asyncio.wait_for(self.client.resume(check=self.check), timeout)
         self.check(self.client.snapshot)
         if recovered:
@@ -848,6 +891,7 @@ async def send_leader_sample(client, producer, body, record, *, phase, progress_
             dict(op="input", **identity, grant_id=grant["grant_id"], seq=client.sequence, **frame)
         )
     except CommandRefusedError as error:
+        error.operation, error.identity = "input", dict(identity)
         record(
             {
                 "event": "leader_frame_rejected",
@@ -1256,9 +1300,11 @@ async def run(args):
                     progress_s=workload.elapsed_s if workload else None,
                 )
             except CommandRefusedError as error:
-                if not recovery_grant_refusal(error):
+                mailbox = mailbox_input_refusal(error)
+                if not (recovery_grant_refusal(error) or mailbox):
                     raise
-                await rejoin(require_episode=True, refusal_identity=error.identity)
+                await rejoin(require_episode=True, refusal_identity=error.identity,
+                             expected_pause="native_input_expired" if mailbox else None)
                 continue
             if sent is None:
                 if workload:
@@ -1326,10 +1372,12 @@ async def run(args):
                     ) from error
                 raise
             except CommandRefusedError as error:
-                if not recovery_grant_refusal(error):
+                mailbox = mailbox_input_refusal(error)
+                if not (recovery_grant_refusal(error) or mailbox):
                     raise
                 await rejoin(
-                    require_episode=True, refusal_identity=error.identity, until=qualification_at + 2
+                    require_episode=True, refusal_identity=error.identity, until=qualification_at + 2,
+                    expected_pause="native_input_expired" if mailbox else None,
                 )
                 continue
             if sent is None:

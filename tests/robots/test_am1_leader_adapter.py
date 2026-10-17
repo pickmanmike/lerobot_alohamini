@@ -535,11 +535,13 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
     foreign_boundary = failure == "expired_foreign_budget"
     recovery_case = failure in {"recovery", "recovery_fault", "recovery_wall"}
     ordinary_case = failure in {"ordinary_pauses", "ordinary_pauses_no_ack"}
+    mailbox_case = isinstance(failure, str) and failure.startswith("mailbox_")
     timed_expiry = failure in {"expired_first", "expired_zero", "expired_zero_timeout"}
     pc_clock = [10.0]
     if (
         recovery_case
         or ordinary_case
+        or mailbox_case
         or timed_expiry
         or failure in {"zero_deadline_rounding", "zero_inner_timeout"}
     ):
@@ -773,13 +775,17 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
             assert predicate()
 
         def identities(self):
+            if mailbox_case:
+                return dict(run_id=owned_id, service_incarnation="service",
+                            controller_generation=self.generation, connection_generation=self.connection,
+                            host_incarnation="host", intent_revision=self.snapshot["run"]["intent_revision"])
             return {"run_id": self.snapshot["run"]["run_id"] if foreign_boundary else owned_id}
 
         async def resume(self, *, check=None):
             assert self.snapshot["run"]["run_id"] == owned_id
             if check:
                 check(self.snapshot)
-            if recovery_case or ordinary_case:
+            if recovery_case or ordinary_case or mailbox_case:
                 assert self.snapshot["run"]["status"] != "recovering"
                 self.resumes += 1
                 if failure == "ordinary_pauses_no_ack" and self.resumes == 5:
@@ -822,6 +828,39 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 return {"accepted": True, "grant_id": str(uuid4()), "expires": 99.0}
             assert payload["op"] == "input"
             self.inputs.append(copy.deepcopy(payload))
+            if mailbox_case and self.authoritative is None and len(self.inputs) == (
+                2 if failure in {"mailbox_zero", "mailbox_zero_budget"} else 1
+            ):
+                self.authoritative = copy.deepcopy(self.snapshot)
+                current = self.authoritative
+                revision = current["run"]["intent_revision"] + 1
+                current["run"].update(status="paused", intent_revision=revision, recovery=None)
+                current["run"]["live_input"]["cursor_intent_revision"] = revision
+                current["evidence"]["acknowledged_intent_revision"] = revision
+                current["evidence"]["accepted_host_action"].update(state="paused", intent_revision=revision)
+                current["events"] = [{"kind": "native_input_expired", "at": 2.0,
+                                      "run_id": owned_id, "service_incarnation": "service"}]
+                if failure == "mailbox_running":
+                    current["run"]["status"] = "running"
+                elif failure == "mailbox_recovering":
+                    current["run"].update(status="recovering", recovery={"started": 2., "ceiling": 3., "revision": revision})
+                elif failure == "mailbox_uncertain":
+                    current["run"]["uncertain"] = True
+                elif failure == "mailbox_fault":
+                    current["evidence"]["fault"] = "retained genuine native fault"
+                elif failure == "mailbox_run":
+                    current["run"]["run_id"] = foreign_id
+                elif failure == "mailbox_revision":
+                    current["run"]["intent_revision"] -= 1
+                elif failure == "mailbox_manual":
+                    current["events"][0]["kind"] = "pause"
+                elif failure == "mailbox_deadline":
+                    current["run"]["deadline"] += 1
+                elif failure == "mailbox_workspace":
+                    current["run"]["live_input"]["workspace"]["reference"][KEYS[0]] += 1
+                raise m.CommandRefusedError({"accepted": False, "status": "refused",
+                                            "reason": "physical input mailbox refused",
+                                            "effect_admitted": failure == "mailbox_effect"})
             if len(self.inputs) >= 2 and failure == "zero_deadline_rounding":
                 await asyncio.sleep(10)  # Owned2s timer expires while coarse PC clock has not ticked.
             if len(self.inputs) >= 2 and failure == "zero_inner_timeout":
@@ -851,6 +890,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
             if (
                 recovery_case
                 or ordinary_case
+                or mailbox_case
                 or timed_expiry
                 or failure in {"zero_deadline_rounding", "zero_inner_timeout"}
             ):
@@ -871,6 +911,12 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
         async def get(self, op):
             assert op == "state"
             self.cleanup_reads += 1
+            if mailbox_case and self.authoritative is not None and not self.stops:
+                pc_clock[0] += 2.01 if failure == "mailbox_zero_budget" else 0.05
+                self.snapshot = copy.deepcopy(self.authoritative)
+                if failure == "mailbox_connection":
+                    self.connection = "replacement-connection"
+                return {"snapshot": self.snapshot}
             if ordinary_case and not self.stops:
                 pc_clock[0] += 0.05  # Held reads must not add active workload time.
             if recovery_case and self.authoritative is not None and not self.stops:
@@ -935,6 +981,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
         if failure
         and not recovery_case
         and not ordinary_case
+        and not mailbox_case
         and (not dropped or failure == "expired_usb_budget")
         else "virtual-leaders",
         output=str(tmp_path / "evidence"),
@@ -1031,6 +1078,43 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                     summary["start_outcome_uncertain"] is True and summary["native_cleanup_uncertain"] is True
                 )
                 assert summary["failure"] == attempts[0]["message"]
+        return
+    if mailbox_case:
+        import json
+
+        args.next_start_seconds, args.duration_seconds = (
+            (0.001, 180.) if failure in {"mailbox_zero", "mailbox_zero_budget"} else (None, 0.02)
+        )
+        succeeds = failure in {"mailbox_main", "mailbox_zero"}
+        if succeeds:
+            summary = asyncio.run(asyncio.wait_for(m.run(args), 5))
+        else:
+            with pytest.raises((RuntimeError, TimeoutError)):
+                asyncio.run(asyncio.wait_for(m.run(args), 5))
+            summary = json.loads((tmp_path / "evidence" / "summary.json").read_text())
+        session = instances[0]
+        records = [json.loads(line) for line in (tmp_path / "evidence" / "frames.jsonl").read_text().splitlines()]
+        rejected = [row for row in records if row["event"] == "leader_frame_rejected"]
+        assert len(rejected) == 1 and rejected[0]["discarded"] is True
+        assert rejected[0]["fresh_acquisition_allowed"] is False
+        assert rejected[0]["receipt"]["reason"] == "physical input mailbox refused"
+        assert session.starts == 1 and session.stops == ([] if failure == "mailbox_run" else [owned_id])
+        assert session.closed == 1
+        if failure == "mailbox_run":
+            assert summary["native_cleanup_uncertain"] is True  # Never Stop a foreign current run.
+        assert summary["original_native_deadline"] == 301. and summary["qualified_native_recovery_episodes"] == 0
+        assert [item["source"]["sample_seq"] for item in session.inputs] == list(range(1, len(session.inputs) + 1))
+        assert len({item["grant_id"] for item in session.inputs}) == len(session.inputs)
+        assert len({item["source"]["source_id"] for item in session.inputs}) == 1
+        if succeeds:
+            assert session.resumes == 2 and summary["qualified_recoveries"] == 1
+            assert summary["final_body_zero"] is True
+            assert len(session.inputs) > (2 if failure == "mailbox_zero" else 1)
+            if failure == "mailbox_main":
+                assert summary["frame_count"] == 2 and summary["active_progress_s"] == pytest.approx(0.02)
+        else:
+            assert session.resumes == 1
+            assert len(session.inputs) == (2 if failure == "mailbox_zero_budget" else 1)
         return
     if ordinary_case:
         args.next_start_seconds, args.duration_seconds = None, 0.05
@@ -2220,3 +2304,91 @@ def test_runner_starting_transport_reattaches_once_to_exact_owned_admission(tmp_
             assert (
                 summary["native_admission_terminal"]["run"]["native_first_cause"] == "original native fault"
             )
+
+
+
+@pytest.mark.parametrize("failure", [
+    "mailbox_main", "mailbox_zero", "mailbox_zero_budget", "mailbox_running",
+    "mailbox_recovering", "mailbox_uncertain", "mailbox_fault", "mailbox_run",
+    "mailbox_connection", "mailbox_revision", "mailbox_manual", "mailbox_deadline",
+    "mailbox_workspace", "mailbox_effect",
+])
+def test_runner_opaque_mailbox_requires_fresh_exact_ordinary_pause(tmp_path, monkeypatch, failure):
+    # Reuse the existing actual run()/source/grant/record/Stop harness unchanged
+    # for every previous case; only this explicitly synthetic loss is injected.
+    test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id(tmp_path, monkeypatch, failure)
+
+
+
+@pytest.mark.parametrize("mutation", [None, "operation", "missing_identity", "bool_revision", "accepted_type",
+                                     "effect_type", "status", "reason", "uncertain", "identity_type"])
+def test_opaque_mailbox_candidate_preserves_exact_nonadmission_and_identity_types(mutation):
+    m = adapter()
+    error = m.CommandRefusedError({"accepted": False, "status": "refused", "effect_admitted": False,
+                                   "reason": "physical input mailbox refused"})
+    error.operation = "input"
+    error.identity = dict(run_id="owned", service_incarnation="service", controller_generation="control",
+                          connection_generation="connection", host_incarnation="host", intent_revision=2)
+    if mutation == "operation":
+        error.operation = "grant"
+    elif mutation == "missing_identity":
+        error.identity.pop("connection_generation")
+    elif mutation == "bool_revision":
+        error.identity["intent_revision"] = True
+    elif mutation == "accepted_type":
+        error.response["accepted"] = 0
+    elif mutation == "effect_type":
+        error.response["effect_admitted"] = 0
+    elif mutation == "status":
+        error.response["status"] = "unknown"
+    elif mutation == "reason":
+        error.response["reason"] = "another refusal"
+    elif mutation == "uncertain":
+        error.response["uncertain"] = True
+    elif mutation == "identity_type":
+        error.identity["host_incarnation"] = False
+    assert m.mailbox_input_refusal(error) is (mutation is None)
+    assert not m.expired_input_refusal(error)  # An opaque refusal never becomes lease expiry.
+
+
+@pytest.mark.parametrize("missing", ["hold_acknowledged", "pose_aligned", "native_ack", "cursor_revision", "view"])
+def test_opaque_mailbox_rejoin_still_waits_for_actual_current_held_proof(missing):
+    import asyncio
+    import copy
+
+    m = adapter()
+    paused = recovery_state()
+    paused["run"].update(status="paused", intent_revision=3)
+    paused["events"] = [{"kind": "native_input_expired", "at": 100.01,
+                          "run_id": "owned", "service_incarnation": "service"}]
+    paused["run"]["live_input"]["cursor_intent_revision"] = 3
+    paused["evidence"]["acknowledged_intent_revision"] = 3
+    paused["evidence"]["accepted_host_action"]["intent_revision"] = 3
+    if missing == "cursor_revision":
+        paused["run"]["live_input"]["cursor_intent_revision"] = 2
+    elif missing == "view":
+        paused["run"]["live_input"]["required_view"]["qualified"] = False
+    else:
+        paused["evidence"][missing] = False
+    calls = []
+    class Client:
+        snapshot = recovery_state()
+        device, generation, connection = "device", "control", "connection"
+        resume, identities = m.SessionClient.resume, m.SessionClient.identities
+        async def get(self, path):
+            return {"snapshot": copy.deepcopy(paused)}
+        async def command(self, payload):
+            calls.append(payload["op"])
+            assert payload["op"] != "resume"
+            return {"connection_generation": "new-qualified-connection", "snapshot": self.snapshot}
+        async def wait(self, predicate, timeout):
+            assert timeout == 8 and not predicate()
+            raise TimeoutError("current held feedback remains unqualified")
+    async def scenario():
+        client = Client()
+        refused = client.identities()
+        guard = m.SameRunRecovery(client, lambda value: None)
+        with pytest.raises(TimeoutError, match="held feedback"):
+            await guard.resume(require_episode=True, refusal_identity=refused, expected_pause="native_input_expired")
+        assert calls == ["connect", "release_input"] and guard.episodes == 0
+    asyncio.run(scenario())
