@@ -491,7 +491,14 @@ class SessionClient:
     async def resume(self, *, check=None):
         if check:
             check(self.snapshot)
-        connected = await self.command(dict(op="connect", **self.identities()))
+        identity = self.identities()
+        try:
+            connected = await self.command(dict(op="connect", **identity))
+        except ConnectionError as error:
+            # Lost connect results are ambiguous, never nonadmission receipts.
+            # Later release/Resume/input failures deliberately have no such tag.
+            error.connect_identity = dict(identity)
+            raise
         self.connection = connected["connection_generation"]
         self.snapshot = connected["snapshot"]
         self.sequence = 0
@@ -574,7 +581,7 @@ class SameRunRecovery:
                     "run": {
                         key: state["run"][key]
                         for key in ("run_id", "recipe", "backend_incarnation", "native_live_at", "deadline")
-                    },
+                    } | ({"operation_id": state["run"]["operation_id"]} if "operation_id" in state["run"] else {}),
                     "service": state["service_incarnation"],
                     "controller": {"device_id": client.device, "controller_generation": client.generation},
                     "workspace": live["workspace"],
@@ -584,6 +591,7 @@ class SameRunRecovery:
             )
         )
         self.episodes, self.cause, self.pause_recoveries = 0, None, 0
+        self.connect_rebindings = 0
         self.check(state)
 
     def history_qualified(self, state):
@@ -623,7 +631,8 @@ class SameRunRecovery:
             raise RuntimeError("native recovery must qualify before explicit Resume")
 
     async def resume(
-        self, *, wall_deadline=None, require_episode=False, refusal_identity=None, expected_pause=None
+        self, *, wall_deadline=None, require_episode=False, refusal_identity=None, expected_pause=None,
+        renewal_check=None,
     ):
         # This is the existing authenticated owner read, not a WSS freshness
         # guess. Anchor BEFORE the read so HTTP time cannot extend the ceiling.
@@ -649,6 +658,7 @@ class SameRunRecovery:
             )
         )["snapshot"]
         self.client.snapshot = state
+        native_remaining = (state.get("run") or {}).get("remaining_s")
         self.record(
             {
                 "event": "owner_rejoin_state",
@@ -810,8 +820,124 @@ class SameRunRecovery:
         timeout = None if local_ceiling is None else max(0, local_ceiling - time.monotonic())
         if mailbox_refusal and self.client.connection != refusal_identity["connection_generation"]:
             raise RuntimeError("original mailbox input refusal connection changed before Resume")
-        await asyncio.wait_for(self.client.resume(check=self.check), timeout)
+        if renewal_check:
+            renewal_check()
+        try:
+            await asyncio.wait_for(self.client.resume(check=self.check), timeout)
+        except ConnectionError as original:
+            close = dict(getattr(self.client, "transport_close", None) or {})
+            identity = getattr(original, "connect_identity", None)
+            expected = dict(
+                run_id=self.original["run"]["run_id"], service_incarnation=self.original["service"],
+                host_incarnation=self.original["run"]["backend_incarnation"],
+                controller_generation=self.original["controller"]["controller_generation"],
+                connection_generation=self.client.connection, intent_revision=state["run"]["intent_revision"],
+            )
+            if (
+                recovered
+                or close.get("expected") is not False or close.get("reason") != "stream-ended"
+                or close.get("close_code") != 1006 or close.get("reader_error") is not None
+                or not isinstance(identity, dict) or set(identity) != set(expected)
+                or any(type(identity[k]) is not type(v) or identity[k] != v for k, v in expected.items())
+                or type(identity["intent_revision"]) is not int
+            ):
+                raise
+            self.connect_rebindings += 1
+            try:
+                if (
+                    type(self.original["run"].get("operation_id")) is not str
+                    or not self.original["run"]["operation_id"]
+                    or any(type(identity[k]) is not str or not identity[k] for k in identity if k != "intent_revision")
+                    or type(native_remaining) not in (int, float) or not math.isfinite(native_remaining)
+                    or not 0 < native_remaining <= self.original["run"]["deadline"] - self.original["run"]["native_live_at"]
+                ):
+                    raise RuntimeError("original native rejoin clock/operation unavailable")
+                def pause_event(snapshot):
+                    return next((event for event in reversed(snapshot.get("events", []))
+                                 if event.get("run_id") == self.original["run"]["run_id"]
+                                 and event.get("service_incarnation") == self.original["service"]), {})
+                original_event = pause_event(state)
+                if (
+                    state["run"].get("status") != "paused" or state["run"].get("recovery") is not None
+                    or set(original_event) != {"kind", "at", "run_id", "service_incarnation"}
+                    or original_event.get("kind") not in {"input_expired", "native_input_expired", "required_view_expired"}
+                    or expected_pause is not None and original_event["kind"] != expected_pause
+                    or type(original_event.get("at")) not in (int, float) or not math.isfinite(original_event["at"])
+                    or not self.original["run"]["native_live_at"] <= original_event["at"] < self.original["run"]["deadline"]
+                ):
+                    raise RuntimeError("original cause-specific ordinary pause unavailable")
+                # Anchor before the FIRST authenticated read; its latency and
+                # all subsequent replacement work consume this same ceiling.
+                ceiling = min(requested + native_remaining,
+                              local_ceiling if local_ceiling is not None else float("inf"))
+                def remaining():
+                    value = ceiling - time.monotonic()
+                    if value <= 0:
+                        raise TimeoutError("original rejoin ceiling exhausted")
+                    return value
+                if renewal_check:
+                    renewal_check()
+                self.record({"event": "ordinary_connect_transport_closed", "transport_close": close,
+                             "identity": identity, "pause_event": original_event,
+                             "remaining_s": remaining(), "outcome": "ambiguous"})
+                budget = remaining()
+                await asyncio.wait_for(self.client.detach(), budget)
+                budget = remaining()
+                await asyncio.wait_for(self.client.attach(), budget)
+                budget = remaining()
+                fresh = (await asyncio.wait_for(self.client.get("state"), budget))["snapshot"]
+                self.client.snapshot = fresh
+                self.check(fresh)
+                run, evidence, live = fresh["run"], fresh.get("evidence", {}), _live(fresh)
+                revision = run.get("intent_revision")
+                ack = evidence.get("accepted_host_action") or {}
+                stamp, old_stamp = ack.get("acquired_at_monotonic_s"), (
+                    state.get("evidence", {}).get("accepted_host_action") or {}
+                ).get("acquired_at_monotonic_s")
+                current_remaining = run.get("remaining_s")
+                if (
+                    run.get("status") != "paused" or run.get("recovery") is not None
+                    or pause_event(fresh) != original_event
+                    or type(revision) is not int or revision not in (identity["intent_revision"], identity["intent_revision"] + 1)
+                    or self.client.connection != identity["connection_generation"]
+                    or not all(evidence.get(k) is True for k in
+                               ("feedback", "required_observation", "hold_acknowledged", "pose_aligned", "native_ack"))
+                    or evidence.get("active_acknowledged") is not False
+                    or ack.get("run_id") != run["run_id"]
+                    or ack.get("host_incarnation") != run["backend_incarnation"]
+                    or ack.get("state") != "paused" or type(ack.get("intent_revision")) is not int
+                    or ack["intent_revision"] != revision
+                    or type(evidence.get("acknowledged_intent_revision")) is not int
+                    or evidence["acknowledged_intent_revision"] != revision
+                    or type(live.get("cursor_intent_revision")) is not int or live["cursor_intent_revision"] != revision
+                    or live.get("required_view", {}).get("qualified") is not True
+                    or any(type(v) not in (int, float) or not math.isfinite(v)
+                           for v in (stamp, old_stamp, current_remaining))
+                    or not 0 < current_remaining <= native_remaining
+                    or not old_stamp <= stamp <= run["deadline"] - current_remaining
+                ):
+                    raise RuntimeError("current ordinary paused binding/held feedback unavailable")
+                if renewal_check:
+                    renewal_check()
+                remaining()
+                self.record({"event": "ordinary_connect_requalified", "intent_revision": revision,
+                             "remaining_s": remaining()})
+                # One deliberate NEW binding, after current held qualification.
+                # The old command/result and every acquired input stay discarded.
+                budget = remaining()
+                await asyncio.wait_for(self.client.resume(check=self.check), budget)
+                if renewal_check:
+                    renewal_check()
+                remaining()
+            except Exception as qualification_error:
+                try:
+                    self.record({"event": "ordinary_connect_requalification_failed",
+                                 "error_type": type(qualification_error).__name__, "message": str(qualification_error)})
+                finally:
+                    raise original from qualification_error
         self.check(self.client.snapshot)
+        if renewal_check:
+            renewal_check()
         if recovered:
             self.record(
                 {
@@ -1174,7 +1300,13 @@ async def run(args):
             duration = args.next_start_seconds or (args.duration_seconds if workload is None else None)
             return None if duration is None else active_at + duration
 
+        def renewal_healthy():
+            if renewal.done():
+                renewal.result()
+                raise RuntimeError("original controller renewal ended")
+
         async def rejoin(*, require_episode=False, refusal_identity=None, expected_pause=None, until=None):
+            renewal_healthy()
             if workload:
                 workload.freeze()
             recovered = await recovery.resume(
@@ -1182,6 +1314,7 @@ async def run(args):
                 require_episode=require_episode,
                 refusal_identity=refusal_identity,
                 expected_pause=expected_pause,
+                renewal_check=renewal_healthy,
             )
             producer.native_cursor = _live(client.snapshot)["cursor"]
             producer.reacquire = True

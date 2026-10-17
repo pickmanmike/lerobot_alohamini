@@ -1710,7 +1710,7 @@ def test_original_recovery_ceiling_includes_authenticated_read_time_without_rean
     asyncio.run(asyncio.wait_for(scenario(), 0.3))
 
 
-@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced"])
+@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post"])
 def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(tmp_path, cause):
     import asyncio
     import copy
@@ -1760,6 +1760,7 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                 "intent_revision": revision,
                 "state": live["state"],
                 "epoch": epoch[0],
+                "acquired_at_monotonic_s": a.clock(),
             },
         )
         return value
@@ -1869,6 +1870,58 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
             assert first[2]["accepted"] is True and producer.sequence == 1
             stale = copy.deepcopy(client.snapshot)
             assert stale["run"]["status"] == "running"
+            if cause in {"connect_loss_pre", "connect_loss_post"}:
+                # Synthetic transport failure at the demonstrated initial-connect
+                # boundary. Core, IPC, TLS, gateway and SessionClient are real.
+                a._pause_live_input("input_expired")
+                sent_bindings, lost = [], [False]
+                original_attach, original_call = client.attach, gateway.call
+
+                def capture_binding(ws):
+                    original_send = ws.send_json
+                    async def send(value, **kwargs):
+                        if (value.get("command") or {}).get("op") == "connect":
+                            sent_bindings.append(copy.deepcopy(value))
+                        return await original_send(value, **kwargs)
+                    ws.send_json = send
+
+                async def attached():
+                    await original_attach()
+                    capture_binding(client.ws)
+
+                async def lose_connect(command, device):
+                    if command.get("op") == "connect" and not lost[0]:
+                        lost[0] = True
+                        if cause == "connect_loss_post":
+                            await original_call(command, device)
+                        # Both before-effect and after-effect cases lose the
+                        # pending result. Neither supplies nonadmission proof.
+                        client.ws._response.connection.transport.abort()
+                        return {"accepted": False, "status": "refused"}
+                    return await original_call(command, device)
+
+                capture_binding(client.ws)
+                client.attach, gateway.call = attached, lose_connect
+                assert guard.original["run"]["operation_id"] == a.run["operation_id"]
+                assert not await guard.resume(expected_pause="input_expired")
+                assert len(sent_bindings) == 2
+                assert sent_bindings[0]["id"] != sent_bindings[1]["id"]
+                assert [op for op, _ in commands].count("claim") == 0
+                assert sum(op == "connect" for op, _ in commands) == initial_connects + (
+                    2 if cause == "connect_loss_post" else 1
+                )
+                assert a.run["deadline"] == 309.0 and a.run["native_live_at"] == 9.0
+                assert a.run["first_cause"] is None and a.run["recovery_episodes"] == 0
+                assert guard.pause_recoveries == 1
+                producer.native_cursor = m._live(client.snapshot)["cursor"]
+                producer.reacquire = True
+                fresh = await m.send_leader_sample(
+                    client, producer, m.ZERO_BODY, record, phase="individual", progress_s=0.02
+                )
+                assert fresh[2]["accepted"] is True and producer.sequence == 2
+                assert fresh[0]["grant_id"] != first[0]["grant_id"]
+                assert m._live(client.snapshot)["reference"] == workspace()["reference"]
+                return
             if cause == "view":
                 a._teleop_view["qualified_until"] = 9.0
             else:
@@ -2392,3 +2445,214 @@ def test_opaque_mailbox_rejoin_still_waits_for_actual_current_held_proof(missing
             await guard.resume(require_episode=True, refusal_identity=refused, expected_pause="native_input_expired")
         assert calls == ["connect", "release_input"] and guard.episodes == 0
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("change", [
+    None, "two_losses", "run", "service", "host", "controller", "device", "operation", "reference", "deadline",
+    "uncertain", "fault", "terminal", "running", "recovering", "revision", "bool_revision",
+    "old_ack", "foreign_ack", "old_stamp", "future_stamp", "view", "active_ack",
+    "native_expired", "http_delay", "wall_expired", "expired_fresh", "backward_clock",
+    "reader_error", "second_loss", "renewal", "renewal_after_attach", "release_loss", "resume_loss",
+    "manual_event", "changed_event_time", "nonordinary", "connection",
+])
+def test_pending_connect_replacement_preserves_identity_proof_budget_and_original_error(monkeypatch, change):
+    import asyncio
+    import copy
+    import time
+    from types import SimpleNamespace
+
+    m = adapter()
+    clock = [1000.0]
+    monkeypatch.setattr(m, "time", SimpleNamespace(monotonic=lambda: clock[0], perf_counter=time.perf_counter))
+    initial = recovery_state()
+    initial["run"]["operation_id"] = str(uuid4())  # Actual Core public Start operation field.
+    initial["evidence"]["accepted_host_action"]["acquired_at_monotonic_s"] = 100.0
+    paused = copy.deepcopy(initial)
+    paused["run"]["status"] = "paused"
+    paused["evidence"]["active_acknowledged"] = False
+    paused["events"] = [{"kind": "input_expired", "at": 100.0,
+                         "run_id": "owned", "service_incarnation": "service"}]
+    fresh = copy.deepcopy(paused)
+    fresh["run"].update(intent_revision=3, remaining_s=299.95)
+    fresh["run"]["live_input"]["cursor_intent_revision"] = 3
+    fresh["evidence"]["acknowledged_intent_revision"] = 3
+    fresh["evidence"]["accepted_host_action"].update(intent_revision=3, acquired_at_monotonic_s=100.04)
+    for key, value in {"run": "foreign", "host": "foreign", "operation": str(uuid4()),
+                       "deadline": 401.0, "uncertain": True, "terminal": "stopped",
+                       "running": "running", "recovering": "recovering", "revision": 5,
+                       "bool_revision": True}.items():
+        if change == key:
+            field = {"run": "run_id", "host": "backend_incarnation", "operation": "operation_id",
+                     "terminal": "status", "running": "status", "recovering": "status",
+                     "revision": "intent_revision", "bool_revision": "intent_revision"}.get(key, key)
+            fresh["run"][field] = value
+    if change == "service": fresh["service_incarnation"] = "foreign"
+    if change == "controller": fresh["controller"]["controller_generation"] = "foreign"
+    if change == "device": fresh["controller"]["device_id"] = "foreign"
+    if change == "reference": fresh["run"]["live_input"]["reference"][KEYS[0]] += 1
+    if change == "fault": fresh["evidence"]["fault"] = "retained native fault"
+    if change == "old_ack": fresh["evidence"]["accepted_host_action"]["intent_revision"] = 2
+    if change == "foreign_ack": fresh["evidence"]["accepted_host_action"]["host_incarnation"] = "foreign"
+    if change == "old_stamp": fresh["evidence"]["accepted_host_action"]["acquired_at_monotonic_s"] = 99.0
+    if change == "future_stamp": fresh["evidence"]["accepted_host_action"]["acquired_at_monotonic_s"] = 101.0
+    if change == "view": fresh["run"]["live_input"]["required_view"]["qualified"] = False
+    if change == "active_ack": fresh["evidence"]["active_acknowledged"] = True
+    if change == "expired_fresh": fresh["run"]["remaining_s"] = 0.0
+    if change == "backward_clock": fresh["run"]["remaining_s"] = 300.0
+    if change == "manual_event": fresh["events"][-1]["kind"] = "pause"
+    if change == "changed_event_time": fresh["events"][-1]["at"] += 0.01
+    if change == "nonordinary": paused["events"][-1]["kind"] = "pause"
+    if change == "native_expired": paused["run"]["remaining_s"] = 0.01
+    if change == "http_delay": paused["run"]["remaining_s"] = 0.5
+    original = ConnectionError("original pending WSS result lost")
+    calls, records = [], []
+
+    class Client:
+        snapshot = copy.deepcopy(initial)
+        device, generation, connection = "device", "control", "connection"
+        resume, identities = m.SessionClient.resume, m.SessionClient.identities
+        transport_close = {"expected": False, "reason": "stream-ended", "close_code": 1006, "reader_error": None}
+        attaches = reads = connects = 0
+        lost = False
+
+        async def get(self, path):
+            assert path == "state"
+            self.reads += 1
+            clock[0] += 0.7 if change == "http_delay" and self.reads == 1 else 0.01
+            self.snapshot = copy.deepcopy(paused if self.reads % 2 else fresh)
+            if change == "connection" and self.reads == 2:
+                self.connection = "foreign-connection"
+            return {"snapshot": self.snapshot}
+
+        async def detach(self):
+            self.snapshot = None
+            clock[0] += 0.01
+
+        async def attach(self):
+            assert self.snapshot is None  # Old cached state cannot satisfy attachment.
+            self.attaches += 1
+            clock[0] += 2.01 if change == "wall_expired" else 0.01
+            self.snapshot = copy.deepcopy(fresh)
+
+        async def command(self, payload):
+            calls.append(copy.deepcopy(payload))
+            clock[0] += 0.02
+            op = payload["op"]
+            if op == "connect":
+                self.connects += 1
+                if (self.connects == 1 or change == "two_losses" and self.connects == 3) and change not in {"release_loss", "resume_loss"}:
+                    self.lost = True
+                    if change == "reader_error":
+                        self.transport_close = dict(self.transport_close, reader_error={"message": "reporting failed"})
+                    raise original if self.connects == 1 else ConnectionError("later distinct connect result lost")
+                if change == "second_loss":
+                    raise ConnectionError("distinct replacement result lost")
+                self.snapshot["run"]["intent_revision"] += 1
+                revision = self.snapshot["run"]["intent_revision"]
+                self.snapshot["run"]["live_input"]["cursor_intent_revision"] = revision
+                self.snapshot["evidence"]["acknowledged_intent_revision"] = revision
+                self.snapshot["evidence"]["accepted_host_action"]["intent_revision"] = revision
+                return {"connection_generation": "new-binding", "snapshot": self.snapshot}
+            if op == "release_input":
+                if change == "release_loss": raise original
+                return {"accepted": True}
+            assert op == "resume"
+            if change == "resume_loss": raise original
+            self.snapshot["run"]["status"] = "running"
+            self.snapshot["evidence"]["active_acknowledged"] = True
+            return {"accepted": True}
+
+        async def wait(self, predicate, timeout):
+            assert predicate(), "existing current held proof is required before Resume"
+
+    async def scenario():
+        client = Client()
+        guard = m.SameRunRecovery(client, records.append)
+        def renewal_healthy():
+            if change == "renewal" and client.lost or change == "renewal_after_attach" and client.attaches:
+                raise RuntimeError("original HTTP renewal failed")
+        if change in {None, "two_losses"}:
+            assert not await guard.resume(wall_deadline=1002.0, expected_pause="input_expired",
+                                          renewal_check=renewal_healthy)
+            assert client.attaches == 1 and client.connects == 2
+            assert guard.pause_recoveries == 1 and guard.episodes == 0 and guard.connect_rebindings == 1
+            if change == "two_losses":
+                # A completed replacement does not spend a run-wide quota.
+                # A later distinct ordinary pause owns its own single attempt.
+                paused.clear()
+                paused.update(copy.deepcopy(client.snapshot))
+                paused["run"].update(status="paused", intent_revision=5, remaining_s=299.85)
+                paused["run"]["live_input"]["cursor_intent_revision"] = 5
+                paused["evidence"].update(active_acknowledged=False, acknowledged_intent_revision=5)
+                paused["evidence"]["accepted_host_action"].update(state="paused", intent_revision=5,
+                                                                    acquired_at_monotonic_s=100.14)
+                paused["events"][-1]["at"] = 100.1
+                fresh.clear()
+                fresh.update(copy.deepcopy(paused))
+                fresh["run"].update(intent_revision=6, remaining_s=299.80)
+                fresh["run"]["live_input"]["cursor_intent_revision"] = 6
+                fresh["evidence"]["acknowledged_intent_revision"] = 6
+                fresh["evidence"]["accepted_host_action"].update(intent_revision=6, acquired_at_monotonic_s=100.19)
+                assert not await guard.resume(wall_deadline=1002.0, expected_pause="input_expired",
+                                              renewal_check=renewal_healthy)
+                assert client.attaches == 2 and client.connects == 4
+                assert guard.pause_recoveries == 2 and guard.episodes == 0 and guard.connect_rebindings == 2
+        else:
+            with pytest.raises(ConnectionError) as caught:
+                await guard.resume(wall_deadline=1002.0,
+                                   expected_pause=None if change == "nonordinary" else "input_expired",
+                                   renewal_check=renewal_healthy)
+            assert caught.value is original
+            assert not any(call["op"] == "resume" for call in calls) or change == "resume_loss"
+            assert client.connects == (2 if change == "second_loss" else 1)
+            if change in {"reader_error", "release_loss", "resume_loss", "renewal", "native_expired", "http_delay"}:
+                assert client.attaches == 0
+            if change not in {"reader_error", "release_loss", "resume_loss"}:
+                assert records[-1]["event"] == "ordinary_connect_requalification_failed"
+        assert not any(call["op"] in {"claim", "start", "input"} for call in calls)
+    asyncio.run(asyncio.wait_for(scenario(), 0.5))
+
+
+def test_input_transport_ambiguity_remains_discarded_without_connect_reattachment():
+    import asyncio
+
+    m = adapter()
+    calls, records = [], []
+    original = ConnectionError("input outcome remains ambiguous")
+    class Input:
+        kind = "virtual-leaders"
+        def get_action(self):
+            return {key.removeprefix("arm_"): value for key, value in workspace()["reference"].items()}
+    class Client:
+        snapshot = recovery_state()
+        device, generation, connection, sequence = "device", "control", "connection", 0
+        identities = m.SessionClient.identities
+        async def command(self, command):
+            calls.append(command)
+            if command["op"] == "grant":
+                return {"accepted": True, "grant_id": str(uuid4()), "expires": 400.0}
+            assert command["op"] == "input"
+            raise original
+    async def scenario():
+        producer = m.FrameProducer(Input())
+        producer.workspace = workspace()
+        producer.native_cursor = workspace()["reference"]
+        with pytest.raises(ConnectionError) as caught:
+            await m.send_leader_sample(Client(), producer, m.ZERO_BODY, records.append,
+                                       phase="individual", progress_s=0.1)
+        assert caught.value is original and not hasattr(original, "connect_identity")
+        assert [call["op"] for call in calls] == ["grant", "input"]
+        assert [row["event"] for row in records] == ["leader_frame_attempt"]
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("missing", ["run_id", "recipe", "backend_incarnation", "native_live_at", "deadline"])
+def test_same_run_recovery_retains_all_five_required_original_run_pins(missing):
+    from types import SimpleNamespace
+
+    m = adapter()
+    state = recovery_state()
+    state["run"].pop(missing)
+    client = SimpleNamespace(snapshot=state, device="device", generation="control")
+    with pytest.raises(KeyError, match=missing):
+        m.SameRunRecovery(client, lambda value: None)
