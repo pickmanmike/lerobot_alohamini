@@ -30,15 +30,15 @@ valid required local observation/diagnostic evidence. Separate decoded view prog
 from capture freshness and motor health; optional loss cannot consume unrelated
 recovery budgets. Keep media work and routine logs outside the motor loop.
 
-Current known stopped deployment: motor a7d17886de711f42618f581b3d226ff991cd4ed7,
+Current known stopped deployment: motor 168915d04a9345e5b064a3d23142999f5c96b8e1,
 protected runtime 7447480924c288fed3a76fc981433b41c7bfcefe, camera
 bc3442b54d9c574a8feddb0ade642c9b351e59f9; manifest
-13012258179ddc6c2a8c28d4e50c1e48f886eeb1329ca404191e3336e498957d.
+01d2bed7c629d3416354ab31556ae998a270b9220bb09c31d8b30369332982df.
 Helper/manual remains 0fe3997f. Immediate matched rollback retains motor
-ff9d5e460dd1a15b3b93abb387d7bf6bf78604a8 with the same runtime/camera and manifest
-d20c49f53b8967f945f7e0b007d3df089b31861d71116929ee9ddf09b9064749.
+a7d17886de711f42618f581b3d226ff991cd4ed7 with the same runtime/camera and manifest
+13012258179ddc6c2a8c28d4e50c1e48f886eeb1329ca404191e3336e498957d.
 The AM1-only group-reply integrity repair and sticky prewrite fault fence passed
-119 focused tests and two independent reviews; all ten affected-motor stage08
+119 focused tests and two independent reviews; all ten affected-motor stage09
 phases and persistent available-idle checks passed without starting hardware.
 Combined08's decoded shoulder-pan temperature126 versus installed70 remains
 unresolved actual wire provenance; Combined07's numeric trigger is still unknown.
@@ -55,7 +55,14 @@ The reviewed AM1 client correction retained80advances with no premature retireme
 110 focused connection/cadence tests pass. Retain credits until ORIGINAL request
 age1s, rather than retiring each40ms empty poll; never refresh timestamps. Three
 credits,40ms polls, original1s feedback and250ms input freshness remain unchanged.
-Stage only this client motor delta before the next supported combined trial.
+All ten stage09 idle-only phases passed, but Combined10 exposed import ownership:
+the Pi owner loads alohamini_client.py from its runtime checkout, whose original
+SHA235f7a8a still has old polling; the reviewed9315af5b copy was staged only in the
+motor checkout. Combined10 stayed preLive at observation3 and ended at the original
+180s startup timeout, with all originals saved and verified cleanup. Correct only
+the actual runtime copy using the same reviewed9315af5b source, preserve the current
+motor/camera pins, and verify actual owner-environment module path/hash before Start.
+Do not claim production validation of a source that its owner did not import.
 Preserve calibration, trust, private permissions, source imports and separate full
 component rollback bundles.
 Tasks stay stopped during editing/staging; services restore idle without replay.
