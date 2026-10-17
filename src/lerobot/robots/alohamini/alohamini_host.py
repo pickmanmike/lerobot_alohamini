@@ -213,7 +213,7 @@ class AM1LocalControl:
         summary["hold_completed_at_monotonic_s"] = self.clock()
         self.state = "paused"
         summary["state"] = "expired" if expired else "held"
-        self.accepted_action = {"mode": "measured_arm_hold", "body_velocity": 0.0}
+        self.accepted_action = {"mode": "raw_goal_hold" if self.teleop else "measured_arm_hold", "body_velocity": 0.0}
         self.live_sample = None
         if self.teleop:
             summary["body"] = {"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0, "lift_axis.vel": 0}
@@ -578,12 +578,13 @@ class AM1LocalControl:
             if self.binding is not None:
                 self.intent_revision = marker["intent_revision"]
                 self.accepted_action_sequence = marker["action_sequence"]
-                self.accepted_action = {"mode": "measured_arm_hold", "body_velocity": 0.0}
+                self.accepted_action = {"mode": "raw_goal_hold" if self.teleop else "measured_arm_hold", "body_velocity": 0.0}
             report = getattr(robot, "_am1_routine_report", None)
+            hold_kind = "exact raw-goal" if self.teleop else "measured-position"
             if report is None:
-                logging.warning("AM1 Local PAUSED: measured-position hold acknowledged; epoch=%s", epoch)
+                logging.warning("AM1 Local PAUSED: %s hold acknowledged; epoch=%s", hold_kind, epoch)
             else:
-                report(f"AM1 Local PAUSED: measured-position hold acknowledged; epoch={epoch}")
+                report(f"AM1 Local PAUSED: {hold_kind} hold acknowledged; epoch={epoch}")
             return True
         if epoch == self.epoch and self.state == "paused":
             return False
@@ -1680,6 +1681,10 @@ def _run_host(args):
                     "binding": robot._am1_teleop_binding,
                     "before": robot._am1_teleop_settings,
                     "active": robot._am1_teleop_active_settings,
+                })
+                routine_writer.submit("[AM1 TELEOP REST] ", {
+                    "binding": robot._am1_teleop_binding,
+                    "acquisitions": robot._am1_teleop_rest_evidence,
                 })
         # One final same-owner startup boundary before ordinary loop timing.
         # Only a due genuine read can refresh the retained original thermal slots.

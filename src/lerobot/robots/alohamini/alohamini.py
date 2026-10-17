@@ -932,6 +932,13 @@ class AlohaMini(Robot):
         if torque != 0:
             raise RuntimeError(f"AM1 arm activation refused: '{name}' torque must be disabled before qualification.")
         present = self._read_am1_activation_raw(bus, "Present_Position", name, phase=phase)
+        teleop_rest = getattr(self, "_am1_teleop_rest_evidence", ())
+        if (getattr(self, "_am1_teleop_binding", None) is not None
+                and bus is self.left_bus and name == "arm_left_shoulder_lift"
+                and (present >= calibration[4] - math.floor(.5 * 4096 / 360)
+                     or phase == "after_home" and teleop_rest)):
+            from .am1_live_teleop import qualify_rest
+            return qualify_rest(self, bus, name, calibration, phase=phase, present_raw=present)
         endpoint_before = any(row["phase"] == "before_home" for row in getattr(self, "_am1_live_endpoint_evidence", ()))
         if (present == calibration[4] + 1 or phase == "after_home" and endpoint_before and name == "arm_left_shoulder_lift") and (self._am1_protected_live_spec() is not None or getattr(self, "_am1_teleop_binding", None) is not None):
             return self._qualify_am1_live_endpoint(bus, name, calibration, phase=phase)
@@ -1004,6 +1011,7 @@ class AlohaMini(Robot):
             if self.config.robot_model == "alohamini1":
                 self._am1_activation_readbacks = []
                 self._am1_live_endpoint_evidence = []
+                self._am1_teleop_rest_evidence = []
                 self._am1_live_frozen_holds = self._am1_live_frozen_binding = None
                 self._am1_live_activation_binding = None
                 if self._am1_protected_live_spec() is not None:
@@ -2032,6 +2040,10 @@ class AlohaMini(Robot):
         """AM1 Local pause: replace old goals with measured raw arm positions."""
         if self.config.robot_model != "alohamini1" or self.config.no_follower:
             raise RuntimeError("AM1 Local arm hold requires connected AM1 follower arms")
+        if getattr(self, "_am1_teleop_binding", None) is not None:
+            from .am1_live_teleop import hold_goals
+            hold_goals(self)
+            return
         if self._am1_protected_live_spec() is not None or getattr(self, "_am1_live_frozen_binding", None) is not None:
             self._hold_am1_live_selected()
             return

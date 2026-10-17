@@ -5,6 +5,7 @@ shared frame contract is imported only by the explicitly selected mode.
 """
 
 import copy
+import json
 import math
 import time
 from uuid import UUID
@@ -186,6 +187,212 @@ def verify_settings(robot):
         raise RuntimeError("AM1 teleop installed settings changed during startup")
     check_health(robot, records, active=True)
     robot._am1_teleop_active_settings = records
+
+
+def qualify_rest(robot, bus, name, calibration, *, phase, present_raw):
+    """Acquire the supported shoulder rest without widening its command range.
+
+    The half-degree limit bounds the initial inward command displacement. It is
+    an operating bound, not an encoder-accuracy or mechanical-clearance claim.
+    Other joints and the historical diagnostic endpoint path keep their rules.
+    """
+    from .lift_operational import TemperatureWindow
+
+    def refuse(reason):
+        raise RuntimeError("AM1 arm activation refused: normal-rest " + reason)
+
+    if (
+        not binding_valid(robot)
+        or bus is not robot.left_bus
+        or name != "arm_left_shoulder_lift"
+        or calibration != (2, 0, 515, 848, 3223)
+        or bus.motors[name].id != 2
+        or bus.motors[name].model != "sts3215"
+        or phase not in {"before_home", "after_home"}
+    ):
+        refuse("protected role/mapping/calibration differs")
+    binding = copy.deepcopy(robot._am1_teleop_binding)
+    baseline = robot._am1_teleop_settings["left"]["registers"]
+    expected = {register: baseline[register][name] for register in STATIC}
+    started = time.monotonic()
+    deadline = started + 1.0
+    proof = {
+        "phase": phase,
+        "binding": binding,
+        "calibration": list(calibration),
+        "operating_displacement_bound_degrees": 0.5,
+        "initial_measured_raw": present_raw,
+        "qualified": False,
+        "samples": [],
+        "settings": {},
+        "started_at": started,
+    }
+    robot._am1_teleop_rest_evidence.append(proof)
+
+    def read(register):
+        began = time.monotonic()
+        if not started <= began < deadline:
+            refuse("acquisition deadline expired")
+        value = robot._read_am1_activation_raw(bus, register, name, phase="normal_rest_" + phase, num_retry=0)
+        ended = time.monotonic()
+        if not began <= ended <= began + 0.04 or ended >= deadline:
+            refuse("register read exceeded its original40ms budget")
+        return value
+
+    def seed_for(raw):
+        if raw < calibration[3]:
+            refuse("lower endpoint is outside the supported rest role")
+        seed = max(calibration[3], min(calibration[4], raw))
+        displacement = abs(raw - seed)
+        cap = robot._am1_relative_target_cap(name + ".pos")
+        if (
+            type(cap) not in (int, float)
+            or not math.isfinite(cap)
+            or cap <= 0
+            or displacement > math.floor(cap * (calibration[4] - calibration[3]) / 200)
+            or displacement > math.floor(0.5 * bus.model_resolution_table["sts3215"] / 360)
+        ):
+            refuse("rest-to-legal-seed displacement exceeds the half-degree or measured-error bound")
+        return seed
+
+    try:
+        if phase == "after_home" and not any(
+            entry["phase"] == "before_home"
+            and entry["qualified"]
+            and entry["binding"] == binding
+            and tuple(entry["calibration"]) == calibration
+            for entry in robot._am1_teleop_rest_evidence
+        ):
+            refuse("post-home endpoint needs its original before-home qualification")
+        seed_for(present_raw)
+        for register in (*STATIC, "CW_Dead_Zone", "CCW_Dead_Zone"):
+            actual = proof["settings"][register] = read(register)
+            if register in expected and actual != expected[register]:
+                refuse("installed settings changed: " + register)
+        if robot._am1_activation_calibration(bus, name) != calibration:
+            refuse("calibration changed")
+        old_goal = read("Goal_Position")
+        # A stale torque-off goal is observed, not used as the new rest anchor.
+        # Historical firmware could report the adjacent unrepresentable goal.
+        seed_for(old_goal)
+        positions, window, first_completed = [present_raw], TemperatureWindow(), None
+        while (
+            len(proof["samples"]) < 9
+            or round((proof["samples"][-1]["completed_at"] - first_completed) * 1e9) < 400_000_000
+        ):
+            if phase == "after_home":
+                robot._refresh_am1_startup_lift_feedback()
+            if first_completed is not None:
+                delay = first_completed + len(proof["samples"]) * 0.05 - time.monotonic()
+                if delay > 0:
+                    time.sleep(delay)
+            row = {"started_at": time.monotonic()}
+            proof["samples"].append(row)
+            for register in (
+                "Torque_Enable",
+                "Lock",
+                "Operating_Mode",
+                "Goal_Position",
+                "Present_Position",
+                "Present_Current",
+                "Status",
+                "Present_Temperature",
+                "Present_Velocity",
+                "Moving",
+                "Present_Voltage",
+            ):
+                value = row[register] = read(register)
+                if register == "Present_Position":
+                    seed_for(value)
+                    positions.append(value)
+                    valid = max(positions) - min(positions) <= 1
+                elif register in {
+                    "Torque_Enable",
+                    "Lock",
+                    "Operating_Mode",
+                    "Status",
+                    "Present_Velocity",
+                    "Moving",
+                }:
+                    valid = value == 0
+                elif register == "Goal_Position":
+                    valid = value == old_goal
+                elif register == "Present_Current":
+                    valid = 0 <= value * 6.5 < min(150, expected["Protection_Current"] * 6.5)
+                elif register == "Present_Temperature":
+                    valid = 0 <= value < min(55, expected["Max_Temperature_Limit"])
+                else:
+                    valid = expected["Min_Voltage_Limit"] <= value <= expected["Max_Voltage_Limit"]
+                if not valid:
+                    refuse("off/quiet/health qualification failed: " + register)
+            row["completed_at"] = time.monotonic()
+            window.update(row["Present_Temperature"], row["completed_at"], cold_start=True)
+            if first_completed is None:
+                first_completed = row["completed_at"]
+        if phase == "after_home":
+            robot._refresh_am1_startup_lift_feedback()
+        window.assert_fresh(time.monotonic())
+        if any(read(register) != value for register, value in proof["settings"].items()):
+            refuse("installed settings changed during acquisition")
+        if phase == "after_home":
+            robot._refresh_am1_startup_lift_feedback()
+        window.assert_fresh(time.monotonic())
+        if (
+            not binding_valid(robot)
+            or robot._am1_teleop_binding != binding
+            or robot._am1_activation_calibration(bus, name) != calibration
+        ):
+            refuse("binding/calibration changed during acquisition")
+        seed = seed_for(positions[-1])
+        proof.update(
+            qualified=True,
+            seed_raw=seed,
+            measured_raw=positions[-1],
+            temperature_slots=list(window.samples),
+            completed_at=time.monotonic(),
+            window_s=round(proof["samples"][-1]["completed_at"] - first_completed, 6),
+        )
+        return seed
+    except Exception as error:
+        proof["first_cause"] = f"{type(error).__name__}: {error}"
+        error.add_note("Original normal-rest acquisition: " + json.dumps(proof, separators=(",", ":")))
+        raise
+
+
+def hold_goals(robot):
+    """Verify the literal current command map; holding never reseeds from PP."""
+    if not binding_valid(robot):
+        raise RuntimeError("AM1 teleop hold requires its protected identity")
+    binding = copy.deepcopy(robot._am1_teleop_binding)
+    calibrations = {
+        name: robot._am1_activation_calibration(bus, name)
+        for _, bus, names in _groups(robot)
+        for name in names
+    }
+    records = read_groups(robot, ("Goal_Position",))
+    for side, bus, names in _groups(robot):
+        for name in names:
+            calibration = calibrations[name]
+            goal = records[side]["registers"]["Goal_Position"][name]
+            if not calibration[3] <= goal <= calibration[4]:
+                raise RuntimeError("AM1 teleop held raw goal exceeds unchanged calibration: " + name)
+            if robot._am1_activation_calibration(bus, name) != calibration:
+                raise RuntimeError("AM1 teleop held calibration changed: " + name)
+    now = time.monotonic()
+    if (
+        not binding_valid(robot)
+        or robot._am1_teleop_binding != binding
+        or any(
+            not 0
+            <= group["timing"]["Goal_Position"]["read_started_at_monotonic_s"]
+            <= group["timing"]["Goal_Position"]["read_completed_at_monotonic_s"]
+            <= now
+            or now - group["timing"]["Goal_Position"]["read_started_at_monotonic_s"]
+            >= robot.AM1_ACTIVATION_MAX_RAW_AGE_S
+            for group in records.values()
+        )
+    ):
+        raise RuntimeError("AM1 teleop literal held-goal acquisition expired or identity changed")
 
 
 def poll_health(robot):

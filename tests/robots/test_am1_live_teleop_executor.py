@@ -190,7 +190,8 @@ def test_view_progress_is_internal_and_static_decode_never_renews_required_view(
         a.close()
 
 
-def test_real_core_executor_native_frame_expiry_and_fresh_rejoin_preserve_run(tmp_path):
+@pytest.mark.parametrize("endpoint_rest", [False, True])
+def test_real_core_executor_native_frame_expiry_and_fresh_rejoin_preserve_run(tmp_path, endpoint_rest):
     import time
 
     from lerobot.robots.alohamini import alohamini_host as host
@@ -204,6 +205,18 @@ def test_real_core_executor_native_frame_expiry_and_fresh_rejoin_preserve_run(tm
 
         def start(self, run_id, incarnation, recipe, cancel):
             _, _, _, self.robot, _ = lane()
+            if endpoint_rest:
+                from lerobot.motors import MotorCalibration
+                from lerobot.motors.feetech import FeetechMotorsBus
+                from lerobot.robots.alohamini.alohamini import AlohaMini
+
+                bus = self.robot.left_bus
+                name = "arm_left_shoulder_lift"
+                bus.calibration[name] = MotorCalibration(2, 0, 515, 848, 3223)
+                normalizer = FeetechMotorsBus("unused-endpoint-rest", bus.motors, bus.calibration)
+                bus._normalize, bus._unnormalize = normalizer._normalize, normalizer._unnormalize
+                bus.raw[name], bus.goals[name] = 3225, 3223
+                self.robot.hold_follower_arms = AlohaMini.hold_follower_arms.__get__(self.robot)
             # Production send_action uses getattr(..., no-op) before an input
             # hook exists. The injected bus fixture calls the hook directly.
             self.robot._am1_live_before_write = lambda: None
@@ -312,6 +325,11 @@ def test_real_core_executor_native_frame_expiry_and_fresh_rejoin_preserve_run(tm
         until(lambda: bool(step()) and a.run.get("native_live_at") is not None)
         frozen_deadline = a.run["deadline"]
         frozen_workspace = copy.deepcopy(e.evidence()["live_input"]["workspace"])
+        if endpoint_rest:
+            key = "arm_left_shoulder_lift.pos"
+            assert frozen_workspace["reference"][key] == pytest.approx(100 + 400 / 2375)
+            assert e.evidence()["live_input"]["cursor"][key] == 100
+            assert io.robot.left_bus.goals[key.removesuffix(".pos")] == 3223
         resume()
         grant = a.handle(dict(op="grant", **ids()), "owner")
         src = source(grant=grant["grant_id"])
