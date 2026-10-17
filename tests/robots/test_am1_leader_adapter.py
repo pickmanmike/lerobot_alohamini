@@ -148,6 +148,8 @@ def test_real_verified_https_wss_client_reuses_exact_ip_cookie_and_generation(tm
             assert client.snapshot["service_incarnation"]
         finally:
             await client.close()
+        assert client.transport_error is None
+        assert client.transport_close["expected"] is True
 
     try:
         asyncio.run(scenario())
@@ -184,8 +186,73 @@ def test_terminal_ack_requires_current_source_and_actual_body_zero():
         assert not m.native_frame_ack(bad, 7, source, body_zero=True)
 
 
+def test_real_wss_clean_close_ends_qualified_wait_before_timeout(tmp_path):
+    import asyncio
+    import json
+
+    from tests.robots.am1_session_fixture import Cluster
+    from tests.robots.test_am1_session_api import enrolled
+
+    m = adapter()
+    cluster = Cluster(tmp_path / "cluster")
+
+    async def scenario():
+        session = await enrolled(cluster)
+        try:
+            token = next(cookie.value for cookie in session.cookie_jar if cookie.key == "__Host-am1-device")
+        finally:
+            await session.close()
+        storage = tmp_path / "storage.json"
+        storage.write_text(
+            json.dumps(
+                {
+                    "cookies": [
+                        {
+                            "name": "__Host-am1-device",
+                            "value": token,
+                            "domain": "127.0.0.1",
+                            "path": "/",
+                            "secure": True,
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        client = m.SessionClient(cluster.url, cluster.cert, storage)
+        try:
+            await client.attach()
+            await client.ws.close()
+            await asyncio.wait_for(client.reader, 1)
+            with pytest.raises(ConnectionError, match="WSS|connection"):
+                await client.wait(lambda: False, 0.15)
+            assert client.transport_error and client.transport_close["expected"] is False
+            assert "close_code" in client.transport_close  # Handshake may complete after reader exit.
+            await client.attach()
+            assert client.transport_error is None and client.transport_close is None
+        finally:
+            await client.close()
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        cluster.close()
+
+
 @pytest.mark.parametrize(
-    "failure", [None, "stop", "renew", "start_lost", "start_unknown", "terminal_fault", "admission_fault"]
+    "failure",
+    [
+        None,
+        "stop",
+        "renew",
+        "start_lost",
+        "start_unknown",
+        "terminal_fault",
+        "admission_fault",
+        "admission_terminal",
+        "terminal_stop_race",
+        "foreign_terminal",
+    ],
 )
 def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id(
     tmp_path, monkeypatch, failure
@@ -195,6 +262,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
     from types import SimpleNamespace
 
     m = adapter()
+    prelive = {"admission_fault", "admission_terminal", "terminal_stop_race", "foreign_terminal"}
     owned_id, foreign_id = str(uuid4()), str(uuid4())
     instances = []
 
@@ -206,6 +274,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
             self.starts = self.closed = self.saw_foreign = 0
             self.stops = []
             self.start_requests = []
+            self.cleanup_reads = 0
             instances.append(self)
 
         async def attach(self):
@@ -264,24 +333,35 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 raise ClientOSError(5, "injected Stop transport failure")
             self.snapshot = self.state(owned_id)
             self.snapshot["run"].update(
-                status="faulted" if failure in {"terminal_fault", "admission_fault"} else "stopped",
+                status="faulted" if failure in {"terminal_fault", *prelive} else "stopped",
                 cleanup="unknown" if failure == "admission_fault" else "physical_readback_verified",
                 uncertain=failure == "admission_fault",
                 first_cause="retained genuine native fault"
-                if failure in {"terminal_fault", "admission_fault"}
+                if failure in {"terminal_fault", *prelive}
                 else None,
             )
-            if failure == "admission_fault":
+            if failure in prelive:
                 self.snapshot["run"].update(
                     native_live_at=None, native_first_cause="injected original pre-Live native fault"
                 )
+            if failure in {"admission_terminal", "terminal_stop_race"}:
+                from tools.am1_session_core import SessionAuthority
+
+                authority = SessionAuthority(tmp_path / "stop-authority")
+                try:
+                    authority.run = copy.deepcopy(self.snapshot["run"])
+                    result = authority._handle({"op": "stop", **payload}, "owner")
+                    assert result["accepted"] is False and result["reason"] == "terminal"
+                    raise RuntimeError(result["reason"])
+                finally:
+                    authority.close()
             return {"accepted": True, "status": "stopped"}
 
         async def wait(self, predicate, timeout):
             if self.snapshot["run"] is None:
                 assert not predicate()
                 self.snapshot = self.state(foreign_id)
-                if failure == "admission_fault":
+                if failure in prelive:
                     self.snapshot["run"].update(
                         status="faulted",
                         native_live_at=None,
@@ -290,14 +370,14 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 assert not predicate(), "same recipe on another run is not this accepted Start"
                 self.saw_foreign += 1
                 self.snapshot = self.state(owned_id)
-                if failure == "admission_fault":
+                if failure in prelive:
                     self.snapshot["run"].update(
                         status="faulted",
                         native_live_at=None,
                         first_cause="generic owning layer failure",
                         native_first_cause="injected original pre-Live native fault",
-                        cleanup="unknown",
-                        uncertain=True,
+                        cleanup="unknown" if failure == "admission_fault" else "physical_readback_verified",
+                        uncertain=failure == "admission_fault",
                     )
             assert predicate()
 
@@ -319,6 +399,15 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
 
         async def get(self, op):
             assert op == "state"
+            self.cleanup_reads += 1
+            if failure == "foreign_terminal":
+                foreign = copy.deepcopy(self.snapshot)
+                foreign["run"]["run_id"] = foreign_id
+                return {"snapshot": foreign}
+            if failure == "terminal_stop_race" and self.cleanup_reads == 1:
+                prior = copy.deepcopy(self.snapshot)
+                prior["run"].update(status="finishing", uncertain=True)
+                return {"snapshot": prior}
             return {"snapshot": self.snapshot}
 
         async def close(self):
@@ -379,24 +468,39 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
         if failure == "terminal_fault":
             assert summary["native_cleanup_uncertain"] is False and summary["cleanup_errors"] == []
             assert summary["terminal_failure"]["cause"] == "retained genuine native fault"
-        if failure == "admission_fault":
+        if failure in prelive:
             assert summary["native_admission_terminal"]["run"]["run_id"] == owned_id
             assert summary["failure"] == "native admission faulted: injected original pre-Live native fault"
-            assert summary["native_cleanup_uncertain"] is True
-            assert summary["cleanup_errors"][0]["step"] == "native_stop"
+            assert summary["native_cleanup_uncertain"] is (failure in {"admission_fault", "foreign_terminal"})
+            if failure in {"admission_fault", "foreign_terminal"}:
+                assert summary["cleanup_errors"][0]["step"] == "native_stop"
+                if failure == "foreign_terminal":
+                    assert "another run" in summary["cleanup_errors"][0]["message"]
+                    assert "native_terminal" not in summary
+            else:
+                assert summary["cleanup_errors"] == []
+                assert (
+                    summary["native_terminal"]["run"]["native_first_cause"]
+                    == "injected original pre-Live native fault"
+                )
             assert "run_id" not in summary and "final_native_ack" not in summary
     else:
         summary = asyncio.run(m.run(args))
     session = instances[0]
     assert (
         session.starts == 1
-        and session.stops == ([] if failure == "start_unknown" else [owned_id])
+        and session.stops
+        == (
+            []
+            if failure in {"start_unknown", "admission_fault", "admission_terminal", "foreign_terminal"}
+            else [owned_id]
+        )
         and session.closed == 1
     )
     assert session.saw_foreign == (0 if failure == "start_unknown" else 1)
-    if failure not in {"start_unknown", "admission_fault"}:
+    if failure not in {"start_unknown", *prelive}:
         assert summary["run_id"] == owned_id
-    if failure not in {"stop", "start_unknown", "terminal_fault", "admission_fault"}:
+    if failure not in {"stop", "start_unknown", "terminal_fault", *prelive}:
         assert summary["native_terminal"]["run"]["status"] == "stopped"
     if failure in {"start_lost", "start_unknown"}:
         assert len(session.start_requests) == 2 and session.start_requests[0] == session.start_requests[1]

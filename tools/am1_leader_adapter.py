@@ -225,6 +225,8 @@ class SessionClient:
         self.sequence = 0
         self.changed = asyncio.Event()
         self.transport_error = None
+        self.transport_close = None
+        self._detaching = False
 
     async def get(self, path):
         async with self.http.get(self.origin + "/api/" + path, allow_redirects=False) as response:
@@ -247,6 +249,8 @@ class SessionClient:
 
     async def attach(self):
         self.transport_error = None
+        self.transport_close = None
+        self._detaching = False
         device = await self.get("session")
         if device.get("control") is not True:
             raise ValueError("existing enrolled PC control capability required")
@@ -266,9 +270,11 @@ class SessionClient:
     async def _read(self):
         import aiohttp
 
+        reason, reader_error = "stream-ended", None
         try:
             async for message in self.ws:
                 if message.type != aiohttp.WSMsgType.TEXT:
+                    reason = "message-" + message.type.name.lower()
                     break
                 value = json.loads(message.data)
                 if value.get("kind") == "snapshot":
@@ -282,9 +288,26 @@ class SessionClient:
                         future.set_result(value)
                 elif value.get("kind") == "unavailable":
                     raise RuntimeError("owner reporting unavailable")
+        except asyncio.CancelledError:
+            reason = "reader-cancelled"
+            raise
         except Exception as error:
+            reason = "reader-error"
+            reader_error = {"error_type": type(error).__name__, "message": str(error)}
             self.transport_error = str(error)
         finally:
+            exception = self.ws.exception()
+            self.transport_close = {
+                "reason": reason,
+                "expected": self._detaching,
+                "close_code": self.ws.close_code,
+                "exception_type": type(exception).__name__ if exception else None,
+                "exception": str(exception) if exception else None,
+                "reader_error": reader_error,
+                "observed_at_monotonic_s": time.monotonic(),
+            }
+            if not self._detaching and self.transport_error is None:
+                self.transport_error = "current WSS connection ended: " + reason
             for future in self.pending.values():
                 if not future.done():
                     future.set_exception(ConnectionError("current WSS connection lost"))
@@ -315,9 +338,13 @@ class SessionClient:
 
     async def wait(self, predicate, timeout):
         deadline = time.monotonic() + timeout
-        while not predicate():
+        while True:
             if self.transport_error:
                 raise ConnectionError(self.transport_error)
+            if self.reader is not None and self.reader.done() or self.ws is not None and self.ws.closed:
+                raise ConnectionError("current WSS connection is closed")
+            if predicate():
+                return
             if time.monotonic() >= deadline:
                 raise TimeoutError("qualified current native state did not arrive")
             self.changed.clear()
@@ -387,6 +414,7 @@ class SessionClient:
         )
 
     async def detach(self):
+        self._detaching = True
         if self.ws is not None:
             await self.ws.close()
         if self.reader is not None:
@@ -776,11 +804,7 @@ async def run(args):
             summary["native_cleanup_uncertain"] = True
 
             async def stop_owned_run():
-                stopped = await client.post("stop", {"run_id": owned_run_id, "operation_id": str(uuid4())})
-                summary["stop_receipt"] = stopped
-                until = time.monotonic() + 85
-                while time.monotonic() < until:
-                    terminal = (await client.get("state"))["snapshot"]
+                def terminal_qualified(terminal):
                     if (terminal.get("run") or {}).get("run_id") != owned_run_id:
                         raise RuntimeError("cleanup status belongs to another run")
                     if terminal["run"].get("status") in {"stopped", "faulted", "interrupted"}:
@@ -800,6 +824,44 @@ async def run(args):
                             }
                         if summary["native_cleanup_uncertain"]:
                             raise RuntimeError("native cleanup remains uncertain")
+                        return True
+                    return False
+
+                try:
+                    before_stop = (await client.get("state"))["snapshot"]
+                except (OSError, TimeoutError, aiohttp.ClientError, RuntimeError) as error:
+                    summary["pre_stop_state_error"] = {
+                        "error_type": type(error).__name__,
+                        "message": str(error),
+                    }
+                else:
+                    if terminal_qualified(before_stop):
+                        return
+                try:
+                    stopped = await client.post(
+                        "stop", {"run_id": owned_run_id, "operation_id": str(uuid4())}
+                    )
+                    summary["stop_receipt"] = stopped
+                except (OSError, TimeoutError, aiohttp.ClientError, RuntimeError) as error:
+                    try:
+                        terminal = (await client.get("state"))["snapshot"]
+                        qualified = terminal_qualified(terminal)
+                    except BaseException as qualification_error:
+                        summary["stop_qualification_error"] = {
+                            "error_type": type(qualification_error).__name__,
+                            "message": str(qualification_error),
+                        }
+                        raise error from qualification_error
+                    if not qualified:
+                        raise
+                    summary["stop_request_error"] = {
+                        "error_type": type(error).__name__,
+                        "message": str(error),
+                    }
+                    return
+                until = time.monotonic() + 85
+                while time.monotonic() < until:
+                    if terminal_qualified((await client.get("state"))["snapshot"]):
                         return
                     await asyncio.sleep(0.1)
                 raise TimeoutError("native cleanup did not qualify")
@@ -811,6 +873,8 @@ async def run(args):
             await cleanup_step("keyboard_close", lambda: asyncio.to_thread(keyboard.disconnect), 2.0)
         if client is not None:
             await cleanup_step("session_close", client.close, 3.0)
+            summary["transport_error"] = getattr(client, "transport_error", None)
+            summary["transport_close"] = getattr(client, "transport_close", None)
         await cleanup_step("frame_log_close", lambda: asyncio.to_thread(log.close), 2.0)
         summary["cleanup_errors"] = cleanup_errors
         if summary.get("terminal_failure") and first_error is None:
