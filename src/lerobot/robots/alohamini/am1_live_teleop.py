@@ -89,7 +89,33 @@ def _fault(robot, reason, side, register, raw, timing, *, offending_motor=None, 
                 "offending_motor": offending_motor,
                 "offending_value": copy.deepcopy(raw.get(offending_motor)),
                 "comparison": copy.deepcopy(comparison),
+                "prior_successful_health": None,
             }
+            with suppress(Exception):
+                prior = robot._am1_teleop_health
+                prior_timing = prior[side]["timing"][register]
+                prior_value = prior[side]["registers"][register][offending_motor]
+                prior_started, prior_completed = (
+                    prior_timing[key]
+                    for key in ("read_started_at_monotonic_s", "read_completed_at_monotonic_s")
+                )
+                if (
+                    prior["binding"] == robot._am1_teleop_binding
+                    and type(prior_value) is int
+                    and all(
+                        type(value) in (int, float) and math.isfinite(value)
+                        for value in (prior_started, prior_completed)
+                    )
+                    and 0 <= prior_started <= prior_completed <= timing["read_started_at_monotonic_s"]
+                ):
+                    robot._am1_teleop_fault["prior_successful_health"] = {
+                        "binding": copy.deepcopy(prior["binding"]),
+                        "register": register,
+                        "motor": offending_motor,
+                        "value": prior_value,
+                        "read_started_at_monotonic_s": prior_started,
+                        "read_completed_at_monotonic_s": prior_completed,
+                    }
             current = getattr(robot, "_am1_teleop_group_receipts", {}).get(side)
             if (
                 current is not None
@@ -236,10 +262,20 @@ def _install_group_reply_guard(robot, side, bus):
     mapping = tuple((name, motor.id, motor.model) for name, motor in bus.motors.items())
     installed = getattr(bus, "_am1_teleop_reply_guard", None)
     if installed is not None:
-        if installed != (robot, binding, reader, ph, port, mapping, reader.txRxPacket, ph.rxPacket):
+        if installed != (
+            robot,
+            binding,
+            reader,
+            ph,
+            port,
+            mapping,
+            reader.txRxPacket,
+            ph.rxPacket,
+            port.writePort,
+        ):
             raise RuntimeError("AM1 teleop group reply guard owner changed")
         return
-    original, original_rx = reader.txRxPacket, ph.rxPacket
+    original, original_rx, original_write = reader.txRxPacket, ph.rxPacket, port.writePort
     if (
         reader.ph is not ph
         or reader.port is not port
@@ -247,6 +283,8 @@ def _install_group_reply_guard(robot, side, bus):
         or getattr(original, "__func__", None) is not getattr(type(reader), "txRxPacket", None)
         or getattr(original_rx, "__self__", None) is not ph
         or getattr(original_rx, "__func__", None) is not getattr(type(ph), "rxPacket", None)
+        or getattr(original_write, "__self__", None) is not port
+        or getattr(original_write, "__func__", None) is not getattr(type(port), "writePort", None)
     ):
         raise RuntimeError("AM1 teleop group reply reader already wrapped or differs")
     table = MODEL_CONTROL_TABLE["sts3215"]
@@ -292,7 +330,7 @@ def _install_group_reply_guard(robot, side, bus):
             except Exception:
                 return False
 
-        if not owner_valid() or ph.rxPacket != original_rx:
+        if not owner_valid() or ph.rxPacket != original_rx or port.writePort != original_write:
             refuse("group reply protected owner/binding changed")
         address, width, ids = reader.start_address, reader.data_length, tuple(reader.data_dict)
         request.update(address=address, width=width, ids=list(ids))
@@ -323,11 +361,57 @@ def _install_group_reply_guard(robot, side, bus):
             "group_call_completed_at_monotonic_s": None,
             "comm_result": None,
             "packets": [],
+            "transmit": None,
         }
         seen = set()
 
+        def checked_write(packet):
+            started = time.monotonic()
+            raw = {}
+            with suppress(Exception):
+                raw = {"packet": list(packet[:64])}
+            timing = {
+                "read_started_at_monotonic_s": started,
+                "read_completed_at_monotonic_s": time.monotonic(),
+            }
+            if (
+                not owner_valid()
+                or port.writePort is not checked_write
+                or (reader.start_address, reader.data_length, tuple(reader.data_dict))
+                != (address, width, ids)
+            ):
+                refuse("group reply transmit owner/request changed", raw, timing)
+            if receipt["transmit"] is not None:
+                refuse("group reply duplicate transmit", raw, timing)
+            transmit = receipt["transmit"] = {
+                "packet": raw.get("packet"),
+                "write_started_at_monotonic_s": None,
+                "write_completed_at_monotonic_s": None,
+                "result": None,
+            }
+            expected = [255, 255, 254, len(ids) + 4, 130, address, width, *ids]
+            expected.append((~sum(expected[2:])) & 255)
+            if (
+                type(packet) is not list
+                or any(type(byte) is not int for byte in packet)
+                or packet != expected
+            ):
+                refuse("group reply transmit differs from original request/frame/checksum", raw, timing)
+            transmit["write_started_at_monotonic_s"] = time.monotonic()
+            try:
+                result = original_write(packet)
+                transmit["result"] = result
+                return result
+            finally:
+                transmit["write_completed_at_monotonic_s"] = time.monotonic()
+
         def checked_rx(*args, **kwargs):
             started = time.monotonic()
+            if receipt["transmit"] is None:
+                refuse(
+                    "group reply missing original transmit",
+                    timing={"read_started_at_monotonic_s": started, "read_completed_at_monotonic_s": started},
+                )
             packet, result = original_rx(*args, **kwargs)
             completed = time.monotonic()
             timing = {"read_started_at_monotonic_s": started, "read_completed_at_monotonic_s": completed}
@@ -340,10 +424,15 @@ def _install_group_reply_guard(robot, side, bus):
                 pass  # Optional capture cannot replace a proven receive guard.
             if result != 0:
                 return packet, result  # The SDK retains its original transport-failure behavior.
-            if not owner_valid() or (reader.start_address, reader.data_length, tuple(reader.data_dict)) != (
-                address,
-                width,
-                ids,
+            if (
+                not owner_valid()
+                or port.writePort is not checked_write
+                or (reader.start_address, reader.data_length, tuple(reader.data_dict))
+                != (
+                    address,
+                    width,
+                    ids,
+                )
             ):
                 refuse("group reply owner/request changed during acquisition", raw, timing)
             if (
@@ -365,16 +454,28 @@ def _install_group_reply_guard(robot, side, bus):
             return packet, result
 
         ph.rxPacket = checked_rx
+        port.writePort = checked_write
         try:
             result = original()
             receipt["comm_result"] = result
             return result
         finally:
             ph.rxPacket = original_rx
+            port.writePort = original_write
             receipt["group_call_completed_at_monotonic_s"] = time.monotonic()
 
     reader.txRxPacket = guarded
-    bus._am1_teleop_reply_guard = (robot, binding, reader, ph, port, mapping, guarded, original_rx)
+    bus._am1_teleop_reply_guard = (
+        robot,
+        binding,
+        reader,
+        ph,
+        port,
+        mapping,
+        guarded,
+        original_rx,
+        original_write,
+    )
 
 
 def prepare_settings(robot):
@@ -628,11 +729,14 @@ def hold_goals(robot):
 
 def poll_health(robot):
     """Actual installed device limits; contact/nonresponse keep their role semantics."""
+    binding = copy.deepcopy(robot._am1_teleop_binding)
     records = read_groups(robot, (*HEALTH, "Operating_Mode"), active=True)
     check_health(robot, records, active=True)
     for side, _, names in _groups(robot):
         if any(records[side]["registers"]["Operating_Mode"][name] != 0 for name in names):
             raise RuntimeError("AM1 teleop actual follower operating mode changed")
+    if binding == robot._am1_teleop_binding:
+        records["binding"] = binding
     robot._am1_teleop_health = records
 
 

@@ -1,83 +1,63 @@
 ## Active AM1 teleoperation consolidation (Packet16)
 
-Goal: dependable Pi-owned whole-robot teleoperation for light manipulation and
-telepresence. Physical C001 leader arms are the primary input. The explicitly
-selected virtual-leaders source substitutes at acquisition and exercises the same
-mapping, authenticated serialization, ownership and native expiry as usb-leaders.
-Generated input is not a human demonstration. Per-motor page presets remain
-engineering diagnostics; retain their accepted coarse elbow behavior and limits.
+Goal: dependable Pi-owned teleoperation for light manipulation and telepresence.
+Physical C001 leaders are primary. Explicit virtual-leaders substitute only at
+acquisition and use the same mapping, authentication, ownership and native expiry.
+Generated input is not a human demonstration. Retain accepted coarse elbow page
+presets as diagnostics; fine positioning and household tasks remain unproven.
 
-The owner invoked AM1-TELEOP-CONSOLIDATION-16, replacing proposed wrist Packet15.
-It authorizes implementation, focused checks/review, component staging, a roughly
-three-minute automated virtual-leader workload with a new fixed five-minute
-native ceiling, then a brief next Start. Existing diagnostic profiles retain their
-original ceilings and results. Packet16 supersedes older elbow-only input scope,
-manual-leader prerequisites and no-merge restrictions for PR24 into the named
-integration target only. PR24 merged normally at 386d3c37. Main is unchanged;
-one focused follow-up from that actual integration tip remains unmerged.
+Packet16 replaces proposed wrist Packet15. PR24 integrated normally into
+integrate/am1-local-teleop at386d3c37; this focused follow-up remains unmerged.
+Main/AM2 are unchanged. Complete the representative172.5 active-second program
+under its original fixed300s native ceiling, selected onboard WebRTC with one view
+switch, controlled input interruption/qualified rejoin, then brief next Start.
+Do not credit idle padding or interactive Stop as finite-program completion.
 
-Preserve original raw feedback and acquisition times, actual per-joint units and
-calibration, bounded latest-valid frames, accumulated rate-limited targets, original
-input expiry/generations, single motor ownership and qualified clutch/reacquisition.
-Do not blanket-apply P16/I0/D32, 500 mA, elbow windows or position heuristics to other
-roles. Keep wheel velocity, lift homing/relief and gripper contact semantics.
-Retain actual health/current/thermal/status/voltage protections and first causes;
-no process freeze, bus fault, overload, permission bypass or speculative tuning.
+Preserve original raw feedback/acquisition times, calibrated units/directions,
+latest-valid coherent frames, accumulated rate-limited targets, original250ms
+input expiry and generations, fixed run reference/deadline and sole motor owner.
+Qualified executor-acknowledged recovery closes its episode; later distinct loss
+may receive another bounded episode, at most three total without deadline reset.
+Acquire actual supported rest, never require an old twelve-joint fingerprint.
+Keep installed settings role-specific; no blanket P16/I0/D32,500mA or elbow windows.
+Wheel velocity, lift home/relief and gripper contact retain their own semantics.
+Preserve real health/current/thermal/status/voltage protections and first causes.
+No process freeze, bus fault, overload, speculative tuning or permission bypass.
 
-Preserve one onboard capture owner and existing auth/TLS; make selected primary
-viewing use the existing supported low-latency streaming capability. JPEG remains
-valid required local observation/diagnostic evidence. Separate decoded view progress
-from capture freshness and motor health; optional loss cannot consume unrelated
-recovery budgets. Keep media work and routine logs outside the motor loop.
+One exclusive onboard capture owner serves selected primary WebRTC. JPEG remains
+required local observation/diagnostic evidence. Decoded progress/source age and
+camera generations remain distinct from control health. Keep media/routine logs
+outside motor polling; optional output cannot consume unrelated recovery budgets.
 
-Current known stopped deployment: motor 168915d04a9345e5b064a3d23142999f5c96b8e1,
-protected runtime 7447480924c288fed3a76fc981433b41c7bfcefe, camera
-bc3442b54d9c574a8feddb0ade642c9b351e59f9; manifest
-01d2bed7c629d3416354ab31556ae998a270b9220bb09c31d8b30369332982df.
-Helper/manual remains 0fe3997f. Immediate matched rollback retains motor
-a7d17886de711f42618f581b3d226ff991cd4ed7 with the same runtime/camera and manifest
-13012258179ddc6c2a8c28d4e50c1e48f886eeb1329ca404191e3336e498957d.
-The AM1-only group-reply integrity repair and sticky prewrite fault fence passed
-119 focused tests and two independent reviews; all ten affected-motor stage09
-phases and persistent available-idle checks passed without starting hardware.
-Combined08's decoded shoulder-pan temperature126 versus installed70 remains
-unresolved actual wire provenance; Combined07's numeric trigger is still unknown.
-A stopped comparison retained360valid replies with values matching their own
-payloads, without reproducing the active126 reading. Preserve these distinctions.
-Combined09 reached post-home readiness but never admitted native Live: delivered
-feedback remained at sequence2 while the host continued normal acquisition.
-The original180s startup deadline ended it with physical_startup_timeout; original
-six artifacts and full native history are retained, cleanup physical_readback_verified,
-all20 off/zero readbacks, qualified lift, closed buses and clean camera release.
-The representative workload and next Start remain unfinished. A deterministic
-one-reply-per78ms test reproduced credit starvation (only2 advances/120polls).
-The reviewed AM1 client correction retained80advances with no premature retirement;
-110 focused connection/cadence tests pass. Retain credits until ORIGINAL request
-age1s, rather than retiring each40ms empty poll; never refresh timestamps. Three
-credits,40ms polls, original1s feedback and250ms input freshness remain unchanged.
-All ten stage09 idle-only phases passed, but Combined10 exposed import ownership:
-the Pi owner loads alohamini_client.py from its runtime checkout, whose original
-SHA235f7a8a still has old polling; the reviewed9315af5b copy was staged only in the
-motor checkout. Combined10 stayed preLive at observation3 and ended at the original
-180s startup timeout, with all originals saved and verified cleanup. Correct only
-the actual runtime copy using the same reviewed9315af5b source, preserve the current
-motor/camera pins, and verify actual owner-environment module path/hash before Start.
-Do not claim production validation of a source that its owner did not import.
-Preserve calibration, trust, private permissions, source imports and separate full
-component rollback bundles.
-Tasks stay stopped during editing/staging; services restore idle without replay.
-AM1 stays wireless, P1 advisory, AM2 untouched. No network tuning, Ethernet,
-manual shoulder/leader readiness questionnaire, new cutoff hardware or architecture.
-Root alone performs Git mutations, SSH, staging and hardware actions; agents use
-explicit disjoint source ownership and offline tests. Use PowerShell 7 and existing
-uv run --no-sync --project C:/Users/pickm/lerobot_alohamini_client environment.
+Installed motor 168915d04a9345e5b064a3d23142999f5c96b8e1,
+runtime 68118e4e9dddf8dddaa3ea6cbf64f54fdd511980,
+camera bc3442b54d9c574a8feddb0ade642c9b351e59f9,
+manifest 7964ad0623af7589b944ec3cbe2975ee2a86050a265c833769ea99979875416d.
+Helper/manual 0fe3997f and original calibration/private trust remain unchanged.
+Full matched rollback: same motor/camera, runtime 7447480924c288fed3a76fc981433b41c7bfcefe,
+manifest 01d2bed7c629d3416354ab31556ae998a270b9220bb09c31d8b30369332982df.
+Stage10 verified actual owner runtime/src/client9315af5b import; nine native
+request-accounting cases passed. Combined11 reached Live/255 accepted frames and
+24.44 active PC seconds, then stopped on valid left-elbow temperature98 versus70.
+All originals/full history and certain cleanup remain retained; full program,
+planned gap/view switch and next Start remain unfinished. Later stopped reads32
+are a distinct condition, not disproof of98. Exact-TX/prior-health evidence checks
+passed139 tests; affected motor staging is pending.
 
-Durability means software fault tolerance, connection/control continuity, state
-preservation and recovery, not motor wear. Historical restrictions/results remain
-at their recorded source versions in docs/alohamini/practical-controls-14.md,
-practical-motion-13.md, response-12.md and earlier reports; old packet-specific
-rules are not current authority for Packet16. Legacy manual operation is retained
-for rollback and must never compete with the persistent owner.
+Tasks stay stopped for source edits and affected-component staging. Verify actual
+owner imports, preserve separate full matched rollback bundles, calibration and
+private permissions. Persistent services restore idle only, never motor replay.
+AM1 wireless; P1 advisory; AM2 untouched. No network tuning, Ethernet prerequisite,
+manual leader/shoulder readiness questions, new cutoff hardware or architecture.
+Root alone performs Git mutations, SSH, staging and devices. Agents own explicit
+disjoint offline edits/tests. Use PowerShell7 and existing uv run --no-sync
+--project C:/Users/pickm/lerobot_alohamini_client environment.
+
+Durability means software fault tolerance, control/connection continuity, state
+preservation and recovery, not physical wear. Current evidence/commands and older
+failure/source-version pointers: docs/alohamini/teleop-consolidation-16.md.
+Historical packet restrictions stay historical. Preserve legacy manual rollback;
+never run it alongside the persistent motor owner.
 
 This file provides guidance to AI agents when working with code in this repository.
 

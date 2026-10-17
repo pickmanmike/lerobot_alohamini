@@ -963,8 +963,9 @@ def test_group_reply_packet_snapshot_does_not_follow_later_mutation(activation):
 
 
 @pytest.mark.parametrize("later_expiry", [False, True])
+@pytest.mark.parametrize("fault_direction", ["rx", "tx"])
 def test_group_reply_swallowed_force_limiter_fault_still_fences_actual_send_action(
-    activation, monkeypatch, later_expiry
+    activation, monkeypatch, later_expiry, fault_direction
 ):
     from types import SimpleNamespace
 
@@ -972,6 +973,11 @@ def test_group_reply_swallowed_force_limiter_fault_still_fences_actual_send_acti
 
     robot = resting_robot(activation, monkeypatch, raw=3223)
     bus = sdk_bus(robot, "left", [reply_packet(1, [], 126)])
+    if fault_direction == "tx":
+        original_sync = bus.packet_handler.syncReadTx
+        bus.packet_handler.syncReadTx = lambda port, address, width, ids, count: original_sync(
+            port, address + 1, width, ids, count
+        )
     right = sdk_bus(robot, "right", [reply_packet(1, [2, 0]), reply_packet(1, [64, 6])])
     robot.config.max_relative_target = None
     robot.logs = {}
@@ -1021,14 +1027,19 @@ def test_group_reply_swallowed_force_limiter_fault_still_fences_actual_send_acti
         "theta.vel": 0.0,
         "lift_axis.vel": 0.0,
     }
-    with pytest.raises(RuntimeError, match="actual device error: 126") as caught:
+    reason = "actual device error: 126" if fault_direction == "rx" else "transmit"
+    with pytest.raises(RuntimeError, match=reason) as caught:
         robot.send_action(action)
     assert events == ["lift_before_fault"]
     assert caught.value is robot._am1_teleop_first_error
     assert right.port_handler.writes == []  # The next ordinary limiter cannot acquire again.
-    assert fault_note(caught.value)["raw"]["packet"] == [255, 255, 1, 2, 126, 126]
+    expected = (
+        [255, 255, 1, 2, 126, 126] if fault_direction == "rx" else [255, 255, 254, 5, 130, 70, 2, 1, 49]
+    )
+    assert fault_note(caught.value)["raw"]["packet"] == expected
     assert bus.packet_handler.rxPacket == original_rx
-    assert len(bus.port_handler.writes) == bus.port_handler.clears == 1
+    assert bus.port_handler.clears == 1
+    assert len(bus.port_handler.writes) == (1 if fault_direction == "rx" else 0)
 
 
 @pytest.mark.parametrize(("address", "width", "ids"), [(222, 1, [1]), (56, 1, [1]), (63, 1, [21])])
@@ -1091,3 +1102,265 @@ def test_group_reply_missing_install_state_cannot_duplicate_an_existing_wrapper(
     with pytest.raises(RuntimeError, match="already wrapped"):
         prepare_settings(robot)
     assert robot.left_bus.port_handler.writes == []
+
+
+def test_group_reply_real98_thermal_fault_retains_exact_original_tx_and_rx(activation):
+    from lerobot.robots.alohamini.am1_live_teleop import read_groups
+
+    robot = configured_robot(activation)
+    packets = [reply_packet(i, [98 if i == 3 else 28]) for i in range(1, 7)]
+    bus = sdk_bus(robot, "left", packets)
+    original_write = bus.port_handler.writePort
+    with pytest.raises(RuntimeError, match="actual configured temperature limit") as caught:
+        read_groups(robot, ("Present_Temperature",))
+    note = fault_note(caught.value)
+    assert note["offending_value"] == 98 and note["comparison"]["upper_exclusive"] == 70
+    receipt = note["group_reply"]
+    assert receipt["transmit"]["packet"] == [255, 255, 254, 10, 130, 63, 1, 1, 2, 3, 4, 5, 6, 32]
+    assert receipt["transmit"]["result"] == 14
+    assert receipt["transmit"]["write_started_at_monotonic_s"] == 100
+    assert receipt["transmit"]["write_completed_at_monotonic_s"] == 100
+    assert receipt["packets"][2]["packet"] == [255, 255, 3, 3, 0, 98, 151]
+    assert bus.port_handler.writePort == original_write
+    assert bus.port_handler.writes == [receipt["transmit"]["packet"]]
+    assert bus.port_handler.clears == 1
+
+
+@pytest.mark.parametrize("change", ["address", "width", "ids"])
+def test_group_reply_wrong_actual_sdk_transmit_refuses_before_port_write(activation, change):
+    robot = configured_robot(activation)
+    bus = sdk_bus(robot, "left", [reply_packet(i, [28]) for i in range(1, 7)])
+    original_write, original_rx = bus.port_handler.writePort, bus.packet_handler.rxPacket
+    original_sync = bus.packet_handler.syncReadTx
+
+    def wrong(port, address, width, ids, count):
+        if change == "address":
+            address = 62
+        elif change == "width":
+            width = 2
+        else:
+            ids = [1, 2, 4, 3, 5, 6]
+        return original_sync(port, address, width, ids, count)
+
+    bus.packet_handler.syncReadTx = wrong
+    with pytest.raises(RuntimeError, match="transmit") as caught:
+        bus.sync_read("Present_Temperature", robot.left_arm_motors, normalize=False, num_retry=0)
+    note = fault_note(caught.value)
+    assert note["comparison"]["request"]["address"] == 63
+    assert note["comparison"]["request"]["width"] == 1
+    assert note["comparison"]["request"]["ids"] == [1, 2, 3, 4, 5, 6]
+    assert note["group_reply"]["transmit"]["packet"] == note["raw"]["packet"]
+    assert note["group_reply"]["transmit"]["write_started_at_monotonic_s"] is None
+    assert bus.port_handler.writes == [] and bus.port_handler.clears == 1
+    assert bus.sync_reader.data_dict[1] == []
+    assert bus.port_handler.writePort == original_write and bus.packet_handler.rxPacket == original_rx
+
+
+@pytest.mark.parametrize("change", ["header", "checksum", "boolean_byte", "extra_byte"])
+def test_group_reply_malformed_final_transmit_is_not_forwarded(activation, monkeypatch, change):
+    import scservo_sdk as sdk
+
+    packet = [255, 255, 254, 10, 130, 63, 1, 1, 2, 3, 4, 5, 6, 32]
+    if change == "header":
+        packet[0] = 254
+    elif change == "checksum":
+        packet[-1] ^= 1
+    elif change == "boolean_byte":
+        packet[6] = True
+    else:
+        packet.append(0)
+    # Controlled final SDK transmit boundary: no synthetic serial port is opened.
+    monkeypatch.setattr(
+        type(sdk.PacketHandler(0)), "txPacket", lambda self, port, request: port.writePort(packet)
+    )
+    robot = configured_robot(activation)
+    bus = sdk_bus(robot, "left", [reply_packet(i, [28]) for i in range(1, 7)])
+    original_write, original_rx = bus.port_handler.writePort, bus.packet_handler.rxPacket
+    with pytest.raises(RuntimeError, match="transmit"):
+        bus.sync_read("Present_Temperature", robot.left_arm_motors, normalize=False, num_retry=0)
+    assert bus.port_handler.writes == [] and bus.port_handler.clears == 0
+    assert bus.port_handler.writePort == original_write and bus.packet_handler.rxPacket == original_rx
+
+
+@pytest.mark.parametrize("failure", ["short_write", "write_exception"])
+def test_group_reply_original_write_object_return_and_failure_are_preserved(activation, monkeypatch, failure):
+    original = OSError("original write failure")
+    calls = []
+
+    def write(port, packet):
+        calls.append(packet)
+        if failure == "write_exception":
+            raise original
+        return 0
+
+    monkeypatch.setattr(ReplyPort, "writePort", write)
+    robot = configured_robot(activation)
+    bus = sdk_bus(robot, "left", [])
+    original_write, original_rx = bus.port_handler.writePort, bus.packet_handler.rxPacket
+    with pytest.raises(OSError if failure == "write_exception" else ConnectionError) as caught:
+        bus.sync_read("Present_Temperature", robot.left_arm_motors, normalize=False, num_retry=0)
+    if failure == "write_exception":
+        assert caught.value is original
+    assert len(calls) == 1 and type(calls[0]) is list
+    assert calls[0] == [255, 255, 254, 10, 130, 63, 1, 1, 2, 3, 4, 5, 6, 32]
+    assert bus.port_handler.writePort == original_write and bus.packet_handler.rxPacket == original_rx
+    assert not getattr(robot, "_am1_teleop_fault", None)
+    receipt = robot._am1_teleop_group_receipts["left"]
+    assert receipt["transmit"]["write_completed_at_monotonic_s"] == 100
+    assert receipt["transmit"]["result"] == (0 if failure == "short_write" else None)
+
+
+def complete_health(robot):
+    from lerobot.robots.alohamini.am1_live_teleop import poll_health
+
+    for bus in (robot.left_bus, robot.right_bus):
+        for name in bus.motors:
+            bus.registers["Torque_Enable", name] = bus.registers["Lock", name] = 1
+    poll_health(robot)
+
+
+def test_fault_note_prior_successful_health_keeps_original_binding_value_and_times(activation):
+    from lerobot.robots.alohamini.am1_live_teleop import poll_health
+
+    robot = configured_robot(activation)
+    complete_health(robot)
+    binding = dict(robot._am1_teleop_binding)
+    activation.clock.now = 100.5
+    robot.left_bus.registers["Present_Temperature", "arm_left_elbow_flex"] = 98
+    boundary = len(activation.events)
+    with pytest.raises(RuntimeError, match="actual configured temperature limit") as caught:
+        poll_health(robot)
+    note = fault_note(caught.value)
+    prior = note["prior_successful_health"]
+    assert prior == {
+        "binding": binding,
+        "register": "Present_Temperature",
+        "motor": "arm_left_elbow_flex",
+        "value": 28,
+        "read_started_at_monotonic_s": 100,
+        "read_completed_at_monotonic_s": 100,
+    }
+    assert note["offending_value"] == 98 and note["read_started_at_monotonic_s"] == 100.5
+    assert len(activation.events) == boundary + 12  # Original Status + temperature; no diagnostic reads.
+    assert robot._am1_teleop_health["binding"] == binding
+    assert robot._am1_teleop_health["left"]["registers"]["Present_Temperature"]["arm_left_elbow_flex"] == 28
+    robot._am1_teleop_health["left"]["registers"]["Present_Temperature"]["arm_left_elbow_flex"] = 99
+    assert fault_note(caught.value)["prior_successful_health"] == prior
+
+
+@pytest.mark.parametrize(
+    "problem", ["missing_binding", "foreign_binding", "future_interval", "invalid_interval"]
+)
+def test_fault_note_does_not_attribute_unproven_prior_health(activation, problem):
+    from lerobot.robots.alohamini.am1_live_teleop import read_groups
+
+    robot = configured_robot(activation)
+    complete_health(robot)
+    # Historical untagged records are explicitly unavailable, never guessed as current.
+    if problem == "missing_binding":
+        robot._am1_teleop_health.pop("binding", None)
+    elif problem == "foreign_binding":
+        robot._am1_teleop_health["binding"]["run_id"] = str(uuid4())
+    else:
+        timing = robot._am1_teleop_health["left"]["timing"]["Present_Temperature"]
+        timing["read_completed_at_monotonic_s"] = 101 if problem == "future_interval" else float("nan")
+    robot.left_bus.registers["Present_Temperature", "arm_left_elbow_flex"] = 98
+    with pytest.raises(RuntimeError, match="actual configured temperature limit") as caught:
+        read_groups(robot, ("Present_Temperature",))
+    assert fault_note(caught.value)["prior_successful_health"] is None
+
+
+def test_group_reply_prewrite_refusal_allows_existing_actual_sdk_shutdown(activation, monkeypatch):
+    from lerobot.motors.feetech.tables import MODEL_CONTROL_TABLE
+
+    original_port_write = ReplyPort.writePort
+
+    def write_with_ack(port, packet):
+        result = original_port_write(port, packet)
+        if packet[4] == 3:
+            port.buffer.extend(reply_packet(packet[2], []))
+        return result
+
+    monkeypatch.setattr(ReplyPort, "writePort", write_with_ack)
+    robot = configured_robot(activation)
+    bus = sdk_bus(robot, "left", [])
+    original_sync = bus.packet_handler.syncReadTx
+    bus.packet_handler.syncReadTx = lambda port, address, width, ids, count: original_sync(
+        port, address + 1, width, ids, count
+    )
+    with pytest.raises(RuntimeError, match="transmit") as caught:
+        bus.sync_read("Present_Temperature", robot.left_arm_motors, normalize=False, num_retry=0)
+    assert bus.port_handler.is_using  # The original SDK exited before resetting its busy flag.
+    first = caught.value
+    for target in (robot.left_bus, robot.right_bus):
+        original_bus_write = target.write
+
+        def sdk_write(
+            register, name, value, *, normalize=True, num_retry=3, _bus=target, _write=original_bus_write
+        ):
+            address, width = MODEL_CONTROL_TABLE["sts3215"][register]
+            data = [(int(value) >> (8 * index)) & 255 for index in range(width)]
+            comm, error = _bus.packet_handler.writeTxRx(
+                _bus.port_handler, _bus.motors[name].id, address, width, data
+            )
+            assert comm == 0 and error == 0
+            _write(register, name, value, normalize=normalize, num_retry=num_retry)
+
+        target.write = sdk_write
+    robot._am1_protected_cleanup = True
+    assert robot._safe_shutdown(close_buses=True, recover_interrupted_bus_io=True) == []
+    assert robot._am1_teleop_first_error is first
+    assert not robot.left_bus.is_connected and not robot.right_bus.is_connected
+    assert all(row["value"] == 0 for row in robot._am1_shutdown_evidence["readbacks"])
+    assert len(robot._am1_shutdown_evidence["readbacks"]) == 20
+    assert all(
+        packet[4] == 3
+        for target in (robot.left_bus, robot.right_bus)
+        for packet in target.port_handler.writes
+    )
+
+
+def test_group_reply_missing_transmit_cannot_consume_valid_cached_reply(activation, monkeypatch):
+    import scservo_sdk as sdk
+
+    # Controlled SDK success without its required send must not credit buffered RX.
+    monkeypatch.setattr(type(sdk.PacketHandler(0)), "syncReadTx", lambda *args: 0)
+    robot = configured_robot(activation)
+    packets = [reply_packet(i, [28]) for i in range(1, 7)]
+    bus = sdk_bus(robot, "left", packets)
+    before = list(bus.port_handler.buffer)
+    with pytest.raises(RuntimeError, match="missing original transmit"):
+        bus.sync_read("Present_Temperature", robot.left_arm_motors, normalize=False, num_retry=0)
+    assert bus.port_handler.buffer == before
+    assert bus.port_handler.writes == [] and bus.port_handler.clears == 0
+
+
+def test_group_reply_forwards_same_original_packet_and_write_result(activation, monkeypatch):
+    import scservo_sdk as sdk
+
+    calls, requests = [], []
+
+    class WriteResult(int):
+        pass
+
+    result = WriteResult(14)
+    original_tx = type(sdk.PacketHandler(0)).txPacket
+
+    def tx(handler, port, packet):
+        requests.append(packet)
+        return original_tx(handler, port, packet)
+
+    def write(port, packet):
+        calls.append(packet)
+        return result
+
+    monkeypatch.setattr(type(sdk.PacketHandler(0)), "txPacket", tx)
+    monkeypatch.setattr(ReplyPort, "writePort", write)
+    robot = configured_robot(activation)
+    bus = sdk_bus(robot, "left", [reply_packet(i, [28]) for i in range(1, 7)])
+    assert set(
+        bus.sync_read("Present_Temperature", robot.left_arm_motors, normalize=False, num_retry=0).values()
+    ) == {28}
+    assert len(calls) == len(requests) == bus.port_handler.clears == 1
+    assert calls[0] is requests[0]
+    assert robot._am1_teleop_group_receipts["left"]["transmit"]["result"] is result
