@@ -36,6 +36,195 @@ def test_acquisition_follows_grant_and_expired_capture_is_never_regranted():
         producer.serialize(frame)
 
 
+def test_expired_input_tolerance_requires_exact_structured_original_refusal():
+    m = adapter()
+    exact = {"accepted": False, "status": "refused", "reason": "expired grant", "effect_admitted": False}
+    assert m.expired_input_refusal(m.CommandRefusedError(exact))
+    assert not m.expired_input_refusal(RuntimeError("expired grant"))
+    for change in (
+        {"accepted": None},
+        {"status": "unknown"},
+        {"reason": "required selected view expired"},
+        {"effect_admitted": None},
+    ):
+        assert not m.expired_input_refusal(m.CommandRefusedError(dict(exact, **change)))
+
+
+@pytest.mark.parametrize(
+    "change", [{"reason": "required selected view expired"}, {"accepted": None}, {"effect_admitted": None}]
+)
+def test_sample_sender_preserves_all_other_refusals_without_regrant(change):
+    import asyncio
+
+    m = adapter()
+    calls, records = [], []
+
+    class Input:
+        kind = "virtual-leaders"
+
+        def get_action(self):
+            return {key.removeprefix("arm_"): 0.0 for key in KEYS}
+
+    class Client:
+        sequence = 0
+
+        def identities(self):
+            return {"run_id": "original"}
+
+        async def command(self, command):
+            calls.append(command)
+            if command["op"] == "grant":
+                return {"grant_id": str(uuid4())}
+            raise m.CommandRefusedError(
+                {
+                    "accepted": False,
+                    "status": "refused",
+                    "reason": "expired grant",
+                    "effect_admitted": False,
+                    **change,
+                }
+            )
+
+    with pytest.raises(m.CommandRefusedError):
+        asyncio.run(
+            m.send_leader_sample(
+                Client(),
+                m.FrameProducer(Input()),
+                m.ZERO_BODY,
+                records.append,
+                phase="individual",
+                progress_s=0.0,
+            )
+        )
+    assert [row["op"] for row in calls] == ["grant", "input"]
+    assert records[-1]["fresh_acquisition_allowed"] is False
+
+
+def test_sample_sender_never_sends_under_an_identity_changed_during_capture():
+    import asyncio
+
+    m = adapter()
+    calls, records = [], []
+    current = ["original"]
+
+    class Input:
+        kind = "virtual-leaders"
+
+        def get_action(self):
+            current[0] = "another-run"
+            return {key.removeprefix("arm_"): 0.0 for key in KEYS}
+
+    class Client:
+        sequence = 0
+
+        def identities(self):
+            return {"run_id": current[0]}
+
+        async def command(self, command):
+            calls.append(command)
+            return {"grant_id": str(uuid4())}
+
+    with pytest.raises(RuntimeError, match="identity changed"):
+        asyncio.run(
+            m.send_leader_sample(
+                Client(),
+                m.FrameProducer(Input()),
+                m.ZERO_BODY,
+                records.append,
+                phase="individual",
+                progress_s=0.0,
+            )
+        )
+    assert [row["op"] for row in calls] == ["grant"]
+    assert records[-1]["identity"]["run_id"] == "original"
+
+
+def test_real_core_wss_expired_grant_keeps_original_refusal_and_allows_fresh_grant(tmp_path):
+    import asyncio
+    import json
+
+    from tests.robots.am1_session_fixture import Cluster
+    from tests.robots.test_am1_session_api import enrolled
+
+    m = adapter()
+    cluster = Cluster(tmp_path / "cluster")
+
+    async def scenario():
+        session = await enrolled(cluster)
+        token = next(cookie.value for cookie in session.cookie_jar if cookie.key == "__Host-am1-device")
+        await session.close()
+        storage = tmp_path / "state.json"
+        storage.write_text(
+            json.dumps(
+                {
+                    "cookies": [
+                        {
+                            "name": "__Host-am1-device",
+                            "value": token,
+                            "domain": "127.0.0.1",
+                            "path": "/",
+                            "secure": True,
+                        }
+                    ]
+                }
+            )
+        )
+        client = m.SessionClient(cluster.url, cluster.cert, storage)
+        try:
+            await client.attach()
+            await client.claim()
+            start = await client.post(
+                "start",
+                {
+                    "operation_id": str(uuid4()),
+                    "recipe": "fake-interactive",
+                    "controller_generation": client.generation,
+                },
+            )
+            await client.wait(lambda: (client.snapshot.get("run") or {}).get("run_id") == start["run_id"], 2)
+            base = {
+                "run_id": start["run_id"],
+                "service_incarnation": client.snapshot["service_incarnation"],
+                "controller_generation": client.generation,
+            }
+            connected = await client.command(dict(op="connect", **base))
+            base["connection_generation"] = connected["connection_generation"]
+            await client.command(dict(op="release_input", **base))
+            current = (await client.get("state"))["snapshot"]
+            await client.command(
+                dict(
+                    op="resume",
+                    **base,
+                    expected_intent_revision=current["run"]["intent_revision"],
+                    operation_id=str(uuid4()),
+                )
+            )
+            old = await client.command(dict(op="grant", **base))
+            await asyncio.sleep(0.3)
+            with pytest.raises(m.CommandRefusedError) as caught:
+                await client.command(dict(op="input", **base, grant_id=old["grant_id"], seq=1, target=[0.0]))
+            assert m.expired_input_refusal(caught.value)
+            assert caught.value.response["reason"] == "expired grant"
+            assert (
+                caught.value.timing["send_completed_at_monotonic_s"]
+                <= caught.value.timing["response_observed_at_monotonic_s"]
+            )
+            fresh = await client.command(dict(op="grant", **base))
+            assert fresh["grant_id"] != old["grant_id"]
+            assert (
+                await client.command(
+                    dict(op="input", **base, grant_id=fresh["grant_id"], seq=2, target=[0.0])
+                )
+            )["accepted"]
+        finally:
+            await client.close()
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        cluster.close()
+
+
 def test_clutch_records_reference_and_rejoin_clears_outage_motion_without_calibration_change():
     m = adapter()
     origin = dict.fromkeys(KEYS, 4.0)
@@ -252,6 +441,12 @@ def test_real_wss_clean_close_ends_qualified_wait_before_timeout(tmp_path):
         "admission_terminal",
         "terminal_stop_race",
         "foreign_terminal",
+        "expired_first",
+        "expired_zero",
+        "expired_zero_timeout",
+        "expired_next_budget",
+        "expired_usb_budget",
+        "expired_foreign_budget",
     ],
 )
 def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id(
@@ -263,6 +458,16 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
 
     m = adapter()
     prelive = {"admission_fault", "admission_terminal", "terminal_stop_race", "foreign_terminal"}
+    dropped = failure in {
+        "expired_first",
+        "expired_zero",
+        "expired_zero_timeout",
+        "expired_next_budget",
+        "expired_usb_budget",
+        "expired_foreign_budget",
+    }
+    wall_budget = failure in {"expired_next_budget", "expired_usb_budget"}
+    foreign_boundary = failure == "expired_foreign_budget"
     owned_id, foreign_id = str(uuid4()), str(uuid4())
     instances = []
 
@@ -275,6 +480,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
             self.stops = []
             self.start_requests = []
             self.cleanup_reads = 0
+            self.inputs = []
             instances.append(self)
 
         async def attach(self):
@@ -382,7 +588,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
             assert predicate()
 
         def identities(self):
-            return {"run_id": owned_id}
+            return {"run_id": self.snapshot["run"]["run_id"] if foreign_boundary else owned_id}
 
         async def resume(self):
             assert self.snapshot["run"]["run_id"] == owned_id
@@ -391,6 +597,27 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
             if payload["op"] == "grant":
                 return {"accepted": True, "grant_id": str(uuid4()), "expires": 99.0}
             assert payload["op"] == "input"
+            self.inputs.append(copy.deepcopy(payload))
+            expired_at = 1 if failure == "expired_first" or foreign_boundary else 2
+            if dropped and (
+                len(self.inputs) == expired_at
+                or failure == "expired_zero_timeout"
+                and len(self.inputs) >= 2
+                or wall_budget
+            ):
+                await asyncio.sleep(0.04)
+                if foreign_boundary:
+                    self.snapshot = self.state(foreign_id)
+                raise m.CommandRefusedError(
+                    {
+                        "accepted": False,
+                        "status": "refused",
+                        "reason": "expired grant",
+                        "effect_admitted": False,
+                    }
+                )
+            if dropped:
+                await asyncio.sleep(0.01)
             self.snapshot["run"]["live_input"].update(
                 last_input_seq=payload["seq"], source=payload["source"], body=payload["body"]
             )
@@ -434,7 +661,9 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
 
     monkeypatch.setattr(m, "USBLeaderSource", Input)
     args = SimpleNamespace(
-        source="usb-leaders" if failure else "virtual-leaders",
+        source="usb-leaders"
+        if failure and (not dropped or failure == "expired_usb_budget")
+        else "virtual-leaders",
         output=str(tmp_path / "evidence"),
         url="unused",
         ca="unused",
@@ -451,16 +680,40 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
     )
     if failure:
         args.duration_seconds = 0.001
-    if failure and failure != "start_lost":
-        with pytest.raises(Exception, match="injected|cleanup failed|native terminal"):
-            asyncio.run(m.run(args))
+    if dropped:
+        args.next_start_seconds = None
+    if failure == "expired_next_budget":
+        args.next_start_seconds = 3.0
+    if failure == "expired_usb_budget":
+        args.duration_seconds = 0.03
+    if foreign_boundary:
+        args.next_start_seconds = 0.001
+    if (
+        failure
+        and failure != "start_lost"
+        and (not dropped or failure == "expired_zero_timeout" or wall_budget or foreign_boundary)
+    ):
+        with pytest.raises(
+            Exception, match="injected|cleanup failed|native terminal|body-zero|identity/deadline"
+        ):
+            asyncio.run(
+                asyncio.wait_for(m.run(args), 6.0 if failure == "expired_next_budget" else 3.0)
+                if wall_budget
+                else m.run(args)
+            )
         import json
 
         summary = json.loads((tmp_path / "evidence" / "summary.json").read_text())
-        assert sources[0].closed == 1
+        if args.source == "usb-leaders":
+            assert sources[0].closed == 1
         if failure != "start_unknown":
             assert summary["owned_run_id"] == owned_id
-        assert "injected" in str(summary) or failure == "terminal_fault"
+        assert (
+            "injected" in str(summary)
+            or failure in {"terminal_fault", "expired_zero_timeout"}
+            or wall_budget
+            or foreign_boundary
+        )
         if failure == "stop":
             assert summary["native_cleanup_uncertain"] is True
         if failure == "start_unknown":
@@ -493,6 +746,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
         == (
             []
             if failure in {"start_unknown", "admission_fault", "admission_terminal", "foreign_terminal"}
+            or foreign_boundary
             else [owned_id]
         )
         and session.closed == 1
@@ -500,7 +754,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
     assert session.saw_foreign == (0 if failure == "start_unknown" else 1)
     if failure not in {"start_unknown", *prelive}:
         assert summary["run_id"] == owned_id
-    if failure not in {"stop", "start_unknown", "terminal_fault", *prelive}:
+    if failure not in {"stop", "start_unknown", "terminal_fault", *prelive} and not foreign_boundary:
         assert summary["native_terminal"]["run"]["status"] == "stopped"
     if failure in {"start_lost", "start_unknown"}:
         assert len(session.start_requests) == 2 and session.start_requests[0] == session.start_requests[1]
@@ -508,6 +762,51 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
     assert summary["producer_program_complete"] is False
     if not failure:
         assert summary["active_progress_s"] == 0
+    if dropped:
+        import json
+
+        records = [
+            json.loads(line) for line in (tmp_path / "evidence" / "frames.jsonl").read_text().splitlines()
+        ]
+        rejected = [row for row in records if row["event"] == "leader_frame_rejected"]
+        assert len(rejected) >= 1 and all(row["discarded"] is True for row in rejected)
+        if failure != "expired_zero_timeout" and not wall_budget:
+            assert len(rejected) == 1
+        assert rejected[0]["receipt"]["reason"] == "expired grant"
+        assert len({item["source"]["source_id"] for item in session.inputs}) == 1
+        assert [item["source"]["sample_seq"] for item in session.inputs] == list(
+            range(1, len(session.inputs) + 1)
+        )
+        assert len({item["grant_id"] for item in session.inputs}) == len(session.inputs)
+        assert all(
+            item["source"]["grant_received_at_monotonic_s"] <= item["source"]["acquired_at_monotonic_s"]
+            for item in session.inputs
+        )
+        if foreign_boundary:
+            assert len(session.inputs) == 1 and session.inputs[0]["run_id"] == owned_id
+            assert "identity/deadline changed" in summary["failure"]
+            assert "native_terminal" not in summary and summary["native_cleanup_uncertain"] is True
+            assert "another run" in summary["cleanup_errors"][0]["message"]
+            return
+        if wall_budget:
+            attempts = [row for row in records if row["event"] == "leader_frame_attempt"]
+            zero = [row for row in attempts if row["phase"] == "terminal_zero_qualification"]
+            assert zero and zero[0]["local_monotonic_s"] - attempts[0]["local_monotonic_s"] < (
+                3.2 if failure == "expired_next_budget" else 0.2
+            )
+            assert not [row for row in records if row["event"] == "leader_frame"]
+            assert summary["producer_program_complete"] is False and summary["cleanup_errors"] == []
+            assert "body-zero" in summary["failure"]
+            return
+        if failure == "expired_zero_timeout":
+            assert all(row["phase"] == "terminal_zero_qualification" for row in rejected)
+            assert 1.8 < records[-1]["local_monotonic_s"] - rejected[0]["local_monotonic_s"] < 2.1
+            assert "body-zero" in summary["failure"]
+            assert summary["cleanup_errors"] == []
+            return
+        assert 0 < summary["active_progress_s"] < 0.04
+        assert summary["original_native_deadline"] == 301.0
+        assert summary["cleanup_errors"] == [] and summary["final_body_zero"] is True
 
 
 def test_runner_constructor_failure_still_saves_first_cause_without_start(tmp_path, monkeypatch):

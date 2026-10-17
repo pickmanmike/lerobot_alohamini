@@ -181,6 +181,31 @@ class USBLeaderSource:
         self.connected.clear()
 
 
+class CommandRefusedError(RuntimeError):
+    """Original bounded WSS refusal, separate from transport uncertainty."""
+
+    def __init__(self, response, *, timing=None):
+        raw = json.dumps(response, allow_nan=False, separators=(",", ":"))
+        if not isinstance(response, dict) or len(raw.encode()) > 65536:
+            raise ValueError("bounded original command refusal required")
+        self.response = json.loads(raw)
+        self.reason = response.get("reason", "session command refused")
+        self.timing = dict(timing or {})
+        super().__init__(self.reason)
+
+
+def expired_input_refusal(error):
+    return isinstance(error, CommandRefusedError) and all(
+        error.response.get(key) == value and type(error.response.get(key)) is type(value)
+        for key, value in {
+            "accepted": False,
+            "status": "refused",
+            "reason": "expired grant",
+            "effect_admitted": False,
+        }.items()
+    )
+
+
 class SessionClient:
     def __init__(self, origin, ca, storage_state):
         import aiohttp
@@ -327,11 +352,15 @@ class SessionClient:
         identity = str(uuid4())
         future = asyncio.get_running_loop().create_future()
         self.pending[identity] = future
+        timing = {"request_started_at_monotonic_s": time.perf_counter()}
         try:
+            timing["send_started_at_monotonic_s"] = time.perf_counter()
             await self.ws.send_json({"id": identity, "command": command})
+            timing["send_completed_at_monotonic_s"] = time.perf_counter()
             result = await asyncio.wait_for(future, 1.0)
+            timing["response_observed_at_monotonic_s"] = time.perf_counter()
             if result.get("accepted") is not True:
-                raise RuntimeError(result.get("reason", "session command refused"))
+                raise CommandRefusedError(result, timing=timing)
             return result
         finally:
             self.pending.pop(identity, None)
@@ -453,6 +482,55 @@ def native_frame_ack(snapshot, sequence, source, *, body_zero=False):
             and all(type(measured.get(k)) in (int, float) and measured[k] == 0 for k in ZERO_BODY)
         )
     return True
+
+
+async def send_leader_sample(client, producer, body, record, *, phase, progress_s):
+    """One original grant/acquisition/send. A refused sample is never resent."""
+    identity = client.identities()
+    grant_started = time.perf_counter()
+    grant = await client.command(dict(op="grant", **identity))
+    received = time.perf_counter()
+    frame = await asyncio.to_thread(producer.capture, grant, body=body, grant_received_at=received)
+    frame = producer.serialize(frame)
+    client.sequence += 1
+    attempt = {
+        "identity": identity,
+        "network_seq": client.sequence,
+        "grant": grant,
+        "frame": frame,
+        "phase": phase,
+        "progress_s": progress_s,
+        "raw_leaders": getattr(producer.input, "last_raw", None),
+        "command_clamps": producer.clutch.last_clamps,
+        "clutch": producer.last_clutch,
+        "timing": {
+            "grant_request_started_at_monotonic_s": grant_started,
+            "grant_received_at_monotonic_s": received,
+            "serialized_at_monotonic_s": time.perf_counter(),
+        },
+    }
+    record({"event": "leader_frame_attempt", **attempt})
+    if client.identities() != identity:
+        raise RuntimeError("current input identity changed during acquisition")
+    try:
+        result = await client.command(
+            dict(op="input", **identity, grant_id=grant["grant_id"], seq=client.sequence, **frame)
+        )
+    except CommandRefusedError as error:
+        record(
+            {
+                "event": "leader_frame_rejected",
+                **attempt,
+                "receipt": error.response,
+                "input_timing": error.timing,
+                "discarded": True,
+                "fresh_acquisition_allowed": expired_input_refusal(error),
+            }
+        )
+        if not expired_input_refusal(error):
+            raise
+        return None
+    return grant, frame, result
 
 
 async def run(args):
@@ -590,6 +668,14 @@ async def run(args):
             state = client.snapshot
             if state["run"]["run_id"] != run_id or state["run"]["deadline"] != deadline:
                 raise RuntimeError("original run identity/deadline changed")
+            wall_elapsed = time.monotonic() - active_at
+            if (
+                args.next_start_seconds
+                and wall_elapsed >= args.next_start_seconds
+                or workload is None
+                and wall_elapsed >= args.duration_seconds
+            ):
+                break
             if state["run"]["status"] != "running":
                 cause = next(
                     (
@@ -683,20 +769,22 @@ async def run(args):
                 original_body = dict(body)
                 body.pop("lift_axis.height_mm")
                 record({"event": "body_velocity_precedence", "original": original_body, "sent": body})
-            grant = await client.command(dict(op="grant", **client.identities()))
-            received = time.perf_counter()
-            frame = await asyncio.to_thread(producer.capture, grant, body=body, grant_received_at=received)
-            frame = producer.serialize(frame)
-            client.sequence += 1
-            result = await client.command(
-                dict(
-                    op="input",
-                    **client.identities(),
-                    grant_id=grant["grant_id"],
-                    seq=client.sequence,
-                    **frame,
-                )
+            sent = await send_leader_sample(
+                client,
+                producer,
+                body,
+                record,
+                phase=phase,
+                progress_s=workload.elapsed_s if workload else None,
             )
+            if sent is None:
+                if workload:
+                    workload.freeze()
+                await asyncio.sleep(0.06)
+                if workload and not args.next_start_seconds:
+                    workload.admit(time.monotonic())
+                continue  # Normal run/deadline/status/rejoin checks precede a new acquisition.
+            grant, frame, result = sent
             if producer.last_clutch:
                 record(producer.last_clutch)
                 producer.last_clutch = None
@@ -734,22 +822,31 @@ async def run(args):
         # one retained zero sample with another grant.
         qualification_at = time.monotonic()
         while True:
-            grant = await client.command(dict(op="grant", **client.identities()))
-            frame = producer.serialize(
-                await asyncio.to_thread(
-                    producer.capture, grant, body=ZERO_BODY, grant_received_at=time.perf_counter()
+            remaining = 2 - (time.monotonic() - qualification_at)
+            if remaining <= 0:
+                raise RuntimeError("terminal current native body-zero feedback did not qualify")
+            try:
+                sent = await asyncio.wait_for(
+                    send_leader_sample(
+                        client,
+                        producer,
+                        ZERO_BODY,
+                        record,
+                        phase="terminal_zero_qualification",
+                        progress_s=workload.elapsed_s if workload else None,
+                    ),
+                    remaining,
                 )
-            )
-            client.sequence += 1
-            await client.command(
-                dict(
-                    op="input",
-                    **client.identities(),
-                    grant_id=grant["grant_id"],
-                    seq=client.sequence,
-                    **frame,
-                )
-            )
+            except TimeoutError as error:
+                if time.monotonic() - qualification_at >= 2:
+                    raise RuntimeError(
+                        "terminal current native body-zero feedback did not qualify"
+                    ) from error
+                raise
+            if sent is None:
+                await asyncio.sleep(min(0.03, max(0, 2 - (time.monotonic() - qualification_at))))
+                continue
+            _, frame, _ = sent
             await client.wait(
                 lambda frame=frame: native_frame_ack(client.snapshot, client.sequence, frame["source"]), 0.18
             )
