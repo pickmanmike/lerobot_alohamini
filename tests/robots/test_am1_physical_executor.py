@@ -83,6 +83,253 @@ def test_cached_reception_cannot_renew_real_feedback():
         module().read_physical_sample(c, "run", "host", 4, clock=lambda: 10.0)
 
 
+def retained_native_sample99_client():
+    """Original combined06 observation99 values/times, with identity anonymized."""
+    raw_and_normalized = {
+        "arm_left_shoulder_pan.pos": (2238, 11.340967861100864),
+        "arm_left_shoulder_lift.pos": (3225, 100.1684210526316),
+        "arm_left_elbow_flex.pos": (2101, 11.996378451788132),
+        "arm_left_wrist_flex.pos": (1547, -75.3959873284055),
+        "arm_left_wrist_roll.pos": (2200, 7.44810744810745),
+        "arm_left_gripper.pos": (3166, 84.48844884488449),
+        "arm_right_shoulder_pan.pos": (2143, 2.8846153846153726),
+        "arm_right_shoulder_lift.pos": (3252, 98.75840662183134),
+        "arm_right_elbow_flex.pos": (1854, -7.142857142857139),
+        "arm_right_wrist_flex.pos": (2772, 53.692848769050414),
+        "arm_right_wrist_roll.pos": (2444, 19.365079365079367),
+        "arm_right_gripper.pos": (1981, 21.121251629726206),
+    }
+    positions = {key: normalized for key, (_raw, normalized) in raw_and_normalized.items()}
+    observation = dict(
+        positions,
+        **{
+            "x.vel": 0.0,
+            "y.vel": 0.0,
+            "theta.vel": 0.0,
+            "lift_axis.vel": 50,
+            "lift_axis.height_mm": 10.458984375,
+        },
+    )
+    marker = {
+        "version": 1,
+        "run_id": "run",
+        "host_incarnation": "host",
+        "observation_id": 99,
+        "accepted_action_sequence": 96,
+        "state": "active",
+        "epoch": 6,
+        "intent_revision": 2,
+        "write_acknowledged": False,
+        "read_started_at_monotonic_s": 93298.362833242,
+        "acquired_at_monotonic_s": 93298.385650822,
+        "accepted_action": dict(
+            positions,
+            **{
+                "arm_left_shoulder_pan.pos": 12.818618396749159,
+                "x.vel": 0.0,
+                "y.vel": 0.0,
+                "theta.vel": 0.0,
+                "lift_axis.vel": 0,
+            },
+        ),
+        "arm_feedback": {
+            "version": 1,
+            "positions": {
+                key: {
+                    "raw": raw,
+                    "normalized": normalized,
+                    "read_started_at_monotonic_s": 93298.362883427 if "_left_" in key else 93298.366766693,
+                    "read_completed_at_monotonic_s": 93298.364696236 if "_left_" in key else 93298.368585854,
+                }
+                for key, (raw, normalized) in raw_and_normalized.items()
+            },
+        },
+        "lift_feedback": {
+            "version": 1,
+            "height_mm": 10.458984375,
+            "present_velocity_raw": 50,
+            "sample_monotonic_s": 93298.343602744,
+            "request_duration_s": 0.0017404389946023002,
+        },
+    }
+    client = SimpleNamespace(
+        latest_am1_local_feedback=marker,
+        latest_raw_observation_keys=frozenset(observation),
+        latest_observation_received_at=93298.387097244,
+        latest_observation_roundtrip_age_s=0.13533435499994084,
+        latest_observation_error=None,
+    )
+    client.get_observation = lambda: observation
+    return client
+
+
+def pending_sample_executor(sample, clock):
+    from examples.alohamini.am1_live_teleop import TELEOP_SPEC
+
+    e = executor(ControlledHost())
+    e.live_spec = TELEOP_SPEC
+    e.sample = copy.deepcopy(sample)
+    e.clock = clock
+    return e
+
+
+def test_real_cached_client_sample99_pending40ms_then_advancing100(monkeypatch, tmp_path):
+    import json
+
+    from lerobot.robots.alohamini import alohamini_client as client_module
+    from lerobot.robots.alohamini.config_alohamini import AlohaMiniClientConfig
+
+    m = module()
+    original = retained_native_sample99_client()
+    clock = [original.latest_observation_received_at]
+    monkeypatch.setattr(
+        client_module, "time", SimpleNamespace(monotonic=lambda: clock[0], perf_counter=lambda: clock[0])
+    )
+    client = client_module.AlohaMiniClient(
+        AlohaMiniClientConfig(
+            remote_ip="127.0.0.1",
+            robot_model="alohamini1",
+            cameras={},
+            calibration_dir=tmp_path,
+        )
+    )
+    client._is_connected = True
+    payload = dict(
+        original.get_observation(), _am1_local_feedback=copy.deepcopy(original.latest_am1_local_feedback)
+    )
+    replies = [payload, None, None]
+
+    def poll():
+        value = replies.pop(0)
+        if value is None:
+            clock[0] += 0.040
+            client._last_response_request_sent_at = None
+            return None
+        client._last_response_request_sent_at = (
+            93298.251762889 if value["_am1_local_feedback"]["observation_id"] == 99 else 93298.387097244
+        )
+        return [json.dumps(value).encode()]
+
+    monkeypatch.setattr(client, "_poll_and_get_latest_message", poll)
+    first = m.read_physical_sample(client, "run", "host", 98, clock=lambda: clock[0])
+    e = pending_sample_executor(first, lambda: clock[0])
+    retained = e.sample
+    pending = m.read_physical_sample(
+        client, "run", "host", 99, clock=lambda: clock[0], allow_pending_sample=True
+    )
+    assert isinstance(pending, m.PendingSample)
+    assert e._update_polled_sample(pending, None) == (False, True)
+    assert e.sample is retained
+    assert client.latest_observation_received_at == 93298.387097244
+    assert client.latest_observation_roundtrip_age_s == 0.13533435499994084
+    assert e.sample["at"] == 93298.251762889 and e.sample["sequence"] == 99
+    with pytest.raises(m.FeedbackUnavailable, match="did not advance"):
+        m.read_physical_sample(client, "run", "host", 99, clock=lambda: clock[0])
+
+    # A synthetic advancing reply follows the exact retained99 cache miss.
+    next_payload = copy.deepcopy(payload)
+    marker = next_payload["_am1_local_feedback"]
+    marker["observation_id"], marker["accepted_action_sequence"] = 100, 97
+    marker["read_started_at_monotonic_s"] += 0.080
+    marker["acquired_at_monotonic_s"] += 0.080
+    marker["lift_feedback"]["sample_monotonic_s"] += 0.080
+    for reading in marker["arm_feedback"]["positions"].values():
+        reading["read_started_at_monotonic_s"] += 0.080
+        reading["read_completed_at_monotonic_s"] += 0.080
+    replies.append(next_payload)
+    candidate = m.read_physical_sample(
+        client, "run", "host", 99, clock=lambda: clock[0], allow_pending_sample=True
+    )
+    assert e._update_polled_sample(candidate, None) == (True, True)
+    assert e.sample["sequence"] == 100 and e.sample["at"] > retained["at"]
+
+
+@pytest.mark.parametrize(
+    "changed", ["positions", "raw", "body", "ack", "request", "reply", "acquired", "identity", "type"]
+)
+def test_pending_same_id_changed_native_payload_is_refused(changed):
+    m = module()
+    client = retained_native_sample99_client()
+    first = m.read_physical_sample(client, "run", "host", 98, clock=lambda: 93298.4)
+    e = pending_sample_executor(first, lambda: 93298.45)
+    candidate = copy.deepcopy(first)
+    if changed == "positions":
+        candidate["positions"]["arm_left_shoulder_pan.pos"] += 1
+    elif changed == "raw":
+        candidate["arm_feedback"]["positions"]["arm_left_shoulder_pan.pos"]["raw"] += 1
+    elif changed == "body":
+        candidate["body_feedback"]["lift_axis.vel"] = 0
+    elif changed == "ack":
+        candidate["ack"]["accepted_action_sequence"] += 1
+    elif changed == "request":
+        candidate["timing"]["original_request_sent_at_monotonic_s"] += 0.001
+    elif changed == "reply":
+        candidate["timing"]["reply_received_at_monotonic_s"] += 0.001
+    elif changed == "acquired":
+        candidate["ack"]["acquired_at_monotonic_s"] += 0.001
+    elif changed == "identity":
+        candidate["ack"]["host_incarnation"] = "foreign"
+    elif changed == "type":
+        candidate["ack"]["epoch"] = 6.0
+    with pytest.raises(ValueError, match="pending.*payload"):
+        e._update_polled_sample(m.PendingSample(candidate), None)
+    assert e.sample == first
+
+
+@pytest.mark.parametrize("changed", ["rewind", "identity", "malformed", "raw_mismatch", "stale"])
+def test_pending_read_validates_original_feedback_before_allowing_cache(changed):
+    m = module()
+    client = retained_native_sample99_client()
+    now = 93298.45
+    if changed == "rewind":
+        client.latest_am1_local_feedback["observation_id"] = 98
+    elif changed == "identity":
+        client.latest_am1_local_feedback["host_incarnation"] = "foreign"
+    elif changed == "malformed":
+        client.latest_observation_error = "invalid original payload"
+    elif changed == "raw_mismatch":
+        client.latest_am1_local_feedback["arm_feedback"]["positions"]["arm_left_shoulder_pan.pos"][
+            "normalized"
+        ] += 1
+    elif changed == "stale":
+        now = 93299.251762889
+    with pytest.raises((m.FeedbackUnavailable, ValueError)):
+        m.read_physical_sample(client, "run", "host", 99, clock=lambda: now, allow_pending_sample=True)
+
+
+def test_pending_never_clears_real_transient_or_extends_original_feedback_age():
+    m = module()
+    client = retained_native_sample99_client()
+    first = m.read_physical_sample(client, "run", "host", 98, clock=lambda: 93298.4)
+    clock = [93298.45]
+    e = pending_sample_executor(first, lambda: clock[0])
+    e._transient = "genuine transport timeout"
+    assert e._update_polled_sample(m.PendingSample(copy.deepcopy(first)), None) == (False, False)
+    assert e._transient == "genuine transport timeout"
+    e._transient = None
+    clock[0] = first["at"] + 1.0
+    assert e._update_polled_sample(m.PendingSample(copy.deepcopy(first)), None) == (False, False)
+    assert e.sample["at"] == first["at"]
+    assert e._update_polled_sample(None, "genuine socket failure") == (False, False)
+    assert e._transient == "genuine socket failure"
+
+
+def test_only_teleop_protected_host_opts_into_pending_sample():
+    from examples.alohamini.am1_session_contract import RECIPES
+
+    m = module()
+    provider = object.__new__(m.ProtectedHostRun)
+    provider.host = provider.camera = SimpleNamespace(poll=lambda: None)
+    provider.run_id, provider.incarnation = "run", "host"
+    provider.client = retained_native_sample99_client()
+    provider.recipe = RECIPES["physical-live-teleop"]
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(m, "read_physical_sample", lambda *a, **kw: kw)
+        assert provider.poll(99)["allow_pending_sample"] is True
+        provider.recipe = RECIPES["physical-live-left-elbow"]
+        assert provider.poll(99)["allow_pending_sample"] is False
+
+
 def test_body_recipe_uses_original_200ms_press_release_and_zero_between():
     m = module()
     seen = []
@@ -202,6 +449,144 @@ def executor(host):
     return module().PhysicalExecutor(
         {"shoulder_amplitude": 1.5, "source_pins": {}}, observation(), io_factory=lambda *_: host
     )
+
+
+def pending_native_worker():
+    """Actual worker and native control, with queued feedback and inert buses."""
+    import queue
+
+    from examples.alohamini.am1_session_contract import RECIPES
+    from tests.robots.test_am1_live_teleop_native import frame, lane, sample
+
+    now, identity, binding, robot, control = lane()
+    control.apply(robot, frame(identity, binding, 1))
+    original = sample(control)
+    now[0] = 10.1
+    control.apply(robot, frame(identity, binding, 2, mode="active", epoch=2, sample=original))
+    measured = robot.get_observation()
+    control.annotate(measured, acquired_at=now[0])
+    requests, actions = queue.Queue(), queue.Queue()
+
+    class NativeIO:
+        provenance = "protected-host"
+
+        def start(self, *args):
+            pass
+
+        def poll(self, previous):
+            return requests.get(timeout=2)
+
+        def send(self, action):
+            control.apply(robot, action)
+            actions.put(copy.deepcopy(action))
+
+        def finish(self, status):
+            return {"cleanup": "physical_readback_verified", "uncertain": False, "terminal_status": status}
+
+    e = executor(NativeIO())
+    e.clock = lambda: now[0]
+    e.bind_run(identity["run_id"], RECIPES["physical-live-teleop"])
+    e.host_incarnation = identity["host_incarnation"]
+    e._live_binding, e._live_target = binding, original
+    e._lifecycle.update(phase="live", native_live_at=10.0)
+    e._epoch, e._epoch_mode, e._epoch_revision = 2, "active", 0
+    e._action_sequence, e.desired, e._dispatch_ack = 2, "active", True
+    e._live_admission_requested = True
+    e.sample = {
+        "sequence": control.observation_id,
+        "at": now[0],
+        "positions": robot.get_observation(),
+        "ack": copy.deepcopy(measured["_am1_local_feedback"]),
+        "observation": measured,
+        "body_feedback": dict(module().ZERO_BODY),
+        "provenance": "protected-host/measured-feedback",
+    }
+    e.worker = threading.Thread(target=e._run, daemon=True)
+    e.worker.start()
+
+    def step():
+        requests.put(module().PendingSample(copy.deepcopy(e.sample)))
+        e._wake.set()
+        return actions.get(timeout=2)
+
+    def stop():
+        e.finish("stopped")
+        requests.put(None)
+        e._wake.set()
+        e.worker.join(2)
+        assert not e.worker.is_alive()
+
+    return now, robot, control, e, step, stop
+
+
+def test_pending_worker_keeps_active_without_new_alignment_ack_or_revision_credit():
+    assert hasattr(module(), "PendingSample"), "explicit cached-feedback result missing"
+    now, _robot, _control, e, step, stop = pending_native_worker()
+    try:
+        original = e.sample
+        assert step()["_am1_local_control"]["mode"] == "active"
+        assert e.sample is original and e._aligned == [] and e._dispatch_ack
+        now[0] += 0.04
+        e._dispatch_ack = False
+        assert step()["_am1_local_control"]["mode"] == "active"
+        assert not e._dispatch_ack and not e._aligned and e._finite_completion is None
+        assert e.sample is original
+        e.set_intent_revision(1)
+        e.desired = "active"  # A cached old active ACK cannot admit this new revision.
+        assert step()["_am1_local_control"]["mode"] == "pause"
+        assert not e.evidence()["native_ack"] and not e._dispatch_ack
+        assert e.sample["ack"]["intent_revision"] == 0
+    finally:
+        stop()
+
+
+@pytest.mark.parametrize("loss", ["observation", "fault", "original_age", "startup"])
+def test_pending_worker_still_holds_and_cannot_supply_startup_credit(loss):
+    assert hasattr(module(), "PendingSample"), "explicit cached-feedback result missing"
+    now, _robot, _control, e, step, stop = pending_native_worker()
+    try:
+        if loss == "observation":
+            e.observation.qualified = False
+        elif loss == "fault":
+            e._fault = "retained hard native fault"
+        elif loss == "original_age":
+            now[0] = e.sample["at"] + 1.0
+        else:
+            e._lifecycle.update(phase="startup", native_live_at=None)
+            e.desired, e._epoch_mode, e._epoch = "hold", "pause", 1
+            e._aligned = [9.8, 9.9, 10.0]
+            e.sample["ack"].update(state="paused", epoch=1)
+            e._live_admission_requested = False
+        assert step()["_am1_local_control"]["mode"] == "pause"
+        if loss == "startup":
+            assert e._lifecycle["native_live_at"] is None
+            assert not e._live_admission_requested
+            assert e._aligned == [9.8, 9.9, 10.0]
+        else:
+            assert not e._dispatch_ack
+        assert e._finite_completion is None
+        if loss == "fault":
+            assert not e.evidence()["native_ack"]
+    finally:
+        stop()
+
+
+def test_pending_worker_keeps_original_input_expiry_at_actual_native_control():
+    assert hasattr(module(), "PendingSample"), "explicit cached-feedback result missing"
+    now, robot, control, e, step, stop = pending_native_worker()
+    try:
+        retained = e.sample
+        assert step()["_am1_local_control"]["live_input"]["valid_until_monotonic_s"] == 10.25
+        now[0] = 10.26  # Feedback remains inside its original 1s; input does not.
+        before = len(robot.events)
+        action = step()
+        assert action["_am1_local_control"]["live_input"]["valid_until_monotonic_s"] == 10.25
+        assert control.state == "paused" and control.live_snapshot()["state"] == "expired"
+        assert not any(event[0] == "action" for event in robot.events[before:])
+        assert ("zero",) in robot.events[before:] and ("hold",) in robot.events[before:]
+        assert e.sample is retained and e.sample["at"] == 10.1
+    finally:
+        stop()
 
 
 def test_live_executor_allowlist_freezes_spec_from_bound_recipe_only():

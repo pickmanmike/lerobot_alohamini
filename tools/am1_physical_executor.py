@@ -1,9 +1,11 @@
 """Explicit protected physical recipes. No hardware is opened by module import."""
 
 import copy
+import json
 import math
 import threading
 import time
+from dataclasses import dataclass
 
 from examples.alohamini.am1_finite_task import JOINT_KEYS
 from examples.alohamini.am1_live_teleop import (
@@ -73,7 +75,24 @@ class FeedbackUnavailable(RuntimeError):  # noqa: N818 - existing adapter/test c
     """A bounded missing/stale reply; owner survives and holds/recoveries remain bounded."""
 
 
-def read_physical_sample(client, run_id, host_incarnation, previous_sequence, *, clock=time.monotonic):
+@dataclass(frozen=True)
+class PendingSample:
+    """Validated cached feedback; not a new observation, receipt or ACK."""
+
+    sample: dict
+
+
+def read_physical_sample(
+    client,
+    run_id,
+    host_incarnation,
+    previous_sequence,
+    *,
+    clock=time.monotonic,
+    allow_pending_sample=False,
+):
+    if type(allow_pending_sample) is not bool:
+        raise ValueError("pending sample opt-in requires bool")
     observation = client.get_observation()
     now = clock()
     marker = client.latest_am1_local_feedback
@@ -82,7 +101,13 @@ def read_physical_sample(client, run_id, host_incarnation, previous_sequence, *,
     if marker.get("run_id") != run_id or marker.get("host_incarnation") != host_incarnation:
         raise ValueError("foreign protected host feedback binding")
     sequence = marker.get("observation_id")
-    if type(sequence) is not int or sequence <= previous_sequence:
+    pending = type(sequence) is int and sequence == previous_sequence and allow_pending_sample
+    if (
+        type(sequence) is not int
+        or sequence < previous_sequence
+        or sequence == previous_sequence
+        and not pending
+    ):
         raise FeedbackUnavailable("native feedback acquisition did not advance")
     started, completed = marker.get("read_started_at_monotonic_s"), marker.get("acquired_at_monotonic_s")
     received, request_age = client.latest_observation_received_at, client.latest_observation_roundtrip_age_s
@@ -175,11 +200,11 @@ def read_physical_sample(client, run_id, host_incarnation, previous_sequence, *,
         }
         if any(selected.get(k) != v or type(selected.get(k)) is not type(v) for k, v in fields.items()):
             raise ValueError("foreign selected native feedback binding")
-    return {
+    sample = {
         "positions": positions,
         "sequence": sequence,
         "at": at,
-        "ack": {k: v for k, v in marker.items() if k != "selected_joint"},
+        "ack": copy.deepcopy({k: v for k, v in marker.items() if k != "selected_joint"}),
         "observation": {**observation, **({"_am1_arm_feedback": copy.deepcopy(arm_feedback)} if arm_feedback is not None else {})},
         "body_feedback": {
             key: observation[key]
@@ -201,6 +226,7 @@ def read_physical_sample(client, run_id, host_incarnation, previous_sequence, *,
         **({"arm_feedback": copy.deepcopy(arm_feedback)} if arm_feedback is not None else {}),
         **({"lift_feedback": copy.deepcopy(lift_feedback)} if lift_feedback is not None else {}),
     }
+    return PendingSample(sample) if pending else sample
 
 
 def body_recipe_action(client, elapsed):
@@ -634,12 +660,58 @@ class PhysicalExecutor:
         self._wake.set()
         return True
 
+    def _update_polled_sample(self, polled, transient):
+        pending = isinstance(polled, PendingSample)
+        if pending:
+
+            def original_payload(value):
+                # The client ndarray is derived from the separately validated
+                # positions. Every original safety value/identity/time remains.
+                return json.dumps(
+                    {k: v for k, v in value.items() if k != "observation"},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+
+            try:
+                unchanged = (
+                    self.live_spec is TELEOP_SPEC
+                    and self.sample is not None
+                    and transient is None
+                    and original_payload(polled.sample) == original_payload(self.sample)
+                )
+            except (AttributeError, TypeError, ValueError):
+                unchanged = False
+            if not unchanged:
+                raise ValueError("pending native feedback payload changed or is not admitted")
+            # Preserve the accepted sample and any earlier real transport fault.
+            # Only advancing acquisition can clear that fault or add proof.
+        else:
+            self._transient = transient
+            if polled is not None:
+                self.sample = polled
+        advanced = not pending and polled is not None
+        usable = bool(
+            (pending or advanced)
+            and self.sample is not None
+            and 0 <= self.clock() - self.sample["at"] < FEEDBACK_MAX_AGE_S
+            and self._transient is None
+            and self._fault is None
+        )
+        return advanced, usable
+
     def evidence(self):
         with self.mutex:
             now = self.clock()
             s = copy.deepcopy(self.sample)
             age = now - s["at"] if s else None
-            fresh = s is not None and 0 <= age < FEEDBACK_MAX_AGE_S and self._transient is None
+            fresh = (
+                s is not None
+                and 0 <= age < FEEDBACK_MAX_AGE_S
+                and self._transient is None
+                and self._fault is None
+            )
             ack = s["ack"] if s else {}
             matched = (
                 fresh
@@ -834,12 +906,9 @@ class PhysicalExecutor:
                 with self.mutex:
                     if self.finish_status:
                         break
-                    self._transient = transient
-                    if sample is not None:
-                        self.sample = sample
-                    fresh = sample is not None
+                    advanced, usable = self._update_polled_sample(sample, transient)
                     observed = self.observation.evidence()["qualified"]
-                    if not fresh or not observed:
+                    if not usable or not observed:
                         # This protection acts at native cadence even if web/database owner stalls.
                         self.desired = "hold"
                         self._dispatch_ack = False
@@ -847,10 +916,11 @@ class PhysicalExecutor:
                         self._hold_reference = None
                         self._completion_returns = []
                     latest_ack = self.sample["ack"] if self.sample else {}
-                    if live_input and latest_ack.get("live_input", {}).get("state") == "expired":
+                    if advanced and live_input and latest_ack.get("live_input", {}).get("state") == "expired":
                         self._live_expired = copy.deepcopy(latest_ack["live_input"])
                     if (
-                        fresh
+                        advanced
+                        and usable
                         and self._epoch_mode == "active"
                         and latest_ack.get("state") == "paused"
                         and latest_ack.get("epoch") == self._epoch
@@ -862,7 +932,13 @@ class PhysicalExecutor:
                         self._aligned = []
                         self._hold_reference = None
                         self._completion_returns = []
-                    desired = "active" if self.desired == "active" and fresh and observed else "pause"
+                    desired = "active" if self.desired == "active" and usable and observed else "pause"
+                    if (
+                        not advanced
+                        and desired == "active"
+                        and (self._epoch_mode != "active" or self._epoch_revision != self.revision)
+                    ):
+                        desired = "pause"  # Cached ACK cannot activate a new revision/epoch.
                     if self._epoch_mode != desired or self._epoch_revision != self.revision:
                         if desired == "pause":
                             self._epoch = (
@@ -879,13 +955,13 @@ class PhysicalExecutor:
                         self._epoch_revision = self.revision
                     ack = self.sample["ack"] if self.sample else {}
                     matched = (
-                        fresh
+                        usable
                         and ack.get("run_id") == self.run_id
                         and ack.get("host_incarnation") == self.host_incarnation
                         and ack.get("intent_revision") == self.revision
                         and ack.get("epoch") == self._epoch
                     )
-                    if matched and desired == "pause" and ack.get("state") == "paused":
+                    if advanced and matched and desired == "pause" and ack.get("state") == "paused":
                         positions = self.sample["positions"]
                         if self._hold_reference is None:
                             self._hold_reference = dict(positions)
@@ -944,7 +1020,8 @@ class PhysicalExecutor:
                             )
                             self._execution = dict(self.task.snapshot(), fault=None)
                     if live_input:
-                        self._dispatch_ack = bool(matched and ack.get("state") == "active")
+                        if advanced:
+                            self._dispatch_ack = bool(matched and ack.get("state") == "active")
                         native = copy.deepcopy(ack.get("live_input", {}))
                         self._execution = {"progress_s": 0 if self._lifecycle["native_live_at"] is None else
                             max(0, self.clock() - self._lifecycle["native_live_at"]), "complete": False,
@@ -955,7 +1032,7 @@ class PhysicalExecutor:
                         if desired == "pause":
                             if self.task.active:
                                 self.task.hold()
-                        elif matched and ack.get("state") == "active":
+                        elif advanced and matched and ack.get("state") == "active":
                             self._dispatch_ack = True
                             if not self.task.active:
                                 self.task.resume(self.clock())
@@ -1449,7 +1526,13 @@ class ProtectedHostRun:
             raise RuntimeError("protected host exited; original first cause retained in host log/receipt")
         if self.camera.poll() is not None:
             raise RuntimeError("required owned camera exited before physical finishing")
-        return read_physical_sample(self.client, self.run_id, self.incarnation, previous)
+        return read_physical_sample(
+            self.client,
+            self.run_id,
+            self.incarnation,
+            previous,
+            allow_pending_sample=self.recipe.name == TELEOP_RECIPE,
+        )
 
     def send(self, action):
         import zmq

@@ -30,9 +30,17 @@ valid required local observation/diagnostic evidence. Separate decoded view prog
 from capture freshness and motor health; optional loss cannot consume unrelated
 recovery budgets. Keep media work and routine logs outside the motor loop.
 
-Current known stopped deployment: motor 5c97a391 / runtime 978fadf4 /
-manifest b8abad25; camera a0e94bc5 and helper/manual 0fe3997f. Full exact pins and matched
-rollback are in docs/alohamini/practical-controls-14.md. Preserve calibration, trust,
+Current known stopped deployment: motor 7d12ad1264750d64e0f8b40edc625e08974581c4,
+protected runtime 34a97f816a78b8c7b5fda77b55c13a26b9df80b3, camera
+bc3442b54d9c574a8feddb0ade642c9b351e59f9; manifest
+c78dac7f081d16dd667a739863f84aa93ec5044d8fad0f17b241a17805aadb36.
+Helper/manual remains 0fe3997f. Immediate matched rollback retains the same motor
+and camera with runtime d70ce5d38ee1de2c0e3233d8f6e216a634a2a934 and manifest
+61be62e713ab2c07769839b8ec9d47e6869b4d50d26a562d6b9c1305848032e1.
+Packet16 combined06 has verified cleanup but an aborted feedback-recovery episode;
+its first cause and original results remain retained. The representative workload
+and next-Start qualification remain unfinished; repair the demonstrated feedback
+pending/recovery boundary before another supported run. Preserve calibration, trust,
 private permissions, source imports and separate full component rollback bundles.
 Tasks stay stopped during editing/staging; services restore idle without replay.
 AM1 stays wireless, P1 advisory, AM2 untouched. No network tuning, Ethernet,
