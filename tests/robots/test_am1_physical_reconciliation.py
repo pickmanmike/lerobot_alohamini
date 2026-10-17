@@ -1491,3 +1491,272 @@ def test_prehome_cool_stale_origin_cannot_admit_heat_device_fault_or_incomplete_
     publish_incomplete_fixture(config, run, proof, state)
     with pytest.raises((ValueError, RuntimeError)):
         m.load_qualified_proof(config, run)
+
+
+# Synthetic fresh readback proof with the retained Combined18 import-trace shape.
+# These fixtures are offline contrasts and grant no physical cleanup credit.
+def preimport_stop_fixture(tmp_path, monkeypatch):
+    m, config, run, proof, state, _, _ = loader_fixture(tmp_path, monkeypatch)
+    run.update(
+        status="stopped",
+        requested_terminal="stopped",
+        cleanup="physical_cleanup_unknown",
+        source="protected-physical-provider",
+        recipe="physical-live-teleop",
+        native_live_at=None,
+        progress_s=0.0,
+        recovery_episodes=0,
+        first_cause=None,
+        native_first_cause=None,
+        execution={"complete": False, "fault": None, "progress_s": 0.0},
+    )
+    run["physical_result"].update(
+        phase="terminal",
+        terminal_status="stopped",
+        run_id=run["run_id"],
+        uncertain=True,
+        cleanup="physical_cleanup_unknown",
+        native_live_at=None,
+        first_cause=None,
+        readback=None,
+        cleanup_errors=[],
+    )
+    proof.update(
+        original_cleanup_origin="preimport-stop-missing-host-receipt",
+        original_first_cause=None,
+        original_cleanup_sha256=None,
+        original_cleanup_missing=True,
+        original_markers=dict.fromkeys(m.MARKERS),
+    )
+    directory = Path(config["run_root"]) / run["run_id"][:8]
+    (directory / "cleanup.json").unlink()
+    (state / "cleanup-uncertain.json").unlink()
+    repository = Path(__file__).resolve().parents[2]
+    config["host_repository"] = str(repository)
+    proof["source"]["backend_contract"] = copy.deepcopy(config)
+    prefix = (repository / "src/lerobot/robots/alohamini").as_posix()
+    stdlib = "/retained/python/lib/python3.12/dataclasses.py"
+    trace = (
+        "Traceback (most recent call last):\n"
+        '  File "<frozen runpy>", line 189, in _run_module_as_main\n'
+        '  File "<frozen runpy>", line 112, in _get_module_details\n'
+        f'  File "{prefix}/__init__.py", line 17, in <module>\n'
+        "    from .alohamini import AlohaMini\n"
+        f'  File "{prefix}/alohamini.py", line 42, in <module>\n'
+        "    from .lift_axis import LiftAxis, LiftAxisConfig, LiftHomeResult\n"
+        f'  File "{prefix}/lift_axis.py", line 59, in <module>\n'
+        "    @dataclass\n     ^^^^^^^^^\n"
+        f'  File "{stdlib}", line 1275, in dataclass\n'
+        "    return wrap(cls)\n           ^^^^^^^^^\n"
+        f'  File "{stdlib}", line 1265, in wrap\n'
+        "    return _process_class(cls, init, repr, eq, order, unsafe_hash,\n"
+        "           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+        f'  File "{stdlib}", line 1092, in _process_class\n'
+        "    _cmp_fn('__eq__', '==',\n"
+        f'  File "{stdlib}", line 667, in _cmp_fn\n'
+        "    return _create_fn(name,\n           ^^^^^^^^^^^^^^^^\n"
+        f'  File "{stdlib}", line 473, in _create_fn\n'
+        "    exec(txt, globals, ns)\n"
+        '  File "<string>", line 0, in <module>\nKeyboardInterrupt\n'
+    ).encode()
+    launch = (
+        f"Running as unit: am1-pa01-host-{run['run_id']}.service; invocation ID: "
+        "3948f26868774d6dbecd7112518e0ccf\nFinished with result: success\n"
+        "Main processes terminated with: code=killed, status=2/INT\n"
+        "Service runtime: 4.676s\nCPU time consumed: 4.830s\n"
+    ).encode()
+    for name, data in (("host-runtime.log", trace), ("host-launch.log", launch)):
+        (directory / name).write_bytes(data)
+    proof["original_host_logs"] = {
+        name: hashlib.sha256((directory / name).read_bytes()).hexdigest()
+        for name in ("host-runtime.log", "host-launch.log")
+    }
+    publish_preimport_fixture(run, proof, state)
+    return m, config, run, proof, state, directory
+
+
+def publish_preimport_fixture(run, proof, state):
+    proof["original_terminal_run_sha256"] = hashlib.sha256(canonical(run)).hexdigest()
+    raw = canonical(proof)
+    (state / ("reconciliation-" + run["run_id"] + ".json")).write_bytes(raw)
+    return raw
+
+
+def test_preimport_stop_missing_receipt_requires_fresh_proof_and_durable_ack(tmp_path, monkeypatch):
+    m, config, run, proof, state, directory = preimport_stop_fixture(tmp_path, monkeypatch)
+    original = copy.deepcopy(run)
+    actual, raw, inventory = m.load_qualified_proof(config, run)
+    assert actual == proof and inventory == dict.fromkeys(m.MARKERS)
+    operation = str(uuid.uuid4())
+    ack = m.archive_and_ack(config, actual, raw, inventory, operation)
+    receipt = dict(actual, acknowledgment=dict(ack, consumed_operation_id=operation))
+    assert m.acknowledged_receipt(receipt, run, operation)
+    assert run == original and run["uncertain"] is True and run["physical_result"]["readback"] is None
+    assert not (directory / "cleanup.json").exists()
+    assert all(not (state / name).exists() for name in m.MARKERS)
+    assert m.load_qualified_proof(config, run)[0] == proof
+
+
+@pytest.mark.parametrize(
+    "broken",
+    [
+        "origin",
+        "missing_declaration",
+        "missing_hash_key",
+        "fake_receipt_hash",
+        "status",
+        "requested",
+        "live",
+        "native_live",
+        "progress",
+        "bool_progress",
+        "execution_progress",
+        "execution_fault",
+        "complete",
+        "recovery",
+        "cause",
+        "native_cause",
+        "host_cause",
+        "readback",
+        "cleanup_error",
+        "terminal_status",
+        "marker_inventory",
+        "marker_appeared",
+        "cleanup_appeared",
+        "trace_hash",
+        "launch_hash",
+        "trace_noise",
+        "trace_other_import",
+        "trace_post_main",
+        "trace_device_error",
+        "launch_other_run",
+        "launch_other_signal",
+        "launch_extra",
+        "source_line",
+        "fresh_torque",
+        "fresh_lift",
+        "fresh_thermal",
+    ],
+)
+def test_preimport_stop_origin_refuses_other_shapes_and_unqualified_fresh_proof(
+    tmp_path, monkeypatch, broken
+):
+    m, config, run, proof, state, directory = preimport_stop_fixture(tmp_path, monkeypatch)
+    lifecycle = run["physical_result"]
+    if broken == "origin":
+        proof["original_cleanup_origin"] = "ordinary-cancel"
+    elif broken == "missing_declaration":
+        proof.pop("original_cleanup_missing")
+    elif broken == "missing_hash_key":
+        proof.pop("original_cleanup_sha256")
+    elif broken == "fake_receipt_hash":
+        proof["original_cleanup_sha256"] = "a" * 64
+    elif broken == "status":
+        run["status"] = "faulted"
+    elif broken == "requested":
+        run["requested_terminal"] = "completed"
+    elif broken == "live":
+        run["native_live_at"] = 98.0
+    elif broken == "native_live":
+        lifecycle["native_live_at"] = 98.0
+    elif broken in ("progress", "bool_progress"):
+        run["progress_s"] = 0.1 if broken == "progress" else False
+    elif broken == "execution_progress":
+        run["execution"]["progress_s"] = 0.1
+    elif broken == "execution_fault":
+        run["execution"]["fault"] = "actual failure"
+    elif broken == "complete":
+        run["execution"]["complete"] = True
+    elif broken == "recovery":
+        run["recovery_episodes"] = 1
+    elif broken == "cause":
+        run["first_cause"] = "owner failure"
+    elif broken == "native_cause":
+        run["native_first_cause"] = proof["original_first_cause"] = "actual failure"
+    elif broken == "host_cause":
+        lifecycle["first_cause"] = "actual failure"
+    elif broken == "readback":
+        lifecycle["readback"] = {}
+    elif broken == "cleanup_error":
+        lifecycle["cleanup_errors"] = ["actual failure"]
+    elif broken == "terminal_status":
+        lifecycle["terminal_status"] = "faulted"
+    elif broken == "marker_inventory":
+        proof["original_markers"][m.MARKERS[0]] = {"sha256": "a" * 64}
+    elif broken == "marker_appeared":
+        (state / m.MARKERS[1]).write_bytes(b"foreign")
+    elif broken == "cleanup_appeared":
+        (directory / "cleanup.json").write_bytes(b"null")
+    elif broken in ("trace_hash", "launch_hash"):
+        proof["original_host_logs"]["host-runtime.log" if broken == "trace_hash" else "host-launch.log"] = (
+            "a" * 64
+        )
+    elif broken.startswith("trace_"):
+        path = directory / "host-runtime.log"
+        data = path.read_bytes()
+        if broken == "trace_noise":
+            data = b"operational_ready\n" + data
+        elif broken == "trace_other_import":
+            data = data.replace(b"from .lift_axis import", b"from .lift_operational import")
+        elif broken == "trace_post_main":
+            data = data.replace(b"in _get_module_details", b"in main")
+        else:
+            data = data.replace(b"KeyboardInterrupt", b"RuntimeError: device error")
+        path.write_bytes(data)
+        proof["original_host_logs"][path.name] = hashlib.sha256(data).hexdigest()
+    elif broken.startswith("launch_"):
+        path = directory / "host-launch.log"
+        data = path.read_bytes()
+        if broken == "launch_other_run":
+            data = data.replace(run["run_id"].encode(), str(uuid.uuid4()).encode())
+        elif broken == "launch_other_signal":
+            data = data.replace(b"2/INT", b"9/KILL")
+        else:
+            data += b"unexpected second launch\n"
+        path.write_bytes(data)
+        proof["original_host_logs"][path.name] = hashlib.sha256(data).hexdigest()
+    elif broken == "source_line":
+        source = tmp_path / "changed-source"
+        source.mkdir()
+        config["host_repository"] = str(source)
+        proof["source"]["backend_contract"] = copy.deepcopy(config)
+    elif broken == "fresh_torque":
+        proof["readback"]["readbacks"][0]["value"] = 1
+    elif broken == "fresh_lift":
+        proof["readback"].pop("lift_stationary")
+    else:
+        proof["readback"]["lift_stationary"]["temperature_slots"][0][0] = 99.0
+    publish_preimport_fixture(run, proof, state)
+    with pytest.raises((ValueError, OSError, RuntimeError, TypeError)):
+        m.load_qualified_proof(config, run)
+
+
+@pytest.mark.parametrize("change", ["cleanup", "runtime", "launch"])
+def test_preimport_origin_original_appearance_or_change_before_ack_refuses(tmp_path, monkeypatch, change):
+    m, config, run, proof, state, directory = preimport_stop_fixture(tmp_path, monkeypatch)
+    actual, raw, inventory = m.load_qualified_proof(config, run)
+    path = (
+        directory
+        / {"cleanup": "cleanup.json", "runtime": "host-runtime.log", "launch": "host-launch.log"}[change]
+    )
+    path.write_bytes(b"changed")
+    with pytest.raises((ValueError, OSError)):
+        m.archive_and_ack(config, actual, raw, inventory, str(uuid.uuid4()))
+    assert not list(state.glob("reconciliation-ack-*"))
+
+
+def test_preimport_origin_cleanup_appearance_during_ack_never_returns_qualified(tmp_path, monkeypatch):
+    m, config, run, proof, state, directory = preimport_stop_fixture(tmp_path, monkeypatch)
+    actual, raw, inventory = m.load_qualified_proof(config, run)
+    original = m._write_new_or_same
+
+    def appearance(path, data):
+        original(path, data)
+        if path.name.startswith("reconciliation-ack-"):
+            (directory / "cleanup.json").write_bytes(b"unexpected")
+
+    monkeypatch.setattr(m, "_write_new_or_same", appearance)
+    with pytest.raises(ValueError):
+        m.archive_and_ack(config, actual, raw, inventory, str(uuid.uuid4()))
+    with pytest.raises(ValueError):
+        m.load_qualified_proof(config, run)

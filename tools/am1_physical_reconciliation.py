@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import socket
 import stat
 import subprocess
@@ -17,6 +18,7 @@ MARKERS = ("cleanup-uncertain.json", "physical-in-progress.json")
 CACHE_S = 5.0
 INCOMPLETE_PREACTIVATION_ORIGIN = "preactivation-lift-unqualified"
 PREHOME_COOL_STALE_ORIGIN = "prehome-cool-thermal-stale-lift-unqualified"
+PREIMPORT_STOP_ORIGIN = "preimport-stop-missing-host-receipt"
 
 
 def canonical(value):
@@ -301,6 +303,170 @@ def validate_cleanup_origin(run, proof, receipt):
         "incomplete preactivation origin requires both original markers absent",
     )
     return True
+
+
+def validate_preimport_stop_origin(run, proof):
+    """Eligibility only: a missing original receipt never proves a stopped motor."""
+    lifecycle = run.get("physical_result") or {}
+    execution = run.get("execution") or {}
+    require(
+        run.get("source") == "protected-physical-provider"
+        and run.get("recipe") == "physical-live-teleop"
+        and run.get("status") == run.get("requested_terminal") == "stopped"
+        and run.get("uncertain") is True
+        and run.get("cleanup") == "physical_cleanup_unknown"
+        and "native_live_at" in run
+        and run["native_live_at"] is None
+        and number(run.get("progress_s"))
+        and run["progress_s"] == 0
+        and type(run.get("recovery_episodes")) is int
+        and run["recovery_episodes"] == 0
+        and execution.get("complete") is False
+        and "fault" in execution
+        and execution["fault"] is None
+        and number(execution.get("progress_s"))
+        and execution["progress_s"] == 0
+        and all(key in run and run[key] is None for key in ("first_cause", "native_first_cause"))
+        and lifecycle.get("phase") == "terminal"
+        and lifecycle.get("terminal_status") == "stopped"
+        and lifecycle.get("run_id") == run.get("run_id")
+        and lifecycle.get("backend_incarnation") == proof.get("host_incarnation")
+        and lifecycle.get("cleanup") == "physical_cleanup_unknown"
+        and lifecycle.get("uncertain") is True
+        and lifecycle.get("cleanup_errors") == []
+        and all(
+            key in lifecycle and lifecycle[key] is None
+            for key in ("native_live_at", "first_cause", "readback")
+        ),
+        "exact uncertain preimport Stop with no native effect/cause/readback required",
+    )
+    require(
+        proof.get("original_cleanup_origin") == PREIMPORT_STOP_ORIGIN
+        and proof.get("original_cleanup_missing") is True
+        and "original_cleanup_sha256" in proof
+        and proof["original_cleanup_sha256"] is None
+        and "original_first_cause" in proof
+        and proof["original_first_cause"] is None
+        and proof.get("original_markers") == dict.fromkeys(MARKERS),
+        "explicit missing original cleanup and absent markers required; no fabricated receipt",
+    )
+
+
+def _load_preimport_stop_originals(config, proof):
+    """Read immutable origin evidence; no old-off or no-actuation qualification."""
+    directory = Path(config["run_root"]) / proof["run_id"][:8]
+    cleanup = directory / "cleanup.json"
+    require(
+        not cleanup.exists() and not cleanup.is_symlink(), "original cleanup must remain literally absent"
+    )
+    hashes = proof.get("original_host_logs")
+    require(
+        isinstance(hashes, dict)
+        and set(hashes) == {"host-runtime.log", "host-launch.log"}
+        and all(type(value) is str and re.fullmatch("[0-9a-f]{64}", value) for value in hashes.values()),
+        "both original host log hashes required",
+    )
+    logs = {}
+    for name, digest in hashes.items():
+        data = _private_bytes(directory / name)
+        require(sha(data) == digest, "original host log changed")
+        logs[name] = data.decode("utf-8")
+    launch = re.fullmatch(
+        r"Running as unit: am1-pa01-host-"
+        + re.escape(proof["run_id"])
+        + r"\.service; invocation ID: [0-9a-f]{32}\nFinished with result: success\n"
+        r"Main processes terminated with: code=killed, status=2/INT\n"
+        r"Service runtime: ([0-9]+(?:\.[0-9]+)?)s\nCPU time consumed: ([0-9]+(?:\.[0-9]+)?)s\n",
+        logs["host-launch.log"],
+    )
+    require(
+        launch is not None and all(math.isfinite(float(v)) and float(v) > 0 for v in launch.groups()),
+        "one original same-run SIGINT host launch required",
+    )
+    lines = logs["host-runtime.log"].splitlines()
+    require(
+        lines and lines[0] == "Traceback (most recent call last):" and lines[-1] == "KeyboardInterrupt",
+        "one complete original import-cancel traceback required",
+    )
+    frames = []
+    for line in lines[1:-1]:
+        match = re.fullmatch(r'  File "([^"]+)", line ([0-9]+), in (.+)', line)
+        if match:
+            frames.append((match[1], int(match[2]), match[3], []))
+        else:
+            require(bool(frames), "unexpected original traceback prefix")
+            frames[-1][3].append(line)
+    require(
+        len(frames) == 11
+        and [f[2] for f in frames]
+        == [
+            "_run_module_as_main",
+            "_get_module_details",
+            "<module>",
+            "<module>",
+            "<module>",
+            "dataclass",
+            "wrap",
+            "_process_class",
+            "_cmp_fn",
+            "_create_fn",
+            "<module>",
+        ]
+        and all(f[0] == "<frozen runpy>" and f[1] > 0 and f[3] == [] for f in frames[:2])
+        and frames[-1] == ("<string>", 0, "<module>", []),
+        "exact package-import/dataclass cancellation chain required; no post-import frames",
+    )
+    root = Path(config["host_repository"]) / "src/lerobot/robots/alohamini"
+    source_lines = [
+        "from .alohamini import AlohaMini",
+        "from .lift_axis import LiftAxis, LiftAxisConfig, LiftHomeResult",
+        "@dataclass",
+    ]
+    for frame, name, expected in zip(
+        frames[2:5], ("__init__.py", "alohamini.py", "lift_axis.py"), source_lines, strict=True
+    ):
+        path = root / name
+        require(
+            frame[0] == path.as_posix()
+            and frame[1] > 0
+            and not any(p.is_symlink() for p in (path, *path.parents)),
+            "original import source path differs",
+        )
+        data = path.read_bytes()
+        require(len(data) <= 1_048_576, "bounded original import source required")
+        source = data.decode("utf-8").splitlines()
+        require(
+            frame[1] <= len(source) and source[frame[1] - 1].strip() == expected,
+            "traceback must match actual pinned import source",
+        )
+        if name == "lift_axis.py":
+            require(
+                frame[1] < len(source) and source[frame[1]].strip() == "class LiftAxisConfig:",
+                "only pre-construction LiftAxisConfig decorator cancellation eligible",
+            )
+    stdlib = frames[5][0]
+    require(
+        stdlib.startswith("/")
+        and stdlib.endswith("/lib/python3.12/dataclasses.py")
+        and all(f[0] == stdlib and f[1] > 0 for f in frames[5:10]),
+        "one original Python3.12 dataclass chain required",
+    )
+    code = source_lines + [
+        "return wrap(cls)",
+        "return _process_class(cls, init, repr, eq, order, unsafe_hash,",
+        "_cmp_fn('__eq__', '==',",
+        "return _create_fn(name,",
+        "exec(txt, globals, ns)",
+    ]
+    for frame, expected in zip(frames[2:10], code, strict=True):
+        require(
+            frame[3]
+            and frame[3][0] == "    " + expected
+            and len(frame[3]) <= 2
+            and all(re.fullmatch(r" +\^+", line) for line in frame[3][1:]),
+            "only original source/caret lines permitted in import-cancel trace",
+        )
+    return logs
 
 
 def _timed_row(row, started, completed):
@@ -883,17 +1049,23 @@ def load_qualified_proof(config, run):
         uuid.UUID(old_ack["operation_id"])
     proof = validate_stopped_proof(config, run, proof, now=time.monotonic(), durable_ack=old_ack is not None)
     _validate_sources(config, proof)
-    original = _private_bytes(Path(config["run_root"]) / run_id[:8] / "cleanup.json")
-    old = _json(original)
-    require(
-        sha(original) == proof.get("original_cleanup_sha256")
-        and old == (run.get("physical_result") or {}).get("readback")
-        and old.get("run_id") == run_id
-        and old.get("host_incarnation") == proof["host_incarnation"]
-        and old.get("first_cause") == proof["original_first_cause"],
-        "literal unchanged original unknown cleanup receipt required",
-    )
-    incomplete_origin = validate_cleanup_origin(run, proof, old)
+    if proof.get("original_cleanup_origin") == PREIMPORT_STOP_ORIGIN:
+        validate_preimport_stop_origin(run, proof)
+        _load_preimport_stop_originals(config, proof)
+        original = None  # Preserve literal absence; never synthesize an old host receipt.
+        incomplete_origin = True
+    else:
+        original = _private_bytes(Path(config["run_root"]) / run_id[:8] / "cleanup.json")
+        old = _json(original)
+        require(
+            sha(original) == proof.get("original_cleanup_sha256")
+            and old == (run.get("physical_result") or {}).get("readback")
+            and old.get("run_id") == run_id
+            and old.get("host_incarnation") == proof["host_incarnation"]
+            and old.get("first_cause") == proof["original_first_cause"],
+            "literal unchanged original unknown cleanup receipt required",
+        )
+        incomplete_origin = validate_cleanup_origin(run, proof, old)
     camera_raw = _private_bytes(Path(config["camera_state"]) / ("release-" + run_id + ".json"))
     require(
         sha(camera_raw) == proof.get("camera_release_sha256")
@@ -946,6 +1118,8 @@ def archive_and_ack(config, proof, raw, originals, operation_id):
         _private_bytes(state / ("reconciliation-" + proof["run_id"] + ".json")) == raw,
         "immutable proof changed before ACK",
     )
+    if proof.get("original_cleanup_origin") == PREIMPORT_STOP_ORIGIN:
+        _load_preimport_stop_originals(config, proof)
     acknowledgment_path = _ack_path(state, proof["run_id"])
     require(current_boot_id() == proof["boot_id"], "stopped proof boot changed before ACK")
     if not acknowledgment_path.exists():
@@ -1017,12 +1191,18 @@ def archive_and_ack(config, proof, raw, originals, operation_id):
         if data is not None and (state / name).exists():
             require(_private_bytes(state / name) == data, "marker changed during guarded ACK")
             (state / name).unlink()
-    if proof.get("original_cleanup_origin") in (INCOMPLETE_PREACTIVATION_ORIGIN, PREHOME_COOL_STALE_ORIGIN):
+    if proof.get("original_cleanup_origin") in (
+        INCOMPLETE_PREACTIVATION_ORIGIN,
+        PREHOME_COOL_STALE_ORIGIN,
+        PREIMPORT_STOP_ORIGIN,
+    ):
         require(
             originals == dict.fromkeys(MARKERS)
             and all(not (state / name).exists() and not (state / name).is_symlink() for name in MARKERS),
             "both incomplete-origin markers must remain absent through durable ACK",
         )
+    if proof.get("original_cleanup_origin") == PREIMPORT_STOP_ORIGIN:
+        _load_preimport_stop_originals(config, proof)
     _fsync_directory(state)
     return ack
 
