@@ -16,6 +16,74 @@ from tests.robots.test_alohamini_lift_motor_feedback import FakeClock, FakeTrans
 ORIGINAL_303 = [(808, 50, 1), (808, 0, 0), (809, -50, 1), (808, 0, 0), (809, 0, 0)]
 
 
+# Exact original reply payloads and acquisition intervals, original host log SHA256
+# 065439f0a09d0fd28f0ff234cb5678ca4dc4faa1cb873685a9afe66f86f6db3d.
+# These original intervals run on an explicitly simulated, rebased test clock.
+TELEOP03_POST_HOME = (
+    (89421.937178631, 0.0009587679960532114, "0114c8500ac8c801fe000000000000e803000000000001290300005b05722400000000003a00"),
+    (89421.989480213, 0.002122437013895251, "0114c8500ac8c801fe000000000000e8030000000000012c0300004e05712400000000003300"),
+    (89422.041206034, 0.0014455310010816902, "0114c8500ac8c801fe000000000000e8030000000000012c0300004e05722400000000003400"),
+    (89422.093246234, 0.0017886319983517751, "0114c8500ac8c801fe000000000000e8030000000000012c0300004e05722400000000003100"),
+    (89422.145210826, 0.0016668210009811446, "0114c8500ac8c801fe000000000000e8030000000000012c0332804d05722400000100003600"),
+    (89422.197216713, 0.0017475959903094918, "0114c8500ac8c801fe000000000000e8030000000000012c0300004e05722400000000003500"),
+    (89422.249234192, 0.0017453369946451858, "0114c8500ac8c801fe000000000000e8030000000000012c0332804e05722400000100003700"),
+    (89422.301217653, 0.001720264001050964, "0114c8500ac8c801fe000000000000e8030000000000012c0300004e05722400000000003300"),
+    (89422.353243743, 0.0017647999920882285, "0114c8500ac8c801fe000000000000e8030000000000012c0332804f05722400000100003000"),
+    (89422.405216428, 0.0017011899908538908, "0114c8500ac8c801fe000000000000e8030000000000012c0300004e05722400000000003400"),
+    (89422.45721667, 0.0017345039959764108, "0114c8500ac8c801fe000000000000e8030000000000012c0300004e05722400000000003300"),
+    (89422.509238466, 0.0017738919996190816, "0114c8500ac8c801fe000000000000e8030000000000012c0300004e05722400000000003600"),
+    (89422.561220856, 0.0017200610018335283, "0114c8500ac8c801fe000000000000e8030000000000012c0332004c05722400000100003700"),
+    (89422.613228282, 0.0017712630069581792, "0114c8500ac8c801fe000000000000e8030000000000012c0300004e05722400000000003300"),
+    (89422.665221097, 0.0017515030049253255, "0114c8500ac8c801fe000000000000e8030000000000012d0332804e05722400000100003900"),
+    (89422.717221857, 0.0017546890012454242, "0114c8500ac8c801fe000000000000e8030000000000012c0300004e05722400000000003600"),
+    (89422.769226468, 0.001743689994327724, "0114c8500ac8c801fe000000000000e8030000000000012d0332004a05722400000100002f00"),
+    (89422.821226913, 0.0017510030011180788, "0114c8500ac8c801fe000000000000e8030000000000012c0332004b05722400000100003900"),
+    (89422.873222025, 0.0017613549862289801, "0114c8500ac8c801fe000000000000e8030000000000012d0300004e05722400000000003700"),
+    (89422.925223655, 0.0017594300006749108, "0114c8500ac8c801fe000000000000e8030000000000012c0332804e05722400000100003300"),
+)
+
+
+def test_actual_teleop03_acquires_post_settle_window_without_retiming_home_or_deadline():
+    monitor, clock, transport, _ = comparison([(809, 0, 0)])
+    first_start = TELEOP03_POST_HOME[0][0] - TELEOP03_POST_HOME[0][1]
+    original_sleep = clock.sleep
+
+    def scheduled_sleep(seconds):
+        if .04 <= seconds <= feedback.POLL_S and transport.read_count < len(TELEOP03_POST_HOME):
+            stamp, duration, _ = TELEOP03_POST_HOME[transport.read_count]
+            clock.now = stamp - duration - first_start
+        else:
+            original_sleep(seconds)
+
+    def original_reply(start, length, **kwargs):
+        assert (start, length) == (feedback.FEEDBACK_START, feedback.FEEDBACK_LENGTH)
+        assert kwargs["timeout_ms"] == 40
+        assert transport.read_count < len(TELEOP03_POST_HOME)
+        stamp, _, payload = TELEOP03_POST_HOME[transport.read_count]
+        transport.read_count += 1
+        clock.now = stamp - first_start
+        transport.arrivals.append(clock.now)
+        value = bytes.fromhex(payload)
+        return value, {"response_payload_bytes": list(value), "checksum_ok": True}
+
+    monitor.sleep, transport.read_group = scheduled_sleep, original_reply
+    result = qualify(monitor, origin=809)
+    proof = result["stationary_qualification"]
+    assert proof["readiness_branch"] == "bounded_indicator"
+    assert proof["motion_feedback_quiet"] is False
+    assert proof["am1_post_home_origin_raw"] == 809
+    assert proof["position_origin_raw"] == 812
+    assert proof["position_excursion_raw"] == 1
+    assert proof["candidate_reset_count"] == 1
+    assert proof["candidate_qualified_sample_index"] == 6
+    assert proof["whole_phase_position_excursion_raw"] == 4
+    assert proof["sample_count"] == 19
+    assert clock.now == pytest.approx(1)
+    assert transport.read_count == len(TELEOP03_POST_HOME) == 20
+    assert all(stamp < 1 for stamp in transport.arrivals)
+
+
+
 class SequenceTransport(FakeTransport):
     def __init__(self, clock, rows, *, error=None, mutation=None, clock_fault=None, delay=0.002):
         super().__init__(clock=clock)
@@ -81,6 +149,16 @@ def comparison(rows, **transport_options):
 
 
 def qualify(monitor, *, origin=808, **overrides):
+    axis = LiftAxis(LiftAxisConfig(), bus_left=SimpleNamespace(), bus_right=None)
+    axis._last_tick, axis._extended_ticks, axis._z0_deg, axis.is_homed = origin, 0, 0, True
+    heights = [0.0, 0.0]
+
+    def original_home_guard(record):
+        height = axis.get_height_mm(read_raw=lambda _: int(record["present_position_raw"]))
+        heights[0], heights[1] = min(heights[0], height), max(heights[1], height)
+        if abs(height) > .5 or heights[1] - heights[0] > .5:
+            monitor.refuse(record, "post_home: process-local zero exceeded its stationary bound.")
+
     kwargs = {
         "expected_torque": 1,
         "expected_goal": 0,
@@ -88,9 +166,18 @@ def qualify(monitor, *, origin=808, **overrides):
         "timeout_s": 1.0,
         "require_quiet_motion_feedback": True,
         "am1_post_home_origin_raw": origin,
+        "on_sample": original_home_guard,
     }
     kwargs.update(overrides)
     return monitor.qualify_stationary("post_home", **kwargs)
+
+
+@pytest.mark.parametrize("callback", [None, False, "not-a-callback"])
+def test_am1_readiness_requires_its_original_whole_phase_geometry_observer(callback):
+    monitor, _, transport, _ = comparison(ORIGINAL_303)
+    with pytest.raises(ValueError, match="observer|guard"):
+        qualify(monitor, on_sample=callback)
+    assert transport.read_count == 0
 
 
 def test_original_303_one_count_intermittent_flags_qualifies_only_at_original_deadline():
@@ -107,6 +194,17 @@ def test_original_303_one_count_intermittent_flags_qualifies_only_at_original_de
     assert 0 <= clock.now - record["sample_monotonic_s"] <= feedback.POLL_S
     assert all(at < 1.0 for at in transport.arrivals)
     assert transport.read_count == 20
+
+
+def test_qualified_candidate_freezes_once_and_later_two_tick_jump_cannot_reacquire():
+    first = [(813, 0, 0), (813, 50, 1), (813, 0, 0), (813, -50, 1), (813, 0, 0)]
+    later = [(815, 50, 1), (815, 0, 0), (815, -50, 1), (815, 0, 0)] * 4
+    monitor, clock, transport, emitted = comparison(first + later)
+    with pytest.raises(feedback.ComparisonRefusal, match="stationary"):
+        qualify(monitor, origin=813)
+    assert clock.now == pytest.approx(1)
+    assert transport.read_count == 20
+    assert not any(row["phase"] == "post_home_stationary_qualified" for row in emitted)
 
 
 def test_predeadline_acquisition_remains_eligible_when_emit_returns_after_deadline():
@@ -409,8 +507,8 @@ def test_actual_post_home_payloads_replay_with_explicit_frozen_acquisition_prove
     transport.read_group = read
     record = qualify(monitor, origin=origin)
     proof = record["stationary_qualification"]
-    assert proof["readiness_policy"] == "am1-post-home-first-quiet-v3"
-    assert proof["readiness_policy_version"] == 3
+    assert proof["readiness_policy"] == "am1-post-home-qualified-window-v4"
+    assert proof["readiness_policy_version"] == 4
     assert proof["readiness_branch"] == branch
     assert proof["am1_post_home_origin_raw"] == origin
     assert proof["stationary_acquisition_origin_raw"] == (815 if trial == "02" else 814)
@@ -586,8 +684,8 @@ def test_simulated07_continuation_waits_for_original_deadline_with_frozen_band()
     assert clock.now == pytest.approx(1.0) and transport.read_count == 20
     assert proof['readiness_branch']=='bounded_indicator'
     assert proof['motion_feedback_quiet'] is False
-    assert proof['readiness_policy']=='am1-post-home-first-quiet-v3'
-    assert proof['readiness_policy_version']==3
+    assert proof['readiness_policy']=='am1-post-home-qualified-window-v4'
+    assert proof['readiness_policy_version']==4
     assert proof['am1_post_home_origin_raw']==812
     assert proof['stationary_acquisition_origin_raw']==815
     assert proof['stationary_acquisition_sample_index']==2
