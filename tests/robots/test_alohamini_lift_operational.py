@@ -290,7 +290,7 @@ def test_one_count_relief_variation_is_logged_and_finishes_with_original_zero(
     assert len(pending) == len(qualified) == 1
     assert pending[0]["present_position_raw"] == setup + 1
     assert qualified[0]["present_position_raw"] < setup
-    assert 0.2 <= qualified[0]["qualification_elapsed_s"] < 0.25
+    assert 0 < pending[0]["qualification_elapsed_s"] < qualified[0]["qualification_elapsed_s"] < 1.0
     writes = [e[2:] for e in bus.events if e[1] == "write"]
     assert writes.count(("Goal_Velocity", "lift_axis", -200)) == 1
     assert 9.5 <= robot._lift_operation.height_mm <= 12
@@ -301,44 +301,50 @@ def test_one_count_relief_variation_is_logged_and_finishes_with_original_zero(
     assert not bus.is_connected
 
 
-@pytest.mark.parametrize("progress_sample,expected_elapsed", [(3, 0.306), (6, 0.612), (9, 0.918)])
+@pytest.mark.parametrize("progress_after_s", [0.306, 0.612, 0.918])
 def test_initial_relief_allows_delayed_net_upward_progress_before_one_second(
-    operating_robot, capsys, progress_sample, expected_elapsed,
+    operating_robot, monkeypatch, capsys, progress_after_s,
 ):
-    robot, _ = operating_robot
+    robot, clock = operating_robot
     bus = robot.left_bus
     bus.up_factor = 0
-    setup = None
-    samples = 0
-
+    setup, started, samples, reached_sample = None, None, 0, None
+    original_write = bus.write
+    def write(register, motor, value, **kwargs):
+        nonlocal started
+        original_write(register, motor, value, **kwargs)
+        if (register, motor, int(value)) == ("Goal_Velocity", "lift_axis", -200):
+            started = clock.now
     def hook(register):
-        nonlocal setup, samples
+        nonlocal setup, samples, reached_sample
         operation = getattr(robot, "_lift_operation", None)
-        if operation is None:
-            return
+        if operation is None: return
         if register == "Present_Position" and operation.reader.phase == "relief_setup":
             setup = round(bus.position)
-        if operation.reader.phase != "relief" or bus.registers[("Goal_Velocity", "lift_axis")] != -200:
-            return
+        if operation.reader.phase != "relief" or bus.registers[("Goal_Velocity", "lift_axis")] != -200: return
         if register == "Present_Position":
             samples += 1
-            if samples == progress_sample:
-                # Synthetic delayed onset, not a reconstruction of the stopped run.
+            if reached_sample is None and clock.now - started >= progress_after_s:
+                reached_sample = samples
                 bus.position = setup - 1
                 bus.registers[(register, "lift_axis")] = setup - 1
                 bus.up_factor = 1
-        elif register == "Present_Velocity" and samples < progress_sample:
+        elif register == "Present_Velocity" and reached_sample is None:
             bus.read_sequences[(register, "lift_axis")] = [0]
-
+    monkeypatch.setattr(bus, "write", write)
     bus.hook = hook
     robot.connect(calibrate=False)
     records = operational_records(capsys)
     pending = [r for r in records if r["phase"] == "relief_direction_pending"]
     qualified = [r for r in records if r["phase"] == "relief_direction_qualified"]
-    assert len(pending) == progress_sample - 1
+    assert len(pending) == reached_sample - 1
     assert all(r["present_position_raw"] == setup for r in pending)
     assert len(qualified) == 1
-    assert qualified[0]["qualification_elapsed_s"] == pytest.approx(expected_elapsed)
+    # Retain the original ~.3/.6/.9-second physical coverage, including the
+    # positive just below the unchanged1-second direction deadline.
+    elapsed = qualified[0]["qualification_elapsed_s"]
+    assert progress_after_s <= elapsed < progress_after_s + lift_relief.grouped_feedback.POLL_S + 0.002
+    assert elapsed < 1.0
     assert qualified[0]["present_position_raw"] == setup - 1
     assert qualified[0]["upward_ticks"] > qualified[0]["initial_upward_ticks"]
     assert 9.5 <= robot._lift_operation.height_mm <= 12
@@ -396,12 +402,14 @@ def test_initial_relief_direction_deadline_is_fixed_and_stops_without_upward_pro
     stop = next(t for t, register, motor, value in writes
                 if t >= start and (register, motor, value) == ("Goal_Velocity", "lift_axis", 0))
     assert stop - start == pytest.approx(1.0)
-    assert samples == 9
     assert sum((register, motor, value) == ("Goal_Velocity", "lift_axis", -200)
                for _, register, motor, value in writes) == 1
     records = operational_records(capsys)
     rejected = next(r for r in records if r.get("rejected") and r["phase"] == "relief")
     assert rejected["qualification_elapsed_s"] == pytest.approx(1.0)
+    actual = [r for r in records if r["phase"] == "relief" and not r.get("rejected")]
+    assert samples == len(actual) and samples > 0
+    assert all(r["sample_monotonic_s"] < start + 1.0 for r in actual)
     assert rejected["sample_monotonic_s"] < start + 1.0  # Last actual reply is NOT relabeled fresh.
     assert not any(r["phase"] in ("relief_direction_qualified", "operational_ready") for r in records)
     assert any(r["phase"] == "shutdown_verified" for r in records)
@@ -482,47 +490,48 @@ def test_initial_relief_cannot_qualify_late_upward_feedback(
     robot, clock = operating_robot
     bus = robot.left_bus
     bus.up_factor = 0
-    original_moving_height = OperationalLift._moving_height
-    samples = 0
-    first_position = None
-
+    original_moving_height, original_write = OperationalLift._moving_height, bus.write
+    original_sleep = clock.sleep
+    samples, first_position, started, delayed = 0, None, None, False
+    def write(register, motor, value, **kwargs):
+        nonlocal started
+        original_write(register, motor, value, **kwargs)
+        if (register, motor, int(value)) == ("Goal_Velocity", "lift_axis", -200): started = clock.now
     def hook(register):
         if register == "Present_Velocity" and bus.registers[("Goal_Velocity", "lift_axis")] == -200:
             bus.read_sequences[(register, "lift_axis")] = [0]
-
     def moving_height(operation, phase):
-        nonlocal samples, first_position
+        nonlocal samples, first_position, delayed
         samples += 1
-        if samples == 1:
-            first_position = bus.position
-        if samples == 9:
-            # Arrive just after 1 s, but retain the unchanged temperature
-            # freshness window so this isolates the direction deadline.
-            clock.sleep(0.085)
+        if first_position is None: first_position = bus.position
+        if delayed_boundary == "feedback" and not delayed and clock.now - started >= 0.9:
+            delayed = True
+            original_sleep(started + 1.001 - clock.now)
             bus.up_factor = 1
-        result = original_moving_height(operation, phase)
-        return result
-
-    original_sleep = clock.sleep
-
+        return original_moving_height(operation, phase)
     def delayed_sleep(seconds):
+        nonlocal delayed
         original_sleep(seconds)
-        if samples == 8 and seconds > 0.05 and bus.registers[("Goal_Velocity", "lift_axis")] == -200:
-            original_sleep(0.085)
-
+        if (not delayed and started is not None and clock.now - started >= 0.9
+                and bus.registers[("Goal_Velocity", "lift_axis")] == -200):
+            delayed = True
+            original_sleep(started + 1.001 - clock.now)
     bus.hook = hook
+    monkeypatch.setattr(bus, "write", write)
     monkeypatch.setattr(OperationalLift, "_moving_height", moving_height)
-    if delayed_boundary == "sleep":
-        monkeypatch.setattr(lift_relief.time, "sleep", delayed_sleep)
-    with pytest.raises(RuntimeError) as failure:
-        robot.connect(calibrate=False)
+    if delayed_boundary == "sleep": monkeypatch.setattr(lift_relief.time, "sleep", delayed_sleep)
+    with pytest.raises(RuntimeError) as failure: robot.connect(calibrate=False)
     assert "initial upward direction not confirmed within 1.0 s" in str(failure.value.__cause__)
     records = operational_records(capsys)
     rejected = next(r for r in records if r.get("rejected") and r["phase"] == "relief")
-    assert 1.0 <= rejected["qualification_elapsed_s"] < 1.01
-    assert samples == (8 if delayed_boundary == "sleep" else 9)
+    assert delayed and 1.0 <= rejected["qualification_elapsed_s"] < 1.01
+    actual = [r for r in records if r["phase"] == "relief" and not r.get("rejected")]
+    assert samples == len(actual) and samples > 0
     if delayed_boundary == "feedback":
-        assert rejected["present_position_raw"] < first_position  # Fresh but too late.
+        assert rejected["present_position_raw"] < first_position
+        assert rejected["sample_monotonic_s"] > started + 1.0  # Genuine fresh progress, too late.
+    else:
+        assert rejected["sample_monotonic_s"] < started + 1.0  # Last reply is never retimestamped.
     assert not any(r["phase"] in ("relief_direction_qualified", "operational_ready") for r in records)
     assert bus.registers[("Goal_Velocity", "lift_axis")] == 0
     assert bus.registers[("Torque_Enable", "lift_axis")] == 0
@@ -534,67 +543,79 @@ def test_initial_relief_cannot_qualify_late_upward_feedback(
     ("current", "2000 mA"), ("voltage", "voltage"), ("interrupt", "cancelled"),
     ("temperature", "majority (3/5 time slots)"),
 ])
-@pytest.mark.parametrize("fault_sample", [2, 6])
+@pytest.mark.parametrize("fault_after_s", [0.204, 0.612])
 def test_initial_relief_pending_does_not_filter_faults_or_cancellation(
-    operating_robot, capsys, fault, reason, fault_sample,
+    operating_robot, monkeypatch, capsys, fault, reason, fault_after_s,
 ):
-    robot, _ = operating_robot
+    robot, clock = operating_robot
     bus = robot.left_bus
     bus.up_factor = 0
-    samples = 0
+    samples, started = 0, None
+    injected = []
+    original_write = bus.write
     interruption = KeyboardInterrupt("cancelled during initial relief")
-
+    def write(register, motor, value, **kwargs):
+        nonlocal started
+        original_write(register, motor, value, **kwargs)
+        if (register, motor, int(value)) == ("Goal_Velocity", "lift_axis", -200): started = clock.now
     def hook(register):
         nonlocal samples
         operation = getattr(robot, "_lift_operation", None)
+        elapsed = clock.now - started if started is not None else -1.0
         if fault == "temperature" and register == "Present_Temperature":
-            # Synthetic sustained high in three occupied slots. Test both
-            # the old interval and the newly allowed part of qualification.
+            # Retain both original early and >.5s late-phase coverage. Faster
+            # RAW replies still need three distinct occupied high time slots.
             heating = operation is not None and (
-                (fault_sample == 2 and operation.reader.phase == "relief_setup")
-                or (operation.reader.phase == "relief" and samples >= fault_sample - 2)
+                (fault_after_s == 0.204 and operation.reader.phase == "relief_setup")
+                or (operation.reader.phase == "relief" and elapsed >= fault_after_s - 2 * operation.temperature.SLOT_S)
             )
             bus.read_sequences[(register, "lift_axis")] = [60 if heating else 30]
         if bus.registers[("Goal_Velocity", "lift_axis")] != -200:
-            if register == "Status":
-                bus.registers[(register, "lift_axis")] = 0
-            if register == "Present_Voltage":
-                bus.registers[(register, "lift_axis")] = 120
+            if register == "Status": bus.registers[(register, "lift_axis")] = 0
+            if register == "Present_Voltage": bus.registers[(register, "lift_axis")] = 120
             return
-        if register == "Present_Position":
-            samples += 1
-        elif register == "Present_Velocity":
-            bus.read_sequences[(register, "lift_axis")] = [50 if samples == 1 else 0]
-        if samples != fault_sample:
-            return
-        if fault == "status" and register == "Status":
+        if register == "Present_Position": samples += 1
+        elif register == "Present_Velocity": bus.read_sequences[(register, "lift_axis")] = [50 if samples == 1 else 0]
+        if elapsed < fault_after_s: return
+        if (fault, register) == ("status", "Status"):
+            injected.append(clock.now)
             bus.read_sequences[(register, "lift_axis")] = [4]
-        elif fault == "current" and register == "Present_Current":
+        elif (fault, register) == ("current", "Present_Current"):
+            injected.append(clock.now)
             bus.read_sequences[(register, "lift_axis")] = [400]
-        elif fault == "voltage" and register == "Present_Voltage":
+        elif (fault, register) == ("voltage", "Present_Voltage"):
+            injected.append(clock.now)
             bus.read_sequences[(register, "lift_axis")] = [20]
         elif register == "Present_Temperature":
             if fault == "transport":
+                injected.append(clock.now)
                 raise OSError("synthetic communication loss during qualification")
             if fault == "interrupt":
+                injected.append(clock.now)
                 raise interruption
-
+    monkeypatch.setattr(bus, "write", write)
     bus.hook = hook
-    with pytest.raises((RuntimeError, KeyboardInterrupt)) as failure:
-        robot.connect(calibrate=False)
+    with pytest.raises((RuntimeError, KeyboardInterrupt)) as failure: robot.connect(calibrate=False)
     primary = failure.value if isinstance(failure.value, KeyboardInterrupt) else failure.value.__cause__
-    assert primary is robot._lift_operation.failure
-    assert reason in str(primary)
-    if fault == "interrupt":
-        assert primary is interruption
+    assert primary is robot._lift_operation.failure and reason in str(primary)
+    if fault == "interrupt": assert primary is interruption
     records = operational_records(capsys)
     assert any(r["phase"] == "relief_direction_pending" for r in records)
     if fault == "temperature":
         rejected = next(r for r in records if r.get("rejected") and r["phase"] == "relief")
-        assert rejected["temperature_c"] == 60
-        assert "majority (3/5 time slots)" in rejected["rejection_reason"]
+        assert rejected["temperature_c"] == 60 and "majority (3/5 time slots)" in rejected["rejection_reason"]
+        window = robot._lift_operation.temperature
+        high = [(t, value) for t, value in window.samples if value >= window.CEILING_C]
+        assert len(high) == 3
+        assert len({(round(t * 1e9) - window._origin_ns) // 100_000_000 for t, _ in high}) == 3
+        assert rejected["sample_monotonic_s"] - started >= fault_after_s - 0.1
+    else:
+        # Cancellation may interrupt before a complete raw record exists.
+        # Retain the actual fake-clock injection time, never cleanup elapsed time.
+        assert len(injected) == 1
+        assert fault_after_s <= injected[0] - started < fault_after_s + lift_relief.grouped_feedback.POLL_S + 0.002
     assert not any(r["phase"] in ("relief_direction_qualified", "operational_ready") for r in records)
-    assert samples == fault_sample
+    assert samples > 0
     assert bus.registers[("Goal_Velocity", "lift_axis")] == 0
     assert bus.registers[("Torque_Enable", "lift_axis")] == 0
     assert not bus.is_connected
@@ -2593,16 +2614,25 @@ def test_short_indicator_pulse_across_acquisition_boundary_cannot_manufacture_pe
     robot.disconnect()
 
 
+@pytest.mark.parametrize("historical_interval", [True, False], ids=["historical-100ms", "normal-50ms"])
 def test_original_35ms_relief_helper_latency_retains_the_earlier_thermal_stale_refusal(
     operating_robot,
     monkeypatch,
     capsys,
+    historical_interval,
 ):
     robot, clock = operating_robot
     bus = robot.left_bus
     bus.up_factor = 0
     original_write = bus.write
     setup_delay = []
+    if historical_interval:
+        from lerobot.robots.alohamini.lift_operational import OperationalLift
+        original_relief = OperationalLift.home_and_relieve
+        def historical_recipe(operation, **kwargs):
+            kwargs["relief_poll_s"] = lift_relief.POLL_S
+            return original_relief(operation, **kwargs)
+        monkeypatch.setattr(OperationalLift, "home_and_relieve", historical_recipe)
 
     def write(register, motor, value, **kwargs):
         original_write(register, motor, value, **kwargs)
@@ -2630,15 +2660,20 @@ def test_original_35ms_relief_helper_latency_retains_the_earlier_thermal_stale_r
     with pytest.raises(RuntimeError, match="AlohaMini motor activation failed") as caught:
         robot.connect(calibrate=False)
     assert len(setup_delay) == 1
-    assert "temperature: five-slot feedback window is stale" in str(caught.value.__cause__)
     assert caught.value.__cause__ is robot._lift_operation.failure
     records = operational_records(capsys)
     rejected = next(r for r in records if r.get("rejected") and r["phase"] == "relief")
-    assert rejected["sample_monotonic_s"] - rejected["temperature_history"][0][0] > 0.5
-    origin = next(row["sample_monotonic_s"] for row in records if "sample_monotonic_s" in row)
-    slots = [round((stamp - origin) * 1_000_000_000) // 100_000_000
-             for stamp, _temperature in rejected["temperature_history"]]
-    assert any(right - left > 1 for left, right in zip(slots, slots[1:]))
+    if historical_interval:
+        assert "temperature: five-slot feedback window is stale" in str(caught.value.__cause__)
+        assert rejected["sample_monotonic_s"] - rejected["temperature_history"][0][0] > 0.5
+        origin = next(row["sample_monotonic_s"] for row in records if "sample_monotonic_s" in row)
+        slots = [round((stamp - origin) * 1_000_000_000) // 100_000_000
+                 for stamp, _temperature in rejected["temperature_history"]]
+        assert any(right - left > 1 for left, right in zip(slots, slots[1:]))
+    else:
+        assert "initial upward direction not confirmed within 1.0 s" in str(caught.value.__cause__)
+        assert rejected["qualification_elapsed_s"] == pytest.approx(1.0)
+        assert robot._lift_operation.temperature.failure is None
     assert rejected["request_duration_s"] <= 0.04
     assert not any(r["phase"] in {"relief_direction_qualified", "operational_ready"} for r in records)
     assert any(r["phase"] == "shutdown_verified" for r in records)

@@ -171,3 +171,108 @@ def test_actual_production_majority_heat_latch_prevents_later_new_slot_read(nati
         robot._refresh_am1_startup_lift_feedback()
     assert again.value is original and window.failure is window_latch and operation.failure is original
     assert window._origin_ns == origin and list(window.samples) == peaks
+
+
+@pytest.mark.parametrize("phase_offset", [0.0, 0.02, 0.04, 0.06, 0.08])
+def test_normal_relief_uses_existing_fast_feedback_cadence_across_slot_phases(
+    operating_robot, monkeypatch, capsys, phase_offset,
+):
+    from lerobot.robots.alohamini import lift_relief
+    from lerobot.robots.alohamini.lift_operational import OperationalLift
+    from tests.robots.test_alohamini_lift_operational import operational_records
+
+    robot, clock = operating_robot
+    bus = robot.left_bus
+    original_check, original_write = OperationalLift._check_temperature, bus.write
+    waits = []
+    def check(operation, record, cold_start):
+        original_check(operation, record, cold_start)
+        # Explicit synthetic continuation:2ms fixture transaction +7.019457ms
+        # callback work produces the saved25 moving109.019457ms period at the
+        # old100ms wait. Settling uses its existing50ms wait plus4ms fake work.
+        if record["phase"] == "relief": clock.sleep(0.007019457)
+        elif record["phase"] == "settle": clock.sleep(0.004)
+    def write(register, name, value, **kwargs):
+        result = original_write(register, name, value, **kwargs)
+        if (register, name, int(value)) == ("Goal_Velocity", "lift_axis", -200):
+            clock.sleep(phase_offset)
+        return result
+    def sleep(seconds):
+        operation = getattr(robot, "_lift_operation", None)
+        if operation is not None and operation.reader.phase == "relief": waits.append(seconds)
+        clock.sleep(seconds)
+    monkeypatch.setattr(OperationalLift, "_check_temperature", check)
+    monkeypatch.setattr(bus, "write", write)
+    monkeypatch.setattr(lift_relief.time, "sleep", sleep)
+    try:
+        robot.connect(calibrate=False)
+        records = operational_records(capsys)
+        relief = [row for row in records if row["phase"] == "relief"]
+        assert waits and all(wait == feedback.POLL_S for wait in waits)
+        origin = robot._lift_operation.temperature._origin_ns
+        slots = [(round(row["sample_monotonic_s"] * 1e9) - origin) // 100_000_000 for row in relief]
+        assert all(0 <= b - a <= 1 for a, b in zip(slots, slots[1:]))
+        assert any(row["phase"] == "operational_ready" for row in records)
+        assert all(row["temperature_window"]["span_s"] <= 0.5 for row in relief)
+        assert robot._lift_operation.temperature.outliers == 0
+        assert 9.5 <= robot._lift_operation.height_mm <= 12
+        nonzero = [event[4] for event in bus.events
+                   if event[1:4] == ("write", "Goal_Velocity", "lift_axis") and event[4] != 0]
+        assert nonzero == [200, -200]
+        robot.disconnect()
+    finally:
+        bus.is_connected = False
+
+
+def test_standalone_relief_retains_original_100ms_default(operating_robot, monkeypatch):
+    from lerobot.robots.alohamini import lift_relief
+
+    robot, clock = operating_robot
+    check = lift_relief.InstalledLiftCheck(robot)
+    waits = []
+    def sleep(seconds):
+        if check.reader.phase == "relief": waits.append(seconds)
+        clock.sleep(seconds)
+    monkeypatch.setattr(lift_relief.time, "sleep", sleep)
+    try:
+        check.monitor.read_configuration()
+        _home, height = check.home_and_relieve()
+        assert waits and all(wait == lift_relief.POLL_S for wait in waits)
+        assert height >= lift_relief.RELIEF_MM - 0.5
+    finally:
+        robot.left_bus.is_connected = False
+
+
+@pytest.mark.parametrize("interval", [False, True, 0, -0.01, float("nan"), float("inf"), "0.05", 0.100001])
+def test_relief_interval_is_typed_finite_positive_and_not_slower_before_writes(
+    operating_robot, interval,
+):
+    from lerobot.robots.alohamini import lift_relief
+
+    robot, _clock = operating_robot
+    check = lift_relief.InstalledLiftCheck(robot)
+    before = list(robot.left_bus.events)
+    with pytest.raises(ValueError, match="poll"):
+        check.home_and_relieve(relief_poll_s=interval)
+    assert robot.left_bus.events == before
+
+
+def test_saved25_original_empty_relief_slot_still_refuses_without_rewriting_history():
+    from lerobot.robots.alohamini.lift_operational import TemperatureWindow
+
+    origin = 172194.841032394
+    window = TemperatureWindow()
+    # Synthetic preceding occupied readings anchor the ACTUAL saved origin.
+    # Original later replies below remain exact; this does not retro-pass25.
+    for slot in range(69): window.update(33, origin + slot * 0.1)
+    saved = [172201.809366795, 172201.915432503, 172202.022485412,
+             172202.132386756, 172202.241406213, 172202.248367430,
+             172202.300389528, 172202.356415298, 172202.412393216,
+             172202.468402320]
+    for when in saved: window.update(33, when)
+    with pytest.raises(feedback.ComparisonRefusal, match="five-slot feedback window is stale"):
+        window.update(33, 172202.524408015)
+    assert list(window.samples) == [(when, 33) for when in
+        (172202.022485412, 172202.132386756, 172202.241406213, 172202.356415298, 172202.468402320)]
+    assert window._origin_ns == round(origin * 1e9) and window.outliers == 0
+    assert window.failure is not None

@@ -444,6 +444,7 @@ class OperationalLift(InstalledLiftCheck):
                 allow_one_count_variation=True, qualify_initial_direction=True,
                 require_quiet_post_home=True,
                 am1_post_home_readiness=True,
+                relief_poll_s=feedback.POLL_S,
             )
             self._goal_since = time.monotonic()
             self.poll()
