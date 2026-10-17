@@ -52,6 +52,33 @@ def configured_robot(activation):
 
         bus.sync_read = grouped
     robot.configure()
+    for bus in (robot.left_bus, robot.right_bus):
+        from lerobot.motors.feetech.tables import MODEL_CONTROL_TABLE
+        from lerobot.motors.motors_bus import MotorsBus
+
+        bus._setup_sync_reader = MotorsBus._setup_sync_reader.__get__(bus)
+        bus._sync_read = MotorsBus._sync_read.__get__(bus)
+        bus._is_comm_success = lambda result: result == 0
+
+        def respond(packet, _bus=bus):
+            assert packet[4:7] == [130, 33, 38]
+            _bus.events.append(("group_read", _bus.side, 33, 38, tuple(packet[7:-1])))
+            if _bus.on_read is not None:
+                _bus.on_read("Live_Health_Block", None)
+            packets = []
+            names = {motor.id: name for name, motor in _bus.motors.items()}
+            for motor_id in packet[7:-1]:
+                payload = [0] * 38
+                for register, (address, width) in MODEL_CONTROL_TABLE["sts3215"].items():
+                    if address >= 33 and address + width <= 71:
+                        value = _bus.registers.get((register, names[motor_id]), 0)
+                        payload[address - 33 : address - 33 + width] = [
+                            (value >> (8 * index)) & 255 for index in range(width)
+                        ]
+                packets.append(reply_packet(motor_id, payload))
+            return [byte for packet in packets for byte in packet]
+
+        bus.port_handler.respond = respond
     return robot
 
 
@@ -60,6 +87,7 @@ class ReplyPort:
 
     def __init__(self):
         self.buffer, self.writes, self.clears = [], [], 0
+        self.respond = None
         self.is_using = False
 
     def readPort(self, count):  # noqa: N802 - exact SDK port interface
@@ -68,6 +96,8 @@ class ReplyPort:
 
     def writePort(self, packet):  # noqa: N802 - exact SDK port interface
         self.writes.append(list(packet))
+        if self.respond is not None:
+            self.buffer.extend(self.respond(packet))
         return len(packet)
 
     def clearPort(self):  # noqa: N802 - exact SDK port interface
@@ -91,6 +121,7 @@ def sdk_bus(robot, side, packets):
 
     bus = getattr(robot, side + "_bus")
     bus.port_handler.buffer = [byte for packet in packets for byte in packet]
+    bus.port_handler.respond = None
     bus._setup_sync_reader = MotorsBus._setup_sync_reader.__get__(bus)
     bus._is_comm_success = lambda result: result == 0
 
@@ -170,19 +201,14 @@ def test_actual_status_fault_is_retained_before_a_later_transport_failure(activa
     from lerobot.robots.alohamini.am1_live_teleop import poll_health
 
     robot = configured_robot(activation)
-    original = robot.left_bus.sync_read
-
-    def fault(register, names, **kwargs):
-        if register == "Status":
-            return dict.fromkeys(names, 1)
-        if register == "Present_Temperature":
-            raise OSError("later transport loss")
-        return original(register, names, **kwargs)
-
-    robot.left_bus.sync_read = fault
+    robot.left_bus.registers["Status", "arm_left_shoulder_lift"] = 1
+    robot.left_bus.registers["Present_Temperature", "arm_left_shoulder_pan"] = 74
+    robot.right_bus._sync_read = lambda *_, **__: (_ for _ in ()).throw(OSError("later right bus loss"))
     with pytest.raises(RuntimeError, match="status"):
         poll_health(robot)
     assert robot._am1_teleop_fault["register"] == "Status"
+    assert len(robot.left_bus.port_handler.writes) == 1
+    assert not robot.right_bus.port_handler.writes
 
 
 @pytest.mark.parametrize(
@@ -236,7 +262,7 @@ def fault_note(error):
 def test_fault_note_exports_original_row_interval_binding_and_installed_comparator(
     activation, register, value, reason, configured
 ):
-    from lerobot.robots.alohamini.am1_live_teleop import HEALTH, poll_health
+    from lerobot.robots.alohamini.am1_live_teleop import HEALTH, poll_health, read_groups
 
     robot = configured_robot(activation)
     for bus in (robot.left_bus, robot.right_bus):
@@ -250,7 +276,12 @@ def test_fault_note_exports_original_row_interval_binding_and_installed_comparat
     robot.right_bus.sync_read = lambda *_, **__: pytest.fail("fault must precede later right-bus reads")
     boundary = len(activation.events)
     with pytest.raises(RuntimeError, match=reason) as caught:
-        poll_health(robot)
+        if value < 0:
+            # Negative numeric values remain a narrow/raw validator regression;
+            # a genuine unsigned one-byte wire value cannot encode negative1.
+            read_groups(robot, (*HEALTH, "Operating_Mode"), active=True)
+        else:
+            poll_health(robot)
     snapshot = fault_note(caught.value)
     assert snapshot == robot._am1_teleop_fault
     assert snapshot["binding"] == binding
@@ -260,10 +291,17 @@ def test_fault_note_exports_original_row_interval_binding_and_installed_comparat
     order = (*HEALTH, "Operating_Mode")
     expected = order[: order.index(register) + 1]
     reads = activation.events[boundary:]
-    assert len(reads) == 6 * len(expected) and all(event[0:2] == ("read", "left") for event in reads)
-    assert [event[2] for event in reads] == [key for key in expected for _ in range(6)]
-    assert snapshot["read_started_at_monotonic_s"] == pytest.approx(120 + 0.006 * (len(expected) - 1))
-    assert snapshot["read_completed_at_monotonic_s"] == pytest.approx(120 + 0.006 * len(expected))
+    if value < 0:
+        assert len(reads) == 6 * len(expected) and all(event[0:2] == ("read", "left") for event in reads)
+        assert [event[2] for event in reads] == [key for key in expected for _ in range(6)]
+        assert snapshot["read_started_at_monotonic_s"] == pytest.approx(120 + 0.006 * (len(expected) - 1))
+        assert snapshot["read_completed_at_monotonic_s"] == pytest.approx(120 + 0.006 * len(expected))
+    else:
+        assert reads == [("group_read", "left", 33, 38, (1, 2, 3, 4, 5, 6))]
+        assert snapshot["read_started_at_monotonic_s"] == 120
+        assert snapshot["read_completed_at_monotonic_s"] == pytest.approx(120.001)
+        assert snapshot["group_reply"]["request"]["width"] == 38
+        assert not robot.right_bus.port_handler.writes
     comparison = snapshot["comparison"]
     assert comparison["units"] == "raw_register"
     if register == "Present_Temperature":
@@ -317,8 +355,11 @@ def test_fault_note_first_snapshot_survives_mutation_and_actual_cleanup_export(a
     robot.left_bus.registers["Status", motor] = 1
     robot._am1_teleop_binding["run_id"] = str(uuid4())
     robot._am1_teleop_settings["left"]["registers"]["Max_Temperature_Limit"][motor] = 99
-    with pytest.raises(RuntimeError, match="status") as later:
+    writes = len(robot.left_bus.port_handler.writes)
+    with pytest.raises(RuntimeError, match="temperature") as later:
         poll_health(robot)
+    assert later.value is first
+    assert len(robot.left_bus.port_handler.writes) == writes
     assert fault_note(later.value) == fault_note(first) == robot._am1_teleop_fault == original
     robot._am1_shutdown_evidence = {"verified": False, "buses_closed": False}
     path = tmp_path / "cleanup.json"
@@ -1241,7 +1282,8 @@ def test_fault_note_prior_successful_health_keeps_original_binding_value_and_tim
         "read_completed_at_monotonic_s": 100,
     }
     assert note["offending_value"] == 98 and note["read_started_at_monotonic_s"] == 100.5
-    assert len(activation.events) == boundary + 12  # Original Status + temperature; no diagnostic reads.
+    assert activation.events[boundary:] == [("group_read", "left", 33, 38, (1, 2, 3, 4, 5, 6))]
+    assert note["group_reply"]["request"]["width"] == 38
     assert robot._am1_teleop_health["binding"] == binding
     assert robot._am1_teleop_health["left"]["registers"]["Present_Temperature"]["arm_left_elbow_flex"] == 28
     robot._am1_teleop_health["left"]["registers"]["Present_Temperature"]["arm_left_elbow_flex"] = 99
@@ -1364,3 +1406,249 @@ def test_group_reply_forwards_same_original_packet_and_write_result(activation, 
     assert len(calls) == len(requests) == bus.port_handler.clears == 1
     assert calls[0] is requests[0]
     assert robot._am1_teleop_group_receipts["left"]["transmit"]["result"] is result
+
+
+def live_health_bus(robot, side, packets):
+    from lerobot.motors.motors_bus import MotorsBus
+
+    bus = sdk_bus(robot, side, packets)
+    bus._sync_read = MotorsBus._sync_read.__get__(bus)
+    return bus
+
+
+def live_health_payload(*, temperature=34, voltage=118, status=0):
+    # Synthetic complete 33..70 payload. Position low byte74 deliberately differs
+    # from temperature34: the consumer must use the register's actual offset.
+    payload = [17] * 38
+    for offset, value in {
+        0: 0,
+        7: 1,
+        22: 1,
+        23: 74,
+        24: 12,
+        29: voltage,
+        30: temperature,
+        32: status,
+        36: 2,
+        37: 0,
+    }.items():
+        payload[offset] = value
+    return payload
+
+
+def test_live_health_acquires_one_original_wide_group_per_exact_arm_chain(activation):
+    from lerobot.robots.alohamini.am1_live_teleop import poll_health
+
+    robot = configured_robot(activation)
+    for side in ("left", "right"):
+        live_health_bus(
+            robot,
+            side,
+            [reply_packet(i, live_health_payload(temperature=28 + i, voltage=117 + i)) for i in range(1, 7)],
+        )
+    poll_health(robot)
+    health = robot._am1_teleop_health
+    assert health["binding"] == robot._am1_teleop_binding
+    for side in ("left", "right"):
+        bus = getattr(robot, side + "_bus")
+        assert bus.port_handler.writes == [[255, 255, 254, 10, 130, 33, 38, 1, 2, 3, 4, 5, 6, 25]]
+        assert bus.port_handler.clears == 1
+        rows, times = health[side]["registers"], health[side]["timing"]
+        names = getattr(robot, side + "_arm_motors")
+        assert rows["Present_Temperature"] == dict(zip(names, (29, 30, 31, 32, 33, 34), strict=True))
+        assert rows["Present_Voltage"] == dict(zip(names, (118, 119, 120, 121, 122, 123), strict=True))
+        assert rows["Status"] == rows["Operating_Mode"] == dict.fromkeys(names, 0)
+        assert rows["Torque_Enable"] == rows["Lock"] == dict.fromkeys(names, 1)
+        assert all(
+            timing == {"read_started_at_monotonic_s": 100, "read_completed_at_monotonic_s": 100}
+            for timing in times.values()
+        )
+        receipt = robot._am1_teleop_group_receipts[side]
+        assert receipt["request"]["address"] == 33 and receipt["request"]["width"] == 38
+        assert len(receipt["packets"]) == 6 and receipt["comm_result"] == 0
+
+
+def test_live_health_valid_wide74_still_faults_with_original_tx_rx_and_limit(activation):
+    from lerobot.robots.alohamini.am1_live_teleop import poll_health
+
+    robot = configured_robot(activation)
+    packets = [reply_packet(i, live_health_payload(temperature=74 if i == 2 else 34)) for i in range(1, 7)]
+    left = live_health_bus(robot, "left", packets)
+    right = live_health_bus(robot, "right", [])
+    original_rx, original_write = left.packet_handler.rxPacket, left.port_handler.writePort
+    with pytest.raises(RuntimeError, match="actual configured temperature limit") as caught:
+        poll_health(robot)
+    note = fault_note(caught.value)
+    assert note["register"] == "Present_Temperature"
+    assert note["offending_motor"] == "arm_left_shoulder_lift" and note["offending_value"] == 74
+    assert note["comparison"]["upper_exclusive"] == 70
+    receipt = note["group_reply"]
+    assert receipt["request"]["address"] == 33 and receipt["request"]["width"] == 38
+    assert receipt["transmit"]["packet"] == [255, 255, 254, 10, 130, 33, 38, 1, 2, 3, 4, 5, 6, 25]
+    assert receipt["packets"][1]["packet"] == packets[1]
+    assert len(receipt["packets"]) == 6
+    assert left.packet_handler.rxPacket == original_rx and left.port_handler.writePort == original_write
+    assert len(left.port_handler.writes) == 1 and not right.port_handler.writes
+
+
+@pytest.mark.parametrize(
+    "problem", ["one_byte", "two_bytes", "foreign_id", "duplicate_id", "checksum", "device_error"]
+)
+def test_live_health_rejects_foreign_or_invalid_reply_before_sdk_decode(activation, problem):
+    from lerobot.robots.alohamini.am1_live_teleop import poll_health
+
+    robot = configured_robot(activation)
+    packets = [reply_packet(i, live_health_payload()) for i in range(1, 7)]
+    reason = "payload width"
+    index = 0
+    if problem in ("one_byte", "two_bytes"):
+        packets[0] = reply_packet(1, [74] if problem == "one_byte" else [74, 12])
+    elif problem == "foreign_id":
+        packets[0], reason = reply_packet(11, live_health_payload()), "unexpected or duplicate"
+    elif problem == "duplicate_id":
+        packets[1], index, reason = packets[0][:], 1, "unexpected or duplicate"
+    elif problem == "checksum":
+        packets[0][-1] ^= 1
+        reason = None  # Existing SDK COMM_RX_CORRUPT remains a transport failure.
+    elif problem == "device_error":
+        packets[0], reason = reply_packet(1, [], error=126), "actual device error"
+    left = live_health_bus(robot, "left", packets)
+    right = live_health_bus(robot, "right", [])
+    if reason is None:
+        with pytest.raises(ConnectionError):
+            poll_health(robot)
+        assert not getattr(robot, "_am1_teleop_fault", None)
+    else:
+        with pytest.raises(RuntimeError, match=reason) as caught:
+            poll_health(robot)
+        note = fault_note(caught.value)
+        assert note["comparison"]["request"]["width"] == 38
+        assert note["raw"]["packet"] == packets[index]
+        assert left.sync_reader.data_dict[2 if problem == "duplicate_id" else 1] == []
+    assert len(left.port_handler.writes) == 1 and not right.port_handler.writes
+
+
+@pytest.mark.parametrize(
+    ("address", "width", "ids"),
+    [
+        (34, 38, [1, 2, 3, 4, 5, 6]),
+        (33, 37, [1, 2, 3, 4, 5, 6]),
+        (33, 38, [1, 2, 3, 4, 5]),
+        (33, 38, [1, 2, 3, 4, 5, 8]),
+        (33, 38, [6, 5, 4, 3, 2, 1]),
+        (33, 38, [1, 2, 3, 4, 5, 6, 8, 9, 10, 11]),
+    ],
+)
+def test_live_health_wide_allowance_cannot_expand_to_other_requests(activation, address, width, ids):
+    robot = configured_robot(activation)
+    bus = live_health_bus(robot, "left", [])
+    with pytest.raises(RuntimeError, match="bound AM1 register/IDs"):
+        bus._sync_read(address, width, ids, num_retry=0)
+    assert not bus.port_handler.writes and bus.port_handler.clears == 0
+
+
+def test_live_health_wrong_actual_wide_transmit_is_fenced_and_hooks_restore(activation):
+    from lerobot.robots.alohamini.am1_live_teleop import poll_health
+
+    robot = configured_robot(activation)
+    bus = live_health_bus(robot, "left", [reply_packet(i, live_health_payload()) for i in range(1, 7)])
+    original_rx, original_write = bus.packet_handler.rxPacket, bus.port_handler.writePort
+    original = bus.packet_handler.syncReadTx
+    bus.packet_handler.syncReadTx = lambda port, start, width, ids, count: original(
+        port, start + 1, width, ids, count
+    )
+    with pytest.raises(RuntimeError, match="transmit differs") as caught:
+        poll_health(robot)
+    assert fault_note(caught.value)["group_reply"]["transmit"]["packet"][5:7] == [34, 38]
+    assert not bus.port_handler.writes
+    assert bus.packet_handler.rxPacket == original_rx and bus.port_handler.writePort == original_write
+
+
+@pytest.mark.parametrize("change", ["reverse", "body"])
+def test_live_health_arm_roles_are_frozen_at_guard_install(activation, change):
+    from lerobot.robots.alohamini.am1_live_teleop import poll_health
+
+    robot = configured_robot(activation)
+    if change == "reverse":
+        robot.left_arm_motors = list(reversed(robot.left_arm_motors))
+    else:
+        robot.left_arm_motors = [*robot.left_arm_motors[:5], "base_left_wheel"]
+    bus = robot.left_bus
+    with pytest.raises(RuntimeError, match="owner/binding changed"):
+        poll_health(robot)
+    assert not bus.port_handler.writes
+
+
+@pytest.mark.parametrize("change", ["last_result", "missing_id"])
+def test_live_health_incomplete_sdk_window_cannot_decode_missing_data_as_zero(
+    activation, monkeypatch, change
+):
+    import scservo_sdk as sdk
+
+    from lerobot.robots.alohamini.am1_live_teleop import poll_health
+
+    robot = configured_robot(activation)
+    bus = live_health_bus(robot, "left", [reply_packet(i, live_health_payload()) for i in range(1, 7)])
+    original = sdk.GroupSyncRead.rxPacket
+
+    def incomplete(reader):
+        result = original(reader)
+        if change == "last_result":
+            reader.last_result = False
+        else:
+            del reader.data_dict[6]
+        return result
+
+    monkeypatch.setattr(sdk.GroupSyncRead, "rxPacket", incomplete)
+    bus.sync_reader.getData = lambda *_: pytest.fail("incomplete window must be rejected BEFORE any decode")
+    with pytest.raises(RuntimeError, match="incomplete original live health"):
+        poll_health(robot)
+    assert len(bus.port_handler.writes) == 1
+
+
+def test_live_health_same_reader_rebinds_current10_then_health6_then_position6(activation):
+    from lerobot.robots.alohamini.am1_live_teleop import poll_health
+
+    robot = configured_robot(activation)
+    left = robot.left_bus
+    all_names = list(left.motors)
+    all_ids = [left.motors[name].id for name in all_names]
+    live_health_bus(robot, "left", [reply_packet(i, [2, 0]) for i in all_ids])
+    assert left.sync_read("Present_Current", all_names, normalize=False, num_retry=0) == dict.fromkeys(
+        all_names, 2
+    )
+    left.port_handler.buffer = [byte for i in range(1, 7) for byte in reply_packet(i, live_health_payload())]
+    live_health_bus(robot, "right", [reply_packet(i, live_health_payload()) for i in range(1, 7)])
+    poll_health(robot)
+    assert tuple(left.sync_reader.data_dict) == (1, 2, 3, 4, 5, 6)
+    left.port_handler.buffer = [byte for i in range(1, 7) for byte in reply_packet(i, [74, 12])]
+    assert left.sync_read(
+        "Present_Position", robot.left_arm_motors, normalize=False, num_retry=0
+    ) == dict.fromkeys(robot.left_arm_motors, 3146)
+    assert [(packet[5:7], packet[7:-1]) for packet in left.port_handler.writes] == [
+        ([69, 2], all_ids),
+        ([33, 38], [1, 2, 3, 4, 5, 6]),
+        ([56, 2], [1, 2, 3, 4, 5, 6]),
+    ]
+    assert left.port_handler.clears == 3
+
+
+def test_live_health_all_fields_keep_their_original_per_bus_interval(activation):
+    from lerobot.robots.alohamini.am1_live_teleop import LIVE_HEALTH, poll_health
+
+    robot = configured_robot(activation)
+    for bus in (robot.left_bus, robot.right_bus):
+        for name in bus.motors:
+            bus.registers["Torque_Enable", name] = bus.registers["Lock", name] = 1
+        bus.on_read = lambda *_: setattr(activation.clock, "now", activation.clock.now + 0.004)
+    poll_health(robot)
+    for side, start, end in (("left", 100, 100.004), ("right", 100.004, 100.008)):
+        row = robot._am1_teleop_health[side]
+        assert set(row["timing"]) == set(LIVE_HEALTH)
+        for timing in row["timing"].values():
+            assert timing["read_started_at_monotonic_s"] == pytest.approx(start)
+            assert timing["read_completed_at_monotonic_s"] == pytest.approx(end)
+        receipt = robot._am1_teleop_group_receipts[side]
+        assert receipt["group_call_started_at_monotonic_s"] == pytest.approx(start)
+        assert receipt["group_call_completed_at_monotonic_s"] == pytest.approx(end)
+        assert len(getattr(robot, side + "_bus").port_handler.writes) == 1

@@ -36,23 +36,24 @@ manifest 1d64de8e1e2f05938a39fae7a67a9a3ff3b19f94ae456f311116c41e52bbbd57.
 Helper/manual 0fe3997f and original calibration/private trust remain unchanged.
 Full matched rollback: motor2c5b12be35567d4e942a557e8add4793f38c3755,
 same runtime/camera, manifestc7e1e65609fb0b45007dc35a7c6ba41160b2231c9aadc459c74cee67fe8c8983.
-Stage10 verified actual owner runtime/src/client9315af5b import; nine native
-request-accounting cases passed. Combined11 reached Live/255 accepted frames and
-24.44 active PC seconds, then stopped on valid left-elbow temperature98 versus70.
-All originals/full history and certain cleanup remain retained; full program,
-planned gap/view switch and next Start remain unfinished. Later stopped reads32
-are a distinct condition, not disproof of98. Exact-TX/prior-health evidence checks
-passed139 tests and all ten stage11 idle-only phases. Combined12 stopped before
-Live on post-home readiness: first reported+150 then stable814..815, while the
-existing fallback admits only exact first+100. Its original fault/cleanup remain;
-replace the brittle fingerprint using the existing homing envelope and retain
-all subsequent stationary, geometry, health and original deadline requirements.
-That v5 correction passed469 tests/4 existing platform skips and stage12
-idle-only checks. Combined13 reached Live/18.014 active seconds, then the PC
-refused the fourth ordinary expiry hold and stopped. Native/Core fault causes stayed
-null and Core recovery episodes stayed0; cleanup verified. Ordinary qualified
-expiry-pause counts are diagnostic; preserve the native bounded-episode budget
-and original run deadline without adding a PC pause-count quota. The PC-only correction removes both quota predicates;67 focused adapter tests passed, including four ordinary rejoins and the unchanged real Core3/4 episode boundary. No native restaging is needed for this producer-only correction.
+Stage10 verified actual owner runtime/src/client9315af5b import and nine native
+request-accounting cases. Original attempts01..14 remain retained by source version.
+Combined14 reached17.34 active seconds/180 Core frames; two ordinary expiry rejoins
+qualified, then valid shoulder-lift temperature74 versus installed70 stopped the
+host. The prior same-binding read34 about59ms earlier does not establish heat or
+reply origin. Known20 off/zero cleanup and all original/full-history evidence remain.
+The full172.5s program, planned gap/view switch and next Start remain unfinished.
+
+A prospective live-only health acquisition change uses one exact33..70 SDK block
+per six-motor arm instead of six one-byte transactions. It preserves original
+acquisition intervals, all health limits and first causes; valid74 still faults.
+The stopped read-only comparison verified20 transactions/120 packets and supported
+field offsets with unchanged history/private state. Its cause relationship to
+Combined14 is unproved. The source passed160 affected tests and focused review;
+affected motor-only staging is next. Runtime/camera remain unchanged.
+Ordinary expiry pauses retain cause/current-feedback/ACK/expiry/deadline checks;
+no separate PC pause quota is imposed. The genuine native three-episode recovery
+budget remains. The PC-only correction passed67 focused adapter tests.
 
 Tasks stay stopped for source edits and affected-component staging. Verify actual
 owner imports, preserve separate full matched rollback bundles, calibration and

@@ -33,6 +33,7 @@ STATIC = (
     "Operating_Mode",
 )
 HEALTH = ("Status", "Present_Temperature", "Present_Voltage", "Torque_Enable", "Lock")
+LIVE_HEALTH = (*HEALTH, "Operating_Mode")
 
 
 def _integer(value):
@@ -120,7 +121,15 @@ def _fault(robot, reason, side, register, raw, timing, *, offending_motor=None, 
             if (
                 current is not None
                 and current["binding"] == robot._am1_teleop_binding
-                and current["request"]["register"] == register
+                and (
+                    current["request"]["register"] == register
+                    or (
+                        current["request"]["address"] == 33
+                        and current["request"]["width"] == 38
+                        and current["request"].get("registers") == list(LIVE_HEALTH)
+                        and register in LIVE_HEALTH
+                    )
+                )
             ):
                 started, completed = (
                     timing["read_started_at_monotonic_s"],
@@ -152,16 +161,54 @@ def _fault(robot, reason, side, register, raw, timing, *, offending_motor=None, 
     raise error
 
 
-def read_groups(robot, registers, *, active=None):
+def read_groups(robot, registers, *, active=None, _live_health=False):
+    if _live_health and (tuple(registers) != LIVE_HEALTH or active is not True):
+        raise RuntimeError("AM1 teleop live health window differs")
     records = {}
     for side, bus, names in _groups(robot):
         if bus is None or len(names) != 6:
             raise RuntimeError("AM1 teleop requires both exact six-motor follower chains")
         rows, timing = {}, {}
-        for register in registers:
+        if _live_health:
+            from lerobot.motors.feetech.tables import MODEL_CONTROL_TABLE
+
+            table = MODEL_CONTROL_TABLE["sts3215"]
+            ids = [bus.motors[name].id for name in names]
             started = time.monotonic()
-            values = bus.sync_read(register, names, normalize=False, num_retry=0)
+            # Exactly one original SDK transaction, with no decode until its
+            # complete window is available. getData cannot decode width38.
+            bus._setup_sync_reader(ids, 33, 38)
+            comm = bus.sync_reader.txRxPacket()
             completed = time.monotonic()
+            if not bus._is_comm_success(comm):
+                raise ConnectionError(
+                    "AM1 teleop live health read failed: " + bus.packet_handler.getTxRxResult(comm)
+                )
+            if not bus.sync_reader.last_result or any(
+                not bus.sync_reader.isAvailable(motor_id, *table[register])
+                for motor_id in ids
+                for register in registers
+            ):
+                _fault(
+                    robot,
+                    "incomplete original live health window",
+                    side,
+                    "Live_Health_Block",
+                    {},
+                    {
+                        "read_started_at_monotonic_s": started,
+                        "read_completed_at_monotonic_s": completed,
+                    },
+                )
+        for register in registers:
+            if _live_health:
+                values = {
+                    name: bus.sync_reader.getData(bus.motors[name].id, *table[register]) for name in names
+                }
+            else:
+                started = time.monotonic()
+                values = bus.sync_read(register, names, normalize=False, num_retry=0)
+                completed = time.monotonic()
             if set(values) != set(names):
                 raise RuntimeError("AM1 teleop incomplete original register acquisition")
             rows[register] = {name: _integer(value) for name, value in values.items()}
@@ -260,6 +307,8 @@ def _install_group_reply_guard(robot, side, bus):
     binding = tuple(sorted(robot._am1_teleop_binding.items()))
     reader, ph, port = bus.sync_reader, bus.packet_handler, bus.port_handler
     mapping = tuple((name, motor.id, motor.model) for name, motor in bus.motors.items())
+    arm_names = tuple(getattr(robot, side + "_arm_motors"))
+    arm_ids = tuple(bus.motors[name].id for name in arm_names)
     installed = getattr(bus, "_am1_teleop_reply_guard", None)
     if installed is not None:
         if installed != (
@@ -269,6 +318,7 @@ def _install_group_reply_guard(robot, side, bus):
             ph,
             port,
             mapping,
+            arm_names,
             reader.txRxPacket,
             ph.rxPacket,
             port.writePort,
@@ -325,6 +375,7 @@ def _install_group_reply_guard(robot, side, bus):
                     and reader.ph is ph
                     and reader.port is port
                     and tuple((name, motor.id, motor.model) for name, motor in bus.motors.items()) == mapping
+                    and tuple(getattr(robot, side + "_arm_motors")) == arm_names
                     and reader.txRxPacket is guarded
                 )
             except Exception:
@@ -335,11 +386,11 @@ def _install_group_reply_guard(robot, side, bus):
         address, width, ids = reader.start_address, reader.data_length, tuple(reader.data_dict)
         request.update(address=address, width=width, ids=list(ids))
         id_names = {motor_id: name for name, motor_id, _model in mapping}
+        live_health = (address, width) == (33, 38) and ids == arm_ids and len(ids) == 6
         if (
             type(address) is not int
             or type(width) is not int
-            or (address, width) not in table.values()
-            or width not in (1, 2)
+            or not (live_health or ((address, width) in table.values() and width in (1, 2)))
             or not ids
             or len(ids) > min(10, len(mapping))
             or len(set(ids)) != len(ids)
@@ -352,8 +403,12 @@ def _install_group_reply_guard(robot, side, bus):
             width=width,
             ids=list(ids),
             motors=[id_names[motor_id] for motor_id in ids],
-            register=next(name for name, spec in table.items() if spec == (address, width)),
+            register="Live_Health_Block"
+            if live_health
+            else next(name for name, spec in table.items() if spec == (address, width)),
         )
+        if live_health:
+            request["registers"] = list(LIVE_HEALTH)
         receipt = receipts[side] = {
             "binding": dict(binding),
             "request": copy.deepcopy(request),
@@ -472,6 +527,7 @@ def _install_group_reply_guard(robot, side, bus):
         ph,
         port,
         mapping,
+        arm_names,
         guarded,
         original_rx,
         original_write,
@@ -730,7 +786,7 @@ def hold_goals(robot):
 def poll_health(robot):
     """Actual installed device limits; contact/nonresponse keep their role semantics."""
     binding = copy.deepcopy(robot._am1_teleop_binding)
-    records = read_groups(robot, (*HEALTH, "Operating_Mode"), active=True)
+    records = read_groups(robot, LIVE_HEALTH, active=True, _live_health=True)
     check_health(robot, records, active=True)
     for side, _, names in _groups(robot):
         if any(records[side]["registers"]["Operating_Mode"][name] != 0 for name in names):

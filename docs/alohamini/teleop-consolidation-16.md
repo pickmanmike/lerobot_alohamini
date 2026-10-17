@@ -21,6 +21,20 @@ Combined12 then stopped before Live on the original one-second lift post-home qu
 
 Combined13 reached Live and186 Core-accepted frames/18.014 active PC seconds. The motor host reported no hard fault. After three qualified ordinary expiry holds, the PC refused the fourth through its local pause-count cap and issued ordinary Stop; Core recovery episodes remained0 and original run/reference/deadline remained fixed. Cleanup and all originals are verified. This identifies a PC recovery restriction: ordinary cause-specific expiry holds must retain their original finite qualification/deadline checks while the native three-episode budget continues to govern bounded recovery episodes. The reviewed PC-only correction removes that separate pause-count cap, preserves all cause/current-feedback/ACK/expiry/deadline checks and the Core three-episode limit, and reports failed attempts as observed pauses rather than qualified recoveries. The existing adapter suite passed67 tests in29.74s, including four ordinary same-run rejoins and refusal of a fourth actual Core recovery episode. It requires no Pi restaging. Full program, planned gap/view switch and next Start are still unfinished.
 
+Combined14 used PC candidate `0a458a90` and unchanged stage12 components. It admitted180 Core frames and17.34 active producer seconds before the host stopped on shoulder-lift temperature74 versus installed70. The original valid TX requested address63/width1; the intact zero-error ID2 reply contains74. The same-binding prior successful read was34 about59ms earlier. Those facts do not establish physical heating, reply aliasing or corruption. The original native fault precedes Core feedback loss; the PC waited through the original bounded episode and refused the ensuing host fault. All originals, full history and verified20 off/zero cleanup are saved. No complete program, planned interruption, view switch or next Start is credited.
+
+| Combined14 observation | Actual result |
+| --- | --- |
+| Source / native evidence |180 Core-accepted frames; final retained native source172 and171 unique feedback samples. Acceptance is not proof of every physical write. |
+| Measured coarse movement |Left pan35 encoder ticks/about3.08 degrees; shoulder lift76 ticks/about6.68 degrees; elbow10 ticks/about0.88 degree. Other joints were held or their phases were unreached. |
+| Final encoder residual to encoded accepted target |Pan+13, shoulder lift−31, elbow+1tick. These are neither goal-register readbacks nor fine-position qualification. |
+| Same-run continuity |Two ordinary expiry holds qualified fresh rejoin. One later native recovery episode remained unclosed after the host fault. Original reference/workspace and300s deadline stayed fixed. |
+| Body phase |Unreached; authored/native body commands stayed zero. Nonzero wheel-derived feedback under those commands is retained separately, without body-workload credit. |
+| Onboard video |Chest WebRTC363 decoded frames and71 fresh health samples; no sampled freshness gap inside that useful interval. Planned wrist switch was unreached. Teardown reconnect is separate. |
+| Timing p50 / p95 / maximum |PC grant RTT19.60/41.69/58.04ms; capture-to-send0.062/0.100/0.324ms; Pi observation RTT170.13/200.98/244.38ms; original joint read2.033/2.411/5.676ms. PC/Pi clocks are not subtracted. |
+
+The prospective live-health hardening replaces six one-byte health transactions per arm with one exact33..70/38-byte SDK transaction per bound six-motor chain. The original per-bus read interval, status-first validation, settings and installed limits remain; a valid block reporting74 still faults. Distinct response width rejects unrelated short replies before field decoding, without retries or hot-sample suppression. It does not prove the cause of Combined14 or distinguish an arbitrary delayed reply of the same width/ID. The two affected modules passed160 tests in1.31s and independent review. A stopped read-only installed-firmware comparison retained20 transactions/120 valid response packets, correct SDK/wire offsets,20 off/zero checks, closed buses and unchanged complete history/private files. No powered success follows from that comparison. Motor-only staging and a supported combined trial remain next.
+
 ## Shared input and motor lessons
 
 - Whole input frames contain exactly twelve calibrated arm/gripper targets plus the existing body/lift intent. The original acquisition/grant age, source identity/sequence and control generation survive transport to the native prewrite guard. A new grant cannot refresh an old sample.
@@ -37,7 +51,47 @@ One stopped format inventory found all five roles advertise MJPEG/YUYV, includin
 
 ## Verification and ordinary use
 
-Focused implementation checks, exact adapter commands, installed component/rollback identities and measured combined-operation results will be recorded here after source review and staging. The representative exercise uses virtual leader-format input, 172.5 active program seconds under a newly declared fixed300-second native ceiling, original250ms input freshness, individual then combined arm/gripper movements, and a separate arms-held existing raised-base body recipe. It includes one selected-view switch/reconnect, one controlled input interruption/fresh rejoin, and a brief next Start. Producer program completion and native interactive Stop are separate results.
+Focused checks are recorded by source version: initial media61 Python checks/one existing skip and44 browser checks; affected existing modes208 checks; AM1 observation client110 local checks and9 actual-owner in-process checks; TX/RX settings/native139 checks; lift readiness469 checks/four existing platform skips; latest PC adapter67 checks. These overlapping cohorts are not a cumulative unique-test count or a physical qualification. Independent affected-source reviews passed before staging. The representative exercise uses virtual leader-format input, 172.5 active program seconds under a newly declared fixed300-second native ceiling, original250ms input freshness, individual then combined arm/gripper movements, and a separate arms-held existing raised-base body recipe. It includes one selected-view switch/reconnect, one controlled input interruption/fresh rejoin, and a brief next Start. Producer program completion and native interactive Stop are separate results.
+
+Use the reviewed checkout, existing environment, enrolled browser state and trusted CA. Open the authenticated onboard viewer separately and explicitly select a fresh role. The viewer observes; the adapter owns input and Start/Stop. Every invocation requires a fresh private output directory.
+
+```powershell
+Set-Location 'C:/Users/pickm/.codex/worktrees/am1-reliability-01/lerobot_alohamini_client'
+$env:PYTHONUTF8 = '1'
+$env:PYTHONDONTWRITEBYTECODE = '1'
+$env:PYTHONPATH = "$PWD/src;$PWD;$PWD/.cache/am1-session-pi-01/http-overlay"
+$sessionArgs = @('--url', '<existing-HTTPS-origin>',
+                 '--ca', '<trusted-CA-file>',
+                 '--storage-state', '<existing-enrolled-state>')
+uv run --no-sync --project C:/Users/pickm/lerobot_alohamini_client python -B -m tools.am1_leader_adapter `
+  @sessionArgs --source virtual-leaders --duration-seconds 180 `
+  --interrupt-at-seconds 60 --interruption-seconds 0.65 `
+  --output '<fresh-private-combined-output>'
+```
+
+The virtual cap is active progress, with172.5s required for the complete declared program. Startup, holds, final-zero qualification and cleanup take additional wall time, within the original native ceiling. View selection/reconnection is a separate authenticated browser action; the adapter has no view-switch flag. A separate brief next Start, after supported completion and retained originals, uses:
+
+```powershell
+uv run --no-sync --project C:/Users/pickm/lerobot_alohamini_client python -B -m tools.am1_leader_adapter `
+  @sessionArgs --source virtual-leaders --next-start-seconds 3 `
+  --output '<fresh-private-next-start-output>'
+```
+
+For ordinary physical leaders, use only the existing verified left/right port identities and calibration. Do not guess port order or create calibration as part of a run:
+
+```powershell
+$leaderArgs = @('--left-port', '<verified-left-port>',
+                '--right-port', '<verified-right-port>',
+                '--leader-id', '<existing-leader-ID>',
+                '--calibration-dir', '<existing-calibration-directory>')
+uv run --no-sync --project C:/Users/pickm/lerobot_alohamini_client python -B -m tools.am1_leader_adapter `
+  @sessionArgs @leaderArgs --source usb-leaders --duration-seconds 180 `
+  --output '<fresh-private-ordinary-USB-output>'
+```
+
+The existing body keys are `w/s` for forward/back, `z/x` for lateral, `a/d` for turn and `u/j` for lift; `q` requests ordinary Stop. The accepted lowest speed is retained; `t/g` do not raise it. A five-second stationary shared-path check replaces duration with `--duration-seconds 5 --no-keyboard`. This still starts followers and homes the lift; it is not a sampling-only command. `--no-keyboard` zeros USB body/lift intent, while the explicit virtual source retains its declared body recipe. The existing USB source opens/calibrates read-only and samples without enabling leader torque; no physical C001 identity or movement proof is inferred from an empty inventory.
+
+After USB connection/identity and stationary sampling are established, the prepared short human check is fresh clutch with still leaders, one modest supported out-and-back per arm and a free gripper opening, then ordinary Stop. Actual human ergonomics, grasping and task success remain separate. Manual follower positioning, an old reference pose or human leader motion does not unlock the current automated implementation work.
 
 The current Windows USB inventory enumerates no serial ports. Physical USB identity/stationary sampling and actual human leader movement are therefore unverified. Virtual success will not be reported as moving-leader validation. After automated qualification, the remaining human check is a short fresh-clutched leader movement within the supported workspace; no object, floor travel, tuning or manual follower positioning is required by this packet.
 
