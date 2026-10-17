@@ -8,6 +8,7 @@ import copy
 import json
 import math
 import time
+from collections import deque
 from contextlib import suppress
 from uuid import UUID
 
@@ -93,6 +94,19 @@ def _fault(robot, reason, side, register, raw, timing, *, offending_motor=None, 
                 "prior_successful_health": None,
             }
             with suppress(Exception):
+                warnings = list(getattr(robot, "_am1_teleop_temperature_warnings", ()))[-4:]
+                if warnings:
+                    robot._am1_teleop_fault["temperature_warnings"] = [
+                        {
+                            key: copy.deepcopy(warning[key])
+                            for key in (
+                                "side", "motor", "id", "binding", "value_c", "sample_monotonic_s",
+                                "numeric_outlier_count", "ceiling_c", "values_c", "high_count",
+                            )
+                        }
+                        for warning in warnings
+                    ]
+            with suppress(Exception):
                 prior = robot._am1_teleop_health
                 prior_timing = prior[side]["timing"][register]
                 prior_value = prior[side]["registers"][register][offending_motor]
@@ -161,14 +175,149 @@ def _fault(robot, reason, side, register, raw, timing, *, offending_motor=None, 
     raise error
 
 
+def _report_temperature_warnings(robot):
+    # The existing sink is bounded/nonblocking. Startup has no print fallback;
+    # retained warnings publish once when this sink becomes available.
+    reporter = getattr(robot, "_am1_routine_report", None)
+    if reporter is None:
+        return
+    for warning in getattr(robot, "_am1_teleop_temperature_warnings", ()):
+        if not warning.get("_reported", False):
+            with suppress(Exception):
+                line = {key: value for key, value in warning.items() if key != "_reported"}
+                if reporter("[AM1 TEMPERATURE WARNING] " + json.dumps(line, separators=(",", ":"))) is not False:
+                    warning["_reported"] = True
+
+
+def _temperature(robot, side, bus, name, raw, timing, baseline_record, *, acquired):
+    """TEMP-01: one original slot history per follower bus/ID/protected run.
+
+    Followers explicitly confirm at their frozen installed limit. The shared
+    lift collector keeps its own 55 C ceiling and cold-start rule.
+    """
+    from .lift_operational import TemperatureWindow
+
+    states = getattr(robot, "_am1_teleop_temperatures", None)
+    if states is None:
+        states = robot._am1_teleop_temperatures = {}
+    ceiling = baseline_record["registers"]["Max_Temperature_Limit"][name]
+    key = (side, bus.motors[name].id)
+    identity = (id(bus), name, bus.motors[name].model, copy.deepcopy(robot._am1_teleop_binding), ceiling)
+    state = states.get(key)
+    if state is None:
+        state = states[key] = {
+            "identity": identity, "bus": bus, "window": TemperatureWindow(ceiling_c=ceiling),
+            "last": None, "receipts": deque(maxlen=64), "last_warning": -math.inf,
+        }
+    window = state["window"]
+    value, now = raw[name], time.monotonic()
+    evidence = None
+    try:
+        if state["identity"] != identity:
+            window.refuse("temperature: frozen follower bus/ID/run/settings changed.")
+        started, completed = (
+            timing["read_started_at_monotonic_s"], timing["read_completed_at_monotonic_s"]
+        )
+        if (
+            any(type(t) not in (int, float) or not math.isfinite(t) for t in (started, completed, now))
+            or not 0 <= started <= completed <= now
+            or now - started > window.MAX_AGE_S
+        ):
+            window.refuse("temperature: invalid or stale original acquisition interval.")
+        original = (started, completed, value)
+        if acquired:
+            evidence = window.update(value, completed)
+            state["last"] = original
+            state["receipts"].append(original)
+        else:
+            if original not in state["receipts"]:
+                window.refuse("temperature: original acquisition was not registered by this follower owner.")
+            # read_groups and check_health consume the SAME original receipt.
+            # Rechecking it neither invents a sample nor adds a thermal vote.
+            if window.failure is not None:
+                raise window.failure
+            if window.ready:
+                window.assert_fresh(now)
+        evidence = {
+            **(evidence or {}),
+            "ceiling_c": ceiling, "count": len(window.samples), "ready": window.ready,
+            "high_count": sum(t >= ceiling for _, t in window.samples),
+            "values_c": [t for _, t in window.samples], "samples": list(window.samples),
+            "numeric_outlier_count": window.outliers, "sample_monotonic_s": completed,
+            "aggregation": "maximum_per_occupied_slot", "slot_s": window.SLOT_S,
+        }
+    except RuntimeError as error:
+        comparison = {
+            "units": "raw_register", "lower_inclusive": 0, "upper_exclusive": ceiling,
+            "temperature": {
+                "ceiling_c": ceiling, "samples": [list(sample) for sample in window.samples],
+                "high_count": sum(t >= ceiling for _, t in window.samples),
+                "numeric_outlier_count": window.outliers, "first_cause": str(error),
+            },
+        }
+        with suppress(Exception):
+            comparison["configured"] = {
+                "Max_Temperature_Limit": {
+                    "value": ceiling, **baseline_record.get("timing", {}).get("Max_Temperature_Limit", {}),
+                }
+            }
+        _fault(
+            robot, "actual configured temperature limit: " + name + "; " + str(error),
+            side, "Present_Temperature", raw, timing, offending_motor=name, comparison=comparison,
+        )
+    if value >= ceiling and acquired and now - state["last_warning"] >= 1.0:
+        warnings = getattr(robot, "_am1_teleop_temperature_warnings", None)
+        if warnings is None:
+            warnings = robot._am1_teleop_temperature_warnings = deque(maxlen=60)
+        warning = {
+            "side": side, "motor": name, "id": key[1], "binding": copy.deepcopy(robot._am1_teleop_binding),
+            "value_c": value, **evidence,
+        }
+        warnings.append(warning)
+        # Before the bounded host writer exists, retain evidence in memory.
+        # _report_routine's print fallback must never block startup acquisition.
+        _report_temperature_warnings(robot)
+        state["last_warning"] = now
+    return evidence
+
+
+def refresh_startup_temperatures(robot, *, force=False):
+    """Due original group reads on the existing owner, only until verified Live."""
+    if (
+        not getattr(robot, "_am1_teleop_startup_temperature", False)
+        or getattr(robot, "_am1_teleop_temperature_refreshing", False)
+    ):
+        return
+    states = robot._am1_teleop_temperatures
+    now = time.monotonic()
+    due = force or any(
+        (round(now * 1e9) - state["window"]._origin_ns) // round(state["window"].SLOT_S * 1e9)
+        > state["window"]._last_slot
+        for state in states.values()
+    )
+    if due:
+        robot._am1_teleop_temperature_refreshing = True
+        try:
+            read_groups(robot, ("Present_Temperature",))
+        finally:
+            robot._am1_teleop_temperature_refreshing = False
+
+
+def _fresh_temperatures(robot):
+    for state in robot._am1_teleop_temperatures.values():
+        state["window"].assert_fresh(time.monotonic())
+
+
 def read_groups(robot, registers, *, active=None, _live_health=False):
+    if getattr(robot, "_am1_teleop_first_error", None) is not None:
+        raise robot._am1_teleop_first_error
     if _live_health and (tuple(registers) != LIVE_HEALTH or active is not True):
         raise RuntimeError("AM1 teleop live health window differs")
     records = {}
     for side, bus, names in _groups(robot):
         if bus is None or len(names) != 6:
             raise RuntimeError("AM1 teleop requires both exact six-motor follower chains")
-        rows, timing = {}, {}
+        rows, timing, temperatures = {}, {}, {}
         if _live_health:
             from lerobot.motors.feetech.tables import MODEL_CONTROL_TABLE
 
@@ -206,6 +355,8 @@ def read_groups(robot, registers, *, active=None, _live_health=False):
                     name: bus.sync_reader.getData(bus.motors[name].id, *table[register]) for name in names
                 }
             else:
+                if register != "Present_Temperature":
+                    refresh_startup_temperatures(robot)
                 started = time.monotonic()
                 values = bus.sync_read(register, names, normalize=False, num_retry=0)
                 completed = time.monotonic()
@@ -226,11 +377,11 @@ def read_groups(robot, registers, *, active=None, _live_health=False):
                     reason = "actual torque/lock fault: " + name
                 elif register == "Operating_Mode" and value != 0:
                     reason = "actual follower operating mode changed: " + name
-                elif (
-                    register == "Present_Temperature"
-                    and not 0 <= value < baseline["Max_Temperature_Limit"][name]
-                ):
-                    reason = "actual configured temperature limit: " + name
+                elif register == "Present_Temperature":
+                    temperatures[name] = _temperature(
+                        robot, side, bus, name, rows[register], timing[register],
+                        baseline_record or {"registers": rows, "timing": timing}, acquired=True,
+                    )
                 elif (
                     register == "Present_Voltage"
                     and not baseline["Min_Voltage_Limit"][name]
@@ -276,12 +427,15 @@ def read_groups(robot, registers, *, active=None, _live_health=False):
                         comparison=comparison,
                     )
         records[side] = {"registers": rows, "timing": timing}
+        if temperatures:
+            records[side]["temperature"] = temperatures
     return records
 
 
 def check_health(robot, records, *, active):
+    refresh_startup_temperatures(robot)
     baseline = robot._am1_teleop_settings
-    for side, _bus, names in _groups(robot):
+    for side, bus, names in _groups(robot):
         rows, limits = records[side]["registers"], baseline[side]["registers"]
         for name in names:
             if (
@@ -290,8 +444,12 @@ def check_health(robot, records, *, active):
                 or rows["Lock"][name] != int(active)
             ):
                 raise RuntimeError("AM1 teleop actual status/torque/lock fault: " + name)
-            if not 0 <= rows["Present_Temperature"][name] < limits["Max_Temperature_Limit"][name]:
-                raise RuntimeError("AM1 teleop actual configured temperature limit: " + name)
+            thermal = _temperature(
+                robot, side, bus, name, rows["Present_Temperature"],
+                records[side]["timing"]["Present_Temperature"], baseline[side], acquired=False,
+            )
+            if active and not thermal["ready"]:
+                raise RuntimeError("AM1 teleop five fresh follower temperature slots are required: " + name)
             if (
                 not limits["Min_Voltage_Limit"][name]
                 <= rows["Present_Voltage"][name]
@@ -563,6 +721,21 @@ def prepare_settings(robot):
             ):
                 raise RuntimeError("AM1 teleop installed protection settings are invalid: " + name)
     check_health(robot, records, active=False)
+    robot._am1_teleop_startup_temperature = True
+    deadline = time.monotonic() + 1.0
+    while not all(state["window"].ready for state in robot._am1_teleop_temperatures.values()):
+        if time.monotonic() >= deadline:
+            raise RuntimeError("AM1 teleop original follower baseline acquisition expired")
+        next_slot = min(
+            (state["window"]._origin_ns / 1e9)
+            + (state["window"]._last_slot + 1) * state["window"].SLOT_S
+            for state in robot._am1_teleop_temperatures.values()
+        )
+        delay = next_slot - time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
+        refresh_startup_temperatures(robot, force=True)
+    _fresh_temperatures(robot)
 
 
 def verify_settings(robot):
@@ -584,8 +757,6 @@ def qualify_rest(robot, bus, name, calibration, *, phase, present_raw):
     an operating bound, not an encoder-accuracy or mechanical-clearance claim.
     Other joints and the historical diagnostic endpoint path keep their rules.
     """
-    from .lift_operational import TemperatureWindow
-
     def refuse(reason):
         raise RuntimeError("AM1 arm activation refused: normal-rest " + reason)
 
@@ -618,6 +789,7 @@ def qualify_rest(robot, bus, name, calibration, *, phase, present_raw):
     robot._am1_teleop_rest_evidence.append(proof)
 
     def read(register):
+        refresh_startup_temperatures(robot)
         began = time.monotonic()
         if not started <= began < deadline:
             refuse("acquisition deadline expired")
@@ -663,7 +835,8 @@ def qualify_rest(robot, bus, name, calibration, *, phase, present_raw):
         # A stale torque-off goal is observed, not used as the new rest anchor.
         # Historical firmware could report the adjacent unrepresentable goal.
         seed_for(old_goal)
-        positions, window, first_completed = [present_raw], TemperatureWindow(), None
+        positions, first_completed = [present_raw], None
+        window = robot._am1_teleop_temperatures["left", bus.motors[name].id]["window"]
         while (
             len(proof["samples"]) < 9
             or round((proof["samples"][-1]["completed_at"] - first_completed) * 1e9) < 400_000_000
@@ -674,6 +847,7 @@ def qualify_rest(robot, bus, name, calibration, *, phase, present_raw):
                 delay = first_completed + len(proof["samples"]) * 0.05 - time.monotonic()
                 if delay > 0:
                     time.sleep(delay)
+            refresh_startup_temperatures(robot)
             row = {"started_at": time.monotonic()}
             proof["samples"].append(row)
             for register in (
@@ -689,6 +863,11 @@ def qualify_rest(robot, bus, name, calibration, *, phase, present_raw):
                 "Moving",
                 "Present_Voltage",
             ):
+                if register == "Present_Temperature":
+                    stamp, _, value = robot._am1_teleop_temperatures["left", bus.motors[name].id]["last"]
+                    row[register] = value
+                    row["temperature_acquired_at"] = stamp
+                    continue  # Already classified by the shared original group acquisition.
                 value = row[register] = read(register)
                 if register == "Present_Position":
                     seed_for(value)
@@ -707,24 +886,21 @@ def qualify_rest(robot, bus, name, calibration, *, phase, present_raw):
                     valid = value == old_goal
                 elif register == "Present_Current":
                     valid = 0 <= value * 6.5 < min(150, expected["Protection_Current"] * 6.5)
-                elif register == "Present_Temperature":
-                    valid = 0 <= value < min(55, expected["Max_Temperature_Limit"])
                 else:
                     valid = expected["Min_Voltage_Limit"] <= value <= expected["Max_Voltage_Limit"]
                 if not valid:
                     refuse("off/quiet/health qualification failed: " + register)
             row["completed_at"] = time.monotonic()
-            window.update(row["Present_Temperature"], row["completed_at"], cold_start=True)
             if first_completed is None:
                 first_completed = row["completed_at"]
         if phase == "after_home":
             robot._refresh_am1_startup_lift_feedback()
-        window.assert_fresh(time.monotonic())
+        _fresh_temperatures(robot)
         if any(read(register) != value for register, value in proof["settings"].items()):
             refuse("installed settings changed during acquisition")
         if phase == "after_home":
             robot._refresh_am1_startup_lift_feedback()
-        window.assert_fresh(time.monotonic())
+        _fresh_temperatures(robot)
         if (
             not binding_valid(robot)
             or robot._am1_teleop_binding != binding
@@ -794,6 +970,8 @@ def poll_health(robot):
     if binding == robot._am1_teleop_binding:
         records["binding"] = binding
     robot._am1_teleop_health = records
+    _report_temperature_warnings(robot)
+    robot._am1_teleop_startup_temperature = False
 
 
 def check_sampled_current(robot, side, values, started, completed):

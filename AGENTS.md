@@ -1,81 +1,46 @@
-## Active AM1 teleoperation consolidation (Packet16)
+## Active AM1 knowledge reuse and teleoperation (Packet18)
 
-Goal: dependable Pi-owned teleoperation for light manipulation and telepresence.
-Physical C001 leaders are primary. Explicit virtual-leaders substitute only at
-acquisition and use the same mapping, authentication, ownership and native expiry.
-Generated input is not a human demonstration. Retain accepted coarse elbow page
-presets as diagnostics; fine positioning and household tasks remain unproven.
+Read first: [current state](docs/alohamini/current-state.md) and
+[source-backed decisions/lessons](docs/alohamini/decisions-and-lessons.md).
+Use the matching lesson before diagnosing a symptom; check coverage at the actual
+new entrypoint before reopening an accepted decision. Update changed rows, not a
+packet diary. Historical runbooks retain original results and detailed procedures.
 
-Packet16 replaces proposed wrist Packet15. PR24 integrated normally into
-integrate/am1-local-teleop at386d3c37; this focused follow-up remains unmerged.
-Main/AM2 are unchanged. The declared target remains the representative172.5
-active-second program under its original fixed300s native ceiling, selected onboard
-WebRTC with one view switch, controlled input interruption/qualified rejoin, then
-brief next Start. The unresolved fault below currently blocks that qualification.
-Do not credit idle padding or interactive Stop as finite-program completion.
+Packet18 supersedes proposed Packet17's spike-causation-first direction; Packet16
+supersedes wrist-button Packet15. PR25 stays unmerged; main and AM2 are unchanged.
+TEMP-01 retains isolated numeric highs/warnings and faults on confirmed high slots,
+genuine device errors and invalid/stale feedback. Reuse TemperatureWindow's five
+occupied 100 ms maxima and original 0.5 s age bound. Historical 55 C/cold-start40 C
+is lift-specific. Packet18 authorizes follower confirmation using each frozen
+installed per-motor ceiling; do not hardcode 70 C, pool IDs/buses, reset history
+at phases or change EEPROM/firmware limits. Exact spike causation is not a gate.
 
-Preserve original raw feedback/acquisition times, calibrated units/directions,
-latest-valid coherent frames, accumulated rate-limited targets, original250ms
-input expiry and generations, fixed run reference/deadline and sole motor owner.
-Qualified executor-acknowledged recovery closes its episode; later distinct loss
-may receive another bounded episode, at most three total without deadline reset.
-Acquire actual supported rest, never require an old twelve-joint fingerprint.
-Keep installed settings role-specific; no blanket P16/I0/D32,500mA or elbow windows.
-Wheel velocity, lift home/relief and gripper contact retain their own semantics.
-Preserve real health/current/thermal/status/voltage protections and first causes.
-No process freeze, bus fault, overload, speculative tuning or permission bypass.
+Physical leaders are primary for useful manipulation/telepresence. Virtual input
+substitutes at acquisition through the same protected Pi-owned path. Quest and
+concrete household autonomy follow later. Per-motor pages remain diagnostics.
+Keep role-specific settings/units, raw feedback and original times, normal-rest
+acquisition, original input expiry/generations, run reference/deadline, sole motor
+ownership and qualified recovery. Ordinary pauses are not extra recovery episodes.
+Preserve actual device/current/status/voltage protections and first causes.
 
-One exclusive onboard capture owner serves selected primary WebRTC. JPEG remains
-required local observation/diagnostic evidence. Decoded progress/source age and
-camera generations remain distinct from control health. Keep media/routine logs
-outside motor polling; optional output cannot consume unrelated recovery budgets.
+AM1 stays wireless; P1 advisory. Keep local required sensing and selected onboard
+WebRTC, one capture owner, bounded media/log work outside motor polling. Persistent
+services restore idle only; no motor replay. Durability means software continuity,
+state preservation and recovery. Do not reopen network tuning, generic inspection,
+manual leader/shoulder readiness questions, gains or broad commissioning.
 
-Installed motor 6328bb524bc4e42c70f9896d66904177c1830277,
-runtime 68118e4e9dddf8dddaa3ea6cbf64f54fdd511980,
-camera bc3442b54d9c574a8feddb0ade642c9b351e59f9,
-manifest de681ad6f73f2639a1971b96eee41214b5edfdc1730082e7f77b78a3c6795dbb.
-Helper/manual 0fe3997f and original calibration/private trust remain unchanged.
-Full matched rollback: motor2fbc8265b15393dcc799e603223b8902844e2919,
-same runtime/camera, manifest1d64de8e1e2f05938a39fae7a67a9a3ff3b19f94ae456f311116c41e52bbbd57.
-Stage10 verified actual owner runtime/src/client9315af5b import and nine native
-request-accounting cases. Original attempts01..15 remain retained by source version.
-Combined15 reached11.002 active seconds/116 Core frames; two required-view expiry
-holds qualified fresh rejoin, then a valid38-byte payload in a44-byte reply reported
-shoulder-lift temperature90 versus installed70. The prior same-binding read34
-about41ms earlier does not establish physical heating or reply-origin cause.
-Known20 off/zero cleanup, lift qualification, closed buses/camera release and all
-original/full-history evidence remain. The full172.5s program, planned input gap,
-view switch and next Start are NOT qualified. Do not repeat that powered workload
-unchanged or relax thermal policy to obtain a passing result.
+Keep tasks stopped during edits/staging. Root alone performs Git mutations,
+SSH/staging/devices; agents own explicit disjoint offline work. Verify imports
+through actual service interpreter/cwd/path; preserve separate component pins,
+full matched rollback, private permissions and calibration. Historical failed
+runs remain failed; old-mode passes do not qualify a new interface.
 
-Live health uses one exact33..70 SDK block per frozen six-motor arm, preserving
-original times/limits/first causes. It passed160 affected tests and the stopped
-installed-firmware comparison; all ten motor-only stage13 phases passed. The new
-full-width90 result leaves the temperature boundary unresolved. Source framing,
-measured response, accepted commands and program completion remain distinct.
-Ordinary expiry pauses retain cause/current-feedback/ACK/expiry/deadline checks;
-no separate PC pause quota is imposed. The genuine native three-episode recovery
-budget remains. Ambiguous HTTP Start outcomes retain the original operation
-identity through one unchanged-operation retry. Only an initial explicit refusal
-establishes nonadmission; a refusal after ambiguity does not settle that outcome.
-Matching accepted Core identities establish ownership even before native ACK or
-with uncertain fault cleanup. This PC-only correction passed80 adapter tests
-without actuation and independent review; installed Pi pins remain unchanged.
-
-Tasks stay stopped for source edits and affected-component staging. Verify actual
-owner imports, preserve separate full matched rollback bundles, calibration and
-private permissions. Persistent services restore idle only, never motor replay.
-AM1 wireless; P1 advisory; AM2 untouched. No network tuning, Ethernet prerequisite,
-manual leader/shoulder readiness questions, new cutoff hardware or architecture.
-Root alone performs Git mutations, SSH, staging and devices. Agents own explicit
-disjoint offline edits/tests. Use PowerShell7 and existing uv run --no-sync
---project C:/Users/pickm/lerobot_alohamini_client environment.
-
-Durability means software fault tolerance, control/connection continuity, state
-preservation and recovery, not physical wear. Current evidence/commands and older
-failure/source-version pointers: docs/alohamini/teleop-consolidation-16.md.
-Historical packet restrictions stay historical. Preserve legacy manual rollback;
-never run it alongside the persistent motor owner.
+Use PowerShell7 and existing uv run --no-sync --project
+C:/Users/pickm/lerobot_alohamini_client. Run affected positive/fault-contrast checks
+and reuse the existing runner/stager. Generic upstream setup/test commands below
+are reference only for AM1 continuation: do not trigger broad installs or full
+repository suites without a demonstrated need. Reread amended guidance in this
+running conversation and give subagents relevant lesson IDs/files.
 
 This file provides guidance to AI agents when working with code in this repository.
 

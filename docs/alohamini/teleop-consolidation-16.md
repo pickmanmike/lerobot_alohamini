@@ -2,6 +2,12 @@
 
 Physical leaders are the primary input for ordinary teleoperation. An explicitly selected virtual-leader source substitutes at acquisition and uses the same mapping, authenticated transport and protected Pi-owned execution. The accepted elbow page presets remain useful diagnostic controls.
 
+## Active continuation — Packet18, 2026-10-17
+
+Read [current state](current-state.md) and [TEMP-01 and the retained lessons](decisions-and-lessons.md) first. Packet18 supersedes the proposed diagnostic-first Packet17. The accepted anomaly-confirmation policy must be carried into the new follower entrypoints; exact numeric-spike causation is not a prerequisite. The historical lift thresholds and the Packet18-authorized follower extension remain role-specific. Focused parity correction and subsequent operation are recorded in the active index.
+
+The Packet16 status/results below describe their original source versions, including the single-value guard then installed. Combined14/15 remain failed partial runs; no later policy change supplies their missing samples or makes them passing runs. The earlier diagnostic-first continuation language is historical, not current authority. Detailed commands below remain the existing shared-path procedure, subject to current-state deployment and qualification.
+
 ## Current status and source
 
 PR24 was integrated normally into `integrate/am1-local-teleop` at `386d3c376c51d3431cf379af61ab99be95382ab8`, after the published tree matched the exercised product and retained checks/reviews. This follow-up starts at that actual tip on `codex/am1-teleop-consolidation-16` and remains unmerged. Main and AM2 are unchanged.

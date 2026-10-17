@@ -24,7 +24,10 @@ class TemperatureWindow:
     MAX_AGE_S = 0.5
     CEILING_C = 55
 
-    def __init__(self) -> None:
+    def __init__(self, *, ceiling_c: int = CEILING_C) -> None:
+        if type(ceiling_c) is not int or not 0 < ceiling_c <= 100:
+            raise ValueError("Temperature confirmation needs an explicit valid role ceiling.")
+        self.ceiling_c = ceiling_c
         # Each entry is the actual peak reading/time in one occupied 100 ms
         # slot. Faster polling cannot create extra votes or erase a slot's high.
         self.samples: deque[tuple[float, int]] = deque(maxlen=self.SIZE)
@@ -92,11 +95,13 @@ class TemperatureWindow:
         self._last_sample_at = now
         if now - self.samples[0][0] > self.MAX_AGE_S:
             self.refuse("temperature: five-slot feedback window is stale (>0.5 s).")
-        if value >= self.CEILING_C:
+        if value >= self.ceiling_c:
             self.outliers += 1  # Includes the actual refusal-causing raw reading.
-        high = sum(temperature >= self.CEILING_C for _, temperature in self.samples)
+        high = sum(temperature >= self.ceiling_c for _, temperature in self.samples)
         if self.ready and high >= 3:
-            self.refuse("temperature: majority (3/5 time slots) at or above 55 C; stop latched.")
+            self.refuse(
+                f"temperature: majority (3/5 time slots) at or above {self.ceiling_c} C; stop latched."
+            )
         if self.ready and cold_start and sum(t > feedback.COOL_START_C for _, t in self.samples) >= 3:
             self.refuse("temperature: confirmed starting temperature exceeds 40 C.")
         return {
@@ -167,6 +172,12 @@ class OperationalLift(InstalledLiftCheck):
             record["temperature_slot_s"] = self.temperature.SLOT_S
             record["numeric_outlier_count"] = self.temperature.outliers
             raise
+        if getattr(self.robot, "_am1_teleop_startup_temperature", False):
+            # Same owner, no recursive lift poll. Keep follower history continuous
+            # through finite lift home/relief before ordinary Live polling owns it.
+            from .am1_live_teleop import refresh_startup_temperatures
+
+            refresh_startup_temperatures(self.robot)
         if record["temperature_c"] >= 55 and now - self._last_warning >= 1.0:
             self.monitor.record(
                 "temperature_warning", event="temperature_outlier",

@@ -1,5 +1,6 @@
 """Installed role settings remain unchanged by Packet16 startup."""
 
+from unittest.mock import patch
 from uuid import uuid4
 
 import pytest
@@ -7,7 +8,7 @@ import pytest
 from tests.robots.test_am1_pre_activation import activation as activation
 
 
-def configured_robot(activation):
+def configured_robot(activation, *, initial_temperature=28):
     robot = activation.robot
     robot.config.no_follower = False
     robot.config.use_degrees = False
@@ -41,17 +42,24 @@ def configured_robot(activation):
                 "Min_Voltage_Limit": 40,
                 "Max_Voltage_Limit": 140,
                 "Status": 0,
-                "Present_Temperature": 28,
+                "Present_Temperature": initial_temperature,
                 "Present_Voltage": 120,
                 "Present_Current": 2,
             }.items():
                 bus.registers[register, name] = value
 
         def grouped(register, names, *, normalize=True, _bus=bus, **kwargs):
-            return {name: _bus.read(register, name, normalize=normalize) for name in names}
+            values = {name: _bus.read(register, name, normalize=normalize) for name in names}
+            activation.clock.now += 0.000001  # Synthetic finite original transaction.
+            return values
 
         bus.sync_read = grouped
-    robot.configure()
+    activation.clock.now = 99.599
+    with patch("time.sleep", side_effect=lambda seconds: setattr(
+        activation.clock, "now", activation.clock.now + seconds
+    )):
+        robot.configure()
+    activation.clock.now = 100.0
     for bus in (robot.left_bus, robot.right_bus):
         from lerobot.motors.feetech.tables import MODEL_CONTROL_TABLE
         from lerobot.motors.motors_bus import MotorsBus
@@ -136,6 +144,19 @@ def sdk_bus(robot, side, packets):
     return bus
 
 
+def prime_thermal_highs(activation, robot, name="arm_left_shoulder_pan", value=70):
+    """Synthetic preceding high slots; the original wire fixture remains final."""
+    from lerobot.robots.alohamini.am1_live_teleop import read_groups
+
+    side = "left" if name.startswith("arm_left_") else "right"
+    bus = getattr(robot, side + "_bus")
+    bus.registers["Present_Temperature", name] = value
+    for when in (100.1, 100.2):
+        activation.clock.now = when
+        read_groups(robot, ("Present_Temperature",))
+    activation.clock.now = 100.3
+
+
 @pytest.mark.parametrize("payload", [[], [28]])
 def test_group_reply_device_error_precedes_sdk_checksum_as_data(activation, payload):
     robot = configured_robot(activation)
@@ -161,6 +182,7 @@ def test_group_reply_real126_still_reaches_original_thermal_guard(activation):
     from lerobot.robots.alohamini.am1_live_teleop import read_groups
 
     robot = configured_robot(activation)
+    prime_thermal_highs(activation, robot, value=126)
     bus = sdk_bus(robot, "left", [reply_packet(i, [126 if i == 1 else 28]) for i in range(1, 7)])
     original_rx = bus.packet_handler.rxPacket
     with pytest.raises(RuntimeError, match="actual configured temperature limit") as caught:
@@ -173,8 +195,8 @@ def test_group_reply_real126_still_reaches_original_thermal_guard(activation):
     assert transaction["packets"][0]["packet"] == [255, 255, 1, 3, 0, 126, 125]
     assert transaction["packets"][0]["device_error"] == 0
     assert transaction["binding"] == robot._am1_teleop_binding
-    assert transaction["group_call_started_at_monotonic_s"] == 100
-    assert transaction["group_call_completed_at_monotonic_s"] == 100
+    assert transaction["group_call_started_at_monotonic_s"] == 100.3
+    assert transaction["group_call_completed_at_monotonic_s"] == 100.3
     assert bus.packet_handler.rxPacket == original_rx
     assert len(bus.port_handler.writes) == bus.port_handler.clears == 1
 
@@ -219,6 +241,8 @@ def test_installed_health_limits_remain_effective(activation, register, raw, rea
     from lerobot.robots.alohamini.am1_live_teleop import poll_health
 
     robot = configured_robot(activation)
+    if register == "Present_Temperature":
+        prime_thermal_highs(activation, robot, "arm_left_gripper")
     for bus in (robot.left_bus, robot.right_bus):
         for name in bus.calibration:
             bus.registers["Torque_Enable", name] = bus.registers["Lock", name] = 1
@@ -265,13 +289,18 @@ def test_fault_note_exports_original_row_interval_binding_and_installed_comparat
     from lerobot.robots.alohamini.am1_live_teleop import HEALTH, poll_health, read_groups
 
     robot = configured_robot(activation)
+    if register == "Present_Temperature" and value >= 70:
+        prime_thermal_highs(activation, robot)
+    elif register != "Present_Temperature":
+        prime_thermal_highs(activation, robot, value=28)
     for bus in (robot.left_bus, robot.right_bus):
         for name in bus.calibration:
             bus.registers["Torque_Enable", name] = bus.registers["Lock", name] = 1
     motor = "arm_left_shoulder_pan"
     robot.left_bus.registers[register, motor] = value
     binding = dict(robot._am1_teleop_binding)
-    activation.clock.now = 120.0
+    activation.clock.now = 100.3
+    robot._am1_teleop_startup_temperature = False
     robot.left_bus.on_read = lambda *_: setattr(activation.clock, "now", activation.clock.now + 0.001)
     robot.right_bus.sync_read = lambda *_, **__: pytest.fail("fault must precede later right-bus reads")
     boundary = len(activation.events)
@@ -294,12 +323,12 @@ def test_fault_note_exports_original_row_interval_binding_and_installed_comparat
     if value < 0:
         assert len(reads) == 6 * len(expected) and all(event[0:2] == ("read", "left") for event in reads)
         assert [event[2] for event in reads] == [key for key in expected for _ in range(6)]
-        assert snapshot["read_started_at_monotonic_s"] == pytest.approx(120 + 0.006 * (len(expected) - 1))
-        assert snapshot["read_completed_at_monotonic_s"] == pytest.approx(120 + 0.006 * len(expected))
+        assert snapshot["read_started_at_monotonic_s"] == pytest.approx(100.3 + 0.006 * (len(expected) - 1))
+        assert snapshot["read_completed_at_monotonic_s"] == pytest.approx(100.3 + 0.006 * len(expected))
     else:
         assert reads == [("group_read", "left", 33, 38, (1, 2, 3, 4, 5, 6))]
-        assert snapshot["read_started_at_monotonic_s"] == 120
-        assert snapshot["read_completed_at_monotonic_s"] == pytest.approx(120.001)
+        assert snapshot["read_started_at_monotonic_s"] == 100.3
+        assert snapshot["read_completed_at_monotonic_s"] == pytest.approx(100.301)
         assert snapshot["group_reply"]["request"]["width"] == 38
         assert not robot.right_bus.port_handler.writes
     comparison = snapshot["comparison"]
@@ -318,20 +347,11 @@ def test_fault_note_exports_original_row_interval_binding_and_installed_comparat
 
 
 def test_fault_note_initial_settings_uses_original_current_capture_without_cached_baseline(activation):
-    from lerobot.robots.alohamini.am1_live_teleop import prepare_settings
-
-    robot = configured_robot(activation)
-    del robot._am1_teleop_settings
-    robot.left_bus.registers["Present_Temperature", "arm_left_shoulder_pan"] = 70
-    activation.clock.now = 121.0
     with pytest.raises(RuntimeError, match="temperature") as caught:
-        prepare_settings(robot)
+        configured_robot(activation, initial_temperature=70)
     limit = fault_note(caught.value)["comparison"]["configured"]["Max_Temperature_Limit"]
-    assert limit == {
-        "value": 70,
-        "read_started_at_monotonic_s": 121.0,
-        "read_completed_at_monotonic_s": 121.0,
-    }
+    assert limit["value"] == 70
+    assert 99.599 <= limit["read_started_at_monotonic_s"] < limit["read_completed_at_monotonic_s"] < 99.6
 
 
 def test_fault_note_first_snapshot_survives_mutation_and_actual_cleanup_export(activation, tmp_path):
@@ -344,6 +364,7 @@ def test_fault_note_first_snapshot_survives_mutation_and_actual_cleanup_export(a
     from lerobot.robots.alohamini.am1_live_teleop import poll_health
 
     robot = configured_robot(activation)
+    prime_thermal_highs(activation, robot)
     motor = "arm_left_shoulder_pan"
     robot.left_bus.registers["Present_Temperature", motor] = 70
     with pytest.raises(RuntimeError, match="temperature") as caught:
@@ -382,6 +403,7 @@ def test_fault_note_failure_cannot_replace_original_guard(activation, monkeypatc
     from lerobot.robots.alohamini import am1_live_teleop as helper
 
     robot = configured_robot(activation)
+    prime_thermal_highs(activation, robot)
     motor = "arm_left_shoulder_pan"
     robot.left_bus.registers["Present_Temperature", motor] = 70
 
@@ -424,6 +446,8 @@ def test_fault_note_malformed_baseline_timing_cannot_replace_proven_guard(activa
     from lerobot.robots.alohamini.am1_live_teleop import check_sampled_current, poll_health
 
     robot = configured_robot(activation)
+    if kind == "temperature":
+        prime_thermal_highs(activation, robot)
     motor = "arm_left_shoulder_pan"
     robot._am1_teleop_settings["left"]["timing"] = None
     robot.left_bus.registers["Present_Temperature", motor] = 70
@@ -516,7 +540,7 @@ def test_rest_fault_or_unstable_series_refuses_without_arm_goals(activation, mon
             "status": ("Status", 1),
             "current": ("Present_Current", 24),
             "velocity": ("Present_Velocity", 1),
-            "temperature": ("Present_Temperature", 60),
+            "temperature": ("Present_Temperature", 70),
             "voltage": ("Present_Voltage", 39),
             "settings": ("P_Coefficient", 25),
         }
@@ -991,6 +1015,7 @@ def test_group_reply_packet_snapshot_does_not_follow_later_mutation(activation):
     from lerobot.robots.alohamini.am1_live_teleop import read_groups
 
     robot = configured_robot(activation)
+    prime_thermal_highs(activation, robot, value=126)
     sdk_bus(robot, "left", [reply_packet(i, [126 if i == 1 else 28]) for i in range(1, 7)])
     with pytest.raises(RuntimeError, match="temperature") as caught:
         read_groups(robot, ("Present_Temperature",))
@@ -1149,6 +1174,7 @@ def test_group_reply_real98_thermal_fault_retains_exact_original_tx_and_rx(activ
     from lerobot.robots.alohamini.am1_live_teleop import read_groups
 
     robot = configured_robot(activation)
+    prime_thermal_highs(activation, robot, "arm_left_elbow_flex", value=98)
     packets = [reply_packet(i, [98 if i == 3 else 28]) for i in range(1, 7)]
     bus = sdk_bus(robot, "left", packets)
     original_write = bus.port_handler.writePort
@@ -1159,8 +1185,8 @@ def test_group_reply_real98_thermal_fault_retains_exact_original_tx_and_rx(activ
     receipt = note["group_reply"]
     assert receipt["transmit"]["packet"] == [255, 255, 254, 10, 130, 63, 1, 1, 2, 3, 4, 5, 6, 32]
     assert receipt["transmit"]["result"] == 14
-    assert receipt["transmit"]["write_started_at_monotonic_s"] == 100
-    assert receipt["transmit"]["write_completed_at_monotonic_s"] == 100
+    assert receipt["transmit"]["write_started_at_monotonic_s"] == 100.3
+    assert receipt["transmit"]["write_completed_at_monotonic_s"] == 100.3
     assert receipt["packets"][2]["packet"] == [255, 255, 3, 3, 0, 98, 151]
     assert bus.port_handler.writePort == original_write
     assert bus.port_handler.writes == [receipt["transmit"]["packet"]]
@@ -1266,7 +1292,7 @@ def test_fault_note_prior_successful_health_keeps_original_binding_value_and_tim
     robot = configured_robot(activation)
     complete_health(robot)
     binding = dict(robot._am1_teleop_binding)
-    activation.clock.now = 100.5
+    prime_thermal_highs(activation, robot, "arm_left_elbow_flex", value=98)
     robot.left_bus.registers["Present_Temperature", "arm_left_elbow_flex"] = 98
     boundary = len(activation.events)
     with pytest.raises(RuntimeError, match="actual configured temperature limit") as caught:
@@ -1281,7 +1307,7 @@ def test_fault_note_prior_successful_health_keeps_original_binding_value_and_tim
         "read_started_at_monotonic_s": 100,
         "read_completed_at_monotonic_s": 100,
     }
-    assert note["offending_value"] == 98 and note["read_started_at_monotonic_s"] == 100.5
+    assert note["offending_value"] == 98 and note["read_started_at_monotonic_s"] == 100.3
     assert activation.events[boundary:] == [("group_read", "left", 33, 38, (1, 2, 3, 4, 5, 6))]
     assert note["group_reply"]["request"]["width"] == 38
     assert robot._am1_teleop_health["binding"] == binding
@@ -1298,6 +1324,7 @@ def test_fault_note_does_not_attribute_unproven_prior_health(activation, problem
 
     robot = configured_robot(activation)
     complete_health(robot)
+    prime_thermal_highs(activation, robot, "arm_left_elbow_flex", value=98)
     # Historical untagged records are explicitly unavailable, never guessed as current.
     if problem == "missing_binding":
         robot._am1_teleop_health.pop("binding", None)
@@ -1472,6 +1499,7 @@ def test_live_health_valid_wide74_still_faults_with_original_tx_rx_and_limit(act
     from lerobot.robots.alohamini.am1_live_teleop import poll_health
 
     robot = configured_robot(activation)
+    prime_thermal_highs(activation, robot, "arm_left_shoulder_lift", value=74)
     packets = [reply_packet(i, live_health_payload(temperature=74 if i == 2 else 34)) for i in range(1, 7)]
     left = live_health_bus(robot, "left", packets)
     right = live_health_bus(robot, "right", [])
