@@ -597,7 +597,6 @@ class SameRunRecovery:
                     not refusal_identity
                     or run["intent_revision"] != refusal_identity.get("intent_revision", -2) + 1
                 )
-                or self.pause_recoveries >= 3
             ):
                 raise RuntimeError(
                     "original native recovery descriptor/current cause-specific pause unavailable"
@@ -997,7 +996,6 @@ async def run(args):
                     or cause not in {"required_view_expired", "input_expired", "native_input_expired"}
                     or not recovery.history_qualified(state)
                     or state["run"].get("uncertain")
-                    or recovery.pause_recoveries >= 3
                 ):
                     raise RuntimeError(
                         "input held: "
@@ -1194,7 +1192,7 @@ async def run(args):
         if recovery:
             summary.update(
                 qualified_native_recovery_episodes=recovery.episodes,
-                qualified_recoveries=recovery.pause_recoveries,
+                ordinary_pauses_observed=recovery.pause_recoveries,
             )
     finally:
 

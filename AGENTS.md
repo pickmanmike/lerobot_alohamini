@@ -29,13 +29,13 @@ required local observation/diagnostic evidence. Decoded progress/source age and
 camera generations remain distinct from control health. Keep media/routine logs
 outside motor polling; optional output cannot consume unrelated recovery budgets.
 
-Installed motor 2c5b12be35567d4e942a557e8add4793f38c3755,
+Installed motor 2fbc8265b15393dcc799e603223b8902844e2919,
 runtime 68118e4e9dddf8dddaa3ea6cbf64f54fdd511980,
 camera bc3442b54d9c574a8feddb0ade642c9b351e59f9,
-manifest c7e1e65609fb0b45007dc35a7c6ba41160b2231c9aadc459c74cee67fe8c8983.
+manifest 1d64de8e1e2f05938a39fae7a67a9a3ff3b19f94ae456f311116c41e52bbbd57.
 Helper/manual 0fe3997f and original calibration/private trust remain unchanged.
-Full matched rollback: motor168915d04a9345e5b064a3d23142999f5c96b8e1,
-same runtime/camera, manifest7964ad0623af7589b944ec3cbe2975ee2a86050a265c833769ea99979875416d.
+Full matched rollback: motor2c5b12be35567d4e942a557e8add4793f38c3755,
+same runtime/camera, manifestc7e1e65609fb0b45007dc35a7c6ba41160b2231c9aadc459c74cee67fe8c8983.
 Stage10 verified actual owner runtime/src/client9315af5b import; nine native
 request-accounting cases passed. Combined11 reached Live/255 accepted frames and
 24.44 active PC seconds, then stopped on valid left-elbow temperature98 versus70.
@@ -47,6 +47,12 @@ Live on post-home readiness: first reported+150 then stable814..815, while the
 existing fallback admits only exact first+100. Its original fault/cleanup remain;
 replace the brittle fingerprint using the existing homing envelope and retain
 all subsequent stationary, geometry, health and original deadline requirements.
+That v5 correction passed469 tests/4 existing platform skips and stage12
+idle-only checks. Combined13 reached Live/18.014 active seconds, then the PC
+refused the fourth ordinary expiry hold and stopped. Native/Core fault causes stayed
+null and Core recovery episodes stayed0; cleanup verified. Ordinary qualified
+expiry-pause counts are diagnostic; preserve the native bounded-episode budget
+and original run deadline without adding a PC pause-count quota. The PC-only correction removes both quota predicates;67 focused adapter tests passed, including four ordinary rejoins and the unchanged real Core3/4 episode boundary. No native restaging is needed for this producer-only correction.
 
 Tasks stay stopped for source edits and affected-component staging. Verify actual
 owner imports, preserve separate full matched rollback bundles, calibration and

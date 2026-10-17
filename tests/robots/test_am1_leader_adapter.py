@@ -491,6 +491,8 @@ def test_real_wss_clean_close_ends_qualified_wait_before_timeout(tmp_path):
         "recovery_wall",
         "zero_deadline_rounding",
         "zero_inner_timeout",
+        "ordinary_pauses",
+        "ordinary_pauses_no_ack",
     ],
 )
 def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id(
@@ -513,8 +515,9 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
     wall_budget = failure in {"expired_next_budget", "expired_usb_budget"}
     foreign_boundary = failure == "expired_foreign_budget"
     recovery_case = failure in {"recovery", "recovery_fault", "recovery_wall"}
+    ordinary_case = failure in {"ordinary_pauses", "ordinary_pauses_no_ack"}
     pc_clock = [10.0]
-    if recovery_case or failure in {"zero_deadline_rounding", "zero_inner_timeout"}:
+    if recovery_case or ordinary_case or failure in {"zero_deadline_rounding", "zero_inner_timeout"}:
         import time
 
         # Advance only the PC's program clock, leaving asyncio scheduling and
@@ -672,9 +675,11 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
             assert self.snapshot["run"]["run_id"] == owned_id
             if check:
                 check(self.snapshot)
-            if recovery_case:
+            if recovery_case or ordinary_case:
                 assert self.snapshot["run"]["status"] != "recovering"
                 self.resumes += 1
+                if failure == "ordinary_pauses_no_ack" and self.resumes == 5:
+                    raise TimeoutError("unqualified ordinary held ACK")
                 self.snapshot["run"]["status"] = "running"
                 self.snapshot["run"]["intent_revision"] += 2
                 self.snapshot["run"]["live_input"]["cursor_intent_revision"] = self.snapshot["run"][
@@ -737,17 +742,26 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 )
             if dropped or recovery_case:
                 await asyncio.sleep(0.01)
-            if recovery_case or failure in {"zero_deadline_rounding", "zero_inner_timeout"}:
+            if recovery_case or ordinary_case or failure in {"zero_deadline_rounding", "zero_inner_timeout"}:
                 pc_clock[0] += 0.01
             self.snapshot["run"]["live_input"].update(
                 last_input_seq=payload["seq"], source=payload["source"], body=payload["body"]
             )
             self.snapshot["evidence"]["measured_positions"] = payload["target"]
+            if ordinary_case and len(self.inputs) <= 4:
+                self.snapshot["run"].update(
+                    status="paused", intent_revision=self.snapshot["run"]["intent_revision"] + 1
+                )
+                self.snapshot["events"] = [
+                    {"kind": "input_expired", "at": 2.0, "run_id": owned_id, "service_incarnation": "service"}
+                ]
             return {"accepted": True}
 
         async def get(self, op):
             assert op == "state"
             self.cleanup_reads += 1
+            if ordinary_case and not self.stops:
+                pc_clock[0] += 0.05  # Held reads must not add active workload time.
             if recovery_case and self.authoritative is not None and not self.stops:
                 pc_clock[0] += 0.05
                 self.recovery_reads += 1
@@ -804,7 +818,10 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
     monkeypatch.setattr(m, "USBLeaderSource", Input)
     args = SimpleNamespace(
         source="usb-leaders"
-        if failure and not recovery_case and (not dropped or failure == "expired_usb_budget")
+        if failure
+        and not recovery_case
+        and not ordinary_case
+        and (not dropped or failure == "expired_usb_budget")
         else "virtual-leaders",
         output=str(tmp_path / "evidence"),
         url="unused",
@@ -830,6 +847,31 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
         args.duration_seconds = 0.03
     if foreign_boundary:
         args.next_start_seconds = 0.001
+    if ordinary_case:
+        args.next_start_seconds, args.duration_seconds = None, 0.05
+        if failure == "ordinary_pauses_no_ack":
+            with pytest.raises(TimeoutError, match="unqualified ordinary held ACK"):
+                asyncio.run(asyncio.wait_for(m.run(args), 20))
+            import json
+
+            summary = json.loads((tmp_path / "evidence" / "summary.json").read_text())
+            assert summary["ordinary_pauses_observed"] == 4
+            assert "qualified_recoveries" not in summary
+            assert summary["failure_type"] == "TimeoutError"
+        else:
+            summary = asyncio.run(asyncio.wait_for(m.run(args), 20))
+            assert summary["qualified_recoveries"] == 4
+        assert summary["qualified_native_recovery_episodes"] == 0
+        assert summary["original_native_deadline"] == 301.0
+        assert summary["active_progress_s"] == pytest.approx(
+            0.04 if failure == "ordinary_pauses_no_ack" else 0.05
+        )
+        assert summary["frame_count"] == (4 if failure == "ordinary_pauses_no_ack" else 5)
+        assert summary["producer_program_complete"] is False
+        assert instances[0].resumes == 5 and instances[0].stops == [owned_id]
+        assert len({item["source"]["source_id"] for item in instances[0].inputs}) == 1
+        assert summary["cleanup_errors"] == []
+        return
     if recovery_case:
         args.next_start_seconds = 0.03 if failure == "recovery_wall" else None
         args.duration_seconds = 0.15 if failure == "recovery_fault" else 0.015
@@ -1270,7 +1312,7 @@ def test_same_run_recovery_waits_original_episode_then_current_held_proof(mutati
     asyncio.run(asyncio.wait_for(scenario(), 0.8))
 
 
-@pytest.mark.parametrize("mutation", ["manual", "foreign_event", "old_revision", "episode_jump", "quota"])
+@pytest.mark.parametrize("mutation", ["manual", "foreign_event", "old_revision", "episode_jump"])
 def test_grant_race_only_rejoins_current_ordinary_pause_with_unchanged_qualified_history(mutation):
     import asyncio
     import copy
@@ -1302,8 +1344,6 @@ def test_grant_race_only_rejoins_current_ordinary_pause_with_unchanged_qualified
 
     async def scenario():
         guard = m.SameRunRecovery(Client(), lambda value: None)
-        if mutation == "quota":
-            guard.pause_recoveries = 3
         with pytest.raises(RuntimeError, match="cause-specific pause"):
             await guard.resume(require_episode=True, refusal_identity={"intent_revision": 2})
 
@@ -1554,6 +1594,66 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
             )
             assert m._live(client.snapshot)["workspace"] == workspace()
             assert [(op, status) for op, status in commands if op == "connect"] == [("connect", "paused")] * 2
+            if cause == "view":
+                for pause in range(2, 5):
+                    a._teleop_view["qualified_until"] = 9.0
+                    with pytest.raises(m.CommandRefusedError) as later:
+                        await m.send_leader_sample(
+                            client, producer, m.ZERO_BODY, record, phase="individual", progress_s=0.02
+                        )
+                    assert m.recovery_grant_refusal(later.value)
+                    a._teleop_view["qualified_until"] = 10.5
+                    assert not await guard.resume(require_episode=True, refusal_identity=later.value.identity)
+                    producer.native_cursor = m._live(client.snapshot)["cursor"]
+                    producer.reacquire = True
+                    current = await m.send_leader_sample(
+                        client, producer, m.ZERO_BODY, record, phase="individual", progress_s=0.02
+                    )
+                    assert current[2]["accepted"] is True
+                    assert guard.pause_recoveries == pause and guard.episodes == 0
+                    assert a.run["deadline"] == 309.0 and a.run["native_live_at"] == 9.0
+                    assert m._live(client.snapshot)["workspace"] == workspace()
+                    assert m._live(client.snapshot)["reference"] == workspace()["reference"]
+                    assert current[1]["source"]["source_id"] == first[1]["source"]["source_id"]
+                assert producer.sequence == 5
+                assert [(op, status) for op, status in commands if op == "connect"] == [
+                    ("connect", "paused")
+                ] * 5
+            elif cause == "feedback":
+                for count in (2, 3):
+                    healthy[0] = False
+                    with pytest.raises(m.CommandRefusedError):
+                        await m.send_leader_sample(
+                            client, producer, m.ZERO_BODY, record, phase="individual", progress_s=0.02
+                        )
+                    assert a.run["status"] == "recovering" and a.run["recovery_episodes"] == count
+                    connects = sum(op == "connect" for op, _ in commands)
+
+                    async def qualify_current_episode(expected_connects=connects):
+                        await asyncio.sleep(0.06)
+                        assert a.run["status"] == "recovering"
+                        assert sum(op == "connect" for op, _ in commands) == expected_connects
+                        healthy[0] = True
+                        a.tick()
+
+                    qualification = asyncio.create_task(qualify_current_episode())
+                    assert await guard.resume(require_episode=True)
+                    await qualification
+                    assert guard.episodes == count and a.run["deadline"] == 309.0
+                    producer.native_cursor = m._live(client.snapshot)["cursor"]
+                    producer.reacquire = True
+                    current = await m.send_leader_sample(
+                        client, producer, m.ZERO_BODY, record, phase="individual", progress_s=0.02
+                    )
+                    assert current[2]["accepted"] is True
+                connects = sum(op == "connect" for op, _ in commands)
+                healthy[0] = False
+                a.tick()
+                assert a.run["recovery_episodes"] == 4 and a.run["requested_terminal"] == "faulted"
+                assert a.run["status"] in {"finishing", "faulted"}
+                with pytest.raises(RuntimeError, match="episode budget"):
+                    await guard.resume(require_episode=True)
+                assert sum(op == "connect" for op, _ in commands) == connects
         finally:
             if qualification:
                 qualification.cancel()
@@ -1564,3 +1664,62 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
             await owner.close()
 
     asyncio.run(asyncio.wait_for(scenario(), 5))
+
+
+@pytest.mark.parametrize("count", [3, 4])
+def test_ordinary_pause_counter_does_not_change_native_episode_three_limit(count):
+    m = adapter()
+    client = type("Client", (), {"snapshot": recovery_state(), "device": "device", "generation": "control"})()
+    guard = m.SameRunRecovery(client, lambda value: None)
+    guard.pause_recoveries, guard.episodes, guard.cause = 12, 3, "feedback_loss"
+    state = recovery_state()
+    state["run"].update(recovery_episodes=count, first_cause="feedback_loss")
+    if count == 3:
+        guard.check(state)
+    else:
+        with pytest.raises(RuntimeError, match="episode budget"):
+            guard.check(state)
+
+
+def test_fourth_ordinary_pause_still_requires_qualified_held_ack_before_resume():
+    import asyncio
+    import copy
+
+    m = adapter()
+    paused = recovery_state()
+    paused["run"].update(status="paused", intent_revision=3)
+    paused["events"] = [
+        {"kind": "input_expired", "at": 100.01, "run_id": "owned", "service_incarnation": "service"}
+    ]
+    paused["run"]["live_input"]["cursor_intent_revision"] = 3
+    paused["evidence"]["acknowledged_intent_revision"] = 3
+    paused["evidence"]["accepted_host_action"]["intent_revision"] = 3
+    paused["evidence"]["hold_acknowledged"] = False
+    commands = []
+
+    class Client:
+        snapshot = recovery_state()
+        device, generation, connection = "device", "control", "connection"
+        resume, identities = m.SessionClient.resume, m.SessionClient.identities
+
+        async def get(self, path):
+            return {"snapshot": copy.deepcopy(paused)}
+
+        async def command(self, payload):
+            commands.append(payload["op"])
+            assert payload["op"] != "resume"
+            return {"connection_generation": "connection", "snapshot": self.snapshot}
+
+        async def wait(self, predicate, timeout):
+            assert timeout == 8 and not predicate()
+            raise TimeoutError("held ACK remains unqualified")
+
+    async def scenario():
+        guard = m.SameRunRecovery(Client(), lambda value: None)
+        guard.pause_recoveries = 3
+        with pytest.raises(TimeoutError, match="held ACK"):
+            await guard.resume(require_episode=True, refusal_identity={"intent_revision": 2})
+        assert commands == ["connect", "release_input"]
+        assert guard.pause_recoveries == 4 and guard.episodes == 0
+
+    asyncio.run(scenario())
