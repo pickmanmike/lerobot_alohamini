@@ -29,13 +29,13 @@ required local observation/diagnostic evidence. Decoded progress/source age and
 camera generations remain distinct from control health. Keep media/routine logs
 outside motor polling; optional output cannot consume unrelated recovery budgets.
 
-Installed motor 2fbc8265b15393dcc799e603223b8902844e2919,
+Installed motor 6328bb524bc4e42c70f9896d66904177c1830277,
 runtime 68118e4e9dddf8dddaa3ea6cbf64f54fdd511980,
 camera bc3442b54d9c574a8feddb0ade642c9b351e59f9,
-manifest 1d64de8e1e2f05938a39fae7a67a9a3ff3b19f94ae456f311116c41e52bbbd57.
+manifest de681ad6f73f2639a1971b96eee41214b5edfdc1730082e7f77b78a3c6795dbb.
 Helper/manual 0fe3997f and original calibration/private trust remain unchanged.
-Full matched rollback: motor2c5b12be35567d4e942a557e8add4793f38c3755,
-same runtime/camera, manifestc7e1e65609fb0b45007dc35a7c6ba41160b2231c9aadc459c74cee67fe8c8983.
+Full matched rollback: motor2fbc8265b15393dcc799e603223b8902844e2919,
+same runtime/camera, manifest1d64de8e1e2f05938a39fae7a67a9a3ff3b19f94ae456f311116c41e52bbbd57.
 Stage10 verified actual owner runtime/src/client9315af5b import and nine native
 request-accounting cases. Original attempts01..14 remain retained by source version.
 Combined14 reached17.34 active seconds/180 Core frames; two ordinary expiry rejoins
@@ -50,7 +50,7 @@ acquisition intervals, all health limits and first causes; valid74 still faults.
 The stopped read-only comparison verified20 transactions/120 packets and supported
 field offsets with unchanged history/private state. Its cause relationship to
 Combined14 is unproved. The source passed160 affected tests and focused review;
-affected motor-only staging is next. Runtime/camera remain unchanged.
+all ten motor-only stage13 phases passed with no task started. Runtime/camera remain unchanged; the supported combined trial is next.
 Ordinary expiry pauses retain cause/current-feedback/ACK/expiry/deadline checks;
 no separate PC pause quota is imposed. The genuine native three-episode recovery
 budget remains. The PC-only correction passed67 focused adapter tests.
