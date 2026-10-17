@@ -8,7 +8,7 @@ import subprocess
 import sys
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from types import SimpleNamespace
 
 import pytest
@@ -218,3 +218,210 @@ def test_failed_connect_preserves_primary_and_reports_separate_cleanup_failure(t
     assert caught.value is reason
     assert closures == [0, 0]
     assert any("separate context cleanup failure" in note for note in reason.__notes__)
+
+
+@contextmanager
+def cadence_client(monkeypatch, *, host_period_s=0.078):
+    """Real inproc envelopes with deterministic synthetic host/worker timing."""
+    from collections import deque
+
+    from lerobot.robots.alohamini import alohamini_client as client_module
+
+    context = zmq.Context()
+    server, socket_ = context.socket(zmq.ROUTER), context.socket(zmq.DEALER)
+    for peer_socket in (server, socket_):
+        peer_socket.setsockopt(zmq.SNDHWM, 3)
+        peer_socket.setsockopt(zmq.RCVHWM, 3)
+        peer_socket.setsockopt(zmq.LINGER, 0)
+    server.bind("inproc://am1-original-request-cadence")
+    socket_.connect("inproc://am1-original-request-cadence")
+    clock = SimpleNamespace(now=0.0, next=0.035, served=0, retired=0)
+    client = object.__new__(AlohaMiniClient)
+    client.config = SimpleNamespace(robot_model="alohamini1")
+    client.zmq_observation_socket = socket_
+    client.observation_request_window = 3
+    client.polling_timeout_ms = 40
+    client._observation_request_tokens = deque()
+    client._observation_response_cache = {}
+    client._observation_request_sent_at = {}
+    client._observation_request_id = 0
+    client._last_response_request_sent_at = None
+
+    def advance(until, stop_on_reply=False):
+        while clock.next <= until:
+            clock.now = clock.next
+            clock.served += 1
+            clock.next += 0.035 if clock.served < 2 else host_period_s
+            if server.poll(0, zmq.POLLIN):
+                identity, token = server.recv_multipart()
+                if token not in client._observation_request_tokens:
+                    clock.retired += 1
+                with suppress(zmq.Again):  # Same bounded response drop as the host.
+                    server.send_multipart([identity, token, str(clock.served).encode()], zmq.NOBLOCK)
+            if stop_on_reply and socket_.poll(0, zmq.POLLIN):
+                return True
+        clock.now = until
+        return False
+
+    class Poller:
+        def register(self, socket, event):
+            assert socket is socket_ and event == zmq.POLLIN
+
+        def poll(self, milliseconds):
+            if socket_.poll(0, zmq.POLLIN) or advance(clock.now + milliseconds / 1000, True):
+                return [(socket_, zmq.POLLIN)]
+            return []
+
+    client._zmq = SimpleNamespace(
+        Poller=Poller, NOBLOCK=zmq.NOBLOCK, POLLIN=zmq.POLLIN, ZMQError=zmq.ZMQError, Again=zmq.Again
+    )
+    monkeypatch.setattr(client_module, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    try:
+        client._fill_observation_request_window()
+        yield SimpleNamespace(client=client, clock=clock, advance=advance, server=server)
+    finally:
+        socket_.close(0)
+        server.close(0)
+        context.term()
+
+
+@pytest.mark.parametrize("host_period_s", [0.035, 0.078])
+def test_am1_short_empty_polls_do_not_starve_original_inflight_requests(monkeypatch, host_period_s):
+    # Synthetic model: two quick availability replies then measured-scale78ms owner cycles.
+    # It is a deterministic queue regression, not a replay of actual09 wire packets.
+    with cadence_client(monkeypatch, host_period_s=host_period_s) as peer:
+        client, advanced = peer.client, []
+        for poll in range(120):
+            message = client._poll_and_get_latest_message()
+            if message is not None:
+                advanced.append(
+                    (poll, int(message[0]), peer.clock.now, client._last_response_request_sent_at)
+                )
+            assert len(client._observation_request_tokens) <= 3
+            assert len(client._observation_response_cache) <= 3
+            assert set(client._observation_request_sent_at) == set(client._observation_request_tokens)
+            peer.advance(peer.clock.now + 1 / 30)  # Existing worker wait after each bounded poll.
+        print(
+            {
+                "synthetic_host_period_s": host_period_s,
+                "polls": 120,
+                "advancing": len(advanced),
+                "served": peer.clock.served,
+                "retired_before_response": peer.clock.retired,
+                "last_advance_poll": advanced[-1][0] if advanced else None,
+            }
+        )
+        assert len(advanced) >= 60
+        assert advanced[-1][0] >= 115
+        assert all(0 <= received - requested < 1.0 for _, _, received, requested in advanced)
+
+
+def test_am1_empty_poll_retains_credit_and_original_timestamp(monkeypatch):
+    with cadence_client(monkeypatch) as peer:
+        peer.clock.next = 0.078
+        client = peer.client
+        original = tuple(client._observation_request_tokens)
+        timestamps = dict(client._observation_request_sent_at)
+        assert client._poll_and_get_latest_message() is None
+        assert tuple(client._observation_request_tokens) == original
+        assert client._observation_request_sent_at == timestamps
+        assert client._observation_request_id == 3
+        assert client._last_response_request_sent_at is None
+
+
+def test_am1_all_lost_credits_retry_only_at_original_one_second_and_recover(monkeypatch):
+    with cadence_client(monkeypatch) as peer:
+        peer.clock.next = 100.0  # This peer loses the entire first request window.
+        client = peer.client
+        for _ in range(3):
+            peer.server.recv_multipart(zmq.NOBLOCK)
+        assert client._poll_and_get_latest_message() is None
+        assert tuple(client._observation_request_tokens) == (b"1", b"2", b"3")
+        peer.clock.now = 0.95
+        assert client._poll_and_get_latest_message() is None
+        assert tuple(client._observation_request_tokens) == (b"1", b"2", b"3")
+        assert client._observation_request_sent_at == {b"1": 0.0, b"2": 0.0, b"3": 0.0}
+        peer.clock.now = 1.0
+        assert client._poll_and_get_latest_message() is None
+        assert tuple(client._observation_request_tokens) == (b"4", b"5", b"6")
+        assert client._observation_request_sent_at == {b"4": 1.0, b"5": 1.0, b"6": 1.0}
+        identity, token = peer.server.recv_multipart(zmq.NOBLOCK)
+        peer.server.send_multipart([identity, token, b"recovered"])
+        peer.clock.now = 1.1
+        assert client._poll_and_get_latest_message() == [b"recovered"]
+        assert client._last_response_request_sent_at == 1.0
+        assert len(client._observation_request_tokens) <= 3
+
+
+def test_am1_exactly_stale_cached_reply_is_excluded_before_later_fresh_selection(monkeypatch):
+    with cadence_client(monkeypatch) as peer:
+        peer.clock.next = 100.0
+        client = peer.client
+        requests = [peer.server.recv_multipart(zmq.NOBLOCK) for _ in range(3)]
+        identity = requests[0][0]
+        peer.server.send_multipart([identity, b"1", b"first"])
+        peer.clock.now = 0.8
+        assert client._poll_and_get_latest_message() == [b"first"]
+        assert peer.server.recv_multipart(zmq.NOBLOCK)[1] == b"4"
+        peer.server.send_multipart([identity, b"2", b"stale"])
+        peer.server.send_multipart([identity, b"4", b"fresh"])
+        client._drain_observation_responses(limit=3)
+        assert b"2" in client._observation_response_cache and b"4" in client._observation_response_cache
+        peer.clock.now = 1.0  # Token2 original request was at0, token4 at.8.
+        assert client._poll_and_get_latest_message() == [b"fresh"]
+        assert client._last_response_request_sent_at == 0.8
+        assert b"2" not in client._observation_response_cache
+        assert b"2" not in client._observation_request_sent_at
+        assert len(client._observation_request_tokens) <= 3
+
+
+def test_am1_explicit_retire_still_fences_late_pre_pause_reply(monkeypatch):
+    with cadence_client(monkeypatch) as peer:
+        peer.clock.next = 100.0
+        client = peer.client
+        identity = [peer.server.recv_multipart(zmq.NOBLOCK) for _ in range(3)][0][0]
+        peer.clock.now = 0.2
+        client.retire_observation_requests()
+        assert tuple(client._observation_request_tokens) == (b"4", b"5", b"6")
+        assert client._last_response_request_sent_at is None
+        peer.server.send_multipart([identity, b"1", b"late-before-pause"])
+        peer.server.send_multipart([identity, b"4", b"after-pause"])
+        peer.clock.now = 0.25
+        assert client._poll_and_get_latest_message() == [b"after-pause"]
+        assert client._last_response_request_sent_at == 0.2
+        assert b"1" not in client._observation_response_cache
+        assert set(client._observation_request_sent_at) == set(client._observation_request_tokens)
+
+
+def test_am1_failed_request_send_never_invents_credit_or_timestamp(monkeypatch):
+    with cadence_client(monkeypatch) as peer:
+        client = peer.client
+        client._observation_request_tokens.clear()
+        client._observation_request_sent_at.clear()
+        client.zmq_observation_socket = SimpleNamespace(
+            send=lambda *_args, **_kwargs: (_ for _ in ()).throw(zmq.Again())
+        )
+        client._fill_observation_request_window()
+        assert not client._observation_request_tokens
+        assert not client._observation_request_sent_at
+        assert not client._observation_response_cache
+
+
+def test_am2_empty_poll_retains_existing_one_missing_credit_retirement(monkeypatch):
+    with cadence_client(monkeypatch) as peer:
+        peer.clock.next = 100.0
+        client = peer.client
+        client.config.robot_model = "alohamini2"
+        assert client._poll_and_get_latest_message() is None
+        assert tuple(client._observation_request_tokens) == (b"2", b"3", b"4")
+        assert b"1" not in client._observation_request_sent_at
+
+
+def test_am1_reply_crossing_original_request_age_during_poll_is_excluded(monkeypatch):
+    with cadence_client(monkeypatch) as peer:
+        client = peer.client
+        peer.clock.now, peer.clock.next = 0.98, 1.01
+        assert client._poll_and_get_latest_message() is None
+        assert client._last_response_request_sent_at is None
+        assert not {b"1", b"2", b"3"}.intersection(client._observation_request_tokens)
+        assert all(sent >= 1.0 for sent in client._observation_request_sent_at.values())

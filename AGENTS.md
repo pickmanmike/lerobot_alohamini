@@ -30,26 +30,32 @@ valid required local observation/diagnostic evidence. Separate decoded view prog
 from capture freshness and motor health; optional loss cannot consume unrelated
 recovery budgets. Keep media work and routine logs outside the motor loop.
 
-Current known stopped deployment: motor ff9d5e460dd1a15b3b93abb387d7bf6bf78604a8,
+Current known stopped deployment: motor a7d17886de711f42618f581b3d226ff991cd4ed7,
 protected runtime 7447480924c288fed3a76fc981433b41c7bfcefe, camera
 bc3442b54d9c574a8feddb0ade642c9b351e59f9; manifest
-d20c49f53b8967f945f7e0b007d3df089b31861d71116929ee9ddf09b9064749.
+13012258179ddc6c2a8c28d4e50c1e48f886eeb1329ca404191e3336e498957d.
 Helper/manual remains 0fe3997f. Immediate matched rollback retains motor
-7d12ad1264750d64e0f8b40edc625e08974581c4 with the same runtime/camera and manifest
-e4e694ffbdfeb387c781e1bb3ab1ebc35cd79e506f88164f0ff424206ee0e1bf.
-Combined08 has verified cleanup after the left shoulder-pan temperature guard.
-The repaired original fault receipt records decoded grouped temperature126 against
-installed70, with other left-arm readings31..37. Actual physical temperature versus
-reply provenance remains unresolved; Combined07's trigger remains unknown. A prior
-stopped sole-owner236-read diagnostic found all20offzero,12healthyarms and five
-left-pan35 readings, without changing history or calibrations. Preserve both results.
-The representative workload and next Start remain unfinished. A stopped comparison
-retained360valid replies; decoded values matched their own payloads, without
-reproducing the active126 reading. A proven SDK short/error-reply decoding defect
-is being corrected at the AM1 group-read boundary, with original packet evidence
-and a sticky prewrite fault fence. Do not claim it caused Combined08. Retain the
-genuine thermal/status/current protections and original first causes; review and
-stage the focused integrity repair before another supported operating run.
+ff9d5e460dd1a15b3b93abb387d7bf6bf78604a8 with the same runtime/camera and manifest
+d20c49f53b8967f945f7e0b007d3df089b31861d71116929ee9ddf09b9064749.
+The AM1-only group-reply integrity repair and sticky prewrite fault fence passed
+119 focused tests and two independent reviews; all ten affected-motor stage08
+phases and persistent available-idle checks passed without starting hardware.
+Combined08's decoded shoulder-pan temperature126 versus installed70 remains
+unresolved actual wire provenance; Combined07's numeric trigger is still unknown.
+A stopped comparison retained360valid replies with values matching their own
+payloads, without reproducing the active126 reading. Preserve these distinctions.
+Combined09 reached post-home readiness but never admitted native Live: delivered
+feedback remained at sequence2 while the host continued normal acquisition.
+The original180s startup deadline ended it with physical_startup_timeout; original
+six artifacts and full native history are retained, cleanup physical_readback_verified,
+all20 off/zero readbacks, qualified lift, closed buses and clean camera release.
+The representative workload and next Start remain unfinished. A deterministic
+one-reply-per78ms test reproduced credit starvation (only2 advances/120polls).
+The reviewed AM1 client correction retained80advances with no premature retirement;
+110 focused connection/cadence tests pass. Retain credits until ORIGINAL request
+age1s, rather than retiring each40ms empty poll; never refresh timestamps. Three
+credits,40ms polls, original1s feedback and250ms input freshness remain unchanged.
+Stage only this client motor delta before the next supported combined trial.
 Preserve calibration, trust, private permissions, source imports and separate full
 component rollback bundles.
 Tasks stay stopped during editing/staging; services restore idle without replay.
