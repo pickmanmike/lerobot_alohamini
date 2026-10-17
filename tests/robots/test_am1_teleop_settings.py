@@ -113,6 +113,194 @@ def test_actual_hardware_current_limit_precedes_other_bus_failure(activation):
     assert robot._am1_teleop_fault["raw"]["arm_left_gripper"] == 311
 
 
+def fault_note(error):
+    import json
+
+    prefix = "[AM1 TELEOP FAULT] "
+    notes = [note for note in getattr(error, "__notes__", []) if note.startswith(prefix)]
+    assert len(notes) == 1, "original AM1 fault snapshot must survive the existing exception path"
+    assert len(notes[0].encode("utf-8")) <= 16384
+    return json.loads(notes[0][len(prefix) :])
+
+
+@pytest.mark.parametrize(
+    ("register", "value", "reason", "configured"),
+    [
+        ("Present_Temperature", 70, "temperature", {"Max_Temperature_Limit": 70}),
+        ("Present_Temperature", -1, "temperature", {"Max_Temperature_Limit": 70}),
+        ("Present_Voltage", 39, "voltage", {"Min_Voltage_Limit": 40, "Max_Voltage_Limit": 140}),
+        ("Status", 1, "status", {}),
+        ("Torque_Enable", 0, "torque/lock", {}),
+        ("Lock", 0, "torque/lock", {}),
+        ("Operating_Mode", 1, "operating mode", {}),
+    ],
+)
+def test_fault_note_exports_original_row_interval_binding_and_installed_comparator(
+    activation, register, value, reason, configured
+):
+    from lerobot.robots.alohamini.am1_live_teleop import HEALTH, poll_health
+
+    robot = configured_robot(activation)
+    for bus in (robot.left_bus, robot.right_bus):
+        for name in bus.calibration:
+            bus.registers["Torque_Enable", name] = bus.registers["Lock", name] = 1
+    motor = "arm_left_shoulder_pan"
+    robot.left_bus.registers[register, motor] = value
+    binding = dict(robot._am1_teleop_binding)
+    activation.clock.now = 120.0
+    robot.left_bus.on_read = lambda *_: setattr(activation.clock, "now", activation.clock.now + 0.001)
+    robot.right_bus.sync_read = lambda *_, **__: pytest.fail("fault must precede later right-bus reads")
+    boundary = len(activation.events)
+    with pytest.raises(RuntimeError, match=reason) as caught:
+        poll_health(robot)
+    snapshot = fault_note(caught.value)
+    assert snapshot == robot._am1_teleop_fault
+    assert snapshot["binding"] == binding
+    assert snapshot["register"] == register and snapshot["offending_motor"] == motor
+    assert snapshot["offending_value"] == snapshot["raw"][motor] == value
+    assert set(snapshot["raw"]) == set(robot.left_arm_motors)
+    order = (*HEALTH, "Operating_Mode")
+    expected = order[: order.index(register) + 1]
+    reads = activation.events[boundary:]
+    assert len(reads) == 6 * len(expected) and all(event[0:2] == ("read", "left") for event in reads)
+    assert [event[2] for event in reads] == [key for key in expected for _ in range(6)]
+    assert snapshot["read_started_at_monotonic_s"] == pytest.approx(120 + 0.006 * (len(expected) - 1))
+    assert snapshot["read_completed_at_monotonic_s"] == pytest.approx(120 + 0.006 * len(expected))
+    comparison = snapshot["comparison"]
+    assert comparison["units"] == "raw_register"
+    if register == "Present_Temperature":
+        assert comparison["lower_inclusive"] == 0 and comparison["upper_exclusive"] == 70
+    elif register == "Present_Voltage":
+        assert comparison["lower_inclusive"] == 40 and comparison["upper_inclusive"] == 140
+    else:
+        assert comparison["expected"] == (1 if register in ("Torque_Enable", "Lock") else 0)
+    assert {key: row["value"] for key, row in comparison.get("configured", {}).items()} == configured
+    for key, row in comparison.get("configured", {}).items():
+        assert {
+            name: row[name] for name in robot._am1_teleop_settings["left"]["timing"][key]
+        } == robot._am1_teleop_settings["left"]["timing"][key]
+
+
+def test_fault_note_initial_settings_uses_original_current_capture_without_cached_baseline(activation):
+    from lerobot.robots.alohamini.am1_live_teleop import prepare_settings
+
+    robot = configured_robot(activation)
+    del robot._am1_teleop_settings
+    robot.left_bus.registers["Present_Temperature", "arm_left_shoulder_pan"] = 70
+    activation.clock.now = 121.0
+    with pytest.raises(RuntimeError, match="temperature") as caught:
+        prepare_settings(robot)
+    limit = fault_note(caught.value)["comparison"]["configured"]["Max_Temperature_Limit"]
+    assert limit == {
+        "value": 70,
+        "read_started_at_monotonic_s": 121.0,
+        "read_completed_at_monotonic_s": 121.0,
+    }
+
+
+def test_fault_note_first_snapshot_survives_mutation_and_actual_cleanup_export(activation, tmp_path):
+    import copy
+    import json
+    import traceback
+    from types import SimpleNamespace
+
+    from lerobot.robots.alohamini.alohamini_host import write_am1_cleanup_receipt
+    from lerobot.robots.alohamini.am1_live_teleop import poll_health
+
+    robot = configured_robot(activation)
+    motor = "arm_left_shoulder_pan"
+    robot.left_bus.registers["Present_Temperature", motor] = 70
+    with pytest.raises(RuntimeError, match="temperature") as caught:
+        poll_health(robot)
+    first = caught.value
+    original = copy.deepcopy(fault_note(first))
+    rendered = "".join(traceback.format_exception(first))
+    assert str(first) in rendered and first.__notes__[0] in rendered
+    robot.left_bus.registers["Status", motor] = 1
+    robot._am1_teleop_binding["run_id"] = str(uuid4())
+    robot._am1_teleop_settings["left"]["registers"]["Max_Temperature_Limit"][motor] = 99
+    with pytest.raises(RuntimeError, match="status") as later:
+        poll_health(robot)
+    assert fault_note(later.value) == fault_note(first) == robot._am1_teleop_fault == original
+    robot._am1_shutdown_evidence = {"verified": False, "buses_closed": False}
+    path = tmp_path / "cleanup.json"
+    args = SimpleNamespace(
+        am1_run_id=original["binding"]["run_id"],
+        am1_host_incarnation=original["binding"]["host_incarnation"],
+        am1_cleanup_receipt=path,
+    )
+    receipt = write_am1_cleanup_receipt(args, robot, first, [])
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved == receipt
+    assert receipt["first_cause"] == "RuntimeError: " + str(first)
+    assert receipt["uncertain"] is True and receipt["cleanup"] == "physical_cleanup_unknown"
+    assert receipt["first_error_chain"][0]["notes"] == first.__notes__
+    assert json.loads(receipt["first_error_chain"][0]["notes"][0].split("] ", 1)[1]) == original
+
+
+@pytest.mark.parametrize("problem", ["serialization", "oversized"])
+def test_fault_note_failure_cannot_replace_original_guard(activation, monkeypatch, problem):
+    from lerobot.robots.alohamini import am1_live_teleop as helper
+
+    robot = configured_robot(activation)
+    motor = "arm_left_shoulder_pan"
+    robot.left_bus.registers["Present_Temperature", motor] = 70
+
+    def encode(*args, **kwargs):
+        if problem == "serialization":
+            raise ValueError("diagnostic serialization failed")
+        return "x" * 16385
+
+    monkeypatch.setattr(helper.json, "dumps", encode)
+    with pytest.raises(
+        RuntimeError, match="AM1 teleop actual configured temperature limit: " + motor
+    ) as caught:
+        helper.poll_health(robot)
+    assert robot._am1_teleop_fault["raw"][motor] == 70
+    assert robot._am1_teleop_fault["offending_motor"] == motor
+    assert not getattr(caught.value, "__notes__", [])
+
+
+def test_fault_note_current_uses_actual_installed_raw_limit_without_later_io(activation):
+    from lerobot.robots.alohamini.am1_live_teleop import check_sampled_current
+
+    robot = configured_robot(activation)
+    values = dict.fromkeys(robot.left_arm_motors, 2)
+    values["arm_left_gripper"] = 311
+    boundary = len(activation.events)
+    with pytest.raises(RuntimeError, match="current") as caught:
+        check_sampled_current(robot, "left", values, 122.0, 122.003)
+    snapshot = fault_note(caught.value)
+    assert snapshot["raw"] == values and snapshot["offending_motor"] == "arm_left_gripper"
+    assert snapshot["comparison"]["absolute_upper_exclusive"] == 310
+    assert snapshot["comparison"]["configured"]["Protection_Current"]["value"] == 310
+    assert snapshot["comparison"]["units"] == "raw_register"
+    assert snapshot["read_started_at_monotonic_s"] == 122.0
+    assert snapshot["read_completed_at_monotonic_s"] == 122.003
+    assert activation.events[boundary:] == []
+
+
+@pytest.mark.parametrize("kind", ["temperature", "current"])
+def test_fault_note_malformed_baseline_timing_cannot_replace_proven_guard(activation, kind):
+    from lerobot.robots.alohamini.am1_live_teleop import check_sampled_current, poll_health
+
+    robot = configured_robot(activation)
+    motor = "arm_left_shoulder_pan"
+    robot._am1_teleop_settings["left"]["timing"] = None
+    robot.left_bus.registers["Present_Temperature", motor] = 70
+    with pytest.raises(RuntimeError, match="actual configured " + kind) as caught:
+        if kind == "temperature":
+            poll_health(robot)
+        else:
+            values = dict.fromkeys(robot.left_arm_motors, 2)
+            values[motor] = 311
+            check_sampled_current(robot, "left", values, 125.0, 125.002)
+    snapshot = fault_note(caught.value)
+    assert snapshot["offending_motor"] == motor
+    assert snapshot["offending_value"] == (70 if kind == "temperature" else 311)
+    assert snapshot["comparison"]["units"] == "raw_register"
+
+
 def resting_robot(activation, monkeypatch, raw=3225):
     from lerobot.motors import MotorCalibration
     from lerobot.motors.feetech import FeetechMotorsBus

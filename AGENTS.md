@@ -31,17 +31,20 @@ from capture freshness and motor health; optional loss cannot consume unrelated
 recovery budgets. Keep media work and routine logs outside the motor loop.
 
 Current known stopped deployment: motor 7d12ad1264750d64e0f8b40edc625e08974581c4,
-protected runtime 34a97f816a78b8c7b5fda77b55c13a26b9df80b3, camera
+protected runtime 7447480924c288fed3a76fc981433b41c7bfcefe, camera
 bc3442b54d9c574a8feddb0ade642c9b351e59f9; manifest
-c78dac7f081d16dd667a739863f84aa93ec5044d8fad0f17b241a17805aadb36.
+e4e694ffbdfeb387c781e1bb3ab1ebc35cd79e506f88164f0ff424206ee0e1bf.
 Helper/manual remains 0fe3997f. Immediate matched rollback retains the same motor
-and camera with runtime d70ce5d38ee1de2c0e3233d8f6e216a634a2a934 and manifest
-61be62e713ab2c07769839b8ec9d47e6869b4d50d26a562d6b9c1305848032e1.
-Packet16 combined06 has verified cleanup but an aborted feedback-recovery episode;
-its first cause and original results remain retained. The representative workload
-and next-Start qualification remain unfinished; repair the demonstrated feedback
-pending/recovery boundary before another supported run. Preserve calibration, trust,
-private permissions, source imports and separate full component rollback bundles.
+and camera with runtime 34a97f816a78b8c7b5fda77b55c13a26b9df80b3 and manifest
+c78dac7f081d16dd667a739863f84aa93ec5044d8fad0f17b241a17805aadb36.
+Combined07 has verified cleanup after an actual left shoulder-pan temperature-guard
+fault. Its triggering numerical reading was not exported; do not infer overheating
+or corrupted feedback from the prior 35 C reading and configured 70 C limit. Preserve
+that fault and original results. The representative workload and next Start remain
+unfinished. Repair the original fault-boundary evidence and check current thermal
+health through stopped sole ownership before another supported run. Preserve
+calibration, trust, private permissions, source imports and separate full component
+rollback bundles.
 Tasks stay stopped during editing/staging; services restore idle without replay.
 AM1 stays wireless, P1 advisory, AM2 untouched. No network tuning, Ethernet,
 manual shoulder/leader readiness questionnaire, new cutoff hardware or architecture.

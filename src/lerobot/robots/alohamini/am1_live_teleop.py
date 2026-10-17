@@ -71,16 +71,32 @@ def _groups(robot):
     )
 
 
-def _fault(robot, reason, side, register, raw, timing):
-    if getattr(robot, "_am1_teleop_fault", None) is None:
-        robot._am1_teleop_fault = {
-            "reason": reason,
-            "side": side,
-            "register": register,
-            "raw": copy.deepcopy(raw),
-            **timing,
-        }
-    raise RuntimeError("AM1 teleop " + reason)
+def _fault(robot, reason, side, register, raw, timing, *, offending_motor=None, comparison=None):
+    error = RuntimeError("AM1 teleop " + reason)
+    # Diagnostic failure must never replace or postpone the original guard.
+    try:
+        if getattr(robot, "_am1_teleop_fault", None) is None:
+            robot._am1_teleop_fault = {
+                "reason": reason,
+                "side": side,
+                "register": register,
+                "raw": copy.deepcopy(raw),
+                **copy.deepcopy(timing),
+                "binding": copy.deepcopy(getattr(robot, "_am1_teleop_binding", None)),
+                "offending_motor": offending_motor,
+                "offending_value": copy.deepcopy(raw.get(offending_motor)),
+                "comparison": copy.deepcopy(comparison),
+            }
+        note = "[AM1 TELEOP FAULT] " + json.dumps(
+            robot._am1_teleop_fault,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+        if len(note.encode("utf-8")) <= 16384:
+            error.add_note(note)
+    except Exception:
+        pass
+    raise error
 
 
 def read_groups(robot, registers, *, active=None):
@@ -100,7 +116,8 @@ def read_groups(robot, registers, *, active=None):
                 "read_started_at_monotonic_s": started,
                 "read_completed_at_monotonic_s": completed,
             }
-            baseline = getattr(robot, "_am1_teleop_settings", {}).get(side, {}).get("registers", rows)
+            baseline_record = getattr(robot, "_am1_teleop_settings", {}).get(side, {})
+            baseline = baseline_record.get("registers", rows)
             for name, value in rows[register].items():
                 reason = None
                 if register == "Status" and value != 0:
@@ -122,7 +139,42 @@ def read_groups(robot, registers, *, active=None):
                 ):
                     reason = "actual configured voltage limit: " + name
                 if reason is not None:
-                    _fault(robot, reason, side, register, rows[register], timing[register])
+                    comparison = {"units": "raw_register"}
+                    try:
+                        configured = ()
+                        if register == "Present_Temperature":
+                            comparison.update(
+                                lower_inclusive=0, upper_exclusive=baseline["Max_Temperature_Limit"][name]
+                            )
+                            configured = ("Max_Temperature_Limit",)
+                        elif register == "Present_Voltage":
+                            comparison.update(
+                                lower_inclusive=baseline["Min_Voltage_Limit"][name],
+                                upper_inclusive=baseline["Max_Voltage_Limit"][name],
+                            )
+                            configured = ("Min_Voltage_Limit", "Max_Voltage_Limit")
+                        else:
+                            comparison["expected"] = (
+                                int(active) if register in ("Torque_Enable", "Lock") else 0
+                            )
+                        if configured:
+                            baseline_timing = baseline_record.get("timing", timing)
+                            comparison["configured"] = {
+                                key: {"value": baseline[key][name], **baseline_timing.get(key, {})}
+                                for key in configured
+                            }
+                    except Exception:
+                        pass  # Optional comparator context cannot replace the proven guard.
+                    _fault(
+                        robot,
+                        reason,
+                        side,
+                        register,
+                        rows[register],
+                        timing[register],
+                        offending_motor=name,
+                        comparison=comparison,
+                    )
         records[side] = {"registers": rows, "timing": timing}
     return records
 
@@ -406,7 +458,8 @@ def poll_health(robot):
 
 
 def check_sampled_current(robot, side, values, started, completed):
-    limits = robot._am1_teleop_settings[side]["registers"]["Protection_Current"]
+    baseline = robot._am1_teleop_settings[side]
+    limits = baseline["registers"]["Protection_Current"]
     sample = {
         "raw": {name: _integer(values[name]) for name in limits},
         "read_started_at_monotonic_s": started,
@@ -417,6 +470,17 @@ def check_sampled_current(robot, side, values, started, completed):
     robot._am1_teleop_currents = samples
     for name, raw in sample["raw"].items():
         if abs(raw) >= limits[name]:
+            comparison = {"units": "raw_register"}
+            try:
+                comparison["absolute_upper_exclusive"] = limits[name]
+                comparison["configured"] = {
+                    "Protection_Current": {
+                        "value": limits[name],
+                        **baseline.get("timing", {}).get("Protection_Current", {}),
+                    }
+                }
+            except Exception:
+                pass  # Keep the actual current fault if optional timing is unavailable.
             _fault(
                 robot,
                 "actual configured current protection reached: " + name,
@@ -427,6 +491,8 @@ def check_sampled_current(robot, side, values, started, completed):
                     key: sample[key]
                     for key in ("read_started_at_monotonic_s", "read_completed_at_monotonic_s")
                 },
+                offending_motor=name,
+                comparison=comparison,
             )
 
 
