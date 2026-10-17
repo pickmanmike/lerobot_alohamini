@@ -922,6 +922,11 @@ async def run(args):
         await client.attach()
         await client.claim()
         renewal = asyncio.create_task(client.renew())
+        admission_owner = {
+            "service": (client.snapshot or {}).get("service_incarnation"),
+            "device": client.device,
+            "generation": client.generation,
+        }
         import aiohttp
 
         start_body = {
@@ -976,12 +981,34 @@ async def run(args):
         summary["owned_run_id"] = owned_run_id
         summary["start_outcome_uncertain"] = False
         started = True
+        startup_anchor = None
 
-        def native_admitted():
-            state = client.snapshot or {}
+        def admission_identity(state):
+            run, controller = state.get("run") or {}, state.get("controller") or {}
+            return (
+                bool(admission_owner["service"])
+                and state.get("service_incarnation") == admission_owner["service"]
+                and client.device == controller.get("device_id") == admission_owner["device"]
+                and client.generation
+                == controller.get("controller_generation")
+                == admission_owner["generation"]
+                and run.get("run_id") == owned_run_id
+                and run.get("operation_id") == start_body["operation_id"]
+                and run.get("recipe") == TELEOP_RECIPE
+            )
+
+        def startup_times(state):
             run = state.get("run") or {}
-            if run.get("run_id") != owned_run_id or run.get("recipe") != TELEOP_RECIPE:
-                return False
+            values = tuple(run.get(key) for key in ("accepted_at", "startup_deadline"))
+            if (
+                all(type(value) in (int, float) and math.isfinite(value) for value in values)
+                and values[0] < values[1] <= values[0] + 180
+            ):
+                return values
+            return None
+
+        def native_admission_terminal(state):
+            run = state.get("run") or {}
             if run.get("status") in {"faulted", "interrupted", "stopped", "completed"}:
                 # Freeze the actual owned-run failure before ordinary Stop and
                 # cleanup reporting can replace the current snapshot.
@@ -994,9 +1021,96 @@ async def run(args):
                     or "terminal before native Live"
                 )
                 raise RuntimeError("native admission " + run["status"] + ": " + str(cause))
+
+        def native_admitted():
+            nonlocal startup_anchor
+            if renewal.done():
+                renewal.result()
+            state = client.snapshot or {}
+            run = state.get("run") or {}
+            if reattached:
+                check_admission_attachment()
+            if run.get("run_id") != owned_run_id or run.get("recipe") != TELEOP_RECIPE:
+                return False
+            if startup_anchor is None and admission_identity(state):
+                startup_anchor = startup_times(state)
+            native_admission_terminal(state)
             return run.get("native_live_at") is not None
 
-        await client.wait(native_admitted, 180)
+        # One current transport loss may reattach to the already accepted Start.
+        # All attachment work consumes this original admission ceiling.
+        admission_until, reattached = time.monotonic() + 180, False
+
+        def admission_remaining():
+            remaining = admission_until - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("original native admission ceiling exhausted")
+            return remaining
+
+        def check_admission_attachment():
+            state = client.snapshot or {}
+            run, evidence = state.get("run") or {}, state.get("evidence") or {}
+            if (
+                startup_anchor is None
+                or not admission_identity(state)
+                or startup_times(state) != startup_anchor
+            ):
+                raise RuntimeError(
+                    "original native admission ownership/startup timestamps changed or unavailable"
+                )
+            native_admission_terminal(state)
+            if (
+                run.get("uncertain") is not False
+                or run.get("first_cause")
+                or run.get("native_first_cause")
+                or evidence.get("fault")
+                or run.get("status") in {"finishing", "recovering"}
+            ):
+                raise RuntimeError(
+                    "native admission reattachment unsafe: "
+                    + str(
+                        run.get("native_first_cause")
+                        or run.get("first_cause")
+                        or evidence.get("fault")
+                        or run.get("status")
+                    )
+                )
+
+        while True:
+            try:
+                await client.wait(native_admitted, admission_remaining())
+                admission_remaining()
+                break
+            except ConnectionError:
+                close = getattr(client, "transport_close", None) or {}
+                if (
+                    reattached
+                    or close.get("expected") is not False
+                    or close.get("reason") != "stream-ended"
+                    or close.get("close_code") != 1006
+                    or close.get("reader_error") is not None
+                ):
+                    raise
+                if renewal.done():
+                    renewal.result()
+                remaining = admission_remaining()
+                if ((client.snapshot or {}).get("run") or {}).get("native_live_at") is not None:
+                    raise RuntimeError("native admission already reached Live before transport loss") from None
+                check_admission_attachment()
+                record(
+                    {
+                        "event": "native_admission_transport_closed",
+                        "transport_close": close,
+                        "remaining_s": remaining,
+                    }
+                )
+                reattached = True
+                async with asyncio.timeout(admission_remaining()):
+                    await client.detach()
+                    await client.attach()
+                remaining = admission_remaining()
+                check_admission_attachment()
+                record({"event": "native_admission_reattached", "remaining_s": remaining})
         workspace = validate_workspace(_live(client.snapshot)["workspace"])
         run_id, deadline = client.snapshot["run"]["run_id"], client.snapshot["run"]["deadline"]
         summary.update(run_id=run_id, original_native_deadline=deadline, workspace=workspace)

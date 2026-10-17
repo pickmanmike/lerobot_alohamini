@@ -535,14 +535,23 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
     foreign_boundary = failure == "expired_foreign_budget"
     recovery_case = failure in {"recovery", "recovery_fault", "recovery_wall"}
     ordinary_case = failure in {"ordinary_pauses", "ordinary_pauses_no_ack"}
+    timed_expiry = failure in {"expired_first", "expired_zero", "expired_zero_timeout"}
     pc_clock = [10.0]
-    if recovery_case or ordinary_case or failure in {"zero_deadline_rounding", "zero_inner_timeout"}:
+    if (
+        recovery_case
+        or ordinary_case
+        or timed_expiry
+        or failure in {"zero_deadline_rounding", "zero_inner_timeout"}
+    ):
         import time
 
         # Advance only the PC's program clock, leaving asyncio scheduling and
         # original perf_counter source acquisition clocks untouched. Held reads
         # cost .05s each; accepted inputs cost .01s. A missing freeze/rebaseline
         # therefore credits the held interval and fails the exact progress test.
+        # The three expiry fixtures also need explicit elapsed transaction time:
+        # a sub-ms accepted frame must not depend on a Windows monotonic tick to
+        # reach their .001s program boundary before all later frames are refused.
         monkeypatch.setattr(
             m, "time", SimpleNamespace(monotonic=lambda: pc_clock[0], perf_counter=time.perf_counter)
         )
@@ -825,6 +834,8 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 or wall_budget
             ):
                 await asyncio.sleep(0.04)
+                if timed_expiry:
+                    pc_clock[0] += 0.04
                 if foreign_boundary:
                     self.snapshot = self.state(foreign_id)
                 raise m.CommandRefusedError(
@@ -837,7 +848,12 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 )
             if dropped or recovery_case:
                 await asyncio.sleep(0.01)
-            if recovery_case or ordinary_case or failure in {"zero_deadline_rounding", "zero_inner_timeout"}:
+            if (
+                recovery_case
+                or ordinary_case
+                or timed_expiry
+                or failure in {"zero_deadline_rounding", "zero_inner_timeout"}
+            ):
                 pc_clock[0] += 0.01
             self.snapshot["run"]["live_input"].update(
                 last_input_seq=payload["seq"], source=payload["source"], body=payload["body"]
@@ -1955,3 +1971,252 @@ def test_fourth_ordinary_pause_still_requires_qualified_held_ack_before_resume()
         assert guard.pause_recoveries == 4 and guard.episodes == 0
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        None,
+        "run",
+        "operation",
+        "recipe",
+        "service",
+        "device",
+        "controller",
+        "accepted_at",
+        "startup_deadline",
+        "terminal",
+        "uncertain",
+        "native_fault",
+        "reporting_error",
+        "policy_close",
+        "reader_reason",
+        "expected_close",
+        "missing_anchor",
+        "expired_before_attach",
+        "expired_during_attach",
+        "second_loss",
+        "stale_attach",
+        "already_live",
+        "later_run",
+        "later_operation",
+        "later_recipe",
+        "later_service",
+        "later_device",
+        "later_controller",
+        "later_accepted_at",
+        "later_startup_deadline",
+        "later_terminal",
+        "later_uncertain",
+        "later_native_fault",
+    ],
+)
+def test_runner_starting_transport_reattaches_once_to_exact_owned_admission(tmp_path, monkeypatch, change):
+    """Synthetic WSS loss at actual run()/wait(), before any native Live or input."""
+    import asyncio
+    import copy
+    import json
+    import time
+    from types import SimpleNamespace
+
+    m = adapter()
+    actual_wait = m.SessionClient.wait
+    clock, instances, live_entries = [20.0], [], []
+    monkeypatch.setattr(
+        m, "time", SimpleNamespace(monotonic=lambda: clock[0], perf_counter=time.perf_counter)
+    )
+    owned = str(uuid4())
+
+    class Session:
+        wait = actual_wait
+
+        def __init__(self, *args):
+            self.device, self.generation, self.connection = "device", "control", None
+            self.snapshot = recovery_state()
+            self.snapshot["run"] = None
+            self.transport_close = self.transport_error = self.reader = None
+            self.ws = SimpleNamespace(closed=False)
+            self.changed = asyncio.Event()
+            self.starts, self.stops, self.claims, self.attaches = [], [], 0, 0
+            self.renewing, self.closed = False, False
+            self.pending = []
+            instances.append(self)
+
+        def starting(self):
+            state = recovery_state()
+            state["run"].update(
+                run_id=owned,
+                operation_id=self.starts[0]["operation_id"],
+                accepted_at=1000.0,
+                startup_deadline=1180.0,
+                status="starting",
+                native_live_at=None,
+                deadline=None,
+                backend_incarnation=None,
+                live_input=None,
+            )
+            return state
+
+        async def lose(self):
+            await asyncio.sleep(0)
+            clock[0] += 181.0 if change == "expired_before_attach" else 9.0
+            if change == "already_live":
+                self.snapshot["run"]["native_live_at"] = 1009.0
+            self.transport_close = {
+                "reason": "reader-error" if change == "reader_reason" else "stream-ended",
+                "expected": change == "expected_close",
+                "close_code": 1008 if change == "policy_close" else 1006,
+                "reader_error": {"error_type": "RuntimeError", "message": "owner reporting unavailable"}
+                if change == "reporting_error"
+                else None,
+                "exception_type": "ClientConnectionResetError",
+                "exception": "Cannot write to closing transport",
+                "observed_at_monotonic_s": clock[0],
+            }
+            self.transport_error = "current WSS connection ended: stream-ended"
+            self.ws.closed = True
+            self.changed.set()
+
+        async def attach(self):
+            self.attaches += 1
+            if self.attaches == 1:
+                return
+            assert self.snapshot is None, "an old cached Live snapshot cannot satisfy fresh attachment"
+            assert self.renewing, "HTTP renewal must keep the same claim alive during attachment"
+            self.transport_close = self.transport_error = None
+            self.ws.closed = False
+            if change == "expired_during_attach":
+                clock[0] += 180.0
+            if change == "stale_attach":
+                return
+            self.snapshot = self.starting()
+            if change is None or change.startswith("later_"):
+                self.pending.append(asyncio.create_task(self.publish_live()))
+            else:
+                self.mutate(change)
+            if change == "second_loss":
+                self.pending.append(asyncio.create_task(self.lose()))
+            self.changed.set()
+
+        def mutate(self, mutation):
+            if mutation in {"run", "operation", "recipe", "accepted_at", "startup_deadline"}:
+                key = {"run": "run_id", "operation": "operation_id"}.get(mutation, mutation)
+                self.snapshot["run"][key] = 1181.0 if mutation == "startup_deadline" else "changed"
+            elif mutation == "service":
+                self.snapshot["service_incarnation"] = "other-service"
+            elif mutation in {"device", "controller"}:
+                key = "device_id" if mutation == "device" else "controller_generation"
+                self.snapshot["controller"][key] = "other-owner"
+            elif mutation == "terminal":
+                self.snapshot["run"].update(status="faulted", native_first_cause="original native fault")
+            elif mutation == "uncertain":
+                self.snapshot["run"]["uncertain"] = True
+            elif mutation == "native_fault":
+                self.snapshot["evidence"]["fault"] = "genuine native status fault"
+
+        async def publish_live(self):
+            await asyncio.sleep(0)
+            self.snapshot["run"].update(
+                native_live_at=1009.0,
+                deadline=1309.0,
+                status="preparing",
+                backend_incarnation="host",
+                live_input=recovery_state()["run"]["live_input"],
+            )
+            if change:
+                self.mutate(change.removeprefix("later_"))
+            self.changed.set()
+
+        async def detach(self):
+            self.snapshot = None
+
+        async def claim(self):
+            self.claims += 1
+
+        async def renew(self):
+            self.renewing = True
+            try:
+                await asyncio.Event().wait()
+            finally:
+                self.renewing = False
+
+        async def post(self, path, body):
+            if path == "start":
+                self.starts.append(copy.deepcopy(body))
+                self.snapshot = self.starting()
+                if change == "missing_anchor":
+                    del self.snapshot["run"]["accepted_at"]
+                self.pending.append(asyncio.create_task(self.lose()))
+                return {"accepted": True, "run_id": owned, "operation_id": body["operation_id"]}
+            assert path == "stop"
+            self.stops.append(copy.deepcopy(body))
+            return {"accepted": True, "status": "finishing"}
+
+        async def get(self, path):
+            assert path == "state"
+            state = self.starting()
+            if self.stops:
+                state["run"].update(status="stopped", cleanup="physical_readback_verified", uncertain=False)
+            return {"snapshot": state}
+
+        async def close(self):
+            for task in self.pending:
+                await task
+            self.closed = True
+
+    def live_boundary(value):
+        live_entries.append(copy.deepcopy(instances[0].snapshot))
+        raise RuntimeError("synthetic reached existing Live entrypoint")
+
+    monkeypatch.setattr(m, "SessionClient", Session)
+    monkeypatch.setattr(m, "validate_workspace", live_boundary)
+    args = SimpleNamespace(
+        source="virtual-leaders",
+        output=str(tmp_path / "run"),
+        url="unused",
+        ca="unused",
+        storage_state="unused",
+    )
+    with pytest.raises((ConnectionError, RuntimeError, TimeoutError)):
+        asyncio.run(asyncio.wait_for(m.run(args), 10))
+    session = instances[0]
+    summary = json.loads((tmp_path / "run" / "summary.json").read_text())
+    rows = [json.loads(row) for row in (tmp_path / "run" / "frames.jsonl").read_text().splitlines()]
+    assert len(session.starts) == 1 and session.claims == 1
+    assert [row["run_id"] for row in session.stops] == [owned]
+    assert session.closed and not session.renewing
+    assert summary["frame_count"] == 0 and summary["cleanup_errors"] == []
+    refused_without_attach = change in {
+        "reporting_error",
+        "policy_close",
+        "reader_reason",
+        "expected_close",
+        "missing_anchor",
+        "expired_before_attach",
+        "already_live",
+    }
+    assert session.attaches == (1 if refused_without_attach else 2)
+    assert len(live_entries) == (1 if change is None else 0)
+    assert not any(row["event"] == "native_admitted" for row in rows)
+    if change is None:
+        assert summary["failure"] == "synthetic reached existing Live entrypoint"
+        assert live_entries[0]["run"]["operation_id"] == session.starts[0]["operation_id"]
+        assert live_entries[0]["run"]["recovery_episodes"] == 0
+        boundary = [row for row in rows if row["event"] == "native_admission_transport_closed"]
+        assert len(boundary) == 1 and boundary[0]["transport_close"]["close_code"] == 1006
+        assert boundary[0]["remaining_s"] == pytest.approx(171.0)
+        assert len([row for row in rows if row["event"] == "native_admission_reattached"]) == 1
+    elif change in {"reporting_error", "policy_close", "reader_reason", "expected_close", "second_loss"}:
+        assert summary["failure_type"] == "ConnectionError"
+        assert summary["failure"] == "current WSS connection ended: stream-ended"
+    elif change in {"expired_before_attach", "expired_during_attach"}:
+        assert summary["failure_type"] == "TimeoutError"
+        assert summary["failure"] == "original native admission ceiling exhausted"
+    else:
+        assert summary["failure_type"] == "RuntimeError"
+        assert "native admission" in summary["failure"]
+        if change in {"terminal", "later_terminal"}:
+            assert "original native fault" in summary["failure"]
+            assert (
+                summary["native_admission_terminal"]["run"]["native_first_cause"] == "original native fault"
+            )
