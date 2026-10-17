@@ -16,11 +16,11 @@ Packet18 authorizes knowledge recovery, focused offline parity and a narrow supp
 | --- | --- |
 | Repository / working PR | [pickmanmike/lerobot_alohamini PR25](https://github.com/pickmanmike/lerobot_alohamini/pull/25), `codex/am1-teleop-consolidation-16`, draft/unmerged |
 | Packet18 initial source checkpoint | `2647b77c558a36f2b07f5730cf7906b4022ba868`; integration base `386d3c376c51d3431cf379af61ab99be95382ab8` after PR24 |
-| Installed motor | `4cc9e04bff5283541524a6f61463b331587258b9` |
+| Installed motor | `19bedce59babc4b4b3e12af4d5e9bc21909eee9d` |
 | Installed runtime | `30263a6c73ba8d76e6b17afc4a45c6a755754ac3` |
 | Installed camera / helper-manual | `bc3442b54d9c574a8feddb0ade642c9b351e59f9` / `0fe3997f12b9cdfdd01fda6f4c6b102781252448` |
-| Installed matched manifest | `de4aa239750bd681fa1089c40afd0bb6864b3756babb5db325b33fd818ab7362`; all ten Stage21 stopped/idle phases passed |
-| Immediate full matched predecessor | Motor `4cc9e04bff5283541524a6f61463b331587258b9`, runtime `cd7e638f62d7b9852a0ebf02851e7cf9bb350a86`, same camera/helper and manifest `bcf918dbd72ccd34024052412bebeff77a953bf72bf3b8ecc2f1d687b9daa9f6`; full bundles archived before Stage21 upload; older pairs retained. |
+| Installed matched manifest | `ad91a57c5add052302d9bd0735d81f82fd8e75add2fc9286056162b935c7cf6f`; all ten Stage22 stopped/idle phases passed |
+| Immediate full matched predecessor | Motor `4cc9e04bff5283541524a6f61463b331587258b9`, runtime `30263a6c73ba8d76e6b17afc4a45c6a755754ac3`, same camera/helper and manifest `de4aa239750bd681fa1089c40afd0bb6864b3756babb5db325b33fd818ab7362`; full bundles archived before Stage22 upload; older pairs retained. |
 
 Deployment authority: [Packet16 source/deployment record](teleop-consolidation-16.md#current-status-and-source), corroborated by private `.cache/am1-teleop-consolidation-16/current-state-16-published.private.md`. That private checkpoint retains full matched bundles, exact staging records and permissions; do not copy credentials or private logs into Git. Verify actual service interpreter/cwd/import roots before changed code is credited as deployed. A rollback identity is not proof of a cure.
 
@@ -44,7 +44,7 @@ The opaque mailbox's exact backend branch remains unknown. The reviewed PC-only 
 
 **Latest attempt: Combined23.** Run `1d1f06ff-a8e4-400c-a2cd-65664f2b35d7`, native `b4024a7023ae3689358e7313199a7a1802a69ddb57c7b5a848e753c4e1b859aa`, faulted before native Live with zero program frames. Native first cause is the lift's five-slot stale-window refusal; Core's host-connect timeout remains separate. All six originals/full SQL/strict startup-fault audit, verified cleanup, lift qualification, closed buses and camera release are retained; uncertainty is false. The analyzer has no Live/reference/deadline observations, not evidence those invariants were changed.
 
-The trace contains no lift acquisition in anchored slot75 while startup settings verification took96.75ms. The next five occupied peaks span71/72/73/74/76; another read in76 correctly refuses the old peak's0.521009740s age. The five-line same-owner hook correction passes189 affected temperature/settings checks, scoped lint and independent review. It preserves original slot maxima/times and the0.5s bound. **Next action:** reviewed stopped-component staging, then the original **172.5 active-second / 300-second-ceiling** workload plus supported separate3s next Start. No unchanged powered retry, window reset or temperature-causation campaign is warranted.
+The trace contains no lift acquisition in anchored slot75 while startup settings verification took96.75ms. The next five occupied peaks span71/72/73/74/76; another read in76 correctly refuses the old peak's0.521009740s age. The five-line same-owner hook correction passes189 affected temperature/settings checks, scoped lint and independent review. It preserves original slot maxima/times and the0.5s bound. All ten Stage22 stopped/idle phases passed; actual service imports match. Only the motor component changed, with one Windows pin literal and unchanged ACL. **Next action:** the original **172.5 active-second / 300-second-ceiling** workload plus supported separate3s next Start. No unchanged powered retry, window reset or temperature-causation campaign is warranted.
 
 
 All original successes/failures and source-specific test cohorts remain in [Packet16](teleop-consolidation-16.md) and private immutable originals. In particular, Combined18/19's original missing/unknown receipts remain unchanged; later genuine stopped proof and separate durable acknowledgment cleared current uncertainty. Known cleanup is not program completion. The one fresh-context read check is complete; do not repeat it.
