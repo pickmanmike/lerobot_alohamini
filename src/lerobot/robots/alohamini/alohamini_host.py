@@ -93,7 +93,9 @@ class AM1RoutineRecordWriter:
         try:
             line = (line + "\n").encode()
             if len(line) > 32768:
-                raise ValueError("Routine log record exceeds 32768 bytes")
+                error = ValueError("Routine log record exceeds 32768 bytes")
+                error.add_note(f"AM1 routine record size: encoded_bytes={len(line)} maximum_bytes=32768")
+                raise error
             self._queue.put_nowait(line)
             return True
         except queue.Full:
@@ -1677,11 +1679,14 @@ def _run_host(args):
             routine_report = routine_writer.submit_line
             robot._am1_routine_report = routine_report
             if teleop:
-                routine_writer.submit("[AM1 TELEOP SETTINGS] ", {
-                    "binding": robot._am1_teleop_binding,
-                    "before": robot._am1_teleop_settings,
-                    "active": robot._am1_teleop_active_settings,
-                })
+                # Keep each complete bus receipt below the existing record bound.
+                for side in ("left", "right"):
+                    routine_writer.submit("[AM1 TELEOP SETTINGS] ", {
+                        "binding": robot._am1_teleop_binding,
+                        "bus": side,
+                        "before": robot._am1_teleop_settings[side],
+                        "active": robot._am1_teleop_active_settings[side],
+                    })
                 routine_writer.submit("[AM1 TELEOP REST] ", {
                     "binding": robot._am1_teleop_binding,
                     "acquisitions": robot._am1_teleop_rest_evidence,

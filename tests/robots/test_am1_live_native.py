@@ -639,6 +639,34 @@ def test_practical_routine_writer_bounds_bytes_and_rejects_zero_progress():
         writer.close(timeout=1)
 
 
+def test_practical_oversized_record_note_counts_utf8_and_retains_original_failure():
+    import threading
+
+    entered, release = threading.Event(), threading.Event()
+
+    def later_failed_write(data):
+        entered.set()
+        assert release.wait(2)
+        raise OSError("later synthetic sink failure")
+
+    writer = host.AM1RoutineRecordWriter(write=later_failed_write)
+    try:
+        assert writer.submit_line("small earlier record") and entered.wait(1)
+        oversized = "é" * 16384
+        assert not writer.submit_line(oversized)
+        with pytest.raises(ValueError) as first:
+            writer.raise_if_failed()
+        assert str(first.value) == "Routine log record exceeds 32768 bytes"
+        assert getattr(first.value, "__notes__", []) == [
+            "AM1 routine record size: encoded_bytes=32769 maximum_bytes=32768"
+        ]
+    finally:
+        release.set()
+        with pytest.raises(ValueError) as closing:
+            writer.close(timeout=1)
+    assert closing.value is first.value
+
+
 def test_practical_routine_writer_uses_duplicate_fd_without_text_stream_write(monkeypatch, tmp_path):
     from types import SimpleNamespace
     path = tmp_path / "routine-native.log"
@@ -744,6 +772,99 @@ def test_practical_writer_error_still_cleans_motor_and_sockets_before_drain(monk
         host._run_host(args)
     assert caught.value is original
     assert events == ["motor-zero-off", "socket-close", *(["normal-stop-report"] if normal_stop else []), "fault-record", "drain"]
+
+
+@pytest.mark.parametrize("sink", ["ordinary", "blocked", "queue_full", "failed"])
+def test_teleop_startup_full_source_settings_fit_bounded_writer_and_preserve_cleanup(monkeypatch, sink):
+    """Synthetic actual configure/rest/activate receipts at the real host entrypoint."""
+    import json
+    import threading
+    from types import SimpleNamespace
+
+    from tests.robots.test_am1_pre_activation import activation
+    from tests.robots.test_am1_teleop_settings import resting_robot
+
+    case = activation.__wrapped__(monkeypatch)
+    source = resting_robot(case, monkeypatch, raw=3225)
+    source.activate_motors()
+    identity = source._am1_teleop_binding
+    original = json.loads(json.dumps({"binding": identity, "before": source._am1_teleop_settings,
+                                     "active": source._am1_teleop_active_settings}))
+    rest = json.loads(json.dumps({"binding": identity, "acquisitions": source._am1_teleop_rest_evidence}))
+    legacy = "[AM1 TELEOP SETTINGS] " + json.dumps(original, separators=(",", ":")) + "\n"
+    assert len(legacy.encode()) > 32768  # Synthetic reproduction, not lost Combined19 bytes.
+    output, events, release = bytearray(), [], threading.Event()
+    failure = OSError("synthetic settings sink failure")
+
+    def write(data):
+        if sink == "failed":
+            raise failure
+        if sink in {"blocked", "queue_full"}:
+            assert release.wait(2)
+        output.extend(data)
+        return len(data)
+
+    original_writer = host.AM1RoutineRecordWriter
+
+    class Writer(original_writer):
+        def __init__(self):
+            super().__init__(write=write, capacity=1 if sink == "queue_full" else 128)
+
+        def close(self, **kwargs):
+            events.append("drain")
+            super().close(**kwargs)
+
+    obj = SimpleNamespace(is_connected=True, config=SimpleNamespace(robot_model="alohamini1"),
+        _am1_teleop_binding=identity, _am1_teleop_settings=original["before"],
+        _am1_teleop_active_settings=original["active"], _am1_teleop_rest_evidence=rest["acquisitions"])
+
+    def disconnect(**kwargs):
+        events.append("motor-zero-off")
+        obj.is_connected = False
+        release.set()
+
+    obj.disconnect = disconnect
+    evidence = SimpleNamespace(enabled=True, enrich_fault=lambda *args: None,
+        emit_pending_fault=lambda *args: events.append("fault-record"))
+    monkeypatch.setattr(host, "AM1RoutineRecordWriter", Writer)
+    monkeypatch.setattr(host, "AM1SelectedJointEvidence", lambda **kwargs: evidence)
+    monkeypatch.setattr(host, "AlohaMini", lambda config: obj)
+    monkeypatch.setattr(host, "connect_robot", lambda *args, **kwargs: None)
+    monkeypatch.setattr(host, "visible_control_binding", lambda args: identity)
+    monkeypatch.setattr(host, "right_p20_trial_binding", lambda *args: None)
+    monkeypatch.setattr(host, "elbow_recovery_binding", lambda *args: None)
+    monkeypatch.setattr(host, "AM1LocalControl", lambda **kwargs: SimpleNamespace(
+        live=True, state="stopped", check_live=lambda robot: False))
+    monkeypatch.setattr(host, "AlohaMiniHost", lambda config: SimpleNamespace(watchdog_timeout_ms=1000,
+        connection_time_s=.1, max_loop_freq_hz=30, disconnect=lambda: events.append("socket-close")))
+    args = host.make_parser().parse_args(["--no_cameras", "--skip_lift_home"])
+    args.am1_run_id, args.am1_host_incarnation = identity["run_id"], identity["host_incarnation"]
+    try:
+        if sink == "queue_full":
+            with pytest.raises(RuntimeError, match="queue full"):
+                host._run_host(args)
+        elif sink == "failed":
+            with pytest.raises(OSError) as caught:
+                host._run_host(args)
+            assert caught.value is failure
+        else:
+            host._run_host(args)
+    finally:
+        release.set()
+    assert events.index("motor-zero-off") < events.index("socket-close") < events.index("drain")
+    if sink in {"ordinary", "blocked"}:
+        lines = output.decode().splitlines(keepends=True)
+        parts = [json.loads(line.split("] ", 1)[1]) for line in lines
+                 if line.startswith("[AM1 TELEOP SETTINGS] ")]
+        assert len(parts) == 2 and {part["bus"] for part in parts} == {"left", "right"}
+        assert all(set(part) == {"binding", "bus", "before", "active"} for part in parts)
+        assembled = {"binding": parts[0]["binding"],
+            "before": {part["bus"]: part["before"] for part in parts},
+            "active": {part["bus"]: part["active"] for part in parts}}
+        assert all(part["binding"] == identity for part in parts) and assembled == original
+        assert all(len(line.encode()) <= 32768 for line in lines)
+        assert [json.loads(line.split("] ", 1)[1]) for line in lines
+                if line.startswith("[AM1 TELEOP REST] ")] == [rest]
 
 
 def test_nonselected_out_of_command_range_pose_keeps_its_existing_raw_hold(monkeypatch):
