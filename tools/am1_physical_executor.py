@@ -1315,6 +1315,7 @@ class ProtectedHostRun:
             20,
             signal_name="SIGTERM",
             log=self.camera_log,
+            camera_route_discovery=True,
         )
         wait_required_camera(self.camera, self.observation, cancel)
         cancel()
@@ -1542,10 +1543,22 @@ class ProtectedHostRun:
 
 
 def protected_unit_command(
-    name, cwd, command, *, environment, runtime_s, stop_s, devices, signal_name="SIGINT", log_path=None
+    name,
+    cwd,
+    command,
+    *,
+    environment,
+    runtime_s,
+    stop_s,
+    devices,
+    signal_name="SIGINT",
+    log_path=None,
+    camera_route_discovery=False,
 ):
     if not 0 < runtime_s <= 920 or not 0 < stop_s <= 80 or signal_name not in ("SIGINT", "SIGTERM"):
         raise ValueError("invalid bounded owned unit limits")
+    if type(camera_route_discovery) is not bool:
+        raise ValueError("camera route discovery requires an explicit bool")
     args = [
         "systemd-run",
         "--user",
@@ -1571,7 +1584,8 @@ def protected_unit_command(
         "-p",
         "TimeoutStopSec=" + str(stop_s) + "s",
         "-p",
-        "RestrictAddressFamilies=AF_UNIX AF_INET",
+        # go2rtc needs route/interface discovery; only its camera owner opts in.
+        "RestrictAddressFamilies=AF_UNIX AF_INET" + (" AF_NETLINK" if camera_route_discovery else ""),
     ]
     if log_path:
         args.extend(["-p", "StandardOutput=append:" + log_path, "-p", "StandardError=inherit"])
@@ -1583,7 +1597,19 @@ def protected_unit_command(
 class OwnedUnit:
     """Administrative monitor of an exact finite user unit; monitor exit is never cleanup proof."""
 
-    def __init__(self, name, cwd, command, environment, runtime_s, stop_s, *, signal_name, log):
+    def __init__(
+        self,
+        name,
+        cwd,
+        command,
+        environment,
+        runtime_s,
+        stop_s,
+        *,
+        signal_name,
+        log,
+        camera_route_discovery=False,
+    ):
         import subprocess
         from pathlib import Path
 
@@ -1600,6 +1626,7 @@ class OwnedUnit:
             devices=True,
             signal_name=signal_name,
             log_path=log_path,
+            camera_route_discovery=camera_route_discovery,
         )
         self.monitor = subprocess.Popen(
             args, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True

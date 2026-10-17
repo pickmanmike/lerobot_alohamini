@@ -603,7 +603,108 @@ def test_physical_units_are_finite_and_host_only_receives_device_access():
     assert "KillMode=mixed" in command and "KillSignal=SIGINT" in command
     assert "RuntimeMaxSec=720s" in command and "TimeoutStopSec=80s" in command
     assert "Restart=no" in command
+    assert "RestrictAddressFamilies=AF_UNIX AF_INET" in command
     assert "/python" in command
+
+
+def test_camera_owned_unit_allows_route_discovery_without_expanding_host(tmp_path, monkeypatch):
+    import subprocess
+    from uuid import uuid4
+
+    from examples.alohamini.am1_session_contract import RECIPES
+
+    m = module()
+    state, runs = tmp_path / "state", tmp_path / "runs"
+    state.mkdir(mode=0o700)
+    runs.mkdir(mode=0o700)
+    provider = object.__new__(m.ProtectedHostRun)
+    provider.config = {
+        "physical_state_directory": str(state),
+        "run_root": str(runs),
+        "host_head": "a" * 40,
+        "host_repository": str(tmp_path),
+        "host_python": "unused-python",
+        "camera_python": "unused-python",
+        "camera_repository": str(tmp_path),
+        "camera_config": str(tmp_path / "config"),
+        "camera_credentials": str(tmp_path / "credentials"),
+        "camera_binary": str(tmp_path / "go2rtc"),
+        "camera_state": str(tmp_path / "camera"),
+    }
+    provider.observation = SimpleNamespace(evidence=lambda: {"qualified": True})
+    monkeypatch.setattr(provider, "_validate_source", lambda: None)
+    launches = []
+
+    def capture_launch(command, **kwargs):
+        launches.append(command)
+        if any(arg.startswith("--unit=am1-pa01-host-") for arg in command):
+            raise OSError("injected stop before actual host launch")
+        return SimpleNamespace(poll=lambda: None)
+
+    monkeypatch.setattr(subprocess, "Popen", capture_launch)
+    try:
+        with pytest.raises(OSError, match="injected stop"):
+            provider.start(str(uuid4()), str(uuid4()), RECIPES["physical-live-teleop"], lambda: None)
+        camera, host = launches
+        assert "RestrictAddressFamilies=AF_UNIX AF_INET AF_NETLINK" in camera
+        assert "RestrictAddressFamilies=AF_UNIX AF_INET" in host
+        assert "RuntimeMaxSec=590.0s" in camera and "TimeoutStopSec=20s" in camera
+        assert "KillSignal=SIGTERM" in camera
+        assert "RuntimeMaxSec=720s" in host and "TimeoutStopSec=80s" in host
+        assert "KillSignal=SIGINT" in host
+        for command in launches:
+            assert command[:2] == ["systemd-run", "--user"]
+            assert all(
+                value in command
+                for value in (
+                    "--wait",
+                    "--collect",
+                    "NoNewPrivileges=yes",
+                    "PrivateDevices=no",
+                    "KillMode=mixed",
+                    "Restart=no",
+                    "UMask=0077",
+                    "StandardError=inherit",
+                )
+            )
+            assert sum(value.startswith("RestrictAddressFamilies=") for value in command) == 1
+            assert not any("AF_INET6" in value for value in command)
+    finally:
+        for stream in (getattr(provider, "host_log", None), getattr(provider, "camera_log", None)):
+            if stream:
+                stream.close()
+
+
+@pytest.mark.parametrize("option", [{}, {"camera_route_discovery": False}])
+def test_route_discovery_is_disabled_for_default_protected_units(option):
+    command = module().protected_unit_command(
+        "am1-default-test",
+        "/tmp/run",
+        ["/python", "-m", "owner"],
+        environment={},
+        runtime_s=720,
+        stop_s=80,
+        devices=False,
+        **option,
+    )
+    assert "RestrictAddressFamilies=AF_UNIX AF_INET" in command
+    assert "PrivateDevices=yes" in command
+    assert not any("AF_NETLINK" in value for value in command)
+
+
+@pytest.mark.parametrize("option", [None, 0, 1, "true", "false", []])
+def test_camera_route_discovery_requires_an_explicit_boolean(option):
+    with pytest.raises(ValueError, match="camera route discovery.*bool"):
+        module().protected_unit_command(
+            "am1-default-test",
+            "/tmp/run",
+            ["/python"],
+            environment={},
+            runtime_s=720,
+            stop_s=80,
+            devices=False,
+            camera_route_discovery=option,
+        )
 
 
 def test_live_selection_requires_explicit_backend_and_cannot_contaminate_default_sim(tmp_path):
