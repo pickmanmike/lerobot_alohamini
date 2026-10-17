@@ -497,6 +497,11 @@ class _AM1PostHomeReadiness:
         self.step_sign = self.direction_steps = 0
         self.bounded = True
         self.acquisition: tuple[int, float, int, int] | None = None
+        self.candidate_origin: tuple[int, float, int, int] | None = None
+        self.candidate_records: list[dict[str, Any]] = []
+        self.candidate_minimum = self.candidate_maximum = 0
+        self.candidate_resets: list[dict[str, Any]] = []
+        self.candidate_qualified_sample_index: int | None = None
         self.stationary_records: list[dict[str, Any]] = []
         self.stationary_minimum = self.stationary_maximum = self.stationary_offset = 0
         self.whole_max_abs_velocity = 0
@@ -538,8 +543,7 @@ class _AM1PostHomeReadiness:
                 # persistent Moving bit without velocity is distinct from
                 # bounded quantized velocity that reverses direction.
                 all(
-                    int(row["moving"]) == 1
-                    and abs(int(row["present_velocity_raw"])) <= STILL_VELOCITY_RAW
+                    int(row["moving"]) == 1 and abs(int(row["present_velocity_raw"])) <= STILL_VELOCITY_RAW
                     for row in self.recent
                 )
                 or all(value > STILL_VELOCITY_RAW for value in velocities)
@@ -548,17 +552,51 @@ class _AM1PostHomeReadiness:
                 self.monitor.refuse(record, "post_home: persistent velocity or Moving evidence.")
         self.whole_max_abs_velocity = max(self.whole_max_abs_velocity, abs(velocity))
         if self.acquisition is None:
-            # Only the demonstrated FIRST +100 settling indication can enter
-            # this fallback above the existing50 bound. Strict quiet is unchanged.
-            initial_settling = not self.records and velocity == 100
+            # Normal AM1 LiftAxis homes at the existing positive startup200
+            # command (AlohaMini.__init__). Only its first settling report can
+            # exceed the ordinary50 bound; no later row can renew this allowance.
+            initial_settling = (
+                not self.records
+                and STATIONARY_REPORTED_VELOCITY_LIMIT_RAW < velocity <= STARTUP_MOTION_VELOCITY_RAW
+            )
             self.initial_settling_exception_used |= initial_settling
             self.bounded = self.bounded and (
                 abs(velocity) <= STATIONARY_REPORTED_VELOCITY_LIMIT_RAW or initial_settling
             )
-            if moving == 0 and abs(velocity) <= STILL_VELOCITY_RAW and stamp <= self.deadline:
-                # Freeze once; later candidate resets cannot replace this origin.
-                self.acquisition = (position, stamp, len(self.records) + 1, self.offset)
-        if self.acquisition is not None:
+            # A quiet scalar may precede the final finite settling step. Only
+            # geometry of this still-unqualified candidate can reset; all
+            # whole-phase motion/velocity evidence above remains sticky.
+            if stamp <= self.deadline:
+                if self.candidate_origin is not None:
+                    offset = self.offset - self.candidate_origin[3]
+                    self.candidate_minimum = min(self.candidate_minimum, offset)
+                    self.candidate_maximum = max(self.candidate_maximum, offset)
+                    if (self.candidate_maximum - self.candidate_minimum > STATIONARY_POSITION_TOLERANCE_RAW
+                            or abs(offset) > STATIONARY_POSITION_TOLERANCE_RAW):
+                        self.candidate_resets.append({
+                            "discarded_origin_raw": self.candidate_origin[0],
+                            "discarded_sample_count": len(self.candidate_records),
+                            "sample_index": len(self.records) + 1,
+                            "sample_monotonic_s": stamp, "present_position_raw": position,
+                            "original_deadline_monotonic_s": self.deadline,
+                        })
+                        self.candidate_origin, self.candidate_records = None, []
+                if self.candidate_origin is None and moving == 0 and abs(velocity) <= STILL_VELOCITY_RAW:
+                    self.candidate_origin = (position, stamp, len(self.records) + 1, self.offset)
+                    self.candidate_minimum = self.candidate_maximum = 0
+                if self.candidate_origin is not None:
+                    self.candidate_records.append(record)
+                    window = stamp - self.candidate_origin[1]
+                    if len(self.candidate_records) >= 5 and window >= 4 * POLL_S:
+                        # Freeze exactly once after a complete original window.
+                        # Later drift cannot ratchet this origin or restart time.
+                        self.acquisition = self.candidate_origin
+                        self.stationary_records = list(self.candidate_records)
+                        self.stationary_minimum = self.candidate_minimum
+                        self.stationary_maximum = self.candidate_maximum
+                        self.stationary_offset = self.offset - self.acquisition[3]
+                        self.candidate_qualified_sample_index = len(self.records) + 1
+        else:
             self.stationary_offset = self.offset - self.acquisition[3]
             self.stationary_minimum = min(self.stationary_minimum, self.stationary_offset)
             self.stationary_maximum = max(self.stationary_maximum, self.stationary_offset)
@@ -576,18 +614,27 @@ class _AM1PostHomeReadiness:
 
     def evidence(self) -> dict[str, Any]:
         return {
-            "readiness_policy": "am1-post-home-first-quiet-v3",
-            "readiness_policy_version": 3,
+            "readiness_policy": "am1-post-home-initial-settling-window-v5",
+            "readiness_policy_version": 5,
             "am1_post_home_origin_raw": self.origin,
             "stationary_acquisition_origin_raw": None if self.acquisition is None else self.acquisition[0],
-            "stationary_acquisition_at_monotonic_s": None if self.acquisition is None else self.acquisition[1],
+            "stationary_acquisition_at_monotonic_s": None
+            if self.acquisition is None
+            else self.acquisition[1],
             "stationary_acquisition_sample_index": None if self.acquisition is None else self.acquisition[2],
+            "candidate_reset_count": len(self.candidate_resets),
+            "candidate_resets": list(self.candidate_resets),
+            "candidate_qualified_sample_index": self.candidate_qualified_sample_index,
             "whole_phase_sample_count": len(self.records),
             "whole_phase_max_abs_velocity_raw": self.whole_max_abs_velocity,
             "whole_phase_present_position_raw": [int(row["present_position_raw"]) for row in self.records],
             "whole_phase_present_velocity_raw": [int(row["present_velocity_raw"]) for row in self.records],
             "whole_phase_moving": [int(row["moving"]) for row in self.records],
             "initial_settling_exception_used": self.initial_settling_exception_used,
+            "first_reported_velocity_raw": None
+            if not self.records
+            else int(self.records[0]["present_velocity_raw"]),
+            "initial_settling_velocity_bound_raw": STARTUP_MOTION_VELOCITY_RAW,
             "bounded_indicator_eligible": self.bounded,
             "whole_phase_position_excursion_raw": self.maximum - self.minimum,
             "whole_phase_position_drift_raw": self.offset,
@@ -870,6 +917,8 @@ class MotorFeedbackComparison:
                 SETTLE_TIMEOUT_S,
             ):
                 raise ValueError("AM1 post-home readiness requires its original strict zero transition.")
+            if not callable(on_sample):
+                raise ValueError("AM1 post-home readiness requires its original whole-phase geometry observer.")
             readiness = _AM1PostHomeReadiness(self, am1_post_home_origin_raw, deadline)
         candidate: list[tuple[float, dict[str, Any]]] = []
         required_samples = self.min_stationary_samples

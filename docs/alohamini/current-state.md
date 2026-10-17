@@ -1,0 +1,57 @@
+# AM1 current state
+
+Updated 2026-10-17 for owner **AM1-KNOWLEDGE-REUSE-18**. Read [decisions and lessons](decisions-and-lessons.md) before diagnosing a known symptom; detailed commands/results remain in [Packet16](teleop-consolidation-16.md). This is an active index, not a replacement for historical evidence.
+
+## Objective and operating scope
+
+Dependable physical-leader AM1 manipulation and telepresence come first; Quest control and concrete household autonomy follow. Explicit virtual leaders substitute at acquisition and exercise the same mapping, authenticated transport and protected Pi execution. Per-motor controls are diagnostics.
+
+AM1 remains wireless; P1 is temporary/advisory; AM2 and `main` are unchanged. Pi owns hardware, operation identity, deadlines and cleanup; browsers attach. Service startup restores an idle interface and never starts or replays motor work. Durability means software continuity/state preservation/recovery, not mechanical lifespan.
+
+Packet18 authorizes knowledge recovery, focused offline parity and a narrow supported carry-forward correction, followed by the existing reviewed Packet16 process. The explicitly invoked AM1 reliability scope permits finite scripted/virtual input, normal owned body controls and qualified same-session recovery without attendance/readiness/manual-leader questions. Preserve protections, single ownership, calibration/mappings, separate pins and private permissions. Physical leader movement and independent cutoff development remain outside that automated packet.
+
+## Published, tested and deployed are separate
+
+| Identity | Recorded state |
+| --- | --- |
+| Repository / working PR | [pickmanmike/lerobot_alohamini PR25](https://github.com/pickmanmike/lerobot_alohamini/pull/25), `codex/am1-teleop-consolidation-16`, draft/unmerged |
+| Packet18 initial source checkpoint | `2647b77c558a36f2b07f5730cf7906b4022ba868`; integration base `386d3c376c51d3431cf379af61ab99be95382ab8` after PR24 |
+| Installed motor | `4cc9e04bff5283541524a6f61463b331587258b9` |
+| Installed runtime | `cd7e638f62d7b9852a0ebf02851e7cf9bb350a86` |
+| Installed camera / helper-manual | `bc3442b54d9c574a8feddb0ade642c9b351e59f9` / `0fe3997f12b9cdfdd01fda6f4c6b102781252448` |
+| Installed matched manifest | `bcf918dbd72ccd34024052412bebeff77a953bf72bf3b8ecc2f1d687b9daa9f6`; all ten Stage20 stopped/idle phases passed |
+| Immediate full matched predecessor | Motor `8f18835b4576abc49571c3821203b37d64718e58`, runtime `cd7e638f62d7b9852a0ebf02851e7cf9bb350a86`, same camera/helper and manifest `817736b80ee38cad35cbee64988fbd77672524918f8071ce9d0b77e99e7235cc`; older full matched bundles also retained. |
+
+Deployment authority: [Packet16 source/deployment record](teleop-consolidation-16.md#current-status-and-source), corroborated by private `.cache/am1-teleop-consolidation-16/current-state-16-published.private.md`. That private checkpoint retains full matched bundles, exact staging records and permissions; do not copy credentials or private logs into Git. Verify actual service interpreter/cwd/import roots before changed code is credited as deployed. A rollback identity is not proof of a cure.
+
+## Accepted capabilities and limits
+
+- September Local operation accepted combined arm/base/lift controls, actual-bottom homing and relief; an isolated 92 C numeric lift report was retained/tolerated. [TEMP-01](decisions-and-lessons.md#temp-01-confirm-numeric-temperature-anomalies) preserves the decision and its role-specific limits.
+- Packet14 physically demonstrated ordinary sequential control of either elbow, useful approximately 6–8.3 degree movement per nominal 10 degree command, ordinary re-jog, same-session browser return and a normal-rest next Start. Fine convergence, simultaneous all-joint control and long-duration operation were not demonstrated by those checks.
+- Current input and selected onboard WebRTC paths are implemented/staged. WebRTC has partial real playback evidence; planned view switching remains unqualified. Actual local sensing is task-selected; P1 cannot substitute for missing required evidence.
+- Combined15 remains a failed partial run: 116 Core-accepted frames, 11.002 active producer seconds, two qualified view-expiry rejoins, then a valid high-temperature reply and host fault. All 20 off/zero readbacks, lift qualification, closed buses and camera release were verified. Cleanup is not program completion.
+- The final PC-only ambiguous-Start repair at the published checkpoint has recorded offline adapter checks; it changed no installed Pi pins and adds no powered qualification. Historical test counts stay with their source versions.
+
+## Current unfinished work and next action
+
+Packet18 supersedes proposed diagnostic-first Packet17; do not assume Packet17 ran. Shared follower anomaly confirmation is implemented, independently reviewed and staged at the motor pin above, using each frozen installed ceiling and continuous per-bus/ID/run history. Historical lift 55 C/cold-start rules remain role-specific. The first parity cohort passed **385 focused checks**; this does not qualify physical workload completion.
+
+Combined16 and Combined17 both failed before Live with zero program progress. The original traces remain failed. Combined16 was separately reconciled through genuine stopped readback and durable acknowledgment; Combined17 verified all 20 off/zero readbacks, lift qualification, closed buses and camera release. The startup due-sampling correction passed 455 affected checks; the subsequent off/zero handoff correction passed 264 affected checks and is installed at motor `1402aa5f9fc55fcd9b41ac4199ffd6fb380bff5c`. These overlapping cohorts are not summed. Full originals, exact source versions and staging repairs remain in [Packet16](teleop-consolidation-16.md).
+
+**Earlier retained failure:** Combined18 stopped before Live/zero frames after WSS1006 during admission. Its initiating close cause is unproved; the three persistent services retained their PIDs with zero restarts. Ordinary client Stop interrupted the host during top-level import. Run `bfdadb10-b891-4fb1-8a16-9dd5e13d2e7d`, original native hash `b0eb95b101b7e22e0479f10206cfbca260625b202655ae662befe6deec6e51c0`, all five available originals and full history are retained. `cleanup.json` is absent; original causes/readback remain null. Camera release passed and gives no motor-cleanup credit. Core originally retained cleanup uncertainty. Later genuine read-only proof verified 20 off/zero readbacks, 80 calibration comparisons, unchanged I0, strict raw-packet lift qualification, closed buses and no owners. A separate durable executor ACK was consumed; current uncertainty is false while original stopped/unknown cleanup, null causes and missing receipt remain unchanged.
+
+**Latest retained failure:** Combined19 reached lift startup/cleanup qualification but faulted before native Live, with zero program frames. Native cause: `ValueError: Routine log record exceeds 32768 bytes`; Core separately retains its host-connect timeout. Run `07c0da60-8a26-4652-8e4a-0ba50f353b65`, original native hash `238372b5f09f1eb83dbefe76e316103c61bdba844fd8e5231a9677e0bdf3cd0d`, all six originals and full SQL audit are retained. The outer cleanup receipt remains unknown because its routine-writer drain failed; its inner 20 off/zero readbacks, qualified lift readback and closed buses are recorded. A later genuine full fresh stopped proof and separate durable executor ACK were consumed through the existing generic route: current uncertainty is false, while the original faulted result, unknown outer receipt, writer-drain error and distinct Core/native causes remain unchanged. No program, input-gap, view-switch or next-Start pass is claimed.
+
+**Latest attempted workload:** Combined20 reached native Live and streamed 134 Core-accepted frames / 12.797 active producer seconds before a later thermal consumer freshness fault. All six originals and full history are retained (run `ae986dcd-f895-4bf7-9c08-deb6b2d2af18`, original native `8d7ac7881863827a9305d241526dd5668db559783f1b3c9bdd42126d690da5f2`). Cleanup is verified, uncertainty false, lift qualified, buses closed and camera released. The existing analyzer confirms one run, fixed reference/workspace and original 300-second deadline. Program completion, the planned input gap, selected-view switch and next Start are incomplete. Chest WebRTC records 287 decoded frames and 56 fresh sampled states; this does not qualify the unperformed switch.
+
+The logging correction is now installed and physically exercised: the actual two full settings records are 17242 and 17559 UTF-8 bytes including newlines. It retains the 32768-byte bound, all settings/thermal data and existing queue/failure/cleanup behavior. Its native-module and audit checks passed 292 checks/two existing skips, with independent review clear.
+
+**Latest retained partial run:** Combined21 reached 256 accepted frames / 24.299 active producer seconds, with three ordinary pause observations and fresh-control rejoins, then faulted on native `RuntimeError: AM1 Local pause epoch is out of order`. The generic Core host-exit cause remains separate. Run `58bce1c4-c967-4e94-a841-ed5acbf00d5e`, original native `5ebf2186be9e584c6296c51ad242b42b85aec5b7f4b50b7e6e00252dc767a46f`, all six originals/full SQL and strict admitted-terminal audit are retained. All 20 off/zero readbacks, lift qualification, bus closure and camera release passed; uncertainty is false. The existing analyzer confirms one run/fixed reference/workspace/original 300-second deadline. Native elapsed progress 32.423718 s is separate from active producer time; no program, planned input-gap, view-switch or next-Start completion is claimed.
+
+The one-pass thermal acquisition correction is installed after all ten Stage20 phases, with 178 affected temperature/settings checks and independent review clear. Combined21 progressed beyond the prior consumer boundary without a thermal fault; its different pause-epoch result remains failed.
+
+**Next action:** stage the reviewed runtime-only pause-epoch correction, then resume the original **172.5 active-second / 300-second-ceiling** workload and separate supported brief next Start. Source replay reproduces the exact ordering refusal when a pending pause is coalesced across revisions before acknowledgment; the original rejected physical marker is unavailable. The correction retains that pending epoch until its exact usable acknowledgment, with 161 affected executor/Core checks and independent review clear. It is not yet installed or physically qualified. Preserve 250 ms input expiry, stale/replay rejection, original references/deadline and qualified fresh-control admission. No gains, travel or thermal limits change.
+
+The reviewed PC admission fix retains the same accepted Start, original identity/timestamps and admission ceiling through Live; it adds no Start/input or deadline reset. It passed 113 adapter checks and 33 frozen-source boundary checks; reconciliation passed 176 checks/one existing Windows skip. These overlapping cohorts are not summed. The one fresh-context read check is complete; do not repeat it.
+
+Physical USB identity/stationary sampling and human leader ergonomics remain distinct from virtual-source evidence. Dock, battery and GPU/cloud arrangements remain plans unless separately verified as installed. Export [the dated Project snapshot](project-snapshot-2026-10-17.md) if needed; no ChatGPT Project file replacement is implied.

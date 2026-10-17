@@ -16,6 +16,74 @@ from tests.robots.test_alohamini_lift_motor_feedback import FakeClock, FakeTrans
 ORIGINAL_303 = [(808, 50, 1), (808, 0, 0), (809, -50, 1), (808, 0, 0), (809, 0, 0)]
 
 
+# Exact original reply payloads and acquisition intervals, original host log SHA256
+# 065439f0a09d0fd28f0ff234cb5678ca4dc4faa1cb873685a9afe66f86f6db3d.
+# These original intervals run on an explicitly simulated, rebased test clock.
+TELEOP03_POST_HOME = (
+    (89421.937178631, 0.0009587679960532114, "0114c8500ac8c801fe000000000000e803000000000001290300005b05722400000000003a00"),
+    (89421.989480213, 0.002122437013895251, "0114c8500ac8c801fe000000000000e8030000000000012c0300004e05712400000000003300"),
+    (89422.041206034, 0.0014455310010816902, "0114c8500ac8c801fe000000000000e8030000000000012c0300004e05722400000000003400"),
+    (89422.093246234, 0.0017886319983517751, "0114c8500ac8c801fe000000000000e8030000000000012c0300004e05722400000000003100"),
+    (89422.145210826, 0.0016668210009811446, "0114c8500ac8c801fe000000000000e8030000000000012c0332804d05722400000100003600"),
+    (89422.197216713, 0.0017475959903094918, "0114c8500ac8c801fe000000000000e8030000000000012c0300004e05722400000000003500"),
+    (89422.249234192, 0.0017453369946451858, "0114c8500ac8c801fe000000000000e8030000000000012c0332804e05722400000100003700"),
+    (89422.301217653, 0.001720264001050964, "0114c8500ac8c801fe000000000000e8030000000000012c0300004e05722400000000003300"),
+    (89422.353243743, 0.0017647999920882285, "0114c8500ac8c801fe000000000000e8030000000000012c0332804f05722400000100003000"),
+    (89422.405216428, 0.0017011899908538908, "0114c8500ac8c801fe000000000000e8030000000000012c0300004e05722400000000003400"),
+    (89422.45721667, 0.0017345039959764108, "0114c8500ac8c801fe000000000000e8030000000000012c0300004e05722400000000003300"),
+    (89422.509238466, 0.0017738919996190816, "0114c8500ac8c801fe000000000000e8030000000000012c0300004e05722400000000003600"),
+    (89422.561220856, 0.0017200610018335283, "0114c8500ac8c801fe000000000000e8030000000000012c0332004c05722400000100003700"),
+    (89422.613228282, 0.0017712630069581792, "0114c8500ac8c801fe000000000000e8030000000000012c0300004e05722400000000003300"),
+    (89422.665221097, 0.0017515030049253255, "0114c8500ac8c801fe000000000000e8030000000000012d0332804e05722400000100003900"),
+    (89422.717221857, 0.0017546890012454242, "0114c8500ac8c801fe000000000000e8030000000000012c0300004e05722400000000003600"),
+    (89422.769226468, 0.001743689994327724, "0114c8500ac8c801fe000000000000e8030000000000012d0332004a05722400000100002f00"),
+    (89422.821226913, 0.0017510030011180788, "0114c8500ac8c801fe000000000000e8030000000000012c0332004b05722400000100003900"),
+    (89422.873222025, 0.0017613549862289801, "0114c8500ac8c801fe000000000000e8030000000000012d0300004e05722400000000003700"),
+    (89422.925223655, 0.0017594300006749108, "0114c8500ac8c801fe000000000000e8030000000000012c0332804e05722400000100003300"),
+)
+
+
+def test_actual_teleop03_acquires_post_settle_window_without_retiming_home_or_deadline():
+    monitor, clock, transport, _ = comparison([(809, 0, 0)])
+    first_start = TELEOP03_POST_HOME[0][0] - TELEOP03_POST_HOME[0][1]
+    original_sleep = clock.sleep
+
+    def scheduled_sleep(seconds):
+        if .04 <= seconds <= feedback.POLL_S and transport.read_count < len(TELEOP03_POST_HOME):
+            stamp, duration, _ = TELEOP03_POST_HOME[transport.read_count]
+            clock.now = stamp - duration - first_start
+        else:
+            original_sleep(seconds)
+
+    def original_reply(start, length, **kwargs):
+        assert (start, length) == (feedback.FEEDBACK_START, feedback.FEEDBACK_LENGTH)
+        assert kwargs["timeout_ms"] == 40
+        assert transport.read_count < len(TELEOP03_POST_HOME)
+        stamp, _, payload = TELEOP03_POST_HOME[transport.read_count]
+        transport.read_count += 1
+        clock.now = stamp - first_start
+        transport.arrivals.append(clock.now)
+        value = bytes.fromhex(payload)
+        return value, {"response_payload_bytes": list(value), "checksum_ok": True}
+
+    monitor.sleep, transport.read_group = scheduled_sleep, original_reply
+    result = qualify(monitor, origin=809)
+    proof = result["stationary_qualification"]
+    assert proof["readiness_branch"] == "bounded_indicator"
+    assert proof["motion_feedback_quiet"] is False
+    assert proof["am1_post_home_origin_raw"] == 809
+    assert proof["position_origin_raw"] == 812
+    assert proof["position_excursion_raw"] == 1
+    assert proof["candidate_reset_count"] == 1
+    assert proof["candidate_qualified_sample_index"] == 6
+    assert proof["whole_phase_position_excursion_raw"] == 4
+    assert proof["sample_count"] == 19
+    assert clock.now == pytest.approx(1)
+    assert transport.read_count == len(TELEOP03_POST_HOME) == 20
+    assert all(stamp < 1 for stamp in transport.arrivals)
+
+
+
 class SequenceTransport(FakeTransport):
     def __init__(self, clock, rows, *, error=None, mutation=None, clock_fault=None, delay=0.002):
         super().__init__(clock=clock)
@@ -81,6 +149,16 @@ def comparison(rows, **transport_options):
 
 
 def qualify(monitor, *, origin=808, **overrides):
+    axis = LiftAxis(LiftAxisConfig(), bus_left=SimpleNamespace(), bus_right=None)
+    axis._last_tick, axis._extended_ticks, axis._z0_deg, axis.is_homed = origin, 0, 0, True
+    heights = [0.0, 0.0]
+
+    def original_home_guard(record):
+        height = axis.get_height_mm(read_raw=lambda _: int(record["present_position_raw"]))
+        heights[0], heights[1] = min(heights[0], height), max(heights[1], height)
+        if abs(height) > .5 or heights[1] - heights[0] > .5:
+            monitor.refuse(record, "post_home: process-local zero exceeded its stationary bound.")
+
     kwargs = {
         "expected_torque": 1,
         "expected_goal": 0,
@@ -88,9 +166,18 @@ def qualify(monitor, *, origin=808, **overrides):
         "timeout_s": 1.0,
         "require_quiet_motion_feedback": True,
         "am1_post_home_origin_raw": origin,
+        "on_sample": original_home_guard,
     }
     kwargs.update(overrides)
     return monitor.qualify_stationary("post_home", **kwargs)
+
+
+@pytest.mark.parametrize("callback", [None, False, "not-a-callback"])
+def test_am1_readiness_requires_its_original_whole_phase_geometry_observer(callback):
+    monitor, _, transport, _ = comparison(ORIGINAL_303)
+    with pytest.raises(ValueError, match="observer|guard"):
+        qualify(monitor, on_sample=callback)
+    assert transport.read_count == 0
 
 
 def test_original_303_one_count_intermittent_flags_qualifies_only_at_original_deadline():
@@ -107,6 +194,17 @@ def test_original_303_one_count_intermittent_flags_qualifies_only_at_original_de
     assert 0 <= clock.now - record["sample_monotonic_s"] <= feedback.POLL_S
     assert all(at < 1.0 for at in transport.arrivals)
     assert transport.read_count == 20
+
+
+def test_qualified_candidate_freezes_once_and_later_two_tick_jump_cannot_reacquire():
+    first = [(813, 0, 0), (813, 50, 1), (813, 0, 0), (813, -50, 1), (813, 0, 0)]
+    later = [(815, 50, 1), (815, 0, 0), (815, -50, 1), (815, 0, 0)] * 4
+    monitor, clock, transport, emitted = comparison(first + later)
+    with pytest.raises(feedback.ComparisonRefusal, match="stationary"):
+        qualify(monitor, origin=813)
+    assert clock.now == pytest.approx(1)
+    assert transport.read_count == 20
+    assert not any(row["phase"] == "post_home_stationary_qualified" for row in emitted)
 
 
 def test_predeadline_acquisition_remains_eligible_when_emit_returns_after_deadline():
@@ -409,8 +507,8 @@ def test_actual_post_home_payloads_replay_with_explicit_frozen_acquisition_prove
     transport.read_group = read
     record = qualify(monitor, origin=origin)
     proof = record["stationary_qualification"]
-    assert proof["readiness_policy"] == "am1-post-home-first-quiet-v3"
-    assert proof["readiness_policy_version"] == 3
+    assert proof["readiness_policy"] == "am1-post-home-initial-settling-window-v5"
+    assert proof["readiness_policy_version"] == 5
     assert proof["readiness_branch"] == branch
     assert proof["am1_post_home_origin_raw"] == origin
     assert proof["stationary_acquisition_origin_raw"] == (815 if trial == "02" else 814)
@@ -429,11 +527,14 @@ def test_actual_post_home_payloads_replay_with_explicit_frozen_acquisition_prove
         assert proof["sample_count"] == 5
 
 
-@pytest.mark.parametrize("prefix", [[(813,150,1)], [(813,500,1)], [(813,-100,1)], [(813,100,1),(813,100,1)]])
+@pytest.mark.parametrize(
+    "prefix", [[(813, 201, 1)], [(813, 500, 1)], [(813, -100, 1)], [(813, 100, 1), (813, 100, 1)]]
+)
 def test_new_fallback_never_admits_unproven_prequiet_speed_or_repeated_settling(prefix):
-    rows = prefix + [(814,0,0),(815,50,1),(814,0,0),(815,-50,1)] * 8
+    rows = prefix + [(814, 0, 0), (815, 50, 1), (814, 0, 0), (815, -50, 1)] * 8
     monitor, clock, _, _ = comparison(rows)
-    with pytest.raises(feedback.ComparisonRefusal):qualify(monitor, origin=813)
+    with pytest.raises(feedback.ComparisonRefusal):
+        qualify(monitor, origin=813)
     assert clock.now <= 1
 
 
@@ -586,8 +687,8 @@ def test_simulated07_continuation_waits_for_original_deadline_with_frozen_band()
     assert clock.now == pytest.approx(1.0) and transport.read_count == 20
     assert proof['readiness_branch']=='bounded_indicator'
     assert proof['motion_feedback_quiet'] is False
-    assert proof['readiness_policy']=='am1-post-home-first-quiet-v3'
-    assert proof['readiness_policy_version']==3
+    assert proof['readiness_policy']=='am1-post-home-initial-settling-window-v5'
+    assert proof['readiness_policy_version']==5
     assert proof['am1_post_home_origin_raw']==812
     assert proof['stationary_acquisition_origin_raw']==815
     assert proof['stationary_acquisition_sample_index']==2
@@ -680,3 +781,283 @@ def test_former_three_moving_prefix_never_qualifies_without_stationary_tail():
     with pytest.raises(feedback.ComparisonRefusal, match='stationary'):
         qualify(monitor, origin=813)
     assert clock.now == pytest.approx(1.0) and transport.read_count == 20
+
+
+# Original full reply payloads/times, rebased only onto the explicit simulated clock.
+# Combined11 host SHA176770928f2337a19bebfb110d4bd2c5dad81c9ceaa8659031d82eb7c247a319.
+# Combined12 host SHA79b564377826687e9345c0a0b665441526bb4f57146b2eecdde71128c5fbb8ce.
+ACTUAL_11_12_POST_HOME = {
+    "11": (
+        (
+            102177.401516198,
+            0.0017413280002074316,
+            "0114c8500ac8c801fe000000000000e8030000000000012c0364006705722500000100003900",
+        ),
+        (
+            102177.453572837,
+            0.0018356229993514717,
+            "0114c8500ac8c801fe000000000000e8030000000000012e0300005905722500000000003900",
+        ),
+        (
+            102177.505545033,
+            0.0016443649947177619,
+            "0114c8500ac8c801fe000000000000e8030000000000012f0332005805722500000100003e00",
+        ),
+        (
+            102177.557602246,
+            0.0017595489916857332,
+            "0114c8500ac8c801fe000000000000e8030000000000012f0332805905722500000100003d00",
+        ),
+        (
+            102177.609557886,
+            0.0016235310031333938,
+            "0114c8500ac8c801fe000000000000e8030000000000012f0300005505722500000000003400",
+        ),
+        (
+            102177.661597397,
+            0.001758864993462339,
+            "0114c8500ac8c801fe000000000000e8030000000000012f0332805a05722500000100003600",
+        ),
+        (
+            102177.713561462,
+            0.0016722719883546233,
+            "0114c8500ac8c801fe000000000000e8030000000000012f0300005505722500000000003900",
+        ),
+        (
+            102177.766021508,
+            0.0021629930124618113,
+            "0114c8500ac8c801fe000000000000e8030000000000012f0300005505722500000000003700",
+        ),
+        (
+            102177.818572998,
+            0.0014322550123324618,
+            "0114c8500ac8c801fe000000000000e8030000000000012e0332805a05722500000100003700",
+        ),
+        (
+            102177.870608915,
+            0.0017348830006085336,
+            "0114c8500ac8c801fe000000000000e8030000000000012e0300005505722500000000003800",
+        ),
+        (
+            102177.922571741,
+            0.0016834940033731982,
+            "0114c8500ac8c801fe000000000000e8030000000000012f0332005805722500000100003600",
+        ),
+        (
+            102177.974640102,
+            0.0017863459943328053,
+            "0114c8500ac8c801fe000000000000e8030000000000012f0332805905722500000100003700",
+        ),
+        (
+            102178.026589446,
+            0.0016523090016562492,
+            "0114c8500ac8c801fe000000000000e8030000000000012f0332005705722500000100003a00",
+        ),
+        (
+            102178.078600771,
+            0.0017184390017064288,
+            "0114c8500ac8c801fe000000000000e8030000000000012e0300005505722500000000003b00",
+        ),
+        (
+            102178.130651466,
+            0.0017414379981346428,
+            "0114c8500ac8c801fe000000000000e8030000000000012e0332005605722500000100003400",
+        ),
+        (
+            102178.18258544,
+            0.0016464939981233329,
+            "0114c8500ac8c801fe000000000000e8030000000000012e0300005505722500000000003c00",
+        ),
+        (
+            102178.234578394,
+            0.0017011980089591816,
+            "0114c8500ac8c801fe000000000000e8030000000000012f0300005505722500000000003500",
+        ),
+        (
+            102178.286592108,
+            0.0017386609979439527,
+            "0114c8500ac8c801fe000000000000e8030000000000012f0332005605722400000100003b00",
+        ),
+        (
+            102178.338636211,
+            0.0017674380069365725,
+            "0114c8500ac8c801fe000000000000e8030000000000012e0332805705722500000100003b00",
+        ),
+        (
+            102178.390883628,
+            0.0019510120037011802,
+            "0114c8500ac8c801fe000000000000e8030000000000012e0332805905722500000100003400",
+        ),
+    ),
+    "12": (
+        (
+            103321.641086659,
+            0.001719252992188558,
+            "0114c8500ac8c801fe000000000000e8030000000000012c0396006805722500000100003c00",
+        ),
+        (
+            103321.696161501,
+            0.0017790120036806911,
+            "0114c8500ac8c801fe000000000000e8030000000000012e0300005d05722500000000003f00",
+        ),
+        (
+            103321.748099632,
+            0.0016741050058044493,
+            "0114c8500ac8c801fe000000000000e8030000000000012e0300005d05722500000000003900",
+        ),
+        (
+            103321.800105152,
+            0.0017366420070175081,
+            "0114c8500ac8c801fe000000000000e8030000000000012f0332805c05722500000100003900",
+        ),
+        (
+            103321.85209906,
+            0.0017401049990439788,
+            "0114c8500ac8c801fe000000000000e8030000000000012f0300005d05712500000000003e00",
+        ),
+        (
+            103321.904099172,
+            0.001751179006532766,
+            "0114c8500ac8c801fe000000000000e8030000000000012e0332005805722500000100003b00",
+        ),
+        (
+            103321.956109543,
+            0.0017584749875823036,
+            "0114c8500ac8c801fe000000000000e8030000000000012f0300005905722500000000003d00",
+        ),
+        (
+            103322.008123211,
+            0.0017414559988537803,
+            "0114c8500ac8c801fe000000000000e8030000000000012f0332005b05722500000100003e00",
+        ),
+        (
+            103322.06010686,
+            0.0016716790123609826,
+            "0114c8500ac8c801fe000000000000e8030000000000012e0300005d05722500000000003700",
+        ),
+        (
+            103322.112126527,
+            0.0017798449989641085,
+            "0114c8500ac8c801fe000000000000e8030000000000012e0332005a05722500000100003a00",
+        ),
+        (
+            103322.164116269,
+            0.0017261789907934144,
+            "0114c8500ac8c801fe000000000000e8030000000000012e0332005805722500000100003500",
+        ),
+        (
+            103322.216117622,
+            0.0017557899991516024,
+            "0114c8500ac8c801fe000000000000e8030000000000012f0300005905722500000000003900",
+        ),
+        (
+            103322.268121123,
+            0.0017534009966766462,
+            "0114c8500ac8c801fe000000000000e8030000000000012f0300005d05722500000000003600",
+        ),
+        (
+            103322.320120216,
+            0.0017497719964012504,
+            "0114c8500ac8c801fe000000000000e8030000000000012e0332005805722500000100003b00",
+        ),
+        (
+            103322.372123495,
+            0.0017729570099618286,
+            "0114c8500ac8c801fe000000000000e8030000000000012e0300005d05722500000000003a00",
+        ),
+        (
+            103322.424125774,
+            0.0017566790047567338,
+            "0114c8500ac8c801fe000000000000e8030000000000012f0332005b05722500000100003c00",
+        ),
+        (
+            103322.476158052,
+            0.0017760310001904145,
+            "0114c8500ac8c801fe000000000000e8030000000000012f0300005905722500000000003600",
+        ),
+        (
+            103322.528132887,
+            0.0017086050065699965,
+            "0114c8500ac8c801fe000000000000e8030000000000012e0332005a05722500000100003b00",
+        ),
+        (
+            103322.580132832,
+            0.0017551420023664832,
+            "0114c8500ac8c801fe000000000000e8030000000000012e0300005d05722500000000003a00",
+        ),
+        (
+            103322.632137185,
+            0.0017572899960214272,
+            "0114c8500ac8c801fe000000000000e8030000000000012f0300005905722500000000003300",
+        ),
+    ),
+}
+
+
+@pytest.mark.parametrize("trial", ["11", "12"])
+def test_actual11_and12_initial_settling_replay_keeps_original_zero_and_deadline(trial):
+    samples = ACTUAL_11_12_POST_HOME[trial]
+    monitor, clock, transport, _ = comparison([(812, 0, 0)])
+    first_start = samples[0][0] - samples[0][1]
+    original_sleep = clock.sleep
+
+    def scheduled_sleep(seconds):
+        if 0.04 <= seconds <= feedback.POLL_S and transport.read_count < len(samples):
+            stamp, duration, _ = samples[transport.read_count]
+            clock.now = stamp - duration - first_start
+        else:
+            original_sleep(seconds)
+
+    def original_reply(start, length, **kwargs):
+        assert (start, length, kwargs["timeout_ms"]) == (33, 38, 40)
+        stamp, _, payload = samples[transport.read_count]
+        transport.read_count += 1
+        clock.now = stamp - first_start
+        transport.arrivals.append(clock.now)
+        return bytes.fromhex(payload), {
+            "response_payload_bytes": list(bytes.fromhex(payload)),
+            "checksum_ok": True,
+        }
+
+    monitor.sleep, transport.read_group = scheduled_sleep, original_reply
+    proof = qualify(monitor, origin=812)["stationary_qualification"]
+    assert proof["readiness_branch"] == "bounded_indicator" and proof["motion_feedback_quiet"] is False
+    assert proof["am1_post_home_origin_raw"] == 812 and proof["position_origin_raw"] == 814
+    assert proof["first_reported_velocity_raw"] == (100 if trial == "11" else 150)
+    assert proof["initial_settling_velocity_bound_raw"] == 200
+    assert proof["initial_settling_exception_used"] is True
+    assert proof["candidate_qualified_sample_index"] == 6 and proof["candidate_reset_count"] == 0
+    assert proof["position_excursion_raw"] == 1 and proof["sample_count"] == 19
+    assert clock.now == pytest.approx(1) and transport.read_count == 20
+    assert all(stamp < 1 for stamp in transport.arrivals)
+
+
+@pytest.mark.parametrize("first", [50, 100, 150, 200])
+def test_first_positive_settling_uses_existing_normal_home_envelope_only(first):
+    tail = [(814, 0, 0), (815, 50, 1), (814, 0, 0), (815, -50, 1)] * 5
+    monitor, clock, transport, _ = comparison([(812, first, 1), *tail])
+    proof = qualify(monitor, origin=812)["stationary_qualification"]
+    assert proof["first_reported_velocity_raw"] == first
+    assert proof["initial_settling_velocity_bound_raw"] == 200
+    assert proof["initial_settling_exception_used"] is (first > 50)
+    assert proof["whole_phase_max_abs_velocity_raw"] == first
+    assert proof["readiness_branch"] == "bounded_indicator" and proof["motion_feedback_quiet"] is False
+    assert clock.now == pytest.approx(1) and transport.read_count == 20
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        [(812, 201, 1)],
+        [(812, -150, 1)],
+        [(812, 0, 0), (814, 150, 1)],
+        [(812, 100, 1), (814, 100, 1)],
+    ],
+)
+def test_initial_settling_exception_cannot_admit_excess_reverse_or_later_speed(prefix):
+    tail = [(814, 0, 0), (815, 50, 1), (814, 0, 0), (815, -50, 1)] * 5
+    monitor, clock, _, emitted = comparison([*prefix, *tail])
+    with pytest.raises(feedback.ComparisonRefusal):
+        qualify(monitor, origin=812)
+    assert clock.now <= 1
+    assert not any(row["phase"] == "post_home_stationary_qualified" for row in emitted)

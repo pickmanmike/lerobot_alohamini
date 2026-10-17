@@ -28,6 +28,14 @@ import time
 import uuid
 from urllib.parse import parse_qs, urlsplit
 
+try:
+    from tools.am1_onboard_media import SharedPrimaryEncoder
+except ModuleNotFoundError as exc:
+    if exc.name != "tools":
+        raise
+    # The existing launcher executes this file directly from its tools directory.
+    from am1_onboard_media import SharedPrimaryEncoder
+
 
 ROLES = ("forward", "backward", "chest", "wrist_left", "wrist_right")
 PREVIEW_ROLES = ("preview_1", "preview_2", "preview_3", "preview_4", "preview_5")
@@ -141,8 +149,8 @@ def validate_config(config, identify=False):
     return result
 
 
-def backend_config(config, password):
-    return {
+def backend_config(config, password, *, primary_webrtc=False):
+    result = {
         "app": {"modules": ["api", "mjpeg", "v4l2"]},
         "api": {
             "listen": "127.0.0.1:1985", "username": "camera_backend", "password": password,
@@ -155,6 +163,16 @@ def backend_config(config, password):
         },
         "log": {"level": "warn"},
     }
+    if primary_webrtc:
+        result["app"]["modules"] += ["rtsp", "webrtc"]
+        result["api"]["allow_paths"] += ["/api/webrtc"]
+        result["rtsp"] = {"listen": "127.0.0.1:8554"}
+        result["webrtc"] = {"listen": config["bind"] + ":8555/udp", "ice_servers": [],
+                            "candidates": [config["bind"] + ":8555"],
+                            "filters": {"ips": [config["bind"]], "candidates": [config["bind"]],
+                                        "networks": ["udp4"]}}
+        result["streams"]["am1_primary"] = None  # One owned FFmpeg publisher, never a second UVC open.
+    return result
 
 
 class FrameStore:
@@ -227,6 +245,7 @@ class FrameStore:
                 "age_ms": None if self.arrived is None else round((now - self.arrived) * 1000, 3),
                 "fps": round((len(recent) - 1) / span, 3) if span > 0 and state == "fresh" else 0,
                 "bytes_received": self.received, "max_gap_ms": round(self.max_gap * 1000, 3),
+                "capture_generation": self.capture_generation, "arrived_at_monotonic_s": self.arrived,
             }
 
 
@@ -289,6 +308,10 @@ class ViewerServer(ThreadingHTTPServer):
         self.identification = set(stores) == set(PREVIEW_ROLES)
         self.stop_event = threading.Event()
         self.source_lease = None
+        self.primary_encoder = None
+        self.backend_authorization = None
+        self.media_offers = deque(maxlen=12)
+        self.media_slots = threading.BoundedSemaphore(2)
         self.slots = threading.BoundedSemaphore(24)
         value = f"{credentials['username']}:{credentials['password']}".encode()
         self.authorization = b"Basic " + base64.b64encode(value)
@@ -330,7 +353,7 @@ class ViewerHandler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Content-Security-Policy", "default-src 'none'; img-src 'self' blob:; "
-                         "script-src 'self'; style-src 'self'; connect-src 'self'; "
+                         "script-src 'self'; style-src 'self'; connect-src 'self'; media-src 'self' blob:; "
                          "frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
         self.send_header("Connection", "close")
         if length is not None:
@@ -366,6 +389,7 @@ class ViewerHandler(BaseHTTPRequestHandler):
                   "/app.js": ("app.js", "text/javascript; charset=utf-8"),
                   "/freshness.js": ("freshness.js", "text/javascript; charset=utf-8"),
                   "/mjpeg.js": ("mjpeg.js", "text/javascript; charset=utf-8"),
+                  "/webrtc.js": ("webrtc.js", "text/javascript; charset=utf-8"),
                   "/style.css": ("style.css", "text/css; charset=utf-8")}
         if target.path in assets:
             if target.query:
@@ -382,6 +406,9 @@ class ViewerHandler(BaseHTTPRequestHandler):
                 self.reply(400)
                 return
             report = {"format": "MJPG", "width": 640, "height": 480, "requested_fps": 30,
+                      "owner_generation": self.server.owner_generation,
+                      "video": self.server.primary_encoder.status() if self.server.primary_encoder else
+                      {"enabled": False, "transport": "mjpeg", "rollback": True},
                       "freshness": "complete upstream frame arrival; not HTTP/cache time",
                       "cameras": {role: {**store.status(), "configured": role in self.server.configured,
                                          "rotation_degrees": self.server.rotations.get(role, 0)}
@@ -456,7 +483,86 @@ class ViewerHandler(BaseHTTPRequestHandler):
     def refuse(self):
         self.reply(403)
 
-    do_POST = do_PUT = do_PATCH = do_DELETE = do_OPTIONS = do_HEAD = do_TRACE = do_CONNECT = refuse
+    def do_POST(self):
+        supplied = self.headers.get_all("Authorization", [])
+        if len(supplied) != 1 or not hmac.compare_digest(supplied[0].encode(), self.server.authorization):
+            self.reply(401, b"Authentication required")
+            return
+        target = urlsplit(self.path)
+        match = re.fullmatch(r"/api/webrtc/(forward|backward|chest|wrist_left|wrist_right)", target.path)
+        if (not match or target.scheme or target.netloc or target.query or target.fragment
+                or self.headers.get("Upgrade") or self.headers.get("Transfer-Encoding")):
+            self.reply(403)
+            return
+        role = match[1]
+        if role not in self.server.configured or self.server.primary_encoder is None:
+            self.reply(404)
+            return
+        if self.server.stop_event.is_set():
+            self.reply(503)
+            return
+        origin = self.headers.get_all("Origin", [])
+        expected = f"http://{self.server.server_address[0]}:{self.server.server_address[1]}"
+        if origin and origin != [expected]:
+            self.reply(403)
+            return
+        lengths = self.headers.get_all("Content-Length", [])
+        types = self.headers.get_all("Content-Type", [])
+        if len(lengths) != 1 or not lengths[0].isdigit() or not 1 <= int(lengths[0]) <= 65536:
+            self.reply(413)
+            return
+        if types != ["application/sdp"]:
+            self.reply(415)
+            return
+        if self.server.source_lease is not None and self.server.source_lease.expired():
+            self.reply(503)
+            return
+        if not self.server.media_slots.acquire(blocking=False):
+            self.reply(429)
+            return
+        try:
+            now = time.monotonic()
+            if len(self.server.media_offers) >= 12 and now - self.server.media_offers[0] < 60:
+                self.reply(429)
+                return
+            self.server.media_offers.append(now)
+            body = self.rfile.read(int(lengths[0]))
+            if len(body) != int(lengths[0]) or not body.startswith(b"v=0"):
+                self.reply(400)
+                return
+            selected = self.server.primary_encoder.select(role)
+            deadline = time.monotonic() + 2.5
+            while True:
+                connection = http.client.HTTPConnection("127.0.0.1", 1985, timeout=1.5)
+                try:
+                    connection.request("POST", "/api/webrtc?src=am1_primary", body,
+                                       {"Authorization": self.server.backend_authorization,
+                                        "Content-Type": "application/sdp"})
+                    response = connection.getresponse()
+                    answer = response.read(65537)
+                    if response.status == 201 and len(answer) <= 65536 and answer.startswith(b"v=0"):
+                        current = self.server.primary_encoder.status()
+                        if (current["encode_generation"] != selected["encode_generation"]
+                                or not current["source_current"]):
+                            raise ValueError("source changed during video negotiation")
+                        self.reply(201, answer, "application/sdp", {
+                            "X-Camera-Owner-Generation": self.server.owner_generation,
+                            "X-Camera-Capture-Generation": selected["capture_generation"],
+                            "X-Camera-Encode-Generation": selected["encode_generation"],
+                        })
+                        return
+                finally:
+                    connection.close()
+                if time.monotonic() >= deadline:
+                    self.reply(503, b"Shared primary encoder unavailable")
+                    return
+                time.sleep(.1)  # Optional HTTP worker only; never capture or the motor loop.
+        except (OSError, ValueError, http.client.HTTPException):
+            self.reply(503, b"Selected primary view unavailable")
+        finally:
+            self.server.media_slots.release()
+
+    do_PUT = do_PATCH = do_DELETE = do_OPTIONS = do_HEAD = do_TRACE = do_CONNECT = refuse  # noqa: N815 - stdlib HTTP method callbacks
 
 
 def make_server(address, stores, configured, credentials, rotations=None):
@@ -512,6 +618,12 @@ def cleanup(stop, workers, server, child):
     stop.set()
     errors = []
     if server is not None:
+        server.stop_event.set()
+        if getattr(server, "primary_encoder", None) is not None:
+            try:
+                server.primary_encoder.close()
+            except Exception as exc:
+                errors.append(f"primary-encoder-stop:{type(exc).__name__}")
         try:
             server.stop_event.set()
             server.server_close()
@@ -613,7 +725,7 @@ def preflight(config, binary):
 
 
 def run_viewer(config, credentials, binary, state_dir, duration=None, identify=False,
-               stop_request=None, lease=None):
+               stop_request=None, lease=None, primary_webrtc=False, ffmpeg="ffmpeg"):
     if lease is not None:
         lease.claim()
     stores = {role: FrameStore() for role in (PREVIEW_ROLES if identify else ROLES)}
@@ -625,6 +737,14 @@ def run_viewer(config, credentials, binary, state_dir, duration=None, identify=F
         if lease is not None and lease.expired():
             raise RuntimeError("Owned camera lease expired before startup")
         preflight(config, binary)
+        if primary_webrtc and not identify:
+            # Refuse foreign listeners; never publish into or kill a pre-existing server.
+            for address, kind in [(("127.0.0.1", 8554), socket.SOCK_STREAM),
+                                  ((config["bind"], 8555), socket.SOCK_DGRAM)]:
+                with socket.socket(socket.AF_INET, kind) as probe:
+                    if kind == socket.SOCK_STREAM:
+                        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    probe.bind(address)
         if stop_request.reason is not None:
             return 0
         if lease is not None and lease.expired():
@@ -640,7 +760,7 @@ def run_viewer(config, credentials, binary, state_dir, duration=None, identify=F
         fd, name = tempfile.mkstemp(prefix="backend-", suffix=".json", dir=state_dir)
         backend_path = Path(name)
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            json.dump(backend_config(config, password), stream)
+            json.dump(backend_config(config, password, primary_webrtc=primary_webrtc and not identify), stream)
         # Isolate child from terminal Ctrl+C. No credentials on argv or in logs.
         try:
             child = subprocess.Popen([str(binary), "-config", str(backend_path)], stdin=subprocess.DEVNULL,
@@ -648,6 +768,10 @@ def run_viewer(config, credentials, binary, state_dir, duration=None, identify=F
         except OSError as exc:
             raise RuntimeError(f"camera backend launch failed (errno={exc.errno})") from exc
         authorization = "Basic " + base64.b64encode(f"camera_backend:{password}".encode()).decode()
+        server.backend_authorization = authorization
+        if primary_webrtc and not identify:
+            server.primary_encoder = SharedPrimaryEncoder(
+                {role: stores[role] for role in config["cameras"]}, ffmpeg)
         for role in config["cameras"]:
             worker = CameraReader(role, authorization, stores[role], stop)
             workers.append(worker)
@@ -667,7 +791,8 @@ def run_viewer(config, credentials, binary, state_dir, duration=None, identify=F
             now = time.monotonic()
             if now - last_report >= 1:
                 log_record("CAMERA_STATUS " + json.dumps({"elapsed_s": round(now - started, 3),
-                      "cameras": {role: stores[role].status() for role in config["cameras"]}},
+                      "cameras": {role: stores[role].status() for role in config["cameras"]},
+                      "video": server.primary_encoder.status() if server.primary_encoder else None},
                       separators=(",", ":")))
                 last_report = now
     except KeyboardInterrupt:
@@ -714,6 +839,8 @@ def main(argv=None):
     parser.add_argument("--identify", action="store_true", help="Numbered live previews from private identification.json; no role assignment")
     parser.add_argument("--credentials", type=Path, default=home / ".config/am1-camera/viewer.json")
     parser.add_argument("--binary", type=Path, default=home / ".local/lib/am1-camera/go2rtc-v1.9.14")
+    parser.add_argument("--legacy-mjpeg", action="store_true", help="Explicit prior primary-view rollback; keep native JPEG capture")
+    parser.add_argument("--ffmpeg", default="/usr/bin/ffmpeg", help="Existing Pi FFmpeg binary; no installation or hardware encoder assumed")
     parser.add_argument("--state-dir", type=Path, default=home / ".local/state/am1-camera")
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--check", action="store_true", help="Validate config only; never open cameras")
@@ -783,7 +910,8 @@ def main(argv=None):
                     lease = OwnedCameraLease(args.state_dir, args.owned_session, args.source_budget_seconds)
                 stage = "camera-preflight-or-runtime"
                 return run_viewer(config, credentials, args.binary, args.state_dir, args.duration,
-                                  identify=args.identify, stop_request=stop_request, lease=lease)
+                                  identify=args.identify, stop_request=stop_request, lease=lease,
+                                  primary_webrtc=not args.legacy_mjpeg, ffmpeg=args.ffmpeg)
             finally:
                 for sig, handler in previous.items():
                     signal.signal(sig, handler)

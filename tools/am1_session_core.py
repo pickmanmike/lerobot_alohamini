@@ -1,6 +1,7 @@
 """Durable session authority. Explicit executor outcomes; no hardware imports."""
 
 import base64
+import copy
 import hashlib
 import json
 import math
@@ -13,6 +14,15 @@ import uuid
 from collections import OrderedDict, deque
 from pathlib import Path
 
+from examples.alohamini.am1_live_teleop import (
+    TELEOP_RECIPE,
+    TELEOP_SPEC,
+    number as teleop_number,
+    validate_body,
+    validate_source,
+    validate_target,
+    validate_workspace,
+)
 from examples.alohamini.am1_session_contract import (
     ELBOW_RECOVERY_DEFINITIONS,
     LEFT_ELBOW_COARSE_BENCH_V2,
@@ -589,6 +599,7 @@ class SessionAuthority:
         self._live_activation_epoch = None
         self.released = False
         self._live_rearm = None  # Volatile; restart/reconnect never restores gesture authority.
+        self._teleop_view = None
         self.events = deque(maxlen=64)
         self.last_tick = clock()
         self.last_checkpoint = clock()
@@ -698,7 +709,8 @@ class SessionAuthority:
         run["deadline"] = native_live_at + (definition.live_s if definition else RECIPES[run["recipe"]].live_s)
         if self._physical_interactive():
             live = evidence.get("live_input", {})
-            if live.get("joint") != LIVE_ELBOW_SPECS[run["recipe"]].joint:
+            if (run["recipe"] == TELEOP_RECIPE and not self._teleop_geometry_valid(live)
+                    or run["recipe"] != TELEOP_RECIPE and live.get("joint") != LIVE_ELBOW_SPECS[run["recipe"]].joint):
                 self._finish("faulted", "physical_live_recipe_mismatch")
                 return True
             if not self._practical_geometry_valid(live):
@@ -1031,7 +1043,7 @@ class SessionAuthority:
 
     def _physical_interactive(self):
         return bool(
-            self.run and self.run["recipe"] in LIVE_ELBOW_SPECS
+            self.run and self.run["recipe"] in {*LIVE_ELBOW_SPECS, TELEOP_RECIPE}
             and self.executor.source == "protected-physical-provider"
         )
 
@@ -1083,7 +1095,7 @@ class SessionAuthority:
             "accepted_target_norm", "encoded_goal_raw", "goal_write_returned",
             "goal_write_started_at_monotonic_s", "goal_write_completed_at_monotonic_s", "goal_action_sequence",
         }
-        if not self._physical_interactive() or type(value) is not dict or set(value) != keys:
+        if not self._physical_interactive() or self.run["recipe"] == TELEOP_RECIPE or type(value) is not dict or set(value) != keys:
             return None
         spec, run = LIVE_ELBOW_SPECS[self.run["recipe"]], self.run
         if (type(value["version"]) is not int or value["version"] != 1
@@ -1159,6 +1171,18 @@ class SessionAuthority:
         value = evidence.get("live_input")
         if not self._physical_interactive():
             return None
+        if self.run["recipe"] == TELEOP_RECIPE:
+            if not isinstance(value, dict):
+                return None
+            keys = {"state", "cursor", "accepted_target", "reference", "workspace", "last_input_seq", "source",
+                    "body", "cursor_feedback_sequence", "cursor_intent_revision", "valid_until_monotonic_s",
+                    "accepted_at_monotonic_s", "live_admitted_at_monotonic_s", "live_deadline_monotonic_s",
+                    "expiry_detected_at_monotonic_s", "hold_started_at_monotonic_s", "hold_completed_at_monotonic_s",
+                    "last_input_gap_s", "goal_action_sequence", "goal_write_returned", "encoded_goals_raw"}
+            return dict(copy.deepcopy({k:v for k,v in value.items() if k in keys}),
+                        run_id=self.run["run_id"], service_incarnation=self.service_incarnation,
+                        host_incarnation=self.executor.host_incarnation, intent_revision=self.run["intent_revision"],
+                        profile=TELEOP_SPEC.profile, required_view=self._teleop_view_status())
         receipt = self._live_write_history(value.get("last_successful_write")) if isinstance(value, dict) else None
         receipt = receipt or self._live_write_history((self.run.get("live_input") or {}).get("last_successful_write"), retained=True)
         if not isinstance(value, dict):
@@ -1214,6 +1238,60 @@ class SessionAuthority:
             **{key: item for key, item in LIVE_ELBOW_SPECS[self.run["recipe"]].summary().items()
                if key in {"side", "label", "profile", "rate_norm_per_s"}},
         )
+
+    def _teleop_geometry_valid(self, value):
+        if not isinstance(value, dict):
+            return False
+        try:
+            workspace = validate_workspace(value.get("workspace"))
+            if value.get("reference") != workspace["reference"]:
+                return False
+            old = (self.run.get("live_input") or {}).get("workspace")
+            return old is None or old == workspace
+        except (TypeError, ValueError, KeyError):
+            return False
+
+    def _teleop_view_qualified(self):
+        v = self._teleop_view
+        return bool(self.run and v and v.get("run_id") == self.run["run_id"]
+                    and self.clock() < v.get("qualified_until", 0))
+
+    def _teleop_view_status(self):
+        v = self._teleop_view or {}
+        return {"required": True, "qualified": self._teleop_view_qualified(),
+                "role": v.get("role"), "cause": None if self._teleop_view_qualified() else "required_view_expired"}
+
+    def _view_progress(self, command, device):
+        fields = {"op", "run_id", "role", "owner_generation", "capture_generation", "encode_generation",
+                  "decoded_frames", "media_time", "source_sequence", "source_fresh", "received_at_monotonic_s"}
+        if (device != "gateway-view" or not self.run or self.run["recipe"] != TELEOP_RECIPE
+            or command.get("run_id") != self.run["run_id"] or set(command) != fields
+            or command.get("role") not in {"forward", "backward", "chest", "wrist_left", "wrist_right"}):
+            return self._refuse("internal current selected-view evidence required")
+        now = self.clock()
+        for key in ("owner_generation", "capture_generation", "encode_generation"):
+            if type(command[key]) is not str or not 0 < len(command[key]) <= 128:
+                return self._refuse("selected-view source generation invalid")
+        if (type(command["decoded_frames"]) is not int or command["decoded_frames"] < 0
+            or type(command["source_sequence"]) is not int or command["source_sequence"] < 0
+            or not teleop_number(command["media_time"]) or command["media_time"] < 0
+            or type(command["source_fresh"]) is not bool or not teleop_number(command["received_at_monotonic_s"])
+            or not 0 <= now - command["received_at_monotonic_s"] < .5):
+            return self._refuse("selected-view original receipt or progress invalid")
+        old = self._teleop_view or {}
+        identity = ("run_id", "role", "owner_generation", "capture_generation", "encode_generation")
+        changed = any(old.get(k) != command[k] for k in identity)
+        advancing = changed or (command["decoded_frames"] > old.get("decoded_frames", -1)
+                                and command["media_time"] > old.get("media_time", -1)
+                                and command["source_sequence"] >= old.get("source_sequence", 0))
+        if changed or not command["source_fresh"] or command["decoded_frames"] == 0:
+            self._teleop_view = dict(command, qualified_until=0.)
+        if advancing and command["source_fresh"] and command["decoded_frames"] > 0:
+            self._teleop_view = dict(command, qualified_until=command["received_at_monotonic_s"] + .5)
+        if not self._teleop_view_qualified() and self.run["status"] in {"running", "resuming"}:
+            self._pause_live_input("required_view_expired")
+        return {"accepted": True, "status": "view_progress", "effect_admitted": False,
+                "required_view": self._teleop_view_status()}
 
     def _clear_input(self, *, preserve_rearm=False):
         if not preserve_rearm:
@@ -2051,6 +2129,8 @@ class SessionAuthority:
     def _handle(self, c, d):
         op = c.get("op")
         now = self.clock()
+        if op == "view_progress":
+            return self._view_progress(c, d)
         if (self._physical_interactive() and self.run["status"] == "finishing"
                 and op in {"connect", "release", "handoff", "release_input", "resume", "grant", "input"}):
             return self._refuse("physical finishing already in progress")
@@ -2450,6 +2530,8 @@ class SessionAuthority:
                 )
             return {"accepted": True, "status": "released", "effect_admitted": not self.asynchronous}
         if op == "resume":
+            if self.run["recipe"] == TELEOP_RECIPE and not self._teleop_view_qualified():
+                return self._refuse("current required selected view must advance before Resume")
             if self._physical_interactive() and c.get("host_incarnation") != self.executor.host_incarnation:
                 return self._refuse("stale physical host identity")
             automatic = "rearm_of_intent_revision" in c
@@ -2506,6 +2588,8 @@ class SessionAuthority:
         if op == "grant":
             if self.run["status"] != "running" or RECIPES[self.run["recipe"]].mode != "interactive":
                 return self._refuse("interactive running required")
+            if self.run["recipe"] == TELEOP_RECIPE and not self._teleop_view_qualified():
+                return self._refuse("required selected view expired")
             if self._physical_interactive():
                 if (type(c.get("intent_revision")) is not int
                         or c["intent_revision"] != self.run["intent_revision"]
@@ -2529,17 +2613,31 @@ class SessionAuthority:
             if type(seq) is not int or seq <= self.connection["seq"]:
                 return self._refuse("sequence must increase")
             physical = self._physical_interactive()
+            teleop = physical and self.run["recipe"] == TELEOP_RECIPE
             if physical:
-                joint = LIVE_ELBOW_SPECS[self.run["recipe"]].joint
+                joint = None if teleop else LIVE_ELBOW_SPECS[self.run["recipe"]].joint
                 allowed = {
                     "op", "run_id", "service_incarnation", "controller_generation", "connection_generation",
                     "host_incarnation", "intent_revision", "grant_id", "seq", "target",
                 }
+                if teleop:
+                    allowed |= {"body", "source"}
                 if (set(c) - allowed or type(c.get("intent_revision")) is not int
                         or c["intent_revision"] != self.run["intent_revision"]
                         or c.get("host_incarnation") != self.executor.host_incarnation):
                     return self._refuse("stale or malformed physical intent identity")
-                if (not isinstance(target, dict) or set(target) != {joint}
+                if teleop:
+                    try:
+                        e = self._evidence()
+                        workspace = validate_workspace(e.get("live_input", {}).get("workspace"))
+                        target = validate_target(target, workspace=workspace)
+                        body = validate_body(c.get("body"))
+                        source = validate_source(c.get("source"), grant_id=self.grant["id"], previous=self.run.get("input_source"))
+                    except (ValueError, KeyError, TypeError):
+                        return self._refuse("invalid or stale whole-frame source/target/body")
+                    if not self._teleop_view_qualified():
+                        return self._refuse("required selected view expired")
+                elif (not isinstance(target, dict) or set(target) != {joint}
                         or type(target[joint]) not in (int, float)
                         or not math.isfinite(target[joint])):
                     return self._refuse("invalid named physical target")
@@ -2567,11 +2665,14 @@ class SessionAuthority:
                     controller_generation=self.controller["generation"],
                     connection_generation=self.connection["generation"],
                     host_incarnation=self.executor.host_incarnation, grant_id=self.grant["id"], seq=seq,
+                    **({"body":body, "source":source} if teleop else {}),
                 )
                 if not accepted:
                     return self._refuse("physical input mailbox refused")
                 self.applied_input = {"expires": expiry, "seq": seq, "intent_revision": self.run["intent_revision"]}
                 self.run["intent"] = dict(target)
+                if teleop:
+                    self.run["input_source"] = source
             else:
                 accepted = self.executor.apply(target)
                 self.run["intent"] = list(target)
@@ -2645,6 +2746,10 @@ class SessionAuthority:
                     and not self._practical_geometry_valid(e.get("live_input"))):
                 self._finish("faulted", "physical_live_preset_geometry_mismatch")
                 return
+            if (r["recipe"] == TELEOP_RECIPE and e.get("feedback") is True and e.get("native_ack") is True
+                    and not self._teleop_geometry_valid(e.get("live_input"))):
+                self._finish("faulted", "physical_live_teleop_geometry_mismatch")
+                return
             live_input = self._live_input_status(e, include_rearm=False)
             if live_input is not None:
                 r["live_input"] = live_input
@@ -2652,6 +2757,9 @@ class SessionAuthority:
                         and e.get("acknowledged_intent_revision") == r["intent_revision"]):
                     self._pause_live_input("native_input_expired")
                     return
+            if r["recipe"] == TELEOP_RECIPE and r["status"] in {"running", "resuming"} and not self._teleop_view_qualified():
+                self._pause_live_input("required_view_expired")
+                return
             qualified = e["feedback"] and e["required_observation"] and e["native_ack"]
             # Only the measured hold immediately preceding this Resume's active
             # epoch may bridge its first native ACK. A watchdog's later hold must
@@ -2961,6 +3069,8 @@ class SessionAuthority:
                 "live_input",
             }
             public = _status_small(run, keys)
+            if self._physical_interactive() and run.get("recipe") == TELEOP_RECIPE:
+                public["live_input"] = self._live_input_status(evidence)
             public["execution"] = _status_execution(run.get("execution"))
             public["physical_result"] = _status_lifecycle(run.get("physical_result"), rows=True)
             receipt = run.get("completion_receipt")
@@ -3015,7 +3125,17 @@ class SessionAuthority:
             "retained_return_reference",
             "live_input",
         }
-        public = _status_small(evidence, keys)
+        presented_evidence = evidence
+        if run is not None and run.get("recipe") == TELEOP_RECIPE:
+            ack = evidence.get("accepted_host_action")
+            if isinstance(ack, dict):
+                # The exact live summary is already exposed separately. Keep
+                # original raw acquisition facts inside the existing ACK field
+                # without its duplicated workspace exceeding the field cap.
+                presented_evidence = {**evidence, "accepted_host_action": {
+                    key: value for key, value in ack.items() if key != "live_input"
+                }}
+        public = _status_small(presented_evidence, keys)
         if self._physical_interactive():
             public["live_input"] = self._live_input_status(evidence)
         public["lifecycle"] = _status_lifecycle(evidence.get("lifecycle"))

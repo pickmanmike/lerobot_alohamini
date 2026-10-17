@@ -441,9 +441,22 @@ class AlohaMiniClient(Robot):
         """Do not withhold advancing AM1 feedback behind a missing older reply."""
         zmq = self._zmq
         self._last_response_request_sent_at = None
+
+        def retire_expired_requests():
+            # A short empty poll is not a request timeout. Preserve the original
+            # one-second native request freshness budget and never renew sent_at.
+            now = time.monotonic()
+            for token in tuple(self._observation_request_tokens):
+                sent_at = self._observation_request_sent_at.get(token)
+                if type(sent_at) not in (int, float) or not 0 <= now - sent_at < 1.0:
+                    self._observation_request_tokens.remove(token)
+                    self._observation_request_sent_at.pop(token, None)
+                    self._observation_response_cache.pop(token, None)
+
+        retire_expired_requests()
         if not self._observation_request_tokens:
             self._drain_observation_responses(limit=self.observation_request_window)
-            self._fill_observation_request_window()
+        self._fill_observation_request_window()
 
         poller = zmq.Poller()
         poller.register(self.zmq_observation_socket, zmq.POLLIN)
@@ -451,8 +464,15 @@ class AlohaMiniClient(Robot):
         while self._observation_request_tokens:
             # Bound each drain as well as the unchanged overall poll deadline.
             self._drain_observation_responses(limit=self.observation_request_window)
-            available = next((token for token in self._observation_request_tokens
-                              if token in self._observation_response_cache), None)
+            retire_expired_requests()  # A reply may cross its original age while poll waited.
+            available = next(
+                (
+                    token
+                    for token in self._observation_request_tokens
+                    if token in self._observation_response_cache
+                ),
+                None,
+            )
             if available is not None:
                 message = self._observation_response_cache.pop(available)
                 # Missing earlier requests can no longer provide advancing data.
@@ -478,12 +498,9 @@ class AlohaMiniClient(Robot):
             if self.zmq_observation_socket not in ready:
                 break
 
-        # Preserve the existing bounded empty-poll retry: retire one missing
-        # credit, never extend a safety deadline or grow the request window.
-        if self._observation_request_tokens:
-            token = self._observation_request_tokens.popleft()
-            self._observation_request_sent_at.pop(token, None)
-            self._observation_response_cache.pop(token, None)
+        # Retain still-fresh unanswered credits across short polls. A dropped
+        # whole window is retried only when its original requests have expired.
+        retire_expired_requests()
         self._fill_observation_request_window()
         logging.info("No new data available within timeout.")
         return None

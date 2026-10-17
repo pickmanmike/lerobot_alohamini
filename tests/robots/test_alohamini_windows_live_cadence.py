@@ -130,9 +130,12 @@ def test_observation_window_recovers_after_timeout_then_late_and_fresh_responses
     client._fill_observation_request_window()
 
     assert client._poll_and_get_latest_message() is None
-    assert tuple(client._observation_request_tokens) == (b"2", b"3", b"4")
+    # Packet16 correction: a short empty poll does not retire an original fresh request.
+    assert tuple(client._observation_request_tokens) == (b"1", b"2", b"3")
 
     socket.responses.extend(([b"1", b"late"], [b"2", b"fresh"]))
+    assert client._poll_and_get_latest_message() == [b"late"]
+    assert tuple(client._observation_request_tokens) == (b"2", b"3", b"4")
     assert client._poll_and_get_latest_message() == [b"fresh"]
     assert tuple(client._observation_request_tokens) == (b"3", b"4", b"5")
 
@@ -190,10 +193,23 @@ def test_am1_missing_oldest_reply_does_not_conceal_available_tracked_feedback(mo
 
     observation = client.get_observation()
 
+    if request_age_s >= 1.0:
+        # Packet16 correction: stale available replies are excluded before decoding,
+        # without creating a fresh observation sequence or receipt timestamp.
+        assert observation.get("arm_left_shoulder_pan.pos") is None
+        assert client.observation_sequence == 0
+        assert client.latest_observation_received_at is None
+        assert client.latest_observation_roundtrip_age_s is None
+        fresh = client._observation_request_tokens[0]
+        socket.responses.extend(([b"1", b'{"arm_left_shoulder_pan.pos":-99.0}'],
+                                 [fresh, b'{"arm_left_shoulder_pan.pos":13.0}']))
+        assert client.get_observation()["arm_left_shoulder_pan.pos"] == 13.0
+        assert client.observation_sequence == 1
+        assert client.latest_observation_roundtrip_age_s == 0.0
+        return
     assert observation["arm_left_shoulder_pan.pos"] == 12.0
     assert client.observation_sequence == 1
-    # An available reply may still be stale. Keep its original send time for
-    # the existing Local freshness guard, rather than rejuvenating its age.
+    # A still-fresh reply retains its original send time; it is never rejuvenated.
     assert client.latest_observation_roundtrip_age_s == pytest.approx(request_age_s)
     assert len(client._observation_request_tokens) == 3
     socket.responses.extend(([b"1", b'{"arm_left_shoulder_pan.pos":-99.0}'],
@@ -232,8 +248,11 @@ def test_observation_sequence_advances_after_timeout_and_late_response_recovery(
     )
     observation = client.get_observation()
 
-    assert observation["arm_left_shoulder_pan.pos"] == pytest.approx(12.0)
+    # Packet16 correction: token1 remains a legitimate fresh request after one empty poll.
+    assert observation["arm_left_shoulder_pan.pos"] == pytest.approx(-99.0)
     assert client.observation_sequence == 1
+    assert client.get_observation()["arm_left_shoulder_pan.pos"] == pytest.approx(12.0)
+    assert client.observation_sequence == 2
 
 
 def test_local_pause_retires_pre_pause_tokens_and_rejects_late_old_replies():
@@ -1004,12 +1023,15 @@ def test_local_feedback_exposes_request_to_reply_age_not_just_receipt_age():
     client, socket = make_observation_transport_client()
     client._is_connected = True
     client._fill_observation_request_window()
-    client._observation_request_sent_at[b"1"] -= 1.5
+    client._observation_request_sent_at[b"1"] -= 0.75
     socket.responses.append([b"1", b'{"arm_left_shoulder_pan.pos":12.0}'])
 
     client.get_observation()
 
-    assert client.latest_observation_roundtrip_age_s >= 1.5
+    # Packet16 correction: a still-valid original request age survives decoding;
+    # replies at or beyond one second are excluded by the separate negative cases.
+    assert 0.75 <= client.latest_observation_roundtrip_age_s < 1.0
+    assert 0 <= time.monotonic() - client.latest_observation_received_at < 0.1
     assert b"1" not in client._observation_request_sent_at
 
 

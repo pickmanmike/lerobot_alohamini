@@ -324,6 +324,19 @@ class AlohaMini(Robot):
 
     @property
     def is_calibrated(self) -> bool:
+        if getattr(self, "_am1_teleop_binding", None) is not None:
+            from .am1_live_teleop import refresh_startup_temperatures
+
+            # Each existing bus check performs its original calibration reads.
+            # Keep due follower slots continuous between the two chain scans.
+            refresh_startup_temperatures(self)
+            left_calibrated = self.left_bus.is_calibrated
+            refresh_startup_temperatures(self)
+            if not left_calibrated or self.right_bus is None:
+                return left_calibrated
+            right_calibrated = self.right_bus.is_calibrated
+            refresh_startup_temperatures(self)
+            return right_calibrated
         return self.left_bus.is_calibrated and (
             self.right_bus.is_calibrated if self.right_bus else True
         )
@@ -496,6 +509,19 @@ class AlohaMini(Robot):
 
     def configure(self) -> None:
         """Configure motor modes and gains while leaving all torque disabled."""
+        if getattr(self, "_am1_teleop_binding", None) is not None:
+            from .am1_live_teleop import prepare_settings, refresh_startup_temperatures
+            prepare_settings(self)
+            for bus, names in ((self.left_bus, self.left_arm_motors), (self.right_bus, self.right_arm_motors)):
+                for name in names:
+                    refresh_startup_temperatures(self)
+                    set_torque_enabled(bus, (name,), enabled=False)
+            # The lift retains its existing velocity-mode homing/relief policy.
+            # No arm gain, acceleration, gearing or calibration is rewritten.
+            refresh_startup_temperatures(self)
+            self.lift.configure(force=True)
+            refresh_startup_temperatures(self)
+            return
         visible = getattr(self, "_am1_visible_control_evidence", None)
         visible_binding = getattr(self, "_am1_visible_control_binding", None)
         if visible_binding is not None:
@@ -667,6 +693,10 @@ class AlohaMini(Robot):
         return identity
 
     def _read_am1_activation_raw(self, bus: FeetechMotorsBus, register: str, name: str, *, phase: str, num_retry: int = REGISTER_RETRIES) -> int:
+        if getattr(self, "_am1_teleop_binding", None) is not None:
+            from .am1_live_teleop import refresh_startup_temperatures
+
+            refresh_startup_temperatures(self)
         started_at = time.monotonic()
         record = {"phase": phase, "motor": name, "register": register, "read_started_at": started_at}
         try:
@@ -737,7 +767,7 @@ class AlohaMini(Robot):
     def _qualify_am1_live_endpoint(self, bus, name, calibration, *, phase):
         """Qualify the installed one-tick feedback error without expanding commands."""
         from .lift_operational import TemperatureWindow
-        if (self._am1_protected_live_spec() is None or bus is not self.left_bus
+        if (self._am1_protected_live_spec() is None and getattr(self, "_am1_teleop_binding", None) is None or bus is not self.left_bus
                 or name != "arm_left_shoulder_lift" or calibration != (2, 0, 515, 848, 3223)
                 or bus.motors[name].id != 2 or bus.motors[name].model != "sts3215"):
             raise RuntimeError("AM1 arm activation refused: endpoint representation lacks its exact protected binding/mapping")
@@ -798,7 +828,7 @@ class AlohaMini(Robot):
         window.assert_fresh(time.monotonic())
         if (self._am1_activation_calibration(bus, name) != calibration
                 or {key: read(key) for key in expected} != expected
-                or self._am1_protected_live_spec() is None):
+                or self._am1_protected_live_spec() is None and getattr(self, "_am1_teleop_binding", None) is None):
             raise RuntimeError("AM1 arm activation refused: endpoint settings/binding changed during qualification")
         if phase == "after_home":
             self._refresh_am1_startup_lift_feedback()
@@ -923,8 +953,15 @@ class AlohaMini(Robot):
         if torque != 0:
             raise RuntimeError(f"AM1 arm activation refused: '{name}' torque must be disabled before qualification.")
         present = self._read_am1_activation_raw(bus, "Present_Position", name, phase=phase)
+        teleop_rest = getattr(self, "_am1_teleop_rest_evidence", ())
+        if (getattr(self, "_am1_teleop_binding", None) is not None
+                and bus is self.left_bus and name == "arm_left_shoulder_lift"
+                and (present >= calibration[4] - math.floor(.5 * 4096 / 360)
+                     or phase == "after_home" and teleop_rest)):
+            from .am1_live_teleop import qualify_rest
+            return qualify_rest(self, bus, name, calibration, phase=phase, present_raw=present)
         endpoint_before = any(row["phase"] == "before_home" for row in getattr(self, "_am1_live_endpoint_evidence", ()))
-        if (present == calibration[4] + 1 or phase == "after_home" and endpoint_before and name == "arm_left_shoulder_lift") and self._am1_protected_live_spec() is not None:
+        if (present == calibration[4] + 1 or phase == "after_home" and endpoint_before and name == "arm_left_shoulder_lift") and (self._am1_protected_live_spec() is not None or getattr(self, "_am1_teleop_binding", None) is not None):
             return self._qualify_am1_live_endpoint(bus, name, calibration, phase=phase)
         if not calibration[3] <= present <= calibration[4]:
             raise RuntimeError(
@@ -995,6 +1032,7 @@ class AlohaMini(Robot):
             if self.config.robot_model == "alohamini1":
                 self._am1_activation_readbacks = []
                 self._am1_live_endpoint_evidence = []
+                self._am1_teleop_rest_evidence = []
                 self._am1_live_frozen_holds = self._am1_live_frozen_binding = None
                 self._am1_live_activation_binding = None
                 if self._am1_protected_live_spec() is not None:
@@ -1046,6 +1084,9 @@ class AlohaMini(Robot):
             visible = getattr(self, "_am1_visible_control_evidence", None)
             if getattr(self, "_am1_visible_control_binding", None) is not None:
                 visible.verify_visible_active(self)
+            if getattr(self, "_am1_teleop_binding", None) is not None:
+                from .am1_live_teleop import verify_settings
+                verify_settings(self)
         except BaseException as error:
             cleanup_errors = self._safe_shutdown(close_buses=True, recover_interrupted_bus_io=True)
             if isinstance(error, (KeyboardInterrupt, SystemExit)):
@@ -1489,6 +1530,8 @@ class AlohaMini(Robot):
 
         #print(f"Left arm motors: {self.left_arm_motors}, Right arm motors: {self.right_arm_motors}")  # debug
         selected = self._selected_joint_evidence_active()
+        teleop = getattr(self, "_am1_teleop_binding", None) is not None
+        left_raw, right_raw = {}, {}
         selected_raw = {} if selected else None
         selected_bus, selected_motor, selected_key = self._selected_joint_identity()
         selected_started = time.monotonic() if selected and selected_bus is self.left_bus else None
@@ -1496,7 +1539,7 @@ class AlohaMini(Robot):
         if self.left_arm_motors:
             left_pos = (
                 self._read_arm_positions(self.left_bus, self.left_arm_motors, raw_positions=selected_raw)
-                if selected and selected_bus is self.left_bus else self._read_arm_positions(self.left_bus, self.left_arm_motors)
+                if selected and selected_bus is self.left_bus else self._read_arm_positions(self.left_bus, self.left_arm_motors, raw_positions=left_raw if teleop else None)
             )
         if selected and selected_bus is self.left_bus and selected_motor in selected_raw:
             self._am1_selected_joint_position = {
@@ -1505,6 +1548,7 @@ class AlohaMini(Robot):
                 "read_started_at_monotonic_s": selected_started,
                 "read_completed_at_monotonic_s": time.monotonic(),
             }
+        left_read_completed = time.monotonic()
         left_arm_done_t = time.perf_counter()
 
 
@@ -1517,14 +1561,16 @@ class AlohaMini(Robot):
         )
         base_done_t = time.perf_counter()
 
+        right_read_started = time.monotonic()
         if selected and selected_bus is self.right_bus:
             selected_started = time.monotonic()
         right_pos = (
             self._read_arm_positions(self.right_bus, self.right_arm_motors, raw_positions=selected_raw)
             if self.right_bus and self.right_arm_motors and selected and selected_bus is self.right_bus
-            else self._read_arm_positions(self.right_bus, self.right_arm_motors)
+            else self._read_arm_positions(self.right_bus, self.right_arm_motors, raw_positions=right_raw if teleop else None)
             if self.right_bus and self.right_arm_motors else {}
         )
+        right_read_completed = time.monotonic()
         if selected and selected_bus is self.right_bus and selected_motor in selected_raw:
             self._am1_selected_joint_position = {
                 "raw": int(selected_raw[selected_motor]), "normalized": float(right_pos[selected_motor]),
@@ -1537,6 +1583,16 @@ class AlohaMini(Robot):
         right_arm_state = {f"{k}.pos": v for k, v in right_pos.items()}
 
         obs_dict = {**left_arm_state, **right_arm_state,**base_vel}
+        if teleop:
+            obs_dict["_am1_arm_feedback"] = {"version": 1, "positions": {
+                **{name + ".pos": {"raw": int(raw), "normalized": left_pos[name],
+                    "read_started_at_monotonic_s": arm_read_started,
+                    "read_completed_at_monotonic_s": left_read_completed}
+                   for name, raw in left_raw.items()},
+                **{name + ".pos": {"raw": int(raw), "normalized": right_pos[name],
+                    "read_started_at_monotonic_s": right_read_started,
+                    "read_completed_at_monotonic_s": right_read_completed}
+                   for name, raw in right_raw.items()}}}
         if (getattr(self,"_am1_visible_control_binding",None) or {}).get("recipe")=="physical-live-right-elbow":
             self._am1_workspace_observation = dict(positions={**left_arm_state,**right_arm_state},
                 read_started_at=arm_read_started, read_completed_at=time.monotonic())
@@ -1544,6 +1600,12 @@ class AlohaMini(Robot):
         if operation is not None:
             try:
                 operation.contribute_observation(obs_dict)
+                if teleop:
+                    obs_dict["_am1_lift_feedback"] = {
+                        "version": 1, "height_mm": operation.height_mm,
+                        **{key: operation.last_record[key] for key in (
+                            "present_velocity_raw", "sample_monotonic_s", "request_duration_s")},
+                    }
             except BaseException as error:
                 # Fault-only in-memory evidence: do not print or perform another
                 # serial read here. Preserve the original refusal through cleanup.
@@ -1569,6 +1631,9 @@ class AlohaMini(Robot):
 
         # currents protection
         self.read_and_check_currents(limit_ma=2000, print_currents=True)
+        if teleop:
+            from .am1_live_teleop import poll_health
+            poll_health(self)
         currents_done_t = time.perf_counter()
 
         # Capture images from cameras
@@ -1936,7 +2001,7 @@ class AlohaMini(Robot):
                     hold_goal = present
                 hold_goal_state[motor] = hold_goal
                 hold_direction_state[motor] = direction
-                print(
+                self._report_routine(
                     f"[{log_tag}] {motor}: {current_ma:.1f} mA >= {current_limit_ma:.1f} mA; "
                     f"holding at position {hold_goal:.2f} (present={present:.2f})"
                 )
@@ -1951,7 +2016,7 @@ class AlohaMini(Robot):
             if (goal - hold_goal) * direction >= release_margin:
                 hold_goal_state.pop(motor, None)
                 hold_direction_state.pop(motor, None)
-                print(
+                self._report_routine(
                     f"[{log_tag}] {motor}: goal {goal:.2f} past held position {hold_goal:.2f}; releasing hold."
                 )
                 continue
@@ -1970,11 +2035,17 @@ class AlohaMini(Robot):
                 failures.append(f"{name}: {error}")
         if failures:
             raise RuntimeError(f"Failed to stop all base motors: {'; '.join(failures)}")
-        logger.info("Base motors stopped")
+        if getattr(self, "_am1_routine_report", None) is not None:
+            self._report_routine("Base motors stopped")
+        else:
+            logger.info("Base motors stopped")
 
     def stop_lift(self) -> None:
         self.lift.stop()
-        logger.info("Lift motor stopped")
+        if getattr(self, "_am1_routine_report", None) is not None:
+            self._report_routine("Lift motor stopped")
+        else:
+            logger.info("Lift motor stopped")
 
     def stop_motion(self) -> None:
         failures = []
@@ -1990,6 +2061,10 @@ class AlohaMini(Robot):
         """AM1 Local pause: replace old goals with measured raw arm positions."""
         if self.config.robot_model != "alohamini1" or self.config.no_follower:
             raise RuntimeError("AM1 Local arm hold requires connected AM1 follower arms")
+        if getattr(self, "_am1_teleop_binding", None) is not None:
+            from .am1_live_teleop import hold_goals
+            hold_goals(self)
+            return
         if self._am1_protected_live_spec() is not None or getattr(self, "_am1_live_frozen_binding", None) is not None:
             self._hold_am1_live_selected()
             return
@@ -2011,6 +2086,13 @@ class AlohaMini(Robot):
                      and self._am1_elbow_integral_trial.restore_required))
             and getattr(self.config, "robot_model", None) == "alohamini1"
         )
+
+    def _report_routine(self, line):
+        report = getattr(self, "_am1_routine_report", None)
+        if report is None:
+            print(line)
+        else:
+            report(line)
 
     def read_and_check_currents(self, limit_ma, print_currents):
         """Read left/right bus currents (mA), print them, and enforce overcurrent protection"""
@@ -2036,25 +2118,33 @@ class AlohaMini(Robot):
             if elbow_trial is not None and elbow_trial.restore_required:
                 elbow_trial.check_current(raw, float(limit_ma))
 
-        selected_started = time.monotonic() if selected and selected_bus is self.left_bus else None
+        teleop = getattr(self, "_am1_teleop_binding", None) is not None
+        left_started = time.monotonic()
+        selected_started = left_started if selected and selected_bus is self.left_bus else None
         left_curr_raw = self.left_bus.sync_read("Present_Current", list(self.left_bus.motors.keys()))
+        if teleop:
+            from .am1_live_teleop import check_sampled_current
+            check_sampled_current(self, "left", left_curr_raw, left_started, time.monotonic())
         if selected and selected_bus is self.left_bus:
             check_selected_current(left_curr_raw, selected_started, time.monotonic())
         right_curr_raw = {}
         if getattr(self, "right_bus", None):
+            right_started = time.monotonic()
             if selected and selected_bus is self.right_bus:
                 selected_started = time.monotonic()
             right_curr_raw = self.right_bus.sync_read("Present_Current", list(self.right_bus.motors.keys()))
+            if teleop:
+                check_sampled_current(self, "right", right_curr_raw, right_started, time.monotonic())
             if selected and selected_bus is self.right_bus:
                 check_selected_current(right_curr_raw, selected_started, time.monotonic())
 
         now = time.monotonic()
         if print_currents and (now - self._last_currents_log_t >= 1.0):
             left_arr = [int(float(raw) * scale) for raw in left_curr_raw.values()]
-            print(f"[Currents][left_bus] {left_arr}")
+            self._report_routine(f"[Currents][left_bus] {left_arr}")
             if right_curr_raw:
                 right_arr = [int(float(raw) * scale) for raw in right_curr_raw.values()]
-                print(f"[Currents][right_bus] {right_arr}")
+                self._report_routine(f"[Currents][right_bus] {right_arr}")
             self._last_currents_log_t = now
 
         tripped = None
@@ -2063,7 +2153,7 @@ class AlohaMini(Robot):
 
             if current_ma > limit_ma:
                 self._overcurrent_count[name] = self._overcurrent_count.get(name, 0) + 1
-                print(f"[Overcurrent] {name}: {current_ma:.1f} mA > {limit_ma:.1f} mA ")
+                self._report_routine(f"[Overcurrent] {name}: {current_ma:.1f} mA > {limit_ma:.1f} mA ")
             else:
                 # reset when it goes back to normal -> "consecutive" semantics
                 self._overcurrent_count[name] = 0
@@ -2074,7 +2164,7 @@ class AlohaMini(Robot):
 
         if tripped is not None:
             name, current_ma, n = tripped
-            print(
+            self._report_routine(
                 f"[Overcurrent] {name}: {current_ma:.1f} mA > {limit_ma:.1f} mA "
                 f"for {n} consecutive reads, disconnecting!"
             )
@@ -2085,7 +2175,7 @@ class AlohaMini(Robot):
             try:
                 self.disconnect()
             except Exception as e:
-                print(f"[Overcurrent] disconnect error: {e}")
+                self._report_routine(f"[Overcurrent] disconnect error: {e}")
             sys.exit(1)
 
 
