@@ -190,7 +190,7 @@ class OperationalLift(InstalledLiftCheck):
         if self.failure is not None:
             raise self.failure
 
-    def _qualify_startup_off(self) -> dict[str, Any]:
+    def _qualify_startup_off(self, *, before_torque: bool = False) -> dict[str, Any]:
         """Acquire observed off state, then prove the unchanged strict baseline."""
         previous_clock = None
 
@@ -394,25 +394,52 @@ class OperationalLift(InstalledLiftCheck):
             ),
             strict_baseline=baseline["stationary_qualification"],
         )
+        if before_torque:
+            self.bus.expected_torque = 0
+            self.monitor.record(
+                "before_torque_off_acquisition_completed",
+                sample_monotonic_s=baseline["sample_monotonic_s"],
+                strict_baseline=baseline["stationary_qualification"],
+            )
+        # Equal/lower replies keep the original peak time. Phase work can cross
+        # its next slot even before the nominal raw poll interval is due. Keep
+        # the same off/zero/cold acquisition, observer and original deadline.
+        now = clock(baseline)
+        self.temperature.assert_fresh(now, refreshing=True)
+        budget = deadline - now
+        if budget <= 0:
+            self.refuse(baseline, "startup off: original deadline expired before thermal handoff.")
+        slot = (round(now * 1_000_000_000) - self.temperature._origin_ns) // round(
+            self.temperature.SLOT_S * 1_000_000_000
+        )
+        if now - self.temperature._last_sample_at >= feedback.POLL_S or slot > self.temperature._last_slot:
+            handoff = self.monitor.sample(
+                "startup_off_handoff", expected_torque=0, expected_goal=0, cold_start=True,
+                timeout_ms=min(self.monitor.sample_timeout_ms, budget * 1000), emit_sample=False,
+            )
+            handoff["absolute_deadline_monotonic_s"] = deadline
+            if clock(handoff) > deadline:
+                self.refuse(handoff, "startup off: original deadline exceeded by thermal handoff.")
+            if observe(handoff):
+                self.refuse(handoff, "startup off: persistent motion invalidated the completed stationary window.")
+            self.emit(handoff)
+            now = clock(handoff)
+            if now > deadline:
+                self.refuse(handoff, "startup off: original deadline exceeded after thermal handoff evidence.")
+        # No output or second-clock decision between this strict guard and return.
+        self.temperature.assert_fresh(now)
         return baseline
 
     def _qualify_before_torque(self) -> None:
         # Reuse the same off acquisition and nine-sample strict baseline, with
         # its one original 600 ms budget and the existing thermal history.
         self.monitor.record("before_torque_off_acquisition_started")
-        baseline = self._qualify_startup_off()
-        self.bus.expected_torque = 0
-        self.monitor.record(
-            "before_torque_off_acquisition_completed",
-            sample_monotonic_s=baseline["sample_monotonic_s"],
-            strict_baseline=baseline["stationary_qualification"],
-        )
+        self._qualify_startup_off(before_torque=True)
 
     def start(self):
         try:
             self.monitor.read_configuration()
             self._qualify_startup_off()
-            self.temperature.assert_fresh(time.monotonic())
             result, _ = self.home_and_relieve(
                 allow_one_count_variation=True, qualify_initial_direction=True,
                 require_quiet_post_home=True,
