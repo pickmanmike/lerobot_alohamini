@@ -399,3 +399,82 @@ def test_runner_constructor_failure_still_saves_first_cause_without_start(tmp_pa
     summary = json.loads((tmp_path / "evidence" / "summary.json").read_text())
     assert summary["failure"] == "injected existing CA/cookie refusal"
     assert not summary.get("owned_run_id") and not summary.get("stop_receipt")
+
+
+@pytest.mark.parametrize("kind", ["virtual-leaders", "usb-leaders"])
+def test_cold_local_initialization_finishes_before_live_wss_is_attached(tmp_path, monkeypatch, kind):
+    import asyncio
+    import builtins
+    import json
+    import time
+    from types import SimpleNamespace
+
+    m = adapter()
+    state = {
+        "attached": False,
+        "cold_imported": False,
+        "source_opened": False,
+        "source_closed": False,
+        "client_closed": False,
+        "claim_calls": 0,
+    }
+    actual_import = builtins.__import__
+
+    def cold_import(name, *args, **kwargs):
+        if name == "lerobot.robots.alohamini.alohamini_client":
+            if state["attached"]:
+                raise RuntimeError("cold mapper import blocked the active WSS reader")
+            time.sleep(0.03)  # Deterministic stand-in for the measured7.632s cold import.
+            state["cold_imported"] = True
+        return actual_import(name, *args, **kwargs)
+
+    class Session:
+        def __init__(self, *args):
+            pass
+
+        async def attach(self):
+            state["attached"] = True
+
+        async def claim(self):
+            state["claim_calls"] += 1
+            assert state["cold_imported"]
+            assert kind != "usb-leaders" or state["source_opened"]
+            raise RuntimeError("injected stop at first current claim before Start")
+
+        async def close(self):
+            state["client_closed"] = True
+
+    class Input:
+        def __init__(self, **kwargs):
+            pass
+
+        def open(self):
+            assert not state["attached"]
+            state["source_opened"] = True
+
+        def close(self):
+            state["source_closed"] = True
+
+    monkeypatch.setattr(m, "SessionClient", Session)
+    monkeypatch.setattr(m, "USBLeaderSource", Input)
+    monkeypatch.setattr(builtins, "__import__", cold_import)
+    args = SimpleNamespace(
+        source=kind,
+        output=str(tmp_path / "evidence"),
+        url="unused",
+        ca="unused",
+        storage_state="unused",
+        left_port="unused",
+        right_port="unused",
+        leader_id="unused",
+        calibration_dir="unused",
+        no_keyboard=True,
+    )
+    with pytest.raises(RuntimeError, match="injected stop at first current claim"):
+        asyncio.run(m.run(args))
+    summary = json.loads((tmp_path / "evidence" / "summary.json").read_text())
+    assert state["cold_imported"] and state["attached"] and state["client_closed"]
+    assert state["claim_calls"] == 1
+    assert state["source_closed"] is (kind == "usb-leaders")
+    assert "start_operation_id" not in summary and "owned_run_id" not in summary
+    assert summary["cleanup_errors"] == []

@@ -455,7 +455,6 @@ async def run(args):
     }
     try:
         client = SessionClient(args.url, args.ca, args.storage_state)
-        await client.attach()
         # Missing/mismatched USB inputs refuse before creating a robot motor task.
         if args.source == "usb-leaders":
             source = USBLeaderSource(
@@ -480,6 +479,9 @@ async def run(args):
             keyboard.connect()
             if not keyboard.is_connected:
                 raise RuntimeError("ordinary body keyboard failed to connect")
+        # Cold mapper imports and local source setup must finish before the
+        # current WSS reader/heartbeat starts on this asyncio thread.
+        await client.attach()
         await client.claim()
         renewal = asyncio.create_task(client.renew())
         import aiohttp
