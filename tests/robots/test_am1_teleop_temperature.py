@@ -14,6 +14,7 @@ from lerobot.robots.alohamini.lift_operational import (
     OperationalLift as ActualOperationalLift,
     TemperatureWindow,
 )
+from tests.robots.test_alohamini_lift_operational import operating_robot as operating_robot
 from tests.robots.test_am1_pre_activation import activation as activation
 from tests.robots.test_am1_teleop_settings import configured_robot, resting_robot
 
@@ -591,3 +592,209 @@ def test_live_consumer_stale_after_one_due_pass_still_faults_without_retry(activ
     window = robot._am1_teleop_temperatures["left", 1]["window"]
     assert activation.clock.now - window._last_sample_at < 0.5
     assert activation.clock.now - window.samples[0][0] > 0.5
+
+
+@pytest.fixture
+def verification_lift_boundary(operating_robot):
+    """Actual owner/verify entrypoints; synthetic clock aligned to Combined23 slots.
+
+    The five offsets after the bridge retain the saved lift reply spacing and
+    values. The bridge and per-register2.1ms latency are synthetic inputs, not
+    missing historical samples or a continuation of the failed physical run.
+    """
+    robot, clock = operating_robot
+    robot.connect(calibrate=False)
+    operation = robot._lift_operation
+    robot.config.no_follower = False
+    # The existing lift-only fixture has no followers. Add synthetic register
+    # chains while retaining its real lift bus/monitor/operation unchanged.
+    robot.left_arm_motors = tuple(f"arm_left_{index}" for index in range(1, 7))
+    robot.right_arm_motors = tuple(f"arm_right_{index}" for index in range(1, 7))
+    robot.left_bus.motors.update({
+        name: SimpleNamespace(id=index, model="sts3215")
+        for index, name in enumerate(robot.left_arm_motors, 1)
+    })
+    robot.right_bus = SimpleNamespace(
+        motors={name: SimpleNamespace(id=index, model="sts3215")
+                for index, name in enumerate(robot.right_arm_motors, 1)},
+        registers={}, is_connected=True,
+    )
+    robot.right_bus.sync_read = lambda register, names, **kwargs: {
+        name: robot.right_bus.registers[register, name] for name in names
+    }
+    robot._am1_teleop_binding = {
+        "recipe": teleop.RECIPE, "run_id": str(uuid4()), "host_incarnation": str(uuid4()),
+    }
+    robot._am1_teleop_settings = {}
+    robot._am1_teleop_temperatures = {}
+    robot._am1_teleop_startup_temperature = False
+    for side, bus, names in teleop._groups(robot):
+        rows = {register: {} for register in (*teleop.STATIC, *teleop.HEALTH)}
+        for name in names:
+            values = {register: 1 for register in teleop.STATIC}
+            values.update({
+                "ID": bus.motors[name].id, "Model_Number": 777,
+                "Max_Temperature_Limit": 70, "Min_Voltage_Limit": 40,
+                "Max_Voltage_Limit": 140, "Operating_Mode": 0,
+                "Status": 0, "Present_Temperature": 31, "Present_Voltage": 120,
+                "Torque_Enable": 1, "Lock": 1,
+            })
+            for register, value in values.items():
+                bus.registers[register, name] = rows[register][name] = value
+        robot._am1_teleop_settings[side] = {"registers": rows, "timing": {}}
+    window = operation.temperature
+    origin = window._origin_ns / 1e9
+    base = origin + (int((clock.now - origin) / 0.1) + 2) * 0.1
+    for index, (offset, value) in enumerate((
+        (-0.084660631, 32),  # Synthetic preceding occupied slot.
+        (0.015339369, 32), (0.123349347, 32), (0.231354882, 32),
+        (0.325340583, 33), (0.377366133, 32),
+    )):
+        clock.now = base + offset - 0.002
+        robot.left_bus.read_sequences["Present_Temperature", "lift_axis"] = [value]
+        operation.poll()
+        if index == 0:
+            teleop.read_groups(robot, ("Present_Temperature",))
+            robot._am1_teleop_startup_temperature = True
+    for _side, bus, _names in teleop._groups(robot):
+        original = bus.sync_read
+        def timed_read(*args, _original=original, **kwargs):
+            values = _original(*args, **kwargs)
+            clock.sleep(0.0021)
+            return values
+        bus.sync_read = timed_read
+    clock.now = base + 0.392773296
+    try:
+        yield robot, clock, base, window
+    finally:
+        # No destructor or fixture cleanup work is added to this offline case.
+        robot.left_bus.is_connected = robot.right_bus.is_connected = False
+
+
+def test_verify_settings_keeps_lift_slot_between_saved23_startup_boundaries(
+    verification_lift_boundary, monkeypatch,
+):
+    robot, clock, base, window = verification_lift_boundary
+    operation = robot._lift_operation
+    origin = window._origin_ns
+    original_poll = operation.poll
+    depth = 0
+    def nonrecursive_poll(*args, **kwargs):
+        nonlocal depth
+        assert depth == 0
+        depth += 1
+        try:
+            return original_poll(*args, **kwargs)
+        finally:
+            depth -= 1
+    monkeypatch.setattr(operation, "poll", nonrecursive_poll)
+    teleop.verify_settings(robot)
+    # Existing post-verification host refresh/first two polls, trace-aligned.
+    assert clock.now < base + 0.499348681
+    clock.now = base + 0.499348681
+    robot._refresh_am1_startup_lift_feedback()
+    operation.poll()
+    clock.now = base + 0.534349109
+    operation.poll()
+    assert operation.temperature is window and window._origin_ns == origin
+    assert window.outliers == 0 and len(window.samples) == 5
+    assert any(base + 0.4 <= when < base + 0.5 for when, _ in window.samples)
+    assert operation.failure is None
+    assert robot._am1_teleop_active_settings
+
+
+@pytest.mark.parametrize("problem,register,value,reason", [
+    ("latched", None, None, "retained lift first cause"),
+    ("status", "Status", 4, "status"),
+    ("current", "Present_Current", 400, "current"),
+    ("device", "Present_Temperature", IOError("checksum/device failure"), "grouped feedback"),
+])
+def test_verify_settings_lift_due_read_preserves_original_faults(
+    verification_lift_boundary, problem, register, value, reason,
+):
+    from lerobot.robots.alohamini.lift_motor_feedback import ComparisonRefusal
+
+    robot, _clock, _base, _window = verification_lift_boundary
+    operation = robot._lift_operation
+    if problem == "latched":
+        operation.failure = ComparisonRefusal(reason)
+    else:
+        robot.left_bus.read_sequences[register, "lift_axis"] = [value]
+    with pytest.raises(RuntimeError, match=reason) as caught:
+        teleop.verify_settings(robot)
+    assert operation.failure is caught.value
+    reads = len(operation.transport.group_reads)
+    with pytest.raises(RuntimeError) as repeated:
+        robot._refresh_am1_startup_lift_feedback()
+    assert repeated.value is caught.value and len(operation.transport.group_reads) == reads
+
+
+def test_verify_settings_cannot_refresh_a_lost_raw_lift_history(verification_lift_boundary):
+    robot, clock, _base, window = verification_lift_boundary
+    last = window._last_sample_at
+    # Followers continue genuinely; the independent lift owner has lost its RAW age.
+    for offset in (0.1, 0.2, 0.3, 0.4, 0.501):
+        clock.now = last + offset
+        teleop.read_groups(robot, ("Present_Temperature",))
+    reads = len(robot._lift_operation.transport.group_reads)
+    with pytest.raises(RuntimeError, match="stale"):
+        teleop.verify_settings(robot)
+    assert len(robot._lift_operation.transport.group_reads) == reads
+    assert window.failure is not None
+
+
+@pytest.mark.parametrize("startup,has_operation,registers", [
+    (True, False, ("Status",)),  # Explicit pre-home/cleanup path without an owner.
+    (False, True, ("Status",)),  # Startup is sealed before steady Live/restore.
+    (True, True, ("Present_Temperature",)),  # Lift callback cannot recurse.
+])
+def test_startup_lift_hook_skips_unowned_sealed_and_temperature_only_reads(
+    thermal_robot, startup, has_operation, registers,
+):
+    robot, _clock = thermal_robot
+    robot._am1_teleop_startup_temperature = startup
+    robot._am1_teleop_temperatures = {}
+    robot._lift_operation = object() if has_operation else None
+    def forbidden():
+        pytest.fail("unexpected lift I/O outside guarded startup register cadence")
+    robot._refresh_am1_startup_lift_feedback = forbidden
+    teleop.read_groups(robot, registers, active=True)
+
+
+def test_saved23_empty_lift_slot_still_latches_without_an_intervening_acquisition(
+    verification_lift_boundary,
+):
+    robot, clock, base, window = verification_lift_boundary
+    robot._am1_teleop_startup_temperature = False
+    teleop.verify_settings(robot)
+    clock.now = base + 0.499348681
+    robot._refresh_am1_startup_lift_feedback()
+    robot._lift_operation.poll()
+    clock.now = base + 0.534349109
+    with pytest.raises(RuntimeError, match="five-slot feedback window is stale"):
+        robot._lift_operation.poll()
+    assert window.samples[0] == (base + 0.015339369, 32)
+    assert not any(base + 0.4 <= when < base + 0.5 for when, _ in window.samples)
+    assert window.outliers == 0 and window.failure is not None
+
+
+def test_verify_settings_lift_due_read_cannot_purge_two_existing_high_slots(
+    verification_lift_boundary,
+):
+    robot, clock, base, window = verification_lift_boundary
+    operation = robot._lift_operation
+    for offset in (0.4, 0.5):
+        clock.now = base + offset - 0.002
+        robot.left_bus.read_sequences["Present_Temperature", "lift_axis"] = [55]
+        operation.poll()
+    retained = list(window.samples)[-2:]
+    assert sum(value >= 55 for _, value in window.samples) == 2
+    clock.now = base + 0.6
+    robot.left_bus.read_sequences["Present_Temperature", "lift_axis"] = [55]
+    reads = len(operation.transport.group_reads)
+    with pytest.raises(RuntimeError, match="majority") as caught:
+        teleop.verify_settings(robot)
+    assert operation.failure is caught.value
+    assert len(operation.transport.group_reads) == reads + 1
+    assert list(window.samples)[-3:-1] == retained
+    assert sum(value >= 55 for _, value in window.samples) == 3

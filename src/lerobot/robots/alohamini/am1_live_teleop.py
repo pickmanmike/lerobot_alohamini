@@ -357,6 +357,11 @@ def read_groups(robot, registers, *, active=None, _live_health=False):
             else:
                 if register != "Present_Temperature":
                     refresh_startup_temperatures(robot)
+                    if (
+                        getattr(robot, "_am1_teleop_startup_temperature", False)
+                        and getattr(robot, "_lift_operation", None) is not None
+                    ):
+                        robot._refresh_am1_startup_lift_feedback()
                 started = time.monotonic()
                 values = bus.sync_read(register, names, normalize=False, num_retry=0)
                 completed = time.monotonic()
