@@ -1070,7 +1070,9 @@ class AM1HostLoopTiming:
             self._omitted_completed_loop_count += 1
         self._completed.append(self.previous)
 
-    def snapshot(self, at: float) -> dict[str, Any]:
+    def snapshot(
+        self, at: float, *, action_timing_ms: dict | None = None, command_completed: bool = False,
+    ) -> dict[str, Any]:
         current = None
         if self.current is not None:
             current = {**self.current, "phase_ms": dict(self.current["phase_ms"])}
@@ -1082,6 +1084,20 @@ class AM1HostLoopTiming:
         def copy_completed(record: dict[str, Any]) -> dict[str, Any]:
             return {**record, "phase_ms": dict(record["phase_ms"])}
 
+        # send_action publishes these only after its writes return. If this
+        # command failed partway through, these are the previous action's
+        # timings; retain that distinction rather than relabeling them current.
+        action = action_timing_ms if isinstance(action_timing_ms, dict) else {}
+        action_fields = (
+            "action_prepare", "action_lift", "action_relative_limit",
+            "action_left_gripper_limit", "action_left_joint_limit",
+            "action_right_gripper_limit", "action_right_joint_limit",
+            "action_left_write", "action_right_write", "action_base_write", "action_total",
+        )
+        retained_action = {
+            name: action[name] for name in action_fields
+            if type(action.get(name)) in (int, float) and math.isfinite(action[name]) and action[name] >= 0
+        }
         return {
             "clock": "perf_counter",
             "previous_loop": None if self.previous is None else copy_completed(self.previous),
@@ -1089,6 +1105,9 @@ class AM1HostLoopTiming:
             "recent_completed_loops": [copy_completed(record) for record in self._completed],
             "completed_loop_history_limit": self.HISTORY_SIZE,
             "omitted_completed_loop_count": self._omitted_completed_loop_count,
+            "command_completed": command_completed,
+            "action_timing_scope": "last_completed_send_action",
+            "action_timing_ms": retained_action,
         }
 
 
@@ -1670,6 +1689,7 @@ def _run_host(args):
     )
     fault_loop_context = None
     fault_loop_context_error = None
+    command_received = False
     routine_writer = None
     routine_report = print
     no_lift_drain = object()
@@ -1970,7 +1990,10 @@ def _run_host(args):
             # Capture BEFORE cleanup, attach AFTER it. Cleanup time must not be
             # misreported as poll/log/observation delay, or diagnostic I/O delay zero/off.
             try:
-                fault_loop_context = loop_timing.snapshot(time.perf_counter())
+                fault_loop_context = loop_timing.snapshot(
+                    time.perf_counter(), action_timing_ms=robot.logs.get("action_timing_ms"),
+                    command_completed=command_received,
+                )
                 sample = getattr(getattr(robot, "_lift_operation", None), "last_record", None) or {}
                 # last_record is cached before some operational guards; it may
                 # contain the rejected sample, not the last accepted one.

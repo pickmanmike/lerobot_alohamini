@@ -1804,6 +1804,9 @@ def test_real_host_retains_fault_loop_timings_after_cleanup(
     assert len(notes) == 1  # The current host loses the preceding iteration's timing.
     context = json.loads(notes[0].split(": ", 1)[1])
     assert context["clock"] == "perf_counter"
+    assert context["command_completed"] is (delay_stage == "robot_observation")
+    assert context["action_timing_scope"] == "last_completed_send_action"
+    assert context["action_timing_ms"] == robot.logs["action_timing_ms"]
     loop = context["current_loop"] if delay_stage == "robot_observation" else context["previous_loop"]
     assert loop["phase_ms"][delay_stage] >= 296
     if delay_stage == "lift_diagnostics":
@@ -1958,6 +1961,25 @@ def test_host_fault_timing_history_is_bounded_and_snapshot_is_independent():
     later = timing.snapshot(101.0)
     assert later["recent_completed_loops"][-2]["phase_ms"]["sample_log"] >= 0
     assert later["omitted_completed_loop_count"] == 93
+
+
+@pytest.mark.parametrize("command_completed", [False, True])
+def test_host_fault_timing_keeps_bounded_last_completed_action(command_completed):
+    from lerobot.robots.alohamini.alohamini_host import AM1HostLoopTiming
+
+    timing = AM1HostLoopTiming()
+    timing.begin(100.0)
+    action = {"action_total": 191.049, "action_left_joint_limit": 160.0,
+              "action_base_write": float("inf"), "action_lift": -1,
+              "action_prepare": True, "unrelated": {"private": "excluded"}}
+    context = timing.snapshot(100.2, action_timing_ms=action,
+                              command_completed=command_completed)
+    assert context["command_completed"] is command_completed
+    assert context["action_timing_scope"] == "last_completed_send_action"
+    assert context["action_timing_ms"] == {"action_total": 191.049, "action_left_joint_limit": 160.0}
+    action["action_total"] = 1
+    assert context["action_timing_ms"]["action_total"] == 191.049
+    assert len(json.dumps(context, allow_nan=False)) < 4096
 
 
 def initial_startup_records(capsys):

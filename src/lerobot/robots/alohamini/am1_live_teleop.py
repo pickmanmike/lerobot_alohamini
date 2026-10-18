@@ -308,7 +308,12 @@ def _refresh_due_temperatures(robot, *, force=False, active=None):
 
 
 def refresh_after_arm_retry(robot):
-    """Interleave due original feedback between the existing finite PP attempts."""
+    """Retain the existing retry entrypoint for the shared owner scheduler."""
+    service_due_feedback(robot)
+
+
+def service_due_feedback(robot):
+    """Service due real role feedback between ordinary Live I/O phases."""
     if getattr(robot, "_am1_teleop_first_error", None) is not None:
         raise robot._am1_teleop_first_error
     if not binding_valid(robot):
@@ -1048,9 +1053,14 @@ def poll_health(robot):
     robot._am1_teleop_startup_temperature = False
 
 
-def check_sampled_current(robot, side, values, started, completed):
+def check_sampled_current(robot, side, values, started, completed, *, names=None):
     baseline = robot._am1_teleop_settings[side]
     limits = baseline["registers"]["Protection_Current"]
+    if names is not None:
+        names = tuple(names)
+        if not names or len(set(names)) != len(names) or set(names) - set(limits) or set(values) != set(names):
+            raise RuntimeError("AM1 sampled current motor subset differs from its frozen mapping")
+        limits = {name: limits[name] for name in names}
     sample = {
         "raw": {name: _integer(values[name]) for name in limits},
         "read_started_at_monotonic_s": started,

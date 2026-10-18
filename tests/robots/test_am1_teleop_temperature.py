@@ -595,7 +595,7 @@ def test_live_consumer_stale_after_one_due_pass_still_faults_without_retry(activ
 
 
 @pytest.fixture
-def verification_lift_boundary(operating_robot):
+def verification_lift_boundary(operating_robot, arm_names=None):
     """Actual owner/verify entrypoints; synthetic clock aligned to Combined23 slots.
 
     The five offsets after the bridge retain the saved lift reply spacing and
@@ -608,8 +608,8 @@ def verification_lift_boundary(operating_robot):
     robot.config.no_follower = False
     # The existing lift-only fixture has no followers. Add synthetic register
     # chains while retaining its real lift bus/monitor/operation unchanged.
-    robot.left_arm_motors = tuple(f"arm_left_{index}" for index in range(1, 7))
-    robot.right_arm_motors = tuple(f"arm_right_{index}" for index in range(1, 7))
+    robot.left_arm_motors = tuple(arm_names["left"]) if arm_names else tuple(f"arm_left_{index}" for index in range(1, 7))
+    robot.right_arm_motors = tuple(arm_names["right"]) if arm_names else tuple(f"arm_right_{index}" for index in range(1, 7))
     robot.left_bus.motors.update({
         name: SimpleNamespace(id=index, model="sts3215")
         for index, name in enumerate(robot.left_arm_motors, 1)
@@ -1016,11 +1016,12 @@ def test_observation_retry_cannot_repair_a_single_uninterrupted_stall(
         state.robot.get_observation()
     assert state.operation.failure is caught.value
     assert state.attempts["left"] == 1
-    assert not any(row[0] == "drain" for row in state.events)
+    assert all(row[1] <= 3 for row in state.events if row[0] == "drain")
+    assert state.attempts["right"] == 0  # The original strict fault precedes further ordinary I/O.
     import json
-    note = next(row for row in caught.value.__notes__ if row.startswith("AM1 observation freshness context: "))
-    context = json.loads(note.split(": ", 1)[1])["arm_position_acquisitions"]
-    assert set(context) == {"left", "right"}
+    note = next(row for row in caught.value.__notes__ if row.startswith("AM1 arm position acquisition context: "))
+    context = json.loads(note.split(": ", 1)[1])["recent_acquisitions"]
+    assert set(context) == {"left"}  # No fabricated receipt for the unread right side.
     assert len(context["left"]["attempts"]) == 1
     interval = (context["left"]["attempts"][0] if stage == "single_attempt" else
                 context["left"]["normalization"])
@@ -1067,7 +1068,7 @@ def test_observation_retry_does_not_retry_acquisition_or_logging_faults(
         assert state.sink_entered.wait(1)
     with pytest.raises((RuntimeError, ConnectionError), match=expected) as caught:
         state.robot.get_observation()
-    assert state.attempts == {"left": 1, "right": 0}
+    assert state.attempts == {"left": 0 if fault in {"latched", "stale_raw"} else 1, "right": 0}
     if fault in {"latched", "log"}:
         assert caught.value is primary
     if fault in {"latched", "stale_raw", "missing_drain", "log"}:
@@ -1093,7 +1094,7 @@ def test_observation_retry_preserves_third_distinct_high_slot(observation_retry_
     state.options["failed_attempts"]["left"] = 3
     with pytest.raises(RuntimeError, match="majority"):
         state.robot.get_observation()
-    assert state.attempts == {"left": 1, "right": 0}
+    assert state.attempts == {"left": 0 if role == "follower" else 1, "right": 0}
     assert sum(value >= high_window.ceiling_c for _, value in high_window.samples) == 3
     assert all(peak in high_window.samples for peak in retained)
     assert high_window.failure is not None
@@ -1262,6 +1263,254 @@ def test_observation_retry_refuses_follower_raw_expiry_during_lift_before_follow
     before = len(state.events)
     with pytest.raises(RuntimeError, match="stale"):
         state.robot.get_observation()
-    assert state.attempts == {"left": 1, "right": 0}
+    assert state.attempts == {"left": 0, "right": 0}
     assert not any(row[0] == "other_read" and row[2:4] == (63, 1)
                    for row in state.events[before:])
+
+
+@pytest.fixture
+def command_cadence_boundary(operating_robot, monkeypatch):
+    """Reuse the original SDK/owner fixture with explicitly synthetic command costs."""
+    from contextlib import contextmanager
+
+    from lerobot.motors import Motor, MotorCalibration, MotorNormMode
+    from lerobot.motors.feetech.tables import MODEL_CONTROL_TABLE
+
+    robot, clock = operating_robot
+    names = {side: tuple("arm_" + side + "_" + joint for joint in
+                         ("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"))
+             for side in ("left", "right")}
+    robot.base_motors = ["base_left_wheel", "base_back_wheel", "base_right_wheel"]
+    for index, name in enumerate(robot.base_motors, 8):
+        robot.left_bus.motors[name] = Motor(index, "sts3215", MotorNormMode.RANGE_M100_100)
+        robot.left_bus.calibration[name] = MotorCalibration(index, 0, 0, 1000, 2200)
+        for register, value in (("Present_Velocity", 0), ("Present_Current", 2)):
+            robot.left_bus.registers[register, name] = value
+    with (
+        contextmanager(verification_lift_boundary.__wrapped__)(operating_robot, arm_names=names) as prepared,
+        contextmanager(observation_retry_boundary.__wrapped__)(prepared, monkeypatch) as state,
+    ):
+        robot.config.max_relative_target = 20.
+        state.command_reads, state.command_writes = [], []
+        state.profile = None
+        for side, bus, _names in teleop._groups(robot):
+            original = bus.port_handler.respond
+            def respond(packet, _original=original, _side=side):
+                address, width = packet[5:7]
+                ids = tuple(packet[7:-1])
+                register = next((name for name in ("Present_Position", "Present_Current", "Present_Velocity")
+                                 if MODEL_CONTROL_TABLE["sts3215"][name] == (address, width)), None)
+                target = ((state.profile == "current" and _side == "left" and register == "Present_Current" and len(ids) == 1)
+                          or (state.profile == "trace_pp" and _side == "left" and register == "Present_Position" and len(ids) == 5)
+                          or (state.profile == "base" and register == "Present_Velocity" and ids == (8, 9, 10)))
+                failures = sum(row[0:3] == (_side, register, ids) and row[5] for row in state.command_reads)
+                began = clock.now
+                if target and failures < 3:
+                    clock.sleep(.055)
+                    state.command_reads.append((_side, register, ids, began, clock.now, True))
+                    return []
+                if state.profile == "successful_chain" and register in {"Present_Position", "Present_Current"}:
+                    clock.sleep(.017)
+                result = _original(packet)
+                if register:
+                    state.command_reads.append((_side, register, ids, began, clock.now, False))
+                return result
+            bus.port_handler.respond = respond
+            def write(register, values, *, _side=side, _bus=bus, **options):
+                state.command_writes.append((_side, register, dict(values), clock.now))
+                for name, value in values.items():
+                    _bus.registers[register, name] = value
+                clock.sleep(.0005)
+                if getattr(state, "after_write", None):
+                    state.after_write(_side, register, values)
+            bus.sync_write = write
+        for side, bus, _names in teleop._groups(robot):
+            bus.motors["arm_" + side + "_gripper"].norm_mode = MotorNormMode.RANGE_0_100
+            teleop._install_group_reply_guard(robot, side, bus)
+        state.action = {**{name + ".pos": value for _side, bus, motors in teleop._groups(robot)
+                           for name, value in robot._normalize_arm_feedback(bus, dict.fromkeys(motors, 1600)).items()},
+                        "x.vel": 0., "y.vel": 0., "theta.vel": 0., "lift_axis.vel": 0.}
+        yield state
+
+
+@pytest.mark.parametrize("profile", ["current", "trace_pp", "successful_chain", "base"])
+def test_shared_command_and_observation_io_services_all_roles_before_slots_are_lost(command_cadence_boundary, profile):
+    state = command_cadence_boundary
+    robot = state.robot
+    state.profile = profile
+    if profile == "trace_pp":
+        robot._am1_left_shoulder_evidence_enabled = True
+    result = robot.send_action(state.action)
+    observed = robot.get_observation()
+    assert all(result[name] == value for name, value in state.action.items() if name.endswith(".pos"))
+    assert len([row for row in state.command_writes if row[1] == "Goal_Position"]) == 2
+    assert len([row for row in state.command_writes if row[1] == "Goal_Velocity"]) == 1
+    assert observed["lift_axis.height_mm"] == state.operation.height_mm
+    assert state.operation.temperature is state.window and state.operation.failure is None
+    state.window.assert_fresh(state.clock.now)
+    for original in state.originals.values():
+        original.assert_fresh(state.clock.now)
+    if profile != "successful_chain":
+        failed = [row for row in state.command_reads if row[5]]
+        assert len(failed) == 3
+        key = failed[0][:3]
+        assert len([row for row in state.command_reads if row[:3] == key]) == 4
+    assert len(state.operation._pending_samples) <= 3
+
+
+@pytest.mark.parametrize("stage", ["single_current", "normalization"])
+def test_shared_io_cannot_repair_one_opaque_read_or_normalization_stall(command_cadence_boundary, monkeypatch, stage):
+    state = command_cadence_boundary
+    calls = []
+    if stage == "single_current":
+        port = state.robot.left_bus.port_handler
+        original = port.respond
+        def stalled(packet):
+            if packet[5:7] == [69, 2] and not calls:
+                calls.append(True)
+                state.clock.sleep(.191)
+            return original(packet)
+        port.respond = stalled
+    else:
+        original = state.robot._normalize_arm_feedback
+        def stalled(*args, **kwargs):
+            values = original(*args, **kwargs)
+            if not calls:
+                calls.append(True)
+                state.clock.sleep(.191)
+            return values
+        monkeypatch.setattr(state.robot, "_normalize_arm_feedback", stalled)
+    from lerobot.robots.alohamini.lift_motor_feedback import ComparisonRefusal
+    with pytest.raises((RuntimeError, ComparisonRefusal), match="stale"):
+        state.robot.send_action(state.action)
+    assert calls == [True]
+    assert not state.command_writes
+
+
+@pytest.mark.parametrize("fault", ["current", "device", "exhausted", "drain"])
+def test_shared_force_current_acquisition_cannot_swallow_protected_faults(command_cadence_boundary, fault):
+    from tests.robots.test_am1_teleop_settings import reply_packet
+    state = command_cadence_boundary
+    robot = state.robot
+    port, attempts = robot.left_bus.port_handler, []
+    original = port.respond
+    primary = OSError("bounded original writer failure")
+    if fault == "current":
+        robot.left_bus.registers["Present_Current", "arm_left_gripper"] = 310
+    if fault == "drain":
+        state.clock.sleep(.03)
+        def broken():
+            raise primary
+        robot._am1_routine_lift_drain = broken
+    def respond(packet):
+        if packet[5:7] == [69, 2]:
+            attempts.append(tuple(packet[7:-1]))
+            if fault == "device":
+                return reply_packet(packet[7], [], 126)
+            if fault == "exhausted":
+                state.clock.sleep(.055)
+                return []
+        return original(packet)
+    port.respond = respond
+    with pytest.raises(Exception) as caught:
+        robot.send_action(state.action)
+    if fault == "drain":
+        assert caught.value is primary and not attempts
+    elif fault == "exhausted":
+        assert isinstance(caught.value, ConnectionError) and len(attempts) == 4
+    else:
+        assert caught.value is robot._am1_teleop_first_error and len(attempts) == 1
+        assert "current" in str(caught.value) if fault == "current" else "device" in str(caught.value)
+    assert not state.command_writes
+
+
+def test_shared_io_preserves_actual_position_and_trace_receipts_through_servicing(command_cadence_boundary):
+    state = command_cadence_boundary
+    state.profile = "successful_chain"
+    state.robot._am1_left_shoulder_evidence_enabled = True
+    state.robot.send_action(state.action)
+    trace = state.robot._am1_left_shoulder_feedback
+    currents = [row for row in state.command_reads if row[:3] == ("left", "Present_Current", (1, 2, 3, 4, 5))]
+    positions = [row for row in state.command_reads if row[:3] == ("left", "Present_Position", (1, 2, 3, 4, 5))]
+    assert (trace["current_read_started_at"], trace["current_read_completed_at"]) == currents[-1][3:5]
+    assert (trace["position_read_started_at"], trace["position_read_completed_at"]) == positions[-1][3:5]
+    observed = state.robot.get_observation()
+    for side in ("left", "right"):
+        original = [row for row in state.command_reads if row[:3] == (side, "Present_Position", (1, 2, 3, 4, 5, 6))][-1]
+        for name in getattr(state.robot, side + "_arm_motors"):
+            sample = observed["_am1_arm_feedback"]["positions"][name + ".pos"]
+            assert (sample["read_started_at_monotonic_s"], sample["read_completed_at_monotonic_s"]) == original[3:5]
+    assert state.clock.now > original[4]
+
+
+def test_shared_current_subset_keeps_contact_hold_below_installed_hard_ceiling(command_cadence_boundary):
+    state = command_cadence_boundary
+    state.robot.left_bus.registers["Present_Current", "arm_left_gripper"] = 80  #520mA, below installed2015mA.
+    state.action["arm_left_gripper.pos"] = 40.  # Closing intent; opening still releases the ordinary contact hold.
+    result = state.robot.send_action(state.action)
+    assert result["arm_left_gripper.pos"] == 47.
+    assert not getattr(state.robot, "_am1_teleop_first_error", None)
+    assert len([row for row in state.command_writes if row[1] == "Goal_Position"]) == 2
+
+
+@pytest.mark.parametrize("boundary", ["before_left", "after_left"])
+def test_shared_servicing_preserves_real_native_expiry_without_partial_cursor_commit(command_cadence_boundary, boundary):
+    from lerobot.robots.alohamini.alohamini_host import AM1LocalControl
+    from tests.robots.test_am1_live_teleop_native import frame, sample
+
+    state = command_cadence_boundary
+    robot = state.robot
+    # Existing complete-native admission requires the supported elbow raw box.
+    for side, raw in (("left", 2124), ("right", 1847)):
+        bus = getattr(robot, side + "_bus")
+        for register in ("Present_Position", "Goal_Position"):
+            bus.registers[register, "arm_" + side + "_elbow_flex"] = raw
+    identity = {key: robot._am1_teleop_binding[key] for key in ("run_id", "host_incarnation")}
+    owner = {key: str(uuid4()) for key in ("service_incarnation", "controller_generation", "connection_generation")}
+    control = AM1LocalControl(**identity, live=True, live_recipe=teleop.RECIPE, clock=lambda: state.clock.now)
+    assert control.apply(robot, frame(identity, owner, 1))
+    assert control.apply(robot, frame(identity, owner, 2, mode="active", epoch=2))
+    original = sample(control, expiry=state.clock.now + .25)
+    assert control.apply(robot, frame(identity, owner, 3, mode="active", epoch=2, sample=original))
+    frozen, accepted = control.live_snapshot(), control.accepted_action_sequence
+    state.command_writes.clear()
+    before_events = len(robot.left_bus.events)
+    fresh = sample(control, seq=2, expiry=state.clock.now + (.005 if boundary == "before_left" else .25),
+                   source_id=original["source"]["source_id"], acquired=1.04)
+    if boundary == "after_left":
+        def expire(side, register, values):
+            if side == "left" and register == "Goal_Position":
+                state.clock.now = fresh["valid_until_monotonic_s"]
+        state.after_write = expire
+    assert not control.apply(robot, frame(identity, owner, 4, mode="active", epoch=2, sample=fresh))
+    summary = control.live_snapshot()
+    assert control.state == "paused" and summary["state"] == "expired"
+    assert control.live_sample is None and control.accepted_action_sequence == accepted
+    assert summary["cursor"] == frozen["cursor"]
+    assert summary["reference"] == frozen["reference"] and summary["workspace"] == frozen["workspace"]
+    assert summary["live_deadline_monotonic_s"] == frozen["live_deadline_monotonic_s"]
+    goals = [row for row in state.command_writes if row[1] == "Goal_Position"]
+    assert [row[0] for row in goals] == ([] if boundary == "before_left" else ["left"])
+    stopped = {row[3] for row in robot.left_bus.events[before_events:]
+               if row[1:3] == ("write", "Goal_Velocity") and row[4] == 0}
+    assert set(robot.base_motors) | {"lift_axis"} <= stopped  # Actual direct safety writes, without service.
+
+
+def test_saved35_original_right_slot_hole_remains_stale_and_latched():
+    origin = 183724.594396945
+    window = TemperatureWindow(ceiling_c=70)
+    for slot in range(1702):  # Synthetic preceding bridge; original35 timestamps below remain exact.
+        window.update(30, origin+slot*.1)
+    stamps = (183894.801738533, 183894.923767774, 183895.009750827,
+              183895.131971493, 183895.347767430)
+    for stamp in stamps[:-1]:
+        window.update(30, stamp)
+    with pytest.raises(RuntimeError, match="five-slot feedback window is stale") as failed:
+        window.update(30, stamps[-1])
+    assert list(window.samples) == [(stamp, 30) for stamp in stamps]
+    assert (stamps[-1]-stamps[0])*1000 == pytest.approx(546.028897)
+    assert [(round(stamp*1e9)-window._origin_ns)//100_000_000 for stamp in stamps] == [1702, 1703, 1704, 1705, 1707]
+    assert window.outliers == 0
+    with pytest.raises(RuntimeError) as repeated:
+        window.update(30, stamps[-1]+.01)
+    assert repeated.value is failed.value

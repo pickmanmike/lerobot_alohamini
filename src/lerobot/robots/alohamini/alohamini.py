@@ -1427,15 +1427,61 @@ class AlohaMini(Robot):
                 normalized[motor.id] = 100 - position if drive_mode else position
         return {name: normalized[bus.motors[name].id] for name in raw}
 
+    def _am1_live_feedback_active(self):
+        return (getattr(self.config, "robot_model", None) == "alohamini1"
+                and getattr(self, "_am1_teleop_binding", None) is not None
+                and getattr(self, "_am1_teleop_startup_temperature", True) is False)
+
+    def _service_am1_live_feedback(self):
+        if self._am1_live_feedback_active():
+            from .am1_live_teleop import service_due_feedback
+            service_due_feedback(self)
+
+    def _read_am1_feedback(self, bus, register, motors, *, normalize=True, receipt=None, context=None):
+        if not self._am1_live_feedback_active():
+            return bus.sync_read(register, motors) if normalize else bus.sync_read(register, motors, normalize=False)
+        from .am1_live_teleop import check_sampled_current
+
+        for attempt in range(4):
+            # Full single attempts rebuild the SDK group after role servicing.
+            # Thermal/lift/log failures stay outside the communication catch.
+            self._service_am1_live_feedback()
+            timing = {"started_at_monotonic_s": time.monotonic(), "outcome": "error"}
+            if context is not None:
+                context["attempts"].append(timing)
+            try:
+                values = bus.sync_read(register, motors, normalize=False, num_retry=0)
+            except ConnectionError:
+                timing["outcome"] = "communication_error"
+                if attempt == 3:
+                    raise
+            else:
+                timing["outcome"] = "ok"
+                break
+            finally:
+                timing["completed_at_monotonic_s"] = time.monotonic()
+        original = {"read_started_at_monotonic_s": timing["started_at_monotonic_s"],
+                    "read_completed_at_monotonic_s": timing["completed_at_monotonic_s"]}
+        if receipt is not None:
+            receipt.update(original)
+        if register == "Present_Current":
+            side = "left" if bus is self.left_bus else "right"
+            names = tuple(name for name in motors if name in self._am1_teleop_settings[side]["registers"]["Protection_Current"])
+            if names:
+                check_sampled_current(self, side, {name: values[name] for name in names},
+                                      original["read_started_at_monotonic_s"],
+                                      original["read_completed_at_monotonic_s"], names=names)
+        # No service after a successful receipt here: callers first retain its
+        # original clock and consume device/current validation, then next phase.
+        return values
+
     def _read_arm_positions(
         self, bus: FeetechMotorsBus, motors: list[str], *, raw_positions: dict[str, int] | None = None,
+        raw_timing: dict[str, float] | None = None,
     ) -> dict[str, float]:
         if getattr(self.config, "robot_model", None) != "alohamini1":
             return bus.sync_read("Present_Position", motors)
-        if (getattr(self, "_am1_teleop_binding", None) is not None
-                and getattr(self, "_am1_teleop_startup_temperature", True) is False):
-            from .am1_live_teleop import refresh_after_arm_retry
-
+        if self._am1_live_feedback_active():
             if getattr(self, "_am1_teleop_first_error", None) is not None:
                 raise self._am1_teleop_first_error
             side = "left" if bus is self.left_bus else "right"
@@ -1445,23 +1491,9 @@ class AlohaMini(Robot):
             contexts[side] = context
             self._am1_arm_position_read_context = contexts
             try:
-                for attempt in range(4):
-                    timing = {"started_at_monotonic_s": time.monotonic(), "outcome": "error"}
-                    context["attempts"].append(timing)
-                    try:
-                        raw = bus.sync_read("Present_Position", motors, normalize=False, num_retry=0)
-                    except ConnectionError:
-                        timing["outcome"] = "communication_error"
-                        if attempt == 3:
-                            raise
-                    else:
-                        timing["outcome"] = "ok"
-                        break
-                    finally:
-                        timing["completed_at_monotonic_s"] = time.monotonic()
-                    # Only the original communication failure is retriable.
-                    # Feedback/log faults leave this owner outside that catch.
-                    refresh_after_arm_retry(self)
+                raw = self._read_am1_feedback(bus, "Present_Position", motors, normalize=False,
+                                              receipt=raw_timing, context=context)
+                self._service_am1_live_feedback()
                 timing = {"started_at_monotonic_s": time.monotonic(), "outcome": "error"}
                 context["normalization"] = timing
                 try:
@@ -1469,13 +1501,15 @@ class AlohaMini(Robot):
                     timing["outcome"] = "ok"
                 finally:
                     timing["completed_at_monotonic_s"] = time.monotonic()
+                self._service_am1_live_feedback()
                 if raw_positions is not None:
                     raw_positions.update(raw)
                 return normalized
             except BaseException as error:
                 try:
                     error.add_note("AM1 arm position acquisition context: " + json.dumps(
-                        context, separators=(",", ":"), allow_nan=False,
+                        {**context, "recent_acquisitions": self._am1_arm_position_read_context},
+                        separators=(",", ":"), allow_nan=False,
                     ))
                 except Exception:
                     pass  # Optional fault evidence cannot replace its original exception.
@@ -1580,6 +1614,7 @@ class AlohaMini(Robot):
         selected = self._selected_joint_evidence_active()
         teleop = getattr(self, "_am1_teleop_binding", None) is not None
         left_raw, right_raw = {}, {}
+        left_timing, right_timing = {}, {}
         selected_raw = {} if selected else None
         selected_bus, selected_motor, selected_key = self._selected_joint_identity()
         selected_started = time.monotonic() if selected and selected_bus is self.left_bus else None
@@ -1587,7 +1622,7 @@ class AlohaMini(Robot):
         if self.left_arm_motors:
             left_pos = (
                 self._read_arm_positions(self.left_bus, self.left_arm_motors, raw_positions=selected_raw)
-                if selected and selected_bus is self.left_bus else self._read_arm_positions(self.left_bus, self.left_arm_motors, raw_positions=left_raw if teleop else None)
+                if selected and selected_bus is self.left_bus else self._read_arm_positions(self.left_bus, self.left_arm_motors, raw_positions=left_raw if teleop else None, raw_timing=left_timing)
             )
         if selected and selected_bus is self.left_bus and selected_motor in selected_raw:
             self._am1_selected_joint_position = {
@@ -1596,11 +1631,12 @@ class AlohaMini(Robot):
                 "read_started_at_monotonic_s": selected_started,
                 "read_completed_at_monotonic_s": time.monotonic(),
             }
-        left_read_completed = time.monotonic()
+        left_read_completed = left_timing.get("read_completed_at_monotonic_s", time.monotonic())
+        arm_read_started = left_timing.get("read_started_at_monotonic_s", arm_read_started)
         left_arm_done_t = time.perf_counter()
 
 
-        base_wheel_vel = self.left_bus.sync_read("Present_Velocity", self.base_motors)
+        base_wheel_vel = self._read_am1_feedback(self.left_bus, "Present_Velocity", self.base_motors)
 
         base_vel = self._wheel_raw_to_body(
             base_wheel_vel["base_left_wheel"],
@@ -1615,10 +1651,11 @@ class AlohaMini(Robot):
         right_pos = (
             self._read_arm_positions(self.right_bus, self.right_arm_motors, raw_positions=selected_raw)
             if self.right_bus and self.right_arm_motors and selected and selected_bus is self.right_bus
-            else self._read_arm_positions(self.right_bus, self.right_arm_motors, raw_positions=right_raw if teleop else None)
+            else self._read_arm_positions(self.right_bus, self.right_arm_motors, raw_positions=right_raw if teleop else None, raw_timing=right_timing)
             if self.right_bus and self.right_arm_motors else {}
         )
-        right_read_completed = time.monotonic()
+        right_read_completed = right_timing.get("read_completed_at_monotonic_s", time.monotonic())
+        right_read_started = right_timing.get("read_started_at_monotonic_s", right_read_started)
         if selected and selected_bus is self.right_bus and selected_motor in selected_raw:
             self._am1_selected_joint_position = {
                 "raw": int(selected_raw[selected_motor]), "normalized": float(right_pos[selected_motor]),
@@ -1750,6 +1787,7 @@ class AlohaMini(Robot):
         #     arm_goal_pos = arm_safe_goal_pos
 
         operation = getattr(self, "_lift_operation", None)
+        self._service_am1_live_feedback()
         live_before_write()
         if operation is not None:
             operation.apply_action(action)
@@ -1787,9 +1825,11 @@ class AlohaMini(Robot):
         right_joint_limit_done_t = time.perf_counter()
         selected_current = {**left_pos, **right_pos}.get(selected_key) if selected else None
 
+        self._service_am1_live_feedback()
         left_pos, left_raw_goals = self._encode_am1_arm_goals(self.left_bus, left_pos, present_left_raw)
         right_raw_goals = None
         if self.right_bus and right_pos:
+            self._service_am1_live_feedback()
             right_pos, right_raw_goals = self._encode_am1_arm_goals(self.right_bus, right_pos, present_right_raw)
 
         # Send goal position to the actuators
@@ -1825,6 +1865,8 @@ class AlohaMini(Robot):
                 self._am1_selected_joint_action["write_started_at_monotonic_s"] = time.monotonic()
             try:
                 live_before_write()
+                self._service_am1_live_feedback()
+                live_before_write()
                 if raw_goals is not None:
                     bus.sync_write("Goal_Position", raw_goals, normalize=False)
                 else:
@@ -1847,6 +1889,8 @@ class AlohaMini(Robot):
         if self.right_bus:
             write_arm_goals(self.right_bus, right_pos, right_raw_goals)
         right_write_done_t = time.perf_counter()
+        live_before_write()
+        self._service_am1_live_feedback()
         live_before_write()
         self.left_bus.sync_write("Goal_Velocity", base_wheel_goal_vel)
         base_write_done_t = time.perf_counter()
@@ -1972,12 +2016,15 @@ class AlohaMini(Robot):
         )
         if trace_shoulder:
             self._am1_left_shoulder_feedback = {"feedback_available": False}
-        try:
+        current_started, current_wall_started = None, None
+        def acquire_feedback():
+            nonlocal current_started, current_wall_started
             practical_current_started = time.monotonic()
             if trace_shoulder:
                 current_started = time.monotonic()
                 current_wall_started = time.time_ns()
-            currents_raw = bus.sync_read("Present_Current", target_motors)
+            current_receipt = {}
+            currents_raw = self._read_am1_feedback(bus, "Present_Current", target_motors, receipt=current_receipt)
             # The practical selected ceiling reuses this current acquisition,
             # before a position read or eventual goal write can obscure a trip.
             evidence = getattr(self, "_am1_visible_control_evidence", None)
@@ -1990,13 +2037,18 @@ class AlohaMini(Robot):
                         "read_started_at_monotonic_s": practical_current_started,
                         "read_completed_at_monotonic_s": time.monotonic()})
             if trace_shoulder:
-                current_completed = time.monotonic()
+                current_started = current_receipt.get("read_started_at_monotonic_s", current_started)
+                current_completed = current_receipt.get("read_completed_at_monotonic_s", time.monotonic())
                 position_started = time.monotonic()
                 position_wall_started = time.time_ns()
                 # Reuse the existing force-limit transaction and retain its raw
                 # sample; AM1 feedback must not hide positions past a command limit.
-                raw_present = bus.sync_read("Present_Position", target_motors, normalize=False)
-                position_completed = time.monotonic()
+                position_receipt = {}
+                raw_present = self._read_am1_feedback(bus, "Present_Position", target_motors, normalize=False,
+                                                      receipt=position_receipt)
+                position_started = position_receipt.get("read_started_at_monotonic_s", position_started)
+                position_completed = position_receipt.get("read_completed_at_monotonic_s", time.monotonic())
+                self._service_am1_live_feedback()
                 present_pos = self._normalize_arm_feedback(bus, raw_present)
                 self._am1_left_shoulder_feedback = {
                     "feedback_available": True,
@@ -2013,19 +2065,25 @@ class AlohaMini(Robot):
                 }
             else:
                 present_pos = self._read_arm_positions(bus, target_motors)
-        except Exception as e:
-            if (getattr(self, "_am1_selected_joint_fault", None) or {}).get("source") == "command_current_limiter":
-                raise
-            if trace_shoulder:
-                self._am1_left_shoulder_feedback = {
-                    "feedback_available": False,
-                    "read_started_at": current_started,
-                    "read_completed_at": time.monotonic(),
-                    "read_started_wall_time_ns": current_wall_started,
-                    "read_error": f"{type(e).__name__}: {e}",
-                }
-            logger.warning("Failed to read %s current/position for force limiting: %s", log_tag, e)
-            return goal_pos
+            return currents_raw, present_pos
+        if self._am1_live_feedback_active():
+            currents_raw, present_pos = acquire_feedback()
+        else:
+            try:
+                currents_raw, present_pos = acquire_feedback()
+            except Exception as e:
+                if (getattr(self, "_am1_selected_joint_fault", None) or {}).get("source") == "command_current_limiter":
+                    raise
+                if trace_shoulder:
+                    self._am1_left_shoulder_feedback = {
+                        "feedback_available": False,
+                        "read_started_at": current_started,
+                        "read_completed_at": time.monotonic(),
+                        "read_started_wall_time_ns": current_wall_started,
+                        "read_error": f"{type(e).__name__}: {e}",
+                    }
+                logger.warning("Failed to read %s current/position for force limiting: %s", log_tag, e)
+                return goal_pos
 
         limited_goal_pos = dict(goal_pos)
         for goal_key in target_keys:
@@ -2171,10 +2229,12 @@ class AlohaMini(Robot):
         teleop = getattr(self, "_am1_teleop_binding", None) is not None
         left_started = time.monotonic()
         selected_started = left_started if selected and selected_bus is self.left_bus else None
-        left_curr_raw = self.left_bus.sync_read("Present_Current", list(self.left_bus.motors.keys()))
+        left_receipt = {}
+        left_curr_raw = self._read_am1_feedback(self.left_bus, "Present_Current", list(self.left_bus.motors.keys()), receipt=left_receipt)
+        left_started = left_receipt.get("read_started_at_monotonic_s", left_started)
         if teleop:
             from .am1_live_teleop import check_sampled_current
-            check_sampled_current(self, "left", left_curr_raw, left_started, time.monotonic())
+            check_sampled_current(self, "left", left_curr_raw, left_started, left_receipt.get("read_completed_at_monotonic_s", time.monotonic()))
         if selected and selected_bus is self.left_bus:
             check_selected_current(left_curr_raw, selected_started, time.monotonic())
         right_curr_raw = {}
@@ -2182,9 +2242,11 @@ class AlohaMini(Robot):
             right_started = time.monotonic()
             if selected and selected_bus is self.right_bus:
                 selected_started = time.monotonic()
-            right_curr_raw = self.right_bus.sync_read("Present_Current", list(self.right_bus.motors.keys()))
+            right_receipt = {}
+            right_curr_raw = self._read_am1_feedback(self.right_bus, "Present_Current", list(self.right_bus.motors.keys()), receipt=right_receipt)
+            right_started = right_receipt.get("read_started_at_monotonic_s", right_started)
             if teleop:
-                check_sampled_current(self, "right", right_curr_raw, right_started, time.monotonic())
+                check_sampled_current(self, "right", right_curr_raw, right_started, right_receipt.get("read_completed_at_monotonic_s", time.monotonic()))
             if selected and selected_bus is self.right_bus:
                 check_selected_current(right_curr_raw, selected_started, time.monotonic())
 
