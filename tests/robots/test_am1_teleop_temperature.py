@@ -103,7 +103,7 @@ def test_rapid_highs_cannot_multiply_votes_or_a_later_low_erase_a_slot_peak(ther
     records = acquire(robot, clock, 10.44, value=28)
     thermal = records["left"]["temperature"]["arm_left_1"]
     assert thermal["values_c"] == [28, 28, 28, 28, 92]
-    assert thermal["samples"][-1] == (10.41, 92)
+    assert thermal["samples"][-1] == (10.43, 92)
     assert thermal["high_count"] == 1
     acquire(robot, clock, 10.5, value=70)
     with pytest.raises(RuntimeError, match="temperature"):
@@ -181,7 +181,12 @@ def test_prepare_collects_genuine_off_baseline_without_fabricating_cool_slots(ac
     windows = [state["window"] for state in robot._am1_teleop_temperatures.values()]
     assert len(windows) == 12
     assert all(window.ready for window in windows)
-    assert all(window.samples[-1][0] - window.samples[0][0] >= 0.399999 for window in windows)
+    for window in windows:
+        # Five anchored occupied slots, not a minimum gap between peak receipts:
+        # a genuine equal maximum may arrive late in the oldest occupied slot.
+        slots = [(round(stamp * 1e9) - window._origin_ns) // 100_000_000
+                 for stamp, _ in window.samples]
+        assert slots == list(range(slots[0], slots[0] + 5))
 
 
 def test_supported_rest_uses_follower_limit_and_retains_the_same_history_through_activation(
@@ -990,7 +995,7 @@ def test_saved28_original_lift_slot_hole_remains_stale_and_latched():
         window.update(34, 174702.824100602)
     assert list(window.samples) == [(stamp, 34) for stamp in (
         174702.291087631, 174702.380107900, 174702.489100558,
-        174702.582195612, 174702.824100602)]
+        174702.627088190, 174702.824100602)]  # Original later equal34 in slot1705.
     assert window.samples[-1][0]-window.samples[0][0] == pytest.approx(.533012971)
     assert window._origin_ns == round(origin*1e9) and window.outliers == 0
     with pytest.raises(RuntimeError) as repeated:
@@ -1514,3 +1519,147 @@ def test_saved35_original_right_slot_hole_remains_stale_and_latched():
     with pytest.raises(RuntimeError) as repeated:
         window.update(30, stamps[-1]+.01)
     assert repeated.value is failed.value
+
+
+def test_recorded40_equal_maximum_uses_only_the_newer_actual_same_slot_receipt():
+    origin = 194543.276201539
+    window = TemperatureWindow(ceiling_c=70)
+    # Synthetic preceding bridge only; these two actual40 receipts share slot1560.
+    for slot in range(1560):
+        window.update(31, origin + slot * .1)
+    window.update(31, 194699.278931687)
+    window.update(31, 194699.344850194)
+    assert window._origin_ns == round(origin * 1e9) and window._last_slot == 1560
+    assert window.samples[-1] == (194699.344850194, 31)
+    assert len(window.samples) == 5 and window.outliers == 0
+
+
+@pytest.mark.parametrize("ceiling", [55, 70])
+def test_synthetic_equal_maxima_keep_five_original_acquisitions_without_age_waiver(ceiling):
+    # Fully synthetic advancing receipts, NOT missing historical40 acquisitions.
+    window = TemperatureWindow(ceiling_c=ceiling)
+    for slot in range(5):
+        window.update(31, slot * .1)
+        window.update(31, slot * .1 + .06)
+    original_origin = window._origin_ns
+    result = window.update(31, .61)
+    expected = [(.16, 31), (.26, 31), (.36, 31), (.46, 31), (.61, 31)]
+    assert [at for at, _ in window.samples] == pytest.approx([at for at, _ in expected])
+    assert [value for _, value in window.samples] == [value for _, value in expected]
+    window.assert_fresh(.61)
+    assert window._origin_ns == original_origin and window._last_slot == 6
+    assert result["count"] == 5 and result["high_count"] == window.outliers == 0
+    assert result["span_s"] == .45 and window.MAX_AGE_S == .5 and window.SLOT_S == .1
+
+
+def test_equal_high_is_one_vote_and_lower_reading_cannot_borrow_its_timestamp():
+    window = TemperatureWindow(ceiling_c=70)
+    for slot in range(5):
+        window.update(31, slot * .1)
+    window.update(70, .41)
+    same = window.update(70, .46)
+    lower = window.update(31, .49)
+    assert window.samples[-1] == (.46, 70)
+    assert same["high_count"] == lower["high_count"] == 1
+    assert window.outliers == 2 and len(window.samples) == 5
+    window.update(70, .5)
+    with pytest.raises(RuntimeError, match="3/5") as failed:
+        window.update(70, .6)
+    retained = list(window.samples)
+    with pytest.raises(RuntimeError) as repeated:
+        window.update(70, .61)
+    assert repeated.value is failed.value and list(window.samples) == retained
+
+
+@pytest.mark.parametrize("stamp", [.45, .44, 1.001], ids=["duplicate", "backward", "stale"])
+def test_equal_reading_cannot_refresh_nonadvancing_or_stale_raw_history(stamp):
+    window = TemperatureWindow(ceiling_c=70)
+    for slot in range(5):
+        window.update(31, slot * .1)
+    window.update(31, .45)
+    retained = list(window.samples)
+    with pytest.raises(RuntimeError) as failed:
+        window.update(31, stamp)
+    assert list(window.samples) == retained
+    with pytest.raises(RuntimeError) as repeated:
+        window.update(31, 1.01)
+    assert repeated.value is failed.value
+
+
+def test_partial40_replay_still_refuses_without_invented_oldest_equal_receipts():
+    origin = 194543.276201539
+    window = TemperatureWindow(ceiling_c=70)
+    # Synthetic bridge establishes the original anchor; oldest-slot later ties
+    # were NOT retained. Reuse only saved peaks and the separately retained RAW.
+    for slot in range(1557):
+        window.update(31, origin + slot * .1)
+    for stamp in (194698.976866344, 194699.076832658, 194699.179007021,
+                  194699.278931687, 194699.344850194):
+        window.update(31, stamp)
+    with pytest.raises(RuntimeError, match="five-slot feedback window is stale") as failed:
+        window.update(31, 194699.528991684)
+    assert window.samples[0] == (194698.976866344, 31)
+    assert 194699.528991684 - window.samples[0][0] == pytest.approx(.552125340)
+    assert window.outliers == 0
+    with pytest.raises(RuntimeError) as repeated:
+        window.update(31, 194699.54)
+    assert repeated.value is failed.value
+
+
+def test_follower_real_health_entrypoint_accepts_fresh_equal_peak_receipts(thermal_robot):
+    robot, clock = thermal_robot
+    for slot in range(5):
+        acquire(robot, clock, 10 + slot * .1, check=slot == 4)
+        acquire(robot, clock, 10 + slot * .1 + .06, check=slot == 4)
+    state = robot._am1_teleop_temperatures["left", 1]
+    window = state["window"]
+    origin = window._origin_ns
+    records = acquire(robot, clock, 10.61)
+    thermal = records["left"]["temperature"]["arm_left_1"]
+    assert state["window"] is window and window._origin_ns == origin
+    assert [at for at, _ in window.samples] == pytest.approx([10.16, 10.26, 10.36, 10.46, 10.61])
+    assert thermal["count"] == 5 and thermal["high_count"] == 0 and thermal["ceiling_c"] == 70
+    teleop.check_health(robot, records, active=True)  # Cached consumer adds no acquisition or timestamp.
+    assert window.samples[-1] == (10.61, 28)
+
+
+def test_equal_peak_updates_are_per_actual_follower_id_and_cannot_erase_another_high(thermal_robot):
+    robot, clock = thermal_robot
+    for slot in range(5):
+        acquire(robot, clock, 10 + slot * .1, check=slot == 4)
+    acquire(robot, clock, 10.41, value=70)
+    records = acquire(robot, clock, 10.46, value=28)
+    windows = {key: state["window"] for key, state in robot._am1_teleop_temperatures.items()}
+    assert windows["left", 1].samples[-1] == (10.41, 70)
+    assert windows["left", 2].samples[-1] == windows["right", 1].samples[-1] == (10.46, 28)
+    assert windows["left", 1] is not windows["right", 1]
+    assert records["left"]["temperature"]["arm_left_1"]["high_count"] == 1
+    assert windows["left", 1].outliers == 1 and windows["right", 1].outliers == 0
+
+
+def test_lift_actual_poll_accepts_only_its_new_equal_peak_receipts(operating_robot):
+    robot, clock = operating_robot
+    robot.connect(calibrate=False)
+    operation = robot._lift_operation
+    window = operation.temperature
+    origin = window._origin_ns
+    base = origin / 1e9 + (window._last_slot + 1) * .1
+    robot.left_bus.registers["Present_Temperature", "lift_axis"] = 31
+    try:
+        completions = []
+        for slot in range(5):
+            for fraction in (.008, .068):
+                clock.now = base + slot * .1 + fraction
+                operation.poll()
+                if fraction == .068:
+                    completions.append(operation.last_record["sample_monotonic_s"])
+        clock.now = base + .628
+        operation.poll()
+        assert operation.temperature is window and window._origin_ns == origin
+        assert [at for at, _ in window.samples] == completions[1:] + [operation.last_record["sample_monotonic_s"]]
+        assert all(value == 31 for _, value in window.samples)
+        assert operation.last_record["temperature_window"]["ready"]
+        assert operation.last_record["temperature_window"]["high_count"] == 0
+        assert window.ceiling_c == 55 and window.MAX_AGE_S == .5
+    finally:
+        robot.disconnect()

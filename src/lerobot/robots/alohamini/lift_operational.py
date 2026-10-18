@@ -90,7 +90,9 @@ class TemperatureWindow:
         if slot != self._last_slot:
             self.samples.append((now, int(value)))
             self._last_slot = slot
-        elif value > self.samples[-1][1]:
+        elif value >= self.samples[-1][1]:
+            # An equal maximum has its own new original receipt. A lower value
+            # cannot retimestamp a retained higher peak.
             self.samples[-1] = (now, int(value))
         self._last_sample_at = now
         if now - self.samples[0][0] > self.MAX_AGE_S:

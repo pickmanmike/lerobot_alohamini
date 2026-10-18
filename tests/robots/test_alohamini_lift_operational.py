@@ -2653,7 +2653,7 @@ def test_short_indicator_pulse_across_acquisition_boundary_cannot_manufacture_pe
 
 
 @pytest.mark.parametrize("historical_interval", [True, False], ids=["historical-100ms", "normal-50ms"])
-def test_original_35ms_relief_helper_latency_retains_the_earlier_thermal_stale_refusal(
+def test_35ms_relief_helper_latency_preserves_direction_guard_with_latest_equal_receipts(
     operating_robot,
     monkeypatch,
     capsys,
@@ -2686,7 +2686,7 @@ def test_original_35ms_relief_helper_latency_retains_the_earlier_thermal_stale_r
             setup_delay.append(clock.now)
             clock.sleep(0.04)
         if (register, motor, int(value)) == ("Goal_Velocity", "lift_axis", -200):
-            clock.sleep(0.035)  # Earlier fake condition retained as its own thermal-fault check.
+            clock.sleep(0.035)  # Keep the earlier fake condition and its actual receipt times.
 
     def hook(register):
         operation = getattr(robot, "_lift_operation", None)
@@ -2701,17 +2701,13 @@ def test_original_35ms_relief_helper_latency_retains_the_earlier_thermal_stale_r
     assert caught.value.__cause__ is robot._lift_operation.failure
     records = operational_records(capsys)
     rejected = next(r for r in records if r.get("rejected") and r["phase"] == "relief")
-    if historical_interval:
-        assert "temperature: five-slot feedback window is stale" in str(caught.value.__cause__)
-        assert rejected["sample_monotonic_s"] - rejected["temperature_history"][0][0] > 0.5
-        origin = next(row["sample_monotonic_s"] for row in records if "sample_monotonic_s" in row)
-        slots = [round((stamp - origin) * 1_000_000_000) // 100_000_000
-                 for stamp, _temperature in rejected["temperature_history"]]
-        assert any(right - left > 1 for left, right in zip(slots, slots[1:]))
-    else:
-        assert "initial upward direction not confirmed within 1.0 s" in str(caught.value.__cause__)
-        assert rejected["qualification_elapsed_s"] == pytest.approx(1.0)
-        assert robot._lift_operation.temperature.failure is None
+    # Under the original FIRST-equal policy the historical100ms case hit a
+    # thermal age fault first (retained in the before-copy and affected03 log).
+    # Its real equal receipts now remain fresh. Neither cadence can manufacture
+    # upward evidence or pass the unchanged original one-second direction guard.
+    assert "initial upward direction not confirmed within 1.0 s" in str(caught.value.__cause__)
+    assert rejected["qualification_elapsed_s"] == pytest.approx(1.0)
+    assert robot._lift_operation.temperature.failure is None
     assert rejected["request_duration_s"] <= 0.04
     assert not any(r["phase"] in {"relief_direction_qualified", "operational_ready"} for r in records)
     assert any(r["phase"] == "shutdown_verified" for r in records)

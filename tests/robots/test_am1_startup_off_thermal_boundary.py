@@ -215,7 +215,11 @@ def test_saved_combined17_cool_peaks_still_refuse_when_original_age_expires():
     for stamp in COMPLETIONS:
         window.update(32, stamp, cold_start=True)
     peaks = list(window.samples)
-    assert COMPLETIONS[-1] - peaks[0][0] == pytest.approx(0.496057583)
+    # The original FIRST-equal policy retained .496057583s of peak age here.
+    # The new replay uses only the later original equal reply in each same slot;
+    # this is not a replacement for Combined17's historical failed outcome.
+    assert peaks == [(stamp, 32) for stamp in COMPLETIONS[1::2]]
+    assert COMPLETIONS[-1] - peaks[0][0] == pytest.approx(0.444033654)
     # Synthetic later guard time, not a claimed timestamp of the native guard.
     with pytest.raises(feedback.ComparisonRefusal, match="stale"):
         window.assert_fresh(peaks[0][0] + 0.505)
