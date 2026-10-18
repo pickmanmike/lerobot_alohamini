@@ -785,6 +785,28 @@ class PhysicalExecutor:
         )
         return advanced, usable
 
+    def _retain_live_expiry(self, *, poll_control, previous_sequence, usable):
+        """Keep current expiry until Core consumes it; fence a superseded poll."""
+        sample = self.sample or {}
+        ack = sample.get("ack", {})
+        current_control = (
+            self.revision, self._epoch, tuple(sorted((self._live_binding or {}).items()))
+        )
+        if (
+            usable
+            and poll_control == current_control
+            and ack.get("run_id") == self.run_id
+            and ack.get("host_incarnation") == self.host_incarnation
+            and type(ack.get("intent_revision")) is int
+            and ack["intent_revision"] == self.revision
+            and type(ack.get("epoch")) is int
+            and ack["epoch"] == self._epoch
+            and type(sample.get("sequence")) is int
+            and sample["sequence"] > previous_sequence
+            and ack.get("live_input", {}).get("state") == "expired"
+        ):
+            self._live_expired = copy.deepcopy(ack["live_input"])
+
     def evidence(self):
         with self.mutex:
             now = self.clock()
@@ -1029,6 +1051,9 @@ class PhysicalExecutor:
                         break
                     if self._lifecycle["phase"] == "startup":
                         cancel()
+                    poll_control = (
+                        self.revision, self._epoch, tuple(sorted((self._live_binding or {}).items()))
+                    )
                     if (
                         self._lifecycle["native_live_at"] is not None
                         and self.clock() >= self._lifecycle["native_live_at"] + self._live_ceiling()
@@ -1055,8 +1080,10 @@ class PhysicalExecutor:
                         self._hold_reference = None
                         self._completion_returns = []
                     latest_ack = self.sample["ack"] if self.sample else {}
-                    if advanced and live_input and latest_ack.get("live_input", {}).get("state") == "expired":
-                        self._live_expired = copy.deepcopy(latest_ack["live_input"])
+                    if advanced and live_input:
+                        self._retain_live_expiry(
+                            poll_control=poll_control, previous_sequence=previous, usable=usable
+                        )
                     if (
                         advanced
                         and usable

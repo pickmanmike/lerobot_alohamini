@@ -107,6 +107,65 @@ def test_connection_rebind_keeps_source_history_but_clears_movement():
     )
 
 
+@pytest.mark.parametrize("mismatch", ["run", "host", "intent", "epoch", "binding", "sequence", "unusable"])
+def test_expiry_cache_rejects_noncurrent_native_poll(mismatch):
+    e, identity = admitted_executor()
+    e._epoch = 2
+    e.sample["sequence"] = 6
+    e.sample["ack"].update(epoch=2, live_input={"state": "expired", "last_input_seq": 1})
+    polled_control = (e.revision, e._epoch, tuple(sorted(e._live_binding.items())))
+    if mismatch == "run":
+        e.sample["ack"]["run_id"] = str(uuid4())
+    elif mismatch == "host":
+        e.sample["ack"]["host_incarnation"] = str(uuid4())
+    elif mismatch == "intent":
+        e.set_intent_revision(identity["intent_revision"] + 1)
+    elif mismatch == "epoch":
+        e._epoch += 1
+    elif mismatch == "binding":
+        assert e.bind_control(**dict(identity, connection_generation=str(uuid4())))
+    elif mismatch == "sequence":
+        e.sample["sequence"] = 5
+    e._retain_live_expiry(poll_control=polled_control, previous_sequence=5, usable=mismatch != "unusable")
+    assert e._live_expired is None
+    assert e._live_target is None
+
+
+@pytest.mark.parametrize("held_sequence", [5, 7])
+def test_current_expiry_survives_same_revision_held_ack_until_core_transition(held_sequence):
+    e, _ = admitted_executor()
+    e._epoch = 2
+    expired = {
+        "state": "expired", "cursor_intent_revision": 0, "cursor_feedback_sequence": 4,
+        "last_input_seq": 1, "valid_until_monotonic_s": 9.99,
+        "expiry_detected_at_monotonic_s": 10.0,
+    }
+    e.sample["sequence"] = 6
+    e.sample["ack"].update(epoch=2, live_input=expired)
+    polled_control = (e.revision, e._epoch, tuple(sorted(e._live_binding.items())))
+    e._retain_live_expiry(poll_control=polled_control, previous_sequence=5, usable=True)
+    assert e._live_expired == expired
+    assert e._live_expired is not expired
+    e._epoch, e._epoch_mode = 3, "pause"
+    e._aligned = [9.7, 9.8, 10.0]
+    e.sample["sequence"] = held_sequence
+    e.sample["ack"].update(
+        state="paused", epoch=3,
+        live_input=dict(expired, state="held", cursor_feedback_sequence=held_sequence - 1),
+    )
+    e._retain_live_expiry(
+        poll_control=(e.revision, e._epoch, tuple(sorted(e._live_binding.items()))),
+        previous_sequence=6, usable=True,
+    )
+    view = e.evidence()
+    assert view["hold_acknowledged"] and view["pose_aligned"]
+    assert view["accepted_host_action"]["live_input"]["state"] == "held"
+    assert view["live_input"] == expired
+    assert e._live_expired == expired
+    e.set_intent_revision(1)
+    assert e._live_expired is None
+
+
 def authority_lane(tmp_path):
     from tools.am1_session_core import SessionAuthority
 
@@ -190,8 +249,10 @@ def test_view_progress_is_internal_and_static_decode_never_renews_required_view(
         a.close()
 
 
+@pytest.mark.parametrize("queued_expiry", [pytest.param(False, id="ordinary"), pytest.param(True, id="queued-expiry")])
 @pytest.mark.parametrize("endpoint_rest", [False, True])
-def test_real_core_executor_native_frame_expiry_and_fresh_rejoin_preserve_run(tmp_path, endpoint_rest):
+def test_real_core_executor_native_frame_expiry_and_fresh_rejoin_preserve_run(tmp_path, endpoint_rest, queued_expiry):
+    import threading
     import time
 
     from lerobot.robots.alohamini import alohamini_host as host
@@ -229,6 +290,10 @@ def test_real_core_executor_native_frame_expiry_and_fresh_rejoin_preserve_run(tm
                 run_id=run_id, host_incarnation=incarnation, live=True, live_recipe=recipe.name
             )
             self.actions = []
+            self.queue_expiry = False
+            self.expiry_queued = threading.Event()
+            self.release_expiry = threading.Event()
+            self.original_expiry = None
 
         def poll(self, previous):
             self.control.check_live(self.robot)
@@ -236,7 +301,7 @@ def test_real_core_executor_native_frame_expiry_and_fresh_rejoin_preserve_run(tm
             at = time.monotonic()
             self.control.annotate(observation, acquired_at=at)
             marker = observation[host.AM1_LOCAL_FEEDBACK_KEY]
-            return {
+            sample = {
                 "positions": self.robot.get_observation(),
                 "sequence": marker["observation_id"],
                 "at": at,
@@ -244,6 +309,12 @@ def test_real_core_executor_native_frame_expiry_and_fresh_rejoin_preserve_run(tm
                 "observation": observation,
                 "provenance": "protected-host/measured-feedback",
             }
+            if self.queue_expiry and marker.get("live_input", {}).get("state") == "expired":
+                self.queue_expiry = False
+                self.original_expiry = copy.deepcopy(sample)
+                self.expiry_queued.set()
+                assert self.release_expiry.wait(2), "test did not release original expired native sample"
+            return sample
 
         def send(self, action):
             self.actions.append(copy.deepcopy(action))
@@ -346,6 +417,7 @@ def test_real_core_executor_native_frame_expiry_and_fresh_rejoin_preserve_run(tm
             grant_id=grant["grant_id"],
             seq=1,
         )
+        io.queue_expiry = queued_expiry
         admitted = a.handle(packet, "owner")
         assert admitted["accepted"], admitted
         until(lambda: bool(step()) and e.evidence()["live_input"].get("last_input_seq") == 1)
@@ -359,8 +431,53 @@ def test_real_core_executor_native_frame_expiry_and_fresh_rejoin_preserve_run(tm
         assert received_samples and all(
             s["valid_until_monotonic_s"] == grant["expires"] for s in received_samples
         )
+        if queued_expiry:
+            # Retain the original native expiry in flight while Core advances
+            # the hold revision; do not synthesize or retimestamp feedback.
+            assert io.expiry_queued.wait(1), "native expiry was not captured"
         until(lambda: bool(step()) and a.run["status"] == "paused")
         assert a.run["deadline"] == frozen_deadline
+        if queued_expiry:
+            expected_revision = a.run["intent_revision"]
+            expired = io.original_expiry["ack"]["live_input"]
+            assert io.original_expiry["ack"]["intent_revision"] < expected_revision
+            assert e._live_expired is None  # Core's new hold cleared the prior cache.
+            io.release_expiry.set()
+
+            def genuine_current_hold():
+                step()
+                with e.mutex:
+                    ack = copy.deepcopy((e.sample or {}).get("ack", {}))
+                return (
+                    ack.get("state") == "paused"
+                    and ack.get("intent_revision") == expected_revision
+                    and ack.get("live_input", {}).get("cursor_intent_revision") == expected_revision
+                    and e.evidence()["hold_acknowledged"]
+                    and e.evidence()["pose_aligned"]
+                )
+
+            until(genuine_current_hold)
+            with e.mutex:
+                raw_ack = copy.deepcopy(e.sample["ack"])
+            held = raw_ack["live_input"]
+            assert held["state"] == "held"
+            assert held["cursor_feedback_sequence"] > expired["cursor_feedback_sequence"]
+            assert held["workspace"] == frozen_workspace
+            assert held["reference"] == expired["reference"]
+            assert held["live_deadline_monotonic_s"] == frozen_deadline
+            assert e._live_target is None and e.desired == "hold"
+            assert held["last_input_seq"] == expired["last_input_seq"] == 1
+            assert held["valid_until_monotonic_s"] == expired["valid_until_monotonic_s"] == grant["expires"]
+            assert held["expiry_detected_at_monotonic_s"] == expired["expiry_detected_at_monotonic_s"]
+            projected = e.evidence()["live_input"]
+            assert projected["cursor_intent_revision"] == expected_revision, {
+                "raw_cursor_revision": held["cursor_intent_revision"],
+                "published_cursor_revision": projected["cursor_intent_revision"],
+                "raw_cursor_sequence": held["cursor_feedback_sequence"],
+                "published_cursor_sequence": projected["cursor_feedback_sequence"],
+                "raw_state": held["state"], "published_state": projected["state"],
+            }
+            assert a.snapshot()["run"]["live_input"]["cursor_intent_revision"] == expected_revision
         resume()
         new_grant = a.handle(dict(op="grant", **ids()), "owner")
         stale = dict(
@@ -381,6 +498,7 @@ def test_real_core_executor_native_frame_expiry_and_fresh_rejoin_preserve_run(tm
         assert io.control.live_snapshot()["workspace"] == frozen_workspace
         assert a.run["deadline"] == frozen_deadline
     finally:
+        io.release_expiry.set()
         if a.run:
             a.handle(command("stop", run_id=a.run["run_id"]), "owner")
         if e.worker:
