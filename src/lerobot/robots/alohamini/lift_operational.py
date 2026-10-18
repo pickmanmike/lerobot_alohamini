@@ -36,10 +36,13 @@ class TemperatureWindow:
         self._last_sample_at: float | None = None
         self.failure: feedback.ComparisonRefusal | None = None
         self.outliers = 0
+        # Enabled only by the admitted whole-teleop owner; never startup/standalone.
+        self.allow_history_hold = False
+        self.history_deficit_at: float | None = None
 
     @property
     def ready(self) -> bool:
-        return len(self.samples) == self.SIZE and self.failure is None
+        return len(self.samples) == self.SIZE and self.failure is None and self.history_deficit_at is None
 
     def refuse(self, reason: str) -> None:
         if self.failure is None:
@@ -49,13 +52,18 @@ class TemperatureWindow:
     def assert_fresh(self, now: float, *, refreshing: bool = False) -> None:
         if self.failure is not None:
             raise self.failure
-        if not math.isfinite(now) or not self.ready:
+        if not math.isfinite(now) or len(self.samples) != self.SIZE:
             self.refuse("temperature: five genuine fresh baseline time slots are required.")
         # A fresh read may replace the oldest slot. Before reading, check the
         # last RAW timestamp; update() then checks all retained peak timestamps
         # before any action can use them. No stale history becomes a normal low.
-        oldest_required = self._last_sample_at if refreshing else self.samples[0][0]
-        if now < self._last_sample_at or now - oldest_required > self.MAX_AGE_S:
+        if now < self._last_sample_at or now - self._last_sample_at > self.MAX_AGE_S:
+            self.refuse("temperature: five-slot feedback window is stale (>0.5 s).")
+        if not refreshing and now - self.samples[0][0] > self.MAX_AGE_S:
+            if self.allow_history_hold is True:
+                if self.history_deficit_at is None:
+                    self.history_deficit_at = now
+                return
             self.refuse("temperature: five-slot feedback window is stale (>0.5 s).")
 
     def update(
@@ -95,15 +103,21 @@ class TemperatureWindow:
             # cannot retimestamp a retained higher peak.
             self.samples[-1] = (now, int(value))
         self._last_sample_at = now
-        if now - self.samples[0][0] > self.MAX_AGE_S:
+        history_stale = now - self.samples[0][0] > self.MAX_AGE_S
+        if history_stale and self.allow_history_hold is not True:
             self.refuse("temperature: five-slot feedback window is stale (>0.5 s).")
         if value >= self.ceiling_c:
             self.outliers += 1  # Includes the actual refusal-causing raw reading.
         high = sum(temperature >= self.ceiling_c for _, temperature in self.samples)
-        if self.ready and high >= 3:
+        if len(self.samples) == self.SIZE and high >= 3:
             self.refuse(
                 f"temperature: majority (3/5 time slots) at or above {self.ceiling_c} C; stop latched."
             )
+        if history_stale:
+            if self.history_deficit_at is None:
+                self.history_deficit_at = now
+        else:
+            self.history_deficit_at = None  # Only actual acquisitions restore peak readiness.
         if self.ready and cold_start and sum(t > feedback.COOL_START_C for _, t in self.samples) >= 3:
             self.refuse("temperature: confirmed starting temperature exceeds 40 C.")
         return {

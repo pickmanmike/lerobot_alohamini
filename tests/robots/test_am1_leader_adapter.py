@@ -4200,3 +4200,298 @@ def test_initial_claim_requalification_preserves_original_error_authority_and_on
         asyncio.run(asyncio.wait_for(scenario(), .5))
     finally:
         authority.close()
+
+
+@pytest.mark.parametrize("change", [None, "wrong_pong_type", "wrong_pong_message", "reader_error",
+    "reference", "hash", "initial_clock", "fresh_clock", "fresh_controller", "fresh_terminal",
+    "fresh_unsafe", "final_clock", "spent_details", "spent_attach", "spent_start"])
+def test_runner_admission_no_pong_uses_original_real_core_detail_clocks(tmp_path, monkeypatch, change):
+    """Synthetic45: real Core/Gateway projection/detail and installed NoPONG; no motor or network."""
+    import asyncio
+    import copy
+    import json
+    import time
+    from types import SimpleNamespace
+    from urllib.parse import parse_qsl, urlsplit
+
+    from aiohttp import WSMessage, WSMsgType
+    from aiohttp.client_ws import ClientWebSocketResponse
+
+    from tests.robots.test_am1_live_teleop_executor import authority_lane
+    from tools.am1_session_service import Gateway
+
+    m = adapter()
+    actual_wait, actual_read = m.SessionClient.wait, m.SessionClient._read
+    authority, executor, _ = authority_lane(tmp_path / "authority")
+    pc, clients, entered, caught = [20.0], [], [], []
+    monkeypatch.setattr(m, "time", SimpleNamespace(monotonic=lambda: pc[0], perf_counter=time.perf_counter))
+    owned = str(uuid4())
+    authority.clock = lambda: 1000.0 + pc[0] - 20.0
+    template = recovery_state()
+    executor.evidence = lambda: dict(copy.deepcopy(template["evidence"]),
+                                     live_input=copy.deepcopy(template["run"]["live_input"]))
+    gateway = object.__new__(Gateway)
+
+    async def call(command, _device):
+        if "reference" in command:
+            return authority.snapshot_detail(command)
+        return {"snapshot": authority.snapshot()}
+
+    gateway.call = call
+
+    class Wire:
+        _pong_heartbeat = .5
+
+        def __init__(self):
+            self.closed, self.close_code, self.error = False, None, None
+            self.messages = asyncio.Queue()
+
+        def _handle_ping_pong_exception(self, error):
+            self.closed, self.close_code, self.error = True, 1006, error
+            self.messages.put_nowait(WSMessage(WSMsgType.ERROR, error, None))
+
+        def exception(self):
+            return self.error
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            return await self.messages.get()
+
+        async def send_json(self, value):
+            assert set(value) == {"ack"}
+
+    class Session:
+        _read = actual_read
+
+        def __init__(self, *_args):
+            self.device, self.generation, self.connection = "device", "control", None
+            self.snapshot = None
+            self.transport_close = self.transport_error = self.reader = self.ws = None
+            self.changed, self.tasks = asyncio.Event(), []
+            self.starts, self.stops, self.claims, self.attaches = [], [], 0, 0
+            self.renewing = self._detaching = False
+            self.detail_reads = 0
+            clients.append(self)
+
+        def current(self):
+            value = authority.snapshot()
+            assert "accepted_at" not in value["run"]
+            assert value["status_projection"] == {"kind": "am1-essential-status", "version": 1}
+            return value
+
+        async def wait(self, predicate, timeout):
+            try:
+                await actual_wait(self, predicate, timeout)
+            except ConnectionError as error:
+                caught.append(error)
+                raise
+
+        async def lose(self):
+            await asyncio.sleep(0)
+            pc[0] += 9
+            if change == "reader_error":
+                self.ws.messages.put_nowait(WSMessage(WSMsgType.TEXT, "invalid JSON", None))
+                await self.reader
+                return
+            ClientWebSocketResponse._pong_not_received(self.ws)
+            if change == "wrong_pong_type":
+                self.ws.error = RuntimeError(str(self.ws.error))
+            elif change == "wrong_pong_message":
+                self.ws.error = type(self.ws.error)("other timeout")
+            await self.reader
+            if change == "reader_error":
+                self.transport_close["reader_error"] = {"error_type": "RuntimeError", "message": "reporting unavailable"}
+
+        async def attach(self):
+            self.attaches += 1
+            assert self.snapshot is None
+            assert self.attaches == 1 or self.renewing
+            self.ws, self.transport_close, self.transport_error = Wire(), None, None
+            self._detaching = False
+            self.reader = asyncio.create_task(self._read())
+            if self.attaches == 1:
+                self.snapshot = {"service_incarnation": authority.service_incarnation, "run": None}
+            else:
+                if change == "spent_attach":
+                    pc[0] += 180
+                if change == "fresh_clock":
+                    authority.run["accepted_at"] += .01
+                elif change == "fresh_controller":
+                    authority.controller["generation"] = "other"
+                elif change == "fresh_terminal":
+                    authority.run.update(status="faulted", native_first_cause="original native fault")
+                elif change == "fresh_unsafe":
+                    authority.run["uncertain"] = True
+                self.snapshot = self.current()
+                self.tasks.append(asyncio.create_task(self.live()))
+
+        async def live(self):
+            await asyncio.sleep(0)
+            authority.run.update(status="preparing", native_live_at=1009.0, deadline=1309.0,
+                                 backend_incarnation=executor.host_incarnation)
+            if change == "final_clock":
+                authority.run["accepted_at"] += .02
+            self.snapshot = self.current()
+            self.changed.set()
+
+        async def detach(self):
+            self._detaching = True
+            if self.reader and not self.reader.done():
+                self.reader.cancel()
+                await asyncio.gather(self.reader, return_exceptions=True)
+            self.ws = self.reader = self.snapshot = None
+
+        async def claim(self):
+            self.claims += 1
+            authority.controller = {"device_id": self.device, "generation": self.generation, "expires": 1180.0}
+
+        async def renew(self):
+            self.renewing = True
+            try:
+                await asyncio.Event().wait()
+            finally:
+                self.renewing = False
+
+        async def post(self, path, body):
+            if path == "start":
+                self.starts.append(copy.deepcopy(body))
+                if change == "spent_start":
+                    pc[0] += 181
+                authority.run.update(run_id=owned, operation_id=body["operation_id"], accepted_at=1000.0,
+                    startup_deadline=1180.0, status="starting", native_live_at=None, deadline=None,
+                    backend_incarnation=None, first_cause=None, uncertain=False)
+                if change == "initial_clock":
+                    del authority.run["accepted_at"]
+                self.snapshot = self.current()
+                if change in {"reference", "hash"}:
+                    self.snapshot["run"]["details_reference"]["field" if change == "reference" else "sha256"] = (
+                        "evidence" if change == "reference" else "0" * 64)
+                self.tasks.append(asyncio.create_task(self.lose()))
+                return {"accepted": True, "run_id": owned, "operation_id": body["operation_id"]}
+            assert path == "stop"
+            self.stops.append(copy.deepcopy(body))
+            authority.run.update(status="stopped", cleanup="physical_readback_verified", uncertain=False)
+            return {"accepted": True}
+
+        async def get(self, path):
+            parsed = urlsplit(path)
+            query = dict(parse_qsl(parsed.query))
+            assert parsed.path == "state"
+            if query:
+                self.detail_reads += 1
+                if change == "spent_details":
+                    pc[0] += 181
+            response = await Gateway.state(gateway, SimpleNamespace(query=query))
+            value = json.loads(response.body)
+            if not query and self.attaches == 1 and change in {"reference", "hash"}:
+                value["snapshot"]["run"]["details_reference"]["field" if change == "reference" else "sha256"] = (
+                    "evidence" if change == "reference" else "0" * 64)
+            return value
+
+        async def close(self):
+            await self.detach()
+            await asyncio.gather(*self.tasks, return_exceptions=True)
+
+    def admitted_boundary(value):
+        entered.append(copy.deepcopy(clients[0].snapshot))
+        raise RuntimeError("synthetic qualified Live boundary")
+
+    monkeypatch.setattr(m, "SessionClient", Session)
+    monkeypatch.setattr(m, "validate_workspace", admitted_boundary)
+    args = SimpleNamespace(source="virtual-leaders", output=str(tmp_path / "run"), url="unused", ca="unused",
+                           storage_state="unused")
+    try:
+        with pytest.raises((RuntimeError, ConnectionError, TimeoutError, ValueError)) as result:
+            asyncio.run(asyncio.wait_for(m.run(args), 10))
+        client = clients[0]
+        if change is None:
+            assert str(result.value) == "synthetic qualified Live boundary"
+            assert len(entered) == 1 and client.attaches == 2 and client.detail_reads >= 3
+        else:
+            assert entered == []
+            if caught:
+                assert result.value is caught[0]
+        assert len(client.starts) == 1 and client.claims == 1
+        assert client.stops == [{"run_id": owned, "operation_id": client.stops[0]["operation_id"]}]
+        rows = [json.loads(row) for row in (tmp_path / "run" / "frames.jsonl").read_text().splitlines()]
+        assert not any(row["event"].startswith("leader_frame") for row in rows)
+        assert "accepted_at" not in (client.current()["run"])
+    finally:
+        authority.close()
+
+
+@pytest.mark.parametrize("change", [None, "offset", "length_bool", "total", "encoding", "truncated", "hash",
+                                    "reference_bool", "budget", "refused"])
+def test_startup_run_detail_reuses_real_core_gateway_bounded_chunk_contract(tmp_path, change):
+    import asyncio
+    import copy
+    import json
+    from types import SimpleNamespace
+    from urllib.parse import parse_qsl, urlsplit
+
+    from tests.robots.test_am1_live_teleop_executor import authority_lane
+    from tools.am1_session_service import Gateway
+
+    m = adapter()
+    authority, executor, _ = authority_lane(tmp_path / "authority")
+    authority.run.update(accepted_at=9.0, startup_deadline=189.0,
+                         backend_incarnation=executor.host_incarnation, original_evidence="x" * 12000)
+    state = authority.snapshot()
+    before, requests, clock = copy.deepcopy(authority.run), [], [0.0]
+    assert "accepted_at" not in state["run"]
+    gateway = object.__new__(Gateway)
+
+    async def call(command, _device):
+        return authority.snapshot_detail(command)
+
+    gateway.call = call
+
+    class Client:
+        async def get(self, path):
+            query = dict(parse_qsl(urlsplit(path).query))
+            requests.append(copy.deepcopy(query))
+            if change == "refused":
+                raise RuntimeError("authenticated read refused")
+            response = await Gateway.state(gateway, SimpleNamespace(query=query))
+            result = json.loads(response.body)
+            if change == "budget":
+                clock[0] += 2.1
+            elif change == "offset":
+                result["offset"] += 1
+            elif change == "length_bool":
+                result["length"] = True
+            elif change == "total":
+                result["total_bytes"] += 1
+            elif change == "encoding":
+                result["encoding"] = "hex"
+            elif change == "truncated":
+                result["data"] = result["data"][:-4]
+            elif change == "hash":
+                import base64
+
+                altered = bytearray(base64.b64decode(result["data"]))
+                altered[0] ^= 1
+                result["data"] = base64.b64encode(altered).decode()
+            elif change == "reference_bool":
+                result["reference"]["version"] = True
+            return result
+
+    def remaining():
+        if clock[0] >= 2.0:
+            raise TimeoutError("original admission clock exhausted")
+        return 2.0 - clock[0]
+
+    try:
+        if change is None:
+            result = asyncio.run(m._startup_run_detail(Client(), state, remaining))
+            assert result == before and result["accepted_at"] == 9.0
+            assert [int(query["offset"]) for query in requests] == [0, 8192]
+        else:
+            with pytest.raises((RuntimeError, ValueError, TimeoutError)):
+                asyncio.run(m._startup_run_detail(Client(), state, remaining))
+        assert authority.run == before and "accepted_at" not in state["run"]
+        assert all(query["limit"] == "8192" for query in requests)
+    finally:
+        authority.close()

@@ -236,7 +236,7 @@ def _temperature(robot, side, bus, name, raw, timing, baseline_record, *, acquir
             # Rechecking it neither invents a sample nor adds a thermal vote.
             if window.failure is not None:
                 raise window.failure
-            if window.ready:
+            if len(window.samples) == window.SIZE:
                 window.assert_fresh(now)
         evidence = {
             **(evidence or {}),
@@ -310,6 +310,79 @@ def _refresh_due_temperatures(robot, *, force=False, active=None):
 def refresh_after_arm_retry(robot):
     """Retain the existing retry entrypoint for the shared owner scheduler."""
     service_due_feedback(robot)
+
+
+class ThermalHistoryHoldRequiredError(RuntimeError):
+    """Fresh RAW exists, but the original five-peak proof cannot permit motion."""
+
+
+def enable_thermal_history(control, robot):
+    """Opt in only after this real whole-teleop owner has its immutable Live clock."""
+    admitted = control._live_summary.get("live_admitted_at_monotonic_s")
+    if admitted is None or not getattr(robot, "_am1_teleop_temperatures", None):
+        return
+    operation = getattr(robot, "_lift_operation", None)
+    if operation is None:
+        return
+    identity = {**control.binding, "recipe": RECIPE}
+    context = {"binding": identity, "live_at": admitted,
+               "deadline": control._live_summary["live_deadline_monotonic_s"]}
+    previous = getattr(robot, "_am1_thermal_history_context", None)
+    if previous is not None:
+        if previous != context:
+            raise RuntimeError("AM1 thermal history owner/Live clock changed")
+        return
+    if not binding_valid(robot) or robot._am1_teleop_binding != identity:
+        raise RuntimeError("AM1 thermal history requires its original admitted owner")
+    windows = [operation.temperature, *(state["window"] for state in robot._am1_teleop_temperatures.values())]
+    if len(windows) != 13:
+        raise RuntimeError("AM1 thermal history requires all original role windows")
+    now = control.clock()
+    for window in windows:
+        window.assert_fresh(now)  # Startup must already have strictly qualified.
+    robot._am1_thermal_history_context = copy.deepcopy(context)
+    robot._am1_thermal_history_enabled = True
+    robot._am1_thermal_history_episode = None
+    for window in windows:
+        window.allow_history_hold = True
+
+
+def thermal_history_status(robot):
+    """Original-clock safety proof; history loss is distinct from lost/invalid RAW."""
+    context = getattr(robot, "_am1_thermal_history_context", None)
+    if context is None:
+        if getattr(robot, "_am1_thermal_history_enabled", False):
+            raise RuntimeError("AM1 thermal history original owner context disappeared")
+        return None
+    if not binding_valid(robot) or robot._am1_teleop_binding != context["binding"]:
+        raise RuntimeError("AM1 thermal history protected identity changed")
+    operation = robot._lift_operation
+    operation.raise_if_faulted()
+    windows = [operation.temperature, *(state["window"] for state in robot._am1_teleop_temperatures.values())]
+    if len(windows) != 13 or any(window.allow_history_hold is not True for window in windows):
+        raise RuntimeError("AM1 thermal history role/collector changed")
+    now = time.monotonic()
+    for window in windows:
+        window.assert_fresh(now)  # RAW loss and every existing latch remain fatal.
+    deficits = [window.history_deficit_at for window in windows if window.history_deficit_at is not None]
+    episode = getattr(robot, "_am1_thermal_history_episode", None)
+    if deficits and episode is None:
+        started = min(deficits)
+        episode = robot._am1_thermal_history_episode = {
+            "started": started, "ceiling": min(started + 10, context["deadline"]),
+            "held_goals": None, "hold_sample": None, "zero_started": None, "zero_completed": None,
+        }
+    if episode is not None and now >= episode["ceiling"]:
+        raise RuntimeError("AM1 thermal history original recovery deadline expired")
+    return {
+        "version": 1, "raw_sample_at_monotonic_s": min(window._last_sample_at for window in windows),
+        "peaks_ready": all(window.ready for window in windows),
+        "deficit_started_at_monotonic_s": episode["started"] if episode else None,
+        "deficit_ceiling_monotonic_s": episode["ceiling"] if episode else None,
+        "hold_sample_at_monotonic_s": episode["hold_sample"] if episode else None,
+        "zero_read_started_at_monotonic_s": episode["zero_started"] if episode else None,
+        "zero_read_completed_at_monotonic_s": episode["zero_completed"] if episode else None,
+    }
 
 
 def service_due_feedback(robot):
@@ -510,7 +583,10 @@ def check_health(robot, records, *, active):
                 robot, side, bus, name, rows["Present_Temperature"],
                 records[side]["timing"]["Present_Temperature"], baseline[side], acquired=False,
             )
-            if active and not thermal["ready"]:
+            window = robot._am1_teleop_temperatures[side, bus.motors[name].id]["window"]
+            history_hold = (window.allow_history_hold is True and len(window.samples) == window.SIZE
+                            and window.history_deficit_at is not None)
+            if active and not thermal["ready"] and not history_hold:
                 raise RuntimeError("AM1 teleop five fresh follower temperature slots are required: " + name)
             if (
                 not limits["Min_Voltage_Limit"][name]
@@ -1019,6 +1095,7 @@ def hold_goals(robot):
         )
     ):
         raise RuntimeError("AM1 teleop literal held-goal acquisition expired or identity changed")
+    return records
 
 
 def poll_health(robot):
@@ -1102,7 +1179,13 @@ def before_write(control, robot):
     if getattr(robot, "_am1_teleop_first_error", None) is not None:
         raise robot._am1_teleop_first_error
     # Expiry is checked again after local validation and at every real write.
-    control.before_live_write(robot)
+    status = thermal_history_status(robot)
+    control.before_live_write(robot)  # Preserve the original expiry hold before a soft history hold.
+    if status is not None and status["deficit_started_at_monotonic_s"] is not None and (
+        not status["peaks_ready"] or status["hold_sample_at_monotonic_s"] is None
+        or time.monotonic() - status["hold_sample_at_monotonic_s"] > 0.5
+    ):
+        raise ThermalHistoryHoldRequiredError("AM1 thermal history needs a verified qualified hold")
     if not binding_valid(robot) or robot._am1_teleop_binding != {**control.binding, "recipe": RECIPE}:
         raise RuntimeError("AM1 teleop protected write identity changed")
     for _, bus, names in _groups(robot):
@@ -1221,10 +1304,13 @@ def apply_frame(control, robot, command, marker_key):
     ):
         return False
     original = marker["live_input"]
+    history = thermal_history_status(robot)
     if marker["mode"] == "pause" and original is not None:
         return False
     if not control.check_live(robot):
         return False
+    if history is not None and history["deficit_started_at_monotonic_s"] is not None and original is not None:
+        raise ThermalHistoryHoldRequiredError("AM1 thermal history revokes pending input before admission")
     if original is not None:
         if (
             not isinstance(original, dict)
@@ -1299,7 +1385,13 @@ def apply_frame(control, robot, command, marker_key):
         return False
     if original is None:
         # Readiness acknowledges an existing literal raw hold, never a synthetic frame.
-        return control._apply_standard(robot, action)
+        accepted = control._apply_standard(robot, action)
+        if accepted and history is not None and history["deficit_started_at_monotonic_s"] is not None:
+            current = thermal_history_status(robot)
+            if not current["peaks_ready"] or current["hold_sample_at_monotonic_s"] is None:
+                raise ThermalHistoryHoldRequiredError("AM1 thermal history has not requalified")
+            robot._am1_thermal_history_episode = None
+        return accepted
     if control.state == "paused" and control._live_summary["state"] == "expired":
         return False
     if control.state == "paused" and (

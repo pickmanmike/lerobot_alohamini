@@ -79,6 +79,45 @@ class FeedbackUnavailable(RuntimeError):  # noqa: N818 - existing adapter/test c
     """A bounded missing/stale reply; owner survives and holds/recoveries remain bounded."""
 
 
+def thermal_history_evidence(ack, now):
+    """Validate the admitted owner's original thermal proof, never its receipt time."""
+    if type(ack) is not dict:
+        raise ValueError("native thermal acknowledgement malformed")
+    if "thermal_history" not in ack:
+        return None, True  # Legacy/nonthermal owners retain their existing contract.
+    proof = ack["thermal_history"]
+    fields = {"version", "raw_sample_at_monotonic_s", "peaks_ready",
+              "deficit_started_at_monotonic_s", "deficit_ceiling_monotonic_s",
+              "hold_sample_at_monotonic_s", "zero_read_started_at_monotonic_s",
+              "zero_read_completed_at_monotonic_s"}
+    if (type(proof) is not dict or set(proof) != fields or type(proof["version"]) is not int
+            or proof["version"] != 1 or type(proof["peaks_ready"]) is not bool):
+        raise ValueError("native thermal history proof malformed")
+    raw = proof["raw_sample_at_monotonic_s"]
+    if (type(raw) not in (int, float) or not math.isfinite(raw)
+            or not 0 <= raw <= now or now - raw > .5):
+        raise ValueError("native thermal original RAW feedback expired/invalid")
+    started, ceiling = (proof[key] for key in
+                         ("deficit_started_at_monotonic_s", "deficit_ceiling_monotonic_s"))
+    hold, zero_start, zero_end = (proof[key] for key in
+                                 ("hold_sample_at_monotonic_s", "zero_read_started_at_monotonic_s",
+                                  "zero_read_completed_at_monotonic_s"))
+    if started is None:
+        if ceiling is not None or any(value is not None for value in (hold, zero_start, zero_end)) or not proof["peaks_ready"]:
+            raise ValueError("native thermal history episode/proof missing")
+        return copy.deepcopy(proof), True
+    if (any(type(value) not in (int, float) or not math.isfinite(value) for value in (started, ceiling))
+            or not 0 <= started <= now or not started < ceiling <= started + 10):
+        raise ValueError("native thermal history original recovery clock invalid")
+    if hold is None and zero_start is None and zero_end is None:
+        return copy.deepcopy(proof), False
+    if (any(type(value) not in (int, float) or not math.isfinite(value) for value in (hold, zero_start, zero_end))
+            or not 0 <= hold <= zero_start <= zero_end <= now or zero_end - zero_start > .04
+            or now - hold > .5):
+        raise ValueError("native thermal actual zero/hold proof expired/invalid")
+    return copy.deepcopy(proof), proof["peaks_ready"] and now < ceiling
+
+
 @dataclass(frozen=True)
 class PendingSample:
     """Validated cached feedback; not a new observation, receipt or ACK."""
@@ -651,6 +690,12 @@ class PhysicalExecutor:
             or type(seq) is not int or seq <= self._live_last_seq
             or type(valid_until_monotonic_s) not in (int, float) or not math.isfinite(valid_until_monotonic_s)):
             return False
+        try:
+            _thermal, thermal_ready = self._thermal_qualification((self.sample or {}).get("ack", {}), self.clock())
+        except ValueError:
+            return False
+        if not thermal_ready or (_thermal is not None and _thermal["deficit_started_at_monotonic_s"] is not None):
+            return False  # Only a new actual active ACK can close the held history episode.
         checked_at = self.clock()
         if (type(checked_at) not in (int, float) or not math.isfinite(checked_at)
                 or valid_until_monotonic_s > checked_at + .25 + 1e-9):
@@ -677,6 +722,22 @@ class PhysicalExecutor:
         self._live_last_seq = seq
         self._wake.set()
         return True
+
+    def _thermal_qualification(self, ack, now):
+        identity = (self.run_id, self.host_incarnation)
+        if "thermal_history" in ack:
+            self._thermal_history_proof_identity = identity
+        elif getattr(self, "_thermal_history_proof_identity", None) == identity:
+            raise ValueError("native thermal history proof disappeared")
+        proof, ready = thermal_history_evidence(ack, now)
+        if proof is not None and proof["deficit_started_at_monotonic_s"] is not None:
+            live = self._lifecycle.get("native_live_at")
+            started, ceiling = (proof[key] for key in
+                                ("deficit_started_at_monotonic_s", "deficit_ceiling_monotonic_s"))
+            if (type(live) not in (int, float) or not math.isfinite(live) or started < live
+                    or ceiling != min(started + 10, live + self._live_ceiling())):
+                raise ValueError("native thermal history original Live/recovery clock changed")
+        return proof, ready
 
     def _update_polled_sample(self, polled, transient):
         pending = isinstance(polled, PendingSample)
@@ -710,8 +771,13 @@ class PhysicalExecutor:
             if polled is not None:
                 self.sample = polled
         advanced = not pending and polled is not None
+        thermal_ready = True
+        if self.sample is not None and self.live_spec is TELEOP_SPEC:
+            _thermal, thermal_ready = self._thermal_qualification(self.sample["ack"], self.clock())
+            if not thermal_ready:
+                self._live_target = None  # A later qualified Resume must never replay this target.
         usable = bool(
-            (pending or advanced)
+            thermal_ready and (pending or advanced)
             and self.sample is not None
             and 0 <= self.clock() - self.sample["at"] < FEEDBACK_MAX_AGE_S
             and self._transient is None
@@ -731,6 +797,13 @@ class PhysicalExecutor:
                 and self._fault is None
             )
             ack = s["ack"] if s else {}
+            thermal, thermal_fault = None, None
+            if self.live_spec is TELEOP_SPEC:
+                try:
+                    thermal, thermal_ready = self._thermal_qualification(ack, now)
+                    fresh = fresh and thermal_ready
+                except ValueError as error:
+                    fresh, thermal_fault = False, str(error)
             matched = (
                 fresh
                 and ack.get("run_id") == self.run_id
@@ -768,7 +841,8 @@ class PhysicalExecutor:
                 "native_ack": bool(hold or active_ack or live_transition),
                 "active_acknowledged": bool(active_ack),
                 "finite_completion": copy.deepcopy(self._finite_completion),
-                "fault": self._fault,
+                "fault": self._fault or thermal_fault,
+                **({"thermal_history": thermal} if thermal is not None else {}),
                 "feedback_age_s": age,
                 "observation_age_s": o["age_s"],
                 "observation": o,
@@ -799,6 +873,7 @@ class PhysicalExecutor:
             o = self.observation.evidence()
             if (
                 not o["qualified"]
+                or not self.evidence()["feedback"]
                 or self.sample is None
                 or self.clock() - self.sample["at"] >= FEEDBACK_MAX_AGE_S
             ):

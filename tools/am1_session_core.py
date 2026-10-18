@@ -2702,6 +2702,66 @@ class SessionAuthority:
         elif self.grant and now >= self.grant["expires"]:
             self._clear_input()
 
+    def _thermal_history_recovery(self, evidence, now):
+        """Admit only the native history-only hold into the existing bounded episode."""
+        proof = evidence.get("thermal_history")
+        if self.run["recipe"] != TELEOP_RECIPE or not isinstance(proof, dict):
+            return False
+        # Evidence can advance while tick obtains it; consume its ORIGINAL clocks now.
+        now = self.clock()
+        from tools.am1_physical_executor import thermal_history_evidence
+
+        try:
+            thermal_history_evidence({"thermal_history": proof}, now)
+        except ValueError as error:
+            self._finish("faulted", str(error))
+            return True
+        started = proof["deficit_started_at_monotonic_s"]
+        if started is None:
+            previous = getattr(self, "_thermal_history_episode", None)
+            if (previous is not None and previous["identity"][0] == self.run["run_id"]
+                    and evidence["feedback"] and evidence.get("active_acknowledged") is True):
+                previous["closed"] = True
+            return False
+        ceiling = min(proof["deficit_ceiling_monotonic_s"], self.run["deadline"])
+        r = self.run
+        if r.get("uncertain") is not False:
+            self._finish("faulted", "thermal_history_current_state_uncertain")
+            return True
+        if not r["native_live_at"] <= started <= now or not started < ceiling <= started + 10:
+            self._finish("faulted", "thermal_history_recovery_clock")
+            return True
+        identity = (r["run_id"], started)
+        previous = getattr(self, "_thermal_history_episode", None)
+        distinct = previous is None or previous["identity"] != identity
+        if distinct:
+            if previous is not None and previous["identity"][0] == r["run_id"] and not previous["closed"]:
+                self._finish("faulted", "thermal_history_episode_changed_before_active_ack")
+                return True
+            if r.get("recovery") is not None:
+                started = min(started, r["recovery"]["started"])
+                ceiling = min(ceiling, r["recovery"]["ceiling"])
+            else:
+                r["recovery_episodes"] += 1
+            previous = self._thermal_history_episode = {
+                "identity": identity, "started": started, "ceiling": ceiling, "closed": False,
+            }
+        else:
+            started, ceiling = previous["started"], previous["ceiling"]
+        if r["recovery_episodes"] > 3 or now >= ceiling:
+            self._finish("faulted", "recovery_budget" if r["recovery_episodes"] > 3 else "recovery_timeout")
+            return True
+        revision_changed = r.get("recovery") is not None and r["recovery"]["revision"] != r["intent_revision"]
+        if distinct or revision_changed or (not evidence["feedback"] and r["status"] in {"paused", "running", "resuming"}):
+            r["first_cause"] = r["first_cause"] or "feedback_loss"
+            r["recovery"] = {"started": started, "ceiling": ceiling, "revision": r["intent_revision"]}
+            r["status"] = "recovering"
+            self._clear_input()
+            self._event("required_hold")
+            self._save()
+            return True
+        return False
+
     def tick(self):
         with self.mutex:
             if self.closed:
@@ -2756,6 +2816,8 @@ class SessionAuthority:
             if (r["recipe"] == TELEOP_RECIPE and e.get("feedback") is True and e.get("native_ack") is True
                     and not self._teleop_geometry_valid(e.get("live_input"))):
                 self._finish("faulted", "physical_live_teleop_geometry_mismatch")
+                return
+            if self._thermal_history_recovery(e, now):
                 return
             live_input = self._live_input_status(e, include_rearm=False)
             if live_input is not None:

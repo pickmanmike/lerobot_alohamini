@@ -1663,3 +1663,339 @@ def test_lift_actual_poll_accepts_only_its_new_equal_peak_receipts(operating_rob
         assert window.ceiling_c == 55 and window.MAX_AGE_S == .5
     finally:
         robot.disconnect()
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_history_hold_saved45_slot_hole_preserves_original_peaks_and_never_forges_readiness(enabled):
+    """Saved45 peaks/raw receipts; the preceding1605 bridge is explicitly synthetic."""
+    window = TemperatureWindow(ceiling_c=70)
+    origin = 201638.116670038
+    window._origin_ns = round(origin * 1e9)
+    window.samples.extend((stamp, 29) for stamp in (
+        201798.698457272, 201798.798457272, 201798.894473781,
+        201799.002469488, 201799.098480496,
+    ))
+    window._last_slot = 1609
+    window._last_sample_at = 201799.098480496
+    window.allow_history_hold = enabled
+    assert window.update(29, 201799.281493231)["ready"]
+    original = list(window.samples)
+    if not enabled:
+        with pytest.raises(RuntimeError, match="five-slot feedback window is stale"):
+            window.update(29, 201799.304482964)
+        assert window.failure is not None
+        return
+    evidence = window.update(29, 201799.304482964)
+    assert evidence["ready"] is False and window.failure is None
+    assert window.history_deficit_at == 201799.304482964
+    assert list(window.samples)[:-1] == original[:-1]
+    assert window.samples[-1] == (201799.304482964, 29)
+    assert window._origin_ns == round(origin * 1e9)
+    # Natural, distinct new slots restore readiness; there is no clear/reset.
+    for stamp in (201799.324, 201799.424, 201799.524, 201799.624):
+        evidence = window.update(29, stamp)
+    assert evidence["ready"] and window.failure is None
+    assert window._origin_ns == round(origin * 1e9)
+
+
+@pytest.mark.parametrize("fault", ["raw_loss", "duplicate", "backward", "invalid", "confirmed_high"])
+def test_history_hold_never_softens_raw_clock_or_confirmed_heat_faults(fault):
+    window = TemperatureWindow(ceiling_c=70)
+    for stamp in (10., 10.1, 10.2, 10.3, 10.4):
+        window.update(70 if fault == "confirmed_high" and stamp in (10.2, 10.3) else 29, stamp)
+    window.allow_history_hold = True
+    stamp, value = {
+        "raw_loss": (10.901, 29), "duplicate": (10.4, 29), "backward": (10.39, 29),
+        "invalid": (10.61, float("nan")), "confirmed_high": (10.61, 70),
+    }[fault]
+    with pytest.raises(RuntimeError, match="majority" if fault == "confirmed_high" else "temperature"):
+        window.update(value, stamp)
+    first = window.failure
+    assert first is not None
+    with pytest.raises(RuntimeError) as retained:
+        window.update(29, stamp + .1)
+    assert retained.value is first
+
+
+def test_history_hold_real_follower_acquisition_keeps_incomplete_history_separate_from_fault(thermal_robot):
+    robot, clock = thermal_robot
+    for stamp in (10., 10.1, 10.2, 10.3, 10.4):
+        acquire(robot, clock, stamp, check=stamp == 10.4)
+    windows = [state["window"] for state in robot._am1_teleop_temperatures.values()]
+    for window in windows:
+        window.allow_history_hold = True
+    records = acquire(robot, clock, 10.61)
+    assert all(not row["ready"] for side in ("left", "right") for row in records[side]["temperature"].values())
+    assert all(window.failure is None for window in windows)
+    assert getattr(robot, "_am1_teleop_first_error", None) is None
+    # Right status must still be checked after left history becomes incomplete.
+    robot.right_bus.rows["Status"]["arm_right_6"] = 8
+    with pytest.raises(RuntimeError, match="status fault"):
+        acquire(robot, clock, 10.62)
+    assert all(window.failure is None for window in windows)
+    assert robot._am1_teleop_first_error is not None
+
+
+@pytest.mark.parametrize("fault", [None, "nonzero", "missing", "long", "raw_expiry", "hold_failure", "failed", "resume_gap"])
+def test_history_hold_real_owner_requires_actual_bounded_zero_and_never_restarts_native_clock(
+    command_cadence_boundary, monkeypatch, fault,
+):
+    from lerobot.robots.alohamini.alohamini_host import AM1LocalControl
+    from tests.robots.test_am1_live_teleop_native import frame
+
+    state, robot = command_cadence_boundary, command_cadence_boundary.robot
+    for side, raw in (("left", 2124), ("right", 1847)):
+        bus = getattr(robot, side + "_bus")
+        for register in ("Present_Position", "Goal_Position"):
+            bus.registers[register, "arm_" + side + "_elbow_flex"] = raw
+    for motor in (*robot.base_motors, "lift_axis"):
+        robot.left_bus.registers["Goal_Velocity", motor] = 0
+    identity = {key: robot._am1_teleop_binding[key] for key in ("run_id", "host_incarnation")}
+    owner = {key: str(uuid4()) for key in ("service_incarnation", "controller_generation", "connection_generation")}
+    control = AM1LocalControl(**identity, live=True, live_recipe=teleop.RECIPE, clock=lambda: state.clock.now)
+    assert control.apply(robot, frame(identity, owner, 1))
+    assert control.apply(robot, frame(identity, owner, 2, mode="active", epoch=2))
+    windows = [state.operation.temperature, *(row["window"] for row in robot._am1_teleop_temperatures.values())]
+    assert all(window.allow_history_hold is True for window in windows)
+    frozen = control.live_snapshot()
+    origins = [window._origin_ns for window in windows]
+    state.clock.sleep(.21)  # Explicit synthetic opaque owner work; not a saved45 subcall.
+    observation = robot.get_observation()
+    before = state.clock.now
+    original = robot.left_bus.sync_read
+    zero_calls, read_error = [], ConnectionError("actual zero proof reply failed")
+    def read(register, motors=None, **kwargs):
+        if register == "Goal_Velocity":
+            zero_calls.append(state.clock.now)
+            if fault == "failed":
+                raise read_error
+        if register == "Goal_Velocity" and fault == "nonzero":
+            # Servo retained a nonzero goal AFTER the actual direct zero request.
+            robot.left_bus.registers[register, robot.base_motors[0]] = 1
+        result = original(register, motors, **kwargs)
+        if register == "Goal_Velocity":
+            if fault == "missing":
+                result.pop(next(iter(result)))
+            if fault in {"long", "raw_expiry"}:
+                state.clock.sleep(.041 if fault == "long" else .501)
+        return result
+    monkeypatch.setattr(robot.left_bus, "sync_read", read)
+    hold_error = RuntimeError("actual direct zero failed")
+    if fault == "hold_failure":
+        monkeypatch.setattr(robot, "stop_motion", lambda: (_ for _ in ()).throw(hold_error))
+    if fault is not None and fault != "resume_gap":
+        with pytest.raises((RuntimeError, ConnectionError)) as caught:
+            control.reconcile_thermal_history(robot, observation)
+        if fault == "hold_failure":
+            assert caught.value is hold_error
+        if fault == "failed":
+            assert caught.value is read_error and len(zero_calls) == 1
+        return
+    control.reconcile_thermal_history(robot, observation)
+    assert control.state == "paused" and control.live_sample is None
+    status = teleop.thermal_history_status(robot)
+    assert status["peaks_ready"] is False and status["hold_sample_at_monotonic_s"] is not None
+    assert status["deficit_started_at_monotonic_s"] <= before
+    anchor, ceiling = status["deficit_started_at_monotonic_s"], status["deficit_ceiling_monotonic_s"]
+    assert ceiling == min(anchor + 10, frozen["live_deadline_monotonic_s"])
+    assert 0 <= status["zero_read_completed_at_monotonic_s"] - status["zero_read_started_at_monotonic_s"] <= .04
+    for _ in range(8):
+        state.clock.sleep(.05)
+        observation = robot.get_observation()
+        control.reconcile_thermal_history(robot, observation)
+    status = teleop.thermal_history_status(robot)
+    assert status["peaks_ready"] and status["deficit_started_at_monotonic_s"] == anchor
+    assert [window._origin_ns for window in windows] == origins
+    assert all(window.failure is None for window in windows)
+    assert control.live_snapshot()["live_deadline_monotonic_s"] == frozen["live_deadline_monotonic_s"]
+    # Real same-owner new pause/active ACK closes this episode; it is not input replay.
+    assert control.apply(robot, frame(identity, owner, 3, epoch=3))
+    if fault == "resume_gap":
+        apply_standard = control._apply_standard
+        def delayed_active(_robot, action):
+            accepted = apply_standard(_robot, action)
+            if action["_am1_local_control"]["mode"] == "active":
+                state.clock.sleep(.21)
+            return accepted
+        monkeypatch.setattr(control, "_apply_standard", delayed_active)
+        assert not control.apply(robot, frame(identity, owner, 4, mode="active", epoch=4))
+        assert control.state == "paused"
+        assert teleop.thermal_history_status(robot)["deficit_started_at_monotonic_s"] == anchor
+        return
+    assert control.apply(robot, frame(identity, owner, 4, mode="active", epoch=4))
+    assert teleop.thermal_history_status(robot)["deficit_started_at_monotonic_s"] is None
+
+
+
+@pytest.mark.parametrize("boundary", ["before_left", "after_left"])
+def test_history_hold_partial_native_action_never_commits_cursor_or_later_goal(
+    command_cadence_boundary, monkeypatch, boundary,
+):
+    from lerobot.robots.alohamini.alohamini_host import AM1LocalControl
+    from tests.robots.test_am1_live_teleop_native import frame, sample
+
+    state, robot = command_cadence_boundary, command_cadence_boundary.robot
+    for side, raw in (("left", 2124), ("right", 1847)):
+        for register in ("Present_Position", "Goal_Position"):
+            getattr(robot, side + "_bus").registers[register, "arm_" + side + "_elbow_flex"] = raw
+    identity = {key: robot._am1_teleop_binding[key] for key in ("run_id", "host_incarnation")}
+    owner = {key: str(uuid4()) for key in ("service_incarnation", "controller_generation", "connection_generation")}
+    control = AM1LocalControl(**identity, live=True, live_recipe=teleop.RECIPE, clock=lambda: state.clock.now)
+    assert control.apply(robot, frame(identity, owner, 1))
+    assert control.apply(robot, frame(identity, owner, 2, mode="active", epoch=2))
+    frozen, sequence = control.live_snapshot(), control.accepted_action_sequence
+    original = sample(control, expiry=state.clock.now + .25)
+    state.command_writes.clear()
+    if boundary == "before_left":
+        state.clock.sleep(.21)
+        original["valid_until_monotonic_s"] = state.clock.now + .25
+    else:
+        def stall(side, register, _values):
+            if side == "left" and register == "Goal_Position":
+                state.after_write = None
+                state.clock.sleep(.21)
+        state.after_write = stall
+    assert not control.apply(robot, frame(identity, owner, 3, mode="active", epoch=2, sample=original))
+    summary = control.live_snapshot()
+    assert control.state == "paused" and control.live_sample is None
+    assert control.accepted_action_sequence == sequence
+    assert "cursor" not in summary and "accepted_target" not in summary
+    assert summary["reference"] == frozen["reference"] and summary["workspace"] == frozen["workspace"]
+    assert summary["live_deadline_monotonic_s"] == frozen["live_deadline_monotonic_s"]
+    goals = [side for side, register, _values, _at in state.command_writes if register == "Goal_Position"]
+    assert goals == ([] if boundary == "before_left" else ["left"])
+    proof = teleop.thermal_history_status(robot)
+    assert proof["hold_sample_at_monotonic_s"] is not None and not proof["peaks_ready"]
+
+
+
+@pytest.mark.parametrize("fault", ["current", "status", "confirmed_heat", "raw_loss"])
+def test_history_hold_real_owner_cannot_downgrade_any_role_hard_fault(command_cadence_boundary, fault):
+    from lerobot.robots.alohamini.alohamini_host import AM1LocalControl
+    from tests.robots.test_am1_live_teleop_native import frame, sample
+
+    state, robot = command_cadence_boundary, command_cadence_boundary.robot
+    for side, raw in (("left", 2124), ("right", 1847)):
+        for register in ("Present_Position", "Goal_Position"):
+            getattr(robot, side + "_bus").registers[register, "arm_" + side + "_elbow_flex"] = raw
+    identity = {key: robot._am1_teleop_binding[key] for key in ("run_id", "host_incarnation")}
+    owner = {key: str(uuid4()) for key in ("service_incarnation", "controller_generation", "connection_generation")}
+    control = AM1LocalControl(**identity, live=True, live_recipe=teleop.RECIPE, clock=lambda: state.clock.now)
+    assert control.apply(robot, frame(identity, owner, 1))
+    assert control.apply(robot, frame(identity, owner, 2, mode="active", epoch=2))
+    state.clock.sleep(.21 if fault != "raw_loss" else .501)
+    if fault == "current":
+        robot.right_bus.registers["Present_Current", "arm_right_gripper"] = 310
+    elif fault == "status":
+        robot.right_bus.registers["Status", "arm_right_gripper"] = 8
+    elif fault == "confirmed_heat":
+        window = robot._am1_teleop_temperatures["right", 6]["window"]
+        window.samples[-1] = (window.samples[-1][0], 70)
+        window.samples[-2] = (window.samples[-2][0], 70)
+        robot.right_bus.registers["Present_Temperature", "arm_right_gripper"] = 70
+    original = sample(control, expiry=state.clock.now + .25)
+    with pytest.raises(RuntimeError, match={"current": "current protection", "status": "status fault",
+                                          "confirmed_heat": "majority", "raw_loss": "stale"}[fault]):
+        control.apply(robot, frame(identity, owner, 3, mode="active", epoch=2, sample=original))
+    assert control.live_snapshot().get("last_successful_write") is None
+
+
+
+def test_history_hold_refill_never_resets_the_original_isolated_high_counter_or_origin():
+    window = TemperatureWindow(ceiling_c=70)
+    for stamp, value in ((10., 80), (10.1, 29), (10.2, 29), (10.3, 29), (10.4, 29)):
+        window.update(value, stamp)
+    origin = window._origin_ns
+    window.allow_history_hold = True
+    assert not window.update(29, 10.61)["ready"]
+    assert window.outliers == 1
+    for stamp in (10.71, 10.81, 10.91, 11.01):
+        window.update(29, stamp)
+    assert window.ready and window.outliers == 1 and window._origin_ns == origin
+    assert len(window.samples) == 5 and window.failure is None
+
+
+def test_history_hold_reconciliation_preserves_the_prior_partial_write_expiry(command_cadence_boundary):
+    from lerobot.robots.alohamini.alohamini_host import AM1LocalControl
+    from tests.robots.test_am1_live_teleop_native import frame, sample
+
+    state, robot = command_cadence_boundary, command_cadence_boundary.robot
+    for side, raw in (("left", 2124), ("right", 1847)):
+        for register in ("Present_Position", "Goal_Position"):
+            getattr(robot, side + "_bus").registers[register, "arm_" + side + "_elbow_flex"] = raw
+    identity = {key: robot._am1_teleop_binding[key] for key in ("run_id", "host_incarnation")}
+    owner = {key: str(uuid4()) for key in ("service_incarnation", "controller_generation", "connection_generation")}
+    control = AM1LocalControl(**identity, live=True, live_recipe=teleop.RECIPE, clock=lambda: state.clock.now)
+    assert control.apply(robot, frame(identity, owner, 1))
+    assert control.apply(robot, frame(identity, owner, 2, mode="active", epoch=2))
+    original = sample(control, expiry=state.clock.now + .25)
+    assert control.apply(robot, frame(identity, owner, 3, mode="active", epoch=2, sample=original))
+    frozen, accepted = control.live_snapshot(), control.accepted_action_sequence
+    fresh = sample(control, seq=2, expiry=state.clock.now + .25,
+                   source_id=original["source"]["source_id"], acquired=1.04)
+    def expire(side, register, _values):
+        if side == "left" and register == "Goal_Position":
+            state.after_write = None
+            state.clock.now = fresh["valid_until_monotonic_s"]
+    state.after_write = expire
+    assert not control.apply(robot, frame(identity, owner, 4, mode="active", epoch=2, sample=fresh))
+    assert control.live_snapshot()["state"] == "expired"
+    before = teleop.thermal_history_status(robot)
+    assert before["deficit_started_at_monotonic_s"] is not None
+    for _ in range(2):
+        state.operation.emit_pending_sample()  # The ordinary owner drains each completed iteration.
+        observation = robot.get_observation()
+        control.reconcile_thermal_history(robot, observation)
+        summary = control.live_snapshot()
+        proof = teleop.thermal_history_status(robot)
+        assert control.state == "paused" and summary["state"] == "expired"
+        assert control.live_sample is None and control.accepted_action_sequence == accepted
+        assert "cursor" not in summary and "accepted_target" not in summary
+        assert summary["reference"] == frozen["reference"] and summary["workspace"] == frozen["workspace"]
+        assert summary["live_deadline_monotonic_s"] == frozen["live_deadline_monotonic_s"]
+        assert proof["deficit_started_at_monotonic_s"] == before["deficit_started_at_monotonic_s"]
+        assert proof["deficit_ceiling_monotonic_s"] == before["deficit_ceiling_monotonic_s"]
+        assert proof["hold_sample_at_monotonic_s"] is not None
+
+
+def test_history_hold_entry_preserves_expiry_of_the_original_stored_sample(command_cadence_boundary):
+    from lerobot.robots.alohamini.alohamini_host import AM1LocalControl
+    from tests.robots.test_am1_live_teleop_native import frame, sample
+
+    state, robot = command_cadence_boundary, command_cadence_boundary.robot
+    for side, raw in (("left", 2124), ("right", 1847)):
+        for register in ("Present_Position", "Goal_Position"):
+            getattr(robot, side + "_bus").registers[register, "arm_" + side + "_elbow_flex"] = raw
+    identity = {key: robot._am1_teleop_binding[key] for key in ("run_id", "host_incarnation")}
+    owner = {key: str(uuid4()) for key in ("service_incarnation", "controller_generation", "connection_generation")}
+    control = AM1LocalControl(**identity, live=True, live_recipe=teleop.RECIPE, clock=lambda: state.clock.now)
+    assert control.apply(robot, frame(identity, owner, 1))
+    assert control.apply(robot, frame(identity, owner, 2, mode="active", epoch=2))
+    original = sample(control, expiry=state.clock.now + .25)
+    assert control.apply(robot, frame(identity, owner, 3, mode="active", epoch=2, sample=original))
+    frozen, accepted = control.live_snapshot(), control.accepted_action_sequence
+    # Synthetic owner work outlasts the STORED original sample, not the incoming one.
+    state.clock.now = original["valid_until_monotonic_s"]
+    fresh = sample(control, seq=2, expiry=state.clock.now + .25,
+                   source_id=original["source"]["source_id"], acquired=1.04)
+    state.command_writes.clear()
+    assert not control.apply(robot, frame(identity, owner, 4, mode="active", epoch=2, sample=fresh))
+    assert control.live_snapshot()["state"] == "expired"
+    assert control.live_sample is None and control.accepted_action_sequence == accepted
+    proof = teleop.thermal_history_status(robot)
+    anchor, ceiling = proof["deficit_started_at_monotonic_s"], proof["deficit_ceiling_monotonic_s"]
+    assert anchor is not None and ceiling == min(anchor + 10, frozen["live_deadline_monotonic_s"])
+    for _ in range(2):
+        state.operation.emit_pending_sample()  # The ordinary owner drains each completed iteration.
+        observation = robot.get_observation()
+        control.reconcile_thermal_history(robot, observation)
+        proof = teleop.thermal_history_status(robot)
+        summary = control.live_snapshot()
+        assert control.state == "paused" and summary["state"] == "expired"
+        assert control.live_sample is None and control.accepted_action_sequence == accepted
+        assert "cursor" not in summary and "accepted_target" not in summary
+        assert proof["deficit_started_at_monotonic_s"] == anchor
+        assert proof["deficit_ceiling_monotonic_s"] == ceiling
+        assert summary["reference"] == frozen["reference"] and summary["workspace"] == frozen["workspace"]
+        assert summary["live_deadline_monotonic_s"] == frozen["live_deadline_monotonic_s"]
+    assert not any(register == "Goal_Position" for _side, register, _values, _at in state.command_writes)

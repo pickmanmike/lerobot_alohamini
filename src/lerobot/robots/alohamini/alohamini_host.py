@@ -230,6 +230,11 @@ class AM1LocalControl:
             return True
         if self.state == "stopped":
             return False  # A cleanup Stop cannot be reopened by expiry/watchdog ticks.
+        if self.teleop:
+            from .am1_live_teleop import enable_thermal_history
+
+            enable_thermal_history(self, robot)
+            self._thermal_robot = robot
         now = self.clock()
         deadline = self._live_summary.get("live_deadline_monotonic_s")
         if deadline is not None and now >= deadline:
@@ -449,6 +454,74 @@ class AM1LocalControl:
                 self.selected_evidence.live_action(robot, self._live_summary)
         return accepted
 
+    def reconcile_thermal_history(self, robot: AlohaMini, observation=None) -> None:
+        """Finite verified native hold; no new input, owner, clock or bus reader."""
+        if not self.teleop:
+            return
+        from .am1_live_teleop import hold_goals, thermal_history_status
+
+        status = thermal_history_status(robot)
+        if status is None or status["deficit_started_at_monotonic_s"] is None:
+            return
+        episode = robot._am1_thermal_history_episode
+        if getattr(self, "_thermal_hold_started", None) != episode["started"] or self.state != "paused":
+            self._live_hold(robot, expired=self._live_summary.get("state") == "expired")
+            self._thermal_hold_started = episode["started"]
+            for key in ("cursor", "cursor_feedback_sequence", "cursor_intent_revision"):
+                self._live_summary.pop(key, None)
+        if observation is None:
+            observation = robot.get_observation()  # All ordinary role/current/status guards run.
+        goals = hold_goals(robot)
+        literal = {side: dict(row["registers"]["Goal_Position"]) for side, row in goals.items()}
+        if episode["held_goals"] is not None and episode["held_goals"] != literal:
+            raise RuntimeError("AM1 thermal history literal hold changed")
+        names = (*robot.base_motors, "lift_axis")
+        if len(names) != 4 or set(names) != {"base_left_wheel", "base_back_wheel", "base_right_wheel", "lift_axis"}:
+            raise RuntimeError("AM1 thermal history exact body motor map changed")
+        thermal_history_status(robot)
+        started = self.clock()
+        values = robot.left_bus.sync_read("Goal_Velocity", names, normalize=False, num_retry=0)
+        completed = self.clock()
+        now = self.clock()
+        if (set(values) != set(names) or any(type(value) is not int or value != 0 for value in values.values())
+                or not 0 <= started <= completed <= now or completed - started > .04
+                or now - started > .5):
+            raise RuntimeError("AM1 thermal history actual bounded body-zero readback unavailable")
+        samples = [started]
+        arm_feedback = observation.get("_am1_arm_feedback", {}).get("positions", {})
+        expected_positions = {name + ".pos" for name in (*robot.left_arm_motors, *robot.right_arm_motors)}
+        if set(arm_feedback) != expected_positions:
+            raise RuntimeError("AM1 thermal history complete original position proof unavailable")
+        for reading in arm_feedback.values():
+            raw_start, raw_end = (reading[key] for key in
+                                 ("read_started_at_monotonic_s", "read_completed_at_monotonic_s"))
+            if not 0 <= raw_start <= raw_end <= now:
+                raise RuntimeError("AM1 thermal history original position clock invalid")
+            samples.append(raw_start)
+        health = robot._am1_teleop_health
+        if health.get("binding") != robot._am1_teleop_binding:
+            raise RuntimeError("AM1 thermal history current role health identity unavailable")
+        for side in ("left", "right"):
+            for timing in health[side]["timing"].values():
+                if not 0 <= timing["read_started_at_monotonic_s"] <= timing["read_completed_at_monotonic_s"] <= now:
+                    raise RuntimeError("AM1 thermal history original role health clock invalid")
+                samples.append(timing["read_started_at_monotonic_s"])
+        lift_record = robot._lift_operation.last_record
+        samples.append(lift_record["sample_monotonic_s"] - lift_record["request_duration_s"])
+        for row in goals.values():
+            samples.append(row["timing"]["Goal_Position"]["read_started_at_monotonic_s"])
+        for side in ("left", "right"):
+            sample = robot._am1_teleop_currents[side]
+            samples.append(sample["read_started_at_monotonic_s"])
+            if not 0 <= sample["read_started_at_monotonic_s"] <= sample["read_completed_at_monotonic_s"] <= now:
+                raise RuntimeError("AM1 thermal history current proof clock invalid")
+        if any(now - stamp > .5 for stamp in samples):
+            raise RuntimeError("AM1 thermal history original hold proof expired")
+        # The full observation has already validated all original role protections.
+        # These are the actual request clocks, never an enqueue/HTTP receipt time.
+        episode.update(held_goals=literal, hold_sample=min(samples), zero_started=started, zero_completed=completed)
+        thermal_history_status(robot)  # No expired RAW/episode is rescued by hold I/O.
+
     def annotate(self, observation: dict, *, acquired_at: float | None = None) -> None:
         self.observation_id += 1
         observation[AM1_LOCAL_FEEDBACK_KEY] = {
@@ -467,6 +540,12 @@ class AM1LocalControl:
             )
             if self.live:
                 observation[AM1_LOCAL_FEEDBACK_KEY]["live_input"] = self.live_snapshot()
+            if self.teleop:
+                from .am1_live_teleop import thermal_history_status
+
+                history = thermal_history_status(self._thermal_robot) if hasattr(self, "_thermal_robot") else None
+                if history is not None:
+                    observation[AM1_LOCAL_FEEDBACK_KEY]["thermal_history"] = history
             if self.teleop and "_am1_arm_feedback" in observation:
                 observation[AM1_LOCAL_FEEDBACK_KEY]["arm_feedback"] = copy.deepcopy(observation["_am1_arm_feedback"])
             if self.teleop and "_am1_lift_feedback" in observation:
@@ -483,7 +562,7 @@ class AM1LocalControl:
 
     def apply(self, robot: AlohaMini, command: dict) -> bool:
         if self.teleop:
-            from .am1_live_teleop import apply_frame
+            from .am1_live_teleop import ThermalHistoryHoldRequiredError, apply_frame
             zero_keys = {"x.vel", "y.vel", "theta.vel", "lift_axis.vel"}
             if (self.state != "ready" and self.binding is not None and set(command) == zero_keys
                     and all(type(value) in (int, float) and value == 0 for value in command.values())):
@@ -493,6 +572,9 @@ class AM1LocalControl:
             try:
                 return apply_frame(self, robot, command, AM1_LOCAL_CONTROL_KEY)
             except AM1LiveInputExpired:
+                return False
+            except ThermalHistoryHoldRequiredError:
+                self.reconcile_thermal_history(robot)
                 return False
         if self.live:
             zero_keys = {"x.vel", "y.vel", "theta.vel", "lift_axis.vel"}
@@ -1844,6 +1926,8 @@ def _run_host(args):
                 loop_timing.mark("robot_observation", time.perf_counter())
             read_started_at = time.monotonic()
             last_observation = robot.get_observation()
+            if local_control is not None and getattr(robot, "_am1_thermal_history_enabled", False):
+                local_control.reconcile_thermal_history(robot, last_observation)
             acquired_at = time.monotonic()
             if local_control is not None:
                 local_control.annotate(last_observation, acquired_at=acquired_at)

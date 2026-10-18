@@ -9,13 +9,15 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import contextlib
+import hashlib
 import json
 import math
 import ssl
 import time
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 from uuid import UUID, uuid4
 
 from examples.alohamini.am1_live_teleop import (
@@ -359,6 +361,75 @@ def recovery_grant_refusal(error):
             }.items()
         )
     )
+
+
+
+def _startup_run_reference(state):
+    """Only the existing essential-status run reference can omit startup clocks."""
+    projection = state.get("status_projection")
+    if projection != {"kind": "am1-essential-status", "version": 1}:
+        return None
+    if type(projection["version"]) is not int:
+        raise RuntimeError("typed original startup projection required")
+    run = state.get("run") or {}
+    reference = run.get("details_reference")
+    keys = {"kind", "version", "service_incarnation", "run_id", "operation_id", "host_incarnation",
+            "field", "sha256", "bytes"}
+    if (not isinstance(reference, dict) or set(reference) != keys
+        or reference["kind"] != "am1-status-field-reference" or type(reference["version"]) is not int
+        or reference["version"] != 1 or reference["field"] != "run"
+        or type(reference["bytes"]) is not int or not 0 < reference["bytes"] <= 8 * 1024**2
+        or type(reference["sha256"]) is not str or len(reference["sha256"]) != 64
+        or any(c not in "0123456789abcdef" for c in reference["sha256"])
+        or any(key not in run for key in ("run_id", "operation_id", "backend_incarnation", "startup_deadline"))
+        or reference["service_incarnation"] != state.get("service_incarnation")
+        or reference["run_id"] != run.get("run_id") or reference["operation_id"] != run.get("operation_id")
+        or reference["host_incarnation"] != run.get("backend_incarnation")):
+        raise RuntimeError("original startup run detail reference unavailable or changed")
+    for key in ("service_incarnation", "run_id", "operation_id", "host_incarnation"):
+        value = reference[key]
+        if value is None and key == "host_incarnation":
+            continue
+        if type(value) is not str or str(UUID(value)) != value:
+            raise RuntimeError("canonical original startup run detail identity required")
+    return reference
+
+
+async def _startup_run_detail(client, state, remaining):
+    """Read one immutable startup run using the existing bounded detail contract."""
+    reference = _startup_run_reference(state)
+    if reference is None:
+        return state.get("run") or {}
+    raw = bytearray()
+    while len(raw) < reference["bytes"]:
+        query = urlencode({"reference": json.dumps(reference, separators=(",", ":")),
+                           "offset": len(raw), "limit": 8192})
+        budget = remaining()
+        reply = await asyncio.wait_for(client.get("state?" + query), budget)
+        remaining()
+        keys = {"accepted", "status", "reference", "offset", "length", "total_bytes", "encoding", "data"}
+        if (not isinstance(reply, dict) or set(reply) != keys or reply["accepted"] is not True
+            or reply["status"] != "detail" or reply["reference"] != reference
+            or json.dumps(reply["reference"], sort_keys=True) != json.dumps(reference, sort_keys=True)
+            or type(reply["offset"]) is not int or reply["offset"] != len(raw)
+            or type(reply["total_bytes"]) is not int or reply["total_bytes"] != reference["bytes"]
+            or type(reply["length"]) is not int or reply["encoding"] != "base64"
+            or type(reply["data"]) is not str or len(reply["data"]) > 4 * ((8192 + 2) // 3)):
+            raise RuntimeError("original startup run detail chunk unqualified")
+        block = base64.b64decode(reply["data"], validate=True)
+        if not 0 < len(block) <= 8192 or len(block) != reply["length"] or len(raw) + len(block) > reference["bytes"]:
+            raise RuntimeError("original startup run detail chunk length changed")
+        raw.extend(block)
+    if hashlib.sha256(raw).hexdigest() != reference["sha256"]:
+        raise RuntimeError("original startup run detail hash changed")
+    run = json.loads(raw)
+    if (not isinstance(run, dict)
+        or json.dumps(run, sort_keys=True, separators=(",", ":"), allow_nan=False).encode() != raw
+        or any(type(run.get(key)) is not type(state["run"].get(key))
+               or run.get(key) != state["run"].get(key)
+               for key in ("run_id", "operation_id", "recipe", "backend_incarnation", "startup_deadline"))):
+        raise RuntimeError("original startup run detail identity or clocks changed")
+    return run
 
 
 class SessionClient:
@@ -1736,6 +1807,8 @@ async def run(args):
                 )
             return detail
 
+        # HTTP Start and every detail/attachment phase consume one original budget.
+        admission_until = time.monotonic() + 180
         try:
             start_receipt = await client.post("start", start_body)
         except (OSError, TimeoutError, aiohttp.ClientError, HTTPOutcomeError) as original:
@@ -1781,6 +1854,8 @@ async def run(args):
         def startup_times(state):
             run = state.get("run") or {}
             values = tuple(run.get(key) for key in ("accepted_at", "startup_deadline"))
+            if "accepted_at" not in run and startup_anchor is not None and _startup_run_reference(state):
+                values = (startup_anchor[0], run.get("startup_deadline"))
             if (
                 all(type(value) in (int, float) and math.isfinite(value) for value in values)
                 and values[0] < values[1] <= values[0] + 180
@@ -1807,6 +1882,7 @@ async def run(args):
             nonlocal startup_anchor
             if renewal.done():
                 renewal.result()
+                raise RuntimeError("original controller renewal ended")
             state = client.snapshot or {}
             run = state.get("run") or {}
             if reattached:
@@ -1820,7 +1896,7 @@ async def run(args):
 
         # One current transport loss may reattach to the already accepted Start.
         # All attachment work consumes this original admission ceiling.
-        admission_until, reattached = time.monotonic() + 180, False
+        reattached = False
 
         def admission_remaining():
             remaining = admission_until - time.monotonic()
@@ -1857,41 +1933,86 @@ async def run(args):
                     )
                 )
 
-        while True:
-            try:
-                await client.wait(native_admitted, admission_remaining())
-                admission_remaining()
-                break
-            except ConnectionError:
-                close = getattr(client, "transport_close", None) or {}
-                if (
-                    reattached
-                    or close.get("expected") is not False
-                    or close.get("reason") != "stream-ended"
-                    or close.get("close_code") != 1006
-                    or close.get("reader_error") is not None
-                ):
-                    raise
-                if renewal.done():
-                    renewal.result()
-                remaining = admission_remaining()
-                if ((client.snapshot or {}).get("run") or {}).get("native_live_at") is not None:
-                    raise RuntimeError("native admission already reached Live before transport loss") from None
-                check_admission_attachment()
-                record(
-                    {
-                        "event": "native_admission_transport_closed",
-                        "transport_close": close,
-                        "remaining_s": remaining,
-                    }
-                )
-                reattached = True
-                async with asyncio.timeout(admission_remaining()):
-                    await client.detach()
-                    await client.attach()
-                remaining = admission_remaining()
-                check_admission_attachment()
-                record({"event": "native_admission_reattached", "remaining_s": remaining})
+        async def authenticated_startup_times():
+            budget = admission_remaining()
+            state = (await asyncio.wait_for(client.get("state"), budget))["snapshot"]
+            admission_remaining()
+            if not admission_identity(state):
+                raise RuntimeError("original native admission ownership changed or unavailable")
+            native_admission_terminal(state)
+            run = await _startup_run_detail(client, state, admission_remaining)
+            values = startup_times({"run": run})
+            if values is None:
+                raise RuntimeError("original native admission startup timestamps unavailable")
+            client.snapshot = state
+            return values
+
+        # Freeze the actual clocks before any replacement; a public projection
+        # never becomes authority merely by borrowing a missing cached field.
+        if (client.snapshot or {}).get("status_projection") == {"kind": "am1-essential-status", "version": 1}:
+            startup_anchor = await authenticated_startup_times()
+        admission_first_error = None
+        try:
+            while True:
+                try:
+                    await client.wait(native_admitted, admission_remaining())
+                    admission_remaining()
+                    if _startup_run_reference(client.snapshot or {}):
+                        if await authenticated_startup_times() != startup_anchor:
+                            raise RuntimeError("original native admission startup timestamps changed")
+                        if not native_admitted():
+                            continue
+                    break
+                except ConnectionError as original:
+                    from aiohttp import ServerTimeoutError
+
+                    close = getattr(client, "transport_close", None) or {}
+                    ws = getattr(client, "ws", None)
+                    stream_error = ws.exception() if ws is not None and hasattr(ws, "exception") else None
+                    no_pong = (
+                        type(stream_error) is ServerTimeoutError
+                        and str(stream_error) == f"No PONG received after {ws._pong_heartbeat} seconds"
+                        and close.get("reason") == "message-error"
+                    )
+                    if (
+                        reattached
+                        or close.get("expected") is not False
+                        or close.get("reason") != "stream-ended" and not no_pong
+                        or close.get("close_code") != 1006
+                        or close.get("reader_error") is not None
+                    ):
+                        raise
+                    if no_pong:
+                        admission_first_error = original
+                    if renewal.done():
+                        renewal.result()
+                        raise RuntimeError("original controller renewal ended") from None
+                    remaining = admission_remaining()
+                    if ((client.snapshot or {}).get("run") or {}).get("native_live_at") is not None:
+                        raise RuntimeError("native admission already reached Live before transport loss") from None
+                    check_admission_attachment()
+                    record(
+                        {
+                            "event": "native_admission_transport_closed",
+                            "transport_close": close,
+                            "remaining_s": remaining,
+                        }
+                    )
+                    reattached = True
+                    async with asyncio.timeout(admission_remaining()):
+                        await client.detach()
+                        await client.attach()
+                    remaining = admission_remaining()
+                    check_admission_attachment()
+                    if _startup_run_reference(client.snapshot or {}):
+                        if await authenticated_startup_times() != startup_anchor:
+                            raise RuntimeError("original native admission startup timestamps changed") from None
+                        check_admission_attachment()
+                    record({"event": "native_admission_reattached", "remaining_s": remaining})
+        except (Exception, asyncio.CancelledError) as qualification_error:
+            if admission_first_error is not None and qualification_error is not admission_first_error:
+                raise admission_first_error from qualification_error
+            raise
         workspace = validate_workspace(_live(client.snapshot)["workspace"])
         run_id, deadline = client.snapshot["run"]["run_id"], client.snapshot["run"]["deadline"]
         summary.update(run_id=run_id, original_native_deadline=deadline, workspace=workspace)

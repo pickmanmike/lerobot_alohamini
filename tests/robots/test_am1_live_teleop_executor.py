@@ -926,3 +926,281 @@ def test_runtime_expiry_reporting_requires_explicit_trusted_core_opt_in(mode):
     else:
         assert e.apply(**options) is False
     assert e._live_target is None and e._teleop_source is None and e._live_last_seq == -1
+
+
+@pytest.mark.parametrize("status", ["paused", "running", "resuming"])
+def test_thermal_history_native_core_uses_original_local_episode_even_from_hold(tmp_path, status):
+    a, e, ids = authority_lane(tmp_path)
+    now = [10.]
+    a.clock = e.clock = lambda: now[0]
+    a.run.update(status=status, recovery_episodes=0, resume_ceiling=18.)
+    e._execution = {"progress_s": 1., "complete": False, "fault": None}
+    live = e.sample["ack"]["live_input"]
+    live["reference"] = live["workspace"]["reference"]
+    a._teleop_view = {"run_id": e.run_id, "qualified_until": 20.}
+    e.sample["ack"]["thermal_history"] = {
+        "version": 1, "raw_sample_at_monotonic_s": 9.98, "peaks_ready": False,
+        "deficit_started_at_monotonic_s": 9.8, "deficit_ceiling_monotonic_s": 19.8,
+        "hold_sample_at_monotonic_s": 9.97,
+        "zero_read_started_at_monotonic_s": 9.97, "zero_read_completed_at_monotonic_s": 9.98,
+    }
+    e._live_target = {"old": "must be discarded"}
+    try:
+        evidence = e.evidence()
+        assert evidence["feedback"] is False
+        assert evidence["thermal_history"]["raw_sample_at_monotonic_s"] == 9.98
+        a.tick()
+        assert a.run["status"] == "recovering"
+        assert a.run["recovery"] == {"started": 9.8, "ceiling": 19.8, "revision": 0}
+        assert a.run["recovery_episodes"] == 1
+        assert e._live_target is None and e.desired == "hold"
+        original = dict(a.run["recovery"])
+        now[0] = 10.1
+        e.sample["at"] = now[0]
+        e.sample["ack"]["thermal_history"]["raw_sample_at_monotonic_s"] = now[0]
+        a.tick()
+        assert a.run["recovery"] == original and a.run["recovery_episodes"] == 1
+        assert a.run["deadline"] == 309.
+    finally:
+        a.run = None
+        a.close()
+
+
+def test_thermal_history_native_raw_cache_cannot_borrow_the_generic_one_second_budget():
+    e, _ids = admitted_executor()
+    e.sample["ack"]["thermal_history"] = {
+        "version": 1, "raw_sample_at_monotonic_s": 9.499, "peaks_ready": True,
+        "deficit_started_at_monotonic_s": None, "deficit_ceiling_monotonic_s": None,
+        "hold_sample_at_monotonic_s": None,
+        "zero_read_started_at_monotonic_s": None, "zero_read_completed_at_monotonic_s": None,
+    }
+    assert e.clock() - e.sample["at"] == 0.
+    assert e.evidence()["feedback"] is False
+    assert not e.dispatch(RECIPES["physical-live-teleop"])
+
+
+@pytest.mark.parametrize("field,value", [
+    ("raw_sample_at_monotonic_s", 10.1), ("raw_sample_at_monotonic_s", float("nan")),
+    ("peaks_ready", 1), ("zero_read_completed_at_monotonic_s", 10.02),
+    ("hold_sample_at_monotonic_s", 9.499),
+])
+def test_thermal_history_native_malformed_or_long_zero_proof_never_qualifies(field, value):
+    e, _ids = admitted_executor()
+    proof = {
+        "version": 1, "raw_sample_at_monotonic_s": 9.99, "peaks_ready": True,
+        "deficit_started_at_monotonic_s": 9.8, "deficit_ceiling_monotonic_s": 19.8,
+        "hold_sample_at_monotonic_s": 9.97,
+        "zero_read_started_at_monotonic_s": 9.97, "zero_read_completed_at_monotonic_s": 9.98,
+    }
+    proof[field] = value
+    e.sample["ack"]["thermal_history"] = proof
+    assert e.evidence()["feedback"] is False
+
+
+
+def test_thermal_history_proof_cannot_disappear_after_the_native_owner_enabled_it():
+    e, _ids = admitted_executor()
+    e.sample["ack"]["thermal_history"] = {
+        "version": 1, "raw_sample_at_monotonic_s": 9.99, "peaks_ready": True,
+        "deficit_started_at_monotonic_s": None, "deficit_ceiling_monotonic_s": None,
+        "hold_sample_at_monotonic_s": None,
+        "zero_read_started_at_monotonic_s": None, "zero_read_completed_at_monotonic_s": None,
+    }
+    assert e.evidence()["feedback"]
+    del e.sample["ack"]["thermal_history"]
+    assert not e.evidence()["feedback"] and e.evidence()["fault"]
+
+
+
+@pytest.mark.parametrize("case", ["late_core", "revision", "native_deadline", "three_episodes", "unqualified_new_anchor", "uncertain"])
+def test_thermal_history_core_budget_cannot_restart_and_distinct_episodes_remain_bounded(tmp_path, case):
+    a, e, ids = authority_lane(tmp_path)
+    now = [10.]
+    a.clock = e.clock = lambda: now[0]
+    a.run.update(status="paused", recovery_episodes=0, resume_ceiling=18.)
+    e._execution = {"progress_s": 1., "complete": False, "fault": None}
+    live = e.sample["ack"]["live_input"]
+    live["reference"] = live["workspace"]["reference"]
+    a._teleop_view = {"run_id": e.run_id, "qualified_until": 400.}
+    def proof(started, *, ready=False):
+        e.sample["at"] = now[0]
+        a.controller["expires"] = now[0] + 2
+        e.sample["ack"]["thermal_history"] = {
+            "version": 1, "raw_sample_at_monotonic_s": now[0] - .01, "peaks_ready": ready,
+            "deficit_started_at_monotonic_s": started,
+            "deficit_ceiling_monotonic_s": min(started + 10, a.run["deadline"]) if started is not None else None,
+            "hold_sample_at_monotonic_s": now[0] - .02,
+            "zero_read_started_at_monotonic_s": now[0] - .02,
+            "zero_read_completed_at_monotonic_s": now[0] - .01,
+        }
+    try:
+        if case == "late_core":
+            now[0] = 20.
+            proof(9.8)
+            a.tick()
+            assert a.run["requested_terminal"] == "faulted"
+            assert a.run["first_cause"] == "recovery_timeout"
+        elif case == "uncertain":
+            proof(9.8)
+            a.run["uncertain"] = True
+            a.tick()
+            assert a.run["requested_terminal"] == "faulted"
+        elif case == "unqualified_new_anchor":
+            proof(9.8)
+            a.tick()
+            original = dict(a.run["recovery"])
+            now[0] = 10.2
+            proof(10.1)
+            a.tick()
+            assert a.run["requested_terminal"] == "faulted"
+            assert a.run["recovery_episodes"] == 1 and a.run["recovery"] == original
+            assert a.run["first_cause"] == "feedback_loss"
+        elif case == "native_deadline":
+            now[0] = 308.9
+            proof(308.8)
+            a.tick()
+            assert a.run["recovery"] == {"started": 308.8, "ceiling": 309., "revision": 0}
+            assert a.run["deadline"] == 309.
+        elif case == "revision":
+            proof(9.8)
+            a.tick()
+            a.run["intent_revision"] = 1
+            e.set_intent_revision(1)
+            e.sample["ack"]["intent_revision"] = 1
+            now[0] = 10.1
+            proof(9.8)
+            a.tick()
+            assert a.run["recovery"] == {"started": 9.8, "ceiling": 19.8, "revision": 1}
+            assert a.run["recovery_episodes"] == 1
+        else:
+            for index in range(4):
+                now[0] = 10. + index
+                proof(now[0] - .1)
+                a.tick()
+                assert a.run["recovery_episodes"] == index + 1
+                if index == 3:
+                    assert a.run["requested_terminal"] == "faulted"
+                    break
+                assert a.run["status"] == "recovering"
+                # Completed actual active ACK is the only closure permitting a distinct episode.
+                now[0] += .1
+                proof(None, ready=True)
+                e.sample["ack"]["thermal_history"].update(
+                    deficit_started_at_monotonic_s=None, deficit_ceiling_monotonic_s=None,
+                    hold_sample_at_monotonic_s=None, zero_read_started_at_monotonic_s=None,
+                    zero_read_completed_at_monotonic_s=None,
+                )
+                e.desired, e._epoch_mode, e._epoch = "active", "active", 0
+                a.run.update(status="running", recovery=None)
+                a.tick()
+                assert e.evidence()["active_acknowledged"]
+    finally:
+        a.run = None
+        a.close()
+
+
+
+def test_thermal_history_actual_worker_requires_new_qualified_hold_then_actual_active_ack():
+    from tests.robots.test_am1_physical_executor import pending_native_worker
+
+    now, robot, control, e, step, stop = pending_native_worker()
+    frozen = copy.deepcopy(control.live_snapshot())
+    started = now[0]
+    def polled(ready, *, closed=False):
+        measured = robot.get_observation()
+        control.annotate(measured, acquired_at=now[0])
+        proof = {
+            "version": 1, "raw_sample_at_monotonic_s": now[0], "peaks_ready": ready,
+            "deficit_started_at_monotonic_s": None if closed else started,
+            "deficit_ceiling_monotonic_s": None if closed else started + 10,
+            "hold_sample_at_monotonic_s": None if closed else now[0],
+            "zero_read_started_at_monotonic_s": None if closed else now[0],
+            "zero_read_completed_at_monotonic_s": None if closed else now[0],
+        }
+        marker = measured["_am1_local_feedback"]
+        marker["thermal_history"] = proof  # Explicit synthetic metadata; actual owner proof tested separately.
+        return {"sequence": marker["observation_id"], "at": now[0], "positions": robot.get_observation(),
+                "ack": copy.deepcopy(marker), "observation": measured,
+                "body_feedback": dict.fromkeys(("x.vel", "y.vel", "theta.vel", "lift_axis.vel"), 0.),
+                "provenance": "protected-host/measured-feedback"}
+    try:
+        action = step(polled(False))
+        assert action["_am1_local_control"]["mode"] == "pause"
+        assert action["_am1_local_control"]["live_input"] is None
+        assert e._live_target is None and control.state == "paused"
+        assert not e.evidence()["feedback"] and not e.evidence()["active_acknowledged"]
+        for offset in (.1, .2, .3):
+            now[0] = started + offset
+            step(polled(True))
+        evidence = e.evidence()
+        assert evidence["hold_acknowledged"] and evidence["pose_aligned"]
+        assert not evidence["active_acknowledged"]
+        assert e.dispatch(RECIPES["physical-live-teleop"])
+        action = step(polled(True))
+        assert action["_am1_local_control"]["mode"] == "active"
+        assert action["_am1_local_control"]["live_input"] is None
+        now[0] += .01
+        step(polled(True, closed=True))
+        assert e.evidence()["active_acknowledged"]
+        assert control.live_snapshot()["workspace"] == frozen["workspace"]
+        assert control.live_snapshot()["reference"] == frozen["reference"]
+        assert control.live_snapshot()["live_deadline_monotonic_s"] == frozen["live_deadline_monotonic_s"]
+    finally:
+        stop()
+
+
+
+@pytest.mark.parametrize("proof", [None, {}, {"version": True}, {"raw_sample_at_monotonic_s": 10.}])
+def test_thermal_history_present_null_or_partial_proof_is_never_legacy_absence(proof):
+    e, _ids = admitted_executor()
+    e.sample["ack"]["thermal_history"] = proof
+    assert not e.evidence()["feedback"] and e.evidence()["fault"]
+
+
+@pytest.mark.parametrize("case", ["advancing", "true_future", "stale", "episode_expired"])
+def test_thermal_history_core_consumes_original_proof_at_the_current_clock(tmp_path, monkeypatch, case):
+    a, e, ids = authority_lane(tmp_path)
+    now = [19.99 if case == "episode_expired" else 10.]
+    a.clock = e.clock = lambda: now[0]
+    a.run.update(status="paused", recovery_episodes=0, resume_ceiling=30.)
+    a.controller["expires"] = 40.
+    e._execution = {"progress_s": 1., "complete": False, "fault": None}
+    e.sample["ack"]["live_input"]["reference"] = e.sample["ack"]["live_input"]["workspace"]["reference"]
+    a._teleop_view = {"run_id": e.run_id, "qualified_until": 40.}
+    original, called = e.evidence, []
+    def delayed_evidence():
+        if not called:
+            called.append(True)
+            now[0] = 20.02 if case == "episode_expired" else 10.02
+            # Explicit synthetic metadata advances during the real Core evidence call.
+            # Its original values are consumed unchanged, not retimestamped by Core.
+            raw = now[0] + .001 if case == "true_future" else now[0] - (.501 if case == "stale" else .001)
+            started = 10.01
+            e.sample["at"] = now[0]
+            e.sample["ack"]["thermal_history"] = {
+                "version": 1, "raw_sample_at_monotonic_s": raw, "peaks_ready": False,
+                "deficit_started_at_monotonic_s": started, "deficit_ceiling_monotonic_s": started + 10,
+                "hold_sample_at_monotonic_s": None,
+                "zero_read_started_at_monotonic_s": None, "zero_read_completed_at_monotonic_s": None,
+            }
+        return original()
+    monkeypatch.setattr(e, "evidence", delayed_evidence)
+    try:
+        a.tick()
+        assert called
+        proof = e.sample["ack"]["thermal_history"]
+        assert proof["deficit_started_at_monotonic_s"] == 10.01
+        assert proof["deficit_ceiling_monotonic_s"] == 20.009999999999998
+        assert a.run["deadline"] == 309.
+        if case == "advancing":
+            assert a.run["status"] == "recovering"
+            assert a.run["recovery"] == {"started": 10.01, "ceiling": 20.009999999999998, "revision": 0}
+            assert a.run["recovery_episodes"] == 1
+            assert proof["raw_sample_at_monotonic_s"] == 10.019
+        else:
+            assert a.run["requested_terminal"] == "faulted"
+            if case == "episode_expired":
+                assert a.run["first_cause"] == "recovery_timeout"
+    finally:
+        a.run = None
+        a.close()
