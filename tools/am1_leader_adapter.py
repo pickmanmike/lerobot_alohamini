@@ -472,7 +472,13 @@ class SessionClient:
         )
         await self.ws.send_json({"ticket": attached["ticket"]})
         self.reader = asyncio.create_task(self._read())
-        await self.wait(lambda: self.snapshot is not None, 3)
+        try:
+            await self.wait(lambda: self.snapshot is not None, 3)
+        except ConnectionError as error:
+            # Only this first-snapshot phase can qualify a transport-only
+            # replacement. Capture the failed stream BEFORE detach changes it.
+            error.initial_snapshot_transport_close = dict(self.transport_close or {})
+            raise
 
     async def _read(self):
         import aiohttp
@@ -1192,10 +1198,42 @@ class SameRunRecovery:
                 self.record({"event": "ordinary_empty_release_ambiguous" if release_loss else "ordinary_connect_transport_closed", "transport_close": close,
                              "identity": identity, "pause_event": original_event,
                              "remaining_s": remaining(), "outcome": "ambiguous"})
-                budget = remaining()
-                await asyncio.wait_for(self.client.detach(), budget)
-                budget = remaining()
-                await asyncio.wait_for(self.client.attach(), budget)
+                attachment_attempt = 0
+                while True:
+                    if renewal_check:
+                        renewal_check()
+                    budget = remaining()
+                    await asyncio.wait_for(self.client.detach(), budget)
+                    budget = remaining()
+                    attachment_attempt += 1
+                    try:
+                        await asyncio.wait_for(self.client.attach(), budget)
+                    except ConnectionError as interrupted_attach:
+                        failed_close = getattr(interrupted_attach, "initial_snapshot_transport_close", None)
+                        if (not isinstance(failed_close, dict) or failed_close.get("expected") is not False
+                            or failed_close.get("reason") != "stream-ended" or failed_close.get("close_code") != 1006
+                            or failed_close.get("reader_error") is not None):
+                            raise
+                        self.check(state)
+                        if self.client.connection != identity["connection_generation"]:
+                            raise RuntimeError("original connection changed during transport attachment") from interrupted_attach
+                        if renewal_check:
+                            renewal_check()
+                        close_evidence = {key: failed_close[key] for key in
+                                          ("expected", "reason", "close_code", "reader_error")}
+                        for key in ("exception_type", "exception"):
+                            value = failed_close.get(key)
+                            # 32 UTF8 bytes also bound JSON's escaped representation.
+                            close_evidence[key] = (value.encode("utf-8", errors="replace")[:32].decode(
+                                "utf-8", errors="ignore") if type(value) is str else None)
+                        stamp = failed_close.get("observed_at_monotonic_s")
+                        close_evidence["observed_at_monotonic_s"] = (stamp if type(stamp) in (int, float)
+                            and math.isfinite(stamp) else None)
+                        self.record({"event": "ordinary_attachment_interrupted", "phase": "initial_snapshot",
+                                     "transport_close": close_evidence, "attachment_attempt": attachment_attempt,
+                                     "remaining_s": remaining()})
+                        continue  # Fresh ticket/stream only; no control command has been retried.
+                    break
                 budget = remaining()
                 fresh = (await asyncio.wait_for(self.client.get("state"), budget))["snapshot"]
                 self.client.snapshot = fresh

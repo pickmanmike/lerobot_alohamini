@@ -1747,7 +1747,7 @@ def test_original_recovery_ceiling_includes_authenticated_read_time_without_rean
     asyncio.run(asyncio.wait_for(scenario(), 0.3))
 
 
-@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice"])
+@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice"])
 def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(tmp_path, cause):
     import asyncio
     import copy
@@ -1938,6 +1938,15 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                             assert a.events[-1] == own_event
                             refused.append(copy.deepcopy(response))
                             awaiting_fresh[0] = True
+                            # An independent viewer advances real Core progress;
+                            # its production cannot depend on the later owner GET.
+                            pi_clock[0] += .01
+                            progress = {"op": "view_progress", "run_id": e.run_id, "role": "chest",
+                                        "owner_generation": "owner", "capture_generation": "capture",
+                                        "encode_generation": "encode", "decoded_frames": len(resumes) + 1,
+                                        "media_time": float(len(resumes) + 1), "source_sequence": len(resumes),
+                                        "source_fresh": True, "received_at_monotonic_s": pi_clock[0]}
+                            assert real_handle(progress, "gateway-view")["accepted"] is True
                             return response
                         assert fresh_reads and fresh_reads[-1]["qualified"] is True
                     return await original_call(command, device)
@@ -1949,16 +1958,8 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                         view = m._live(snapshot)["required_view"]
                         fresh_reads.append(copy.deepcopy(view))
                         assert snapshot["events"][-1] == own_event and snapshot["run"]["status"] == "paused"
-                        if view["qualified"] is True:
-                            awaiting_fresh[0] = False
-                        else:
-                            pi_clock[0] += .01
-                            progress = {"op": "view_progress", "run_id": e.run_id, "role": "chest",
-                                            "owner_generation": "owner", "capture_generation": "capture",
-                                            "encode_generation": "encode", "decoded_frames": len(resumes) + 1,
-                                            "media_time": float(len(resumes) + 1), "source_sequence": len(resumes),
-                                            "source_fresh": True, "received_at_monotonic_s": pi_clock[0]}
-                            assert real_handle(progress, "gateway-view")["accepted"] is True
+                        assert view["qualified"] is True  # Fresh HTTP proof, never a cached flag assignment.
+                        awaiting_fresh[0] = False
                     return response
 
                 gateway.call, client.get = refuse_after_pc_view, fresh_view_owner
@@ -2124,12 +2125,24 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                     renewal.cancel()
                     await asyncio.gather(renewal, return_exceptions=True)
                 return
-            if cause in {"connect_loss_pre", "connect_loss_post"}:
+            if cause in {"connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post"}:
                 # Synthetic transport failure at the demonstrated initial-connect
                 # boundary. Core, IPC, TLS, gateway and SessionClient are real.
                 a._pause_live_input("input_expired")
                 sent_bindings, lost = [], [False]
-                original_attach, original_call = client.attach, gateway.call
+                original_attach, original_call, original_wait = client.attach, gateway.call, client.wait
+                attaching, attachment_losses = [False], [0]
+                interrupt_attachment = cause.startswith("connect_attach_loss_")
+
+                async def wait_initial_snapshot(predicate, timeout):
+                    if attaching[0] and interrupt_attachment and not attachment_losses[0]:
+                        assert timeout == 3 and client.snapshot is None
+                        attachment_losses[0] += 1
+                        # Exact37 seam: actual authenticated TLS/WSS attachment
+                        # loses its fresh stream before its first snapshot.
+                        client.ws._response.connection.transport.abort()
+                        await client.reader
+                    return await original_wait(predicate, timeout)
 
                 def capture_binding(ws):
                     original_send = ws.send_json
@@ -2140,13 +2153,17 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                     ws.send_json = send
 
                 async def attached():
-                    await original_attach()
+                    attaching[0] = True
+                    try:
+                        await original_attach()
+                    finally:
+                        attaching[0] = False
                     capture_binding(client.ws)
 
                 async def lose_connect(command, device):
                     if command.get("op") == "connect" and not lost[0]:
                         lost[0] = True
-                        if cause == "connect_loss_post":
+                        if cause in {"connect_loss_post", "connect_attach_loss_post"}:
                             await original_call(command, device)
                         # Both before-effect and after-effect cases lose the
                         # pending result. Neither supplies nonadmission proof.
@@ -2155,14 +2172,28 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                     return await original_call(command, device)
 
                 capture_binding(client.ws)
-                client.attach, gateway.call = attached, lose_connect
+                client.attach, client.wait, gateway.call = attached, wait_initial_snapshot, lose_connect
                 assert guard.original["run"]["operation_id"] == a.run["operation_id"]
-                assert not await guard.resume(expected_pause="input_expired")
+                if interrupt_attachment:
+                    renewal = asyncio.create_task(client.renew())
+                    def renewal_healthy():
+                        if renewal.done():
+                            renewal.result()
+                            raise RuntimeError("original HTTP renewal ended")
+                    try:
+                        assert not await guard.resume(expected_pause="input_expired", renewal_check=renewal_healthy)
+                    finally:
+                        renewal.cancel()
+                        await asyncio.gather(renewal, return_exceptions=True)
+                    assert attachment_losses == [1]
+                    assert any(row["event"] == "ordinary_attachment_interrupted" for row in records)
+                else:
+                    assert not await guard.resume(expected_pause="input_expired")
                 assert len(sent_bindings) == 2
                 assert sent_bindings[0]["id"] != sent_bindings[1]["id"]
                 assert [op for op, _ in commands].count("claim") == 0
                 assert sum(op == "connect" for op, _ in commands) == initial_connects + (
-                    2 if cause == "connect_loss_post" else 1
+                    2 if cause in {"connect_loss_post", "connect_attach_loss_post"} else 1
                 )
                 assert a.run["deadline"] == 309.0 and a.run["native_live_at"] == 9.0
                 assert a.run["first_cause"] is None and a.run["recovery_episodes"] == 0
@@ -2711,7 +2742,7 @@ def test_opaque_mailbox_rejoin_still_waits_for_actual_current_held_proof(missing
     "reader_error", "second_loss", "renewal", "renewal_after_attach", "release_loss", "resume_loss",
     "manual_event", "changed_event_time", "nonordinary", "connection",
 ])
-def test_pending_connect_replacement_preserves_identity_proof_budget_and_original_error(monkeypatch, change, inspect=None):
+def test_pending_connect_replacement_preserves_identity_proof_budget_and_original_error(monkeypatch, change, inspect=None, attachment=None):
     import asyncio
     import copy
     import time
@@ -2760,6 +2791,8 @@ def test_pending_connect_replacement_preserves_identity_proof_budget_and_origina
     if change == "nonordinary": paused["events"][-1]["kind"] = "pause"
     if change == "native_expired": paused["run"]["remaining_s"] = 0.01
     if change == "http_delay": paused["run"]["remaining_s"] = 0.5
+    if change == "attachment_native_budget":
+        paused["run"]["remaining_s"] = 1.4
     original = ConnectionError("original pending WSS result lost")
     calls, records = [], []
 
@@ -2770,12 +2803,15 @@ def test_pending_connect_replacement_preserves_identity_proof_budget_and_origina
         transport_close = {"expected": False, "reason": "stream-ended", "close_code": 1006, "reader_error": None}
         attaches = reads = connects = 0
         lost = False
+        attachment_errors = []
 
         async def get(self, path):
             assert path == "state"
             self.reads += 1
             clock[0] += 0.7 if change == "http_delay" and self.reads == 1 else 0.01
             self.snapshot = copy.deepcopy(paused if self.reads % 2 else fresh)
+            if attachment == "later" and self.reads == 2:
+                raise ConnectionError("later authenticated proof read interrupted")
             if change == "connection" and self.reads == 2:
                 self.connection = "foreign-connection"
             return {"snapshot": self.snapshot}
@@ -2787,7 +2823,28 @@ def test_pending_connect_replacement_preserves_identity_proof_budget_and_origina
         async def attach(self):
             assert self.snapshot is None  # Old cached state cannot satisfy attachment.
             self.attaches += 1
-            clock[0] += 2.01 if change == "wall_expired" else 0.01
+            clock[0] += (.6 if attachment == "repeat" else 2.01 if change == "wall_expired" else 0.01)
+            if attachment and attachment != "later" and (self.attaches == 1 or attachment == "repeat"):
+                close = {"expected": False, "reason": "stream-ended", "close_code": 1006,
+                         "reader_error": None, "observed_at_monotonic_s": clock[0]}
+                if attachment == "policy":
+                    close["close_code"] = 1008
+                if attachment == "reader":
+                    close["reader_error"] = {"message": "owner reporting unavailable"}
+                if attachment == "expected":
+                    close["expected"] = True
+                if attachment == "reason":
+                    close["reason"] = "message-error"
+                if attachment in {"oversized", "unicode"}:
+                    close.update(exception=("\U0001f600" if attachment == "unicode" else "x") * 20000,
+                                 exception_type=("\U0001f600" if attachment == "unicode" else "y") * 20000,
+                                 observed_at_monotonic_s=float("nan"), unrelated_private="never record")
+                error = (TimeoutError if attachment == "timeout" else ConnectionError)("initial snapshot interrupted")
+                if attachment not in {"untagged", "http"}:
+                    error.initial_snapshot_transport_close = copy.deepcopy(close)
+                self.transport_close = close
+                self.attachment_errors.append(error)
+                raise error
             self.snapshot = copy.deepcopy(fresh)
 
         async def command(self, payload):
@@ -2823,7 +2880,11 @@ def test_pending_connect_replacement_preserves_identity_proof_budget_and_origina
 
     async def scenario():
         client = Client()
-        guard = m.SameRunRecovery(client, records.append)
+        def record(value):
+            records.append(value)
+            if attachment == "record" and value["event"] == "ordinary_attachment_interrupted":
+                raise ValueError("interrupted attachment record unavailable")
+        guard = m.SameRunRecovery(client, record)
         def renewal_healthy():
             if change == "renewal" and client.lost or change == "renewal_after_attach" and client.attaches:
                 raise RuntimeError("original HTTP renewal failed")
@@ -2835,7 +2896,7 @@ def test_pending_connect_replacement_preserves_identity_proof_budget_and_origina
         if change in {None, "two_losses"}:
             assert not await guard.resume(wall_deadline=1002.0, expected_pause="input_expired",
                                           renewal_check=renewal_healthy)
-            assert client.attaches == 1 and client.connects == 2
+            assert client.attaches == (2 if attachment else 1) and client.connects == 2
             assert guard.pause_recoveries == 1 and guard.episodes == 0 and guard.connect_rebindings == 1
             if change == "two_losses":
                 # A completed replacement does not spend a run-wide quota.
@@ -3561,3 +3622,68 @@ def test_failed_connect_qualification_projection_is_bounded_and_json_safe():
             return [item for child in value for item in strings(child)]
         return [value] if isinstance(value, str) else []
     assert max(map(len, strings(detail))) <= 128
+
+
+@pytest.mark.parametrize("change", [None, "run", "view", "old_ack", "revision", "manual_event", "renewal_after_attach"])
+def test_initial_snapshot_transport_retry_still_requires_unchanged_current_proof(monkeypatch, change):
+    def inspect(records, calls, original, client):
+        attempts = [row for row in records if row["event"] == "ordinary_attachment_interrupted"]
+        if change == "renewal_after_attach":
+            assert attempts == [] and client.attaches == 1
+        else:
+            assert len(attempts) == 1 and attempts[0]["phase"] == "initial_snapshot"
+            assert attempts[0]["remaining_s"] < 2 and client.attaches == 2
+        assert client.connects == (2 if change is None else 1)
+        if change is None:
+            assert [call["op"] for call in calls] == ["connect", "connect", "release_input", "resume"]
+        else:
+            assert original.__cause__ is not None
+            assert not any(call["op"] == "resume" for call in calls)
+    test_pending_connect_replacement_preserves_identity_proof_budget_and_original_error(
+        monkeypatch, change, inspect, attachment="retry")
+
+
+@pytest.mark.parametrize("failure", ["policy", "reader", "reason", "expected", "untagged", "http", "timeout", "later"])
+def test_initial_snapshot_retry_rejects_all_other_attachment_or_later_failures(monkeypatch, failure):
+    def inspect(records, calls, original, client):
+        assert client.attaches == 1 and client.connects == 1
+        assert not any(row["event"] == "ordinary_attachment_interrupted" for row in records)
+        if failure != "later":
+            assert original.__cause__ is client.attachment_errors[0]
+        assert [call["op"] for call in calls] == ["connect"]
+    test_pending_connect_replacement_preserves_identity_proof_budget_and_original_error(
+        monkeypatch, "attachment_error", inspect, attachment=failure)
+
+
+@pytest.mark.parametrize("budget", ["caller", "native"])
+def test_repeated_initial_snapshot_losses_spend_one_original_ceiling(monkeypatch, budget):
+    def inspect(records, calls, original, client):
+        attempts = [row for row in records if row["event"] == "ordinary_attachment_interrupted"]
+        assert len(attempts) >= 2 and client.attaches == len(attempts) + 1
+        assert all(later["remaining_s"] < earlier["remaining_s"] for earlier, later in zip(attempts, attempts[1:], strict=False))
+        assert isinstance(original.__cause__, TimeoutError)
+        assert str(original.__cause__) == "original rejoin ceiling exhausted"
+        assert [call["op"] for call in calls] == ["connect"] and client.connects == 1
+    test_pending_connect_replacement_preserves_identity_proof_budget_and_original_error(
+        monkeypatch, "attachment_native_budget" if budget == "native" else "attachment_budget", inspect,
+        attachment="repeat")
+
+
+@pytest.mark.parametrize("stage", ["oversized", "unicode", "record"])
+def test_initial_snapshot_interruption_record_is_bounded_and_keeps_first_error(monkeypatch, stage):
+    import json
+
+    def inspect(records, calls, original, client):
+        row = next(row for row in records if row["event"] == "ordinary_attachment_interrupted")
+        assert len(json.dumps(row, allow_nan=False).encode()) < 1024
+        if stage == "record":
+            assert isinstance(original.__cause__, ValueError) and client.attaches == 1
+            assert [call["op"] for call in calls] == ["connect"]
+        else:
+            assert "unrelated_private" not in row["transport_close"]
+            assert 0 < len(row["transport_close"]["exception"].encode("utf-8")) <= 32
+            assert 0 < len(row["transport_close"]["exception_type"].encode("utf-8")) <= 32
+            assert row["transport_close"]["observed_at_monotonic_s"] is None
+            assert client.attaches == 2 and client.connects == 2
+    test_pending_connect_replacement_preserves_identity_proof_budget_and_original_error(
+        monkeypatch, "attachment_record" if stage == "record" else None, inspect, attachment=stage)
