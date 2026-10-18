@@ -1747,7 +1747,7 @@ def test_original_recovery_ceiling_includes_authenticated_read_time_without_rean
     asyncio.run(asyncio.wait_for(scenario(), 0.3))
 
 
-@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_view_reconnect", "grant_view_switch", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "held_qualification_loss", "resume_alignment_refusal", "resume_alignment_refused_twice", "runner_initial_cursor_pending", "resume_reply_timeout_pre", "resume_reply_timeout_post"])
+@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_view_reconnect", "grant_view_switch", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "held_qualification_loss", "resume_alignment_refusal", "resume_alignment_refused_twice", "runner_initial_cursor_pending", "resume_reply_timeout_pre", "resume_reply_timeout_post", "acquisition_input_pause", "receipt_ack_starvation", "ack_never_returns", "ack_close_cancel", "transport_blackout_hb1", "transport_blackout_hb2", "transport_blackout_long", "initial_ack_timely", "initial_ack_missing"])
 def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(tmp_path, monkeypatch, cause):
     import asyncio
     import copy
@@ -1760,7 +1760,7 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
     from tests.robots.am1_session_fixture import OPENSSL
     from tests.robots.test_am1_live_teleop_executor import authority_lane
     from tools.am1_session_ipc import OwnerServer
-    from tools.am1_session_service import Gateway
+    from tools.am1_session_service import Gateway, Peer
 
     m = adapter()
     a, e, ids = authority_lane(tmp_path / "authority")
@@ -1897,8 +1897,59 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                 )
             )
             client = m.SessionClient(gateway.origin, cert, storage)
+            initial_revision_allowed = [cause not in {"initial_ack_timely", "initial_ack_missing"}]
+            if not initial_revision_allowed[0]:
+                original_put = Peer.put
+                def initial_revision_gate(peer, value, snapshot=False):
+                    if value.get("kind") == "snapshot" and not initial_revision_allowed[0]:
+                        value = {k: v for k, v in value.items() if k != "revision"}
+                    return original_put(peer, value, snapshot)
+                monkeypatch.setattr(Peer, "put", initial_revision_gate)
+            if cause in {"transport_blackout_hb1", "resume_pong_pause"}:
+                original_ws_connect = client.http.ws_connect
+                def fixture_heartbeat(*args, **kwargs):
+                    kwargs["heartbeat"] = 1  # Retained baseline; other cases exercise common production heartbeat=2.
+                    return original_ws_connect(*args, **kwargs)
+                monkeypatch.setattr(client.http, "ws_connect", fixture_heartbeat)
             await client.attach()
             client.generation, client.connection = ids["controller_generation"], ids["connection_generation"]
+            if cause in {"initial_ack_timely", "initial_ack_missing"}:
+                # Initialized real TLS client, current snapshots but no revision
+                # yet. Missing protocol evidence cannot count as local ACK credit.
+                envelopes, ack_frames = [], []
+                original_send, original_call = client.ws.send_json, gateway.call
+                async def capture_initial(value, **kwargs):
+                    if "command" in value:
+                        envelopes.append(copy.deepcopy(value))
+                    elif "ack" in value:
+                        ack_frames.append(copy.deepcopy(value))
+                    return await original_send(value, **kwargs)
+                async def verify_initial(command, device):
+                    if command.get("op") == "connect":
+                        assert next(iter(gateway.peers)).ack is True
+                    return await original_call(command, device)
+                client.ws.send_json, gateway.call = capture_initial, verify_initial
+                assert client._ack_ws is client.ws and client._ack_revision is None
+                pending = asyncio.create_task(client.command(dict(op="connect", **client.identities())))
+                await asyncio.sleep(.1)
+                assert not pending.done() and envelopes == ack_frames == []
+                assert client._acked_revision is None
+                if cause == "initial_ack_timely":
+                    initial_revision_allowed[0] = True
+                    connected = await asyncio.wait_for(pending, .5)
+                    assert connected["accepted"] is True and ack_frames
+                    assert [v["command"]["op"] for v in envelopes] == ["connect"]
+                    assert client._acked_revision == client._ack_revision is not None
+                else:
+                    with pytest.raises(TimeoutError) as missing:
+                        await asyncio.wait_for(pending, 2.5)
+                    assert client._ack_error is missing.value and client.transport_error is not None
+                    assert envelopes == ack_frames == [] and client._acked_revision is None
+                assert a.run["deadline"] == 309. and a.run["native_live_at"] == 9.
+                assert not any(op in {"grant", "input", "resume"} for op, _ in commands)
+                print("COMMON59_INITIAL_ACK", json.dumps({"mode": cause, "commands": len(envelopes),
+                    "ack_frames": len(ack_frames), "credited": client._acked_revision is not None}))
+                return
             if cause == "runner_initial_cursor_pending":
                 # Synthetic56: native Live is real Core status, not a current
                 # cursor/held/active qualification. Fake native sensing advances
@@ -1962,6 +2013,15 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                 assert sum(op == "connect" for op, _ in commands) == 1
                 assert a.run["native_live_at"] == 9. and a.run["deadline"] == 309.
                 return
+            if cause == "acquisition_input_pause":
+                # The manually initialized fake-native lane omits this public
+                # field; actual retained59 explicitly carries null, not absence.
+                a.run["native_first_cause"] = None
+                # Restore authority_lane's original running state, then use
+                # the existing Core hold transition for a prior own event.
+                a.run["status"] = "running"
+                a._pause_live_input("input_expired")
+                client.snapshot = (await client.get("state"))["snapshot"]
             guard = m.SameRunRecovery(client, record)
             await guard.resume()
             initial_connects = sum(op == "connect" for op, _ in commands)
@@ -2558,6 +2618,273 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
             assert first[2]["accepted"] is True and producer.sequence == 1
             stale = copy.deepcopy(client.snapshot)
             assert stale["run"]["status"] == "running"
+            if cause in {"receipt_ack_starvation", "ack_never_returns", "ack_close_cancel"}:
+                # Controlled common-path contrast: an input was already accepted
+                # before a legitimate revision/resync ACK stalls its reader.
+                from aiohttp import WSMsgType
+                loop = asyncio.get_running_loop()
+                timeline, envelopes, incoming = [], [], []
+                accepted, release_result = asyncio.Event(), asyncio.Event()
+                ack_entered, release_ack = asyncio.Event(), asyncio.Event()
+                original_call, send_json, receive = gateway.call, client.ws.send_json, client.ws.receive
+                peer = next(iter(gateway.peers))
+                put, send_str = peer.put, peer.ws.send_str
+                protocol = client.ws._response.connection.protocol
+                data_received = protocol._data_received_cb
+                old_revision, input_id = peer.revision, [None]
+                held_once = [False]
+                def stamp(event, **detail):
+                    timeline.append(dict(event=event, pc_monotonic_s=loop.time(), pi_monotonic_s=a.clock(), **detail))
+                async def traced_call(command, device):
+                    result = await original_call(command, device)
+                    if command.get("op") == "input" and not accepted.is_set():
+                        assert result.get("accepted") is True and result.get("effect_admitted") is True
+                        stamp("native_input_accepted", sample_seq=command["source"]["sample_seq"])
+                        accepted.set()
+                        await release_result.wait()
+                    return result
+                async def traced_send(value, **kwargs):
+                    if "command" in value:
+                        envelopes.append(copy.deepcopy(value))
+                        if value["command"].get("op") == "input":
+                            input_id[0] = value["id"]
+                    result = await send_json(value, **kwargs)
+                    if "ack" in value and not held_once[0]:
+                        held_once[0] = True
+                        stamp("ack_written", revision=value["ack"])
+                        ack_entered.set()
+                        await release_ack.wait()
+                        stamp("ack_send_return_released")
+                    return result
+                def traced_put(value, snapshot=False):
+                    if value.get("kind") == "result" and value.get("id") == input_id[0]:
+                        stamp("gateway_result_published", request_id=value["id"])
+                    return put(value, snapshot)
+                async def traced_send_str(value, **kwargs):
+                    parsed = json.loads(value)
+                    if parsed.get("kind") == "result" and parsed.get("id") == input_id[0]:
+                        stamp("gateway_result_send_started", request_id=parsed["id"])
+                        result = await send_str(value, **kwargs)
+                        stamp("gateway_result_send_returned", request_id=parsed["id"])
+                        return result
+                    return await send_str(value, **kwargs)
+                async def traced_receive(*args, **kwargs):
+                    message = await receive(*args, **kwargs)
+                    if message.type == WSMsgType.TEXT:
+                        value = json.loads(message.data)
+                        if value.get("kind") == "result" and value.get("id") == input_id[0]:
+                            stamp("client_result_read", request_id=value["id"], pending=value["id"] in client.pending)
+                    return message
+                def traced_data_received():
+                    incoming.append(loop.time())
+                    data_received()  # Keep aiohttp3.14's actual transport heartbeat reset.
+                gateway.call, client.ws.send_json, client.ws.receive = traced_call, traced_send, traced_receive
+                peer.put, peer.ws.send_str, protocol._data_received_cb = traced_put, traced_send_str, traced_data_received
+                pending = asyncio.create_task(m.send_leader_sample(
+                    client, producer, m.ZERO_BODY, record, phase="individual", progress_s=.04))
+                try:
+                    await asyncio.wait_for(accepted.wait(), .5)
+                    peer.revision, peer.ack = gateway.next_revision(), False
+                    peer.put({"kind": "snapshot", "revision": peer.revision, "snapshot": await gateway.current()}, True)
+                    await asyncio.wait_for(ack_entered.wait(), .5)
+                    while not peer.ack:
+                        await asyncio.sleep(.005)
+                    stamp("server_ack_observed", revision=peer.revision)
+                    assert peer.revision != old_revision
+                    release_result.set()
+                    result = await asyncio.wait_for(asyncio.shield(pending), .5)
+                    stamp("client_input_result_observed")
+                    assert result[2]["accepted"] is True and not release_ack.is_set()
+                    assert client.pending == {} and not client.reader.done() and not client.ws.closed
+                    assert client.transport_error is None and client.transport_close is None
+                    assert a.run["status"] == "running"
+                    assert [v["command"]["op"] for v in envelopes] == ["grant", "input"]
+                    # A pending result is observable, but new control waits for
+                    # this same stream/revision's ACK transmission to finish.
+                    blocked = asyncio.create_task(client.command(dict(op="grant", **client.identities())))
+                    await asyncio.sleep(.1)
+                    assert not blocked.done()
+                    assert [v["command"]["op"] for v in envelopes] == ["grant", "input"]
+                    if cause == "ack_never_returns":
+                        with pytest.raises(TimeoutError) as ack_error:
+                            await asyncio.wait_for(blocked, 2.5)
+                        assert client._ack_error is ack_error.value and client.transport_error is not None
+                        assert client._ack_task.done() and len(incoming) >= 5
+                        assert [v["command"]["op"] for v in envelopes] == ["grant", "input"]
+                        print("COMMON59_ACK_NEVER", json.dumps({"timeline": timeline, "transport_chunks": len(incoming),
+                            "error_type": type(ack_error.value).__name__, "bounded_ack_s": 2, "no_new_control": True}))
+                        return
+                    if cause == "ack_close_cancel":
+                        old_task, old_ws = client._ack_task, client.ws
+                        # The native fake clock is otherwise fixed at10 in this
+                        # receipt contrast; exercise actual original input expiry
+                        # before asking the new stream to qualify paused control.
+                        a.clock = e.clock = lambda: 10.3
+                        a._teleop_view["qualified_until"] = 10.8
+                        a.tick()
+                        assert a.run["status"] == "paused" and a.events[-1]["kind"] == "input_expired"
+                        await client.detach()
+                        with pytest.raises(ConnectionError):
+                            await blocked
+                        assert old_task.done() and client._ack_ws is None and client._acked_revision is None
+                        await client.attach()
+                        assert client.ws is not old_ws
+                        assert not await guard.resume()  # Fresh WSS ACK alone cannot restore Core control.
+                        assert client.snapshot["evidence"]["active_acknowledged"] is True
+                        fresh_grant = await client.command(dict(op="grant", **client.identities()))
+                        assert fresh_grant["accepted"] is True and client._ack_ws is client.ws
+                        print("COMMON59_ACK_CLOSE", json.dumps({"cancelled_and_joined": old_task.done(),
+                            "old_stream_ack_credited": False, "current_stream_qualified": True}))
+                        return
+                    release_ack.set()
+                    fresh_grant = await asyncio.wait_for(blocked, .5)
+                    assert fresh_grant["accepted"] is True
+                    assert fresh_grant["grant_id"] != first[0]["grant_id"]
+                finally:
+                    release_result.set()
+                    release_ack.set()
+                    await asyncio.gather(pending, return_exceptions=True)
+                observed = next(v for v in timeline if v["event"] == "client_result_read")
+                assert observed["pending"] is True
+                order = [v["event"] for v in timeline]
+                assert order.index("native_input_accepted") < order.index("server_ack_observed")
+                assert order.index("gateway_result_send_returned") < order.index("client_input_result_observed")
+                assert order.index("client_input_result_observed") < order.index("ack_send_return_released")
+                assert sum(op == "input" for op, _ in commands) == 2
+                assert a.run["deadline"] == 309. and a.run["native_live_at"] == 9.
+                print("COMMON59_ACK", json.dumps({"timeline": timeline, "transport_chunks": len(incoming),
+                    "outcome": "accepted input receipt observed during ACK send wait; new control barred until current ACK completes"}))
+                return
+            if cause in {"transport_blackout_hb1", "transport_blackout_hb2", "transport_blackout_long"}:
+                # Real loopback transport receive blackout, not merely an app
+                # receive pause:3.14 resets heartbeat from transport chunks.
+                loop, timeline = asyncio.get_running_loop(), []
+                started, pi_now = loop.time(), [10.]
+                a.clock = e.clock = lambda: pi_now[0]
+                original_reference = copy.deepcopy(m._live(client.snapshot)["reference"])
+                old_identity = client.identities()
+                old_frame = copy.deepcopy(first[1])
+                old_grant = first[0]["grant_id"]
+                transport = client.ws._response.connection.transport
+                async def native_ticks():
+                    expired_seen = False
+                    while True:
+                        pi_now[0] = 10. + loop.time() - started
+                        a._teleop_view["qualified_until"] = pi_now[0] + .5
+                        a.tick()
+                        if not expired_seen and a.run["status"] == "paused":
+                            expired_seen = True
+                            timeline.append({"event": "native_paused", "pc_monotonic_s": loop.time(), "pi_monotonic_s": pi_now[0],
+                                "cause": a.events[-1]["kind"], "feedback": e.evidence()["feedback"]})
+                        await asyncio.sleep(.01)
+                ticking = asyncio.create_task(native_ticks())
+                renewal = asyncio.create_task(client.renew())
+                def healthy_renewal():
+                    assert not renewal.done()
+                try:
+                    await asyncio.sleep(.02)
+                    transport.pause_reading()
+                    timeline.append({"event": "receive_blackout_started", "pc_monotonic_s": loop.time(), "pi_monotonic_s": pi_now[0]})
+                    await asyncio.sleep(3.2 if cause == "transport_blackout_long" else 1.6)
+                    if not transport.is_closing():
+                        transport.resume_reading()
+                    timeline.append({"event": "receive_blackout_ended", "pc_monotonic_s": loop.time(), "pi_monotonic_s": pi_now[0]})
+                    assert a.run["status"] == "paused" and a.run["recovery_episodes"] == 0
+                    assert a.run["first_cause"] is None and healthy[0]
+                    paused = next(v for v in timeline if v["event"] == "native_paused")
+                    assert paused["cause"] == "input_expired" and paused["feedback"] is True
+                    assert 10.25 <= paused["pi_monotonic_s"] < 10.35
+                    if cause in {"transport_blackout_hb1", "transport_blackout_long"}:
+                        await asyncio.wait_for(client.reader, .5)
+                        close = copy.deepcopy(client.transport_close)
+                        assert close["close_code"] == 1006 and close["expected"] is False
+                        assert close["exception_type"] == "ServerTimeoutError"
+                        expected_pong = .5 if cause == "transport_blackout_hb1" else 1.0
+                        assert close["exception"] == f"No PONG received after {expected_pong} seconds"
+                        await client.detach()
+                        await client.attach()
+                    else:
+                        await asyncio.sleep(.05)
+                        close = copy.deepcopy(client.transport_close)
+                        assert close is None and not client.ws.closed and not client.reader.done()
+                    timeline.append({"event": "transport_observed", "pc_monotonic_s": loop.time(), "pi_monotonic_s": pi_now[0], "close": close})
+                    assert not await guard.resume(expected_pause="input_expired", renewal_check=healthy_renewal)
+                    assert client.snapshot["evidence"]["active_acknowledged"] is True
+                    with pytest.raises(m.CommandRefusedError) as stale:
+                        await client.command(dict(old_frame, op="input", **old_identity))
+                    assert stale.value.response["accepted"] is False and stale.value.response.get("effect_admitted") is False
+                    with pytest.raises(m.CommandRefusedError) as old_grant_reply:
+                        await client.command(dict(old_frame, op="input", **client.identities()))
+                    assert old_grant_reply.value.response["accepted"] is False
+                    assert old_grant_reply.value.response.get("effect_admitted") is False
+                    assert not e._live_target  # Neither old generation nor expired grant can replay a frame.
+                    producer.native_cursor, producer.reacquire = m._live(client.snapshot)["cursor"], True
+                    fresh = await m.send_leader_sample(client, producer, m.ZERO_BODY, record, phase="individual", progress_s=.04)
+                    assert fresh[2]["accepted"] is True and fresh[0]["grant_id"] != old_grant
+                    assert fresh[1]["source"]["sample_seq"] == 2
+                    assert a.run["deadline"] == 309. and a.run["native_live_at"] == 9.
+                    assert m._live(client.snapshot)["reference"] == original_reference
+                    assert a.run["recovery_episodes"] == guard.completed_episodes == 0
+                    print("COMMON59_BLACKOUT", json.dumps({"cause": cause, "timeline": timeline,
+                        "recovered_new_input": True, "original_deadline": a.run["deadline"], "native_episodes": a.run["recovery_episodes"]}))
+                finally:
+                    if not transport.is_closing():
+                        transport.resume_reading()
+                    ticking.cancel()
+                    renewal.cancel()
+                    await asyncio.gather(ticking, renewal, return_exceptions=True)
+                return
+            if cause == "acquisition_input_pause":
+                # Synthetic59: the granted capture overlaps a real Core ordinary
+                # expiry. Source/authority remain original; no input was sent.
+                pi_now, sent = [10.], []
+                a.clock = e.clock = lambda: pi_now[0]
+                original_call, original_capture = gateway.call, producer.capture
+                loop = asyncio.get_running_loop()
+                before_identity = client.identities()
+
+                async def capture_envelopes(command, device):
+                    if command["op"] in {"grant", "input", "connect", "release_input", "resume", "claim", "start", "stop"}:
+                        sent.append(copy.deepcopy(command))
+                    return await original_call(command, device)
+
+                async def expire_before_capture_returns():
+                    pi_now[0] += .3
+                    a.tick()
+                    assert a.run["status"] == "paused" and a.events[-1]["kind"] == "input_expired"
+                    await client.wait(lambda: client.snapshot["run"]["intent_revision"] ==
+                                      before_identity["intent_revision"] + 1, 1)
+
+                def overlapping_capture(*args, **kwargs):
+                    value = original_capture(*args, **kwargs)
+                    asyncio.run_coroutine_threadsafe(expire_before_capture_returns(), loop).result(1)
+                    return value
+
+                gateway.call, producer.capture = capture_envelopes, overlapping_capture
+                discarded = await m.send_leader_sample(
+                    client, producer, m.ZERO_BODY, record, phase="individual", progress_s=.02)
+                assert discarded is None and producer.sequence == 2
+                assert [v["op"] for v in sent] == ["grant"]
+                dropped = records[-1]
+                assert dropped["event"] == "leader_acquisition_discarded"
+                assert dropped["identity"] == before_identity
+                assert dropped["current_identity"]["intent_revision"] == before_identity["intent_revision"] + 1
+                assert dropped["pause_event"]["kind"] == "input_expired"
+                assert dropped["discarded"] is True and dropped["fresh_acquisition_allowed"] is False
+                assert not await guard.resume(expected_pause="input_expired")
+                assert client.snapshot["evidence"]["active_acknowledged"] is True
+                producer.capture = original_capture
+                producer.native_cursor, producer.reacquire = m._live(client.snapshot)["cursor"], True
+                fresh = await m.send_leader_sample(
+                    client, producer, m.ZERO_BODY, record, phase="individual", progress_s=.02)
+                assert fresh[2]["accepted"] is True and producer.sequence == 3
+                assert fresh[0]["grant_id"] != dropped["grant"]["grant_id"]
+                assert fresh[1]["source"]["sample_seq"] == dropped["frame"]["source"]["sample_seq"] + 1
+                assert [v["op"] for v in sent] == ["grant", "connect", "release_input", "resume", "grant", "input"]
+                assert sent[-1]["grant_id"] != dropped["grant"]["grant_id"]
+                assert a.run["deadline"] == 309. and a.run["native_live_at"] == 9.
+                assert a.run["recovery_episodes"] == 0 and guard.pause_recoveries == 1
+                return
             if cause == "resume_pong_pause":
                 # Synthetic38 transition: real accepted Resume, pending native
                 # active ACK, then installed aiohttp's actual NoPONG callback.
@@ -3129,7 +3456,7 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
             a.run = None
             await owner.close()
 
-    asyncio.run(asyncio.wait_for(scenario(), 5))
+    asyncio.run(asyncio.wait_for(scenario(), 8 if cause == "transport_blackout_long" else 5))
 
 
 @pytest.mark.parametrize("count", [3, 4])
@@ -3486,11 +3813,13 @@ def test_opaque_mailbox_candidate_preserves_exact_nonadmission_and_identity_type
 
 
 @pytest.mark.parametrize("missing", ["hold_acknowledged", "pose_aligned", "native_ack", "cursor_revision", "view"])
-def test_opaque_mailbox_rejoin_still_waits_for_actual_current_held_proof(missing):
+def test_opaque_mailbox_rejoin_still_waits_for_actual_current_held_proof(missing, monkeypatch):
     import asyncio
     import copy
+    from types import SimpleNamespace
 
     m = adapter()
+    monkeypatch.setattr(m, "time", SimpleNamespace(monotonic=lambda: 1000., perf_counter=m.time.perf_counter))
     paused = recovery_state()
     paused["run"].update(status="paused", intent_revision=3)
     paused["events"] = [{"kind": "native_input_expired", "at": 100.01,
@@ -6482,3 +6811,102 @@ def test_resume_reply_timeout_tag_requires_the_actual_inner_response_future(phas
         if phase == "send":
             assert caught.value is original
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("change", ["closed-history", "manual", "deadline", "workspace", "episode", "controller"])
+def test_acquisition_pause_discard_keeps_immutable_authority_and_closed_history(change):
+    import asyncio
+    import copy
+
+    m = adapter()
+    records, calls = [], []
+    before = recovery_state()
+    before["run"]["operation_id"] = str(uuid4())
+    before["run"].update(first_cause="feedback_loss", recovery_episodes=2)
+    before["run"]["live_input"].update(live_admitted_at_monotonic_s=100., live_deadline_monotonic_s=400.)
+    before["events"] = [{"kind": "resumed", "at": 100.005, "run_id": "owned", "service_incarnation": "service"}]
+    after = copy.deepcopy(before)
+    after["run"].update(status="paused", intent_revision=3, remaining_s=299.9)
+    after["events"].append({"kind": "input_expired", "at": 100.08, "run_id": "owned", "service_incarnation": "service"})
+    if change == "manual":
+        after["events"][-1]["kind"] = "pause"
+    elif change == "deadline":
+        after["run"]["deadline"] += 1
+    elif change == "workspace":
+        after["run"]["live_input"]["workspace"]["reference"][KEYS[0]] += 1
+    elif change == "episode":
+        after["run"]["recovery_episodes"] += 1
+    elif change == "controller":
+        after["controller"]["controller_generation"] = "foreign"
+
+    class Client:
+        snapshot = copy.deepcopy(before)
+        generation, connection, device, sequence = "control", "connection", "device", 0
+        identities = m.SessionClient.identities
+
+        async def command(self, command):
+            calls.append(command)
+            assert command["op"] == "grant"
+            return {"grant_id": str(uuid4())}
+
+    client = Client()
+
+    class Input:
+        kind = "virtual-leaders"
+
+        def get_action(self):
+            client.snapshot = copy.deepcopy(after)
+            return {key.removeprefix("arm_"): value for key, value in workspace()["reference"].items()}
+
+    producer = m.FrameProducer(Input())
+    producer.workspace, producer.native_cursor = workspace(), workspace()["reference"]
+    async def scenario():
+        return await m.send_leader_sample(client, producer, m.ZERO_BODY, records.append,
+                                          phase="individual", progress_s=0.)
+    if change == "closed-history":
+        assert asyncio.run(scenario()) is None
+        assert records[-1]["discarded"] is True and records[-1]["fresh_acquisition_allowed"] is False
+        assert client.snapshot["run"]["first_cause"] == "feedback_loss"
+        assert client.snapshot["run"]["recovery_episodes"] == 2
+    else:
+        with pytest.raises(RuntimeError, match="current input identity changed during acquisition"):
+            asyncio.run(scenario())
+        assert not any(row["event"] == "leader_acquisition_discarded" for row in records)
+    assert [value["op"] for value in calls] == ["grant"]
+
+
+
+def test_current_stream_ack_credit_cannot_come_from_a_late_old_stream():
+    import asyncio
+    from types import SimpleNamespace
+
+    m = adapter()
+    async def scenario():
+        old_entered, old_release, new_entered, new_release = (asyncio.Event() for _ in range(4))
+        async def old_send(value):
+            assert value == {"ack": "old-revision"}
+            old_entered.set()
+            await old_release.wait()
+        async def new_send(value):
+            assert value == {"ack": "new-revision"}
+            new_entered.set()
+            await new_release.wait()
+        old_ws, new_ws = (SimpleNamespace(closed=False, send_json=f) for f in (old_send, new_send))
+        client = SimpleNamespace(ws=old_ws, _ack_ws=old_ws, _ack_task=None,
+            _ack_slot=("old-revision", m.time.monotonic() + 2), _ack_revision="old-revision",
+            _acked_revision=None, _ack_error=None, transport_error=None, _ack_changed=asyncio.Event())
+        old_task = asyncio.create_task(m.SessionClient._send_acks(client, old_ws))
+        await old_entered.wait()
+        client.ws = client._ack_ws = new_ws
+        client._ack_revision, client._ack_slot = "new-revision", ("new-revision", m.time.monotonic() + 2)
+        barrier = asyncio.create_task(m.SessionClient._wait_current_ack(client, new_ws, m.time.monotonic() + 2))
+        old_release.set()
+        await old_task
+        await asyncio.sleep(0)
+        assert client._acked_revision is None and not barrier.done()
+        new_task = asyncio.create_task(m.SessionClient._send_acks(client, new_ws))
+        await new_entered.wait()
+        new_release.set()
+        await asyncio.gather(new_task, barrier)
+        assert client._acked_revision == "new-revision" and client._ack_error is None
+    asyncio.run(asyncio.wait_for(scenario(), 1))

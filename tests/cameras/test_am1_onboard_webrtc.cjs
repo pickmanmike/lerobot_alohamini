@@ -251,3 +251,135 @@ test("actual video keeps presented-frame proof across the ordinary primary scree
   largest_frame_gap:result.largest_frame_gap,first_stall:result.first_stall,raf:result.raf,final_stats:result.final_stats}));
  await page.close();
 });
+
+
+// One camera-only discriminating check. A delayed status publication is synthetic;
+// all video uses real browser RTP/decoder/RVFC and unchanged production assets.
+test("actual video separates delayed source publication from explicit stale reoffer",{timeout:45000},async t=>{
+ const {chromium}=require("playwright"),directory=path.resolve(__dirname,"../../tools/am1_camera");
+ const browser=await chromium.launch({headless:true,channel:process.env.AM1_TEST_BROWSER_CHANNEL||"msedge"});
+ t.after(()=>browser.close());const results=[];
+ for(const policy of ["existing-stale-reoffer","retain-peer-test-only"]){
+  const page=await browser.newPage({viewport:{width:1400,height:1000}}),errors=[],offers=[],status=[];
+  page.on("pageerror",error=>errors.push(error.message));let delayNextStatus=false,delayed=false;
+  await page.addInitScript(()=>{
+   globalThis.am1Remote={csrf:"offline"};globalThis.probePeers=[];globalThis.probeSenders=[];
+   globalThis.probeFrames=[];globalThis.probeTicks=[];globalThis.probeSamples=[];
+   const Native=RTCPeerConnection;globalThis.RTCPeerConnection=new Proxy(Native,{construct(Target,args,newTarget){
+    const peer=Reflect.construct(Target,args,newTarget);probePeers.push(peer);return peer;}});
+   const original=HTMLVideoElement.prototype.requestVideoFrameCallback;
+   HTMLVideoElement.prototype.requestVideoFrameCallback=function(callback){return original.call(this,function(now,m){
+    if(probeFrames.length<600)probeFrames.push({at:performance.now(),presented:m.presentedFrames,media:m.mediaTime,
+     presentation:m.presentationTime,expected_display:m.expectedDisplayTime,receive:m.receiveTime??null,
+     rtp:m.rtpTimestamp??null,processing:m.processingDuration??null});
+    return Reflect.apply(callback,this,[now,m]);});};
+   globalThis.probeSnapshot=async()=>{
+    const at=performance.now(),health=AM1CameraHealth().video;
+    const peer=probePeers.filter(p=>!probeSenders.includes(p)).at(-1),id=probePeers.indexOf(peer);
+    let inbound=null;
+    if(peer&&peer.connectionState!=="closed"){
+     const rows=await peer.getStats();rows.forEach(row=>{if(row.type==="inbound-rtp"&&row.kind==="video")
+      inbound={timestamp:row.timestamp,packets:row.packetsReceived??null,bytes:row.bytesReceived??null,
+       received:row.framesReceived??null,decoded:row.framesDecoded??null,rendered:row.framesRendered??null,
+       emitted:row.jitterBufferEmittedCount??null,decode_s:row.totalDecodeTime??null};});
+    }
+    return {at,completed_at:performance.now(),health,peer_id:id,peer_state:peer?.connectionState??null,
+     inbound,last_rvfc:probeFrames.at(-1)??null,source_tick:probeTicks.at(-1)??null,source_ticks:probeTicks.length};
+   };
+  });
+  const roles=["forward","backward","chest","wrist_left","wrist_right"];
+  await page.route("https://am1-publication.invalid/**",async route=>{
+   const request=route.request(),url=new URL(request.url());
+   const reply=(code,mime,body,headers={})=>route.fulfill({status:code,contentType:mime,body,headers});
+   if(url.pathname==="/api/onboard/status"){
+    const sampled=await page.evaluate(()=>({at:performance.now(),tick:probeTicks.at(-1)??performance.now(),sequence:Math.max(1,probeTicks.length)}));
+    const slow=delayNextStatus&&!delayed;if(slow){delayed=true;await new Promise(resolve=>setTimeout(resolve,650));}
+    const delivered=await page.evaluate(()=>performance.now());status.push({sampled_at:sampled.at,delivered_at:delivered,synthetic_delayed:slow});
+    return reply(200,"application/json",JSON.stringify({owner_generation:"offline-owner",
+     cameras:Object.fromEntries(roles.map(role=>[role,{configured:role==="chest",state:role==="chest"?"fresh":"unavailable",
+      age_ms:Math.max(0,sampled.at-sampled.tick),sequence:sampled.sequence,capture_generation:"offline-capture",rotation_degrees:0}])),
+     video:{enabled:true,transport:"webrtc",role:"chest",encode_generation:"offline-encode",capture_generation:"offline-capture",state:"running"}}));
+   }
+   if(url.pathname==="/api/onboard/webrtc/chest"){
+    const at=await page.evaluate(()=>performance.now());
+    const answer=await page.evaluate(async offer=>{
+     if(!globalThis.probeMedia){
+      const canvas=document.createElement("canvas");canvas.width=640;canvas.height=480;
+      const context=canvas.getContext("2d");let frame=0;
+      const timer=setInterval(()=>{if(probeTicks.length<600)probeTicks.push(performance.now());
+       context.fillStyle=frame++%2?"#185388":"#aa5522";context.fillRect(0,0,640,480);context.fillStyle="white";context.fillText(String(frame),40,40);},1000/15);
+      globalThis.probeMedia={stream:canvas.captureStream(15),timer};
+     }
+     const sender=new RTCPeerConnection({iceServers:[]});probeSenders.push(sender);
+     probeMedia.stream.getTracks().forEach(track=>sender.addTrack(track,probeMedia.stream));
+     await sender.setRemoteDescription({type:"offer",sdp:offer});await sender.setLocalDescription(await sender.createAnswer());
+     if(sender.iceGatheringState!=="complete")await new Promise((resolve,reject)=>{
+      const timer=setTimeout(()=>reject(Error("offline answer ICE deadline")),2000);
+      sender.onicegatheringstatechange=()=>{if(sender.iceGatheringState==="complete"){clearTimeout(timer);resolve();}};
+     });return sender.localDescription.sdp;
+    },request.postData());
+    offers.push({at,answered_at:await page.evaluate(()=>performance.now())});
+    return reply(201,"application/sdp",answer,{"X-Camera-Owner-Generation":"offline-owner","X-Camera-Capture-Generation":"offline-capture","X-Camera-Encode-Generation":"offline-encode"});
+   }
+   // No Core/native owner exists in this fixture. Local player health is not an ACK.
+   if(url.pathname==="/api/onboard/progress")return reply(200,"application/json",'{"accepted":false,"reason":"offline loopback has no native owner"}');
+   if(url.pathname.startsWith("/api/"))return reply(503,"text/plain","offline unassigned source");
+   const name=url.pathname==="/"?"index.html":url.pathname.slice(1);
+   if(!["index.html","app.js","webrtc.js","freshness.js","mjpeg.js","style.css"].includes(name))return reply(404,"text/plain","");
+   let body=fs.readFileSync(path.join(directory,name));
+   if(name==="index.html")body=body.toString().replace('<body>','<body data-console="compact">')
+    .replace('data-camera-base="/"','data-camera-base="/api/onboard/" data-onboard="true"');
+   return reply(200,name.endsWith("js")?"text/javascript":name.endsWith("css")?"text/css":"text/html",body);
+  });
+  await page.goto("https://am1-publication.invalid");await page.addStyleTag({path:path.resolve(__dirname,"../../tools/am1_console_ui/style.css")});
+  await page.waitForFunction(()=>typeof AM1CameraHealth==="function");await page.evaluate(()=>AM1CameraSelect("chest"));
+  await page.waitForFunction(()=>AM1CameraHealth().video?.fresh&&AM1CameraHealth().video.decoded_frames>=5,null,{timeout:7000});
+  const before=await page.evaluate(()=>probeSnapshot()),offersBefore=offers.length;delayNextStatus=true;
+  await page.waitForFunction(()=>{const v=AM1CameraHealth().video;return v?.source_fresh===false&&v.decoded_frames>0&&v.decoded_age_ms<500;},null,{timeout:4000,polling:25});
+  const stale=await page.evaluate(()=>probeSnapshot());assert.equal(stale.health.fresh,false);assert.equal(stale.health.source_fresh,false);
+  assert.ok(stale.last_rvfc.at>before.last_rvfc.at,"the synthetic status delay must coexist with genuine new presentation");
+  const action=policy==="existing-stale-reoffer"?await page.evaluate(()=>AM1CameraReconnect("chest")):{accepted:false,reason:"test-only retain connected advancing peer"};
+  const decisionAt=await page.evaluate(()=>performance.now());
+  await page.waitForFunction(()=>AM1CameraHealth().video?.fresh===true,null,{timeout:7000,polling:25});
+  const after=await page.evaluate(()=>probeSnapshot());
+  const snapshots=await page.evaluate(()=>({frames:probeFrames,ticks:probeTicks}));
+  results.push({policy,synthetic_status_delay_ms:650,before,stale,decision_at:decisionAt,action,after,
+   first_observed_local_fresh_after_stale_ms:after.at-stale.at,peer_retained:after.peer_id===before.peer_id,
+   offers_before:offersBefore,offers_total:offers.length,offers,status,frames_during_interval:snapshots.frames.filter(x=>x.at>=before.at&&x.at<=after.at),
+   source_ticks_during_interval:snapshots.ticks.filter(x=>x>=before.at&&x<=after.at),native_qualification:"not present; local health only"});
+  if(policy==="existing-stale-reoffer"){assert.equal(action.accepted,true);assert.ok(offers.length>offersBefore);}
+  assert.deepEqual(errors,[]);await page.evaluate(()=>{clearInterval(probeMedia.timer);probeMedia.stream.getTracks().forEach(track=>track.stop());probePeers.forEach(peer=>peer.close());});await page.close();
+ }
+ t.diagnostic(JSON.stringify({actual_video:true,comparison:results,production_assets_unchanged:true,physical_workload_credit:false}));
+ const retained=results.find(row=>row.policy==="retain-peer-test-only");
+ assert.equal(retained.peer_retained,true,"the production default player must retain a connected presenting peer through status-only staleness");
+ assert.equal(retained.offers_total,retained.offers_before,"status-only staleness must not restart the production default player");
+});
+
+
+for(const mode of ["source-only","presentation-stale","failed","disconnected","closed","no-frame-startup","invalid-age","source-unavailable"])
+ test("default player preserves qualification and bounded transport failure: "+mode,()=>{
+ const code=fs.readFileSync(path.resolve(__dirname,"../../tools/am1_camera/app.js"),"utf8");
+ const start=code.indexOf("function render() {"),end=code.indexOf("async function statusLoop()",start);
+ assert.ok(start>=0&&end>start);const stops=[];let starts=0;
+ const health={fresh:false,source_fresh:mode!=="source-only",decoded_frames:10,decoded_age_ms:30};
+ if(mode==="presentation-stale")health.decoded_age_ms=501;
+ if(mode==="invalid-age")health.decoded_age_ms=NaN;
+ if(mode==="no-frame-startup"){health.decoded_frames=0;health.decoded_age_ms=null;}
+ const context=vm.createContext({primary:{dataset:{}},selected:"chest",usable:()=>mode!=="source-unavailable",statusAvailable:()=>true,
+  stream:{kind:"webrtc",progressed:0,decoded:mode!=="no-frame-startup",deadline:6000},
+  webView:{health:()=>health,pc:{connectionState:["failed","disconnected","closed"].includes(mode)?mode:"connected"}},
+  performance:{now:()=>mode==="no-frame-startup"?7000:1000},paint(){},tiles:new Map(),slots:new Map(),roles:[],
+  connection:{},diagnostics:{},statusUncertain:false,sourceFor:()=>({state:"fresh"}),webPrimary:()=>true,
+  document:{body:{dataset:{}}},timing:{},progress:new Map(),labels:{}});
+ context.stopPrimary=reason=>{stops.push(reason);context.stream=null;};context.startPrimary=()=>{starts++;context.stream={kind:"webrtc"};};
+ vm.runInContext(code.slice(start,end)+";render();",context);
+ assert.equal(health.fresh,false,"transport liveness must never grant local source/view qualification");
+ if(mode==="source-only"){
+  assert.deepEqual(stops,[]);assert.equal(starts,0);assert.equal(context.stream.progressed,1000);
+  assert.equal(health.source_fresh,false);assert.equal(health.decoded_age_ms,30);
+ }else{
+  assert.equal(stops.length,1);assert.equal(stops[0],mode==="source-unavailable"?"source-unavailable":"decoded-video-stall");
+  assert.equal(starts,mode==="source-unavailable"?0:1);
+ }
+});

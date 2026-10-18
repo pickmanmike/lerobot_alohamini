@@ -494,6 +494,9 @@ class SessionClient:
         self.transport_error = None
         self.transport_close = None
         self._detaching = False
+        self._ack_task = self._ack_slot = self._ack_ws = None
+        self._ack_revision = self._acked_revision = self._ack_error = None
+        self._ack_changed = asyncio.Event()
 
     async def get(self, path):
         async with self.http.get(self.origin + "/api/" + path, allow_redirects=False) as response:
@@ -553,10 +556,14 @@ class SessionClient:
         self.ws = await self.http.ws_connect(
             self.origin.replace("https:", "wss:") + "/api/ws",
             ssl=self.tls,
-            heartbeat=1,
+            heartbeat=2,
             max_msg_size=65536,
             compress=0,
         )
+        self._ack_ws = self.ws
+        self._ack_task = self._ack_slot = None
+        self._ack_revision = self._acked_revision = self._ack_error = None
+        self._ack_changed = asyncio.Event()
         await self.ws.send_json({"ticket": attached["ticket"]})
         self.reader = asyncio.create_task(self._read())
         try:
@@ -570,9 +577,12 @@ class SessionClient:
     async def _read(self):
         import aiohttp
 
+        ws = self.ws
         reason, reader_error = "stream-ended", None
         try:
-            async for message in self.ws:
+            async for message in ws:
+                if self.ws is not ws:
+                    break  # A replaced stream cannot publish current proof or receipts.
                 if message.type != aiohttp.WSMsgType.TEXT:
                     reason = "message-" + message.type.name.lower()
                     break
@@ -580,7 +590,12 @@ class SessionClient:
                 if value.get("kind") == "snapshot":
                     self.snapshot = value["snapshot"]
                     if "revision" in value:
-                        await self.ws.send_json({"ack": value["revision"]})
+                        if value["revision"] != self._ack_revision:
+                            self._ack_revision = value["revision"]
+                            self._ack_slot = (value["revision"], time.monotonic() + 2)
+                            self._ack_changed.clear()
+                        if self._ack_slot is not None and (self._ack_task is None or self._ack_task.done()):
+                            self._ack_task = asyncio.create_task(SessionClient._send_acks(self, ws))
                     self.changed.set()
                 elif value.get("kind") == "result":
                     future = self.pending.pop(value["id"], None)
@@ -594,25 +609,92 @@ class SessionClient:
         except Exception as error:
             reason = "reader-error"
             reader_error = {"error_type": type(error).__name__, "message": str(error)}
-            self.transport_error = str(error)
+            if self.ws is ws:
+                self.transport_error = self.transport_error or str(error)
         finally:
-            exception = self.ws.exception()
-            self.transport_close = {
-                "reason": reason,
-                "expected": self._detaching,
-                "close_code": self.ws.close_code,
-                "exception_type": type(exception).__name__ if exception else None,
-                "exception": str(exception) if exception else None,
-                "reader_error": reader_error,
-                "observed_at_monotonic_s": time.monotonic(),
-            }
-            if not self._detaching and self.transport_error is None:
-                self.transport_error = "current WSS connection ended: " + reason
-            for future in self.pending.values():
-                if not future.done():
-                    future.set_exception(ConnectionError("current WSS connection lost"))
-            self.pending.clear()
-            self.changed.set()
+            if self.ws is ws:
+                task = getattr(self, "_ack_task", None)
+                if task is not None and task is not asyncio.current_task():
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                self._ack_slot = None
+                ack_changed = getattr(self, "_ack_changed", None)
+                if ack_changed is not None:
+                    ack_changed.set()
+                exception = ws.exception()
+                self.transport_close = {
+                    "reason": reason,
+                    "expected": self._detaching,
+                    "close_code": ws.close_code,
+                    "exception_type": type(exception).__name__ if exception else None,
+                    "exception": str(exception) if exception else None,
+                    "reader_error": reader_error,
+                    "observed_at_monotonic_s": time.monotonic(),
+                }
+                if not self._detaching and self.transport_error is None:
+                    self.transport_error = "current WSS connection ended: " + reason
+                for future in self.pending.values():
+                    if not future.done():
+                        future.set_exception(ConnectionError("current WSS connection lost"))
+                self.pending.clear()
+                self.changed.set()
+
+    async def _ack_failed(self, ws, error):
+        if self.ws is not ws or self._ack_ws is not ws:
+            return
+        self._ack_error = self._ack_error or error
+        self.transport_error = self.transport_error or "current WSS snapshot acknowledgement failed"
+        self._ack_changed.set()
+        self.changed.set()
+        # Quarantine this authenticated stream immediately; no control is replayed.
+        ws._response.close()
+        task = self._ack_task
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def _send_acks(self, ws):
+        try:
+            while self.ws is ws and self._ack_ws is ws and self._ack_slot is not None:
+                revision, ceiling = self._ack_slot
+                self._ack_slot = None
+                remaining = ceiling - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("current WSS snapshot acknowledgement deadline expired")
+                await asyncio.wait_for(ws.send_json({"ack": revision}), remaining)
+                if self.ws is ws and self._ack_ws is ws and self._ack_revision == revision:
+                    self._acked_revision = revision
+                    self._ack_changed.set()
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            await SessionClient._ack_failed(self, ws, error)
+
+    async def _wait_current_ack(self, ws, ceiling):
+        while True:
+            if self.ws is not ws or getattr(self, "_ack_ws", ws) is not ws:
+                raise ConnectionError("current WSS snapshot acknowledgement stream changed")
+            if getattr(self, "_ack_error", None) is not None:
+                raise self._ack_error
+            if self.transport_error or ws.closed:
+                raise ConnectionError("current WSS snapshot acknowledgement connection ended")
+            revision = getattr(self, "_ack_revision", None)
+            initialized = getattr(self, "_ack_changed", None) is not None
+            if (revision is None and not initialized
+                    or revision is not None and getattr(self, "_acked_revision", None) == revision):
+                return
+            remaining = ceiling - time.monotonic()
+            if remaining <= 0:
+                error = TimeoutError("current WSS snapshot acknowledgement deadline expired")
+                await SessionClient._ack_failed(self, ws, error)
+                raise self._ack_error
+            try:
+                await asyncio.wait_for(self._ack_changed.wait(), remaining)
+            except TimeoutError as error:
+                await SessionClient._ack_failed(self, ws, error)
+                if self._ack_error is error:
+                    raise
+                raise self._ack_error from error
 
     async def command(self, command):
         if (
@@ -628,7 +710,12 @@ class SessionClient:
         future = asyncio.get_running_loop().create_future()
         self.pending[identity] = future
         timing = {"request_started_at_monotonic_s": time.perf_counter()}
+        ack_ceiling, ws = time.monotonic() + 2, self.ws
         try:
+            if command.get("op") not in {"pause", "stop"}:
+                await SessionClient._wait_current_ack(self, ws, ack_ceiling)
+            if self.ws is not ws or self.transport_error or ws.closed:
+                raise ConnectionError("bounded current WSS connection required")
             timing["send_started_at_monotonic_s"] = time.perf_counter()
             await self.ws.send_json({"id": identity, "command": command})
             timing["send_completed_at_monotonic_s"] = time.perf_counter()
@@ -648,6 +735,10 @@ class SessionClient:
             return result
         finally:
             self.pending.pop(identity, None)
+            if not future.done():
+                future.cancel()
+            elif not future.cancelled():
+                future.exception()  # A failed ACK barrier may leave an unread stream-close result.
 
     async def wait(self, predicate, timeout):
         deadline = time.monotonic() + timeout
@@ -1132,8 +1223,20 @@ class SessionClient:
 
     async def detach(self):
         self._detaching = True
+        self._ack_ws = self._ack_slot = None
+        self._ack_revision = self._acked_revision = None
+        if getattr(self, "_ack_changed", None) is not None:
+            self._ack_changed.set()
+        task = getattr(self, "_ack_task", None)
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self._ack_task = None
         if self.ws is not None:
-            await self.ws.close()
+            try:
+                await asyncio.wait_for(self.ws.close(), 2)
+            finally:
+                self.ws._response.close()
         if self.reader is not None:
             with contextlib.suppress(asyncio.CancelledError, ConnectionError, RuntimeError):
                 await self.reader
@@ -2298,7 +2401,68 @@ async def send_leader_sample(client, producer, body, record, *, phase, progress_
         },
     }
     record({"event": "leader_frame_attempt", **attempt})
-    if client.identities() != identity:
+    current_identity = client.identities()
+    if current_identity != identity:
+        original = grant_context["snapshot"] if grant_context is not None else {}
+        current = getattr(client, "snapshot", None) or {}
+        before, after = original.get("run") or {}, current.get("run") or {}
+        old_live, new_live = _live(original), _live(current)
+        previous_event, pause = (
+            next((event for event in reversed(snapshot.get("events", []))
+                  if event.get("run_id") == identity.get("run_id")
+                  and event.get("service_incarnation") == identity.get("service_incarnation")), {})
+            for snapshot in (original, current)
+        )
+        revision = identity.get("intent_revision")
+        remaining = (before.get("remaining_s"), after.get("remaining_s"))
+        clocks = (*remaining, before.get("native_live_at"), before.get("deadline"), pause.get("at"), previous_event.get("at"))
+        run_pins = ("run_id", "operation_id", "backend_incarnation", "native_live_at", "deadline",
+                    "first_cause", "native_first_cause")
+        live_pins = ("reference", "workspace", "live_admitted_at_monotonic_s", "live_deadline_monotonic_s")
+        ordinary_pause = (
+            set(identity) == {"run_id", "service_incarnation", "controller_generation", "connection_generation",
+                              "host_incarnation", "intent_revision"}
+            and set(current_identity) == set(identity)
+            and type(revision) is int and type(current_identity.get("intent_revision")) is int
+            and current_identity["intent_revision"] == revision + 1
+            and all(type(identity[key]) is str and identity[key]
+                    and current_identity[key] == identity[key] for key in identity if key != "intent_revision")
+            and before.get("status") == "running" and after.get("status") == "paused"
+            and before.get("intent_revision") == revision and after.get("intent_revision") == revision + 1
+            and all(key in before and key in after and before[key] == after[key] for key in run_pins)
+            and type(before.get("operation_id")) is str and bool(before["operation_id"])
+            and all(run.get("uncertain", True) is False and run.get("recovery") is None
+                    and run.get("native_first_cause") is None for run in (before, after))
+            and type(before.get("recovery_episodes")) is int and 0 <= before["recovery_episodes"] <= 3
+            and type(after.get("recovery_episodes")) is int
+            and after["recovery_episodes"] == before["recovery_episodes"]
+            and all(snapshot.get("service_incarnation") == identity["service_incarnation"]
+                    and snapshot.get("evidence", {}).get("fault") is None
+                    and (snapshot.get("controller") or {}).get("controller_generation") == identity["controller_generation"]
+                    for snapshot in (original, current))
+            and (original.get("controller") or {}).get("device_id") == getattr(client, "device", None)
+            and (current.get("controller") or {}).get("device_id") == getattr(client, "device", None)
+            and before.get("run_id") == identity["run_id"] and before.get("backend_incarnation") == identity["host_incarnation"]
+            and all(key in old_live and key in new_live and old_live[key] == new_live[key] for key in live_pins)
+            and isinstance(old_live.get("reference"), dict) and isinstance(old_live.get("workspace"), dict)
+            and old_live.get("live_admitted_at_monotonic_s") == before.get("native_live_at")
+            and old_live.get("live_deadline_monotonic_s") == before.get("deadline")
+            and pause.get("kind") in {"input_expired", "native_input_expired", "required_view_expired"}
+            and all(type(value) in (int, float) and math.isfinite(value) for value in clocks)
+            and 0 < remaining[1] <= remaining[0]
+            and before["native_live_at"] < before["deadline"]
+            and previous_event["at"] < pause["at"]
+            and before["deadline"] - remaining[0] <= pause["at"] <= before["deadline"] - remaining[1]
+        )
+        if ordinary_pause:
+            record({"event": "leader_acquisition_discarded", **attempt,
+                    "current_identity": {key: value[:128] if isinstance(value, str) else value
+                                         for key, value in current_identity.items()},
+                    "pause_event": {key: value[:128] if isinstance(value, str) else value
+                                    for key, value in pause.items() if key in {"kind", "at", "run_id", "service_incarnation"}},
+                    "reason": "same-run ordinary pause during acquisition", "discarded": True,
+                    "fresh_acquisition_allowed": False})
+            return None  # Existing outer authority/rejoin checks precede any new grant/capture.
         raise RuntimeError("current input identity changed during acquisition")
     try:
         result = await client.command(

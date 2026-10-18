@@ -252,7 +252,12 @@ function render() {
   if (!allowed) stopPrimary(statusAvailable() ? "source-unavailable" : "status-unavailable");
   else if (stream?.kind === "webrtc") {
     const health=webView?.health();
-    if(health?.fresh){stream.progressed=performance.now();stream.decoded=true;}
+    // Source qualification can expire while the same peer is still presenting.
+    // Preserve that transport; health().fresh remains false until source proof returns.
+    const presenting=Number.isSafeInteger(health?.decoded_frames)&&health.decoded_frames>0&&
+      Number.isFinite(health.decoded_age_ms)&&health.decoded_age_ms>=0&&health.decoded_age_ms<500&&
+      !["failed","disconnected","closed"].includes(webView?.pc?.connectionState);
+    if(presenting){stream.progressed=performance.now();stream.decoded=true;}
     else if(stream.decoded && performance.now()-stream.progressed>500 || performance.now()>stream.deadline && !stream.decoded)
       stopPrimary("decoded-video-stall");
   } else if (stream && performance.now() - stream.progressed > 500) stopPrimary("display-stall");
