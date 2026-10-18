@@ -1747,7 +1747,7 @@ def test_original_recovery_ceiling_includes_authenticated_read_time_without_rean
     asyncio.run(asyncio.wait_for(scenario(), 0.3))
 
 
-@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_view_reconnect", "grant_view_switch", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "resume_alignment_refusal", "resume_alignment_refused_twice"])
+@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_view_reconnect", "grant_view_switch", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "held_qualification_loss", "resume_alignment_refusal", "resume_alignment_refused_twice"])
 def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(tmp_path, cause):
     import asyncio
     import copy
@@ -2247,6 +2247,75 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                 finally:
                     renewal.cancel()
                     await asyncio.gather(renewal, return_exceptions=True)
+                return
+            if cause == "held_qualification_loss":
+                # Synthetic55: known connect + positive empty release, but
+                # the fresh held proof has NOT qualified and no Resume exists.
+                from aiohttp import ClientConnectionResetError
+
+                a._pause_live_input("input_expired")
+                pending, lost, envelopes = [True], [False], []
+                original_evidence, original_wait, original_attach = e.evidence, client.wait, client.attach
+                phase_seen = asyncio.Event()
+                def pending_hold():
+                    value = original_evidence()
+                    value["pose_aligned"] = not pending[0]
+                    return value
+                e.evidence = pending_hold
+                def capture(ws):
+                    send = ws.send_json
+                    async def sent(value, **kwargs):
+                        if "command" in value:
+                            envelopes.append(copy.deepcopy(value))
+                        return await send(value, **kwargs)
+                    ws.send_json = sent
+                async def attached():
+                    await original_attach()
+                    capture(client.ws)
+                async def lost_held_wait(predicate, timeout):
+                    if not lost[0] and timeout != 5:
+                        lost[0] = True
+                        assert [v["command"]["op"] for v in envelopes] == ["connect", "release_input"]
+                        assert predicate() is False
+                        client.ws._exception = ClientConnectionResetError("Cannot write to closing transport")
+                        client.ws._response.connection.transport.abort()
+                        await client.reader
+                    return await original_wait(predicate, timeout)
+                original_record = guard.record
+                def record_phase(value):
+                    original_record(value)
+                    if value["event"] == "held_qualification_transport_closed":
+                        phase_seen.set()
+                async def native_ready():
+                    await phase_seen.wait()
+                    await asyncio.sleep(.04)  # Independent native alignment convergence, never a GET side effect.
+                    pending[0] = False
+                capture(client.ws)
+                client.attach, client.wait, guard.record = attached, lost_held_wait, record_phase
+                renewal, qualification = asyncio.create_task(client.renew()), asyncio.create_task(native_ready())
+                def healthy_renewal():
+                    if renewal.done():
+                        renewal.result()
+                        raise RuntimeError("original renewal ended")
+                try:
+                    assert not await guard.resume(expected_pause="input_expired", renewal_check=healthy_renewal)
+                    await qualification
+                    ops = [v["command"]["op"] for v in envelopes]
+                    assert ops == ["connect", "release_input", "connect", "release_input", "resume"]
+                    assert client.snapshot["evidence"]["active_acknowledged"] is True
+                    phase = [v for v in records if v["event"] == "held_qualification_transport_closed"]
+                    assert len(phase) == 1 and phase[0]["operation_id"] is None
+                    assert phase[0]["outcome"] == "resume_not_requested"
+                    assert phase[0]["sent_flags"]["pose_aligned"] is False
+                    assert not any(v["event"] == "resume_result_unknown" for v in records)
+                    assert a.run["deadline"] == 309. and a.run["native_live_at"] == 9.
+                    producer.native_cursor, producer.reacquire = m._live(client.snapshot)["cursor"], True
+                    fresh = await m.send_leader_sample(client, producer, m.ZERO_BODY, record, phase="individual", progress_s=.02)
+                    assert fresh[2]["accepted"] is True and producer.sequence == 1
+                finally:
+                    qualification.cancel()
+                    renewal.cancel()
+                    await asyncio.gather(qualification, renewal, return_exceptions=True)
                 return
             if cause in {"resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending"}:
                 # Synthetic54: the actual Core/Gateway receives a Resume whose
@@ -6110,6 +6179,7 @@ def test_same_open_native_episode_retains_source_and_original_phase(monkeypatch,
     None, "post", "view_wait", "twice", "wrong_type", "wrong_message", "reader", "expected", "code",
     "manual", "foreign", "fault", "uncertain", "revision", "running", "stale_ack", "phase_expired",
     "phase_extended", "caller_expired", "renewal", "later_error", "reporting", "persistent_view",
+    "held_wait", "held_foreign", "held_wrong_type", "held_phase_expired", "held_renewal", "held_reporting",
 ])
 def test_unknown_resume_result_keeps_authority_original_phase_and_error(monkeypatch, change):
     """Synthetic guards supplement the real Core/Gateway pre/post/native cases."""
@@ -6211,6 +6281,19 @@ def test_unknown_resume_result_keeps_authority_original_phase_and_error(monkeypa
             return {"accepted": True, "status": "running", "effect_admitted": False}
 
         async def wait(self, predicate, timeout):
+            if change is not None and change.startswith("held_") and not failures:
+                assert not any(c["op"] == "resume" for c in commands)
+                self.fresh = held(copy.deepcopy(self.snapshot), self.snapshot["run"]["intent_revision"], 100.375)
+                if change == "held_foreign":
+                    self.fresh["run"]["run_id"] = "foreign"
+                if change == "held_phase_expired":
+                    pc[0] += 8
+                self.transport_close = {"expected": False, "close_code": 1006, "reason": "stream-ended", "reader_error": None,
+                    "exception_type": "RuntimeError" if change == "held_wrong_type" else "ClientConnectionResetError",
+                    "exception": "Cannot write to closing transport"}
+                error = ConnectionError("current WSS connection ended: stream-ended")
+                failures.append(error)
+                raise error
             if change == "post" and timeout == 5:
                 pc[0] += .5  # Distinct active-ACK phase may cross the earlier held deadline.
                 self.snapshot["run"]["remaining_s"] = 1400. - pc[0]
@@ -6229,33 +6312,35 @@ def test_unknown_resume_result_keeps_authority_original_phase_and_error(monkeypa
     async def scenario():
         client = Client()
         def record(value):
-            if value["event"] == "resume_result_unknown":
+            if value["event"] in {"resume_result_unknown", "held_qualification_transport_closed"}:
                 assert len(__import__("json").dumps(value, allow_nan=False).encode()) <= 2048
-                assert value["outcome"] == "unknown"
-                if change == "reporting":
+                assert value["outcome"] == ("resume_not_requested" if change is not None and change.startswith("held_") else "unknown")
+                if change is not None and change.startswith("held_"):
+                    assert value["operation_id"] is None
+                if change in {"reporting", "held_reporting"}:
                     raise ValueError("fault reporting failed")
                 if change == "phase_extended":
                     failures[-1].resume_result_context["phase_ceiling"] += 1
             records.append(value)
         guard = m.SameRunRecovery(client, record)
         def renewal():
-            if failures and change == "renewal":
+            if failures and change in {"renewal", "held_renewal"}:
                 raise RuntimeError("original renewal failed")
-        if change in {None, "post", "view_wait", "twice"}:
+        if change in {None, "post", "view_wait", "twice", "held_wait"}:
             assert not await guard.resume(expected_pause="input_expired", renewal_check=renewal)
             resumes = [c for c in commands if c["op"] == "resume"]
-            assert len(resumes) == (3 if change == "twice" else 2)
+            assert len(resumes) == (1 if change == "held_wait" else 3 if change == "twice" else 2)
             assert len({c["operation_id"] for c in resumes}) == len(resumes)
             assert len({c["connection_generation"] for c in resumes}) == len(resumes)
             assert client.snapshot["evidence"]["active_acknowledged"] is True
-            assert client.attaches == len(resumes) - 1
-            assert len([v for v in records if v["event"] == "resume_result_unknown"]) == len(resumes) - 1
+            assert client.attaches == (1 if change == "held_wait" else len(resumes) - 1)
+            assert len([v for v in records if v["event"] == "resume_result_unknown"]) == (0 if change == "held_wait" else len(resumes) - 1)
         else:
             with pytest.raises(ConnectionError) as caught:
                 await guard.resume(expected_pause="input_expired", renewal_check=renewal,
                                    wall_deadline=1000.125 if change == "caller_expired" else None)
             assert caught.value is failures[0]
-            assert sum(c["op"] == "resume" for c in commands) == 1
+            assert sum(c["op"] == "resume" for c in commands) == (0 if change.startswith("held_") else 1)
             if change != "later_error":
                 assert sum(c["op"] == "connect" for c in commands) == 1
             assert guard.completed_episodes == 0

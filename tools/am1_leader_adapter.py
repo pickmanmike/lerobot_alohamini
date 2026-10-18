@@ -861,9 +861,57 @@ class SessionClient:
             except (Exception, asyncio.CancelledError) as reporting_error:
                 raise first_refusal from reporting_error
 
+        def record_transport_phase(error, context):
+            close = dict(getattr(self, "transport_close", None) or {})
+            held = context.get("phase") == "held_qualification"
+            release = context["release"]
+            if (str(error) == ("current WSS connection ended: stream-ended" if held else "current WSS connection lost")
+                and context["connect_identity"] is not None and isinstance(release, dict)
+                and all(type(release.get(k)) is type(v) and release[k] == v for k, v in
+                        {"accepted": True, "status": "released", "effect_admitted": False}.items())
+                and close.get("expected") is False and close.get("close_code") == 1006
+                and close.get("reason") == "stream-ended" and close.get("reader_error") is None
+                and close.get("exception_type") == "ClientConnectionResetError"
+                and close.get("exception") == "Cannot write to closing transport"):
+                context["transport_close"] = {key: close.get(key) for key in
+                    ("expected", "close_code", "reason", "reader_error", "exception_type", "exception")}
+                error.resume_result_context = context
+                if refusal_record:
+                    try:
+                        proof = context["snapshot"]
+                        detail = {"event": "held_qualification_transport_closed" if held else "resume_result_unknown",
+                                  "outcome": "resume_not_requested" if held else "unknown",
+                                  "operation_id": context["operation_id"], "identity": context["identity"],
+                                  "phase_ceiling_monotonic_s": context["phase_ceiling"], "native_remaining_s": proof["run"].get("remaining_s"),
+                                  "sent_flags": {key: proof.get("evidence", {}).get(key) for key in
+                                      ("feedback", "required_observation", "hold_acknowledged", "pose_aligned", "native_ack", "active_acknowledged")},
+                                  "sent_ack": {key: (proof.get("evidence", {}).get("accepted_host_action") or {}).get(key)
+                                               for key in ("state", "intent_revision", "acquired_at_monotonic_s")},
+                                  "transport_close": context["transport_close"]}
+                        if len(json.dumps(detail, allow_nan=False).encode("utf-8")) > 2048:
+                            raise ValueError("bounded owned qualification context required")
+                        refusal_record(detail)
+                    except (Exception, asyncio.CancelledError) as reporting_error:
+                        del error.resume_result_context
+                        raise error from reporting_error
+
+        waiting_held = None
         try:
             while True:
+                held_identity = self.identities()
+                held_run = self.snapshot["run"]
+                held_remaining = held_run.get("remaining_s")
+                waiting_held = json.loads(json.dumps({
+                    "phase": "held_qualification", "identity": held_identity, "snapshot": self.snapshot,
+                    "operation_id": None, "prior_event": _latest_run_event(self.snapshot, held_identity),
+                    "pi_lower_bound": (held_run["deadline"] - held_remaining
+                                       if all(type(v) in (int, float) and math.isfinite(v)
+                                              for v in (held_remaining, held_run.get("deadline"))) else None),
+                    "phase_ceiling": phase_ceiling, "requested": time.monotonic(),
+                    "connect_identity": connect_identity, "release": released,
+                }, allow_nan=False))
                 await self.wait(qualified, phase_remaining())
+                waiting_held = None
                 if first_refusal is not None:
                     # Only the authenticated owner can prove current held/view
                     # qualification after an explicitly nonadmitted Resume.
@@ -932,34 +980,7 @@ class SessionClient:
                     resumed = await asyncio.wait_for(self.command(command), budget)
                     break
                 except ConnectionError as error:
-                    close = dict(getattr(self, "transport_close", None) or {})
-                    if (str(error) == "current WSS connection lost" and release_context is not None
-                        and isinstance(released, dict) and all(type(released.get(k)) is type(v)
-                            and released[k] == v for k, v in
-                            {"accepted": True, "status": "released", "effect_admitted": False}.items())
-                        and close.get("expected") is False and close.get("close_code") == 1006
-                        and close.get("reason") == "stream-ended" and close.get("reader_error") is None
-                        and close.get("exception_type") == "ClientConnectionResetError"
-                        and close.get("exception") == "Cannot write to closing transport"):
-                        unknown_resume["transport_close"] = {key: close.get(key) for key in
-                            ("expected", "close_code", "reason", "reader_error", "exception_type", "exception")}
-                        error.resume_result_context = unknown_resume
-                        if refusal_record:
-                            try:
-                                detail = {"event": "resume_result_unknown", "outcome": "unknown",
-                                          "operation_id": command["operation_id"], "identity": identity,
-                                          "phase_ceiling_monotonic_s": phase_ceiling, "native_remaining_s": remaining,
-                                          "sent_flags": {key: sent_state.get("evidence", {}).get(key) for key in
-                                              ("feedback", "required_observation", "hold_acknowledged", "pose_aligned", "native_ack", "active_acknowledged")},
-                                          "sent_ack": {key: (sent_state.get("evidence", {}).get("accepted_host_action") or {}).get(key)
-                                                       for key in ("state", "intent_revision", "acquired_at_monotonic_s")},
-                                          "transport_close": unknown_resume["transport_close"]}
-                                if len(json.dumps(detail, allow_nan=False).encode("utf-8")) > 2048:
-                                    raise ValueError("bounded unknown Resume context required")
-                                refusal_record(detail)
-                            except (Exception, asyncio.CancelledError) as reporting_error:
-                                del error.resume_result_context
-                                raise error from reporting_error
+                    record_transport_phase(error, unknown_resume)
                     raise
                 except CommandRefusedError as refusal:
                     reason = refusal.response.get("reason")
@@ -1008,6 +1029,13 @@ class SessionClient:
                         if refusal_record:
                             refusal_record(dict(event="resume_view_refused", **context))
         except (Exception, asyncio.CancelledError) as error:
+            if isinstance(error, ConnectionError) and waiting_held is not None:
+                try:
+                    record_transport_phase(error, waiting_held)
+                except (Exception, asyncio.CancelledError) as reporting_error:
+                    if first_refusal is not None:
+                        raise first_refusal from reporting_error
+                    raise
             if isinstance(error, _NativeRecoveryPendingError):
                 error.held_view_ceiling = phase_ceiling
             if first_refusal is not None and error is not first_refusal:
@@ -1311,6 +1339,9 @@ class SameRunRecovery:
                               "controller_generation": self.client.generation, "connection_generation": self.client.connection,
                               "intent_revision": before["run"].get("intent_revision")}
                     known, close = context["connect_identity"], context["transport_close"]
+                    held = context.get("phase") == "held_qualification"
+                    phase_key = ((identity["connection_generation"], identity["intent_revision"], "held")
+                                 if held else context["operation_id"])
                     event, remaining, ceiling = context["prior_event"], before["run"].get("remaining_s"), context["phase_ceiling"]
                     if (set(identity) != set(actual) or any(type(identity[k]) is not type(v) or identity[k] != v for k, v in actual.items())
                         or type(identity["intent_revision"]) is not int or identity["intent_revision"] < 1
@@ -1320,8 +1351,8 @@ class SameRunRecovery:
                                if k not in {"intent_revision", "connection_generation"})
                         or known.get("intent_revision") != identity["intent_revision"] - 1
                         or str(UUID(identity["connection_generation"])) != identity["connection_generation"]
-                        or str(UUID(context["operation_id"])) != context["operation_id"]
-                        or context["operation_id"] in consumed_resumes
+                        or (context["operation_id"] is not None if held else str(UUID(context["operation_id"])) != context["operation_id"])
+                        or phase_key in consumed_resumes
                         or before["run"].get("status") != "paused" or before["run"].get("recovery") is not None
                         or _latest_run_event(before, identity) != event
                         or event.get("kind") not in {"input_expired", "native_input_expired", "required_view_expired", "live_sensing_requalified"}
@@ -1343,7 +1374,7 @@ class SameRunRecovery:
                         if budget <= 0:
                             raise TimeoutError("original unknown Resume qualification ceiling exhausted")
                         return budget
-                    consumed_resumes.add(context["operation_id"])
+                    consumed_resumes.add(phase_key)
                     await self._attach_transport(before, identity, remaining_budget, renewal_check)
                     resume_context = context | {"pending_episode": getattr(original, "resume_pending_episode", None)}
                     grant_context, pending_recovery, interrupted = None, None, None
@@ -1492,11 +1523,13 @@ class SameRunRecovery:
             if (not self.history_qualified(state) or run.get("status") == "recovering"
                 or resume_context["pending_episode"] is not None
                 and _latest_run_event(state, identity) != resume_context["prior_event"]):
-                retained = self._grant_episode(state, resume_context, pending=resume_context["pending_episode"], resume_unknown=True)
+                retained = self._grant_episode(state, resume_context, pending=resume_context["pending_episode"],
+                                               resume_unknown=resume_context.get("phase") != "held_qualification")
             else:
                 event = _latest_run_event(state, identity)
                 same = run.get("intent_revision") == identity["intent_revision"] and event == resume_context["prior_event"]
-                new_pause = (type(run.get("intent_revision")) is int and run["intent_revision"] == identity["intent_revision"] + 2
+                new_pause = (resume_context.get("phase") != "held_qualification"
+                             and type(run.get("intent_revision")) is int and run["intent_revision"] == identity["intent_revision"] + 2
                              and set(event) == {"kind", "at", "run_id", "service_incarnation"}
                              and event.get("kind") in {"input_expired", "native_input_expired", "required_view_expired"}
                              and type(event.get("at")) in (int, float) and math.isfinite(event["at"])
@@ -1735,6 +1768,35 @@ class SameRunRecovery:
                 identity = self.client.identities()
                 event = json.loads(json.dumps(_latest_run_event(state, binding_context["identity"]), allow_nan=False))
                 previous_remaining, previous_stamp = state["run"]["remaining_s"], None
+                if resume_context is not None and resume_context.get("phase") == "held_qualification":
+                    def current_held():
+                        checked(self.client.snapshot)
+                        current = self.client.snapshot
+                        actual = self.client.identities()
+                        if (set(actual) != set(identity) or any(type(actual[k]) is not type(v) or actual[k] != v for k, v in identity.items())
+                            or current["run"].get("status") != "paused" or current["run"].get("recovery") is not None
+                            or _latest_run_event(current, identity) != event):
+                            raise RuntimeError("fresh held qualification authority changed")
+                        evidence, live = current.get("evidence", {}), _live(current)
+                        return (all(evidence.get(k) is True for k in
+                                    ("feedback", "required_observation", "hold_acknowledged", "pose_aligned", "native_ack"))
+                                and live.get("cursor_intent_revision") == current["run"]["intent_revision"]
+                                and live.get("required_view", {}).get("qualified") is True)
+                    budget = min(local_ceiling, clock["held_view_ceiling"]) - time.monotonic()
+                    if budget <= 0:
+                        raise TimeoutError("original held qualification ceiling exhausted")
+                    await self.client.wait(current_held, budget)
+                    requested = time.monotonic()
+                    budget = min(local_ceiling, clock["held_view_ceiling"]) - requested
+                    if budget <= 0:
+                        raise TimeoutError("original held qualification ceiling exhausted")
+                    if renewal_check:
+                        renewal_check()
+                    state = (await asyncio.wait_for(self.client.get("state"), budget))["snapshot"]
+                    self.client.snapshot = state
+                    self.record({"event": "owner_rejoin_state", "snapshot": state,
+                                 "request_started_at_monotonic_s": requested,
+                                 "response_observed_at_monotonic_s": time.monotonic()})
                 waiting_view = False
                 while True:
                     checked(state)
