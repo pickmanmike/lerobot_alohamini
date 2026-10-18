@@ -4495,3 +4495,96 @@ def test_startup_run_detail_reuses_real_core_gateway_bounded_chunk_contract(tmp_
         assert all(query["limit"] == "8192" for query in requests)
     finally:
         authority.close()
+
+
+@pytest.mark.parametrize("change", [None, "small", "matching_null", "mixed_null_projection",
+    "mixed_absent_projection", "foreign_host", "live_null_host", "bound_null_host", "unsafe_status",
+    "missing_live", "missing_deadline", "changed_deadline", "future_deadline", "bad_ref_shape", "detail_error"])
+def test_startup_detail_uses_the_actual_core_start_pending_backend_shape(tmp_path, monkeypatch, change):
+    import asyncio
+    import copy
+    import json
+    from types import SimpleNamespace
+    from urllib.parse import parse_qsl, urlsplit
+
+    from tests.robots.test_am1_live_teleop_executor import authority_lane
+    from tools.am1_session_service import Gateway
+
+    m = adapter()
+    authority, executor, _ = authority_lane(tmp_path / "authority")
+    authority.run = None
+    begins = []
+    # Only the actual executor worker launch is suppressed. Core Start, bind_run,
+    # original startup clocks and Gateway status/detail generation are unchanged.
+    monkeypatch.setattr(executor, "begin", lambda recipe: begins.append(recipe.name) or True)
+    receipt = authority.handle({"op": "start", "operation_id": str(uuid4()),
+        "recipe": "physical-live-teleop", "controller_generation": authority.controller["generation"]}, "pc")
+    assert receipt["accepted"] and receipt["effect_admitted"] is False
+    assert begins == ["physical-live-teleop"]
+    assert authority.run["status"] == "starting" and authority.run["accepted_at"] == 10.
+    assert authority.run["startup_deadline"] == 190.
+    assert authority.run["native_live_at"] is None and authority.run["deadline"] is None
+    assert "backend_incarnation" not in authority.run  # The real production pending shape.
+    if change in {"matching_null", "mixed_absent_projection", "live_null_host", "bound_null_host",
+                  "unsafe_status", "missing_live", "missing_deadline"}:
+        # Explicit synthetic compatibility/negative states; the primary case above
+        # retains the unmodified Core-generated ABSENT field.
+        authority.run["backend_incarnation"] = None
+    if change == "live_null_host":
+        authority.run.update(status="paused", native_live_at=10., deadline=310.)
+    before, requests = copy.deepcopy(authority.run), []
+    gateway = object.__new__(Gateway)
+    async def call(command, _device):
+        return authority.snapshot_detail(command) if "reference" in command else {"snapshot": authority.snapshot()}
+    gateway.call = call
+    read_error = RuntimeError("original authenticated detail unavailable")
+    class Client:
+        async def get(self, path):
+            requests.append(path)
+            if change == "detail_error":
+                raise read_error
+            response = await Gateway.state(gateway, SimpleNamespace(query=dict(parse_qsl(urlsplit(path).query))))
+            return json.loads(response.body)
+    async def scenario():
+        response = await Gateway.state(gateway, SimpleNamespace(query={}))
+        state = json.loads(response.body)["snapshot"]
+        assert state["status_projection"] == {"kind": "am1-essential-status", "version": 1}
+        assert "accepted_at" not in state["run"]
+        assert state["run"]["details_reference"]["host_incarnation"] is None
+        if change == "small":
+            state = {"service_incarnation": state["service_incarnation"], "run": copy.deepcopy(before)}
+        elif change == "mixed_null_projection":
+            state["run"]["backend_incarnation"] = None
+        elif change == "mixed_absent_projection":
+            state["run"].pop("backend_incarnation")
+        elif change == "foreign_host":
+            state["run"]["details_reference"]["host_incarnation"] = str(uuid4())
+        elif change == "bound_null_host":
+            state["run"]["backend_incarnation"] = str(uuid4())
+        elif change == "unsafe_status":
+            state["run"]["status"] = "recovering"
+        elif change == "missing_live":
+            state["run"].pop("native_live_at")
+        elif change == "missing_deadline":
+            state["run"].pop("deadline")
+        elif change in {"changed_deadline", "future_deadline"}:
+            state["run"]["startup_deadline"] += .01 if change == "changed_deadline" else 1800.
+        elif change == "bad_ref_shape":
+            state["run"]["details_reference"]["bytes"] = True
+        if change in {None, "small", "matching_null"}:
+            result = await m._startup_run_detail(Client(), state, lambda: 1.)
+            assert result == before and result["accepted_at"] == 10.
+            assert result["startup_deadline"] == 190.
+            assert ("backend_incarnation" in result) is (change == "matching_null")
+            assert bool(requests) is (change != "small")
+        else:
+            with pytest.raises((RuntimeError, ValueError)) as caught:
+                await m._startup_run_detail(Client(), state, lambda: 1.)
+            if change == "detail_error":
+                assert caught.value is read_error
+        assert authority.run == before and begins == ["physical-live-teleop"]
+    try:
+        asyncio.run(scenario())
+    finally:
+        authority.run = None
+        authority.close()

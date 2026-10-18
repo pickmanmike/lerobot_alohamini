@@ -381,11 +381,16 @@ def _startup_run_reference(state):
         or type(reference["bytes"]) is not int or not 0 < reference["bytes"] <= 8 * 1024**2
         or type(reference["sha256"]) is not str or len(reference["sha256"]) != 64
         or any(c not in "0123456789abcdef" for c in reference["sha256"])
-        or any(key not in run for key in ("run_id", "operation_id", "backend_incarnation", "startup_deadline"))
+        or any(key not in run for key in ("run_id", "operation_id", "startup_deadline"))
         or reference["service_incarnation"] != state.get("service_incarnation")
         or reference["run_id"] != run.get("run_id") or reference["operation_id"] != run.get("operation_id")
         or reference["host_incarnation"] != run.get("backend_incarnation")):
         raise RuntimeError("original startup run detail reference unavailable or changed")
+    if run.get("backend_incarnation") is None and (
+        run.get("status") != "starting"
+        or any(key not in run or run[key] is not None for key in ("native_live_at", "deadline"))
+    ):
+        raise RuntimeError("original startup pending backend identity unavailable or changed")
     for key in ("service_incarnation", "run_id", "operation_id", "host_incarnation"):
         value = reference[key]
         if value is None and key == "host_incarnation":
@@ -425,6 +430,7 @@ async def _startup_run_detail(client, state, remaining):
     run = json.loads(raw)
     if (not isinstance(run, dict)
         or json.dumps(run, sort_keys=True, separators=(",", ":"), allow_nan=False).encode() != raw
+        or ("backend_incarnation" in run) != ("backend_incarnation" in state["run"])
         or any(type(run.get(key)) is not type(state["run"].get(key))
                or run.get(key) != state["run"].get(key)
                for key in ("run_id", "operation_id", "recipe", "backend_incarnation", "startup_deadline"))):
