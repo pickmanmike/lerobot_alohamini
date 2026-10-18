@@ -496,7 +496,7 @@ class SessionClient:
             connected = await self.command(dict(op="connect", **identity))
         except ConnectionError as error:
             # Lost connect results are ambiguous, never nonadmission receipts.
-            # Later release/Resume/input failures deliberately have no such tag.
+            # This tag is only for the initial connect result.
             error.connect_identity = dict(identity)
             raise
         self.connection = connected["connection_generation"]
@@ -504,7 +504,21 @@ class SessionClient:
         self.sequence = 0
         if check:
             check(self.snapshot)
-        await self.command(dict(op="release_input", **self.identities()))
+        await SessionClient._resume_connected(self, check=check, connect_identity=identity)
+
+    async def _resume_connected(self, *, check=None, connect_identity=None, qualified_check=None):
+        identity = self.identities()
+        release_context = None if connect_identity is None else json.loads(json.dumps({
+            "identity": identity, "connect_identity": connect_identity, "snapshot": self.snapshot,
+        }, allow_nan=False))
+        try:
+            await self.command(dict(op="release_input", **identity))
+        except (ConnectionError, TimeoutError) as error:
+            if connect_identity is not None:
+                # Only this empty release follows a known connect ACK. Its
+                # outcome stays unknown; later waits/Resume/input are untagged.
+                error.empty_release_context = release_context
+            raise
 
         def qualified():
             if check:
@@ -524,6 +538,7 @@ class SessionClient:
                 )
                 and live.get("cursor_intent_revision") == run.get("intent_revision")
                 and live.get("required_view", {}).get("qualified") is True
+                and (qualified_check is None or qualified_check(self.snapshot))
             )
 
         await self.wait(qualified, 8)
@@ -824,19 +839,23 @@ class SameRunRecovery:
             renewal_check()
         try:
             await asyncio.wait_for(self.client.resume(check=self.check), timeout)
-        except ConnectionError as original:
+        except (ConnectionError, TimeoutError) as original:
+            release = getattr(original, "empty_release_context", None)
+            release_loss = isinstance(release, dict) and set(release) == {"identity", "connect_identity", "snapshot"}
             close = dict(getattr(self.client, "transport_close", None) or {})
-            identity = getattr(original, "connect_identity", None)
+            identity = release["identity"] if release_loss else getattr(original, "connect_identity", None)
             expected = dict(
                 run_id=self.original["run"]["run_id"], service_incarnation=self.original["service"],
                 host_incarnation=self.original["run"]["backend_incarnation"],
                 controller_generation=self.original["controller"]["controller_generation"],
-                connection_generation=self.client.connection, intent_revision=state["run"]["intent_revision"],
+                connection_generation=self.client.connection,
+                intent_revision=state["run"]["intent_revision"] + (1 if release_loss else 0),
             )
             if (
                 recovered
-                or close.get("expected") is not False or close.get("reason") != "stream-ended"
-                or close.get("close_code") != 1006 or close.get("reader_error") is not None
+                or close.get("reader_error") is not None
+                or not release_loss and (close.get("expected") is not False or close.get("reason") != "stream-ended"
+                                         or close.get("close_code") != 1006)
                 or not isinstance(identity, dict) or set(identity) != set(expected)
                 or any(type(identity[k]) is not type(v) or identity[k] != v for k, v in expected.items())
                 or type(identity["intent_revision"]) is not int
@@ -857,6 +876,23 @@ class SameRunRecovery:
                                  if event.get("run_id") == self.original["run"]["run_id"]
                                  and event.get("service_incarnation") == self.original["service"]), {})
                 original_event = pause_event(state)
+                if release_loss:
+                    before = release["connect_identity"]
+                    if not isinstance(before, dict):
+                        raise RuntimeError("known accepted connect identity unavailable")
+                    expected_before = dict(expected, connection_generation=before.get("connection_generation"),
+                                           intent_revision=state["run"]["intent_revision"])
+                    if (not isinstance(before, dict) or set(before) != set(expected_before)
+                        or any(type(before[k]) is not type(v) or before[k] != v for k, v in expected_before.items())
+                        or type(before["connection_generation"]) is not str or not before["connection_generation"]
+                        or before["connection_generation"] == identity["connection_generation"]):
+                        raise RuntimeError("known accepted connect identity unavailable")
+                    self.check(release["snapshot"])
+                    if (release["snapshot"]["run"].get("status") != "paused"
+                        or type(release["snapshot"]["run"].get("intent_revision")) is not int
+                        or release["snapshot"]["run"]["intent_revision"] != identity["intent_revision"]
+                        or pause_event(release["snapshot"]) != original_event):
+                        raise RuntimeError("known accepted connect revision/pause changed")
                 if (
                     state["run"].get("status") != "paused" or state["run"].get("recovery") is not None
                     or set(original_event) != {"kind", "at", "run_id", "service_incarnation"}
@@ -877,7 +913,7 @@ class SameRunRecovery:
                     return value
                 if renewal_check:
                     renewal_check()
-                self.record({"event": "ordinary_connect_transport_closed", "transport_close": close,
+                self.record({"event": "ordinary_empty_release_ambiguous" if release_loss else "ordinary_connect_transport_closed", "transport_close": close,
                              "identity": identity, "pause_event": original_event,
                              "remaining_s": remaining(), "outcome": "ambiguous"})
                 budget = remaining()
@@ -898,7 +934,8 @@ class SameRunRecovery:
                 if (
                     run.get("status") != "paused" or run.get("recovery") is not None
                     or pause_event(fresh) != original_event
-                    or type(revision) is not int or revision not in (identity["intent_revision"], identity["intent_revision"] + 1)
+                    or type(revision) is not int or revision not in ((identity["intent_revision"],) if release_loss else
+                                                                  (identity["intent_revision"], identity["intent_revision"] + 1))
                     or self.client.connection != identity["connection_generation"]
                     or not all(evidence.get(k) is True for k in
                                ("feedback", "required_observation", "hold_acknowledged", "pose_aligned", "native_ack"))
@@ -920,18 +957,64 @@ class SameRunRecovery:
                 if renewal_check:
                     renewal_check()
                 remaining()
-                self.record({"event": "ordinary_connect_requalified", "intent_revision": revision,
+                self.record({"event": "ordinary_empty_release_requalified" if release_loss else "ordinary_connect_requalified", "intent_revision": revision,
                              "remaining_s": remaining()})
                 # One deliberate NEW binding, after current held qualification.
                 # The old command/result and every acquired input stay discarded.
                 budget = remaining()
-                await asyncio.wait_for(self.client.resume(check=self.check), budget)
+                if release_loss:
+                    # A NEW acknowledged generation fences an old release that
+                    # may still be queued in Gateway/IPC. Never replay its ID.
+                    connected = await asyncio.wait_for(
+                        self.client.command(dict(op="connect", **self.client.identities())), budget)
+                    generation = connected.get("connection_generation")
+                    replacement = connected.get("snapshot")
+                    self.check(replacement)
+                    if (type(generation) is not str or not generation or generation == identity["connection_generation"]
+                        or type(replacement["run"].get("intent_revision")) is not int
+                        or replacement["run"]["intent_revision"] != revision + 1
+                        or replacement["run"].get("status") != "paused"
+                        or pause_event(replacement) != original_event):
+                        raise RuntimeError("replacement connect generation/revision ACK unavailable")
+                    self.client.connection, self.client.snapshot, self.client.sequence = generation, replacement, 0
+                    self.record({"event": "ordinary_empty_release_fenced", "connection_generation": generation,
+                                 "previous_connection_generation": identity["connection_generation"],
+                                 "intent_revision": revision + 1, "remaining_s": remaining()})
+                    held_stamp = stamp
+                    if renewal_check:
+                        renewal_check()
+                    def current_held(snapshot):
+                        self.check(snapshot)
+                        run, evidence, live = snapshot["run"], snapshot.get("evidence", {}), _live(snapshot)
+                        ack = evidence.get("accepted_host_action") or {}
+                        stamp, current_remaining = ack.get("acquired_at_monotonic_s"), run.get("remaining_s")
+                        if (self.client.connection != generation or pause_event(snapshot) != original_event
+                            or type(run.get("intent_revision")) is not int or run["intent_revision"] != revision + 1
+                            or run.get("status") != "paused" or run.get("recovery") is not None):
+                            raise RuntimeError("replacement current authority changed")
+                        return (evidence.get("active_acknowledged") is False
+                                and type(evidence.get("acknowledged_intent_revision")) is int
+                                and evidence["acknowledged_intent_revision"] == revision + 1
+                                and ack.get("run_id") == run["run_id"]
+                                and ack.get("host_incarnation") == run["backend_incarnation"]
+                                and ack.get("state") == "paused" and type(ack.get("intent_revision")) is int
+                                and ack["intent_revision"] == revision + 1
+                                and type(live.get("cursor_intent_revision")) is int
+                                and live["cursor_intent_revision"] == revision + 1
+                                and all(type(v) in (int, float) and math.isfinite(v) for v in (stamp, current_remaining))
+                                and 0 < current_remaining <= native_remaining
+                                and held_stamp <= stamp <= run["deadline"] - current_remaining)
+                    budget = remaining()
+                    await asyncio.wait_for(SessionClient._resume_connected(
+                        self.client, check=self.check, qualified_check=current_held), budget)
+                else:
+                    await asyncio.wait_for(self.client.resume(check=self.check), budget)
                 if renewal_check:
                     renewal_check()
                 remaining()
             except Exception as qualification_error:
                 try:
-                    self.record({"event": "ordinary_connect_requalification_failed",
+                    self.record({"event": "ordinary_empty_release_requalification_failed" if release_loss else "ordinary_connect_requalification_failed",
                                  "error_type": type(qualification_error).__name__, "message": str(qualification_error)})
                 finally:
                     raise original from qualification_error
