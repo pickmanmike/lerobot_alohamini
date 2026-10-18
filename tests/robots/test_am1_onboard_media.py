@@ -385,3 +385,59 @@ def test_selected_view_progress_entrypoint_records_real_phase_times_without_rene
     finally:
         a.run = None
         a.close()
+
+
+@pytest.mark.parametrize("costs,expected", [
+    ([0.] * 8, [i / 10 for i in range(8)]),
+    ([.02] * 8, [i / 10 for i in range(8)]),
+    ([.04] * 8, [i / 10 for i in range(8)]),
+    ([.02, .02, .13, .02, .02, .02], [0., .1, .2, .4, .5, .6]),
+])
+def test_shared_feeder_keeps_declared_clock_without_write_cost_drift_or_catchup(monkeypatch, costs, expected):
+    """Synthetic finite costs, real FrameStore/_feed; no encoder/network/device claim."""
+    from types import SimpleNamespace
+
+    from tools.am1_camera_viewer import FrameStore
+
+    m = module()
+    now, next_capture, published, starts, delivered = [0.], [1 / 15], [0], [], []
+    store = FrameStore(clock=lambda: now[0])
+    def publish():
+        published[0] += 1
+        store.publish(b"\xff\xd8" + published[0].to_bytes(2, "big") + b"\xff\xd9")
+    publish()
+    generation = store.metadata_snapshot()[1]["capture_generation"]
+    def advance(seconds):
+        end = now[0] + seconds
+        while next_capture[0] <= end:
+            now[0] = next_capture[0]
+            publish()
+            next_capture[0] += 1 / 15
+        now[0] = end
+    class Stop:
+        stopped, waits = False, 0
+        def is_set(self):
+            return self.stopped
+        def wait(self, seconds):
+            assert seconds >= 0
+            advance(seconds)
+            self.waits += 1
+            self.stopped = self.waits == len(costs)
+            return self.stopped
+    class Pipe:
+        def write(self, value):
+            starts.append(now[0])
+            delivered.append(int.from_bytes(value[2:4], "big"))
+            advance(costs[len(starts) - 1])
+            return len(value)
+    monkeypatch.setattr(m, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    process = SimpleNamespace(stdin=Pipe(), poll=lambda: None)
+    encoder = m.SharedPrimaryEncoder({"chest": store}, "ffmpeg", process_factory=lambda *args, **kwargs: process)
+    encoder._feed(process, Stop(), "chest", generation)
+    assert encoder.command()[encoder.command().index("-framerate") + 1] == "10"
+    assert starts == pytest.approx(expected, abs=1e-9)
+    assert all(b - a >= .1 - 1e-9 for a, b in zip(starts, starts[1:], strict=False))
+    assert delivered == sorted(set(delivered))  # Latest genuine JPEG only, no repeat/catch-up votes.
+    assert encoder.frames == len(costs) and encoder.sequence == delivered[-1]
+    assert encoder.dropped == delivered[-1] - delivered[0] + 1 - len(delivered)
+    assert encoder.failure is None and encoder.write_started is None

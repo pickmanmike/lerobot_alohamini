@@ -137,6 +137,7 @@ class SharedPrimaryEncoder:
 
     def _feed(self, process, stop, role, generation):
         last = 0
+        next_frame_at = time.monotonic()
         try:
             while not stop.is_set() and process.poll() is None:
                 sample = self.stores[role].metadata_snapshot()
@@ -161,7 +162,12 @@ class SharedPrimaryEncoder:
                         last = self.sequence = sequence
                         self.frames += 1
                         self.write_started = None
-                stop.wait(0.1)
+                next_frame_at += 0.1
+                now = time.monotonic()
+                if next_frame_at < now:
+                    # Skip missed slots; slow writes must not trigger catch-up bursts.
+                    next_frame_at += (math.floor((now - next_frame_at) / 0.1) + 1) * 0.1
+                stop.wait(max(0.0, next_frame_at - now))
         except (OSError, ValueError):
             if not stop.is_set():
                 self.failure = "encoder-pipe-unavailable"
