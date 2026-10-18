@@ -460,7 +460,7 @@ class AM1LocalControl:
             return
         from .am1_live_teleop import hold_goals, thermal_history_status
 
-        status = thermal_history_status(robot)
+        status = thermal_history_status(robot, collect_due=True)
         if status is None or status["deficit_started_at_monotonic_s"] is None:
             return
         episode = robot._am1_thermal_history_episode

@@ -350,7 +350,7 @@ def enable_thermal_history(control, robot):
         window.allow_history_hold = True
 
 
-def thermal_history_status(robot):
+def thermal_history_status(robot, *, collect_due=False):
     """Original-clock safety proof; history loss is distinct from lost/invalid RAW."""
     context = getattr(robot, "_am1_thermal_history_context", None)
     if context is None:
@@ -365,10 +365,31 @@ def thermal_history_status(robot):
     if len(windows) != 13 or any(window.allow_history_hold is not True for window in windows):
         raise RuntimeError("AM1 thermal history role/collector changed")
     now = time.monotonic()
+    episode = getattr(robot, "_am1_thermal_history_episode", None)
+    prior_deficits = [window.history_deficit_at for window in windows if window.history_deficit_at is not None]
+    if collect_due:
+        if getattr(robot, "_am1_teleop_first_error", None) is not None:
+            raise robot._am1_teleop_first_error
+        for window in windows:
+            window.assert_fresh(now, refreshing=True)
+        ceiling = episode["ceiling"] if episode else min(
+            min(prior_deficits) + 10 if prior_deficits else context["deadline"], context["deadline"])
+        if now >= ceiling:
+            raise RuntimeError("AM1 thermal history original recovery deadline expired")
+        if (getattr(robot, "_am1_thermal_history_collecting", False)
+                or getattr(robot, "_am1_teleop_temperature_refreshing", False)):
+            raise RuntimeError("AM1 thermal history nested due collection refused")
+        robot._am1_thermal_history_collecting = True
+        try:
+            service_due_feedback(robot)
+        finally:
+            robot._am1_thermal_history_collecting = False
+        now = time.monotonic()
+        if now >= ceiling:
+            raise RuntimeError("AM1 thermal history original recovery deadline expired")
     for window in windows:
         window.assert_fresh(now)  # RAW loss and every existing latch remain fatal.
-    deficits = [window.history_deficit_at for window in windows if window.history_deficit_at is not None]
-    episode = getattr(robot, "_am1_thermal_history_episode", None)
+    deficits = prior_deficits + [window.history_deficit_at for window in windows if window.history_deficit_at is not None]
     if deficits and episode is None:
         started = min(deficits)
         episode = robot._am1_thermal_history_episode = {

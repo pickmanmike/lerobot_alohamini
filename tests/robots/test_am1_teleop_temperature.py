@@ -2188,3 +2188,104 @@ def test_live_cadence_first_active_ack_cannot_skip_original_raw_revalidation(com
     monkeypatch.setattr(control, "_apply_standard", delayed)
     with pytest.raises(RuntimeError, match="stale"):
         control.apply(state.robot, frame(identity, owner, 2, mode="active", epoch=2))
+
+
+def test_reconcile_services_saved58_due_lift_before_history_permission(command_cadence_boundary, monkeypatch):
+    """Observed58 ages/next-read interval with explicitly synthetic compatible middle slots."""
+    state = command_cadence_boundary
+    control, _identity, _owner, _base = _live_cadence_owner(state)
+    observation = state.robot.get_observation()
+    target = state.clock.now + .06
+    # Only oldest peak, last RAW, deficit and next RAW are exact saved facts.
+    # The compatible origin/middle slots below are controlled fixture choices.
+    ages = ((.506547105, 33), (.35, 32), (.25, 33), (.15, 33), (.056513387, 32))
+    replay = TemperatureWindow()
+    replay.allow_history_hold = True
+    replay._origin_ns = round((target - .609) * 1e9)
+    for age, value in ages:
+        replay.update(value, target - age)
+    read_group = state.operation.transport.read_group
+    def delayed_group(*args, **kwargs):
+        # Synthetic bounded work reproduces the observed 18.133514 ms interval;
+        # this does not identify the historical wire/request cost.
+        state.clock.sleep(.016133514)
+        return read_group(*args, **kwargs)
+    monkeypatch.setattr(state.operation.transport, "read_group", delayed_group)
+    window = state.operation.temperature
+    window.__dict__.update(replay.__dict__)  # Fixture setup; production never resets a window.
+    origins = [w._origin_ns for w in [window, *(v["window"] for v in state.robot._am1_teleop_temperatures.values())]]
+    deadline = control.live_snapshot()["live_deadline_monotonic_s"]
+    state.clock.now = target
+    assert state.clock.now - window.samples[0][0] == pytest.approx(.506547105, abs=1e-9)
+    assert state.clock.now - window._last_sample_at == pytest.approx(.056513387, abs=1e-9)
+    state.command_writes.clear()
+    control.reconcile_thermal_history(state.robot, observation)
+    assert state.robot._am1_thermal_history_episode is None
+    assert control.state == "active" and window.ready and window.failure is None
+    assert window._last_sample_at == pytest.approx(target + .018133514, abs=1e-9)
+    assert len(window.samples) == 5
+    assert [w._origin_ns for w in [window, *(v["window"] for v in state.robot._am1_teleop_temperatures.values())]] == origins
+    assert window.outliers == 0 and not state.command_writes
+    assert control.live_snapshot()["live_deadline_monotonic_s"] == deadline
+
+
+@pytest.mark.parametrize("guard", ["stale-raw", "expired-episode", "first-fault", "nested-collection"])
+def test_history_permission_collection_preserves_pre_io_guards(command_cadence_boundary, monkeypatch, guard):
+    state = command_cadence_boundary
+    _live_cadence_owner(state)
+    state.clock.sleep(.06)
+    expected = None
+    if guard == "stale-raw":
+        state.clock.sleep(.501)
+    elif guard == "expired-episode":
+        state.robot._am1_thermal_history_episode = {
+            "started": state.clock.now - 10, "ceiling": state.clock.now,
+            "held_goals": None, "hold_sample": None, "zero_started": None, "zero_completed": None,
+        }
+    elif guard == "first-fault":
+        expected = RuntimeError("retained first owner fault")
+        state.robot._am1_teleop_first_error = expected
+    else:
+        state.robot._am1_thermal_history_collecting = True
+    for _side, bus, _names in teleop._groups(state.robot):
+        monkeypatch.setattr(bus, "sync_read", lambda *a, **k: pytest.fail("guard allowed device I/O"))
+    with pytest.raises(RuntimeError) as error:
+        teleop.thermal_history_status(state.robot, collect_due=True)
+    if expected is not None:
+        assert error.value is expected
+    else:
+        assert any(word in str(error.value) for word in ("stale", "deadline", "nested"))
+
+
+@pytest.mark.parametrize("registered", [False, True], ids=["original-window-deficit", "existing-episode"])
+def test_history_permission_collection_keeps_original_deficit_after_refill(command_cadence_boundary, registered):
+    state = command_cadence_boundary
+    _live_cadence_owner(state)
+    state.clock.sleep(.06)
+    window = state.operation.temperature
+    started = state.clock.now - .01
+    window.history_deficit_at = started
+    if registered:
+        state.robot._am1_thermal_history_episode = {
+            "started": started, "ceiling": started + 10,
+            "held_goals": None, "hold_sample": None, "zero_started": None, "zero_completed": None,
+        }
+    origin, outliers = window._origin_ns, window.outliers
+    proof = teleop.thermal_history_status(state.robot, collect_due=True)
+    assert proof["peaks_ready"] and window.history_deficit_at is None
+    assert proof["deficit_started_at_monotonic_s"] == started
+    assert proof["deficit_ceiling_monotonic_s"] == started + 10
+    assert window._origin_ns == origin and window.outliers == outliers
+    assert state.robot._am1_thermal_history_collecting is False
+
+
+def test_history_permission_collection_rejects_recursive_drain_before_nested_bus_io(command_cadence_boundary):
+    state = command_cadence_boundary
+    _live_cadence_owner(state)
+    state.clock.sleep(.06)
+    state.robot._am1_routine_lift_drain = lambda: teleop.thermal_history_status(state.robot, collect_due=True)
+    state.command_reads.clear()
+    with pytest.raises(RuntimeError, match="nested"):
+        teleop.thermal_history_status(state.robot, collect_due=True)
+    assert not state.command_reads
+    assert state.robot._am1_thermal_history_collecting is False
