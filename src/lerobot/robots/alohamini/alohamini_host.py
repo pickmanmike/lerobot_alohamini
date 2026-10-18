@@ -1672,6 +1672,9 @@ def _run_host(args):
     fault_loop_context_error = None
     routine_writer = None
     routine_report = print
+    no_lift_drain = object()
+    previous_lift_drain = getattr(robot, "_am1_routine_lift_drain", no_lift_drain)
+    installed_lift_drain = False
     exit_message = None
     logging.info("Waiting for commands...")
 
@@ -1682,6 +1685,13 @@ def _run_host(args):
             routine_report = routine_writer.submit_line
             robot._am1_routine_report = routine_report
             if teleop:
+                def drain_lift_samples():
+                    routine_writer.raise_if_failed()
+                    routine_writer.emit_lift_samples(robot._lift_operation)
+                    routine_writer.raise_if_failed()
+
+                robot._am1_routine_lift_drain = drain_lift_samples
+                installed_lift_drain = True
                 # Keep each complete bus receipt below the existing record bound.
                 for side in ("left", "right"):
                     routine_writer.submit("[AM1 TELEOP SETTINGS] ", {
@@ -1969,6 +1979,11 @@ def _run_host(args):
                 fault_loop_context_error = type(context_error).__name__
     finally:
         args._am1_finishing = True
+        if installed_lift_drain:
+            if previous_lift_drain is no_lift_drain:
+                del robot._am1_routine_lift_drain
+            else:
+                robot._am1_routine_lift_drain = previous_lift_drain
         cleanup_errors: list[tuple[str, BaseException]] = []
         try:
             if robot.is_connected:

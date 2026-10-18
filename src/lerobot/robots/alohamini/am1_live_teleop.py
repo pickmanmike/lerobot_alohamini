@@ -288,6 +288,10 @@ def refresh_startup_temperatures(robot, *, force=False):
         or getattr(robot, "_am1_teleop_temperature_refreshing", False)
     ):
         return
+    _refresh_due_temperatures(robot, force=force)
+
+
+def _refresh_due_temperatures(robot, *, force=False, active=None):
     states = robot._am1_teleop_temperatures
     now = time.monotonic()
     due = force or any(
@@ -298,9 +302,57 @@ def refresh_startup_temperatures(robot, *, force=False):
     if due:
         robot._am1_teleop_temperature_refreshing = True
         try:
-            read_groups(robot, ("Present_Temperature",))
+            read_groups(robot, ("Present_Temperature",), active=active)
         finally:
             robot._am1_teleop_temperature_refreshing = False
+
+
+def refresh_after_arm_retry(robot):
+    """Interleave due original feedback between the existing finite PP attempts."""
+    if getattr(robot, "_am1_teleop_first_error", None) is not None:
+        raise robot._am1_teleop_first_error
+    if not binding_valid(robot):
+        raise RuntimeError("AM1 teleop retry feedback identity changed")
+    operation = getattr(robot, "_lift_operation", None)
+    if operation is None:
+        raise RuntimeError("AM1 teleop retry requires its original lift owner")
+    operation.raise_if_faulted()
+    windows = [operation.temperature, *(state["window"] for state in robot._am1_teleop_temperatures.values())]
+    now = time.monotonic()
+    for window in windows:
+        window.assert_fresh(now, refreshing=True)
+    def refresh_lift_if_due():
+        now = time.monotonic()
+        for window in windows:
+            window.assert_fresh(now, refreshing=True)
+        window = operation.temperature
+        due = (round(now * 1e9) - window._origin_ns) // round(window.SLOT_S * 1e9) > window._last_slot
+        if due:
+            drain = getattr(robot, "_am1_routine_lift_drain", None)
+            if not callable(drain):
+                raise RuntimeError("AM1 teleop retry requires its bounded routine lift drain")
+            drain()
+            # Formatting/queue submission consumes actual time; no earlier guard
+            # grants permission to read after any role's last RAW receipt expires.
+            now = time.monotonic()
+            for window in windows:
+                window.assert_fresh(now, refreshing=True)
+            operation.poll(defer_sample_log=True)
+
+    refresh_lift_if_due()
+    now = time.monotonic()
+    for window in windows:
+        window.assert_fresh(now, refreshing=True)
+    _refresh_due_temperatures(robot, active=True)
+    # Other-role I/O can cross an anchored boundary. One bounded follow-up per
+    # role keeps genuine slots; there is no retry-until-fresh loop or age waiver.
+    refresh_lift_if_due()
+    now = time.monotonic()
+    for window in windows:
+        window.assert_fresh(now, refreshing=True)
+    _refresh_due_temperatures(robot, active=True)
+    operation.temperature.assert_fresh(time.monotonic())
+    _fresh_temperatures(robot)
 
 
 def _fresh_temperatures(robot):

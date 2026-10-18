@@ -1432,6 +1432,54 @@ class AlohaMini(Robot):
     ) -> dict[str, float]:
         if getattr(self.config, "robot_model", None) != "alohamini1":
             return bus.sync_read("Present_Position", motors)
+        if (getattr(self, "_am1_teleop_binding", None) is not None
+                and getattr(self, "_am1_teleop_startup_temperature", True) is False):
+            from .am1_live_teleop import refresh_after_arm_retry
+
+            if getattr(self, "_am1_teleop_first_error", None) is not None:
+                raise self._am1_teleop_first_error
+            side = "left" if bus is self.left_bus else "right"
+            context = {"side": side, "attempts": [], "normalization": None}
+            previous = getattr(self, "_am1_arm_position_read_context", {})
+            contexts = {key: previous[key] for key in ("left", "right") if key in previous}
+            contexts[side] = context
+            self._am1_arm_position_read_context = contexts
+            try:
+                for attempt in range(4):
+                    timing = {"started_at_monotonic_s": time.monotonic(), "outcome": "error"}
+                    context["attempts"].append(timing)
+                    try:
+                        raw = bus.sync_read("Present_Position", motors, normalize=False, num_retry=0)
+                    except ConnectionError:
+                        timing["outcome"] = "communication_error"
+                        if attempt == 3:
+                            raise
+                    else:
+                        timing["outcome"] = "ok"
+                        break
+                    finally:
+                        timing["completed_at_monotonic_s"] = time.monotonic()
+                    # Only the original communication failure is retriable.
+                    # Feedback/log faults leave this owner outside that catch.
+                    refresh_after_arm_retry(self)
+                timing = {"started_at_monotonic_s": time.monotonic(), "outcome": "error"}
+                context["normalization"] = timing
+                try:
+                    normalized = self._normalize_arm_feedback(bus, raw)
+                    timing["outcome"] = "ok"
+                finally:
+                    timing["completed_at_monotonic_s"] = time.monotonic()
+                if raw_positions is not None:
+                    raw_positions.update(raw)
+                return normalized
+            except BaseException as error:
+                try:
+                    error.add_note("AM1 arm position acquisition context: " + json.dumps(
+                        context, separators=(",", ":"), allow_nan=False,
+                    ))
+                except Exception:
+                    pass  # Optional fault evidence cannot replace its original exception.
+                raise
         raw = bus.sync_read("Present_Position", motors, normalize=False)
         if raw_positions is not None:
             raw_positions.update(raw)
@@ -1619,6 +1667,8 @@ class AlohaMini(Robot):
                     "left_arm_ms": round((left_arm_done_t - observation_start_t) * 1000, 3),
                     "base_ms": round((base_done_t - left_arm_done_t) * 1000, 3),
                     "right_arm_ms": round((right_arm_done_t - base_done_t) * 1000, 3),
+                    **({"arm_position_acquisitions": getattr(self, "_am1_arm_position_read_context", None)}
+                       if teleop else {}),
                 }, separators=(",", ":")))
                 raise
         else:

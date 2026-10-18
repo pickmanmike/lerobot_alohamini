@@ -798,3 +798,470 @@ def test_verify_settings_lift_due_read_cannot_purge_two_existing_high_slots(
     assert len(operation.transport.group_reads) == reads + 1
     assert list(window.samples)[-3:-1] == retained
     assert sum(value >= 55 for _, value in window.samples) == 3
+
+
+@pytest.fixture
+def observation_retry_boundary(verification_lift_boundary, monkeypatch):
+    """Real owner/SDK retry semantics; finite synthetic failures, not measured28 attempts."""
+    import math
+    import threading
+    import scservo_sdk as sdk
+    from lerobot.motors import Motor, MotorCalibration, MotorNormMode
+    from lerobot.motors.feetech import FeetechMotorsBus
+    from lerobot.motors.feetech.tables import MODEL_CONTROL_TABLE
+    from lerobot.motors.motors_bus import MotorsBus
+    from lerobot.robots.alohamini import alohamini_host as host
+    from tests.robots.test_am1_teleop_settings import ReplyPort, reply_packet
+
+    robot, clock, _base, window = verification_lift_boundary
+    operation = robot._lift_operation
+    robot._am1_teleop_startup_temperature = False
+    events, written, attempts = [], [], {"left": 0, "right": 0}
+    options = {"failed_attempts": {"left": 0, "right": 0}, "attempt_s": .055,
+               "success_s": .004358, "block_sink": False}
+    sink_gate, sink_entered = threading.Event(), threading.Event()
+    owner_thread = threading.get_ident()
+    for side, bus, names in teleop._groups(robot):
+        bus.calibration = getattr(bus, "calibration", {})
+        for name in names:
+            motor_id = bus.motors[name].id
+            bus.motors[name] = Motor(motor_id, "sts3215", MotorNormMode.RANGE_M100_100)
+            bus.calibration[name] = MotorCalibration(motor_id, 0, 0, 1000, 2200)
+            for register, value in (("Present_Position", 1600), ("Goal_Position", 1600),
+                                    ("Present_Current", 2), ("Present_Velocity", 0),
+                                    ("Protection_Current", 310)):
+                bus.registers[register, name] = value
+            robot._am1_teleop_settings[side]["registers"]["Protection_Current"][name] = 310
+        normalizer = FeetechMotorsBus("unused-observation-retry", bus.motors, bus.calibration)
+        for attr in ("_assert_protocol_is_compatible", "_get_motors_list", "_decode_sign",
+                     "_id_to_name", "_normalize", "_unnormalize"):
+            setattr(bus, attr, getattr(normalizer, attr))
+        bus._has_different_ctrl_tables = normalizer._has_different_ctrl_tables
+        bus.normalized_data = normalizer.normalized_data
+        bus.model_ctrl_table = normalizer.model_ctrl_table
+        bus.apply_drive_mode = normalizer.apply_drive_mode
+        bus.model_resolution_table = normalizer.model_resolution_table
+        bus.port_handler = ReplyPort()
+        bus.packet_handler = sdk.PacketHandler(0)
+        bus.sync_reader = sdk.GroupSyncRead(bus.port_handler, bus.packet_handler, 0, 0)
+        bus._setup_sync_reader = MotorsBus._setup_sync_reader.__get__(bus)
+        bus._sync_read = MotorsBus._sync_read.__get__(bus)
+        bus._is_comm_success = lambda result: result == 0
+        bus.sync_read = MotorsBus.sync_read.__get__(bus)
+
+        def respond(packet, _bus=bus, _side=side, _names=names):
+            assert threading.get_ident() == owner_thread
+            address, width = packet[5:7]
+            ids = packet[7:-1]
+            position = (address, width) == MODEL_CONTROL_TABLE["sts3215"]["Present_Position"]
+            if position:
+                attempts[_side] += 1
+                began = clock.now
+                failed = attempts[_side] <= options["failed_attempts"][_side]
+                clock.sleep(options["attempt_s"] if failed else options["success_s"])
+                events.append(("position_attempt", _side, began, clock.now, failed))
+                if failed:
+                    return []  # The real SDK returns COMM_RX_TIMEOUT; actual MotorsBus decides retries.
+            else:
+                clock.sleep(options.get("follower_read_s", .0001) if (address, width) == (63, 1) else .0001)
+                events.append(("other_read", _side, address, width, clock.now))
+            packets = []
+            by_id = {motor.id: name for name, motor in _bus.motors.items()}
+            for motor_id in ids:
+                payload = [0] * width
+                for register, (start, size) in MODEL_CONTROL_TABLE["sts3215"].items():
+                    if address <= start and start + size <= address + width:
+                        value = _bus.registers.get((register, by_id[motor_id]), 0)
+                        payload[start-address:start-address+size] = [(value >> (8*i)) & 255 for i in range(size)]
+                packets.append(reply_packet(motor_id, payload))
+            return [byte for packet in packets for byte in packet]
+
+        bus.port_handler.respond = respond
+    origin = window._origin_ns / 1e9
+    start = origin + math.ceil((clock.now-origin)/.1)*.1
+    # Align the retained five-peak/last-RAW shape with28. Earlier fixture readings
+    # remain genuine; these additional values/times are explicitly synthetic.
+    for offset in (.035523895, .125495254, .214515523, .323508181, .416603235):
+        # Each follower retains its different original slot origin. Genuine
+        #20ms acquisitions bridge these synthetic lift-aligned peak intervals.
+        while clock.now + .02 < start + offset - .002:
+            clock.sleep(.02)
+            teleop.read_groups(robot, ("Present_Temperature",), active=True)
+        clock.now = start + offset - .002
+        robot.left_bus.read_sequences["Present_Temperature", "lift_axis"] = [34]
+        operation.poll()
+        teleop.read_groups(robot, ("Present_Temperature",), active=True)
+    clock.now = start + .461495813 - .002
+    robot.left_bus.read_sequences["Present_Temperature", "lift_axis"] = [34]
+    operation.poll(defer_sample_log=True)
+    teleop.read_groups(robot, ("Present_Temperature",), active=True)
+    robot.config.use_degrees = False
+    robot._am1_routine_report = lambda line: None
+    originals = {key: state["window"] for key, state in robot._am1_teleop_temperatures.items()}
+
+    def write(data):
+        if options["block_sink"]:
+            sink_entered.set()
+            sink_gate.wait(2)
+        error = options.get("sink_error")
+        if error is not None:
+            sink_entered.set()
+            raise error
+        written.append(bytes(data))
+        return len(data)
+
+    writer = host.AM1RoutineRecordWriter(write=write)
+    def drain():
+        assert threading.get_ident() == owner_thread
+        events.append(("drain", len(operation._pending_samples)))
+        writer.raise_if_failed()
+        writer.emit_lift_samples(operation)
+        writer.raise_if_failed()
+    robot._am1_routine_lift_drain = drain
+    clock.now = start + .483630817
+    state = SimpleNamespace(robot=robot, clock=clock, operation=operation, window=window,
+                            start=start, events=events, attempts=attempts, options=options,
+                            writer=writer, written=written, sink_gate=sink_gate,
+                            sink_entered=sink_entered, originals=originals)
+    try:
+        yield state
+    finally:
+        sink_gate.set()
+        try:
+            writer.close()
+        except BaseException as error:
+            if error is not options.get("sink_error"):
+                raise
+
+
+@pytest.mark.parametrize("sides", [("left",), ("left", "right")])
+def test_observation_retry_entrypoint_preserves_both_role_slots_and_bounded_writer(
+    observation_retry_boundary, sides,
+):
+    import time
+    state = observation_retry_boundary
+    for side in sides:
+        state.options["failed_attempts"][side] = 3
+    state.options["block_sink"] = True
+    before_writes = len(state.robot.left_bus.events)
+    normalizations = []
+    normalize = state.robot._normalize_arm_feedback
+    def counted(bus, values):
+        normalizations.append(bus)
+        return normalize(bus, values)
+    state.robot._normalize_arm_feedback = counted
+    before = time.perf_counter()
+    result = state.robot.get_observation()
+    assert normalizations == [state.robot.left_bus, state.robot.right_bus]
+    context = state.robot._am1_arm_position_read_context
+    assert set(context) == {"left", "right"} and "arm_position_acquisitions" not in result
+    for side in ("left", "right"):
+        assert [row["outcome"] for row in context[side]["attempts"]] == (
+            ["communication_error"]*3+["ok"] if side in sides else ["ok"])
+        assert context[side]["normalization"]["outcome"] == "ok"
+    assert not any(row[1] == "write" for row in state.robot.left_bus.events[before_writes:] if len(row)>1)
+    assert time.perf_counter()-before < .5  # Main owner cannot wait for the deliberately blocked stdout worker.
+    assert not state.sink_gate.is_set()
+    assert state.attempts == {side: 4 if side in sides else 1 for side in ("left", "right")}
+    assert state.operation.temperature is state.window
+    assert state.operation.failure is None and result["lift_axis.height_mm"] == state.operation.height_mm
+    state.window.assert_fresh(state.clock.now)
+    for key, original in state.originals.items():
+        assert state.robot._am1_teleop_temperatures[key]["window"] is original
+        original.assert_fresh(state.clock.now)
+    drains = [row for row in state.events if row[0] == "drain"]
+    assert drains and max(row[1] for row in drains) <= 3
+    assert len(state.operation._pending_samples) <= 3
+    for side in sides:
+        sequence = [index for index, row in enumerate(state.events) if row[:2] == ("position_attempt", side)]
+        assert len(sequence) == 4
+        assert any(row[0] == "drain" for row in state.events[sequence[0]+1:sequence[-1]])
+
+
+def test_saved28_original_lift_slot_hole_remains_stale_and_latched():
+    origin = 174532.065592377
+    window = TemperatureWindow()
+    for slot in range(1701):  # Synthetic preceding bridge preserves the exact recorded origin.
+        window.update(34, origin+slot*.1)
+    for stamp in (174702.201116272, 174702.291087631, 174702.380107900,
+                  174702.489100558, 174702.582195612, 174702.627088190):
+        window.update(34, stamp)
+    with pytest.raises(RuntimeError, match="five-slot feedback window is stale") as failed:
+        window.update(34, 174702.824100602)
+    assert list(window.samples) == [(stamp, 34) for stamp in (
+        174702.291087631, 174702.380107900, 174702.489100558,
+        174702.582195612, 174702.824100602)]
+    assert window.samples[-1][0]-window.samples[0][0] == pytest.approx(.533012971)
+    assert window._origin_ns == round(origin*1e9) and window.outliers == 0
+    with pytest.raises(RuntimeError) as repeated:
+        window.assert_fresh(174702.825)
+    assert repeated.value is failed.value
+
+
+@pytest.mark.parametrize("stage", ["single_attempt", "normalization"])
+def test_observation_retry_cannot_repair_a_single_uninterrupted_stall(
+    observation_retry_boundary, monkeypatch, stage,
+):
+    state = observation_retry_boundary
+    if stage == "single_attempt":
+        state.options["success_s"] = .169358
+    else:
+        normalize = state.robot._normalize_arm_feedback
+        def delayed(bus, values):
+            if bus is state.robot.left_bus:
+                state.clock.sleep(.169358)
+            return normalize(bus, values)
+        monkeypatch.setattr(state.robot, "_normalize_arm_feedback", delayed)
+    with pytest.raises(RuntimeError, match="five-slot feedback window is stale") as caught:
+        state.robot.get_observation()
+    assert state.operation.failure is caught.value
+    assert state.attempts["left"] == 1
+    assert not any(row[0] == "drain" for row in state.events)
+    import json
+    note = next(row for row in caught.value.__notes__ if row.startswith("AM1 observation freshness context: "))
+    context = json.loads(note.split(": ", 1)[1])["arm_position_acquisitions"]
+    assert set(context) == {"left", "right"}
+    assert len(context["left"]["attempts"]) == 1
+    interval = (context["left"]["attempts"][0] if stage == "single_attempt" else
+                context["left"]["normalization"])
+    assert interval["completed_at_monotonic_s"]-interval["started_at_monotonic_s"] == pytest.approx(.169358)
+    assert interval["outcome"] == "ok"
+
+
+def test_observation_retry_exhaustion_still_has_exactly_four_attempts(observation_retry_boundary):
+    state = observation_retry_boundary
+    state.options["failed_attempts"]["left"] = 4
+    with pytest.raises(ConnectionError, match="Failed to sync read"):
+        state.robot.get_observation()
+    assert state.attempts == {"left": 4, "right": 0}
+    assert len(state.operation._pending_samples) <= 3
+    assert state.operation.failure is None
+    assert state.window.failure is None
+
+
+@pytest.mark.parametrize("fault", ["latched", "stale_raw", "status", "current", "device", "missing_drain", "log"])
+def test_observation_retry_does_not_retry_acquisition_or_logging_faults(
+    observation_retry_boundary, fault,
+):
+    state = observation_retry_boundary
+    state.options["failed_attempts"]["left"] = 3
+    primary = RuntimeError("retained lift fault")
+    expected = {"latched": "retained lift fault", "stale_raw": "stale", "status": "status",
+                "current": "current", "device": "grouped feedback", "missing_drain": "bounded routine",
+                "log": "synthetic existing writer failure"}[fault]
+    reads = len(state.operation.transport.group_reads)
+    if fault == "latched":
+        state.operation.failure = primary
+    elif fault == "stale_raw":
+        state.clock.sleep(.51)
+    elif fault in {"status", "current", "device"}:
+        register, value = {"status": ("Status", 4), "current": ("Present_Current", 400),
+                           "device": ("Present_Temperature", OSError("synthetic grouped device failure"))}[fault]
+        state.robot.left_bus.read_sequences[register, "lift_axis"] = [value]
+    elif fault == "missing_drain":
+        del state.robot._am1_routine_lift_drain
+    elif fault == "log":
+        primary = ConnectionError("synthetic existing writer failure")
+        state.options["sink_error"] = primary
+        state.writer.submit_line("synthetic writer-fault setup")
+        assert state.sink_entered.wait(1)
+    with pytest.raises((RuntimeError, ConnectionError), match=expected) as caught:
+        state.robot.get_observation()
+    assert state.attempts == {"left": 1, "right": 0}
+    if fault in {"latched", "log"}:
+        assert caught.value is primary
+    if fault in {"latched", "stale_raw", "missing_drain", "log"}:
+        assert len(state.operation.transport.group_reads) == reads
+
+
+@pytest.mark.parametrize("role", ["lift", "follower"])
+def test_observation_retry_preserves_third_distinct_high_slot(observation_retry_boundary, role):
+    state = observation_retry_boundary
+    for offset in (.505, .605):
+        state.clock.now = state.start+offset-.002
+        state.robot.left_bus.read_sequences["Present_Temperature", "lift_axis"] = [55 if role == "lift" else 34]
+        if role == "follower":
+            state.robot.left_bus.registers["Present_Temperature", "arm_left_1"] = 70
+        state.operation.poll()
+        teleop.read_groups(state.robot, ("Present_Temperature",), active=True)
+    high_window = (state.window if role == "lift" else
+                   state.robot._am1_teleop_temperatures["left", 1]["window"])
+    retained = [(stamp, value) for stamp, value in high_window.samples if value >= high_window.ceiling_c]
+    assert len(retained) == 2
+    state.robot.left_bus.read_sequences["Present_Temperature", "lift_axis"] = [55 if role == "lift" else 34]
+    state.clock.now = state.start+.65
+    state.options["failed_attempts"]["left"] = 3
+    with pytest.raises(RuntimeError, match="majority"):
+        state.robot.get_observation()
+    assert state.attempts == {"left": 1, "right": 0}
+    assert sum(value >= high_window.ceiling_c for _, value in high_window.samples) == 3
+    assert all(peak in high_window.samples for peak in retained)
+    assert high_window.failure is not None
+
+
+@pytest.mark.parametrize("fault", ["decode", "normalization"])
+def test_observation_retry_preserves_foreign_error_and_commits_no_failed_raw_map(
+    observation_retry_boundary, monkeypatch, fault,
+):
+    state = observation_retry_boundary
+    primary = ValueError("synthetic original "+fault+" fault")
+    raw = {}
+    calls = []
+    def fail(*args, **kwargs):
+        calls.append(True)
+        raise primary
+    if fault == "decode":
+        monkeypatch.setattr(state.robot.left_bus, "_decode_sign", fail)
+    else:
+        monkeypatch.setattr(state.robot, "_normalize_arm_feedback", fail)
+    with pytest.raises(ValueError) as caught:
+        state.robot._read_arm_positions(state.robot.left_bus, state.robot.left_arm_motors, raw_positions=raw)
+    assert caught.value is primary and len(calls) == 1 and raw == {}
+    import json
+    note = next(row for row in caught.value.__notes__ if row.startswith("AM1 arm position acquisition context: "))
+    context = json.loads(note.split(": ", 1)[1])
+    assert context["side"] == "left" and len(context["attempts"]) == 1
+    assert context["attempts"][0]["outcome"] == ("error" if fault == "decode" else "ok")
+    assert context["normalization"] is None if fault == "decode" else context["normalization"]["outcome"] == "error"
+    assert state.attempts == {"left": 1, "right": 0}
+    assert not any(row[0] == "drain" for row in state.events)
+
+
+@pytest.mark.parametrize("mode", ["am2", "legacy", "startup"])
+def test_observation_retry_leaves_other_roles_on_original_bus_retry_path(observation_retry_boundary, mode):
+    state = observation_retry_boundary
+    if mode == "am2":
+        state.robot.config.robot_model = "alohamini2"
+    elif mode == "legacy":
+        state.robot._am1_teleop_binding = None
+    else:
+        state.robot._am1_teleop_startup_temperature = True
+    state.options["failed_attempts"]["left"] = 3
+    before = list(state.window.samples)
+    raw = {}
+    values = state.robot._read_arm_positions(state.robot.left_bus, state.robot.left_arm_motors, raw_positions=raw)
+    assert len(values) == 6 and state.attempts == {"left": 4, "right": 0}
+    assert list(state.window.samples) == before
+    assert not any(row[0] == "drain" for row in state.events)
+
+
+def test_observation_retry_rechecks_lift_slot_after_follower_acquisition_work(observation_retry_boundary):
+    import math
+    state = observation_retry_boundary
+    origin = state.window._origin_ns/1e9
+    base = origin+math.ceil((state.clock.now-origin)/.1)*.1
+    state.robot._am1_routine_lift_drain()
+    for _side, bus, names in teleop._groups(state.robot):
+        for name in names:
+            bus.registers["Present_Temperature", name] = 32
+    for offset in (0, .1, .2, .3, .4):
+        state.clock.now = base+offset-.002
+        state.robot.left_bus.read_sequences["Present_Temperature", "lift_axis"] = [34]
+        state.operation.poll()
+        teleop.read_groups(state.robot, ("Present_Temperature",), active=True)
+    state.clock.now = base+.49-.002
+    state.robot.left_bus.read_sequences["Present_Temperature", "lift_axis"] = [34]
+    state.operation.poll(defer_sample_log=True)
+    assert state.window.samples[0][0] == pytest.approx(base, abs=1e-9)
+    state.options.update(attempt_s=.0001, follower_read_s=.002)
+    state.options["failed_attempts"]["left"] = 1
+    state.clock.now = base+.4989
+    # First failed PP returns at.499: lift still same slot, follower slot due.
+    # Two genuine2ms follower reads cross.5; a new actual lift slot must follow.
+    result = state.robot.get_observation()
+    assert result["lift_axis.height_mm"] == state.operation.height_mm
+    assert state.attempts == {"left": 2, "right": 1}
+    assert any(stamp >= base+.5 for stamp, _ in state.window.samples)
+    assert state.operation.failure is None
+    state.window.assert_fresh(state.clock.now)
+    for key, window in state.originals.items():
+        assert state.robot._am1_teleop_temperatures[key]["window"] is window
+        window.assert_fresh(state.clock.now)
+
+
+def test_observation_retry_refreshes_followers_after_lift_io_crosses_their_slot(
+    observation_retry_boundary, monkeypatch,
+):
+    state = observation_retry_boundary
+    read_group = state.operation.transport.read_group
+    def delayed_group(*args, **kwargs):
+        state.clock.sleep(.018)  # Plus the existing2ms reply remains inside40ms.
+        return read_group(*args, **kwargs)
+    monkeypatch.setattr(state.operation.transport, "read_group", delayed_group)
+    state.options["failed_attempts"]["left"] = 1
+    state.options["attempt_s"] = .0001
+    state.clock.now = state.start+.4999
+    before = {key: window._last_slot for key, window in state.originals.items()}
+    initial = state.start+.5
+    assert all((round(initial*1e9)-window._origin_ns)//100_000_000 == before[key]
+               for key, window in state.originals.items())
+    result = state.robot.get_observation()
+    assert result["lift_axis.height_mm"] == state.operation.height_mm
+    assert state.attempts == {"left": 2, "right": 1}
+    for key, window in state.originals.items():
+        assert window._last_slot > before[key]
+        assert window._last_sample_at > initial+.02
+        window.assert_fresh(state.clock.now)
+    state.window.assert_fresh(state.clock.now)
+
+
+def test_observation_retry_preserves_direct_lift_pending_input_refusal(observation_retry_boundary):
+    from lerobot.robots.alohamini.lift_motor_feedback import DirectSdkTransport
+    state = observation_retry_boundary
+    pending = bytearray([255, 255, 11])
+    serial = SimpleNamespace(in_waiting=len(pending),
+                             read=lambda count: bytes(pending[:count]),
+                             reset_input_buffer=lambda: pending.clear())
+    port = state.robot.left_bus.port_handler
+    port.ser = serial
+    direct = DirectSdkTransport("unused-existing-owner", port_handler=port,
+                                packet_handler=state.robot.left_bus.packet_handler)
+    # The real same-owner transport's guard runs before its request/capture.
+    state.operation.transport.read_group = direct.read_group
+    state.options["failed_attempts"]["left"] = 3
+    with pytest.raises(RuntimeError, match="Unexpected pending input"):
+        state.robot.get_observation()
+    assert state.attempts == {"left": 1, "right": 0}
+    assert not pending
+    assert state.operation.failure is not None
+
+
+def test_observation_retry_checks_new_queue_failure_after_bounded_drain(observation_retry_boundary):
+    state = observation_retry_boundary
+    state.options["block_sink"] = True
+    state.writer.submit_line("occupy worker")
+    assert state.sink_entered.wait(1)
+    for index in range(128):
+        assert state.writer.submit_line(str(index))
+    state.options["failed_attempts"]["left"] = 3
+    with pytest.raises(RuntimeError, match="queue full") as caught:
+        state.robot.get_observation()
+    state.options["sink_error"] = caught.value  # Preserve the expected original on fixture writer close.
+    assert state.attempts == {"left": 1, "right": 0}
+    with pytest.raises(RuntimeError) as first:
+        state.writer.raise_if_failed()
+    assert first.value is caught.value
+
+
+def test_observation_retry_refuses_follower_raw_expiry_during_lift_before_follower_io(
+    observation_retry_boundary, monkeypatch,
+):
+    state = observation_retry_boundary
+    for offset in (.5, .6, .7, .8):
+        state.clock.now = state.start+offset-.002
+        state.robot.left_bus.read_sequences["Present_Temperature", "lift_axis"] = [34]
+        state.operation.poll()
+    read_group = state.operation.transport.read_group
+    def delayed_group(*args, **kwargs):
+        state.clock.sleep(.018)
+        return read_group(*args, **kwargs)
+    monkeypatch.setattr(state.operation.transport, "read_group", delayed_group)
+    state.options["failed_attempts"]["left"] = 3
+    state.options["attempt_s"] = .0001
+    state.clock.now = state.start+.9499
+    before = len(state.events)
+    with pytest.raises(RuntimeError, match="stale"):
+        state.robot.get_observation()
+    assert state.attempts == {"left": 1, "right": 0}
+    assert not any(row[0] == "other_read" and row[2:4] == (63, 1)
+                   for row in state.events[before:])

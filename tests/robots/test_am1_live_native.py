@@ -2119,3 +2119,72 @@ def test_real_m_host_defines_its_own_expiry_type_before_hardware(monkeypatch):
     assert entrypoint.AM1LiveInputExpired.__module__ == "__main__"
     assert entrypoint.AM1LiveInputExpired is not host.AM1LiveInputExpired
     assert not isinstance(entrypoint.AM1LiveInputExpired(), host.AM1LiveInputExpired)
+
+
+@pytest.mark.parametrize("previous", [False, True])
+@pytest.mark.parametrize("failed", [False, True])
+def test_teleop_host_retry_drain_lifetime_ends_before_real_cleanup_order(monkeypatch, previous, failed):
+    from types import SimpleNamespace
+
+    events, identity = [], binding()
+    primary = OSError("synthetic existing writer failure")
+    saved = object()
+    operation = SimpleNamespace(last_record={}, poll=lambda **kwargs: None)
+    obj = SimpleNamespace(is_connected=True, config=SimpleNamespace(robot_model="alohamini1"),
+                          _lift_operation=operation, _refresh_am1_startup_lift_feedback=lambda: None,
+                          _am1_teleop_settings={"left": {}, "right": {}},
+                          _am1_teleop_active_settings={"left": {}, "right": {}},
+                          _am1_teleop_rest_evidence=[])
+    if previous:
+        obj._am1_routine_lift_drain = saved
+    def disconnect(**kwargs):
+        assert getattr(obj, "_am1_routine_lift_drain", saved) is saved
+        assert previous or not hasattr(obj, "_am1_routine_lift_drain")
+        events.append("motor-zero-off")
+        obj.is_connected = False
+    obj.disconnect = disconnect
+    evidence = SimpleNamespace(enabled=True, enrich_fault=lambda *args: None,
+                               emit_pending_fault=lambda *args: events.append("fault-record"))
+    class Writer:
+        count = 0
+        ready_to_fail = False
+        def submit(self, prefix, record):
+            self.count += 1
+            assert callable(obj._am1_routine_lift_drain)
+            start = len(events)
+            obj._am1_routine_lift_drain()
+            assert events[start:] == ["writer-check", "lift-submit", "writer-check"]
+            self.ready_to_fail = self.count == 3
+        def submit_line(self, *args, **kwargs):
+            pass
+        def emit_selected(self, record):
+            pass
+        def emit_lift_samples(self, current):
+            assert current is operation
+            events.append("lift-submit")
+        def raise_if_failed(self):
+            events.append("writer-check")
+            if failed and self.ready_to_fail:
+                raise primary
+        def close(self, **kwargs):
+            events.append("writer-close")
+    monkeypatch.setattr(host, "AM1RoutineRecordWriter", Writer)
+    monkeypatch.setattr(host, "AM1SelectedJointEvidence", lambda **kwargs: evidence)
+    monkeypatch.setattr(host, "AlohaMini", lambda config: obj)
+    monkeypatch.setattr(host, "connect_robot", lambda *args, **kwargs: None)
+    monkeypatch.setattr(host, "visible_control_binding", lambda args: {**identity, "recipe": "physical-live-teleop"})
+    monkeypatch.setattr(host, "AM1LocalControl", lambda **kwargs: SimpleNamespace(
+        live=True, state="stopped", check_live=lambda robot: False))
+    monkeypatch.setattr(host, "AlohaMiniHost", lambda config: SimpleNamespace(
+        watchdog_timeout_ms=1000, connection_time_s=.1, max_loop_freq_hz=30,
+        disconnect=lambda: events.append("socket-close")))
+    args = host.make_parser().parse_args(["--no_cameras", "--skip_lift_home"])
+    args.am1_run_id, args.am1_host_incarnation = identity["run_id"], identity["host_incarnation"]
+    if failed:
+        with pytest.raises(OSError) as caught:
+            host._run_host(args)
+        assert caught.value is primary
+    else:
+        host._run_host(args)
+    assert events.index("motor-zero-off") < events.index("socket-close") < events.index("writer-close")
+    assert getattr(obj, "_am1_routine_lift_drain", saved) is saved

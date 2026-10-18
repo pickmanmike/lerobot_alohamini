@@ -50,6 +50,8 @@ Recovery inputs are retained privately in `.cache/am1-knowledge-reuse-18/`: owne
 - **Acquisition cadence:** Combined25 exposes moving relief sleeping100ms plus read/callback overhead, skipping an anchored temperature slot before the later verification hook. Correct normal operation by reusing its existing50ms feedback cadence; retain standalone100ms, the same monitor/history/original times and strict0.5s age bound. The reviewed two-file correction passes318 affected checks/scoped lint and all ten Stage23 stopped/idle phases; physical qualification remains separate. Keep actual failed evidence distinct from synthetic phase-alignment checks.
 - **Reopen:** demonstrated meaningful displacement, load/status fault or failure of that specific readiness model. Do not revive exact first+100 exceptions, extended bottom heating, ID/phase/gain commissioning or obsolete failed procedures.
 
+- **Observation retry boundary:** Combined28 preserves a197.012ms true lift gap during169.358ms aggregate left-arm observation, missing an anchored slot. Generic position reads permit four uninterrupted attempts; actual retries are unmeasured. Review role-aware due acquisition between bounded retries without hiding single long reads, stale history, residual bytes or hard faults.
+
 ## IO-01: optional output cannot block hardware work
 
 - **Accepted / scope:** terminal display, routine logs, media encoding/decoding and browser waits stay outside timing-sensitive motor work. Preserve required receipts/faults, finite drain, cleanup ordering and the first cause if reporting also fails.
@@ -75,6 +77,8 @@ Recovery inputs are retained privately in `.cache/am1-knowledge-reuse-18/`: owne
 - **Result/source:** [Packet16][p16] Combined13 exposed a fourth-ordinary-pause PC cap with Core recovery count 0; `0a458a900aae2600be4099465920addda92aecf6` removes that extra cap. Published `2647b77c` corrects HTTP 503 unknown Start classification; a later refusal cannot erase earlier ambiguity, and matching accepted Core identity establishes ownership separately from native effect/cleanup.
 - **Implementation/tests/status:** [one leader adapter](../../tools/am1_leader_adapter.py), [real-Core/HTTP/pause tests](../../tests/robots/test_am1_leader_adapter.py). PC fixes have recorded offline checks, no Pi restaging for these changes; full combined qualification pending. Combined18 exposed a distinct pre-Live entrypoint gap: WSS close exits admission into ordinary Stop instead of reattaching to the same accepted operation. Its initiating close cause is unproved. The independently reviewed correction permits one classified pre-Live reattachment, retaining original ownership/admission times through the actual Live handoff and the original ceiling, with no new Start/input or deadline reset. It passed 113 adapter checks and 33 exact-source boundary checks; the existing Live timing path remains unchanged.
 - **Reopen:** a concrete ambiguous admission, unqualified ACK, wrong same-run binding, replay or violated native episode/deadline limit. Count observed pauses honestly; do not relabel failed attempts qualified recovery.
+
+- **Reported versus opened episodes:** Combined28 producer-qualified count0 is distinct from final raw owner count1: a feedback-loss episode opened and the task faulted before qualification/ACK. Preserve both scopes, total episode budget and original deadline; never infer closure from an earlier cached report.
 
 ## COMM-03: an empty poll is not an expired request
 
