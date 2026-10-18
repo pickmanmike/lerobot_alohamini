@@ -297,3 +297,91 @@ def test_camera_script_loads_shared_encoder_without_gateway_packages_or_working_
         env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
     )
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("case", ["fresh", "delayed", "stale", "nonadvancing", "foreign"])
+def test_selected_view_progress_entrypoint_records_real_phase_times_without_renewing_proof(tmp_path, monkeypatch, case):
+    from types import SimpleNamespace
+    from tests.robots.test_am1_live_teleop_executor import authority_lane
+    from tools import am1_session_service as service
+
+    a, e, _ = authority_lane(tmp_path)
+    clock = SimpleNamespace(now=10.)
+    a.clock = lambda: clock.now
+    monkeypatch.setattr(service.time, "monotonic", lambda: clock.now)
+    proxy = object.__new__(module().OnboardMediaProxy)
+    proxy.clock, proxy.web = lambda: clock.now, web
+    proxy.viewers = {"viewer-a": {"frames": 0, "media_time": -1}}
+    report = {"owner_generation": "owner", "cameras": {"chest": {
+        "state": "stale" if case == "stale" else "fresh", "configured": True, "sequence": 11,
+        "capture_generation": "capture", "arrived_at_monotonic_s": 9.98}},
+        "video": {"role": "chest", "encode_generation": "encode", "capture_generation": "capture", "state": "running"}}
+    async def status():
+        clock.now += .02
+        return report
+    proxy.status = status
+    commands = []
+    class IPC:
+        async def request(self, command, device):
+            commands.append(command)
+            assert device == "gateway-view"
+            if command["op"] == "snapshot":
+                clock.now += .04
+                return {"snapshot": {"run": {"run_id": e.run_id, "recipe": "physical-live-teleop"}}}
+            clock.now += .5 if case == "delayed" else .03
+            with a.mutex:
+                return a._handle(command, device)
+    proxy.ipc = IPC()
+    gateway = object.__new__(service.Gateway)
+    gateway.onboard = proxy
+    body = dict(role="chest", owner_generation="owner", capture_generation="capture",
+                encode_generation="foreign" if case == "foreign" else "encode", decoded_frames=3, media_time=.3)
+    class Request(dict):
+        path = "/api/onboard/progress"
+        async def read(self):
+            clock.now += .01
+            return json.dumps(body).encode()
+    async def scenario():
+        request = Request(device={"id": "viewer-a"})
+        if case == "nonadvancing":
+            await gateway.onboard_request(request)
+            before = len(commands)
+            clock.now = 10.49
+        else:
+            before = 0
+        received = clock.now
+        response = await gateway.onboard_request(request)
+        result = json.loads(response.body)
+        assert result["accepted"] is (case == "fresh")
+        timing = result["view_delivery"]
+        assert timing["request_received_at_monotonic_s"] == received
+        assert timing["request_body_completed_at_monotonic_s"] == pytest.approx(received + .01)
+        assert timing["status_started_at_monotonic_s"] == pytest.approx(received + .01)
+        assert timing["status_completed_at_monotonic_s"] == pytest.approx(received + .03)
+        assert timing["source_arrived_at_monotonic_s"] == 9.98
+        assert timing["decoded_frames"] == 3 and timing["media_time"] == .3 and timing["source_sequence"] == 11
+        assert timing["owner_enqueued_at_monotonic_s"] is None
+        assert timing["http_response_ready_at_monotonic_s"] == clock.now
+        if case in {"foreign", "nonadvancing"}:
+            assert len(commands) == before
+            assert timing["owner_snapshot_started_at_monotonic_s"] is None
+            assert timing["core"] is None
+        else:
+            assert timing["owner_snapshot_started_at_monotonic_s"] == pytest.approx(received + .03)
+            assert timing["owner_snapshot_completed_at_monotonic_s"] == pytest.approx(received + .07)
+            assert timing["owner_progress_started_at_monotonic_s"] == pytest.approx(received + .07)
+            assert timing["owner_progress_completed_at_monotonic_s"] == clock.now
+            assert timing["core"]["core_started_at_monotonic_s"] == clock.now
+            assert timing["original_floor_at_monotonic_s"] == (received if case == "stale" else 9.98)
+            if case == "fresh":
+                assert result["required_view"]["qualified"]
+                assert timing["core"]["qualified_until_monotonic_s"] == 10.48
+            elif case == "delayed":
+                assert result["reason"] == "selected-view original receipt or progress invalid"
+            else:
+                assert result["reason"] == "selected source is not fresh"
+    try:
+        asyncio.run(scenario())
+    finally:
+        a.run = None
+        a.close()

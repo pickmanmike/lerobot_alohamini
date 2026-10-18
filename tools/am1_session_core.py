@@ -1275,15 +1275,28 @@ class SessionAuthority:
             or command.get("role") not in {"forward", "backward", "chest", "wrist_left", "wrist_right"}):
             return self._refuse("internal current selected-view evidence required")
         now = self.clock()
+
+        def receipt(result):
+            # Observed under the existing Core mutex. Request enqueue is not
+            # visible here; neither this receipt nor its clocks qualify a view.
+            result["view_timing"] = {
+                "core_started_at_monotonic_s": now,
+                "core_completed_at_monotonic_s": self.clock(),
+                "core_accepted_at_monotonic_s": now if result.get("accepted") is True else None,
+                "original_floor_at_monotonic_s": command.get("received_at_monotonic_s"),
+                "qualified_until_monotonic_s": (self._teleop_view or {}).get("qualified_until"),
+            }
+            return result
+
         for key in ("owner_generation", "capture_generation", "encode_generation"):
             if type(command[key]) is not str or not 0 < len(command[key]) <= 128:
-                return self._refuse("selected-view source generation invalid")
+                return receipt(self._refuse("selected-view source generation invalid"))
         if (type(command["decoded_frames"]) is not int or command["decoded_frames"] < 0
             or type(command["source_sequence"]) is not int or command["source_sequence"] < 0
             or not teleop_number(command["media_time"]) or command["media_time"] < 0
             or type(command["source_fresh"]) is not bool or not teleop_number(command["received_at_monotonic_s"])
             or not 0 <= now - command["received_at_monotonic_s"] < .5):
-            return self._refuse("selected-view original receipt or progress invalid")
+            return receipt(self._refuse("selected-view original receipt or progress invalid"))
         old = self._teleop_view or {}
         identity = ("run_id", "role", "owner_generation", "capture_generation", "encode_generation")
         changed = any(old.get(k) != command[k] for k in identity)
@@ -1296,8 +1309,8 @@ class SessionAuthority:
             self._teleop_view = dict(command, qualified_until=command["received_at_monotonic_s"] + .5)
         if not self._teleop_view_qualified() and self.run["status"] in {"running", "resuming"}:
             self._pause_live_input("required_view_expired")
-        return {"accepted": True, "status": "view_progress", "effect_admitted": False,
-                "required_view": self._teleop_view_status()}
+        return receipt({"accepted": True, "status": "view_progress", "effect_admitted": False,
+                        "required_view": self._teleop_view_status()})
 
     def _clear_input(self, *, preserve_rearm=False):
         if not preserve_rearm:

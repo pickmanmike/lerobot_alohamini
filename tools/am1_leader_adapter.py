@@ -807,10 +807,10 @@ class SessionClient:
         }, allow_nan=False))
         try:
             if qualification_ceiling is None:
-                await self.command(dict(op="release_input", **identity))
+                released = await self.command(dict(op="release_input", **identity))
             else:
                 budget = phase_remaining()
-                await asyncio.wait_for(self.command(dict(op="release_input", **identity)), budget)
+                released = await asyncio.wait_for(self.command(dict(op="release_input", **identity)), budget)
         except (ConnectionError, TimeoutError) as error:
             if connect_identity is not None:
                 # Only this empty release follows a known connect ACK. Its
@@ -841,16 +841,35 @@ class SessionClient:
 
         if phase_ceiling is None:
             phase_ceiling = time.monotonic() + 8
-        first_refusal, refused_identity, refused_event, refused_state = None, None, None, None
+        first_refusal, refused_identity, refused_event, refused_state, refused_context = None, None, None, None, None
+
+        def record_qualification(phase, current):
+            if refusal_record is None:
+                return
+            try:
+                detail = {"event": "resume_qualification_" + phase,
+                          "proof_source": "pc_sent_snapshot" if phase == "refused" else "authenticated_owner_snapshot",
+                          "identity": refused_identity, "operation_id": refused_context["operation_id"],
+                          "receipt": refused_context["receipt"], "timing": refused_context["timing"],
+                          "qualification": _paused_binding_diagnostic(
+                              refused_state, current, refused_identity, refused_event, True,
+                              self.connection, refused_state["run"]["remaining_s"], phase_ceiling)}
+                if len(json.dumps(detail, allow_nan=False).encode("utf-8")) > 8192:
+                    raise ValueError("bounded nonadmitted Resume proof required")
+                refusal_record(detail)
+            except (Exception, asyncio.CancelledError) as reporting_error:
+                raise first_refusal from reporting_error
 
         try:
             while True:
                 await self.wait(qualified, phase_remaining())
                 if first_refusal is not None:
-                    # Only the authenticated owner can prove that view progress
-                    # advanced after Core explicitly refused the expired view.
+                    # Only the authenticated owner can prove current held/view
+                    # qualification after an explicitly nonadmitted Resume.
                     budget = phase_remaining()
                     self.snapshot = (await asyncio.wait_for(self.get("state"), budget))["snapshot"]
+                    if first_refusal.response.get("reason") == "qualified release/alignment required":
+                        record_qualification("observed", self.snapshot)
                     if check:
                         check(self.snapshot)
                     run, evidence, live = self.snapshot["run"], self.snapshot.get("evidence", {}), _live(self.snapshot)
@@ -904,11 +923,19 @@ class SessionClient:
                     resumed = await asyncio.wait_for(self.command(command), budget)
                     break
                 except CommandRefusedError as refusal:
-                    if refusal.response.get("uncertain", False) is not False or not all(
+                    reason = refusal.response.get("reason")
+                    if (reason not in ("current required selected view must advance before Resume", "qualified release/alignment required")
+                        or refusal.response.get("uncertain", False) is not False or not all(
                             type(refusal.response.get(k)) is type(v) and refusal.response[k] == v
                                for k, v in {"accepted": False, "status": "refused", "effect_admitted": False,
-                                            "reason": "current required selected view must advance before Resume"}.items()):
+                                            "reason": reason}.items())):
                         raise
+                    if reason == "qualified release/alignment required" and (
+                        release_context is None or not isinstance(released, dict)
+                        or any(type(released.get(k)) is not type(v) or released[k] != v for k, v in
+                               {"accepted": True, "status": "released", "effect_admitted": False}.items())
+                    ):
+                        raise  # Only this known connect + empty-release phase is eligible.
                     first = first_refusal is None
                     if first:
                         first_refusal = refusal
@@ -931,10 +958,16 @@ class SessionClient:
                     context = {"identity": refused_identity, "pause_event": refused_event,
                                "operation_id": command["operation_id"], "receipt": refusal.response,
                                "timing": refusal.timing, "remaining_s": phase_remaining()}
-                    if first:
-                        first_refusal.resume_view_context = context
-                    if refusal_record:
-                        refusal_record(dict(event="resume_view_refused", **context))
+                    refused_context = context
+                    if reason == "qualified release/alignment required":
+                        if first:
+                            first_refusal.resume_qualification_context = context
+                        record_qualification("refused", sent_state)
+                    else:
+                        if first:
+                            first_refusal.resume_view_context = context
+                        if refusal_record:
+                            refusal_record(dict(event="resume_view_refused", **context))
         except (Exception, asyncio.CancelledError) as error:
             if first_refusal is not None and error is not first_refusal:
                 raise first_refusal from error
@@ -944,7 +977,9 @@ class SessionClient:
         try:
             await self.wait(lambda: SessionClient._resume_active(
                 self, identity, prior_event, pi_lower_bound, resumed, check), 5)
-        except _ResumePausedError:
+        except _ResumePausedError as outcome:
+            if first_refusal is not None and first_refusal.response.get("reason") == "qualified release/alignment required":
+                outcome.transport_error = first_refusal  # Preserve it through the existing +2 continuation.
             raise  # The positively accepted Resume uses the unchanged +2 path.
         except (Exception, asyncio.CancelledError) as error:
             if first_refusal is not None:

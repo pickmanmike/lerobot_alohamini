@@ -5,7 +5,7 @@ globalThis.AM1OnboardView=class {
     this.video=video;this.options=options;this.clock=options.clock||(()=>performance.now());
     this.pc=null;this.epoch=0;this.binding=null;this.source=null;this.sourceAt=0;
     this.decodedAt=null;this.frames=0;this.mediaTime=-1;this.callback=null;
-    this.reporting=false;this.timer=null;this.connecting=false;this.error=null;
+    this.reporting=false;this.timer=null;this.connecting=false;this.error=null;this.progressReceipt=null;
   }
   updateSource(report,at=this.clock()) {this.source=report;this.sourceAt=at;}
   health() {
@@ -68,9 +68,19 @@ globalThis.AM1OnboardView=class {
     this.reporting=true;const epoch=this.epoch;
     const body={...this.binding,decoded_frames:this.frames,media_time:this.mediaTime};
     try {
-      await fetch(this.options.progress,{method:"POST",credentials:"same-origin",redirect:"error",
+      const response=await fetch(this.options.progress,{method:"POST",credentials:"same-origin",redirect:"error",
         headers:{"Content-Type":"application/json","X-AM1-CSRF":this.options.csrf?.()||""},
         body:JSON.stringify(body),signal:AbortSignal.timeout(750)});
+      const length=response.headers.get("Content-Length"),mime=response.headers.get("Content-Type");
+      if(!response.ok||!/^\d{1,5}$/.test(length||"")||Number(length)>8192||
+         typeof mime!=="string"||mime.split(";")[0]!=="application/json")throw Error("Invalid view receipt");
+      const text=await response.text();
+      if(text.length>8192)throw Error("Oversized view receipt");
+      const receipt=JSON.parse(text),allowed=["accepted","status","reason","effect_admitted","required_view","view_delivery"];
+      if(!receipt||typeof receipt!=="object"||Array.isArray(receipt)||typeof receipt.accepted!=="boolean"||
+         Object.keys(receipt).some(key=>!allowed.includes(key)))throw Error("Invalid logical view receipt");
+      // A receipt records delivery only; health still uses the original source and decoder clocks.
+      if(epoch===this.epoch)this.progressReceipt=receipt;
     } catch {if(epoch===this.epoch)this.error="View progress delivery unavailable";}
     finally {this.reporting=false;}
   }
@@ -78,6 +88,6 @@ globalThis.AM1OnboardView=class {
     this.epoch++;clearInterval(this.timer);this.timer=null;
     if(this.callback!==null)this.video.cancelVideoFrameCallback?.(this.callback);
     this.callback=null;this.pc?.close();this.pc=null;this.video.srcObject=null;
-    this.binding=null;this.decodedAt=null;this.frames=0;this.mediaTime=-1;this.connecting=false;
+    this.binding=null;this.decodedAt=null;this.frames=0;this.mediaTime=-1;this.connecting=false;this.progressReceipt=null;
   }
 };

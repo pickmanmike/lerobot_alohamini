@@ -1382,3 +1382,37 @@ def test_real_core_terminal_thermal_ack_allows_only_new_startup_after_known_clea
         a.close()
         if e.worker:
             e.worker.join(2)
+
+
+@pytest.mark.parametrize("case", ["fresh", "delayed", "stale", "nonadvancing"])
+def test_selected_view_core_receipt_preserves_original_floor_and_reports_actual_policy_clock(tmp_path, case):
+    a, e, _ = authority_lane(tmp_path)
+    now = [10.]
+    a.clock = lambda: now[0]
+    command = dict(op="view_progress", run_id=e.run_id, role="chest", owner_generation="owner",
+                   capture_generation="capture", encode_generation="encode", decoded_frames=3,
+                   media_time=.3, source_sequence=11, source_fresh=True, received_at_monotonic_s=9.98)
+    try:
+        if case == "delayed":
+            now[0] = 10.49
+        elif case == "stale":
+            command["source_fresh"] = False
+        elif case == "nonadvancing":
+            assert a._handle(command, "gateway-view")["required_view"]["qualified"]
+            now[0] = 10.49
+            command["received_at_monotonic_s"] = 10.2  # A new HTTP receipt cannot renew old decoded counters.
+        result = a._handle(command, "gateway-view")
+        assert result["accepted"] is (case != "delayed")
+        if case != "delayed":
+            assert result["required_view"]["qualified"] is (case == "fresh")
+        timing = result["view_timing"]
+        assert timing["core_started_at_monotonic_s"] == now[0]
+        assert timing["core_completed_at_monotonic_s"] == now[0]
+        assert timing["original_floor_at_monotonic_s"] == command["received_at_monotonic_s"]
+        assert timing["core_accepted_at_monotonic_s"] == (None if case == "delayed" else now[0])
+        assert timing["qualified_until_monotonic_s"] == (
+            10.48 if case in {"fresh", "nonadvancing"} else 0. if case == "stale" else None)
+        assert command["received_at_monotonic_s"] == (10.2 if case == "nonadvancing" else 9.98)
+    finally:
+        a.run = None
+        a.close()

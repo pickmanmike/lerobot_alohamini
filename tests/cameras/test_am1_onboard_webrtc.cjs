@@ -3,7 +3,7 @@ const test=require("node:test"),assert=require("node:assert/strict"),fs=require(
 function fixture() {
   const file=path.resolve(__dirname,"../../tools/am1_camera/webrtc.js");
   assert.ok(fs.existsSync(file),"bounded native onboard WebRTC player missing");
-  let now=0;const callbacks=[],requests=[];
+  let now=0,progressResponse=null;const callbacks=[],requests=[];
   const video={srcObject:null,requestVideoFrameCallback(fn){callbacks.push(fn);return callbacks.length;},cancelVideoFrameCallback(){},play:async()=>{}};
   class Peer {
     constructor(){this.iceGatheringState="complete";this.connectionState="connected";}
@@ -13,7 +13,7 @@ function fixture() {
   const ids={owner_generation:"owner-a",capture_generation:"capture-a",encode_generation:"encode-a"};
   const context=vm.createContext({RTCPeerConnection:Peer,MediaStream:class {},performance:{now:()=>now},
     setInterval:()=>1,clearInterval(){},setTimeout,clearTimeout,AbortSignal,
-    fetch:async(url,options)=>{requests.push({url,...options});return {ok:true,headers:{get:name=>({
+    fetch:async(url,options)=>{requests.push({url,...options});if(url.endsWith("/progress")&&progressResponse)return progressResponse;return {ok:true,headers:{get:name=>({
       "X-Camera-Owner-Generation":ids.owner_generation,"X-Camera-Capture-Generation":ids.capture_generation,
       "X-Camera-Encode-Generation":ids.encode_generation}[name]||null)},text:async()=>"v=0\r\n",json:async()=>({accepted:true})};}});
   vm.runInContext(fs.readFileSync(file,"utf8"),context);
@@ -22,7 +22,7 @@ function fixture() {
   function source(role="chest") {view.updateSource({owner_generation:ids.owner_generation,
     cameras:{[role]:{configured:true,state:"fresh",age_ms:0,sequence:12,capture_generation:ids.capture_generation}},
     video:{role,state:"running",encode_generation:ids.encode_generation,capture_generation:ids.capture_generation}},now);}
-  return {view,video,callbacks,requests,ids,source,advance:value=>{now=value;}};
+  return {view,video,callbacks,requests,ids,source,advance:value=>{now=value;},setProgressResponse:value=>{progressResponse=value;}};
 }
 test("a connected video and ontrack never qualify an undecoded primary view",async()=>{
   const p=fixture();await p.view.start("chest");p.source();p.view.pc.ontrack({track:{}});
@@ -106,4 +106,41 @@ test("loaded camera page selects WebRTC and switches roles without any control r
   assert.ok(!requests.some(request=>request.path.includes("stream.mjpeg")||request.path.includes("/mjpeg/")));
   assert.deepEqual(errors,[]);
   await page.close();
+});
+
+
+test("view progress consumes the bounded logical body before releasing its one in-flight slot",async()=>{
+  const p=fixture();await p.view.start("chest");p.source();
+  p.callbacks.shift()(0,{presentedFrames:1,mediaTime:.1});
+  let release,read=false;
+  const body=JSON.stringify({accepted:true,status:"view_progress",effect_admitted:false,
+    required_view:{required:true,qualified:true,role:"chest",cause:null},view_delivery:{version:1}});
+  p.view.options.progress="/api/onboard/progress";
+  // Replace only HTTP transport; the product reporting state machine remains real.
+  const response={ok:true,headers:{get:name=>name.toLowerCase()==="content-type"?"application/json":String(body.length)},
+    text:()=>{read=true;return new Promise(resolve=>{release=()=>resolve(body);});}};
+  p.setProgressResponse(response);
+  const pending=p.view.report();await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(read,true);assert.equal(p.view.reporting,true);assert.equal(p.view.progressReceipt,null);
+  release();await pending;
+  assert.equal(p.view.reporting,false);assert.equal(p.view.progressReceipt.accepted,true);
+  assert.equal(p.view.progressReceipt.required_view.qualified,true);
+  assert.equal(p.view.health().fresh,true);
+  await p.view.stop();assert.equal(p.view.progressReceipt,null);
+});
+
+for(const mode of ["refused","malformed","oversized","http-error","stale-epoch"])test("view progress receipt contrast: "+mode,async()=>{
+  const p=fixture();await p.view.start("chest");p.source();
+  p.callbacks.shift()(0,{presentedFrames:1,mediaTime:.1});
+  let text=mode==="malformed"?"not-json":JSON.stringify({accepted:false,reason:"decoded video has not advanced"});
+  const response={ok:mode!=="http-error",headers:{get:name=>name.toLowerCase()==="content-type"?"application/json":mode==="oversized"?"8193":String(text.length)},
+    text:async()=>{if(mode==="stale-epoch")await p.view.stop();return text;}};
+  p.setProgressResponse(response);await p.view.report();
+  if(mode==="refused"){
+    assert.equal(p.view.progressReceipt.accepted,false);
+    assert.equal(p.view.progressReceipt.reason,"decoded video has not advanced");
+    assert.equal(p.view.health().fresh,true); // A response cannot fabricate or clear original decode/source clocks.
+    p.advance(501);assert.equal(p.view.health().fresh,false);
+  }else assert.equal(p.view.progressReceipt,null);
+  assert.equal(p.view.reporting,false);await p.view.stop();
 });

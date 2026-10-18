@@ -393,8 +393,13 @@ class Gateway:
             return web.json_response(await self.onboard.status(), headers={"Cache-Control": "no-store"})
         if request.path == "/api/onboard/progress":
             body = strict_json(await asyncio.wait_for(request.read(), 1))
-            return web.json_response(await self.onboard.progress(request["device"]["id"], body, receipt),
-                                     headers={"Cache-Control": "no-store"})
+            body_completed = time.monotonic()
+            result = await self.onboard.progress(request["device"]["id"], body, receipt)
+            delivery = result.get("view_delivery")
+            if isinstance(delivery, dict):
+                delivery["request_body_completed_at_monotonic_s"] = body_completed
+                delivery["http_response_ready_at_monotonic_s"] = time.monotonic()
+            return web.json_response(result, headers={"Cache-Control": "no-store"})
         role = request.match_info["role"]
         if request.path.startswith("/api/onboard/mjpeg/"):
             iterator = self.onboard.mjpeg(role)

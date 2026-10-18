@@ -357,11 +357,17 @@ class OnboardMediaProxy:
         finally:
             self.streams.release()
 
-    async def owner_progress(self, report, role, frames, media_time, receipt, *, qualified):
+    async def owner_progress(self, report, role, frames, media_time, receipt, *, qualified, delivery=None):
+        if delivery is not None:
+            delivery["owner_snapshot_started_at_monotonic_s"] = self.clock()
         result = await asyncio.wait_for(self.ipc.request({"op": "snapshot"}, "gateway-view"), 1)
+        if delivery is not None:
+            delivery["owner_snapshot_completed_at_monotonic_s"] = self.clock()
         run = result.get("snapshot", {}).get("run") or {}
         if run.get("recipe") != "physical-live-teleop":
             return {"accepted": False, "reason": "no required interactive view"}
+        if delivery is not None:
+            delivery["run_id"] = run["run_id"]
         source, video = report.get("cameras", {}).get(role, {}), report.get("video", {})
         arrived = source.get("arrived_at_monotonic_s")
         original = (
@@ -385,7 +391,17 @@ class OnboardMediaProxy:
             # Same-Pi monotonic floor retains both original source and decode receipt expiry.
             "received_at_monotonic_s": original,
         }
-        return await asyncio.wait_for(self.ipc.request(command, "gateway-view"), 1)
+        if delivery is not None:
+            delivery["original_floor_at_monotonic_s"] = original
+            delivery["owner_progress_started_at_monotonic_s"] = self.clock()
+        result = await asyncio.wait_for(self.ipc.request(command, "gateway-view"), 1)
+        if delivery is not None:
+            delivery["owner_progress_completed_at_monotonic_s"] = self.clock()
+            result = dict(result)
+            delivery["core"] = result.pop("view_timing", None)
+            delivery["owner_result"] = {key: result[key] for key in
+                                       ("accepted", "status", "reason", "required_view") if key in result}
+        return result
 
     async def offer(self, role, sdp, device):
         self.role(role)
@@ -445,11 +461,32 @@ class OnboardMediaProxy:
             )
         ):
             raise self.web.HTTPBadRequest(reason="bounded decoded view progress required")
+        delivery = {
+            "version": 1, "role": role, "run_id": None,
+            "decoded_frames": frames, "media_time": media_time, "source_sequence": None,
+            "request_received_at_monotonic_s": received_at,
+            "request_body_completed_at_monotonic_s": None,
+            "status_started_at_monotonic_s": None, "status_completed_at_monotonic_s": None,
+            "source_arrived_at_monotonic_s": None, "original_floor_at_monotonic_s": None,
+            "owner_snapshot_started_at_monotonic_s": None, "owner_snapshot_completed_at_monotonic_s": None,
+            "owner_progress_started_at_monotonic_s": None, "owner_progress_completed_at_monotonic_s": None,
+            "owner_enqueued_at_monotonic_s": None,  # Not observed by this API.
+            "core": None, "owner_result": None, "http_response_ready_at_monotonic_s": None,
+        }
+        def receipt(result):
+            return {**result, "view_delivery": delivery}
+
         viewer = self.viewers.get(device)
         if viewer is None:
-            return {"accepted": False, "reason": "current view attachment required"}
+            return receipt({"accepted": False, "reason": "current view attachment required"})
+        delivery["status_started_at_monotonic_s"] = self.clock()
         report = await self.status()
+        delivery["status_completed_at_monotonic_s"] = self.clock()
         source, video = report.get("cameras", {}).get(role, {}), report.get("video", {})
+        arrived = source.get("arrived_at_monotonic_s")
+        delivery["source_arrived_at_monotonic_s"] = (
+            arrived if type(arrived) in (int, float) and math.isfinite(arrived) else None)
+        delivery["source_sequence"] = source.get("sequence")
         identities = (
             body["owner_generation"] == report.get("owner_generation")
             and body["capture_generation"] == source.get("capture_generation")
@@ -458,10 +495,10 @@ class OnboardMediaProxy:
             and video.get("role") == role
         )
         if not identities:
-            return {"accepted": False, "reason": "view source generation changed"}
+            return receipt({"accepted": False, "reason": "view source generation changed"})
         advanced = frames > viewer["frames"] and media_time > viewer["media_time"]
         if not advanced:
-            return {"accepted": False, "reason": "decoded video has not advanced"}
+            return receipt({"accepted": False, "reason": "decoded video has not advanced"})
         viewer.update(frames=frames, media_time=media_time, at=self.clock())
         arrived = source.get("arrived_at_monotonic_s")
         fresh = (
@@ -472,5 +509,6 @@ class OnboardMediaProxy:
             and math.isfinite(arrived)
             and 0 <= self.clock() - arrived < 0.5
         )
-        result = await self.owner_progress(report, role, frames, media_time, received_at, qualified=fresh)
-        return result if fresh else {"accepted": False, "reason": "selected source is not fresh"}
+        result = await self.owner_progress(report, role, frames, media_time, received_at, qualified=fresh,
+                                           delivery=delivery)
+        return receipt(result if fresh else {"accepted": False, "reason": "selected source is not fresh"})

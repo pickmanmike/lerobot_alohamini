@@ -1747,7 +1747,7 @@ def test_original_recovery_ceiling_includes_authenticated_read_time_without_rean
     asyncio.run(asyncio.wait_for(scenario(), 0.3))
 
 
-@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_view_reconnect", "grant_view_switch", "qualification_episode_pending", "qualification_episode_cleared"])
+@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_view_reconnect", "grant_view_switch", "qualification_episode_pending", "qualification_episode_cleared", "resume_alignment_refusal", "resume_alignment_refused_twice"])
 def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(tmp_path, cause):
     import asyncio
     import copy
@@ -2305,6 +2305,76 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                 finally:
                     renewal.cancel()
                     await asyncio.gather(renewal, return_exceptions=True)
+                return
+            if cause in {"resume_alignment_refusal", "resume_alignment_refused_twice"}:
+                # Synthetic52: PC observes qualified held proof; a later real
+                # Core Resume evidence read sees alignment unavailable.
+                pi_clock, denied = [10.], [False]
+                a.clock = e.clock = lambda: pi_clock[0]
+                a._pause_live_input("input_expired")
+                a._teleop_view["qualified_until"] = pi_clock[0] + .5
+                original_call, original_get, original_evidence = gateway.call, client.get, e.evidence
+                count = 3 if cause == "resume_alignment_refused_twice" else 2
+                resumes, refused, fresh_reads, envelopes = [], [], [], []
+                awaiting_fresh = [False]
+                own_event = copy.deepcopy(a.events[-1])
+                send = client.ws.send_json
+
+                def current_evidence():
+                    proof = original_evidence()
+                    if denied[0]:
+                        proof["pose_aligned"] = False
+                    return proof
+
+                async def capture(value, **kwargs):
+                    if "command" in value:
+                        envelopes.append(copy.deepcopy(value))
+                    return await send(value, **kwargs)
+
+                async def refuse_after_qualified(command, device):
+                    if command.get("op") == "resume":
+                        resumes.append(copy.deepcopy(command))
+                        revision = a.run["intent_revision"]
+                        if len(resumes) < count:
+                            denied[0] = True
+                            response = await original_call(command, device)
+                            assert response == {"accepted": False, "status": "refused", "effect_admitted": False,
+                                                "reason": "qualified release/alignment required"}
+                            assert a.run["intent_revision"] == revision and a.events[-1] == own_event
+                            refused.append(copy.deepcopy(response))
+                            awaiting_fresh[0] = True
+                            denied[0] = False  # Independent native convergence, not a GET side effect.
+                            return response
+                        assert fresh_reads and all(fresh_reads[-1].values())
+                    return await original_call(command, device)
+
+                async def fresh_owner(path):
+                    response = await original_get(path)
+                    if awaiting_fresh[0]:
+                        proof = response["snapshot"]["evidence"]
+                        fresh_reads.append({key:proof[key] for key in
+                                            ("feedback", "required_observation", "hold_acknowledged", "pose_aligned", "native_ack")})
+                        assert all(fresh_reads[-1].values())
+                        awaiting_fresh[0] = False
+                    return response
+
+                e.evidence, gateway.call, client.get = current_evidence, refuse_after_qualified, fresh_owner
+                client.ws.send_json = capture
+                ceiling = m.time.monotonic() + 1.5
+                assert not await guard.resume(expected_pause="input_expired", wall_deadline=ceiling)
+                assert len(resumes) == count and len(refused) == count - 1
+                assert len({v["operation_id"] for v in resumes}) == count
+                assert sum(v["command"]["op"] == "connect" for v in envelopes) == 1
+                assert sum(v["command"]["op"] == "release_input" for v in envelopes) == 1
+                assert not any(v["command"]["op"] in {"claim", "start", "grant", "input"} for v in envelopes)
+                assert client.snapshot["evidence"]["active_acknowledged"] is True
+                assert a.run["native_live_at"] == 9. and a.run["deadline"] == 309.
+                assert guard.episodes == 0 and m.time.monotonic() < ceiling
+                assert sum(r["event"] == "resume_qualification_refused" for r in records) == count - 1
+                assert any(r["event"] == "resume_qualification_observed" for r in records)
+                producer.native_cursor, producer.reacquire = m._live(client.snapshot)["cursor"], True
+                fresh = await m.send_leader_sample(client, producer, m.ZERO_BODY, record, phase="individual", progress_s=.04)
+                assert fresh[2]["accepted"] is True and producer.sequence == 2
                 return
             if cause in {"resume_view_refusal", "resume_view_refused_twice"}:
                 # Clearly synthetic Core/Gateway witness: expiry occurs AFTER
@@ -5552,3 +5622,163 @@ def test_native_qualification_handoff_preserves_source_budget_and_first_error(mo
             assert client.resumes == 1
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("mutation", [
+    None, "persistent", "raw_unavailable", "stale_hold", "fault", "uncertain", "owner", "connection",
+    "revision", "manual", "episode", "caller_budget", "native_budget", "phase_budget", "renewal",
+    "later_timeout", "later_refusal", "active_missing", "reporting", "release_unproven", "receipt_uncertain",
+    "superseded_timeout", "oversize_evidence", "invalid_evidence",
+])
+def test_nonadmitted_alignment_resume_preserves_original_phase_and_error(monkeypatch, mutation):
+    """Synthetic safety contrasts for the real Core/Gateway entrypoint witness."""
+    import asyncio
+    import copy
+    import json
+    import time
+    from types import SimpleNamespace
+
+    m = adapter()
+    pc = [1000.]
+    monkeypatch.setattr(m, "time", SimpleNamespace(monotonic=lambda: pc[0], perf_counter=time.perf_counter))
+    state = recovery_state()
+    state["run"].update(status="paused", remaining_s=.125 if mutation == "native_budget" else 299.)
+    state["evidence"].update(active_acknowledged=False)
+    state["evidence"]["accepted_host_action"]["acquired_at_monotonic_s"] = 101.
+    state["events"] = [{"kind": "input_expired", "at": 100.9, "run_id": "owned", "service_incarnation": "service"}]
+    receipt = {"accepted": False, "status": "refused", "effect_admitted": False,
+               "reason": "qualified release/alignment required"}
+    if mutation == "receipt_uncertain":
+        receipt["uncertain"] = True
+    original = m.CommandRefusedError(receipt)
+    if mutation == "oversize_evidence":
+        original.timing = {"untrusted": "x" * 9000}
+    elif mutation == "invalid_evidence":
+        original.timing = {"untrusted": float("nan")}
+    later = TimeoutError("later Resume result unknown")
+    calls, records, waits = [], [], []
+
+    class Client:
+        device, generation, connection = "device", "control", "connection"
+        identities, resume = m.SessionClient.identities, m.SessionClient.resume
+        reads = resumes = 0
+
+        def __init__(self):
+            self.snapshot = copy.deepcopy(state)
+
+        async def get(self, path):
+            assert path == "state"
+            self.reads += 1
+            pc[0] += .01
+            fresh = copy.deepcopy(self.snapshot)
+            if self.reads > 1:
+                fresh["run"]["remaining_s"] -= .0625
+                fresh["evidence"]["accepted_host_action"]["acquired_at_monotonic_s"] = fresh["run"]["deadline"] - fresh["run"]["remaining_s"]
+                if mutation in {"persistent", "raw_unavailable"}:
+                    fresh["evidence"]["pose_aligned" if mutation == "persistent" else "feedback"] = False
+                elif mutation == "stale_hold":
+                    fresh["evidence"]["accepted_host_action"]["acquired_at_monotonic_s"] = 100.
+                elif mutation == "fault":
+                    fresh["evidence"]["fault"] = "real native fault"
+                elif mutation == "uncertain":
+                    fresh["run"]["uncertain"] = True
+                elif mutation == "owner":
+                    fresh["controller"]["controller_generation"] = "foreign"
+                elif mutation == "connection":
+                    self.connection = "foreign"
+                elif mutation == "revision":
+                    fresh["run"]["intent_revision"] += 1
+                elif mutation == "manual":
+                    fresh["events"].append(dict(fresh["events"][-1], kind="pause", at=101.01))
+                elif mutation == "episode":
+                    fresh["run"].update(recovery_episodes=1, first_cause="feedback_loss")
+                elif mutation in {"caller_budget", "native_budget"}:
+                    pc[0] += 1.
+            return {"snapshot": fresh}
+
+        async def command(self, payload):
+            calls.append(copy.deepcopy(payload))
+            pc[0] += .01
+            if payload["op"] == "connect":
+                self.snapshot["run"]["intent_revision"] += 1
+                revision = self.snapshot["run"]["intent_revision"]
+                self.snapshot["run"]["live_input"]["cursor_intent_revision"] = revision
+                self.snapshot["evidence"]["acknowledged_intent_revision"] = revision
+                self.snapshot["evidence"]["accepted_host_action"]["intent_revision"] = revision
+                return {"accepted": True, "status": "connected", "connection_generation": str(uuid4()), "snapshot": self.snapshot}
+            if payload["op"] == "release_input":
+                return {"accepted": True} if mutation == "release_unproven" else {
+                    "accepted": True, "status": "released", "effect_admitted": False}
+            assert payload["op"] == "resume"
+            self.resumes += 1
+            if self.resumes == 1 or mutation == "phase_budget":
+                raise original
+            if mutation == "later_timeout" or mutation == "superseded_timeout" and self.resumes > 2:
+                raise later
+            if mutation == "later_refusal":
+                raise m.CommandRefusedError(dict(receipt, reason="stale or malformed intent revision"))
+            if mutation == "superseded_timeout":
+                pi_now = self.snapshot["run"]["deadline"] - self.snapshot["run"]["remaining_s"] + .0625
+                self.snapshot["run"].update(status="paused", intent_revision=payload["intent_revision"] + 2,
+                                             remaining_s=400. - pi_now)
+                self.snapshot["events"].append({"kind": "input_expired", "at": pi_now,
+                                                 "run_id": "owned", "service_incarnation": "service"})
+            else:
+                self.snapshot["run"].update(status="running", intent_revision=payload["intent_revision"] + 1)
+                self.snapshot["evidence"]["active_acknowledged"] = mutation != "active_missing"
+            return {"accepted": True, "status": "resuming"}
+
+        async def wait(self, predicate, timeout):
+            waits.append(timeout)
+            if self.resumes:
+                pc[0] += .125
+            until = pc[0] + timeout
+            while not predicate():
+                pc[0] += .125
+                if pc[0] >= until:
+                    raise TimeoutError("original qualified phase unavailable")
+                await asyncio.sleep(0)
+
+    def record(value):
+        if mutation == "reporting" and value["event"] == "resume_qualification_refused":
+            raise OSError("failed optional fault report")
+        records.append(value)
+
+    async def scenario():
+        client = Client()
+        guard = m.SameRunRecovery(client, record)
+        def healthy():
+            if mutation == "renewal" and client.resumes:
+                raise RuntimeError("original renewal stopped")
+        deadline = 1000.125 if mutation == "caller_budget" else 1009. if mutation == "phase_budget" else 1002.
+        if mutation is None:
+            assert not await guard.resume(expected_pause="input_expired", wall_deadline=deadline, renewal_check=healthy)
+            assert client.resumes == 2 and client.snapshot["evidence"]["active_acknowledged"] is True
+        else:
+            with pytest.raises(m.CommandRefusedError) as caught:
+                await guard.resume(expected_pause="input_expired", wall_deadline=deadline, renewal_check=healthy)
+            assert caught.value is original
+            if mutation in {"later_timeout", "superseded_timeout"}:
+                assert original.__cause__ is later
+            if mutation == "phase_budget":
+                assert client.resumes > 2 and 1008. <= pc[0] < 1009.
+            elif mutation == "superseded_timeout":
+                assert client.resumes == 3
+            elif mutation not in {"later_timeout", "later_refusal", "active_missing"}:
+                assert client.resumes == 1
+        if mutation != "superseded_timeout":
+            assert sum(c["op"] == "connect" for c in calls) == 1
+            assert sum(c["op"] == "release_input" for c in calls) == 1
+        assert not any(c["op"] in {"claim", "start", "grant", "input"} for c in calls)
+        assert guard.episodes == 0 and guard.original["run"]["deadline"] == 400.
+        resumes = [c for c in calls if c["op"] == "resume"]
+        assert len({c["operation_id"] for c in resumes}) == len(resumes)
+        for row in records:
+            if row["event"].startswith("resume_qualification_"):
+                assert row["proof_source"] in {"pc_sent_snapshot", "authenticated_owner_snapshot"}
+                assert len(json.dumps(row, allow_nan=False).encode("utf-8")) <= 8192
+        if mutation not in {"release_unproven", "receipt_uncertain", "reporting", "oversize_evidence", "invalid_evidence"}:
+            assert any(r["event"] == "resume_qualification_refused" for r in records)
+        if mutation is None:
+            assert any(r["event"] == "resume_qualification_observed" for r in records)
+    asyncio.run(asyncio.wait_for(scenario(), 1.))
