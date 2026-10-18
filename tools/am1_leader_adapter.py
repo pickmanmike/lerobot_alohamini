@@ -757,12 +757,18 @@ class SessionClient:
             await asyncio.sleep(0.45)
             await self.post("claim", {"controller_generation": self.generation})
 
-    async def resume(self, *, check=None, refusal_record=None):
+    async def resume(self, *, check=None, refusal_record=None, qualification_ceiling=None):
         if check:
             check(self.snapshot)
         identity = self.identities()
         try:
-            connected = await self.command(dict(op="connect", **identity))
+            if qualification_ceiling is None:
+                connected = await self.command(dict(op="connect", **identity))
+            else:
+                budget = qualification_ceiling - time.monotonic()
+                if budget <= 0:
+                    raise TimeoutError("original held/view qualification ceiling exhausted")
+                connected = await asyncio.wait_for(self.command(dict(op="connect", **identity)), budget)
         except ConnectionError as error:
             # Lost connect results are ambiguous, never nonadmission receipts.
             # This tag is only for the initial connect result.
@@ -774,16 +780,28 @@ class SessionClient:
         if check:
             check(self.snapshot)
         await SessionClient._resume_connected(self, check=check, connect_identity=identity,
-                                              refusal_record=refusal_record)
+                                              refusal_record=refusal_record, qualification_ceiling=qualification_ceiling)
 
     async def _resume_connected(self, *, check=None, connect_identity=None, qualified_check=None,
-                                refusal_record=None):
+                                refusal_record=None, qualification_ceiling=None):
+        phase_ceiling = qualification_ceiling
+
+        def phase_remaining():
+            remaining = phase_ceiling - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("original held/view qualification ceiling exhausted")
+            return remaining
+
         identity = self.identities()
         release_context = None if connect_identity is None else json.loads(json.dumps({
             "identity": identity, "connect_identity": connect_identity, "snapshot": self.snapshot,
         }, allow_nan=False))
         try:
-            await self.command(dict(op="release_input", **identity))
+            if qualification_ceiling is None:
+                await self.command(dict(op="release_input", **identity))
+            else:
+                budget = phase_remaining()
+                await asyncio.wait_for(self.command(dict(op="release_input", **identity)), budget)
         except (ConnectionError, TimeoutError) as error:
             if connect_identity is not None:
                 # Only this empty release follows a known connect ACK. Its
@@ -812,14 +830,9 @@ class SessionClient:
                 and (qualified_check is None or qualified_check(self.snapshot))
             )
 
-        phase_ceiling = time.monotonic() + 8
+        if phase_ceiling is None:
+            phase_ceiling = time.monotonic() + 8
         first_refusal, refused_identity, refused_event, refused_state = None, None, None, None
-
-        def phase_remaining():
-            remaining = phase_ceiling - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("original held/view qualification ceiling exhausted")
-            return remaining
 
         try:
             while True:
@@ -1138,9 +1151,10 @@ class SameRunRecovery:
                     or not 0 <= requested <= time.monotonic()):
                     raise RuntimeError("original running grant identity/clock unavailable")
                 clock["ceiling"] = min(requested + remaining, wall_deadline if wall_deadline is not None else float("inf"))
+                clock["held_view_ceiling"] = min(requested + 8, clock["ceiling"])
                 def remaining_budget():
                     renewal_check()
-                    value = clock["ceiling"] - time.monotonic()
+                    value = min(clock["ceiling"], clock["held_view_ceiling"]) - time.monotonic()
                     if value <= 0:
                         raise TimeoutError("original grant rejoin ceiling exhausted")
                     return value
@@ -1237,9 +1251,11 @@ class SameRunRecovery:
             ):
                 raise RuntimeError("original mailbox input refusal identity changed")
         requested = time.monotonic()
+        request_ceiling = min(wall_deadline if wall_deadline is not None else float("inf"),
+                              clock.get("held_view_ceiling", float("inf")))
         state = (
             await asyncio.wait_for(
-                self.client.get("state"), None if wall_deadline is None else max(0, wall_deadline - requested)
+                self.client.get("state"), None if math.isinf(request_ceiling) else max(0, request_ceiling - requested)
             )
         )["snapshot"]
         self.client.snapshot = state
@@ -1357,6 +1373,7 @@ class SameRunRecovery:
                 wall_deadline if wall_deadline is not None else float("inf"),
             )
             clock["ceiling"] = min(clock["ceiling"], local_ceiling)
+            qualifying_ceiling = min(local_ceiling, clock.get("held_view_ceiling", float("inf")))
             cause, count, connection = run["first_cause"], run["recovery_episodes"], self.client.connection
             self.record(
                 {
@@ -1375,7 +1392,7 @@ class SameRunRecovery:
                     or current["recovery_episodes"] != count
                 ):
                     raise RuntimeError("original native recovery ownership/episode changed")
-                if time.monotonic() >= local_ceiling:
+                if time.monotonic() >= qualifying_ceiling:
                     raise TimeoutError("original native recovery ceiling exhausted")
                 if current["status"] == "paused":
                     event = next(
@@ -1423,9 +1440,9 @@ class SameRunRecovery:
                         break
                 elif current["status"] != "recovering" or current.get("recovery") != episode:
                     raise RuntimeError("original native recovery descriptor changed")
-                await asyncio.sleep(min(0.05, max(0, local_ceiling - time.monotonic())))
+                await asyncio.sleep(min(0.05, max(0, qualifying_ceiling - time.monotonic())))
                 state = (
-                    await asyncio.wait_for(self.client.get("state"), max(0, local_ceiling - time.monotonic()))
+                    await asyncio.wait_for(self.client.get("state"), max(0, qualifying_ceiling - time.monotonic()))
                 )["snapshot"]
                 self.client.snapshot = state
                 self.record(
@@ -1450,30 +1467,67 @@ class SameRunRecovery:
             self.check(snapshot)
         try:
             if grant_context is not None:
-                run, evidence, live = state["run"], state.get("evidence", {}), _live(state)
-                revision, ack = run.get("intent_revision"), evidence.get("accepted_host_action") or {}
-                stamp, remaining = ack.get("acquired_at_monotonic_s"), run.get("remaining_s")
-                event = _latest_run_event(state, grant_context["identity"])
-                if (run.get("status") != "paused" or run.get("recovery") is not None
-                    or type(revision) is not int
-                    or not all(evidence.get(k) is True for k in
-                               ("feedback", "required_observation", "hold_acknowledged", "pose_aligned", "native_ack"))
-                    or evidence.get("active_acknowledged") is not False
-                    or type(evidence.get("acknowledged_intent_revision")) is not int
-                    or evidence["acknowledged_intent_revision"] != revision
-                    or ack.get("run_id") != run["run_id"] or ack.get("host_incarnation") != run["backend_incarnation"]
-                    or ack.get("state") != "paused" or type(ack.get("intent_revision")) is not int
-                    or ack["intent_revision"] != revision
-                    or type(live.get("cursor_intent_revision")) is not int or live["cursor_intent_revision"] != revision
-                    or live.get("required_view", {}).get("qualified") is not True
-                    or any(type(value) not in (int, float) or not math.isfinite(value)
-                           for value in (stamp, remaining, event.get("at")))
-                    or not run["native_live_at"] <= event["at"] <= stamp
-                    or stamp + remaining > run["deadline"]):
-                    raise RuntimeError("fresh grant rejoin held/current-view proof unavailable")
                 identity = self.client.identities()
+                event = json.loads(json.dumps(_latest_run_event(state, grant_context["identity"]), allow_nan=False))
+                previous_remaining, previous_stamp = state["run"]["remaining_s"], None
+                waiting_view = False
+                while True:
+                    checked(state)
+                    run, evidence, live = state["run"], state.get("evidence", {}), _live(state)
+                    revision, ack = run.get("intent_revision"), evidence.get("accepted_host_action") or {}
+                    stamp, remaining = ack.get("acquired_at_monotonic_s"), run.get("remaining_s")
+                    actual = self.client.identities()
+                    if (set(actual) != set(identity)
+                        or any(type(actual[k]) is not type(v) or actual[k] != v for k, v in identity.items())
+                        or _latest_run_event(state, identity) != event
+                        or run.get("status") != "paused" or run.get("recovery") is not None
+                        or type(revision) is not int
+                        or not all(evidence.get(k) is True for k in
+                                   ("feedback", "required_observation", "hold_acknowledged", "pose_aligned", "native_ack"))
+                        or evidence.get("active_acknowledged") is not False
+                        or type(evidence.get("acknowledged_intent_revision")) is not int
+                        or evidence["acknowledged_intent_revision"] != revision
+                        or ack.get("run_id") != run["run_id"] or ack.get("host_incarnation") != run["backend_incarnation"]
+                        or ack.get("state") != "paused" or type(ack.get("intent_revision")) is not int
+                        or ack["intent_revision"] != revision
+                        or type(live.get("cursor_intent_revision")) is not int or live["cursor_intent_revision"] != revision
+                        or any(type(value) not in (int, float) or not math.isfinite(value)
+                               for value in (stamp, remaining, event.get("at")))
+                        or not 0 < remaining <= previous_remaining
+                        or previous_stamp is not None and stamp < previous_stamp
+                        or not run["native_live_at"] <= event["at"] <= stamp
+                        or stamp + remaining > run["deadline"]):
+                        raise RuntimeError("fresh grant rejoin held/current-view proof unavailable")
+                    clock["remaining"] = remaining
+                    budget = min(local_ceiling, clock["held_view_ceiling"]) - time.monotonic()
+                    if budget <= 0:
+                        raise TimeoutError("original grant held/view ceiling exhausted")
+                    view = live.get("required_view") or {}
+                    if view.get("qualified") is True and not waiting_view:
+                        break  # Preserve the established already-qualified path.
+                    if (set(view) != {"required", "qualified", "role", "cause"}
+                        or view.get("required") is not True or type(view.get("qualified")) is not bool
+                        or view.get("role") not in {"forward", "backward", "chest", "wrist_left", "wrist_right"}
+                        or view.get("cause") != (None if view["qualified"] else "required_view_expired")):
+                        raise RuntimeError("current selected view deficit is unavailable or malformed")
+                    if view["qualified"]:
+                        break
+                    waiting_view = True
+                    previous_remaining, previous_stamp = remaining, stamp
+                    await asyncio.sleep(min(.05, budget))
+                    requested = time.monotonic()
+                    budget = min(local_ceiling, clock["held_view_ceiling"]) - requested
+                    if budget <= 0:
+                        raise TimeoutError("original grant held/view ceiling exhausted")
+                    if renewal_check:
+                        renewal_check()
+                    state = (await asyncio.wait_for(self.client.get("state"), budget))["snapshot"]
+                    self.client.snapshot = state
+                    self.record({"event": "owner_rejoin_state", "snapshot": state,
+                                 "request_started_at_monotonic_s": requested,
+                                 "response_observed_at_monotonic_s": time.monotonic()})
                 checked(state)
-                budget = local_ceiling - time.monotonic()
+                budget = min(local_ceiling, clock["held_view_ceiling"]) - time.monotonic()
                 if budget <= 0:
                     raise TimeoutError("original grant rejoin ceiling exhausted")
                 connected = await asyncio.wait_for(self.client.command(dict(op="connect", **identity)), budget)
@@ -1496,9 +1550,12 @@ class SameRunRecovery:
                 if budget <= 0:
                     raise TimeoutError("original grant rejoin ceiling exhausted")
                 await asyncio.wait_for(SessionClient._resume_connected(
-                    self.client, check=checked, connect_identity=identity, refusal_record=self.record), budget)
+                    self.client, check=checked, connect_identity=identity, refusal_record=self.record,
+                    qualification_ceiling=clock["held_view_ceiling"]), budget)
             else:
-                await asyncio.wait_for(self.client.resume(check=checked, refusal_record=self.record), timeout)
+                options = ({"qualification_ceiling": clock["held_view_ceiling"]}
+                           if "held_view_ceiling" in clock else {})
+                await asyncio.wait_for(self.client.resume(check=checked, refusal_record=self.record, **options), timeout)
         except _ResumePausedError as outcome:
             self.check(self.client.snapshot)
             outcome.episode = episode if recovered else None
@@ -1506,7 +1563,7 @@ class SameRunRecovery:
                 renewal_check()
             raise
         except (ConnectionError, TimeoutError) as original:
-            if grant_context is not None:
+            if "held_view_ceiling" in clock:
                 raise  # A nested ambiguous phase never starts another replacement.
             accepted = getattr(original, "accepted_resume_context", None)
             if accepted is not None:
