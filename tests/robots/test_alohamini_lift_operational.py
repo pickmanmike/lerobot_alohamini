@@ -1831,6 +1831,7 @@ def test_host_fault_timing_cannot_replace_primary_or_cleanup_failure(
     original_connect = robot.connect
     original_dumps = json.dumps
     closed = False
+    retained_current, retained_lift = {}, {}
 
     def connect(**kwargs):
         original_connect(calibrate=False, **kwargs)
@@ -1839,6 +1840,13 @@ def test_host_fault_timing_cannot_replace_primary_or_cleanup_failure(
 
         def failed_emit(record):
             if record["phase"] == "live":
+                # Already validated memory, not another read during a fault.
+                completed = clock.monotonic()
+                retained_current.update(read_started_at_monotonic_s=completed - 0.186,
+                                        read_completed_at_monotonic_s=completed)
+                robot._am1_teleop_currents = {"left": dict(retained_current)}
+                retained_lift.update(sample_monotonic_s=record["sample_monotonic_s"],
+                                     request_duration_s=record["request_duration_s"])
                 raise primary
             emit(record)
 
@@ -1880,7 +1888,15 @@ def test_host_fault_timing_cannot_replace_primary_or_cleanup_failure(
         assert "AM1 host loop timing context unavailable: ValueError" in notes
     else:
         note = next(n for n in notes if n.startswith("AM1 host loop timing context: "))
-        assert json.loads(note.split(": ", 1)[1])["current_loop"]["active_phase"] == "sample_log"
+        context = json.loads(note.split(": ", 1)[1])
+        assert context["current_loop"]["active_phase"] == "sample_log"
+        receipt = context["current_feedback_timing"]["left"]
+        assert receipt["source"] == "last_sampled_current_receipt_may_be_rejected"
+        assert receipt["read_started_at_monotonic_s"] == retained_current["read_started_at_monotonic_s"]
+        assert receipt["read_completed_at_monotonic_s"] == retained_current["read_completed_at_monotonic_s"]
+        assert context["lift_feedback_timing"]["sample_monotonic_s"] == retained_lift["sample_monotonic_s"]
+        assert context["lift_feedback_timing"]["request_duration_s"] == retained_lift["request_duration_s"]
+        assert context["lift_feedback_timing"]["emit_timing_scope"] == "last_emit_attempt"
 
 
 @pytest.mark.parametrize("model,home", [("alohamini1", False), ("alohamini2", True), ("alohamini2pro", True)])
@@ -2916,3 +2932,65 @@ def test_startup_candidate_reset_cannot_clear_the_original_thermal_slot_history(
     assert any(r.get("rejected") and "3/5" in r["rejection_reason"] for r in records)
     assert not any(r["phase"] == "startup_off_baseline_qualified" for r in records)
     assert_no_startup_motion(robot)
+
+
+@pytest.mark.parametrize("command_completed", [False, True])
+def test_host_fault_note_retains_original_current_and_lift_request_boundaries(command_completed):
+    from lerobot.robots.alohamini.alohamini_host import AM1HostLoopTiming
+
+    timing = AM1HostLoopTiming()
+    timing.begin(100.0)
+    timing.mark("command", 100.001)
+    receipts = {
+        "left": {"raw": {"private": 999}, "read_started_at_monotonic_s": 100.002,
+                 "read_completed_at_monotonic_s": 100.188},
+        "right": {"read_started_at_monotonic_s": 99.8, "read_completed_at_monotonic_s": 99.802},
+        "foreign": {"private": "never retain"},
+    }
+    lift = {"sample_monotonic_s": 100.189, "request_duration_s": 0.0018,
+            "rejected": True, "group_trace": {"private": "never retain"}}
+    context = timing.snapshot(100.2, action_timing_ms={"action_total": 1.719},
+                              command_completed=command_completed, current_receipts=receipts,
+                              lift_record=lift, lift_emit_ms=0.25)
+    assert context["command_completed"] is command_completed
+    assert context["action_timing_scope"] == "last_completed_send_action"
+    assert context["action_timing_ms"] == {"action_total": 1.719}
+    assert context["current_feedback_timing"] == {
+        "left": {"clock": "monotonic", "source": "last_sampled_current_receipt_may_be_rejected",
+                 "read_started_at_monotonic_s": 100.002, "read_completed_at_monotonic_s": 100.188,
+                 "relation_to_current_loop": "within_current_loop"},
+        "right": {"clock": "monotonic", "source": "last_sampled_current_receipt_may_be_rejected",
+                  "read_started_at_monotonic_s": 99.8, "read_completed_at_monotonic_s": 99.802,
+                  "relation_to_current_loop": "before_current_loop"},
+    }
+    assert context["lift_feedback_timing"] == {
+        "clock": "monotonic", "source": "last_cached_lift_record_may_be_rejected",
+        "sample_monotonic_s": 100.189, "request_duration_s": 0.0018,
+        "last_emit_ms": 0.25, "emit_timing_scope": "last_emit_attempt",
+    }
+    receipts["left"]["read_completed_at_monotonic_s"] = 0
+    lift["sample_monotonic_s"] = 0
+    assert context["current_feedback_timing"]["left"]["read_completed_at_monotonic_s"] == 100.188
+    assert context["lift_feedback_timing"]["sample_monotonic_s"] == 100.189
+    assert len(json.dumps(context, allow_nan=False).encode()) < 4096
+
+
+@pytest.mark.parametrize("invalid", [None, True, float("nan"), float("inf"), -1, "x" * 20000, 10 ** 400],
+                         ids=["missing", "boolean", "nan", "infinite", "negative", "oversized_string", "huge_integer"])
+def test_host_fault_note_excludes_invalid_or_unbounded_cached_feedback(invalid):
+    from lerobot.robots.alohamini.alohamini_host import AM1HostLoopTiming
+
+    timing = AM1HostLoopTiming()
+    timing.begin(100.0)
+    context = timing.snapshot(100.2, current_receipts={
+        "left": {"read_started_at_monotonic_s": invalid, "read_completed_at_monotonic_s": 100.1},
+        "right": {"read_started_at_monotonic_s": 100.1, "read_completed_at_monotonic_s": invalid},
+        "private": "x" * 20000,
+    }, lift_record={"sample_monotonic_s": invalid, "request_duration_s": invalid,
+                    "private": "x" * 20000}, lift_emit_ms=invalid)
+    assert context["current_feedback_timing"] == {}
+    assert context["lift_feedback_timing"] == {
+        "clock": "monotonic", "source": "last_cached_lift_record_may_be_rejected",
+        "emit_timing_scope": "last_emit_attempt",
+    }
+    assert len(json.dumps(context, allow_nan=False).encode()) < 4096

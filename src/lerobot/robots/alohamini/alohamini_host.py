@@ -1072,6 +1072,8 @@ class AM1HostLoopTiming:
 
     def snapshot(
         self, at: float, *, action_timing_ms: dict | None = None, command_completed: bool = False,
+        current_receipts: dict | None = None, lift_record: dict | None = None,
+        lift_emit_ms: float | None = None,
     ) -> dict[str, Any]:
         current = None
         if self.current is not None:
@@ -1098,6 +1100,38 @@ class AM1HostLoopTiming:
             name: action[name] for name in action_fields
             if type(action.get(name)) in (int, float) and math.isfinite(action[name]) and action[name] >= 0
         }
+        # These are existing validated receipts, not reads for this diagnostic.
+        # A side may still describe a previous loop when the other side fails.
+        receipts = current_receipts if isinstance(current_receipts, dict) else {}
+        retained_currents = {}
+        for side in ("left", "right"):
+            sample = receipts.get(side)
+            if not isinstance(sample, dict):
+                continue
+            started, completed = (sample.get(name) for name in
+                                  ("read_started_at_monotonic_s", "read_completed_at_monotonic_s"))
+            if (type(started) not in (int, float) or type(completed) not in (int, float)
+                    or not 0 <= started <= completed <= at):
+                continue
+            relation = "current_loop_unavailable"
+            if current is not None:
+                relation = ("within_current_loop" if started >= current["start_s"] else
+                            "before_current_loop" if completed < current["start_s"] else
+                            "overlaps_current_loop_start")
+            retained_currents[side] = {
+                "clock": "monotonic", "source": "last_sampled_current_receipt_may_be_rejected",
+                "read_started_at_monotonic_s": started, "read_completed_at_monotonic_s": completed,
+                "relation_to_current_loop": relation,
+            }
+        lift = lift_record if isinstance(lift_record, dict) else {}
+        retained_lift = {"clock": "monotonic", "source": "last_cached_lift_record_may_be_rejected",
+                         "emit_timing_scope": "last_emit_attempt"}
+        for name in ("sample_monotonic_s", "request_duration_s"):
+            value = lift.get(name)
+            if type(value) in (int, float) and 0 <= value <= at:
+                retained_lift[name] = value
+        if type(lift_emit_ms) in (int, float) and 0 <= lift_emit_ms <= at * 1000:
+            retained_lift["last_emit_ms"] = lift_emit_ms
         return {
             "clock": "perf_counter",
             "previous_loop": None if self.previous is None else copy_completed(self.previous),
@@ -1108,6 +1142,8 @@ class AM1HostLoopTiming:
             "command_completed": command_completed,
             "action_timing_scope": "last_completed_send_action",
             "action_timing_ms": retained_action,
+            "current_feedback_timing": retained_currents,
+            "lift_feedback_timing": retained_lift,
         }
 
 
@@ -1990,11 +2026,14 @@ def _run_host(args):
             # Capture BEFORE cleanup, attach AFTER it. Cleanup time must not be
             # misreported as poll/log/observation delay, or diagnostic I/O delay zero/off.
             try:
+                operation = getattr(robot, "_lift_operation", None)
+                sample = getattr(operation, "last_record", None) or {}
                 fault_loop_context = loop_timing.snapshot(
                     time.perf_counter(), action_timing_ms=robot.logs.get("action_timing_ms"),
                     command_completed=command_received,
+                    current_receipts=getattr(robot, "_am1_teleop_currents", None),
+                    lift_record=sample, lift_emit_ms=getattr(operation, "last_emit_ms", None),
                 )
-                sample = getattr(getattr(robot, "_lift_operation", None), "last_record", None) or {}
                 # last_record is cached before some operational guards; it may
                 # contain the rejected sample, not the last accepted one.
                 fault_loop_context["last_cached_lift_sample_monotonic_s"] = sample.get("sample_monotonic_s")

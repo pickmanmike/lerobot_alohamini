@@ -749,36 +749,57 @@ class SessionClient:
                 raise first_refusal from error
             raise
 
-        def active():
-            if check:
-                check(self.snapshot)
-            run = self.snapshot["run"]
-            if run.get("status") == "paused" and run.get("intent_revision") != identity["intent_revision"]:
-                event = _latest_run_event(self.snapshot, identity)
-                at, prior_at = event.get("at"), prior_event.get("at")
-                if (resumed.get("accepted") is True and resumed.get("status") in {"running", "resuming"}
-                    and type(identity["intent_revision"]) is int
-                    and all(type(value) is str and value for key, value in identity.items() if key != "intent_revision")
-                    and all(type(self.identities()[key]) is type(value) and self.identities()[key] == value
-                            for key, value in dict(identity, intent_revision=identity["intent_revision"] + 2).items())
-                    and type(run.get("intent_revision")) is int
-                    and set(event) == {"kind", "at", "run_id", "service_incarnation"}
-                    and event.get("kind") in {"required_view_expired", "input_expired", "native_input_expired"}
-                    and all(type(value) in (int, float) and math.isfinite(value)
-                            for value in (at, prior_at, pi_lower_bound))
-                    and prior_at < at and pi_lower_bound <= at < run["deadline"]):
-                    raise _ResumePausedError(identity, event)
-                raise RuntimeError("accepted Resume superseded by an unqualified pause")
-            return run.get("status") == "running" and self.snapshot["evidence"].get("active_acknowledged") is True
-
+        active_ceiling = time.monotonic() + 5
         try:
-            await self.wait(active, 5)
+            await self.wait(lambda: SessionClient._resume_active(
+                self, identity, prior_event, pi_lower_bound, resumed, check), 5)
         except _ResumePausedError:
             raise  # The positively accepted Resume uses the unchanged +2 path.
         except (Exception, asyncio.CancelledError) as error:
             if first_refusal is not None:
                 raise first_refusal from error
+            if isinstance(error, ConnectionError):
+                from aiohttp import ServerTimeoutError
+
+                ws = getattr(self, "ws", None)
+                stream_error = ws.exception() if ws is not None else None
+                close = dict(getattr(self, "transport_close", None) or {})
+                if (resumed.get("accepted") is True and resumed.get("status") in {"running", "resuming"}
+                    and type(stream_error) is ServerTimeoutError
+                    and str(stream_error) == f"No PONG received after {ws._pong_heartbeat} seconds"
+                    and close.get("expected") is False and close.get("reason") == "message-error"
+                    and close.get("close_code") == 1006 and close.get("reader_error") is None):
+                    # This is the known accepted Resume's active-observation
+                    # phase, never an unknown command or nonadmission receipt.
+                    error.accepted_resume_context = {
+                        "identity": dict(identity), "operation_id": command["operation_id"],
+                        "prior_event": prior_event, "pi_lower_bound": pi_lower_bound,
+                        "native_remaining": remaining, "active_ceiling": active_ceiling,
+                        "transport_close": close, "receipt": resumed,
+                    }
             raise
+
+    def _resume_active(self, identity, prior_event, pi_lower_bound, resumed, check=None):
+        if check:
+            check(self.snapshot)
+        run = self.snapshot["run"]
+        if run.get("status") == "paused" and run.get("intent_revision") != identity["intent_revision"]:
+            event = _latest_run_event(self.snapshot, identity)
+            at, prior_at = event.get("at"), prior_event.get("at")
+            if (resumed.get("accepted") is True and resumed.get("status") in {"running", "resuming"}
+                and type(identity["intent_revision"]) is int
+                and all(type(value) is str and value for key, value in identity.items() if key != "intent_revision")
+                and all(type(self.identities()[key]) is type(value) and self.identities()[key] == value
+                        for key, value in dict(identity, intent_revision=identity["intent_revision"] + 2).items())
+                and type(run.get("intent_revision")) is int
+                and set(event) == {"kind", "at", "run_id", "service_incarnation"}
+                and event.get("kind") in {"required_view_expired", "input_expired", "native_input_expired"}
+                and all(type(value) in (int, float) and math.isfinite(value)
+                        for value in (at, prior_at, pi_lower_bound))
+                and prior_at < at and pi_lower_bound <= at < run["deadline"]):
+                raise _ResumePausedError(identity, event)
+            raise RuntimeError("accepted Resume superseded by an unqualified pause")
+        return run.get("status") == "running" and self.snapshot["evidence"].get("active_acknowledged") is True
 
     async def detach(self):
         self._detaching = True
@@ -869,25 +890,70 @@ class SameRunRecovery:
         renewal_check=None,
     ):
         clock = {"ceiling": wall_deadline, "anchored": False}
-        interrupted, deferred = None, []
+        interrupted, deferred, first_transport_error = None, [], None
         while True:
             try:
-                recovered = await self._resume_once(
-                    wall_deadline=clock["ceiling"], require_episode=require_episode,
-                    refusal_identity=refusal_identity, expected_pause=expected_pause,
-                    renewal_check=renewal_check, clock=clock, interrupted=interrupted)
-            except _ResumePausedError as outcome:
-                if outcome.episode is not None:
-                    deferred.append(outcome.episode)
-                interrupted = outcome
-                require_episode, refusal_identity, expected_pause = False, None, outcome.event["kind"]
-                self.record({"event": "accepted_resume_superseded", "identity": outcome.identity,
-                             "pause_event": outcome.event, "remaining_s": clock["ceiling"] - time.monotonic()})
-                continue
-            for episode in deferred:
-                self.record({"event": "qualified_native_recovery", "original_recovery": episode,
-                             "snapshot": self.client.snapshot})
-            return recovered or bool(deferred)
+                try:
+                    recovered = await self._resume_once(
+                        wall_deadline=clock["ceiling"], require_episode=require_episode,
+                        refusal_identity=refusal_identity, expected_pause=expected_pause,
+                        renewal_check=renewal_check, clock=clock, interrupted=interrupted)
+                except _ResumePausedError as outcome:
+                    first_transport_error = first_transport_error or getattr(outcome, "transport_error", None)
+                    if outcome.episode is not None:
+                        deferred.append(outcome.episode)
+                    interrupted = outcome
+                    require_episode, refusal_identity, expected_pause = False, None, outcome.event["kind"]
+                    self.record({"event": "accepted_resume_superseded", "identity": outcome.identity,
+                                 "pause_event": outcome.event, "remaining_s": clock["ceiling"] - time.monotonic()})
+                    continue
+                for episode in deferred:
+                    self.record({"event": "qualified_native_recovery", "original_recovery": episode,
+                                 "snapshot": self.client.snapshot})
+                return recovered or bool(deferred)
+
+            except (Exception, asyncio.CancelledError) as error:
+                if first_transport_error is not None and error is not first_transport_error:
+                    raise first_transport_error from error
+                raise
+
+    async def _attach_transport(self, state, identity, remaining, renewal_check):
+        attachment_attempt = 0
+        while True:
+            if renewal_check:
+                renewal_check()
+            budget = remaining()
+            await asyncio.wait_for(self.client.detach(), budget)
+            budget = remaining()
+            attachment_attempt += 1
+            try:
+                await asyncio.wait_for(self.client.attach(), budget)
+            except ConnectionError as interrupted_attach:
+                failed_close = getattr(interrupted_attach, "initial_snapshot_transport_close", None)
+                if (not isinstance(failed_close, dict) or failed_close.get("expected") is not False
+                    or failed_close.get("reason") != "stream-ended" or failed_close.get("close_code") != 1006
+                    or failed_close.get("reader_error") is not None):
+                    raise
+                self.check(state)
+                if self.client.connection != identity["connection_generation"]:
+                    raise RuntimeError("original connection changed during transport attachment") from interrupted_attach
+                if renewal_check:
+                    renewal_check()
+                close_evidence = {key: failed_close[key] for key in
+                                  ("expected", "reason", "close_code", "reader_error")}
+                for key in ("exception_type", "exception"):
+                    value = failed_close.get(key)
+                    # 32 UTF8 bytes also bound JSON's escaped representation.
+                    close_evidence[key] = (value.encode("utf-8", errors="replace")[:32].decode(
+                        "utf-8", errors="ignore") if type(value) is str else None)
+                stamp = failed_close.get("observed_at_monotonic_s")
+                close_evidence["observed_at_monotonic_s"] = (stamp if type(stamp) in (int, float)
+                    and math.isfinite(stamp) else None)
+                self.record({"event": "ordinary_attachment_interrupted", "phase": "initial_snapshot",
+                             "transport_close": close_evidence, "attachment_attempt": attachment_attempt,
+                             "remaining_s": remaining()})
+                continue  # Fresh ticket/stream only; no control command has been retried.
+            break
 
     async def _resume_once(
         self, *, wall_deadline, require_episode, refusal_identity, expected_pause,
@@ -1122,6 +1188,87 @@ class SameRunRecovery:
                 renewal_check()
             raise
         except (ConnectionError, TimeoutError) as original:
+            accepted = getattr(original, "accepted_resume_context", None)
+            if accepted is not None:
+                try:
+                    identity = accepted["identity"]
+                    expected = {"run_id": self.original["run"]["run_id"], "service_incarnation": self.original["service"],
+                                "host_incarnation": self.original["run"]["backend_incarnation"],
+                                "controller_generation": self.original["controller"]["controller_generation"],
+                                "connection_generation": self.client.connection,
+                                "intent_revision": state["run"]["intent_revision"] + 1}
+                    prior, lower = accepted["prior_event"], accepted["pi_lower_bound"]
+                    if (recovered or state["run"].get("recovery") is not None
+                        or not isinstance(identity, dict) or set(identity) != set(expected)
+                        or any(type(identity[k]) is not type(v) or identity[k] != v for k, v in expected.items())
+                        or type(identity["intent_revision"]) is not int
+                        or any(type(v) is not str or not v for k, v in identity.items() if k != "intent_revision")
+                        or str(UUID(accepted["operation_id"])) != accepted["operation_id"]
+                        or set(prior) != {"kind", "at", "run_id", "service_incarnation"}
+                        or prior != _latest_run_event(state, identity)
+                        or prior.get("kind") not in {"input_expired", "native_input_expired", "required_view_expired"}
+                        or any(type(v) not in (int, float) or not math.isfinite(v)
+                               for v in (prior.get("at"), lower, accepted["native_remaining"], accepted["active_ceiling"]))
+                        or not self.original["run"]["native_live_at"] <= prior["at"] < self.original["run"]["deadline"]
+                        or not self.original["run"]["native_live_at"] <= lower < self.original["run"]["deadline"]
+                        or prior["at"] + accepted["native_remaining"] > self.original["run"]["deadline"]
+                        or not 0 < accepted["native_remaining"] <= native_remaining):
+                        raise RuntimeError("known accepted ordinary Resume phase unavailable")
+                    clock["ceiling"] = min(clock["ceiling"], accepted["active_ceiling"])
+                    def remaining():
+                        value = clock["ceiling"] - time.monotonic()
+                        if value <= 0:
+                            raise TimeoutError("original accepted Resume observation ceiling exhausted")
+                        if renewal_check:
+                            renewal_check()
+                        return value
+                    # Only fixed fields from this failed phase are emitted.
+                    # Full owner snapshots and successful traffic stay unchanged.
+                    self.record({"event": "accepted_resume_transport_closed", "phase": "active_ack",
+                                 "identity": {k: (v.encode("utf-8")[:32].decode("utf-8", errors="ignore")
+                                                   if type(v) is str else v) for k, v in identity.items()},
+                                 "operation_id": accepted["operation_id"], "remaining_s": remaining(),
+                                 "transport_close": {k: accepted["transport_close"].get(k) for k in
+                                                     ("expected", "reason", "close_code", "exception_type", "reader_error")}})
+                    await self._attach_transport(state, identity, remaining, renewal_check)
+                    budget = remaining()
+                    fresh = (await asyncio.wait_for(self.client.get("state"), budget))["snapshot"]
+                    self.client.snapshot = fresh
+                    self.check(fresh)
+                    run, evidence, live = fresh["run"], fresh.get("evidence", {}), _live(fresh)
+                    ack = evidence.get("accepted_host_action") or {}
+                    stamp, current_remaining = ack.get("acquired_at_monotonic_s"), run.get("remaining_s")
+                    revision = identity["intent_revision"] + 2
+                    if (self.client.connection != identity["connection_generation"]
+                        or run.get("status") != "paused" or run.get("recovery") is not None
+                        or not all(evidence.get(k) is True for k in
+                                   ("feedback", "required_observation", "hold_acknowledged", "pose_aligned", "native_ack"))
+                        or evidence.get("active_acknowledged") is not False
+                        or type(evidence.get("acknowledged_intent_revision")) is not int
+                        or evidence["acknowledged_intent_revision"] != revision
+                        or ack.get("run_id") != identity["run_id"] or ack.get("host_incarnation") != identity["host_incarnation"]
+                        or ack.get("state") != "paused" or type(ack.get("intent_revision")) is not int
+                        or ack["intent_revision"] != revision
+                        or type(live.get("cursor_intent_revision")) is not int or live["cursor_intent_revision"] != revision
+                        or live.get("required_view", {}).get("qualified") is not True
+                        or any(type(v) not in (int, float) or not math.isfinite(v) for v in (stamp, current_remaining))
+                        or not 0 < current_remaining <= accepted["native_remaining"]
+                        or not run["deadline"] <= stamp + accepted["native_remaining"]
+                        or stamp + current_remaining > run["deadline"]):
+                        raise RuntimeError("fresh accepted Resume ordinary paused proof unavailable")
+                    remaining()
+                    try:
+                        SessionClient._resume_active(self.client, identity, prior, lower, accepted["receipt"], checked)
+                    except _ResumePausedError as outcome:
+                        if outcome.event["at"] > stamp:
+                            raise RuntimeError("current held ACK predates the new ordinary pause") from outcome
+                        outcome.transport_error = original
+                        raise
+                    raise RuntimeError("fresh accepted Resume did not prove a new ordinary pause")
+                except _ResumePausedError:
+                    raise
+                except (Exception, asyncio.CancelledError) as qualification_error:
+                    raise original from qualification_error
             release = getattr(original, "empty_release_context", None)
             release_loss = isinstance(release, dict) and set(release) == {"identity", "connect_identity", "snapshot"}
             close = dict(getattr(self.client, "transport_close", None) or {})
@@ -1198,42 +1345,7 @@ class SameRunRecovery:
                 self.record({"event": "ordinary_empty_release_ambiguous" if release_loss else "ordinary_connect_transport_closed", "transport_close": close,
                              "identity": identity, "pause_event": original_event,
                              "remaining_s": remaining(), "outcome": "ambiguous"})
-                attachment_attempt = 0
-                while True:
-                    if renewal_check:
-                        renewal_check()
-                    budget = remaining()
-                    await asyncio.wait_for(self.client.detach(), budget)
-                    budget = remaining()
-                    attachment_attempt += 1
-                    try:
-                        await asyncio.wait_for(self.client.attach(), budget)
-                    except ConnectionError as interrupted_attach:
-                        failed_close = getattr(interrupted_attach, "initial_snapshot_transport_close", None)
-                        if (not isinstance(failed_close, dict) or failed_close.get("expected") is not False
-                            or failed_close.get("reason") != "stream-ended" or failed_close.get("close_code") != 1006
-                            or failed_close.get("reader_error") is not None):
-                            raise
-                        self.check(state)
-                        if self.client.connection != identity["connection_generation"]:
-                            raise RuntimeError("original connection changed during transport attachment") from interrupted_attach
-                        if renewal_check:
-                            renewal_check()
-                        close_evidence = {key: failed_close[key] for key in
-                                          ("expected", "reason", "close_code", "reader_error")}
-                        for key in ("exception_type", "exception"):
-                            value = failed_close.get(key)
-                            # 32 UTF8 bytes also bound JSON's escaped representation.
-                            close_evidence[key] = (value.encode("utf-8", errors="replace")[:32].decode(
-                                "utf-8", errors="ignore") if type(value) is str else None)
-                        stamp = failed_close.get("observed_at_monotonic_s")
-                        close_evidence["observed_at_monotonic_s"] = (stamp if type(stamp) in (int, float)
-                            and math.isfinite(stamp) else None)
-                        self.record({"event": "ordinary_attachment_interrupted", "phase": "initial_snapshot",
-                                     "transport_close": close_evidence, "attachment_attempt": attachment_attempt,
-                                     "remaining_s": remaining()})
-                        continue  # Fresh ticket/stream only; no control command has been retried.
-                    break
+                await self._attach_transport(state, identity, remaining, renewal_check)
                 budget = remaining()
                 fresh = (await asyncio.wait_for(self.client.get("state"), budget))["snapshot"]
                 self.client.snapshot = fresh
