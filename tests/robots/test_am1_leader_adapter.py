@@ -515,6 +515,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
 
     m = adapter()
     production_post = m.SessionClient.post
+    initial_pause_case = failure == "initial_resume_pause"
     http_start = failure is not None and failure.startswith("http_start_")
     prelive = {
         "admission_fault",
@@ -543,6 +544,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
         or ordinary_case
         or mailbox_case
         or timed_expiry
+        or initial_pause_case
         or failure in {"zero_deadline_rounding", "zero_inner_timeout"}
     ):
         import time
@@ -671,6 +673,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                     "recipe": "physical-live-teleop",
                     "native_live_at": 1.0,
                     "deadline": 301.0,
+                    "remaining_s": 300.0,  # Actual Core publishes the native clock on owner reads.
                     "status": "running",
                     "uncertain": False,
                     "cleanup": None,
@@ -775,7 +778,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
             assert predicate()
 
         def identities(self):
-            if mailbox_case:
+            if mailbox_case or initial_pause_case:
                 return dict(run_id=owned_id, service_incarnation="service",
                             controller_generation=self.generation, connection_generation=self.connection,
                             host_incarnation="host", intent_revision=self.snapshot["run"]["intent_revision"])
@@ -785,6 +788,21 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
             assert self.snapshot["run"]["run_id"] == owned_id
             if check:
                 check(self.snapshot)
+            if initial_pause_case:
+                self.resumes += 1
+                assert not self.inputs, "initial interrupted Resume cannot admit a source frame"
+                if self.resumes == 1:
+                    self.connection = "accepted-initial-connect"
+                    identity = dict(self.identities(), intent_revision=3)
+                    self.snapshot["run"].update(status="paused", intent_revision=5, remaining_s=299.)
+                    self.snapshot["evidence"]["active_acknowledged"] = False
+                    event = {"kind": "required_view_expired", "at": 2.,
+                             "run_id": owned_id, "service_incarnation": "service"}
+                    self.snapshot["events"] = [event]
+                    raise m._ResumePausedError(identity, event)
+                self.snapshot["run"]["status"] = "running"
+                self.snapshot["evidence"]["active_acknowledged"] = True
+                return
             if recovery_case or ordinary_case or mailbox_case:
                 assert self.snapshot["run"]["status"] != "recovering"
                 self.resumes += 1
@@ -799,6 +817,8 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 self.sequence = 0
 
         async def command(self, payload):
+            if initial_pause_case:
+                assert self.resumes == 2, "grant/input cannot precede initial true active ACK"
             if payload["op"] == "grant":
                 if (
                     recovery_case
@@ -892,6 +912,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 or ordinary_case
                 or mailbox_case
                 or timed_expiry
+                or initial_pause_case
                 or failure in {"zero_deadline_rounding", "zero_inner_timeout"}
             ):
                 pc_clock[0] += 0.01
@@ -917,7 +938,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 if failure == "mailbox_connection":
                     self.connection = "replacement-connection"
                 return {"snapshot": self.snapshot}
-            if ordinary_case and not self.stops:
+            if (ordinary_case or initial_pause_case) and not self.stops:
                 pc_clock[0] += 0.05  # Held reads must not add active workload time.
             if recovery_case and self.authoritative is not None and not self.stops:
                 pc_clock[0] += 0.05
@@ -1008,6 +1029,22 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
         args.duration_seconds = 0.03
     if foreign_boundary:
         args.next_start_seconds = 0.001
+    if initial_pause_case:
+        import json
+
+        args.source = "virtual-leaders"  # This assertion concerns the scripted-progress clock.
+        summary = asyncio.run(asyncio.wait_for(m.run(args), 5))
+        session = instances[0]
+        records = [json.loads(line) for line in (tmp_path / "evidence" / "frames.jsonl").read_text().splitlines()]
+        assert session.resumes == 2 and session.starts == 1 and session.stops == [owned_id]
+        assert sum(r["event"] == "accepted_resume_superseded" for r in records) == 1
+        assert next(i for i, r in enumerate(records) if r["event"] == "accepted_resume_superseded") < next(
+            i for i, r in enumerate(records) if r["event"] == "leader_frame_attempt")
+        first_frame = next(r for r in records if r["event"] == "leader_frame_attempt")
+        assert 0 <= first_frame["progress_s"] < .04  # Held initial work is outside the active clock.
+        assert summary["active_progress_s"] == 0 and summary["frame_count"] == 1
+        assert summary["original_native_deadline"] == 301. and summary["cleanup_errors"] == []
+        return
     if http_start:
         import json
 
@@ -1710,7 +1747,7 @@ def test_original_recovery_ceiling_includes_authenticated_read_time_without_rean
     asyncio.run(asyncio.wait_for(scenario(), 0.3))
 
 
-@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss"])
+@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice"])
 def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(tmp_path, cause):
     import asyncio
     import copy
@@ -1871,6 +1908,74 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
             assert first[2]["accepted"] is True and producer.sequence == 1
             stale = copy.deepcopy(client.snapshot)
             assert stale["run"]["status"] == "running"
+            if cause in {"resume_view_pause", "resume_view_twice"}:
+                # Synthetic view expiry AFTER a positively accepted Resume,
+                # before an active snapshot. Core/Gateway/client are real.
+                pi_clock, remaining_pauses = [10.01], [2 if cause == "resume_view_twice" else 1]
+                a.clock = e.clock = lambda: pi_clock[0]  # Same Pi clock for owner and mailbox expiry.
+                a._pause_live_input("required_view_expired")
+                a._teleop_view["qualified_until"] = pi_clock[0] + .5
+                original_call, original_get = gateway.call, client.get
+                original_evidence, defer_active = e.evidence, [False]
+                def pending_active_evidence():
+                    value = original_evidence()
+                    if defer_active[0] and e.desired == "active":
+                        # Fake native ACK has not arrived yet. Prevent a real
+                        # publisher race from qualifying BEFORE the injected pause.
+                        value["active_acknowledged"] = False
+                        value["accepted_host_action"].update(state="paused", epoch=epoch[0] - 1)
+                    return value
+                e.evidence = pending_active_evidence
+                resume_commands, new_pause_reads = [], []
+                current_pause = [None]
+
+                async def pause_accepted_resume(command, device):
+                    if command.get("op") == "resume" and remaining_pauses[0]:
+                        defer_active[0] = True
+                    result = await original_call(command, device)
+                    if command.get("op") == "resume":
+                        assert result["accepted"] is True
+                        resume_commands.append(copy.deepcopy(command))
+                        assert sum(op == "input" for op, _ in commands) == 1
+                        if remaining_pauses[0]:
+                            remaining_pauses[0] -= 1
+                            pi_clock[0] += .02
+                            a._teleop_view["qualified_until"] = pi_clock[0] - .001
+                            a.tick()  # Actual selected-view protection owns the new pause.
+                            assert a.run["status"] == "paused"
+                            current_pause[0] = copy.deepcopy(a.events[-1])
+                            defer_active[0] = False
+                    return result
+
+                async def fresh_owner(path):
+                    result = await original_get(path)
+                    if current_pause[0] is not None:
+                        assert result["snapshot"]["run"]["status"] == "paused"
+                        assert result["snapshot"]["events"][-1] == current_pause[0]
+                        new_pause_reads.append(current_pause[0])
+                        current_pause[0] = None
+                        pi_clock[0] += .01
+                        a._teleop_view["qualified_until"] = pi_clock[0] + .5
+                    return result
+
+                gateway.call, client.get = pause_accepted_resume, fresh_owner
+                ceiling = m.time.monotonic() + 1.5
+                assert not await guard.resume(expected_pause="required_view_expired", wall_deadline=ceiling)
+                count = 3 if cause == "resume_view_twice" else 2
+                assert len(resume_commands) == count and len(new_pause_reads) == count - 1
+                assert len({c["operation_id"] for c in resume_commands}) == count
+                assert client.snapshot["run"]["status"] == "running"
+                assert client.snapshot["evidence"]["active_acknowledged"] is True
+                assert a.run["deadline"] == 309. and a.run["native_live_at"] == 9.
+                assert guard.episodes == 0 and guard.pause_recoveries == count
+                assert m.time.monotonic() < ceiling
+                assert not any(r["event"] == "qualified_native_recovery" for r in records)
+                producer.native_cursor = m._live(client.snapshot)["cursor"]
+                producer.reacquire = True
+                fresh = await m.send_leader_sample(client, producer, m.ZERO_BODY, record,
+                                                   phase="individual", progress_s=.04)
+                assert fresh[2]["accepted"] is True and producer.sequence == 2
+                return
             if cause in {"release_loss_pre", "release_loss_post", "release_connection_loss"}:
                 # Synthetic delayed release; real Core/IPC/Gateway concurrently
                 # execute it only AFTER a new connection has resumed the run.
@@ -2647,6 +2752,11 @@ def test_pending_connect_replacement_preserves_identity_proof_budget_and_origina
         def renewal_healthy():
             if change == "renewal" and client.lost or change == "renewal_after_attach" and client.attaches:
                 raise RuntimeError("original HTTP renewal failed")
+        if change in {"native_expired", "http_delay"}:
+            with pytest.raises(TimeoutError):
+                await guard.resume(wall_deadline=1002., renewal_check=renewal_healthy)
+            assert calls == [] and client.attaches == 0  # Budget expired before pending transport I/O exists.
+            return
         if change in {None, "two_losses"}:
             assert not await guard.resume(wall_deadline=1002.0, expected_pause="input_expired",
                                           renewal_check=renewal_healthy)
@@ -2890,6 +3000,11 @@ def test_known_connect_empty_release_loss_requires_new_fenced_authority(monkeypa
         def healthy():
             if change == "renewal" and client.releases or change == "renewal_after_attach" and client.attaches:
                 raise RuntimeError("original renewal failed")
+        if change in {"native_expired", "http_delay"}:
+            with pytest.raises(TimeoutError):
+                await guard.resume(wall_deadline=1002., renewal_check=healthy)
+            assert calls == [] and client.attaches == 0  # No original release was attempted after expiry.
+            return
         if change in {None, "connection_loss"}:
             assert not await guard.resume(wall_deadline=1002., renewal_check=healthy)
             assert [v["op"] for v in calls] == ["connect", "release_input", "connect", "release_input", "resume"]
@@ -2905,3 +3020,218 @@ def test_known_connect_empty_release_loss_requires_new_fenced_authority(monkeypa
             assert client.connects <= 2 and client.releases <= 2 and client.attaches <= 1
         assert not any(v["op"] in {"claim", "start", "input", "grant"} for v in calls)
     asyncio.run(asyncio.wait_for(scenario(), .5))
+
+
+@pytest.mark.parametrize("expired", [False, True])
+def test_interrupted_resume_defers_episode_credit_and_preserves_original_episode_ceiling(monkeypatch, expired):
+    import asyncio
+    import copy
+    import time
+    from types import SimpleNamespace
+
+    m = adapter()
+    pc = [1000.0]
+    monkeypatch.setattr(m, "time", SimpleNamespace(monotonic=lambda: pc[0], perf_counter=time.perf_counter))
+    first, ready = recovering_state(), requalified_state()
+    records, resumes = [], []
+
+    class Client:
+        snapshot = recovery_state()
+        device, generation, connection = "device", "control", "connection"
+        identities = m.SessionClient.identities
+        reads = 0
+
+        async def get(self, path):
+            self.reads += 1
+            if self.reads == 1:
+                self.snapshot = copy.deepcopy(first)
+            elif self.reads == 2:
+                pc[0] += .05
+                self.snapshot = copy.deepcopy(ready)
+            else:
+                pc[0] += .5 if expired else .05
+            return {"snapshot": copy.deepcopy(self.snapshot)}
+
+        async def resume(self, *, check):
+            check(self.snapshot)
+            resumes.append(pc[0])
+            assert not any(r["event"] == "qualified_native_recovery" for r in records)
+            if len(resumes) == 1:
+                # Model known connect(+1), accepted Resume(+1), ordinarypause(+1).
+                identity = dict(self.identities(), intent_revision=self.snapshot["run"]["intent_revision"] + 1)
+                self.snapshot["run"].update(intent_revision=6, remaining_s=299.8)
+                event = {"kind": "required_view_expired", "at": 100.2,
+                         "run_id": "owned", "service_incarnation": "service"}
+                self.snapshot["events"].append(event)
+                raise m._ResumePausedError(identity, event)
+            assert pc[0] < 1000.39, "continued beyond the original episode ceiling"
+            self.snapshot["run"]["status"] = "running"
+            self.snapshot["evidence"]["active_acknowledged"] = True
+
+    async def scenario():
+        client = Client()
+        guard = m.SameRunRecovery(client, records.append)
+        if expired:
+            with pytest.raises(TimeoutError):
+                await guard.resume(wall_deadline=1002.)
+            assert len(resumes) == 1
+            assert not any(r["event"] == "qualified_native_recovery" for r in records)
+        else:
+            assert await guard.resume(wall_deadline=1002.) is True
+            assert len(resumes) == 2
+            qualified = [r for r in records if r["event"] == "qualified_native_recovery"]
+            assert len(qualified) == 1 and qualified[0]["original_recovery"] == first["run"]["recovery"]
+        assert guard.episodes == 1 and guard.cause == "feedback_loss"
+    asyncio.run(asyncio.wait_for(scenario(), .7))
+
+
+@pytest.mark.parametrize("mutation", [
+    None, "twice", "manual", "foreign_event", "event_extra", "old_event", "before_request",
+    "revision_plus1", "revision_plus3", "bool_revision", "connection", "foreign_run", "foreign_host",
+    "reference", "workspace", "deadline", "uncertain", "fault", "terminal", "recovering",
+    "remaining_increased", "remaining_invalid", "wall_budget", "native_budget", "missing_ack",
+    "false_ack", "wrong_ack_status", "resume_timeout", "resume_connection", "fresh_event_changed",
+    "fresh_revision", "renewal", "renewal_initial",
+])
+def test_accepted_resume_superseding_pause_preserves_identity_proof_and_one_clock(monkeypatch, mutation):
+    import asyncio
+    import copy
+    import time
+    from types import SimpleNamespace
+
+    m = adapter()
+    pc = [1000.0]
+    monkeypatch.setattr(m, "time", SimpleNamespace(monotonic=lambda: pc[0], perf_counter=time.perf_counter))
+    original = TimeoutError("original Resume outcome unknown") if mutation == "resume_timeout" else ConnectionError("original Resume result lost")
+    state = recovery_state()
+    state["run"].update(status="paused", operation_id=str(uuid4()), remaining_s=.15 if mutation == "native_budget" else 299.99)
+    state["evidence"]["active_acknowledged"] = False
+    pi_start = state["run"]["deadline"] - state["run"]["remaining_s"]
+    state["events"] = [{"kind": "required_view_expired", "at": pi_start - .01,
+                         "run_id": "owned", "service_incarnation": "service"}]
+    calls, records = [], []
+
+    class Client:
+        snapshot = copy.deepcopy(state)
+        device, generation, connection = "device", "control", "connection"
+        identities, resume = m.SessionClient.identities, m.SessionClient.resume
+        reads = connects = resumes = 0
+
+        async def get(self, path):
+            self.reads += 1
+            pc[0] += .8 if mutation == "wall_budget" and self.reads > 1 else .01
+            if self.reads > 1:
+                self.snapshot["run"]["remaining_s"] = state["run"]["remaining_s"] - self.resumes * .01
+                if mutation == "remaining_increased":
+                    self.snapshot["run"]["remaining_s"] = 300.
+                if mutation == "remaining_invalid":
+                    self.snapshot["run"]["remaining_s"] = True
+                if mutation == "fresh_event_changed":
+                    self.snapshot["events"][-1]["at"] += .001
+                if mutation == "fresh_revision":
+                    self.snapshot["run"]["intent_revision"] += 1
+            return {"snapshot": copy.deepcopy(self.snapshot)}
+
+        async def command(self, payload):
+            calls.append(copy.deepcopy(payload))
+            pc[0] += .02
+            if payload["op"] == "connect":
+                self.connects += 1
+                self.snapshot = copy.deepcopy(self.snapshot)
+                revision = self.snapshot["run"]["intent_revision"] + 1
+                self.snapshot["run"].update(intent_revision=revision, status="paused")
+                self.snapshot["run"]["live_input"]["cursor_intent_revision"] = revision
+                self.snapshot["evidence"].update(hold_acknowledged=True, pose_aligned=True, native_ack=True,
+                                                active_acknowledged=False, acknowledged_intent_revision=revision)
+                self.snapshot["evidence"]["accepted_host_action"].update(intent_revision=revision, state="paused")
+                return {"connection_generation": "connection-" + str(self.connects), "snapshot": self.snapshot}
+            if payload["op"] == "release_input":
+                return {"accepted": True}
+            assert payload["op"] == "resume"
+            self.resumes += 1
+            if mutation in {"resume_timeout", "resume_connection"}:
+                raise original
+            if self.resumes <= (2 if mutation == "twice" else 1) or mutation == "wall_budget":
+                revision = payload["intent_revision"] + 2
+                if mutation == "revision_plus1":
+                    revision -= 1
+                if mutation == "revision_plus3":
+                    revision += 1
+                if mutation == "bool_revision":
+                    revision = True
+                self.snapshot["run"].update(status="paused", intent_revision=revision)
+                event = {"kind": "required_view_expired", "at": pi_start + self.resumes * .01,
+                         "run_id": "owned", "service_incarnation": "service"}
+                if mutation == "manual":
+                    event["kind"] = "pause"
+                if mutation == "foreign_event":
+                    event["run_id"] = "foreign"
+                if mutation == "event_extra":
+                    event["extra"] = True
+                if mutation == "old_event":
+                    event["at"] = self.snapshot["events"][-1]["at"]
+                if mutation == "before_request":
+                    event["at"] = pi_start - .001
+                self.snapshot["events"].append(event)
+                if mutation == "connection":
+                    self.connection = "foreign"
+                if mutation in {"foreign_run", "foreign_host", "deadline", "uncertain", "terminal", "recovering"}:
+                    key, value = {"foreign_run": ("run_id", "foreign"), "foreign_host": ("backend_incarnation", "foreign"),
+                                  "deadline": ("deadline", 401.), "uncertain": ("uncertain", True),
+                                  "terminal": ("status", "stopped"), "recovering": ("status", "recovering")}[mutation]
+                    self.snapshot["run"][key] = value
+                if mutation == "reference":
+                    self.snapshot["run"]["live_input"]["reference"][KEYS[0]] += 1
+                if mutation == "workspace":
+                    self.snapshot["run"]["live_input"]["workspace"]["reference"][KEYS[0]] += 1
+                if mutation == "fault":
+                    self.snapshot["evidence"]["fault"] = "real fault"
+            else:
+                self.snapshot["run"].update(status="running", intent_revision=payload["intent_revision"] + 1)
+                self.snapshot["evidence"]["active_acknowledged"] = True
+            if mutation == "native_budget":
+                pc[0] += .2
+            result = {"accepted": True, "status": "resuming", "effect_admitted": False}
+            if mutation == "missing_ack":
+                result.pop("accepted")
+            if mutation == "false_ack":
+                result["accepted"] = False
+            if mutation == "wrong_ack_status":
+                result["status"] = "unknown"
+            return result
+
+        async def wait(self, predicate, timeout):
+            if not predicate():
+                raise TimeoutError("actual active ACK unavailable")
+
+    async def scenario():
+        client = Client()
+        guard = m.SameRunRecovery(client, records.append)
+        def healthy():
+            if mutation == "renewal_initial" or mutation == "renewal" and client.resumes:
+                raise RuntimeError("original renewal failed")
+        if mutation in {None, "twice"}:
+            assert await guard.resume(wall_deadline=1002., renewal_check=healthy) is False
+            assert client.resumes == (3 if mutation == "twice" else 2)
+            assert client.snapshot["evidence"]["active_acknowledged"] is True
+            assert len({c["operation_id"] for c in calls if c["op"] == "resume"}) == client.resumes
+        else:
+            with pytest.raises((RuntimeError, TimeoutError, ConnectionError)) as caught:
+                await guard.resume(wall_deadline=1002., renewal_check=healthy)
+            if mutation in {"resume_timeout", "resume_connection"}:
+                assert caught.value is original
+            if mutation == "renewal_initial":
+                assert not calls
+            elif mutation == "wall_budget":
+                assert pc[0] >= 1002. and 1 < client.resumes < 5
+            else:
+                assert client.resumes == 1
+            assert not any(r["event"] == "qualified_native_recovery" for r in records)
+        assert guard.episodes == 0 and guard.original["run"]["deadline"] == 400.
+        assert not any(c["op"] in {"grant", "input", "claim", "start"} for c in calls)
+    asyncio.run(asyncio.wait_for(scenario(), .6))
+
+
+def test_initial_runner_waits_through_superseding_pause_before_grant_and_progress(tmp_path, monkeypatch):
+    test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id(
+        tmp_path, monkeypatch, "initial_resume_pause")

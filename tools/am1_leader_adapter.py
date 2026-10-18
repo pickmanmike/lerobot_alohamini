@@ -195,6 +195,21 @@ class CommandRefusedError(RuntimeError):
         super().__init__(self.reason)
 
 
+class _ResumePausedError(RuntimeError):
+    """A known accepted Resume was superseded by a new ordinary pause."""
+
+    def __init__(self, identity, event):
+        super().__init__("accepted Resume superseded by a new ordinary pause")
+        self.identity, self.event = json.loads(json.dumps([identity, event], allow_nan=False))
+        self.episode = None
+
+
+def _latest_run_event(snapshot, identity):
+    return next((event for event in reversed(snapshot.get("events", []))
+                 if event.get("run_id") == identity["run_id"]
+                 and event.get("service_incarnation") == identity["service_incarnation"]), {})
+
+
 class HTTPOutcomeError(RuntimeError):
     """A bounded original HTTP outcome; refusal and ambiguity remain distinct."""
 
@@ -542,10 +557,16 @@ class SessionClient:
             )
 
         await self.wait(qualified, 8)
-        await self.command(
+        identity = self.identities()
+        prior_event = json.loads(json.dumps(_latest_run_event(self.snapshot, identity), allow_nan=False))
+        run = self.snapshot["run"]
+        remaining = run.get("remaining_s")
+        pi_lower_bound = (run["deadline"] - remaining
+                          if type(remaining) in (int, float) and math.isfinite(remaining) else None)
+        resumed = await self.command(
             dict(
                 op="resume",
-                **self.identities(),
+                **identity,
                 expected_intent_revision=self.snapshot["run"]["intent_revision"],
                 operation_id=str(uuid4()),
             )
@@ -554,10 +575,24 @@ class SessionClient:
         def active():
             if check:
                 check(self.snapshot)
-            return (
-                self.snapshot["run"]["status"] == "running"
-                and self.snapshot["evidence"].get("active_acknowledged") is True
-            )
+            run = self.snapshot["run"]
+            if run.get("status") == "paused" and run.get("intent_revision") != identity["intent_revision"]:
+                event = _latest_run_event(self.snapshot, identity)
+                at, prior_at = event.get("at"), prior_event.get("at")
+                if (resumed.get("accepted") is True and resumed.get("status") in {"running", "resuming"}
+                    and type(identity["intent_revision"]) is int
+                    and all(type(value) is str and value for key, value in identity.items() if key != "intent_revision")
+                    and all(type(self.identities()[key]) is type(value) and self.identities()[key] == value
+                            for key, value in dict(identity, intent_revision=identity["intent_revision"] + 2).items())
+                    and type(run.get("intent_revision")) is int
+                    and set(event) == {"kind", "at", "run_id", "service_incarnation"}
+                    and event.get("kind") in {"required_view_expired", "input_expired", "native_input_expired"}
+                    and all(type(value) in (int, float) and math.isfinite(value)
+                            for value in (at, prior_at, pi_lower_bound))
+                    and prior_at < at and pi_lower_bound <= at < run["deadline"]):
+                    raise _ResumePausedError(identity, event)
+                raise RuntimeError("accepted Resume superseded by an unqualified pause")
+            return run.get("status") == "running" and self.snapshot["evidence"].get("active_acknowledged") is True
 
         await self.wait(active, 5)
 
@@ -649,6 +684,31 @@ class SameRunRecovery:
         self, *, wall_deadline=None, require_episode=False, refusal_identity=None, expected_pause=None,
         renewal_check=None,
     ):
+        clock = {"ceiling": wall_deadline, "anchored": False}
+        interrupted, deferred = None, []
+        while True:
+            try:
+                recovered = await self._resume_once(
+                    wall_deadline=clock["ceiling"], require_episode=require_episode,
+                    refusal_identity=refusal_identity, expected_pause=expected_pause,
+                    renewal_check=renewal_check, clock=clock, interrupted=interrupted)
+            except _ResumePausedError as outcome:
+                if outcome.episode is not None:
+                    deferred.append(outcome.episode)
+                interrupted = outcome
+                require_episode, refusal_identity, expected_pause = False, None, outcome.event["kind"]
+                self.record({"event": "accepted_resume_superseded", "identity": outcome.identity,
+                             "pause_event": outcome.event, "remaining_s": clock["ceiling"] - time.monotonic()})
+                continue
+            for episode in deferred:
+                self.record({"event": "qualified_native_recovery", "original_recovery": episode,
+                             "snapshot": self.client.snapshot})
+            return recovered or bool(deferred)
+
+    async def _resume_once(
+        self, *, wall_deadline, require_episode, refusal_identity, expected_pause,
+        renewal_check, clock, interrupted,
+    ):
         # This is the existing authenticated owner read, not a WSS freshness
         # guess. Anchor BEFORE the read so HTTP time cannot extend the ceiling.
         mailbox_refusal = expected_pause == "native_input_expired" and refusal_identity is not None
@@ -674,6 +734,19 @@ class SameRunRecovery:
         )["snapshot"]
         self.client.snapshot = state
         native_remaining = (state.get("run") or {}).get("remaining_s")
+        if not clock["anchored"]:
+            if (type(native_remaining) not in (int, float) or not math.isfinite(native_remaining)
+                or not 0 < native_remaining <= self.original["run"]["deadline"] - self.original["run"]["native_live_at"]):
+                raise RuntimeError("original native rejoin clock unavailable")
+            clock["ceiling"] = min(requested + native_remaining,
+                                   wall_deadline if wall_deadline is not None else float("inf"))
+            clock["anchored"] = True
+            clock["remaining"] = native_remaining
+        elif (type(native_remaining) not in (int, float) or not math.isfinite(native_remaining)
+              or not 0 < native_remaining <= clock["remaining"]):
+            raise RuntimeError("original native rejoin remaining clock increased or became invalid")
+        clock["remaining"] = native_remaining
+        wall_deadline = clock["ceiling"]
         self.record(
             {
                 "event": "owner_rejoin_state",
@@ -683,6 +756,18 @@ class SameRunRecovery:
             }
         )
         self.check(state, history=False)
+        if interrupted is not None:
+            identity = interrupted.identity
+            actual = self.client.identities()
+            self.check(state)
+            if (set(actual) != set(identity)
+                or any(type(actual[k]) is not type(v) or actual[k] != v
+                       for k, v in identity.items() if k != "intent_revision")
+                or state["run"].get("status") != "paused" or state["run"].get("recovery") is not None
+                or type(state["run"].get("intent_revision")) is not int
+                or state["run"]["intent_revision"] != identity["intent_revision"] + 2
+                or _latest_run_event(state, identity) != interrupted.event):
+                raise RuntimeError("fresh authority for superseding ordinary pause changed")
         if mailbox_refusal and (
             self.client.connection != refusal_identity["connection_generation"]
             or state["run"]["status"] != "paused"
@@ -752,6 +837,7 @@ class SameRunRecovery:
                 requested + episode["ceiling"] - pi_now,
                 wall_deadline if wall_deadline is not None else float("inf"),
             )
+            clock["ceiling"] = min(clock["ceiling"], local_ceiling)
             cause, count, connection = run["first_cause"], run["recovery_episodes"], self.client.connection
             self.record(
                 {
@@ -839,6 +925,12 @@ class SameRunRecovery:
             renewal_check()
         try:
             await asyncio.wait_for(self.client.resume(check=self.check), timeout)
+        except _ResumePausedError as outcome:
+            self.check(self.client.snapshot)
+            outcome.episode = episode if recovered else None
+            if renewal_check:
+                renewal_check()
+            raise
         except (ConnectionError, TimeoutError) as original:
             release = getattr(original, "empty_release_context", None)
             release_loss = isinstance(release, dict) and set(release) == {"identity", "connect_identity", "snapshot"}
@@ -1374,7 +1466,12 @@ async def run(args):
         producer.workspace = workspace
         producer.native_cursor = _live(client.snapshot)["cursor"]
         recovery = SameRunRecovery(client, record)
-        await recovery.resume()
+        def renewal_healthy():
+            if renewal.done():
+                renewal.result()
+                raise RuntimeError("original controller renewal ended")
+
+        await recovery.resume(renewal_check=renewal_healthy)
         if workload and not args.next_start_seconds:
             workload.admit(time.monotonic())
         active_at, interrupted, frame_count = time.monotonic(), False, 0
@@ -1382,11 +1479,6 @@ async def run(args):
         def wall_deadline():
             duration = args.next_start_seconds or (args.duration_seconds if workload is None else None)
             return None if duration is None else active_at + duration
-
-        def renewal_healthy():
-            if renewal.done():
-                renewal.result()
-                raise RuntimeError("original controller renewal ended")
 
         async def rejoin(*, require_episode=False, refusal_identity=None, expected_pause=None, until=None):
             renewal_healthy()
