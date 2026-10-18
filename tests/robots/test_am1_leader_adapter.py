@@ -1747,7 +1747,7 @@ def test_original_recovery_ceiling_includes_authenticated_read_time_without_rean
     asyncio.run(asyncio.wait_for(scenario(), 0.3))
 
 
-@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_view_reconnect", "grant_view_switch", "qualification_episode_pending", "qualification_episode_cleared", "resume_alignment_refusal", "resume_alignment_refused_twice"])
+@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_view_reconnect", "grant_view_switch", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_alignment_refusal", "resume_alignment_refused_twice"])
 def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(tmp_path, cause):
     import asyncio
     import copy
@@ -1902,10 +1902,11 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
 
             producer = m.FrameProducer(Input())
             producer.workspace, producer.native_cursor = workspace(), workspace()["reference"]
-            if cause in {"qualification_episode_pending", "qualification_episode_cleared"}:
+            if cause in {"qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode"}:
                 # Synthetic50: a NEW actual Core episode opens during the
                 # already-connected empty-release/held qualification phase.
                 pi_now, injected, thermal = [10.], [False], [None]
+                repeated = [False]
                 a.clock = e.clock = lambda: pi_now[0]
                 native_evidence = e.evidence
 
@@ -1924,6 +1925,8 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                 def restore_native():
                     pi_now[0] += .125
                     healthy[0] = True
+                    if cause == "qualification_same_episode":
+                        a._teleop_view["qualified_until"] = pi_now[0] + .5
                     thermal[0].update(peaks_ready=True, raw_sample_at_monotonic_s=pi_now[0],
                                       hold_sample_at_monotonic_s=pi_now[0], zero_read_started_at_monotonic_s=pi_now[0],
                                       zero_read_completed_at_monotonic_s=pi_now[0])
@@ -1966,12 +1969,29 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                             restore_native()  # Real Core clears only its public descriptor.
                             assert a.run["status"] == "paused" and a.run["recovery"] is None
                         await original_wait(lambda: client.snapshot["run"]["recovery_episodes"] == 1, 1)
+                    elif cause == "qualification_same_episode" and not repeated[0] and timeout != 5:
+                        # Synthetic53: held qualification did not close the episode.
+                        # The acknowledged replacement connect advances revision,
+                        # then the SAME original deficit returns before Resume.
+                        repeated[0] = True
+                        assert guard.episodes == 1
+                        assert not any(v["command"]["op"] == "resume" for v in envelopes)
+                        pi_now[0] += .125
+                        healthy[0] = False
+                        thermal[0].update(peaks_ready=False, raw_sample_at_monotonic_s=pi_now[0])
+                        a.tick()
+                        descriptors.append(copy.deepcopy(a.run["recovery"]))
+                        assert a.run["recovery_episodes"] == 1
+                        assert all(descriptors[1][key] == descriptors[0][key] for key in ("started", "ceiling"))
+                        await original_wait(lambda: client.snapshot["run"]["status"] == "recovering", 1)
                     return await original_wait(predicate, timeout)
 
                 async def qualify_native():
-                    await native_wait.wait()  # Independent of authenticated GET.
-                    assert producer.sequence == client.sequence == 0
-                    restore_native()
+                    for _ in range(2 if cause == "qualification_same_episode" else 1):
+                        await native_wait.wait()  # Independent of authenticated GET.
+                        native_wait.clear()
+                        assert producer.sequence == client.sequence == 0
+                        restore_native()
 
                 client.ws.send_json, client.wait, guard.record = capture, interrupted_qualification, record_handoff
                 renewal = asyncio.create_task(client.renew())
@@ -1985,14 +2005,16 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                     await qualification
                     assert guard.episodes == 1 and a.run["recovery_episodes"] == 1
                     assert client.snapshot["evidence"]["active_acknowledged"] is True
-                    assert sum(v["command"]["op"] == "connect" for v in envelopes) == 2
+                    assert sum(v["command"]["op"] == "connect" for v in envelopes) == (3 if cause == "qualification_same_episode" else 2)
+                    assert guard.completed_episodes == 1
                     assert sum(v["command"]["op"] == "resume" for v in envelopes) == 1
                     assert not any(v["command"]["op"] in {"claim", "start", "input", "grant"} for v in envelopes)
                     closed = [v for v in records if v["event"] == "qualified_native_recovery"]
                     assert len(closed) == 1 and closed[0]["original_recovery"] == descriptors[0]
                     holds = [json.loads(row[0]) for row in a.db.execute("SELECT data FROM transitions")
                              if json.loads(row[0])["kind"] == "required_hold"]
-                    assert len(holds) == 1 and holds[0]["recovery"] == descriptors[0]
+                    assert len(holds) == (2 if cause == "qualification_same_episode" else 1)
+                    assert holds[0]["recovery"] == descriptors[0]
                     assert a.run["native_live_at"] == 9. and a.run["deadline"] == 309.
                     producer.native_cursor, producer.reacquire = m._live(client.snapshot)["cursor"], True
                     fresh = await m.send_leader_sample(client, producer, m.ZERO_BODY, record, phase="individual", progress_s=.02)
@@ -5782,3 +5804,150 @@ def test_nonadmitted_alignment_resume_preserves_original_phase_and_error(monkeyp
         if mutation is None:
             assert any(r["event"] == "resume_qualification_observed" for r in records)
     asyncio.run(asyncio.wait_for(scenario(), 1.))
+
+
+@pytest.mark.parametrize("mutation", [
+    None, "start", "ceiling", "count", "closed", "manual", "foreign", "fault", "uncertain", "cause",
+    "phase_expired", "phase_refill_late", "episode_expired", "caller_expired", "later_error",
+])
+def test_same_open_native_episode_retains_source_and_original_phase(monkeypatch, mutation):
+    """Synthetic53 safety/clock contrasts supplement the actual Core/Gateway sequence."""
+    import asyncio
+    import copy
+    from types import SimpleNamespace
+
+    m = adapter()
+    pc, records, errors, commands = [1000.], [], [], []
+    monkeypatch.setattr(m, "time", SimpleNamespace(monotonic=lambda: pc[0]))
+    paused = recovery_state()
+    paused["run"].update(status="paused", intent_revision=3, remaining_s=299.875)
+    paused["evidence"].update(active_acknowledged=False, acknowledged_intent_revision=3)
+    paused["evidence"]["accepted_host_action"].update(intent_revision=3, acquired_at_monotonic_s=100.125)
+    paused["run"]["live_input"]["cursor_intent_revision"] = 3
+    paused["events"] = [{"kind": "input_expired", "at": 100.125,
+                          "run_id": "owned", "service_incarnation": "service"}]
+    original = {"started": 100.25, "ceiling": 110.25, "revision": 3}
+    opened = copy.deepcopy(paused)
+    opened["run"].update(status="recovering", intent_revision=3, remaining_s=299.625,
+                         first_cause="feedback_loss", recovery_episodes=1, recovery=copy.deepcopy(original))
+    opened["events"].append({"kind": "required_hold", "at": 100.375, "run_id": "owned",
+                             "service_incarnation": "service", "recovery": copy.deepcopy(original)})
+    ready = copy.deepcopy(opened)
+    ready["run"].update(status="paused", intent_revision=4, remaining_s=299.5, recovery=None)
+    ready["events"].append({"kind": "live_sensing_requalified", "at": 100.5,
+                            "run_id": "owned", "service_incarnation": "service"})
+    ready["evidence"].update(acknowledged_intent_revision=4)
+    ready["evidence"]["accepted_host_action"].update(intent_revision=4, acquired_at_monotonic_s=100.5)
+    ready["run"]["live_input"]["cursor_intent_revision"] = 4
+    known = copy.deepcopy(ready)
+    known["run"]["intent_revision"] = 5
+    repeated = copy.deepcopy(known)
+    descriptor = dict(original, revision=5)
+    repeated["run"].update(status="recovering", remaining_s=299.375, recovery=descriptor)
+    repeated["events"].append({"kind": "required_hold", "at": 100.625, "run_id": "owned",
+                               "service_incarnation": "service", "recovery": copy.deepcopy(descriptor)})
+    refilled = copy.deepcopy(repeated)
+    refilled["run"].update(status="paused", intent_revision=6, remaining_s=299.25, recovery=None)
+    refilled["events"].append({"kind": "live_sensing_requalified", "at": 100.75,
+                               "run_id": "owned", "service_incarnation": "service"})
+    refilled["evidence"].update(acknowledged_intent_revision=6)
+    refilled["evidence"]["accepted_host_action"].update(intent_revision=6, acquired_at_monotonic_s=100.75)
+    refilled["run"]["live_input"]["cursor_intent_revision"] = 6
+
+    class Client:
+        device, generation, connection, sequence = "device", "control", "connection", 0
+        reads, attempts = 0, 0
+
+        def __init__(self):
+            self.snapshot = recovery_state()
+
+        def identities(self):
+            return m.SessionClient.identities(self)
+
+        async def get(self, path):
+            assert path == "state"
+            self.reads += 1
+            if self.reads == 3 and mutation == "phase_refill_late":
+                pc[0] += .75
+            self.snapshot = copy.deepcopy([paused, ready, refilled][min(self.reads - 1, 2)])
+            return {"snapshot": self.snapshot}
+
+        async def resume(self, *, check, refusal_record=None, qualification_ceiling=None):
+            self.attempts += 1
+            check(self.snapshot)
+            assert guard.completed_episodes == 0
+            if self.attempts == 1:
+                self.snapshot = copy.deepcopy(opened)
+            elif self.attempts == 2:
+                assert qualification_ceiling == 1008.  # Original held phase, never now + 8.
+                self.connection = str(uuid4())
+                self.snapshot = copy.deepcopy(known)
+                check(self.snapshot)  # Known acknowledged replacement, before the same deficit.
+                self.snapshot = copy.deepcopy(repeated)
+                if mutation in {"start", "ceiling"}:
+                    self.snapshot["run"]["recovery"][{"start": "started", "ceiling": "ceiling"}[mutation]] += .125
+                    self.snapshot["events"][-1]["recovery"] = copy.deepcopy(self.snapshot["run"]["recovery"])
+                elif mutation == "count":
+                    self.snapshot["run"]["recovery_episodes"] = 2
+                elif mutation == "closed":
+                    guard.completed_episodes = 1  # An already observed active ACK cannot reopen this token.
+                elif mutation == "manual":
+                    self.snapshot["events"].insert(-1, {"kind": "pause", "at": 100.5625,
+                                                       "run_id": "owned", "service_incarnation": "service"})
+                elif mutation == "foreign":
+                    self.snapshot["run"]["run_id"] = "foreign"
+                elif mutation == "fault":
+                    self.snapshot["evidence"]["fault"] = "actual native fault"
+                elif mutation == "uncertain":
+                    self.snapshot["run"]["uncertain"] = True
+                elif mutation == "cause":
+                    self.snapshot["run"]["first_cause"] = "manual"
+                if mutation in {"phase_expired", "episode_expired", "caller_expired", "phase_refill_late"}:
+                    pc[0] += {"phase_expired": 8., "episode_expired": 10.5,
+                              "caller_expired": .25, "phase_refill_late": 7.5}[mutation]
+            else:
+                assert qualification_ceiling == 1008.
+                if mutation == "later_error":
+                    raise ConnectionError("later transport failure")
+                commands.append("new-resume-active-ack")
+                self.snapshot["run"]["status"] = "running"
+                self.snapshot["evidence"]["active_acknowledged"] = True
+                check(self.snapshot)
+                return
+            try:
+                check(self.snapshot)
+            except m._NativeRecoveryPendingError as outcome:
+                outcome.held_view_ceiling = 1008.  # Same field supplied by the real SessionClient phase.
+                errors.append(outcome.original_error)
+                raise
+
+    async def scenario():
+        nonlocal guard
+        client = Client()
+        guard = m.SameRunRecovery(client, records.append)
+        if mutation is None:
+            assert await guard.resume(expected_pause="input_expired")
+            assert guard.completed_episodes == guard.episodes == 1
+            assert commands == ["new-resume-active-ack"]
+            assert len([v for v in records if v["event"] == "qualified_native_recovery"]) == 1
+        else:
+            with pytest.raises(RuntimeError) as caught:
+                await guard.resume(expected_pause="input_expired",
+                                   wall_deadline=1000.125 if mutation == "caller_expired" else None)
+            assert caught.value is errors[0]
+            assert guard.completed_episodes == (1 if mutation == "closed" else 0)
+            assert commands == []
+            assert not any(v["event"] == "qualified_native_recovery" for v in records)
+        assert client.sequence == 0
+        assert client.snapshot["run"]["deadline"] == 400.
+        if mutation == "phase_refill_late":
+            assert client.attempts == 2 and pc[0] == 1008.25
+        if mutation in {None, "phase_refill_late", "later_error"}:
+            handoffs = [v for v in records if v["event"] == "native_recovery_handoff"]
+            assert len(handoffs) == 2
+            assert all(v["original_recovery"]["started"] == original["started"]
+                       and v["original_recovery"]["ceiling"] == original["ceiling"] for v in handoffs)
+            assert handoffs[1]["local_ceiling_monotonic_s"] <= 1008.
+
+    guard = None
+    asyncio.run(scenario())

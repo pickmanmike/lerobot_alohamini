@@ -209,10 +209,11 @@ class _ResumePausedError(RuntimeError):
 class _NativeRecoveryPendingError(RuntimeError):
     """Source-qualified native recovery interrupts unfinished held qualification."""
 
-    def __init__(self, context, recovery, ceiling, original_error):
+    def __init__(self, context, recovery, ceiling, original_error, pending_episode=None):
         super().__init__("new native recovery interrupted held qualification")
         self.context, self.recovery = json.loads(json.dumps([context, recovery], allow_nan=False))
         self.ceiling, self.original_error, self.episode = ceiling, original_error, None
+        self.pending_episode = json.loads(json.dumps(pending_episode, allow_nan=False))
 
 
 def _latest_run_event(snapshot, identity):
@@ -969,6 +970,8 @@ class SessionClient:
                         if refusal_record:
                             refusal_record(dict(event="resume_view_refused", **context))
         except (Exception, asyncio.CancelledError) as error:
+            if isinstance(error, _NativeRecoveryPendingError):
+                error.held_view_ceiling = phase_ceiling
             if first_refusal is not None and error is not first_refusal:
                 raise first_refusal from error
             raise
@@ -1071,7 +1074,7 @@ class SameRunRecovery:
                 allow_nan=False,
             )
         )
-        self.episodes, self.cause, self.pause_recoveries = 0, None, 0
+        self.episodes, self.completed_episodes, self.cause, self.pause_recoveries = 0, 0, None, 0
         self.connect_rebindings = 0
         self.check(state)
 
@@ -1111,7 +1114,7 @@ class SameRunRecovery:
         if history and run.get("status") == "recovering":
             raise RuntimeError("native recovery must qualify before explicit Resume")
 
-    def _grant_episode(self, state, context):
+    def _grant_episode(self, state, context, *, pending=None):
         """Use only the original Core required_hold descriptor, never infer it."""
         run, identity = state["run"], context["identity"]
         own = [event for event in state.get("events", [])
@@ -1119,6 +1122,15 @@ class SameRunRecovery:
                and event.get("service_incarnation") == identity["service_incarnation"]]
         hold = next((event for event in reversed(own) if event.get("kind") == "required_hold"), {})
         episode = hold.get("recovery")
+        continuing = pending is not None
+        if continuing and (
+            not isinstance(pending, dict) or set(pending) != {"recovery", "count", "cause"}
+            or pending["count"] != self.episodes or not self.completed_episodes < self.episodes
+            or pending["cause"] != self.cause or run.get("first_cause") != pending["cause"]
+            or not isinstance(episode, dict)
+            or any(episode.get(k) != pending["recovery"].get(k) for k in ("started", "ceiling"))
+        ):
+            raise RuntimeError("same pending native recovery original episode changed or closed")
         if (set(hold) != {"kind", "at", "run_id", "service_incarnation", "recovery"}
             or not isinstance(episode, dict) or set(episode) != {"started", "ceiling", "revision"}
             or any(type(episode[k]) not in (int, float) or not math.isfinite(episode[k])
@@ -1128,19 +1140,19 @@ class SameRunRecovery:
             or type(hold.get("at")) not in (int, float) or not math.isfinite(hold["at"])
             or not self.original["run"]["native_live_at"] <= episode["started"] <= hold["at"] < episode["ceiling"]
             or not episode["ceiling"] <= min(episode["started"] + 10, run["deadline"])
-            or run.get("recovery_episodes") != self.episodes + 1
+            or run.get("recovery_episodes") != self.episodes + (0 if continuing else 1)
             or run.get("first_cause") not in {"feedback_loss", "native_active_ack_loss", "required_proof_loss"}
             or self.cause is not None and run.get("first_cause") != self.cause):
             raise RuntimeError("source-retained native recovery descriptor unavailable/invalid")
         index = own.index(hold)
         prior = context["snapshot"]["run"]
-        if (episode["started"] + prior["remaining_s"] < prior["deadline"]
+        if (not continuing and (episode["started"] + prior["remaining_s"] < prior["deadline"]
             or episode["revision"] == identity["intent_revision"] + 1
             and (index == 0 or own[index - 1].get("kind") not in
                  {"required_view_expired", "input_expired", "native_input_expired"}
                  or type(own[index - 1].get("at")) not in (int, float)
                  or own[index - 1]["at"] + prior["remaining_s"] < prior["deadline"]
-                 or own[index - 1]["at"] > hold["at"])):
+                 or own[index - 1]["at"] > hold["at"]))):
             raise RuntimeError("source-retained native recovery preceding pause changed")
         remaining = run.get("remaining_s")
         if (type(remaining) not in (int, float) or not math.isfinite(remaining)
@@ -1221,6 +1233,10 @@ class SameRunRecovery:
                     if outcome.episode is not None:
                         deferred.append(outcome.episode)
                     clock["ceiling"] = min(clock["ceiling"], outcome.ceiling)
+                    if hasattr(outcome, "held_view_ceiling"):
+                        clock["held_view_ceiling"] = min(clock.get("held_view_ceiling", float("inf")),
+                                                        outcome.held_view_ceiling)
+                        clock["ceiling"] = min(clock["ceiling"], clock["held_view_ceiling"])
                     pending_recovery, interrupted, grant_context = outcome, None, None
                     require_episode, refusal_identity, expected_pause = False, None, None
                     self.record({"event": "native_recovery_handoff", "original_recovery": outcome.recovery,
@@ -1239,6 +1255,9 @@ class SameRunRecovery:
                 for episode in deferred:
                     self.record({"event": "qualified_native_recovery", "original_recovery": episode,
                                  "snapshot": self.client.snapshot})
+                if (self.client.snapshot["run"].get("status") == "running"
+                    and self.client.snapshot.get("evidence", {}).get("active_acknowledged") is True):
+                    self.completed_episodes = self.episodes
                 return recovered or bool(deferred)
 
             except (Exception, asyncio.CancelledError) as error:
@@ -1365,7 +1384,7 @@ class SameRunRecovery:
             context = pending_recovery.context
             if self.client.connection != context["identity"]["connection_generation"]:
                 raise RuntimeError("pending native recovery binding changed")
-            retained = self._grant_episode(state, context)
+            retained = self._grant_episode(state, context, pending=pending_recovery.pending_episode)
             if retained != pending_recovery.recovery:
                 raise RuntimeError("pending native recovery original source descriptor changed")
         if grant_context is not None:
@@ -1419,7 +1438,8 @@ class SameRunRecovery:
                 or not episode["started"]
                 < episode["ceiling"]
                 <= min(episode["started"] + 10, run["deadline"])
-                or run["recovery_episodes"] != self.episodes + 1
+                or run["recovery_episodes"] != self.episodes + (0 if pending_recovery is not None
+                    and pending_recovery.pending_episode is not None else 1)
                 or run.get("first_cause")
                 not in {"feedback_loss", "native_active_ack_loss", "required_proof_loss"}
             ):
@@ -1546,9 +1566,17 @@ class SameRunRecovery:
                         self.record(detail)
                 try:
                     self.check(snapshot, history=False)
-                    if (qualification_context is None or self.history_qualified(snapshot)
-                        or snapshot["run"].get("recovery_episodes") != self.episodes + 1):
+                    same_pending = (recovered and episode is not None
+                                    and self.completed_episodes < self.episodes
+                                    and snapshot["run"].get("recovery_episodes") == self.episodes)
+                    if (qualification_context is None or not same_pending and (
+                        self.history_qualified(snapshot)
+                        or snapshot["run"].get("recovery_episodes") != self.episodes + 1)):
                         raise original
+                    pending = ({"recovery": (pending_recovery.pending_episode["recovery"]
+                                             if pending_recovery is not None and pending_recovery.pending_episode is not None
+                                             else episode), "count": self.episodes, "cause": self.cause}
+                               if same_pending else None)
                     context = json.loads(json.dumps(qualification_context, allow_nan=False))
                     identity, actual = context["identity"], self.client.identities()
                     if (set(actual) != set(identity)
@@ -1564,7 +1592,7 @@ class SameRunRecovery:
                         # no ambiguous command or authority can be adopted.
                         identity["connection_generation"] = generation
                         identity["intent_revision"] += 1
-                    recovery = self._grant_episode(snapshot, context)
+                    recovery = self._grant_episode(snapshot, context, pending=pending)
                     own = [v for v in snapshot.get("events", []) if v.get("run_id") == identity["run_id"]
                            and v.get("service_incarnation") == identity["service_incarnation"]]
                     hold_index = max(i for i, v in enumerate(own) if v.get("kind") == "required_hold")
@@ -1577,7 +1605,7 @@ class SameRunRecovery:
                     if refusal is original:
                         raise
                     raise original from refusal
-                raise _NativeRecoveryPendingError(context, recovery, ceiling, original) from original
+                raise _NativeRecoveryPendingError(context, recovery, ceiling, original, pending) from original
             if snapshot["run"].get("status") == "paused" and snapshot["run"].get("recovery") is None:
                 identities = getattr(self.client, "identities", None)
                 # Stateless supported callers keep their old behavior; without
@@ -1677,7 +1705,7 @@ class SameRunRecovery:
                            if "held_view_ceiling" in clock else {})
                 await asyncio.wait_for(self.client.resume(check=checked, refusal_record=self.record, **options), timeout)
         except _NativeRecoveryPendingError as outcome:
-            outcome.episode = episode if recovered else None
+            outcome.episode = episode if recovered and outcome.pending_episode is None else None
             raise
         except _ResumePausedError as outcome:
             self.check(self.client.snapshot)
@@ -1961,7 +1989,9 @@ class SameRunRecovery:
             self.record(
                 {
                     "event": "qualified_native_recovery",
-                    "original_recovery": episode,
+                    "original_recovery": (pending_recovery.pending_episode["recovery"]
+                                          if pending_recovery is not None and pending_recovery.pending_episode is not None
+                                          else episode),
                     "snapshot": self.client.snapshot,
                 }
             )
@@ -2635,7 +2665,7 @@ async def run(args):
             final_body_zero=True,
             interrupted=interrupted,
             qualified_recoveries=recovery.pause_recoveries,
-            qualified_native_recovery_episodes=recovery.episodes,
+            qualified_native_recovery_episodes=recovery.completed_episodes,
             terminal_qualification_seconds=time.monotonic() - qualification_at,
             endpoint_error_normalized={
                 k: final["evidence"]["measured_positions"][k] - frame["target"][k] for k in TELEOP_ARM_KEYS
@@ -2654,7 +2684,7 @@ async def run(args):
         summary["frame_count"] = frame_count
         if recovery:
             summary.update(
-                qualified_native_recovery_episodes=recovery.episodes,
+                qualified_native_recovery_episodes=recovery.completed_episodes,
                 ordinary_pauses_observed=recovery.pause_recoveries,
             )
     finally:
