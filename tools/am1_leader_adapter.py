@@ -2591,7 +2591,6 @@ async def run(args):
             workload = source = TeleopWorkload(workspace)
         producer = FrameProducer(source)
         producer.workspace = workspace
-        producer.native_cursor = _live(client.snapshot)["cursor"]
         recovery = SameRunRecovery(client, record)
         def renewal_healthy():
             if renewal.done():
@@ -2599,6 +2598,7 @@ async def run(args):
                 raise RuntimeError("original controller renewal ended")
 
         await recovery.resume(renewal_check=renewal_healthy)
+        producer.native_cursor = _live(client.snapshot)["cursor"]
         if workload and not args.next_start_seconds:
             workload.admit(time.monotonic())
         active_at, interrupted, frame_count = time.monotonic(), False, 0

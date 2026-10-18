@@ -1747,8 +1747,8 @@ def test_original_recovery_ceiling_includes_authenticated_read_time_without_rean
     asyncio.run(asyncio.wait_for(scenario(), 0.3))
 
 
-@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_view_reconnect", "grant_view_switch", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "held_qualification_loss", "resume_alignment_refusal", "resume_alignment_refused_twice"])
-def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(tmp_path, cause):
+@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_view_reconnect", "grant_view_switch", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "held_qualification_loss", "resume_alignment_refusal", "resume_alignment_refused_twice", "runner_initial_cursor_pending"])
+def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(tmp_path, monkeypatch, cause):
     import asyncio
     import copy
     import json
@@ -1767,6 +1767,10 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
     a.run.update(backend_incarnation=e.host_incarnation, recovery_episodes=0, status="paused")
     a._teleop_view = {"run_id": e.run_id, "qualified_until": 10.5, "role": "chest"}
     healthy, epoch, commands = [True], [0], []
+    cursor_ready = [cause != "runner_initial_cursor_pending"]
+    if not cursor_ready[0]:
+        e.desired = "hold"
+        a.run.update(accepted_at=8., startup_deadline=188.)
 
     def evidence():
         value = recovery_state()["evidence"]
@@ -1800,6 +1804,11 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                 "acquired_at_monotonic_s": a.clock(),
             },
         )
+        if not cursor_ready[0]:
+            for key in ("cursor", "cursor_intent_revision", "cursor_feedback_sequence"):
+                live.pop(key, None)
+            value.update(feedback=False, native_ack=False, pose_aligned=False,
+                         hold_acknowledged=False, active_acknowledged=False)
         return value
 
     e.evidence = evidence  # Explicit fake native sensing/ACK; Core/IPC/gateway/client are production.
@@ -1890,6 +1899,69 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
             client = m.SessionClient(gateway.origin, cert, storage)
             await client.attach()
             client.generation, client.connection = ids["controller_generation"], ids["connection_generation"]
+            if cause == "runner_initial_cursor_pending":
+                # Synthetic56: native Live is real Core status, not a current
+                # cursor/held/active qualification. Fake native sensing advances
+                # independently once the runner reaches its producer boundary.
+                initial = copy.deepcopy(client.snapshot)
+                assert initial["status_projection"] == {"kind": "am1-essential-status", "version": 1}
+                assert initial["run"]["native_live_at"] == 9. and initial["run"]["deadline"] == 309.
+                assert all(key not in m._live(initial)
+                           for key in ("cursor", "cursor_intent_revision", "cursor_feedback_sequence"))
+                assert all(initial["evidence"][key] is False for key in
+                           ("feedback", "native_ack", "pose_aligned", "hold_acknowledged", "active_acknowledged"))
+                producer_created, observed = asyncio.Event(), []
+                original_post, original_producer = client.post, m.FrameProducer
+                async def native_ready():
+                    await producer_created.wait()
+                    cursor_ready[0] = True
+                    a.tick()
+                qualification = asyncio.create_task(native_ready())
+                class RunnerSession(m.SessionClient):
+                    def __new__(cls, *_args):
+                        return client
+                class Producer(original_producer):
+                    def __init__(self, source):
+                        super().__init__(source)
+                        producer_created.set()
+                async def post(path, body):
+                    if path == "start":
+                        # Existing admitted fake-native lane; Core/Gateway reads,
+                        # connect/release/Resume and ACK qualification stay real.
+                        a.run["operation_id"] = body["operation_id"]
+                        client.snapshot = a.snapshot()
+                        return {"accepted": True, "run_id": e.run_id, "operation_id": body["operation_id"]}
+                    if path == "stop":
+                        a.run.update(status="stopped", cleanup="physical_readback_verified", uncertain=False)
+                        return {"accepted": True}
+                    return await original_post(path, body)
+                async def first_sample(_client, producer, _body, _record, **_kwargs):
+                    assert cursor_ready[0] and qualification.done()
+                    current = client.snapshot
+                    assert current["evidence"]["active_acknowledged"] is True
+                    assert m._live(current)["cursor_intent_revision"] == current["run"]["intent_revision"]
+                    assert producer.native_cursor == m._live(current)["cursor"]
+                    observed.append(copy.deepcopy(current))
+                    raise RuntimeError("synthetic current active cursor boundary")
+                async def already_attached():
+                    assert client.ws is not None and not client.ws.closed
+                client.attach, client.post = already_attached, post
+                monkeypatch.setattr(m, "SessionClient", RunnerSession)
+                monkeypatch.setattr(m, "FrameProducer", Producer)
+                monkeypatch.setattr(m, "send_leader_sample", first_sample)
+                args = type("Args", (), {"source": "virtual-leaders", "output": str(tmp_path / "run"),
+                    "url": gateway.origin, "ca": cert, "storage_state": storage, "next_start_seconds": None,
+                    "duration_seconds": 180, "interrupt_at_seconds": None})()
+                with pytest.raises(RuntimeError, match="synthetic current active cursor boundary"):
+                    await m.run(args)
+                assert len(observed) == 1
+                rows = [json.loads(v) for v in (tmp_path / "run/frames.jsonl").read_text().splitlines()]
+                admitted = next(v["snapshot"] for v in rows if v["event"] == "native_admitted")
+                assert "cursor" not in m._live(admitted)  # Preserve the genuine admission record.
+                assert not any(op in {"grant", "input"} for op, _ in commands)
+                assert sum(op == "connect" for op, _ in commands) == 1
+                assert a.run["native_live_at"] == 9. and a.run["deadline"] == 309.
+                return
             guard = m.SameRunRecovery(client, record)
             await guard.resume()
             initial_connects = sum(op == "connect" for op, _ in commands)
