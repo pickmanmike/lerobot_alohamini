@@ -919,10 +919,48 @@ class SessionClient:
                 sent_state = json.loads(json.dumps(self.snapshot, allow_nan=False))
                 command = dict(op="resume", **identity, expected_intent_revision=run["intent_revision"],
                                operation_id=str(uuid4()))
+                # Freeze the actual sent authority/proof BEFORE awaiting an
+                # unknown command result. This never constitutes nonadmission.
+                unknown_resume = json.loads(json.dumps({
+                    "identity": identity, "snapshot": sent_state, "operation_id": command["operation_id"],
+                    "prior_event": prior_event, "pi_lower_bound": pi_lower_bound,
+                    "phase_ceiling": phase_ceiling, "requested": time.monotonic(), "connect_identity": connect_identity,
+                    "release": released,
+                }, allow_nan=False))
                 try:
                     budget = phase_remaining()
                     resumed = await asyncio.wait_for(self.command(command), budget)
                     break
+                except ConnectionError as error:
+                    close = dict(getattr(self, "transport_close", None) or {})
+                    if (str(error) == "current WSS connection lost" and release_context is not None
+                        and isinstance(released, dict) and all(type(released.get(k)) is type(v)
+                            and released[k] == v for k, v in
+                            {"accepted": True, "status": "released", "effect_admitted": False}.items())
+                        and close.get("expected") is False and close.get("close_code") == 1006
+                        and close.get("reason") == "stream-ended" and close.get("reader_error") is None
+                        and close.get("exception_type") == "ClientConnectionResetError"
+                        and close.get("exception") == "Cannot write to closing transport"):
+                        unknown_resume["transport_close"] = {key: close.get(key) for key in
+                            ("expected", "close_code", "reason", "reader_error", "exception_type", "exception")}
+                        error.resume_result_context = unknown_resume
+                        if refusal_record:
+                            try:
+                                detail = {"event": "resume_result_unknown", "outcome": "unknown",
+                                          "operation_id": command["operation_id"], "identity": identity,
+                                          "phase_ceiling_monotonic_s": phase_ceiling, "native_remaining_s": remaining,
+                                          "sent_flags": {key: sent_state.get("evidence", {}).get(key) for key in
+                                              ("feedback", "required_observation", "hold_acknowledged", "pose_aligned", "native_ack", "active_acknowledged")},
+                                          "sent_ack": {key: (sent_state.get("evidence", {}).get("accepted_host_action") or {}).get(key)
+                                                       for key in ("state", "intent_revision", "acquired_at_monotonic_s")},
+                                          "transport_close": unknown_resume["transport_close"]}
+                                if len(json.dumps(detail, allow_nan=False).encode("utf-8")) > 2048:
+                                    raise ValueError("bounded unknown Resume context required")
+                                refusal_record(detail)
+                            except (Exception, asyncio.CancelledError) as reporting_error:
+                                del error.resume_result_context
+                                raise error from reporting_error
+                    raise
                 except CommandRefusedError as refusal:
                     reason = refusal.response.get("reason")
                     if (reason not in ("current required selected view must advance before Resume", "qualified release/alignment required")
@@ -1114,7 +1152,7 @@ class SameRunRecovery:
         if history and run.get("status") == "recovering":
             raise RuntimeError("native recovery must qualify before explicit Resume")
 
-    def _grant_episode(self, state, context, *, pending=None):
+    def _grant_episode(self, state, context, *, pending=None, resume_unknown=False):
         """Use only the original Core required_hold descriptor, never infer it."""
         run, identity = state["run"], context["identity"]
         own = [event for event in state.get("events", [])
@@ -1146,8 +1184,16 @@ class SameRunRecovery:
             raise RuntimeError("source-retained native recovery descriptor unavailable/invalid")
         index = own.index(hold)
         prior = context["snapshot"]["run"]
+        if resume_unknown:
+            previous = own[index - 1] if index else {}
+            if (previous != _latest_run_event(context["snapshot"], identity)
+                and (set(previous) != {"kind", "at", "run_id", "service_incarnation"}
+                     or previous.get("kind") != "resumed"
+                     or type(previous.get("at")) not in (int, float) or not math.isfinite(previous["at"])
+                     or not context["pi_lower_bound"] <= previous["at"] <= hold["at"])):
+                raise RuntimeError("unknown Resume native recovery preceding source event changed")
         if (not continuing and (episode["started"] + prior["remaining_s"] < prior["deadline"]
-            or episode["revision"] == identity["intent_revision"] + 1
+            or not resume_unknown and episode["revision"] == identity["intent_revision"] + 1
             and (index == 0 or own[index - 1].get("kind") not in
                  {"required_view_expired", "input_expired", "native_input_expired"}
                  or type(own[index - 1].get("at")) not in (int, float)
@@ -1180,7 +1226,8 @@ class SameRunRecovery:
     ):
         clock = {"ceiling": wall_deadline, "anchored": False}
         interrupted, deferred, first_transport_error = None, [], grant_error
-        grant_context, pending_recovery = None, None
+        grant_context, pending_recovery, resume_context = None, None, None
+        consumed_resumes = set()
         if grant_error is not None:
             try:
                 grant_context = getattr(grant_error, "grant_context", None)
@@ -1227,7 +1274,7 @@ class SameRunRecovery:
                         wall_deadline=clock["ceiling"], require_episode=require_episode,
                         refusal_identity=refusal_identity, expected_pause=expected_pause,
                         renewal_check=renewal_check, clock=clock, interrupted=interrupted,
-                        grant_context=grant_context, pending_recovery=pending_recovery)
+                        grant_context=grant_context, pending_recovery=pending_recovery, resume_context=resume_context)
                 except _NativeRecoveryPendingError as outcome:
                     first_transport_error = first_transport_error or outcome.original_error
                     if outcome.episode is not None:
@@ -1237,7 +1284,7 @@ class SameRunRecovery:
                         clock["held_view_ceiling"] = min(clock.get("held_view_ceiling", float("inf")),
                                                         outcome.held_view_ceiling)
                         clock["ceiling"] = min(clock["ceiling"], clock["held_view_ceiling"])
-                    pending_recovery, interrupted, grant_context = outcome, None, None
+                    pending_recovery, interrupted, grant_context, resume_context = outcome, None, None, None
                     require_episode, refusal_identity, expected_pause = False, None, None
                     self.record({"event": "native_recovery_handoff", "original_recovery": outcome.recovery,
                                  "identity": outcome.context["identity"], "local_ceiling_monotonic_s": outcome.ceiling})
@@ -1247,10 +1294,60 @@ class SameRunRecovery:
                     if outcome.episode is not None:
                         deferred.append(outcome.episode)
                     interrupted = outcome
-                    grant_context, pending_recovery = None, None
+                    grant_context, pending_recovery, resume_context = None, None, None
                     require_episode, refusal_identity, expected_pause = False, None, outcome.event["kind"]
                     self.record({"event": "accepted_resume_superseded", "identity": outcome.identity,
                                  "pause_event": outcome.event, "remaining_s": clock["ceiling"] - time.monotonic()})
+                    continue
+                except ConnectionError as original:
+                    context = getattr(original, "resume_result_context", None)
+                    if not isinstance(context, dict) or renewal_check is None:
+                        raise
+                    first_transport_error = first_transport_error or original
+                    before, identity = context["snapshot"], context["identity"]
+                    self.check(before)
+                    actual = {"run_id": self.original["run"]["run_id"], "service_incarnation": self.original["service"],
+                              "host_incarnation": self.original["run"]["backend_incarnation"],
+                              "controller_generation": self.client.generation, "connection_generation": self.client.connection,
+                              "intent_revision": before["run"].get("intent_revision")}
+                    known, close = context["connect_identity"], context["transport_close"]
+                    event, remaining, ceiling = context["prior_event"], before["run"].get("remaining_s"), context["phase_ceiling"]
+                    if (set(identity) != set(actual) or any(type(identity[k]) is not type(v) or identity[k] != v for k, v in actual.items())
+                        or type(identity["intent_revision"]) is not int or identity["intent_revision"] < 1
+                        or any(type(v) is not str or not v for k, v in identity.items() if k != "intent_revision")
+                        or not isinstance(known, dict) or set(known) != set(identity)
+                        or any(type(known[k]) is not type(v) or known[k] != v for k, v in identity.items()
+                               if k not in {"intent_revision", "connection_generation"})
+                        or known.get("intent_revision") != identity["intent_revision"] - 1
+                        or str(UUID(identity["connection_generation"])) != identity["connection_generation"]
+                        or str(UUID(context["operation_id"])) != context["operation_id"]
+                        or context["operation_id"] in consumed_resumes
+                        or before["run"].get("status") != "paused" or before["run"].get("recovery") is not None
+                        or _latest_run_event(before, identity) != event
+                        or event.get("kind") not in {"input_expired", "native_input_expired", "required_view_expired", "live_sensing_requalified"}
+                        or any(type(v) not in (int, float) or not math.isfinite(v)
+                               for v in (remaining, ceiling, context["requested"], context["pi_lower_bound"], event.get("at")))
+                        or not 0 < remaining <= clock["remaining"]
+                        or not 0 <= context["requested"] <= time.monotonic()
+                        or not ceiling <= context["requested"] + 8
+                        or not before["run"]["native_live_at"] <= event["at"] <= context["pi_lower_bound"] < before["run"]["deadline"]
+                        or close != {"expected": False, "close_code": 1006, "reason": "stream-ended", "reader_error": None,
+                                     "exception_type": "ClientConnectionResetError", "exception": "Cannot write to closing transport"}):
+                        raise original
+                    first_transport_error = first_transport_error or original
+                    clock["ceiling"] = min(clock["ceiling"], getattr(original, "resume_original_ceiling", float("inf")))
+                    clock["held_view_ceiling"] = min(clock.get("held_view_ceiling", float("inf")), ceiling)
+                    def remaining_budget():
+                        renewal_check()
+                        budget = min(clock["ceiling"], clock["held_view_ceiling"]) - time.monotonic()
+                        if budget <= 0:
+                            raise TimeoutError("original unknown Resume qualification ceiling exhausted")
+                        return budget
+                    consumed_resumes.add(context["operation_id"])
+                    await self._attach_transport(before, identity, remaining_budget, renewal_check)
+                    resume_context = context | {"pending_episode": getattr(original, "resume_pending_episode", None)}
+                    grant_context, pending_recovery, interrupted = None, None, None
+                    require_episode, refusal_identity, expected_pause = False, None, None
                     continue
                 for episode in deferred:
                     self.record({"event": "qualified_native_recovery", "original_recovery": episode,
@@ -1305,7 +1402,7 @@ class SameRunRecovery:
 
     async def _resume_once(
         self, *, wall_deadline, require_episode, refusal_identity, expected_pause,
-        renewal_check, clock, interrupted, grant_context=None, pending_recovery=None,
+        renewal_check, clock, interrupted, grant_context=None, pending_recovery=None, resume_context=None,
     ):
         # This is the existing authenticated owner read, not a WSS freshness
         # guess. Anchor BEFORE the read so HTTP time cannot extend the ceiling.
@@ -1357,7 +1454,8 @@ class SameRunRecovery:
             }
         )
         self.check(state, history=False)
-        if grant_context is not None and native_remaining > grant_context["snapshot"]["run"]["remaining_s"]:
+        binding_context = grant_context or resume_context
+        if binding_context is not None and native_remaining > binding_context["snapshot"]["run"]["remaining_s"]:
             raise RuntimeError("original grant native remaining clock increased")
         if interrupted is not None:
             identity = interrupted.identity
@@ -1387,6 +1485,25 @@ class SameRunRecovery:
             retained = self._grant_episode(state, context, pending=pending_recovery.pending_episode)
             if retained != pending_recovery.recovery:
                 raise RuntimeError("pending native recovery original source descriptor changed")
+        if resume_context is not None:
+            identity, run = resume_context["identity"], state["run"]
+            if self.client.connection != identity["connection_generation"]:
+                raise RuntimeError("original unknown Resume binding changed")
+            if (not self.history_qualified(state) or run.get("status") == "recovering"
+                or resume_context["pending_episode"] is not None
+                and _latest_run_event(state, identity) != resume_context["prior_event"]):
+                retained = self._grant_episode(state, resume_context, pending=resume_context["pending_episode"], resume_unknown=True)
+            else:
+                event = _latest_run_event(state, identity)
+                same = run.get("intent_revision") == identity["intent_revision"] and event == resume_context["prior_event"]
+                new_pause = (type(run.get("intent_revision")) is int and run["intent_revision"] == identity["intent_revision"] + 2
+                             and set(event) == {"kind", "at", "run_id", "service_incarnation"}
+                             and event.get("kind") in {"input_expired", "native_input_expired", "required_view_expired"}
+                             and type(event.get("at")) in (int, float) and math.isfinite(event["at"])
+                             and resume_context["prior_event"]["at"] < event["at"]
+                             and resume_context["pi_lower_bound"] <= event["at"] < run["deadline"])
+                if run.get("status") != "paused" or run.get("recovery") is not None or not (same or new_pause):
+                    raise RuntimeError("fresh unknown Resume own paused phase unavailable")
         if grant_context is not None:
             if self.client.connection != grant_context["identity"]["connection_generation"]:
                 raise RuntimeError("original ambiguous grant connection changed")
@@ -1438,8 +1555,8 @@ class SameRunRecovery:
                 or not episode["started"]
                 < episode["ceiling"]
                 <= min(episode["started"] + 10, run["deadline"])
-                or run["recovery_episodes"] != self.episodes + (0 if pending_recovery is not None
-                    and pending_recovery.pending_episode is not None else 1)
+                or run["recovery_episodes"] != self.episodes + (0 if (pending_recovery is not None and pending_recovery.pending_episode is not None
+                    or resume_context is not None and resume_context["pending_episode"] is not None) else 1)
                 or run.get("first_cause")
                 not in {"feedback_loss", "native_active_ack_loss", "required_proof_loss"}
             ):
@@ -1614,9 +1731,9 @@ class SameRunRecovery:
                     {"identity": identities(), "snapshot": snapshot}, allow_nan=False))
                     if callable(identities) else None)
         try:
-            if grant_context is not None:
+            if binding_context is not None:
                 identity = self.client.identities()
-                event = json.loads(json.dumps(_latest_run_event(state, grant_context["identity"]), allow_nan=False))
+                event = json.loads(json.dumps(_latest_run_event(state, binding_context["identity"]), allow_nan=False))
                 previous_remaining, previous_stamp = state["run"]["remaining_s"], None
                 waiting_view = False
                 while True:
@@ -1714,6 +1831,11 @@ class SameRunRecovery:
                 renewal_check()
             raise
         except (ConnectionError, TimeoutError) as original:
+            if getattr(original, "resume_result_context", None) is not None:
+                original.resume_original_ceiling = local_ceiling
+                original.resume_pending_episode = ({"recovery": episode, "count": self.episodes, "cause": self.cause}
+                                                   if recovered and self.completed_episodes < self.episodes else None)
+                raise
             if "held_view_ceiling" in clock:
                 raise  # A nested ambiguous phase never starts another replacement.
             accepted = getattr(original, "accepted_resume_context", None)
@@ -1991,6 +2113,8 @@ class SameRunRecovery:
                     "event": "qualified_native_recovery",
                     "original_recovery": (pending_recovery.pending_episode["recovery"]
                                           if pending_recovery is not None and pending_recovery.pending_episode is not None
+                                          else resume_context["pending_episode"]["recovery"]
+                                          if resume_context is not None and resume_context["pending_episode"] is not None
                                           else episode),
                     "snapshot": self.client.snapshot,
                 }

@@ -1747,7 +1747,7 @@ def test_original_recovery_ceiling_includes_authenticated_read_time_without_rean
     asyncio.run(asyncio.wait_for(scenario(), 0.3))
 
 
-@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_view_reconnect", "grant_view_switch", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_alignment_refusal", "resume_alignment_refused_twice"])
+@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_view_reconnect", "grant_view_switch", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "resume_alignment_refusal", "resume_alignment_refused_twice"])
 def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(tmp_path, cause):
     import asyncio
     import copy
@@ -2244,6 +2244,159 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                     assert len(grants) == 2 and grants[0]["id"] != grants[1]["id"]
                     assert grants[0]["command"]["connection_generation"] != grants[1]["command"]["connection_generation"]
                     assert len([r for r in records if r["event"] == "qualified_native_recovery"]) == 1
+                finally:
+                    renewal.cancel()
+                    await asyncio.gather(renewal, return_exceptions=True)
+                return
+            if cause in {"resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending"}:
+                # Synthetic54: the actual Core/Gateway receives a Resume whose
+                # result is lost; no negative-admission receipt is invented.
+                from aiohttp import ClientConnectionResetError
+
+                pi_clock, lost, thermal = [10.], [False], [None]
+                a.clock = e.clock = lambda: pi_clock[0]
+                native_evidence = e.evidence
+                def pending_thermal():
+                    value = native_evidence()
+                    if thermal[0] is not None:
+                        proof = copy.deepcopy(thermal[0])
+                        if proof["peaks_ready"] and e.desired == "active":
+                            proof.update(deficit_started_at_monotonic_s=None, deficit_ceiling_monotonic_s=None,
+                                         hold_sample_at_monotonic_s=None, zero_read_started_at_monotonic_s=None,
+                                         zero_read_completed_at_monotonic_s=None)
+                        value["thermal_history"] = proof
+                        value["accepted_host_action"]["thermal_history"] = copy.deepcopy(proof)
+                    return value
+                e.evidence = pending_thermal
+                a._pause_live_input("input_expired")
+                original_call, original_attach = gateway.call, client.attach
+                envelopes, old_results = [], []
+
+                def capture(ws):
+                    send = ws.send_json
+                    async def sent(value, **kwargs):
+                        if "command" in value:
+                            envelopes.append(copy.deepcopy(value))
+                        return await send(value, **kwargs)
+                    ws.send_json = sent
+
+                async def attached():
+                    await original_attach()
+                    capture(client.ws)
+
+                async def lose_resume(command, device):
+                    if command.get("op") == "resume" and not lost[0]:
+                        lost[0] = True
+                        old = copy.deepcopy(command)
+                        if cause == "resume_result_loss_post":
+                            old_results.append(await original_call(old, device))
+                            assert old_results[-1]["accepted"] is True
+                            pi_clock[0] += .125
+                            a._pause_live_input("native_input_expired")
+                        elif cause in {"resume_result_loss_native", "resume_result_loss_pending"}:
+                            pi_clock[0] += .125
+                            healthy[0] = False
+                            if thermal[0] is None:
+                                thermal[0] = {"version": 1, "raw_sample_at_monotonic_s": pi_clock[0], "peaks_ready": False,
+                                              "deficit_started_at_monotonic_s": pi_clock[0],
+                                              "deficit_ceiling_monotonic_s": pi_clock[0] + 10,
+                                              "hold_sample_at_monotonic_s": None, "zero_read_started_at_monotonic_s": None,
+                                              "zero_read_completed_at_monotonic_s": None}
+                            else:
+                                thermal[0].update(peaks_ready=False, raw_sample_at_monotonic_s=pi_clock[0])
+                            a.tick()  # Real source-retained new episode.
+                            original_episode = copy.deepcopy(a.run["recovery"])
+                            pi_clock[0] += .125
+                            healthy[0] = True
+                            thermal[0].update(peaks_ready=True, raw_sample_at_monotonic_s=pi_clock[0],
+                                              hold_sample_at_monotonic_s=pi_clock[0], zero_read_started_at_monotonic_s=pi_clock[0],
+                                              zero_read_completed_at_monotonic_s=pi_clock[0])
+                            a.tick()
+                            assert a.run["status"] == "paused" and a.run["recovery"] is None
+                            assert original_episode["started"] + 10 == original_episode["ceiling"]
+                        a._teleop_view["qualified_until"] = pi_clock[0] + .5
+                        async def finish_old():
+                            await unblock_release.wait()
+                            if cause != "resume_result_loss_post":
+                                old_results.append(await original_call(old, device))
+                            return old_results[-1]
+                        task = asyncio.create_task(finish_old())
+                        delayed.append(task)
+                        # Real authenticated stream loss; the exact observed
+                        # aiohttp exception is supplied as the replay taxonomy.
+                        client.ws._exception = ClientConnectionResetError("Cannot write to closing transport")
+                        client.ws._response.connection.transport.abort()
+                        return await asyncio.shield(task)
+                    return await original_call(command, device)
+
+                async def checked_loss(command, device):
+                    try:
+                        return await lose_resume(command, device)
+                    except (ValueError, TypeError, KeyError) as error:
+                        raise AssertionError("new Resume-loss fixture failed: " + repr(error)) from error
+
+                capture(client.ws)
+                client.attach, gateway.call = attached, checked_loss
+                renewal = asyncio.create_task(client.renew())
+                def healthy_renewal():
+                    if renewal.done():
+                        renewal.result()
+                        raise RuntimeError("original renewal ended")
+                if cause == "resume_result_loss_pending":
+                    pi_clock[0] += .125
+                    healthy[0] = False
+                    thermal[0] = {"version": 1, "raw_sample_at_monotonic_s": pi_clock[0], "peaks_ready": False,
+                                  "deficit_started_at_monotonic_s": pi_clock[0], "deficit_ceiling_monotonic_s": pi_clock[0] + 10,
+                                  "hold_sample_at_monotonic_s": None, "zero_read_started_at_monotonic_s": None,
+                                  "zero_read_completed_at_monotonic_s": None}
+                    a.tick()
+                    original_pending = copy.deepcopy(a.run["recovery"])
+                    async def ready_original():
+                        await entered.wait()  # Independently supply actual native qualification.
+                        pi_clock[0] += .125
+                        healthy[0] = True
+                        thermal[0].update(peaks_ready=True, raw_sample_at_monotonic_s=pi_clock[0],
+                                          hold_sample_at_monotonic_s=pi_clock[0], zero_read_started_at_monotonic_s=pi_clock[0],
+                                          zero_read_completed_at_monotonic_s=pi_clock[0])
+                        a._teleop_view["qualified_until"] = pi_clock[0] + .5
+                        a.tick()
+                    qualification = asyncio.create_task(ready_original())
+                try:
+                    try:
+                        result = await guard.resume(expected_pause="input_expired", renewal_check=healthy_renewal)
+                    except ConnectionError:
+                        assert client.transport_close["reason"] == "stream-ended"
+                        assert client.transport_close["close_code"] == 1006
+                        assert client.transport_close["reader_error"] is None
+                        assert client.transport_close["exception_type"] == "ClientConnectionResetError"
+                        assert client.transport_close["exception"] == "Cannot write to closing transport"
+                        raise
+                    assert result is (cause in {"resume_result_loss_native", "resume_result_loss_pending"})
+                    assert client.snapshot["evidence"]["active_acknowledged"] is True
+                    resumes = [v for v in envelopes if v["command"]["op"] == "resume"]
+                    assert len(resumes) == 2
+                    assert resumes[0]["id"] != resumes[1]["id"]
+                    assert resumes[0]["command"]["operation_id"] != resumes[1]["command"]["operation_id"]
+                    assert resumes[0]["command"]["connection_generation"] != resumes[1]["command"]["connection_generation"]
+                    assert sum(v["command"]["op"] == "connect" for v in envelopes) == 2
+                    assert sum(v["command"]["op"] == "release_input" for v in envelopes) == 2
+                    assert not any(v["command"]["op"] in {"claim", "start", "grant", "input"} for v in envelopes)
+                    assert guard.completed_episodes == int(cause in {"resume_result_loss_native", "resume_result_loss_pending"})
+                    if cause == "resume_result_loss_pending":
+                        qualified = [v for v in records if v["event"] == "qualified_native_recovery"]
+                        assert len(qualified) == 1 and qualified[0]["original_recovery"] == original_pending
+                        assert a.run["recovery_episodes"] == 1
+                    unblock_release.set()
+                    await asyncio.wait_for(asyncio.gather(*delayed), .5)
+                    if cause != "resume_result_loss_post":
+                        assert old_results == [{"accepted": False, "status": "refused", "reason": "stale control generation", "effect_admitted": False}]
+                    assert a.run["status"] == "running" and a.run["deadline"] == 309. and a.run["native_live_at"] == 9.
+                    ambiguous = [v for v in records if v["event"] == "resume_result_unknown"]
+                    assert len(ambiguous) == 1 and ambiguous[0]["operation_id"] == resumes[0]["command"]["operation_id"]
+                    assert ambiguous[0]["outcome"] == "unknown"
+                    producer.native_cursor, producer.reacquire = m._live(client.snapshot)["cursor"], True
+                    fresh = await m.send_leader_sample(client, producer, m.ZERO_BODY, record, phase="individual", progress_s=.02)
+                    assert fresh[2]["accepted"] is True and producer.sequence == 1
                 finally:
                     renewal.cancel()
                     await asyncio.gather(renewal, return_exceptions=True)
@@ -5950,4 +6103,164 @@ def test_same_open_native_episode_retains_source_and_original_phase(monkeypatch,
             assert handoffs[1]["local_ceiling_monotonic_s"] <= 1008.
 
     guard = None
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("change", [
+    None, "post", "view_wait", "twice", "wrong_type", "wrong_message", "reader", "expected", "code",
+    "manual", "foreign", "fault", "uncertain", "revision", "running", "stale_ack", "phase_expired",
+    "phase_extended", "caller_expired", "renewal", "later_error", "reporting", "persistent_view",
+])
+def test_unknown_resume_result_keeps_authority_original_phase_and_error(monkeypatch, change):
+    """Synthetic guards supplement the real Core/Gateway pre/post/native cases."""
+    import asyncio
+    import copy
+    from types import SimpleNamespace
+
+    m = adapter()
+    pc, commands, failures, records = [1000.], [], [], []
+    monkeypatch.setattr(m, "time", SimpleNamespace(monotonic=lambda: pc[0]))
+    initial = recovery_state()
+    initial["run"].update(status="paused", intent_revision=3, remaining_s=299.875)
+    initial["events"] = [{"kind": "input_expired", "at": 100.125,
+                           "run_id": "owned", "service_incarnation": "service"}]
+
+    def held(state, revision, stamp):
+        state["run"].update(status="paused", intent_revision=revision, remaining_s=400. - stamp)
+        state["evidence"].update(active_acknowledged=False, acknowledged_intent_revision=revision)
+        state["evidence"]["accepted_host_action"].update(state="paused", intent_revision=revision,
+                                                        acquired_at_monotonic_s=stamp)
+        state["run"]["live_input"]["cursor_intent_revision"] = revision
+        return state
+
+    held(initial, 3, 100.125)
+
+    class Client:
+        device, generation, connection, sequence = "device", "control", "connection", 0
+        resume = m.SessionClient.resume
+        identities = m.SessionClient.identities
+        transport_close, reads, attaches = None, 0, 0
+
+        def __init__(self):
+            self.snapshot = copy.deepcopy(initial)
+            self.fresh = None
+
+        async def get(self, path):
+            assert path == "state"
+            self.reads += 1
+            if self.fresh is not None:
+                pc[0] += .125
+                state = copy.deepcopy(self.fresh)
+                if change == "persistent_view":
+                    pc[0] += 8
+                if change in {"view_wait", "persistent_view"}:
+                    state["run"]["live_input"]["required_view"] = {
+                        "required": True, "qualified": self.reads > 2 and change != "persistent_view",
+                        "role": "wrist_left", "cause": None if self.reads > 2 and change != "persistent_view" else "required_view_expired"}
+                self.snapshot = state
+            return {"snapshot": copy.deepcopy(self.snapshot)}
+
+        async def command(self, command):
+            commands.append(copy.deepcopy(command))
+            op = command["op"]
+            if op == "connect":
+                if failures and change == "later_error":
+                    raise ConnectionError("new fenced operation failed")
+                self.snapshot = held(copy.deepcopy(self.snapshot), self.snapshot["run"]["intent_revision"] + 1,
+                                     100.25 if not failures else 100.5)
+                return {"accepted": True, "status": "connected", "connection_generation": str(uuid4()),
+                        "snapshot": copy.deepcopy(self.snapshot)}
+            if op == "release_input":
+                return {"accepted": True, "status": "released", "effect_admitted": False}
+            assert op == "resume"
+            if not failures or change == "twice" and len(failures) < 2:
+                self.fresh = held(copy.deepcopy(self.snapshot), command["intent_revision"],
+                                  100.375 if not failures else 100.625)
+                if change == "post":
+                    self.fresh = held(self.fresh, command["intent_revision"] + 2, 100.5)
+                    self.fresh["events"].append({"kind": "native_input_expired", "at": 100.375,
+                                                  "run_id": "owned", "service_incarnation": "service"})
+                if change == "manual":
+                    self.fresh["events"].append({"kind": "pause", "at": 100.375,
+                                                  "run_id": "owned", "service_incarnation": "service"})
+                elif change == "foreign":
+                    self.fresh["run"]["run_id"] = "foreign"
+                elif change == "fault":
+                    self.fresh["evidence"]["fault"] = "actual hard fault"
+                elif change == "uncertain":
+                    self.fresh["run"]["uncertain"] = True
+                elif change == "revision":
+                    self.fresh["run"]["intent_revision"] += 1
+                elif change == "running":
+                    self.fresh["run"]["status"] = "running"
+                elif change == "stale_ack":
+                    self.fresh["evidence"]["accepted_host_action"]["acquired_at_monotonic_s"] = 99.
+                if change in {"phase_expired", "caller_expired"}:
+                    pc[0] += 8. if change == "phase_expired" else .25
+                self.transport_close = {"expected": change == "expected", "close_code": 1008 if change == "code" else 1006,
+                    "reason": "stream-ended", "reader_error": {"error_type": "RuntimeError"} if change == "reader" else None,
+                    "exception_type": "RuntimeError" if change == "wrong_type" else "ClientConnectionResetError",
+                    "exception": "other reset" if change == "wrong_message" else "Cannot write to closing transport"}
+                error = ConnectionError("current WSS connection lost")
+                failures.append(error)
+                raise error
+            if change == "post":
+                pc[0] = 1007.75  # Qualification finished within the ORIGINAL eight seconds.
+            self.snapshot["run"].update(status="running", intent_revision=command["intent_revision"] + 1)
+            self.snapshot["evidence"]["active_acknowledged"] = True
+            return {"accepted": True, "status": "running", "effect_admitted": False}
+
+        async def wait(self, predicate, timeout):
+            if change == "post" and timeout == 5:
+                pc[0] += .5  # Distinct active-ACK phase may cross the earlier held deadline.
+                self.snapshot["run"]["remaining_s"] = 1400. - pc[0]
+                self.snapshot["evidence"]["accepted_host_action"].update(
+                    state="active", intent_revision=self.snapshot["run"]["intent_revision"],
+                    acquired_at_monotonic_s=pc[0] - 900.)
+            assert predicate(), "no success can bypass held/view or actual active ACK"
+
+        async def detach(self):
+            self.snapshot = None
+
+        async def attach(self):
+            self.attaches += 1
+            self.snapshot = copy.deepcopy(self.fresh)
+
+    async def scenario():
+        client = Client()
+        def record(value):
+            if value["event"] == "resume_result_unknown":
+                assert len(__import__("json").dumps(value, allow_nan=False).encode()) <= 2048
+                assert value["outcome"] == "unknown"
+                if change == "reporting":
+                    raise ValueError("fault reporting failed")
+                if change == "phase_extended":
+                    failures[-1].resume_result_context["phase_ceiling"] += 1
+            records.append(value)
+        guard = m.SameRunRecovery(client, record)
+        def renewal():
+            if failures and change == "renewal":
+                raise RuntimeError("original renewal failed")
+        if change in {None, "post", "view_wait", "twice"}:
+            assert not await guard.resume(expected_pause="input_expired", renewal_check=renewal)
+            resumes = [c for c in commands if c["op"] == "resume"]
+            assert len(resumes) == (3 if change == "twice" else 2)
+            assert len({c["operation_id"] for c in resumes}) == len(resumes)
+            assert len({c["connection_generation"] for c in resumes}) == len(resumes)
+            assert client.snapshot["evidence"]["active_acknowledged"] is True
+            assert client.attaches == len(resumes) - 1
+            assert len([v for v in records if v["event"] == "resume_result_unknown"]) == len(resumes) - 1
+        else:
+            with pytest.raises(ConnectionError) as caught:
+                await guard.resume(expected_pause="input_expired", renewal_check=renewal,
+                                   wall_deadline=1000.125 if change == "caller_expired" else None)
+            assert caught.value is failures[0]
+            assert sum(c["op"] == "resume" for c in commands) == 1
+            if change != "later_error":
+                assert sum(c["op"] == "connect" for c in commands) == 1
+            assert guard.completed_episodes == 0
+        assert not any(c["op"] in {"claim", "start", "grant", "input"} for c in commands)
+        assert client.sequence == 0 and guard.original["run"]["deadline"] == 400.
+        assert all(v["phase_ceiling_monotonic_s"] == 1008. for v in records if v["event"] == "resume_result_unknown")
+
     asyncio.run(scenario())
