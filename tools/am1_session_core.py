@@ -2658,15 +2658,22 @@ class SessionAuthority:
                             or not workspace.normalize(workspace.command_min_raw) <= target[joint]
                             <= workspace.normalize(workspace.command_max_raw)):
                         return self._refuse("physical target left the fixed ordinary practical preset")
+                from tools.am1_physical_executor import LiveInputExpiredBeforeAdmissionError
+
                 expiry = self.grant["expires"]
-                accepted = self.executor.apply(
-                    target, valid_until_monotonic_s=expiry, intent_revision=self.run["intent_revision"],
-                    run_id=self.run["run_id"], service_incarnation=self.service_incarnation,
-                    controller_generation=self.controller["generation"],
-                    connection_generation=self.connection["generation"],
-                    host_incarnation=self.executor.host_incarnation, grant_id=self.grant["id"], seq=seq,
-                    **({"body":body, "source":source} if teleop else {}),
-                )
+                try:
+                    accepted = self.executor.apply(
+                        target, valid_until_monotonic_s=expiry, intent_revision=self.run["intent_revision"],
+                        run_id=self.run["run_id"], service_incarnation=self.service_incarnation,
+                        controller_generation=self.controller["generation"],
+                        connection_generation=self.connection["generation"],
+                        host_incarnation=self.executor.host_incarnation, grant_id=self.grant["id"], seq=seq,
+                        **({"body":body, "source":source, "classify_expiry": True} if teleop else {}),
+                    )
+                except LiveInputExpiredBeforeAdmissionError as error:
+                    if not teleop or type(error) is not LiveInputExpiredBeforeAdmissionError:
+                        raise
+                    return self._refuse("expired grant")
                 if not accepted:
                     return self._refuse("physical input mailbox refused")
                 self.applied_input = {"expires": expiry, "seq": seq, "intent_revision": self.run["intent_revision"]}

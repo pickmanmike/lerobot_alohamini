@@ -753,3 +753,176 @@ def test_real_codec_core_ipc_https_wss_preserves_raw12_lift_and_actual_zero(tmp_
             await owner.close()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("offset", [-0.001, 0.0, 0.001], ids=["before", "at", "after"])
+def test_authority_preserves_runtime_expiry_nonadmission_after_delayed_evidence(tmp_path, monkeypatch, offset):
+    a, e, ids = authority_lane(tmp_path)
+    now = [10.0]
+    a.clock = e.clock = lambda: now[0]
+    a._teleop_view = {"run_id": e.run_id, "qualified_until": 10.8}
+
+    def frame(grant, sample_seq, network_seq):
+        return dict(op="input", **ids, grant_id=grant["grant_id"], seq=network_seq,
+                    source=source(sample_seq, grant=grant["grant_id"]),
+                    target=dict.fromkeys(KEYS, 5.0),
+                    body={"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0, "lift_axis.vel": 0})
+
+    try:
+        first_grant = a._handle(dict(op="grant", **ids), "pc")
+        first_frame = frame(first_grant, 1, 1)
+        assert a._handle(first_frame, "pc")["accepted"] is True
+        original_target, original_source = copy.deepcopy(e._live_target), copy.deepcopy(e._teleop_source)
+        original_workspace = copy.deepcopy(e.sample["ack"]["live_input"]["workspace"])
+        now[0] = 10.01
+        grant = a._handle(dict(op="grant", **ids), "pc")
+        candidate = frame(grant, 2, 2)
+        evidence = e.evidence
+        delayed = [False]
+
+        def delayed_evidence():
+            if not delayed[0]:
+                delayed[0] = True
+                # Same Pi clock advances AFTER Core captured its command now.
+                now[0] = grant["expires"] + offset
+            return evidence()
+
+        monkeypatch.setattr(e, "evidence", delayed_evidence)
+        result = a._handle(candidate, "pc")
+        assert delayed == [True]
+        assert a.run["status"] == "running" and a.run["intent_revision"] == 0
+        assert a.run["deadline"] == 309.0 and a.run["native_live_at"] == 9.0
+        assert e.sample["ack"]["live_input"]["workspace"] == original_workspace
+        if offset < 0:
+            assert result["accepted"] is True and result["effect_admitted"] is True
+            assert e._live_target["valid_until_monotonic_s"] == grant["expires"]
+        else:
+            assert result == {"accepted": False, "status": "refused", "effect_admitted": False,
+                              "reason": "expired grant"}
+            assert e._live_target == original_target and e._teleop_source == original_source
+            assert e._live_last_seq == a.connection["seq"] == 1
+            assert a.run["input_source"] == first_frame["source"]
+            assert a.run["intent"] == first_frame["target"]
+            fresh_grant = a._handle(dict(op="grant", **ids), "pc")
+            assert a._handle(candidate, "pc")["accepted"] is False  # Original grant/frame stays refused.
+            replay = frame(fresh_grant, 1, 3)
+            assert a._handle(replay, "pc")["accepted"] is False  # Accepted source history never resets.
+            fresh = frame(fresh_grant, 3, 3)
+            assert a._handle(fresh, "pc")["accepted"] is True
+            assert e._live_target["source"] == fresh["source"]
+            assert e._live_target["valid_until_monotonic_s"] == fresh_grant["expires"]
+            assert a.run["deadline"] == 309.0 and a.run["recovery"] is None
+    finally:
+        a.run = None
+        a.close()
+
+
+@pytest.mark.parametrize("invalid", [
+    "finishing", "lifecycle", "inactive", "run", "host", "revision", "binding", "replay",
+    "target", "body", "source", "workspace", "far_future", "boolean_expiry", "infinite_expiry", "fault",
+])
+def test_runtime_expiry_cannot_reclassify_any_other_mailbox_refusal(invalid):
+    e, ids = admitted_executor()
+    e.clock = lambda: 10.3
+    src = source()
+    options = dict(**ids, target=dict.fromkeys(KEYS, 5.0),
+                   body={"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0, "lift_axis.vel": 0},
+                   source=src, grant_id=src["grant_id"], seq=1, valid_until_monotonic_s=10.2)
+    if invalid == "finishing":
+        e.finish_status = "stopped"
+    elif invalid == "lifecycle":
+        e._lifecycle["phase"] = "starting"
+    elif invalid == "inactive":
+        e.desired = "hold"
+    elif invalid in {"run", "host", "revision"}:
+        options[{"run": "run_id", "host": "host_incarnation", "revision": "intent_revision"}[invalid]] = (
+            1 if invalid == "revision" else str(uuid4()))
+    elif invalid == "binding":
+        options["connection_generation"] = str(uuid4())
+    elif invalid == "replay":
+        e._live_last_seq = 1
+    elif invalid == "target":
+        options["target"] = {"unknown": 0}
+    elif invalid == "body":
+        options["body"] = {"unknown": 0}
+    elif invalid == "source":
+        options["source"] = dict(src, sample_seq=True)
+    elif invalid == "workspace":
+        e.sample["ack"]["live_input"]["workspace"] = {}
+    elif invalid in {"far_future", "boolean_expiry", "infinite_expiry"}:
+        options["valid_until_monotonic_s"] = {"far_future": 10.6, "boolean_expiry": True,
+                                             "infinite_expiry": float("inf")}[invalid]
+    else:
+        e._fault = "original protected fault"
+    assert e.apply(**options, classify_expiry=True) is False
+    assert e._live_target is None and e._teleop_source is None
+    assert e._live_last_seq == (1 if invalid == "replay" else -1)
+
+
+@pytest.mark.parametrize("kind", ["runtime", "io", "same_name"])
+def test_authority_runtime_expiry_mapping_does_not_catch_foreign_errors(tmp_path, monkeypatch, kind):
+    a, e, ids = authority_lane(tmp_path)
+    a._teleop_view = {"run_id": e.run_id, "qualified_until": 10.4}
+    error_type = {"runtime": RuntimeError, "io": OSError,
+                  "same_name": type("LiveInputExpiredBeforeAdmissionError", (RuntimeError,), {})}[kind]
+    primary = error_type("original unrelated mailbox error")
+
+    def failed(*args, **kwargs):
+        raise primary
+
+    try:
+        grant = a._handle(dict(op="grant", **ids), "pc")
+        packet = dict(op="input", **ids, grant_id=grant["grant_id"], seq=1,
+                      source=source(grant=grant["grant_id"]), target=dict.fromkeys(KEYS, 5.0),
+                      body={"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0, "lift_axis.vel": 0})
+        monkeypatch.setattr(e, "apply", failed)
+        with pytest.raises(error_type) as caught:
+            a._handle(packet, "pc")
+        assert caught.value is primary
+        assert e._live_target is None and e._teleop_source is None
+    finally:
+        a.run = None
+        a.close()
+
+
+def test_runtime_validation_delay_cannot_make_original_far_future_expiry_valid(monkeypatch):
+    from tools import am1_physical_executor as physical
+
+    e, ids = admitted_executor()
+    now = [10.0]
+    e.clock = lambda: now[0]
+    src = source()
+    original = physical.validate_source
+
+    def delayed(*args, **kwargs):
+        value = original(*args, **kwargs)
+        now[0] = 10.1
+        return value
+
+    monkeypatch.setattr(physical, "validate_source", delayed)
+    assert e.apply(dict.fromkeys(KEYS, 5.0), **ids,
+                   body={"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0, "lift_axis.vel": 0},
+                   source=src, grant_id=src["grant_id"], seq=1,
+                   valid_until_monotonic_s=10.3) is False
+    assert e._live_target is None and e._teleop_source is None and e._live_last_seq == -1
+
+
+@pytest.mark.parametrize("mode", ["default", "false", "true", "truthy_integer", "truthy_string"])
+def test_runtime_expiry_reporting_requires_explicit_trusted_core_opt_in(mode):
+    from tools.am1_physical_executor import LiveInputExpiredBeforeAdmissionError
+
+    e, ids = admitted_executor()
+    e.clock = lambda: 10.3
+    src = source()
+    options = dict(**ids, target=dict.fromkeys(KEYS, 5.0), source=src, grant_id=src["grant_id"],
+                   seq=1, valid_until_monotonic_s=10.2,
+                   body={"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0, "lift_axis.vel": 0})
+    if mode != "default":
+        options["classify_expiry"] = {"false": False, "true": True,
+                                      "truthy_integer": 1, "truthy_string": "true"}[mode]
+    if mode == "true":
+        with pytest.raises(LiveInputExpiredBeforeAdmissionError):
+            e.apply(**options)
+    else:
+        assert e.apply(**options) is False
+    assert e._live_target is None and e._teleop_source is None and e._live_last_seq == -1

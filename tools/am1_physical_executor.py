@@ -67,6 +67,10 @@ def load_elbow_return_reference(config, *, definition=LEFT_ELBOW_ORIGINAL_RETURN
     return copy.deepcopy(value)
 
 
+class LiveInputExpiredBeforeAdmissionError(RuntimeError):
+    """A valid whole frame expired before its original mailbox could admit it."""
+
+
 class StartupCancelledError(RuntimeError):
     """An explicit Stop cancels admission without inventing a hardware fault."""
 
@@ -601,14 +605,15 @@ class PhysicalExecutor:
             return True
 
     def apply(self, target, *, valid_until_monotonic_s, intent_revision, run_id, service_incarnation,
-              controller_generation, connection_generation, host_incarnation, grant_id, seq, body=None, source=None):
+              controller_generation, connection_generation, host_incarnation, grant_id, seq, body=None, source=None,
+              classify_expiry=False):
         with self.mutex:
             if self.recipe is not None and self.recipe.name == TELEOP_RECIPE:
                 return self._apply_teleop(target, body=body, source=source,
                     valid_until_monotonic_s=valid_until_monotonic_s, intent_revision=intent_revision,
                     run_id=run_id, service_incarnation=service_incarnation, controller_generation=controller_generation,
                     connection_generation=connection_generation, host_incarnation=host_incarnation,
-                    grant_id=grant_id, seq=seq)
+                    grant_id=grant_id, seq=seq, classify_expiry=classify_expiry)
             joint = self.live_spec.joint if self.live_spec is not None else None
             if (self.recipe is None or self.live_spec is None or self.finish_status
                     or self._lifecycle["phase"] != "live" or self.desired != "active"
@@ -637,14 +642,18 @@ class PhysicalExecutor:
 
     def _apply_teleop(self, target, *, body, source, valid_until_monotonic_s, intent_revision,
                       run_id, service_incarnation, controller_generation, connection_generation,
-                      host_incarnation, grant_id, seq):
-        if (self.finish_status or self._lifecycle["phase"] != "live" or self.desired != "active"
+                      host_incarnation, grant_id, seq, classify_expiry=False):
+        if (self.finish_status or self._fault is not None
+            or self._lifecycle["phase"] != "live" or self.desired != "active"
             or run_id != self.run_id or host_incarnation != self.host_incarnation or intent_revision != self.revision
             or self._live_binding != {"service_incarnation": service_incarnation,
                 "controller_generation": controller_generation, "connection_generation": connection_generation}
             or type(seq) is not int or seq <= self._live_last_seq
-            or type(valid_until_monotonic_s) not in (int, float) or not math.isfinite(valid_until_monotonic_s)
-            or not self.clock() < valid_until_monotonic_s <= self.clock() + .25 + 1e-9):
+            or type(valid_until_monotonic_s) not in (int, float) or not math.isfinite(valid_until_monotonic_s)):
+            return False
+        checked_at = self.clock()
+        if (type(checked_at) not in (int, float) or not math.isfinite(checked_at)
+                or valid_until_monotonic_s > checked_at + .25 + 1e-9):
             return False
         try:
             workspace = validate_workspace((self.sample or {}).get("ack", {}).get("live_input", {}).get("workspace"))
@@ -652,6 +661,15 @@ class PhysicalExecutor:
             body = validate_body(body)
             source = validate_source(source, grant_id=grant_id, previous=self._teleop_source)
         except (KeyError, TypeError, ValueError):
+            return False
+        # Core's earlier grant check can precede evidence work or this mutex.
+        # Only a fully valid frame gets this exact nonadmission classification.
+        now = self.clock()
+        if type(now) not in (int, float) or not math.isfinite(now) or now < checked_at:
+            return False
+        if now >= valid_until_monotonic_s:
+            if classify_expiry is True:
+                raise LiveInputExpiredBeforeAdmissionError("original input grant expired before mailbox admission")
             return False
         self._live_target = {"target": target, "body": body, "source": source, "grant_id": grant_id, "seq": seq,
                              "valid_until_monotonic_s": valid_until_monotonic_s}
