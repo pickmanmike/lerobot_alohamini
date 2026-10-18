@@ -4528,7 +4528,9 @@ def test_initial_claim_requalification_preserves_original_error_authority_and_on
 
 @pytest.mark.parametrize("change", [None, "wrong_pong_type", "wrong_pong_message", "reader_error",
     "reference", "hash", "initial_clock", "fresh_clock", "fresh_controller", "fresh_terminal",
-    "fresh_unsafe", "final_clock", "spent_details", "spent_attach", "spent_start"])
+    "fresh_unsafe", "final_clock", "spent_details", "spent_attach", "spent_start",
+    "closing_transport", "closing_wrong_type", "closing_wrong_message", "closing_reader",
+    "closing_expected", "closing_code", "closing_after_live", "closing_fresh_controller", "closing_spent_attach"])
 def test_runner_admission_no_pong_uses_original_real_core_detail_clocks(tmp_path, monkeypatch, change):
     """Synthetic45: real Core/Gateway projection/detail and installed NoPONG; no motor or network."""
     import asyncio
@@ -4538,7 +4540,8 @@ def test_runner_admission_no_pong_uses_original_real_core_detail_clocks(tmp_path
     from types import SimpleNamespace
     from urllib.parse import parse_qsl, urlsplit
 
-    from aiohttp import WSMessage, WSMsgType
+    from aiohttp import ClientConnectionResetError, WSMessage, WSMsgType
+    from aiohttp._websocket.writer import WebSocketWriter
     from aiohttp.client_ws import ClientWebSocketResponse
 
     from tests.robots.test_am1_live_teleop_executor import authority_lane
@@ -4591,7 +4594,7 @@ def test_runner_admission_no_pong_uses_original_real_core_detail_clocks(tmp_path
 
         def __init__(self, *_args):
             self.device, self.generation, self.connection = "device", "control", None
-            self.snapshot = None
+            self.snapshot, self.pending = None, {}
             self.transport_close = self.transport_error = self.reader = self.ws = None
             self.changed, self.tasks = asyncio.Event(), []
             self.starts, self.stops, self.claims, self.attaches = [], [], 0, 0
@@ -4609,6 +4612,14 @@ def test_runner_admission_no_pong_uses_original_real_core_detail_clocks(tmp_path
             try:
                 await actual_wait(self, predicate, timeout)
             except ConnectionError as error:
+                # Mutate negative close evidence at its consumption boundary,
+                # before the runner can quarantine/replace the failed stream.
+                if change == "closing_reader":
+                    self.transport_close["reader_error"] = {"error_type": "RuntimeError", "message": "reporting unavailable"}
+                elif change == "closing_expected":
+                    self.transport_close["expected"] = True
+                elif change == "closing_code":
+                    self.transport_close["close_code"] = 1008
                 caught.append(error)
                 raise
 
@@ -4619,7 +4630,25 @@ def test_runner_admission_no_pong_uses_original_real_core_detail_clocks(tmp_path
                 self.ws.messages.put_nowait(WSMessage(WSMsgType.TEXT, "invalid JSON", None))
                 await self.reader
                 return
-            ClientWebSocketResponse._pong_not_received(self.ws)
+            if change and change.startswith("closing_"):
+                # Installed writer + ping completion callback produce ERROR;
+                # no network or physical backend is involved in this replay.
+                writer = WebSocketWriter(SimpleNamespace(_paused=False), SimpleNamespace(is_closing=lambda: True))
+                ping = asyncio.create_task(writer.send_frame(b"", WSMsgType.PING))
+                await asyncio.sleep(0)
+                ClientWebSocketResponse._ping_task_done(self.ws, ping)
+                assert type(self.ws.error) is ClientConnectionResetError
+                assert str(self.ws.error) == "Cannot write to closing transport"
+                if change == "closing_wrong_type":
+                    self.ws.error = RuntimeError(str(self.ws.error))
+                elif change == "closing_wrong_message":
+                    self.ws.error = type(self.ws.error)("other connection reset")
+                elif change == "closing_after_live":
+                    authority.run.update(status="preparing", native_live_at=1009.0, deadline=1309.0,
+                                         backend_incarnation=executor.host_incarnation)
+                    self.snapshot = self.current()
+            else:
+                ClientWebSocketResponse._pong_not_received(self.ws)
             if change == "wrong_pong_type":
                 self.ws.error = RuntimeError(str(self.ws.error))
             elif change == "wrong_pong_message":
@@ -4638,11 +4667,11 @@ def test_runner_admission_no_pong_uses_original_real_core_detail_clocks(tmp_path
             if self.attaches == 1:
                 self.snapshot = {"service_incarnation": authority.service_incarnation, "run": None}
             else:
-                if change == "spent_attach":
+                if change in {"spent_attach", "closing_spent_attach"}:
                     pc[0] += 180
                 if change == "fresh_clock":
                     authority.run["accepted_at"] += .01
-                elif change == "fresh_controller":
+                elif change in {"fresh_controller", "closing_fresh_controller"}:
                     authority.controller["generation"] = "other"
                 elif change == "fresh_terminal":
                     authority.run.update(status="faulted", native_first_cause="original native fault")
@@ -4730,7 +4759,11 @@ def test_runner_admission_no_pong_uses_original_real_core_detail_clocks(tmp_path
         with pytest.raises((RuntimeError, ConnectionError, TimeoutError, ValueError)) as result:
             asyncio.run(asyncio.wait_for(m.run(args), 10))
         client = clients[0]
-        if change is None:
+        if change and change.startswith("closing_"):
+            for task in client.tasks:
+                if task.done() and not task.cancelled():
+                    task.result()  # A fixture error must never masquerade as a qualified transport loss.
+        if change in {None, "closing_transport"}:
             assert str(result.value) == "synthetic qualified Live boundary"
             assert len(entered) == 1 and client.attaches == 2 and client.detail_reads >= 3
         else:

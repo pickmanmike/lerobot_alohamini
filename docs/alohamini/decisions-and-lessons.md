@@ -103,6 +103,8 @@ The explicit candidate correction is limited to powered AM1 live teleoperation: 
 
 - **A new native episode can supersede held qualification:** Combined50 completed two qualified episodes before a distinct third opened. Handoff must use its original source-retained descriptor, current authority and unchanged ceilings; a previous qualified count cannot authorize it. Pair coherent all-role native confirmation with fresh held proof, a NEW Resume and actual active acknowledgment before new grant/capture. Never reset history or adopt an episode from its count alone.
 
+- **Startup reattachment is source qualified:** an accepted Start may survive the demonstrated closing-transport error through the existing single reattachment. Fresh run, owner and startup-clock proof must pass under the original budget before admission. Arbitrary message errors remain failures; neither another Start nor early input can substitute for those checks.
+
 ## COMM-03: an empty poll is not an expired request
 
 - **Accepted / scope:** AM1 retains still-fresh observation credits across short empty polls, retires by original one-second age and rejects stale cached/late replies. Keep the three-credit window, polling, freshness and input expiry intact; AM2 behavior is separate.

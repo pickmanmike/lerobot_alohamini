@@ -2278,7 +2278,7 @@ async def run(args):
                             continue
                     break
                 except ConnectionError as original:
-                    from aiohttp import ServerTimeoutError
+                    from aiohttp import ClientConnectionResetError, ServerTimeoutError
 
                     close = getattr(client, "transport_close", None) or {}
                     ws = getattr(client, "ws", None)
@@ -2288,15 +2288,20 @@ async def run(args):
                         and str(stream_error) == f"No PONG received after {ws._pong_heartbeat} seconds"
                         and close.get("reason") == "message-error"
                     )
+                    closing_transport = (
+                        type(stream_error) is ClientConnectionResetError
+                        and str(stream_error) == "Cannot write to closing transport"
+                        and close.get("reason") == "message-error"
+                    )
                     if (
                         reattached
                         or close.get("expected") is not False
-                        or close.get("reason") != "stream-ended" and not no_pong
+                        or close.get("reason") != "stream-ended" and not (no_pong or closing_transport)
                         or close.get("close_code") != 1006
                         or close.get("reader_error") is not None
                     ):
                         raise
-                    if no_pong:
+                    if no_pong or closing_transport:
                         admission_first_error = original
                     if renewal.done():
                         renewal.result()
