@@ -1747,7 +1747,7 @@ def test_original_recovery_ceiling_includes_authenticated_read_time_without_rean
     asyncio.run(asyncio.wait_for(scenario(), 0.3))
 
 
-@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_view_reconnect", "grant_view_switch"])
+@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_view_reconnect", "grant_view_switch", "qualification_episode_pending", "qualification_episode_cleared"])
 def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(tmp_path, cause):
     import asyncio
     import copy
@@ -1902,6 +1902,106 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
 
             producer = m.FrameProducer(Input())
             producer.workspace, producer.native_cursor = workspace(), workspace()["reference"]
+            if cause in {"qualification_episode_pending", "qualification_episode_cleared"}:
+                # Synthetic50: a NEW actual Core episode opens during the
+                # already-connected empty-release/held qualification phase.
+                pi_now, injected, thermal = [10.], [False], [None]
+                a.clock = e.clock = lambda: pi_now[0]
+                native_evidence = e.evidence
+
+                def thermal_evidence():
+                    value = native_evidence()
+                    if thermal[0] is not None:
+                        proof = copy.deepcopy(thermal[0])
+                        if proof["peaks_ready"] and e.desired == "active":
+                            proof.update(deficit_started_at_monotonic_s=None, deficit_ceiling_monotonic_s=None,
+                                         hold_sample_at_monotonic_s=None, zero_read_started_at_monotonic_s=None,
+                                         zero_read_completed_at_monotonic_s=None)
+                        value["thermal_history"] = proof
+                        value["accepted_host_action"]["thermal_history"] = copy.deepcopy(proof)
+                    return value
+
+                def restore_native():
+                    pi_now[0] += .125
+                    healthy[0] = True
+                    thermal[0].update(peaks_ready=True, raw_sample_at_monotonic_s=pi_now[0],
+                                      hold_sample_at_monotonic_s=pi_now[0], zero_read_started_at_monotonic_s=pi_now[0],
+                                      zero_read_completed_at_monotonic_s=pi_now[0])
+                    a.tick()
+
+                e.evidence = thermal_evidence
+                a._pause_live_input("input_expired")
+                original_wait, original_record = client.wait, guard.record
+                native_wait = asyncio.Event()
+                descriptors, envelopes = [], []
+                send = client.ws.send_json
+
+                async def capture(value, **kwargs):
+                    if "command" in value:
+                        envelopes.append(copy.deepcopy(value))
+                    return await send(value, **kwargs)
+
+                def record_handoff(value):
+                    original_record(value)
+                    if value["event"] == "native_recovery_wait":
+                        native_wait.set()
+
+                async def interrupted_qualification(predicate, timeout):
+                    if not injected[0] and timeout != 5:
+                        injected[0] = True
+                        assert sum(v["command"]["op"] == "connect" for v in envelopes) == 1
+                        assert sum(v["command"]["op"] == "release_input" for v in envelopes) == 1
+                        assert not any(v["command"]["op"] in {"resume", "grant", "input"} for v in envelopes)
+                        pi_now[0] += .125
+                        healthy[0] = False
+                        thermal[0] = {"version": 1, "raw_sample_at_monotonic_s": pi_now[0], "peaks_ready": False,
+                                      "deficit_started_at_monotonic_s": pi_now[0],
+                                      "deficit_ceiling_monotonic_s": pi_now[0] + 10,
+                                      "hold_sample_at_monotonic_s": None, "zero_read_started_at_monotonic_s": None,
+                                      "zero_read_completed_at_monotonic_s": None}
+                        a.tick()  # Real Core thermal-history transition also supports paused runs.
+                        descriptors.append(copy.deepcopy(a.run["recovery"]))
+                        assert set(descriptors[0]) == {"started", "ceiling", "revision"}
+                        if cause == "qualification_episode_cleared":
+                            restore_native()  # Real Core clears only its public descriptor.
+                            assert a.run["status"] == "paused" and a.run["recovery"] is None
+                        await original_wait(lambda: client.snapshot["run"]["recovery_episodes"] == 1, 1)
+                    return await original_wait(predicate, timeout)
+
+                async def qualify_native():
+                    await native_wait.wait()  # Independent of authenticated GET.
+                    assert producer.sequence == client.sequence == 0
+                    restore_native()
+
+                client.ws.send_json, client.wait, guard.record = capture, interrupted_qualification, record_handoff
+                renewal = asyncio.create_task(client.renew())
+                qualification = asyncio.create_task(qualify_native())
+                def renewal_current():
+                    if renewal.done():
+                        renewal.result()
+                        raise RuntimeError("original renewal ended")
+                try:
+                    assert await guard.resume(expected_pause="input_expired", renewal_check=renewal_current)
+                    await qualification
+                    assert guard.episodes == 1 and a.run["recovery_episodes"] == 1
+                    assert client.snapshot["evidence"]["active_acknowledged"] is True
+                    assert sum(v["command"]["op"] == "connect" for v in envelopes) == 2
+                    assert sum(v["command"]["op"] == "resume" for v in envelopes) == 1
+                    assert not any(v["command"]["op"] in {"claim", "start", "input", "grant"} for v in envelopes)
+                    closed = [v for v in records if v["event"] == "qualified_native_recovery"]
+                    assert len(closed) == 1 and closed[0]["original_recovery"] == descriptors[0]
+                    holds = [json.loads(row[0]) for row in a.db.execute("SELECT data FROM transitions")
+                             if json.loads(row[0])["kind"] == "required_hold"]
+                    assert len(holds) == 1 and holds[0]["recovery"] == descriptors[0]
+                    assert a.run["native_live_at"] == 9. and a.run["deadline"] == 309.
+                    producer.native_cursor, producer.reacquire = m._live(client.snapshot)["cursor"], True
+                    fresh = await m.send_leader_sample(client, producer, m.ZERO_BODY, record, phase="individual", progress_s=.02)
+                    assert fresh[2]["accepted"] is True and producer.sequence == 1
+                finally:
+                    qualification.cancel()
+                    renewal.cancel()
+                    await asyncio.gather(qualification, renewal, return_exceptions=True)
+                return
             if cause in {"grant_view_reconnect", "grant_view_switch"}:
                 # Synthetic48: actual Core/IPC/TLS/Gateway view reset, then an
                 # independent viewer task publishes genuine advancing progress.
@@ -5246,4 +5346,176 @@ def test_grant_view_wait_keeps_current_authority_and_one_original_phase(change, 
         assert client.sequence == 0
         assert not any(v["op"] in {"grant", "input", "claim", "start"} for v in commands)
         assert sum(v["event"] == "qualified_native_recovery" for v in records) == (1 if change == "episode_active_grace" else 0)
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("mutation", [
+    None, "third", "known_connect", "missing_source", "missing_descriptor", "extra_descriptor",
+    "future_source", "extended_source", "manual", "old_event", "closed_episode", "count_jump", "fourth",
+    "foreign", "fault", "uncertain", "changed_cause", "changed_source", "connection_changed",
+    "caller_expired", "episode_expired", "renewal_lost", "nested_resume", "reporting_failure", "legacy_no_identity",
+])
+def test_native_qualification_handoff_preserves_source_budget_and_first_error(monkeypatch, mutation):
+    """Synthetic source contrasts; the real Core/Gateway cases prove the entrypoint."""
+    import asyncio
+    import copy
+    import json
+    from types import SimpleNamespace
+
+    m = adapter()
+    pc = [1000.0]
+    monkeypatch.setattr(m, "time", SimpleNamespace(monotonic=lambda: pc[0]))
+    prior = 2 if mutation == "third" else 3 if mutation == "fourth" else 0
+    records, calls, guard_errors = [], [], []
+    initial = recovery_state()
+    initial["run"].update(recovery_episodes=prior, first_cause="feedback_loss" if prior else None)
+    paused = copy.deepcopy(initial)
+    paused["run"].update(status="paused", intent_revision=3, remaining_s=299.875)
+    paused["evidence"].update(active_acknowledged=False, acknowledged_intent_revision=3)
+    paused["evidence"]["accepted_host_action"].update(intent_revision=3, acquired_at_monotonic_s=100.125)
+    paused["run"]["live_input"]["cursor_intent_revision"] = 3
+    paused["events"] = [{"kind": "input_expired", "at": 100.125,
+                         "run_id": "owned", "service_incarnation": "service"}]
+    revision = 4 if mutation == "known_connect" else 3
+    episode = {"started": 100.25, "ceiling": 100.75, "revision": revision}
+    injected = copy.deepcopy(paused)
+    injected["run"].update(status="recovering", recovery_episodes=prior + 1, first_cause="feedback_loss",
+                           intent_revision=revision, remaining_s=299.625, recovery=copy.deepcopy(episode))
+    injected["events"].append({"kind": "required_hold", "at": 100.375,
+                               "run_id": "owned", "service_incarnation": "service",
+                               "recovery": copy.deepcopy(episode)})
+    fresh = copy.deepcopy(injected)
+    fresh["run"].update(status="paused", intent_revision=revision + 1, remaining_s=299.5, recovery=None)
+    fresh["events"].append({"kind": "live_sensing_requalified", "at": 100.5,
+                            "run_id": "owned", "service_incarnation": "service"})
+    fresh["evidence"].update(acknowledged_intent_revision=revision + 1)
+    fresh["evidence"]["accepted_host_action"].update(intent_revision=revision + 1, acquired_at_monotonic_s=100.5)
+    fresh["run"]["live_input"]["cursor_intent_revision"] = revision + 1
+    hold = injected["events"][-1]
+    if mutation == "missing_source":
+        injected["events"].pop()
+    elif mutation == "missing_descriptor":
+        hold.pop("recovery")
+    elif mutation == "extra_descriptor":
+        hold["recovery"]["extra"] = True
+    elif mutation == "future_source":
+        hold["recovery"]["started"] = 100.5
+    elif mutation == "extended_source":
+        hold["recovery"]["ceiling"] = 111.0
+    elif mutation == "manual":
+        injected["events"].insert(-1, {"kind": "pause", "at": 100.3,
+                                      "run_id": "owned", "service_incarnation": "service"})
+    elif mutation == "old_event":
+        injected["events"][0]["at"] = 100.0
+    elif mutation == "closed_episode":
+        injected = copy.deepcopy(fresh)
+        injected["events"].append({"kind": "resumed", "at": 100.55,
+                                    "run_id": "owned", "service_incarnation": "service"})
+    elif mutation == "count_jump":
+        injected["run"]["recovery_episodes"] += 1
+    elif mutation == "foreign":
+        injected["run"]["run_id"] = "foreign"
+    elif mutation == "fault":
+        injected["evidence"]["fault"] = "real native fault"
+    elif mutation == "uncertain":
+        injected["run"]["uncertain"] = True
+    elif mutation == "changed_cause":
+        injected["run"]["first_cause"] = "manual"
+    elif mutation == "changed_source":
+        fresh["events"][-2]["recovery"]["started"] += .0625
+    rejected = mutation not in {None, "third", "known_connect"}
+
+    class Client:
+        device, generation, connection, sequence = "device", "control", "connection", 0
+        reads, resumes = 0, 0
+
+        def __init__(self):
+            self.snapshot = recovery_state()
+
+        def identities(self):
+            return m.SessionClient.identities(self)
+
+        async def get(self, path):
+            assert path == "state"
+            self.reads += 1
+            if self.reads > 1:
+                if mutation == "connection_changed":
+                    self.connection = "changed"
+                elif mutation == "caller_expired":
+                    pc[0] += .125
+                elif mutation == "episode_expired":
+                    pc[0] += 1
+            self.snapshot = copy.deepcopy(paused if self.reads == 1 else fresh)
+            return {"snapshot": self.snapshot}
+
+        async def resume(self, *, check, refusal_record=None):
+            self.resumes += 1
+            check(self.snapshot)
+            if self.resumes == 1:
+                if mutation == "known_connect":
+                    self.connection = str(uuid4())
+                self.snapshot = copy.deepcopy(injected)
+                check(self.snapshot)
+                pytest.fail("unsafe/new history cannot continue the old Resume")
+            if mutation == "nested_resume":
+                raise ConnectionError("new qualification transport failed")
+            calls.append("new-resume-active-ack")
+            self.snapshot["run"]["status"] = "running"
+            self.snapshot["evidence"]["active_acknowledged"] = True
+            check(self.snapshot)
+
+    def record(value):
+        if mutation == "reporting_failure" and value["event"] == "native_rejoin_qualification_changed":
+            raise ValueError("fault reporting failed")
+        records.append(value)
+
+    async def scenario():
+        client = Client()
+        if mutation == "legacy_no_identity":
+            client.identities = None
+        guard = m.SameRunRecovery(client, record)
+        guard.episodes, guard.cause = prior, initial["run"]["first_cause"]
+        client.snapshot = copy.deepcopy(initial)
+        original_check = guard.check
+
+        def checked(state, *, history=True):
+            try:
+                original_check(state, history=history)
+            except RuntimeError as error:
+                if history and not guard_errors:
+                    guard_errors.append(error)
+                raise
+
+        guard.check = checked
+
+        def renewal():
+            if mutation == "renewal_lost" and guard_errors:
+                raise RuntimeError("original HTTP renewal lost")
+
+        # Reporting failure is itself isolated; force a later unsafe source so
+        # this contrast also proves that it cannot replace the original guard.
+        if mutation == "reporting_failure":
+            fresh["events"][-2]["recovery"]["started"] += .0625
+        if rejected:
+            with pytest.raises(RuntimeError) as caught:
+                await guard.resume(expected_pause="input_expired", renewal_check=renewal,
+                                   wall_deadline=1000.0625 if mutation == "caller_expired" else None)
+            assert caught.value is guard_errors[0]
+            assert calls == []
+            assert not any(v["event"] == "qualified_native_recovery" for v in records)
+        else:
+            assert await guard.resume(expected_pause="input_expired", renewal_check=renewal) is True
+            assert calls == ["new-resume-active-ack"]
+            assert guard.episodes == prior + 1
+            qualified = [v for v in records if v["event"] == "qualified_native_recovery"]
+            assert len(qualified) == 1 and qualified[0]["original_recovery"] == episode
+        assert client.sequence == 0
+        assert client.snapshot["run"]["native_live_at"] == 100.0
+        assert client.snapshot["run"]["deadline"] == 400.0
+        for entry in records:
+            if entry["event"] == "native_rejoin_qualification_changed":
+                assert len(json.dumps(entry, allow_nan=False).encode()) <= 8192
+        if mutation in {"caller_expired", "episode_expired"}:
+            assert client.resumes == 1
+
     asyncio.run(scenario())

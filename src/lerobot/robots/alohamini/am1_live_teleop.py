@@ -292,11 +292,14 @@ def refresh_startup_temperatures(robot, *, force=False):
 
 
 def _refresh_due_temperatures(robot, *, force=False, active=None):
+    from .lift_motor_feedback import POLL_S
+
     states = robot._am1_teleop_temperatures
     now = time.monotonic()
     due = force or any(
         (round(now * 1e9) - state["window"]._origin_ns) // round(state["window"].SLOT_S * 1e9)
         > state["window"]._last_slot
+        or active is True and now - state["window"]._last_sample_at >= POLL_S
         for state in states.values()
     )
     if due:
@@ -387,6 +390,8 @@ def thermal_history_status(robot):
 
 def service_due_feedback(robot):
     """Service due real role feedback between ordinary Live I/O phases."""
+    from .lift_motor_feedback import POLL_S
+
     if getattr(robot, "_am1_teleop_first_error", None) is not None:
         raise robot._am1_teleop_first_error
     if not binding_valid(robot):
@@ -404,7 +409,8 @@ def service_due_feedback(robot):
         for window in windows:
             window.assert_fresh(now, refreshing=True)
         window = operation.temperature
-        due = (round(now * 1e9) - window._origin_ns) // round(window.SLOT_S * 1e9) > window._last_slot
+        due = ((round(now * 1e9) - window._origin_ns) // round(window.SLOT_S * 1e9) > window._last_slot
+               or now - window._last_sample_at >= POLL_S)
         if due:
             drain = getattr(robot, "_am1_routine_lift_drain", None)
             if not callable(drain):
@@ -1178,14 +1184,8 @@ def before_write(control, robot):
     # A legacy force limiter can catch read errors; the original hard fault still fences every later write.
     if getattr(robot, "_am1_teleop_first_error", None) is not None:
         raise robot._am1_teleop_first_error
-    # Expiry is checked again after local validation and at every real write.
-    status = thermal_history_status(robot)
-    control.before_live_write(robot)  # Preserve the original expiry hold before a soft history hold.
-    if status is not None and status["deficit_started_at_monotonic_s"] is not None and (
-        not status["peaks_ready"] or status["hold_sample_at_monotonic_s"] is None
-        or time.monotonic() - status["hold_sample_at_monotonic_s"] > 0.5
-    ):
-        raise ThermalHistoryHoldRequiredError("AM1 thermal history needs a verified qualified hold")
+    # Original input expiry is checked before validation and after collection.
+    control.before_live_write(robot)
     if not binding_valid(robot) or robot._am1_teleop_binding != {**control.binding, "recipe": RECIPE}:
         raise RuntimeError("AM1 teleop protected write identity changed")
     for _, bus, names in _groups(robot):
@@ -1195,7 +1195,18 @@ def before_write(control, robot):
                 != control._live_summary["workspace"]["calibration"][name]
             ):
                 raise RuntimeError("AM1 teleop calibration changed before write: " + name)
-    control.before_live_write(robot)
+    # Calibration work may consume history margin. Complete the bounded
+    # whole-owner collection before the final all-role write permission; every
+    # intermediate collection guard still checks original RAW freshness.
+    if getattr(robot, "_am1_thermal_history_enabled", False):
+        service_due_feedback(robot)
+    control.before_live_write(robot)  # A genuine read cannot renew input expiry.
+    status = thermal_history_status(robot)
+    if status is not None and status["deficit_started_at_monotonic_s"] is not None and (
+        not status["peaks_ready"] or status["hold_sample_at_monotonic_s"] is None
+        or time.monotonic() - status["hold_sample_at_monotonic_s"] > 0.5
+    ):
+        raise ThermalHistoryHoldRequiredError("AM1 thermal history needs a verified qualified hold")
 
 
 def workspace(robot, identity, measured, *, goals=None):
@@ -1304,6 +1315,11 @@ def apply_frame(control, robot, command, marker_key):
     ):
         return False
     original = marker["live_input"]
+    if marker["mode"] == "active" and not control.check_live(robot):
+        # Enable the original admitted owner before its first active ACK.
+        return False
+    if getattr(robot, "_am1_thermal_history_enabled", False):
+        service_due_feedback(robot)
     history = thermal_history_status(robot)
     if marker["mode"] == "pause" and original is not None:
         return False
@@ -1386,11 +1402,20 @@ def apply_frame(control, robot, command, marker_key):
     if original is None:
         # Readiness acknowledges an existing literal raw hold, never a synthetic frame.
         accepted = control._apply_standard(robot, action)
-        if accepted and history is not None and history["deficit_started_at_monotonic_s"] is not None:
+        if accepted and history is not None:
+            # Actual owner work may consume the admission proof. Collect before
+            # ACK capture, then qualify all thirteen original histories together.
+            service_due_feedback(robot)
+            if not control.check_live(robot):  # Collection cannot renew the original Live/input clocks.
+                return False
             current = thermal_history_status(robot)
-            if not current["peaks_ready"] or current["hold_sample_at_monotonic_s"] is None:
+            if not current["peaks_ready"] or (
+                current["deficit_started_at_monotonic_s"] is not None
+                and current["hold_sample_at_monotonic_s"] is None
+            ):
                 raise ThermalHistoryHoldRequiredError("AM1 thermal history has not requalified")
-            robot._am1_thermal_history_episode = None
+            if current["deficit_started_at_monotonic_s"] is not None:
+                robot._am1_thermal_history_episode = None
         return accepted
     if control.state == "paused" and control._live_summary["state"] == "expired":
         return False

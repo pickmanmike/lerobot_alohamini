@@ -1818,9 +1818,17 @@ def test_history_hold_real_owner_requires_actual_bounded_zero_and_never_restarts
                 state.clock.sleep(.21)
             return accepted
         monkeypatch.setattr(control, "_apply_standard", delayed_active)
-        assert not control.apply(robot, frame(identity, owner, 4, mode="active", epoch=4))
-        assert control.state == "paused"
-        assert teleop.thermal_history_status(robot)["deficit_started_at_monotonic_s"] == anchor
+        # Genuine collection after the opaque work replaces an original oldest
+        # slot; the duration alone cannot decide the actual thirteen-role proof.
+        assert control.apply(robot, frame(identity, owner, 4, mode="active", epoch=4))
+        now = state.clock.now
+        assert control.state == "active"
+        assert all(window.ready and len(window.samples) == 5 for window in windows)
+        assert max(now - window.samples[0][0] for window in windows) == pytest.approx(.47388)
+        assert all(0 <= now - window._last_sample_at <= .5 for window in windows)
+        assert [window._origin_ns for window in windows] == origins
+        assert control.live_snapshot()["live_deadline_monotonic_s"] == frozen["live_deadline_monotonic_s"]
+        assert teleop.thermal_history_status(robot)["deficit_started_at_monotonic_s"] is None
         return
     assert control.apply(robot, frame(identity, owner, 4, mode="active", epoch=4))
     assert teleop.thermal_history_status(robot)["deficit_started_at_monotonic_s"] is None
@@ -1999,3 +2007,184 @@ def test_history_hold_entry_preserves_expiry_of_the_original_stored_sample(comma
         assert summary["reference"] == frozen["reference"] and summary["workspace"] == frozen["workspace"]
         assert summary["live_deadline_monotonic_s"] == frozen["live_deadline_monotonic_s"]
     assert not any(register == "Goal_Position" for _side, register, _values, _at in state.command_writes)
+
+
+@pytest.mark.parametrize("active", [None, True], ids=["startup-unchanged", "live"])
+@pytest.mark.parametrize("value", [28, 70], ids=["equal", "lower-than-retained-high"])
+def test_live_cadence_collects_real_within_slot_receipts_without_new_votes(thermal_robot, active, value):
+    robot, clock = thermal_robot
+    for stamp in (10., 10.1, 10.2, 10.3, 10.4):
+        acquire(robot, clock, stamp, value=value if stamp == 10.4 else 28, check=stamp == 10.4)
+    window = robot._am1_teleop_temperatures["left", 1]["window"]
+    original_peak, origin = window.samples[-1], window._origin_ns
+    robot.left_bus.rows["Present_Temperature"]["arm_left_1"] = 28
+    clock.now = 10.46
+    teleop._refresh_due_temperatures(robot, active=active)
+    assert window._last_sample_at == (10.46 if active is True else 10.4)
+    assert window.samples[-1] == ((10.46, 28) if active is True and value == 28 else original_peak)
+    assert len(window.samples) == 5 and window._origin_ns == origin
+    assert sum(t >= 70 for _, t in window.samples) == int(value == 70)
+
+
+def _live_cadence_owner(state, *, admit_active=True):
+    """Actual owner/SDK with a finite synthetic sequence of genuine role reads."""
+    from lerobot.robots.alohamini.alohamini_host import AM1LocalControl
+    from tests.robots.test_am1_live_teleop_native import frame
+
+    robot = state.robot
+    for side, raw in (("left", 2124), ("right", 1847)):
+        for register in ("Present_Position", "Goal_Position"):
+            getattr(robot, side + "_bus").registers[register, "arm_" + side + "_elbow_flex"] = raw
+    for motor in (*robot.base_motors, "lift_axis"):
+        robot.left_bus.registers["Goal_Velocity", motor] = 0
+    identity = {key: robot._am1_teleop_binding[key] for key in ("run_id", "host_incarnation")}
+    owner = {key: str(uuid4()) for key in ("service_incarnation", "controller_generation", "connection_generation")}
+    control = AM1LocalControl(**identity, live=True, live_recipe=teleop.RECIPE, clock=lambda: state.clock.now)
+    assert control.apply(robot, frame(identity, owner, 1))
+    if not admit_active:
+        return control, identity, owner, None
+    assert control.apply(robot, frame(identity, owner, 2, mode="active", epoch=2))
+    base = state.clock.now + .01
+    for index in range(5):
+        state.operation.emit_pending_sample()
+        state.clock.now = base + index * .1
+        state.operation.poll(defer_sample_log=True)
+        teleop.read_groups(robot, ("Present_Temperature",), active=True)
+    assert teleop.thermal_history_status(robot)["deficit_started_at_monotonic_s"] is None
+    return control, identity, owner, base
+
+
+@pytest.mark.parametrize("consumer", ["admission", "before_write"])
+def test_live_cadence_due_batch_precedes_cached_all_role_admission(command_cadence_boundary, consumer):
+    from tests.robots.test_am1_live_teleop_native import frame
+
+    state = command_cadence_boundary
+    control, identity, owner, base = _live_cadence_owner(state)
+    windows = [state.operation.temperature, *(row["window"] for row in state.robot._am1_teleop_temperatures.values())]
+    origins = [window._origin_ns for window in windows]
+    state.clock.now = base + .51  # Cached oldest peaks expired; last RAW is still fresh.
+    if consumer == "admission":
+        assert control.apply(state.robot, frame(identity, owner, 3, mode="active", epoch=2))
+    else:
+        teleop.before_write(control, state.robot)
+    proof = teleop.thermal_history_status(state.robot)
+    assert proof["peaks_ready"] and proof["deficit_started_at_monotonic_s"] is None
+    assert all(window._last_sample_at >= base + .51 for window in windows)
+    assert [window._origin_ns for window in windows] == origins
+    assert all(window.failure is None for window in windows)
+    assert not state.robot._am1_thermal_history_episode
+
+
+@pytest.mark.parametrize("delay", [.21, .501], ids=["missing-history", "expired-raw"])
+def test_live_cadence_incomplete_batch_cannot_acknowledge_or_write(command_cadence_boundary, delay):
+    from tests.robots.test_am1_live_teleop_native import frame
+
+    state = command_cadence_boundary
+    control, identity, owner, base = _live_cadence_owner(state)
+    frozen = control.live_snapshot()
+    state.clock.now = base + .4 + delay
+    state.command_writes.clear()
+    if delay > .5:
+        with pytest.raises(RuntimeError, match="stale"):
+            control.apply(state.robot, frame(identity, owner, 3, mode="active", epoch=2))
+    else:
+        assert not control.apply(state.robot, frame(identity, owner, 3, mode="active", epoch=2))
+        proof = teleop.thermal_history_status(state.robot)
+        assert not proof["peaks_ready"] and proof["hold_sample_at_monotonic_s"] is not None
+        assert proof["deficit_ceiling_monotonic_s"] == min(
+            proof["deficit_started_at_monotonic_s"] + 10, frozen["live_deadline_monotonic_s"])
+    assert not any(register == "Goal_Position" for _side, register, _values, _at in state.command_writes)
+    assert control.live_snapshot()["live_deadline_monotonic_s"] == frozen["live_deadline_monotonic_s"]
+
+
+def test_live_cadence_ack_annotation_never_acquires_future_original_proof(command_cadence_boundary, monkeypatch):
+    from lerobot.robots.alohamini.alohamini_host import AM1_LOCAL_FEEDBACK_KEY
+
+    state = command_cadence_boundary
+    control, _identity, _owner, _base = _live_cadence_owner(state)
+    acquired_at = state.clock.now
+    for _side, bus, _names in teleop._groups(state.robot):
+        monkeypatch.setattr(bus, "sync_read", lambda *a, **k: pytest.fail("ACK annotation performed device I/O"))
+    result = {}
+    control.annotate(result, acquired_at=acquired_at)
+    proof = result[AM1_LOCAL_FEEDBACK_KEY]["thermal_history"]
+    assert proof["raw_sample_at_monotonic_s"] <= acquired_at
+    assert state.clock.now == acquired_at
+
+
+@pytest.mark.parametrize("delay", [.11, .21, .501], ids=["due-batch", "missing-history", "expired-raw"])
+def test_live_cadence_active_ack_requalifies_after_actual_owner_work(command_cadence_boundary, monkeypatch, delay):
+    from tests.robots.test_am1_live_teleop_native import frame
+
+    state = command_cadence_boundary
+    control, identity, owner, base = _live_cadence_owner(state)
+    state.clock.now = base + .43
+    original = control._apply_standard
+    def delayed(robot, action):
+        accepted = original(robot, action)
+        state.clock.sleep(delay)  # Explicit synthetic work before active ACK; no invented historical subcall.
+        return accepted
+    monkeypatch.setattr(control, "_apply_standard", delayed)
+    if delay > .5:
+        with pytest.raises(RuntimeError, match="stale"):
+            control.apply(state.robot, frame(identity, owner, 3, mode="active", epoch=2))
+    else:
+        accepted = control.apply(state.robot, frame(identity, owner, 3, mode="active", epoch=2))
+        assert accepted is (delay == .11)
+        proof = teleop.thermal_history_status(state.robot)
+        if accepted:
+            assert proof["peaks_ready"] and proof["raw_sample_at_monotonic_s"] >= base + .54
+            assert proof["deficit_started_at_monotonic_s"] is None
+        else:
+            assert control.state == "paused" and not proof["peaks_ready"]
+            assert proof["hold_sample_at_monotonic_s"] is not None
+
+
+def test_live_cadence_write_checks_all_roles_after_calibration_work(command_cadence_boundary, monkeypatch):
+    state = command_cadence_boundary
+    control, _identity, _owner, base = _live_cadence_owner(state)
+    state.clock.now = base + .43
+    original = state.robot._am1_activation_calibration
+    delayed = False
+    def calibration(bus, name):
+        nonlocal delayed
+        value = original(bus, name)
+        if not delayed:
+            delayed = True
+            state.clock.sleep(.21)  # Synthetic CPU work between collection and the real write guard.
+        return value
+    monkeypatch.setattr(state.robot, "_am1_activation_calibration", calibration)
+    with pytest.raises(teleop.ThermalHistoryHoldRequiredError):
+        teleop.before_write(control, state.robot)
+    assert not teleop.thermal_history_status(state.robot)["peaks_ready"]
+
+
+def test_live_cadence_repeated_real_shared_batches_keep_all_original_role_histories(command_cadence_boundary):
+    state = command_cadence_boundary
+    control, _identity, _owner, base = _live_cadence_owner(state)
+    windows = [state.operation.temperature, *(row["window"] for row in state.robot._am1_teleop_temperatures.values())]
+    origins = [window._origin_ns for window in windows]
+    for offset in range(45, 201, 5):
+        state.clock.now = base + offset / 100
+        teleop.before_write(control, state.robot)
+        proof = teleop.thermal_history_status(state.robot)
+        assert proof["peaks_ready"] and proof["deficit_started_at_monotonic_s"] is None
+        assert [window._origin_ns for window in windows] == origins
+        assert all(len(window.samples) == 5 for window in windows)
+    assert state.operation.failure is None
+
+
+def test_live_cadence_first_active_ack_cannot_skip_original_raw_revalidation(command_cadence_boundary, monkeypatch):
+    from tests.robots.test_am1_live_teleop_native import frame
+
+    state = command_cadence_boundary
+    control, identity, owner, _base = _live_cadence_owner(state, admit_active=False)
+    assert not getattr(state.robot, "_am1_thermal_history_enabled", False)
+    original = control._apply_standard
+    def delayed(robot, action):
+        accepted = original(robot, action)
+        state.clock.sleep(.501)
+        return accepted
+    monkeypatch.setattr(control, "_apply_standard", delayed)
+    with pytest.raises(RuntimeError, match="stale"):
+        control.apply(state.robot, frame(identity, owner, 2, mode="active", epoch=2))

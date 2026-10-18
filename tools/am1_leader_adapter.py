@@ -206,6 +206,15 @@ class _ResumePausedError(RuntimeError):
         self.episode = None
 
 
+class _NativeRecoveryPendingError(RuntimeError):
+    """Source-qualified native recovery interrupts unfinished held qualification."""
+
+    def __init__(self, context, recovery, ceiling, original_error):
+        super().__init__("new native recovery interrupted held qualification")
+        self.context, self.recovery = json.loads(json.dumps([context, recovery], allow_nan=False))
+        self.ceiling, self.original_error, self.episode = ceiling, original_error, None
+
+
 def _latest_run_event(snapshot, identity):
     return next((event for event in reversed(snapshot.get("events", []))
                  if event.get("run_id") == identity["run_id"]
@@ -1124,7 +1133,7 @@ class SameRunRecovery:
     ):
         clock = {"ceiling": wall_deadline, "anchored": False}
         interrupted, deferred, first_transport_error = None, [], grant_error
-        grant_context = None
+        grant_context, pending_recovery = None, None
         if grant_error is not None:
             try:
                 grant_context = getattr(grant_error, "grant_context", None)
@@ -1151,6 +1160,7 @@ class SameRunRecovery:
                     or not 0 <= requested <= time.monotonic()):
                     raise RuntimeError("original running grant identity/clock unavailable")
                 clock["ceiling"] = min(requested + remaining, wall_deadline if wall_deadline is not None else float("inf"))
+                clock["native_ceiling"] = requested + remaining
                 clock["held_view_ceiling"] = min(requested + 8, clock["ceiling"])
                 def remaining_budget():
                     renewal_check()
@@ -1170,13 +1180,23 @@ class SameRunRecovery:
                         wall_deadline=clock["ceiling"], require_episode=require_episode,
                         refusal_identity=refusal_identity, expected_pause=expected_pause,
                         renewal_check=renewal_check, clock=clock, interrupted=interrupted,
-                        grant_context=grant_context)
+                        grant_context=grant_context, pending_recovery=pending_recovery)
+                except _NativeRecoveryPendingError as outcome:
+                    first_transport_error = first_transport_error or outcome.original_error
+                    if outcome.episode is not None:
+                        deferred.append(outcome.episode)
+                    clock["ceiling"] = min(clock["ceiling"], outcome.ceiling)
+                    pending_recovery, interrupted, grant_context = outcome, None, None
+                    require_episode, refusal_identity, expected_pause = False, None, None
+                    self.record({"event": "native_recovery_handoff", "original_recovery": outcome.recovery,
+                                 "identity": outcome.context["identity"], "local_ceiling_monotonic_s": outcome.ceiling})
+                    continue
                 except _ResumePausedError as outcome:
                     first_transport_error = first_transport_error or getattr(outcome, "transport_error", None)
                     if outcome.episode is not None:
                         deferred.append(outcome.episode)
                     interrupted = outcome
-                    grant_context = None
+                    grant_context, pending_recovery = None, None
                     require_episode, refusal_identity, expected_pause = False, None, outcome.event["kind"]
                     self.record({"event": "accepted_resume_superseded", "identity": outcome.identity,
                                  "pause_event": outcome.event, "remaining_s": clock["ceiling"] - time.monotonic()})
@@ -1231,7 +1251,7 @@ class SameRunRecovery:
 
     async def _resume_once(
         self, *, wall_deadline, require_episode, refusal_identity, expected_pause,
-        renewal_check, clock, interrupted, grant_context=None,
+        renewal_check, clock, interrupted, grant_context=None, pending_recovery=None,
     ):
         # This is the existing authenticated owner read, not a WSS freshness
         # guess. Anchor BEFORE the read so HTTP time cannot extend the ceiling.
@@ -1272,6 +1292,7 @@ class SameRunRecovery:
               or not 0 < native_remaining <= clock["remaining"]):
             raise RuntimeError("original native rejoin remaining clock increased or became invalid")
         clock["remaining"] = native_remaining
+        clock["native_ceiling"] = min(clock.get("native_ceiling", float("inf")), requested + native_remaining)
         wall_deadline = clock["ceiling"]
         self.record(
             {
@@ -1305,6 +1326,13 @@ class SameRunRecovery:
             raise RuntimeError("original mailbox input refusal/current ordinary pause unavailable")
         recovered, local_ceiling, episode = False, wall_deadline, None
         retained = None
+        if pending_recovery is not None:
+            context = pending_recovery.context
+            if self.client.connection != context["identity"]["connection_generation"]:
+                raise RuntimeError("pending native recovery binding changed")
+            retained = self._grant_episode(state, context)
+            if retained != pending_recovery.recovery:
+                raise RuntimeError("pending native recovery original source descriptor changed")
         if grant_context is not None:
             if self.client.connection != grant_context["identity"]["connection_generation"]:
                 raise RuntimeError("original ambiguous grant connection changed")
@@ -1459,12 +1487,69 @@ class SameRunRecovery:
             raise RuntimeError("original mailbox input refusal connection changed before Resume")
         if renewal_check:
             renewal_check()
+        qualification_context = None
         def checked(snapshot):
+            nonlocal qualification_context
             if time.monotonic() >= local_ceiling:
                 raise TimeoutError("original rejoin ceiling exhausted")
             if renewal_check:
                 renewal_check()
-            self.check(snapshot)
+            try:
+                self.check(snapshot)
+            except RuntimeError as original:
+                # Keep the offending current proof bounded and fault-only.
+                # Reporting never replaces this original guard refusal.
+                with contextlib.suppress(Exception):
+                    identity = (qualification_context or {}).get("identity") or self.client.identities()
+                    detail = {"event": "native_rejoin_qualification_changed", "guard": str(original)[:128],
+                              "prior_qualified_count": self.episodes,
+                              "current_count": snapshot["run"].get("recovery_episodes"),
+                              "qualification": _paused_binding_diagnostic(
+                                  state, snapshot, identity, _latest_run_event(state, identity), False,
+                                  self.client.connection, native_remaining, local_ceiling)}
+                    if len(json.dumps(detail, allow_nan=False).encode()) <= 8192:
+                        self.record(detail)
+                try:
+                    self.check(snapshot, history=False)
+                    if (qualification_context is None or self.history_qualified(snapshot)
+                        or snapshot["run"].get("recovery_episodes") != self.episodes + 1):
+                        raise original
+                    context = json.loads(json.dumps(qualification_context, allow_nan=False))
+                    identity, actual = context["identity"], self.client.identities()
+                    if (set(actual) != set(identity)
+                        or any(type(actual[k]) is not type(v) or actual[k] != v for k, v in identity.items()
+                               if k not in {"intent_revision", "connection_generation"})):
+                        raise RuntimeError("native recovery current authority changed")
+                    if self.client.connection != identity["connection_generation"]:
+                        generation = self.client.connection
+                        if (type(generation) is not str or str(UUID(generation)) != generation
+                            or type(identity["intent_revision"]) is not int or self.client.sequence != 0):
+                            raise RuntimeError("native recovery acknowledged connect binding unavailable")
+                        # Only the known connect ACK moves this local binding;
+                        # no ambiguous command or authority can be adopted.
+                        identity["connection_generation"] = generation
+                        identity["intent_revision"] += 1
+                    recovery = self._grant_episode(snapshot, context)
+                    own = [v for v in snapshot.get("events", []) if v.get("run_id") == identity["run_id"]
+                           and v.get("service_incarnation") == identity["service_incarnation"]]
+                    hold_index = max(i for i, v in enumerate(own) if v.get("kind") == "required_hold")
+                    if hold_index < 1 or own[hold_index - 1] != _latest_run_event(context["snapshot"], identity):
+                        raise RuntimeError("native recovery preceding own qualification event changed")
+                    ceiling = min(local_ceiling, clock["native_ceiling"] - snapshot["run"]["deadline"] + recovery["ceiling"])
+                    if time.monotonic() >= ceiling:
+                        raise TimeoutError("original pending native recovery ceiling exhausted")
+                except (Exception, asyncio.CancelledError) as refusal:
+                    if refusal is original:
+                        raise
+                    raise original from refusal
+                raise _NativeRecoveryPendingError(context, recovery, ceiling, original) from original
+            if snapshot["run"].get("status") == "paused" and snapshot["run"].get("recovery") is None:
+                identities = getattr(self.client, "identities", None)
+                # Stateless supported callers keep their old behavior; without
+                # current binding proof they cannot enter this new handoff.
+                qualification_context = (json.loads(json.dumps(
+                    {"identity": identities(), "snapshot": snapshot}, allow_nan=False))
+                    if callable(identities) else None)
         try:
             if grant_context is not None:
                 identity = self.client.identities()
@@ -1556,6 +1641,9 @@ class SameRunRecovery:
                 options = ({"qualification_ceiling": clock["held_view_ceiling"]}
                            if "held_view_ceiling" in clock else {})
                 await asyncio.wait_for(self.client.resume(check=checked, refusal_record=self.record, **options), timeout)
+        except _NativeRecoveryPendingError as outcome:
+            outcome.episode = episode if recovered else None
+            raise
         except _ResumePausedError as outcome:
             self.check(self.client.snapshot)
             outcome.episode = episode if recovered else None

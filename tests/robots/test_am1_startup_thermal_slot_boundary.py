@@ -273,6 +273,6 @@ def test_saved25_original_empty_relief_slot_still_refuses_without_rewriting_hist
     with pytest.raises(feedback.ComparisonRefusal, match="five-slot feedback window is stale"):
         window.update(33, 172202.524408015)
     assert list(window.samples) == [(when, 33) for when in
-        (172202.022485412, 172202.132386756, 172202.241406213, 172202.356415298, 172202.468402320)]
+        (172202.022485412, 172202.132386756, 172202.300389528, 172202.412393216, 172202.524408015)]
     assert window._origin_ns == round(origin * 1e9) and window.outliers == 0
     assert window.failure is not None
