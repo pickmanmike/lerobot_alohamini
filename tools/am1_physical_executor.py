@@ -797,13 +797,59 @@ class PhysicalExecutor:
                 and self._fault is None
             )
             ack = s["ack"] if s else {}
-            thermal, thermal_fault = None, None
+            thermal, thermal_fault, terminal_clean = None, None, False
             if self.live_spec is TELEOP_SPEC:
-                try:
-                    thermal, thermal_ready = self._thermal_qualification(ack, now)
-                    fresh = fresh and thermal_ready
-                except ValueError as error:
-                    fresh, thermal_fault = False, str(error)
+                if self._lifecycle.get("phase") == "terminal":
+                    try:
+                        from examples.alohamini.am1_session_contract import uuid_text
+
+                        lifecycle = self._lifecycle
+                        receipt = lifecycle.get("readback")
+                        readback = receipt.get("readback") if isinstance(receipt, dict) else {}
+                        camera = lifecycle.get("camera_release") or {}
+                        release = camera.get("release_evidence") or {}
+                        terminal_clean = bool(
+                            uuid_text(self.run_id) == self.run_id
+                            and uuid_text(self.host_incarnation) == self.host_incarnation
+                            and lifecycle.get("run_id") == self.run_id
+                            and lifecycle.get("backend_incarnation") == self.host_incarnation
+                            and ack.get("run_id") == self.run_id
+                            and ack.get("host_incarnation") == self.host_incarnation
+                            and type(lifecycle.get("terminal_status")) is str
+                            and lifecycle["terminal_status"] in {"stopped", "completed", "faulted", "interrupted"}
+                            and lifecycle.get("uncertain") is False
+                            and lifecycle.get("cleanup") == "physical_readback_verified"
+                            and lifecycle.get("cleanup_errors") == []
+                            and not (self.worker and self.worker.is_alive())
+                            and not (self._reconciliation_worker and self._reconciliation_worker.thread.is_alive())
+                            and isinstance(receipt, dict) and type(receipt.get("version")) is int
+                            and "first_cause" in lifecycle and "first_cause" in receipt
+                            and (lifecycle["first_cause"] is None
+                                 or type(lifecycle["first_cause"]) is str and bool(lifecycle["first_cause"]))
+                            and receipt["first_cause"] == lifecycle["first_cause"]
+                            and isinstance(readback, dict) and readback.get("verified") is True
+                            and readback.get("buses_closed") is True and readback.get("cleanup_errors") == []
+                            and readback.get("selected_gain_restore_required") is False
+                            and qualified_cleanup_receipt(receipt, self.run_id, self.host_incarnation)
+                            and type(camera.get("version")) is int and camera["version"] == 1
+                            and camera.get("session_id") == self.run_id and camera.get("state") == "released"
+                            and camera.get("errors") == [] and camera.get("runtime_failed") is False
+                            and type(release.get("backend_returncode")) is int and release["backend_returncode"] == 0
+                            and all(release.get(k) is True for k in
+                                    ("backend_exited", "readers_joined", "viewer_socket_closed", "runtime_config_removed"))
+                        )
+                    except (AttributeError, KeyError, TypeError, ValueError):
+                        terminal_clean = False  # Incomplete or foreign cleanup retains live proof validation.
+                if terminal_clean:
+                    # The closed owner's ACK stays diagnostic, never fresh
+                    # permission or a new live thermal fault. Resident faults remain.
+                    fresh = False
+                else:
+                    try:
+                        thermal, thermal_ready = self._thermal_qualification(ack, now)
+                        fresh = fresh and thermal_ready
+                    except ValueError as error:
+                        fresh, thermal_fault = False, str(error)
             matched = (
                 fresh
                 and ack.get("run_id") == self.run_id
@@ -833,7 +879,7 @@ class PhysicalExecutor:
             return {
                 "source": self.source,
                 "feedback": bool(fresh),
-                "required_observation": o["qualified"],
+                "required_observation": o["qualified"] and not terminal_clean,
                 "optional_quality": False,
                 "optional_observation": {"required": False, "state": "not-requested", "qualified": False},
                 "pose_aligned": aligned or bool(self._dispatch_ack and active_ack),

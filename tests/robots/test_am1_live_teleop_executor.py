@@ -1204,3 +1204,181 @@ def test_thermal_history_core_consumes_original_proof_at_the_current_clock(tmp_p
     finally:
         a.run = None
         a.close()
+
+
+@pytest.mark.parametrize("change", [None, "recent", "resident_fault", "live", "held", "startup", "finishing",
+    "uncertain", "unknown_cleanup", "foreign_run", "foreign_host", "foreign_ack", "missing_row", "nonzero_row",
+    "bool_row", "buses_open", "gain_restore", "missing_readback", "camera_active", "camera_foreign", "camera_failed",
+    "reader_alive", "backend_alive", "bad_returncode", "worker_alive", "reconcile_alive", "malformed_cleanup", "invalid_source_identity"])
+def test_thermal_terminal_cleanup_does_not_revalidate_old_raw_as_a_current_fault(change):
+    from types import SimpleNamespace
+
+    from tests.robots.test_am1_physical_executor import terminal_cleanup_outcome
+
+    e, _ids = admitted_executor()
+    now = 10.01 if change == "recent" else 10.6
+    e.clock = lambda: now
+    proof = {"version": 1, "raw_sample_at_monotonic_s": 9.98, "peaks_ready": True,
+             "deficit_started_at_monotonic_s": None, "deficit_ceiling_monotonic_s": None,
+             "hold_sample_at_monotonic_s": None, "zero_read_started_at_monotonic_s": None,
+             "zero_read_completed_at_monotonic_s": None}
+    e.sample["ack"]["thermal_history"] = proof
+    outcome = terminal_cleanup_outcome(e.run_id, e.host_incarnation, "stopped")
+    outcome["first_cause"] = outcome["readback"]["first_cause"] = None
+    e._lifecycle.update(outcome, phase="terminal", run_id=e.run_id)
+    if change == "resident_fault":
+        e._fault = "RuntimeError: actual resident native fault"
+    elif change in {"live", "held", "startup", "finishing"}:
+        e._lifecycle["phase"] = "live" if change == "held" else change
+        if change == "held":
+            e.desired = "hold"
+    elif change == "uncertain":
+        e._lifecycle["uncertain"] = True
+    elif change == "unknown_cleanup":
+        e._lifecycle["cleanup"] = "physical_cleanup_unknown"
+    elif change == "foreign_run":
+        e._lifecycle["run_id"] = str(uuid4())
+    elif change == "foreign_host":
+        e._lifecycle["backend_incarnation"] = str(uuid4())
+    elif change == "foreign_ack":
+        e.sample["ack"]["host_incarnation"] = str(uuid4())
+    elif change == "missing_row":
+        e._lifecycle["readback"]["readback"]["readbacks"].pop()
+    elif change in {"nonzero_row", "bool_row"}:
+        e._lifecycle["readback"]["readback"]["readbacks"][0]["value"] = True if change == "bool_row" else 1
+    elif change == "buses_open":
+        e._lifecycle["readback"]["readback"]["buses_closed"] = False
+    elif change == "gain_restore":
+        e._lifecycle["readback"]["readback"]["selected_gain_restore_required"] = True
+    elif change == "missing_readback":
+        e._lifecycle.pop("readback")
+    elif change == "camera_active":
+        e._lifecycle["camera_release"]["state"] = "running"
+    elif change == "camera_foreign":
+        e._lifecycle["camera_release"]["session_id"] = str(uuid4())
+    elif change == "camera_failed":
+        e._lifecycle["camera_release"]["runtime_failed"] = True
+    elif change in {"reader_alive", "backend_alive", "bad_returncode"}:
+        key = {"reader_alive": "readers_joined", "backend_alive": "backend_exited",
+               "bad_returncode": "backend_returncode"}[change]
+        e._lifecycle["camera_release"]["release_evidence"][key] = 1 if change == "bad_returncode" else False
+    elif change == "worker_alive":
+        e.worker = SimpleNamespace(is_alive=lambda: True)
+    elif change == "reconcile_alive":
+        e._reconciliation_worker = SimpleNamespace(thread=SimpleNamespace(is_alive=lambda: True), state="pending", error=None)
+    elif change == "malformed_cleanup":
+        e._lifecycle["readback"]["readback"]["readbacks"][0] = None
+    elif change == "invalid_source_identity":
+        e.run_id = e._lifecycle["run_id"] = e.sample["ack"]["run_id"] = "not-a-native-run"
+        e._lifecycle["readback"]["run_id"] = e._lifecycle["camera_release"]["session_id"] = e.run_id
+    original = copy.deepcopy((e.sample, e._lifecycle, e._fault))
+    evidence = e.evidence()
+    if change in {None, "recent", "resident_fault"}:
+        assert evidence["fault"] == e._fault
+        assert all(evidence[k] is False for k in ("feedback", "required_observation", "native_ack",
+                                                  "active_acknowledged", "hold_acknowledged", "pose_aligned"))
+    else:
+        assert evidence["fault"] == "native thermal original RAW feedback expired/invalid"
+    assert (e.sample, e._lifecycle, e._fault) == original
+    assert evidence["accepted_host_action"]["thermal_history"]["raw_sample_at_monotonic_s"] == 9.98
+
+
+@pytest.mark.parametrize("boundary", ["evidence", "new_start"])
+def test_real_core_terminal_thermal_ack_allows_only_new_startup_after_known_cleanup(tmp_path, boundary):
+    import threading
+    import time
+
+    from lerobot.robots.alohamini import alohamini_host as host
+    from tests.robots.test_am1_live_teleop_native import lane
+    from tests.robots.test_am1_persistent_session import command, start
+    from tests.robots.test_am1_physical_executor import terminal_cleanup_outcome, until
+    from tools.am1_session_core import SessionAuthority
+
+    class NativeIO:
+        provenance = "protected-host"
+
+        def __init__(self):
+            self.started = 0
+            self.entered, self.release = threading.Event(), threading.Event()
+
+        def start(self, run_id, incarnation, recipe, cancel):
+            self.started += 1
+            self.run_id, self.incarnation = run_id, incarnation
+            if self.started > 1:
+                self.entered.set()
+                while not self.release.wait(.005):
+                    cancel()
+            _, _, _, self.robot, _ = lane()
+            self.robot._am1_live_before_write = lambda: None
+            self.robot._am1_teleop_binding = {"run_id": run_id, "host_incarnation": incarnation, "recipe": recipe.name}
+            self.control = host.AM1LocalControl(run_id=run_id, host_incarnation=incarnation,
+                                               live=True, live_recipe=recipe.name)
+
+        def poll(self, previous):
+            self.control.check_live(self.robot)
+            measured = self.robot.get_observation()
+            at = time.monotonic()
+            self.control.annotate(measured, acquired_at=at)
+            marker = measured[host.AM1_LOCAL_FEEDBACK_KEY]
+            marker["thermal_history"] = {"version": 1, "raw_sample_at_monotonic_s": at, "peaks_ready": True,
+                "deficit_started_at_monotonic_s": None, "deficit_ceiling_monotonic_s": None,
+                "hold_sample_at_monotonic_s": None, "zero_read_started_at_monotonic_s": None,
+                "zero_read_completed_at_monotonic_s": None}  # Explicit synthetic thermal sensor proof.
+            return {"positions": self.robot.get_observation(), "sequence": marker["observation_id"],
+                    "at": at, "ack": marker, "observation": measured, "provenance": "protected-host/measured-feedback"}
+
+        def send(self, action):
+            self.control.apply(self.robot, action)
+
+        def finish(self, status):
+            result = terminal_cleanup_outcome(self.run_id, self.incarnation, status)
+            result["first_cause"] = result["readback"]["first_cause"] = None
+            return result
+
+    io = NativeIO()
+    e = executor(io)
+    a = SessionAuthority(tmp_path, executor=e)
+    try:
+        first = start(a, "physical-live-teleop")
+        assert first["accepted"] and first["status"] == "starting" and not first["effect_admitted"]
+        def live():
+            a.tick()
+            return a.run.get("native_live_at") is not None
+        until(live)
+        stopped = a.handle(command("stop", run_id=a.run["run_id"]), "owner")
+        assert stopped["accepted"]
+        until(lambda: e.evidence()["lifecycle"]["phase"] == "terminal")
+        e.worker.join(2)
+        a.tick()
+        assert a.run["status"] == "stopped" and a.run["cleanup"] == "physical_readback_verified"
+        assert a.run["uncertain"] is False and e._fault is None
+        old_run = a.run
+        original, sample = copy.deepcopy(a.run), copy.deepcopy(e.sample)
+        prior_run, prior_host = e.run_id, e.host_incarnation
+        old_result = a.db.execute("SELECT result FROM operations WHERE id=?", (first["operation_id"],)).fetchone()
+        time.sleep(.55)  # Genuine wall time: old thermal RAW expires while the closed host stays off.
+        if boundary == "evidence":
+            evidence = e.evidence()
+            assert evidence["fault"] is None
+            assert not evidence["feedback"] and not evidence["native_ack"] and not evidence["required_observation"]
+        else:
+            result = start(a, "physical-live-teleop")
+            assert result["accepted"] and result["status"] == "starting" and result["effect_admitted"] is False
+            assert io.entered.wait(1)
+            assert e.run_id != prior_run and e.host_incarnation != prior_host
+            assert e.sample is None and e._fault is None
+            a.tick()
+            assert a.run["native_live_at"] is None and a.run["deadline"] is None and a.run["progress_s"] == 0
+            assert not e.evidence()["feedback"] and not e.evidence()["native_ack"]
+            io.release.set()
+            until(live)
+            assert e.sample["at"] > sample["at"]
+        assert old_run == original and original["run_id"] == prior_run
+        assert a.db.execute("SELECT result FROM operations WHERE id=?", (first["operation_id"],)).fetchone() == old_result
+        if boundary == "evidence":
+            assert a.run == original and e.sample == sample
+    finally:
+        io.release.set()
+        a.close()
+        if e.worker:
+            e.worker.join(2)

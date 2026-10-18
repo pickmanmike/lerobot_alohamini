@@ -47,6 +47,7 @@ The explicit candidate correction is limited to powered AM1 live teleoperation: 
 - **Result/source:** [Packet14][p14] next right Start accepted actual left Goal2101 instead of the earlier2124 anchor; [Packet13][p13] used supported initial return when needed without manual positioning or deadline renewal.
 - **Implementation/tests/status:** [normal-rest startup](../../tests/robots/test_am1_normal_rest_startup.py), [practical native](../../tests/robots/test_am1_practical_native.py), [live qualify_rest/workspace][live]. Practical next Start demonstrated; representative Packet16 next Start unfinished.
 - **Reopen:** fresh rest outside the supported workspace/calibration, a jump, stale hold or drift beyond admitted bounds. Do not reseed away drift or rewrite calibration to force admission.
+- **Terminal evidence is historical:** Combined49 was refused before a new run because a cleaned, stopped run's old thermal acknowledgment was revalidated as live. The focused candidate recognizes only same-run/host terminal motor and camera cleanup with no active owner work, preserves actual resident faults and raw records, and sets all terminal readiness flags false. A new Start must acquire new startup feedback; current thermal guards are unchanged. Thirty focused and 244 affected executor checks pass; the consolidated product/helper review is clear; deployment and physical reuse remain separate.
 
 ## START-02: preserve lift home, relief and readiness semantics
 
