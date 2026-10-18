@@ -784,7 +784,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                             host_incarnation="host", intent_revision=self.snapshot["run"]["intent_revision"])
             return {"run_id": self.snapshot["run"]["run_id"] if foreign_boundary else owned_id}
 
-        async def resume(self, *, check=None):
+        async def resume(self, *, check=None, refusal_record=None):
             assert self.snapshot["run"]["run_id"] == owned_id
             if check:
                 check(self.snapshot)
@@ -1587,7 +1587,7 @@ def test_same_run_recovery_waits_original_episode_then_current_held_proof(mutati
             self.snapshot = copy.deepcopy(first if self.reads == 1 else last)
             return {"snapshot": self.snapshot}
 
-        async def resume(self, *, check=None):
+        async def resume(self, *, check=None, refusal_record=None):
             assert self.reads >= 2 and self.snapshot["run"]["status"] == "paused"
             assert check is not None
             check(self.snapshot)
@@ -1747,7 +1747,7 @@ def test_original_recovery_ceiling_includes_authenticated_read_time_without_rean
     asyncio.run(asyncio.wait_for(scenario(), 0.3))
 
 
-@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice"])
+@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice"])
 def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(tmp_path, cause):
     import asyncio
     import copy
@@ -1908,6 +1908,81 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
             assert first[2]["accepted"] is True and producer.sequence == 1
             stale = copy.deepcopy(client.snapshot)
             assert stale["run"]["status"] == "running"
+            if cause in {"resume_view_refusal", "resume_view_refused_twice"}:
+                # Clearly synthetic Core/Gateway witness: expiry occurs AFTER
+                # the PC held/view predicate, BEFORE the real Core Resume gate.
+                pi_clock, refusals_left = [10.01], [2 if cause == "resume_view_refused_twice" else 1]
+                a.clock = e.clock = lambda: pi_clock[0]
+                a._pause_live_input("input_expired")
+                a._teleop_view["qualified_until"] = pi_clock[0] + .5
+                original_call, original_get = gateway.call, client.get
+                resumes, refused, fresh_reads = [], [], []
+                awaiting_fresh = [False]
+                own_event = copy.deepcopy(a.events[-1])
+                before_connects = sum(op == "connect" for op, _ in commands)
+                before_releases = sum(op == "release_input" for op, _ in commands)
+
+                async def refuse_after_pc_view(command, device):
+                    if command.get("op") == "resume":
+                        resumes.append(copy.deepcopy(command))
+                        revision = a.run["intent_revision"]
+                        assert sum(op == "input" for op, _ in commands) == 1
+                        if refusals_left[0]:
+                            refusals_left[0] -= 1
+                            pi_clock[0] += .02
+                            a._teleop_view["qualified_until"] = pi_clock[0] - .001
+                            response = await original_call(command, device)
+                            assert response == {"accepted": False, "status": "refused", "effect_admitted": False,
+                                                "reason": "current required selected view must advance before Resume"}
+                            assert a.run["intent_revision"] == revision and a.run["status"] == "paused"
+                            assert a.events[-1] == own_event
+                            refused.append(copy.deepcopy(response))
+                            awaiting_fresh[0] = True
+                            return response
+                        assert fresh_reads and fresh_reads[-1]["qualified"] is True
+                    return await original_call(command, device)
+
+                async def fresh_view_owner(path):
+                    response = await original_get(path)
+                    if awaiting_fresh[0]:
+                        snapshot = response["snapshot"]
+                        view = m._live(snapshot)["required_view"]
+                        fresh_reads.append(copy.deepcopy(view))
+                        assert snapshot["events"][-1] == own_event and snapshot["run"]["status"] == "paused"
+                        if view["qualified"] is True:
+                            awaiting_fresh[0] = False
+                        else:
+                            pi_clock[0] += .01
+                            progress = {"op": "view_progress", "run_id": e.run_id, "role": "chest",
+                                            "owner_generation": "owner", "capture_generation": "capture",
+                                            "encode_generation": "encode", "decoded_frames": len(resumes) + 1,
+                                            "media_time": float(len(resumes) + 1), "source_sequence": len(resumes),
+                                            "source_fresh": True, "received_at_monotonic_s": pi_clock[0]}
+                            assert real_handle(progress, "gateway-view")["accepted"] is True
+                    return response
+
+                gateway.call, client.get = refuse_after_pc_view, fresh_view_owner
+                ceiling = m.time.monotonic() + 1.5
+                assert not await guard.resume(expected_pause="input_expired", wall_deadline=ceiling)
+                count = 3 if cause == "resume_view_refused_twice" else 2
+                assert len(resumes) == count and len(refused) == count - 1
+                assert len({command["operation_id"] for command in resumes}) == count
+                assert sum(op == "connect" for op, _ in commands) == before_connects + 1
+                assert sum(op == "release_input" for op, _ in commands) == before_releases + 1
+                assert client.snapshot["run"]["status"] == "running"
+                assert client.snapshot["evidence"]["active_acknowledged"] is True
+                assert a.run["deadline"] == 309. and a.run["native_live_at"] == 9.
+                assert guard.episodes == 0 and guard.pause_recoveries == 1
+                assert not any(record["event"] in {"accepted_resume_superseded", "qualified_native_recovery"}
+                               for record in records)
+                assert sum(record["event"] == "resume_view_refused" for record in records) == count - 1
+                assert m.time.monotonic() < ceiling
+                producer.native_cursor = m._live(client.snapshot)["cursor"]
+                producer.reacquire = True
+                fresh = await m.send_leader_sample(client, producer, m.ZERO_BODY, record,
+                                                   phase="individual", progress_s=.04)
+                assert fresh[2]["accepted"] is True and producer.sequence == 2
+                return
             if cause in {"resume_view_pause", "resume_view_twice"}:
                 # Synthetic view expiry AFTER a positively accepted Resume,
                 # before an active snapshot. Core/Gateway/client are real.
@@ -3052,7 +3127,7 @@ def test_interrupted_resume_defers_episode_credit_and_preserves_original_episode
                 pc[0] += .5 if expired else .05
             return {"snapshot": copy.deepcopy(self.snapshot)}
 
-        async def resume(self, *, check):
+        async def resume(self, *, check, refusal_record=None):
             check(self.snapshot)
             resumes.append(pc[0])
             assert not any(r["event"] == "qualified_native_recovery" for r in records)
@@ -3235,3 +3310,157 @@ def test_accepted_resume_superseding_pause_preserves_identity_proof_and_one_cloc
 def test_initial_runner_waits_through_superseding_pause_before_grant_and_progress(tmp_path, monkeypatch):
     test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id(
         tmp_path, monkeypatch, "initial_resume_pause")
+
+
+@pytest.mark.parametrize("mutation", [
+    None, "receipt_accepted", "receipt_effect", "receipt_reason", "receipt_uncertain", "manual_origin",
+    "connection", "revision", "bool_revision", "foreign_run", "owner", "manual_event", "foreign_event",
+    "recovering", "uncertain", "fault", "reference", "remaining_increased", "stale_hold", "cursor",
+    "cached_view_only", "caller_budget", "native_budget", "phase_budget", "renewal", "later_refusal",
+    "later_timeout", "active_missing",
+])
+def test_nonadmitted_view_resume_requires_fresh_owner_proof_and_original_phase(monkeypatch, mutation):
+    import asyncio
+    import copy
+    import time
+    from types import SimpleNamespace
+
+    m = adapter()
+    pc = [1000.]
+    monkeypatch.setattr(m, "time", SimpleNamespace(monotonic=lambda: pc[0], perf_counter=time.perf_counter))
+    state = recovery_state()
+    state["run"].update(status="paused", operation_id=str(uuid4()), remaining_s=.15 if mutation == "native_budget" else 299.)
+    state["evidence"]["active_acknowledged"] = False
+    state["evidence"]["accepted_host_action"]["acquired_at_monotonic_s"] = 101.
+    state["events"] = [{"kind": "pause" if mutation == "manual_origin" else "input_expired", "at": 100.9,
+                            "run_id": "owned", "service_incarnation": "service"}]
+    receipt = {"accepted": False, "status": "refused", "effect_admitted": False,
+                   "reason": "current required selected view must advance before Resume"}
+    for name, update in {"receipt_accepted": {"accepted": None}, "receipt_effect": {"effect_admitted": None},
+                         "receipt_reason": {"reason": "qualified release/alignment required"},
+                         "receipt_uncertain": {"uncertain": True}}.items():
+        if mutation == name:
+            receipt.update(update)
+    original = m.CommandRefusedError(receipt, timing={"request_started_at_monotonic_s": 42.})
+    later = TimeoutError("later Resume outcome unknown")
+    calls, records, waits = [], [], []
+
+    class Client:
+        snapshot = copy.deepcopy(state)
+        device, generation, connection = "device", "control", "connection"
+        identities, resume = m.SessionClient.identities, m.SessionClient.resume
+        reads = resumes = 0
+
+        async def get(self, path):
+            self.reads += 1
+            pc[0] += .01
+            fresh = copy.deepcopy(self.snapshot)
+            if self.reads > 1:
+                fresh["run"]["remaining_s"] -= .01
+                fresh["evidence"]["accepted_host_action"]["acquired_at_monotonic_s"] = fresh["run"]["deadline"] - fresh["run"]["remaining_s"]
+                if mutation == "connection":
+                    self.connection = "foreign"
+                if mutation in {"revision", "bool_revision", "foreign_run", "recovering", "uncertain", "remaining_increased"}:
+                    key, value = {"revision": ("intent_revision", 4), "bool_revision": ("intent_revision", True),
+                                  "foreign_run": ("run_id", "foreign"), "recovering": ("status", "recovering"),
+                                  "uncertain": ("uncertain", True), "remaining_increased": ("remaining_s", 300.)}[mutation]
+                    fresh["run"][key] = value
+                if mutation == "owner":
+                    fresh["controller"]["device_id"] = "foreign"
+                if mutation == "manual_event":
+                    fresh["events"].append(dict(fresh["events"][-1], kind="pause", at=100.95))
+                if mutation == "foreign_event":
+                    fresh["events"][-1]["run_id"] = "foreign"
+                if mutation == "fault":
+                    fresh["evidence"]["fault"] = "actual hard fault"
+                if mutation == "reference":
+                    fresh["run"]["live_input"]["reference"][KEYS[0]] += 1
+                if mutation == "stale_hold":
+                    fresh["evidence"]["accepted_host_action"]["acquired_at_monotonic_s"] = 100.
+                if mutation == "cursor":
+                    fresh["run"]["live_input"]["cursor_intent_revision"] -= 1
+                if mutation == "cached_view_only":
+                    fresh["run"]["live_input"]["required_view"]["qualified"] = False
+                if mutation in {"caller_budget", "native_budget"}:
+                    pc[0] += 2.
+            return {"snapshot": fresh}
+
+        async def command(self, payload):
+            calls.append(copy.deepcopy(payload))
+            pc[0] += .02
+            if payload["op"] == "connect":
+                self.snapshot = copy.deepcopy(self.snapshot)
+                self.snapshot["run"]["intent_revision"] += 1
+                revision = self.snapshot["run"]["intent_revision"]
+                self.snapshot["run"]["live_input"]["cursor_intent_revision"] = revision
+                self.snapshot["evidence"]["acknowledged_intent_revision"] = revision
+                self.snapshot["evidence"]["accepted_host_action"]["intent_revision"] = revision
+                return {"connection_generation": "new-connection", "snapshot": self.snapshot}
+            if payload["op"] == "release_input":
+                return {"accepted": True}
+            assert payload["op"] == "resume"
+            self.resumes += 1
+            if self.resumes == 1 or mutation == "phase_budget":
+                raise original
+            if mutation == "later_timeout":
+                raise later
+            if mutation == "later_refusal":
+                raise m.CommandRefusedError(dict(receipt, reason="stale or malformed intent revision"))
+            self.snapshot["run"].update(status="running", intent_revision=payload["intent_revision"] + 1)
+            self.snapshot["evidence"]["active_acknowledged"] = mutation != "active_missing"
+            return {"accepted": True, "status": "resuming"}
+
+        async def wait(self, predicate, timeout):
+            waits.append(timeout)
+            if self.resumes:
+                pc[0] += .2
+            if not predicate():
+                if mutation in {"cached_view_only", "cursor"}:
+                    # Even an old WSS True/current cursor cannot replace the
+                    # following authenticated owner's missing proof.
+                    self.snapshot["run"]["live_input"]["required_view"]["qualified"] = True
+                    self.snapshot["run"]["live_input"]["cursor_intent_revision"] = self.snapshot["run"]["intent_revision"]
+                    pc[0] += .2
+                    assert predicate()
+                else:
+                    raise TimeoutError("actual active ACK unavailable")
+
+    async def scenario():
+        client = Client()
+        guard = m.SameRunRecovery(client, records.append)
+        def healthy():
+            if mutation == "renewal" and client.resumes:
+                raise RuntimeError("original renewal task failed")
+        deadline = 1009. if mutation == "phase_budget" else 1002.
+        if mutation is None:
+            assert await guard.resume(expected_pause="input_expired", wall_deadline=deadline, renewal_check=healthy) is False
+            assert client.resumes == 2 and client.reads == 2
+            assert client.snapshot["evidence"]["active_acknowledged"] is True
+            assert len({c["operation_id"] for c in calls if c["op"] == "resume"}) == 2
+        else:
+            with pytest.raises(m.CommandRefusedError) as caught:
+                await guard.resume(expected_pause=None if mutation == "manual_origin" else "input_expired",
+                                   wall_deadline=deadline, renewal_check=healthy)
+            assert caught.value is original
+            if mutation in {"later_refusal", "later_timeout", "active_missing"}:
+                assert client.resumes == 2 and original.__cause__ is not None
+                if mutation == "later_timeout":
+                    assert original.__cause__ is later
+            elif mutation == "phase_budget":
+                assert client.resumes > 2 and 1008. <= pc[0] < 1009.
+                assert min(waits) < max(waits) and original.__cause__ is not None
+            else:
+                assert client.resumes == 1
+            if mutation.startswith("receipt_") or mutation == "manual_origin":
+                assert client.reads == 1
+            assert not any(r["event"] in {"qualified_native_recovery", "accepted_resume_superseded"} for r in records)
+        assert sum(c["op"] == "connect" for c in calls) == 1
+        assert sum(c["op"] == "release_input" for c in calls) == 1
+        assert not any(c["op"] in {"claim", "start", "grant", "input"} for c in calls)
+        assert guard.episodes == 0 and guard.original["run"]["deadline"] == 400.
+        if not (mutation and (mutation.startswith("receipt_") or mutation == "manual_origin")):
+            assert records[-1]["event"] == "resume_view_refused" or any(r["event"] == "resume_view_refused" for r in records)
+            context = original.resume_view_context
+            assert context["receipt"] == receipt and context["timing"] == original.timing
+            assert context["operation_id"] == next(c["operation_id"] for c in calls if c["op"] == "resume")
+    asyncio.run(asyncio.wait_for(scenario(), .8))

@@ -503,7 +503,7 @@ class SessionClient:
             await asyncio.sleep(0.45)
             await self.post("claim", {"controller_generation": self.generation})
 
-    async def resume(self, *, check=None):
+    async def resume(self, *, check=None, refusal_record=None):
         if check:
             check(self.snapshot)
         identity = self.identities()
@@ -519,9 +519,11 @@ class SessionClient:
         self.sequence = 0
         if check:
             check(self.snapshot)
-        await SessionClient._resume_connected(self, check=check, connect_identity=identity)
+        await SessionClient._resume_connected(self, check=check, connect_identity=identity,
+                                              refusal_record=refusal_record)
 
-    async def _resume_connected(self, *, check=None, connect_identity=None, qualified_check=None):
+    async def _resume_connected(self, *, check=None, connect_identity=None, qualified_check=None,
+                                refusal_record=None):
         identity = self.identities()
         release_context = None if connect_identity is None else json.loads(json.dumps({
             "identity": identity, "connect_identity": connect_identity, "snapshot": self.snapshot,
@@ -556,21 +558,111 @@ class SessionClient:
                 and (qualified_check is None or qualified_check(self.snapshot))
             )
 
-        await self.wait(qualified, 8)
-        identity = self.identities()
-        prior_event = json.loads(json.dumps(_latest_run_event(self.snapshot, identity), allow_nan=False))
-        run = self.snapshot["run"]
-        remaining = run.get("remaining_s")
-        pi_lower_bound = (run["deadline"] - remaining
-                          if type(remaining) in (int, float) and math.isfinite(remaining) else None)
-        resumed = await self.command(
-            dict(
-                op="resume",
-                **identity,
-                expected_intent_revision=self.snapshot["run"]["intent_revision"],
-                operation_id=str(uuid4()),
-            )
-        )
+        phase_ceiling = time.monotonic() + 8
+        first_refusal, refused_identity, refused_event, refused_state = None, None, None, None
+
+        def phase_remaining():
+            remaining = phase_ceiling - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("original held/view qualification ceiling exhausted")
+            return remaining
+
+        try:
+            while True:
+                await self.wait(qualified, phase_remaining())
+                if first_refusal is not None:
+                    # Only the authenticated owner can prove that view progress
+                    # advanced after Core explicitly refused the expired view.
+                    budget = phase_remaining()
+                    self.snapshot = (await asyncio.wait_for(self.get("state"), budget))["snapshot"]
+                    if check:
+                        check(self.snapshot)
+                    run, evidence, live = self.snapshot["run"], self.snapshot.get("evidence", {}), _live(self.snapshot)
+                    actual = self.identities()
+                    ack = evidence.get("accepted_host_action") or {}
+                    stamp = ack.get("acquired_at_monotonic_s")
+                    current_remaining = run.get("remaining_s")
+                    old_run = refused_state["run"]
+                    if (
+                        set(actual) != set(refused_identity)
+                        or any(type(actual[k]) is not type(v) or actual[k] != v for k, v in refused_identity.items())
+                        or any(type(run.get(k)) is not type(v) or run.get(k) != v for k, v in old_run.items()
+                               if k in {"run_id", "recipe", "operation_id", "backend_incarnation", "native_live_at", "deadline",
+                                        "first_cause", "native_first_cause", "recovery_episodes"})
+                        or any(type((self.snapshot.get("controller") or {}).get(k)) is not type(v)
+                               or (self.snapshot.get("controller") or {}).get(k) != v
+                               for k, v in (refused_state.get("controller") or {}).items()
+                               if k in {"device_id", "controller_generation"})
+                        or run.get("status") != "paused" or run.get("uncertain") is not False
+                        or run.get("recovery") is not None or run.get("native_first_cause") or evidence.get("fault")
+                        or _latest_run_event(self.snapshot, refused_identity) != refused_event
+                        or live.get("reference") != _live(refused_state).get("reference")
+                        or live.get("workspace") != _live(refused_state).get("workspace")
+                        or type(current_remaining) not in (int, float) or not math.isfinite(current_remaining)
+                        or not 0 < current_remaining <= old_run["remaining_s"]
+                        or evidence.get("active_acknowledged") is not False
+                        or type(evidence.get("acknowledged_intent_revision")) is not int
+                        or evidence["acknowledged_intent_revision"] != refused_identity["intent_revision"]
+                        or ack.get("run_id") != refused_identity["run_id"]
+                        or ack.get("host_incarnation") != refused_identity["host_incarnation"]
+                        or ack.get("state") != "paused" or type(ack.get("intent_revision")) is not int
+                        or ack["intent_revision"] != refused_identity["intent_revision"]
+                        or type(stamp) not in (int, float) or not math.isfinite(stamp)
+                        or not run["deadline"] <= stamp + old_run["remaining_s"]
+                        or stamp + current_remaining > run["deadline"]
+                    ):
+                        raise RuntimeError("fresh authority for nonadmitted view Resume changed")
+                    if not qualified():
+                        continue
+                identity = self.identities()
+                prior_event = json.loads(json.dumps(_latest_run_event(self.snapshot, identity), allow_nan=False))
+                run = self.snapshot["run"]
+                remaining = run.get("remaining_s")
+                pi_lower_bound = (run["deadline"] - remaining
+                                  if type(remaining) in (int, float) and math.isfinite(remaining) else None)
+                sent_state = json.loads(json.dumps(self.snapshot, allow_nan=False))
+                command = dict(op="resume", **identity, expected_intent_revision=run["intent_revision"],
+                               operation_id=str(uuid4()))
+                try:
+                    budget = phase_remaining()
+                    resumed = await asyncio.wait_for(self.command(command), budget)
+                    break
+                except CommandRefusedError as refusal:
+                    if refusal.response.get("uncertain", False) is not False or not all(
+                            type(refusal.response.get(k)) is type(v) and refusal.response[k] == v
+                               for k, v in {"accepted": False, "status": "refused", "effect_admitted": False,
+                                            "reason": "current required selected view must advance before Resume"}.items()):
+                        raise
+                    first = first_refusal is None
+                    if first:
+                        first_refusal = refusal
+                    if (
+                        type(identity["intent_revision"]) is not int or identity["intent_revision"] < 0
+                        or any(type(v) is not str or not v for k, v in identity.items() if k != "intent_revision")
+                        or run.get("status") != "paused" or run.get("uncertain") is not False
+                        or run.get("recovery") is not None or run.get("native_first_cause")
+                        or self.snapshot.get("evidence", {}).get("fault")
+                        or set(prior_event) != {"kind", "at", "run_id", "service_incarnation"}
+                        or prior_event.get("kind") not in {"input_expired", "native_input_expired", "required_view_expired"}
+                        or any(type(v) not in (int, float) or not math.isfinite(v)
+                               for v in (prior_event.get("at"), pi_lower_bound))
+                        or not run["native_live_at"] <= prior_event["at"] < run["deadline"]
+                        or not run["native_live_at"] <= pi_lower_bound < run["deadline"]
+                    ):
+                        raise RuntimeError("original ordinary pause for nonadmitted view Resume unavailable") from None
+                    refused_identity, refused_event, refused_state = json.loads(json.dumps(
+                        [identity, prior_event, sent_state], allow_nan=False))
+                    context = {"identity": refused_identity, "pause_event": refused_event,
+                               "operation_id": command["operation_id"], "receipt": refusal.response,
+                               "timing": refusal.timing, "remaining_s": phase_remaining()}
+                    if first:
+                        first_refusal.resume_view_context = context
+                    if refusal_record:
+                        refusal_record(dict(event="resume_view_refused", **context))
+        except (Exception, asyncio.CancelledError) as error:
+            if first_refusal is not None and error is not first_refusal:
+                raise first_refusal from error
+            raise
 
         def active():
             if check:
@@ -594,7 +686,14 @@ class SessionClient:
                 raise RuntimeError("accepted Resume superseded by an unqualified pause")
             return run.get("status") == "running" and self.snapshot["evidence"].get("active_acknowledged") is True
 
-        await self.wait(active, 5)
+        try:
+            await self.wait(active, 5)
+        except _ResumePausedError:
+            raise  # The positively accepted Resume uses the unchanged +2 path.
+        except (Exception, asyncio.CancelledError) as error:
+            if first_refusal is not None:
+                raise first_refusal from error
+            raise
 
     async def detach(self):
         self._detaching = True
@@ -923,8 +1022,14 @@ class SameRunRecovery:
             raise RuntimeError("original mailbox input refusal connection changed before Resume")
         if renewal_check:
             renewal_check()
+        def checked(snapshot):
+            if time.monotonic() >= local_ceiling:
+                raise TimeoutError("original rejoin ceiling exhausted")
+            if renewal_check:
+                renewal_check()
+            self.check(snapshot)
         try:
-            await asyncio.wait_for(self.client.resume(check=self.check), timeout)
+            await asyncio.wait_for(self.client.resume(check=checked, refusal_record=self.record), timeout)
         except _ResumePausedError as outcome:
             self.check(self.client.snapshot)
             outcome.episode = episode if recovered else None
@@ -1098,9 +1203,9 @@ class SameRunRecovery:
                                 and held_stamp <= stamp <= run["deadline"] - current_remaining)
                     budget = remaining()
                     await asyncio.wait_for(SessionClient._resume_connected(
-                        self.client, check=self.check, qualified_check=current_held), budget)
+                        self.client, check=checked, qualified_check=current_held, refusal_record=self.record), budget)
                 else:
-                    await asyncio.wait_for(self.client.resume(check=self.check), budget)
+                    await asyncio.wait_for(self.client.resume(check=checked, refusal_record=self.record), budget)
                 if renewal_check:
                     renewal_check()
                 remaining()
