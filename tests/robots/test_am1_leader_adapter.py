@@ -1747,7 +1747,7 @@ def test_original_recovery_ceiling_includes_authenticated_read_time_without_rean
     asyncio.run(asyncio.wait_for(scenario(), 0.3))
 
 
-@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_view_reconnect", "grant_view_switch", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "held_qualification_loss", "resume_alignment_refusal", "resume_alignment_refused_twice", "runner_initial_cursor_pending"])
+@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_view_reconnect", "grant_view_switch", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "held_qualification_loss", "resume_alignment_refusal", "resume_alignment_refused_twice", "runner_initial_cursor_pending", "resume_reply_timeout_pre", "resume_reply_timeout_post"])
 def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(tmp_path, monkeypatch, cause):
     import asyncio
     import copy
@@ -2389,8 +2389,11 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                     renewal.cancel()
                     await asyncio.gather(qualification, renewal, return_exceptions=True)
                 return
-            if cause in {"resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending"}:
-                # Synthetic54: the actual Core/Gateway receives a Resume whose
+            if cause in {"resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending",
+                         "resume_reply_timeout_pre", "resume_reply_timeout_post"}:
+                reply_timeout = cause in {"resume_reply_timeout_pre", "resume_reply_timeout_post"}
+                post_admitted = cause in {"resume_result_loss_post", "resume_reply_timeout_post"}
+                # Synthetic54/57: the actual Core/Gateway receives a Resume whose
                 # result is lost; no negative-admission receipt is invented.
                 from aiohttp import ClientConnectionResetError
 
@@ -2429,7 +2432,7 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                     if command.get("op") == "resume" and not lost[0]:
                         lost[0] = True
                         old = copy.deepcopy(command)
-                        if cause == "resume_result_loss_post":
+                        if post_admitted:
                             old_results.append(await original_call(old, device))
                             assert old_results[-1]["accepted"] is True
                             pi_clock[0] += .125
@@ -2458,15 +2461,16 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                         a._teleop_view["qualified_until"] = pi_clock[0] + .5
                         async def finish_old():
                             await unblock_release.wait()
-                            if cause != "resume_result_loss_post":
+                            if not post_admitted:
                                 old_results.append(await original_call(old, device))
                             return old_results[-1]
                         task = asyncio.create_task(finish_old())
                         delayed.append(task)
-                        # Real authenticated stream loss; the exact observed
-                        # aiohttp exception is supplied as the replay taxonomy.
-                        client.ws._exception = ClientConnectionResetError("Cannot write to closing transport")
-                        client.ws._response.connection.transport.abort()
+                        if not reply_timeout:
+                            # Existing54 taxonomy. New57 keeps the actual channel
+                            # open until the original command future times out.
+                            client.ws._exception = ClientConnectionResetError("Cannot write to closing transport")
+                            client.ws._response.connection.transport.abort()
                         return await asyncio.shield(task)
                     return await original_call(command, device)
 
@@ -2529,12 +2533,18 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                         assert a.run["recovery_episodes"] == 1
                     unblock_release.set()
                     await asyncio.wait_for(asyncio.gather(*delayed), .5)
-                    if cause != "resume_result_loss_post":
+                    if not post_admitted:
                         assert old_results == [{"accepted": False, "status": "refused", "reason": "stale control generation", "effect_admitted": False}]
                     assert a.run["status"] == "running" and a.run["deadline"] == 309. and a.run["native_live_at"] == 9.
                     ambiguous = [v for v in records if v["event"] == "resume_result_unknown"]
                     assert len(ambiguous) == 1 and ambiguous[0]["operation_id"] == resumes[0]["command"]["operation_id"]
                     assert ambiguous[0]["outcome"] == "unknown"
+                    if reply_timeout:
+                        timeout = ambiguous[0]["reply_timeout"]
+                        assert timeout["operation_id"] == resumes[0]["command"]["operation_id"]
+                        assert timeout["request_id"] == resumes[0]["id"]
+                        assert timeout["timing"]["response_timeout_observed_at_monotonic_s"] >= timeout["timing"]["send_completed_at_monotonic_s"]
+                        assert ambiguous[0]["transport_close"] == {}
                     producer.native_cursor, producer.reacquire = m._live(client.snapshot)["cursor"], True
                     fresh = await m.send_leader_sample(client, producer, m.ZERO_BODY, record, phase="individual", progress_s=.02)
                     assert fresh[2]["accepted"] is True and producer.sequence == 1
@@ -6252,6 +6262,7 @@ def test_same_open_native_episode_retains_source_and_original_phase(monkeypatch,
     "manual", "foreign", "fault", "uncertain", "revision", "running", "stale_ack", "phase_expired",
     "phase_extended", "caller_expired", "renewal", "later_error", "reporting", "persistent_view",
     "held_wait", "held_foreign", "held_wrong_type", "held_phase_expired", "held_renewal", "held_reporting",
+    "reply_foreign", "reply_phase_expired", "reply_nested",
 ])
 def test_unknown_resume_result_keeps_authority_original_phase_and_error(monkeypatch, change):
     """Synthetic guards supplement the real Core/Gateway pre/post/native cases."""
@@ -6286,6 +6297,9 @@ def test_unknown_resume_result_keeps_authority_original_phase_and_error(monkeypa
         def __init__(self):
             self.snapshot = copy.deepcopy(initial)
             self.fresh = None
+            if change is not None and change.startswith("reply_"):
+                self.ws = SimpleNamespace(closed=False, exception=lambda: None)
+                self.reader, self.transport_error = None, None
 
         async def get(self, path):
             assert path == "state"
@@ -6315,7 +6329,7 @@ def test_unknown_resume_result_keeps_authority_original_phase_and_error(monkeypa
             if op == "release_input":
                 return {"accepted": True, "status": "released", "effect_admitted": False}
             assert op == "resume"
-            if not failures or change == "twice" and len(failures) < 2:
+            if not failures or change == "twice" and len(failures) < 2 or change == "reply_nested":
                 self.fresh = held(copy.deepcopy(self.snapshot), command["intent_revision"],
                                   100.375 if not failures else 100.625)
                 if change == "post":
@@ -6343,7 +6357,18 @@ def test_unknown_resume_result_keeps_authority_original_phase_and_error(monkeypa
                     "reason": "stream-ended", "reader_error": {"error_type": "RuntimeError"} if change == "reader" else None,
                     "exception_type": "RuntimeError" if change == "wrong_type" else "ClientConnectionResetError",
                     "exception": "other reset" if change == "wrong_message" else "Cannot write to closing transport"}
-                error = ConnectionError("current WSS connection lost")
+                if change is not None and change.startswith("reply_"):
+                    self.transport_close = None
+                    if change == "reply_foreign":
+                        self.fresh["run"]["run_id"] = "foreign"
+                    if change == "reply_phase_expired":
+                        pc[0] += 8
+                    error = TimeoutError()
+                    error.resume_reply_timeout = {"operation_id": command["operation_id"], "request_id": str(uuid4()),
+                        "timing": {"request_started_at_monotonic_s": 10., "send_started_at_monotonic_s": 10.,
+                                   "send_completed_at_monotonic_s": 10., "response_timeout_observed_at_monotonic_s": 11.}}
+                else:
+                    error = ConnectionError("current WSS connection lost")
                 failures.append(error)
                 raise error
             if change == "post":
@@ -6407,6 +6432,13 @@ def test_unknown_resume_result_keeps_authority_original_phase_and_error(monkeypa
             assert client.snapshot["evidence"]["active_acknowledged"] is True
             assert client.attaches == (1 if change == "held_wait" else len(resumes) - 1)
             assert len([v for v in records if v["event"] == "resume_result_unknown"]) == (0 if change == "held_wait" else len(resumes) - 1)
+        elif change.startswith("reply_"):
+            with pytest.raises(TimeoutError) as caught:
+                await guard.resume(expected_pause="input_expired", renewal_check=renewal)
+            assert caught.value is failures[0]
+            assert sum(c["op"] == "connect" for c in commands) == (2 if change == "reply_nested" else 1)
+            assert sum(c["op"] == "resume" for c in commands) == (2 if change == "reply_nested" else 1)
+            assert guard.completed_episodes == 0
         else:
             with pytest.raises(ConnectionError) as caught:
                 await guard.resume(expected_pause="input_expired", renewal_check=renewal,
@@ -6420,4 +6452,33 @@ def test_unknown_resume_result_keeps_authority_original_phase_and_error(monkeypa
         assert client.sequence == 0 and guard.original["run"]["deadline"] == 400.
         assert all(v["phase_ceiling_monotonic_s"] == 1008. for v in records if v["event"] == "resume_result_unknown")
 
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("phase", ["send", "outer", "non_resume"])
+def test_resume_reply_timeout_tag_requires_the_actual_inner_response_future(phase):
+    import asyncio
+    from types import SimpleNamespace
+
+    m = adapter()
+    sent = []
+    original = TimeoutError("original send timeout")
+    async def send(value):
+        sent.append(value)
+        if phase == "send":
+            raise original
+    client = SimpleNamespace(transport_error=None, ws=SimpleNamespace(closed=False, send_json=send),
+                             reader=None, pending={})
+    async def scenario():
+        command = {"op": "grant" if phase == "non_resume" else "resume", "operation_id": str(uuid4())}
+        with pytest.raises(TimeoutError) as caught:
+            if phase == "outer":
+                await asyncio.wait_for(m.SessionClient.command(client, command), .01)
+            else:
+                await m.SessionClient.command(client, command)
+        assert not hasattr(caught.value, "resume_reply_timeout")
+        assert not hasattr(caught.value, "resume_result_context")
+        assert client.pending == {} and len(sent) == 1
+        if phase == "send":
+            assert caught.value is original
     asyncio.run(scenario())

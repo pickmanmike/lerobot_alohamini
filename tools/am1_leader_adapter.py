@@ -632,7 +632,16 @@ class SessionClient:
             timing["send_started_at_monotonic_s"] = time.perf_counter()
             await self.ws.send_json({"id": identity, "command": command})
             timing["send_completed_at_monotonic_s"] = time.perf_counter()
-            result = await asyncio.wait_for(future, 1.0)
+            try:
+                result = await asyncio.wait_for(future, 1.0)
+            except TimeoutError as error:
+                if command.get("op") == "resume":
+                    # Only the actual reply future's timeout is unknown admission;
+                    # send failures and outer phase cancellation cannot set this.
+                    error.resume_reply_timeout = {"operation_id": command.get("operation_id"),
+                        "request_id": identity, "timing": dict(timing,
+                            response_timeout_observed_at_monotonic_s=time.perf_counter())}
+                raise
             timing["response_observed_at_monotonic_s"] = time.perf_counter()
             if result.get("accepted") is not True:
                 raise CommandRefusedError(result, timing=timing)
@@ -865,16 +874,34 @@ class SessionClient:
             close = dict(getattr(self, "transport_close", None) or {})
             held = context.get("phase") == "held_qualification"
             release = context["release"]
-            if (str(error) == ("current WSS connection ended: stream-ended" if held else "current WSS connection lost")
-                and context["connect_identity"] is not None and isinstance(release, dict)
-                and all(type(release.get(k)) is type(v) and release[k] == v for k, v in
-                        {"accepted": True, "status": "released", "effect_admitted": False}.items())
+            reply = getattr(error, "resume_reply_timeout", None)
+            stamps = reply.get("timing", {}) if isinstance(reply, dict) else {}
+            reply_timeout = (type(error) is TimeoutError and not held and isinstance(reply, dict)
+                and set(reply) == {"operation_id", "request_id", "timing"}
+                and reply["operation_id"] == context["operation_id"]
+                and type(reply["request_id"]) is str and str(UUID(reply["request_id"])) == reply["request_id"]
+                and isinstance(stamps, dict)
+                and set(stamps) == {"request_started_at_monotonic_s", "send_started_at_monotonic_s",
+                                    "send_completed_at_monotonic_s", "response_timeout_observed_at_monotonic_s"}
+                and all(type(v) in (int, float) and math.isfinite(v) for v in stamps.values())
+                and stamps["request_started_at_monotonic_s"] <= stamps["send_started_at_monotonic_s"]
+                <= stamps["send_completed_at_monotonic_s"] <= stamps["response_timeout_observed_at_monotonic_s"]
+                and not close and getattr(self, "transport_error", None) is None
+                and self.ws is not None and not self.ws.closed and self.ws.exception() is None
+                and (self.reader is None or not self.reader.done()) and not getattr(self, "_detaching", False))
+            closed_transport = (str(error) == ("current WSS connection ended: stream-ended" if held else "current WSS connection lost")
                 and close.get("expected") is False and close.get("close_code") == 1006
                 and close.get("reason") == "stream-ended" and close.get("reader_error") is None
                 and close.get("exception_type") == "ClientConnectionResetError"
-                and close.get("exception") == "Cannot write to closing transport"):
+                and close.get("exception") == "Cannot write to closing transport")
+            if (context["connect_identity"] is not None and isinstance(release, dict)
+                and all(type(release.get(k)) is type(v) and release[k] == v for k, v in
+                        {"accepted": True, "status": "released", "effect_admitted": False}.items())
+                and (closed_transport or reply_timeout)):
                 context["transport_close"] = {key: close.get(key) for key in
                     ("expected", "close_code", "reason", "reader_error", "exception_type", "exception")}
+                if reply_timeout:
+                    context["transport_close"], context["reply_timeout"] = {}, reply
                 error.resume_result_context = context
                 if refusal_record:
                     try:
@@ -888,6 +915,8 @@ class SessionClient:
                                   "sent_ack": {key: (proof.get("evidence", {}).get("accepted_host_action") or {}).get(key)
                                                for key in ("state", "intent_revision", "acquired_at_monotonic_s")},
                                   "transport_close": context["transport_close"]}
+                        if reply_timeout:
+                            detail["reply_timeout"] = reply
                         if len(json.dumps(detail, allow_nan=False).encode("utf-8")) > 2048:
                             raise ValueError("bounded owned qualification context required")
                         refusal_record(detail)
@@ -979,8 +1008,13 @@ class SessionClient:
                     budget = phase_remaining()
                     resumed = await asyncio.wait_for(self.command(command), budget)
                     break
-                except ConnectionError as error:
-                    record_transport_phase(error, unknown_resume)
+                except (ConnectionError, TimeoutError) as error:
+                    try:
+                        record_transport_phase(error, unknown_resume)
+                    except (Exception, asyncio.CancelledError) as reporting_error:
+                        if reporting_error is error:
+                            raise
+                        raise error from reporting_error
                     raise
                 except CommandRefusedError as refusal:
                     reason = refusal.response.get("reason")
@@ -1327,7 +1361,7 @@ class SameRunRecovery:
                     self.record({"event": "accepted_resume_superseded", "identity": outcome.identity,
                                  "pause_event": outcome.event, "remaining_s": clock["ceiling"] - time.monotonic()})
                     continue
-                except ConnectionError as original:
+                except (ConnectionError, TimeoutError) as original:
                     context = getattr(original, "resume_result_context", None)
                     if not isinstance(context, dict) or renewal_check is None:
                         raise
@@ -1340,6 +1374,12 @@ class SameRunRecovery:
                               "intent_revision": before["run"].get("intent_revision")}
                     known, close = context["connect_identity"], context["transport_close"]
                     held = context.get("phase") == "held_qualification"
+                    reply_timeout = (type(original) is TimeoutError and not held
+                        and isinstance(context.get("reply_timeout"), dict)
+                        and context["reply_timeout"] == getattr(original, "resume_reply_timeout", None)
+                        and context["reply_timeout"].get("operation_id") == context["operation_id"])
+                    if isinstance(original, TimeoutError) and (not reply_timeout or resume_context is not None):
+                        raise original
                     phase_key = ((identity["connection_generation"], identity["intent_revision"], "held")
                                  if held else context["operation_id"])
                     event, remaining, ceiling = context["prior_event"], before["run"].get("remaining_s"), context["phase_ceiling"]
@@ -1362,8 +1402,9 @@ class SameRunRecovery:
                         or not 0 <= context["requested"] <= time.monotonic()
                         or not ceiling <= context["requested"] + 8
                         or not before["run"]["native_live_at"] <= event["at"] <= context["pi_lower_bound"] < before["run"]["deadline"]
-                        or close != {"expected": False, "close_code": 1006, "reason": "stream-ended", "reader_error": None,
-                                     "exception_type": "ClientConnectionResetError", "exception": "Cannot write to closing transport"}):
+                        or (close != {} if reply_timeout else close != {
+                            "expected": False, "close_code": 1006, "reason": "stream-ended", "reader_error": None,
+                            "exception_type": "ClientConnectionResetError", "exception": "Cannot write to closing transport"})):
                         raise original
                     first_transport_error = first_transport_error or original
                     clock["ceiling"] = min(clock["ceiling"], getattr(original, "resume_original_ceiling", float("inf")))
