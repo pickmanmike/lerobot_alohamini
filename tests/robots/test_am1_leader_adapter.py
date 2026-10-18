@@ -2711,7 +2711,7 @@ def test_opaque_mailbox_rejoin_still_waits_for_actual_current_held_proof(missing
     "reader_error", "second_loss", "renewal", "renewal_after_attach", "release_loss", "resume_loss",
     "manual_event", "changed_event_time", "nonordinary", "connection",
 ])
-def test_pending_connect_replacement_preserves_identity_proof_budget_and_original_error(monkeypatch, change):
+def test_pending_connect_replacement_preserves_identity_proof_budget_and_original_error(monkeypatch, change, inspect=None):
     import asyncio
     import copy
     import time
@@ -2870,6 +2870,8 @@ def test_pending_connect_replacement_preserves_identity_proof_budget_and_origina
                 assert client.attaches == 0
             if change not in {"reader_error", "release_loss", "resume_loss"}:
                 assert records[-1]["event"] == "ordinary_connect_requalification_failed"
+        if inspect:
+            inspect(records, calls, original, client)
         assert not any(call["op"] in {"claim", "start", "input"} for call in calls)
     asyncio.run(asyncio.wait_for(scenario(), 0.5))
 
@@ -3464,3 +3466,98 @@ def test_nonadmitted_view_resume_requires_fresh_owner_proof_and_original_phase(m
             assert context["receipt"] == receipt and context["timing"] == original.timing
             assert context["operation_id"] == next(c["operation_id"] for c in calls if c["op"] == "resume")
     asyncio.run(asyncio.wait_for(scenario(), .8))
+
+
+@pytest.mark.parametrize("change,label", [("view", "required_view"), ("old_ack", "ack_revision"),
+                                          ("old_stamp", "ack_clock"), ("backward_clock", "remaining_clock"),
+                                          ("revision", "intent_revision"), ("connection", "connection"),
+                                          ("active_ack", "active_ack"), ("manual_event", "pause_event")])
+def test_failed_connect_qualification_retains_compared_proof_without_changing_first_error(monkeypatch, change, label):
+    import json
+
+    def inspect(records, calls, original, client):
+        failure = records[-1]
+        assert failure["event"] == "ordinary_connect_requalification_failed"
+        detail = failure["qualification"]
+        assert label in detail["failed"]
+        assert detail["authority"]["status"] == client.snapshot["run"]["status"]
+        assert detail["proof"]["view"]["qualified"] == client.snapshot["run"]["live_input"]["required_view"]["qualified"]
+        assert detail["clocks"]["original_remaining_s"] == 299.99
+        assert detail["clocks"]["fresh_remaining_s"] == client.snapshot["run"]["remaining_s"]
+        assert isinstance(original.__cause__, RuntimeError)
+        assert str(original.__cause__) == "current ordinary paused binding/held feedback unavailable"
+        assert original.__cause__.qualification == detail
+        assert len(json.dumps(detail, allow_nan=False).encode()) <= 8192
+        assert not any(name in json.dumps(detail) for name in ("workspace", "reference", "arm_feedback", "settings", "cookies"))
+        assert client.connects == 1 and client.attaches == 1
+    test_pending_connect_replacement_preserves_identity_proof_budget_and_original_error(monkeypatch, change, inspect)
+
+
+@pytest.mark.parametrize("stage", ["success", "construction", "record"])
+def test_connect_qualification_evidence_is_fault_only_and_preserves_first_error(monkeypatch, stage):
+    m = adapter()
+    constructed = []
+    if stage in {"success", "construction"}:
+        def unavailable(*args):
+            constructed.append(True)
+            raise ValueError("diagnostic-only failure containing private content")
+        monkeypatch.setattr(m, "_paused_binding_diagnostic", unavailable)
+    else:
+        original_init = m.SameRunRecovery.__init__
+        def initialized(self, client, record):
+            def broken_record(value):
+                record(value)
+                if value["event"] == "ordinary_connect_requalification_failed":
+                    raise ValueError("record-only failure")
+            original_init(self, client, broken_record)
+        monkeypatch.setattr(m.SameRunRecovery, "__init__", initialized)
+
+    def inspect(records, calls, original, client):
+        if stage == "success":
+            assert not constructed and original.__cause__ is None
+            assert [call["op"] for call in calls] == ["connect", "connect", "release_input", "resume"]
+            assert not any("qualification" in row for row in records)
+            assert not any(row["event"].endswith("_failed") for row in records)
+        else:
+            assert original.__cause__.__class__ is RuntimeError
+            assert str(original.__cause__) == "current ordinary paused binding/held feedback unavailable"
+            failure = records[-1]
+            assert failure["message"] == str(original.__cause__)
+            assert "private content" not in str(failure)
+            assert ("qualification" in failure) is (stage == "record")
+            assert client.connects == 1 and client.attaches == 1
+            if stage == "construction":
+                assert constructed == [True]
+    test_pending_connect_replacement_preserves_identity_proof_budget_and_original_error(
+        monkeypatch, None if stage == "success" else "view", inspect)
+
+
+def test_failed_connect_qualification_projection_is_bounded_and_json_safe():
+    import copy
+    import json
+
+    m = adapter()
+    state = recovery_state()
+    fresh = copy.deepcopy(state)
+    identity = {"run_id": "owned", "service_incarnation": "service", "host_incarnation": "host",
+                "controller_generation": "control", "connection_generation": "connection", "intent_revision": 2}
+    event = {"kind": "input_expired", "at": 100., "run_id": "owned", "service_incarnation": "service"}
+    fresh["run"].update(status="paused", remaining_s=True)
+    fresh["events"] = [dict(event, kind="x" * 20000)]
+    fresh["run"]["live_input"]["required_view"] = {"qualified": False, "cause": "x" * 20000, "role": {"private": "secret"}}
+    fresh["evidence"]["accepted_host_action"].update(host_incarnation="x" * 20000, acquired_at_monotonic_s=float("nan"))
+    detail = m._paused_binding_diagnostic(state, fresh, identity, event, False, "connection", 299.99, 1002.)
+    encoded = json.dumps(detail, allow_nan=False)
+    assert len(encoded.encode()) <= 8192
+    assert "secret" not in encoded and "private" not in encoded
+    assert detail["proof"]["view"]["role"] == "<invalid>"
+    assert detail["clocks"]["fresh_ack_at"] == "<invalid>"
+    assert detail["clocks"]["fresh_remaining_s"] is True  # Preserve the invalid bool's actual type.
+    assert {"pause_event", "ack_host", "required_view", "clock_types"} <= set(detail["failed"])
+    def strings(value):
+        if isinstance(value, dict):
+            return [item for child in value.values() for item in strings(child)]
+        if isinstance(value, list):
+            return [item for child in value for item in strings(child)]
+        return [value] if isinstance(value, str) else []
+    assert max(map(len, strings(detail))) <= 128

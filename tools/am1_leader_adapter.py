@@ -210,6 +210,85 @@ def _latest_run_event(snapshot, identity):
                  and event.get("service_incarnation") == identity["service_incarnation"]), {})
 
 
+def _paused_binding_diagnostic(state, fresh, identity, original_event, release_loss,
+                               connection, native_remaining, ceiling):
+    """Fault-only compared scalars; never an alternative qualification policy."""
+    def scalar(value):
+        if value is None or type(value) is bool:
+            return value
+        if type(value) is str:
+            return value[:128]
+        if type(value) is int and -(2 ** 63) <= value < 2 ** 63:
+            return value
+        if type(value) is float and math.isfinite(value):
+            return value
+        return "<invalid>"
+
+    def fields(value, keys):
+        value = value if isinstance(value, dict) else {}
+        return {key: scalar(value.get(key)) for key in keys}
+
+    run, evidence, live = fresh["run"], fresh.get("evidence", {}), _live(fresh)
+    ack = evidence.get("accepted_host_action") or {}
+    revision, stamp = run.get("intent_revision"), ack.get("acquired_at_monotonic_s")
+    old_stamp = (state.get("evidence", {}).get("accepted_host_action") or {}).get("acquired_at_monotonic_s")
+    current_remaining = run.get("remaining_s")
+    event = _latest_run_event(fresh, identity)
+    flags = ("feedback", "required_observation", "hold_acknowledged", "pose_aligned", "native_ack")
+    checks = (
+        ("status", lambda: run.get("status") != "paused"),
+        ("recovery", lambda: run.get("recovery") is not None),
+        ("pause_event", lambda: event != original_event),
+        ("intent_revision", lambda: type(revision) is not int or revision not in
+         ((identity["intent_revision"],) if release_loss else (identity["intent_revision"], identity["intent_revision"] + 1))),
+        ("connection", lambda: connection != identity["connection_generation"]),
+        ("readiness", lambda: not all(evidence.get(k) is True for k in flags)),
+        ("active_ack", lambda: evidence.get("active_acknowledged") is not False),
+        ("ack_run", lambda: ack.get("run_id") != run["run_id"]),
+        ("ack_host", lambda: ack.get("host_incarnation") != run["backend_incarnation"]),
+        ("ack_state", lambda: ack.get("state") != "paused"),
+        ("ack_revision", lambda: type(ack.get("intent_revision")) is not int or ack["intent_revision"] != revision),
+        ("acknowledged_revision", lambda: type(evidence.get("acknowledged_intent_revision")) is not int
+         or evidence["acknowledged_intent_revision"] != revision),
+        ("cursor_revision", lambda: type(live.get("cursor_intent_revision")) is not int or live["cursor_intent_revision"] != revision),
+        ("required_view", lambda: live.get("required_view", {}).get("qualified") is not True),
+        ("clock_types", lambda: any(type(v) not in (int, float) or not math.isfinite(v)
+         for v in (stamp, old_stamp, current_remaining))),
+        ("remaining_clock", lambda: not 0 < current_remaining <= native_remaining),
+        ("ack_clock", lambda: not old_stamp <= stamp <= run["deadline"] - current_remaining),
+    )
+    failed = []
+    for label, predicate in checks:
+        try:
+            if predicate():
+                failed.append(label)
+        except Exception:
+            failed.append(label + ":unavailable")
+    detail = {
+        "authority": {"sent_identity": fields(identity, identity),
+                      "fresh_identity": fields({"run_id": run.get("run_id"), "service_incarnation": fresh.get("service_incarnation"),
+                          "host_incarnation": run.get("backend_incarnation"), "intent_revision": revision,
+                          "controller_generation": (fresh.get("controller") or {}).get("controller_generation"),
+                          "connection_generation": connection}, identity),
+                      "status": scalar(run.get("status")), "recovery_present": run.get("recovery") is not None,
+                      "original_event": fields(original_event, ("kind", "at", "run_id", "service_incarnation")),
+                      "fresh_event": fields(event, ("kind", "at", "run_id", "service_incarnation"))},
+        "proof": {"flags": fields(evidence, flags), "active": scalar(evidence.get("active_acknowledged")),
+                  "ack": fields(ack, ("run_id", "host_incarnation", "state", "intent_revision", "acquired_at_monotonic_s")),
+                  "acknowledged_revision": scalar(evidence.get("acknowledged_intent_revision")),
+                  "cursor_revision": scalar(live.get("cursor_intent_revision")),
+                  "view": fields(live.get("required_view"), ("required", "qualified", "role", "cause"))},
+        "clocks": {"old_ack_at": scalar(old_stamp), "fresh_ack_at": scalar(stamp),
+                   "original_remaining_s": scalar(native_remaining), "fresh_remaining_s": scalar(current_remaining),
+                   "native_deadline": scalar(run.get("deadline")), "local_ceiling": scalar(ceiling),
+                   "observed_at_monotonic_s": scalar(time.monotonic())},
+        "failed": failed,
+    }
+    if len(json.dumps(detail, allow_nan=False).encode()) > 8192:
+        raise ValueError("bounded paused binding diagnostic required")
+    return detail
+
+
 class HTTPOutcomeError(RuntimeError):
     """A bounded original HTTP outcome; refusal and ambiguity remain distinct."""
 
@@ -1150,7 +1229,13 @@ class SameRunRecovery:
                     or not 0 < current_remaining <= native_remaining
                     or not old_stamp <= stamp <= run["deadline"] - current_remaining
                 ):
-                    raise RuntimeError("current ordinary paused binding/held feedback unavailable")
+                    error = RuntimeError("current ordinary paused binding/held feedback unavailable")
+                    # Diagnostics never replace the original guard refusal.
+                    with contextlib.suppress(Exception):
+                        error.qualification = _paused_binding_diagnostic(
+                            state, fresh, identity, original_event, release_loss,
+                            self.client.connection, native_remaining, ceiling)
+                    raise error
                 if renewal_check:
                     renewal_check()
                 remaining()
@@ -1211,8 +1296,12 @@ class SameRunRecovery:
                 remaining()
             except Exception as qualification_error:
                 try:
-                    self.record({"event": "ordinary_empty_release_requalification_failed" if release_loss else "ordinary_connect_requalification_failed",
-                                 "error_type": type(qualification_error).__name__, "message": str(qualification_error)})
+                    failure = {"event": "ordinary_empty_release_requalification_failed" if release_loss else "ordinary_connect_requalification_failed",
+                               "error_type": type(qualification_error).__name__, "message": str(qualification_error)}
+                    detail = getattr(qualification_error, "qualification", None)
+                    if isinstance(detail, dict):
+                        failure["qualification"] = detail
+                    self.record(failure)
                 finally:
                     raise original from qualification_error
         self.check(self.client.snapshot)
