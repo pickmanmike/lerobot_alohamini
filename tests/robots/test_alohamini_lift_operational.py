@@ -65,8 +65,19 @@ def operating_robot(monkeypatch, tmp_path):
         return bus
 
     class Transport(GroupedLiftTransport):
+        def write_register(self, address, width, value):
+            from lerobot.robots.alohamini import lift_motor_feedback as feedback
+            from tests.robots.test_alohamini_lift_motor_feedback import ByteStreamPort, status
+
+            assert (address, width, value) == (feedback.TORQUE_ENABLE_ADDRESS, 1, 0)
+            port = ByteStreamPort([status(b"")])
+            transport = feedback.DirectSdkTransport("synthetic-owned-off-write", port_handler=port)
+            trace = transport.write_register(address, width, value)
+            self.bus.write("Torque_Enable", "lift_axis", 0, normalize=False, num_retry=0)
+            return trace
+
         def read_group(self, *args, **kwargs):
-            clock.sleep(0.002)  # Synthetic finite transaction time, not instant duplicate samples.
+            clock.sleep(getattr(self, "read_delay_s", 0.002))  # Finite original acquisition time.
             payload, trace = super().read_group(*args, **kwargs)
             from lerobot.robots.alohamini import lift_motor_feedback as feedback
 
@@ -2990,3 +3001,139 @@ def test_host_fault_note_excludes_invalid_or_unbounded_cached_feedback(invalid):
         "emit_timing_scope": "last_emit_attempt",
     }
     assert len(json.dumps(context, allow_nan=False).encode()) < 4096
+
+
+@pytest.mark.parametrize("change", ["effect", "already_off", "still_on", "saved44", "late_zero", "long_write",
+    "deadline_write", "pending", "bad_ack", "device_ack", "comm", "record_failure", "current", "status", "hot"])
+def test_startup_off_single_strict_reassert_requires_actual_off_and_original_baseline(
+    operating_robot, monkeypatch, capsys, change,
+):
+    from lerobot.robots.alohamini import lift_motor_feedback as feedback
+    from lerobot.robots.alohamini.lift_operational import OperationalLift
+    from tests.robots.test_alohamini_lift_motor_feedback import ByteStreamPort, status
+
+    robot, clock = operating_robot
+    bus = robot.left_bus
+    bus.registers["Torque_Enable", "lift_axis"] = int(change != "already_off")
+    bus.registers["Present_Current", "lift_axis"] = 0
+    bus.registers["Present_Temperature", "lift_axis"] = 31
+    operation = OperationalLift(robot)
+    operation.monitor.read_configuration()
+    normal_write = bus.write
+    helpers, strict_calls, failures = [], [], []
+
+    def helper_returns_without_observed_effect(register, motor, value, **kwargs):
+        if (register, motor, int(value)) == ("Torque_Enable", "lift_axis", 0):
+            helpers.append(clock.now)
+            return None  # Synthetic ACK-success/no observed effect, not a wire-cause claim for44.
+        return normal_write(register, motor, value, **kwargs)
+
+    monkeypatch.setattr(bus, "write", helper_returns_without_observed_effect)
+    reply = bytearray(status(b"", error=4 if change == "device_ack" else 0))
+    if change == "bad_ack":
+        reply[-1] ^= 1
+    port = ByteStreamPort([] if change == "comm" else [bytes(reply)],
+                          pending=b"unexpected old bytes" if change == "pending" else b"")
+    wire = feedback.DirectSdkTransport("synthetic-owned-off-write", port_handler=port)
+
+    def strict_write(address, width, value):
+        strict_calls.append((clock.now, address, width, value, len(operation.transport.group_reads)))
+        assert (address, width, value) == (40, 1, 0)
+        # The historical replay preserves only its saved original acquisition times.
+        clock.sleep(.601 if change == "deadline_write" else .041 if change == "long_write"
+                    else 0 if change == "saved44" else .001)
+        try:
+            trace = wire.write_register(address, width, value)  # Actual vendor SDK and protocol validator.
+        except feedback.TransportRefusal as error:
+            failures.append(error)
+            raise
+        if change not in {"still_on", "saved44", "late_zero"}:
+            normal_write("Torque_Enable", "lift_axis", 0, normalize=False, num_retry=0)
+        return trace
+
+    monkeypatch.setattr(operation.transport, "write_register", strict_write)
+    requested = clock.now
+    normal_group = operation.transport.read_group
+    if change == "saved44":
+        operation.transport.read_delay_s = .001  # Finite read fitting every saved original interval.
+    original44 = [199422.844828964, 199422.896853230, 199422.952888244, 199423.008853758,
+                  199423.060908413, 199423.116864187, 199423.168862693, 199423.224863022,
+                  199423.281328054, 199423.337978733, 199423.394004507]
+    acquired = []
+
+    def group(start, length, **kwargs):
+        if (start, length) == (feedback.FEEDBACK_START, feedback.FEEDBACK_LENGTH):
+            if change == "late_zero" and clock.now >= requested + .21:
+                bus.registers["Torque_Enable", "lift_axis"] = 0
+            if change == "saved44":
+                # Only the saved ORIGINAL44 acquisition offsets and on readbacks;
+                # the inserted zero-write response has no assumed physical effect.
+                target = requested + original44[len(acquired)] - 199422.841019548
+                assert target >= clock.now + operation.transport.read_delay_s - 1e-9
+                clock.now = target - operation.transport.read_delay_s
+            bus.read_sequences["Present_Current", "lift_axis"] = [31 if change == "current" else 0]
+            if change == "status":
+                bus.registers["Status", "lift_axis"] = 8
+            if change == "hot":
+                bus.registers["Present_Temperature", "lift_axis"] = 60
+        result = normal_group(start, length, **kwargs)
+        if (start, length) == (feedback.FEEDBACK_START, feedback.FEEDBACK_LENGTH):
+            acquired.append(clock.now)
+        return result
+
+    monkeypatch.setattr(operation.transport, "read_group", group)
+    if change == "record_failure":
+        port.responses = [b"invalid ACK"]
+        normal_record = operation.monitor.record
+
+        def record(phase, **values):
+            if phase == "startup_off_reassert_failed":
+                raise OSError("secondary trace sink failure")
+            return normal_record(phase, **values)
+
+        monkeypatch.setattr(operation.monitor, "record", record)
+
+    if change in {"effect", "already_off"}:
+        operation._qualify_startup_off()
+        records = operational_records(capsys)
+        baseline = [v for v in records if v["phase"] == "baseline"]
+        acquired_records = [v for v in records if v["phase"] == "startup_off_acquisition"]
+        assert [v["torque_enable"] for v in acquired_records] == ([1, 0] if change == "effect" else [0])
+        assert len(baseline) == 9 and all(v["torque_enable"] == 0 for v in baseline)
+        assert baseline[-1]["sample_monotonic_s"] - baseline[0]["sample_monotonic_s"] >= .4
+        assert clock.now <= requested + .6
+        assert all(v["absolute_deadline_monotonic_s"] == pytest.approx(requested + .6)
+                   for v in acquired_records)
+        returns = [v for v in records if v["phase"] == "startup_off_reassert_returned"]
+        assert len(returns) == (change == "effect")
+        if returns:
+            assert returns[0]["write_trace"]["request_bytes"] == list(port.writes[0])
+            assert returns[0]["write_trace"]["checksum_ok"] is True
+            assert returns[0]["write_trace"]["comm_result"] == 0
+            assert returns[0]["requested_at_monotonic_s"] < returns[0]["helper_returned_at_monotonic_s"]
+    else:
+        with pytest.raises(feedback.ComparisonRefusal) as caught:
+            operation._qualify_startup_off()
+        records = operational_records(capsys)
+        assert not any(v["phase"] == "startup_off_baseline_qualified" for v in records)
+        if failures:
+            assert caught.value is failures[0]  # A trace/log failure cannot replace the SDK first cause.
+            assert sum(v["phase"] == "startup_off_reassert_failed" for v in records) == (change != "record_failure")
+        if change in {"long_write", "deadline_write", "pending", "bad_ack", "device_ack", "comm", "record_failure"}:
+            assert len(acquired) == 1  # No next read/baseline after late or failed zero write.
+        if change == "long_write":
+            assert "40 ms" in str(caught.value)
+        if change == "deadline_write":
+            assert "deadline" in str(caught.value)
+        if change == "saved44":
+            assert len(acquired) == 11
+            assert acquired == pytest.approx([requested + t - 199422.841019548 for t in original44])
+            assert "deadline" in str(caught.value) and clock.now == pytest.approx(requested + .6)
+        if change in {"still_on", "late_zero"}:
+            assert "deadline" in str(caught.value) and clock.now == pytest.approx(requested + .6)
+    assert len(helpers) == 1
+    assert len(strict_calls) == (0 if change in {"already_off", "current", "status"} else 1)
+    assert len(port.writes) == (0 if change in {"already_off", "pending", "current", "status"} else 1)
+    assert not any(e[1] == "write" and e[3] == "lift_axis" and
+                   ((e[2] == "Torque_Enable" and e[4] == 1) or (e[2] == "Goal_Velocity" and e[4] != 0))
+                   for e in bus.events if len(e) == 5)

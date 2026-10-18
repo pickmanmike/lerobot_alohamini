@@ -230,7 +230,7 @@ class OperationalLift(InstalledLiftCheck):
             return value
 
         # Keep the existing helper's SDK retry/readback behavior. There is no
-        # additional request, enabled write, outer retry or renewed deadline.
+        # enabled write, outer retry or renewed deadline.
         for register in ("Goal_Velocity", "Torque_Enable"):
             remaining(request)
             started = clock(request)
@@ -339,6 +339,7 @@ class OperationalLift(InstalledLiftCheck):
                     return True
             record["startup_off_motion_candidate_reset"] = False
             return False
+        off_reasserted = False
         while True:
             budget = min(self.monitor.sample_timeout_ms, remaining(request) * 1000)
             record = self.monitor.sample(
@@ -356,6 +357,43 @@ class OperationalLift(InstalledLiftCheck):
             self.emit(record)
             if int(record["torque_enable"]) == 0:
                 break  # This first zero is acquisition evidence, not a baseline vote.
+            if not off_reasserted:
+                remaining(record)
+                off_reasserted = True
+                started = clock(record)
+                try:
+                    trace = self.transport.write_register(feedback.TORQUE_ENABLE_ADDRESS, 1, 0)
+                except BaseException as error:
+                    try:
+                        self.monitor.record(
+                            "startup_off_reassert_failed",
+                            register="Torque_Enable",
+                            requested_value=0,
+                            requested_at_monotonic_s=started,
+                            helper_failed_at_monotonic_s=clock(record),
+                            absolute_deadline_monotonic_s=deadline,
+                            error_type=type(error).__name__,
+                            error=str(error),
+                            write_trace=getattr(error, "trace", None),
+                            wire_effect="unqualified",
+                        )
+                    except BaseException as diagnostic_error:
+                        error.add_note("Startup off zero reassert diagnostic also failed: " + type(diagnostic_error).__name__)
+                    raise
+                returned = clock(record)
+                record = self.monitor.record(
+                    "startup_off_reassert_returned",
+                    register="Torque_Enable",
+                    requested_value=0,
+                    requested_at_monotonic_s=started,
+                    helper_returned_at_monotonic_s=returned,
+                    absolute_deadline_monotonic_s=deadline,
+                    write_trace=trace,
+                    wire_effect="not established until fresh grouped torque-off feedback",
+                )
+                remaining(record)
+                if returned - started > self.monitor.sample_timeout_ms / 1000:
+                    self.refuse(record, "startup off: zero-only reassertion exceeded its 40 ms request budget.")
             self.monitor.sleep(min(feedback.POLL_S, remaining(record)))
             remaining(record)
 
@@ -403,8 +441,9 @@ class OperationalLift(InstalledLiftCheck):
                 sample_monotonic_s=baseline["sample_monotonic_s"],
                 strict_baseline=baseline["stationary_qualification"],
             )
-        # Equal/lower replies keep the original peak time. Phase work can cross
-        # its next slot even before the nominal raw poll interval is due. Keep
+        # Lower replies retain the original peak time; advancing equal maxima
+        # use the latest actual reply time. Phase work can cross the next slot
+        # even before the nominal raw poll interval is due. Keep
         # the same off/zero/cold acquisition, observer and original deadline.
         now = clock(baseline)
         self.temperature.assert_fresh(now, refreshing=True)
