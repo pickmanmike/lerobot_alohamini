@@ -1747,7 +1747,7 @@ def test_original_recovery_ceiling_includes_authenticated_read_time_without_rean
     asyncio.run(asyncio.wait_for(scenario(), 0.3))
 
 
-@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause"])
+@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "grant_loss_pre", "grant_loss_post", "grant_connection_loss"])
 def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(tmp_path, cause):
     import asyncio
     import copy
@@ -1902,6 +1902,106 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
 
             producer = m.FrameProducer(Input())
             producer.workspace, producer.native_cursor = workspace(), workspace()["reference"]
+            if cause in {"grant_loss_pre", "grant_loss_post", "grant_connection_loss"}:
+                # Synthetic47: real Core creates and qualifies an episode while
+                # a grant result is unknown, before ANY producer capture.
+                pi_clock = [10.01]
+                a.clock = e.clock = lambda: pi_clock[0]
+                original_call, lost = gateway.call, [False]
+                old_results, envelopes = [], []
+                original_attach = client.attach
+
+                def capture(ws):
+                    send = ws.send_json
+                    async def sent(value, **kwargs):
+                        if "command" in value:
+                            envelopes.append(copy.deepcopy(value))
+                        return await send(value, **kwargs)
+                    ws.send_json = sent
+
+                async def attached():
+                    await original_attach()
+                    capture(client.ws)
+
+                async def delay_grant(command, device):
+                    if command.get("op") == "grant" and not lost[0]:
+                        lost[0] = True
+                        old = copy.deepcopy(command)
+                        if cause == "grant_loss_post":
+                            old_results.append(await original_call(old, device))
+                        pi_clock[0] += .01
+                        healthy[0] = False
+                        a.tick()  # Actual Core required_hold, original descriptor.
+                        descriptor = copy.deepcopy(a.run["recovery"])
+                        assert set(descriptor) == {"started", "ceiling", "revision"}
+                        pi_clock[0] += .01
+                        healthy[0] = True
+                        a.tick()  # Actual public descriptor clearing after qualification.
+                        assert a.run["status"] == "paused" and a.run["recovery"] is None
+                        async def finish_old():
+                            await unblock_release.wait()
+                            if cause != "grant_loss_post":
+                                old_results.append(await original_call(old, device))
+                            return old_results[-1]
+                        task = asyncio.create_task(finish_old())
+                        delayed.append(task)
+                        if cause == "grant_connection_loss":
+                            client.ws._response.connection.transport.abort()
+                        return await asyncio.shield(task)
+                    return await original_call(command, device)
+
+                capture(client.ws)
+                client.attach, gateway.call = attached, delay_grant
+                renewal = asyncio.create_task(client.renew())
+                def healthy_renewal():
+                    if renewal.done():
+                        renewal.result()
+                        raise RuntimeError("original renewal ended")
+                cursor = copy.deepcopy(producer.native_cursor)
+                try:
+                    with pytest.raises((TimeoutError, ConnectionError)) as caught:
+                        await m.send_leader_sample(client, producer, m.ZERO_BODY, record,
+                                                   phase="individual", progress_s=0)
+                    original = caught.value
+                    assert producer.sequence == 0 and client.sequence == 0
+                    assert producer.native_cursor == cursor
+                    assert not any(op == "input" for op, _ in commands)
+                    assert await guard.resume(grant_error=original, renewal_check=healthy_renewal)
+                    assert a.run["status"] == "running" and guard.episodes == 1
+                    assert client.snapshot["evidence"]["active_acknowledged"] is True
+                    assert sum(op == "connect" for op, _ in commands) == initial_connects + 1
+                    holds = [v for v in a.events if v["kind"] == "required_hold"]
+                    assert len(holds) == 1 and set(holds[0]["recovery"]) == {"started", "ceiling", "revision"}
+                    sql_holds = [json.loads(row[0]) for row in a.db.execute("SELECT data FROM transitions")
+                                 if json.loads(row[0])["kind"] == "required_hold"]
+                    assert sql_holds == holds
+                    assert a.run["recovery"] is None  # No lifecycle/API change.
+                    grants = [v for v in envelopes if v["command"]["op"] == "grant"]
+                    assert len(grants) == 1  # Unknown permission was discarded.
+                    unblock_release.set()
+                    await asyncio.wait_for(asyncio.gather(*delayed), .5)
+                    if cause == "grant_loss_post":
+                        assert old_results[0]["accepted"] is True
+                    else:
+                        assert old_results == [{"accepted": False, "status": "refused", "reason": "stale control generation", "effect_admitted": False}]
+                    assert not any(v["command"]["op"] in {"claim", "start", "input"} for v in envelopes)
+                    assert not any(op == "input" for op, _ in commands)
+                    assert client.generation == ids["controller_generation"]  # Existing fenced HTTP renewal only.
+                    assert client.snapshot["status_projection"] == {"kind": "am1-essential-status", "version": 1}
+                    assert a.run["deadline"] == 309. and a.run["native_live_at"] == 9.
+                    producer.native_cursor = m._live(client.snapshot)["cursor"]
+                    producer.reacquire = True
+                    fresh = await m.send_leader_sample(client, producer, m.ZERO_BODY, record,
+                                                       phase="individual", progress_s=.02)
+                    assert fresh[2]["accepted"] is True and producer.sequence == client.sequence == 1
+                    grants = [v for v in envelopes if v["command"]["op"] == "grant"]
+                    assert len(grants) == 2 and grants[0]["id"] != grants[1]["id"]
+                    assert grants[0]["command"]["connection_generation"] != grants[1]["command"]["connection_generation"]
+                    assert len([r for r in records if r["event"] == "qualified_native_recovery"]) == 1
+                finally:
+                    renewal.cancel()
+                    await asyncio.gather(renewal, return_exceptions=True)
+                return
             first = await m.send_leader_sample(
                 client, producer, m.ZERO_BODY, record, phase="individual", progress_s=0.02
             )
@@ -4585,6 +4685,263 @@ def test_startup_detail_uses_the_actual_core_start_pending_backend_shape(tmp_pat
         assert authority.run == before and begins == ["physical-live-teleop"]
     try:
         asyncio.run(scenario())
+    finally:
+        authority.run = None
+        authority.close()
+
+
+@pytest.mark.parametrize("change", [None, "still_recovering", "ordinary", "ordinary_held", "ordinary_view", "ordinary_then_episode", "manual_before_hold", "remaining_increased", "missing_source", "changed_source", "missing_descriptor", "extra_descriptor",
+    "future_source", "future_qualified", "earlier_source", "manual_pause", "closed_episode", "later_distinct_episode", "limit",
+    "foreign", "service", "controller", "reference", "deadline", "live", "fault", "uncertain", "native_fault",
+    "running", "view", "held", "ack", "alignment", "caller_expired", "episode_expired", "http_delay",
+    "renewal", "nested_connect", "nested_release", "nested_resume", "same_generation", "missing_tag"])
+def test_unknown_grant_requires_source_episode_fresh_hold_new_fence_and_original_budget(change, monkeypatch):
+    import asyncio
+    import copy
+    from types import SimpleNamespace
+
+    m = adapter()
+    now, commands, records = [1000.], [], []
+    monkeypatch.setattr(m, "time", SimpleNamespace(monotonic=lambda: now[0], perf_counter=m.time.perf_counter))
+    before, fresh = recovery_state(), requalified_state()
+    episode = {"started": 100.02, "ceiling": 100.42, "revision": 2}
+    hold = {"kind": "required_hold", "at": 100.03, "run_id": "owned", "service_incarnation": "service",
+            "recovery": copy.deepcopy(episode)}
+    fresh["events"].insert(0, hold)
+    fresh["evidence"]["active_acknowledged"] = False
+    fresh["evidence"]["accepted_host_action"]["acquired_at_monotonic_s"] = 100.1
+    original = TimeoutError("original unknown permission")
+    connection = str(uuid4())
+
+    class Client:
+        device, generation, sequence = "device", "control", 0
+        identities = m.SessionClient.identities
+        snapshot = copy.deepcopy(before)
+        attaches = 0
+        reads = 0
+
+        async def detach(self):
+            self.snapshot = None
+
+        async def attach(self):
+            self.attaches += 1
+            self.snapshot = copy.deepcopy(fresh)
+
+        async def get(self, path):
+            assert path == "state"
+            if change == "http_delay":
+                now[0] += .4
+            elif change in {"view", "held", "ack", "alignment"}:
+                now[0] += .05  # Original episode/caller clock also advances while waiting.
+                fresh["run"]["remaining_s"] -= .05
+            self.reads += 1
+            value = copy.deepcopy(fresh)
+            if change == "still_recovering" and self.reads == 1:
+                value["run"].update(status="recovering", recovery=copy.deepcopy(episode), intent_revision=2)
+                value["events"] = [copy.deepcopy(hold)]
+                value["evidence"]["feedback"] = False
+            return {"snapshot": value}
+
+        async def command(self, command):
+            commands.append(copy.deepcopy(command))
+            op = command["op"]
+            if change == ("nested_release" if op == "release_input" else "nested_" + op):
+                raise ConnectionError("new phase outcome unknown")
+            if op == "connect":
+                value = copy.deepcopy(self.snapshot)
+                value["run"]["intent_revision"] += 1
+                revision = value["run"]["intent_revision"]
+                value["run"]["live_input"]["cursor_intent_revision"] = revision
+                value["evidence"]["acknowledged_intent_revision"] = revision
+                value["evidence"]["accepted_host_action"]["intent_revision"] = revision
+                return {"accepted": True, "connection_generation": self.connection if change == "same_generation" else connection,
+                        "snapshot": value}
+            if op == "resume":
+                self.snapshot["run"]["status"] = "running"
+                self.snapshot["run"]["intent_revision"] += 1
+                revision = self.snapshot["run"]["intent_revision"]
+                self.snapshot["run"]["live_input"]["cursor_intent_revision"] = revision
+                self.snapshot["evidence"].update(active_acknowledged=True, acknowledged_intent_revision=revision)
+                self.snapshot["evidence"]["accepted_host_action"].update(state="active", intent_revision=revision)
+            return {"accepted": True}
+
+        async def wait(self, predicate, timeout):
+            if not predicate():
+                raise TimeoutError("current held/active proof unavailable")
+
+    client = Client()
+    client.connection = "connection"
+    guard = m.SameRunRecovery(client, records.append)
+    context = {"identity": client.identities(), "snapshot": copy.deepcopy(before), "requested": 1000.}
+    original.grant_context = context
+    if change in {"ordinary", "ordinary_held", "ordinary_view", "remaining_increased"}:
+        fresh["run"].update(first_cause=None, recovery_episodes=0)
+        fresh["events"] = [{"kind": "input_expired", "at": 100.1,
+                            "run_id": "owned", "service_incarnation": "service"}]
+        if change == "remaining_increased":
+            fresh["run"]["remaining_s"] = 300.
+        elif change == "ordinary_held":
+            fresh["evidence"]["hold_acknowledged"] = False
+        elif change == "ordinary_view":
+            fresh["run"]["live_input"]["required_view"]["qualified"] = False
+    elif change in {"ordinary_then_episode", "manual_before_hold"}:
+        fresh["events"].insert(0, {"kind": "input_expired" if change == "ordinary_then_episode" else "pause",
+                                    "at": 100.02, "run_id": "owned", "service_incarnation": "service"})
+        hold["recovery"]["revision"] += 1
+        episode["revision"] += 1
+        fresh["run"]["intent_revision"] += 1
+        fresh["run"]["live_input"]["cursor_intent_revision"] += 1
+        fresh["evidence"]["acknowledged_intent_revision"] += 1
+        fresh["evidence"]["accepted_host_action"]["intent_revision"] += 1
+    elif change == "missing_source":
+        fresh["events"].pop(0)
+    elif change == "changed_source":
+        hold["service_incarnation"] = "foreign"
+    elif change == "missing_descriptor":
+        hold.pop("recovery")
+    elif change == "extra_descriptor":
+        hold["recovery"]["count"] = 1
+    elif change == "future_source":
+        hold["at"] = 101.
+    elif change == "future_qualified":
+        fresh["events"][-1]["at"] = 100.2
+    elif change == "earlier_source":
+        hold["recovery"]["started"] = 99.
+    elif change in {"manual_pause", "closed_episode"}:
+        fresh["events"].append({"kind": "pause" if change == "manual_pause" else "resumed", "at": 100.11,
+                                "run_id": "owned", "service_incarnation": "service"})
+        fresh["run"]["intent_revision"] += 2
+    elif change == "later_distinct_episode":
+        fresh["run"]["recovery_episodes"] = 2
+    elif change == "limit":
+        guard.episodes, guard.cause = 3, "feedback_loss"
+        context["snapshot"]["run"].update(recovery_episodes=3, first_cause="feedback_loss")
+        fresh["run"]["recovery_episodes"] = 4
+    elif change == "foreign":
+        fresh["run"]["run_id"] = "other"
+    elif change == "service":
+        fresh["service_incarnation"] = "other"
+    elif change == "controller":
+        fresh["controller"]["controller_generation"] = "other"
+    elif change == "reference":
+        fresh["run"]["live_input"]["reference"][KEYS[0]] += 1
+    elif change == "deadline":
+        fresh["run"]["deadline"] += 1
+    elif change == "live":
+        fresh["run"]["native_live_at"] += 1
+    elif change == "fault":
+        fresh["evidence"]["fault"] = "device hard fault"
+    elif change == "uncertain":
+        fresh["run"]["uncertain"] = True
+    elif change == "native_fault":
+        fresh["run"]["native_first_cause"] = "device hard fault"
+    elif change == "running":
+        fresh["run"]["status"] = "running"
+    elif change == "view":
+        fresh["run"]["live_input"]["required_view"]["qualified"] = False
+    elif change == "held":
+        fresh["evidence"]["hold_acknowledged"] = False
+    elif change == "ack":
+        fresh["evidence"]["accepted_host_action"]["intent_revision"] -= 1
+    elif change == "alignment":
+        fresh["evidence"]["pose_aligned"] = False
+    elif change == "episode_expired":
+        fresh["run"]["remaining_s"] = 299.5
+    elif change == "missing_tag":
+        del original.grant_context
+
+    def healthy():
+        if change == "renewal":
+            raise RuntimeError("original renewal failed")
+
+    async def scenario():
+        if change in {None, "still_recovering", "ordinary", "ordinary_then_episode"}:
+            assert await guard.resume(grant_error=original, wall_deadline=1000.2, renewal_check=healthy) is (change != "ordinary")
+            assert [command["op"] for command in commands] == ["connect", "release_input", "resume"]
+            assert client.connection == connection and client.sequence == 0
+            assert guard.episodes == (0 if change == "ordinary" else 1)
+            if change != "ordinary":
+                assert records[-1]["event"] == "qualified_native_recovery"
+                assert records[-1]["original_recovery"] == episode
+            else:
+                assert not any(r["event"] == "qualified_native_recovery" for r in records)
+            assert client.snapshot["evidence"]["active_acknowledged"] is True
+        else:
+            with pytest.raises(TimeoutError) as caught:
+                await guard.resume(grant_error=original, wall_deadline=999.9 if change == "caller_expired" else 1000.2,
+                                   renewal_check=healthy)
+            assert caught.value is original
+            assert not any(command["op"] in {"grant", "input", "claim", "start"} for command in commands)
+            assert not any(r["event"] == "qualified_native_recovery" for r in records)
+            if change not in {"nested_connect", "nested_release", "nested_resume", "same_generation"}:
+                assert commands == []
+        assert client.sequence == 0
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("phase", ["individual", "terminal_zero_qualification"])
+def test_runner_routes_only_pre_capture_grant_ambiguity_and_preserves_terminal_ceiling(tmp_path, monkeypatch, phase):
+    m = adapter()
+    actual_send, actual_resume = m.send_leader_sample, m.SameRunRecovery.resume
+    original, seen, samples = TimeoutError("unknown first permission"), [], []
+
+    async def send(client, producer, body, record, *, phase: str, progress_s):
+        if phase == selected and not seen:
+            sequence, source_sequence = client.sequence, producer.sequence
+            command = client.command
+            async def lost(payload):
+                assert payload["op"] == "grant"
+                raise original
+            client.command = lost
+            try:
+                return await actual_send(client, producer, body, record, phase=phase, progress_s=progress_s)
+            finally:
+                client.command = command
+                samples.append((client.sequence == sequence, producer.sequence == source_sequence))
+        return await actual_send(client, producer, body, record, phase=phase, progress_s=progress_s)
+
+    async def resume(guard, **kwargs):
+        if kwargs.get("grant_error") is original:
+            assert samples == [(True, True)]
+            assert original.grant_context["snapshot"]["run"]["status"] == "running"
+            kwargs["renewal_check"]()
+            if selected == "terminal_zero_qualification":
+                assert m.time.monotonic() < kwargs["wall_deadline"] <= m.time.monotonic() + 2
+            seen.append(kwargs)
+            return False  # Routing seam only; real qualified Core/fence is tested above.
+        return await actual_resume(guard, **kwargs)
+
+    selected = phase
+    monkeypatch.setattr(m, "send_leader_sample", send)
+    monkeypatch.setattr(m.SameRunRecovery, "resume", resume)
+    test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id(tmp_path, monkeypatch, None)
+    assert len(seen) == 1 and samples == [(True, True)]
+
+
+@pytest.mark.parametrize("teleop,kind", [(True, "required_hold"), (False, "required_hold"), (True, "pause")])
+def test_required_hold_source_descriptor_is_copied_before_sql_and_only_for_teleop(tmp_path, teleop, kind):
+    import copy
+    import json
+
+    from tests.robots.test_am1_live_teleop_executor import authority_lane
+
+    authority, _, _ = authority_lane(tmp_path / "owner")
+    try:
+        descriptor = {"started": 10., "ceiling": 20., "revision": authority.run["intent_revision"]}
+        authority.run["recovery"] = descriptor
+        if not teleop:
+            authority.run["recipe"] = "ordinary-non-teleop"
+        authority._event(kind)
+        original = copy.deepcopy(authority.events[-1])
+        descriptor["started"] = 99.
+        authority.run["recovery"] = None
+        assert authority.events[-1] == original
+        sql = json.loads(authority.db.execute("SELECT data FROM transitions ORDER BY rowid DESC LIMIT 1").fetchone()[0])
+        assert sql == original
+        if teleop and kind == "required_hold":
+            assert original["recovery"] == {"started": 10., "ceiling": 20., "revision": original["recovery"]["revision"]}
+        else:
+            assert set(original) == {"kind", "at", "run_id", "service_incarnation"}
     finally:
         authority.run = None
         authority.close()

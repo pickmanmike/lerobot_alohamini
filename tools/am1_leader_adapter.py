@@ -1054,24 +1054,115 @@ class SameRunRecovery:
         if history and run.get("status") == "recovering":
             raise RuntimeError("native recovery must qualify before explicit Resume")
 
+    def _grant_episode(self, state, context):
+        """Use only the original Core required_hold descriptor, never infer it."""
+        run, identity = state["run"], context["identity"]
+        own = [event for event in state.get("events", [])
+               if event.get("run_id") == identity["run_id"]
+               and event.get("service_incarnation") == identity["service_incarnation"]]
+        hold = next((event for event in reversed(own) if event.get("kind") == "required_hold"), {})
+        episode = hold.get("recovery")
+        if (set(hold) != {"kind", "at", "run_id", "service_incarnation", "recovery"}
+            or not isinstance(episode, dict) or set(episode) != {"started", "ceiling", "revision"}
+            or any(type(episode[k]) not in (int, float) or not math.isfinite(episode[k])
+                   for k in ("started", "ceiling"))
+            or type(episode["revision"]) is not int
+            or episode["revision"] not in (identity["intent_revision"], identity["intent_revision"] + 1)
+            or type(hold.get("at")) not in (int, float) or not math.isfinite(hold["at"])
+            or not self.original["run"]["native_live_at"] <= episode["started"] <= hold["at"] < episode["ceiling"]
+            or not episode["ceiling"] <= min(episode["started"] + 10, run["deadline"])
+            or run.get("recovery_episodes") != self.episodes + 1
+            or run.get("first_cause") not in {"feedback_loss", "native_active_ack_loss", "required_proof_loss"}
+            or self.cause is not None and run.get("first_cause") != self.cause):
+            raise RuntimeError("source-retained native recovery descriptor unavailable/invalid")
+        index = own.index(hold)
+        prior = context["snapshot"]["run"]
+        if (episode["started"] + prior["remaining_s"] < prior["deadline"]
+            or episode["revision"] == identity["intent_revision"] + 1
+            and (index == 0 or own[index - 1].get("kind") not in
+                 {"required_view_expired", "input_expired", "native_input_expired"}
+                 or type(own[index - 1].get("at")) not in (int, float)
+                 or own[index - 1]["at"] + prior["remaining_s"] < prior["deadline"]
+                 or own[index - 1]["at"] > hold["at"])):
+            raise RuntimeError("source-retained native recovery preceding pause changed")
+        remaining = run.get("remaining_s")
+        if (type(remaining) not in (int, float) or not math.isfinite(remaining)
+            or not episode["started"] <= hold["at"] or hold["at"] + remaining > run["deadline"]):
+            raise RuntimeError("source-retained native recovery clock unavailable")
+        if run["status"] == "paused":
+            event = own[-1]
+            if (run.get("recovery") is not None or type(run.get("intent_revision")) is not int
+                or run["intent_revision"] != episode["revision"] + 1
+                or event.get("kind") != "live_sensing_requalified"
+                or type(event.get("at")) not in (int, float)
+                # Compare sums to avoid cancellation in deadline - remaining;
+                # no tolerance or timestamp replacement is introduced.
+                or not hold["at"] <= event["at"] or event["at"] + remaining > run["deadline"]
+                or not event["at"] < episode["ceiling"]
+                or own[index + 1:] != [event]):
+                raise RuntimeError("source-retained native recovery is closed or changed")
+        elif run["status"] != "recovering" or run.get("recovery") != episode or own[-1] != hold:
+            raise RuntimeError("source-retained native recovery current phase changed")
+        return dict(episode)
+
     async def resume(
         self, *, wall_deadline=None, require_episode=False, refusal_identity=None, expected_pause=None,
-        renewal_check=None,
+        renewal_check=None, grant_error=None,
     ):
         clock = {"ceiling": wall_deadline, "anchored": False}
-        interrupted, deferred, first_transport_error = None, [], None
+        interrupted, deferred, first_transport_error = None, [], grant_error
+        grant_context = None
+        if grant_error is not None:
+            try:
+                grant_context = getattr(grant_error, "grant_context", None)
+                if (not isinstance(grant_error, (TimeoutError, ConnectionError))
+                    or not isinstance(grant_context, dict)
+                    or set(grant_context) != {"identity", "snapshot", "requested"} or renewal_check is None):
+                    raise RuntimeError("original pre-capture grant ambiguity unavailable")
+                before, identity = grant_context["snapshot"], grant_context["identity"]
+                self.check(before)
+                run = before["run"]
+                binding = {"run_id": self.original["run"]["run_id"], "service_incarnation": self.original["service"],
+                           "host_incarnation": self.original["run"]["backend_incarnation"],
+                           "controller_generation": self.client.generation,
+                           "connection_generation": self.client.connection,
+                           "intent_revision": run.get("intent_revision")}
+                remaining, requested = run.get("remaining_s"), grant_context["requested"]
+                if (not isinstance(identity, dict) or set(identity) != set(binding)
+                    or any(type(identity[k]) is not type(v) or identity[k] != v for k, v in binding.items())
+                    or type(identity["intent_revision"]) is not int or identity["intent_revision"] < 0
+                    or run.get("status") != "running" or run.get("recovery") is not None
+                    or any(type(value) not in (int, float) or not math.isfinite(value)
+                           for value in (remaining, requested))
+                    or not 0 < remaining <= run["deadline"] - run["native_live_at"]
+                    or not 0 <= requested <= time.monotonic()):
+                    raise RuntimeError("original running grant identity/clock unavailable")
+                clock["ceiling"] = min(requested + remaining, wall_deadline if wall_deadline is not None else float("inf"))
+                def remaining_budget():
+                    renewal_check()
+                    value = clock["ceiling"] - time.monotonic()
+                    if value <= 0:
+                        raise TimeoutError("original grant rejoin ceiling exhausted")
+                    return value
+                self.record({"event": "leader_grant_ambiguous", "identity": identity,
+                             "outcome": "unknown_discarded_before_capture", "remaining_s": remaining_budget()})
+                await self._attach_transport(before, identity, remaining_budget, renewal_check)
+            except (Exception, asyncio.CancelledError) as error:
+                raise grant_error from error
         while True:
             try:
                 try:
                     recovered = await self._resume_once(
                         wall_deadline=clock["ceiling"], require_episode=require_episode,
                         refusal_identity=refusal_identity, expected_pause=expected_pause,
-                        renewal_check=renewal_check, clock=clock, interrupted=interrupted)
+                        renewal_check=renewal_check, clock=clock, interrupted=interrupted,
+                        grant_context=grant_context)
                 except _ResumePausedError as outcome:
                     first_transport_error = first_transport_error or getattr(outcome, "transport_error", None)
                     if outcome.episode is not None:
                         deferred.append(outcome.episode)
                     interrupted = outcome
+                    grant_context = None
                     require_episode, refusal_identity, expected_pause = False, None, outcome.event["kind"]
                     self.record({"event": "accepted_resume_superseded", "identity": outcome.identity,
                                  "pause_event": outcome.event, "remaining_s": clock["ceiling"] - time.monotonic()})
@@ -1126,7 +1217,7 @@ class SameRunRecovery:
 
     async def _resume_once(
         self, *, wall_deadline, require_episode, refusal_identity, expected_pause,
-        renewal_check, clock, interrupted,
+        renewal_check, clock, interrupted, grant_context=None,
     ):
         # This is the existing authenticated owner read, not a WSS freshness
         # guess. Anchor BEFORE the read so HTTP time cannot extend the ceiling.
@@ -1175,6 +1266,8 @@ class SameRunRecovery:
             }
         )
         self.check(state, history=False)
+        if grant_context is not None and native_remaining > grant_context["snapshot"]["run"]["remaining_s"]:
+            raise RuntimeError("original grant native remaining clock increased")
         if interrupted is not None:
             identity = interrupted.identity
             actual = self.client.identities()
@@ -1195,7 +1288,13 @@ class SameRunRecovery:
         ):
             raise RuntimeError("original mailbox input refusal/current ordinary pause unavailable")
         recovered, local_ceiling, episode = False, wall_deadline, None
-        if state["run"]["status"] != "recovering" and (require_episode or expected_pause):
+        retained = None
+        if grant_context is not None:
+            if self.client.connection != grant_context["identity"]["connection_generation"]:
+                raise RuntimeError("original ambiguous grant connection changed")
+            if not self.history_qualified(state):
+                retained = self._grant_episode(state, grant_context)
+        if state["run"]["status"] != "recovering" and retained is None and (require_episode or expected_pause or grant_context is not None):
             run = state["run"]
             event = next(
                 (
@@ -1211,6 +1310,7 @@ class SameRunRecovery:
                 run["status"] != "paused"
                 or run.get("recovery") is not None
                 or not self.history_qualified(state)
+                or grant_context is not None and run.get("intent_revision") != grant_context["identity"]["intent_revision"] + 1
                 or event.get("kind") not in allowed
                 or expected_pause is not None
                 and event.get("kind") != expected_pause
@@ -1225,9 +1325,9 @@ class SameRunRecovery:
                 )
             self.pause_recoveries += 1
             self.record({"event": "cause_specific_hold", "cause": event["kind"], "snapshot": state})
-        if state["run"]["status"] == "recovering":
+        if state["run"]["status"] == "recovering" or retained is not None:
             run = state["run"]
-            episode = run.get("recovery")
+            episode = retained if retained is not None else run.get("recovery")
             if (
                 not isinstance(episode, dict)
                 or set(episode) != {"started", "ceiling", "revision"}
@@ -1236,7 +1336,7 @@ class SameRunRecovery:
                     for k in ("started", "ceiling")
                 )
                 or type(episode["revision"]) is not int
-                or episode["revision"] != run["intent_revision"]
+                or episode["revision"] != run["intent_revision"] - (1 if run["status"] == "paused" else 0)
                 or not episode["started"]
                 < episode["ceiling"]
                 <= min(episode["started"] + 10, run["deadline"])
@@ -1349,7 +1449,56 @@ class SameRunRecovery:
                 renewal_check()
             self.check(snapshot)
         try:
-            await asyncio.wait_for(self.client.resume(check=checked, refusal_record=self.record), timeout)
+            if grant_context is not None:
+                run, evidence, live = state["run"], state.get("evidence", {}), _live(state)
+                revision, ack = run.get("intent_revision"), evidence.get("accepted_host_action") or {}
+                stamp, remaining = ack.get("acquired_at_monotonic_s"), run.get("remaining_s")
+                event = _latest_run_event(state, grant_context["identity"])
+                if (run.get("status") != "paused" or run.get("recovery") is not None
+                    or type(revision) is not int
+                    or not all(evidence.get(k) is True for k in
+                               ("feedback", "required_observation", "hold_acknowledged", "pose_aligned", "native_ack"))
+                    or evidence.get("active_acknowledged") is not False
+                    or type(evidence.get("acknowledged_intent_revision")) is not int
+                    or evidence["acknowledged_intent_revision"] != revision
+                    or ack.get("run_id") != run["run_id"] or ack.get("host_incarnation") != run["backend_incarnation"]
+                    or ack.get("state") != "paused" or type(ack.get("intent_revision")) is not int
+                    or ack["intent_revision"] != revision
+                    or type(live.get("cursor_intent_revision")) is not int or live["cursor_intent_revision"] != revision
+                    or live.get("required_view", {}).get("qualified") is not True
+                    or any(type(value) not in (int, float) or not math.isfinite(value)
+                           for value in (stamp, remaining, event.get("at")))
+                    or not run["native_live_at"] <= event["at"] <= stamp
+                    or stamp + remaining > run["deadline"]):
+                    raise RuntimeError("fresh grant rejoin held/current-view proof unavailable")
+                identity = self.client.identities()
+                checked(state)
+                budget = local_ceiling - time.monotonic()
+                if budget <= 0:
+                    raise TimeoutError("original grant rejoin ceiling exhausted")
+                connected = await asyncio.wait_for(self.client.command(dict(op="connect", **identity)), budget)
+                generation, replacement = connected.get("connection_generation"), connected.get("snapshot")
+                self.check(replacement)
+                if (type(generation) is not str or str(UUID(generation)) != generation
+                    or generation == identity["connection_generation"]
+                    or replacement["run"].get("status") != "paused"
+                    or type(replacement["run"].get("intent_revision")) is not int
+                    or replacement["run"]["intent_revision"] != state["run"]["intent_revision"] + 1
+                    or replacement["run"].get("recovery") is not None
+                    or _latest_run_event(replacement, identity) != _latest_run_event(state, identity)):
+                    raise RuntimeError("new grant connection generation/revision ACK unavailable")
+                self.client.connection, self.client.snapshot, self.client.sequence = generation, replacement, 0
+                checked(replacement)
+                self.record({"event": "leader_grant_connection_fenced", "connection_generation": generation,
+                             "previous_connection_generation": identity["connection_generation"],
+                             "intent_revision": replacement["run"]["intent_revision"]})
+                budget = local_ceiling - time.monotonic()
+                if budget <= 0:
+                    raise TimeoutError("original grant rejoin ceiling exhausted")
+                await asyncio.wait_for(SessionClient._resume_connected(
+                    self.client, check=checked, connect_identity=identity, refusal_record=self.record), budget)
+            else:
+                await asyncio.wait_for(self.client.resume(check=checked, refusal_record=self.record), timeout)
         except _ResumePausedError as outcome:
             self.check(self.client.snapshot)
             outcome.episode = episode if recovered else None
@@ -1357,6 +1506,8 @@ class SameRunRecovery:
                 renewal_check()
             raise
         except (ConnectionError, TimeoutError) as original:
+            if grant_context is not None:
+                raise  # A nested ambiguous phase never starts another replacement.
             accepted = getattr(original, "accepted_resume_context", None)
             if accepted is not None:
                 try:
@@ -1660,6 +1811,14 @@ async def send_leader_sample(client, producer, body, record, *, phase, progress_
     """One original grant/acquisition/send. A refused sample is never resent."""
     identity = client.identities()
     grant_started = time.perf_counter()
+    requested, grant_context = time.monotonic(), None
+    snapshot = getattr(client, "snapshot", None)
+    if isinstance(snapshot, dict):
+        # Stateless sender callers keep their original API. Recovery is eligible
+        # only when this original immutable owner snapshot was available.
+        with contextlib.suppress(TypeError, ValueError):
+            grant_context = {"identity": dict(identity), "snapshot": json.loads(json.dumps(snapshot, allow_nan=False)),
+                             "requested": requested}
     try:
         grant = await client.command(dict(op="grant", **identity))
     except CommandRefusedError as error:
@@ -1676,6 +1835,10 @@ async def send_leader_sample(client, producer, body, record, *, phase, progress_
                 "grant_request_started_at_monotonic_s": grant_started,
             }
         )
+        raise
+    except (TimeoutError, ConnectionError) as error:
+        if grant_context is not None:
+            error.grant_context = grant_context
         raise
     received = time.perf_counter()
     frame = await asyncio.to_thread(producer.capture, grant, body=body, grant_received_at=received)
@@ -2043,7 +2206,7 @@ async def run(args):
             duration = args.next_start_seconds or (args.duration_seconds if workload is None else None)
             return None if duration is None else active_at + duration
 
-        async def rejoin(*, require_episode=False, refusal_identity=None, expected_pause=None, until=None):
+        async def rejoin(*, require_episode=False, refusal_identity=None, expected_pause=None, until=None, grant_error=None):
             renewal_healthy()
             if workload:
                 workload.freeze()
@@ -2052,7 +2215,7 @@ async def run(args):
                 require_episode=require_episode,
                 refusal_identity=refusal_identity,
                 expected_pause=expected_pause,
-                renewal_check=renewal_healthy,
+                renewal_check=renewal_healthy, grant_error=grant_error,
             )
             producer.native_cursor = _live(client.snapshot)["cursor"]
             producer.reacquire = True
@@ -2170,6 +2333,11 @@ async def run(args):
                     phase=phase,
                     progress_s=workload.elapsed_s if workload else None,
                 )
+            except (TimeoutError, ConnectionError) as error:
+                if not hasattr(error, "grant_context"):
+                    raise
+                await rejoin(grant_error=error)
+                continue
             except CommandRefusedError as error:
                 mailbox = mailbox_input_refusal(error)
                 if not (recovery_grant_refusal(error) or mailbox):
@@ -2237,11 +2405,19 @@ async def run(args):
                         progress_s=workload.elapsed_s if workload else None,
                     )
             except TimeoutError as error:
+                if hasattr(error, "grant_context") and not attempt_budget.expired():
+                    await rejoin(grant_error=error, until=qualification_at + 2)
+                    continue
                 if attempt_budget.expired():
                     raise RuntimeError(
                         "terminal current native body-zero feedback did not qualify"
                     ) from error
                 raise
+            except ConnectionError as error:
+                if not hasattr(error, "grant_context"):
+                    raise
+                await rejoin(grant_error=error, until=qualification_at + 2)
+                continue
             except CommandRefusedError as error:
                 mailbox = mailbox_input_refusal(error)
                 if not (recovery_grant_refusal(error) or mailbox):

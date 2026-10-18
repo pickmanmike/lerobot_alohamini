@@ -986,6 +986,12 @@ class SessionAuthority:
             "run_id": self.run["run_id"] if self.run else None,
             "service_incarnation": self.service_incarnation,
         }
+        if (kind == "required_hold" and self.run and self.run["recipe"] == TELEOP_RECIPE
+                and isinstance(self.run.get("recovery"), dict)
+                and set(self.run["recovery"]) == {"started", "ceiling", "revision"}):
+            # Retain the original source clock after public qualification clears
+            # run.recovery. This copy is persisted with the existing event.
+            event["recovery"] = dict(self.run["recovery"])
         self.events.append(event)
         self.db.execute("INSERT INTO transitions(data) VALUES (?)", (json.dumps(event),))
         self.db.commit()
