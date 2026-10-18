@@ -16,13 +16,13 @@ PR [#25](https://github.com/pickmanmike/lerobot_alohamini/pull/25), branch `code
 
 | Component | Recorded installed identity |
 | --- | --- |
-| Motor | `c9190b110858e1060daaf849981295cb5b06cba7` |
+| Motor | `5a2e750b9c1f0778fad7c70fbd419a27ddfc9d79` |
 | Runtime | `30263a6c73ba8d76e6b17afc4a45c6a755754ac3` |
 | Camera | `bc3442b54d9c574a8feddb0ade642c9b351e59f9` |
 | Helper/manual | `0fe3997f12b9cdfdd01fda6f4c6b102781252448` |
-| Manifest | `bcdf4ad7a925c21bdcc8d57284554c985deb01aad4f26bf09c73b97a0a926659` |
+| Manifest | `48d4c7fc2fa2ff1227d35d3f296e3e89c1b9f42bc097d7151fb425d4c1c17fc7` |
 
-Immediate full matched predecessor: motor `19bedce59babc4b4b3e12af4d5e9bc21909eee9d`, runtime `30263a6c73ba8d76e6b17afc4a45c6a755754ac3`, same camera/helper, manifest `ad91a57c5add052302d9bd0735d81f82fd8e75add2fc9286056162b935c7cf6f`; full bundles archived before Stage23 upload and older rollback retained. Exact private deployment/permission pointers remain in the current-state reference. Historical original failures are unchanged; later genuine reconciliation and acknowledgment have separately cleared uncertainty.
+Immediate full matched predecessor: motor `c9190b110858e1060daaf849981295cb5b06cba7`, runtime `30263a6c73ba8d76e6b17afc4a45c6a755754ac3`, same camera/helper, manifest `bcdf4ad7a925c21bdcc8d57284554c985deb01aad4f26bf09c73b97a0a926659`; full bundles archived before Stage24 upload and older rollback retained. Actual imports/private permission records remain linked in current state; original failures and later reconciliation/acknowledgment stay separate.
 
 ## Carry-forward decisions
 
@@ -41,4 +41,4 @@ Installed thermal acquisition and pending-pause acknowledgment repairs have part
 
 The normal-relief cadence correction passes318 affected checks/scoped lint/independent review and all ten Stage23 phases. Combined26 correctly refused genuine post-home motion, then cleanup proved a different stationary off rest. One ordinary new Start from that rest passed unchanged guards in Combined27, exercising the50ms relief cadence.
 
-Latest Combined27 reaches255producerframes/24.271active seconds before an ordinary input-expiry sentinel escapes the new interface. All originals/strict audit, fixed reference/workspace/original300s deadline and verified cleanup remain retained, uncertaintyfalse. A `-m` host's `__main__` exception differs from the named host class imported by the shared catch. The narrow correction uses the owner's exact sentinel boundary; its real-entrypoint regression passes11cases after2original failures, and the affected cohort passes335checks/8skips with scoped lint. Independent frozen review is clear; affected staging precedes resuming the original172.5-active-second workload, planned interruption/view switch and supported separate3s next Start. No expiry relaxation, broad catch, replay or new architecture is authorized. Physical USB sampling, human ergonomics and fine precision remain separately unqualified.
+Latest Combined27 reaches255producerframes/24.271active seconds before an ordinary input-expiry sentinel escapes the new interface. All originals/strict audit, fixed reference/workspace/original300s deadline and verified cleanup remain retained, uncertaintyfalse. A `-m` host's `__main__` exception differs from the named host class imported by the shared catch. The narrow correction uses the owner's exact sentinel boundary; its real-entrypoint regression passes11cases after2original failures, and the affected cohort passes335checks/8skips with scoped lint. Independent frozen review is clear and all ten Stage24 stopped/idle phases pass; physical qualification resumes with the original172.5-active-second workload, planned interruption/view switch and supported separate3s next Start. No expiry relaxation, broad catch, replay or new architecture is authorized. Physical USB sampling, human ergonomics and fine precision remain separately unqualified.
