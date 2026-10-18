@@ -2087,3 +2087,35 @@ def test_workspace_rest_box_fresh_passive_pp_is_prospective_seed_not_old_goal():
     assert result["measured_origin_raw"]==1845 and result["admission_version"]==2
     assert (result["corridor_min_raw"],result["corridor_max_raw"])==(1834,1867)
     assert context==original
+
+
+def load_host_as_main(monkeypatch):
+    """Execute the real -m module path, stopping at argument parsing before I/O."""
+    import argparse
+    import runpy
+    import sys
+    from types import SimpleNamespace
+
+    namespace = {}
+
+    class ArgumentsReached(BaseException):
+        pass
+
+    def stop_before_hardware(parser):
+        namespace.update(sys._getframe(1).f_globals)
+        raise ArgumentsReached
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(argparse.ArgumentParser, "parse_args", stop_before_hardware)
+        with pytest.warns(RuntimeWarning, match="found in sys.modules"):
+            with pytest.raises(ArgumentsReached):
+                runpy.run_module(host.__name__, run_name="__main__", alter_sys=True)
+    return SimpleNamespace(**namespace)
+
+
+def test_real_m_host_defines_its_own_expiry_type_before_hardware(monkeypatch):
+    entrypoint = load_host_as_main(monkeypatch)
+    assert entrypoint.AM1LocalControl.apply.__globals__["__name__"] == "__main__"
+    assert entrypoint.AM1LiveInputExpired.__module__ == "__main__"
+    assert entrypoint.AM1LiveInputExpired is not host.AM1LiveInputExpired
+    assert not isinstance(entrypoint.AM1LiveInputExpired(), host.AM1LiveInputExpired)

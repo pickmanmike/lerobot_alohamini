@@ -490,7 +490,10 @@ class AM1LocalControl:
                 self._live_hold(robot)
                 self.state = "stopped"
                 return True
-            return apply_frame(self, robot, command, AM1_LOCAL_CONTROL_KEY)
+            try:
+                return apply_frame(self, robot, command, AM1_LOCAL_CONTROL_KEY)
+            except AM1LiveInputExpired:
+                return False
         if self.live:
             zero_keys = {"x.vel", "y.vel", "theta.vel", "lift_axis.vel"}
             if (self.state != "ready" and self.binding is not None

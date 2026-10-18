@@ -1273,14 +1273,7 @@ def apply_frame(control, robot, command, marker_key):
         action.pop(key, None)
     action.update(original["body"])
     robot._am1_live_before_write = lambda: before_write(control, robot)
-    try:
-        accepted = control._apply_standard(robot, action)
-    except Exception as error:
-        from .alohamini_host import AM1LiveInputExpired
-
-        if isinstance(error, AM1LiveInputExpired):
-            return False
-        raise
+    accepted = control._apply_standard(robot, action)
     if accepted:
         control._live_summary.update(
             state="active",

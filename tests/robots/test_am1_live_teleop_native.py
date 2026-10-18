@@ -410,3 +410,129 @@ def test_actual_second_bus_expiry_clears_prior_body_and_prevents_late_right_writ
         not any(values.values()) for register, values in robot.left_bus.writes if register == "Goal_Velocity"
     )
     assert control.live_snapshot()["body"] == ZERO
+
+
+@pytest.fixture(params=["named", "main"])
+def expiry_host(request, monkeypatch):
+    if request.param == "named":
+        return host
+    from tests.robots.test_am1_live_native import load_host_as_main
+
+    return load_host_as_main(monkeypatch)
+
+
+def real_action_lane(entrypoint):
+    now, identity, binding, robot, _ = lane()
+    control = entrypoint.AM1LocalControl(
+        **identity, live=True, live_recipe="physical-live-teleop", clock=lambda: now[0]
+    )
+    robot.config.max_relative_target = 20.0
+    robot.logs, robot.cameras = {}, {}
+    robot.base_motors = ["base_left_wheel", "base_back_wheel", "base_right_wheel"]
+    robot.wheel_radius, robot.base_radius = 0.05, 0.125
+    robot.lift = SimpleNamespace(apply_action=lambda action: None)
+    robot._gripper_current_limit_ma, robot._joint_current_limit_ma = 500.0, 1800.0
+    robot._gripper_release_margin = robot._joint_release_margin = 1.0
+    robot._gripper_hold_goal, robot._gripper_hold_direction = {}, {}
+    robot._joint_hold_goal, robot._joint_hold_direction = {}, {}
+    robot._gripper_open_direction, robot._gripper_hold_close_step = {}, 3
+    robot.send_action = AlohaMini.send_action.__get__(robot)
+
+    def stop():
+        robot.events.append(("zero",))
+        robot.left_bus.sync_write("Goal_Velocity", dict.fromkeys(robot.base_motors, 0))
+
+    robot.stop_motion = stop
+    return now, identity, binding, robot, control
+
+
+@pytest.mark.parametrize("boundary", ["before_left", "before_right"])
+def test_entrypoint_expiry_holds_without_committing_and_fresh_rejoin_preserves_run(expiry_host, boundary):
+    # Synthetic real-send_action boundary, not a reconstruction of the unlogged expiry instant.
+    now, identity, binding, robot, control = real_action_lane(expiry_host)
+    assert control.apply(robot, frame(identity, binding, 1))
+    now[0] = 10.01
+    assert control.apply(robot, frame(identity, binding, 2, mode="active", epoch=2))
+    original = sample(control)
+    original["body"]["x.vel"] = 0.15
+    now[0] = 10.05
+    assert control.apply(robot, frame(identity, binding, 3, mode="active", epoch=2, sample=original))
+    frozen = control.live_snapshot()
+    accepted_sequence = control.accepted_action_sequence
+    robot.left_bus.writes.clear()
+    robot.right_bus.writes.clear()
+    if boundary == "before_left":
+        previous_read = robot.left_bus.sync_read
+
+        def delayed(register, motors, **kwargs):
+            result = previous_read(register, motors, **kwargs)
+            if register == "Present_Position":
+                now[0] = 10.26
+            return result
+
+        robot.left_bus.sync_read = delayed
+    else:
+        def delayed(register, values):
+            if register == "Goal_Position":
+                now[0] = 10.26
+
+        robot.left_bus.on_write = delayed
+    now[0] = 10.1
+    assert not control.apply(robot, frame(identity, binding, 4, mode="active", epoch=2, sample=original))
+    snapshot = control.live_snapshot()
+    assert control.state == "paused" and snapshot["state"] == "expired"
+    assert robot.events[-2:] == [("zero",), ("hold",)]
+    assert control.live_sample is None and snapshot["body"] == ZERO
+    assert control.accepted_action_sequence == accepted_sequence
+    assert snapshot["last_input_seq"] == frozen["last_input_seq"] == 1
+    assert snapshot["cursor"] == frozen["cursor"]
+    assert snapshot["valid_until_monotonic_s"] == original["valid_until_monotonic_s"]
+    assert not set(host.AM1_LIVE_WRITE_PROOF_FIELDS).intersection(snapshot)
+    assert "accepted_target" not in snapshot
+    assert not any(register == "Goal_Position" for register, _ in robot.right_bus.writes)
+    assert any(register == "Goal_Position" for register, _ in robot.left_bus.writes) == (boundary == "before_right")
+    assert all(not any(values.values()) for register, values in robot.left_bus.writes if register == "Goal_Velocity")
+    if boundary == "before_left":
+        robot.left_bus.sync_read = previous_read
+    robot.left_bus.on_write = None
+    now[0] = 10.3
+    assert control.apply(robot, frame(identity, binding, 5, epoch=3, revision=1))
+    fresh = sample(control, seq=2, expiry=10.55, source_id=original["source"]["source_id"], acquired=1.3)
+    now[0] = 10.35
+    assert control.apply(robot, frame(identity, binding, 6, mode="active", epoch=4, revision=1, sample=fresh))
+    resumed = control.live_snapshot()
+    assert resumed["last_input_seq"] == 2 and resumed["state"] == "active"
+    assert control.binding == identity and control.live_binding == binding
+    for key in ("reference", "workspace", "live_admitted_at_monotonic_s", "live_deadline_monotonic_s"):
+        assert resumed[key] == frozen[key]
+
+
+@pytest.mark.parametrize("fault", ["motor", "hold", "foreign_same_name"])
+def test_entrypoint_expiry_handler_preserves_exact_genuine_fault(expiry_host, fault):
+    now, identity, binding, robot, _ = lane()
+    control = expiry_host.AM1LocalControl(
+        **identity, live=True, live_recipe="physical-live-teleop", clock=lambda: now[0]
+    )
+    assert control.apply(robot, frame(identity, binding, 1))
+    original = sample(control)
+    now[0] = 10.1
+    assert control.apply(robot, frame(identity, binding, 2, mode="active", epoch=2, sample=original))
+    error = (type("AM1LiveInputExpired", (Exception,), {})("foreign")
+             if fault == "foreign_same_name" else RuntimeError(fault + " failed"))
+
+    def fail():
+        raise error
+
+    def send(action):
+        if fault == "hold":
+            now[0] = 10.26
+            robot._am1_live_before_write()
+        raise error
+
+    if fault == "hold":
+        robot.hold_follower_arms = fail
+    robot.send_action = send
+    with pytest.raises(type(error)) as caught:
+        control.apply(robot, frame(identity, binding, 3, mode="active", epoch=2, sample=original))
+    assert caught.value is error
+    assert control.accepted_action_sequence == 2
