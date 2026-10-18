@@ -580,7 +580,99 @@ class SessionClient:
         }
 
     async def claim(self):
-        result = await self.command({"op": "claim"})
+        entered = time.monotonic()
+        ceiling = entered + 1.0
+        before = self.snapshot or {}
+        device, service = self.device, before.get("service_incarnation")
+        old_run, old_controller = before.get("run"), before.get("controller")
+        run_keys = ("run_id", "operation_id", "recipe", "backend_incarnation", "status", "uncertain",
+                    "cleanup", "first_cause", "native_first_cause", "native_live_at", "deadline",
+                    "accepted_at", "startup_deadline", "intent_revision", "execution")
+        run_anchor = {key: old_run[key] for key in run_keys if key in old_run} if isinstance(old_run, dict) else None
+        initial = (self.generation is None and self.connection is None and self.transport_error is None
+                   and self.transport_close is None and self.ws is not None and not self.ws.closed
+                   and (self.reader is None or not self.reader.done()))
+
+        def remaining():
+            budget = ceiling - time.monotonic()
+            if budget <= 0:
+                raise TimeoutError("original initial Claim ceiling expired")
+            return budget
+
+        def owned(snapshot, generation=None):
+            run = snapshot.get("run")
+            controller = snapshot.get("controller") or {}
+            if ("run" not in before or "run" not in snapshot
+                or type(device) is not str or not device or type(service) is not str or not service
+                or self.device != device or snapshot.get("service_incarnation") != service
+                or self.generation is not None or self.connection is not None):
+                raise RuntimeError("initial Claim authority changed")
+            if run_anchor is None:
+                if old_run is not None or run is not None:
+                    raise RuntimeError("initial idle run changed")
+            elif (not set(run_keys) <= set(run_anchor)
+                  or any(type(run_anchor.get(key)) is not str or not run_anchor[key]
+                         for key in ("run_id", "operation_id", "recipe", "backend_incarnation"))
+                  or type(run_anchor.get("intent_revision")) is not int
+                  or not isinstance(run_anchor.get("execution"), dict)
+                  or type(run_anchor["execution"].get("complete")) is not bool
+                  or any(value is not None and (type(value) not in (int, float) or not math.isfinite(value))
+                         for value in (run_anchor.get(key) for key in
+                                       ("native_live_at", "deadline", "accepted_at", "startup_deadline")))
+                  or run_anchor.get("status") not in {"stopped", "faulted", "interrupted"}
+                  or run_anchor.get("cleanup") != "physical_readback_verified"
+                  or run_anchor.get("uncertain") is not False or not isinstance(run, dict)
+                  or {key: run[key] for key in run_keys if key in run} != run_anchor
+                  or any(type(run[key]) is not type(value) for key, value in run_anchor.items())
+                  or type(run["execution"].get("complete")) is not bool):
+                raise RuntimeError("initial known-cleanup terminal run changed")
+            current = controller.get("controller_generation")
+            expiry = controller.get("presence_expires")
+            if (controller.get("device_id") != device or type(current) is not str
+                or str(UUID(current)) != current or type(expiry) not in (int, float)
+                or not math.isfinite(expiry) or expiry <= 0
+                or generation is not None and current != generation
+                or old_controller is not None and (old_controller.get("device_id") != device
+                    or old_controller.get("controller_generation") != current)):
+                raise RuntimeError("current initial Claim generation unavailable")
+            return current
+
+        try:
+            budget = remaining()
+            result = await asyncio.wait_for(self.command({"op": "claim"}), budget)
+        except ConnectionError as original:
+            close = dict(self.transport_close or {})  # Capture before quarantine changes the stream.
+            stamp = close.get("observed_at_monotonic_s")
+            if (not initial or close.get("expected") is not False or close.get("close_code") != 1006
+                or close.get("reason") != "stream-ended" or close.get("reader_error") is not None
+                or type(stamp) not in (int, float) or not math.isfinite(stamp) or stamp < entered):
+                raise
+            try:
+                budget = remaining()
+                await asyncio.wait_for(self.detach(), budget)
+                budget = remaining()
+                fresh = (await asyncio.wait_for(self.get("state"), budget))["snapshot"]
+                generation = owned(fresh)
+                budget = remaining()
+                renewed = await asyncio.wait_for(
+                    self.post("claim", {"controller_generation": generation}), budget)
+                if (renewed.get("accepted") is not True or renewed.get("status") != "claimed"
+                    or renewed.get("controller_generation") != generation
+                    or type(renewed.get("presence_expires")) not in (int, float)
+                    or not math.isfinite(renewed["presence_expires"])):
+                    raise RuntimeError("initial Claim fenced renewal was not acknowledged")
+                budget = remaining()
+                await asyncio.wait_for(self.attach(), budget)
+                owned(self.snapshot, generation)
+                budget = remaining()
+                fresh = (await asyncio.wait_for(self.get("state"), budget))["snapshot"]
+                owned(fresh, generation)
+                if fresh["controller"]["presence_expires"] != renewed["presence_expires"]:
+                    raise RuntimeError("initial Claim renewed authority changed")
+                remaining()
+                result = renewed
+            except (Exception, asyncio.CancelledError) as qualification_error:
+                raise original from qualification_error
         self.generation = result["controller_generation"]
 
     async def renew(self):

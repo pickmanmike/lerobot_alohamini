@@ -3940,3 +3940,263 @@ def test_known_resume_no_pong_requires_new_ordinary_proof_and_original_clocks(mo
                 assert row["operation_id"] == next(c["operation_id"] for c in calls if c["op"] == "resume")
         assert not any(row["event"] == "qualified_native_recovery" for row in records)
     asyncio.run(asyncio.wait_for(scenario(), .6))
+
+
+@pytest.mark.parametrize("existing_owner", [False, True], ids=["new-owned-generation", "same-owned-generation"])
+def test_initial_claim_lost_result_reuses_live_authority_without_replaying_claim(tmp_path, existing_owner):
+    import asyncio
+    import json
+
+    from tests.robots.am1_session_fixture import Cluster
+    from tests.robots.test_am1_session_api import enrolled
+
+    m = adapter()
+    cluster = Cluster(tmp_path / "cluster")
+
+    async def scenario():
+        session = await enrolled(cluster)
+        token = next(cookie.value for cookie in session.cookie_jar if cookie.key == "__Host-am1-device")
+        await session.close()
+        storage = tmp_path / "state.json"
+        storage.write_text(json.dumps({"cookies": [{"name": "__Host-am1-device", "value": token,
+            "domain": "127.0.0.1", "path": "/", "secure": True}]}))
+        client = m.SessionClient(cluster.url, cluster.cert, storage)
+        loss = None
+        try:
+            await client.attach()
+            if existing_owner:
+                prior = await client.post("claim", {})
+                await client.wait(lambda: (client.snapshot.get("controller") or {}).get(
+                    "controller_generation") == prior["controller_generation"], 1)
+            assert client.snapshot["run"] is None and client.generation is None
+            cluster.flags.write_text(json.dumps({"delay_reply": "claim"}))
+            original_close, generation = {}, []
+
+            async def lose_result_after_actual_core_effect():
+                while not cluster.flags.with_suffix(".reply").exists():
+                    await asyncio.sleep(.002)
+                receipt = json.loads(cluster.flags.with_suffix(".reply").read_text())
+                assert receipt["accepted"] is True
+                generation.append(receipt["controller_generation"])
+                assert (await client.get("state"))["snapshot"]["run"] is None
+                client.ws._response.connection.transport.abort()
+                while client.transport_close is None:
+                    await asyncio.sleep(.002)
+                original_close.update(client.transport_close)
+                cluster.flags.with_suffix(".release").write_text("release old result only")
+
+            loss = asyncio.create_task(lose_result_after_actual_core_effect())
+            await client.claim()
+            await loss
+            assert original_close["expected"] is False and original_close["close_code"] == 1006
+            assert original_close["reader_error"] is None and original_close["reason"] == "stream-ended"
+            assert client.generation == generation[0]
+            fresh = (await client.get("state"))["snapshot"]
+            assert fresh["run"] is None
+            assert fresh["controller"]["device_id"] == client.device
+            assert fresh["controller"]["controller_generation"] == generation[0]
+            # A supplied generation is renewal-only in real Core. No second
+            # bare Claim can create authority, and no Start precedes fresh proof.
+            assert sum(v["kind"] == "claim" for v in fresh["events"]) == 1
+            start = await client.post("start", {"operation_id": str(uuid4()),
+                "recipe": "fake-interactive", "controller_generation": client.generation})
+            assert start["accepted"] is True
+            assert (await client.get("state"))["snapshot"]["run"]["run_id"] == start["run_id"]
+        finally:
+            cluster.flags.with_suffix(".release").write_text("finish")
+            if loss is not None and not loss.done():
+                loss.cancel()
+                await asyncio.gather(loss, return_exceptions=True)
+            await client.close()
+
+    try:
+        asyncio.run(asyncio.wait_for(scenario(), 6))
+    finally:
+        cluster.close()
+
+
+@pytest.mark.parametrize("change", [None, "terminal", "accepted", "no_effect", "expired", "foreign", "service", "device",
+    "run", "unsafe", "cause", "clock", "missing_identity", "missing_clock", "complete", "generation_changed", "renew_refused", "renew_lost",
+    "renew_generation", "renew_expiry", "attach_loss", "final_generation", "final_run", "final_lease",
+    "initial_generation", "initial_connection", "reader_error", "timeout", "expected_close", "wrong_close",
+    "wrong_reason", "old_close", "command_precheck", "budget_spent", "spent_09", "attach_budget",
+    "missing_original_run", "missing_fresh_run", "missing_attached_run", "missing_final_run"])
+def test_initial_claim_requalification_preserves_original_error_authority_and_one_second_budget(tmp_path, monkeypatch, change):
+    import asyncio
+    import copy
+    from types import SimpleNamespace
+
+    from tools.am1_fake_executor import FakeExecutor
+    from tools.am1_session_core import SessionAuthority
+
+    m = adapter()
+    pc, pi, calls = [1000.], [100.], []
+    monkeypatch.setattr(m, "time", SimpleNamespace(monotonic=lambda: pc[0]))
+    device, service = str(uuid4()), str(uuid4())
+    authority = SessionAuthority(tmp_path / "authority", clock=lambda: pi[0], executor=FakeExecutor(clock=lambda: pi[0]))
+    authority.service_incarnation = service
+    original = ConnectionError("original pending initial Claim result lost")
+    terminal = {"run_id": str(uuid4()), "operation_id": str(uuid4()), "recipe": "physical-live-teleop",
+        "backend_incarnation": str(uuid4()), "status": "faulted", "uncertain": False, "cleanup": "physical_readback_verified",
+        "first_cause": "feedback_loss", "native_first_cause": "retained actual first cause", "native_live_at": None,
+        "deadline": None, "accepted_at": 90., "startup_deadline": 270., "intent_revision": 2, "execution": {"complete": False}}
+    terminal_case = change in {"terminal", "unsafe", "cause", "clock", "missing_identity", "missing_clock", "complete"}
+    if change == "unsafe":
+        terminal["uncertain"] = True
+    if change == "missing_identity":
+        terminal.pop("run_id")
+    if change == "missing_clock":
+        terminal.pop("deadline")
+    if change == "generation_changed":
+        authority.handle({"op": "claim"}, device)
+
+    def snapshot():
+        value = authority.handle({"op": "snapshot"}, device)["snapshot"]
+        if terminal_case:
+            value["run"] = copy.deepcopy(terminal)  # Explicit synthetic known-cleanup last-run fields.
+        return value
+
+    client = m.SessionClient.__new__(m.SessionClient)
+    client.snapshot = snapshot()
+    if change == "missing_original_run":
+        client.snapshot.pop("run")
+    client.device, client.generation, client.connection = device, None, None
+    client.transport_error = client.transport_close = None
+    client.ws, client.reader = SimpleNamespace(closed=False), None
+    if change == "initial_generation":
+        client.generation = str(uuid4())
+    if change == "initial_connection":
+        client.connection = str(uuid4())
+    if change == "command_precheck":
+        client.transport_error = "already closed before command entry"
+    generation, get_count = [], [0]
+
+    async def command(command):
+        calls.append(("command", copy.deepcopy(command)))
+        assert command == {"op": "claim"}
+        if change != "no_effect":
+            receipt = authority.handle(command, device)
+            generation.append(receipt["controller_generation"])
+        if change == "accepted":
+            return receipt
+        pc[0] += 1.01 if change == "budget_spent" else .9 if change == "spent_09" else .02
+        if change == "expired":
+            pi[0] += 1.6
+        if change == "foreign":
+            authority.controller["device_id"] = str(uuid4())
+        if change == "generation_changed":
+            authority.controller["generation"] = str(uuid4())
+        client.transport_error = "current WSS connection ended: stream-ended"
+        client.transport_close = {"expected": False, "close_code": 1006, "reason": "stream-ended", "reader_error": None,
+            "exception_type": "ClientConnectionResetError", "exception": "Cannot write to closing transport",
+            "observed_at_monotonic_s": pc[0]}
+        if change == "reader_error":
+            client.transport_close["reader_error"] = {"error_type": "RuntimeError", "message": "reporting"}
+        if change == "expected_close":
+            client.transport_close["expected"] = True
+        if change == "wrong_close":
+            client.transport_close["close_code"] = 1008
+        if change == "wrong_reason":
+            client.transport_close["reason"] = "message-error"
+        if change == "old_close":
+            client.transport_close["observed_at_monotonic_s"] = 999.
+        if change == "timeout":
+            raise TimeoutError("initial Claim result timeout is not classified stream loss")
+        raise original
+
+    async def detach():
+        calls.append(("detach", None))
+        client.snapshot = None
+        client.ws = client.reader = None
+
+    async def get(path):
+        calls.append(("get", path))
+        assert path == "state"
+        get_count[0] += 1
+        pc[0] += .11 if change == "spent_09" else .01
+        if change == "final_lease" and get_count[0] == 2:
+            pi[0] += 1.6
+        value = snapshot()
+        if change == "service":
+            value["service_incarnation"] = str(uuid4())
+        if change == "device":
+            client.device = str(uuid4())
+        if change == "run" or change == "final_run" and get_count[0] == 2:
+            value["run"] = dict(terminal, run_id=str(uuid4()), status="starting")
+        if change == "cause":
+            value["run"]["native_first_cause"] = "changed first cause"
+        if change == "clock":
+            value["run"]["startup_deadline"] += 1
+        if change == "complete":
+            value["run"]["execution"]["complete"] = True
+        if change == "missing_fresh_run" or change == "missing_final_run" and get_count[0] == 2:
+            value.pop("run")
+        return {"snapshot": value}
+
+    async def post(path, body):
+        calls.append(("post", (path, copy.deepcopy(body))))
+        assert path == "claim" and body == {"controller_generation": generation[0]}
+        assert client.generation is None  # No authority/Start publication before the final fresh proof.
+        pc[0] += .01
+        if change == "renew_refused":
+            pi[0] += 1.6
+        if change == "renew_lost":
+            raise TimeoutError("generation-fenced renewal outcome unavailable")
+        result = authority.handle(dict(op="claim", **body), device)
+        if result["accepted"] is not True:
+            raise m.HTTPOutcomeError(200, result)
+        if change == "renew_generation":
+            result["controller_generation"] = str(uuid4())
+        if change == "renew_expiry":
+            result["presence_expires"] = float("nan")
+        return result
+
+    async def attach():
+        calls.append(("attach", None))
+        assert client.snapshot is None and client.generation is None
+        if change == "attach_loss":
+            raise ConnectionError("fresh initial stream interrupted")
+        pc[0] += .95 if change == "attach_budget" else .01
+        if change == "final_generation":
+            authority.controller["generation"] = str(uuid4())
+        client.transport_error = client.transport_close = None
+        client.ws = SimpleNamespace(closed=False)
+        client.snapshot = snapshot()
+        if change == "missing_attached_run":
+            client.snapshot.pop("run")
+
+    client.command, client.detach, client.get, client.post, client.attach = command, detach, get, post, attach
+
+    async def scenario():
+        if change in {None, "terminal", "accepted"}:
+            await client.claim()
+            assert client.generation == generation[0] and pc[0] < 1001.
+            assert [v[0] for v in calls] == (["command"] if change == "accepted" else
+                ["command", "detach", "get", "post", "attach", "get"])
+        elif change == "timeout":
+            with pytest.raises(TimeoutError, match="initial Claim result timeout"):
+                await client.claim()
+            assert [v[0] for v in calls] == ["command"]
+        else:
+            with pytest.raises(ConnectionError) as caught:
+                await client.claim()
+            assert caught.value is original
+            assert client.generation is None or change == "initial_generation"
+            if change in {"initial_generation", "initial_connection", "reader_error", "expected_close",
+                          "wrong_close", "wrong_reason", "old_close", "command_precheck"}:
+                assert [v[0] for v in calls] == ["command"]
+            if change == "budget_spent":
+                assert isinstance(original.__cause__, TimeoutError) and len(calls) == 1
+            if change == "spent_09":
+                assert isinstance(original.__cause__, TimeoutError)
+                assert [v[0] for v in calls] == ["command", "detach", "get"]
+            if change == "attach_budget":
+                assert isinstance(original.__cause__, TimeoutError) and pc[0] < 1001.02
+        assert sum(op == "command" for op, _ in calls) == 1
+        assert sum(op == "post" for op, _ in calls) <= 1
+        assert authority.run is None  # No Start, Resume, input, or motor work at this entrypoint.
+
+    try:
+        asyncio.run(asyncio.wait_for(scenario(), .5))
+    finally:
+        authority.close()
