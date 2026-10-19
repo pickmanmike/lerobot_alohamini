@@ -1478,6 +1478,94 @@ class SameRunRecovery:
                      "previous_generation": old, "elapsed_seconds": time.monotonic() - entered,
                      "snapshot": fresh})
 
+    async def finish_bench(self, *, wall_deadline, renewal_check):
+        """End completed bench intent; a Pause receipt alone never proves Native HOLD."""
+        entered = time.monotonic()
+        async with asyncio.timeout(max(0, wall_deadline - entered)):
+            before = (await self.client.get("state"))["snapshot"]
+            self.client.snapshot = before
+            self.check(before)
+            run, live = before["run"], _live(before)
+            intent = run.get("control_intent") or {}
+            remaining = run.get("remaining_s")
+            if (run.get("bench_continuity") is not True or run.get("status") not in {"running", "paused"}
+                or run.get("recovery") is not None or intent.get("eligible") is not True
+                or intent.get("device_id") != self.client.device
+                or intent.get("controller_generation") != self.client.generation
+                or intent.get("service_incarnation") != self.original["service"]
+                or intent.get("start_operation_id") != run.get("operation_id")
+                or type(run.get("intent_revision")) is not int
+                or type(remaining) not in (int, float) or not math.isfinite(remaining) or remaining <= 0):
+                raise RuntimeError("current uncancelled bench finish authority unavailable")
+            prior_event = _latest_run_event(before, self.client.identities())
+            if prior_event and prior_event.get("kind") not in {"resumed", "input_expired", "native_input_expired", "required_view_expired"}:
+                raise RuntimeError("current bench intent was superseded before finishing")
+            ceiling = min(wall_deadline, entered + remaining)
+            revision, lower = run["intent_revision"] + 1, run["deadline"] - remaining
+            old_epoch = (before.get("evidence", {}).get("accepted_host_action") or {}).get("epoch")
+            request = {"run_id": run["run_id"], "operation_id": str(uuid4())}
+            expected_intent = dict(intent, eligible=False, invalidated_by="pause")
+            def budget():
+                renewal_check()
+                value = ceiling - time.monotonic()
+                if value <= 0:
+                    raise TimeoutError("original bench finishing ceiling exhausted")
+                return value
+            self.record({"event": "bench_finish_pause_requested", "operation_id": request["operation_id"],
+                         "identity": self.client.identities(), "expected_intent_revision": revision,
+                         "original_ceiling_monotonic_s": ceiling})
+            receipt = await asyncio.wait_for(self.client.post("pause", request), budget())
+            if (receipt.get("accepted") is not True or receipt.get("status") != "paused"
+                or receipt.get("uncertain", False) is not False or receipt.get("effect_admitted") is not False):
+                raise RuntimeError("own bench Pause did not receive a definite paused acknowledgement")
+            self.record({"event": "bench_finish_pause_acknowledged", "operation_id": request["operation_id"],
+                         "receipt": receipt, "expected_intent_revision": revision})
+            while True:
+                state = (await asyncio.wait_for(self.client.get("state"), budget()))["snapshot"]
+                self.client.snapshot = state
+                self.check(state)
+                current, evidence, live = state["run"], state.get("evidence", {}), _live(state)
+                event, ack = _latest_run_event(state, self.client.identities()), evidence.get("accepted_host_action") or {}
+                native_remaining = current.get("remaining_s")
+                if (current.get("status") != "paused" or current.get("recovery") is not None
+                    or type(current.get("intent_revision")) is not int or current["intent_revision"] != revision
+                    or current.get("control_intent") != expected_intent
+                    or set(event) != {"kind", "at", "run_id", "service_incarnation"} or event.get("kind") != "pause"
+                    or type(event.get("at")) not in (int, float) or not math.isfinite(event["at"])
+                    or not lower <= event["at"] < run["deadline"]
+                    or type(native_remaining) not in (int, float) or not math.isfinite(native_remaining)
+                    or not 0 < native_remaining <= remaining):
+                    raise RuntimeError("own bench Pause authority/revision was superseded")
+                remaining = native_remaining
+                current_ack = (ack.get("run_id") == run["run_id"] and ack.get("host_incarnation") == run["backend_incarnation"]
+                    and type(ack.get("intent_revision")) is int and ack["intent_revision"] == revision
+                    and ack.get("state") == "paused" and type(ack.get("epoch")) is int
+                    and type(old_epoch) is int and ack["epoch"] > old_epoch
+                    and type(ack.get("acquired_at_monotonic_s")) in (int, float)
+                    and event["at"] <= ack["acquired_at_monotonic_s"] <= run["deadline"] - native_remaining
+                    and live.get("cursor_intent_revision") == revision
+                    and type(evidence.get("acknowledged_intent_revision")) is int
+                    and evidence["acknowledged_intent_revision"] == revision)
+                if current_ack:
+                    body = live.get("body") or {}
+                    if (set(body) != set(ZERO_BODY)
+                        or not all(type(body[key]) in (int, float) and body[key] == 0 for key in ZERO_BODY)
+                        or ack.get("accepted_action") != {"mode": "raw_goal_hold", "body_velocity": 0.0}):
+                        raise RuntimeError("current native held zero body command unavailable")
+                    if (all(evidence.get(key) is True for key in
+                            ("feedback", "native_ack", "hold_acknowledged", "pose_aligned", "required_observation"))
+                        and evidence.get("active_acknowledged") is False and _view_admitted(state)):
+                        measured = evidence.get("measured_body") or {}
+                        if not all(type(measured.get(key)) in (int, float) and math.isfinite(measured[key]) for key in ZERO_BODY):
+                            raise RuntimeError("current native held body feedback unavailable")
+                        proof = {"snapshot": state, "pause_operation_id": request["operation_id"], "pause_receipt": receipt,
+                                 "native_held_qualified": True, "zero_body_command": True,
+                                 "measured_body_exact_zero": all(measured[key] == 0 for key in ZERO_BODY)}
+                        self.record({"event": "bench_finish_hold_qualified", **proof,
+                                     "original_ceiling_monotonic_s": ceiling})
+                        return proof
+                await asyncio.sleep(min(.03, budget()))
+
     def history_qualified(self, state):
         run = state.get("run") or {}
         return run.get("first_cause") == self.cause and run.get("recovery_episodes") == self.episodes
@@ -2735,6 +2823,11 @@ async def run(args):
         "workload_segment": segment,
         "view_policy": "advisory_presentation" if bench else "required_presentation",
         "terminal_qualification_budget_seconds": terminal_budget,
+        "terminal_completion_policy": "owned_pause_native_hold_after_program_complete" if bench else "current_active_source_exact_body_zero",
+        "finish_qualified": False,
+        "native_held_qualified": False,
+        "zero_body_command": None,
+        "measured_body_exact_zero": None,
     }
     renewal_counts = {"accepted": 0, "failed": 0, "cancelled": 0, "max_roundtrip_seconds": 0.0}
 
@@ -2799,6 +2892,7 @@ async def run(args):
             {"event": "start_requested", "operation_id": start_body["operation_id"], "recipe": TELEOP_RECIPE,
              "bench_continuity": bench, "view_policy": summary["view_policy"], "workload_segment": segment,
              "terminal_qualification_budget_seconds": terminal_budget,
+             "terminal_completion_policy": summary["terminal_completion_policy"],
              "program_active_seconds": {"full": 172.5, "combined": 12., "body": 4.5, "continuity": 24.}[segment],
              "controller_interruption": controller_gap, "interruption_at_seconds": getattr(args, "interrupt_at_seconds", None),
              "interruption_seconds": getattr(args, "interruption_seconds", .65)}
@@ -3355,7 +3449,18 @@ async def run(args):
         qualification_ceiling = qualification_at + min(terminal_budget, native_remaining)
         record({"event": "terminal_qualification_started", "budget_seconds": terminal_budget,
                 "original_ceiling_monotonic_s": qualification_ceiling, "native_remaining_s": native_remaining})
-        while True:
+        summary["producer_program_complete"] = bool(workload and workload.complete)
+        held_finish = bench and summary["producer_program_complete"]
+        if held_finish:
+            # No new motion is needed after the declared program has completed.
+            # Own Pause cancels that intent; only current Native HOLD proof can
+            # qualify finishing. Ordinary Stop/readback remains separate below.
+            proof = await recovery.finish_bench(wall_deadline=qualification_ceiling, renewal_check=renewal_healthy)
+            final = proof["snapshot"]
+            summary.update({key: proof[key] for key in
+                            ("pause_operation_id", "pause_receipt", "native_held_qualified",
+                             "zero_body_command", "measured_body_exact_zero")})
+        while not held_finish:
             remaining = qualification_ceiling - time.monotonic()
             if remaining <= 0:
                 raise RuntimeError("terminal current native body-zero feedback did not qualify")
@@ -3439,7 +3544,10 @@ async def run(args):
             phases_completed=sorted(workload.phases_completed) if workload else [],
             producer_program_complete=bool(workload and workload.complete),
             final_native_ack=final,
-            final_body_zero=True,
+            final_body_zero=summary["measured_body_exact_zero"] if held_finish else True,
+            zero_body_command=True,
+            measured_body_exact_zero=summary["measured_body_exact_zero"] if held_finish else True,
+            finish_qualified=True,
             interrupted=interrupted,
             qualified_recoveries=recovery.pause_recoveries,
             qualified_native_recovery_episodes=recovery.completed_episodes,
@@ -3456,7 +3564,8 @@ async def run(args):
         if workload:
             workload.freeze()
             summary.update(
-                active_progress_s=workload.elapsed_s, phases_completed=sorted(workload.phases_completed)
+                active_progress_s=workload.elapsed_s, phases_completed=sorted(workload.phases_completed),
+                producer_program_complete=bool(workload.complete),
             )
         summary["frame_count"] = frame_count
         if recovery:
@@ -3550,6 +3659,9 @@ async def run(args):
                 raise TimeoutError("native cleanup did not qualify")
 
             await cleanup_step("native_stop", stop_owned_run, 89.0)
+            summary["physical_register_off_readback_verified"] = (
+                summary.get("native_cleanup_uncertain") is False
+                and (summary.get("native_terminal", {}).get("run") or {}).get("cleanup") == "physical_readback_verified")
         if isinstance(source, USBLeaderSource):
             await cleanup_step("usb_leader_close", lambda: asyncio.to_thread(source.close), 3.0)
         if keyboard is not None:

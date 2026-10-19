@@ -684,6 +684,7 @@ def test_real_wss_clean_close_ends_qualified_wait_before_timeout(tmp_path):
         "bench_terminal_hold_rejoin", "bench_terminal_hold_pause", "bench_terminal_hold_takeover",
         "bench_terminal_hold_stopped", "bench_terminal_hold_cancel", "bench_terminal_hold_budget",
         "bench_terminal_hold_native_ceiling",
+        "bench_program_finish", "bench_program_finish_failed",
     ],
 )
 def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id(
@@ -697,10 +698,11 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
     production_post = m.SessionClient.post
     initial_pause_case = failure == "initial_resume_pause"
     terminal_hold = isinstance(failure, str) and failure.startswith("bench_terminal_hold_")
+    program_finish = failure in {"bench_program_finish", "bench_program_finish_failed"}
     bench_case = failure in {"bench_input_gap", "bench_controller_gap", "bench_renewal_during_resume", "bench_renewal_attach_ceiling", "bench_renewal_snapshot_race",
                              "bench_input_receipt_unknown", "bench_input_receipt_pause", "bench_input_receipt_takeover", "bench_input_receipt_terminal",
                              "bench_terminal_ack_delayed", "bench_terminal_ack_missing", "bench_terminal_ack_cancel",
-                             "bench_terminal_ack_stopped", "bench_terminal_ack_pause", "bench_terminal_ack_takeover"} or terminal_hold
+                             "bench_terminal_ack_stopped", "bench_terminal_ack_pause", "bench_terminal_ack_takeover"} or terminal_hold or program_finish
     ack_wait_case = isinstance(failure, str) and failure.startswith("bench_terminal_ack_")
     input_unknown = isinstance(failure, str) and failure.startswith("bench_input_receipt_")
     http_start = failure is not None and failure.startswith("http_start_")
@@ -757,6 +759,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
             self.device, self.connection = "device", "connection"
             self.starts = self.closed = self.saw_foreign = 0
             self.stops = []
+            self.pauses = []
             self.start_requests = []
             self.cleanup_reads = 0
             self.inputs = []
@@ -939,6 +942,22 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                     assert payload == {"controller_generation": self.generation}
                     generation = self.generation
                 return {"accepted": True, "status": "claimed", "controller_generation": generation}
+            if program_finish and op == "pause":
+                self.pauses.append(copy.deepcopy(payload))
+                current = self.snapshot
+                revision = current["run"]["intent_revision"] + 1
+                now = current["run"]["deadline"] - current["run"]["remaining_s"]
+                current["run"].update(status="paused", intent_revision=revision, recovery=None)
+                current["run"]["control_intent"].update(eligible=False, invalidated_by="pause")
+                current["run"]["live_input"].update(body=dict(m.ZERO_BODY), cursor_intent_revision=revision)
+                current["evidence"].update(active_acknowledged=False, acknowledged_intent_revision=revision)
+                current["evidence"]["accepted_host_action"].update(state="paused", intent_revision=revision,
+                    epoch=2, acquired_at_monotonic_s=now, accepted_action={"mode": "raw_goal_hold", "body_velocity": 0.})
+                current["evidence"]["measured_body"].update({"lift_axis.vel": -50, "theta.vel": .5859375})
+                current["events"] = [{"kind": "pause", "at": now, "run_id": owned_id, "service_incarnation": "service"}]
+                if failure.endswith("failed"):
+                    current["evidence"]["fault"] = "Native held qualification unavailable"
+                return {"accepted": True, "status": "paused", "effect_admitted": False}
             assert op == "stop"
             self.stops.append(payload["run_id"])
             if failure == "stop":
@@ -990,6 +1009,8 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                             "service_incarnation": "service", "start_operation_id": self.start_requests[0]["operation_id"]})
                     if failure == "bench_renewal_attach_ceiling":
                         self.snapshot["run"]["remaining_s"] = .02
+                    if program_finish:
+                        self.snapshot["evidence"]["accepted_host_action"].update(epoch=1, acquired_at_monotonic_s=1.)
                 if failure in prelive:
                     self.snapshot["run"].update(
                         status="faulted",
@@ -1215,7 +1236,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 self.snapshot["events"] = [
                     {"kind": "input_expired", "at": 2.0, "run_id": owned_id, "service_incarnation": "service"}
                 ]
-            if (failure == "bench_input_receipt_terminal" or ack_wait_case or terminal_hold) and len(self.inputs) == 1:
+            if (failure == "bench_input_receipt_terminal" or ack_wait_case or terminal_hold or program_finish) and len(self.inputs) == 1:
                 await asyncio.sleep(.03)  # Cross the Windows monotonic tick before terminal qualification.
                 if failure == "bench_terminal_ack_missing":
                     self.snapshot["run"]["remaining_s"] = 2.  # The new declared bench finish budget remains Native-clipped.
@@ -1339,7 +1360,36 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
         args.source, args.next_start_seconds, args.duration_seconds = "virtual-leaders", None, .001
         args.bench_continuity, args.workload_segment = True, "combined"
         args.interrupt_controller = failure == "bench_controller_gap"
-        args.interrupt_at_seconds, args.interruption_seconds = (None if input_unknown or ack_wait_case or terminal_hold or failure in {"bench_renewal_during_resume", "bench_renewal_attach_ceiling"} else 0.), .001
+        args.interrupt_at_seconds, args.interruption_seconds = (None if input_unknown or ack_wait_case or terminal_hold or program_finish or failure in {"bench_renewal_during_resume", "bench_renewal_attach_ceiling"} else 0.), .001
+        if program_finish:
+            from examples.alohamini import am1_teleop_workload
+            original_workload = am1_teleop_workload.TeleopWorkload
+            class ShortProgramme(original_workload):
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+                    self.duration_s = .001  # Reporting seam only; real Native held proof is exercised below.
+            monkeypatch.setattr(am1_teleop_workload, "TeleopWorkload", ShortProgramme)
+            if failure.endswith("failed"):
+                with pytest.raises(RuntimeError, match="Native held qualification unavailable"):
+                    asyncio.run(asyncio.wait_for(m.run(args), 10))
+                summary = json.loads((tmp_path / "evidence/summary.json").read_text())
+            else:
+                summary = asyncio.run(asyncio.wait_for(m.run(args), 10))
+                assert summary["native_held_qualified"] is True and summary["zero_body_command"] is True
+                assert summary["measured_body_exact_zero"] is False and summary["final_body_zero"] is False
+            session = instances[0]
+            records = [json.loads(line) for line in (tmp_path / "evidence/frames.jsonl").read_text().splitlines()]
+            start = next(row for row in records if row["event"] == "start_requested")
+            assert start["terminal_completion_policy"] == "owned_pause_native_hold_after_program_complete"
+            assert summary["producer_program_complete"] is True and summary["native_execution_complete"] is False
+            assert summary["finish_qualified"] is (not failure.endswith("failed"))
+            assert summary["physical_register_off_readback_verified"] is True
+            assert session.starts == 1 and session.stops == [owned_id] and session.resumes == 1
+            assert len(session.inputs) == len(session.pauses) == 1
+            if not failure.endswith("failed"):
+                assert summary["pause_operation_id"] == session.pauses[0]["operation_id"]
+            assert not any(row.get("phase") == "terminal_zero_qualification" for row in records)
+            return
         if terminal_hold:
             if failure.endswith(("rejoin", "budget")):
                 summary = asyncio.run(asyncio.wait_for(m.run(args), 10))
@@ -2153,7 +2203,7 @@ def test_original_recovery_ceiling_includes_authenticated_read_time_without_rean
     asyncio.run(asyncio.wait_for(scenario(), 0.3))
 
 
-@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_view_reconnect", "grant_view_switch", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "held_qualification_loss", "resume_alignment_refusal", "resume_alignment_refused_twice", "runner_initial_cursor_pending", "resume_reply_timeout_pre", "resume_reply_timeout_post", "acquisition_input_pause", "receipt_ack_starvation", "ack_never_returns", "ack_close_cancel", "transport_blackout_hb1", "transport_blackout_hb2", "transport_blackout_long", "initial_ack_timely", "initial_ack_missing", "connect_receipt_fast", "connect_receipt_delayed", "connect_receipt_missing", "connect_receipt_late", "connect_receipt_caller_ceiling", "connect_receipt_input", "connect_receipt_grant", "renew_receipt_cost", "renew_receipt_cost_expired", "bench_reacquire", "bench_reacquire_receipt_lost", "bench_reacquire_receipt_cancelled", "bench_input_receipt_unknown_native", "bench_input_receipt_unknown_pause", "grant_close_timeout", "grant_close_timeout_pause", "grant_close_timeout_takeover", "grant_close_timeout_cancel", "resume_send_pre", "resume_send_post", "resume_send_pause", "resume_send_takeover", "resume_send_stop", "resume_send_cancel", "resume_send_budget", "resume_send_reboot"])
+@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_view_reconnect", "grant_view_switch", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "held_qualification_loss", "resume_alignment_refusal", "resume_alignment_refused_twice", "runner_initial_cursor_pending", "resume_reply_timeout_pre", "resume_reply_timeout_post", "acquisition_input_pause", "receipt_ack_starvation", "ack_never_returns", "ack_close_cancel", "transport_blackout_hb1", "transport_blackout_hb2", "transport_blackout_long", "initial_ack_timely", "initial_ack_missing", "connect_receipt_fast", "connect_receipt_delayed", "connect_receipt_missing", "connect_receipt_late", "connect_receipt_caller_ceiling", "connect_receipt_input", "connect_receipt_grant", "renew_receipt_cost", "renew_receipt_cost_expired", "bench_reacquire", "bench_reacquire_receipt_lost", "bench_reacquire_receipt_cancelled", "bench_input_receipt_unknown_native", "bench_input_receipt_unknown_pause", "grant_close_timeout", "grant_close_timeout_pause", "grant_close_timeout_takeover", "grant_close_timeout_cancel", "resume_send_pre", "resume_send_post", "resume_send_pause", "resume_send_takeover", "resume_send_stop", "resume_send_cancel", "resume_send_budget", "resume_send_reboot", "bench_finish_hold", "bench_finish_no_ack", "bench_finish_stale_revision", "bench_finish_body_nonzero", "bench_finish_fault", "bench_finish_external_pause", "bench_finish_stop", "bench_finish_takeover", "bench_finish_reboot", "bench_finish_cancel", "bench_finish_pause_unknown", "bench_finish_budget", "bench_finish_native_ceiling", "bench_finish_strict"])
 def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(tmp_path, monkeypatch, cause):
     import asyncio
     import copy
@@ -2268,7 +2318,7 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
         gateway = Gateway(owner.directory, tmp_path / "auth")
         enrolled = gateway.auth.enroll(gateway.auth.pair(control=True))
         a.controller["device_id"] = a.connection["device_id"] = enrolled["device_id"]
-        if cause.startswith(("bench_reacquire", "bench_input_receipt_unknown", "grant_close_timeout", "resume_send_")):
+        if cause.startswith(("bench_reacquire", "bench_input_receipt_unknown", "grant_close_timeout", "resume_send_", "bench_finish_")):
             a.run.update(bench_continuity=True, control_intent={"eligible": True,
                 "device_id": enrolled["device_id"], "controller_generation": ids["controller_generation"],
                 "service_incarnation": a.service_incarnation, "start_operation_id": a.run["operation_id"]})
@@ -3183,6 +3233,96 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                     qualification.cancel()
                     renewal.cancel()
                     await asyncio.gather(qualification, renewal, return_exceptions=True)
+                return
+            if cause.startswith("bench_finish_"):
+                original_evidence, original_post, original_hold = e.evidence, client.post, e.hold
+                pauses = []
+                def held():
+                    epoch[0] += 1  # Explicit fake Native acceptance of a NEW hold action epoch.
+                    return original_hold()
+                e.hold = held
+                def final_evidence():
+                    value = original_evidence()
+                    value["measured_body"].update({"lift_axis.vel": -50, "theta.vel": .5859375,
+                                                   "y.vel": .002556634646476069})
+                    value["live_input"]["body"] = dict(m.ZERO_BODY)
+                    value["accepted_host_action"]["accepted_action"] = (
+                        {"mode": "raw_goal_hold", "body_velocity": 0.0} if e.desired != "active" else dict(m.ZERO_BODY))
+                    if pauses:
+                        if cause == "bench_finish_no_ack":
+                            value["hold_acknowledged"] = False
+                        elif cause == "bench_finish_stale_revision":
+                            value["accepted_host_action"]["intent_revision"] -= 1
+                        elif cause == "bench_finish_body_nonzero":
+                            value["live_input"]["body"]["x.vel"] = .1
+                        elif cause == "bench_finish_fault":
+                            value["fault"] = "actual hard native fault"
+                    return value
+                e.evidence = final_evidence
+                async def post(path, body):
+                    if path != "pause":
+                        return await original_post(path, body)
+                    pauses.append(copy.deepcopy(body))
+                    if cause in {"bench_finish_budget", "bench_finish_native_ceiling"}:
+                        await asyncio.sleep(.3)
+                    result = await original_post(path, body)
+                    if cause == "bench_finish_pause_unknown":
+                        raise TimeoutError("own Pause accepted; receipt unavailable")
+                    if cause == "bench_finish_cancel":
+                        raise asyncio.CancelledError("cancelled before own Pause qualification")
+                    if cause == "bench_finish_external_pause":
+                        assert a.handle({"op": "pause", "run_id": a.run["run_id"],
+                                         "operation_id": str(uuid4())}, enrolled["device_id"])["accepted"]
+                    elif cause == "bench_finish_stop":
+                        assert a.handle({"op": "stop", "run_id": a.run["run_id"],
+                                         "operation_id": str(uuid4())}, enrolled["device_id"])["accepted"]
+                    elif cause == "bench_finish_takeover":
+                        a.controller["expires"] = 9.9
+                        a._expire_controls(10.)
+                        assert a.handle({"op": "claim"}, "competitor")["accepted"]
+                    elif cause == "bench_finish_reboot":
+                        a.service_incarnation = str(uuid4())
+                    return result
+                client.post = post
+                if cause == "bench_finish_strict":
+                    a.run["bench_continuity"] = False
+                if cause == "bench_finish_native_ceiling":
+                    a.clock = e.clock = lambda: 308.9
+                    a.controller["expires"] = 314.9
+                renewal = asyncio.create_task(client.renew())
+                def healthy_renewal():
+                    if renewal.done():
+                        renewal.result()
+                        raise RuntimeError("original renewal ended")
+                entered = m.time.monotonic()
+                try:
+                    if cause == "bench_finish_hold":
+                        proof = await guard.finish_bench(wall_deadline=entered + 12, renewal_check=healthy_renewal)
+                        assert proof["native_held_qualified"] is True and proof["zero_body_command"] is True
+                        assert proof["measured_body_exact_zero"] is False
+                        assert proof["pause_operation_id"] == pauses[0]["operation_id"]
+                        assert a.run["status"] == "paused" and e.desired == "hold"
+                        assert proof["snapshot"]["evidence"]["accepted_host_action"]["intent_revision"] == a.run["intent_revision"]
+                        assert len([row for row in records if row["event"] == "bench_finish_hold_qualified"]) == 1
+                    else:
+                        expected = (asyncio.CancelledError if cause.endswith("cancel") else
+                                    TimeoutError if cause in {"bench_finish_no_ack", "bench_finish_stale_revision",
+                                        "bench_finish_budget", "bench_finish_native_ceiling", "bench_finish_pause_unknown"} else RuntimeError)
+                        with pytest.raises(expected):
+                            await guard.finish_bench(wall_deadline=entered + (.1 if cause in {
+                                "bench_finish_no_ack", "bench_finish_stale_revision", "bench_finish_budget"} else 12),
+                                                     renewal_check=healthy_renewal)
+                        assert not any(row["event"] == "bench_finish_hold_qualified" for row in records)
+                    assert len(pauses) == (0 if cause == "bench_finish_strict" else 1)
+                    assert not any(op in {"grant", "input"} for op, _ in commands)
+                    assert sum(op == "connect" for op, _ in commands) == 1
+                    assert sum(op == "resume" for op, _ in commands) == 1
+                    assert a.run["deadline"] == 309. and a.run["native_live_at"] == 9.
+                    if cause in {"bench_finish_budget", "bench_finish_native_ceiling"}:
+                        assert m.time.monotonic() - entered < .25
+                finally:
+                    renewal.cancel()
+                    await asyncio.gather(renewal, return_exceptions=True)
                 return
             if cause.startswith("resume_send_"):
                 from aiohttp import ClientConnectionResetError
