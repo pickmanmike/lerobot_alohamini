@@ -29,6 +29,35 @@ def test_selected_bench_view_policy_preserves_actual_presentation(bench, require
     assert state == original
 
 
+def test_ordinary_physical_teleop_lease_preserves_idle_and_other_mode_boundaries(tmp_path):
+    from types import SimpleNamespace
+
+    from tests.robots.test_am1_live_teleop_executor import authority_lane
+    from tools.am1_session_core import LIVE_ELBOW_SPECS, TERMINAL
+
+    a, executor, _ = authority_lane(tmp_path)
+    try:
+        for status in ("starting", "preparing", "paused", "resuming", "running", "recovering", "finishing"):
+            a.run["status"] = status
+            assert a._controller_lease_seconds() == 3.
+        a.run.update(status="running", bench_continuity=True)
+        assert a._controller_lease_seconds() == 6.
+        for status in TERMINAL:
+            a.run["status"] = status
+            assert a._controller_lease_seconds() == 1.5
+        a.run.update(status="running", bench_continuity=False, recipe=next(iter(LIVE_ELBOW_SPECS)))
+        assert a._controller_lease_seconds() == 1.5
+        a.run["recipe"] = "physical-live-teleop"
+        a.executor = SimpleNamespace(source="fake")
+        assert a._controller_lease_seconds() == 1.5
+        a.run = None
+        assert a._controller_lease_seconds() == 1.5
+    finally:
+        a.executor = executor
+        a.run = None
+        a.close()
+
+
 @pytest.mark.parametrize("invalid", [False, True])
 def test_bench_continuity_cli_selects_policy_before_start_and_bounds_controller_gap(monkeypatch, invalid):
     m = adapter()
@@ -48,6 +77,20 @@ def test_bench_continuity_cli_selects_policy_before_start_and_bounds_controller_
         m.main(argv)
         assert seen[0].bench_continuity and seen[0].interrupt_controller
         assert seen[0].workload_segment == "continuity" and seen[0].interruption_seconds == 7
+
+
+def test_combined_body_cli_preserves_normal_required_view_selection(monkeypatch):
+    m = adapter()
+    seen = []
+    async def run(args):
+        seen.append(args)
+        return {}
+    monkeypatch.setattr(m, "run", run)
+    m.main(["--source", "virtual-leaders", "--url", "unused", "--ca", "unused",
+            "--storage-state", "unused", "--output", "unused", "--workload-segment", "combined-body",
+            "--duration-seconds", "65"])
+    assert seen[0].workload_segment == "combined-body" and seen[0].duration_seconds == 65.
+    assert seen[0].bench_continuity is False and seen[0].interrupt_at_seconds is None
 
 
 @pytest.mark.parametrize("boundary", ["cli", "run"])
@@ -685,7 +728,7 @@ def test_real_wss_clean_close_ends_qualified_wait_before_timeout(tmp_path):
         "bench_terminal_hold_stopped", "bench_terminal_hold_cancel", "bench_terminal_hold_budget",
         "bench_terminal_hold_native_ceiling",
         "bench_program_finish", "bench_program_finish_failed",
-        "normal_program_finish", "normal_program_finish_failed", "usb_finite_finish", "usb_finite_finish_failed", "usb_quit_finish", "usb_quit_empty_finish",
+        "normal_program_finish", "normal_program_finish_failed", "normal_program_finish_combined_body", "usb_finite_finish", "usb_finite_finish_failed", "usb_quit_finish", "usb_quit_empty_finish",
     ],
 )
 def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id(
@@ -1371,6 +1414,8 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
         if program_finish:
             if normal_finish:
                 args.bench_continuity = False
+            if failure == "normal_program_finish_combined_body":
+                args.workload_segment = "combined-body"
             if usb_finish:
                 args.source, args.workload_segment = "usb-leaders", "full"
             if failure.startswith("usb_quit_"):
@@ -1416,6 +1461,10 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 assert start["terminal_qualification_budget_seconds"] == 2.
                 assert summary["producer_program_complete"] is (not usb_finish)
                 assert summary["native_execution_complete"] is False
+                if failure == "normal_program_finish_combined_body":
+                    assert start["workload_segment"] == summary["workload_segment"] == "combined-body"
+                    assert start["program_active_seconds"] == 64.5
+                    assert start["bench_continuity"] is False
                 if usb_finish:
                     assert summary["clean_input_end"] == ("local_quit" if failure.startswith("usb_quit_") else "duration_elapsed")
             else:
@@ -2246,7 +2295,7 @@ def test_original_recovery_ceiling_includes_authenticated_read_time_without_rean
     asyncio.run(asyncio.wait_for(scenario(), 0.3))
 
 
-@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_view_reconnect", "grant_view_switch", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "held_qualification_loss", "resume_alignment_refusal", "resume_alignment_refused_twice", "runner_initial_cursor_pending", "resume_reply_timeout_pre", "resume_reply_timeout_post", "acquisition_input_pause", "receipt_ack_starvation", "ack_never_returns", "ack_close_cancel", "transport_blackout_hb1", "transport_blackout_hb2", "transport_blackout_long", "initial_ack_timely", "initial_ack_missing", "connect_receipt_fast", "connect_receipt_delayed", "connect_receipt_missing", "connect_receipt_late", "connect_receipt_caller_ceiling", "connect_receipt_input", "connect_receipt_grant", "renew_receipt_cost", "renew_receipt_cost_expired", "bench_reacquire", "bench_reacquire_receipt_lost", "bench_reacquire_receipt_cancelled", "bench_input_receipt_unknown_native", "bench_input_receipt_unknown_pause", "grant_close_timeout", "grant_close_timeout_pause", "grant_close_timeout_takeover", "grant_close_timeout_cancel", "resume_send_pre", "resume_send_post", "resume_send_pause", "resume_send_takeover", "resume_send_stop", "resume_send_cancel", "resume_send_budget", "resume_send_reboot", "bench_finish_hold", "bench_finish_no_ack", "bench_finish_stale_revision", "bench_finish_body_nonzero", "bench_finish_fault", "bench_finish_external_pause", "bench_finish_stop", "bench_finish_takeover", "bench_finish_reboot", "bench_finish_cancel", "bench_finish_pause_unknown", "bench_finish_budget", "bench_finish_native_ceiling", "bench_finish_strict", "normal_finish_hold", "normal_finish_no_ack", "normal_finish_stale_revision", "normal_finish_body_nonzero", "normal_finish_fault", "normal_finish_external_pause", "normal_finish_stop", "normal_finish_takeover", "normal_finish_reboot", "normal_finish_cancel", "normal_finish_pause_unknown", "normal_finish_budget", "normal_finish_native_ceiling", "normal_finish_view_before", "normal_finish_view_after"])
+@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_view_reconnect", "grant_view_switch", "connect_view_reconnect", "release_view_reconnect", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "held_qualification_loss", "resume_alignment_refusal", "resume_alignment_refused_twice", "runner_initial_cursor_pending", "resume_reply_timeout_pre", "resume_reply_timeout_post", "resume_reply_timeout_alignment", "resume_reply_timeout_alignment_persistent", "acquisition_input_pause", "receipt_ack_starvation", "ack_never_returns", "ack_close_cancel", "transport_blackout_hb1", "transport_blackout_hb2", "transport_blackout_long", "initial_ack_timely", "initial_ack_missing", "connect_receipt_fast", "connect_receipt_delayed", "connect_receipt_missing", "connect_receipt_late", "connect_receipt_caller_ceiling", "connect_receipt_input", "connect_receipt_grant", "renew_receipt_cost", "renew_receipt_cost_expired", "bench_reacquire", "bench_reacquire_receipt_lost", "bench_reacquire_receipt_cancelled", "bench_input_receipt_unknown_native", "bench_input_receipt_unknown_pause", "grant_close_timeout", "grant_close_timeout_pause", "grant_close_timeout_takeover", "grant_close_timeout_cancel", "resume_send_pre", "resume_send_post", "resume_send_pause", "resume_send_takeover", "resume_send_stop", "resume_send_cancel", "resume_send_budget", "resume_send_reboot", "bench_finish_hold", "bench_finish_no_ack", "bench_finish_stale_revision", "bench_finish_body_nonzero", "bench_finish_fault", "bench_finish_external_pause", "bench_finish_stop", "bench_finish_takeover", "bench_finish_reboot", "bench_finish_cancel", "bench_finish_pause_unknown", "bench_finish_budget", "bench_finish_native_ceiling", "bench_finish_strict", "normal_finish_hold", "normal_finish_no_ack", "normal_finish_stale_revision", "normal_finish_body_nonzero", "normal_finish_fault", "normal_finish_external_pause", "normal_finish_stop", "normal_finish_takeover", "normal_finish_reboot", "normal_finish_cancel", "normal_finish_pause_unknown", "normal_finish_budget", "normal_finish_native_ceiling", "normal_finish_view_before", "normal_finish_view_after", "ordinary_lease_dispatch_stall", "ordinary_lease_expired", "ordinary_start_late_first_renewal"])
 def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(tmp_path, monkeypatch, cause):
     import asyncio
     import copy
@@ -2321,7 +2370,7 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
     real_handle = a.handle
 
     def handle(command, device):
-        commands.append((command["op"], a.run["status"]))
+        commands.append((command["op"], a.run["status"] if a.run else None))
         if command["op"] == "connect":
             assert a.run["status"] == "paused", "connect must not short-circuit Core recovery"
             if a.run["recovery_episodes"]:
@@ -2416,6 +2465,31 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                     return original_ws_connect(*args, **kwargs)
                 monkeypatch.setattr(client.http, "ws_connect", fixture_heartbeat)
             await client.attach()
+            if cause == "ordinary_start_late_first_renewal":
+                client.generation, client.connection = ids["controller_generation"], ids["connection_generation"]
+                idle_evidence, pi_now, begun = copy.deepcopy(e.evidence()), [10.], []
+                a.clock = e.clock = lambda: pi_now[0]
+                e.evidence = lambda: copy.deepcopy(idle_evidence)
+                e.begin = lambda recipe: begun.append(recipe) or True  # No device worker.
+                a.run = None
+                initial = await client.post("claim", {"controller_generation": client.generation})
+                assert initial["lease_seconds"] == 1.5 and initial["presence_expires"] == 11.5
+                generation = client.generation
+                pi_now[0] = 10.802256399  # Actual84's admitted Start offset from its idle Claim.
+                started = await client.post("start", {"operation_id": str(uuid4()),
+                    "recipe": "physical-live-teleop", "controller_generation": generation})
+                assert started["accepted"] is True and a.run["status"] == "starting"
+                admitted_expiry = a.controller["expires"]
+                pi_now[0] = 12.  # First renewal is processed beyond the old idle expiry.
+                renewed = await client.post("claim", {"controller_generation": generation})
+                assert renewed["accepted"] is True and renewed["controller_generation"] == generation
+                assert admitted_expiry == 13.802256399 and renewed["presence_expires"] == 15.
+                assert renewed["lease_seconds"] == 3. and len(begun) == 1
+                assert a.run["native_live_at"] is None and a.run["deadline"] is None and a.run["progress_s"] == 0.
+                assert a.run.get("control_intent") is None and a.run.get("bench_continuity") is False
+                assert not any(op in {"connect", "resume", "grant", "input"} for op, _ in commands)
+                assert not any(event["kind"] == "presence_expired" for event in a.events)
+                return
             client.generation, client.connection = ids["controller_generation"], ids["connection_generation"]
             if cause.startswith("bench_input_receipt_unknown"):
                 guard = m.SameRunRecovery(client, record)
@@ -2526,7 +2600,8 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                 return
             if cause.startswith("renew_receipt_cost"):
                 # Only a processed HTTP renewal's reply is delayed. The real
-                # Core lease clock advances while the PC remains present.
+                # normal teleop 3 s control lease advances independently of the
+                # 250 ms movement lifetime; no product clock is altered here.
                 loop = asyncio.get_running_loop()
                 started = loop.time()
                 a.clock = e.clock = lambda: 10. + loop.time() - started
@@ -2547,8 +2622,8 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                         raise
                     if len(calls) == 1:
                         assert result["accepted"] is True
-                        assert 1.4 < result["presence_expires"] - a.clock() <= 1.5
-                        await asyncio.sleep(1.7 if expired else 1.2)
+                        assert 2.9 < result["presence_expires"] - a.clock() <= 3.
+                        await asyncio.sleep(3.2 if expired else 2.7)
                     elif not second.done():
                         second.set_result(result)
                     in_flight[0] = False
@@ -2559,12 +2634,12 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                 try:
                     if expired:
                         with pytest.raises(m.HTTPOutcomeError, match="controller renewal fence"):
-                            await asyncio.wait_for(second, 2.6)
+                            await asyncio.wait_for(second, 4.1)
                         assert a.controller is None or a.controller["expires"] <= a.clock()
                     else:
-                        result = await asyncio.wait_for(second, 2.6)
+                        result = await asyncio.wait_for(second, 4.1)
                         assert result["accepted"] is True
-                        assert calls[1][0] - calls[0][0] < 1.5
+                        assert calls[1][0] - calls[0][0] < 3.
                         assert a.controller["generation"] == ids["controller_generation"]
                         assert a.controller["expires"] > a.clock()
                         assert not any(v["kind"] == "presence_expired" for v in a.events)
@@ -2781,6 +2856,57 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
 
             producer = m.FrameProducer(Input())
             producer.workspace, producer.native_cursor = workspace(), workspace()["reference"]
+            if cause.startswith("ordinary_lease_"):
+                pi_now = [10.]
+                a.clock = e.clock = lambda: pi_now[0]
+                renewed = await client.post("claim", {"controller_generation": client.generation})
+                first = await m.send_leader_sample(client, producer, m.ZERO_BODY, record, phase="combined", progress_s=.01)
+                assert first is not None and first[2]["accepted"] is True
+                assert first[0]["expires"] - first[0]["issued"] == .25
+                assert a.applied_input is not None and e._live_target is not None
+                pi_now[0] = 10.249
+                a._expire_controls(pi_now[0])
+                assert a.run["status"] == "running" and e.desired == "active"
+                pi_now[0] = 10.251
+                a._expire_controls(pi_now[0])
+                assert a.run["status"] == "paused" and e.desired == "hold"
+                assert a.applied_input is None and e._live_target is None
+                old = client.generation
+                if cause == "ordinary_lease_expired":
+                    pi_now[0] = 13.001
+                    a._expire_controls(pi_now[0])
+                    assert a.controller is a.connection is None
+                    with pytest.raises(m.HTTPOutcomeError) as refused:
+                        await client.post("claim", {"controller_generation": old})
+                    assert refused.value.non_admitted and refused.value.response["reason"] == "controller renewal fence"
+                    with pytest.raises(m.CommandRefusedError, match="stale control generation"):
+                        await client.command(dict(op="grant", **client.identities()))
+                    assert a.controller is None and e._live_target is None
+                else:
+                    pi_now[0] = 11.64  # Actual82's observed gap between renewal dispatches.
+                    # Independent required viewing stays current during the PC sender scheduling gap.
+                    a._teleop_view["qualified_until"] = pi_now[0] + .5
+                    a._expire_controls(pi_now[0])
+                    assert a.controller is not None and a.controller["generation"] == old
+                    assert renewed["lease_seconds"] == 3. and renewed["presence_expires"] == 13.
+                    assert a.run["status"] == "paused" and e._live_target is None
+                    competitor = a.handle({"op": "claim"}, "competitor")
+                    assert competitor["accepted"] is False and competitor["reason"] == "controller occupied"
+                    current = await client.post("claim", {"controller_generation": old})
+                    assert current["controller_generation"] == old and current["presence_expires"] == 14.64
+                    client.snapshot = (await client.get("state"))["snapshot"]
+                    assert not await guard.resume(expected_pause="input_expired")
+                    assert a.run["status"] == "running" and e._live_target is None
+                    producer.native_cursor, producer.reacquire = m._live(client.snapshot)["cursor"], True
+                    fresh = await m.send_leader_sample(client, producer, m.ZERO_BODY, record, phase="combined", progress_s=.02)
+                    assert fresh is not None and fresh[2]["accepted"] is True
+                    assert fresh[0]["grant_id"] != first[0]["grant_id"]
+                    assert fresh[1]["source"]["sample_seq"] > first[1]["source"]["sample_seq"]
+                    assert fresh[0]["expires"] - fresh[0]["issued"] == .25
+                    assert m._live(client.snapshot)["required_view"]["required"] is True
+                    assert a.run.get("control_intent") is None and a.run.get("bench_continuity") is not True
+                assert a.run["native_live_at"] == 9. and a.run["deadline"] == 309.
+                return
             if cause.startswith("grant_close_timeout"):
                 original_call, accepted_grants, applied = gateway.call, [], []
                 old_ws, old_reader = client.ws, client.reader
@@ -2984,15 +3110,15 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                     renewal.cancel()
                     await asyncio.gather(qualification, renewal, return_exceptions=True)
                 return
-            if cause in {"grant_view_reconnect", "grant_view_switch"}:
-                # Synthetic48: actual Core/IPC/TLS/Gateway view reset, then an
+            if cause in {"grant_view_reconnect", "grant_view_switch", "connect_view_reconnect", "release_view_reconnect"}:
+                # Actual86 / Synthetic48: actual Core/IPC/TLS/Gateway view reset, then an
                 # independent viewer task publishes genuine advancing progress.
                 from types import SimpleNamespace
 
                 from tools import am1_session_service as service
                 from tools.am1_onboard_media import OnboardMediaProxy
 
-                pi_clock, old_time = [10.01], service.time
+                pi_clock, old_time = [10. if cause in {"connect_view_reconnect", "release_view_reconnect"} else 10.01], service.time
                 a.clock = e.clock = lambda: pi_clock[0]
                 service.time = SimpleNamespace(monotonic=lambda: pi_clock[0], time=old_time.time)
                 auth = tmp_path / "view-auth.json"
@@ -3017,8 +3143,17 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
 
                 proxy.status, proxy.upstream, gateway.onboard = status, upstream, proxy
                 original_call, lost = gateway.call, [False]
+                loss_op = "connect" if cause == "connect_view_reconnect" else "release_input" if cause == "release_view_reconnect" else "grant"
+                if loss_op != "grant":
+                    a._pause_live_input("input_expired")
                 envelopes, observed, published = [], asyncio.Event(), asyncio.Event()
-                original_record, original_attach = guard.record, client.attach
+                original_record, original_attach, original_get = guard.record, client.attach, client.get
+
+                async def observe_owner(path):
+                    value = await original_get(path)
+                    if path == "state" and lost[0] and not m._live(value["snapshot"])["required_view"]["qualified"]:
+                        observed.set()
+                    return value
 
                 def record_gap(value):
                     original_record(value)
@@ -3038,9 +3173,12 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                     capture(client.ws)
 
                 async def lose_grant(command, device):
-                    if command.get("op") == "grant" and not lost[0]:
+                    if command.get("op") == loss_op and not lost[0]:
                         lost[0] = True
-                        a._pause_live_input("input_expired")
+                        if loss_op == "grant":
+                            a._pause_live_input("input_expired")
+                        else:
+                            assert (await original_call(command, device))["accepted"] is True
                         await proxy.offer("chest", b"v=0\r\n", client.device)
                         assert not a._teleop_view_qualified()
                         client.ws._response.connection.transport.abort()
@@ -3052,10 +3190,15 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                     # request proceeds after the unqualified snapshot is retained.
                     await observed.wait()
                     await asyncio.sleep(.05)
-                    assert not any(v["command"]["op"] in {"connect", "release_input", "resume", "input"} for v in envelopes)
+                    baseline = {"connect": int(loss_op != "grant"), "release_input": int(loss_op == "release_input")}
+                    if loss_op == "grant":
+                        assert not any(v["command"]["op"] in {"connect", "release_input", "resume", "input"} for v in envelopes)
+                    else:
+                        assert all(sum(v["command"]["op"] == op for v in envelopes) == count for op, count in baseline.items())
+                        assert not any(v["command"]["op"] in {"resume", "input"} for v in envelopes)
                     assert producer.sequence == client.sequence == 0
                     role = "wrist_left" if cause == "grant_view_switch" else "chest"
-                    pi_clock[0] += 1.05  # Existing source re-offer minimum remains enforced.
+                    pi_clock[0] += 1.125 if loss_op != "grant" else 1.05  # Existing source re-offer minimum remains enforced.
                     report["video"].update(role=role, capture_generation=generation[role])
                     report["cameras"][role].update(sequence=20, arrived_at_monotonic_s=pi_clock[0] - .02)
                     await proxy.offer(role, b"v=0\r\n", client.device)
@@ -3071,7 +3214,11 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                         await client.post("onboard/progress", progress)
                     assert stale_source.value.response["reason"] == "selected source is not fresh"
                     assert not a._teleop_view_qualified()
-                    assert not any(v["command"]["op"] in {"connect", "release_input", "resume", "input"} for v in envelopes)
+                    if loss_op == "grant":
+                        assert not any(v["command"]["op"] in {"connect", "release_input", "resume", "input"} for v in envelopes)
+                    else:
+                        assert all(sum(v["command"]["op"] == op for v in envelopes) == count for op, count in baseline.items())
+                        assert not any(v["command"]["op"] in {"resume", "input"} for v in envelopes)
                     report["cameras"][role].update(sequence=21, arrived_at_monotonic_s=pi_clock[0] - .02)
                     receipt = await client.post("onboard/progress", dict(progress, decoded_frames=10, media_time=.8))
                     assert receipt["accepted"] is True and receipt["required_view"]["qualified"] is True
@@ -3079,7 +3226,7 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                     published.set()
 
                 capture(client.ws)
-                guard.record, client.attach, gateway.call = record_gap, attached, lose_grant
+                guard.record, client.attach, client.get, gateway.call = record_gap, attached, observe_owner, lose_grant
                 renewal = asyncio.create_task(client.renew())
                 qualification = asyncio.create_task(fresh_view())
                 def view_renewal_healthy():
@@ -3087,16 +3234,24 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                         renewal.result()
                         raise RuntimeError("original renewal ended")
                 try:
-                    with pytest.raises(ConnectionError) as caught:
-                        await m.send_leader_sample(client, producer, m.ZERO_BODY, record, phase="individual", progress_s=0)
-                    assert not await guard.resume(grant_error=caught.value, renewal_check=view_renewal_healthy)
+                    if loss_op == "grant":
+                        with pytest.raises(ConnectionError) as caught:
+                            await m.send_leader_sample(client, producer, m.ZERO_BODY, record, phase="individual", progress_s=0)
+                        assert not await guard.resume(grant_error=caught.value, renewal_check=view_renewal_healthy)
+                    else:
+                        assert not await guard.resume(expected_pause="input_expired", renewal_check=view_renewal_healthy)
                     await qualification
                     assert published.is_set() and guard.episodes == 0
                     assert client.snapshot["evidence"]["active_acknowledged"] is True
                     assert m._live(client.snapshot)["required_view"]["role"] == ("wrist_left" if cause == "grant_view_switch" else "chest")
-                    assert sum(v["command"]["op"] == "connect" for v in envelopes) == 1
-                    assert sum(v["command"]["op"] == "release_input" for v in envelopes) == 1
+                    if loss_op == "grant":
+                        assert sum(v["command"]["op"] == "connect" for v in envelopes) == 1
+                        assert sum(v["command"]["op"] == "release_input" for v in envelopes) == 1
+                    else:
+                        assert sum(v["command"]["op"] == "connect" for v in envelopes) == 2
+                        assert sum(v["command"]["op"] == "release_input" for v in envelopes) == (2 if loss_op == "release_input" else 1)
                     assert sum(v["command"]["op"] == "resume" for v in envelopes) == 1
+                    assert not any(v["command"]["op"] in {"claim", "start"} for v in envelopes)
                     producer.native_cursor, producer.reacquire = m._live(client.snapshot)["cursor"], True
                     frame = await m.send_leader_sample(client, producer, m.ZERO_BODY, record, phase="individual", progress_s=.02)
                     assert frame[2]["accepted"] is True and producer.sequence == 1
@@ -3356,7 +3511,7 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                         assert proof["snapshot"]["evidence"]["accepted_host_action"]["intent_revision"] == a.run["intent_revision"]
                         if normal_finish:
                             assert a.run.get("control_intent") is None
-                            assert a._controller_lease_seconds() == 1.5
+                            assert a._controller_lease_seconds() == 3.
                             assert proof["snapshot"]["run"]["live_input"]["required_view"]["required"] is True
                             assert proof["snapshot"]["run"]["live_input"]["required_view"]["qualified"] is True
                             assert len([row for row in records if row["event"] == "normal_finish_hold_qualified"]) == 1
@@ -3493,18 +3648,21 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                     await asyncio.gather(renewal, return_exceptions=True)
                 return
             if cause in {"resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending",
-                         "resume_reply_timeout_pre", "resume_reply_timeout_post"}:
-                reply_timeout = cause in {"resume_reply_timeout_pre", "resume_reply_timeout_post"}
+                         "resume_reply_timeout_pre", "resume_reply_timeout_post", "resume_reply_timeout_alignment", "resume_reply_timeout_alignment_persistent"}:
+                reply_timeout = cause in {"resume_reply_timeout_pre", "resume_reply_timeout_post", "resume_reply_timeout_alignment", "resume_reply_timeout_alignment_persistent"}
                 post_admitted = cause in {"resume_result_loss_post", "resume_reply_timeout_post"}
                 # Synthetic54/57: the actual Core/Gateway receives a Resume whose
                 # result is lost; no negative-admission receipt is invented.
                 from aiohttp import ClientConnectionResetError
 
                 pi_clock, lost, thermal = [10.], [False], [None]
+                pose_ready, pose_observed = [True], asyncio.Event()
                 a.clock = e.clock = lambda: pi_clock[0]
                 native_evidence = e.evidence
                 def pending_thermal():
                     value = native_evidence()
+                    if cause.startswith("resume_reply_timeout_alignment"):
+                        value["pose_aligned"] = pose_ready[0]
                     if thermal[0] is not None:
                         proof = copy.deepcopy(thermal[0])
                         if proof["peaks_ready"] and e.desired == "active":
@@ -3535,6 +3693,8 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                     if command.get("op") == "resume" and not lost[0]:
                         lost[0] = True
                         old = copy.deepcopy(command)
+                        if cause.startswith("resume_reply_timeout_alignment"):
+                            pose_ready[0] = False  # Actual87: current HOLD is not yet stably aligned.
                         if post_admitted:
                             old_results.append(await original_call(old, device))
                             assert old_results[-1]["accepted"] is True
@@ -3585,6 +3745,27 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
 
                 capture(client.ws)
                 client.attach, gateway.call = attached, checked_loss
+                if cause.startswith("resume_reply_timeout_alignment"):
+                    original_record = guard.record
+                    def record_alignment(value):
+                        original_record(value)
+                        if value["event"] == "owner_rejoin_state" and value["snapshot"]["evidence"]["pose_aligned"] is False:
+                            pose_observed.set()
+                    async def qualify_alignment():
+                        await pose_observed.wait()
+                        await asyncio.sleep(.05)
+                        assert sum(v["command"]["op"] == "connect" for v in envelopes) == 1
+                        assert sum(v["command"]["op"] == "release_input" for v in envelopes) == 1
+                        assert sum(v["command"]["op"] == "resume" for v in envelopes) == 1
+                        assert not any(v["command"]["op"] in {"grant", "input"} for v in envelopes)
+                        if cause.endswith("persistent"):
+                            return  # No independent Native qualification arrives inside the caller's fixed budget.
+                        pi_clock[0] += .25  # Independent Native stable-HOLD qualification, over0.2 s.
+                        epoch[0] += 1
+                        pose_ready[0] = True
+                        a._teleop_view["qualified_until"] = pi_clock[0] + .5
+                    guard.record = record_alignment
+                    qualification = asyncio.create_task(qualify_alignment())
                 renewal = asyncio.create_task(client.renew())
                 def healthy_renewal():
                     if renewal.done():
@@ -3610,6 +3791,21 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                         a.tick()
                     qualification = asyncio.create_task(ready_original())
                 try:
+                    if cause == "resume_reply_timeout_alignment_persistent":
+                        ceiling = m.time.monotonic() + 1.5
+                        with pytest.raises(TimeoutError):
+                            await guard.resume(expected_pause="input_expired", renewal_check=healthy_renewal,
+                                               wall_deadline=ceiling)
+                        await qualification
+                        assert pose_observed.is_set() and pose_ready[0] is False
+                        assert m.time.monotonic() < ceiling + .2
+                        assert sum(v["command"]["op"] == "connect" for v in envelopes) == 1
+                        assert sum(v["command"]["op"] == "release_input" for v in envelopes) == 1
+                        assert sum(v["command"]["op"] == "resume" for v in envelopes) == 1
+                        assert not any(v["command"]["op"] in {"grant", "input", "claim", "start"} for v in envelopes)
+                        assert a.run["status"] == "paused" and a.run["deadline"] == 309. and a.run["native_live_at"] == 9.
+                        assert guard.completed_episodes == 0
+                        return
                     try:
                         result = await guard.resume(expected_pause="input_expired", renewal_check=healthy_renewal)
                     except ConnectionError:
@@ -3620,6 +3816,10 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                         assert client.transport_close["exception"] == "Cannot write to closing transport"
                         raise
                     assert result is (cause in {"resume_result_loss_native", "resume_result_loss_pending"})
+                    if cause.startswith("resume_reply_timeout_alignment"):
+                        await qualification
+                        assert pose_observed.is_set() and client.snapshot["evidence"]["pose_aligned"] is True
+                        assert client.snapshot["evidence"]["accepted_host_action"]["acquired_at_monotonic_s"] >= 10.25
                     assert client.snapshot["evidence"]["active_acknowledged"] is True
                     resumes = [v for v in envelopes if v["command"]["op"] == "resume"]
                     assert len(resumes) == 2
@@ -8014,3 +8214,169 @@ def test_current_stream_ack_credit_cannot_come_from_a_late_old_stream():
         await asyncio.gather(new_task, barrier)
         assert client._acked_revision == "new-revision" and client._ack_error is None
     asyncio.run(asyncio.wait_for(scenario(), 1))
+
+
+@pytest.mark.parametrize("lost_op", ["connect", "release_input"])
+@pytest.mark.parametrize("change", [None, "persistent", "phase", "caller", "native", "cancel", "pause", "stop",
+    "takeover", "reboot", "expired", "revision", "cursor", "ack", "backwards_ack", "remaining",
+    "feedback", "observation", "hold", "alignment", "native_ack", "fault", "bool_alignment", "malformed_view", "view_cause", "wrong_role", "renewal",
+    "alignment_ready", "alignment_persistent", "alignment_stale_ack"])
+def test_ordinary_binding_view_wait_keeps_current_hold_and_original_ceiling(monkeypatch, lost_op, change):
+    import asyncio
+    import copy
+    from types import SimpleNamespace
+
+    m = adapter()
+    pc, records, calls = [1000.], [], []
+    real_sleep = asyncio.sleep
+    monkeypatch.setattr(m, "time", SimpleNamespace(monotonic=lambda: pc[0], perf_counter=m.time.perf_counter))
+    async def sleep(value):
+        pc[0] += value
+        await real_sleep(0)
+    monkeypatch.setattr(m.asyncio, "sleep", sleep)
+    before = recovery_state()
+    before["run"].update(status="paused", operation_id=str(uuid4()))
+    before["evidence"].update(active_acknowledged=False)
+    before["evidence"]["accepted_host_action"]["acquired_at_monotonic_s"] = 100.
+    before["events"] = [{"kind": "input_expired", "at": 100., "run_id": "owned", "service_incarnation": "service"}]
+    original = ConnectionError("original ordinary command result unknown")
+
+    class Client:
+        snapshot = copy.deepcopy(before)
+        device, generation, connection, sequence = "device", "control", "connection", 0
+        identities, resume = m.SessionClient.identities, m.SessionClient.resume
+        transport_close = {"expected": False, "reason": "stream-ended", "close_code": 1006, "reader_error": None}
+        reads, connects, releases, revision = 0, 0, 0, before["run"]["intent_revision"]
+        lost, pending_stamp = False, None
+
+        def current(self):
+            value = copy.deepcopy(before)
+            elapsed = pc[0] - 1000.
+            value["run"].update(intent_revision=self.revision, remaining_s=300. - elapsed)
+            value["run"]["live_input"]["cursor_intent_revision"] = self.revision
+            value["evidence"]["acknowledged_intent_revision"] = self.revision
+            value["evidence"]["accepted_host_action"].update(intent_revision=self.revision, acquired_at_monotonic_s=100. + elapsed)
+            return value
+
+        async def get(self, path):
+            assert path == "state"
+            self.reads += 1
+            pc[0] += 3. if change == "phase" else .01
+            value = self.current()
+            if self.lost:
+                assert sum(v["op"] == "connect" for v in calls) == 1
+                assert sum(v["op"] == "release_input" for v in calls) == int(lost_op == "release_input")
+                assert not any(v["op"] in {"resume", "grant", "input", "claim", "start"} for v in calls)
+                pending = self.reads == 2 or change in {"persistent", "phase"}
+                if change and change.startswith("alignment_"):
+                    value["evidence"]["pose_aligned"] = not (self.reads == 2 or change == "alignment_persistent")
+                    pending = False
+                    if self.reads == 2:
+                        self.pending_stamp = value["evidence"]["accepted_host_action"]["acquired_at_monotonic_s"]
+                    if change == "alignment_stale_ack" and self.reads > 2:
+                        value["evidence"]["accepted_host_action"]["acquired_at_monotonic_s"] = self.pending_stamp
+                value["run"]["live_input"]["required_view"].update(
+                    required=True, qualified=not pending, role="chest", cause="required_view_expired" if pending else None)
+                if self.reads > 2:
+                    if change == "cancel":
+                        raise asyncio.CancelledError()
+                    if change == "pause":
+                        value["events"].append(dict(value["events"][-1], kind="pause", at=100.05))
+                    if change == "stop":
+                        value["run"]["status"] = "stopped"
+                    if change == "takeover":
+                        value["controller"]["controller_generation"] = "newer-owner"
+                    if change == "reboot":
+                        value["service_incarnation"] = "new-service"
+                    if change == "expired":
+                        value["controller"] = None
+                    if change == "revision":
+                        value["run"]["intent_revision"] += 1
+                    if change == "cursor":
+                        value["run"]["live_input"]["cursor_intent_revision"] -= 1
+                    if change == "ack":
+                        value["evidence"]["accepted_host_action"]["intent_revision"] -= 1
+                    if change == "backwards_ack":
+                        value["evidence"]["accepted_host_action"]["acquired_at_monotonic_s"] = 100.01
+                    if change == "remaining":
+                        value["run"]["remaining_s"] = 300.
+                    if change in {"feedback", "observation", "hold", "alignment", "native_ack"}:
+                        value["evidence"][{"observation": "required_observation", "hold": "hold_acknowledged", "alignment": "pose_aligned"}.get(change, change)] = False
+                    if change == "fault":
+                        value["evidence"]["fault"] = "genuine hard fault"
+                    if change == "bool_alignment":
+                        value["evidence"]["pose_aligned"] = 0
+                    view = value["run"]["live_input"]["required_view"]
+                    if change == "malformed_view":
+                        view.pop("required")
+                    if change == "view_cause":
+                        view["cause"] = "required_view_expired"
+                    if change == "wrong_role":
+                        view["role"] = "unconfigured"
+            if change == "native":
+                value["run"]["remaining_s"] = .05 - (pc[0] - 1000.)
+            return {"snapshot": value}
+
+        async def detach(self):
+            self.snapshot = None
+
+        async def attach(self):
+            self.snapshot = self.current()
+
+        async def command(self, command):
+            calls.append(copy.deepcopy(command))
+            pc[0] += .01
+            if command["op"] == "connect":
+                self.connects += 1
+                self.revision += 1
+                if lost_op == "connect" and not self.lost:
+                    self.lost = True
+                    raise original
+                value = self.current()
+                return {"connection_generation": "acknowledged-" + str(self.connects), "snapshot": value}
+            if command["op"] == "release_input":
+                self.releases += 1
+                if lost_op == "release_input" and not self.lost:
+                    self.lost = True
+                    raise original
+                return {"accepted": True}
+            assert command["op"] == "resume"
+            assert self.snapshot["run"]["live_input"]["required_view"]["qualified"] is True
+            self.snapshot["run"]["status"] = "running"
+            self.snapshot["evidence"]["active_acknowledged"] = True
+            return {"accepted": True}
+
+        async def wait(self, predicate, timeout):
+            assert 0 < timeout <= 8.
+            assert predicate(), "fresh required-view and current Native HOLD are still required"
+
+    async def scenario():
+        client = Client()
+        guard = m.SameRunRecovery(client, records.append)
+        def renewed():
+            if change == "renewal" and client.reads > 2:
+                raise RuntimeError("current renewal ended")
+        until = 1000.055 if change == "caller" else None
+        if change in {None, "alignment_ready"}:
+            assert not await guard.resume(expected_pause="input_expired", wall_deadline=until, renewal_check=renewed)
+            assert client.reads == 3 and client.connects == 2
+            assert client.snapshot["evidence"]["active_acknowledged"] is True
+            assert [v["op"] for v in calls] == (["connect", "connect", "release_input", "resume"] if lost_op == "connect"
+                                                    else ["connect", "release_input", "connect", "release_input", "resume"])
+        elif change == "cancel":
+            with pytest.raises(asyncio.CancelledError):
+                await guard.resume(expected_pause="input_expired", renewal_check=renewed)
+        else:
+            with pytest.raises((ConnectionError, TimeoutError)) as caught:
+                await guard.resume(expected_pause="input_expired", wall_deadline=until, renewal_check=renewed)
+            if client.lost:
+                assert caught.value is original
+            assert client.connects == 1 and not any(v["op"] == "resume" for v in calls)
+            if change in {"persistent", "phase", "alignment_persistent"}:
+                assert 1008. <= pc[0] < 1009.2
+            if change == "caller":
+                assert pc[0] < 1000.11
+        assert not any(v["op"] in {"claim", "start", "grant", "input"} for v in calls)
+        assert guard.original["run"]["deadline"] == 400. and guard.episodes == 0
+        assert client.generation == "control" and client.sequence == 0
+    asyncio.run(asyncio.wait_for(scenario(), 1.))

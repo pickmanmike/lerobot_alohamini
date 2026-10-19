@@ -13,7 +13,8 @@ class TeleopWorkload:
 
     def __init__(self, workspace, *, segment="full"):
         segments = {"full": (0.0, 172.5), "combined": (96.0, 12.0),
-                    "continuity": (96.0, 24.0), "body": (168.0, 4.5)}
+                    "continuity": (96.0, 24.0), "body": (168.0, 4.5),
+                    "combined-body": (108.0, 64.5)}
         if segment not in segments:
             raise ValueError("Unknown declared bench segment")
         self.segment = segment
@@ -79,6 +80,11 @@ class TeleopWorkload:
             if self.elapsed_s >= 96:
                 self.phases_completed.add("individual")
             if self.elapsed_s >= 168:
+                self.phases_completed.add("combined")
+            if self.complete:
+                self.phases_completed.add("body")
+        elif self.segment == "combined-body":
+            if self.elapsed_s >= 60:
                 self.phases_completed.add("combined")
             if self.complete:
                 self.phases_completed.add("body")

@@ -1904,6 +1904,174 @@ def test_preimport_processor_discovery_refuses_execution_and_unqualified_proof(t
     assert not (directory / "cleanup.json").exists()
 
 
+# Exact Actual83 bytes; only filesystem roots are relocated in the offline fixture.
+ENUM_PREIMPORT_TRACE = """Traceback (most recent call last):
+  File "/home/pickmanmike/.local/share/uv/python/cpython-3.12.13-linux-aarch64-gnu/lib/python3.12/enum.py", line 302, in __set_name__
+    enum_member = enum_class._value2member_map_[value]
+                  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^
+TypeError: unhashable type: 'Weights'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/home/pickmanmike/.local/share/uv/python/cpython-3.12.13-linux-aarch64-gnu/lib/python3.12/enum.py", line 309, in __set_name__
+    raise KeyError
+KeyError
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "<frozen runpy>", line 189, in _run_module_as_main
+  File "<frozen runpy>", line 112, in _get_module_details
+  File "/home/pickmanmike/lerobot_alohamini/src/lerobot/robots/alohamini/__init__.py", line 17, in <module>
+    from .alohamini import AlohaMini
+  File "/home/pickmanmike/lerobot_alohamini/src/lerobot/robots/alohamini/alohamini.py", line 34, in <module>
+    from lerobot.processor import RobotAction, RobotObservation
+  File "/home/pickmanmike/lerobot_alohamini/src/lerobot/processor/__init__.py", line 26, in <module>
+    from .batch_processor import AddBatchDimensionProcessorStep
+  File "/home/pickmanmike/lerobot_alohamini/src/lerobot/processor/batch_processor.py", line 27, in <module>
+    from lerobot.configs import PipelineFeatureType, PolicyFeature
+  File "/home/pickmanmike/lerobot_alohamini/src/lerobot/configs/__init__.py", line 25, in <module>
+    from .default import DatasetConfig, EvalConfig, JobConfig, PeftConfig, WandBConfig
+  File "/home/pickmanmike/lerobot_alohamini/src/lerobot/configs/default.py", line 19, in <module>
+    from lerobot.transforms import ImageTransformsConfig
+  File "/home/pickmanmike/lerobot_alohamini/src/lerobot/transforms/__init__.py", line 15, in <module>
+    from .transforms import (
+  File "/home/pickmanmike/lerobot_alohamini/src/lerobot/transforms/transforms.py", line 22, in <module>
+    from torchvision.transforms import v2
+  File "/home/pickmanmike/lerobot_alohamini/.venv/lib/python3.12/site-packages/torchvision/__init__.py", line 8, in <module>
+    from torchvision import _meta_registrations, datasets, io, models, ops, transforms, utils  # usort:skip
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/pickmanmike/lerobot_alohamini/.venv/lib/python3.12/site-packages/torchvision/models/__init__.py", line 15, in <module>
+    from .swin_transformer import *
+  File "/home/pickmanmike/lerobot_alohamini/.venv/lib/python3.12/site-packages/torchvision/models/swin_transformer.py", line 752, in <module>
+    class Swin_V2_S_Weights(WeightsEnum):
+  File "/home/pickmanmike/.local/share/uv/python/cpython-3.12.13-linux-aarch64-gnu/lib/python3.12/enum.py", line 595, in __new__
+    enum_class = super().__new__(metacls, cls, bases, classdict, **kwds)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/pickmanmike/.local/share/uv/python/cpython-3.12.13-linux-aarch64-gnu/lib/python3.12/enum.py", line 315, in __set_name__
+    or not issubclass(enum_class, Flag)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+KeyboardInterrupt
+Error calling __set_name__ on '_proto_member' instance 'IMAGENET1K_V1' in 'Swin_V2_S_Weights'
+"""
+
+
+def enum_preimport_fixture(tmp_path, monkeypatch):
+    import re
+
+    assert hashlib.sha256(ENUM_PREIMPORT_TRACE.encode()).hexdigest() == (
+        "aa234b55b63b9cb38b75940989bb5045b8e95f831ab06fdf6cff166405350a50")
+    m, config, run, proof, state, directory = preimport_stop_fixture(tmp_path, monkeypatch)
+    environment = tmp_path / "venv"
+    python = environment / "bin/python"
+    python.parent.mkdir(parents=True)
+    python.write_bytes(b"# fixture interpreter identity; never executed\n")
+    config["host_python"] = str(python)
+    proof["source"]["backend_contract"] = copy.deepcopy(config)
+    stdlib = environment / "lib/python3.12/enum.py"
+    data = ENUM_PREIMPORT_TRACE.replace(
+        "/home/pickmanmike/lerobot_alohamini/.venv", environment.as_posix()).replace(
+        "/home/pickmanmike/lerobot_alohamini", Path(config["host_repository"]).as_posix()).replace(
+        "/home/pickmanmike/.local/share/uv/python/cpython-3.12.13-linux-aarch64-gnu/lib/python3.12/enum.py",
+        stdlib.as_posix())
+    sources = {}
+    lines = data.splitlines()
+    for index, line in enumerate(lines):
+        frame = re.fullmatch(r'  File "([^"]+)", line ([0-9]+), in (.+)', line)
+        if frame is None or not frame[1].startswith(environment.as_posix() + "/"):
+            continue
+        path, number = Path(frame[1]), int(frame[2])
+        source = sources.setdefault(path, {})
+        source[number] = lines[index + 1].strip()
+    for path, source in sources.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        content = ["# retained import source"] * max(source)
+        for number, line in source.items():
+            content[number - 1] = line
+        path.write_text("\n".join(content) + "\n", encoding="utf-8")
+    (directory / "host-runtime.log").write_bytes(data.encode())
+    proof["original_host_logs"]["host-runtime.log"] = hashlib.sha256(data.encode()).hexdigest()
+    publish_preimport_fixture(run, proof, state)
+    return m, config, run, proof, state, directory
+
+
+def test_preimport_enum_interruption_accepts_exact_trace_only_with_fresh_proof_and_ack(tmp_path, monkeypatch):
+    m, config, run, proof, state, directory = enum_preimport_fixture(tmp_path, monkeypatch)
+    original = copy.deepcopy(run)
+    logs = {name: (directory / name).read_bytes() for name in proof["original_host_logs"]}
+    actual, raw, inventory = m.load_qualified_proof(config, run)
+    assert actual == proof and inventory == dict.fromkeys(m.MARKERS)
+    operation = str(uuid.uuid4())
+    ack = m.archive_and_ack(config, actual, raw, inventory, operation)
+    receipt = dict(actual, acknowledgment=dict(ack, consumed_operation_id=operation))
+    assert m.acknowledged_receipt(receipt, run, operation)
+    assert m.load_qualified_proof(config, run)[0] == proof
+    assert run == original and run["uncertain"] is True and run["native_first_cause"] is None
+    assert run["physical_result"]["readback"] is None and not (directory / "cleanup.json").exists()
+    assert {name: (directory / name).read_bytes() for name in logs} == logs
+    assert all(not (state / name).exists() for name in m.MARKERS)
+
+
+@pytest.mark.parametrize("broken", [
+    "footer", "prefix_type", "prefix_keyerror", "prefix_frame", "class_source", "terminal_context",
+    "stdlib_path", "stdlib_source", "prefix_source", "host_execution", "missing_chain", "extra_footer",
+    "trace_hash", "native_live", "fresh_torque", "fresh_lift", "fresh_thermal",
+])
+def test_preimport_enum_interruption_refuses_other_chains_execution_and_unqualified_proof(tmp_path, monkeypatch, broken):
+    m, config, run, proof, state, directory = enum_preimport_fixture(tmp_path, monkeypatch)
+    path = directory / "host-runtime.log"
+    data = path.read_bytes()
+    stdlib = Path(config["host_python"]).parent.parent / "lib/python3.12/enum.py"
+    if broken == "footer":
+        data = data.replace(b"instance 'IMAGENET1K_V1'", b"instance 'OTHER'")
+    elif broken == "prefix_type":
+        data = data.replace(b"TypeError: unhashable type: 'Weights'", b"RuntimeError: actual motor error")
+    elif broken == "prefix_keyerror":
+        data = data.replace(b"\nKeyError\n", b"\nValueError\n", 1)
+    elif broken == "prefix_frame":
+        data = data.replace(b"line 302, in __set_name__", b"line 302, in __call__", 1)
+    elif broken == "class_source":
+        data = data.replace(b"class Swin_V2_S_Weights(WeightsEnum):", b"class OtherWeights(WeightsEnum):")
+    elif broken == "terminal_context":
+        data = data.replace(b"line 315, in __set_name__", b"line 315, in __call__")
+    elif broken == "stdlib_path":
+        foreign = stdlib.with_name("other.py")
+        foreign.write_bytes(stdlib.read_bytes())
+        data = data.replace(stdlib.as_posix().encode(), foreign.as_posix().encode())
+    elif broken in {"stdlib_source", "prefix_source"}:
+        content = stdlib.read_text().splitlines()
+        content[(315 if broken == "stdlib_source" else 302) - 1] = "raise RuntimeError('not the original source')"
+        stdlib.write_text("\n".join(content) + "\n", encoding="utf-8")
+    elif broken == "host_execution":
+        source = Path(config["host_repository"]) / "src/lerobot/robots/alohamini/alohamini_host.py"
+        line = source.read_text(encoding="utf-8").splitlines()[0].strip()
+        frame = f'  File "{source.as_posix()}", line 1, in <module>\n    {line}\n'.encode()
+        data = data.replace(b"KeyboardInterrupt", frame + b"KeyboardInterrupt")
+    elif broken == "missing_chain":
+        data = data[data.index(b"Traceback (most recent call last):", 1):]
+    elif broken == "extra_footer":
+        data += b"post-import execution\n"
+    elif broken == "native_live":
+        run["native_live_at"] = 1.
+    elif broken == "fresh_torque":
+        proof["readback"]["readbacks"][0]["value"] = 1
+    elif broken == "fresh_lift":
+        proof["readback"].pop("lift_stationary")
+    elif broken == "fresh_thermal":
+        proof["readback"]["lift_stationary"]["temperature_slots"][0][0] = 99.
+    else:
+        proof["original_host_logs"][path.name] = "0" * 64
+    path.write_bytes(data)
+    if broken != "trace_hash":
+        proof["original_host_logs"][path.name] = hashlib.sha256(data).hexdigest()
+    publish_preimport_fixture(run, proof, state)
+    with pytest.raises((ValueError, OSError, RuntimeError, TypeError)):
+        m.load_qualified_proof(config, run)
+    assert not list(state.glob("reconciliation-ack-*"))
+    assert not (directory / "cleanup.json").exists()
+
+
 @pytest.mark.parametrize(
     "later_temperature, retimestamp_peak, accepted",
     [(34, True, True), (33, False, True), (33, True, False)],

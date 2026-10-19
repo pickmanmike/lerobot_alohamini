@@ -1869,6 +1869,48 @@ class SameRunRecovery:
                 continue  # Fresh ticket/stream only; no control command has been retried.
             break
 
+    async def _wait_current_hold(self, state, qualify, remaining, renewal_check, view_refusal=None):
+        # Shared non-actuating qualification for an uncertain binding/Resume.
+        # Only stable-HOLD alignment and canonical selected-view expiry may wait;
+        # each authenticated read must retain all other current Native/owner proof.
+        waiting_view, pending_stamp = False, None
+        while True:
+            if renewal_check:
+                renewal_check()
+            aligned = qualify(state)
+            stamp = state["evidence"]["accepted_host_action"]["acquired_at_monotonic_s"]
+            if not aligned and pending_stamp is None:
+                pending_stamp = stamp
+            if aligned and pending_stamp is not None and stamp <= pending_stamp:
+                raise RuntimeError("current HOLD alignment lacks a newer Native ACK")
+            budget = remaining()
+            view = _live(state).get("required_view") or {}
+            admitted = _view_admitted(state)
+            if admitted and not waiting_view:
+                if aligned:
+                    return state
+            else:
+                if (set(view) != {"required", "qualified", "role", "cause"}
+                    or view.get("required") is not True or type(view.get("qualified")) is not bool
+                    or view.get("role") not in {"forward", "backward", "chest", "wrist_left", "wrist_right"}
+                    or view.get("cause") != (None if view["qualified"] else "required_view_expired")):
+                    if view_refusal:
+                        raise view_refusal(state)
+                    raise RuntimeError("current selected view deficit is unavailable or malformed")
+                if view["qualified"] and aligned:
+                    return state
+                waiting_view = waiting_view or not view["qualified"]
+            await asyncio.sleep(min(.05, budget))
+            requested = time.monotonic()
+            budget = remaining()
+            if renewal_check:
+                renewal_check()
+            state = (await asyncio.wait_for(self.client.get("state"), budget))["snapshot"]
+            self.client.snapshot = state
+            self.record({"event": "owner_rejoin_state", "snapshot": state,
+                         "request_started_at_monotonic_s": requested,
+                         "response_observed_at_monotonic_s": time.monotonic()})
+
     async def _resume_once(
         self, *, wall_deadline, require_episode, refusal_identity, expected_pause,
         renewal_check, clock, interrupted, grant_context=None, pending_recovery=None, resume_context=None,
@@ -2235,8 +2277,8 @@ class SameRunRecovery:
                     self.record({"event": "owner_rejoin_state", "snapshot": state,
                                  "request_started_at_monotonic_s": requested,
                                  "response_observed_at_monotonic_s": time.monotonic()})
-                waiting_view = False
-                while True:
+                def qualify_current_hold(state):
+                    nonlocal previous_remaining, previous_stamp
                     checked(state)
                     run, evidence, live = state["run"], state.get("evidence", {}), _live(state)
                     revision, ack = run.get("intent_revision"), evidence.get("accepted_host_action") or {}
@@ -2248,7 +2290,8 @@ class SameRunRecovery:
                         or run.get("status") != "paused" or run.get("recovery") is not None
                         or type(revision) is not int
                         or not all(evidence.get(k) is True for k in
-                                   ("feedback", "required_observation", "hold_acknowledged", "pose_aligned", "native_ack"))
+                                   ("feedback", "required_observation", "hold_acknowledged", "native_ack"))
+                        or type(evidence.get("pose_aligned")) is not bool
                         or evidence.get("active_acknowledged") is not False
                         or type(evidence.get("acknowledged_intent_revision")) is not int
                         or evidence["acknowledged_intent_revision"] != revision
@@ -2264,33 +2307,14 @@ class SameRunRecovery:
                         or stamp + remaining > run["deadline"]):
                         raise RuntimeError("fresh grant rejoin held/current-view proof unavailable")
                     clock["remaining"] = remaining
+                    previous_remaining, previous_stamp = remaining, stamp
+                    return evidence["pose_aligned"]
+                def held_remaining():
                     budget = min(local_ceiling, clock["held_view_ceiling"]) - time.monotonic()
                     if budget <= 0:
                         raise TimeoutError("original grant held/view ceiling exhausted")
-                    view = live.get("required_view") or {}
-                    if _view_admitted(state) and not waiting_view:
-                        break  # Preserve the established already-qualified path.
-                    if (set(view) != {"required", "qualified", "role", "cause"}
-                        or view.get("required") is not True or type(view.get("qualified")) is not bool
-                        or view.get("role") not in {"forward", "backward", "chest", "wrist_left", "wrist_right"}
-                        or view.get("cause") != (None if view["qualified"] else "required_view_expired")):
-                        raise RuntimeError("current selected view deficit is unavailable or malformed")
-                    if view["qualified"]:
-                        break
-                    waiting_view = True
-                    previous_remaining, previous_stamp = remaining, stamp
-                    await asyncio.sleep(min(.05, budget))
-                    requested = time.monotonic()
-                    budget = min(local_ceiling, clock["held_view_ceiling"]) - requested
-                    if budget <= 0:
-                        raise TimeoutError("original grant held/view ceiling exhausted")
-                    if renewal_check:
-                        renewal_check()
-                    state = (await asyncio.wait_for(self.client.get("state"), budget))["snapshot"]
-                    self.client.snapshot = state
-                    self.record({"event": "owner_rejoin_state", "snapshot": state,
-                                 "request_started_at_monotonic_s": requested,
-                                 "response_observed_at_monotonic_s": time.monotonic()})
+                    return budget
+                state = await self._wait_current_hold(state, qualify_current_hold, held_remaining, renewal_check)
                 checked(state)
                 budget = min(local_ceiling, clock["held_view_ceiling"]) - time.monotonic()
                 if budget <= 0:
@@ -2485,6 +2509,8 @@ class SameRunRecovery:
                 # all subsequent replacement work consume this same ceiling.
                 ceiling = min(requested + native_remaining,
                               local_ceiling if local_ceiling is not None else float("inf"))
+                clock["held_view_ceiling"] = min(clock.get("held_view_ceiling", float("inf")), requested + 8, ceiling)
+                ceiling = min(ceiling, clock["held_view_ceiling"])
                 def remaining():
                     value = ceiling - time.monotonic()
                     if value <= 0:
@@ -2497,45 +2523,60 @@ class SameRunRecovery:
                              "remaining_s": remaining(), "outcome": "ambiguous"})
                 await self._attach_transport(state, identity, remaining, renewal_check)
                 budget = remaining()
+                fresh_requested = time.monotonic()
                 fresh = (await asyncio.wait_for(self.client.get("state"), budget))["snapshot"]
                 self.client.snapshot = fresh
-                self.check(fresh)
-                run, evidence, live = fresh["run"], fresh.get("evidence", {}), _live(fresh)
-                revision = run.get("intent_revision")
-                ack = evidence.get("accepted_host_action") or {}
-                stamp, old_stamp = ack.get("acquired_at_monotonic_s"), (
-                    state.get("evidence", {}).get("accepted_host_action") or {}
-                ).get("acquired_at_monotonic_s")
-                current_remaining = run.get("remaining_s")
-                if (
-                    run.get("status") != "paused" or run.get("recovery") is not None
-                    or pause_event(fresh) != original_event
-                    or type(revision) is not int or revision not in ((identity["intent_revision"],) if release_loss else
-                                                                  (identity["intent_revision"], identity["intent_revision"] + 1))
-                    or self.client.connection != identity["connection_generation"]
-                    or not all(evidence.get(k) is True for k in
-                               ("feedback", "required_observation", "hold_acknowledged", "pose_aligned", "native_ack"))
-                    or evidence.get("active_acknowledged") is not False
-                    or ack.get("run_id") != run["run_id"]
-                    or ack.get("host_incarnation") != run["backend_incarnation"]
-                    or ack.get("state") != "paused" or type(ack.get("intent_revision")) is not int
-                    or ack["intent_revision"] != revision
-                    or type(evidence.get("acknowledged_intent_revision")) is not int
-                    or evidence["acknowledged_intent_revision"] != revision
-                    or type(live.get("cursor_intent_revision")) is not int or live["cursor_intent_revision"] != revision
-                    or not _view_admitted(fresh)
-                    or any(type(v) not in (int, float) or not math.isfinite(v)
-                           for v in (stamp, old_stamp, current_remaining))
-                    or not 0 < current_remaining <= native_remaining
-                    or not old_stamp <= stamp <= run["deadline"] - current_remaining
-                ):
+                self.record({"event": "owner_rejoin_state", "snapshot": fresh,
+                             "request_started_at_monotonic_s": fresh_requested,
+                             "response_observed_at_monotonic_s": time.monotonic()})
+                previous_remaining = native_remaining
+                previous_stamp = (state.get("evidence", {}).get("accepted_host_action") or {}).get("acquired_at_monotonic_s")
+                previous_revision = None
+                def unavailable(snapshot):
                     error = RuntimeError("current ordinary paused binding/held feedback unavailable")
                     # Diagnostics never replace the original guard refusal.
                     with contextlib.suppress(Exception):
                         error.qualification = _paused_binding_diagnostic(
-                            state, fresh, identity, original_event, release_loss,
+                            state, snapshot, identity, original_event, release_loss,
                             self.client.connection, native_remaining, ceiling)
-                    raise error
+                    return error
+                def qualify_current_hold(snapshot):
+                    nonlocal previous_remaining, previous_stamp, previous_revision
+                    self.check(snapshot)
+                    run, evidence, live = snapshot["run"], snapshot.get("evidence", {}), _live(snapshot)
+                    revision = run.get("intent_revision")
+                    ack = evidence.get("accepted_host_action") or {}
+                    stamp, current_remaining = ack.get("acquired_at_monotonic_s"), run.get("remaining_s")
+                    if (
+                        run.get("status") != "paused" or run.get("recovery") is not None
+                        or pause_event(snapshot) != original_event
+                        or type(revision) is not int or revision not in ((identity["intent_revision"],) if release_loss else
+                                                                      (identity["intent_revision"], identity["intent_revision"] + 1))
+                        or previous_revision is not None and revision != previous_revision
+                        or self.client.connection != identity["connection_generation"]
+                        or not all(evidence.get(k) is True for k in
+                                   ("feedback", "required_observation", "hold_acknowledged", "native_ack"))
+                        or type(evidence.get("pose_aligned")) is not bool
+                        or evidence.get("active_acknowledged") is not False
+                        or ack.get("run_id") != run["run_id"]
+                        or ack.get("host_incarnation") != run["backend_incarnation"]
+                        or ack.get("state") != "paused" or type(ack.get("intent_revision")) is not int
+                        or ack["intent_revision"] != revision
+                        or type(evidence.get("acknowledged_intent_revision")) is not int
+                        or evidence["acknowledged_intent_revision"] != revision
+                        or type(live.get("cursor_intent_revision")) is not int or live["cursor_intent_revision"] != revision
+                        or any(type(v) not in (int, float) or not math.isfinite(v)
+                               for v in (stamp, previous_stamp, current_remaining))
+                        or not 0 < current_remaining <= previous_remaining
+                        or not previous_stamp <= stamp <= run["deadline"] - current_remaining
+                    ):
+                        raise unavailable(snapshot)
+                    previous_remaining, previous_stamp, previous_revision = current_remaining, stamp, revision
+                    clock["remaining"] = current_remaining
+                    return evidence["pose_aligned"]
+                fresh = await self._wait_current_hold(fresh, qualify_current_hold, remaining, renewal_check, unavailable)
+                revision = fresh["run"]["intent_revision"]
+                stamp = fresh["evidence"]["accepted_host_action"]["acquired_at_monotonic_s"]
                 if renewal_check:
                     renewal_check()
                 remaining()
@@ -2588,9 +2629,11 @@ class SameRunRecovery:
                                 and held_stamp <= stamp <= run["deadline"] - current_remaining)
                     budget = remaining()
                     await asyncio.wait_for(SessionClient._resume_connected(
-                        self.client, check=checked, qualified_check=current_held, refusal_record=self.record), budget)
+                        self.client, check=checked, qualified_check=current_held, refusal_record=self.record,
+                        qualification_ceiling=clock["held_view_ceiling"]), budget)
                 else:
-                    await asyncio.wait_for(self.client.resume(check=checked, refusal_record=self.record), budget)
+                    await asyncio.wait_for(self.client.resume(
+                        check=checked, refusal_record=self.record, qualification_ceiling=clock["held_view_ceiling"]), budget)
                 if renewal_check:
                     renewal_check()
                 remaining()
@@ -2900,7 +2943,7 @@ async def run(args):
              "bench_continuity": bench, "view_policy": summary["view_policy"], "workload_segment": segment,
              "terminal_qualification_budget_seconds": terminal_budget,
              "terminal_completion_policy": summary["terminal_completion_policy"],
-             "program_active_seconds": {"full": 172.5, "combined": 12., "body": 4.5, "continuity": 24.}[segment] if args.source == "virtual-leaders" else None,
+             "program_active_seconds": {"full": 172.5, "combined": 12., "body": 4.5, "continuity": 24., "combined-body": 64.5}[segment] if args.source == "virtual-leaders" else None,
              "input_duration_seconds": args.duration_seconds,
              "controller_interruption": controller_gap, "interruption_at_seconds": getattr(args, "interrupt_at_seconds", None),
              "interruption_seconds": getattr(args, "interruption_seconds", .65)}
@@ -3716,7 +3759,7 @@ def main(argv=None):
     parser.add_argument("--interrupt-at-seconds", type=float)
     parser.add_argument("--interruption-seconds", type=float, default=0.65)
     parser.add_argument("--bench-continuity", action="store_true", help="predetermined virtual bench; viewing is advisory")
-    parser.add_argument("--workload-segment", choices=("full", "combined", "body", "continuity"), default="full")
+    parser.add_argument("--workload-segment", choices=("full", "combined", "body", "continuity", "combined-body"), default="full")
     parser.add_argument("--interrupt-controller", action="store_true", help="declared bench gap also stops current controller renewals")
     parser.add_argument(
         "--no-keyboard", action="store_true", help="USB stationary probe/arm-only operation; body stays zero"

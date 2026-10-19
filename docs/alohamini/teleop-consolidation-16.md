@@ -2,7 +2,7 @@
 
 Physical leaders are the primary input for ordinary teleoperation. An explicitly selected virtual-leader source substitutes at acquisition and uses the same mapping, authenticated transport and protected Pi-owned execution. The accepted elbow page presets remain useful diagnostic controls.
 
-## Active continuation — Packet18, 2026-10-18
+## Active continuation — Packet18 ordinary use, 2026-10-19
 
 Current operation-first authority and installed/source state are in [current state](current-state.md) and [PROCESS-01/02 and EVIDENCE-01](decisions-and-lessons.md). It permits reviewed finite application-policy changes, new fenced same-operation authority, explicitly selected advisory-presentation virtual bench checks, independent later segments and ordinary reuse. Required local sensing, fresh motion intent and hardware protections remain mandatory. Keep the original strict-view combined workload separate. The checkpoint reports below retain their historical directions and outcomes; their proposed next steps are not current prerequisites.
 
@@ -46,9 +46,9 @@ The Packet16 status/results below describe their original source versions, inclu
 
 ## Current status and source
 
-PR24 was integrated normally into `integrate/am1-local-teleop` at `386d3c376c51d3431cf379af61ab99be95382ab8`, after the published tree matched the exercised product and retained checks/reviews. This follow-up starts at that actual tip on `codex/am1-teleop-consolidation-16` and remains unmerged. Main and AM2 are unchanged.
+PR24 integrated at `386d3c376c51d3431cf379af61ab99be95382ab8`. PR25 subsequently merged normally into `integrate/am1-local-teleop` at `e3d8a1968be12e4b01887b930ed644061f88bf41` with the exact accepted tree; integration documentation tip is `cbc10b56`. Current [PR26](https://github.com/pickmanmike/lerobot_alohamini/pull/26) is draft/unmerged on `codex/am1-ordinary-use`, reviewed/exercised source `528307b276bab31c41f10a508ed4ba26eeb26379`. Its PC-only current-HOLD correction passed 160 affected checks and independent review, then completed Actual88. Main and AM2 are unchanged.
 
-Current deployment, full matched rollback and the operational “Resume work here” map are maintained once in [current state](current-state.md). Use its current row before the historical results below; source publication, installed imports, cleanup, active workload progress and next Start remain separate evidence. Earlier failed results and source-specific checks retain their original identities. The original combined workload and separate next Start remain unqualified.
+Current deployment, full matched rollback and the operational “Resume work here” map are maintained once in [current state](current-state.md). Stage42 installed runtime `089dd15ddf910dc9410523f57c6fcb2778ecc1cd` /manifest `728baae5382b8dd9e24ddc5fb2ea540cf0a983be6e8dd90a434861660651a182` through all ten stopped/idle phases; motor A910, camera BC344 and helper0FE remain separate. The immediate full matched predecessor is A910/runtime2ba/MF3dff. Only Coree229 changed; installed reconciliation remains FB700. Normal admitted Start/active ownership is 3s, idle/terminal 1.5s, explicit bench 6s; native input250ms and required view500ms remain. Use the current row before historical results. Actual73 advisory full producer completion, Actual78 advisory-policy reuse and Actual79 short normal required-view success are accepted separately; the original 172.5s strict full benchmark remains unqualified, while Actual88 completed the separate 64.5s finite normal programme with real holds and the limits below.
 
 Historical pre-Packet18 known-cleanup installation (retained provenance): motor `6328bb524bc4e42c70f9896d66904177c1830277`, runtime `68118e4e9dddf8dddaa3ea6cbf64f54fdd511980`, manifest `de681ad6f73f2639a1971b96eee41214b5edfdc1730082e7f77b78a3c6795dbb`, helper/manual `0fe3997f12b9cdfdd01fda6f4c6b102781252448`, and physical camera `bc3442b54d9c574a8feddb0ade642c9b351e59f9`. Immediate full matched rollback is motor `2fbc8265b15393dcc799e603223b8902844e2919`, the same runtime/camera, and manifest `1d64de8e1e2f05938a39fae7a67a9a3ff3b19f94ae456f311116c41e52bbbd57`. Older rollback bundles and all original results remain retained.
 
@@ -79,7 +79,7 @@ Combined14 used PC candidate `0a458a90` and unchanged stage12 components. It adm
 
 The prospective live-health hardening replaces six one-byte health transactions per arm with one exact33..70/38-byte SDK transaction per bound six-motor chain. The original per-bus read interval, status-first validation, settings and installed limits remain; a valid block reporting74 still faults. Distinct response width rejects unrelated short replies before field decoding, without retries or hot-sample suppression. It does not prove the cause of Combined14 or distinguish an arbitrary delayed reply of the same width/ID. The two affected modules passed 160 tests in1.31s and independent review. A stopped read-only installed-firmware comparison retained20 transactions/120 valid response packets, correct SDK/wire offsets,20 off/zero checks, closed buses and unchanged complete history/private files. No powered success follows from that comparison. All ten actual motor-only stage13 phases passed, including actual owner runtime/client import and idle availability. Full matched predecessor motor/runtime bundles were archived before motor upload/checkout; no task started during staging. Combined15 exercised this source and stopped on another valid high-temperature reply, as recorded below; the acquisition hardening did not resolve that boundary.
 
-## Latest operating result and remaining boundary
+## Historical Combined15 result and subsequent boundary records
 
 Combined15 used motor6328/runtime681/manifestde681 and the original PC producer45c84c8a. It recorded116 Core-accepted frames and 11.002 active producer seconds; the final retained native accepted source is106. The host faulted on an intact44-byte ID2 response containing temperature90 at the correct33..70-block offset30, against installed70. Its same-binding prior successful block reported34 about41.2ms earlier. The exact outgoing request, all six full replies, original times and first cause remain retained. SDK decoding matches the wire; physical temperature, sensor behavior and any remaining reply-origin cause are unresolved. A short one-byte reply cannot explain this accepted full-width packet.
 
@@ -129,6 +129,12 @@ One stopped format inventory found all five roles advertise MJPEG/YUYV, includin
 
 ## Verification and ordinary use
 
+Actual88 completed the declared 64.5 producer-active seconds/999targets of the existing combined-body suffix (original program 108..172.5), normal required chest viewing, no injected interruption and original 300s native ceiling. Useful right-elbow out/back spanned 5.361deg; grippers 18.086/17.471 opening points and wrist/right-shoulder movement were measured. Left elbow remains weak: 13 ticks/1.143deg opposite-command drift is not useful-capability credit. During body work arms remained within 5 raw ticks/about 0.439deg, with the existing small supported shoulder hold adjustment. Wheel-derived forward response peaked 0.126m/s; yaw41.016deg/s during accepted turn command/44.531deg/s post-release, then near zero; lift 10.459→15.771→8.470mm. These brief raised-base responses do not prove floor travel or target arrival.
+
+Core ACK-running time 78.491s and post-first-Resume held 43.768s are separate from producer time; longest uninterrupted interval 7.556s, longest hold 4.058s. The PC-only common 8s canonical-view/native-HOLD wait physically qualified pending pose in 1.031s and later required-view state in 2.047s before new grant/capture, preserving original authority/run/reference/deadline without Claim/replay. All 313 renewals succeeded, max RTT 0.813s; native episodes 0 and causes null do not erase ordinary pauses. Viewer106 had 225/241 fresh source+decoded operating samples, longest consecutive sampled span 14.329s and 3 accepted automatic source reconnects. Current chest images provide dark/partly occluded room/linkage awareness, not precise or uninterrupted visual teleoperation.
+
+Programme completion, finish/native HOLD and zero commanded body qualified; exact measured zero and native interactive execution-complete remain false. Terminal qualification 0.453s and verified Stop/readback 3.820s are separate. All six originals/correct-context audit/once-only analysis qualify certain off/zero cleanup. Actual88 was a fresh ordinary Start after87; afterward the authenticated read-only interface showed stopped/certain/readback-verified with Start and Claim available, zero blocked control requests and no new Start requested. No extra physical test is required solely to publish these results. Earlier80–87 failures, accepted73/78/79 scopes and the original 172.5s strict comparison remain separate in [current state](current-state.md). Physical USB acquisition stays owner-deferred.
+
 Focused checks are recorded by source version: initial media61 Python checks/one existing skip and 44 browser checks; affected existing modes208 checks; AM1 observation client110 local checks and 9 actual-owner in-process checks; TX/RX settings/native139 checks; lift readiness469 checks/four existing platform skips; latest live-health/native160 checks; final PC adapter80 checks/one existing warning. These overlapping cohorts are not a cumulative unique-test count or a physical qualification. Independent affected-source reviews passed before staging. The declared representative exercise uses virtual leader-format input, 172.5 active program seconds under a newly declared fixed300-second native ceiling, original250ms input freshness, individual then combined arm/gripper movements, and a separate arms-held existing raised-base body recipe. It includes one selected-view switch/reconnect, one controlled input interruption/fresh rejoin, and a brief next Start. Producer program completion and native interactive Stop are separate results.
 
 Use the reviewed checkout, existing environment, enrolled browser state and trusted CA. Open the authenticated onboard viewer separately and explicitly select a fresh role. The viewer observes; the adapter owns input and Start/Stop. Every invocation requires a fresh private output directory.
@@ -141,13 +147,26 @@ $env:PYTHONPATH = "$PWD/src;$PWD;$PWD/.cache/am1-session-pi-01/http-overlay"
 $sessionArgs = @('--url', '<existing-HTTPS-origin>',
                  '--ca', '<trusted-CA-file>',
                  '--storage-state', '<existing-enrolled-state>')
+```
+
+The current ordinary suffix uses the existing selector:
+
+```powershell
+uv run --no-sync --project C:/Users/pickm/lerobot_alohamini_client python -B -m tools.am1_leader_adapter `
+  @sessionArgs --source virtual-leaders --workload-segment combined-body --duration-seconds 65 `
+  --output '<fresh-private-ordinary-output>'
+```
+
+The retained original full comparison uses the same session/environment arguments; it is not a prerequisite to an independently declared supported suffix or next Start:
+
+```powershell
 uv run --no-sync --project C:/Users/pickm/lerobot_alohamini_client python -B -m tools.am1_leader_adapter `
   @sessionArgs --source virtual-leaders --duration-seconds 180 `
   --interrupt-at-seconds 60 --interruption-seconds 0.65 `
   --output '<fresh-private-combined-output>'
 ```
 
-The virtual cap is active progress, with172.5s required for the complete declared program. Startup, holds, final-zero qualification and cleanup take additional wall time, within the original native ceiling. View selection/reconnection is a separate authenticated browser action; the adapter has no view-switch flag. A separate brief next Start, after the prior task is stopped with qualified cleanup, any uncertainty resolved, and originals retained; full-program completion is not required, uses:
+The virtual cap is active progress, with172.5s required for the complete declared program. Startup, holds, final-zero qualification and cleanup take additional wall time, within the original native ceiling. View selection/reconnection is a separate authenticated browser action; the adapter has no view-switch flag. A separate brief held-input admission diagnostic, after the prior task is stopped with qualified cleanup, any uncertainty resolved, and originals retained, uses the command below. It is not a useful out-and-back or human-teleoperation qualification; Actual78/79 separately demonstrate their declared 12s useful checks. Full-program completion is not required before another supported Start:
 
 ```powershell
 uv run --no-sync --project C:/Users/pickm/lerobot_alohamini_client python -B -m tools.am1_leader_adapter `
@@ -171,6 +190,6 @@ The existing body keys are `w/s` for forward/back, `z/x` for lateral, `a/d` for 
 
 After USB connection/identity and stationary sampling are established, the prepared short human check is fresh clutch with still leaders, one modest supported out-and-back per arm and a free gripper opening, then ordinary Stop. Actual human ergonomics, grasping and task success remain separate. Manual follower positioning, an old reference pose or human leader motion does not unlock the current automated implementation work.
 
-The current post-Actual78 Duffy_Laptop enumeration finds no serial ports; the last retained P1 inventory was empty and has not been requalified here. The owner elected to continue without connecting physical leaders. Historic left USB identity5B3D045224 and right5B3D048497 (VID1A86/PID55D3), leader ID so101_leader_bi and the existing so_leader calibration remain preparation references; historical COM8/COM7 are not current ports. Physical USB identity/stationary sampling and actual human leader movement are unverified. Virtual success will not be reported as moving-leader validation. After automated qualification, the remaining human check is a short fresh-clutched leader movement within the supported workspace; no object, floor travel, tuning or manual follower positioning is required by this packet.
+The last retained post-Actual78 Duffy_Laptop and P1 inventories were empty; this is historical evidence, not a current COM validation. The owner deferred physical USB acquisition, so no new enumeration or connection request is required for the available virtual-source work. Historic left USB identity5B3D045224 and right5B3D048497 (VID1A86/PID55D3), leader ID so101_leader_bi and existing so_leader calibration remain preparation references; historical COM8/COM7 are not current ports. Physical USB acquisition and human ergonomics stay unverified, separate from virtual success. The later short fresh-clutched human check remains prepared, with no object, floor travel, tuning or manual follower positioning prerequisite.
 
 AM1 stays wireless. Persistent service startup restores an idle interface and never starts or replays motor activity. Software durability here means continuity, state preservation and recovery; it does not mean mechanical lifespan. Internet telepresence, grasping, VR, autonomy and human ergonomics remain later task-level checks.

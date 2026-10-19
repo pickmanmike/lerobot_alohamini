@@ -1036,10 +1036,12 @@ class SessionAuthority:
                     and self.run.get("bench_continuity") is True)
 
     def _controller_lease_seconds(self):
-        # HTTP receipt delivery may take three seconds. The selected predetermined
-        # bench keeps a finite six-second ownership margin, separately from the
-        # unchanged 250 ms fresh movement grant and native input watchdog.
-        return 6.0 if self._bench_continuity() and self.run["status"] not in TERMINAL else 1.5
+        # Session presence is separate from the unchanged 250 ms movement expiry.
+        # Ordinary teleop tolerates the observed 1.64 s renewal-dispatch stall;
+        # selected bench control retains its six-second receipt-delivery margin.
+        if self._physical_interactive() and self.run["recipe"] == TELEOP_RECIPE and self.run["status"] not in TERMINAL:
+            return 6.0 if self._bench_continuity() else 3.0
+        return 1.5
 
     def _invalidate_control_intent(self, reason):
         intent = self.run.get("control_intent") if self.run else None
@@ -2431,7 +2433,10 @@ class SessionAuthority:
                         "controller_generation": self.controller["generation"],
                         "service_incarnation": self.service_incarnation, "start_operation_id": oid,
                     }
-                    self.controller["expires"] = self.clock() + 6.0
+                if self._physical_interactive():
+                    # This accepted Start owns the current generation after the
+                    # recheck above; give its first renewal the active-session margin.
+                    self.controller["expires"] = self.clock() + self._controller_lease_seconds()
             if recipe.name == LEFT_ELBOW_POSITIVE_CONTROL.recipe_name:
                 self.run["confirmation_of"] = confirmation_of
                 self.run["positive_prerequisite"] = positive_prerequisite
