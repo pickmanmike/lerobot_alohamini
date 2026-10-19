@@ -29,7 +29,12 @@ useful movement, uninterrupted intervals, active/held and recovery time, usable
 viewing and ordinary reuse; cleanup/refusals support rather than complete it.
 
 Packet18 supersedes proposed Packet17's spike-causation-first direction; Packet16
-supersedes wrist-button Packet15. PR25 stays unmerged; main and AM2 are unchanged.
+supersedes wrist-button Packet15. The owner accepted Actual73/78/79 and authorized
+ordinary integration of PR25 into integrate/am1-local-teleop (comment6272465039).
+PR25 is merged at e3d8a196; main and AM2 are unchanged. New executable follow-up
+repairs use a focused branch/PR and are not automatically merged. Physical USB
+connection remains owner-deferred; retain historic identities/calibration without
+requesting connection, repeated unchanged enumeration or claiming new validation.
 TEMP-01 retains isolated numeric highs/warnings and faults on confirmed high slots,
 genuine device errors and invalid/stale feedback. Reuse TemperatureWindow's five
 occupied 100 ms maxima and original 0.5 s age bound. Historical 55 C/cold-start40 C
