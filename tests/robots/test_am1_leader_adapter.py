@@ -29,6 +29,35 @@ def test_selected_bench_view_policy_preserves_actual_presentation(bench, require
     assert state == original
 
 
+def test_ordinary_physical_teleop_lease_preserves_idle_and_other_mode_boundaries(tmp_path):
+    from types import SimpleNamespace
+
+    from tests.robots.test_am1_live_teleop_executor import authority_lane
+    from tools.am1_session_core import LIVE_ELBOW_SPECS, TERMINAL
+
+    a, executor, _ = authority_lane(tmp_path)
+    try:
+        for status in ("starting", "preparing", "paused", "resuming", "running", "recovering", "finishing"):
+            a.run["status"] = status
+            assert a._controller_lease_seconds() == 3.
+        a.run.update(status="running", bench_continuity=True)
+        assert a._controller_lease_seconds() == 6.
+        for status in TERMINAL:
+            a.run["status"] = status
+            assert a._controller_lease_seconds() == 1.5
+        a.run.update(status="running", bench_continuity=False, recipe=next(iter(LIVE_ELBOW_SPECS)))
+        assert a._controller_lease_seconds() == 1.5
+        a.run["recipe"] = "physical-live-teleop"
+        a.executor = SimpleNamespace(source="fake")
+        assert a._controller_lease_seconds() == 1.5
+        a.run = None
+        assert a._controller_lease_seconds() == 1.5
+    finally:
+        a.executor = executor
+        a.run = None
+        a.close()
+
+
 @pytest.mark.parametrize("invalid", [False, True])
 def test_bench_continuity_cli_selects_policy_before_start_and_bounds_controller_gap(monkeypatch, invalid):
     m = adapter()
@@ -2266,7 +2295,7 @@ def test_original_recovery_ceiling_includes_authenticated_read_time_without_rean
     asyncio.run(asyncio.wait_for(scenario(), 0.3))
 
 
-@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_view_reconnect", "grant_view_switch", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "held_qualification_loss", "resume_alignment_refusal", "resume_alignment_refused_twice", "runner_initial_cursor_pending", "resume_reply_timeout_pre", "resume_reply_timeout_post", "acquisition_input_pause", "receipt_ack_starvation", "ack_never_returns", "ack_close_cancel", "transport_blackout_hb1", "transport_blackout_hb2", "transport_blackout_long", "initial_ack_timely", "initial_ack_missing", "connect_receipt_fast", "connect_receipt_delayed", "connect_receipt_missing", "connect_receipt_late", "connect_receipt_caller_ceiling", "connect_receipt_input", "connect_receipt_grant", "renew_receipt_cost", "renew_receipt_cost_expired", "bench_reacquire", "bench_reacquire_receipt_lost", "bench_reacquire_receipt_cancelled", "bench_input_receipt_unknown_native", "bench_input_receipt_unknown_pause", "grant_close_timeout", "grant_close_timeout_pause", "grant_close_timeout_takeover", "grant_close_timeout_cancel", "resume_send_pre", "resume_send_post", "resume_send_pause", "resume_send_takeover", "resume_send_stop", "resume_send_cancel", "resume_send_budget", "resume_send_reboot", "bench_finish_hold", "bench_finish_no_ack", "bench_finish_stale_revision", "bench_finish_body_nonzero", "bench_finish_fault", "bench_finish_external_pause", "bench_finish_stop", "bench_finish_takeover", "bench_finish_reboot", "bench_finish_cancel", "bench_finish_pause_unknown", "bench_finish_budget", "bench_finish_native_ceiling", "bench_finish_strict", "normal_finish_hold", "normal_finish_no_ack", "normal_finish_stale_revision", "normal_finish_body_nonzero", "normal_finish_fault", "normal_finish_external_pause", "normal_finish_stop", "normal_finish_takeover", "normal_finish_reboot", "normal_finish_cancel", "normal_finish_pause_unknown", "normal_finish_budget", "normal_finish_native_ceiling", "normal_finish_view_before", "normal_finish_view_after"])
+@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_view_reconnect", "grant_view_switch", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "held_qualification_loss", "resume_alignment_refusal", "resume_alignment_refused_twice", "runner_initial_cursor_pending", "resume_reply_timeout_pre", "resume_reply_timeout_post", "acquisition_input_pause", "receipt_ack_starvation", "ack_never_returns", "ack_close_cancel", "transport_blackout_hb1", "transport_blackout_hb2", "transport_blackout_long", "initial_ack_timely", "initial_ack_missing", "connect_receipt_fast", "connect_receipt_delayed", "connect_receipt_missing", "connect_receipt_late", "connect_receipt_caller_ceiling", "connect_receipt_input", "connect_receipt_grant", "renew_receipt_cost", "renew_receipt_cost_expired", "bench_reacquire", "bench_reacquire_receipt_lost", "bench_reacquire_receipt_cancelled", "bench_input_receipt_unknown_native", "bench_input_receipt_unknown_pause", "grant_close_timeout", "grant_close_timeout_pause", "grant_close_timeout_takeover", "grant_close_timeout_cancel", "resume_send_pre", "resume_send_post", "resume_send_pause", "resume_send_takeover", "resume_send_stop", "resume_send_cancel", "resume_send_budget", "resume_send_reboot", "bench_finish_hold", "bench_finish_no_ack", "bench_finish_stale_revision", "bench_finish_body_nonzero", "bench_finish_fault", "bench_finish_external_pause", "bench_finish_stop", "bench_finish_takeover", "bench_finish_reboot", "bench_finish_cancel", "bench_finish_pause_unknown", "bench_finish_budget", "bench_finish_native_ceiling", "bench_finish_strict", "normal_finish_hold", "normal_finish_no_ack", "normal_finish_stale_revision", "normal_finish_body_nonzero", "normal_finish_fault", "normal_finish_external_pause", "normal_finish_stop", "normal_finish_takeover", "normal_finish_reboot", "normal_finish_cancel", "normal_finish_pause_unknown", "normal_finish_budget", "normal_finish_native_ceiling", "normal_finish_view_before", "normal_finish_view_after", "ordinary_lease_dispatch_stall", "ordinary_lease_expired"])
 def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(tmp_path, monkeypatch, cause):
     import asyncio
     import copy
@@ -2546,7 +2575,8 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                 return
             if cause.startswith("renew_receipt_cost"):
                 # Only a processed HTTP renewal's reply is delayed. The real
-                # Core lease clock advances while the PC remains present.
+                # normal teleop 3 s control lease advances independently of the
+                # 250 ms movement lifetime; no product clock is altered here.
                 loop = asyncio.get_running_loop()
                 started = loop.time()
                 a.clock = e.clock = lambda: 10. + loop.time() - started
@@ -2567,8 +2597,8 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                         raise
                     if len(calls) == 1:
                         assert result["accepted"] is True
-                        assert 1.4 < result["presence_expires"] - a.clock() <= 1.5
-                        await asyncio.sleep(1.7 if expired else 1.2)
+                        assert 2.9 < result["presence_expires"] - a.clock() <= 3.
+                        await asyncio.sleep(3.2 if expired else 2.7)
                     elif not second.done():
                         second.set_result(result)
                     in_flight[0] = False
@@ -2579,12 +2609,12 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                 try:
                     if expired:
                         with pytest.raises(m.HTTPOutcomeError, match="controller renewal fence"):
-                            await asyncio.wait_for(second, 2.6)
+                            await asyncio.wait_for(second, 4.1)
                         assert a.controller is None or a.controller["expires"] <= a.clock()
                     else:
-                        result = await asyncio.wait_for(second, 2.6)
+                        result = await asyncio.wait_for(second, 4.1)
                         assert result["accepted"] is True
-                        assert calls[1][0] - calls[0][0] < 1.5
+                        assert calls[1][0] - calls[0][0] < 3.
                         assert a.controller["generation"] == ids["controller_generation"]
                         assert a.controller["expires"] > a.clock()
                         assert not any(v["kind"] == "presence_expired" for v in a.events)
@@ -2801,6 +2831,57 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
 
             producer = m.FrameProducer(Input())
             producer.workspace, producer.native_cursor = workspace(), workspace()["reference"]
+            if cause.startswith("ordinary_lease_"):
+                pi_now = [10.]
+                a.clock = e.clock = lambda: pi_now[0]
+                renewed = await client.post("claim", {"controller_generation": client.generation})
+                first = await m.send_leader_sample(client, producer, m.ZERO_BODY, record, phase="combined", progress_s=.01)
+                assert first is not None and first[2]["accepted"] is True
+                assert first[0]["expires"] - first[0]["issued"] == .25
+                assert a.applied_input is not None and e._live_target is not None
+                pi_now[0] = 10.249
+                a._expire_controls(pi_now[0])
+                assert a.run["status"] == "running" and e.desired == "active"
+                pi_now[0] = 10.251
+                a._expire_controls(pi_now[0])
+                assert a.run["status"] == "paused" and e.desired == "hold"
+                assert a.applied_input is None and e._live_target is None
+                old = client.generation
+                if cause == "ordinary_lease_expired":
+                    pi_now[0] = 13.001
+                    a._expire_controls(pi_now[0])
+                    assert a.controller is a.connection is None
+                    with pytest.raises(m.HTTPOutcomeError) as refused:
+                        await client.post("claim", {"controller_generation": old})
+                    assert refused.value.non_admitted and refused.value.response["reason"] == "controller renewal fence"
+                    with pytest.raises(m.CommandRefusedError, match="stale control generation"):
+                        await client.command(dict(op="grant", **client.identities()))
+                    assert a.controller is None and e._live_target is None
+                else:
+                    pi_now[0] = 11.64  # Actual82's observed gap between renewal dispatches.
+                    # Independent required viewing stays current during the PC sender scheduling gap.
+                    a._teleop_view["qualified_until"] = pi_now[0] + .5
+                    a._expire_controls(pi_now[0])
+                    assert a.controller is not None and a.controller["generation"] == old
+                    assert renewed["lease_seconds"] == 3. and renewed["presence_expires"] == 13.
+                    assert a.run["status"] == "paused" and e._live_target is None
+                    competitor = a.handle({"op": "claim"}, "competitor")
+                    assert competitor["accepted"] is False and competitor["reason"] == "controller occupied"
+                    current = await client.post("claim", {"controller_generation": old})
+                    assert current["controller_generation"] == old and current["presence_expires"] == 14.64
+                    client.snapshot = (await client.get("state"))["snapshot"]
+                    assert not await guard.resume(expected_pause="input_expired")
+                    assert a.run["status"] == "running" and e._live_target is None
+                    producer.native_cursor, producer.reacquire = m._live(client.snapshot)["cursor"], True
+                    fresh = await m.send_leader_sample(client, producer, m.ZERO_BODY, record, phase="combined", progress_s=.02)
+                    assert fresh is not None and fresh[2]["accepted"] is True
+                    assert fresh[0]["grant_id"] != first[0]["grant_id"]
+                    assert fresh[1]["source"]["sample_seq"] > first[1]["source"]["sample_seq"]
+                    assert fresh[0]["expires"] - fresh[0]["issued"] == .25
+                    assert m._live(client.snapshot)["required_view"]["required"] is True
+                    assert a.run.get("control_intent") is None and a.run.get("bench_continuity") is not True
+                assert a.run["native_live_at"] == 9. and a.run["deadline"] == 309.
+                return
             if cause.startswith("grant_close_timeout"):
                 original_call, accepted_grants, applied = gateway.call, [], []
                 old_ws, old_reader = client.ws, client.reader
@@ -3376,7 +3457,7 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                         assert proof["snapshot"]["evidence"]["accepted_host_action"]["intent_revision"] == a.run["intent_revision"]
                         if normal_finish:
                             assert a.run.get("control_intent") is None
-                            assert a._controller_lease_seconds() == 1.5
+                            assert a._controller_lease_seconds() == 3.
                             assert proof["snapshot"]["run"]["live_input"]["required_view"]["required"] is True
                             assert proof["snapshot"]["run"]["live_input"]["required_view"]["qualified"] is True
                             assert len([row for row in records if row["event"] == "normal_finish_hold_qualified"]) == 1

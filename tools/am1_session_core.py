@@ -1036,10 +1036,12 @@ class SessionAuthority:
                     and self.run.get("bench_continuity") is True)
 
     def _controller_lease_seconds(self):
-        # HTTP receipt delivery may take three seconds. The selected predetermined
-        # bench keeps a finite six-second ownership margin, separately from the
-        # unchanged 250 ms fresh movement grant and native input watchdog.
-        return 6.0 if self._bench_continuity() and self.run["status"] not in TERMINAL else 1.5
+        # Session presence is separate from the unchanged 250 ms movement expiry.
+        # Ordinary teleop tolerates the observed 1.64 s renewal-dispatch stall;
+        # selected bench control retains its six-second receipt-delivery margin.
+        if self._physical_interactive() and self.run["recipe"] == TELEOP_RECIPE and self.run["status"] not in TERMINAL:
+            return 6.0 if self._bench_continuity() else 3.0
+        return 1.5
 
     def _invalidate_control_intent(self, reason):
         intent = self.run.get("control_intent") if self.run else None
