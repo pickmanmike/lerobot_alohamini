@@ -1,5 +1,6 @@
 """Private stopped-state proof validation; this module never opens a motor device."""
 
+import ast
 import copy
 import hashlib
 import json
@@ -352,6 +353,75 @@ def validate_preimport_stop_origin(run, proof):
     )
 
 
+def _validate_processor_import_frames(config, frames):
+    """Bounded pre-main package discovery; never evidence of stopped hardware."""
+    require(
+        5 <= len(frames) <= 64
+        and [frame[2] for frame in frames[:2]] == ["_run_module_as_main", "_get_module_details"]
+        and all(frame[0] == "<frozen runpy>" and frame[1] > 0 and frame[3] == [] for frame in frames[:2]),
+        "package discovery must precede selected host main; bounded import chain required",
+    )
+    repository = Path(config["host_repository"]) / "src/lerobot"
+    package = repository / "robots/alohamini"
+    anchors = (
+        (package / "__init__.py", "from .alohamini import AlohaMini"),
+        (package / "alohamini.py", "from lerobot.processor import RobotAction, RobotObservation"),
+    )
+    for frame, (path, source) in zip(frames[2:4], anchors, strict=True):
+        require(
+            frame[0] == path.as_posix() and frame[2] == "<module>" and frame[3]
+            and frame[3][0] == "    " + source,
+            "current package discovery anchors required; no host execution frames",
+        )
+    # These are the non-device import roots demonstrated by the existing processor
+    # path. A new dependency family needs evidence rather than a permissive fallback.
+    site = Path(config["host_python"]).parent.parent / "lib/python3.12/site-packages"
+    sources = {}
+    total_bytes = 0
+    for index, (name, number, context, body) in enumerate(frames[2:], 2):
+        path = Path(name)
+        local = path.is_relative_to(repository)
+        if index < 4:
+            permitted = path == anchors[index - 2][0]
+        elif local:
+            relative = path.relative_to(repository)
+            permitted = bool(relative.parts) and relative.parts[0] in {"processor", "configs", "transforms"}
+        else:
+            relative = path.relative_to(site) if path.is_relative_to(site) else None
+            permitted = relative is not None and len(relative.parts) >= 2 and relative.parts[0] in {
+                "torch", "torchvision", "sympy"
+            }
+        require(
+            permitted and path.is_absolute() and path.as_posix() == name and ".." not in path.parts
+            and path.suffix == ".py" and all(not p.is_symlink() for p in (path, *path.parents))
+            and path.is_file() and path.stat().st_size <= 2 * 1024 * 1024,
+            "literal bounded package-import source required; device/foreign source refused",
+        )
+        if name not in sources:
+            data = path.read_bytes()
+            total_bytes += len(data)
+            require(total_bytes <= 16 * 1024 * 1024, "bounded total package-import source required")
+            sources[name] = data.decode("utf-8").splitlines()
+        source = sources[name]
+        require(
+            0 < number <= len(source) and len(source[number - 1]) <= 1024
+            and 1 <= len(body) <= 2 and body[0] == "    " + source[number - 1].strip()
+            and all(len(line) <= 1024 and re.fullmatch(r" +[~^]+", line) for line in body[1:])
+            and re.fullmatch(r"<module>|[A-Za-z_][A-Za-z_0-9.]*", context),
+            "trace must match actual bounded import source/carets",
+        )
+        if local:
+            tree = ast.parse("\n".join(source))
+            require(
+                context == "<module>"
+                and any(isinstance(node, (ast.Import, ast.ImportFrom))
+                        and node.lineno <= number <= node.end_lineno for node in ast.walk(tree))
+                and not any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                            and node.lineno <= number <= node.end_lineno for node in ast.walk(tree)),
+                "repository frames must remain module imports; no construction or operational frame",
+            )
+
+
 def _load_preimport_stop_originals(config, proof):
     """Read immutable origin evidence; no old-off or no-actuation qualification."""
     directory = Path(config["run_root"]) / proof["run_id"][:8]
@@ -370,6 +440,7 @@ def _load_preimport_stop_originals(config, proof):
     for name, digest in hashes.items():
         data = _private_bytes(directory / name)
         require(sha(data) == digest, "original host log changed")
+        require(len(data) <= 65536, "bounded original import-cancel logs required")
         logs[name] = data.decode("utf-8")
     launch = re.fullmatch(
         r"Running as unit: am1-pa01-host-"
@@ -396,6 +467,11 @@ def _load_preimport_stop_originals(config, proof):
         else:
             require(bool(frames), "unexpected original traceback prefix")
             frames[-1][3].append(line)
+    if len(frames) > 3 and frames[3][3] and frames[3][3][0] == (
+        "    from lerobot.processor import RobotAction, RobotObservation"
+    ):
+        _validate_processor_import_frames(config, frames)
+        return logs
     require(
         len(frames) == 11
         and [f[2] for f in frames]

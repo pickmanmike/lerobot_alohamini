@@ -1760,3 +1760,143 @@ def test_preimport_origin_cleanup_appearance_during_ack_never_returns_qualified(
         m.archive_and_ack(config, actual, raw, inventory, str(uuid.uuid4()))
     with pytest.raises(ValueError):
         m.load_qualified_proof(config, run)
+
+
+# Retained Combined66 package-discovery cancellation, with paths rebound only.
+# Offline origin evidence never replaces the separately qualified fresh readback.
+PROCESSOR_PREIMPORT_TRACE = (
+    ('<frozen runpy>', 189, '_run_module_as_main', ()),
+    ('<frozen runpy>', 112, '_get_module_details', ()),
+    ('repo/lerobot/robots/alohamini/__init__.py', 17, '<module>', ('    from .alohamini import AlohaMini',)),
+    ('repo/lerobot/robots/alohamini/alohamini.py', 34, '<module>', ('    from lerobot.processor import RobotAction, RobotObservation',)),
+    ('repo/lerobot/processor/__init__.py', 26, '<module>', ('    from .batch_processor import AddBatchDimensionProcessorStep',)),
+    ('repo/lerobot/processor/batch_processor.py', 27, '<module>', ('    from lerobot.configs import PipelineFeatureType, PolicyFeature',)),
+    ('repo/lerobot/configs/__init__.py', 25, '<module>', ('    from .default import DatasetConfig, EvalConfig, JobConfig, PeftConfig, WandBConfig',)),
+    ('repo/lerobot/configs/default.py', 19, '<module>', ('    from lerobot.transforms import ImageTransformsConfig',)),
+    ('repo/lerobot/transforms/__init__.py', 15, '<module>', ('    from .transforms import (',)),
+    ('repo/lerobot/transforms/transforms.py', 22, '<module>', ('    from torchvision.transforms import v2',)),
+    ('venv/lib/python3.12/site-packages/torchvision/__init__.py', 8, '<module>', ('    from torchvision import _meta_registrations, datasets, io, models, ops, transforms, utils  # usort:skip', '    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^')),
+    ('venv/lib/python3.12/site-packages/torchvision/models/__init__.py', 2, '<module>', ('    from .convnext import *',)),
+    ('venv/lib/python3.12/site-packages/torchvision/models/convnext.py', 9, '<module>', ('    from ..ops.misc import Conv2dNormActivation, Permute',)),
+    ('venv/lib/python3.12/site-packages/torchvision/ops/__init__.py', 23, '<module>', ('    from .poolers import MultiScaleRoIAlign',)),
+    ('venv/lib/python3.12/site-packages/torchvision/ops/poolers.py', 10, '<module>', ('    from .roi_align import roi_align',)),
+    ('venv/lib/python3.12/site-packages/torchvision/ops/roi_align.py', 7, '<module>', ('    from torch._dynamo.utils import is_compile_supported',)),
+    ('venv/lib/python3.12/site-packages/torch/_dynamo/__init__.py', 13, '<module>', ('    from . import (',)),
+    ('venv/lib/python3.12/site-packages/torch/_dynamo/aot_compile.py', 15, '<module>', ('    from torch._dynamo.convert_frame import GraphRuntimeEnv',)),
+    ('venv/lib/python3.12/site-packages/torch/_dynamo/convert_frame.py', 62, '<module>', ('    from torch._dynamo.symbolic_convert import TensorifyState',)),
+    ('venv/lib/python3.12/site-packages/torch/_dynamo/symbolic_convert.py', 54, '<module>', ('    from torch._dynamo.exc import ObservedException, TensorifyScalarRestartAnalysis',)),
+    ('venv/lib/python3.12/site-packages/torch/_dynamo/exc.py', 44, '<module>', ('    from .utils import counters',)),
+    ('venv/lib/python3.12/site-packages/torch/_dynamo/utils.py', 70, '<module>', ('    import torch.fx.experimental.symbolic_shapes',)),
+    ('venv/lib/python3.12/site-packages/torch/fx/experimental/symbolic_shapes.py', 3, '<module>', ('    import sympy',)),
+    ('venv/lib/python3.12/site-packages/sympy/__init__.py', 31, '<module>', ('    from sympy.core.cache import lazy_function',)),
+    ('venv/lib/python3.12/site-packages/sympy/core/__init__.py', 9, '<module>', ('    from .expr import Expr, AtomicExpr, UnevaluatedExpr',)),
+    ('venv/lib/python3.12/site-packages/sympy/core/expr.py', 4188, '<module>', ('    from .mul import Mul',)),
+    ('venv/lib/python3.12/site-packages/sympy/core/mul.py', 2212, '<module>', ('    from .numbers import Rational',)),
+    ('venv/lib/python3.12/site-packages/sympy/core/numbers.py', 4467, '<module>', ('    from .power import Pow',)),
+    ('venv/lib/python3.12/site-packages/sympy/core/power.py', 14, '<module>', ('    from .relational import is_gt, is_lt',)),
+    ('venv/lib/python3.12/site-packages/sympy/core/relational.py', 909, '<module>', ('    class GreaterThan(_Greater):',)),
+    ('venv/lib/python3.12/site-packages/sympy/core/basic.py', 218, '__init_subclass__', ('    _prepare_class_assumptions(cls)',)),
+    ('venv/lib/python3.12/site-packages/sympy/core/assumptions.py', 624, '_prepare_class_assumptions', ("    v = cls.__dict__.get(attrname, '')", '        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^')),
+)
+
+
+def processor_preimport_fixture(tmp_path, monkeypatch):
+    m, config, run, proof, state, directory = preimport_stop_fixture(tmp_path, monkeypatch)
+    repository = Path(config["host_repository"])
+    environment = tmp_path / "venv"
+    config["host_python"] = str(environment / "bin/python")
+    proof["source"]["backend_contract"] = copy.deepcopy(config)
+    lines = ["Traceback (most recent call last):"]
+    for name, number, context, body in PROCESSOR_PREIMPORT_TRACE:
+        if name.startswith("repo/"):
+            path = repository / "src" / name.removeprefix("repo/")
+            name = path.as_posix()
+        elif name.startswith("venv/"):
+            path = environment / name.removeprefix("venv/")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            source = ["# retained dependency source"] * number
+            source[number - 1] = body[0].strip()
+            path.write_text("\n".join(source) + "\n", encoding="utf-8")
+            name = path.as_posix()
+        lines.append(f'  File "{name}", line {number}, in {context}')
+        lines.extend(body)
+    data = ("\n".join(lines) + "\nKeyboardInterrupt\n").encode()
+    (directory / "host-runtime.log").write_bytes(data)
+    proof["original_host_logs"]["host-runtime.log"] = hashlib.sha256(data).hexdigest()
+    publish_preimport_fixture(run, proof, state)
+    return m, config, run, proof, state, directory
+
+
+def test_preimport_processor_discovery_accepts_retained_trace_only_with_fresh_proof(tmp_path, monkeypatch):
+    m, config, run, proof, state, directory = processor_preimport_fixture(tmp_path, monkeypatch)
+    original = copy.deepcopy(run)
+    logs = {name: (directory / name).read_bytes() for name in proof["original_host_logs"]}
+    actual, raw, inventory = m.load_qualified_proof(config, run)
+    assert actual == proof and inventory == dict.fromkeys(m.MARKERS)
+    operation = str(uuid.uuid4())
+    ack = m.archive_and_ack(config, actual, raw, inventory, operation)
+    receipt = dict(actual, acknowledgment=dict(ack, consumed_operation_id=operation))
+    assert m.acknowledged_receipt(receipt, run, operation)
+    assert m.load_qualified_proof(config, run)[0] == proof
+    assert run == original and run["uncertain"] is True and run["native_first_cause"] is None
+    assert run["physical_result"]["readback"] is None and not (directory / "cleanup.json").exists()
+    assert {name: (directory / name).read_bytes() for name in logs} == logs
+    assert all(not (state / name).exists() for name in m.MARKERS)
+
+
+@pytest.mark.parametrize(
+    "broken",
+    [
+        "discovery", "package_source", "local_function", "host_main", "physical_module",
+        "foreign_dependency", "dependency_source", "caret", "trace_bound", "frame_bound",
+        "source_bound", "source_escape", "fresh_torque", "fresh_lift", "fresh_thermal",
+    ],
+)
+def test_preimport_processor_discovery_refuses_execution_and_unqualified_proof(tmp_path, monkeypatch, broken):
+    m, config, run, proof, state, directory = processor_preimport_fixture(tmp_path, monkeypatch)
+    path = directory / "host-runtime.log"
+    data = path.read_bytes()
+    dependency = Path(config["host_python"]).parent.parent / "lib/python3.12/site-packages/sympy/core/assumptions.py"
+    if broken == "discovery":
+        data = data.replace(b"in _get_module_details", b"in _run_code")
+    elif broken == "package_source":
+        data = data.replace(b"from lerobot.processor import RobotAction, RobotObservation", b"from lerobot.motors import Motor")
+    elif broken == "local_function":
+        data = data.replace(b'line 26, in <module>', b'line 26, in __init__', 1)
+    elif broken in ("host_main", "physical_module"):
+        source = Path(config["host_repository"]) / "src/lerobot" / (
+            "robots/alohamini/alohamini_host.py" if broken == "host_main" else "motors/motors_bus.py"
+        )
+        body = source.read_text(encoding="utf-8").splitlines()[0].strip()
+        extra = f'  File "{source.as_posix()}", line 1, in <module>\n    {body}\n'.encode()
+        data = data.replace(b"KeyboardInterrupt", extra + b"KeyboardInterrupt")
+    elif broken == "foreign_dependency":
+        foreign = tmp_path / "foreign.py"
+        foreign.write_bytes(dependency.read_bytes())
+        data = data.replace(dependency.as_posix().encode(), foreign.as_posix().encode())
+    elif broken == "dependency_source":
+        dependency.write_text("# source changed\n", encoding="utf-8")
+    elif broken == "caret":
+        data = data.replace(b'        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^', b'    unexpected execution text')
+    elif broken == "trace_bound":
+        data = data.replace(b"KeyboardInterrupt", b" " * 65536 + b"KeyboardInterrupt")
+    elif broken == "frame_bound":
+        frame = f'  File "{dependency.as_posix()}", line 624, in _prepare_class_assumptions\n    v = cls.__dict__.get(attrname, '')\n'.encode()
+        data = data.replace(b"KeyboardInterrupt", frame * 65 + b"KeyboardInterrupt")
+    elif broken == "source_bound":
+        dependency.write_bytes(b"#" * (2 * 1024 * 1024 + 1))
+    elif broken == "source_escape":
+        data = data.replace(dependency.as_posix().encode(), (dependency.parent / ".." / "core" / dependency.name).as_posix().encode())
+    elif broken == "fresh_torque":
+        proof["readback"]["readbacks"][0]["value"] = 1
+    elif broken == "fresh_lift":
+        proof["readback"].pop("lift_stationary")
+    else:
+        proof["readback"]["lift_stationary"]["temperature_slots"][0][0] = 99.0
+    path.write_bytes(data)
+    proof["original_host_logs"][path.name] = hashlib.sha256(data).hexdigest()
+    publish_preimport_fixture(run, proof, state)
+    with pytest.raises((ValueError, OSError, RuntimeError, TypeError)):
+        m.load_qualified_proof(config, run)
+    assert not list(state.glob("reconciliation-ack-*"))
+    assert not (directory / "cleanup.json").exists()
