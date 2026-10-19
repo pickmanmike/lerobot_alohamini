@@ -1,4 +1,4 @@
-## Active AM1 knowledge reuse and teleoperation (Packet18)
+## Active AM1 view continuity after accepted Packet18 operation
 
 Read first: [current state](docs/alohamini/current-state.md) and
 [source-backed decisions/lessons](docs/alohamini/decisions-and-lessons.md).
@@ -29,10 +29,23 @@ useful movement, uninterrupted intervals, active/held and recovery time, usable
 viewing and ordinary reuse; cleanup/refusals support rather than complete it.
 
 Packet18 supersedes proposed Packet17's spike-causation-first direction; Packet16
-supersedes wrist-button Packet15. The owner accepted Actual73/78/79 and authorized
-ordinary integration of PR25 into integrate/am1-local-teleop (comment6272465039).
-PR25 is merged at e3d8a196; main and AM2 are unchanged. New executable follow-up
-repairs use a focused branch/PR and are not automatically merged. Physical USB
+supersedes wrist-button Packet15. Actual73/78/79 retain their separate acceptance.
+The owner accepted Actual88's bounded normal64.5s result and integrated PR26 into
+integrate/am1-local-teleop at472f8c4d, exact accepted a4d5f7e1 tree; PR25 remains
+merged at e3d8a196. Main/AM2 and installed Stage42 are unchanged; no redeploy or
+physical repeat follows from that source-equivalent merge. The current focused
+branch codex/am1-view-continuity remains unmerged, with no automatic integration.
+[Latest scoped direction](https://github.com/pickmanmike/lerobot_alohamini/pull/26#issuecomment-6279335089) prioritizes viewing interruptions: join ONE
+representative Actual88 episode across source, complete RTP, decoded/presented
+frames and progress delivery/acceptance before choosing a supported correction.
+The150ms serialized progress POST/750ms wait versus500ms freshness is a candidate,
+not an established cause. Reuse the finite camera-only and delayed-receipt fixtures;
+then a supported short check and64.5s normal REQUIRED-view comparison when justified.
+This is not a new merge gate or a pass of the original172.5s strict comparison.
+Keep the existing process-local msedge software-decoder workaround/rollback exact;
+ordinary-launch integration is pending, not GPU proof or a global preference change.
+No fault-injection campaign, gains, network remediation or freshness downgrade.
+Physical USB
 connection remains owner-deferred; retain historic identities/calibration without
 requesting connection, repeated unchanged enumeration or claiming new validation.
 TEMP-01 retains isolated numeric highs/warnings and faults on confirmed high slots,
