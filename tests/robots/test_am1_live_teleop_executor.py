@@ -1562,19 +1562,55 @@ def test_bench_start_records_immutable_policy_and_extends_only_current_applicati
     monkeypatch.setattr(e, "begin", lambda recipe: True)  # No device worker; real admission/binding still run.
     try:
         claim = a._handle({"op": "claim"}, "pc")
+        assert a.controller["expires"] == 11.5  # Idle Claim retains its original short lease.
         request = {'op': "start", 'operation_id': str(uuid4()), 'recipe': "physical-live-teleop", 'controller_generation': claim["controller_generation"]}
         if policy is not None:
             request["bench_continuity"] = policy
         result = a._handle(request, "pc")
         assert result["accepted"], result
         assert a.run.get("bench_continuity", False) is (policy is True)
-        assert a.controller["expires"] == (16. if policy is True else 11.5)
+        assert a.controller["expires"] == (16. if policy is True else 13.)
         if policy is True:
             assert a.run["control_intent"]["eligible"]
             assert a.snapshot()["run"]["bench_continuity"] is True
             assert not a._handle(dict(request, bench_continuity=False), "pc")["accepted"]
         else:
             assert "control_intent" not in a.run
+    finally:
+        a.run = None
+        a.close()
+
+
+@pytest.mark.parametrize("phase", ["before_start", "during_evidence"])
+@pytest.mark.parametrize("policy", [None, False, True])
+def test_teleop_start_never_extends_expired_idle_authority(tmp_path, monkeypatch, phase, policy):
+    from tools.am1_session_core import SessionAuthority
+
+    e, _ = admitted_executor()
+    now, begun = [10.], []
+    a = SessionAuthority(tmp_path, clock=lambda: now[0], executor=e)
+    monkeypatch.setattr(e, "begin", lambda recipe: begun.append(recipe) or True)
+    try:
+        claimed = a._handle({"op": "claim"}, "pc")
+        generation, original_run_id = claimed["controller_generation"], e.run_id
+        assert a.controller["expires"] == 11.5 and a.run is None
+        original_evidence = a._evidence
+        def late_evidence():
+            evidence = original_evidence()
+            now[0] = 11.5
+            return evidence
+        if phase == "during_evidence":
+            monkeypatch.setattr(a, "_evidence", late_evidence)
+        else:
+            now[0] = 11.5
+        request = {"op": "start", "operation_id": str(uuid4()), "recipe": "physical-live-teleop",
+                   "controller_generation": generation}
+        if policy is not None:
+            request["bench_continuity"] = policy
+        result = a._handle(request, "pc")
+        assert result["accepted"] is False and result["reason"] == "current controller lease required"
+        assert a.run is None and a.controller["generation"] == generation and a.controller["expires"] == 11.5
+        assert begun == [] and e.run_id == original_run_id
     finally:
         a.run = None
         a.close()

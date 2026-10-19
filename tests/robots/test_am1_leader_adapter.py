@@ -2295,7 +2295,7 @@ def test_original_recovery_ceiling_includes_authenticated_read_time_without_rean
     asyncio.run(asyncio.wait_for(scenario(), 0.3))
 
 
-@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_view_reconnect", "grant_view_switch", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "held_qualification_loss", "resume_alignment_refusal", "resume_alignment_refused_twice", "runner_initial_cursor_pending", "resume_reply_timeout_pre", "resume_reply_timeout_post", "acquisition_input_pause", "receipt_ack_starvation", "ack_never_returns", "ack_close_cancel", "transport_blackout_hb1", "transport_blackout_hb2", "transport_blackout_long", "initial_ack_timely", "initial_ack_missing", "connect_receipt_fast", "connect_receipt_delayed", "connect_receipt_missing", "connect_receipt_late", "connect_receipt_caller_ceiling", "connect_receipt_input", "connect_receipt_grant", "renew_receipt_cost", "renew_receipt_cost_expired", "bench_reacquire", "bench_reacquire_receipt_lost", "bench_reacquire_receipt_cancelled", "bench_input_receipt_unknown_native", "bench_input_receipt_unknown_pause", "grant_close_timeout", "grant_close_timeout_pause", "grant_close_timeout_takeover", "grant_close_timeout_cancel", "resume_send_pre", "resume_send_post", "resume_send_pause", "resume_send_takeover", "resume_send_stop", "resume_send_cancel", "resume_send_budget", "resume_send_reboot", "bench_finish_hold", "bench_finish_no_ack", "bench_finish_stale_revision", "bench_finish_body_nonzero", "bench_finish_fault", "bench_finish_external_pause", "bench_finish_stop", "bench_finish_takeover", "bench_finish_reboot", "bench_finish_cancel", "bench_finish_pause_unknown", "bench_finish_budget", "bench_finish_native_ceiling", "bench_finish_strict", "normal_finish_hold", "normal_finish_no_ack", "normal_finish_stale_revision", "normal_finish_body_nonzero", "normal_finish_fault", "normal_finish_external_pause", "normal_finish_stop", "normal_finish_takeover", "normal_finish_reboot", "normal_finish_cancel", "normal_finish_pause_unknown", "normal_finish_budget", "normal_finish_native_ceiling", "normal_finish_view_before", "normal_finish_view_after", "ordinary_lease_dispatch_stall", "ordinary_lease_expired"])
+@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_view_reconnect", "grant_view_switch", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "held_qualification_loss", "resume_alignment_refusal", "resume_alignment_refused_twice", "runner_initial_cursor_pending", "resume_reply_timeout_pre", "resume_reply_timeout_post", "acquisition_input_pause", "receipt_ack_starvation", "ack_never_returns", "ack_close_cancel", "transport_blackout_hb1", "transport_blackout_hb2", "transport_blackout_long", "initial_ack_timely", "initial_ack_missing", "connect_receipt_fast", "connect_receipt_delayed", "connect_receipt_missing", "connect_receipt_late", "connect_receipt_caller_ceiling", "connect_receipt_input", "connect_receipt_grant", "renew_receipt_cost", "renew_receipt_cost_expired", "bench_reacquire", "bench_reacquire_receipt_lost", "bench_reacquire_receipt_cancelled", "bench_input_receipt_unknown_native", "bench_input_receipt_unknown_pause", "grant_close_timeout", "grant_close_timeout_pause", "grant_close_timeout_takeover", "grant_close_timeout_cancel", "resume_send_pre", "resume_send_post", "resume_send_pause", "resume_send_takeover", "resume_send_stop", "resume_send_cancel", "resume_send_budget", "resume_send_reboot", "bench_finish_hold", "bench_finish_no_ack", "bench_finish_stale_revision", "bench_finish_body_nonzero", "bench_finish_fault", "bench_finish_external_pause", "bench_finish_stop", "bench_finish_takeover", "bench_finish_reboot", "bench_finish_cancel", "bench_finish_pause_unknown", "bench_finish_budget", "bench_finish_native_ceiling", "bench_finish_strict", "normal_finish_hold", "normal_finish_no_ack", "normal_finish_stale_revision", "normal_finish_body_nonzero", "normal_finish_fault", "normal_finish_external_pause", "normal_finish_stop", "normal_finish_takeover", "normal_finish_reboot", "normal_finish_cancel", "normal_finish_pause_unknown", "normal_finish_budget", "normal_finish_native_ceiling", "normal_finish_view_before", "normal_finish_view_after", "ordinary_lease_dispatch_stall", "ordinary_lease_expired", "ordinary_start_late_first_renewal"])
 def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(tmp_path, monkeypatch, cause):
     import asyncio
     import copy
@@ -2370,7 +2370,7 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
     real_handle = a.handle
 
     def handle(command, device):
-        commands.append((command["op"], a.run["status"]))
+        commands.append((command["op"], a.run["status"] if a.run else None))
         if command["op"] == "connect":
             assert a.run["status"] == "paused", "connect must not short-circuit Core recovery"
             if a.run["recovery_episodes"]:
@@ -2465,6 +2465,31 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                     return original_ws_connect(*args, **kwargs)
                 monkeypatch.setattr(client.http, "ws_connect", fixture_heartbeat)
             await client.attach()
+            if cause == "ordinary_start_late_first_renewal":
+                client.generation, client.connection = ids["controller_generation"], ids["connection_generation"]
+                idle_evidence, pi_now, begun = copy.deepcopy(e.evidence()), [10.], []
+                a.clock = e.clock = lambda: pi_now[0]
+                e.evidence = lambda: copy.deepcopy(idle_evidence)
+                e.begin = lambda recipe: begun.append(recipe) or True  # No device worker.
+                a.run = None
+                initial = await client.post("claim", {"controller_generation": client.generation})
+                assert initial["lease_seconds"] == 1.5 and initial["presence_expires"] == 11.5
+                generation = client.generation
+                pi_now[0] = 10.802256399  # Actual84's admitted Start offset from its idle Claim.
+                started = await client.post("start", {"operation_id": str(uuid4()),
+                    "recipe": "physical-live-teleop", "controller_generation": generation})
+                assert started["accepted"] is True and a.run["status"] == "starting"
+                admitted_expiry = a.controller["expires"]
+                pi_now[0] = 12.  # First renewal is processed beyond the old idle expiry.
+                renewed = await client.post("claim", {"controller_generation": generation})
+                assert renewed["accepted"] is True and renewed["controller_generation"] == generation
+                assert admitted_expiry == 13.802256399 and renewed["presence_expires"] == 15.
+                assert renewed["lease_seconds"] == 3. and len(begun) == 1
+                assert a.run["native_live_at"] is None and a.run["deadline"] is None and a.run["progress_s"] == 0.
+                assert a.run.get("control_intent") is None and a.run.get("bench_continuity") is False
+                assert not any(op in {"connect", "resume", "grant", "input"} for op, _ in commands)
+                assert not any(event["kind"] == "presence_expired" for event in a.events)
+                return
             client.generation, client.connection = ids["controller_generation"], ids["connection_generation"]
             if cause.startswith("bench_input_receipt_unknown"):
                 guard = m.SameRunRecovery(client, record)

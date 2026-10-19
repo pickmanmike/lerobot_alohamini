@@ -2433,7 +2433,10 @@ class SessionAuthority:
                         "controller_generation": self.controller["generation"],
                         "service_incarnation": self.service_incarnation, "start_operation_id": oid,
                     }
-                    self.controller["expires"] = self.clock() + 6.0
+                if self._physical_interactive():
+                    # This accepted Start owns the current generation after the
+                    # recheck above; give its first renewal the active-session margin.
+                    self.controller["expires"] = self.clock() + self._controller_lease_seconds()
             if recipe.name == LEFT_ELBOW_POSITIVE_CONTROL.recipe_name:
                 self.run["confirmation_of"] = confirmation_of
                 self.run["positive_prerequisite"] = positive_prerequisite
