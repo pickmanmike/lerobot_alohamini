@@ -50,6 +50,20 @@ def test_bench_continuity_cli_selects_policy_before_start_and_bounds_controller_
         assert seen[0].workload_segment == "continuity" and seen[0].interruption_seconds == 7
 
 
+def test_combined_body_cli_preserves_normal_required_view_selection(monkeypatch):
+    m = adapter()
+    seen = []
+    async def run(args):
+        seen.append(args)
+        return {}
+    monkeypatch.setattr(m, "run", run)
+    m.main(["--source", "virtual-leaders", "--url", "unused", "--ca", "unused",
+            "--storage-state", "unused", "--output", "unused", "--workload-segment", "combined-body",
+            "--duration-seconds", "65"])
+    assert seen[0].workload_segment == "combined-body" and seen[0].duration_seconds == 65.
+    assert seen[0].bench_continuity is False and seen[0].interrupt_at_seconds is None
+
+
 @pytest.mark.parametrize("boundary", ["cli", "run"])
 def test_predetermined_segment_refuses_usb_before_creating_run(monkeypatch, boundary):
     import asyncio
@@ -685,7 +699,7 @@ def test_real_wss_clean_close_ends_qualified_wait_before_timeout(tmp_path):
         "bench_terminal_hold_stopped", "bench_terminal_hold_cancel", "bench_terminal_hold_budget",
         "bench_terminal_hold_native_ceiling",
         "bench_program_finish", "bench_program_finish_failed",
-        "normal_program_finish", "normal_program_finish_failed", "usb_finite_finish", "usb_finite_finish_failed", "usb_quit_finish", "usb_quit_empty_finish",
+        "normal_program_finish", "normal_program_finish_failed", "normal_program_finish_combined_body", "usb_finite_finish", "usb_finite_finish_failed", "usb_quit_finish", "usb_quit_empty_finish",
     ],
 )
 def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id(
@@ -1371,6 +1385,8 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
         if program_finish:
             if normal_finish:
                 args.bench_continuity = False
+            if failure == "normal_program_finish_combined_body":
+                args.workload_segment = "combined-body"
             if usb_finish:
                 args.source, args.workload_segment = "usb-leaders", "full"
             if failure.startswith("usb_quit_"):
@@ -1416,6 +1432,10 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 assert start["terminal_qualification_budget_seconds"] == 2.
                 assert summary["producer_program_complete"] is (not usb_finish)
                 assert summary["native_execution_complete"] is False
+                if failure == "normal_program_finish_combined_body":
+                    assert start["workload_segment"] == summary["workload_segment"] == "combined-body"
+                    assert start["program_active_seconds"] == 64.5
+                    assert start["bench_continuity"] is False
                 if usb_finish:
                     assert summary["clean_input_end"] == ("local_quit" if failure.startswith("usb_quit_") else "duration_elapsed")
             else:
