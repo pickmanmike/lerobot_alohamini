@@ -6,6 +6,28 @@ Use the matching lesson before diagnosing a symptom; check coverage at the actua
 new entrypoint before reopening an accepted decision. Update changed rows, not a
 packet diary. Historical runbooks retain original results and detailed procedures.
 
+Current operation-first authority (PR25 comment6258758730 and the owner's
+continuation mandate) permits bounded repeated virtual-leader bench operation,
+focused PC/browser/Pi repairs, reviewed affected-component staging and ordinary
+reconciliation/restart. Application ownership leases, renewal/receipt timing,
+rearm/reconnection budgets and experiment criteria may be revised with a stated
+purpose and affected positive/cancellation checks; earlier packet constants are
+not immutable hardware requirements. Fresh movement intent remains separate from
+controller/session lifetime. Obtain new fenced authority after expiry rather than
+reviving an expired generation; a newer takeover, revocation, accepted Pause/Stop
+or owner reboot prevails. Never replay old input or auto-resume after owner reboot.
+
+For an explicitly selected predetermined virtual bench exercise, browser video
+presentation may be advisory to execution while genuine required local inputs
+remain healthy. Select and record that policy before Start; keep WebRTC measured
+and recovering. It does not qualify the original strict-view benchmark or remove
+useful viewing for human visual teleoperation. Declare shortened/reordered segments
+before Start; later segments and ordinary next Start can be tested independently
+when their own prerequisites hold. Do not aggregate segments into a full pass.
+Continue supported engineering/retries after an interruption. Judge progress by
+useful movement, uninterrupted intervals, active/held and recovery time, usable
+viewing and ordinary reuse; cleanup/refusals support rather than complete it.
+
 Packet18 supersedes proposed Packet17's spike-causation-first direction; Packet16
 supersedes wrist-button Packet15. PR25 stays unmerged; main and AM2 are unchanged.
 TEMP-01 retains isolated numeric highs/warnings and faults on confirmed high slots,
@@ -19,7 +41,7 @@ Physical leaders are primary for useful manipulation/telepresence. Virtual input
 substitutes at acquisition through the same protected Pi-owned path. Quest and
 concrete household autonomy follow later. Per-motor pages remain diagnostics.
 Keep role-specific settings/units, raw feedback and original times, normal-rest
-acquisition, original input expiry/generations, run reference/deadline, sole motor
+acquisition, fresh input expiry and fenced new generations, run reference/deadline, sole motor
 ownership and qualified recovery. Ordinary pauses are not extra recovery episodes.
 Preserve actual device/current/status/voltage protections and first causes.
 

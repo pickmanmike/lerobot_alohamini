@@ -553,9 +553,9 @@ class Gateway:
 
     async def fence(self, device):
         self.tickets = {key: value for key, value in self.tickets.items() if value[0] != device}
-        snapshot = await self.current()
-        if snapshot.get("controller", {}) and snapshot["controller"]["device_id"] == device:
-            await self.call({"op": "release", "operation_id": str(uuid.uuid4())}, device)
+        # Core also fences eligible same-operation intent after the lease expires.
+        # It atomically preserves any other device's current authority.
+        await self.call({"op": "release", "operation_id": str(uuid.uuid4())}, device)
         for peer in list(self.peers):
             if peer.device == device:
                 await close_socket(peer.ws, peer.ws._writer.transport, 1008)
@@ -850,6 +850,11 @@ class Gateway:
                 controller = snapshot.get("controller")
                 if controller and not self.auth.capable(controller["device_id"]):
                     await self.fence(controller["device_id"])
+                    snapshot = await self.current()
+                intent = (snapshot.get("run") or {}).get("control_intent") or {}
+                if (intent.get("eligible") is True and isinstance(intent.get("device_id"), str)
+                        and not self.auth.capable(intent["device_id"])):
+                    await self.fence(intent["device_id"])
                     snapshot = await self.current()
                 for peer in list(self.peers):
                     if not self.auth.resolve(peer.token):

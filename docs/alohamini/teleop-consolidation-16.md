@@ -2,7 +2,9 @@
 
 Physical leaders are the primary input for ordinary teleoperation. An explicitly selected virtual-leader source substitutes at acquisition and uses the same mapping, authenticated transport and protected Pi-owned execution. The accepted elbow page presets remain useful diagnostic controls.
 
-## Active continuation — Packet18, 2026-10-17
+## Active continuation — Packet18, 2026-10-18
+
+Current operation-first authority and installed/source state are in [current state](current-state.md) and [PROCESS-01/02 and EVIDENCE-01](decisions-and-lessons.md). It permits reviewed finite application-policy changes, new fenced same-operation authority, explicitly selected advisory-presentation virtual bench checks, independent later segments and ordinary reuse. Required local sensing, fresh motion intent and hardware protections remain mandatory. Keep the original strict-view combined workload separate. The checkpoint reports below retain their historical directions and outcomes; their proposed next steps are not current prerequisites.
 
 Earlier Stage24 Packet18 installation was motor `5a2e750b9c1f0778fad7c70fbd419a27ddfc9d79`, runtime `30263a6c73ba8d76e6b17afc4a45c6a755754ac3`, unchanged camera `bc3442b54d9c574a8feddb0ade642c9b351e59f9`, matched manifest `48d4c7fc2fa2ff1227d35d3f296e3e89c1b9f42bc097d7151fb425d4c1c17fc7`. All ten Stage24 stopped/idle phases passed. Source candidate `b74ab3dc23750fbd8b34a3757bd6bae9d0018e6e` contains the reviewed exact-owner expiry correction (335checks/8skips/scoped lint/independent CLEAR). Full13 motor context retains11 files, including the50ms lift relief correction, and changes only host/apply_frame against actual priorc919; capsule parent remains f03. Runtime full22 bundle, camera/helper/calibration remain unchanged; actual imports match. Full matchedc919/runtime302/MFbcdf rollback was archived before upload; older pairs remain. Windows changes only its motor pin with exact beforebytes/SDDL and unchanged ACL. Staging starts no physical task; original failures and later genuine reconciliation/ACK remain distinct.
 

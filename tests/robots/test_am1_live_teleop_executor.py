@@ -1534,3 +1534,294 @@ def test_selected_view_core_receipt_preserves_original_floor_and_reports_actual_
     finally:
         a.run = None
         a.close()
+
+
+# Operation-first bench policy is opt-in; strict visual teleoperation is unchanged.
+def _bench_intent(a):
+    a.run["bench_continuity"] = True
+    a.run["control_intent"] = {
+        "eligible": True, "device_id": "pc",
+        "controller_generation": a.controller["generation"],
+        "service_incarnation": a.service_incarnation,
+        "start_operation_id": a.run["operation_id"],
+    }
+
+
+def _reclaim(a, generation, **changes):
+    proof = {'run_id': a.run["run_id"], 'service_incarnation': a.service_incarnation, 'start_operation_id': a.run["operation_id"], 'previous_generation': generation}
+    proof.update(changes)
+    return {'op': "claim", 'operation_id': str(uuid4()), 'reacquire': proof}
+
+
+@pytest.mark.parametrize("policy", [None, False, True])
+def test_bench_start_records_immutable_policy_and_extends_only_current_application_lease(tmp_path, monkeypatch, policy):
+    from tools.am1_session_core import SessionAuthority
+
+    e, _ = admitted_executor()
+    a = SessionAuthority(tmp_path, clock=lambda: 10., executor=e)
+    monkeypatch.setattr(e, "begin", lambda recipe: True)  # No device worker; real admission/binding still run.
+    try:
+        claim = a._handle({"op": "claim"}, "pc")
+        request = {'op': "start", 'operation_id': str(uuid4()), 'recipe': "physical-live-teleop", 'controller_generation': claim["controller_generation"]}
+        if policy is not None:
+            request["bench_continuity"] = policy
+        result = a._handle(request, "pc")
+        assert result["accepted"], result
+        assert a.run.get("bench_continuity", False) is (policy is True)
+        assert a.controller["expires"] == (16. if policy is True else 11.5)
+        if policy is True:
+            assert a.run["control_intent"]["eligible"]
+            assert a.snapshot()["run"]["bench_continuity"] is True
+            assert not a._handle(dict(request, bench_continuity=False), "pc")["accepted"]
+        else:
+            assert "control_intent" not in a.run
+    finally:
+        a.run = None
+        a.close()
+
+
+@pytest.mark.parametrize("policy", [1, "true", None])
+def test_bench_start_refuses_non_boolean_policy(tmp_path, monkeypatch, policy):
+    from tools.am1_session_core import SessionAuthority
+
+    e, _ = admitted_executor()
+    a = SessionAuthority(tmp_path, clock=lambda: 10., executor=e)
+    monkeypatch.setattr(e, "begin", lambda recipe: True)
+    try:
+        claim = a._handle({"op": "claim"}, "pc")
+        result = a._handle({'op': "start", 'operation_id': str(uuid4()), 'recipe': "physical-live-teleop", 'controller_generation': claim["controller_generation"], 'bench_continuity': policy}, "pc")
+        assert not result["accepted"] and a.run is None
+    finally:
+        a.run = None
+        a.close()
+
+
+def test_bench_advisory_view_preserves_actual_view_state_and_native_input_expiry(tmp_path):
+    a, e, ids = authority_lane(tmp_path)
+    _bench_intent(a)
+    now = [10.]
+    a.clock = e.clock = lambda: now[0]
+    try:
+        assert a._teleop_view_status() == {"required": False, "qualified": False, "role": None,
+                                            "cause": "required_view_expired"}
+        grant = a._handle(dict(op="grant", **ids), "pc")
+        assert grant["accepted"], grant
+        src = source(grant=grant["grant_id"])
+        packet = dict(op="input", **ids, grant_id=grant["grant_id"], seq=1, source=src,
+                      target=dict.fromkeys(KEYS, 5.),
+                      body={"x.vel": 0., "y.vel": 0., "theta.vel": 0., "lift_axis.vel": 0.})
+        assert a._handle(packet, "pc")["accepted"]
+        assert a.applied_input["expires"] == 10.25
+        now[0] = 10.251
+        a._expire_controls(now[0])
+        assert a.run["status"] == "paused" and e._live_target is None
+        assert a.run["control_intent"]["eligible"]
+        assert not a._handle(packet, "pc")["accepted"]
+    finally:
+        a.run = None
+        a.close()
+
+
+def test_bench_advisory_never_accepts_usb_source_or_bypasses_required_local_feedback(tmp_path):
+    a, e, ids = authority_lane(tmp_path)
+    _bench_intent(a)
+    try:
+        a._teleop_view = {"run_id": e.run_id, "qualified_until": 11.}
+        grant = a._handle(dict(op="grant", **ids), "pc")
+        frame = dict(op="input", **ids, grant_id=grant["grant_id"], seq=1,
+                     source=dict(source(grant=grant["grant_id"]), kind="usb-leaders"),
+                     target=dict.fromkeys(KEYS, 5.),
+                     body={"x.vel": 0., "y.vel": 0., "theta.vel": 0., "lift_axis.vel": 0.})
+        assert not a._handle(frame, "pc")["accepted"]
+        assert e._live_target is None
+        frame["source"]["kind"] = "virtual-leaders"
+        e.sample["at"] = 8.  # Genuine stale native feedback; advisory video cannot admit it.
+        assert not a._handle(frame, "pc")["accepted"]
+        assert e._live_target is None
+        e.sample["at"] = 10.
+        e.observation.qualified = False  # Required local images remain distinct from browser presentation.
+        assert e.evidence()["feedback"] is True and e.evidence()["required_observation"] is False
+        assert not a._handle(frame, "pc")["accepted"]
+        assert e._live_target is None
+    finally:
+        a.run = None
+        a.close()
+
+
+def test_bench_current_renewal_survives_three_seconds_but_never_revives_expired_generation(tmp_path):
+    a, e, ids = authority_lane(tmp_path)
+    _bench_intent(a)
+    now = [10.]
+    a.clock = e.clock = lambda: now[0]
+    try:
+        renewed = a._handle({'op': "claim", 'controller_generation': ids["controller_generation"]}, "pc")
+        assert renewed["lease_seconds"] == 6. and renewed["presence_expires"] == 16.
+        assert renewed["timing"] == {"service_received_at": 10., "service_completed_at": 10.}
+        now[0] = 13.1
+        a._expire_controls(now[0])
+        assert a.controller["generation"] == ids["controller_generation"]
+        now[0] = 16.
+        a._expire_controls(now[0])
+        assert a.controller is None and a.run["status"] == "paused"
+        assert not a._handle({'op': "claim", 'controller_generation': ids["controller_generation"]}, "pc")["accepted"]
+    finally:
+        a.run = None
+        a.close()
+
+
+def test_bench_expired_authority_reacquires_new_generation_without_replaying_old_input(tmp_path):
+    a, e, ids = authority_lane(tmp_path)
+    _bench_intent(a)
+    now = [10.]
+    a.clock = e.clock = lambda: now[0]
+    try:
+        old_generation = ids["controller_generation"]
+        old_deadline = a.run["deadline"]
+        reference = copy.deepcopy(e.sample["ack"]["live_input"]["workspace"])
+        a.run["input_source"] = source(seq=1)
+        a.run["intent"] = dict.fromkeys(KEYS, 5.)
+        a.grant = {"id": str(uuid4()), "expires": 10.2}
+        a.controller["expires"] = 10.01
+        now[0] = 10.02
+        a._expire_controls(now[0])
+        reclaimed = a._handle(_reclaim(a, old_generation), "pc")
+        assert reclaimed["accepted"], reclaimed
+        new_generation = reclaimed["controller_generation"]
+        assert new_generation != old_generation
+        assert a.controller["expires"] == 16.02
+        assert a.run["status"] == "paused" and a.run["deadline"] == old_deadline
+        assert a.connection is None and a.grant is None and a.applied_input is None
+        assert a.run["intent"] is None and e._live_target is None
+        assert a.run["input_source"]["sample_seq"] == 1  # Old source history stays a replay fence.
+        assert e.sample["ack"]["live_input"]["workspace"] == reference
+        assert not a._handle(dict(op="connect", **ids), "pc")["accepted"]
+        newids = dict(ids, controller_generation=new_generation)
+        connected = a._handle(dict(op="connect", **newids), "pc")
+        assert connected["accepted"]
+        assert not a._handle(dict(op="grant", **newids), "pc")["accepted"]
+        assert a.events[-1]["kind"] == "controller_reacquired"
+    finally:
+        a.run = None
+        a.close()
+
+
+@pytest.mark.parametrize("intervening", ["pause", "stop", "release", "handoff", "takeover", "same_device_claim"])
+def test_bench_automatic_intent_stays_invalid_after_newer_action_even_when_new_owner_expires(tmp_path, intervening):
+    a, e, ids = authority_lane(tmp_path)
+    _bench_intent(a)
+    now = [10.]
+    a.clock = e.clock = lambda: now[0]
+    old_generation = ids["controller_generation"]
+    try:
+        if intervening in {"takeover", "same_device_claim"}:
+            a.controller["expires"] = 10.01
+            now[0] = 10.02
+            a._expire_controls(now[0])
+            actor = "other" if intervening == "takeover" else "pc"
+            assert a._handle({"op": "claim"}, actor)["accepted"]
+        else:
+            request = {'op': intervening, 'run_id': a.run["run_id"], 'operation_id': str(uuid4())}
+            if intervening == "handoff":
+                request["target_device_id"] = "other"
+            assert a._handle(request, "pc")["accepted"]
+        if a.controller:
+            now[0] = a.controller["expires"]
+            a._expire_controls(now[0])
+        assert not a.run["control_intent"]["eligible"]
+        assert not a._handle(_reclaim(a, old_generation), "pc")["accepted"]
+        assert a.controller is None
+    finally:
+        a.run = None
+        a.close()
+
+
+@pytest.mark.parametrize("field", ["run_id", "service_incarnation", "start_operation_id", "previous_generation"])
+def test_bench_reacquire_requires_exact_current_operation_and_service(tmp_path, field):
+    a, e, ids = authority_lane(tmp_path)
+    _bench_intent(a)
+    try:
+        a.controller = None
+        a.connection = None
+        a.run["status"] = "paused"
+        result = a._handle(_reclaim(a, ids["controller_generation"], **{field: str(uuid4())}), "pc")
+        assert not result["accepted"] and a.controller is None
+    finally:
+        a.run = None
+        a.close()
+
+
+def test_bench_expired_release_revokes_durable_intent_without_disturbing_another_owner(tmp_path):
+    a, e, ids = authority_lane(tmp_path)
+    _bench_intent(a)
+    try:
+        a.controller = None
+        assert a._handle({'op': "release", 'operation_id': str(uuid4())}, "pc")["accepted"]
+        assert not a.run["control_intent"]["eligible"]
+        assert not a._handle(_reclaim(a, ids["controller_generation"]), "pc")["accepted"]
+    finally:
+        a.run = None
+        a.close()
+
+
+@pytest.mark.parametrize("operation", ["connect", "release_input"])
+def test_bench_accepted_pause_cancels_automatic_control_even_before_generation_expires(tmp_path, operation):
+    a, e, ids = authority_lane(tmp_path)
+    _bench_intent(a)
+    try:
+        assert a._handle({'op': "pause", 'run_id': a.run["run_id"], 'operation_id': str(uuid4())}, "pc")["accepted"]
+        assert a.controller["generation"] == ids["controller_generation"]
+        assert not a._handle(dict(op=operation, **ids), "pc")["accepted"]
+    finally:
+        a.run = None
+        a.close()
+
+
+def test_bench_reacquire_idempotent_reply_never_regrants_or_extends_new_authority(tmp_path):
+    a, e, ids = authority_lane(tmp_path)
+    _bench_intent(a)
+    now = [10.]
+    a.clock = e.clock = lambda: now[0]
+    try:
+        a.run.update(status="paused", recovery_episodes=0)
+        e._execution = {"progress_s": 0., "complete": False, "fault": None}
+        live = e.sample["ack"]["live_input"]
+        live["reference"] = live["workspace"]["reference"]
+        a.controller = a.connection = None
+        request = _reclaim(a, ids["controller_generation"])
+        first = a.handle(request, "pc")
+        assert first["accepted"]
+        expires = a.controller["expires"]
+        generation = a.controller["generation"]
+        now[0] = 10.1
+        e.sample["at"] = now[0]
+        assert a.handle(request, "pc") == first
+        assert a.controller["expires"] == expires and a.controller["generation"] == generation
+        a.controller = None
+        assert a.handle(request, "pc") == first
+        assert a.controller is None  # Retained accepted receipt is not renewed authority.
+        assert not a.handle(dict(request, operation_id=str(uuid4())), "pc")["accepted"]
+    finally:
+        a.run = None
+        a.close()
+
+
+def test_bench_owner_restart_invalidates_intent_and_never_auto_reclaims(tmp_path):
+    from tools.am1_session_core import SessionAuthority
+
+    a, e, ids = authority_lane(tmp_path)
+    _bench_intent(a)
+    a.run.update(mode="interactive", started_wall=0.)
+    request = _reclaim(a, ids["controller_generation"])
+    a._save()
+    # End only this non-actuating fixture authority, keeping its durable state.
+    a.run = None
+    a.close()
+    restored = SessionAuthority(tmp_path, clock=lambda: 10., executor=e)
+    try:
+        assert restored.run["status"] == "interrupted"
+        assert not restored.run["control_intent"]["eligible"]
+        assert not restored.handle(request, "pc")["accepted"]
+        assert restored.controller is None and e._live_target is None
+    finally:
+        restored.run = None
+        restored.close()
