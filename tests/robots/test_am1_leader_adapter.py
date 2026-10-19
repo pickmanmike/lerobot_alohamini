@@ -681,6 +681,9 @@ def test_real_wss_clean_close_ends_qualified_wait_before_timeout(tmp_path):
         "bench_input_receipt_terminal",
         "bench_terminal_ack_delayed", "bench_terminal_ack_missing", "bench_terminal_ack_cancel",
         "bench_terminal_ack_stopped", "bench_terminal_ack_pause", "bench_terminal_ack_takeover",
+        "bench_terminal_hold_rejoin", "bench_terminal_hold_pause", "bench_terminal_hold_takeover",
+        "bench_terminal_hold_stopped", "bench_terminal_hold_cancel", "bench_terminal_hold_budget",
+        "bench_terminal_hold_native_ceiling",
     ],
 )
 def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id(
@@ -693,10 +696,11 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
     m = adapter()
     production_post = m.SessionClient.post
     initial_pause_case = failure == "initial_resume_pause"
+    terminal_hold = isinstance(failure, str) and failure.startswith("bench_terminal_hold_")
     bench_case = failure in {"bench_input_gap", "bench_controller_gap", "bench_renewal_during_resume", "bench_renewal_attach_ceiling", "bench_renewal_snapshot_race",
                              "bench_input_receipt_unknown", "bench_input_receipt_pause", "bench_input_receipt_takeover", "bench_input_receipt_terminal",
                              "bench_terminal_ack_delayed", "bench_terminal_ack_missing", "bench_terminal_ack_cancel",
-                             "bench_terminal_ack_stopped", "bench_terminal_ack_pause", "bench_terminal_ack_takeover"}
+                             "bench_terminal_ack_stopped", "bench_terminal_ack_pause", "bench_terminal_ack_takeover"} or terminal_hold
     ack_wait_case = isinstance(failure, str) and failure.startswith("bench_terminal_ack_")
     input_unknown = isinstance(failure, str) and failure.startswith("bench_input_receipt_")
     http_start = failure is not None and failure.startswith("http_start_")
@@ -997,6 +1001,30 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                         else "physical_readback_verified",
                         uncertain=failure in {"admission_fault", "http_start_terminal_uncertain"},
                     )
+            if terminal_hold and len(self.inputs) == 3 and not self.stops:
+                self.terminal_waits += 1
+                prior = self.inputs[-2]
+                current = self.snapshot
+                revision = current["run"]["intent_revision"] + 1
+                current["run"].update(status="paused", intent_revision=revision, recovery=None)
+                current["run"]["live_input"].update(last_input_seq=prior["seq"], source=prior["source"],
+                                                      cursor_intent_revision=revision)
+                current["evidence"].update(active_acknowledged=False, acknowledged_intent_revision=revision)
+                current["evidence"]["accepted_host_action"].update(state="paused", intent_revision=revision)
+                current["events"] = [{"kind": "native_input_expired", "at": 2., "run_id": owned_id,
+                                      "service_incarnation": "service"}]
+                if failure.endswith("pause"):
+                    current["events"][0]["kind"] = "pause"
+                    current["run"]["control_intent"]["eligible"] = False
+                elif failure.endswith("takeover"):
+                    current["controller"] = {"device_id": "other", "controller_generation": str(uuid4())}
+                elif failure.endswith("stopped"):
+                    current["run"].update(status="stopped", cleanup="physical_readback_verified", uncertain=False)
+                elif failure.endswith("cancel"):
+                    raise asyncio.CancelledError("cancellation after current hold publication")
+                assert not predicate(), "the preceding source ACK cannot qualify the current fresh sample"
+                await asyncio.sleep(timeout)
+                raise TimeoutError("current source publication crossed an ordinary input expiry")
             if ack_wait_case and len(self.inputs) >= 2 and not self.stops:
                 self.terminal_waits += 1
                 if self.terminal_waits == 1 or failure == "bench_terminal_ack_missing":
@@ -1052,6 +1080,11 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
             if recovery_case or ordinary_case or mailbox_case or bench_case:
                 assert self.snapshot["run"]["status"] != "recovering"
                 self.resumes += 1
+                if terminal_hold and self.resumes == 2:
+                    assert self.snapshot["events"][-1]["kind"] == "native_input_expired"
+                    assert self.snapshot["evidence"]["hold_acknowledged"] is True
+                    if failure.endswith(("budget", "native_ceiling")):
+                        await asyncio.sleep(2.05)  # A normal rearm can exceed the old whole-finish ceiling.
                 if failure == "ordinary_pauses_no_ack" and self.resumes == 5:
                     raise TimeoutError("unqualified ordinary held ACK")
                 self.snapshot["run"]["status"] = "running"
@@ -1066,6 +1099,9 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
             if initial_pause_case:
                 assert self.resumes == 2, "grant/input cannot precede initial true active ACK"
             if payload["op"] == "grant":
+                if terminal_hold and self.snapshot["run"]["status"] != "running":
+                    raise m.CommandRefusedError({"accepted": False, "status": "refused", "effect_admitted": False,
+                                                "reason": "interactive running required"})
                 if ack_wait_case and self.snapshot["run"]["control_intent"]["eligible"] is False:
                     raise m.CommandRefusedError({"accepted": False, "status": "refused", "effect_admitted": False,
                                                 "reason": "same-operation control intent cancelled"})
@@ -1169,6 +1205,9 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 last_input_seq=payload["seq"], source=payload["source"], body=payload["body"]
             )
             self.snapshot["evidence"]["measured_positions"] = payload["target"]
+            if terminal_hold:
+                self.snapshot["evidence"]["active_acknowledged"] = True
+                self.snapshot["evidence"]["measured_body"]["theta.vel"] = -.5859375 if len(self.inputs) == 2 else 0.
             if ordinary_case and len(self.inputs) <= 4:
                 self.snapshot["run"].update(
                     status="paused", intent_revision=self.snapshot["run"]["intent_revision"] + 1
@@ -1176,8 +1215,12 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 self.snapshot["events"] = [
                     {"kind": "input_expired", "at": 2.0, "run_id": owned_id, "service_incarnation": "service"}
                 ]
-            if (failure == "bench_input_receipt_terminal" or ack_wait_case) and len(self.inputs) == 1:
+            if (failure == "bench_input_receipt_terminal" or ack_wait_case or terminal_hold) and len(self.inputs) == 1:
                 await asyncio.sleep(.03)  # Cross the Windows monotonic tick before terminal qualification.
+                if failure == "bench_terminal_ack_missing":
+                    self.snapshot["run"]["remaining_s"] = 2.  # The new declared bench finish budget remains Native-clipped.
+                if failure == "bench_terminal_hold_native_ceiling":
+                    self.snapshot["run"]["remaining_s"] = .6
             if input_unknown and len(self.inputs) == (2 if failure == "bench_input_receipt_terminal" else 1):
                 self.snapshot["run"]["status"] = "paused"
                 self.snapshot["events"] = [{"kind": "native_input_expired", "at": 2., "run_id": owned_id,
@@ -1296,7 +1339,37 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
         args.source, args.next_start_seconds, args.duration_seconds = "virtual-leaders", None, .001
         args.bench_continuity, args.workload_segment = True, "combined"
         args.interrupt_controller = failure == "bench_controller_gap"
-        args.interrupt_at_seconds, args.interruption_seconds = (None if input_unknown or ack_wait_case or failure in {"bench_renewal_during_resume", "bench_renewal_attach_ceiling"} else 0.), .001
+        args.interrupt_at_seconds, args.interruption_seconds = (None if input_unknown or ack_wait_case or terminal_hold or failure in {"bench_renewal_during_resume", "bench_renewal_attach_ceiling"} else 0.), .001
+        if terminal_hold:
+            if failure.endswith(("rejoin", "budget")):
+                summary = asyncio.run(asyncio.wait_for(m.run(args), 10))
+                assert summary["final_body_zero"] is True and summary["frame_count"] == 1
+                assert summary["terminal_qualification_budget_seconds"] == 12.
+                assert summary["original_native_deadline"] == 301. and summary["active_progress_s"] < .1
+                if failure.endswith("budget"):
+                    assert 2. < summary["terminal_qualification_seconds"] < 12.
+            else:
+                expected = (asyncio.CancelledError if failure.endswith("cancel") else
+                            TimeoutError if failure.endswith("native_ceiling") else RuntimeError)
+                with pytest.raises(expected):
+                    asyncio.run(asyncio.wait_for(m.run(args), 10))
+            session = instances[0]
+            records = [json.loads(line) for line in (tmp_path / "evidence" / "frames.jsonl").read_text().splitlines()]
+            start = next(row for row in records if row["event"] == "start_requested")
+            finish = next(row for row in records if row["event"] == "terminal_qualification_started")
+            assert start["terminal_qualification_budget_seconds"] == 12.
+            assert finish["budget_seconds"] == 12.
+            assert finish["original_ceiling_monotonic_s"] == pytest.approx(
+                finish["local_monotonic_s"] + (.6 if failure.endswith("native_ceiling") else 12.), abs=.02)
+            assert all(row["original_ceiling_monotonic_s"] == finish["original_ceiling_monotonic_s"]
+                       for row in records if row["event"] == "terminal_zero_ack_pending")
+            assert session.resumes == (2 if failure.endswith(("rejoin", "budget", "native_ceiling")) else 1)
+            assert len(session.inputs) == (4 if failure.endswith(("rejoin", "budget")) else 3)
+            assert [row["source"]["sample_seq"] for row in session.inputs] == list(range(1, len(session.inputs) + 1))
+            assert len({row["grant_id"] for row in session.inputs}) == len(session.inputs)
+            assert session.starts == 1 and session.stops == ([] if failure.endswith("stopped") else [owned_id])
+            assert not any(row["event"] == "leader_grant_rejected" for row in records)
+            return
         if ack_wait_case:
             expected = None if failure == "bench_terminal_ack_delayed" else asyncio.CancelledError if failure.endswith("cancel") else RuntimeError
             if expected is None:

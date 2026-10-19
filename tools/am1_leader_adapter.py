@@ -2644,6 +2644,7 @@ async def run(args):
     bench = getattr(args, "bench_continuity", False)
     segment = getattr(args, "workload_segment", "full")
     controller_gap = getattr(args, "interrupt_controller", False)
+    terminal_budget = 12. if bench else 2.
     if (bench or segment != "full") and args.source != "virtual-leaders" or controller_gap and not bench:
         raise ValueError("predetermined virtual bench mode required")
 
@@ -2673,6 +2674,7 @@ async def run(args):
         "bench_continuity": bench,
         "workload_segment": segment,
         "view_policy": "advisory_presentation" if bench else "required_presentation",
+        "terminal_qualification_budget_seconds": terminal_budget,
     }
     renewal_counts = {"accepted": 0, "failed": 0, "cancelled": 0, "max_roundtrip_seconds": 0.0}
 
@@ -2736,6 +2738,7 @@ async def run(args):
         record(
             {"event": "start_requested", "operation_id": start_body["operation_id"], "recipe": TELEOP_RECIPE,
              "bench_continuity": bench, "view_policy": summary["view_policy"], "workload_segment": segment,
+             "terminal_qualification_budget_seconds": terminal_budget,
              "program_active_seconds": {"full": 172.5, "combined": 12., "body": 4.5, "continuity": 24.}[segment],
              "controller_interruption": controller_gap, "interruption_at_seconds": getattr(args, "interrupt_at_seconds", None),
              "interruption_seconds": getattr(args, "interruption_seconds", .65)}
@@ -3091,6 +3094,44 @@ async def run(args):
             renewal = asyncio.create_task(client.renew())
             return True
 
+        def acquisition_state():
+            state = client.snapshot
+            if state["run"]["run_id"] != run_id or state["run"]["deadline"] != deadline:
+                raise RuntimeError("original run identity/deadline changed")
+            recovery.check(state, history=state["run"]["status"] != "recovering")
+            return state
+
+        async def qualify_acquisition(state, *, until=None):
+            if state["run"]["status"] == "running":
+                return True
+            if state["run"]["status"] == "recovering":
+                await rejoin(require_episode=True, until=until)
+                return False
+            cause = next(
+                (
+                    v.get("kind")
+                    for v in reversed(state.get("events", []))
+                    if v.get("kind")
+                    in {"required_view_expired", "input_expired", "native_input_expired", "pause", "stop"}
+                ),
+                None,
+            )
+            if (
+                state["run"]["status"] != "paused"
+                or cause not in {"required_view_expired", "input_expired", "native_input_expired"}
+                or not recovery.history_qualified(state)
+                or state["run"].get("uncertain")
+            ):
+                raise RuntimeError(
+                    "input held: "
+                    + str(state["run"].get("first_cause") or cause or _live(state).get("state"))
+                )
+            if workload:
+                workload.freeze()
+            await rejoin(expected_pause=cause, until=until)
+            record({"event": "qualified_hold_recovery", "cause": cause, "snapshot": client.snapshot})
+            return True
+
         if bench:
             await rejoin()
             if workload and not args.next_start_seconds:
@@ -3102,10 +3143,7 @@ async def run(args):
                 await rejoin()
             if renewal.done():
                 renewal.result()
-            state = client.snapshot
-            if state["run"]["run_id"] != run_id or state["run"]["deadline"] != deadline:
-                raise RuntimeError("original run identity/deadline changed")
-            recovery.check(state, history=state["run"]["status"] != "recovering")
+            state = acquisition_state()
             wall_elapsed = time.monotonic() - active_at
             if (
                 args.next_start_seconds
@@ -3114,33 +3152,8 @@ async def run(args):
                 and wall_elapsed >= args.duration_seconds
             ):
                 break
-            if state["run"]["status"] != "running":
-                if state["run"]["status"] == "recovering":
-                    await rejoin(require_episode=True)
-                    continue
-                cause = next(
-                    (
-                        v.get("kind")
-                        for v in reversed(state.get("events", []))
-                        if v.get("kind")
-                        in {"required_view_expired", "input_expired", "native_input_expired", "pause", "stop"}
-                    ),
-                    None,
-                )
-                if (
-                    state["run"]["status"] != "paused"
-                    or cause not in {"required_view_expired", "input_expired", "native_input_expired"}
-                    or not recovery.history_qualified(state)
-                    or state["run"].get("uncertain")
-                ):
-                    raise RuntimeError(
-                        "input held: "
-                        + str(state["run"].get("first_cause") or cause or _live(state).get("state"))
-                    )
-                if workload:
-                    workload.freeze()
-                await rejoin(expected_pause=cause)
-                record({"event": "qualified_hold_recovery", "cause": cause, "snapshot": client.snapshot})
+            if not await qualify_acquisition(state):
+                continue
             if (
                 args.interrupt_at_seconds is not None
                 and workload
@@ -3276,8 +3289,22 @@ async def run(args):
         # acquisitions alive while actual body feedback settles; never refresh
         # one retained zero sample with another grant.
         qualification_at = time.monotonic()
+        native_remaining = client.snapshot["run"].get("remaining_s")
+        if type(native_remaining) not in (int, float) or not math.isfinite(native_remaining) or native_remaining <= 0:
+            raise RuntimeError("original terminal native remaining clock unavailable")
+        qualification_ceiling = qualification_at + min(terminal_budget, native_remaining)
+        record({"event": "terminal_qualification_started", "budget_seconds": terminal_budget,
+                "original_ceiling_monotonic_s": qualification_ceiling, "native_remaining_s": native_remaining})
         while True:
-            remaining = 2 - (time.monotonic() - qualification_at)
+            remaining = qualification_ceiling - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("terminal current native body-zero feedback did not qualify")
+            if bench and await ensure_authority(until=qualification_ceiling):
+                await rejoin(until=qualification_ceiling)
+            renewal_healthy()
+            if not await qualify_acquisition(acquisition_state(), until=qualification_ceiling):
+                continue
+            remaining = qualification_ceiling - time.monotonic()
             if remaining <= 0:
                 raise RuntimeError("terminal current native body-zero feedback did not qualify")
             attempt_budget = asyncio.timeout(remaining)
@@ -3293,10 +3320,10 @@ async def run(args):
                     )
             except TimeoutError as error:
                 if bench and hasattr(error, "input_context") and not attempt_budget.expired():
-                    await rejoin(input_error=error, until=qualification_at + 2)
+                    await rejoin(input_error=error, until=qualification_ceiling)
                     continue
                 if hasattr(error, "grant_context") and not attempt_budget.expired():
-                    await rejoin(grant_error=error, until=qualification_at + 2)
+                    await rejoin(grant_error=error, until=qualification_ceiling)
                     continue
                 if attempt_budget.expired():
                     raise RuntimeError(
@@ -3305,26 +3332,26 @@ async def run(args):
                 raise
             except ConnectionError as error:
                 if bench and hasattr(error, "input_context"):
-                    await rejoin(input_error=error, until=qualification_at + 2)
+                    await rejoin(input_error=error, until=qualification_ceiling)
                     continue
                 if not hasattr(error, "grant_context"):
                     raise
-                await rejoin(grant_error=error, until=qualification_at + 2)
+                await rejoin(grant_error=error, until=qualification_ceiling)
                 continue
             except CommandRefusedError as error:
                 mailbox = mailbox_input_refusal(error)
                 if not (recovery_grant_refusal(error) or mailbox):
                     raise
                 await rejoin(
-                    require_episode=True, refusal_identity=error.identity, until=qualification_at + 2,
+                    require_episode=True, refusal_identity=error.identity, until=qualification_ceiling,
                     expected_pause="native_input_expired" if mailbox else None,
                 )
                 continue
             if sent is None:
-                await asyncio.sleep(min(0.03, max(0, 2 - (time.monotonic() - qualification_at))))
+                await asyncio.sleep(min(0.03, max(0, qualification_ceiling - time.monotonic())))
                 continue
             _, frame, _ = sent
-            remaining = qualification_at + 2 - time.monotonic()
+            remaining = qualification_ceiling - time.monotonic()
             if remaining <= 0:
                 raise RuntimeError("terminal current native body-zero feedback did not qualify")
             try:
@@ -3337,13 +3364,13 @@ async def run(args):
                 record({"event": "terminal_zero_ack_pending", "network_seq": client.sequence,
                         "source": frame["source"], "native_last_input_seq": _live(client.snapshot).get("last_input_seq"),
                         "native_source": _live(client.snapshot).get("source"),
-                        "original_ceiling_monotonic_s": qualification_at + 2})
+                        "original_ceiling_monotonic_s": qualification_ceiling})
                 continue  # New grant/capture, exact current ACK, and the same original ceiling.
             final = client.snapshot
             record({"event": "terminal_zero_qualification", "frame": frame, "native": final})
             if native_frame_ack(final, client.sequence, frame["source"], body_zero=True):
                 break
-            if time.monotonic() - qualification_at >= 2:
+            if time.monotonic() >= qualification_ceiling:
                 raise RuntimeError("terminal current native body-zero feedback did not qualify")
             await asyncio.sleep(0.03)
         summary.update(
