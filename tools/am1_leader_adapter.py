@@ -373,6 +373,40 @@ def recovery_grant_refusal(error):
     )
 
 
+def _resume_send_failure(error, identity, operation_id, ws):
+    """Only the original current-channel send site can establish this unknown outcome."""
+    from aiohttp import ClientConnectionResetError
+
+    detail = getattr(error, "resume_send_failure", None)
+    keys = {"run_id", "service_incarnation", "controller_generation", "connection_generation",
+            "host_incarnation", "intent_revision"}
+    if (type(error) is not ClientConnectionResetError or str(error) != "Cannot write to closing transport"
+        or ws is None or getattr(error, "_resume_send_ws", None) is not ws
+        or not isinstance(detail, dict) or set(detail) != {"operation_id", "request_id", "identity", "timing", "error_type", "message"}
+        or detail["error_type"] != "ClientConnectionResetError" or detail["message"] != str(error)
+        or detail["operation_id"] != operation_id or type(operation_id) is not str
+        or type(detail["request_id"]) is not str
+        or not isinstance(detail["identity"], dict) or set(detail["identity"]) != keys
+        or not isinstance(identity, dict) or set(identity) != keys
+        or any(type(detail["identity"][key]) is not type(value) or detail["identity"][key] != value
+               for key, value in identity.items())):
+        return None
+    try:
+        if str(UUID(operation_id)) != operation_id or str(UUID(detail["request_id"])) != detail["request_id"]:
+            return None
+    except ValueError:
+        return None
+    stamps = detail["timing"]
+    if (not isinstance(stamps, dict)
+        or set(stamps) != {"request_started_at_monotonic_s", "send_started_at_monotonic_s",
+                          "send_failed_at_monotonic_s"}
+        or any(type(value) not in (int, float) or not math.isfinite(value) for value in stamps.values())
+        or not stamps["request_started_at_monotonic_s"] <= stamps["send_started_at_monotonic_s"]
+        <= stamps["send_failed_at_monotonic_s"] <= time.perf_counter()):
+        return None
+    return detail
+
+
 
 def _startup_run_reference(state):
     """Only the existing essential-status run reference can omit startup clocks."""
@@ -717,7 +751,24 @@ class SessionClient:
             if self.ws is not ws or self.transport_error or ws.closed:
                 raise ConnectionError("bounded current WSS connection required")
             timing["send_started_at_monotonic_s"] = time.perf_counter()
-            await self.ws.send_json({"id": identity, "command": command})
+            try:
+                await ws.send_json({"id": identity, "command": command})
+            except ConnectionError as error:
+                from aiohttp import ClientConnectionResetError
+
+                if (command.get("op") == "resume" and type(error) is ClientConnectionResetError
+                    and str(error) == "Cannot write to closing transport" and self.ws is ws):
+                    # A send failure never establishes nonadmission. Retain the
+                    # exact discarded operation/channel; qualification requires
+                    # a new Connect, held proof and a different Resume UUID.
+                    error._resume_send_ws = ws
+                    error.resume_send_failure = {
+                        "operation_id": command.get("operation_id"), "request_id": identity,
+                        "error_type": type(error).__name__, "message": str(error),
+                        "identity": {key: command.get(key) for key in ("run_id", "service_incarnation",
+                            "controller_generation", "connection_generation", "host_incarnation", "intent_revision")},
+                        "timing": dict(timing, send_failed_at_monotonic_s=time.perf_counter())}
+                raise
             timing["send_completed_at_monotonic_s"] = time.perf_counter()
             try:
                 # A connect fence can take effect before its receipt arrives.
@@ -996,6 +1047,8 @@ class SessionClient:
             held = context.get("phase") == "held_qualification"
             release = context["release"]
             reply = getattr(error, "resume_reply_timeout", None)
+            send_failure = (None if held or getattr(self, "_detaching", False) else
+                            _resume_send_failure(error, context["identity"], context["operation_id"], getattr(self, "ws", None)))
             stamps = reply.get("timing", {}) if isinstance(reply, dict) else {}
             reply_timeout = (type(error) is TimeoutError and not held and isinstance(reply, dict)
                 and set(reply) == {"operation_id", "request_id", "timing"}
@@ -1018,11 +1071,13 @@ class SessionClient:
             if (context["connect_identity"] is not None and isinstance(release, dict)
                 and all(type(release.get(k)) is type(v) and release[k] == v for k, v in
                         {"accepted": True, "status": "released", "effect_admitted": False}.items())
-                and (closed_transport or reply_timeout)):
+                and (closed_transport or reply_timeout or send_failure is not None)):
                 context["transport_close"] = {key: close.get(key) for key in
-                    ("expected", "close_code", "reason", "reader_error", "exception_type", "exception")}
+                    ("expected", "close_code", "reason", "reader_error", "exception_type", "exception")} if close else {}
                 if reply_timeout:
                     context["transport_close"], context["reply_timeout"] = {}, reply
+                if send_failure is not None:
+                    context["send_failure"] = json.loads(json.dumps(send_failure, allow_nan=False))
                 error.resume_result_context = context
                 if refusal_record:
                     try:
@@ -1038,6 +1093,8 @@ class SessionClient:
                                   "transport_close": context["transport_close"]}
                         if reply_timeout:
                             detail["reply_timeout"] = reply
+                        if send_failure is not None:
+                            detail["send_failure"] = send_failure
                         if len(json.dumps(detail, allow_nan=False).encode("utf-8")) > 2048:
                             raise ValueError("bounded owned qualification context required")
                         refusal_record(detail)
@@ -1621,6 +1678,9 @@ class SameRunRecovery:
                         and isinstance(context.get("reply_timeout"), dict)
                         and context["reply_timeout"] == getattr(original, "resume_reply_timeout", None)
                         and context["reply_timeout"].get("operation_id") == context["operation_id"])
+                    send_failure = (not held and context.get("send_failure") is not None
+                        and context["send_failure"] == _resume_send_failure(
+                            original, identity, context["operation_id"], getattr(self.client, "ws", None)))
                     if isinstance(original, TimeoutError) and (not reply_timeout or resume_context is not None):
                         raise original
                     phase_key = ((identity["connection_generation"], identity["intent_revision"], "held")
@@ -1645,7 +1705,7 @@ class SameRunRecovery:
                         or not 0 <= context["requested"] <= time.monotonic()
                         or not ceiling <= context["requested"] + 8
                         or not before["run"]["native_live_at"] <= event["at"] <= context["pi_lower_bound"] < before["run"]["deadline"]
-                        or (close != {} if reply_timeout else close != {
+                        or not send_failure and (close != {} if reply_timeout else close != {
                             "expected": False, "close_code": 1006, "reason": "stream-ended", "reader_error": None,
                             "exception_type": "ClientConnectionResetError", "exception": "Cannot write to closing transport"})):
                         raise original
