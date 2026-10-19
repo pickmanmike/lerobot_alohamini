@@ -395,7 +395,9 @@ def stopped_proof():
                     "position_excursion_raw": 0,
                     "position_drift_raw": 0,
                 },
-                "temperature_slots": [[99.6 + n * 0.1, 34] for n in range(5)],
+                "temperature_slots": [
+                    [samples[n]["sample_monotonic_s"], 34] for n in (1, 3, 5, 7, 8)
+                ],
                 "temperature_ready": True,
                 "temperature_max_age_s": 0.5,
             },
@@ -1900,3 +1902,34 @@ def test_preimport_processor_discovery_refuses_execution_and_unqualified_proof(t
         m.load_qualified_proof(config, run)
     assert not list(state.glob("reconciliation-ack-*"))
     assert not (directory / "cleanup.json").exists()
+
+
+@pytest.mark.parametrize(
+    "later_temperature, retimestamp_peak, accepted",
+    [(34, True, True), (33, False, True), (33, True, False)],
+)
+def test_stopped_thermal_replay_retains_actual_latest_equal_peak_without_refreshing_lower(
+    later_temperature, retimestamp_peak, accepted
+):
+    from tools import am1_physical_reconciliation as m
+
+    config, run, proof = stopped_proof()
+    lift = proof["readback"]["lift_stationary"]
+    samples = lift["samples"]
+    # The later receipt in each other slot is lower; their real earlier maxima
+    # remain. Only the first slot varies between an equal and a lower receipt.
+    for index in (1, 3, 5, 7):
+        sample = samples[index]
+        sample["temperature_c"] = later_temperature if index == 1 else 33
+        packet = sample["group_trace"]["response_bytes"]
+        packet[5 + 30] = sample["temperature_c"]
+        packet[-1] = (~sum(packet[2:-1])) & 255
+    indices = (1 if retimestamp_peak else 0, 2, 4, 6, 8)
+    lift["temperature_slots"] = [[samples[index]["sample_monotonic_s"], 34] for index in indices]
+    original = copy.deepcopy(proof)
+    if accepted:
+        assert m.validate_stopped_proof(config, run, proof, now=100.1, boot_id=proof["boot_id"]) == proof
+    else:
+        with pytest.raises(ValueError, match="thermal peak slot provenance/freshness"):
+            m.validate_stopped_proof(config, run, proof, now=100.1, boot_id=proof["boot_id"])
+    assert proof == original

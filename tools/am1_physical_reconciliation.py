@@ -796,7 +796,7 @@ def validate_stopped_proof(config, run, proof, *, now, boot_id=None, durable_ack
     for record in samples:
         stamp, temp = record["sample_monotonic_s"], record["temperature_c"]
         slot = (round(stamp * 1e9) - origin_ns) // 100_000_000
-        if slot not in by_slot or temp > by_slot[slot][1]:
+        if slot not in by_slot or temp >= by_slot[slot][1]:
             by_slot[slot] = [stamp, temp]
     expected = list(by_slot.values())[-5:]
     require(
