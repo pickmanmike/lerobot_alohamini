@@ -1747,7 +1747,7 @@ def test_original_recovery_ceiling_includes_authenticated_read_time_without_rean
     asyncio.run(asyncio.wait_for(scenario(), 0.3))
 
 
-@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_view_reconnect", "grant_view_switch", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "held_qualification_loss", "resume_alignment_refusal", "resume_alignment_refused_twice", "runner_initial_cursor_pending", "resume_reply_timeout_pre", "resume_reply_timeout_post", "acquisition_input_pause", "receipt_ack_starvation", "ack_never_returns", "ack_close_cancel", "transport_blackout_hb1", "transport_blackout_hb2", "transport_blackout_long", "initial_ack_timely", "initial_ack_missing", "connect_receipt_fast", "connect_receipt_delayed", "connect_receipt_missing", "connect_receipt_late", "connect_receipt_caller_ceiling", "connect_receipt_input", "connect_receipt_grant"])
+@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_view_reconnect", "grant_view_switch", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "held_qualification_loss", "resume_alignment_refusal", "resume_alignment_refused_twice", "runner_initial_cursor_pending", "resume_reply_timeout_pre", "resume_reply_timeout_post", "acquisition_input_pause", "receipt_ack_starvation", "ack_never_returns", "ack_close_cancel", "transport_blackout_hb1", "transport_blackout_hb2", "transport_blackout_long", "initial_ack_timely", "initial_ack_missing", "connect_receipt_fast", "connect_receipt_delayed", "connect_receipt_missing", "connect_receipt_late", "connect_receipt_caller_ceiling", "connect_receipt_input", "connect_receipt_grant", "renew_receipt_cost", "renew_receipt_cost_expired"])
 def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(tmp_path, monkeypatch, cause):
     import asyncio
     import copy
@@ -1913,6 +1913,61 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                 monkeypatch.setattr(client.http, "ws_connect", fixture_heartbeat)
             await client.attach()
             client.generation, client.connection = ids["controller_generation"], ids["connection_generation"]
+            if cause.startswith("renew_receipt_cost"):
+                # Only a processed HTTP renewal's reply is delayed. The real
+                # Core lease clock advances while the PC remains present.
+                loop = asyncio.get_running_loop()
+                started = loop.time()
+                a.clock = e.clock = lambda: 10. + loop.time() - started
+                calls, second = [], loop.create_future()
+                in_flight, expired = [False], cause.endswith("_expired")
+                original_post = client.post
+
+                async def late_renewal(path, body):
+                    assert not in_flight[0], "only one current renewal may be in flight"
+                    in_flight[0] = True
+                    calls.append((loop.time(), copy.deepcopy(body)))
+                    try:
+                        result = await original_post(path, body)
+                    except Exception as error:
+                        in_flight[0] = False
+                        if not second.done():
+                            second.set_exception(error)
+                        raise
+                    if len(calls) == 1:
+                        assert result["accepted"] is True
+                        assert 1.4 < result["presence_expires"] - a.clock() <= 1.5
+                        await asyncio.sleep(1.7 if expired else 1.2)
+                    elif not second.done():
+                        second.set_result(result)
+                    in_flight[0] = False
+                    return result
+
+                client.post = late_renewal
+                renewal = asyncio.create_task(client.renew())
+                try:
+                    if expired:
+                        with pytest.raises(m.HTTPOutcomeError, match="controller renewal fence"):
+                            await asyncio.wait_for(second, 2.6)
+                        assert a.controller is None or a.controller["expires"] <= a.clock()
+                    else:
+                        result = await asyncio.wait_for(second, 2.6)
+                        assert result["accepted"] is True
+                        assert calls[1][0] - calls[0][0] < 1.5
+                        assert a.controller["generation"] == ids["controller_generation"]
+                        assert a.controller["expires"] > a.clock()
+                        assert not any(v["kind"] == "presence_expired" for v in a.events)
+                    assert len(calls) == 2 and not in_flight[0]
+                    assert all(body == {"controller_generation": ids["controller_generation"]}
+                               for _, body in calls)
+                    assert a.run["deadline"] == 309. and a.run["native_live_at"] == 9.
+                    assert a.run["status"] == "paused" and a.run["recovery_episodes"] == 0
+                    assert commands == [("claim", "paused"), ("claim", "paused")]
+                    assert e._live_target is None
+                finally:
+                    renewal.cancel()
+                    await asyncio.gather(renewal, return_exceptions=True)
+                return
             if cause.startswith("connect_receipt_"):
                 # Hold only the correlated result after real Core processing.
                 # Snapshot/ACK traffic continues on the actual TLS connection.

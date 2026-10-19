@@ -866,8 +866,12 @@ class SessionClient:
         self.generation = result["controller_generation"]
 
     async def renew(self):
+        due = time.monotonic() + 0.45
         while True:
-            await asyncio.sleep(0.45)
+            await asyncio.sleep(max(0, due - time.monotonic()))
+            # Include receipt time in the cadence; one overdue renewal is
+            # current presence, not a burst of missed ticks or a new Claim.
+            due = time.monotonic() + 0.45
             await self.post("claim", {"controller_generation": self.generation})
 
     async def resume(self, *, check=None, refusal_record=None, qualification_ceiling=None):
