@@ -71,8 +71,10 @@ globalThis.AM1OnboardView=class {
   }
   report() {
     const latest=this.reports.get(this.latestReport),idle=()=>Promise.resolve();
-    if(!this.options.progress||!this.binding||this.frames<1||!this.health().fresh)return idle();
-    const now=this.clock();
+    const now=this.clock(),decodedAge=this.decodedAt===null?Infinity:now-this.decodedAt;
+    // Cached browser source status can lag; Gateway independently qualifies
+    // current Pi source identity/arrival. Publish only genuinely current decode.
+    if(!this.options.progress||!this.binding||this.frames<1||!Number.isFinite(decodedAge)||decodedAge<0||decodedAge>=500)return idle();
     if(now-this.lastReportAt<150||this.frames<=this.lastReportedFrames||this.mediaTime<=this.lastReportedMedia)
       return latest?.epoch===this.epoch&&!latest.cancelled?latest.promise:idle();
     if(this.reports.size>=2) {

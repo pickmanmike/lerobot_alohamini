@@ -461,3 +461,21 @@ test("new decode publishes promptly within cadence while an actual frozen decode
   assert.equal(p.requests.filter(r=>r.url.endsWith("/progress")).length,2,"stale decoder counters cannot be published as fresh progress");
  }finally{await p.view.stop();}
 });
+
+
+test("fresh decoded progress is published despite an aged browser source-status cache",async()=>{
+ const p=fixture();await p.view.start("chest");p.source();
+ const text=JSON.stringify({accepted:false,reason:"selected source is not fresh"});
+ p.setProgressResponse({ok:true,headers:{get:name=>name.toLowerCase()==="content-type"?"application/json":String(text.length)},text:async()=>text});
+ try{
+  p.callbacks.shift()(0,{presentedFrames:1,mediaTime:.1});await p.view.report();
+  p.advance(600); // No status refresh: actual server source freshness is independent.
+  p.callbacks.shift()(600,{presentedFrames:2,mediaTime:.2});await p.view.report();
+  const reports=p.requests.filter(r=>r.url.endsWith("/progress"));
+  assert.equal(reports.length,2,"cached source status must not suppress genuine new decoder evidence");
+  assert.equal(JSON.parse(reports[1].body).decoded_frames,2);
+  assert.equal(p.view.health().decoded_age_ms,0);assert.equal(p.view.health().source_age_ms,600);
+  assert.equal(p.view.health().source_fresh,false);assert.equal(p.view.health().fresh,false);
+  assert.equal(p.view.progressReceipt.accepted,false,"the independent server refusal stays truthful");
+ }finally{await p.view.stop();}
+});
