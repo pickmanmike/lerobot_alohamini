@@ -1253,25 +1253,44 @@ class SessionClient:
 
     async def detach(self):
         self._detaching = True
+        ws, reader = self.ws, self.reader
+        close_error, close_started = None, time.monotonic()
         self._ack_ws = self._ack_slot = None
         self._ack_revision = self._acked_revision = None
         if getattr(self, "_ack_changed", None) is not None:
             self._ack_changed.set()
         task = getattr(self, "_ack_task", None)
-        if task is not None:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-        self._ack_task = None
-        if self.ws is not None:
-            try:
-                await asyncio.wait_for(self.ws.close(), 2)
-            finally:
-                self.ws._response.close()
-        if self.reader is not None:
-            with contextlib.suppress(asyncio.CancelledError, ConnectionError, RuntimeError):
-                await self.reader
-        self.ws = self.reader = None
-        self.snapshot = None
+        try:
+            if task is not None:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            if ws is not None:
+                try:
+                    await asyncio.wait_for(ws.close(), 2)
+                except (TimeoutError, ConnectionError) as error:
+                    # The polite handshake may be unavailable. Definite local
+                    # quarantine below still precedes every fresh attachment.
+                    close_error = {"error_type": type(error).__name__, "message": str(error)}
+        finally:
+            if ws is not None:
+                ws._response.close()
+            self.ws = self.reader = self._ack_task = None
+            self.snapshot = None
+            for future in self.pending.values():
+                if not future.done():
+                    future.set_exception(ConnectionError("current WSS connection detached"))
+            self.pending.clear()
+            retired = {item for item in (task, reader) if item is not None and item is not asyncio.current_task()}
+            for item in retired:
+                item.cancel()
+            if retired:
+                await asyncio.gather(*retired, return_exceptions=True)
+            if close_error is not None and getattr(self, "record", None) is not None:
+                self.record({"event": "session_detach_close_interrupted", **close_error,
+                             "started_at_monotonic_s": close_started,
+                             "quarantined_at_monotonic_s": time.monotonic(),
+                             "reader_drained": reader is None or reader.done(),
+                             "ack_task_drained": task is None or task.done(), "pending_requests": len(self.pending)})
 
     async def close(self):
         try:

@@ -1150,7 +1150,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                     {"kind": "input_expired", "at": 2.0, "run_id": owned_id, "service_incarnation": "service"}
                 ]
             if failure == "bench_input_receipt_terminal" and len(self.inputs) == 1:
-                await asyncio.sleep(.005)  # Guarantees the second acquisition is terminal qualification.
+                await asyncio.sleep(.03)  # Cross the Windows monotonic tick before terminal qualification.
             if input_unknown and len(self.inputs) == (2 if failure == "bench_input_receipt_terminal" else 1):
                 self.snapshot["run"]["status"] = "paused"
                 self.snapshot["events"] = [{"kind": "native_input_expired", "at": 2., "run_id": owned_id,
@@ -2030,7 +2030,7 @@ def test_original_recovery_ceiling_includes_authenticated_read_time_without_rean
     asyncio.run(asyncio.wait_for(scenario(), 0.3))
 
 
-@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_view_reconnect", "grant_view_switch", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "held_qualification_loss", "resume_alignment_refusal", "resume_alignment_refused_twice", "runner_initial_cursor_pending", "resume_reply_timeout_pre", "resume_reply_timeout_post", "acquisition_input_pause", "receipt_ack_starvation", "ack_never_returns", "ack_close_cancel", "transport_blackout_hb1", "transport_blackout_hb2", "transport_blackout_long", "initial_ack_timely", "initial_ack_missing", "connect_receipt_fast", "connect_receipt_delayed", "connect_receipt_missing", "connect_receipt_late", "connect_receipt_caller_ceiling", "connect_receipt_input", "connect_receipt_grant", "renew_receipt_cost", "renew_receipt_cost_expired", "bench_reacquire", "bench_reacquire_receipt_lost", "bench_reacquire_receipt_cancelled", "bench_input_receipt_unknown_native", "bench_input_receipt_unknown_pause"])
+@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_view_reconnect", "grant_view_switch", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "held_qualification_loss", "resume_alignment_refusal", "resume_alignment_refused_twice", "runner_initial_cursor_pending", "resume_reply_timeout_pre", "resume_reply_timeout_post", "acquisition_input_pause", "receipt_ack_starvation", "ack_never_returns", "ack_close_cancel", "transport_blackout_hb1", "transport_blackout_hb2", "transport_blackout_long", "initial_ack_timely", "initial_ack_missing", "connect_receipt_fast", "connect_receipt_delayed", "connect_receipt_missing", "connect_receipt_late", "connect_receipt_caller_ceiling", "connect_receipt_input", "connect_receipt_grant", "renew_receipt_cost", "renew_receipt_cost_expired", "bench_reacquire", "bench_reacquire_receipt_lost", "bench_reacquire_receipt_cancelled", "bench_input_receipt_unknown_native", "bench_input_receipt_unknown_pause", "grant_close_timeout", "grant_close_timeout_pause", "grant_close_timeout_takeover", "grant_close_timeout_cancel"])
 def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(tmp_path, monkeypatch, cause):
     import asyncio
     import copy
@@ -2145,7 +2145,7 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
         gateway = Gateway(owner.directory, tmp_path / "auth")
         enrolled = gateway.auth.enroll(gateway.auth.pair(control=True))
         a.controller["device_id"] = a.connection["device_id"] = enrolled["device_id"]
-        if cause.startswith(("bench_reacquire", "bench_input_receipt_unknown")):
+        if cause.startswith(("bench_reacquire", "bench_input_receipt_unknown", "grant_close_timeout")):
             a.run.update(bench_continuity=True, control_intent={"eligible": True,
                 "device_id": enrolled["device_id"], "controller_generation": ids["controller_generation"],
                 "service_incarnation": a.service_incarnation, "start_operation_id": a.run["operation_id"]})
@@ -2565,6 +2565,87 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
 
             producer = m.FrameProducer(Input())
             producer.workspace, producer.native_cursor = workspace(), workspace()["reference"]
+            if cause.startswith("grant_close_timeout"):
+                original_call, accepted_grants, applied = gateway.call, [], []
+                old_ws, old_reader = client.ws, client.reader
+                old_close = old_ws.close
+                pending = None
+                client.record = record
+                close_entered, close_cancelled = asyncio.Event(), asyncio.Event()
+                async def stalled_close(*args, **kwargs):
+                    close_entered.set()
+                    try:
+                        await asyncio.Event().wait()
+                    finally:
+                        close_cancelled.set()
+                old_ws.close = stalled_close
+                async def missing_grant_receipt(command, device):
+                    result = await original_call(command, device)
+                    if command.get("op") == "grant" and not accepted_grants:
+                        accepted_grants.append(copy.deepcopy(result))
+                        assert result["accepted"] is True
+                        a._pause_live_input("input_expired")
+                        await unblock_release.wait()
+                    if command.get("op") == "input":
+                        applied.append(copy.deepcopy(command))
+                    return result
+                gateway.call = missing_grant_receipt
+                renewal = asyncio.create_task(client.renew())
+                def healthy_renewal():
+                    if renewal.done():
+                        renewal.result()
+                try:
+                    with pytest.raises(TimeoutError) as caught:
+                        await m.send_leader_sample(client, producer, m.ZERO_BODY, record, phase="combined", progress_s=.01)
+                    assert producer.sequence == client.sequence == 0 and len(accepted_grants) == 1
+                    pending = asyncio.get_running_loop().create_future()
+                    client.pending["quarantined-test-request"] = pending
+                    if cause.endswith("cancel"):
+                        detaching = asyncio.create_task(client.detach())
+                        await close_entered.wait()
+                        detaching.cancel()
+                        with pytest.raises(asyncio.CancelledError):
+                            await detaching
+                        assert close_cancelled.is_set() and old_reader.done()
+                        assert client.ws is client.reader is client.snapshot is None
+                        assert isinstance(pending.exception(), ConnectionError) and client.pending == {}
+                        return
+                    if cause.endswith("pause"):
+                        assert a.handle({"op": "pause", "run_id": a.run["run_id"],
+                            "operation_id": str(uuid4())}, enrolled["device_id"])["accepted"]
+                    elif cause.endswith("takeover"):
+                        a.controller["expires"] = 9.9
+                        a._expire_controls(10.)
+                        assert a.handle({"op": "claim"}, "competitor")["accepted"]
+                    if cause == "grant_close_timeout":
+                        assert not await guard.resume(grant_error=caught.value, renewal_check=healthy_renewal)
+                        assert a.run["status"] == "running" and guard.episodes == 0
+                        assert old_reader.done() and client.reader is not old_reader and client.ws is not old_ws
+                        assert close_cancelled.is_set()
+                        assert any(row["event"] == "session_detach_close_interrupted" for row in records)
+                        assert isinstance(pending.exception(), ConnectionError) and client.pending == {}
+                        producer.native_cursor, producer.reacquire = m._live(client.snapshot)["cursor"], True
+                        fresh = await m.send_leader_sample(client, producer, m.ZERO_BODY, record, phase="combined", progress_s=.01)
+                        assert fresh is not None and fresh[2]["accepted"] is True
+                        assert producer.sequence == 1 and len(applied) == 1
+                        assert fresh[0]["grant_id"] != accepted_grants[0]["grant_id"]
+                        assert fresh[0]["expires"] - fresh[0]["issued"] <= .25
+                    else:
+                        with pytest.raises((RuntimeError, TimeoutError, m.CommandRefusedError)):
+                            await guard.resume(grant_error=caught.value, renewal_check=healthy_renewal)
+                        assert producer.sequence == 0 and applied == []
+                        if pending.done():
+                            pending.exception()
+                    assert a.run["native_live_at"] == 9. and a.run["deadline"] == 309.
+                    assert a.run["control_intent"]["eligible"] is (cause == "grant_close_timeout")
+                finally:
+                    old_ws.close = old_close
+                    if pending is not None and pending.done() and not pending.cancelled():
+                        pending.exception()
+                    unblock_release.set()
+                    renewal.cancel()
+                    await asyncio.gather(renewal, return_exceptions=True)
+                return
             if cause in {"qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode"}:
                 # Synthetic50: a NEW actual Core episode opens during the
                 # already-connected empty-release/held qualification phase.
