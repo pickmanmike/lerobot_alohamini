@@ -32,18 +32,20 @@ Packet18 supersedes proposed Packet17's spike-causation-first direction; Packet1
 supersedes wrist-button Packet15. Actual73/78/79 retain their separate acceptance.
 The owner accepted Actual88's bounded normal64.5s result and integrated PR26 into
 integrate/am1-local-teleop at472f8c4d, exact accepted a4d5f7e1 tree; PR25 remains
-merged at e3d8a196. Main/AM2 and installed Stage42 are unchanged; no redeploy or
-physical repeat follows from that source-equivalent merge. The current focused
-branch codex/am1-view-continuity remains unmerged, with no automatic integration.
-[Latest scoped direction](https://github.com/pickmanmike/lerobot_alohamini/pull/26#issuecomment-6279335089) prioritizes viewing interruptions: join ONE
-representative Actual88 episode across source, complete RTP, decoded/presented
-frames and progress delivery/acceptance before choosing a supported correction.
-The150ms serialized progress POST/750ms wait versus500ms freshness is a candidate,
-not an established cause. Reuse the finite camera-only and delayed-receipt fixtures;
-then a supported short check and64.5s normal REQUIRED-view comparison when justified.
-This is not a new merge gate or a pass of the original172.5s strict comparison.
-Keep the existing process-local msedge software-decoder workaround/rollback exact;
-ordinary-launch integration is pending, not GPU proof or a global preference change.
+merged at e3d8a196. That source-equivalent merge needed no redeploy or physical repeat.
+Current PR27 is open, ready for review and unmerged on codex/am1-view-continuity,
+source87cd55da. Stage43 passed all ten stopped phases, changing only selected-view
+JavaScript among the22 runtime files; motor/camera/helper and private operating settings remain.
+The [scoped viewing direction](https://github.com/pickmanmike/lerobot_alohamini/pull/26#issuecomment-6279335089)
+joined one Actual88 presentation-progress episode, tested delayed receipts/camera
+fixtures and completed Actual89's64.5s normal REQUIRED-view programme. Preserve its
+real holds, one view expiry inside an existing input hold, weak left-elbow response
+and sampled-view limitations; this is not the original172.5s strict qualification.
+Keep500ms required view,250ms native input and original ownership/deadline guards.
+The process-local msedge software-decoder option is available in the ordinary
+browser-only launcher with stable separate mode profiles; dedicated-profile live
+enrollment/use remains unqualified. It is not GPU proof or a global preference change.
+Main/AM2 remain unchanged. Do not repeat powered checks solely for publication.
 No fault-injection campaign, gains, network remediation or freshness downgrade.
 Physical USB
 connection remains owner-deferred; retain historic identities/calibration without
