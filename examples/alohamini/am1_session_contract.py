@@ -2164,6 +2164,7 @@ RECIPES = MappingProxyType(
            for name, definition in ELBOW_RECOVERY_DEFINITIONS.items()},
         **{name: Recipe(name, "interactive", None, spec.live_s, seed=None)
            for name, spec in LIVE_ELBOW_SPECS.items()},
+        "physical-live-teleop": Recipe("physical-live-teleop", "interactive", None, 300.0, seed=None),
         "fake-interactive": Recipe("fake-interactive", "interactive", None, 420.0),
     }
 )

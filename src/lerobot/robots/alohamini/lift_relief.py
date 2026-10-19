@@ -724,8 +724,14 @@ class InstalledLiftCheck:
         self, *, allow_one_count_variation: bool = False, qualify_initial_direction: bool = False,
         require_quiet_post_home: bool = False,
         am1_post_home_readiness: bool = False,
+        relief_poll_s: float = POLL_S,
     ) -> tuple[Any, float]:
         """The same bounded mechanics for the opt-in comparison and normal AM1 startup."""
+        if (
+            type(relief_poll_s) not in (int, float)
+            or not math.isfinite(relief_poll_s) or not 0 < relief_poll_s <= POLL_S
+        ):
+            raise ValueError("Relief poll interval must be finite, positive and no slower than the default.")
         self.reader.set_phase("setup_position")
         result = self.lift.home(safety_check=self.home_guard, read_raw=self.reader)
         if time.monotonic() - self.home_started >= self.lift.cfg.home_timeout_s:
@@ -804,7 +810,7 @@ class InstalledLiftCheck:
             remaining = RELIEF_TIMEOUT_S - (time.monotonic() - started)
             if remaining <= 0:
                 raise ReliefRefusal(f"relief: target not reached within {RELIEF_TIMEOUT_S}s.")
-            time.sleep(min(POLL_S, remaining, direction_remaining(record)))
+            time.sleep(min(relief_poll_s, remaining, direction_remaining(record)))
             direction_remaining(record)
             record, height = self._moving_height("relief")
             elapsed = time.monotonic() - started

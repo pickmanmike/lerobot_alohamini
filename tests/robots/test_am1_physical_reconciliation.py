@@ -395,7 +395,9 @@ def stopped_proof():
                     "position_excursion_raw": 0,
                     "position_drift_raw": 0,
                 },
-                "temperature_slots": [[99.6 + n * 0.1, 34] for n in range(5)],
+                "temperature_slots": [
+                    [samples[n]["sample_monotonic_s"], 34] for n in (1, 3, 5, 7, 8)
+                ],
                 "temperature_ready": True,
                 "temperature_max_age_s": 0.5,
             },
@@ -825,18 +827,35 @@ def incomplete_preactivation_fixture(tmp_path, monkeypatch):
         "is outside verified calibration limits 848..3223."
     )
     proof["original_first_cause"] = run["native_first_cause"]
-    run["physical_result"].update(phase="terminal", run_id=run["run_id"], native_live_at=None,
-                                  cleanup="physical_cleanup_unknown", uncertain=True)
-    old = run["physical_result"]["readback"]
-    old.update(cleanup="physical_readback_verified", uncertain=False, cleanup_errors=[],
-               provenance="protected-host/actual-motor-readback", first_cause=run["native_first_cause"],
-               first_error_chain=[{"cause": "RuntimeError: AlohaMini motor activation failed.", "notes": []},
-                                  {"cause": run["native_first_cause"], "notes": []}])
-    old["readback"] = dict(
-        verified=True, buses_closed=True, lift_readback="unavailable-or-failed",
-        selected_gain_restore_required=False, cleanup_errors=[], started_at_monotonic_s=99.0,
-        completed_at_monotonic_s=99.5, readbacks=copy.deepcopy(proof["readback"]["readbacks"]),
+    run["physical_result"].update(
+        phase="terminal",
+        run_id=run["run_id"],
+        native_live_at=None,
+        cleanup="physical_cleanup_unknown",
+        uncertain=True,
     )
+    old = run["physical_result"]["readback"]
+    old.update(
+        cleanup="physical_readback_verified",
+        uncertain=False,
+        cleanup_errors=[],
+        provenance="protected-host/actual-motor-readback",
+        first_cause=run["native_first_cause"],
+        first_error_chain=[
+            {"cause": "RuntimeError: AlohaMini motor activation failed.", "notes": []},
+            {"cause": run["native_first_cause"], "notes": []},
+        ],
+    )
+    old["readback"] = {
+        "verified": True,
+        "buses_closed": True,
+        "lift_readback": "unavailable-or-failed",
+        "selected_gain_restore_required": False,
+        "cleanup_errors": [],
+        "started_at_monotonic_s": 99.0,
+        "completed_at_monotonic_s": 99.5,
+        "readbacks": copy.deepcopy(proof["readback"]["readbacks"]),
+    }
     proof["original_cleanup_origin"] = "preactivation-lift-unqualified"
     proof["original_markers"] = dict.fromkeys(m.MARKERS)
     (state / "cleanup-uncertain.json").unlink()
@@ -854,7 +873,9 @@ def publish_incomplete_fixture(config, run, proof, state):
     return raw
 
 
-def test_incomplete_preactivation_lift_origin_still_requires_fresh_proof_and_durable_ack(tmp_path, monkeypatch):
+def test_incomplete_preactivation_lift_origin_still_requires_fresh_proof_and_durable_ack(
+    tmp_path, monkeypatch
+):
     m, config, run, proof, state = incomplete_preactivation_fixture(tmp_path, monkeypatch)
     raw = publish_incomplete_fixture(config, run, proof, state)
     original_run = copy.deepcopy(run)
@@ -869,14 +890,40 @@ def test_incomplete_preactivation_lift_origin_still_requires_fresh_proof_and_dur
     assert m.load_qualified_proof(config, run)[2] == inventory
 
 
-@pytest.mark.parametrize("broken", [
-    "origin_missing", "origin_foreign", "live_started", "progress", "progress_boolean", "not_faulted",
-    "native_live_started", "host_uncertain", "host_unknown", "lift_qualified", "buses_open", "unverified",
-    "cleanup_error", "restore_pending", "nonzero", "boolean_zero", "missing_row", "duplicate_row", "late_row",
-    "marker_inventory", "marker_appeared", "native_cause", "unrelated_cause", "error_chain_missing",
-    "fresh_lift_missing", "fresh_thermal_stale",
-])
-def test_incomplete_lift_origin_cannot_promote_other_failures_or_weaken_stopped_proof(tmp_path, monkeypatch, broken):
+@pytest.mark.parametrize(
+    "broken",
+    [
+        "origin_missing",
+        "origin_foreign",
+        "live_started",
+        "progress",
+        "progress_boolean",
+        "not_faulted",
+        "native_live_started",
+        "host_uncertain",
+        "host_unknown",
+        "lift_qualified",
+        "buses_open",
+        "unverified",
+        "cleanup_error",
+        "restore_pending",
+        "nonzero",
+        "boolean_zero",
+        "missing_row",
+        "duplicate_row",
+        "late_row",
+        "marker_inventory",
+        "marker_appeared",
+        "native_cause",
+        "unrelated_cause",
+        "error_chain_missing",
+        "fresh_lift_missing",
+        "fresh_thermal_stale",
+    ],
+)
+def test_incomplete_lift_origin_cannot_promote_other_failures_or_weaken_stopped_proof(
+    tmp_path, monkeypatch, broken
+):
     m, config, run, proof, state = incomplete_preactivation_fixture(tmp_path, monkeypatch)
     old = run["physical_result"]["readback"]
     rb = old["readback"]
@@ -913,7 +960,7 @@ def test_incomplete_lift_origin_cannot_promote_other_failures_or_weaken_stopped_
     elif broken == "duplicate_row":
         rb["readbacks"][0] = copy.deepcopy(rb["readbacks"][1])
     elif broken == "late_row":
-        rb["readbacks"][0]["read_completed_at_monotonic_s"] += .05
+        rb["readbacks"][0]["read_completed_at_monotonic_s"] += 0.05
     elif broken == "marker_inventory":
         proof["original_markers"][m.MARKERS[0]] = {"sha256": "a" * 64}
     elif broken == "marker_appeared":
@@ -946,7 +993,9 @@ def test_incomplete_origin_marker_appearance_after_validation_refuses_ack(tmp_pa
     assert not list(state.glob("reconciliation-ack-*"))
 
 
-def test_incomplete_origin_marker_appearance_during_ack_cannot_return_qualified_receipt(tmp_path, monkeypatch):
+def test_incomplete_origin_marker_appearance_during_ack_cannot_return_qualified_receipt(
+    tmp_path, monkeypatch
+):
     m, config, run, proof, state = incomplete_preactivation_fixture(tmp_path, monkeypatch)
     publish_incomplete_fixture(config, run, proof, state)
     actual, raw, inventory = m.load_qualified_proof(config, run)
@@ -1212,3 +1261,675 @@ def test_actual_calibration_comparison_must_cover_every_owned_motor_and_match_pr
     rows[0]["cached_expected"] += 1
     with pytest.raises(ValueError):
         m.validate_calibration_evidence(proof, cached)
+
+
+# Exact Combined16 original note bytes; isolated loader sessions below rebind only IDs.
+# Their later stopped-proof continuation is synthetic and does not qualify Combined16.
+ACTUAL16_COOL_STALE_FAULT_NOTE = (
+    '[AM1 TELEOP FAULT] {"reason":"actual configured temperature limit: arm_left_shoulder_pan; '
+    'temperature: five-slot feedback window is stale (>0.5 s).","side":"left","register":"Present_Te'
+    'mperature","raw":{"arm_left_shoulder_pan":32,"arm_left_shoulder_lift":31,"arm_left_elbow_flex":'
+    '28,"arm_left_wrist_flex":30,"arm_left_wrist_roll":29,"arm_left_gripper":34},"read_started_at_mo'
+    'notonic_s":155503.029919034,"read_completed_at_monotonic_s":155503.031678142,"binding":{"recipe'
+    '":"physical-live-teleop","run_id":"94358dfa-4363-4658-9fd4-'
+    'fe0dc82c5499","host_incarnation":"acf244a1-c2a4-482e-b648-'
+    '558edc31d35e"},"offending_motor":"arm_left_shoulder_pan","offending_value":32,"comparison":{"un'
+    'its":"raw_register","lower_inclusive":0,"upper_exclusive":70,"temperature":{"ceiling_c":70,"sam'
+    'ples":[[155502.524492496,32],[155502.624574612,32],[155502.724499211,32],[155502.824513753,32],'
+    '[155503.031678142,32]],"high_count":0,"numeric_outlier_count":0,"first_cause":"temperature: '
+    'five-slot feedback window is stale (>0.5 s)."},"configured":{"Max_Temperature_Limit":{"value":7'
+    '0,"read_started_at_monotonic_s":155502.410460883,"read_completed_at_monotonic_s":155502.4124485'
+    '28}}},"prior_successful_health":null,"group_reply":{"binding":{"host_incarnation":"acf244a1-'
+    'c2a4-482e-b648-558edc31d35e","recipe":"physical-live-teleop","run_id":"94358dfa-4363-4658-9fd4-'
+    'fe0dc82c5499"},"request":{"binding":{"host_incarnation":"acf244a1-c2a4-482e-b648-'
+    '558edc31d35e","recipe":"physical-live-teleop","run_id":"94358dfa-4363-4658-9fd4-'
+    'fe0dc82c5499"},"side":"left","address":63,"width":1,"ids":[1,2,3,4,5,6],"motors":["arm_left_sho'
+    'ulder_pan","arm_left_shoulder_lift","arm_left_elbow_flex","arm_left_wrist_flex","arm_left_wrist'
+    '_roll","arm_left_gripper"],"register":"Present_Temperature"},"group_call_started_at_monotonic_s'
+    '":155503.030073663,"group_call_completed_at_monotonic_s":155503.031652272,"comm_result":0,"pack'
+    'ets":[{"packet":[255,255,1,3,0,32,219],"device_error":0,"read_started_at_monotonic_s":155503.03'
+    '04097,"read_completed_at_monotonic_s":155503.031312384,"comm_result":0},{"packet":[255,255,2,3,'
+    '0,31,219],"device_error":0,"read_started_at_monotonic_s":155503.031407458,"read_completed_at_mo'
+    'notonic_s":155503.031425921,"comm_result":0},{"packet":[255,255,3,3,0,28,221],"device_error":0,'
+    '"read_started_at_monotonic_s":155503.031464254,"read_completed_at_monotonic_s":155503.031478717'
+    ',"comm_result":0},{"packet":[255,255,4,3,0,30,218],"device_error":0,"read_started_at_monotonic_'
+    's":155503.031511772,"read_completed_at_monotonic_s":155503.031524772,"comm_result":0},{"packet"'
+    ':[255,255,5,3,0,29,218],"device_error":0,"read_started_at_monotonic_s":155503.031555791,"read_c'
+    'ompleted_at_monotonic_s":155503.031571031,"comm_result":0},{"packet":[255,255,6,3,0,34,212],"de'
+    'vice_error":0,"read_started_at_monotonic_s":155503.031603679,"read_completed_at_monotonic_s":15'
+    '5503.031619383,"comm_result":0}],"transmit":{"packet":[255,255,254,10,130,63,1,1,2,3,4,5,6,32],'
+    '"write_started_at_monotonic_s":155503.030138719,"write_completed_at_monotonic_s":155503.0303932'
+    '93,"result":14}}}'
+)
+
+ACTUAL16_BEFORE_HOME_NOTE = (
+    'Original normal-rest acquisition: {"phase":"before_home","binding":{"recipe":"physical-live-tel'
+    'eop","run_id":"94358dfa-4363-4658-9fd4-fe0dc82c5499","host_incarnation":"acf244a1-c2a4-482e-'
+    "b648-"
+    '558edc31d35e"},"calibration":[2,0,515,848,3223],"operating_displacement_bound_degrees":0.5,"ini'
+    'tial_measured_raw":3223,"qualified":false,"samples":[],"settings":{},"started_at":155503.029860'
+    '108,"first_cause":"RuntimeError: AM1 teleop actual configured temperature limit: '
+    'arm_left_shoulder_pan; temperature: five-slot feedback window is stale (>0.5 s)."}'
+)
+
+
+def cool_stale_preactivation_fixture(tmp_path, monkeypatch):
+    """Retain original packet/times; rebind the isolated session and use synthetic fresh proof."""
+    m, config, run, proof, state = incomplete_preactivation_fixture(tmp_path, monkeypatch)
+    fault = json.loads(ACTUAL16_COOL_STALE_FAULT_NOTE.removeprefix("[AM1 TELEOP FAULT] "))
+    rest = json.loads(ACTUAL16_BEFORE_HOME_NOTE.removeprefix("Original normal-rest acquisition: "))
+    binding = {
+        "recipe": "physical-live-teleop",
+        "run_id": run["run_id"],
+        "host_incarnation": proof["host_incarnation"],
+    }
+    fault["binding"] = fault["group_reply"]["binding"] = fault["group_reply"]["request"]["binding"] = binding
+    rest["binding"] = binding
+    run["recipe"] = "physical-live-teleop"
+    run["native_first_cause"] = rest["first_cause"]
+    proof.update(
+        original_cleanup_origin="prehome-cool-thermal-stale-lift-unqualified",
+        original_first_cause=run["native_first_cause"],
+    )
+    old = run["physical_result"]["readback"]
+    old["first_cause"] = run["native_first_cause"]
+    old["first_error_chain"] = [
+        {"cause": "RuntimeError: AlohaMini motor activation failed.", "notes": []},
+        {
+            "cause": run["native_first_cause"],
+            "notes": [
+                "[AM1 TELEOP FAULT] " + json.dumps(fault),
+                "Original normal-rest acquisition: " + json.dumps(rest),
+            ],
+        },
+    ]
+    # Synthetic original stop register timing follows the retained fault note.
+    rb = old["readback"]
+    rb["started_at_monotonic_s"] = fault["read_completed_at_monotonic_s"] + 0.02
+    for index, row in enumerate(rb["readbacks"]):
+        row["read_started_at_monotonic_s"] = rb["started_at_monotonic_s"] + index * 0.001
+        row["read_completed_at_monotonic_s"] = row["read_started_at_monotonic_s"] + 0.0005
+    rb["completed_at_monotonic_s"] = rb["started_at_monotonic_s"] + 0.03
+    return m, config, run, proof, state
+
+
+def test_prehome_cool_stale_origin_requires_fresh_stopped_proof_and_separate_durable_ack(
+    tmp_path, monkeypatch
+):
+    m, config, run, proof, state = cool_stale_preactivation_fixture(tmp_path, monkeypatch)
+    raw = publish_incomplete_fixture(config, run, proof, state)
+    before = copy.deepcopy(run)
+    actual, received, inventory = m.load_qualified_proof(config, run)
+    assert actual == proof and received == raw and inventory == dict.fromkeys(m.MARKERS)
+    operation = str(uuid.uuid4())
+    ack = m.archive_and_ack(config, actual, received, inventory, operation)
+    assert m.acknowledged_receipt(
+        {**actual, "acknowledgment": {**ack, "consumed_operation_id": operation}}, run, operation
+    )
+    assert run == before and run["uncertain"] is True and run["status"] == "faulted"
+    assert all(not (state / name).exists() for name in m.MARKERS)
+
+
+@pytest.mark.parametrize(
+    "broken",
+    [
+        "old_origin",
+        "live",
+        "progress",
+        "post_home",
+        "rest_missing",
+        "rest_duplicate",
+        "rest_qualified",
+        "rest_samples",
+        "binding",
+        "first_cause",
+        "partial_chain",
+        "fault_duplicate",
+        "fault_malformed",
+        "numeric_high",
+        "slot_high",
+        "slot_duplicate",
+        "not_stale",
+        "high_count",
+        "outlier_count",
+        "ceiling",
+        "impossible_ceiling",
+        "device_error",
+        "packet_error",
+        "packet_checksum",
+        "packet_width",
+        "packet_missing",
+        "packet_raw",
+        "group_error",
+        "raw_boolean",
+        "cleanup_error",
+        "nonzero",
+        "fresh_lift_missing",
+        "fresh_thermal_stale",
+    ],
+)
+def test_prehome_cool_stale_origin_cannot_admit_heat_device_fault_or_incomplete_proof(
+    tmp_path, monkeypatch, broken
+):
+    m, config, run, proof, state = cool_stale_preactivation_fixture(tmp_path, monkeypatch)
+    old = run["physical_result"]["readback"]
+    notes = old["first_error_chain"][1]["notes"]
+    fault = json.loads(notes[0].removeprefix("[AM1 TELEOP FAULT] "))
+    rest = json.loads(notes[1].removeprefix("Original normal-rest acquisition: "))
+    if broken == "old_origin":
+        proof["original_cleanup_origin"] = "preactivation-lift-unqualified"
+    elif broken == "live":
+        run["native_live_at"] = 99.0
+    elif broken == "progress":
+        run["progress_s"] = 0.1
+    elif broken == "post_home":
+        rest["phase"] = "after_home"
+    elif broken == "rest_qualified":
+        rest["qualified"] = True
+    elif broken == "rest_samples":
+        rest["samples"] = [{"position": 3223}]
+    elif broken == "binding":
+        fault["binding"]["run_id"] = str(uuid.uuid4())
+    elif broken == "first_cause":
+        rest["first_cause"] = "RuntimeError: genuine motor error"
+    elif broken == "numeric_high":
+        fault["offending_value"] = fault["raw"]["arm_left_shoulder_pan"] = 90
+    elif broken == "slot_high":
+        fault["comparison"]["temperature"]["samples"][0][1] = 90
+    elif broken == "slot_duplicate":
+        fault["comparison"]["temperature"]["samples"][1][0] = fault["comparison"]["temperature"]["samples"][
+            0
+        ][0]
+    elif broken == "not_stale":
+        fault["comparison"]["temperature"]["samples"][0][0] += 0.02
+    elif broken in {"high_count", "outlier_count"}:
+        fault["comparison"]["temperature"][
+            "high_count" if broken == "high_count" else "numeric_outlier_count"
+        ] = 1
+    elif broken == "ceiling":
+        fault["comparison"]["temperature"]["ceiling_c"] = 90
+    elif broken == "impossible_ceiling":
+        fault["comparison"]["temperature"]["ceiling_c"] = 150
+        fault["comparison"]["configured"]["Max_Temperature_Limit"]["value"] = 150
+        fault["comparison"]["upper_exclusive"] = 150
+    elif broken == "device_error":
+        fault["group_reply"]["packets"][0]["device_error"] = 4
+    elif broken == "packet_error":
+        fault["group_reply"]["packets"][0]["packet"][4] = 4
+    elif broken == "packet_checksum":
+        fault["group_reply"]["packets"][0]["packet"][-1] ^= 1
+    elif broken == "packet_width":
+        fault["group_reply"]["request"]["width"] = 38
+    elif broken == "packet_missing":
+        fault["group_reply"]["packets"].pop()
+    elif broken == "packet_raw":
+        fault["raw"]["arm_left_shoulder_pan"] = 33
+    elif broken == "group_error":
+        fault["group_reply"]["comm_result"] = -1
+    elif broken == "raw_boolean":
+        fault["offending_value"] = False
+    elif broken == "cleanup_error":
+        old["cleanup_errors"] = ["failed"]
+    elif broken == "nonzero":
+        old["readback"]["readbacks"][0]["value"] = 1
+    elif broken == "fresh_lift_missing":
+        proof["readback"].pop("lift_stationary")
+    elif broken == "fresh_thermal_stale":
+        proof["readback"]["lift_stationary"]["temperature_slots"][0][0] = 90.0
+    notes[:] = [
+        "[AM1 TELEOP FAULT] " + json.dumps(fault),
+        "Original normal-rest acquisition: " + json.dumps(rest),
+    ]
+    if broken == "rest_missing":
+        notes.pop()
+    elif broken == "rest_duplicate":
+        notes.append(notes[1])
+    elif broken == "fault_duplicate":
+        notes.append(notes[0])
+    elif broken == "fault_malformed":
+        notes[0] = "[AM1 TELEOP FAULT] {bad"
+    elif broken == "partial_chain":
+        old["first_error_chain"].pop(0)
+    publish_incomplete_fixture(config, run, proof, state)
+    with pytest.raises((ValueError, RuntimeError)):
+        m.load_qualified_proof(config, run)
+
+
+# Synthetic fresh readback proof with the retained Combined18 import-trace shape.
+# These fixtures are offline contrasts and grant no physical cleanup credit.
+def preimport_stop_fixture(tmp_path, monkeypatch):
+    m, config, run, proof, state, _, _ = loader_fixture(tmp_path, monkeypatch)
+    run.update(
+        status="stopped",
+        requested_terminal="stopped",
+        cleanup="physical_cleanup_unknown",
+        source="protected-physical-provider",
+        recipe="physical-live-teleop",
+        native_live_at=None,
+        progress_s=0.0,
+        recovery_episodes=0,
+        first_cause=None,
+        native_first_cause=None,
+        execution={"complete": False, "fault": None, "progress_s": 0.0},
+    )
+    run["physical_result"].update(
+        phase="terminal",
+        terminal_status="stopped",
+        run_id=run["run_id"],
+        uncertain=True,
+        cleanup="physical_cleanup_unknown",
+        native_live_at=None,
+        first_cause=None,
+        readback=None,
+        cleanup_errors=[],
+    )
+    proof.update(
+        original_cleanup_origin="preimport-stop-missing-host-receipt",
+        original_first_cause=None,
+        original_cleanup_sha256=None,
+        original_cleanup_missing=True,
+        original_markers=dict.fromkeys(m.MARKERS),
+    )
+    directory = Path(config["run_root"]) / run["run_id"][:8]
+    (directory / "cleanup.json").unlink()
+    (state / "cleanup-uncertain.json").unlink()
+    repository = Path(__file__).resolve().parents[2]
+    config["host_repository"] = str(repository)
+    proof["source"]["backend_contract"] = copy.deepcopy(config)
+    prefix = (repository / "src/lerobot/robots/alohamini").as_posix()
+    stdlib = "/retained/python/lib/python3.12/dataclasses.py"
+    trace = (
+        "Traceback (most recent call last):\n"
+        '  File "<frozen runpy>", line 189, in _run_module_as_main\n'
+        '  File "<frozen runpy>", line 112, in _get_module_details\n'
+        f'  File "{prefix}/__init__.py", line 17, in <module>\n'
+        "    from .alohamini import AlohaMini\n"
+        f'  File "{prefix}/alohamini.py", line 42, in <module>\n'
+        "    from .lift_axis import LiftAxis, LiftAxisConfig, LiftHomeResult\n"
+        f'  File "{prefix}/lift_axis.py", line 59, in <module>\n'
+        "    @dataclass\n     ^^^^^^^^^\n"
+        f'  File "{stdlib}", line 1275, in dataclass\n'
+        "    return wrap(cls)\n           ^^^^^^^^^\n"
+        f'  File "{stdlib}", line 1265, in wrap\n'
+        "    return _process_class(cls, init, repr, eq, order, unsafe_hash,\n"
+        "           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+        f'  File "{stdlib}", line 1092, in _process_class\n'
+        "    _cmp_fn('__eq__', '==',\n"
+        f'  File "{stdlib}", line 667, in _cmp_fn\n'
+        "    return _create_fn(name,\n           ^^^^^^^^^^^^^^^^\n"
+        f'  File "{stdlib}", line 473, in _create_fn\n'
+        "    exec(txt, globals, ns)\n"
+        '  File "<string>", line 0, in <module>\nKeyboardInterrupt\n'
+    ).encode()
+    launch = (
+        f"Running as unit: am1-pa01-host-{run['run_id']}.service; invocation ID: "
+        "3948f26868774d6dbecd7112518e0ccf\nFinished with result: success\n"
+        "Main processes terminated with: code=killed, status=2/INT\n"
+        "Service runtime: 4.676s\nCPU time consumed: 4.830s\n"
+    ).encode()
+    for name, data in (("host-runtime.log", trace), ("host-launch.log", launch)):
+        (directory / name).write_bytes(data)
+    proof["original_host_logs"] = {
+        name: hashlib.sha256((directory / name).read_bytes()).hexdigest()
+        for name in ("host-runtime.log", "host-launch.log")
+    }
+    publish_preimport_fixture(run, proof, state)
+    return m, config, run, proof, state, directory
+
+
+def publish_preimport_fixture(run, proof, state):
+    proof["original_terminal_run_sha256"] = hashlib.sha256(canonical(run)).hexdigest()
+    raw = canonical(proof)
+    (state / ("reconciliation-" + run["run_id"] + ".json")).write_bytes(raw)
+    return raw
+
+
+def test_preimport_stop_missing_receipt_requires_fresh_proof_and_durable_ack(tmp_path, monkeypatch):
+    m, config, run, proof, state, directory = preimport_stop_fixture(tmp_path, monkeypatch)
+    original = copy.deepcopy(run)
+    actual, raw, inventory = m.load_qualified_proof(config, run)
+    assert actual == proof and inventory == dict.fromkeys(m.MARKERS)
+    operation = str(uuid.uuid4())
+    ack = m.archive_and_ack(config, actual, raw, inventory, operation)
+    receipt = dict(actual, acknowledgment=dict(ack, consumed_operation_id=operation))
+    assert m.acknowledged_receipt(receipt, run, operation)
+    assert run == original and run["uncertain"] is True and run["physical_result"]["readback"] is None
+    assert not (directory / "cleanup.json").exists()
+    assert all(not (state / name).exists() for name in m.MARKERS)
+    assert m.load_qualified_proof(config, run)[0] == proof
+
+
+@pytest.mark.parametrize(
+    "broken",
+    [
+        "origin",
+        "missing_declaration",
+        "missing_hash_key",
+        "fake_receipt_hash",
+        "status",
+        "requested",
+        "live",
+        "native_live",
+        "progress",
+        "bool_progress",
+        "execution_progress",
+        "execution_fault",
+        "complete",
+        "recovery",
+        "cause",
+        "native_cause",
+        "host_cause",
+        "readback",
+        "cleanup_error",
+        "terminal_status",
+        "marker_inventory",
+        "marker_appeared",
+        "cleanup_appeared",
+        "trace_hash",
+        "launch_hash",
+        "trace_noise",
+        "trace_other_import",
+        "trace_post_main",
+        "trace_device_error",
+        "launch_other_run",
+        "launch_other_signal",
+        "launch_extra",
+        "source_line",
+        "fresh_torque",
+        "fresh_lift",
+        "fresh_thermal",
+    ],
+)
+def test_preimport_stop_origin_refuses_other_shapes_and_unqualified_fresh_proof(
+    tmp_path, monkeypatch, broken
+):
+    m, config, run, proof, state, directory = preimport_stop_fixture(tmp_path, monkeypatch)
+    lifecycle = run["physical_result"]
+    if broken == "origin":
+        proof["original_cleanup_origin"] = "ordinary-cancel"
+    elif broken == "missing_declaration":
+        proof.pop("original_cleanup_missing")
+    elif broken == "missing_hash_key":
+        proof.pop("original_cleanup_sha256")
+    elif broken == "fake_receipt_hash":
+        proof["original_cleanup_sha256"] = "a" * 64
+    elif broken == "status":
+        run["status"] = "faulted"
+    elif broken == "requested":
+        run["requested_terminal"] = "completed"
+    elif broken == "live":
+        run["native_live_at"] = 98.0
+    elif broken == "native_live":
+        lifecycle["native_live_at"] = 98.0
+    elif broken in ("progress", "bool_progress"):
+        run["progress_s"] = 0.1 if broken == "progress" else False
+    elif broken == "execution_progress":
+        run["execution"]["progress_s"] = 0.1
+    elif broken == "execution_fault":
+        run["execution"]["fault"] = "actual failure"
+    elif broken == "complete":
+        run["execution"]["complete"] = True
+    elif broken == "recovery":
+        run["recovery_episodes"] = 1
+    elif broken == "cause":
+        run["first_cause"] = "owner failure"
+    elif broken == "native_cause":
+        run["native_first_cause"] = proof["original_first_cause"] = "actual failure"
+    elif broken == "host_cause":
+        lifecycle["first_cause"] = "actual failure"
+    elif broken == "readback":
+        lifecycle["readback"] = {}
+    elif broken == "cleanup_error":
+        lifecycle["cleanup_errors"] = ["actual failure"]
+    elif broken == "terminal_status":
+        lifecycle["terminal_status"] = "faulted"
+    elif broken == "marker_inventory":
+        proof["original_markers"][m.MARKERS[0]] = {"sha256": "a" * 64}
+    elif broken == "marker_appeared":
+        (state / m.MARKERS[1]).write_bytes(b"foreign")
+    elif broken == "cleanup_appeared":
+        (directory / "cleanup.json").write_bytes(b"null")
+    elif broken in ("trace_hash", "launch_hash"):
+        proof["original_host_logs"]["host-runtime.log" if broken == "trace_hash" else "host-launch.log"] = (
+            "a" * 64
+        )
+    elif broken.startswith("trace_"):
+        path = directory / "host-runtime.log"
+        data = path.read_bytes()
+        if broken == "trace_noise":
+            data = b"operational_ready\n" + data
+        elif broken == "trace_other_import":
+            data = data.replace(b"from .lift_axis import", b"from .lift_operational import")
+        elif broken == "trace_post_main":
+            data = data.replace(b"in _get_module_details", b"in main")
+        else:
+            data = data.replace(b"KeyboardInterrupt", b"RuntimeError: device error")
+        path.write_bytes(data)
+        proof["original_host_logs"][path.name] = hashlib.sha256(data).hexdigest()
+    elif broken.startswith("launch_"):
+        path = directory / "host-launch.log"
+        data = path.read_bytes()
+        if broken == "launch_other_run":
+            data = data.replace(run["run_id"].encode(), str(uuid.uuid4()).encode())
+        elif broken == "launch_other_signal":
+            data = data.replace(b"2/INT", b"9/KILL")
+        else:
+            data += b"unexpected second launch\n"
+        path.write_bytes(data)
+        proof["original_host_logs"][path.name] = hashlib.sha256(data).hexdigest()
+    elif broken == "source_line":
+        source = tmp_path / "changed-source"
+        source.mkdir()
+        config["host_repository"] = str(source)
+        proof["source"]["backend_contract"] = copy.deepcopy(config)
+    elif broken == "fresh_torque":
+        proof["readback"]["readbacks"][0]["value"] = 1
+    elif broken == "fresh_lift":
+        proof["readback"].pop("lift_stationary")
+    else:
+        proof["readback"]["lift_stationary"]["temperature_slots"][0][0] = 99.0
+    publish_preimport_fixture(run, proof, state)
+    with pytest.raises((ValueError, OSError, RuntimeError, TypeError)):
+        m.load_qualified_proof(config, run)
+
+
+@pytest.mark.parametrize("change", ["cleanup", "runtime", "launch"])
+def test_preimport_origin_original_appearance_or_change_before_ack_refuses(tmp_path, monkeypatch, change):
+    m, config, run, proof, state, directory = preimport_stop_fixture(tmp_path, monkeypatch)
+    actual, raw, inventory = m.load_qualified_proof(config, run)
+    path = (
+        directory
+        / {"cleanup": "cleanup.json", "runtime": "host-runtime.log", "launch": "host-launch.log"}[change]
+    )
+    path.write_bytes(b"changed")
+    with pytest.raises((ValueError, OSError)):
+        m.archive_and_ack(config, actual, raw, inventory, str(uuid.uuid4()))
+    assert not list(state.glob("reconciliation-ack-*"))
+
+
+def test_preimport_origin_cleanup_appearance_during_ack_never_returns_qualified(tmp_path, monkeypatch):
+    m, config, run, proof, state, directory = preimport_stop_fixture(tmp_path, monkeypatch)
+    actual, raw, inventory = m.load_qualified_proof(config, run)
+    original = m._write_new_or_same
+
+    def appearance(path, data):
+        original(path, data)
+        if path.name.startswith("reconciliation-ack-"):
+            (directory / "cleanup.json").write_bytes(b"unexpected")
+
+    monkeypatch.setattr(m, "_write_new_or_same", appearance)
+    with pytest.raises(ValueError):
+        m.archive_and_ack(config, actual, raw, inventory, str(uuid.uuid4()))
+    with pytest.raises(ValueError):
+        m.load_qualified_proof(config, run)
+
+
+# Retained Combined66 package-discovery cancellation, with paths rebound only.
+# Offline origin evidence never replaces the separately qualified fresh readback.
+PROCESSOR_PREIMPORT_TRACE = (
+    ('<frozen runpy>', 189, '_run_module_as_main', ()),
+    ('<frozen runpy>', 112, '_get_module_details', ()),
+    ('repo/lerobot/robots/alohamini/__init__.py', 17, '<module>', ('    from .alohamini import AlohaMini',)),
+    ('repo/lerobot/robots/alohamini/alohamini.py', 34, '<module>', ('    from lerobot.processor import RobotAction, RobotObservation',)),
+    ('repo/lerobot/processor/__init__.py', 26, '<module>', ('    from .batch_processor import AddBatchDimensionProcessorStep',)),
+    ('repo/lerobot/processor/batch_processor.py', 27, '<module>', ('    from lerobot.configs import PipelineFeatureType, PolicyFeature',)),
+    ('repo/lerobot/configs/__init__.py', 25, '<module>', ('    from .default import DatasetConfig, EvalConfig, JobConfig, PeftConfig, WandBConfig',)),
+    ('repo/lerobot/configs/default.py', 19, '<module>', ('    from lerobot.transforms import ImageTransformsConfig',)),
+    ('repo/lerobot/transforms/__init__.py', 15, '<module>', ('    from .transforms import (',)),
+    ('repo/lerobot/transforms/transforms.py', 22, '<module>', ('    from torchvision.transforms import v2',)),
+    ('venv/lib/python3.12/site-packages/torchvision/__init__.py', 8, '<module>', ('    from torchvision import _meta_registrations, datasets, io, models, ops, transforms, utils  # usort:skip', '    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^')),
+    ('venv/lib/python3.12/site-packages/torchvision/models/__init__.py', 2, '<module>', ('    from .convnext import *',)),
+    ('venv/lib/python3.12/site-packages/torchvision/models/convnext.py', 9, '<module>', ('    from ..ops.misc import Conv2dNormActivation, Permute',)),
+    ('venv/lib/python3.12/site-packages/torchvision/ops/__init__.py', 23, '<module>', ('    from .poolers import MultiScaleRoIAlign',)),
+    ('venv/lib/python3.12/site-packages/torchvision/ops/poolers.py', 10, '<module>', ('    from .roi_align import roi_align',)),
+    ('venv/lib/python3.12/site-packages/torchvision/ops/roi_align.py', 7, '<module>', ('    from torch._dynamo.utils import is_compile_supported',)),
+    ('venv/lib/python3.12/site-packages/torch/_dynamo/__init__.py', 13, '<module>', ('    from . import (',)),
+    ('venv/lib/python3.12/site-packages/torch/_dynamo/aot_compile.py', 15, '<module>', ('    from torch._dynamo.convert_frame import GraphRuntimeEnv',)),
+    ('venv/lib/python3.12/site-packages/torch/_dynamo/convert_frame.py', 62, '<module>', ('    from torch._dynamo.symbolic_convert import TensorifyState',)),
+    ('venv/lib/python3.12/site-packages/torch/_dynamo/symbolic_convert.py', 54, '<module>', ('    from torch._dynamo.exc import ObservedException, TensorifyScalarRestartAnalysis',)),
+    ('venv/lib/python3.12/site-packages/torch/_dynamo/exc.py', 44, '<module>', ('    from .utils import counters',)),
+    ('venv/lib/python3.12/site-packages/torch/_dynamo/utils.py', 70, '<module>', ('    import torch.fx.experimental.symbolic_shapes',)),
+    ('venv/lib/python3.12/site-packages/torch/fx/experimental/symbolic_shapes.py', 3, '<module>', ('    import sympy',)),
+    ('venv/lib/python3.12/site-packages/sympy/__init__.py', 31, '<module>', ('    from sympy.core.cache import lazy_function',)),
+    ('venv/lib/python3.12/site-packages/sympy/core/__init__.py', 9, '<module>', ('    from .expr import Expr, AtomicExpr, UnevaluatedExpr',)),
+    ('venv/lib/python3.12/site-packages/sympy/core/expr.py', 4188, '<module>', ('    from .mul import Mul',)),
+    ('venv/lib/python3.12/site-packages/sympy/core/mul.py', 2212, '<module>', ('    from .numbers import Rational',)),
+    ('venv/lib/python3.12/site-packages/sympy/core/numbers.py', 4467, '<module>', ('    from .power import Pow',)),
+    ('venv/lib/python3.12/site-packages/sympy/core/power.py', 14, '<module>', ('    from .relational import is_gt, is_lt',)),
+    ('venv/lib/python3.12/site-packages/sympy/core/relational.py', 909, '<module>', ('    class GreaterThan(_Greater):',)),
+    ('venv/lib/python3.12/site-packages/sympy/core/basic.py', 218, '__init_subclass__', ('    _prepare_class_assumptions(cls)',)),
+    ('venv/lib/python3.12/site-packages/sympy/core/assumptions.py', 624, '_prepare_class_assumptions', ("    v = cls.__dict__.get(attrname, '')", '        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^')),
+)
+
+
+def processor_preimport_fixture(tmp_path, monkeypatch):
+    m, config, run, proof, state, directory = preimport_stop_fixture(tmp_path, monkeypatch)
+    repository = Path(config["host_repository"])
+    environment = tmp_path / "venv"
+    config["host_python"] = str(environment / "bin/python")
+    proof["source"]["backend_contract"] = copy.deepcopy(config)
+    lines = ["Traceback (most recent call last):"]
+    for name, number, context, body in PROCESSOR_PREIMPORT_TRACE:
+        if name.startswith("repo/"):
+            path = repository / "src" / name.removeprefix("repo/")
+            name = path.as_posix()
+        elif name.startswith("venv/"):
+            path = environment / name.removeprefix("venv/")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            source = ["# retained dependency source"] * number
+            source[number - 1] = body[0].strip()
+            path.write_text("\n".join(source) + "\n", encoding="utf-8")
+            name = path.as_posix()
+        lines.append(f'  File "{name}", line {number}, in {context}')
+        lines.extend(body)
+    data = ("\n".join(lines) + "\nKeyboardInterrupt\n").encode()
+    (directory / "host-runtime.log").write_bytes(data)
+    proof["original_host_logs"]["host-runtime.log"] = hashlib.sha256(data).hexdigest()
+    publish_preimport_fixture(run, proof, state)
+    return m, config, run, proof, state, directory
+
+
+def test_preimport_processor_discovery_accepts_retained_trace_only_with_fresh_proof(tmp_path, monkeypatch):
+    m, config, run, proof, state, directory = processor_preimport_fixture(tmp_path, monkeypatch)
+    original = copy.deepcopy(run)
+    logs = {name: (directory / name).read_bytes() for name in proof["original_host_logs"]}
+    actual, raw, inventory = m.load_qualified_proof(config, run)
+    assert actual == proof and inventory == dict.fromkeys(m.MARKERS)
+    operation = str(uuid.uuid4())
+    ack = m.archive_and_ack(config, actual, raw, inventory, operation)
+    receipt = dict(actual, acknowledgment=dict(ack, consumed_operation_id=operation))
+    assert m.acknowledged_receipt(receipt, run, operation)
+    assert m.load_qualified_proof(config, run)[0] == proof
+    assert run == original and run["uncertain"] is True and run["native_first_cause"] is None
+    assert run["physical_result"]["readback"] is None and not (directory / "cleanup.json").exists()
+    assert {name: (directory / name).read_bytes() for name in logs} == logs
+    assert all(not (state / name).exists() for name in m.MARKERS)
+
+
+@pytest.mark.parametrize(
+    "broken",
+    [
+        "discovery", "package_source", "local_function", "host_main", "physical_module",
+        "foreign_dependency", "dependency_source", "caret", "trace_bound", "frame_bound",
+        "source_bound", "source_escape", "fresh_torque", "fresh_lift", "fresh_thermal",
+    ],
+)
+def test_preimport_processor_discovery_refuses_execution_and_unqualified_proof(tmp_path, monkeypatch, broken):
+    m, config, run, proof, state, directory = processor_preimport_fixture(tmp_path, monkeypatch)
+    path = directory / "host-runtime.log"
+    data = path.read_bytes()
+    dependency = Path(config["host_python"]).parent.parent / "lib/python3.12/site-packages/sympy/core/assumptions.py"
+    if broken == "discovery":
+        data = data.replace(b"in _get_module_details", b"in _run_code")
+    elif broken == "package_source":
+        data = data.replace(b"from lerobot.processor import RobotAction, RobotObservation", b"from lerobot.motors import Motor")
+    elif broken == "local_function":
+        data = data.replace(b'line 26, in <module>', b'line 26, in __init__', 1)
+    elif broken in ("host_main", "physical_module"):
+        source = Path(config["host_repository"]) / "src/lerobot" / (
+            "robots/alohamini/alohamini_host.py" if broken == "host_main" else "motors/motors_bus.py"
+        )
+        body = source.read_text(encoding="utf-8").splitlines()[0].strip()
+        extra = f'  File "{source.as_posix()}", line 1, in <module>\n    {body}\n'.encode()
+        data = data.replace(b"KeyboardInterrupt", extra + b"KeyboardInterrupt")
+    elif broken == "foreign_dependency":
+        foreign = tmp_path / "foreign.py"
+        foreign.write_bytes(dependency.read_bytes())
+        data = data.replace(dependency.as_posix().encode(), foreign.as_posix().encode())
+    elif broken == "dependency_source":
+        dependency.write_text("# source changed\n", encoding="utf-8")
+    elif broken == "caret":
+        data = data.replace(b'        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^', b'    unexpected execution text')
+    elif broken == "trace_bound":
+        data = data.replace(b"KeyboardInterrupt", b" " * 65536 + b"KeyboardInterrupt")
+    elif broken == "frame_bound":
+        frame = f'  File "{dependency.as_posix()}", line 624, in _prepare_class_assumptions\n    v = cls.__dict__.get(attrname, '')\n'.encode()
+        data = data.replace(b"KeyboardInterrupt", frame * 65 + b"KeyboardInterrupt")
+    elif broken == "source_bound":
+        dependency.write_bytes(b"#" * (2 * 1024 * 1024 + 1))
+    elif broken == "source_escape":
+        data = data.replace(dependency.as_posix().encode(), (dependency.parent / ".." / "core" / dependency.name).as_posix().encode())
+    elif broken == "fresh_torque":
+        proof["readback"]["readbacks"][0]["value"] = 1
+    elif broken == "fresh_lift":
+        proof["readback"].pop("lift_stationary")
+    else:
+        proof["readback"]["lift_stationary"]["temperature_slots"][0][0] = 99.0
+    path.write_bytes(data)
+    proof["original_host_logs"][path.name] = hashlib.sha256(data).hexdigest()
+    publish_preimport_fixture(run, proof, state)
+    with pytest.raises((ValueError, OSError, RuntimeError, TypeError)):
+        m.load_qualified_proof(config, run)
+    assert not list(state.glob("reconciliation-ack-*"))
+    assert not (directory / "cleanup.json").exists()
+
+
+@pytest.mark.parametrize(
+    "later_temperature, retimestamp_peak, accepted",
+    [(34, True, True), (33, False, True), (33, True, False)],
+)
+def test_stopped_thermal_replay_retains_actual_latest_equal_peak_without_refreshing_lower(
+    later_temperature, retimestamp_peak, accepted
+):
+    from tools import am1_physical_reconciliation as m
+
+    config, run, proof = stopped_proof()
+    lift = proof["readback"]["lift_stationary"]
+    samples = lift["samples"]
+    # The later receipt in each other slot is lower; their real earlier maxima
+    # remain. Only the first slot varies between an equal and a lower receipt.
+    for index in (1, 3, 5, 7):
+        sample = samples[index]
+        sample["temperature_c"] = later_temperature if index == 1 else 33
+        packet = sample["group_trace"]["response_bytes"]
+        packet[5 + 30] = sample["temperature_c"]
+        packet[-1] = (~sum(packet[2:-1])) & 255
+    indices = (1 if retimestamp_peak else 0, 2, 4, 6, 8)
+    lift["temperature_slots"] = [[samples[index]["sample_monotonic_s"], 34] for index in indices]
+    original = copy.deepcopy(proof)
+    if accepted:
+        assert m.validate_stopped_proof(config, run, proof, now=100.1, boot_id=proof["boot_id"]) == proof
+    else:
+        with pytest.raises(ValueError, match="thermal peak slot provenance/freshness"):
+            m.validate_stopped_proof(config, run, proof, now=100.1, boot_id=proof["boot_id"])
+    assert proof == original

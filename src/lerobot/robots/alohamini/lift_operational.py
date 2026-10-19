@@ -24,7 +24,10 @@ class TemperatureWindow:
     MAX_AGE_S = 0.5
     CEILING_C = 55
 
-    def __init__(self) -> None:
+    def __init__(self, *, ceiling_c: int = CEILING_C) -> None:
+        if type(ceiling_c) is not int or not 0 < ceiling_c <= 100:
+            raise ValueError("Temperature confirmation needs an explicit valid role ceiling.")
+        self.ceiling_c = ceiling_c
         # Each entry is the actual peak reading/time in one occupied 100 ms
         # slot. Faster polling cannot create extra votes or erase a slot's high.
         self.samples: deque[tuple[float, int]] = deque(maxlen=self.SIZE)
@@ -33,10 +36,13 @@ class TemperatureWindow:
         self._last_sample_at: float | None = None
         self.failure: feedback.ComparisonRefusal | None = None
         self.outliers = 0
+        # Enabled only by the admitted whole-teleop owner; never startup/standalone.
+        self.allow_history_hold = False
+        self.history_deficit_at: float | None = None
 
     @property
     def ready(self) -> bool:
-        return len(self.samples) == self.SIZE and self.failure is None
+        return len(self.samples) == self.SIZE and self.failure is None and self.history_deficit_at is None
 
     def refuse(self, reason: str) -> None:
         if self.failure is None:
@@ -46,13 +52,18 @@ class TemperatureWindow:
     def assert_fresh(self, now: float, *, refreshing: bool = False) -> None:
         if self.failure is not None:
             raise self.failure
-        if not math.isfinite(now) or not self.ready:
+        if not math.isfinite(now) or len(self.samples) != self.SIZE:
             self.refuse("temperature: five genuine fresh baseline time slots are required.")
         # A fresh read may replace the oldest slot. Before reading, check the
         # last RAW timestamp; update() then checks all retained peak timestamps
         # before any action can use them. No stale history becomes a normal low.
-        oldest_required = self._last_sample_at if refreshing else self.samples[0][0]
-        if now < self._last_sample_at or now - oldest_required > self.MAX_AGE_S:
+        if now < self._last_sample_at or now - self._last_sample_at > self.MAX_AGE_S:
+            self.refuse("temperature: five-slot feedback window is stale (>0.5 s).")
+        if not refreshing and now - self.samples[0][0] > self.MAX_AGE_S:
+            if self.allow_history_hold is True:
+                if self.history_deficit_at is None:
+                    self.history_deficit_at = now
+                return
             self.refuse("temperature: five-slot feedback window is stale (>0.5 s).")
 
     def update(
@@ -87,16 +98,26 @@ class TemperatureWindow:
         if slot != self._last_slot:
             self.samples.append((now, int(value)))
             self._last_slot = slot
-        elif value > self.samples[-1][1]:
+        elif value >= self.samples[-1][1]:
+            # An equal maximum has its own new original receipt. A lower value
+            # cannot retimestamp a retained higher peak.
             self.samples[-1] = (now, int(value))
         self._last_sample_at = now
-        if now - self.samples[0][0] > self.MAX_AGE_S:
+        history_stale = now - self.samples[0][0] > self.MAX_AGE_S
+        if history_stale and self.allow_history_hold is not True:
             self.refuse("temperature: five-slot feedback window is stale (>0.5 s).")
-        if value >= self.CEILING_C:
+        if value >= self.ceiling_c:
             self.outliers += 1  # Includes the actual refusal-causing raw reading.
-        high = sum(temperature >= self.CEILING_C for _, temperature in self.samples)
-        if self.ready and high >= 3:
-            self.refuse("temperature: majority (3/5 time slots) at or above 55 C; stop latched.")
+        high = sum(temperature >= self.ceiling_c for _, temperature in self.samples)
+        if len(self.samples) == self.SIZE and high >= 3:
+            self.refuse(
+                f"temperature: majority (3/5 time slots) at or above {self.ceiling_c} C; stop latched."
+            )
+        if history_stale:
+            if self.history_deficit_at is None:
+                self.history_deficit_at = now
+        else:
+            self.history_deficit_at = None  # Only actual acquisitions restore peak readiness.
         if self.ready and cold_start and sum(t > feedback.COOL_START_C for _, t in self.samples) >= 3:
             self.refuse("temperature: confirmed starting temperature exceeds 40 C.")
         return {
@@ -167,6 +188,12 @@ class OperationalLift(InstalledLiftCheck):
             record["temperature_slot_s"] = self.temperature.SLOT_S
             record["numeric_outlier_count"] = self.temperature.outliers
             raise
+        if getattr(self.robot, "_am1_teleop_startup_temperature", False):
+            # Same owner, no recursive lift poll. Keep follower history continuous
+            # through finite lift home/relief before ordinary Live polling owns it.
+            from .am1_live_teleop import refresh_startup_temperatures
+
+            refresh_startup_temperatures(self.robot)
         if record["temperature_c"] >= 55 and now - self._last_warning >= 1.0:
             self.monitor.record(
                 "temperature_warning", event="temperature_outlier",
@@ -179,7 +206,7 @@ class OperationalLift(InstalledLiftCheck):
         if self.failure is not None:
             raise self.failure
 
-    def _qualify_startup_off(self) -> dict[str, Any]:
+    def _qualify_startup_off(self, *, before_torque: bool = False) -> dict[str, Any]:
         """Acquire observed off state, then prove the unchanged strict baseline."""
         previous_clock = None
 
@@ -217,7 +244,7 @@ class OperationalLift(InstalledLiftCheck):
             return value
 
         # Keep the existing helper's SDK retry/readback behavior. There is no
-        # additional request, enabled write, outer retry or renewed deadline.
+        # enabled write, outer retry or renewed deadline.
         for register in ("Goal_Velocity", "Torque_Enable"):
             remaining(request)
             started = clock(request)
@@ -326,6 +353,7 @@ class OperationalLift(InstalledLiftCheck):
                     return True
             record["startup_off_motion_candidate_reset"] = False
             return False
+        off_reasserted = False
         while True:
             budget = min(self.monitor.sample_timeout_ms, remaining(request) * 1000)
             record = self.monitor.sample(
@@ -343,6 +371,43 @@ class OperationalLift(InstalledLiftCheck):
             self.emit(record)
             if int(record["torque_enable"]) == 0:
                 break  # This first zero is acquisition evidence, not a baseline vote.
+            if not off_reasserted:
+                remaining(record)
+                off_reasserted = True
+                started = clock(record)
+                try:
+                    trace = self.transport.write_register(feedback.TORQUE_ENABLE_ADDRESS, 1, 0)
+                except BaseException as error:
+                    try:
+                        self.monitor.record(
+                            "startup_off_reassert_failed",
+                            register="Torque_Enable",
+                            requested_value=0,
+                            requested_at_monotonic_s=started,
+                            helper_failed_at_monotonic_s=clock(record),
+                            absolute_deadline_monotonic_s=deadline,
+                            error_type=type(error).__name__,
+                            error=str(error),
+                            write_trace=getattr(error, "trace", None),
+                            wire_effect="unqualified",
+                        )
+                    except BaseException as diagnostic_error:
+                        error.add_note("Startup off zero reassert diagnostic also failed: " + type(diagnostic_error).__name__)
+                    raise
+                returned = clock(record)
+                record = self.monitor.record(
+                    "startup_off_reassert_returned",
+                    register="Torque_Enable",
+                    requested_value=0,
+                    requested_at_monotonic_s=started,
+                    helper_returned_at_monotonic_s=returned,
+                    absolute_deadline_monotonic_s=deadline,
+                    write_trace=trace,
+                    wire_effect="not established until fresh grouped torque-off feedback",
+                )
+                remaining(record)
+                if returned - started > self.monitor.sample_timeout_ms / 1000:
+                    self.refuse(record, "startup off: zero-only reassertion exceeded its 40 ms request budget.")
             self.monitor.sleep(min(feedback.POLL_S, remaining(record)))
             remaining(record)
 
@@ -383,29 +448,58 @@ class OperationalLift(InstalledLiftCheck):
             ),
             strict_baseline=baseline["stationary_qualification"],
         )
+        if before_torque:
+            self.bus.expected_torque = 0
+            self.monitor.record(
+                "before_torque_off_acquisition_completed",
+                sample_monotonic_s=baseline["sample_monotonic_s"],
+                strict_baseline=baseline["stationary_qualification"],
+            )
+        # Lower replies retain the original peak time; advancing equal maxima
+        # use the latest actual reply time. Phase work can cross the next slot
+        # even before the nominal raw poll interval is due. Keep
+        # the same off/zero/cold acquisition, observer and original deadline.
+        now = clock(baseline)
+        self.temperature.assert_fresh(now, refreshing=True)
+        budget = deadline - now
+        if budget <= 0:
+            self.refuse(baseline, "startup off: original deadline expired before thermal handoff.")
+        slot = (round(now * 1_000_000_000) - self.temperature._origin_ns) // round(
+            self.temperature.SLOT_S * 1_000_000_000
+        )
+        if now - self.temperature._last_sample_at >= feedback.POLL_S or slot > self.temperature._last_slot:
+            handoff = self.monitor.sample(
+                "startup_off_handoff", expected_torque=0, expected_goal=0, cold_start=True,
+                timeout_ms=min(self.monitor.sample_timeout_ms, budget * 1000), emit_sample=False,
+            )
+            handoff["absolute_deadline_monotonic_s"] = deadline
+            if clock(handoff) > deadline:
+                self.refuse(handoff, "startup off: original deadline exceeded by thermal handoff.")
+            if observe(handoff):
+                self.refuse(handoff, "startup off: persistent motion invalidated the completed stationary window.")
+            self.emit(handoff)
+            now = clock(handoff)
+            if now > deadline:
+                self.refuse(handoff, "startup off: original deadline exceeded after thermal handoff evidence.")
+        # No output or second-clock decision between this strict guard and return.
+        self.temperature.assert_fresh(now)
         return baseline
 
     def _qualify_before_torque(self) -> None:
         # Reuse the same off acquisition and nine-sample strict baseline, with
         # its one original 600 ms budget and the existing thermal history.
         self.monitor.record("before_torque_off_acquisition_started")
-        baseline = self._qualify_startup_off()
-        self.bus.expected_torque = 0
-        self.monitor.record(
-            "before_torque_off_acquisition_completed",
-            sample_monotonic_s=baseline["sample_monotonic_s"],
-            strict_baseline=baseline["stationary_qualification"],
-        )
+        self._qualify_startup_off(before_torque=True)
 
     def start(self):
         try:
             self.monitor.read_configuration()
             self._qualify_startup_off()
-            self.temperature.assert_fresh(time.monotonic())
             result, _ = self.home_and_relieve(
                 allow_one_count_variation=True, qualify_initial_direction=True,
                 require_quiet_post_home=True,
                 am1_post_home_readiness=True,
+                relief_poll_s=feedback.POLL_S,
             )
             self._goal_since = time.monotonic()
             self.poll()

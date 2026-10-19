@@ -208,8 +208,10 @@ def test_settings_budget_stops_more_serial_reads_and_never_retries(capsys):
     (False, True, 0), (True, True, 13), (True, False, 0),
 ])
 def test_host_opt_in_requires_profile_and_existing_am1_owner(
-    monkeypatch, capsys, opt_in, profile, expected_reads,
+    monkeypatch, capsys, tmp_path, opt_in, profile, expected_reads,
 ):
+    # This fake-host unit test must never claim the real user physical state.
+    monkeypatch.setattr(alohamini_host.Path, "home", classmethod(lambda cls: tmp_path))
     args = alohamini_host.make_parser().parse_args(
         ["--robot_model", "alohamini1", "--no_cameras", "--skip_lift_home"]
     )

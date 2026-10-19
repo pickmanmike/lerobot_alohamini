@@ -21,6 +21,7 @@ from urllib.parse import urlsplit
 
 from aiohttp import WSMsgType, web
 
+from examples.alohamini.am1_live_teleop import TELEOP_RECIPE
 from examples.alohamini.am1_session_contract import LIVE_ELBOW_SPECS
 from tools.am1_session_ipc import (
     CONTROL_LIMIT,
@@ -222,10 +223,15 @@ class Peer:
 
 
 class Gateway:
-    def __init__(self, owner_state, auth_state, media_config=None):
+    def __init__(self, owner_state, auth_state, media_config=None, onboard_config=None):
         self.ipc = IPCClient(owner_state)
         self.auth = AuthStore(auth_state)
         self.media = None
+        self.onboard = None
+        if onboard_config:
+            from tools.am1_onboard_media import OnboardMediaProxy
+
+            self.onboard = OnboardMediaProxy(onboard_config, self.ipc)
         if media_config:
             from tools.am1_media_proxy import WHEPProxy
 
@@ -255,6 +261,12 @@ class Gateway:
         self.app.router.add_patch("/api/media/{handle}", self.media_request)
         self.app.router.add_delete("/api/media/{handle}", self.media_request)
         self.app.router.add_post("/api/media/{handle}/keepalive", self.media_request)
+        self.app.router.add_get("/camera/assets/{name}", self.camera_asset)
+        self.app.router.add_get("/api/onboard/status", self.onboard_request)
+        self.app.router.add_get("/api/onboard/frame/{role}", self.onboard_request)
+        self.app.router.add_get("/api/onboard/mjpeg/{role}", self.onboard_request)
+        self.app.router.add_post("/api/onboard/webrtc/{role}", self.onboard_request)
+        self.app.router.add_post("/api/onboard/progress", self.onboard_request)
         self.app.on_startup.append(self.start)
         self.app.on_cleanup.append(self.cleanup)
 
@@ -280,7 +292,8 @@ class Gateway:
             ):
                 raise web.HTTPBadRequest(reason="query not supported")
             mutation = request.method in {"POST", "PATCH", "DELETE"}
-            media = request.path == "/api/media" or request.path.startswith("/api/media/")
+            media = (request.path == "/api/media" or request.path.startswith("/api/media/")
+                     or request.path.startswith("/api/onboard/webrtc/"))
             websocket = request.path == "/api/ws"
             if (mutation or websocket) and request.headers.get("Origin") != self.origin:
                 raise web.HTTPForbidden(reason="Origin")
@@ -366,6 +379,55 @@ class Gateway:
         headers["Cache-Control"] = "no-store"
         return web.Response(status=status, body=body, headers=headers)
 
+    async def camera_asset(self, request):
+        name = request.match_info["name"]
+        if name not in {"style.css", "app.js", "freshness.js", "mjpeg.js", "webrtc.js"}:
+            raise web.HTTPNotFound()
+        return web.FileResponse(Path(__file__).parent / "am1_camera" / name)
+
+    async def onboard_request(self, request):
+        if not self.onboard:
+            raise web.HTTPNotFound(reason="onboard viewing is disabled")
+        receipt = time.monotonic()
+        if request.path == "/api/onboard/status":
+            return web.json_response(await self.onboard.status(), headers={"Cache-Control": "no-store"})
+        if request.path == "/api/onboard/progress":
+            body = strict_json(await asyncio.wait_for(request.read(), 1))
+            body_completed = time.monotonic()
+            result = await self.onboard.progress(request["device"]["id"], body, receipt)
+            delivery = result.get("view_delivery")
+            if isinstance(delivery, dict):
+                delivery["request_body_completed_at_monotonic_s"] = body_completed
+                delivery["http_response_ready_at_monotonic_s"] = time.monotonic()
+            return web.json_response(result, headers={"Cache-Control": "no-store"})
+        role = request.match_info["role"]
+        if request.path.startswith("/api/onboard/mjpeg/"):
+            iterator = self.onboard.mjpeg(role)
+            try:
+                first = await anext(iterator)
+                response = web.StreamResponse(headers={"Content-Type": "multipart/x-mixed-replace; boundary=frame",
+                                                       "Cache-Control": "no-store"})
+                await response.prepare(request)
+                await asyncio.wait_for(response.write(first), .25)
+                async for chunk in iterator:
+                    await asyncio.wait_for(response.write(chunk), .25)
+                return response
+            except (TimeoutError, ConnectionError, StopAsyncIteration):
+                return web.Response(status=503)
+            finally:
+                await iterator.aclose()
+        if request.method == "POST":
+            status, body, headers = await self.onboard.offer(role, await asyncio.wait_for(request.read(), 1),
+                                                       request["device"]["id"])
+            return web.Response(status=status, body=body, content_type="application/sdp",
+                                headers={"Cache-Control": "no-store", **{
+                                    key: value for key, value in headers.items()
+                                    if key.lower().startswith("x-camera-")}})
+        status, body, headers = await self.onboard.snapshot(role)
+        allowed = {key: value for key, value in headers.items() if key.lower().startswith(("x-frame-", "x-camera-"))}
+        return web.Response(status=status, body=body, content_type="image/jpeg",
+                            headers={**allowed, "Cache-Control": "no-store"})
+
     async def body(self, request):
         value = strict_json(await asyncio.wait_for(request.read(), 1))
         if not isinstance(value, dict):
@@ -397,16 +459,18 @@ class Gateway:
 
     async def html(self, request):
         text = (ASSETS / "index.html").read_text(encoding="utf-8")
-        # Remote initializer executes before legacy bootstrap; independent camera scripts omitted.
-        text = text.replace('<link rel="stylesheet" href="/camera/assets/style.css">', "")
-        text = text.replace(
-            '<script defer src="/camera/assets/freshness.js"></script><script defer src="/camera/assets/mjpeg.js"></script>',
-            "",
-        )
-        text = text.replace(
-            '<script defer src="/camera/assets/app.js"></script>',
-            '<script defer src="/assets/p1_view.js"></script><script defer src="/assets/session_transport.js"></script>',
-        )
+        # Viewing never instantiates legacy input or claims the persistent owner.
+        if self.onboard:
+            text = text.replace('data-camera-base="/camera/"', 'data-camera-base="/api/onboard/" data-onboard="true"')
+            text = text.replace('<script defer src="/camera/assets/app.js"></script>',
+                                '<script defer src="/camera/assets/webrtc.js"></script><script defer src="/camera/assets/app.js"></script>'
+                                '<script defer src="/assets/p1_view.js"></script><script defer src="/assets/session_transport.js"></script>')
+        else:
+            text = text.replace('<link rel="stylesheet" href="/camera/assets/style.css">', "")
+            text = text.replace(
+                '<script defer src="/camera/assets/freshness.js"></script><script defer src="/camera/assets/mjpeg.js"></script>', "")
+            text = text.replace('<script defer src="/camera/assets/app.js"></script>',
+                                '<script defer src="/assets/p1_view.js"></script><script defer src="/assets/session_transport.js"></script>')
         text = text.replace(
             '<body data-console="compact">', '<body data-console="compact" data-session-mode="remote-fake">'
         )
@@ -415,7 +479,7 @@ class Gateway:
             content_type="text/html",
             headers={
                 "Cache-Control": "no-store",
-                "Content-Security-Policy": "default-src 'self'; connect-src 'self'; media-src 'self' blob:; img-src 'self' data:; frame-ancestors 'none'",
+                "Content-Security-Policy": "default-src 'self'; connect-src 'self'; media-src 'self' blob:; img-src 'self' data: blob:; frame-ancestors 'none'",
             },
         )
 
@@ -445,6 +509,7 @@ class Gateway:
                 "csrf": d["csrf"],
                 "control": bool(d["control"]),
                 "optional_p1_video": self.media is not None,
+                "onboard_video": self.onboard is not None,
             },
             headers={"Cache-Control": "no-store"},
         )
@@ -488,9 +553,9 @@ class Gateway:
 
     async def fence(self, device):
         self.tickets = {key: value for key, value in self.tickets.items() if value[0] != device}
-        snapshot = await self.current()
-        if snapshot.get("controller", {}) and snapshot["controller"]["device_id"] == device:
-            await self.call({"op": "release", "operation_id": str(uuid.uuid4())}, device)
+        # Core also fences eligible same-operation intent after the lease expires.
+        # It atomically preserves any other device's current authority.
+        await self.call({"op": "release", "operation_id": str(uuid.uuid4())}, device)
         for peer in list(self.peers):
             if peer.device == device:
                 await close_socket(peer.ws, peer.ws._writer.transport, 1008)
@@ -757,7 +822,7 @@ class Gateway:
                         if (
                             controller
                             and controller["device_id"] == peer.device
-                            and state.get("run", {}).get("recipe") in {"fake-interactive", *LIVE_ELBOW_SPECS}
+                            and state.get("run", {}).get("recipe") in {"fake-interactive", TELEOP_RECIPE, *LIVE_ELBOW_SPECS}
                         ):
                             await self.call(
                                 {
@@ -767,7 +832,7 @@ class Gateway:
                                     "controller_generation": controller["controller_generation"],
                                     "connection_generation": peer.connection,
                                     **({"host_incarnation": state.get("evidence", {}).get("host_incarnation")}
-                                       if state["run"]["recipe"] in LIVE_ELBOW_SPECS else {}),
+                                       if state["run"]["recipe"] in {*LIVE_ELBOW_SPECS, TELEOP_RECIPE} else {}),
                                 },
                                 peer.device,
                             )
@@ -785,6 +850,11 @@ class Gateway:
                 controller = snapshot.get("controller")
                 if controller and not self.auth.capable(controller["device_id"]):
                     await self.fence(controller["device_id"])
+                    snapshot = await self.current()
+                intent = (snapshot.get("run") or {}).get("control_intent") or {}
+                if (intent.get("eligible") is True and isinstance(intent.get("device_id"), str)
+                        and not self.auth.capable(intent["device_id"])):
+                    await self.fence(intent["device_id"])
                     snapshot = await self.current()
                 for peer in list(self.peers):
                     if not self.auth.resolve(peer.token):
@@ -809,11 +879,15 @@ class Gateway:
     async def start(self, app):
         if self.media:
             await self.media.start()
+        if self.onboard:
+            await self.onboard.start()
         self.publisher = asyncio.create_task(self.publish())
 
     async def cleanup(self, app):
         if self.media:
             await self.media.close()
+        if self.onboard:
+            await self.onboard.close()
         self.publisher.cancel()
         await asyncio.gather(self.publisher, return_exceptions=True)
         for peer in list(self.peers):
@@ -864,7 +938,12 @@ async def run_gateway(args):
     media_config = (
         strict_json(Path(args.media_config).read_bytes()) if getattr(args, "media_config", None) else None
     )
-    gateway = Gateway(args.owner_state, args.auth_state, media_config)
+    onboard_config = (
+        strict_json(Path(args.onboard_camera_config).read_bytes())
+        if getattr(args, "onboard_camera_config", None) else None)
+    gateway = Gateway(args.owner_state, args.auth_state, media_config, onboard_config)
+    if gateway.onboard and origin:
+        gateway.onboard.validate_origin(origin)
     runner = web.AppRunner(
         gateway.app,
         access_log=None,
@@ -879,6 +958,8 @@ async def run_gateway(args):
     await site.start()
     port = site._server.sockets[0].getsockname()[1]
     gateway.origin = origin or f"https://127.0.0.1:{port}"
+    if gateway.onboard:
+        gateway.onboard.validate_origin(gateway.origin)
     # Ready metadata contains no credential, pairing code or private IPC address.
     private_json(args.ready_file, {"url": gateway.origin, "pid": os.getpid()})
     try:
@@ -894,6 +975,7 @@ def main():
     for name in ("owner-state", "auth-state", "cert", "key", "ready-file"):
         gateway.add_argument("--" + name, required=True)
     gateway.add_argument("--media-config", help="Private optional named TLS WHEP source configuration")
+    gateway.add_argument("--onboard-camera-config", help="Private existing same-Pi camera origin and credentials path")
     gateway.add_argument("--host", default="127.0.0.1")
     gateway.add_argument("--origin", help="Exact HTTPS origin required for explicit private LAN listener")
     gateway.add_argument("--port", type=int, default=0)

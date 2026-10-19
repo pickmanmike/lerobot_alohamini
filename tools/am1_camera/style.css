@@ -42,6 +42,12 @@ main { display: grid; gap: 16px; }
 }
 #primary .image-wrap { height: min(60vh, 620px); aspect-ratio: auto; }
 .view img { width: 100%; height: 100%; object-fit: contain; }
+.view video { width: 100%; height: 100%; object-fit: contain; }
+.webrtc-primary img { display: none; }
+.held video { filter: saturate(.65) brightness(.72); }
+.view video[data-rotation="90"] { transform: rotate(90deg) scale(.75); }
+.view video[data-rotation="180"] { transform: rotate(180deg); }
+.view video[data-rotation="270"] { transform: rotate(270deg) scale(.75); }
 .held img { filter: saturate(.65) brightness(.72); }
 .unavailable {
   display: flex;

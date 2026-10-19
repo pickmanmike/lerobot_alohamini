@@ -273,6 +273,7 @@ class AM1SessionTransport {
     if(generation) return this.claim(generation);
   }
   async start(recipe,confirmationOf=null,selectedExperiment=null) {
+    if(recipe==="physical-live-teleop")throw Error("Start USB or virtual leader teleoperation with the authenticated PC adapter; this page supplies the selected live view.");
     const active=this.snapshot?.run;
     if(active?.source==="protected-physical-provider" && (!["stopped","completed","faulted","interrupted"].includes(active.status) || active.uncertain))
       throw Error("Active physical recipe is frozen; finish the current run before Start.");
@@ -578,7 +579,7 @@ globalThis.AM1RemoteInitialize=function() {
     if(recipes && select.dataset.recipes!==selection) {
       const previous=select.value;
       const ordinary=recipes.filter(name=>name!=="fake-finite-short" && !presets.some(preset=>preset.recipe===name)).map(name=> {
-        const option=document.createElement("option"); option.value=name; option.textContent=transport.liveElbowSpec(name)?.label || name; return option;
+        const option=document.createElement("option"); option.value=name; option.textContent=name==="physical-live-teleop" ? "USB or virtual leaders · PC adapter" : transport.liveElbowSpec(name)?.label || name; return option;
       });
       const named=presets.map(preset=>{const option=document.createElement("option");option.value=preset.id;option.textContent=preset.label;return option;});
       select.replaceChildren(...ordinary,...named);
@@ -594,7 +595,8 @@ globalThis.AM1RemoteInitialize=function() {
     const liveBudget=Number.isFinite(run?.deadline)&&Number.isFinite(run?.native_live_at)&&run.deadline>run.native_live_at ? Math.round(run.deadline-run.native_live_at) : selectedElbow?.live_s || 90;
     const simulated=run?.source==="simulated-provider" || recipes?.some(name=>name.startsWith("sim-"));
     const priorTest=physical && run && !physicalRun, priorKind=simulated ? "simulated" : "synthetic";
-    document.querySelector("#view-heading").textContent=physical ? liveElbow ? "Physical live elbow AM1 session" : "Physical finite AM1 session" : simulated ? "Simulated finite provider session" : "Fake persistent session";
+    const teleop=run?.recipe==="physical-live-teleop" || select.value==="physical-live-teleop";
+    document.querySelector("#view-heading").textContent=physical ? teleop ? "AM1 leader teleoperation" : liveElbow ? "Physical live elbow AM1 session" : "Physical finite AM1 session" : simulated ? "Simulated finite provider session" : "Fake persistent session";
     state.textContent=run ? `${priorTest ? `Prior ${priorKind}` : physical ? "Physical" : "Fake"} session · ${run.status} · ${run.progress_s.toFixed(2)} s` : `${physical ? "Physical" : "Fake"} session · no run`;
     document.querySelector("#session-details").textContent=JSON.stringify(transport.snapshot,null,2);
     const terminal=run && ["stopped","completed","faulted","interrupted"].includes(run.status);
@@ -608,7 +610,11 @@ globalThis.AM1RemoteInitialize=function() {
     const observationStatus=observationLabel ? `${observationLabel} · ${evidence?.required_observation ? "current images validated on Pi" : "current image proof unavailable"}` : "Task observation policy shown in current status";
     document.querySelector("#connection").textContent=`${transport.connected ? "Connected" : "Disconnected"} · ${physical ? `${observationStatus} · actual motor feedback ${evidence?.feedback ? "current" : "unavailable"} · protected-host ACK ${evidence?.native_ack ? "current" : "pending"}` : observationLabel ? `${observationStatus} · motor feedback and commands simulated` : "Cameras and hardware unavailable in fake mode"}`;
     if(transport.optionalVideo&&!transport.videoView&&globalThis.AM1P1View) {
-      const root=document.querySelector("#am1-camera-root");root.replaceChildren();
+      let root=document.querySelector("#am1-camera-root");
+      if(root.dataset.onboard==="true") {
+        const advisory=document.createElement("section");advisory.id="p1-advisory-root";
+        root.parentElement.append(advisory);root=advisory;
+      } else root.replaceChildren();
       const label=document.createElement("p");label.textContent="Optional external P1 view · separate from required Pi image validation";
       const video=document.createElement("video");video.muted=true;video.autoplay=true;video.playsInline=true;video.controls=true;video.style.maxWidth="640px";video.style.width="100%";
       const status=document.createElement("p");status.textContent="View closed · task and finite capture continue independently";
@@ -620,7 +626,7 @@ globalThis.AM1RemoteInitialize=function() {
     }
     document.querySelector("#gate-state").textContent=transport.controllerGeneration ? physical ? "Explicit controller; physical Start activates the protected host. Request acceptance is separate from protected-host ACK and measured motion." : "Explicit controller; accepted requests require actual fake acknowledgement." : "Spectator; viewing does not claim input.";
     document.querySelector("#control-help").textContent=liveElbow ? `Claim input, explicitly Start, then qualify Resume. Hold an elbow jog button or [ / ] to stream current mapped targets. Ordinary release holds position; a new press requests qualified rearm. Blur, expiry or reconnection requires explicit Resume and new input. The original ${liveBudget}-second Live budget continues through holds and reconnects. Other joints remain held; body and lift stay zero. Input acceptance, protected-host ACK and measured movement are separate.` : physical ? "Explicitly claim input before physical Start. Start activates the selected bounded recipe through the protected motor host. Viewing, enrollment and reconnection do not start motion. Finite authorization survives browser closure. Pause and Stop remain available to enrolled control-capable spectators. Actual feedback and protected-host ACK are reported separately; an accepted command does not prove joint motion. Body inputs belong to the selected finite recipe. Required camera evidence is validated on Pi; optional P1 viewing is advisory." : defaultControlHelp;
-    if(!transport.videoView)document.querySelector("#am1-camera-root").textContent=physical ? "Task camera evidence is validated on Pi; optional P1 viewing is advisory." : "Cameras unavailable · synthetic fake evidence only";
+    if(!transport.videoView&&document.querySelector("#am1-camera-root").dataset.onboard!=="true")document.querySelector("#am1-camera-root").textContent=physical ? "Task camera evidence is validated on Pi; optional P1 viewing is advisory." : "Cameras unavailable · synthetic fake evidence only";
     for(const button of document.querySelectorAll("[data-operation], [data-body-key]")) {
       button.title=physical ? liveElbow ? "Physical live elbow session control" : "Physical finite session control" : "Fake session control";
       if(button.dataset.operation)button.setAttribute("aria-label",`${button.dataset.operation} ${physical ? "physical" : "fake"} session`);
@@ -653,6 +659,7 @@ globalThis.AM1RemoteInitialize=function() {
       const rate=Number.isFinite(actualRate) ? actualRate.toFixed(3)+" normalized/s" : "pending";
       elbow.querySelector("output").textContent=!selectionFrozen&&selectedElbow ? workspace ? `Workspace ${workspace.id} · raw ${workspace.command_min_raw} to ${workspace.command_max_raw} · span ${workspace.span_norm.toFixed(3)} normalized · rate ${rate} · current admission pending` : `${selectedElbow.label} · rate ${rate} · current admission pending` : `Measured ${Number.isFinite(measured) ? measured.toFixed(3) : "pending"} · target ${Number.isFinite(transport.elbowCursor) ? transport.elbowCursor.toFixed(3) : Number.isFinite(cursor) ? cursor.toFixed(3) : "pending"} normalized · admitted ${Number.isFinite(run?.live_input?.corridor_min_norm) ? run.live_input.corridor_min_norm.toFixed(3) : "pending"} to ${Number.isFinite(run?.live_input?.corridor_max_norm) ? run.live_input.corridor_max_norm.toFixed(3) : "pending"} · rate ${rate} · run q0 ${Number.isFinite(run?.live_input?.reference_norm) ? run.live_input.reference_norm.toFixed(3) : "pending"}`;
     }
+    if(teleop)document.querySelector("#control-help").textContent="The authenticated PC adapter owns USB or virtual leader input and the original finite deadline. This page supplies the selected required onboard view. Lost decoded view progress holds steering; fresh video permits the existing qualified Resume. Camera selection, opening and closing this page do not Claim or Start input. Pause and Stop remain available.";
     if(message){notice.textContent=message;notice.hidden=false;}
     document.querySelector("#pairing-panel").hidden=Boolean(transport.device);
     for(const button of document.querySelectorAll("[data-operation]"))button.disabled=!transport.control || !transport.connected || button.dataset.operation==="Start" && selectionFrozen;
@@ -667,7 +674,7 @@ globalThis.AM1RemoteInitialize=function() {
   const claimButton=document.querySelector('[data-operation="ClaimInput"]');
   claimButton.textContent="Claim input";options.prepend(claimButton);
   document.querySelector('label[for="duration-seconds"]').hidden=true;
-  const camera=document.querySelector("#am1-camera-root");camera.replaceChildren();camera.textContent="Cameras unavailable · synthetic fake evidence only";
+  const camera=document.querySelector("#am1-camera-root");if(camera.dataset.onboard!=="true"){camera.replaceChildren();camera.textContent="Cameras unavailable · synthetic fake evidence only";}
   document.querySelector("#control-help").textContent=defaultControlHelp;
   document.querySelector('[data-operation="Approve"]').hidden=true;
   for(const button of document.querySelectorAll("[data-operation], [data-body-key]")) {

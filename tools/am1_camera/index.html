@@ -1,7 +1,7 @@
 <!doctype html>
 <html lang="en">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>AM1 · Local cameras</title><link rel="stylesheet" href="/style.css"><script defer src="/freshness.js"></script><script defer src="/mjpeg.js"></script><script defer src="/app.js"></script></head>
+<title>AM1 · Local cameras</title><link rel="stylesheet" href="/style.css"><script defer src="/freshness.js"></script><script defer src="/mjpeg.js"></script><script defer src="/webrtc.js"></script><script defer src="/app.js"></script></head>
 <body><header><span class="eyebrow">ALOHA MINI 1 / CAMERA-ONLY</span><h1 id="view-heading">Local view</h1>
 <p>Read-only camera viewer; it provides no motor controls or motor-state indication.</p><p id="connection">Connecting to frame status…</p></header>
 <main id="am1-camera-root" data-camera-base="/">
@@ -17,5 +17,5 @@
 </section>
 <section id="thumbnails" aria-label="Camera positions"></section></main>
 <details><summary>Browser delivery diagnostics</summary><pre id="diagnostics">Waiting for status…</pre></details>
-<p class="note">Native MJPG 640 × 480 · 30 fps requested. Image age starts when the gateway receives a JPEG; it is not physical scene-to-display latency. A held image is labeled Last frame / waiting and must not be used as a live driving view. A dark live image is still camera data; unassigned tiles are not identification previews.</p>
+<p class="note">Native JPEG observation remains 640 × 480. The selected primary uses one shared Pi H264 WebRTC encode up to 10 fps. Source freshness and decoded-video progress are separate; neither measures scene-to-display latency. JPEG rollback is explicit. Retained pictures are not live steering views.</p>
 </body></html>

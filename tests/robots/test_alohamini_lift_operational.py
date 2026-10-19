@@ -65,8 +65,19 @@ def operating_robot(monkeypatch, tmp_path):
         return bus
 
     class Transport(GroupedLiftTransport):
+        def write_register(self, address, width, value):
+            from lerobot.robots.alohamini import lift_motor_feedback as feedback
+            from tests.robots.test_alohamini_lift_motor_feedback import ByteStreamPort, status
+
+            assert (address, width, value) == (feedback.TORQUE_ENABLE_ADDRESS, 1, 0)
+            port = ByteStreamPort([status(b"")])
+            transport = feedback.DirectSdkTransport("synthetic-owned-off-write", port_handler=port)
+            trace = transport.write_register(address, width, value)
+            self.bus.write("Torque_Enable", "lift_axis", 0, normalize=False, num_retry=0)
+            return trace
+
         def read_group(self, *args, **kwargs):
-            clock.sleep(0.002)  # Synthetic finite transaction time, not instant duplicate samples.
+            clock.sleep(getattr(self, "read_delay_s", 0.002))  # Finite original acquisition time.
             payload, trace = super().read_group(*args, **kwargs)
             from lerobot.robots.alohamini import lift_motor_feedback as feedback
 
@@ -290,7 +301,7 @@ def test_one_count_relief_variation_is_logged_and_finishes_with_original_zero(
     assert len(pending) == len(qualified) == 1
     assert pending[0]["present_position_raw"] == setup + 1
     assert qualified[0]["present_position_raw"] < setup
-    assert 0.2 <= qualified[0]["qualification_elapsed_s"] < 0.25
+    assert 0 < pending[0]["qualification_elapsed_s"] < qualified[0]["qualification_elapsed_s"] < 1.0
     writes = [e[2:] for e in bus.events if e[1] == "write"]
     assert writes.count(("Goal_Velocity", "lift_axis", -200)) == 1
     assert 9.5 <= robot._lift_operation.height_mm <= 12
@@ -301,44 +312,50 @@ def test_one_count_relief_variation_is_logged_and_finishes_with_original_zero(
     assert not bus.is_connected
 
 
-@pytest.mark.parametrize("progress_sample,expected_elapsed", [(3, 0.306), (6, 0.612), (9, 0.918)])
+@pytest.mark.parametrize("progress_after_s", [0.306, 0.612, 0.918])
 def test_initial_relief_allows_delayed_net_upward_progress_before_one_second(
-    operating_robot, capsys, progress_sample, expected_elapsed,
+    operating_robot, monkeypatch, capsys, progress_after_s,
 ):
-    robot, _ = operating_robot
+    robot, clock = operating_robot
     bus = robot.left_bus
     bus.up_factor = 0
-    setup = None
-    samples = 0
-
+    setup, started, samples, reached_sample = None, None, 0, None
+    original_write = bus.write
+    def write(register, motor, value, **kwargs):
+        nonlocal started
+        original_write(register, motor, value, **kwargs)
+        if (register, motor, int(value)) == ("Goal_Velocity", "lift_axis", -200):
+            started = clock.now
     def hook(register):
-        nonlocal setup, samples
+        nonlocal setup, samples, reached_sample
         operation = getattr(robot, "_lift_operation", None)
-        if operation is None:
-            return
+        if operation is None: return
         if register == "Present_Position" and operation.reader.phase == "relief_setup":
             setup = round(bus.position)
-        if operation.reader.phase != "relief" or bus.registers[("Goal_Velocity", "lift_axis")] != -200:
-            return
+        if operation.reader.phase != "relief" or bus.registers[("Goal_Velocity", "lift_axis")] != -200: return
         if register == "Present_Position":
             samples += 1
-            if samples == progress_sample:
-                # Synthetic delayed onset, not a reconstruction of the stopped run.
+            if reached_sample is None and clock.now - started >= progress_after_s:
+                reached_sample = samples
                 bus.position = setup - 1
                 bus.registers[(register, "lift_axis")] = setup - 1
                 bus.up_factor = 1
-        elif register == "Present_Velocity" and samples < progress_sample:
+        elif register == "Present_Velocity" and reached_sample is None:
             bus.read_sequences[(register, "lift_axis")] = [0]
-
+    monkeypatch.setattr(bus, "write", write)
     bus.hook = hook
     robot.connect(calibrate=False)
     records = operational_records(capsys)
     pending = [r for r in records if r["phase"] == "relief_direction_pending"]
     qualified = [r for r in records if r["phase"] == "relief_direction_qualified"]
-    assert len(pending) == progress_sample - 1
+    assert len(pending) == reached_sample - 1
     assert all(r["present_position_raw"] == setup for r in pending)
     assert len(qualified) == 1
-    assert qualified[0]["qualification_elapsed_s"] == pytest.approx(expected_elapsed)
+    # Retain the original ~.3/.6/.9-second physical coverage, including the
+    # positive just below the unchanged1-second direction deadline.
+    elapsed = qualified[0]["qualification_elapsed_s"]
+    assert progress_after_s <= elapsed < progress_after_s + lift_relief.grouped_feedback.POLL_S + 0.002
+    assert elapsed < 1.0
     assert qualified[0]["present_position_raw"] == setup - 1
     assert qualified[0]["upward_ticks"] > qualified[0]["initial_upward_ticks"]
     assert 9.5 <= robot._lift_operation.height_mm <= 12
@@ -396,12 +413,14 @@ def test_initial_relief_direction_deadline_is_fixed_and_stops_without_upward_pro
     stop = next(t for t, register, motor, value in writes
                 if t >= start and (register, motor, value) == ("Goal_Velocity", "lift_axis", 0))
     assert stop - start == pytest.approx(1.0)
-    assert samples == 9
     assert sum((register, motor, value) == ("Goal_Velocity", "lift_axis", -200)
                for _, register, motor, value in writes) == 1
     records = operational_records(capsys)
     rejected = next(r for r in records if r.get("rejected") and r["phase"] == "relief")
     assert rejected["qualification_elapsed_s"] == pytest.approx(1.0)
+    actual = [r for r in records if r["phase"] == "relief" and not r.get("rejected")]
+    assert samples == len(actual) and samples > 0
+    assert all(r["sample_monotonic_s"] < start + 1.0 for r in actual)
     assert rejected["sample_monotonic_s"] < start + 1.0  # Last actual reply is NOT relabeled fresh.
     assert not any(r["phase"] in ("relief_direction_qualified", "operational_ready") for r in records)
     assert any(r["phase"] == "shutdown_verified" for r in records)
@@ -482,47 +501,48 @@ def test_initial_relief_cannot_qualify_late_upward_feedback(
     robot, clock = operating_robot
     bus = robot.left_bus
     bus.up_factor = 0
-    original_moving_height = OperationalLift._moving_height
-    samples = 0
-    first_position = None
-
+    original_moving_height, original_write = OperationalLift._moving_height, bus.write
+    original_sleep = clock.sleep
+    samples, first_position, started, delayed = 0, None, None, False
+    def write(register, motor, value, **kwargs):
+        nonlocal started
+        original_write(register, motor, value, **kwargs)
+        if (register, motor, int(value)) == ("Goal_Velocity", "lift_axis", -200): started = clock.now
     def hook(register):
         if register == "Present_Velocity" and bus.registers[("Goal_Velocity", "lift_axis")] == -200:
             bus.read_sequences[(register, "lift_axis")] = [0]
-
     def moving_height(operation, phase):
-        nonlocal samples, first_position
+        nonlocal samples, first_position, delayed
         samples += 1
-        if samples == 1:
-            first_position = bus.position
-        if samples == 9:
-            # Arrive just after 1 s, but retain the unchanged temperature
-            # freshness window so this isolates the direction deadline.
-            clock.sleep(0.085)
+        if first_position is None: first_position = bus.position
+        if delayed_boundary == "feedback" and not delayed and clock.now - started >= 0.9:
+            delayed = True
+            original_sleep(started + 1.001 - clock.now)
             bus.up_factor = 1
-        result = original_moving_height(operation, phase)
-        return result
-
-    original_sleep = clock.sleep
-
+        return original_moving_height(operation, phase)
     def delayed_sleep(seconds):
+        nonlocal delayed
         original_sleep(seconds)
-        if samples == 8 and seconds > 0.05 and bus.registers[("Goal_Velocity", "lift_axis")] == -200:
-            original_sleep(0.085)
-
+        if (not delayed and started is not None and clock.now - started >= 0.9
+                and bus.registers[("Goal_Velocity", "lift_axis")] == -200):
+            delayed = True
+            original_sleep(started + 1.001 - clock.now)
     bus.hook = hook
+    monkeypatch.setattr(bus, "write", write)
     monkeypatch.setattr(OperationalLift, "_moving_height", moving_height)
-    if delayed_boundary == "sleep":
-        monkeypatch.setattr(lift_relief.time, "sleep", delayed_sleep)
-    with pytest.raises(RuntimeError) as failure:
-        robot.connect(calibrate=False)
+    if delayed_boundary == "sleep": monkeypatch.setattr(lift_relief.time, "sleep", delayed_sleep)
+    with pytest.raises(RuntimeError) as failure: robot.connect(calibrate=False)
     assert "initial upward direction not confirmed within 1.0 s" in str(failure.value.__cause__)
     records = operational_records(capsys)
     rejected = next(r for r in records if r.get("rejected") and r["phase"] == "relief")
-    assert 1.0 <= rejected["qualification_elapsed_s"] < 1.01
-    assert samples == (8 if delayed_boundary == "sleep" else 9)
+    assert delayed and 1.0 <= rejected["qualification_elapsed_s"] < 1.01
+    actual = [r for r in records if r["phase"] == "relief" and not r.get("rejected")]
+    assert samples == len(actual) and samples > 0
     if delayed_boundary == "feedback":
-        assert rejected["present_position_raw"] < first_position  # Fresh but too late.
+        assert rejected["present_position_raw"] < first_position
+        assert rejected["sample_monotonic_s"] > started + 1.0  # Genuine fresh progress, too late.
+    else:
+        assert rejected["sample_monotonic_s"] < started + 1.0  # Last reply is never retimestamped.
     assert not any(r["phase"] in ("relief_direction_qualified", "operational_ready") for r in records)
     assert bus.registers[("Goal_Velocity", "lift_axis")] == 0
     assert bus.registers[("Torque_Enable", "lift_axis")] == 0
@@ -534,67 +554,79 @@ def test_initial_relief_cannot_qualify_late_upward_feedback(
     ("current", "2000 mA"), ("voltage", "voltage"), ("interrupt", "cancelled"),
     ("temperature", "majority (3/5 time slots)"),
 ])
-@pytest.mark.parametrize("fault_sample", [2, 6])
+@pytest.mark.parametrize("fault_after_s", [0.204, 0.612])
 def test_initial_relief_pending_does_not_filter_faults_or_cancellation(
-    operating_robot, capsys, fault, reason, fault_sample,
+    operating_robot, monkeypatch, capsys, fault, reason, fault_after_s,
 ):
-    robot, _ = operating_robot
+    robot, clock = operating_robot
     bus = robot.left_bus
     bus.up_factor = 0
-    samples = 0
+    samples, started = 0, None
+    injected = []
+    original_write = bus.write
     interruption = KeyboardInterrupt("cancelled during initial relief")
-
+    def write(register, motor, value, **kwargs):
+        nonlocal started
+        original_write(register, motor, value, **kwargs)
+        if (register, motor, int(value)) == ("Goal_Velocity", "lift_axis", -200): started = clock.now
     def hook(register):
         nonlocal samples
         operation = getattr(robot, "_lift_operation", None)
+        elapsed = clock.now - started if started is not None else -1.0
         if fault == "temperature" and register == "Present_Temperature":
-            # Synthetic sustained high in three occupied slots. Test both
-            # the old interval and the newly allowed part of qualification.
+            # Retain both original early and >.5s late-phase coverage. Faster
+            # RAW replies still need three distinct occupied high time slots.
             heating = operation is not None and (
-                (fault_sample == 2 and operation.reader.phase == "relief_setup")
-                or (operation.reader.phase == "relief" and samples >= fault_sample - 2)
+                (fault_after_s == 0.204 and operation.reader.phase == "relief_setup")
+                or (operation.reader.phase == "relief" and elapsed >= fault_after_s - 2 * operation.temperature.SLOT_S)
             )
             bus.read_sequences[(register, "lift_axis")] = [60 if heating else 30]
         if bus.registers[("Goal_Velocity", "lift_axis")] != -200:
-            if register == "Status":
-                bus.registers[(register, "lift_axis")] = 0
-            if register == "Present_Voltage":
-                bus.registers[(register, "lift_axis")] = 120
+            if register == "Status": bus.registers[(register, "lift_axis")] = 0
+            if register == "Present_Voltage": bus.registers[(register, "lift_axis")] = 120
             return
-        if register == "Present_Position":
-            samples += 1
-        elif register == "Present_Velocity":
-            bus.read_sequences[(register, "lift_axis")] = [50 if samples == 1 else 0]
-        if samples != fault_sample:
-            return
-        if fault == "status" and register == "Status":
+        if register == "Present_Position": samples += 1
+        elif register == "Present_Velocity": bus.read_sequences[(register, "lift_axis")] = [50 if samples == 1 else 0]
+        if elapsed < fault_after_s: return
+        if (fault, register) == ("status", "Status"):
+            injected.append(clock.now)
             bus.read_sequences[(register, "lift_axis")] = [4]
-        elif fault == "current" and register == "Present_Current":
+        elif (fault, register) == ("current", "Present_Current"):
+            injected.append(clock.now)
             bus.read_sequences[(register, "lift_axis")] = [400]
-        elif fault == "voltage" and register == "Present_Voltage":
+        elif (fault, register) == ("voltage", "Present_Voltage"):
+            injected.append(clock.now)
             bus.read_sequences[(register, "lift_axis")] = [20]
         elif register == "Present_Temperature":
             if fault == "transport":
+                injected.append(clock.now)
                 raise OSError("synthetic communication loss during qualification")
             if fault == "interrupt":
+                injected.append(clock.now)
                 raise interruption
-
+    monkeypatch.setattr(bus, "write", write)
     bus.hook = hook
-    with pytest.raises((RuntimeError, KeyboardInterrupt)) as failure:
-        robot.connect(calibrate=False)
+    with pytest.raises((RuntimeError, KeyboardInterrupt)) as failure: robot.connect(calibrate=False)
     primary = failure.value if isinstance(failure.value, KeyboardInterrupt) else failure.value.__cause__
-    assert primary is robot._lift_operation.failure
-    assert reason in str(primary)
-    if fault == "interrupt":
-        assert primary is interruption
+    assert primary is robot._lift_operation.failure and reason in str(primary)
+    if fault == "interrupt": assert primary is interruption
     records = operational_records(capsys)
     assert any(r["phase"] == "relief_direction_pending" for r in records)
     if fault == "temperature":
         rejected = next(r for r in records if r.get("rejected") and r["phase"] == "relief")
-        assert rejected["temperature_c"] == 60
-        assert "majority (3/5 time slots)" in rejected["rejection_reason"]
+        assert rejected["temperature_c"] == 60 and "majority (3/5 time slots)" in rejected["rejection_reason"]
+        window = robot._lift_operation.temperature
+        high = [(t, value) for t, value in window.samples if value >= window.CEILING_C]
+        assert len(high) == 3
+        assert len({(round(t * 1e9) - window._origin_ns) // 100_000_000 for t, _ in high}) == 3
+        assert rejected["sample_monotonic_s"] - started >= fault_after_s - 0.1
+    else:
+        # Cancellation may interrupt before a complete raw record exists.
+        # Retain the actual fake-clock injection time, never cleanup elapsed time.
+        assert len(injected) == 1
+        assert fault_after_s <= injected[0] - started < fault_after_s + lift_relief.grouped_feedback.POLL_S + 0.002
     assert not any(r["phase"] in ("relief_direction_qualified", "operational_ready") for r in records)
-    assert samples == fault_sample
+    assert samples > 0
     assert bus.registers[("Goal_Velocity", "lift_axis")] == 0
     assert bus.registers[("Torque_Enable", "lift_axis")] == 0
     assert not bus.is_connected
@@ -1783,6 +1815,9 @@ def test_real_host_retains_fault_loop_timings_after_cleanup(
     assert len(notes) == 1  # The current host loses the preceding iteration's timing.
     context = json.loads(notes[0].split(": ", 1)[1])
     assert context["clock"] == "perf_counter"
+    assert context["command_completed"] is (delay_stage == "robot_observation")
+    assert context["action_timing_scope"] == "last_completed_send_action"
+    assert context["action_timing_ms"] == robot.logs["action_timing_ms"]
     loop = context["current_loop"] if delay_stage == "robot_observation" else context["previous_loop"]
     assert loop["phase_ms"][delay_stage] >= 296
     if delay_stage == "lift_diagnostics":
@@ -1807,6 +1842,7 @@ def test_host_fault_timing_cannot_replace_primary_or_cleanup_failure(
     original_connect = robot.connect
     original_dumps = json.dumps
     closed = False
+    retained_current, retained_lift = {}, {}
 
     def connect(**kwargs):
         original_connect(calibrate=False, **kwargs)
@@ -1815,6 +1851,13 @@ def test_host_fault_timing_cannot_replace_primary_or_cleanup_failure(
 
         def failed_emit(record):
             if record["phase"] == "live":
+                # Already validated memory, not another read during a fault.
+                completed = clock.monotonic()
+                retained_current.update(read_started_at_monotonic_s=completed - 0.186,
+                                        read_completed_at_monotonic_s=completed)
+                robot._am1_teleop_currents = {"left": dict(retained_current)}
+                retained_lift.update(sample_monotonic_s=record["sample_monotonic_s"],
+                                     request_duration_s=record["request_duration_s"])
                 raise primary
             emit(record)
 
@@ -1856,7 +1899,15 @@ def test_host_fault_timing_cannot_replace_primary_or_cleanup_failure(
         assert "AM1 host loop timing context unavailable: ValueError" in notes
     else:
         note = next(n for n in notes if n.startswith("AM1 host loop timing context: "))
-        assert json.loads(note.split(": ", 1)[1])["current_loop"]["active_phase"] == "sample_log"
+        context = json.loads(note.split(": ", 1)[1])
+        assert context["current_loop"]["active_phase"] == "sample_log"
+        receipt = context["current_feedback_timing"]["left"]
+        assert receipt["source"] == "last_sampled_current_receipt_may_be_rejected"
+        assert receipt["read_started_at_monotonic_s"] == retained_current["read_started_at_monotonic_s"]
+        assert receipt["read_completed_at_monotonic_s"] == retained_current["read_completed_at_monotonic_s"]
+        assert context["lift_feedback_timing"]["sample_monotonic_s"] == retained_lift["sample_monotonic_s"]
+        assert context["lift_feedback_timing"]["request_duration_s"] == retained_lift["request_duration_s"]
+        assert context["lift_feedback_timing"]["emit_timing_scope"] == "last_emit_attempt"
 
 
 @pytest.mark.parametrize("model,home", [("alohamini1", False), ("alohamini2", True), ("alohamini2pro", True)])
@@ -1937,6 +1988,25 @@ def test_host_fault_timing_history_is_bounded_and_snapshot_is_independent():
     later = timing.snapshot(101.0)
     assert later["recent_completed_loops"][-2]["phase_ms"]["sample_log"] >= 0
     assert later["omitted_completed_loop_count"] == 93
+
+
+@pytest.mark.parametrize("command_completed", [False, True])
+def test_host_fault_timing_keeps_bounded_last_completed_action(command_completed):
+    from lerobot.robots.alohamini.alohamini_host import AM1HostLoopTiming
+
+    timing = AM1HostLoopTiming()
+    timing.begin(100.0)
+    action = {"action_total": 191.049, "action_left_joint_limit": 160.0,
+              "action_base_write": float("inf"), "action_lift": -1,
+              "action_prepare": True, "unrelated": {"private": "excluded"}}
+    context = timing.snapshot(100.2, action_timing_ms=action,
+                              command_completed=command_completed)
+    assert context["command_completed"] is command_completed
+    assert context["action_timing_scope"] == "last_completed_send_action"
+    assert context["action_timing_ms"] == {"action_total": 191.049, "action_left_joint_limit": 160.0}
+    action["action_total"] = 1
+    assert context["action_timing_ms"]["action_total"] == 191.049
+    assert len(json.dumps(context, allow_nan=False)) < 4096
 
 
 def initial_startup_records(capsys):
@@ -2593,16 +2663,25 @@ def test_short_indicator_pulse_across_acquisition_boundary_cannot_manufacture_pe
     robot.disconnect()
 
 
-def test_original_35ms_relief_helper_latency_retains_the_earlier_thermal_stale_refusal(
+@pytest.mark.parametrize("historical_interval", [True, False], ids=["historical-100ms", "normal-50ms"])
+def test_35ms_relief_helper_latency_preserves_direction_guard_with_latest_equal_receipts(
     operating_robot,
     monkeypatch,
     capsys,
+    historical_interval,
 ):
     robot, clock = operating_robot
     bus = robot.left_bus
     bus.up_factor = 0
     original_write = bus.write
     setup_delay = []
+    if historical_interval:
+        from lerobot.robots.alohamini.lift_operational import OperationalLift
+        original_relief = OperationalLift.home_and_relieve
+        def historical_recipe(operation, **kwargs):
+            kwargs["relief_poll_s"] = lift_relief.POLL_S
+            return original_relief(operation, **kwargs)
+        monkeypatch.setattr(OperationalLift, "home_and_relieve", historical_recipe)
 
     def write(register, motor, value, **kwargs):
         original_write(register, motor, value, **kwargs)
@@ -2618,7 +2697,7 @@ def test_original_35ms_relief_helper_latency_retains_the_earlier_thermal_stale_r
             setup_delay.append(clock.now)
             clock.sleep(0.04)
         if (register, motor, int(value)) == ("Goal_Velocity", "lift_axis", -200):
-            clock.sleep(0.035)  # Earlier fake condition retained as its own thermal-fault check.
+            clock.sleep(0.035)  # Keep the earlier fake condition and its actual receipt times.
 
     def hook(register):
         operation = getattr(robot, "_lift_operation", None)
@@ -2630,15 +2709,16 @@ def test_original_35ms_relief_helper_latency_retains_the_earlier_thermal_stale_r
     with pytest.raises(RuntimeError, match="AlohaMini motor activation failed") as caught:
         robot.connect(calibrate=False)
     assert len(setup_delay) == 1
-    assert "temperature: five-slot feedback window is stale" in str(caught.value.__cause__)
     assert caught.value.__cause__ is robot._lift_operation.failure
     records = operational_records(capsys)
     rejected = next(r for r in records if r.get("rejected") and r["phase"] == "relief")
-    assert rejected["sample_monotonic_s"] - rejected["temperature_history"][0][0] > 0.5
-    origin = next(row["sample_monotonic_s"] for row in records if "sample_monotonic_s" in row)
-    slots = [round((stamp - origin) * 1_000_000_000) // 100_000_000
-             for stamp, _temperature in rejected["temperature_history"]]
-    assert any(right - left > 1 for left, right in zip(slots, slots[1:]))
+    # Under the original FIRST-equal policy the historical100ms case hit a
+    # thermal age fault first (retained in the before-copy and affected03 log).
+    # Its real equal receipts now remain fresh. Neither cadence can manufacture
+    # upward evidence or pass the unchanged original one-second direction guard.
+    assert "initial upward direction not confirmed within 1.0 s" in str(caught.value.__cause__)
+    assert rejected["qualification_elapsed_s"] == pytest.approx(1.0)
+    assert robot._lift_operation.temperature.failure is None
     assert rejected["request_duration_s"] <= 0.04
     assert not any(r["phase"] in {"relief_direction_qualified", "operational_ready"} for r in records)
     assert any(r["phase"] == "shutdown_verified" for r in records)
@@ -2859,3 +2939,201 @@ def test_startup_candidate_reset_cannot_clear_the_original_thermal_slot_history(
     assert any(r.get("rejected") and "3/5" in r["rejection_reason"] for r in records)
     assert not any(r["phase"] == "startup_off_baseline_qualified" for r in records)
     assert_no_startup_motion(robot)
+
+
+@pytest.mark.parametrize("command_completed", [False, True])
+def test_host_fault_note_retains_original_current_and_lift_request_boundaries(command_completed):
+    from lerobot.robots.alohamini.alohamini_host import AM1HostLoopTiming
+
+    timing = AM1HostLoopTiming()
+    timing.begin(100.0)
+    timing.mark("command", 100.001)
+    receipts = {
+        "left": {"raw": {"private": 999}, "read_started_at_monotonic_s": 100.002,
+                 "read_completed_at_monotonic_s": 100.188},
+        "right": {"read_started_at_monotonic_s": 99.8, "read_completed_at_monotonic_s": 99.802},
+        "foreign": {"private": "never retain"},
+    }
+    lift = {"sample_monotonic_s": 100.189, "request_duration_s": 0.0018,
+            "rejected": True, "group_trace": {"private": "never retain"}}
+    context = timing.snapshot(100.2, action_timing_ms={"action_total": 1.719},
+                              command_completed=command_completed, current_receipts=receipts,
+                              lift_record=lift, lift_emit_ms=0.25)
+    assert context["command_completed"] is command_completed
+    assert context["action_timing_scope"] == "last_completed_send_action"
+    assert context["action_timing_ms"] == {"action_total": 1.719}
+    assert context["current_feedback_timing"] == {
+        "left": {"clock": "monotonic", "source": "last_sampled_current_receipt_may_be_rejected",
+                 "read_started_at_monotonic_s": 100.002, "read_completed_at_monotonic_s": 100.188,
+                 "relation_to_current_loop": "within_current_loop"},
+        "right": {"clock": "monotonic", "source": "last_sampled_current_receipt_may_be_rejected",
+                  "read_started_at_monotonic_s": 99.8, "read_completed_at_monotonic_s": 99.802,
+                  "relation_to_current_loop": "before_current_loop"},
+    }
+    assert context["lift_feedback_timing"] == {
+        "clock": "monotonic", "source": "last_cached_lift_record_may_be_rejected",
+        "sample_monotonic_s": 100.189, "request_duration_s": 0.0018,
+        "last_emit_ms": 0.25, "emit_timing_scope": "last_emit_attempt",
+    }
+    receipts["left"]["read_completed_at_monotonic_s"] = 0
+    lift["sample_monotonic_s"] = 0
+    assert context["current_feedback_timing"]["left"]["read_completed_at_monotonic_s"] == 100.188
+    assert context["lift_feedback_timing"]["sample_monotonic_s"] == 100.189
+    assert len(json.dumps(context, allow_nan=False).encode()) < 4096
+
+
+@pytest.mark.parametrize("invalid", [None, True, float("nan"), float("inf"), -1, "x" * 20000, 10 ** 400],
+                         ids=["missing", "boolean", "nan", "infinite", "negative", "oversized_string", "huge_integer"])
+def test_host_fault_note_excludes_invalid_or_unbounded_cached_feedback(invalid):
+    from lerobot.robots.alohamini.alohamini_host import AM1HostLoopTiming
+
+    timing = AM1HostLoopTiming()
+    timing.begin(100.0)
+    context = timing.snapshot(100.2, current_receipts={
+        "left": {"read_started_at_monotonic_s": invalid, "read_completed_at_monotonic_s": 100.1},
+        "right": {"read_started_at_monotonic_s": 100.1, "read_completed_at_monotonic_s": invalid},
+        "private": "x" * 20000,
+    }, lift_record={"sample_monotonic_s": invalid, "request_duration_s": invalid,
+                    "private": "x" * 20000}, lift_emit_ms=invalid)
+    assert context["current_feedback_timing"] == {}
+    assert context["lift_feedback_timing"] == {
+        "clock": "monotonic", "source": "last_cached_lift_record_may_be_rejected",
+        "emit_timing_scope": "last_emit_attempt",
+    }
+    assert len(json.dumps(context, allow_nan=False).encode()) < 4096
+
+
+@pytest.mark.parametrize("change", ["effect", "already_off", "still_on", "saved44", "late_zero", "long_write",
+    "deadline_write", "pending", "bad_ack", "device_ack", "comm", "record_failure", "current", "status", "hot"])
+def test_startup_off_single_strict_reassert_requires_actual_off_and_original_baseline(
+    operating_robot, monkeypatch, capsys, change,
+):
+    from lerobot.robots.alohamini import lift_motor_feedback as feedback
+    from lerobot.robots.alohamini.lift_operational import OperationalLift
+    from tests.robots.test_alohamini_lift_motor_feedback import ByteStreamPort, status
+
+    robot, clock = operating_robot
+    bus = robot.left_bus
+    bus.registers["Torque_Enable", "lift_axis"] = int(change != "already_off")
+    bus.registers["Present_Current", "lift_axis"] = 0
+    bus.registers["Present_Temperature", "lift_axis"] = 31
+    operation = OperationalLift(robot)
+    operation.monitor.read_configuration()
+    normal_write = bus.write
+    helpers, strict_calls, failures = [], [], []
+
+    def helper_returns_without_observed_effect(register, motor, value, **kwargs):
+        if (register, motor, int(value)) == ("Torque_Enable", "lift_axis", 0):
+            helpers.append(clock.now)
+            return None  # Synthetic ACK-success/no observed effect, not a wire-cause claim for44.
+        return normal_write(register, motor, value, **kwargs)
+
+    monkeypatch.setattr(bus, "write", helper_returns_without_observed_effect)
+    reply = bytearray(status(b"", error=4 if change == "device_ack" else 0))
+    if change == "bad_ack":
+        reply[-1] ^= 1
+    port = ByteStreamPort([] if change == "comm" else [bytes(reply)],
+                          pending=b"unexpected old bytes" if change == "pending" else b"")
+    wire = feedback.DirectSdkTransport("synthetic-owned-off-write", port_handler=port)
+
+    def strict_write(address, width, value):
+        strict_calls.append((clock.now, address, width, value, len(operation.transport.group_reads)))
+        assert (address, width, value) == (40, 1, 0)
+        # The historical replay preserves only its saved original acquisition times.
+        clock.sleep(.601 if change == "deadline_write" else .041 if change == "long_write"
+                    else 0 if change == "saved44" else .001)
+        try:
+            trace = wire.write_register(address, width, value)  # Actual vendor SDK and protocol validator.
+        except feedback.TransportRefusal as error:
+            failures.append(error)
+            raise
+        if change not in {"still_on", "saved44", "late_zero"}:
+            normal_write("Torque_Enable", "lift_axis", 0, normalize=False, num_retry=0)
+        return trace
+
+    monkeypatch.setattr(operation.transport, "write_register", strict_write)
+    requested = clock.now
+    normal_group = operation.transport.read_group
+    if change == "saved44":
+        operation.transport.read_delay_s = .001  # Finite read fitting every saved original interval.
+    original44 = [199422.844828964, 199422.896853230, 199422.952888244, 199423.008853758,
+                  199423.060908413, 199423.116864187, 199423.168862693, 199423.224863022,
+                  199423.281328054, 199423.337978733, 199423.394004507]
+    acquired = []
+
+    def group(start, length, **kwargs):
+        if (start, length) == (feedback.FEEDBACK_START, feedback.FEEDBACK_LENGTH):
+            if change == "late_zero" and clock.now >= requested + .21:
+                bus.registers["Torque_Enable", "lift_axis"] = 0
+            if change == "saved44":
+                # Only the saved ORIGINAL44 acquisition offsets and on readbacks;
+                # the inserted zero-write response has no assumed physical effect.
+                target = requested + original44[len(acquired)] - 199422.841019548
+                assert target >= clock.now + operation.transport.read_delay_s - 1e-9
+                clock.now = target - operation.transport.read_delay_s
+            bus.read_sequences["Present_Current", "lift_axis"] = [31 if change == "current" else 0]
+            if change == "status":
+                bus.registers["Status", "lift_axis"] = 8
+            if change == "hot":
+                bus.registers["Present_Temperature", "lift_axis"] = 60
+        result = normal_group(start, length, **kwargs)
+        if (start, length) == (feedback.FEEDBACK_START, feedback.FEEDBACK_LENGTH):
+            acquired.append(clock.now)
+        return result
+
+    monkeypatch.setattr(operation.transport, "read_group", group)
+    if change == "record_failure":
+        port.responses = [b"invalid ACK"]
+        normal_record = operation.monitor.record
+
+        def record(phase, **values):
+            if phase == "startup_off_reassert_failed":
+                raise OSError("secondary trace sink failure")
+            return normal_record(phase, **values)
+
+        monkeypatch.setattr(operation.monitor, "record", record)
+
+    if change in {"effect", "already_off"}:
+        operation._qualify_startup_off()
+        records = operational_records(capsys)
+        baseline = [v for v in records if v["phase"] == "baseline"]
+        acquired_records = [v for v in records if v["phase"] == "startup_off_acquisition"]
+        assert [v["torque_enable"] for v in acquired_records] == ([1, 0] if change == "effect" else [0])
+        assert len(baseline) == 9 and all(v["torque_enable"] == 0 for v in baseline)
+        assert baseline[-1]["sample_monotonic_s"] - baseline[0]["sample_monotonic_s"] >= .4
+        assert clock.now <= requested + .6
+        assert all(v["absolute_deadline_monotonic_s"] == pytest.approx(requested + .6)
+                   for v in acquired_records)
+        returns = [v for v in records if v["phase"] == "startup_off_reassert_returned"]
+        assert len(returns) == (change == "effect")
+        if returns:
+            assert returns[0]["write_trace"]["request_bytes"] == list(port.writes[0])
+            assert returns[0]["write_trace"]["checksum_ok"] is True
+            assert returns[0]["write_trace"]["comm_result"] == 0
+            assert returns[0]["requested_at_monotonic_s"] < returns[0]["helper_returned_at_monotonic_s"]
+    else:
+        with pytest.raises(feedback.ComparisonRefusal) as caught:
+            operation._qualify_startup_off()
+        records = operational_records(capsys)
+        assert not any(v["phase"] == "startup_off_baseline_qualified" for v in records)
+        if failures:
+            assert caught.value is failures[0]  # A trace/log failure cannot replace the SDK first cause.
+            assert sum(v["phase"] == "startup_off_reassert_failed" for v in records) == (change != "record_failure")
+        if change in {"long_write", "deadline_write", "pending", "bad_ack", "device_ack", "comm", "record_failure"}:
+            assert len(acquired) == 1  # No next read/baseline after late or failed zero write.
+        if change == "long_write":
+            assert "40 ms" in str(caught.value)
+        if change == "deadline_write":
+            assert "deadline" in str(caught.value)
+        if change == "saved44":
+            assert len(acquired) == 11
+            assert acquired == pytest.approx([requested + t - 199422.841019548 for t in original44])
+            assert "deadline" in str(caught.value) and clock.now == pytest.approx(requested + .6)
+        if change in {"still_on", "late_zero"}:
+            assert "deadline" in str(caught.value) and clock.now == pytest.approx(requested + .6)
+    assert len(helpers) == 1
+    assert len(strict_calls) == (0 if change in {"already_off", "current", "status"} else 1)
+    assert len(port.writes) == (0 if change in {"already_off", "pending", "current", "status"} else 1)
+    assert not any(e[1] == "write" and e[3] == "lift_axis" and
+                   ((e[2] == "Torque_Enable" and e[4] == 1) or (e[2] == "Goal_Velocity" and e[4] != 0))
+                   for e in bus.events if len(e) == 5)

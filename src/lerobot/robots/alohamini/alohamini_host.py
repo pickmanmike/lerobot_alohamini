@@ -93,7 +93,9 @@ class AM1RoutineRecordWriter:
         try:
             line = (line + "\n").encode()
             if len(line) > 32768:
-                raise ValueError("Routine log record exceeds 32768 bytes")
+                error = ValueError("Routine log record exceeds 32768 bytes")
+                error.add_note(f"AM1 routine record size: encoded_bytes={len(line)} maximum_bytes=32768")
+                raise error
             self._queue.put_nowait(line)
             return True
         except queue.Full:
@@ -176,8 +178,14 @@ class AM1LocalControl:
         self.observation_id = 0
         self.selected_evidence = selected_evidence
         self.live = live
-        self.practical_config = live_elbow_config(live_recipe, practical_config) if live else practical_config
-        self.live_spec = live_elbow_spec(live_recipe, self.practical_config) if live else None
+        self.teleop = live and live_recipe == "physical-live-teleop"
+        self._teleop_source = None
+        self.practical_config = live_elbow_config(live_recipe, practical_config) if live and not self.teleop else practical_config
+        if self.teleop:
+            from examples.alohamini.am1_live_teleop import TELEOP_SPEC
+            self.live_spec = TELEOP_SPEC
+        else:
+            self.live_spec = live_elbow_spec(live_recipe, self.practical_config) if live else None
         if live and self.live_spec is None:
             raise ValueError("Live native recipe is not allowlisted")
         if live and getattr(self.live_spec, "practical_motion", False) and self.practical_config is None:
@@ -187,7 +195,9 @@ class AM1LocalControl:
         self.live_sample = None
         self.live_held = None
         self.live_cursor_at = None
-        self._live_summary = {"state": "held", "joint": self.live_spec.joint if live else AM1_LIVE_JOINT, "last_input_seq": -1}
+        self._live_summary = {"state": "held", "last_input_seq": -1}
+        if not self.teleop:
+            self._live_summary["joint"] = self.live_spec.joint if live else AM1_LIVE_JOINT
 
     def live_snapshot(self) -> dict:
         return copy.deepcopy(self._live_summary)
@@ -205,9 +215,13 @@ class AM1LocalControl:
         summary["hold_completed_at_monotonic_s"] = self.clock()
         self.state = "paused"
         summary["state"] = "expired" if expired else "held"
-        self.accepted_action = {"mode": "measured_arm_hold", "body_velocity": 0.0}
+        self.accepted_action = {"mode": "raw_goal_hold" if self.teleop else "measured_arm_hold", "body_velocity": 0.0}
         self.live_sample = None
-        if self.selected_evidence is not None:
+        if self.teleop:
+            summary["body"] = {"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0, "lift_axis.vel": 0}
+            for key in ("accepted_target", "held_goals_raw", "held_goal_acquisition"):
+                summary.pop(key, None)
+        if self.selected_evidence is not None and not self.teleop:
             self.selected_evidence.deactivate_live(robot)
 
     def check_live(self, robot: AlohaMini) -> bool:
@@ -216,6 +230,11 @@ class AM1LocalControl:
             return True
         if self.state == "stopped":
             return False  # A cleanup Stop cannot be reopened by expiry/watchdog ticks.
+        if self.teleop:
+            from .am1_live_teleop import enable_thermal_history
+
+            enable_thermal_history(self, robot)
+            self._thermal_robot = robot
         now = self.clock()
         deadline = self._live_summary.get("live_deadline_monotonic_s")
         if deadline is not None and now >= deadline:
@@ -435,6 +454,74 @@ class AM1LocalControl:
                 self.selected_evidence.live_action(robot, self._live_summary)
         return accepted
 
+    def reconcile_thermal_history(self, robot: AlohaMini, observation=None) -> None:
+        """Finite verified native hold; no new input, owner, clock or bus reader."""
+        if not self.teleop:
+            return
+        from .am1_live_teleop import hold_goals, thermal_history_status
+
+        status = thermal_history_status(robot, collect_due=True)
+        if status is None or status["deficit_started_at_monotonic_s"] is None:
+            return
+        episode = robot._am1_thermal_history_episode
+        if getattr(self, "_thermal_hold_started", None) != episode["started"] or self.state != "paused":
+            self._live_hold(robot, expired=self._live_summary.get("state") == "expired")
+            self._thermal_hold_started = episode["started"]
+            for key in ("cursor", "cursor_feedback_sequence", "cursor_intent_revision"):
+                self._live_summary.pop(key, None)
+        if observation is None:
+            observation = robot.get_observation()  # All ordinary role/current/status guards run.
+        goals = hold_goals(robot)
+        literal = {side: dict(row["registers"]["Goal_Position"]) for side, row in goals.items()}
+        if episode["held_goals"] is not None and episode["held_goals"] != literal:
+            raise RuntimeError("AM1 thermal history literal hold changed")
+        names = (*robot.base_motors, "lift_axis")
+        if len(names) != 4 or set(names) != {"base_left_wheel", "base_back_wheel", "base_right_wheel", "lift_axis"}:
+            raise RuntimeError("AM1 thermal history exact body motor map changed")
+        thermal_history_status(robot)
+        started = self.clock()
+        values = robot.left_bus.sync_read("Goal_Velocity", names, normalize=False, num_retry=0)
+        completed = self.clock()
+        now = self.clock()
+        if (set(values) != set(names) or any(type(value) is not int or value != 0 for value in values.values())
+                or not 0 <= started <= completed <= now or completed - started > .04
+                or now - started > .5):
+            raise RuntimeError("AM1 thermal history actual bounded body-zero readback unavailable")
+        samples = [started]
+        arm_feedback = observation.get("_am1_arm_feedback", {}).get("positions", {})
+        expected_positions = {name + ".pos" for name in (*robot.left_arm_motors, *robot.right_arm_motors)}
+        if set(arm_feedback) != expected_positions:
+            raise RuntimeError("AM1 thermal history complete original position proof unavailable")
+        for reading in arm_feedback.values():
+            raw_start, raw_end = (reading[key] for key in
+                                 ("read_started_at_monotonic_s", "read_completed_at_monotonic_s"))
+            if not 0 <= raw_start <= raw_end <= now:
+                raise RuntimeError("AM1 thermal history original position clock invalid")
+            samples.append(raw_start)
+        health = robot._am1_teleop_health
+        if health.get("binding") != robot._am1_teleop_binding:
+            raise RuntimeError("AM1 thermal history current role health identity unavailable")
+        for side in ("left", "right"):
+            for timing in health[side]["timing"].values():
+                if not 0 <= timing["read_started_at_monotonic_s"] <= timing["read_completed_at_monotonic_s"] <= now:
+                    raise RuntimeError("AM1 thermal history original role health clock invalid")
+                samples.append(timing["read_started_at_monotonic_s"])
+        lift_record = robot._lift_operation.last_record
+        samples.append(lift_record["sample_monotonic_s"] - lift_record["request_duration_s"])
+        for row in goals.values():
+            samples.append(row["timing"]["Goal_Position"]["read_started_at_monotonic_s"])
+        for side in ("left", "right"):
+            sample = robot._am1_teleop_currents[side]
+            samples.append(sample["read_started_at_monotonic_s"])
+            if not 0 <= sample["read_started_at_monotonic_s"] <= sample["read_completed_at_monotonic_s"] <= now:
+                raise RuntimeError("AM1 thermal history current proof clock invalid")
+        if any(now - stamp > .5 for stamp in samples):
+            raise RuntimeError("AM1 thermal history original hold proof expired")
+        # The full observation has already validated all original role protections.
+        # These are the actual request clocks, never an enqueue/HTTP receipt time.
+        episode.update(held_goals=literal, hold_sample=min(samples), zero_started=started, zero_completed=completed)
+        thermal_history_status(robot)  # No expired RAW/episode is rescued by hold I/O.
+
     def annotate(self, observation: dict, *, acquired_at: float | None = None) -> None:
         self.observation_id += 1
         observation[AM1_LOCAL_FEEDBACK_KEY] = {
@@ -453,6 +540,16 @@ class AM1LocalControl:
             )
             if self.live:
                 observation[AM1_LOCAL_FEEDBACK_KEY]["live_input"] = self.live_snapshot()
+            if self.teleop:
+                from .am1_live_teleop import thermal_history_status
+
+                history = thermal_history_status(self._thermal_robot) if hasattr(self, "_thermal_robot") else None
+                if history is not None:
+                    observation[AM1_LOCAL_FEEDBACK_KEY]["thermal_history"] = history
+            if self.teleop and "_am1_arm_feedback" in observation:
+                observation[AM1_LOCAL_FEEDBACK_KEY]["arm_feedback"] = copy.deepcopy(observation["_am1_arm_feedback"])
+            if self.teleop and "_am1_lift_feedback" in observation:
+                observation[AM1_LOCAL_FEEDBACK_KEY]["lift_feedback"] = copy.deepcopy(observation["_am1_lift_feedback"])
 
     def watchdog_stop(self, robot: AlohaMini) -> None:
         if self.selected_evidence is not None:
@@ -464,6 +561,21 @@ class AM1LocalControl:
             logging.warning("AM1 Local watchdog held follower arms at measured positions; epoch=%s", self.epoch)
 
     def apply(self, robot: AlohaMini, command: dict) -> bool:
+        if self.teleop:
+            from .am1_live_teleop import ThermalHistoryHoldRequiredError, apply_frame
+            zero_keys = {"x.vel", "y.vel", "theta.vel", "lift_axis.vel"}
+            if (self.state != "ready" and self.binding is not None and set(command) == zero_keys
+                    and all(type(value) in (int, float) and value == 0 for value in command.values())):
+                self._live_hold(robot)
+                self.state = "stopped"
+                return True
+            try:
+                return apply_frame(self, robot, command, AM1_LOCAL_CONTROL_KEY)
+            except AM1LiveInputExpired:
+                return False
+            except ThermalHistoryHoldRequiredError:
+                self.reconcile_thermal_history(robot)
+                return False
         if self.live:
             zero_keys = {"x.vel", "y.vel", "theta.vel", "lift_axis.vel"}
             if (self.state != "ready" and self.binding is not None
@@ -553,8 +665,13 @@ class AM1LocalControl:
             if self.binding is not None:
                 self.intent_revision = marker["intent_revision"]
                 self.accepted_action_sequence = marker["action_sequence"]
-                self.accepted_action = {"mode": "measured_arm_hold", "body_velocity": 0.0}
-            logging.warning("AM1 Local PAUSED: measured-position hold acknowledged; epoch=%s", epoch)
+                self.accepted_action = {"mode": "raw_goal_hold" if self.teleop else "measured_arm_hold", "body_velocity": 0.0}
+            report = getattr(robot, "_am1_routine_report", None)
+            hold_kind = "exact raw-goal" if self.teleop else "measured-position"
+            if report is None:
+                logging.warning("AM1 Local PAUSED: %s hold acknowledged; epoch=%s", hold_kind, epoch)
+            else:
+                report(f"AM1 Local PAUSED: {hold_kind} hold acknowledged; epoch={epoch}")
             return True
         if epoch == self.epoch and self.state == "paused":
             return False
@@ -593,7 +710,11 @@ class AM1LocalControl:
                 if type(_jsonable(value)) in (int, float) and math.isfinite(_jsonable(value))
             }
         if resuming:
-            logging.info("AM1 Local RECOVERED: first bounded action applied; epoch=%s", epoch)
+            report = getattr(robot, "_am1_routine_report", None)
+            if report is None:
+                logging.info("AM1 Local RECOVERED: first bounded action applied; epoch=%s", epoch)
+            else:
+                report(f"AM1 Local RECOVERED: first bounded action applied; epoch={epoch}")
         return True
 
 
@@ -1031,7 +1152,11 @@ class AM1HostLoopTiming:
             self._omitted_completed_loop_count += 1
         self._completed.append(self.previous)
 
-    def snapshot(self, at: float) -> dict[str, Any]:
+    def snapshot(
+        self, at: float, *, action_timing_ms: dict | None = None, command_completed: bool = False,
+        current_receipts: dict | None = None, lift_record: dict | None = None,
+        lift_emit_ms: float | None = None,
+    ) -> dict[str, Any]:
         current = None
         if self.current is not None:
             current = {**self.current, "phase_ms": dict(self.current["phase_ms"])}
@@ -1043,6 +1168,52 @@ class AM1HostLoopTiming:
         def copy_completed(record: dict[str, Any]) -> dict[str, Any]:
             return {**record, "phase_ms": dict(record["phase_ms"])}
 
+        # send_action publishes these only after its writes return. If this
+        # command failed partway through, these are the previous action's
+        # timings; retain that distinction rather than relabeling them current.
+        action = action_timing_ms if isinstance(action_timing_ms, dict) else {}
+        action_fields = (
+            "action_prepare", "action_lift", "action_relative_limit",
+            "action_left_gripper_limit", "action_left_joint_limit",
+            "action_right_gripper_limit", "action_right_joint_limit",
+            "action_left_write", "action_right_write", "action_base_write", "action_total",
+        )
+        retained_action = {
+            name: action[name] for name in action_fields
+            if type(action.get(name)) in (int, float) and math.isfinite(action[name]) and action[name] >= 0
+        }
+        # These are existing validated receipts, not reads for this diagnostic.
+        # A side may still describe a previous loop when the other side fails.
+        receipts = current_receipts if isinstance(current_receipts, dict) else {}
+        retained_currents = {}
+        for side in ("left", "right"):
+            sample = receipts.get(side)
+            if not isinstance(sample, dict):
+                continue
+            started, completed = (sample.get(name) for name in
+                                  ("read_started_at_monotonic_s", "read_completed_at_monotonic_s"))
+            if (type(started) not in (int, float) or type(completed) not in (int, float)
+                    or not 0 <= started <= completed <= at):
+                continue
+            relation = "current_loop_unavailable"
+            if current is not None:
+                relation = ("within_current_loop" if started >= current["start_s"] else
+                            "before_current_loop" if completed < current["start_s"] else
+                            "overlaps_current_loop_start")
+            retained_currents[side] = {
+                "clock": "monotonic", "source": "last_sampled_current_receipt_may_be_rejected",
+                "read_started_at_monotonic_s": started, "read_completed_at_monotonic_s": completed,
+                "relation_to_current_loop": relation,
+            }
+        lift = lift_record if isinstance(lift_record, dict) else {}
+        retained_lift = {"clock": "monotonic", "source": "last_cached_lift_record_may_be_rejected",
+                         "emit_timing_scope": "last_emit_attempt"}
+        for name in ("sample_monotonic_s", "request_duration_s"):
+            value = lift.get(name)
+            if type(value) in (int, float) and 0 <= value <= at:
+                retained_lift[name] = value
+        if type(lift_emit_ms) in (int, float) and 0 <= lift_emit_ms <= at * 1000:
+            retained_lift["last_emit_ms"] = lift_emit_ms
         return {
             "clock": "perf_counter",
             "previous_loop": None if self.previous is None else copy_completed(self.previous),
@@ -1050,6 +1221,11 @@ class AM1HostLoopTiming:
             "recent_completed_loops": [copy_completed(record) for record in self._completed],
             "completed_loop_history_limit": self.HISTORY_SIZE,
             "omitted_completed_loop_count": self._omitted_completed_loop_count,
+            "command_completed": command_completed,
+            "action_timing_scope": "last_completed_send_action",
+            "action_timing_ms": retained_action,
+            "current_feedback_timing": retained_currents,
+            "lift_feedback_timing": retained_lift,
         }
 
 
@@ -1409,6 +1585,18 @@ def visible_control_binding(args):
         if experiment_file is not None:
             raise ValueError("Selected experiment file requires its explicit protected recipe")
         return None
+    if recipe == "physical-live-teleop":
+        binding = {"recipe": recipe, "run_id": args.am1_run_id, "host_incarnation": args.am1_host_incarnation}
+        if (experiment_file is not None or args.robot_model != "alohamini1" or args.no_follower
+                or not getattr(args, "no_cameras", False) or not getattr(args, "am1_protected_run_directory", None)
+                or os.environ.get("AM1_SCRIPTED_PREPARE") != "1"
+                or any(os.environ.get(key) is not None for key in ("AM1_ELBOW_RECOVERY", "AM1_ELBOW_RECOVERY_RECIPE", "AM1_ELBOW_INTEGRAL"))
+                or os.environ.get("AM1_SHOULDER_INTEGRAL_TEST") == "1"):
+            raise ValueError("Whole-robot teleop requires its exact protected owner")
+        if any(type(binding[key]) is not str or str(UUID(binding[key])) != binding[key]
+               for key in ("run_id", "host_incarnation")):
+            raise ValueError("Whole-robot teleop requires canonical protected identities")
+        return binding
     from examples.alohamini.am1_session_contract import (
         LEFT_ELBOW_POSITIVE_CONTROL,
         LIVE_ELBOW_SPECS,
@@ -1501,6 +1689,7 @@ def elbow_recovery_binding(args):
 def _run_host(args):
     _validate_host_arguments(args)
     visible_binding = visible_control_binding(args)
+    teleop = visible_binding is not None and visible_binding["recipe"] == "physical-live-teleop"
     recovery_binding = elbow_recovery_binding(args)
     right_p20_binding = right_p20_trial_binding(args, visible_binding)
     practical_config = live_elbow_config(None if visible_binding is None else visible_binding["recipe"])
@@ -1537,7 +1726,9 @@ def _run_host(args):
     robot._am1_selected_joint_evidence_enabled = selected_evidence.enabled
     if recovery_binding is not None:
         robot._am1_elbow_recovery_binding = recovery_binding
-    if visible_binding is not None:
+    if teleop:
+        robot._am1_teleop_binding = visible_binding
+    elif visible_binding is not None:
         robot._am1_visible_control_binding = visible_binding
         robot._am1_visible_control_evidence = selected_evidence
         experiment = getattr(args, "_am1_selected_elbow_experiment", None)
@@ -1599,7 +1790,7 @@ def _run_host(args):
         AM1LocalControl(
             run_id=args.am1_run_id, host_incarnation=args.am1_host_incarnation,
             selected_evidence=selected_evidence,
-            live=visible_binding is not None and live_elbow_spec(visible_binding["recipe"]) is not None,
+            live=teleop or visible_binding is not None and live_elbow_spec(visible_binding["recipe"]) is not None,
             live_recipe=AM1_LIVE_RECIPE if visible_binding is None else visible_binding["recipe"],
             practical_config=practical_config,
         )
@@ -1616,16 +1807,41 @@ def _run_host(args):
     )
     fault_loop_context = None
     fault_loop_context_error = None
+    command_received = False
     routine_writer = None
     routine_report = print
+    no_lift_drain = object()
+    previous_lift_drain = getattr(robot, "_am1_routine_lift_drain", no_lift_drain)
+    installed_lift_drain = False
     exit_message = None
     logging.info("Waiting for commands...")
 
     try:
-        if practical_config is not None:
+        if practical_config is not None or teleop:
             routine_writer = AM1RoutineRecordWriter()
             selected_evidence.emit = routine_writer.emit_selected
             routine_report = routine_writer.submit_line
+            robot._am1_routine_report = routine_report
+            if teleop:
+                def drain_lift_samples():
+                    routine_writer.raise_if_failed()
+                    routine_writer.emit_lift_samples(robot._lift_operation)
+                    routine_writer.raise_if_failed()
+
+                robot._am1_routine_lift_drain = drain_lift_samples
+                installed_lift_drain = True
+                # Keep each complete bus receipt below the existing record bound.
+                for side in ("left", "right"):
+                    routine_writer.submit("[AM1 TELEOP SETTINGS] ", {
+                        "binding": robot._am1_teleop_binding,
+                        "bus": side,
+                        "before": robot._am1_teleop_settings[side],
+                        "active": robot._am1_teleop_active_settings[side],
+                    })
+                routine_writer.submit("[AM1 TELEOP REST] ", {
+                    "binding": robot._am1_teleop_binding,
+                    "acquisitions": robot._am1_teleop_rest_evidence,
+                })
         # One final same-owner startup boundary before ordinary loop timing.
         # Only a due genuine read can refresh the retained original thermal slots.
         if (
@@ -1710,6 +1926,8 @@ def _run_host(args):
                 loop_timing.mark("robot_observation", time.perf_counter())
             read_started_at = time.monotonic()
             last_observation = robot.get_observation()
+            if local_control is not None and getattr(robot, "_am1_thermal_history_enabled", False):
+                local_control.reconcile_thermal_history(robot, last_observation)
             acquired_at = time.monotonic()
             if local_control is not None:
                 local_control.annotate(last_observation, acquired_at=acquired_at)
@@ -1892,8 +2110,14 @@ def _run_host(args):
             # Capture BEFORE cleanup, attach AFTER it. Cleanup time must not be
             # misreported as poll/log/observation delay, or diagnostic I/O delay zero/off.
             try:
-                fault_loop_context = loop_timing.snapshot(time.perf_counter())
-                sample = getattr(getattr(robot, "_lift_operation", None), "last_record", None) or {}
+                operation = getattr(robot, "_lift_operation", None)
+                sample = getattr(operation, "last_record", None) or {}
+                fault_loop_context = loop_timing.snapshot(
+                    time.perf_counter(), action_timing_ms=robot.logs.get("action_timing_ms"),
+                    command_completed=command_received,
+                    current_receipts=getattr(robot, "_am1_teleop_currents", None),
+                    lift_record=sample, lift_emit_ms=getattr(operation, "last_emit_ms", None),
+                )
                 # last_record is cached before some operational guards; it may
                 # contain the rejected sample, not the last accepted one.
                 fault_loop_context["last_cached_lift_sample_monotonic_s"] = sample.get("sample_monotonic_s")
@@ -1901,6 +2125,11 @@ def _run_host(args):
                 fault_loop_context_error = type(context_error).__name__
     finally:
         args._am1_finishing = True
+        if installed_lift_drain:
+            if previous_lift_drain is no_lift_drain:
+                del robot._am1_routine_lift_drain
+            else:
+                robot._am1_routine_lift_drain = previous_lift_drain
         cleanup_errors: list[tuple[str, BaseException]] = []
         try:
             if robot.is_connected:

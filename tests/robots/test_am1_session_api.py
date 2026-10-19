@@ -158,7 +158,13 @@ def test_websocket_ticket_binding_acknowledgement_and_revoke(cluster):
             state = await ws.receive_json(timeout=2)
             assert state["kind"] == "snapshot"
             await ws.send_json({"id": "bad", "command": {"op": "claim"}})
-            result = await ws.receive_json(timeout=2)
+            # Unacknowledged snapshots may repeat before the command result.
+            # Do not ACK them: this assertion specifically checks missing-ACK refusal.
+            async with asyncio.timeout(2):
+                while True:
+                    result = await ws.receive_json(timeout=2)
+                    if result.get("id") == "bad":
+                        break
             assert result["accepted"] is False
             await ws.send_json({"ack": state["revision"]})
             await ws.send_json({"id": "claim", "command": {"op": "claim"}})
@@ -566,6 +572,70 @@ def test_partial_ipc_frames_cannot_starve_owner_cadence_or_reserved_stop(cluster
                 writer.close()
                 await writer.wait_closed()
             await a.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("controller", [None, {"device_id": "revoked"}, {"device_id": "new-owner"}])
+def test_revocation_dispatches_fence_after_controller_expiry(controller):
+    # Durable same-operation intent must be cancelled even after its lease expires.
+    # Core, rather than a stale gateway snapshot, fences a different current owner.
+    from tools.am1_session_service import Gateway
+
+    async def scenario():
+        gateway = object.__new__(Gateway)
+        gateway.tickets = {"old": ("revoked", 100), "other": ("new-owner", 100)}
+        gateway.peers = []
+        calls = []
+
+        async def current():
+            return {"controller": controller}
+
+        async def call(command, device):
+            calls.append((command, device))
+            return {"accepted": controller is None or controller["device_id"] == device}
+
+        gateway.current, gateway.call = current, call
+        await gateway.fence("revoked")
+        assert len(calls) == 1
+        command, device = calls[0]
+        assert command["op"] == "release" and device == "revoked"
+        assert uuid.UUID(command["operation_id"]).version == 4
+        assert gateway.tickets == {"other": ("new-owner", 100)}
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("controller", [None, {"device_id": "new-owner"}])
+def test_local_revocation_discovers_expired_disconnected_bench_intent(controller):
+    from types import SimpleNamespace
+
+    from tools.am1_session_service import Gateway
+
+    async def scenario():
+        gateway = object.__new__(Gateway)
+        gateway.tickets, gateway.peers = {}, []
+        gateway.auth = SimpleNamespace(capable=lambda device: device == "new-owner")
+        state = {"controller": controller, "run": {"control_intent": {"eligible": True, "device_id": "revoked"}}}
+        fenced, calls = asyncio.Event(), []
+
+        async def current():
+            return state
+
+        async def call(command, device):
+            calls.append((command, device))
+            state["run"]["control_intent"]["eligible"] = False
+            fenced.set()
+            return {"accepted": True}
+
+        gateway.current, gateway.call = current, call
+        task = asyncio.create_task(gateway.publish())
+        try:
+            await asyncio.wait_for(fenced.wait(), .6)
+            assert len(calls) == 1 and calls[0][0]["op"] == "release" and calls[0][1] == "revoked"
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     asyncio.run(scenario())
 

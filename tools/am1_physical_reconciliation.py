@@ -1,10 +1,12 @@
 """Private stopped-state proof validation; this module never opens a motor device."""
 
+import ast
 import copy
 import hashlib
 import json
 import math
 import os
+import re
 import socket
 import stat
 import subprocess
@@ -16,6 +18,8 @@ from pathlib import Path
 MARKERS = ("cleanup-uncertain.json", "physical-in-progress.json")
 CACHE_S = 5.0
 INCOMPLETE_PREACTIVATION_ORIGIN = "preactivation-lift-unqualified"
+PREHOME_COOL_STALE_ORIGIN = "prehome-cool-thermal-stale-lift-unqualified"
+PREIMPORT_STOP_ORIGIN = "preimport-stop-missing-host-receipt"
 
 
 def canonical(value):
@@ -80,6 +84,145 @@ def expected_readbacks():
     return rows
 
 
+def _original_origin_note(chain, prefix):
+    notes = []
+    for entry in chain:
+        values = entry.get("notes")
+        require(
+            isinstance(values, list) and all(type(value) is str for value in values),
+            "complete original prehome error notes required",
+        )
+        notes.extend(value for value in values if value.startswith(prefix))
+    require(len(notes) == 1 and len(notes[0]) <= 16384, "one bounded original prehome note required")
+    value = _json(notes[0][len(prefix) :])
+    require(isinstance(value, dict), "original prehome note object required")
+    return value
+
+
+def _validate_prehome_cool_stale_origin(run, receipt, chain):
+    """Recognize only retained cool, stale pre-home evidence; never qualify the lift."""
+    require(
+        isinstance(chain, list)
+        and len(chain) == 2
+        and all(isinstance(entry, dict) for entry in chain)
+        and chain[0].get("cause") == "RuntimeError: AlohaMini motor activation failed."
+        and chain[1].get("cause") == receipt["first_cause"],
+        "original prehome activation wrapper and complete error chain required",
+    )
+    fault = _original_origin_note(chain, "[AM1 TELEOP FAULT] ")
+    rest = _original_origin_note(chain, "Original normal-rest acquisition: ")
+    binding = {
+        "recipe": "physical-live-teleop",
+        "run_id": run["run_id"],
+        "host_incarnation": receipt["host_incarnation"],
+    }
+    require(
+        run.get("recipe") == "physical-live-teleop"
+        and rest.get("binding") == binding
+        and fault.get("binding") == binding
+        and rest.get("phase") == "before_home"
+        and rest.get("qualified") is False
+        and rest.get("samples") == []
+        and rest.get("first_cause") == receipt["first_cause"],
+        "original same-run before-home refusal without acquisition or homing required",
+    )
+    side, motor = fault.get("side"), fault.get("offending_motor")
+    joints = ("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper")
+    names = ["arm_" + str(side) + "_" + joint for joint in joints]
+    suffix = "; temperature: five-slot feedback window is stale (>0.5 s)."
+    require(
+        side in ("left", "right")
+        and motor in names
+        and fault.get("register") == "Present_Temperature"
+        and fault.get("reason") == "actual configured temperature limit: " + motor + suffix
+        and receipt["first_cause"] == "RuntimeError: AM1 teleop " + fault["reason"],
+        "only exact mapped-arm cool thermal-window stale cause may use this origin",
+    )
+    comparison = fault.get("comparison") or {}
+    thermal = comparison.get("temperature") or {}
+    configured = (comparison.get("configured") or {}).get("Max_Temperature_Limit") or {}
+    ceiling, raw = configured.get("value"), fault.get("raw")
+    require(
+        type(ceiling) is int
+        and 0 < ceiling <= 100
+        and thermal.get("ceiling_c") == ceiling
+        and type(thermal.get("ceiling_c")) is int
+        and comparison.get("units") == "raw_register"
+        and comparison.get("lower_inclusive") == 0
+        and comparison.get("upper_exclusive") == ceiling
+        and thermal.get("high_count") == 0
+        and thermal.get("numeric_outlier_count") == 0
+        and thermal.get("first_cause") == suffix.removeprefix("; ")
+        and isinstance(raw, dict)
+        and set(raw) == set(names)
+        and all(type(value) is int and 0 <= value < ceiling for value in raw.values())
+        and type(fault.get("offending_value")) is int
+        and fault["offending_value"] == raw[motor],
+        "original configured cool values without high votes or outliers required",
+    )
+    started, completed = fault.get("read_started_at_monotonic_s"), fault.get("read_completed_at_monotonic_s")
+    slots = thermal.get("samples")
+    require(
+        number(started)
+        and number(completed)
+        and 0 <= started <= completed
+        and number(rest.get("started_at"))
+        and rest["started_at"] <= started
+        and completed <= receipt["readback"]["started_at_monotonic_s"]
+        and isinstance(slots, list)
+        and len(slots) == 5
+        and all(
+            isinstance(row, list)
+            and len(row) == 2
+            and number(row[0])
+            and 0 <= row[0] <= completed
+            and type(row[1]) is int
+            and 0 <= row[1] < ceiling
+            for row in slots
+        ),
+        "original timed cool five-slot stale evidence required",
+    )
+    times = [row[0] for row in slots]
+    require(
+        all(a < b for a, b in zip(times, times[1:], strict=False))
+        and len({(round(at * 1e9) - round(times[0] * 1e9)) // 100_000_000 for at in times}) == 5
+        and completed - times[0] > 0.5
+        and times[-1] == completed
+        and slots[-1][1] == raw[motor],
+        "original advancing occupied slots must demonstrate cool stale history",
+    )
+    group = fault.get("group_reply") or {}
+    request, packets = group.get("request") or {}, group.get("packets")
+    require(
+        group.get("binding") == binding
+        and request.get("binding") == binding
+        and request.get("side") == side
+        and request.get("address") == 63
+        and request.get("width") == 1
+        and request.get("ids") == [1, 2, 3, 4, 5, 6]
+        and request.get("motors") == names
+        and request.get("register") == "Present_Temperature"
+        and group.get("comm_result") == 0
+        and isinstance(packets, list)
+        and len(packets) == 6,
+        "original exact one-byte six-motor temperature group required",
+    )
+    for ident, name, record in zip(range(1, 7), names, packets, strict=True):
+        require(isinstance(record, dict), "original temperature packet record required")
+        packet = record.get("packet")
+        require(
+            record.get("comm_result") == 0
+            and record.get("device_error") == 0
+            and isinstance(packet, list)
+            and len(packet) == 7
+            and all(type(value) is int and 0 <= value <= 255 for value in packet)
+            and packet[:5] == [255, 255, ident, 3, 0]
+            and packet[5] == raw[name]
+            and sum(packet[2:]) & 255 == 255,
+            "original checksum-valid cool temperature replies without device errors required",
+        )
+
+
 def validate_cleanup_origin(run, proof, receipt):
     """Qualify an explicit incomplete origin without promoting its old lift proof."""
     origin = proof.get("original_cleanup_origin")
@@ -89,45 +232,68 @@ def validate_cleanup_origin(run, proof, receipt):
             "literal unchanged original unknown cleanup receipt required",
         )
         return False
-    require(origin == INCOMPLETE_PREACTIVATION_ORIGIN, "unsupported original cleanup origin")
+    require(
+        origin in (INCOMPLETE_PREACTIVATION_ORIGIN, PREHOME_COOL_STALE_ORIGIN),
+        "unsupported original cleanup origin",
+    )
     lifecycle, rb = run.get("physical_result") or {}, receipt.get("readback") or {}
     require(
-        run.get("status") == "faulted" and run.get("uncertain") is True
-        and "native_live_at" in run and run["native_live_at"] is None
-        and number(run.get("progress_s")) and run["progress_s"] == 0
-        and lifecycle.get("phase") == "terminal" and lifecycle.get("uncertain") is True
+        run.get("status") == "faulted"
+        and run.get("uncertain") is True
+        and "native_live_at" in run
+        and run["native_live_at"] is None
+        and number(run.get("progress_s"))
+        and run["progress_s"] == 0
+        and lifecycle.get("phase") == "terminal"
+        and lifecycle.get("uncertain") is True
         and lifecycle.get("cleanup") == "physical_cleanup_unknown"
-        and "native_live_at" in lifecycle and lifecycle["native_live_at"] is None
+        and "native_live_at" in lifecycle
+        and lifecycle["native_live_at"] is None
         and lifecycle.get("readback") == receipt,
         "exact uncertain preactivation terminal origin required",
     )
     require(
-        type(receipt.get("version")) is int and receipt["version"] == 1
+        type(receipt.get("version")) is int
+        and receipt["version"] == 1
         and receipt.get("run_id") == run.get("run_id")
-        and receipt.get("host_incarnation") == lifecycle.get("backend_incarnation") == proof.get("host_incarnation")
+        and receipt.get("host_incarnation")
+        == lifecycle.get("backend_incarnation")
+        == proof.get("host_incarnation")
         and receipt.get("first_cause") == run.get("native_first_cause") == proof.get("original_first_cause")
-        and isinstance(receipt.get("first_cause"), str) and bool(receipt["first_cause"])
+        and isinstance(receipt.get("first_cause"), str)
+        and bool(receipt["first_cause"])
         and receipt.get("provenance") == "protected-host/actual-motor-readback"
-        and receipt.get("cleanup") == "physical_readback_verified" and receipt.get("uncertain") is False
-        and receipt.get("cleanup_errors") == [] and receipt.get("expected_stop") is None
-        and rb.get("verified") is True and rb.get("buses_closed") is True
+        and receipt.get("cleanup") == "physical_readback_verified"
+        and receipt.get("uncertain") is False
+        and receipt.get("cleanup_errors") == []
+        and receipt.get("expected_stop") is None
+        and rb.get("verified") is True
+        and rb.get("buses_closed") is True
         and rb.get("lift_readback") == "unavailable-or-failed"
-        and rb.get("cleanup_errors") == [] and rb.get("selected_gain_restore_required") is False,
+        and rb.get("cleanup_errors") == []
+        and rb.get("selected_gain_restore_required") is False,
         "only incomplete lift proof with otherwise actual known off cleanup may use this origin",
     )
     chain = receipt.get("first_error_chain")
-    require(
-        receipt["first_cause"].startswith("RuntimeError: AM1 arm activation refused: ")
-        and isinstance(chain, list) and len(chain) == 2
-        and chain[0].get("cause") == "RuntimeError: AlohaMini motor activation failed."
-        and chain[1].get("cause") == receipt["first_cause"],
-        "original preactivation arm-guard cause and complete error chain required",
-    )
+    if origin == PREHOME_COOL_STALE_ORIGIN:
+        _validate_prehome_cool_stale_origin(run, receipt, chain)
+    else:
+        require(
+            receipt["first_cause"].startswith("RuntimeError: AM1 arm activation refused: ")
+            and isinstance(chain, list)
+            and len(chain) == 2
+            and chain[0].get("cause") == "RuntimeError: AlohaMini motor activation failed."
+            and chain[1].get("cause") == receipt["first_cause"],
+            "original preactivation arm-guard cause and complete error chain required",
+        )
     started, completed = rb.get("started_at_monotonic_s"), rb.get("completed_at_monotonic_s")
     rows = rb.get("readbacks")
     require(
-        number(started) and number(completed) and 0 <= started <= completed
-        and isinstance(rows, list) and len(rows) == 20
+        number(started)
+        and number(completed)
+        and 0 <= started <= completed
+        and isinstance(rows, list)
+        and len(rows) == 20
         and {(r.get("bus"), r.get("motor"), r.get("register")) for r in rows} == expected_readbacks(),
         "original twenty distinct timed zero/off readbacks required",
     )
@@ -138,6 +304,245 @@ def validate_cleanup_origin(run, proof, receipt):
         "incomplete preactivation origin requires both original markers absent",
     )
     return True
+
+
+def validate_preimport_stop_origin(run, proof):
+    """Eligibility only: a missing original receipt never proves a stopped motor."""
+    lifecycle = run.get("physical_result") or {}
+    execution = run.get("execution") or {}
+    require(
+        run.get("source") == "protected-physical-provider"
+        and run.get("recipe") == "physical-live-teleop"
+        and run.get("status") == run.get("requested_terminal") == "stopped"
+        and run.get("uncertain") is True
+        and run.get("cleanup") == "physical_cleanup_unknown"
+        and "native_live_at" in run
+        and run["native_live_at"] is None
+        and number(run.get("progress_s"))
+        and run["progress_s"] == 0
+        and type(run.get("recovery_episodes")) is int
+        and run["recovery_episodes"] == 0
+        and execution.get("complete") is False
+        and "fault" in execution
+        and execution["fault"] is None
+        and number(execution.get("progress_s"))
+        and execution["progress_s"] == 0
+        and all(key in run and run[key] is None for key in ("first_cause", "native_first_cause"))
+        and lifecycle.get("phase") == "terminal"
+        and lifecycle.get("terminal_status") == "stopped"
+        and lifecycle.get("run_id") == run.get("run_id")
+        and lifecycle.get("backend_incarnation") == proof.get("host_incarnation")
+        and lifecycle.get("cleanup") == "physical_cleanup_unknown"
+        and lifecycle.get("uncertain") is True
+        and lifecycle.get("cleanup_errors") == []
+        and all(
+            key in lifecycle and lifecycle[key] is None
+            for key in ("native_live_at", "first_cause", "readback")
+        ),
+        "exact uncertain preimport Stop with no native effect/cause/readback required",
+    )
+    require(
+        proof.get("original_cleanup_origin") == PREIMPORT_STOP_ORIGIN
+        and proof.get("original_cleanup_missing") is True
+        and "original_cleanup_sha256" in proof
+        and proof["original_cleanup_sha256"] is None
+        and "original_first_cause" in proof
+        and proof["original_first_cause"] is None
+        and proof.get("original_markers") == dict.fromkeys(MARKERS),
+        "explicit missing original cleanup and absent markers required; no fabricated receipt",
+    )
+
+
+def _validate_processor_import_frames(config, frames):
+    """Bounded pre-main package discovery; never evidence of stopped hardware."""
+    require(
+        5 <= len(frames) <= 64
+        and [frame[2] for frame in frames[:2]] == ["_run_module_as_main", "_get_module_details"]
+        and all(frame[0] == "<frozen runpy>" and frame[1] > 0 and frame[3] == [] for frame in frames[:2]),
+        "package discovery must precede selected host main; bounded import chain required",
+    )
+    repository = Path(config["host_repository"]) / "src/lerobot"
+    package = repository / "robots/alohamini"
+    anchors = (
+        (package / "__init__.py", "from .alohamini import AlohaMini"),
+        (package / "alohamini.py", "from lerobot.processor import RobotAction, RobotObservation"),
+    )
+    for frame, (path, source) in zip(frames[2:4], anchors, strict=True):
+        require(
+            frame[0] == path.as_posix() and frame[2] == "<module>" and frame[3]
+            and frame[3][0] == "    " + source,
+            "current package discovery anchors required; no host execution frames",
+        )
+    # These are the non-device import roots demonstrated by the existing processor
+    # path. A new dependency family needs evidence rather than a permissive fallback.
+    site = Path(config["host_python"]).parent.parent / "lib/python3.12/site-packages"
+    sources = {}
+    total_bytes = 0
+    for index, (name, number, context, body) in enumerate(frames[2:], 2):
+        path = Path(name)
+        local = path.is_relative_to(repository)
+        if index < 4:
+            permitted = path == anchors[index - 2][0]
+        elif local:
+            relative = path.relative_to(repository)
+            permitted = bool(relative.parts) and relative.parts[0] in {"processor", "configs", "transforms"}
+        else:
+            relative = path.relative_to(site) if path.is_relative_to(site) else None
+            permitted = relative is not None and len(relative.parts) >= 2 and relative.parts[0] in {
+                "torch", "torchvision", "sympy"
+            }
+        require(
+            permitted and path.is_absolute() and path.as_posix() == name and ".." not in path.parts
+            and path.suffix == ".py" and all(not p.is_symlink() for p in (path, *path.parents))
+            and path.is_file() and path.stat().st_size <= 2 * 1024 * 1024,
+            "literal bounded package-import source required; device/foreign source refused",
+        )
+        if name not in sources:
+            data = path.read_bytes()
+            total_bytes += len(data)
+            require(total_bytes <= 16 * 1024 * 1024, "bounded total package-import source required")
+            sources[name] = data.decode("utf-8").splitlines()
+        source = sources[name]
+        require(
+            0 < number <= len(source) and len(source[number - 1]) <= 1024
+            and 1 <= len(body) <= 2 and body[0] == "    " + source[number - 1].strip()
+            and all(len(line) <= 1024 and re.fullmatch(r" +[~^]+", line) for line in body[1:])
+            and re.fullmatch(r"<module>|[A-Za-z_][A-Za-z_0-9.]*", context),
+            "trace must match actual bounded import source/carets",
+        )
+        if local:
+            tree = ast.parse("\n".join(source))
+            require(
+                context == "<module>"
+                and any(isinstance(node, (ast.Import, ast.ImportFrom))
+                        and node.lineno <= number <= node.end_lineno for node in ast.walk(tree))
+                and not any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                            and node.lineno <= number <= node.end_lineno for node in ast.walk(tree)),
+                "repository frames must remain module imports; no construction or operational frame",
+            )
+
+
+def _load_preimport_stop_originals(config, proof):
+    """Read immutable origin evidence; no old-off or no-actuation qualification."""
+    directory = Path(config["run_root"]) / proof["run_id"][:8]
+    cleanup = directory / "cleanup.json"
+    require(
+        not cleanup.exists() and not cleanup.is_symlink(), "original cleanup must remain literally absent"
+    )
+    hashes = proof.get("original_host_logs")
+    require(
+        isinstance(hashes, dict)
+        and set(hashes) == {"host-runtime.log", "host-launch.log"}
+        and all(type(value) is str and re.fullmatch("[0-9a-f]{64}", value) for value in hashes.values()),
+        "both original host log hashes required",
+    )
+    logs = {}
+    for name, digest in hashes.items():
+        data = _private_bytes(directory / name)
+        require(sha(data) == digest, "original host log changed")
+        require(len(data) <= 65536, "bounded original import-cancel logs required")
+        logs[name] = data.decode("utf-8")
+    launch = re.fullmatch(
+        r"Running as unit: am1-pa01-host-"
+        + re.escape(proof["run_id"])
+        + r"\.service; invocation ID: [0-9a-f]{32}\nFinished with result: success\n"
+        r"Main processes terminated with: code=killed, status=2/INT\n"
+        r"Service runtime: ([0-9]+(?:\.[0-9]+)?)s\nCPU time consumed: ([0-9]+(?:\.[0-9]+)?)s\n",
+        logs["host-launch.log"],
+    )
+    require(
+        launch is not None and all(math.isfinite(float(v)) and float(v) > 0 for v in launch.groups()),
+        "one original same-run SIGINT host launch required",
+    )
+    lines = logs["host-runtime.log"].splitlines()
+    require(
+        lines and lines[0] == "Traceback (most recent call last):" and lines[-1] == "KeyboardInterrupt",
+        "one complete original import-cancel traceback required",
+    )
+    frames = []
+    for line in lines[1:-1]:
+        match = re.fullmatch(r'  File "([^"]+)", line ([0-9]+), in (.+)', line)
+        if match:
+            frames.append((match[1], int(match[2]), match[3], []))
+        else:
+            require(bool(frames), "unexpected original traceback prefix")
+            frames[-1][3].append(line)
+    if len(frames) > 3 and frames[3][3] and frames[3][3][0] == (
+        "    from lerobot.processor import RobotAction, RobotObservation"
+    ):
+        _validate_processor_import_frames(config, frames)
+        return logs
+    require(
+        len(frames) == 11
+        and [f[2] for f in frames]
+        == [
+            "_run_module_as_main",
+            "_get_module_details",
+            "<module>",
+            "<module>",
+            "<module>",
+            "dataclass",
+            "wrap",
+            "_process_class",
+            "_cmp_fn",
+            "_create_fn",
+            "<module>",
+        ]
+        and all(f[0] == "<frozen runpy>" and f[1] > 0 and f[3] == [] for f in frames[:2])
+        and frames[-1] == ("<string>", 0, "<module>", []),
+        "exact package-import/dataclass cancellation chain required; no post-import frames",
+    )
+    root = Path(config["host_repository"]) / "src/lerobot/robots/alohamini"
+    source_lines = [
+        "from .alohamini import AlohaMini",
+        "from .lift_axis import LiftAxis, LiftAxisConfig, LiftHomeResult",
+        "@dataclass",
+    ]
+    for frame, name, expected in zip(
+        frames[2:5], ("__init__.py", "alohamini.py", "lift_axis.py"), source_lines, strict=True
+    ):
+        path = root / name
+        require(
+            frame[0] == path.as_posix()
+            and frame[1] > 0
+            and not any(p.is_symlink() for p in (path, *path.parents)),
+            "original import source path differs",
+        )
+        data = path.read_bytes()
+        require(len(data) <= 1_048_576, "bounded original import source required")
+        source = data.decode("utf-8").splitlines()
+        require(
+            frame[1] <= len(source) and source[frame[1] - 1].strip() == expected,
+            "traceback must match actual pinned import source",
+        )
+        if name == "lift_axis.py":
+            require(
+                frame[1] < len(source) and source[frame[1]].strip() == "class LiftAxisConfig:",
+                "only pre-construction LiftAxisConfig decorator cancellation eligible",
+            )
+    stdlib = frames[5][0]
+    require(
+        stdlib.startswith("/")
+        and stdlib.endswith("/lib/python3.12/dataclasses.py")
+        and all(f[0] == stdlib and f[1] > 0 for f in frames[5:10]),
+        "one original Python3.12 dataclass chain required",
+    )
+    code = source_lines + [
+        "return wrap(cls)",
+        "return _process_class(cls, init, repr, eq, order, unsafe_hash,",
+        "_cmp_fn('__eq__', '==',",
+        "return _create_fn(name,",
+        "exec(txt, globals, ns)",
+    ]
+    for frame, expected in zip(frames[2:10], code, strict=True):
+        require(
+            frame[3]
+            and frame[3][0] == "    " + expected
+            and len(frame[3]) <= 2
+            and all(re.fullmatch(r" +\^+", line) for line in frame[3][1:]),
+            "only original source/caret lines permitted in import-cancel trace",
+        )
+    return logs
 
 
 def _timed_row(row, started, completed):
@@ -391,7 +796,7 @@ def validate_stopped_proof(config, run, proof, *, now, boot_id=None, durable_ack
     for record in samples:
         stamp, temp = record["sample_monotonic_s"], record["temperature_c"]
         slot = (round(stamp * 1e9) - origin_ns) // 100_000_000
-        if slot not in by_slot or temp > by_slot[slot][1]:
+        if slot not in by_slot or temp >= by_slot[slot][1]:
             by_slot[slot] = [stamp, temp]
     expected = list(by_slot.values())[-5:]
     require(
@@ -720,17 +1125,23 @@ def load_qualified_proof(config, run):
         uuid.UUID(old_ack["operation_id"])
     proof = validate_stopped_proof(config, run, proof, now=time.monotonic(), durable_ack=old_ack is not None)
     _validate_sources(config, proof)
-    original = _private_bytes(Path(config["run_root"]) / run_id[:8] / "cleanup.json")
-    old = _json(original)
-    require(
-        sha(original) == proof.get("original_cleanup_sha256")
-        and old == (run.get("physical_result") or {}).get("readback")
-        and old.get("run_id") == run_id
-        and old.get("host_incarnation") == proof["host_incarnation"]
-        and old.get("first_cause") == proof["original_first_cause"],
-        "literal unchanged original unknown cleanup receipt required",
-    )
-    incomplete_origin = validate_cleanup_origin(run, proof, old)
+    if proof.get("original_cleanup_origin") == PREIMPORT_STOP_ORIGIN:
+        validate_preimport_stop_origin(run, proof)
+        _load_preimport_stop_originals(config, proof)
+        original = None  # Preserve literal absence; never synthesize an old host receipt.
+        incomplete_origin = True
+    else:
+        original = _private_bytes(Path(config["run_root"]) / run_id[:8] / "cleanup.json")
+        old = _json(original)
+        require(
+            sha(original) == proof.get("original_cleanup_sha256")
+            and old == (run.get("physical_result") or {}).get("readback")
+            and old.get("run_id") == run_id
+            and old.get("host_incarnation") == proof["host_incarnation"]
+            and old.get("first_cause") == proof["original_first_cause"],
+            "literal unchanged original unknown cleanup receipt required",
+        )
+        incomplete_origin = validate_cleanup_origin(run, proof, old)
     camera_raw = _private_bytes(Path(config["camera_state"]) / ("release-" + run_id + ".json"))
     require(
         sha(camera_raw) == proof.get("camera_release_sha256")
@@ -740,7 +1151,8 @@ def load_qualified_proof(config, run):
     )
     markers = proof.get("original_markers")
     require(
-        isinstance(markers, dict) and set(markers) == set(MARKERS)
+        isinstance(markers, dict)
+        and set(markers) == set(MARKERS)
         and (incomplete_origin or markers[MARKERS[0]] is not None),
         "exact original unknown marker inventory required",
     )
@@ -782,6 +1194,8 @@ def archive_and_ack(config, proof, raw, originals, operation_id):
         _private_bytes(state / ("reconciliation-" + proof["run_id"] + ".json")) == raw,
         "immutable proof changed before ACK",
     )
+    if proof.get("original_cleanup_origin") == PREIMPORT_STOP_ORIGIN:
+        _load_preimport_stop_originals(config, proof)
     acknowledgment_path = _ack_path(state, proof["run_id"])
     require(current_boot_id() == proof["boot_id"], "stopped proof boot changed before ACK")
     if not acknowledgment_path.exists():
@@ -853,12 +1267,18 @@ def archive_and_ack(config, proof, raw, originals, operation_id):
         if data is not None and (state / name).exists():
             require(_private_bytes(state / name) == data, "marker changed during guarded ACK")
             (state / name).unlink()
-    if proof.get("original_cleanup_origin") == INCOMPLETE_PREACTIVATION_ORIGIN:
+    if proof.get("original_cleanup_origin") in (
+        INCOMPLETE_PREACTIVATION_ORIGIN,
+        PREHOME_COOL_STALE_ORIGIN,
+        PREIMPORT_STOP_ORIGIN,
+    ):
         require(
             originals == dict.fromkeys(MARKERS)
             and all(not (state / name).exists() and not (state / name).is_symlink() for name in MARKERS),
             "both incomplete-origin markers must remain absent through durable ACK",
         )
+    if proof.get("original_cleanup_origin") == PREIMPORT_STOP_ORIGIN:
+        _load_preimport_stop_originals(config, proof)
     _fsync_directory(state)
     return ack
 

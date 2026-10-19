@@ -1,11 +1,22 @@
 """Explicit protected physical recipes. No hardware is opened by module import."""
 
 import copy
+import json
 import math
 import threading
 import time
+from dataclasses import dataclass
 
 from examples.alohamini.am1_finite_task import JOINT_KEYS
+from examples.alohamini.am1_live_teleop import (
+    TELEOP_ARM_KEYS,
+    TELEOP_RECIPE,
+    TELEOP_SPEC,
+    validate_body,
+    validate_source,
+    validate_target,
+    validate_workspace,
+)
 from examples.alohamini.am1_session_contract import (
     ELBOW_RECOVERY_DEFINITIONS,
     LEFT_ELBOW_ORIGINAL_RETURN,
@@ -56,6 +67,10 @@ def load_elbow_return_reference(config, *, definition=LEFT_ELBOW_ORIGINAL_RETURN
     return copy.deepcopy(value)
 
 
+class LiveInputExpiredBeforeAdmissionError(RuntimeError):
+    """A valid whole frame expired before its original mailbox could admit it."""
+
+
 class StartupCancelledError(RuntimeError):
     """An explicit Stop cancels admission without inventing a hardware fault."""
 
@@ -64,7 +79,63 @@ class FeedbackUnavailable(RuntimeError):  # noqa: N818 - existing adapter/test c
     """A bounded missing/stale reply; owner survives and holds/recoveries remain bounded."""
 
 
-def read_physical_sample(client, run_id, host_incarnation, previous_sequence, *, clock=time.monotonic):
+def thermal_history_evidence(ack, now):
+    """Validate the admitted owner's original thermal proof, never its receipt time."""
+    if type(ack) is not dict:
+        raise ValueError("native thermal acknowledgement malformed")
+    if "thermal_history" not in ack:
+        return None, True  # Legacy/nonthermal owners retain their existing contract.
+    proof = ack["thermal_history"]
+    fields = {"version", "raw_sample_at_monotonic_s", "peaks_ready",
+              "deficit_started_at_monotonic_s", "deficit_ceiling_monotonic_s",
+              "hold_sample_at_monotonic_s", "zero_read_started_at_monotonic_s",
+              "zero_read_completed_at_monotonic_s"}
+    if (type(proof) is not dict or set(proof) != fields or type(proof["version"]) is not int
+            or proof["version"] != 1 or type(proof["peaks_ready"]) is not bool):
+        raise ValueError("native thermal history proof malformed")
+    raw = proof["raw_sample_at_monotonic_s"]
+    if (type(raw) not in (int, float) or not math.isfinite(raw)
+            or not 0 <= raw <= now or now - raw > .5):
+        raise ValueError("native thermal original RAW feedback expired/invalid")
+    started, ceiling = (proof[key] for key in
+                         ("deficit_started_at_monotonic_s", "deficit_ceiling_monotonic_s"))
+    hold, zero_start, zero_end = (proof[key] for key in
+                                 ("hold_sample_at_monotonic_s", "zero_read_started_at_monotonic_s",
+                                  "zero_read_completed_at_monotonic_s"))
+    if started is None:
+        if ceiling is not None or any(value is not None for value in (hold, zero_start, zero_end)) or not proof["peaks_ready"]:
+            raise ValueError("native thermal history episode/proof missing")
+        return copy.deepcopy(proof), True
+    if (any(type(value) not in (int, float) or not math.isfinite(value) for value in (started, ceiling))
+            or not 0 <= started <= now or not started < ceiling <= started + 10):
+        raise ValueError("native thermal history original recovery clock invalid")
+    if hold is None and zero_start is None and zero_end is None:
+        return copy.deepcopy(proof), False
+    if (any(type(value) not in (int, float) or not math.isfinite(value) for value in (hold, zero_start, zero_end))
+            or not 0 <= hold <= zero_start <= zero_end <= now or zero_end - zero_start > .04
+            or now - hold > .5):
+        raise ValueError("native thermal actual zero/hold proof expired/invalid")
+    return copy.deepcopy(proof), proof["peaks_ready"] and now < ceiling
+
+
+@dataclass(frozen=True)
+class PendingSample:
+    """Validated cached feedback; not a new observation, receipt or ACK."""
+
+    sample: dict
+
+
+def read_physical_sample(
+    client,
+    run_id,
+    host_incarnation,
+    previous_sequence,
+    *,
+    clock=time.monotonic,
+    allow_pending_sample=False,
+):
+    if type(allow_pending_sample) is not bool:
+        raise ValueError("pending sample opt-in requires bool")
     observation = client.get_observation()
     now = clock()
     marker = client.latest_am1_local_feedback
@@ -73,7 +144,13 @@ def read_physical_sample(client, run_id, host_incarnation, previous_sequence, *,
     if marker.get("run_id") != run_id or marker.get("host_incarnation") != host_incarnation:
         raise ValueError("foreign protected host feedback binding")
     sequence = marker.get("observation_id")
-    if type(sequence) is not int or sequence <= previous_sequence:
+    pending = type(sequence) is int and sequence == previous_sequence and allow_pending_sample
+    if (
+        type(sequence) is not int
+        or sequence < previous_sequence
+        or sequence == previous_sequence
+        and not pending
+    ):
         raise FeedbackUnavailable("native feedback acquisition did not advance")
     started, completed = marker.get("read_started_at_monotonic_s"), marker.get("acquired_at_monotonic_s")
     received, request_age = client.latest_observation_received_at, client.latest_observation_roundtrip_age_s
@@ -95,6 +172,58 @@ def read_physical_sample(client, run_id, host_incarnation, previous_sequence, *,
     positions = {key: observation.get(key) for key in JOINT_KEYS}
     if any(type(v) not in (int, float) or not math.isfinite(v) for v in positions.values()):
         raise ValueError("invalid actual arm feedback")
+    arm_feedback = marker.get("arm_feedback")
+    if arm_feedback is not None:
+        if (
+            not isinstance(arm_feedback, dict)
+            or set(arm_feedback) != {"version", "positions"}
+            or type(arm_feedback["version"]) is not int
+            or arm_feedback["version"] != 1
+            or not isinstance(arm_feedback["positions"], dict)
+            or set(arm_feedback["positions"]) != set(TELEOP_ARM_KEYS)
+        ):
+            raise ValueError("invalid twelve-joint original native feedback")
+        for key, reading in arm_feedback["positions"].items():
+            fields = {"raw", "normalized", "read_started_at_monotonic_s", "read_completed_at_monotonic_s"}
+            if not isinstance(reading, dict) or set(reading) != fields or type(reading["raw"]) is not int:
+                raise ValueError("invalid original native raw reading")
+            raw_started, raw_completed, normalized = (
+                reading["read_started_at_monotonic_s"], reading["read_completed_at_monotonic_s"], reading["normalized"]
+            )
+            if (
+                any(type(v) not in (int, float) or not math.isfinite(v) for v in (raw_started, raw_completed, normalized))
+                or not 0 <= raw_started <= raw_completed <= completed
+                or normalized != positions[key]
+            ):
+                raise ValueError("original native raw reading differs from measured feedback")
+            at = min(at, raw_started)
+        if now - at >= FEEDBACK_MAX_AGE_S:
+            raise FeedbackUnavailable("native raw feedback original acquisition expired")
+    lift_feedback = marker.get("lift_feedback")
+    if lift_feedback is not None:
+        fields = {"version", "present_velocity_raw", "height_mm", "sample_monotonic_s", "request_duration_s"}
+        if (
+            not isinstance(lift_feedback, dict) or set(lift_feedback) != fields
+            or type(lift_feedback["version"]) is not int or lift_feedback["version"] != 1
+            or type(lift_feedback["present_velocity_raw"]) is not int
+            or not {"lift_axis.vel", "lift_axis.height_mm"} <= client.latest_raw_observation_keys
+        ):
+            raise ValueError("original native lift feedback missing or malformed")
+        height, sampled, duration = (lift_feedback[key] for key in
+                                    ("height_mm", "sample_monotonic_s", "request_duration_s"))
+        if (
+            any(type(v) not in (int, float) or not math.isfinite(v) for v in (height, sampled, duration))
+            or not 0 <= duration <= sampled <= completed
+            or height != observation.get("lift_axis.height_mm")
+        ):
+            raise ValueError("original native lift feedback interval/value differs")
+        # Keep the existing sample timestamp and transaction duration. The
+        # conservative original start is never replaced by host/client receipt.
+        at = min(at, sampled - duration)
+        if now - at >= FEEDBACK_MAX_AGE_S:
+            raise FeedbackUnavailable("native lift feedback original acquisition expired")
+        observation = {**observation, "lift_axis.vel": lift_feedback["present_velocity_raw"],
+                       "_am1_lift_feedback": copy.deepcopy(lift_feedback)}
     selected = marker.get("selected_joint")
     if selected is not None:
         if (
@@ -114,12 +243,12 @@ def read_physical_sample(client, run_id, host_incarnation, previous_sequence, *,
         }
         if any(selected.get(k) != v or type(selected.get(k)) is not type(v) for k, v in fields.items()):
             raise ValueError("foreign selected native feedback binding")
-    return {
+    sample = {
         "positions": positions,
         "sequence": sequence,
         "at": at,
-        "ack": {k: v for k, v in marker.items() if k != "selected_joint"},
-        "observation": dict(observation),
+        "ack": copy.deepcopy({k: v for k, v in marker.items() if k != "selected_joint"}),
+        "observation": {**observation, **({"_am1_arm_feedback": copy.deepcopy(arm_feedback)} if arm_feedback is not None else {})},
         "body_feedback": {
             key: observation[key]
             for key in ("x.vel", "y.vel", "theta.vel", "lift_axis.vel", "lift_axis.height_mm")
@@ -133,10 +262,14 @@ def read_physical_sample(client, run_id, host_incarnation, previous_sequence, *,
             "original_request_sent_at_monotonic_s": received - request_age,
             "reply_received_at_monotonic_s": received,
             "original_request_roundtrip_age_s": request_age,
+            **({"lift_feedback": copy.deepcopy(lift_feedback)} if lift_feedback is not None else {}),
         },
         "provenance": "protected-host/measured-feedback",
         **({"selected_joint": copy.deepcopy(selected)} if selected is not None else {}),
+        **({"arm_feedback": copy.deepcopy(arm_feedback)} if arm_feedback is not None else {}),
+        **({"lift_feedback": copy.deepcopy(lift_feedback)} if lift_feedback is not None else {}),
     }
+    return PendingSample(sample) if pending else sample
 
 
 def body_recipe_action(client, elapsed):
@@ -244,8 +377,11 @@ class PhysicalExecutor:
         self._live_last_seq = -1
         self._live_admission_requested = False
         self._live_expired = None
+        self._teleop_source = None
 
     def supports(self, recipe):
+        if recipe.name == TELEOP_RECIPE:
+            return recipe.seed is None and recipe.mode == "interactive" and recipe.trajectory_s is None and recipe.live_s == 300
         return (
             (recipe.name in self.recipes or recipe.name in LIVE_ELBOW_SPECS)
             and recipe.seed is None
@@ -422,7 +558,8 @@ class PhysicalExecutor:
             ):
                 raise RuntimeError("previous physical owner is active or uncertain, or recipe unsupported")
             self.run_id, self.recipe = run_id, recipe
-            self.live_spec = LIVE_ELBOW_SPECS.get(recipe.name)
+            self.live_spec = TELEOP_SPEC if recipe.name == TELEOP_RECIPE else LIVE_ELBOW_SPECS.get(recipe.name)
+            self._teleop_source = None
             self._reconciliation_worker = None
             self.host_incarnation = __import__("uuid").uuid4().__str__()
             self.revision = 0
@@ -507,8 +644,15 @@ class PhysicalExecutor:
             return True
 
     def apply(self, target, *, valid_until_monotonic_s, intent_revision, run_id, service_incarnation,
-              controller_generation, connection_generation, host_incarnation, grant_id, seq):
+              controller_generation, connection_generation, host_incarnation, grant_id, seq, body=None, source=None,
+              classify_expiry=False):
         with self.mutex:
+            if self.recipe is not None and self.recipe.name == TELEOP_RECIPE:
+                return self._apply_teleop(target, body=body, source=source,
+                    valid_until_monotonic_s=valid_until_monotonic_s, intent_revision=intent_revision,
+                    run_id=run_id, service_incarnation=service_incarnation, controller_generation=controller_generation,
+                    connection_generation=connection_generation, host_incarnation=host_incarnation,
+                    grant_id=grant_id, seq=seq, classify_expiry=classify_expiry)
             joint = self.live_spec.joint if self.live_spec is not None else None
             if (self.recipe is None or self.live_spec is None or self.finish_status
                     or self._lifecycle["phase"] != "live" or self.desired != "active"
@@ -535,13 +679,199 @@ class PhysicalExecutor:
             self._wake.set()
             return True
 
+    def _apply_teleop(self, target, *, body, source, valid_until_monotonic_s, intent_revision,
+                      run_id, service_incarnation, controller_generation, connection_generation,
+                      host_incarnation, grant_id, seq, classify_expiry=False):
+        if (self.finish_status or self._fault is not None
+            or self._lifecycle["phase"] != "live" or self.desired != "active"
+            or run_id != self.run_id or host_incarnation != self.host_incarnation or intent_revision != self.revision
+            or self._live_binding != {"service_incarnation": service_incarnation,
+                "controller_generation": controller_generation, "connection_generation": connection_generation}
+            or type(seq) is not int or seq <= self._live_last_seq
+            or type(valid_until_monotonic_s) not in (int, float) or not math.isfinite(valid_until_monotonic_s)):
+            return False
+        try:
+            _thermal, thermal_ready = self._thermal_qualification((self.sample or {}).get("ack", {}), self.clock())
+        except ValueError:
+            return False
+        if not thermal_ready or (_thermal is not None and _thermal["deficit_started_at_monotonic_s"] is not None):
+            return False  # Only a new actual active ACK can close the held history episode.
+        checked_at = self.clock()
+        if (type(checked_at) not in (int, float) or not math.isfinite(checked_at)
+                or valid_until_monotonic_s > checked_at + .25 + 1e-9):
+            return False
+        try:
+            workspace = validate_workspace((self.sample or {}).get("ack", {}).get("live_input", {}).get("workspace"))
+            target = validate_target(target, workspace=workspace)
+            body = validate_body(body)
+            source = validate_source(source, grant_id=grant_id, previous=self._teleop_source)
+        except (KeyError, TypeError, ValueError):
+            return False
+        # Core's earlier grant check can precede evidence work or this mutex.
+        # Only a fully valid frame gets this exact nonadmission classification.
+        now = self.clock()
+        if type(now) not in (int, float) or not math.isfinite(now) or now < checked_at:
+            return False
+        if now >= valid_until_monotonic_s:
+            if classify_expiry is True:
+                raise LiveInputExpiredBeforeAdmissionError("original input grant expired before mailbox admission")
+            return False
+        self._live_target = {"target": target, "body": body, "source": source, "grant_id": grant_id, "seq": seq,
+                             "valid_until_monotonic_s": valid_until_monotonic_s}
+        self._teleop_source = copy.deepcopy(source)
+        self._live_last_seq = seq
+        self._wake.set()
+        return True
+
+    def _thermal_qualification(self, ack, now):
+        identity = (self.run_id, self.host_incarnation)
+        if "thermal_history" in ack:
+            self._thermal_history_proof_identity = identity
+        elif getattr(self, "_thermal_history_proof_identity", None) == identity:
+            raise ValueError("native thermal history proof disappeared")
+        proof, ready = thermal_history_evidence(ack, now)
+        if proof is not None and proof["deficit_started_at_monotonic_s"] is not None:
+            live = self._lifecycle.get("native_live_at")
+            started, ceiling = (proof[key] for key in
+                                ("deficit_started_at_monotonic_s", "deficit_ceiling_monotonic_s"))
+            if (type(live) not in (int, float) or not math.isfinite(live) or started < live
+                    or ceiling != min(started + 10, live + self._live_ceiling())):
+                raise ValueError("native thermal history original Live/recovery clock changed")
+        return proof, ready
+
+    def _update_polled_sample(self, polled, transient):
+        pending = isinstance(polled, PendingSample)
+        if pending:
+
+            def original_payload(value):
+                # The client ndarray is derived from the separately validated
+                # positions. Every original safety value/identity/time remains.
+                return json.dumps(
+                    {k: v for k, v in value.items() if k != "observation"},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+
+            try:
+                unchanged = (
+                    self.live_spec is TELEOP_SPEC
+                    and self.sample is not None
+                    and transient is None
+                    and original_payload(polled.sample) == original_payload(self.sample)
+                )
+            except (AttributeError, TypeError, ValueError):
+                unchanged = False
+            if not unchanged:
+                raise ValueError("pending native feedback payload changed or is not admitted")
+            # Preserve the accepted sample and any earlier real transport fault.
+            # Only advancing acquisition can clear that fault or add proof.
+        else:
+            self._transient = transient
+            if polled is not None:
+                self.sample = polled
+        advanced = not pending and polled is not None
+        thermal_ready = True
+        if self.sample is not None and self.live_spec is TELEOP_SPEC:
+            _thermal, thermal_ready = self._thermal_qualification(self.sample["ack"], self.clock())
+            if not thermal_ready:
+                self._live_target = None  # A later qualified Resume must never replay this target.
+        usable = bool(
+            thermal_ready and (pending or advanced)
+            and self.sample is not None
+            and 0 <= self.clock() - self.sample["at"] < FEEDBACK_MAX_AGE_S
+            and self._transient is None
+            and self._fault is None
+        )
+        return advanced, usable
+
+    def _retain_live_expiry(self, *, poll_control, previous_sequence, usable):
+        """Keep current expiry until Core consumes it; fence a superseded poll."""
+        sample = self.sample or {}
+        ack = sample.get("ack", {})
+        current_control = (
+            self.revision, self._epoch, tuple(sorted((self._live_binding or {}).items()))
+        )
+        if (
+            usable
+            and poll_control == current_control
+            and ack.get("run_id") == self.run_id
+            and ack.get("host_incarnation") == self.host_incarnation
+            and type(ack.get("intent_revision")) is int
+            and ack["intent_revision"] == self.revision
+            and type(ack.get("epoch")) is int
+            and ack["epoch"] == self._epoch
+            and type(sample.get("sequence")) is int
+            and sample["sequence"] > previous_sequence
+            and ack.get("live_input", {}).get("state") == "expired"
+        ):
+            self._live_expired = copy.deepcopy(ack["live_input"])
+
     def evidence(self):
         with self.mutex:
             now = self.clock()
             s = copy.deepcopy(self.sample)
             age = now - s["at"] if s else None
-            fresh = s is not None and 0 <= age < FEEDBACK_MAX_AGE_S and self._transient is None
+            fresh = (
+                s is not None
+                and 0 <= age < FEEDBACK_MAX_AGE_S
+                and self._transient is None
+                and self._fault is None
+            )
             ack = s["ack"] if s else {}
+            thermal, thermal_fault, terminal_clean = None, None, False
+            if self.live_spec is TELEOP_SPEC:
+                if self._lifecycle.get("phase") == "terminal":
+                    try:
+                        from examples.alohamini.am1_session_contract import uuid_text
+
+                        lifecycle = self._lifecycle
+                        receipt = lifecycle.get("readback")
+                        readback = receipt.get("readback") if isinstance(receipt, dict) else {}
+                        camera = lifecycle.get("camera_release") or {}
+                        release = camera.get("release_evidence") or {}
+                        terminal_clean = bool(
+                            uuid_text(self.run_id) == self.run_id
+                            and uuid_text(self.host_incarnation) == self.host_incarnation
+                            and lifecycle.get("run_id") == self.run_id
+                            and lifecycle.get("backend_incarnation") == self.host_incarnation
+                            and ack.get("run_id") == self.run_id
+                            and ack.get("host_incarnation") == self.host_incarnation
+                            and type(lifecycle.get("terminal_status")) is str
+                            and lifecycle["terminal_status"] in {"stopped", "completed", "faulted", "interrupted"}
+                            and lifecycle.get("uncertain") is False
+                            and lifecycle.get("cleanup") == "physical_readback_verified"
+                            and lifecycle.get("cleanup_errors") == []
+                            and not (self.worker and self.worker.is_alive())
+                            and not (self._reconciliation_worker and self._reconciliation_worker.thread.is_alive())
+                            and isinstance(receipt, dict) and type(receipt.get("version")) is int
+                            and "first_cause" in lifecycle and "first_cause" in receipt
+                            and (lifecycle["first_cause"] is None
+                                 or type(lifecycle["first_cause"]) is str and bool(lifecycle["first_cause"]))
+                            and receipt["first_cause"] == lifecycle["first_cause"]
+                            and isinstance(readback, dict) and readback.get("verified") is True
+                            and readback.get("buses_closed") is True and readback.get("cleanup_errors") == []
+                            and readback.get("selected_gain_restore_required") is False
+                            and qualified_cleanup_receipt(receipt, self.run_id, self.host_incarnation)
+                            and type(camera.get("version")) is int and camera["version"] == 1
+                            and camera.get("session_id") == self.run_id and camera.get("state") == "released"
+                            and camera.get("errors") == [] and camera.get("runtime_failed") is False
+                            and type(release.get("backend_returncode")) is int and release["backend_returncode"] == 0
+                            and all(release.get(k) is True for k in
+                                    ("backend_exited", "readers_joined", "viewer_socket_closed", "runtime_config_removed"))
+                        )
+                    except (AttributeError, KeyError, TypeError, ValueError):
+                        terminal_clean = False  # Incomplete or foreign cleanup retains live proof validation.
+                if terminal_clean:
+                    # The closed owner's ACK stays diagnostic, never fresh
+                    # permission or a new live thermal fault. Resident faults remain.
+                    fresh = False
+                else:
+                    try:
+                        thermal, thermal_ready = self._thermal_qualification(ack, now)
+                        fresh = fresh and thermal_ready
+                    except ValueError as error:
+                        fresh, thermal_fault = False, str(error)
             matched = (
                 fresh
                 and ack.get("run_id") == self.run_id
@@ -571,7 +901,7 @@ class PhysicalExecutor:
             return {
                 "source": self.source,
                 "feedback": bool(fresh),
-                "required_observation": o["qualified"],
+                "required_observation": o["qualified"] and not terminal_clean,
                 "optional_quality": False,
                 "optional_observation": {"required": False, "state": "not-requested", "qualified": False},
                 "pose_aligned": aligned or bool(self._dispatch_ack and active_ack),
@@ -579,7 +909,8 @@ class PhysicalExecutor:
                 "native_ack": bool(hold or active_ack or live_transition),
                 "active_acknowledged": bool(active_ack),
                 "finite_completion": copy.deepcopy(self._finite_completion),
-                "fault": self._fault,
+                "fault": self._fault or thermal_fault,
+                **({"thermal_history": thermal} if thermal is not None else {}),
                 "feedback_age_s": age,
                 "observation_age_s": o["age_s"],
                 "observation": o,
@@ -592,7 +923,7 @@ class PhysicalExecutor:
                 "host_incarnation": self.host_incarnation,
                 "lifecycle": copy.deepcopy(self._lifecycle),
                 "transport_issue": self._transient,
-                **({"live_input": copy.deepcopy(self._live_expired or ack.get("live_input", {"state": "held", "joint": self.live_spec.joint}))}
+                **({"live_input": copy.deepcopy(self._live_expired or ack.get("live_input", {"state": "held", **({} if self.live_spec is TELEOP_SPEC else {"joint": self.live_spec.joint})}))}
                    if self.live_spec is not None else {}),
                 "reconciliation": {
                     "state": self._reconciliation_worker.state,
@@ -610,6 +941,7 @@ class PhysicalExecutor:
             o = self.observation.evidence()
             if (
                 not o["qualified"]
+                or not self.evidence()["feedback"]
                 or self.sample is None
                 or self.clock() - self.sample["at"] >= FEEDBACK_MAX_AGE_S
             ):
@@ -719,6 +1051,9 @@ class PhysicalExecutor:
                         break
                     if self._lifecycle["phase"] == "startup":
                         cancel()
+                    poll_control = (
+                        self.revision, self._epoch, tuple(sorted((self._live_binding or {}).items()))
+                    )
                     if (
                         self._lifecycle["native_live_at"] is not None
                         and self.clock() >= self._lifecycle["native_live_at"] + self._live_ceiling()
@@ -735,12 +1070,9 @@ class PhysicalExecutor:
                 with self.mutex:
                     if self.finish_status:
                         break
-                    self._transient = transient
-                    if sample is not None:
-                        self.sample = sample
-                    fresh = sample is not None
+                    advanced, usable = self._update_polled_sample(sample, transient)
                     observed = self.observation.evidence()["qualified"]
-                    if not fresh or not observed:
+                    if not usable or not observed:
                         # This protection acts at native cadence even if web/database owner stalls.
                         self.desired = "hold"
                         self._dispatch_ack = False
@@ -748,10 +1080,13 @@ class PhysicalExecutor:
                         self._hold_reference = None
                         self._completion_returns = []
                     latest_ack = self.sample["ack"] if self.sample else {}
-                    if live_input and latest_ack.get("live_input", {}).get("state") == "expired":
-                        self._live_expired = copy.deepcopy(latest_ack["live_input"])
+                    if advanced and live_input:
+                        self._retain_live_expiry(
+                            poll_control=poll_control, previous_sequence=previous, usable=usable
+                        )
                     if (
-                        fresh
+                        advanced
+                        and usable
                         and self._epoch_mode == "active"
                         and latest_ack.get("state") == "paused"
                         and latest_ack.get("epoch") == self._epoch
@@ -763,12 +1098,30 @@ class PhysicalExecutor:
                         self._aligned = []
                         self._hold_reference = None
                         self._completion_returns = []
-                    desired = "active" if self.desired == "active" and fresh and observed else "pause"
+                    desired = "active" if self.desired == "active" and usable and observed else "pause"
+                    if (
+                        not advanced
+                        and desired == "active"
+                        and (self._epoch_mode != "active" or self._epoch_revision != self.revision)
+                    ):
+                        desired = "pause"  # Cached ACK cannot activate a new revision/epoch.
                     if self._epoch_mode != desired or self._epoch_revision != self.revision:
                         if desired == "pause":
-                            self._epoch = (
-                                1 if self._epoch < 0 else self._epoch + (2 if self._epoch % 2 else 1)
+                            # Revisions can coalesce before a queued pause reaches
+                            # the host. Keep its pending odd epoch until original
+                            # current feedback proves that pause was accepted.
+                            pause_acknowledged = (
+                                usable
+                                and latest_ack.get("run_id") == self.run_id
+                                and latest_ack.get("host_incarnation") == self.host_incarnation
+                                and latest_ack.get("state") == "paused"
+                                and latest_ack.get("epoch") == self._epoch
+                                and latest_ack.get("intent_revision") == self._epoch_revision
                             )
+                            if self._epoch_mode != "pause" or pause_acknowledged:
+                                self._epoch = (
+                                    1 if self._epoch < 0 else self._epoch + (2 if self._epoch % 2 else 1)
+                                )
                             self._aligned = []
                             self._hold_reference = None
                         else:
@@ -780,13 +1133,13 @@ class PhysicalExecutor:
                         self._epoch_revision = self.revision
                     ack = self.sample["ack"] if self.sample else {}
                     matched = (
-                        fresh
+                        usable
                         and ack.get("run_id") == self.run_id
                         and ack.get("host_incarnation") == self.host_incarnation
                         and ack.get("intent_revision") == self.revision
                         and ack.get("epoch") == self._epoch
                     )
-                    if matched and desired == "pause" and ack.get("state") == "paused":
+                    if advanced and matched and desired == "pause" and ack.get("state") == "paused":
                         positions = self.sample["positions"]
                         if self._hold_reference is None:
                             self._hold_reference = dict(positions)
@@ -845,17 +1198,19 @@ class PhysicalExecutor:
                             )
                             self._execution = dict(self.task.snapshot(), fault=None)
                     if live_input:
-                        self._dispatch_ack = bool(matched and ack.get("state") == "active")
+                        if advanced:
+                            self._dispatch_ack = bool(matched and ack.get("state") == "active")
                         native = copy.deepcopy(ack.get("live_input", {}))
                         self._execution = {"progress_s": 0 if self._lifecycle["native_live_at"] is None else
                             max(0, self.clock() - self._lifecycle["native_live_at"]), "complete": False,
                             "fault": self._fault, "profile": live_spec.profile, "live_input": native,
-                            "provenance": "browser-origin/protected-host/measured-feedback"}
+                            "provenance": ("leader-origin/protected-host/measured-feedback" if live_spec is TELEOP_SPEC else
+                                           "browser-origin/protected-host/measured-feedback")}
                     if self.task:
                         if desired == "pause":
                             if self.task.active:
                                 self.task.hold()
-                        elif matched and ack.get("state") == "active":
+                        elif advanced and matched and ack.get("state") == "active":
                             self._dispatch_ack = True
                             if not self.task.active:
                                 self.task.resume(self.clock())
@@ -1215,6 +1570,7 @@ class ProtectedHostRun:
             20,
             signal_name="SIGTERM",
             log=self.camera_log,
+            camera_route_discovery=True,
         )
         wait_required_camera(self.camera, self.observation, cancel)
         cancel()
@@ -1240,7 +1596,11 @@ class ProtectedHostRun:
                 env.pop(k, None)
             env["AM1_SCRIPTED_PREPARE"] = "1"
             env["AM1_SELECTED_JOINT_EVIDENCE"] = "1"
-        if recipe.name in {LEFT_ELBOW_POSITIVE_CONTROL.recipe_name, SelectedElbowExperiment.recipe_name, *LIVE_ELBOW_SPECS}:
+        if recipe.name == TELEOP_RECIPE:
+            for k in ("AM1_SYNC_SHOULDER_READBACK", "AM1_LEFT_SHOULDER_EVIDENCE"):
+                env.pop(k, None)
+            env["AM1_SCRIPTED_PREPARE"] = "1"
+        if recipe.name in {LEFT_ELBOW_POSITIVE_CONTROL.recipe_name, SelectedElbowExperiment.recipe_name, *LIVE_ELBOW_SPECS, TELEOP_RECIPE}:
             env["AM1_VISIBLE_CONTROL_RECIPE"] = recipe.name
         if recipe.name in ELBOW_RECOVERY_DEFINITIONS:
             env["AM1_ELBOW_RECOVERY"] = f"I{ELBOW_RECOVERY_DEFINITIONS[recipe.name].integral}"
@@ -1344,7 +1704,13 @@ class ProtectedHostRun:
             raise RuntimeError("protected host exited; original first cause retained in host log/receipt")
         if self.camera.poll() is not None:
             raise RuntimeError("required owned camera exited before physical finishing")
-        return read_physical_sample(self.client, self.run_id, self.incarnation, previous)
+        return read_physical_sample(
+            self.client,
+            self.run_id,
+            self.incarnation,
+            previous,
+            allow_pending_sample=self.recipe.name == TELEOP_RECIPE,
+        )
 
     def send(self, action):
         import zmq
@@ -1438,10 +1804,22 @@ class ProtectedHostRun:
 
 
 def protected_unit_command(
-    name, cwd, command, *, environment, runtime_s, stop_s, devices, signal_name="SIGINT", log_path=None
+    name,
+    cwd,
+    command,
+    *,
+    environment,
+    runtime_s,
+    stop_s,
+    devices,
+    signal_name="SIGINT",
+    log_path=None,
+    camera_route_discovery=False,
 ):
     if not 0 < runtime_s <= 920 or not 0 < stop_s <= 80 or signal_name not in ("SIGINT", "SIGTERM"):
         raise ValueError("invalid bounded owned unit limits")
+    if type(camera_route_discovery) is not bool:
+        raise ValueError("camera route discovery requires an explicit bool")
     args = [
         "systemd-run",
         "--user",
@@ -1467,7 +1845,8 @@ def protected_unit_command(
         "-p",
         "TimeoutStopSec=" + str(stop_s) + "s",
         "-p",
-        "RestrictAddressFamilies=AF_UNIX AF_INET",
+        # go2rtc needs route/interface discovery; only its camera owner opts in.
+        "RestrictAddressFamilies=AF_UNIX AF_INET" + (" AF_NETLINK" if camera_route_discovery else ""),
     ]
     if log_path:
         args.extend(["-p", "StandardOutput=append:" + log_path, "-p", "StandardError=inherit"])
@@ -1479,7 +1858,19 @@ def protected_unit_command(
 class OwnedUnit:
     """Administrative monitor of an exact finite user unit; monitor exit is never cleanup proof."""
 
-    def __init__(self, name, cwd, command, environment, runtime_s, stop_s, *, signal_name, log):
+    def __init__(
+        self,
+        name,
+        cwd,
+        command,
+        environment,
+        runtime_s,
+        stop_s,
+        *,
+        signal_name,
+        log,
+        camera_route_discovery=False,
+    ):
         import subprocess
         from pathlib import Path
 
@@ -1496,6 +1887,7 @@ class OwnedUnit:
             devices=True,
             signal_name=signal_name,
             log_path=log_path,
+            camera_route_discovery=camera_route_discovery,
         )
         self.monitor = subprocess.Popen(
             args, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
