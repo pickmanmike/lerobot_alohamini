@@ -12,8 +12,8 @@ function fixture() {
   }
   const ids={owner_generation:"owner-a",capture_generation:"capture-a",encode_generation:"encode-a"};
   const context=vm.createContext({RTCPeerConnection:Peer,MediaStream:class {},performance:{now:()=>now},
-    setInterval:()=>1,clearInterval(){},setTimeout,clearTimeout,AbortSignal,
-    fetch:async(url,options)=>{requests.push({url,...options});if(url.endsWith("/progress")&&progressResponse)return progressResponse;return {ok:true,headers:{get:name=>({
+    setInterval:()=>1,clearInterval(){},setTimeout,clearTimeout,AbortSignal,AbortController,
+    fetch:async(url,options)=>{requests.push({url,...options});if(url.endsWith("/progress")&&progressResponse)return typeof progressResponse==="function"?progressResponse(options):progressResponse;return {ok:true,headers:{get:name=>({
       "X-Camera-Owner-Generation":ids.owner_generation,"X-Camera-Capture-Generation":ids.capture_generation,
       "X-Camera-Encode-Generation":ids.encode_generation}[name]||null)},text:async()=>"v=0\r\n",json:async()=>({accepted:true})};}});
   vm.runInContext(fs.readFileSync(file,"utf8"),context);
@@ -109,9 +109,8 @@ test("loaded camera page selects WebRTC and switches roles without any control r
 });
 
 
-test("view progress consumes the bounded logical body before releasing its one in-flight slot",async()=>{
+test("view progress consumes the bounded logical body before releasing its receipt slot",async()=>{
   const p=fixture();await p.view.start("chest");p.source();
-  p.callbacks.shift()(0,{presentedFrames:1,mediaTime:.1});
   let release,read=false;
   const body=JSON.stringify({accepted:true,status:"view_progress",effect_admitted:false,
     required_view:{required:true,qualified:true,role:"chest",cause:null},view_delivery:{version:1}});
@@ -120,6 +119,7 @@ test("view progress consumes the bounded logical body before releasing its one i
   const response={ok:true,headers:{get:name=>name.toLowerCase()==="content-type"?"application/json":String(body.length)},
     text:()=>{read=true;return new Promise(resolve=>{release=()=>resolve(body);});}};
   p.setProgressResponse(response);
+  p.callbacks.shift()(0,{presentedFrames:1,mediaTime:.1});
   const pending=p.view.report();await new Promise(resolve=>setImmediate(resolve));
   assert.equal(read,true);assert.equal(p.view.reporting,true);assert.equal(p.view.progressReceipt,null);
   release();await pending;
@@ -131,11 +131,10 @@ test("view progress consumes the bounded logical body before releasing its one i
 
 for(const mode of ["refused","malformed","oversized","http-error","stale-epoch"])test("view progress receipt contrast: "+mode,async()=>{
   const p=fixture();await p.view.start("chest");p.source();
-  p.callbacks.shift()(0,{presentedFrames:1,mediaTime:.1});
   let text=mode==="malformed"?"not-json":JSON.stringify({accepted:false,reason:"decoded video has not advanced"});
   const response={ok:mode!=="http-error",headers:{get:name=>name.toLowerCase()==="content-type"?"application/json":mode==="oversized"?"8193":String(text.length)},
     text:async()=>{if(mode==="stale-epoch")await p.view.stop();return text;}};
-  p.setProgressResponse(response);await p.view.report();
+  p.setProgressResponse(response);p.callbacks.shift()(0,{presentedFrames:1,mediaTime:.1});await p.view.report();
   if(mode==="refused"){
     assert.equal(p.view.progressReceipt.accepted,false);
     assert.equal(p.view.progressReceipt.reason,"decoded video has not advanced");
@@ -382,4 +381,83 @@ for(const mode of ["source-only","presentation-stale","failed","disconnected","c
   assert.equal(stops.length,1);assert.equal(stops[0],mode==="source-unavailable"?"source-unavailable":"decoded-video-stall");
   assert.equal(starts,mode==="source-unavailable"?0:1);
  }
+});
+
+
+test("latest-only progress publishes new decoded data before an older receipt body finishes",async()=>{
+ const p=fixture(),bodies=[];await p.view.start("chest");p.source();
+ p.setProgressResponse(options=>{const frame=JSON.parse(options.body).decoded_frames;
+  const body=JSON.stringify({accepted:true,view_delivery:{frame}});
+  return {ok:true,headers:{get:name=>name.toLowerCase()==="content-type"?"application/json":String(body.length)},
+   text:()=>new Promise(resolve=>bodies.push({frame,finish:()=>resolve(body)}))};});
+ try{
+  p.callbacks.shift()(0,{presentedFrames:1,mediaTime:.1});const first=p.view.report();await new Promise(setImmediate);
+  p.advance(150);p.source();p.callbacks.shift()(150,{presentedFrames:2,mediaTime:.2});const second=p.view.report();
+  await new Promise(setImmediate);
+  assert.equal(p.requests.filter(r=>r.url.endsWith("/progress")).length,2,"receipt delivery must not block newer decoded progress");
+  assert.deepEqual(bodies.map(v=>v.frame),[1,2]);
+  bodies[1].finish();await second;assert.equal(p.view.progressReceipt.view_delivery.frame,2);
+  bodies[0].finish();await first;assert.equal(p.view.progressReceipt.view_delivery.frame,2,"late old receipt cannot replace current delivery");
+  assert.equal(p.view.health().decoded_age_ms,0);p.advance(651);p.source();assert.equal(p.view.health().fresh,false);
+ }finally{bodies.forEach(v=>v.finish());await p.view.stop();}
+});
+
+test("latest-only progress bounds two requests and aborts older delivery without queuing frames",async()=>{
+ const p=fixture(),pending=[],sent=[];let active=0,maximum=0;await p.view.start("chest");p.source();
+ p.setProgressResponse(options=>{const frame=JSON.parse(options.body).decoded_frames;sent.push(frame);active++;maximum=Math.max(maximum,active);
+  const body=JSON.stringify({accepted:true,view_delivery:{frame}});
+  return {ok:true,headers:{get:name=>name.toLowerCase()==="content-type"?"application/json":String(body.length)},
+   text:()=>new Promise((resolve,reject)=>{let done=false;const finish=error=>{if(done)return;done=true;active--;error?reject(error):resolve(body);};
+    options.signal.addEventListener("abort",()=>finish(new Error("aborted")),{once:true});pending.push(()=>finish());})};});
+ try{
+  for(const [at,frame]of [[0,1],[150,2],[300,3]]){p.advance(at);p.source();p.callbacks.shift()(at,{presentedFrames:frame,mediaTime:frame/10});void p.view.report();await new Promise(setImmediate);}
+  assert.equal(p.requests.filter(r=>r.url.endsWith("/progress")).length,2);
+  assert.equal(p.requests.find(r=>r.url.endsWith("/progress")).signal.aborted,true);
+  p.advance(450);p.source();p.callbacks.shift()(450,{presentedFrames:5,mediaTime:.5});void p.view.report();await new Promise(setImmediate);
+  assert.deepEqual(sent,[1,2,5],"the latest current capture replaces skipped frames; no FIFO replay");assert.equal(maximum,2);
+ }finally{pending.forEach(finish=>finish());await p.view.stop();}
+});
+
+test("ignored transport abort settles callers while quarantining no more than two raw requests",async()=>{
+ const p=fixture(),finish=[];await p.view.start("chest");p.source();
+ p.setProgressResponse(()=>{const body=JSON.stringify({accepted:true});return {ok:true,
+  headers:{get:name=>name.toLowerCase()==="content-type"?"application/json":String(body.length)},
+  text:()=>new Promise(resolve=>finish.push(()=>resolve(body)))};});
+ try{
+  p.callbacks.shift()(0,{presentedFrames:1,mediaTime:.1});const first=p.view.report();await new Promise(setImmediate);
+  p.advance(150);p.source();p.callbacks.shift()(150,{presentedFrames:2,mediaTime:.2});const second=p.view.report();await new Promise(setImmediate);
+  for(let frame=3;frame<=8;frame++){p.advance((frame-1)*150);p.source();p.callbacks.shift()((frame-1)*150,{presentedFrames:frame,mediaTime:frame/10});void p.view.report();await new Promise(setImmediate);}
+  await Promise.race([Promise.all([first,second]),new Promise((_,reject)=>setTimeout(()=>reject(Error("abort did not settle caller")),200))]);
+  assert.equal(p.requests.filter(r=>r.url.endsWith("/progress")).length,2,"an uncooperative transport is quarantined instead of leaking more work");
+  assert.equal(p.view.reporting,false);assert.equal(p.view.progressReceipt,null);
+ }finally{finish.forEach(resolve=>resolve());await new Promise(setImmediate);await p.view.stop();}
+});
+
+test("stopped report cannot clear a new epoch's active delivery or publish a stale receipt",async()=>{
+ const p=fixture(),finish=[];await p.view.start("chest");p.source();
+ p.setProgressResponse(options=>{const body=JSON.stringify({accepted:true,view_delivery:{role:JSON.parse(options.body).role}});return {ok:true,
+  headers:{get:name=>name.toLowerCase()==="content-type"?"application/json":String(body.length)},
+  text:()=>new Promise(resolve=>finish.push(()=>resolve(body)))};});
+ try{
+  p.callbacks.shift()(0,{presentedFrames:1,mediaTime:.1});const old=p.view.report();await new Promise(setImmediate);
+  await p.view.stop();await Promise.race([old,new Promise((_,reject)=>setTimeout(()=>reject(Error("stop did not settle old report")),200))]);await p.view.start("forward");p.source("forward");p.advance(200);
+  p.callbacks.pop()(200,{presentedFrames:1,mediaTime:.1});const current=p.view.report();await new Promise(setImmediate);
+  assert.equal(finish.length,2);assert.equal(p.view.reporting,true);
+  finish[0]();await new Promise(setImmediate);assert.equal(p.view.reporting,true);assert.equal(p.view.progressReceipt,null);
+  finish[1]();await current;assert.equal(p.view.progressReceipt.view_delivery.role,"forward");assert.equal(p.view.reporting,false);
+ }finally{finish.forEach(resolve=>resolve());await p.view.stop();}
+});
+
+test("new decode publishes promptly within cadence while an actual frozen decoder still expires",async()=>{
+ const p=fixture();await p.view.start("chest");p.source();const text=JSON.stringify({accepted:true});
+ p.setProgressResponse({ok:true,headers:{get:name=>name.toLowerCase()==="content-type"?"application/json":String(text.length)},text:async()=>text});
+ try{
+  p.callbacks.shift()(0,{presentedFrames:1,mediaTime:.1});await p.view.report();
+  p.advance(100);p.source();p.callbacks.shift()(100,{presentedFrames:2,mediaTime:.2});await p.view.report();
+  assert.equal(p.requests.filter(r=>r.url.endsWith("/progress")).length,1,"rVFC never creates a cadence burst");
+  p.advance(450);p.source();p.callbacks.shift()(450,{presentedFrames:3,mediaTime:.3});await new Promise(setImmediate);
+  assert.equal(p.requests.filter(r=>r.url.endsWith("/progress")).length,2,"a newly decoded frame gets the due opportunity immediately");
+  p.advance(951);p.source();await p.view.report();assert.equal(p.view.health().decoded_age_ms,501);assert.equal(p.view.health().fresh,false);
+  assert.equal(p.requests.filter(r=>r.url.endsWith("/progress")).length,2,"stale decoder counters cannot be published as fresh progress");
+ }finally{await p.view.stop();}
 });
