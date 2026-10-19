@@ -675,6 +675,10 @@ def test_real_wss_clean_close_ends_qualified_wait_before_timeout(tmp_path):
         "bench_renewal_during_resume",
         "bench_renewal_attach_ceiling",
         "bench_renewal_snapshot_race",
+        "bench_input_receipt_unknown",
+        "bench_input_receipt_pause",
+        "bench_input_receipt_takeover",
+        "bench_input_receipt_terminal",
     ],
 )
 def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id(
@@ -687,7 +691,9 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
     m = adapter()
     production_post = m.SessionClient.post
     initial_pause_case = failure == "initial_resume_pause"
-    bench_case = failure in {"bench_input_gap", "bench_controller_gap", "bench_renewal_during_resume", "bench_renewal_attach_ceiling", "bench_renewal_snapshot_race"}
+    bench_case = failure in {"bench_input_gap", "bench_controller_gap", "bench_renewal_during_resume", "bench_renewal_attach_ceiling", "bench_renewal_snapshot_race",
+                             "bench_input_receipt_unknown", "bench_input_receipt_pause", "bench_input_receipt_takeover", "bench_input_receipt_terminal"}
+    input_unknown = isinstance(failure, str) and failure.startswith("bench_input_receipt_")
     http_start = failure is not None and failure.startswith("http_start_")
     prelive = {
         "admission_fault",
@@ -1143,6 +1149,19 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 self.snapshot["events"] = [
                     {"kind": "input_expired", "at": 2.0, "run_id": owned_id, "service_incarnation": "service"}
                 ]
+            if failure == "bench_input_receipt_terminal" and len(self.inputs) == 1:
+                await asyncio.sleep(.005)  # Guarantees the second acquisition is terminal qualification.
+            if input_unknown and len(self.inputs) == (2 if failure == "bench_input_receipt_terminal" else 1):
+                self.snapshot["run"]["status"] = "paused"
+                self.snapshot["events"] = [{"kind": "native_input_expired", "at": 2., "run_id": owned_id,
+                                            "service_incarnation": "service"}]
+                if failure == "bench_input_receipt_pause":
+                    self.snapshot["events"][0]["kind"] = "pause"
+                    self.snapshot["run"]["control_intent"]["eligible"] = False
+                elif failure == "bench_input_receipt_takeover":
+                    self.snapshot["controller"] = {"device_id": "new-owner", "controller_generation": str(uuid4())}
+                    self.snapshot["run"]["control_intent"]["eligible"] = False
+                raise TimeoutError("input accepted; original receipt unavailable")
             return {"accepted": True}
 
         async def get(self, op):
@@ -1250,7 +1269,28 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
         args.source, args.next_start_seconds, args.duration_seconds = "virtual-leaders", None, .001
         args.bench_continuity, args.workload_segment = True, "combined"
         args.interrupt_controller = failure == "bench_controller_gap"
-        args.interrupt_at_seconds, args.interruption_seconds = (None if failure in {"bench_renewal_during_resume", "bench_renewal_attach_ceiling"} else 0.), .001
+        args.interrupt_at_seconds, args.interruption_seconds = (None if input_unknown or failure in {"bench_renewal_during_resume", "bench_renewal_attach_ceiling"} else 0.), .001
+        if input_unknown:
+            if failure in {"bench_input_receipt_unknown", "bench_input_receipt_terminal"}:
+                summary = asyncio.run(asyncio.wait_for(m.run(args), 10))
+                session = instances[0]
+                records = [json.loads(line) for line in (tmp_path / "evidence" / "frames.jsonl").read_text().splitlines()]
+                assert session.resumes == 2 and session.starts == 1 and session.stops == [owned_id]
+                assert summary["frame_count"] >= 1 and summary["cleanup_errors"] == []
+                assert [row["source"]["sample_seq"] for row in session.inputs] == list(range(1, len(session.inputs) + 1))
+                assert len({row["grant_id"] for row in session.inputs}) == len(session.inputs)
+                assert sum(row["event"] == "leader_frame_receipt_unknown" for row in records) == 1
+                assert sum(row["event"] == "bench_input_receipt_requalification" for row in records) == 1
+                assert summary["original_native_deadline"] == 301.
+                if failure == "bench_input_receipt_terminal":
+                    assert summary["frame_count"] == 1 and summary["final_body_zero"] is True
+                    assert summary["terminal_qualification_seconds"] < 2.
+            else:
+                with pytest.raises(RuntimeError):
+                    asyncio.run(asyncio.wait_for(m.run(args), 10))
+                session = instances[0]
+                assert session.starts == 1 and len(session.inputs) == 1 and session.stops == [owned_id]
+            return
         if failure == "bench_renewal_attach_ceiling":
             with pytest.raises(TimeoutError):
                 asyncio.run(asyncio.wait_for(m.run(args), 10))
@@ -1990,7 +2030,7 @@ def test_original_recovery_ceiling_includes_authenticated_read_time_without_rean
     asyncio.run(asyncio.wait_for(scenario(), 0.3))
 
 
-@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_view_reconnect", "grant_view_switch", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "held_qualification_loss", "resume_alignment_refusal", "resume_alignment_refused_twice", "runner_initial_cursor_pending", "resume_reply_timeout_pre", "resume_reply_timeout_post", "acquisition_input_pause", "receipt_ack_starvation", "ack_never_returns", "ack_close_cancel", "transport_blackout_hb1", "transport_blackout_hb2", "transport_blackout_long", "initial_ack_timely", "initial_ack_missing", "connect_receipt_fast", "connect_receipt_delayed", "connect_receipt_missing", "connect_receipt_late", "connect_receipt_caller_ceiling", "connect_receipt_input", "connect_receipt_grant", "renew_receipt_cost", "renew_receipt_cost_expired", "bench_reacquire", "bench_reacquire_receipt_lost", "bench_reacquire_receipt_cancelled"])
+@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_view_reconnect", "grant_view_switch", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "held_qualification_loss", "resume_alignment_refusal", "resume_alignment_refused_twice", "runner_initial_cursor_pending", "resume_reply_timeout_pre", "resume_reply_timeout_post", "acquisition_input_pause", "receipt_ack_starvation", "ack_never_returns", "ack_close_cancel", "transport_blackout_hb1", "transport_blackout_hb2", "transport_blackout_long", "initial_ack_timely", "initial_ack_missing", "connect_receipt_fast", "connect_receipt_delayed", "connect_receipt_missing", "connect_receipt_late", "connect_receipt_caller_ceiling", "connect_receipt_input", "connect_receipt_grant", "renew_receipt_cost", "renew_receipt_cost_expired", "bench_reacquire", "bench_reacquire_receipt_lost", "bench_reacquire_receipt_cancelled", "bench_input_receipt_unknown_native", "bench_input_receipt_unknown_pause"])
 def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(tmp_path, monkeypatch, cause):
     import asyncio
     import copy
@@ -2105,7 +2145,7 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
         gateway = Gateway(owner.directory, tmp_path / "auth")
         enrolled = gateway.auth.enroll(gateway.auth.pair(control=True))
         a.controller["device_id"] = a.connection["device_id"] = enrolled["device_id"]
-        if cause.startswith("bench_reacquire"):
+        if cause.startswith(("bench_reacquire", "bench_input_receipt_unknown")):
             a.run.update(bench_continuity=True, control_intent={"eligible": True,
                 "device_id": enrolled["device_id"], "controller_generation": ids["controller_generation"],
                 "service_incarnation": a.service_incarnation, "start_operation_id": a.run["operation_id"]})
@@ -2161,6 +2201,59 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                 monkeypatch.setattr(client.http, "ws_connect", fixture_heartbeat)
             await client.attach()
             client.generation, client.connection = ids["controller_generation"], ids["connection_generation"]
+            if cause.startswith("bench_input_receipt_unknown"):
+                guard = m.SameRunRecovery(client, record)
+                original = copy.deepcopy(guard.original)
+                await guard.resume()
+                class Input:
+                    kind = "virtual-leaders"
+                    def get_action(self):
+                        return {key.removeprefix("arm_"): 1. for key in KEYS}
+                producer = m.FrameProducer(Input())
+                producer.workspace = workspace()
+                producer.native_cursor = dict(workspace()["reference"])
+                original_call, accepted_inputs, applied_inputs = gateway.call, [], []
+                async def delayed_input(command, device):
+                    result = await original_call(command, device)
+                    if command.get("op") == "input":
+                        accepted_inputs.append(copy.deepcopy(command))
+                        applied_inputs.append(copy.deepcopy(e._live_target))
+                        if len(accepted_inputs) == 1:
+                            assert result["accepted"] is True
+                            a.clock = e.clock = lambda: 10.3
+                            a.tick()  # Original 250ms input expiry causes a real Core hold.
+                            if cause.endswith("pause"):
+                                assert a.handle({"op": "pause", "run_id": a.run["run_id"],
+                                    "operation_id": str(uuid4())}, enrolled["device_id"])["accepted"] is True
+                            await asyncio.sleep(1.2)  # Receipt only; never refresh the accepted input.
+                    return result
+                gateway.call = delayed_input
+                with pytest.raises(TimeoutError) as caught:
+                    await m.send_leader_sample(client, producer, m.ZERO_BODY, record, phase="combined", progress_s=.01)
+                assert len(accepted_inputs) == 1 and producer.sequence == 1
+                assert caught.value.input_context["source"] == accepted_inputs[0]["source"]
+                assert applied_inputs[0]["valid_until_monotonic_s"] <= 10.25
+                assert a.run["status"] == "paused" and a.run["deadline"] == 309.
+                assert any(row["event"] == "leader_frame_receipt_unknown" for row in records)
+                await client.detach()
+                await client.attach()
+                assert guard.original == original and client.generation == ids["controller_generation"]
+                if cause.endswith("pause"):
+                    with pytest.raises(m.CommandRefusedError, match="same-operation control intent cancelled"):
+                        await guard.resume()
+                    assert len(accepted_inputs) == 1 and a.run["control_intent"]["eligible"] is False
+                    return
+                await client.post("claim", {"controller_generation": client.generation})
+                await guard.resume()
+                producer.native_cursor, producer.reacquire = dict(workspace()["reference"]), True
+                sent = await m.send_leader_sample(client, producer, m.ZERO_BODY, record, phase="combined", progress_s=.01)
+                assert sent is not None and sent[2]["accepted"] is True
+                assert [row["source"]["sample_seq"] for row in accepted_inputs] == [1, 2]
+                assert accepted_inputs[0]["grant_id"] != accepted_inputs[1]["grant_id"]
+                assert applied_inputs[1]["valid_until_monotonic_s"] <= 10.55
+                assert a.run["native_live_at"] == 9. and a.run["deadline"] == 309.
+                assert guard.original == original
+                return
             if cause.startswith("bench_reacquire"):
                 guard = m.SameRunRecovery(client, record)
                 original = copy.deepcopy(guard.original)

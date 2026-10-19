@@ -736,6 +736,10 @@ class SessionClient:
             if result.get("accepted") is not True:
                 raise CommandRefusedError(result, timing=timing)
             return result
+        except (TimeoutError, ConnectionError) as error:
+            if command.get("op") == "input":
+                error.input_command_timing = dict(timing, outcome_observed_at_monotonic_s=time.perf_counter())
+            raise
         finally:
             self.pending.pop(identity, None)
             if not future.done():
@@ -2585,6 +2589,18 @@ async def send_leader_sample(client, producer, body, record, *, phase, progress_
         result = await client.command(
             dict(op="input", **identity, grant_id=grant["grant_id"], seq=client.sequence, **frame)
         )
+    except (TimeoutError, ConnectionError) as error:
+        # The input may already have reached the owner. Its target, grant and
+        # original expiry are consumed, never replayed as a recovery command.
+        if grant_context is not None:
+            error.input_context = {"identity": dict(identity), "snapshot": grant_context["snapshot"],
+                                   "requested": requested, "network_seq": client.sequence,
+                                   "source": dict(frame["source"])}
+        record({"event": "leader_frame_receipt_unknown", **attempt,
+                "error_type": type(error).__name__, "message": str(error),
+                "input_timing": getattr(error, "input_command_timing", None),
+                "discarded": True, "fresh_acquisition_allowed": False})
+        raise
     except CommandRefusedError as error:
         error.operation, error.identity = "input", dict(identity)
         record(
@@ -2953,14 +2969,37 @@ async def run(args):
             duration = args.next_start_seconds or (args.duration_seconds if workload is None else None)
             return None if duration is None or active_at is None else active_at + duration
 
-        async def rejoin(*, require_episode=False, refusal_identity=None, expected_pause=None, until=None, grant_error=None):
+        async def rejoin(*, require_episode=False, refusal_identity=None, expected_pause=None, until=None, grant_error=None,
+                         input_error=None):
             ceiling = until if until is not None else wall_deadline()
             if bench:
                 remaining = (client.snapshot or {}).get("run", {}).get("remaining_s")
                 if type(remaining) not in (int, float) or not math.isfinite(remaining) or remaining <= 0:
                     raise RuntimeError("original bench rejoin remaining clock unavailable")
                 ceiling = min(time.monotonic() + min(12., remaining), ceiling if ceiling is not None else float("inf"))
-            if bench and await ensure_authority(until=ceiling):
+            if input_error is not None:
+                context = getattr(input_error, "input_context", None)
+                if (not bench or not isinstance(context, dict)
+                    or set(context) != {"identity", "snapshot", "requested", "network_seq", "source"}
+                    or context["network_seq"] != client.sequence
+                    or type(context["requested"]) not in (int, float)
+                    or not math.isfinite(context["requested"]) or context["requested"] > time.monotonic()):
+                    raise RuntimeError("original ambiguous input context unavailable") from input_error
+                recovery.check(context["snapshot"])
+                binding = {"run_id": recovery.original["run"]["run_id"],
+                           "service_incarnation": recovery.original["service"],
+                           "host_incarnation": recovery.original["run"]["backend_incarnation"],
+                           "controller_generation": client.generation, "connection_generation": client.connection}
+                if any(context["identity"].get(k) != v for k, v in binding.items()):
+                    raise RuntimeError("original ambiguous input authority changed") from input_error
+                ceiling = min(ceiling, context["requested"] + context["snapshot"]["run"]["remaining_s"])
+                if workload:
+                    workload.freeze()
+                record({"event": "bench_input_receipt_requalification", "identity": context["identity"],
+                        "network_seq": context["network_seq"], "source": context["source"],
+                        "original_ceiling_monotonic_s": ceiling,
+                        "meaning": "discard ambiguous input; fresh attachment, held qualification and new capture"})
+            if bench and await ensure_authority(force=input_error is not None, until=ceiling):
                 require_episode, refusal_identity, expected_pause, grant_error = False, None, None, None
             renewal_healthy()
             if workload:
@@ -3156,6 +3195,9 @@ async def run(args):
                     progress_s=workload.elapsed_s if workload else None,
                 )
             except (TimeoutError, ConnectionError) as error:
+                if bench and hasattr(error, "input_context"):
+                    await rejoin(input_error=error)
+                    continue
                 if not hasattr(error, "grant_context"):
                     raise
                 await rejoin(grant_error=error)
@@ -3231,6 +3273,9 @@ async def run(args):
                         progress_s=workload.elapsed_s if workload else None,
                     )
             except TimeoutError as error:
+                if bench and hasattr(error, "input_context") and not attempt_budget.expired():
+                    await rejoin(input_error=error, until=qualification_at + 2)
+                    continue
                 if hasattr(error, "grant_context") and not attempt_budget.expired():
                     await rejoin(grant_error=error, until=qualification_at + 2)
                     continue
@@ -3240,6 +3285,9 @@ async def run(args):
                     ) from error
                 raise
             except ConnectionError as error:
+                if bench and hasattr(error, "input_context"):
+                    await rejoin(input_error=error, until=qualification_at + 2)
+                    continue
                 if not hasattr(error, "grant_context"):
                     raise
                 await rejoin(grant_error=error, until=qualification_at + 2)
