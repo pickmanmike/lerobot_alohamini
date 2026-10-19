@@ -720,7 +720,10 @@ class SessionClient:
             await self.ws.send_json({"id": identity, "command": command})
             timing["send_completed_at_monotonic_s"] = time.perf_counter()
             try:
-                result = await asyncio.wait_for(future, 1.0)
+                # A connect fence can take effect before its receipt arrives.
+                # Allow its bounded gateway call (1.5 s) to return; callers keep
+                # their original phase ceilings and input/grant waits stay 1 s.
+                result = await asyncio.wait_for(future, 2.0 if command.get("op") == "connect" else 1.0)
             except TimeoutError as error:
                 if command.get("op") == "resume":
                     # Only the actual reply future's timeout is unknown admission;

@@ -136,13 +136,13 @@ The explicit candidate correction is limited to powered AM1 live teleoperation: 
 
 ## PROCESS-01: product control is leaders, then Quest, then tasks
 
-- **Owner decision / scope:** Packet18 directs dependable leader-operated light-object manipulation and telepresence first, then Quest and concrete household autonomy. Virtual acquisition tests the shared real path; per-motor web buttons remain diagnostics.
+- **Owner decision / scope:** Packet18 directs dependable leader-operated light-object manipulation and telepresence first, then Quest and concrete household autonomy. Virtual acquisition tests the shared real path; per-motor web buttons remain diagnostics. Judge progress by usable operation, not diagnostic coverage or counts. Separate control invariants, tunable operating parameters and experiment-only scores: current run policy remains binding; a future change needs a stated purpose and evidence. [Owner refinement][p18-process].
 - **Implementation/tests/status:** [Packet16 shared input][p16], [leader adapter](../../tools/am1_leader_adapter.py), [leader-format contract tests](../../tests/robots/test_am1_live_teleop_contract.py). Virtual-source evidence cannot qualify physical USB acquisition or human ergonomics; those remain separately unverified.
 - **Reopen:** concrete task evidence changing product priorities or proving a shared-path gap. Do not substitute more per-joint menus or precision scores for the representative combined workload.
 
 ## PROCESS-02: one lean runner, focused informative checks
 
-- **Owner decision / scope:** reuse one parameterized runner and actual payload fixtures; repair schema, workspace-ID, timing and supported recovery errors offline where possible. Automate authorized finite work and inspect changed executable boundaries.
+- **Owner decision / scope:** reuse one parameterized runner and actual payload fixtures; repair schema, workspace-ID, timing and supported recovery errors offline where possible. Automate authorized finite work and inspect changed executable boundaries. Use byte-preserved evidence/configuration and declarative manifests through the existing parameterized stager, without per-run source constants or cloned helper families.
 - **Result/source:** [Packet13][p13] runner corrected delayed same-gesture continuation; [Packet14][p14] reused parameterized runner; [Packet16][p16] declares one 172.5-active-second program under a fixed 300-second ceiling. Do not rerun accepted historical checks solely to rediscover them.
 - **Implementation/tests/status:** [one adapter](../../tools/am1_leader_adapter.py) and [adapter tests](../../tests/robots/test_am1_leader_adapter.py); private bounded runners preserve actual invocation evidence. Current whole-workload result pending, historical test counts not summed or presented as fresh passes.
 - **Reopen:** a new executable boundary, failing check or unresolved material concern; ask only for an indispensable specific physical action outside existing authorization.
@@ -150,7 +150,7 @@ The explicit candidate correction is limited to powered AM1 live teleoperation: 
 ## EVIDENCE-01: retain success, first cause and limits
 
 - **Accepted / scope:** preserve legacy mapping/combined-operation qualification, simulated results, actual new-path motion and failed attempts separately. A new-mode failure does not undo old mapping qualification; old-mode success does not prove new-path parity.
-- **Sources/status:** [September acceptance][sep], [Packet14][p14], [Packet16][p16], [protected physical record](protected-physical-sessions.md). Combined14/15 remain stopped failures; exact wire bytes do not alone prove physical heat or reply causation. Known cleanup is not workload completion.
+- **Sources/status:** [September acceptance][sep], [Packet14][p14], [Packet16][p16], [protected physical record](protected-physical-sessions.md). Combined14/15 remain stopped failures; exact wire bytes do not alone prove physical heat or reply causation. Known cleanup is not workload completion. Distinguish implemented, deployed, physically demonstrated and pending; report useful movement, active/held and interruption time, views, next Start and task limits. Owner-reported external changes, including a network restart, do not establish controlled before/after causation or a percentage improvement.
 - **Reopen:** new contradictory evidence about the original claim. Preserve originals, original times and first cause; explicitly label synthetic traces and inferred explanations. Close a migration only after positive behavior and genuine-fault contrasts pass at its actual new entrypoint.
 
 ## FUTURE-01: roadmap does not describe installed equipment
@@ -169,3 +169,5 @@ The explicit candidate correction is limited to powered AM1 live teleoperation: 
 [p14]: https://github.com/pickmanmike/lerobot_alohamini/blob/2647b77c558a36f2b07f5730cf7906b4022ba868/docs/alohamini/practical-controls-14.md
 [p16]: https://github.com/pickmanmike/lerobot_alohamini/blob/2647b77c558a36f2b07f5730cf7906b4022ba868/docs/alohamini/teleop-consolidation-16.md
 [session]: https://github.com/pickmanmike/lerobot_alohamini/blob/2647b77c558a36f2b07f5730cf7906b4022ba868/docs/alohamini/roaming-resilient-sessions.md
+
+[p18-process]: https://github.com/pickmanmike/lerobot_alohamini/pull/25#issuecomment-6256276874

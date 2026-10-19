@@ -1747,7 +1747,7 @@ def test_original_recovery_ceiling_includes_authenticated_read_time_without_rean
     asyncio.run(asyncio.wait_for(scenario(), 0.3))
 
 
-@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_view_reconnect", "grant_view_switch", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "held_qualification_loss", "resume_alignment_refusal", "resume_alignment_refused_twice", "runner_initial_cursor_pending", "resume_reply_timeout_pre", "resume_reply_timeout_post", "acquisition_input_pause", "receipt_ack_starvation", "ack_never_returns", "ack_close_cancel", "transport_blackout_hb1", "transport_blackout_hb2", "transport_blackout_long", "initial_ack_timely", "initial_ack_missing"])
+@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_view_reconnect", "grant_view_switch", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "held_qualification_loss", "resume_alignment_refusal", "resume_alignment_refused_twice", "runner_initial_cursor_pending", "resume_reply_timeout_pre", "resume_reply_timeout_post", "acquisition_input_pause", "receipt_ack_starvation", "ack_never_returns", "ack_close_cancel", "transport_blackout_hb1", "transport_blackout_hb2", "transport_blackout_long", "initial_ack_timely", "initial_ack_missing", "connect_receipt_fast", "connect_receipt_delayed", "connect_receipt_missing", "connect_receipt_late", "connect_receipt_caller_ceiling", "connect_receipt_input", "connect_receipt_grant"])
 def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(tmp_path, monkeypatch, cause):
     import asyncio
     import copy
@@ -1913,6 +1913,87 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                 monkeypatch.setattr(client.http, "ws_connect", fixture_heartbeat)
             await client.attach()
             client.generation, client.connection = ids["controller_generation"], ids["connection_generation"]
+            if cause.startswith("connect_receipt_"):
+                # Hold only the correlated result after real Core processing.
+                # Snapshot/ACK traffic continues on the actual TLS connection.
+                mode = cause.removeprefix("connect_receipt_")
+                operation = mode if mode in {"input", "grant"} else "connect"
+                if operation != "connect":
+                    initial = await client.command(dict(op="connect", **client.identities()))
+                    assert initial["accepted"] is True
+                    client.connection = initial["connection_generation"]
+                    commands.clear()
+                original_call, original_send = gateway.call, client.ws.send_json
+                processed, envelopes = asyncio.Event(), []
+                old_connection = a.connection["generation"]
+                old_revision = a.run["intent_revision"]
+                result_seen = []
+
+                async def hold_result(command, device):
+                    result = await original_call(command, device)
+                    if command.get("op") == operation:
+                        result_seen.append(copy.deepcopy(result))
+                        processed.set()
+                        if mode == "missing":
+                            await unblock_release.wait()
+                        else:
+                            await asyncio.sleep(0 if mode == "fast" else 2.2 if mode == "late" else 1.2)
+                    return result
+
+                async def capture_envelope(value, **kwargs):
+                    if "command" in value:
+                        envelopes.append(copy.deepcopy(value))
+                    return await original_send(value, **kwargs)
+
+                gateway.call, client.ws.send_json = hold_result, capture_envelope
+                loop = asyncio.get_running_loop()
+                started = loop.time()
+                pending = asyncio.create_task(client.command(dict(op=operation, **client.identities())))
+                try:
+                    await asyncio.wait_for(processed.wait(), .5)
+                    assert len(envelopes) == len(result_seen) == 1
+                    assert a.run["status"] == "paused"
+                    if operation == "connect":
+                        assert result_seen[0]["accepted"] is True
+                        assert a.connection["generation"] != old_connection
+                        assert a.run["intent_revision"] == old_revision + 1
+                    else:
+                        # Invalid while held: withholding a refusal must not
+                        # lengthen ordinary input/grant result waits either.
+                        assert result_seen[0]["accepted"] is False
+                    if mode in {"fast", "delayed"}:
+                        result = await pending
+                        assert result == dict(result_seen[0], id=envelopes[0]["id"], kind="result")
+                        if mode == "delayed":
+                            assert 1.1 < loop.time() - started < 2
+                    else:
+                        with pytest.raises(TimeoutError):
+                            if mode == "caller_ceiling":
+                                await asyncio.wait_for(pending, .2)
+                            else:
+                                await pending
+                        elapsed = loop.time() - started
+                        if mode in {"input", "grant"}:
+                            assert .9 < elapsed < 1.5
+                        elif mode == "caller_ceiling":
+                            assert elapsed < .75
+                        else:
+                            assert 1.8 < elapsed < 2.6
+                        if mode == "late":
+                            await asyncio.sleep(.3)
+                    assert client.pending == {}
+                    assert len(envelopes) == 1
+                    assert commands == [(operation, "paused")]
+                    assert a.run["native_live_at"] == 9. and a.run["deadline"] == 309.
+                    assert a.run["recovery_episodes"] == 0 and a.run["first_cause"] is None
+                    assert client.generation == ids["controller_generation"]
+                    assert e._live_target is None
+                finally:
+                    unblock_release.set()
+                    if not pending.done():
+                        pending.cancel()
+                    await asyncio.gather(pending, return_exceptions=True)
+                return
             if cause in {"initial_ack_timely", "initial_ack_missing"}:
                 # Initialized real TLS client, current snapshots but no revision
                 # yet. Missing protocol evidence cannot count as local ACK credit.
