@@ -353,7 +353,7 @@ def validate_preimport_stop_origin(run, proof):
     )
 
 
-def _validate_processor_import_frames(config, frames):
+def _validate_processor_import_frames(config, frames, *, enum_source=None):
     """Bounded pre-main package discovery; never evidence of stopped hardware."""
     require(
         5 <= len(frames) <= 64
@@ -388,9 +388,9 @@ def _validate_processor_import_frames(config, frames):
             permitted = bool(relative.parts) and relative.parts[0] in {"processor", "configs", "transforms"}
         else:
             relative = path.relative_to(site) if path.is_relative_to(site) else None
-            permitted = relative is not None and len(relative.parts) >= 2 and relative.parts[0] in {
+            permitted = (relative is not None and len(relative.parts) >= 2 and relative.parts[0] in {
                 "torch", "torchvision", "sympy"
-            }
+            }) or (enum_source is not None and path == enum_source and context in {"__new__", "__set_name__"})
         require(
             permitted and path.is_absolute() and path.as_posix() == name and ".." not in path.parts
             and path.suffix == ".py" and all(not p.is_symlink() for p in (path, *path.parents))
@@ -455,6 +455,34 @@ def _load_preimport_stop_originals(config, proof):
         "one original same-run SIGINT host launch required",
     )
     lines = logs["host-runtime.log"].splitlines()
+    enum_source, handled_frames = None, []
+    if lines and lines[-1] == (
+        "Error calling __set_name__ on '_proto_member' instance 'IMAGENET1K_V1' in 'Swin_V2_S_Weights'"
+    ):
+        # Recognize the complete retained Enum exception chain, not a trimmed
+        # stderr suffix. Every handled and terminal frame is source-checked below.
+        python = Path(config["host_python"]).resolve(strict=True)
+        require(python.is_file(), "configured real interpreter required for enum import origin")
+        enum_source = python.parent.parent / "lib/python3.12/enum.py"
+        name = enum_source.as_posix()
+        prefix = [
+            "Traceback (most recent call last):",
+            f'  File "{name}", line 302, in __set_name__',
+            "    enum_member = enum_class._value2member_map_[value]",
+            "                  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^",
+            "TypeError: unhashable type: 'Weights'", "",
+            "During handling of the above exception, another exception occurred:", "",
+            "Traceback (most recent call last):",
+            f'  File "{name}", line 309, in __set_name__',
+            "    raise KeyError", "KeyError", "",
+            "During handling of the above exception, another exception occurred:", "",
+        ]
+        require(lines[:len(prefix)] == prefix, "exact original handled Weights enum chain required")
+        handled_frames = [
+            (name, 302, "__set_name__", prefix[2:4]),
+            (name, 309, "__set_name__", [prefix[10]]),
+        ]
+        lines = lines[len(prefix):-1]
     require(
         lines and lines[0] == "Traceback (most recent call last):" and lines[-1] == "KeyboardInterrupt",
         "one complete original import-cancel traceback required",
@@ -470,8 +498,21 @@ def _load_preimport_stop_originals(config, proof):
     if len(frames) > 3 and frames[3][3] and frames[3][3][0] == (
         "    from lerobot.processor import RobotAction, RobotObservation"
     ):
-        _validate_processor_import_frames(config, frames)
+        if enum_source is not None:
+            site = Path(config["host_python"]).parent.parent / "lib/python3.12/site-packages"
+            require(
+                len(frames) >= 7
+                and frames[-3] == ((site / "torchvision/models/swin_transformer.py").as_posix(), 752,
+                                   "<module>", ["    class Swin_V2_S_Weights(WeightsEnum):"])
+                and [(frame[0], frame[1], frame[2]) for frame in frames[-2:]] == [
+                    (enum_source.as_posix(), 595, "__new__"),
+                    (enum_source.as_posix(), 315, "__set_name__"),
+                ],
+                "exact original Swin weights construction in stdlib enum import required",
+            )
+        _validate_processor_import_frames(config, frames + handled_frames, enum_source=enum_source)
         return logs
+    require(enum_source is None, "enum cancellation requires the retained processor discovery chain")
     require(
         len(frames) == 11
         and [f[2] for f in frames]
