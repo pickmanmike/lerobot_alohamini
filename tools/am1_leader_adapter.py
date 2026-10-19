@@ -263,7 +263,7 @@ def _paused_binding_diagnostic(state, fresh, identity, original_event, release_l
         ("acknowledged_revision", lambda: type(evidence.get("acknowledged_intent_revision")) is not int
          or evidence["acknowledged_intent_revision"] != revision),
         ("cursor_revision", lambda: type(live.get("cursor_intent_revision")) is not int or live["cursor_intent_revision"] != revision),
-        ("required_view", lambda: live.get("required_view", {}).get("qualified") is not True),
+        ("required_view", lambda: not _view_admitted(fresh)),
         ("clock_types", lambda: any(type(v) not in (int, float) or not math.isfinite(v)
          for v in (stamp, old_stamp, current_remaining))),
         ("remaining_clock", lambda: not 0 < current_remaining <= native_remaining),
@@ -872,7 +872,26 @@ class SessionClient:
             # Include receipt time in the cadence; one overdue renewal is
             # current presence, not a burst of missed ticks or a new Claim.
             due = time.monotonic() + 0.45
-            await self.post("claim", {"controller_generation": self.generation})
+            started = time.monotonic()
+            detail = {"event": "controller_renewal", "controller_generation": self.generation,
+                      "dispatch_at_monotonic_s": started}
+            try:
+                result = await self.post("claim", {"controller_generation": self.generation})
+            except asyncio.CancelledError:
+                detail["outcome"] = "cancelled"
+                raise
+            except Exception as error:
+                detail.update(outcome="failed", error_type=type(error).__name__, message=str(error))
+                raise
+            else:
+                detail.update(outcome="accepted", presence_expires=result.get("presence_expires"),
+                              lease_seconds=result.get("lease_seconds"), service_timing=result.get("timing"))
+            finally:
+                detail["receipt_at_monotonic_s"] = time.monotonic()
+                detail["roundtrip_seconds"] = detail["receipt_at_monotonic_s"] - started
+                record = getattr(self, "record", None)
+                if record is not None:
+                    record(detail)
 
     async def resume(self, *, check=None, refusal_record=None, qualification_ceiling=None):
         if check:
@@ -943,7 +962,7 @@ class SessionClient:
                     )
                 )
                 and live.get("cursor_intent_revision") == run.get("intent_revision")
-                and live.get("required_view", {}).get("qualified") is True
+                and _view_admitted(self.snapshot)
                 and (qualified_check is None or qualified_check(self.snapshot))
             )
 
@@ -1263,6 +1282,18 @@ def _live(snapshot):
     )
 
 
+def _view_admitted(snapshot):
+    view = _live(snapshot).get("required_view") or {}
+    return (view.get("qualified") is True or
+            (snapshot.get("run") or {}).get("bench_continuity") is True and view.get("required") is False)
+
+
+async def _acquisition_delay(requested_at):
+    # Receipt cost consumes this cadence; an overdue tick acquires one NEW
+    # sample, rather than sleeping again or replaying missed samples.
+    await asyncio.sleep(max(0, requested_at + .06 - time.monotonic()))
+
+
 class SameRunRecovery:
     """Observe the existing Core episode before permitting explicit rejoin."""
 
@@ -1287,6 +1318,85 @@ class SameRunRecovery:
         self.episodes, self.completed_episodes, self.cause, self.pause_recoveries = 0, 0, None, 0
         self.connect_rebindings = 0
         self.check(state)
+
+    async def reacquire(self, *, until=None):
+        """Obtain a new generation for the persisted, still uncancelled bench task."""
+        import aiohttp
+
+        entered = time.monotonic()
+        state = (await self.client.get("state"))["snapshot"]
+        run, live = state.get("run") or {}, _live(state)
+        event = _latest_run_event(state, {"run_id": self.original["run"]["run_id"],
+                                         "service_incarnation": self.original["service"]})
+        if (run.get("bench_continuity") is not True or run.get("status") != "paused"
+            or state.get("controller") is not None or run.get("uncertain") is not False
+            or state.get("service_incarnation") != self.original["service"]
+            or any(run.get(k) != v for k, v in self.original["run"].items())
+            or live.get("reference") != self.original["reference"]
+            or live.get("workspace") != self.original["workspace"]
+            or self.client.device != self.original["controller"]["device_id"]
+            or self.client.generation != self.original["controller"]["controller_generation"]
+            or not self.history_qualified(state) or run.get("recovery") is not None
+            or run.get("native_first_cause") or state.get("evidence", {}).get("fault")
+            or event.get("kind") in {"pause", "stop", "handoff", "revoked", "released"}
+            or type(run.get("remaining_s")) not in (int, float)
+            or not math.isfinite(run["remaining_s"]) or run["remaining_s"] <= 0):
+            raise RuntimeError("same-operation reacquisition original task or intent unavailable")
+        ceiling = min(entered + min(12., run["remaining_s"]), until if until is not None else float("inf"))
+        if ceiling <= time.monotonic():
+            raise TimeoutError("original same-operation reacquisition ceiling exhausted")
+        old = self.original["controller"]["controller_generation"]
+        request = {"operation_id": str(uuid4()), "reacquire": {
+            "run_id": run["run_id"], "service_incarnation": self.original["service"],
+            "start_operation_id": self.original["run"]["operation_id"], "previous_generation": old}}
+        self.record({"event": "same_operation_reacquisition_requested", **request})
+        for attempt in range(2):
+            try:
+                result = await asyncio.wait_for(self.client.post("claim", request), max(0, ceiling - time.monotonic()))
+                break
+            except (OSError, aiohttp.ClientError, HTTPOutcomeError) as error:
+                if attempt or isinstance(error, HTTPOutcomeError) and error.non_admitted or time.monotonic() >= ceiling:
+                    raise
+                self.record({"event": "same_operation_claim_receipt_unknown", "operation_id": request["operation_id"],
+                             "error_type": type(error).__name__, "message": str(error),
+                             "meaning": "one exact operation replay; no new Claim or deadline extension"})
+        generation = result.get("controller_generation")
+        try:
+            valid = type(generation) is str and str(UUID(generation)) == generation and generation != old
+        except ValueError:
+            valid = False
+        if not valid or result.get("accepted") is not True or result.get("status") != "claimed":
+            raise RuntimeError("fresh same-operation Claim receipt unavailable")
+        for attempt in range(2):
+            try:
+                fresh = (await asyncio.wait_for(self.client.get("state"), max(0, ceiling - time.monotonic())))["snapshot"]
+                break
+            except (OSError, aiohttp.ClientError) as error:
+                if attempt or time.monotonic() >= ceiling:
+                    raise
+                self.record({"event": "same_operation_state_read_interrupted", "operation_id": request["operation_id"],
+                             "error_type": type(error).__name__, "message": str(error)})
+        current = fresh.get("controller") or {}
+        before = self.original["controller"]
+        replacement = {"device_id": self.client.device, "controller_generation": generation}
+        intent = (fresh.get("run") or {}).get("control_intent") or {}
+        expected_intent = dict(replacement, eligible=True, service_incarnation=self.original["service"],
+                               start_operation_id=self.original["run"]["operation_id"])
+        if (any(current.get(k) != v for k, v in replacement.items())
+            or any(type(intent.get(k)) is not type(v) or intent.get(k) != v for k, v in expected_intent.items())):
+            raise RuntimeError("fresh same-operation generation was superseded")
+        self.original["controller"] = replacement
+        self.client.generation = generation
+        try:
+            self.check(fresh)
+        except BaseException:
+            self.original["controller"] = before
+            self.client.generation = old
+            raise
+        self.client.snapshot, self.client.connection = fresh, None
+        self.record({"event": "same_operation_reacquired", "receipt": result,
+                     "previous_generation": old, "elapsed_seconds": time.monotonic() - entered,
+                     "snapshot": fresh})
 
     def history_qualified(self, state):
         run = state.get("run") or {}
@@ -1818,7 +1928,7 @@ class SameRunRecovery:
                         and ack.get("intent_revision") == revision
                         and ack.get("state") == "paused"
                         and live.get("cursor_intent_revision") == revision
-                        and live.get("required_view", {}).get("qualified") is True
+                        and _view_admitted(state)
                     ):
                         self.episodes, self.cause, recovered = count, cause, True
                         break
@@ -1932,7 +2042,7 @@ class SameRunRecovery:
                         return (all(evidence.get(k) is True for k in
                                     ("feedback", "required_observation", "hold_acknowledged", "pose_aligned", "native_ack"))
                                 and live.get("cursor_intent_revision") == current["run"]["intent_revision"]
-                                and live.get("required_view", {}).get("qualified") is True)
+                                and _view_admitted(current))
                     budget = min(local_ceiling, clock["held_view_ceiling"]) - time.monotonic()
                     if budget <= 0:
                         raise TimeoutError("original held qualification ceiling exhausted")
@@ -1981,7 +2091,7 @@ class SameRunRecovery:
                     if budget <= 0:
                         raise TimeoutError("original grant held/view ceiling exhausted")
                     view = live.get("required_view") or {}
-                    if view.get("qualified") is True and not waiting_view:
+                    if _view_admitted(state) and not waiting_view:
                         break  # Preserve the established already-qualified path.
                     if (set(view) != {"required", "qualified", "role", "cause"}
                         or view.get("required") is not True or type(view.get("qualified")) is not bool
@@ -2113,7 +2223,7 @@ class SameRunRecovery:
                         or ack.get("state") != "paused" or type(ack.get("intent_revision")) is not int
                         or ack["intent_revision"] != revision
                         or type(live.get("cursor_intent_revision")) is not int or live["cursor_intent_revision"] != revision
-                        or live.get("required_view", {}).get("qualified") is not True
+                        or not _view_admitted(fresh)
                         or any(type(v) not in (int, float) or not math.isfinite(v) for v in (stamp, current_remaining))
                         or not 0 < current_remaining <= accepted["native_remaining"]
                         or not run["deadline"] <= stamp + accepted["native_remaining"]
@@ -2236,7 +2346,7 @@ class SameRunRecovery:
                     or type(evidence.get("acknowledged_intent_revision")) is not int
                     or evidence["acknowledged_intent_revision"] != revision
                     or type(live.get("cursor_intent_revision")) is not int or live["cursor_intent_revision"] != revision
-                    or live.get("required_view", {}).get("qualified") is not True
+                    or not _view_admitted(fresh)
                     or any(type(v) not in (int, float) or not math.isfinite(v)
                            for v in (stamp, old_stamp, current_remaining))
                     or not 0 < current_remaining <= native_remaining
@@ -2496,6 +2606,12 @@ async def send_leader_sample(client, producer, body, record, *, phase, progress_
 async def run(args):
     from examples.alohamini.am1_teleop_workload import TeleopWorkload
 
+    bench = getattr(args, "bench_continuity", False)
+    segment = getattr(args, "workload_segment", "full")
+    controller_gap = getattr(args, "interrupt_controller", False)
+    if (bench or segment != "full") and args.source != "virtual-leaders" or controller_gap and not bench:
+        raise ValueError("predetermined virtual bench mode required")
+
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=False)
     log = (output / "frames.jsonl").open("x", encoding="utf-8")
@@ -2519,9 +2635,20 @@ async def run(args):
         "producer_program_complete": False,
         "native_execution_complete": False,
         "physical_human_movement_validated": False,
+        "bench_continuity": bench,
+        "workload_segment": segment,
+        "view_policy": "advisory_presentation" if bench else "required_presentation",
     }
+    renewal_counts = {"accepted": 0, "failed": 0, "cancelled": 0, "max_roundtrip_seconds": 0.0}
+
+    def renewal_record(value):
+        if value.get("event") == "controller_renewal":
+            renewal_counts[value["outcome"]] += 1
+            renewal_counts["max_roundtrip_seconds"] = max(renewal_counts["max_roundtrip_seconds"], value["roundtrip_seconds"])
+        record(value)
     try:
         client = SessionClient(args.url, args.ca, args.storage_state)
+        client.record = renewal_record
         # Missing/mismatched USB inputs refuse before creating a robot motor task.
         if args.source == "usb-leaders":
             source = USBLeaderSource(
@@ -2563,6 +2690,8 @@ async def run(args):
             "recipe": TELEOP_RECIPE,
             "controller_generation": client.generation,
         }
+        if bench:
+            start_body["bench_continuity"] = True
         summary.update(
             start_operation_id=start_body["operation_id"],
             start_outcome_uncertain=True,
@@ -2570,7 +2699,11 @@ async def run(args):
             start_ambiguous_attempts=[],
         )
         record(
-            {"event": "start_requested", "operation_id": start_body["operation_id"], "recipe": TELEOP_RECIPE}
+            {"event": "start_requested", "operation_id": start_body["operation_id"], "recipe": TELEOP_RECIPE,
+             "bench_continuity": bench, "view_policy": summary["view_policy"], "workload_segment": segment,
+             "program_active_seconds": {"full": 172.5, "combined": 12., "body": 4.5, "continuity": 24.}[segment],
+             "controller_interruption": controller_gap, "interruption_at_seconds": getattr(args, "interrupt_at_seconds", None),
+             "interruption_seconds": getattr(args, "interruption_seconds", .65)}
         )
 
         def start_error(error, attempt):
@@ -2800,7 +2933,7 @@ async def run(args):
         summary.update(run_id=run_id, original_native_deadline=deadline, workspace=workspace)
         record({"event": "native_admitted", "snapshot": client.snapshot})
         if args.source == "virtual-leaders":
-            workload = source = TeleopWorkload(workspace)
+            workload = source = TeleopWorkload(workspace) if segment == "full" else TeleopWorkload(workspace, segment=segment)
         producer = FrameProducer(source)
         producer.workspace = workspace
         recovery = SameRunRecovery(client, record)
@@ -2809,35 +2942,106 @@ async def run(args):
                 renewal.result()
                 raise RuntimeError("original controller renewal ended")
 
-        await recovery.resume(renewal_check=renewal_healthy)
-        producer.native_cursor = _live(client.snapshot)["cursor"]
-        if workload and not args.next_start_seconds:
-            workload.admit(time.monotonic())
-        active_at, interrupted, frame_count = time.monotonic(), False, 0
+        if not bench:
+            await recovery.resume(renewal_check=renewal_healthy)
+            producer.native_cursor = _live(client.snapshot)["cursor"]
+            if workload and not args.next_start_seconds:
+                workload.admit(time.monotonic())
+        active_at, interrupted, frame_count = (None if bench else time.monotonic()), False, 0
 
         def wall_deadline():
             duration = args.next_start_seconds or (args.duration_seconds if workload is None else None)
-            return None if duration is None else active_at + duration
+            return None if duration is None or active_at is None else active_at + duration
 
         async def rejoin(*, require_episode=False, refusal_identity=None, expected_pause=None, until=None, grant_error=None):
+            ceiling = until if until is not None else wall_deadline()
+            if bench:
+                remaining = (client.snapshot or {}).get("run", {}).get("remaining_s")
+                if type(remaining) not in (int, float) or not math.isfinite(remaining) or remaining <= 0:
+                    raise RuntimeError("original bench rejoin remaining clock unavailable")
+                ceiling = min(time.monotonic() + min(12., remaining), ceiling if ceiling is not None else float("inf"))
+            if bench and await ensure_authority(until=ceiling):
+                require_episode, refusal_identity, expected_pause, grant_error = False, None, None, None
             renewal_healthy()
             if workload:
                 workload.freeze()
-            recovered = await recovery.resume(
-                wall_deadline=until if until is not None else wall_deadline(),
-                require_episode=require_episode,
-                refusal_identity=refusal_identity,
-                expected_pause=expected_pause,
-                renewal_check=renewal_healthy, grant_error=grant_error,
-            )
+            while True:
+                try:
+                    recovered = await recovery.resume(
+                        wall_deadline=ceiling,
+                        require_episode=require_episode,
+                        refusal_identity=refusal_identity,
+                        expected_pause=expected_pause,
+                        renewal_check=renewal_healthy, grant_error=grant_error,
+                    )
+                    break
+                except Exception as error:
+                    if not bench or not renewal.done() or time.monotonic() >= ceiling:
+                        raise
+                    record({"event": "bench_rejoin_renewal_interrupted", "error_type": type(error).__name__,
+                            "message": str(error), "original_ceiling_monotonic_s": ceiling,
+                            "transport_close": getattr(client, "transport_close", None),
+                            "resume_result_context": getattr(error, "resume_result_context", None),
+                            "accepted_resume_context": getattr(error, "accepted_resume_context", None)})
+                    await ensure_authority(until=ceiling)
+                    require_episode, refusal_identity, expected_pause, grant_error = False, None, None, None
             producer.native_cursor = _live(client.snapshot)["cursor"]
             producer.reacquire = True
-            if workload and not args.next_start_seconds:
+            if workload and not args.next_start_seconds and active_at is not None:
                 workload.admit(time.monotonic())
             return recovered
 
+        async def ensure_authority(*, force=False, until=None):
+            async with asyncio.timeout_at(until):
+                return await refresh_authority(force=force, until=until)
+
+        async def refresh_authority(*, force=False, until=None):
+            nonlocal renewal
+            current = (client.snapshot or {}).get("controller") or {}
+            if not force and not renewal.done() and current.get("controller_generation") == client.generation:
+                return False
+            if not bench:
+                renewal_healthy()
+                return
+            if workload:
+                workload.freeze()
+            if not renewal.done():
+                renewal.cancel()
+            previous = await asyncio.gather(renewal, return_exceptions=True)
+            if previous and isinstance(previous[0], Exception):
+                record({"event": "controller_renewal_ended", "error_type": type(previous[0]).__name__,
+                        "message": str(previous[0])})
+            await client.detach()
+            await client.attach()
+            current = (client.snapshot or {}).get("controller") or {}
+            if current.get("controller_generation") == client.generation:
+                # A transport/receipt loss may leave current authority intact.
+                # Renew only the exact generation; never fall back to Claim.
+                recovery.check(client.snapshot, history=False)
+                event = _latest_run_event(client.snapshot, client.identities())
+                if event.get("kind") in {"pause", "stop", "handoff", "revoked", "released"}:
+                    raise RuntimeError("explicit control intent superseded automatic bench rejoin")
+                try:
+                    await client.post("claim", {"controller_generation": client.generation})
+                except HTTPOutcomeError as error:
+                    if not error.non_admitted or error.response.get("reason") != "controller renewal fence":
+                        raise
+                    record({"event": "controller_expired_during_renewal", "response": error.response})
+                    await recovery.reacquire(until=until)
+            else:
+                await recovery.reacquire(until=until)
+            renewal = asyncio.create_task(client.renew())
+            return True
+
+        if bench:
+            await rejoin()
+            if workload and not args.next_start_seconds:
+                workload.admit(time.monotonic())
+            active_at = time.monotonic()
         last_phase = None
         while True:
+            if bench and await ensure_authority():
+                await rejoin()
             if renewal.done():
                 renewal.result()
             state = client.snapshot
@@ -2890,12 +3094,16 @@ async def run(args):
                 renewal.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await renewal
-                record({"event": "controlled_input_interruption", "progress_s": workload.elapsed_s})
+                record({"event": "controlled_input_interruption", "progress_s": workload.elapsed_s,
+                        "controller_gap": controller_gap, "declared_seconds": args.interruption_seconds})
                 await client.detach()
                 await asyncio.sleep(args.interruption_seconds)
-                await client.attach()
-                await client.claim()
-                renewal = asyncio.create_task(client.renew())
+                if bench:
+                    await ensure_authority(force=True)
+                else:
+                    await client.attach()
+                    await client.claim()
+                    renewal = asyncio.create_task(client.renew())
                 await rejoin()
                 record(
                     {
@@ -2937,6 +3145,7 @@ async def run(args):
                 original_body = dict(body)
                 body.pop("lift_axis.height_mm")
                 record({"event": "body_velocity_precedence", "original": original_body, "sent": body})
+            acquisition_started = time.monotonic()
             try:
                 sent = await send_leader_sample(
                     client,
@@ -2952,6 +3161,10 @@ async def run(args):
                 await rejoin(grant_error=error)
                 continue
             except CommandRefusedError as error:
+                if bench and error.reason == "stale control generation":
+                    await ensure_authority(force=True)
+                    await rejoin()
+                    continue
                 mailbox = mailbox_input_refusal(error)
                 if not (recovery_grant_refusal(error) or mailbox):
                     raise
@@ -2961,7 +3174,7 @@ async def run(args):
             if sent is None:
                 if workload:
                     workload.freeze()
-                await asyncio.sleep(0.06)
+                await _acquisition_delay(acquisition_started)
                 if workload and not args.next_start_seconds:
                     workload.admit(time.monotonic())
                 continue  # Normal run/deadline/status/rejoin checks precede a new acquisition.
@@ -2997,7 +3210,7 @@ async def run(args):
                     break
             elif time.monotonic() - active_at >= args.duration_seconds:
                 break
-            await asyncio.sleep(0.06)
+            await _acquisition_delay(acquisition_started)
         # Qualification time is separate from active program progress. Keep new
         # acquisitions alive while actual body feedback settles; never refresh
         # one retained zero sample with another grant.
@@ -3181,6 +3394,7 @@ async def run(args):
             summary["transport_close"] = getattr(client, "transport_close", None)
         await cleanup_step("frame_log_close", lambda: asyncio.to_thread(log.close), 2.0)
         summary["cleanup_errors"] = cleanup_errors
+        summary["controller_renewal"] = renewal_counts
         if summary.get("terminal_failure") and first_error is None:
             terminal_failure = summary["terminal_failure"]
             first_error = RuntimeError(
@@ -3208,6 +3422,9 @@ def main(argv=None):
     parser.add_argument("--next-start-seconds", type=float)
     parser.add_argument("--interrupt-at-seconds", type=float)
     parser.add_argument("--interruption-seconds", type=float, default=0.65)
+    parser.add_argument("--bench-continuity", action="store_true", help="predetermined virtual bench; viewing is advisory")
+    parser.add_argument("--workload-segment", choices=("full", "combined", "body", "continuity"), default="full")
+    parser.add_argument("--interrupt-controller", action="store_true", help="declared bench gap also stops current controller renewals")
     parser.add_argument(
         "--no-keyboard", action="store_true", help="USB stationary probe/arm-only operation; body stays zero"
     )
@@ -3216,8 +3433,11 @@ def main(argv=None):
         (args.left_port, args.right_port, args.leader_id, args.calibration_dir)
     ):
         parser.error("USB requires existing explicit ports, leader ID and calibration directory")
-    if not 0 < args.duration_seconds <= 180 or not 0.3 <= args.interruption_seconds <= 2:
-        parser.error("bounded duration <=180s and interruption .3..2s required")
+    if ((args.bench_continuity or args.workload_segment != "full") and args.source != "virtual-leaders"
+        or args.interrupt_controller and not args.bench_continuity):
+        parser.error("bench continuity/controller gap requires predetermined virtual source")
+    if not 0 < args.duration_seconds <= 180 or not 0.3 <= args.interruption_seconds <= (12 if args.interrupt_controller else 2):
+        parser.error("bounded duration <=180s and selected finite interruption required")
     if args.next_start_seconds is not None and not 0 < args.next_start_seconds <= 5:
         parser.error("next Start check must be greater than zero through5s")
     print(json.dumps(asyncio.run(run(args)), sort_keys=True))

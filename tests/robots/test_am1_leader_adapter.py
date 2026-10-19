@@ -14,6 +14,172 @@ def adapter():
     return importlib.import_module(name)
 
 
+@pytest.mark.parametrize("bench,required,qualified,accepted", [
+    (False, True, False, False), (False, False, False, False),
+    (True, True, False, False), (True, False, False, True),
+    (True, False, True, True), (False, True, True, True),
+])
+def test_selected_bench_view_policy_preserves_actual_presentation(bench, required, qualified, accepted):
+    import copy
+    m = adapter()
+    state = {"run": {"bench_continuity": bench, "live_input": {
+        "required_view": {"required": required, "qualified": qualified}}}}
+    original = copy.deepcopy(state)
+    assert m._view_admitted(state) is accepted
+    assert state == original
+
+
+@pytest.mark.parametrize("invalid", [False, True])
+def test_bench_continuity_cli_selects_policy_before_start_and_bounds_controller_gap(monkeypatch, invalid):
+    m = adapter()
+    seen = []
+    async def run(args):
+        seen.append(args)
+        return {}
+    monkeypatch.setattr(m, "run", run)
+    argv = ["--source", "usb-leaders" if invalid else "virtual-leaders", "--url", "unused", "--ca", "unused",
+            "--storage-state", "unused", "--output", "unused", "--bench-continuity", "--workload-segment", "continuity",
+            "--interrupt-controller", "--interrupt-at-seconds", "6", "--interruption-seconds", "7"]
+    if invalid:
+        with pytest.raises(SystemExit):
+            m.main(argv)
+        assert seen == []
+    else:
+        m.main(argv)
+        assert seen[0].bench_continuity and seen[0].interrupt_controller
+        assert seen[0].workload_segment == "continuity" and seen[0].interruption_seconds == 7
+
+
+@pytest.mark.parametrize("boundary", ["cli", "run"])
+def test_predetermined_segment_refuses_usb_before_creating_run(monkeypatch, boundary):
+    import asyncio
+    from types import SimpleNamespace
+    m = adapter()
+    if boundary == "run":
+        with pytest.raises(ValueError, match="virtual"):
+            asyncio.run(m.run(SimpleNamespace(source="usb-leaders", workload_segment="body")))
+        return
+    async def forbidden_run(args):
+        raise AssertionError("USB segment must refuse before Start")
+    monkeypatch.setattr(m, "run", forbidden_run)
+    argv = ["--source", "usb-leaders", "--workload-segment", "body", "--url", "unused", "--ca", "unused",
+            "--storage-state", "unused", "--output", "unused", "--left-port", "unused", "--right-port", "unused",
+            "--leader-id", "unused", "--calibration-dir", "unused"]
+    with pytest.raises(SystemExit):
+        m.main(argv)
+
+
+@pytest.mark.parametrize("receipt_seconds,expected_sleep", [(0.02, 0.04), (0.24, 0.0), (0.5, 0.0)])
+def test_current_acquisition_cadence_includes_receipt_cost_without_catchup(monkeypatch, receipt_seconds, expected_sleep):
+    import asyncio
+    from types import SimpleNamespace
+    m = adapter()
+    waits = []
+    monkeypatch.setattr(m, "time", SimpleNamespace(monotonic=lambda: 10.0 + receipt_seconds))
+    async def sleep(value):
+        waits.append(value)
+    monkeypatch.setattr(m.asyncio, "sleep", sleep)
+    asyncio.run(m._acquisition_delay(10.0))
+    assert waits == pytest.approx([expected_sleep])
+
+
+def test_cancelled_inflight_renewal_is_recorded_separately_from_failure():
+    import asyncio
+    from types import SimpleNamespace
+    m = adapter()
+    async def scenario():
+        entered, records = asyncio.Event(), []
+        async def post(path, body):
+            entered.set()
+            await asyncio.Event().wait()
+        client = SimpleNamespace(generation="current", post=post, record=records.append)
+        task = asyncio.create_task(m.SessionClient.renew(client))
+        await asyncio.wait_for(entered.wait(), 1.)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert len(records) == 1 and records[0]["outcome"] == "cancelled"
+        assert records[0]["receipt_at_monotonic_s"] >= records[0]["dispatch_at_monotonic_s"]
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("mutation", [None, "refused", "generation", "service", "deadline", "reference", "pause", "terminal",
+    "receipt_lost", "qualification_read_lost", "receipt_expired", "receipt_cancelled", "receipt_superseded"])
+def test_same_operation_reacquisition_rebinds_only_fresh_fenced_authority(monkeypatch, mutation):
+    import asyncio
+    import copy
+    from types import SimpleNamespace
+    m = adapter()
+    state = recovery_state()
+    state["run"].update(bench_continuity=True, operation_id=str(uuid4()), status="paused")
+    old, fresh = str(uuid4()), str(uuid4())
+    state["run"]["control_intent"] = {"eligible": True, "device_id": "device", "controller_generation": old,
+        "service_incarnation": state["service_incarnation"], "start_operation_id": state["run"]["operation_id"]}
+    state["controller"] = {"device_id": "device", "controller_generation": old}
+    calls, records = [], []
+    reads, claims = [0], []
+    client = SimpleNamespace(snapshot=copy.deepcopy(state), device="device", generation=old, connection="old")
+    guard = m.SameRunRecovery(client, records.append)
+    anchored = copy.deepcopy(guard.original)
+    state["controller"] = None
+    if mutation == "service":
+        state["service_incarnation"] = "replacement-service"
+    if mutation == "deadline":
+        state["run"]["deadline"] += 1
+    if mutation == "reference":
+        state["run"]["live_input"]["reference"][next(iter(KEYS))] += 1
+    if mutation == "pause":
+        state["events"].append({"kind": "pause", "run_id": state["run"]["run_id"],
+                                "service_incarnation": state["service_incarnation"], "at": 10.1})
+    if mutation == "terminal":
+        state["run"]["status"] = "stopped"
+    async def get(path):
+        calls.append(("get", path))
+        reads[0] += 1
+        if mutation == "qualification_read_lost" and reads[0] == 2:
+            raise TimeoutError("fresh current-state read lost after Claim")
+        return {"snapshot": copy.deepcopy(state)}
+    async def post(path, body):
+        calls.append((path, copy.deepcopy(body)))
+        claims.append(copy.deepcopy(body))
+        if mutation == "refused":
+            raise m.HTTPOutcomeError(403, {"accepted": False, "reason": "same-operation reacquisition fence"})
+        state["controller"] = {"device_id": "device", "controller_generation": fresh, "presence_expires": 20.0}
+        state["run"]["control_intent"]["controller_generation"] = fresh
+        if isinstance(mutation, str) and mutation.startswith("receipt_"):
+            if len(claims) == 1:
+                raise TimeoutError("new Claim accepted but first receipt lost")
+            if mutation == "receipt_expired":
+                state["controller"] = None
+            elif mutation == "receipt_superseded":
+                state["controller"]["controller_generation"] = str(uuid4())
+            elif mutation == "receipt_cancelled":
+                state["run"]["control_intent"]["eligible"] = False
+                state["events"].append({"kind": "pause", "run_id": state["run"]["run_id"],
+                                        "service_incarnation": state["service_incarnation"], "at": 10.1})
+        return {"accepted": True, "status": "claimed", "controller_generation": old if mutation == "generation" else fresh,
+                "presence_expires": 20.0, "lease_seconds": 6.0}
+    client.get, client.post = get, post
+    async def scenario():
+        if mutation in {None, "receipt_lost", "qualification_read_lost"}:
+            await guard.reacquire()
+            assert client.generation == fresh and client.connection is None
+            assert guard.original == dict(anchored, controller={"device_id": "device", "controller_generation": fresh})
+            claim = next(body for path, body in calls if path == "claim")
+            assert str(uuid4()) != claim["operation_id"] and len(claim["operation_id"]) == 36
+            assert claim["reacquire"] == {
+                "run_id": anchored["run"]["run_id"], "service_incarnation": anchored["service"],
+                "start_operation_id": anchored["run"]["operation_id"], "previous_generation": old}
+            assert not any(path in {"input", "start", "resume", "connect"} for path, _ in calls)
+            if mutation == "receipt_lost":
+                assert len(claims) == 2 and claims[0] == claims[1]
+        else:
+            with pytest.raises((RuntimeError, m.HTTPOutcomeError)):
+                await guard.reacquire()
+            assert guard.original == anchored and client.generation == old
+    asyncio.run(scenario())
+
+
 def test_acquisition_follows_grant_and_expired_capture_is_never_regranted():
     m = adapter()
     clock = [20.0]
@@ -504,6 +670,11 @@ def test_real_wss_clean_close_ends_qualified_wait_before_timeout(tmp_path):
         "http_start_malformed",
         "http_start_foreign_receipt",
         "http_start_bad_runid",
+        "bench_input_gap",
+        "bench_controller_gap",
+        "bench_renewal_during_resume",
+        "bench_renewal_attach_ceiling",
+        "bench_renewal_snapshot_race",
     ],
 )
 def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id(
@@ -516,6 +687,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
     m = adapter()
     production_post = m.SessionClient.post
     initial_pause_case = failure == "initial_resume_pause"
+    bench_case = failure in {"bench_input_gap", "bench_controller_gap", "bench_renewal_during_resume", "bench_renewal_attach_ceiling", "bench_renewal_snapshot_race"}
     http_start = failure is not None and failure.startswith("http_start_")
     prelive = {
         "admission_fault",
@@ -576,9 +748,16 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
             self.recovery_reads = 0
             self.authoritative = None
             self.resumes = 0
+            self.expire_renewal = asyncio.Event()
+            self.renewals = 0
+            self.attachment_overran = False
+            self.claim_posts = 0
             instances.append(self)
 
         async def attach(self):
+            if failure == "bench_renewal_attach_ceiling" and self.starts:
+                await asyncio.sleep(.1)
+                self.attachment_overran = True
             if http_start:
                 from aiohttp import ClientSession, web
 
@@ -654,9 +833,20 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 self.http, self.csrf = ClientSession(), "existing-test-csrf"
 
         async def claim(self):
-            pass
+            if bench_case and self.starts:
+                raise RuntimeError("ordinary Claim after bench Start invalidates durable intent")
+
+        async def detach(self):
+            if bench_case:
+                self.snapshot["run"]["status"] = "paused"
+                if failure == "bench_controller_gap":
+                    self.snapshot["controller"] = None
 
         async def renew(self):
+            self.renewals += 1
+            if failure in {"bench_renewal_during_resume", "bench_renewal_attach_ceiling"} and self.renewals == 1:
+                await self.expire_renewal.wait()
+                raise m.HTTPOutcomeError(403, {"accepted": False, "reason": "controller renewal fence"})
             if failure == "renew":
                 from aiohttp import ServerDisconnectedError
 
@@ -719,6 +909,20 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
 
                     raise ServerDisconnectedError("injected Start accepted but response lost")
                 return {"accepted": True, "run_id": owned_id}
+            if bench_case and op == "claim":
+                self.claim_posts += 1
+                if failure == "bench_renewal_snapshot_race" and "controller_generation" in payload:
+                    self.snapshot["controller"] = None
+                    raise m.HTTPOutcomeError(403, {"accepted": False, "status": "refused", "effect_admitted": False,
+                                                   "reason": "controller renewal fence"})
+                if "reacquire" in payload:
+                    generation = str(uuid4())
+                    self.snapshot["controller"] = {"device_id": "device", "controller_generation": generation}
+                    self.snapshot["run"]["control_intent"]["controller_generation"] = generation
+                else:
+                    assert payload == {"controller_generation": self.generation}
+                    generation = self.generation
+                return {"accepted": True, "status": "claimed", "controller_generation": generation}
             assert op == "stop"
             self.stops.append(payload["run_id"])
             if failure == "stop":
@@ -764,6 +968,12 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 assert not predicate(), "same recipe on another run is not this accepted Start"
                 self.saw_foreign += 1
                 self.snapshot = self.state(owned_id)
+                if bench_case:
+                    self.snapshot["run"].update(bench_continuity=True, operation_id=self.start_requests[0]["operation_id"],
+                        control_intent={"eligible": True, "device_id": self.device, "controller_generation": self.generation,
+                            "service_incarnation": "service", "start_operation_id": self.start_requests[0]["operation_id"]})
+                    if failure == "bench_renewal_attach_ceiling":
+                        self.snapshot["run"]["remaining_s"] = .02
                 if failure in prelive:
                     self.snapshot["run"].update(
                         status="faulted",
@@ -778,7 +988,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
             assert predicate()
 
         def identities(self):
-            if mailbox_case or initial_pause_case:
+            if mailbox_case or initial_pause_case or bench_case:
                 return dict(run_id=owned_id, service_incarnation="service",
                             controller_generation=self.generation, connection_generation=self.connection,
                             host_incarnation="host", intent_revision=self.snapshot["run"]["intent_revision"])
@@ -786,6 +996,12 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
 
         async def resume(self, *, check=None, refusal_record=None):
             assert self.snapshot["run"]["run_id"] == owned_id
+            if failure in {"bench_renewal_during_resume", "bench_renewal_attach_ceiling"} and self.resumes == 0:
+                self.resumes += 1
+                self.snapshot["controller"] = None
+                self.snapshot["run"]["status"] = "paused"
+                self.expire_renewal.set()
+                await asyncio.sleep(0)
             if check:
                 check(self.snapshot)
             if initial_pause_case:
@@ -803,7 +1019,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 self.snapshot["run"]["status"] = "running"
                 self.snapshot["evidence"]["active_acknowledged"] = True
                 return
-            if recovery_case or ordinary_case or mailbox_case:
+            if recovery_case or ordinary_case or mailbox_case or bench_case:
                 assert self.snapshot["run"]["status"] != "recovering"
                 self.resumes += 1
                 if failure == "ordinary_pauses_no_ack" and self.resumes == 5:
@@ -1029,6 +1245,33 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
         args.duration_seconds = 0.03
     if foreign_boundary:
         args.next_start_seconds = 0.001
+    if bench_case:
+        import json
+        args.source, args.next_start_seconds, args.duration_seconds = "virtual-leaders", None, .001
+        args.bench_continuity, args.workload_segment = True, "combined"
+        args.interrupt_controller = failure == "bench_controller_gap"
+        args.interrupt_at_seconds, args.interruption_seconds = (None if failure in {"bench_renewal_during_resume", "bench_renewal_attach_ceiling"} else 0.), .001
+        if failure == "bench_renewal_attach_ceiling":
+            with pytest.raises(TimeoutError):
+                asyncio.run(asyncio.wait_for(m.run(args), 10))
+            session = instances[0]
+            assert not session.attachment_overran and session.claim_posts == 0
+            assert session.starts == 1 and session.stops == [owned_id] and session.inputs == []
+            return
+        summary = asyncio.run(asyncio.wait_for(m.run(args), 10))
+        session = instances[0]
+        records = [json.loads(line) for line in (tmp_path / "evidence" / "frames.jsonl").read_text().splitlines()]
+        assert session.starts == 1 and session.stops == [owned_id]
+        assert session.start_requests[0]["bench_continuity"] is True
+        assert summary["interrupted"] is (failure != "bench_renewal_during_resume")
+        assert summary["frame_count"] >= 1 and summary["cleanup_errors"] == []
+        assert sum(row["event"] == "same_operation_reacquired" for row in records) == int(failure != "bench_input_gap")
+        if failure == "bench_renewal_during_resume":
+            assert session.resumes == 2
+            assert any(row["event"] == "controller_renewal_ended" for row in records)
+        assert all(frame["source"]["sample_seq"] == n for n, frame in enumerate(session.inputs, 1))
+        assert summary["original_native_deadline"] == 301.
+        return
     if initial_pause_case:
         import json
 
@@ -1747,7 +1990,7 @@ def test_original_recovery_ceiling_includes_authenticated_read_time_without_rean
     asyncio.run(asyncio.wait_for(scenario(), 0.3))
 
 
-@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_view_reconnect", "grant_view_switch", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "held_qualification_loss", "resume_alignment_refusal", "resume_alignment_refused_twice", "runner_initial_cursor_pending", "resume_reply_timeout_pre", "resume_reply_timeout_post", "acquisition_input_pause", "receipt_ack_starvation", "ack_never_returns", "ack_close_cancel", "transport_blackout_hb1", "transport_blackout_hb2", "transport_blackout_long", "initial_ack_timely", "initial_ack_missing", "connect_receipt_fast", "connect_receipt_delayed", "connect_receipt_missing", "connect_receipt_late", "connect_receipt_caller_ceiling", "connect_receipt_input", "connect_receipt_grant", "renew_receipt_cost", "renew_receipt_cost_expired"])
+@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_view_reconnect", "grant_view_switch", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "held_qualification_loss", "resume_alignment_refusal", "resume_alignment_refused_twice", "runner_initial_cursor_pending", "resume_reply_timeout_pre", "resume_reply_timeout_post", "acquisition_input_pause", "receipt_ack_starvation", "ack_never_returns", "ack_close_cancel", "transport_blackout_hb1", "transport_blackout_hb2", "transport_blackout_long", "initial_ack_timely", "initial_ack_missing", "connect_receipt_fast", "connect_receipt_delayed", "connect_receipt_missing", "connect_receipt_late", "connect_receipt_caller_ceiling", "connect_receipt_input", "connect_receipt_grant", "renew_receipt_cost", "renew_receipt_cost_expired", "bench_reacquire", "bench_reacquire_receipt_lost", "bench_reacquire_receipt_cancelled"])
 def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(tmp_path, monkeypatch, cause):
     import asyncio
     import copy
@@ -1862,6 +2105,11 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
         gateway = Gateway(owner.directory, tmp_path / "auth")
         enrolled = gateway.auth.enroll(gateway.auth.pair(control=True))
         a.controller["device_id"] = a.connection["device_id"] = enrolled["device_id"]
+        if cause.startswith("bench_reacquire"):
+            a.run.update(bench_continuity=True, control_intent={"eligible": True,
+                "device_id": enrolled["device_id"], "controller_generation": ids["controller_generation"],
+                "service_incarnation": a.service_incarnation, "start_operation_id": a.run["operation_id"]})
+            a._teleop_view = None
         tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         tls.load_cert_chain(cert, key)
         runner = web.AppRunner(gateway.app, access_log=None, shutdown_timeout=1)
@@ -1913,6 +2161,60 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                 monkeypatch.setattr(client.http, "ws_connect", fixture_heartbeat)
             await client.attach()
             client.generation, client.connection = ids["controller_generation"], ids["connection_generation"]
+            if cause.startswith("bench_reacquire"):
+                guard = m.SameRunRecovery(client, record)
+                original = copy.deepcopy(guard.original)
+                a.controller["expires"] = 9.9
+                a._expire_controls(10.)
+                assert a.controller is None and a.run["status"] == "paused"
+                if cause != "bench_reacquire":
+                    original_post, claim_replays, accepted_expiry = client.post, [], []
+                    async def lose_reclaim_receipt(path, body):
+                        result = await original_post(path, body)
+                        if path == "claim" and "reacquire" in body:
+                            claim_replays.append(copy.deepcopy(body))
+                            if len(claim_replays) == 1:
+                                accepted_expiry.append(a.controller["expires"])
+                                if cause.endswith("cancelled"):
+                                    paused = a.handle({"op": "pause", "run_id": a.run["run_id"],
+                                                       "operation_id": str(uuid4())}, enrolled["device_id"])
+                                    assert paused["accepted"] is True
+                                raise ConnectionError("fresh Claim accepted but receipt connection lost")
+                        return result
+                    client.post = lose_reclaim_receipt
+                    if cause.endswith("cancelled"):
+                        with pytest.raises(RuntimeError, match="superseded"):
+                            await guard.reacquire()
+                        assert client.generation == ids["controller_generation"]
+                        assert guard.original == original and e._live_target is None
+                        assert claim_replays[0] == claim_replays[1]
+                        assert a.run["control_intent"]["eligible"] is False and a.run["status"] == "paused"
+                        return
+                await guard.reacquire()
+                if cause.endswith("receipt_lost"):
+                    assert len(claim_replays) == 2 and claim_replays[0] == claim_replays[1]
+                    assert a.controller["expires"] == accepted_expiry[0]
+                assert client.generation != ids["controller_generation"]
+                assert client.connection is None
+                assert guard.original["run"] == original["run"]
+                await guard.resume()
+                assert a.run["status"] == "running" and e.desired == "active"
+                assert a.run["deadline"] == 309. and a.run["native_live_at"] == 9.
+                class Input:
+                    kind = "virtual-leaders"
+                    def get_action(self):
+                        return {key.removeprefix("arm_"): 1. for key in KEYS}
+                producer = m.FrameProducer(Input())
+                producer.workspace = workspace()
+                producer.native_cursor = dict(workspace()["reference"])
+                sent = await m.send_leader_sample(client, producer, m.ZERO_BODY, record, phase="combined", progress_s=0.)
+                assert sent is not None and sent[2]["accepted"] is True
+                assert e._live_target["source"] == sent[1]["source"]
+                assert e._live_target["source"]["sample_seq"] == 1
+                current_view = client.snapshot["run"]["live_input"]["required_view"]
+                assert current_view["required"] is False and current_view["qualified"] is False
+                assert any(row["event"] == "same_operation_reacquired" for row in records)
+                return
             if cause.startswith("renew_receipt_cost"):
                 # Only a processed HTTP renewal's reply is delayed. The real
                 # Core lease clock advances while the PC remains present.
