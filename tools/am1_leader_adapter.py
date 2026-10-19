@@ -3324,9 +3324,21 @@ async def run(args):
                 await asyncio.sleep(min(0.03, max(0, 2 - (time.monotonic() - qualification_at))))
                 continue
             _, frame, _ = sent
-            await client.wait(
-                lambda frame=frame: native_frame_ack(client.snapshot, client.sequence, frame["source"]), 0.18
-            )
+            remaining = qualification_at + 2 - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("terminal current native body-zero feedback did not qualify")
+            try:
+                await client.wait(
+                    lambda frame=frame: native_frame_ack(client.snapshot, client.sequence, frame["source"]),
+                    min(0.18, remaining),
+                )
+            except TimeoutError:
+                recovery.check(client.snapshot, history=False)
+                record({"event": "terminal_zero_ack_pending", "network_seq": client.sequence,
+                        "source": frame["source"], "native_last_input_seq": _live(client.snapshot).get("last_input_seq"),
+                        "native_source": _live(client.snapshot).get("source"),
+                        "original_ceiling_monotonic_s": qualification_at + 2})
+                continue  # New grant/capture, exact current ACK, and the same original ceiling.
             final = client.snapshot
             record({"event": "terminal_zero_qualification", "frame": frame, "native": final})
             if native_frame_ack(final, client.sequence, frame["source"], body_zero=True):

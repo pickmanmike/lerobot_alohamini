@@ -147,7 +147,7 @@ uv run --no-sync --project C:/Users/pickm/lerobot_alohamini_client python -B -m 
   --output '<fresh-private-combined-output>'
 ```
 
-The virtual cap is active progress, with172.5s required for the complete declared program. Startup, holds, final-zero qualification and cleanup take additional wall time, within the original native ceiling. View selection/reconnection is a separate authenticated browser action; the adapter has no view-switch flag. A separate brief next Start, after supported completion and retained originals, uses:
+The virtual cap is active progress, with172.5s required for the complete declared program. Startup, holds, final-zero qualification and cleanup take additional wall time, within the original native ceiling. View selection/reconnection is a separate authenticated browser action; the adapter has no view-switch flag. A separate brief next Start, after the prior task is stopped with qualified cleanup, any uncertainty resolved, and originals retained; full-program completion is not required, uses:
 
 ```powershell
 uv run --no-sync --project C:/Users/pickm/lerobot_alohamini_client python -B -m tools.am1_leader_adapter `
