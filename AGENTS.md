@@ -60,14 +60,15 @@ references through recovery and report interrupted dwells honestly. No gain swee
 expanded travel, micro-tick gate, calibration or new telemetry/launcher framework.
 Stage45 source871598c6 is installed at motor603c4624/runtimeD632471f/MF2a115478;
 only host/selected-evidence and Core/media changed, with matched Stage44 rollback.
-Actual90 completed16 active seconds without producer holds, but actual left response
-is partial:2020→2041→2031 despite actual Goal2020→2124→2020. Calibration matches
-Packet14; poses differ. Actual91 completed28active with useful shoulder/gripper
-response, but elbow only2ticks despite actual Goal2124. Eight ordinary input holds
-recovered; required viewing remained general-purpose, not precision-grasp qualified.
-One supported18s opposite-first comparison is the next focused question, within
-unchanged2011..2124 travel/settings and other11 actual admitted holds. No speculative
-tuning or unchanged native redeploy; new PC-only source needs focused checks/review.
+Actual90/92/93 demonstrate partial directional elbow movement; Actual91 remains
+weak despite actual Goal2124. Actual93 completed20active unloaded elbow/hold/grip/
+retract,1.934deg outward/1.318deg back,18.944/18.482 gripper opening points,
+with one.867s recovery and42/42 fresh operating chest samples. Target2124 held
+5.861s while PP2059 stayed short: coarse control is achieved, full reach/fine
+positioning is not. Do not rerun an unchanged workload for publication or infer a
+gain fault from undertravel. Current PC source d3faf3a7, native871598c6/Stage45
+unchanged. Post93 interface is stopped/certain/Start+Claim enabled. Publish/review
+PR28 without automatic merge; retain current source, limitations and rollback.
 Main/AM2 remain unchanged. Do not repeat powered checks solely for publication.
 No fault-injection campaign, gains, network remediation or freshness downgrade.
 Physical USB
