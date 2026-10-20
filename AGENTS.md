@@ -49,8 +49,9 @@ real holds, one view expiry inside an existing input hold, weak left-elbow respo
 and sampled-view limitations; this is not the original172.5s strict qualification.
 Keep500ms required view,250ms native input and original ownership/deadline guards.
 The process-local msedge software-decoder option is available in the ordinary
-browser-only launcher with stable separate mode profiles; dedicated-profile live
-enrollment/use remains unqualified. It is not GPU proof or a global preference change.
+browser-only launcher with stable separate mode profiles. Dedicated-profile fresh
+enrollment now survives reload and camera-only09 verified live chest WebRTC; motor
+operation in that profile remains untested. This is not GPU proof or a global preference change.
 Next operating scope is useful left-elbow response, then a short unloaded
 reach/hold/gripper/retract under normal required usable viewing. Compare actual
 requested/mapped/accepted/servo-Goal/measured evidence, sign/units, pose, direction
