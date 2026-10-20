@@ -1861,3 +1861,67 @@ def test_bench_owner_restart_invalidates_intent_and_never_auto_reclaims(tmp_path
     finally:
         restored.run = None
         restored.close()
+
+
+@pytest.mark.parametrize("case", ["new_zero_fence", "old_role", "old_same_role_source", "late_false", "late_zero", "late_advancing", "new_advancing", "nonadvancing", "foreign_run"])
+def test_selected_view_original_floor_cannot_rollback_current_run_evidence(tmp_path, case):
+    a, e, _ = authority_lane(tmp_path)
+    a.clock = lambda: 10.2
+    current = dict(op="view_progress", run_id=e.run_id, role="chest", owner_generation="owner",
+                   capture_generation="capture-new", encode_generation="encode-new", decoded_frames=10,
+                   media_time=1., source_sequence=20, source_fresh=True, received_at_monotonic_s=10.1)
+    if case == "new_zero_fence":
+        current.update(decoded_frames=0, media_time=0., source_fresh=False)
+    try:
+        assert a._handle(current, "gateway-view")["accepted"]
+        before = copy.deepcopy(a._teleop_view)
+        late = dict(current, decoded_frames=11, media_time=1.1, source_sequence=21,
+                    received_at_monotonic_s=10.05)
+        if case in {"new_zero_fence", "old_same_role_source"}:
+            late.update(capture_generation="capture-old", encode_generation="encode-old", source_fresh=True)
+        if case == "old_role":
+            late["role"] = "wrist_right"
+        if case == "late_false":
+            late["source_fresh"] = False
+        if case == "late_zero":
+            late.update(decoded_frames=0, media_time=0.)
+        if case in {"new_advancing", "nonadvancing"}:
+            late["received_at_monotonic_s"] = 10.15
+        if case == "nonadvancing":
+            late.update(decoded_frames=current["decoded_frames"], media_time=current["media_time"])
+        if case == "foreign_run":
+            late["run_id"] = str(uuid4())
+        result = a._handle(late, "gateway-view")
+        assert result["accepted"] is (case in {"new_advancing", "nonadvancing"})
+        if case == "new_advancing":
+            assert a._teleop_view["qualified_until"] == 10.65
+        else:
+            assert a._teleop_view == before
+        if case not in {"new_advancing", "nonadvancing", "foreign_run"}:
+            assert result["reason"] == "selected-view original receipt superseded"
+            assert result["view_timing"]["core_accepted_at_monotonic_s"] is None
+            assert result["view_timing"]["original_floor_at_monotonic_s"] == 10.05
+    finally:
+        a.run = None
+        a.close()
+
+
+
+def test_selected_view_equal_floor_retains_existing_admission_without_extending_age(tmp_path):
+    a, e, _ = authority_lane(tmp_path)
+    a.clock = lambda: 10.2
+    command = dict(op="view_progress", run_id=e.run_id, role="chest", owner_generation="owner",
+                   capture_generation="capture", encode_generation="encode", decoded_frames=1,
+                   media_time=.1, source_sequence=11, source_fresh=True, received_at_monotonic_s=10.1)
+    try:
+        assert a._handle(command, "gateway-view")["accepted"]
+        # Equal floors do not establish request order; preserve existing semantics,
+        # including a current source replacement, but never manufacture younger proof.
+        result = a._handle(dict(command, encode_generation="encode-new", decoded_frames=2, media_time=.2), "gateway-view")
+        assert result["accepted"] and result["required_view"]["qualified"]
+        assert a._teleop_view["qualified_until"] == 10.6
+        assert a._handle(dict(command, encode_generation="encode-new", decoded_frames=0), "gateway-view")["accepted"]
+        assert not a._teleop_view_qualified()
+    finally:
+        a.run = None
+        a.close()

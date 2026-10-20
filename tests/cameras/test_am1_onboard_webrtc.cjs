@@ -10,12 +10,12 @@ function fixture() {
     addTransceiver(){} async createOffer(){return {type:"offer",sdp:"v=0\r\n"};}
     async setLocalDescription(value){this.localDescription=value;} async setRemoteDescription(){} close(){this.closed=true;}
   }
-  const ids={owner_generation:"owner-a",capture_generation:"capture-a",encode_generation:"encode-a"};
+  const ids={owner_generation:"owner-a",capture_generation:"capture-a",encode_generation:"encode-a",view_generation:"11111111-1111-4111-8111-111111111111"};
   const context=vm.createContext({RTCPeerConnection:Peer,MediaStream:class {},performance:{now:()=>now},
     setInterval:()=>1,clearInterval(){},setTimeout,clearTimeout,AbortSignal,AbortController,
     fetch:async(url,options)=>{requests.push({url,...options});if(url.endsWith("/progress")&&progressResponse)return typeof progressResponse==="function"?progressResponse(options):progressResponse;return {ok:true,headers:{get:name=>({
       "X-Camera-Owner-Generation":ids.owner_generation,"X-Camera-Capture-Generation":ids.capture_generation,
-      "X-Camera-Encode-Generation":ids.encode_generation}[name]||null)},text:async()=>"v=0\r\n",json:async()=>({accepted:true})};}});
+      "X-Camera-Encode-Generation":ids.encode_generation,"X-Camera-View-Generation":ids.view_generation}[name]||null)},text:async()=>"v=0\r\n",json:async()=>({accepted:true})};}});
   vm.runInContext(fs.readFileSync(file,"utf8"),context);
   const view=new context.AM1OnboardView(video,{offer:role=>"/api/onboard/webrtc/"+role,
     progress:"/api/onboard/progress",csrf:()=>"csrf",clock:()=>now});
@@ -31,7 +31,7 @@ test("a connected video and ontrack never qualify an undecoded primary view",asy
   await p.view.report();const request=p.requests.find(r=>r.url.endsWith("/progress"));
   assert.equal(request.headers["X-AM1-CSRF"],"csrf");
   assert.deepEqual(JSON.parse(request.body),{role:"chest",owner_generation:"owner-a",capture_generation:"capture-a",
-    encode_generation:"encode-a",decoded_frames:1,media_time:0});
+    encode_generation:"encode-a",view_generation:p.ids.view_generation,decoded_frames:1,media_time:0});
   await p.view.stop();
 });
 test("advancing source metadata and repeated media time cannot renew a frozen decoder",async()=>{
@@ -70,7 +70,7 @@ test("loaded camera page selects WebRTC and switches roles without any control r
       const role=request.url.split("/").at(-1);if(role!==selected){selected=role;generation=randomUUID();}
       for await(const _ of request){};
       return reply(201,"application/sdp","v=0\r\n",{"X-Camera-Owner-Generation":owner,
-        "X-Camera-Capture-Generation":captures[role],"X-Camera-Encode-Generation":generation});
+        "X-Camera-Capture-Generation":captures[role],"X-Camera-Encode-Generation":generation,"X-Camera-View-Generation":randomUUID()});
     }
     if(request.url==="/api/onboard/progress"){for await(const _ of request){};return reply(200,"application/json",'{"accepted":true}');}
     if(request.url.startsWith("/api/"))return reply(503,"text/plain","fixture thumbnail unavailable");
@@ -193,7 +193,7 @@ test("actual video keeps presented-frame proof across the ordinary primary scree
     });
     globalThis.offlineMedia={sender,stream,timer};return sender.localDescription.sdp;
    },request.postData());
-   return reply(201,"application/sdp",answer,{"X-Camera-Owner-Generation":owner,"X-Camera-Capture-Generation":capture,"X-Camera-Encode-Generation":encode});
+   return reply(201,"application/sdp",answer,{"X-Camera-Owner-Generation":owner,"X-Camera-Capture-Generation":capture,"X-Camera-Encode-Generation":encode,"X-Camera-View-Generation":require("node:crypto").randomUUID()});
   }
   if(url.pathname==="/api/onboard/progress")return reply(200,"application/json",'{"accepted":true}');
   if(url.pathname.startsWith("/api/"))return reply(503,"text/plain","offline unassigned source");
@@ -318,7 +318,7 @@ test("actual video separates delayed source publication from explicit stale reof
      });return sender.localDescription.sdp;
     },request.postData());
     offers.push({at,answered_at:await page.evaluate(()=>performance.now())});
-    return reply(201,"application/sdp",answer,{"X-Camera-Owner-Generation":"offline-owner","X-Camera-Capture-Generation":"offline-capture","X-Camera-Encode-Generation":"offline-encode"});
+    return reply(201,"application/sdp",answer,{"X-Camera-Owner-Generation":"offline-owner","X-Camera-Capture-Generation":"offline-capture","X-Camera-Encode-Generation":"offline-encode","X-Camera-View-Generation":require("node:crypto").randomUUID()});
    }
    // No Core/native owner exists in this fixture. Local player health is not an ACK.
    if(url.pathname==="/api/onboard/progress")return reply(200,"application/json",'{"accepted":false,"reason":"offline loopback has no native owner"}');
@@ -477,5 +477,37 @@ test("fresh decoded progress is published despite an aged browser source-status 
   assert.equal(p.view.health().decoded_age_ms,0);assert.equal(p.view.health().source_age_ms,600);
   assert.equal(p.view.health().source_fresh,false);assert.equal(p.view.health().fresh,false);
   assert.equal(p.view.progressReceipt.accepted,false,"the independent server refusal stays truthful");
+ }finally{await p.view.stop();}
+});
+
+
+for(const token of [null,"not-a-uuid"])test("view attachment requires a current issued SDP token: "+token,async()=>{
+ const p=fixture();p.ids.view_generation=token;
+ try{await assert.rejects(p.view.start("chest"),/view attachment/i);
+  assert.equal(p.view.binding,null);assert.equal(p.requests.filter(r=>r.url.endsWith("/progress")).length,0);
+ }finally{await p.view.stop();}
+});
+
+test("a receipt from a replaced same-source attachment cannot update the current binding",async()=>{
+ const p=fixture();await p.view.start("chest");p.source();let finish;
+ const text=JSON.stringify({accepted:true});
+ p.setProgressResponse({ok:true,headers:{get:name=>name.toLowerCase()==="content-type"?"application/json":String(text.length)},
+  text:()=>new Promise(resolve=>{finish=()=>resolve(text);})});
+ try{
+  p.callbacks.shift()(0,{presentedFrames:1,mediaTime:.1});const receipt=p.view.report();await new Promise(setImmediate);
+  const sent=JSON.parse(p.requests.find(r=>r.url.endsWith("/progress")).body);
+  assert.equal(sent.view_generation,p.ids.view_generation);
+  p.view.binding={...p.view.binding,view_generation:"22222222-2222-4222-8222-222222222222"};
+  finish();await receipt;assert.equal(p.view.progressReceipt,null);
+ }finally{finish?.();await p.view.stop();}
+});
+
+
+test("standalone WebRTC without progress remains usable without an attachment header",async()=>{
+ const p=fixture();p.view.options.progress=null;p.ids.view_generation=null;
+ try{
+  await p.view.start("chest");p.source();p.callbacks.shift()(0,{presentedFrames:1,mediaTime:.1});
+  assert.equal(p.view.health().fresh,true);assert.equal(p.view.health().decoded_frames,1);
+  assert.equal(p.requests.filter(r=>r.url.endsWith("/progress")).length,0);
  }finally{await p.view.stop();}
 });

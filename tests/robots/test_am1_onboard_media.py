@@ -168,11 +168,14 @@ def test_proxy_uses_actual_source_identity_and_original_arrival_for_decode_progr
         try:
             result = await proxy.offer("chest", b"v=0\r\n", "viewer-a")
             assert result[0] == 201 and result[1] == b"v=0\r\n"
+            token = result[2]["X-Camera-View-Generation"]
+            assert str(uuid.UUID(token)) == token
             body = {
                 "role": "chest",
                 "owner_generation": ids[0],
                 "capture_generation": ids[1],
                 "encode_generation": ids[2],
+                "view_generation": token,
                 "decoded_frames": 3,
                 "media_time": 0.3,
             }
@@ -189,6 +192,17 @@ def test_proxy_uses_actual_source_identity_and_original_arrival_for_decode_progr
                     now,
                 )
             )["accepted"] is False
+            before = len(received)
+            for changed in ({"view_generation": str(uuid.uuid4())}, {"role": "wrist_right"}):
+                assert not (await proxy.progress("viewer-a", {**body, **changed}, now))["accepted"]
+            with pytest.raises(web.HTTPBadRequest):
+                await proxy.progress("viewer-a", {key: value for key, value in body.items() if key != "view_generation"}, now)
+            assert len(received) == before
+            with pytest.raises(web.HTTPTooManyRequests):
+                await proxy.offer("chest", b"v=0\r\n", "viewer-a")
+            await proxy.offer("chest", b"v=0\r\n", "viewer-b")
+            with pytest.raises(web.HTTPTooManyRequests):
+                await proxy.offer("chest", b"v=0\r\n", "viewer-c")
             status["cameras"]["chest"]["state"] = "stale"
             assert (await proxy.progress("viewer-a", {**body, "decoded_frames": 5, "media_time": 0.5}, now))[
                 "accepted"
@@ -311,7 +325,8 @@ def test_selected_view_progress_entrypoint_records_real_phase_times_without_rene
     monkeypatch.setattr(service.time, "monotonic", lambda: clock.now)
     proxy = object.__new__(module().OnboardMediaProxy)
     proxy.clock, proxy.web = lambda: clock.now, web
-    proxy.viewers = {"viewer-a": {"frames": 0, "media_time": -1}}
+    proxy.viewers = {"viewer-a": {"frames": 0, "media_time": -1, "ready": True, "role": "chest",
+                                  "view_generation": "11111111-1111-4111-8111-111111111111"}}
     report = {"owner_generation": "owner", "cameras": {"chest": {
         "state": "stale" if case == "stale" else "fresh", "configured": True, "sequence": 11,
         "capture_generation": "capture", "arrived_at_monotonic_s": 9.98}},
@@ -335,7 +350,8 @@ def test_selected_view_progress_entrypoint_records_real_phase_times_without_rene
     gateway = object.__new__(service.Gateway)
     gateway.onboard = proxy
     body = dict(role="chest", owner_generation="owner", capture_generation="capture",
-                encode_generation="foreign" if case == "foreign" else "encode", decoded_frames=3, media_time=.3)
+                encode_generation="foreign" if case == "foreign" else "encode",
+                view_generation=proxy.viewers["viewer-a"]["view_generation"], decoded_frames=3, media_time=.3)
     class Request(dict):
         path = "/api/onboard/progress"
         async def read(self):
@@ -441,3 +457,226 @@ def test_shared_feeder_keeps_declared_clock_without_write_cost_drift_or_catchup(
     assert encoder.frames == len(costs) and encoder.sequence == delivered[-1]
     assert encoder.dropped == delivered[-1] - delivered[0] + 1 - len(delivered)
     assert encoder.failure is None and encoder.write_started is None
+
+
+@pytest.mark.parametrize("same_role", [False, True])
+@pytest.mark.parametrize("new_progress", [False, True])
+@pytest.mark.parametrize("old_fresh", [False, True])
+def test_canceled_progress_server_work_cannot_replace_newer_offer_or_progress(tmp_path, monkeypatch, same_role, new_progress, old_fresh):
+    """Real Gateway/proxy/Core order; only upstream media and IPC waiting are simulated."""
+    import copy
+    from types import SimpleNamespace
+
+    from tests.robots.test_am1_live_teleop_executor import authority_lane
+    from tools import am1_session_service as service
+
+    a, e, _ = authority_lane(tmp_path)
+    clock = SimpleNamespace(now=10.)
+    a.clock = lambda: clock.now
+    monkeypatch.setattr(service.time, "monotonic", lambda: clock.now)
+    proxy = object.__new__(module().OnboardMediaProxy)
+    proxy.clock, proxy.web = lambda: clock.now, web
+    proxy.viewers = {"viewer-a": {"frames": 0, "media_time": -1, "at": 9., "offered_at": 8.,
+                                  "ready": True, "role": "chest", "view_generation": "11111111-1111-4111-8111-111111111111"}}
+    old_report = {"owner_generation": "owner", "cameras": {"chest": {
+        "state": "fresh" if old_fresh else "stale", "configured": True, "sequence": 11,
+        "capture_generation": "capture-old", "arrived_at_monotonic_s": 9.98}},
+        "video": {"role": "chest", "encode_generation": "encode-old", "capture_generation": "capture-old", "state": "running"}}
+    current_report = [old_report]
+    async def status():
+        return current_report[0]
+    proxy.status = status
+    async def upstream(*args, **kwargs):
+        return 201, b"v=0\r\n", {"Content-Type": "application/sdp"}
+    proxy.upstream = upstream
+    gateway = object.__new__(service.Gateway)
+    gateway.onboard = proxy
+    class Request(dict):
+        method = "POST"
+        def __init__(self, path, body, role=None):
+            super().__init__(device={"id": "viewer-a"})
+            self.path, self.content, self.match_info = path, body, {"role": role}
+        async def read(self):
+            return self.content
+    async def scenario():
+        blocked, release = asyncio.Event(), asyncio.Event()
+        proxy.offer_lock = asyncio.Lock()
+        class IPC:
+            async def request(self, command, device):
+                if command["op"] == "snapshot":
+                    return {"snapshot": {"run": {"run_id": e.run_id, "recipe": "physical-live-teleop"}}}
+                if command["encode_generation"] == "encode-old":
+                    blocked.set()
+                    await release.wait()
+                with a.mutex:
+                    return a._handle(command, device)
+        proxy.ipc = IPC()
+        old_body = {"role": "chest", "owner_generation": "owner", "capture_generation": "capture-old",
+                    "encode_generation": "encode-old", "view_generation": proxy.viewers["viewer-a"]["view_generation"],
+                    "decoded_frames": 3, "media_time": .3}
+        server_work = asyncio.create_task(gateway.onboard_request(Request("/api/onboard/progress", json.dumps(old_body).encode())))
+        async def browser_wait():
+            return await asyncio.shield(server_work)
+        browser = asyncio.create_task(browser_wait())
+        try:
+            await asyncio.wait_for(blocked.wait(), 1)
+            browser.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await browser
+            assert not server_work.done()  # A canceled browser receipt is not server cancellation.
+            clock.now = 10.1
+            role = "chest" if same_role else "wrist_right"
+            report = {"owner_generation": "owner", "cameras": {role: {
+                "state": "fresh", "configured": True, "sequence": 20,
+                "capture_generation": "capture-new", "arrived_at_monotonic_s": 10.09}},
+                "video": {"role": role, "encode_generation": "encode-new", "capture_generation": "capture-new", "state": "running"}}
+            current_report[0] = report
+            offered = await gateway.onboard_request(Request("/api/onboard/webrtc/" + role, b"v=0\r\n", role))
+            assert offered.status == 201 and a._teleop_view["decoded_frames"] == 0
+            assert not a._teleop_view_qualified()
+            if new_progress:
+                clock.now = 10.15
+                report["cameras"][role].update(sequence=21, arrived_at_monotonic_s=10.14)
+                body = {"role": role, "owner_generation": "owner", "capture_generation": "capture-new",
+                        "encode_generation": "encode-new", "view_generation": offered.headers["X-Camera-View-Generation"],
+                        "decoded_frames": 1, "media_time": .1}
+                result = json.loads((await gateway.onboard_request(Request("/api/onboard/progress", json.dumps(body).encode()))).body)
+                assert result["accepted"] and result["required_view"]["qualified"]
+            before = copy.deepcopy(a._teleop_view)
+            clock.now = 10.18
+            release.set()
+            result = json.loads((await asyncio.wait_for(server_work, 1)).body)
+            assert not result["accepted"]
+            assert result["view_delivery"]["owner_result"]["reason"] == "selected-view original receipt superseded"
+            assert result["view_delivery"]["core"]["core_accepted_at_monotonic_s"] is None
+            assert a._teleop_view == before and a._teleop_view["role"] == role
+            assert a._teleop_view["qualified_until"] == (10.64 if new_progress else 0.)
+        finally:
+            release.set()
+            await asyncio.gather(server_work, return_exceptions=True)
+    try:
+        asyncio.run(scenario())
+    finally:
+        a.run = None
+        a.close()
+
+
+@pytest.mark.parametrize("stage", ["offer_status", "offer_upstream", "after_complete", "progress_status", "failed_offer"])
+@pytest.mark.parametrize("same_role", [False, True])
+def test_view_attachment_retires_old_reports_before_offer_work_and_after_same_source_reconnect(tmp_path, monkeypatch, stage, same_role):
+    """Real Gateway/proxy/Core; a new offer retires old browser work before any await."""
+    import copy
+    from types import SimpleNamespace
+
+    from tests.robots.test_am1_live_teleop_executor import authority_lane
+    from tools import am1_session_service as service
+
+    a, e, _ = authority_lane(tmp_path)
+    clock = SimpleNamespace(now=10.)
+    a.clock = lambda: clock.now
+    monkeypatch.setattr(service.time, "monotonic", lambda: clock.now)
+    proxy = object.__new__(module().OnboardMediaProxy)
+    proxy.clock, proxy.web = lambda: clock.now, web
+    proxy.viewers = {"viewer-a": {"frames": 0, "media_time": -1, "at": 9., "offered_at": 8.,
+                                  "ready": True, "role": "chest", "view_generation": "11111111-1111-4111-8111-111111111111"}}
+    report = {"owner_generation": "owner", "cameras": {role: {
+        "state": "fresh", "configured": True, "sequence": 11,
+        "capture_generation": "capture", "arrived_at_monotonic_s": 9.98}
+        for role in ("chest", "wrist_right")},
+        "video": {"role": "chest", "encode_generation": "encode", "capture_generation": "capture", "state": "running"}}
+    gateway = object.__new__(service.Gateway)
+    gateway.onboard = proxy
+    class Request(dict):
+        method = "POST"
+        def __init__(self, path, body, role=None):
+            super().__init__(device={"id": "viewer-a"})
+            self.path, self.content, self.match_info = path, body, {"role": role}
+        async def read(self):
+            return self.content
+    async def scenario():
+        blocked, release = asyncio.Event(), asyncio.Event()
+        proxy.offer_lock = asyncio.Lock()
+        commands = []
+        class IPC:
+            async def request(self, command, device):
+                if command["op"] == "snapshot":
+                    return {"snapshot": {"run": {"run_id": e.run_id, "recipe": "physical-live-teleop"}}}
+                commands.append(command)
+                with a.mutex:
+                    return a._handle(command, device)
+        proxy.ipc = IPC()
+        block_status = [stage in {"offer_status", "progress_status"}]
+        async def status():
+            if block_status[0]:
+                block_status[0] = False
+                blocked.set()
+                await release.wait()
+            return report
+        proxy.status = status
+        async def upstream(*args, **kwargs):
+            if stage == "offer_upstream":
+                blocked.set()
+                await release.wait()
+            return (201, b"bad" if stage == "failed_offer" else b"v=0\r\n", {"Content-Type": "application/sdp"})
+        proxy.upstream = upstream
+        old_body = {"role": "chest", "owner_generation": "owner", "capture_generation": "capture",
+                    "encode_generation": "encode", "view_generation": proxy.viewers["viewer-a"]["view_generation"],
+                    "decoded_frames": 30, "media_time": 3.}
+        def progress():
+            return gateway.onboard_request(Request("/api/onboard/progress", json.dumps(old_body).encode()))
+        role = "chest" if same_role else "wrist_right"
+        def offer():
+            return gateway.onboard_request(Request("/api/onboard/webrtc/" + role, b"v=0\r\n", role))
+        task = None
+        try:
+            if stage == "progress_status":
+                task = asyncio.create_task(progress())
+                await asyncio.wait_for(blocked.wait(), 1)
+                clock.now = 10.1
+                offered = await offer()
+                assert offered.status == 201
+                before_commands = len(commands)
+                before = copy.deepcopy(a._teleop_view)
+                clock.now = 10.2
+                release.set()
+                result = json.loads((await asyncio.wait_for(task, 1)).body)
+            else:
+                clock.now = 10.1
+                if stage in {"offer_status", "offer_upstream"}:
+                    task = asyncio.create_task(offer())
+                    await asyncio.wait_for(blocked.wait(), 1)
+                elif stage == "failed_offer":
+                    with pytest.raises(web.HTTPBadGateway):
+                        await offer()
+                else:
+                    offered = await offer()
+                    assert offered.status == 201
+                    report["video"]["role"] = role
+                before_commands = len(commands)
+                before = copy.deepcopy(a._teleop_view)
+                clock.now = 10.2
+                report["cameras"]["chest"].update(sequence=12, arrived_at_monotonic_s=10.19)
+                result = json.loads((await progress()).body)
+            assert result["accepted"] is False
+            assert len(commands) == before_commands  # Rejected at attachment, before owner IPC.
+            assert a._teleop_view == before
+            if stage in {"after_complete", "progress_status"}:
+                token = offered.headers["X-Camera-View-Generation"]  # Existing Gateway header pass-through.
+                assert token != old_body["view_generation"] and str(uuid.UUID(token)) == token
+                clock.now = 10.24
+                report["video"]["role"] = role
+                report["cameras"][role].update(sequence=13, arrived_at_monotonic_s=10.23)
+                current = {**old_body, "role": role, "view_generation": token, "decoded_frames": 1, "media_time": .1}
+                accepted = json.loads((await gateway.onboard_request(Request("/api/onboard/progress", json.dumps(current).encode()))).body)
+                assert accepted["accepted"] and accepted["required_view"]["qualified"]
+                assert commands[-1]["received_at_monotonic_s"] == 10.23
+                assert a._teleop_view["qualified_until"] == 10.73
+        finally:
+            release.set()
+            if task is not None:
+                await asyncio.gather(task, return_exceptions=True)
+    try:
+        asyncio.run(scenario())
+    finally:
+        a.run = None
+        a.close()

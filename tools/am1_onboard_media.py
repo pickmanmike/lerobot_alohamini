@@ -423,6 +423,11 @@ class OnboardMediaProxy:
                 raise self.web.HTTPTooManyRequests(reason="bounded view retry delay")
             if device not in self.viewers and len(self.viewers) >= 2:
                 raise self.web.HTTPTooManyRequests(reason="two shared primary viewers maximum")
+            # Retire the previous browser attachment before status/IPC/upstream
+            # work can yield. A failed offer must not restore its old authority.
+            viewer = {"at": now, "offered_at": now, "frames": 0, "media_time": -1,
+                      "role": role, "view_generation": str(uuid.uuid4()), "ready": False}
+            self.viewers[device] = viewer
             report = await self.status()
             await self.owner_progress(report, role, 0, 0, now, qualified=False)
             response = await self.upstream(
@@ -434,13 +439,8 @@ class OnboardMediaProxy:
                 or not response[1].startswith(b"v=0")
             ):
                 raise self.web.HTTPBadGateway(reason="invalid onboard SDP answer")
-            self.viewers[device] = {
-                "at": self.clock(),
-                "offered_at": self.clock(),
-                "frames": 0,
-                "media_time": -1,
-            }
-            return response
+            viewer.update(at=self.clock(), ready=True)
+            return response[0], response[1], {**response[2], "X-Camera-View-Generation": viewer["view_generation"]}
 
     async def progress(self, device, body, received_at):
         keys = {
@@ -448,6 +448,7 @@ class OnboardMediaProxy:
             "owner_generation",
             "capture_generation",
             "encode_generation",
+            "view_generation",
             "decoded_frames",
             "media_time",
         }
@@ -463,7 +464,7 @@ class OnboardMediaProxy:
             or media_time < 0
             or any(
                 not isinstance(body[key], str) or not 1 <= len(body[key]) <= 128
-                for key in ("owner_generation", "capture_generation", "encode_generation")
+                for key in ("owner_generation", "capture_generation", "encode_generation", "view_generation")
             )
         ):
             raise self.web.HTTPBadRequest(reason="bounded decoded view progress required")
@@ -483,11 +484,15 @@ class OnboardMediaProxy:
             return {**result, "view_delivery": delivery}
 
         viewer = self.viewers.get(device)
-        if viewer is None:
+        if (viewer is None or viewer.get("ready") is not True or viewer.get("role") != role
+                or viewer.get("view_generation") != body["view_generation"]):
             return receipt({"accepted": False, "reason": "current view attachment required"})
         delivery["status_started_at_monotonic_s"] = self.clock()
         report = await self.status()
         delivery["status_completed_at_monotonic_s"] = self.clock()
+        if (self.viewers.get(device) is not viewer or viewer.get("ready") is not True
+                or viewer.get("role") != role or viewer.get("view_generation") != body["view_generation"]):
+            return receipt({"accepted": False, "reason": "current view attachment required"})
         source, video = report.get("cameras", {}).get(role, {}), report.get("video", {})
         arrived = source.get("arrived_at_monotonic_s")
         delivery["source_arrived_at_monotonic_s"] = (

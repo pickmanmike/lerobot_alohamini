@@ -45,6 +45,12 @@ globalThis.AM1OnboardView=class {
       const binding={role,owner_generation:response.headers.get("X-Camera-Owner-Generation"),
         capture_generation:response.headers.get("X-Camera-Capture-Generation"),
         encode_generation:response.headers.get("X-Camera-Encode-Generation")};
+      if(this.options.progress) {
+        binding.view_generation=response.headers.get("X-Camera-View-Generation");
+        if(typeof binding.view_generation!=="string"||
+           !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(binding.view_generation))
+          throw Error("Current view attachment unavailable");
+      }
       if(Object.values(binding).some(value=>typeof value!=="string"||!value||value.length>128))throw Error("Current video source identity unavailable");
       const answer=await response.text();
       if(epoch!==this.epoch)return;
@@ -89,7 +95,7 @@ globalThis.AM1OnboardView=class {
     const current=()=>{
       const source=this.source?.cameras?.[body.role],video=this.source?.video;
       return !slot.cancelled&&epoch===this.epoch&&id===this.latestReport&&
-        ["role","owner_generation","capture_generation","encode_generation"].every(key=>body[key]===this.binding?.[key])&&
+        ["role","owner_generation","capture_generation","encode_generation","view_generation"].every(key=>body[key]===this.binding?.[key])&&
         body.owner_generation===this.source?.owner_generation&&body.capture_generation===source?.capture_generation&&
         body.capture_generation===video?.capture_generation&&body.encode_generation===video?.encode_generation&&body.role===video?.role;
     };

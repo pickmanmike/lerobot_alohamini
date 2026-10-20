@@ -1316,6 +1316,11 @@ class SessionAuthority:
             or not 0 <= now - command["received_at_monotonic_s"] < .5):
             return receipt(self._refuse("selected-view original receipt or progress invalid"))
         old = self._teleop_view or {}
+        # Browser cancellation does not cancel already-enqueued owner work.
+        # Compare original Pi floors before an old source can reset current evidence.
+        if (old.get("run_id") == command["run_id"] and command["received_at_monotonic_s"]
+                < old.get("received_at_monotonic_s", -1.)):
+            return receipt(self._refuse("selected-view original receipt superseded"))
         identity = ("run_id", "role", "owner_generation", "capture_generation", "encode_generation")
         changed = any(old.get(k) != command[k] for k in identity)
         advancing = changed or (command["decoded_frames"] > old.get("decoded_frames", -1)
