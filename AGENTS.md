@@ -53,8 +53,9 @@ and sampled-view limitations; this is not the original172.5s strict qualificatio
 Keep500ms required view,250ms native input and original ownership/deadline guards.
 The process-local msedge software-decoder option is available in the ordinary
 browser-only launcher with stable separate mode profiles. Dedicated-profile fresh
-enrollment now survives reload and camera-only09 verified live chest WebRTC; motor
-operation in that profile remains untested. This is not GPU proof or a global preference change.
+enrollment now survives reload and camera-only09 verified live chest WebRTC. It supplied
+Actual94's required presentation without a shadow viewer, but the scene was too dark
+to qualify useful arm viewing. This is not GPU proof or a global preference change.
 Next operating scope is materially better repeatable maintained left-elbow response,
 then repeat the short unloaded
 reach/hold/gripper/retract under normal required usable viewing. Compare actual
@@ -68,16 +69,24 @@ semantics: one parameter at a time, a small candidate set, baseline/restoration
 verified. If substantial effort lacks motion, distinguish actual load/power/mechanism
 before escalating. Never change IDs, phase, calibration, travel or device protections;
 never overcommand to hide error. No general gain sweep, micro-tick gate or new framework.
-Stage45 source871598c6 is installed at motor603c4624/runtimeD632471f/MF2a115478;
-only host/selected-evidence and Core/media changed, with matched Stage44 rollback.
+Stage46 source fa1b8391 is installed at motor8a3a91ed/runtimeD80c7d28/MF11027f16;
+all ten phases passed, changing only the reviewed five motor/two runtime files.
+Camera/helper/Core/media/client/calibration remain unchanged; full matched Stage45
+rollback and private state are retained. PR29 remains draft/unmerged.
 Actual90/92/93 demonstrate partial directional elbow movement; Actual91 remains
 weak despite actual Goal2124. Actual93 completed20active unloaded elbow/hold/grip/
 retract,1.934deg outward/1.318deg back,18.944/18.482 gripper opening points,
 with one.867s recovery and42/42 fresh operating chest samples. Target2124 held
 5.861s while PP2059 stayed short: coarse control is achieved, full reach/fine
 positioning is not. Do not rerun an unchanged workload for publication or infer a
-gain fault from undertravel. Current PC source d3faf3a7, native871598c6/Stage45
-unchanged. Post93 interface is stopped/certain/Start+Claim enabled. Publish/review
+gain fault from undertravel. Actual94 at fa1/Stage46 completed the16-active-second
+P16 baseline: requested7.119deg, achieved1.406deg outward/0.439deg back,
+0.967deg residual. Direct reads confirm Goal2124/PP2059,195–208mA,11.6V and
+unchanged device limits; P16/Lock restoration and off readback passed. Three ordinary
+input recoveries preserved the task/deadline. P32 has not started. Source and Edge
+images were too dark for useful observation; camera-only10 confirmed advancing
+WebRTC then clean60s exit. Resolve that specific viewing issue before more motion.
+The current interface remains stopped/readback-verified. Publish/review
 the new response follow-up without automatic merge; retain current source,
 limitations and rollback. PR28 integration is complete.
 Main/AM2 remain unchanged. Do not repeat powered checks solely for publication.
