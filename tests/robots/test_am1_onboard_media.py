@@ -680,3 +680,92 @@ def test_view_attachment_retires_old_reports_before_offer_work_and_after_same_so
     finally:
         a.run = None
         a.close()
+
+
+@pytest.mark.parametrize("old_fresh", [False, True])
+@pytest.mark.parametrize("source_changed", [False, True])
+def test_older_gateway_request_cannot_replace_newer_view_with_an_older_source_floor(tmp_path, monkeypatch, old_fresh, source_changed):
+    """Real Gateway/proxy/Core; receipt order differs from source freshness order."""
+    import copy
+    from types import SimpleNamespace
+
+    from tests.robots.test_am1_live_teleop_executor import authority_lane
+    from tools import am1_session_service as service
+
+    a, e, _ = authority_lane(tmp_path)
+    clock = SimpleNamespace(now=10.2)
+    a.clock = lambda: clock.now
+    monkeypatch.setattr(service.time, "monotonic", lambda: clock.now)
+    proxy = object.__new__(module().OnboardMediaProxy)
+    proxy.clock, proxy.web = lambda: clock.now, web
+    token = "11111111-1111-4111-8111-111111111111"
+    proxy.viewers = {"viewer-a": {"frames": 0, "media_time": -1, "ready": True, "role": "chest",
+                                  "view_generation": token}}
+    report = {"owner_generation": "owner", "cameras": {"chest": {
+        "state": "fresh" if old_fresh else "stale", "configured": True, "sequence": 11,
+        "capture_generation": "capture", "arrived_at_monotonic_s": 10.19}},
+        "video": {"role": "chest", "encode_generation": "encode", "capture_generation": "capture", "state": "running"}}
+    async def status():
+        return copy.deepcopy(report)
+    proxy.status = status
+    gateway = object.__new__(service.Gateway)
+    gateway.onboard = proxy
+    class Request(dict):
+        path = "/api/onboard/progress"
+        def __init__(self, body):
+            super().__init__(device={"id": "viewer-a"})
+            self.content = json.dumps(body).encode()
+        async def read(self):
+            return self.content
+    async def scenario():
+        blocked, release = asyncio.Event(), asyncio.Event()
+        commands = []
+        class IPC:
+            async def request(self, command, device):
+                if command["op"] == "snapshot":
+                    return {"snapshot": {"run": {"run_id": e.run_id, "recipe": "physical-live-teleop"}}}
+                commands.append(copy.deepcopy(command))
+                if command["decoded_frames"] == 3:
+                    blocked.set()
+                    await release.wait()
+                with a.mutex:
+                    return a._handle(command, device)
+        proxy.ipc = IPC()
+        body = {'role': 'chest', 'owner_generation': 'owner', 'capture_generation': 'capture', 'encode_generation': 'encode', 'view_generation': token, 'decoded_frames': 3, 'media_time': 0.3}
+        old = asyncio.create_task(gateway.onboard_request(Request(body)))
+        try:
+            await asyncio.wait_for(blocked.wait(), 1)
+            clock.now = 10.25
+            report["cameras"]["chest"].update(state="fresh", sequence=12, arrived_at_monotonic_s=10.1)
+            if source_changed:
+                report["cameras"]["chest"]["capture_generation"] = "capture-new"
+                report["video"].update(capture_generation="capture-new", encode_generation="encode-new")
+                body.update(capture_generation="capture-new", encode_generation="encode-new")
+            current = json.loads((await gateway.onboard_request(Request(dict(body, decoded_frames=4, media_time=.4)))).body)
+            assert current["accepted"] and current["required_view"]["qualified"]
+            assert commands[-1]["received_at_monotonic_s"] == 10.1
+            assert commands[-1]["request_received_at_monotonic_s"] == 10.25
+            assert commands[0]["request_received_at_monotonic_s"] == 10.2
+            assert commands[0]["received_at_monotonic_s"] == (10.19 if old_fresh else 10.2)
+            before = copy.deepcopy(a._teleop_view)
+            clock.now = 10.3
+            release.set()
+            stale = json.loads((await asyncio.wait_for(old, 1)).body)
+            assert not stale["view_delivery"]["owner_result"]["accepted"]
+            assert stale["view_delivery"]["owner_result"]["reason"] == "selected-view original receipt superseded"
+            assert a._teleop_view == before and a._teleop_view_qualified()
+            assert a._teleop_view["qualified_until"] == 10.6  # Source age, not younger HTTP receipt.
+            assert a.run["status"] == "running"
+            clock.now = 10.31
+            report["cameras"]["chest"].update(state="stale", sequence=13)
+            latest = json.loads((await gateway.onboard_request(Request(dict(body, decoded_frames=5, media_time=.5)))).body)
+            assert not latest["accepted"] and latest["reason"] == "selected source is not fresh"
+            assert not a._teleop_view_qualified() and a.run["status"] == "paused"
+        finally:
+            release.set()
+            await asyncio.gather(old, return_exceptions=True)
+    try:
+        asyncio.run(scenario())
+    finally:
+        a.run = None
+        a.close()

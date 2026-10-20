@@ -33,8 +33,12 @@ supersedes wrist-button Packet15. Actual73/78/79 retain their separate acceptanc
 The owner accepted Actual88's bounded normal64.5s result and integrated PR26 into
 integrate/am1-local-teleop at472f8c4d, exact accepted a4d5f7e1 tree; PR25 remains
 merged at e3d8a196. That source-equivalent merge needed no redeploy or physical repeat.
-Current PR27 is open, ready for review and unmerged on codex/am1-view-continuity,
-view-repair source73690add. Stage44 passed all ten stopped phases, changing only
+The owner accepted Actual89 and authorized ordinary PR27 integration into
+integrate/am1-local-teleop after outstanding applicable checks/review, superseding
+the prior PR27-unmerged restriction. The current comparable-request-clock review
+finding must be resolved first. New executable left-response/reach work belongs on
+a focused follow-up after integration, without automatically merging it.
+PR27 view-repair source is73690add. Stage44 passed all ten stopped phases, changing only
 Core/media/WebRTC among22 runtime files; the other19, motor/camera/helper, private
 operating settings and matched rollback remain. Actual89 remains at source87cd55da/
 Stage43. The later attachment-race correction was verified without another motor run.
@@ -47,6 +51,13 @@ Keep500ms required view,250ms native input and original ownership/deadline guard
 The process-local msedge software-decoder option is available in the ordinary
 browser-only launcher with stable separate mode profiles; dedicated-profile live
 enrollment/use remains unqualified. It is not GPU proof or a global preference change.
+Next operating scope is useful left-elbow response, then a short unloaded
+reach/hold/gripper/retract under normal required usable viewing. Compare actual
+requested/mapped/accepted/servo-Goal/measured evidence, sign/units, pose, direction
+and maintained dwell before tuning. Use current supported workspace/settings and
+fresh streamed intent; other joints hold actual admitted targets. Preserve fixed
+references through recovery and report interrupted dwells honestly. No gain sweep,
+expanded travel, micro-tick gate, calibration or new telemetry/launcher framework.
 Main/AM2 remain unchanged. Do not repeat powered checks solely for publication.
 No fault-injection campaign, gains, network remediation or freshness downgrade.
 Physical USB

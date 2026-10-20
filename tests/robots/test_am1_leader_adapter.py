@@ -4311,7 +4311,8 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                                         "owner_generation": "owner", "capture_generation": "capture",
                                         "encode_generation": "encode", "decoded_frames": len(resumes) + 1,
                                         "media_time": float(len(resumes) + 1), "source_sequence": len(resumes),
-                                        "source_fresh": True, "received_at_monotonic_s": pi_clock[0]}
+                                        "source_fresh": True, "received_at_monotonic_s": pi_clock[0],
+                                        "request_received_at_monotonic_s": pi_clock[0]}
                             assert real_handle(progress, "gateway-view")["accepted"] is True
                             return response
                         assert fresh_reads and fresh_reads[-1]["qualified"] is True

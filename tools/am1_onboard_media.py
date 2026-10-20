@@ -396,6 +396,7 @@ class OnboardMediaProxy:
             "source_fresh": bool(qualified),
             # Same-Pi monotonic floor retains both original source and decode receipt expiry.
             "received_at_monotonic_s": original,
+            "request_received_at_monotonic_s": receipt,
         }
         if delivery is not None:
             delivery["original_floor_at_monotonic_s"] = original
