@@ -43,10 +43,12 @@ class LeaderClutch:
     def acquire(self, leader, cursor):
         self.reference, self.cursor = dict(leader), dict(cursor)
 
-    def map(self, leader, workspace):
+    def map(self, leader, workspace, *, absolute=False):
         if self.reference is None:
             raise ValueError("qualified current leader/cursor acquisition required")
-        requested = {k: self.cursor[k] + leader[k] - self.reference[k] for k in TELEOP_ARM_KEYS}
+        requested = dict(leader) if absolute else {
+            k: self.cursor[k] + leader[k] - self.reference[k] for k in TELEOP_ARM_KEYS
+        }
         result = {
             k: max(workspace["bounds"][k]["min"], min(workspace["bounds"][k]["max"], requested[k]))
             for k in TELEOP_ARM_KEYS
@@ -56,6 +58,156 @@ class LeaderClutch:
             for k in TELEOP_ARM_KEYS
             if result[k] != requested[k]
         }
+        return result
+
+
+class SelectedLeftWorkload:
+    """Finite current input with fixed original targets, not a native trajectory."""
+
+    kind = "virtual-leaders"
+    DURATIONS = {"left-maintained": 16., "left-reach": 20., "left-supported-reach": 28., "left-opposite-first": 18.}
+    elbow = "arm_left_elbow_flex.pos"
+    shoulder = "arm_left_shoulder_lift.pos"
+    gripper = "arm_left_gripper.pos"
+
+    def __init__(self, workspace, *, segment="left-maintained"):
+        if segment not in self.DURATIONS:
+            raise ValueError("Unknown selected left finite profile")
+        self.segment, self.duration_s = segment, self.DURATIONS[segment]
+        self.workspace = validate_workspace(workspace)
+        # Refuse an unsupported nonselected pose instead of moving it into a
+        # different command corridor during an allegedly selected-only check.
+        self.origin = validate_target(self.workspace["reference"], workspace=self.workspace)
+        bound = self.workspace["bounds"][self.elbow]
+        self.endpoint = (bound["max"] if segment == "left-opposite-first" else
+                         max((bound["min"], bound["max"]), key=lambda value: abs(value-self.origin[self.elbow])))
+        if segment == "left-opposite-first":
+            self.first_endpoint = bound["min"]
+            ramps = ((self.origin[self.elbow], self.first_endpoint, 2.),
+                     (self.first_endpoint, self.endpoint, 4.), (self.endpoint, self.origin[self.elbow], 4.))
+            if any(abs(end-start) > duration * bound["rate_per_s"] + 1e-9 for start, end, duration in ramps):
+                raise ValueError("opposite-first endpoint exceeds an unchanged ramp rate")
+        elif abs(self.endpoint-self.origin[self.elbow]) > 4 * bound["rate_per_s"] + 1e-9:
+            raise ValueError("selected endpoint exceeds the unchanged four-second ramp rate")
+        opening = self.workspace["bounds"][self.gripper]
+        self.opening = (min(self.origin[self.gripper] + 20., opening["max"],
+                            self.origin[self.gripper] + 2 * opening["rate_per_s"])
+                        if segment in {"left-reach", "left-supported-reach"} else self.origin[self.gripper])
+        if segment == "left-supported-reach":
+            shoulder = self.workspace["bounds"][self.shoulder]
+            self.shoulder_endpoint = shoulder["max"]
+            if self.shoulder_endpoint-self.origin[self.shoulder] > 4 * shoulder["rate_per_s"] + 1e-9:
+                raise ValueError("selected shoulder endpoint exceeds the unchanged four-second ramp rate")
+        self.schedule = [("left_baseline", 0., 2.), ("left_outward", 2., 6.),
+                         ("left_endpoint_hold", 6., 10. if segment == "left-maintained" else 8.)]
+        if segment == "left-reach":
+            self.schedule += [("left_gripper_open", 8., 10.), ("left_gripper_return", 10., 12.)]
+        retract = 10. if segment == "left-maintained" else 12.
+        self.schedule += [("left_retract", retract, retract + 4.),
+                          ("left_final_hold", retract + 4., self.duration_s)]
+        if segment == "left-supported-reach":
+            self.schedule = [("left_baseline", 0., 2.), ("left_shoulder_outward", 2., 6.),
+                             ("left_shoulder_hold", 6., 8.), ("left_outward", 8., 12.),
+                             ("left_endpoint_hold", 12., 14.), ("left_gripper_open", 14., 16.),
+                             ("left_gripper_return", 16., 18.), ("left_retract", 18., 22.),
+                             ("left_shoulder_retract", 22., 26.), ("left_final_hold", 26., 28.)]
+        if segment == "left-opposite-first":
+            self.schedule = [("left_baseline", 0., 2.), ("left_opposite", 2., 4.),
+                             ("left_opposite_hold", 4., 6.), ("left_outward", 6., 10.),
+                             ("left_endpoint_hold", 10., 12.), ("left_retract", 12., 16.),
+                             ("left_final_hold", 16., 18.)]
+        self.elapsed_s, self._last = 0., None
+        self.phases_completed, self.interrupted_phases = set(), set()
+
+    @property
+    def complete(self):
+        return self.elapsed_s >= self.duration_s
+
+    @property
+    def phase(self):
+        return next((name for name, start, end in self.schedule if start <= self.elapsed_s < end), "complete")
+
+    @property
+    def body_phase_elapsed(self):
+        return None
+
+    def admit(self, now):
+        self._last = now
+
+    def freeze(self):
+        if self._last is not None and 0 < self.elapsed_s < self.duration_s:
+            self.interrupted_phases.add(self.phase)
+        self._last = None
+
+    def advance(self, now):
+        if self._last is None or self.complete:
+            return
+        if now < self._last:
+            raise ValueError("workload acquisition clock regressed")
+        self.elapsed_s = min(self.duration_s, round(self.elapsed_s + min(.1, now-self._last), 9))
+        self._last = now
+        self.phases_completed.update(name for name, _start, end in self.schedule if self.elapsed_s >= end)
+
+    def get_action(self):
+        target = dict(self.origin)
+        if self.segment == "left-opposite-first":
+            elapsed = self.elapsed_s
+            if elapsed <= 6.:
+                start, end, fraction = self.origin[self.elbow], self.first_endpoint, (elapsed-2.) / 2.
+            elif elapsed <= 12.:
+                start, end, fraction = self.first_endpoint, self.endpoint, (elapsed-6.) / 4.
+            else:
+                start, end, fraction = self.endpoint, self.origin[self.elbow], (elapsed-12.) / 4.
+            target[self.elbow] = start + max(0., min(1., fraction)) * (end-start)
+            return {key.removeprefix("arm_"): value for key, value in target.items()}
+        if self.segment == "left-supported-reach":
+            elapsed = self.elapsed_s
+            shoulder = (max(0., min(1., (elapsed-2.) / 4.)) if elapsed <= 22.
+                        else max(0., 1. - (elapsed-22.) / 4.))
+            elbow = (max(0., min(1., (elapsed-8.) / 4.)) if elapsed <= 18.
+                     else max(0., 1. - (elapsed-18.) / 4.))
+            opening = ((elapsed-14.) / 2. if 14. < elapsed <= 16.
+                       else (18.-elapsed) / 2. if 16. < elapsed < 18. else 0.)
+            target[self.shoulder] += shoulder * (self.shoulder_endpoint-self.origin[self.shoulder])
+            target[self.elbow] += elbow * (self.endpoint-self.origin[self.elbow])
+            target[self.gripper] += opening * (self.opening-self.origin[self.gripper])
+            return {key.removeprefix("arm_"): value for key, value in target.items()}
+        retract = 10. if self.segment == "left-maintained" else 12.
+        elapsed = self.elapsed_s
+        fraction = (max(0., min(1., (elapsed-2.) / 4.)) if elapsed <= retract
+                    else max(0., 1. - (elapsed-retract) / 4.))
+        target[self.elbow] += fraction * (self.endpoint-self.origin[self.elbow])
+        if self.segment == "left-reach":
+            opening = ((elapsed-8.) / 2. if 8. < elapsed <= 10.
+                       else (12.-elapsed) / 2. if 10. < elapsed < 12. else 0.)
+            target[self.gripper] += opening * (self.opening-self.origin[self.gripper])
+        return {key.removeprefix("arm_"): value for key, value in target.items()}
+
+    def plan(self):
+        bound, cal = self.workspace["bounds"][self.elbow], self.workspace["calibration"][self.elbow.removesuffix(".pos")]
+        raw = min(self.workspace["raw_bounds"][self.elbow], key=lambda value: abs(normalized_raw(value, cal)-self.endpoint))
+        result = {"segment": self.segment, "program_active_seconds": self.duration_s,
+                "reference": dict(self.origin), "endpoint_normalized": self.endpoint, "endpoint_raw_bound": raw,
+                "direction_normalized": 1 if self.endpoint > self.origin[self.elbow] else -1,
+                "travel_normalized": self.endpoint-self.origin[self.elbow], "rate_limit_per_s": bound["rate_per_s"],
+                "gripper_opening_delta": self.opening-self.origin[self.gripper],
+                "phases": [{"phase": name, "start_s": start, "end_s": end} for name, start, end in self.schedule],
+                "active_progress_s": self.elapsed_s, "interrupted_phases": sorted(self.interrupted_phases),
+                "dwell_basis": "producer active intent; native delivered dwell assessed separately",
+                "target_policy": "fixed original admitted references and supported endpoint across qualified recovery"}
+        if self.segment == "left-opposite-first":
+            raw = min(self.workspace["raw_bounds"][self.elbow],
+                      key=lambda value: abs(normalized_raw(value, cal)-self.first_endpoint))
+            result.update(first_endpoint_normalized=self.first_endpoint, first_endpoint_raw_bound=raw,
+                          first_travel_normalized=self.first_endpoint-self.origin[self.elbow])
+        if self.segment == "left-supported-reach":
+            shoulder = self.workspace["bounds"][self.shoulder]
+            cal = self.workspace["calibration"][self.shoulder.removesuffix(".pos")]
+            raw = min(self.workspace["raw_bounds"][self.shoulder],
+                      key=lambda value: abs(normalized_raw(value, cal)-self.shoulder_endpoint))
+            result.update(shoulder_endpoint_normalized=self.shoulder_endpoint, shoulder_endpoint_raw_bound=raw,
+                          shoulder_travel_normalized=self.shoulder_endpoint-self.origin[self.shoulder],
+                          shoulder_rate_limit_per_s=shoulder["rate_per_s"])
         return result
 
 
@@ -86,7 +238,10 @@ class FrameProducer:
                     "meaning": "explicit relative acquisition; calibration unchanged",
                 }
                 self.reacquire = False
-            target = self.clutch.map(leader, self.workspace)
+            fixed = isinstance(self.input, SelectedLeftWorkload)
+            if fixed and self.last_clutch:
+                self.last_clutch["meaning"] = "fresh binding; declared original absolute programme targets remain fixed"
+            target = self.clutch.map(leader, self.workspace, absolute=True) if fixed else self.clutch.map(leader, self.workspace)
         self.sequence += 1
         source = {
             "kind": self.input.kind,
@@ -2943,7 +3098,7 @@ async def run(args):
              "bench_continuity": bench, "view_policy": summary["view_policy"], "workload_segment": segment,
              "terminal_qualification_budget_seconds": terminal_budget,
              "terminal_completion_policy": summary["terminal_completion_policy"],
-             "program_active_seconds": {"full": 172.5, "combined": 12., "body": 4.5, "continuity": 24., "combined-body": 64.5}[segment] if args.source == "virtual-leaders" else None,
+             "program_active_seconds": {"full": 172.5, "combined": 12., "body": 4.5, "continuity": 24., "combined-body": 64.5, **SelectedLeftWorkload.DURATIONS}[segment] if args.source == "virtual-leaders" else None,
              "input_duration_seconds": args.duration_seconds,
              "controller_interruption": controller_gap, "interruption_at_seconds": getattr(args, "interrupt_at_seconds", None),
              "interruption_seconds": getattr(args, "interruption_seconds", .65)}
@@ -3176,7 +3331,12 @@ async def run(args):
         summary.update(run_id=run_id, original_native_deadline=deadline, workspace=workspace)
         record({"event": "native_admitted", "snapshot": client.snapshot})
         if args.source == "virtual-leaders":
-            workload = source = TeleopWorkload(workspace) if segment == "full" else TeleopWorkload(workspace, segment=segment)
+            if segment in SelectedLeftWorkload.DURATIONS:
+                workload = source = SelectedLeftWorkload(workspace, segment=segment)
+                summary["selected_profile"] = workload.plan()
+                record({"event": "workload_plan", "run_id": run_id, **workload.plan()})
+            else:
+                workload = source = TeleopWorkload(workspace) if segment == "full" else TeleopWorkload(workspace, segment=segment)
         producer = FrameProducer(source)
         producer.workspace = workspace
         recovery = SameRunRecovery(client, record)
@@ -3632,6 +3792,8 @@ async def run(args):
                 ordinary_pauses_observed=recovery.pause_recoveries,
             )
     finally:
+        if isinstance(workload, SelectedLeftWorkload):
+            summary["selected_profile"] = workload.plan()
 
         async def cleanup_step(name, operation, timeout):
             try:
@@ -3759,7 +3921,7 @@ def main(argv=None):
     parser.add_argument("--interrupt-at-seconds", type=float)
     parser.add_argument("--interruption-seconds", type=float, default=0.65)
     parser.add_argument("--bench-continuity", action="store_true", help="predetermined virtual bench; viewing is advisory")
-    parser.add_argument("--workload-segment", choices=("full", "combined", "body", "continuity", "combined-body"), default="full")
+    parser.add_argument("--workload-segment", choices=("full", "combined", "body", "continuity", "combined-body", *SelectedLeftWorkload.DURATIONS), default="full")
     parser.add_argument("--interrupt-controller", action="store_true", help="declared bench gap also stops current controller renewals")
     parser.add_argument(
         "--no-keyboard", action="store_true", help="USB stationary probe/arm-only operation; body stays zero"

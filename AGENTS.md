@@ -1,4 +1,4 @@
-## Active AM1 view continuity after accepted Packet18 operation
+## Active AM1 useful arm operation after PR27 integration
 
 Read first: [current state](docs/alohamini/current-state.md) and
 [source-backed decisions/lessons](docs/alohamini/decisions-and-lessons.md).
@@ -33,11 +33,11 @@ supersedes wrist-button Packet15. Actual73/78/79 retain their separate acceptanc
 The owner accepted Actual88's bounded normal64.5s result and integrated PR26 into
 integrate/am1-local-teleop at472f8c4d, exact accepted a4d5f7e1 tree; PR25 remains
 merged at e3d8a196. That source-equivalent merge needed no redeploy or physical repeat.
-The owner accepted Actual89 and authorized ordinary PR27 integration into
-integrate/am1-local-teleop after outstanding applicable checks/review, superseding
-the prior PR27-unmerged restriction. The current comparable-request-clock review
-finding must be resolved first. New executable left-response/reach work belongs on
-a focused follow-up after integration, without automatically merging it.
+The owner accepted Actual89 and PR27 is integrated into
+integrate/am1-local-teleop at2ec74f14 after the comparable-request-clock finding
+was repaired at1bb715e3 and reviewed. Both threads are resolved; no CI runs were
+reported. New executable left-response/reach work is on the focused follow-up
+codex/am1-left-maintained-response, without automatic merge.
 PR27 view-repair source is73690add. Stage44 passed all ten stopped phases, changing only
 Core/media/WebRTC among22 runtime files; the other19, motor/camera/helper, private
 operating settings and matched rollback remain. Actual89 remains at source87cd55da/
@@ -49,8 +49,9 @@ real holds, one view expiry inside an existing input hold, weak left-elbow respo
 and sampled-view limitations; this is not the original172.5s strict qualification.
 Keep500ms required view,250ms native input and original ownership/deadline guards.
 The process-local msedge software-decoder option is available in the ordinary
-browser-only launcher with stable separate mode profiles; dedicated-profile live
-enrollment/use remains unqualified. It is not GPU proof or a global preference change.
+browser-only launcher with stable separate mode profiles. Dedicated-profile fresh
+enrollment now survives reload and camera-only09 verified live chest WebRTC; motor
+operation in that profile remains untested. This is not GPU proof or a global preference change.
 Next operating scope is useful left-elbow response, then a short unloaded
 reach/hold/gripper/retract under normal required usable viewing. Compare actual
 requested/mapped/accepted/servo-Goal/measured evidence, sign/units, pose, direction
@@ -58,6 +59,17 @@ and maintained dwell before tuning. Use current supported workspace/settings and
 fresh streamed intent; other joints hold actual admitted targets. Preserve fixed
 references through recovery and report interrupted dwells honestly. No gain sweep,
 expanded travel, micro-tick gate, calibration or new telemetry/launcher framework.
+Stage45 source871598c6 is installed at motor603c4624/runtimeD632471f/MF2a115478;
+only host/selected-evidence and Core/media changed, with matched Stage44 rollback.
+Actual90/92/93 demonstrate partial directional elbow movement; Actual91 remains
+weak despite actual Goal2124. Actual93 completed20active unloaded elbow/hold/grip/
+retract,1.934deg outward/1.318deg back,18.944/18.482 gripper opening points,
+with one.867s recovery and42/42 fresh operating chest samples. Target2124 held
+5.861s while PP2059 stayed short: coarse control is achieved, full reach/fine
+positioning is not. Do not rerun an unchanged workload for publication or infer a
+gain fault from undertravel. Current PC source d3faf3a7, native871598c6/Stage45
+unchanged. Post93 interface is stopped/certain/Start+Claim enabled. Publish/review
+PR28 without automatic merge; retain current source, limitations and rollback.
 Main/AM2 remain unchanged. Do not repeat powered checks solely for publication.
 No fault-injection campaign, gains, network remediation or freshness downgrade.
 Physical USB

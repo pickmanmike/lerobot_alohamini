@@ -167,6 +167,10 @@ class AM1SelectedJointEvidence:
         self.live_admission = None
         self.live_response = None
         self.live_goal_checkpoint_at = None
+        self.teleop_binding = self.teleop_action = self.teleop_checkpoint = None
+        self.teleop_bus = None
+        self.teleop_attempted = set()
+        self.teleop_last_read = None
 
     @property
     def motor(self):
@@ -1203,6 +1207,158 @@ class AM1SelectedJointEvidence:
                 self._pending_sparse = dict(kind="practical_response_diagnostic", **copy.deepcopy(self.response_boundary),
                     window=copy.deepcopy(window), position=copy.deepcopy(position), current=copy.deepcopy(current))
 
+    def _teleop_identity(self, robot, control):
+        """Independent diagnostic binding; never enables legacy selected rules."""
+        if (not getattr(control, "teleop", False) or not getattr(control, "live", False)
+                or getattr(getattr(control, "live_spec", None), "profile", None) != "WholeRobotTeleop"
+                or self.enabled or self.context is not None
+                or getattr(robot, "_am1_selected_joint_evidence_enabled", False)
+                or getattr(robot, "_am1_selected_joint_evidence_context", None) is not None
+                or getattr(robot, "_am1_visible_control_binding", None) is not None
+                or getattr(robot, "_am1_elbow_integral_trial", None) is not None
+                or getattr(robot, "_am1_selected_elbow_experiment", None) is not None
+                or getattr(robot.config, "robot_model", None) != "alohamini1"
+                or getattr(robot.config, "no_follower", False) or getattr(robot.config, "use_degrees", False)
+                or not isinstance(control.binding, dict)
+                or getattr(robot, "_am1_teleop_binding", None) != {**control.binding, "recipe": "physical-live-teleop"}):
+            return None
+        bus = robot.left_bus
+        motor, calibration = bus.motors.get(MOTOR), bus.calibration.get(MOTOR)
+        if (motor is None or motor.id != 3 or motor.model != "sts3215"
+                or motor.norm_mode is not MotorNormMode.RANGE_M100_100 or calibration is None
+                or bus.apply_drive_mode is not True):
+            return None
+        material = [getattr(calibration, k) for k in ("id", "drive_mode", "homing_offset", "range_min", "range_max")]
+        if (any(type(v) is not int for v in material) or material[0] != 3 or material[1] not in (0, 1)
+                or not 0 <= material[3] < material[4] <= 4095):
+            return None
+        return {**control.binding, "calibration": material}
+
+    def record_teleop_action(self, robot, control, marker, accepted):
+        """Copy only successfully returned whole-map action; raw expectation is derived."""
+        from examples.alohamini.am1_live_teleop import TELEOP_ARM_KEYS, validate_target
+
+        self.teleop_action = None
+        identity = self._teleop_identity(robot, control)
+        if identity is None or accepted is None or control.state != "active":
+            return
+        if self.teleop_binding is None:
+            self.teleop_binding, self.teleop_bus = copy.deepcopy(identity), robot.left_bus
+        if identity != self.teleop_binding or robot.left_bus is not self.teleop_bus:
+            return
+        if (any(marker.get(k) != v for k, v in control.binding.items())
+                or any(type(marker.get(k)) is not int or marker[k] < 0 for k in ("epoch", "intent_revision", "action_sequence"))
+                or (marker["epoch"], marker["intent_revision"], marker["action_sequence"])
+                   != (control.epoch, control.intent_revision, control.accepted_action_sequence)):
+            return
+        try:
+            final = validate_target({k: accepted[k] for k in TELEOP_ARM_KEYS})
+            desired = validate_target(control.live_sample["target"])[POSITION]
+        except (KeyError, TypeError, ValueError):
+            return
+        if accepted != control.accepted_action:
+            return
+        bus = self.teleop_bus
+        cal = identity["calibration"]
+        value = -final[POSITION] if cal[1] else final[POSITION]
+        raw = round((value + 100) / 200 * (cal[4] - cal[3]) + cal[3])
+        if (not cal[3] <= raw <= cal[4] or abs(float(bus._normalize({3: raw})[3]) - final[POSITION]) > 1e-7):
+            return
+        encoded = int(bus._encode_sign("Goal_Position", {3: raw})[3])
+        now = self.clock()
+        if not _number(now):
+            return
+        previous = self.teleop_checkpoint
+        key = (control.epoch, control.intent_revision, desired)
+        if previous is None or previous["key"] != key:
+            same = previous is not None and previous["key"][:2] == key[:2]
+            direction = (1 if desired > previous["key"][2] else -1) if same else 0
+            leg = previous["leg"] + int(direction != previous["direction"]) if same else 0
+            self.teleop_checkpoint = {"key": key, "since": now, "direction": direction, "leg": leg}
+        self.teleop_action = {
+            **control.binding, "epoch": control.epoch, "intent_revision": control.intent_revision,
+            "action_sequence": control.accepted_action_sequence, "accepted_action": copy.deepcopy(accepted),
+            "accepted_at_monotonic_s": now, "input": copy.deepcopy(control.live_sample),
+            "action": {"joint": POSITION, "motor": MOTOR, "side": "left", "calibration": list(cal),
+                       "requested": desired, "final_normalized": final[POSITION], "expected_goal_raw": raw,
+                       "encoded_goal_word": encoded, "encoded_goal_bytes": bus._split_into_byte_chunks(encoded, 2),
+                       "provenance": "accepted-normalized-from-encoded-integer/derived-roundtrip",
+                       "write_acknowledged": False},
+        }
+
+    def _teleop_marker(self, robot, control, observation):
+        action, identity = self.teleop_action, self._teleop_identity(robot, control)
+        marker = observation.get("_am1_local_feedback", {})
+        now = self.clock()
+        sample = getattr(control, "live_sample", None)
+        if (action is None or identity != self.teleop_binding or robot.left_bus is not self.teleop_bus
+                or control.state != "active" or not isinstance(sample, dict)
+                or not _number(sample.get("valid_until_monotonic_s")) or not now < sample["valid_until_monotonic_s"]
+                or not _number(control.live_snapshot().get("live_deadline_monotonic_s"))
+                or not now < control.live_snapshot()["live_deadline_monotonic_s"]
+                or type(marker.get("version")) is not int or marker["version"] != 1 or marker.get("state") != "active"
+                or any(marker.get(k) != v for k, v in control.binding.items())
+                or any(type(marker.get(k)) is not int for k in ("epoch", "intent_revision", "accepted_action_sequence", "observation_id"))
+                or (marker["epoch"], marker["intent_revision"], marker["accepted_action_sequence"])
+                   != (control.epoch, control.intent_revision, control.accepted_action_sequence)
+                or (action["epoch"], action["intent_revision"], action["action_sequence"])
+                   != (control.epoch, control.intent_revision, control.accepted_action_sequence)
+                or any(action.get(k) != v for k, v in control.binding.items())
+                or action["accepted_action"] != control.accepted_action or action["input"] != sample
+                or not _number(marker.get("acquired_at_monotonic_s"))
+                or not 0 <= now - marker["acquired_at_monotonic_s"] <= .5):
+            return None
+        return marker
+
+    def report_teleop_goal(self, robot, control, observation):
+        """At most eight same-owner reads after response; never a readiness gate."""
+        marker = self._teleop_marker(robot, control, observation)
+        pending, now = self.teleop_checkpoint, self.clock()
+        if marker is None or pending is None or now - pending["since"] < .5:
+            return
+        checkpoint = (*pending["key"], pending["leg"])
+        if (len(self.teleop_attempted) >= 8 or checkpoint in self.teleop_attempted
+                or self.teleop_last_read is not None and now - self.teleop_last_read < 1):
+            return
+        self.teleop_attempted.add(checkpoint)
+        self.teleop_last_read = now
+        original = copy.deepcopy(self.teleop_action)
+        row = {"kind": "live_goal_readback", **control.binding, "epoch": control.epoch,
+               "intent_revision": control.intent_revision, "action_sequence": control.accepted_action_sequence,
+               "state": "active", "last_input_seq": control.live_sample["seq"], "action": original["action"],
+               "position": copy.deepcopy(observation.get("_am1_arm_feedback", {}).get("positions", {}).get(POSITION)),
+               "requested_goal_raw": original["action"]["expected_goal_raw"], "goal_position_raw": None,
+               "present_position_raw": None, "goal_matches_expected_raw": None,
+               "diagnostic_available": False, "read_started_at_monotonic_s": now}
+        bus = self.teleop_bus
+        transport = DirectSdkTransport(bus.port, motor_id=3, port_handler=bus.port_handler, packet_handler=bus.packet_handler)
+        primary = None
+        try:
+            payload, trace = transport.read_group(33, 38, timeout_ms=40.0)
+            row["traces"] = [trace]
+            decoded = self._decoded(bus, payload)
+            row["decoded"] = decoded
+            if decoded["status"] != 0 or decoded["torque_enable"] != 1 or decoded["operating_mode"] != 0:
+                raise RuntimeError("Selected joint readback reported status/torque/mode fault")
+            if self._teleop_marker(robot, control, observation) is None or self.teleop_action != original:
+                row["unavailable_reason"] = "teleop action correlation changed during read"
+            else:
+                row.update(diagnostic_available=True, goal_position_raw=decoded["goal_position_raw"],
+                           present_position_raw=decoded["present_position_raw"], temperature_c=decoded["temperature_c"],
+                           goal_matches_expected_raw=decoded["goal_position_raw"] == row["requested_goal_raw"])
+        except TransportRefusal as error:
+            row.update(traces=[error.trace], unavailable_reason=f"{type(error).__name__}: {error}")
+            if error.trace.get("response_bytes") != [] or error.trace.get("comm_result") != transport.sdk.COMM_RX_TIMEOUT:
+                primary = error
+        except BaseException as error:
+            row["unavailable_reason"] = f"{type(error).__name__}: {error}"
+            primary = error
+        row["read_completed_at_monotonic_s"] = self.clock()
+        self.goal_readbacks[f"teleop_{len(self.teleop_attempted)}"] = copy.deepcopy(row)
+        self.emit(row)
+        if primary is not None:
+            raise primary
+
     def report_live_goal(self, robot, control):
         """A few existing-owner readbacks; broadcast completion remains unacknowledged."""
         now = self.clock()
@@ -1985,6 +2141,19 @@ class AM1SelectedJointEvidence:
 
     def publish(self, robot, control, observation):
         """Copy actual caches before response; never read, emit or renew timestamps."""
+        if getattr(control, "teleop", False):
+            outer = observation.get("_am1_local_feedback")
+            if isinstance(outer, dict):
+                outer.pop("selected_joint", None)
+            marker = self._teleop_marker(robot, control, observation)
+            if marker is not None:
+                marker["selected_joint"] = {
+                    "version": 1, **{k: marker[k] for k in
+                        ("run_id", "host_incarnation", "epoch", "intent_revision", "observation_id", "acquired_at_monotonic_s")},
+                    "action_sequence": marker["accepted_action_sequence"],
+                    "goal_readbacks": copy.deepcopy(self.goal_readbacks),
+                }
+            return
         outer = observation.get("_am1_local_feedback")
         if isinstance(outer, dict):
             outer.pop("selected_joint", None)
@@ -2009,6 +2178,9 @@ class AM1SelectedJointEvidence:
         retained[row["sample_key"]] = copy.deepcopy(row)
 
     def report(self, robot, control, observation):
+        if getattr(control, "teleop", False):
+            self.report_teleop_goal(robot, control, observation)
+            return
         if getattr(self._live_definition, "practical_motion", False):
             self.emit_pending_fault(robot)
         marker = self._matched_marker(control, observation)
