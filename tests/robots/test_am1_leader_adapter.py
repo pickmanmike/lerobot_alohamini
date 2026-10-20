@@ -729,7 +729,7 @@ def test_real_wss_clean_close_ends_qualified_wait_before_timeout(tmp_path):
         "bench_terminal_hold_native_ceiling",
         "bench_program_finish", "bench_program_finish_failed",
         "normal_program_finish", "normal_program_finish_failed", "normal_program_finish_combined_body",
-        "normal_program_finish_left_maintained", "normal_program_finish_left_reach", "usb_finite_finish", "usb_finite_finish_failed", "usb_quit_finish", "usb_quit_empty_finish",
+        "normal_program_finish_left_maintained", "normal_program_finish_left_reach", "normal_program_finish_left_supported", "usb_finite_finish", "usb_finite_finish_failed", "usb_quit_finish", "usb_quit_empty_finish",
     ],
 )
 def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id(
@@ -921,6 +921,8 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
 
         def state(self, run_id):
             w = workspace()
+            if failure == "normal_program_finish_left_supported":
+                w["bounds"]["arm_left_shoulder_lift.pos"]["rate_per_s"] = 3.
             return {
                 "service_incarnation": "service",
                 "controller": {"device_id": "device", "controller_generation": "control"},
@@ -1419,6 +1421,8 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 args.workload_segment = "combined-body"
             if failure in {"normal_program_finish_left_maintained", "normal_program_finish_left_reach"}:
                 args.workload_segment = "left-maintained" if failure.endswith("maintained") else "left-reach"
+            if failure == "normal_program_finish_left_supported":
+                args.workload_segment = "left-supported-reach"
             if usb_finish:
                 args.source, args.workload_segment = "usb-leaders", "full"
             if failure.startswith("usb_quit_"):
@@ -1447,7 +1451,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                     super().__init__(*args, **kwargs)
                     self.duration_s = .001  # Reporting seam only; real Native held proof is exercised below.
             monkeypatch.setattr(am1_teleop_workload, "TeleopWorkload", ShortProgramme)
-            if failure in {"normal_program_finish_left_maintained", "normal_program_finish_left_reach"}:
+            if failure in {"normal_program_finish_left_maintained", "normal_program_finish_left_reach", "normal_program_finish_left_supported"}:
                 original_selected = m.SelectedLeftWorkload
                 class ShortSelected(original_selected):
                     def __init__(self, *args, **kwargs):
@@ -1485,6 +1489,11 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                     assert summary["selected_profile"]["reference"] == plan["reference"]
                     assert summary["selected_profile"]["endpoint_normalized"] == plan["endpoint_normalized"]
                     assert start["bench_continuity"] is False
+                if failure == "normal_program_finish_left_supported":
+                    assert start["workload_segment"] == summary["workload_segment"] == "left-supported-reach"
+                    assert start["program_active_seconds"] == 28. and start["bench_continuity"] is False
+                    assert summary["selected_profile"]["reference"] == summary["workspace"]["reference"]
+                    assert summary["selected_profile"]["shoulder_endpoint_normalized"] == summary["workspace"]["bounds"]["arm_left_shoulder_lift.pos"]["max"]
                 if usb_finish:
                     assert summary["clean_input_end"] == ("local_quit" if failure.startswith("usb_quit_") else "duration_elapsed")
             else:
@@ -8483,7 +8492,7 @@ def test_selected_left_profile_chooses_supported_far_bound_and_never_moves_an_ou
         m.SelectedLeftWorkload(outside)
 
 
-@pytest.mark.parametrize("segment,duration", [("left-maintained", 16.), ("left-reach", 20.)])
+@pytest.mark.parametrize("segment,duration", [("left-maintained", 16.), ("left-reach", 20.), ("left-supported-reach", 28.)])
 def test_selected_left_cli_declares_finite_normal_virtual_profile(monkeypatch, segment, duration):
     m = adapter()
     seen = []
@@ -8524,3 +8533,66 @@ def test_selected_left_profile_refuses_endpoint_that_cannot_fit_existing_ramp_ra
     native["bounds"]["arm_left_elbow_flex.pos"]["rate_per_s"] = .1
     with pytest.raises(ValueError, match="unchanged.*ramp rate"):
         m.SelectedLeftWorkload(native)
+
+
+@pytest.mark.parametrize("at,shoulder_fraction,elbow_fraction,opening_fraction", [
+    (0., 0., 0., 0.), (2., 0., 0., 0.), (4., .5, 0., 0.), (6., 1., 0., 0.),
+    (8., 1., 0., 0.), (10., 1., .5, 0.), (12., 1., 1., 0.), (14., 1., 1., 0.),
+    (15., 1., 1., .5), (16., 1., 1., 1.), (17., 1., 1., .5), (18., 1., 1., 0.),
+    (20., 1., .5, 0.), (22., 1., 0., 0.), (24., .5, 0., 0.), (26., 0., 0., 0.), (28., 0., 0., 0.),
+])
+def test_supported_left_reach_keeps_declared_shoulder_first_order_and_nine_other_targets(at, shoulder_fraction, elbow_fraction, opening_fraction):
+    m = adapter()
+    native = workspace()
+    shoulder, elbow, gripper = "arm_left_shoulder_lift.pos", "arm_left_elbow_flex.pos", "arm_left_gripper.pos"
+    native["bounds"][shoulder]["rate_per_s"] = 3.
+    task = m.SelectedLeftWorkload(native, segment="left-supported-reach")
+    task.elapsed_s = at
+    action = {"arm_" + key: value for key, value in task.get_action().items()}
+    origin = native["reference"]
+    assert action[shoulder] == pytest.approx(origin[shoulder] + shoulder_fraction * (native["bounds"][shoulder]["max"] - origin[shoulder]))
+    assert action[elbow] == pytest.approx(origin[elbow] + elbow_fraction * (task.endpoint-origin[elbow]))
+    assert action[gripper] == pytest.approx(origin[gripper] + opening_fraction * (task.opening-origin[gripper]))
+    assert all(action[key] == origin[key] for key in KEYS if key not in {shoulder, elbow, gripper})
+    assert task.duration_s == 28. and task.body_phase_elapsed is None
+    plan = task.plan()
+    assert plan["shoulder_endpoint_normalized"] == native["bounds"][shoulder]["max"]
+    assert plan["reference"] == origin and plan["program_active_seconds"] == 28.
+
+
+def test_supported_left_reach_recovery_preserves_both_absolute_endpoints_and_interrupted_phase():
+    m = adapter()
+    native = workspace()
+    shoulder, elbow = "arm_left_shoulder_lift.pos", "arm_left_elbow_flex.pos"
+    native["bounds"][shoulder]["rate_per_s"] = 3.
+    task = m.SelectedLeftWorkload(native, segment="left-supported-reach")
+    task.elapsed_s = 13.
+    task.admit(10.)
+    now = [10.]
+    producer = m.FrameProducer(task, clock=lambda: now[0])
+    producer.workspace, producer.native_cursor = native, dict(native["reference"])
+    original = producer.capture({"grant_id": str(uuid4())}, body=m.ZERO_BODY)
+    task.freeze()
+    task.advance(90.)
+    assert task.elapsed_s == 13. and task.interrupted_phases == {"left_endpoint_hold"}
+    task.admit(90.)
+    now[0] = 90.
+    producer.native_cursor.update({shoulder: 1., elbow: 6.})
+    producer.reacquire = True
+    fresh = producer.capture({"grant_id": str(uuid4())}, body=m.ZERO_BODY)
+    assert fresh["target"] == original["target"] and fresh["body"] == m.ZERO_BODY
+    assert fresh["source"]["sample_seq"] == 2 and fresh["source"]["grant_id"] != original["source"]["grant_id"]
+    for step in range(1, 151):
+        task.advance(90. + step / 10)
+    assert task.complete and task.elapsed_s == 28.
+    assert task.plan()["reference"] == native["reference"]
+    assert task.plan()["interrupted_phases"] == ["left_endpoint_hold"]
+    assert task.phases_completed == {name for name, _, _ in task.schedule}
+
+
+def test_supported_left_reach_refuses_unsupported_shoulder_ramp():
+    m = adapter()
+    native = workspace()
+    native["bounds"]["arm_left_shoulder_lift.pos"]["rate_per_s"] = .1
+    with pytest.raises(ValueError, match="shoulder.*unchanged.*ramp rate"):
+        m.SelectedLeftWorkload(native, segment="left-supported-reach")

@@ -1,4 +1,4 @@
-## Active AM1 view continuity after accepted Packet18 operation
+## Active AM1 useful arm operation after PR27 integration
 
 Read first: [current state](docs/alohamini/current-state.md) and
 [source-backed decisions/lessons](docs/alohamini/decisions-and-lessons.md).
@@ -58,6 +58,13 @@ and maintained dwell before tuning. Use current supported workspace/settings and
 fresh streamed intent; other joints hold actual admitted targets. Preserve fixed
 references through recovery and report interrupted dwells honestly. No gain sweep,
 expanded travel, micro-tick gate, calibration or new telemetry/launcher framework.
+Stage45 source871598c6 is installed at motor603c4624/runtimeD632471f/MF2a115478;
+only host/selected-evidence and Core/media changed, with matched Stage44 rollback.
+Actual90 completed16 active seconds without producer holds, but actual left response
+is partial:2020→2041→2031 despite actual Goal2020→2124→2020. Calibration matches
+Packet14; poses differ. Next supported28s shoulder-conditioned unloaded reach uses
+current bounds/settings and fresh input, not a gain/travel increase or old-pose claim.
+New PC-only source needs focused checks/review, no unchanged native redeploy.
 Main/AM2 remain unchanged. Do not repeat powered checks solely for publication.
 No fault-injection campaign, gains, network remediation or freshness downgrade.
 Physical USB

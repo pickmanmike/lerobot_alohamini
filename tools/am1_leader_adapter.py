@@ -65,8 +65,9 @@ class SelectedLeftWorkload:
     """Finite current input with fixed original targets, not a native trajectory."""
 
     kind = "virtual-leaders"
-    DURATIONS = {"left-maintained": 16., "left-reach": 20.}
+    DURATIONS = {"left-maintained": 16., "left-reach": 20., "left-supported-reach": 28.}
     elbow = "arm_left_elbow_flex.pos"
+    shoulder = "arm_left_shoulder_lift.pos"
     gripper = "arm_left_gripper.pos"
 
     def __init__(self, workspace, *, segment="left-maintained"):
@@ -84,7 +85,12 @@ class SelectedLeftWorkload:
         opening = self.workspace["bounds"][self.gripper]
         self.opening = (min(self.origin[self.gripper] + 20., opening["max"],
                             self.origin[self.gripper] + 2 * opening["rate_per_s"])
-                        if segment == "left-reach" else self.origin[self.gripper])
+                        if segment in {"left-reach", "left-supported-reach"} else self.origin[self.gripper])
+        if segment == "left-supported-reach":
+            shoulder = self.workspace["bounds"][self.shoulder]
+            self.shoulder_endpoint = shoulder["max"]
+            if self.shoulder_endpoint-self.origin[self.shoulder] > 4 * shoulder["rate_per_s"] + 1e-9:
+                raise ValueError("selected shoulder endpoint exceeds the unchanged four-second ramp rate")
         self.schedule = [("left_baseline", 0., 2.), ("left_outward", 2., 6.),
                          ("left_endpoint_hold", 6., 10. if segment == "left-maintained" else 8.)]
         if segment == "left-reach":
@@ -92,6 +98,12 @@ class SelectedLeftWorkload:
         retract = 10. if segment == "left-maintained" else 12.
         self.schedule += [("left_retract", retract, retract + 4.),
                           ("left_final_hold", retract + 4., self.duration_s)]
+        if segment == "left-supported-reach":
+            self.schedule = [("left_baseline", 0., 2.), ("left_shoulder_outward", 2., 6.),
+                             ("left_shoulder_hold", 6., 8.), ("left_outward", 8., 12.),
+                             ("left_endpoint_hold", 12., 14.), ("left_gripper_open", 14., 16.),
+                             ("left_gripper_return", 16., 18.), ("left_retract", 18., 22.),
+                             ("left_shoulder_retract", 22., 26.), ("left_final_hold", 26., 28.)]
         self.elapsed_s, self._last = 0., None
         self.phases_completed, self.interrupted_phases = set(), set()
 
@@ -126,6 +138,18 @@ class SelectedLeftWorkload:
 
     def get_action(self):
         target = dict(self.origin)
+        if self.segment == "left-supported-reach":
+            elapsed = self.elapsed_s
+            shoulder = (max(0., min(1., (elapsed-2.) / 4.)) if elapsed <= 22.
+                        else max(0., 1. - (elapsed-22.) / 4.))
+            elbow = (max(0., min(1., (elapsed-8.) / 4.)) if elapsed <= 18.
+                     else max(0., 1. - (elapsed-18.) / 4.))
+            opening = ((elapsed-14.) / 2. if 14. < elapsed <= 16.
+                       else (18.-elapsed) / 2. if 16. < elapsed < 18. else 0.)
+            target[self.shoulder] += shoulder * (self.shoulder_endpoint-self.origin[self.shoulder])
+            target[self.elbow] += elbow * (self.endpoint-self.origin[self.elbow])
+            target[self.gripper] += opening * (self.opening-self.origin[self.gripper])
+            return {key.removeprefix("arm_"): value for key, value in target.items()}
         retract = 10. if self.segment == "left-maintained" else 12.
         elapsed = self.elapsed_s
         fraction = (max(0., min(1., (elapsed-2.) / 4.)) if elapsed <= retract
@@ -140,7 +164,7 @@ class SelectedLeftWorkload:
     def plan(self):
         bound, cal = self.workspace["bounds"][self.elbow], self.workspace["calibration"][self.elbow.removesuffix(".pos")]
         raw = min(self.workspace["raw_bounds"][self.elbow], key=lambda value: abs(normalized_raw(value, cal)-self.endpoint))
-        return {"segment": self.segment, "program_active_seconds": self.duration_s,
+        result = {"segment": self.segment, "program_active_seconds": self.duration_s,
                 "reference": dict(self.origin), "endpoint_normalized": self.endpoint, "endpoint_raw_bound": raw,
                 "direction_normalized": 1 if self.endpoint > self.origin[self.elbow] else -1,
                 "travel_normalized": self.endpoint-self.origin[self.elbow], "rate_limit_per_s": bound["rate_per_s"],
@@ -149,6 +173,15 @@ class SelectedLeftWorkload:
                 "active_progress_s": self.elapsed_s, "interrupted_phases": sorted(self.interrupted_phases),
                 "dwell_basis": "producer active intent; native delivered dwell assessed separately",
                 "target_policy": "fixed original admitted references and supported endpoint across qualified recovery"}
+        if self.segment == "left-supported-reach":
+            shoulder = self.workspace["bounds"][self.shoulder]
+            cal = self.workspace["calibration"][self.shoulder.removesuffix(".pos")]
+            raw = min(self.workspace["raw_bounds"][self.shoulder],
+                      key=lambda value: abs(normalized_raw(value, cal)-self.shoulder_endpoint))
+            result.update(shoulder_endpoint_normalized=self.shoulder_endpoint, shoulder_endpoint_raw_bound=raw,
+                          shoulder_travel_normalized=self.shoulder_endpoint-self.origin[self.shoulder],
+                          shoulder_rate_limit_per_s=shoulder["rate_per_s"])
+        return result
 
 
 class FrameProducer:
