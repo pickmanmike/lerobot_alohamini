@@ -33,11 +33,11 @@ supersedes wrist-button Packet15. Actual73/78/79 retain their separate acceptanc
 The owner accepted Actual88's bounded normal64.5s result and integrated PR26 into
 integrate/am1-local-teleop at472f8c4d, exact accepted a4d5f7e1 tree; PR25 remains
 merged at e3d8a196. That source-equivalent merge needed no redeploy or physical repeat.
-The owner accepted Actual89 and authorized ordinary PR27 integration into
-integrate/am1-local-teleop after outstanding applicable checks/review, superseding
-the prior PR27-unmerged restriction. The current comparable-request-clock review
-finding must be resolved first. New executable left-response/reach work belongs on
-a focused follow-up after integration, without automatically merging it.
+The owner accepted Actual89 and PR27 is integrated into
+integrate/am1-local-teleop at2ec74f14 after the comparable-request-clock finding
+was repaired at1bb715e3 and reviewed. Both threads are resolved; no CI runs were
+reported. New executable left-response/reach work is on the focused follow-up
+codex/am1-left-maintained-response, without automatic merge.
 PR27 view-repair source is73690add. Stage44 passed all ten stopped phases, changing only
 Core/media/WebRTC among22 runtime files; the other19, motor/camera/helper, private
 operating settings and matched rollback remain. Actual89 remains at source87cd55da/

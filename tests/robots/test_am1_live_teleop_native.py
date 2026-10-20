@@ -536,3 +536,120 @@ def test_entrypoint_expiry_handler_preserves_exact_genuine_fault(expiry_host, fa
         control.apply(robot, frame(identity, binding, 3, mode="active", epoch=2, sample=original))
     assert caught.value is error
     assert control.accepted_action_sequence == 2
+
+
+@pytest.mark.parametrize("last_outcome", ["accepted", "none", "expired"])
+def test_whole_robot_goal_evidence_uses_real_apply_standard_and_existing_nonblocking_sink(monkeypatch, last_outcome):
+    import json
+    import threading
+
+    import scservo_sdk as scs
+
+    from tests.robots.test_alohamini_lift_motor_feedback import ByteStreamPort, status
+    from tests.robots.test_am1_selected_joint_evidence import group_payload
+    from tools.am1_physical_executor import read_physical_sample
+
+    now, identity, binding, robot, control = lane()
+    robot.config.max_relative_target = None
+    robot._gripper_hold_goal = robot._joint_hold_goal = {}
+    robot._am1_selected_joint_evidence_enabled = False
+    evidence = host.AM1SelectedJointEvidence(enabled=False, clock=lambda: now[0])
+    control.selected_evidence = evidence
+    bus = robot.left_bus
+    codec = FeetechMotorsBus("unused-whole-goal", bus.motors, bus.calibration)
+    port = ByteStreamPort([status(group_payload(goal=2124, present=2120), motor_id=3)])
+    bus.port, bus.port_handler, bus.packet_handler = codec.port, port, scs.PacketHandler(0)
+    bus.model_ctrl_table, bus._decode_sign = codec.model_ctrl_table, codec._decode_sign
+    bus._encode_sign, bus._split_into_byte_chunks = codec._encode_sign, codec._split_into_byte_chunks
+    returned = []
+    def send(action):
+        robot._am1_live_before_write()
+        if now[0] >= 10.7 and last_outcome != "accepted":
+            if last_outcome == "expired":
+                raise host.AM1LiveInputExpired()
+            return None
+        accepted = {k: v for k,v in action.items() if not k.endswith(".pos")}
+        for arm in (robot.left_bus, robot.right_bus):
+            goals = {k:v for k,v in action.items() if k.endswith(".pos") and k[:-4] in arm.motors}
+            normalized, raw = robot._encode_am1_arm_goals(arm, goals, arm.raw)
+            arm.sync_write("Goal_Position", raw, normalize=False)
+            accepted.update(normalized)
+        returned.append(accepted)
+        return accepted
+    robot.send_action = send
+    assert control.apply(robot, frame(identity, binding, 1))
+    frozen = control.live_snapshot()
+    original = sample(control, expiry=10.34)
+    original["target"] = dict(frozen["cursor"])
+    now[0] = 10.1
+    assert control.apply(robot, frame(identity, binding, 2, mode="active", epoch=2, sample=original))
+    assert evidence.teleop_action["action_sequence"] == control.accepted_action_sequence == 2
+    for index in range(2, 7):
+        now[0] = 10.+index/10
+        fresh = sample(control, seq=index, expiry=now[0]+.24,
+                       source_id=original["source"]["source_id"], acquired=1.01+(index-1)/10)
+        fresh["target"] = dict(frozen["cursor"])
+        assert control.apply(robot, frame(identity, binding, index+1, mode="active", epoch=2, sample=fresh))
+    observation = robot.get_observation()
+    observation["_am1_arm_feedback"] = {"version": 1, "positions": {
+        name+".pos": {"raw": arm.raw[name], "normalized": observation[name+".pos"],
+                      "read_started_at_monotonic_s": 10.59, "read_completed_at_monotonic_s": 10.6}
+        for arm in (robot.left_bus, robot.right_bus) for name in arm.motors}}
+    control.annotate(observation, acquired_at=now[0])
+    observation[host.AM1_LOCAL_FEEDBACK_KEY]["read_started_at_monotonic_s"] = 10.59
+    evidence.publish(robot, control, observation)
+    assert observation["_am1_local_feedback"]["selected_joint"]["goal_readbacks"] == {}
+    started, release, written = threading.Event(), threading.Event(), []
+    def slow_sink(data):
+        started.set()
+        assert release.wait(2)
+        written.append(data)
+        return len(data)
+    writer = host.AM1RoutineRecordWriter(write=slow_sink)
+    evidence.emit = writer.emit_selected
+    try:
+        evidence.report(robot, control, observation)
+        assert started.wait(1) and not release.is_set()
+        assert len(port.writes) == 1
+        evidence.publish(robot, control, observation)
+        row = next(iter(observation["_am1_local_feedback"]["selected_joint"]["goal_readbacks"].values()))
+        assert row["diagnostic_available"] is True
+        assert row["goal_position_raw"] == row["requested_goal_raw"] == 2124 and row["present_position_raw"] == 2120
+        assert row["position"]["raw"] == 2124 and row["position"]["read_started_at_monotonic_s"] == 10.59
+        assert row["action_sequence"] == control.accepted_action_sequence == 7 and row["last_input_seq"] == 6
+        assert row["epoch"] == control.epoch == 2 and row["intent_revision"] == control.intent_revision == 0
+        consumer = SimpleNamespace(get_observation=lambda: observation,
+            latest_am1_local_feedback=copy.deepcopy(observation[host.AM1_LOCAL_FEEDBACK_KEY]),
+            latest_observation_received_at=10.61, latest_observation_roundtrip_age_s=.02,
+            latest_observation_error=None, latest_raw_observation_keys=frozenset(observation))
+        consumed = read_physical_sample(consumer, identity["run_id"], identity["host_incarnation"], -1, clock=lambda: 10.62)
+        selected = consumed["selected_joint"]
+        assert selected["version"] == 1 and selected["epoch"] == 2 and selected["intent_revision"] == 0
+        assert selected["action_sequence"] == 7 and selected["observation_id"] == control.observation_id
+        assert selected["acquired_at_monotonic_s"] == 10.6 and selected["goal_readbacks"] == evidence.goal_readbacks
+        consumer.latest_am1_local_feedback["selected_joint"]["observation_id"] += 1
+        with pytest.raises(ValueError, match="foreign selected native feedback"):
+            read_physical_sample(consumer, identity["run_id"], identity["host_incarnation"], -1, clock=lambda: 10.62)
+        assert row["run_id"] == identity["run_id"] and row["host_incarnation"] == identity["host_incarnation"]
+        assert control.live_snapshot()["workspace"] == frozen["workspace"] and control.live_snapshot()["reference"] == frozen["reference"]
+        assert control.live_snapshot()["live_deadline_monotonic_s"] == 310 and control.live_sample["valid_until_monotonic_s"] == 10.84
+        returned[-1]["arm_left_elbow_flex.pos"] += 1
+        assert evidence.teleop_action["accepted_action"] == control.accepted_action
+        if last_outcome != "accepted":
+            now[0] = 10.7
+            next_sample = sample(control, seq=7, expiry=10.94, source_id=original["source"]["source_id"], acquired=1.61)
+            next_sample["target"] = dict(frozen["cursor"])
+            assert control.apply(robot, frame(identity, binding, 8, mode="active", epoch=2, sample=next_sample)) is (last_outcome == "none")
+            assert evidence.teleop_action is None
+        else:
+            now[0] = 10.85
+            assert control.check_live(robot) and control.state == "paused"
+            evidence.publish(robot, control, observation)
+            assert "selected_joint" not in observation["_am1_local_feedback"]
+        assert robot._am1_selected_joint_evidence_enabled is False and not evidence.enabled
+        assert evidence.visible_settings is None and evidence.response_boundary is None and evidence.context is None
+    finally:
+        release.set()
+        writer.close()
+    emitted = json.loads(written[0].decode().removeprefix("[AM1 SELECTED JOINT] "))
+    assert emitted["goal_position_raw"] == 2124 and emitted["action"]["write_acknowledged"] is False

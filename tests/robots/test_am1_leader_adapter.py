@@ -728,7 +728,8 @@ def test_real_wss_clean_close_ends_qualified_wait_before_timeout(tmp_path):
         "bench_terminal_hold_stopped", "bench_terminal_hold_cancel", "bench_terminal_hold_budget",
         "bench_terminal_hold_native_ceiling",
         "bench_program_finish", "bench_program_finish_failed",
-        "normal_program_finish", "normal_program_finish_failed", "normal_program_finish_combined_body", "usb_finite_finish", "usb_finite_finish_failed", "usb_quit_finish", "usb_quit_empty_finish",
+        "normal_program_finish", "normal_program_finish_failed", "normal_program_finish_combined_body",
+        "normal_program_finish_left_maintained", "normal_program_finish_left_reach", "usb_finite_finish", "usb_finite_finish_failed", "usb_quit_finish", "usb_quit_empty_finish",
     ],
 )
 def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id(
@@ -1416,6 +1417,8 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 args.bench_continuity = False
             if failure == "normal_program_finish_combined_body":
                 args.workload_segment = "combined-body"
+            if failure in {"normal_program_finish_left_maintained", "normal_program_finish_left_reach"}:
+                args.workload_segment = "left-maintained" if failure.endswith("maintained") else "left-reach"
             if usb_finish:
                 args.source, args.workload_segment = "usb-leaders", "full"
             if failure.startswith("usb_quit_"):
@@ -1444,6 +1447,13 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                     super().__init__(*args, **kwargs)
                     self.duration_s = .001  # Reporting seam only; real Native held proof is exercised below.
             monkeypatch.setattr(am1_teleop_workload, "TeleopWorkload", ShortProgramme)
+            if failure in {"normal_program_finish_left_maintained", "normal_program_finish_left_reach"}:
+                original_selected = m.SelectedLeftWorkload
+                class ShortSelected(original_selected):
+                    def __init__(self, *args, **kwargs):
+                        super().__init__(*args, **kwargs)
+                        self.duration_s = .001  # Runner/reporting seam; full16/20s clocks tested independently.
+                monkeypatch.setattr(m, "SelectedLeftWorkload", ShortSelected)
             if failure.endswith("failed"):
                 with pytest.raises(RuntimeError, match="Native held qualification unavailable"):
                     asyncio.run(asyncio.wait_for(m.run(args), 10))
@@ -1464,6 +1474,16 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 if failure == "normal_program_finish_combined_body":
                     assert start["workload_segment"] == summary["workload_segment"] == "combined-body"
                     assert start["program_active_seconds"] == 64.5
+                    assert start["bench_continuity"] is False
+                if failure in {"normal_program_finish_left_maintained", "normal_program_finish_left_reach"}:
+                    expected = "left-maintained" if failure.endswith("maintained") else "left-reach"
+                    assert start["workload_segment"] == summary["workload_segment"] == expected
+                    assert start["program_active_seconds"] == (16. if expected == "left-maintained" else 20.)
+                    plan = next(row for row in records if row["event"] == "workload_plan")
+                    assert plan["run_id"] == owned_id and plan["segment"] == expected
+                    assert plan["reference"] == summary["workspace"]["reference"]
+                    assert summary["selected_profile"]["reference"] == plan["reference"]
+                    assert summary["selected_profile"]["endpoint_normalized"] == plan["endpoint_normalized"]
                     assert start["bench_continuity"] is False
                 if usb_finish:
                     assert summary["clean_input_end"] == ("local_quit" if failure.startswith("usb_quit_") else "duration_elapsed")
@@ -8383,3 +8403,124 @@ def test_ordinary_binding_view_wait_keeps_current_hold_and_original_ceiling(monk
         assert guard.original["run"]["deadline"] == 400. and guard.episodes == 0
         assert client.generation == "control" and client.sequence == 0
     asyncio.run(asyncio.wait_for(scenario(), 1.))
+
+
+@pytest.mark.parametrize("segment,duration", [("left-maintained", 16.), ("left-reach", 20.)])
+def test_selected_left_profile_keeps_fixed_targets_schedule_and_other_admitted_joints(segment, duration):
+    m = adapter()
+    native = workspace()
+    task = m.SelectedLeftWorkload(native, segment=segment)
+    elbow, gripper = "arm_left_elbow_flex.pos", "arm_left_gripper.pos"
+    reference = dict(native["reference"])
+    endpoint = native["bounds"][elbow]["max"]
+    checks = [(0., 0.), (2., 0.), (4., .5), (6., 1.), (8., 1.)]
+    checks += [(10., 1.), (12., .5), (14., 0.), (16., 0.)] if duration == 16 else [(10., 1.), (12., 1.), (14., .5), (16., 0.), (20., 0.)]
+    for at, fraction in checks:
+        task.elapsed_s = at
+        action = {"arm_" + key: value for key, value in task.get_action().items()}
+        assert action[elbow] == pytest.approx(reference[elbow] + fraction * (endpoint - reference[elbow]))
+        assert all(action[key] == reference[key] for key in KEYS if key not in {elbow, gripper})
+        expected_opening = min(reference[gripper] + 20., native["bounds"][gripper]["max"],
+                               reference[gripper] + 2 * native["bounds"][gripper]["rate_per_s"])
+        opening_fraction = (at - 8) / 2 if 8 < at <= 10 else (12 - at) / 2 if 10 < at < 12 else 0.
+        assert action[gripper] == pytest.approx(reference[gripper] + opening_fraction * (expected_opening - reference[gripper]) if duration == 20 else reference[gripper])
+        assert task.body_phase_elapsed is None
+    assert task.complete and task.duration_s == duration
+    assert task.plan()["reference"] == reference
+    assert task.plan()["endpoint_normalized"] == endpoint
+    assert task.plan()["program_active_seconds"] == duration
+    assert task.plan()["gripper_opening_delta"] == (expected_opening - reference[gripper] if duration == 20 else 0.)
+
+
+@pytest.mark.parametrize("segment", ["left-maintained", "left-reach"])
+def test_selected_left_profile_recovery_preserves_absolute_endpoint_and_truthful_interrupted_dwell(segment):
+    m = adapter()
+    native = workspace()
+    task = m.SelectedLeftWorkload(native, segment=segment)
+    elbow = "arm_left_elbow_flex.pos"
+    origin, endpoint = native["reference"][elbow], native["bounds"][elbow]["max"]
+    task.elapsed_s = 7.
+    task.admit(10.)
+    now = [10.]
+    producer = m.FrameProducer(task, clock=lambda: now[0])
+    producer.workspace, producer.native_cursor = native, dict(native["reference"])
+    frame = producer.capture({"grant_id": str(uuid4())}, body=m.ZERO_BODY)
+    assert frame["target"][elbow] == endpoint
+    original_plan = task.plan()
+    task.freeze()
+    task.advance(80.)
+    assert task.elapsed_s == 7. and task.interrupted_phases == {"left_endpoint_hold"}
+    task.admit(80.)
+    now[0] = 80.
+    producer.native_cursor[elbow] = origin + 1.
+    producer.reacquire = True
+    fresh = producer.capture({"grant_id": str(uuid4())}, body=m.ZERO_BODY)
+    assert fresh["target"] == frame["target"] and fresh["body"] == m.ZERO_BODY
+    assert fresh["source"]["sample_seq"] == 2 and fresh["source"]["grant_id"] != frame["source"]["grant_id"]
+    assert task.plan()["reference"] == original_plan["reference"]
+    assert task.plan()["endpoint_normalized"] == original_plan["endpoint_normalized"]
+    assert task.plan()["interrupted_phases"] == ["left_endpoint_hold"]
+    assert task.plan()["dwell_basis"] == "producer active intent; native delivered dwell assessed separately"
+    task.elapsed_s = 15. if segment == "left-maintained" else 18.
+    now[0] = 81.
+    returned = producer.capture({"grant_id": str(uuid4())}, body=m.ZERO_BODY)
+    assert returned["target"] == native["reference"]
+
+
+def test_selected_left_profile_chooses_supported_far_bound_and_never_moves_an_outside_other_reference():
+    import copy
+    m = adapter()
+    native = workspace()
+    elbow = "arm_left_elbow_flex.pos"
+    native["reference"][elbow] = native["bounds"][elbow]["max"]
+    native["bounds"][elbow]["rate_per_s"] = 3.
+    task = m.SelectedLeftWorkload(native)
+    assert task.plan()["endpoint_normalized"] == native["bounds"][elbow]["min"]
+    assert task.plan()["direction_normalized"] == -1
+    outside = copy.deepcopy(native)
+    outside["reference"]["arm_left_wrist_flex.pos"] = -1.
+    with pytest.raises(ValueError, match="workspace"):
+        m.SelectedLeftWorkload(outside)
+
+
+@pytest.mark.parametrize("segment,duration", [("left-maintained", 16.), ("left-reach", 20.)])
+def test_selected_left_cli_declares_finite_normal_virtual_profile(monkeypatch, segment, duration):
+    m = adapter()
+    seen = []
+    async def run(args):
+        seen.append(args)
+        return {}
+    monkeypatch.setattr(m, "run", run)
+    m.main(["--source", "virtual-leaders", "--url", "unused", "--ca", "unused", "--storage-state", "unused",
+            "--output", "unused", "--workload-segment", segment, "--duration-seconds", str(duration)])
+    assert seen[0].workload_segment == segment and seen[0].duration_seconds == duration
+    assert not seen[0].bench_continuity and seen[0].interrupt_at_seconds is None
+
+
+@pytest.mark.parametrize("segment", ["left-maintained", "left-reach"])
+def test_selected_left_profile_original_active_clock_does_not_reset_dwell_after_hold(segment):
+    m = adapter()
+    task = m.SelectedLeftWorkload(workspace(), segment=segment)
+    task.admit(0.)
+    for step in range(1, 71):
+        task.advance(step / 10)
+    assert task.elapsed_s == 7.
+    task.freeze()
+    task.advance(90.)
+    assert task.elapsed_s == 7. and task.interrupted_phases == {"left_endpoint_hold"}
+    task.admit(90.)
+    for step in range(1, 201):
+        task.advance(90. + step / 10)
+    assert task.complete and task.elapsed_s == task.duration_s
+    assert task.phases_completed == {name for name, _, _ in task.schedule}
+    assert task.plan()["interrupted_phases"] == ["left_endpoint_hold"]
+    assert task.plan()["phases"][2]["start_s"] == 6.
+    assert task.plan()["phases"][2]["end_s"] == (10. if segment == "left-maintained" else 8.)
+
+
+def test_selected_left_profile_refuses_endpoint_that_cannot_fit_existing_ramp_rate():
+    m = adapter()
+    native = workspace()
+    native["bounds"]["arm_left_elbow_flex.pos"]["rate_per_s"] = .1
+    with pytest.raises(ValueError, match="unchanged.*ramp rate"):
+        m.SelectedLeftWorkload(native)

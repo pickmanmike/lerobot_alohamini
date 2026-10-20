@@ -691,6 +691,8 @@ class AM1LocalControl:
                 action = self.selected_evidence.prepare(robot, action, self.binding)
         if resuming and any(float(action.get(key, 0)) != 0 for key in ("x.vel", "y.vel", "theta.vel", "lift_axis.vel")):
             raise RuntimeError("AM1 Local first resumed action must have zero body velocity")
+        if self.teleop and self.selected_evidence is not None:
+            self.selected_evidence.record_teleop_action(robot, self, marker, None)
         if hold_admission:
             try:
                 accepted = robot.send_action(action)
@@ -709,6 +711,8 @@ class AM1LocalControl:
                 key: _jsonable(value) for key, value in accepted.items()
                 if type(_jsonable(value)) in (int, float) and math.isfinite(_jsonable(value))
             }
+        if self.teleop and self.selected_evidence is not None:
+            self.selected_evidence.record_teleop_action(robot, self, marker, self.accepted_action)
         if resuming:
             report = getattr(robot, "_am1_routine_report", None)
             if report is None:

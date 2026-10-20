@@ -1066,3 +1066,152 @@ def test_right_p20_raw_paired_visible_proof_is_trial_only_and_never_rewrites_pid
         else: bad["active"]["registers"]["Protection_Current"] = 0
         assert not evidence._live_definition.settings_valid(bad), mutation
     assert len(json.dumps(proof, separators=(",", ":"))) < 4096
+
+
+def teleop_goal_lane(monkeypatch):
+    """Real codec/sparse SDK bytes; no device, old selected flags or response rule."""
+    from examples.alohamini.am1_live_teleop import TELEOP_ARM_KEYS, ZERO_BODY
+
+    obj, _, writes = robot(monkeypatch, enabled=False)
+    obj.config.no_follower = obj.config.use_degrees = False
+    now, rows = [10.], []
+    evidence = host.AM1SelectedJointEvidence(enabled=False, clock=lambda: now[0], emit=rows.append)
+    ident = binding()
+    obj._am1_teleop_binding = dict(ident, recipe="physical-live-teleop")
+    control = host.AM1LocalControl(**ident, selected_evidence=evidence, live=True,
+                                   live_recipe="physical-live-teleop", clock=lambda: now[0])
+    control.state, control.epoch, control.intent_revision = "active", 2, 0
+    control._live_summary.update(state="active", live_deadline_monotonic_s=310.)
+
+    def acquire(raw=2020, *, target_raw=None):
+        bus = obj.left_bus
+        normalized = float(bus._normalize({3: raw})[3])
+        desired = float(bus._normalize({3: raw if target_raw is None else target_raw})[3])
+        control.accepted_action_sequence += 1
+        control.accepted_action = {**dict.fromkeys(TELEOP_ARM_KEYS, 0.), **ZERO_BODY, KEY: normalized}
+        control.live_sample = {"seq": control.accepted_action_sequence, "target": {k: desired if k == KEY else control.accepted_action[k] for k in TELEOP_ARM_KEYS},
+                               "valid_until_monotonic_s": now[0]+.24}
+        marker = {**ident, "epoch": 2, "intent_revision": 0, "action_sequence": control.accepted_action_sequence}
+        evidence.record_teleop_action(obj, control, marker, control.accepted_action)
+        observation = {}
+        control.annotate(observation, acquired_at=now[0])
+        return observation
+    return obj, evidence, control, now, rows, writes, acquire
+
+
+def test_teleop_goal_evidence_maintains_old_flags_and_correlates_actual_readback(monkeypatch):
+    obj, evidence, control, now, rows, writes, acquire = teleop_goal_lane(monkeypatch)
+    port = attach_port(obj, [status(group_payload(goal=2020, present=2012), motor_id=3)])
+    observation = acquire()
+    evidence.report(obj, control, observation)
+    assert not port.writes
+    now[0] += .5
+    observation = acquire()  # Genuine fresh input/action at the same maintained target.
+    evidence.report(obj, control, observation)
+    assert len(port.writes) == 1 and writes == []
+    row = next(r for r in rows if r["kind"] == "live_goal_readback")
+    assert row["goal_position_raw"] == row["requested_goal_raw"] == 2020
+    assert row["present_position_raw"] == 2012 and row["goal_matches_expected_raw"] is True
+    assert row["action"]["provenance"] == "accepted-normalized-from-encoded-integer/derived-roundtrip"
+    assert row["action"]["encoded_goal_word"] == 2020 and row["action"]["write_acknowledged"] is False
+    assert row["run_id"] == control.binding["run_id"] and row["host_incarnation"] == control.binding["host_incarnation"]
+    assert row["epoch"] == 2 and row["intent_revision"] == 0 and row["action_sequence"] == control.accepted_action_sequence
+    evidence.publish(obj, control, observation)
+    assert len(observation["_am1_local_feedback"]["selected_joint"]["goal_readbacks"]) == 1
+    assert not evidence.enabled and obj._am1_selected_joint_evidence_enabled is False
+    assert getattr(obj, "_am1_selected_joint_evidence_context", None) is None
+    assert getattr(obj, "_am1_visible_control_binding", None) is None and evidence.context is None
+    assert evidence.response_boundary is None and evidence.visible_settings is None
+
+
+@pytest.mark.parametrize("mode", ["ordinary", "protected_hold", "inward_cap"])
+@pytest.mark.parametrize("drive", [0, 1])
+def test_teleop_expected_raw_is_accepted_codec_roundtrip_not_requested_wire_capture(monkeypatch, mode, drive):
+    obj, evidence, control, _, _, _, acquire = teleop_goal_lane(monkeypatch)
+    obj.left_bus.calibration[ELBOW] = MotorCalibration(3, drive, 1845, 864, 3073)
+    measured = 2124
+    held = float(obj.left_bus._normalize({3: measured})[3])
+    desired = held + 8.751 * (-1 if drive else 1)
+    if mode == "protected_hold":
+        desired = held
+        obj._joint_hold_goal[ELBOW] = held
+    elif mode == "inward_cap":
+        obj.config.max_relative_target = .31
+    accepted, actual_raw = obj._encode_am1_arm_goals(obj.left_bus, {KEY: desired}, {ELBOW: measured})
+    acquire(actual_raw[ELBOW])
+    record = evidence.teleop_action
+    assert record["action"]["expected_goal_raw"] == actual_raw[ELBOW]
+    assert record["action"]["final_normalized"] == accepted[KEY]
+    assert record["action"]["calibration"] == [3, drive, 1845, 864, 3073]
+    assert record["action"]["write_acknowledged"] is False
+    assert not evidence.enabled and obj._am1_selected_joint_evidence_enabled is False
+
+
+@pytest.mark.parametrize("changed", ["run", "host", "epoch", "revision", "sequence", "accepted", "calibration", "expired", "legacy_flag"])
+def test_teleop_goal_readback_refuses_changed_or_expired_correlation_without_extra_io(monkeypatch, changed):
+    obj, evidence, control, now, rows, _, acquire = teleop_goal_lane(monkeypatch)
+    port = attach_port(obj, [status(group_payload(goal=2020), motor_id=3)])
+    acquire()
+    now[0] += .5
+    observation = acquire()
+    original_decode = evidence._decoded
+    def decode(bus, payload):
+        result = original_decode(bus, payload)
+        if changed in {"run", "host"}:
+            control.binding["run_id" if changed == "run" else "host_incarnation"] = str(uuid4())
+        elif changed in {"epoch", "revision", "sequence"}:
+            attr = {"epoch": "epoch", "revision": "intent_revision", "sequence": "accepted_action_sequence"}[changed]
+            setattr(control, attr, getattr(control, attr)+1)
+        elif changed == "accepted":
+            control.accepted_action[KEY] += .1
+        elif changed == "calibration":
+            obj.left_bus.calibration[ELBOW].range_min += 1
+        elif changed == "legacy_flag":
+            obj._am1_selected_joint_evidence_enabled = True
+        else:
+            now[0] += .3
+        return result
+    monkeypatch.setattr(evidence, "_decoded", decode)
+    evidence.report(obj, control, observation)
+    assert len(port.writes) == 1
+    row = rows[-1]
+    assert row["diagnostic_available"] is False and row["unavailable_reason"] == "teleop action correlation changed during read"
+    assert row["goal_matches_expected_raw"] is None
+    evidence.report(obj, control, observation)
+    assert len(port.writes) == 1
+
+
+def test_teleop_goal_checkpoints_include_maintained_outward_and_return_with_maximum_eight_reads(monkeypatch):
+    obj, evidence, control, now, rows, _, acquire = teleop_goal_lane(monkeypatch)
+    port = attach_port(obj, [status(group_payload(goal=raw), motor_id=3) for raw in (2020, 2100, 2020, 2100, 2020, 2100, 2020, 2100)])
+    for index in range(10):
+        now[0] = 10.+index*2
+        raw = 2020 if index%2 == 0 else 2100
+        evidence.report(obj, control, acquire(raw))
+        now[0] += .5
+        evidence.report(obj, control, acquire(raw))
+        now[0] += .1
+        evidence.report(obj, control, acquire(raw))
+    assert len(port.writes) == len(rows) == len(evidence.goal_readbacks) == 8
+    assert [r["requested_goal_raw"] for r in rows[:3]] == [2020, 2100, 2020]
+    assert all(b["read_started_at_monotonic_s"]-a["read_started_at_monotonic_s"] >= 1 for a,b in zip(rows, rows[1:], strict=False))
+
+
+@pytest.mark.parametrize("bad", ["timeout", "checksum", "servo", "status", "torque", "mode"])
+def test_teleop_goal_optional_empty_timeout_and_actual_faults_keep_existing_meaning(monkeypatch, bad):
+    obj, evidence, control, now, rows, _, acquire = teleop_goal_lane(monkeypatch)
+    payload=group_payload(goal=2020, servo_status=8 if bad=="status" else 0, torque=0 if bad=="torque" else 1, mode=1 if bad=="mode" else 0)
+    packet=bytearray(status(payload,motor_id=3,error=8 if bad=="servo" else 0))
+    if bad=="checksum":
+        packet[-1]^=1
+    port=attach_port(obj,[] if bad=="timeout" else [bytes(packet)])
+    acquire()
+    now[0]+=.5
+    observation=acquire()
+    if bad=="timeout":
+        evidence.report(obj,control,observation)
+    else:
+        with pytest.raises(RuntimeError):
+            evidence.report(obj,control,observation)
+    assert len(port.writes)==1 and rows[-1]["diagnostic_available"] is False
+    assert not evidence.enabled and obj._am1_selected_joint_evidence_enabled is False
