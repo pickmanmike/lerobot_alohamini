@@ -2364,3 +2364,59 @@ def test_pending_pause_ack_exact_accepted_hold_preserves_existing_plus_two_rule(
         assert e._fault is None
     finally:
         stop()
+
+
+@pytest.mark.parametrize("recipe,present", [("physical-live-teleop", True),
+    ("physical-live-teleop", False), ("physical-arm-hold-body", True)])
+def test_left_response_request_is_bound_before_any_owned_unit(tmp_path, monkeypatch, recipe, present):
+    from examples.alohamini.am1_session_contract import RECIPES
+    from lerobot.robots.alohamini import am1_elbow_integral as gains
+    from tests.robots.test_am1_elbow_integral import RIGHT_P20_HOST, RIGHT_P20_RUN
+    m = module()
+    state, root = tmp_path / "state", tmp_path / "runs"
+    state.mkdir(mode=0o700)
+    root.mkdir(mode=0o700)
+    provider = object.__new__(m.ProtectedHostRun)
+    provider.config = {"physical_state_directory": str(state), "run_root": str(root), "host_head": "a" * 40,
+        "host_repository": str(tmp_path), "host_python": "unused-python", "camera_python": "unused-python",
+        "camera_repository": str(tmp_path), "camera_config": str(tmp_path / "config"),
+        "camera_credentials": str(tmp_path / "credentials"), "camera_binary": str(tmp_path / "binary"),
+        "camera_state": str(tmp_path / "camera")}
+    provider.observation = SimpleNamespace()
+    monkeypatch.setattr(provider, "_validate_source", lambda: None)
+    monkeypatch.setattr(m, "wait_required_camera", lambda *args: None)
+    owned, calls = [], []
+    descriptor = root / RIGHT_P20_RUN[:8] / "left-response-p.json"
+    def consume(actual_state, directory, actual_recipe, run, host, source):
+        assert not owned, "comparison authority must qualify before camera or motor ownership"
+        assert (actual_state, directory, actual_recipe, run, host, source) == (
+            state, root / RIGHT_P20_RUN[:8], recipe, RIGHT_P20_RUN, RIGHT_P20_HOST, "a" * 40)
+        calls.append(actual_recipe)
+        if present and actual_recipe != "physical-live-teleop":
+            raise ValueError("left comparison requires the whole-arm shared path")
+        if present:
+            descriptor.write_text("{}")
+            return descriptor
+        return None
+    monkeypatch.setattr(gains, "consume_left_response_p_request", consume, raising=False)
+    monkeypatch.setattr(gains, "consume_right_p20_request", lambda *args: None)
+    def unit(name, *args, **kwargs):
+        owned.append((name, args))
+        if "host" in name:
+            raise OSError("stop before hardware host creation")
+        return SimpleNamespace()
+    monkeypatch.setattr(m, "OwnedUnit", unit)
+    if present and recipe != "physical-live-teleop":
+        with pytest.raises(ValueError, match="whole-arm shared path"):
+            provider.start(RIGHT_P20_RUN, RIGHT_P20_HOST, RECIPES[recipe], lambda: None)
+        assert not owned and calls == [recipe]
+    else:
+        with pytest.raises(OSError, match="before hardware"):
+            provider.start(RIGHT_P20_RUN, RIGHT_P20_HOST, RECIPES[recipe], lambda: None)
+        assert calls == [recipe]
+        command = owned[-1][1][1]
+        option = "--am1-left-response-p-trial-file"
+        if present:
+            assert command[command.index(option) + 1] == str(descriptor)
+        else:
+            assert option not in command

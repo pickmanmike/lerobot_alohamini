@@ -1680,3 +1680,89 @@ def test_live_health_all_fields_keep_their_original_per_bus_interval(activation)
         assert receipt["group_call_started_at_monotonic_s"] == pytest.approx(start)
         assert receipt["group_call_completed_at_monotonic_s"] == pytest.approx(end)
         assert len(getattr(robot, side + "_bus").port_handler.writes) == 1
+
+
+@pytest.mark.parametrize("proportional", [16, 32])
+def test_left_response_active_settings_preserve_original_and_only_allow_declared_p(activation, monkeypatch, proportional):
+    import copy
+
+    from lerobot.robots.alohamini.am1_live_teleop import verify_settings
+    from tests.robots.test_am1_live_teleop_native import install_left_response_trial
+
+    robot = configured_robot(activation)
+    key = "arm_left_elbow_flex"
+    robot._am1_teleop_settings["left"]["registers"]["P_Coefficient"][key] = 16
+    trial = install_left_response_trial(monkeypatch, robot, proportional=proportional)
+    original = copy.deepcopy(robot._am1_teleop_settings)
+    robot.left_bus.registers["P_Coefficient", key] = proportional
+    for bus, names in ((robot.left_bus, robot.left_arm_motors), (robot.right_bus, robot.right_arm_motors)):
+        for name in names:
+            bus.registers["Torque_Enable", name] = bus.registers["Lock", name] = 1
+    verify_settings(robot)
+    assert robot._am1_teleop_settings == original
+    assert robot._am1_teleop_active_settings["left"]["registers"]["P_Coefficient"][key] == proportional
+    assert trial.events == []
+    robot.right_bus.registers["P_Coefficient", "arm_right_elbow_flex"] += 1
+    with pytest.raises(RuntimeError, match="settings changed"):
+        verify_settings(robot)
+
+
+def test_left_response_configure_retains_transaction_before_writes_and_does_not_restart_on_rearm(activation, monkeypatch):
+    from tests.robots.test_am1_live_teleop_native import install_left_response_trial
+
+    robot = configured_robot(activation)
+    robot.left_bus.registers["P_Coefficient", "arm_left_elbow_flex"] = 16
+    install_left_response_trial(monkeypatch, robot, installed=False)
+    robot.configure()
+    trial = getattr(robot, "_am1_left_response_p_trial", None)
+    assert trial is not None and trial.events == ["prepare", "off", "apply"]
+    assert robot._am1_teleop_settings["left"]["registers"]["P_Coefficient"]["arm_left_elbow_flex"] == 16
+    assert robot.left_bus.registers["P_Coefficient", "arm_left_elbow_flex"] == 32
+    with pytest.raises(RuntimeError, match="left.*response|Left.*response"):
+        robot.configure()
+    assert trial.events == ["prepare", "off", "apply"]
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_left_response_cleanup_retains_restore_failure_before_bus_close(activation, monkeypatch, failed):
+    from tests.robots.test_am1_live_teleop_native import install_left_response_trial
+
+    robot = configured_robot(activation)
+    robot._am1_protected_cleanup = True
+    trial = install_left_response_trial(monkeypatch, robot)
+    robot.left_bus.registers["P_Coefficient", "arm_left_elbow_flex"] = 32
+    if failed:
+        def refuse(owner):
+            assert owner.left_bus.is_connected
+            raise OSError("restoration proof missing")
+        trial.restore = refuse
+    errors = robot._safe_shutdown(close_buses=True)
+    assert robot._am1_shutdown_evidence["selected_gain_restore_required"] is failed
+    assert bool([e for e in errors if "left response" in e.lower()]) is failed
+    assert robot._am1_shutdown_evidence["verified"] is not failed
+    if not failed:
+        assert trial.events[-1] == "restore"
+        assert robot.left_bus.registers["P_Coefficient", "arm_left_elbow_flex"] == 16
+    assert not robot.left_bus.is_connected
+
+
+@pytest.mark.parametrize("retired", ["baseline_refused", "restored"])
+def test_left_response_cleanup_without_outstanding_obligation_uses_ordinary_off(activation, monkeypatch, retired):
+    from tests.robots.test_am1_live_teleop_native import install_left_response_trial
+
+    robot = configured_robot(activation)
+    robot._am1_protected_cleanup = True
+    trial = install_left_response_trial(monkeypatch, robot)
+    trial.restore_required = False
+    robot.left_bus.registers["P_Coefficient", "arm_left_elbow_flex"] = 16
+    robot.left_bus.registers["Torque_Enable", "arm_left_elbow_flex"] = 1
+    def no_obligation(owner):
+        raise RuntimeError("no durable outstanding original: " + retired)
+    trial.disable_torque = no_obligation
+    trial.restore = lambda owner: None  # The actual transaction restore is a no-op without an obligation.
+    assert not robot._safe_shutdown(close_buses=True)
+    assert not robot._am1_shutdown_evidence["selected_gain_restore_required"]
+    assert robot._am1_shutdown_evidence["verified"]
+    assert robot.left_bus.registers["Torque_Enable", "arm_left_elbow_flex"] == 0
+    assert robot.left_bus.registers["P_Coefficient", "arm_left_elbow_flex"] == 16
+    assert not robot.left_bus.is_connected

@@ -1232,7 +1232,13 @@ class AM1SelectedJointEvidence:
         if (any(type(v) is not int for v in material) or material[0] != 3 or material[1] not in (0, 1)
                 or not 0 <= material[3] < material[4] <= 4095):
             return None
-        return {**control.binding, "calibration": material}
+        from .am1_live_teleop import left_response_receipt
+        try:
+            trial = left_response_receipt(robot)
+        except RuntimeError:
+            return None
+        return {**control.binding, "calibration": material,
+                **({"left_response_p_trial": trial} if trial is not None else {})}
 
     def record_teleop_action(self, robot, control, marker, accepted):
         """Copy only successfully returned whole-map action; raw expectation is derived."""
@@ -1330,6 +1336,8 @@ class AM1SelectedJointEvidence:
                "requested_goal_raw": original["action"]["expected_goal_raw"], "goal_position_raw": None,
                "present_position_raw": None, "goal_matches_expected_raw": None,
                "diagnostic_available": False, "read_started_at_monotonic_s": now}
+        if "left_response_p_trial" in self.teleop_binding:
+            row["left_response_p_trial"] = copy.deepcopy(self.teleop_binding["left_response_p_trial"])
         bus = self.teleop_bus
         transport = DirectSdkTransport(bus.port, motor_id=3, port_handler=bus.port_handler, packet_handler=bus.packet_handler)
         primary = None
@@ -2152,6 +2160,8 @@ class AM1SelectedJointEvidence:
                         ("run_id", "host_incarnation", "epoch", "intent_revision", "observation_id", "acquired_at_monotonic_s")},
                     "action_sequence": marker["accepted_action_sequence"],
                     "goal_readbacks": copy.deepcopy(self.goal_readbacks),
+                    **({"left_response_p_trial": copy.deepcopy(self.teleop_binding["left_response_p_trial"])}
+                       if "left_response_p_trial" in self.teleop_binding else {}),
                 }
             return
         outer = observation.get("_am1_local_feedback")

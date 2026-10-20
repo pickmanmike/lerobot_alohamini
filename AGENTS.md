@@ -1,4 +1,4 @@
-## Active AM1 useful arm operation after PR27 integration
+## Active AM1 response correction after PR28 integration
 
 Read first: [current state](docs/alohamini/current-state.md) and
 [source-backed decisions/lessons](docs/alohamini/decisions-and-lessons.md).
@@ -36,8 +36,11 @@ merged at e3d8a196. That source-equivalent merge needed no redeploy or physical 
 The owner accepted Actual89 and PR27 is integrated into
 integrate/am1-local-teleop at2ec74f14 after the comparable-request-clock finding
 was repaired at1bb715e3 and reviewed. Both threads are resolved; no CI runs were
-reported. New executable left-response/reach work is on the focused follow-up
-codex/am1-left-maintained-response, without automatic merge.
+reported. The owner accepted Actual90–93 only as completed procedures/modest
+directional movement, viewing/recovery/reuse; requested reach remains unachieved.
+PR28 is integrated at0a14c051445d076f8a2bff16be59763675da2bf1, exact40929d58
+tree, without component redeployment or powered repeat. New response work is on
+codex/am1-left-response-effort; that follow-up is not automatically merged.
 PR27 view-repair source is73690add. Stage44 passed all ten stopped phases, changing only
 Core/media/WebRTC among22 runtime files; the other19, motor/camera/helper, private
 operating settings and matched rollback remain. Actual89 remains at source87cd55da/
@@ -52,13 +55,19 @@ The process-local msedge software-decoder option is available in the ordinary
 browser-only launcher with stable separate mode profiles. Dedicated-profile fresh
 enrollment now survives reload and camera-only09 verified live chest WebRTC; motor
 operation in that profile remains untested. This is not GPU proof or a global preference change.
-Next operating scope is useful left-elbow response, then a short unloaded
+Next operating scope is materially better repeatable maintained left-elbow response,
+then repeat the short unloaded
 reach/hold/gripper/retract under normal required usable viewing. Compare actual
 requested/mapped/accepted/servo-Goal/measured evidence, sign/units, pose, direction
 and maintained dwell before tuning. Use current supported workspace/settings and
 fresh streamed intent; other joints hold actual admitted targets. Preserve fixed
-references through recovery and report interrupted dwells honestly. No gain sweep,
-expanded travel, micro-tick gate, calibration or new telemetry/launcher framework.
+references through recovery and report interrupted dwells honestly. The owner now
+authorizes a small predeclared reversible LEFT-ID3-only position-control parameter
+comparison when supported by retained effort/voltage/settings and installed FW
+semantics: one parameter at a time, a small candidate set, baseline/restoration
+verified. If substantial effort lacks motion, distinguish actual load/power/mechanism
+before escalating. Never change IDs, phase, calibration, travel or device protections;
+never overcommand to hide error. No general gain sweep, micro-tick gate or new framework.
 Stage45 source871598c6 is installed at motor603c4624/runtimeD632471f/MF2a115478;
 only host/selected-evidence and Core/media changed, with matched Stage44 rollback.
 Actual90/92/93 demonstrate partial directional elbow movement; Actual91 remains
@@ -69,9 +78,14 @@ with one.867s recovery and42/42 fresh operating chest samples. Target2124 held
 positioning is not. Do not rerun an unchanged workload for publication or infer a
 gain fault from undertravel. Current PC source d3faf3a7, native871598c6/Stage45
 unchanged. Post93 interface is stopped/certain/Start+Claim enabled. Publish/review
-PR28 without automatic merge; retain current source, limitations and rollback.
+the new response follow-up without automatic merge; retain current source,
+limitations and rollback. PR28 integration is complete.
 Main/AM2 remain unchanged. Do not repeat powered checks solely for publication.
-No fault-injection campaign, gains, network remediation or freshness downgrade.
+No fault-injection campaign, unreviewed/out-of-scope tuning, network remediation
+or freshness downgrade. Dedicated Edge enrollment is resolved; no pairing request.
+Use that ordinary profile as the sole qualifying viewer when feasible; a second
+viewer must not mask its required-view behavior. Native active ACKs are not extra
+hardware register reads. Judge requested versus achieved action, not displacement alone.
 Physical USB
 connection remains owner-deferred; retain historic identities/calibration without
 requesting connection, repeated unchanged enumeration or claiming new validation.

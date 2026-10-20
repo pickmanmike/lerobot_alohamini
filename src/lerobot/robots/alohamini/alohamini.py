@@ -511,13 +511,24 @@ class AlohaMini(Robot):
         """Configure motor modes and gains while leaving all torque disabled."""
         if getattr(self, "_am1_teleop_binding", None) is not None:
             from .am1_live_teleop import prepare_settings, refresh_startup_temperatures
+            if getattr(self, "_am1_left_response_p_trial", None) is not None:
+                raise RuntimeError("AM1 left response transaction cannot be reacquired or reused")
             prepare_settings(self)
             for bus, names in ((self.left_bus, self.left_arm_motors), (self.right_bus, self.right_arm_motors)):
                 for name in names:
                     refresh_startup_temperatures(self)
                     set_torque_enabled(bus, (name,), enabled=False)
+            if getattr(self, "_am1_left_response_p_binding", None) is not None:
+                from .am1_elbow_integral import AM1LeftResponseProportionalTrial
+                trial = AM1LeftResponseProportionalTrial(
+                    self._am1_left_response_p_binding, self._am1_left_response_p_trial_directory
+                )
+                self._am1_left_response_p_trial = trial  # Retain the cleanup obligation before prepare can fail.
+                trial.prepare(self)
+                trial.disable_torque(self)
+                trial.apply(self)
             # The lift retains its existing velocity-mode homing/relief policy.
-            # No arm gain, acceleration, gearing or calibration is rewritten.
+            # Only an explicitly consumed left comparison may change its volatile P.
             refresh_startup_temperatures(self)
             self.lift.configure(force=True)
             refresh_startup_temperatures(self)
@@ -1084,6 +1095,9 @@ class AlohaMini(Robot):
             visible = getattr(self, "_am1_visible_control_evidence", None)
             if getattr(self, "_am1_visible_control_binding", None) is not None:
                 visible.verify_visible_active(self)
+            left_response = getattr(self, "_am1_left_response_p_trial", None)
+            if left_response is not None:
+                left_response.verify_active(self)
             if getattr(self, "_am1_teleop_binding", None) is not None:
                 from .am1_live_teleop import verify_settings
                 verify_settings(self)
@@ -1146,7 +1160,11 @@ class AlohaMini(Robot):
             for name in bus.motors:
                 try:
                     elbow_trial = getattr(self, "_am1_elbow_integral_trial", None)
-                    if bus is self.left_bus and name == RECOVERY_ELBOW and elbow_trial is not None:
+                    left_response = getattr(self, "_am1_left_response_p_trial", None)
+                    if (bus is self.left_bus and name == RECOVERY_ELBOW and left_response is not None
+                            and left_response.restore_required):
+                        left_response.disable_torque(self)
+                    elif bus is self.left_bus and name == RECOVERY_ELBOW and elbow_trial is not None:
                         elbow_trial.disable_torque(self)
                     elif (bus is self.right_bus and name == "arm_right_elbow_flex"
                           and getattr(self, "_am1_right_elbow_p_trial", None) is not None
@@ -1169,6 +1187,12 @@ class AlohaMini(Robot):
                 right_p20.restore(self)
             except BaseException as error:
                 errors.append(f"restore AM1 right elbow proportional: {type(error).__name__}: {error}")
+        left_response = getattr(self, "_am1_left_response_p_trial", None)
+        if left_response is not None:
+            try:
+                left_response.restore(self)
+            except BaseException as error:
+                errors.append(f"restore AM1 left response proportional: {type(error).__name__}: {error}")
         integral_trial = getattr(self, "_am1_shoulder_integral_trial", None)
         if integral_trial is not None:
             try:
@@ -1219,11 +1243,14 @@ class AlohaMini(Robot):
                 (integral_trial is not None and integral_trial.restore_required)
                 or (elbow_trial is not None and elbow_trial.restore_required)
                 or (right_p20 is not None and right_p20.restore_required)
+                or (left_response is not None and left_response.restore_required)
             )
             if elbow_trial is not None:
                 evidence["elbow_integral"] = elbow_trial.evidence
             if right_p20 is not None:
                 evidence["right_p20_trial"] = right_p20.evidence
+            if left_response is not None:
+                evidence["left_response_p_trial"] = left_response.evidence
             evidence["completed_at_monotonic_s"] = time.monotonic()
             evidence["verified"] = not errors
 

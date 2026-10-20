@@ -653,3 +653,207 @@ def test_whole_robot_goal_evidence_uses_real_apply_standard_and_existing_nonbloc
         writer.close()
     emitted = json.loads(written[0].decode().removeprefix("[AM1 SELECTED JOINT] "))
     assert emitted["goal_position_raw"] == 2124 and emitted["action"]["write_acknowledged"] is False
+
+
+# Existing native lane; the gain transaction itself has separate injected-wire tests.
+def install_left_response_trial(monkeypatch, robot, *, workload="left-maintained", proportional=32, installed=True):
+    from lerobot.robots.alohamini import am1_elbow_integral as gains
+
+    binding = {"version": 1, "kind": "left-response-p", "run_id": robot._am1_teleop_binding["run_id"],
+               "host_incarnation": robot._am1_teleop_binding["host_incarnation"], "request_sha256": "a" * 64,
+               "request": {"proportional": proportional, "workload_segment": workload}}
+
+    class Trial:
+        def __init__(self, value, directory):
+            assert value == binding
+            self.binding, self.directory, self.proportional = copy.deepcopy(value), directory, proportional
+            self.restore_required, self.verified, self.events = False, False, []
+
+        @property
+        def receipt(self):
+            return {"version": 1, "kind": "left-response-p", "run_id": binding["run_id"],
+                    "host_incarnation": binding["host_incarnation"], "request_sha256": binding["request_sha256"],
+                    "source_head": "b" * 40, "request_id": "c" * 36, "workload_segment": workload,
+                    "original_p": 16, "configured_p": proportional, "restore_required": self.restore_required,
+                    "original_settings_sha256": "d" * 64, "prepared_at_monotonic_s": 1., "configured_at_monotonic_s": 2.}
+
+        @property
+        def evidence(self):
+            return {"binding": copy.deepcopy(binding), "original_registers": {"P_Coefficient": 16},
+                    "original_settings_sha256": "d" * 64, "configured_p_readback": proportional,
+                    "events": list(self.events)}
+
+        def prepare(self, owner):
+            assert owner is robot and owner._am1_left_response_p_trial is self
+            assert all(bus.registers["Torque_Enable", name] == 0
+                       for bus, names in ((owner.left_bus, owner.left_arm_motors), (owner.right_bus, owner.right_arm_motors))
+                       for name in names)
+            assert owner._am1_teleop_settings["left"]["registers"]["P_Coefficient"]["arm_left_elbow_flex"] == 16
+            self.restore_required = True
+            self.events.append("prepare")
+
+        def disable_torque(self, owner):
+            assert owner is robot
+            if hasattr(owner.left_bus, "registers"):
+                owner.left_bus.registers["Torque_Enable", "arm_left_elbow_flex"] = 0
+                owner.left_bus.registers["Lock", "arm_left_elbow_flex"] = 1
+            self.events.append("off")
+
+        def apply(self, owner):
+            assert owner is robot and self.restore_required
+            owner.left_bus.registers["P_Coefficient", "arm_left_elbow_flex"] = proportional
+            self.events.append("apply")
+
+        def verify_active(self, owner):
+            assert owner is robot
+            self.verified = True
+            self.events.append("active")
+
+        def active_receipt(self, owner):
+            if owner is not robot or not self.verified or not self.restore_required or owner._am1_left_response_p_binding != self.binding:
+                raise RuntimeError("left response active binding changed")
+            return self.receipt
+
+        def restore(self, owner):
+            assert owner is robot
+            self.disable_torque(owner)
+            if hasattr(owner.left_bus, "registers"):
+                owner.left_bus.registers["P_Coefficient", "arm_left_elbow_flex"] = 16
+                owner.left_bus.registers["Lock", "arm_left_elbow_flex"] = 0
+            self.events.append("restore")
+            self.restore_required = False
+
+    monkeypatch.setattr(gains, "AM1LeftResponseProportionalTrial", Trial, raising=False)
+    robot._am1_left_response_p_binding = copy.deepcopy(binding)
+    robot._am1_left_response_p_trial_directory = "/private/left-response"
+    trial = Trial(binding, robot._am1_left_response_p_trial_directory)
+    trial.restore_required = trial.verified = installed
+    if installed:
+        robot._am1_left_response_p_trial = trial
+    return trial
+
+
+def test_left_response_cli_binding_is_opt_in_and_exact_protected_teleop(monkeypatch):
+    from lerobot.robots.alohamini import am1_elbow_integral as gains
+
+    args = SimpleNamespace(robot_model="alohamini1", no_follower=False, no_cameras=True,
+                           am1_run_id=str(uuid4()), am1_host_incarnation=str(uuid4()),
+                           am1_protected_run_directory="/private/run", am1_left_response_p_trial_file=None)
+    assert host.left_response_p_trial_binding(args, None) is None
+    args.am1_left_response_p_trial_file = "/private/run/left-response-p.json"
+    identity = {"run_id": args.am1_run_id, "host_incarnation": args.am1_host_incarnation, "recipe": "physical-live-teleop"}
+    expected = {"kind": "left-response-p", "run_id": args.am1_run_id, "host_incarnation": args.am1_host_incarnation,
+                "request": {"source_head": "b" * 40}}
+    import subprocess
+    monkeypatch.setattr(subprocess, "check_output", lambda *a, **k: b"b" * 40 + b"\n")
+    calls = []
+    monkeypatch.setattr(gains, "load_left_response_p_binding", lambda *a: calls.append(a) or expected, raising=False)
+    monkeypatch.setenv("AM1_VISIBLE_CONTROL_RECIPE", "physical-live-teleop")
+    monkeypatch.setenv("AM1_SCRIPTED_PREPARE", "1")
+    monkeypatch.delenv("AM1_SELECTED_JOINT_EVIDENCE", raising=False)
+    assert host.left_response_p_trial_binding(args, identity) == expected
+    assert calls == [(args.am1_left_response_p_trial_file, "/private/run", args.am1_run_id, args.am1_host_incarnation)]
+    monkeypatch.setattr(subprocess, "check_output", lambda *a, **k: b"9" * 40 + b"\n")
+    with pytest.raises(ValueError, match="actual motor source differs"):
+        host.left_response_p_trial_binding(args, identity)
+    assert len(calls) == 2
+    args.robot_model = "alohamini2"
+    with pytest.raises(ValueError, match="left.*response|Left.*response"):
+        host.left_response_p_trial_binding(args, identity)
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("workload", ["left-maintained", "left-reach"])
+@pytest.mark.parametrize("change", ["other_arm", "right_gripper", "body", "lift", "left_gripper"])
+def test_left_response_native_frames_fence_unselected_targets_before_admission(monkeypatch, workload, change):
+    now, identity, owner, robot, control = lane()
+    install_left_response_trial(monkeypatch, robot, workload=workload)
+    assert control.apply(robot, frame(identity, owner, 0))
+    from lerobot.robots.alohamini.am1_live_teleop import before_write
+    robot._am1_live_before_write = lambda: before_write(control, robot)
+    assert control.apply(robot, frame(identity, owner, 1, mode="active", epoch=2))
+    robot.events.clear()  # Empty readiness is not the following input-admission attempt.
+    value = sample(control)
+    value["target"] = dict(control._live_summary["reference"])
+    bound = control._live_summary["workspace"]["bounds"]["arm_left_elbow_flex.pos"]
+    value["target"]["arm_left_elbow_flex.pos"] = bound["min"]
+    key = {"other_arm": "arm_left_shoulder_pan.pos", "right_gripper": "arm_right_gripper.pos",
+           "left_gripper": "arm_left_gripper.pos"}.get(change)
+    if key:
+        value["target"][key] = control._live_summary["workspace"]["bounds"][key]["max"]
+    elif change == "body":
+        value["body"]["x.vel"] = .001
+    else:
+        value["body"]["lift_axis.vel"] = .001
+    before = copy.deepcopy(control._live_summary)
+    allowed = change == "left_gripper" and workload == "left-reach"
+    assert control.apply(robot, frame(identity, owner, 2, mode="active", epoch=2, sample=value)) is allowed
+    if not allowed:
+        assert control.live_sample is None and control._live_summary == before
+        assert not [e for e in robot.events if e[0] == "action"]
+
+
+def test_left_response_native_quantization_and_rearm_keep_original_reference(monkeypatch):
+    now, identity, owner, robot, control = lane()
+    install_left_response_trial(monkeypatch, robot)
+    assert control.apply(robot, frame(identity, owner, 0))
+    original = copy.deepcopy(control._live_summary["reference"])
+    value = sample(control)
+    value["target"] = dict(original)
+    cal = control._live_summary["workspace"]["calibration"]["arm_left_shoulder_pan"]
+    value["target"]["arm_left_shoulder_pan.pos"] += 200 / (cal[4] - cal[3])
+    assert control.apply(robot, frame(identity, owner, 1, mode="active", epoch=2, sample=value))
+    now[0] += .05
+    assert control.apply(robot, frame(identity, owner, 2, revision=1, epoch=3))
+    assert control._live_summary["reference"] == original
+    value = sample(control, seq=2, expiry=now[0] + .24, source_id=value["source"]["source_id"], acquired=1.06)
+    value["target"] = dict(original)
+    assert control.apply(robot, frame(identity, owner, 3, mode="active", revision=1, epoch=4, sample=value))
+    assert control._live_summary["reference"] == original
+
+
+@pytest.mark.parametrize("changed", ["restored", "binding", "late_target", "late_body"])
+def test_left_response_active_fences_cannot_be_lost_between_validation_and_write(monkeypatch, changed):
+    now, identity, owner, robot, control = lane()
+    trial = install_left_response_trial(monkeypatch, robot)
+    assert control.apply(robot, frame(identity, owner, 0))
+    value = sample(control)
+    value["target"] = dict(control._live_summary["reference"])
+    if changed == "restored":
+        trial.restore_required = False
+    elif changed == "binding":
+        robot._am1_left_response_p_binding = dict(trial.binding, run_id=str(uuid4()))
+    else:
+        send = robot.send_action
+        def mutate(action):
+            if changed == "late_body":
+                control.live_sample["body"]["x.vel"] = .001
+            else:
+                control.live_sample["target"]["arm_right_gripper.pos"] += 2
+            return send(action)
+        robot.send_action = mutate
+    with pytest.raises(RuntimeError, match="left response"):
+        control.apply(robot, frame(identity, owner, 1, mode="active", epoch=2, sample=value))
+    assert not [e for e in robot.events if e[0] == "action"]
+
+
+def test_left_response_optout_does_not_read_git_or_load_a_trial(monkeypatch):
+    import subprocess
+    monkeypatch.setattr(subprocess, "check_output", lambda *a, **k: pytest.fail("ordinary mode must not read Git"))
+    assert host.left_response_p_trial_binding(SimpleNamespace(am1_left_response_p_trial_file=None), None) is None
+
+
+def test_left_response_explicit_comparison_refuses_usb_source_without_changing_ordinary_mode(monkeypatch):
+    for selected in (False, True):
+        now, identity, owner, robot, control = lane()
+        if selected:
+            install_left_response_trial(monkeypatch, robot)
+        assert control.apply(robot, frame(identity, owner, 0))
+        value = sample(control)
+        value["target"] = dict(control._live_summary["reference"])
+        value["source"]["kind"] = "usb-leaders"
+        before = copy.deepcopy(control._live_summary)
+        assert control.apply(robot, frame(identity, owner, 1, mode="active", epoch=2, sample=value)) is not selected
+        if selected:
+            assert control.live_sample is None and control._live_summary == before
+            assert not [e for e in robot.events if e[0] == "action"]

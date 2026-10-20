@@ -1215,3 +1215,45 @@ def test_teleop_goal_optional_empty_timeout_and_actual_faults_keep_existing_mean
             evidence.report(obj,control,observation)
     assert len(port.writes)==1 and rows[-1]["diagnostic_available"] is False
     assert not evidence.enabled and obj._am1_selected_joint_evidence_enabled is False
+
+
+def test_left_response_goal_evidence_keeps_exact_trial_and_old_flags_off(monkeypatch):
+    from tests.robots.test_am1_live_teleop_native import install_left_response_trial
+
+    obj, evidence, control, now, rows, writes, acquire = teleop_goal_lane(monkeypatch)
+    trial = install_left_response_trial(monkeypatch, obj)
+    port = attach_port(obj, [status(group_payload(goal=2020, present=2012), motor_id=3)])
+    evidence.report(obj, control, acquire())
+    now[0] += .5
+    observation = acquire()
+    evidence.report(obj, control, observation)
+    row = next(r for r in rows if r["kind"] == "live_goal_readback")
+    assert row["left_response_p_trial"] == trial.receipt
+    assert row["left_response_p_trial"]["original_p"] == 16
+    assert row["left_response_p_trial"]["configured_p"] == 32
+    assert row["goal_matches_expected_raw"] and len(port.writes) == 1 and not writes
+    evidence.publish(obj, control, observation)
+    assert observation["_am1_local_feedback"]["selected_joint"]["left_response_p_trial"] == trial.receipt
+    assert not evidence.enabled and not obj._am1_selected_joint_evidence_enabled
+    assert getattr(obj, "_am1_visible_control_binding", None) is None and evidence.context is None
+
+
+@pytest.mark.parametrize("change", ["restored", "binding", "legacy"])
+def test_left_response_goal_evidence_refuses_retired_trial_or_legacy_flags_without_io(monkeypatch, change):
+    from tests.robots.test_am1_live_teleop_native import install_left_response_trial
+
+    obj, evidence, control, now, rows, writes, acquire = teleop_goal_lane(monkeypatch)
+    trial = install_left_response_trial(monkeypatch, obj)
+    port = attach_port(obj, [status(group_payload(goal=2020, present=2012), motor_id=3)])
+    evidence.report(obj, control, acquire())
+    now[0] += .5
+    if change == "restored":
+        trial.restore_required = False
+    elif change == "binding":
+        obj._am1_left_response_p_binding = dict(trial.binding, run_id=str(uuid4()))
+    else:
+        obj._am1_selected_joint_evidence_enabled = True
+    observation = acquire()
+    evidence.report(obj, control, observation)
+    assert not port.writes and not writes
+    assert not [row for row in rows if row["kind"] == "live_goal_readback"]

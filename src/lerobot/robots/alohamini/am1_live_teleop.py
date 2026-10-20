@@ -903,10 +903,61 @@ def prepare_settings(robot):
     _fresh_temperatures(robot)
 
 
+def left_response_receipt(robot):
+    """Read-free proof for the one explicitly admitted left-ID3 comparison."""
+    binding = getattr(robot, "_am1_left_response_p_binding", None)
+    trial = getattr(robot, "_am1_left_response_p_trial", None)
+    if binding is None and trial is None:
+        return None
+    from .am1_elbow_integral import AM1LeftResponseProportionalTrial
+
+    if (not binding_valid(robot) or type(trial) is not AM1LeftResponseProportionalTrial
+            or trial.binding != binding):
+        raise RuntimeError("AM1 left response transaction binding changed")
+    receipt = trial.active_receipt(robot)
+    if (receipt.get("kind") != "left-response-p" or receipt.get("original_p") != 16
+            or receipt.get("configured_p") not in (16, 32) or receipt.get("restore_required") is not True
+            or receipt.get("workload_segment") not in ("left-maintained", "left-reach")
+            or any(receipt.get(key) != robot._am1_teleop_binding[key] for key in ("run_id", "host_incarnation"))):
+        raise RuntimeError("AM1 left response active settings proof differs")
+    return receipt
+
+
+def _left_response_target_valid(robot, control, sample):
+    receipt = left_response_receipt(robot)
+    if receipt is None:
+        return True
+    from examples.alohamini.am1_live_teleop import ZERO_BODY
+
+    if not isinstance(sample.get("source"), dict) or sample["source"].get("kind") != "virtual-leaders":
+        return False
+    if set(sample["body"]) != set(ZERO_BODY) or any(sample["body"][key] != 0 for key in ZERO_BODY):
+        return False
+    workspace = control._live_summary["workspace"]
+    allowed = {"arm_left_elbow_flex.pos"}
+    if receipt["workload_segment"] == "left-reach":
+        allowed.add("arm_left_gripper.pos")
+    for key, reference in workspace["reference"].items():
+        if key in allowed:
+            continue
+        cal = workspace["calibration"][key.removesuffix(".pos")]
+        tick = (100 if key.endswith("_gripper.pos") else 200) / (cal[4] - cal[3])
+        if abs(sample["target"][key] - reference) > tick + 1e-9:
+            return False
+    return True
+
+
 def verify_settings(robot):
     records = read_groups(robot, (*STATIC, *HEALTH), active=True)
+    expected = {side: {register: dict(robot._am1_teleop_settings[side]["registers"][register])
+                       for register in STATIC} for side, _, _ in _groups(robot)}
+    trial = left_response_receipt(robot)
+    if trial is not None:
+        if expected["left"]["P_Coefficient"]["arm_left_elbow_flex"] != 16:
+            raise RuntimeError("AM1 left response original baseline differs")
+        expected["left"]["P_Coefficient"]["arm_left_elbow_flex"] = trial["configured_p"]
     if any(
-        records[side]["registers"][register] != robot._am1_teleop_settings[side]["registers"][register]
+        records[side]["registers"][register] != expected[side][register]
         for side, _, _ in _groups(robot)
         for register in STATIC
     ):
@@ -1221,6 +1272,8 @@ def before_write(control, robot):
     # intermediate collection guard still checks original RAW freshness.
     if getattr(robot, "_am1_thermal_history_enabled", False):
         service_due_feedback(robot)
+    if getattr(control, "live_sample", None) is not None and not _left_response_target_valid(robot, control, control.live_sample):
+        raise RuntimeError("AM1 left response nonselected target or body changed before write")
     control.before_live_write(robot)  # A genuine read cannot renew input expiry.
     status = thermal_history_status(robot)
     if status is not None and status["deficit_started_at_monotonic_s"] is not None and (
@@ -1365,6 +1418,8 @@ def apply_frame(control, robot, command, marker_key):
         try:
             validate_target(original["target"], workspace=control._live_summary["workspace"])
             validate_body(original["body"])
+            if not _left_response_target_valid(robot, control, original):
+                return False
             if original != control.live_sample:
                 validate_source(
                     original["source"], grant_id=original["grant_id"], previous=control._teleop_source
