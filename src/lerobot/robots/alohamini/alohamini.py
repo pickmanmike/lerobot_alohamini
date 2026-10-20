@@ -510,15 +510,29 @@ class AlohaMini(Robot):
     def configure(self) -> None:
         """Configure motor modes and gains while leaving all torque disabled."""
         if getattr(self, "_am1_teleop_binding", None) is not None:
-            from .am1_live_teleop import prepare_settings, refresh_startup_temperatures
+            from .am1_live_teleop import (
+                binding_valid,
+                prepare_settings,
+                qualify_startup_temperatures,
+                refresh_startup_temperatures,
+            )
             if getattr(self, "_am1_left_response_p_trial", None) is not None:
                 raise RuntimeError("AM1 left response transaction cannot be reacquired or reused")
-            prepare_settings(self)
-            for bus, names in ((self.left_bus, self.left_arm_motors), (self.right_bus, self.right_arm_motors)):
-                for name in names:
-                    refresh_startup_temperatures(self)
-                    set_torque_enabled(bus, (name,), enabled=False)
-            if getattr(self, "_am1_left_response_p_binding", None) is not None:
+            selected = getattr(self, "_am1_left_response_p_binding", None) is not None
+            if selected:
+                if not binding_valid(self):
+                    raise RuntimeError("AM1 teleop settings need the protected binding")
+                # Actual OFF precedes every private selected configuration step.
+                for bus, names in ((self.left_bus, self.left_arm_motors), (self.right_bus, self.right_arm_motors)):
+                    set_torque_enabled(bus, names, enabled=False)
+                prepare_settings(self, defer_temperature_baseline=True)  # Reads all Torque0/Lock0 back.
+            else:
+                prepare_settings(self)
+                for bus, names in ((self.left_bus, self.left_arm_motors), (self.right_bus, self.right_arm_motors)):
+                    for name in names:
+                        refresh_startup_temperatures(self)
+                        set_torque_enabled(bus, (name,), enabled=False)
+            if selected:
                 from .am1_elbow_integral import AM1LeftResponseProportionalTrial
                 trial = AM1LeftResponseProportionalTrial(
                     self._am1_left_response_p_binding, self._am1_left_response_p_trial_directory
@@ -527,6 +541,7 @@ class AlohaMini(Robot):
                 trial.prepare(self)
                 trial.disable_torque(self)
                 trial.apply(self)
+                qualify_startup_temperatures(self)
             # The lift retains its existing velocity-mode homing/relief policy.
             # Only an explicitly consumed left comparison may change its volatile P.
             refresh_startup_temperatures(self)

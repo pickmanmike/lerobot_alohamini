@@ -2101,3 +2101,163 @@ def test_stopped_thermal_replay_retains_actual_latest_equal_peak_without_refresh
         with pytest.raises(ValueError, match="thermal peak slot provenance/freshness"):
             m.validate_stopped_proof(config, run, proof, now=100.1, boot_id=proof["boot_id"])
     assert proof == original
+
+
+# Literal Actual96 note/packet/times; isolated IDs and fresh stopped proof below are synthetic.
+ACTUAL96_CONFIGURE_STALE_NOTE = (
+    '[AM1 TELEOP FAULT] {"reason":"actual configured temperature limit: arm_right_shoulder_pan; '
+    'temperature: five-slot feedback window is stale (>0.5 s).","side":"right","register":"Present_Temper'
+    'ature","raw":{"arm_right_shoulder_pan":31,"arm_right_shoulder_lift":27,"arm_right_elbow_flex":29,"ar'
+    'm_right_wrist_flex":32,"arm_right_wrist_roll":30,"arm_right_gripper":29},"read_started_at_monotonic_'
+    's":410730.158254421,"read_completed_at_monotonic_s":410730.159918472,"binding":{"recipe":"physical-l'
+    'ive-teleop","run_id":"6486bf44-1e01-4cb2-9010-ea4572adafa1","host_incarnation":"59e3c32b-ecc4-486c-8'
+    '00a-61ad6204f2b8"},"offending_motor":"arm_right_shoulder_pan","offending_value":31,"comparison":{"un'
+    'its":"raw_register","lower_inclusive":0,"upper_exclusive":70,"temperature":{"ceiling_c":70,"samples"'
+    ':[[410729.659892388,31],[410729.759878286,31],[410729.860166125,31],[410729.95995299,31],[410730.159'
+    '918472,31]],"high_count":0,"numeric_outlier_count":0,"first_cause":"temperature: five-slot feedback '
+    'window is stale (>0.5 s)."},"configured":{"Max_Temperature_Limit":{"value":70,"read_started_at_monot'
+    'onic_s":410729.507972075,"read_completed_at_monotonic_s":410729.509958678}}},"prior_successful_healt'
+    'h":null,"group_reply":{"binding":{"host_incarnation":"59e3c32b-ecc4-486c-800a-61ad6204f2b8","recipe"'
+    ':"physical-live-teleop","run_id":"6486bf44-1e01-4cb2-9010-ea4572adafa1"},"request":{"binding":{"host'
+    '_incarnation":"59e3c32b-ecc4-486c-800a-61ad6204f2b8","recipe":"physical-live-teleop","run_id":"6486b'
+    'f44-1e01-4cb2-9010-ea4572adafa1"},"side":"right","address":63,"width":1,"ids":[1,2,3,4,5,6],"motors"'
+    ':["arm_right_shoulder_pan","arm_right_shoulder_lift","arm_right_elbow_flex","arm_right_wrist_flex","'
+    'arm_right_wrist_roll","arm_right_gripper"],"register":"Present_Temperature"},"group_call_started_at_'
+    'monotonic_s":410730.158338845,"group_call_completed_at_monotonic_s":410730.159905898,"comm_result":0'
+    ',"packets":[{"packet":[255,255,1,3,0,31,220],"device_error":0,"read_started_at_monotonic_s":410730.1'
+    '58681711,"read_completed_at_monotonic_s":410730.159676698,"comm_result":0},{"packet":[255,255,2,3,0,'
+    '27,223],"device_error":0,"read_started_at_monotonic_s":410730.159727327,"read_completed_at_monotonic'
+    '_s":410730.159740586,"comm_result":0},{"packet":[255,255,3,3,0,29,220],"device_error":0,"read_starte'
+    'd_at_monotonic_s":410730.159766604,"read_completed_at_monotonic_s":410730.159778308,"comm_result":0}'
+    ',{"packet":[255,255,4,3,0,32,216],"device_error":0,"read_started_at_monotonic_s":410730.1598024,"rea'
+    'd_completed_at_monotonic_s":410730.159813733,"comm_result":0},{"packet":[255,255,5,3,0,30,217],"devi'
+    'ce_error":0,"read_started_at_monotonic_s":410730.159836585,"read_completed_at_monotonic_s":410730.15'
+    '9847584,"comm_result":0},{"packet":[255,255,6,3,0,29,217],"device_error":0,"read_started_at_monotoni'
+    'c_s":410730.159871343,"read_completed_at_monotonic_s":410730.159882565,"comm_result":0}],"transmit":'
+    '{"packet":[255,255,254,10,130,63,1,1,2,3,4,5,6,32],"write_started_at_monotonic_s":410730.158375493,"'
+    'write_completed_at_monotonic_s":410730.158676359,"result":14}}}'
+)
+
+
+
+def configure_cool_stale_fixture(tmp_path, monkeypatch):
+    m, config, run, proof, state = cool_stale_preactivation_fixture(tmp_path, monkeypatch)
+    fault = json.loads(ACTUAL96_CONFIGURE_STALE_NOTE.removeprefix("[AM1 TELEOP FAULT] "))
+    binding = {
+        "recipe": "physical-live-teleop", "run_id": run["run_id"],
+        "host_incarnation": proof["host_incarnation"],
+    }
+    fault["binding"] = fault["group_reply"]["binding"] = fault["group_reply"]["request"]["binding"] = binding
+    old = run["physical_result"]["readback"]
+    cause = "RuntimeError: AM1 teleop " + fault["reason"]
+    old["first_cause"] = run["native_first_cause"] = proof["original_first_cause"] = cause
+    old["first_error_chain"] = [{"cause": cause, "notes": ["[AM1 TELEOP FAULT] " + json.dumps(fault)]}]
+    proof["original_cleanup_origin"] = "preconfigure-cool-thermal-stale-lift-unqualified"
+    rb = old["readback"]
+    rb["started_at_monotonic_s"] = fault["read_completed_at_monotonic_s"] + .02
+    for index, row in enumerate(rb["readbacks"]):
+        row["read_started_at_monotonic_s"] = rb["started_at_monotonic_s"] + index * .001
+        row["read_completed_at_monotonic_s"] = row["read_started_at_monotonic_s"] + .0005
+    rb["completed_at_monotonic_s"] = rb["started_at_monotonic_s"] + .03
+    return m, config, run, proof, state
+
+
+def test_configure_cool_stale_origin_literal96_still_requires_fresh_proof_and_durable_ack(tmp_path, monkeypatch):
+    m, config, run, proof, state = configure_cool_stale_fixture(tmp_path, monkeypatch)
+    original = copy.deepcopy(run)
+    raw = publish_incomplete_fixture(config, run, proof, state)
+    actual, received, inventory = m.load_qualified_proof(config, run)
+    assert actual == proof and received == raw and inventory == dict.fromkeys(m.MARKERS)
+    operation = str(uuid.uuid4())
+    ack = m.archive_and_ack(config, actual, received, inventory, operation)
+    assert m.acknowledged_receipt({**actual, "acknowledgment": {**ack, "consumed_operation_id": operation}}, run, operation)
+    assert run == original and run["uncertain"] is True and run["status"] == "faulted"
+    assert run["physical_result"]["readback"]["readback"]["lift_readback"] == "unavailable-or-failed"
+    assert not any((state / name).exists() for name in m.MARKERS)
+
+
+@pytest.mark.parametrize("broken", [
+    "old_origin", "partial_wrapper", "extra_rest", "extra_note", "prior_health", "missing_prior",
+    "binding", "configured_time", "group_time", "packet_time", "packet_checksum", "device_error",
+    "missing_group", "high", "high_votes", "not_stale", "wrong_side", "live", "progress",
+    "old_nonzero", "restore_pending", "fresh_lift", "fresh_thermal", "fresh_nonzero", "boot", "age",
+    "impossible_phase", "repeated_peak", "backward_peak", "packet_type", "source",
+])
+def test_configure_cool_stale_origin_near_misses_and_unqualified_fresh_proof_refuse(tmp_path, monkeypatch, broken):
+    m, config, run, proof, state = configure_cool_stale_fixture(tmp_path, monkeypatch)
+    old = run["physical_result"]["readback"]
+    entry = old["first_error_chain"][0]
+    fault = json.loads(entry["notes"][0].removeprefix("[AM1 TELEOP FAULT] "))
+    if broken == "old_origin":
+        proof["original_cleanup_origin"] = m.PREHOME_COOL_STALE_ORIGIN
+    elif broken == "partial_wrapper":
+        old["first_error_chain"].insert(0, {"cause": "RuntimeError: AlohaMini motor activation failed.", "notes": []})
+    elif broken == "prior_health":
+        fault["prior_successful_health"] = {"value": 31}
+    elif broken == "missing_prior":
+        fault.pop("prior_successful_health")
+    elif broken == "binding":
+        fault["binding"]["host_incarnation"] = str(uuid.uuid4())
+    elif broken == "configured_time":
+        fault["comparison"]["configured"]["Max_Temperature_Limit"]["read_completed_at_monotonic_s"] = fault["read_completed_at_monotonic_s"] + 1
+    elif broken == "group_time":
+        fault["group_reply"]["group_call_started_at_monotonic_s"] = fault["read_started_at_monotonic_s"] - 1
+    elif broken == "packet_time":
+        fault["group_reply"]["packets"][0]["read_completed_at_monotonic_s"] = fault["read_completed_at_monotonic_s"] + 1
+    elif broken == "packet_checksum":
+        fault["group_reply"]["packets"][0]["packet"][-1] ^= 1
+    elif broken == "device_error":
+        fault["group_reply"]["packets"][0]["device_error"] = 4
+    elif broken == "missing_group":
+        fault.pop("group_reply")
+    elif broken == "high":
+        fault["raw"]["arm_right_shoulder_pan"] = fault["offending_value"] = 70
+    elif broken == "high_votes":
+        fault["comparison"]["temperature"]["high_count"] = 1
+    elif broken == "not_stale":
+        fault["comparison"]["temperature"]["samples"][0][0] += .01
+    elif broken == "impossible_phase":
+        peaks = fault["comparison"]["temperature"]["samples"]
+        for index in range(1, 4):
+            peaks[index][0] = peaks[0][0] + index * .001
+    elif broken == "repeated_peak":
+        peaks = fault["comparison"]["temperature"]["samples"]
+        peaks[1][0] = peaks[0][0]
+    elif broken == "backward_peak":
+        peaks = fault["comparison"]["temperature"]["samples"]
+        peaks[1][0] = peaks[0][0] - .01
+    elif broken == "packet_type":
+        fault["group_reply"]["packets"][0] = []
+    elif broken == "source":
+        proof["source"]["backend_contract"] = dict(config, machine="foreign")
+    elif broken == "wrong_side":
+        fault["side"] = "left"
+    elif broken == "live":
+        run["native_live_at"] = 1.
+    elif broken == "progress":
+        run["progress_s"] = .1
+    elif broken == "old_nonzero":
+        old["readback"]["readbacks"][0]["value"] = 1
+    elif broken == "restore_pending":
+        old["readback"]["selected_gain_restore_required"] = True
+    elif broken == "fresh_lift":
+        proof["readback"].pop("lift_stationary")
+    elif broken == "fresh_thermal":
+        proof["readback"]["lift_stationary"]["temperature_slots"][0][0] = 90.
+    elif broken == "fresh_nonzero":
+        proof["readback"]["readbacks"][0]["value"] = 1
+    elif broken == "boot":
+        current_boot = proof["boot_id"]
+        monkeypatch.setattr(m, "current_boot_id", lambda: current_boot)
+        proof["boot_id"] = str(uuid.uuid4())
+    elif broken == "age":
+        monkeypatch.setattr(m.time, "monotonic", lambda: 1000.)
+    entry["notes"] = ["[AM1 TELEOP FAULT] " + json.dumps(fault)]
+    if broken == "extra_rest":
+        entry["notes"].append('Original normal-rest acquisition: {"phase":"after_home"}')
+    elif broken == "extra_note":
+        entry["notes"].append("Unqualified operation followed")
+    publish_incomplete_fixture(config, run, proof, state)
+    with pytest.raises((ValueError, RuntimeError, KeyError)):
+        m.load_qualified_proof(config, run)
+    assert not list(state.glob("reconciliation-ack-*"))

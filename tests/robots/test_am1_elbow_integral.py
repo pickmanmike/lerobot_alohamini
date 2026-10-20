@@ -1438,3 +1438,67 @@ def test_left_response_p_descriptor_loss_does_not_bypass_retained_torque_off_own
         trial.disable_torque(r)
     assert bus.events == before and r.left_bus.events == other_before
     assert bus.values[("Torque_Enable", ELBOW)] == 1 and trial.restore_required
+
+
+@pytest.mark.parametrize("fault", [None, "current", "owner", "cancel"])
+def test_left_response_p_powered_proof_keeps_durable_configured_obligation_until_off(
+    tmp_path, monkeypatch, fault
+):
+    module, r, trial, directory, request, value = left_response_p_robot(tmp_path, monkeypatch)
+    trial.prepare(r)
+    trial.disable_torque(r)
+    trial.apply(r)
+    durable = trial.snapshot_path.read_bytes()
+    configured = json.loads(durable)
+    assert configured["state"] == "configured" and configured["restore_required"] is True
+    assert configured["original_registers"]["P_Coefficient"] == 16
+    r.left_bus.values[("Torque_Enable", ELBOW)] = 1
+    persist = trial._persist_snapshot
+    loads, saved = [], []
+    original_load = module.load_left_response_p_binding
+
+    def load(*args, **kwargs):
+        loads.append("private-binding-read")
+        return original_load(*args, **kwargs)
+
+    def record(state, **kwargs):
+        assert r.left_bus.values[("Torque_Enable", ELBOW)] == 0, "No private persistence while powered"
+        saved.append(state)
+        return persist(state, **kwargs)
+
+    monkeypatch.setattr(module, "load_left_response_p_binding", load)
+    monkeypatch.setattr(trial, "_persist_snapshot", record)
+    bus = r.left_bus
+    if fault == "current":
+        bus.values[("Present_Current", ELBOW)] = 310
+    elif fault == "owner":
+        r._am1_teleop_binding = dict(r._am1_teleop_binding, run_id="foreign")
+    elif fault == "cancel":
+        r._am1_shutdown_in_progress = True
+    before = list(bus.events)
+    if fault is None:
+        trial.verify_active(r)
+        assert trial.active_receipt(r)["original_settings_sha256"] == configured["original_settings_sha256"]
+        assert trial.evidence["state"] == "active" and trial.evidence["active_verified"] is True
+    else:
+        with pytest.raises(RuntimeError):
+            trial.verify_active(r)
+        assert trial.evidence["first_failure"] and trial.restore_required
+        if fault in ("owner", "cancel"):
+            assert bus.events == before
+    assert loads == [] and saved == []
+    assert trial.snapshot_path.read_bytes() == durable
+    # Stop remains synchronous: OFF, original gain, original Lock, then one durable final proof.
+    r._am1_teleop_binding = {k: trial.binding[k] for k in ("run_id", "host_incarnation")}
+    r._am1_teleop_binding["recipe"] = "physical-live-teleop"
+    r._am1_shutdown_in_progress = True
+    trial.restore(r)
+    assert bus.values[("Torque_Enable", ELBOW)] == 0 and bus.values[("P_Coefficient", ELBOW)] == 16
+    assert bus.values[("Lock", ELBOW)] == 0 and trial.restore_required is False
+    assert saved == ["restored"]
+    final = json.loads(trial.snapshot_path.read_bytes())
+    if fault is None:
+        assert final["active_verified"] and final["active_registers"]["P_Coefficient"] == 32
+    else:
+        assert final["first_failure"] == trial.evidence["first_failure"]
+    assert not list(directory.glob("*.tmp")) and not list(directory.glob(".*.tmp"))

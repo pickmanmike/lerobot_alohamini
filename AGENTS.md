@@ -83,10 +83,17 @@ gain fault from undertravel. Actual94 at fa1/Stage46 completed the16-active-seco
 P16 baseline: requested7.119deg, achieved1.406deg outward/0.439deg back,
 0.967deg residual. Direct reads confirm Goal2124/PP2059,195–208mA,11.6V and
 unchanged device limits; P16/Lock restoration and off readback passed. Three ordinary
-input recoveries preserved the task/deadline. P32 has not started. Source and Edge
-images were too dark for useful observation; camera-only10 confirmed advancing
-WebRTC then clean60s exit. Resolve that specific viewing issue before more motion.
-The current interface remains stopped/readback-verified. Publish/review
+input recoveries preserved the task/deadline. Actual95 P32 reached only7.148active
+seconds before receipt/rejoin failure: requested6.064deg, measured2.900deg outward,
+without return or a completed maintained comparison. P16 restoration/off readback
+passed. Fresh camera-only11 and Actual95 Edge chest were illuminated; the earlier
+dark-scene question is superseded, without an established cause. Actual96 then
+refused before Live on stale startup thermal history; no P32 write/input occurred.
+Inner20off/P16 proof passed, but outer cleanup remains unknown because lift
+qualification was unavailable. Preserve that original outcome; use fresh read-only
+proof and durable reconciliation before normal affected-component staging/motion.
+The selected-left startup repair is under focused test/review; no relaxed thermal
+age, reset history, new device limits or unchanged failed retry is authorized. Publish/review
 the new response follow-up without automatic merge; retain current source,
 limitations and rollback. PR28 integration is complete.
 Main/AM2 remain unchanged. Do not repeat powered checks solely for publication.

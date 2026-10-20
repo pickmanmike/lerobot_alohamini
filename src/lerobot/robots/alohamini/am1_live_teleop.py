@@ -857,13 +857,23 @@ def _install_group_reply_guard(robot, side, bus):
     )
 
 
-def prepare_settings(robot):
-    """Capture installed position-role settings without writing a tuning profile."""
+def prepare_settings(robot, *, defer_temperature_baseline=False):
+    """Capture installed settings; only the selected OFF transaction may defer its first history."""
     if not binding_valid(robot):
         raise RuntimeError("AM1 teleop settings need the protected binding")
+    if defer_temperature_baseline:
+        if (getattr(robot, "_am1_left_response_p_binding", None) is None
+                or getattr(robot, "_am1_teleop_temperatures", None)
+                or hasattr(robot, "_am1_teleop_initial_temperature_deadline")):
+            raise RuntimeError("AM1 selected initial thermal acquisition cannot be reused or reset")
+        # Private original/configured durability consumes this same finite startup budget.
+        robot._am1_teleop_initial_temperature_deadline = time.monotonic() + 1.0
+        robot._am1_teleop_initial_temperature_binding = copy.deepcopy(robot._am1_teleop_binding)
+        robot._am1_teleop_initial_temperature_pending = True
     for side, bus, _names in _groups(robot):
         _install_group_reply_guard(robot, side, bus)
-    records = read_groups(robot, (*STATIC, *HEALTH), active=False)
+    health = tuple(k for k in HEALTH if k != "Present_Temperature") if defer_temperature_baseline else HEALTH
+    records = read_groups(robot, (*STATIC, *health), active=False)
     robot._am1_teleop_settings = records
     for side, bus, names in _groups(robot):
         rows = records[side]["registers"]
@@ -885,10 +895,49 @@ def prepare_settings(robot):
                 or not 0 < rows["Min_Voltage_Limit"][name] < rows["Max_Voltage_Limit"][name]
             ):
                 raise RuntimeError("AM1 teleop installed protection settings are invalid: " + name)
+    if defer_temperature_baseline:
+        check_initial_temperature_budget(robot)
+        return
     check_health(robot, records, active=False)
     robot._am1_teleop_startup_temperature = True
-    deadline = time.monotonic() + 1.0
+    _qualify_initial_temperatures(robot, time.monotonic() + 1.0)
+
+
+def check_initial_temperature_budget(robot):
+    """The selected OFF preparation cannot restart its original qualification clock."""
+    if (not binding_valid(robot)
+            or getattr(robot, "_am1_shutdown_in_progress", False) is True
+            or getattr(robot, "_am1_teleop_initial_temperature_pending", None) is not True
+            or robot._am1_teleop_binding != robot._am1_teleop_initial_temperature_binding):
+        raise RuntimeError("AM1 selected initial thermal acquisition owner/phase changed")
+    if getattr(robot, "_am1_teleop_first_error", None) is not None:
+        raise robot._am1_teleop_first_error
+    deadline = robot._am1_teleop_initial_temperature_deadline
+    if type(deadline) not in (int, float) or not math.isfinite(deadline) or time.monotonic() >= deadline:
+        raise RuntimeError("AM1 teleop original follower baseline acquisition expired")
+    return deadline
+
+
+def qualify_startup_temperatures(robot):
+    """First genuine follower histories after the selected transaction's private OFF work."""
+    deadline = check_initial_temperature_budget(robot)
+    if getattr(robot, "_am1_teleop_temperatures", None):
+        raise RuntimeError("AM1 selected initial thermal acquisition cannot be reused or reset")
+    records = read_groups(robot, ("Present_Temperature",), active=False)
+    for side in records:
+        for key in ("registers", "timing"):
+            robot._am1_teleop_settings[side][key].update(records[side][key])
+        robot._am1_teleop_settings[side]["temperature"] = records[side]["temperature"]
+    robot._am1_teleop_startup_temperature = True
+    _qualify_initial_temperatures(robot, deadline)
+    check_initial_temperature_budget(robot)
+    robot._am1_teleop_initial_temperature_pending = False
+
+
+def _qualify_initial_temperatures(robot, deadline):
     while not all(state["window"].ready for state in robot._am1_teleop_temperatures.values()):
+        if getattr(robot, "_am1_teleop_initial_temperature_pending", False):
+            check_initial_temperature_budget(robot)
         if time.monotonic() >= deadline:
             raise RuntimeError("AM1 teleop original follower baseline acquisition expired")
         next_slot = min(

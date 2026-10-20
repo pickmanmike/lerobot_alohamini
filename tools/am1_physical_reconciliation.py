@@ -19,6 +19,7 @@ MARKERS = ("cleanup-uncertain.json", "physical-in-progress.json")
 CACHE_S = 5.0
 INCOMPLETE_PREACTIVATION_ORIGIN = "preactivation-lift-unqualified"
 PREHOME_COOL_STALE_ORIGIN = "prehome-cool-thermal-stale-lift-unqualified"
+PRECONFIGURE_COOL_STALE_ORIGIN = "preconfigure-cool-thermal-stale-lift-unqualified"
 PREIMPORT_STOP_ORIGIN = "preimport-stop-missing-host-receipt"
 
 
@@ -99,18 +100,27 @@ def _original_origin_note(chain, prefix):
     return value
 
 
-def _validate_prehome_cool_stale_origin(run, receipt, chain):
+def _validate_prehome_cool_stale_origin(run, receipt, chain, *, configure=False):
     """Recognize only retained cool, stale pre-home evidence; never qualify the lift."""
-    require(
-        isinstance(chain, list)
-        and len(chain) == 2
-        and all(isinstance(entry, dict) for entry in chain)
-        and chain[0].get("cause") == "RuntimeError: AlohaMini motor activation failed."
-        and chain[1].get("cause") == receipt["first_cause"],
-        "original prehome activation wrapper and complete error chain required",
-    )
+    if configure:
+        require(
+            isinstance(chain, list) and len(chain) == 1
+            and isinstance(chain[0], dict) and set(chain[0]) == {"cause", "notes"}
+            and chain[0]["cause"] == receipt["first_cause"]
+            and isinstance(chain[0]["notes"], list) and len(chain[0]["notes"]) == 1,
+            "original direct configure fault and its single structured note required",
+        )
+    else:
+        require(
+            isinstance(chain, list)
+            and len(chain) == 2
+            and all(isinstance(entry, dict) for entry in chain)
+            and chain[0].get("cause") == "RuntimeError: AlohaMini motor activation failed."
+            and chain[1].get("cause") == receipt["first_cause"],
+            "original prehome activation wrapper and complete error chain required",
+        )
     fault = _original_origin_note(chain, "[AM1 TELEOP FAULT] ")
-    rest = _original_origin_note(chain, "Original normal-rest acquisition: ")
+    rest = None if configure else _original_origin_note(chain, "Original normal-rest acquisition: ")
     binding = {
         "recipe": "physical-live-teleop",
         "run_id": run["run_id"],
@@ -118,12 +128,11 @@ def _validate_prehome_cool_stale_origin(run, receipt, chain):
     }
     require(
         run.get("recipe") == "physical-live-teleop"
-        and rest.get("binding") == binding
         and fault.get("binding") == binding
-        and rest.get("phase") == "before_home"
-        and rest.get("qualified") is False
-        and rest.get("samples") == []
-        and rest.get("first_cause") == receipt["first_cause"],
+        and (configure or (
+            rest.get("binding") == binding and rest.get("phase") == "before_home"
+            and rest.get("qualified") is False and rest.get("samples") == []
+            and rest.get("first_cause") == receipt["first_cause"])),
         "original same-run before-home refusal without acquisition or homing required",
     )
     side, motor = fault.get("side"), fault.get("offending_motor")
@@ -166,8 +175,7 @@ def _validate_prehome_cool_stale_origin(run, receipt, chain):
         number(started)
         and number(completed)
         and 0 <= started <= completed
-        and number(rest.get("started_at"))
-        and rest["started_at"] <= started
+        and (configure or (number(rest.get("started_at")) and rest["started_at"] <= started))
         and completed <= receipt["readback"]["started_at_monotonic_s"]
         and isinstance(slots, list)
         and len(slots) == 5
@@ -183,9 +191,21 @@ def _validate_prehome_cool_stale_origin(run, receipt, chain):
         "original timed cool five-slot stale evidence required",
     )
     times = [row[0] for row in slots]
+    if configure:
+        # Original maxima may move within occupied slots; their first retained
+        # timestamp is not the original anchor. Only check consistency with ONE
+        # fixed phase. This old stale diagnosis grants no thermal readiness:
+        # fresh stopped proof below still replays its own exact origin/maxima.
+        peaks_ns = [round(at * 1_000_000_000) for at in times]
+        phases_ns = {0, *(at % 100_000_000 for at in peaks_ns)}
+        occupied = all(a < b for a, b in zip(peaks_ns, peaks_ns[1:], strict=False)) and any(
+            len({(at - phase) // 100_000_000 for at in peaks_ns}) == 5 for phase in phases_ns
+        )
+    else:
+        occupied = len({(round(at * 1e9) - round(times[0] * 1e9)) // 100_000_000 for at in times}) == 5
     require(
         all(a < b for a, b in zip(times, times[1:], strict=False))
-        and len({(round(at * 1e9) - round(times[0] * 1e9)) // 100_000_000 for at in times}) == 5
+        and occupied
         and completed - times[0] > 0.5
         and times[-1] == completed
         and slots[-1][1] == raw[motor],
@@ -207,8 +227,42 @@ def _validate_prehome_cool_stale_origin(run, receipt, chain):
         and len(packets) == 6,
         "original exact one-byte six-motor temperature group required",
     )
+    if configure:
+        require(
+            set(fault) == {"reason", "side", "register", "raw", "read_started_at_monotonic_s",
+                "read_completed_at_monotonic_s", "binding", "offending_motor", "offending_value",
+                "comparison", "prior_successful_health", "group_reply"}
+            and fault["prior_successful_health"] is None,
+            "configure origin requires original first health failure without later rest/home evidence",
+        )
+        configured_started, configured_completed = (
+            configured.get(key) for key in ("read_started_at_monotonic_s", "read_completed_at_monotonic_s")
+        )
+        group_started, group_completed = (
+            group.get(key) for key in ("group_call_started_at_monotonic_s", "group_call_completed_at_monotonic_s")
+        )
+        transmit = group.get("transmit") or {}
+        tx_started, tx_completed = (
+            transmit.get(key) for key in ("write_started_at_monotonic_s", "write_completed_at_monotonic_s")
+        )
+        require(
+            all(number(value) for value in (configured_started, configured_completed,
+                group_started, group_completed, tx_started, tx_completed))
+            and 0 <= configured_started <= configured_completed <= times[0]
+            and started <= group_started <= tx_started <= tx_completed <= group_completed <= completed
+            and transmit.get("packet") == [255, 255, 254, 10, 130, 63, 1, 1, 2, 3, 4, 5, 6, 32]
+            and type(transmit.get("result")) is int and transmit["result"] == 14,
+            "original configure ceiling acquisition and exact temperature read request chronology required",
+        )
     for ident, name, record in zip(range(1, 7), names, packets, strict=True):
         require(isinstance(record, dict), "original temperature packet record required")
+        if configure:
+            packet_started, packet_completed = (
+                record.get(key) for key in ("read_started_at_monotonic_s", "read_completed_at_monotonic_s")
+            )
+            require(number(packet_started) and number(packet_completed)
+                and group_started <= packet_started <= packet_completed <= group_completed,
+                "original configure temperature packet acquisition chronology required")
         packet = record.get("packet")
         require(
             record.get("comm_result") == 0
@@ -233,7 +287,7 @@ def validate_cleanup_origin(run, proof, receipt):
         )
         return False
     require(
-        origin in (INCOMPLETE_PREACTIVATION_ORIGIN, PREHOME_COOL_STALE_ORIGIN),
+        origin in (INCOMPLETE_PREACTIVATION_ORIGIN, PREHOME_COOL_STALE_ORIGIN, PRECONFIGURE_COOL_STALE_ORIGIN),
         "unsupported original cleanup origin",
     )
     lifecycle, rb = run.get("physical_result") or {}, receipt.get("readback") or {}
@@ -275,8 +329,8 @@ def validate_cleanup_origin(run, proof, receipt):
         "only incomplete lift proof with otherwise actual known off cleanup may use this origin",
     )
     chain = receipt.get("first_error_chain")
-    if origin == PREHOME_COOL_STALE_ORIGIN:
-        _validate_prehome_cool_stale_origin(run, receipt, chain)
+    if origin in (PREHOME_COOL_STALE_ORIGIN, PRECONFIGURE_COOL_STALE_ORIGIN):
+        _validate_prehome_cool_stale_origin(run, receipt, chain, configure=origin == PRECONFIGURE_COOL_STALE_ORIGIN)
     else:
         require(
             receipt["first_cause"].startswith("RuntimeError: AM1 arm activation refused: ")

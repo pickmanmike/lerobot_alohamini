@@ -1147,8 +1147,10 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
         robot = self._robot
         self._retained_owner(robot)
         if getattr(robot, "_am1_shutdown_in_progress", False) is not True:
-            from .am1_live_teleop import refresh_startup_temperatures
+            from .am1_live_teleop import check_initial_temperature_budget, refresh_startup_temperatures
 
+            if getattr(robot, "_am1_teleop_initial_temperature_pending", False):
+                check_initial_temperature_budget(robot)
             refresh_startup_temperatures(robot)
             if (
                 getattr(robot, "_am1_teleop_startup_temperature", False)
@@ -1311,7 +1313,10 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
         self._write("Lock", 1, phase="volatile_lock", reconcile=True)
 
     def _preserved(self, robot, *, phase):
-        self._same_owner(robot)
+        if phase == "active":
+            self._retained_owner(robot)  # Powered verification performs only device I/O.
+        else:
+            self._same_owner(robot)
         original = self._snapshot["original_registers"]
         if (
             any(self._read(k, phase=phase) != original[k] for k in _LEFT_RESPONSE_P_PRESERVED)
@@ -1380,11 +1385,16 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
                 )
             # Existing owner thermal windows remain authoritative; one raw temperature is not a new vote.
             self._snapshot.update(
-                active_verified=True, active_registers=actual, active_verified_at_monotonic_s=time.monotonic()
+                state="active", status="active", active_verified=True,
+                active_registers=actual, active_verified_at_monotonic_s=time.monotonic(),
             )
-            self._persist_snapshot("active")
+            # The durable configured file already owns restoration. Flush active evidence only after OFF.
         except BaseException as error:
-            self._failure("active_failed", error)
+            self._snapshot.update(state="active_failed", status="active_failed")
+            self._snapshot.setdefault("first_failure", {
+                "type": type(error).__name__, "message": str(error),
+                "traceback": "".join(traceback.format_exception(error)),
+            })
             raise
 
     @property
@@ -1404,6 +1414,7 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
             "original_p": 16,
             "configured_p": self.proportional,
             "restore_required": True,
+            # Hash of the durable original registers/bytes, never a claim of durable active readback.
             "original_settings_sha256": self._snapshot["original_settings_sha256"],
             "prepared_at_monotonic_s": self._snapshot["prepared_at_monotonic_s"],
             "configured_at_monotonic_s": self._snapshot["configured_at_monotonic_s"],

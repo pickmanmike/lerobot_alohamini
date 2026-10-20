@@ -8,7 +8,7 @@ import pytest
 from tests.robots.test_am1_pre_activation import activation as activation
 
 
-def configured_robot(activation, *, initial_temperature=28):
+def configured_robot(activation, *, initial_temperature=28, before_configure=None):
     robot = activation.robot
     robot.config.no_follower = False
     robot.config.use_degrees = False
@@ -54,6 +54,8 @@ def configured_robot(activation, *, initial_temperature=28):
             return values
 
         bus.sync_read = grouped
+    if before_configure is not None:
+        before_configure(robot)
     activation.clock.now = 99.599
     with patch("time.sleep", side_effect=lambda seconds: setattr(
         activation.clock, "now", activation.clock.now + seconds
@@ -1707,13 +1709,194 @@ def test_left_response_active_settings_preserve_original_and_only_allow_declared
         verify_settings(robot)
 
 
+@pytest.mark.parametrize("private_gap_s,fault", [
+    (0.0, None), (0.125, None), (1.125, "budget"), (0.125, "configured_budget"),
+    (0.125, "hot"), (0.125, "stale"), (0.125, "identity"), (0.125, "cancel"),
+    (0.125, "configured_owner"),
+])
+def test_left_response_configuration_keeps_real_startup_slots_during_private_work(
+    activation, monkeypatch, tmp_path, private_gap_s, fault, record_property
+):
+    import copy
+    import json
+    from uuid import UUID
+
+    from tests.robots.test_am1_elbow_integral import (
+        ELBOW,
+        RIGHT_P20_HOST,
+        RIGHT_P20_RUN,
+        left_response_p_robot,
+    )
+
+    gains, seed, _, directory, _, _ = left_response_p_robot(tmp_path, monkeypatch)
+    baseline = {key: value for (key, name), value in seed.left_bus.values.items() if name == ELBOW}
+    calibration = copy.deepcopy(seed.left_bus.calibration[ELBOW])
+    binding = copy.deepcopy(seed._am1_left_response_p_binding)
+    seed._am1_left_response_p_trial = None
+    ids = iter((UUID(RIGHT_P20_RUN), UUID(RIGHT_P20_HOST)))
+    monkeypatch.setitem(configured_robot.__globals__, "uuid4", lambda: next(ids))
+    original_prepare = gains.AM1LeftResponseProportionalTrial.prepare
+    original_persist = gains.AM1LeftResponseProportionalTrial._persist_snapshot
+    private_work = []
+
+    def prepare(trial, robot):
+        # The actual configure path decides when histories start. Do not prime/reset them here.
+        activation.clock.now += 0.05
+        for bus in (robot.left_bus, robot.right_bus):
+            bus.on_read = lambda *_: setattr(activation.clock, "now", activation.clock.now + 0.001)
+        assert not getattr(robot, "_am1_teleop_temperatures", {})
+        assert all(bus.registers["Torque_Enable", name] == 0
+                   for bus, names in ((robot.left_bus, robot.left_arm_motors),
+                                      (robot.right_bus, robot.right_arm_motors)) for name in names)
+        assert all(any(row[:4] == ("read", side, "Torque_Enable", name) for row in activation.events)
+                   for side, names in (("left", robot.left_arm_motors), ("right", robot.right_arm_motors))
+                   for name in names)
+        original_prepare(trial, robot)
+
+    def persist(trial, state, **kwargs):
+        original_persist(trial, state, **kwargs)
+        if state == "prepared":
+            start = activation.clock.now
+            activation.clock.now += private_gap_s
+            private_work.append((start, activation.clock.now))
+            if fault == "identity":
+                trial._robot.left_bus.calibration[ELBOW].range_min += 1
+            elif fault == "cancel":
+                trial._robot._am1_shutdown_in_progress = True
+        if state == "configured" and fault == "configured_budget":
+            activation.clock.now += 1.125
+        if state == "configured" and fault == "configured_owner":
+            trial._robot._am1_teleop_binding = dict(
+                trial._robot._am1_teleop_binding, run_id="99999999-9999-4999-8999-999999999999"
+            )
+
+    monkeypatch.setattr(gains.AM1LeftResponseProportionalTrial, "prepare", prepare)
+    monkeypatch.setattr(gains.AM1LeftResponseProportionalTrial, "_persist_snapshot", persist)
+
+    def attach(robot):
+        robot._am1_protected_cleanup = True
+        robot._am1_selected_joint_evidence_enabled = False
+        robot._am1_left_response_p_binding = binding
+        robot._am1_left_response_p_trial_directory = directory
+        for bus, names in ((robot.left_bus, robot.left_arm_motors), (robot.right_bus, robot.right_arm_motors)):
+            for name in names:
+                bus.registers["Torque_Enable", name] = bus.registers["Lock", name] = 1
+        robot.left_bus.calibration[ELBOW] = copy.deepcopy(calibration)
+        robot.left_bus.registers.update({(key, ELBOW): value for key, value in baseline.items()})
+
+        def individual(address, width, motor_id, **kwargs):
+            assert (address, width, motor_id) in ((24, 1, 3), (25, 1, 3))
+            activation.clock.now += 0.001
+            return {24: 16, 25: 0}[address], 0, 0
+
+        robot.left_bus._read = individual
+        if fault == "hot":
+            robot.right_bus.registers["Present_Temperature", "arm_right_shoulder_pan"] = 70
+        if fault == "stale":
+            read = robot.left_bus.sync_read
+
+            def delayed(register, names, **kwargs):
+                if register == "Present_Temperature":
+                    activation.clock.now += 0.625
+                return read(register, names, **kwargs)
+
+            robot.left_bus.sync_read = delayed
+
+    failure = None
+    try:
+        robot = configured_robot(activation, before_configure=attach)
+    except RuntimeError as error:
+        failure, robot = error, activation.robot
+    fault_evidence = getattr(robot, "_am1_teleop_fault", None) or {}
+    windows = {}
+    for side in ("left", "right"):
+        state = getattr(robot, "_am1_teleop_temperatures", {}).get((side, 1))
+        if state is None:
+            continue
+        window = state["window"]
+        receipts = list(state["receipts"])
+        raw_slots = [(round(end * 1e9) - window._origin_ns) // 100_000_000 for _, end, _ in receipts]
+        failed_at = fault_evidence.get("read_completed_at_monotonic_s") if fault_evidence.get("side") == side else None
+        windows[side] = {
+            "origin_ns": window._origin_ns, "raw_receipts": receipts, "raw_slots": raw_slots,
+            "retained_maxima": list(window.samples), "last_raw_at": window._last_sample_at,
+            "failed_raw_slot": (round(failed_at * 1e9) - window._origin_ns) // 100_000_000
+            if failed_at is not None and window._origin_ns is not None else None,
+            "failed_raw_at": failed_at, "first_failure": str(window.failure) if window.failure else None,
+        }
+    proof = {"private_work": private_work, "windows": windows,
+             "P32_written": any(row.get("register") == "P_Coefficient" and row.get("value") == 32
+                                for row in robot._am1_left_response_p_trial.evidence["events"])}
+    record_property("left_response_startup_private_work", json.dumps(proof))
+    trial = robot._am1_left_response_p_trial
+    assert robot._am1_teleop_initial_temperature_deadline == pytest.approx(100.599)
+    if fault == "configured_owner":
+        robot._am1_teleop_binding = {"recipe": "physical-live-teleop", "run_id": binding["run_id"],
+                                     "host_incarnation": binding["host_incarnation"]}
+    if fault == "identity":
+        robot.left_bus.calibration[ELBOW] = copy.deepcopy(calibration)
+    assert not any(row[0] == "write" and row[2] == "Torque_Enable" and row[4] == 1
+                   for row in activation.events)
+    if failure is None:
+        from lerobot.robots.alohamini.am1_live_teleop import qualify_startup_temperatures
+
+        original_windows = {key: state["window"] for key, state in robot._am1_teleop_temperatures.items()}
+        samples = {key: list(window.samples) for key, window in original_windows.items()}
+        before = list(activation.events)
+        with pytest.raises(RuntimeError, match="owner/phase changed"):
+            qualify_startup_temperatures(robot)
+        assert activation.events == before
+        assert all(robot._am1_teleop_temperatures[key]["window"] is window and list(window.samples) == samples[key]
+                   for key, window in original_windows.items())
+    robot._am1_shutdown_in_progress = True
+    trial.restore(robot)
+    assert robot.left_bus.registers["Torque_Enable", ELBOW] == 0 and not trial.restore_required
+    if fault is None:
+        assert failure is None, json.dumps(proof)
+        assert all(state["window"].failure is None for state in robot._am1_teleop_temperatures.values())
+        assert all(window["raw_slots"][0] == 0 and set(range(5)) <= set(window["raw_slots"])
+                   for window in windows.values())
+    else:
+        assert failure is not None, json.dumps(proof)
+        if fault in ("budget", "configured_budget"):
+            assert "baseline acquisition expired" in str(failure)
+            assert not windows
+            assert proof["P32_written"] is (fault == "configured_budget")
+        elif fault == "configured_owner":
+            assert "owner/phase changed" in str(failure) and not windows
+        elif fault in ("hot", "stale"):
+            assert "temperature" in str(failure)
+            assert getattr(robot, "_am1_teleop_first_error", None) is failure
+        assert robot.left_bus.registers["P_Coefficient", ELBOW] == 16
+
+
+def test_startup_retained_peak_times_do_not_stand_in_for_raw_receipt_slots(activation):
+    from lerobot.robots.alohamini.am1_live_teleop import read_groups
+
+    robot = configured_robot(activation)
+    state = robot._am1_teleop_temperatures["right", 1]
+    window = state["window"]
+    anchor = window._origin_ns
+    activation.clock.now = 100.01
+    robot.right_bus.registers["Present_Temperature", "arm_right_shoulder_pan"] = 40
+    read_groups(robot, ("Present_Temperature",))
+    peak = window.samples[-1]
+    activation.clock.now = 100.05
+    robot.right_bus.registers["Present_Temperature", "arm_right_shoulder_pan"] = 28
+    read_groups(robot, ("Present_Temperature",))
+    assert window.samples[-1] == peak and window._last_sample_at > peak[0]
+    assert state["receipts"][-1][1] == window._last_sample_at
+    assert window.ready and window._origin_ns == anchor and window.failure is None
+
+
 def test_left_response_configure_retains_transaction_before_writes_and_does_not_restart_on_rearm(activation, monkeypatch):
     from tests.robots.test_am1_live_teleop_native import install_left_response_trial
 
-    robot = configured_robot(activation)
-    robot.left_bus.registers["P_Coefficient", "arm_left_elbow_flex"] = 16
-    install_left_response_trial(monkeypatch, robot, installed=False)
-    robot.configure()
+    def attach(robot):
+        robot.left_bus.registers["P_Coefficient", "arm_left_elbow_flex"] = 16
+        install_left_response_trial(monkeypatch, robot, installed=False)
+
+    robot = configured_robot(activation, before_configure=attach)
     trial = getattr(robot, "_am1_left_response_p_trial", None)
     assert trial is not None and trial.events == ["prepare", "off", "apply"]
     assert robot._am1_teleop_settings["left"]["registers"]["P_Coefficient"]["arm_left_elbow_flex"] == 16
