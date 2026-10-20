@@ -54,11 +54,14 @@ Keep500ms required view,250ms native input and original ownership/deadline guard
 The process-local msedge software-decoder option is available in the ordinary
 browser-only launcher with stable separate mode profiles. Dedicated-profile fresh
 enrollment now survives reload and camera-only09 verified live chest WebRTC. It supplied
-Actual94's required presentation without a shadow viewer, but the scene was too dark
-to qualify useful arm viewing. This is not GPU proof or a global preference change.
-Next operating scope is materially better repeatable maintained left-elbow response,
-then repeat the short unloaded
-reach/hold/gripper/retract under normal required usable viewing. Compare actual
+Actual94's required presentation without a shadow viewer, but that scene was too dark.
+Camera-only11/12 and Actual97-99 subsequently supplied illuminated coarse bench/gripper
+viewing through this same enrolled profile. Occluded wrist/precision visibility remains
+limited. This is not GPU proof or a global preference change.
+The current increment demonstrated useful repeatable negative-direction coarse
+left-elbow response and the short unloaded reach/hold/gripper/retract under normal
+required coarse viewing. Positive-direction undertravel and return/fine limits remain;
+retain that bounded result without another powered repeat for publication. Compare actual
 requested/mapped/accepted/servo-Goal/measured evidence, sign/units, pose, direction
 and maintained dwell before tuning. Use current supported workspace/settings and
 fresh streamed intent; other joints hold actual admitted targets. Preserve fixed
@@ -69,10 +72,11 @@ semantics: one parameter at a time, a small candidate set, baseline/restoration
 verified. If substantial effort lacks motion, distinguish actual load/power/mechanism
 before escalating. Never change IDs, phase, calibration, travel or device protections;
 never overcommand to hide error. No general gain sweep, micro-tick gate or new framework.
-Stage46 source fa1b8391 is installed at motor8a3a91ed/runtimeD80c7d28/MF11027f16;
-all ten phases passed, changing only the reviewed five motor/two runtime files.
-Camera/helper/Core/media/client/calibration remain unchanged; full matched Stage45
-rollback and private state are retained. PR29 remains draft/unmerged.
+Stage48 source4599d9f8 is installed at motor6af9d512/runtimece2c3ec3/MFddbbf831;
+all ten phases passed, changing only the reviewed three motor/two runtime files over
+Stage46. Camera/helper/Core/media/client/calibration remain unchanged; full matched
+8a3a91ed/D80c7d28/MF11027f16 rollback, private state and Windows bytes/ACL are retained.
+PR29 remains draft/unmerged. Documentation publication does not redeploy components.
 Actual90/92/93 demonstrate partial directional elbow movement; Actual91 remains
 weak despite actual Goal2124. Actual93 completed20active unloaded elbow/hold/grip/
 retract,1.934deg outward/1.318deg back,18.944/18.482 gripper opening points,
@@ -89,13 +93,28 @@ without return or a completed maintained comparison. P16 restoration/off readbac
 passed. Fresh camera-only11 and Actual95 Edge chest were illuminated; the earlier
 dark-scene question is superseded, without an established cause. Actual96 then
 refused before Live on stale startup thermal history; no P32 write/input occurred.
-Inner20off/P16 proof passed, but outer cleanup remains unknown because lift
-qualification was unavailable. Preserve that original outcome; use fresh read-only
-proof and durable reconciliation before normal affected-component staging/motion.
-The selected-left startup repair is under focused test/review; no relaxed thermal
-age, reset history, new device limits or unchanged failed retry is authorized. Publish/review
-the new response follow-up without automatic merge; retain current source,
-limitations and rollback. PR28 integration is complete.
+Inner20off/P16 proof passed, but its original outer cleanup remains unknown because
+lift qualification was unavailable. Separate fresh stopped proof and durable executor
+ACK later cleared current uncertainty without rewriting Actual96. Stage48 installed
+the reviewed selected-left startup correction: complete private configuration while
+OFF, then acquire the first original thermal histories within the unchanged startup
+budget; no relaxed thermal age, reset history or new device limit.
+Actual97 completed16active seconds: requested2088->2011 (6.768deg), achieved2019
+(6.064deg), returned2064, residual24ticks/2.109deg. Actual98 positive-direction
+20s action stopped at6.958active seconds after required-view expiry; only28/60ticks
+outward, no gripper/retract. Fresh camera-only12 and normal Edge reload/reselection
+supported one unchanged short retry, not a code or network-cause claim.
+Actual99 completed the20active-second unloaded action and useful ordinary next Start:
+requested2090->2011 (6.943deg), measured2090->2022->2066 (5.977deg outward,
+3.867deg back), residual24ticks/2.109deg. Gripper opened18.944 points and returned
+within0.660 points. Five qualified ordinary input recoveries totaled5.034s; longest
+uninterrupted interval11.024s. All311 accepted-frame snapshots qualified required
+view/local input; the sole enrolled Edge supplied illuminated coarse bench/gripper
+viewing. This repeats useful negative-direction coarse response, not symmetric/fine
+positioning, precision grasping or the full requested reach. Stop gain escalation:
+P32 was temporary and original P16/Lock0/off cleanup verified. The current source-aware
+pure audit admits97-99; original97 audit refusal and96 uncertainty remain historical.
+Publish/review the follow-up without automatic merge. PR28 integration is complete.
 Main/AM2 remain unchanged. Do not repeat powered checks solely for publication.
 No fault-injection campaign, unreviewed/out-of-scope tuning, network remediation
 or freshness downgrade. Dedicated Edge enrollment is resolved; no pairing request.
