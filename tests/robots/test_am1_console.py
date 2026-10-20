@@ -1399,3 +1399,147 @@ def test_direct_console_browser_missing_edge_refuses_without_fallback(tmp_path, 
     monkeypatch.setattr(subprocess, "Popen", lambda *_a, **_kw: pytest.fail("Edge is missing"))
     with pytest.raises(FileNotFoundError, match="Edge"):
         console.open_console_browser("http://127.0.0.1:8765/", tmp_path, direct=True)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Session Edge launcher is Windows-only")
+def test_session_browser_uses_stable_mode_profiles_and_exact_decoder_flag(tmp_path, monkeypatch, capsys):
+    edge = tmp_path / "programs/Microsoft/Edge/Application/msedge.exe"
+    edge.parent.mkdir(parents=True)
+    edge.write_bytes(b"fake Edge executable boundary")
+    monkeypatch.setenv("ProgramFiles(x86)", str(tmp_path / "programs"))
+    commands = []
+    monkeypatch.setattr(console.subprocess, "Popen", lambda argv, **kw: commands.append((argv, kw)))
+    monkeypatch.setattr(console.webbrowser, "open", lambda *_: pytest.fail("must not reuse the ordinary browser profile"))
+    state = tmp_path / "private-state"
+    url = "https://192.168.1.134:8443/"
+    console.open_console_browser(url, state, persistent_session=True, software_video_decode=True)
+    console.open_console_browser(url, state, persistent_session=True, software_video_decode=True)
+    console.open_console_browser(url, state, persistent_session=True)
+    software_profile = state / "edge-session-software-video"
+    default_profile = state / "edge-session-default"
+    assert commands[0][0] == commands[1][0], "same mode retains its separate enrollment/profile"
+    for (argv, options), profile, software in zip(commands[::2], (software_profile, default_profile), (True, False), strict=True):
+        assert argv[0] == str(edge)
+        assert f"--user-data-dir={profile}" in argv and profile.is_dir()
+        assert ("--disable-accelerated-video-decode" in argv) is software
+        assert argv[-1] == f"--app={url}"
+        assert options["shell"] is False
+        assert not any("proxy" in arg or "ignore-certificate" in arg or "disable-web-security" in arg for arg in argv)
+    output = capsys.readouterr().out
+    assert str(software_profile) in output and str(default_profile) in output
+    assert "software" in output and "default" in output and "enrollment" in output
+
+
+@pytest.mark.parametrize("url", [
+    "https://10.0.0.2:8443/", "https://172.16.3.5:8443/", "https://192.168.1.134:8443/",
+    "https://localhost:8443/", "https://am1-pi:8443/", "https://am1-pi.local:8443/",
+])
+def test_session_url_admits_only_explicit_supported_https_targets(url, tmp_path, monkeypatch):
+    edge = tmp_path / "programs/Microsoft/Edge/Application/msedge.exe"
+    edge.parent.mkdir(parents=True)
+    edge.write_bytes(b"fake Edge")
+    monkeypatch.setattr(console.sys, "platform", "win32")
+    monkeypatch.setenv("ProgramFiles(x86)", str(tmp_path / "programs"))
+    commands = []
+    monkeypatch.setattr(console.subprocess, "Popen", lambda argv, **kw: commands.append(argv))
+    console.open_console_browser(url, tmp_path / "state", persistent_session=True)
+    assert len(commands) == 1 and commands[0][-1] == f"--app={url}"
+
+
+@pytest.mark.parametrize("url", [
+    "http://192.168.1.134:8443/", "https://8.8.8.8:8443/", "https://198.51.100.1:8443/",
+    "https://arbitrary.local:8443/", "https://example.com:8443/", "https://192.168.1.134/",
+    "https://192.168.1.134:443/", "https://user:password@192.168.1.134:8443/",
+    "https://192.168.1.134:8443/control", "https://192.168.1.134:8443/camera", "https://192.168.1.134:8443/camera/",
+    "https://192.168.1.134:8443/?x=1", "https://192.168.1.134:8443/?",
+    "https://192.168.1.134:8443/#", "https://192.168.1.134:8443/#camera",
+    "https://192.168.1.134:8443/%2fcamera", "https://192.168.1.134:8443/ --ignore-certificate-errors",
+    "https://192.168.1.134:8443/\n", "file:///camera", "", "https://192.168.1.134:bad/",
+])
+def test_session_browser_rejects_invalid_url_before_any_process_or_profile(url, tmp_path, monkeypatch):
+    monkeypatch.setattr(console.subprocess, "Popen", lambda *_a, **_kw: pytest.fail("invalid URL launched a process"))
+    monkeypatch.setattr(console.webbrowser, "open", lambda *_: pytest.fail("invalid URL used a fallback"))
+    with pytest.raises(ValueError):
+        console.open_console_browser(url, tmp_path / "never-created", persistent_session=True)
+    assert not (tmp_path / "never-created").exists()
+
+
+def test_session_cli_opens_only_persistent_page_without_loading_legacy_owner(tmp_path, monkeypatch):
+    config = tmp_path / "session.json"
+    config.write_text(json.dumps({"local_state_directory": str(tmp_path / "state")}), encoding="utf-8")
+    before = config.read_bytes()
+    monkeypatch.setattr(console, "run_console", lambda *_a, **_kw: pytest.fail("must not construct the legacy console"))
+    monkeypatch.setattr(console, "ConsoleServer", lambda *_a, **_kw: pytest.fail("must not bind a listener"))
+    monkeypatch.setattr(console, "ConsoleSessionAdapter", lambda *_a, **_kw: pytest.fail("must not construct a session owner"))
+    calls = []
+    monkeypatch.setattr(console, "open_console_browser", lambda *args, **kw: calls.append((args, kw)))
+    assert console.main(["--config", str(config), "--session-url", "https://192.168.1.134:8443/", "--software-video-decode"]) == 0
+    assert calls == [(("https://192.168.1.134:8443/", tmp_path / "state"), {"persistent_session": True, "software_video_decode": True})]
+    assert config.read_bytes() == before
+
+
+@pytest.mark.parametrize("options", [
+    ["--software-video-decode"], ["--session-url", "https://localhost:8443/", "--no-browser"],
+    ["--session-url", "https://localhost:8443/", "--direct-browser"],
+])
+def test_session_cli_incompatible_modes_refuse_before_open(options, tmp_path, monkeypatch):
+    monkeypatch.setattr(console, "run_console", lambda *_a, **_kw: pytest.fail("invalid mode reached legacy console"))
+    monkeypatch.setattr(console, "open_console_browser", lambda *_a, **_kw: pytest.fail("invalid mode opened a browser"))
+    with pytest.raises(SystemExit) as exc:
+        console.main(["--config", str(tmp_path / "missing.json"), *options])
+    assert exc.value.code == 2
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="PowerShell 7 unavailable")
+@pytest.mark.parametrize("software", [False, True])
+def test_powershell_session_command_is_open_only_without_legacy_camera_auth(tmp_path, software):
+    helper = ROOT / "tools/run_am1_console.ps1"
+    config = tmp_path / "session.json"
+    config.write_text(json.dumps({"windows_python": sys.executable,
+                                  "local_state_directory": str(tmp_path / "state")}), encoding="utf-8")
+    script = f"""
+. '{str(helper).replace("'", "''")}'
+$command = New-Am1ConsoleCommand -ConfigPath '{str(config).replace("'", "''")}' -SessionUrl 'https://192.168.1.134:8443/' {"-SoftwareVideoDecode" if software else ""}
+$command | ConvertTo-Json -Compress
+"""
+    result = subprocess.run([shutil.which("pwsh"), "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                            cwd=ROOT, capture_output=True, text=True, timeout=20, check=False)
+    assert result.returncode == 0, result.stderr
+    command = json.loads(result.stdout.splitlines()[-1])
+    expected = ["-m", "tools.am1_console", "--config", str(config), "--session-url", "https://192.168.1.134:8443/"]
+    if software:
+        expected.append("--software-video-decode")
+    assert command["executable"] == sys.executable and command["arguments"] == expected
+    assert not (tmp_path / "state").exists(), "command preparation must not launch anything"
+
+
+@pytest.mark.parametrize("values", [{}, {"local_state_directory": "relative"}, {"local_state_directory": ""}, [], {"local_state_directory": None}])
+def test_session_cli_bad_state_config_refuses_without_legacy_or_browser(tmp_path, monkeypatch, values):
+    config = tmp_path / "session.json"
+    config.write_text(json.dumps(values), encoding="utf-8")
+    monkeypatch.setattr(console, "run_console", lambda *_a, **_kw: pytest.fail("bad session state reached legacy owner"))
+    monkeypatch.setattr(console, "open_console_browser", lambda *_a, **_kw: pytest.fail("bad session state opened a browser"))
+    assert console.main(["--config", str(config), "--session-url", "https://am1-pi:8443/"]) == 2
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="PowerShell 7 unavailable")
+def test_powershell_empty_explicit_session_url_cannot_fall_back_to_legacy(tmp_path):
+    helper = ROOT / "tools/run_am1_console.ps1"
+    auth = tmp_path / "auth.json"
+    auth.write_text("{}", encoding="utf-8")
+    config = tmp_path / "session.json"
+    config.write_text(json.dumps({"windows_python": sys.executable, "console_camera_auth_file": str(auth),
+                                  "local_state_directory": str(tmp_path / "state")}), encoding="utf-8")
+    script = f"""
+. '{str(helper).replace("'", "''")}'
+try {{
+    $null = New-Am1ConsoleCommand -ConfigPath '{str(config).replace("'", "''")}' -SessionUrl ''
+    exit 9
+}} catch {{
+    [Console]::Out.WriteLine($_.Exception.Message)
+}}
+"""
+    result = subprocess.run([shutil.which("pwsh"), "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                            cwd=ROOT, capture_output=True, text=True, timeout=20, check=False)
+    assert result.returncode == 0, "an explicitly empty session URL became a legacy console command"
+    assert "SessionUrl" in result.stdout

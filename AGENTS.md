@@ -1,4 +1,4 @@
-## Active AM1 knowledge reuse and teleoperation (Packet18)
+## Active AM1 view continuity after accepted Packet18 operation
 
 Read first: [current state](docs/alohamini/current-state.md) and
 [source-backed decisions/lessons](docs/alohamini/decisions-and-lessons.md).
@@ -29,10 +29,38 @@ useful movement, uninterrupted intervals, active/held and recovery time, usable
 viewing and ordinary reuse; cleanup/refusals support rather than complete it.
 
 Packet18 supersedes proposed Packet17's spike-causation-first direction; Packet16
-supersedes wrist-button Packet15. The owner accepted Actual73/78/79 and authorized
-ordinary integration of PR25 into integrate/am1-local-teleop (comment6272465039).
-PR25 is merged at e3d8a196; main and AM2 are unchanged. New executable follow-up
-repairs use a focused branch/PR and are not automatically merged. Physical USB
+supersedes wrist-button Packet15. Actual73/78/79 retain their separate acceptance.
+The owner accepted Actual88's bounded normal64.5s result and integrated PR26 into
+integrate/am1-local-teleop at472f8c4d, exact accepted a4d5f7e1 tree; PR25 remains
+merged at e3d8a196. That source-equivalent merge needed no redeploy or physical repeat.
+The owner accepted Actual89 and authorized ordinary PR27 integration into
+integrate/am1-local-teleop after outstanding applicable checks/review, superseding
+the prior PR27-unmerged restriction. The current comparable-request-clock review
+finding must be resolved first. New executable left-response/reach work belongs on
+a focused follow-up after integration, without automatically merging it.
+PR27 view-repair source is73690add. Stage44 passed all ten stopped phases, changing only
+Core/media/WebRTC among22 runtime files; the other19, motor/camera/helper, private
+operating settings and matched rollback remain. Actual89 remains at source87cd55da/
+Stage43. The later attachment-race correction was verified without another motor run.
+The [scoped viewing direction](https://github.com/pickmanmike/lerobot_alohamini/pull/26#issuecomment-6279335089)
+joined one Actual88 presentation-progress episode, tested delayed receipts/camera
+fixtures and completed Actual89's64.5s normal REQUIRED-view programme. Preserve its
+real holds, one view expiry inside an existing input hold, weak left-elbow response
+and sampled-view limitations; this is not the original172.5s strict qualification.
+Keep500ms required view,250ms native input and original ownership/deadline guards.
+The process-local msedge software-decoder option is available in the ordinary
+browser-only launcher with stable separate mode profiles; dedicated-profile live
+enrollment/use remains unqualified. It is not GPU proof or a global preference change.
+Next operating scope is useful left-elbow response, then a short unloaded
+reach/hold/gripper/retract under normal required usable viewing. Compare actual
+requested/mapped/accepted/servo-Goal/measured evidence, sign/units, pose, direction
+and maintained dwell before tuning. Use current supported workspace/settings and
+fresh streamed intent; other joints hold actual admitted targets. Preserve fixed
+references through recovery and report interrupted dwells honestly. No gain sweep,
+expanded travel, micro-tick gate, calibration or new telemetry/launcher framework.
+Main/AM2 remain unchanged. Do not repeat powered checks solely for publication.
+No fault-injection campaign, gains, network remediation or freshness downgrade.
+Physical USB
 connection remains owner-deferred; retain historic identities/calibration without
 requesting connection, repeated unchanged enumeration or claiming new validation.
 TEMP-01 retains isolated numeric highs/warnings and faults on confirmed high slots,

@@ -236,6 +236,7 @@ def test_view_progress_is_internal_and_static_decode_never_renews_required_view(
             "source_sequence": 1,
             "source_fresh": True,
             "received_at_monotonic_s": 9.9,
+            "request_received_at_monotonic_s": 10.,
         }
         assert not a._handle(progress, "pc")["accepted"]
         assert a._handle(progress, "gateway-view")["accepted"]
@@ -344,6 +345,7 @@ def test_real_core_executor_native_frame_expiry_and_fresh_rejoin_preserve_run(tm
                     "source_sequence": decode[0],
                     "source_fresh": True,
                     "received_at_monotonic_s": time.monotonic(),
+                    "request_received_at_monotonic_s": time.monotonic(),
                 },
                 "gateway-view",
             )
@@ -1509,7 +1511,8 @@ def test_selected_view_core_receipt_preserves_original_floor_and_reports_actual_
     a.clock = lambda: now[0]
     command = dict(op="view_progress", run_id=e.run_id, role="chest", owner_generation="owner",
                    capture_generation="capture", encode_generation="encode", decoded_frames=3,
-                   media_time=.3, source_sequence=11, source_fresh=True, received_at_monotonic_s=9.98)
+                   media_time=.3, source_sequence=11, source_fresh=True, received_at_monotonic_s=9.98,
+                   request_received_at_monotonic_s=10.)
     try:
         if case == "delayed":
             now[0] = 10.49
@@ -1519,6 +1522,7 @@ def test_selected_view_core_receipt_preserves_original_floor_and_reports_actual_
             assert a._handle(command, "gateway-view")["required_view"]["qualified"]
             now[0] = 10.49
             command["received_at_monotonic_s"] = 10.2  # A new HTTP receipt cannot renew old decoded counters.
+            command["request_received_at_monotonic_s"] = 10.2
         result = a._handle(command, "gateway-view")
         assert result["accepted"] is (case != "delayed")
         if case != "delayed":
@@ -1861,3 +1865,127 @@ def test_bench_owner_restart_invalidates_intent_and_never_auto_reclaims(tmp_path
     finally:
         restored.run = None
         restored.close()
+
+
+@pytest.mark.parametrize("case", ["new_zero_fence", "old_role", "old_same_role_source", "late_false", "late_zero", "late_advancing", "new_advancing", "nonadvancing", "foreign_run"])
+def test_selected_view_original_floor_cannot_rollback_current_run_evidence(tmp_path, case):
+    a, e, _ = authority_lane(tmp_path)
+    a.clock = lambda: 10.2
+    current = dict(op="view_progress", run_id=e.run_id, role="chest", owner_generation="owner",
+                   capture_generation="capture-new", encode_generation="encode-new", decoded_frames=10,
+                   media_time=1., source_sequence=20, source_fresh=True, received_at_monotonic_s=10.1,
+                   request_received_at_monotonic_s=10.1)
+    if case == "new_zero_fence":
+        current.update(decoded_frames=0, media_time=0., source_fresh=False)
+    try:
+        assert a._handle(current, "gateway-view")["accepted"]
+        before = copy.deepcopy(a._teleop_view)
+        late = dict(current, decoded_frames=11, media_time=1.1, source_sequence=21,
+                    received_at_monotonic_s=10.05, request_received_at_monotonic_s=10.05)
+        if case in {"new_zero_fence", "old_same_role_source"}:
+            late.update(capture_generation="capture-old", encode_generation="encode-old", source_fresh=True)
+        if case == "old_role":
+            late["role"] = "wrist_right"
+        if case == "late_false":
+            late["source_fresh"] = False
+        if case == "late_zero":
+            late.update(decoded_frames=0, media_time=0.)
+        if case in {"new_advancing", "nonadvancing"}:
+            late["received_at_monotonic_s"] = late["request_received_at_monotonic_s"] = 10.15
+        if case == "nonadvancing":
+            late.update(decoded_frames=current["decoded_frames"], media_time=current["media_time"])
+        if case == "foreign_run":
+            late["run_id"] = str(uuid4())
+        result = a._handle(late, "gateway-view")
+        assert result["accepted"] is (case in {"new_advancing", "nonadvancing"})
+        if case == "new_advancing":
+            assert a._teleop_view["qualified_until"] == 10.65
+        else:
+            assert a._teleop_view == before
+        if case not in {"new_advancing", "nonadvancing", "foreign_run"}:
+            assert result["reason"] == "selected-view original receipt superseded"
+            assert result["view_timing"]["core_accepted_at_monotonic_s"] is None
+            assert result["view_timing"]["original_floor_at_monotonic_s"] == 10.05
+    finally:
+        a.run = None
+        a.close()
+
+
+
+def test_selected_view_equal_floor_retains_existing_admission_without_extending_age(tmp_path):
+    a, e, _ = authority_lane(tmp_path)
+    a.clock = lambda: 10.2
+    command = dict(op="view_progress", run_id=e.run_id, role="chest", owner_generation="owner",
+                   capture_generation="capture", encode_generation="encode", decoded_frames=1,
+                   media_time=.1, source_sequence=11, source_fresh=True, received_at_monotonic_s=10.1,
+                   request_received_at_monotonic_s=10.1)
+    try:
+        assert a._handle(command, "gateway-view")["accepted"]
+        # Equal request receipts do not establish order; preserve existing semantics,
+        # including a current source replacement, but never manufacture younger proof.
+        result = a._handle(dict(command, encode_generation="encode-new", decoded_frames=2, media_time=.2), "gateway-view")
+        assert result["accepted"] and result["required_view"]["qualified"]
+        assert a._teleop_view["qualified_until"] == 10.6
+        assert a._handle(dict(command, encode_generation="encode-new", decoded_frames=0), "gateway-view")["accepted"]
+        assert not a._teleop_view_qualified()
+    finally:
+        a.run = None
+        a.close()
+
+
+@pytest.mark.parametrize("request_receipt", [None, True, float("nan"), float("inf"), 10.05, 10.21])
+def test_selected_view_requires_actual_internal_request_receipt_between_floor_and_core(tmp_path, request_receipt):
+    a, e, _ = authority_lane(tmp_path)
+    a.clock = lambda: 10.2
+    command = {'op': 'view_progress', 'run_id': e.run_id, 'role': 'chest', 'owner_generation': 'owner', 'capture_generation': 'capture', 'encode_generation': 'encode', 'decoded_frames': 1, 'media_time': 0.1, 'source_sequence': 11, 'source_fresh': True, 'received_at_monotonic_s': 10.1, 'request_received_at_monotonic_s': request_receipt}
+    try:
+        result = a._handle(command, "gateway-view")
+        assert not result["accepted"] and a._teleop_view is None
+        assert result["reason"] == "selected-view original receipt or progress invalid"
+        missing = dict(command)
+        missing.pop("request_received_at_monotonic_s")
+        assert not a._handle(missing, "gateway-view")["accepted"]
+    finally:
+        a.run = None
+        a.close()
+
+
+def test_nonadvancing_request_fences_older_false_without_renewing_original_view(tmp_path):
+    a, e, _ = authority_lane(tmp_path)
+    a.clock = lambda: 10.3
+    command = {'op': 'view_progress', 'run_id': e.run_id, 'role': 'chest', 'owner_generation': 'owner', 'capture_generation': 'capture', 'encode_generation': 'encode', 'decoded_frames': 3, 'media_time': 0.3, 'source_sequence': 11, 'source_fresh': True, 'received_at_monotonic_s': 10.1, 'request_received_at_monotonic_s': 10.15}
+    try:
+        assert a._handle(command, "gateway-view")["accepted"]
+        before = copy.deepcopy(a._teleop_view)
+        assert a._handle(dict(command, request_received_at_monotonic_s=10.25), "gateway-view")["accepted"]
+        assert a._teleop_view == before and a._teleop_view["qualified_until"] == 10.6
+        late = dict(command, source_fresh=False, received_at_monotonic_s=10.2, request_received_at_monotonic_s=10.2)
+        result = a._handle(late, "gateway-view")
+        assert not result["accepted"] and result["reason"] == "selected-view original receipt superseded"
+        assert a._teleop_view == before and a._teleop_view_qualified()
+        current = dict(late, received_at_monotonic_s=10.28, request_received_at_monotonic_s=10.28)
+        assert a._handle(current, "gateway-view")["accepted"]
+        assert not a._teleop_view_qualified() and a.run["status"] == "paused"
+    finally:
+        a.run = None
+        a.close()
+
+
+def test_newer_view_request_can_use_older_fresh_source_without_extending_its_age(tmp_path):
+    a, e, _ = authority_lane(tmp_path)
+    a.clock = lambda: 10.3
+    command = {'op': 'view_progress', 'run_id': e.run_id, 'role': 'chest', 'owner_generation': 'owner', 'capture_generation': 'capture', 'encode_generation': 'encode', 'decoded_frames': 3, 'media_time': 0.3, 'source_sequence': 11, 'source_fresh': True, 'received_at_monotonic_s': 10.2, 'request_received_at_monotonic_s': 10.2}
+    try:
+        assert a._handle(command, "gateway-view")["required_view"]["qualified"]
+        newer = dict(command, decoded_frames=4, media_time=.4, source_sequence=12,
+                     received_at_monotonic_s=10.1, request_received_at_monotonic_s=10.25)
+        accepted = a._handle(newer, "gateway-view")
+        assert accepted["accepted"] and accepted["required_view"]["qualified"]
+        assert a._teleop_view["received_at_monotonic_s"] == 10.1
+        assert a._teleop_view["request_received_at_monotonic_s"] == 10.25
+        assert a._teleop_view["qualified_until"] == 10.6
+        a.clock = lambda: 10.6
+        assert not a._teleop_view_qualified()
+    finally:
+        a.run = None
+        a.close()

@@ -3201,8 +3201,9 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                     pi_clock[0] += 1.125 if loss_op != "grant" else 1.05  # Existing source re-offer minimum remains enforced.
                     report["video"].update(role=role, capture_generation=generation[role])
                     report["cameras"][role].update(sequence=20, arrived_at_monotonic_s=pi_clock[0] - .02)
-                    await proxy.offer(role, b"v=0\r\n", client.device)
+                    offered = await proxy.offer(role, b"v=0\r\n", client.device)
                     progress = {"role": role, "owner_generation": generation["owner"],
+                                "view_generation": offered[2]["X-Camera-View-Generation"],
                                 "capture_generation": generation[role], "encode_generation": generation["encode"],
                                 "decoded_frames": 9, "media_time": .692}
                     with pytest.raises(m.HTTPOutcomeError) as wrong_source:
@@ -3219,6 +3220,7 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                     else:
                         assert all(sum(v["command"]["op"] == op for v in envelopes) == count for op, count in baseline.items())
                         assert not any(v["command"]["op"] in {"resume", "input"} for v in envelopes)
+                    pi_clock[0] += .03125  # Exact synthetic tick: genuine arrival after the offer's original-floor invalidation.
                     report["cameras"][role].update(sequence=21, arrived_at_monotonic_s=pi_clock[0] - .02)
                     receipt = await client.post("onboard/progress", dict(progress, decoded_frames=10, media_time=.8))
                     assert receipt["accepted"] is True and receipt["required_view"]["qualified"] is True
@@ -4309,7 +4311,8 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                                         "owner_generation": "owner", "capture_generation": "capture",
                                         "encode_generation": "encode", "decoded_frames": len(resumes) + 1,
                                         "media_time": float(len(resumes) + 1), "source_sequence": len(resumes),
-                                        "source_fresh": True, "received_at_monotonic_s": pi_clock[0]}
+                                        "source_fresh": True, "received_at_monotonic_s": pi_clock[0],
+                                        "request_received_at_monotonic_s": pi_clock[0]}
                             assert real_handle(progress, "gateway-view")["accepted"] is True
                             return response
                         assert fresh_reads and fresh_reads[-1]["qualified"] is True

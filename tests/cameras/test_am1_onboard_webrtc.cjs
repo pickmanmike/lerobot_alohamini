@@ -10,12 +10,12 @@ function fixture() {
     addTransceiver(){} async createOffer(){return {type:"offer",sdp:"v=0\r\n"};}
     async setLocalDescription(value){this.localDescription=value;} async setRemoteDescription(){} close(){this.closed=true;}
   }
-  const ids={owner_generation:"owner-a",capture_generation:"capture-a",encode_generation:"encode-a"};
+  const ids={owner_generation:"owner-a",capture_generation:"capture-a",encode_generation:"encode-a",view_generation:"11111111-1111-4111-8111-111111111111"};
   const context=vm.createContext({RTCPeerConnection:Peer,MediaStream:class {},performance:{now:()=>now},
-    setInterval:()=>1,clearInterval(){},setTimeout,clearTimeout,AbortSignal,
-    fetch:async(url,options)=>{requests.push({url,...options});if(url.endsWith("/progress")&&progressResponse)return progressResponse;return {ok:true,headers:{get:name=>({
+    setInterval:()=>1,clearInterval(){},setTimeout,clearTimeout,AbortSignal,AbortController,
+    fetch:async(url,options)=>{requests.push({url,...options});if(url.endsWith("/progress")&&progressResponse)return typeof progressResponse==="function"?progressResponse(options):progressResponse;return {ok:true,headers:{get:name=>({
       "X-Camera-Owner-Generation":ids.owner_generation,"X-Camera-Capture-Generation":ids.capture_generation,
-      "X-Camera-Encode-Generation":ids.encode_generation}[name]||null)},text:async()=>"v=0\r\n",json:async()=>({accepted:true})};}});
+      "X-Camera-Encode-Generation":ids.encode_generation,"X-Camera-View-Generation":ids.view_generation}[name]||null)},text:async()=>"v=0\r\n",json:async()=>({accepted:true})};}});
   vm.runInContext(fs.readFileSync(file,"utf8"),context);
   const view=new context.AM1OnboardView(video,{offer:role=>"/api/onboard/webrtc/"+role,
     progress:"/api/onboard/progress",csrf:()=>"csrf",clock:()=>now});
@@ -31,7 +31,7 @@ test("a connected video and ontrack never qualify an undecoded primary view",asy
   await p.view.report();const request=p.requests.find(r=>r.url.endsWith("/progress"));
   assert.equal(request.headers["X-AM1-CSRF"],"csrf");
   assert.deepEqual(JSON.parse(request.body),{role:"chest",owner_generation:"owner-a",capture_generation:"capture-a",
-    encode_generation:"encode-a",decoded_frames:1,media_time:0});
+    encode_generation:"encode-a",view_generation:p.ids.view_generation,decoded_frames:1,media_time:0});
   await p.view.stop();
 });
 test("advancing source metadata and repeated media time cannot renew a frozen decoder",async()=>{
@@ -70,7 +70,7 @@ test("loaded camera page selects WebRTC and switches roles without any control r
       const role=request.url.split("/").at(-1);if(role!==selected){selected=role;generation=randomUUID();}
       for await(const _ of request){};
       return reply(201,"application/sdp","v=0\r\n",{"X-Camera-Owner-Generation":owner,
-        "X-Camera-Capture-Generation":captures[role],"X-Camera-Encode-Generation":generation});
+        "X-Camera-Capture-Generation":captures[role],"X-Camera-Encode-Generation":generation,"X-Camera-View-Generation":randomUUID()});
     }
     if(request.url==="/api/onboard/progress"){for await(const _ of request){};return reply(200,"application/json",'{"accepted":true}');}
     if(request.url.startsWith("/api/"))return reply(503,"text/plain","fixture thumbnail unavailable");
@@ -109,9 +109,8 @@ test("loaded camera page selects WebRTC and switches roles without any control r
 });
 
 
-test("view progress consumes the bounded logical body before releasing its one in-flight slot",async()=>{
+test("view progress consumes the bounded logical body before releasing its receipt slot",async()=>{
   const p=fixture();await p.view.start("chest");p.source();
-  p.callbacks.shift()(0,{presentedFrames:1,mediaTime:.1});
   let release,read=false;
   const body=JSON.stringify({accepted:true,status:"view_progress",effect_admitted:false,
     required_view:{required:true,qualified:true,role:"chest",cause:null},view_delivery:{version:1}});
@@ -120,6 +119,7 @@ test("view progress consumes the bounded logical body before releasing its one i
   const response={ok:true,headers:{get:name=>name.toLowerCase()==="content-type"?"application/json":String(body.length)},
     text:()=>{read=true;return new Promise(resolve=>{release=()=>resolve(body);});}};
   p.setProgressResponse(response);
+  p.callbacks.shift()(0,{presentedFrames:1,mediaTime:.1});
   const pending=p.view.report();await new Promise(resolve=>setImmediate(resolve));
   assert.equal(read,true);assert.equal(p.view.reporting,true);assert.equal(p.view.progressReceipt,null);
   release();await pending;
@@ -131,11 +131,10 @@ test("view progress consumes the bounded logical body before releasing its one i
 
 for(const mode of ["refused","malformed","oversized","http-error","stale-epoch"])test("view progress receipt contrast: "+mode,async()=>{
   const p=fixture();await p.view.start("chest");p.source();
-  p.callbacks.shift()(0,{presentedFrames:1,mediaTime:.1});
   let text=mode==="malformed"?"not-json":JSON.stringify({accepted:false,reason:"decoded video has not advanced"});
   const response={ok:mode!=="http-error",headers:{get:name=>name.toLowerCase()==="content-type"?"application/json":mode==="oversized"?"8193":String(text.length)},
     text:async()=>{if(mode==="stale-epoch")await p.view.stop();return text;}};
-  p.setProgressResponse(response);await p.view.report();
+  p.setProgressResponse(response);p.callbacks.shift()(0,{presentedFrames:1,mediaTime:.1});await p.view.report();
   if(mode==="refused"){
     assert.equal(p.view.progressReceipt.accepted,false);
     assert.equal(p.view.progressReceipt.reason,"decoded video has not advanced");
@@ -194,7 +193,7 @@ test("actual video keeps presented-frame proof across the ordinary primary scree
     });
     globalThis.offlineMedia={sender,stream,timer};return sender.localDescription.sdp;
    },request.postData());
-   return reply(201,"application/sdp",answer,{"X-Camera-Owner-Generation":owner,"X-Camera-Capture-Generation":capture,"X-Camera-Encode-Generation":encode});
+   return reply(201,"application/sdp",answer,{"X-Camera-Owner-Generation":owner,"X-Camera-Capture-Generation":capture,"X-Camera-Encode-Generation":encode,"X-Camera-View-Generation":require("node:crypto").randomUUID()});
   }
   if(url.pathname==="/api/onboard/progress")return reply(200,"application/json",'{"accepted":true}');
   if(url.pathname.startsWith("/api/"))return reply(503,"text/plain","offline unassigned source");
@@ -319,7 +318,7 @@ test("actual video separates delayed source publication from explicit stale reof
      });return sender.localDescription.sdp;
     },request.postData());
     offers.push({at,answered_at:await page.evaluate(()=>performance.now())});
-    return reply(201,"application/sdp",answer,{"X-Camera-Owner-Generation":"offline-owner","X-Camera-Capture-Generation":"offline-capture","X-Camera-Encode-Generation":"offline-encode"});
+    return reply(201,"application/sdp",answer,{"X-Camera-Owner-Generation":"offline-owner","X-Camera-Capture-Generation":"offline-capture","X-Camera-Encode-Generation":"offline-encode","X-Camera-View-Generation":require("node:crypto").randomUUID()});
    }
    // No Core/native owner exists in this fixture. Local player health is not an ACK.
    if(url.pathname==="/api/onboard/progress")return reply(200,"application/json",'{"accepted":false,"reason":"offline loopback has no native owner"}');
@@ -382,4 +381,133 @@ for(const mode of ["source-only","presentation-stale","failed","disconnected","c
   assert.equal(stops.length,1);assert.equal(stops[0],mode==="source-unavailable"?"source-unavailable":"decoded-video-stall");
   assert.equal(starts,mode==="source-unavailable"?0:1);
  }
+});
+
+
+test("latest-only progress publishes new decoded data before an older receipt body finishes",async()=>{
+ const p=fixture(),bodies=[];await p.view.start("chest");p.source();
+ p.setProgressResponse(options=>{const frame=JSON.parse(options.body).decoded_frames;
+  const body=JSON.stringify({accepted:true,view_delivery:{frame}});
+  return {ok:true,headers:{get:name=>name.toLowerCase()==="content-type"?"application/json":String(body.length)},
+   text:()=>new Promise(resolve=>bodies.push({frame,finish:()=>resolve(body)}))};});
+ try{
+  p.callbacks.shift()(0,{presentedFrames:1,mediaTime:.1});const first=p.view.report();await new Promise(setImmediate);
+  p.advance(150);p.source();p.callbacks.shift()(150,{presentedFrames:2,mediaTime:.2});const second=p.view.report();
+  await new Promise(setImmediate);
+  assert.equal(p.requests.filter(r=>r.url.endsWith("/progress")).length,2,"receipt delivery must not block newer decoded progress");
+  assert.deepEqual(bodies.map(v=>v.frame),[1,2]);
+  bodies[1].finish();await second;assert.equal(p.view.progressReceipt.view_delivery.frame,2);
+  bodies[0].finish();await first;assert.equal(p.view.progressReceipt.view_delivery.frame,2,"late old receipt cannot replace current delivery");
+  assert.equal(p.view.health().decoded_age_ms,0);p.advance(651);p.source();assert.equal(p.view.health().fresh,false);
+ }finally{bodies.forEach(v=>v.finish());await p.view.stop();}
+});
+
+test("latest-only progress bounds two requests and aborts older delivery without queuing frames",async()=>{
+ const p=fixture(),pending=[],sent=[];let active=0,maximum=0;await p.view.start("chest");p.source();
+ p.setProgressResponse(options=>{const frame=JSON.parse(options.body).decoded_frames;sent.push(frame);active++;maximum=Math.max(maximum,active);
+  const body=JSON.stringify({accepted:true,view_delivery:{frame}});
+  return {ok:true,headers:{get:name=>name.toLowerCase()==="content-type"?"application/json":String(body.length)},
+   text:()=>new Promise((resolve,reject)=>{let done=false;const finish=error=>{if(done)return;done=true;active--;error?reject(error):resolve(body);};
+    options.signal.addEventListener("abort",()=>finish(new Error("aborted")),{once:true});pending.push(()=>finish());})};});
+ try{
+  for(const [at,frame]of [[0,1],[150,2],[300,3]]){p.advance(at);p.source();p.callbacks.shift()(at,{presentedFrames:frame,mediaTime:frame/10});void p.view.report();await new Promise(setImmediate);}
+  assert.equal(p.requests.filter(r=>r.url.endsWith("/progress")).length,2);
+  assert.equal(p.requests.find(r=>r.url.endsWith("/progress")).signal.aborted,true);
+  p.advance(450);p.source();p.callbacks.shift()(450,{presentedFrames:5,mediaTime:.5});void p.view.report();await new Promise(setImmediate);
+  assert.deepEqual(sent,[1,2,5],"the latest current capture replaces skipped frames; no FIFO replay");assert.equal(maximum,2);
+ }finally{pending.forEach(finish=>finish());await p.view.stop();}
+});
+
+test("ignored transport abort settles callers while quarantining no more than two raw requests",async()=>{
+ const p=fixture(),finish=[];await p.view.start("chest");p.source();
+ p.setProgressResponse(()=>{const body=JSON.stringify({accepted:true});return {ok:true,
+  headers:{get:name=>name.toLowerCase()==="content-type"?"application/json":String(body.length)},
+  text:()=>new Promise(resolve=>finish.push(()=>resolve(body)))};});
+ try{
+  p.callbacks.shift()(0,{presentedFrames:1,mediaTime:.1});const first=p.view.report();await new Promise(setImmediate);
+  p.advance(150);p.source();p.callbacks.shift()(150,{presentedFrames:2,mediaTime:.2});const second=p.view.report();await new Promise(setImmediate);
+  for(let frame=3;frame<=8;frame++){p.advance((frame-1)*150);p.source();p.callbacks.shift()((frame-1)*150,{presentedFrames:frame,mediaTime:frame/10});void p.view.report();await new Promise(setImmediate);}
+  await Promise.race([Promise.all([first,second]),new Promise((_,reject)=>setTimeout(()=>reject(Error("abort did not settle caller")),200))]);
+  assert.equal(p.requests.filter(r=>r.url.endsWith("/progress")).length,2,"an uncooperative transport is quarantined instead of leaking more work");
+  assert.equal(p.view.reporting,false);assert.equal(p.view.progressReceipt,null);
+ }finally{finish.forEach(resolve=>resolve());await new Promise(setImmediate);await p.view.stop();}
+});
+
+test("stopped report cannot clear a new epoch's active delivery or publish a stale receipt",async()=>{
+ const p=fixture(),finish=[];await p.view.start("chest");p.source();
+ p.setProgressResponse(options=>{const body=JSON.stringify({accepted:true,view_delivery:{role:JSON.parse(options.body).role}});return {ok:true,
+  headers:{get:name=>name.toLowerCase()==="content-type"?"application/json":String(body.length)},
+  text:()=>new Promise(resolve=>finish.push(()=>resolve(body)))};});
+ try{
+  p.callbacks.shift()(0,{presentedFrames:1,mediaTime:.1});const old=p.view.report();await new Promise(setImmediate);
+  await p.view.stop();await Promise.race([old,new Promise((_,reject)=>setTimeout(()=>reject(Error("stop did not settle old report")),200))]);await p.view.start("forward");p.source("forward");p.advance(200);
+  p.callbacks.pop()(200,{presentedFrames:1,mediaTime:.1});const current=p.view.report();await new Promise(setImmediate);
+  assert.equal(finish.length,2);assert.equal(p.view.reporting,true);
+  finish[0]();await new Promise(setImmediate);assert.equal(p.view.reporting,true);assert.equal(p.view.progressReceipt,null);
+  finish[1]();await current;assert.equal(p.view.progressReceipt.view_delivery.role,"forward");assert.equal(p.view.reporting,false);
+ }finally{finish.forEach(resolve=>resolve());await p.view.stop();}
+});
+
+test("new decode publishes promptly within cadence while an actual frozen decoder still expires",async()=>{
+ const p=fixture();await p.view.start("chest");p.source();const text=JSON.stringify({accepted:true});
+ p.setProgressResponse({ok:true,headers:{get:name=>name.toLowerCase()==="content-type"?"application/json":String(text.length)},text:async()=>text});
+ try{
+  p.callbacks.shift()(0,{presentedFrames:1,mediaTime:.1});await p.view.report();
+  p.advance(100);p.source();p.callbacks.shift()(100,{presentedFrames:2,mediaTime:.2});await p.view.report();
+  assert.equal(p.requests.filter(r=>r.url.endsWith("/progress")).length,1,"rVFC never creates a cadence burst");
+  p.advance(450);p.source();p.callbacks.shift()(450,{presentedFrames:3,mediaTime:.3});await new Promise(setImmediate);
+  assert.equal(p.requests.filter(r=>r.url.endsWith("/progress")).length,2,"a newly decoded frame gets the due opportunity immediately");
+  p.advance(951);p.source();await p.view.report();assert.equal(p.view.health().decoded_age_ms,501);assert.equal(p.view.health().fresh,false);
+  assert.equal(p.requests.filter(r=>r.url.endsWith("/progress")).length,2,"stale decoder counters cannot be published as fresh progress");
+ }finally{await p.view.stop();}
+});
+
+
+test("fresh decoded progress is published despite an aged browser source-status cache",async()=>{
+ const p=fixture();await p.view.start("chest");p.source();
+ const text=JSON.stringify({accepted:false,reason:"selected source is not fresh"});
+ p.setProgressResponse({ok:true,headers:{get:name=>name.toLowerCase()==="content-type"?"application/json":String(text.length)},text:async()=>text});
+ try{
+  p.callbacks.shift()(0,{presentedFrames:1,mediaTime:.1});await p.view.report();
+  p.advance(600); // No status refresh: actual server source freshness is independent.
+  p.callbacks.shift()(600,{presentedFrames:2,mediaTime:.2});await p.view.report();
+  const reports=p.requests.filter(r=>r.url.endsWith("/progress"));
+  assert.equal(reports.length,2,"cached source status must not suppress genuine new decoder evidence");
+  assert.equal(JSON.parse(reports[1].body).decoded_frames,2);
+  assert.equal(p.view.health().decoded_age_ms,0);assert.equal(p.view.health().source_age_ms,600);
+  assert.equal(p.view.health().source_fresh,false);assert.equal(p.view.health().fresh,false);
+  assert.equal(p.view.progressReceipt.accepted,false,"the independent server refusal stays truthful");
+ }finally{await p.view.stop();}
+});
+
+
+for(const token of [null,"not-a-uuid"])test("view attachment requires a current issued SDP token: "+token,async()=>{
+ const p=fixture();p.ids.view_generation=token;
+ try{await assert.rejects(p.view.start("chest"),/view attachment/i);
+  assert.equal(p.view.binding,null);assert.equal(p.requests.filter(r=>r.url.endsWith("/progress")).length,0);
+ }finally{await p.view.stop();}
+});
+
+test("a receipt from a replaced same-source attachment cannot update the current binding",async()=>{
+ const p=fixture();await p.view.start("chest");p.source();let finish;
+ const text=JSON.stringify({accepted:true});
+ p.setProgressResponse({ok:true,headers:{get:name=>name.toLowerCase()==="content-type"?"application/json":String(text.length)},
+  text:()=>new Promise(resolve=>{finish=()=>resolve(text);})});
+ try{
+  p.callbacks.shift()(0,{presentedFrames:1,mediaTime:.1});const receipt=p.view.report();await new Promise(setImmediate);
+  const sent=JSON.parse(p.requests.find(r=>r.url.endsWith("/progress")).body);
+  assert.equal(sent.view_generation,p.ids.view_generation);
+  p.view.binding={...p.view.binding,view_generation:"22222222-2222-4222-8222-222222222222"};
+  finish();await receipt;assert.equal(p.view.progressReceipt,null);
+ }finally{finish?.();await p.view.stop();}
+});
+
+
+test("standalone WebRTC without progress remains usable without an attachment header",async()=>{
+ const p=fixture();p.view.options.progress=null;p.ids.view_generation=null;
+ try{
+  await p.view.start("chest");p.source();p.callbacks.shift()(0,{presentedFrames:1,mediaTime:.1});
+  assert.equal(p.view.health().fresh,true);assert.equal(p.view.health().decoded_frames,1);
+  assert.equal(p.requests.filter(r=>r.url.endsWith("/progress")).length,0);
+ }finally{await p.view.stop();}
 });

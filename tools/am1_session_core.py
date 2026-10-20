@@ -600,6 +600,7 @@ class SessionAuthority:
         self.released = False
         self._live_rearm = None  # Volatile; restart/reconnect never restores gesture authority.
         self._teleop_view = None
+        self._teleop_view_request = None  # Same-run ordering; never renews source freshness.
         self.events = deque(maxlen=64)
         self.last_tick = clock()
         self.last_checkpoint = clock()
@@ -1287,7 +1288,8 @@ class SessionAuthority:
 
     def _view_progress(self, command, device):
         fields = {"op", "run_id", "role", "owner_generation", "capture_generation", "encode_generation",
-                  "decoded_frames", "media_time", "source_sequence", "source_fresh", "received_at_monotonic_s"}
+                  "decoded_frames", "media_time", "source_sequence", "source_fresh", "received_at_monotonic_s",
+                  "request_received_at_monotonic_s"}
         if (device != "gateway-view" or not self.run or self.run["recipe"] != TELEOP_RECIPE
             or command.get("run_id") != self.run["run_id"] or set(command) != fields
             or command.get("role") not in {"forward", "backward", "chest", "wrist_left", "wrist_right"}):
@@ -1313,9 +1315,18 @@ class SessionAuthority:
             or type(command["source_sequence"]) is not int or command["source_sequence"] < 0
             or not teleop_number(command["media_time"]) or command["media_time"] < 0
             or type(command["source_fresh"]) is not bool or not teleop_number(command["received_at_monotonic_s"])
+            or not teleop_number(command["request_received_at_monotonic_s"])
+            or not command["received_at_monotonic_s"] <= command["request_received_at_monotonic_s"] <= now
             or not 0 <= now - command["received_at_monotonic_s"] < .5):
             return receipt(self._refuse("selected-view original receipt or progress invalid"))
         old = self._teleop_view or {}
+        # Source age and request order are independent. A delayed callback may
+        # have a younger source floor but an older original Gateway receipt.
+        previous = self._teleop_view_request
+        if (previous and previous[0] == command["run_id"]
+                and command["request_received_at_monotonic_s"] < previous[1]):
+            return receipt(self._refuse("selected-view original receipt superseded"))
+        self._teleop_view_request = (command["run_id"], command["request_received_at_monotonic_s"])
         identity = ("run_id", "role", "owner_generation", "capture_generation", "encode_generation")
         changed = any(old.get(k) != command[k] for k in identity)
         advancing = changed or (command["decoded_frames"] > old.get("decoded_frames", -1)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Loopback-only AM1 console shell; it does not start a robot on page load."""
+"""AM1 loopback console and explicit persistent-session browser; opening never starts a robot."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import base64
 import binascii
 import hmac
 import http.client
+import ipaddress
 import json
 import os
 import re
@@ -1061,15 +1062,43 @@ class ConsoleHandler(BaseHTTPRequestHandler):
     do_PUT = do_PATCH = do_DELETE = do_OPTIONS = do_TRACE = do_CONNECT = do_HEAD = lambda self: self._reply(403)
 
 
-def open_console_browser(address: str, state_directory: Path, *, direct: bool = False) -> None:
-    """Opt-in local-only Edge process; never alter system/default-profile proxy settings."""
-    if not direct:
+def validate_session_url(address: str) -> None:
+    """Allow only the explicit local persistent owner, never arbitrary browser arguments."""
+    if (not isinstance(address, str) or not address or any(ch.isspace() or ord(ch) < 32 for ch in address)
+            or "?" in address or "#" in address or "\\" in address):
+        raise ValueError("Session URL must be an explicit local HTTPS8443 root URL")
+    target = urlsplit(address)
+    supported_host = target.hostname in {"localhost", "am1-pi", "am1-pi.local"}
+    try:
+        host_ip = ipaddress.ip_address(target.hostname or "")
+        supported_host = supported_host or (isinstance(host_ip, ipaddress.IPv4Address) and any(
+            host_ip in ipaddress.ip_network(network) for network in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")))
+    except ValueError:
+        pass
+    if (target.scheme != "https" or target.port != 8443 or not supported_host
+            or target.path != "/" or target.username is not None or target.password is not None):
+        raise ValueError("Session URL requires HTTPS8443 at an RFC1918 address or supported AM1/localhost name, root path /")
+
+
+def open_console_browser(address: str, state_directory: Path, *, direct: bool = False,
+                         persistent_session: bool = False, software_video_decode: bool = False) -> None:
+    """Open a selected Edge profile without changing system proxy, trust or user preferences."""
+    if software_video_decode and not persistent_session:
+        raise ValueError("Software video decoding requires an explicit persistent session URL")
+    if persistent_session:
+        if direct:
+            raise ValueError("Persistent session and legacy direct browser modes are mutually exclusive")
+        validate_session_url(address)
+        if sys.platform != "win32":
+            raise ValueError("Persistent session browser requires Windows Edge")
+    elif not direct:
         webbrowser.open(address)
         return
-    target = urlsplit(address)
-    if (sys.platform != "win32" or target.scheme != "http" or target.hostname != "127.0.0.1"
-            or target.username is not None or target.password is not None):
-        raise ValueError("Direct console browser requires a Windows loopback HTTP address")
+    else:
+        target = urlsplit(address)
+        if (sys.platform != "win32" or target.scheme != "http" or target.hostname != "127.0.0.1"
+                or target.username is not None or target.password is not None):
+            raise ValueError("Direct console browser requires a Windows loopback HTTP address")
     candidates = [Path(root) / "Microsoft/Edge/Application/msedge.exe"
                   for name in ("ProgramFiles(x86)", "ProgramFiles", "LOCALAPPDATA")
                   if (root := os.environ.get(name))]
@@ -1077,14 +1106,21 @@ def open_console_browser(address: str, state_directory: Path, *, direct: bool = 
     if edge is None and (installed := shutil.which("msedge")):
         edge = Path(installed)
     if edge is None:
-        raise FileNotFoundError("Microsoft Edge is unavailable for the direct console browser; no profile fallback")
-    # A distinct profile gives these process flags effect even if ordinary Edge
-    # is already open. Retain it privately; never change/delete the user's profile.
-    profile = state_directory.resolve() / "edge-console-direct"
+        raise FileNotFoundError("Microsoft Edge is unavailable for the selected console browser; no profile fallback")
+    # Stable mode-specific profiles retain enrollment. Each always has the same
+    # fixed flags, separate from ordinary Edge and the other decoding mode.
+    mode = "software-video" if software_video_decode else "default"
+    profile = state_directory.resolve() / (f"edge-session-{mode}" if persistent_session else "edge-console-direct")
     profile.mkdir(parents=True, exist_ok=True)
-    subprocess.Popen([str(edge), "--no-proxy-server", f"--user-data-dir={profile}",
-                      "--no-first-run", "--no-default-browser-check", f"--app={address}"],
-                     shell=False, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+    arguments = [str(edge), f"--user-data-dir={profile}", "--no-first-run", "--no-default-browser-check"]
+    if direct:
+        arguments.insert(1, "--no-proxy-server")
+    if software_video_decode:
+        arguments.append("--disable-accelerated-video-decode")
+    arguments.append(f"--app={address}")
+    if persistent_session:
+        print(f"AM1 session browser: {mode}; profile={profile}; separate enrollment, existing trusted CA required", flush=True)
+    subprocess.Popen(arguments, shell=False, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL)
 
 
@@ -1152,13 +1188,33 @@ def run_console(config_path: Path, *, no_browser: bool = False, direct_browser: 
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Loopback AM1 camera and supervised Local control console")
+    parser = argparse.ArgumentParser(description="Open an existing AM1 Pi session page, or the legacy loopback Local control console")
     parser.add_argument("--config", type=Path, required=True, help="existing private AM1 session configuration")
     browsers = parser.add_mutually_exclusive_group()
     browsers.add_argument("--no-browser", action="store_true", help="serve without opening a browser tab")
     browsers.add_argument("--direct-browser", action="store_true",
                           help="open dedicated Windows Edge console with process-local direct routing")
+    parser.add_argument("--session-url", help="open only the existing HTTPS8443 Pi session page; no local console or Start")
+    parser.add_argument("--software-video-decode", action="store_true",
+                        help="use the separate session Edge profile with process-local software video decoding")
     args = parser.parse_args(argv)
+    if args.session_url is not None:
+        if args.no_browser or args.direct_browser:
+            parser.error("--session-url cannot combine with legacy --no-browser or --direct-browser")
+        try:
+            validate_session_url(args.session_url)
+            values = json.loads(args.config.read_text(encoding="utf-8"))
+            state = values.get("local_state_directory") if isinstance(values, dict) else None
+            if not isinstance(state, str) or not state.strip() or not Path(state).is_absolute():
+                raise ValueError("Existing private local_state_directory must be an absolute path")
+            open_console_browser(args.session_url, Path(state), persistent_session=True,
+                                 software_video_decode=args.software_video_decode)
+        except (OSError, ValueError) as exc:
+            print(f"AM1 session browser refused before session start: {exc}")
+            return 2
+        return 0
+    if args.software_video_decode:
+        parser.error("--software-video-decode requires --session-url")
     return run_console(args.config, no_browser=args.no_browser, direct_browser=args.direct_browser)
 
 
