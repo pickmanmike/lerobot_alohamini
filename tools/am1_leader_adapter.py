@@ -65,7 +65,7 @@ class SelectedLeftWorkload:
     """Finite current input with fixed original targets, not a native trajectory."""
 
     kind = "virtual-leaders"
-    DURATIONS = {"left-maintained": 16., "left-reach": 20., "left-supported-reach": 28.}
+    DURATIONS = {"left-maintained": 16., "left-reach": 20., "left-supported-reach": 28., "left-opposite-first": 18.}
     elbow = "arm_left_elbow_flex.pos"
     shoulder = "arm_left_shoulder_lift.pos"
     gripper = "arm_left_gripper.pos"
@@ -79,8 +79,15 @@ class SelectedLeftWorkload:
         # different command corridor during an allegedly selected-only check.
         self.origin = validate_target(self.workspace["reference"], workspace=self.workspace)
         bound = self.workspace["bounds"][self.elbow]
-        self.endpoint = max((bound["min"], bound["max"]), key=lambda value: abs(value-self.origin[self.elbow]))
-        if abs(self.endpoint-self.origin[self.elbow]) > 4 * bound["rate_per_s"] + 1e-9:
+        self.endpoint = (bound["max"] if segment == "left-opposite-first" else
+                         max((bound["min"], bound["max"]), key=lambda value: abs(value-self.origin[self.elbow])))
+        if segment == "left-opposite-first":
+            self.first_endpoint = bound["min"]
+            ramps = ((self.origin[self.elbow], self.first_endpoint, 2.),
+                     (self.first_endpoint, self.endpoint, 4.), (self.endpoint, self.origin[self.elbow], 4.))
+            if any(abs(end-start) > duration * bound["rate_per_s"] + 1e-9 for start, end, duration in ramps):
+                raise ValueError("opposite-first endpoint exceeds an unchanged ramp rate")
+        elif abs(self.endpoint-self.origin[self.elbow]) > 4 * bound["rate_per_s"] + 1e-9:
             raise ValueError("selected endpoint exceeds the unchanged four-second ramp rate")
         opening = self.workspace["bounds"][self.gripper]
         self.opening = (min(self.origin[self.gripper] + 20., opening["max"],
@@ -104,6 +111,11 @@ class SelectedLeftWorkload:
                              ("left_endpoint_hold", 12., 14.), ("left_gripper_open", 14., 16.),
                              ("left_gripper_return", 16., 18.), ("left_retract", 18., 22.),
                              ("left_shoulder_retract", 22., 26.), ("left_final_hold", 26., 28.)]
+        if segment == "left-opposite-first":
+            self.schedule = [("left_baseline", 0., 2.), ("left_opposite", 2., 4.),
+                             ("left_opposite_hold", 4., 6.), ("left_outward", 6., 10.),
+                             ("left_endpoint_hold", 10., 12.), ("left_retract", 12., 16.),
+                             ("left_final_hold", 16., 18.)]
         self.elapsed_s, self._last = 0., None
         self.phases_completed, self.interrupted_phases = set(), set()
 
@@ -138,6 +150,16 @@ class SelectedLeftWorkload:
 
     def get_action(self):
         target = dict(self.origin)
+        if self.segment == "left-opposite-first":
+            elapsed = self.elapsed_s
+            if elapsed <= 6.:
+                start, end, fraction = self.origin[self.elbow], self.first_endpoint, (elapsed-2.) / 2.
+            elif elapsed <= 12.:
+                start, end, fraction = self.first_endpoint, self.endpoint, (elapsed-6.) / 4.
+            else:
+                start, end, fraction = self.endpoint, self.origin[self.elbow], (elapsed-12.) / 4.
+            target[self.elbow] = start + max(0., min(1., fraction)) * (end-start)
+            return {key.removeprefix("arm_"): value for key, value in target.items()}
         if self.segment == "left-supported-reach":
             elapsed = self.elapsed_s
             shoulder = (max(0., min(1., (elapsed-2.) / 4.)) if elapsed <= 22.
@@ -173,6 +195,11 @@ class SelectedLeftWorkload:
                 "active_progress_s": self.elapsed_s, "interrupted_phases": sorted(self.interrupted_phases),
                 "dwell_basis": "producer active intent; native delivered dwell assessed separately",
                 "target_policy": "fixed original admitted references and supported endpoint across qualified recovery"}
+        if self.segment == "left-opposite-first":
+            raw = min(self.workspace["raw_bounds"][self.elbow],
+                      key=lambda value: abs(normalized_raw(value, cal)-self.first_endpoint))
+            result.update(first_endpoint_normalized=self.first_endpoint, first_endpoint_raw_bound=raw,
+                          first_travel_normalized=self.first_endpoint-self.origin[self.elbow])
         if self.segment == "left-supported-reach":
             shoulder = self.workspace["bounds"][self.shoulder]
             cal = self.workspace["calibration"][self.shoulder.removesuffix(".pos")]

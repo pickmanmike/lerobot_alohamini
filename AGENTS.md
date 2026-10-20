@@ -62,9 +62,12 @@ Stage45 source871598c6 is installed at motor603c4624/runtimeD632471f/MF2a115478;
 only host/selected-evidence and Core/media changed, with matched Stage44 rollback.
 Actual90 completed16 active seconds without producer holds, but actual left response
 is partial:2020→2041→2031 despite actual Goal2020→2124→2020. Calibration matches
-Packet14; poses differ. Next supported28s shoulder-conditioned unloaded reach uses
-current bounds/settings and fresh input, not a gain/travel increase or old-pose claim.
-New PC-only source needs focused checks/review, no unchanged native redeploy.
+Packet14; poses differ. Actual91 completed28active with useful shoulder/gripper
+response, but elbow only2ticks despite actual Goal2124. Eight ordinary input holds
+recovered; required viewing remained general-purpose, not precision-grasp qualified.
+One supported18s opposite-first comparison is the next focused question, within
+unchanged2011..2124 travel/settings and other11 actual admitted holds. No speculative
+tuning or unchanged native redeploy; new PC-only source needs focused checks/review.
 Main/AM2 remain unchanged. Do not repeat powered checks solely for publication.
 No fault-injection campaign, gains, network remediation or freshness downgrade.
 Physical USB
