@@ -34,8 +34,10 @@ The owner accepted Actual88's bounded normal64.5s result and integrated PR26 int
 integrate/am1-local-teleop at472f8c4d, exact accepted a4d5f7e1 tree; PR25 remains
 merged at e3d8a196. That source-equivalent merge needed no redeploy or physical repeat.
 Current PR27 is open, ready for review and unmerged on codex/am1-view-continuity,
-source87cd55da. Stage43 passed all ten stopped phases, changing only selected-view
-JavaScript among the22 runtime files; motor/camera/helper and private operating settings remain.
+view-repair source73690add. Stage44 passed all ten stopped phases, changing only
+Core/media/WebRTC among22 runtime files; the other19, motor/camera/helper, private
+operating settings and matched rollback remain. Actual89 remains at source87cd55da/
+Stage43. The later attachment-race correction was verified without another motor run.
 The [scoped viewing direction](https://github.com/pickmanmike/lerobot_alohamini/pull/26#issuecomment-6279335089)
 joined one Actual88 presentation-progress episode, tested delayed receipts/camera
 fixtures and completed Actual89's64.5s normal REQUIRED-view programme. Preserve its
