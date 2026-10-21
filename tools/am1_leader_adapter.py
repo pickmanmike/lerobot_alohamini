@@ -61,19 +61,37 @@ class LeaderClutch:
         return result
 
 
+def _peer_options(segment, side, direction, raw_step, *, bench=False, next_start=None):
+    peer = segment in {"left-peer-maintained", "right-peer-maintained"}
+    if not peer:
+        if any(value is not None for value in (side, direction, raw_step)):
+            raise ValueError("peer options require an explicitly selected peer segment")
+        return None
+    if (side != segment.split("-", 1)[0] or type(direction) is not int or direction not in (-1, 1)
+            or type(raw_step) is not int or not 1 <= raw_step <= 79 or bench or next_start is not None):
+        raise ValueError("peer profile requires matching side, raw direction, explicit1..79tick excursion and normal finite mode")
+    return {"side": side, "direction_raw": direction, "raw_step": raw_step}
+
+
 class SelectedLeftWorkload:
     """Finite current input with fixed original targets, not a native trajectory."""
 
     kind = "virtual-leaders"
-    DURATIONS = {"left-maintained": 16., "left-reach": 20., "left-supported-reach": 28., "left-opposite-first": 18.}
+    DURATIONS = {"left-maintained": 16., "left-reach": 20., "left-supported-reach": 28., "left-opposite-first": 18.,
+                 "left-peer-maintained": 16., "right-peer-maintained": 16.}
     elbow = "arm_left_elbow_flex.pos"
     shoulder = "arm_left_shoulder_lift.pos"
     gripper = "arm_left_gripper.pos"
 
-    def __init__(self, workspace, *, segment="left-maintained"):
+    def __init__(self, workspace, *, segment="left-maintained", peer_side=None, peer_direction=None, peer_raw_step=None):
         if segment not in self.DURATIONS:
             raise ValueError("Unknown selected left finite profile")
         self.segment, self.duration_s = segment, self.DURATIONS[segment]
+        self.peer = _peer_options(segment, peer_side, peer_direction, peer_raw_step)
+        self.peer_baseline = None
+        if self.peer:
+            self.elbow = f"arm_{peer_side}_elbow_flex.pos"
+            self.gripper = f"arm_{peer_side}_gripper.pos"
         self.workspace = validate_workspace(workspace)
         # Refuse an unsupported nonselected pose instead of moving it into a
         # different command corridor during an allegedly selected-only check.
@@ -81,6 +99,19 @@ class SelectedLeftWorkload:
         bound = self.workspace["bounds"][self.elbow]
         self.endpoint = (bound["max"] if segment == "left-opposite-first" else
                          max((bound["min"], bound["max"]), key=lambda value: abs(value-self.origin[self.elbow])))
+        if self.peer:
+            cal = self.workspace["calibration"][self.elbow[:-4]]
+            value = -self.origin[self.elbow] if cal[1] else self.origin[self.elbow]
+            reference = (value + 100.) / 200. * (cal[4] - cal[3]) + cal[3]
+            self.reference_raw = round(reference)
+            if abs(reference - self.reference_raw) > 1e-7:
+                raise ValueError("peer reference must be the actual admitted encoder pose")
+            self.endpoint_raw = self.reference_raw + peer_direction * peer_raw_step
+            low, high = self.workspace["raw_bounds"][self.elbow]
+            if not low <= self.reference_raw <= high or not low <= self.endpoint_raw <= high:
+                raise ValueError("peer endpoint is outside the unchanged supported workspace")
+            self.endpoint = normalized_raw(self.endpoint_raw, cal)
+            validate_target({**self.origin, self.elbow: self.endpoint}, workspace=self.workspace)
         if segment == "left-opposite-first":
             self.first_endpoint = bound["min"]
             ramps = ((self.origin[self.elbow], self.first_endpoint, 2.),
@@ -99,10 +130,10 @@ class SelectedLeftWorkload:
             if self.shoulder_endpoint-self.origin[self.shoulder] > 4 * shoulder["rate_per_s"] + 1e-9:
                 raise ValueError("selected shoulder endpoint exceeds the unchanged four-second ramp rate")
         self.schedule = [("left_baseline", 0., 2.), ("left_outward", 2., 6.),
-                         ("left_endpoint_hold", 6., 10. if segment == "left-maintained" else 8.)]
+                         ("left_endpoint_hold", 6., 10. if segment == "left-maintained" or self.peer else 8.)]
         if segment == "left-reach":
             self.schedule += [("left_gripper_open", 8., 10.), ("left_gripper_return", 10., 12.)]
-        retract = 10. if segment == "left-maintained" else 12.
+        retract = 10. if segment == "left-maintained" or self.peer else 12.
         self.schedule += [("left_retract", retract, retract + 4.),
                           ("left_final_hold", retract + 4., self.duration_s)]
         if segment == "left-supported-reach":
@@ -116,8 +147,79 @@ class SelectedLeftWorkload:
                              ("left_opposite_hold", 4., 6.), ("left_outward", 6., 10.),
                              ("left_endpoint_hold", 10., 12.), ("left_retract", 12., 16.),
                              ("left_final_hold", 16., 18.)]
+        if self.peer:
+            self.schedule = [(name.replace("left_", peer_side + "_", 1), start, end) for name, start, end in self.schedule]
         self.elapsed_s, self._last = 0., None
         self.phases_completed, self.interrupted_phases = set(), set()
+
+    def observe_peer_baseline(self, state):
+        """Use one current Native ACK and cached startup reads, never new settings I/O."""
+        if not self.peer:
+            return False
+        run, evidence = state.get("run") or {}, state.get("evidence") or {}
+        marker = evidence.get("accepted_host_action") or {}
+        identity = (run.get("run_id"), run.get("backend_incarnation"), state.get("service_incarnation"))
+        try:
+            valid_identity = all(type(value) is str and str(UUID(value)) == value for value in identity)
+        except (TypeError, ValueError, AttributeError):
+            valid_identity = False
+        if not valid_identity:
+            return False
+        if self.peer_baseline is not None and identity != self.peer_baseline["identity"]:
+            raise RuntimeError("peer baseline original operation identity changed")
+        revision = run.get("intent_revision")
+        if (not evidence.get("native_ack") or not evidence.get("active_acknowledged")
+                or not evidence.get("feedback") or evidence.get("fault")
+                or marker.get("run_id") != identity[0] or marker.get("host_incarnation") != identity[1]
+                or evidence.get("host_incarnation") != identity[1]
+                or type(revision) is not int or marker.get("intent_revision") != revision
+                or evidence.get("acknowledged_intent_revision") != revision
+                or any(type(marker.get(k)) is not int or marker[k] < 0 for k in ("epoch", "accepted_action_sequence"))):
+            return False
+        proof = marker.get("teleop_elbow_settings")
+        if proof is None:
+            return False
+        if (not isinstance(proof, dict) or set(proof) != {"version", "sha256", "left", "right"}
+                or type(proof["version"]) is not int or proof["version"] != 1
+                or type(proof["sha256"]) is not str or len(proof["sha256"]) != 64
+                or any(c not in "0123456789abcdef" for c in proof["sha256"])):
+            raise RuntimeError("peer baseline closed cached proof required")
+        if self.peer_baseline is not None and proof["sha256"] != self.peer_baseline["sha256"]:
+            raise RuntimeError("peer baseline original cached settings changed")
+        acquired = marker.get("acquired_at_monotonic_s")
+        if type(acquired) not in (int, float) or not math.isfinite(acquired) or acquired < 0:
+            raise RuntimeError("peer baseline original ACK acquisition unavailable")
+        expected = [3, 777, 3, 10, 16, 0, 32, 0]
+        for side in ("left", "right"):
+            row = proof[side]
+            motor = f"arm_{side}_elbow_flex"
+            if (not isinstance(row, dict) or set(row) != {"motor", "motor_id", "calibration", "original", "active",
+                                                        "original_read_interval", "active_read_interval"}
+                    or row["motor"] != motor or type(row["motor_id"]) is not int or row["motor_id"] != 3
+                    or type(row["calibration"]) is not list or len(row["calibration"]) != 5
+                    or any(type(value) is not int for value in row["calibration"])
+                    or row["calibration"] != self.workspace["calibration"][motor]
+                    or row["calibration"] != ([3, 0, 1845, 864, 3073] if side == "left" else [3, 0, -658, 827, 3039])):
+                raise RuntimeError("peer baseline actual side/mapping/calibration differs")
+            for phase in ("original", "active"):
+                if (type(row[phase]) is not list or len(row[phase]) != len(expected)
+                        or any(type(v) is not int for v in row[phase]) or row[phase] != expected):
+                    raise RuntimeError("peer baseline both elbows require original/active P16/I0/D32 and verified profile")
+            intervals = [row[phase + "_read_interval"] for phase in ("original", "active")]
+            if (any(type(v) is not list or len(v) != 2 or any(type(t) not in (int, float) or not math.isfinite(t) for t in v) for v in intervals)
+                    or not 0 <= intervals[0][0] <= intervals[0][1] <= intervals[1][0] <= intervals[1][1] <= acquired):
+                raise RuntimeError("peer baseline original startup read intervals differ")
+        if self.peer_baseline is None:
+            self.peer_baseline = {"identity": identity, "sha256": proof["sha256"],
+                                  "epoch": marker["epoch"], "intent_revision": revision,
+                                  "accepted_action_sequence": marker["accepted_action_sequence"],
+                                  "acquired_at_monotonic_s": acquired}
+        return True
+
+    def require_peer_baseline(self):
+        if self.peer and self.elapsed_s > 2. and self.peer_baseline is None:
+            raise RuntimeError("peer baseline BOTH P16 settings were not verified before outward input")
+
 
     @property
     def complete(self):
@@ -149,6 +251,7 @@ class SelectedLeftWorkload:
         self.phases_completed.update(name for name, _start, end in self.schedule if self.elapsed_s >= end)
 
     def get_action(self):
+        self.require_peer_baseline()
         target = dict(self.origin)
         if self.segment == "left-opposite-first":
             elapsed = self.elapsed_s
@@ -172,7 +275,7 @@ class SelectedLeftWorkload:
             target[self.elbow] += elbow * (self.endpoint-self.origin[self.elbow])
             target[self.gripper] += opening * (self.opening-self.origin[self.gripper])
             return {key.removeprefix("arm_"): value for key, value in target.items()}
-        retract = 10. if self.segment == "left-maintained" else 12.
+        retract = 10. if self.segment == "left-maintained" or self.peer else 12.
         elapsed = self.elapsed_s
         fraction = (max(0., min(1., (elapsed-2.) / 4.)) if elapsed <= retract
                     else max(0., 1. - (elapsed-retract) / 4.))
@@ -195,6 +298,13 @@ class SelectedLeftWorkload:
                 "active_progress_s": self.elapsed_s, "interrupted_phases": sorted(self.interrupted_phases),
                 "dwell_basis": "producer active intent; native delivered dwell assessed separately",
                 "target_policy": "fixed original admitted references and supported endpoint across qualified recovery"}
+        if self.peer:
+            result.pop("endpoint_raw_bound")
+            result.update(peer_side=self.peer["side"], direction_raw=self.peer["direction_raw"], raw_step=self.peer["raw_step"],
+                          reference_raw=self.reference_raw, endpoint_raw=self.endpoint_raw,
+                          travel_encoder_degrees=self.peer["direction_raw"] * self.peer["raw_step"] * 360. / 4096,
+                          baseline_settings_verified=self.peer_baseline is not None,
+                          baseline_settings_binding=dict(self.peer_baseline) if self.peer_baseline else None)
         if self.segment == "left-opposite-first":
             raw = min(self.workspace["raw_bounds"][self.elbow],
                       key=lambda value: abs(normalized_raw(value, cal)-self.first_endpoint))
@@ -2997,6 +3107,8 @@ async def run(args):
     segment = getattr(args, "workload_segment", "full")
     controller_gap = getattr(args, "interrupt_controller", False)
     terminal_budget = 12. if bench else 2.
+    peer = _peer_options(segment, getattr(args, "peer_side", None), getattr(args, "peer_direction", None),
+                         getattr(args, "peer_raw_step", None), bench=bench, next_start=getattr(args, "next_start_seconds", None))
     if (bench or segment != "full") and args.source != "virtual-leaders" or controller_gap and not bench:
         raise ValueError("predetermined virtual bench mode required")
 
@@ -3025,6 +3137,7 @@ async def run(args):
         "physical_human_movement_validated": False,
         "bench_continuity": bench,
         "workload_segment": segment,
+        **({"peer_selection": peer} if peer else {}),
         "view_policy": "advisory_presentation" if bench else "required_presentation",
         "terminal_qualification_budget_seconds": terminal_budget,
         "terminal_completion_policy": "owned_pause_native_hold_after_program_complete" if bench else "owned_pause_native_hold_after_finite_input",
@@ -3096,6 +3209,7 @@ async def run(args):
         record(
             {"event": "start_requested", "operation_id": start_body["operation_id"], "recipe": TELEOP_RECIPE,
              "bench_continuity": bench, "view_policy": summary["view_policy"], "workload_segment": segment,
+             **({"peer_selection": peer} if peer else {}),
              "terminal_qualification_budget_seconds": terminal_budget,
              "terminal_completion_policy": summary["terminal_completion_policy"],
              "program_active_seconds": {"full": 172.5, "combined": 12., "body": 4.5, "continuity": 24., "combined-body": 64.5, **SelectedLeftWorkload.DURATIONS}[segment] if args.source == "virtual-leaders" else None,
@@ -3332,7 +3446,8 @@ async def run(args):
         record({"event": "native_admitted", "snapshot": client.snapshot})
         if args.source == "virtual-leaders":
             if segment in SelectedLeftWorkload.DURATIONS:
-                workload = source = SelectedLeftWorkload(workspace, segment=segment)
+                selected_kwargs = {"peer_side": peer["side"], "peer_direction": peer["direction_raw"], "peer_raw_step": peer["raw_step"]} if peer else {}
+                workload = source = SelectedLeftWorkload(workspace, segment=segment, **selected_kwargs)
                 summary["selected_profile"] = workload.plan()
                 record({"event": "workload_plan", "run_id": run_id, **workload.plan()})
             else:
@@ -3550,6 +3665,13 @@ async def run(args):
                         "snapshot": client.snapshot,
                     }
                 )
+            if peer:
+                previous = workload.peer_baseline
+                workload.observe_peer_baseline(state)
+                workload.require_peer_baseline()
+                if previous is None and workload.peer_baseline is not None:
+                    record({"event": "peer_baseline_settings_verified", "binding": workload.peer_baseline,
+                            "peer_selection": peer})
             phase = workload.phase if workload else "usb"
             if phase != last_phase:
                 record(
@@ -3922,11 +4044,19 @@ def main(argv=None):
     parser.add_argument("--interruption-seconds", type=float, default=0.65)
     parser.add_argument("--bench-continuity", action="store_true", help="predetermined virtual bench; viewing is advisory")
     parser.add_argument("--workload-segment", choices=("full", "combined", "body", "continuity", "combined-body", *SelectedLeftWorkload.DURATIONS), default="full")
+    parser.add_argument("--peer-side", choices=("left", "right"))
+    parser.add_argument("--peer-direction", type=int, choices=(-1, 1))
+    parser.add_argument("--peer-raw-step", type=int)
     parser.add_argument("--interrupt-controller", action="store_true", help="declared bench gap also stops current controller renewals")
     parser.add_argument(
         "--no-keyboard", action="store_true", help="USB stationary probe/arm-only operation; body stays zero"
     )
     args = parser.parse_args(argv)
+    try:
+        _peer_options(args.workload_segment, args.peer_side, args.peer_direction, args.peer_raw_step,
+                      bench=args.bench_continuity, next_start=args.next_start_seconds)
+    except ValueError as error:
+        parser.error(str(error))
     if args.source == "usb-leaders" and not all(
         (args.left_port, args.right_port, args.leader_id, args.calibration_dir)
     ):

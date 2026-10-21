@@ -8708,3 +8708,355 @@ def test_opposite_first_left_rejoin_preserves_current_run_reference_endpoints_an
     now[0] = 108.
     returned = producer.capture({"grant_id": str(uuid4())}, body=m.ZERO_BODY)
     assert returned["target"] == native["reference"]
+
+
+def peer_workspace():
+    m = adapter()
+    value = workspace()
+    for side, cal, raw in (("left", [3, 0, 1845, 864, 3073], 2066), ("right", [3, 0, -658, 827, 3039], 1855)):
+        key = f"arm_{side}_elbow_flex.pos"
+        value["calibration"][key[:-4]] = cal
+        lo, hi = value["raw_bounds"][key]
+        value["bounds"][key].update(min=m.normalized_raw(lo, cal), max=m.normalized_raw(hi, cal))
+        value["reference"][key] = m.normalized_raw(raw, cal)
+    return value
+
+
+def peer_baseline_state(value):
+    settings = {"version": 1, "sha256": "a" * 64}
+    for side in ("left", "right"):
+        motor = f"arm_{side}_elbow_flex"
+        settings[side] = {
+            "motor": motor,
+            "motor_id": 3,
+            "calibration": value["calibration"][motor],
+            "original": [3, 777, 3, 10, 16, 0, 32, 0],
+            "active": [3, 777, 3, 10, 16, 0, 32, 0],
+            "original_read_interval": [1.0, 1.01],
+            "active_read_interval": [2.0, 2.01],
+        }
+    run, host, service = str(uuid4()), str(uuid4()), str(uuid4())
+    return {
+        "service_incarnation": service,
+        "run": {"run_id": run, "backend_incarnation": host, "intent_revision": 2},
+        "evidence": {
+            "host_incarnation": host,
+            "native_ack": True,
+            "active_acknowledged": True,
+            "acknowledged_intent_revision": 2,
+            "feedback": True,
+            "feedback_age_s": 0.02,
+            "required_observation": True,
+            "observation_age_s": 0.03,
+            "observation": {"qualified": True},
+            "accepted_host_action": {
+                "run_id": run,
+                "host_incarnation": host,
+                "epoch": 1,
+                "intent_revision": 2,
+                "accepted_action_sequence": 3,
+                "read_started_at_monotonic_s": 3.0,
+                "acquired_at_monotonic_s": 3.01,
+                "teleop_elbow_settings": settings,
+            },
+        },
+    }
+
+
+@pytest.mark.parametrize("side,direction,raw,endpoint", [("left", -1, 2066, 2014), ("right", 1, 1855, 1907)])
+def test_peer_maintained_explicit_raw_geometry_and_other_eleven_targets(side, direction, raw, endpoint):
+    m = adapter()
+    native = peer_workspace()
+    task = m.SelectedLeftWorkload(
+        native, segment=side + "-peer-maintained", peer_side=side, peer_direction=direction, peer_raw_step=52
+    )
+    assert task.observe_peer_baseline(peer_baseline_state(native)) is True
+    key = f"arm_{side}_elbow_flex.pos"
+    cal = native["calibration"][key[:-4]]
+    expected = m.normalized_raw(endpoint, cal)
+    for at, fraction in (
+        (0.0, 0.0),
+        (2.0, 0.0),
+        (4.0, 0.5),
+        (6.0, 1.0),
+        (8.0, 1.0),
+        (10.0, 1.0),
+        (12.0, 0.5),
+        (14.0, 0.0),
+        (16.0, 0.0),
+    ):
+        task.elapsed_s = at
+        action = m.map_leader_action(task.get_action())
+        assert action[key] == pytest.approx(
+            native["reference"][key] + fraction * (expected - native["reference"][key])
+        )
+        assert all(action[k] == native["reference"][k] for k in KEYS if k != key)
+        assert task.body_phase_elapsed is None
+    plan = task.plan()
+    assert task.complete and plan["program_active_seconds"] == 16.0
+    assert plan["peer_side"] == side and plan["direction_raw"] == direction
+    assert plan["reference_raw"] == raw and plan["endpoint_raw"] == endpoint and plan["raw_step"] == 52
+    assert plan["travel_encoder_degrees"] == direction * 4.5703125
+    assert [(x["phase"], x["start_s"], x["end_s"]) for x in plan["phases"]] == [
+        (side + "_baseline", 0.0, 2.0),
+        (side + "_outward", 2.0, 6.0),
+        (side + "_endpoint_hold", 6.0, 10.0),
+        (side + "_retract", 10.0, 14.0),
+        (side + "_final_hold", 14.0, 16.0),
+    ]
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "side",
+        "direction",
+        "boolean_step",
+        "zero_step",
+        "large_step",
+        "unsupported_endpoint",
+        "fractional_reference",
+        "slow_rate",
+        "old_segment",
+    ],
+)
+def test_peer_maintained_refuses_geometry_without_flip_clamp_or_old_mode_change(fault):
+    m = adapter()
+    native = peer_workspace()
+    kwargs = {
+        "segment": "left-peer-maintained",
+        "peer_side": "left",
+        "peer_direction": -1,
+        "peer_raw_step": 52,
+    }
+    key = "arm_left_elbow_flex.pos"
+    if fault == "side":
+        kwargs["peer_side"] = "right"
+    elif fault == "direction":
+        kwargs["peer_direction"] = 0
+    elif fault == "boolean_step":
+        kwargs["peer_raw_step"] = True
+    elif fault == "zero_step":
+        kwargs["peer_raw_step"] = 0
+    elif fault == "large_step":
+        kwargs["peer_raw_step"] = 80
+    elif fault == "unsupported_endpoint":
+        kwargs["peer_raw_step"] = 79
+    elif fault == "fractional_reference":
+        native["reference"][key] += 0.01
+    elif fault == "slow_rate":
+        native["bounds"][key]["rate_per_s"] = 0.01
+    else:
+        kwargs["segment"] = "left-maintained"
+    with pytest.raises(ValueError):
+        m.SelectedLeftWorkload(native, **kwargs)
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "missing",
+        "p32",
+        "wrong_other_pid",
+        "firmware",
+        "calibration",
+        "unknown_field",
+        "bad_hash",
+        "missing_timing",
+        "future_timing",
+        "stale_marker",
+        "foreign_host",
+        "no_ack",
+    ],
+)
+def test_peer_maintained_requires_both_exact_baselines_before_first_outward(fault):
+    from contextlib import suppress
+
+    m = adapter()
+    native = peer_workspace()
+    task = m.SelectedLeftWorkload(
+        native, segment="left-peer-maintained", peer_side="left", peer_direction=-1, peer_raw_step=52
+    )
+    state = peer_baseline_state(native)
+    marker = state["evidence"]["accepted_host_action"]
+    proof = marker["teleop_elbow_settings"]
+    if fault == "missing":
+        marker.pop("teleop_elbow_settings")
+    elif fault == "p32":
+        proof["left"]["active"][4] = 32
+    elif fault == "wrong_other_pid":
+        proof["right"]["original"][5] = 1
+    elif fault == "firmware":
+        proof["right"]["active"][3] = 11
+    elif fault == "calibration":
+        proof["left"]["calibration"] = [3, 0, 0, 864, 3073]
+    elif fault == "unknown_field":
+        proof["right"]["allow_nonbaseline"] = True
+    elif fault == "bad_hash":
+        proof["sha256"] = "not-a-hash"
+    elif fault == "missing_timing":
+        proof["left"].pop("original_read_interval")
+    elif fault == "future_timing":
+        proof["right"]["active_read_interval"][1] = 5.0
+    elif fault == "stale_marker":
+        marker["intent_revision"] = 1
+    elif fault == "foreign_host":
+        marker["host_incarnation"] = str(uuid4())
+    else:
+        state["evidence"]["native_ack"] = False
+    with suppress(RuntimeError):
+        assert task.observe_peer_baseline(state) is False
+    task.elapsed_s = 2.0
+    assert m.map_leader_action(task.get_action()) == native["reference"]
+    task.elapsed_s = 2.01
+    with pytest.raises(RuntimeError, match="baseline"):
+        task.get_action()
+
+
+@pytest.mark.parametrize("side,direction", [("left", -1), ("right", 1)])
+def test_peer_maintained_rejoin_keeps_absolute_geometry_and_no_dwell_reset(side, direction):
+    m = adapter()
+    native = peer_workspace()
+    task = m.SelectedLeftWorkload(
+        native, segment=side + "-peer-maintained", peer_side=side, peer_direction=direction, peer_raw_step=52
+    )
+    state = peer_baseline_state(native)
+    assert task.observe_peer_baseline(state)
+    task.elapsed_s = 7.0
+    task.admit(10.0)
+    now = [10.0]
+    producer = m.FrameProducer(task, clock=lambda: now[0])
+    producer.workspace, producer.native_cursor = native, dict(native["reference"])
+    first = producer.capture({"grant_id": str(uuid4())}, body=m.ZERO_BODY)
+    task.freeze()
+    task.advance(70.0)
+    task.admit(70.0)
+    now[0] = 70.0
+    producer.native_cursor[task.elbow] += 0.5
+    producer.reacquire = True
+    fresh = producer.capture({"grant_id": str(uuid4())}, body=m.ZERO_BODY)
+    assert fresh["target"] == first["target"] and fresh["body"] == m.ZERO_BODY
+    assert fresh["source"]["sample_seq"] == 2 and fresh["source"]["grant_id"] != first["source"]["grant_id"]
+    assert task.elapsed_s == 7.0 and task.interrupted_phases == {side + "_endpoint_hold"}
+    assert task.plan()["reference"] == native["reference"]
+
+
+@pytest.mark.parametrize("fault", [None, "missing", "mismatched", "old_segment", "bench"])
+def test_peer_maintained_cli_requires_explicit_prestart_selection(monkeypatch, fault):
+    m = adapter()
+    seen = []
+
+    async def run(args):
+        seen.append(args)
+        return {}
+
+    monkeypatch.setattr(m, "run", run)
+    argv = [
+        "--source",
+        "virtual-leaders",
+        "--url",
+        "unused",
+        "--ca",
+        "unused",
+        "--storage-state",
+        "unused",
+        "--output",
+        "unused",
+        "--workload-segment",
+        "left-peer-maintained",
+        "--duration-seconds",
+        "16",
+        "--peer-side",
+        "left",
+        "--peer-direction",
+        "-1",
+        "--peer-raw-step",
+        "52",
+    ]
+    if fault == "missing":
+        argv = argv[:-2]
+    elif fault == "mismatched":
+        argv[argv.index("--peer-side") + 1] = "right"
+    elif fault == "old_segment":
+        argv[argv.index("--workload-segment") + 1] = "left-maintained"
+    elif fault == "bench":
+        argv.append("--bench-continuity")
+    if fault:
+        with pytest.raises(SystemExit):
+            m.main(argv)
+        assert seen == []
+    else:
+        m.main(argv)
+        assert (seen[0].peer_side, seen[0].peer_direction, seen[0].peer_raw_step) == ("left", -1, 52)
+        assert seen[0].bench_continuity is False
+
+
+@pytest.mark.parametrize("change", ["service", "run", "host", "proof_hash", "active_pid"])
+def test_peer_maintained_original_baseline_cannot_cross_operation_or_change_settings(change):
+    m = adapter()
+    native = peer_workspace()
+    task = m.SelectedLeftWorkload(
+        native, segment="right-peer-maintained", peer_side="right", peer_direction=1, peer_raw_step=52
+    )
+    state = peer_baseline_state(native)
+    assert task.observe_peer_baseline(state)
+    if change == "service":
+        state["service_incarnation"] = str(uuid4())
+    elif change in {"run", "host"}:
+        state["run"]["run_id" if change == "run" else "backend_incarnation"] = str(uuid4())
+    elif change == "proof_hash":
+        state["evidence"]["accepted_host_action"]["teleop_elbow_settings"]["sha256"] = "b" * 64
+    else:
+        state["evidence"]["accepted_host_action"]["teleop_elbow_settings"]["right"]["active"][4] = 32
+    with pytest.raises(RuntimeError):
+        task.observe_peer_baseline(state)
+
+
+@pytest.mark.parametrize("change", ["calibration_bool", "interval_backwards", "version_bool", "missing_id"])
+def test_peer_maintained_malformed_baseline_never_opens_outward_gate(change):
+    from contextlib import suppress
+
+    m = adapter()
+    native = peer_workspace()
+    task = m.SelectedLeftWorkload(
+        native, segment="left-peer-maintained", peer_side="left", peer_direction=-1, peer_raw_step=52
+    )
+    state = peer_baseline_state(native)
+    proof = state["evidence"]["accepted_host_action"]["teleop_elbow_settings"]
+    if change == "calibration_bool":
+        proof["left"]["calibration"] = [3, False, 1845, 864, 3073]
+    elif change == "interval_backwards":
+        proof["right"]["active_read_interval"] = [2.5, 2.0]
+    elif change == "version_bool":
+        proof["version"] = True
+    else:
+        state["run"]["run_id"] = None
+    with suppress(RuntimeError):
+        assert task.observe_peer_baseline(state) is False
+    task.elapsed_s = 2.01
+    with pytest.raises(RuntimeError, match="baseline"):
+        task.get_action()
+
+
+def test_peer_maintained_run_refuses_invalid_prestart_selection_before_output_or_client(
+    tmp_path, monkeypatch
+):
+    import asyncio
+    from types import SimpleNamespace
+
+    m = adapter()
+    output = tmp_path / "not-created"
+    monkeypatch.setattr(
+        m, "SessionClient", lambda *a, **k: pytest.fail("peer invalid selection created client")
+    )
+    args = SimpleNamespace(
+        source="virtual-leaders",
+        workload_segment="right-peer-maintained",
+        peer_side="left",
+        peer_direction=1,
+        peer_raw_step=52,
+        output=output,
+    )
+    with pytest.raises(ValueError, match="matching side"):
+        asyncio.run(m.run(args))
+    assert not output.exists()

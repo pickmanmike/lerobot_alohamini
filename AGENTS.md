@@ -6,6 +6,24 @@ Use the matching lesson before diagnosing a symptom; check coverage at the actua
 new entrypoint before reopening an accepted decision. Update changed rows, not a
 packet diary. Historical runbooks retain original results and detailed procedures.
 
+Owner clarification2026-10-21 ([PR29 comment6307778284](https://github.com/pickmanmike/lerobot_alohamini/pull/29#issuecomment-6307778284)):
+the LEFT elbow servo has NOT been replaced. Suspend swap-first advice/preparation;
+substantial disassembly is not an appropriate diagnostic swap. Replacement requires
+a sufficiently supported likely defect and a later owner decision. PR29 stays
+draft/unmerged; no preceding proposed replacement/integration prompt was sent.
+Current work compares installed LEFT-bus/ID3 and RIGHT-bus/ID3 at their verified
+ordinary P16/I0/D32 baselines, with no gain change. Use measured approximately mirrored
+shoulder/elbow/wrist geometry and equivalent gravity-relative direction, recording
+material differences; raw sign or normalized equality alone does not match load.
+One short fresh-streamed maintained practical out/back per elbow, sequential, about
+7 encoder degrees within existing workspaces, slow ramps and a few active dwell seconds;
+hold other joints/body intent zero. Repeat reversed side order only for a consequential
+contrast or interrupted comparison. Only one informative second pose/paired joint if a
+material ambiguity remains. Bind sparse evidence to side/bus plus ID, retain device
+protections and original times, and do not infer external torque from drive duty.
+Use the existing sole owner/runner and a minimal reviewed two-elbow reader extension.
+No new gain sweep, general telemetry/UI, all-motor commissioning, disassembly or merge.
+
 Current operation-first authority (PR25 comment6258758730 and the owner's
 continuation mandate) permits bounded repeated virtual-leader bench operation,
 focused PC/browser/Pi repairs, reviewed affected-component staging and ordinary
@@ -65,8 +83,8 @@ retain that bounded result without another powered repeat for publication. Compa
 requested/mapped/accepted/servo-Goal/measured evidence, sign/units, pose, direction
 and maintained dwell before tuning. Use current supported workspace/settings and
 fresh streamed intent; other joints hold actual admitted targets. Preserve fixed
-references through recovery and report interrupted dwells honestly. The owner now
-authorizes a small predeclared reversible LEFT-ID3-only position-control parameter
+references through recovery and report interrupted dwells honestly. The earlier owner scope
+authorized a small predeclared reversible LEFT-ID3-only position-control parameter
 comparison when supported by retained effort/voltage/settings and installed FW
 semantics: one parameter at a time, a small candidate set, baseline/restoration
 verified. If substantial effort lacks motion, distinguish actual load/power/mechanism

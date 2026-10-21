@@ -2420,3 +2420,72 @@ def test_left_response_request_is_bound_before_any_owned_unit(tmp_path, monkeypa
             assert command[command.index(option) + 1] == str(descriptor)
         else:
             assert option not in command
+
+def test_current_selected_elbow_settings_cross_existing_ack_without_goal_payload():
+    """Keep the ordinary essential ACK while admitting cached baseline evidence."""
+    import hashlib
+    import json
+
+    from lerobot.robots.alohamini.am1_live_teleop import STATIC
+    from tools.am1_session_core import _status_small
+
+    m = module()
+    client = client_sample()
+    marker = client.latest_am1_local_feedback
+    registers = dict.fromkeys(STATIC, 0)
+    registers.update(ID=3, Model_Number=777, Firmware_Major_Version=3, Firmware_Minor_Version=10,
+                     P_Coefficient=16, I_Coefficient=0, D_Coefficient=32, Operating_Mode=0)
+    timing = {k: {"read_started_at_monotonic_s": 8., "read_completed_at_monotonic_s": 8.01}
+              for k in STATIC}
+    proof = {side: {"motor": "arm_" + side + "_elbow_flex", "motor_id": 3,
+                    "calibration": [3, 0, offset, low, high],
+                    "original": dict(registers), "active": dict(registers),
+                    "original_read_timing": copy.deepcopy(timing),
+                    "active_read_timing": {k: {"read_started_at_monotonic_s": 8.1,
+                                               "read_completed_at_monotonic_s": 8.11} for k in STATIC}}
+             for side, offset, low, high in (("left", 1845, 864, 3073), ("right", -658, 827, 3039))}
+    selected = {"version": 1, "run_id": marker["run_id"], "host_incarnation": marker["host_incarnation"],
+                "epoch": marker["epoch"], "intent_revision": marker["intent_revision"],
+                "action_sequence": marker["accepted_action_sequence"], "observation_id": marker["observation_id"],
+                "acquired_at_monotonic_s": marker["acquired_at_monotonic_s"],
+                "teleop_elbow_settings": proof, "goal_readbacks": {"teleop_1": {"preserved": True}}}
+    marker["selected_joint"] = selected
+    marker["arm_feedback"] = {"version": 1, "positions": {
+        key: {"raw": 1800, "normalized": client.get_observation()[key],
+              "read_started_at_monotonic_s": 9.961, "read_completed_at_monotonic_s": 9.97}
+        for key in m.TELEOP_ARM_KEYS}}
+    sample = m.read_physical_sample(client, "run", "host", 4, clock=lambda: 10.)
+    compact = sample["ack"]["teleop_elbow_settings"]
+    assert compact["version"] == 1
+    assert compact["sha256"] == hashlib.sha256(
+        json.dumps(proof, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+    for side in ("left", "right"):
+        assert compact[side]["motor"] == proof[side]["motor"]
+        assert compact[side]["motor_id"] == 3
+        assert compact[side]["calibration"] == proof[side]["calibration"]
+        assert compact[side]["original"] == compact[side]["active"] == [3, 777, 3, 10, 16, 0, 32, 0]
+        assert compact[side]["original_read_interval"] == [8., 8.01]
+        assert compact[side]["active_read_interval"] == [8.1, 8.11]
+    assert "selected_joint" not in sample["ack"] and "goal_readbacks" not in sample["ack"]
+    assert sample["selected_joint"] == selected
+    assert sample["ack"]["acquired_at_monotonic_s"] == marker["acquired_at_monotonic_s"]
+    assert _status_small({"accepted_host_action": sample["ack"]})["accepted_host_action"] == sample["ack"]
+    proof["left"]["original"]["P_Coefficient"] = 32
+    assert compact["left"]["original"][4] == 16
+
+
+@pytest.mark.parametrize("field", ["run_id", "host_incarnation", "epoch", "intent_revision",
+                                   "action_sequence", "observation_id", "acquired_at_monotonic_s"])
+def test_foreign_selected_settings_cannot_cross_the_existing_ack(field):
+    m = module()
+    client = client_sample()
+    marker = client.latest_am1_local_feedback
+    selected = {"version": 1, "run_id": marker["run_id"], "host_incarnation": marker["host_incarnation"],
+                "epoch": marker["epoch"], "intent_revision": marker["intent_revision"],
+                "action_sequence": marker["accepted_action_sequence"], "observation_id": marker["observation_id"],
+                "acquired_at_monotonic_s": marker["acquired_at_monotonic_s"],
+                "teleop_elbow_settings": {"left": {}, "right": {}}}
+    selected[field] = selected[field] + 1 if type(selected[field]) in (int, float) else "foreign"
+    marker["selected_joint"] = selected
+    with pytest.raises(ValueError, match="foreign selected"):
+        m.read_physical_sample(client, "run", "host", 4, clock=lambda: 10.)

@@ -1,6 +1,7 @@
 """Explicit protected physical recipes. No hardware is opened by module import."""
 
 import copy
+import hashlib
 import json
 import math
 import threading
@@ -123,6 +124,55 @@ class PendingSample:
     """Validated cached feedback; not a new observation, receipt or ACK."""
 
     sample: dict
+
+
+def _teleop_elbow_settings_summary(proof, acquired_at):
+    """Compact cached settings only; preserve the full proof in native evidence."""
+    registers = ("ID", "Model_Number", "Firmware_Major_Version", "Firmware_Minor_Version",
+                 "P_Coefficient", "I_Coefficient", "D_Coefficient", "Operating_Mode")
+    row_keys = {"motor", "motor_id", "calibration", "original", "active",
+                "original_read_timing", "active_read_timing"}
+    if not isinstance(proof, dict) or set(proof) != {"left", "right"}:
+        return None
+    result = {"version": 1}
+    try:
+        for side in ("left", "right"):
+            row = proof[side]
+            if (not isinstance(row, dict) or set(row) != row_keys
+                    or row["motor"] != "arm_" + side + "_elbow_flex"
+                    or type(row["motor_id"]) is not int or row["motor_id"] != 3
+                    or not isinstance(row["calibration"], list) or len(row["calibration"]) != 5
+                    or any(type(v) is not int for v in row["calibration"])):
+                return None
+            summary = {key: copy.deepcopy(row[key]) for key in ("motor", "motor_id", "calibration")}
+            for phase in ("original", "active"):
+                values = row[phase]
+                times = row[phase + "_read_timing"]
+                if (not isinstance(values, dict) or not set(registers) <= set(values)
+                        or any(type(values[key]) is not int for key in registers)
+                        or not isinstance(times, dict) or set(times) != set(values)):
+                    return None
+                intervals = []
+                for timing in times.values():
+                    if not isinstance(timing, dict) or set(timing) != {
+                            "read_started_at_monotonic_s", "read_completed_at_monotonic_s"}:
+                        return None
+                    start, end = (timing[key] for key in
+                                  ("read_started_at_monotonic_s", "read_completed_at_monotonic_s"))
+                    if (any(type(v) not in (int, float) or not math.isfinite(v) for v in (start, end))
+                            or not 0 <= start <= end <= acquired_at):
+                        return None
+                    intervals.append((start, end))
+                summary[phase] = [values[key] for key in registers]
+                summary[phase + "_read_interval"] = [min(v[0] for v in intervals), max(v[1] for v in intervals)]
+            if summary["original_read_interval"][1] > summary["active_read_interval"][0]:
+                return None
+            result[side] = summary
+        result["sha256"] = hashlib.sha256(
+            json.dumps(proof, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+    except (KeyError, TypeError, ValueError):
+        return None
+    return result
 
 
 def read_physical_sample(
@@ -269,6 +319,17 @@ def read_physical_sample(
         **({"arm_feedback": copy.deepcopy(arm_feedback)} if arm_feedback is not None else {}),
         **({"lift_feedback": copy.deepcopy(lift_feedback)} if lift_feedback is not None else {}),
     }
+    # The source marker was correlated above. Forward only its compact cached
+    # proof: full settings/Goal payloads must not displace the essential ACK.
+    if isinstance(selected, dict) and "teleop_elbow_settings" in selected:
+        compact = _teleop_elbow_settings_summary(selected["teleop_elbow_settings"], completed)
+        if compact is not None:
+            candidate = {**sample["ack"], "teleop_elbow_settings": compact}
+            # Match the existing Core projection after removing duplicated live
+            # workspace data. Missing proof refuses the peer run, never freshness.
+            presented = {key: value for key, value in candidate.items() if key != "live_input"}
+            if len(json.dumps(presented, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()) <= 4096:
+                sample["ack"] = candidate
     return PendingSample(sample) if pending else sample
 
 
