@@ -61,16 +61,26 @@ class LeaderClutch:
         return result
 
 
-def _peer_options(segment, side, direction, raw_step, *, bench=False, next_start=None):
-    peer = segment in {"left-peer-maintained", "right-peer-maintained"}
+def _peer_options(segment, side, direction, raw_step, *, bench=False, next_start=None, active_p=None):
+    fixed = segment in {"left-peer-fixed", "right-peer-fixed"}
+    peer = fixed or segment in {"left-peer-maintained", "right-peer-maintained"}
     if not peer:
-        if any(value is not None for value in (side, direction, raw_step)):
+        if any(value is not None for value in (side, direction, raw_step, active_p)):
             raise ValueError("peer options require an explicitly selected peer segment")
         return None
     if (side != segment.split("-", 1)[0] or type(direction) is not int or direction not in (-1, 1)
             or type(raw_step) is not int or not 1 <= raw_step <= 79 or next_start is not None):
         raise ValueError("peer profile requires matching side, raw direction, explicit1..79tick excursion and finite mode")
-    return {"side": side, "direction_raw": direction, "raw_step": raw_step}
+    result = {"side": side, "direction_raw": direction, "raw_step": raw_step}
+    if fixed:
+        start, end = (2067, 2015) if side == "left" else (1855, 1907)
+        if (direction * raw_step != end-start or active_p is not None
+                and (type(active_p) is not int or active_p not in (16, 32))):
+            raise ValueError("fixed peer interval and explicit baseline/temporary P comparison required")
+        result.update(fixed_start_raw=start, fixed_endpoint_raw=end, active_p=16 if active_p is None else active_p)
+    elif active_p is not None:
+        raise ValueError("peer active P selection requires the fixed comparison profile")
+    return result
 
 
 class SelectedLeftWorkload:
@@ -78,17 +88,19 @@ class SelectedLeftWorkload:
 
     kind = "virtual-leaders"
     DURATIONS = {"left-maintained": 16., "left-reach": 20., "left-supported-reach": 28., "left-opposite-first": 18.,
-                 "left-peer-maintained": 16., "right-peer-maintained": 16.}
+                 "left-peer-maintained": 16., "right-peer-maintained": 16., "left-peer-fixed": 20., "right-peer-fixed": 20.}
     elbow = "arm_left_elbow_flex.pos"
     shoulder = "arm_left_shoulder_lift.pos"
     gripper = "arm_left_gripper.pos"
 
-    def __init__(self, workspace, *, segment="left-maintained", peer_side=None, peer_direction=None, peer_raw_step=None):
+    def __init__(self, workspace, *, segment="left-maintained", peer_side=None, peer_direction=None, peer_raw_step=None, peer_active_p=None):
         if segment not in self.DURATIONS:
             raise ValueError("Unknown selected left finite profile")
         self.segment, self.duration_s = segment, self.DURATIONS[segment]
-        self.peer = _peer_options(segment, peer_side, peer_direction, peer_raw_step)
+        self.peer = _peer_options(segment, peer_side, peer_direction, peer_raw_step, active_p=peer_active_p)
+        self.fixed = self.peer is not None and "fixed_start_raw" in self.peer
         self.peer_baseline = None
+        self.comparison_start_observation = None
         if self.peer:
             self.elbow = f"arm_{peer_side}_elbow_flex.pos"
             self.gripper = f"arm_{peer_side}_gripper.pos"
@@ -106,11 +118,14 @@ class SelectedLeftWorkload:
             self.reference_raw = round(reference)
             if abs(reference - self.reference_raw) > 1e-7:
                 raise ValueError("peer reference must be the actual admitted encoder pose")
-            self.endpoint_raw = self.reference_raw + peer_direction * peer_raw_step
+            self.endpoint_raw = self.peer["fixed_endpoint_raw"] if self.fixed else self.reference_raw + peer_direction * peer_raw_step
             low, high = self.workspace["raw_bounds"][self.elbow]
             if not low <= self.reference_raw <= high or not low <= self.endpoint_raw <= high:
                 raise ValueError("peer endpoint is outside the unchanged supported workspace")
             self.endpoint = normalized_raw(self.endpoint_raw, cal)
+            if self.fixed:
+                self.comparison_start = normalized_raw(self.peer["fixed_start_raw"], cal)
+                validate_target({**self.origin, self.elbow: self.comparison_start}, workspace=self.workspace)
             validate_target({**self.origin, self.elbow: self.endpoint}, workspace=self.workspace)
         if segment == "left-opposite-first":
             self.first_endpoint = bound["min"]
@@ -118,6 +133,10 @@ class SelectedLeftWorkload:
                      (self.first_endpoint, self.endpoint, 4.), (self.endpoint, self.origin[self.elbow], 4.))
             if any(abs(end-start) > duration * bound["rate_per_s"] + 1e-9 for start, end, duration in ramps):
                 raise ValueError("opposite-first endpoint exceeds an unchanged ramp rate")
+        elif self.fixed:
+            if any(abs(end-start) > 4 * bound["rate_per_s"] + 1e-9 for start, end in (
+                    (self.origin[self.elbow], self.comparison_start), (self.comparison_start, self.endpoint))):
+                raise ValueError("fixed peer preparation/comparison exceeds unchanged four-second ramp rate")
         elif abs(self.endpoint-self.origin[self.elbow]) > 4 * bound["rate_per_s"] + 1e-9:
             raise ValueError("selected endpoint exceeds the unchanged four-second ramp rate")
         opening = self.workspace["bounds"][self.gripper]
@@ -149,6 +168,10 @@ class SelectedLeftWorkload:
                              ("left_final_hold", 16., 18.)]
         if self.peer:
             self.schedule = [(name.replace("left_", peer_side + "_", 1), start, end) for name, start, end in self.schedule]
+        if self.fixed:
+            self.schedule = [(peer_side+"_prepare", 0., 4.), (peer_side+"_baseline", 4., 6.),
+                             (peer_side+"_outward", 6., 10.), (peer_side+"_endpoint_hold", 10., 14.),
+                             (peer_side+"_retract", 14., 18.), (peer_side+"_final_hold", 18., 20.)]
         self.elapsed_s, self._last = 0., None
         self.phases_completed, self.interrupted_phases = set(), set()
 
@@ -179,11 +202,33 @@ class SelectedLeftWorkload:
         proof = marker.get("teleop_elbow_settings")
         if proof is None:
             return False
-        if (not isinstance(proof, dict) or set(proof) != {"version", "sha256", "left", "right"}
-                or type(proof["version"]) is not int or proof["version"] != 1
-                or type(proof["sha256"]) is not str or len(proof["sha256"]) != 64
+        if (not isinstance(proof, dict) or type(proof.get("version")) is not int
+                or proof["version"] not in (1, 2)
+                or type(proof.get("sha256")) is not str or len(proof["sha256"]) != 64
                 or any(c not in "0123456789abcdef" for c in proof["sha256"])):
             raise RuntimeError("peer baseline closed cached proof required")
+        compact_trial = proof["version"] == 2
+        keys = {"version", "sha256", "left", "right"}
+        if set(proof) != (keys | {"trial"} if compact_trial else keys) or compact_trial and not self.fixed:
+            raise RuntimeError("peer baseline exact ordinary or fixed-trial proof required")
+        trial, expected_p = proof.get("trial"), self.peer.get("active_p", 16)
+        if compact_trial:
+            if (type(trial) is not list or len(trial) != 4
+                    or trial[0] != self.peer["side"]+"-response-p"
+                    or type(trial[1]) is not str or len(trial[1]) != 64
+                    or any(c not in "0123456789abcdef" for c in trial[1])
+                    or type(trial[3]) is not int or trial[3] != expected_p):
+                raise RuntimeError("peer baseline exact selected fixed trial binding required")
+            try:
+                valid_request = type(trial[2]) is str and str(UUID(trial[2])) == trial[2]
+            except (TypeError, ValueError, AttributeError):
+                valid_request = False
+            if not valid_request:
+                raise RuntimeError("peer baseline original trial identity required")
+        elif expected_p != 16:
+            raise RuntimeError("peer baseline temporary P requires an explicit matching current trial")
+        if self.peer_baseline is not None and trial != self.peer_baseline.get("trial"):
+            raise RuntimeError("peer baseline original trial request/source changed")
         if self.peer_baseline is not None and proof["sha256"] != self.peer_baseline["sha256"]:
             raise RuntimeError("peer baseline original cached settings changed")
         acquired = marker.get("acquired_at_monotonic_s")
@@ -192,6 +237,13 @@ class SelectedLeftWorkload:
         expected = [3, 777, 3, 10, 16, 0, 32, 0]
         for side in ("left", "right"):
             row = proof[side]
+            if compact_trial:
+                if (type(row) is not list or len(row) != 4
+                        or type(row[3]) is not list or len(row[3]) != 4):
+                    raise RuntimeError("peer baseline exact compact side row required")
+                row = {"motor": f"arm_{side}_elbow_flex", "motor_id": 3,
+                       "calibration": row[0], "original": row[1], "active": row[2],
+                       "original_read_interval": row[3][:2], "active_read_interval": row[3][2:]}
             motor = f"arm_{side}_elbow_flex"
             if (not isinstance(row, dict) or set(row) != {"motor", "motor_id", "calibration", "original", "active",
                                                         "original_read_interval", "active_read_interval"}
@@ -202,9 +254,12 @@ class SelectedLeftWorkload:
                     or row["calibration"] != ([3, 0, 1845, 864, 3073] if side == "left" else [3, 0, -658, 827, 3039])):
                 raise RuntimeError("peer baseline actual side/mapping/calibration differs")
             for phase in ("original", "active"):
+                wanted = list(expected)
+                if self.fixed and phase == "active" and side == self.peer["side"]:
+                    wanted[4] = expected_p
                 if (type(row[phase]) is not list or len(row[phase]) != len(expected)
-                        or any(type(v) is not int for v in row[phase]) or row[phase] != expected):
-                    raise RuntimeError("peer baseline both elbows require original/active P16/I0/D32 and verified profile")
+                        or any(type(v) is not int for v in row[phase]) or row[phase] != wanted):
+                    raise RuntimeError("peer baseline both elbows require original P16/role-specific active P and verified I0/D32 profile")
             intervals = [row[phase + "_read_interval"] for phase in ("original", "active")]
             if (any(type(v) is not list or len(v) != 2 or any(type(t) not in (int, float) or not math.isfinite(t) for t in v) for v in intervals)
                     or not 0 <= intervals[0][0] <= intervals[0][1] <= intervals[1][0] <= intervals[1][1] <= acquired):
@@ -214,10 +269,18 @@ class SelectedLeftWorkload:
                                   "epoch": marker["epoch"], "intent_revision": revision,
                                   "accepted_action_sequence": marker["accepted_action_sequence"],
                                   "acquired_at_monotonic_s": acquired}
+            if self.fixed:
+                self.peer_baseline["trial"] = json.loads(json.dumps(trial))
+        if self.fixed and self.elapsed_s >= 6. and self.comparison_start_observation is None:
+            self.comparison_start_observation = json.loads(json.dumps({
+                "commanded_start_raw": self.peer["fixed_start_raw"], "progress_s": self.elapsed_s,
+                "measured_positions": evidence.get("measured_positions"), "accepted_host_action": marker,
+                "feedback_age_s": evidence.get("feedback_age_s"), "position_qualified": False,
+                "basis": "existing current Native feedback before first outward input; no precision gate"}))
         return True
 
     def require_peer_baseline(self):
-        if self.peer and self.elapsed_s > 2. and self.peer_baseline is None:
+        if self.peer and self.elapsed_s > (0. if self.fixed else 2.) and self.peer_baseline is None:
             raise RuntimeError("peer baseline BOTH P16 settings were not verified before outward input")
 
 
@@ -253,6 +316,16 @@ class SelectedLeftWorkload:
     def get_action(self):
         self.require_peer_baseline()
         target = dict(self.origin)
+        if self.fixed:
+            elapsed = self.elapsed_s
+            if elapsed <= 4.:
+                start, end, fraction = self.origin[self.elbow], self.comparison_start, elapsed/4.
+            elif elapsed <= 14.:
+                start, end, fraction = self.comparison_start, self.endpoint, (elapsed-6.)/4.
+            else:
+                start, end, fraction = self.endpoint, self.comparison_start, (elapsed-14.)/4.
+            target[self.elbow] = start + max(0., min(1., fraction)) * (end-start)
+            return {key.removeprefix("arm_"): value for key, value in target.items()}
         if self.segment == "left-opposite-first":
             elapsed = self.elapsed_s
             if elapsed <= 6.:
@@ -305,6 +378,11 @@ class SelectedLeftWorkload:
                           travel_encoder_degrees=self.peer["direction_raw"] * self.peer["raw_step"] * 360. / 4096,
                           baseline_settings_verified=self.peer_baseline is not None,
                           baseline_settings_binding=dict(self.peer_baseline) if self.peer_baseline else None)
+        if self.fixed:
+            result.update(comparison_start_raw=self.peer["fixed_start_raw"], comparison_start_normalized=self.comparison_start,
+                          comparison_active_p=self.peer["active_p"],
+                          comparison_start_qualification="commanded preparation; achieved pose assessed separately",
+                          comparison_start_observation=json.loads(json.dumps(self.comparison_start_observation)))
         if self.segment == "left-opposite-first":
             raw = min(self.workspace["raw_bounds"][self.elbow],
                       key=lambda value: abs(normalized_raw(value, cal)-self.first_endpoint))
@@ -3108,7 +3186,7 @@ async def run(args):
     controller_gap = getattr(args, "interrupt_controller", False)
     terminal_budget = 12. if bench else 2.
     peer = _peer_options(segment, getattr(args, "peer_side", None), getattr(args, "peer_direction", None),
-                         getattr(args, "peer_raw_step", None), bench=bench, next_start=getattr(args, "next_start_seconds", None))
+                         getattr(args, "peer_raw_step", None), bench=bench, next_start=getattr(args, "next_start_seconds", None), active_p=getattr(args, "peer_active_p", None))
     if (bench or segment != "full") and args.source != "virtual-leaders" or controller_gap and not bench:
         raise ValueError("predetermined virtual bench mode required")
 
@@ -3446,7 +3524,8 @@ async def run(args):
         record({"event": "native_admitted", "snapshot": client.snapshot})
         if args.source == "virtual-leaders":
             if segment in SelectedLeftWorkload.DURATIONS:
-                selected_kwargs = {"peer_side": peer["side"], "peer_direction": peer["direction_raw"], "peer_raw_step": peer["raw_step"]} if peer else {}
+                selected_kwargs = {"peer_side": peer["side"], "peer_direction": peer["direction_raw"], "peer_raw_step": peer["raw_step"],
+                                   **({"peer_active_p": peer["active_p"]} if "active_p" in peer else {})} if peer else {}
                 workload = source = SelectedLeftWorkload(workspace, segment=segment, **selected_kwargs)
                 summary["selected_profile"] = workload.plan()
                 record({"event": "workload_plan", "run_id": run_id, **workload.plan()})
@@ -3666,12 +3745,16 @@ async def run(args):
                     }
                 )
             if peer:
+                state = acquisition_state()  # Rejoin may have replaced the earlier snapshot.
                 previous = workload.peer_baseline
+                previous_start = workload.comparison_start_observation
                 workload.observe_peer_baseline(state)
                 workload.require_peer_baseline()
                 if previous is None and workload.peer_baseline is not None:
                     record({"event": "peer_baseline_settings_verified", "binding": workload.peer_baseline,
                             "peer_selection": peer})
+                if previous_start is None and workload.comparison_start_observation is not None:
+                    record({"event": "peer_comparison_start_observed", **workload.comparison_start_observation})
             phase = workload.phase if workload else "usb"
             if phase != last_phase:
                 record(
@@ -4047,6 +4130,7 @@ def main(argv=None):
     parser.add_argument("--peer-side", choices=("left", "right"))
     parser.add_argument("--peer-direction", type=int, choices=(-1, 1))
     parser.add_argument("--peer-raw-step", type=int)
+    parser.add_argument("--peer-active-p", type=int, choices=(16, 32))
     parser.add_argument("--interrupt-controller", action="store_true", help="declared bench gap also stops current controller renewals")
     parser.add_argument(
         "--no-keyboard", action="store_true", help="USB stationary probe/arm-only operation; body stays zero"
@@ -4054,7 +4138,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         _peer_options(args.workload_segment, args.peer_side, args.peer_direction, args.peer_raw_step,
-                      bench=args.bench_continuity, next_start=args.next_start_seconds)
+                      bench=args.bench_continuity, next_start=args.next_start_seconds, active_p=args.peer_active_p)
     except ValueError as error:
         parser.error(str(error))
     if args.source == "usb-leaders" and not all(

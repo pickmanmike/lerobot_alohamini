@@ -884,18 +884,23 @@ def right_p20_settings_valid(proof, run_id=None, host_incarnation=None):
 
 
 LEFT_RESPONSE_P_KIND = "left-response-p"
+RIGHT_RESPONSE_P_KIND = "right-response-p"
 
 
 def _left_response_p_boot_id():
     value = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
     if str(UUID(value)) != value:
-        raise ValueError("Left response P requires the actual canonical boot identity")
+        raise ValueError("Selected elbow response P requires the actual canonical boot identity")
     return value
 
 
-def _left_response_p_request(value, source_head=None):
+def _response_p_request(value, source_head=None, *, kind):
     import re
 
+    if kind not in (LEFT_RESPONSE_P_KIND, RIGHT_RESPONSE_P_KIND):
+        raise ValueError("Only the two selected response elbow roles are supported")
+    segments = (("left-maintained", "left-reach", "left-peer-fixed")
+                if kind == LEFT_RESPONSE_P_KIND else ("right-peer-fixed",))
     if (
         not isinstance(value, dict)
         or set(value)
@@ -911,10 +916,10 @@ def _left_response_p_request(value, source_head=None):
         }
         or type(value["version"]) is not int
         or value["version"] != 1
-        or value["kind"] != LEFT_RESPONSE_P_KIND
+        or value["kind"] != kind
         or type(value["proportional"]) is not int
         or value["proportional"] not in (16, 32)
-        or value["workload_segment"] not in ("left-maintained", "left-reach")
+        or value["workload_segment"] not in segments
         or type(value["source_head"]) is not str
         or re.fullmatch("[0-9a-f]{40}", value["source_head"]) is None
         or source_head is not None
@@ -926,52 +931,66 @@ def _left_response_p_request(value, source_head=None):
         or not math.isfinite(value["expires_at_monotonic_s"])
         or value["expires_at_monotonic_s"] <= 0
     ):
-        raise ValueError("Left response P requires its closed current-source finite comparison request")
+        raise ValueError("Selected elbow response P requires its closed current-source finite comparison request")
     return value
 
 
+def _left_response_p_request(value, source_head=None):
+    return _response_p_request(value, source_head, kind=LEFT_RESPONSE_P_KIND)
+
+
 def consume_left_response_p_request(state, directory, recipe, run_id, host_incarnation, source_head):
+    return _consume_response_p_request(state, directory, recipe, run_id, host_incarnation, source_head,
+                                       kind=LEFT_RESPONSE_P_KIND)
+
+
+def consume_right_response_p_request(state, directory, recipe, run_id, host_incarnation, source_head):
+    return _consume_response_p_request(state, directory, recipe, run_id, host_incarnation, source_head,
+                                       kind=RIGHT_RESPONSE_P_KIND)
+
+
+def _consume_response_p_request(state, directory, recipe, run_id, host_incarnation, source_head, *, kind):
     """Consume fresh boot-local admission once; expiry never invalidates restoration."""
     state, directory = Path(state), Path(directory)
-    request = state / (LEFT_RESPONSE_P_KIND + "-request.json")
+    request = state / (kind + "-request.json")
     if not request.exists() and not request.is_symlink():
         return None
     if recipe != "physical-live-teleop" or any(
         type(v) is not str or str(UUID(v)) != v for v in (run_id, host_incarnation)
     ):
-        raise ValueError("Left response P requires the exact current WholeRobot run/host")
+        raise ValueError("Selected elbow response P requires the exact current WholeRobot run/host")
     AM1ElbowIntegralTrial._private_directory(directory)
     if directory.name != run_id[:8]:
-        raise ValueError("Left response P requires its current protected run directory")
+        raise ValueError("Selected elbow response P requires its current protected run directory")
     value, raw, info = _right_p20_file(request)
-    _left_response_p_request(value, source_head)
+    _response_p_request(value, source_head, kind=kind)
     if (
         value["boot_id"] != _left_response_p_boot_id()
         or not 0 <= time.monotonic() < value["expires_at_monotonic_s"]
     ):
-        raise ValueError("Left response P request boot/deadline admission expired")
-    used = state / (LEFT_RESPONSE_P_KIND + "-used-" + value["request_id"] + ".json")
+        raise ValueError("Selected elbow response P request boot/deadline admission expired")
+    used = state / (kind + "-used-" + value["request_id"] + ".json")
     consumed, target = (
-        directory / (LEFT_RESPONSE_P_KIND + "-consumed.json"),
-        directory / (LEFT_RESPONSE_P_KIND + ".json"),
+        directory / (kind + "-consumed.json"),
+        directory / (kind + ".json"),
     )
     if used.exists() or used.is_symlink():
-        raise ValueError("Left response P request nonce was already retired")
+        raise ValueError("Selected elbow response P request nonce was already retired")
     if any(p.exists() or p.is_symlink() for p in (consumed, target)):
-        raise ValueError("Left response P request cannot be consumed twice")
+        raise ValueError("Selected elbow response P request cannot be consumed twice")
     current = request.stat(follow_symlinks=False)
     if (current.st_dev, current.st_ino, current.st_size) != (info.st_dev, info.st_ino, info.st_size):
-        raise ValueError("Left response P request changed before consumption")
+        raise ValueError("Selected elbow response P request changed before consumption")
     bound = {
         "version": 1,
-        "kind": LEFT_RESPONSE_P_KIND,
+        "kind": kind,
         "run_id": run_id,
         "host_incarnation": host_incarnation,
         "request_sha256": hashlib.sha256(raw).hexdigest(),
         "request": value,
     }
     if not 0 <= time.monotonic() < value["expires_at_monotonic_s"]:
-        raise ValueError("Left response P request expired before one-use consumption")
+        raise ValueError("Selected elbow response P request expired before one-use consumption")
     descriptor = os.open(used, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
     with os.fdopen(descriptor, "wb") as stream:
         stream.write(_right_p20_json(bound))
@@ -983,7 +1002,7 @@ def consume_left_response_p_request(state, directory, recipe, run_id, host_incar
     AM1ElbowIntegralTrial._sync_directory(directory)
     _, retained, retained_info = _right_p20_file(consumed)
     if retained != raw or (retained_info.st_dev, retained_info.st_ino) != (info.st_dev, info.st_ino):
-        raise ValueError("Left response P original request changed during consumption")
+        raise ValueError("Selected elbow response P original request changed during consumption")
     descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
     with os.fdopen(descriptor, "wb") as stream:
         stream.write(_right_p20_json(bound))
@@ -994,28 +1013,36 @@ def consume_left_response_p_request(state, directory, recipe, run_id, host_incar
 
 
 def load_left_response_p_binding(path, directory, run_id, host_incarnation):
+    return _load_response_p_binding(path, directory, run_id, host_incarnation, kind=LEFT_RESPONSE_P_KIND)
+
+
+def load_right_response_p_binding(path, directory, run_id, host_incarnation):
+    return _load_response_p_binding(path, directory, run_id, host_incarnation, kind=RIGHT_RESPONSE_P_KIND)
+
+
+def _load_response_p_binding(path, directory, run_id, host_incarnation, *, kind):
     directory, path = Path(directory), Path(path)
     if (
         directory.name != run_id[:8]
-        or path != directory / (LEFT_RESPONSE_P_KIND + ".json")
+        or path != directory / (kind + ".json")
         or any(type(v) is not str or str(UUID(v)) != v for v in (run_id, host_incarnation))
     ):
-        raise ValueError("Left response P binding requires its exact current path/run/host")
+        raise ValueError("Selected elbow response P binding requires its exact current path/run/host")
     value, _, _ = _right_p20_file(path)
     if (
         not isinstance(value, dict)
         or set(value) != {"version", "kind", "run_id", "host_incarnation", "request_sha256", "request"}
         or type(value["version"]) is not int
         or value["version"] != 1
-        or value["kind"] != LEFT_RESPONSE_P_KIND
+        or value["kind"] != kind
         or value["run_id"] != run_id
         or value["host_incarnation"] != host_incarnation
     ):
-        raise ValueError("Left response P immutable binding identity differs")
-    request = _left_response_p_request(value["request"])
-    retained, raw, _ = _right_p20_file(directory / (LEFT_RESPONSE_P_KIND + "-consumed.json"))
+        raise ValueError("Selected elbow response P immutable binding identity differs")
+    request = _response_p_request(value["request"], kind=kind)
+    retained, raw, _ = _right_p20_file(directory / (kind + "-consumed.json"))
     if retained != request or hashlib.sha256(raw).hexdigest() != value["request_sha256"]:
-        raise ValueError("Left response P consumed original request content/hash differs")
+        raise ValueError("Selected elbow response P consumed original request content/hash differs")
     return copy.deepcopy(value)
 
 
@@ -1059,34 +1086,59 @@ _LEFT_RESPONSE_P_PRESERVED = tuple(
 
 
 class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
-    """One left-ID3 WholeRobot P16/P32 comparison; no inherited diagnostic cap."""
+    """The closed left-ID3 WholeRobot comparison; the right role reuses its transaction."""
+
+    side, kind, motor = "left", LEFT_RESPONSE_P_KIND, ELBOW
+    calibration = (3, 0, 1845, 864, 3073)
+    raw_bounds = (2011, 2124)
+
+    def _load_binding(self, path, directory, run_id, host_incarnation):
+        loader = load_left_response_p_binding if self.side == "left" else load_right_response_p_binding
+        return loader(path, directory, run_id, host_incarnation)
 
     def __init__(self, binding, directory):
+        if type(self) not in (AM1LeftResponseProportionalTrial, AM1RightResponseProportionalTrial):
+            raise ValueError("Response P supports only the two exact elbow transaction types")
         self.directory = Path(directory)
-        self.binding = load_left_response_p_binding(
-            self.directory / (LEFT_RESPONSE_P_KIND + ".json"),
+        self.binding = self._load_binding(
+            self.directory / (self.kind + ".json"),
             self.directory,
             binding["run_id"],
             binding["host_incarnation"],
         )
         if self.binding != binding:
-            raise ValueError("Left response P constructor binding differs from its retained original")
+            raise ValueError("Selected elbow response P constructor binding differs from its retained original")
         self.proportional = self.binding["request"]["proportional"]
-        super().__init__(integral=0, snapshot_path=self.directory / (LEFT_RESPONSE_P_KIND + "-original.json"))
+        super().__init__(integral=0, snapshot_path=self.directory / (self.kind + "-original.json"))
         self._snapshot = {
             "schema_version": 1,
-            "kind": LEFT_RESPONSE_P_KIND,
+            "kind": self.kind,
             "binding": copy.deepcopy(binding),
             "events": [],
         }
 
-    @staticmethod
-    def _owner(robot):
-        bus, identity = AM1ElbowIntegralTrial._owner(robot)
+    def _owner(self, robot):
+        if self.side == "left":
+            bus, identity = AM1ElbowIntegralTrial._owner(robot)
+        else:
+            bus = getattr(robot, "right_bus", None)
+            if (getattr(robot.config, "robot_model", None) != "alohamini1"
+                    or bus is None or not bus.is_connected or self.motor not in robot.right_arm_motors):
+                raise RuntimeError("Right response P requires its connected AM1 right owner")
+            motor, calibration = bus.motors.get(self.motor), bus.calibration.get(self.motor)
+            if (motor is None or type(motor.id) is not int or motor.id != 3 or motor.model != "sts3215"
+                    or motor.norm_mode is not MotorNormMode.RANGE_M100_100 or calibration is None
+                    or any(type(getattr(calibration, k)) is not int for k in
+                           ("id", "drive_mode", "homing_offset", "range_min", "range_max"))):
+                raise RuntimeError("Right response P requires actual calibrated ID3 mapping")
+            identity = (motor.id, motor.model, calibration.id, calibration.drive_mode,
+                        calibration.homing_offset, calibration.range_min, calibration.range_max)
         if (
             not getattr(robot, "_am1_protected_cleanup", False)
             or getattr(robot, "_am1_selected_joint_evidence_enabled", False)
-            or identity != (3, "sts3215", 3, 0, 1845, 864, 3073)
+            or getattr(robot, "_am1_" + ("right" if self.side == "left" else "left") + "_response_p_binding", None) is not None
+            or getattr(robot, "_am1_" + ("right" if self.side == "left" else "left") + "_response_p_trial", None) is not None
+            or identity != (3, "sts3215", *self.calibration)
             or AM1ElbowIntegralTrial.requested_integral() is not None
             or any(
                 os.environ.get(k) == "1"
@@ -1105,7 +1157,7 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
             )
         ):
             raise RuntimeError(
-                "Left response P requires its exact protected WholeRobot owner without legacy trials"
+                "Selected elbow response P requires its exact protected WholeRobot owner without legacy trials"
             )
         return bus, identity
 
@@ -1117,30 +1169,30 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
             bus is not self._bus
             or identity != self._identity
             or self.binding != self._snapshot["binding"]
-            or getattr(robot, "_am1_left_response_p_trial", None) is not self
-            or getattr(robot, "_am1_left_response_p_binding", None) != self.binding
+            or getattr(robot, "_am1_" + self.side + "_response_p_trial", None) is not self
+            or getattr(robot, "_am1_" + self.side + "_response_p_binding", None) != self.binding
             or getattr(robot, "_am1_teleop_binding", None) != expected
         ):
-            raise RuntimeError("Left response P same owner/mapping/run binding changed")
+            raise RuntimeError("Selected elbow response P same owner/mapping/run binding changed")
         frozen = self._snapshot.get("frozen_teleop_registers")
         if frozen is not None:
-            records = robot._am1_teleop_settings["left"]["registers"]
-            if any(records[k].get(ELBOW) != v for k, v in frozen.items()):
-                raise RuntimeError("Left response P original protected settings changed")
+            records = robot._am1_teleop_settings[self.side]["registers"]
+            if any(records[k].get(self.motor) != v for k, v in frozen.items()):
+                raise RuntimeError("Selected elbow response P original protected settings changed")
         return bus
 
     def _same_owner(self, robot):
         bus = self._retained_owner(robot)
         if (
-            load_left_response_p_binding(
-                self.directory / (LEFT_RESPONSE_P_KIND + ".json"),
+            self._load_binding(
+                self.directory / (self.kind + ".json"),
                 self.directory,
                 self.binding["run_id"],
                 self.binding["host_incarnation"],
             )
             != self.binding
         ):
-            raise RuntimeError("Left response P immutable consumed binding changed")
+            raise RuntimeError("Selected elbow response P immutable consumed binding changed")
         return bus
 
     def _service_boundary(self):
@@ -1162,7 +1214,17 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
     def _read(self, register, *, phase):
         if register != "Present_Temperature":
             self._service_boundary()
-        return super()._read(register, phase=phase)
+        row = {"operation": "read", "register": register, "phase": phase,
+               "started_at_monotonic_s": time.monotonic()}
+        self._snapshot["events"].append(row)
+        try:
+            value = self._bus.read(register, self.motor, normalize=False, num_retry=0)
+            if type(value) is not int:
+                raise RuntimeError("Response P readback must be a raw integer")
+            row["value"] = value
+            return value
+        finally:
+            row["completed_at_monotonic_s"] = time.monotonic()
 
     def _bytes(self, *, phase):
         result = {}
@@ -1183,10 +1245,10 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
                     3,
                     num_retry=0,
                     raise_on_error=True,
-                    err_msg="Left response P individual-byte read failed",
+                    err_msg="Selected elbow response P individual-byte read failed",
                 )
                 if type(value) is not int or not 0 <= value <= 255:
-                    raise RuntimeError("Left response P individual-byte read must be uint8")
+                    raise RuntimeError("Selected elbow response P individual-byte read must be uint8")
                 row["value"] = value
                 result[str(address)] = value
             finally:
@@ -1199,7 +1261,7 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
             or self._bus is not None
             or getattr(robot, "_am1_shutdown_in_progress", False) is True
         ):
-            raise RuntimeError("Left response P transaction cannot be reused")
+            raise RuntimeError("Selected elbow response P transaction cannot be reused")
         self._bus, self._identity = self._owner(robot)
         self._robot = robot
         self._same_owner(robot)
@@ -1208,9 +1270,9 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
         raw_bytes = self._bytes(phase="baseline")
         from .am1_live_teleop import STATIC
 
-        frozen = {k: robot._am1_teleop_settings["left"]["registers"][k][ELBOW] for k in STATIC}
+        frozen = {k: robot._am1_teleop_settings[self.side]["registers"][k][self.motor] for k in STATIC}
         self._snapshot.update(
-            motor=ELBOW,
+            motor=self.motor,
             motor_id=3,
             original_registers=original,
             original_bytes=raw_bytes,
@@ -1230,9 +1292,9 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
             "P_Coefficient": 16,
             "I_Coefficient": 0,
             "D_Coefficient": 32,
-            "Min_Position_Limit": 864,
-            "Max_Position_Limit": 3073,
-            "Homing_Offset": 1845,
+            "Min_Position_Limit": self.calibration[3],
+            "Max_Position_Limit": self.calibration[4],
+            "Homing_Offset": self.calibration[2],
             "Phase": 12,
             "Max_Torque_Limit": 1000,
             "Torque_Limit": 1000,
@@ -1249,8 +1311,8 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
             or original["Lock"] not in (0, 1)
             or raw_bytes != {"24": 16, "25": 0}
             or any(original[k] != v for k, v in frozen.items())
-            or not 2011 <= original["Present_Position"] <= 2124
-            or not 2011 <= original["Goal_Position"] <= 2124
+            or not self.raw_bounds[0] <= original["Present_Position"] <= self.raw_bounds[1]
+            or not self.raw_bounds[0] <= original["Goal_Position"] <= self.raw_bounds[1]
             or original["Protection_Current"] <= 0
             or not 0 < original["Max_Temperature_Limit"] <= 100
             or not 0 < original["Min_Voltage_Limit"] < original["Max_Voltage_Limit"]
@@ -1260,7 +1322,7 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
             or abs(original["Present_Current"]) >= original["Protection_Current"]
         ):
             self._persist_snapshot("baseline_refused", required=False)
-            raise RuntimeError("Left response P actual stopped baseline differs from its reviewed original")
+            raise RuntimeError("Selected elbow response P actual stopped baseline differs from its reviewed original")
         # The original and restoration obligation reach durable storage before any write.
         self.restore_required = True
         try:
@@ -1272,7 +1334,7 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
     def _write(self, register, value, *, phase, reconcile=False):
         allowed = {"Torque_Enable": (0,), "Lock": (0, 1), "P_Coefficient": (16, self.proportional)}
         if register not in allowed or type(value) is not int or value not in allowed[register]:
-            raise ValueError("Left response P transaction cannot write that register/value")
+            raise ValueError("Selected elbow response P transaction cannot write that register/value")
         self._service_boundary()
         row = {
             "operation": "write",
@@ -1283,7 +1345,7 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
         }
         self._snapshot["events"].append(row)
         try:
-            self._bus.write(register, ELBOW, value, normalize=False, num_retry=0)
+            self._bus.write(register, self.motor, value, normalize=False, num_retry=0)
         except BaseException as error:
             row.update(error_type=type(error).__name__, error=str(error))
             self._failure(phase + "_failed", error)
@@ -1293,7 +1355,7 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
                 actual = self._read(register, phase=phase + "_ack_reconciliation")
             except BaseException as read_error:
                 error.add_note(
-                    "Left response P acknowledgement readback failed: " + type(read_error).__name__
+                    "Selected elbow response P acknowledgement readback failed: " + type(read_error).__name__
                 )
                 raise error from read_error
             if actual != value:
@@ -1302,11 +1364,11 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
         finally:
             row["completed_at_monotonic_s"] = time.monotonic()
         if self._read(register, phase=phase + "_verify") != value:
-            raise RuntimeError("Left response P write verification failed: " + register)
+            raise RuntimeError("Selected elbow response P write verification failed: " + register)
 
     def disable_torque(self, robot):
         if not self._created or not self.restore_required:
-            raise RuntimeError("Left response P has no durable outstanding original")
+            raise RuntimeError("Selected elbow response P has no durable outstanding original")
         # A lost descriptor cannot prevent off on the still-retained exact device owner.
         self._retained_owner(robot)
         self._write("Torque_Enable", 0, phase="torque_off", reconcile=True)
@@ -1323,7 +1385,7 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
             or self._bytes(phase=phase) != self._snapshot["original_bytes"]
         ):
             raise RuntimeError(
-                "Left response P preserved identity/I/D/protection/profile/individual bytes changed"
+                "Selected elbow response P preserved identity/I/D/protection/profile/individual bytes changed"
             )
 
     def apply(self, robot):
@@ -1333,14 +1395,14 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
                 or self._apply_attempted
                 or getattr(robot, "_am1_shutdown_in_progress", False) is True
             ):
-                raise RuntimeError("Left response P requires one fresh durable apply opportunity")
+                raise RuntimeError("Selected elbow response P requires one fresh durable apply opportunity")
             self._apply_attempted = True
             self._preserved(robot, phase="before_apply")
             if any(
                 self._read(k, phase="before_apply") != v
                 for k, v in {"Torque_Enable": 0, "Lock": 1, "P_Coefficient": 16}.items()
             ):
-                raise RuntimeError("Left response P requires actual Torque0/Lock1/P16 before apply")
+                raise RuntimeError("Selected elbow response P requires actual Torque0/Lock1/P16 before apply")
             if self.proportional != 16:
                 self._write("P_Coefficient", self.proportional, phase="configure_proportional")
             self._snapshot.update(
@@ -1354,7 +1416,7 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
     def verify_active(self, robot):
         try:
             if getattr(robot, "_am1_shutdown_in_progress", False) is True:
-                raise RuntimeError("Left response P cannot qualify active settings during shutdown")
+                raise RuntimeError("Selected elbow response P cannot qualify active settings during shutdown")
             self._preserved(robot, phase="active")
             actual = {
                 k: self._read(k, phase="active")
@@ -1381,7 +1443,7 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
                 or getattr(robot, "_am1_teleop_first_error", None) is not None
             ):
                 raise RuntimeError(
-                    "Left response P active gain/Lock/torque/configured current/status/voltage refused"
+                    "Selected elbow response P active gain/Lock/torque/configured current/status/voltage refused"
                 )
             # Existing owner thermal windows remain authoritative; one raw temperature is not a new vote.
             self._snapshot.update(
@@ -1400,11 +1462,11 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
     @property
     def receipt(self):
         if not self.restore_required or self._snapshot.get("configured_p_readback") != self.proportional:
-            raise RuntimeError("Left response P receipt requires its applied outstanding obligation")
+            raise RuntimeError("Selected elbow response P receipt requires its applied outstanding obligation")
         request = self.binding["request"]
         return {
             "version": 1,
-            "kind": LEFT_RESPONSE_P_KIND,
+            "kind": self.kind,
             "run_id": self.binding["run_id"],
             "host_incarnation": self.binding["host_incarnation"],
             "request_sha256": self.binding["request_sha256"],
@@ -1428,7 +1490,7 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
             or self._snapshot.get("active_verified") is not True
             or getattr(robot, "_am1_shutdown_in_progress", False) is True
         ):
-            raise RuntimeError("Left response P active receipt requires its prior verified active phase")
+            raise RuntimeError("Selected elbow response P active receipt requires its prior verified active phase")
         return copy.deepcopy(self.receipt)
 
     def restore(self, robot):
@@ -1440,7 +1502,7 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
             if self._read("P_Coefficient", phase="before_restore") != 16:
                 self._write("P_Coefficient", 16, phase="restore_proportional", reconcile=True)
             if self._read("P_Coefficient", phase="restored") != 16:
-                raise RuntimeError("Left response P original P16 restoration failed")
+                raise RuntimeError("Selected elbow response P original P16 restoration failed")
             self._preserved(robot, phase="restored")
             self._write(
                 "Lock",
@@ -1459,7 +1521,15 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
                 self._write("Lock", 1, phase="restore_failed_lock", reconcile=True)
             except BaseException as hold_error:
                 error.add_note(
-                    "Left response P failed-restore hold also failed: " + type(hold_error).__name__
+                    "Selected elbow response P failed-restore hold also failed: " + type(hold_error).__name__
                 )
             self._failure("restore_failed", error)
             raise
+
+
+class AM1RightResponseProportionalTrial(AM1LeftResponseProportionalTrial):
+    """The closed right-ID3 comparison uses the same durable restoration machinery."""
+
+    side, kind, motor = "right", RIGHT_RESPONSE_P_KIND, "arm_right_elbow_flex"
+    calibration = (3, 0, -658, 827, 3039)
+    raw_bounds = (1847, 1960)

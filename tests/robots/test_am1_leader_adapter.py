@@ -9122,3 +9122,429 @@ def test_peer_maintained_cli_explicit_bench_keeps_ordinary_default(monkeypatch, 
     assert len(seen) == 1 and seen[0].bench_continuity is bench
     assert seen[0].workload_segment == side + "-peer-maintained" and seen[0].peer_raw_step == 52
     assert seen[0].interrupt_at_seconds is None and seen[0].next_start_seconds is None
+@pytest.mark.parametrize(
+    "side,q0,start,end,direction", [("left", 2043, 2067, 2015, -1), ("right", 1861, 1855, 1907, 1)]
+)
+def test_peer_fixed_preparation_keeps_exact_interval_and_actual_reference(side, q0, start, end, direction):
+    m = adapter()
+    native = peer_workspace()
+    key = f"arm_{side}_elbow_flex.pos"
+    cal = native["calibration"][key[:-4]]
+    native["reference"][key] = m.normalized_raw(q0, cal)
+    task = m.SelectedLeftWorkload(
+        native, segment=side + "-peer-fixed", peer_side=side, peer_direction=direction, peer_raw_step=52
+    )
+    assert task.observe_peer_baseline(peer_baseline_state(native)) is True
+    origin = dict(native["reference"])
+    start_value, end_value = m.normalized_raw(start, cal), m.normalized_raw(end, cal)
+    for at, expected in (
+        (0.0, origin[key]),
+        (2.0, (origin[key] + start_value) / 2),
+        (4.0, start_value),
+        (5.0, start_value),
+        (6.0, start_value),
+        (8.0, (start_value + end_value) / 2),
+        (10.0, end_value),
+        (12.0, end_value),
+        (14.0, end_value),
+        (16.0, (end_value + start_value) / 2),
+        (18.0, start_value),
+        (20.0, start_value),
+    ):
+        task.elapsed_s = at
+        action = m.map_leader_action(task.get_action())
+        assert action[key] == pytest.approx(expected)
+        assert all(action[k] == origin[k] for k in KEYS if k != key)
+        assert task.body_phase_elapsed is None
+    plan = task.plan()
+    assert task.complete and plan["program_active_seconds"] == 20.0
+    assert plan["reference"] == origin and plan["reference_raw"] == q0
+    assert (plan["comparison_start_raw"], plan["endpoint_raw"], plan["raw_step"]) == (start, end, 52)
+    assert [(p["phase"], p["start_s"], p["end_s"]) for p in plan["phases"]] == [
+        (side + "_prepare", 0.0, 4.0),
+        (side + "_baseline", 4.0, 6.0),
+        (side + "_outward", 6.0, 10.0),
+        (side + "_endpoint_hold", 10.0, 14.0),
+        (side + "_retract", 14.0, 18.0),
+        (side + "_final_hold", 18.0, 20.0),
+    ]
+    assert (
+        plan["comparison_start_qualification"] == "commanded preparation; achieved pose assessed separately"
+    )
+
+
+@pytest.mark.parametrize("fault", ["direction", "step", "unsupported_reference", "rate", "relative_p32"])
+def test_peer_fixed_refuses_retargeting_or_unsupported_preparation(fault):
+    m = adapter()
+    native = peer_workspace()
+    kwargs = {"segment": "left-peer-fixed", "peer_side": "left", "peer_direction": -1, "peer_raw_step": 52}
+    if fault == "direction":
+        kwargs["peer_direction"] = 1
+    elif fault == "step":
+        kwargs["peer_raw_step"] = 51
+    elif fault == "unsupported_reference":
+        native["reference"]["arm_left_elbow_flex.pos"] = m.normalized_raw(
+            2010, native["calibration"]["arm_left_elbow_flex"]
+        )
+    elif fault == "rate":
+        native["bounds"]["arm_left_elbow_flex.pos"]["rate_per_s"] = 0.01
+    else:
+        kwargs.update(segment="left-peer-maintained", peer_active_p=32)
+    with pytest.raises(ValueError):
+        m.SelectedLeftWorkload(native, **kwargs)
+
+
+@pytest.mark.parametrize("side,direction", [("left", -1), ("right", 1)])
+def test_peer_fixed_rejoin_retains_preparation_and_endpoint_clock(side, direction):
+    m = adapter()
+    native = peer_workspace()
+    task = m.SelectedLeftWorkload(
+        native, segment=side + "-peer-fixed", peer_side=side, peer_direction=direction, peer_raw_step=52
+    )
+    assert task.observe_peer_baseline(peer_baseline_state(native))
+    task.elapsed_s = 11.0
+    task.admit(20.0)
+    now = [20.0]
+    producer = m.FrameProducer(task, clock=lambda: now[0])
+    producer.workspace, producer.native_cursor = native, dict(native["reference"])
+    before = producer.capture({"grant_id": str(uuid4())}, body=m.ZERO_BODY)
+    original = task.plan()
+    task.freeze()
+    task.advance(100.0)
+    task.admit(100.0)
+    now[0] = 100.0
+    producer.native_cursor[task.elbow] += 0.5
+    producer.reacquire = True
+    after = producer.capture({"grant_id": str(uuid4())}, body=m.ZERO_BODY)
+    assert after["target"] == before["target"] and after["body"] == m.ZERO_BODY
+    assert after["source"]["sample_seq"] == before["source"]["sample_seq"] + 1
+    assert after["source"]["grant_id"] != before["source"]["grant_id"]
+    assert task.elapsed_s == 11.0 and task.interrupted_phases == {side + "_endpoint_hold"}
+    assert all(
+        task.plan()[key] == original[key]
+        for key in ("reference", "comparison_start_raw", "endpoint_raw", "phases")
+    )
+
+
+def test_peer_fixed_requires_verified_settings_before_preparation_motion():
+    m = adapter()
+    native = peer_workspace()
+    task = m.SelectedLeftWorkload(
+        native, segment="left-peer-fixed", peer_side="left", peer_direction=-1, peer_raw_step=52
+    )
+    assert m.map_leader_action(task.get_action()) == native["reference"]
+    task.elapsed_s = 0.01
+    with pytest.raises(RuntimeError, match="baseline"):
+        task.get_action()
+
+
+def test_peer_fixed_retains_actual_achieved_start_without_precision_gate():
+    m = adapter()
+    native = peer_workspace()
+    task = m.SelectedLeftWorkload(
+        native, segment="left-peer-fixed", peer_side="left", peer_direction=-1, peer_raw_step=52
+    )
+    state = peer_baseline_state(native)
+    state["evidence"]["measured_positions"] = dict(native["reference"])
+    state["evidence"]["measured_positions"][task.elbow] = m.normalized_raw(
+        2043, native["calibration"][task.elbow[:-4]]
+    )
+    assert task.observe_peer_baseline(state)
+    task.elapsed_s = 6.01
+    assert task.observe_peer_baseline(state)
+    observation = task.plan()["comparison_start_observation"]
+    assert observation["measured_positions"] == state["evidence"]["measured_positions"]
+    assert observation["accepted_host_action"] == state["evidence"]["accepted_host_action"]
+    assert observation["commanded_start_raw"] == 2067 and observation["position_qualified"] is False
+    state["evidence"]["measured_positions"][task.elbow] += 0.1
+    task.elapsed_s = 12.0
+    assert task.observe_peer_baseline(state)
+    assert task.plan()["comparison_start_observation"] == observation
+    assert m.map_leader_action(task.get_action())[task.elbow] == pytest.approx(task.endpoint)
+
+
+@pytest.mark.parametrize(
+    "side,active_p,bench",
+    [("left", None, False), ("right", 16, False), ("left", 32, True), ("right", 32, True)],
+)
+def test_peer_fixed_cli_declares_explicit_interval_and_active_settings(monkeypatch, side, active_p, bench):
+    m = adapter()
+    seen = []
+
+    async def run(args):
+        seen.append(args)
+        return {}
+
+    monkeypatch.setattr(m, "run", run)
+    argv = [
+        "--source",
+        "virtual-leaders",
+        "--url",
+        "unused",
+        "--ca",
+        "unused",
+        "--storage-state",
+        "unused",
+        "--output",
+        "unused",
+        "--workload-segment",
+        side + "-peer-fixed",
+        "--duration-seconds",
+        "20",
+        "--peer-side",
+        side,
+        "--peer-direction",
+        "-1" if side == "left" else "1",
+        "--peer-raw-step",
+        "52",
+    ]
+    if active_p is not None:
+        argv += ["--peer-active-p", str(active_p)]
+    if bench:
+        argv.append("--bench-continuity")
+    m.main(argv)
+    assert len(seen) == 1 and seen[0].peer_active_p is active_p and seen[0].bench_continuity is bench
+    assert seen[0].workload_segment == side + "-peer-fixed" and seen[0].duration_seconds == 20.0
+    assert seen[0].interrupt_at_seconds is None and seen[0].next_start_seconds is None
+
+
+def peer_fixed_trial_state(native, side, proportional):
+    state = peer_baseline_state(native)
+    proof = state["evidence"]["accepted_host_action"]["teleop_elbow_settings"]
+    proof[side]["active"][4] = proportional
+    proof["version"] = 2
+    proof["trial"] = [side+"-response-p", "b"*64, str(uuid4()), proportional]
+    for role in ("left", "right"):
+        row = proof[role]
+        proof[role] = [row["calibration"], row["original"], row["active"],
+                       row["original_read_interval"] + row["active_read_interval"]]
+    return state
+
+
+@pytest.mark.parametrize(
+    "side,proportional,trial",
+    [
+        ("left", 16, False),
+        ("right", 16, False),
+        ("left", 16, True),
+        ("right", 16, True),
+        ("left", 32, True),
+        ("right", 32, True),
+    ],
+)
+def test_peer_fixed_requires_exact_current_trial_for_selected_temporary_p(side, proportional, trial):
+    m = adapter()
+    native = peer_workspace()
+    key = f"arm_{side}_elbow_flex.pos"
+    native["reference"][key] = m.normalized_raw(
+        1861 if side == "right" else 2043, native["calibration"][key[:-4]]
+    )
+    task = m.SelectedLeftWorkload(
+        native,
+        segment=side + "-peer-fixed",
+        peer_side=side,
+        peer_direction=-1 if side == "left" else 1,
+        peer_raw_step=52,
+        peer_active_p=proportional,
+    )
+    state = peer_fixed_trial_state(native, side, proportional) if trial else peer_baseline_state(native)
+    assert task.observe_peer_baseline(state)
+    task.elapsed_s = 2.0
+    assert m.map_leader_action(task.get_action())[task.elbow] != native["reference"][task.elbow]
+    plan = task.plan()
+    assert plan["comparison_active_p"] == proportional and plan["baseline_settings_verified"] is True
+    if trial:
+        assert (
+            plan["baseline_settings_binding"]["trial"]
+            == state["evidence"]["accepted_host_action"]["teleop_elbow_settings"]["trial"]
+        )
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "missing",
+        "other_side",
+        "segment",
+        "original_p",
+        "configured_p",
+        "hash",
+        "source",
+        "request_id",
+        "original_hash",
+        "nan",
+        "backwards",
+        "future",
+        "old_original",
+        "early_active",
+        "extra",
+        "other_active",
+        "relative",
+        "changed_request",
+        "changed_source",
+    ],
+)
+def test_peer_fixed_temporary_proof_never_weakens_settings_or_operation_binding(fault):
+    m = adapter()
+    native = peer_workspace()
+    kwargs = {
+        "segment": "left-peer-fixed",
+        "peer_side": "left",
+        "peer_direction": -1,
+        "peer_raw_step": 52,
+        "peer_active_p": 32,
+    }
+    if fault == "relative":
+        kwargs.update(segment="left-peer-maintained", peer_active_p=None)
+    task = m.SelectedLeftWorkload(native, **kwargs)
+    state = peer_fixed_trial_state(native, "left", 32)
+    proof = state["evidence"]["accepted_host_action"]["teleop_elbow_settings"]
+    trial = proof["trial"]
+    if fault in {"changed_request", "changed_source"}:
+        assert task.observe_peer_baseline(state)
+        if fault == "changed_request":
+            trial[2] = str(uuid4())
+        else:
+            proof["sha256"] = "e" * 64
+    elif fault == "missing":
+        proof.pop("trial")
+    elif fault == "other_side":
+        trial[0] = "right-response-p"
+    elif fault == "segment":
+        trial.append("left-maintained")
+    elif fault == "original_p":
+        proof["left"][1][4] = 32
+    elif fault == "configured_p":
+        trial[3] = 16
+    elif fault == "hash":
+        trial[1] = "not-a-hash"
+    elif fault == "source":
+        proof["sha256"] = "not-a-source-proof"
+    elif fault == "request_id":
+        trial[2] = "not-a-uuid"
+    elif fault == "original_hash":
+        trial[1] = "not-an-original-request-hash"
+    elif fault == "nan":
+        proof["left"][3][0] = float("nan")
+    elif fault == "backwards":
+        proof["left"][3][0] = 2.
+    elif fault == "future":
+        proof["left"][3][-1] = 4.
+    elif fault == "old_original":
+        proof["left"][3][1] = 2.1
+    elif fault == "early_active":
+        proof["left"][3][2] = 2.5
+    elif fault == "extra":
+        trial.append("unknown")
+    elif fault == "other_active":
+        proof["right"][2][4] = 32
+    with pytest.raises(RuntimeError, match="baseline"):
+        task.observe_peer_baseline(state)
+    task.elapsed_s = 2.01 if fault == "relative" else 0.01
+    if fault not in {"changed_request", "changed_source"}:
+        with pytest.raises(RuntimeError, match="baseline"):
+            task.get_action()
+
+
+@pytest.mark.parametrize("side,proportional", [("left", 16), ("right", 16), ("left", 32), ("right", 32)])
+def test_peer_fixed_v2_trial_fits_existing_gate_with_current_ack(side, proportional):
+    m = adapter()
+    native = peer_workspace()
+    key = f"arm_{side}_elbow_flex.pos"
+    native["reference"][key] = m.normalized_raw(2043 if side == "left" else 1861,
+                                               native["calibration"][key[:-4]])
+    task = m.SelectedLeftWorkload(native, segment=side+"-peer-fixed", peer_side=side,
+                                 peer_direction=-1 if side == "left" else 1,
+                                 peer_raw_step=52, peer_active_p=proportional)
+    state = peer_fixed_trial_state(native, side, proportional)
+    assert task.observe_peer_baseline(state)
+    original = task.plan()["baseline_settings_binding"]
+    task.elapsed_s = 1.
+    assert m.map_leader_action(task.get_action())[task.elbow] != native["reference"][task.elbow]
+    state["run"]["intent_revision"] += 1
+    state["evidence"]["acknowledged_intent_revision"] += 1
+    state["evidence"]["accepted_host_action"]["intent_revision"] += 1
+    assert task.observe_peer_baseline(state)
+    assert task.plan()["baseline_settings_binding"] == original
+
+
+@pytest.mark.parametrize("fault", ["ordinary", "relative", "extra", "version", "missing_trial", "trial_width",
+                                  "trial_side", "trial_hash", "trial_uuid", "trial_p", "row_width", "calibration",
+                                  "original_p", "nonselected_p", "backwards", "future", "changed_request", "changed_proof"])
+def test_peer_fixed_v2_rejects_foreign_or_malformed_trial(fault):
+    m = adapter()
+    native = peer_workspace()
+    task = m.SelectedLeftWorkload(native, segment="left-peer-fixed", peer_side="left", peer_direction=-1,
+                                 peer_raw_step=52, peer_active_p=32)
+    state = peer_fixed_trial_state(native, "left", 32)
+    proof = state["evidence"]["accepted_host_action"]["teleop_elbow_settings"]
+    if fault in {"changed_request", "changed_proof"}:
+        assert task.observe_peer_baseline(state)
+        if fault == "changed_request":
+            proof["trial"][2] = str(uuid4())
+        else:
+            proof["sha256"] = "e" * 64
+    elif fault == "ordinary":
+        task = m.SelectedLeftWorkload(native)
+    elif fault == "relative":
+        task = m.SelectedLeftWorkload(native, segment="left-peer-maintained", peer_side="left", peer_direction=-1, peer_raw_step=52)
+    elif fault == "extra":
+        proof["extra"] = True
+    elif fault == "version":
+        proof["version"] = True
+    elif fault == "missing_trial":
+        del proof["trial"]
+    elif fault == "trial_width":
+        proof["trial"].append("extra")
+    elif fault == "trial_side":
+        proof["trial"][0] = "right-response-p"
+    elif fault == "trial_hash":
+        proof["trial"][1] = "g" * 64
+    elif fault == "trial_uuid":
+        proof["trial"][2] = "not-a-uuid"
+    elif fault == "trial_p":
+        proof["trial"][3] = 16
+    elif fault == "row_width":
+        proof["left"].append("extra")
+    elif fault == "calibration":
+        proof["left"][0][2] += 1
+    elif fault == "original_p":
+        proof["left"][1][4] = 32
+    elif fault == "nonselected_p":
+        proof["right"][2][4] = 32
+    elif fault == "backwards":
+        proof["left"][3] = [2., 1., 2., 3.]
+    elif fault == "future":
+        proof["left"][3][-1] = 99.
+    if fault == "ordinary":
+        assert task.observe_peer_baseline(state) is False
+    else:
+        with pytest.raises(RuntimeError, match="baseline"):
+            task.observe_peer_baseline(state)
+
+
+@pytest.mark.parametrize("proportional", [16, 32])
+def test_peer_fixed_v1_rejects_obsolete_trial_wire_shape(proportional):
+    m = adapter()
+    native = peer_workspace()
+    task = m.SelectedLeftWorkload(native, segment="left-peer-fixed", peer_side="left", peer_direction=-1,
+                                 peer_raw_step=52, peer_active_p=proportional)
+    state = peer_baseline_state(native)
+    proof = state["evidence"]["accepted_host_action"]["teleop_elbow_settings"]
+    proof["left"]["active"][4] = proportional
+    proof["trial"] = ["left-response-p", "b"*64, "c"*40, str(uuid4()), "left-peer-fixed", 16,
+                       proportional, "d"*64, 1.1, 1.2]
+    with pytest.raises(RuntimeError, match="baseline"):
+        task.observe_peer_baseline(state)
+
+
+@pytest.mark.parametrize("selected_p", [16, 32])
+def test_peer_fixed_v1_cannot_credit_active_p32_without_trial(selected_p):
+    m = adapter()
+    native = peer_workspace()
+    task = m.SelectedLeftWorkload(native, segment="left-peer-fixed", peer_side="left", peer_direction=-1,
+                                 peer_raw_step=52, peer_active_p=selected_p)
+    state = peer_baseline_state(native)
+    state["evidence"]["accepted_host_action"]["teleop_elbow_settings"]["left"]["active"][4] = 32
+    with pytest.raises(RuntimeError, match="baseline"):
+        task.observe_peer_baseline(state)

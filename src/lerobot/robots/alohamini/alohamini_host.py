@@ -1531,6 +1531,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--am1-selected-experiment-file")
     parser.add_argument("--am1-right-p20-trial-file")
     parser.add_argument("--am1-left-response-p-trial-file")
+    parser.add_argument("--am1-right-response-p-trial-file")
     parser.add_argument("--am1-admission-fd", type=int)
     parser.add_argument("--am1-host-runtime-s", type=int, default=480)
     parser.add_argument("--am1-physical-state-directory", default=str(Path.home() / ".local/state/am1-session"))
@@ -1664,7 +1665,8 @@ def left_response_p_trial_binding(args, teleop_binding):
             or os.environ.get("AM1_SHOULDER_INTEGRAL_TEST") == "1"
             or any(os.environ.get(key) is not None for key in ("AM1_ELBOW_RECOVERY", "AM1_ELBOW_RECOVERY_RECIPE", "AM1_ELBOW_INTEGRAL"))
             or getattr(args, "am1_selected_experiment_file", None) is not None
-            or getattr(args, "am1_right_p20_trial_file", None) is not None):
+            or getattr(args, "am1_right_p20_trial_file", None) is not None
+            or getattr(args, "am1_right_response_p_trial_file", None) is not None):
         raise ValueError("AM1 left response file requires its exact protected WholeRobot owner")
     binding = load_left_response_p_binding(path, args.am1_protected_run_directory, args.am1_run_id, args.am1_host_incarnation)
     import subprocess
@@ -1678,6 +1680,40 @@ def left_response_p_trial_binding(args, teleop_binding):
         raise ValueError("AM1 left response actual motor source is unavailable") from None
     if actual_head != binding["request"]["source_head"]:
         raise ValueError("AM1 left response actual motor source differs from its consumed request")
+    return binding
+
+
+def right_response_p_trial_binding(args, teleop_binding):
+    """Accept only a fresh consumed file for this protected WholeRobot owner."""
+    path = getattr(args, "am1_right_response_p_trial_file", None)
+    if path is None:
+        return None
+    from .am1_elbow_integral import load_right_response_p_binding
+
+    expected = {"run_id": args.am1_run_id, "host_incarnation": args.am1_host_incarnation, "recipe": "physical-live-teleop"}
+    if (teleop_binding != expected or args.robot_model != "alohamini1" or args.no_follower or not args.no_cameras
+            or not getattr(args, "am1_protected_run_directory", None)
+            or os.environ.get("AM1_VISIBLE_CONTROL_RECIPE") != "physical-live-teleop"
+            or os.environ.get("AM1_SCRIPTED_PREPARE") != "1"
+            or os.environ.get("AM1_SELECTED_JOINT_EVIDENCE") == "1"
+            or os.environ.get("AM1_SHOULDER_INTEGRAL_TEST") == "1"
+            or any(os.environ.get(key) is not None for key in ("AM1_ELBOW_RECOVERY", "AM1_ELBOW_RECOVERY_RECIPE", "AM1_ELBOW_INTEGRAL"))
+            or getattr(args, "am1_selected_experiment_file", None) is not None
+            or getattr(args, "am1_right_p20_trial_file", None) is not None
+            or getattr(args, "am1_left_response_p_trial_file", None) is not None):
+        raise ValueError("AM1 right response file requires its exact protected WholeRobot owner")
+    binding = load_right_response_p_binding(path, args.am1_protected_run_directory, args.am1_run_id, args.am1_host_incarnation)
+    import subprocess
+
+    try:
+        actual_head = subprocess.check_output(
+            ["git", "-C", str(Path(__file__).resolve().parents[4]), "rev-parse", "HEAD"],
+            stderr=subprocess.DEVNULL, timeout=2,
+        ).decode("ascii").strip()
+    except (OSError, UnicodeError, subprocess.SubprocessError):
+        raise ValueError("AM1 right response actual motor source is unavailable") from None
+    if actual_head != binding["request"]["source_head"]:
+        raise ValueError("AM1 right response actual motor source differs from its consumed request")
     return binding
 
 
@@ -1731,6 +1767,7 @@ def _run_host(args):
     recovery_binding = elbow_recovery_binding(args)
     right_p20_binding = right_p20_trial_binding(args, visible_binding)
     left_response_binding = left_response_p_trial_binding(args, visible_binding)
+    right_response_binding = right_response_p_trial_binding(args, visible_binding)
     practical_config = live_elbow_config(None if visible_binding is None else visible_binding["recipe"])
     if right_p20_binding is not None and right_p20_binding["kind"] == "practical13-right":
         from examples.alohamini.am1_session_contract import PracticalElbowConfig
@@ -1770,6 +1807,9 @@ def _run_host(args):
         if left_response_binding is not None:
             robot._am1_left_response_p_binding = left_response_binding
             robot._am1_left_response_p_trial_directory = args.am1_protected_run_directory
+        if right_response_binding is not None:
+            robot._am1_right_response_p_binding = right_response_binding
+            robot._am1_right_response_p_trial_directory = args.am1_protected_run_directory
     elif visible_binding is not None:
         robot._am1_visible_control_binding = visible_binding
         robot._am1_visible_control_evidence = selected_evidence
@@ -1881,6 +1921,8 @@ def _run_host(args):
                         "active": robot._am1_teleop_active_settings[side],
                         **({"left_response_p_trial": robot._am1_left_response_p_trial.receipt}
                            if getattr(robot, "_am1_left_response_p_trial", None) is not None else {}),
+                        **({"right_response_p_trial": robot._am1_right_response_p_trial.receipt}
+                           if getattr(robot, "_am1_right_response_p_trial", None) is not None else {}),
                     })
                 routine_writer.submit("[AM1 TELEOP REST] ", {
                     "binding": robot._am1_teleop_binding,

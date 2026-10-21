@@ -1949,3 +1949,100 @@ def test_left_response_cleanup_without_outstanding_obligation_uses_ordinary_off(
     assert robot.left_bus.registers["Torque_Enable", "arm_left_elbow_flex"] == 0
     assert robot.left_bus.registers["P_Coefficient", "arm_left_elbow_flex"] == 16
     assert not robot.left_bus.is_connected
+
+
+@pytest.mark.parametrize("proportional", [16, 32])
+def test_right_response_fixed_configure_records_original_before_write_and_restores(activation, monkeypatch, proportional):
+    from tests.robots.test_am1_live_teleop_native import install_right_response_trial
+    def attach(robot):
+        for side in ("left", "right"):
+            bus = getattr(robot, side + "_bus")
+            bus.registers["P_Coefficient", "arm_" + side + "_elbow_flex"] = 16
+        install_right_response_trial(monkeypatch, robot, proportional=proportional, installed=False)
+    robot = configured_robot(activation, before_configure=attach)
+    trial = getattr(robot, "_am1_right_response_p_trial", None)
+    assert trial is not None and trial.events == ["prepare", "off", "apply"]
+    assert robot._am1_teleop_settings["right"]["registers"]["P_Coefficient"]["arm_right_elbow_flex"] == 16
+    assert robot.right_bus.registers["P_Coefficient", "arm_right_elbow_flex"] == proportional
+    assert robot.left_bus.registers["P_Coefficient", "arm_left_elbow_flex"] == 16
+    with pytest.raises(RuntimeError, match="right.*response|Right.*response"):
+        robot.configure()
+    robot._am1_protected_cleanup = True
+    assert not robot._safe_shutdown(close_buses=True)
+    assert not trial.restore_required and trial.events[-1] == "restore"
+    assert robot.right_bus.registers["P_Coefficient", "arm_right_elbow_flex"] == 16
+    assert robot.right_bus.registers["Lock", "arm_right_elbow_flex"] == 0
+    assert robot._am1_shutdown_evidence["right_response_p_trial"] == trial.evidence
+    assert robot._am1_shutdown_evidence["selected_gain_restore_required"] is False
+
+
+@pytest.mark.parametrize("proportional", [16, 32])
+def test_right_response_fixed_active_settings_only_allow_one_selected_p(activation, monkeypatch, proportional):
+    import copy
+
+    from lerobot.robots.alohamini.am1_live_teleop import verify_settings
+    from tests.robots.test_am1_live_teleop_native import install_right_response_trial
+    robot = configured_robot(activation)
+    for side in ("left", "right"):
+        key = "arm_" + side + "_elbow_flex"
+        robot._am1_teleop_settings[side]["registers"]["P_Coefficient"][key] = 16
+        getattr(robot, side + "_bus").registers["P_Coefficient", key] = 16
+    install_right_response_trial(monkeypatch, robot, proportional=proportional)
+    original = copy.deepcopy(robot._am1_teleop_settings)
+    robot.right_bus.registers["P_Coefficient", "arm_right_elbow_flex"] = proportional
+    for bus, names in ((robot.left_bus, robot.left_arm_motors), (robot.right_bus, robot.right_arm_motors)):
+        for name in names:
+            bus.registers["Torque_Enable", name] = bus.registers["Lock", name] = 1
+    verify_settings(robot)
+    assert robot._am1_teleop_settings == original
+    assert robot._am1_teleop_active_settings["right"]["registers"]["P_Coefficient"]["arm_right_elbow_flex"] == proportional
+    robot.left_bus.registers["P_Coefficient", "arm_left_elbow_flex"] = 32
+    with pytest.raises(RuntimeError, match="settings changed"):
+        verify_settings(robot)
+
+
+def test_right_response_fixed_cleanup_without_obligation_still_torques_off(activation, monkeypatch):
+    from tests.robots.test_am1_live_teleop_native import install_right_response_trial
+    robot = configured_robot(activation)
+    trial = install_right_response_trial(monkeypatch, robot)
+    trial.restore_required = False
+    trial.disable_torque = lambda owner: (_ for _ in ()).throw(RuntimeError("no outstanding obligation"))
+    trial.restore = lambda owner: None
+    robot._am1_protected_cleanup = True
+    robot.right_bus.registers["P_Coefficient", "arm_right_elbow_flex"] = 16
+    robot.right_bus.registers["Torque_Enable", "arm_right_elbow_flex"] = 1
+    assert not robot._safe_shutdown(close_buses=True)
+    assert robot.right_bus.registers["Torque_Enable", "arm_right_elbow_flex"] == 0
+    assert not robot._am1_shutdown_evidence["selected_gain_restore_required"]
+
+
+def test_right_response_fixed_cleanup_restoration_failure_stays_unqualified(activation, monkeypatch):
+    from tests.robots.test_am1_live_teleop_native import install_right_response_trial
+    robot = configured_robot(activation)
+    trial = install_right_response_trial(monkeypatch, robot)
+    robot._am1_protected_cleanup = True
+    robot.right_bus.registers["P_Coefficient", "arm_right_elbow_flex"] = 32
+    def refuse(owner):
+        assert owner.right_bus.is_connected
+        raise OSError("right restoration proof missing")
+    trial.restore = refuse
+    errors = robot._safe_shutdown(close_buses=True)
+    assert any("right response" in value for value in errors)
+    assert robot.right_bus.registers["Torque_Enable", "arm_right_elbow_flex"] == 0
+    assert trial.restore_required and robot._am1_shutdown_evidence["selected_gain_restore_required"]
+    assert not robot._am1_shutdown_evidence["verified"] and not robot.right_bus.is_connected
+
+
+def test_response_fixed_dual_selection_refuses_before_startup_io(activation, monkeypatch):
+    from tests.robots.test_am1_live_teleop_native import (
+        install_left_response_trial,
+        install_right_response_trial,
+    )
+    before = []
+    def attach(robot):
+        install_left_response_trial(monkeypatch, robot, workload="left-peer-fixed", installed=False)
+        install_right_response_trial(monkeypatch, robot, installed=False)
+        before[:] = activation.events
+    with pytest.raises(RuntimeError, match="only one selected elbow"):
+        configured_robot(activation, before_configure=attach)
+    assert activation.events == before

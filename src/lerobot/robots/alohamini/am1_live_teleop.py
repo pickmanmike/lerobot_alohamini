@@ -862,7 +862,8 @@ def prepare_settings(robot, *, defer_temperature_baseline=False):
     if not binding_valid(robot):
         raise RuntimeError("AM1 teleop settings need the protected binding")
     if defer_temperature_baseline:
-        if (getattr(robot, "_am1_left_response_p_binding", None) is None
+        if (sum(getattr(robot, "_am1_" + side + "_response_p_binding", None) is not None
+                for side in ("left", "right")) != 1
                 or getattr(robot, "_am1_teleop_temperatures", None)
                 or hasattr(robot, "_am1_teleop_initial_temperature_deadline")):
             raise RuntimeError("AM1 selected initial thermal acquisition cannot be reused or reset")
@@ -952,28 +953,45 @@ def _qualify_initial_temperatures(robot, deadline):
     _fresh_temperatures(robot)
 
 
-def left_response_receipt(robot):
-    """Read-free proof for the one explicitly admitted left-ID3 comparison."""
-    binding = getattr(robot, "_am1_left_response_p_binding", None)
-    trial = getattr(robot, "_am1_left_response_p_trial", None)
+def _response_receipt(robot, side):
+    """Read-free proof for one explicitly admitted response comparison."""
+    binding = getattr(robot, "_am1_" + side + "_response_p_binding", None)
+    trial = getattr(robot, "_am1_" + side + "_response_p_trial", None)
     if binding is None and trial is None:
         return None
-    from .am1_elbow_integral import AM1LeftResponseProportionalTrial
+    from .am1_elbow_integral import AM1LeftResponseProportionalTrial, AM1RightResponseProportionalTrial
 
-    if (not binding_valid(robot) or type(trial) is not AM1LeftResponseProportionalTrial
-            or trial.binding != binding):
-        raise RuntimeError("AM1 left response transaction binding changed")
+    other = "right" if side == "left" else "left"
+    trial_type = AM1LeftResponseProportionalTrial if side == "left" else AM1RightResponseProportionalTrial
+    if (not binding_valid(robot) or type(trial) is not trial_type or trial.binding != binding
+            or getattr(robot, "_am1_" + other + "_response_p_binding", None) is not None
+            or getattr(robot, "_am1_" + other + "_response_p_trial", None) is not None):
+        raise RuntimeError(f"AM1 {side} response transaction binding changed")
     receipt = trial.active_receipt(robot)
-    if (receipt.get("kind") != "left-response-p" or receipt.get("original_p") != 16
+    allowed = ("left-maintained", "left-reach", "left-peer-fixed") if side == "left" else ("right-peer-fixed",)
+    if (receipt.get("kind") != side + "-response-p" or receipt.get("original_p") != 16
             or receipt.get("configured_p") not in (16, 32) or receipt.get("restore_required") is not True
-            or receipt.get("workload_segment") not in ("left-maintained", "left-reach")
+            or receipt.get("workload_segment") not in allowed
             or any(receipt.get(key) != robot._am1_teleop_binding[key] for key in ("run_id", "host_incarnation"))):
-        raise RuntimeError("AM1 left response active settings proof differs")
+        raise RuntimeError(f"AM1 {side} response active settings proof differs")
     return receipt
 
 
+def left_response_receipt(robot):
+    """Retain the existing left receipt API and exact receipt shape."""
+    return _response_receipt(robot, "left")
+
+
+def right_response_receipt(robot):
+    return _response_receipt(robot, "right")
+
+
+def response_receipt(robot):
+    return left_response_receipt(robot) or right_response_receipt(robot)
+
+
 def _left_response_target_valid(robot, control, sample):
-    receipt = left_response_receipt(robot)
+    receipt = response_receipt(robot)
     if receipt is None:
         return True
     from examples.alohamini.am1_live_teleop import ZERO_BODY
@@ -983,7 +1001,8 @@ def _left_response_target_valid(robot, control, sample):
     if set(sample["body"]) != set(ZERO_BODY) or any(sample["body"][key] != 0 for key in ZERO_BODY):
         return False
     workspace = control._live_summary["workspace"]
-    allowed = {"arm_left_elbow_flex.pos"}
+    side = "left" if receipt["kind"] == "left-response-p" else "right"
+    allowed = {"arm_" + side + "_elbow_flex.pos"}
     if receipt["workload_segment"] == "left-reach":
         allowed.add("arm_left_gripper.pos")
     for key, reference in workspace["reference"].items():
@@ -1000,11 +1019,17 @@ def verify_settings(robot):
     records = read_groups(robot, (*STATIC, *HEALTH), active=True)
     expected = {side: {register: dict(robot._am1_teleop_settings[side]["registers"][register])
                        for register in STATIC} for side, _, _ in _groups(robot)}
-    trial = left_response_receipt(robot)
+    trial = response_receipt(robot)
     if trial is not None:
-        if expected["left"]["P_Coefficient"]["arm_left_elbow_flex"] != 16:
-            raise RuntimeError("AM1 left response original baseline differs")
-        expected["left"]["P_Coefficient"]["arm_left_elbow_flex"] = trial["configured_p"]
+        side = "left" if trial["kind"] == "left-response-p" else "right"
+        if trial["workload_segment"].endswith("-peer-fixed"):
+            for role in ("left", "right"):
+                name = "arm_" + role + "_elbow_flex"
+                if expected[role]["P_Coefficient"][name] != 16:
+                    raise RuntimeError("AM1 response both original elbow baselines differ")
+        if expected[side]["P_Coefficient"]["arm_" + side + "_elbow_flex"] != 16:
+            raise RuntimeError(f"AM1 {side} response original baseline differs")
+        expected[side]["P_Coefficient"]["arm_" + side + "_elbow_flex"] = trial["configured_p"]
     if any(
         records[side]["registers"][register] != expected[side][register]
         for side, _, _ in _groups(robot)

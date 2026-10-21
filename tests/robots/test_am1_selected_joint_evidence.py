@@ -1559,3 +1559,28 @@ def test_whole_teleop_right_transport_replacement_invalidates_actual_read_correl
     evidence.report(obj, control, observation)
     assert len(right.writes) == 1 and rows[-1]["diagnostic_available"] is False
     assert rows[-1]["goal_matches_expected_raw"] is None
+
+
+@pytest.mark.parametrize("side", ["left", "right"])
+@pytest.mark.parametrize("proportional", [16, 32])
+def test_fixed_response_cached_proof_contains_exact_trial_and_both_baselines(monkeypatch, side, proportional):
+    from tests.robots.test_am1_live_teleop_native import (
+        install_left_response_trial,
+        install_right_response_trial,
+    )
+    obj, evidence, control, _, _, writes, acquire = two_elbow_goal_lane(monkeypatch)
+    install = install_left_response_trial if side == "left" else install_right_response_trial
+    trial = install(monkeypatch, obj, workload=side + "-peer-fixed", proportional=proportional)
+    obj._am1_teleop_active_settings[side]["registers"]["P_Coefficient"]["arm_" + side + "_elbow_flex"] = proportional
+    observation = acquire()
+    evidence.publish(obj, control, observation)
+    selected = observation["_am1_local_feedback"]["selected_joint"]
+    proof = selected["teleop_elbow_settings"]
+    assert set(proof) == {"left", "right", "trial"} and proof["trial"] == trial.receipt
+    assert selected[side + "_response_p_trial"] == trial.receipt
+    for current in ("left", "right"):
+        assert proof[current]["original"]["P_Coefficient"] == 16
+        assert proof[current]["active"]["P_Coefficient"] == (proportional if current == side else 16)
+        assert proof[current]["original"]["I_Coefficient"] == proof[current]["active"]["I_Coefficient"] == 0
+        assert proof[current]["original"]["D_Coefficient"] == proof[current]["active"]["D_Coefficient"] == 32
+    assert not writes

@@ -1240,13 +1240,14 @@ class AM1SelectedJointEvidence:
         if (any(type(v) is not int for v in material) or material[0] != 3 or material[1] not in (0, 1)
                 or not 0 <= material[3] < material[4] <= 4095):
             return None
-        from .am1_live_teleop import left_response_receipt
+        from .am1_live_teleop import response_receipt
         try:
-            trial = left_response_receipt(robot)
+            trial = response_receipt(robot)
         except RuntimeError:
             return None
         return {**control.binding, "side": side, "motor": name, "motor_id": 3, "calibration": material,
-                **({"left_response_p_trial": trial} if trial is not None and side == "left" else {})}
+                **({side + "_response_p_trial": trial}
+                   if trial is not None and trial["kind"] == side + "-response-p" else {})}
 
     def record_teleop_action(self, robot, control, marker, accepted):
         """Copy successfully returned actions for the two closed elbow roles."""
@@ -1268,11 +1269,12 @@ class AM1SelectedJointEvidence:
 
     def _teleop_elbow_settings(self, robot, control):
         """Project cached original acquisitions without new I/O or fresh timestamps."""
-        from .am1_live_teleop import STATIC, left_response_receipt
+        from .am1_live_teleop import STATIC, response_receipt
 
         try:
-            if left_response_receipt(robot) is not None:
-                return None  # An explicit trial is not ordinary baseline evidence.
+            trial = response_receipt(robot)
+            if trial is not None and trial["workload_segment"] not in ("left-peer-fixed", "right-peer-fixed"):
+                return None  # Legacy trials cannot masquerade as ordinary baseline evidence.
             now, result = self.clock(), {}
             if not _number(now):
                 return None
@@ -1301,6 +1303,19 @@ class AM1SelectedJointEvidence:
                         t["read_started_at_monotonic_s"] for t in row["active_read_timing"].values()):
                     return None
                 result[side] = row
+            if trial is not None:
+                selected = "left" if trial["kind"] == "left-response-p" else "right"
+                for side in ("left", "right"):
+                    original, active = result[side]["original"], result[side]["active"]
+                    if any(original[key] != value for key, value in
+                           {"P_Coefficient": 16, "I_Coefficient": 0, "D_Coefficient": 32}.items()):
+                        return None
+                    expected = dict(original)
+                    if side == selected:
+                        expected["P_Coefficient"] = trial["configured_p"]
+                    if active != expected:
+                        return None
+                result["trial"] = copy.deepcopy(trial)
             return result
         except (AttributeError, KeyError, TypeError, ValueError, RuntimeError):
             return None
@@ -1417,8 +1432,9 @@ class AM1SelectedJointEvidence:
                "requested_goal_raw": original["action"]["expected_goal_raw"], "goal_position_raw": None,
                "present_position_raw": None, "goal_matches_expected_raw": None,
                "diagnostic_available": False, "read_started_at_monotonic_s": now}
-        if "left_response_p_trial" in state["binding"]:
-            row["left_response_p_trial"] = copy.deepcopy(state["binding"]["left_response_p_trial"])
+        for key in ("left_response_p_trial", "right_response_p_trial"):
+            if key in state["binding"]:
+                row[key] = copy.deepcopy(state["binding"][key])
         bus = state["bus"]
         transport = DirectSdkTransport(bus.port, motor_id=3, port_handler=bus.port_handler, packet_handler=bus.packet_handler)
         primary = None
@@ -2247,8 +2263,9 @@ class AM1SelectedJointEvidence:
                     "goal_readbacks": copy.deepcopy(self.goal_readbacks),
                     **({"teleop_elbow_settings": copy.deepcopy(settings)}
                        if settings is not None and settings == self.teleop_settings else {}),
-                    **({"left_response_p_trial": copy.deepcopy(self.teleop_binding["left_response_p_trial"])}
-                       if self.teleop_binding is not None and "left_response_p_trial" in self.teleop_binding else {}),
+                    **{key: copy.deepcopy(state["binding"][key])
+                       for state in self.teleop_states.values() if state.get("binding") is not None
+                       for key in ("left_response_p_trial", "right_response_p_trial") if key in state["binding"]},
                 }
             return
         outer = observation.get("_am1_local_feedback")

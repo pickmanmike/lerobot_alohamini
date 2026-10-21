@@ -126,13 +126,14 @@ class PendingSample:
     sample: dict
 
 
-def _teleop_elbow_settings_summary(proof, acquired_at):
+def _teleop_elbow_settings_summary(proof, acquired_at, *, run_id=None, host_incarnation=None):
     """Compact cached settings only; preserve the full proof in native evidence."""
     registers = ("ID", "Model_Number", "Firmware_Major_Version", "Firmware_Minor_Version",
                  "P_Coefficient", "I_Coefficient", "D_Coefficient", "Operating_Mode")
     row_keys = {"motor", "motor_id", "calibration", "original", "active",
                 "original_read_timing", "active_read_timing"}
-    if not isinstance(proof, dict) or set(proof) != {"left", "right"}:
+    if (not isinstance(proof, dict) or set(proof) not in ({"left", "right"}, {"left", "right", "trial"})
+            or type(acquired_at) not in (int, float) or not math.isfinite(acquired_at) or acquired_at < 0):
         return None
     result = {"version": 1}
     try:
@@ -168,6 +169,50 @@ def _teleop_elbow_settings_summary(proof, acquired_at):
             if summary["original_read_interval"][1] > summary["active_read_interval"][0]:
                 return None
             result[side] = summary
+        if "trial" in proof:
+            from uuid import UUID
+
+            trial = proof["trial"]
+            keys = {"version", "kind", "run_id", "host_incarnation", "request_sha256", "source_head",
+                    "request_id", "workload_segment", "original_p", "configured_p", "restore_required",
+                    "original_settings_sha256", "prepared_at_monotonic_s", "configured_at_monotonic_s"}
+            if (not isinstance(trial, dict) or set(trial) != keys
+                    or type(trial["version"]) is not int or trial["version"] != 1
+                    or trial["restore_required"] is not True
+                    or type(trial["original_p"]) is not int or trial["original_p"] != 16
+                    or type(trial["configured_p"]) is not int or trial["configured_p"] not in (16, 32)
+                    or trial["run_id"] != run_id or trial["host_incarnation"] != host_incarnation
+                    or any(type(v) is not str or str(UUID(v)) != v for v in
+                           (run_id, host_incarnation, trial["request_id"]))
+                    or any(type(trial[key]) is not str or len(trial[key]) != width
+                           or any(c not in "0123456789abcdef" for c in trial[key])
+                           for key, width in (("request_sha256", 64), ("source_head", 40),
+                                              ("original_settings_sha256", 64)))):
+                return None
+            side = {"left-response-p": "left", "right-response-p": "right"}.get(trial["kind"])
+            if side is None or trial["workload_segment"] != side + "-peer-fixed":
+                return None
+            prepared, configured = (trial[key] for key in
+                                    ("prepared_at_monotonic_s", "configured_at_monotonic_s"))
+            if (any(type(v) not in (int, float) or not math.isfinite(v) for v in (prepared, configured))
+                    or not 0 <= prepared <= configured <= result[side]["active_read_interval"][0] <= acquired_at):
+                return None
+            original = [3, 777, 3, 10, 16, 0, 32, 0]
+            for name in ("left", "right"):
+                active = list(original)
+                if name == side:
+                    active[4] = trial["configured_p"]
+                calibration = [3, 0, 1845, 864, 3073] if name == "left" else [3, 0, -658, 827, 3039]
+                if (result[name]["original"] != original or result[name]["active"] != active
+                        or result[name]["calibration"] != calibration):
+                    return None
+            # All full receipt fields were validated above. The full-proof digest
+            # binds them while the closed trial-only vectors keep the real ACK
+            # within its existing cap without dropping arm/lift/thermal feedback.
+            result = {"version": 2, **{name: [result[name]["calibration"], result[name]["original"],
+                      result[name]["active"], result[name]["original_read_interval"]
+                      + result[name]["active_read_interval"]] for name in ("left", "right")},
+                      "trial": [trial[key] for key in ("kind", "request_sha256", "request_id", "configured_p")]}
         result["sha256"] = hashlib.sha256(
             json.dumps(proof, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
     except (KeyError, TypeError, ValueError):
@@ -322,7 +367,8 @@ def read_physical_sample(
     # The source marker was correlated above. Forward only its compact cached
     # proof: full settings/Goal payloads must not displace the essential ACK.
     if isinstance(selected, dict) and "teleop_elbow_settings" in selected:
-        compact = _teleop_elbow_settings_summary(selected["teleop_elbow_settings"], completed)
+        compact = _teleop_elbow_settings_summary(selected["teleop_elbow_settings"], completed,
+                                                run_id=run_id, host_incarnation=host_incarnation)
         if compact is not None:
             candidate = {**sample["ack"], "teleop_elbow_settings": compact}
             # Match the existing Core projection after removing duplicated live
@@ -1575,6 +1621,9 @@ class ProtectedHostRun:
         state = Path(self.config["physical_state_directory"])
         if (state / "cleanup-uncertain.json").exists() or (state / "physical-in-progress.json").exists():
             raise RuntimeError("previous physical cleanup requires actual stopped reconciliation")
+        pending_response = [state / (side + "-response-p-request.json") for side in ("left", "right")]
+        if all(path.exists() or path.is_symlink() for path in pending_response):
+            raise ValueError("response P admission requires one selected elbow request")
         # The isolated hardware host unit acquires canonical + serial admission before robot construction.
         # Parent/client stays in its existing PrivateDevices=yes namespace.
         cancel()
@@ -1586,10 +1635,16 @@ class ProtectedHostRun:
         from lerobot.robots.alohamini.am1_elbow_integral import (
             consume_left_response_p_request,
             consume_right_p20_request,
+            consume_right_response_p_request,
         )
         left_response_p_file = consume_left_response_p_request(
             state, self.run_directory, recipe.name, run_id, incarnation, self.config["host_head"]
         )
+        right_response_p_file = None
+        if left_response_p_file is None:
+            right_response_p_file = consume_right_response_p_request(
+                state, self.run_directory, recipe.name, run_id, incarnation, self.config["host_head"]
+            )
         # Named baseline presets derive fixed native settings from the authenticated
         # recipe and this fresh run identity; experimental nonces are unrelated.
         right_p20_file = None
@@ -1705,6 +1760,8 @@ class ProtectedHostRun:
             host_command.extend(["--am1-right-p20-trial-file", str(right_p20_file)])
         if left_response_p_file is not None:
             host_command.extend(["--am1-left-response-p-trial-file", str(left_response_p_file)])
+        if right_response_p_file is not None:
+            host_command.extend(["--am1-right-response-p-trial-file", str(right_response_p_file)])
         host_environment = {
             k: env[k]
             for k in (
