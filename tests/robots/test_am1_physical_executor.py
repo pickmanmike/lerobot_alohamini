@@ -2729,3 +2729,161 @@ def test_dual_response_requests_refuse_before_either_nonce_or_owned_unit(tmp_pat
     if not broken:
         assert right.read_bytes() == b"right original request"
     assert not list(state.glob("*-used-*"))
+
+
+def initial_empty_real_client(tmp_path, monkeypatch, clock):
+    from lerobot.robots.alohamini import alohamini_client as client_module
+    from lerobot.robots.alohamini.config_alohamini import AlohaMiniClientConfig
+
+    monkeypatch.setattr(client_module, "time", SimpleNamespace(monotonic=lambda: clock[0], perf_counter=time.perf_counter))
+    client = client_module.AlohaMiniClient(AlohaMiniClientConfig(
+        remote_ip="127.0.0.1", robot_model="alohamini1", cameras={}, calibration_dir=tmp_path))
+    client._is_connected = True  # Existing handshake establishes availability without populating decoded cache.
+    monkeypatch.setattr(client, "_poll_and_get_latest_message", lambda: None)
+    return client
+
+
+def test_initial_empty_real_client_waits_without_inventing_feedback_then_accepts_first_packet(tmp_path, monkeypatch):
+    import json
+
+    m = module()
+    clock = [10.]
+    client = initial_empty_real_client(tmp_path, monkeypatch, clock)
+    for _ in range(2):
+        with pytest.raises(m.FeedbackUnavailable, match="initial"):
+            m.read_physical_sample(client, "run", "host", -1, clock=lambda: clock[0], allow_pending_sample=True)
+        assert client.observation_sequence == 0 and client.latest_am1_local_feedback is None
+        assert client.latest_observation_received_at is None and client.latest_raw_observation_keys == frozenset()
+        clock[0] += .04
+    original = client_sample(now=clock[0])
+    payload = dict(original.get_observation(), _am1_local_feedback=original.latest_am1_local_feedback)
+    client._last_response_request_sent_at = clock[0] - .03
+    monkeypatch.setattr(client, "_poll_and_get_latest_message", lambda: [json.dumps(payload).encode()])
+    actual = m.read_physical_sample(client, "run", "host", -1, clock=lambda: clock[0], allow_pending_sample=True)
+    assert client.observation_sequence == 1 and actual["sequence"] == 5
+    assert actual["ack"] == original.latest_am1_local_feedback
+    assert actual["at"] == pytest.approx(clock[0]-.04)
+
+
+@pytest.mark.parametrize("bad", ["not_pending", "later_read", "previous_float", "sequence", "sequence_bool",
+                                 "missing_sequence", "received", "missing_received", "request_age", "raw_keys",
+                                 "cached_state", "missing_raw_keys", "received_without_marker", "parse", "marker_version", "foreign"])
+def test_initial_empty_grace_never_accepts_received_or_ambiguous_feedback(tmp_path, monkeypatch, bad):
+    import json
+
+    m = module()
+    clock = [10.]
+    client = initial_empty_real_client(tmp_path, monkeypatch, clock)
+    previous, pending = -1, True
+    if bad == "not_pending":
+        pending = False
+    elif bad == "later_read":
+        previous = 0
+    elif bad == "previous_float":
+        previous = -1.
+    elif bad == "sequence":
+        client._observation_sequence = 1
+    elif bad == "sequence_bool":
+        client._observation_sequence = False
+    elif bad == "missing_sequence":
+        del client._observation_sequence
+    elif bad == "received":
+        client._latest_observation_received_at = 10.
+    elif bad == "missing_received":
+        del client._latest_observation_received_at
+    elif bad == "request_age":
+        client._latest_observation_roundtrip_age_s = 0.
+    elif bad == "raw_keys":
+        client._latest_raw_observation_keys = frozenset(JOINT_KEYS)
+    elif bad == "missing_raw_keys":
+        del client._latest_raw_observation_keys
+    elif bad == "cached_state":
+        client.last_remote_state = {"arm_left_elbow_flex.pos": 0.}
+    elif bad == "parse":
+        monkeypatch.setattr(client, "_poll_and_get_latest_message", lambda: [b"{malformed"])
+    else:
+        payload = dict.fromkeys(JOINT_KEYS, 7.)
+        if bad == "marker_version":
+            payload["_am1_local_feedback"] = {"version": 0}
+        elif bad == "foreign":
+            payload["_am1_local_feedback"] = client_sample(run_id="foreign").latest_am1_local_feedback
+        client._last_response_request_sent_at = 9.99
+        monkeypatch.setattr(client, "_poll_and_get_latest_message", lambda: [json.dumps(payload).encode()])
+    with pytest.raises(ValueError):
+        m.read_physical_sample(client, "run", "host", previous, clock=lambda: clock[0], allow_pending_sample=pending)
+
+
+@pytest.mark.parametrize("outcome", ["first_packet", "original_deadline", "stop"])
+def test_initial_empty_real_client_worker_keeps_startup_hold_deadline_and_cancellation(tmp_path, monkeypatch, outcome):
+    import json
+
+    from examples.alohamini.am1_session_contract import RECIPES
+
+    m = module()
+    clock = [10.]
+    client = initial_empty_real_client(tmp_path, monkeypatch, clock)
+
+    class InitialHost(ControlledHost):
+        valid = False
+        admitted_at = None
+
+        def send(self, action):
+            super().send(action)
+            if action["_am1_local_control"].get("live_admitted"):
+                if self.admitted_at is None:
+                    self.admitted_at = clock[0]
+                self.marker["live_input"] = {"live_admitted_at_monotonic_s": self.admitted_at,
+                                             "live_deadline_monotonic_s": self.admitted_at + 300.}
+
+        def poll(self, previous):
+            if self.valid:
+                clock[0] += .05
+                self.sequence += 1
+                stamp = clock[0]
+                marker = dict(self.marker, version=1, observation_id=self.sequence,
+                              run_id=self.run_id, host_incarnation=self.incarnation,
+                              read_started_at_monotonic_s=stamp-.01, acquired_at_monotonic_s=stamp)
+                payload = dict(dict.fromkeys(JOINT_KEYS, 7.), _am1_local_feedback=marker)
+                client._last_response_request_sent_at = stamp-.02
+                monkeypatch.setattr(client, "_poll_and_get_latest_message", lambda: [json.dumps(payload).encode()])
+            return m.read_physical_sample(client, self.run_id, self.incarnation, previous,
+                                          clock=lambda: clock[0], allow_pending_sample=True)
+
+    host = InitialHost()
+    e = executor(host)
+    e.clock = lambda: clock[0]
+    recipe = RECIPES["physical-live-teleop"]
+    e.bind_run("run", recipe)
+    original_deadline = e.evidence()["lifecycle"]["startup_deadline"]
+    assert e.begin(recipe)
+    try:
+        until(lambda: bool(host.actions) or not e.worker.is_alive())
+        assert e.worker.is_alive() and e.evidence()["fault"] is None
+        assert e.evidence()["lifecycle"]["native_live_at"] is None
+        assert not e.evidence()["feedback"] and not e.evidence()["pose_aligned"]
+        assert all(set(action) == set(m.ZERO_BODY) | {"_am1_local_control"} for action in host.actions)
+        assert all(action["_am1_local_control"]["mode"] == "pause" for action in host.actions)
+        assert all(all(action[key] == 0 for key in m.ZERO_BODY) for action in host.actions)
+        if outcome == "first_packet":
+            host.valid = True
+            e._wake.set()
+            until(lambda: e.evidence()["lifecycle"]["phase"] == "live")
+            assert e.evidence()["hold_acknowledged"] and e.evidence()["pose_aligned"]
+            assert e.evidence()["feedback"] and client.observation_sequence > 0
+            assert e.evidence()["fault"] is None
+        elif outcome == "original_deadline":
+            clock[0] = original_deadline
+            e._wake.set()
+            until(lambda: not e.worker.is_alive())
+            assert e.evidence()["lifecycle"]["native_live_at"] is None
+            assert e.evidence()["fault"] == "RuntimeError: physical startup deadline expired"
+        else:
+            e.finish("stopped")
+            e.worker.join(2)
+            assert not e.worker.is_alive() and e.evidence()["fault"] is None
+            assert e.evidence()["lifecycle"]["native_live_at"] is None
+        assert e.evidence()["lifecycle"]["startup_deadline"] == original_deadline
+    finally:
+        e.close()
+        e.worker.join(2)
+        assert not e.worker.is_alive() and host.finished == 1

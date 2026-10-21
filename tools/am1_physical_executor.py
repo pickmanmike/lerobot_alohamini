@@ -234,6 +234,19 @@ def read_physical_sample(
     observation = client.get_observation()
     now = clock()
     marker = client.latest_am1_local_feedback
+    if allow_pending_sample and type(previous_sequence) is int and previous_sequence == -1 and marker is None:
+        received_sequence = getattr(client, "observation_sequence", ...)
+        raw_keys = getattr(client, "latest_raw_observation_keys", ...)
+        if (type(received_sequence) is int and received_sequence == 0
+                and getattr(client, "latest_observation_received_at", ...) is None
+                and getattr(client, "latest_observation_roundtrip_age_s", ...) is None
+                and getattr(client, "latest_observation_error", ...) is None
+                and type(raw_keys) is frozenset and not raw_keys
+                and type(observation) is dict and not observation):
+            # Connect's availability handshake leaves this cache empty. No first
+            # packet may supply feedback/ACK/Live credit; the existing worker
+            # retries in hold under its original startup deadline and Stop fence.
+            raise FeedbackUnavailable("initial native observation not yet received")
     if not isinstance(marker, dict) or marker.get("version") != 1:
         raise ValueError("protected host feedback marker missing")
     if marker.get("run_id") != run_id or marker.get("host_incarnation") != host_incarnation:
