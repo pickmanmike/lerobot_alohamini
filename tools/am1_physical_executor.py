@@ -248,7 +248,27 @@ def read_physical_sample(
             # retries in hold under its original startup deadline and Stop fence.
             raise FeedbackUnavailable("initial native observation not yet received")
     if not isinstance(marker, dict) or marker.get("version") != 1:
-        raise ValueError("protected host feedback marker missing")
+        def diagnostic_scalar(value, *, integer_only=False):
+            if type(value) is int and -(1 << 63) <= value < (1 << 63):
+                return value
+            if not integer_only and (value is None or type(value) is float and math.isfinite(value)):
+                return value
+            return {"available": value is not ..., "type": "missing" if value is ... else type(value).__name__[:48]}
+
+        raw_keys = getattr(client, "latest_raw_observation_keys", ...)
+        parse_error = getattr(client, "latest_observation_error", ...)
+        context = {
+            "observation_sequence": diagnostic_scalar(getattr(client, "observation_sequence", ...), integer_only=True),
+            "received_at": diagnostic_scalar(getattr(client, "latest_observation_received_at", ...)),
+            "request_age_s": diagnostic_scalar(getattr(client, "latest_observation_roundtrip_age_s", ...)),
+            "parse_error": parse_error[:160] if type(parse_error) is str else diagnostic_scalar(parse_error),
+            "raw_key_count": len(raw_keys) if type(raw_keys) is frozenset else diagnostic_scalar(raw_keys, integer_only=True),
+            "marker_key_present": "_am1_local_feedback" in raw_keys if type(raw_keys) is frozenset else None,
+            "returned_key_count": len(observation) if type(observation) is dict else diagnostic_scalar(observation, integer_only=True),
+            "marker_type": type(marker).__name__[:48],
+            "marker_version": diagnostic_scalar(marker.get("version", ...)) if type(marker) is dict else diagnostic_scalar(...),
+        }
+        raise ValueError("protected host feedback marker missing; context=" + json.dumps(context, sort_keys=True, separators=(",", ":")))
     if marker.get("run_id") != run_id or marker.get("host_incarnation") != host_incarnation:
         raise ValueError("foreign protected host feedback binding")
     sequence = marker.get("observation_id")

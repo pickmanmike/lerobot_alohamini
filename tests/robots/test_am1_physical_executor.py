@@ -2767,7 +2767,7 @@ def test_initial_empty_real_client_waits_without_inventing_feedback_then_accepts
 
 @pytest.mark.parametrize("bad", ["not_pending", "later_read", "previous_float", "sequence", "sequence_bool",
                                  "missing_sequence", "received", "missing_received", "request_age", "raw_keys",
-                                 "cached_state", "missing_raw_keys", "received_without_marker", "parse", "marker_version", "foreign"])
+                                 "cached_state", "missing_raw_keys", "received_without_marker", "parse", "marker_version", "foreign", "process_long"])
 def test_initial_empty_grace_never_accepts_received_or_ambiguous_feedback(tmp_path, monkeypatch, bad):
     import json
 
@@ -2809,8 +2809,32 @@ def test_initial_empty_grace_never_accepts_received_or_ambiguous_feedback(tmp_pa
             payload["_am1_local_feedback"] = client_sample(run_id="foreign").latest_am1_local_feedback
         client._last_response_request_sent_at = 9.99
         monkeypatch.setattr(client, "_poll_and_get_latest_message", lambda: [json.dumps(payload).encode()])
-    with pytest.raises(ValueError):
+        if bad == "process_long":
+            def fail_processing(*args):
+                raise RuntimeError("x" * 500)
+            monkeypatch.setattr(client, "_remote_state_from_obs", fail_processing)
+    with pytest.raises(ValueError) as caught:
         m.read_physical_sample(client, "run", "host", previous, clock=lambda: clock[0], allow_pending_sample=pending)
+    if bad != "foreign":
+        message = str(caught.value)
+        assert message.startswith("protected host feedback marker missing; context=")
+        context = json.loads(message.split("; context=", 1)[1])
+        assert context["marker_type"] == ("dict" if bad == "marker_version" else "NoneType")
+        assert set(context) == {"observation_sequence", "received_at", "request_age_s", "parse_error",
+                               "raw_key_count", "marker_key_present", "returned_key_count", "marker_type", "marker_version"}
+        if bad == "received_without_marker":
+            assert context["observation_sequence"] == 1 and context["received_at"] == 10.
+            assert context["raw_key_count"] == len(JOINT_KEYS) and context["marker_key_present"] is False
+            assert context["returned_key_count"] > 0 and context["parse_error"] is None
+        elif bad == "parse":
+            assert context["observation_sequence"] == 0 and context["received_at"] is None
+            assert context["parse_error"] == "remote observation message could not be parsed"
+            assert context["raw_key_count"] == context["returned_key_count"] == 0
+        elif bad == "missing_sequence":
+            assert context["observation_sequence"]["available"] is False
+        elif bad == "process_long":
+            assert len(context["parse_error"]) == 160 and context["parse_error"].startswith("RuntimeError: ")
+            assert len(message) < 1500
 
 
 @pytest.mark.parametrize("outcome", ["first_packet", "original_deadline", "stop"])
