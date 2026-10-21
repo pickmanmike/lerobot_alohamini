@@ -23,6 +23,12 @@ material ambiguity remains. Bind sparse evidence to side/bus plus ID, retain dev
 protections and original times, and do not infer external torque from drive duty.
 Use the existing sole owner/runner and a minimal reviewed two-elbow reader extension.
 No new gain sweep, general telemetry/UI, all-motor commissioning, disassembly or merge.
+The current declared peer exercise uses52raw counts (4.5703125encoder degrees),
+16producer-active seconds per side, under the existing finite ceiling. Fresh measured
+references/endpoints must fit retained workspaces; do not clamp or ratchet them.
+The owner-authorized predetermined-bench presentation policy may be explicitly
+selected before these runs; actual required local images/feedback remain mandatory.
+Keep ordinary required-view operation and this advisory-view bench result separate.
 
 Current operation-first authority (PR25 comment6258758730 and the owner's
 continuation mandate) permits bounded repeated virtual-leader bench operation,

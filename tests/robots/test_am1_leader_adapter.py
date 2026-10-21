@@ -2336,7 +2336,7 @@ def test_original_recovery_ceiling_includes_authenticated_read_time_without_rean
     asyncio.run(asyncio.wait_for(scenario(), 0.3))
 
 
-@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_view_reconnect", "grant_view_switch", "connect_view_reconnect", "release_view_reconnect", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "held_qualification_loss", "resume_alignment_refusal", "resume_alignment_refused_twice", "runner_initial_cursor_pending", "resume_reply_timeout_pre", "resume_reply_timeout_post", "resume_reply_timeout_alignment", "resume_reply_timeout_alignment_persistent", "acquisition_input_pause", "receipt_ack_starvation", "ack_never_returns", "ack_close_cancel", "transport_blackout_hb1", "transport_blackout_hb2", "transport_blackout_long", "initial_ack_timely", "initial_ack_missing", "connect_receipt_fast", "connect_receipt_delayed", "connect_receipt_missing", "connect_receipt_late", "connect_receipt_caller_ceiling", "connect_receipt_input", "connect_receipt_grant", "renew_receipt_cost", "renew_receipt_cost_expired", "bench_reacquire", "bench_reacquire_receipt_lost", "bench_reacquire_receipt_cancelled", "bench_input_receipt_unknown_native", "bench_input_receipt_unknown_pause", "grant_close_timeout", "grant_close_timeout_pause", "grant_close_timeout_takeover", "grant_close_timeout_cancel", "resume_send_pre", "resume_send_post", "resume_send_pause", "resume_send_takeover", "resume_send_stop", "resume_send_cancel", "resume_send_budget", "resume_send_reboot", "bench_finish_hold", "bench_finish_no_ack", "bench_finish_stale_revision", "bench_finish_body_nonzero", "bench_finish_fault", "bench_finish_external_pause", "bench_finish_stop", "bench_finish_takeover", "bench_finish_reboot", "bench_finish_cancel", "bench_finish_pause_unknown", "bench_finish_budget", "bench_finish_native_ceiling", "bench_finish_strict", "normal_finish_hold", "normal_finish_no_ack", "normal_finish_stale_revision", "normal_finish_body_nonzero", "normal_finish_fault", "normal_finish_external_pause", "normal_finish_stop", "normal_finish_takeover", "normal_finish_reboot", "normal_finish_cancel", "normal_finish_pause_unknown", "normal_finish_budget", "normal_finish_native_ceiling", "normal_finish_view_before", "normal_finish_view_after", "ordinary_lease_dispatch_stall", "ordinary_lease_expired", "ordinary_start_late_first_renewal"])
+@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_view_reconnect", "grant_view_switch", "connect_view_reconnect", "release_view_reconnect", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "held_qualification_loss", "resume_alignment_refusal", "resume_alignment_refused_twice", "runner_initial_cursor_pending", "resume_reply_timeout_pre", "resume_reply_timeout_post", "resume_reply_timeout_alignment", "resume_reply_timeout_alignment_persistent", "acquisition_input_pause", "receipt_ack_starvation", "ack_never_returns", "ack_close_cancel", "transport_blackout_hb1", "transport_blackout_hb2", "transport_blackout_long", "initial_ack_timely", "initial_ack_missing", "connect_receipt_fast", "connect_receipt_delayed", "connect_receipt_missing", "connect_receipt_late", "connect_receipt_caller_ceiling", "connect_receipt_input", "connect_receipt_grant", "renew_receipt_cost", "renew_receipt_cost_expired", "bench_reacquire", "bench_reacquire_receipt_lost", "bench_reacquire_receipt_cancelled", "bench_input_receipt_unknown_native", "bench_input_receipt_unknown_pause", "grant_close_timeout", "grant_close_timeout_pause", "grant_close_timeout_takeover", "grant_close_timeout_cancel", "resume_send_pre", "resume_send_post", "resume_send_pause", "resume_send_takeover", "resume_send_stop", "resume_send_cancel", "resume_send_budget", "resume_send_reboot", "bench_finish_hold", "bench_finish_no_ack", "bench_finish_stale_revision", "bench_finish_body_nonzero", "bench_finish_fault", "bench_finish_external_pause", "bench_finish_stop", "bench_finish_takeover", "bench_finish_reboot", "bench_finish_cancel", "bench_finish_pause_unknown", "bench_finish_budget", "bench_finish_native_ceiling", "bench_finish_strict", "normal_finish_hold", "normal_finish_no_ack", "normal_finish_stale_revision", "normal_finish_body_nonzero", "normal_finish_fault", "normal_finish_external_pause", "normal_finish_stop", "normal_finish_takeover", "normal_finish_reboot", "normal_finish_cancel", "normal_finish_pause_unknown", "normal_finish_budget", "normal_finish_native_ceiling", "normal_finish_view_before", "normal_finish_view_after", "ordinary_lease_dispatch_stall", "ordinary_lease_expired", "ordinary_start_late_first_renewal", "peer_start_normal", "peer_start_bench", "peer_bench_unqualified_view", "peer_bench_local_loss", "peer_normal_unqualified_view"])
 def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(tmp_path, monkeypatch, cause):
     import asyncio
     import copy
@@ -2451,7 +2451,7 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
         gateway = Gateway(owner.directory, tmp_path / "auth")
         enrolled = gateway.auth.enroll(gateway.auth.pair(control=True))
         a.controller["device_id"] = a.connection["device_id"] = enrolled["device_id"]
-        if cause.startswith(("bench_reacquire", "bench_input_receipt_unknown", "grant_close_timeout", "resume_send_", "bench_finish_")):
+        if cause.startswith(("bench_reacquire", "bench_input_receipt_unknown", "grant_close_timeout", "resume_send_", "bench_finish_", "peer_bench_")):
             a.run.update(bench_continuity=True, control_intent={"eligible": True,
                 "device_id": enrolled["device_id"], "controller_generation": ids["controller_generation"],
                 "service_incarnation": a.service_incarnation, "start_operation_id": a.run["operation_id"]})
@@ -2506,6 +2506,26 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                     return original_ws_connect(*args, **kwargs)
                 monkeypatch.setattr(client.http, "ws_connect", fixture_heartbeat)
             await client.attach()
+            if cause in {"peer_start_normal", "peer_start_bench"}:
+                bench = cause == "peer_start_bench"
+                selected = m._peer_options("left-peer-maintained", "left", -1, 52, bench=bench)
+                assert selected == {"side": "left", "direction_raw": -1, "raw_step": 52}
+                client.generation = ids["controller_generation"]
+                idle = copy.deepcopy(e.evidence())
+                e.evidence = lambda: copy.deepcopy(idle)
+                begun = []
+                e.begin = lambda recipe: begun.append(recipe) or True
+                a.run = None
+                start_body = {"operation_id": str(uuid4()), "recipe": "physical-live-teleop",
+                              "controller_generation": client.generation, "bench_continuity": bench}
+                receipt = await client.post("start", start_body)
+                assert receipt["accepted"] is True and a.run["operation_id"] == start_body["operation_id"]
+                assert a.run["bench_continuity"] is bench and a.run["status"] == "starting"
+                assert a._controller_lease_seconds() == (6. if bench else 3.)
+                assert bool(a.run.get("control_intent")) is bench
+                assert [recipe.name for recipe in begun] == ["physical-live-teleop"]
+                assert not any(op in {"grant", "input", "resume"} for op, _ in commands)
+                return
             if cause == "ordinary_start_late_first_renewal":
                 client.generation, client.connection = ids["controller_generation"], ids["connection_generation"]
                 idle_evidence, pi_now, begun = copy.deepcopy(e.evidence()), [10.], []
@@ -2532,6 +2552,31 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                 assert not any(event["kind"] == "presence_expired" for event in a.events)
                 return
             client.generation, client.connection = ids["controller_generation"], ids["connection_generation"]
+            if cause in {"peer_bench_unqualified_view", "peer_bench_local_loss", "peer_normal_unqualified_view"}:
+                bench = cause.startswith("peer_bench_")
+                assert m._peer_options("left-peer-maintained", "left", -1, 52, bench=bench)
+                a._teleop_view = None
+                if cause == "peer_bench_local_loss":
+                    original_evidence = e.evidence
+                    def missing_local_camera():
+                        return dict(original_evidence(), required_observation=False)
+                    e.evidence = missing_local_camera
+                client.snapshot = (await client.get("state"))["snapshot"]
+                view = m._live(client.snapshot)["required_view"]
+                assert view["qualified"] is False and view["required"] is (not bench)
+                guard = m.SameRunRecovery(client, record)
+                if cause == "peer_bench_unqualified_view":
+                    await guard.resume()
+                    assert a.run["status"] == "running" and e.desired == "active"
+                    assert m._view_admitted(client.snapshot) is True
+                    assert client.snapshot["evidence"]["required_observation"] is True
+                else:
+                    with pytest.raises(TimeoutError):
+                        await asyncio.wait_for(guard.resume(), .15)
+                    assert e.desired != "active"
+                    assert not any(op in {"grant", "input", "resume"} for op, _ in commands)
+                assert a.run["native_live_at"] == 9. and a.run["deadline"] == 309.
+                return
             if cause.startswith("bench_input_receipt_unknown"):
                 guard = m.SameRunRecovery(client, record)
                 original = copy.deepcopy(guard.original)
@@ -8941,7 +8986,7 @@ def test_peer_maintained_rejoin_keeps_absolute_geometry_and_no_dwell_reset(side,
     assert task.plan()["reference"] == native["reference"]
 
 
-@pytest.mark.parametrize("fault", [None, "missing", "mismatched", "old_segment", "bench"])
+@pytest.mark.parametrize("fault", [None, "missing", "mismatched", "old_segment"])
 def test_peer_maintained_cli_requires_explicit_prestart_selection(monkeypatch, fault):
     m = adapter()
     seen = []
@@ -8979,8 +9024,6 @@ def test_peer_maintained_cli_requires_explicit_prestart_selection(monkeypatch, f
         argv[argv.index("--peer-side") + 1] = "right"
     elif fault == "old_segment":
         argv[argv.index("--workload-segment") + 1] = "left-maintained"
-    elif fault == "bench":
-        argv.append("--bench-continuity")
     if fault:
         with pytest.raises(SystemExit):
             m.main(argv)
@@ -9060,3 +9103,22 @@ def test_peer_maintained_run_refuses_invalid_prestart_selection_before_output_or
     with pytest.raises(ValueError, match="matching side"):
         asyncio.run(m.run(args))
     assert not output.exists()
+
+
+@pytest.mark.parametrize("side,bench", [("left", False), ("right", False), ("left", True), ("right", True)])
+def test_peer_maintained_cli_explicit_bench_keeps_ordinary_default(monkeypatch, side, bench):
+    m = adapter()
+    seen = []
+    async def run(args):
+        seen.append(args)
+        return {}
+    monkeypatch.setattr(m, "run", run)
+    argv = ["--source", "virtual-leaders", "--url", "unused", "--ca", "unused", "--storage-state", "unused",
+            "--output", "unused", "--workload-segment", side + "-peer-maintained", "--duration-seconds", "16",
+            "--peer-side", side, "--peer-direction", "-1" if side == "left" else "1", "--peer-raw-step", "52"]
+    if bench:
+        argv.append("--bench-continuity")
+    m.main(argv)
+    assert len(seen) == 1 and seen[0].bench_continuity is bench
+    assert seen[0].workload_segment == side + "-peer-maintained" and seen[0].peer_raw_step == 52
+    assert seen[0].interrupt_at_seconds is None and seen[0].next_start_seconds is None

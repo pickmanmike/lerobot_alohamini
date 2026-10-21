@@ -68,8 +68,8 @@ def _peer_options(segment, side, direction, raw_step, *, bench=False, next_start
             raise ValueError("peer options require an explicitly selected peer segment")
         return None
     if (side != segment.split("-", 1)[0] or type(direction) is not int or direction not in (-1, 1)
-            or type(raw_step) is not int or not 1 <= raw_step <= 79 or bench or next_start is not None):
-        raise ValueError("peer profile requires matching side, raw direction, explicit1..79tick excursion and normal finite mode")
+            or type(raw_step) is not int or not 1 <= raw_step <= 79 or next_start is not None):
+        raise ValueError("peer profile requires matching side, raw direction, explicit1..79tick excursion and finite mode")
     return {"side": side, "direction_raw": direction, "raw_step": raw_step}
 
 
