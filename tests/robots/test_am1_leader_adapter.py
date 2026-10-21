@@ -728,6 +728,7 @@ def test_real_wss_clean_close_ends_qualified_wait_before_timeout(tmp_path):
         "bench_terminal_hold_stopped", "bench_terminal_hold_cancel", "bench_terminal_hold_budget",
         "bench_terminal_hold_native_ceiling",
         "bench_program_finish", "bench_program_finish_failed",
+        "peer_fixed_baseline_ready", "peer_fixed_baseline_missing", "peer_fixed_baseline_native", "peer_fixed_baseline_blocked",
         "normal_program_finish", "normal_program_finish_failed", "normal_program_finish_combined_body",
         "normal_program_finish_left_maintained", "normal_program_finish_left_reach", "normal_program_finish_left_supported", "normal_program_finish_left_opposite", "usb_finite_finish", "usb_finite_finish_failed", "usb_quit_finish", "usb_quit_empty_finish",
     ],
@@ -741,6 +742,8 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
 
     m = adapter()
     production_post = m.SessionClient.post
+    peer_wait_case = isinstance(failure, str) and failure.startswith("peer_fixed_baseline_")
+    peer_template = peer_baseline_state(peer_workspace()) if peer_wait_case else None
     initial_pause_case = failure == "initial_resume_pause"
     terminal_hold = isinstance(failure, str) and failure.startswith("bench_terminal_hold_")
     normal_finish = isinstance(failure, str) and failure.startswith(("normal_program_finish", "usb_finite_finish", "usb_quit_"))
@@ -920,12 +923,14 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
             await asyncio.Event().wait()
 
         def state(self, run_id):
-            w = workspace()
+            w = peer_workspace() if peer_wait_case else workspace()
+            if peer_wait_case:
+                w["reference"]["arm_left_elbow_flex.pos"] = m.normalized_raw(2043, w["calibration"]["arm_left_elbow_flex"])
             if failure == "normal_program_finish_left_supported":
                 w["bounds"]["arm_left_shoulder_lift.pos"]["rate_per_s"] = 3.
             if failure == "normal_program_finish_left_opposite":
                 w["bounds"]["arm_left_elbow_flex.pos"]["rate_per_s"] = 3.
-            return {
+            value = {
                 "service_incarnation": "service",
                 "controller": {"device_id": "device", "controller_generation": "control"},
                 "run": {
@@ -967,6 +972,16 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                     "measured_body": {"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0, "lift_axis.vel": 0},
                 },
             }
+
+            if peer_wait_case:
+                value["service_incarnation"] = peer_template["service_incarnation"]
+                value["run"]["backend_incarnation"] = peer_template["run"]["backend_incarnation"]
+                if failure == "peer_fixed_baseline_native":
+                    value["run"]["remaining_s"] = .12
+                value["evidence"].update(copy.deepcopy(peer_template["evidence"]))
+                value["evidence"]["accepted_host_action"]["run_id"] = run_id
+                value["evidence"]["accepted_host_action"].pop("teleop_elbow_settings")
+            return value
 
         async def post(self, op, payload):
             if op == "start":
@@ -1209,6 +1224,14 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 return {"accepted": True, "grant_id": str(uuid4()), "expires": 99.0}
             assert payload["op"] == "input"
             self.inputs.append(copy.deepcopy(payload))
+            if peer_wait_case:
+                if failure == "peer_fixed_baseline_blocked":
+                    await asyncio.sleep(10.)  # The one original baseline ceiling must cancel an in-flight receipt wait.
+                await asyncio.sleep(.03)  # Actual102-shaped asynchronous Native proof follows accepted reference holds.
+                if failure == "peer_fixed_baseline_ready" and len(self.inputs) >= 3:
+                    self.snapshot["evidence"]["accepted_host_action"]["teleop_elbow_settings"] = copy.deepcopy(
+                        peer_template["evidence"]["accepted_host_action"]["teleop_elbow_settings"])
+
             if mailbox_case and self.authoritative is None and len(self.inputs) == (
                 2 if failure in {"mailbox_zero", "mailbox_zero_budget"} else 1
             ):
@@ -1280,6 +1303,8 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
             self.snapshot["run"]["live_input"].update(
                 last_input_seq=payload["seq"], source=payload["source"], body=payload["body"]
             )
+            if peer_wait_case and "teleop_elbow_settings" not in self.snapshot["evidence"]["accepted_host_action"]:
+                self.snapshot["run"]["live_input"].update(last_input_seq=-1, source=None, state="held", accepted_at=None)
             self.snapshot["evidence"]["measured_positions"] = payload["target"]
             if terminal_hold:
                 self.snapshot["evidence"]["active_acknowledged"] = True
@@ -1410,6 +1435,42 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
         args.duration_seconds = 0.03
     if foreign_boundary:
         args.next_start_seconds = 0.001
+    if peer_wait_case:
+        import json
+        args.source, args.next_start_seconds, args.duration_seconds = "virtual-leaders", None, .05
+        args.workload_segment, args.peer_side, args.peer_direction, args.peer_raw_step = "left-peer-fixed", "left", -1, 52
+        if failure == "peer_fixed_baseline_ready":
+            summary = asyncio.run(asyncio.wait_for(m.run(args), 5))
+        else:
+            with pytest.raises(TimeoutError, match="baseline"):
+                asyncio.run(asyncio.wait_for(m.run(args), 5))
+            summary = json.loads((tmp_path / "evidence/summary.json").read_text())
+        records = [json.loads(line) for line in (tmp_path / "evidence/frames.jsonl").read_text().splitlines()]
+        frames = [r for r in records if r["event"] == "leader_frame"]
+        verified = next((r for r in records if r["event"] == "peer_baseline_settings_verified"), None)
+        held = [r for r in frames if verified is None or r["local_monotonic_s"] < verified["local_monotonic_s"]]
+        assert len(held) >= (0 if failure.endswith("blocked") else 1 if failure.endswith("native") else 3)
+        assert all(r["progress_s"] == 0. for r in held)
+        assert all(r["frame"]["target"] == summary["workspace"]["reference"] for r in held)
+        assert all(r["frame"]["body"] == m.ZERO_BODY for r in frames)
+        if frames:
+            assert frames[0]["receipt"]["accepted"] is True
+            assert frames[0]["native"]["run"]["live_input"]["last_input_seq"] == -1
+            assert frames[0]["native"]["run"]["live_input"]["source"] is None
+        assert records[0]["peer_baseline_qualification_budget_seconds"] == 2.
+        assert [r["frame"]["source"]["sample_seq"] for r in frames] == list(range(1, len(frames)+1))
+        assert len({r["grant"]["grant_id"] for r in frames}) == len(frames)
+        assert all(0 <= r["frame"]["source"]["sent_at_monotonic_s"]-r["frame"]["source"]["acquired_at_monotonic_s"] < .25 for r in frames)
+        assert summary["peer_baseline_qualification_seconds"] >= .06
+        assert summary["original_native_deadline"] == 301. and instances[0].stops == [owned_id]
+        if verified:
+            assert .05 <= summary["active_progress_s"] <= .15  # One retained max .1s advancement may cross the .05s fixture end.
+            assert summary["peer_baseline_qualified"] is True
+        else:
+            assert summary["active_progress_s"] == 0. and not summary["producer_program_complete"]
+            assert summary["peer_baseline_qualified"] is False
+            assert (.09 if failure.endswith("native") else 1.95) <= summary["peer_baseline_qualification_seconds"] < (.3 if failure.endswith("native") else 2.5)
+        return
     if bench_case:
         import json
         args.source, args.next_start_seconds, args.duration_seconds = "virtual-leaders", None, .001

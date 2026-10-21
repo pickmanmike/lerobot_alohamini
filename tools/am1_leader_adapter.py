@@ -3288,6 +3288,7 @@ async def run(args):
             {"event": "start_requested", "operation_id": start_body["operation_id"], "recipe": TELEOP_RECIPE,
              "bench_continuity": bench, "view_policy": summary["view_policy"], "workload_segment": segment,
              **({"peer_selection": peer} if peer else {}),
+             **({"peer_baseline_qualification_budget_seconds": 2.} if peer and "fixed_start_raw" in peer else {}),
              "terminal_qualification_budget_seconds": terminal_budget,
              "terminal_completion_policy": summary["terminal_completion_policy"],
              "program_active_seconds": {"full": 172.5, "combined": 12., "body": 4.5, "continuity": 24., "combined-body": 64.5, **SelectedLeftWorkload.DURATIONS}[segment] if args.source == "virtual-leaders" else None,
@@ -3697,9 +3698,13 @@ async def run(args):
                 workload.admit(time.monotonic())
             active_at = time.monotonic()
         last_phase = None
+        peer_baseline_started = peer_baseline_until = None
         while True:
-            if bench and await ensure_authority():
-                await rejoin()
+            if peer_baseline_until is not None and time.monotonic() >= peer_baseline_until:
+                summary["peer_baseline_qualification_seconds"] = time.monotonic() - peer_baseline_started
+                raise TimeoutError("peer baseline original qualification ceiling exhausted")
+            if bench and await ensure_authority(until=peer_baseline_until):
+                await rejoin(until=peer_baseline_until)
             if renewal.done():
                 renewal.result()
             state = acquisition_state()
@@ -3713,7 +3718,7 @@ async def run(args):
                 if workload is None and not args.next_start_seconds:
                     summary["clean_input_end"] = "duration_elapsed"
                 break
-            if not await qualify_acquisition(state):
+            if not await qualify_acquisition(state, until=peer_baseline_until):
                 continue
             if (
                 args.interrupt_at_seconds is not None
@@ -3731,12 +3736,12 @@ async def run(args):
                 await client.detach()
                 await asyncio.sleep(args.interruption_seconds)
                 if bench:
-                    await ensure_authority(force=True)
+                    await ensure_authority(force=True, until=peer_baseline_until)
                 else:
                     await client.attach()
                     await client.claim()
                     renewal = asyncio.create_task(client.renew())
-                await rejoin()
+                await rejoin(until=peer_baseline_until)
                 record(
                     {
                         "event": "qualified_reattachment",
@@ -3748,9 +3753,28 @@ async def run(args):
                 state = acquisition_state()  # Rejoin may have replaced the earlier snapshot.
                 previous = workload.peer_baseline
                 previous_start = workload.comparison_start_observation
+                if workload.fixed and previous is None:
+                    now = time.monotonic()
+                    if peer_baseline_started is None:
+                        remaining = state["run"].get("remaining_s")
+                        if type(remaining) not in (int, float) or not math.isfinite(remaining) or remaining <= 0:
+                            raise RuntimeError("peer baseline original Native time unavailable")
+                        peer_baseline_started, peer_baseline_until = now, now + min(2., remaining)
+                        summary.update(peer_baseline_qualified=False, peer_baseline_qualification_seconds=0.,
+                                       peer_baseline_qualification_budget_seconds=2.)
+                        record({"event": "peer_baseline_qualification_started", "progress_s": workload.elapsed_s,
+                                "original_ceiling_monotonic_s": peer_baseline_until})
+                    workload.freeze()  # Fresh q0 holds cannot consume any preparation/dwell time.
+                    summary["peer_baseline_qualification_seconds"] = now - peer_baseline_started
                 workload.observe_peer_baseline(state)
                 workload.require_peer_baseline()
                 if previous is None and workload.peer_baseline is not None:
+                    if workload.fixed:
+                        now = time.monotonic()
+                        summary.update(peer_baseline_qualified=True,
+                                       peer_baseline_qualification_seconds=now - peer_baseline_started)
+                        peer_baseline_until = None
+                        workload.admit(now)  # Start at zero with no wait-time catch-up.
                     record({"event": "peer_baseline_settings_verified", "binding": workload.peer_baseline,
                             "peer_selection": peer})
                 if previous_start is None and workload.comparison_start_observation is not None:
@@ -3791,32 +3815,36 @@ async def run(args):
                 record({"event": "body_velocity_precedence", "original": original_body, "sent": body})
             acquisition_started = time.monotonic()
             try:
-                sent = await send_leader_sample(
-                    client,
-                    producer,
-                    body,
-                    record,
-                    phase=phase,
-                    progress_s=workload.elapsed_s if workload else None,
-                )
+                async with asyncio.timeout_at(peer_baseline_until) as baseline_budget:
+                    sent = await send_leader_sample(
+                        client,
+                        producer,
+                        body,
+                        record,
+                        phase=phase,
+                        progress_s=workload.elapsed_s if workload else None,
+                    )
             except (TimeoutError, ConnectionError) as error:
+                if peer_baseline_until is not None and (baseline_budget.expired() or time.monotonic() >= peer_baseline_until):
+                    summary["peer_baseline_qualification_seconds"] = time.monotonic() - peer_baseline_started
+                    raise TimeoutError("peer baseline original qualification ceiling exhausted") from error
                 if bench and hasattr(error, "input_context"):
-                    await rejoin(input_error=error)
+                    await rejoin(input_error=error, until=peer_baseline_until)
                     continue
                 if not hasattr(error, "grant_context"):
                     raise
-                await rejoin(grant_error=error)
+                await rejoin(grant_error=error, until=peer_baseline_until)
                 continue
             except CommandRefusedError as error:
                 if bench and error.reason == "stale control generation":
-                    await ensure_authority(force=True)
-                    await rejoin()
+                    await ensure_authority(force=True, until=peer_baseline_until)
+                    await rejoin(until=peer_baseline_until)
                     continue
                 mailbox = mailbox_input_refusal(error)
                 if not (recovery_grant_refusal(error) or mailbox):
                     raise
                 await rejoin(require_episode=True, refusal_identity=error.identity,
-                             expected_pause="native_input_expired" if mailbox else None)
+                             expected_pause="native_input_expired" if mailbox else None, until=peer_baseline_until)
                 continue
             if sent is None:
                 if workload:
@@ -3981,6 +4009,8 @@ async def run(args):
         )
     except BaseException as error:
         first_error = error
+        if summary.get("peer_baseline_qualified") is False:
+            summary["peer_baseline_qualification_seconds"] = time.monotonic() - peer_baseline_started
         summary["failure"] = str(error)
         summary["failure_type"] = type(error).__name__
         summary["last_raw_leaders"] = getattr(source, "last_raw", None)
