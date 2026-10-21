@@ -11,7 +11,7 @@ the LEFT elbow servo has NOT been replaced. Suspend swap-first advice/preparatio
 substantial disassembly is not an appropriate diagnostic swap. Replacement requires
 a sufficiently supported likely defect and a later owner decision. PR29 stays
 draft/unmerged; no preceding proposed replacement/integration prompt was sent.
-Current work compares installed LEFT-bus/ID3 and RIGHT-bus/ID3 at their verified
+The current comparison rules use installed LEFT-bus/ID3 and RIGHT-bus/ID3 at their verified
 ordinary P16/I0/D32 baselines, with no gain change. Use measured approximately mirrored
 shoulder/elbow/wrist geometry and equivalent gravity-relative direction, recording
 material differences; raw sign or normalized equality alone does not match load.
@@ -29,6 +29,11 @@ references/endpoints must fit retained workspaces; do not clamp or ratchet them.
 The owner-authorized predetermined-bench presentation policy may be explicitly
 selected before these runs; actual required local images/feedback remain mandatory.
 Keep ordinary required-view operation and this advisory-view bench result separate.
+Actual100/101 completed the pair: left31/52counts outward, right15/52, with verified
+baseline/Goal delivery and certain cleanup. Both undertravel; unequal poses/load
+prevent a common-cause/internal-defect conclusion. Replacement is unsupported.
+Do not repeat the pair or resume swap preparation merely to publish/resume; the
+left final2043 cannot support another unchanged negative52-count command.
 
 Current operation-first authority (PR25 comment6258758730 and the owner's
 continuation mandate) permits bounded repeated virtual-leader bench operation,
