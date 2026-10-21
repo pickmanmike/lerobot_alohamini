@@ -2,6 +2,32 @@
 
 Current owner continuation2026-10-21 ([PR29 comment6309687239](https://github.com/pickmanmike/lerobot_alohamini/pull/29#issuecomment-6309687239)) accepts Actual100/101 and supersedes the earlier peer-only no-gain restriction ONLY for one predeclared P16-versus-temporary-P32 comparison per follower elbow, sequentially, if retained effort/settings support it. Reuse the targeted transaction/restoration machinery, extend it only for right elbow, restore original P16/Lock afterward; I0/D32, motion rate, physical travel, calibration and protections stay unchanged. No P beyond32, integral trial, permanent default, replacement, disassembly or merge. Use each elbow as its own control with fixed absolute endpoints/dwell and streamed preparation; record actual achieved start, never clamp/shrink/recenter or require manual exact reset. Continue the existing short unloaded action when useful response supports it. One existing camera-only sequence distinguishes source/attachment/decoder from dark/occluded scene, with the enrolled software-decoder profile and one capture owner. Prior lighting action is complete; no generic lighting request or unsupported network attribution. The existing explicitly selected advisory-view bench policy remains available, never a normal human-view qualification. Earlier peer-only restrictions/results below remain historical where this authority differs.
 
+Current result: the authorized paired comparisons and supported short action are complete.
+LEFT107/109 improved P16-to-temporary-P32 out/back from5/5 to24/24ticks;
+RIGHT105/106 improved9/11 to27/27. Fixed endpoints were retained; achieved
+preparation differed, so do not claim identical loading or unique gain causation.
+Actual113 completed20producer-active seconds from2050 toGoal2124, achieved2096,
+then returned2058:4.043deg outward of6.504deg requested,3.340deg back,+.703deg
+residual. Gripper opened19.010 points and returned within.462. Four ordinary input
+holds recovered in.769-1.001s; longest Core running interval10.328s. This is useful
+coarse action with substantial undertravel, not the fully requested reach or fine
+positioning. Both temporary trials and113 restored P16/I0/D32/protection310 and
+originalLock0 last; no further escalation, permanent default, swap or unchanged
+powered repeat is required for publication.
+
+Stage51 source5157155 is installed at motor927c17aa (unchanged), runtime04c7b3ec,
+manifestc5adf5f6. Only one runtime file changed fromStage50; full matched Stage50
+rollback and older rollbacks are retained. Provably untouched initial feedback
+cache now waits in the existing held startup path under the original deadline;
+received malformed/foreign feedback still faults with bounded diagnostic context.
+Actual111/112's exact cache failure remains unproven; their original failures stay.
+113 supplied a successful new Start after112, not a separate post113 restart test.
+Ordinary enrolled software-decoder Edge showed advancing640x480 chest video, but
+source/display remain dim and occluded. All these new comparisons/actions selected
+advisory presentation beforeStart; no new normal human required-view qualification.
+PR29 remains draft/unmerged. Retain original device/input/ownership protections,
+wireless AM1, advisory P1, deferred USB leaders and unchanged main/AM2.
+
 Read first: [current state](docs/alohamini/current-state.md) and
 [source-backed decisions/lessons](docs/alohamini/decisions-and-lessons.md).
 Use the matching lesson before diagnosing a symptom; check coverage at the actual
@@ -13,7 +39,7 @@ the LEFT elbow servo has NOT been replaced. Suspend swap-first advice/preparatio
 substantial disassembly is not an appropriate diagnostic swap. Replacement requires
 a sufficiently supported likely defect and a later owner decision. PR29 stays
 draft/unmerged; no preceding proposed replacement/integration prompt was sent.
-The current comparison rules use installed LEFT-bus/ID3 and RIGHT-bus/ID3 at their verified
+The accepted Actual100/101 comparison used installed LEFT-bus/ID3 and RIGHT-bus/ID3 at their verified
 ordinary P16/I0/D32 baselines, with no gain change. Use measured approximately mirrored
 shoulder/elbow/wrist geometry and equivalent gravity-relative direction, recording
 material differences; raw sign or normalized equality alone does not match load.
@@ -25,7 +51,7 @@ material ambiguity remains. Bind sparse evidence to side/bus plus ID, retain dev
 protections and original times, and do not infer external torque from drive duty.
 Use the existing sole owner/runner and a minimal reviewed two-elbow reader extension.
 No new gain sweep, general telemetry/UI, all-motor commissioning, disassembly or merge.
-The current declared peer exercise uses52raw counts (4.5703125encoder degrees),
+The accepted Actual100/101 peer exercise used52raw counts (4.5703125encoder degrees),
 16producer-active seconds per side, under the existing finite ceiling. Fresh measured
 references/endpoints must fit retained workspaces; do not clamp or ratchet them.
 The owner-authorized predetermined-bench presentation policy may be explicitly
@@ -89,7 +115,7 @@ Actual94's required presentation without a shadow viewer, but that scene was too
 Camera-only11/12 and Actual97-99 subsequently supplied illuminated coarse bench/gripper
 viewing through this same enrolled profile. Occluded wrist/precision visibility remains
 limited. This is not GPU proof or a global preference change.
-The current increment demonstrated useful repeatable negative-direction coarse
+The earlier Actual97-99 increment demonstrated useful repeatable negative-direction coarse
 left-elbow response and the short unloaded reach/hold/gripper/retract under normal
 required coarse viewing. Positive-direction undertravel and return/fine limits remain;
 retain that bounded result without another powered repeat for publication. Compare actual
@@ -103,7 +129,7 @@ semantics: one parameter at a time, a small candidate set, baseline/restoration
 verified. If substantial effort lacks motion, distinguish actual load/power/mechanism
 before escalating. Never change IDs, phase, calibration, travel or device protections;
 never overcommand to hide error. No general gain sweep, micro-tick gate or new framework.
-Stage48 source4599d9f8 is installed at motor6af9d512/runtimece2c3ec3/MFddbbf831;
+Historical Stage48 source4599d9f8 was installed at motor6af9d512/runtimece2c3ec3/MFddbbf831;
 all ten phases passed, changing only the reviewed three motor/two runtime files over
 Stage46. Camera/helper/Core/media/client/calibration remain unchanged; full matched
 8a3a91ed/D80c7d28/MF11027f16 rollback, private state and Windows bytes/ACL are retained.
