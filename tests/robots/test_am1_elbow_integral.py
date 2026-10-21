@@ -886,3 +886,884 @@ def test_right_p20_fresh_nonce_requires_absent_global_marker_after_explicit_reti
         bound = module.load_right_p20_binding(result, next_dir, next_run, RIGHT_P20_HOST)
         assert bound["request"]["request_id"] == "66666666-6666-4666-8666-666666666666"
         assert json.loads(used.read_bytes())["request"]["request_id"] == "66666666-6666-4666-8666-666666666666"
+
+
+LEFT_P_BOOT = "77777777-7777-4777-8777-777777777777"
+
+
+def left_response_p_files(tmp_path, monkeypatch, *, proportional=32):
+    module = right_p20_module()
+    assert callable(getattr(module, "consume_left_response_p_request", None)), (
+        "left proportional consumer missing"
+    )
+    monkeypatch.setattr(module, "_left_response_p_boot_id", lambda: LEFT_P_BOOT)
+    state, directory = tmp_path / "state", tmp_path / RIGHT_P20_RUN[:8]
+    state.mkdir(mode=0o700)
+    directory.mkdir(mode=0o700)
+    value = {
+        "version": 1,
+        "kind": "left-response-p",
+        "request_id": RIGHT_P20_RUN,
+        "source_head": "a" * 40,
+        "proportional": proportional,
+        "workload_segment": "left-maintained",
+        "boot_id": LEFT_P_BOOT,
+        "expires_at_monotonic_s": module.time.monotonic() + 60.0,
+    }
+    request = state / "left-response-p-request.json"
+    request.write_bytes(module._right_p20_json(value))
+    request.chmod(0o600)
+    return module, state, directory, request, value
+
+
+def left_response_p_robot(tmp_path, monkeypatch, *, proportional=32):
+    module, state, directory, request, value = left_response_p_files(
+        tmp_path, monkeypatch, proportional=proportional
+    )
+    path = module.consume_left_response_p_request(
+        state, directory, "physical-live-teleop", RIGHT_P20_RUN, RIGHT_P20_HOST, "a" * 40
+    )
+    binding = module.load_left_response_p_binding(path, directory, RIGHT_P20_RUN, RIGHT_P20_HOST)
+    r = robot()
+    r._am1_selected_joint_evidence_enabled = False
+    del r._am1_elbow_recovery_binding
+    r._am1_teleop_binding = {
+        "run_id": RIGHT_P20_RUN,
+        "host_incarnation": RIGHT_P20_HOST,
+        "recipe": "physical-live-teleop",
+    }
+    baseline = dict(
+        BASELINE,
+        ID=3,
+        Phase=12,
+        Present_Position=2044,
+        Goal_Position=2037,
+        Max_Torque_Limit=1000,
+        Torque_Limit=1000,
+        Acceleration=254,
+        Maximum_Acceleration=254,
+        CW_Dead_Zone=1,
+        CCW_Dead_Zone=1,
+        Goal_Time=0,
+        Goal_Velocity=0,
+        Protection_Current=310,
+        Max_Temperature_Limit=70,
+        Min_Voltage_Limit=40,
+        Max_Voltage_Limit=140,
+        Protective_Torque=20,
+        Protection_Time=200,
+        Overload_Torque=80,
+        Over_Current_Protection_Time=200,
+        Velocity_closed_loop_P_proportional_coefficient=10,
+        Velocity_closed_loop_I_integral_coefficient=200,
+        Present_Current=0,
+        Status=0,
+        Present_Voltage=119,
+        Present_Temperature=28,
+    )
+    r.left_bus.values.update({(k, ELBOW): v for k, v in baseline.items()})
+    from lerobot.robots.alohamini.am1_live_teleop import STATIC
+
+    r._am1_teleop_settings = {"left": {"registers": {k: {ELBOW: baseline[k]} for k in STATIC}}}
+    r._am1_left_response_p_binding = binding
+    trial = module.AM1LeftResponseProportionalTrial(binding, directory)
+    r._am1_left_response_p_trial = trial
+    return module, r, trial, directory, request, value
+
+
+@pytest.mark.parametrize("proportional", [16, 32])
+def test_left_response_p_consumes_once_and_binding_survives_request_deadline(
+    tmp_path, monkeypatch, proportional
+):
+    module, r, trial, directory, request, value = left_response_p_robot(
+        tmp_path, monkeypatch, proportional=proportional
+    )
+    assert not request.exists()
+    assert (request.parent / ("left-response-p-used-" + value["request_id"] + ".json")).exists()
+    assert (directory / "left-response-p-consumed.json").read_bytes() == module._right_p20_json(value)
+    monkeypatch.setattr(module.time, "monotonic", lambda: value["expires_at_monotonic_s"] + 1.0)
+    assert (
+        module.load_left_response_p_binding(
+            directory / "left-response-p.json", directory, RIGHT_P20_RUN, RIGHT_P20_HOST
+        )
+        == trial.binding
+    )
+    trial.prepare(r)
+    trial.disable_torque(r)
+    trial.apply(r)
+    assert (
+        trial.receipt["configured_p"] == proportional
+        and trial.receipt["workload_segment"] == "left-maintained"
+    )
+    trial.restore(r)
+    request.write_bytes(module._right_p20_json(value))
+    request.chmod(0o600)
+    with pytest.raises(ValueError):
+        module.consume_left_response_p_request(
+            request.parent, directory, "physical-live-teleop", RIGHT_P20_RUN, RIGHT_P20_HOST, "a" * 40
+        )
+    assert request.exists()
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "expired",
+        "boot",
+        "source",
+        "recipe",
+        "gain",
+        "gain_bool",
+        "segment",
+        "extra",
+        "noncanonical",
+        "hardlink",
+    ],
+)
+def test_left_response_p_bad_request_is_rejected_before_consumption(tmp_path, monkeypatch, bad):
+    import os
+
+    module, state, directory, request, value = left_response_p_files(tmp_path, monkeypatch)
+    recipe = "physical-live-teleop"
+    if bad == "expired":
+        value["expires_at_monotonic_s"] = 0.0
+    elif bad == "boot":
+        value["boot_id"] = "88888888-8888-4888-8888-888888888888"
+    elif bad == "source":
+        value["source_head"] = "b" * 40
+    elif bad == "recipe":
+        recipe = "physical-live-right-elbow"
+    elif bad == "gain":
+        value["proportional"] = 24
+    elif bad == "gain_bool":
+        value["proportional"] = True
+    elif bad == "segment":
+        value["workload_segment"] = "full"
+    elif bad == "extra":
+        value["cap_ma"] = 100
+    request.write_bytes(module._right_p20_json(value))
+    if bad == "noncanonical":
+        request.write_text(json.dumps(value, indent=2), encoding="utf-8")
+    if bad == "hardlink":
+        os.link(request, state / "linked")
+    with pytest.raises((RuntimeError, ValueError, OSError)):
+        module.consume_left_response_p_request(
+            state, directory, recipe, RIGHT_P20_RUN, RIGHT_P20_HOST, "a" * 40
+        )
+    assert request.exists() and not list(directory.iterdir())
+
+
+@pytest.mark.parametrize("proportional", [16, 32])
+def test_left_response_p_durable_original_and_exact_restoration_without_legacy_current_cap(
+    tmp_path, monkeypatch, proportional
+):
+    module, r, trial, directory, request, value = left_response_p_robot(
+        tmp_path, monkeypatch, proportional=proportional
+    )
+    trial.prepare(r)
+    assert not writes(r.left_bus)
+
+    def retained(register, motor, new_value):
+        saved = json.loads(trial.snapshot_path.read_bytes())
+        assert saved["restore_required"] and saved["original_registers"]["P_Coefficient"] == 16
+        if register == "P_Coefficient":
+            assert (
+                r.left_bus.values[("Torque_Enable", motor)] == 0 and r.left_bus.values[("Lock", motor)] == 1
+            )
+
+    r.left_bus.before_write = retained
+    trial.disable_torque(r)
+    trial.apply(r)
+    r.left_bus.values[("Torque_Enable", ELBOW)] = 1
+    r.left_bus.values[("Present_Current", ELBOW)] = 100  # 650mA exceeds superseded diagnostic caps.
+    trial.verify_active(r)
+    assert (
+        trial.evidence["active_verified"]
+        and trial.evidence["active_registers"]["P_Coefficient"] == proportional
+    )
+    assert trial.receipt["original_settings_sha256"] == trial.evidence["original_settings_sha256"]
+    trial.restore(r)
+    expected = [("Torque_Enable", 0), ("Lock", 1)]
+    if proportional == 32:
+        expected += [("P_Coefficient", 32)]
+    expected += [("Torque_Enable", 0), ("Lock", 1)]
+    if proportional == 32:
+        expected += [("P_Coefficient", 16)]
+    expected += [("Lock", 0)]
+    assert [(e[1], e[3]) for e in writes(r.left_bus)] == expected
+    assert not writes(r.left_bus, OTHER) and not writes(r.right_bus)
+    assert not trial.restore_required and json.loads(trial.snapshot_path.read_bytes())["status"] == "restored"
+    assert r.left_bus.raw == {24: 16, 25: 0}
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["max_torque", "torque_limit", "startup", "integral_limit", "deadband", "PID", "legacy", "AM2"],
+)
+def test_left_response_p_unknown_actual_baseline_retains_proof_without_writes(
+    tmp_path, monkeypatch, mutation
+):
+    module, r, trial, directory, request, value = left_response_p_robot(tmp_path, monkeypatch)
+    if mutation == "max_torque":
+        r.left_bus.values[("Max_Torque_Limit", ELBOW)] = 500
+    elif mutation == "torque_limit":
+        r.left_bus.values[("Torque_Limit", ELBOW)] = 500
+    elif mutation == "startup":
+        r.left_bus.raw[24] = 17
+    elif mutation == "integral_limit":
+        r.left_bus.raw[25] = 1
+    elif mutation == "deadband":
+        r.left_bus.values[("CW_Dead_Zone", ELBOW)] = 2
+    elif mutation == "PID":
+        r.left_bus.values[("I_Coefficient", ELBOW)] = 1
+    elif mutation == "legacy":
+        r._am1_selected_joint_evidence_enabled = True
+    else:
+        r.config.robot_model = "alohamini2"
+    with pytest.raises(RuntimeError):
+        trial.prepare(r)
+    assert not writes(r.left_bus)
+    if mutation not in {"legacy", "AM2"}:
+        assert trial.evidence["original_registers"] and trial.evidence["original_bytes"]
+        assert json.loads(trial.snapshot_path.read_bytes())["status"] == "baseline_refused"
+        assert not trial.restore_required
+
+
+@pytest.mark.parametrize(
+    "phase",
+    [
+        "apply_lost",
+        "cancel",
+        "restore_lost",
+        "restore_failed",
+        "preserved",
+        "owner",
+        "current",
+        "configured_persist",
+        "restored_persist",
+    ],
+)
+def test_left_response_p_failure_keeps_original_until_verified_restore(tmp_path, monkeypatch, phase):
+    module, r, trial, directory, request, value = left_response_p_robot(tmp_path, monkeypatch)
+    trial.prepare(r)
+    trial.disable_torque(r)
+    if phase in {"apply_lost", "cancel"}:
+        error = KeyboardInterrupt("cancel after P32") if phase == "cancel" else OSError("P32 ACK lost")
+        r.left_bus.fail_writes[("P_Coefficient", ELBOW, 32)] = (error, True)
+        with pytest.raises(type(error)):
+            trial.apply(r)
+        assert trial.restore_required
+    else:
+        if phase == "configured_persist":
+            persist = trial._persist_snapshot
+
+            def fail(state, **kwargs):
+                if state == "configured":
+                    raise OSError("configured persistence")
+                return persist(state, **kwargs)
+
+            monkeypatch.setattr(trial, "_persist_snapshot", fail)
+            with pytest.raises(OSError):
+                trial.apply(r)
+        else:
+            trial.apply(r)
+        if phase == "restore_lost":
+            r.left_bus.fail_writes[("P_Coefficient", ELBOW, 16)] = (OSError("restore ACK lost"), True)
+        if phase == "restore_failed":
+            r.left_bus.fail_writes[("P_Coefficient", ELBOW, 16)] = (OSError("restore refused"), False)
+        if phase == "preserved":
+            r.left_bus.raw[25] = 1
+        if phase == "owner":
+            r._am1_teleop_binding = dict(r._am1_teleop_binding, run_id="foreign")
+        if phase == "current":
+            r.left_bus.values[("Torque_Enable", ELBOW)] = 1
+            r.left_bus.values[("Present_Current", ELBOW)] = 310
+            with pytest.raises(RuntimeError):
+                trial.verify_active(r)
+            r.left_bus.values[("Present_Current", ELBOW)] = 0
+        if phase == "restored_persist":
+            persist = trial._persist_snapshot
+
+            def fail(state, **kwargs):
+                if state == "restored":
+                    raise OSError("restored persistence")
+                return persist(state, **kwargs)
+
+            monkeypatch.setattr(trial, "_persist_snapshot", fail)
+    if phase in {"restore_failed", "preserved", "owner", "restored_persist"}:
+        with pytest.raises((RuntimeError, OSError)):
+            trial.restore(r)
+        assert trial.restore_required and json.loads(trial.snapshot_path.read_bytes())["restore_required"]
+        if phase != "owner":
+            assert r.left_bus.values[("Lock", ELBOW)] == 1
+    else:
+        trial.restore(r)
+        assert not trial.restore_required and r.left_bus.values[("P_Coefficient", ELBOW)] == 16
+        assert r.left_bus.values[("Lock", ELBOW)] == 0
+
+
+@pytest.mark.parametrize("change", [None, "bus", "calibration", "binding", "frozen", "restored"])
+def test_left_response_p_active_receipt_is_read_free_and_fenced_to_original_owner(
+    tmp_path, monkeypatch, change
+):
+    import copy
+
+    module, r, trial, directory, request, value = left_response_p_robot(tmp_path, monkeypatch)
+    trial.prepare(r)
+    trial.disable_torque(r)
+    trial.apply(r)
+    with pytest.raises(RuntimeError):
+        trial.active_receipt(r)
+    r.left_bus.values[("Torque_Enable", ELBOW)] = 1
+    trial.verify_active(r)
+    bus = r.left_bus
+    if change == "bus":
+        r.left_bus = OwnerBus()
+    elif change == "calibration":
+        r.left_bus.calibration[ELBOW].range_min += 1
+    elif change == "binding":
+        trial.binding["request"]["workload_segment"] = "left-reach"
+        r._am1_left_response_p_binding = copy.deepcopy(trial.binding)
+    elif change == "frozen":
+        r._am1_teleop_settings["left"]["registers"]["Protection_Current"][ELBOW] = 500
+    elif change == "restored":
+        trial.restore(r)
+    before = list(bus.events)
+    if change is None:
+        receipt = trial.active_receipt(r)
+        assert receipt == trial.receipt
+        receipt["configured_p"] = 99
+        assert trial.active_receipt(r)["configured_p"] == 32
+    else:
+        with pytest.raises(RuntimeError):
+            trial.active_receipt(r)
+    assert bus.events == before
+
+
+def test_left_response_p_retired_nonce_refuses_new_source_and_extended_expiry(tmp_path, monkeypatch):
+    module, r, trial, directory, request, value = left_response_p_robot(tmp_path, monkeypatch)
+    value.update(source_head="b" * 40, expires_at_monotonic_s=module.time.monotonic() + 120.0)
+    request.write_bytes(module._right_p20_json(value))
+    request.chmod(0o600)
+    next_run = "66666666-6666-4666-8666-666666666666"
+    next_directory = directory.parent / next_run[:8]
+    next_directory.mkdir(mode=0o700)
+    with pytest.raises(ValueError, match="nonce"):
+        module.consume_left_response_p_request(
+            request.parent, next_directory, "physical-live-teleop", next_run, RIGHT_P20_HOST, "b" * 40
+        )
+    assert request.exists() and not list(next_directory.iterdir())
+
+
+def test_left_response_p_prepare_persistence_failure_never_reaches_device_write(tmp_path, monkeypatch):
+    module, r, trial, directory, request, value = left_response_p_robot(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        trial,
+        "_persist_snapshot",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("original persistence")),
+    )
+    with pytest.raises(OSError, match="original persistence"):
+        trial.prepare(r)
+    assert not writes(r.left_bus) and trial.restore_required
+    with pytest.raises(RuntimeError, match="durable"):
+        trial.disable_torque(r)
+    assert not writes(r.left_bus)
+
+
+def test_left_response_p_expiry_during_private_file_checks_refuses_before_consumption(tmp_path, monkeypatch):
+    module, state, directory, request, value = left_response_p_files(tmp_path, monkeypatch)
+    clock = iter((value["expires_at_monotonic_s"] - 1.0, value["expires_at_monotonic_s"]))
+    monkeypatch.setattr(module.time, "monotonic", lambda: next(clock))
+    with pytest.raises(ValueError, match="expired"):
+        module.consume_left_response_p_request(
+            state, directory, "physical-live-teleop", RIGHT_P20_RUN, RIGHT_P20_HOST, "a" * 40
+        )
+    assert request.exists() and not list(directory.iterdir())
+    assert not list(state.glob("left-response-p-used-*"))
+
+
+def test_left_response_p_does_not_reject_accepted_single_raw_temperature_anomaly(tmp_path, monkeypatch):
+    module, r, trial, directory, request, value = left_response_p_robot(tmp_path, monkeypatch)
+    trial.prepare(r)
+    trial.disable_torque(r)
+    trial.apply(r)
+    r.left_bus.values[("Torque_Enable", ELBOW)] = 1
+    r.left_bus.values[("Present_Temperature", ELBOW)] = 78
+    trial.verify_active(r)  # Existing qualified owner windows decide actual thermal readiness.
+    assert trial.evidence["active_registers"]["Present_Temperature"] == 78
+    trial.restore(r)
+
+
+def test_left_response_p_each_actual_bus_boundary_services_existing_startup_cadence(tmp_path, monkeypatch):
+    module, r, trial, directory, request, value = left_response_p_robot(tmp_path, monkeypatch)
+    from lerobot.robots.alohamini import am1_live_teleop
+
+    bus = r.left_bus
+    r._am1_teleop_startup_temperature = True
+    r._lift_operation = object()
+    monkeypatch.setattr(
+        am1_live_teleop, "refresh_startup_temperatures", lambda robot: bus.events.append(("thermal-due",))
+    )
+    monkeypatch.setattr(r, "_refresh_am1_startup_lift_feedback", lambda: bus.events.append(("lift-due",)))
+    trial.prepare(r)
+    trial.disable_torque(r)
+    trial.apply(r)
+    r.left_bus.values[("Torque_Enable", ELBOW)] = 1
+    trial.verify_active(r)
+    trial.restore(r)
+    for i, event in enumerate(bus.events):
+        if event[0] in {"read", "raw-read", "write"} and event[1] != "Present_Temperature":
+            assert bus.events[i - 2 : i] == [("thermal-due",), ("lift-due",)]
+    assert not trial.restore_required
+
+
+def test_left_response_p_startup_fault_remains_binding_but_shutdown_can_restore_original(
+    tmp_path, monkeypatch
+):
+    module, r, trial, directory, request, value = left_response_p_robot(tmp_path, monkeypatch)
+    from lerobot.robots.alohamini import am1_live_teleop
+
+    trial.prepare(r)
+    trial.disable_torque(r)
+    trial.apply(r)
+    r.left_bus.values[("Torque_Enable", ELBOW)] = 1
+    r._am1_teleop_startup_temperature = True
+    fault = RuntimeError("original startup thermal/lift fault")
+    r._am1_teleop_first_error = fault
+    original_slots = object()
+    r._am1_teleop_temperatures = original_slots
+    services = []
+
+    def failed_refresh(robot):
+        services.append("startup")
+        raise fault
+
+    monkeypatch.setattr(am1_live_teleop, "refresh_startup_temperatures", failed_refresh)
+    with pytest.raises(RuntimeError) as caught:
+        trial.verify_active(r)
+    assert caught.value is fault and services == ["startup"]
+    assert trial.restore_required and r.left_bus.values[("P_Coefficient", ELBOW)] == 32
+    r._am1_shutdown_in_progress = True
+    trial.restore(r)
+    assert r._am1_teleop_first_error is fault and r._am1_teleop_temperatures is original_slots
+    assert r._am1_teleop_startup_temperature is True and services == ["startup"]
+    assert r.left_bus.values[("P_Coefficient", ELBOW)] == 16
+    assert r.left_bus.values[("Torque_Enable", ELBOW)] == 0
+    assert r.left_bus.values[("Lock", ELBOW)] == 0 and not trial.restore_required
+    assert trial.evidence["first_failure"]["message"] == str(fault)
+
+
+@pytest.mark.parametrize("phase", ["prepare", "apply", "verify", "receipt"])
+def test_left_response_p_shutdown_is_not_active_comparison_authority(tmp_path, monkeypatch, phase):
+    module, r, trial, directory, request, value = left_response_p_robot(tmp_path, monkeypatch)
+    if phase != "prepare":
+        trial.prepare(r)
+        trial.disable_torque(r)
+    if phase in {"verify", "receipt"}:
+        trial.apply(r)
+        r.left_bus.values[("Torque_Enable", ELBOW)] = 1
+    if phase == "receipt":
+        trial.verify_active(r)
+    before = list(r.left_bus.events)
+    r._am1_shutdown_in_progress = True
+    operation = {
+        "prepare": trial.prepare,
+        "apply": trial.apply,
+        "verify": trial.verify_active,
+        "receipt": trial.active_receipt,
+    }[phase]
+    with pytest.raises(RuntimeError):
+        operation(r)
+    assert r.left_bus.events == before
+    if phase != "prepare":
+        trial.restore(r)
+        assert r.left_bus.values[("P_Coefficient", ELBOW)] == 16 and not trial.restore_required
+
+
+@pytest.mark.parametrize("descriptor", ["left-response-p.json", "left-response-p-consumed.json"])
+@pytest.mark.parametrize("damage", ["missing", "corrupt"])
+def test_left_response_p_descriptor_loss_still_turns_off_but_cannot_restore_gain(
+    tmp_path, monkeypatch, descriptor, damage
+):
+    module, r, trial, directory, request, value = left_response_p_robot(tmp_path, monkeypatch)
+    trial.prepare(r)
+    trial.disable_torque(r)
+    trial.apply(r)
+    r.left_bus.values[("Torque_Enable", ELBOW)] = 1
+    trial.verify_active(r)
+    path = directory / descriptor
+    if damage == "missing":
+        path.unlink()
+    else:
+        path.write_bytes(b"corrupt")
+    r._am1_shutdown_in_progress = True
+    before = len(r.left_bus.events)
+    trial.disable_torque(r)
+    assert r.left_bus.values[("Torque_Enable", ELBOW)] == 0
+    assert r.left_bus.values[("Lock", ELBOW)] == 1
+    with pytest.raises((OSError, ValueError)):
+        trial.restore(r)
+    assert r.left_bus.values[("P_Coefficient", ELBOW)] == 32
+    assert r.left_bus.values[("Torque_Enable", ELBOW)] == 0
+    assert r.left_bus.values[("Lock", ELBOW)] == 1 and trial.restore_required
+    assert json.loads(trial.snapshot_path.read_bytes())["restore_required"] is True
+    assert trial.evidence["state"] == "restore_failed"
+    assert not any(
+        row[:3] == ("write", "P_Coefficient", ELBOW) for row in r.left_bus.events[before:]
+    )
+
+
+@pytest.mark.parametrize("change", ["bus", "calibration", "run"])
+def test_left_response_p_descriptor_loss_does_not_bypass_retained_torque_off_owner(
+    tmp_path, monkeypatch, change
+):
+    module, r, trial, directory, request, value = left_response_p_robot(tmp_path, monkeypatch)
+    trial.prepare(r)
+    trial.disable_torque(r)
+    trial.apply(r)
+    r.left_bus.values[("Torque_Enable", ELBOW)] = 1
+    trial.verify_active(r)
+    (directory / "left-response-p.json").unlink()
+    bus = r.left_bus
+    if change == "bus":
+        r.left_bus = OwnerBus()
+    elif change == "calibration":
+        r.left_bus.calibration[ELBOW].range_min += 1
+    else:
+        r._am1_teleop_binding = dict(r._am1_teleop_binding, run_id="foreign")
+    before = list(bus.events)
+    other_before = list(r.left_bus.events)
+    r._am1_shutdown_in_progress = True
+    with pytest.raises(RuntimeError):
+        trial.disable_torque(r)
+    assert bus.events == before and r.left_bus.events == other_before
+    assert bus.values[("Torque_Enable", ELBOW)] == 1 and trial.restore_required
+
+
+@pytest.mark.parametrize("fault", [None, "current", "owner", "cancel"])
+def test_left_response_p_powered_proof_keeps_durable_configured_obligation_until_off(
+    tmp_path, monkeypatch, fault
+):
+    # Retire earlier fault-fixture owner cycles before intercepting this owner's private reads.
+    import gc
+
+    gc.collect()
+    module, r, trial, directory, request, value = left_response_p_robot(tmp_path, monkeypatch)
+    trial.prepare(r)
+    trial.disable_torque(r)
+    trial.apply(r)
+    durable = trial.snapshot_path.read_bytes()
+    configured = json.loads(durable)
+    assert configured["state"] == "configured" and configured["restore_required"] is True
+    assert configured["original_registers"]["P_Coefficient"] == 16
+    r.left_bus.values[("Torque_Enable", ELBOW)] = 1
+    persist = trial._persist_snapshot
+    loads, saved = [], []
+    original_load = module.load_left_response_p_binding
+
+    def load(*args, **kwargs):
+        loads.append("private-binding-read")
+        return original_load(*args, **kwargs)
+
+    def record(state, **kwargs):
+        assert r.left_bus.values[("Torque_Enable", ELBOW)] == 0, "No private persistence while powered"
+        saved.append(state)
+        return persist(state, **kwargs)
+
+    monkeypatch.setattr(module, "load_left_response_p_binding", load)
+    monkeypatch.setattr(trial, "_persist_snapshot", record)
+    bus = r.left_bus
+    if fault == "current":
+        bus.values[("Present_Current", ELBOW)] = 310
+    elif fault == "owner":
+        r._am1_teleop_binding = dict(r._am1_teleop_binding, run_id="foreign")
+    elif fault == "cancel":
+        r._am1_shutdown_in_progress = True
+    before = list(bus.events)
+    if fault is None:
+        trial.verify_active(r)
+        assert trial.active_receipt(r)["original_settings_sha256"] == configured["original_settings_sha256"]
+        assert trial.evidence["state"] == "active" and trial.evidence["active_verified"] is True
+    else:
+        with pytest.raises(RuntimeError):
+            trial.verify_active(r)
+        assert trial.evidence["first_failure"] and trial.restore_required
+        if fault in ("owner", "cancel"):
+            assert bus.events == before
+    assert loads == [] and saved == []
+    assert trial.snapshot_path.read_bytes() == durable
+    # Stop remains synchronous: OFF, original gain, original Lock, then one durable final proof.
+    r._am1_teleop_binding = {k: trial.binding[k] for k in ("run_id", "host_incarnation")}
+    r._am1_teleop_binding["recipe"] = "physical-live-teleop"
+    r._am1_shutdown_in_progress = True
+    trial.restore(r)
+    assert bus.values[("Torque_Enable", ELBOW)] == 0 and bus.values[("P_Coefficient", ELBOW)] == 16
+    assert bus.values[("Lock", ELBOW)] == 0 and trial.restore_required is False
+    assert saved == ["restored"]
+    final = json.loads(trial.snapshot_path.read_bytes())
+    if fault is None:
+        assert final["active_verified"] and final["active_registers"]["P_Coefficient"] == 32
+    else:
+        assert final["first_failure"] == trial.evidence["first_failure"]
+    assert not list(directory.glob("*.tmp")) and not list(directory.glob(".*.tmp"))
+
+
+RIGHT_RESPONSE_ELBOW = "arm_right_elbow_flex"
+
+
+def right_response_p_robot(tmp_path, monkeypatch, *, proportional=32):
+    seed = tmp_path / "left-seed"
+    seed.mkdir(mode=0o700)
+    module, r, _left, _directory, _request, value = left_response_p_robot(
+        seed, monkeypatch, proportional=proportional
+    )
+    assert callable(getattr(module, "consume_right_response_p_request", None)), "right response consumer missing"
+    assert callable(getattr(module, "load_right_response_p_binding", None)), "right response loader missing"
+    state, parent = tmp_path / "right-state", tmp_path / "right-owner"
+    state.mkdir(mode=0o700)
+    parent.mkdir(mode=0o700)
+    directory = parent / RIGHT_P20_RUN[:8]
+    directory.mkdir(mode=0o700)
+    value = dict(value, kind="right-response-p", workload_segment="right-peer-fixed")
+    request = state / "right-response-p-request.json"
+    request.write_bytes(module._right_p20_json(value))
+    request.chmod(0o600)
+    path = module.consume_right_response_p_request(
+        state, directory, "physical-live-teleop", RIGHT_P20_RUN, RIGHT_P20_HOST, "a" * 40
+    )
+    binding = module.load_right_response_p_binding(path, directory, RIGHT_P20_RUN, RIGHT_P20_HOST)
+    bus = OwnerBus()
+    bus.motors = {RIGHT_RESPONSE_ELBOW: Motor(3, "sts3215", MotorNormMode.RANGE_M100_100)}
+    bus.calibration = {RIGHT_RESPONSE_ELBOW: MotorCalibration(3, 0, -658, 827, 3039)}
+    baseline = {register: val for (register, motor), val in r.left_bus.values.items() if motor == ELBOW}
+    baseline.update(Min_Position_Limit=827, Max_Position_Limit=3039, Homing_Offset=-658,
+                    Present_Position=1855, Goal_Position=1855)
+    bus.values = {(key, RIGHT_RESPONSE_ELBOW): val for key, val in baseline.items()}
+    r.right_bus, r.right_arm_motors = bus, [RIGHT_RESPONSE_ELBOW]
+    del r._am1_left_response_p_binding
+    del r._am1_left_response_p_trial
+    from lerobot.robots.alohamini.am1_live_teleop import STATIC
+    r._am1_teleop_settings["right"] = {"registers": {k: {RIGHT_RESPONSE_ELBOW: baseline[k]} for k in STATIC}}
+    r._am1_right_response_p_binding = binding
+    trial = module.AM1RightResponseProportionalTrial(binding, directory)
+    r._am1_right_response_p_trial = trial
+    return module, r, trial, directory, request, value
+
+
+@pytest.mark.parametrize("proportional", [16, 32])
+def test_right_response_p_exact_owner_original_active_and_lock_last_restoration(tmp_path, monkeypatch, proportional):
+    module, r, trial, directory, request, value = right_response_p_robot(tmp_path, monkeypatch, proportional=proportional)
+    bus, left_before = r.right_bus, list(r.left_bus.events)
+    trial.prepare(r)
+    assert not writes(bus, RIGHT_RESPONSE_ELBOW)
+    original = json.loads(trial.snapshot_path.read_bytes())
+    assert original["kind"] == "right-response-p" and original["motor"] == RIGHT_RESPONSE_ELBOW
+    assert original["original_registers"]["P_Coefficient"] == 16 and original["restore_required"] is True
+    assert original["original_registers"]["Homing_Offset"] == -658
+    trial.disable_torque(r)
+    trial.apply(r)
+    configured = trial.snapshot_path.read_bytes()
+    bus.values[("Torque_Enable", RIGHT_RESPONSE_ELBOW)] = 1
+    # Active verification and receipts use only retained owner/device I/O; no private reads/writes powered.
+    original_loader = module.load_right_response_p_binding
+    monkeypatch.setattr(module, "load_right_response_p_binding", lambda *a, **k: pytest.fail("powered private read"))
+    trial.verify_active(r)
+    receipt = trial.active_receipt(r)
+    assert receipt["kind"] == "right-response-p" and receipt["configured_p"] == proportional
+    assert receipt["workload_segment"] == "right-peer-fixed" and receipt["original_p"] == 16
+    assert set(receipt) == {"version", "kind", "run_id", "host_incarnation", "request_sha256", "source_head",
+                            "request_id", "workload_segment", "original_p", "configured_p", "restore_required",
+                            "original_settings_sha256", "prepared_at_monotonic_s", "configured_at_monotonic_s"}
+    assert trial.snapshot_path.read_bytes() == configured
+    monkeypatch.setattr(module, "load_right_response_p_binding", original_loader)
+    r._am1_shutdown_in_progress = True
+    trial.restore(r)
+    assert bus.values[("P_Coefficient", RIGHT_RESPONSE_ELBOW)] == 16
+    assert bus.values[("Torque_Enable", RIGHT_RESPONSE_ELBOW)] == 0
+    assert bus.values[("Lock", RIGHT_RESPONSE_ELBOW)] == 0 and not trial.restore_required
+    events = writes(bus, RIGHT_RESPONSE_ELBOW)
+    assert events[-1][1:4] == ("Lock", RIGHT_RESPONSE_ELBOW, 0)
+    assert all(row[1] in {"Torque_Enable", "Lock", "P_Coefficient"} for row in events)
+    assert [row[3] for row in events if row[1] == "P_Coefficient"] == ([32, 16] if proportional == 32 else [])
+    assert r.left_bus.events == left_before
+    assert json.loads(trial.snapshot_path.read_bytes())["active_verified"] is True
+    assert not request.exists() and (request.parent / ("right-response-p-used-" + value["request_id"] + ".json")).is_file()
+
+
+@pytest.mark.parametrize("change", ["left_calibration", "wrong_bus", "run", "simultaneous_left"])
+def test_right_response_p_side_identity_refuses_before_any_effect(tmp_path, monkeypatch, change):
+    _module, r, trial, _directory, _request, _value = right_response_p_robot(tmp_path, monkeypatch)
+    if change == "left_calibration":
+        r.right_bus.calibration[RIGHT_RESPONSE_ELBOW] = MotorCalibration(3, 0, 1845, 864, 3073)
+    elif change == "wrong_bus":
+        r.right_bus = r.left_bus
+    elif change == "run":
+        r._am1_teleop_binding = dict(r._am1_teleop_binding, run_id="foreign")
+    else:
+        r._am1_left_response_p_binding = {"foreign": True}
+    before = (list(r.left_bus.events), list(r.right_bus.events))
+    with pytest.raises((RuntimeError, ValueError)):
+        trial.prepare(r)
+    assert (r.left_bus.events, r.right_bus.events) == before and not trial.restore_required
+
+
+@pytest.mark.parametrize("field,value", [("kind", "left-response-p"), ("workload_segment", "left-peer-fixed"),
+    ("workload_segment", "right-peer-maintained"), ("proportional", 64), ("proportional", True),
+    ("source_head", "b" * 40), ("boot_id", "88888888-8888-4888-8888-888888888888"),
+    ("expires_at_monotonic_s", 0.0), ("side", "right")])
+def test_right_response_p_request_closed_side_source_and_deadline(tmp_path, monkeypatch, field, value):
+    module, state, directory, left_path, original = left_response_p_files(tmp_path, monkeypatch)
+    consumer = getattr(module, "consume_right_response_p_request", None)
+    assert callable(consumer), "right response consumer missing"
+    left_path.unlink()
+    current = dict(original, kind="right-response-p", workload_segment="right-peer-fixed")
+    current[field] = value
+    path = state / "right-response-p-request.json"
+    path.write_bytes(module._right_p20_json(current))
+    path.chmod(0o600)
+    with pytest.raises((ValueError, RuntimeError)):
+        consumer(state, directory, "physical-live-teleop", RIGHT_P20_RUN, RIGHT_P20_HOST, "a" * 40)
+    assert path.exists() and not list(directory.iterdir())
+    assert not list(state.glob("right-response-p-used-*"))
+
+
+def test_left_response_p_accepts_explicit_fixed_profile_without_changing_old_request_shape(tmp_path, monkeypatch):
+    module, state, directory, request, original = left_response_p_files(tmp_path, monkeypatch)
+    value = dict(original, workload_segment="left-peer-fixed")
+    request.write_bytes(module._right_p20_json(value))
+    path = module.consume_left_response_p_request(state, directory, "physical-live-teleop", RIGHT_P20_RUN, RIGHT_P20_HOST, "a" * 40)
+    binding = module.load_left_response_p_binding(path, directory, RIGHT_P20_RUN, RIGHT_P20_HOST)
+    assert binding["request"] == value and set(value) == set(original)
+
+
+@pytest.mark.parametrize("damage", ["missing", "corrupt"])
+def test_right_response_p_descriptor_loss_allows_off_without_forging_restoration(tmp_path, monkeypatch, damage):
+    _module, r, trial, directory, _request, _value = right_response_p_robot(tmp_path, monkeypatch)
+    trial.prepare(r)
+    trial.disable_torque(r)
+    trial.apply(r)
+    r.right_bus.values[("Torque_Enable", RIGHT_RESPONSE_ELBOW)] = 1
+    trial.verify_active(r)
+    path = directory / "right-response-p.json"
+    if damage == "missing":
+        path.unlink()
+    else:
+        path.write_bytes(b"corrupt")
+    r._am1_shutdown_in_progress = True
+    trial.disable_torque(r)
+    with pytest.raises((OSError, ValueError)):
+        trial.restore(r)
+    assert r.right_bus.values[("Torque_Enable", RIGHT_RESPONSE_ELBOW)] == 0
+    assert r.right_bus.values[("Lock", RIGHT_RESPONSE_ELBOW)] == 1
+    assert r.right_bus.values[("P_Coefficient", RIGHT_RESPONSE_ELBOW)] == 32 and trial.restore_required
+    assert json.loads(trial.snapshot_path.read_bytes())["restore_required"] is True
+
+
+@pytest.mark.parametrize("fault", ["configure_ack", "restore_ack", "current", "status", "voltage", "cancel"])
+def test_right_response_p_faults_remain_binding_and_sync_stop_restores(tmp_path, monkeypatch, fault):
+    _module, r, trial, _directory, _request, _value = right_response_p_robot(tmp_path, monkeypatch)
+    bus = r.right_bus
+    trial.prepare(r)
+    trial.disable_torque(r)
+    if fault == "configure_ack":
+        bus.fail_writes[("P_Coefficient", RIGHT_RESPONSE_ELBOW, 32)] = (OSError("lost configured ACK"), True)
+        with pytest.raises(OSError):
+            trial.apply(r)
+    else:
+        trial.apply(r)
+        bus.values[("Torque_Enable", RIGHT_RESPONSE_ELBOW)] = 1
+        if fault == "current":
+            bus.values[("Present_Current", RIGHT_RESPONSE_ELBOW)] = 310
+        elif fault == "status":
+            bus.values[("Status", RIGHT_RESPONSE_ELBOW)] = 1
+        elif fault == "voltage":
+            bus.values[("Present_Voltage", RIGHT_RESPONSE_ELBOW)] = 39
+        elif fault == "cancel":
+            r._am1_shutdown_in_progress = True
+        if fault in {"current", "status", "voltage", "cancel"}:
+            with pytest.raises(RuntimeError):
+                trial.verify_active(r)
+        else:
+            trial.verify_active(r)
+            bus.fail_writes[("P_Coefficient", RIGHT_RESPONSE_ELBOW, 16)] = (OSError("lost restored ACK"), True)
+    assert trial.restore_required
+    r._am1_shutdown_in_progress = True
+    trial.restore(r)
+    assert bus.values[("P_Coefficient", RIGHT_RESPONSE_ELBOW)] == 16
+    assert bus.values[("Lock", RIGHT_RESPONSE_ELBOW)] == 0
+    assert bus.values[("Torque_Enable", RIGHT_RESPONSE_ELBOW)] == 0 and not trial.restore_required
+
+
+@pytest.mark.parametrize("change", ["pid", "deadband", "startup_byte", "torque_limit", "firmware", "position"])
+def test_right_response_p_unknown_stopped_baseline_is_proven_and_refused_without_write(tmp_path, monkeypatch, change):
+    _module, r, trial, _directory, _request, _value = right_response_p_robot(tmp_path, monkeypatch)
+    if change == "startup_byte":
+        r.right_bus.raw[25] = 1
+    else:
+        register, value = {"pid": ("I_Coefficient", 1), "deadband": ("CW_Dead_Zone", 2),
+            "torque_limit": ("Torque_Limit", 999), "firmware": ("Firmware_Minor_Version", 11),
+            "position": ("Present_Position", 1961)}[change]
+        r.right_bus.values[(register, RIGHT_RESPONSE_ELBOW)] = value
+    with pytest.raises(RuntimeError):
+        trial.prepare(r)
+    assert not writes(r.right_bus, RIGHT_RESPONSE_ELBOW) and not writes(r.left_bus)
+    saved = json.loads(trial.snapshot_path.read_bytes())
+    assert saved["state"] == "baseline_refused" and saved["restore_required"] is False
+    assert saved["original_registers"] and saved["original_bytes"]
+
+
+def test_right_response_p_consumed_binding_outlives_admission_and_nonce_cannot_be_reissued(tmp_path, monkeypatch):
+    module, r, trial, directory, request, value = right_response_p_robot(tmp_path, monkeypatch)
+    monkeypatch.setattr(module.time, "monotonic", lambda: value["expires_at_monotonic_s"] + 1.)
+    assert module.load_right_response_p_binding(directory / "right-response-p.json", directory,
+                                                RIGHT_P20_RUN, RIGHT_P20_HOST) == trial.binding
+    trial.prepare(r)
+    trial.disable_torque(r)
+    trial.apply(r)
+    trial.restore(r)
+    request.write_bytes(module._right_p20_json(dict(value, expires_at_monotonic_s=value["expires_at_monotonic_s"] + 100.)))
+    request.chmod(0o600)
+    with pytest.raises(ValueError, match="retired"):
+        module.consume_right_response_p_request(request.parent, directory, "physical-live-teleop",
+                                               RIGHT_P20_RUN, RIGHT_P20_HOST, "a" * 40)
+    assert request.exists() and not trial.restore_required
+
+
+@pytest.mark.parametrize("change", ["bus", "calibration", "run"])
+def test_right_response_p_active_receipt_never_refreshes_changed_owner(tmp_path, monkeypatch, change):
+    _module, r, trial, _directory, _request, _value = right_response_p_robot(tmp_path, monkeypatch)
+    trial.prepare(r)
+    trial.disable_torque(r)
+    trial.apply(r)
+    bus = r.right_bus
+    bus.values[("Torque_Enable", RIGHT_RESPONSE_ELBOW)] = 1
+    trial.verify_active(r)
+    if change == "bus":
+        r.right_bus = OwnerBus()
+    elif change == "calibration":
+        bus.calibration[RIGHT_RESPONSE_ELBOW].drive_mode = 1
+    else:
+        r._am1_teleop_binding = dict(r._am1_teleop_binding, host_incarnation="foreign")
+    before = list(bus.events)
+    with pytest.raises(RuntimeError):
+        trial.active_receipt(r)
+    assert bus.events == before and trial.restore_required
+
+
+def test_right_response_p_uses_frozen_device_protection_and_restores_original_lock_one(tmp_path, monkeypatch):
+    _module, r, trial, _directory, _request, _value = right_response_p_robot(tmp_path, monkeypatch)
+    bus = r.right_bus
+    bus.values[("Lock", RIGHT_RESPONSE_ELBOW)] = 1
+    trial.prepare(r)
+    trial.disable_torque(r)
+    trial.apply(r)
+    bus.values[("Torque_Enable", RIGHT_RESPONSE_ELBOW)] = 1
+    bus.values[("Present_Current", RIGHT_RESPONSE_ELBOW)] = 100  # 650mA, below actual frozen310counts.
+    bus.values[("Present_Temperature", RIGHT_RESPONSE_ELBOW)] = 95  # Single raw is not an extra thermal vote.
+    trial.verify_active(r)
+    assert trial.active_receipt(r)["configured_p"] == 32
+    r._am1_shutdown_in_progress = True
+    trial.restore(r)
+    assert bus.values[("P_Coefficient", RIGHT_RESPONSE_ELBOW)] == 16
+    assert bus.values[("Lock", RIGHT_RESPONSE_ELBOW)] == 1 and not trial.restore_required
+    assert not any(row[1] == "Protection_Current" for row in writes(bus, RIGHT_RESPONSE_ELBOW))

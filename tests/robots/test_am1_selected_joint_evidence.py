@@ -1215,3 +1215,372 @@ def test_teleop_goal_optional_empty_timeout_and_actual_faults_keep_existing_mean
             evidence.report(obj,control,observation)
     assert len(port.writes)==1 and rows[-1]["diagnostic_available"] is False
     assert not evidence.enabled and obj._am1_selected_joint_evidence_enabled is False
+
+
+def test_left_response_goal_evidence_keeps_exact_trial_and_old_flags_off(monkeypatch):
+    from tests.robots.test_am1_live_teleop_native import install_left_response_trial
+
+    obj, evidence, control, now, rows, writes, acquire = teleop_goal_lane(monkeypatch)
+    trial = install_left_response_trial(monkeypatch, obj)
+    port = attach_port(obj, [status(group_payload(goal=2020, present=2012), motor_id=3)])
+    evidence.report(obj, control, acquire())
+    now[0] += .5
+    observation = acquire()
+    evidence.report(obj, control, observation)
+    row = next(r for r in rows if r["kind"] == "live_goal_readback")
+    assert row["left_response_p_trial"] == trial.receipt
+    assert row["left_response_p_trial"]["original_p"] == 16
+    assert row["left_response_p_trial"]["configured_p"] == 32
+    assert row["goal_matches_expected_raw"] and len(port.writes) == 1 and not writes
+    evidence.publish(obj, control, observation)
+    assert observation["_am1_local_feedback"]["selected_joint"]["left_response_p_trial"] == trial.receipt
+    assert not evidence.enabled and not obj._am1_selected_joint_evidence_enabled
+    assert getattr(obj, "_am1_visible_control_binding", None) is None and evidence.context is None
+
+
+@pytest.mark.parametrize("change", ["restored", "binding", "legacy"])
+def test_left_response_goal_evidence_refuses_retired_trial_or_legacy_flags_without_io(monkeypatch, change):
+    from tests.robots.test_am1_live_teleop_native import install_left_response_trial
+
+    obj, evidence, control, now, rows, writes, acquire = teleop_goal_lane(monkeypatch)
+    trial = install_left_response_trial(monkeypatch, obj)
+    port = attach_port(obj, [status(group_payload(goal=2020, present=2012), motor_id=3)])
+    evidence.report(obj, control, acquire())
+    now[0] += .5
+    if change == "restored":
+        trial.restore_required = False
+    elif change == "binding":
+        obj._am1_left_response_p_binding = dict(trial.binding, run_id=str(uuid4()))
+    else:
+        obj._am1_selected_joint_evidence_enabled = True
+    observation = acquire()
+    evidence.report(obj, control, observation)
+    assert not port.writes and not writes
+    assert not [row for row in rows if row["kind"] == "live_goal_readback"]
+
+
+def cached_elbow_settings(obj):
+    for _phase, attr, at in (
+        ("original", "_am1_teleop_settings", 8.0),
+        ("active", "_am1_teleop_active_settings", 9.0),
+    ):
+        records = {}
+        for side, bus in (("left", obj.left_bus), ("right", obj.right_bus)):
+            motor = f"arm_{side}_elbow_flex"
+            cal = bus.calibration[motor]
+            values = {
+                "ID": 3,
+                "Model_Number": 777,
+                "Firmware_Major_Version": 3,
+                "Firmware_Minor_Version": 10,
+                "Min_Position_Limit": cal.range_min,
+                "Max_Position_Limit": cal.range_max,
+                "Homing_Offset": cal.homing_offset,
+                "Phase": 12,
+                "P_Coefficient": 16,
+                "I_Coefficient": 0,
+                "D_Coefficient": 32,
+                "Acceleration": 0,
+                "Maximum_Acceleration": 0,
+                "Protection_Current": 310,
+                "Max_Temperature_Limit": 70,
+                "Min_Voltage_Limit": 40,
+                "Max_Voltage_Limit": 140,
+                "Operating_Mode": 0,
+            }
+            records[side] = {
+                "registers": {register: {motor: value} for register, value in values.items()},
+                "timing": {
+                    register: {"read_started_at_monotonic_s": at, "read_completed_at_monotonic_s": at + 0.01}
+                    for register in values
+                },
+            }
+        setattr(obj, attr, records)
+
+
+def two_elbow_goal_lane(monkeypatch):
+    obj, evidence, control, now, rows, writes, _ = teleop_goal_lane(monkeypatch)
+    obj.left_bus.calibration[ELBOW] = MotorCalibration(3, 0, 1845, 864, 3073)
+    right = "arm_right_elbow_flex"
+    obj.right_bus = FeetechMotorsBus(
+        "unused-right-elbow",
+        {right: Motor(3, "sts3215", MotorNormMode.RANGE_M100_100)},
+        {right: MotorCalibration(3, 0, -658, 827, 3039)},
+    )
+    obj.right_arm_motors = [right]
+    cached_elbow_settings(obj)
+
+    def acquire(left_raw=2020, right_raw=1847):
+        from examples.alohamini.am1_live_teleop import TELEOP_ARM_KEYS, ZERO_BODY
+
+        control.accepted_action_sequence += 1
+        values = {
+            KEY: float(obj.left_bus._normalize({3: left_raw})[3]),
+            right + ".pos": float(obj.right_bus._normalize({3: right_raw})[3]),
+        }
+        control.accepted_action = {**dict.fromkeys(TELEOP_ARM_KEYS, 0.0), **ZERO_BODY, **values}
+        control.live_sample = {
+            "seq": control.accepted_action_sequence,
+            "target": {k: control.accepted_action[k] for k in TELEOP_ARM_KEYS},
+            "valid_until_monotonic_s": now[0] + 0.24,
+        }
+        evidence.record_teleop_action(
+            obj,
+            control,
+            {
+                **control.binding,
+                "epoch": control.epoch,
+                "intent_revision": control.intent_revision,
+                "action_sequence": control.accepted_action_sequence,
+            },
+            control.accepted_action,
+        )
+        observation = {}
+        control.annotate(observation, acquired_at=now[0])
+        return observation
+
+    return obj, evidence, control, now, rows, writes, acquire
+
+
+def test_whole_teleop_two_elbows_read_actual_separate_buses_with_shared_spacing(monkeypatch):
+    obj, evidence, control, now, rows, writes, acquire = two_elbow_goal_lane(monkeypatch)
+    left = attach_port(obj, [status(group_payload(goal=2020, present=2012), motor_id=3)])
+    right = ByteStreamPort([status(group_payload(goal=1847, present=1834, current=39), motor_id=3)])
+    obj.right_bus.port_handler, obj.right_bus.packet_handler = right, scs.PacketHandler(0)
+    acquire()
+    now[0] = 10.5
+    evidence.report(obj, control, acquire())
+    now[0] = 10.99
+    evidence.report(obj, control, acquire())
+    assert len(left.writes) == 1 and not right.writes
+    now[0] = 11.5
+    observation = acquire()
+    evidence.report(obj, control, observation)
+    assert len(left.writes) == len(right.writes) == 1 and not writes
+    assert [r["action"]["side"] for r in rows] == ["left", "right"]
+    row = rows[-1]
+    assert (
+        row["action"]["motor"] == "arm_right_elbow_flex"
+        and row["action"]["joint"] == "arm_right_elbow_flex.pos"
+    )
+    assert row["action"]["calibration"] == [3, 0, -658, 827, 3039]
+    assert (
+        row["requested_goal_raw"] == row["goal_position_raw"] == 1847 and row["present_position_raw"] == 1834
+    )
+    assert row["decoded"]["present_position_normalized"] == pytest.approx((1834 - 827) / 2212 * 200 - 100)
+    assert row["decoded"]["present_current_ma"] == 253.5 and row["decoded"]["voltage_v"] == 11.9
+    assert row["decoded"]["torque_limit_raw"] == 1000 and row["decoded"]["present_load_raw"] == -3
+    assert row["decoded"]["status"] == 0 and row["diagnostic_available"] is True
+    assert all(
+        r["run_id"] == control.binding["run_id"]
+        and r["host_incarnation"] == control.binding["host_incarnation"]
+        for r in rows
+    )
+    evidence.publish(obj, control, observation)
+    assert len(observation["_am1_local_feedback"]["selected_joint"]["goal_readbacks"]) == 2
+
+
+def test_whole_teleop_two_elbows_share_eight_attempt_budget_not_eight_per_bus(monkeypatch):
+    obj, evidence, control, now, rows, _, acquire = two_elbow_goal_lane(monkeypatch)
+    left = attach_port(obj, [status(group_payload(goal=2020), motor_id=3) for _ in range(8)])
+    right = ByteStreamPort([status(group_payload(goal=1847), motor_id=3) for _ in range(8)])
+    obj.right_bus.port_handler, obj.right_bus.packet_handler = right, scs.PacketHandler(0)
+    for index in range(12):
+        now[0] = 10.0 + index * 2
+        acquire(2020 + index, 1847 + index)
+        now[0] += 0.5
+        evidence.report(obj, control, acquire(2020 + index, 1847 + index))
+    assert len(rows) == len(left.writes) + len(right.writes) == 8
+    assert len(left.writes) == len(right.writes) == 4
+    assert all(
+        b["read_started_at_monotonic_s"] - a["read_started_at_monotonic_s"] >= 1
+        for a, b in zip(rows, rows[1:], strict=False)
+    )
+
+
+@pytest.mark.parametrize("change", ["bus", "calibration", "run", "input", "accepted"])
+def test_whole_teleop_right_read_rejects_changed_owner_or_current_intent(monkeypatch, change):
+    obj, evidence, control, now, rows, _, acquire = two_elbow_goal_lane(monkeypatch)
+    attach_port(obj, [status(group_payload(goal=2020), motor_id=3)])
+    right = ByteStreamPort([status(group_payload(goal=1847), motor_id=3)])
+    obj.right_bus.port_handler, obj.right_bus.packet_handler = right, scs.PacketHandler(0)
+    acquire()
+    now[0] = 10.5
+    evidence.report(obj, control, acquire())
+    now[0] = 11.5
+    observation = acquire()
+    original = evidence._decoded
+
+    def decode(bus, payload, **kwargs):
+        result = original(bus, payload, **kwargs)
+        if change == "bus":
+            obj.right_bus = obj.left_bus
+        elif change == "calibration":
+            obj.right_bus.calibration["arm_right_elbow_flex"].range_min += 1
+        elif change == "run":
+            control.binding["run_id"] = str(uuid4())
+        elif change == "input":
+            now[0] += 0.3
+        else:
+            control.accepted_action["arm_right_elbow_flex.pos"] += 0.1
+        return result
+
+    monkeypatch.setattr(evidence, "_decoded", decode)
+    evidence.report(obj, control, observation)
+    assert len(right.writes) == 1 and rows[-1]["action"]["side"] == "right"
+    assert rows[-1]["diagnostic_available"] is False and rows[-1]["goal_matches_expected_raw"] is None
+    evidence.publish(obj, control, observation)
+    assert "teleop_elbow_settings" not in observation.get("_am1_local_feedback", {}).get("selected_joint", {})
+
+
+def test_whole_teleop_cached_two_elbow_settings_publish_original_scalar_and_timing_without_io(monkeypatch):
+    obj, evidence, control, now, rows, writes, acquire = two_elbow_goal_lane(monkeypatch)
+    observation = acquire()
+    evidence.publish(obj, control, observation)
+    selected = observation["_am1_local_feedback"]["selected_joint"]
+    proof = selected.get("teleop_elbow_settings")
+    assert isinstance(proof, dict) and set(proof) == {"left", "right"}
+    assert set(proof["right"]) == {
+        "motor",
+        "motor_id",
+        "calibration",
+        "original",
+        "active",
+        "original_read_timing",
+        "active_read_timing",
+    }
+    assert proof["right"]["motor"] == "arm_right_elbow_flex" and proof["right"]["motor_id"] == 3
+    assert proof["right"]["calibration"] == [3, 0, -658, 827, 3039]
+    assert proof["left"]["calibration"] == [3, 0, 1845, 864, 3073]
+    for side in ("left", "right"):
+        assert proof[side]["original"]["P_Coefficient"] == proof[side]["active"]["P_Coefficient"] == 16
+        assert proof[side]["active"]["I_Coefficient"] == 0 and proof[side]["active"]["D_Coefficient"] == 32
+        assert proof[side]["active"]["Model_Number"] == 777
+        assert (
+            proof[side]["active"]["Firmware_Major_Version"] == 3
+            and proof[side]["active"]["Firmware_Minor_Version"] == 10
+        )
+        assert proof[side]["active"]["Protection_Current"] == 310
+        assert proof[side]["original_read_timing"]["P_Coefficient"] == {
+            "read_started_at_monotonic_s": 8.0,
+            "read_completed_at_monotonic_s": 8.01,
+        }
+        assert proof[side]["active_read_timing"]["P_Coefficient"] == {
+            "read_started_at_monotonic_s": 9.0,
+            "read_completed_at_monotonic_s": 9.01,
+        }
+    assert selected["acquired_at_monotonic_s"] == now[0] == 10.0
+    assert not writes and not rows
+    proof["right"]["active"]["P_Coefficient"] = 99
+    evidence.publish(obj, control, observation)
+    assert (
+        observation["_am1_local_feedback"]["selected_joint"]["teleop_elbow_settings"]["right"]["active"][
+            "P_Coefficient"
+        ]
+        == 16
+    )
+
+
+@pytest.mark.parametrize(
+    "bad", ["missing", "timing", "future", "boolean", "calibration", "bus_swap", "mutated_cache"]
+)
+def test_whole_teleop_cached_settings_never_invent_missing_or_changed_proof(monkeypatch, bad):
+    obj, evidence, control, now, _, _, acquire = two_elbow_goal_lane(monkeypatch)
+    observation = acquire()
+    if bad == "missing":
+        del obj._am1_teleop_active_settings["right"]
+    elif bad == "timing":
+        del obj._am1_teleop_active_settings["right"]["timing"]["P_Coefficient"]
+    elif bad == "future":
+        obj._am1_teleop_active_settings["right"]["timing"]["P_Coefficient"][
+            "read_completed_at_monotonic_s"
+        ] = 11.0
+    elif bad == "boolean":
+        obj._am1_teleop_active_settings["right"]["registers"]["P_Coefficient"]["arm_right_elbow_flex"] = True
+    elif bad == "calibration":
+        obj.right_bus.calibration["arm_right_elbow_flex"].range_min += 1
+    elif bad == "bus_swap":
+        obj.right_bus = obj.left_bus
+    else:
+        obj._am1_teleop_active_settings["right"]["registers"]["P_Coefficient"]["arm_right_elbow_flex"] = 32
+    evidence.publish(obj, control, observation)
+    assert "teleop_elbow_settings" not in observation.get("_am1_local_feedback", {}).get("selected_joint", {})
+
+
+@pytest.mark.parametrize("drive", [0, 1])
+def test_whole_teleop_right_expected_raw_uses_right_encoder_and_actual_drive(monkeypatch, drive):
+    obj, evidence, _, _, _, _, acquire = two_elbow_goal_lane(monkeypatch)
+    motor, key = "arm_right_elbow_flex", "arm_right_elbow_flex.pos"
+    obj.right_bus.calibration[motor] = MotorCalibration(3, drive, -658, 827, 3039)
+    desired = float(obj.right_bus._normalize({3: 1900})[3])
+    accepted, raw = obj._encode_am1_arm_goals(obj.right_bus, {key: desired}, {motor: 1847})
+    acquire(right_raw=raw[motor])
+    action = evidence.teleop_states["right"]["action"]["action"]
+    assert action["expected_goal_raw"] == raw[motor] == 1900
+    assert action["final_normalized"] == accepted[key]
+    assert action["calibration"] == [3, drive, -658, 827, 3039]
+    assert action["encoded_goal_bytes"] == [108, 7] and action["write_acknowledged"] is False
+
+
+@pytest.mark.parametrize("proportional", [16, 32])
+def test_whole_teleop_explicit_left_trial_never_publishes_ordinary_baseline_settings(
+    monkeypatch, proportional
+):
+    from tests.robots.test_am1_live_teleop_native import install_left_response_trial
+
+    obj, evidence, control, _, _, _, acquire = two_elbow_goal_lane(monkeypatch)
+    trial = install_left_response_trial(monkeypatch, obj, proportional=proportional)
+    observation = acquire()
+    evidence.publish(obj, control, observation)
+    selected = observation["_am1_local_feedback"]["selected_joint"]
+    assert selected["left_response_p_trial"] == trial.receipt
+    assert "teleop_elbow_settings" not in selected
+
+
+@pytest.mark.parametrize("which", ["port", "port_handler", "packet_handler"])
+def test_whole_teleop_right_transport_replacement_invalidates_actual_read_correlation(monkeypatch, which):
+    obj, evidence, control, now, rows, _, acquire = two_elbow_goal_lane(monkeypatch)
+    attach_port(obj, [status(group_payload(goal=2020), motor_id=3)])
+    right = ByteStreamPort([status(group_payload(goal=1847), motor_id=3)])
+    obj.right_bus.port_handler, obj.right_bus.packet_handler = right, scs.PacketHandler(0)
+    acquire()
+    now[0] = 10.5
+    evidence.report(obj, control, acquire())
+    now[0] = 11.5
+    observation = acquire()
+    original = evidence._decoded
+
+    def decode(bus, payload, **kwargs):
+        decoded = original(bus, payload, **kwargs)
+        setattr(obj.right_bus, which, "different-port" if which == "port" else object())
+        return decoded
+
+    monkeypatch.setattr(evidence, "_decoded", decode)
+    evidence.report(obj, control, observation)
+    assert len(right.writes) == 1 and rows[-1]["diagnostic_available"] is False
+    assert rows[-1]["goal_matches_expected_raw"] is None
+
+
+@pytest.mark.parametrize("side", ["left", "right"])
+@pytest.mark.parametrize("proportional", [16, 32])
+def test_fixed_response_cached_proof_contains_exact_trial_and_both_baselines(monkeypatch, side, proportional):
+    from tests.robots.test_am1_live_teleop_native import (
+        install_left_response_trial,
+        install_right_response_trial,
+    )
+    obj, evidence, control, _, _, writes, acquire = two_elbow_goal_lane(monkeypatch)
+    install = install_left_response_trial if side == "left" else install_right_response_trial
+    trial = install(monkeypatch, obj, workload=side + "-peer-fixed", proportional=proportional)
+    obj._am1_teleop_active_settings[side]["registers"]["P_Coefficient"]["arm_" + side + "_elbow_flex"] = proportional
+    observation = acquire()
+    evidence.publish(obj, control, observation)
+    selected = observation["_am1_local_feedback"]["selected_joint"]
+    proof = selected["teleop_elbow_settings"]
+    assert set(proof) == {"left", "right", "trial"} and proof["trial"] == trial.receipt
+    assert selected[side + "_response_p_trial"] == trial.receipt
+    for current in ("left", "right"):
+        assert proof[current]["original"]["P_Coefficient"] == 16
+        assert proof[current]["active"]["P_Coefficient"] == (proportional if current == side else 16)
+        assert proof[current]["original"]["I_Coefficient"] == proof[current]["active"]["I_Coefficient"] == 0
+        assert proof[current]["original"]["D_Coefficient"] == proof[current]["active"]["D_Coefficient"] == 32
+    assert not writes

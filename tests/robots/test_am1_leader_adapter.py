@@ -728,6 +728,7 @@ def test_real_wss_clean_close_ends_qualified_wait_before_timeout(tmp_path):
         "bench_terminal_hold_stopped", "bench_terminal_hold_cancel", "bench_terminal_hold_budget",
         "bench_terminal_hold_native_ceiling",
         "bench_program_finish", "bench_program_finish_failed",
+        "peer_fixed_baseline_ready", "peer_fixed_baseline_missing", "peer_fixed_baseline_native", "peer_fixed_baseline_blocked",
         "normal_program_finish", "normal_program_finish_failed", "normal_program_finish_combined_body",
         "normal_program_finish_left_maintained", "normal_program_finish_left_reach", "normal_program_finish_left_supported", "normal_program_finish_left_opposite", "usb_finite_finish", "usb_finite_finish_failed", "usb_quit_finish", "usb_quit_empty_finish",
     ],
@@ -741,6 +742,8 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
 
     m = adapter()
     production_post = m.SessionClient.post
+    peer_wait_case = isinstance(failure, str) and failure.startswith("peer_fixed_baseline_")
+    peer_template = peer_baseline_state(peer_workspace()) if peer_wait_case else None
     initial_pause_case = failure == "initial_resume_pause"
     terminal_hold = isinstance(failure, str) and failure.startswith("bench_terminal_hold_")
     normal_finish = isinstance(failure, str) and failure.startswith(("normal_program_finish", "usb_finite_finish", "usb_quit_"))
@@ -920,12 +923,14 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
             await asyncio.Event().wait()
 
         def state(self, run_id):
-            w = workspace()
+            w = peer_workspace() if peer_wait_case else workspace()
+            if peer_wait_case:
+                w["reference"]["arm_left_elbow_flex.pos"] = m.normalized_raw(2043, w["calibration"]["arm_left_elbow_flex"])
             if failure == "normal_program_finish_left_supported":
                 w["bounds"]["arm_left_shoulder_lift.pos"]["rate_per_s"] = 3.
             if failure == "normal_program_finish_left_opposite":
                 w["bounds"]["arm_left_elbow_flex.pos"]["rate_per_s"] = 3.
-            return {
+            value = {
                 "service_incarnation": "service",
                 "controller": {"device_id": "device", "controller_generation": "control"},
                 "run": {
@@ -967,6 +972,16 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                     "measured_body": {"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0, "lift_axis.vel": 0},
                 },
             }
+
+            if peer_wait_case:
+                value["service_incarnation"] = peer_template["service_incarnation"]
+                value["run"]["backend_incarnation"] = peer_template["run"]["backend_incarnation"]
+                if failure == "peer_fixed_baseline_native":
+                    value["run"]["remaining_s"] = .12
+                value["evidence"].update(copy.deepcopy(peer_template["evidence"]))
+                value["evidence"]["accepted_host_action"]["run_id"] = run_id
+                value["evidence"]["accepted_host_action"].pop("teleop_elbow_settings")
+            return value
 
         async def post(self, op, payload):
             if op == "start":
@@ -1209,6 +1224,14 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 return {"accepted": True, "grant_id": str(uuid4()), "expires": 99.0}
             assert payload["op"] == "input"
             self.inputs.append(copy.deepcopy(payload))
+            if peer_wait_case:
+                if failure == "peer_fixed_baseline_blocked":
+                    await asyncio.sleep(10.)  # The one original baseline ceiling must cancel an in-flight receipt wait.
+                await asyncio.sleep(.03)  # Actual102-shaped asynchronous Native proof follows accepted reference holds.
+                if failure == "peer_fixed_baseline_ready" and len(self.inputs) >= 3:
+                    self.snapshot["evidence"]["accepted_host_action"]["teleop_elbow_settings"] = copy.deepcopy(
+                        peer_template["evidence"]["accepted_host_action"]["teleop_elbow_settings"])
+
             if mailbox_case and self.authoritative is None and len(self.inputs) == (
                 2 if failure in {"mailbox_zero", "mailbox_zero_budget"} else 1
             ):
@@ -1280,6 +1303,8 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
             self.snapshot["run"]["live_input"].update(
                 last_input_seq=payload["seq"], source=payload["source"], body=payload["body"]
             )
+            if peer_wait_case and "teleop_elbow_settings" not in self.snapshot["evidence"]["accepted_host_action"]:
+                self.snapshot["run"]["live_input"].update(last_input_seq=-1, source=None, state="held", accepted_at=None)
             self.snapshot["evidence"]["measured_positions"] = payload["target"]
             if terminal_hold:
                 self.snapshot["evidence"]["active_acknowledged"] = True
@@ -1410,6 +1435,42 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
         args.duration_seconds = 0.03
     if foreign_boundary:
         args.next_start_seconds = 0.001
+    if peer_wait_case:
+        import json
+        args.source, args.next_start_seconds, args.duration_seconds = "virtual-leaders", None, .05
+        args.workload_segment, args.peer_side, args.peer_direction, args.peer_raw_step = "left-peer-fixed", "left", -1, 52
+        if failure == "peer_fixed_baseline_ready":
+            summary = asyncio.run(asyncio.wait_for(m.run(args), 5))
+        else:
+            with pytest.raises(TimeoutError, match="baseline"):
+                asyncio.run(asyncio.wait_for(m.run(args), 5))
+            summary = json.loads((tmp_path / "evidence/summary.json").read_text())
+        records = [json.loads(line) for line in (tmp_path / "evidence/frames.jsonl").read_text().splitlines()]
+        frames = [r for r in records if r["event"] == "leader_frame"]
+        verified = next((r for r in records if r["event"] == "peer_baseline_settings_verified"), None)
+        held = [r for r in frames if verified is None or r["local_monotonic_s"] < verified["local_monotonic_s"]]
+        assert len(held) >= (0 if failure.endswith("blocked") else 1 if failure.endswith("native") else 3)
+        assert all(r["progress_s"] == 0. for r in held)
+        assert all(r["frame"]["target"] == summary["workspace"]["reference"] for r in held)
+        assert all(r["frame"]["body"] == m.ZERO_BODY for r in frames)
+        if frames:
+            assert frames[0]["receipt"]["accepted"] is True
+            assert frames[0]["native"]["run"]["live_input"]["last_input_seq"] == -1
+            assert frames[0]["native"]["run"]["live_input"]["source"] is None
+        assert records[0]["peer_baseline_qualification_budget_seconds"] == 2.
+        assert [r["frame"]["source"]["sample_seq"] for r in frames] == list(range(1, len(frames)+1))
+        assert len({r["grant"]["grant_id"] for r in frames}) == len(frames)
+        assert all(0 <= r["frame"]["source"]["sent_at_monotonic_s"]-r["frame"]["source"]["acquired_at_monotonic_s"] < .25 for r in frames)
+        assert summary["peer_baseline_qualification_seconds"] >= .06
+        assert summary["original_native_deadline"] == 301. and instances[0].stops == [owned_id]
+        if verified:
+            assert .05 <= summary["active_progress_s"] <= .15  # One retained max .1s advancement may cross the .05s fixture end.
+            assert summary["peer_baseline_qualified"] is True
+        else:
+            assert summary["active_progress_s"] == 0. and not summary["producer_program_complete"]
+            assert summary["peer_baseline_qualified"] is False
+            assert (.09 if failure.endswith("native") else 1.95) <= summary["peer_baseline_qualification_seconds"] < (.3 if failure.endswith("native") else 2.5)
+        return
     if bench_case:
         import json
         args.source, args.next_start_seconds, args.duration_seconds = "virtual-leaders", None, .001
@@ -2336,7 +2397,7 @@ def test_original_recovery_ceiling_includes_authenticated_read_time_without_rean
     asyncio.run(asyncio.wait_for(scenario(), 0.3))
 
 
-@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_view_reconnect", "grant_view_switch", "connect_view_reconnect", "release_view_reconnect", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "held_qualification_loss", "resume_alignment_refusal", "resume_alignment_refused_twice", "runner_initial_cursor_pending", "resume_reply_timeout_pre", "resume_reply_timeout_post", "resume_reply_timeout_alignment", "resume_reply_timeout_alignment_persistent", "acquisition_input_pause", "receipt_ack_starvation", "ack_never_returns", "ack_close_cancel", "transport_blackout_hb1", "transport_blackout_hb2", "transport_blackout_long", "initial_ack_timely", "initial_ack_missing", "connect_receipt_fast", "connect_receipt_delayed", "connect_receipt_missing", "connect_receipt_late", "connect_receipt_caller_ceiling", "connect_receipt_input", "connect_receipt_grant", "renew_receipt_cost", "renew_receipt_cost_expired", "bench_reacquire", "bench_reacquire_receipt_lost", "bench_reacquire_receipt_cancelled", "bench_input_receipt_unknown_native", "bench_input_receipt_unknown_pause", "grant_close_timeout", "grant_close_timeout_pause", "grant_close_timeout_takeover", "grant_close_timeout_cancel", "resume_send_pre", "resume_send_post", "resume_send_pause", "resume_send_takeover", "resume_send_stop", "resume_send_cancel", "resume_send_budget", "resume_send_reboot", "bench_finish_hold", "bench_finish_no_ack", "bench_finish_stale_revision", "bench_finish_body_nonzero", "bench_finish_fault", "bench_finish_external_pause", "bench_finish_stop", "bench_finish_takeover", "bench_finish_reboot", "bench_finish_cancel", "bench_finish_pause_unknown", "bench_finish_budget", "bench_finish_native_ceiling", "bench_finish_strict", "normal_finish_hold", "normal_finish_no_ack", "normal_finish_stale_revision", "normal_finish_body_nonzero", "normal_finish_fault", "normal_finish_external_pause", "normal_finish_stop", "normal_finish_takeover", "normal_finish_reboot", "normal_finish_cancel", "normal_finish_pause_unknown", "normal_finish_budget", "normal_finish_native_ceiling", "normal_finish_view_before", "normal_finish_view_after", "ordinary_lease_dispatch_stall", "ordinary_lease_expired", "ordinary_start_late_first_renewal"])
+@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_view_reconnect", "grant_view_switch", "connect_view_reconnect", "release_view_reconnect", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "held_qualification_loss", "resume_alignment_refusal", "resume_alignment_refused_twice", "runner_initial_cursor_pending", "resume_reply_timeout_pre", "resume_reply_timeout_post", "resume_reply_timeout_alignment", "resume_reply_timeout_alignment_persistent", "acquisition_input_pause", "receipt_ack_starvation", "ack_never_returns", "ack_close_cancel", "transport_blackout_hb1", "transport_blackout_hb2", "transport_blackout_long", "initial_ack_timely", "initial_ack_missing", "connect_receipt_fast", "connect_receipt_delayed", "connect_receipt_missing", "connect_receipt_late", "connect_receipt_caller_ceiling", "connect_receipt_input", "connect_receipt_grant", "renew_receipt_cost", "renew_receipt_cost_expired", "bench_reacquire", "bench_reacquire_receipt_lost", "bench_reacquire_receipt_cancelled", "bench_input_receipt_unknown_native", "bench_input_receipt_unknown_pause", "grant_close_timeout", "grant_close_timeout_pause", "grant_close_timeout_takeover", "grant_close_timeout_cancel", "resume_send_pre", "resume_send_post", "resume_send_pause", "resume_send_takeover", "resume_send_stop", "resume_send_cancel", "resume_send_budget", "resume_send_reboot", "bench_finish_hold", "bench_finish_no_ack", "bench_finish_stale_revision", "bench_finish_body_nonzero", "bench_finish_fault", "bench_finish_external_pause", "bench_finish_stop", "bench_finish_takeover", "bench_finish_reboot", "bench_finish_cancel", "bench_finish_pause_unknown", "bench_finish_budget", "bench_finish_native_ceiling", "bench_finish_strict", "normal_finish_hold", "normal_finish_no_ack", "normal_finish_stale_revision", "normal_finish_body_nonzero", "normal_finish_fault", "normal_finish_external_pause", "normal_finish_stop", "normal_finish_takeover", "normal_finish_reboot", "normal_finish_cancel", "normal_finish_pause_unknown", "normal_finish_budget", "normal_finish_native_ceiling", "normal_finish_view_before", "normal_finish_view_after", "ordinary_lease_dispatch_stall", "ordinary_lease_expired", "ordinary_start_late_first_renewal", "peer_start_normal", "peer_start_bench", "peer_bench_unqualified_view", "peer_bench_local_loss", "peer_normal_unqualified_view"])
 def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(tmp_path, monkeypatch, cause):
     import asyncio
     import copy
@@ -2451,7 +2512,7 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
         gateway = Gateway(owner.directory, tmp_path / "auth")
         enrolled = gateway.auth.enroll(gateway.auth.pair(control=True))
         a.controller["device_id"] = a.connection["device_id"] = enrolled["device_id"]
-        if cause.startswith(("bench_reacquire", "bench_input_receipt_unknown", "grant_close_timeout", "resume_send_", "bench_finish_")):
+        if cause.startswith(("bench_reacquire", "bench_input_receipt_unknown", "grant_close_timeout", "resume_send_", "bench_finish_", "peer_bench_")):
             a.run.update(bench_continuity=True, control_intent={"eligible": True,
                 "device_id": enrolled["device_id"], "controller_generation": ids["controller_generation"],
                 "service_incarnation": a.service_incarnation, "start_operation_id": a.run["operation_id"]})
@@ -2506,6 +2567,26 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                     return original_ws_connect(*args, **kwargs)
                 monkeypatch.setattr(client.http, "ws_connect", fixture_heartbeat)
             await client.attach()
+            if cause in {"peer_start_normal", "peer_start_bench"}:
+                bench = cause == "peer_start_bench"
+                selected = m._peer_options("left-peer-maintained", "left", -1, 52, bench=bench)
+                assert selected == {"side": "left", "direction_raw": -1, "raw_step": 52}
+                client.generation = ids["controller_generation"]
+                idle = copy.deepcopy(e.evidence())
+                e.evidence = lambda: copy.deepcopy(idle)
+                begun = []
+                e.begin = lambda recipe: begun.append(recipe) or True
+                a.run = None
+                start_body = {"operation_id": str(uuid4()), "recipe": "physical-live-teleop",
+                              "controller_generation": client.generation, "bench_continuity": bench}
+                receipt = await client.post("start", start_body)
+                assert receipt["accepted"] is True and a.run["operation_id"] == start_body["operation_id"]
+                assert a.run["bench_continuity"] is bench and a.run["status"] == "starting"
+                assert a._controller_lease_seconds() == (6. if bench else 3.)
+                assert bool(a.run.get("control_intent")) is bench
+                assert [recipe.name for recipe in begun] == ["physical-live-teleop"]
+                assert not any(op in {"grant", "input", "resume"} for op, _ in commands)
+                return
             if cause == "ordinary_start_late_first_renewal":
                 client.generation, client.connection = ids["controller_generation"], ids["connection_generation"]
                 idle_evidence, pi_now, begun = copy.deepcopy(e.evidence()), [10.], []
@@ -2532,6 +2613,31 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                 assert not any(event["kind"] == "presence_expired" for event in a.events)
                 return
             client.generation, client.connection = ids["controller_generation"], ids["connection_generation"]
+            if cause in {"peer_bench_unqualified_view", "peer_bench_local_loss", "peer_normal_unqualified_view"}:
+                bench = cause.startswith("peer_bench_")
+                assert m._peer_options("left-peer-maintained", "left", -1, 52, bench=bench)
+                a._teleop_view = None
+                if cause == "peer_bench_local_loss":
+                    original_evidence = e.evidence
+                    def missing_local_camera():
+                        return dict(original_evidence(), required_observation=False)
+                    e.evidence = missing_local_camera
+                client.snapshot = (await client.get("state"))["snapshot"]
+                view = m._live(client.snapshot)["required_view"]
+                assert view["qualified"] is False and view["required"] is (not bench)
+                guard = m.SameRunRecovery(client, record)
+                if cause == "peer_bench_unqualified_view":
+                    await guard.resume()
+                    assert a.run["status"] == "running" and e.desired == "active"
+                    assert m._view_admitted(client.snapshot) is True
+                    assert client.snapshot["evidence"]["required_observation"] is True
+                else:
+                    with pytest.raises(TimeoutError):
+                        await asyncio.wait_for(guard.resume(), .15)
+                    assert e.desired != "active"
+                    assert not any(op in {"grant", "input", "resume"} for op, _ in commands)
+                assert a.run["native_live_at"] == 9. and a.run["deadline"] == 309.
+                return
             if cause.startswith("bench_input_receipt_unknown"):
                 guard = m.SameRunRecovery(client, record)
                 original = copy.deepcopy(guard.original)
@@ -8708,3 +8814,798 @@ def test_opposite_first_left_rejoin_preserves_current_run_reference_endpoints_an
     now[0] = 108.
     returned = producer.capture({"grant_id": str(uuid4())}, body=m.ZERO_BODY)
     assert returned["target"] == native["reference"]
+
+
+def peer_workspace():
+    m = adapter()
+    value = workspace()
+    for side, cal, raw in (("left", [3, 0, 1845, 864, 3073], 2066), ("right", [3, 0, -658, 827, 3039], 1855)):
+        key = f"arm_{side}_elbow_flex.pos"
+        value["calibration"][key[:-4]] = cal
+        lo, hi = value["raw_bounds"][key]
+        value["bounds"][key].update(min=m.normalized_raw(lo, cal), max=m.normalized_raw(hi, cal))
+        value["reference"][key] = m.normalized_raw(raw, cal)
+    return value
+
+
+def peer_baseline_state(value):
+    settings = {"version": 1, "sha256": "a" * 64}
+    for side in ("left", "right"):
+        motor = f"arm_{side}_elbow_flex"
+        settings[side] = {
+            "motor": motor,
+            "motor_id": 3,
+            "calibration": value["calibration"][motor],
+            "original": [3, 777, 3, 10, 16, 0, 32, 0],
+            "active": [3, 777, 3, 10, 16, 0, 32, 0],
+            "original_read_interval": [1.0, 1.01],
+            "active_read_interval": [2.0, 2.01],
+        }
+    run, host, service = str(uuid4()), str(uuid4()), str(uuid4())
+    return {
+        "service_incarnation": service,
+        "run": {"run_id": run, "backend_incarnation": host, "intent_revision": 2},
+        "evidence": {
+            "host_incarnation": host,
+            "native_ack": True,
+            "active_acknowledged": True,
+            "acknowledged_intent_revision": 2,
+            "feedback": True,
+            "feedback_age_s": 0.02,
+            "required_observation": True,
+            "observation_age_s": 0.03,
+            "observation": {"qualified": True},
+            "accepted_host_action": {
+                "run_id": run,
+                "host_incarnation": host,
+                "epoch": 1,
+                "intent_revision": 2,
+                "accepted_action_sequence": 3,
+                "read_started_at_monotonic_s": 3.0,
+                "acquired_at_monotonic_s": 3.01,
+                "teleop_elbow_settings": settings,
+            },
+        },
+    }
+
+
+@pytest.mark.parametrize("side,direction,raw,endpoint", [("left", -1, 2066, 2014), ("right", 1, 1855, 1907)])
+def test_peer_maintained_explicit_raw_geometry_and_other_eleven_targets(side, direction, raw, endpoint):
+    m = adapter()
+    native = peer_workspace()
+    task = m.SelectedLeftWorkload(
+        native, segment=side + "-peer-maintained", peer_side=side, peer_direction=direction, peer_raw_step=52
+    )
+    assert task.observe_peer_baseline(peer_baseline_state(native)) is True
+    key = f"arm_{side}_elbow_flex.pos"
+    cal = native["calibration"][key[:-4]]
+    expected = m.normalized_raw(endpoint, cal)
+    for at, fraction in (
+        (0.0, 0.0),
+        (2.0, 0.0),
+        (4.0, 0.5),
+        (6.0, 1.0),
+        (8.0, 1.0),
+        (10.0, 1.0),
+        (12.0, 0.5),
+        (14.0, 0.0),
+        (16.0, 0.0),
+    ):
+        task.elapsed_s = at
+        action = m.map_leader_action(task.get_action())
+        assert action[key] == pytest.approx(
+            native["reference"][key] + fraction * (expected - native["reference"][key])
+        )
+        assert all(action[k] == native["reference"][k] for k in KEYS if k != key)
+        assert task.body_phase_elapsed is None
+    plan = task.plan()
+    assert task.complete and plan["program_active_seconds"] == 16.0
+    assert plan["peer_side"] == side and plan["direction_raw"] == direction
+    assert plan["reference_raw"] == raw and plan["endpoint_raw"] == endpoint and plan["raw_step"] == 52
+    assert plan["travel_encoder_degrees"] == direction * 4.5703125
+    assert [(x["phase"], x["start_s"], x["end_s"]) for x in plan["phases"]] == [
+        (side + "_baseline", 0.0, 2.0),
+        (side + "_outward", 2.0, 6.0),
+        (side + "_endpoint_hold", 6.0, 10.0),
+        (side + "_retract", 10.0, 14.0),
+        (side + "_final_hold", 14.0, 16.0),
+    ]
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "side",
+        "direction",
+        "boolean_step",
+        "zero_step",
+        "large_step",
+        "unsupported_endpoint",
+        "fractional_reference",
+        "slow_rate",
+        "old_segment",
+    ],
+)
+def test_peer_maintained_refuses_geometry_without_flip_clamp_or_old_mode_change(fault):
+    m = adapter()
+    native = peer_workspace()
+    kwargs = {
+        "segment": "left-peer-maintained",
+        "peer_side": "left",
+        "peer_direction": -1,
+        "peer_raw_step": 52,
+    }
+    key = "arm_left_elbow_flex.pos"
+    if fault == "side":
+        kwargs["peer_side"] = "right"
+    elif fault == "direction":
+        kwargs["peer_direction"] = 0
+    elif fault == "boolean_step":
+        kwargs["peer_raw_step"] = True
+    elif fault == "zero_step":
+        kwargs["peer_raw_step"] = 0
+    elif fault == "large_step":
+        kwargs["peer_raw_step"] = 80
+    elif fault == "unsupported_endpoint":
+        kwargs["peer_raw_step"] = 79
+    elif fault == "fractional_reference":
+        native["reference"][key] += 0.01
+    elif fault == "slow_rate":
+        native["bounds"][key]["rate_per_s"] = 0.01
+    else:
+        kwargs["segment"] = "left-maintained"
+    with pytest.raises(ValueError):
+        m.SelectedLeftWorkload(native, **kwargs)
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "missing",
+        "p32",
+        "wrong_other_pid",
+        "firmware",
+        "calibration",
+        "unknown_field",
+        "bad_hash",
+        "missing_timing",
+        "future_timing",
+        "stale_marker",
+        "foreign_host",
+        "no_ack",
+    ],
+)
+def test_peer_maintained_requires_both_exact_baselines_before_first_outward(fault):
+    from contextlib import suppress
+
+    m = adapter()
+    native = peer_workspace()
+    task = m.SelectedLeftWorkload(
+        native, segment="left-peer-maintained", peer_side="left", peer_direction=-1, peer_raw_step=52
+    )
+    state = peer_baseline_state(native)
+    marker = state["evidence"]["accepted_host_action"]
+    proof = marker["teleop_elbow_settings"]
+    if fault == "missing":
+        marker.pop("teleop_elbow_settings")
+    elif fault == "p32":
+        proof["left"]["active"][4] = 32
+    elif fault == "wrong_other_pid":
+        proof["right"]["original"][5] = 1
+    elif fault == "firmware":
+        proof["right"]["active"][3] = 11
+    elif fault == "calibration":
+        proof["left"]["calibration"] = [3, 0, 0, 864, 3073]
+    elif fault == "unknown_field":
+        proof["right"]["allow_nonbaseline"] = True
+    elif fault == "bad_hash":
+        proof["sha256"] = "not-a-hash"
+    elif fault == "missing_timing":
+        proof["left"].pop("original_read_interval")
+    elif fault == "future_timing":
+        proof["right"]["active_read_interval"][1] = 5.0
+    elif fault == "stale_marker":
+        marker["intent_revision"] = 1
+    elif fault == "foreign_host":
+        marker["host_incarnation"] = str(uuid4())
+    else:
+        state["evidence"]["native_ack"] = False
+    with suppress(RuntimeError):
+        assert task.observe_peer_baseline(state) is False
+    task.elapsed_s = 2.0
+    assert m.map_leader_action(task.get_action()) == native["reference"]
+    task.elapsed_s = 2.01
+    with pytest.raises(RuntimeError, match="baseline"):
+        task.get_action()
+
+
+@pytest.mark.parametrize("side,direction", [("left", -1), ("right", 1)])
+def test_peer_maintained_rejoin_keeps_absolute_geometry_and_no_dwell_reset(side, direction):
+    m = adapter()
+    native = peer_workspace()
+    task = m.SelectedLeftWorkload(
+        native, segment=side + "-peer-maintained", peer_side=side, peer_direction=direction, peer_raw_step=52
+    )
+    state = peer_baseline_state(native)
+    assert task.observe_peer_baseline(state)
+    task.elapsed_s = 7.0
+    task.admit(10.0)
+    now = [10.0]
+    producer = m.FrameProducer(task, clock=lambda: now[0])
+    producer.workspace, producer.native_cursor = native, dict(native["reference"])
+    first = producer.capture({"grant_id": str(uuid4())}, body=m.ZERO_BODY)
+    task.freeze()
+    task.advance(70.0)
+    task.admit(70.0)
+    now[0] = 70.0
+    producer.native_cursor[task.elbow] += 0.5
+    producer.reacquire = True
+    fresh = producer.capture({"grant_id": str(uuid4())}, body=m.ZERO_BODY)
+    assert fresh["target"] == first["target"] and fresh["body"] == m.ZERO_BODY
+    assert fresh["source"]["sample_seq"] == 2 and fresh["source"]["grant_id"] != first["source"]["grant_id"]
+    assert task.elapsed_s == 7.0 and task.interrupted_phases == {side + "_endpoint_hold"}
+    assert task.plan()["reference"] == native["reference"]
+
+
+@pytest.mark.parametrize("fault", [None, "missing", "mismatched", "old_segment"])
+def test_peer_maintained_cli_requires_explicit_prestart_selection(monkeypatch, fault):
+    m = adapter()
+    seen = []
+
+    async def run(args):
+        seen.append(args)
+        return {}
+
+    monkeypatch.setattr(m, "run", run)
+    argv = [
+        "--source",
+        "virtual-leaders",
+        "--url",
+        "unused",
+        "--ca",
+        "unused",
+        "--storage-state",
+        "unused",
+        "--output",
+        "unused",
+        "--workload-segment",
+        "left-peer-maintained",
+        "--duration-seconds",
+        "16",
+        "--peer-side",
+        "left",
+        "--peer-direction",
+        "-1",
+        "--peer-raw-step",
+        "52",
+    ]
+    if fault == "missing":
+        argv = argv[:-2]
+    elif fault == "mismatched":
+        argv[argv.index("--peer-side") + 1] = "right"
+    elif fault == "old_segment":
+        argv[argv.index("--workload-segment") + 1] = "left-maintained"
+    if fault:
+        with pytest.raises(SystemExit):
+            m.main(argv)
+        assert seen == []
+    else:
+        m.main(argv)
+        assert (seen[0].peer_side, seen[0].peer_direction, seen[0].peer_raw_step) == ("left", -1, 52)
+        assert seen[0].bench_continuity is False
+
+
+@pytest.mark.parametrize("change", ["service", "run", "host", "proof_hash", "active_pid"])
+def test_peer_maintained_original_baseline_cannot_cross_operation_or_change_settings(change):
+    m = adapter()
+    native = peer_workspace()
+    task = m.SelectedLeftWorkload(
+        native, segment="right-peer-maintained", peer_side="right", peer_direction=1, peer_raw_step=52
+    )
+    state = peer_baseline_state(native)
+    assert task.observe_peer_baseline(state)
+    if change == "service":
+        state["service_incarnation"] = str(uuid4())
+    elif change in {"run", "host"}:
+        state["run"]["run_id" if change == "run" else "backend_incarnation"] = str(uuid4())
+    elif change == "proof_hash":
+        state["evidence"]["accepted_host_action"]["teleop_elbow_settings"]["sha256"] = "b" * 64
+    else:
+        state["evidence"]["accepted_host_action"]["teleop_elbow_settings"]["right"]["active"][4] = 32
+    with pytest.raises(RuntimeError):
+        task.observe_peer_baseline(state)
+
+
+@pytest.mark.parametrize("change", ["calibration_bool", "interval_backwards", "version_bool", "missing_id"])
+def test_peer_maintained_malformed_baseline_never_opens_outward_gate(change):
+    from contextlib import suppress
+
+    m = adapter()
+    native = peer_workspace()
+    task = m.SelectedLeftWorkload(
+        native, segment="left-peer-maintained", peer_side="left", peer_direction=-1, peer_raw_step=52
+    )
+    state = peer_baseline_state(native)
+    proof = state["evidence"]["accepted_host_action"]["teleop_elbow_settings"]
+    if change == "calibration_bool":
+        proof["left"]["calibration"] = [3, False, 1845, 864, 3073]
+    elif change == "interval_backwards":
+        proof["right"]["active_read_interval"] = [2.5, 2.0]
+    elif change == "version_bool":
+        proof["version"] = True
+    else:
+        state["run"]["run_id"] = None
+    with suppress(RuntimeError):
+        assert task.observe_peer_baseline(state) is False
+    task.elapsed_s = 2.01
+    with pytest.raises(RuntimeError, match="baseline"):
+        task.get_action()
+
+
+def test_peer_maintained_run_refuses_invalid_prestart_selection_before_output_or_client(
+    tmp_path, monkeypatch
+):
+    import asyncio
+    from types import SimpleNamespace
+
+    m = adapter()
+    output = tmp_path / "not-created"
+    monkeypatch.setattr(
+        m, "SessionClient", lambda *a, **k: pytest.fail("peer invalid selection created client")
+    )
+    args = SimpleNamespace(
+        source="virtual-leaders",
+        workload_segment="right-peer-maintained",
+        peer_side="left",
+        peer_direction=1,
+        peer_raw_step=52,
+        output=output,
+    )
+    with pytest.raises(ValueError, match="matching side"):
+        asyncio.run(m.run(args))
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("side,bench", [("left", False), ("right", False), ("left", True), ("right", True)])
+def test_peer_maintained_cli_explicit_bench_keeps_ordinary_default(monkeypatch, side, bench):
+    m = adapter()
+    seen = []
+    async def run(args):
+        seen.append(args)
+        return {}
+    monkeypatch.setattr(m, "run", run)
+    argv = ["--source", "virtual-leaders", "--url", "unused", "--ca", "unused", "--storage-state", "unused",
+            "--output", "unused", "--workload-segment", side + "-peer-maintained", "--duration-seconds", "16",
+            "--peer-side", side, "--peer-direction", "-1" if side == "left" else "1", "--peer-raw-step", "52"]
+    if bench:
+        argv.append("--bench-continuity")
+    m.main(argv)
+    assert len(seen) == 1 and seen[0].bench_continuity is bench
+    assert seen[0].workload_segment == side + "-peer-maintained" and seen[0].peer_raw_step == 52
+    assert seen[0].interrupt_at_seconds is None and seen[0].next_start_seconds is None
+@pytest.mark.parametrize(
+    "side,q0,start,end,direction", [("left", 2043, 2067, 2015, -1), ("right", 1861, 1855, 1907, 1)]
+)
+def test_peer_fixed_preparation_keeps_exact_interval_and_actual_reference(side, q0, start, end, direction):
+    m = adapter()
+    native = peer_workspace()
+    key = f"arm_{side}_elbow_flex.pos"
+    cal = native["calibration"][key[:-4]]
+    native["reference"][key] = m.normalized_raw(q0, cal)
+    task = m.SelectedLeftWorkload(
+        native, segment=side + "-peer-fixed", peer_side=side, peer_direction=direction, peer_raw_step=52
+    )
+    assert task.observe_peer_baseline(peer_baseline_state(native)) is True
+    origin = dict(native["reference"])
+    start_value, end_value = m.normalized_raw(start, cal), m.normalized_raw(end, cal)
+    for at, expected in (
+        (0.0, origin[key]),
+        (2.0, (origin[key] + start_value) / 2),
+        (4.0, start_value),
+        (5.0, start_value),
+        (6.0, start_value),
+        (8.0, (start_value + end_value) / 2),
+        (10.0, end_value),
+        (12.0, end_value),
+        (14.0, end_value),
+        (16.0, (end_value + start_value) / 2),
+        (18.0, start_value),
+        (20.0, start_value),
+    ):
+        task.elapsed_s = at
+        action = m.map_leader_action(task.get_action())
+        assert action[key] == pytest.approx(expected)
+        assert all(action[k] == origin[k] for k in KEYS if k != key)
+        assert task.body_phase_elapsed is None
+    plan = task.plan()
+    assert task.complete and plan["program_active_seconds"] == 20.0
+    assert plan["reference"] == origin and plan["reference_raw"] == q0
+    assert (plan["comparison_start_raw"], plan["endpoint_raw"], plan["raw_step"]) == (start, end, 52)
+    assert [(p["phase"], p["start_s"], p["end_s"]) for p in plan["phases"]] == [
+        (side + "_prepare", 0.0, 4.0),
+        (side + "_baseline", 4.0, 6.0),
+        (side + "_outward", 6.0, 10.0),
+        (side + "_endpoint_hold", 10.0, 14.0),
+        (side + "_retract", 14.0, 18.0),
+        (side + "_final_hold", 18.0, 20.0),
+    ]
+    assert (
+        plan["comparison_start_qualification"] == "commanded preparation; achieved pose assessed separately"
+    )
+
+
+@pytest.mark.parametrize("fault", ["direction", "step", "unsupported_reference", "rate", "relative_p32"])
+def test_peer_fixed_refuses_retargeting_or_unsupported_preparation(fault):
+    m = adapter()
+    native = peer_workspace()
+    kwargs = {"segment": "left-peer-fixed", "peer_side": "left", "peer_direction": -1, "peer_raw_step": 52}
+    if fault == "direction":
+        kwargs["peer_direction"] = 1
+    elif fault == "step":
+        kwargs["peer_raw_step"] = 51
+    elif fault == "unsupported_reference":
+        native["reference"]["arm_left_elbow_flex.pos"] = m.normalized_raw(
+            2010, native["calibration"]["arm_left_elbow_flex"]
+        )
+    elif fault == "rate":
+        native["bounds"]["arm_left_elbow_flex.pos"]["rate_per_s"] = 0.01
+    else:
+        kwargs.update(segment="left-peer-maintained", peer_active_p=32)
+    with pytest.raises(ValueError):
+        m.SelectedLeftWorkload(native, **kwargs)
+
+
+@pytest.mark.parametrize("side,direction", [("left", -1), ("right", 1)])
+def test_peer_fixed_rejoin_retains_preparation_and_endpoint_clock(side, direction):
+    m = adapter()
+    native = peer_workspace()
+    task = m.SelectedLeftWorkload(
+        native, segment=side + "-peer-fixed", peer_side=side, peer_direction=direction, peer_raw_step=52
+    )
+    assert task.observe_peer_baseline(peer_baseline_state(native))
+    task.elapsed_s = 11.0
+    task.admit(20.0)
+    now = [20.0]
+    producer = m.FrameProducer(task, clock=lambda: now[0])
+    producer.workspace, producer.native_cursor = native, dict(native["reference"])
+    before = producer.capture({"grant_id": str(uuid4())}, body=m.ZERO_BODY)
+    original = task.plan()
+    task.freeze()
+    task.advance(100.0)
+    task.admit(100.0)
+    now[0] = 100.0
+    producer.native_cursor[task.elbow] += 0.5
+    producer.reacquire = True
+    after = producer.capture({"grant_id": str(uuid4())}, body=m.ZERO_BODY)
+    assert after["target"] == before["target"] and after["body"] == m.ZERO_BODY
+    assert after["source"]["sample_seq"] == before["source"]["sample_seq"] + 1
+    assert after["source"]["grant_id"] != before["source"]["grant_id"]
+    assert task.elapsed_s == 11.0 and task.interrupted_phases == {side + "_endpoint_hold"}
+    assert all(
+        task.plan()[key] == original[key]
+        for key in ("reference", "comparison_start_raw", "endpoint_raw", "phases")
+    )
+
+
+def test_peer_fixed_requires_verified_settings_before_preparation_motion():
+    m = adapter()
+    native = peer_workspace()
+    task = m.SelectedLeftWorkload(
+        native, segment="left-peer-fixed", peer_side="left", peer_direction=-1, peer_raw_step=52
+    )
+    assert m.map_leader_action(task.get_action()) == native["reference"]
+    task.elapsed_s = 0.01
+    with pytest.raises(RuntimeError, match="baseline"):
+        task.get_action()
+
+
+def test_peer_fixed_retains_actual_achieved_start_without_precision_gate():
+    m = adapter()
+    native = peer_workspace()
+    task = m.SelectedLeftWorkload(
+        native, segment="left-peer-fixed", peer_side="left", peer_direction=-1, peer_raw_step=52
+    )
+    state = peer_baseline_state(native)
+    state["evidence"]["measured_positions"] = dict(native["reference"])
+    state["evidence"]["measured_positions"][task.elbow] = m.normalized_raw(
+        2043, native["calibration"][task.elbow[:-4]]
+    )
+    assert task.observe_peer_baseline(state)
+    task.elapsed_s = 6.01
+    assert task.observe_peer_baseline(state)
+    observation = task.plan()["comparison_start_observation"]
+    assert observation["measured_positions"] == state["evidence"]["measured_positions"]
+    assert observation["accepted_host_action"] == state["evidence"]["accepted_host_action"]
+    assert observation["commanded_start_raw"] == 2067 and observation["position_qualified"] is False
+    state["evidence"]["measured_positions"][task.elbow] += 0.1
+    task.elapsed_s = 12.0
+    assert task.observe_peer_baseline(state)
+    assert task.plan()["comparison_start_observation"] == observation
+    assert m.map_leader_action(task.get_action())[task.elbow] == pytest.approx(task.endpoint)
+
+
+@pytest.mark.parametrize(
+    "side,active_p,bench",
+    [("left", None, False), ("right", 16, False), ("left", 32, True), ("right", 32, True)],
+)
+def test_peer_fixed_cli_declares_explicit_interval_and_active_settings(monkeypatch, side, active_p, bench):
+    m = adapter()
+    seen = []
+
+    async def run(args):
+        seen.append(args)
+        return {}
+
+    monkeypatch.setattr(m, "run", run)
+    argv = [
+        "--source",
+        "virtual-leaders",
+        "--url",
+        "unused",
+        "--ca",
+        "unused",
+        "--storage-state",
+        "unused",
+        "--output",
+        "unused",
+        "--workload-segment",
+        side + "-peer-fixed",
+        "--duration-seconds",
+        "20",
+        "--peer-side",
+        side,
+        "--peer-direction",
+        "-1" if side == "left" else "1",
+        "--peer-raw-step",
+        "52",
+    ]
+    if active_p is not None:
+        argv += ["--peer-active-p", str(active_p)]
+    if bench:
+        argv.append("--bench-continuity")
+    m.main(argv)
+    assert len(seen) == 1 and seen[0].peer_active_p is active_p and seen[0].bench_continuity is bench
+    assert seen[0].workload_segment == side + "-peer-fixed" and seen[0].duration_seconds == 20.0
+    assert seen[0].interrupt_at_seconds is None and seen[0].next_start_seconds is None
+
+
+def peer_fixed_trial_state(native, side, proportional):
+    state = peer_baseline_state(native)
+    proof = state["evidence"]["accepted_host_action"]["teleop_elbow_settings"]
+    proof[side]["active"][4] = proportional
+    proof["version"] = 2
+    proof["trial"] = [side+"-response-p", "b"*64, str(uuid4()), proportional]
+    for role in ("left", "right"):
+        row = proof[role]
+        proof[role] = [row["calibration"], row["original"], row["active"],
+                       row["original_read_interval"] + row["active_read_interval"]]
+    return state
+
+
+@pytest.mark.parametrize(
+    "side,proportional,trial",
+    [
+        ("left", 16, False),
+        ("right", 16, False),
+        ("left", 16, True),
+        ("right", 16, True),
+        ("left", 32, True),
+        ("right", 32, True),
+    ],
+)
+def test_peer_fixed_requires_exact_current_trial_for_selected_temporary_p(side, proportional, trial):
+    m = adapter()
+    native = peer_workspace()
+    key = f"arm_{side}_elbow_flex.pos"
+    native["reference"][key] = m.normalized_raw(
+        1861 if side == "right" else 2043, native["calibration"][key[:-4]]
+    )
+    task = m.SelectedLeftWorkload(
+        native,
+        segment=side + "-peer-fixed",
+        peer_side=side,
+        peer_direction=-1 if side == "left" else 1,
+        peer_raw_step=52,
+        peer_active_p=proportional,
+    )
+    state = peer_fixed_trial_state(native, side, proportional) if trial else peer_baseline_state(native)
+    assert task.observe_peer_baseline(state)
+    task.elapsed_s = 2.0
+    assert m.map_leader_action(task.get_action())[task.elbow] != native["reference"][task.elbow]
+    plan = task.plan()
+    assert plan["comparison_active_p"] == proportional and plan["baseline_settings_verified"] is True
+    if trial:
+        assert (
+            plan["baseline_settings_binding"]["trial"]
+            == state["evidence"]["accepted_host_action"]["teleop_elbow_settings"]["trial"]
+        )
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "missing",
+        "other_side",
+        "segment",
+        "original_p",
+        "configured_p",
+        "hash",
+        "source",
+        "request_id",
+        "original_hash",
+        "nan",
+        "backwards",
+        "future",
+        "old_original",
+        "early_active",
+        "extra",
+        "other_active",
+        "relative",
+        "changed_request",
+        "changed_source",
+    ],
+)
+def test_peer_fixed_temporary_proof_never_weakens_settings_or_operation_binding(fault):
+    m = adapter()
+    native = peer_workspace()
+    kwargs = {
+        "segment": "left-peer-fixed",
+        "peer_side": "left",
+        "peer_direction": -1,
+        "peer_raw_step": 52,
+        "peer_active_p": 32,
+    }
+    if fault == "relative":
+        kwargs.update(segment="left-peer-maintained", peer_active_p=None)
+    task = m.SelectedLeftWorkload(native, **kwargs)
+    state = peer_fixed_trial_state(native, "left", 32)
+    proof = state["evidence"]["accepted_host_action"]["teleop_elbow_settings"]
+    trial = proof["trial"]
+    if fault in {"changed_request", "changed_source"}:
+        assert task.observe_peer_baseline(state)
+        if fault == "changed_request":
+            trial[2] = str(uuid4())
+        else:
+            proof["sha256"] = "e" * 64
+    elif fault == "missing":
+        proof.pop("trial")
+    elif fault == "other_side":
+        trial[0] = "right-response-p"
+    elif fault == "segment":
+        trial.append("left-maintained")
+    elif fault == "original_p":
+        proof["left"][1][4] = 32
+    elif fault == "configured_p":
+        trial[3] = 16
+    elif fault == "hash":
+        trial[1] = "not-a-hash"
+    elif fault == "source":
+        proof["sha256"] = "not-a-source-proof"
+    elif fault == "request_id":
+        trial[2] = "not-a-uuid"
+    elif fault == "original_hash":
+        trial[1] = "not-an-original-request-hash"
+    elif fault == "nan":
+        proof["left"][3][0] = float("nan")
+    elif fault == "backwards":
+        proof["left"][3][0] = 2.
+    elif fault == "future":
+        proof["left"][3][-1] = 4.
+    elif fault == "old_original":
+        proof["left"][3][1] = 2.1
+    elif fault == "early_active":
+        proof["left"][3][2] = 2.5
+    elif fault == "extra":
+        trial.append("unknown")
+    elif fault == "other_active":
+        proof["right"][2][4] = 32
+    with pytest.raises(RuntimeError, match="baseline"):
+        task.observe_peer_baseline(state)
+    task.elapsed_s = 2.01 if fault == "relative" else 0.01
+    if fault not in {"changed_request", "changed_source"}:
+        with pytest.raises(RuntimeError, match="baseline"):
+            task.get_action()
+
+
+@pytest.mark.parametrize("side,proportional", [("left", 16), ("right", 16), ("left", 32), ("right", 32)])
+def test_peer_fixed_v2_trial_fits_existing_gate_with_current_ack(side, proportional):
+    m = adapter()
+    native = peer_workspace()
+    key = f"arm_{side}_elbow_flex.pos"
+    native["reference"][key] = m.normalized_raw(2043 if side == "left" else 1861,
+                                               native["calibration"][key[:-4]])
+    task = m.SelectedLeftWorkload(native, segment=side+"-peer-fixed", peer_side=side,
+                                 peer_direction=-1 if side == "left" else 1,
+                                 peer_raw_step=52, peer_active_p=proportional)
+    state = peer_fixed_trial_state(native, side, proportional)
+    assert task.observe_peer_baseline(state)
+    original = task.plan()["baseline_settings_binding"]
+    task.elapsed_s = 1.
+    assert m.map_leader_action(task.get_action())[task.elbow] != native["reference"][task.elbow]
+    state["run"]["intent_revision"] += 1
+    state["evidence"]["acknowledged_intent_revision"] += 1
+    state["evidence"]["accepted_host_action"]["intent_revision"] += 1
+    assert task.observe_peer_baseline(state)
+    assert task.plan()["baseline_settings_binding"] == original
+
+
+@pytest.mark.parametrize("fault", ["ordinary", "relative", "extra", "version", "missing_trial", "trial_width",
+                                  "trial_side", "trial_hash", "trial_uuid", "trial_p", "row_width", "calibration",
+                                  "original_p", "nonselected_p", "backwards", "future", "changed_request", "changed_proof"])
+def test_peer_fixed_v2_rejects_foreign_or_malformed_trial(fault):
+    m = adapter()
+    native = peer_workspace()
+    task = m.SelectedLeftWorkload(native, segment="left-peer-fixed", peer_side="left", peer_direction=-1,
+                                 peer_raw_step=52, peer_active_p=32)
+    state = peer_fixed_trial_state(native, "left", 32)
+    proof = state["evidence"]["accepted_host_action"]["teleop_elbow_settings"]
+    if fault in {"changed_request", "changed_proof"}:
+        assert task.observe_peer_baseline(state)
+        if fault == "changed_request":
+            proof["trial"][2] = str(uuid4())
+        else:
+            proof["sha256"] = "e" * 64
+    elif fault == "ordinary":
+        task = m.SelectedLeftWorkload(native)
+    elif fault == "relative":
+        task = m.SelectedLeftWorkload(native, segment="left-peer-maintained", peer_side="left", peer_direction=-1, peer_raw_step=52)
+    elif fault == "extra":
+        proof["extra"] = True
+    elif fault == "version":
+        proof["version"] = True
+    elif fault == "missing_trial":
+        del proof["trial"]
+    elif fault == "trial_width":
+        proof["trial"].append("extra")
+    elif fault == "trial_side":
+        proof["trial"][0] = "right-response-p"
+    elif fault == "trial_hash":
+        proof["trial"][1] = "g" * 64
+    elif fault == "trial_uuid":
+        proof["trial"][2] = "not-a-uuid"
+    elif fault == "trial_p":
+        proof["trial"][3] = 16
+    elif fault == "row_width":
+        proof["left"].append("extra")
+    elif fault == "calibration":
+        proof["left"][0][2] += 1
+    elif fault == "original_p":
+        proof["left"][1][4] = 32
+    elif fault == "nonselected_p":
+        proof["right"][2][4] = 32
+    elif fault == "backwards":
+        proof["left"][3] = [2., 1., 2., 3.]
+    elif fault == "future":
+        proof["left"][3][-1] = 99.
+    if fault == "ordinary":
+        assert task.observe_peer_baseline(state) is False
+    else:
+        with pytest.raises(RuntimeError, match="baseline"):
+            task.observe_peer_baseline(state)
+
+
+@pytest.mark.parametrize("proportional", [16, 32])
+def test_peer_fixed_v1_rejects_obsolete_trial_wire_shape(proportional):
+    m = adapter()
+    native = peer_workspace()
+    task = m.SelectedLeftWorkload(native, segment="left-peer-fixed", peer_side="left", peer_direction=-1,
+                                 peer_raw_step=52, peer_active_p=proportional)
+    state = peer_baseline_state(native)
+    proof = state["evidence"]["accepted_host_action"]["teleop_elbow_settings"]
+    proof["left"]["active"][4] = proportional
+    proof["trial"] = ["left-response-p", "b"*64, "c"*40, str(uuid4()), "left-peer-fixed", 16,
+                       proportional, "d"*64, 1.1, 1.2]
+    with pytest.raises(RuntimeError, match="baseline"):
+        task.observe_peer_baseline(state)
+
+
+@pytest.mark.parametrize("selected_p", [16, 32])
+def test_peer_fixed_v1_cannot_credit_active_p32_without_trial(selected_p):
+    m = adapter()
+    native = peer_workspace()
+    task = m.SelectedLeftWorkload(native, segment="left-peer-fixed", peer_side="left", peer_direction=-1,
+                                 peer_raw_step=52, peer_active_p=selected_p)
+    state = peer_baseline_state(native)
+    state["evidence"]["accepted_host_action"]["teleop_elbow_settings"]["left"]["active"][4] = 32
+    with pytest.raises(RuntimeError, match="baseline"):
+        task.observe_peer_baseline(state)

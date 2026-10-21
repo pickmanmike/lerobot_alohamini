@@ -857,13 +857,24 @@ def _install_group_reply_guard(robot, side, bus):
     )
 
 
-def prepare_settings(robot):
-    """Capture installed position-role settings without writing a tuning profile."""
+def prepare_settings(robot, *, defer_temperature_baseline=False):
+    """Capture installed settings; only the selected OFF transaction may defer its first history."""
     if not binding_valid(robot):
         raise RuntimeError("AM1 teleop settings need the protected binding")
+    if defer_temperature_baseline:
+        if (sum(getattr(robot, "_am1_" + side + "_response_p_binding", None) is not None
+                for side in ("left", "right")) != 1
+                or getattr(robot, "_am1_teleop_temperatures", None)
+                or hasattr(robot, "_am1_teleop_initial_temperature_deadline")):
+            raise RuntimeError("AM1 selected initial thermal acquisition cannot be reused or reset")
+        # Private original/configured durability consumes this same finite startup budget.
+        robot._am1_teleop_initial_temperature_deadline = time.monotonic() + 1.0
+        robot._am1_teleop_initial_temperature_binding = copy.deepcopy(robot._am1_teleop_binding)
+        robot._am1_teleop_initial_temperature_pending = True
     for side, bus, _names in _groups(robot):
         _install_group_reply_guard(robot, side, bus)
-    records = read_groups(robot, (*STATIC, *HEALTH), active=False)
+    health = tuple(k for k in HEALTH if k != "Present_Temperature") if defer_temperature_baseline else HEALTH
+    records = read_groups(robot, (*STATIC, *health), active=False)
     robot._am1_teleop_settings = records
     for side, bus, names in _groups(robot):
         rows = records[side]["registers"]
@@ -885,10 +896,49 @@ def prepare_settings(robot):
                 or not 0 < rows["Min_Voltage_Limit"][name] < rows["Max_Voltage_Limit"][name]
             ):
                 raise RuntimeError("AM1 teleop installed protection settings are invalid: " + name)
+    if defer_temperature_baseline:
+        check_initial_temperature_budget(robot)
+        return
     check_health(robot, records, active=False)
     robot._am1_teleop_startup_temperature = True
-    deadline = time.monotonic() + 1.0
+    _qualify_initial_temperatures(robot, time.monotonic() + 1.0)
+
+
+def check_initial_temperature_budget(robot):
+    """The selected OFF preparation cannot restart its original qualification clock."""
+    if (not binding_valid(robot)
+            or getattr(robot, "_am1_shutdown_in_progress", False) is True
+            or getattr(robot, "_am1_teleop_initial_temperature_pending", None) is not True
+            or robot._am1_teleop_binding != robot._am1_teleop_initial_temperature_binding):
+        raise RuntimeError("AM1 selected initial thermal acquisition owner/phase changed")
+    if getattr(robot, "_am1_teleop_first_error", None) is not None:
+        raise robot._am1_teleop_first_error
+    deadline = robot._am1_teleop_initial_temperature_deadline
+    if type(deadline) not in (int, float) or not math.isfinite(deadline) or time.monotonic() >= deadline:
+        raise RuntimeError("AM1 teleop original follower baseline acquisition expired")
+    return deadline
+
+
+def qualify_startup_temperatures(robot):
+    """First genuine follower histories after the selected transaction's private OFF work."""
+    deadline = check_initial_temperature_budget(robot)
+    if getattr(robot, "_am1_teleop_temperatures", None):
+        raise RuntimeError("AM1 selected initial thermal acquisition cannot be reused or reset")
+    records = read_groups(robot, ("Present_Temperature",), active=False)
+    for side in records:
+        for key in ("registers", "timing"):
+            robot._am1_teleop_settings[side][key].update(records[side][key])
+        robot._am1_teleop_settings[side]["temperature"] = records[side]["temperature"]
+    robot._am1_teleop_startup_temperature = True
+    _qualify_initial_temperatures(robot, deadline)
+    check_initial_temperature_budget(robot)
+    robot._am1_teleop_initial_temperature_pending = False
+
+
+def _qualify_initial_temperatures(robot, deadline):
     while not all(state["window"].ready for state in robot._am1_teleop_temperatures.values()):
+        if getattr(robot, "_am1_teleop_initial_temperature_pending", False):
+            check_initial_temperature_budget(robot)
         if time.monotonic() >= deadline:
             raise RuntimeError("AM1 teleop original follower baseline acquisition expired")
         next_slot = min(
@@ -903,10 +953,85 @@ def prepare_settings(robot):
     _fresh_temperatures(robot)
 
 
+def _response_receipt(robot, side):
+    """Read-free proof for one explicitly admitted response comparison."""
+    binding = getattr(robot, "_am1_" + side + "_response_p_binding", None)
+    trial = getattr(robot, "_am1_" + side + "_response_p_trial", None)
+    if binding is None and trial is None:
+        return None
+    from .am1_elbow_integral import AM1LeftResponseProportionalTrial, AM1RightResponseProportionalTrial
+
+    other = "right" if side == "left" else "left"
+    trial_type = AM1LeftResponseProportionalTrial if side == "left" else AM1RightResponseProportionalTrial
+    if (not binding_valid(robot) or type(trial) is not trial_type or trial.binding != binding
+            or getattr(robot, "_am1_" + other + "_response_p_binding", None) is not None
+            or getattr(robot, "_am1_" + other + "_response_p_trial", None) is not None):
+        raise RuntimeError(f"AM1 {side} response transaction binding changed")
+    receipt = trial.active_receipt(robot)
+    allowed = ("left-maintained", "left-reach", "left-peer-fixed") if side == "left" else ("right-peer-fixed",)
+    if (receipt.get("kind") != side + "-response-p" or receipt.get("original_p") != 16
+            or receipt.get("configured_p") not in (16, 32) or receipt.get("restore_required") is not True
+            or receipt.get("workload_segment") not in allowed
+            or any(receipt.get(key) != robot._am1_teleop_binding[key] for key in ("run_id", "host_incarnation"))):
+        raise RuntimeError(f"AM1 {side} response active settings proof differs")
+    return receipt
+
+
+def left_response_receipt(robot):
+    """Retain the existing left receipt API and exact receipt shape."""
+    return _response_receipt(robot, "left")
+
+
+def right_response_receipt(robot):
+    return _response_receipt(robot, "right")
+
+
+def response_receipt(robot):
+    return left_response_receipt(robot) or right_response_receipt(robot)
+
+
+def _left_response_target_valid(robot, control, sample):
+    receipt = response_receipt(robot)
+    if receipt is None:
+        return True
+    from examples.alohamini.am1_live_teleop import ZERO_BODY
+
+    if not isinstance(sample.get("source"), dict) or sample["source"].get("kind") != "virtual-leaders":
+        return False
+    if set(sample["body"]) != set(ZERO_BODY) or any(sample["body"][key] != 0 for key in ZERO_BODY):
+        return False
+    workspace = control._live_summary["workspace"]
+    side = "left" if receipt["kind"] == "left-response-p" else "right"
+    allowed = {"arm_" + side + "_elbow_flex.pos"}
+    if receipt["workload_segment"] == "left-reach":
+        allowed.add("arm_left_gripper.pos")
+    for key, reference in workspace["reference"].items():
+        if key in allowed:
+            continue
+        cal = workspace["calibration"][key.removesuffix(".pos")]
+        tick = (100 if key.endswith("_gripper.pos") else 200) / (cal[4] - cal[3])
+        if abs(sample["target"][key] - reference) > tick + 1e-9:
+            return False
+    return True
+
+
 def verify_settings(robot):
     records = read_groups(robot, (*STATIC, *HEALTH), active=True)
+    expected = {side: {register: dict(robot._am1_teleop_settings[side]["registers"][register])
+                       for register in STATIC} for side, _, _ in _groups(robot)}
+    trial = response_receipt(robot)
+    if trial is not None:
+        side = "left" if trial["kind"] == "left-response-p" else "right"
+        if trial["workload_segment"].endswith("-peer-fixed"):
+            for role in ("left", "right"):
+                name = "arm_" + role + "_elbow_flex"
+                if expected[role]["P_Coefficient"][name] != 16:
+                    raise RuntimeError("AM1 response both original elbow baselines differ")
+        if expected[side]["P_Coefficient"]["arm_" + side + "_elbow_flex"] != 16:
+            raise RuntimeError(f"AM1 {side} response original baseline differs")
+        expected[side]["P_Coefficient"]["arm_" + side + "_elbow_flex"] = trial["configured_p"]
     if any(
-        records[side]["registers"][register] != robot._am1_teleop_settings[side]["registers"][register]
+        records[side]["registers"][register] != expected[side][register]
         for side, _, _ in _groups(robot)
         for register in STATIC
     ):
@@ -1221,6 +1346,8 @@ def before_write(control, robot):
     # intermediate collection guard still checks original RAW freshness.
     if getattr(robot, "_am1_thermal_history_enabled", False):
         service_due_feedback(robot)
+    if getattr(control, "live_sample", None) is not None and not _left_response_target_valid(robot, control, control.live_sample):
+        raise RuntimeError("AM1 left response nonselected target or body changed before write")
     control.before_live_write(robot)  # A genuine read cannot renew input expiry.
     status = thermal_history_status(robot)
     if status is not None and status["deficit_started_at_monotonic_s"] is not None and (
@@ -1365,6 +1492,8 @@ def apply_frame(control, robot, command, marker_key):
         try:
             validate_target(original["target"], workspace=control._live_summary["workspace"])
             validate_body(original["body"])
+            if not _left_response_target_valid(robot, control, original):
+                return False
             if original != control.live_sample:
                 validate_source(
                     original["source"], grant_id=original["grant_id"], previous=control._teleop_source

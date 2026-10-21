@@ -2364,3 +2364,550 @@ def test_pending_pause_ack_exact_accepted_hold_preserves_existing_plus_two_rule(
         assert e._fault is None
     finally:
         stop()
+
+
+@pytest.mark.parametrize("recipe,present", [("physical-live-teleop", True),
+    ("physical-live-teleop", False), ("physical-arm-hold-body", True)])
+def test_left_response_request_is_bound_before_any_owned_unit(tmp_path, monkeypatch, recipe, present):
+    from examples.alohamini.am1_session_contract import RECIPES
+    from lerobot.robots.alohamini import am1_elbow_integral as gains
+    from tests.robots.test_am1_elbow_integral import RIGHT_P20_HOST, RIGHT_P20_RUN
+    m = module()
+    state, root = tmp_path / "state", tmp_path / "runs"
+    state.mkdir(mode=0o700)
+    root.mkdir(mode=0o700)
+    provider = object.__new__(m.ProtectedHostRun)
+    provider.config = {"physical_state_directory": str(state), "run_root": str(root), "host_head": "a" * 40,
+        "host_repository": str(tmp_path), "host_python": "unused-python", "camera_python": "unused-python",
+        "camera_repository": str(tmp_path), "camera_config": str(tmp_path / "config"),
+        "camera_credentials": str(tmp_path / "credentials"), "camera_binary": str(tmp_path / "binary"),
+        "camera_state": str(tmp_path / "camera")}
+    provider.observation = SimpleNamespace()
+    monkeypatch.setattr(provider, "_validate_source", lambda: None)
+    monkeypatch.setattr(m, "wait_required_camera", lambda *args: None)
+    owned, calls = [], []
+    descriptor = root / RIGHT_P20_RUN[:8] / "left-response-p.json"
+    def consume(actual_state, directory, actual_recipe, run, host, source):
+        assert not owned, "comparison authority must qualify before camera or motor ownership"
+        assert (actual_state, directory, actual_recipe, run, host, source) == (
+            state, root / RIGHT_P20_RUN[:8], recipe, RIGHT_P20_RUN, RIGHT_P20_HOST, "a" * 40)
+        calls.append(actual_recipe)
+        if present and actual_recipe != "physical-live-teleop":
+            raise ValueError("left comparison requires the whole-arm shared path")
+        if present:
+            descriptor.write_text("{}")
+            return descriptor
+        return None
+    monkeypatch.setattr(gains, "consume_left_response_p_request", consume, raising=False)
+    monkeypatch.setattr(gains, "consume_right_p20_request", lambda *args: None)
+    def unit(name, *args, **kwargs):
+        owned.append((name, args))
+        if "host" in name:
+            raise OSError("stop before hardware host creation")
+        return SimpleNamespace()
+    monkeypatch.setattr(m, "OwnedUnit", unit)
+    if present and recipe != "physical-live-teleop":
+        with pytest.raises(ValueError, match="whole-arm shared path"):
+            provider.start(RIGHT_P20_RUN, RIGHT_P20_HOST, RECIPES[recipe], lambda: None)
+        assert not owned and calls == [recipe]
+    else:
+        with pytest.raises(OSError, match="before hardware"):
+            provider.start(RIGHT_P20_RUN, RIGHT_P20_HOST, RECIPES[recipe], lambda: None)
+        assert calls == [recipe]
+        command = owned[-1][1][1]
+        option = "--am1-left-response-p-trial-file"
+        if present:
+            assert command[command.index(option) + 1] == str(descriptor)
+        else:
+            assert option not in command
+
+def test_current_selected_elbow_settings_cross_existing_ack_without_goal_payload():
+    """Keep the ordinary essential ACK while admitting cached baseline evidence."""
+    import hashlib
+    import json
+
+    from lerobot.robots.alohamini.am1_live_teleop import STATIC
+    from tools.am1_session_core import _status_small
+
+    m = module()
+    client = client_sample()
+    marker = client.latest_am1_local_feedback
+    registers = dict.fromkeys(STATIC, 0)
+    registers.update(ID=3, Model_Number=777, Firmware_Major_Version=3, Firmware_Minor_Version=10,
+                     P_Coefficient=16, I_Coefficient=0, D_Coefficient=32, Operating_Mode=0)
+    timing = {k: {"read_started_at_monotonic_s": 8., "read_completed_at_monotonic_s": 8.01}
+              for k in STATIC}
+    proof = {side: {"motor": "arm_" + side + "_elbow_flex", "motor_id": 3,
+                    "calibration": [3, 0, offset, low, high],
+                    "original": dict(registers), "active": dict(registers),
+                    "original_read_timing": copy.deepcopy(timing),
+                    "active_read_timing": {k: {"read_started_at_monotonic_s": 8.1,
+                                               "read_completed_at_monotonic_s": 8.11} for k in STATIC}}
+             for side, offset, low, high in (("left", 1845, 864, 3073), ("right", -658, 827, 3039))}
+    selected = {"version": 1, "run_id": marker["run_id"], "host_incarnation": marker["host_incarnation"],
+                "epoch": marker["epoch"], "intent_revision": marker["intent_revision"],
+                "action_sequence": marker["accepted_action_sequence"], "observation_id": marker["observation_id"],
+                "acquired_at_monotonic_s": marker["acquired_at_monotonic_s"],
+                "teleop_elbow_settings": proof, "goal_readbacks": {"teleop_1": {"preserved": True}}}
+    marker["selected_joint"] = selected
+    marker["arm_feedback"] = {"version": 1, "positions": {
+        key: {"raw": 1800, "normalized": client.get_observation()[key],
+              "read_started_at_monotonic_s": 9.961, "read_completed_at_monotonic_s": 9.97}
+        for key in m.TELEOP_ARM_KEYS}}
+    sample = m.read_physical_sample(client, "run", "host", 4, clock=lambda: 10.)
+    compact = sample["ack"]["teleop_elbow_settings"]
+    assert compact["version"] == 1
+    assert compact["sha256"] == hashlib.sha256(
+        json.dumps(proof, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+    for side in ("left", "right"):
+        assert compact[side]["motor"] == proof[side]["motor"]
+        assert compact[side]["motor_id"] == 3
+        assert compact[side]["calibration"] == proof[side]["calibration"]
+        assert compact[side]["original"] == compact[side]["active"] == [3, 777, 3, 10, 16, 0, 32, 0]
+        assert compact[side]["original_read_interval"] == [8., 8.01]
+        assert compact[side]["active_read_interval"] == [8.1, 8.11]
+    assert "selected_joint" not in sample["ack"] and "goal_readbacks" not in sample["ack"]
+    assert sample["selected_joint"] == selected
+    assert sample["ack"]["acquired_at_monotonic_s"] == marker["acquired_at_monotonic_s"]
+    assert _status_small({"accepted_host_action": sample["ack"]})["accepted_host_action"] == sample["ack"]
+    proof["left"]["original"]["P_Coefficient"] = 32
+    assert compact["left"]["original"][4] == 16
+
+
+@pytest.mark.parametrize("field", ["run_id", "host_incarnation", "epoch", "intent_revision",
+                                   "action_sequence", "observation_id", "acquired_at_monotonic_s"])
+def test_foreign_selected_settings_cannot_cross_the_existing_ack(field):
+    m = module()
+    client = client_sample()
+    marker = client.latest_am1_local_feedback
+    selected = {"version": 1, "run_id": marker["run_id"], "host_incarnation": marker["host_incarnation"],
+                "epoch": marker["epoch"], "intent_revision": marker["intent_revision"],
+                "action_sequence": marker["accepted_action_sequence"], "observation_id": marker["observation_id"],
+                "acquired_at_monotonic_s": marker["acquired_at_monotonic_s"],
+                "teleop_elbow_settings": {"left": {}, "right": {}}}
+    selected[field] = selected[field] + 1 if type(selected[field]) in (int, float) else "foreign"
+    marker["selected_joint"] = selected
+    with pytest.raises(ValueError, match="foreign selected"):
+        m.read_physical_sample(client, "run", "host", 4, clock=lambda: 10.)
+
+
+def response_trial_sample(side="right", proportional=32):
+    from lerobot.robots.alohamini.am1_live_teleop import STATIC
+    from tests.robots.test_am1_elbow_integral import RIGHT_P20_HOST, RIGHT_P20_RUN
+
+    client = client_sample(run_id=RIGHT_P20_RUN, host_incarnation=RIGHT_P20_HOST)
+    marker = client.latest_am1_local_feedback
+    registers = dict.fromkeys(STATIC, 0)
+    registers.update(ID=3, Model_Number=777, Firmware_Major_Version=3, Firmware_Minor_Version=10,
+                     P_Coefficient=16, I_Coefficient=0, D_Coefficient=32, Operating_Mode=0)
+    proof = {}
+    for name, offset, low, high in (("left", 1845, 864, 3073), ("right", -658, 827, 3039)):
+        proof[name] = {"motor": "arm_" + name + "_elbow_flex", "motor_id": 3,
+                       "calibration": [3, 0, offset, low, high], "original": dict(registers),
+                       "active": {**registers, "P_Coefficient": proportional if name == side else 16},
+                       "original_read_timing": {key: {"read_started_at_monotonic_s": 8.,
+                           "read_completed_at_monotonic_s": 8.01} for key in STATIC},
+                       "active_read_timing": {key: {"read_started_at_monotonic_s": 8.1,
+                           "read_completed_at_monotonic_s": 8.11} for key in STATIC}}
+    proof["trial"] = {"version": 1, "kind": side + "-response-p", "run_id": RIGHT_P20_RUN,
+        "host_incarnation": RIGHT_P20_HOST, "request_sha256": "a" * 64, "source_head": "b" * 40,
+        "request_id": "66666666-6666-4666-8666-666666666666", "workload_segment": side + "-peer-fixed",
+        "original_p": 16, "configured_p": proportional, "restore_required": True,
+        "original_settings_sha256": "c" * 64, "prepared_at_monotonic_s": 8.03,
+        "configured_at_monotonic_s": 8.05}
+    marker["selected_joint"] = {"version": 1, "run_id": marker["run_id"],
+        "host_incarnation": marker["host_incarnation"], "epoch": marker["epoch"],
+        "intent_revision": marker["intent_revision"], "action_sequence": marker["accepted_action_sequence"],
+        "observation_id": marker["observation_id"], "acquired_at_monotonic_s": marker["acquired_at_monotonic_s"],
+        "teleop_elbow_settings": proof}
+    marker["arm_feedback"] = {"version": 1, "positions": {key: {
+        "raw": 1800, "normalized": client.get_observation()[key],
+        "read_started_at_monotonic_s": 9.961, "read_completed_at_monotonic_s": 9.97}
+        for key in module().TELEOP_ARM_KEYS}}
+    return client, proof
+
+
+@pytest.mark.parametrize("side", ["left", "right"])
+@pytest.mark.parametrize("proportional", [16, 32])
+def test_response_trial_compact_proof_fits_current_ack_without_replacing_full_evidence(side, proportional):
+    import hashlib
+    import json
+
+    from tools.am1_session_core import _status_small
+
+    m = module()
+    client, proof = response_trial_sample(side, proportional)
+    marker = client.latest_am1_local_feedback
+    sample = m.read_physical_sample(client, marker["run_id"], marker["host_incarnation"], 4, clock=lambda: 10.)
+    compact = sample["ack"].get("teleop_elbow_settings")
+    assert compact is not None, "current explicit response trial proof must reach the real ACK"
+    trial = proof["trial"]
+    fields = ("kind", "request_sha256", "request_id", "configured_p")
+    assert compact["version"] == 2
+    assert compact["trial"] == [trial[key] for key in fields]
+    assert compact[side][2][4] == proportional
+    assert compact["left"][1] == compact["right"][1] == [3, 777, 3, 10, 16, 0, 32, 0]
+    for name in ("left", "right"):
+        assert compact[name][0] == proof[name]["calibration"]
+        assert compact[name][3] == [8., 8.01, 8.1, 8.11]
+    assert compact["sha256"] == hashlib.sha256(
+        json.dumps(proof, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+    assert _status_small({"accepted_host_action": sample["ack"]})["accepted_host_action"] == sample["ack"]
+    assert sample["selected_joint"]["teleop_elbow_settings"] == proof
+    assert sample["ack"]["acquired_at_monotonic_s"] == marker["acquired_at_monotonic_s"]
+    proof["trial"]["configured_p"] = 64
+    assert compact["trial"][3] == proportional
+
+
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_response_trial_current_full_ack_with_thermal_history_survives_unchanged_cap(side):
+    import json
+
+    from tools.am1_session_core import _status_small
+
+    client = retained_native_sample99_client()
+    template, proof = response_trial_sample(side)
+    marker = client.latest_am1_local_feedback
+    marker.update(run_id=template.latest_am1_local_feedback["run_id"],
+                  host_incarnation=template.latest_am1_local_feedback["host_incarnation"])
+    marker["thermal_history"] = {"version": 1, "raw_sample_at_monotonic_s": 93298.34,
+        "peaks_ready": True, "deficit_started_at_monotonic_s": None,
+        "deficit_ceiling_monotonic_s": None, "hold_sample_at_monotonic_s": None,
+        "zero_read_started_at_monotonic_s": None, "zero_read_completed_at_monotonic_s": None}
+    marker["selected_joint"] = {"version": 1, "run_id": marker["run_id"],
+        "host_incarnation": marker["host_incarnation"], "epoch": marker["epoch"],
+        "intent_revision": marker["intent_revision"], "action_sequence": marker["accepted_action_sequence"],
+        "observation_id": marker["observation_id"], "acquired_at_monotonic_s": marker["acquired_at_monotonic_s"],
+        "teleop_elbow_settings": proof}
+    sample = module().read_physical_sample(client, marker["run_id"], marker["host_incarnation"], 98,
+                                          clock=lambda: 93298.4)
+    ack = sample["ack"]
+    assert ack["teleop_elbow_settings"]["version"] == 2
+    assert set(ack) == (set(marker) - {"selected_joint"}) | {"teleop_elbow_settings"}
+    assert ack["arm_feedback"] == marker["arm_feedback"]
+    assert ack["lift_feedback"] == marker["lift_feedback"]
+    assert ack["thermal_history"] == marker["thermal_history"]
+    assert 3500 < len(json.dumps(ack, sort_keys=True, separators=(",", ":")).encode()) <= 4096
+    assert _status_small({"accepted_host_action": ack})["accepted_host_action"] == ack
+    assert sample["selected_joint"]["teleop_elbow_settings"] == proof
+    # Exercise the actual PC consumer on the same full ACK, not a second hand-built wire schema.
+    from tests.robots.test_am1_leader_adapter import peer_baseline_state, peer_workspace
+    from tools.am1_leader_adapter import SelectedLeftWorkload
+
+    workspace = peer_workspace()
+    state = peer_baseline_state(workspace)
+    state["run"].update(run_id=marker["run_id"], backend_incarnation=marker["host_incarnation"],
+                        intent_revision=marker["intent_revision"])
+    state["evidence"].update(host_incarnation=marker["host_incarnation"],
+                            acknowledged_intent_revision=marker["intent_revision"], accepted_host_action=ack)
+    task = SelectedLeftWorkload(workspace, segment=side + "-peer-fixed", peer_side=side,
+                               peer_direction=-1 if side == "left" else 1, peer_raw_step=52, peer_active_p=32)
+    assert task.observe_peer_baseline(state)
+    ordinary = module()._teleop_elbow_settings_summary({name: proof[name] for name in ("left", "right")},
+                                                      marker["acquired_at_monotonic_s"])
+    state["evidence"]["accepted_host_action"] = {**ack, "teleop_elbow_settings": ordinary}
+    unbound = SelectedLeftWorkload(workspace, segment=side + "-peer-fixed", peer_side=side,
+                                  peer_direction=-1 if side == "left" else 1, peer_raw_step=52, peer_active_p=32)
+    with pytest.raises(RuntimeError, match="baseline"):
+        unbound.observe_peer_baseline(state)
+    # The existing cap still omits proof if a later ACK is larger; never discard its feedback to fit.
+    marker["retained_extra"] = "x" * 4096
+    larger = module().read_physical_sample(client, marker["run_id"], marker["host_incarnation"], 98,
+                                          clock=lambda: 93298.4)
+    assert "teleop_elbow_settings" not in larger["ack"]
+    assert larger["ack"]["arm_feedback"] == marker["arm_feedback"]
+    assert larger["selected_joint"]["teleop_elbow_settings"] == proof
+
+
+@pytest.mark.parametrize("bad", ["missing_owner", "run", "host", "version_bool", "restore", "kind", "segment",
+    "gain", "original", "hash", "source", "uuid", "nonfinite", "reversed", "after_active", "extra",
+    "peer_gain", "original_gain", "firmware", "calibration"])
+def test_response_trial_compact_proof_refuses_foreign_or_modified_original_without_requalification(bad):
+    from tests.robots.test_am1_elbow_integral import RIGHT_P20_HOST, RIGHT_P20_RUN
+
+    m = module()
+    _client, proof = response_trial_sample()
+    changes = {"run": ("run_id", "foreign"), "host": ("host_incarnation", "foreign"),
+        "version_bool": ("version", True), "restore": ("restore_required", False),
+        "kind": ("kind", "left-response-p"), "segment": ("workload_segment", "full"),
+        "gain": ("configured_p", 64), "original": ("original_p", 32), "hash": ("request_sha256", "f" * 63),
+        "source": ("source_head", "f" * 39), "uuid": ("request_id", "foreign"),
+        "nonfinite": ("prepared_at_monotonic_s", float("nan")),
+        "reversed": ("prepared_at_monotonic_s", 8.06),
+        "after_active": ("configured_at_monotonic_s", 8.12), "extra": ("arbitrary", 1)}
+    if bad in changes:
+        key, value = changes[bad]
+        proof["trial"][key] = value
+    elif bad == "peer_gain":
+        proof["left"]["active"]["P_Coefficient"] = 32
+    elif bad == "original_gain":
+        proof["right"]["original"]["P_Coefficient"] = 32
+    elif bad == "firmware":
+        proof["right"]["active"]["Firmware_Minor_Version"] = 11
+    elif bad == "calibration":
+        proof["right"]["calibration"] = proof["left"]["calibration"]
+    kwargs = {} if bad == "missing_owner" else {"run_id": RIGHT_P20_RUN, "host_incarnation": RIGHT_P20_HOST}
+    assert m._teleop_elbow_settings_summary(proof, 9.98, **kwargs) is None
+
+
+@pytest.mark.parametrize("present", [True, False])
+def test_right_response_request_reaches_only_its_exact_owned_host_argument(tmp_path, monkeypatch, present):
+    from examples.alohamini.am1_session_contract import RECIPES
+    from lerobot.robots.alohamini import am1_elbow_integral as gains
+    from tests.robots.test_am1_elbow_integral import RIGHT_P20_HOST, RIGHT_P20_RUN
+
+    m = module()
+    state, root = tmp_path / "state", tmp_path / "runs"
+    state.mkdir(mode=0o700)
+    root.mkdir(mode=0o700)
+    provider = object.__new__(m.ProtectedHostRun)
+    provider.config = {"physical_state_directory": str(state), "run_root": str(root), "host_head": "a" * 40,
+        "host_repository": str(tmp_path), "host_python": "unused-python", "camera_python": "unused-python",
+        "camera_repository": str(tmp_path), "camera_config": str(tmp_path / "config"),
+        "camera_credentials": str(tmp_path / "credentials"), "camera_binary": str(tmp_path / "binary"),
+        "camera_state": str(tmp_path / "camera")}
+    provider.observation = SimpleNamespace()
+    monkeypatch.setattr(provider, "_validate_source", lambda: None)
+    monkeypatch.setattr(m, "wait_required_camera", lambda *args: None)
+    monkeypatch.setattr(gains, "consume_left_response_p_request", lambda *args: None)
+    monkeypatch.setattr(gains, "consume_right_p20_request", lambda *args: None)
+    owned, calls = [], []
+    descriptor = root / RIGHT_P20_RUN[:8] / "right-response-p.json"
+    def consume(actual_state, directory, recipe, run, host, source):
+        assert not owned
+        assert (actual_state, directory, recipe, run, host, source) == (
+            state, root / RIGHT_P20_RUN[:8], "physical-live-teleop", RIGHT_P20_RUN, RIGHT_P20_HOST, "a" * 40)
+        calls.append(source)
+        return descriptor if present else None
+    monkeypatch.setattr(gains, "consume_right_response_p_request", consume)
+    def unit(name, *args, **kwargs):
+        owned.append((name, args))
+        if "host" in name:
+            raise OSError("stop before hardware host creation")
+        return SimpleNamespace()
+    monkeypatch.setattr(m, "OwnedUnit", unit)
+    with pytest.raises(OSError, match="before hardware"):
+        provider.start(RIGHT_P20_RUN, RIGHT_P20_HOST, RECIPES["physical-live-teleop"], lambda: None)
+    assert calls == ["a" * 40]
+    command = owned[-1][1][1]
+    option = "--am1-right-response-p-trial-file"
+    assert (option in command) is present
+    if present:
+        assert command[command.index(option) + 1] == str(descriptor)
+    assert "--am1-left-response-p-trial-file" not in command
+
+
+@pytest.mark.parametrize("broken", [False, True])
+def test_dual_response_requests_refuse_before_either_nonce_or_owned_unit(tmp_path, monkeypatch, broken):
+    from pathlib import Path
+
+    from examples.alohamini.am1_session_contract import RECIPES
+    from lerobot.robots.alohamini import am1_elbow_integral as gains
+    from tests.robots.test_am1_elbow_integral import RIGHT_P20_HOST, RIGHT_P20_RUN
+
+    m = module()
+    state, root = tmp_path / "state", tmp_path / "runs"
+    state.mkdir(mode=0o700)
+    left, right = state / "left-response-p-request.json", state / "right-response-p-request.json"
+    left.write_bytes(b"left original request")
+    if broken:
+        original = Path.is_symlink
+        monkeypatch.setattr(Path, "is_symlink", lambda path: path == right or original(path))
+    else:
+        right.write_bytes(b"right original request")
+    provider = object.__new__(m.ProtectedHostRun)
+    provider.config = {"physical_state_directory": str(state), "run_root": str(root), "host_head": "a" * 40}
+    monkeypatch.setattr(provider, "_validate_source", lambda: None)
+    def forbidden(*args, **kwargs):
+        pytest.fail("dual requests must refuse before nonce consumption or ownership")
+    monkeypatch.setattr(gains, "consume_left_response_p_request", forbidden)
+    monkeypatch.setattr(gains, "consume_right_response_p_request", forbidden)
+    monkeypatch.setattr(m, "OwnedUnit", forbidden)
+    with pytest.raises(ValueError, match="one selected"):
+        provider.start(RIGHT_P20_RUN, RIGHT_P20_HOST, RECIPES["physical-live-teleop"], lambda: None)
+    assert left.read_bytes() == b"left original request"
+    if not broken:
+        assert right.read_bytes() == b"right original request"
+    assert not list(state.glob("*-used-*"))
+
+
+def initial_empty_real_client(tmp_path, monkeypatch, clock):
+    from lerobot.robots.alohamini import alohamini_client as client_module
+    from lerobot.robots.alohamini.config_alohamini import AlohaMiniClientConfig
+
+    monkeypatch.setattr(client_module, "time", SimpleNamespace(monotonic=lambda: clock[0], perf_counter=time.perf_counter))
+    client = client_module.AlohaMiniClient(AlohaMiniClientConfig(
+        remote_ip="127.0.0.1", robot_model="alohamini1", cameras={}, calibration_dir=tmp_path))
+    client._is_connected = True  # Existing handshake establishes availability without populating decoded cache.
+    monkeypatch.setattr(client, "_poll_and_get_latest_message", lambda: None)
+    return client
+
+
+def test_initial_empty_real_client_waits_without_inventing_feedback_then_accepts_first_packet(tmp_path, monkeypatch):
+    import json
+
+    m = module()
+    clock = [10.]
+    client = initial_empty_real_client(tmp_path, monkeypatch, clock)
+    for _ in range(2):
+        with pytest.raises(m.FeedbackUnavailable, match="initial"):
+            m.read_physical_sample(client, "run", "host", -1, clock=lambda: clock[0], allow_pending_sample=True)
+        assert client.observation_sequence == 0 and client.latest_am1_local_feedback is None
+        assert client.latest_observation_received_at is None and client.latest_raw_observation_keys == frozenset()
+        clock[0] += .04
+    original = client_sample(now=clock[0])
+    payload = dict(original.get_observation(), _am1_local_feedback=original.latest_am1_local_feedback)
+    client._last_response_request_sent_at = clock[0] - .03
+    monkeypatch.setattr(client, "_poll_and_get_latest_message", lambda: [json.dumps(payload).encode()])
+    actual = m.read_physical_sample(client, "run", "host", -1, clock=lambda: clock[0], allow_pending_sample=True)
+    assert client.observation_sequence == 1 and actual["sequence"] == 5
+    assert actual["ack"] == original.latest_am1_local_feedback
+    assert actual["at"] == pytest.approx(clock[0]-.04)
+
+
+@pytest.mark.parametrize("bad", ["not_pending", "later_read", "previous_float", "sequence", "sequence_bool",
+                                 "missing_sequence", "received", "missing_received", "request_age", "raw_keys",
+                                 "cached_state", "missing_raw_keys", "received_without_marker", "parse", "marker_version", "foreign", "process_long"])
+def test_initial_empty_grace_never_accepts_received_or_ambiguous_feedback(tmp_path, monkeypatch, bad):
+    import json
+
+    m = module()
+    clock = [10.]
+    client = initial_empty_real_client(tmp_path, monkeypatch, clock)
+    previous, pending = -1, True
+    if bad == "not_pending":
+        pending = False
+    elif bad == "later_read":
+        previous = 0
+    elif bad == "previous_float":
+        previous = -1.
+    elif bad == "sequence":
+        client._observation_sequence = 1
+    elif bad == "sequence_bool":
+        client._observation_sequence = False
+    elif bad == "missing_sequence":
+        del client._observation_sequence
+    elif bad == "received":
+        client._latest_observation_received_at = 10.
+    elif bad == "missing_received":
+        del client._latest_observation_received_at
+    elif bad == "request_age":
+        client._latest_observation_roundtrip_age_s = 0.
+    elif bad == "raw_keys":
+        client._latest_raw_observation_keys = frozenset(JOINT_KEYS)
+    elif bad == "missing_raw_keys":
+        del client._latest_raw_observation_keys
+    elif bad == "cached_state":
+        client.last_remote_state = {"arm_left_elbow_flex.pos": 0.}
+    elif bad == "parse":
+        monkeypatch.setattr(client, "_poll_and_get_latest_message", lambda: [b"{malformed"])
+    else:
+        payload = dict.fromkeys(JOINT_KEYS, 7.)
+        if bad == "marker_version":
+            payload["_am1_local_feedback"] = {"version": 0}
+        elif bad == "foreign":
+            payload["_am1_local_feedback"] = client_sample(run_id="foreign").latest_am1_local_feedback
+        client._last_response_request_sent_at = 9.99
+        monkeypatch.setattr(client, "_poll_and_get_latest_message", lambda: [json.dumps(payload).encode()])
+        if bad == "process_long":
+            def fail_processing(*args):
+                raise RuntimeError("x" * 500)
+            monkeypatch.setattr(client, "_remote_state_from_obs", fail_processing)
+    with pytest.raises(ValueError) as caught:
+        m.read_physical_sample(client, "run", "host", previous, clock=lambda: clock[0], allow_pending_sample=pending)
+    if bad != "foreign":
+        message = str(caught.value)
+        assert message.startswith("protected host feedback marker missing; context=")
+        context = json.loads(message.split("; context=", 1)[1])
+        assert context["marker_type"] == ("dict" if bad == "marker_version" else "NoneType")
+        assert set(context) == {"observation_sequence", "received_at", "request_age_s", "parse_error",
+                               "raw_key_count", "marker_key_present", "returned_key_count", "marker_type", "marker_version"}
+        if bad == "received_without_marker":
+            assert context["observation_sequence"] == 1 and context["received_at"] == 10.
+            assert context["raw_key_count"] == len(JOINT_KEYS) and context["marker_key_present"] is False
+            assert context["returned_key_count"] > 0 and context["parse_error"] is None
+        elif bad == "parse":
+            assert context["observation_sequence"] == 0 and context["received_at"] is None
+            assert context["parse_error"] == "remote observation message could not be parsed"
+            assert context["raw_key_count"] == context["returned_key_count"] == 0
+        elif bad == "missing_sequence":
+            assert context["observation_sequence"]["available"] is False
+        elif bad == "process_long":
+            assert len(context["parse_error"]) == 160 and context["parse_error"].startswith("RuntimeError: ")
+            assert len(message) < 1500
+
+
+@pytest.mark.parametrize("outcome", ["first_packet", "original_deadline", "stop"])
+def test_initial_empty_real_client_worker_keeps_startup_hold_deadline_and_cancellation(tmp_path, monkeypatch, outcome):
+    import json
+
+    from examples.alohamini.am1_session_contract import RECIPES
+
+    m = module()
+    clock = [10.]
+    client = initial_empty_real_client(tmp_path, monkeypatch, clock)
+
+    class InitialHost(ControlledHost):
+        valid = False
+        admitted_at = None
+
+        def send(self, action):
+            super().send(action)
+            if action["_am1_local_control"].get("live_admitted"):
+                if self.admitted_at is None:
+                    self.admitted_at = clock[0]
+                self.marker["live_input"] = {"live_admitted_at_monotonic_s": self.admitted_at,
+                                             "live_deadline_monotonic_s": self.admitted_at + 300.}
+
+        def poll(self, previous):
+            if self.valid:
+                clock[0] += .05
+                self.sequence += 1
+                stamp = clock[0]
+                marker = dict(self.marker, version=1, observation_id=self.sequence,
+                              run_id=self.run_id, host_incarnation=self.incarnation,
+                              read_started_at_monotonic_s=stamp-.01, acquired_at_monotonic_s=stamp)
+                payload = dict(dict.fromkeys(JOINT_KEYS, 7.), _am1_local_feedback=marker)
+                client._last_response_request_sent_at = stamp-.02
+                monkeypatch.setattr(client, "_poll_and_get_latest_message", lambda: [json.dumps(payload).encode()])
+            return m.read_physical_sample(client, self.run_id, self.incarnation, previous,
+                                          clock=lambda: clock[0], allow_pending_sample=True)
+
+    host = InitialHost()
+    e = executor(host)
+    e.clock = lambda: clock[0]
+    recipe = RECIPES["physical-live-teleop"]
+    e.bind_run("run", recipe)
+    original_deadline = e.evidence()["lifecycle"]["startup_deadline"]
+    assert e.begin(recipe)
+    try:
+        until(lambda: bool(host.actions) or not e.worker.is_alive())
+        assert e.worker.is_alive() and e.evidence()["fault"] is None
+        assert e.evidence()["lifecycle"]["native_live_at"] is None
+        assert not e.evidence()["feedback"] and not e.evidence()["pose_aligned"]
+        assert all(set(action) == set(m.ZERO_BODY) | {"_am1_local_control"} for action in host.actions)
+        assert all(action["_am1_local_control"]["mode"] == "pause" for action in host.actions)
+        assert all(all(action[key] == 0 for key in m.ZERO_BODY) for action in host.actions)
+        if outcome == "first_packet":
+            host.valid = True
+            e._wake.set()
+            until(lambda: e.evidence()["lifecycle"]["phase"] == "live")
+            assert e.evidence()["hold_acknowledged"] and e.evidence()["pose_aligned"]
+            assert e.evidence()["feedback"] and client.observation_sequence > 0
+            assert e.evidence()["fault"] is None
+        elif outcome == "original_deadline":
+            clock[0] = original_deadline
+            e._wake.set()
+            until(lambda: not e.worker.is_alive())
+            assert e.evidence()["lifecycle"]["native_live_at"] is None
+            assert e.evidence()["fault"] == "RuntimeError: physical startup deadline expired"
+        else:
+            e.finish("stopped")
+            e.worker.join(2)
+            assert not e.worker.is_alive() and e.evidence()["fault"] is None
+            assert e.evidence()["lifecycle"]["native_live_at"] is None
+        assert e.evidence()["lifecycle"]["startup_deadline"] == original_deadline
+    finally:
+        e.close()
+        e.worker.join(2)
+        assert not e.worker.is_alive() and host.finished == 1

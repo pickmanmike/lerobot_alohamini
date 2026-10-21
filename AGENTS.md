@@ -1,10 +1,67 @@
-## Active AM1 useful arm operation after PR27 integration
+## Active AM1 response correction after PR28 integration
+
+Current owner continuation2026-10-21 ([PR29 comment6309687239](https://github.com/pickmanmike/lerobot_alohamini/pull/29#issuecomment-6309687239)) accepts Actual100/101 and supersedes the earlier peer-only no-gain restriction ONLY for one predeclared P16-versus-temporary-P32 comparison per follower elbow, sequentially, if retained effort/settings support it. Reuse the targeted transaction/restoration machinery, extend it only for right elbow, restore original P16/Lock afterward; I0/D32, motion rate, physical travel, calibration and protections stay unchanged. No P beyond32, integral trial, permanent default, replacement, disassembly or merge. Use each elbow as its own control with fixed absolute endpoints/dwell and streamed preparation; record actual achieved start, never clamp/shrink/recenter or require manual exact reset. Continue the existing short unloaded action when useful response supports it. One existing camera-only sequence distinguishes source/attachment/decoder from dark/occluded scene, with the enrolled software-decoder profile and one capture owner. Prior lighting action is complete; no generic lighting request or unsupported network attribution. The existing explicitly selected advisory-view bench policy remains available, never a normal human-view qualification. Earlier peer-only restrictions/results below remain historical where this authority differs.
+
+Current result: the authorized paired comparisons and supported short action are complete.
+LEFT107/109 improved P16-to-temporary-P32 out/back from5/5 to24/24ticks;
+RIGHT105/106 improved9/11 to27/27. Fixed endpoints were retained; achieved
+preparation differed, so do not claim identical loading or unique gain causation.
+Actual113 completed20producer-active seconds from2050 toGoal2124, achieved2096,
+then returned2058:4.043deg outward of6.504deg requested,3.340deg back,+.703deg
+residual. Gripper opened19.010 points and returned within.462. Four ordinary input
+holds recovered in.769-1.001s; longest Core running interval10.328s. This is useful
+coarse action with substantial undertravel, not the fully requested reach or fine
+positioning. Both temporary trials and113 restored P16/I0/D32/protection310 and
+originalLock0 last; no further escalation, permanent default, swap or unchanged
+powered repeat is required for publication.
+
+Stage51 source5157155 is installed at motor927c17aa (unchanged), runtime04c7b3ec,
+manifestc5adf5f6. Only one runtime file changed fromStage50; full matched Stage50
+rollback and older rollbacks are retained. Provably untouched initial feedback
+cache now waits in the existing held startup path under the original deadline;
+received malformed/foreign feedback still faults with bounded diagnostic context.
+Actual111/112's exact cache failure remains unproven; their original failures stay.
+113 supplied a successful new Start after112, not a separate post113 restart test.
+Ordinary enrolled software-decoder Edge showed advancing640x480 chest video, but
+source/display remain dim and occluded. All these new comparisons/actions selected
+advisory presentation beforeStart; no new normal human required-view qualification.
+PR29 remains draft/unmerged. Retain original device/input/ownership protections,
+wireless AM1, advisory P1, deferred USB leaders and unchanged main/AM2.
 
 Read first: [current state](docs/alohamini/current-state.md) and
 [source-backed decisions/lessons](docs/alohamini/decisions-and-lessons.md).
 Use the matching lesson before diagnosing a symptom; check coverage at the actual
 new entrypoint before reopening an accepted decision. Update changed rows, not a
 packet diary. Historical runbooks retain original results and detailed procedures.
+
+Owner clarification2026-10-21 ([PR29 comment6307778284](https://github.com/pickmanmike/lerobot_alohamini/pull/29#issuecomment-6307778284)):
+the LEFT elbow servo has NOT been replaced. Suspend swap-first advice/preparation;
+substantial disassembly is not an appropriate diagnostic swap. Replacement requires
+a sufficiently supported likely defect and a later owner decision. PR29 stays
+draft/unmerged; no preceding proposed replacement/integration prompt was sent.
+The accepted Actual100/101 comparison used installed LEFT-bus/ID3 and RIGHT-bus/ID3 at their verified
+ordinary P16/I0/D32 baselines, with no gain change. Use measured approximately mirrored
+shoulder/elbow/wrist geometry and equivalent gravity-relative direction, recording
+material differences; raw sign or normalized equality alone does not match load.
+One short fresh-streamed maintained practical out/back per elbow, sequential, about
+7 encoder degrees within existing workspaces, slow ramps and a few active dwell seconds;
+hold other joints/body intent zero. Repeat reversed side order only for a consequential
+contrast or interrupted comparison. Only one informative second pose/paired joint if a
+material ambiguity remains. Bind sparse evidence to side/bus plus ID, retain device
+protections and original times, and do not infer external torque from drive duty.
+Use the existing sole owner/runner and a minimal reviewed two-elbow reader extension.
+No new gain sweep, general telemetry/UI, all-motor commissioning, disassembly or merge.
+The accepted Actual100/101 peer exercise used52raw counts (4.5703125encoder degrees),
+16producer-active seconds per side, under the existing finite ceiling. Fresh measured
+references/endpoints must fit retained workspaces; do not clamp or ratchet them.
+The owner-authorized predetermined-bench presentation policy may be explicitly
+selected before these runs; actual required local images/feedback remain mandatory.
+Keep ordinary required-view operation and this advisory-view bench result separate.
+Actual100/101 completed the pair: left31/52counts outward, right15/52, with verified
+baseline/Goal delivery and certain cleanup. Both undertravel; unequal poses/load
+prevent a common-cause/internal-defect conclusion. Replacement is unsupported.
+Do not repeat the pair or resume swap preparation merely to publish/resume; the
+left final2043 cannot support another unchanged negative52-count command.
 
 Current operation-first authority (PR25 comment6258758730 and the owner's
 continuation mandate) permits bounded repeated virtual-leader bench operation,
@@ -36,8 +93,11 @@ merged at e3d8a196. That source-equivalent merge needed no redeploy or physical 
 The owner accepted Actual89 and PR27 is integrated into
 integrate/am1-local-teleop at2ec74f14 after the comparable-request-clock finding
 was repaired at1bb715e3 and reviewed. Both threads are resolved; no CI runs were
-reported. New executable left-response/reach work is on the focused follow-up
-codex/am1-left-maintained-response, without automatic merge.
+reported. The owner accepted Actual90–93 only as completed procedures/modest
+directional movement, viewing/recovery/reuse; requested reach remains unachieved.
+PR28 is integrated at0a14c051445d076f8a2bff16be59763675da2bf1, exact40929d58
+tree, without component redeployment or powered repeat. New response work is on
+codex/am1-left-response-effort; that follow-up is not automatically merged.
 PR27 view-repair source is73690add. Stage44 passed all ten stopped phases, changing only
 Core/media/WebRTC among22 runtime files; the other19, motor/camera/helper, private
 operating settings and matched rollback remain. Actual89 remains at source87cd55da/
@@ -50,28 +110,74 @@ and sampled-view limitations; this is not the original172.5s strict qualificatio
 Keep500ms required view,250ms native input and original ownership/deadline guards.
 The process-local msedge software-decoder option is available in the ordinary
 browser-only launcher with stable separate mode profiles. Dedicated-profile fresh
-enrollment now survives reload and camera-only09 verified live chest WebRTC; motor
-operation in that profile remains untested. This is not GPU proof or a global preference change.
-Next operating scope is useful left-elbow response, then a short unloaded
-reach/hold/gripper/retract under normal required usable viewing. Compare actual
+enrollment now survives reload and camera-only09 verified live chest WebRTC. It supplied
+Actual94's required presentation without a shadow viewer, but that scene was too dark.
+Camera-only11/12 and Actual97-99 subsequently supplied illuminated coarse bench/gripper
+viewing through this same enrolled profile. Occluded wrist/precision visibility remains
+limited. This is not GPU proof or a global preference change.
+The earlier Actual97-99 increment demonstrated useful repeatable negative-direction coarse
+left-elbow response and the short unloaded reach/hold/gripper/retract under normal
+required coarse viewing. Positive-direction undertravel and return/fine limits remain;
+retain that bounded result without another powered repeat for publication. Compare actual
 requested/mapped/accepted/servo-Goal/measured evidence, sign/units, pose, direction
 and maintained dwell before tuning. Use current supported workspace/settings and
 fresh streamed intent; other joints hold actual admitted targets. Preserve fixed
-references through recovery and report interrupted dwells honestly. No gain sweep,
-expanded travel, micro-tick gate, calibration or new telemetry/launcher framework.
-Stage45 source871598c6 is installed at motor603c4624/runtimeD632471f/MF2a115478;
-only host/selected-evidence and Core/media changed, with matched Stage44 rollback.
+references through recovery and report interrupted dwells honestly. The earlier owner scope
+authorized a small predeclared reversible LEFT-ID3-only position-control parameter
+comparison when supported by retained effort/voltage/settings and installed FW
+semantics: one parameter at a time, a small candidate set, baseline/restoration
+verified. If substantial effort lacks motion, distinguish actual load/power/mechanism
+before escalating. Never change IDs, phase, calibration, travel or device protections;
+never overcommand to hide error. No general gain sweep, micro-tick gate or new framework.
+Historical Stage48 source4599d9f8 was installed at motor6af9d512/runtimece2c3ec3/MFddbbf831;
+all ten phases passed, changing only the reviewed three motor/two runtime files over
+Stage46. Camera/helper/Core/media/client/calibration remain unchanged; full matched
+8a3a91ed/D80c7d28/MF11027f16 rollback, private state and Windows bytes/ACL are retained.
+PR29 remains draft/unmerged. Documentation publication does not redeploy components.
 Actual90/92/93 demonstrate partial directional elbow movement; Actual91 remains
 weak despite actual Goal2124. Actual93 completed20active unloaded elbow/hold/grip/
 retract,1.934deg outward/1.318deg back,18.944/18.482 gripper opening points,
 with one.867s recovery and42/42 fresh operating chest samples. Target2124 held
 5.861s while PP2059 stayed short: coarse control is achieved, full reach/fine
 positioning is not. Do not rerun an unchanged workload for publication or infer a
-gain fault from undertravel. Current PC source d3faf3a7, native871598c6/Stage45
-unchanged. Post93 interface is stopped/certain/Start+Claim enabled. Publish/review
-PR28 without automatic merge; retain current source, limitations and rollback.
+gain fault from undertravel. Actual94 at fa1/Stage46 completed the16-active-second
+P16 baseline: requested7.119deg, achieved1.406deg outward/0.439deg back,
+0.967deg residual. Direct reads confirm Goal2124/PP2059,195–208mA,11.6V and
+unchanged device limits; P16/Lock restoration and off readback passed. Three ordinary
+input recoveries preserved the task/deadline. Actual95 P32 reached only7.148active
+seconds before receipt/rejoin failure: requested6.064deg, measured2.900deg outward,
+without return or a completed maintained comparison. P16 restoration/off readback
+passed. Fresh camera-only11 and Actual95 Edge chest were illuminated; the earlier
+dark-scene question is superseded, without an established cause. Actual96 then
+refused before Live on stale startup thermal history; no P32 write/input occurred.
+Inner20off/P16 proof passed, but its original outer cleanup remains unknown because
+lift qualification was unavailable. Separate fresh stopped proof and durable executor
+ACK later cleared current uncertainty without rewriting Actual96. Stage48 installed
+the reviewed selected-left startup correction: complete private configuration while
+OFF, then acquire the first original thermal histories within the unchanged startup
+budget; no relaxed thermal age, reset history or new device limit.
+Actual97 completed16active seconds: requested2088->2011 (6.768deg), achieved2019
+(6.064deg), returned2064, residual24ticks/2.109deg. Actual98 positive-direction
+20s action stopped at6.958active seconds after required-view expiry; only28/60ticks
+outward, no gripper/retract. Fresh camera-only12 and normal Edge reload/reselection
+supported one unchanged short retry, not a code or network-cause claim.
+Actual99 completed the20active-second unloaded action and useful ordinary next Start:
+requested2090->2011 (6.943deg), measured2090->2022->2066 (5.977deg outward,
+3.867deg back), residual24ticks/2.109deg. Gripper opened18.944 points and returned
+within0.660 points. Five qualified ordinary input recoveries totaled5.034s; longest
+uninterrupted interval11.024s. All311 accepted-frame snapshots qualified required
+view/local input; the sole enrolled Edge supplied illuminated coarse bench/gripper
+viewing. This repeats useful negative-direction coarse response, not symmetric/fine
+positioning, precision grasping or the full requested reach. Stop gain escalation:
+P32 was temporary and original P16/Lock0/off cleanup verified. The current source-aware
+pure audit admits97-99; original97 audit refusal and96 uncertainty remain historical.
+Publish/review the follow-up without automatic merge. PR28 integration is complete.
 Main/AM2 remain unchanged. Do not repeat powered checks solely for publication.
-No fault-injection campaign, gains, network remediation or freshness downgrade.
+No fault-injection campaign, unreviewed/out-of-scope tuning, network remediation
+or freshness downgrade. Dedicated Edge enrollment is resolved; no pairing request.
+Use that ordinary profile as the sole qualifying viewer when feasible; a second
+viewer must not mask its required-view behavior. Native active ACKs are not extra
+hardware register reads. Judge requested versus achieved action, not displacement alone.
 Physical USB
 connection remains owner-deferred; retain historic identities/calibration without
 requesting connection, repeated unchanged enumeration or claiming new validation.

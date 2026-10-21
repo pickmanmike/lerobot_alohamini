@@ -881,3 +881,655 @@ def right_p20_settings_valid(proof, run_id=None, host_incarnation=None):
                 and hashlib.sha256(_right_p20_json(material)).hexdigest() == proof["settings_sha256"])
     except (KeyError, ValueError, TypeError, AttributeError, OverflowError):
         return False
+
+
+LEFT_RESPONSE_P_KIND = "left-response-p"
+RIGHT_RESPONSE_P_KIND = "right-response-p"
+
+
+def _left_response_p_boot_id():
+    value = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+    if str(UUID(value)) != value:
+        raise ValueError("Selected elbow response P requires the actual canonical boot identity")
+    return value
+
+
+def _response_p_request(value, source_head=None, *, kind):
+    import re
+
+    if kind not in (LEFT_RESPONSE_P_KIND, RIGHT_RESPONSE_P_KIND):
+        raise ValueError("Only the two selected response elbow roles are supported")
+    segments = (("left-maintained", "left-reach", "left-peer-fixed")
+                if kind == LEFT_RESPONSE_P_KIND else ("right-peer-fixed",))
+    if (
+        not isinstance(value, dict)
+        or set(value)
+        != {
+            "version",
+            "kind",
+            "request_id",
+            "source_head",
+            "proportional",
+            "workload_segment",
+            "boot_id",
+            "expires_at_monotonic_s",
+        }
+        or type(value["version"]) is not int
+        or value["version"] != 1
+        or value["kind"] != kind
+        or type(value["proportional"]) is not int
+        or value["proportional"] not in (16, 32)
+        or value["workload_segment"] not in segments
+        or type(value["source_head"]) is not str
+        or re.fullmatch("[0-9a-f]{40}", value["source_head"]) is None
+        or source_head is not None
+        and value["source_head"] != source_head
+        or any(
+            type(value[k]) is not str or str(UUID(value[k])) != value[k] for k in ("request_id", "boot_id")
+        )
+        or type(value["expires_at_monotonic_s"]) not in (int, float)
+        or not math.isfinite(value["expires_at_monotonic_s"])
+        or value["expires_at_monotonic_s"] <= 0
+    ):
+        raise ValueError("Selected elbow response P requires its closed current-source finite comparison request")
+    return value
+
+
+def _left_response_p_request(value, source_head=None):
+    return _response_p_request(value, source_head, kind=LEFT_RESPONSE_P_KIND)
+
+
+def consume_left_response_p_request(state, directory, recipe, run_id, host_incarnation, source_head):
+    return _consume_response_p_request(state, directory, recipe, run_id, host_incarnation, source_head,
+                                       kind=LEFT_RESPONSE_P_KIND)
+
+
+def consume_right_response_p_request(state, directory, recipe, run_id, host_incarnation, source_head):
+    return _consume_response_p_request(state, directory, recipe, run_id, host_incarnation, source_head,
+                                       kind=RIGHT_RESPONSE_P_KIND)
+
+
+def _consume_response_p_request(state, directory, recipe, run_id, host_incarnation, source_head, *, kind):
+    """Consume fresh boot-local admission once; expiry never invalidates restoration."""
+    state, directory = Path(state), Path(directory)
+    request = state / (kind + "-request.json")
+    if not request.exists() and not request.is_symlink():
+        return None
+    if recipe != "physical-live-teleop" or any(
+        type(v) is not str or str(UUID(v)) != v for v in (run_id, host_incarnation)
+    ):
+        raise ValueError("Selected elbow response P requires the exact current WholeRobot run/host")
+    AM1ElbowIntegralTrial._private_directory(directory)
+    if directory.name != run_id[:8]:
+        raise ValueError("Selected elbow response P requires its current protected run directory")
+    value, raw, info = _right_p20_file(request)
+    _response_p_request(value, source_head, kind=kind)
+    if (
+        value["boot_id"] != _left_response_p_boot_id()
+        or not 0 <= time.monotonic() < value["expires_at_monotonic_s"]
+    ):
+        raise ValueError("Selected elbow response P request boot/deadline admission expired")
+    used = state / (kind + "-used-" + value["request_id"] + ".json")
+    consumed, target = (
+        directory / (kind + "-consumed.json"),
+        directory / (kind + ".json"),
+    )
+    if used.exists() or used.is_symlink():
+        raise ValueError("Selected elbow response P request nonce was already retired")
+    if any(p.exists() or p.is_symlink() for p in (consumed, target)):
+        raise ValueError("Selected elbow response P request cannot be consumed twice")
+    current = request.stat(follow_symlinks=False)
+    if (current.st_dev, current.st_ino, current.st_size) != (info.st_dev, info.st_ino, info.st_size):
+        raise ValueError("Selected elbow response P request changed before consumption")
+    bound = {
+        "version": 1,
+        "kind": kind,
+        "run_id": run_id,
+        "host_incarnation": host_incarnation,
+        "request_sha256": hashlib.sha256(raw).hexdigest(),
+        "request": value,
+    }
+    if not 0 <= time.monotonic() < value["expires_at_monotonic_s"]:
+        raise ValueError("Selected elbow response P request expired before one-use consumption")
+    descriptor = os.open(used, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    with os.fdopen(descriptor, "wb") as stream:
+        stream.write(_right_p20_json(bound))
+        stream.flush()
+        os.fsync(stream.fileno())
+    AM1ElbowIntegralTrial._sync_directory(state)
+    os.rename(request, consumed)
+    AM1ElbowIntegralTrial._sync_directory(state)
+    AM1ElbowIntegralTrial._sync_directory(directory)
+    _, retained, retained_info = _right_p20_file(consumed)
+    if retained != raw or (retained_info.st_dev, retained_info.st_ino) != (info.st_dev, info.st_ino):
+        raise ValueError("Selected elbow response P original request changed during consumption")
+    descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    with os.fdopen(descriptor, "wb") as stream:
+        stream.write(_right_p20_json(bound))
+        stream.flush()
+        os.fsync(stream.fileno())
+    AM1ElbowIntegralTrial._sync_directory(directory)
+    return target
+
+
+def load_left_response_p_binding(path, directory, run_id, host_incarnation):
+    return _load_response_p_binding(path, directory, run_id, host_incarnation, kind=LEFT_RESPONSE_P_KIND)
+
+
+def load_right_response_p_binding(path, directory, run_id, host_incarnation):
+    return _load_response_p_binding(path, directory, run_id, host_incarnation, kind=RIGHT_RESPONSE_P_KIND)
+
+
+def _load_response_p_binding(path, directory, run_id, host_incarnation, *, kind):
+    directory, path = Path(directory), Path(path)
+    if (
+        directory.name != run_id[:8]
+        or path != directory / (kind + ".json")
+        or any(type(v) is not str or str(UUID(v)) != v for v in (run_id, host_incarnation))
+    ):
+        raise ValueError("Selected elbow response P binding requires its exact current path/run/host")
+    value, _, _ = _right_p20_file(path)
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"version", "kind", "run_id", "host_incarnation", "request_sha256", "request"}
+        or type(value["version"]) is not int
+        or value["version"] != 1
+        or value["kind"] != kind
+        or value["run_id"] != run_id
+        or value["host_incarnation"] != host_incarnation
+    ):
+        raise ValueError("Selected elbow response P immutable binding identity differs")
+    request = _response_p_request(value["request"], kind=kind)
+    retained, raw, _ = _right_p20_file(directory / (kind + "-consumed.json"))
+    if retained != request or hashlib.sha256(raw).hexdigest() != value["request_sha256"]:
+        raise ValueError("Selected elbow response P consumed original request content/hash differs")
+    return copy.deepcopy(value)
+
+
+_LEFT_RESPONSE_P_REGISTERS = tuple(
+    dict.fromkeys(
+        (
+            *_RIGHT_P20_REGISTERS,
+            "Protection_Current",
+            "Max_Temperature_Limit",
+            "Min_Voltage_Limit",
+            "Max_Voltage_Limit",
+            "Protective_Torque",
+            "Protection_Time",
+            "Overload_Torque",
+            "Over_Current_Protection_Time",
+            "Velocity_closed_loop_P_proportional_coefficient",
+            "Velocity_closed_loop_I_integral_coefficient",
+            "Present_Current",
+            "Present_Voltage",
+            "Present_Temperature",
+            "Status",
+        )
+    )
+)
+_LEFT_RESPONSE_P_PRESERVED = tuple(
+    k
+    for k in _LEFT_RESPONSE_P_REGISTERS
+    if k
+    not in {
+        "P_Coefficient",
+        "Torque_Enable",
+        "Lock",
+        "Present_Position",
+        "Goal_Position",
+        "Present_Current",
+        "Present_Voltage",
+        "Present_Temperature",
+        "Status",
+    }
+)
+
+
+class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
+    """The closed left-ID3 WholeRobot comparison; the right role reuses its transaction."""
+
+    side, kind, motor = "left", LEFT_RESPONSE_P_KIND, ELBOW
+    calibration = (3, 0, 1845, 864, 3073)
+    raw_bounds = (2011, 2124)
+
+    def _load_binding(self, path, directory, run_id, host_incarnation):
+        loader = load_left_response_p_binding if self.side == "left" else load_right_response_p_binding
+        return loader(path, directory, run_id, host_incarnation)
+
+    def __init__(self, binding, directory):
+        if type(self) not in (AM1LeftResponseProportionalTrial, AM1RightResponseProportionalTrial):
+            raise ValueError("Response P supports only the two exact elbow transaction types")
+        self.directory = Path(directory)
+        self.binding = self._load_binding(
+            self.directory / (self.kind + ".json"),
+            self.directory,
+            binding["run_id"],
+            binding["host_incarnation"],
+        )
+        if self.binding != binding:
+            raise ValueError("Selected elbow response P constructor binding differs from its retained original")
+        self.proportional = self.binding["request"]["proportional"]
+        super().__init__(integral=0, snapshot_path=self.directory / (self.kind + "-original.json"))
+        self._snapshot = {
+            "schema_version": 1,
+            "kind": self.kind,
+            "binding": copy.deepcopy(binding),
+            "events": [],
+        }
+
+    def _owner(self, robot):
+        if self.side == "left":
+            bus, identity = AM1ElbowIntegralTrial._owner(robot)
+        else:
+            bus = getattr(robot, "right_bus", None)
+            if (getattr(robot.config, "robot_model", None) != "alohamini1"
+                    or bus is None or not bus.is_connected or self.motor not in robot.right_arm_motors):
+                raise RuntimeError("Right response P requires its connected AM1 right owner")
+            motor, calibration = bus.motors.get(self.motor), bus.calibration.get(self.motor)
+            if (motor is None or type(motor.id) is not int or motor.id != 3 or motor.model != "sts3215"
+                    or motor.norm_mode is not MotorNormMode.RANGE_M100_100 or calibration is None
+                    or any(type(getattr(calibration, k)) is not int for k in
+                           ("id", "drive_mode", "homing_offset", "range_min", "range_max"))):
+                raise RuntimeError("Right response P requires actual calibrated ID3 mapping")
+            identity = (motor.id, motor.model, calibration.id, calibration.drive_mode,
+                        calibration.homing_offset, calibration.range_min, calibration.range_max)
+        if (
+            not getattr(robot, "_am1_protected_cleanup", False)
+            or getattr(robot, "_am1_selected_joint_evidence_enabled", False)
+            or getattr(robot, "_am1_" + ("right" if self.side == "left" else "left") + "_response_p_binding", None) is not None
+            or getattr(robot, "_am1_" + ("right" if self.side == "left" else "left") + "_response_p_trial", None) is not None
+            or identity != (3, "sts3215", *self.calibration)
+            or AM1ElbowIntegralTrial.requested_integral() is not None
+            or any(
+                os.environ.get(k) == "1"
+                for k in ("AM1_SELECTED_JOINT_EVIDENCE", "AM1_SHOULDER_INTEGRAL_TEST")
+            )
+            or any(
+                getattr(robot, k, None) is not None
+                for k in (
+                    "_am1_elbow_integral_trial",
+                    "_am1_right_elbow_p_trial",
+                    "_am1_elbow_recovery_binding",
+                    "_am1_right_p20_trial_binding",
+                    "_am1_visible_control_binding",
+                    "_am1_practical_config",
+                )
+            )
+        ):
+            raise RuntimeError(
+                "Selected elbow response P requires its exact protected WholeRobot owner without legacy trials"
+            )
+        return bus, identity
+
+    def _retained_owner(self, robot):
+        bus, identity = self._owner(robot)
+        expected = {k: self.binding[k] for k in ("run_id", "host_incarnation")}
+        expected["recipe"] = "physical-live-teleop"
+        if (
+            bus is not self._bus
+            or identity != self._identity
+            or self.binding != self._snapshot["binding"]
+            or getattr(robot, "_am1_" + self.side + "_response_p_trial", None) is not self
+            or getattr(robot, "_am1_" + self.side + "_response_p_binding", None) != self.binding
+            or getattr(robot, "_am1_teleop_binding", None) != expected
+        ):
+            raise RuntimeError("Selected elbow response P same owner/mapping/run binding changed")
+        frozen = self._snapshot.get("frozen_teleop_registers")
+        if frozen is not None:
+            records = robot._am1_teleop_settings[self.side]["registers"]
+            if any(records[k].get(self.motor) != v for k, v in frozen.items()):
+                raise RuntimeError("Selected elbow response P original protected settings changed")
+        return bus
+
+    def _same_owner(self, robot):
+        bus = self._retained_owner(robot)
+        if (
+            self._load_binding(
+                self.directory / (self.kind + ".json"),
+                self.directory,
+                self.binding["run_id"],
+                self.binding["host_incarnation"],
+            )
+            != self.binding
+        ):
+            raise RuntimeError("Selected elbow response P immutable consumed binding changed")
+        return bus
+
+    def _service_boundary(self):
+        robot = self._robot
+        self._retained_owner(robot)
+        if getattr(robot, "_am1_shutdown_in_progress", False) is not True:
+            from .am1_live_teleop import check_initial_temperature_budget, refresh_startup_temperatures
+
+            if getattr(robot, "_am1_teleop_initial_temperature_pending", False):
+                check_initial_temperature_budget(robot)
+            refresh_startup_temperatures(robot)
+            if (
+                getattr(robot, "_am1_teleop_startup_temperature", False)
+                and getattr(robot, "_lift_operation", None) is not None
+            ):
+                robot._refresh_am1_startup_lift_feedback()
+        self._retained_owner(robot)
+
+    def _read(self, register, *, phase):
+        if register != "Present_Temperature":
+            self._service_boundary()
+        row = {"operation": "read", "register": register, "phase": phase,
+               "started_at_monotonic_s": time.monotonic()}
+        self._snapshot["events"].append(row)
+        try:
+            value = self._bus.read(register, self.motor, normalize=False, num_retry=0)
+            if type(value) is not int:
+                raise RuntimeError("Response P readback must be a raw integer")
+            row["value"] = value
+            return value
+        finally:
+            row["completed_at_monotonic_s"] = time.monotonic()
+
+    def _bytes(self, *, phase):
+        result = {}
+        for address in (24, 25):
+            self._service_boundary()
+            row = {
+                "operation": "read",
+                "address": address,
+                "width": 1,
+                "phase": phase,
+                "started_at_monotonic_s": time.monotonic(),
+            }
+            self._snapshot["events"].append(row)
+            try:
+                value, _, _ = self._bus._read(
+                    address,
+                    1,
+                    3,
+                    num_retry=0,
+                    raise_on_error=True,
+                    err_msg="Selected elbow response P individual-byte read failed",
+                )
+                if type(value) is not int or not 0 <= value <= 255:
+                    raise RuntimeError("Selected elbow response P individual-byte read must be uint8")
+                row["value"] = value
+                result[str(address)] = value
+            finally:
+                row["completed_at_monotonic_s"] = time.monotonic()
+        return result
+
+    def prepare(self, robot):
+        if (
+            self._created
+            or self._bus is not None
+            or getattr(robot, "_am1_shutdown_in_progress", False) is True
+        ):
+            raise RuntimeError("Selected elbow response P transaction cannot be reused")
+        self._bus, self._identity = self._owner(robot)
+        self._robot = robot
+        self._same_owner(robot)
+        self._prepare_path()
+        original = {k: self._read(k, phase="baseline") for k in _LEFT_RESPONSE_P_REGISTERS}
+        raw_bytes = self._bytes(phase="baseline")
+        from .am1_live_teleop import STATIC
+
+        frozen = {k: robot._am1_teleop_settings[self.side]["registers"][k][self.motor] for k in STATIC}
+        self._snapshot.update(
+            motor=self.motor,
+            motor_id=3,
+            original_registers=original,
+            original_bytes=raw_bytes,
+            frozen_teleop_registers=frozen,
+            prepared_at_monotonic_s=time.monotonic(),
+            original_settings_sha256=hashlib.sha256(
+                _right_p20_json({"registers": original, "individual_bytes": raw_bytes})
+            ).hexdigest(),
+        )
+        expected = {
+            "Model_Number": 777,
+            "Firmware_Major_Version": 3,
+            "Firmware_Minor_Version": 10,
+            "ID": 3,
+            "Operating_Mode": 0,
+            "Torque_Enable": 0,
+            "P_Coefficient": 16,
+            "I_Coefficient": 0,
+            "D_Coefficient": 32,
+            "Min_Position_Limit": self.calibration[3],
+            "Max_Position_Limit": self.calibration[4],
+            "Homing_Offset": self.calibration[2],
+            "Phase": 12,
+            "Max_Torque_Limit": 1000,
+            "Torque_Limit": 1000,
+            "CW_Dead_Zone": 1,
+            "CCW_Dead_Zone": 1,
+            "Acceleration": 254,
+            "Maximum_Acceleration": 254,
+            "Goal_Time": 0,
+            "Goal_Velocity": 0,
+            "Status": 0,
+        }
+        if (
+            any(original[k] != v for k, v in expected.items())
+            or original["Lock"] not in (0, 1)
+            or raw_bytes != {"24": 16, "25": 0}
+            or any(original[k] != v for k, v in frozen.items())
+            or not self.raw_bounds[0] <= original["Present_Position"] <= self.raw_bounds[1]
+            or not self.raw_bounds[0] <= original["Goal_Position"] <= self.raw_bounds[1]
+            or original["Protection_Current"] <= 0
+            or not 0 < original["Max_Temperature_Limit"] <= 100
+            or not 0 < original["Min_Voltage_Limit"] < original["Max_Voltage_Limit"]
+            or not original["Min_Voltage_Limit"]
+            <= original["Present_Voltage"]
+            <= original["Max_Voltage_Limit"]
+            or abs(original["Present_Current"]) >= original["Protection_Current"]
+        ):
+            self._persist_snapshot("baseline_refused", required=False)
+            raise RuntimeError("Selected elbow response P actual stopped baseline differs from its reviewed original")
+        # The original and restoration obligation reach durable storage before any write.
+        self.restore_required = True
+        try:
+            self._persist_snapshot("prepared")
+        except BaseException as error:
+            self._failure("prepare_failed", error)
+            raise
+
+    def _write(self, register, value, *, phase, reconcile=False):
+        allowed = {"Torque_Enable": (0,), "Lock": (0, 1), "P_Coefficient": (16, self.proportional)}
+        if register not in allowed or type(value) is not int or value not in allowed[register]:
+            raise ValueError("Selected elbow response P transaction cannot write that register/value")
+        self._service_boundary()
+        row = {
+            "operation": "write",
+            "register": register,
+            "value": value,
+            "phase": phase,
+            "started_at_monotonic_s": time.monotonic(),
+        }
+        self._snapshot["events"].append(row)
+        try:
+            self._bus.write(register, self.motor, value, normalize=False, num_retry=0)
+        except BaseException as error:
+            row.update(error_type=type(error).__name__, error=str(error))
+            self._failure(phase + "_failed", error)
+            if not reconcile or not isinstance(error, Exception):
+                raise
+            try:
+                actual = self._read(register, phase=phase + "_ack_reconciliation")
+            except BaseException as read_error:
+                error.add_note(
+                    "Selected elbow response P acknowledgement readback failed: " + type(read_error).__name__
+                )
+                raise error from read_error
+            if actual != value:
+                raise
+            row["reconciled"] = True
+        finally:
+            row["completed_at_monotonic_s"] = time.monotonic()
+        if self._read(register, phase=phase + "_verify") != value:
+            raise RuntimeError("Selected elbow response P write verification failed: " + register)
+
+    def disable_torque(self, robot):
+        if not self._created or not self.restore_required:
+            raise RuntimeError("Selected elbow response P has no durable outstanding original")
+        # A lost descriptor cannot prevent off on the still-retained exact device owner.
+        self._retained_owner(robot)
+        self._write("Torque_Enable", 0, phase="torque_off", reconcile=True)
+        self._write("Lock", 1, phase="volatile_lock", reconcile=True)
+
+    def _preserved(self, robot, *, phase):
+        if phase == "active":
+            self._retained_owner(robot)  # Powered verification performs only device I/O.
+        else:
+            self._same_owner(robot)
+        original = self._snapshot["original_registers"]
+        if (
+            any(self._read(k, phase=phase) != original[k] for k in _LEFT_RESPONSE_P_PRESERVED)
+            or self._bytes(phase=phase) != self._snapshot["original_bytes"]
+        ):
+            raise RuntimeError(
+                "Selected elbow response P preserved identity/I/D/protection/profile/individual bytes changed"
+            )
+
+    def apply(self, robot):
+        try:
+            if (
+                not self.restore_required
+                or self._apply_attempted
+                or getattr(robot, "_am1_shutdown_in_progress", False) is True
+            ):
+                raise RuntimeError("Selected elbow response P requires one fresh durable apply opportunity")
+            self._apply_attempted = True
+            self._preserved(robot, phase="before_apply")
+            if any(
+                self._read(k, phase="before_apply") != v
+                for k, v in {"Torque_Enable": 0, "Lock": 1, "P_Coefficient": 16}.items()
+            ):
+                raise RuntimeError("Selected elbow response P requires actual Torque0/Lock1/P16 before apply")
+            if self.proportional != 16:
+                self._write("P_Coefficient", self.proportional, phase="configure_proportional")
+            self._snapshot.update(
+                configured_p_readback=self.proportional, configured_at_monotonic_s=time.monotonic()
+            )
+            self._persist_snapshot("configured")
+        except BaseException as error:
+            self._failure("configure_failed", error)
+            raise
+
+    def verify_active(self, robot):
+        try:
+            if getattr(robot, "_am1_shutdown_in_progress", False) is True:
+                raise RuntimeError("Selected elbow response P cannot qualify active settings during shutdown")
+            self._preserved(robot, phase="active")
+            actual = {
+                k: self._read(k, phase="active")
+                for k in (
+                    "P_Coefficient",
+                    "Lock",
+                    "Torque_Enable",
+                    "Present_Current",
+                    "Status",
+                    "Present_Voltage",
+                    "Present_Temperature",
+                )
+            }
+            original = self._snapshot["original_registers"]
+            if (
+                actual["P_Coefficient"] != self.proportional
+                or actual["Lock"] != 1
+                or actual["Torque_Enable"] != 1
+                or actual["Status"] != 0
+                or abs(actual["Present_Current"]) >= original["Protection_Current"]
+                or not original["Min_Voltage_Limit"]
+                <= actual["Present_Voltage"]
+                <= original["Max_Voltage_Limit"]
+                or getattr(robot, "_am1_teleop_first_error", None) is not None
+            ):
+                raise RuntimeError(
+                    "Selected elbow response P active gain/Lock/torque/configured current/status/voltage refused"
+                )
+            # Existing owner thermal windows remain authoritative; one raw temperature is not a new vote.
+            self._snapshot.update(
+                state="active", status="active", active_verified=True,
+                active_registers=actual, active_verified_at_monotonic_s=time.monotonic(),
+            )
+            # The durable configured file already owns restoration. Flush active evidence only after OFF.
+        except BaseException as error:
+            self._snapshot.update(state="active_failed", status="active_failed")
+            self._snapshot.setdefault("first_failure", {
+                "type": type(error).__name__, "message": str(error),
+                "traceback": "".join(traceback.format_exception(error)),
+            })
+            raise
+
+    @property
+    def receipt(self):
+        if not self.restore_required or self._snapshot.get("configured_p_readback") != self.proportional:
+            raise RuntimeError("Selected elbow response P receipt requires its applied outstanding obligation")
+        request = self.binding["request"]
+        return {
+            "version": 1,
+            "kind": self.kind,
+            "run_id": self.binding["run_id"],
+            "host_incarnation": self.binding["host_incarnation"],
+            "request_sha256": self.binding["request_sha256"],
+            "source_head": request["source_head"],
+            "request_id": request["request_id"],
+            "workload_segment": request["workload_segment"],
+            "original_p": 16,
+            "configured_p": self.proportional,
+            "restore_required": True,
+            # Hash of the durable original registers/bytes, never a claim of durable active readback.
+            "original_settings_sha256": self._snapshot["original_settings_sha256"],
+            "prepared_at_monotonic_s": self._snapshot["prepared_at_monotonic_s"],
+            "configured_at_monotonic_s": self._snapshot["configured_at_monotonic_s"],
+        }
+
+    def active_receipt(self, robot):
+        """Read-free per-frame identity fence; never acquire or refresh a device sample."""
+        self._retained_owner(robot)
+        if (
+            self._snapshot.get("state") != "active"
+            or self._snapshot.get("active_verified") is not True
+            or getattr(robot, "_am1_shutdown_in_progress", False) is True
+        ):
+            raise RuntimeError("Selected elbow response P active receipt requires its prior verified active phase")
+        return copy.deepcopy(self.receipt)
+
+    def restore(self, robot):
+        if not self.restore_required:
+            return
+        try:
+            self.disable_torque(robot)
+            self._same_owner(robot)
+            if self._read("P_Coefficient", phase="before_restore") != 16:
+                self._write("P_Coefficient", 16, phase="restore_proportional", reconcile=True)
+            if self._read("P_Coefficient", phase="restored") != 16:
+                raise RuntimeError("Selected elbow response P original P16 restoration failed")
+            self._preserved(robot, phase="restored")
+            self._write(
+                "Lock",
+                self._snapshot["original_registers"]["Lock"],
+                phase="restore_original_lock",
+                reconcile=True,
+            )
+            self._snapshot.update(restored_p_readback=16, restored_at_monotonic_s=time.monotonic())
+            self._persist_snapshot("restored", required=False)
+            self.restore_required = False
+        except BaseException as error:
+            # An ambiguous final unlock or durable-result failure must retain Lock1 and the obligation.
+            try:
+                self._retained_owner(robot)
+                self._write("Torque_Enable", 0, phase="restore_failed_torque_off", reconcile=True)
+                self._write("Lock", 1, phase="restore_failed_lock", reconcile=True)
+            except BaseException as hold_error:
+                error.add_note(
+                    "Selected elbow response P failed-restore hold also failed: " + type(hold_error).__name__
+                )
+            self._failure("restore_failed", error)
+            raise
+
+
+class AM1RightResponseProportionalTrial(AM1LeftResponseProportionalTrial):
+    """The closed right-ID3 comparison uses the same durable restoration machinery."""
+
+    side, kind, motor = "right", RIGHT_RESPONSE_P_KIND, "arm_right_elbow_flex"
+    calibration = (3, 0, -658, 827, 3039)
+    raw_bounds = (1847, 1960)
