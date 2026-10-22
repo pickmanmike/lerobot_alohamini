@@ -1825,6 +1825,12 @@ class ProtectedHostRun:
             signal_name="SIGINT",
             log=self.host_log,
         )
+        # This fresh run directory cannot borrow another run's readiness. Retain
+        # its post-home marker while activation finishes and the socket binds;
+        # startup receipts and routine lift output may exceed the old log tail.
+        logpath = self.run_directory / "host-runtime.log"
+        ready_marker = b'"operational_ready"'
+        ready, log_offset, log_overlap = False, 0, b""
         while True:
             cancel()
             if self.host.poll() is not None:
@@ -1833,14 +1839,18 @@ class ProtectedHostRun:
                 )
             if self.camera.poll() is not None:
                 raise RuntimeError("owned required camera exited during startup; inspect original camera log")
-            # Existing post-home operational_ready precedes client handshake. Socket bind alone is not ready.
-            logpath = self.run_directory / "host-runtime.log"
-            if logpath.exists():
+            if not ready and logpath.exists():
                 with logpath.open("rb") as stream:
-                    stream.seek(max(0, logpath.stat().st_size - 64000))
-                    ready = b'"operational_ready"' in stream.read()
-                if ready and (self.run_directory / "observation.sock").exists():
-                    break
+                    stream.seek(log_offset)
+                    chunk = stream.read(64000)
+                log_offset += len(chunk)
+                scanned = log_overlap + chunk
+                ready = ready_marker in scanned
+                log_overlap = scanned[-(len(ready_marker) - 1):]
+            # Socket bind alone is not ready. Every bounded scan/wait keeps the
+            # same cancellation deadline and actual host/camera exit fences.
+            if ready and (self.run_directory / "observation.sock").exists():
+                break
             time.sleep(0.05)
         cancel()
         self.client = AlohaMiniClient(

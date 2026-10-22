@@ -3346,3 +3346,184 @@ def test_left_shoulder_startup_cli_refuses_missing_profile_or_free_bound_before_
     with pytest.raises(SystemExit):
         m.main(["--prepare-left-response-p", "--ssh", "am1-pi", "--config",
                 "/home/pickmanmike/.local/share/am1-physical-adapter-01/deployments/7438c74662d59a02/physical.json", *extra])
+
+@pytest.fixture
+def readiness_gate_case(tmp_path, monkeypatch):
+    """Run the real startup gate with file replay and inert unit/client boundaries."""
+    from pathlib import Path
+    from lerobot.robots.alohamini import alohamini_client
+    from examples.alohamini.am1_session_contract import RECIPES
+    m = module()
+    _, config, _, _ = request_preparation_config(tmp_path, monkeypatch)
+    provider = m.ProtectedHostRun(config)
+    monkeypatch.setattr(provider, "_validate_source", lambda: None)
+    provider.observation = SimpleNamespace(evidence=lambda: {"qualified": True})
+    state = SimpleNamespace(now=0.0, deadline=.6, steps=0, initial_log=b"", append=b"",
+                            socket_at_start=False, socket_step=1, fault=None, fault_step=1,
+                            clients=[], reads=[], host=None, camera=None, provider=provider)
+    run_id="28122793-8395-4d47-9491-29a6cfc00d9a"
+    incarnation="751e9680-ce4c-40fd-a4e5-cf2b61ae8160"
+    run_directory=Path(config["run_root"]) / run_id[:8]
+    logpath=run_directory / "host-runtime.log"
+    socketpath=run_directory / "observation.sock"
+    original_open=Path.open
+
+    class Reader:
+        def __init__(self, stream):
+            self.stream=stream
+        def __enter__(self):
+            self.stream.__enter__()
+            return self
+        def __exit__(self, *args):
+            return self.stream.__exit__(*args)
+        def seek(self, *args):
+            return self.stream.seek(*args)
+        def read(self, size=-1):
+            state.reads.append((self.stream.tell(), size))
+            return self.stream.read(size)
+
+    def opened(path, mode="r", *args, **kwargs):
+        stream=original_open(path, mode, *args, **kwargs)
+        return Reader(stream) if path == logpath and mode == "rb" else stream
+    monkeypatch.setattr(Path, "open", opened)
+
+    def unit(name, *args, **kwargs):
+        result=SimpleNamespace(returncode=None)
+        result.poll=lambda: result.returncode
+        if "-host-" in name:
+            state.host=result
+            logpath.write_bytes(state.initial_log)
+            if state.socket_at_start:
+                socketpath.touch()
+        else:
+            state.camera=result
+        return result
+    monkeypatch.setattr(m, "OwnedUnit", unit)
+
+    class Client:
+        def __init__(self, config):
+            self.connected=False
+            state.clients.append(self)
+        def connect(self, *, cancel_check):
+            cancel_check()
+            self.connected=True
+    monkeypatch.setattr(alohamini_client, "AlohaMiniClient", Client)
+
+    def cancel():
+        if state.fault == "stop" and state.steps >= state.fault_step:
+            raise m.StartupCancelledError("physical startup cancelled by Stop")
+        if state.now >= state.deadline:
+            raise RuntimeError("physical startup deadline expired")
+
+    def sleep(seconds):
+        assert seconds == .05
+        state.steps += 1
+        state.now += seconds
+        if state.steps == 1 and state.append:
+            with original_open(logpath, "ab") as stream:
+                stream.write(state.append)
+        if state.steps == state.socket_step:
+            socketpath.touch()
+        if state.steps == state.fault_step and state.fault in {"host", "camera"}:
+            getattr(state, state.fault).returncode=1
+    monkeypatch.setattr(m.time, "sleep", sleep)
+    state.start=lambda: provider.start(run_id, incarnation, RECIPES["physical-live-teleop"], cancel)
+    state.logpath, state.socketpath = logpath, socketpath
+    try:
+        yield state
+    finally:
+        for stream in (provider.host_log, provider.camera_log):
+            if stream is not None:
+                stream.close()
+
+
+def test_readiness_gate_replays_actual118_output_burst_before_socket(readiness_gate_case):
+    case=readiness_gate_case
+    ready=b'[LIFT OPERATIONAL] {"phase":"operational_ready"}'
+    # Actual118: ready line ends at203637; receipts end at266824. The first
+    # routine lift record then removes readiness from the previous64k tail.
+    case.initial_log=b"x" * 203225 + ready + b" " * (412-len(ready)-1) + b"\n" + b"s" * 63187
+    case.append=b"c" * 94 + b"l" * 1364
+    assert len(case.initial_log) == 266824
+    assert b'"operational_ready"' not in (case.initial_log+case.append)[-64000:]
+    case.start()
+    assert len(case.clients) == 1 and case.clients[0].connected
+    assert case.reads[0][0] == 0
+    assert all(0 < size <= 64000 for _, size in case.reads)
+    assert [at for at, _ in case.reads] == sorted(set(at for at, _ in case.reads))
+
+
+def test_readiness_gate_latches_marker_while_its_socket_is_absent(readiness_gate_case):
+    case=readiness_gate_case
+    case.initial_log=b'[LIFT OPERATIONAL] {"phase":"operational_ready"}\n'
+    case.append=b"l" * 128000
+    case.socket_step=3
+    case.start()
+    assert case.steps == 3 and case.clients[0].connected
+    assert len(case.reads) == 1, "latched readiness must not depend on later output volume"
+
+
+def test_readiness_gate_matches_marker_split_across_bounded_reads(readiness_gate_case):
+    case=readiness_gate_case
+    case.initial_log=b"x" * 63991 + b'"operational_ready"' + b"\n"
+    case.socket_at_start=True
+    case.start()
+    assert case.clients[0].connected
+    assert case.reads == [(0, 64000), (64000, 64000)]
+
+
+@pytest.mark.parametrize("fault,pattern", [("stop", "cancelled by Stop"),
+    ("deadline", "startup deadline expired"), ("host", "host exited during startup"),
+    ("camera", "camera exited during startup")])
+def test_readiness_gate_retains_stop_deadline_and_owned_exit_fences(readiness_gate_case, fault, pattern):
+    case=readiness_gate_case
+    case.initial_log=b'[LIFT OPERATIONAL] {"phase":"operational_ready"}\n'
+    case.socket_step=1
+    case.fault=fault
+    if fault == "deadline":
+        case.deadline=.05
+    with pytest.raises(RuntimeError, match=pattern):
+        case.start()
+    assert case.clients == []
+
+
+def test_readiness_gate_socket_or_other_run_marker_cannot_supply_readiness(readiness_gate_case, tmp_path):
+    case=readiness_gate_case
+    other=tmp_path / "other-run"
+    other.mkdir()
+    (other / "host-runtime.log").write_bytes(b'"operational_ready"')
+    case.initial_log=b'"phase":"live"\n' * 5000
+    case.socket_at_start=True
+    with pytest.raises(RuntimeError, match="startup deadline expired"):
+        case.start()
+    assert not case.clients
+    assert all(0 < size <= 64000 for _, size in case.reads)
+
+def test_readiness_gate_matches_marker_split_across_writer_polls(readiness_gate_case):
+    case = readiness_gate_case
+    case.initial_log = b'[LIFT OPERATIONAL] {"phase":"operational_'
+    case.append = b'ready"}\n'
+    case.start()
+    assert case.clients[0].connected
+    assert case.reads == [(0, 64000), (len(case.initial_log), 64000)]
+
+
+@pytest.mark.parametrize("fault", ["stop", "deadline"])
+def test_readiness_gate_rechecks_cancellation_after_socket_before_client(readiness_gate_case, monkeypatch, fault):
+    from pathlib import Path
+    case = readiness_gate_case
+    case.initial_log = b'[LIFT OPERATIONAL] {"phase":"operational_ready"}\n'
+    case.socket_at_start = True
+    exists = Path.exists
+    def cancellation_at_socket(path):
+        present = exists(path)
+        if path == case.socketpath and present:
+            if fault == "stop":
+                case.fault, case.fault_step = "stop", 0
+            else:
+                case.deadline = 0
+        return present
+    monkeypatch.setattr(Path, "exists", cancellation_at_socket)
+    with pytest.raises(RuntimeError, match="cancelled by Stop" if fault == "stop" else "startup deadline expired"):
+        case.start()
+    assert not case.clients
