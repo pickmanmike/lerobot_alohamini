@@ -21,6 +21,7 @@ INCOMPLETE_PREACTIVATION_ORIGIN = "preactivation-lift-unqualified"
 PREHOME_COOL_STALE_ORIGIN = "prehome-cool-thermal-stale-lift-unqualified"
 PRECONFIGURE_COOL_STALE_ORIGIN = "preconfigure-cool-thermal-stale-lift-unqualified"
 PREIMPORT_STOP_ORIGIN = "preimport-stop-missing-host-receipt"
+RESPONSE_BASELINE_REFUSED_ORIGIN = "preconfigure-left-response-baseline-refused-lift-unqualified"
 
 
 def canonical(value):
@@ -277,6 +278,131 @@ def _validate_prehome_cool_stale_origin(run, receipt, chain, *, configure=False)
         )
 
 
+def _validate_response_baseline_refused_origin(run, proof, receipt, chain):
+    """This old refusal grants no readiness; the independent fresh stopped proof does."""
+    cause = "RuntimeError: Selected elbow response P actual stopped baseline differs from its reviewed original"
+    require(
+        chain == [{"cause": cause, "notes": []}] and receipt["first_cause"] == cause,
+        "exact direct selected response baseline refusal required",
+    )
+    trial = receipt["readback"].get("left_response_p_trial")
+    fields = {
+        "schema_version", "kind", "binding", "motor", "motor_id", "original_registers",
+        "original_bytes", "frozen_teleop_registers", "prepared_at_monotonic_s",
+        "original_settings_sha256", "events", "restore_required", "state", "status",
+    }
+    require(
+        isinstance(trial, dict) and set(trial) == fields
+        and type(trial["schema_version"]) is int and trial["schema_version"] == 1
+        and trial["kind"] == "left-response-p" and trial["motor"] == "arm_left_elbow_flex"
+        and type(trial["motor_id"]) is int and trial["motor_id"] == 3
+        and trial["restore_required"] is False
+        and trial["state"] == trial["status"] == "baseline_refused",
+        "original left baseline-refused snapshot without effects or obligation required",
+    )
+    binding = trial["binding"]
+    require(
+        isinstance(binding, dict)
+        and set(binding) == {"version", "kind", "run_id", "host_incarnation", "request_sha256", "request"}
+        and type(binding["version"]) is int and binding["version"] == 1
+        and binding["kind"] == trial["kind"] and binding["run_id"] == run["run_id"]
+        and binding["host_incarnation"] == proof["host_incarnation"],
+        "original same-run response binding required",
+    )
+    request = binding["request"]
+    source = proof.get("source") or {}
+    backend = source.get("backend_contract") or {}
+    original_motor = "927c17aa52bdf8da3e0ab53d7a122bbb3749b816"
+    require(
+        isinstance(request, dict)
+        and set(request) == {"version", "kind", "request_id", "source_head", "proportional",
+                            "workload_segment", "boot_id", "expires_at_monotonic_s"}
+        and type(request["version"]) is int and request["version"] == 1
+        and request["kind"] == "left-response-p"
+        and type(request["proportional"]) is int and request["proportional"] == 32
+        and request["workload_segment"] == "left-reach"
+        and request["source_head"] == source.get("motor_head") == backend.get("host_head") == original_motor
+        and run.get("backend_contract") == backend and run.get("recipe") == "physical-live-teleop"
+        and request["boot_id"] == proof.get("boot_id")
+        and binding["request_sha256"] == sha(canonical(request)),
+        "exact original motor source and canonical consumed left-reach request required",
+    )
+    for value in (request["request_id"], request["boot_id"]):
+        require(type(value) is str and str(uuid.UUID(value)) == value, "canonical original request identity required")
+    expected = {
+        "Model_Number": 777, "Firmware_Major_Version": 3, "Firmware_Minor_Version": 10,
+        "Operating_Mode": 0, "Torque_Enable": 0, "Lock": 0, "P_Coefficient": 16,
+        "I_Coefficient": 0, "D_Coefficient": 32, "Min_Position_Limit": 864,
+        "Max_Position_Limit": 3073, "ID": 3, "Homing_Offset": 1845, "Phase": 12,
+        "Max_Torque_Limit": 1000, "Torque_Limit": 1000, "CW_Dead_Zone": 1,
+        "CCW_Dead_Zone": 1, "Acceleration": 254, "Maximum_Acceleration": 254,
+        "Goal_Time": 0, "Goal_Velocity": 0, "Protection_Current": 310,
+        "Max_Temperature_Limit": 70, "Min_Voltage_Limit": 40, "Max_Voltage_Limit": 140,
+        "Protective_Torque": 20, "Protection_Time": 200, "Overload_Torque": 80,
+        "Over_Current_Protection_Time": 200, "Velocity_closed_loop_P_proportional_coefficient": 10,
+        "Velocity_closed_loop_I_integral_coefficient": 200, "Present_Current": 0, "Status": 0,
+    }
+    registers, individual = trial["original_registers"], trial["original_bytes"]
+    require(
+        isinstance(registers, dict)
+        and set(registers) == set(expected) | {"Present_Position", "Goal_Position", "Present_Voltage", "Present_Temperature"}
+        and all(type(value) is int for value in registers.values())
+        and all(registers[key] == value for key, value in expected.items())
+        and 864 <= registers["Present_Position"] <= 3073
+        and not 2011 <= registers["Present_Position"] <= 2124
+        and 2011 <= registers["Goal_Position"] <= 2124
+        and 40 <= registers["Present_Voltage"] <= 140
+        and 0 <= registers["Present_Temperature"] < 70
+        and individual == {"24": 16, "25": 0}
+        and all(type(value) is int for value in individual.values())
+        and trial["original_settings_sha256"] == sha(canonical({"registers": registers, "individual_bytes": individual})),
+        "only calibrated out-of-corridor position with unchanged safe stopped settings required",
+    )
+    frozen_keys = {
+        "ID", "Model_Number", "Firmware_Major_Version", "Firmware_Minor_Version",
+        "Min_Position_Limit", "Max_Position_Limit", "Homing_Offset", "Phase", "P_Coefficient",
+        "I_Coefficient", "D_Coefficient", "Acceleration", "Maximum_Acceleration", "Protection_Current",
+        "Max_Temperature_Limit", "Min_Voltage_Limit", "Max_Voltage_Limit", "Operating_Mode",
+    }
+    frozen = trial["frozen_teleop_registers"]
+    require(
+        isinstance(frozen, dict) and set(frozen) == frozen_keys
+        and all(type(value) is int and value == registers[key] for key, value in frozen.items()),
+        "unchanged actual original frozen teleop settings required",
+    )
+    events, prepared = trial["events"], trial["prepared_at_monotonic_s"]
+    expiry = request["expires_at_monotonic_s"]
+    require(
+        isinstance(events, list) and len(events) == 40 and number(prepared)
+        and number(expiry) and 0 <= prepared < expiry
+        and prepared <= receipt["readback"]["started_at_monotonic_s"],
+        "original pre-cleanup consumed baseline timing required",
+    )
+    observed, previous = set(), 0.0
+    common = {"operation", "phase", "value", "started_at_monotonic_s", "completed_at_monotonic_s"}
+    for row in events:
+        require(isinstance(row, dict), "original baseline read row required")
+        key = row.get("register") if "register" in row else row.get("address")
+        wanted = common | ({"register"} if "register" in row else {"address", "width"})
+        require(
+            set(row) == wanted and row["operation"] == "read" and row["phase"] == "baseline"
+            and key not in observed and type(row["value"]) is int
+            and (key in registers and row["value"] == registers[key]
+                 or type(key) is int and key in (24, 25) and row["width"] == 1
+                 and type(row["width"]) is int and row["value"] == individual[str(key)]),
+            "forty distinct value-matched read-only baseline rows required",
+        )
+        started, completed = row["started_at_monotonic_s"], row["completed_at_monotonic_s"]
+        require(
+            number(started) and number(completed) and previous <= started <= completed <= prepared
+            and completed - started <= 0.04,
+            "original ordered bounded baseline read timing required",
+        )
+        observed.add(key)
+        previous = completed
+    require(observed == set(registers) | {24, 25}, "complete original baseline register/byte reads required")
+
+
 def validate_cleanup_origin(run, proof, receipt):
     """Qualify an explicit incomplete origin without promoting its old lift proof."""
     origin = proof.get("original_cleanup_origin")
@@ -287,7 +413,8 @@ def validate_cleanup_origin(run, proof, receipt):
         )
         return False
     require(
-        origin in (INCOMPLETE_PREACTIVATION_ORIGIN, PREHOME_COOL_STALE_ORIGIN, PRECONFIGURE_COOL_STALE_ORIGIN),
+        origin in (INCOMPLETE_PREACTIVATION_ORIGIN, PREHOME_COOL_STALE_ORIGIN,
+                   PRECONFIGURE_COOL_STALE_ORIGIN, RESPONSE_BASELINE_REFUSED_ORIGIN),
         "unsupported original cleanup origin",
     )
     lifecycle, rb = run.get("physical_result") or {}, receipt.get("readback") or {}
@@ -329,7 +456,9 @@ def validate_cleanup_origin(run, proof, receipt):
         "only incomplete lift proof with otherwise actual known off cleanup may use this origin",
     )
     chain = receipt.get("first_error_chain")
-    if origin in (PREHOME_COOL_STALE_ORIGIN, PRECONFIGURE_COOL_STALE_ORIGIN):
+    if origin == RESPONSE_BASELINE_REFUSED_ORIGIN:
+        _validate_response_baseline_refused_origin(run, proof, receipt, chain)
+    elif origin in (PREHOME_COOL_STALE_ORIGIN, PRECONFIGURE_COOL_STALE_ORIGIN):
         _validate_prehome_cool_stale_origin(run, receipt, chain, configure=origin == PRECONFIGURE_COOL_STALE_ORIGIN)
     else:
         require(
@@ -1366,6 +1495,7 @@ def archive_and_ack(config, proof, raw, originals, operation_id):
         INCOMPLETE_PREACTIVATION_ORIGIN,
         PREHOME_COOL_STALE_ORIGIN,
         PREIMPORT_STOP_ORIGIN,
+        RESPONSE_BASELINE_REFUSED_ORIGIN,
     ):
         require(
             originals == dict.fromkeys(MARKERS)

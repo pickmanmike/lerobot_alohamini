@@ -2261,3 +2261,493 @@ def test_configure_cool_stale_origin_near_misses_and_unqualified_fresh_proof_ref
     with pytest.raises((ValueError, RuntimeError, KeyError)):
         m.load_qualified_proof(config, run)
     assert not list(state.glob("reconciliation-ack-*"))
+
+
+# Literal Actual114 read-only baseline refusal; fresh stopped proof below remains synthetic.
+ACTUAL114_RESPONSE_BASELINE = {'binding': {'host_incarnation': '1a96514b-89e7-49ef-b6f8-8cfe5be9c74f',
+             'kind': 'left-response-p',
+             'request': {'boot_id': '4ff03ddb-1495-485c-aae8-33a67d79a98f',
+                         'expires_at_monotonic_s': 525964.05962306,
+                         'kind': 'left-response-p',
+                         'proportional': 32,
+                         'request_id': 'f483a179-4902-413d-aec8-eb839d3902dc',
+                         'source_head': '927c17aa52bdf8da3e0ab53d7a122bbb3749b816',
+                         'version': 1,
+                         'workload_segment': 'left-reach'},
+             'request_sha256': '1762770d85bdb20d113118bef99766f0cc2ff39b133e5f4f2b75cba107586a14',
+             'run_id': '120e914e-613d-4794-9d75-23c1567e0cd9',
+             'version': 1},
+ 'events': [{'completed_at_monotonic_s': 525864.006334197,
+             'operation': 'read',
+             'phase': 'baseline',
+             'register': 'Model_Number',
+             'started_at_monotonic_s': 525864.00535018,
+             'value': 777},
+            {'completed_at_monotonic_s': 525864.00731601,
+             'operation': 'read',
+             'phase': 'baseline',
+             'register': 'Firmware_Major_Version',
+             'started_at_monotonic_s': 525864.006417197,
+             'value': 3},
+            {'completed_at_monotonic_s': 525864.008305545,
+             'operation': 'read',
+             'phase': 'baseline',
+             'register': 'Firmware_Minor_Version',
+             'started_at_monotonic_s': 525864.007390695,
+             'value': 10},
+            {'completed_at_monotonic_s': 525864.009818746,
+             'operation': 'read',
+             'phase': 'baseline',
+             'register': 'Operating_Mode',
+             'started_at_monotonic_s': 525864.008380063,
+             'value': 0},
+            {'completed_at_monotonic_s': 525864.010509948,
+             'operation': 'read',
+             'phase': 'baseline',
+             'register': 'Torque_Enable',
+             'started_at_monotonic_s': 525864.009893523,
+             'value': 0},
+            {'completed_at_monotonic_s': 525864.014249681,
+             'operation': 'read',
+             'phase': 'baseline',
+             'register': 'Lock',
+             'started_at_monotonic_s': 525864.010569078,
+             'value': 0},
+            {'completed_at_monotonic_s': 525864.015298864,
+             'operation': 'read',
+             'phase': 'baseline',
+             'register': 'P_Coefficient',
+             'started_at_monotonic_s': 525864.014371366,
+             'value': 16},
+            {'completed_at_monotonic_s': 525864.016291159,
+             'operation': 'read',
+             'phase': 'baseline',
+             'register': 'I_Coefficient',
+             'started_at_monotonic_s': 525864.015361698,
+             'value': 0},
+            {'completed_at_monotonic_s': 525864.017289879,
+             'operation': 'read',
+             'phase': 'baseline',
+             'register': 'D_Coefficient',
+             'started_at_monotonic_s': 525864.016337899,
+             'value': 32},
+            {'completed_at_monotonic_s': 525864.018288136,
+             'operation': 'read',
+             'phase': 'baseline',
+             'register': 'Min_Position_Limit',
+             'started_at_monotonic_s': 525864.017331064,
+             'value': 864},
+            {'completed_at_monotonic_s': 525864.019283171,
+             'operation': 'read',
+             'phase': 'baseline',
+             'register': 'Max_Position_Limit',
+             'started_at_monotonic_s': 525864.018328766,
+             'value': 3073},
+            {'completed_at_monotonic_s': 525864.020287892,
+             'operation': 'read',
+             'phase': 'baseline',
+             'register': 'Present_Position',
+             'started_at_monotonic_s': 525864.019323412,
+             'value': 1090},
+            {'completed_at_monotonic_s': 525864.021288556,
+             'operation': 'read',
+             'phase': 'baseline',
+             'register': 'Goal_Position',
+             'started_at_monotonic_s': 525864.020329817,
+             'value': 2050},
+            {'completed_at_monotonic_s': 525864.022287221,
+             'operation': 'read',
+             'phase': 'baseline',
+             'register': 'ID',
+             'started_at_monotonic_s': 525864.021329038,
+             'value': 3},
+            {'completed_at_monotonic_s': 525864.023282775,
+             'operation': 'read',
+             'phase': 'baseline',
+             'register': 'Homing_Offset',
+             'started_at_monotonic_s': 525864.022325758,
+             'value': 1845},
+            {'completed_at_monotonic_s': 525864.02428718,
+             'operation': 'read',
+             'phase': 'baseline',
+             'register': 'Phase',
+             'started_at_monotonic_s': 525864.023321404,
+             'value': 12},
+            {'completed_at_monotonic_s': 525864.025290808,
+             'operation': 'read',
+             'phase': 'baseline',
+             'register': 'Max_Torque_Limit',
+             'started_at_monotonic_s': 525864.024326661,
+             'value': 1000},
+            {'completed_at_monotonic_s': 525864.026288861,
+             'operation': 'read',
+             'phase': 'baseline',
+             'register': 'Torque_Limit',
+             'started_at_monotonic_s': 525864.025330511,
+             'value': 1000},
+            {'completed_at_monotonic_s': 525864.027281507,
+             'operation': 'read',
+             'phase': 'baseline',
+             'register': 'CW_Dead_Zone',
+             'started_at_monotonic_s': 525864.026326843,
+             'value': 1},
+            {'completed_at_monotonic_s': 525864.028299524,
+             'operation': 'read',
+             'phase': 'baseline',
+             'register': 'CCW_Dead_Zone',
+             'started_at_monotonic_s': 525864.027317785,
+             'value': 1},
+            {'completed_at_monotonic_s': 525864.029289948,
+             'operation': 'read',
+             'phase': 'baseline',
+             'register': 'Acceleration',
+             'started_at_monotonic_s': 525864.028348413,
+             'value': 254},
+            {'completed_at_monotonic_s': 525864.030288187,
+             'operation': 'read',
+             'phase': 'baseline',
+             'register': 'Maximum_Acceleration',
+             'started_at_monotonic_s': 525864.029328114,
+             'value': 254},
+            {'completed_at_monotonic_s': 525864.031283055,
+             'operation': 'read',
+             'phase': 'baseline',
+             'register': 'Goal_Time',
+             'started_at_monotonic_s': 525864.030327242,
+             'value': 0},
+            {'completed_at_monotonic_s': 525864.032290294,
+             'operation': 'read',
+             'phase': 'baseline',
+             'register': 'Goal_Velocity',
+             'started_at_monotonic_s': 525864.031319555,
+             'value': 0},
+            {'completed_at_monotonic_s': 525864.033293384,
+             'operation': 'read',
+             'phase': 'baseline',
+             'register': 'Protection_Current',
+             'started_at_monotonic_s': 525864.032329182,
+             'value': 310},
+            {'completed_at_monotonic_s': 525864.034288642,
+             'operation': 'read',
+             'phase': 'baseline',
+             'register': 'Max_Temperature_Limit',
+             'started_at_monotonic_s': 525864.033334977,
+             'value': 70},
+            {'completed_at_monotonic_s': 525864.035286491,
+             'operation': 'read',
+             'phase': 'baseline',
+             'register': 'Min_Voltage_Limit',
+             'started_at_monotonic_s': 525864.034325586,
+             'value': 40},
+            {'completed_at_monotonic_s': 525864.03628886,
+             'operation': 'read',
+             'phase': 'baseline',
+             'register': 'Max_Voltage_Limit',
+             'started_at_monotonic_s': 525864.035324325,
+             'value': 140},
+            {'completed_at_monotonic_s': 525864.037287025,
+             'operation': 'read',
+             'phase': 'baseline',
+             'register': 'Protective_Torque',
+             'started_at_monotonic_s': 525864.036328712,
+             'value': 20},
+            {'completed_at_monotonic_s': 525864.038299411,
+             'operation': 'read',
+             'phase': 'baseline',
+             'register': 'Protection_Time',
+             'started_at_monotonic_s': 525864.037323524,
+             'value': 200},
+            {'completed_at_monotonic_s': 525864.039281724,
+             'operation': 'read',
+             'phase': 'baseline',
+             'register': 'Overload_Torque',
+             'started_at_monotonic_s': 525864.038347411,
+             'value': 80},
+            {'completed_at_monotonic_s': 525864.040289167,
+             'operation': 'read',
+             'phase': 'baseline',
+             'register': 'Over_Current_Protection_Time',
+             'started_at_monotonic_s': 525864.039318483,
+             'value': 200},
+            {'completed_at_monotonic_s': 525864.041284276,
+             'operation': 'read',
+             'phase': 'baseline',
+             'register': 'Velocity_closed_loop_P_proportional_coefficient',
+             'started_at_monotonic_s': 525864.040327667,
+             'value': 10},
+            {'completed_at_monotonic_s': 525864.042288107,
+             'operation': 'read',
+             'phase': 'baseline',
+             'register': 'Velocity_closed_loop_I_integral_coefficient',
+             'started_at_monotonic_s': 525864.041321239,
+             'value': 200},
+            {'completed_at_monotonic_s': 525864.043286161,
+             'operation': 'read',
+             'phase': 'baseline',
+             'register': 'Present_Current',
+             'started_at_monotonic_s': 525864.042324403,
+             'value': 0},
+            {'completed_at_monotonic_s': 525864.044288918,
+             'operation': 'read',
+             'phase': 'baseline',
+             'register': 'Present_Voltage',
+             'started_at_monotonic_s': 525864.043323161,
+             'value': 119},
+            {'completed_at_monotonic_s': 525864.04528449,
+             'operation': 'read',
+             'phase': 'baseline',
+             'register': 'Present_Temperature',
+             'started_at_monotonic_s': 525864.044289566,
+             'value': 28},
+            {'completed_at_monotonic_s': 525864.046285525,
+             'operation': 'read',
+             'phase': 'baseline',
+             'register': 'Status',
+             'started_at_monotonic_s': 525864.045325046,
+             'value': 0},
+            {'address': 24,
+             'completed_at_monotonic_s': 525864.047287968,
+             'operation': 'read',
+             'phase': 'baseline',
+             'started_at_monotonic_s': 525864.046326821,
+             'value': 16,
+             'width': 1},
+            {'address': 25,
+             'completed_at_monotonic_s': 525864.048289892,
+             'operation': 'read',
+             'phase': 'baseline',
+             'started_at_monotonic_s': 525864.047326523,
+             'value': 0,
+             'width': 1}],
+ 'frozen_teleop_registers': {'Acceleration': 254,
+                             'D_Coefficient': 32,
+                             'Firmware_Major_Version': 3,
+                             'Firmware_Minor_Version': 10,
+                             'Homing_Offset': 1845,
+                             'ID': 3,
+                             'I_Coefficient': 0,
+                             'Max_Position_Limit': 3073,
+                             'Max_Temperature_Limit': 70,
+                             'Max_Voltage_Limit': 140,
+                             'Maximum_Acceleration': 254,
+                             'Min_Position_Limit': 864,
+                             'Min_Voltage_Limit': 40,
+                             'Model_Number': 777,
+                             'Operating_Mode': 0,
+                             'P_Coefficient': 16,
+                             'Phase': 12,
+                             'Protection_Current': 310},
+ 'kind': 'left-response-p',
+ 'motor': 'arm_left_elbow_flex',
+ 'motor_id': 3,
+ 'original_bytes': {'24': 16, '25': 0},
+ 'original_registers': {'Acceleration': 254,
+                        'CCW_Dead_Zone': 1,
+                        'CW_Dead_Zone': 1,
+                        'D_Coefficient': 32,
+                        'Firmware_Major_Version': 3,
+                        'Firmware_Minor_Version': 10,
+                        'Goal_Position': 2050,
+                        'Goal_Time': 0,
+                        'Goal_Velocity': 0,
+                        'Homing_Offset': 1845,
+                        'ID': 3,
+                        'I_Coefficient': 0,
+                        'Lock': 0,
+                        'Max_Position_Limit': 3073,
+                        'Max_Temperature_Limit': 70,
+                        'Max_Torque_Limit': 1000,
+                        'Max_Voltage_Limit': 140,
+                        'Maximum_Acceleration': 254,
+                        'Min_Position_Limit': 864,
+                        'Min_Voltage_Limit': 40,
+                        'Model_Number': 777,
+                        'Operating_Mode': 0,
+                        'Over_Current_Protection_Time': 200,
+                        'Overload_Torque': 80,
+                        'P_Coefficient': 16,
+                        'Phase': 12,
+                        'Present_Current': 0,
+                        'Present_Position': 1090,
+                        'Present_Temperature': 28,
+                        'Present_Voltage': 119,
+                        'Protection_Current': 310,
+                        'Protection_Time': 200,
+                        'Protective_Torque': 20,
+                        'Status': 0,
+                        'Torque_Enable': 0,
+                        'Torque_Limit': 1000,
+                        'Velocity_closed_loop_I_integral_coefficient': 200,
+                        'Velocity_closed_loop_P_proportional_coefficient': 10},
+ 'original_settings_sha256': '58a201eda573458979914c8144880f8e709ac8d3774144c29900fef818e57fd1',
+ 'prepared_at_monotonic_s': 525864.048308225,
+ 'restore_required': False,
+ 'schema_version': 1,
+ 'state': 'baseline_refused',
+ 'status': 'baseline_refused'}
+
+
+def response_baseline_refused_fixture(tmp_path, monkeypatch):
+    m, config, run, proof, state = incomplete_preactivation_fixture(tmp_path, monkeypatch)
+    old = run["physical_result"]["readback"]
+    trial = copy.deepcopy(ACTUAL114_RESPONSE_BASELINE)
+    trial["binding"].update(run_id=run["run_id"], host_incarnation=proof["host_incarnation"])
+    cause = "RuntimeError: Selected elbow response P actual stopped baseline differs from its reviewed original"
+    old.update(first_cause=cause, first_error_chain=[{"cause": cause, "notes": []}])
+    old["readback"]["left_response_p_trial"] = trial
+    old["readback"]["started_at_monotonic_s"] = 525864.05
+    for index, row in enumerate(old["readback"]["readbacks"]):
+        row["read_started_at_monotonic_s"] = 525864.05 + index * .001
+        row["read_completed_at_monotonic_s"] = row["read_started_at_monotonic_s"] + .0005
+    old["readback"]["completed_at_monotonic_s"] = 525864.08
+    run["native_first_cause"] = proof["original_first_cause"] = cause
+    config["host_head"] = proof["source"]["motor_head"] = trial["binding"]["request"]["source_head"]
+    run["backend_contract"] = copy.deepcopy(config)
+    run["recipe"] = "physical-live-teleop"
+    proof["boot_id"] = trial["binding"]["request"]["boot_id"]
+    proof["original_cleanup_origin"] = "preconfigure-left-response-baseline-refused-lift-unqualified"
+    # Only synthetic fresh-proof timestamps move; original114 baseline reads remain literal.
+    def fresh_clock(value):
+        if isinstance(value, dict):
+            return {key: fresh_clock(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [fresh_clock(item) for item in value]
+        return value + 525800 if type(value) is float and 99 <= value <= 100.1 else value
+    fresh = fresh_clock(proof)
+    proof.clear()
+    proof.update(fresh)
+    from types import SimpleNamespace
+    monkeypatch.setattr(m, "time", SimpleNamespace(monotonic=lambda: 525900.1))
+    return m, config, run, proof, state
+
+
+def test_response_baseline_refusal_literal114_requires_fresh_proof_and_durable_ack(tmp_path, monkeypatch):
+    m, config, run, proof, state = response_baseline_refused_fixture(tmp_path, monkeypatch)
+    before = copy.deepcopy(run)
+    raw = publish_incomplete_fixture(config, run, proof, state)
+    actual, received, inventory = m.load_qualified_proof(config, run)
+    assert actual == proof and received == raw and inventory == dict.fromkeys(m.MARKERS)
+    acknowledged = str(uuid.uuid4())
+    consumed = str(uuid.uuid4())
+    ack = m.archive_and_ack(config, actual, received, inventory, acknowledged)
+    assert m.acknowledged_receipt({**actual, "acknowledgment": {**ack, "consumed_operation_id": consumed}}, run, consumed)
+    assert run == before and run["status"] == "faulted" and run["uncertain"] is True
+    old = run["physical_result"]["readback"]
+    assert old["readback"]["lift_readback"] == "unavailable-or-failed"
+    assert old["readback"]["left_response_p_trial"]["restore_required"] is False
+    assert all(not (state / name).exists() for name in m.MARKERS)
+
+
+@pytest.mark.parametrize("broken", [
+    "origin", "source", "request_source", "request_hash", "request_run", "request_host", "request_boot",
+    "request_kind", "request_extra", "request_expiry", "trial_kind", "trial_state", "trial_extra",
+    "obligation", "configured", "snapshot_digest", "frozen", "static", "boolean_raw", "pp_inside",
+    "pp_outside_cal", "goal_outside", "current", "status", "torque", "lock", "hot", "voltage",
+    "byte", "write", "missing_event", "duplicate_event", "event_error", "event_value", "event_time",
+    "live", "progress", "original_nonzero", "fresh_lift", "fresh_thermal", "fresh_nonzero", "age", "boot",
+])
+def test_response_baseline_refusal_cannot_qualify_other_origin_or_incomplete_new_proof(tmp_path, monkeypatch, broken):
+    m, config, run, proof, state = response_baseline_refused_fixture(tmp_path, monkeypatch)
+    old = run["physical_result"]["readback"]
+    trial = old["readback"]["left_response_p_trial"]
+    binding, regs = trial["binding"], trial["original_registers"]
+    request = binding["request"]
+    if broken == "origin":
+        proof["original_cleanup_origin"] = m.INCOMPLETE_PREACTIVATION_ORIGIN
+    elif broken == "source":
+        config["host_head"] = proof["source"]["motor_head"] = "a" * 40
+    elif broken == "request_source":
+        request["source_head"] = "a" * 40
+    elif broken == "request_hash":
+        binding["request_sha256"] = "a" * 64
+    elif broken == "request_run":
+        binding["run_id"] = str(uuid.uuid4())
+    elif broken == "request_host":
+        binding["host_incarnation"] = str(uuid.uuid4())
+    elif broken == "request_boot":
+        request["boot_id"] = str(uuid.uuid4())
+    elif broken == "request_kind":
+        request["kind"] = "right-response-p"
+    elif broken == "request_extra":
+        request["extra"] = True
+    elif broken == "request_expiry":
+        request["expires_at_monotonic_s"] = 525863.0
+    elif broken == "trial_kind":
+        trial["kind"] = "right-response-p"
+    elif broken == "trial_state":
+        trial["status"] = "prepared"
+    elif broken == "trial_extra":
+        trial["active_registers"] = dict(regs)
+    elif broken == "obligation":
+        trial["restore_required"] = True
+    elif broken == "configured":
+        trial["configured_at_monotonic_s"] = trial["prepared_at_monotonic_s"]
+    elif broken == "snapshot_digest":
+        trial["original_settings_sha256"] = "a" * 64
+    elif broken == "frozen":
+        trial["frozen_teleop_registers"]["P_Coefficient"] = 32
+    elif broken == "static":
+        regs["Protection_Current"] = 0
+    elif broken == "boolean_raw":
+        regs["Torque_Enable"] = False
+    elif broken == "pp_inside":
+        regs["Present_Position"] = 2050
+    elif broken == "pp_outside_cal":
+        regs["Present_Position"] = 863
+    elif broken == "goal_outside":
+        regs["Goal_Position"] = 1090
+    elif broken == "current":
+        regs["Present_Current"] = 1
+    elif broken == "status":
+        regs["Status"] = 1
+    elif broken == "torque":
+        regs["Torque_Enable"] = 1
+    elif broken == "lock":
+        regs["Lock"] = 1
+    elif broken == "hot":
+        regs["Present_Temperature"] = 70
+    elif broken == "voltage":
+        regs["Present_Voltage"] = 0
+    elif broken == "byte":
+        trial["original_bytes"]["24"] = 0
+    elif broken == "write":
+        trial["events"][-1]["operation"] = "write"
+    elif broken == "missing_event":
+        trial["events"].pop()
+    elif broken == "duplicate_event":
+        trial["events"][-1] = copy.deepcopy(trial["events"][-2])
+    elif broken == "event_error":
+        trial["events"][0]["error"] = "fault"
+    elif broken == "event_value":
+        trial["events"][0]["value"] = 778
+    elif broken == "event_time":
+        trial["events"][1]["started_at_monotonic_s"] = 525864.0
+    elif broken == "live":
+        run["native_live_at"] = 525863.0
+    elif broken == "progress":
+        run["progress_s"] = .1
+    elif broken == "original_nonzero":
+        old["readback"]["readbacks"][0]["value"] = 1
+    elif broken == "fresh_lift":
+        proof["readback"]["lift_stationary"] = None
+    elif broken == "fresh_thermal":
+        proof["readback"]["lift_stationary"]["temperature_slots"][0][0] -= 1
+    elif broken == "fresh_nonzero":
+        proof["readback"]["readbacks"][0]["value"] = 1
+    elif broken == "age":
+        monkeypatch.setattr(m.time, "monotonic", lambda: proof["completed_at_monotonic_s"] + 181)
+    elif broken == "boot":
+        monkeypatch.setattr(m, "current_boot_id", lambda: str(uuid.uuid4()))
+    # Mutated register guards must still refuse with internally coherent hashes/events.
+    if broken in {"static", "boolean_raw", "pp_inside", "pp_outside_cal", "goal_outside", "current", "status", "torque", "lock", "hot", "voltage", "byte"}:
+        for event in trial["events"]:
+            event["value"] = regs[event["register"]] if "register" in event else trial["original_bytes"][str(event["address"])]
+        trial["original_settings_sha256"] = hashlib.sha256(canonical({"registers": regs, "individual_bytes": trial["original_bytes"]})).hexdigest()
+    if broken in {"request_source", "request_kind", "request_extra", "request_expiry", "request_boot"}:
+        binding["request_sha256"] = hashlib.sha256(canonical(request)).hexdigest()
+    publish_incomplete_fixture(config, run, proof, state)
+    before = copy.deepcopy(run)
+    with pytest.raises((ValueError, KeyError, TypeError)):
+        m.load_qualified_proof(config, run)
+    assert run == before
+    assert not (state / ("reconciliation-ack-" + run["run_id"] + ".json")).exists()
