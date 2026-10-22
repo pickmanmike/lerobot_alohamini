@@ -1,6 +1,6 @@
 ## Active AM1 ordinary required-view action after PR29 integration
 
-Current owner continuation ([PR29 comment6328872364](https://github.com/pickmanmike/lerobot_alohamini/pull/29#issuecomment-6328872364)) accepts the completed paired comparisons and Actual113 at their recorded limits. PR29 is integrated into integrate/am1-local-teleop at ff3c5ef014492820397b86d85bd96dfc4e2aa513, with exactly the reviewed21c5b574 tree; no powered repeat or component deployment was needed. Earlier PR29 no-merge restrictions are superseded for PR29 only; historical results retain their original scope. Main/AM2 and installed Stage51 component pins/rollback remain unchanged. Continue on codex/am1-normal-view-action in this same worktree; any executable follow-up gets a focused PR without automatic merge.
+Current owner continuation ([PR29 comment6328872364](https://github.com/pickmanmike/lerobot_alohamini/pull/29#issuecomment-6328872364)) accepts the completed paired comparisons and Actual113 at their recorded limits. PR29 is integrated into integrate/am1-local-teleop at ff3c5ef014492820397b86d85bd96dfc4e2aa513, with exactly the reviewed21c5b574 tree; no powered repeat or component deployment was needed. Earlier PR29 no-merge restrictions are superseded for PR29 only; historical results retain their original scope. Main/AM2 remain unchanged; current component-specific installation and matched rollback are recorded below. Continue on codex/am1-normal-view-action in this same worktree; any executable follow-up gets a focused PR without automatic merge.
 
 The current objective is one reproducible existing short unloaded left-reach/hold/gripper/retract action under NORMAL REQUIRED viewing, with explicitly selected temporary LEFT P32/I0/D32 and existing transaction/restoration; other joints retain baseline. Use the existing invocation plus canonical serializer/strict reader for a fresh request. No higher P, integral experiment, permanent EEPROM/default, new framework/UI/service, calibration/travel change or repeated peer matrix. Substantial undertravel and unequal achieved preparation remain real. Keep replacement/disassembly suspended.
 
@@ -21,9 +21,12 @@ positioning. Both temporary trials and113 restored P16/I0/D32/protection310 and
 originalLock0 last; no further escalation, permanent default, swap or unchanged
 powered repeat is required for publication.
 
-Stage51 source5157155 is installed at motor927c17aa (unchanged), runtime04c7b3ec,
-manifestc5adf5f6. Only one runtime file changed fromStage50; full matched Stage50
-rollback and older rollbacks are retained. Provably untouched initial feedback
+Current Stage53 source3d291882 is installed at unchanged motor927c17aa,
+runtimeca1433daa/MF7438c746; only two viewing assets changed overStage52,
+with executor107eb165 and other20 runtime rows retained. Full matched Stage52
+rollback and older rollbacks remain. No new motor task/request has started;
+normal useful viewing remains pending, not qualified by source/encoding alone.
+Historical Stage51 startup repair: provably untouched initial feedback
 cache now waits in the existing held startup path under the original deadline;
 received malformed/foreign feedback still faults with bounded diagnostic context.
 Actual111/112's exact cache failure remains unproven; their original failures stay.
