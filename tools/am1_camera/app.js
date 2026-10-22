@@ -282,6 +282,8 @@ function render() {
   diagnostics.textContent = `Status request ${Math.round(timing.status_ms)} ms (max ${Math.round(timing.status_max_ms)} ms); failures ${timing.status_failures}\n` +
     `Decode failures ${timing.decode_failures}; stream cancellations ${timing.cancellations}; last ${timing.last_cancel}\n` +
     roles.map(role => { const p = progress.get(role); return `${labels[role]} primary: received ${p.received}, displayed ${p.displayed}, seq ${p.sequence}; max receive/display gap ${Math.round(p.receive_max_gap_ms)}/${Math.round(p.display_max_gap_ms)} ms`; }).join("\n");
+  const attempt=webView?.diagnostics?.();
+  if(attempt)diagnostics.textContent+="\nWebRTC attempt diagnostics (observational): "+JSON.stringify(attempt);
 }
 async function statusLoop() {
   const start = performance.now();

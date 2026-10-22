@@ -8,7 +8,11 @@ globalThis.AM1OnboardView=class {
     this.reporting=false;this.timer=null;this.connecting=false;this.error=null;this.progressReceipt=null;
     this.reports=new Map();this.reportSerial=0;this.latestReport=0;
     this.lastReportAt=-Infinity;this.lastReportedFrames=0;this.lastReportedMedia=-1;
-    this.diagnostic=null;this.statsPending=null;
+    this.diagnostic=null;this.statsPending=null;this.diagnosticView=null;
+  }
+  diagnostics() {
+    const view=this.diagnosticView;
+    return view?{attempt:view.attempt,state:view.state,records:view.records.map(row=>({...row}))}:null;
   }
   diagnosticCurrent(attempt) {return this.diagnostic===attempt&&attempt.epoch===this.epoch&&attempt.pc===this.pc;}
   diagnose(attempt,phase,fields) {
@@ -18,7 +22,9 @@ globalThis.AM1OnboardView=class {
       attempt.counts[phase]++;
       // Call sites supply only the closed scalar projections below, never browser
       // objects, messages, SDP, source identities, candidates or addresses.
-      console.info("AM1 WebRTC diagnostics",JSON.stringify({attempt:attempt.epoch,phase,...fields}));
+      const record={attempt:attempt.epoch,phase,...fields};
+      this.diagnosticView.records.push(record);
+      console.info("AM1 WebRTC diagnostics",JSON.stringify(record));
     } catch {} // Diagnostics must never change player behavior, even if console fails.
   }
   diagnosticCategory(error) {
@@ -39,6 +45,7 @@ globalThis.AM1OnboardView=class {
   beginDiagnostics(epoch,pc) {
     const attempt={epoch,pc,counts:{offer:0,"remote-description":0,ice:0,connection:0,track:0,stats:0},timer:null};
     this.diagnostic=attempt;
+    this.diagnosticView={attempt:epoch,state:"current",records:[]};
     try {attempt.timer=setTimeout(()=>this.sampleDiagnosticStats(attempt),3000);}catch{}
     return attempt;
   }
@@ -84,6 +91,7 @@ globalThis.AM1OnboardView=class {
   endDiagnostics() {
     try {
       const attempt=this.diagnostic;this.diagnostic=null;clearTimeout(attempt?.timer);
+      if(attempt&&this.diagnosticView?.attempt===attempt.epoch)this.diagnosticView.state="stopped";
       // getStats cannot be aborted. Retain its single underlying slot until it
       // settles, without awaiting it or permitting another hung call per retry.
       if(this.statsPending?.attempt===attempt)clearTimeout(this.statsPending.timer);

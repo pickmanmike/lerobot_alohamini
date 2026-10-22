@@ -63,13 +63,13 @@ test("loaded camera page selects WebRTC and switches roles without any control r
   const directory=path.resolve(__dirname,"../../tools/am1_camera"),requests=[],errors=[];
   const roles=["forward","backward","chest","wrist_left","wrist_right"],owner=randomUUID();
   const captures=Object.fromEntries(roles.map(role=>[role,randomUUID()]));
-  let selected=null,generation=null,sequence=1,statusGate=null,chestGate=null;
+  let selected=null,generation=null,sequence=1,statusGate=null,chestGate=null,sourceFresh=true;
   const server=http.createServer(async(request,response)=>{
     requests.push({method:request.method,path:request.url});
     const reply=(status,type,body,headers={})=>{response.writeHead(status,{"Content-Type":type,...headers});response.end(body);};
     if(request.url==="/api/onboard/status"){
       const body=JSON.stringify({owner_generation:owner,
-        cameras:Object.fromEntries(roles.map(role=>[role,{configured:true,state:"fresh",age_ms:0,sequence:sequence++,
+        cameras:Object.fromEntries(roles.map(role=>[role,{configured:true,state:sourceFresh?"fresh":"stale",age_ms:0,sequence:sequence++,
           capture_generation:captures[role],rotation_degrees:role==="wrist_right"?270:180}])),
         video:{enabled:true,transport:"webrtc",role:selected,encode_generation:generation,
           capture_generation:captures[selected],state:selected?"running":"unavailable"}});
@@ -144,6 +144,18 @@ test("loaded camera page selects WebRTC and switches roles without any control r
     assert.ok(requests.slice(first).some(request=>request.path==="/api/onboard/webrtc/backward"));
   });
   assert.deepEqual(errors,[]);
+  const diagnosticPrefix="WebRTC attempt diagnostics (observational): ";
+  const readDiagnostic=async()=>JSON.parse((await page.locator("#diagnostics").textContent()).split(diagnosticPrefix)[1]);
+  await page.waitForFunction(()=>document.querySelector("#diagnostics").textContent.includes('"state":"current"'));
+  assert.ok((await page.locator("#diagnostics").textContent()).includes(diagnosticPrefix),"existing diagnostics panel must surface the curated attempt");
+  const liveDiagnostic=await readDiagnostic();assert.equal(liveDiagnostic.state,"current");
+  assert.ok(liveDiagnostic.records.some(row=>row.phase==="offer"&&row.http_status===201&&row.headers_valid===true));
+  assert.ok(liveDiagnostic.records.length<=8);
+  sourceFresh=false;
+  await page.waitForFunction(()=>document.querySelector("#diagnostics").textContent.includes('"state":"stopped"'));
+  const stoppedDiagnostic=await readDiagnostic();assert.equal(stoppedDiagnostic.attempt,liveDiagnostic.attempt);
+  assert.equal(stoppedDiagnostic.state,"stopped");assert.deepEqual(stoppedDiagnostic.records.slice(0,liveDiagnostic.records.length),liveDiagnostic.records);
+  assert.equal(await page.evaluate(()=>AM1CameraHealth().video?.fresh),false);
   await page.close();
 });
 
@@ -678,4 +690,36 @@ for(const phase of ["create","local-description","ice-gather"])test("curated dia
  assert.ok(failure,"pre-offer failure needs a closed phase label");assert.equal(failure.error_category,"other");
  assert.ok(!JSON.stringify(p.logs).includes("private"));assert.equal(p.requests.length,0);
  assert.equal(p.timers.size,0);assert.ok(p.logs.length<=8);
+});
+
+test("existing-panel diagnostics retain only the bounded current-or-stopped scalar snapshot",async()=>{
+ const p=fixture({manualTimers:true});
+ assert.equal(typeof p.view.diagnostics,"function","curated snapshot is missing");
+ assert.equal(p.view.diagnostics(),null);
+ await p.view.start("chest");const old=p.view.pc;
+ for(let i=0;i<50;i++){
+  old.oniceconnectionstatechange?.();old.onconnectionstatechange?.();old.ontrack({track:{kind:"video",id:"private"}});
+ }
+ p.setStatsResponse(new Map([["video",{type:"inbound-rtp",kind:"video",framesDecoded:0,packetsReceived:99}]]));
+ p.runTimers(3000);await new Promise(setImmediate);
+ const current=p.view.diagnostics();assert.equal(current.state,"current");assert.equal(current.attempt,p.view.epoch);
+ assert.equal(current.records.length,8);assert.ok(!JSON.stringify(current).includes("private"));
+ const unchanged=JSON.stringify(current);current.records[0].http_status="corrupted";current.records.length=0;
+ assert.equal(JSON.stringify(p.view.diagnostics()),unchanged,"public snapshot must not alias player state");
+ await p.view.stop();const stopped=p.view.diagnostics();assert.equal(stopped.state,"stopped");
+ assert.equal(stopped.attempt,JSON.parse(unchanged).attempt);
+ assert.deepEqual(JSON.parse(JSON.stringify(stopped.records)),JSON.parse(unchanged).records);
+ old.ontrack({track:{kind:"video"}});assert.deepEqual(p.view.diagnostics(),stopped);
+ await p.view.start("forward");const next=p.view.diagnostics();assert.equal(next.state,"current");
+ assert.ok(next.attempt>stopped.attempt);assert.equal(next.records.length,2);
+ assert.ok(!next.records.some(row=>row.phase==="stats"));await p.view.stop();
+});
+
+test("existing-panel diagnostics survive an unavailable console without changing freshness",async()=>{
+ const p=fixture({manualTimers:true});p.context.console.info=()=>{throw Error("private console unavailable");};
+ await p.view.start("chest");p.source();
+ assert.equal(typeof p.view.diagnostics,"function","panel snapshot must not depend on console receipt");
+ assert.equal(p.view.diagnostics().records.length,2);
+ assert.equal(p.view.health().fresh,false);p.callbacks.shift()(0,{presentedFrames:1,mediaTime:.1});await p.view.report();
+ assert.equal(p.view.health().fresh,true);await p.view.stop();assert.equal(p.view.diagnostics().state,"stopped");
 });
